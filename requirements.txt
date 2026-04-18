@@ -1,0 +1,27 @@
+# Trading Bot - Python 3.12
+# Install with: pip3.12 install -r requirements.txt
+
+# Broker
+alpaca-trade-api==3.2.0
+
+# Data
+pandas
+numpy
+pandas-ta
+pyarrow
+
+# Backtesting
+vectorbt
+
+# Utilities
+python-dotenv
+requests
+websocket-client
+
+# Logging
+loguru
+
+# Testing
+pytest
+pytest-cov
+freezegun

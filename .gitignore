@@ -1,0 +1,16 @@
+config/.env
+__pycache__/
+*.pyc
+*.pyo
+.DS_Store
+data/db/*.db
+data/historical/
+logs/
+.env
+venv/
+old/
+notebooks/
+*.egg-info/
+.coverage
+*.swp
+.claude/
