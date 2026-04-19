@@ -1,6 +1,6 @@
 # Trading Bot
 
-A modular, strategy-agnostic algorithmic trading bot built in Python. Currently paper trading on Alpaca with two complementary strategies and a full go/no-go framework for live capital deployment.
+A modular, strategy-agnostic algorithmic trading bot built in Python. Currently paper trading on Alpaca with the SMA crossover strategy and a full go/no-go framework for live capital deployment.
 
 ## Stack
 
@@ -19,10 +19,10 @@ A modular, strategy-agnostic algorithmic trading bot built in Python. Currently 
 
 | Strategy | Type | Order Type | Status |
 |---|---|---|---|
-| SMA Crossover | Trend-following | Market | Paper Trading |
-| RSI Reversion | Mean-reversion | Limit | Paper Trading |
+| SMA Crossover | Trend-following | Market | **Active — Paper Trading** |
+| RSI Reversion | Mean-reversion | Limit | Implemented, not yet active |
 
-Running both simultaneously provides regime diversification — SMA profits in trends, RSI profits in ranges.
+Only SMA crossover is currently running. RSI Reversion is implemented and backtested but will not be activated until SMA crossover completes the go/no-go evaluation. When activated, both strategies will run in separate `StrategySlot` instances, sharing one risk manager and equity pool — SMA profits in trends, RSI profits in ranges.
 
 See [docs/strategies.md](docs/strategies.md) for full signal logic and parameters.
 
@@ -93,7 +93,7 @@ Thresholds (from [architecture.md](docs/architecture.md)):
 ## Testing
 
 ```bash
-# Run all 352 unit tests
+# Run all unit tests
 pytest
 
 # With coverage
@@ -108,7 +108,8 @@ python phase9_verify.py
 - Phases 1-9 complete (data, strategies, backtesting, risk, execution, reporting)
 - Phase 9.5 complete (forward-test infrastructure, reconciliation)
 - Architecture alignment complete (SDK migration, SQLite, metrics, go/no-go)
-- Currently running paper trading — awaiting 4+ weeks of data for go/no-go evaluation
+- Currently running paper trading (SMA crossover only) — awaiting 4+ weeks of data for go/no-go evaluation
+- RSI Reversion implemented and backtested; will activate after SMA go/no-go passes
 
 ## Environment Variables
 

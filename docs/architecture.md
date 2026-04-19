@@ -4,7 +4,7 @@
 
 This document defines the target architecture for the Alpaca trading bot. It is the source of truth for structural decisions, coding conventions, and the go/no-go framework for live capital deployment. All refactoring and new development should align with this guide.
 
-The bot is built in Python using `alpaca-py`, currently paper trading SMA crossover and RSI mean-reversion strategies simultaneously. The goal is a clean, multi-strategy architecture that is live-ready when go/no-go thresholds are met.
+The bot is built in Python using `alpaca-py`, currently paper trading the SMA crossover strategy. RSI mean-reversion is implemented and backtested but not yet active — it will be added once SMA crossover completes its go/no-go evaluation. The goal is a clean, multi-strategy architecture that is live-ready when go/no-go thresholds are met.
 
 ---
 
@@ -39,7 +39,7 @@ trading-bot/
 ├── architecture.md            # This file
 ├── PLAN.md                    # Phased build plan and progress tracker
 ├── requirements.txt           # Pinned dependencies
-├── main.py                    # Entry point (wires engine together)
+├── main.py                    # Entry point (delegates to forward_test.py)
 ├── forward_test.py            # Launches engine for multi-week paper runs
 ├── start_bot.sh               # tmux + caffeinate launcher
 │
@@ -51,8 +51,7 @@ trading-bot/
 │   ├── __init__.py
 │   ├── fetcher.py             # Fetches OHLCV bars via StockHistoricalDataClient
 │   ├── trades.db              # SQLite trade log (gitignored)
-│   ├── historical/            # Cached historical bars
-│   └── db/                    # Local persistence
+│   └── historical/            # Cached historical bars (Parquet, gitignored)
 │
 ├── indicators/
 │   ├── __init__.py
@@ -178,11 +177,11 @@ Each slot binds a strategy to its symbol universe and timeframe. The engine iter
 
 | Strategy | File | Status | Order Type | Signal logic |
 |---|---|---|---|---|
-| SMA Crossover | `sma_crossover.py` | Active | MARKET | Fast SMA crosses above/below slow SMA |
-| RSI Reversion | `rsi_reversion.py` | Active | LIMIT | RSI crosses below oversold / above overbought |
+| SMA Crossover | `sma_crossover.py` | **Active (paper trading)** | MARKET | Fast SMA crosses above/below slow SMA |
+| RSI Reversion | `rsi_reversion.py` | Implemented, not yet active | LIMIT | RSI crosses below oversold / above overbought |
 
-**Why SMA + RSI complement each other:**
-SMA crossover is a trend-following strategy — it performs well in trending markets but suffers in sideways/ranging conditions. RSI mean reversion is the opposite — it performs well when prices oscillate in a range. Running both simultaneously provides natural regime diversification.
+**Why SMA + RSI complement each other (planned):**
+SMA crossover is a trend-following strategy — it performs well in trending markets but suffers in sideways/ranging conditions. RSI mean reversion is the opposite — it performs well when prices oscillate in a range. Running both simultaneously will provide natural regime diversification. RSI Reversion will be added to `forward_test.py` as a second `StrategySlot` after SMA crossover passes go/no-go.
 
 ### 4. Risk Manager
 
