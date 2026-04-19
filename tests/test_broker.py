@@ -185,6 +185,22 @@ class TestSubmitOrderKwargs:
         assert req.type.value == "limit"
         assert req.limit_price == 99.12  # rounded to 2dp
 
+    def test_atr_computed_stop_price_rounded_to_2dp(self):
+        """ATR-based stops produce long decimals (e.g. entry - k*ATR).
+        Alpaca rejects prices with more than 2 decimal places, so the
+        broker must round before submission."""
+        api = MagicMock()
+        api.submit_order.return_value = _alpaca_order(status="filled")
+        api.get_order_by_id.return_value = _alpaca_order(status="filled")
+        broker = _broker_with_mock(api)
+
+        # Simulate a raw ATR-computed stop: 150.00 - 2.0 * 5.8137 = 138.3726
+        raw_stop = 150.00 - 2.0 * 5.8137  # 138.3726
+        broker.place_order(_decision(entry=150.0, stop=raw_stop), poll_timeout=0.1)
+
+        req = api.submit_order.call_args.args[0]
+        assert req.stop_loss.stop_price == 138.37  # rounded, not 138.3726
+
 
 # ── place_order: terminal-state mapping ──────────────────────────────────────
 
