@@ -2,7 +2,7 @@
 Unit tests for the Phase 9 reporting module.
 
 Covers:
-  - TradeLogger: CSV creation, record building, append, read-back
+  - TradeLogger: SQLite creation, record building, append, read-back
   - PnLTracker: daily summary, per-strategy attribution, intraday drawdown,
     slippage stats, weekly report generation
   - AlertDispatcher: fire, cooldown suppression, backend failure isolation
@@ -12,8 +12,8 @@ Covers:
 
 from __future__ import annotations
 
-import csv
 import os
+import sqlite3
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from unittest.mock import MagicMock, patch
@@ -46,7 +46,7 @@ from strategies.base import OrderType
 
 @pytest.fixture
 def tmp_csv(tmp_path: Path) -> str:
-    return str(tmp_path / "trades.csv")
+    return str(tmp_path / "trades.db")
 
 
 @pytest.fixture
@@ -91,15 +91,17 @@ def sample_result() -> OrderResult:
 
 
 class TestTradeLogger:
-    def test_csv_created_with_header(self, tmp_csv, sample_decision, sample_result):
+    def test_db_created_with_trades_table(self, tmp_csv, sample_decision, sample_result):
         tl = TradeLogger(path=tmp_csv)
         record = tl.build_record(sample_decision, sample_result, modeled_price=150.0)
         tl.log(record)
 
-        with open(tmp_csv) as f:
-            reader = csv.reader(f)
-            header = next(reader)
-        assert header == TRADE_CSV_COLUMNS
+        conn = sqlite3.connect(tmp_csv)
+        cursor = conn.execute(
+            "SELECT name FROM sqlite_master WHERE type='table' AND name='trades'"
+        )
+        assert cursor.fetchone() is not None
+        conn.close()
 
     def test_record_fields(self, sample_decision, sample_result):
         tl = TradeLogger(path="/dev/null")
@@ -164,6 +166,35 @@ class TestTradeLogger:
         tl = TradeLogger(path="/dev/null")
         record = tl.build_record(sample_decision, result, modeled_price=150.0)
         assert record.realized_slippage_bps == 0.0
+
+    def test_read_trades_in_range(self, tmp_csv, sample_decision, sample_result):
+        tl = TradeLogger(path=tmp_csv)
+        # Log 3 records — all will have today's timestamp
+        for _ in range(3):
+            record = tl.build_record(sample_decision, sample_result)
+            tl.log(record)
+        today = record.timestamp[:10]
+        rows = tl.read_trades_in_range(today, today)
+        assert len(rows) == 3
+        # Out-of-range returns nothing
+        assert tl.read_trades_in_range("1999-01-01", "1999-12-31") == []
+
+    def test_read_recent(self, tmp_csv, sample_decision, sample_result):
+        tl = TradeLogger(path=tmp_csv)
+        for _ in range(5):
+            record = tl.build_record(sample_decision, sample_result)
+            tl.log(record)
+        recent = tl.read_recent(3)
+        assert len(recent) == 3
+
+    def test_close_and_reopen(self, tmp_csv, sample_decision, sample_result):
+        tl = TradeLogger(path=tmp_csv)
+        record = tl.build_record(sample_decision, sample_result)
+        tl.log(record)
+        tl.close()
+        # After close, read_all should still work (reconnects lazily)
+        tl2 = TradeLogger(path=tmp_csv)
+        assert len(tl2.read_all()) == 1
 
 
 # ── TestPnLTracker ──────────────────────────────────────────────────────────
@@ -266,8 +297,8 @@ class TestPnLTracker:
         assert report["count"] == 0
         assert report["mean_bps"] == 0.0
 
-    def test_slippage_report_from_csv(self, tmp_csv, tmp_daily_dir, sample_decision, sample_result):
-        # Write some trade records to the CSV first.
+    def test_slippage_report_from_db(self, tmp_csv, tmp_daily_dir, sample_decision, sample_result):
+        # Write some trade records to the database first.
         tl = TradeLogger(path=tmp_csv)
         for _ in range(5):
             record = tl.build_record(sample_decision, sample_result, modeled_price=150.0)
@@ -519,8 +550,6 @@ class TestEngineReportingWiring:
         )
 
         config = EngineConfig(
-            symbols=["AAPL"],
-            timeframe="1Day",
             cycle_interval_seconds=1,
             market_hours_only=False,
         )
@@ -531,6 +560,7 @@ class TestEngineReportingWiring:
 
         engine = TradingEngine(
             strategy=_Strat(),
+            symbols=["AAPL"],
             risk=RiskManager(),
             broker=broker,
             config=config,
@@ -545,7 +575,7 @@ class TestEngineReportingWiring:
         assert engine.alerts is not None
         assert engine.pnl_tracker is not None
 
-    def test_entry_fill_logged_to_csv(self, tmp_csv, monkeypatch, sample_decision, sample_result):
+    def test_entry_fill_logged_to_db(self, tmp_csv, monkeypatch, sample_decision, sample_result):
         engine, tl, backend = self._make_engine(tmp_csv, monkeypatch)
         engine._log_entry(sample_decision, sample_result, 150.0)
 
@@ -554,7 +584,7 @@ class TestEngineReportingWiring:
         assert rows[0]["symbol"] == "AAPL"
         assert rows[0]["side"] == "buy"
 
-    def test_close_fill_logged_to_csv(self, tmp_csv, monkeypatch, sample_result):
+    def test_close_fill_logged_to_db(self, tmp_csv, monkeypatch, sample_result):
         engine, tl, backend = self._make_engine(tmp_csv, monkeypatch)
         engine._log_close(sample_result, 150.0)
 

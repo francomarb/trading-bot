@@ -2,7 +2,7 @@
 # Install with: pip3.12 install -r requirements.txt
 
 # Broker
-alpaca-trade-api==3.2.0
+alpaca-py>=0.43.0
 
 # Data
 pandas

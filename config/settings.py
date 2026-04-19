@@ -5,7 +5,14 @@ load_dotenv("config/.env")
 
 ALPACA_API_KEY = os.getenv("ALPACA_API_KEY")
 ALPACA_SECRET_KEY = os.getenv("ALPACA_SECRET_KEY")
-ALPACA_BASE_URL = os.getenv("ALPACA_BASE_URL", "https://paper-api.alpaca.markets")
+ALPACA_PAPER = os.getenv("ALPACA_PAPER", "true").lower() in ("true", "1", "yes")
+
+# Derived base URL — used only by legacy verify scripts; alpaca-py uses the
+# `paper=` flag on TradingClient directly.
+ALPACA_BASE_URL = (
+    "https://paper-api.alpaca.markets" if ALPACA_PAPER
+    else "https://api.alpaca.markets"
+)
 
 # Trading universe
 WATCHLIST = [
@@ -51,7 +58,8 @@ ENGINE_MARKET_HOURS_ONLY = True     # Only trade during regular session
 ENGINE_CANCEL_ORDERS_ON_SHUTDOWN = True  # Tidy on SIGINT
 
 # ── Reporting settings (Phase 9) ────────────────────────────────────────────
-TRADE_LOG_CSV = "logs/trades.csv"           # Append-only trade log
+TRADE_LOG_CSV = "logs/trades.csv"           # Legacy CSV trade log (deprecated)
+TRADE_LOG_DB = "data/trades.db"             # SQLite trade log
 DAILY_PNL_DIR = "logs/daily_pnl"            # Daily P&L markdown summaries
 WEEKLY_REPORT_DIR = "logs/weekly_reports"    # Weekly summary markdowns
 JSON_LOG_FILE = "logs/bot.jsonl"            # Structured JSON log sink

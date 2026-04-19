@@ -108,8 +108,6 @@ def test_engine_runs_five_cycles(broker: AlpacaBroker) -> TradingEngine:
 
     # Use only 1 symbol to keep the verify fast.
     config = EngineConfig(
-        symbols=["AAPL"],
-        timeframe="1Day",
         history_lookback_days=200,
         cycle_interval_seconds=2,
         max_bar_age_multiplier=2.5,
@@ -121,6 +119,7 @@ def test_engine_runs_five_cycles(broker: AlpacaBroker) -> TradingEngine:
     risk = RiskManager()
     engine = TradingEngine(
         strategy=strategy,
+        symbols=["AAPL"],
         risk=risk,
         broker=broker,
         config=config,

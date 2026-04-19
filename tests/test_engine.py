@@ -35,7 +35,7 @@ from unittest.mock import MagicMock
 import pandas as pd
 import pytest
 
-from engine.trader import EngineConfig, TradingEngine
+from engine.trader import EngineConfig, TradingEngine, _lookback_days
 from execution.broker import (
     BrokerSnapshot,
     OpenOrder,
@@ -193,8 +193,6 @@ def engine_factory(patch_fetch):
             broker_error_threshold=10,
         )
         cfg = EngineConfig(
-            symbols=["AAPL"],
-            timeframe="1Day",
             history_lookback_days=120,
             cycle_interval_seconds=0.01,
             max_bar_age_multiplier=10.0,  # synthetic bars are days "old" wrt T0
@@ -207,6 +205,7 @@ def engine_factory(patch_fetch):
 
         engine = TradingEngine(
             strategy=strategy,
+            symbols=["AAPL"],
             risk=risk,
             broker=broker,
             config=cfg,
@@ -221,39 +220,51 @@ def engine_factory(patch_fetch):
 
 
 class TestEngineConfig:
-    def test_empty_symbols_rejected(self):
-        with pytest.raises(ValueError, match="symbols"):
-            EngineConfig(symbols=[])
-
-    def test_unsupported_timeframe_rejected(self):
-        with pytest.raises(ValueError, match="timeframe"):
-            EngineConfig(symbols=["AAPL"], timeframe="1Week")
-
     def test_negative_cycle_interval_rejected(self):
         with pytest.raises(ValueError):
-            EngineConfig(symbols=["AAPL"], cycle_interval_seconds=0)
+            EngineConfig(cycle_interval_seconds=0)
 
     def test_max_bar_age_multiplier_must_be_above_one(self):
         with pytest.raises(ValueError):
-            EngineConfig(symbols=["AAPL"], max_bar_age_multiplier=1.0)
+            EngineConfig(max_bar_age_multiplier=1.0)
 
-    def test_bar_interval_and_max_bar_age_derive_from_timeframe(self):
-        cfg = EngineConfig(
-            symbols=["AAPL"], timeframe="1Hour", max_bar_age_multiplier=2.0
-        )
-        assert cfg.bar_interval == timedelta(hours=1)
-        assert cfg.max_bar_age == timedelta(hours=2)
+
+# ── _lookback_days helper ──────────────────────────────────────────────────
+
+
+class TestLookbackDays:
+    def test_daily_bars_accounts_for_weekends(self):
+        # 200 daily bars × 1.5 cal days/bar + 5 buffer = 305
+        assert _lookback_days(200, "1Day", config_lookback=60) == 305
+
+    def test_hourly_bars(self):
+        # 50 hourly bars × (1/6.5) + 5 ≈ 12
+        result = _lookback_days(50, "1Hour", config_lookback=5)
+        assert result == int(50 * (1.0 / 6.5)) + 5
+
+    def test_config_lookback_wins_when_larger(self):
+        # 20 daily bars × 1.5 + 5 = 35, but config says 60
+        assert _lookback_days(20, "1Day", config_lookback=60) == 60
+
+    def test_unknown_timeframe_uses_conservative_default(self):
+        # Unknown → 1.5 days/bar (same as daily)
+        assert _lookback_days(100, "5Min", config_lookback=10) == int(100 * 1.5) + 5
 
 
 # ── _process_symbol: every branch ────────────────────────────────────────────
 
 
 class TestProcessSymbol:
+    def _process(self, engine, symbol, snap):
+        """Helper: call _process_symbol with the engine's first slot."""
+        slot = engine.slots[0]
+        engine._process_symbol(symbol, snap, slot.strategy, slot.timeframe)
+
     def test_entry_signal_no_position_places_order(self, engine_factory):
         engine, broker = engine_factory(entries=[False] * 59 + [True])
         snap = _snapshot()
         engine._session_start_equity = snap.account.equity
-        engine._process_symbol("AAPL", snap)
+        self._process(engine, "AAPL", snap)
         assert broker.place_order.call_count == 1
         decision = broker.place_order.call_args.args[0]
         assert decision.symbol == "AAPL"
@@ -267,7 +278,7 @@ class TestProcessSymbol:
         }
         snap = _snapshot(positions=positions)
         engine._session_start_equity = snap.account.equity
-        engine._process_symbol("AAPL", snap)
+        self._process(engine, "AAPL", snap)
         # Risk would reject DUPLICATE_POSITION → no place_order.
         broker.place_order.assert_not_called()
         broker.close_position.assert_not_called()
@@ -277,7 +288,7 @@ class TestProcessSymbol:
         positions = {"AAPL": Position("AAPL", 10, 100.0, 1010.0)}
         snap = _snapshot(positions=positions)
         engine._session_start_equity = snap.account.equity
-        engine._process_symbol("AAPL", snap)
+        self._process(engine, "AAPL", snap)
         broker.close_position.assert_called_once_with("AAPL")
         broker.place_order.assert_not_called()
 
@@ -285,7 +296,7 @@ class TestProcessSymbol:
         engine, broker = engine_factory(exits=[False] * 59 + [True])
         snap = _snapshot()
         engine._session_start_equity = snap.account.equity
-        engine._process_symbol("AAPL", snap)
+        self._process(engine, "AAPL", snap)
         broker.close_position.assert_not_called()
         broker.place_order.assert_not_called()
 
@@ -293,7 +304,7 @@ class TestProcessSymbol:
         engine, broker = engine_factory()
         snap = _snapshot()
         engine._session_start_equity = snap.account.equity
-        engine._process_symbol("AAPL", snap)
+        self._process(engine, "AAPL", snap)
         broker.place_order.assert_not_called()
         broker.close_position.assert_not_called()
 
@@ -304,7 +315,7 @@ class TestProcessSymbol:
         engine, broker = engine_factory(entries=[False] * 59 + [True])
         snap = _snapshot()
         engine._session_start_equity = snap.account.equity
-        engine._process_symbol("AAPL", snap)
+        self._process(engine, "AAPL", snap)
         broker.place_order.assert_not_called()
 
     def test_fetch_failure_caught_no_crash(self, engine_factory, patch_fetch):
@@ -313,7 +324,7 @@ class TestProcessSymbol:
         snap = _snapshot()
         engine._session_start_equity = snap.account.equity
         # Should not raise.
-        engine._process_symbol("AAPL", snap)
+        self._process(engine, "AAPL", snap)
         broker.place_order.assert_not_called()
 
     def test_pending_close_order_blocks_redundant_close(self, engine_factory):
@@ -321,7 +332,7 @@ class TestProcessSymbol:
         positions = {"AAPL": Position("AAPL", 10, 100.0, 1010.0)}
         snap = _snapshot(positions=positions, open_orders=[_open_sell_order("AAPL")])
         engine._session_start_equity = snap.account.equity
-        engine._process_symbol("AAPL", snap)
+        self._process(engine, "AAPL", snap)
         broker.close_position.assert_not_called()
 
 
@@ -355,20 +366,19 @@ class TestRunOneCycle:
     def test_one_bad_symbol_does_not_abort_cycle(
         self, engine_factory, patch_fetch
     ):
-        # Multi-symbol config; first symbol's fetch raises, second succeeds.
+        # Multi-symbol slot; first symbol's fetch raises, second succeeds.
         engine, broker = engine_factory(
             entries=[False] * 59 + [True],
-            config_overrides={"symbols": ["BAD", "AAPL"]},
         )
+        # Widen the slot's symbol list to include a bad symbol.
+        engine.slots[0].symbols = ["BAD", "AAPL"]
         engine._session_start_equity = 100_000.0
         engine._cycle_count = 1
 
         # First call raises, then we let it succeed.
         original = patch_fetch["df"]
-        call_count = {"n": 0}
 
         def _fetch_with_first_bad(symbol, start, end, timeframe="1Day"):
-            call_count["n"] += 1
             if symbol == "BAD":
                 raise RuntimeError("fetch boom")
             return original, SimpleNamespace(api_calls=0)
@@ -451,9 +461,252 @@ class TestSlippageRecording:
         )
         snap = _snapshot()
         engine._session_start_equity = snap.account.equity
-        engine._process_symbol("AAPL", snap)
+        slot = engine.slots[0]
+        engine._process_symbol("AAPL", snap, slot.strategy, slot.timeframe)
         # Exactly one slippage sample fed to risk.
         assert len(engine.risk._slippage_samples) == 1
         modeled_bps, realized_bps = engine.risk._slippage_samples[0]
         assert modeled_bps == 0.0
         assert realized_bps == pytest.approx(0.20 / modeled_close * 10_000, rel=1e-3)
+
+
+# ── Multi-slot ──────────────────────────────────────────────────────────────
+
+
+class TestMultiSlot:
+    def test_multi_slot_processes_all_slots(self, patch_fetch):
+        """Two slots with different strategies and symbols — both fire."""
+        from strategies.base import StrategySlot
+
+        broker = MagicMock()
+        broker.sync_with_broker.return_value = _snapshot()
+        broker.place_order.return_value = _filled_result("AAPL", 1, 100.5)
+        broker.close_position.return_value = _filled_result("AAPL", 1, 100.0)
+        broker.get_open_orders.return_value = []
+        broker._with_retry.side_effect = lambda fn, **_: fn()
+        broker._api.get_clock.return_value = SimpleNamespace(is_open=True)
+
+        strat_a = FakeStrategy(entries=[False] * 59 + [True], exits=[False])
+        strat_b = FakeStrategy(entries=[False] * 59 + [True], exits=[False])
+        strat_b.name = "fake_strategy_b"
+
+        slots = [
+            StrategySlot(strategy=strat_a, symbols=["AAPL"]),
+            StrategySlot(strategy=strat_b, symbols=["MSFT"]),
+        ]
+
+        risk = RiskManager(
+            max_position_pct=0.02,
+            max_open_positions=5,
+            max_gross_exposure_pct=0.50,
+            atr_stop_multiplier=2.0,
+            max_daily_loss_pct=0.05,
+            hard_dollar_loss_cap=1_000_000.0,
+            loss_streak_threshold=10,
+            broker_error_threshold=10,
+        )
+
+        config = EngineConfig(
+            cycle_interval_seconds=0.01,
+            max_bar_age_multiplier=10.0,
+            market_hours_only=False,
+            cancel_orders_on_shutdown=False,
+            atr_length=14,
+        )
+
+        engine = TradingEngine(
+            slots=slots,
+            risk=risk,
+            broker=broker,
+            config=config,
+            clock=lambda: T0,
+        )
+        engine.start(max_cycles=1)
+        # Both slots should have placed orders.
+        assert broker.place_order.call_count == 2
+
+    def test_legacy_single_strategy_api_still_works(self, patch_fetch):
+        """Passing strategy= (no slots) still works via backward compat."""
+        broker = MagicMock()
+        broker.sync_with_broker.return_value = _snapshot()
+        broker.place_order.return_value = _filled_result("AAPL", 1, 100.5)
+        broker.get_open_orders.return_value = []
+        broker._with_retry.side_effect = lambda fn, **_: fn()
+        broker._api.get_clock.return_value = SimpleNamespace(is_open=True)
+
+        strategy = FakeStrategy(entries=[False], exits=[False])
+        config = EngineConfig(
+            cycle_interval_seconds=0.01,
+            max_bar_age_multiplier=10.0,
+            market_hours_only=False,
+            cancel_orders_on_shutdown=False,
+        )
+        engine = TradingEngine(
+            strategy=strategy,
+            symbols=["AAPL"],
+            risk=RiskManager(),
+            broker=broker,
+            config=config,
+            clock=lambda: T0,
+        )
+        assert len(engine.slots) == 1
+        assert engine.slots[0].strategy is strategy
+        assert engine.slots[0].symbols == ["AAPL"]
+
+    def test_no_strategy_no_slots_raises(self):
+        """Must provide either strategy or slots."""
+        with pytest.raises(ValueError, match="slots.*strategy"):
+            TradingEngine(
+                risk=RiskManager(),
+                broker=MagicMock(),
+            )
+
+
+# ── Position ownership ────────────────────────────────────────────────────
+
+
+class TestPositionOwnership:
+    """Verify that exit signals only close positions owned by the same strategy."""
+
+    def test_exit_ignored_when_position_owned_by_different_strategy(
+        self, engine_factory
+    ):
+        """Strategy B's exit should not close Strategy A's position."""
+        engine, broker = engine_factory(exits=[False] * 59 + [True])
+        positions = {"AAPL": Position("AAPL", 10, 100.0, 1010.0)}
+        snap = _snapshot(positions=positions)
+        engine._session_start_equity = snap.account.equity
+
+        # Mark AAPL as owned by a different strategy.
+        engine._position_owners["AAPL"] = "other_strategy"
+
+        slot = engine.slots[0]
+        engine._process_symbol("AAPL", snap, slot.strategy, slot.timeframe)
+        broker.close_position.assert_not_called()
+
+    def test_exit_allowed_when_position_owned_by_same_strategy(
+        self, engine_factory
+    ):
+        """Strategy's own exit closes its own position normally."""
+        engine, broker = engine_factory(exits=[False] * 59 + [True])
+        positions = {"AAPL": Position("AAPL", 10, 100.0, 1010.0)}
+        snap = _snapshot(positions=positions)
+        engine._session_start_equity = snap.account.equity
+
+        # Mark AAPL as owned by this strategy.
+        engine._position_owners["AAPL"] = "fake_strategy"
+
+        slot = engine.slots[0]
+        engine._process_symbol("AAPL", snap, slot.strategy, slot.timeframe)
+        broker.close_position.assert_called_once_with("AAPL")
+        # Ownership cleared after close.
+        assert "AAPL" not in engine._position_owners
+
+    def test_exit_allowed_when_no_owner_recorded(self, engine_factory):
+        """Pre-existing positions (no recorded owner) can be closed by anyone."""
+        engine, broker = engine_factory(exits=[False] * 59 + [True])
+        positions = {"AAPL": Position("AAPL", 10, 100.0, 1010.0)}
+        snap = _snapshot(positions=positions)
+        engine._session_start_equity = snap.account.equity
+
+        # No ownership recorded — should still allow close.
+        slot = engine.slots[0]
+        engine._process_symbol("AAPL", snap, slot.strategy, slot.timeframe)
+        broker.close_position.assert_called_once_with("AAPL")
+
+    def test_entry_registers_ownership(self, engine_factory):
+        """A successful entry fill records the strategy as position owner."""
+        engine, broker = engine_factory(entries=[False] * 59 + [True])
+        snap = _snapshot()
+        engine._session_start_equity = snap.account.equity
+
+        slot = engine.slots[0]
+        engine._process_symbol("AAPL", snap, slot.strategy, slot.timeframe)
+        assert broker.place_order.call_count == 1
+        assert engine._position_owners["AAPL"] == "fake_strategy"
+
+    def test_startup_seeds_ownership_from_broker(self, engine_factory):
+        """On start(), existing broker positions are assigned to matching slots."""
+        positions = {"AAPL": Position("AAPL", 10, 100.0, 1010.0)}
+        engine, broker = engine_factory(snapshot=_snapshot(positions=positions))
+        engine.start(max_cycles=1)
+        assert engine._position_owners["AAPL"] == "fake_strategy"
+
+
+# ── Scanner cadence ────────────────────────────────────────────────────────
+
+
+class TestScannerCadence:
+    def test_scanner_runs_on_first_call(self):
+        """Scanner fires immediately on the first active_symbols() call."""
+        from strategies.base import Scanner, StrategySlot
+
+        class CountingScanner(Scanner):
+            def __init__(self):
+                self.call_count = 0
+
+            def scan(self) -> list[str]:
+                self.call_count += 1
+                return ["AAPL"]
+
+        scanner = CountingScanner()
+        slot = StrategySlot(
+            strategy=FakeStrategy(entries=[False], exits=[False]),
+            scanner=scanner,
+            scan_interval_seconds=3600,
+        )
+        result = slot.active_symbols()
+        assert result == ["AAPL"]
+        assert scanner.call_count == 1
+
+    def test_scanner_throttled_by_interval(self):
+        """Scanner does not fire again before scan_interval_seconds elapse."""
+        from strategies.base import Scanner, StrategySlot
+
+        class CountingScanner(Scanner):
+            def __init__(self):
+                self.call_count = 0
+
+            def scan(self) -> list[str]:
+                self.call_count += 1
+                return ["AAPL", "MSFT"]
+
+        scanner = CountingScanner()
+        slot = StrategySlot(
+            strategy=FakeStrategy(entries=[False], exits=[False]),
+            scanner=scanner,
+            scan_interval_seconds=3600,  # 1 hour
+        )
+        slot.active_symbols()
+        assert scanner.call_count == 1
+
+        # Second call within the interval — should return cached symbols.
+        result = slot.active_symbols()
+        assert result == ["AAPL", "MSFT"]
+        assert scanner.call_count == 1  # still 1
+
+    def test_scanner_fires_after_interval_elapses(self):
+        """Scanner fires again once enough time has passed."""
+        import time as _time
+        from strategies.base import Scanner, StrategySlot
+
+        class CountingScanner(Scanner):
+            def __init__(self):
+                self.call_count = 0
+
+            def scan(self) -> list[str]:
+                self.call_count += 1
+                return ["AAPL"]
+
+        scanner = CountingScanner()
+        slot = StrategySlot(
+            strategy=FakeStrategy(entries=[False], exits=[False]),
+            scanner=scanner,
+            scan_interval_seconds=0.05,  # 50ms
+        )
+        slot.active_symbols()
+        assert scanner.call_count == 1
+
+        _time.sleep(0.06)
+        slot.active_symbols()
+        assert scanner.call_count == 2

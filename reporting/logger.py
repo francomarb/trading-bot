@@ -1,5 +1,5 @@
 """
-Trade logging and structured JSON sink (Phase 9).
+Trade logging and structured JSON sink (Phase 9 → migrated to SQLite in Step 5).
 
 Two responsibilities:
 
@@ -7,25 +7,25 @@ Two responsibilities:
    alongside the human-readable console output. Every log line becomes a
    machine-parseable record for downstream monitoring.
 
-2. **TradeLogger** — appends a row to the trade CSV after every fill. The
-   CSV is the append-only audit trail of every order the bot placed, with
-   slippage data baked in.
+2. **TradeLogger** — inserts a row to the SQLite trades table after every
+   fill. The database is the append-only audit trail of every order the bot
+   placed, with slippage data baked in.
 
 Design principles:
-  - The CSV schema is fixed at write time; reads happen in `reporting/pnl.py`
-    and in operator tools — never in the hot path.
-  - All writes are append-only. We never rewrite the file.
-  - `ensure_dirs` is called lazily on first write, not at import time, so
+  - The schema is fixed at table-creation time; reads happen in
+    `reporting/pnl.py`, `backtest/reconcile.py`, and in operator tools —
+    never in the hot path.
+  - All writes are append-only (INSERT). We never UPDATE or DELETE rows.
+  - `_ensure_db` is called lazily on first write, not at import time, so
     tests that never write don't need the filesystem.
 """
 
 from __future__ import annotations
 
-import csv
 import os
+import sqlite3
 from dataclasses import dataclass
 from datetime import datetime, timezone
-from pathlib import Path
 
 from loguru import logger
 
@@ -52,9 +52,9 @@ def install_json_sink(path: str | None = None) -> int:
     return sink_id
 
 
-# ── Trade CSV ───────────────────────────────────────────────────────────────
+# ── Schema ──────────────────────────────────────────────────────────────────
 
-TRADE_CSV_COLUMNS = [
+TRADE_COLUMNS = [
     "timestamp",
     "symbol",
     "side",
@@ -73,10 +73,39 @@ TRADE_CSV_COLUMNS = [
     "filled_qty",
 ]
 
+# Keep the old name as an alias for backwards compatibility with tests
+# that import TRADE_CSV_COLUMNS.
+TRADE_CSV_COLUMNS = TRADE_COLUMNS
+
+_CREATE_TABLE_SQL = """
+CREATE TABLE IF NOT EXISTS trades (
+    id                    INTEGER PRIMARY KEY AUTOINCREMENT,
+    timestamp             TEXT    NOT NULL,
+    symbol                TEXT    NOT NULL,
+    side                  TEXT    NOT NULL,
+    qty                   REAL    NOT NULL,
+    avg_fill_price        REAL,
+    order_id              TEXT,
+    strategy              TEXT    NOT NULL,
+    reason                TEXT    NOT NULL,
+    stop_price            REAL,
+    entry_reference_price REAL,
+    modeled_slippage_bps  REAL,
+    realized_slippage_bps REAL,
+    order_type            TEXT,
+    status                TEXT    NOT NULL,
+    requested_qty         REAL,
+    filled_qty            REAL
+);
+"""
+
+
+# ── Trade record ────────────────────────────────────────────────────────────
+
 
 @dataclass(frozen=True)
 class TradeRecord:
-    """One row in the trade CSV — built from a RiskDecision + OrderResult."""
+    """One row in the trades table — built from a RiskDecision + OrderResult."""
 
     timestamp: str
     symbol: str
@@ -96,13 +125,16 @@ class TradeRecord:
     filled_qty: int
 
     def as_dict(self) -> dict:
-        """Column-ordered dict for csv.DictWriter."""
-        return {col: getattr(self, col) for col in TRADE_CSV_COLUMNS}
+        """Column-ordered dict (same interface as before migration)."""
+        return {col: getattr(self, col) for col in TRADE_COLUMNS}
+
+
+# ── TradeLogger ─────────────────────────────────────────────────────────────
 
 
 class TradeLogger:
     """
-    Appends trade records to a CSV file.
+    Appends trade records to a SQLite database.
 
     Usage (from engine):
         trade_logger = TradeLogger()
@@ -111,19 +143,24 @@ class TradeLogger:
     """
 
     def __init__(self, path: str | None = None) -> None:
-        self._path = path or settings.TRADE_LOG_CSV
-        self._initialized = False
+        self._path = path or settings.TRADE_LOG_DB
+        self._conn: sqlite3.Connection | None = None
 
-    def _ensure_file(self) -> None:
-        """Create the CSV with a header row if it doesn't exist yet."""
-        if self._initialized:
-            return
-        os.makedirs(os.path.dirname(self._path), exist_ok=True)
-        if not os.path.exists(self._path):
-            with open(self._path, "w", newline="") as f:
-                writer = csv.DictWriter(f, fieldnames=TRADE_CSV_COLUMNS)
-                writer.writeheader()
-        self._initialized = True
+    def _ensure_db(self) -> sqlite3.Connection:
+        """Create the database and table if they don't exist yet."""
+        if self._conn is not None:
+            return self._conn
+        os.makedirs(os.path.dirname(self._path) or ".", exist_ok=True)
+        self._conn = sqlite3.connect(self._path)
+        self._conn.execute(_CREATE_TABLE_SQL)
+        self._conn.commit()
+        return self._conn
+
+    def close(self) -> None:
+        """Close the database connection."""
+        if self._conn is not None:
+            self._conn.close()
+            self._conn = None
 
     def build_record(
         self,
@@ -207,11 +244,16 @@ class TradeLogger:
         )
 
     def log(self, record: TradeRecord) -> None:
-        """Append one trade record to the CSV."""
-        self._ensure_file()
-        with open(self._path, "a", newline="") as f:
-            writer = csv.DictWriter(f, fieldnames=TRADE_CSV_COLUMNS)
-            writer.writerow(record.as_dict())
+        """Insert one trade record into the database."""
+        conn = self._ensure_db()
+        d = record.as_dict()
+        columns = ", ".join(d.keys())
+        placeholders = ", ".join(["?"] * len(d))
+        conn.execute(
+            f"INSERT INTO trades ({columns}) VALUES ({placeholders})",
+            list(d.values()),
+        )
+        conn.commit()
         logger.info(
             f"trade logged: {record.side} {record.qty} {record.symbol} "
             f"@ ${record.avg_fill_price} [{record.strategy}] "
@@ -219,8 +261,42 @@ class TradeLogger:
         )
 
     def read_all(self) -> list[dict]:
-        """Read all trade records from the CSV. For reporting, not hot path."""
+        """Read all trade records from the database. For reporting, not hot path."""
         if not os.path.exists(self._path):
             return []
-        with open(self._path, newline="") as f:
-            return list(csv.DictReader(f))
+        conn = self._ensure_db()
+        conn.row_factory = sqlite3.Row
+        cursor = conn.execute(
+            f"SELECT {', '.join(TRADE_COLUMNS)} FROM trades ORDER BY id"
+        )
+        return [dict(row) for row in cursor.fetchall()]
+
+    def read_trades_in_range(
+        self, start_date: str, end_date: str
+    ) -> list[dict]:
+        """Read trades whose timestamp falls within [start_date, end_date] (date prefix match)."""
+        if not os.path.exists(self._path):
+            return []
+        conn = self._ensure_db()
+        conn.row_factory = sqlite3.Row
+        cursor = conn.execute(
+            f"SELECT {', '.join(TRADE_COLUMNS)} FROM trades "
+            "WHERE substr(timestamp, 1, 10) >= ? AND substr(timestamp, 1, 10) <= ? "
+            "ORDER BY id",
+            (start_date, end_date),
+        )
+        return [dict(row) for row in cursor.fetchall()]
+
+    def read_recent(self, last_n: int) -> list[dict]:
+        """Read the last N trade records."""
+        if not os.path.exists(self._path):
+            return []
+        conn = self._ensure_db()
+        conn.row_factory = sqlite3.Row
+        cursor = conn.execute(
+            f"SELECT {', '.join(TRADE_COLUMNS)} FROM trades ORDER BY id DESC LIMIT ?",
+            (last_n,),
+        )
+        rows = [dict(row) for row in cursor.fetchall()]
+        rows.reverse()  # Return in chronological order
+        return rows

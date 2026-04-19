@@ -20,7 +20,7 @@ import math
 import pandas as pd
 import pytest
 
-from indicators.technicals import add_atr, add_ema, add_sma
+from indicators.technicals import add_atr, add_ema, add_rsi, add_sma
 
 
 # ── Helpers ──────────────────────────────────────────────────────────────────
@@ -251,6 +251,104 @@ class TestATR:
             add_atr(df, 0)
 
 
+# ── RSI ──────────────────────────────────────────────────────────────────────
+
+
+class TestRSI:
+    def test_basic_values_n3(self):
+        """
+        Hand-worked example, length=3.
+
+        closes: 44, 44.34, 44.09, 43.61, 44.33, 44.83, 45.10
+        changes:    +0.34, -0.25, -0.48, +0.72, +0.50, +0.27
+
+        First 3 changes (indices 1-3): +0.34, -0.25, -0.48
+          avg_gain = (0.34 + 0 + 0) / 3 = 0.1133...
+          avg_loss = (0 + 0.25 + 0.48) / 3 = 0.2433...
+          RS = 0.1133 / 0.2433 = 0.46575...
+          RSI[3] = 100 - 100 / (1 + 0.46575) = 31.81...
+
+        idx 4: change = +0.72 → gain=0.72, loss=0
+          avg_gain = (0.1133 * 2 + 0.72) / 3 = 0.3155...
+          avg_loss = (0.2433 * 2 + 0.0) / 3 = 0.1622...
+          RS = 0.3155 / 0.1622 = 1.9452...
+          RSI[4] = 100 - 100 / (1 + 1.9452) = 66.05...
+        """
+        closes = [44, 44.34, 44.09, 43.61, 44.33, 44.83, 45.10]
+        df = _close_series(closes)
+        result = add_rsi(df, 3)
+
+        rsi = result["rsi_3"].tolist()
+        assert all(math.isnan(v) for v in rsi[:3]), "first 3 values must be NaN"
+
+        avg_gain_0 = 0.34 / 3
+        avg_loss_0 = (0.25 + 0.48) / 3
+        rs_0 = avg_gain_0 / avg_loss_0
+        expected_3 = 100 - 100 / (1 + rs_0)
+        assert abs(rsi[3] - expected_3) < 1e-6
+
+        avg_gain_1 = (avg_gain_0 * 2 + 0.72) / 3
+        avg_loss_1 = (avg_loss_0 * 2 + 0.0) / 3
+        rs_1 = avg_gain_1 / avg_loss_1
+        expected_4 = 100 - 100 / (1 + rs_1)
+        assert abs(rsi[4] - expected_4) < 1e-6
+
+    def test_constant_prices_yield_nan_then_50(self):
+        """When all prices are the same, gains=losses=0; RSI should be 100 (all-gains edge case)."""
+        # Actually: avg_gain=0 and avg_loss=0 → division by zero.
+        # Convention: if avg_loss=0 → RSI=100.
+        df = _close_series([50.0] * 10)
+        result = add_rsi(df, 3)
+        rsi = result["rsi_3"].tolist()
+        assert all(math.isnan(v) for v in rsi[:3])
+        # avg_gain=0, avg_loss=0 → RSI=100
+        assert rsi[3] == 100.0
+
+    def test_monotonic_up_yields_100(self):
+        df = _close_series(list(range(1, 20)))
+        result = add_rsi(df, 5)
+        rsi_vals = result["rsi_5"].dropna().tolist()
+        assert all(v == 100.0 for v in rsi_vals), "pure uptrend → RSI=100"
+
+    def test_monotonic_down_yields_0(self):
+        df = _close_series(list(range(20, 0, -1)))
+        result = add_rsi(df, 5)
+        rsi_vals = result["rsi_5"].dropna().tolist()
+        assert all(v == 0.0 for v in rsi_vals), "pure downtrend → RSI=0"
+
+    def test_rsi_bounded_0_100(self):
+        closes = [10, 12, 9, 14, 8, 15, 7, 16, 9, 13, 11, 10, 15, 8, 12]
+        df = _close_series(closes)
+        result = add_rsi(df, 5)
+        rsi_vals = result["rsi_5"].dropna().tolist()
+        assert all(0 <= v <= 100 for v in rsi_vals)
+
+    def test_length_longer_than_data_gives_all_nan(self):
+        df = _close_series([10, 11, 12])
+        result = add_rsi(df, 5)
+        assert result["rsi_5"].isna().all()
+
+    def test_input_not_mutated(self):
+        df = _close_series([10, 11, 12, 13, 14, 15])
+        add_rsi(df, 3)
+        assert "rsi_3" not in df.columns
+
+    def test_default_length_is_14(self):
+        df = _close_series(list(range(1, 25)))
+        result = add_rsi(df)
+        assert "rsi_14" in result.columns
+
+    def test_missing_source_column_raises(self):
+        df = pd.DataFrame({"open": [1, 2, 3]})
+        with pytest.raises(ValueError, match="missing required columns"):
+            add_rsi(df, 2)
+
+    def test_invalid_length_raises(self):
+        df = _close_series([1, 2, 3])
+        with pytest.raises(ValueError, match="positive int"):
+            add_rsi(df, 0)
+
+
 # ── Cross-cutting: indicators stack on a single DataFrame ────────────────────
 
 
@@ -267,8 +365,9 @@ class TestCombined:
         df = add_sma(df, 5)
         df = add_ema(df, 3)
         df = add_atr(df, 3)
+        df = add_rsi(df, 3)
 
-        for col in ["sma_3", "sma_5", "ema_3", "atr_3"]:
+        for col in ["sma_3", "sma_5", "ema_3", "atr_3", "rsi_3"]:
             assert col in df.columns
 
         # Original columns preserved.

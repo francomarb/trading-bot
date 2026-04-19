@@ -1,7 +1,7 @@
 """
 P&L tracking and reporting (Phase 9).
 
-`PnLTracker` reads the trade CSV produced by `TradeLogger` and computes:
+`PnLTracker` reads the trade database produced by `TradeLogger` and computes:
 
   1. **Daily P&L summary** — realized + unrealized, trade count, largest
      win/loss, max intraday drawdown. Written as a markdown file per day.
@@ -18,7 +18,7 @@ P&L tracking and reporting (Phase 9).
      weekly digest.
 
 Design principles:
-  - All computation is from the trade CSV — single source of truth.
+  - All computation is from the trade database — single source of truth.
   - Reports are markdown files, human-readable, git-friendly.
   - No external dependencies beyond pandas (already in stack).
 """
@@ -94,7 +94,7 @@ class DailySummary:
 
 class PnLTracker:
     """
-    Reads the trade CSV and computes P&L reports.
+    Reads the trade database and computes P&L reports.
 
     In-memory state tracks intraday P&L for the running drawdown
     calculation. Persisted reports are markdown files.
@@ -105,8 +105,12 @@ class PnLTracker:
         trade_csv_path: str | None = None,
         daily_pnl_dir: str | None = None,
         weekly_report_dir: str | None = None,
+        *,
+        trade_logger: "TradeLogger | None" = None,
     ) -> None:
-        self._trade_csv = trade_csv_path or settings.TRADE_LOG_CSV
+        from reporting.logger import TradeLogger
+
+        self._trade_logger = trade_logger or TradeLogger(path=trade_csv_path)
         self._daily_dir = daily_pnl_dir or settings.DAILY_PNL_DIR
         self._weekly_dir = weekly_report_dir or settings.WEEKLY_REPORT_DIR
 
@@ -192,7 +196,7 @@ class PnLTracker:
         largest_win = max(all_pnls) if all_pnls else 0.0
         largest_loss = min(all_pnls) if all_pnls else 0.0
 
-        # Slippage from CSV (today's rows).
+        # Slippage from database (today's rows).
         slip_mean, slip_max = self._slippage_stats_for_day(day)
 
         # Enrich strategy stats with slippage.
@@ -354,11 +358,10 @@ class PnLTracker:
 
     def slippage_report(self, last_n: int = 50) -> dict:
         """
-        Rolling slippage stats from the trade CSV. Returns a dict with
+        Rolling slippage stats from the trade database. Returns a dict with
         mean/max/count for the last N fills.
         """
-        trades = self._read_trades()
-        recent = trades[-last_n:] if trades else []
+        recent = self._trade_logger.read_recent(last_n)
         if not recent:
             return {"count": 0, "mean_bps": 0.0, "max_bps": 0.0}
 
@@ -378,22 +381,11 @@ class PnLTracker:
             "max_bps": round(max(slips), 2),
         }
 
-    # ── CSV helpers ─────────────────────────────────────────────────────
-
-    def _read_trades(self) -> list[dict]:
-        if not os.path.exists(self._trade_csv):
-            return []
-        with open(self._trade_csv, newline="") as f:
-            return list(csv.DictReader(f))
+    # ── Database helpers ────────────────────────────────────────────────
 
     def _trades_in_range(self, start: str, end: str) -> list[dict]:
-        """Filter trades whose timestamp falls within [start, end] (date prefix match)."""
-        trades = self._read_trades()
-        return [
-            t
-            for t in trades
-            if start <= t.get("timestamp", "")[:10] <= end
-        ]
+        """Read trades whose timestamp falls within [start, end]."""
+        return self._trade_logger.read_trades_in_range(start, end)
 
     def _slippage_stats_for_day(self, day: str) -> tuple[float, float]:
         """Mean and max realized slippage for a given day."""
@@ -425,7 +417,3 @@ class PnLTracker:
             for name, vs in by_strat.items()
             if vs
         }
-
-
-# Need csv for _read_trades
-import csv  # noqa: E402 — grouped with stdlib but placed after class for readability

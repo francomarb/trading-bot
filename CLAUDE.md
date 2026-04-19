@@ -18,37 +18,59 @@ A Python-based algorithmic trading bot built incrementally, starting with paper 
 | Language | Python 3.12 |
 | Broker / Exchange | Alpaca Markets (paper trading → live) |
 | Data Manipulation | pandas |
-| Technical Indicators | pandas-ta |
+| Technical Indicators | Hand-rolled (SMA, EMA, ATR, RSI in `indicators/technicals.py`) |
 | Backtesting | vectorbt |
-| API Client | alpaca-trade-api (legacy SDK, v3.2.0) |
+| API Client | alpaca-py (official SDK) |
+| Trade Logging | sqlite3 (`data/trades.db`) |
 | Environment Config | python-dotenv (loaded from `config/.env`) |
-| Scheduling | APScheduler or cron |
 | Logging | loguru (rotating file + console sinks) |
 
 ---
 
-## Project Structure (Target)
+## Project Structure
 
 ```
 trading-bot/
 ├── CLAUDE.md                  # This file
+├── docs/
+│   └── architecture.md        # Architecture guide and go/no-go framework
 ├── PLAN.md                    # Phased build plan and progress tracker
 ├── requirements.txt           # Pinned dependencies
-├── phase1_connect.py          # Phase 1 Alpaca connectivity smoke test
-├── main.py                    # Entry point (wires engine together)
+├── main.py                    # Entry point
+├── forward_test.py            # Launches engine for multi-week paper runs
+├── start_bot.sh               # tmux + caffeinate launcher
 ├── config/
 │   ├── .env                   # API keys (never committed)
 │   └── settings.py            # Centralized config (symbols, risk params, etc.)
 ├── data/
-│   ├── fetcher.py             # Market data retrieval via Alpaca
-│   ├── historical/            # Cached historical bars
-│   └── db/                    # Local persistence
-├── strategies/                # Strategy framework + concrete strategies
-├── backtest/                  # vectorbt backtesting harness
-├── execution/                 # Alpaca broker wrapper, order execution
-├── risk/                      # RiskManager: sizing, drawdown, stop-loss
-├── logs/                      # Rotating log files
-└── notebooks/                 # Exploratory analysis
+│   ├── fetcher.py             # Market data retrieval via StockHistoricalDataClient
+│   ├── trades.db              # SQLite trade log (gitignored)
+│   └── historical/            # Cached historical bars
+├── indicators/
+│   └── technicals.py          # SMA, EMA, ATR, RSI (hand-rolled)
+├── strategies/
+│   ├── base.py                # BaseStrategy, SignalFrame, StrategySlot, Scanner
+│   ├── sma_crossover.py       # Trend-following: SMA crossover
+│   └── rsi_reversion.py       # Mean-reversion: RSI oversold/overbought
+├── engine/
+│   └── trader.py              # TradingEngine — the live loop orchestrator
+├── backtest/
+│   ├── runner.py              # vectorbt backtesting harness
+│   └── reconcile.py           # Forward-test reconciliation (paper vs backtest)
+├── execution/
+│   └── broker.py              # AlpacaBroker — TradingClient wrapper
+├── risk/
+│   └── manager.py             # RiskManager: sizing, drawdown, stop-loss
+├── reporting/
+│   ├── logger.py              # TradeLogger — SQLite trade log
+│   ├── metrics.py             # Sharpe, drawdown, profit factor, win rate
+│   ├── pnl.py                 # PnLTracker — daily/weekly reports
+│   └── alerts.py              # AlertDispatcher with pluggable backends
+├── scripts/
+│   └── gonogo.py              # Go/no-go checker for live readiness
+├── tests/                     # 352 unit tests (pytest)
+├── logs/                      # Rotating log files (gitignored)
+└── phase*_verify.py           # Integration verification scripts per phase
 ```
 
 ---
@@ -60,7 +82,7 @@ Stored in `config/.env` (never commit this file):
 ```
 ALPACA_API_KEY=your_key_here
 ALPACA_SECRET_KEY=your_secret_here
-ALPACA_BASE_URL=https://paper-api.alpaca.markets   # paper trading
+ALPACA_PAPER=true        # Set to false for live trading
 ```
 
 ---
@@ -128,7 +150,7 @@ python phase2_verify.py
 - Paper trading base URL: `https://paper-api.alpaca.markets`
 - Live trading base URL: `https://api.alpaca.markets`
 - Data API (market data): use `feed="iex"` on a paper account (SIP requires paid subscription).
-- Use `alpaca-trade-api` (legacy SDK, v3.2.0) — this project has standardized on it. Do not migrate to `alpaca-py` without explicit user approval.
+- Use `alpaca-py` (official SDK) — this project has migrated from the deprecated `alpaca-trade-api`. Do not use `alpaca-trade-api`.
 - Orders: support market, limit, and stop-limit types.
 - Positions: always check existing positions before placing new orders.
 
@@ -136,18 +158,25 @@ python phase2_verify.py
 
 ## Current Phase
 
-**Phases 1–9 complete. Phase 9.5 infrastructure complete (awaiting run).**
-Phase 9.5 tooling verified 2026-04-16: `backtest/reconcile.py` compares paper
-fills against backtest predictions with a two-gate decision (return divergence
-≤10% + mean slippage ≤20bps). `forward_test.py` launches the engine with full
-reporting for multi-week paper runs. `get_closed_orders` on `AlpacaBroker`
-retrieves Alpaca fill history. Total 256 unit tests + 17/17 live-paper
-integration checks pass.
+**Phases 1–9 complete. Phase 9.5 infrastructure complete. Architecture
+alignment refactoring complete (2026-04-19).**
+
+Refactoring accomplished:
+- Migrated from `alpaca-trade-api` to `alpaca-py` (official SDK)
+- Paper/Live toggle via `ALPACA_PAPER` boolean
+- `BaseStrategy.required_bars()` with calendar-day conversion in engine
+- RSI indicator + `RSIReversion` strategy (mean-reversion, limit orders)
+- SQLite trade log (migrated from CSV)
+- Live metrics module (`compute_metrics` → `MetricsSnapshot`)
+- Go/no-go checker script (`scripts/gonogo.py`)
+
+Total: 352 unit tests passing + 17/17 live-paper integration checks.
 
 **Next steps:**
 1. Run `python forward_test.py` for 2–4 weeks (operational, not code).
-2. After the run, reconcile: `Reconciler(strategy, symbols, start, end).run()`.
-3. If GO → proceed to Phase 10 (Live Trading Transition).
-4. If NO-GO → return to Phase 5 for strategy re-analysis.
+2. Check readiness: `python scripts/gonogo.py` (exit 0 = GO).
+3. After the run, reconcile: `Reconciler(strategy, symbols, start, end).run()`.
+4. If GO → proceed to Phase 10 (Live Trading Transition).
+5. If NO-GO → return to Phase 5 for strategy re-analysis.
 
 See `PLAN.md` for full phase breakdown and progress tracking.

@@ -57,6 +57,10 @@ class SMACrossover(BaseStrategy):
         self.fast = fast
         self.slow = slow
 
+    def required_bars(self) -> int:
+        """Need at least `slow` bars for the slow SMA to produce a value."""
+        return self.slow
+
     def _raw_signals(self, df: pd.DataFrame) -> SignalFrame:
         if "close" not in df.columns:
             raise ValueError("SMACrossover requires a 'close' column")

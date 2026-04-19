@@ -9,6 +9,7 @@ Currently provided:
   - add_sma(df, length)   → df with 'sma_{length}'    column appended
   - add_ema(df, length)   → df with 'ema_{length}'    column appended
   - add_atr(df, length)   → df with 'atr_{length}'    column appended (Wilder/RMA)
+  - add_rsi(df, length)   → df with 'rsi_{length}'    column appended (Wilder/RMA)
 
 Design notes:
   - Every function is pure: it returns a new DataFrame. Inputs are not mutated.
@@ -30,6 +31,10 @@ References:
     TR = max(H-L, |H - C_prev|, |L - C_prev|).
     First ATR = simple mean of first N TR values; subsequent values use
     ATR_t = (ATR_{t-1} * (N-1) + TR_t) / N.
+  - RSI: Wilder's Relative Strength Index. Uses RMA (same as ATR) to smooth
+    average gains and losses. First avg_gain/avg_loss = simple mean of first
+    N changes; subsequent use RMA recurrence. RSI = 100 - 100/(1 + RS)
+    where RS = avg_gain / avg_loss.
 """
 
 from __future__ import annotations
@@ -159,4 +164,69 @@ def add_atr(df: pd.DataFrame, length: int = 14) -> pd.DataFrame:
         prev = cur
 
     out[col] = pd.Series(atr_values, index=tr.index)
+    return out
+
+
+# ── RSI ──────────────────────────────────────────────────────────────────────
+
+
+def add_rsi(
+    df: pd.DataFrame, length: int = 14, *, source: str = "close"
+) -> pd.DataFrame:
+    """
+    Append Wilder's Relative Strength Index over `length` bars.
+
+    New column: `rsi_{length}`. The first `length` values are NaN (we need
+    `length` price changes, which requires `length + 1` prices, so the first
+    usable RSI is at index `length`).
+
+    Smoothing uses Wilder's RMA (same as ATR):
+      avg_gain_t = (avg_gain_{t-1} * (length - 1) + gain_t) / length
+      avg_loss_t = (avg_loss_{t-1} * (length - 1) + loss_t) / length
+      RS = avg_gain / avg_loss
+      RSI = 100 - 100 / (1 + RS)
+
+    When avg_loss == 0, RSI = 100 (all gains). When avg_gain == 0, RSI = 0.
+    """
+    _require_length(length, "RSI")
+    _require_columns(df, [source], "RSI")
+
+    out = df.copy()
+    s = out[source]
+    col = f"rsi_{length}"
+
+    n = len(s)
+    if n < length + 1:
+        out[col] = pd.Series([float("nan")] * n, index=s.index)
+        return out
+
+    deltas = s.diff()  # deltas[0] is NaN
+
+    gains = deltas.clip(lower=0)
+    losses = (-deltas).clip(lower=0)
+
+    # Seed: simple mean of first `length` changes (indices 1..length)
+    avg_gain = float(gains.iloc[1 : length + 1].mean())
+    avg_loss = float(losses.iloc[1 : length + 1].mean())
+
+    rsi_values: list[float] = [float("nan")] * length
+
+    # RSI at index `length`
+    if avg_loss == 0:
+        rsi_values.append(100.0)
+    else:
+        rs = avg_gain / avg_loss
+        rsi_values.append(100.0 - 100.0 / (1.0 + rs))
+
+    # Remaining bars
+    for i in range(length + 1, n):
+        avg_gain = (avg_gain * (length - 1) + float(gains.iloc[i])) / length
+        avg_loss = (avg_loss * (length - 1) + float(losses.iloc[i])) / length
+        if avg_loss == 0:
+            rsi_values.append(100.0)
+        else:
+            rs = avg_gain / avg_loss
+            rsi_values.append(100.0 - 100.0 / (1.0 + rs))
+
+    out[col] = pd.Series(rsi_values, index=s.index)
     return out

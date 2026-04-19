@@ -284,8 +284,6 @@ def test_engine_with_reporting(tmp_dir: str, broker: AlpacaBroker) -> None:
     daily_dir = os.path.join(tmp_dir, "engine_daily")
 
     config = EngineConfig(
-        symbols=["AAPL"],
-        timeframe="1Day",
         cycle_interval_seconds=2,
         market_hours_only=False,
         cancel_orders_on_shutdown=True,
@@ -297,6 +295,7 @@ def test_engine_with_reporting(tmp_dir: str, broker: AlpacaBroker) -> None:
 
     engine = TradingEngine(
         strategy=NoOpStrategy(),
+        symbols=["AAPL"],
         risk=RiskManager(),
         broker=broker,
         config=config,

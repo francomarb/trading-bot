@@ -16,6 +16,8 @@ Non-goals (deferred to later phases):
   - Streaming / websocket data
   - Indicators (Phase 3)
   - Corporate actions beyond what Alpaca's `adjustment` flag provides
+
+SDK: alpaca-py (official, replaces deprecated alpaca-trade-api).
 """
 
 from __future__ import annotations
@@ -28,12 +30,15 @@ from pathlib import Path
 from typing import Iterable
 
 import pandas as pd
-import alpaca_trade_api as tradeapi
-from alpaca_trade_api.rest import APIError
+from alpaca.common.exceptions import APIError
+from alpaca.data.enums import Adjustment, DataFeed
+from alpaca.data.historical import StockHistoricalDataClient
+from alpaca.data.requests import StockBarsRequest
+from alpaca.data.timeframe import TimeFrame
 from loguru import logger
 from requests.adapters import HTTPAdapter
 
-from config.settings import ALPACA_API_KEY, ALPACA_SECRET_KEY, ALPACA_BASE_URL
+from config.settings import ALPACA_API_KEY, ALPACA_SECRET_KEY
 
 
 # ── Paths & constants ────────────────────────────────────────────────────────
@@ -43,11 +48,25 @@ CACHE_DIR.mkdir(parents=True, exist_ok=True)
 
 OHLCV_COLS = ["open", "high", "low", "close", "volume"]
 
-# Timeframe string → Alpaca TimeFrame object + a pandas offset for gap math.
-_TIMEFRAME_MAP: dict[str, tuple[tradeapi.TimeFrame, pd.Timedelta]] = {
-    "1Day": (tradeapi.TimeFrame.Day, pd.Timedelta(days=1)),
-    "1Hour": (tradeapi.TimeFrame.Hour, pd.Timedelta(hours=1)),
-    "1Min": (tradeapi.TimeFrame.Minute, pd.Timedelta(minutes=1)),
+# Timeframe string → alpaca-py TimeFrame + pandas offset for gap math.
+_TIMEFRAME_MAP: dict[str, tuple[TimeFrame, pd.Timedelta]] = {
+    "1Day": (TimeFrame.Day, pd.Timedelta(days=1)),
+    "1Hour": (TimeFrame.Hour, pd.Timedelta(hours=1)),
+    "1Min": (TimeFrame.Minute, pd.Timedelta(minutes=1)),
+}
+
+# Adjustment string → alpaca-py enum.
+_ADJUSTMENT_MAP: dict[str, Adjustment] = {
+    "raw": Adjustment.RAW,
+    "split": Adjustment.SPLIT,
+    "dividend": Adjustment.DIVIDEND,
+    "all": Adjustment.ALL,
+}
+
+# Feed string → alpaca-py enum.
+_FEED_MAP: dict[str, DataFeed] = {
+    "iex": DataFeed.IEX,
+    "sip": DataFeed.SIP,
 }
 
 
@@ -84,7 +103,7 @@ def _install_timeout(session) -> None:
 
 # ── Client (lazy singleton) ──────────────────────────────────────────────────
 
-_client: tradeapi.REST | None = None
+_client: StockHistoricalDataClient | None = None
 
 
 def close_connections() -> None:
@@ -93,13 +112,12 @@ def close_connections() -> None:
         _client._session.close()
 
 
-def _get_client() -> tradeapi.REST:
+def _get_client() -> StockHistoricalDataClient:
     global _client
     if _client is None:
-        _client = tradeapi.REST(
-            key_id=ALPACA_API_KEY,
+        _client = StockHistoricalDataClient(
+            api_key=ALPACA_API_KEY,
             secret_key=ALPACA_SECRET_KEY,
-            base_url=ALPACA_BASE_URL,
         )
         _install_timeout(_client._session)
     return _client
@@ -254,9 +272,7 @@ def _with_retry(
         try:
             return fn()
         except APIError as e:
-            status = getattr(e, "status_code", None) or getattr(
-                getattr(e, "response", None), "status_code", None
-            )
+            status = e.status_code
             last_exc = e
             # 429 = rate limit. 5xx = transient server. Retry both.
             if status == 429 or (status is not None and 500 <= status < 600):
@@ -293,28 +309,38 @@ def _fetch_bars_api(
 ) -> pd.DataFrame:
     """Single uncached API fetch for one symbol + range."""
     tf_obj, _ = _TIMEFRAME_MAP[timeframe]
-    api = _get_client()
+    client = _get_client()
+
+    adj_enum = _ADJUSTMENT_MAP.get(adjustment, Adjustment.ALL)
+    feed_enum = _FEED_MAP.get(feed, DataFeed.IEX)
+
+    request = StockBarsRequest(
+        symbol_or_symbols=symbol,
+        timeframe=tf_obj,
+        start=start,
+        end=end,
+        adjustment=adj_enum,
+        feed=feed_enum,
+    )
 
     def _call():
-        return api.get_bars(
-            symbol,
-            tf_obj,
-            start=start.strftime("%Y-%m-%d"),
-            end=end.strftime("%Y-%m-%d"),
-            adjustment=adjustment,
-            feed=feed,
-        ).df
+        return client.get_stock_bars(request)
 
-    bars = _with_retry(_call, op_desc=f"get_bars({symbol}, {timeframe})")
+    barset = _with_retry(_call, op_desc=f"get_stock_bars({symbol}, {timeframe})")
+
+    if barset is None:
+        return pd.DataFrame()
+
+    # Convert BarSet to DataFrame.
+    bars = barset.df
 
     if bars is None or bars.empty:
         return pd.DataFrame()
 
-    # Alpaca returns a tz-aware DatetimeIndex named 'timestamp'.
-    # For multi-symbol responses it may include a 'symbol' column; we fetch
-    # per-symbol here so that won't happen, but be defensive.
-    if "symbol" in bars.columns:
-        bars = bars[bars["symbol"] == symbol].drop(columns=["symbol"])
+    # alpaca-py returns a MultiIndex (symbol, timestamp) for single-symbol
+    # requests. Drop the symbol level to get a plain DatetimeIndex.
+    if isinstance(bars.index, pd.MultiIndex):
+        bars = bars.droplevel("symbol")
 
     keep = [c for c in OHLCV_COLS if c in bars.columns]
     bars = bars[keep]

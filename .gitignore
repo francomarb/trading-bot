@@ -4,6 +4,7 @@ __pycache__/
 *.pyo
 .DS_Store
 data/db/*.db
+data/trades.db
 data/historical/
 logs/
 .env

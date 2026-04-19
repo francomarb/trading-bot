@@ -35,8 +35,9 @@ Design principles (from CLAUDE.md + PLAN.md):
 
 from __future__ import annotations
 
+import time
 from abc import ABC, abstractmethod
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from enum import Enum
 from typing import Callable
 
@@ -95,6 +96,16 @@ class BaseStrategy(ABC):
     def __init__(self, *, edge_filter: EdgeFilter | None = None) -> None:
         self._edge_filter = edge_filter
 
+    def required_bars(self) -> int:
+        """Minimum number of bars needed to generate a valid signal.
+
+        Subclasses should override this if they need more than 50 bars
+        (e.g. a strategy using a 200-day SMA needs at least 200).  The
+        engine uses this to determine how much history to fetch for each
+        strategy slot.
+        """
+        return 50
+
     # Concrete strategies implement this.
     @abstractmethod
     def _raw_signals(self, df: pd.DataFrame) -> SignalFrame:
@@ -126,3 +137,70 @@ class BaseStrategy(ABC):
             entries=(raw.entries & gate_aligned),
             exits=raw.exits,
         )
+
+
+# ── Scanner ─────────────────────────────────────────────────────────────────
+
+
+class Scanner(ABC):
+    """
+    Discovers symbols dynamically at runtime.
+
+    A StrategySlot can optionally hold a Scanner. When present, the engine
+    calls `scan()` at the start of each cycle (or on a slower cadence) to
+    refresh the slot's symbol list. This allows strategies to trade a
+    universe that changes over time — e.g. stocks near a crossover, unusual
+    volume, or sector rotation signals.
+    """
+
+    @abstractmethod
+    def scan(self) -> list[str]:
+        """Return the current list of symbols to trade."""
+
+
+# ── Strategy Slot ───────────────────────────────────────────────────────────
+
+
+@dataclass
+class StrategySlot:
+    """
+    Binds a strategy to its trading universe.
+
+    The engine holds a list of slots. Each cycle iterates over every slot,
+    running the slot's strategy against its symbols. Risk and broker are
+    shared across all slots (one account, one equity pool).
+
+    Fields:
+        strategy:  A BaseStrategy instance (e.g. SMACrossover, MeanReversion).
+        symbols:   Static list of symbols to trade. Ignored if `scanner` is set.
+        timeframe: Bar timeframe for this slot (default "1Day").
+        scanner:   Optional Scanner that refreshes `symbols` dynamically.
+        scan_interval_seconds: Minimum seconds between scanner invocations.
+            Expensive scanners (e.g. screening the entire market) should use
+            a longer interval so they don't run every engine cycle.  Defaults
+            to 0 (scan every cycle).
+    """
+
+    strategy: BaseStrategy
+    symbols: list[str] = field(default_factory=list)
+    timeframe: str = "1Day"
+    scanner: Scanner | None = None
+    scan_interval_seconds: float = 0
+
+    # Internal: monotonic timestamp of the last scanner invocation.
+    _last_scan_time: float = field(default=0.0, init=False, repr=False)
+
+    def __post_init__(self) -> None:
+        if not self.symbols and self.scanner is None:
+            raise ValueError(
+                "StrategySlot must have either symbols or a scanner"
+            )
+
+    def active_symbols(self) -> list[str]:
+        """Return the current symbol list, refreshing from scanner if due."""
+        if self.scanner is not None:
+            now = time.monotonic()
+            if now - self._last_scan_time >= self.scan_interval_seconds:
+                self.symbols = self.scanner.scan()
+                self._last_scan_time = now
+        return self.symbols

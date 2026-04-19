@@ -1,7 +1,7 @@
 """
 Forward-test reconciliation (Phase 9.5).
 
-Compares realized paper fills from the trade CSV (or Alpaca closed orders)
+Compares realized paper fills from the trade database (or Alpaca closed orders)
 against backtest-predicted fills over the same date range. Produces:
 
   1. **Per-trade divergence** — matched entry/exit pairs showing price
@@ -14,14 +14,13 @@ against backtest-predicted fills over the same date range. Produces:
 Design principles:
   - Backtest is rerun on the same bars the bot saw, with the same strategy
     and config — the comparison is apples-to-apples.
-  - The trade CSV is the paper source of truth (not Alpaca's fill history
-    directly, since the CSV includes strategy metadata).
+  - The trade database is the paper source of truth (not Alpaca's fill
+    history directly, since the database includes strategy metadata).
   - The gate is conservative: fail = go back to Phase 5, not "try harder."
 """
 
 from __future__ import annotations
 
-import csv
 import os
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
@@ -111,11 +110,13 @@ class Reconciler:
         timeframe: str = "1Day",
         history_lookback_days: int = 200,
     ) -> None:
+        from reporting.logger import TradeLogger
+
         self.strategy = strategy
         self.symbols = symbols
         self.start_date = start_date
         self.end_date = end_date
-        self._trade_csv = trade_csv_path or settings.TRADE_LOG_CSV
+        self._trade_logger = TradeLogger(path=trade_csv_path)
         self._forward_test_dir = forward_test_dir or settings.FORWARD_TEST_DIR
         self._bt_config = backtest_config or BacktestConfig()
         self._return_threshold = (
@@ -133,7 +134,7 @@ class Reconciler:
 
     def run(self) -> ReconciliationResult:
         """Execute the full reconciliation."""
-        # 1. Read paper trades from CSV.
+        # 1. Read paper trades from database.
         paper_trades = self._read_paper_trades()
         paper_fills = [
             t for t in paper_trades
@@ -288,15 +289,13 @@ class Reconciler:
     # ── Internals ───────────────────────────────────────────────────────────
 
     def _read_paper_trades(self) -> list[dict]:
-        """Read trades from CSV filtered by date range and symbols."""
-        if not os.path.exists(self._trade_csv):
-            return []
-        with open(self._trade_csv, newline="") as f:
-            all_trades = list(csv.DictReader(f))
+        """Read trades from database filtered by date range and symbols."""
+        all_trades = self._trade_logger.read_trades_in_range(
+            self.start_date, self.end_date
+        )
         return [
             t for t in all_trades
-            if self.start_date <= t.get("timestamp", "")[:10] <= self.end_date
-            and t.get("symbol", "") in self.symbols
+            if t.get("symbol", "") in self.symbols
         ]
 
     def _run_backtest_for_symbol(self, symbol: str) -> BacktestResult | None:

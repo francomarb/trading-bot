@@ -2,7 +2,7 @@
 Unit tests for execution/broker.py.
 
 The broker is offline-tested against a mock REST client that mimics the
-shape of `alpaca_trade_api.REST`. The tests pin the contract:
+shape of Alpaca's TradingClient. The tests pin the contract:
 
   - `place_order` REJECTS any non-`RiskDecision` argument (the risk gate is
     structural, not advisory).
@@ -28,7 +28,7 @@ from types import SimpleNamespace
 from unittest.mock import MagicMock
 
 import pytest
-from alpaca_trade_api.rest import APIError
+from alpaca.common.exceptions import APIError
 
 from execution.broker import (
     AlpacaBroker,
@@ -48,13 +48,21 @@ from strategies.base import OrderType
 # ── Helpers ──────────────────────────────────────────────────────────────────
 
 
-def _api_error(status_code: int, message: str = "boom") -> APIError:
+class _FakeAPIError(APIError):
+    """APIError subclass with a controllable status_code for tests."""
+
+    def __init__(self, status_code: int, message: str = "boom"):
+        super().__init__(message)
+        self._test_status = status_code
+
+    @property
+    def status_code(self):
+        return self._test_status
+
+
+def _api_error(status_code: int, message: str = "boom") -> _FakeAPIError:
     """Build an APIError with a usable .status_code property."""
-    err = APIError({"message": message, "code": status_code})
-    err._http_error = SimpleNamespace(
-        response=SimpleNamespace(status_code=status_code)
-    )
-    return err
+    return _FakeAPIError(status_code, message)
 
 
 def _decision(
@@ -144,27 +152,28 @@ class TestSubmitOrderKwargs:
     def test_market_order_uses_oto_with_stop_loss(self):
         api = MagicMock()
         api.submit_order.return_value = _alpaca_order(status="filled")
-        api.get_order.return_value = _alpaca_order(status="filled")
+        api.get_order_by_id.return_value = _alpaca_order(status="filled")
         broker = _broker_with_mock(api)
 
         result = broker.place_order(_decision(stop=95.5), poll_timeout=0.1)
 
         assert result.status is OrderStatus.FILLED
-        kwargs = api.submit_order.call_args.kwargs
-        assert kwargs["symbol"] == "AAPL"
-        assert kwargs["qty"] == 10
-        assert kwargs["side"] == "buy"
-        assert kwargs["type"] == "market"
-        assert kwargs["order_class"] == "oto"
-        assert kwargs["stop_loss"] == {"stop_price": "95.50"}
-        assert "limit_price" not in kwargs
-        assert kwargs["client_order_id"].startswith("sma_crossover-")
-        assert kwargs["time_in_force"] == "day"
+        # alpaca-py: submit_order receives a request object as first positional arg.
+        req = api.submit_order.call_args.args[0]
+        assert req.symbol == "AAPL"
+        assert req.qty == 10
+        assert req.side.value == "buy"
+        assert req.type.value == "market"
+        assert req.order_class.value == "oto"
+        assert req.stop_loss.stop_price == 95.5
+        assert not hasattr(req, "limit_price") or getattr(req, "limit_price", None) is None
+        assert req.client_order_id.startswith("sma_crossover-")
+        assert req.time_in_force.value == "day"
 
     def test_limit_order_includes_limit_price(self):
         api = MagicMock()
         api.submit_order.return_value = _alpaca_order(status="accepted")
-        api.get_order.return_value = _alpaca_order(status="accepted", filled_qty=0)
+        api.get_order_by_id.return_value = _alpaca_order(status="accepted", filled_qty=0)
         broker = _broker_with_mock(api)
 
         broker.place_order(
@@ -172,9 +181,9 @@ class TestSubmitOrderKwargs:
             poll_timeout=0.0,
             poll_interval=0.0,
         )
-        kwargs = api.submit_order.call_args.kwargs
-        assert kwargs["type"] == "limit"
-        assert kwargs["limit_price"] == "99.12"  # rounded to 2dp
+        req = api.submit_order.call_args.args[0]
+        assert req.type.value == "limit"
+        assert req.limit_price == 99.12  # rounded to 2dp
 
 
 # ── place_order: terminal-state mapping ──────────────────────────────────────
@@ -184,7 +193,7 @@ class TestPlaceOrderTerminalStates:
     def test_filled_returns_filled_with_avg_price(self):
         api = MagicMock()
         api.submit_order.return_value = _alpaca_order(status="filled")
-        api.get_order.return_value = _alpaca_order(
+        api.get_order_by_id.return_value = _alpaca_order(
             status="filled", filled_qty=10, filled_avg_price=100.42
         )
         result = _broker_with_mock(api).place_order(_decision(), poll_timeout=0.0)
@@ -204,7 +213,7 @@ class TestPlaceOrderTerminalStates:
     def test_rejected_status_after_submit(self):
         api = MagicMock()
         api.submit_order.return_value = _alpaca_order(status="accepted")
-        api.get_order.return_value = _alpaca_order(
+        api.get_order_by_id.return_value = _alpaca_order(
             status="rejected", filled_qty=0, filled_avg_price=None
         )
         result = _broker_with_mock(api).place_order(_decision(), poll_timeout=0.0)
@@ -215,7 +224,7 @@ class TestPlaceOrderTerminalStates:
     def test_canceled_status(self):
         api = MagicMock()
         api.submit_order.return_value = _alpaca_order(status="accepted")
-        api.get_order.return_value = _alpaca_order(
+        api.get_order_by_id.return_value = _alpaca_order(
             status="canceled", filled_qty=0, filled_avg_price=None
         )
         result = _broker_with_mock(api).place_order(_decision(), poll_timeout=0.0)
@@ -224,7 +233,7 @@ class TestPlaceOrderTerminalStates:
     def test_timeout_with_no_fills_returns_TIMEOUT(self):
         api = MagicMock()
         api.submit_order.return_value = _alpaca_order(status="accepted")
-        api.get_order.return_value = _alpaca_order(
+        api.get_order_by_id.return_value = _alpaca_order(
             status="accepted", filled_qty=0, filled_avg_price=None
         )
         result = _broker_with_mock(api).place_order(
@@ -236,7 +245,7 @@ class TestPlaceOrderTerminalStates:
     def test_timeout_with_partial_returns_PARTIAL(self):
         api = MagicMock()
         api.submit_order.return_value = _alpaca_order(status="accepted")
-        api.get_order.return_value = _alpaca_order(
+        api.get_order_by_id.return_value = _alpaca_order(
             status="partially_filled", filled_qty=4, filled_avg_price=100.1
         )
         result = _broker_with_mock(api).place_order(
@@ -250,7 +259,7 @@ class TestPlaceOrderTerminalStates:
         # First poll = pending, second = filled.
         api = MagicMock()
         api.submit_order.return_value = _alpaca_order(status="accepted")
-        api.get_order.side_effect = [
+        api.get_order_by_id.side_effect = [
             _alpaca_order(status="accepted", filled_qty=0, filled_avg_price=None),
             _alpaca_order(status="filled", filled_qty=10, filled_avg_price=100.5),
         ]
@@ -258,7 +267,7 @@ class TestPlaceOrderTerminalStates:
             _decision(), poll_timeout=5.0, poll_interval=0.0
         )
         assert result.status is OrderStatus.FILLED
-        assert api.get_order.call_count == 2
+        assert api.get_order_by_id.call_count == 2
 
 
 # ── cancel_order ─────────────────────────────────────────────────────────────
@@ -267,13 +276,13 @@ class TestPlaceOrderTerminalStates:
 class TestCancelOrder:
     def test_success_returns_true(self):
         api = MagicMock()
-        api.cancel_order.return_value = None
+        api.cancel_order_by_id.return_value = None
         assert _broker_with_mock(api).cancel_order("ord-1") is True
-        api.cancel_order.assert_called_once_with("ord-1")
+        api.cancel_order_by_id.assert_called_once_with("ord-1")
 
     def test_failure_returns_false_not_raises(self):
         api = MagicMock()
-        api.cancel_order.side_effect = _api_error(404, "not found")
+        api.cancel_order_by_id.side_effect = _api_error(404, "not found")
         assert _broker_with_mock(api).cancel_order("nope") is False
 
 
@@ -284,13 +293,13 @@ class TestClosePosition:
     def test_closes_existing_position_with_market(self):
         api = MagicMock()
         # get_positions called inside close_position
-        api.list_positions.return_value = [
+        api.get_all_positions.return_value = [
             SimpleNamespace(
                 symbol="AAPL", qty="10", avg_entry_price="100", market_value="1010"
             )
         ]
         api.close_position.return_value = _alpaca_order(status="accepted")
-        api.get_order.return_value = _alpaca_order(
+        api.get_order_by_id.return_value = _alpaca_order(
             status="filled", filled_qty=10, filled_avg_price=101.0
         )
         result = _broker_with_mock(api).close_position("AAPL", poll_timeout=0.0)
@@ -302,7 +311,7 @@ class TestClosePosition:
 
     def test_no_position_raises_BrokerError(self):
         api = MagicMock()
-        api.list_positions.return_value = []
+        api.get_all_positions.return_value = []
         with pytest.raises(BrokerError, match="no open position"):
             _broker_with_mock(api).close_position("AAPL")
 
@@ -311,13 +320,13 @@ class TestClosePosition:
         close as 'insufficient qty available'. Hard exits must not fail
         because of an attached stop."""
         api = MagicMock()
-        api.list_positions.return_value = [
+        api.get_all_positions.return_value = [
             SimpleNamespace(
                 symbol="AAPL", qty="10", avg_entry_price="100", market_value="1010"
             )
         ]
         # One sibling stop order on AAPL, one unrelated MSFT order.
-        api.list_orders.return_value = [
+        api.get_orders.return_value = [
             SimpleNamespace(
                 id="aapl-stop", symbol="AAPL", side="sell", qty="10",
                 type="stop", status="open", limit_price=None, stop_price="95",
@@ -329,15 +338,15 @@ class TestClosePosition:
                 submitted_at="2026-04-15T14:30:00Z",
             ),
         ]
-        api.cancel_order.return_value = None
+        api.cancel_order_by_id.return_value = None
         api.close_position.return_value = _alpaca_order(status="accepted")
-        api.get_order.return_value = _alpaca_order(
+        api.get_order_by_id.return_value = _alpaca_order(
             status="filled", filled_qty=10, filled_avg_price=101.0
         )
         result = _broker_with_mock(api).close_position("AAPL", poll_timeout=0.0)
         assert result.status is OrderStatus.FILLED
         # Only the AAPL sibling was canceled, not the unrelated MSFT order.
-        api.cancel_order.assert_called_once_with("aapl-stop")
+        api.cancel_order_by_id.assert_called_once_with("aapl-stop")
 
 
 # ── Read-side: positions + sync ──────────────────────────────────────────────
@@ -346,7 +355,7 @@ class TestClosePosition:
 class TestReadSide:
     def test_get_positions_normalises_shape(self):
         api = MagicMock()
-        api.list_positions.return_value = [
+        api.get_all_positions.return_value = [
             SimpleNamespace(
                 symbol="AAPL", qty="3", avg_entry_price="100.5", market_value="305.10"
             ),
@@ -363,12 +372,12 @@ class TestReadSide:
     def test_sync_bundles_account_positions_and_orders(self):
         api = MagicMock()
         api.get_account.return_value = SimpleNamespace(equity="100000", cash="50000")
-        api.list_positions.return_value = [
+        api.get_all_positions.return_value = [
             SimpleNamespace(
                 symbol="AAPL", qty="1", avg_entry_price="100", market_value="101"
             )
         ]
-        api.list_orders.return_value = [
+        api.get_orders.return_value = [
             SimpleNamespace(
                 id="o1", symbol="AAPL", side="buy", qty="1", type="limit",
                 status="open", limit_price="99.5", stop_price=None,
@@ -388,7 +397,7 @@ class TestReadSide:
     def test_get_account_defaults_session_start_to_current_equity(self):
         api = MagicMock()
         api.get_account.return_value = SimpleNamespace(equity="50000", cash="50000")
-        api.list_positions.return_value = []
+        api.get_all_positions.return_value = []
         acct = _broker_with_mock(api).get_account()
         assert acct.session_start_equity == acct.equity == 50_000.0
 
@@ -400,43 +409,43 @@ class TestRetry:
     def test_retries_on_429_then_succeeds(self):
         api = MagicMock()
         api.submit_order.side_effect = [_api_error(429), _alpaca_order(status="filled")]
-        api.get_order.return_value = _alpaca_order(status="filled")
+        api.get_order_by_id.return_value = _alpaca_order(status="filled")
         result = _broker_with_mock(api).place_order(_decision(), poll_timeout=0.0)
         assert result.status is OrderStatus.FILLED
         assert api.submit_order.call_count == 2
 
     def test_retries_on_503(self):
         api = MagicMock()
-        api.list_positions.side_effect = [
+        api.get_all_positions.side_effect = [
             _api_error(503),
             _api_error(502),
             [],
         ]
         positions = _broker_with_mock(api).get_positions()
         assert positions == {}
-        assert api.list_positions.call_count == 3
+        assert api.get_all_positions.call_count == 3
 
     def test_4xx_other_than_429_raises_immediately(self):
         api = MagicMock()
-        api.list_positions.side_effect = _api_error(403, "forbidden")
+        api.get_all_positions.side_effect = _api_error(403, "forbidden")
         with pytest.raises(APIError):
             _broker_with_mock(api).get_positions()
-        assert api.list_positions.call_count == 1
+        assert api.get_all_positions.call_count == 1
 
     def test_gives_up_after_max_attempts(self):
         api = MagicMock()
-        api.list_positions.side_effect = _api_error(429)
+        api.get_all_positions.side_effect = _api_error(429)
         broker = AlpacaBroker(client=api, max_attempts=2, base_delay=0.0)
         with pytest.raises(APIError):
             broker.get_positions()
-        assert api.list_positions.call_count == 2
+        assert api.get_all_positions.call_count == 2
 
     def test_network_error_retried(self):
         api = MagicMock()
-        api.list_positions.side_effect = [ConnectionError("boom"), []]
+        api.get_all_positions.side_effect = [ConnectionError("boom"), []]
         result = _broker_with_mock(api).get_positions()
         assert result == {}
-        assert api.list_positions.call_count == 2
+        assert api.get_all_positions.call_count == 2
 
 
 # ── OrderResult contract ─────────────────────────────────────────────────────

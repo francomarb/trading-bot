@@ -37,6 +37,7 @@ from reporting.alerts import AlertDispatcher
 from reporting.logger import TradeLogger, install_json_sink
 from reporting.pnl import PnLTracker
 from risk.manager import RiskManager
+from strategies.base import StrategySlot
 from strategies.sma_crossover import SMACrossover
 
 
@@ -64,10 +65,20 @@ def main() -> None:
     # JSON structured log.
     install_json_sink()
 
-    # Strategy — same params as backtest baseline.
-    strategy = SMACrossover(fast=20, slow=50)
+    # ── Strategy slots ──────────────────────────────────────────────────
+    slots = [
+        StrategySlot(
+            strategy=SMACrossover(fast=20, slow=50),
+            symbols=list(settings.WATCHLIST),
+        ),
+        # Add more slots here as new strategies are built:
+        # StrategySlot(
+        #     strategy=MeanReversion(...),
+        #     symbols=["AAPL", "MSFT"],
+        # ),
+    ]
 
-    # Risk manager with production settings.
+    # Risk manager with production settings (shared across all slots).
     risk = RiskManager()
 
     # Broker (paper).
@@ -78,10 +89,8 @@ def main() -> None:
     pnl_tracker = PnLTracker()
     alerts = AlertDispatcher()
 
-    # Engine config — production settings.
+    # Engine config (engine-level only; symbols/timeframes live on slots).
     config = EngineConfig(
-        symbols=list(settings.WATCHLIST),
-        timeframe=settings.ENGINE_TIMEFRAME,
         history_lookback_days=settings.ENGINE_HISTORY_LOOKBACK_DAYS,
         cycle_interval_seconds=settings.ENGINE_CYCLE_INTERVAL_SECONDS,
         max_bar_age_multiplier=settings.ENGINE_MAX_BAR_AGE_MULTIPLIER,
@@ -90,7 +99,7 @@ def main() -> None:
     )
 
     engine = TradingEngine(
-        strategy=strategy,
+        slots=slots,
         risk=risk,
         broker=broker,
         config=config,
@@ -99,10 +108,11 @@ def main() -> None:
         alerts=alerts,
     )
 
-    logger.info(
-        f"strategy={strategy.name}, symbols={config.symbols}, "
-        f"timeframe={config.timeframe}, cycle={config.cycle_interval_seconds}s"
+    slot_desc = ", ".join(
+        f"{s.strategy.name}({s.symbols})" for s in slots
     )
+    logger.info(f"slots: {slot_desc}")
+    logger.info(f"cycle={config.cycle_interval_seconds}s")
     logger.info("starting engine — Ctrl+C to stop")
     logger.info("after multi-week run, use backtest/reconcile.py to evaluate")
 

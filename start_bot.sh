@@ -12,7 +12,13 @@ if tmux has-session -t "$SESSION" 2>/dev/null; then
     exit 0
 fi
 
-tmux new-session -d -s "$SESSION" "source venv/bin/activate && python forward_test.py"
+CMD="source venv/bin/activate && python forward_test.py"
+if [[ "$(uname)" == "Darwin" ]]; then
+    CMD="source venv/bin/activate && caffeinate -s python forward_test.py"
+    echo "  caffeinate -s prevents idle sleep while the bot runs (macOS)."
+fi
+
+tmux new-session -d -s "$SESSION" "$CMD"
 echo "Started forward test in tmux session '$SESSION'."
 echo "  Attach:  tmux attach -t $SESSION"
 echo "  Stop:    tmux send-keys -t $SESSION C-c"

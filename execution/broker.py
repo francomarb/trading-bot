@@ -32,6 +32,8 @@ Contract guarantees
 Hard-risk exits (engine-initiated stop-outs, kill-switch liquidations) go
 through `close_position`, which always uses MARKET regardless of the
 strategy's preferred order type.
+
+SDK: alpaca-py (official, replaces deprecated alpaca-trade-api).
 """
 
 from __future__ import annotations
@@ -42,15 +44,29 @@ from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from enum import Enum
 
-import alpaca_trade_api as tradeapi
-from alpaca_trade_api.rest import APIError
+from alpaca.common.exceptions import APIError
+from alpaca.trading.client import TradingClient
+from alpaca.trading.enums import (
+    OrderClass as AlpacaOrderClass,
+    OrderSide as AlpacaOrderSide,
+    OrderStatus as AlpacaOrderStatus,
+    OrderType as AlpacaOrderType,
+    QueryOrderStatus,
+    TimeInForce,
+)
+from alpaca.trading.requests import (
+    GetOrdersRequest,
+    LimitOrderRequest,
+    MarketOrderRequest,
+    StopLossRequest,
+)
 from loguru import logger
 
 from data.fetcher import _install_timeout
 
 from config.settings import (
     ALPACA_API_KEY,
-    ALPACA_BASE_URL,
+    ALPACA_PAPER,
     ALPACA_SECRET_KEY,
 )
 from risk.manager import AccountState, Position, RiskDecision, Side
@@ -149,25 +165,25 @@ class BrokerSnapshot:
 
 class AlpacaBroker:
     """
-    Thin wrapper around `alpaca_trade_api.REST` that enforces the risk gate
+    Thin wrapper around `alpaca-py` TradingClient that enforces the risk gate
     and normalises responses into typed dataclasses.
 
-    The instance is cheap; create one per session. Tests inject a mock REST
-    client via the `client` constructor argument.
+    The instance is cheap; create one per session. Tests inject a mock client
+    via the `client` constructor argument.
     """
 
     def __init__(
         self,
         *,
-        client: tradeapi.REST | None = None,
+        client: TradingClient | None = None,
         max_attempts: int = 5,
         base_delay: float = 1.0,
         time_in_force: str = "day",
     ) -> None:
-        self._api = client or tradeapi.REST(
-            key_id=ALPACA_API_KEY,
+        self._api = client or TradingClient(
+            api_key=ALPACA_API_KEY,
             secret_key=ALPACA_SECRET_KEY,
-            base_url=ALPACA_BASE_URL,
+            paper=ALPACA_PAPER,
         )
         if client is None:
             _install_timeout(self._api._session)
@@ -189,9 +205,7 @@ class AlpacaBroker:
             try:
                 return fn()
             except APIError as e:
-                status = getattr(e, "status_code", None) or getattr(
-                    getattr(e, "response", None), "status_code", None
-                )
+                status = e.status_code
                 last_exc = e
                 if status == 429 or (status is not None and 500 <= status < 600):
                     logger.warning(
@@ -233,7 +247,7 @@ class AlpacaBroker:
 
     def get_positions(self) -> dict[str, Position]:
         """Return all open positions keyed by symbol."""
-        raw = self._with_retry(self._api.list_positions, op_desc="list_positions")
+        raw = self._with_retry(self._api.get_all_positions, op_desc="get_all_positions")
         out: dict[str, Position] = {}
         for p in raw:
             out[p.symbol] = Position(
@@ -246,9 +260,10 @@ class AlpacaBroker:
 
     def get_open_orders(self) -> list[OpenOrder]:
         """All currently-open orders, projected into `OpenOrder`."""
+        request = GetOrdersRequest(status=QueryOrderStatus.OPEN)
         raw = self._with_retry(
-            lambda: self._api.list_orders(status="open"),
-            op_desc="list_orders(open)",
+            lambda: self._api.get_orders(request),
+            op_desc="get_orders(open)",
         )
         return [self._to_open_order(o) for o in raw]
 
@@ -279,34 +294,38 @@ class AlpacaBroker:
         interface as `place_order`. Filters to status=closed (terminal),
         optionally scoped by date range and symbols.
         """
-        kwargs: dict = {"status": "closed", "limit": limit}
-        if after is not None:
-            kwargs["after"] = after.isoformat()
-        if until is not None:
-            kwargs["until"] = until.isoformat()
+        request = GetOrdersRequest(
+            status=QueryOrderStatus.CLOSED,
+            limit=limit,
+            after=after,
+            until=until,
+        )
 
         raw = self._with_retry(
-            lambda: self._api.list_orders(**kwargs),
-            op_desc="list_orders(closed)",
+            lambda: self._api.get_orders(request),
+            op_desc="get_orders(closed)",
         )
 
         results: list[OrderResult] = []
         for o in raw:
-            if symbols and o.symbol not in symbols:
+            sym = o.symbol
+            if symbols and sym not in symbols:
                 continue
-            mapped = _ALPACA_TERMINAL.get(o.status, OrderStatus.CANCELED)
-            filled = int(float(getattr(o, "filled_qty", 0) or 0))
-            avg = getattr(o, "filled_avg_price", None)
+            status_str = o.status.value if isinstance(o.status, AlpacaOrderStatus) else str(o.status)
+            mapped = _ALPACA_TERMINAL.get(status_str, OrderStatus.CANCELED)
+            filled = int(float(o.filled_qty or 0))
+            avg = o.filled_avg_price
             avg_price = float(avg) if avg is not None else None
+            side_str = o.side.value if isinstance(o.side, AlpacaOrderSide) else str(o.side)
             results.append(OrderResult(
                 status=mapped,
-                order_id=o.id,
-                symbol=o.symbol,
+                order_id=str(o.id),
+                symbol=sym,
                 requested_qty=int(float(o.qty)),
                 filled_qty=filled,
                 avg_fill_price=avg_price,
-                raw_status=o.status,
-                message=f"historical: {o.side} {o.qty} {o.symbol} @ {avg_price}",
+                raw_status=status_str,
+                message=f"historical: {side_str} {o.qty} {sym} @ {avg_price}",
             ))
         return results
 
@@ -334,24 +353,37 @@ class AlpacaBroker:
                 "Strategy signals must go through RiskManager.evaluate first."
             )
 
-        # Build kwargs. Round prices to 2dp — Alpaca rejects sub-cent prices
-        # for normal equities.
+        # Build request object.
         client_order_id = f"{decision.strategy_name}-{uuid.uuid4().hex[:10]}"
-        kwargs: dict = {
-            "symbol": decision.symbol,
-            "qty": decision.qty,
-            "side": decision.side.value,
-            "type": decision.order_type.value,
-            "time_in_force": self._time_in_force,
-            "order_class": "oto",
-            "stop_loss": {"stop_price": f"{decision.stop_price:.2f}"},
-            "client_order_id": client_order_id,
-        }
+        stop_loss = StopLossRequest(stop_price=round(decision.stop_price, 2))
+
+        tif = TimeInForce.DAY if self._time_in_force == "day" else TimeInForce.GTC
+
         if decision.order_type is OrderType.LIMIT:
             if decision.limit_price is None:
-                # Risk layer should have caught this; defence in depth.
                 raise ValueError("LIMIT decision missing limit_price")
-            kwargs["limit_price"] = f"{decision.limit_price:.2f}"
+            order_request = LimitOrderRequest(
+                symbol=decision.symbol,
+                qty=decision.qty,
+                side=AlpacaOrderSide.BUY if decision.side is Side.BUY else AlpacaOrderSide.SELL,
+                type=AlpacaOrderType.LIMIT,
+                time_in_force=tif,
+                order_class=AlpacaOrderClass.OTO,
+                stop_loss=stop_loss,
+                client_order_id=client_order_id,
+                limit_price=round(decision.limit_price, 2),
+            )
+        else:
+            order_request = MarketOrderRequest(
+                symbol=decision.symbol,
+                qty=decision.qty,
+                side=AlpacaOrderSide.BUY if decision.side is Side.BUY else AlpacaOrderSide.SELL,
+                type=AlpacaOrderType.MARKET,
+                time_in_force=tif,
+                order_class=AlpacaOrderClass.OTO,
+                stop_loss=stop_loss,
+                client_order_id=client_order_id,
+            )
 
         logger.info(
             f"placing {decision.order_type.value} {decision.side.value} "
@@ -360,7 +392,7 @@ class AlpacaBroker:
         )
         try:
             order = self._with_retry(
-                lambda: self._api.submit_order(**kwargs),
+                lambda: self._api.submit_order(order_request),
                 op_desc=f"submit_order({decision.symbol})",
             )
         except APIError as e:
@@ -377,7 +409,7 @@ class AlpacaBroker:
             )
 
         return self._poll_until_terminal(
-            order_id=order.id,
+            order_id=str(order.id),
             symbol=decision.symbol,
             requested_qty=decision.qty,
             timeout=poll_timeout,
@@ -388,7 +420,7 @@ class AlpacaBroker:
         """Cancel an order by id. Returns True on success, False on failure."""
         try:
             self._with_retry(
-                lambda: self._api.cancel_order(order_id),
+                lambda: self._api.cancel_order_by_id(order_id),
                 op_desc=f"cancel_order({order_id})",
             )
             logger.info(f"canceled order {order_id}")
@@ -443,7 +475,7 @@ class AlpacaBroker:
                 message=str(e),
             )
         return self._poll_until_terminal(
-            order_id=order.id,
+            order_id=str(order.id),
             symbol=symbol,
             requested_qty=qty,
             timeout=poll_timeout,
@@ -467,21 +499,19 @@ class AlpacaBroker:
         (often `partially_filled` → PARTIAL, otherwise TIMEOUT).
         """
         deadline = time.monotonic() + timeout
-        last_order = None
         while True:
             order = self._with_retry(
-                lambda: self._api.get_order(order_id),
+                lambda: self._api.get_order_by_id(order_id),
                 op_desc=f"get_order({order_id})",
             )
-            last_order = order
-            raw = order.status
+            raw = order.status.value if isinstance(order.status, AlpacaOrderStatus) else str(order.status)
             mapped = _ALPACA_TERMINAL.get(raw)
             if mapped is not None and mapped is not OrderStatus.PARTIAL:
                 # Truly terminal (filled / rejected / canceled / etc).
                 return self._build_result(order, symbol, requested_qty, mapped)
             if time.monotonic() >= deadline:
                 # Out of time. If we've got partial fills, surface them.
-                filled = int(float(getattr(order, "filled_qty", 0) or 0))
+                filled = int(float(order.filled_qty or 0))
                 if filled > 0:
                     return self._build_result(
                         order, symbol, requested_qty, OrderStatus.PARTIAL
@@ -495,39 +525,48 @@ class AlpacaBroker:
     def _build_result(
         order, symbol: str, requested_qty: int, status: OrderStatus
     ) -> OrderResult:
-        filled = int(float(getattr(order, "filled_qty", 0) or 0))
-        avg = getattr(order, "filled_avg_price", None)
+        filled = int(float(order.filled_qty or 0))
+        avg = order.filled_avg_price
         avg_price = float(avg) if avg is not None else None
+        order_id = str(order.id) if order.id is not None else None
         msg = (
             f"{status.value}: filled {filled}/{requested_qty} "
             f"@ avg {avg_price if avg_price is not None else '—'}"
         )
-        logger.info(f"{symbol} order {order.id}: {msg}")
+        logger.info(f"{symbol} order {order_id}: {msg}")
         return OrderResult(
             status=status,
-            order_id=order.id,
+            order_id=order_id,
             symbol=symbol,
             requested_qty=requested_qty,
             filled_qty=filled,
             avg_fill_price=avg_price,
-            raw_status=order.status,
+            raw_status=order.status.value if hasattr(order.status, 'value') else str(order.status),
             message=msg,
         )
 
     @staticmethod
     def _to_open_order(o) -> OpenOrder:
+        # Handle both alpaca-py model objects and SimpleNamespace mocks.
         submitted = getattr(o, "submitted_at", None)
         if isinstance(submitted, str):
             submitted = datetime.fromisoformat(submitted.replace("Z", "+00:00"))
         elif submitted is None:
             submitted = datetime.now(timezone.utc)
+
+        # Extract raw string values from enums or plain strings.
+        side_val = o.side.value if hasattr(o.side, 'value') else str(o.side)
+        type_val = o.type.value if hasattr(o.type, 'value') else str(o.type) if hasattr(o, 'type') and o.type else None
+        status_val = o.status.value if hasattr(o.status, 'value') else str(o.status)
+        order_id = str(o.id) if o.id is not None else None
+
         return OpenOrder(
-            order_id=o.id,
+            order_id=order_id,
             symbol=o.symbol,
-            side=Side(o.side),
+            side=Side(side_val),
             qty=int(float(o.qty)),
-            order_type=OrderType(o.type) if o.type in {ot.value for ot in OrderType} else OrderType.MARKET,
-            status=o.status,
+            order_type=OrderType(type_val) if type_val in {ot.value for ot in OrderType} else OrderType.MARKET,
+            status=status_val,
             submitted_at=submitted,
             limit_price=float(o.limit_price) if getattr(o, "limit_price", None) else None,
             stop_price=float(o.stop_price) if getattr(o, "stop_price", None) else None,

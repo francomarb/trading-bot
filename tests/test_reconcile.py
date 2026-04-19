@@ -3,7 +3,7 @@ Unit tests for the Phase 9.5 reconciliation module.
 
 Covers:
   - ReconciliationResult structure and gate logic
-  - Reconciler paper return computation from CSV fills
+  - Reconciler paper return computation from database fills
   - Per-trade divergence matching
   - Report generation
   - Go/no-go gate with threshold checks
@@ -12,7 +12,6 @@ Covers:
 
 from __future__ import annotations
 
-import csv
 import os
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
@@ -27,7 +26,7 @@ from backtest.reconcile import (
     TradeDivergence,
 )
 from execution.broker import AlpacaBroker, OrderResult, OrderStatus
-from reporting.logger import TRADE_CSV_COLUMNS
+from reporting.logger import TRADE_COLUMNS, TradeLogger, TradeRecord
 from strategies.base import BaseStrategy, OrderType, SignalFrame
 
 
@@ -47,7 +46,7 @@ class _DummyStrategy(BaseStrategy):
 
 @pytest.fixture
 def tmp_csv(tmp_path: Path) -> str:
-    return str(tmp_path / "trades.csv")
+    return str(tmp_path / "trades.db")
 
 
 @pytest.fixture
@@ -55,14 +54,29 @@ def tmp_forward_dir(tmp_path: Path) -> str:
     return str(tmp_path / "forward_tests")
 
 
-def _write_csv(path: str, rows: list[dict]) -> None:
-    """Write trade records to a CSV file."""
-    os.makedirs(os.path.dirname(path), exist_ok=True)
-    with open(path, "w", newline="") as f:
-        writer = csv.DictWriter(f, fieldnames=TRADE_CSV_COLUMNS)
-        writer.writeheader()
-        for row in rows:
-            writer.writerow(row)
+def _write_trades(path: str, rows: list[dict]) -> None:
+    """Write trade records to a SQLite database via TradeLogger."""
+    tl = TradeLogger(path=path)
+    for row in rows:
+        record = TradeRecord(
+            timestamp=row["timestamp"],
+            symbol=row["symbol"],
+            side=row["side"],
+            qty=int(float(row["qty"])),
+            avg_fill_price=float(row["avg_fill_price"]) if row.get("avg_fill_price") else None,
+            order_id=row.get("order_id"),
+            strategy=row["strategy"],
+            reason=row.get("reason", ""),
+            stop_price=float(row.get("stop_price", 0)),
+            entry_reference_price=float(row.get("entry_reference_price", 0)),
+            modeled_slippage_bps=float(row.get("modeled_slippage_bps", 0)),
+            realized_slippage_bps=float(row.get("realized_slippage_bps", 0)),
+            order_type=row.get("order_type", "market"),
+            status=row.get("status", "filled"),
+            requested_qty=int(float(row.get("requested_qty", row["qty"]))),
+            filled_qty=int(float(row.get("filled_qty", row["qty"]))),
+        )
+        tl.log(record)
 
 
 def _make_fill(
@@ -73,7 +87,7 @@ def _make_fill(
     strategy: str = "test_strat",
     qty: int = 10,
 ) -> dict:
-    """Build a minimal CSV row for a filled trade."""
+    """Build a minimal row dict for a filled trade."""
     return {
         "timestamp": f"{date}T15:30:00+00:00",
         "symbol": symbol,
@@ -142,7 +156,7 @@ class TestReconciler:
             _make_fill(side="buy", price=150.0, date="2026-04-20"),
             _make_fill(side="sell", price=160.0, date="2026-04-25"),
         ]
-        _write_csv(tmp_csv, rows)
+        _write_trades(tmp_csv, rows)
 
         recon = Reconciler(
             _DummyStrategy(),
@@ -159,7 +173,7 @@ class TestReconciler:
         assert abs(paper_return - 0.0667) < 0.001
 
     def test_paper_return_no_fills(self, tmp_csv, tmp_forward_dir):
-        _write_csv(tmp_csv, [])
+        _write_trades(tmp_csv, [])
         recon = Reconciler(
             _DummyStrategy(),
             ["AAPL"],
@@ -176,7 +190,7 @@ class TestReconciler:
             _make_fill(date="2026-03-01"),  # before range
             _make_fill(date="2026-05-15"),  # after range
         ]
-        _write_csv(tmp_csv, rows)
+        _write_trades(tmp_csv, rows)
 
         recon = Reconciler(
             _DummyStrategy(),
@@ -194,7 +208,7 @@ class TestReconciler:
             _make_fill(symbol="AAPL"),
             _make_fill(symbol="TSLA"),
         ]
-        _write_csv(tmp_csv, rows)
+        _write_trades(tmp_csv, rows)
 
         recon = Reconciler(
             _DummyStrategy(),
@@ -218,7 +232,7 @@ class TestReconciler:
             _make_fill(side="buy", price=150.0, date="2026-04-20"),
             _make_fill(side="sell", price=155.0, date="2026-04-25"),
         ]
-        _write_csv(tmp_csv, rows)
+        _write_trades(tmp_csv, rows)
 
         # Mock fetch + backtest.
         idx = pd.date_range("2026-04-01", periods=30, freq="D", tz="UTC")
@@ -268,7 +282,7 @@ class TestReconciler:
                 "realized_slippage_bps": "30.0",  # above threshold
             },
         ]
-        _write_csv(tmp_csv, rows)
+        _write_trades(tmp_csv, rows)
 
         mock_fetch.return_value = (pd.DataFrame(), {})
 
@@ -287,7 +301,7 @@ class TestReconciler:
         assert any("slippage" in r for r in result.reasons)
 
     def test_no_go_on_no_fills(self, tmp_csv, tmp_forward_dir):
-        _write_csv(tmp_csv, [])
+        _write_trades(tmp_csv, [])
         recon = Reconciler(
             _DummyStrategy(),
             ["AAPL"],
@@ -308,7 +322,7 @@ class TestReconciler:
         rows = [
             _make_fill(side="buy", price=150.0, date="2026-04-20"),
         ]
-        _write_csv(tmp_csv, rows)
+        _write_trades(tmp_csv, rows)
         mock_fetch.return_value = (pd.DataFrame(), {})
 
         recon = Reconciler(
@@ -372,7 +386,7 @@ class TestGetClosedOrders:
         mock_order.filled_avg_price = "150.05"
         mock_order.status = "filled"
         mock_order.side = "buy"
-        mock_client.list_orders.return_value = [mock_order]
+        mock_client.get_orders.return_value = [mock_order]
 
         broker = AlpacaBroker(client=mock_client)
         results = broker.get_closed_orders()
@@ -391,7 +405,7 @@ class TestGetClosedOrders:
         o2 = MagicMock()
         o2.id, o2.symbol, o2.qty, o2.filled_qty = "2", "TSLA", "5", "5"
         o2.filled_avg_price, o2.status, o2.side = "200.0", "filled", "buy"
-        mock_client.list_orders.return_value = [o1, o2]
+        mock_client.get_orders.return_value = [o1, o2]
 
         broker = AlpacaBroker(client=mock_client)
         results = broker.get_closed_orders(symbols=["AAPL"])
@@ -401,6 +415,6 @@ class TestGetClosedOrders:
 
     def test_empty_history(self):
         mock_client = MagicMock()
-        mock_client.list_orders.return_value = []
+        mock_client.get_orders.return_value = []
         broker = AlpacaBroker(client=mock_client)
         assert broker.get_closed_orders() == []

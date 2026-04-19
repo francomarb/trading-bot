@@ -21,6 +21,7 @@ import pandas as pd
 import pytest
 
 from strategies.base import BaseStrategy, OrderType, SignalFrame
+from strategies.rsi_reversion import RSIReversion
 from strategies.sma_crossover import SMACrossover
 
 
@@ -299,3 +300,141 @@ class TestPurity:
         original_cols = set(df.columns)
         SMACrossover(fast=3, slow=7).generate_signals(df)
         assert set(df.columns) == original_cols, "strategy must not add columns to input"
+
+
+# ── required_bars ───────────────────────────────────────────────────────────
+
+
+class TestRequiredBars:
+    def test_base_default_is_50(self):
+        class Minimal(BaseStrategy):
+            name = "minimal"
+
+            def _raw_signals(self, df):
+                empty = pd.Series([False] * len(df), index=df.index)
+                return SignalFrame(entries=empty, exits=empty)
+
+        assert Minimal().required_bars() == 50
+
+    def test_sma_crossover_returns_slow_window(self):
+        assert SMACrossover(fast=10, slow=30).required_bars() == 30
+        assert SMACrossover(fast=20, slow=50).required_bars() == 50
+        assert SMACrossover(fast=50, slow=200).required_bars() == 200
+
+    def test_rsi_reversion_returns_period_plus_one(self):
+        assert RSIReversion(period=14).required_bars() == 15
+        assert RSIReversion(period=5).required_bars() == 6
+
+
+# ── RSIReversion param validation ──────────────────────────────────────────
+
+
+class TestRSIReversionParams:
+    def test_period_must_be_positive_int(self):
+        with pytest.raises(TypeError):
+            RSIReversion(period=3.5)
+        with pytest.raises(ValueError, match="positive"):
+            RSIReversion(period=0)
+
+    def test_thresholds_must_be_ordered(self):
+        with pytest.raises(ValueError, match="oversold.*overbought"):
+            RSIReversion(oversold=70, overbought=30)
+        with pytest.raises(ValueError, match="oversold.*overbought"):
+            RSIReversion(oversold=50, overbought=50)
+
+    def test_thresholds_must_be_in_range(self):
+        with pytest.raises(ValueError):
+            RSIReversion(oversold=0, overbought=70)
+        with pytest.raises(ValueError):
+            RSIReversion(oversold=30, overbought=100)
+
+    def test_default_order_type_is_limit(self):
+        assert RSIReversion().preferred_order_type == OrderType.LIMIT
+
+    def test_missing_close_column_raises(self):
+        idx = pd.date_range("2026-01-01", periods=3, freq="D", tz="UTC")
+        bad = pd.DataFrame({"open": [1, 2, 3]}, index=idx)
+        with pytest.raises(ValueError, match="close"):
+            RSIReversion(period=2).generate_signals(bad)
+
+    def test_repr(self):
+        r = repr(RSIReversion(period=10, oversold=25, overbought=75))
+        assert "RSIReversion" in r
+        assert "10" in r
+
+
+# ── RSIReversion signals ───────────────────────────────────────────────────
+
+
+class TestRSIReversionSignals:
+    def _make_crash_recovery(self) -> list[float]:
+        """
+        Price path that creates an RSI oversold entry followed by
+        overbought exit:
+          - Start at 100, drop sharply to ~60 (RSI < 30)
+          - Recover sharply back to ~120 (RSI > 70)
+        """
+        # Steady state, then sharp drop, then sharp recovery
+        steady = [100.0] * 10
+        drop = [100 - i * 5 for i in range(1, 10)]  # 95, 90, ..., 55
+        recovery = [55 + i * 8 for i in range(1, 15)]  # 63, 71, ..., 167
+        return steady + drop + recovery
+
+    def test_no_signals_on_flat_prices(self):
+        df = _df([50.0] * 30)
+        sig = RSIReversion(period=5).generate_signals(df)
+        # RSI=100 for constant (all gains=0, all losses=0), never crosses 30 or 70
+        # Actually with constant prices, no changes → stays at 100
+        # No crossover of thresholds since it starts at 100 and stays
+        assert sig.entries.sum() == 0
+
+    def test_entry_on_crash_exit_on_recovery(self):
+        df = _df(self._make_crash_recovery())
+        sig = RSIReversion(period=5, oversold=30, overbought=70).generate_signals(df)
+        assert sig.entries.sum() >= 1, "sharp drop should trigger oversold entry"
+        assert sig.exits.sum() >= 1, "sharp recovery should trigger overbought exit"
+
+        # Entry must precede exit
+        entry_idx = sig.entries[sig.entries].index.min()
+        exit_idx = sig.exits[sig.exits].index.min()
+        assert entry_idx < exit_idx
+
+    def test_no_signals_on_monotonic_uptrend(self):
+        df = _df(list(range(1, 40)))
+        sig = RSIReversion(period=5).generate_signals(df)
+        # RSI stays at 100 — never crosses below 30
+        assert sig.entries.sum() == 0
+
+    def test_signals_are_false_during_nan_prefix(self):
+        df = _df(list(range(1, 20)))
+        sig = RSIReversion(period=5).generate_signals(df)
+        # RSI needs period+1=6 bars → first 5 indices are NaN + shift needs 1 more
+        assert not sig.entries.iloc[:6].any()
+        assert not sig.exits.iloc[:6].any()
+
+    def test_entries_and_exits_never_simultaneous(self):
+        df = _df(self._make_crash_recovery())
+        sig = RSIReversion(period=5).generate_signals(df)
+        both = sig.entries & sig.exits
+        assert not both.any(), "a single bar cannot be both entry and exit"
+
+    def test_edge_filter_gates_entries(self):
+        df = _df(self._make_crash_recovery())
+        # Block all entries
+        gate = pd.Series([False] * len(df), index=df.index)
+        sig = RSIReversion(
+            period=5, edge_filter=lambda _: gate
+        ).generate_signals(df)
+        assert sig.entries.sum() == 0, "edge filter should block all entries"
+
+    def test_edge_filter_does_not_block_exits(self):
+        df = _df(self._make_crash_recovery())
+        gate = pd.Series([False] * len(df), index=df.index)
+        sig = RSIReversion(
+            period=5, edge_filter=lambda _: gate
+        ).generate_signals(df)
+        # Exits should still fire even with gate blocking entries
+        # (may or may not fire depending on price path reaching overbought)
+        # The key contract is that exits are NOT gated
+        sig_no_filter = RSIReversion(period=5).generate_signals(df)
+        assert sig.exits.equals(sig_no_filter.exits)
