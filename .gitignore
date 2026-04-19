@@ -15,3 +15,4 @@ notebooks/
 .coverage
 *.swp
 .claude/
+docs/franco-notes.md
