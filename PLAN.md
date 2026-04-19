@@ -295,22 +295,172 @@ If reality diverges significantly from backtest, the strategy does not go live.
 ### Phase 10 — Live Trading Transition
 **Goal:** Safely switch from paper to live trading with multiple independent guardrails.
 
-| # | Deliverable | Status |
-|---|---|---|
-| 10.1 | `config/settings.py` — `LIVE_TRADING` flag + separate `.env` keys for live vs. paper | ⬜ |
-| 10.2 | Pre-flight checklist script: validates keys point to live endpoint, buying power, all risk params set, forward-test go/no-go on file | ⬜ |
-| 10.3 | **Position-size multiplier** (default 0.25x) for the first N weeks of live trading | ⬜ |
-| 10.4 | **Hard dollar kill switch** enabled with a conservative cap for initial live run (e.g. $500) | ⬜ |
-| 10.5 | **Manual approval prompt** before the very first live order — prints order details, requires typed confirmation | ⬜ |
-| 10.6 | **Dry-run mode** — one final option where engine runs live-connected but logs orders instead of placing them; used for the final sanity check | ⬜ |
-| 10.7 | Separate live trade DB (never co-mingled with paper history) | ⬜ |
-| 10.8 | **WebSocket order streaming** — replace `get_order()` polling with `alpaca-py` `TradingStream` for real-time order updates (fills, partial fills, rejections). With real capital, faster state updates reduce exposure to stale order state. Current REST polling is fine for paper but not acceptable for live. | ⬜ |
-| 10.9 | **Enable slippage-drift kill switch** — set `SLIPPAGE_DRIFT_ENABLED=True` in `.env` after validating paper fill data confirms the 5 bps model and 3× multiplier thresholds are correctly calibrated. Currently disabled to avoid false halts during paper trading. | ⬜ |
-| 10.10 | **Durable position ownership** — on restart, restore strategy→symbol ownership from trade DB (last open-but-not-closed trade per symbol) instead of best-effort slot ordering. Guards against misattribution in multi-strategy setups after a crash. See `TODO Phase 10` in `engine/trader.py`. | ⬜ |
-| 10.11 | **Harden restart reconciliation** — if broker positions, open orders, and trade DB state cannot be fully reconciled on startup, log CRITICAL and enter a safe (no-new-entries) mode until operator confirms. Current behavior is best-effort. | ⬜ |
-| 10.12 | Verified: bot connects to live Alpaca endpoint in dry-run, then with 1-share manual-approval order | ⬜ |
+**Implementation order matters.** Items are grouped by dependency and risk. Do not
+skip ahead. Each group must be paper-validated before the next begins.
 
-**Exit Criteria:** Bot can switch to live via config. First live order requires explicit human approval. Hard dollar cap is enforced. Paper and live data are never co-mingled. Order state is maintained via WebSocket streaming, not polling. Slippage-drift kill switch is enabled and calibrated.
+---
+
+#### Blocker classification
+
+| Label | Meaning |
+|---|---|
+| 🔴 HARD BLOCKER | Bot must not go live without this |
+| 🟡 REQUIRED | Must be done in Phase 10, not blocking start but blocking flip to live |
+| 🟢 LIVE GATE | Final checks run immediately before the live flip |
+
+---
+
+#### Group A — Manual prerequisite (no code, do first)
+
+| # | Deliverable | Complexity | Status |
+|---|---|---|---|
+| 10.A1 | **Manual restart verification** — with at least one open paper position: stop the bot, restart it, confirm startup logs show ownership assignment (`restart: assigned existing position X → 'sma_crossover'`) and that any unmanaged symbol emits a WARNING. Instructions in CLAUDE.md. | Operational | ⬜ |
+
+---
+
+#### Group B — Config and separation (low risk, do next)
+
+| # | Deliverable | Complexity | Blocker | Status |
+|---|---|---|---|---|
+| 10.B1 | **Live config separation** — `LIVE_TRADING` flag in `config/settings.py`; separate `.env` keys for live vs. paper (`ALPACA_API_KEY_LIVE`, `ALPACA_SECRET_KEY_LIVE`); separate trade DB path (`data/trades_live.db`) so paper and live fills are never co-mingled. | Low (~20 lines) | 🔴 | ⬜ |
+| 10.B2 | **Pre-flight checklist script** — validates: keys point to live endpoint, buying power meets minimum, go/no-go file on disk with GO verdict, all risk params set, `SLIPPAGE_DRIFT_ENABLED=True`, dry-run passes. Exits non-zero if any check fails. | Low (~50 lines) | 🟡 | ⬜ |
+
+---
+
+#### Group C — Safety hardening (🔴 hard blockers, implement + paper-validate before live)
+
+| # | Deliverable | Complexity | Blocker | Status |
+|---|---|---|---|---|
+| 10.C1 | **Durable position ownership** — on restart, restore `_position_owners` from the trade DB instead of best-effort slot-order matching. See design below. | Medium (~60 lines) | 🔴 | ⬜ |
+| 10.C2 | **Startup reconciliation + fail-safe mode** — cross-check broker positions, open orders, trade DB, and ownership state on startup. Enter RESTRICTED mode (exits only, no new entries) on any medium mismatch; HALT on critical mismatch. See design below. | Medium (~80 lines) | 🔴 | ⬜ |
+| 10.C3 | **Tests for 10.C1 and 10.C2** — restart with pre-existing broker positions; durable ownership restored correctly; reconciliation detects and classifies mismatches. | Medium | 🔴 | ⬜ |
+
+> **Paper validation gate:** After implementing 10.C1 and 10.C2, run the paper bot for at
+> least one week with reconciliation active and confirm startup logs are clean on each restart
+> before proceeding to Group D.
+
+---
+
+#### Group D — Slippage kill switch calibration (requires paper fill data)
+
+| # | Deliverable | Complexity | Blocker | Status |
+|---|---|---|---|---|
+| 10.D1 | **Review paper fill data** — query `data/trades.db`, compute mean realized slippage across all fills. If mean realized ≤ 3× modeled (5 bps), the current thresholds are calibrated. If not, adjust `SLIPPAGE_MODEL_MARKET_BPS` in `config/settings.py` before enabling. | Operational | 🔴 | ⬜ |
+| 10.D2 | **Enable slippage-drift kill switch** — set `SLIPPAGE_DRIFT_ENABLED=True` in `config/.env`. Requires 10.D1 to confirm thresholds are reasonable. Kill switch must be active for live trading. | Low (1 config line) | 🔴 | ⬜ |
+
+---
+
+#### Group E — Infrastructure (highest complexity, do after C and D)
+
+| # | Deliverable | Complexity | Blocker | Status |
+|---|---|---|---|---|
+| 10.E1 | **WebSocket order streaming** (`alpaca-py` `TradingStream`) — replace `_poll_until_terminal` REST polling with a stream handler for real-time fill/rejection/partial-fill events. Also wires stop-leg fills into `_record_fill` so slippage tracking covers OTO exits. Current REST polling is acceptable for paper but not live. | High (~200 lines, async) | 🔴 | ⬜ |
+
+> **Paper validation gate:** After implementing 10.E1, run the paper bot for at least one
+> week with streaming active. Confirm stop-leg fills appear in slippage samples and that
+> the stream reconnects cleanly after network interruptions before proceeding to Group F.
+
+---
+
+#### Group F — Live trading gates (run immediately before the live flip)
+
+| # | Deliverable | Complexity | Blocker | Status |
+|---|---|---|---|---|
+| 10.F1 | **Position-size multiplier** — `LIVE_SIZE_MULTIPLIER = 0.25` config setting; engine scales final `qty` by this for the first N weeks. Limits exposure while calibrating live fills. | Low (~15 lines) | 🟢 | ⬜ |
+| 10.F2 | **Hard dollar cap** — set `HARD_DOLLAR_LOSS_CAP` to a conservative value (e.g. $500) in the live `.env`. Already implemented in RiskManager; this is a config decision only. | Low (config) | 🟢 | ⬜ |
+| 10.F3 | **Manual approval prompt** — before the very first live order, print full order details and require the operator to type the symbol to confirm. One-time gate; disables itself after the first live fill. | Low (~20 lines) | 🟢 | ⬜ |
+| 10.F4 | **Dry-run mode** — `DRY_RUN=True` config flag; engine runs live-connected but logs orders instead of placing them. Final sanity check before real orders. | Low (~15 lines) | 🟢 | ⬜ |
+| 10.F5 | **Verified** — pre-flight checklist passes; dry-run connects to live Alpaca endpoint and logs at least one cycle; first real order requires manual approval; hard cap enforced. | Operational | 🟢 | ⬜ |
+
+---
+
+#### Design: Durable position ownership (10.C1)
+
+The trade DB already records `strategy` on every fill. On restart, query net open
+position per (symbol, strategy) pair instead of guessing from slot ordering.
+
+**Query:**
+```sql
+SELECT symbol, strategy,
+       SUM(CASE WHEN side='buy' THEN qty ELSE 0 END) -
+       SUM(CASE WHEN side='sell' THEN qty ELSE 0 END) AS net_qty
+FROM trades
+WHERE symbol = ?
+GROUP BY symbol, strategy
+HAVING net_qty > 0
+ORDER BY MAX(timestamp) DESC
+LIMIT 1;
+```
+
+**Startup flow:**
+```
+For each open broker position:
+  a. Run query against trade DB
+  b. If net_qty > 0 found → assign ownership from DB, log INFO
+  c. If no DB record → fallback to slot-order match, log WARNING ("fallback used")
+  d. If matches no slot at all → log WARNING ("unmanaged, will not be traded")
+  e. If two strategies both show net_qty > 0 → log CRITICAL, engage kill switch
+```
+
+**Edge cases:**
+- Partial fill with no exit: net_qty = filled qty, still positive → correctly open
+- Position opened before DB existed: no rows → falls through to slot-order fallback
+- Manually opened position (dashboard): no rows → fallback → WARNING
+- DB missing/corrupt: catch all exceptions, skip DB lookup, fallback for all symbols, log ERROR
+
+**Implementation location:** New `_restore_ownership_from_db()` method on `TradingEngine`,
+called from `start()` after `broker.sync_with_broker()`. See `TODO Phase 10` comment
+in `engine/trader.py`.
+
+---
+
+#### Design: Startup reconciliation + fail-safe mode (10.C2)
+
+**Four sources cross-checked at startup:**
+- `broker_positions`: symbols with open shares (from broker snapshot)
+- `broker_open_orders`: symbols with pending orders (from broker snapshot)
+- `db_open_positions`: (symbol, strategy) pairs with net_qty > 0 (from trade DB)
+- `engine_owners`: what `_restore_ownership_from_db()` assigned
+
+**Mismatch classification:**
+
+| Check | Severity | Engine behavior |
+|---|---|---|
+| Broker position, DB record, slot match → all agree | — | NORMAL |
+| Broker position, no DB record | MEDIUM | RESTRICTED: log WARNING, assign fallback |
+| Broker position, no matching slot | MEDIUM | RESTRICTED: log WARNING, skip symbol |
+| DB open record, no broker position | LOW | Log INFO (position closed elsewhere) |
+| Orphan stop order (open order, no position) | MEDIUM | RESTRICTED: log WARNING |
+| Two DB strategies claim same symbol net_qty > 0 | HIGH | HALT: log CRITICAL, engage kill switch |
+
+**Startup modes:**
+```
+All checks clean    → NORMAL  (full operation)
+Any MEDIUM issue    → RESTRICTED (existing positions managed, no new entries)
+Any HIGH issue      → HALT (no new entries or exits; broker stops still protect positions)
+```
+
+**Fail-safe rules:**
+1. Exits always fire in RESTRICTED mode — never block risk reduction
+2. HALT mode requires operator `reset_kill_switches()` to clear
+3. RESTRICTED mode auto-clears after one clean cycle (MEDIUM issues may self-heal
+   as positions close naturally)
+4. Reconciliation verdict logged in startup summary and written to alert log
+5. Broker OTO stop legs remain active regardless of engine mode — they protect
+   positions even if the engine is fully halted
+
+**Implementation location:** New `_reconcile_startup()` method on `TradingEngine`,
+called from `start()` after `_restore_ownership_from_db()`. Returns
+`"NORMAL" | "RESTRICTED" | "HALT"`. Engine stores mode in `self._startup_mode`
+and checks it before opening new entries.
+
+---
+
+**Exit Criteria:** Pre-flight checklist passes. Bot connects to live Alpaca in dry-run
+mode. Position ownership is restored from trade DB on restart. Startup reconciliation
+is clean or RESTRICTED with operator awareness. Slippage kill switch is enabled and
+calibrated against paper fills. First real order requires explicit typed approval.
+Hard dollar cap ($500 initial) enforced. Paper and live trade DBs are separate files.
 
 ---
 
@@ -359,5 +509,6 @@ window (minimum 4–8 weeks live) with acceptable performance. Complexity is ear
 | 2026-04-16 | **Phase 9.5 infrastructure complete.** Built `backtest/reconcile.py` — `Reconciler` compares paper fills (from trade CSV) against backtest predictions (rerun on the same bars) for a given date range. **Key design decisions:** (a) **Two-gate decision.** Return divergence gate (paper vs backtest total return, default threshold 10 percentage points) + slippage gate (mean realized slippage, default threshold 20bps). Either failing → NO-GO; the strategy returns to Phase 5 for re-analysis. (b) **Per-trade divergence.** Each paper fill is matched against the closest backtest entry/exit price. Price diff reported in bps with matched/unmatched flag. (c) **Paper return from CSV.** Sequential buy→sell pairs per symbol, P&L as fraction of entry cost. No position is assumed to carry across days if only one side is in the CSV. (d) **Report as markdown.** Written to `logs/forward_tests/<strategy>_<date>.md` with verdict (GO/NO-GO), aggregate returns, trade counts, slippage stats, gate reasons, and per-trade divergence table. (e) **`forward_test.py` launcher.** Starts the engine with production config (all 5 watchlist symbols, daily bars, 5-min cycles, market hours only) and full Phase 9 reporting wired up. On shutdown writes a daily P&L summary. Includes a docstring with the reconciliation command for after the multi-week run. (f) **`get_closed_orders`** added to `AlpacaBroker` — retrieves historical filled orders with optional date range and symbol filtering, returns typed `OrderResult` objects. (g) **Config** — 3 new settings: `FORWARD_TEST_DIR`, `FORWARD_TEST_RETURN_DIVERGENCE_PCT` (0.10), `FORWARD_TEST_MAX_SLIPPAGE_BPS` (20.0). 15 unit tests covering reconciliation logic, CSV filtering, gate decisions, report generation, and `get_closed_orders`. Full suite 256/256 passing in ~7s. Integration `phase95_verify.py` against live paper: 17/17 checks pass — config settings, closed order retrieval (10 historical orders found), reconciler produces a result (correctly NO-GO with 0 paper fills), report written, engine runs 3 cycles with forward-test wiring. **Remaining:** operational step — run `python forward_test.py` for 2-4 weeks, then reconcile. |
 | 2026-04-16 | **Phase 9 complete.** Built `reporting/` package — three modules providing full observability into the bot's trading activity. **Key design decisions:** (a) **`TradeLogger`** (`reporting/logger.py`) writes an append-only CSV (`logs/trades.csv`) with 16 columns including both modeled and realized slippage in bps. Separate `build_record` (for entries via RiskDecision + OrderResult) and `build_close_record` (for exits without a RiskDecision). (b) **Structured JSON sink** via `install_json_sink()` — adds a JSONL loguru sink with 10MB rotation / 30-day retention alongside the human-readable console output. (c) **`PnLTracker`** (`reporting/pnl.py`) tracks intraday P&L in-memory (peak/trough for drawdown), generates `DailySummary` with per-strategy `StrategyStats` (trade count, P&L, win rate, expectancy, profit factor, slippage). Daily reports are markdown files in `logs/daily_pnl/`. Weekly reports aggregate daily summaries into `logs/weekly_reports/`. `slippage_report(last_n)` provides rolling slippage stats from the trade CSV. (d) **`AlertDispatcher`** (`reporting/alerts.py`) fires alerts through pluggable backends (MVP: `LogFileBackend` writing to `logs/alerts.log`). Supports 8 alert types (order rejection, circuit breaker, loss-streak cooldown, stale data, slippage drift, broker error, engine halt, position mismatch). Duplicate suppression via configurable cooldown (default 5 min per type+symbol+strategy key). Backend failures are caught and logged — an alert failure never crashes the bot. Slack/email backends can be added by subclassing `AlertBackend`. (e) **Engine integration** — `TradingEngine` now accepts optional `trade_logger`, `pnl_tracker`, and `alerts` (defaults created if not provided). Entry fills → `_log_entry` → CSV. Exit fills → `_log_close` → CSV. Risk rejections → `alerts.order_rejection`. Stale data → `alerts.stale_data`. Broker errors → `alerts.broker_error`. Halt state → `alerts.engine_halt`. (f) **Config** — 5 new settings in `config/settings.py` (TRADE_LOG_CSV, DAILY_PNL_DIR, WEEKLY_REPORT_DIR, JSON_LOG_FILE, ALERT_LOG_FILE). 35 unit tests (reporting/ at 94% coverage). Full suite 241/241 passing in ~8s. Integration `phase9_verify.py` exercises all 7 sections end-to-end on live paper: JSONL sink, trade CSV round-trip, daily P&L with per-strategy attribution, weekly report, all 7 alert types, slippage monitoring, and engine wiring with 3 live cycles; 23/23 checks pass. |
 | 2026-04-16 | **Phase 8 complete.** Built `engine/trader.py` — `TradingEngine` orchestrates the full pipeline: `sync_with_broker → fetch → freshness → indicators → signals → risk → execute → log`. **Key design decisions:** (a) **Broker is the source of truth.** Every cycle starts with `broker.sync_with_broker()`; on startup the engine captures a snapshot before any decision, so a killed-mid-trade restart reconciles against reality. (b) **Stale-data guard.** `require_fresh(df, max_bar_age)` raises `StaleDataError` if the latest bar is older than `bar_interval × max_bar_age_multiplier` — silence beats wrong action. (c) **Exception containment at two levels.** Per-symbol errors are caught and logged (one flaky fetch doesn't skip the other symbols); per-cycle errors are caught (one bad cycle doesn't crash the loop). (d) **Redundant-close prevention.** `_has_pending_close_order` checks for an existing SELL order before issuing another close. (e) **Market hours gating.** Calls `broker._api.get_clock()` with retry; network failure falls back to "closed" (fail-safe). (f) **Graceful SIGINT/SIGTERM.** Sets `_running = False`; responsive sleep (1s tick) means shutdown latency ≤ 1s. Optionally cancels open orders on the way out (configurable). (g) **Slippage fed back to risk.** `_record_fill` computes realized vs. modeled slippage in bps and feeds `risk.record_fill_slippage` — the Phase 6.11 drift kill switch is wired end-to-end. (h) **Clock injection seam.** `_clock` callable lets tests control "now" without `freezegun`. (i) **`EngineConfig` frozen dataclass** with validation (bad timeframe, empty watchlist, invalid multiplier) and derived properties (`bar_interval`, `max_bar_age`). 21 unit tests (engine coverage 84%) covering config validation, per-symbol decision paths (entry/exit/stale/flat/halted/pending-close), cycle-level containment, start/stop lifecycle, shutdown order-cancel, and slippage recording. Full suite 206/206 passing in ~8s. Integration `phase8_verify.py` runs 5 cycles on live paper with a NoOpStrategy (never trades), injects a simulated fetch failure on cycle 3 — engine survives and completes all 5 cycles; 5/5 checks pass. |
+| 2026-04-19 | **Phase 10 redesigned after safety review.** Full review cycle surfaced: (a) slippage kill switch had a latent bug (modeled_bps hardcoded 0, epsilon trick caused false halt — fixed); (b) position ownership is in-memory only and will misattribute after restart in multi-strategy setups — durable ownership from trade DB designed and deferred to Phase 10; (c) startup reconciliation is best-effort — full cross-check of broker/orders/DB/ownership designed and deferred to Phase 10; (d) REST polling for order state acceptable for paper but not live — WebSocket TradingStream required before live. Phase 10 restructured into Groups A–F with hard-blocker classification, implementation order, and embedded design for 10.C1 (durable ownership) and 10.C2 (reconciliation). Two paper-validation gates added between groups. |
 | 2026-04-19 | **Future Alpaca features noted (not actionable now).** (a) **Trailing stop orders** — Alpaca supports trail_price / trail_percent on stop orders. Could replace fixed ATR stops for trend-following strategies (SMA crossover) to let winners run longer. Evaluate in Phase 11. (b) **VWAP/TWAP execution** — available via Elite Smart Router for minimizing market impact. Not relevant at current position sizes; revisit if scaling up. (c) **24/5 extended hours trading** — Alpaca supports overnight/extended hours. Current market hours gate correctly restricts to regular session, which is appropriate for daily-bar strategies. Available if a future strategy warrants it. |
 | 2026-04-14 | **Integrated `trading-bot-design-guide-full.md` recommendations.** (a) Added explicit success metric: "positive expectancy with controlled drawdowns" — not "always profitable." (b) Expanded Guiding Principles with Risk>Entry, Boring beats fancy, One strategy first, Strategies decay. (c) Added 6-layer architectural mental model (Data → Regime → Strategy → Risk → Execution → Monitoring). (d) Phase 4 gains minimal edge-filter hook (e.g. SPY>200MA gate) and strategy-declared preferred order type. (e) Phase 6 gains loss-streak cooldown, broker-error-streak kill switch, slippage-drift kill switch, gross exposure cap. (f) Phase 7 clarifies strategy chooses order type; hard-risk exits always immediate. (g) Phase 9 gains per-strategy P&L attribution (even for single-strategy MVP — schema ready for N strategies) + continuous slippage monitoring feeding the 6.11 kill switch. (h) New **Phase 11** for multi-strategy + full regime detection + correlation/sector caps + strategy health auto-disable. Explicitly gated on "do not start until single-strategy live has proven out." Correlation/sector/per-strategy caps deferred there from Phase 6 as YAGNI for MVP. |

@@ -160,24 +160,63 @@ python phase2_verify.py
 ## Current Phase
 
 **Phases 1–9 complete. Phase 9.5 infrastructure complete. Architecture
-alignment refactoring complete (2026-04-19).**
+alignment refactoring complete (2026-04-19). Safety review and Phase 10
+redesign complete (2026-04-19).**
 
-Refactoring accomplished:
-- Migrated from `alpaca-trade-api` to `alpaca-py` (official SDK)
-- Paper/Live toggle via `ALPACA_PAPER` boolean
-- `BaseStrategy.required_bars()` with calendar-day conversion in engine
-- RSI indicator + `RSIReversion` strategy (mean-reversion, limit orders)
-- SQLite trade log (migrated from CSV)
-- Live metrics module (`compute_metrics` → `MetricsSnapshot`)
-- Go/no-go checker script (`scripts/gonogo.py`)
+Only **SMA Crossover** is currently active in `forward_test.py`.
+RSI Reversion is implemented and backtested but not yet running.
 
-Total: 352 unit tests passing + 17/17 live-paper integration checks.
+Recent fixes (2026-04-19):
+- Slippage kill switch bug fixed: `modeled_bps` was hardcoded 0; now uses
+  5 bps for MARKET orders (matching backtest), 0 for LIMIT
+- `SLIPPAGE_DRIFT_ENABLED=False` by default; must be enabled before live
+- Position ownership logs on restart; unmanaged symbols emit WARNING
+- `main.py` now delegates to `forward_test.py`
+- Docs corrected: README and architecture.md now say SMA-only is active
 
-**Next steps:**
-1. Run `python forward_test.py` for 2–4 weeks (operational, not code).
-2. Check readiness: `python scripts/gonogo.py` (exit 0 = GO).
-3. After the run, reconcile: `Reconciler(strategy, symbols, start, end).run()`.
-4. If GO → proceed to Phase 10 (Live Trading Transition).
-5. If NO-GO → return to Phase 5 for strategy re-analysis.
+Total: 357 unit tests passing.
 
-See `PLAN.md` for full phase breakdown and progress tracking.
+**Next steps (operational — no code):**
+1. Run `python forward_test.py` for 2–4 weeks.
+2. **Manual restart verification** (see below) — do this during the paper run.
+3. After the run: `python scripts/gonogo.py` (exit 0 = GO).
+4. Reconcile paper fills: `Reconciler(strategy, symbols, start, end).run()`.
+5. If GO → execute Phase 10 (see PLAN.md for ordered steps).
+6. If NO-GO → return to Phase 5 for strategy re-analysis.
+
+---
+
+## Manual Restart Verification (Phase 9.5 operational gate)
+
+Do this once during the paper run while at least one position is open.
+
+**Steps:**
+1. Confirm a position is open: check Alpaca paper dashboard or `broker.get_positions()`.
+2. Stop the bot: `tmux send-keys -t bot C-c` (wait for clean shutdown log).
+3. Restart: `python forward_test.py` (or `./start_bot.sh`).
+4. Check startup logs for the ownership block (appears before cycle 1).
+
+**Expected log — position found and assigned:**
+```
+restart: assigned existing position AAPL → 'sma_crossover' (best-effort slot match)
+engine starting: 1 slot(s) [sma_crossover(13)], 13 unique symbol(s),
+  session_start_equity=$..., open_positions=1, open_orders=1
+```
+
+**Expected log — position not in any slot (unmanaged):**
+```
+WARNING | restart: open position TSLA does not belong to any configured slot —
+  it will NOT be managed by this engine. Close it manually or add it to a
+  strategy's symbol universe.
+```
+
+**First cycle with an open position should show:**
+```
+[sma_crossover] AAPL: ... position=OPEN 12
+```
+`position=OPEN` confirms the engine sees the position. `entry=False` means no
+duplicate entry will be attempted.
+
+**What to do if you see the WARNING:**
+Close the unmanaged position manually on the Alpaca paper dashboard.
+It will not be touched by the engine until you add it to the watchlist.
