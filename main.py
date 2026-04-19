@@ -1,14 +1,20 @@
 """
-Trading Bot - Entry Point
-Phase 1: Connection test only.
-More to come phase by phase.
+Trading Bot — top-level entry point.
+
+This file delegates to `forward_test.py`, which is the canonical runtime
+entrypoint for paper and forward-test runs.
+
+    python main.py          # same as: python forward_test.py
+
+For the lower-level engine without full reporting wired up:
+
+    python -m engine.trader
+
+Phase 1 note: this file originally only printed the mode and exited.
+That stub has been replaced with this delegation. See PLAN.md for history.
 """
 
-from config.settings import ALPACA_API_KEY, ALPACA_SECRET_KEY, ALPACA_PAPER
-
-def main():
-    mode = "paper" if ALPACA_PAPER else "LIVE"
-    print(f"Trading Bot starting... (mode: {mode})")
+import forward_test
 
 if __name__ == "__main__":
-    main()
+    forward_test.main()

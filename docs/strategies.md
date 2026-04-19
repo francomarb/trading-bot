@@ -56,7 +56,7 @@ SMA crossover is the simplest trend-following signal. It captures sustained dire
 | Class | `RSIReversion` |
 | Type | Mean-reversion |
 | Order type | Limit |
-| Status | **Paper Trading** |
+| Status | **Implemented — not yet active** (pending SMA crossover go/no-go) |
 
 **Signal logic:**
 - **Entry:** RSI crosses *below* the oversold threshold (fading a sell-off)
@@ -89,7 +89,7 @@ Running SMA Crossover and RSI Reversion together provides complementary coverage
 | Sideways/range | Whipsawed (false crossovers) | Profitable (buys dips, sells rips) |
 | Volatile crash | Late entry, but captures recovery | Early entry on oversold bounce |
 
-The engine runs both strategies in separate `StrategySlot` instances with independent symbol universes, sharing a single risk manager and equity pool.
+When RSI Reversion is activated, the engine will run both strategies in separate `StrategySlot` instances with independent symbol universes, sharing a single risk manager and equity pool. Currently only SMA Crossover is active.
 
 ---
 

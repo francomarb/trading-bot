@@ -305,9 +305,12 @@ If reality diverges significantly from backtest, the strategy does not go live.
 | 10.6 | **Dry-run mode** — one final option where engine runs live-connected but logs orders instead of placing them; used for the final sanity check | ⬜ |
 | 10.7 | Separate live trade DB (never co-mingled with paper history) | ⬜ |
 | 10.8 | **WebSocket order streaming** — replace `get_order()` polling with `alpaca-py` `TradingStream` for real-time order updates (fills, partial fills, rejections). With real capital, faster state updates reduce exposure to stale order state. Current REST polling is fine for paper but not acceptable for live. | ⬜ |
-| 10.9 | Verified: bot connects to live Alpaca endpoint in dry-run, then with 1-share manual-approval order | ⬜ |
+| 10.9 | **Enable slippage-drift kill switch** — set `SLIPPAGE_DRIFT_ENABLED=True` in `.env` after validating paper fill data confirms the 5 bps model and 3× multiplier thresholds are correctly calibrated. Currently disabled to avoid false halts during paper trading. | ⬜ |
+| 10.10 | **Durable position ownership** — on restart, restore strategy→symbol ownership from trade DB (last open-but-not-closed trade per symbol) instead of best-effort slot ordering. Guards against misattribution in multi-strategy setups after a crash. See `TODO Phase 10` in `engine/trader.py`. | ⬜ |
+| 10.11 | **Harden restart reconciliation** — if broker positions, open orders, and trade DB state cannot be fully reconciled on startup, log CRITICAL and enter a safe (no-new-entries) mode until operator confirms. Current behavior is best-effort. | ⬜ |
+| 10.12 | Verified: bot connects to live Alpaca endpoint in dry-run, then with 1-share manual-approval order | ⬜ |
 
-**Exit Criteria:** Bot can switch to live via config. First live order requires explicit human approval. Hard dollar cap is enforced. Paper and live data are never co-mingled. Order state is maintained via WebSocket streaming, not polling.
+**Exit Criteria:** Bot can switch to live via config. First live order requires explicit human approval. Hard dollar cap is enforced. Paper and live data are never co-mingled. Order state is maintained via WebSocket streaming, not polling. Slippage-drift kill switch is enabled and calibrated.
 
 ---
 

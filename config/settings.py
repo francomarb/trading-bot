@@ -46,6 +46,14 @@ BROKER_ERROR_WINDOW_SECONDS = 300    # ... within this rolling window (5 min)
 # Slippage-drift kill switch
 SLIPPAGE_DRIFT_MIN_SAMPLES = 10      # Need at least this many fills before judging
 SLIPPAGE_DRIFT_MULTIPLIER = 3.0      # Halt if mean realized slippage > k * mean modeled
+# Enable the slippage-drift kill switch. Disabled by default during paper trading
+# because modeled slippage has not yet been calibrated against real fills.
+# Enable once you have enough paper fills to validate the threshold (≥ min_samples).
+# Must be True before going live (Phase 10).
+SLIPPAGE_DRIFT_ENABLED = False
+# Expected execution cost for MARKET orders in bps. Matches the backtest default
+# (runner.py slippage_bps=5). LIMIT orders model 0 bps (price is controlled).
+SLIPPAGE_MODEL_MARKET_BPS = 5.0
 
 # ── Engine settings (Phase 8) ────────────────────────────────────────────────
 ATR_LENGTH = 14                     # ATR window the engine uses for stops

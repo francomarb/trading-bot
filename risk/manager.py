@@ -222,6 +222,7 @@ class RiskManager:
         broker_error_window_seconds: float = settings.BROKER_ERROR_WINDOW_SECONDS,
         slippage_min_samples: int = settings.SLIPPAGE_DRIFT_MIN_SAMPLES,
         slippage_drift_multiplier: float = settings.SLIPPAGE_DRIFT_MULTIPLIER,
+        slippage_drift_enabled: bool = settings.SLIPPAGE_DRIFT_ENABLED,
     ) -> None:
         # Validate config — bad knobs should fail loudly at construction, not
         # silently disable a rule mid-session.
@@ -250,6 +251,7 @@ class RiskManager:
         if slippage_drift_multiplier <= 1:
             raise ValueError("slippage_drift_multiplier must be > 1")
 
+        self.slippage_drift_enabled = slippage_drift_enabled
         self.max_position_pct = max_position_pct
         self.max_open_positions = max_open_positions
         self.max_gross_exposure_pct = max_gross_exposure_pct
@@ -346,30 +348,51 @@ class RiskManager:
     ) -> None:
         """
         Append a fill-slippage sample. Once we have at least
-        `slippage_min_samples`, engages the kill switch if mean realized
+        `slippage_min_samples`, logs drift metrics and — if
+        `slippage_drift_enabled` — engages the kill switch when mean realized
         exceeds `slippage_drift_multiplier × mean modeled`.
 
         Both inputs must be non-negative bps (absolute slippage cost).
+
+        The kill switch is disabled by default (SLIPPAGE_DRIFT_ENABLED=False)
+        during paper trading. Enable only after calibrating the modeled baseline
+        against real fills. Must be enabled before going live (Phase 10).
         """
         if modeled_bps < 0 or realized_bps < 0:
             raise ValueError("slippage bps must be non-negative")
         self._slippage_samples.append((modeled_bps, realized_bps))
-        if len(self._slippage_samples) < self.slippage_min_samples:
+        n = len(self._slippage_samples)
+        if n < self.slippage_min_samples:
             return
-        modeled_mean = sum(m for m, _ in self._slippage_samples) / len(
-            self._slippage_samples
+        modeled_mean = sum(m for m, _ in self._slippage_samples) / n
+        realized_mean = sum(r for _, r in self._slippage_samples) / n
+
+        logger.debug(
+            f"slippage monitor: realized={realized_mean:.2f}bps "
+            f"modeled={modeled_mean:.2f}bps n={n} "
+            f"threshold={self.slippage_drift_multiplier}× "
+            f"enabled={self.slippage_drift_enabled}"
         )
-        realized_mean = sum(r for _, r in self._slippage_samples) / len(
-            self._slippage_samples
-        )
-        # If we modeled zero slippage, any positive realized slippage is drift —
-        # treat zero-modeled as a tiny epsilon so the ratio is meaningful.
-        baseline = max(modeled_mean, 1e-9)
-        if realized_mean > self.slippage_drift_multiplier * baseline:
+
+        # Guard: if modeled baseline is zero we have nothing to compare against.
+        # Skip the ratio check rather than using an epsilon that would fire on
+        # any positive realized slippage.
+        if modeled_mean == 0.0:
+            logger.warning(
+                f"slippage monitor: modeled mean is 0 — skipping drift check "
+                f"(realized={realized_mean:.2f}bps, n={n}). "
+                "Set SLIPPAGE_MODEL_MARKET_BPS to a non-zero value to enable."
+            )
+            return
+
+        if not self.slippage_drift_enabled:
+            return
+
+        if realized_mean > self.slippage_drift_multiplier * modeled_mean:
             self._engage_kill_switch(
                 f"slippage drift: realized mean {realized_mean:.2f}bps > "
                 f"{self.slippage_drift_multiplier}× modeled mean {modeled_mean:.2f}bps "
-                f"(n={len(self._slippage_samples)})"
+                f"(n={n})"
             )
 
     # ── Internal helpers ─────────────────────────────────────────────────

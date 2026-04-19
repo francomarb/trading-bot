@@ -83,7 +83,11 @@ def _signal(
 
 
 def _mgr(**overrides) -> RiskManager:
-    """RiskManager with deterministic, easy-to-reason-about defaults."""
+    """RiskManager with deterministic, easy-to-reason-about defaults.
+
+    slippage_drift_enabled defaults to True in tests so existing drift tests
+    work without change. Production default is False (paper calibration phase).
+    """
     defaults = dict(
         max_position_pct=0.02,
         max_open_positions=3,
@@ -97,6 +101,7 @@ def _mgr(**overrides) -> RiskManager:
         broker_error_window_seconds=60,
         slippage_min_samples=5,
         slippage_drift_multiplier=3.0,
+        slippage_drift_enabled=True,   # tests exercise the kill switch directly
     )
     defaults.update(overrides)
     return RiskManager(**defaults)
@@ -508,6 +513,40 @@ class TestSlippageDrift:
         mgr = _mgr()
         with pytest.raises(ValueError):
             mgr.record_fill_slippage(modeled_bps=-1.0, realized_bps=5.0)
+
+    def test_zero_modeled_skips_ratio_check_no_halt(self):
+        """modeled_bps=0 must not trigger the kill switch via epsilon trick.
+        Previously the code used max(modeled_mean, 1e-9) which caused any
+        positive realized slippage to exceed the threshold."""
+        mgr = _mgr(slippage_min_samples=5, slippage_drift_multiplier=3.0)
+        for _ in range(5):
+            mgr.record_fill_slippage(modeled_bps=0.0, realized_bps=50.0)
+        assert not mgr.is_halted()
+
+    def test_flag_disabled_prevents_halt(self):
+        """With slippage_drift_enabled=False the kill switch never fires,
+        even when the ratio clearly exceeds the threshold."""
+        mgr = _mgr(
+            slippage_min_samples=5,
+            slippage_drift_multiplier=3.0,
+            slippage_drift_enabled=False,
+        )
+        for _ in range(5):
+            mgr.record_fill_slippage(modeled_bps=5.0, realized_bps=100.0)
+        assert not mgr.is_halted()
+
+    def test_flag_enabled_still_halts_on_drift(self):
+        """Sanity-check: when the flag is explicitly enabled, the kill switch
+        fires normally on genuine drift."""
+        mgr = _mgr(
+            slippage_min_samples=5,
+            slippage_drift_multiplier=3.0,
+            slippage_drift_enabled=True,
+        )
+        for _ in range(5):
+            mgr.record_fill_slippage(modeled_bps=5.0, realized_bps=20.0)
+        assert mgr.is_halted()
+        assert "slippage drift" in mgr.halt_reason()
 
 
 # ── RiskDecision invariants ─────────────────────────────────────────────────

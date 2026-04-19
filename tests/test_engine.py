@@ -450,11 +450,11 @@ class TestShutdown:
 
 
 class TestSlippageRecording:
-    def test_realized_slippage_fed_to_risk(self, engine_factory):
-        # Last bar close in synthetic data: see _bars(); 60 bars, base=100,
-        # closes = base + (i%7)*0.5 → close[59] = 100 + (59%7)*0.5 = 101.5
+    def test_market_order_uses_model_bps(self, engine_factory):
+        """MARKET entries use SLIPPAGE_MODEL_MARKET_BPS (5.0) as modeled cost."""
+        from config.settings import SLIPPAGE_MODEL_MARKET_BPS
+
         modeled_close = 101.5
-        # Realized fill 101.70 — ~19.7 bps slippage on the buy side.
         engine, broker = engine_factory(
             entries=[False] * 59 + [True],
             place_result=_filled_result("AAPL", 1, modeled_close + 0.20),
@@ -463,11 +463,45 @@ class TestSlippageRecording:
         engine._session_start_equity = snap.account.equity
         slot = engine.slots[0]
         engine._process_symbol("AAPL", snap, slot.strategy, slot.timeframe)
-        # Exactly one slippage sample fed to risk.
+
         assert len(engine.risk._slippage_samples) == 1
         modeled_bps, realized_bps = engine.risk._slippage_samples[0]
-        assert modeled_bps == 0.0
+        # MARKET order → modeled cost is the configured baseline, not 0.
+        assert modeled_bps == pytest.approx(SLIPPAGE_MODEL_MARKET_BPS)
         assert realized_bps == pytest.approx(0.20 / modeled_close * 10_000, rel=1e-3)
+
+    def test_limit_order_models_zero_bps(self, engine_factory):
+        """LIMIT entries model 0 bps — the fill price is controlled by the limit."""
+        modeled_close = 101.5
+        engine, broker = engine_factory(
+            entries=[False] * 59 + [True],
+            place_result=_filled_result("AAPL", 1, modeled_close + 0.05),
+        )
+        snap = _snapshot()
+        engine._session_start_equity = snap.account.equity
+        slot = engine.slots[0]
+        # Override the strategy's preferred order type so the Signal carries LIMIT.
+        slot.strategy.preferred_order_type = OrderType.LIMIT
+        # Risk also needs a limit_price on the signal — patch evaluate to return
+        # a valid LIMIT RiskDecision instead of going through full sizing logic.
+        from risk.manager import RiskDecision, Side
+        limit_decision = RiskDecision(
+            symbol="AAPL",
+            side=Side.BUY,
+            qty=1,
+            entry_reference_price=modeled_close,
+            stop_price=modeled_close - 5.0,
+            strategy_name="fake_strategy",
+            reason="test",
+            order_type=OrderType.LIMIT,
+            limit_price=modeled_close,
+        )
+        engine.risk.evaluate = MagicMock(return_value=limit_decision)
+        engine._process_symbol("AAPL", snap, slot.strategy, slot.timeframe)
+
+        assert len(engine.risk._slippage_samples) == 1
+        modeled_bps, _ = engine.risk._slippage_samples[0]
+        assert modeled_bps == 0.0
 
 
 # ── Multi-slot ──────────────────────────────────────────────────────────────

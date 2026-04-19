@@ -52,6 +52,7 @@ import pandas as pd
 from loguru import logger
 
 from config import settings
+from config.settings import SLIPPAGE_MODEL_MARKET_BPS
 from data.fetcher import StaleDataError, close_connections, fetch_symbol, require_fresh
 from execution.broker import (
     AlpacaBroker,
@@ -227,12 +228,26 @@ class TradingEngine:
         # with existing positions, assign each to the *first* slot whose
         # symbol list includes it.  This is best-effort — an operator who
         # reshuffles slot configs between restarts should review manually.
+        # TODO Phase 10: restore ownership from trade DB (last open trade per
+        # symbol) instead of guessing from slot ordering. See PLAN.md §10.
         for sym in startup_snapshot.account.open_positions:
             if sym not in self._position_owners:
+                matched = False
                 for slot in self.slots:
                     if sym in slot.active_symbols():
                         self._position_owners[sym] = slot.strategy.name
+                        logger.info(
+                            f"restart: assigned existing position {sym} "
+                            f"→ '{slot.strategy.name}' (best-effort slot match)"
+                        )
+                        matched = True
                         break
+                if not matched:
+                    logger.warning(
+                        f"restart: open position {sym} does not belong to any "
+                        "configured slot — it will NOT be managed by this engine. "
+                        "Close it manually or add it to a strategy's symbol universe."
+                    )
 
         slot_desc = ", ".join(
             f"{s.strategy.name}({len(s.active_symbols())})"
@@ -406,7 +421,8 @@ class TradingEngine:
                 return
             try:
                 result = self.broker.close_position(symbol)
-                self._record_fill(result, modeled_price=latest_close)
+                # close_position always uses MARKET (hard-risk exit).
+                self._record_fill(result, modeled_price=latest_close, order_type="market")
                 self._log_close(result, latest_close, strategy.name)
                 # Release ownership.
                 self._position_owners.pop(symbol, None)
@@ -445,7 +461,11 @@ class TradingEngine:
 
         try:
             result = self.broker.place_order(decision)
-            self._record_fill(result, modeled_price=latest_close)
+            self._record_fill(
+                result,
+                modeled_price=latest_close,
+                order_type=decision.order_type.value,
+            )
             self._log_entry(decision, result, latest_close)
             # Register ownership so only this strategy can exit the position.
             if result.status in {OrderStatus.FILLED, OrderStatus.PARTIAL}:
@@ -457,17 +477,29 @@ class TradingEngine:
 
     # ── Post-fill bookkeeping ────────────────────────────────────────────
 
-    def _record_fill(self, result: OrderResult, *, modeled_price: float) -> None:
+    def _record_fill(
+        self,
+        result: OrderResult,
+        *,
+        modeled_price: float,
+        order_type: str = "market",
+    ) -> None:
         """
         Feed the realized vs. modeled slippage into the Phase 6 drift kill
         switch. Modeled fill = the bar close we acted on; realized fill =
         what Alpaca actually gave us.
+
+        Modeled slippage uses SLIPPAGE_MODEL_MARKET_BPS for MARKET orders
+        (matches the backtest default of 5 bps) and 0 bps for LIMIT orders
+        (the fill price is controlled by the limit).
         """
         if result.status not in {OrderStatus.FILLED, OrderStatus.PARTIAL}:
             return
         if result.avg_fill_price is None or modeled_price <= 0:
             return
-        modeled_bps = 0.0
+        modeled_bps = (
+            0.0 if order_type == "limit" else SLIPPAGE_MODEL_MARKET_BPS
+        )
         realized_bps = (
             abs(result.avg_fill_price - modeled_price) / modeled_price * 10_000
         )
