@@ -32,6 +32,10 @@ from __future__ import annotations
 
 import math
 from dataclasses import dataclass
+from typing import TYPE_CHECKING
+
+if TYPE_CHECKING:
+    import pandas as pd
 
 
 # ── Constants ───────────────────────────────────────────────────────────────
@@ -45,6 +49,52 @@ MAX_DRAWDOWN_THRESHOLD = 0.15  # 15%
 PROFIT_FACTOR_THRESHOLD = 1.3
 WIN_RATE_THRESHOLD = 0.45  # 45%
 AVG_WIN_LOSS_THRESHOLD = 1.5
+
+
+# ── Kelly Criterion ─────────────────────────────────────────────────────────
+
+
+def kelly_fraction(
+    returns: "pd.Series",
+    risk_free_rate: float = 0.0,
+    freq: int = TRADING_DAYS_PER_YEAR,
+) -> float:
+    """
+    Compute the Kelly optimal fraction for a strategy.
+
+    Uses the continuous-time form (Hilpisch, *Python for Algorithmic Trading*,
+    Ch. 10):
+
+        f* = (μ - r) / σ²
+
+    where μ and σ² are the *annualized* mean excess return and variance of the
+    strategy's period returns.
+
+    Args:
+        returns:         Period log or simple return series for the *strategy*
+                         (not the benchmark). Typically from the backtest equity
+                         curve: ``equity.pct_change().dropna()``.
+        risk_free_rate:  Annualized risk-free rate (default 0.0 — appropriate
+                         during paper trading when not modelling cash yield).
+        freq:            Trading periods per year used for annualization
+                         (default 252 for daily bars).
+
+    Returns:
+        Full Kelly fraction (float). Practitioners typically deploy *half Kelly*
+        (f*/2) to reduce variance. A negative return means the strategy has
+        negative expected excess return and should not be traded.
+    """
+    import pandas as pd  # local import — avoids making pandas a hard dep here
+
+    n = len(returns)
+    if n < 2:
+        return 0.0
+
+    mu = float(returns.mean() * freq)
+    sigma2 = float(returns.var() * freq)
+    if sigma2 == 0.0:
+        return 0.0
+    return (mu - risk_free_rate) / sigma2
 
 
 # ── MetricsSnapshot ────────────────────────────────────────────────────────

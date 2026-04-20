@@ -132,12 +132,21 @@ real money. Every phase has both:
 
 ### Running tests
 
-```bash
-# Unit tests (fast, offline — run constantly during dev)
-pytest
+The project virtualenv is at `venv/` inside the project root. Always invoke
+pytest via its full path — never search outside the project directory:
 
+```bash
+# Correct — use the project venv directly
+/Users/franco/trading-bot/venv/bin/pytest
+
+# Never do this — it searches the entire home directory and triggers
+# macOS permission prompts for Desktop, Documents, and every other folder:
+# find /Users/franco -name pytest   ❌
+```
+
+```bash
 # With coverage
-pytest --cov=<module> --cov-report=term-missing
+/Users/franco/trading-bot/venv/bin/pytest --cov=<module> --cov-report=term-missing
 
 # Phase integration check (hits Alpaca paper)
 python phase2_verify.py

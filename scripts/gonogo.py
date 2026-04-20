@@ -33,6 +33,9 @@ import sys
 from dataclasses import asdict, dataclass
 from datetime import datetime, timedelta
 
+import numpy as np
+
+from config import settings
 from reporting.logger import TradeLogger
 from reporting.metrics import (
     MAX_DRAWDOWN_THRESHOLD,
@@ -153,6 +156,40 @@ def check_trade_count(n_trades: int, min_trades: int = 50) -> OperationalCheck:
     )
 
 
+def check_var(pnls: list[float]) -> OperationalCheck:
+    """
+    Check that the 99% trade-level VaR does not exceed the hard dollar loss cap.
+
+    VaR here is the 1st-percentile worst single-trade P&L — i.e. the loss
+    expected to be exceeded in only 1% of trades. Requires at least 100 closed
+    trades for a meaningful estimate (the 1st percentile of fewer than 100
+    observations is just the single worst trade, which is noise not statistics);
+    returns PASS (with a note) if fewer.
+
+    Gate: |99% trade VaR| <= HARD_DOLLAR_LOSS_CAP
+    A single trade losing more than the configured cap in 1% of cases means the
+    per-trade stop-loss sizing is not protecting the hard dollar limit reliably.
+    """
+    if len(pnls) < 100:
+        return OperationalCheck(
+            name="var_99",
+            passed=True,
+            detail=f"insufficient trades for VaR ({len(pnls)} < 100) — skipped",
+        )
+
+    var_99 = float(np.percentile(pnls, 1))  # 1st percentile (worst losses)
+    cap = settings.HARD_DOLLAR_LOSS_CAP
+    passed = abs(var_99) <= cap
+    return OperationalCheck(
+        name="var_99",
+        passed=passed,
+        detail=(
+            f"99% trade VaR = ${var_99:.2f} | cap = ${cap:.2f} "
+            f"({'PASS' if passed else 'FAIL'})"
+        ),
+    )
+
+
 # ── Main ────────────────────────────────────────────────────────────────────
 
 
@@ -183,6 +220,7 @@ def run_gonogo(
     ops: list[OperationalCheck] = [
         check_trade_count(len(pnls), min_trades),
         check_trading_span(all_trades, min_weeks),
+        check_var(pnls),
     ]
 
     ops_go = all(op.passed for op in ops)

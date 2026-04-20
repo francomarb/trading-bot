@@ -9,6 +9,7 @@ pandas
 numpy
 pandas-ta
 pyarrow
+yfinance           # fundamental data for watchlist_review.py
 
 # Backtesting
 vectorbt
