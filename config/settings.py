@@ -14,13 +14,23 @@ ALPACA_BASE_URL = (
     else "https://api.alpaca.markets"
 )
 
-# Trading universe
-WATCHLIST = [
-    # Original large-cap tech
-    "AAPL", "MSFT", "GOOGL", "AMZN", "NVDA",
-    # Near or at SMA(20,50) crossover — added for forward-test signal coverage
-    "JPM", "DAL", "BAC", "GS", "PINS", "UBER", "COIN", "RIVN",
+# Strategy-specific watchlists
+# SMA Crossover — trend-following; suits Stalwarts and Fast Growers (Lynch Ch. 3)
+SMA_WATCHLIST = [
+    "AAPL", "MSFT", "GOOGL", "AMZN", "NVDA",   # stalwarts / fast growers
+    "JPM", "BAC", "GS",                          # large-cap financials (trend)
+    "PINS", "UBER",                              # growth names, acceptable for trend
 ]
+# RSI Reversion — mean-reversion; suits Turnarounds and Cyclicals (Lynch Ch. 3)
+RSI_WATCHLIST = [
+    "AAPL", "MSFT", "GOOGL", "AMZN",            # stalwarts — revert reliably
+    "DAL", "COIN",                               # cyclicals — ideal reversion candidates
+    "BAC", "JPM", "GS",                          # financial cyclicals
+    "PINS", "UBER",                              # growth names with pullback potential
+]
+# Full engine universe — union of both lists; preserves paper-run continuity.
+# NOTE: RIVN is included here but not in either strategy list — review before Phase 10.
+WATCHLIST = list(dict.fromkeys(SMA_WATCHLIST + RSI_WATCHLIST + ["RIVN"]))
 
 # ── Risk settings (Phase 6) ──────────────────────────────────────────────────
 # Position sizing

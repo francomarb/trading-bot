@@ -86,6 +86,55 @@ The system is a pipeline of 6 layers. Each cycle flows top-to-bottom:
 
 ---
 
+## Watchlist Curation Philosophy
+
+> *Source: Lynch, Peter — One Up on Wall Street (full read, 2026-04-19)*
+
+Lynch classifies every stock into six types. The type determines which strategy fits
+it — and using the wrong strategy on the wrong type is a primary source of losses.
+
+| Lynch Type | Description | Best strategy fit |
+|---|---|---|
+| **Fast Grower** | 20–25% earnings growth, expanding into new markets | SMA crossover (multi-year uptrends) |
+| **Stalwart** | Large, profitable, 10–12% growth, brand moat | SMA crossover (slower, steadier trends) |
+| **Turnaround** | Battered/depressed, coming back | RSI reversion + fundamental filter |
+| **Cyclical** | Autos, airlines, banks, chemicals — expand/contract with economy | RSI reversion at cycle troughs; **avoid** for SMA trend |
+| **Slow Grower** | Mature, growing ~GNP rate, dividend-heavy utilities | Neither strategy — no edge |
+| **Asset Play** | Undervalued assets on balance sheet | Neither strategy |
+
+### Current watchlist assessment
+
+| Symbol | Lynch Type | SMA fit | Flag |
+|---|---|---|---|
+| AAPL | Stalwart | ✅ | — |
+| MSFT | Fast Grower → Stalwart | ✅ | — |
+| GOOGL | Fast Grower → Stalwart | ✅ | — |
+| AMZN | Fast Grower | ✅ | — |
+| NVDA | Fast Grower (hot industry) | ⚠️ | AI narrative-driven; high P/E; sharp reversal risk if narrative breaks. Lynch Ch. 9: *"hot stocks in hot industries... the ones that go up the most come down the most"* |
+| JPM | Financial Cyclical | ⚠️ | Earnings tied to rate/credit cycle; expect whipsaw on rate reversals |
+| BAC | Financial Cyclical | ⚠️ | Same as JPM |
+| GS | Financial Cyclical | ⚠️ | M&A/IPO revenues highly cyclical; trend collapses fast at cycle turn |
+| DAL | Pure Cyclical (airline) | ❌ | Lynch's textbook example of the worst investment: no moat, commodity pricing, fuel/labour cost exposure. SMA crossover will be late to exit. Better candidate for RSI reversion at cycle trough. |
+| PINS | Fading Fast Grower | ⚠️ | User growth decelerating; watch for PEG expansion |
+| UBER | Turnaround → Fast Grower | ⚠️ | Now profitable, network moat exists; still early track record |
+| COIN | Crypto Cyclical | ❌ | Boom/bust directly tied to crypto cycle, not earnings-driven trends. Extremely high volatility; SMA will give very late exit signals. Better for RSI reversion during crypto drawdowns. |
+| RIVN | Pre-profit / Whisper Stock | ❌ | No earnings, cash-burning. Lynch Ch. 15: *"I've lost money on every single whisper stock I've ever bought."* No P/E ratio, no fundamental trend anchor. Remove before going live. |
+
+### Rules for watchlist changes
+
+- **Do not change the watchlist mid-paper-run** — it invalidates the forward-test
+  reconciliation comparison. Review and revise *after* the paper run concludes and
+  *before* Phase 10 live flip.
+- **Pre-screen for live watchlist** (Lynch Ch. 13): positive earnings for ≥ 2 consecutive
+  years, PEG ratio < 1.5 at entry, no active bank-debt crisis, not in a single sector
+  with > 3 other symbols.
+- **Cyclicals (DAL, COIN) are not removed — they are relabelled.** Keep them as
+  RSI mean-reversion candidates for Phase 11; remove them from the SMA crossover slot.
+- **RIVN** should be removed entirely before going live. Pre-profit companies provide
+  no earnings anchor for a sustained trend.
+
+---
+
 ## Phase Details
 
 ---
@@ -181,6 +230,17 @@ without slippage, walk-forward validation, and look-ahead checks is a marketing 
 **Exit Criteria:** Backtest runs end-to-end with slippage, commission, and look-ahead-safe timing. Walk-forward and parameter-sensitivity reports are generated. Equity curve PNG saved.
 
 **Note on survivorship bias:** for single-symbol backtests on large-cap liquid names (AAPL, etc.) survivorship is not a concern. If/when this bot trades a dynamic universe, revisit.
+
+**Note on limit order fill realism *(Hilpisch, Ch. 6 — Event-Based Backtesting)*:**
+Vectorized backtesting (vectorbt) assumes a limit order fills whenever price touches the
+limit level during a bar. In reality a limit order may sit unfilled, partially fill, or be
+skipped entirely if price gaps through it. For market-order strategies like SMA crossover
+this is not a concern. For **RSI reversion**, which relies on limit entries, vectorized
+backtesting will systematically overestimate fill rates and therefore overestimate returns.
+When RSI reversion is added in Phase 11, consider supplementing the vectorbt backtest
+with an event-based backtester that processes each bar and explicitly checks whether the
+limit was touched and held long enough to fill. See `backtest/runner.py` for the existing
+harness; an event-based variant would sit alongside it, not replace it.
 
 ---
 
@@ -464,6 +524,35 @@ Hard dollar cap ($500 initial) enforced. Paper and live trade DBs are separate f
 
 ---
 
+#### Group G — Cloud Infrastructure *(Deferred — requires a VPS)*
+
+> **Why deferred:** Running live trading from a local Mac with tmux + caffeinate is
+> not appropriate for real capital. A power outage, sleep cycle, or Wi-Fi drop kills
+> the process and can leave open positions unmanaged. This group is not a blocker for
+> the paper run or the initial live flip, but **must be resolved before sustained live
+> operation** (i.e. within the first few weeks of live trading).
+>
+> *Hilpisch, Python for Algorithmic Trading, Ch. 10:* "A simple loss of the web
+> connection or a brief power outage might bring down the whole algorithm, leaving,
+> for example, unintended open positions in the portfolio."
+
+| # | Deliverable | Complexity | Status |
+|---|---|---|---|
+| 10.G1 | **Provision a cloud VPS** — DigitalOcean, Hetzner, Linode, or equivalent. Minimum spec: 1 vCPU, 1 GB RAM, SSD, reliable uptime SLA (99.9%+). Prefer a region close to Alpaca's data centers (US East). | Operational | ⬜ |
+| 10.G2 | **Systemd service unit** — `trading-bot.service` that starts `python forward_test.py` on boot, restarts automatically on crash (`Restart=always`, `RestartSec=10`). Replaces `start_bot.sh` + tmux for production. | Low (~20 lines config) | ⬜ |
+| 10.G3 | **Secure key management on VPS** — `config/.env` copied to the VPS via `scp` (never committed). SSH key-only access. Firewall (`ufw`) allowing only SSH inbound. | Operational | ⬜ |
+| 10.G4 | **Remote monitoring** — `reporting/monitor.py` ZeroMQ PUB socket that publishes cycle events (fills, rejections, kill-switch trips, halts). Companion `scripts/monitor_client.py` SUB script runs locally. Allows real-time observation without SSH. See Hilpisch Ch. 10 pattern. | Medium (~80 lines) | ⬜ |
+| 10.G5 | **Log shipping** — either `rsync` cron or a lightweight agent to pull `logs/` from the VPS daily. Ensures logs survive a VPS rebuild. | Low | ⬜ |
+
+**Notes:**
+- Until 10.G1–10.G3 are done, keep `start_bot.sh` (tmux) as the launch mechanism and
+  accept the local-machine reliability risk during early live operation.
+- 10.G4 (ZeroMQ monitor) can be implemented locally before the VPS is provisioned —
+  it will still work over `localhost` for local observation during the paper run.
+- `systemd` is Linux-only; on the VPS this replaces caffeinate entirely.
+
+---
+
 ### Phase 11 — Multi-Strategy, Regime Detection & Portfolio Layer
 **Goal:** Once the single-strategy bot has demonstrated a baseline edge in live trading
 (positive expectancy, survived a drawdown, execution quality as expected), expand to a
@@ -485,6 +574,13 @@ window (minimum 4–8 weeks live) with acceptable performance. Complexity is ear
 | 11.9 | **Strategy re-enable workflow** — disabled strategies require manual review + a fresh paper forward-test before being re-enabled with capital | ⬜ |
 | 11.10 | Dashboard / report: per-strategy P&L, regime history, capital allocation over time | ⬜ |
 | 11.11 | **Websocket streaming** (`data/stream.py`) — if any intraday strategy is added, replace REST polling with `alpaca-py` `StockDataStream` for real-time bars/quotes/trades. Daily-bar strategies can continue on REST polling; streaming is only needed when sub-minute latency matters. | ⬜ |
+| 11.12 | **Event-based backtester for limit orders** — supplement `backtest/runner.py` with a bar-by-bar event-driven harness that models limit order fill realism (price must touch and hold). Required for honest RSI reversion backtesting. *(Hilpisch, Ch. 6 — Event-Based Backtesting)* | ⬜ |
+| 11.13 | **ML edge filter** — train a direction classifier (logistic regression or AdaBoost) on lagged log-return features; plug it into `BaseStrategy` via the existing `edge_filter` hook to gate SMA/RSI entries during unfavourable regimes. The `edge_filter(df) -> pd.Series[bool]` interface in `strategies/base.py` is already designed for this — zero architecture changes needed. *(Hilpisch, Ch. 5 — ML-Based Strategy + Ch. 10 — Online Algorithm)* | ⬜ |
+| 11.14 | **Incremental online signal generation** — if any intraday strategy is added, refactor `generate_signals()` from full-history recomputation to an incremental deque-based algorithm that processes one new bar at a time. Full-history recomputation is fine for daily bars; wasteful at 1-minute resolution. *(Hilpisch, Ch. 7 — Online Algorithm pattern)* | ⬜ |
+| 11.15 | **Fundamental health filter for RSI mean-reversion** — buying oversold stocks without a balance sheet check is structurally exposed to catastrophic losses: an oversold stock with heavy *bank* debt (callable on demand) can go to zero before it reverts. Pre-screen RSI universe for: (a) positive earnings for ≥ 2 years, (b) net cash positive or long-term (funded) debt only — no bank debt crisis, (c) inventory growth not outpacing revenue growth (Lynch's red flag for cyclicals). *(Lynch, One Up on Wall Street, Ch. 13 — Some Famous Numbers; Ch. 19 — The Cyclical)* | ⬜ |
+| 11.16 | **Category-aware ATR stop multiplier** — the current flat `ATR_STOP_MULTIPLIER = 2.0` is applied to all symbols equally. Lynch's framework implies fast growers and turnarounds need wider stops (higher volatility, larger legitimate swings) than stalwarts. Consider per-symbol or per-category multiplier config. *(Lynch, One Up on Wall Street, Ch. 11 — Two-Minute Drill)* | ⬜ |
+| 11.17 | **Sector concentration cap on watchlist** — Lynch Ch. 9 documents how hot-industry stocks rise together and fall together (disk drives 1981–83, oil service stocks, home shopping). Cap the watchlist at ≤ 3 symbols per GICS sector to prevent a single sector rotation from producing a correlated drawdown across multiple open positions simultaneously. | ⬜ |
+| 11.18 | **Watchlist two-stage pre-screen** — before applying the SMA crossover signal, filter the candidate universe by: PEG ratio < 1.5 (Lynch: *"the P/E of any fairly priced company will equal its growth rate"*), ≥ 2 years positive earnings, not a pure cyclical (airlines, autos, basic materials). Cyclicals route to RSI reversion only. *(Lynch, One Up on Wall Street, Ch. 13)* | ⬜ |
 
 **Exit Criteria:** Bot runs 2–3 strategies concurrently, each gated to its appropriate regime, with portfolio-level caps enforced and automatic health-based capital adjustments. A degrading strategy is automatically throttled without operator intervention.
 
@@ -494,6 +590,10 @@ window (minimum 4–8 weeks live) with acceptable performance. Complexity is ear
 
 | Date | Note |
 |---|---|
+| 2026-04-20 | **Multi-strategy watchlist architecture implemented.** `config/settings.py` now has `SMA_WATCHLIST` (10 symbols: stalwarts/fast growers + large-cap financials) and `RSI_WATCHLIST` (11 symbols: stalwarts + cyclicals + financial cyclicals). `WATCHLIST` is computed as the ordered union of both lists plus RIVN (kept for paper-run continuity, not yet assigned to either strategy). The watchlist review script was redesigned around strategy-specific `CheckProfile` objects: SMA profile requires positive FCF and revenue growth (failing either = POOR FIT); RSI profile treats both as informational only (failing = MARGINAL, not POOR FIT). Solvency is always required for both, with different floors (18-month for SMA, 12-month for RSI). Output is a strategy-fitness matrix showing GOOD FIT / MARGINAL / POOR FIT per symbol per strategy. A scanner (`scripts/scanner.py`) is deferred to Phase 11 when RSI is live and has consumers; scanner design: Stage 1 Alpaca equity screener (fast universe filter) → Stage 2 technical pre-screen (ATR, volume) → Stage 3 yfinance fundamental routing (same CheckProfile logic). Full suite: 424 tests passing. |
+| 2026-04-20 | **Book review: Lynch — *Beating the Street* (full read). Three solid-keep findings implemented immediately; two "keep with caution" and six skip decisions made.** Implemented: (1) `scripts/watchlist_review.py` — Lynch six-month checkup operationalised as a runnable script (Ch. 15 FCF check, Ch. 21 revenue growth check, Golden Rules cash solvency check). Outputs a markdown report; exit 0 = all pass, exit 1 = failures found. Run before any watchlist change and before the Phase 10 live flip. 48 unit tests added. `yfinance` added to requirements.txt. (2) FCF positivity and cash solvency are the admission gate for any new RSI reversion symbol — coded into the script. (3) Revenue growth ≥ 0% YoY required for consumer/growth names in RSI universe. **Deliberately skipped:** January Effect (academically arbitraged since ~2000), sum-of-parts valuation (priced in continuously by sell-side), "lousy industry" preference (captured by existing market-cap/beta filters), pent-up demand indicator (data-intensive, well-known to institutions), insider buying Form 4 (low signal for large caps), Russell/S&P P/E spread (wrong tool for 13-symbol universe). **"Keep with caution" deferred:** cyclical P/E inversion filter and P/E divergence stop tightener — both were judged likely to create more problems than they solve at current stage; neither is implemented. |
+| 2026-04-20 | **Book review: Lynch — *One Up on Wall Street* (full read).** Five findings folded into the plan: (1) *Ch. 3 + 11* — Six-category framework (Fast Grower / Stalwart / Turnaround / Cyclical / Slow Grower / Asset Play) determines which strategy fits each stock. SMA crossover suits Stalwarts and Fast Growers; RSI reversion suits Turnarounds and Cyclicals. Current watchlist assessment added to **Watchlist Curation Philosophy** section: AAPL/MSFT/GOOGL/AMZN ✅ for trend-following; JPM/BAC/GS/NVDA/PINS/UBER ⚠️ acceptable with caveats; DAL/COIN/RIVN ❌ wrong category for SMA — reclassify DAL/COIN as RSI reversion candidates, remove RIVN before Phase 10 (do not change mid-paper-run). (2) *Ch. 13* — PEG < 1.5 + ≥2 years positive earnings as a two-stage pre-screen before any symbol enters the RSI watchlist (logged as Phase 11 item 11.18). (3) *Ch. 13 + 19* — Fundamental health filter for RSI reversion: reject positions if inventory/sales ratio rising, earnings declining, or bank debt present (item 11.15). (4) *Ch. 11* — Category-aware ATR stop multiplier: wider stops (k=3.0) for cyclicals, tighter (k=1.5) for stalwarts (item 11.16). (5) *Ch. 15* — Sector concentration cap ≤ 3 symbols per GICS sector to prevent correlated drawdowns (item 11.17). No immediate code changes; all items are Phase 11 or deferred to watchlist revision before Phase 10. |
+| 2026-04-19 | **Book review: Hilpisch — *Python for Algorithmic Trading* (full read).** Three findings folded into the plan: (1) *Ch. 4 + 10* — VaR, max drawdown duration, and Kelly criterion added to `backtest/runner.py` `compute_stats()` and `scripts/gonogo.py`. Kelly is informational-only until ~200 trades (RSI reversion will provide the volume). (2) *Ch. 6* — Vectorized backtesting overestimates limit order fill rates; an event-based backtester is needed for honest RSI reversion validation (logged as Phase 11 item 11.12). (3) *Ch. 5 + 7* — ML direction classifier maps directly onto the existing `edge_filter` hook in `BaseStrategy` (11.13); incremental online signal generation is needed only if intraday strategies are added (11.14). Cloud deployment pattern (Ch. 10 ZeroMQ + systemd) logged in Phase 10 Group G. Nothing from the book required immediate code changes beyond the stats improvements. |
 | — | Project initialized. Stack confirmed: Python 3.12, Alpaca, pandas, pandas-ta, vectorbt. |
 | — | Starting with SMA crossover as the first strategy; architecture is strategy-agnostic. |
 | — | Paper trading only until Phase 10. |

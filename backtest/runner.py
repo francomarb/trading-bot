@@ -39,6 +39,7 @@ import numpy as np
 import pandas as pd
 import vectorbt as vbt
 
+from reporting.metrics import kelly_fraction
 from strategies.base import BaseStrategy
 
 # ── Config ──────────────────────────────────────────────────────────────────
@@ -82,6 +83,59 @@ class BacktestResult:
 
     def drawdown(self) -> pd.Series:
         return self.portfolio.drawdown()
+
+    def format_stats(self) -> str:
+        """
+        Human-readable summary of all backtest stats.
+
+        Includes a reliability caveat on the Kelly numbers: the estimate is
+        noise-dominated below ~200 trades (typical for daily-bar strategies
+        with short track records). Use Kelly as a sanity check on
+        MAX_POSITION_PCT, not as a precise sizing instruction.
+        """
+        s = self.stats
+        n = int(s.get("trade_count", 0))
+
+        kelly_note = (
+            f"  ⚠  unreliable below ~200 trades ({n} here) — informational only"
+            if n < 200
+            else f"  ({n} trades — estimate is reasonably stable)"
+        )
+
+        lines = [
+            f"Backtest: {self.strategy_name} on {self.symbol}",
+            f"  Config : cash=${self.config.initial_cash:,.0f}  "
+            f"slippage={self.config.slippage_bps}bps  "
+            f"commission=${self.config.commission_per_trade:.2f}",
+            "",
+            "── Returns ──────────────────────────────────────────",
+            f"  Total return : {s['total_return']:+.1%}",
+            f"  CAGR         : {s['cagr']:+.1%}",
+            f"  Final equity : ${s['final_equity']:,.2f}",
+            "",
+            "── Risk ─────────────────────────────────────────────",
+            f"  Sharpe       : {s['sharpe']:.2f}",
+            f"  Sortino      : {s['sortino']:.2f}",
+            f"  Max drawdown : {s['max_drawdown']:.1%}",
+            f"  Max DD days  : {int(s['max_dd_days'])} calendar days",
+            f"  VaR 95%      : {s['var_95']:.2%} per period",
+            f"  VaR 99%      : {s['var_99']:.2%} per period",
+            f"  VaR 99.9%    : {s['var_999']:.2%} per period",
+            "",
+            "── Trades ───────────────────────────────────────────",
+            f"  Count        : {n}",
+            f"  Win rate     : {s['win_rate']:.1%}",
+            f"  Profit factor: {s['profit_factor']:.2f}",
+            f"  Expectancy   : ${s['expectancy']:.2f}",
+            f"  Avg win      : ${s['avg_win']:.2f}",
+            f"  Avg loss     : ${s['avg_loss']:.2f}",
+            "",
+            "── Kelly Criterion (reference only) ─────────────────",
+            f"  Full Kelly   : {s['kelly_full']:.2f}×",
+            f"  Half Kelly   : {s['kelly_half']:.2f}×",
+            kelly_note,
+        ]
+        return "\n".join(lines)
 
 
 # ── Core run ────────────────────────────────────────────────────────────────
@@ -187,12 +241,51 @@ def compute_stats(pf: vbt.Portfolio, initial_cash: float) -> dict[str, float]:
         except Exception:
             return default
 
+    # ── Max drawdown duration ────────────────────────────────────────────
+    # Longest period (in calendar days) between consecutive equity highs.
+    # A strategy with an acceptable max-drawdown % but a 600-day recovery
+    # period is operationally different from one that recovers in 30 days.
+    cummax = equity.cummax()
+    dd_series = cummax - equity
+    at_high = dd_series[dd_series == 0.0]
+    if len(at_high) >= 2:
+        gaps = at_high.index[1:] - at_high.index[:-1]
+        max_dd_days = int(gaps.max().days)
+    else:
+        # Never recovered to a new high after the first bar — use full span.
+        max_dd_days = int((equity.index[-1] - equity.index[0]).days)
+
+    # ── Value at Risk (VaR) ───────────────────────────────────────────────
+    # Per-period return distribution. Reported as a *negative* number
+    # (a loss), matching the convention: "99% VaR = -2.1%" means the
+    # strategy loses more than 2.1% in only 1% of periods.
+    period_returns = equity.pct_change().dropna()
+    if len(period_returns) >= 10:
+        var_95  = float(np.percentile(period_returns, 5.0))
+        var_99  = float(np.percentile(period_returns, 1.0))
+        var_999 = float(np.percentile(period_returns, 0.1))
+    else:
+        var_95 = var_99 = var_999 = float("nan")
+
+    # ── Kelly Criterion ───────────────────────────────────────────────────
+    # Optimal fraction of equity to deploy, derived from strategy's own
+    # return series. f* = (μ - r) / σ² (Hilpisch Ch. 10).
+    # Practitioners use half-Kelly to halve variance.
+    kelly_full = kelly_fraction(period_returns)
+    kelly_half = kelly_full / 2.0
+
     return {
         "total_return": float(total_return),
         "cagr": float(cagr),
         "sharpe": _safe(pf.sharpe_ratio),
         "sortino": _safe(pf.sortino_ratio),
         "max_drawdown": _safe(pf.max_drawdown),
+        "max_dd_days": float(max_dd_days),
+        "var_95": var_95,
+        "var_99": var_99,
+        "var_999": var_999,
+        "kelly_full": kelly_full,
+        "kelly_half": kelly_half,
         "profit_factor": profit_factor,
         "expectancy": expectancy,
         "trade_count": float(n_trades),
