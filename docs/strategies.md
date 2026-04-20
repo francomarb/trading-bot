@@ -43,6 +43,17 @@ Both signals require a confirmed crossover — the previous bar must have been o
 
 **Required bars:** `slow` (e.g. 50 with defaults)
 
+**Exit mechanics:**
+
+A position closes when whichever of the following occurs first:
+
+| Trigger | Mechanism | Code |
+|---|---|---|
+| Bearish crossunder | Fast SMA crosses below slow SMA → strategy emits an exit signal | `strategies/sma_crossover.py` |
+| ATR stop-loss | Price falls to `entry_price − (ATR × multiplier)` → broker stop order fires | `risk/manager.py` |
+
+There is **no fixed take-profit target.** The strategy is designed to let winners run for as long as the trend holds, and exit only when the trend reverses (crossunder) or the downside stop is hit. Profit captured depends entirely on how long the trend persists.
+
 **Why this strategy:**
 SMA crossover is the simplest trend-following signal. It captures sustained directional moves and naturally avoids counter-trend entries. It underperforms in sideways/choppy markets, which is why it's paired with RSI Reversion for regime diversification.
 
@@ -73,6 +84,15 @@ Both signals require a confirmed threshold crossing — the previous bar's RSI m
 | `overbought` | 70 | Exit threshold (RSI above this) |
 
 **Required bars:** `period + 1` (e.g. 15 with defaults)
+
+**Exit mechanics:**
+
+| Trigger | Mechanism | Code |
+|---|---|---|
+| Overbought RSI | RSI crosses above the overbought threshold → strategy emits an exit signal | `strategies/rsi_reversion.py` |
+| ATR stop-loss | Price falls to `entry_price − (ATR × multiplier)` → broker stop order fires | `risk/manager.py` |
+
+Unlike SMA Crossover, RSI Reversion has an implicit profit target: it exits when price has reverted enough to push RSI above the overbought level. The ATR stop handles the case where the expected reversion doesn't materialize.
 
 **Why this strategy:**
 RSI mean reversion profits when prices snap back from extremes. It performs well in ranging/sideways markets where SMA crossover suffers, providing natural regime diversification when both strategies run simultaneously.

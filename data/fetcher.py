@@ -386,6 +386,18 @@ def fetch_symbol(
         _read_meta(symbol, timeframe, adjustment) if use_cache else (None, None)
     )
 
+    # Clamp a future-dated covered_end to now so a backtest or verify script
+    # that fetched with end=<far future> can't lock out the live fetcher.
+    now_utc = datetime.now(timezone.utc)
+    if cov_end is not None and cov_end > now_utc:
+        logger.warning(
+            f"{symbol}: cache covered_end {cov_end.date()} is in the future — "
+            "clamping to now to force re-fetch of recent bars"
+        )
+        cov_end = now_utc
+
+    _, bar_interval = _TIMEFRAME_MAP[timeframe]
+
     api_calls = 0
     fetched_frames: list[pd.DataFrame] = []
 
@@ -393,7 +405,13 @@ def fetch_symbol(
     # Coverage is tracked by the sidecar meta (what we *requested*), not by
     # actual bar timestamps — weekends/holidays mean the first/last bar are
     # often strictly inside the requested window.
-    missing_ranges = _missing_ranges(cov_start, cov_end, start, end)
+    #
+    # We subtract one bar interval from cov_end before the range check so the
+    # most-recent bar is always re-fetched. This catches feed-lag gaps where
+    # IEX delivers a bar late: without this, the fetcher would mark the range
+    # as covered even though the bar never arrived, locking it out permanently.
+    effective_cov_end = cov_end - bar_interval if cov_end is not None else None
+    missing_ranges = _missing_ranges(cov_start, effective_cov_end, start, end)
 
     for rng_start, rng_end in missing_ranges:
         logger.info(
@@ -406,9 +424,10 @@ def fetch_symbol(
         if not frame.empty:
             fetched_frames.append(frame)
 
-    # New covered window = union of old coverage and this request.
+    # New covered window = union of old coverage and this request, capped at now
+    # so a future-dated end argument can never poison the coverage metadata.
     new_cov_start = min(cov_start, start) if cov_start else start
-    new_cov_end = max(cov_end, end) if cov_end else end
+    new_cov_end = min(max(cov_end, end) if cov_end else end, now_utc)
 
     if fetched_frames:
         new_data = pd.concat(fetched_frames)

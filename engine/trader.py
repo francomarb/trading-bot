@@ -436,10 +436,10 @@ class TradingEngine:
         if not last_entry:
             return
         if position is not None:
-            # Risk would reject this anyway (DUPLICATE_POSITION); short-circuit
-            # for clarity. Still let risk evaluate so the rejection is logged
-            # uniformly via the same path.
-            pass
+            # Already in this position — the crossover bar persists across
+            # intra-day cycles, so this is expected noise, not a real signal.
+            # Risk would reject anyway; skip to avoid spamming alerts.
+            return
 
         sig = Signal(
             symbol=symbol,
