@@ -331,13 +331,31 @@ class TradingEngine:
             )
             self.alerts.engine_halt(reason)
 
+        # Maintain a running account that updates after each intra-cycle fill so
+        # the gross-exposure and max-positions caps see positions opened earlier
+        # in the same cycle — not just what the broker reported at cycle start.
+        running_account = snapshot.account
+
         for slot in self.slots:
             symbols = slot.active_symbols()
             for symbol in symbols:
                 try:
-                    self._process_symbol(
-                        symbol, snapshot, slot.strategy, slot.timeframe
+                    filled = self._process_symbol(
+                        symbol, snapshot, running_account, slot.strategy, slot.timeframe
                     )
+                    if filled is not None:
+                        # Merge the new position into the running account so
+                        # the next symbol's risk.evaluate() sees it.
+                        updated_positions = {
+                            **running_account.open_positions,
+                            filled.symbol: filled,
+                        }
+                        running_account = AccountState(
+                            equity=running_account.equity,
+                            cash=running_account.cash - filled.market_value,
+                            session_start_equity=running_account.session_start_equity,
+                            open_positions=updated_positions,
+                        )
                 except Exception as e:
                     # Never let one symbol kill the cycle.
                     logger.exception(f"{symbol}: cycle step failed: {e}")
@@ -351,13 +369,16 @@ class TradingEngine:
         self,
         symbol: str,
         snapshot: BrokerSnapshot,
+        account: AccountState,
         strategy: BaseStrategy,
         timeframe: str,
-    ) -> None:
+    ) -> Position | None:
         """
-        The full per-symbol decision path. Any expected exception type
-        (StaleDataError, etc.) is caught and logged at WARNING/ERROR; the
-        outer `_run_one_cycle` catches anything unexpected.
+        The full per-symbol decision path. Returns a Position if an entry was
+        filled this call (so the cycle loop can update its running AccountState),
+        otherwise None. Any expected exception type (StaleDataError, etc.) is
+        caught and logged at WARNING/ERROR; the outer `_run_one_cycle` catches
+        anything unexpected.
         """
         # 1. Fetch bars — use enough lookback to satisfy the strategy.
         end = self._clock()
@@ -395,7 +416,7 @@ class TradingEngine:
         last_entry = bool(signals.entries.iloc[-1])
         last_exit = bool(signals.exits.iloc[-1])
 
-        position = snapshot.account.open_positions.get(symbol)
+        position = account.open_positions.get(symbol)
         logger.info(
             f"[{strategy.name}] {symbol}: bar={latest_ts.isoformat()} "
             f"close=${latest_close:.2f} atr=${latest_atr:.2f} "
@@ -450,13 +471,13 @@ class TradingEngine:
             reason=f"{strategy.name} entry @ {latest_ts.isoformat()}",
             order_type=strategy.preferred_order_type,
         )
-        decision = self.risk.evaluate(sig, snapshot.account)
+        decision = self.risk.evaluate(sig, account)
         if isinstance(decision, RiskRejection):
             # Already logged by risk; alert the operator.
             self.alerts.order_rejection(
                 symbol, strategy.name, decision.message, decision.code.value
             )
-            return
+            return None
         assert isinstance(decision, RiskDecision)
 
         try:
@@ -467,13 +488,21 @@ class TradingEngine:
                 order_type=decision.order_type.value,
             )
             self._log_entry(decision, result, latest_close)
-            # Register ownership so only this strategy can exit the position.
             if result.status in {OrderStatus.FILLED, OrderStatus.PARTIAL}:
                 self._position_owners[symbol] = strategy.name
+                fill_price = result.avg_fill_price or decision.entry_reference_price
+                fill_qty = int(result.filled_qty or decision.qty)
+                return Position(
+                    symbol=symbol,
+                    qty=fill_qty,
+                    avg_entry_price=fill_price,
+                    market_value=fill_qty * fill_price,
+                )
         except Exception as e:
             logger.error(f"{symbol}: place_order raised: {e}")
             self.risk.record_broker_error()
             self.alerts.broker_error(f"{symbol} place_order: {e}")
+        return None
 
     # ── Post-fill bookkeeping ────────────────────────────────────────────
 
