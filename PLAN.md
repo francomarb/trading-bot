@@ -132,6 +132,10 @@ it — and using the wrong strategy on the wrong type is a primary source of los
   RSI mean-reversion candidates for Phase 11; remove them from the SMA crossover slot.
 - **RIVN** should be removed entirely before going live. Pre-profit companies provide
   no earnings anchor for a sustained trend.
+- **Post-paper-run SMA cleanup:** after the current SMA-only paper run and reconciliation
+  finish, update `forward_test.py` so the SMA slot uses `settings.SMA_WATCHLIST`
+  instead of the union `settings.WATCHLIST`. Keep `WATCHLIST` only as a backward-compatible
+  full-universe helper unless a future engine explicitly needs a combined universe.
 
 ---
 
@@ -399,6 +403,10 @@ skip ahead. Each group must be paper-validated before the next begins.
 > least one week with reconciliation active and confirm startup logs are clean on each restart
 > before proceeding to Group D.
 
+> **Allocator dependency:** Do not enable per-strategy capital buckets until 10.C1 and
+> 10.C2 are complete. Bucket accounting depends on durable ownership because every
+> open broker position must map unambiguously to exactly one strategy after restart.
+
 ---
 
 #### Group D — Slippage kill switch calibration (requires paper fill data)
@@ -581,6 +589,48 @@ window (minimum 4–8 weeks live) with acceptable performance. Complexity is ear
 | 11.16 | **Category-aware ATR stop multiplier** — the current flat `ATR_STOP_MULTIPLIER = 2.0` is applied to all symbols equally. Lynch's framework implies fast growers and turnarounds need wider stops (higher volatility, larger legitimate swings) than stalwarts. Consider per-symbol or per-category multiplier config. *(Lynch, One Up on Wall Street, Ch. 11 — Two-Minute Drill)* | ⬜ |
 | 11.17 | **Sector concentration cap on watchlist** — Lynch Ch. 9 documents how hot-industry stocks rise together and fall together (disk drives 1981–83, oil service stocks, home shopping). Cap the watchlist at ≤ 3 symbols per GICS sector to prevent a single sector rotation from producing a correlated drawdown across multiple open positions simultaneously. | ⬜ |
 | 11.18 | **Watchlist two-stage pre-screen** — before applying the SMA crossover signal, filter the candidate universe by: PEG ratio < 1.5 (Lynch: *"the P/E of any fairly priced company will equal its growth rate"*), ≥ 2 years positive earnings, not a pure cyclical (airlines, autos, basic materials). Cyclicals route to RSI reversion only. *(Lynch, One Up on Wall Street, Ch. 13)* | ⬜ |
+
+#### Design: Per-strategy capital allocation (11.5)
+
+Use a conservative sleeve model before introducing dynamic optimizers. The first
+implementation should allocate from a total portfolio budget into fixed strategy
+buckets, while preserving existing global kill switches.
+
+**Baseline model:**
+- `TOTAL_ALLOCATABLE_GROSS_PCT` caps strategy-managed gross exposure as a share of equity.
+  Start at the existing `MAX_GROSS_EXPOSURE_PCT` value unless the go/no-go review says otherwise.
+- `STRATEGY_ALLOCATIONS` maps strategy name to target sleeve weight, e.g.
+  `{"sma_crossover": 0.60, "rsi_reversion": 0.40}`.
+- A strategy's max gross notional is `equity * TOTAL_ALLOCATABLE_GROSS_PCT * strategy_weight`.
+- Existing global caps remain authoritative: hard dollar cap, daily loss cap, broker-error
+  kill switch, slippage-drift kill switch, total gross exposure cap, and cash availability.
+- Per-strategy caps add an inner guardrail: max sleeve notional, max open positions per
+  strategy, and max loss-to-stop per sleeve.
+
+**Accounting source of truth:**
+- Open strategy exposure must be computed from broker positions plus durable ownership
+  restored from the trade DB. In-memory `_position_owners` alone is not sufficient.
+- If any open position cannot be mapped to exactly one strategy, enter exits-only
+  restricted mode and block new entries until the mismatch is resolved.
+- Shared symbols are allowed only when ownership is durable. One Alpaca position per
+  symbol means the first implementation should continue to block simultaneous ownership
+  of the same symbol by multiple strategies unless sub-position accounting is added.
+
+**Order flow:**
+- Strategies continue to emit signals only.
+- A new portfolio/allocation layer should convert a signal into a strategy-scoped
+  budget constraint before `RiskManager.evaluate()` sizes the final order.
+- `RiskManager` should still enforce final safety checks using the full account state;
+  the allocator narrows available capital, it never bypasses risk.
+
+**Tests required before enabling RSI live/paper multi-strategy:**
+- Strategy A cannot consume Strategy B's sleeve budget.
+- Strategy A can trade while Strategy B is in loss-streak cooldown, assuming global
+  risk is healthy.
+- A full sleeve rejects new entries with a distinct allocator rejection reason.
+- Restart restores ownership from DB, recomputes sleeve exposure, and preserves bucket
+  limits before the first new entry.
+- Global gross cap still rejects trades even when the individual strategy sleeve has room.
 
 **Exit Criteria:** Bot runs 2–3 strategies concurrently, each gated to its appropriate regime, with portfolio-level caps enforced and automatic health-based capital adjustments. A degrading strategy is automatically throttled without operator intervention.
 
