@@ -76,7 +76,8 @@ The system is a pipeline of 6 layers. Each cycle flows top-to-bottom:
 
 1. **Data** — market data, indicators, signal inputs, integrity checks *(Phases 2–3)*
 2. **Regime Detector** — identifies trend/chop/volatility state; gates which strategies
-   are allowed to run. *(Minimal "edge filters" in Phase 4; full regime layer in Phase 11.)*
+   are allowed to run. *(Minimal "edge filters" in Phase 4; production regime layer
+   moves into Phase 10 before SMA + RSI can go live.)*
 3. **Strategy** — generates entries and exits. Pure function of data. *(Phase 4)*
 4. **Risk** — position sizing, stop placement, exposure caps, kill switches.
    **Mandatory gate between Strategy and Execution.** *(Phase 6)*
@@ -129,7 +130,8 @@ it — and using the wrong strategy on the wrong type is a primary source of los
   years, PEG ratio < 1.5 at entry, no active bank-debt crisis, not in a single sector
   with > 3 other symbols.
 - **Cyclicals (DAL, COIN) are not removed — they are relabelled.** Keep them as
-  RSI mean-reversion candidates for Phase 11; remove them from the SMA crossover slot.
+  RSI mean-reversion candidates for the Phase 10 SMA + RSI paper gate; remove them
+  from the SMA crossover slot.
 - **RIVN** should be removed entirely before going live. Pre-profit companies provide
   no earnings anchor for a sustained trend.
 - **Post-paper-run SMA cleanup:** after the current SMA-only paper run and reconciliation
@@ -207,7 +209,7 @@ concrete working strategy.
 | 4.4 | **Look-ahead bias guard** — all indicators use only data available *at signal bar close*; execution assumed on *next bar's open* | ✅ |
 | 4.5 | Unit tests in `tests/test_strategies.py` using synthetic price paths with known crossover points | ✅ |
 | 4.6 | Strategies are pure functions of input data — no network calls, no broker state | ✅ |
-| 4.7 | **Edge-filter hook** — strategies can optionally require a market-regime condition (e.g. `SPY > 200-day MA`) before emitting long entries. Implemented as a composable filter, not hard-coded. This is the minimal regime awareness for the first strategy; the full regime detector is Phase 11. | ✅ |
+| 4.7 | **Edge-filter hook** — strategies can optionally require a market-regime condition (e.g. `SPY > 200-day MA`) before emitting long entries. Implemented as a composable filter, not hard-coded. This is the minimal regime awareness for the first strategy; the production regime detector is Phase 10. | ✅ |
 | 4.8 | **Preferred order type declared on the strategy** — e.g. `SMACrossover.preferred_order_type = OrderType.MARKET`. Trend/breakout strategies will use market; mean-reversion will use limit. Consumed by Phase 7 execution. | ✅ |
 
 **Exit Criteria:** `SMACrossover.generate_signals()` returns correct entries/exits on synthetic data with known crossover points; tests pass.
@@ -241,7 +243,7 @@ limit level during a bar. In reality a limit order may sit unfilled, partially f
 skipped entirely if price gaps through it. For market-order strategies like SMA crossover
 this is not a concern. For **RSI reversion**, which relies on limit entries, vectorized
 backtesting will systematically overestimate fill rates and therefore overestimate returns.
-When RSI reversion is added in Phase 11, consider supplementing the vectorbt backtest
+When RSI reversion is activated for the Phase 10 SMA + RSI paper gate, consider supplementing the vectorbt backtest
 with an event-based backtester that processes each bar and explicitly checks whether the
 limit was touched and held long enough to fill. See `backtest/runner.py` for the existing
 harness; an event-based variant would sit alongside it, not replace it.
@@ -271,9 +273,9 @@ risk decision as input. Unsafe order placement is impossible by construction.
 
 **Exit Criteria:** `RiskManager.evaluate(signal, account_state)` returns either a `RiskDecision` or a typed rejection reason. Every rule has a test that confirms it blocks a violating trade.
 
-**Future extensions (Phase 11):** correlation limits across positions, per-sector capital caps,
-per-strategy capital caps, dynamic sizing based on volatility regime. These are deferred
-until multiple strategies exist — a single-strategy MVP doesn't benefit from them.
+**Future extensions:** fixed per-strategy capital caps and minimum concentration guardrails
+move into Phase 10 before SMA + RSI can go live. Dynamic sizing based on volatility regime,
+advanced correlation limits, and automatic capital reallocation remain Phase 11 enhancements.
 
 ---
 
@@ -430,15 +432,35 @@ skip ahead. Each group must be paper-validated before the next begins.
 
 ---
 
-#### Group F — Live trading gates (run immediately before the live flip)
+#### Group F — Pre-live multi-strategy portfolio layer (hard blockers for SMA + RSI)
 
 | # | Deliverable | Complexity | Blocker | Status |
 |---|---|---|---|---|
-| 10.F1 | **Position-size multiplier** — `LIVE_SIZE_MULTIPLIER = 0.25` config setting; engine scales final `qty` by this for the first N weeks. Limits exposure while calibrating live fills. | Low (~15 lines) | 🟢 | ⬜ |
-| 10.F2 | **Hard dollar cap** — set `HARD_DOLLAR_LOSS_CAP` to a conservative value (e.g. $500) in the live `.env`. Already implemented in RiskManager; this is a config decision only. | Low (config) | 🟢 | ⬜ |
-| 10.F3 | **Manual approval prompt** — before the very first live order, print full order details and require the operator to type the symbol to confirm. One-time gate; disables itself after the first live fill. | Low (~20 lines) | 🟢 | ⬜ |
-| 10.F4 | **Dry-run mode** — `DRY_RUN=True` config flag; engine runs live-connected but logs orders instead of placing them. Final sanity check before real orders. | Low (~15 lines) | 🟢 | ⬜ |
-| 10.F5 | **Verified** — pre-flight checklist passes; dry-run connects to live Alpaca endpoint and logs at least one cycle; first real order requires manual approval; hard cap enforced. | Operational | 🟢 | ⬜ |
+| 10.F1 | **Per-strategy capital allocation** — fixed sleeves from a total allocatable gross budget. SMA and RSI each get an explicit budget; one strategy cannot consume the other's sleeve. See design below. | Medium (~120 lines) | 🔴 | ⬜ |
+| 10.F2 | **Regime Detector module** (`regime/detector.py`) — classifies current state from inputs like realized vol, ATR expansion/contraction, MA slope, ADX, SPY vs. 200-day MA. Output is a typed regime enum. | Medium (~100 lines) | 🔴 | ⬜ |
+| 10.F3 | **Strategy regime registration/gating** — each strategy declares allowed regimes. The engine only invokes entries for strategies whose regime gate is true; exits always remain allowed. | Medium (~60 lines) | 🔴 | ⬜ |
+| 10.F4 | **RSI paper activation slot** — add `RSIReversion` to the paper engine with `settings.RSI_WATCHLIST`, strategy-specific allocation, limit-order behavior, and attribution verified. Do not enable live. | Medium | 🔴 | ⬜ |
+| 10.F5 | **Minimum portfolio concentration guardrails** — add the first-pass correlated exposure controls needed for two strategies: sector cap and shared-symbol/sleeve conflict rejection. Advanced dynamic caps stay in Phase 11. | Medium (~80 lines) | 🔴 | ⬜ |
+| 10.F6 | **Verified** — unit tests pass; startup reconciliation recomputes sleeve exposure before first entry; paper logs show both SMA and RSI gated by regime and allocation. | Operational | 🔴 | ⬜ |
+
+> **Pre-live SMA + RSI paper gate:** After Groups A-F are complete, run the combined
+> SMA + RSI bot in Alpaca paper mode for **minimum 2 weeks, target 4 weeks**. This is
+> separate from the current SMA-only Phase 9.5 run because durable ownership, startup
+> reconciliation, TradingStream order state handling, RSI limit orders, regime gating,
+> and per-strategy allocation all change the execution surface. The run must produce a
+> documented GO/NO-GO report before any SMA + RSI live flip.
+
+---
+
+#### Group G — Live trading gates (run immediately before the live flip)
+
+| # | Deliverable | Complexity | Blocker | Status |
+|---|---|---|---|---|
+| 10.G1 | **Position-size multiplier** — `LIVE_SIZE_MULTIPLIER = 0.25` config setting; engine scales final `qty` by this for the first N weeks. Limits exposure while calibrating live fills. | Low (~15 lines) | 🟢 | ⬜ |
+| 10.G2 | **Hard dollar cap** — set `HARD_DOLLAR_LOSS_CAP` to a conservative value (e.g. $500) in the live `.env`. Already implemented in RiskManager; this is a config decision only. | Low (config) | 🟢 | ⬜ |
+| 10.G3 | **Manual approval prompt** — before the very first live order, print full order details and require the operator to type the symbol to confirm. One-time gate; disables itself after the first live fill. | Low (~20 lines) | 🟢 | ⬜ |
+| 10.G4 | **Dry-run mode** — `DRY_RUN=True` config flag; engine runs live-connected but logs orders instead of placing them. Final sanity check before real orders. | Low (~15 lines) | 🟢 | ⬜ |
+| 10.G5 | **Verified** — pre-flight checklist passes; dry-run connects to live Alpaca endpoint and logs at least one cycle; first real order requires manual approval; hard cap enforced. | Operational | 🟢 | ⬜ |
 
 ---
 
@@ -524,77 +546,11 @@ and checks it before opening new entries.
 
 ---
 
-**Exit Criteria:** Pre-flight checklist passes. Bot connects to live Alpaca in dry-run
-mode. Position ownership is restored from trade DB on restart. Startup reconciliation
-is clean or RESTRICTED with operator awareness. Slippage kill switch is enabled and
-calibrated against paper fills. First real order requires explicit typed approval.
-Hard dollar cap ($500 initial) enforced. Paper and live trade DBs are separate files.
-
----
-
-#### Group G — Cloud Infrastructure *(Deferred — requires a VPS)*
-
-> **Why deferred:** Running live trading from a local Mac with tmux + caffeinate is
-> not appropriate for real capital. A power outage, sleep cycle, or Wi-Fi drop kills
-> the process and can leave open positions unmanaged. This group is not a blocker for
-> the paper run or the initial live flip, but **must be resolved before sustained live
-> operation** (i.e. within the first few weeks of live trading).
->
-> *Hilpisch, Python for Algorithmic Trading, Ch. 10:* "A simple loss of the web
-> connection or a brief power outage might bring down the whole algorithm, leaving,
-> for example, unintended open positions in the portfolio."
-
-| # | Deliverable | Complexity | Status |
-|---|---|---|---|
-| 10.G1 | **Provision a cloud VPS** — DigitalOcean, Hetzner, Linode, or equivalent. Minimum spec: 1 vCPU, 1 GB RAM, SSD, reliable uptime SLA (99.9%+). Prefer a region close to Alpaca's data centers (US East). | Operational | ⬜ |
-| 10.G2 | **Systemd service unit** — `trading-bot.service` that starts `python forward_test.py` on boot, restarts automatically on crash (`Restart=always`, `RestartSec=10`). Replaces `start_bot.sh` + tmux for production. | Low (~20 lines config) | ⬜ |
-| 10.G3 | **Secure key management on VPS** — `config/.env` copied to the VPS via `scp` (never committed). SSH key-only access. Firewall (`ufw`) allowing only SSH inbound. | Operational | ⬜ |
-| 10.G4 | **Remote monitoring** — `reporting/monitor.py` ZeroMQ PUB socket that publishes cycle events (fills, rejections, kill-switch trips, halts). Companion `scripts/monitor_client.py` SUB script runs locally. Allows real-time observation without SSH. See Hilpisch Ch. 10 pattern. | Medium (~80 lines) | ⬜ |
-| 10.G5 | **Log shipping** — either `rsync` cron or a lightweight agent to pull `logs/` from the VPS daily. Ensures logs survive a VPS rebuild. | Low | ⬜ |
-
-**Notes:**
-- Until 10.G1–10.G3 are done, keep `start_bot.sh` (tmux) as the launch mechanism and
-  accept the local-machine reliability risk during early live operation.
-- 10.G4 (ZeroMQ monitor) can be implemented locally before the VPS is provisioned —
-  it will still work over `localhost` for local observation during the paper run.
-- `systemd` is Linux-only; on the VPS this replaces caffeinate entirely.
-
----
-
-### Phase 11 — Multi-Strategy, Regime Detection & Portfolio Layer
-**Goal:** Once the single-strategy bot has demonstrated a baseline edge in live trading
-(positive expectancy, survived a drawdown, execution quality as expected), expand to a
-portfolio of 2–3 strategies with regime-aware gating and portfolio-level risk controls.
-
-**Do not start this phase** until the single-strategy bot has run live for a meaningful
-window (minimum 4–8 weeks live) with acceptable performance. Complexity is earned.
-
-| # | Deliverable | Status |
-|---|---|---|
-| 11.1 | **Regime Detector module** (`regime/detector.py`) — classifies current state from inputs like realized vol, ATR expansion/contraction, MA slope, ADX, SPY vs. 200-day MA. Output: typed regime enum (trending / chop / volatile / low-vol). | ⬜ |
-| 11.2 | Strategy registration declares which regimes it's allowed to run in. Engine only invokes strategies whose regime gate is currently true. | ⬜ |
-| 11.3 | Second strategy: **Dip Buyer** (RSI-based mean reversion, gated to non-downtrend regime with strong long-term uptrend intact) | ⬜ |
-| 11.4 | Third strategy *(optional)*: **Volatility Breakout** (range compression + breakout, gated to volatility-expansion regime) | ⬜ |
-| 11.5 | **Per-strategy capital allocation** — each strategy gets a configurable share of equity; can't exceed its cap | ⬜ |
-| 11.6 | **Correlation cap** — block new position if it would push correlated exposure (symbol-level or sector-level) above threshold | ⬜ |
-| 11.7 | **Per-sector capital cap** (e.g. ≤ 40% in semiconductors) | ⬜ |
-| 11.8 | **Strategy health monitor** — rolling expectancy + rolling Sharpe per strategy; automatic capital reduction or disable when performance degrades beyond a pre-committed threshold | ⬜ |
-| 11.9 | **Strategy re-enable workflow** — disabled strategies require manual review + a fresh paper forward-test before being re-enabled with capital | ⬜ |
-| 11.10 | Dashboard / report: per-strategy P&L, regime history, capital allocation over time | ⬜ |
-| 11.11 | **Websocket streaming** (`data/stream.py`) — if any intraday strategy is added, replace REST polling with `alpaca-py` `StockDataStream` for real-time bars/quotes/trades. Daily-bar strategies can continue on REST polling; streaming is only needed when sub-minute latency matters. | ⬜ |
-| 11.12 | **Event-based backtester for limit orders** — supplement `backtest/runner.py` with a bar-by-bar event-driven harness that models limit order fill realism (price must touch and hold). Required for honest RSI reversion backtesting. *(Hilpisch, Ch. 6 — Event-Based Backtesting)* | ⬜ |
-| 11.13 | **ML edge filter** — train a direction classifier (logistic regression or AdaBoost) on lagged log-return features; plug it into `BaseStrategy` via the existing `edge_filter` hook to gate SMA/RSI entries during unfavourable regimes. The `edge_filter(df) -> pd.Series[bool]` interface in `strategies/base.py` is already designed for this — zero architecture changes needed. *(Hilpisch, Ch. 5 — ML-Based Strategy + Ch. 10 — Online Algorithm)* | ⬜ |
-| 11.14 | **Incremental online signal generation** — if any intraday strategy is added, refactor `generate_signals()` from full-history recomputation to an incremental deque-based algorithm that processes one new bar at a time. Full-history recomputation is fine for daily bars; wasteful at 1-minute resolution. *(Hilpisch, Ch. 7 — Online Algorithm pattern)* | ⬜ |
-| 11.15 | **Fundamental health filter for RSI mean-reversion** — buying oversold stocks without a balance sheet check is structurally exposed to catastrophic losses: an oversold stock with heavy *bank* debt (callable on demand) can go to zero before it reverts. Pre-screen RSI universe for: (a) positive earnings for ≥ 2 years, (b) net cash positive or long-term (funded) debt only — no bank debt crisis, (c) inventory growth not outpacing revenue growth (Lynch's red flag for cyclicals). *(Lynch, One Up on Wall Street, Ch. 13 — Some Famous Numbers; Ch. 19 — The Cyclical)* | ⬜ |
-| 11.16 | **Category-aware ATR stop multiplier** — the current flat `ATR_STOP_MULTIPLIER = 2.0` is applied to all symbols equally. Lynch's framework implies fast growers and turnarounds need wider stops (higher volatility, larger legitimate swings) than stalwarts. Consider per-symbol or per-category multiplier config. *(Lynch, One Up on Wall Street, Ch. 11 — Two-Minute Drill)* | ⬜ |
-| 11.17 | **Sector concentration cap on watchlist** — Lynch Ch. 9 documents how hot-industry stocks rise together and fall together (disk drives 1981–83, oil service stocks, home shopping). Cap the watchlist at ≤ 3 symbols per GICS sector to prevent a single sector rotation from producing a correlated drawdown across multiple open positions simultaneously. | ⬜ |
-| 11.18 | **Watchlist two-stage pre-screen** — before applying the SMA crossover signal, filter the candidate universe by: PEG ratio < 1.5 (Lynch: *"the P/E of any fairly priced company will equal its growth rate"*), ≥ 2 years positive earnings, not a pure cyclical (airlines, autos, basic materials). Cyclicals route to RSI reversion only. *(Lynch, One Up on Wall Street, Ch. 13)* | ⬜ |
-
-#### Design: Per-strategy capital allocation (11.5)
+#### Design: Per-strategy capital allocation (10.F1)
 
 Use a conservative sleeve model before introducing dynamic optimizers. The first
-implementation should allocate from a total portfolio budget into fixed strategy
-buckets, while preserving existing global kill switches.
+implementation allocates from a total portfolio budget into fixed strategy buckets,
+while preserving existing global kill switches.
 
 **Baseline model:**
 - `TOTAL_ALLOCATABLE_GROSS_PCT` caps strategy-managed gross exposure as a share of equity.
@@ -618,12 +574,12 @@ buckets, while preserving existing global kill switches.
 
 **Order flow:**
 - Strategies continue to emit signals only.
-- A new portfolio/allocation layer should convert a signal into a strategy-scoped
-  budget constraint before `RiskManager.evaluate()` sizes the final order.
-- `RiskManager` should still enforce final safety checks using the full account state;
-  the allocator narrows available capital, it never bypasses risk.
+- A portfolio/allocation layer converts a signal into a strategy-scoped budget
+  constraint before `RiskManager.evaluate()` sizes the final order.
+- `RiskManager` still enforces final safety checks using the full account state; the
+  allocator narrows available capital, it never bypasses risk.
 
-**Tests required before enabling RSI live/paper multi-strategy:**
+**Tests required before enabling SMA + RSI paper multi-strategy:**
 - Strategy A cannot consume Strategy B's sleeve budget.
 - Strategy A can trade while Strategy B is in loss-streak cooldown, assuming global
   risk is healthy.
@@ -632,7 +588,87 @@ buckets, while preserving existing global kill switches.
   limits before the first new entry.
 - Global gross cap still rejects trades even when the individual strategy sleeve has room.
 
-**Exit Criteria:** Bot runs 2–3 strategies concurrently, each gated to its appropriate regime, with portfolio-level caps enforced and automatic health-based capital adjustments. A degrading strategy is automatically throttled without operator intervention.
+---
+
+**Exit Criteria:** Pre-flight checklist passes. Bot connects to live Alpaca in dry-run
+mode. Position ownership is restored from trade DB on restart. Startup reconciliation
+is clean or RESTRICTED with operator awareness. Slippage kill switch is enabled and
+calibrated against paper fills. WebSocket order streaming is active and paper-validated.
+Per-strategy capital allocation, regime detection, strategy gating, and RSI paper
+activation are implemented. The combined SMA + RSI paper run completes for minimum
+2 weeks, target 4 weeks, with a documented GO/NO-GO report. First real order requires
+explicit typed approval. Hard dollar cap ($500 initial) enforced. Paper and live
+trade DBs are separate files.
+
+---
+
+#### Group H — Cloud Infrastructure *(Deferred — requires a VPS)*
+
+> **Why deferred:** Running live trading from a local Mac with tmux + caffeinate is
+> not appropriate for real capital. A power outage, sleep cycle, or Wi-Fi drop kills
+> the process and can leave open positions unmanaged. This group is not a blocker for
+> the paper run or the initial live flip, but **must be resolved before sustained live
+> operation** (i.e. within the first few weeks of live trading).
+>
+> *Hilpisch, Python for Algorithmic Trading, Ch. 10:* "A simple loss of the web
+> connection or a brief power outage might bring down the whole algorithm, leaving,
+> for example, unintended open positions in the portfolio."
+
+| # | Deliverable | Complexity | Status |
+|---|---|---|---|
+| 10.H1 | **Provision a cloud VPS** — DigitalOcean, Hetzner, Linode, or equivalent. Minimum spec: 1 vCPU, 1 GB RAM, SSD, reliable uptime SLA (99.9%+). Prefer a region close to Alpaca's data centers (US East). | Operational | ⬜ |
+| 10.H2 | **Systemd service unit** — `trading-bot.service` that starts `python forward_test.py` on boot, restarts automatically on crash (`Restart=always`, `RestartSec=10`). Replaces `start_bot.sh` + tmux for production. | Low (~20 lines config) | ⬜ |
+| 10.H3 | **Secure key management on VPS** — `config/.env` copied to the VPS via `scp` (never committed). SSH key-only access. Firewall (`ufw`) allowing only SSH inbound. | Operational | ⬜ |
+| 10.H4 | **Remote monitoring** — `reporting/monitor.py` ZeroMQ PUB socket that publishes cycle events (fills, rejections, kill-switch trips, halts). Companion `scripts/monitor_client.py` SUB script runs locally. Allows real-time observation without SSH. See Hilpisch Ch. 10 pattern. | Medium (~80 lines) | ⬜ |
+| 10.H5 | **Log shipping** — either `rsync` cron or a lightweight agent to pull `logs/` from the VPS daily. Ensures logs survive a VPS rebuild. | Low | ⬜ |
+
+**Notes:**
+- Until 10.H1–10.H3 are done, keep `start_bot.sh` (tmux) as the launch mechanism and
+  accept the local-machine reliability risk during early live operation.
+- 10.H4 (ZeroMQ monitor) can be implemented locally before the VPS is provisioned —
+  it will still work over `localhost` for local observation during the paper run.
+- `systemd` is Linux-only; on the VPS this replaces caffeinate entirely.
+
+---
+
+### Phase 11 — Advanced Multi-Strategy Portfolio Enhancements
+**Goal:** After the Phase 10 SMA + RSI pre-live gate is complete, improve portfolio
+intelligence beyond the minimum safe two-strategy launch: optional third strategy,
+dynamic allocation, richer concentration controls, health-based throttling, reporting,
+and intraday-specific infrastructure if needed.
+
+**Boundary:** The critical pre-live subset moved into Phase 10 Group F. Regime detection,
+strategy regime gating, RSI paper activation, fixed per-strategy allocation, and minimum
+concentration guardrails are no longer Phase 11 nice-to-haves; they are blockers before
+SMA + RSI can trade live. Phase 11 should not be used to smuggle new complexity into the
+pre-live checklist unless the item is promoted back into Phase 10 with a clear blocker
+reason.
+
+| # | Deliverable | Status |
+|---|---|---|
+| 11.1 | **Regime Detector module** — moved to Phase 10 Group F because regime gating is required before SMA + RSI can trade live. | Moved to 10.F2 |
+| 11.2 | **Strategy regime registration/gating** — moved to Phase 10 Group F. Exits remain always allowed; entries are regime-gated. | Moved to 10.F3 |
+| 11.3 | **Second strategy: Dip Buyer / RSI Reversion paper activation** — moved to Phase 10 Group F for the mandatory SMA + RSI paper gate. | Moved to 10.F4 |
+| 11.4 | Third strategy *(optional)*: **Volatility Breakout** (range compression + breakout, gated to volatility-expansion regime) | ⬜ |
+| 11.5 | **Dynamic per-strategy capital allocation** — fixed sleeves moved to Phase 10 Group F. Phase 11 may add volatility/risk-parity style reallocations only after fixed sleeves prove stable. | ⬜ |
+| 11.6 | **Advanced correlation cap** — block new position if it would push correlated exposure (symbol-level or sector-level) above threshold. Minimum guardrails moved to 10.F5. | ⬜ |
+| 11.7 | **Advanced per-sector capital cap** (e.g. ≤ 40% in semiconductors), building on the minimum Phase 10 guardrail. | ⬜ |
+| 11.8 | **Strategy health monitor** — rolling expectancy + rolling Sharpe per strategy; automatic capital reduction or disable when performance degrades beyond a pre-committed threshold | ⬜ |
+| 11.9 | **Strategy re-enable workflow** — disabled strategies require manual review + a fresh paper forward-test before being re-enabled with capital | ⬜ |
+| 11.10 | Dashboard / report: per-strategy P&L, regime history, capital allocation over time | ⬜ |
+| 11.11 | **Intraday market-data stream** (`data/stream.py`) — deferred until an intraday strategy exists. This would use `alpaca-py` `StockDataStream` for real-time bars/quotes/trades and is **not** the same as Phase 10's mandatory `TradingStream` order/fill websocket. | ⬜ |
+| 11.12 | **Event-based backtester for limit orders** — supplement `backtest/runner.py` with a bar-by-bar event-driven harness that models limit order fill realism (price must touch and hold). Required for honest RSI reversion backtesting. *(Hilpisch, Ch. 6 — Event-Based Backtesting)* | ⬜ |
+| 11.13 | **ML edge filter** — train a direction classifier (logistic regression or AdaBoost) on lagged log-return features; plug it into `BaseStrategy` via the existing `edge_filter` hook to gate SMA/RSI entries during unfavourable regimes. The `edge_filter(df) -> pd.Series[bool]` interface in `strategies/base.py` is already designed for this — zero architecture changes needed. *(Hilpisch, Ch. 5 — ML-Based Strategy + Ch. 10 — Online Algorithm)* | ⬜ |
+| 11.14 | **Incremental online signal generation** — if any intraday strategy is added, refactor `generate_signals()` from full-history recomputation to an incremental deque-based algorithm that processes one new bar at a time. Full-history recomputation is fine for daily bars; wasteful at 1-minute resolution. *(Hilpisch, Ch. 7 — Online Algorithm pattern)* | ⬜ |
+| 11.15 | **Fundamental health filter for RSI mean-reversion** — buying oversold stocks without a balance sheet check is structurally exposed to catastrophic losses: an oversold stock with heavy *bank* debt (callable on demand) can go to zero before it reverts. Pre-screen RSI universe for: (a) positive earnings for ≥ 2 years, (b) net cash positive or long-term (funded) debt only — no bank debt crisis, (c) inventory growth not outpacing revenue growth (Lynch's red flag for cyclicals). *(Lynch, One Up on Wall Street, Ch. 13 — Some Famous Numbers; Ch. 19 — The Cyclical)* | ⬜ |
+| 11.16 | **Category-aware ATR stop multiplier** — the current flat `ATR_STOP_MULTIPLIER = 2.0` is applied to all symbols equally. Lynch's framework implies fast growers and turnarounds need wider stops (higher volatility, larger legitimate swings) than stalwarts. Consider per-symbol or per-category multiplier config. *(Lynch, One Up on Wall Street, Ch. 11 — Two-Minute Drill)* | ⬜ |
+| 11.17 | **Sector concentration cap on watchlist** — Lynch Ch. 9 documents how hot-industry stocks rise together and fall together (disk drives 1981–83, oil service stocks, home shopping). Cap the watchlist at ≤ 3 symbols per GICS sector to prevent a single sector rotation from producing a correlated drawdown across multiple open positions simultaneously. | ⬜ |
+| 11.18 | **Watchlist two-stage pre-screen** — before applying the SMA crossover signal, filter the candidate universe by: PEG ratio < 1.5 (Lynch: *"the P/E of any fairly priced company will equal its growth rate"*), ≥ 2 years positive earnings, not a pure cyclical (airlines, autos, basic materials). Cyclicals route to RSI reversion only. *(Lynch, One Up on Wall Street, Ch. 13)* | ⬜ |
+
+**Exit Criteria:** Advanced portfolio enhancements run safely on top of the Phase 10
+SMA + RSI baseline. Optional third strategies, dynamic allocation, advanced concentration
+caps, dashboards, and health-based throttling are paper-validated before any live capital
+is assigned to those new behaviors.
 
 ---
 
@@ -640,10 +676,11 @@ buckets, while preserving existing global kill switches.
 
 | Date | Note |
 |---|---|
+| 2026-04-21 | **Pre-live multi-strategy gates moved into Phase 10.** Phase 10 Group F now owns the critical SMA + RSI blockers: fixed per-strategy capital allocation, production regime detector, strategy regime gating, RSI paper activation, and minimum concentration guardrails. Phase 10 exit criteria now require a combined SMA + RSI Alpaca paper run for minimum 2 weeks, target 4 weeks, with a documented GO/NO-GO report before any SMA + RSI live flip. Phase 11 is now reserved for advanced enhancements such as optional third strategies, dynamic allocation, richer caps, dashboards, and health-based throttling. |
 | 2026-04-20 | **Multi-strategy watchlist architecture implemented.** `config/settings.py` now has `SMA_WATCHLIST` (10 symbols: stalwarts/fast growers + large-cap financials) and `RSI_WATCHLIST` (11 symbols: stalwarts + cyclicals + financial cyclicals). `WATCHLIST` is computed as the ordered union of both lists plus RIVN (kept for paper-run continuity, not yet assigned to either strategy). The watchlist review script was redesigned around strategy-specific `CheckProfile` objects: SMA profile requires positive FCF and revenue growth (failing either = POOR FIT); RSI profile treats both as informational only (failing = MARGINAL, not POOR FIT). Solvency is always required for both, with different floors (18-month for SMA, 12-month for RSI). Output is a strategy-fitness matrix showing GOOD FIT / MARGINAL / POOR FIT per symbol per strategy. A scanner (`scripts/scanner.py`) is deferred to Phase 11 when RSI is live and has consumers; scanner design: Stage 1 Alpaca equity screener (fast universe filter) → Stage 2 technical pre-screen (ATR, volume) → Stage 3 yfinance fundamental routing (same CheckProfile logic). Full suite: 424 tests passing. |
 | 2026-04-20 | **Book review: Lynch — *Beating the Street* (full read). Three solid-keep findings implemented immediately; two "keep with caution" and six skip decisions made.** Implemented: (1) `scripts/watchlist_review.py` — Lynch six-month checkup operationalised as a runnable script (Ch. 15 FCF check, Ch. 21 revenue growth check, Golden Rules cash solvency check). Outputs a markdown report; exit 0 = all pass, exit 1 = failures found. Run before any watchlist change and before the Phase 10 live flip. 48 unit tests added. `yfinance` added to requirements.txt. (2) FCF positivity and cash solvency are the admission gate for any new RSI reversion symbol — coded into the script. (3) Revenue growth ≥ 0% YoY required for consumer/growth names in RSI universe. **Deliberately skipped:** January Effect (academically arbitraged since ~2000), sum-of-parts valuation (priced in continuously by sell-side), "lousy industry" preference (captured by existing market-cap/beta filters), pent-up demand indicator (data-intensive, well-known to institutions), insider buying Form 4 (low signal for large caps), Russell/S&P P/E spread (wrong tool for 13-symbol universe). **"Keep with caution" deferred:** cyclical P/E inversion filter and P/E divergence stop tightener — both were judged likely to create more problems than they solve at current stage; neither is implemented. |
-| 2026-04-20 | **Book review: Lynch — *One Up on Wall Street* (full read).** Five findings folded into the plan: (1) *Ch. 3 + 11* — Six-category framework (Fast Grower / Stalwart / Turnaround / Cyclical / Slow Grower / Asset Play) determines which strategy fits each stock. SMA crossover suits Stalwarts and Fast Growers; RSI reversion suits Turnarounds and Cyclicals. Current watchlist assessment added to **Watchlist Curation Philosophy** section: AAPL/MSFT/GOOGL/AMZN ✅ for trend-following; JPM/BAC/GS/NVDA/PINS/UBER ⚠️ acceptable with caveats; DAL/COIN/RIVN ❌ wrong category for SMA — reclassify DAL/COIN as RSI reversion candidates, remove RIVN before Phase 10 (do not change mid-paper-run). (2) *Ch. 13* — PEG < 1.5 + ≥2 years positive earnings as a two-stage pre-screen before any symbol enters the RSI watchlist (logged as Phase 11 item 11.18). (3) *Ch. 13 + 19* — Fundamental health filter for RSI reversion: reject positions if inventory/sales ratio rising, earnings declining, or bank debt present (item 11.15). (4) *Ch. 11* — Category-aware ATR stop multiplier: wider stops (k=3.0) for cyclicals, tighter (k=1.5) for stalwarts (item 11.16). (5) *Ch. 15* — Sector concentration cap ≤ 3 symbols per GICS sector to prevent correlated drawdowns (item 11.17). No immediate code changes; all items are Phase 11 or deferred to watchlist revision before Phase 10. |
-| 2026-04-19 | **Book review: Hilpisch — *Python for Algorithmic Trading* (full read).** Three findings folded into the plan: (1) *Ch. 4 + 10* — VaR, max drawdown duration, and Kelly criterion added to `backtest/runner.py` `compute_stats()` and `scripts/gonogo.py`. Kelly is informational-only until ~200 trades (RSI reversion will provide the volume). (2) *Ch. 6* — Vectorized backtesting overestimates limit order fill rates; an event-based backtester is needed for honest RSI reversion validation (logged as Phase 11 item 11.12). (3) *Ch. 5 + 7* — ML direction classifier maps directly onto the existing `edge_filter` hook in `BaseStrategy` (11.13); incremental online signal generation is needed only if intraday strategies are added (11.14). Cloud deployment pattern (Ch. 10 ZeroMQ + systemd) logged in Phase 10 Group G. Nothing from the book required immediate code changes beyond the stats improvements. |
+| 2026-04-20 | **Book review: Lynch — *One Up on Wall Street* (full read).** Five findings folded into the plan: (1) *Ch. 3 + 11* — Six-category framework (Fast Grower / Stalwart / Turnaround / Cyclical / Slow Grower / Asset Play) determines which strategy fits each stock. SMA crossover suits Stalwarts and Fast Growers; RSI reversion suits Turnarounds and Cyclicals. Current watchlist assessment added to **Watchlist Curation Philosophy** section: AAPL/MSFT/GOOGL/AMZN ✅ for trend-following; JPM/BAC/GS/NVDA/PINS/UBER ⚠️ acceptable with caveats; DAL/COIN/RIVN ❌ wrong category for SMA — reclassify DAL/COIN as RSI reversion candidates, remove RIVN before Phase 10 (do not change mid-paper-run). (2) *Ch. 13* — PEG < 1.5 + ≥2 years positive earnings as a two-stage pre-screen before any symbol enters the RSI watchlist (logged as Phase 11 item 11.18). (3) *Ch. 13 + 19* — Fundamental health filter for RSI reversion: reject positions if inventory/sales ratio rising, earnings declining, or bank debt present (item 11.15). (4) *Ch. 11* — Category-aware ATR stop multiplier: wider stops (k=3.0) for cyclicals, tighter (k=1.5) for stalwarts (item 11.16). (5) *Ch. 15* — Sector concentration cap ≤ 3 symbols per GICS sector to prevent correlated drawdowns; the minimum guardrail is now Phase 10 Group F, with advanced refinement in Phase 11. |
+| 2026-04-19 | **Book review: Hilpisch — *Python for Algorithmic Trading* (full read).** Three findings folded into the plan: (1) *Ch. 4 + 10* — VaR, max drawdown duration, and Kelly criterion added to `backtest/runner.py` `compute_stats()` and `scripts/gonogo.py`. Kelly is informational-only until ~200 trades (RSI reversion will provide the volume). (2) *Ch. 6* — Vectorized backtesting overestimates limit order fill rates; an event-based backtester is needed for honest RSI reversion validation (logged as Phase 11 item 11.12). (3) *Ch. 5 + 7* — ML direction classifier maps directly onto the existing `edge_filter` hook in `BaseStrategy` (11.13); incremental online signal generation is needed only if intraday strategies are added (11.14). Cloud deployment pattern (Ch. 10 ZeroMQ + systemd) logged in Phase 10 Group H. Nothing from the book required immediate code changes beyond the stats improvements. |
 | — | Project initialized. Stack confirmed: Python 3.12, Alpaca, pandas, pandas-ta, vectorbt. |
 | — | Starting with SMA crossover as the first strategy; architecture is strategy-agnostic. |
 | — | Paper trading only until Phase 10. |
@@ -659,6 +696,6 @@ buckets, while preserving existing global kill switches.
 | 2026-04-16 | **Phase 9.5 infrastructure complete.** Built `backtest/reconcile.py` — `Reconciler` compares paper fills (from trade CSV) against backtest predictions (rerun on the same bars) for a given date range. **Key design decisions:** (a) **Two-gate decision.** Return divergence gate (paper vs backtest total return, default threshold 10 percentage points) + slippage gate (mean realized slippage, default threshold 20bps). Either failing → NO-GO; the strategy returns to Phase 5 for re-analysis. (b) **Per-trade divergence.** Each paper fill is matched against the closest backtest entry/exit price. Price diff reported in bps with matched/unmatched flag. (c) **Paper return from CSV.** Sequential buy→sell pairs per symbol, P&L as fraction of entry cost. No position is assumed to carry across days if only one side is in the CSV. (d) **Report as markdown.** Written to `logs/forward_tests/<strategy>_<date>.md` with verdict (GO/NO-GO), aggregate returns, trade counts, slippage stats, gate reasons, and per-trade divergence table. (e) **`forward_test.py` launcher.** Starts the engine with production config (all 5 watchlist symbols, daily bars, 5-min cycles, market hours only) and full Phase 9 reporting wired up. On shutdown writes a daily P&L summary. Includes a docstring with the reconciliation command for after the multi-week run. (f) **`get_closed_orders`** added to `AlpacaBroker` — retrieves historical filled orders with optional date range and symbol filtering, returns typed `OrderResult` objects. (g) **Config** — 3 new settings: `FORWARD_TEST_DIR`, `FORWARD_TEST_RETURN_DIVERGENCE_PCT` (0.10), `FORWARD_TEST_MAX_SLIPPAGE_BPS` (20.0). 15 unit tests covering reconciliation logic, CSV filtering, gate decisions, report generation, and `get_closed_orders`. Full suite 256/256 passing in ~7s. Integration `phase95_verify.py` against live paper: 17/17 checks pass — config settings, closed order retrieval (10 historical orders found), reconciler produces a result (correctly NO-GO with 0 paper fills), report written, engine runs 3 cycles with forward-test wiring. **Remaining:** operational step — run `python forward_test.py` for 2-4 weeks, then reconcile. |
 | 2026-04-16 | **Phase 9 complete.** Built `reporting/` package — three modules providing full observability into the bot's trading activity. **Key design decisions:** (a) **`TradeLogger`** (`reporting/logger.py`) writes an append-only CSV (`logs/trades.csv`) with 16 columns including both modeled and realized slippage in bps. Separate `build_record` (for entries via RiskDecision + OrderResult) and `build_close_record` (for exits without a RiskDecision). (b) **Structured JSON sink** via `install_json_sink()` — adds a JSONL loguru sink with 10MB rotation / 30-day retention alongside the human-readable console output. (c) **`PnLTracker`** (`reporting/pnl.py`) tracks intraday P&L in-memory (peak/trough for drawdown), generates `DailySummary` with per-strategy `StrategyStats` (trade count, P&L, win rate, expectancy, profit factor, slippage). Daily reports are markdown files in `logs/daily_pnl/`. Weekly reports aggregate daily summaries into `logs/weekly_reports/`. `slippage_report(last_n)` provides rolling slippage stats from the trade CSV. (d) **`AlertDispatcher`** (`reporting/alerts.py`) fires alerts through pluggable backends (MVP: `LogFileBackend` writing to `logs/alerts.log`). Supports 8 alert types (order rejection, circuit breaker, loss-streak cooldown, stale data, slippage drift, broker error, engine halt, position mismatch). Duplicate suppression via configurable cooldown (default 5 min per type+symbol+strategy key). Backend failures are caught and logged — an alert failure never crashes the bot. Slack/email backends can be added by subclassing `AlertBackend`. (e) **Engine integration** — `TradingEngine` now accepts optional `trade_logger`, `pnl_tracker`, and `alerts` (defaults created if not provided). Entry fills → `_log_entry` → CSV. Exit fills → `_log_close` → CSV. Risk rejections → `alerts.order_rejection`. Stale data → `alerts.stale_data`. Broker errors → `alerts.broker_error`. Halt state → `alerts.engine_halt`. (f) **Config** — 5 new settings in `config/settings.py` (TRADE_LOG_CSV, DAILY_PNL_DIR, WEEKLY_REPORT_DIR, JSON_LOG_FILE, ALERT_LOG_FILE). 35 unit tests (reporting/ at 94% coverage). Full suite 241/241 passing in ~8s. Integration `phase9_verify.py` exercises all 7 sections end-to-end on live paper: JSONL sink, trade CSV round-trip, daily P&L with per-strategy attribution, weekly report, all 7 alert types, slippage monitoring, and engine wiring with 3 live cycles; 23/23 checks pass. |
 | 2026-04-16 | **Phase 8 complete.** Built `engine/trader.py` — `TradingEngine` orchestrates the full pipeline: `sync_with_broker → fetch → freshness → indicators → signals → risk → execute → log`. **Key design decisions:** (a) **Broker is the source of truth.** Every cycle starts with `broker.sync_with_broker()`; on startup the engine captures a snapshot before any decision, so a killed-mid-trade restart reconciles against reality. (b) **Stale-data guard.** `require_fresh(df, max_bar_age)` raises `StaleDataError` if the latest bar is older than `bar_interval × max_bar_age_multiplier` — silence beats wrong action. (c) **Exception containment at two levels.** Per-symbol errors are caught and logged (one flaky fetch doesn't skip the other symbols); per-cycle errors are caught (one bad cycle doesn't crash the loop). (d) **Redundant-close prevention.** `_has_pending_close_order` checks for an existing SELL order before issuing another close. (e) **Market hours gating.** Calls `broker._api.get_clock()` with retry; network failure falls back to "closed" (fail-safe). (f) **Graceful SIGINT/SIGTERM.** Sets `_running = False`; responsive sleep (1s tick) means shutdown latency ≤ 1s. Optionally cancels open orders on the way out (configurable). (g) **Slippage fed back to risk.** `_record_fill` computes realized vs. modeled slippage in bps and feeds `risk.record_fill_slippage` — the Phase 6.11 drift kill switch is wired end-to-end. (h) **Clock injection seam.** `_clock` callable lets tests control "now" without `freezegun`. (i) **`EngineConfig` frozen dataclass** with validation (bad timeframe, empty watchlist, invalid multiplier) and derived properties (`bar_interval`, `max_bar_age`). 21 unit tests (engine coverage 84%) covering config validation, per-symbol decision paths (entry/exit/stale/flat/halted/pending-close), cycle-level containment, start/stop lifecycle, shutdown order-cancel, and slippage recording. Full suite 206/206 passing in ~8s. Integration `phase8_verify.py` runs 5 cycles on live paper with a NoOpStrategy (never trades), injects a simulated fetch failure on cycle 3 — engine survives and completes all 5 cycles; 5/5 checks pass. |
-| 2026-04-19 | **Phase 10 redesigned after safety review.** Full review cycle surfaced: (a) slippage kill switch had a latent bug (modeled_bps hardcoded 0, epsilon trick caused false halt — fixed); (b) position ownership is in-memory only and will misattribute after restart in multi-strategy setups — durable ownership from trade DB designed and deferred to Phase 10; (c) startup reconciliation is best-effort — full cross-check of broker/orders/DB/ownership designed and deferred to Phase 10; (d) REST polling for order state acceptable for paper but not live — WebSocket TradingStream required before live. Phase 10 restructured into Groups A–F with hard-blocker classification, implementation order, and embedded design for 10.C1 (durable ownership) and 10.C2 (reconciliation). Two paper-validation gates added between groups. |
+| 2026-04-19 | **Phase 10 redesigned after safety review.** Full review cycle surfaced: (a) slippage kill switch had a latent bug (modeled_bps hardcoded 0, epsilon trick caused false halt — fixed); (b) position ownership is in-memory only and will misattribute after restart in multi-strategy setups — durable ownership from trade DB designed and deferred to Phase 10; (c) startup reconciliation is best-effort — full cross-check of broker/orders/DB/ownership designed and deferred to Phase 10; (d) REST polling for order state acceptable for paper but not live — WebSocket TradingStream required before live. Phase 10 restructured into Groups A–H with hard-blocker classification, implementation order, and embedded design for 10.C1 (durable ownership), 10.C2 (reconciliation), and 10.F1 (per-strategy allocation). Paper-validation gates added between major risk groups. |
 | 2026-04-19 | **Future Alpaca features noted (not actionable now).** (a) **Trailing stop orders** — Alpaca supports trail_price / trail_percent on stop orders. Could replace fixed ATR stops for trend-following strategies (SMA crossover) to let winners run longer. Evaluate in Phase 11. (b) **VWAP/TWAP execution** — available via Elite Smart Router for minimizing market impact. Not relevant at current position sizes; revisit if scaling up. (c) **24/5 extended hours trading** — Alpaca supports overnight/extended hours. Current market hours gate correctly restricts to regular session, which is appropriate for daily-bar strategies. Available if a future strategy warrants it. |
-| 2026-04-14 | **Integrated `trading-bot-design-guide-full.md` recommendations.** (a) Added explicit success metric: "positive expectancy with controlled drawdowns" — not "always profitable." (b) Expanded Guiding Principles with Risk>Entry, Boring beats fancy, One strategy first, Strategies decay. (c) Added 6-layer architectural mental model (Data → Regime → Strategy → Risk → Execution → Monitoring). (d) Phase 4 gains minimal edge-filter hook (e.g. SPY>200MA gate) and strategy-declared preferred order type. (e) Phase 6 gains loss-streak cooldown, broker-error-streak kill switch, slippage-drift kill switch, gross exposure cap. (f) Phase 7 clarifies strategy chooses order type; hard-risk exits always immediate. (g) Phase 9 gains per-strategy P&L attribution (even for single-strategy MVP — schema ready for N strategies) + continuous slippage monitoring feeding the 6.11 kill switch. (h) New **Phase 11** for multi-strategy + full regime detection + correlation/sector caps + strategy health auto-disable. Explicitly gated on "do not start until single-strategy live has proven out." Correlation/sector/per-strategy caps deferred there from Phase 6 as YAGNI for MVP. |
+| 2026-04-14 | **Integrated `trading-bot-design-guide-full.md` recommendations.** (a) Added explicit success metric: "positive expectancy with controlled drawdowns" — not "always profitable." (b) Expanded Guiding Principles with Risk>Entry, Boring beats fancy, One strategy first, Strategies decay. (c) Added 6-layer architectural mental model (Data → Regime → Strategy → Risk → Execution → Monitoring). (d) Phase 4 gains minimal edge-filter hook (e.g. SPY>200MA gate) and strategy-declared preferred order type. (e) Phase 6 gains loss-streak cooldown, broker-error-streak kill switch, slippage-drift kill switch, gross exposure cap. (f) Phase 7 clarifies strategy chooses order type; hard-risk exits always immediate. (g) Phase 9 gains per-strategy P&L attribution (even for single-strategy MVP — schema ready for N strategies) + continuous slippage monitoring feeding the 6.11 kill switch. (h) Phase 10 now owns the pre-live multi-strategy safety layer; Phase 11 owns advanced enhancements after that baseline is proven. |

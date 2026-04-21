@@ -173,7 +173,8 @@ alignment refactoring complete (2026-04-19). Safety review and Phase 10
 redesign complete (2026-04-19).**
 
 Only **SMA Crossover** is currently active in `forward_test.py`.
-RSI Reversion is implemented and backtested but not yet running.
+RSI Reversion is implemented and backtested but not yet running. RSI activation is
+now a Phase 10 paper-mode deliverable, not a Phase 11 item.
 
 Recent fixes (2026-04-19):
 - Slippage kill switch bug fixed: `modeled_bps` was hardcoded 0; now uses
@@ -183,6 +184,20 @@ Recent fixes (2026-04-19):
 - `main.py` now delegates to `forward_test.py`
 - Docs corrected: README and architecture.md now say SMA-only is active
 
+Phase 10 pre-live blockers now include:
+- Durable position ownership restored from the trade DB
+- Startup reconciliation with NORMAL / RESTRICTED / HALT fail-safe modes
+- WebSocket order/fill streaming via Alpaca `TradingStream`
+- Fixed per-strategy capital allocation so SMA and RSI cannot consume each other's sleeves
+- Production regime detector and strategy regime gating
+- RSI paper activation with `settings.RSI_WATCHLIST`
+- Minimum 2-week, target 4-week, SMA + RSI Alpaca paper run before any multi-strategy live flip
+
+Phase 11 is reserved for advanced follow-on work: optional third strategies, dynamic
+allocation, richer correlation/sector caps, dashboards, health-based throttling, and
+intraday market-data streaming only if intraday strategies exist. Phase 11's optional
+`StockDataStream` work is not the same as Phase 10's mandatory order/fill `TradingStream`.
+
 Total: 357 unit tests passing.
 
 **Next steps (operational — no code):**
@@ -190,7 +205,7 @@ Total: 357 unit tests passing.
 2. **Manual restart verification** (see below) — do this during the paper run.
 3. After the run: `python scripts/gonogo.py` (exit 0 = GO).
 4. Reconcile paper fills: `Reconciler(strategy, symbols, start, end).run()`.
-5. If GO → execute Phase 10 (see PLAN.md for ordered steps).
+5. If GO → execute Phase 10 (see PLAN.md for ordered steps), including RSI paper activation and fixed per-strategy capital allocation.
 6. If NO-GO → return to Phase 5 for strategy re-analysis.
 
 ---

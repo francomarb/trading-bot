@@ -22,7 +22,7 @@ A modular, strategy-agnostic algorithmic trading bot built in Python. Currently 
 | SMA Crossover | Trend-following | Market | **Active — Paper Trading** |
 | RSI Reversion | Mean-reversion | Limit | Implemented, not yet active |
 
-Only SMA crossover is currently running. RSI Reversion is implemented and backtested but will not be activated until SMA crossover completes the go/no-go evaluation. When activated, both strategies will run in separate `StrategySlot` instances, sharing one risk manager and equity pool — SMA profits in trends, RSI profits in ranges.
+Only SMA crossover is currently running. RSI Reversion is implemented and backtested but will not be activated until the current SMA paper run is reconciled and Phase 10 safety work is complete. Phase 10 now requires fixed per-strategy capital allocation before SMA + RSI run together, so one strategy cannot consume the other's sleeve. After Phase 10, SMA + RSI must run together in Alpaca paper mode for at least 2 weeks, target 4 weeks, before any multi-strategy live flip.
 
 See [docs/strategies.md](docs/strategies.md) for full signal logic and parameters.
 
@@ -32,7 +32,7 @@ See [docs/strategies.md](docs/strategies.md) for full signal logic and parameter
 Engine (live loop) → Data Layer → Indicators + Strategies → Risk Manager → Broker → Reporting
 ```
 
-The engine runs multiple strategy slots, each with its own symbol universe. Risk and execution are shared across all slots. Every trade is logged to SQLite and evaluated against go/no-go thresholds before live deployment.
+The engine runs multiple strategy slots, each with its own symbol universe. Risk and execution are shared across all slots, and Phase 10 adds a portfolio allocation layer so each strategy has an explicit capital sleeve. Every trade is logged to SQLite and evaluated against go/no-go thresholds before live deployment.
 
 See [docs/architecture.md](docs/architecture.md) for the full architecture guide.
 
@@ -109,7 +109,8 @@ python phase9_verify.py
 - Phase 9.5 complete (forward-test infrastructure, reconciliation)
 - Architecture alignment complete (SDK migration, SQLite, metrics, go/no-go)
 - Currently running paper trading (SMA crossover only) — awaiting 4+ weeks of data for go/no-go evaluation
-- RSI Reversion implemented and backtested; will activate after SMA go/no-go passes
+- Phase 10 pre-live blockers include durable ownership, startup reconciliation, WebSocket order/fill streaming (`TradingStream`), fixed per-strategy capital allocation, regime gating, and RSI paper activation
+- RSI Reversion implemented and backtested; it activates in Phase 10 paper mode with `settings.RSI_WATCHLIST`, strategy-specific allocation, and a mandatory 2-4 week SMA + RSI paper validation window before live
 
 ## Environment Variables
 
