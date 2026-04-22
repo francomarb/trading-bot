@@ -63,6 +63,7 @@ from execution.broker import (
 from indicators.technicals import add_atr
 from risk.manager import (
     AccountState,
+    Position,
     RiskDecision,
     RiskManager,
     RiskRejection,

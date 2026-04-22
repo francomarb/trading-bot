@@ -95,7 +95,7 @@ def main() -> None:
         cycle_interval_seconds=settings.ENGINE_CYCLE_INTERVAL_SECONDS,
         max_bar_age_multiplier=settings.ENGINE_MAX_BAR_AGE_MULTIPLIER,
         market_hours_only=True,
-        cancel_orders_on_shutdown=True,
+        cancel_orders_on_shutdown=settings.ENGINE_CANCEL_ORDERS_ON_SHUTDOWN,
     )
 
     engine = TradingEngine(

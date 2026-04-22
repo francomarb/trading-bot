@@ -116,6 +116,8 @@ class TestRiskManagerConstruction:
         [
             ("max_position_pct", 0),
             ("max_position_pct", 1.0),
+            ("max_position_notional_pct", 0),
+            ("max_position_notional_pct", 1.1),
             ("max_open_positions", 0),
             ("max_gross_exposure_pct", 0),
             ("max_gross_exposure_pct", 6),
@@ -186,12 +188,16 @@ class TestStopAndSizing:
         assert result.side is Side.BUY
         # Stop = 100 - 2*2 = 96
         assert result.stop_price == pytest.approx(96.0)
-        # risk = 100k * 0.02 = $2000; stop dist = $4 → qty = 500
-        assert result.qty == 500
+        # risk = 100k * 0.02 = $2000; stop dist = $4 → risk qty 500.
+        # Per-position notional cap = 10% of 100k = $10k → 100 shares.
+        assert result.qty == 100
 
     def test_dollar_loss_to_stop_bounded_by_max_position_pct(self):
         """The whole point of the sizing rule: stopping out costs ≤ X% of equity."""
-        mgr = _mgr(max_position_pct=0.01)  # 1% per trade
+        mgr = _mgr(
+            max_position_pct=0.01,
+            max_position_notional_pct=1.0,
+        )  # 1% per trade
         equity = 50_000.0
         result = mgr.evaluate(
             _signal(price=200.0, atr=5.0),
@@ -203,6 +209,43 @@ class TestStopAndSizing:
         assert result.qty == 50
         loss_at_stop = result.qty * (result.entry_reference_price - result.stop_price)
         assert loss_at_stop <= equity * 0.01 + 1e-6
+
+    def test_per_position_notional_cap_scales_qty_down(self):
+        mgr = _mgr(max_position_notional_pct=0.10)
+        result = mgr.evaluate(
+            _signal(symbol="NVDA", price=200.0, atr=4.7),
+            _account(equity=100_000.0),
+            now=T0,
+        )
+        assert isinstance(result, RiskDecision)
+        # Stop-risk sizing would allow floor(2000 / 9.4) = 212 shares.
+        # 10% notional cap allows floor(10000 / 200) = 50 shares.
+        assert result.qty == 50
+        assert result.qty * result.entry_reference_price <= 10_000.0
+
+    def test_per_position_notional_cap_still_allows_five_position_sleeve(self):
+        mgr = _mgr(
+            max_position_notional_pct=0.10,
+            max_open_positions=5,
+            max_gross_exposure_pct=0.50,
+        )
+        equity = 100_000.0
+        positions = {
+            f"SYM{i}": Position(
+                symbol=f"SYM{i}",
+                qty=100,
+                avg_entry_price=100.0,
+                market_value=10_000.0,
+            )
+            for i in range(4)
+        }
+        result = mgr.evaluate(
+            _signal(symbol="AAPL", price=100.0, atr=1.0),
+            _account(equity=equity, positions=positions),
+            now=T0,
+        )
+        assert isinstance(result, RiskDecision)
+        assert result.qty == 100
 
     def test_gross_exposure_cap_scales_qty_down(self):
         mgr = _mgr(max_gross_exposure_pct=0.10)  # very tight cap

@@ -259,7 +259,7 @@ class TestProcessSymbol:
     def _process(self, engine, symbol, snap):
         """Helper: call _process_symbol with the engine's first slot."""
         slot = engine.slots[0]
-        engine._process_symbol(
+        return engine._process_symbol(
             symbol, snap, snap.account, slot.strategy, slot.timeframe
         )
 
@@ -267,11 +267,12 @@ class TestProcessSymbol:
         engine, broker = engine_factory(entries=[False] * 59 + [True])
         snap = _snapshot()
         engine._session_start_equity = snap.account.equity
-        self._process(engine, "AAPL", snap)
+        filled = self._process(engine, "AAPL", snap)
         assert broker.place_order.call_count == 1
         decision = broker.place_order.call_args.args[0]
         assert decision.symbol == "AAPL"
         assert decision.side is Side.BUY
+        assert filled == Position("AAPL", 1, 100.5, 100.5)
         broker.close_position.assert_not_called()
 
     def test_entry_signal_with_existing_position_no_order(self, engine_factory):

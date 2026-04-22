@@ -34,6 +34,7 @@ WATCHLIST = list(dict.fromkeys(SMA_WATCHLIST + RSI_WATCHLIST + ["RIVN"]))
 # ── Risk settings (Phase 6) ──────────────────────────────────────────────────
 # Position sizing
 MAX_POSITION_PCT = 0.02         # Risk no more than 2% of equity per trade (loss-to-stop)
+MAX_POSITION_NOTIONAL_PCT = 0.10 # Cap one position at 10% notional so 5 can fit in 50% gross
 MAX_OPEN_POSITIONS = 5          # Cap concurrent open positions
 MAX_GROSS_EXPOSURE_PCT = 0.50   # Cap total gross notional at 50% of equity (initial live)
 
@@ -72,7 +73,9 @@ ENGINE_CYCLE_INTERVAL_SECONDS = 300 # 5 min between cycles for daily strategy
 ENGINE_MAX_BAR_AGE_MULTIPLIER = 2.5 # Stale guard: refuse to trade if last bar
                                     # is older than (bar_interval × multiplier)
 ENGINE_MARKET_HOURS_ONLY = True     # Only trade during regular session
-ENGINE_CANCEL_ORDERS_ON_SHUTDOWN = True  # Tidy on SIGINT
+# Preserve OTO stop-loss legs across bot restarts. Manual liquidation paths
+# explicitly cancel sibling orders before closing a position.
+ENGINE_CANCEL_ORDERS_ON_SHUTDOWN = False
 
 # ── Reporting settings (Phase 9) ────────────────────────────────────────────
 TRADE_LOG_CSV = "logs/trades.csv"           # Legacy CSV trade log (deprecated)

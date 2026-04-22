@@ -18,6 +18,9 @@ Design principles
    *dollar* loss on a stop-out is bounded to `MAX_POSITION_PCT * equity`
    regardless of the symbol's volatility.
 
+   Sizing is also capped by per-position notional exposure. A tight stop must
+   not let one trade consume the whole gross-exposure sleeve.
+
 3. **Multiple independent kill switches.** Daily-loss %, hard-dollar cap,
    broker-error streak, and slippage drift each halt trading independently.
    Once tripped, the manager stays halted until `reset_kill_switches()` is
@@ -211,6 +214,7 @@ class RiskManager:
         self,
         *,
         max_position_pct: float = settings.MAX_POSITION_PCT,
+        max_position_notional_pct: float = settings.MAX_POSITION_NOTIONAL_PCT,
         max_open_positions: int = settings.MAX_OPEN_POSITIONS,
         max_gross_exposure_pct: float = settings.MAX_GROSS_EXPOSURE_PCT,
         atr_stop_multiplier: float = settings.ATR_STOP_MULTIPLIER,
@@ -228,6 +232,8 @@ class RiskManager:
         # silently disable a rule mid-session.
         if not (0 < max_position_pct < 1):
             raise ValueError("max_position_pct must be in (0, 1)")
+        if not (0 < max_position_notional_pct <= 1):
+            raise ValueError("max_position_notional_pct must be in (0, 1]")
         if max_open_positions < 1:
             raise ValueError("max_open_positions must be >= 1")
         if not (0 < max_gross_exposure_pct <= 5):
@@ -253,6 +259,7 @@ class RiskManager:
 
         self.slippage_drift_enabled = slippage_drift_enabled
         self.max_position_pct = max_position_pct
+        self.max_position_notional_pct = max_position_notional_pct
         self.max_open_positions = max_open_positions
         self.max_gross_exposure_pct = max_gross_exposure_pct
         self.atr_stop_multiplier = atr_stop_multiplier
@@ -424,7 +431,8 @@ class RiskManager:
         Fixed-fractional sizing on stop distance:
             risk_dollars = equity * max_position_pct
             qty          = floor(risk_dollars / |entry - stop|)
-        Then capped by remaining gross-exposure budget and available cash.
+        Then capped by per-position notional exposure, remaining
+        gross-exposure budget, and available cash.
         """
         risk_dollars = account.equity * self.max_position_pct
         stop_distance = abs(signal.reference_price - stop_price)
@@ -433,6 +441,15 @@ class RiskManager:
         raw_qty = math.floor(risk_dollars / stop_distance)
         if raw_qty <= 0:
             return 0
+
+        # Cap by per-position notional budget so tight stops do not consume
+        # the whole SMA sleeve.
+        if signal.reference_price > 0:
+            max_position_notional = account.equity * self.max_position_notional_pct
+            notional_qty_cap = math.floor(
+                max_position_notional / signal.reference_price
+            )
+            raw_qty = min(raw_qty, notional_qty_cap)
 
         # Cap by remaining gross-exposure budget.
         max_gross = account.equity * self.max_gross_exposure_pct
