@@ -160,9 +160,9 @@ class MetricsSnapshot:
         go = len(reasons) == 0
         return go, reasons
 
-    def format_report(self) -> str:
+    def format_report(self, *, min_trades: int = 50) -> str:
         """Human-readable summary of all metrics."""
-        go, reasons = self.meets_go_thresholds()
+        go, reasons = self.meets_go_thresholds(min_trades=min_trades)
         verdict = "GO" if go else "NO-GO"
 
         lines = [
@@ -170,8 +170,8 @@ class MetricsSnapshot:
             "",
             f"| Metric | Value | Threshold | Status |",
             f"|--------|-------|-----------|--------|",
-            f"| Trades | {self.trade_count} | >= 50 | "
-            f"{'PASS' if self.trade_count >= 50 else 'FAIL'} |",
+            f"| Trades | {self.trade_count} | >= {min_trades} | "
+            f"{'PASS' if self.trade_count >= min_trades else 'FAIL'} |",
             f"| Sharpe Ratio | {self.sharpe_ratio:.2f} | > {SHARPE_THRESHOLD} | "
             f"{'PASS' if self.sharpe_ratio > SHARPE_THRESHOLD else 'FAIL'} |",
             f"| Max Drawdown | {self.max_drawdown_pct:.1%} | < {MAX_DRAWDOWN_THRESHOLD:.0%} | "

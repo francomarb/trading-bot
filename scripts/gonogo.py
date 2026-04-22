@@ -17,7 +17,7 @@ Exit codes:
     1 — NO-GO (one or more gates failed)
 
 Architecture reference (architecture.md §Go/No-Go Framework):
-    1. Minimum 50 closed trades
+    1. Minimum 50 closed trades for live-readiness statistics
     2. Paper trading spans at least 4 weeks
     3. All five metrics meet thresholds
     4. Bot ran 72+ hours continuously without crashes
@@ -242,7 +242,10 @@ def main() -> None:
         "--min-trades",
         type=int,
         default=50,
-        help="Minimum closed trades required (default: 50)",
+        help=(
+            "Minimum closed round trips required (default: 50 for live-readiness; "
+            "lower only for slow-strategy diagnostics)"
+        ),
     )
     parser.add_argument(
         "--min-weeks",
@@ -280,7 +283,7 @@ def main() -> None:
         }
         print(json.dumps(result, indent=2))
     else:
-        print(metrics.format_report())
+        print(metrics.format_report(min_trades=args.min_trades))
         print()
         print("## Operational Checks")
         print()

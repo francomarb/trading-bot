@@ -343,9 +343,15 @@ trade-level and P&L reporting on top.
 ---
 
 ### Phase 9.5 — Forward-Test (Paper, Multi-Week)
-**Goal:** The single most important gate before live money. Run the live paper bot for
-multiple weeks and **reconcile realized fills against what the backtest predicted**.
-If reality diverges significantly from backtest, the strategy does not go live.
+**Goal:** Stabilize the paper bot under real market conditions and gather evidence
+about SMA behavior before Phase 10. Run the live paper bot for multiple weeks and
+**reconcile realized fills against what the backtest predicted**. If reality diverges
+significantly from backtest, return to Phase 5/6 analysis before expanding the system.
+
+This is **not** the final live-capital GO/NO-GO gate. The final gate happens after
+Phase 10 hardening, with both SMA and RSI active in paper mode, fixed strategy
+capital sleeves, durable ownership, startup reconciliation, and the remaining
+pre-live safeguards implemented.
 
 | # | Deliverable | Status |
 |---|---|---|
@@ -359,7 +365,16 @@ If reality diverges significantly from backtest, the strategy does not go live.
 | 9.5.8 | `get_closed_orders` on `AlpacaBroker` for fill history retrieval | ✅ |
 | 9.5.9 | Verified: infrastructure verified against live paper — reconciler, report generation, engine wiring | ✅ (2026-04-16) |
 
-**Exit Criteria:** Multi-week paper run completes; realized P&L reconciles with backtest expectations within committed threshold. Go/no-go decision documented.
+**SMA-only sample-size note:** a daily SMA trend strategy may not produce 50
+closed trades during a 2-4 week paper run. For Phase 9.5, the primary gate is
+paper-vs-backtest reconciliation over the same bars plus operational stability.
+The 50 closed-trade threshold remains a stricter live-readiness/statistical gate,
+not a realistic expectation for the current SMA-only forward test.
+
+**Exit Criteria:** The SMA paper run is operationally stable, startup/shutdown/restart
+behavior is clean, realized fills reconcile with backtest expectations within the
+committed threshold, and any defects discovered during paper trading are fixed or
+promoted into Phase 10 blockers.
 
 ---
 
@@ -682,6 +697,7 @@ is assigned to those new behaviors.
 | Date | Note |
 |---|---|
 | 2026-04-22 | **Interim SMA notional guardrail added after contaminated paper run.** `MAX_POSITION_NOTIONAL_PCT` now caps each position's notional exposure so one tight-stop SMA trade cannot starve the rest of the SMA sleeve. This is intentionally a temporary crutch for the SMA-only forward test; Phase 10 Group F still owns the real fix via fixed per-strategy capital allocation, durable ownership, and sleeve-level exposure accounting before SMA + RSI run together. |
+| 2026-04-22 | **Phase 9.5 reclassified as stabilization, not final live GO/NO-GO.** The SMA-only paper run should continue until the bot is operationally stable and reconciles reasonably against the same-window backtest. The actual live-readiness gate moves to the post-Phase-10 combined SMA + RSI paper run, after fixed capital allocation, durable ownership, startup reconciliation, and remaining pre-live safeguards are implemented. |
 | 2026-04-21 | **Pre-live multi-strategy gates moved into Phase 10.** Phase 10 Group F now owns the critical SMA + RSI blockers: fixed per-strategy capital allocation, production regime detector, strategy regime gating, RSI paper activation, and minimum concentration guardrails. Phase 10 exit criteria now require a combined SMA + RSI Alpaca paper run for minimum 2 weeks, target 4 weeks, with a documented GO/NO-GO report before any SMA + RSI live flip. Phase 11 is now reserved for advanced enhancements such as optional third strategies, dynamic allocation, richer caps, dashboards, and health-based throttling. |
 | 2026-04-20 | **Multi-strategy watchlist architecture implemented.** `config/settings.py` now has `SMA_WATCHLIST` (10 symbols: stalwarts/fast growers + large-cap financials) and `RSI_WATCHLIST` (11 symbols: stalwarts + cyclicals + financial cyclicals). `WATCHLIST` is computed as the ordered union of both lists plus RIVN (kept for paper-run continuity, not yet assigned to either strategy). The watchlist review script was redesigned around strategy-specific `CheckProfile` objects: SMA profile requires positive FCF and revenue growth (failing either = POOR FIT); RSI profile treats both as informational only (failing = MARGINAL, not POOR FIT). Solvency is always required for both, with different floors (18-month for SMA, 12-month for RSI). Output is a strategy-fitness matrix showing GOOD FIT / MARGINAL / POOR FIT per symbol per strategy. A scanner (`scripts/scanner.py`) is deferred to Phase 11 when RSI is live and has consumers; scanner design: Stage 1 Alpaca equity screener (fast universe filter) → Stage 2 technical pre-screen (ATR, volume) → Stage 3 yfinance fundamental routing (same CheckProfile logic). Full suite: 424 tests passing. |
 | 2026-04-20 | **Book review: Lynch — *Beating the Street* (full read). Three solid-keep findings implemented immediately; two "keep with caution" and six skip decisions made.** Implemented: (1) `scripts/watchlist_review.py` — Lynch six-month checkup operationalised as a runnable script (Ch. 15 FCF check, Ch. 21 revenue growth check, Golden Rules cash solvency check). Outputs a markdown report; exit 0 = all pass, exit 1 = failures found. Run before any watchlist change and before the Phase 10 live flip. 48 unit tests added. `yfinance` added to requirements.txt. (2) FCF positivity and cash solvency are the admission gate for any new RSI reversion symbol — coded into the script. (3) Revenue growth ≥ 0% YoY required for consumer/growth names in RSI universe. **Deliberately skipped:** January Effect (academically arbitraged since ~2000), sum-of-parts valuation (priced in continuously by sell-side), "lousy industry" preference (captured by existing market-cap/beta filters), pent-up demand indicator (data-intensive, well-known to institutions), insider buying Form 4 (low signal for large caps), Russell/S&P P/E spread (wrong tool for 13-symbol universe). **"Keep with caution" deferred:** cyclical P/E inversion filter and P/E divergence stop tightener — both were judged likely to create more problems than they solve at current stage; neither is implemented. |

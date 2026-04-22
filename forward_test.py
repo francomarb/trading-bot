@@ -14,9 +14,14 @@ Reconcile after the run:
 
     python -c "
     from backtest.reconcile import Reconciler
+    from config import settings
     from strategies.sma_crossover import SMACrossover
-    r = Reconciler(SMACrossover(20,50), ['AAPL','MSFT','GOOGL','AMZN','NVDA'],
-                   '2026-04-17', '2026-05-15')
+    r = Reconciler(
+        SMACrossover(20, 50),
+        list(settings.SMA_WATCHLIST),
+        'YYYY-MM-DD',
+        'YYYY-MM-DD',
+    )
     result = r.run()
     r.write_report(result)
     print('GO' if result.go else 'NO-GO', result.reasons)
