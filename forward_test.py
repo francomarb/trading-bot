@@ -31,6 +31,7 @@ Reconcile after the run:
 from __future__ import annotations
 
 import sys
+import subprocess
 from datetime import datetime, timezone
 
 from loguru import logger
@@ -62,10 +63,27 @@ logger.add(
 logger.add("logs/forward_test.log", rotation="10 MB", retention="90 days", level="DEBUG")
 
 
+def _git_version() -> str:
+    """Return a concise git identity for the running bot code."""
+    try:
+        result = subprocess.run(
+            ["git", "describe", "--always", "--dirty", "--tags"],
+            check=True,
+            capture_output=True,
+            text=True,
+            timeout=2,
+        )
+        return result.stdout.strip() or "unknown"
+    except Exception:
+        return "unknown"
+
+
 def main() -> None:
     logger.info("=" * 60)
     logger.info("Forward Test — Paper Trading (Phase 9.5)")
     logger.info("=" * 60)
+    logger.info(f"bot version: {_git_version()}")
+    logger.info(f"python={sys.version.split()[0]} paper={settings.ALPACA_PAPER}")
 
     # JSON structured log.
     install_json_sink()

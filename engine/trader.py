@@ -289,6 +289,12 @@ class TradingEngine:
         """
         cycle_id = self._cycle_count
         now_mono = time.monotonic()
+        cycle_started_mono = now_mono
+        total_symbols = sum(len(slot.active_symbols()) for slot in self.slots)
+        processed_symbols = 0
+        new_positions = 0
+        error_count = 0
+        cycle_status = "ok"
 
         # Detect sleep gaps — if wall-clock time since the last cycle end is
         # much larger than the configured interval, the machine likely slept.
@@ -306,10 +312,23 @@ class TradingEngine:
                 )
 
         try:
-            logger.info(f"── cycle {cycle_id} ──────────────────────────────")
+            market_state = "not_checked"
+            if self.config.market_hours_only:
+                market_open = self._market_open()
+                market_state = "open" if market_open else "closed"
+            else:
+                market_open = True
+                market_state = "not_enforced"
 
-            if self.config.market_hours_only and not self._market_open():
-                logger.info("market closed — skipping cycle")
+            logger.info(
+                f"cycle {cycle_id} start: "
+                f"market={market_state}, symbols={total_symbols}, "
+                f"slots={len(self.slots)}"
+            )
+
+            if not market_open:
+                cycle_status = "market_closed"
+                logger.info(f"cycle {cycle_id} skipped: market closed")
                 return
 
             try:
@@ -317,10 +336,19 @@ class TradingEngine:
                     session_start_equity=self._session_start_equity
                 )
             except Exception as e:
+                cycle_status = "sync_failed"
                 logger.error(f"sync_with_broker failed: {e}; skipping cycle")
                 self.risk.record_broker_error()
                 self.alerts.broker_error(str(e))
                 return
+
+            risk_state = self.risk.halt_reason() or "healthy"
+            logger.info(
+                f"cycle {cycle_id} broker state: "
+                f"positions={len(snapshot.account.open_positions)}, "
+                f"open_orders={len(snapshot.open_orders)}, "
+                f"risk={risk_state}"
+            )
 
             # Daily-loss / hard-dollar gates can fire on any signal; halt state
             # is sticky until manual reset, so we don't need to short-circuit
@@ -342,6 +370,7 @@ class TradingEngine:
                 symbols = slot.active_symbols()
                 for symbol in symbols:
                     try:
+                        processed_symbols += 1
                         filled = self._process_symbol(
                             symbol,
                             snapshot,
@@ -350,6 +379,7 @@ class TradingEngine:
                             slot.timeframe,
                         )
                         if filled is not None:
+                            new_positions += 1
                             # Merge the new position into the running account so
                             # the next symbol's risk.evaluate() sees it.
                             updated_positions = {
@@ -364,8 +394,18 @@ class TradingEngine:
                             )
                     except Exception as e:
                         # Never let one symbol kill the cycle.
+                        error_count += 1
+                        cycle_status = "symbol_errors"
                         logger.exception(f"{symbol}: cycle step failed: {e}")
         finally:
+            duration = time.monotonic() - cycle_started_mono
+            logger.info(
+                f"cycle {cycle_id} complete: status={cycle_status}, "
+                f"processed={processed_symbols}/{total_symbols}, "
+                f"new_positions={new_positions}, errors={error_count}, "
+                f"duration={duration:.1f}s, "
+                f"next_cycle_in={self.config.cycle_interval_seconds:.0f}s"
+            )
             # Close idle HTTP connections so they don't go stale during the
             # inter-cycle sleep (5 min default).  Fresh connections are cheap.
             close_connections()
