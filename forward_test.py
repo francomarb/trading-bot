@@ -69,7 +69,7 @@ def main() -> None:
     slots = [
         StrategySlot(
             strategy=SMACrossover(fast=20, slow=50),
-            symbols=list(settings.WATCHLIST),
+            symbols=list(settings.SMA_WATCHLIST),
         ),
         # Add more slots here as new strategies are built:
         # StrategySlot(

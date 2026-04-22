@@ -304,66 +304,71 @@ class TradingEngine:
                     f"sleep gap: {gap:.0f}s, ~{missed} cycles missed"
                 )
 
-        logger.info(f"── cycle {cycle_id} ──────────────────────────────")
-
-        if self.config.market_hours_only and not self._market_open():
-            logger.info("market closed — skipping cycle")
-            return
-
         try:
-            snapshot = self.broker.sync_with_broker(
-                session_start_equity=self._session_start_equity
-            )
-        except Exception as e:
-            logger.error(f"sync_with_broker failed: {e}; skipping cycle")
-            self.risk.record_broker_error()
-            self.alerts.broker_error(str(e))
-            return
+            logger.info(f"── cycle {cycle_id} ──────────────────────────────")
 
-        # Daily-loss / hard-dollar gates can fire on any signal; halt state
-        # is sticky until manual reset, so we don't need to short-circuit
-        # here — every per-symbol evaluate() call respects it.
-        if self.risk.is_halted():
-            reason = self.risk.halt_reason() or "unknown"
-            logger.warning(
-                f"risk halted ({reason}) — no new entries "
-                "this cycle, but continuing to monitor"
-            )
-            self.alerts.engine_halt(reason)
+            if self.config.market_hours_only and not self._market_open():
+                logger.info("market closed — skipping cycle")
+                return
 
-        # Maintain a running account that updates after each intra-cycle fill so
-        # the gross-exposure and max-positions caps see positions opened earlier
-        # in the same cycle — not just what the broker reported at cycle start.
-        running_account = snapshot.account
+            try:
+                snapshot = self.broker.sync_with_broker(
+                    session_start_equity=self._session_start_equity
+                )
+            except Exception as e:
+                logger.error(f"sync_with_broker failed: {e}; skipping cycle")
+                self.risk.record_broker_error()
+                self.alerts.broker_error(str(e))
+                return
 
-        for slot in self.slots:
-            symbols = slot.active_symbols()
-            for symbol in symbols:
-                try:
-                    filled = self._process_symbol(
-                        symbol, snapshot, running_account, slot.strategy, slot.timeframe
-                    )
-                    if filled is not None:
-                        # Merge the new position into the running account so
-                        # the next symbol's risk.evaluate() sees it.
-                        updated_positions = {
-                            **running_account.open_positions,
-                            filled.symbol: filled,
-                        }
-                        running_account = AccountState(
-                            equity=running_account.equity,
-                            cash=running_account.cash - filled.market_value,
-                            session_start_equity=running_account.session_start_equity,
-                            open_positions=updated_positions,
+            # Daily-loss / hard-dollar gates can fire on any signal; halt state
+            # is sticky until manual reset, so we don't need to short-circuit
+            # here — every per-symbol evaluate() call respects it.
+            if self.risk.is_halted():
+                reason = self.risk.halt_reason() or "unknown"
+                logger.warning(
+                    f"risk halted ({reason}) — no new entries "
+                    "this cycle, but continuing to monitor"
+                )
+                self.alerts.engine_halt(reason)
+
+            # Maintain a running account that updates after each intra-cycle fill so
+            # the gross-exposure and max-positions caps see positions opened earlier
+            # in the same cycle — not just what the broker reported at cycle start.
+            running_account = snapshot.account
+
+            for slot in self.slots:
+                symbols = slot.active_symbols()
+                for symbol in symbols:
+                    try:
+                        filled = self._process_symbol(
+                            symbol,
+                            snapshot,
+                            running_account,
+                            slot.strategy,
+                            slot.timeframe,
                         )
-                except Exception as e:
-                    # Never let one symbol kill the cycle.
-                    logger.exception(f"{symbol}: cycle step failed: {e}")
-
-        # Close idle HTTP connections so they don't go stale during the
-        # inter-cycle sleep (5 min default).  Fresh connections are cheap.
-        close_connections()
-        self._last_cycle_end = time.monotonic()
+                        if filled is not None:
+                            # Merge the new position into the running account so
+                            # the next symbol's risk.evaluate() sees it.
+                            updated_positions = {
+                                **running_account.open_positions,
+                                filled.symbol: filled,
+                            }
+                            running_account = AccountState(
+                                equity=running_account.equity,
+                                cash=running_account.cash - filled.market_value,
+                                session_start_equity=running_account.session_start_equity,
+                                open_positions=updated_positions,
+                            )
+                    except Exception as e:
+                        # Never let one symbol kill the cycle.
+                        logger.exception(f"{symbol}: cycle step failed: {e}")
+        finally:
+            # Close idle HTTP connections so they don't go stale during the
+            # inter-cycle sleep (5 min default).  Fresh connections are cheap.
+            close_connections()
+            self._last_cycle_end = time.monotonic()
 
     def _process_symbol(
         self,

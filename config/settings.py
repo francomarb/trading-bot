@@ -17,9 +17,8 @@ ALPACA_BASE_URL = (
 # Strategy-specific watchlists
 # SMA Crossover — trend-following; suits Stalwarts and Fast Growers (Lynch Ch. 3)
 SMA_WATCHLIST = [
-    "AAPL", "MSFT", "GOOGL", "AMZN", "NVDA",   # stalwarts / fast growers
-    "JPM", "BAC", "GS",                          # large-cap financials (trend)
-    "PINS", "UBER",                              # growth names, acceptable for trend
+    "AAPL", "MSFT", "GOOGL", "AMZN", "META", "NVDA", "AVGO", "AMD",
+    "MU", "TSLA", "ORCL", "ANET", "MRVL", "MELI", "GS", "BAC",
 ]
 # RSI Reversion — mean-reversion; suits Turnarounds and Cyclicals (Lynch Ch. 3)
 RSI_WATCHLIST = [

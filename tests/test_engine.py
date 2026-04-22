@@ -28,6 +28,7 @@ Coverage map (one class per concern):
 
 from __future__ import annotations
 
+import time
 from datetime import datetime, timedelta, timezone
 from types import SimpleNamespace
 from unittest.mock import MagicMock
@@ -258,7 +259,9 @@ class TestProcessSymbol:
     def _process(self, engine, symbol, snap):
         """Helper: call _process_symbol with the engine's first slot."""
         slot = engine.slots[0]
-        engine._process_symbol(symbol, snap, slot.strategy, slot.timeframe)
+        engine._process_symbol(
+            symbol, snap, snap.account, slot.strategy, slot.timeframe
+        )
 
     def test_entry_signal_no_position_places_order(self, engine_factory):
         engine, broker = engine_factory(entries=[False] * 59 + [True])
@@ -351,6 +354,20 @@ class TestRunOneCycle:
         engine._run_one_cycle()
         broker.sync_with_broker.assert_not_called()
         broker.place_order.assert_not_called()
+
+    def test_market_closed_cycle_updates_sleep_gap_baseline(self, engine_factory):
+        engine, broker = engine_factory(
+            market_open=False,
+            config_overrides={"market_hours_only": True},
+        )
+        engine._session_start_equity = 100_000.0
+        engine._cycle_count = 1
+        before = time.monotonic()
+
+        engine._run_one_cycle()
+
+        assert engine._last_cycle_end >= before
+        broker.sync_with_broker.assert_not_called()
 
     def test_sync_failure_skips_cycle_and_records_broker_error(
         self, engine_factory
@@ -462,7 +479,7 @@ class TestSlippageRecording:
         snap = _snapshot()
         engine._session_start_equity = snap.account.equity
         slot = engine.slots[0]
-        engine._process_symbol("AAPL", snap, slot.strategy, slot.timeframe)
+        engine._process_symbol("AAPL", snap, snap.account, slot.strategy, slot.timeframe)
 
         assert len(engine.risk._slippage_samples) == 1
         modeled_bps, realized_bps = engine.risk._slippage_samples[0]
@@ -497,7 +514,7 @@ class TestSlippageRecording:
             limit_price=modeled_close,
         )
         engine.risk.evaluate = MagicMock(return_value=limit_decision)
-        engine._process_symbol("AAPL", snap, slot.strategy, slot.timeframe)
+        engine._process_symbol("AAPL", snap, snap.account, slot.strategy, slot.timeframe)
 
         assert len(engine.risk._slippage_samples) == 1
         modeled_bps, _ = engine.risk._slippage_samples[0]
@@ -615,7 +632,7 @@ class TestPositionOwnership:
         engine._position_owners["AAPL"] = "other_strategy"
 
         slot = engine.slots[0]
-        engine._process_symbol("AAPL", snap, slot.strategy, slot.timeframe)
+        engine._process_symbol("AAPL", snap, snap.account, slot.strategy, slot.timeframe)
         broker.close_position.assert_not_called()
 
     def test_exit_allowed_when_position_owned_by_same_strategy(
@@ -631,7 +648,7 @@ class TestPositionOwnership:
         engine._position_owners["AAPL"] = "fake_strategy"
 
         slot = engine.slots[0]
-        engine._process_symbol("AAPL", snap, slot.strategy, slot.timeframe)
+        engine._process_symbol("AAPL", snap, snap.account, slot.strategy, slot.timeframe)
         broker.close_position.assert_called_once_with("AAPL")
         # Ownership cleared after close.
         assert "AAPL" not in engine._position_owners
@@ -645,7 +662,7 @@ class TestPositionOwnership:
 
         # No ownership recorded — should still allow close.
         slot = engine.slots[0]
-        engine._process_symbol("AAPL", snap, slot.strategy, slot.timeframe)
+        engine._process_symbol("AAPL", snap, snap.account, slot.strategy, slot.timeframe)
         broker.close_position.assert_called_once_with("AAPL")
 
     def test_entry_registers_ownership(self, engine_factory):
@@ -655,7 +672,7 @@ class TestPositionOwnership:
         engine._session_start_equity = snap.account.equity
 
         slot = engine.slots[0]
-        engine._process_symbol("AAPL", snap, slot.strategy, slot.timeframe)
+        engine._process_symbol("AAPL", snap, snap.account, slot.strategy, slot.timeframe)
         assert broker.place_order.call_count == 1
         assert engine._position_owners["AAPL"] == "fake_strategy"
 
