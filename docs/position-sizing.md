@@ -114,6 +114,10 @@ If broker supports fractional trading:
 shares = position_size / price
 ```
 
+Broker caveat: Alpaca supports fractional equity orders only with `DAY` time in
+force. Any future fractional execution path cannot assume `GTC` entry or
+protective stop orders.
+
 If not:
 
 ```text

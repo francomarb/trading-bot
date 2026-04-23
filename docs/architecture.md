@@ -188,9 +188,19 @@ class BaseStrategy(ABC):
 - Exits are never blocked by the edge filter
 - Missing, NaN, or false filter values block entries by default
 - Use edge filters for confirmation or veto rules such as market regime,
-  symbol trend, volatility gates, MACD confirmation, or EMA5/EMA10 confirmation
+  symbol trend, volatility gates, MACD confirmation, EMA5/EMA10 confirmation,
+  or an earnings-blackout veto for entry timing
 - Do not use edge filters for universe selection; scanners/watchlist sources own
   symbol selection
+
+**Filter file layout:**
+- Keep strategy-specific edge filters in `strategies/filters/<strategy_name>.py`
+- Put reusable filter helpers in `strategies/filters/common.py`
+- Start with strategy-local filters first; promote a rule into a shared pre-risk
+  or policy layer only if multiple strategies converge on the same behavior
+- Example: an SMA earnings blackout should live first in
+  `strategies/filters/sma_crossover.py`, while shared calendar/helper logic can
+  live in `strategies/filters/common.py`
 
 **StrategySlot:**
 Each slot binds a strategy to its symbol universe and timeframe. The engine iterates over slots each cycle. An optional `Scanner` can refresh symbols dynamically.
@@ -241,6 +251,9 @@ A thin wrapper (`AlpacaBroker`) around `alpaca-py`'s `TradingClient`. Translates
 - All entry orders include a stop-loss (OTO bracket)
 - Order errors are caught, logged, and never crash the bot
 - Position ownership is tracked per strategy to prevent cross-strategy interference
+- Alpaca supports `GTC` for whole-share equity market/limit/stop orders, but
+  fractional equity orders are `DAY`-only. Any future fractional execution
+  path must account for that broker constraint explicitly.
 
 ### 6. Reporting & Monitoring
 

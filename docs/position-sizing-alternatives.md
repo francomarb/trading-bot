@@ -210,6 +210,9 @@ Target notional = $200
 - requires a tolerance rule
 - slightly more branching than pure notional sizing
 - still needs minimum trade threshold
+- broker-specific time-in-force handling matters: Alpaca supports fractional
+  equity orders as `DAY` only, so `GTC` protective-stop workflows need an
+  explicit whole-share or fallback path
 
 #### Verdict
 

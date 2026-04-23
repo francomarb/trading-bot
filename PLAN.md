@@ -209,7 +209,7 @@ concrete working strategy.
 | 4.4 | **Look-ahead bias guard** — all indicators use only data available *at signal bar close*; execution assumed on *next bar's open* | ✅ |
 | 4.5 | Unit tests in `tests/test_strategies.py` using synthetic price paths with known crossover points | ✅ |
 | 4.6 | Strategies are pure functions of input data — no network calls, no broker state | ✅ |
-| 4.7 | **Edge-filter hook** — strategies can optionally require a market-regime condition (e.g. `SPY > 200-day MA`) before emitting long entries. Implemented as a composable filter, not hard-coded. This is the minimal regime awareness for the first strategy; the production regime detector is Phase 10. | ✅ |
+| 4.7 | **Edge-filter hook** — strategies can optionally require a market-regime condition (e.g. `SPY > 200-day MA`) before emitting long entries. Implemented as a composable filter, not hard-coded. This is the minimal regime awareness for the first strategy; the production regime detector is Phase 10. Strategy-specific filters should live in `strategies/filters/<strategy_name>.py`, with reusable helpers in `strategies/filters/common.py`. | ✅ |
 | 4.8 | **Preferred order type declared on the strategy** — e.g. `SMACrossover.preferred_order_type = OrderType.MARKET`. Trend/breakout strategies will use market; mean-reversion will use limit. Consumed by Phase 7 execution. | ✅ |
 
 **Exit Criteria:** `SMACrossover.generate_signals()` returns correct entries/exits on synthetic data with known crossover points; tests pass.
@@ -300,6 +300,11 @@ the risk layer enforced by the API shape.
 | 7.8 | Verified: place a paper market order for 1 share of AAPL via a `RiskDecision`, confirm fill, cancel a pending order | ✅ (2026-04-16) |
 
 **Exit Criteria:** `AlpacaBroker.place_order()` successfully submits a paper trade via a `RiskDecision`. `sync_with_broker()` returns current truth. Partial fills and timeouts are handled, not crashed on.
+
+**Broker note:** If/when fractional equity execution is enabled, Alpaca supports
+fractional orders only with `DAY` time in force. `GTC` protective stops and
+`GTC` entry orders therefore remain a whole-share-only path unless fractional
+execution gets an explicit Alpaca-specific fallback.
 
 ---
 
@@ -685,6 +690,7 @@ reason.
 | 11.17 | **Sector concentration cap on watchlist** — Lynch Ch. 9 documents how hot-industry stocks rise together and fall together (disk drives 1981–83, oil service stocks, home shopping). Cap the watchlist at ≤ 3 symbols per GICS sector to prevent a single sector rotation from producing a correlated drawdown across multiple open positions simultaneously. | ⬜ |
 | 11.18 | **Watchlist two-stage pre-screen** — before applying the SMA crossover signal, filter the candidate universe by: PEG ratio < 1.5 (Lynch: *"the P/E of any fairly priced company will equal its growth rate"*), ≥ 2 years positive earnings, not a pure cyclical (airlines, autos, basic materials). Cyclicals route to RSI reversion only. *(Lynch, One Up on Wall Street, Ch. 13)* | ⬜ |
 | 11.19 | **Per-symbol cooldown after losing exit** — after a stop-out or other losing exit, block new entries in that same symbol for a configurable number of bars or hours unless a stronger re-entry rule is explicitly satisfied. Current protection is only per-strategy loss-streak cooldown; this would reduce immediate symbol-level re-entry churn. | ⬜ |
+| 11.20 | **SMA earnings-gap guardrail** — 20/50 crossover exits are too slow to protect against large overnight earnings gaps. Before live, add an explicit earnings-event control for SMA symbols: either (a) earnings blackout window for new entries, (b) reduced size near earnings, or (c) gap-risk slippage overlay in sizing/review. Gross exposure and normal risk-to-stop sizing do not fully cover this event risk. First implementation should live as an SMA edge filter in `strategies/filters/sma_crossover.py`; shared calendar/event helpers can live in `strategies/filters/common.py`. | ⬜ |
 
 **Exit Criteria:** Advanced portfolio enhancements run safely on top of the Phase 10
 SMA + RSI baseline. Optional third strategies, dynamic allocation, advanced concentration

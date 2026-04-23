@@ -43,6 +43,16 @@ Both signals require a confirmed crossover — the previous bar must have been o
 
 **Required bars:** `slow` (e.g. 50 with defaults)
 
+**Edge filters:**
+- SMA supports optional entry gating via the `edge_filter` hook inherited from
+  `BaseStrategy`
+- The intended file layout is `strategies/filters/sma_crossover.py` for
+  SMA-specific filters and `strategies/filters/common.py` for reusable helpers
+- Candidate SMA edge filters include market-regime confirmation and an
+  earnings-blackout veto for new entries
+- Edge filters are entry-only; exits and broker stop-losses must always remain
+  available
+
 **Exit mechanics:**
 
 A position closes when whichever of the following occurs first:
@@ -84,6 +94,14 @@ Both signals require a confirmed threshold crossing — the previous bar's RSI m
 | `overbought` | 70 | Exit threshold (RSI above this) |
 
 **Required bars:** `period + 1` (e.g. 15 with defaults)
+
+**Edge filters:**
+- RSI also supports optional entry gating via the `edge_filter` hook inherited
+  from `BaseStrategy`
+- The intended file layout is `strategies/filters/rsi_reversion.py` for
+  RSI-specific filters and `strategies/filters/common.py` for reusable helpers
+- RSI edge filters are expected to differ from SMA's, so strategy-local filter
+  files are preferred over one combined filter module
 
 **Exit mechanics:**
 
