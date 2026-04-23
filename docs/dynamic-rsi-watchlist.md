@@ -104,7 +104,7 @@ The scanner should be a separate layer **before** RSI.
 ### Desired flow
 
 ```text
-Universe → Scanner → Dynamic Watchlist → RSI Edge Filter → RSI Signal → Risk → Execution
+Universe → Scanner → Dynamic Watchlist → raw RSI Signal → RSI Edge Filter → Risk → Execution
 ```
 
 This is important because symbol selection is not the same as signal generation.
@@ -345,6 +345,32 @@ Daily refresh is the best tradeoff for the current architecture:
 
 ---
 
+## Dynamic Watchlist Guardrails
+
+Dynamic watchlists must not create ambiguity around ownership, attribution, or
+paper-run validity.
+
+Required guardrails:
+
+- do not remove a symbol with an open position unless the exit and ownership
+  behavior is explicit
+- do not change the active watchlist mid-paper-run when that run is being used
+  for reconciliation or GO/NO-GO analysis
+- cache each generated watchlist with timestamp, rule version, data timestamp,
+  and selected symbols
+- log rejection counts for every hard filter
+- log manual overrides separately from scanner output
+- run new scanner logic in report-only mode before it can drive a strategy slot
+- cap daily turnover so one noisy data update cannot replace the whole list
+- preserve durable strategy ownership across restarts before enabling dynamic
+  multi-strategy watchlists
+
+If a symbol drops out of the scanner while a position is open, the strategy still
+owns that position until the strategy exits it or an explicit reconciliation rule
+transfers/halts management. Scanner membership is not position ownership.
+
+---
+
 ## Interaction with RSI Edge Filter
 
 The scanner and the edge filter are different layers.
@@ -360,8 +386,16 @@ Decides whether a signal is allowed under current conditions
 That means:
 
 - the scanner narrows the field
+- the RSI strategy emits the raw setup signal
+- the edge filter confirms or rejects that raw signal
 - the edge filter prevents known-bad regime entries
-- the RSI strategy still controls the actual setup logic
+- the RSI strategy still controls the core setup logic
+
+Short-term confirmation rules such as MACD improvement or EMA5/EMA10
+confirmation are not scanner rules. If they only veto a raw RSI signal, place
+them in the RSI edge filter. If they change the definition or timing of the
+signal itself, create a clearly named RSI strategy variant and validate it
+separately.
 
 ---
 

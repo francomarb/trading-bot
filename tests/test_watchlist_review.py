@@ -72,12 +72,16 @@ def _mock_ticker(
     cashflow: pd.DataFrame | None = None,
     income_stmt: pd.DataFrame | None = None,
     balance_sheet: pd.DataFrame | None = None,
+    fast_info: dict | None = None,
+    info: dict | None = None,
 ) -> MagicMock:
     """Return a mock yf.Ticker with the given DataFrames."""
     t = MagicMock()
     t.cashflow = cashflow if cashflow is not None else _empty_df()
     t.income_stmt = income_stmt if income_stmt is not None else _empty_df()
     t.balance_sheet = balance_sheet if balance_sheet is not None else _empty_df()
+    t.fast_info = fast_info if fast_info is not None else {}
+    t.info = info if info is not None else {}
     return t
 
 
@@ -131,6 +135,18 @@ class TestRowLatest:
 
 
 class TestFetchFundamentals:
+    def test_market_cap_from_fast_info(self):
+        t = _mock_ticker(fast_info={"market_cap": 2_500_000_000.0})
+        with patch("scripts.watchlist_review.yf.Ticker", return_value=t):
+            r = fetch_fundamentals("AAPL")
+        assert r.market_cap == pytest.approx(2_500_000_000.0)
+
+    def test_market_cap_fallback_to_info(self):
+        t = _mock_ticker(info={"marketCap": 7_000_000_000.0})
+        with patch("scripts.watchlist_review.yf.Ticker", return_value=t):
+            r = fetch_fundamentals("AAPL")
+        assert r.market_cap == pytest.approx(7_000_000_000.0)
+
     # ── FCF field ──────────────────────────────────────────────────────────────
 
     def test_fcf_positive_stored(self):

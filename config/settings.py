@@ -15,17 +15,28 @@ ALPACA_BASE_URL = (
 )
 
 # Strategy-specific watchlists
-# SMA Crossover — trend-following; suits Stalwarts and Fast Growers (Lynch Ch. 3)
+# SMA Crossover — trend-following; static list promoted from:
+#   /Users/franco/trading-bot/scripts/sma_watchlist_scan.py
+#   rule=sma_watchlist_v1, feed=sip, end_delay=60m, fundamentals=True
+#   generated 2026-04-22; report: logs/sma_watchlist_scan_latest.md
+# NVDA is the only non-scanner exception, retained solely for ownership
+# continuity while an open paper position exists. Remove it after the strategy
+# exits if it still fails the scan.
 SMA_WATCHLIST = [
-    "AAPL", "MSFT", "GOOGL", "AMZN", "META", "NVDA", "AVGO", "AMD",
-    "MU", "TSLA", "ORCL", "ANET", "MRVL", "MELI", "GS", "BAC",
+    "WDC", "CIEN", "GSAT", "STX", "FORM", "COHR", "CLS", "BE",
+    "MTZ", "AMKR", "TER", "DELL", "MPWR", "TIGO", "MU", "NVDA",
 ]
-# RSI Reversion — mean-reversion; suits Turnarounds and Cyclicals (Lynch Ch. 3)
+# RSI Reversion — mean-reversion; static list promoted from:
+#   /Users/franco/trading-bot/scripts/rsi_watchlist_scan.py
+#   /Users/franco/trading-bot/scripts/rsi_candidate_validate.py
+#   /Users/franco/trading-bot/scripts/rsi_candidate_post_analysis.py
+#   scanner_rule=rsi_watchlist_v1, validation_rule=rsi_validation_v1,
+#   post_rule=rsi_post_analysis_v1, feed=sip, end_delay=60m
+#   generated 2026-04-23; report: logs/rsi_candidate_post_analysis_latest.md
+# RSI is implemented but not active in forward_test.py yet. Keep this as the
+# first paper-mode RSI pool unless the post-analysis guardrails are changed.
 RSI_WATCHLIST = [
-    "AAPL", "MSFT", "GOOGL", "AMZN",            # stalwarts — revert reliably
-    "DAL", "COIN",                               # cyclicals — ideal reversion candidates
-    "BAC", "JPM", "GS",                          # financial cyclicals
-    "PINS", "UBER",                              # growth names with pullback potential
+    "ALLY", "CDNS", "CCK", "SN", "TFC",
 ]
 # Full engine universe — union of both lists; preserves paper-run continuity.
 # NOTE: RIVN is included here but not in either strategy list — review before Phase 10.

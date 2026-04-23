@@ -78,12 +78,13 @@ Purpose:
 
 ## Resulting Entry Logic
 
-RSI BUY is allowed ONLY if:
+The RSI strategy first emits a raw entry signal. The edge filter then confirms
+or rejects that entry. RSI BUY is allowed ONLY if:
 
+- raw RSI entry signal is true
 - SPY > 200 SMA
 - SPY > 50 SMA
 - Stock > 50 SMA
-- RSI < oversold threshold (e.g., 30)
 
 ---
 
@@ -115,10 +116,13 @@ Options:
 
 - RSI crossing upward (not just below threshold)
 - Price above short-term SMA (e.g., 10-day)
+- EMA5 > EMA10 or EMA5 crossing above EMA10
+- MACD histogram improving, or MACD line crossing above signal
 
 Purpose:
 
 - Avoid premature entries
+- Confirm that an oversold long setup is starting to rebound
 
 ---
 
@@ -149,14 +153,24 @@ def rsi_edge_filter(symbol, market_data):
 Flow:
 
 ```text
-RSI signal → Edge Filter → Risk Engine → Execution
+Watchlist → raw RSI signal → Edge Filter confirms/rejects → Risk Engine → Execution
 ```
 
 Important:
 
-- Strategy logic remains untouched
-- Filter acts as a gate
+- The scanner/watchlist decides which symbols are monitored
+- `RSIReversion._raw_signals()` detects the unfiltered RSI setup
+- `BaseStrategy.generate_signals()` applies the edge filter to entries
+- The filter acts as a confirmation/veto gate
+- The filter must not block exits
+- Strategy logic remains focused on setup detection
 - Future `MetaSignal` layer can replace this
+
+MACD and EMA5/EMA10 confirmations fit here when they are used as veto rules:
+the raw RSI signal fires first, then the edge filter allows the entry only when
+confirmation is present. If a confirmation changes the actual setup timing
+rather than simply vetoing a setup, implement it as a deliberate RSI strategy
+variant instead of hiding it in the scanner.
 
 ---
 

@@ -28,6 +28,17 @@ The bot is organized into six layers. Each layer has a single responsibility and
 └─────────────────────────────────────────┘
 ```
 
+At the signal level, strategy entries pass through a narrower trade-permission
+pipeline:
+
+```text
+Watchlist -> raw strategy signal -> edge filter confirms/rejects -> risk -> execution
+```
+
+The strategy owns setup detection. The edge filter owns current-condition
+permission. Risk owns sizing, stops, exposure limits, and kill switches.
+Execution only places orders after risk approval.
+
 ---
 
 ## Project Structure
@@ -169,6 +180,17 @@ class BaseStrategy(ABC):
 - Both share the same DatetimeIndex as the input bars
 - Signals at bar t depend only on data up to and including t (no look-ahead)
 - The engine shifts execution to bar t+1's open
+
+**Edge filter contract:**
+- A strategy may be constructed with `edge_filter(df) -> pd.Series[bool]`
+- `_raw_signals(df)` computes the strategy's unfiltered setup first
+- `generate_signals(df)` AND-gates entries with the edge filter
+- Exits are never blocked by the edge filter
+- Missing, NaN, or false filter values block entries by default
+- Use edge filters for confirmation or veto rules such as market regime,
+  symbol trend, volatility gates, MACD confirmation, or EMA5/EMA10 confirmation
+- Do not use edge filters for universe selection; scanners/watchlist sources own
+  symbol selection
 
 **StrategySlot:**
 Each slot binds a strategy to its symbol universe and timeframe. The engine iterates over slots each cycle. An optional `Scanner` can refresh symbols dynamically.

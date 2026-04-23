@@ -99,6 +99,7 @@ class SymbolFundamentals:
     symbol: str
 
     # Raw metrics ($, not $M — raw yfinance values)
+    market_cap: Optional[float] = None          # Market capitalization, $
     fcf_annual: Optional[float] = None          # Annual free cash flow, $
     revenue_growth_pct: Optional[float] = None  # YoY revenue growth, %
     is_profitable: Optional[bool] = None        # Net income > 0
@@ -243,6 +244,13 @@ def fetch_fundamentals(symbol: str) -> SymbolFundamentals:
         inc = ticker.income_stmt
         bs = ticker.balance_sheet
 
+        # ── Market cap ──────────────────────────────────────────────────────
+        # Prefer fast_info because it is lighter than the full info payload.
+        market_cap = _mapping_float(getattr(ticker, "fast_info", {}), "market_cap")
+        if market_cap is None:
+            market_cap = _mapping_float(getattr(ticker, "info", {}), "marketCap")
+        result.market_cap = market_cap
+
         # ── FCF ──────────────────────────────────────────────────────────────
         # Try "Free Cash Flow" directly; fall back to OCF + CapEx (capex is
         # negative in yfinance, so addition gives the correct sign).
@@ -284,6 +292,20 @@ def fetch_fundamentals(symbol: str) -> SymbolFundamentals:
         logger.warning(f"{symbol}: fundamental data fetch error — {exc}")
 
     return result
+
+
+def _mapping_float(obj, key: str) -> Optional[float]:
+    """Best-effort float lookup for dict-like yfinance metadata objects."""
+    try:
+        value = obj.get(key)
+    except Exception:
+        return None
+    if value is None or pd.isna(value):
+        return None
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return None
 
 
 # ── Report formatting ─────────────────────────────────────────────────────────
