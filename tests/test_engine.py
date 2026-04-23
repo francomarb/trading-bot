@@ -43,6 +43,7 @@ from execution.broker import (
     OrderResult,
     OrderStatus,
 )
+from reporting.logger import TradeLogger
 from risk.manager import (
     AccountState,
     Position,
@@ -139,6 +140,20 @@ def _open_sell_order(symbol: str = "AAPL") -> OpenOrder:
         submitted_at=T0,
         limit_price=None,
         stop_price=None,
+    )
+
+
+def _open_stop_order(symbol: str = "AAPL", stop_price: float = 95.0) -> OpenOrder:
+    return OpenOrder(
+        order_id="o-stop",
+        symbol=symbol,
+        side=Side.SELL,
+        qty=1,
+        order_type=OrderType.MARKET,
+        status="open",
+        submitted_at=T0,
+        limit_price=None,
+        stop_price=stop_price,
     )
 
 
@@ -683,6 +698,77 @@ class TestPositionOwnership:
         engine, broker = engine_factory(snapshot=_snapshot(positions=positions))
         engine.start(max_cycles=1)
         assert engine._position_owners["AAPL"] == "fake_strategy"
+
+    def test_startup_repairs_missing_protective_stop(
+        self, engine_factory, tmp_path
+    ):
+        positions = {"AAPL": Position("AAPL", 10, 100.0, 1010.0)}
+        startup = _snapshot(positions=positions, open_orders=[])
+        cycle = _snapshot(
+            positions=positions,
+            open_orders=[_open_stop_order("AAPL", 95.0)],
+        )
+        engine, broker = engine_factory(snapshot=startup)
+        broker.sync_with_broker.side_effect = [startup, cycle]
+        tl = TradeLogger(path=str(tmp_path / "trades.db"))
+        engine.trade_logger = tl
+        tl.log(tl.build_record(
+            decision=SimpleNamespace(
+                symbol="AAPL",
+                side=Side.BUY,
+                qty=10,
+                entry_reference_price=100.0,
+                stop_price=95.0,
+                strategy_name="fake_strategy",
+                reason="test",
+                order_type=OrderType.MARKET,
+            ),
+            result=_filled_result("AAPL", 10, 100.5),
+            modeled_price=100.0,
+        ))
+        broker.place_protective_stop.return_value = _open_stop_order("AAPL", 95.0)
+
+        engine.start(max_cycles=1)
+
+        broker.place_protective_stop.assert_called_once_with(
+            symbol="AAPL",
+            qty=10,
+            stop_price=95.0,
+            client_order_id_prefix="fake_strategy-repair-stop",
+        )
+
+    def test_cycle_repairs_missing_protective_stop_after_gtc_absent(
+        self, engine_factory, tmp_path
+    ):
+        positions = {"AAPL": Position("AAPL", 10, 100.0, 1010.0)}
+        startup = _snapshot(
+            positions=positions,
+            open_orders=[_open_stop_order("AAPL", 95.0)],
+        )
+        cycle = _snapshot(positions=positions, open_orders=[])
+        engine, broker = engine_factory(snapshot=startup)
+        broker.sync_with_broker.side_effect = [startup, cycle]
+        tl = TradeLogger(path=str(tmp_path / "trades.db"))
+        engine.trade_logger = tl
+        tl.log(tl.build_record(
+            decision=SimpleNamespace(
+                symbol="AAPL",
+                side=Side.BUY,
+                qty=10,
+                entry_reference_price=100.0,
+                stop_price=95.0,
+                strategy_name="fake_strategy",
+                reason="test",
+                order_type=OrderType.MARKET,
+            ),
+            result=_filled_result("AAPL", 10, 100.5),
+            modeled_price=100.0,
+        ))
+        broker.place_protective_stop.return_value = _open_stop_order("AAPL", 95.0)
+
+        engine.start(max_cycles=1)
+
+        broker.place_protective_stop.assert_called_once()
 
 
 # ── Scanner cadence ────────────────────────────────────────────────────────

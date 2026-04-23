@@ -168,7 +168,7 @@ class TestSubmitOrderKwargs:
         assert req.stop_loss.stop_price == 95.5
         assert not hasattr(req, "limit_price") or getattr(req, "limit_price", None) is None
         assert req.client_order_id.startswith("sma_crossover-")
-        assert req.time_in_force.value == "day"
+        assert req.time_in_force.value == "gtc"
 
     def test_limit_order_includes_limit_price(self):
         api = MagicMock()
@@ -200,6 +200,35 @@ class TestSubmitOrderKwargs:
 
         req = api.submit_order.call_args.args[0]
         assert req.stop_loss.stop_price == 138.37  # rounded, not 138.3726
+
+    def test_repair_stop_uses_simple_gtc_sell_stop(self):
+        api = MagicMock()
+        api.submit_order.return_value = _alpaca_order(
+            status="accepted",
+            side="sell",
+            type="stop",
+            stop_price="95.5",
+            qty=10,
+        )
+        broker = _broker_with_mock(api)
+
+        result = broker.place_protective_stop(
+            symbol="AAPL",
+            qty=10,
+            stop_price=95.5,
+            client_order_id_prefix="sma-repair",
+        )
+
+        req = api.submit_order.call_args.args[0]
+        assert req.symbol == "AAPL"
+        assert req.qty == 10
+        assert req.side.value == "sell"
+        assert req.type.value == "stop"
+        assert req.time_in_force.value == "gtc"
+        assert req.stop_price == 95.5
+        assert req.client_order_id.startswith("sma-repair-")
+        assert result.side is Side.SELL
+        assert result.stop_price == 95.5
 
 
 # ── place_order: terminal-state mapping ──────────────────────────────────────

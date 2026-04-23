@@ -300,3 +300,38 @@ class TradeLogger:
         rows = [dict(row) for row in cursor.fetchall()]
         rows.reverse()  # Return in chronological order
         return rows
+
+    def read_latest_open_stop_price(
+        self, *, symbol: str, strategy: str
+    ) -> float | None:
+        """
+        Return the original fixed stop price for the latest still-open trade
+        on `symbol` owned by `strategy`.
+
+        The trade log is append-only and this engine allows at most one open
+        position per symbol. That means the latest filled/partial row for a
+        symbol/strategy pair tells us whether the trade is still open:
+
+        - latest row is `buy` with `stop_price > 0` -> position should still
+          be open, so return that original stop
+        - latest row is `sell` -> position was closed, return None
+        """
+        if not os.path.exists(self._path):
+            return None
+        conn = self._ensure_db()
+        conn.row_factory = sqlite3.Row
+        cursor = conn.execute(
+            "SELECT side, stop_price "
+            "FROM trades "
+            "WHERE symbol = ? AND strategy = ? "
+            "AND status IN ('filled', 'partial') "
+            "ORDER BY id DESC LIMIT 1",
+            (symbol, strategy),
+        )
+        row = cursor.fetchone()
+        if row is None:
+            return None
+        if row["side"] != "buy":
+            return None
+        stop_price = float(row["stop_price"] or 0.0)
+        return stop_price if stop_price > 0 else None

@@ -58,6 +58,7 @@ from alpaca.trading.requests import (
     GetOrdersRequest,
     LimitOrderRequest,
     MarketOrderRequest,
+    StopOrderRequest,
     StopLossRequest,
 )
 from loguru import logger
@@ -178,7 +179,7 @@ class AlpacaBroker:
         client: TradingClient | None = None,
         max_attempts: int = 5,
         base_delay: float = 1.0,
-        time_in_force: str = "day",
+        time_in_force: str = "gtc",
     ) -> None:
         self._api = client or TradingClient(
             api_key=ALPACA_API_KEY,
@@ -481,6 +482,39 @@ class AlpacaBroker:
             timeout=poll_timeout,
             interval=poll_interval,
         )
+
+    def place_protective_stop(
+        self,
+        *,
+        symbol: str,
+        qty: int,
+        stop_price: float,
+        client_order_id_prefix: str = "repair-stop",
+    ) -> OpenOrder:
+        """
+        Submit a standalone protective SELL stop as a simple GTC order.
+
+        Used by engine reconciliation when a managed long position exists
+        without any broker-side protective stop.
+        """
+        client_order_id = f"{client_order_id_prefix}-{uuid.uuid4().hex[:10]}"
+        order_request = StopOrderRequest(
+            symbol=symbol,
+            qty=qty,
+            side=AlpacaOrderSide.SELL,
+            time_in_force=TimeInForce.GTC,
+            stop_price=round(stop_price, 2),
+            client_order_id=client_order_id,
+        )
+        logger.warning(
+            f"repairing protective stop for {symbol}: "
+            f"sell {qty} stop @ ${stop_price:.2f} (client_id={client_order_id})"
+        )
+        order = self._with_retry(
+            lambda: self._api.submit_order(order_request),
+            op_desc=f"submit_repair_stop({symbol})",
+        )
+        return self._to_open_order(order)
 
     # ── Internals ────────────────────────────────────────────────────────
 

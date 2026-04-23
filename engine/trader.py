@@ -250,6 +250,8 @@ class TradingEngine:
                         "Close it manually or add it to a strategy's symbol universe."
                     )
 
+        self._repair_missing_protective_stops(startup_snapshot)
+
         slot_desc = ", ".join(
             f"{s.strategy.name}({len(s.active_symbols())})"
             for s in self.slots
@@ -349,6 +351,8 @@ class TradingEngine:
                 f"open_orders={len(snapshot.open_orders)}, "
                 f"risk={risk_state}"
             )
+
+            self._repair_missing_protective_stops(snapshot)
 
             # Daily-loss / hard-dollar gates can fire on any signal; halt state
             # is sticky until manual reset, so we don't need to short-circuit
@@ -625,6 +629,60 @@ class TradingEngine:
             o.symbol == symbol and o.side is Side.SELL
             for o in snapshot.open_orders
         )
+
+    @staticmethod
+    def _has_protective_stop_order(symbol: str, snapshot: BrokerSnapshot) -> bool:
+        """True if there's already an open SELL stop order for this symbol."""
+        return any(
+            o.symbol == symbol and o.side is Side.SELL and o.stop_price is not None
+            for o in snapshot.open_orders
+        )
+
+    def _repair_missing_protective_stops(self, snapshot: BrokerSnapshot) -> None:
+        """
+        Ensure every managed broker position still has a protective stop.
+
+        Alpaca expires GTC orders after 90 days, and earlier runs also left
+        some positions unprotected because attached stops were submitted as DAY.
+        This reconciliation restores the original fixed stop from the trade log
+        whenever a managed position has no broker-side stop order.
+        """
+        for symbol, position in snapshot.account.open_positions.items():
+            owner = self._position_owners.get(symbol)
+            if owner is None:
+                continue
+            if self._has_protective_stop_order(symbol, snapshot):
+                continue
+
+            stop_price = self.trade_logger.read_latest_open_stop_price(
+                symbol=symbol,
+                strategy=owner,
+            )
+            if stop_price is None:
+                msg = (
+                    f"{symbol}: managed position owned by '{owner}' has no "
+                    "protective stop and no recoverable stop price in trade log"
+                )
+                logger.error(msg)
+                self.alerts.broker_error(msg)
+                continue
+
+            try:
+                repaired = self.broker.place_protective_stop(
+                    symbol=symbol,
+                    qty=abs(int(position.qty)),
+                    stop_price=stop_price,
+                    client_order_id_prefix=f"{owner}-repair-stop",
+                )
+                logger.warning(
+                    f"{symbol}: restored missing protective stop at "
+                    f"${stop_price:.2f} as {repaired.order_id}"
+                )
+            except Exception as e:
+                msg = f"{symbol}: failed to restore missing protective stop: {e}"
+                logger.error(msg)
+                self.risk.record_broker_error()
+                self.alerts.broker_error(msg)
 
     # ── Market hours ─────────────────────────────────────────────────────
 
