@@ -123,6 +123,7 @@ class EngineConfig:
     market_hours_only: bool = settings.ENGINE_MARKET_HOURS_ONLY
     cancel_orders_on_shutdown: bool = settings.ENGINE_CANCEL_ORDERS_ON_SHUTDOWN
     atr_length: int = settings.ATR_LENGTH
+    external_close_confirm_cycles: int = settings.ENGINE_EXTERNAL_CLOSE_CONFIRM_CYCLES
 
     def __post_init__(self) -> None:
         if self.cycle_interval_seconds <= 0:
@@ -133,6 +134,8 @@ class EngineConfig:
             raise ValueError("atr_length must be >= 1")
         if self.history_lookback_days < 1:
             raise ValueError("history_lookback_days must be >= 1")
+        if self.external_close_confirm_cycles < 1:
+            raise ValueError("external_close_confirm_cycles must be >= 1")
 
 
 # ── Engine ───────────────────────────────────────────────────────────────────
@@ -203,6 +206,12 @@ class TradingEngine:
         # opened each position so that exit signals from a *different* strategy
         # watching the same symbol don't close someone else's trade.
         self._position_owners: dict[str, str] = {}
+
+        # Consecutive-cycle absence counter for external-close confirmation.
+        # symbol → number of consecutive cycles absent from broker positions.
+        # Only after external_close_confirm_cycles consecutive misses do we
+        # treat the position as genuinely gone (guards against API blips).
+        self._external_close_suspects: dict[str, int] = {}
 
         # Startup mode set by _reconcile_startup. NORMAL → full trading.
         # RESTRICTED → exits only (one cycle, then auto-clears to NORMAL).
@@ -694,32 +703,60 @@ class TradingEngine:
         Detect positions that disappeared from the broker without the bot
         placing the closing order (stop-out, manual liquidation, margin call).
 
-        For each symbol in ``_position_owners`` that is no longer in the
-        broker's open positions, log a WARNING and write a synthetic sell
-        record so the trade DB reflects a closed position. This prevents
-        ``read_all_open_owners`` from treating the old buy record as still
-        open on the next restart.
+        A position must be absent for ``config.external_close_confirm_cycles``
+        consecutive cycles before we act. This guards against transient broker
+        API blips that return incomplete position data — a single-cycle absence
+        is treated as a suspect, not a confirmed close.
+
+        When confirmed:
+          - Logs a WARNING and fires an alert.
+          - Writes a synthetic sell to the trade DB so ``read_all_open_owners``
+            does not treat the stale buy record as open on the next restart.
+          - Clears ownership so stop-repair logic ignores the symbol.
+
+        If a suspected position reappears (API blip recovered), the counter
+        resets silently.
+
+        With WebSocket order/fill streaming (Phase 10), genuine stop-outs and
+        manual liquidations will be detected via fill events with the real fill
+        price. This method then serves only as a fallback for WebSocket gaps.
         """
+        confirm = self.config.external_close_confirm_cycles
+
         for symbol in list(self._position_owners):
-            if symbol not in snapshot.account.open_positions:
-                owner = self._position_owners.pop(symbol)
-                msg = (
-                    f"{symbol}: position owned by '{owner}' is no longer "
-                    "at the broker — externally closed (stop-out, manual "
-                    "liquidation, or margin call)"
+            if symbol in snapshot.account.open_positions:
+                # Position is present — reset any suspect counter and continue.
+                self._external_close_suspects.pop(symbol, None)
+                continue
+
+            count = self._external_close_suspects.get(symbol, 0) + 1
+            self._external_close_suspects[symbol] = count
+
+            if count < confirm:
+                logger.debug(
+                    f"{symbol}: absent from broker positions "
+                    f"({count}/{confirm} cycles) — awaiting confirmation"
                 )
-                logger.warning(msg)
-                self.alerts.broker_error(msg)
-                try:
-                    self.trade_logger.log_external_close(
-                        symbol=symbol,
-                        strategy=owner,
-                        reason="external_close_detected",
-                    )
-                except Exception as e:
-                    logger.error(
-                        f"{symbol}: failed to log external close: {e}"
-                    )
+                continue
+
+            # Confirmed absent for `confirm` consecutive cycles.
+            owner = self._position_owners.pop(symbol)
+            self._external_close_suspects.pop(symbol, None)
+            msg = (
+                f"{symbol}: position owned by '{owner}' absent for "
+                f"{confirm} consecutive cycle(s) — declared externally closed "
+                "(stop-out, manual liquidation, or margin call)"
+            )
+            logger.warning(msg)
+            self.alerts.broker_error(msg)
+            try:
+                self.trade_logger.log_external_close(
+                    symbol=symbol,
+                    strategy=owner,
+                    reason="external_close_detected",
+                )
+            except Exception as e:
+                logger.error(f"{symbol}: failed to log external close: {e}")
 
     def _restore_ownership_from_db(self, snapshot: BrokerSnapshot) -> set[str]:
         """

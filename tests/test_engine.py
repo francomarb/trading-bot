@@ -1105,50 +1105,92 @@ class TestStartupReconciliation:
 # ── External close detection ──────────────────────────────────────────────
 
 
+def _engine_with_confirm(patch_fetch, tmp_path, *, confirm: int = 3, positions=None):
+    """Like _engine_with_db but with a configurable confirm cycle count."""
+    engine, broker, tl = _engine_with_db(patch_fetch, tmp_path, positions=positions)
+    # Patch the config with the desired confirmation window.
+    object.__setattr__(engine.config, "external_close_confirm_cycles", confirm)
+    return engine, broker, tl
+
+
 class TestExternalCloseDetection:
     """
     Positions that disappear from the broker without the bot closing them
-    (stop-out, manual liquidation) must be detected, logged, and cleared
-    from ownership so the trade DB stays coherent across restarts.
+    (stop-out, manual liquidation) must be detected after N consecutive absent
+    cycles, logged, and cleared from ownership so the trade DB stays coherent.
     """
 
-    def test_position_gone_clears_ownership(self, patch_fetch, tmp_path):
-        """Owned position not in broker snapshot → ownership cleared."""
-        engine, _, _ = _engine_with_db(patch_fetch, tmp_path)
+    def test_single_absence_does_not_act(self, patch_fetch, tmp_path):
+        """One absent cycle is a suspect — ownership not cleared yet."""
+        engine, _, _ = _engine_with_confirm(patch_fetch, tmp_path, confirm=3)
         engine._position_owners["AAPL"] = "fake_strategy"
-        # Broker shows no positions.
-        snap = _snapshot()
-        engine._detect_external_closes(snap)
-        assert "AAPL" not in engine._position_owners
+        engine._detect_external_closes(_snapshot())
+        assert "AAPL" in engine._position_owners
+        assert engine._external_close_suspects["AAPL"] == 1
 
-    def test_position_still_present_not_cleared(self, patch_fetch, tmp_path):
-        """Owned position still in broker snapshot → ownership untouched."""
+    def test_two_absences_still_not_confirmed(self, patch_fetch, tmp_path):
+        """Two absent cycles with confirm=3 → still suspect."""
+        engine, _, _ = _engine_with_confirm(patch_fetch, tmp_path, confirm=3)
+        engine._position_owners["AAPL"] = "fake_strategy"
+        engine._detect_external_closes(_snapshot())
+        engine._detect_external_closes(_snapshot())
+        assert "AAPL" in engine._position_owners
+        assert engine._external_close_suspects["AAPL"] == 2
+
+    def test_confirmed_after_n_cycles_clears_ownership(self, patch_fetch, tmp_path):
+        """After N consecutive absent cycles ownership is cleared."""
+        engine, _, _ = _engine_with_confirm(patch_fetch, tmp_path, confirm=3)
+        engine._position_owners["AAPL"] = "fake_strategy"
+        for _ in range(3):
+            engine._detect_external_closes(_snapshot())
+        assert "AAPL" not in engine._position_owners
+        assert "AAPL" not in engine._external_close_suspects
+
+    def test_blip_recovery_resets_counter(self, patch_fetch, tmp_path):
+        """Position reappears after 2 absent cycles → counter resets, no action."""
         positions = {"AAPL": Position("AAPL", 10, 100.0, 1000.0)}
-        engine, _, _ = _engine_with_db(patch_fetch, tmp_path, positions=positions)
+        engine, _, _ = _engine_with_confirm(patch_fetch, tmp_path, confirm=3)
+        engine._position_owners["AAPL"] = "fake_strategy"
+
+        engine._detect_external_closes(_snapshot())           # absent: count=1
+        engine._detect_external_closes(_snapshot())           # absent: count=2
+        engine._detect_external_closes(_snapshot(positions=positions))  # back
+
+        assert "AAPL" in engine._position_owners
+        assert "AAPL" not in engine._external_close_suspects
+
+    def test_position_still_present_not_counted(self, patch_fetch, tmp_path):
+        """Present position never increments suspect counter."""
+        positions = {"AAPL": Position("AAPL", 10, 100.0, 1000.0)}
+        engine, _, _ = _engine_with_confirm(patch_fetch, tmp_path, confirm=3)
         engine._position_owners["AAPL"] = "fake_strategy"
         snap = _snapshot(positions=positions)
         engine._detect_external_closes(snap)
         assert engine._position_owners["AAPL"] == "fake_strategy"
+        assert "AAPL" not in engine._external_close_suspects
 
-    def test_synthetic_sell_written_to_db(self, patch_fetch, tmp_path):
-        """A synthetic sell row is written so the DB reflects a closed position."""
-        engine, _, tl = _engine_with_db(patch_fetch, tmp_path)
+    def test_synthetic_sell_written_after_confirmation(self, patch_fetch, tmp_path):
+        """Synthetic sell is written only after N cycles, not before."""
+        engine, _, tl = _engine_with_confirm(patch_fetch, tmp_path, confirm=3)
         _write_buy(tl, "AAPL", "fake_strategy")
         engine._position_owners["AAPL"] = "fake_strategy"
 
-        snap = _snapshot()
-        engine._detect_external_closes(snap)
+        engine._detect_external_closes(_snapshot())  # cycle 1 — no action yet
+        assert tl.read_all_open_owners() == {"AAPL": "fake_strategy"}
 
-        # After the synthetic sell, read_all_open_owners must not list AAPL.
+        engine._detect_external_closes(_snapshot())  # cycle 2 — no action yet
+        assert tl.read_all_open_owners() == {"AAPL": "fake_strategy"}
+
+        engine._detect_external_closes(_snapshot())  # cycle 3 — confirmed
         assert tl.read_all_open_owners() == {}
 
     def test_synthetic_sell_reason_recorded(self, patch_fetch, tmp_path):
-        """The synthetic sell row carries the external_close_detected reason."""
-        engine, _, tl = _engine_with_db(patch_fetch, tmp_path)
+        """The confirmed synthetic sell row carries external_close_detected."""
+        engine, _, tl = _engine_with_confirm(patch_fetch, tmp_path, confirm=2)
         _write_buy(tl, "AAPL", "fake_strategy")
         engine._position_owners["AAPL"] = "fake_strategy"
-
-        engine._detect_external_closes(_snapshot())
+        for _ in range(2):
+            engine._detect_external_closes(_snapshot())
 
         rows = tl.read_all()
         sell_rows = [r for r in rows if r["side"] == "sell"]
@@ -1156,24 +1198,24 @@ class TestExternalCloseDetection:
         assert sell_rows[0]["reason"] == "external_close_detected"
         assert sell_rows[0]["strategy"] == "fake_strategy"
 
-    def test_multiple_positions_only_gone_ones_cleared(self, patch_fetch, tmp_path):
-        """Only positions missing from the broker are cleared; others kept."""
+    def test_multiple_positions_only_confirmed_ones_cleared(self, patch_fetch, tmp_path):
+        """Only positions that hit confirm threshold are cleared."""
         positions = {"MSFT": Position("MSFT", 5, 200.0, 1000.0)}
-        engine, _, _ = _engine_with_db(patch_fetch, tmp_path, positions=positions)
-        engine._position_owners["AAPL"] = "fake_strategy"  # gone
-        engine._position_owners["MSFT"] = "fake_strategy"  # still open
+        engine, _, _ = _engine_with_confirm(patch_fetch, tmp_path, confirm=3)
+        engine._position_owners["AAPL"] = "fake_strategy"   # will go absent
+        engine._position_owners["MSFT"] = "fake_strategy"   # stays present
 
-        snap = _snapshot(positions=positions)
-        engine._detect_external_closes(snap)
+        snap_with_msft = _snapshot(positions=positions)
+        for _ in range(3):
+            engine._detect_external_closes(snap_with_msft)
 
         assert "AAPL" not in engine._position_owners
         assert engine._position_owners["MSFT"] == "fake_strategy"
 
     def test_no_owned_positions_no_op(self, patch_fetch, tmp_path):
         """With no owned positions, detect_external_closes is a no-op."""
-        engine, _, _ = _engine_with_db(patch_fetch, tmp_path)
-        snap = _snapshot()
-        engine._detect_external_closes(snap)  # must not raise
+        engine, _, _ = _engine_with_confirm(patch_fetch, tmp_path, confirm=3)
+        engine._detect_external_closes(_snapshot())
         assert engine._position_owners == {}
 
     def test_log_external_close_closes_db_record(self, tmp_path):
@@ -1187,3 +1229,12 @@ class TestExternalCloseDetection:
         )
         assert tl.read_all_open_owners() == {}
         assert tl.read_owner_for_symbol("AAPL") is None
+
+    def test_confirm_cycles_configurable_via_engine_config(self):
+        """EngineConfig validates external_close_confirm_cycles."""
+        with pytest.raises(ValueError, match="external_close_confirm_cycles"):
+            EngineConfig(
+                cycle_interval_seconds=1,
+                max_bar_age_multiplier=2,
+                external_close_confirm_cycles=0,
+            )

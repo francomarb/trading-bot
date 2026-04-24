@@ -86,7 +86,7 @@ SLIPPAGE_DRIFT_ENABLED = False
 # (runner.py slippage_bps=5). LIMIT orders model 0 bps (price is controlled).
 SLIPPAGE_MODEL_MARKET_BPS = 5.0
 
-# ── Engine settings (Phase 8) ────────────────────────────────────────────────
+# ── Engine settings (Phase 8 / 10) ──────────────────────────────────────────
 ATR_LENGTH = 14                     # ATR window the engine uses for stops
 ENGINE_TIMEFRAME = "1Day"           # Bar timeframe for the live loop
 ENGINE_HISTORY_LOOKBACK_DAYS = 200  # How much history to keep loaded per cycle
@@ -97,6 +97,11 @@ ENGINE_MARKET_HOURS_ONLY = True     # Only trade during regular session
 # Preserve OTO stop-loss legs across bot restarts. Manual liquidation paths
 # explicitly cancel sibling orders before closing a position.
 ENGINE_CANCEL_ORDERS_ON_SHUTDOWN = False
+# Consecutive cycles a managed position must be absent from the broker before
+# it is declared externally closed (stop-out / manual liquidation). Protects
+# against transient API blips that return incomplete position data.
+# With WebSocket streaming (Phase 10), this becomes a fallback for gap periods.
+ENGINE_EXTERNAL_CLOSE_CONFIRM_CYCLES = 3
 
 # ── Reporting settings (Phase 9) ────────────────────────────────────────────
 TRADE_LOG_CSV = "logs/trades.csv"           # Legacy CSV trade log (deprecated)
