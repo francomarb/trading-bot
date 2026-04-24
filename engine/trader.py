@@ -204,6 +204,11 @@ class TradingEngine:
         # watching the same symbol don't close someone else's trade.
         self._position_owners: dict[str, str] = {}
 
+        # Startup mode set by _reconcile_startup. NORMAL → full trading.
+        # RESTRICTED → exits only (one cycle, then auto-clears to NORMAL).
+        # HALT → no new entries until manual reset_kill_switches().
+        self._startup_mode: str = "NORMAL"
+
     # ── Lifecycle ────────────────────────────────────────────────────────
 
     def start(self, *, max_cycles: int | None = None) -> None:
@@ -225,30 +230,12 @@ class TradingEngine:
             all_symbols.extend(slot.active_symbols())
         unique_symbols = sorted(set(all_symbols))
 
-        # Seed position ownership from broker state.  If we're restarting
-        # with existing positions, assign each to the *first* slot whose
-        # symbol list includes it.  This is best-effort — an operator who
-        # reshuffles slot configs between restarts should review manually.
-        # TODO Phase 10: restore ownership from trade DB (last open trade per
-        # symbol) instead of guessing from slot ordering. See PLAN.md §10.
-        for sym in startup_snapshot.account.open_positions:
-            if sym not in self._position_owners:
-                matched = False
-                for slot in self.slots:
-                    if sym in slot.active_symbols():
-                        self._position_owners[sym] = slot.strategy.name
-                        logger.info(
-                            f"restart: assigned existing position {sym} "
-                            f"→ '{slot.strategy.name}' (best-effort slot match)"
-                        )
-                        matched = True
-                        break
-                if not matched:
-                    logger.warning(
-                        f"restart: open position {sym} does not belong to any "
-                        "configured slot — it will NOT be managed by this engine. "
-                        "Close it manually or add it to a strategy's symbol universe."
-                    )
+        # Restore position ownership from the trade DB (10.C1) and determine
+        # startup mode (10.C2). This replaces the old best-effort slot-match.
+        conflict_symbols = self._restore_ownership_from_db(startup_snapshot)
+        self._startup_mode = self._reconcile_startup(
+            startup_snapshot, conflict_symbols
+        )
 
         self._repair_missing_protective_stops(startup_snapshot)
 
@@ -402,6 +389,15 @@ class TradingEngine:
                         cycle_status = "symbol_errors"
                         logger.exception(f"{symbol}: cycle step failed: {e}")
         finally:
+            # RESTRICTED mode auto-clears after one cycle — anomalies were
+            # logged at startup; a full clean cycle proves state is coherent.
+            if self._startup_mode == "RESTRICTED":
+                logger.info(
+                    "startup_mode RESTRICTED → NORMAL "
+                    "(cleared after first full cycle)"
+                )
+                self._startup_mode = "NORMAL"
+
             duration = time.monotonic() - cycle_started_mono
             logger.info(
                 f"cycle {cycle_id} complete: status={cycle_status}, "
@@ -505,6 +501,12 @@ class TradingEngine:
 
         # 6. Entry branch — risk is the gate.
         if not last_entry:
+            return
+        if self._startup_mode != "NORMAL":
+            logger.info(
+                f"[{strategy.name}] {symbol}: entry blocked — "
+                f"startup_mode={self._startup_mode}"
+            )
             return
         if position is not None:
             # Already in this position — the crossover bar persists across
@@ -683,6 +685,102 @@ class TradingEngine:
                 logger.error(msg)
                 self.risk.record_broker_error()
                 self.alerts.broker_error(msg)
+
+    # ── Startup ownership + reconciliation (10.C1 / 10.C2) ─────────────
+
+    def _restore_ownership_from_db(self, snapshot: BrokerSnapshot) -> set[str]:
+        """
+        Restore ``_position_owners`` from the trade DB (10.C1).
+
+        For each symbol in the broker's open positions:
+        - If the trade DB records a still-open buy for that symbol, use the
+          logged strategy as the authoritative owner.
+        - If the logged strategy is no longer in any configured slot, log a
+          WARNING and mark the symbol as a conflict.
+        - If the DB has no record (new account or DB gap), fall back to
+          best-effort slot-order match with a WARNING.
+
+        Returns the set of conflict symbols (DB owner no longer in any slot).
+        """
+        db_owners = self.trade_logger.read_all_open_owners()
+        known_strategy_names = {slot.strategy.name for slot in self.slots}
+        conflicts: set[str] = set()
+
+        for sym in snapshot.account.open_positions:
+            if sym in self._position_owners:
+                continue  # already assigned (shouldn't happen at startup)
+
+            db_owner = db_owners.get(sym)
+            if db_owner is not None:
+                if db_owner in known_strategy_names:
+                    self._position_owners[sym] = db_owner
+                    logger.info(
+                        f"restart: assigned existing position {sym} "
+                        f"→ '{db_owner}' (trade DB record)"
+                    )
+                else:
+                    logger.warning(
+                        f"restart: open position {sym} was opened by strategy "
+                        f"'{db_owner}' which is no longer configured — "
+                        "position will not be managed. Close it manually."
+                    )
+                    conflicts.add(sym)
+            else:
+                # No DB record — fall back to best-effort slot-order match.
+                matched = False
+                for slot in self.slots:
+                    if sym in slot.active_symbols():
+                        self._position_owners[sym] = slot.strategy.name
+                        logger.warning(
+                            f"restart: no DB record for {sym}; assigned to "
+                            f"'{slot.strategy.name}' (best-effort slot match)"
+                        )
+                        matched = True
+                        break
+                if not matched:
+                    logger.warning(
+                        f"restart: open position {sym} does not belong to any "
+                        "configured slot — it will NOT be managed by this engine. "
+                        "Close it manually or add it to a strategy's symbol universe."
+                    )
+
+        return conflicts
+
+    def _reconcile_startup(
+        self, snapshot: BrokerSnapshot, conflict_symbols: set[str]
+    ) -> str:
+        """
+        Determine the startup mode based on broker state and ownership conflicts.
+
+        NORMAL     — no anomalies; full trading.
+        RESTRICTED — anomalies found (conflicts or unresolvable positions);
+                     entries blocked for one cycle, then auto-clears to NORMAL.
+        HALT       — reserved for manual kill-switch; this method never sets it.
+
+        Returns the mode string.
+        """
+        if conflict_symbols:
+            logger.warning(
+                f"startup: RESTRICTED mode — ownership conflicts for "
+                f"{sorted(conflict_symbols)}. No new entries this cycle."
+            )
+            return "RESTRICTED"
+
+        # Check for broker positions with no ownership at all.
+        unmanaged = [
+            sym
+            for sym in snapshot.account.open_positions
+            if sym not in self._position_owners
+        ]
+        if unmanaged:
+            logger.warning(
+                f"startup: RESTRICTED mode — unmanaged broker positions: "
+                f"{sorted(unmanaged)}. No new entries this cycle."
+            )
+            return "RESTRICTED"
+
+        logger.info("startup: NORMAL mode — ownership verified")
+        return "NORMAL"
 
     # ── Market hours ─────────────────────────────────────────────────────
 

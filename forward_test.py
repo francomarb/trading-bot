@@ -43,6 +43,7 @@ from reporting.alerts import AlertDispatcher
 from reporting.logger import TradeLogger, install_json_sink
 from reporting.pnl import PnLTracker
 from risk.manager import RiskManager
+from data.watchlists import StaticWatchlistSource
 from strategies.base import StrategySlot
 from strategies.sma_crossover import SMACrossover
 
@@ -92,12 +93,16 @@ def main() -> None:
     slots = [
         StrategySlot(
             strategy=SMACrossover(fast=20, slow=50),
-            symbols=list(settings.SMA_WATCHLIST),
+            watchlist_source=StaticWatchlistSource(
+                list(settings.SMA_WATCHLIST), name="sma"
+            ),
         ),
         # Add more slots here as new strategies are built:
         # StrategySlot(
-        #     strategy=MeanReversion(...),
-        #     symbols=["AAPL", "MSFT"],
+        #     strategy=RSIReversion(...),
+        #     watchlist_source=StaticWatchlistSource(
+        #         list(settings.RSI_WATCHLIST), name="rsi"
+        #     ),
         # ),
     ]
 

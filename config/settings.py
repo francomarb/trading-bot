@@ -3,9 +3,19 @@ from dotenv import load_dotenv
 
 load_dotenv("config/.env")
 
-ALPACA_API_KEY = os.getenv("ALPACA_API_KEY")
-ALPACA_SECRET_KEY = os.getenv("ALPACA_SECRET_KEY")
-ALPACA_PAPER = os.getenv("ALPACA_PAPER", "true").lower() in ("true", "1", "yes")
+# ── Paper vs live environment selection (Phase 10.B1) ───────────────────────
+# Set LIVE_TRADING=true only after scripts/preflight.py exits 0.
+# All credential and DB routing derives from this single flag.
+LIVE_TRADING: bool = os.getenv("LIVE_TRADING", "false").lower() in ("true", "1", "yes")
+
+_ALPACA_API_KEY_PAPER: str | None = os.getenv("ALPACA_API_KEY")
+_ALPACA_SECRET_KEY_PAPER: str | None = os.getenv("ALPACA_SECRET_KEY")
+_ALPACA_API_KEY_LIVE: str | None = os.getenv("ALPACA_API_KEY_LIVE")
+_ALPACA_SECRET_KEY_LIVE: str | None = os.getenv("ALPACA_SECRET_KEY_LIVE")
+
+ALPACA_API_KEY: str | None = _ALPACA_API_KEY_LIVE if LIVE_TRADING else _ALPACA_API_KEY_PAPER
+ALPACA_SECRET_KEY: str | None = _ALPACA_SECRET_KEY_LIVE if LIVE_TRADING else _ALPACA_SECRET_KEY_PAPER
+ALPACA_PAPER: bool = not LIVE_TRADING
 
 # Derived base URL — used only by legacy verify scripts; alpaca-py uses the
 # `paper=` flag on TradingClient directly.
@@ -90,7 +100,9 @@ ENGINE_CANCEL_ORDERS_ON_SHUTDOWN = False
 
 # ── Reporting settings (Phase 9) ────────────────────────────────────────────
 TRADE_LOG_CSV = "logs/trades.csv"           # Legacy CSV trade log (deprecated)
-TRADE_LOG_DB = "data/trades.db"             # SQLite trade log
+TRADE_LOG_DB_PAPER = "data/trades.db"       # Paper-trading SQLite log
+TRADE_LOG_DB_LIVE = "data/trades_live.db"   # Live-trading SQLite log (separate to prevent cross-contamination)
+TRADE_LOG_DB = TRADE_LOG_DB_LIVE if LIVE_TRADING else TRADE_LOG_DB_PAPER
 DAILY_PNL_DIR = "logs/daily_pnl"            # Daily P&L markdown summaries
 WEEKLY_REPORT_DIR = "logs/weekly_reports"    # Weekly summary markdowns
 JSON_LOG_FILE = "logs/bot.jsonl"            # Structured JSON log sink

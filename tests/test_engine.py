@@ -848,3 +848,255 @@ class TestScannerCadence:
         _time.sleep(0.06)
         slot.active_symbols()
         assert scanner.call_count == 2
+
+
+# ── Durable ownership from trade DB (10.C1) ───────────────────────────────
+
+
+def _engine_with_db(patch_fetch, tmp_path, *, positions=None, snapshot=None):
+    """Build an engine with a real TradeLogger backed by a tmp_path DB."""
+    broker = MagicMock()
+    snap = snapshot or _snapshot(positions=positions or {})
+    broker.sync_with_broker.return_value = snap
+    broker.place_order.return_value = _filled_result("AAPL", 1, 100.5)
+    broker.close_position.return_value = _filled_result("AAPL", 1, 100.0)
+    broker.get_open_orders.return_value = []
+    broker._with_retry.side_effect = lambda fn, **_: fn()
+    broker._api.get_clock.return_value = SimpleNamespace(is_open=False)
+
+    strategy = FakeStrategy(entries=[False], exits=[False])
+    risk = RiskManager(
+        max_position_pct=0.02,
+        max_open_positions=5,
+        max_gross_exposure_pct=0.50,
+        atr_stop_multiplier=2.0,
+        max_daily_loss_pct=0.05,
+        hard_dollar_loss_cap=1_000_000.0,
+        loss_streak_threshold=10,
+        broker_error_threshold=10,
+    )
+    cfg = EngineConfig(
+        history_lookback_days=120,
+        cycle_interval_seconds=0.01,
+        max_bar_age_multiplier=10.0,
+        market_hours_only=False,
+        cancel_orders_on_shutdown=False,
+        atr_length=14,
+    )
+    tl = TradeLogger(path=str(tmp_path / "trades.db"))
+    engine = TradingEngine(
+        strategy=strategy,
+        symbols=["AAPL"],
+        risk=risk,
+        broker=broker,
+        config=cfg,
+        trade_logger=tl,
+        clock=lambda: T0,
+    )
+    return engine, broker, tl
+
+
+def _write_buy(tl: TradeLogger, symbol: str, strategy: str) -> None:
+    """Insert a filled buy row into a TradeLogger's DB."""
+    tl.log(
+        tl.build_record(
+            decision=SimpleNamespace(
+                symbol=symbol,
+                side=Side.BUY,
+                qty=10,
+                entry_reference_price=100.0,
+                stop_price=95.0,
+                strategy_name=strategy,
+                reason="test",
+                order_type=OrderType.MARKET,
+            ),
+            result=_filled_result(symbol, 10, 100.5),
+            modeled_price=100.0,
+        )
+    )
+
+
+def _write_sell(tl: TradeLogger, symbol: str, strategy: str) -> None:
+    """Insert a filled sell row into a TradeLogger's DB."""
+    from reporting.logger import TradeRecord
+
+    tl.log(
+        TradeRecord(
+            timestamp="2026-04-23T10:00:00+00:00",
+            symbol=symbol,
+            side="sell",
+            qty=10,
+            avg_fill_price=105.0,
+            order_id="ord-sell",
+            strategy=strategy,
+            reason="exit signal",
+            stop_price=0.0,
+            entry_reference_price=100.0,
+            modeled_slippage_bps=0.0,
+            realized_slippage_bps=5.0,
+            order_type="market",
+            status="filled",
+            requested_qty=10,
+            filled_qty=10,
+        )
+    )
+
+
+class TestDurableOwnershipFromDB:
+    """10.C1 — _restore_ownership_from_db reads the trade log, not slot order."""
+
+    def test_db_record_authoritative_owner(self, patch_fetch, tmp_path):
+        """DB buy record → ownership assigned from DB, not slot guess."""
+        positions = {"AAPL": Position("AAPL", 10, 100.0, 1000.0)}
+        engine, _, tl = _engine_with_db(patch_fetch, tmp_path, positions=positions)
+        _write_buy(tl, "AAPL", "fake_strategy")
+
+        snap = _snapshot(positions=positions)
+        conflicts = engine._restore_ownership_from_db(snap)
+
+        assert engine._position_owners["AAPL"] == "fake_strategy"
+        assert conflicts == set()
+
+    def test_db_unknown_strategy_becomes_conflict(self, patch_fetch, tmp_path):
+        """DB buy owned by a strategy not in any slot → conflict, no assignment."""
+        positions = {"AAPL": Position("AAPL", 10, 100.0, 1000.0)}
+        engine, _, tl = _engine_with_db(patch_fetch, tmp_path, positions=positions)
+        _write_buy(tl, "AAPL", "retired_strategy")
+
+        snap = _snapshot(positions=positions)
+        conflicts = engine._restore_ownership_from_db(snap)
+
+        assert "AAPL" not in engine._position_owners
+        assert "AAPL" in conflicts
+
+    def test_no_db_record_falls_back_to_slot_match(self, patch_fetch, tmp_path):
+        """No DB record → fall back to slot-order match (AAPL in slot → assigned)."""
+        positions = {"AAPL": Position("AAPL", 10, 100.0, 1000.0)}
+        engine, _, tl = _engine_with_db(patch_fetch, tmp_path, positions=positions)
+        # No buy record written — DB is empty.
+
+        snap = _snapshot(positions=positions)
+        conflicts = engine._restore_ownership_from_db(snap)
+
+        assert engine._position_owners["AAPL"] == "fake_strategy"
+        assert conflicts == set()
+
+    def test_db_sell_as_latest_falls_back(self, patch_fetch, tmp_path):
+        """Latest DB row is a sell (position closed) → treated as no open record."""
+        positions = {"AAPL": Position("AAPL", 10, 100.0, 1000.0)}
+        engine, _, tl = _engine_with_db(patch_fetch, tmp_path, positions=positions)
+        _write_buy(tl, "AAPL", "fake_strategy")
+        _write_sell(tl, "AAPL", "fake_strategy")
+        # Net = closed.  DB shows no open position → fallback.
+
+        snap = _snapshot(positions=positions)
+        engine._restore_ownership_from_db(snap)
+
+        # Fallback slot match still assigns ownership.
+        assert engine._position_owners["AAPL"] == "fake_strategy"
+
+    def test_read_all_open_owners_empty_db(self, tmp_path):
+        """read_all_open_owners returns {} when the DB doesn't exist."""
+        tl = TradeLogger(path=str(tmp_path / "no_trades.db"))
+        assert tl.read_all_open_owners() == {}
+
+    def test_read_all_open_owners_buy_only(self, tmp_path):
+        tl = TradeLogger(path=str(tmp_path / "trades.db"))
+        _write_buy(tl, "AAPL", "sma_crossover")
+        _write_buy(tl, "MSFT", "rsi_reversion")
+        result = tl.read_all_open_owners()
+        assert result == {"AAPL": "sma_crossover", "MSFT": "rsi_reversion"}
+
+    def test_read_all_open_owners_sell_closes(self, tmp_path):
+        tl = TradeLogger(path=str(tmp_path / "trades.db"))
+        _write_buy(tl, "AAPL", "sma_crossover")
+        _write_sell(tl, "AAPL", "sma_crossover")
+        result = tl.read_all_open_owners()
+        assert "AAPL" not in result
+
+    def test_read_owner_for_symbol_buy(self, tmp_path):
+        tl = TradeLogger(path=str(tmp_path / "trades.db"))
+        _write_buy(tl, "AAPL", "sma_crossover")
+        assert tl.read_owner_for_symbol("AAPL") == "sma_crossover"
+
+    def test_read_owner_for_symbol_sell_returns_none(self, tmp_path):
+        tl = TradeLogger(path=str(tmp_path / "trades.db"))
+        _write_buy(tl, "AAPL", "sma_crossover")
+        _write_sell(tl, "AAPL", "sma_crossover")
+        assert tl.read_owner_for_symbol("AAPL") is None
+
+    def test_read_owner_for_symbol_no_db(self, tmp_path):
+        tl = TradeLogger(path=str(tmp_path / "no_trades.db"))
+        assert tl.read_owner_for_symbol("AAPL") is None
+
+
+# ── Startup reconciliation modes (10.C2) ──────────────────────────────────
+
+
+class TestStartupReconciliation:
+    """10.C2 — _reconcile_startup returns NORMAL/RESTRICTED; RESTRICTED auto-clears."""
+
+    def test_no_conflicts_no_unmanaged_gives_normal(self, patch_fetch, tmp_path):
+        positions = {"AAPL": Position("AAPL", 10, 100.0, 1000.0)}
+        engine, _, tl = _engine_with_db(patch_fetch, tmp_path, positions=positions)
+        # Pre-assign ownership so no unmanaged positions.
+        engine._position_owners["AAPL"] = "fake_strategy"
+        snap = _snapshot(positions=positions)
+
+        mode = engine._reconcile_startup(snap, set())
+        assert mode == "NORMAL"
+
+    def test_conflicts_give_restricted(self, patch_fetch, tmp_path):
+        positions = {"AAPL": Position("AAPL", 10, 100.0, 1000.0)}
+        engine, _, _ = _engine_with_db(patch_fetch, tmp_path, positions=positions)
+        snap = _snapshot(positions=positions)
+
+        mode = engine._reconcile_startup(snap, {"AAPL"})
+        assert mode == "RESTRICTED"
+
+    def test_unmanaged_positions_give_restricted(self, patch_fetch, tmp_path):
+        positions = {"AAPL": Position("AAPL", 10, 100.0, 1000.0)}
+        engine, _, _ = _engine_with_db(patch_fetch, tmp_path, positions=positions)
+        # AAPL not in _position_owners → unmanaged.
+        snap = _snapshot(positions=positions)
+
+        mode = engine._reconcile_startup(snap, set())
+        assert mode == "RESTRICTED"
+
+    def test_restricted_blocks_entries(self, patch_fetch, tmp_path):
+        """When startup_mode=RESTRICTED, entry signals are suppressed."""
+        engine, broker, _ = _engine_with_db(patch_fetch, tmp_path)
+        engine._startup_mode = "RESTRICTED"
+        engine._session_start_equity = 100_000.0
+        snap = _snapshot()
+        # Override strategy to emit an entry.
+        engine.slots[0].strategy._entries = [False] * 59 + [True]
+
+        slot = engine.slots[0]
+        engine._process_symbol("AAPL", snap, snap.account, slot.strategy, slot.timeframe)
+        broker.place_order.assert_not_called()
+
+    def test_restricted_auto_clears_after_cycle(self, patch_fetch, tmp_path):
+        """RESTRICTED mode becomes NORMAL after one full cycle completes."""
+        positions = {"AAPL": Position("AAPL", 10, 100.0, 1000.0)}
+        snap = _snapshot(positions=positions)
+        engine, broker, tl = _engine_with_db(
+            patch_fetch, tmp_path, positions=positions, snapshot=snap
+        )
+        _write_buy(tl, "AAPL", "retired_strategy")  # causes conflict → RESTRICTED
+
+        engine.start(max_cycles=1)
+
+        assert engine._startup_mode == "NORMAL"
+
+    def test_normal_mode_allows_entries(self, patch_fetch, tmp_path):
+        """When startup_mode=NORMAL, entries proceed through risk normally."""
+        engine, broker, _ = _engine_with_db(patch_fetch, tmp_path)
+        engine._startup_mode = "NORMAL"
+        engine._session_start_equity = 100_000.0
+        snap = _snapshot()
+        engine.slots[0].strategy._entries = [False] * 59 + [True]
+
+        slot = engine.slots[0]
+        engine._process_symbol("AAPL", snap, snap.account, slot.strategy, slot.timeframe)
+        broker.place_order.assert_called_once()

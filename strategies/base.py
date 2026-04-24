@@ -39,9 +39,12 @@ import time
 from abc import ABC, abstractmethod
 from dataclasses import dataclass, field
 from enum import Enum
-from typing import Callable
+from typing import TYPE_CHECKING, Callable
 
 import pandas as pd
+
+if TYPE_CHECKING:
+    from data.watchlists import WatchlistSource
 
 
 # ── Shared types ─────────────────────────────────────────────────────────────
@@ -172,9 +175,15 @@ class StrategySlot:
 
     Fields:
         strategy:  A BaseStrategy instance (e.g. SMACrossover, MeanReversion).
-        symbols:   Static list of symbols to trade. Ignored if `scanner` is set.
+        symbols:   Static list of symbols to trade. Ignored if `watchlist_source`
+                   or `scanner` is set.
         timeframe: Bar timeframe for this slot (default "1Day").
+        watchlist_source: Optional WatchlistSource that supplies the symbol list.
+                   Takes precedence over `symbols` and `scanner`. Use
+                   StaticWatchlistSource for Phase 10; DynamicWatchlistSource
+                   is Phase 11.
         scanner:   Optional Scanner that refreshes `symbols` dynamically.
+                   Superseded by `watchlist_source` when both are set.
         scan_interval_seconds: Minimum seconds between scanner invocations.
             Expensive scanners (e.g. screening the entire market) should use
             a longer interval so they don't run every engine cycle.  Defaults
@@ -184,6 +193,7 @@ class StrategySlot:
     strategy: BaseStrategy
     symbols: list[str] = field(default_factory=list)
     timeframe: str = "1Day"
+    watchlist_source: "WatchlistSource | None" = None
     scanner: Scanner | None = None
     scan_interval_seconds: float = 0
 
@@ -191,13 +201,18 @@ class StrategySlot:
     _last_scan_time: float = field(default=0.0, init=False, repr=False)
 
     def __post_init__(self) -> None:
-        if not self.symbols and self.scanner is None:
+        if not self.symbols and self.scanner is None and self.watchlist_source is None:
             raise ValueError(
-                "StrategySlot must have either symbols or a scanner"
+                "StrategySlot must have symbols, a watchlist_source, or a scanner"
             )
 
     def active_symbols(self) -> list[str]:
-        """Return the current symbol list, refreshing from scanner if due."""
+        """Return the current symbol list.
+
+        Precedence: watchlist_source → scanner → symbols.
+        """
+        if self.watchlist_source is not None:
+            return self.watchlist_source.symbols()
         if self.scanner is not None:
             now = time.monotonic()
             if now - self._last_scan_time >= self.scan_interval_seconds:

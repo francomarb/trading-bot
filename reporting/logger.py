@@ -301,6 +301,59 @@ class TradeLogger:
         rows.reverse()  # Return in chronological order
         return rows
 
+    def read_owner_for_symbol(self, symbol: str) -> str | None:
+        """
+        Return the strategy_name that owns the currently-open position for
+        `symbol` per the trade log, or None if the position is closed (or
+        never traded).
+
+        The trade log is append-only and allows at most one open position per
+        symbol at a time. The most recent filled/partial row determines state:
+        - side='buy'  → position open, return strategy name
+        - side='sell' → position closed, return None
+        """
+        if not os.path.exists(self._path):
+            return None
+        conn = self._ensure_db()
+        conn.row_factory = sqlite3.Row
+        cursor = conn.execute(
+            "SELECT side, strategy "
+            "FROM trades "
+            "WHERE symbol = ? "
+            "AND status IN ('filled', 'partial') "
+            "ORDER BY id DESC LIMIT 1",
+            (symbol,),
+        )
+        row = cursor.fetchone()
+        if row is None or row["side"] != "buy":
+            return None
+        return row["strategy"]
+
+    def read_all_open_owners(self) -> dict[str, str]:
+        """
+        Return ``{symbol: strategy_name}`` for every symbol whose most recent
+        filled/partial trade is a ``'buy'``.
+
+        This is the trade log's view of currently-open positions and their
+        owning strategies. Used by the engine on startup to restore durable
+        ownership without guessing from slot order.
+        """
+        if not os.path.exists(self._path):
+            return {}
+        conn = self._ensure_db()
+        conn.row_factory = sqlite3.Row
+        cursor = conn.execute(
+            "SELECT symbol, strategy, side "
+            "FROM trades "
+            "WHERE id IN ("
+            "  SELECT MAX(id) FROM trades "
+            "  WHERE status IN ('filled', 'partial') "
+            "  GROUP BY symbol"
+            ") "
+            "AND side = 'buy'"
+        )
+        return {row["symbol"]: row["strategy"] for row in cursor.fetchall()}
+
     def read_latest_open_stop_price(
         self, *, symbol: str, strategy: str
     ) -> float | None:
