@@ -339,6 +339,7 @@ class TradingEngine:
                 f"risk={risk_state}"
             )
 
+            self._detect_external_closes(snapshot)
             self._repair_missing_protective_stops(snapshot)
 
             # Daily-loss / hard-dollar gates can fire on any signal; halt state
@@ -687,6 +688,38 @@ class TradingEngine:
                 self.alerts.broker_error(msg)
 
     # ── Startup ownership + reconciliation (10.C1 / 10.C2) ─────────────
+
+    def _detect_external_closes(self, snapshot: BrokerSnapshot) -> None:
+        """
+        Detect positions that disappeared from the broker without the bot
+        placing the closing order (stop-out, manual liquidation, margin call).
+
+        For each symbol in ``_position_owners`` that is no longer in the
+        broker's open positions, log a WARNING and write a synthetic sell
+        record so the trade DB reflects a closed position. This prevents
+        ``read_all_open_owners`` from treating the old buy record as still
+        open on the next restart.
+        """
+        for symbol in list(self._position_owners):
+            if symbol not in snapshot.account.open_positions:
+                owner = self._position_owners.pop(symbol)
+                msg = (
+                    f"{symbol}: position owned by '{owner}' is no longer "
+                    "at the broker — externally closed (stop-out, manual "
+                    "liquidation, or margin call)"
+                )
+                logger.warning(msg)
+                self.alerts.broker_error(msg)
+                try:
+                    self.trade_logger.log_external_close(
+                        symbol=symbol,
+                        strategy=owner,
+                        reason="external_close_detected",
+                    )
+                except Exception as e:
+                    logger.error(
+                        f"{symbol}: failed to log external close: {e}"
+                    )
 
     def _restore_ownership_from_db(self, snapshot: BrokerSnapshot) -> set[str]:
         """

@@ -1100,3 +1100,90 @@ class TestStartupReconciliation:
         slot = engine.slots[0]
         engine._process_symbol("AAPL", snap, snap.account, slot.strategy, slot.timeframe)
         broker.place_order.assert_called_once()
+
+
+# ── External close detection ──────────────────────────────────────────────
+
+
+class TestExternalCloseDetection:
+    """
+    Positions that disappear from the broker without the bot closing them
+    (stop-out, manual liquidation) must be detected, logged, and cleared
+    from ownership so the trade DB stays coherent across restarts.
+    """
+
+    def test_position_gone_clears_ownership(self, patch_fetch, tmp_path):
+        """Owned position not in broker snapshot → ownership cleared."""
+        engine, _, _ = _engine_with_db(patch_fetch, tmp_path)
+        engine._position_owners["AAPL"] = "fake_strategy"
+        # Broker shows no positions.
+        snap = _snapshot()
+        engine._detect_external_closes(snap)
+        assert "AAPL" not in engine._position_owners
+
+    def test_position_still_present_not_cleared(self, patch_fetch, tmp_path):
+        """Owned position still in broker snapshot → ownership untouched."""
+        positions = {"AAPL": Position("AAPL", 10, 100.0, 1000.0)}
+        engine, _, _ = _engine_with_db(patch_fetch, tmp_path, positions=positions)
+        engine._position_owners["AAPL"] = "fake_strategy"
+        snap = _snapshot(positions=positions)
+        engine._detect_external_closes(snap)
+        assert engine._position_owners["AAPL"] == "fake_strategy"
+
+    def test_synthetic_sell_written_to_db(self, patch_fetch, tmp_path):
+        """A synthetic sell row is written so the DB reflects a closed position."""
+        engine, _, tl = _engine_with_db(patch_fetch, tmp_path)
+        _write_buy(tl, "AAPL", "fake_strategy")
+        engine._position_owners["AAPL"] = "fake_strategy"
+
+        snap = _snapshot()
+        engine._detect_external_closes(snap)
+
+        # After the synthetic sell, read_all_open_owners must not list AAPL.
+        assert tl.read_all_open_owners() == {}
+
+    def test_synthetic_sell_reason_recorded(self, patch_fetch, tmp_path):
+        """The synthetic sell row carries the external_close_detected reason."""
+        engine, _, tl = _engine_with_db(patch_fetch, tmp_path)
+        _write_buy(tl, "AAPL", "fake_strategy")
+        engine._position_owners["AAPL"] = "fake_strategy"
+
+        engine._detect_external_closes(_snapshot())
+
+        rows = tl.read_all()
+        sell_rows = [r for r in rows if r["side"] == "sell"]
+        assert len(sell_rows) == 1
+        assert sell_rows[0]["reason"] == "external_close_detected"
+        assert sell_rows[0]["strategy"] == "fake_strategy"
+
+    def test_multiple_positions_only_gone_ones_cleared(self, patch_fetch, tmp_path):
+        """Only positions missing from the broker are cleared; others kept."""
+        positions = {"MSFT": Position("MSFT", 5, 200.0, 1000.0)}
+        engine, _, _ = _engine_with_db(patch_fetch, tmp_path, positions=positions)
+        engine._position_owners["AAPL"] = "fake_strategy"  # gone
+        engine._position_owners["MSFT"] = "fake_strategy"  # still open
+
+        snap = _snapshot(positions=positions)
+        engine._detect_external_closes(snap)
+
+        assert "AAPL" not in engine._position_owners
+        assert engine._position_owners["MSFT"] == "fake_strategy"
+
+    def test_no_owned_positions_no_op(self, patch_fetch, tmp_path):
+        """With no owned positions, detect_external_closes is a no-op."""
+        engine, _, _ = _engine_with_db(patch_fetch, tmp_path)
+        snap = _snapshot()
+        engine._detect_external_closes(snap)  # must not raise
+        assert engine._position_owners == {}
+
+    def test_log_external_close_closes_db_record(self, tmp_path):
+        """log_external_close writes a sell row that closes the DB open record."""
+        tl = TradeLogger(path=str(tmp_path / "trades.db"))
+        _write_buy(tl, "AAPL", "sma_crossover")
+        tl.log_external_close(
+            symbol="AAPL",
+            strategy="sma_crossover",
+            reason="external_close_detected",
+        )
+        assert tl.read_all_open_owners() == {}
+        assert tl.read_owner_for_symbol("AAPL") is None

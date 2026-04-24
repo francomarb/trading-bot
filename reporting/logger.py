@@ -301,6 +301,35 @@ class TradeLogger:
         rows.reverse()  # Return in chronological order
         return rows
 
+    def log_external_close(self, *, symbol: str, strategy: str, reason: str) -> None:
+        """
+        Write a synthetic sell record when a position disappears externally
+        (stop-out, manual liquidation, margin call, etc.) without the bot
+        placing the closing order.
+
+        Fill price is None because we don't know the exact execution price.
+        The reason field carries the detection context.
+        """
+        record = TradeRecord(
+            timestamp=datetime.now(timezone.utc).isoformat(),
+            symbol=symbol,
+            side="sell",
+            qty=0,
+            avg_fill_price=None,
+            order_id=None,
+            strategy=strategy,
+            reason=reason,
+            stop_price=0.0,
+            entry_reference_price=0.0,
+            modeled_slippage_bps=0.0,
+            realized_slippage_bps=0.0,
+            order_type="unknown",
+            status="filled",
+            requested_qty=0,
+            filled_qty=0,
+        )
+        self.log(record)
+
     def read_owner_for_symbol(self, symbol: str) -> str | None:
         """
         Return the strategy_name that owns the currently-open position for
