@@ -22,7 +22,7 @@
 | 8 | Trading Engine (Main Loop) | ✅ Complete |
 | 9 | Trade Reporting & P&L | ✅ Complete |
 | 9.5 | Forward-Test (Paper, Multi-Week) | 🔄 In Progress (infrastructure complete, awaiting multi-week run) |
-| 10 | Live Trading Transition | ⬜ Not Started |
+| 10 | Live Trading Transition | 🔄 In Progress (Groups A–C complete; paper-validating before Group D) |
 | 11 | Multi-Strategy, Regime Detection & Portfolio Layer | ⬜ Not Started *(post-live)* |
 
 **Legend:** ⬜ Not Started · 🔄 In Progress · ✅ Complete
@@ -402,7 +402,7 @@ skip ahead. Each group must be paper-validated before the next begins.
 
 | # | Deliverable | Complexity | Status |
 |---|---|---|---|
-| 10.A1 | **Manual restart verification** — with at least one open paper position: stop the bot, restart it, confirm startup logs show ownership assignment (`restart: assigned existing position X → 'sma_crossover'`) and that any unmanaged symbol emits a WARNING. Instructions in CLAUDE.md. | Operational | ⬜ |
+| 10.A1 | **Manual restart verification** — with at least one open paper position: stop the bot, restart it, confirm startup logs show ownership assignment (`restart: assigned existing position X → 'sma_crossover'`) and that any unmanaged symbol emits a WARNING. Instructions in CLAUDE.md. | Operational | ✅ (2026-04-24: MU + NVDA restored from trade DB record; NORMAL mode confirmed) |
 
 ---
 
@@ -410,9 +410,9 @@ skip ahead. Each group must be paper-validated before the next begins.
 
 | # | Deliverable | Complexity | Blocker | Status |
 |---|---|---|---|---|
-| 10.B1 | **Live config separation** — `LIVE_TRADING` flag in `config/settings.py`; separate `.env` keys for live vs. paper (`ALPACA_API_KEY_LIVE`, `ALPACA_SECRET_KEY_LIVE`); separate trade DB path (`data/trades_live.db`) so paper and live fills are never co-mingled. | Low (~20 lines) | 🔴 | ⬜ |
-| 10.B2 | **Pre-flight checklist script** — validates: keys point to live endpoint, buying power meets minimum, go/no-go file on disk with GO verdict, all risk params set, `SLIPPAGE_DRIFT_ENABLED=True`, dry-run passes. Exits non-zero if any check fails. | Low (~50 lines) | 🟡 | ⬜ |
-| 10.B3 | **`WatchlistSource` abstraction + per-strategy wiring** — introduce `data/watchlists.py` with a `WatchlistSource` base class (`name: str`, `symbols() -> list[str]`) and a `StaticWatchlistSource` implementation. `StrategySlot` accepts a `WatchlistSource` instead of a raw list and calls `.symbols()` each cycle — it has no knowledge of whether the source is static or dynamic. Wire `forward_test.py`: SMA slot → `StaticWatchlistSource(settings.SMA_WATCHLIST)`, RSI slot → `StaticWatchlistSource(settings.RSI_WATCHLIST)`. `WATCHLIST` stays in settings as a convenience union for review scripts only. `DynamicWatchlistSource` (calls a configurable scanner module and expects a `list[str]` back) is deferred to Phase 11 — dynamic sources require durable ownership to be proven stable first so a symbol rotating out of the scanner while a position is open is handled correctly. Unit tests: `StaticWatchlistSource.symbols()` returns the configured list; `StrategySlot` calls the source rather than holding a raw list; SMA and RSI slots return their respective symbols with no cross-contamination. | Low (~40 lines) | 🔴 | ⬜ |
+| 10.B1 | **Live config separation** — `LIVE_TRADING` flag in `config/settings.py`; separate `.env` keys for live vs. paper (`ALPACA_API_KEY_LIVE`, `ALPACA_SECRET_KEY_LIVE`); separate trade DB path (`data/trades_live.db`) so paper and live fills are never co-mingled. | Low (~20 lines) | 🔴 | ✅ (2026-04-24) |
+| 10.B2 | **Pre-flight checklist script** — validates: keys point to live endpoint, buying power meets minimum, go/no-go file on disk with GO verdict, all risk params set, `SLIPPAGE_DRIFT_ENABLED=True`, dry-run passes. Exits non-zero if any check fails. | Low (~50 lines) | 🟡 | ✅ (2026-04-24) |
+| 10.B3 | **`WatchlistSource` abstraction + per-strategy wiring** — introduce `data/watchlists.py` with a `WatchlistSource` base class (`name: str`, `symbols() -> list[str]`) and a `StaticWatchlistSource` implementation. `StrategySlot` accepts a `WatchlistSource` instead of a raw list and calls `.symbols()` each cycle — it has no knowledge of whether the source is static or dynamic. Wire `forward_test.py`: SMA slot → `StaticWatchlistSource(settings.SMA_WATCHLIST)`, RSI slot → `StaticWatchlistSource(settings.RSI_WATCHLIST)`. `WATCHLIST` stays in settings as a convenience union for review scripts only. `DynamicWatchlistSource` (calls a configurable scanner module and expects a `list[str]` back) is deferred to Phase 11 — dynamic sources require durable ownership to be proven stable first so a symbol rotating out of the scanner while a position is open is handled correctly. Unit tests: `StaticWatchlistSource.symbols()` returns the configured list; `StrategySlot` calls the source rather than holding a raw list; SMA and RSI slots return their respective symbols with no cross-contamination. | Low (~40 lines) | 🔴 | ✅ (2026-04-24) |
 
 ---
 
@@ -420,13 +420,15 @@ skip ahead. Each group must be paper-validated before the next begins.
 
 | # | Deliverable | Complexity | Blocker | Status |
 |---|---|---|---|---|
-| 10.C1 | **Durable position ownership** — on restart, restore `_position_owners` from the trade DB instead of best-effort slot-order matching. See design below. | Medium (~60 lines) | 🔴 | ⬜ |
-| 10.C2 | **Startup reconciliation + fail-safe mode** — cross-check broker positions, open orders, trade DB, and ownership state on startup. Enter RESTRICTED mode (exits only, no new entries) on any medium mismatch; HALT on critical mismatch. See design below. | Medium (~80 lines) | 🔴 | ⬜ |
-| 10.C3 | **Tests for 10.C1 and 10.C2** — restart with pre-existing broker positions; durable ownership restored correctly; reconciliation detects and classifies mismatches. | Medium | 🔴 | ⬜ |
+| 10.C1 | **Durable position ownership** — on restart, restore `_position_owners` from the trade DB instead of best-effort slot-order matching. See design below. | Medium (~60 lines) | 🔴 | ✅ (2026-04-24) |
+| 10.C2 | **Startup reconciliation + fail-safe mode** — cross-check broker positions, open orders, trade DB, and ownership state on startup. Enter RESTRICTED mode (exits only, no new entries) on any medium mismatch; HALT on critical mismatch. See design below. | Medium (~80 lines) | 🔴 | ✅ (2026-04-24) |
+| 10.C3 | **Tests for 10.C1 and 10.C2** — restart with pre-existing broker positions; durable ownership restored correctly; reconciliation detects and classifies mismatches. | Medium | 🔴 | ✅ (2026-04-24) |
+| 10.C4 | **External close detection with confirmation window** — each cycle, cross-check `_position_owners` against broker positions. A position absent for `ENGINE_EXTERNAL_CLOSE_CONFIRM_CYCLES` (default 3) consecutive cycles is declared externally closed (stop-out, manual liquidation, margin call): log WARNING, fire alert, write synthetic sell to trade DB (closes stale buy record so restarts are not misled), clear ownership. Confirmation window guards against transient broker API blips returning incomplete data. With WebSocket order streaming (10.E1), genuine closes are detected via fill events; this method becomes a fallback for WebSocket gap periods only. | Low (~50 lines) | 🔴 | ✅ (2026-04-24) |
 
-> **Paper validation gate:** After implementing 10.C1 and 10.C2, run the paper bot for at
-> least one week with reconciliation active and confirm startup logs are clean on each restart
-> before proceeding to Group D.
+> **Paper validation gate (active — started 2026-04-24):** Groups A–C (including 10.C4
+> external close detection) are complete and the bot is running with the new startup
+> reconciliation. Run for at least one week, confirm startup logs are clean on each restart,
+> and verify no false external-close detections before proceeding to Group D.
 
 > **Allocator dependency:** Do not enable per-strategy capital buckets until 10.C1 and
 > 10.C2 are complete. Bucket accounting depends on durable ownership because every
@@ -705,6 +707,7 @@ is assigned to those new behaviors.
 
 | Date | Note |
 |---|---|
+| 2026-04-24 | **Phase 10 Groups A–C complete. Paper validation gate active.** 10.A1 verified live: bot recycled with MU + NVDA open positions; both restored from trade DB record (`trade DB record` in log, not `best-effort slot match`); NORMAL mode confirmed. 10.B1: `LIVE_TRADING` flag + derived credentials + `TRADE_LOG_DB_PAPER`/`TRADE_LOG_DB_LIVE` routing. 10.B2: `scripts/preflight.py` 8-point live checklist. 10.B3: `data/watchlists.py` `WatchlistSource` ABC + `StaticWatchlistSource`; `StrategySlot` gains `watchlist_source` field (precedence over scanner and symbols); `forward_test.py` wired. 10.C1: `_restore_ownership_from_db()` replaces TODO slot-match; `TradeLogger.read_all_open_owners()` + `read_owner_for_symbol()`. 10.C2: `_reconcile_startup()` returns NORMAL/RESTRICTED; RESTRICTED auto-clears after one cycle; entry branch respects mode. 10.C3: 116 new tests (480 total). 10.C4: `_detect_external_closes()` runs each cycle with 3-cycle confirmation window; `TradeLogger.log_external_close()` writes synthetic sell to close stale DB records. Next market open Monday 2026-04-27. |
 | 2026-04-23 | **Per-strategy watchlist wiring added as Phase 10 item 10.B3.** Each strategy must watch only its own symbol universe. `forward_test.py` currently passes the union `WATCHLIST` to the SMA slot; before RSI is activated alongside SMA this must be corrected so SMA uses `settings.SMA_WATCHLIST` and RSI uses `settings.RSI_WATCHLIST`. Without this fix, RSI would inherit SMA symbols and SMA would inherit RSI symbols, producing incorrect signal generation, wrong attribution, and sleeve accounting errors. `WATCHLIST` stays in settings as a convenience union for review scripts only. |
 | 2026-04-23 | **Edge filters for SMA and RSI promoted into Phase 10.** Both strategies require strategy-level entry filters before going live — the regime detector (10.F2/F3) operates at the portfolio level and is not a substitute. SMA edge filter (10.F3a): SPY>200SMA market-trend gate + earnings-blackout veto wired into `strategies/filters/sma_crossover.py`; promoted from Phase 11 item 11.20. RSI edge filter (10.F3b): SPY>200SMA, SPY>50SMA, stock>50SMA Tier 1 gates from `docs/RSI-edge-filter.md` wired into `strategies/filters/rsi_reversion.py`; required before RSI paper activation (10.F4). Exits are never blocked by either filter. |
 | 2026-04-23 | **Fractional share sizing added as Phase 10 item 10.G6.** Fractional shares address two problems on a small live account: (1) stocks priced above the notional budget (e.g. AVGO, NVDA) round to 0 whole shares and are skipped entirely; (2) stocks in the $300–600 range where whole-share rounding produces 20–50% notional distortion from target. Both problems are most acute at account launch and shrink as the account grows — a larger notional budget means whole-share errors become negligible. Implementation: replace `floor(notional_budget / price)` with `round(notional_budget / price, 2)` when `FRACTIONAL_ENABLED=True`. Alpaca fractional orders are `DAY`-only (no GTC stop leg) — engine-side stop monitoring (fresh `DAY` stop each session open) covers the missing OTO leg. |
