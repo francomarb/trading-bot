@@ -146,7 +146,7 @@ def main() -> None:
     )
 
     slot_desc = ", ".join(
-        f"{s.strategy.name}({s.symbols})" for s in slots
+        f"{s.strategy.name}({s.active_symbols()})" for s in slots
     )
     logger.info(f"slots: {slot_desc}")
     logger.info(f"cycle={config.cycle_interval_seconds}s")
