@@ -480,7 +480,7 @@ class TradingEngine:
         latest_ts = df.index[-1]
 
         # 4. Signals.
-        signals = strategy.generate_signals(df)
+        signals = strategy.generate_signals(df, symbol=symbol)
         last_entry = bool(signals.entries.iloc[-1])
         last_exit = bool(signals.exits.iloc[-1])
 

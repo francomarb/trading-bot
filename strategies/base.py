@@ -114,15 +114,23 @@ class BaseStrategy(ABC):
     def _raw_signals(self, df: pd.DataFrame) -> SignalFrame:
         """Compute entries/exits before edge-filter gating."""
 
-    def generate_signals(self, df: pd.DataFrame) -> SignalFrame:
+    def generate_signals(self, df: pd.DataFrame, *, symbol: str = "") -> SignalFrame:
         """
         Public entry point. Computes raw signals, then AND-gates entries
         (but not exits — we always want to be able to exit) with the
         edge filter if one is configured.
+
+        `symbol` is passed through to symbol-aware filters (those that
+        implement a `set_symbol` method, e.g. EarningsBlackout). Filters
+        that don't need the symbol ignore it — backwards compatible.
         """
         raw = self._raw_signals(df)
         if self._edge_filter is None:
             return raw
+
+        # Inject symbol into filters that declare set_symbol().
+        if symbol and hasattr(self._edge_filter, "set_symbol"):
+            self._edge_filter.set_symbol(symbol)
 
         gate = self._edge_filter(df)
         if not isinstance(gate, pd.Series):

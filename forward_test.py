@@ -46,6 +46,7 @@ from reporting.pnl import PnLTracker
 from risk.manager import RiskManager
 from data.watchlists import StaticWatchlistSource
 from strategies.base import StrategySlot
+from strategies.filters.sma_crossover import SMAEdgeFilter
 from strategies.sma_crossover import SMACrossover
 
 
@@ -93,7 +94,7 @@ def main() -> None:
     # ── Strategy slots ──────────────────────────────────────────────────
     slots = [
         StrategySlot(
-            strategy=SMACrossover(fast=20, slow=50),
+            strategy=SMACrossover(fast=20, slow=50, edge_filter=SMAEdgeFilter()),
             watchlist_source=StaticWatchlistSource(
                 list(settings.SMA_WATCHLIST), name="sma"
             ),
