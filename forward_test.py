@@ -39,6 +39,7 @@ from loguru import logger
 from config import settings
 from engine.trader import EngineConfig, TradingEngine
 from execution.broker import AlpacaBroker
+from execution.stream import StreamManager
 from reporting.alerts import AlertDispatcher
 from reporting.logger import TradeLogger, install_json_sink
 from reporting.pnl import PnLTracker
@@ -109,8 +110,15 @@ def main() -> None:
     # Risk manager with production settings (shared across all slots).
     risk = RiskManager()
 
-    # Broker (paper).
-    broker = AlpacaBroker()
+    # WebSocket stream for real-time fill/stop-out detection (Phase 10.E1).
+    stream = StreamManager(
+        api_key=settings.ALPACA_API_KEY or "",
+        secret_key=settings.ALPACA_SECRET_KEY or "",
+        paper=settings.ALPACA_PAPER,
+    )
+
+    # Broker (paper) — stream wired for stream-first fill detection.
+    broker = AlpacaBroker(stream_manager=stream)
 
     # Reporting.
     trade_logger = TradeLogger()
@@ -134,6 +142,7 @@ def main() -> None:
         trade_logger=trade_logger,
         pnl_tracker=pnl_tracker,
         alerts=alerts,
+        stream_manager=stream,
     )
 
     slot_desc = ", ".join(

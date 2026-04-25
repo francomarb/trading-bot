@@ -612,6 +612,11 @@ class RiskManager:
             )
 
         qty = self._size_position(signal, stop_price, account)
+
+        # Live-trading size multiplier (10.G1): scale down on first live exposure.
+        if settings.LIVE_TRADING and settings.LIVE_SIZE_MULTIPLIER != 1.0:
+            qty = max(1, math.floor(qty * settings.LIVE_SIZE_MULTIPLIER))
+
         if qty <= 0:
             # Distinguish gross-exposure exhaustion from cash exhaustion for
             # better operator diagnostics.

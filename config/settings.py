@@ -86,6 +86,17 @@ SLIPPAGE_DRIFT_ENABLED = False
 # (runner.py slippage_bps=5). LIMIT orders model 0 bps (price is controlled).
 SLIPPAGE_MODEL_MARKET_BPS = 5.0
 
+# ── Live-trading safety overrides (Phase 10.G) ──────────────────────────────
+# Scale calculated position sizes to this fraction when LIVE_TRADING=True.
+# Default 0.25 = start live at 25% of the paper-tested size.
+# Raise to 1.0 once you are confident in live execution quality.
+LIVE_SIZE_MULTIPLIER: float = float(os.getenv("LIVE_SIZE_MULTIPLIER", "0.25"))
+
+# Dry-run mode: log order decisions but do not submit to the broker.
+# Useful for verifying the live environment before committing real capital.
+# Set DRY_RUN=true in the environment; never rely on code-level default alone.
+DRY_RUN: bool = os.getenv("DRY_RUN", "false").lower() in ("true", "1", "yes")
+
 # ── Engine settings (Phase 8 / 10) ──────────────────────────────────────────
 ATR_LENGTH = 14                     # ATR window the engine uses for stops
 ENGINE_TIMEFRAME = "1Day"           # Bar timeframe for the live loop

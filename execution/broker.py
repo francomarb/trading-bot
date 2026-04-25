@@ -38,11 +38,16 @@ SDK: alpaca-py (official, replaces deprecated alpaca-trade-api).
 
 from __future__ import annotations
 
+import threading
 import time
 import uuid
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from enum import Enum
+from typing import TYPE_CHECKING
+
+if TYPE_CHECKING:
+    from execution.stream import StreamManager
 
 from alpaca.common.exceptions import APIError
 from alpaca.trading.client import TradingClient
@@ -69,6 +74,7 @@ from config.settings import (
     ALPACA_API_KEY,
     ALPACA_PAPER,
     ALPACA_SECRET_KEY,
+    DRY_RUN,
 )
 from risk.manager import AccountState, Position, RiskDecision, Side
 from strategies.base import OrderType
@@ -180,6 +186,8 @@ class AlpacaBroker:
         max_attempts: int = 5,
         base_delay: float = 1.0,
         time_in_force: str = "gtc",
+        stream_manager: "StreamManager | None" = None,
+        dry_run: bool | None = None,
     ) -> None:
         self._api = client or TradingClient(
             api_key=ALPACA_API_KEY,
@@ -191,6 +199,9 @@ class AlpacaBroker:
         self._max_attempts = max_attempts
         self._base_delay = base_delay
         self._time_in_force = time_in_force
+        self._stream_manager = stream_manager
+        # Dry-run: log orders but never submit. Defaults to settings.DRY_RUN.
+        self._dry_run: bool = dry_run if dry_run is not None else DRY_RUN
 
     # ── Retry wrapper ────────────────────────────────────────────────────
 
@@ -391,6 +402,28 @@ class AlpacaBroker:
             f"{decision.qty} {decision.symbol} (stop ${decision.stop_price:.2f}, "
             f"client_id={client_order_id})"
         )
+
+        if self._dry_run:
+            logger.warning(
+                f"DRY RUN — order NOT submitted: {decision.order_type.value} "
+                f"{decision.side.value} {decision.qty} {decision.symbol}"
+            )
+            return OrderResult(
+                status=OrderStatus.FILLED,
+                order_id=f"dry-run-{uuid.uuid4().hex[:10]}",
+                symbol=decision.symbol,
+                requested_qty=decision.qty,
+                filled_qty=decision.qty,
+                avg_fill_price=decision.entry_reference_price,
+                raw_status="dry_run",
+                message="dry run — no order submitted",
+            )
+
+        # Register with the stream before submitting to avoid a fill-before-watch race.
+        stream_event: threading.Event | None = None
+        if self._stream_manager is not None:
+            stream_event = self._stream_manager.watch(client_order_id)
+
         try:
             order = self._with_retry(
                 lambda: self._api.submit_order(order_request),
@@ -409,12 +442,22 @@ class AlpacaBroker:
                 message=str(e),
             )
 
-        return self._poll_until_terminal(
-            order_id=str(order.id),
+        order_id = str(order.id)
+
+        # Re-register using the real Alpaca order ID (stream matches on order.id).
+        if self._stream_manager is not None:
+            stream_event = self._stream_manager.watch(order_id)
+            # Register stop-leg ID so stop-outs are captured by drain_stop_fills().
+            for leg in getattr(order, "legs", None) or []:
+                self._stream_manager.register_stop_leg(str(leg.id))
+
+        return self._wait_for_fill(
+            order_id=order_id,
             symbol=decision.symbol,
             requested_qty=decision.qty,
             timeout=poll_timeout,
             interval=poll_interval,
+            stream_event=stream_event,
         )
 
     def cancel_order(self, order_id: str) -> bool:
@@ -475,12 +518,13 @@ class AlpacaBroker:
                 raw_status=None,
                 message=str(e),
             )
-        return self._poll_until_terminal(
+        return self._wait_for_fill(
             order_id=str(order.id),
             symbol=symbol,
             requested_qty=qty,
             timeout=poll_timeout,
             interval=poll_interval,
+            stream_event=None,  # close_position doesn't pre-register with stream
         )
 
     def place_protective_stop(
@@ -517,6 +561,97 @@ class AlpacaBroker:
         return self._to_open_order(order)
 
     # ── Internals ────────────────────────────────────────────────────────
+
+    def _wait_for_fill(
+        self,
+        *,
+        order_id: str,
+        symbol: str,
+        requested_qty: int,
+        timeout: float,
+        interval: float,
+        stream_event: threading.Event | None,
+    ) -> OrderResult:
+        """
+        Stream-first fill detection with REST polling fallback.
+
+        If a stream_event is provided, waits up to `timeout` seconds for the
+        WebSocket to deliver a terminal update. On success, builds the result
+        from the stream data (no REST call). On timeout or missing update,
+        falls back to a single-pass REST poll.
+
+        If no stream is wired, delegates directly to _poll_until_terminal.
+        """
+        if stream_event is not None:
+            fired = stream_event.wait(timeout=timeout)
+            if fired:
+                update = (
+                    self._stream_manager.get_update(order_id)
+                    if self._stream_manager is not None
+                    else None
+                )
+                if update is not None:
+                    return self._build_result_from_stream(update, symbol, requested_qty)
+            # Stream timed out or update was None — fall back to a short REST check.
+            logger.debug(
+                f"{symbol} order {order_id}: stream timeout, falling back to REST"
+            )
+            return self._poll_until_terminal(
+                order_id=order_id,
+                symbol=symbol,
+                requested_qty=requested_qty,
+                timeout=interval * 3,
+                interval=interval,
+            )
+
+        return self._poll_until_terminal(
+            order_id=order_id,
+            symbol=symbol,
+            requested_qty=requested_qty,
+            timeout=timeout,
+            interval=interval,
+        )
+
+    @staticmethod
+    def _build_result_from_stream(
+        update: "TradeUpdate",
+        symbol: str,
+        requested_qty: int,
+    ) -> "OrderResult":
+        """Build an OrderResult from a terminal TradeUpdate (WebSocket path)."""
+        from alpaca.trading.models import TradeUpdate  # local import avoids circular
+
+        event_val = (
+            update.event.value
+            if hasattr(update.event, "value")
+            else str(update.event)
+        )
+        _STATUS_MAP = {
+            "fill": OrderStatus.FILLED,
+            "canceled": OrderStatus.CANCELED,
+            "expired": OrderStatus.CANCELED,
+            "replaced": OrderStatus.CANCELED,
+            "rejected": OrderStatus.REJECTED,
+        }
+        status = _STATUS_MAP.get(event_val, OrderStatus.FILLED)
+        filled_qty = int(float(update.qty or 0))
+        avg_price = float(update.price) if update.price is not None else None
+        order_id = str(update.order.id)
+        msg = (
+            f"{status.value} (stream): filled {filled_qty}/{requested_qty} "
+            f"@ avg {avg_price if avg_price is not None else '—'}"
+        )
+        logger.info(f"{symbol} order {order_id}: {msg}")
+        return OrderResult(
+            status=status,
+            order_id=order_id,
+            symbol=symbol,
+            requested_qty=requested_qty,
+            filled_qty=filled_qty,
+            avg_fill_price=avg_price,
+            raw_status=event_val,
+            message=msg,
+        )
 
     def _poll_until_terminal(
         self,

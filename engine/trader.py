@@ -47,6 +47,7 @@ import signal
 import time
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
+from typing import TYPE_CHECKING
 
 import pandas as pd
 from loguru import logger
@@ -74,6 +75,9 @@ from reporting.alerts import AlertDispatcher
 from reporting.logger import TradeLogger
 from reporting.pnl import PnLTracker
 from strategies.base import BaseStrategy, StrategySlot
+
+if TYPE_CHECKING:
+    from execution.stream import StreamManager
 
 
 # ── Bar-interval helpers ─────────────────────────────────────────────────────
@@ -164,6 +168,7 @@ class TradingEngine:
         trade_logger: TradeLogger | None = None,
         pnl_tracker: PnLTracker | None = None,
         alerts: AlertDispatcher | None = None,
+        stream_manager: "StreamManager | None" = None,
         # Injection seam for tests — production should leave this as None.
         clock: callable = None,  # type: ignore[assignment]
     ) -> None:
@@ -195,6 +200,7 @@ class TradingEngine:
         self.trade_logger = trade_logger or TradeLogger()
         self.pnl_tracker = pnl_tracker or PnLTracker()
         self.alerts = alerts or AlertDispatcher()
+        self._stream_manager = stream_manager
         self._clock = clock or (lambda: datetime.now(timezone.utc))
 
         self._running: bool = False
@@ -229,6 +235,11 @@ class TradingEngine:
         self._install_signal_handlers()
         self._running = True
         self._cycle_count = 0
+
+        # Start WebSocket stream before the first broker snapshot so that
+        # fills from positions placed immediately after startup are not missed.
+        if self._stream_manager is not None:
+            self._stream_manager.start()
 
         # Capture truth-of-the-world before any decision.
         startup_snapshot = self.broker.sync_with_broker()
@@ -349,6 +360,7 @@ class TradingEngine:
             )
 
             self._detect_external_closes(snapshot)
+            self._process_stream_stop_fills()
             self._repair_missing_protective_stops(snapshot)
 
             # Daily-loss / hard-dollar gates can fire on any signal; halt state
@@ -758,6 +770,49 @@ class TradingEngine:
             except Exception as e:
                 logger.error(f"{symbol}: failed to log external close: {e}")
 
+    def _process_stream_stop_fills(self) -> None:
+        """
+        Drain WebSocket stop-leg fill events from the stream manager.
+
+        When a protective stop triggers, Alpaca sends a fill event for the
+        stop-leg order. StreamManager accumulates these in drain_stop_fills().
+        We process them here each cycle — before _detect_external_closes —
+        so the ownership map is already cleared when the cycle-count fallback
+        runs (which then finds no owned symbols absent, and does nothing).
+
+        This gives immediate detection of stop-outs rather than waiting for
+        external_close_confirm_cycles cycles.
+        """
+        if self._stream_manager is None:
+            return
+
+        for update in self._stream_manager.drain_stop_fills():
+            symbol = update.order.symbol
+            if symbol not in self._position_owners:
+                logger.debug(
+                    f"stream stop fill for unowned {symbol} — already handled"
+                )
+                continue
+
+            owner = self._position_owners.pop(symbol)
+            self._external_close_suspects.pop(symbol, None)
+            price = float(update.price) if update.price is not None else None
+            qty = int(float(update.qty or 0))
+            msg = (
+                f"{symbol}: protective stop triggered (WebSocket) — "
+                f"qty={qty} price={price} strategy={owner}"
+            )
+            logger.warning(msg)
+            self.alerts.broker_error(msg)
+            try:
+                self.trade_logger.log_external_close(
+                    symbol=symbol,
+                    strategy=owner,
+                    reason="stop_triggered",
+                )
+            except Exception as e:
+                logger.error(f"{symbol}: failed to log stop fill: {e}")
+
     def _restore_ownership_from_db(self, snapshot: BrokerSnapshot) -> set[str]:
         """
         Restore ``_position_owners`` from the trade DB (10.C1).
@@ -896,14 +951,15 @@ class TradingEngine:
 
     def _shutdown(self) -> None:
         logger.info(f"engine stopped after {self._cycle_count} cycle(s)")
-        if not self.config.cancel_orders_on_shutdown:
-            return
-        try:
-            for o in self.broker.get_open_orders():
-                logger.info(f"shutdown: canceling order {o.order_id} ({o.symbol})")
-                self.broker.cancel_order(o.order_id)
-        except Exception as e:
-            logger.error(f"shutdown cleanup failed: {e}")
+        if self.config.cancel_orders_on_shutdown:
+            try:
+                for o in self.broker.get_open_orders():
+                    logger.info(f"shutdown: canceling order {o.order_id} ({o.symbol})")
+                    self.broker.cancel_order(o.order_id)
+            except Exception as e:
+                logger.error(f"shutdown cleanup failed: {e}")
+        if self._stream_manager is not None:
+            self._stream_manager.stop()
 
 
 # ── CLI entry point ──────────────────────────────────────────────────────────
