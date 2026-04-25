@@ -437,8 +437,19 @@ class TestSMAEdgeFilter:
 # ── TestRSIEdgeFilter ─────────────────────────────────────────────────────────
 
 
+def _liquid_df(n: int, avg_vol: int = 1_000_000) -> pd.DataFrame:
+    """Synthetic df with `n` bars of rising closes and steady volume."""
+    idx = pd.date_range("2020-01-01", periods=n, freq="B")
+    closes = list(range(1, n + 1))
+    return pd.DataFrame(
+        {"close": closes, "open": closes, "high": closes,
+         "low": closes, "volume": [avg_vol] * n},
+        index=idx,
+    )
+
+
 class TestRSIEdgeFilter:
-    """RSIEdgeFilter: SPY > 200SMA AND SPY > 50SMA AND not near earnings."""
+    """RSIEdgeFilter: SPY dual-SMA + earnings blackout + liquidity + no new low."""
 
     def _spy_allows(self, f: RSIEdgeFilter) -> None:
         f._spy_filter._spy_cache = _spy_df(list(range(1, 211)))
@@ -448,49 +459,159 @@ class TestRSIEdgeFilter:
         f._spy_filter._spy_cache = _spy_df(list(range(210, 0, -1)))
         f._spy_filter._cache_time = float("inf")
 
-    def test_all_gates_pass_returns_true(self):
-        f = RSIEdgeFilter()
+    def _clear_earnings(self, f: RSIEdgeFilter, symbol: str = "MU") -> None:
+        """Seed earnings cache with no upcoming dates for symbol."""
+        f._earnings._cache[symbol] = (datetime.date.today(), [])
+
+    # ── SPY gate ─────────────────────────────────────────────────────────────
+
+    def test_spy_gate_allows(self):
+        f = RSIEdgeFilter(vol_min_avg=0)   # disable vol/low gates
         f.set_symbol("MU")
         self._spy_allows(f)
-        f._earnings._cache["MU"] = (datetime.date.today(), [])  # no earnings
-        gate = f(_today_df())
+        self._clear_earnings(f)
+        gate = f(_liquid_df(25, avg_vol=1_000_000))
         assert gate.iloc[-1]
 
-    def test_spy_gate_fails_returns_false(self):
-        f = RSIEdgeFilter()
+    def test_spy_gate_blocks(self):
+        f = RSIEdgeFilter(vol_min_avg=0)
         f.set_symbol("MU")
         self._spy_blocks(f)
-        f._earnings._cache["MU"] = (datetime.date.today(), [])
-        gate = f(_today_df())
+        self._clear_earnings(f)
+        gate = f(_liquid_df(25, avg_vol=1_000_000))
         assert not gate.iloc[-1]
+
+    def test_spy_windows_both_required(self):
+        """Both SPY 200SMA and 50SMA must pass."""
+        f = RSIEdgeFilter(vol_min_avg=0)
+        f.set_symbol("MU")
+        self._clear_earnings(f)
+        df = _liquid_df(25, avg_vol=1_000_000)
+
+        with patch.object(f._spy_filter, "_check", return_value=(True, "ok")):
+            assert f(df).iloc[-1]
+
+        with patch.object(f._spy_filter, "_check", return_value=(False, "below 50SMA")):
+            assert not f(df).iloc[-1]
+
+    # ── Earnings blackout gate ────────────────────────────────────────────────
 
     def test_earnings_blackout_blocks(self):
-        """Entry blocked when within earnings window, even if SPY is fine."""
-        f = RSIEdgeFilter(days_before=3, days_after=1)
+        f = RSIEdgeFilter(days_before=3, days_after=2, vol_min_avg=0)
         f.set_symbol("MU")
         self._spy_allows(f)
-        tomorrow = datetime.date.today() + datetime.timedelta(days=1)
+        df = _today_df()
+        last_bar = df.index[-1].date()
+        tomorrow = last_bar + datetime.timedelta(days=1)
         f._earnings._cache["MU"] = (datetime.date.today(), [tomorrow])
-        gate = f(_today_df())
-        assert not gate.iloc[-1]
+        assert not f(df).iloc[-1]
 
     def test_earnings_far_away_allows(self):
-        f = RSIEdgeFilter(days_before=3, days_after=1)
+        f = RSIEdgeFilter(days_before=3, days_after=2, vol_min_avg=0)
         f.set_symbol("MU")
         self._spy_allows(f)
         far = datetime.date.today() + datetime.timedelta(days=30)
         f._earnings._cache["MU"] = (datetime.date.today(), [far])
-        gate = f(_today_df())
+        gate = f(_liquid_df(25, avg_vol=1_000_000))
         assert gate.iloc[-1]
 
-    def test_both_spy_and_earnings_blocked(self):
+    def test_days_before_after_defaults(self):
+        """Default blackout window is 3 days before, 2 days after."""
         f = RSIEdgeFilter()
+        assert f._earnings._days_before == 3
+        assert f._earnings._days_after == 2
+
+    # ── Liquidity gate ────────────────────────────────────────────────────────
+
+    def test_volume_above_threshold_allows(self):
+        f = RSIEdgeFilter(vol_min_window=5, vol_min_avg=500_000)
         f.set_symbol("MU")
-        self._spy_blocks(f)
-        tomorrow = datetime.date.today() + datetime.timedelta(days=1)
-        f._earnings._cache["MU"] = (datetime.date.today(), [tomorrow])
-        gate = f(_today_df())
+        self._spy_allows(f)
+        self._clear_earnings(f)
+        df = _liquid_df(25, avg_vol=1_000_000)   # 1M >> 500K
+        gate = f(df)
+        assert gate.iloc[-1]
+
+    def test_volume_below_threshold_blocks(self):
+        f = RSIEdgeFilter(vol_min_window=5, vol_min_avg=500_000)
+        f.set_symbol("MU")
+        self._spy_allows(f)
+        self._clear_earnings(f)
+        df = _liquid_df(25, avg_vol=100_000)     # 100K < 500K
+        gate = f(df)
         assert not gate.iloc[-1]
+
+    def test_volume_no_column_fails_open(self):
+        """No volume column → fail open. Uses rising closes so new_low gate passes."""
+        f = RSIEdgeFilter(vol_min_window=5, vol_min_avg=500_000)
+        f.set_symbol("MU")
+        self._spy_allows(f)
+        self._clear_earnings(f)
+        closes = list(range(1, 26))   # rising — new_low gate passes
+        idx = pd.date_range("2020-01-01", periods=25, freq="B")
+        df = pd.DataFrame({"close": closes}, index=idx)   # no volume column
+        gate = f(df)
+        assert gate.iloc[-1]   # fail open on volume
+
+    def test_volume_nan_fails_open(self):
+        """Fewer bars than vol_min_window → NaN avg → fail open."""
+        f = RSIEdgeFilter(vol_min_window=20, vol_min_avg=500_000)
+        f.set_symbol("MU")
+        self._spy_allows(f)
+        self._clear_earnings(f)
+        df = _liquid_df(5, avg_vol=100_000)   # only 5 bars, need 20
+        gate = f(df)
+        assert gate.iloc[-1]   # fail open
+
+    # ── No-new-low gate ───────────────────────────────────────────────────────
+
+    def test_no_new_low_allows(self):
+        """Rising stock → last close above prior-N min → allowed."""
+        f = RSIEdgeFilter(new_low_window=5, vol_min_avg=0)
+        f.set_symbol("MU")
+        self._spy_allows(f)
+        self._clear_earnings(f)
+        df = _liquid_df(25, avg_vol=1_000_000)   # closes 1..25, always rising
+        gate = f(df)
+        assert gate.iloc[-1]
+
+    def test_new_low_blocks(self):
+        """Stock making new 5-day low → blocked."""
+        f = RSIEdgeFilter(new_low_window=5, vol_min_avg=0)
+        f.set_symbol("MU")
+        self._spy_allows(f)
+        self._clear_earnings(f)
+        # Rises then drops sharply to a new low on the last bar
+        closes = [10, 11, 12, 13, 14, 15, 16, 5]   # last bar = 5, prior min = 10
+        idx = pd.date_range("2020-01-01", periods=len(closes), freq="B")
+        df = pd.DataFrame(
+            {"close": closes, "open": closes, "high": closes,
+             "low": closes, "volume": [1_000_000] * len(closes)},
+            index=idx,
+        )
+        gate = f(df)
+        assert not gate.iloc[-1]
+
+    def test_new_low_nan_fails_open(self):
+        """Fewer bars than new_low_window + 1 → NaN prior_min → fail open."""
+        f = RSIEdgeFilter(new_low_window=20, vol_min_avg=0)
+        f.set_symbol("MU")
+        self._spy_allows(f)
+        self._clear_earnings(f)
+        df = _liquid_df(5)   # only 5 bars, need 21 for prior_min to be non-NaN
+        gate = f(df)
+        assert gate.iloc[-1]   # fail open
+
+    # ── Structural / combined ─────────────────────────────────────────────────
+
+    def test_all_four_gates_pass(self):
+        f = RSIEdgeFilter(vol_min_window=5, vol_min_avg=500_000, new_low_window=5)
+        f.set_symbol("MU")
+        self._spy_allows(f)
+        self._clear_earnings(f)
+        df = _liquid_df(25, avg_vol=1_000_000)
+        gate = f(df)
+        assert gate.iloc[-1]
 
     def test_no_stock_sma_attribute(self):
         """Stock-level 50 SMA gate must not exist on RSIEdgeFilter."""
@@ -505,34 +626,13 @@ class TestRSIEdgeFilter:
         assert f._earnings._symbol == "CDNS"
 
     def test_gate_series_aligned_to_df(self):
-        f = RSIEdgeFilter()
+        f = RSIEdgeFilter(vol_min_avg=0)
         f.set_symbol("MU")
         self._spy_allows(f)
-        f._earnings._cache["MU"] = (datetime.date.today(), [])
-        df = _today_df(8)
+        self._clear_earnings(f)
+        df = _liquid_df(25)
         gate = f(df)
         assert list(gate.index) == list(df.index)
-
-    def test_spy_windows_both_required(self):
-        """Both SPY 200SMA and 50SMA must pass."""
-        f = RSIEdgeFilter()
-        f.set_symbol("MU")
-        f._earnings._cache["MU"] = (datetime.date.today(), [])
-        df = _today_df()
-
-        with patch.object(f._spy_filter, "_check", return_value=(True, "ok")):
-            gate = f(df)
-            assert gate.iloc[-1]
-
-        with patch.object(f._spy_filter, "_check", return_value=(False, "SPY below 50SMA")):
-            gate = f(df)
-            assert not gate.iloc[-1]
-
-    def test_days_before_after_defaults(self):
-        """Default blackout window is 3 days before, 1 day after."""
-        f = RSIEdgeFilter()
-        assert f._earnings._days_before == 3
-        assert f._earnings._days_after == 1
 
 
 # ── TestBaseStrategySymbolInjection ───────────────────────────────────────────
