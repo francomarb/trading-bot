@@ -48,7 +48,9 @@ from reporting.pnl import PnLTracker
 from risk.manager import RiskManager
 from data.watchlists import StaticWatchlistSource
 from strategies.base import StrategySlot
+from strategies.filters.rsi_reversion import RSIEdgeFilter
 from strategies.filters.sma_crossover import SMAEdgeFilter
+from strategies.rsi_reversion import RSIReversion
 from strategies.sma_crossover import SMACrossover
 
 
@@ -121,14 +123,20 @@ def main() -> None:
             # degrade significantly.
             allowed_regimes=frozenset({MarketRegime.TRENDING, MarketRegime.RANGING}),
         ),
-        # Add more slots here as new strategies are built:
-        # StrategySlot(
-        #     strategy=RSIReversion(...),
-        #     watchlist_source=StaticWatchlistSource(
-        #         list(settings.RSI_WATCHLIST), name="rsi"
-        #     ),
-        #     allowed_regimes=frozenset({MarketRegime.TRENDING, MarketRegime.RANGING}),
-        # ),
+        StrategySlot(
+            strategy=RSIReversion(period=14, oversold=30, overbought=70,
+                                  edge_filter=RSIEdgeFilter()),
+            watchlist_source=StaticWatchlistSource(
+                list(settings.RSI_WATCHLIST), name="rsi"
+            ),
+            # RSI reversion works in both trending and ranging markets;
+            # blocked in BEAR (stocks can keep falling past oversold) and
+            # VOLATILE (fear-driven overshoots are unpredictable and the
+            # snap-back timing is unreliable). The RSI edge filter adds a
+            # second layer: SPY > 200 SMA AND SPY > 50 SMA, so BEAR is
+            # double-blocked.
+            allowed_regimes=frozenset({MarketRegime.TRENDING, MarketRegime.RANGING}),
+        ),
     ]
 
     # Risk manager with production settings (shared across all slots).
