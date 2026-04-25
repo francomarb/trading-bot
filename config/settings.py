@@ -52,12 +52,33 @@ RSI_WATCHLIST = [
 # NOTE: RIVN is included here but not in either strategy list — review before Phase 10.
 WATCHLIST = list(dict.fromkeys(SMA_WATCHLIST + RSI_WATCHLIST + ["RIVN"]))
 
+# ── Capital allocation (Phase 10.F1) ────────────────────────────────────────
+# Per-strategy sleeve budgets. Each entry maps strategy_name →
+#   weight:        fraction of gross capital for this strategy (must sum ≤ 1.0)
+#   max_positions: hard cap on simultaneous open positions for this strategy
+#
+# Gross notional ceiling per strategy = equity × MAX_GROSS_EXPOSURE_PCT × weight
+# Per-position notional budget        = ceiling / max_positions
+#
+# Example at $100k equity, 80% gross, 50/50, max_positions=5:
+#   each sleeve = $100k × 0.80 × 0.50 = $40,000
+#   per position = $40,000 ÷ 5          = $8,000
+#
+# Idle sleeve capital stays locked to its strategy (no cross-borrowing).
+# Dynamic reallocation is a Phase 11 item.
+# Weights start 50/50 — rebalance after ≥4 weeks of combined paper data.
+STRATEGY_ALLOCATIONS: dict[str, dict] = {
+    "sma_crossover": {"weight": 0.50, "max_positions": 5},
+    "rsi_reversion":  {"weight": 0.50, "max_positions": 5},
+}
+MIN_TRADE_NOTIONAL = 100.0      # Reject entries if sleeve available < this
+
 # ── Risk settings (Phase 6) ──────────────────────────────────────────────────
 # Position sizing
 MAX_POSITION_PCT = 0.02         # Risk no more than 2% of equity per trade (loss-to-stop)
-MAX_POSITION_NOTIONAL_PCT = 0.10 # Cap one position at 10% notional so 5 can fit in 50% gross
-MAX_OPEN_POSITIONS = 5          # Cap concurrent open positions
-MAX_GROSS_EXPOSURE_PCT = 0.50   # Cap total gross notional at 50% of equity (initial live)
+MAX_POSITION_NOTIONAL_PCT = 0.10 # Cap one position at 10% notional so 5 can fit in 80% gross
+MAX_OPEN_POSITIONS = 10         # Global cap; per-strategy limit enforced by sleeve
+MAX_GROSS_EXPOSURE_PCT = 0.80   # 80% of equity tradeable across all strategies
 
 # Stop-loss
 ATR_STOP_MULTIPLIER = 2.0       # Stop = entry - k * ATR (long); always defined pre-entry

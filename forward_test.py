@@ -40,6 +40,8 @@ from config import settings
 from engine.trader import EngineConfig, TradingEngine
 from execution.broker import AlpacaBroker
 from execution.stream import StreamManager
+from regime.detector import MarketRegime, RegimeDetector
+from risk.allocator import SleeveAllocator
 from reporting.alerts import AlertDispatcher
 from reporting.logger import TradeLogger, install_json_sink
 from reporting.pnl import PnLTracker
@@ -91,6 +93,22 @@ def main() -> None:
     # JSON structured log.
     install_json_sink()
 
+    # ── Capital sleeve allocator (Phase 10.F1) ──────────────────────────
+    # Enforces per-strategy gross-notional budgets so SMA cannot starve RSI
+    # (or vice versa). Weights are 50/50 until ≥4 weeks of combined paper
+    # data justify a rebalance. Idle sleeve capital stays locked.
+    allocator = SleeveAllocator(
+        allocations=settings.STRATEGY_ALLOCATIONS,
+        total_gross_pct=settings.MAX_GROSS_EXPOSURE_PCT,
+        min_trade_notional=settings.MIN_TRADE_NOTIONAL,
+    )
+
+    # ── Regime detector (Phase 10.F2) ───────────────────────────────────
+    # Classifies SPY into BEAR / VOLATILE / TRENDING / RANGING once per
+    # cycle with a 10-minute TTL cache. Each slot's allowed_regimes gates
+    # new entries; exits are never blocked.
+    regime = RegimeDetector()
+
     # ── Strategy slots ──────────────────────────────────────────────────
     slots = [
         StrategySlot(
@@ -98,6 +116,10 @@ def main() -> None:
             watchlist_source=StaticWatchlistSource(
                 list(settings.SMA_WATCHLIST), name="sma"
             ),
+            # SMA crossover works in both trending and ranging markets;
+            # blocked only in BEAR and VOLATILE where edge and risk/reward
+            # degrade significantly.
+            allowed_regimes=frozenset({MarketRegime.TRENDING, MarketRegime.RANGING}),
         ),
         # Add more slots here as new strategies are built:
         # StrategySlot(
@@ -105,6 +127,7 @@ def main() -> None:
         #     watchlist_source=StaticWatchlistSource(
         #         list(settings.RSI_WATCHLIST), name="rsi"
         #     ),
+        #     allowed_regimes=frozenset({MarketRegime.TRENDING, MarketRegime.RANGING}),
         # ),
     ]
 
@@ -144,6 +167,8 @@ def main() -> None:
         pnl_tracker=pnl_tracker,
         alerts=alerts,
         stream_manager=stream,
+        regime_detector=regime,
+        allocator=allocator,
     )
 
     slot_desc = ", ".join(

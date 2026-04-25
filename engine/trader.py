@@ -78,6 +78,8 @@ from strategies.base import BaseStrategy, StrategySlot
 
 if TYPE_CHECKING:
     from execution.stream import StreamManager
+    from regime.detector import RegimeDetector
+    from risk.allocator import SleeveAllocator
 
 
 # ── Bar-interval helpers ─────────────────────────────────────────────────────
@@ -169,6 +171,8 @@ class TradingEngine:
         pnl_tracker: PnLTracker | None = None,
         alerts: AlertDispatcher | None = None,
         stream_manager: "StreamManager | None" = None,
+        regime_detector: "RegimeDetector | None" = None,
+        allocator: "SleeveAllocator | None" = None,
         # Injection seam for tests — production should leave this as None.
         clock: callable = None,  # type: ignore[assignment]
     ) -> None:
@@ -201,6 +205,8 @@ class TradingEngine:
         self.pnl_tracker = pnl_tracker or PnLTracker()
         self.alerts = alerts or AlertDispatcher()
         self._stream_manager = stream_manager
+        self._regime_detector = regime_detector
+        self._allocator = allocator
         self._clock = clock or (lambda: datetime.now(timezone.utc))
 
         self._running: bool = False
@@ -379,7 +385,38 @@ class TradingEngine:
             # in the same cycle — not just what the broker reported at cycle start.
             running_account = snapshot.account
 
+            # Regime detection — runs once per cycle, before any slot.
+            # Exits are never blocked by regime; only new entries are gated.
+            current_regime = None
+            if self._regime_detector is not None:
+                try:
+                    current_regime = self._regime_detector.detect()
+                except Exception as exc:
+                    logger.warning(
+                        f"regime detection failed: {exc} — "
+                        "proceeding without regime gate this cycle"
+                    )
+
+            # Order attribution — computed once per cycle for sleeve accounting.
+            # Maps order_id → strategy_name for pending buy entries using
+            # watchlist membership. Used by SleeveAllocator to count open
+            # orders against the correct strategy's sleeve budget.
+            order_strategy = self._attribute_orders(snapshot.open_orders)
+
             for slot in self.slots:
+                # Per-slot regime gate: block new entries if current regime is
+                # not in the slot's allowed set. Exits always proceed.
+                entry_allowed = True
+                if current_regime is not None and slot.allowed_regimes is not None:
+                    if current_regime not in slot.allowed_regimes:
+                        entry_allowed = False
+                        logger.info(
+                            f"[{slot.strategy.name}] regime={current_regime.value} "
+                            f"not in allowed_regimes="
+                            f"{sorted(r.value for r in slot.allowed_regimes)} "
+                            "— new entries blocked this cycle"
+                        )
+
                 symbols = slot.active_symbols()
                 for symbol in symbols:
                     try:
@@ -390,6 +427,8 @@ class TradingEngine:
                             running_account,
                             slot.strategy,
                             slot.timeframe,
+                            entry_allowed=entry_allowed,
+                            order_strategy=order_strategy,
                         )
                         if filled is not None:
                             new_positions += 1
@@ -440,6 +479,9 @@ class TradingEngine:
         account: AccountState,
         strategy: BaseStrategy,
         timeframe: str,
+        *,
+        entry_allowed: bool = True,
+        order_strategy: dict[str, str] | None = None,
     ) -> Position | None:
         """
         The full per-symbol decision path. Returns a Position if an entry was
@@ -524,6 +566,11 @@ class TradingEngine:
         # 6. Entry branch — risk is the gate.
         if not last_entry:
             return
+        if not entry_allowed:
+            logger.debug(
+                f"[{strategy.name}] {symbol}: entry blocked by regime gate"
+            )
+            return
         if self._startup_mode != "NORMAL":
             logger.info(
                 f"[{strategy.name}] {symbol}: entry blocked — "
@@ -536,6 +583,30 @@ class TradingEngine:
             # Risk would reject anyway; skip to avoid spamming alerts.
             return
 
+        # Sleeve check — must pass before risk sizing.
+        # Narrows the notional budget available to this strategy without
+        # bypassing any global risk control. Exits are never sleeve-gated.
+        notional_cap: float | None = None
+        if self._allocator is not None:
+            from risk.allocator import SleeveRejection
+            sleeve = self._allocator.check(
+                strategy_name=strategy.name,
+                account=account,
+                open_orders=snapshot.open_orders,
+                position_owners=self._position_owners,
+                order_strategy=order_strategy or {},
+            )
+            if isinstance(sleeve, SleeveRejection):
+                logger.info(
+                    f"[{strategy.name}] {symbol}: "
+                    f"sleeve blocked — {sleeve.message}"
+                )
+                self.alerts.order_rejection(
+                    symbol, strategy.name, sleeve.message, sleeve.code.value
+                )
+                return None
+            notional_cap = sleeve.per_position_notional
+
         sig = Signal(
             symbol=symbol,
             side=Side.BUY,
@@ -545,7 +616,7 @@ class TradingEngine:
             reason=f"{strategy.name} entry @ {latest_ts.isoformat()}",
             order_type=strategy.preferred_order_type,
         )
-        decision = self.risk.evaluate(sig, account)
+        decision = self.risk.evaluate(sig, account, notional_cap=notional_cap)
         if isinstance(decision, RiskRejection):
             # Already logged by risk; alert the operator.
             self.alerts.order_rejection(
@@ -645,6 +716,35 @@ class TradingEngine:
             self.trade_logger.log(record)
         except Exception as e:
             logger.error(f"trade logging (close) failed: {e}")
+
+    def _attribute_orders(
+        self, open_orders: list
+    ) -> dict[str, str]:
+        """
+        Build order_id → strategy_name for pending buy orders.
+
+        Logic:
+          - SELL orders are skipped (exits don't consume sleeve budget).
+          - If the order's symbol already has an open position, skip it —
+            it's a close order placed by the owner strategy.
+          - Otherwise, find the first slot whose watchlist includes the symbol
+            and attribute the order to that slot's strategy.
+
+        This is computed once per cycle and passed into _process_symbol so
+        SleeveAllocator can count open limit orders against the correct sleeve.
+        """
+        result: dict[str, str] = {}
+        for order in open_orders:
+            if order.side is Side.SELL:
+                continue
+            if order.symbol in self._position_owners:
+                # Close / reduce order for an existing position — skip.
+                continue
+            for slot in self.slots:
+                if order.symbol in slot.active_symbols():
+                    result[order.order_id] = slot.strategy.name
+                    break
+        return result
 
     @staticmethod
     def _has_pending_close_order(symbol: str, snapshot: BrokerSnapshot) -> bool:

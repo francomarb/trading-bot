@@ -185,20 +185,27 @@ Phase 10 completed to date (2026-04-24):
 - **10.G1** `LIVE_SIZE_MULTIPLIER=0.25` applied in risk manager when live
 - **10.G4** `DRY_RUN` flag — broker logs orders without submitting
 
+Phase 10 completed to date (continued 2026-04-25):
+- **10.F3a** SMA edge filter: stock > 200 SMA + volume expansion; SPY > 200 SMA disabled (regime owns it)
+- **10.F3b** RSI edge filter: SPY dual macro + earnings blackout (3/2) + liquidity floor + no-new-low
+- **10.F2** Regime Detector: BEAR/VOLATILE/TRENDING/RANGING; SPY bars, TTL-cached; `add_adx()` in technicals
+- **10.F3** Engine regime gating: `StrategySlot.allowed_regimes`; per-slot block in `_run_one_cycle`; exits never blocked
+- **10.F1** Capital sleeve allocator: `SleeveAllocator` in `risk/allocator.py`; 50/50 SMA/RSI; `MAX_GROSS_EXPOSURE_PCT` → 0.80; `notional_cap` threaded into `RiskManager`
+
 Phase 10 remaining blockers before live (see PLAN.md):
 - 10.D1/D2 Slippage kill switch calibration (needs ≥10 real fills)
-- 10.F1–F5 Multi-strategy portfolio layer (capital allocation, regime gating, RSI activation)
-- 10.F3a/F3b SMA + RSI edge filters
+- 10.F4 RSI paper activation (requires F1 ✅ + filter ✅)
+- 10.F5 Portfolio concentration guardrails
 - 10.G2 Hard dollar cap config; 10.G5 Go/no-go verification
 - Minimum 2-week SMA + RSI combined paper run before any live flip
 
-Total: 510 unit tests passing.
+Total: 630 unit tests passing.
 
 **Next steps:**
 1. Let `python forward_test.py` run through next market week (Monday 2026-04-28).
 2. After ≥10 real fills → enable slippage kill switch (10.D1/D2).
-3. Implement SMA edge filter (10.F3a) and RSI edge filter (10.F3b).
-4. Then capital allocation + regime gating (10.F1–F3) + RSI activation (10.F4).
+3. Implement per-strategy capital allocation (10.F1).
+4. Then RSI paper activation (10.F4) + concentration guardrails (10.F5).
 
 ---
 

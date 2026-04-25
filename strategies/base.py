@@ -196,6 +196,13 @@ class StrategySlot:
             Expensive scanners (e.g. screening the entire market) should use
             a longer interval so they don't run every engine cycle.  Defaults
             to 0 (scan every cycle).
+        allowed_regimes: frozenset of MarketRegime values (from regime.detector)
+            that permit new entries for this slot. None = all regimes allowed
+            (legacy / regime-unaware default — entries never blocked by regime).
+            Exits are NEVER blocked regardless of this setting.
+            Typical values:
+              frozenset({MarketRegime.TRENDING, MarketRegime.RANGING})
+              — blocks new entries in BEAR and VOLATILE, allows in bull markets.
     """
 
     strategy: BaseStrategy
@@ -204,6 +211,7 @@ class StrategySlot:
     watchlist_source: "WatchlistSource | None" = None
     scanner: Scanner | None = None
     scan_interval_seconds: float = 0
+    allowed_regimes: "frozenset | None" = None  # frozenset[MarketRegime] | None
 
     # Internal: monotonic timestamp of the last scanner invocation.
     _last_scan_time: float = field(default=0.0, init=False, repr=False)

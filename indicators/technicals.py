@@ -1,15 +1,16 @@
 """
-Technical indicator wrappers (Phase 3).
+Technical indicator wrappers (Phase 3 / Phase 10.F2).
 
-Scope: the minimum set needed for the MVP strategy (SMA crossover, Phase 4) and
-the ATR-based stop-loss in Phase 6 Risk. Indicators are deferred until a
-strategy actually needs them (YAGNI).
+Scope: the minimum set needed for the MVP strategy (SMA crossover, Phase 4),
+the ATR-based stop-loss in Phase 6 Risk, and the Regime Detector (Phase 10.F2).
 
 Currently provided:
-  - add_sma(df, length)   → df with 'sma_{length}'    column appended
-  - add_ema(df, length)   → df with 'ema_{length}'    column appended
-  - add_atr(df, length)   → df with 'atr_{length}'    column appended (Wilder/RMA)
-  - add_rsi(df, length)   → df with 'rsi_{length}'    column appended (Wilder/RMA)
+  - add_sma(df, length)   → df with 'sma_{length}'                 column appended
+  - add_ema(df, length)   → df with 'ema_{length}'                 column appended
+  - add_atr(df, length)   → df with 'atr_{length}'                 column appended (Wilder/RMA)
+  - add_rsi(df, length)   → df with 'rsi_{length}'                 column appended (Wilder/RMA)
+  - add_adx(df, length)   → df with 'adx_{length}', 'plus_di_{length}',
+                                     'minus_di_{length}'           columns appended
 
 Design notes:
   - Every function is pure: it returns a new DataFrame. Inputs are not mutated.
@@ -229,4 +230,92 @@ def add_rsi(
             rsi_values.append(100.0 - 100.0 / (1.0 + rs))
 
     out[col] = pd.Series(rsi_values, index=s.index)
+    return out
+
+
+# ── ADX ──────────────────────────────────────────────────────────────────────
+
+
+def _wilder_rma(series: pd.Series, length: int) -> pd.Series:
+    """
+    Wilder's smoothed moving average (RMA).
+    First value = simple mean of first `length` elements.
+    Subsequent: RMA_t = (RMA_{t-1} * (length - 1) + x_t) / length.
+    Identical to the smoothing used in add_atr().
+    """
+    n = len(series)
+    if n < length:
+        return pd.Series([float("nan")] * n, index=series.index)
+
+    result: list[float] = [float("nan")] * (length - 1)
+    seed = float(series.iloc[:length].mean())
+    result.append(seed)
+    prev = seed
+    for x in series.iloc[length:]:
+        cur = (prev * (length - 1) + float(x)) / length
+        result.append(cur)
+        prev = cur
+    return pd.Series(result, index=series.index)
+
+
+def add_adx(df: pd.DataFrame, length: int = 14) -> pd.DataFrame:
+    """
+    Append Wilder's Average Directional Index and directional indicators.
+
+    New columns:
+      adx_{length}       — trend strength (0–100); ≥25 → trending, <20 → ranging
+      plus_di_{length}   — positive directional indicator
+      minus_di_{length}  — negative directional indicator
+
+    The first (2 * length - 1) ADX values are NaN (length bars needed for
+    smoothed +DM/-DM/TR, then another length bars for the ADX smoothing).
+
+    Algorithm (Wilder, 1978):
+      +DM = max(high - prev_high, 0) when it exceeds -DM, else 0
+      -DM = max(prev_low - low, 0)   when it exceeds +DM, else 0
+      TR  = max(H-L, |H-C_prev|, |L-C_prev|)   (same as add_atr)
+      Smooth +DM, -DM, TR with Wilder's RMA(length)
+      +DI = 100 * smooth(+DM) / smooth(TR)
+      -DI = 100 * smooth(-DM) / smooth(TR)
+      DX  = 100 * |+DI - -DI| / (+DI + -DI)
+      ADX = Wilder's RMA(length) applied to DX
+    """
+    _require_length(length, "ADX")
+    _require_columns(df, OHLC_REQUIRED, "ADX")
+
+    out = df.copy()
+    high  = out["high"]
+    low   = out["low"]
+    close = out["close"]
+
+    # Directional movement (+DM and -DM).
+    up_move   = high.diff()    # high_t - high_{t-1}
+    down_move = -low.diff()    # low_{t-1} - low_t
+
+    plus_dm  = up_move.where((up_move > down_move) & (up_move > 0), 0.0).fillna(0.0)
+    minus_dm = down_move.where((down_move > up_move) & (down_move > 0), 0.0).fillna(0.0)
+
+    # True range (reuse existing helper).
+    tr = _true_range(high, low, close)
+
+    # Wilder smooth all three series.
+    smooth_plus_dm  = _wilder_rma(plus_dm,  length)
+    smooth_minus_dm = _wilder_rma(minus_dm, length)
+    smooth_tr       = _wilder_rma(tr,       length)
+
+    # Directional indicators.
+    plus_di  = 100.0 * smooth_plus_dm  / smooth_tr
+    minus_di = 100.0 * smooth_minus_dm / smooth_tr
+
+    # DX — undefined when +DI + -DI = 0 (flat market); treat as 0.
+    di_sum  = plus_di + minus_di
+    di_diff = (plus_di - minus_di).abs()
+    dx = (100.0 * di_diff / di_sum).where(di_sum > 0, other=0.0)
+
+    # ADX = Wilder RMA of DX.
+    adx = _wilder_rma(dx, length)
+
+    out[f"adx_{length}"]      = adx
+    out[f"plus_di_{length}"]  = plus_di
+    out[f"minus_di_{length}"] = minus_di
     return out

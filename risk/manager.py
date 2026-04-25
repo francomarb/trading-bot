@@ -425,14 +425,19 @@ class RiskManager:
         return signal.reference_price + offset
 
     def _size_position(
-        self, signal: Signal, stop_price: float, account: AccountState
+        self,
+        signal: Signal,
+        stop_price: float,
+        account: AccountState,
+        notional_cap: float | None = None,
     ) -> int:
         """
         Fixed-fractional sizing on stop distance:
             risk_dollars = equity * max_position_pct
             qty          = floor(risk_dollars / |entry - stop|)
         Then capped by per-position notional exposure, remaining
-        gross-exposure budget, and available cash.
+        gross-exposure budget, available cash, and — when provided —
+        the sleeve notional_cap from the SleeveAllocator.
         """
         risk_dollars = account.equity * self.max_position_pct
         stop_distance = abs(signal.reference_price - stop_price)
@@ -443,7 +448,7 @@ class RiskManager:
             return 0
 
         # Cap by per-position notional budget so tight stops do not consume
-        # the whole SMA sleeve.
+        # the whole sleeve in a single position.
         if signal.reference_price > 0:
             max_position_notional = account.equity * self.max_position_notional_pct
             notional_qty_cap = math.floor(
@@ -462,6 +467,18 @@ class RiskManager:
         if signal.side is Side.BUY and signal.reference_price > 0:
             cash_qty_cap = math.floor(max(0.0, account.cash) / signal.reference_price)
             raw_qty = min(raw_qty, cash_qty_cap)
+
+        # Cap by sleeve budget (supplied by SleeveAllocator when active).
+        # This prevents one strategy from consuming another's reserved capital.
+        if notional_cap is not None and signal.reference_price > 0:
+            sleeve_qty_cap = math.floor(notional_cap / signal.reference_price)
+            if sleeve_qty_cap < raw_qty:
+                logger.debug(
+                    f"[{signal.strategy_name}] {signal.symbol}: "
+                    f"qty {raw_qty}→{sleeve_qty_cap} "
+                    f"(sleeve notional_cap=${notional_cap:,.0f})"
+                )
+                raw_qty = sleeve_qty_cap
 
         return max(raw_qty, 0)
 
@@ -488,11 +505,19 @@ class RiskManager:
         signal: Signal,
         account: AccountState,
         *,
+        notional_cap: float | None = None,
         now: datetime | None = None,
     ) -> RiskDecision | RiskRejection:
         """
         Run every gate in order. Returns either a `RiskDecision` (the only
         legitimate input to broker.place_order) or a typed `RiskRejection`.
+
+        Args:
+            notional_cap: Optional upper bound on position notional (market
+                          value = qty × price) supplied by the sleeve allocator.
+                          When provided, sizing is additionally capped so the
+                          new position cannot exceed the strategy's remaining
+                          sleeve budget. Global risk caps remain authoritative.
         """
         now = now or datetime.now(timezone.utc)
 
@@ -611,7 +636,7 @@ class RiskManager:
                 signal,
             )
 
-        qty = self._size_position(signal, stop_price, account)
+        qty = self._size_position(signal, stop_price, account, notional_cap=notional_cap)
 
         # Live-trading size multiplier (10.G1): scale down on first live exposure.
         if settings.LIVE_TRADING and settings.LIVE_SIZE_MULTIPLIER != 1.0:
