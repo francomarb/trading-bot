@@ -168,78 +168,58 @@ python phase2_verify.py
 
 ## Current Phase
 
-**Phases 1–9 complete. Phase 9.5 infrastructure complete. Architecture
-alignment refactoring complete (2026-04-19). Safety review and Phase 10
-redesign complete (2026-04-19).**
+**Phase 10 — In Progress (2026-04-24). Phases 1–9 and 9.5 complete.**
 
 Only **SMA Crossover** is currently active in `forward_test.py`.
-RSI Reversion is implemented and backtested but not yet running. RSI activation is
-now a Phase 10 paper-mode deliverable, not a Phase 11 item.
+RSI Reversion is implemented and backtested but not yet running. RSI activation
+is a Phase 10 paper-mode deliverable (10.F4).
 
-Recent fixes (2026-04-19):
-- Slippage kill switch bug fixed: `modeled_bps` was hardcoded 0; now uses
-  5 bps for MARKET orders (matching backtest), 0 for LIMIT
-- `SLIPPAGE_DRIFT_ENABLED=False` by default; must be enabled before live
-- Position ownership logs on restart; unmanaged symbols emit WARNING
-- `main.py` now delegates to `forward_test.py`
-- Docs corrected: README and architecture.md now say SMA-only is active
+Phase 10 completed to date (2026-04-24):
+- **10.B1** Live config separation (`LIVE_TRADING` flag, separate credentials, `trades_live.db`)
+- **10.B2** Pre-flight checklist (`scripts/preflight.py`)
+- **10.B3** `WatchlistSource` abstraction + `StaticWatchlistSource`; `forward_test.py` wired
+- **10.C1** Durable position ownership restored from trade DB on restart
+- **10.C2** Startup reconciliation with NORMAL / RESTRICTED fail-safe modes
+- **10.C3/C4** Tests + external-close detection with 3-cycle confirmation window
+- **10.E1** WebSocket order/fill streaming via `TradingStream` (stream-first, REST fallback)
+- **10.G1** `LIVE_SIZE_MULTIPLIER=0.25` applied in risk manager when live
+- **10.G4** `DRY_RUN` flag — broker logs orders without submitting
 
-Phase 10 pre-live blockers now include:
-- Durable position ownership restored from the trade DB
-- Startup reconciliation with NORMAL / RESTRICTED / HALT fail-safe modes
-- WebSocket order/fill streaming via Alpaca `TradingStream`
-- Fixed per-strategy capital allocation so SMA and RSI cannot consume each other's sleeves
-- Production regime detector and strategy regime gating
-- RSI paper activation with `settings.RSI_WATCHLIST`
-- Minimum 2-week, target 4-week, SMA + RSI Alpaca paper run before any multi-strategy live flip
+Phase 10 remaining blockers before live (see PLAN.md):
+- 10.D1/D2 Slippage kill switch calibration (needs ≥10 real fills)
+- 10.F1–F5 Multi-strategy portfolio layer (capital allocation, regime gating, RSI activation)
+- 10.F3a/F3b SMA + RSI edge filters
+- 10.G2 Hard dollar cap config; 10.G5 Go/no-go verification
+- Minimum 2-week SMA + RSI combined paper run before any live flip
 
-Phase 11 is reserved for advanced follow-on work: optional third strategies, dynamic
-allocation, richer correlation/sector caps, dashboards, health-based throttling, and
-intraday market-data streaming only if intraday strategies exist. Phase 11's optional
-`StockDataStream` work is not the same as Phase 10's mandatory order/fill `TradingStream`.
+Total: 510 unit tests passing.
 
-Total: 357 unit tests passing.
-
-**Next steps (operational — no code):**
-1. Run `python forward_test.py` for 2–4 weeks.
-2. **Manual restart verification** (see below) — do this during the paper run.
-3. After the run: `python scripts/gonogo.py` (exit 0 = GO).
-4. Reconcile paper fills: `Reconciler(strategy, symbols, start, end).run()`.
-5. If GO → execute Phase 10 (see PLAN.md for ordered steps), including RSI paper activation and fixed per-strategy capital allocation.
-6. If NO-GO → return to Phase 5 for strategy re-analysis.
+**Next steps:**
+1. Let `python forward_test.py` run through next market week (Monday 2026-04-28).
+2. After ≥10 real fills → enable slippage kill switch (10.D1/D2).
+3. Implement SMA edge filter (10.F3a) and RSI edge filter (10.F3b).
+4. Then capital allocation + regime gating (10.F1–F3) + RSI activation (10.F4).
 
 ---
 
-## Manual Restart Verification (Phase 9.5 operational gate)
+## Manual Restart Verification (Phase 10 operational gate — completed 2026-04-24)
 
-Do this once during the paper run while at least one position is open.
+Verified live with MU + NVDA open. Both restored from trade DB record; NORMAL
+mode confirmed. Expected startup log pattern for reference:
 
-**Steps:**
-1. Confirm a position is open: check Alpaca paper dashboard or `broker.get_positions()`.
-2. Stop the bot: `tmux send-keys -t bot C-c` (wait for clean shutdown log).
-3. Restart: `python forward_test.py` (or `./start_bot.sh`).
-4. Check startup logs for the ownership block (appears before cycle 1).
-
-**Expected log — position found and assigned:**
+**Position found and assigned from DB:**
 ```
-restart: assigned existing position AAPL → 'sma_crossover' (best-effort slot match)
-engine starting: 1 slot(s) [sma_crossover(13)], 13 unique symbol(s),
-  session_start_equity=$..., open_positions=1, open_orders=1
+restart: assigned existing position MU → 'sma_crossover' (trade DB record)
+engine starting: 1 slot(s) [sma_crossover(16)], 16 unique symbol(s),
+  session_start_equity=$..., open_positions=2, open_orders=2
 ```
 
-**Expected log — position not in any slot (unmanaged):**
+**Position not in any slot (unmanaged):**
 ```
 WARNING | restart: open position TSLA does not belong to any configured slot —
   it will NOT be managed by this engine. Close it manually or add it to a
   strategy's symbol universe.
 ```
-
-**First cycle with an open position should show:**
-```
-[sma_crossover] AAPL: ... position=OPEN 12
-```
-`position=OPEN` confirms the engine sees the position. `entry=False` means no
-duplicate entry will be attempted.
 
 **What to do if you see the WARNING:**
 Close the unmanaged position manually on the Alpaca paper dashboard.

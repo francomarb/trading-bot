@@ -124,7 +124,7 @@ WEEKLY_REPORT_DIR = "logs/weekly_reports"    # Weekly summary markdowns
 JSON_LOG_FILE = "logs/bot.jsonl"            # Structured JSON log sink
 ALERT_LOG_FILE = "logs/alerts.log"          # Dedicated alert log file
 
-# ── Forward-test settings (Phase 9.5) ──────────────────────────────────────
+# ── Forward-test settings (Phase 10) ───────────────────────────────────────
 FORWARD_TEST_DIR = "logs/forward_tests"          # Go/no-go decision docs
 # Divergence gate: if |paper_return - backtest_return| exceeds this, no-go.
 FORWARD_TEST_RETURN_DIVERGENCE_PCT = 0.10        # 10 percentage points

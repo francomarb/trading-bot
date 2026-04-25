@@ -293,7 +293,7 @@ Before committing live capital, ALL of the following must be satisfied:
 
 Run the checker: `python scripts/gonogo.py` (exit code 0 = GO, 1 = NO-GO).
 
-For slow daily-bar strategies such as the SMA-only Phase 9.5 run, 50 closed
+For slow daily-bar strategies such as the SMA-only Phase 10 paper run, 50 closed
 trades may not be attainable in a 2-4 week paper window. In that case,
 forward-test reconciliation and operational stability are stabilization gates.
 The final live-readiness GO/NO-GO gate happens after Phase 10, with both SMA and

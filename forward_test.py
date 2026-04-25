@@ -1,5 +1,5 @@
 """
-Forward-test launcher (Phase 9.5).
+Forward-test launcher (Phase 10).
 
 Starts the trading engine on paper with full reporting wired up for a
 multi-week forward test. Run with:
@@ -82,7 +82,7 @@ def _git_version() -> str:
 
 def main() -> None:
     logger.info("=" * 60)
-    logger.info("Forward Test — Paper Trading (Phase 9.5)")
+    logger.info("Forward Test — Paper Trading (Phase 10)")
     logger.info("=" * 60)
     logger.info(f"bot version: {_git_version()}")
     logger.info(f"python={sys.version.split()[0]} paper={settings.ALPACA_PAPER}")

@@ -90,7 +90,7 @@ Thresholds (from [architecture.md](docs/architecture.md)):
 | Win Rate | > 45% |
 | Avg Win / Avg Loss | > 1.5 |
 
-For the SMA-only Phase 9.5 paper run, 50 closed trades is unlikely on daily bars.
+For the SMA-only Phase 10 paper run, 50 closed trades is unlikely on daily bars.
 Use `backtest/reconcile.py` and operational stability as the primary stabilization
 gates for that run. The final live GO/NO-GO gate is the post-Phase-10 SMA + RSI
 paper run; the 50-trade threshold remains a stricter live-readiness/statistical
@@ -111,12 +111,15 @@ python phase9_verify.py
 
 ## Project Status
 
-- Phases 1-9 complete (data, strategies, backtesting, risk, execution, reporting)
-- Phase 9.5 complete (forward-test infrastructure, reconciliation)
-- Architecture alignment complete (SDK migration, SQLite, metrics, go/no-go)
-- Currently running paper trading (SMA crossover only) — stabilization and reconciliation before Phase 10
-- Phase 10 pre-live blockers include durable ownership, startup reconciliation, WebSocket order/fill streaming (`TradingStream`), fixed per-strategy capital allocation, regime gating, and RSI paper activation
-- RSI Reversion implemented and backtested; it activates in Phase 10 paper mode with `settings.RSI_WATCHLIST`, strategy-specific allocation, and a mandatory 2-4 week SMA + RSI paper validation window before live
+- Phases 1–9 and 9.5 complete (data, strategies, backtesting, risk, execution, reporting, reconciliation)
+- **Phase 10 in progress** — live-readiness hardening (510 tests passing)
+  - ✅ Live config separation, pre-flight checklist, WatchlistSource abstraction
+  - ✅ Durable position ownership from trade DB, startup reconciliation, external-close detection
+  - ✅ WebSocket order/fill streaming via `TradingStream` (stream-first, REST fallback)
+  - ✅ `LIVE_SIZE_MULTIPLIER`, `DRY_RUN` mode
+  - ⬜ Slippage kill switch calibration (needs ≥10 real fills)
+  - ⬜ SMA + RSI edge filters, capital allocation, regime gating, RSI paper activation
+- Currently running SMA crossover paper trading; RSI activates after Phase 10 portfolio layer is complete
 
 ## Environment Variables
 
