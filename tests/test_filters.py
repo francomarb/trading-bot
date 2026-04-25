@@ -3,12 +3,11 @@ Unit tests for strategies/filters/ (Phase 10.F3a + 10.F3b).
 
 Tests cover:
   - SPYTrendFilter: SPY above/below SMA, multiple windows, fetch failure,
-    NaN SMA, cache reuse, fail-open defaults.
+    NaN SMA, cache reuse, fail-open defaults, fetch-failure rate-limiting.
   - EarningsBlackout: within/outside blackout window, set_symbol, yfinance
     failure graceful degradation, caching, edge cases.
-  - SMAEdgeFilter: combined gate, set_symbol routing, each sub-gate independently.
-  - RSIEdgeFilter: all three gates, each independently, stock SMA from df,
-    NaN SMA treatment, observability log presence.
+  - SMAEdgeFilter: SPY-only gate (no earnings blackout).
+  - RSIEdgeFilter: SPY dual-SMA gate + earnings blackout; observability logs.
   - BaseStrategy integration: symbol passed through generate_signals → set_symbol.
 
 No real network calls. All external dependencies (fetch_symbol, yfinance) are
@@ -100,6 +99,16 @@ class TestSPYTrendFilter:
         with patch("data.fetcher.fetch_symbol", side_effect=Exception("timeout")):
             gate = f(_symbol_df([100.0] * 3))
         assert gate.all()  # no cache → fail open
+
+    def test_fetch_failure_advances_cache_time_to_rate_limit(self):
+        """After a failed fetch, cache_time is updated so we don't retry every cycle."""
+        import time as _time
+        f = SPYTrendFilter(sma_windows=[200], cache_ttl_seconds=60)
+        before = _time.monotonic()
+        with patch("data.fetcher.fetch_symbol", side_effect=Exception("down")):
+            f(_symbol_df([100.0] * 3))
+        # cache_time must have advanced to (approximately) now
+        assert f._cache_time >= before
 
     def test_fetch_failure_returns_stale_cache(self):
         spy = _spy_df(list(range(1, 211)))  # rising → allowed
@@ -260,69 +269,58 @@ def _today_df(n: int = 5) -> pd.DataFrame:
 
 
 class TestSMAEdgeFilter:
+    """SMAEdgeFilter: SPY > 200SMA only — no earnings blackout."""
+
     def _spy_allows(self, f: SMAEdgeFilter) -> None:
-        """Patch the internal SPY filter to always allow."""
         f._spy_filter._spy_cache = _spy_df(list(range(1, 211)))
         f._spy_filter._cache_time = float("inf")
 
     def _spy_blocks(self, f: SMAEdgeFilter) -> None:
-        """Patch the internal SPY filter to always block."""
         f._spy_filter._spy_cache = _spy_df(list(range(210, 0, -1)))
         f._spy_filter._cache_time = float("inf")
 
-    def test_both_gates_clear_returns_true(self):
-        f = SMAEdgeFilter(days_before=5, days_after=2)
-        f.set_symbol("AAPL")
+    def test_spy_above_sma_allows(self):
+        f = SMAEdgeFilter()
         self._spy_allows(f)
-        f._earnings._cache["AAPL"] = (datetime.date.today(), [])
-        gate = f(_today_df())
+        gate = f(_symbol_df([100.0] * 5))
         assert gate.all()
 
-    def test_spy_blocked_returns_false(self):
+    def test_spy_below_sma_blocks(self):
         f = SMAEdgeFilter()
-        f.set_symbol("AAPL")
         self._spy_blocks(f)
-        f._earnings._cache["AAPL"] = (datetime.date.today(), [])
-        gate = f(_today_df())
+        gate = f(_symbol_df([100.0] * 5))
         assert not gate.any()
 
-    def test_earnings_blackout_returns_false(self):
-        f = SMAEdgeFilter(days_before=5, days_after=2)
-        f.set_symbol("AAPL")
-        self._spy_allows(f)
-        tomorrow = datetime.date.today() + datetime.timedelta(days=1)
-        f._earnings._cache["AAPL"] = (datetime.date.today(), [tomorrow])
-        gate = f(_today_df())
-        assert not gate.any()
-
-    def test_both_blocked_returns_false(self):
+    def test_no_earnings_attribute(self):
+        """Earnings blackout must not exist on SMAEdgeFilter."""
         f = SMAEdgeFilter()
-        f.set_symbol("AAPL")
-        self._spy_blocks(f)
-        tomorrow = datetime.date.today() + datetime.timedelta(days=1)
-        f._earnings._cache["AAPL"] = (datetime.date.today(), [tomorrow])
-        gate = f(_today_df())
-        assert not gate.any()
+        assert not hasattr(f, "_earnings")
 
-    def test_set_symbol_routes_to_earnings(self):
+    def test_no_set_symbol_needed(self):
+        """SMAEdgeFilter has no set_symbol — it is not symbol-aware."""
         f = SMAEdgeFilter()
-        f.set_symbol("MU")
-        assert f._earnings._symbol == "MU"
+        assert not hasattr(f, "set_symbol")
 
     def test_gate_series_aligned_to_df(self):
         f = SMAEdgeFilter()
-        f.set_symbol("AAPL")
         self._spy_allows(f)
-        f._earnings._cache["AAPL"] = (datetime.date.today(), [])
-        df = _today_df(8)
+        df = _symbol_df([100.0] * 8)
         gate = f(df)
         assert list(gate.index) == list(df.index)
+
+    def test_fetch_failure_allows(self):
+        f = SMAEdgeFilter()
+        with patch("data.fetcher.fetch_symbol", side_effect=Exception("down")):
+            gate = f(_symbol_df([100.0] * 5))
+        assert gate.all()  # fail open
 
 
 # ── TestRSIEdgeFilter ─────────────────────────────────────────────────────────
 
 
 class TestRSIEdgeFilter:
+    """RSIEdgeFilter: SPY > 200SMA AND SPY > 50SMA AND not near earnings."""
+
     def _spy_allows(self, f: RSIEdgeFilter) -> None:
         f._spy_filter._spy_cache = _spy_df(list(range(1, 211)))
         f._spy_filter._cache_time = float("inf")
@@ -335,68 +333,87 @@ class TestRSIEdgeFilter:
         f = RSIEdgeFilter()
         f.set_symbol("MU")
         self._spy_allows(f)
-        # Rising stock: close > SMA50
-        closes = list(range(1, 56))  # 1..55 → last close=55, SMA50=28
-        df = _symbol_df(closes)
-        gate = f(df)
+        f._earnings._cache["MU"] = (datetime.date.today(), [])  # no earnings
+        gate = f(_today_df())
         assert gate.iloc[-1]
 
     def test_spy_gate_fails_returns_false(self):
         f = RSIEdgeFilter()
         f.set_symbol("MU")
         self._spy_blocks(f)
-        closes = list(range(1, 56))
-        gate = f(_symbol_df(closes))
+        f._earnings._cache["MU"] = (datetime.date.today(), [])
+        gate = f(_today_df())
         assert not gate.iloc[-1]
 
-    def test_stock_below_sma50_returns_false(self):
-        f = RSIEdgeFilter()
+    def test_earnings_blackout_blocks(self):
+        """Entry blocked when within earnings window, even if SPY is fine."""
+        f = RSIEdgeFilter(days_before=3, days_after=1)
         f.set_symbol("MU")
         self._spy_allows(f)
-        # Falling stock: close < SMA50
-        closes = list(range(55, 0, -1))  # 55..1 → last close=1, SMA50 ~28
-        gate = f(_symbol_df(closes))
+        tomorrow = datetime.date.today() + datetime.timedelta(days=1)
+        f._earnings._cache["MU"] = (datetime.date.today(), [tomorrow])
+        gate = f(_today_df())
         assert not gate.iloc[-1]
 
-    def test_stock_nan_sma_allows(self):
-        f = RSIEdgeFilter()
+    def test_earnings_far_away_allows(self):
+        f = RSIEdgeFilter(days_before=3, days_after=1)
         f.set_symbol("MU")
         self._spy_allows(f)
-        # Only 5 bars → SMA50 is NaN → fail open
-        closes = [100.0, 101.0, 102.0, 103.0, 104.0]
-        gate = f(_symbol_df(closes))
+        far = datetime.date.today() + datetime.timedelta(days=30)
+        f._earnings._cache["MU"] = (datetime.date.today(), [far])
+        gate = f(_today_df())
         assert gate.iloc[-1]
 
-    def test_set_symbol_stored(self):
+    def test_both_spy_and_earnings_blocked(self):
+        f = RSIEdgeFilter()
+        f.set_symbol("MU")
+        self._spy_blocks(f)
+        tomorrow = datetime.date.today() + datetime.timedelta(days=1)
+        f._earnings._cache["MU"] = (datetime.date.today(), [tomorrow])
+        gate = f(_today_df())
+        assert not gate.iloc[-1]
+
+    def test_no_stock_sma_attribute(self):
+        """Stock-level 50 SMA gate must not exist on RSIEdgeFilter."""
+        f = RSIEdgeFilter()
+        assert not hasattr(f, "_stock_sma_window")
+        assert not hasattr(f, "_stock_above_sma")
+
+    def test_set_symbol_routes_to_earnings(self):
         f = RSIEdgeFilter()
         f.set_symbol("CDNS")
         assert f._symbol == "CDNS"
+        assert f._earnings._symbol == "CDNS"
 
     def test_gate_series_aligned_to_df(self):
         f = RSIEdgeFilter()
         f.set_symbol("MU")
         self._spy_allows(f)
-        closes = list(range(1, 56))
-        df = _symbol_df(closes)
+        f._earnings._cache["MU"] = (datetime.date.today(), [])
+        df = _today_df(8)
         gate = f(df)
         assert list(gate.index) == list(df.index)
 
     def test_spy_windows_both_required(self):
-        """Both SPY 200SMA and 50SMA must pass. Mock SPYTrendFilter._check directly."""
+        """Both SPY 200SMA and 50SMA must pass."""
         f = RSIEdgeFilter()
         f.set_symbol("MU")
-        closes = list(range(1, 56))
-        df = _symbol_df(closes)
+        f._earnings._cache["MU"] = (datetime.date.today(), [])
+        df = _today_df()
 
-        # SPY allows (both windows clear)
         with patch.object(f._spy_filter, "_check", return_value=(True, "ok")):
             gate = f(df)
             assert gate.iloc[-1]
 
-        # SPY blocks
         with patch.object(f._spy_filter, "_check", return_value=(False, "SPY below 50SMA")):
             gate = f(df)
             assert not gate.iloc[-1]
+
+    def test_days_before_after_defaults(self):
+        """Default blackout window is 3 days before, 1 day after."""
+        f = RSIEdgeFilter()
+        assert f._earnings._days_before == 3
+        assert f._earnings._days_after == 1
 
 
 # ── TestBaseStrategySymbolInjection ───────────────────────────────────────────

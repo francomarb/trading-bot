@@ -87,8 +87,11 @@ class SPYTrendFilter:
         except Exception as e:
             logger.warning(
                 f"SPYTrendFilter: failed to fetch SPY bars — {e}. "
-                "Defaulting to ALLOW (fail open)."
+                "Defaulting to ALLOW (fail open). Will retry after TTL."
             )
+            # Advance cache_time so we don't hammer the API (and spam logs)
+            # on every engine cycle during an outage — retry after full TTL.
+            self._cache_time = now
             return self._spy_cache  # may be None (first failure) or stale
 
     def _check(self) -> tuple[bool, str]:
