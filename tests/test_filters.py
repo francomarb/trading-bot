@@ -295,45 +295,45 @@ def _rising_df(n: int, *, with_volume: bool = True, vol_expanding: bool = True) 
 
 
 class TestSMAEdgeFilter:
-    """SMAEdgeFilter: SPY>200SMA AND stock>200SMA AND volume expanding."""
+    """
+    SMAEdgeFilter: stock > 200SMA AND volume expanding.
 
-    def _spy_allows(self, f: SMAEdgeFilter) -> None:
-        f._spy_filter._spy_cache = _spy_df(list(range(1, 211)))
-        f._spy_filter._cache_time = float("inf")
+    SPY > 200 SMA gate is INTENTIONALLY DISABLED — delegated to RegimeDetector
+    (BEAR regime, universal gate enforced at engine level). Tests document this
+    delegation. If the SPY gate is ever re-enabled, restore _spy_allows /
+    _spy_blocks helpers and flip test_spy_below_sma_does_not_block_here back.
+    """
 
-    def _spy_blocks(self, f: SMAEdgeFilter) -> None:
-        f._spy_filter._spy_cache = _spy_df(list(range(210, 0, -1)))
-        f._spy_filter._cache_time = float("inf")
+    # ── SPY gate delegation ───────────────────────────────────────────────────
 
-    # ── SPY gate ─────────────────────────────────────────────────────────────
-
-    def test_spy_above_sma_allows(self):
-        """SPY fine, stock/vol insufficient history → fail open → allowed."""
+    def test_spy_gate_disabled_no_spy_filter_attribute(self):
+        """_spy_filter must not exist while the gate is disabled."""
         f = SMAEdgeFilter()
-        self._spy_allows(f)
+        assert not hasattr(f, "_spy_filter")
+
+    def test_spy_below_sma_does_not_block_here(self):
+        """
+        SPY below 200 SMA must NOT block SMAEdgeFilter — that veto belongs to
+        RegimeDetector. With insufficient stock/vol history both fail open so
+        the filter allows regardless of SPY state.
+        """
+        f = SMAEdgeFilter()
+        # 5 bars → stock SMA NaN → fail open, vol NaN → fail open → allowed
         gate = f(_symbol_df([100.0] * 5))
         assert gate.all()
-
-    def test_spy_below_sma_blocks(self):
-        f = SMAEdgeFilter()
-        self._spy_blocks(f)
-        gate = f(_symbol_df([100.0] * 5))
-        assert not gate.any()
 
     # ── Stock 200 SMA gate ───────────────────────────────────────────────────
 
     def test_stock_above_200sma_allows(self):
-        """Rising stock > 200 SMA, SPY fine, volume fine → allowed."""
+        """Rising stock > 200 SMA with expanding volume → allowed."""
         f = SMAEdgeFilter(stock_sma_window=200, vol_short_window=10, vol_long_window=30)
-        self._spy_allows(f)
         df = _rising_df(210, vol_expanding=True)
         gate = f(df)
         assert gate.iloc[-1]
 
     def test_stock_below_200sma_blocks(self):
-        """Falling stock below its 200 SMA → blocked even if SPY is fine."""
+        """Falling stock below its 200 SMA → blocked."""
         f = SMAEdgeFilter(stock_sma_window=200, vol_short_window=10, vol_long_window=30)
-        self._spy_allows(f)
         closes = list(range(210, 0, -1))   # falling: last close=1, SMA200 ≈ 105
         idx = pd.date_range("2020-01-01", periods=210, freq="B")
         volumes = list(range(1_000, 1_000 + 210 * 100, 100))  # expanding vol
@@ -348,7 +348,6 @@ class TestSMAEdgeFilter:
     def test_stock_nan_200sma_fails_open(self):
         """Fewer than 200 bars → SMA is NaN → fail open (allow)."""
         f = SMAEdgeFilter(stock_sma_window=200)
-        self._spy_allows(f)
         gate = f(_symbol_df([100.0] * 10))
         assert gate.all()
 
@@ -356,8 +355,6 @@ class TestSMAEdgeFilter:
 
     def test_volume_expanding_allows(self):
         f = SMAEdgeFilter(stock_sma_window=5, vol_short_window=3, vol_long_window=5)
-        self._spy_allows(f)
-        # Short avg (last 3) > long avg (last 5) when volume is ramping up
         df = pd.DataFrame(
             {"close": [10, 11, 12, 13, 14, 15, 16],
              "volume": [100, 100, 100, 100, 200, 300, 400]},
@@ -368,8 +365,6 @@ class TestSMAEdgeFilter:
 
     def test_volume_contracting_blocks(self):
         f = SMAEdgeFilter(stock_sma_window=5, vol_short_window=3, vol_long_window=5)
-        self._spy_allows(f)
-        # Short avg < long avg when volume is decaying
         df = pd.DataFrame(
             {"close": [10, 11, 12, 13, 14, 15, 16],
              "volume": [400, 300, 200, 100, 50, 30, 10]},
@@ -379,31 +374,26 @@ class TestSMAEdgeFilter:
         assert not gate.iloc[-1]
 
     def test_no_volume_column_fails_open(self):
-        """If volume is missing from bar data → fail open (allow).
-        Uses default stock_sma_window=200 so stock SMA is also NaN (fail open)."""
-        f = SMAEdgeFilter()  # stock_sma_window=200; 10 bars → NaN → fail open
-        self._spy_allows(f)
+        """No volume column → fail open. stock_sma_window=200 also NaN → open."""
+        f = SMAEdgeFilter()
         df = pd.DataFrame(
-            {"close": [10.0] * 10},   # no volume column
+            {"close": [10.0] * 10},
             index=pd.date_range("2020-01-01", periods=10, freq="B"),
         )
         gate = f(df)
         assert gate.all()
 
     def test_volume_nan_fails_open(self):
-        """Fewer bars than vol_long_window → NaN avg → fail open.
-        Uses default stock_sma_window=200 so stock SMA is also NaN (fail open)."""
+        """Fewer bars than vol_long_window → NaN avg → fail open."""
         f = SMAEdgeFilter(vol_short_window=10, vol_long_window=30)
-        self._spy_allows(f)
-        # 5 bars: need 200 for stock SMA (NaN→open) and 30 for vol avg (NaN→open)
         gate = f(_symbol_df([100.0] * 5))
         assert gate.all()
 
     # ── Combined / structural ────────────────────────────────────────────────
 
-    def test_all_three_gates_pass(self):
+    def test_both_active_gates_pass(self):
+        """Both stock SMA and volume gates clear → allowed."""
         f = SMAEdgeFilter(stock_sma_window=10, vol_short_window=3, vol_long_window=5)
-        self._spy_allows(f)
         df = pd.DataFrame(
             {"close":  [10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20],
              "volume": [100, 100, 100, 100, 100, 100, 200, 200, 300, 300, 400]},
@@ -422,16 +412,9 @@ class TestSMAEdgeFilter:
 
     def test_gate_series_aligned_to_df(self):
         f = SMAEdgeFilter()
-        self._spy_allows(f)
         df = _symbol_df([100.0] * 8)
         gate = f(df)
         assert list(gate.index) == list(df.index)
-
-    def test_fetch_failure_allows(self):
-        f = SMAEdgeFilter()
-        with patch("data.fetcher.fetch_symbol", side_effect=Exception("down")):
-            gate = f(_symbol_df([100.0] * 5))
-        assert gate.all()
 
 
 # ── TestRSIEdgeFilter ─────────────────────────────────────────────────────────
