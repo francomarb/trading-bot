@@ -100,7 +100,9 @@ DRY_RUN: bool = os.getenv("DRY_RUN", "false").lower() in ("true", "1", "yes")
 # ── Engine settings (Phase 8 / 10) ──────────────────────────────────────────
 ATR_LENGTH = 14                     # ATR window the engine uses for stops
 ENGINE_TIMEFRAME = "1Day"           # Bar timeframe for the live loop
-ENGINE_HISTORY_LOOKBACK_DAYS = 200  # How much history to keep loaded per cycle
+ENGINE_HISTORY_LOOKBACK_DAYS = 300  # Calendar days of stock history per cycle.
+                                    # 300 cd ≈ 206 trading days — required by
+                                    # SMAEdgeFilter's stock 200-day SMA gate.
 ENGINE_CYCLE_INTERVAL_SECONDS = 300 # 5 min between cycles for daily strategy
 ENGINE_MAX_BAR_AGE_MULTIPLIER = 2.5 # Stale guard: refuse to trade if last bar
                                     # is older than (bar_interval × multiplier)

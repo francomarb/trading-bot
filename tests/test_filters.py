@@ -188,21 +188,26 @@ class TestEarningsBlackout:
         assert f(df).all()
 
     def test_exactly_at_days_before_boundary_blocks(self):
-        edge = datetime.date.today() + datetime.timedelta(days=5)  # days_before=5
-        f = self._filter([edge], days_before=5)
+        # Anchor offset to the actual last bar date so the test is
+        # robust whether today is a weekday or weekend.
         df = self._df_on(datetime.date.today())
+        last_bar = df.index[-1].date()
+        edge = last_bar + datetime.timedelta(days=5)   # days_before=5
+        f = self._filter([edge], days_before=5)
         assert not f(df).any()
 
     def test_exactly_at_days_after_boundary_blocks(self):
-        edge = datetime.date.today() - datetime.timedelta(days=2)  # days_after=2
-        f = self._filter([edge], days_after=2)
         df = self._df_on(datetime.date.today())
+        last_bar = df.index[-1].date()
+        edge = last_bar - datetime.timedelta(days=2)   # days_after=2
+        f = self._filter([edge], days_after=2)
         assert not f(df).any()
 
     def test_one_day_outside_window_allows(self):
-        outside = datetime.date.today() + datetime.timedelta(days=6)  # days_before=5
-        f = self._filter([outside], days_before=5)
         df = self._df_on(datetime.date.today())
+        last_bar = df.index[-1].date()
+        outside = last_bar + datetime.timedelta(days=6)  # one beyond days_before=5
+        f = self._filter([outside], days_before=5)
         assert f(df).all()
 
     def test_no_earnings_dates_allows(self):
@@ -268,8 +273,29 @@ def _today_df(n: int = 5) -> pd.DataFrame:
     )
 
 
+def _rising_df(n: int, *, with_volume: bool = True, vol_expanding: bool = True) -> pd.DataFrame:
+    """
+    Synthetic df with `n` bars of rising closes.
+    Volume alternates expanding (short avg > long avg) or contracting.
+    """
+    closes = list(range(1, n + 1))
+    idx = pd.date_range("2020-01-01", periods=n, freq="B")
+    if with_volume and vol_expanding:
+        # Volume ramps up steadily — 10-day avg will exceed 30-day avg
+        volumes = list(range(1_000, 1_000 + n * 100, 100))
+    elif with_volume:
+        # Volume ramps down — 10-day avg will be below 30-day avg
+        volumes = list(range(1_000 + n * 100, 1_000, -100))
+    else:
+        volumes = [1_000] * n
+    data: dict = {"close": closes, "open": closes, "high": closes, "low": closes}
+    if with_volume:
+        data["volume"] = volumes
+    return pd.DataFrame(data, index=idx)
+
+
 class TestSMAEdgeFilter:
-    """SMAEdgeFilter: SPY > 200SMA only — no earnings blackout."""
+    """SMAEdgeFilter: SPY>200SMA AND stock>200SMA AND volume expanding."""
 
     def _spy_allows(self, f: SMAEdgeFilter) -> None:
         f._spy_filter._spy_cache = _spy_df(list(range(1, 211)))
@@ -279,7 +305,10 @@ class TestSMAEdgeFilter:
         f._spy_filter._spy_cache = _spy_df(list(range(210, 0, -1)))
         f._spy_filter._cache_time = float("inf")
 
+    # ── SPY gate ─────────────────────────────────────────────────────────────
+
     def test_spy_above_sma_allows(self):
+        """SPY fine, stock/vol insufficient history → fail open → allowed."""
         f = SMAEdgeFilter()
         self._spy_allows(f)
         gate = f(_symbol_df([100.0] * 5))
@@ -291,15 +320,105 @@ class TestSMAEdgeFilter:
         gate = f(_symbol_df([100.0] * 5))
         assert not gate.any()
 
-    def test_no_earnings_attribute(self):
-        """Earnings blackout must not exist on SMAEdgeFilter."""
-        f = SMAEdgeFilter()
-        assert not hasattr(f, "_earnings")
+    # ── Stock 200 SMA gate ───────────────────────────────────────────────────
 
-    def test_no_set_symbol_needed(self):
-        """SMAEdgeFilter has no set_symbol — it is not symbol-aware."""
+    def test_stock_above_200sma_allows(self):
+        """Rising stock > 200 SMA, SPY fine, volume fine → allowed."""
+        f = SMAEdgeFilter(stock_sma_window=200, vol_short_window=10, vol_long_window=30)
+        self._spy_allows(f)
+        df = _rising_df(210, vol_expanding=True)
+        gate = f(df)
+        assert gate.iloc[-1]
+
+    def test_stock_below_200sma_blocks(self):
+        """Falling stock below its 200 SMA → blocked even if SPY is fine."""
+        f = SMAEdgeFilter(stock_sma_window=200, vol_short_window=10, vol_long_window=30)
+        self._spy_allows(f)
+        closes = list(range(210, 0, -1))   # falling: last close=1, SMA200 ≈ 105
+        idx = pd.date_range("2020-01-01", periods=210, freq="B")
+        volumes = list(range(1_000, 1_000 + 210 * 100, 100))  # expanding vol
+        df = pd.DataFrame(
+            {"close": closes, "open": closes, "high": closes,
+             "low": closes, "volume": volumes},
+            index=idx,
+        )
+        gate = f(df)
+        assert not gate.iloc[-1]
+
+    def test_stock_nan_200sma_fails_open(self):
+        """Fewer than 200 bars → SMA is NaN → fail open (allow)."""
+        f = SMAEdgeFilter(stock_sma_window=200)
+        self._spy_allows(f)
+        gate = f(_symbol_df([100.0] * 10))
+        assert gate.all()
+
+    # ── Volume expansion gate ────────────────────────────────────────────────
+
+    def test_volume_expanding_allows(self):
+        f = SMAEdgeFilter(stock_sma_window=5, vol_short_window=3, vol_long_window=5)
+        self._spy_allows(f)
+        # Short avg (last 3) > long avg (last 5) when volume is ramping up
+        df = pd.DataFrame(
+            {"close": [10, 11, 12, 13, 14, 15, 16],
+             "volume": [100, 100, 100, 100, 200, 300, 400]},
+            index=pd.date_range("2020-01-01", periods=7, freq="B"),
+        )
+        gate = f(df)
+        assert gate.iloc[-1]
+
+    def test_volume_contracting_blocks(self):
+        f = SMAEdgeFilter(stock_sma_window=5, vol_short_window=3, vol_long_window=5)
+        self._spy_allows(f)
+        # Short avg < long avg when volume is decaying
+        df = pd.DataFrame(
+            {"close": [10, 11, 12, 13, 14, 15, 16],
+             "volume": [400, 300, 200, 100, 50, 30, 10]},
+            index=pd.date_range("2020-01-01", periods=7, freq="B"),
+        )
+        gate = f(df)
+        assert not gate.iloc[-1]
+
+    def test_no_volume_column_fails_open(self):
+        """If volume is missing from bar data → fail open (allow).
+        Uses default stock_sma_window=200 so stock SMA is also NaN (fail open)."""
+        f = SMAEdgeFilter()  # stock_sma_window=200; 10 bars → NaN → fail open
+        self._spy_allows(f)
+        df = pd.DataFrame(
+            {"close": [10.0] * 10},   # no volume column
+            index=pd.date_range("2020-01-01", periods=10, freq="B"),
+        )
+        gate = f(df)
+        assert gate.all()
+
+    def test_volume_nan_fails_open(self):
+        """Fewer bars than vol_long_window → NaN avg → fail open.
+        Uses default stock_sma_window=200 so stock SMA is also NaN (fail open)."""
+        f = SMAEdgeFilter(vol_short_window=10, vol_long_window=30)
+        self._spy_allows(f)
+        # 5 bars: need 200 for stock SMA (NaN→open) and 30 for vol avg (NaN→open)
+        gate = f(_symbol_df([100.0] * 5))
+        assert gate.all()
+
+    # ── Combined / structural ────────────────────────────────────────────────
+
+    def test_all_three_gates_pass(self):
+        f = SMAEdgeFilter(stock_sma_window=10, vol_short_window=3, vol_long_window=5)
+        self._spy_allows(f)
+        df = pd.DataFrame(
+            {"close":  [10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20],
+             "volume": [100, 100, 100, 100, 100, 100, 200, 200, 300, 300, 400]},
+            index=pd.date_range("2020-01-01", periods=11, freq="B"),
+        )
+        gate = f(df)
+        assert gate.iloc[-1]
+
+    def test_no_earnings_attribute(self):
+        assert not hasattr(SMAEdgeFilter(), "_earnings")
+
+    def test_set_symbol_stored(self):
         f = SMAEdgeFilter()
-        assert not hasattr(f, "set_symbol")
+        f.set_symbol("MU")
+        assert f._symbol == "MU"
 
     def test_gate_series_aligned_to_df(self):
         f = SMAEdgeFilter()
@@ -312,7 +431,7 @@ class TestSMAEdgeFilter:
         f = SMAEdgeFilter()
         with patch("data.fetcher.fetch_symbol", side_effect=Exception("down")):
             gate = f(_symbol_df([100.0] * 5))
-        assert gate.all()  # fail open
+        assert gate.all()
 
 
 # ── TestRSIEdgeFilter ─────────────────────────────────────────────────────────
