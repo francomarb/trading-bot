@@ -50,12 +50,11 @@ RSI_WATCHLIST = [
     "ALLY", "CDNS", "KBE", "SN", "DINO", "BA", "TFC",
 ]
 # Full engine universe — union of both lists; preserves paper-run continuity.
-# NOTE: RIVN is included here but not in either strategy list — review before Phase 10.
 #
 # IMPORTANT: When adding new symbols to any of these watchlists, remember to also
 # map them to their corresponding Sector ETF in `scripts/post_mortem.py`'s 
 # SECTOR_MAP dictionary to ensure proper Relative Strength diagnostic reporting.
-WATCHLIST = list(dict.fromkeys(SMA_WATCHLIST + RSI_WATCHLIST + ["RIVN"]))
+WATCHLIST = list(dict.fromkeys(SMA_WATCHLIST + RSI_WATCHLIST))
 
 # ── Capital allocation (Phase 10.F1) ────────────────────────────────────────
 # Per-strategy sleeve budgets. Each entry maps strategy_name →

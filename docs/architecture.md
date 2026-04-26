@@ -115,10 +115,15 @@ trading-bot/
 │
 ├── scripts/
 │   ├── __init__.py
-│   ├── preflight.py           # Pre-flight checklist (must exit 0 before live flip)
 │   ├── gonogo.py              # Go/no-go checker for live readiness
-│   └── *.py                   # Watchlist scanners and candidate analysis scripts
-│
+│   ├── post_mortem.py         # Post-trade diagnostic reporting (RS, MA trends)
+│   ├── preflight.py           # Pre-flight checklist (must exit 0 before live flip)
+│   ├── rsi_backtest_report.py # Backtest reporter for RSI candidates
+│   ├── rsi_candidate_post_analysis.py # RSI guardrail evaluation (Drawdown, Profit Factor)
+│   ├── rsi_candidate_validate.py      # Stage 2 validation for RSI scanner candidates
+│   ├── rsi_watchlist_scan.py  # Stage 1 fundamental screener for RSI targets
+│   ├── sma_watchlist_scan.py  # Trend-following pipeline (Consolidation & Coil ranking)
+│   └── watchlist_review.py    # General fundamental/health strategy-fitness matrix
 ├── tests/
 │   ├── conftest.py            # Shared fixtures (make_ohlcv, tmp_cache_dir, etc.)
 │   ├── test_strategies.py
