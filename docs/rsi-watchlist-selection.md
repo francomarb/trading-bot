@@ -89,7 +89,7 @@ Excluded:
 
 Required:
 
-- market capitalization >= 10,000,000,000
+- market capitalization >= 2,000,000,000
 - latest close >= 10.00
 - 20-day average share volume >= 1,000,000
 - 50-day average dollar volume >= 100,000,000
@@ -143,7 +143,7 @@ report it, but the engine should gate entries at runtime.
 Required:
 
 - close > SMA200
-- close >= 0.80 * 52-week high
+- close >= 0.60 * 52-week high
 - close >= 1.20 * 52-week low
 
 Preferred:
@@ -259,8 +259,8 @@ Current post-analysis guardrails:
 
 - minimum oversold events: 5
 - minimum exact-strategy return: 20%
-- minimum profit factor: 1.50
-- maximum exact-strategy drawdown: -50%
+- minimum profit factor: 1.20
+- maximum exact-strategy drawdown: -65%
 - minimum event hit rate: 35%
 - maximum ATR-stop-failure rate: 35%
 

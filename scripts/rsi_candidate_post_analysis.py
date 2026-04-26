@@ -43,8 +43,8 @@ class PostAnalysisConfig:
 
     min_events: int = 5
     min_strategy_return: float = 0.20
-    min_profit_factor: float = 1.5
-    max_strategy_drawdown: float = -0.50
+    min_profit_factor: float = 1.20
+    max_strategy_drawdown: float = -0.65
     min_event_hit_rate: float = 0.35
     max_stop_rate: float = 0.35
 
@@ -217,7 +217,8 @@ def render_report(
             "## Notes",
             "",
             "- This is post-processing, not a replacement for the RSI scanner.",
-            "- Deep drawdown is penalized heavily because this strategy must survive paper trading before activation.",
+            "- The raw backtest lacks the bot's live Edge Filters (like SPY macro regime), so the max drawdown allowance is intentionally wide (-65%) to account for unprotected bear market exposure.",
+            "- Profit factor minimum is 1.20 because this is an unprotected base strategy; edge filters in live trading will improve this.",
             "- Controls are included to sanity-check whether rejected favorites would accidentally rank well.",
             "- Earnings-date overlay is still not implemented and remains a manual review item.",
         ]

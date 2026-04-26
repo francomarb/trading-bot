@@ -61,7 +61,7 @@ class ScanConfig:
     """Thresholds for the SMA watchlist scanner."""
 
     min_bars: int = 260
-    min_market_cap: float = 10_000_000_000.0
+    min_market_cap: float = 2_000_000_000.0
     min_price: float = 10.0
     min_avg_volume_20: float = 500_000.0
     min_avg_dollar_volume_50: float = 50_000_000.0
@@ -86,6 +86,7 @@ class Candidate:
     close: float
     avg_volume_20: float
     avg_dollar_volume_50: float
+    sma20: float
     sma50: float
     sma150: float
     sma200: float
@@ -291,10 +292,11 @@ def scan_candidates(
     asset_by_symbol = {a.symbol: a for a in assets}
     rejections: Counter[str] = Counter()
     examples: dict[str, list[str]] = defaultdict(list)
-    metrics: dict[str, dict[str, float | int]] = {}
     explanations: dict[str, str] = {}
     explain_symbols = explain_symbols or set()
 
+    # Step 1: Compute metrics for all symbols to establish a global Relative Strength baseline
+    all_metrics: dict[str, dict[str, float | int]] = {}
     for symbol, df in bars_by_symbol.items():
         metric = _compute_metrics(symbol, df, config)
         if metric is None:
@@ -302,24 +304,32 @@ def scan_candidates(
             if symbol in explain_symbols:
                 explanations[symbol] = "Rejected: insufficient_or_bad_bars"
             continue
+        all_metrics[symbol] = metric
 
-        reason = _first_technical_rejection(metric, config)
-        if reason is not None:
-            _reject(symbol, reason, rejections, examples)
-            if symbol in explain_symbols:
-                explanations[symbol] = _format_explanation(symbol, reason, metric, None, config)
-            continue
-        metrics[symbol] = metric
-
-    if not metrics:
+    if not all_metrics:
         for symbol in explain_symbols - set(explanations):
             explanations[symbol] = "No bars returned from Alpaca."
         return [], rejections, examples, explanations
 
+    # Calculate global momentums and percentiles against the whole valid market
     momentums = pd.Series(
-        {symbol: float(metric["momentum_12m_skip_1m"]) for symbol, metric in metrics.items()}
+        {symbol: float(metric["momentum_12m_skip_1m"]) for symbol, metric in all_metrics.items()}
     )
     rs_pct = momentums.rank(pct=True) * 100.0
+
+    # Step 2: Apply technical rejections with global relative strength available
+    metrics: dict[str, dict[str, float | int]] = {}
+    for symbol, metric in all_metrics.items():
+        relative_strength_pct = float(rs_pct[symbol])
+        reason = _first_technical_rejection(metric, config)
+        if reason is not None:
+            _reject(symbol, reason, rejections, examples)
+            if symbol in explain_symbols:
+                explanations[symbol] = _format_explanation(
+                    symbol, reason, metric, relative_strength_pct, config
+                )
+            continue
+        metrics[symbol] = metric
 
     ranked: list[Candidate] = []
     for symbol, metric in metrics.items():
@@ -369,6 +379,7 @@ def scan_candidates(
                 close=float(metric["close"]),
                 avg_volume_20=float(metric["avg_volume_20"]),
                 avg_dollar_volume_50=float(metric["avg_dollar_volume_50"]),
+                sma20=float(metric["sma20"]),
                 sma50=float(metric["sma50"]),
                 sma150=float(metric["sma150"]),
                 sma200=float(metric["sma200"]),
@@ -445,6 +456,7 @@ def _compute_metrics(
 
     return {
         "close": close,
+        "sma20": float(last["sma_20"]),
         "sma50": float(last["sma_50"]),
         "sma150": float(last["sma_150"]),
         "sma200": float(last["sma_200"]),
@@ -572,17 +584,27 @@ def _score_candidate(
     adx_score = min(adx / 50.0, 1.0) * 100.0
     dollar_volume = float(metric["avg_dollar_volume_50"])
     liquidity_score = min(math.log10(max(dollar_volume, 1.0)) / 10.0, 1.0) * 100.0
-    sma200_distance = float(metric["close"]) / float(metric["sma200"]) - 1.0
-    distance_score = max(0.0, min(sma200_distance / 0.50, 1.0)) * 100.0
+    
+    # 1. Consolidation Score: Penalize short-term exhaustion (Price vs SMA50)
+    # Normal distance is 0% to 10%. At >25% above SMA50, it is highly extended.
+    dist_50 = max(0.0, float(metric["close"]) / float(metric["sma50"]) - 1.0)
+    consolidation_score = max(0.0, 1.0 - (dist_50 / 0.25)) * 100.0
+
+    # 2. Freshness Score: Reward tightly coiled moving averages (SMA20 vs SMA50)
+    # Tighter gap means the trend is either fresh or resting, ready for a new leg.
+    coil_gap = abs(float(metric["sma20"]) / float(metric["sma50"]) - 1.0)
+    freshness_score = max(0.0, 1.0 - (coil_gap / 0.10)) * 100.0
+
     smoothness_score = max(0.0, 100.0 - int(metric["crossover_count_1y"]) * 10.0)
     adx_slope_bonus = 5.0 if float(metric["adx14"]) > float(metric["adx14_5d_ago"]) else 0.0
     preferred_adx_bonus = 5.0 if adx >= config.preferred_adx else 0.0
 
     return (
         relative_strength_pct * 0.35
-        + adx_score * 0.25
-        + liquidity_score * 0.15
-        + distance_score * 0.10
+        + adx_score * 0.20
+        + liquidity_score * 0.10
+        + consolidation_score * 0.10
+        + freshness_score * 0.10
         + smoothness_score * 0.15
         + adx_slope_bonus
         + preferred_adx_bonus
@@ -693,6 +715,8 @@ def render_report(
         "- Rising SMA200 avoids long-term downtrends that have only bounced recently.",
         "- 52-week strength keeps the watchlist near leadership instead of damaged recovery names.",
         "- Relative strength requires the stock to be a market leader before SMA is allowed to watch it.",
+        "- Consolidation scoring penalizes parabolic exhaustion by checking price vs the 50-day moving average.",
+        "- Freshness scoring rewards stocks whose 20-day and 50-day moving averages are tightly coiled.",
         "- ADX and +DI/-DI reduce sideways whipsaw risk and require bullish directional pressure.",
         "- ATR sanity rejects names that are too quiet to move or too chaotic for stable trend following.",
         "- Fundamental sanity keeps SMA out of deteriorating or solvency-stressed companies.",

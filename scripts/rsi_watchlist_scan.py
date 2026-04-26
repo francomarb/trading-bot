@@ -55,11 +55,11 @@ class ScanConfig:
     """Thresholds for the RSI watchlist scanner."""
 
     min_bars: int = 260
-    min_market_cap: float = 10_000_000_000.0
+    min_market_cap: float = 2_000_000_000.0
     min_price: float = 10.0
     min_avg_volume_20: float = 1_000_000.0
     min_avg_dollar_volume_50: float = 100_000_000.0
-    min_pct_of_52w_high: float = 0.80
+    min_pct_of_52w_high: float = 0.60
     min_above_52w_low: float = 1.20
     min_atr_pct: float = 0.015
     max_atr_pct: float = 0.07
@@ -321,14 +321,26 @@ def _oversold_reversion_stats(
             continue
 
         events += 1
-        hit = bool((future["rsi_14"] >= config.reversion_threshold).any())
-        if hit:
-            hits += 1
-        returns.append(float(future["close"].iloc[-1] / entry_close - 1.0))
-
         stop_level = entry_close - config.atr_stop_multiplier * entry_atr
-        if bool((future["low"] <= stop_level).any()):
-            stop_failures += 1
+        
+        hit = False
+        stop_breached = False
+        
+        # Evaluate path-dependency day-by-day
+        for _, bar in future.iterrows():
+            if float(bar["low"]) <= stop_level:
+                stop_breached = True
+                stop_failures += 1
+                break  # Stopped out before or on the same day it could revert
+                
+            if float(bar["rsi_14"]) >= config.reversion_threshold:
+                hit = True
+                break  # Successfully reverted!
+
+        if hit and not stop_breached:
+            hits += 1
+            
+        returns.append(float(future["close"].iloc[-1] / entry_close - 1.0))
 
     hit_rate = hits / events if events else 0.0
     avg_return = sum(returns) / len(returns) if returns else 0.0
@@ -507,7 +519,7 @@ def render_report(
         "- Liquidity and market-cap filters keep RSI in names that can absorb limit orders.",
         "- Solvency keeps RSI from buying companies where a sell-off may be terminal.",
         "- Price above SMA200 keeps entries in structurally intact names.",
-        "- 52-week position avoids deep breakdowns while still allowing pullbacks.",
+        "- 52-week position avoids deep breakdowns while allowing deep pullbacks (down to 40% off highs) required for mean-reversion.",
         "- Historical oversold-event behavior measures whether the stock actually mean-reverts.",
         "- ATR and Bollinger width require enough movement for opportunity without chaos.",
         "- One-day and five-day crash filters avoid news shocks and falling knives.",

@@ -28,13 +28,14 @@ ALPACA_BASE_URL = (
 # SMA Crossover — trend-following; static list promoted from:
 #   /Users/franco/trading-bot/scripts/sma_watchlist_scan.py
 #   rule=sma_watchlist_v1, feed=sip, end_delay=60m, fundamentals=True
-#   generated 2026-04-22; report: logs/sma_watchlist_scan_latest.md
-# NVDA is the only non-scanner exception, retained solely for ownership
-# continuity while an open paper position exists. Remove it after the strategy
-# exits if it still fails the scan.
+#   generated 2026-04-26; report: logs/sma_scan_v2.md
+# MU and NVDA are non-scanner exceptions, retained solely for ownership
+# continuity while open paper positions exist. Remove them after the strategy
+# exits if they still fail the scan.
 SMA_WATCHLIST = [
-    "WDC", "CIEN", "GSAT", "STX", "FORM", "COHR", "CLS", "BE",
-    "MTZ", "AMKR", "TER", "DELL", "MPWR", "TIGO", "MU", "NVDA",
+    "TERN", "GOOG", "WT", "GOOGL", "TD", "IYZ", "RY", "MS",
+    "CM", "JAZZ", "BK", "BMO", "WDC", "FIGS", "VLUE",
+    "MU", "NVDA",
 ]
 # RSI Reversion — mean-reversion; static list promoted from:
 #   /Users/franco/trading-bot/scripts/rsi_watchlist_scan.py
@@ -42,14 +43,18 @@ SMA_WATCHLIST = [
 #   /Users/franco/trading-bot/scripts/rsi_candidate_post_analysis.py
 #   scanner_rule=rsi_watchlist_v1, validation_rule=rsi_validation_v1,
 #   post_rule=rsi_post_analysis_v1, feed=sip, end_delay=60m
-#   generated 2026-04-23; report: logs/rsi_candidate_post_analysis_latest.md
+#   generated 2026-04-26; report: logs/rsi_post_analysis_temp_v2.md
 # RSI is implemented but not active in forward_test.py yet. Keep this as the
 # first paper-mode RSI pool unless the post-analysis guardrails are changed.
 RSI_WATCHLIST = [
-    "ALLY", "CDNS", "CCK", "SN", "TFC",
+    "ALLY", "CDNS", "KBE", "SN", "DINO", "BA", "TFC",
 ]
 # Full engine universe — union of both lists; preserves paper-run continuity.
 # NOTE: RIVN is included here but not in either strategy list — review before Phase 10.
+#
+# IMPORTANT: When adding new symbols to any of these watchlists, remember to also
+# map them to their corresponding Sector ETF in `scripts/post_mortem.py`'s 
+# SECTOR_MAP dictionary to ensure proper Relative Strength diagnostic reporting.
 WATCHLIST = list(dict.fromkeys(SMA_WATCHLIST + RSI_WATCHLIST + ["RIVN"]))
 
 # ── Capital allocation (Phase 10.F1) ────────────────────────────────────────

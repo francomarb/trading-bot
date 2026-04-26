@@ -420,7 +420,7 @@ class TestSMAEdgeFilter:
         f = SMAEdgeFilter(stock_sma_window=10, vol_short_window=3, vol_long_window=5)
         df = pd.DataFrame(
             {"close":  [10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20],
-             "volume": [100, 100, 100, 100, 100, 100, 200, 200, 300, 300, 400]},
+             "volume": [100, 100, 100, 100, 100, 100, 100, 200, 300, 400, 500]},
             index=pd.date_range("2020-01-01", periods=11, freq="B"),
         )
         gate = f(df)

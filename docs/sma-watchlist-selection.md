@@ -170,7 +170,7 @@ Excluded:
 
 Required:
 
-- market capitalization >= 10,000,000,000
+- market capitalization >= 2,000,000,000
 - latest close >= 10.00
 - 20-day average share volume >= 500,000
 - 50-day average dollar volume >= 50,000,000
@@ -302,11 +302,12 @@ If more symbols pass than the target list size allows, rank survivors.
 Recommended ranking inputs:
 
 1. relative strength percentile
-2. ADX14 level and slope
-3. 50-day average dollar volume
-4. distance above rising SMA200
-5. trend smoothness, measured by fewer 20/50 crossovers over the last year
-6. sector diversification
+2. Consolidation Score (penalizes parabolic exhaustion above SMA50)
+3. Freshness / Coil Score (rewards tightness between SMA20 and SMA50)
+4. ADX14 level and slope
+5. 50-day average dollar volume
+6. trend smoothness, measured by fewer 20/50 crossovers over the last year
+7. sector diversification
 
 Do not rank by recent one-day price jump alone.
 

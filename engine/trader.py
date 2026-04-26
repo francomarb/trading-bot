@@ -508,7 +508,7 @@ class TradingEngine:
         # 2. Freshness gate.
         max_bar_age = _BAR_INTERVAL[timeframe] * self.config.max_bar_age_multiplier
         try:
-            require_fresh(df, max_bar_age, symbol)
+            require_fresh(df, max_bar_age, symbol, now=self._clock())
         except StaleDataError as e:
             logger.warning(f"{symbol}: skipping — {e}")
             self.alerts.stale_data(symbol, str(e))

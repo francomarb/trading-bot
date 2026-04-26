@@ -172,7 +172,7 @@ def _validate(df: pd.DataFrame, symbol: str) -> pd.DataFrame:
 # ── Freshness ────────────────────────────────────────────────────────────────
 
 
-def is_fresh(df: pd.DataFrame, max_age: timedelta) -> bool:
+def is_fresh(df: pd.DataFrame, max_age: timedelta, now: datetime | None = None) -> bool:
     """
     True if the most recent bar is within `max_age` of now (UTC).
     Weekend/holiday-aware callers should pass a generous `max_age`.
@@ -182,14 +182,14 @@ def is_fresh(df: pd.DataFrame, max_age: timedelta) -> bool:
     last_ts = df.index[-1]
     if last_ts.tzinfo is None:
         last_ts = last_ts.tz_localize("UTC")
-    now = datetime.now(timezone.utc)
+    now = now or datetime.now(timezone.utc)
     age = now - last_ts.to_pydatetime()
     return age <= max_age
 
 
-def require_fresh(df: pd.DataFrame, max_age: timedelta, symbol: str) -> None:
+def require_fresh(df: pd.DataFrame, max_age: timedelta, symbol: str, now: datetime | None = None) -> None:
     """Raise StaleDataError if bars are not fresh. Live-cycle gate."""
-    if not is_fresh(df, max_age):
+    if not is_fresh(df, max_age, now):
         last = df.index[-1] if not df.empty else "EMPTY"
         raise StaleDataError(
             f"{symbol}: latest bar {last} is older than {max_age}"

@@ -193,25 +193,36 @@ def extract_oversold_events(
         if entry_close <= 0 or math.isnan(entry_atr):
             continue
 
-        hit_mask = future[rsi_col] >= config.reversion_threshold
+        stop_level = entry_close - config.atr_stop_multiplier * entry_atr
+        
+        hit_rsi50_10d = False
+        stop_failed = False
         days_to_rsi50 = None
-        if bool(hit_mask.any()):
-            hit_pos = int(hit_mask.to_numpy().argmax())
-            days_to_rsi50 = hit_pos + 1
+        
+        # Evaluate path-dependency day-by-day
+        for i, (_, bar) in enumerate(future.iterrows()):
+            if float(bar["low"]) <= stop_level:
+                stop_failed = True
+                break  # Stopped out before or on the same day it could revert
+                
+            if float(bar[rsi_col]) >= config.reversion_threshold:
+                hit_rsi50_10d = True
+                days_to_rsi50 = i + 1
+                break  # Successfully reverted!
 
         min_low = float(future["low"].min())
         max_drawdown = min(0.0, min_low / entry_close - 1.0)
-        stop_level = entry_close - config.atr_stop_multiplier * entry_atr
+        
         records.append(
             EventRecord(
                 symbol=symbol,
                 date=work.index[idx],
                 close=entry_close,
                 rsi=float(row[rsi_col]),
-                hit_rsi50_10d=bool(hit_mask.any()),
+                hit_rsi50_10d=hit_rsi50_10d,
                 return_10d=float(future["close"].iloc[-1] / entry_close - 1.0),
                 max_drawdown_10d=max_drawdown,
-                stop_failed=bool(min_low <= stop_level),
+                stop_failed=stop_failed,
                 days_to_rsi50=days_to_rsi50,
             )
         )

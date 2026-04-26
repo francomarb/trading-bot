@@ -84,7 +84,7 @@ class TestRankResults:
                 _validation(
                     "DEEP",
                     total_return=0.80,
-                    max_drawdown=-0.60,
+                    max_drawdown=-0.70,
                     profit_factor=2.0,
                 )
             ],
