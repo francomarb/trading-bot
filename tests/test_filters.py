@@ -6,8 +6,8 @@ Tests cover:
     NaN SMA, cache reuse, fail-open defaults, fetch-failure rate-limiting.
   - EarningsBlackout: within/outside blackout window, set_symbol, yfinance
     failure graceful degradation, caching, edge cases.
-  - SMAEdgeFilter: SPY-only gate (no earnings blackout).
-  - RSIEdgeFilter: SPY dual-SMA gate + earnings blackout; observability logs.
+  - SMAEdgeFilter: stock SMA, volume expansion, earnings blackout (2d/0d).
+  - RSIEdgeFilter: SPY dual-SMA gate + earnings blackout (3d/2d) + liquidity + no-new-low.
   - BaseStrategy integration: symbol passed through generate_signals → set_symbol.
 
 No real network calls. All external dependencies (fetch_symbol, yfinance) are
@@ -309,13 +309,24 @@ def _rising_df(n: int, *, with_volume: bool = True, vol_expanding: bool = True) 
 
 class TestSMAEdgeFilter:
     """
-    SMAEdgeFilter: stock > 200SMA AND volume expanding.
+    SMAEdgeFilter: stock > 200SMA AND volume expanding AND no earnings blackout.
 
     SPY > 200 SMA gate is INTENTIONALLY DISABLED — delegated to RegimeDetector
     (BEAR regime, universal gate enforced at engine level). Tests document this
     delegation. If the SPY gate is ever re-enabled, restore _spy_allows /
     _spy_blocks helpers and flip test_spy_below_sma_does_not_block_here back.
+
+    Earnings blackout (days_before=2, days_after=0): protects against gap risk
+    on a new entry right before earnings. An earnings miss can gap a stock 20%+
+    overnight; the GTC stop becomes a market order at the open, bypassing the
+    2% MAX_POSITION_PCT limit entirely. days_after=0 allows post-earnings
+    trend continuation entries immediately.
     """
+
+    def _clear_earnings(self, f: SMAEdgeFilter, symbol: str = "AAPL") -> None:
+        """Seed the earnings cache with no upcoming dates."""
+        f._earnings._cache[symbol] = (datetime.date.today(), [])
+        f.set_symbol(symbol)
 
     # ── SPY gate delegation ───────────────────────────────────────────────────
 
@@ -415,19 +426,81 @@ class TestSMAEdgeFilter:
         gate = f(df)
         assert gate.iloc[-1]
 
-    def test_no_earnings_attribute(self):
-        assert not hasattr(SMAEdgeFilter(), "_earnings")
-
-    def test_set_symbol_stored(self):
+    def test_set_symbol_stored_and_forwarded_to_earnings(self):
         f = SMAEdgeFilter()
         f.set_symbol("MU")
         assert f._symbol == "MU"
+        assert f._earnings._symbol == "MU"
 
     def test_gate_series_aligned_to_df(self):
         f = SMAEdgeFilter()
         df = _symbol_df([100.0] * 8)
         gate = f(df)
         assert list(gate.index) == list(df.index)
+
+    # ── Earnings blackout gate ────────────────────────────────────────────────
+
+    def _sma_earnings_df(self) -> pd.DataFrame:
+        """5-bar df; last bar is the most recent business day."""
+        return _today_df(5)
+
+    def _last_bar(self, df: pd.DataFrame) -> datetime.date:
+        """Date of the last bar in the df — used to anchor earnings offsets."""
+        return df.index[-1].date()
+
+    def test_earnings_tomorrow_blocks(self):
+        """Entry the day before earnings → blocked (gap-risk protection)."""
+        df = self._sma_earnings_df()
+        last = self._last_bar(df)
+        f = SMAEdgeFilter()
+        f._earnings._cache["AAPL"] = (datetime.date.today(), [last + datetime.timedelta(days=1)])
+        f.set_symbol("AAPL")
+        assert not f(df).iloc[-1]
+
+    def test_earnings_two_days_before_blocks(self):
+        """2 days before earnings (default days_before=2) → blocked."""
+        df = self._sma_earnings_df()
+        last = self._last_bar(df)
+        f = SMAEdgeFilter()
+        f._earnings._cache["AAPL"] = (datetime.date.today(), [last + datetime.timedelta(days=2)])
+        f.set_symbol("AAPL")
+        assert not f(df).iloc[-1]
+
+    def test_earnings_day_after_allows(self):
+        """Day after earnings → allowed (days_after=0, post-earnings trend ok)."""
+        df = self._sma_earnings_df()
+        last = self._last_bar(df)
+        f = SMAEdgeFilter()
+        f._earnings._cache["AAPL"] = (datetime.date.today(), [last - datetime.timedelta(days=1)])
+        f.set_symbol("AAPL")
+        assert f(df).iloc[-1]
+
+    def test_earnings_far_away_allows(self):
+        """Earnings 30 days out → not in blackout window → allowed."""
+        df = self._sma_earnings_df()
+        last = self._last_bar(df)
+        f = SMAEdgeFilter()
+        f._earnings._cache["AAPL"] = (datetime.date.today(), [last + datetime.timedelta(days=30)])
+        f.set_symbol("AAPL")
+        assert f(df).iloc[-1]
+
+    def test_earnings_custom_days_before(self):
+        """days_before param is respected."""
+        df = self._sma_earnings_df()
+        last = self._last_bar(df)
+        f = SMAEdgeFilter(days_before=5, days_after=0)
+        f._earnings._cache["AAPL"] = (datetime.date.today(), [last + datetime.timedelta(days=5)])
+        f.set_symbol("AAPL")
+        assert not f(df).iloc[-1]
+
+    def test_yfinance_failure_fails_open_on_earnings(self):
+        """yfinance unavailable for earnings → fail open (allow), log warning."""
+        from unittest.mock import patch as _patch
+        f = SMAEdgeFilter()
+        f.set_symbol("AAPL")
+        with _patch("yfinance.Ticker", side_effect=Exception("down")):
+            gate = f(_today_df(5))
+        assert gate.iloc[-1]  # earnings fail open; other gates also fail open
 
 
 # ── TestRSIEdgeFilter ─────────────────────────────────────────────────────────

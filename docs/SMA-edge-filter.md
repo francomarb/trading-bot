@@ -36,7 +36,7 @@ The filter lives at `strategies/filters/sma_crossover.py`. Shared building block
 
 ## Gates
 
-Both gates must be `True` on a given bar for an entry to be allowed on that bar. Exits are never evaluated against the filter.
+All three gates must be `True` on a given bar for an entry to be allowed on that bar. Exits are never evaluated against the filter.
 
 ### Gate 1 — Stock Structural Strength
 
@@ -62,6 +62,22 @@ A crossover on contracting volume is a weak signal. If institutions are not part
 
 ---
 
+### Gate 3 — Pre-Earnings Blackout
+
+**Rule:** No new entry within 2 calendar days **before** an earnings announcement. Entries are allowed immediately **after** earnings (`days_after=0`).
+
+**Why:**
+An SMA crossover the day before earnings creates an asymmetric gap risk that the OTO stop-loss cannot protect against. A GTC stop order becomes a market order that executes at the next available price after the open — if a stock gaps down 20% on an earnings miss, the stop fills at the gap-down open price, not at the stop price. The 2% `MAX_POSITION_PCT` risk limit is completely bypassed.
+
+**Why `days_after=0`** (different from RSI's `days_after=2`):
+Trend-following specifically captures earnings acceleration. A stock that beats earnings and gaps up is exactly the kind of momentum an SMA crossover is designed to ride. Blocking post-earnings entries would miss the best setups. RSI reversion holds a longer post-earnings window (2 days) because options-unwinding and analyst follow-through noise makes oversold readings unreliable after the event — that concern does not apply to trend-following.
+
+**Data source:** `yfinance` ticker calendar and `earnings_dates`, cached daily per symbol.
+
+**Fail-open:** if `yfinance` is unavailable, the gate returns `True`. Missing earnings data affects one symbol at a time; silent blocking is worse than occasionally entering near earnings.
+
+---
+
 ## Default Parameters
 
 | Parameter | Default | Description |
@@ -69,6 +85,8 @@ A crossover on contracting volume is a weak signal. If institutions are not part
 | `stock_sma_window` | 200 | SMA period for the stock's own trend check (bars) |
 | `vol_short_window` | 10 | Short rolling window for volume expansion (bars) |
 | `vol_long_window` | 30 | Long rolling window for volume expansion (bars) |
+| `days_before` | 2 | Earnings blackout: calendar days before announcement |
+| `days_after` | 0 | Earnings blackout: days after (0 = allow immediately) |
 
 All parameters can be overridden at construction time:
 
@@ -77,6 +95,7 @@ edge = SMAEdgeFilter(
     stock_sma_window=150,
     vol_short_window=5,
     vol_long_window=20,
+    days_before=3,   # more conservative window
 )
 ```
 
@@ -88,13 +107,14 @@ Every filter decision on the most recent bar is logged. No silent passes or bloc
 
 **Entry allowed:**
 ```
-DEBUG | SMAEdgeFilter: ALLOWED MU — stock>200SMA vol_expanding
+DEBUG | SMAEdgeFilter: ALLOWED MU — stock>200SMA vol_expanding no_earnings_blackout
 ```
 
 **Entry blocked** (all failing gates listed):
 ```
 INFO | SMAEdgeFilter: BLOCKED NVDA — stock 118.32 ≤ SMA200 124.57
 INFO | SMAEdgeFilter: BLOCKED WDC — volume contracting (avg10 ≤ avg30)
+INFO | SMAEdgeFilter: BLOCKED DELL — earnings blackout (gap-risk protection)
 INFO | SMAEdgeFilter: BLOCKED CIEN — stock 42.10 ≤ SMA200 45.88, volume contracting (avg10 ≤ avg30)
 ```
 
@@ -116,11 +136,15 @@ Allowed decisions log at DEBUG (high-frequency, not noise-worthy). Blocked decis
 
 The re-enable path is prepared in the code: the `SPYTrendFilter` import is retained, and the commented-out `self._spy_filter` instantiation and `spy_gate` lines in `__call__` can be uncommented in one step.
 
-### Earnings blackout — intentionally excluded
+### Earnings blackout — pre-earnings only, post-earnings open
 
-Earnings blackout belongs on RSI Reversion, not SMA Crossover. Trend-following strategies benefit from earnings announcements that act as catalysts — a strong earnings beat can accelerate an established trend and is exactly the kind of move the strategy is designed to capture. Blocking entries around earnings would cause missed setups without meaningfully reducing risk for this strategy type.
+The SMA filter blocks new entries up to 2 days **before** earnings but allows entries immediately **after** (`days_after=0`). This is a narrower window than RSI's 3/2 split and it is asymmetric by design.
 
-By contrast, RSI mean-reversion buys oversold dips. A dip into an earnings announcement is binary event risk, not a reversion opportunity — the correct home for the blackout rule.
+**The pre-earnings block** guards against gap risk on a new position. An OTO GTC stop-loss becomes a market order at the open after an overnight gap — a 20% earnings miss would bypass `MAX_POSITION_PCT` entirely. This is not a theoretical concern; it is a guaranteed bad trade on any significant miss when the position is entered the session before.
+
+**The post-earnings open** preserves the core SMA edge. Earnings beats that accelerate trends are exactly the entries this strategy is designed to capture. A blackout after earnings would systematically miss the highest-momentum setups.
+
+**Why different from RSI (days_after=2):** RSI reversion enters on oversold dips. Post-earnings, options unwinding and analyst price-target revisions create follow-through that makes oversold readings unreliable for 2 days — buying an "oversold" stock that is down 15% because of a bad earnings report is a knife-catch, not a reversion. This noise does not affect trend-following.
 
 ### Stock 50-day SMA gate — excluded
 

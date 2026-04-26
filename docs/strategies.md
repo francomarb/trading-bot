@@ -58,8 +58,7 @@ All gates must pass for an entry to be allowed. Exits are never blocked.
 |---|---|---|
 | Stock trend | `close > 200-day SMA` | Avoids crossovers in structurally broken names |
 | Volume expansion | 10-day avg volume > 30-day avg volume | Confirms institutional participation |
-
-Note: earnings blackout is intentionally absent from SMA — trend-following strategies benefit from earnings catalysts rather than being hurt by them.
+| Pre-earnings blackout | No new entry within 2 days before earnings (`days_after=0`) | OTO stop cannot protect against an overnight gap; a 20% earnings miss bypasses `MAX_POSITION_PCT` entirely. Post-earnings entries allowed immediately to capture trend acceleration. |
 
 **Regime gating:**
 
