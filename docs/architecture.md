@@ -4,23 +4,25 @@
 
 This document defines the target architecture for the Alpaca trading bot. It is the source of truth for structural decisions, coding conventions, and the go/no-go framework for live capital deployment. All refactoring and new development should align with this guide.
 
-The bot is built in Python using `alpaca-py`, currently paper trading the SMA crossover strategy. RSI mean-reversion is implemented and backtested but not yet active — it will be added after SMA paper stabilization and Phase 10 safety work. The final live GO/NO-GO gate is the combined SMA + RSI paper run after Phase 10 is implemented.
+The bot is built in Python using `alpaca-py`. Both the SMA Crossover (trend-following) and RSI Reversion (mean-reversion) strategies are active in paper trading as of Phase 10. The final live GO/NO-GO gate is the combined SMA + RSI paper run after Phase 10 safety work is complete.
 
 ---
 
 ## Layered Architecture
 
-The bot is organized into six layers. Each layer has a single responsibility and communicates only with the layer directly above or below it.
+The bot is organized into seven layers. Each layer has a single responsibility and communicates only with the layer directly above or below it.
 
 ```
 ┌─────────────────────────────────────────┐
 │           Engine (trader.py)            │  Orchestrates the live loop
 ├─────────────────────────────────────────┤
+│         Regime Detector                 │  BEAR/VOLATILE/TRENDING/RANGING gate
+├─────────────────────────────────────────┤
 │              Data Layer                 │  Historical bars, freshness checks
 ├─────────────────────────────────────────┤
 │     Indicators + Strategy Interface     │  Technical indicators, BaseStrategy
 ├─────────────────────────────────────────┤
-│             Risk Manager                │  Position sizing, drawdown limits, stop-loss
+│        Risk Manager + Allocator         │  Position sizing, sleeve budgets, kill switches
 ├─────────────────────────────────────────┤
 │         Execution Layer (alpaca-py)     │  TradingClient, order management, paper↔live
 ├─────────────────────────────────────────┤
@@ -28,16 +30,18 @@ The bot is organized into six layers. Each layer has a single responsibility and
 └─────────────────────────────────────────┘
 ```
 
-At the signal level, strategy entries pass through a narrower trade-permission
-pipeline:
+At the signal level, strategy entries pass through a narrower trade-permission pipeline:
 
-```text
-Watchlist -> raw strategy signal -> edge filter confirms/rejects -> risk -> execution
+```
+Watchlist → raw strategy signal → edge filter → regime gate → sleeve check → risk → execution
 ```
 
-The strategy owns setup detection. The edge filter owns current-condition
-permission. Risk owns sizing, stops, exposure limits, and kill switches.
-Execution only places orders after risk approval.
+- **Strategy** owns setup detection (crossover, RSI extreme)
+- **Edge filter** owns current-condition permission (stock trend, macro state, earnings)
+- **Regime detector** gates entire strategies by market regime
+- **Sleeve allocator** enforces per-strategy capital budgets
+- **Risk manager** owns sizing, stops, exposure limits, and kill switches
+- **Execution** only places orders after all upstream gates pass
 
 ---
 
@@ -47,32 +51,42 @@ Execution only places orders after risk approval.
 trading-bot/
 │
 ├── CLAUDE.md                  # Claude Code session context
-├── architecture.md            # This file
 ├── PLAN.md                    # Phased build plan and progress tracker
 ├── requirements.txt           # Pinned dependencies
 ├── main.py                    # Entry point (delegates to forward_test.py)
 ├── forward_test.py            # Launches engine for multi-week paper runs
 ├── start_bot.sh               # tmux + caffeinate launcher
+├── stop_bot.sh                # Graceful shutdown
+├── recycle_bot.sh             # stop + start (picks up code changes without restart)
 │
 ├── config/
-│   ├── .env                   # API keys (never committed)
+│   ├── .env                   # API keys and runtime flags (never committed)
 │   └── settings.py            # Centralized config (symbols, risk params, etc.)
 │
 ├── data/
 │   ├── __init__.py
 │   ├── fetcher.py             # Fetches OHLCV bars via StockHistoricalDataClient
-│   ├── trades.db              # SQLite trade log (gitignored)
+│   ├── trades.db              # Paper SQLite trade log (gitignored)
+│   ├── trades_live.db         # Live SQLite trade log (gitignored)
 │   └── historical/            # Cached historical bars (Parquet, gitignored)
 │
 ├── indicators/
 │   ├── __init__.py
-│   └── technicals.py          # SMA, EMA, ATR, RSI (hand-rolled, no pandas-ta)
+│   └── technicals.py          # SMA, EMA, ATR, RSI, ADX (hand-rolled, no pandas-ta)
 │
 ├── strategies/
 │   ├── __init__.py
-│   ├── base.py                # BaseStrategy, SignalFrame, StrategySlot, Scanner
+│   ├── base.py                # BaseStrategy, SignalFrame, StrategySlot, WatchlistSource
 │   ├── sma_crossover.py       # Trend-following: SMA crossover
-│   └── rsi_reversion.py       # Mean-reversion: RSI oversold/overbought
+│   ├── rsi_reversion.py       # Mean-reversion: RSI oversold/overbought
+│   └── filters/
+│       ├── common.py          # SPYTrendFilter (shared macro gate, TTL-cached)
+│       ├── sma_crossover.py   # SMAEdgeFilter: stock > 200 SMA, volume expansion
+│       └── rsi_reversion.py   # RSIEdgeFilter: SPY dual macro, earnings, liquidity, no-new-low
+│
+├── regime/
+│   ├── __init__.py
+│   └── detector.py            # RegimeDetector: BEAR/VOLATILE/TRENDING/RANGING
 │
 ├── engine/
 │   ├── __init__.py
@@ -80,15 +94,16 @@ trading-bot/
 │
 ├── risk/
 │   ├── __init__.py
-│   └── manager.py             # RiskManager class
+│   ├── manager.py             # RiskManager: sizing, drawdown, stop-loss, kill switches
+│   └── allocator.py           # SleeveAllocator: per-strategy capital budgets
 │
 ├── execution/
 │   ├── __init__.py
-│   └── broker.py              # AlpacaBroker — TradingClient wrapper
+│   └── broker.py              # AlpacaBroker — TradingClient wrapper + fractional path
 │
 ├── reporting/
 │   ├── __init__.py
-│   ├── logger.py              # TradeLogger — writes to SQLite (data/trades.db)
+│   ├── logger.py              # TradeLogger — writes to SQLite
 │   ├── metrics.py             # Computes Sharpe, drawdown, profit factor, win rate
 │   ├── pnl.py                 # PnLTracker — daily/weekly P&L reports
 │   └── alerts.py              # AlertDispatcher with pluggable backends
@@ -100,13 +115,16 @@ trading-bot/
 │
 ├── scripts/
 │   ├── __init__.py
-│   └── gonogo.py              # Go/no-go checker for live readiness
+│   ├── preflight.py           # Pre-flight checklist (must exit 0 before live flip)
+│   ├── gonogo.py              # Go/no-go checker for live readiness
+│   └── *.py                   # Watchlist scanners and candidate analysis scripts
 │
 ├── tests/
 │   ├── conftest.py            # Shared fixtures (make_ohlcv, tmp_cache_dir, etc.)
 │   ├── test_strategies.py
 │   ├── test_technicals.py
 │   ├── test_risk.py
+│   ├── test_allocator.py
 │   ├── test_broker.py
 │   ├── test_engine.py
 │   ├── test_fetcher.py
@@ -114,8 +132,11 @@ trading-bot/
 │   ├── test_reporting.py
 │   ├── test_reconcile.py
 │   ├── test_metrics.py
+│   ├── test_regime.py
+│   ├── test_filters.py
 │   └── test_gonogo.py
 │
+├── docs/                      # Architecture and strategy documentation
 ├── logs/                      # Rotating log files (gitignored)
 ├── phase*_verify.py           # Integration verification scripts per phase
 └── .gitignore
@@ -139,7 +160,28 @@ Key rules:
 - Data fetching is the only layer allowed to call Alpaca market data endpoints
 - Retry logic with exponential backoff on transient errors (429, 5xx)
 
-### 2. Indicators
+### 2. Regime Detector
+
+`regime/detector.py` — `RegimeDetector` classifies the current market environment each cycle and gates which strategies are allowed to open new positions.
+
+**Four regimes:**
+
+| Regime | Condition | SMA entries | RSI entries |
+|---|---|---|---|
+| BEAR | SPY < 200-day SMA | ❌ blocked | ❌ blocked |
+| VOLATILE | ATR% above 80th percentile of trailing 126 bars | ❌ blocked | ❌ blocked |
+| TRENDING | ADX ≥ 25 | ✅ allowed | ✅ allowed |
+| RANGING | ADX ≤ 20 (or ambiguous zone, SMA50 slope tie-break) | ✅ allowed | ✅ allowed |
+
+**Classification priority:** BEAR → VOLATILE → TRENDING/RANGING (ADX + slope).
+
+**Fail-safe:** returns last cached regime (or RANGING on first call) if the SPY fetch fails. Exits are never blocked by regime.
+
+**TTL caching:** SPY bars are fetched once per cycle and cached for `ENGINE_CYCLE_INTERVAL_SECONDS`. The detector is called once per cycle, not per symbol.
+
+Each `StrategySlot` declares `allowed_regimes: frozenset[MarketRegime] | None`. `None` means no gating. The engine checks the current regime against the slot's allowed set before processing entries.
+
+### 3. Indicators
 
 Hand-rolled technical indicators in `indicators/technicals.py`. Each function is pure (returns a new DataFrame, never mutates input) with predictable column names (`sma_{length}`, `rsi_{length}`, etc.).
 
@@ -148,10 +190,11 @@ Currently provided:
 - `add_ema(df, length)` — Exponential Moving Average (Wilder seed)
 - `add_atr(df, length)` — Average True Range (Wilder/RMA)
 - `add_rsi(df, length)` — Relative Strength Index (Wilder/RMA)
+- `add_adx(df, length)` — Average Directional Index (used by regime detector)
 
-Design decision: indicators are hand-rolled (~5-10 lines each) rather than using pandas-ta. This eliminates a dependency risk on a library with pandas 2.x breakage history, on a code path that will manage real money.
+Design decision: indicators are hand-rolled (~5–10 lines each) rather than using pandas-ta. This eliminates a dependency risk on a library with pandas 2.x breakage history, on a code path that will manage real money.
 
-### 3. Strategy Interface
+### 4. Strategy Interface
 
 Every strategy conforms to the `BaseStrategy` interface. The engine never needs to know which strategy is running.
 
@@ -187,37 +230,43 @@ class BaseStrategy(ABC):
 - `generate_signals(df)` AND-gates entries with the edge filter
 - Exits are never blocked by the edge filter
 - Missing, NaN, or false filter values block entries by default
-- Use edge filters for confirmation or veto rules such as market regime,
-  symbol trend, volatility gates, MACD confirmation, EMA5/EMA10 confirmation,
-  or an earnings-blackout veto for entry timing
-- Do not use edge filters for universe selection; scanners/watchlist sources own
-  symbol selection
 
 **Filter file layout:**
-- Keep strategy-specific edge filters in `strategies/filters/<strategy_name>.py`
-- Put reusable filter helpers in `strategies/filters/common.py`
-- Start with strategy-local filters first; promote a rule into a shared pre-risk
-  or policy layer only if multiple strategies converge on the same behavior
-- Example: an SMA earnings blackout should live first in
-  `strategies/filters/sma_crossover.py`, while shared calendar/helper logic can
-  live in `strategies/filters/common.py`
+- Strategy-specific edge filters live in `strategies/filters/<strategy_name>.py`
+- Shared filter helpers live in `strategies/filters/common.py`
+- Do not use edge filters for universe selection; `WatchlistSource` owns symbol selection
 
 **StrategySlot:**
-Each slot binds a strategy to its symbol universe and timeframe. The engine iterates over slots each cycle. An optional `Scanner` can refresh symbols dynamically.
+Each slot binds a strategy to its symbol universe, timeframe, and allowed regimes. The engine iterates over slots each cycle.
 
 **Current strategies:**
 
-| Strategy | File | Status | Order Type | Signal logic |
+| Strategy | File | Status | Order Type | Allowed Regimes |
 |---|---|---|---|---|
-| SMA Crossover | `sma_crossover.py` | **Active (paper trading)** | MARKET | Fast SMA crosses above/below slow SMA |
-| RSI Reversion | `rsi_reversion.py` | Implemented, not yet active | LIMIT | RSI crosses below oversold / above overbought |
+| SMA Crossover | `sma_crossover.py` | **Paper Trading** | MARKET | TRENDING, RANGING |
+| RSI Reversion | `rsi_reversion.py` | **Paper Trading** | LIMIT | TRENDING, RANGING |
 
-**Why SMA + RSI complement each other (planned):**
-SMA crossover is a trend-following strategy — it performs well in trending markets but suffers in sideways/ranging conditions. RSI mean reversion is the opposite — it performs well when prices oscillate in a range. Running both simultaneously will provide natural regime diversification. RSI Reversion will be added to `forward_test.py` as a second `StrategySlot` after SMA paper stabilization and Phase 10 safety work.
+### 5. Risk Manager + Sleeve Allocator
 
-### 4. Risk Manager
+The Risk Manager sits between strategy signals and the execution layer. No order reaches the broker without passing through it. The Sleeve Allocator enforces per-strategy capital budgets before the risk manager is invoked.
 
-The Risk Manager sits between strategy signals and the execution layer. No order reaches the broker without passing through it.
+#### Sleeve Allocator (`risk/allocator.py`)
+
+`SleeveAllocator` divides the gross capital budget across strategies. Each strategy has a `weight` (fraction of gross capital) and `max_positions` (hard cap on simultaneous positions).
+
+```
+Sleeve budget       = equity × MAX_GROSS_EXPOSURE_PCT × weight
+Per-position budget = sleeve_budget / max_positions
+```
+
+At $100k equity, 80% gross, 50/50 weights, max_positions=5:
+- Each sleeve = $100k × 0.80 × 0.50 = $40,000
+- Per-position cap = $40,000 ÷ 5 = $8,000
+
+Rejection codes: `SLEEVE_FULL` (budget exhausted), `SLEEVE_MAX_POSITIONS` (count cap hit).
+Idle sleeve capital stays locked — no cross-borrowing between strategies (Phase 11 item).
+
+#### Risk Manager (`risk/manager.py`)
 
 **Responsibilities:**
 - Validate signals against current portfolio state
@@ -234,32 +283,44 @@ The Risk Manager sits between strategy signals and the execution layer. No order
 | Rule | Description | Default |
 |---|---|---|
 | `MAX_POSITION_PCT` | Max % of equity risked per trade (loss-to-stop) | 2% |
-| `MAX_OPEN_POSITIONS` | Max concurrent open positions | 5 |
-| `MAX_GROSS_EXPOSURE_PCT` | Max total gross notional as % of equity | 50% |
+| `MAX_POSITION_NOTIONAL_PCT` | Max notional for one position as % of equity | 10% |
+| `MAX_OPEN_POSITIONS` | Max concurrent global positions | 10 |
+| `MAX_GROSS_EXPOSURE_PCT` | Max total gross notional as % of equity | 80% |
 | `MAX_DAILY_LOSS_PCT` | Halt for the session if equity down this much | 5% |
 | `HARD_DOLLAR_LOSS_CAP` | Absolute $ loss cap from session start | $2,000 |
-| `ATR_STOP_MULTIPLIER` | Stop = entry - k × ATR | 2.0 |
+| `ATR_STOP_MULTIPLIER` | Stop = entry − k × ATR | 2.0 |
 | `LOSS_STREAK_THRESHOLD` | Disable strategy after N consecutive losses | 3 |
+| `STRATEGY_ALLOCATIONS` | Per-strategy weight + max_positions | 50/50, 5 each |
 
-### 5. Execution Layer
+### 6. Execution Layer
 
 A thin wrapper (`AlpacaBroker`) around `alpaca-py`'s `TradingClient`. Translates approved risk decisions into actual orders.
 
-**Key rules:**
-- Paper vs live is controlled **only** by the `ALPACA_PAPER` environment variable
-- `TradingClient(api_key=, secret_key=, paper=ALPACA_PAPER)`
-- All entry orders include a stop-loss (OTO bracket)
+**Paper vs live routing** is controlled by the `LIVE_TRADING` flag in `config/.env`. All credential and DB routing derives from this single flag — never set `ALPACA_PAPER` directly.
+
+**Order paths:**
+
+| Path | Condition | TIF | Stop |
+|---|---|---|---|
+| OTO GTC | Whole-share MARKET or LIMIT | GTC | Attached stop-loss leg (OTO bracket) |
+| Fractional DAY | `FRACTIONAL_ENABLED=True` and `floor(qty) ≠ qty` | DAY | Standalone GTC stop submitted after fill confirmation |
+
+**Fractional shares (`FRACTIONAL_ENABLED`):** Alpaca fractional orders require DAY TIF and cannot use OTO order class. The broker routes fractional quantities to `_place_fractional_order()`: DAY market entry first, then a standalone GTC stop for `floor(qty)` whole shares after confirmed fill. If `floor(qty) == 0` (qty < 1 share), no stop is submitted and the position exits via engine signals. Disable `FRACTIONAL_ENABLED` once the account exceeds ~$10k — whole-share rounding error becomes negligible at that scale and the simpler OTO path is preferred.
+
+**Other rules:**
+- `DRY_RUN=True` logs orders without submitting (final sanity check before live)
+- `LIVE_SIZE_MULTIPLIER=0.25` scales live position sizes to 25% at launch
 - Order errors are caught, logged, and never crash the bot
 - Position ownership is tracked per strategy to prevent cross-strategy interference
-- Alpaca supports `GTC` for whole-share equity market/limit/stop orders, but
-  fractional equity orders are `DAY`-only. Any future fractional execution
-  path must account for that broker constraint explicitly.
+- WebSocket streaming (10.E1) is the primary fill notification path; REST polling is the fallback
 
-### 6. Reporting & Monitoring
+### 7. Reporting & Monitoring
 
 Every trade is logged to SQLite for the go/no-go evaluation. This layer also computes live performance metrics and sends alerts.
 
-**Trade log (SQLite — `data/trades.db`):**
+**Trade logs (SQLite):**
+- `data/trades.db` — paper trading (never mixed with live data)
+- `data/trades_live.db` — live trading (separate file to prevent cross-contamination)
 
 The `TradeLogger` inserts a row for every fill (entry and exit). Schema includes timestamp, symbol, side, qty, avg_fill_price, strategy, slippage data, and status.
 
@@ -278,6 +339,9 @@ Metrics are computed by `compute_metrics()` from a list of per-trade P&L values.
 **Go/no-go checker (`scripts/gonogo.py`):**
 CLI tool that reads the trade DB, pairs buy/sell fills into round-trip P&Ls, computes all metrics, and renders a final GO/NO-GO verdict. Supports `--json` for machine-readable output.
 
+**Pre-flight checklist (`scripts/preflight.py`):**
+Must exit 0 before any live capital is committed. Validates: credentials point to the live endpoint, buying power meets minimum, `SLIPPAGE_DRIFT_ENABLED=True`, dry-run cycle passes, go/no-go file on disk with GO verdict.
+
 ---
 
 ## Go/No-Go Framework
@@ -285,19 +349,16 @@ CLI tool that reads the trade DB, pairs buy/sell fills into round-trip P&Ls, com
 Before committing live capital, ALL of the following must be satisfied:
 
 1. Minimum **50 closed trades** in paper trading (statistical significance)
-2. Paper trading period spans **at least 4 weeks** across varying market conditions
+2. Paper trading period spans **at least 4 weeks** across varying market conditions, with both SMA and RSI active
 3. All five metrics meet their thresholds (see table above)
 4. Bot has run for at least **72 hours continuously** without crashes or errors
 5. Risk manager daily halt has never been triggered without being intentional
-6. Paper ↔ Live toggle has been tested and confirmed working
+6. `scripts/preflight.py` exits 0 against the live endpoint
+7. `SLIPPAGE_DRIFT_ENABLED=True` — kill switch calibrated from real fills
 
 Run the checker: `python scripts/gonogo.py` (exit code 0 = GO, 1 = NO-GO).
 
-For slow daily-bar strategies such as the SMA-only Phase 10 paper run, 50 closed
-trades may not be attainable in a 2-4 week paper window. In that case,
-forward-test reconciliation and operational stability are stabilization gates.
-The final live-readiness GO/NO-GO gate happens after Phase 10, with both SMA and
-RSI active in paper mode and the full pre-live safeguard set implemented.
+For slow daily-bar strategies, 50 closed trades may not be attainable in a 2–4 week paper window. In that case, forward-test reconciliation and operational stability are the primary stabilization gates.
 
 ---
 
@@ -311,9 +372,11 @@ When implementing any new strategy:
 4. Set `preferred_order_type` — `OrderType.MARKET` or `OrderType.LIMIT`
 5. Implement `_raw_signals(df) -> SignalFrame` — entries/exits boolean Series
 6. Override `required_bars()` if the strategy needs more than 50 bars
-7. Add unit tests in `tests/test_strategies.py`
-8. Add a `StrategySlot` in `forward_test.py` to include the strategy in paper trading
-9. Update this document's strategy table
+7. Create `strategies/filters/<strategy_name>.py` with an `EdgeFilter` subclass
+8. Add an entry to `STRATEGY_ALLOCATIONS` in `config/settings.py`
+9. Add unit tests in `tests/test_strategies.py` and `tests/test_filters.py`
+10. Add a `StrategySlot` with `allowed_regimes` in `forward_test.py`
+11. Update `docs/strategies.md`
 
 ---
 
@@ -337,5 +400,7 @@ When implementing any new strategy:
 - Never use `alpaca-trade-api` (deprecated) — use `alpaca-py` only
 - Never assume the market is open — always check the market clock
 - Never let an unhandled exception crash the bot silently — use structured error handling and logging
-- Never commit `.env` or `data/trades.db` to version control
+- Never commit `.env`, `data/trades.db`, or `data/trades_live.db` to version control
 - Never use `pandas-ta` — indicators are hand-rolled to eliminate dependency risk
+- Never set `LIVE_TRADING=true` before `scripts/preflight.py` exits 0
+- Never mix paper and live trade logs — they are separate databases by design

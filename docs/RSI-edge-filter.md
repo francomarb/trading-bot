@@ -1,367 +1,198 @@
-# RSI Edge Filter Design (Phase 9.5 → Phase 10 Bridge)
+# RSI Edge Filter — Implementation Reference
+
+> Documents the **as-built** `RSIEdgeFilter` in `strategies/filters/rsi_reversion.py`.
+> This is not a design proposal — it reflects what is running in paper trading today.
+
+---
 
 ## Purpose
 
-Define a **minimal, robust edge filter** for the RSI mean-reversion strategy that:
+The RSI mean-reversion strategy buys oversold dips. Without entry gates, it fires in conditions where reversion has no statistical edge: broken markets, broken individual stocks, pre-earnings binary events, and illiquid names where limit orders fill poorly. The `RSIEdgeFilter` removes those conditions without touching the strategy's core signal logic.
 
-- Prevents trading in conditions where RSI is known to fail
-- Aligns RSI with broader market trends
-- Enables safe multi-strategy (SMA + RSI) paper testing
-- Provides strong observability for debugging
-- Bridges current system → future meta-signal architecture
-
-This filter is intentionally:
-
-- simple
-- deterministic
-- auditable
+**Core principle:** don't make RSI smarter — remove situations where RSI reliably fails.
 
 ---
 
-## Core Principle
+## Architecture
 
-RSI should only operate when:
+```
+raw RSI entry signal
+        │
+        ▼
+  RSIEdgeFilter.__call__(df)
+        │  AND-gates 4 boolean Series
+        ▼
+filtered entry signal → Risk Manager → Execution
+```
 
-> **Mean reversion has a statistical edge**
+- `RSIReversion._raw_signals(df)` detects the unfiltered RSI threshold crossing
+- `BaseStrategy.generate_signals(df)` AND-gates entries with the edge filter output
+- **Exits are never blocked** — enforced unconditionally by `BaseStrategy`
+- `BaseStrategy.generate_signals` calls `filter.set_symbol(symbol)` before `filter(df)` so the filter knows which symbol it is evaluating
 
-Avoid:
-
-- trending down markets
-- structurally weak stocks
-- chaotic / high-volatility regimes
-
----
-
-## Tier 1 — Minimum Viable Filter (REQUIRED)
-
-### Rule 1 — Market Trend Filter (Mandatory)
-
-Only allow RSI trades when the overall market is healthy.
-
-Conditions:
-
-- SPY price > 200-day SMA
-- SPY price > 50-day SMA
-
-Purpose:
-
-- Avoid bear markets
-- Avoid macro downtrends
+The filter lives at `strategies/filters/rsi_reversion.py`. Shared building blocks (`SPYTrendFilter`, `EarningsBlackout`) live in `strategies/filters/common.py`.
 
 ---
 
-### Rule 2 — Symbol Trend Filter
+## Gates
 
-Only trade RSI on stocks that are not structurally weak.
+All four gates must be `True` on a given bar for an entry to be allowed on that bar. Exits are never evaluated against the filter.
 
-Condition:
+### Gate 1 — SPY Macro Trend (mandatory)
 
-- Stock price > 50-day SMA
+**Rule:** `SPY close > SPY 200-day SMA` AND `SPY close > SPY 50-day SMA`
 
-Purpose:
+**Implemented by:** `SPYTrendFilter(sma_windows=[200, 50])` from `strategies/filters/common.py`
 
-- Avoid buying collapsing stocks
-- Align with upward bias
+**Why both SMAs:**
+- 200 SMA: structural bear market gate — RSI reversion into a broad bear is catching a falling knife, not a mean-reversion setup
+- 50 SMA: intermediate downtrend gate — even in a long-term bull, a SPY below its 50 SMA signals deteriorating momentum where individual oversold setups are more likely to extend than revert
 
----
+**SPY data:** fetched once per engine cycle with a 600-second TTL cache. All symbols in one cycle share the same SPY fetch — no repeated API calls.
 
-### Rule 3 — Long-Only Mode
+**Fail-open:** if SPY data is unavailable (network error, API outage), the gate returns `True` and logs a WARNING. The operator sees the failure; the bot does not silently block all trades.
 
-Disable RSI shorting entirely.
-
-Purpose:
-
-- Avoid fighting strong trends
-- Reduce complexity during validation phase
+**Note:** This gate provides a second BEAR block on top of the `RegimeDetector`'s BEAR classification. The redundancy is intentional — the regime detector has a TTL-cached SPY fetch with a longer staleness window. The filter's SPY check is more current and is also the correct home for the RSI-specific 50 SMA gate (which the regime detector does not apply to SMA entries).
 
 ---
 
-## Resulting Entry Logic
+### Gate 2 — Earnings Blackout
 
-The RSI strategy first emits a raw entry signal. The edge filter then confirms
-or rejects that entry. RSI BUY is allowed ONLY if:
+**Rule:** No entry within 3 calendar days **before** or 2 calendar days **after** a known earnings date.
 
-- raw RSI entry signal is true
-- SPY > 200 SMA
-- SPY > 50 SMA
-- Stock > 50 SMA
+**Implemented by:** `EarningsBlackout(days_before=3, days_after=2)` from `strategies/filters/common.py`
 
----
+**Why:**
+RSI reversion buys oversold dips. A dip into an upcoming earnings announcement is binary event risk — the stock may gap down 15% or gap up 15% on the report. The expected reversion does not materialize; the fill is at an entry price that may be wildly wrong post-announcement. 
 
-## Tier 2 — Optional Additions (After Validation)
+Post-earnings (2 days after): options unwinding, analyst price-target updates, and institutional rebalancing create follow-through that makes the "oversold" signal unreliable. After 2 days, these effects have largely settled.
 
-### Rule 4 — Volatility Filter
+**Data source:** `yfinance` ticker calendar and `earnings_dates`. Cached daily per symbol (one lookup per symbol per trading day).
 
-Avoid unstable environments.
-
-Options:
-
-- ATR / price < threshold (e.g., < 3–4%)
-- OR VIX below threshold
-
-Purpose:
-
-- Reduce noise-driven trades
-- Avoid panic conditions
+**Fail-open:** if `yfinance` is unavailable or returns no dates for a symbol, the gate returns `True` and logs a WARNING. Missing earnings data does not silently block trades.
 
 ---
 
-## Tier 3 — Optional Refinements (Later)
+### Gate 3 — Minimum Liquidity
 
-### Rule 5 — Momentum Confirmation
+**Rule:** 20-day rolling average volume ≥ 500,000 shares
 
-Improve entry quality.
+**Why:**
+RSI reversion enters via LIMIT orders. Thinly traded stocks fill partially at the limit price (or not at all), leaving the bot with a partial position at an unfavorable price while the stop is sized for a full position. The edge on paper disappears in practice because fill quality degrades below this liquidity floor.
 
-Options:
+This is a hard structural floor, not a directional signal. It is evaluated against the historical bars already fetched for the symbol — no additional API call.
 
-- RSI crossing upward (not just below threshold)
-- Price above short-term SMA (e.g., 10-day)
-- EMA5 > EMA10 or EMA5 crossing above EMA10
-- MACD histogram improving, or MACD line crossing above signal
-
-Purpose:
-
-- Avoid premature entries
-- Confirm that an oversold long setup is starting to rebound
+**Fail-open:** if the `volume` column is absent or there are fewer than 20 bars of history, the gate returns `True`. Insufficient data is not treated as a rejection signal.
 
 ---
 
-## Example Edge Filter Function
+### Gate 4 — No Active Breakdown
+
+**Rule:** Current `close > min(close)` of the prior 20 bars (not including the current bar)
+
+**Why:**
+A stock making new 20-day lows is in active breakdown. Each lower low looks like an RSI oversold setup — it generates a raw entry signal — but each one is a knife-catch. The price action is dominated by forced selling, structural deterioration, or bad news that the SPY macro gates cannot see (the broad market may be fine while this individual stock collapses).
+
+This gate blocks those entries without penalising normal pullbacks, which is what the strategy is designed to capture. The SPY > 50 SMA gate guards the macro environment; this gate guards individual stock breakdown.
+
+**Why not the 50-day SMA:** RSI oversold stocks are typically below their 50-day SMA — that is exactly the population the strategy targets. Filtering on `close < 50 SMA` would remove most valid setups. The new-low gate addresses the same concern more precisely: it distinguishes "temporarily below 50 SMA" (normal pullback, reversion candidate) from "making new 20-day lows" (active breakdown, knife-catch).
+
+**Fail-open:** if there are fewer than 21 bars of history (20 for rolling minimum + 1 for shift), the gate returns `True`.
+
+---
+
+## Default Parameters
+
+| Parameter | Default | Description |
+|---|---|---|
+| `spy_lookback_days` | 280 | Calendar days of SPY history to fetch (covers 200 trading days) |
+| `spy_cache_ttl` | 600.0 s | SPY cache TTL — reused across all symbols in one cycle |
+| `days_before` | 3 | Earnings blackout: calendar days before announcement |
+| `days_after` | 2 | Earnings blackout: calendar days after announcement |
+| `vol_min_window` | 20 | Rolling window for average volume calculation (bars) |
+| `vol_min_avg` | 500,000 | Minimum average daily share volume |
+| `new_low_window` | 20 | Look-back window for breakdown detection (bars) |
+
+All parameters can be overridden at construction time:
 
 ```python
-def rsi_edge_filter(symbol, market_data):
-    spy = market_data["SPY"]
-    stock = market_data[symbol]
-
-    # Market filter
-    if spy.price < spy.sma200:
-        return False
-    if spy.price < spy.sma50:
-        return False
-
-    # Symbol filter
-    if stock.price < stock.sma50:
-        return False
-
-    return True
+edge = RSIEdgeFilter(
+    days_before=5,
+    vol_min_avg=1_000_000,
+)
 ```
 
 ---
 
-## Integration with Architecture
+## Observability
 
-Flow:
+Every filter decision on the most recent bar is logged. No silent passes or blocks.
 
-```text
-Watchlist → raw RSI signal → Edge Filter confirms/rejects → Risk Engine → Execution
+**Entry allowed:**
+```
+INFO | RSI_FILTER_ALLOWED ALLY — SPY=True earnings=True liquid=True no_new_low=True
 ```
 
-Important:
-
-- The scanner/watchlist decides which symbols are monitored
-- `RSIReversion._raw_signals()` detects the unfiltered RSI setup
-- `BaseStrategy.generate_signals()` applies the edge filter to entries
-- The filter acts as a confirmation/veto gate
-- The filter must not block exits
-- Strategy logic remains focused on setup detection
-- Future `MetaSignal` layer can replace this
-
-MACD and EMA5/EMA10 confirmations fit here when they are used as veto rules:
-the raw RSI signal fires first, then the edge filter allows the entry only when
-confirmation is present. If a confirmation changes the actual setup timing
-rather than simply vetoing a setup, implement it as a deliberate RSI strategy
-variant instead of hiding it in the scanner.
-
----
-
-## Capital Allocation Interaction
-
-RSI must respect:
-
-- Strategy-level capital bucket
-- Max open positions per strategy
-- Portfolio-level exposure caps
-
-The filter reduces:
-
-- Unnecessary capital usage
-- Low-quality trades
-
----
-
-## Success Criteria
-
-### Behavioral Success (Primary)
-
-- RSI trades only occur in strong/uptrending markets
-- No trades in clear downtrends
-- Trades align with SMA direction, with no conflict
-- Reduced frequency of bad entries
-
-### System-Level Success
-
-- No increase in errors or warnings
-- No duplicate orders
-- No ownership confusion
-- Clean integration with existing logs
-
-### Comparative Success
-
-Compared to no filter:
-
-- Fewer trades
-- Higher trade quality
-- Lower drawdowns
-- More consistent behavior
-
----
-
-## Observability (Critical)
-
-The filter must be fully observable.
-
-### Required Logs
-
-For every RSI signal:
-
-- `RSI_SIGNAL_DETECTED`
-- `RSI_FILTER_ALLOWED` or `RSI_FILTER_BLOCKED`
-- Reason for block:
-  - Market trend failed
-  - Symbol trend failed
-  - Volatility filter, if enabled
-
-### Example Log
-
-```text
-RSI signal detected: AAPL RSI=28
-RSI filter blocked: AAPL — price below 50 SMA
+**Entry blocked** (one or more gates failed, all failing gates listed):
+```
+INFO | RSI_FILTER_BLOCKED CDNS — SPY trend gate failed (below 200 or 50 SMA)
+INFO | RSI_FILTER_BLOCKED CCK — earnings blackout
+INFO | RSI_FILTER_BLOCKED SN — volume illiquid (avg20=312,450 < 500,000)
+INFO | RSI_FILTER_BLOCKED TFC — new 20-day low (active breakdown)
 ```
 
-### Metrics to Track
-
-- Total RSI signals
-- Allowed vs blocked ratio
-- Reasons for filtering
-- Average holding time
-- Win/loss ratio, later stage
+Multiple reasons are comma-separated in a single log line if more than one gate fails simultaneously.
 
 ---
 
-## Testing Strategy
+## Design Decisions and Exclusions
 
-### Phase 1 — Log-Only Mode
+### Stock 50-day SMA gate — intentionally excluded
 
-- Generate RSI signals
-- Apply filter
-- Do not execute trades
-- Validate behavior vs charts
+**Why it was considered:** a stock below its 50 SMA has weakening momentum.
 
-### Phase 2 — Limited Trading
+**Why it was removed:** RSI oversold stocks are almost always below their 50 SMA. This was the population the strategy is designed to trade. Including this gate was observed to filter out the majority of valid setups. The new-low gate (Gate 4) addresses the legitimate concern — active breakdown — without penalising normal mean-reversion candidates.
 
-- Enable RSI with small allocation, e.g. 20–30%
-- Monitor trade quality
-- Monitor system stability
-- Monitor interaction with SMA
+### Earnings blackout on SMA Crossover — intentionally absent
 
-### Phase 3 — Full Paper Parallel
+Earnings blackout belongs on RSI, not SMA. Trend-following strategies benefit from earnings catalysts that accelerate established trends. Mean-reversion strategies are hurt by binary events that can gap a stock far beyond any sensible stop before the trade has a chance to work.
 
-- SMA + RSI both active
-- Validate ownership correctness
-- Validate capital allocation
-- Validate no conflicts
+### SPY volatility filter (ATR%) — deferred to Phase 11
+
+High volatility environments are handled at the engine level by the `RegimeDetector` VOLATILE regime gate, which blocks new entries for all strategies. A redundant ATR% check in this filter would be duplication. If the regime detector is ever removed, revisit.
+
+### Cliff-edge SPY 50 SMA gate — noted for Phase 11
+
+The current gate is a hard binary: SPY crosses the 50 SMA on one bar → all RSI entries blocked on the next cycle. A brief SPY dip below the 50 SMA on a single day can trigger a lockout during a valid paper run. A smoother N-bar confirmation window (require SPY below 50 SMA for ≥ 3 consecutive bars) would reduce false lockouts. Deferred: hard gates are operationally auditable; the smooth version requires forward-test data to validate the threshold.
 
 ---
 
-## Failure Modes
+## Integration
 
-### Known Risks
+```python
+# forward_test.py
+from strategies.filters.rsi_reversion import RSIEdgeFilter
+from strategies.rsi_reversion import RSIReversion
 
-- Over-filtering → no trades
-- Under-filtering → poor trades
-- Missing SPY data → false negatives
-- Data lag → incorrect filtering
-
-### Critical Stop Conditions
-
-- RSI trading below 50 SMA
-- RSI firing excessively in chop
-- Capital overuse
-- Strategy conflicts with SMA
-
----
-
-## Rollout Plan
-
-1. Implement filter logic
-2. Run in log-only mode
-3. Validate logs vs charts
-4. Enable small capital allocation
-5. Monitor behavior
-6. Expand gradually
-
----
-
-## Design Philosophy
-
-This filter is:
-
-- Simple
-- Explainable
-- Testable
-- Aligned with architecture
-
-It is not:
-
-- Predictive
-- Adaptive
-- Sentiment-driven
-
----
-
-## Future Evolution
-
-This filter will evolve into:
-
-- Phase 10+ future work
-- `MetaSignalState`
-- Sentiment gating
-- Volatility-aware regimes
-- Dynamic capital allocation
-
-### Long-Term Vision
-
-```text
-Strategy → MetaSignal → Position Expression → Execution
+slot = StrategySlot(
+    strategy=RSIReversion(
+        period=14,
+        oversold=30,
+        overbought=70,
+        edge_filter=RSIEdgeFilter(),
+    ),
+    watchlist_source=StaticWatchlistSource(settings.RSI_WATCHLIST, name="rsi"),
+    allowed_regimes=frozenset({MarketRegime.TRENDING, MarketRegime.RANGING}),
+)
 ```
 
-Where:
-
-- RSI/SMA generate opportunities
-- Meta layer decides validity
-- Execution chooses instrument, equity or options
+The `allowed_regimes` on the `StrategySlot` provides the engine-level BEAR and VOLATILE block. The `RSIEdgeFilter` provides the symbol-level and SPY-level gates within allowed regimes.
 
 ---
 
-## Key Insight
+## Phase 11 Deferred Items
 
-The goal is not to make RSI smarter.
-
-It is to remove situations where RSI fails.
-
----
-
-## Sample Core Watchlist for RSI
-
-- AAPL
-- MSFT
-- GOOGL
-- AMZN
-- META
-- NVDA
-- AVGO
-- AMD
-- MU
-- TSLA
-- QQQ
-- SMH
+| Item | Description |
+|---|---|
+| 11.23 | SPY 50 SMA cliff-edge smoothing — N-bar confirmation before engaging the block |
+| 11.25 | VIX integration — high VIX is actually favourable for RSI reversion (sharp oversold snaps); could relax VOLATILE block selectively for RSI when VIX is elevated |
