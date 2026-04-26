@@ -94,11 +94,24 @@ class TestSPYTrendFilter:
         gate = f(_symbol_df([50.0] * 3))
         assert gate.all()  # NaN → fail open
 
-    def test_fetch_failure_with_no_cache_allows(self):
+    def test_fetch_failure_with_no_cache_blocks(self):
+        # Cold-start failure with no prior cache → fail closed.
+        # Protects against deploying into a market crash while the data API is down.
         f = SPYTrendFilter(sma_windows=[200], cache_ttl_seconds=0)
         with patch("data.fetcher.fetch_symbol", side_effect=Exception("timeout")):
             gate = f(_symbol_df([100.0] * 3))
-        assert gate.all()  # no cache → fail open
+        assert not gate.any()  # no cache → fail closed
+
+    def test_fetch_failure_with_stale_cache_uses_last_known_state(self):
+        # Subsequent failure after a successful fetch → stale cache reused.
+        # Safe: last known SPY state is a reasonable proxy during brief outages.
+        f = SPYTrendFilter(sma_windows=[200], cache_ttl_seconds=0)
+        spy_df = _spy_df([float(i) for i in range(1, 202)])  # rising closes, SPY > SMA200
+        f._spy_cache = spy_df
+        f._cache_time = 0.0  # expired TTL
+        with patch("data.fetcher.fetch_symbol", side_effect=Exception("down")):
+            gate = f(_symbol_df([100.0] * 3))
+        assert gate.all()  # stale cache says SPY was healthy → allow
 
     def test_fetch_failure_advances_cache_time_to_rate_limit(self):
         """After a failed fetch, cache_time is updated so we don't retry every cycle."""

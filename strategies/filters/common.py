@@ -13,8 +13,11 @@ Two reusable callables used by both SMA and RSI filters:
 
 Design principles (from docs/RSI-edge-filter.md and docs/strategies.md):
   - Simple, deterministic, auditable — no ML, no lookahead.
-  - Fail open: if SPY data or earnings data is unavailable, allow the trade
-    rather than block it silently. Log the failure so the operator knows.
+  - SPYTrendFilter fails CLOSED on cold-start API failure (no prior cache).
+    If a prior cache exists, stale data is reused and a WARNING is logged —
+    last known SPY state is a safe proxy for brief outages.
+  - EarningsBlackout fails open — missing earnings data affects one symbol
+    at a time; yfinance outages are common; silent blocking would be worse.
   - Exits are NEVER blocked — that responsibility lives in BaseStrategy.
   - Every filter action is logged at INFO (allowed) or INFO (blocked) so
     the operator can reconstruct why any signal was suppressed.
@@ -85,20 +88,28 @@ class SPYTrendFilter:
             )
             return df
         except Exception as e:
-            logger.warning(
-                f"SPYTrendFilter: failed to fetch SPY bars — {e}. "
-                "Defaulting to ALLOW (fail open). Will retry after TTL."
-            )
+            if self._spy_cache is not None:
+                logger.warning(
+                    f"SPYTrendFilter: failed to fetch SPY bars — {e}. "
+                    "Using stale cache. Will retry after TTL."
+                )
+            else:
+                logger.error(
+                    f"SPYTrendFilter: failed to fetch SPY bars and no prior "
+                    f"cache exists — {e}. Failing CLOSED (blocking all entries)."
+                )
             # Advance cache_time so we don't hammer the API (and spam logs)
             # on every engine cycle during an outage — retry after full TTL.
             self._cache_time = now
-            return self._spy_cache  # may be None (first failure) or stale
+            return self._spy_cache  # None (first failure) → fail closed; stale → reused
 
     def _check(self) -> tuple[bool, str]:
         """Return (allowed, reason) based on latest SPY data."""
         spy = self._fetch_spy()
         if spy is None or spy.empty:
-            return True, "no SPY data — fail open"
+            # No prior cache exists — fail closed to prevent entries during
+            # a cold-start API outage (e.g. market crash + data API down).
+            return False, "no SPY data and no prior cache — fail closed"
 
         close = spy["close"]
         last_close = close.iloc[-1]

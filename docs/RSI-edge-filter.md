@@ -50,7 +50,14 @@ All four gates must be `True` on a given bar for an entry to be allowed on that 
 
 **SPY data:** fetched once per engine cycle with a 600-second TTL cache. All symbols in one cycle share the same SPY fetch — no repeated API calls.
 
-**Fail-open:** if SPY data is unavailable (network error, API outage), the gate returns `True` and logs a WARNING. The operator sees the failure; the bot does not silently block all trades.
+**Failure behaviour — two distinct cases:**
+
+| Situation | Behaviour | Rationale |
+|---|---|---|
+| Cold-start: no prior cache exists | **Fail closed** — block all entries, log ERROR | No SPY data at all during a potential crash is the highest-risk scenario. Deploying the entire RSI sleeve into a collapsing market because the data API is down is unacceptable. |
+| Warm: prior cache exists, fetch failed | **Use stale cache**, log WARNING | Last known SPY state (at most one TTL interval old) is a reasonable proxy during brief outages. Daily SMA values do not change materially in 10 minutes. |
+
+The TTL is 600 seconds. After a failed fetch `cache_time` is still advanced, so the API is retried no more than once per TTL interval rather than every cycle.
 
 **Note:** This gate provides a second BEAR block on top of the `RegimeDetector`'s BEAR classification. The redundancy is intentional — the regime detector has a TTL-cached SPY fetch with a longer staleness window. The filter's SPY check is more current and is also the correct home for the RSI-specific 50 SMA gate (which the regime detector does not apply to SMA entries).
 
