@@ -154,7 +154,7 @@ class RiskDecision:
 
     symbol: str
     side: Side
-    qty: int
+    qty: float  # int when FRACTIONAL_ENABLED=False, float (2 dp) when True
     entry_reference_price: float
     stop_price: float
     strategy_name: str
@@ -430,20 +430,38 @@ class RiskManager:
         stop_price: float,
         account: AccountState,
         notional_cap: float | None = None,
-    ) -> int:
+    ) -> float:
         """
         Fixed-fractional sizing on stop distance:
             risk_dollars = equity * max_position_pct
-            qty          = floor(risk_dollars / |entry - stop|)
+            qty          = _floor(risk_dollars / |entry - stop|)
         Then capped by per-position notional exposure, remaining
         gross-exposure budget, available cash, and — when provided —
         the sleeve notional_cap from the SleeveAllocator.
+
+        When settings.FRACTIONAL_ENABLED=True and signal.order_type is MARKET:
+          _floor rounds down to 2 decimal places (fractional shares).
+          Returns float; broker routes to DAY entry + standalone GTC stop.
+
+        When FRACTIONAL_ENABLED=False (or LIMIT order):
+          _floor is math.floor (returns int); exact current behaviour.
+          Broker uses OTO GTC exactly as before — this path is byte-for-byte
+          identical to the pre-fractional implementation.
         """
+        # Choose floor function based on fractional mode.
+        # LIMIT orders (RSI reversion) always use whole shares — Alpaca GTC
+        # limit orders do not support fractional quantities.
+        fractional = (
+            settings.FRACTIONAL_ENABLED
+            and signal.order_type is OrderType.MARKET
+        )
+        _floor = (lambda x: math.floor(x * 100) / 100) if fractional else math.floor
+
         risk_dollars = account.equity * self.max_position_pct
         stop_distance = abs(signal.reference_price - stop_price)
         if stop_distance <= 0:
             return 0
-        raw_qty = math.floor(risk_dollars / stop_distance)
+        raw_qty = _floor(risk_dollars / stop_distance)
         if raw_qty <= 0:
             return 0
 
@@ -451,27 +469,25 @@ class RiskManager:
         # the whole sleeve in a single position.
         if signal.reference_price > 0:
             max_position_notional = account.equity * self.max_position_notional_pct
-            notional_qty_cap = math.floor(
-                max_position_notional / signal.reference_price
-            )
+            notional_qty_cap = _floor(max_position_notional / signal.reference_price)
             raw_qty = min(raw_qty, notional_qty_cap)
 
         # Cap by remaining gross-exposure budget.
         max_gross = account.equity * self.max_gross_exposure_pct
         remaining_gross = max(0.0, max_gross - account.gross_exposure())
         if signal.reference_price > 0:
-            gross_qty_cap = math.floor(remaining_gross / signal.reference_price)
+            gross_qty_cap = _floor(remaining_gross / signal.reference_price)
             raw_qty = min(raw_qty, gross_qty_cap)
 
         # Cap by cash on hand (a buy must be payable).
         if signal.side is Side.BUY and signal.reference_price > 0:
-            cash_qty_cap = math.floor(max(0.0, account.cash) / signal.reference_price)
+            cash_qty_cap = _floor(max(0.0, account.cash) / signal.reference_price)
             raw_qty = min(raw_qty, cash_qty_cap)
 
         # Cap by sleeve budget (supplied by SleeveAllocator when active).
         # This prevents one strategy from consuming another's reserved capital.
         if notional_cap is not None and signal.reference_price > 0:
-            sleeve_qty_cap = math.floor(notional_cap / signal.reference_price)
+            sleeve_qty_cap = _floor(notional_cap / signal.reference_price)
             if sleeve_qty_cap < raw_qty:
                 logger.debug(
                     f"[{signal.strategy_name}] {signal.symbol}: "
@@ -640,7 +656,17 @@ class RiskManager:
 
         # Live-trading size multiplier (10.G1): scale down on first live exposure.
         if settings.LIVE_TRADING and settings.LIVE_SIZE_MULTIPLIER != 1.0:
-            qty = max(1, math.floor(qty * settings.LIVE_SIZE_MULTIPLIER))
+            _is_fractional = (
+                settings.FRACTIONAL_ENABLED
+                and signal.order_type is OrderType.MARKET
+            )
+            if _is_fractional:
+                qty = max(
+                    0.01,
+                    math.floor(qty * settings.LIVE_SIZE_MULTIPLIER * 100) / 100,
+                )
+            else:
+                qty = max(1, math.floor(qty * settings.LIVE_SIZE_MULTIPLIER))
 
         if qty <= 0:
             # Distinguish gross-exposure exhaustion from cash exhaustion for

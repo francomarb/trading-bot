@@ -574,9 +574,10 @@ class TestRiskManagerNotionalCap:
         risk = self._risk()
         account = _account(equity=100_000.0)
         sig = self._signal(price=500.0, atr=5.0)
-        # cap=$100 → cap_qty=0 → POSITION_TOO_SMALL
+        # cap=$2 → fractional floor(2/500*100)/100 = 0.0 → POSITION_TOO_SMALL
+        # (with fractional enabled, cap must be < 0.01 * price = $5 to produce 0)
         from risk.manager import RiskRejection
-        decision = risk.evaluate(sig, account, notional_cap=100.0)
+        decision = risk.evaluate(sig, account, notional_cap=2.0)
         assert isinstance(decision, RiskRejection)
 
 

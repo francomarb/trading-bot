@@ -512,3 +512,105 @@ class TestOrderResult:
             assert OrderResult(status=s, **common).is_terminal is True
         for s in [OrderStatus.ACCEPTED, OrderStatus.PENDING]:
             assert OrderResult(status=s, **common).is_terminal is False
+
+
+# ── Fractional share sizing (10.G6) ──────────────────────────────────────────
+
+
+class TestFractionalOrders:
+    """Tests for the fractional-share path in place_order / _place_fractional_order.
+
+    Routing rule: if math.floor(decision.qty) != decision.qty, the fractional
+    path is taken (DAY entry + standalone GTC stop). Whole-share qty always
+    takes the original OTO GTC path, regardless of FRACTIONAL_ENABLED.
+    """
+
+    def test_fractional_market_uses_day_tif_no_oto(self):
+        """Fractional qty routes to _place_fractional_order: DAY TIF, no OTO."""
+        api = MagicMock()
+        entry_order = _alpaca_order(id="entry-1", status="accepted", qty=8.5)
+        filled_order = _alpaca_order(
+            id="entry-1", status="filled", qty=8.5,
+            filled_qty=8.5, filled_avg_price=100.5,
+        )
+        stop_order = _alpaca_order(id="stop-1", status="accepted", qty=8)
+        api.submit_order.side_effect = [entry_order, stop_order]
+        api.get_order_by_id.return_value = filled_order
+
+        broker = _broker_with_mock(api)
+        result = broker.place_order(_decision(qty=8.5), poll_timeout=0.1)
+
+        assert result.status is OrderStatus.FILLED
+        assert api.submit_order.call_count == 2
+
+        # First call: DAY market entry — no OTO, no stop leg.
+        entry_req = api.submit_order.call_args_list[0].args[0]
+        assert entry_req.time_in_force.value == "day"
+        assert entry_req.qty == 8.5
+        assert not hasattr(entry_req, "order_class") or getattr(entry_req, "order_class", None) is None
+        assert not hasattr(entry_req, "stop_loss") or getattr(entry_req, "stop_loss", None) is None
+
+    def test_fractional_submits_standalone_gtc_stop_after_fill(self):
+        """After fill: second submit_order is a GTC stop for floor(qty) whole shares."""
+        api = MagicMock()
+        entry_order = _alpaca_order(id="entry-2", status="accepted", qty=8.5)
+        filled_order = _alpaca_order(
+            id="entry-2", status="filled", qty=8.5,
+            filled_qty=8.5, filled_avg_price=100.5,
+        )
+        stop_order = _alpaca_order(id="stop-2", status="accepted", qty=8)
+        api.submit_order.side_effect = [entry_order, stop_order]
+        api.get_order_by_id.return_value = filled_order
+
+        broker = _broker_with_mock(api)
+        broker.place_order(_decision(qty=8.5, stop=96.0), poll_timeout=0.1)
+
+        stop_req = api.submit_order.call_args_list[1].args[0]
+        assert stop_req.qty == 8               # floor(8.5)
+        assert stop_req.time_in_force.value == "gtc"
+        assert stop_req.type.value == "stop"
+        assert stop_req.stop_price == 96.0
+        assert stop_req.side.value == "sell"
+
+    def test_fractional_sub_one_share_no_stop_submitted(self):
+        """When floor(qty) == 0 (qty < 1), no stop order is submitted."""
+        api = MagicMock()
+        entry_order = _alpaca_order(id="entry-3", status="accepted", qty=0.5)
+        filled_order = _alpaca_order(
+            id="entry-3", status="filled", qty=0.5,
+            filled_qty=0.5, filled_avg_price=100.5,
+        )
+        api.submit_order.return_value = entry_order
+        api.get_order_by_id.return_value = filled_order
+
+        broker = _broker_with_mock(api)
+        result = broker.place_order(_decision(qty=0.5), poll_timeout=0.1)
+
+        assert result.status is OrderStatus.FILLED
+        # Only the entry was submitted — no stop (floor(0.5) == 0).
+        assert api.submit_order.call_count == 1
+
+    def test_whole_share_uses_oto_path_unchanged(self):
+        """Whole-share qty (floor(qty) == qty) always takes the OTO GTC path."""
+        api = MagicMock()
+        api.submit_order.return_value = _alpaca_order(status="filled")
+        api.get_order_by_id.return_value = _alpaca_order(status="filled")
+        broker = _broker_with_mock(api)
+
+        result = broker.place_order(_decision(qty=10), poll_timeout=0.1)
+
+        assert result.status is OrderStatus.FILLED
+        assert api.submit_order.call_count == 1   # single OTO — no second call
+        req = api.submit_order.call_args.args[0]
+        assert req.order_class.value == "oto"
+        assert req.stop_loss.stop_price == 96.0
+
+    def test_fractional_dry_run_returns_filled_without_submit(self):
+        """DRY_RUN: fractional path logs and returns FILLED without hitting API."""
+        api = MagicMock()
+        broker = AlpacaBroker(client=api, max_attempts=3, base_delay=0.0, dry_run=True)
+
+        result = broker.place_order(_decision(qty=8.5), poll_timeout=0.1)
+
+        assert result.status is OrderStatus.FILLED
+        api.submit_order.assert_not_called()

@@ -33,6 +33,7 @@ import pytest
 
 from risk.manager import (
     AccountState,
+    OrderType,
     Position,
     RejectionCode,
     RiskDecision,
@@ -71,6 +72,8 @@ def _signal(
     strategy: str = "sma_crossover",
     price: float = 100.0,
     atr: float = 2.0,
+    order_type: OrderType = OrderType.MARKET,
+    limit_price: float | None = None,
 ) -> Signal:
     return Signal(
         symbol=symbol,
@@ -79,6 +82,8 @@ def _signal(
         reference_price=price,
         atr=atr,
         reason="test",
+        order_type=order_type,
+        limit_price=limit_price,
     )
 
 
@@ -292,7 +297,7 @@ class TestStopAndSizing:
         mgr = _mgr()
         rej = mgr.evaluate(
             _signal(price=100.0, atr=2.0),
-            _account(equity=100_000.0, cash=50.0),  # can't afford 1 share
+            _account(equity=100_000.0, cash=0.5),  # can't afford even min fractional
             now=T0,
         )
         assert isinstance(rej, RiskRejection)
@@ -323,9 +328,14 @@ class TestStopAndSizing:
     def test_position_too_small_for_tiny_equity(self):
         # risk budget = 0.02 * $50 = $1; stop distance = 2*2 = $4 → qty = 0
         # cash $50 / price $10 = 5 → cash isn't the binding cap, sizing is.
+        # Use LIMIT order type: LIMIT orders always use whole-share floor()
+        # regardless of FRACTIONAL_ENABLED, so this test is unambiguous.
         mgr = _mgr(max_position_pct=0.02)
         rej = mgr.evaluate(
-            _signal(price=10.0, atr=2.0),
+            _signal(
+                price=10.0, atr=2.0,
+                order_type=OrderType.LIMIT, limit_price=9.5,
+            ),
             _account(equity=50.0, cash=50.0, session_start=50.0),
             now=T0,
         )

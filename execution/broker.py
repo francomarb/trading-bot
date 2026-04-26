@@ -70,11 +70,14 @@ from loguru import logger
 
 from data.fetcher import _install_timeout
 
+import math
+
 from config.settings import (
     ALPACA_API_KEY,
     ALPACA_PAPER,
     ALPACA_SECRET_KEY,
     DRY_RUN,
+    FRACTIONAL_ENABLED,
 )
 from risk.manager import AccountState, Position, RiskDecision, Side
 from strategies.base import OrderType
@@ -351,10 +354,15 @@ class AlpacaBroker:
         poll_interval: float = 1.0,
     ) -> OrderResult:
         """
-        Submit `decision` to Alpaca as a one-triggers-other order: an entry
-        (market or limit, per the strategy's preference) with an attached
-        stop_loss leg at `decision.stop_price`. Polls until terminal or
-        `poll_timeout` elapses.
+        Submit `decision` to Alpaca.
+
+        Whole-share path (FRACTIONAL_ENABLED=False, or qty is a whole number):
+          OTO GTC — entry + stop submitted atomically. Exact original behaviour.
+
+        Fractional path (FRACTIONAL_ENABLED=True and qty has a decimal part):
+          DAY market entry (Alpaca fractional requires DAY TIF, no OTO).
+          After fill: standalone GTC stop for floor(qty) whole shares.
+          The fractional remainder exits via engine exit signals.
 
         Refuses any non-`RiskDecision` input. There is no other way to call
         this — that is the Phase 6 / 7 contract.
@@ -363,6 +371,15 @@ class AlpacaBroker:
             raise TypeError(
                 f"place_order requires a RiskDecision (got {type(decision).__name__}). "
                 "Strategy signals must go through RiskManager.evaluate first."
+            )
+
+        # Route fractional quantities to the DAY-entry + GTC-stop path.
+        # When FRACTIONAL_ENABLED=False, _size_position always returns a whole
+        # number so math.floor(qty) == qty is always True — this branch is
+        # never entered and the OTO path below is byte-for-byte unchanged.
+        if math.floor(decision.qty) != decision.qty:
+            return self._place_fractional_order(
+                decision, poll_timeout=poll_timeout, poll_interval=poll_interval
             )
 
         # Build request object.
@@ -459,6 +476,141 @@ class AlpacaBroker:
             interval=poll_interval,
             stream_event=stream_event,
         )
+
+    def _place_fractional_order(
+        self,
+        decision: RiskDecision,
+        *,
+        poll_timeout: float,
+        poll_interval: float,
+    ) -> OrderResult:
+        """
+        Fractional market entry path — only reached when FRACTIONAL_ENABLED=True
+        and decision.qty has a decimal part.
+
+        Alpaca fractional shares require DAY TIF and cannot use OTO order class,
+        so the entry and stop are submitted as two separate orders:
+          1. DAY MarketOrderRequest (fractional qty, no stop leg).
+          2. After confirmed fill: GTC StopOrderRequest for floor(qty) whole shares.
+
+        If floor(qty) == 0 (qty < 1 share), no stop can be submitted — the
+        position exits via engine exit signals only (logged as WARNING).
+
+        If stop submission fails after a successful fill, an ERROR is logged.
+        The position is unprotected until the engine's next exit signal; close
+        manually if that occurs.
+
+        When FRACTIONAL_ENABLED=False this method is never called — place_order()
+        routes directly to the OTO GTC path, which is byte-for-byte unchanged.
+        """
+        client_order_id = f"{decision.strategy_name}-frac-{uuid.uuid4().hex[:10]}"
+
+        logger.info(
+            f"placing fractional market buy {decision.qty} {decision.symbol} "
+            f"[DAY, stop ${decision.stop_price:.2f}, "
+            f"client_id={client_order_id}]"
+        )
+
+        if self._dry_run:
+            logger.warning(
+                f"DRY RUN — fractional order NOT submitted: "
+                f"market buy {decision.qty} {decision.symbol}"
+            )
+            return OrderResult(
+                status=OrderStatus.FILLED,
+                order_id=f"dry-run-{uuid.uuid4().hex[:10]}",
+                symbol=decision.symbol,
+                requested_qty=decision.qty,
+                filled_qty=decision.qty,
+                avg_fill_price=decision.entry_reference_price,
+                raw_status="dry_run",
+                message="dry run — no order submitted",
+            )
+
+        order_request = MarketOrderRequest(
+            symbol=decision.symbol,
+            qty=decision.qty,
+            side=AlpacaOrderSide.BUY if decision.side is Side.BUY else AlpacaOrderSide.SELL,
+            type=AlpacaOrderType.MARKET,
+            time_in_force=TimeInForce.DAY,   # required for fractional
+            client_order_id=client_order_id,
+            # No order_class / stop_loss — stop submitted separately after fill.
+        )
+
+        # Register with stream before submitting to avoid fill-before-watch race.
+        stream_event: threading.Event | None = None
+        if self._stream_manager is not None:
+            stream_event = self._stream_manager.watch(client_order_id)
+
+        try:
+            order = self._with_retry(
+                lambda: self._api.submit_order(order_request),
+                op_desc=f"submit_frac_order({decision.symbol})",
+            )
+        except APIError as e:
+            logger.error(f"broker rejected fractional {decision.symbol}: {e}")
+            return OrderResult(
+                status=OrderStatus.REJECTED,
+                order_id=None,
+                symbol=decision.symbol,
+                requested_qty=decision.qty,
+                filled_qty=0,
+                avg_fill_price=None,
+                raw_status=None,
+                message=str(e),
+            )
+
+        order_id = str(order.id)
+        if self._stream_manager is not None:
+            stream_event = self._stream_manager.watch(order_id)
+
+        result = self._wait_for_fill(
+            order_id=order_id,
+            symbol=decision.symbol,
+            requested_qty=decision.qty,
+            timeout=poll_timeout,
+            interval=poll_interval,
+            stream_event=stream_event,
+        )
+
+        # Submit standalone GTC stop for the whole-share portion after fill.
+        # Alpaca stop orders require whole shares; fractional remainder exits
+        # via engine exit signals when the strategy fires.
+        if result.status is OrderStatus.FILLED:
+            stop_qty = math.floor(decision.qty)
+            if stop_qty >= 1:
+                stop_client_id = f"frac-stop-{uuid.uuid4().hex[:10]}"
+                stop_request = StopOrderRequest(
+                    symbol=decision.symbol,
+                    qty=stop_qty,
+                    side=AlpacaOrderSide.SELL,
+                    time_in_force=TimeInForce.GTC,
+                    stop_price=round(decision.stop_price, 2),
+                    client_order_id=stop_client_id,
+                )
+                try:
+                    self._with_retry(
+                        lambda: self._api.submit_order(stop_request),
+                        op_desc=f"submit_frac_stop({decision.symbol})",
+                    )
+                    logger.info(
+                        f"[fractional] GTC stop: sell {stop_qty} "
+                        f"{decision.symbol} @ ${decision.stop_price:.2f}"
+                    )
+                except APIError as e:
+                    logger.error(
+                        f"[fractional] stop submission failed for "
+                        f"{decision.symbol}: {e} — position has no stop "
+                        f"protection; close manually or wait for exit signal"
+                    )
+            else:
+                logger.warning(
+                    f"[fractional] {decision.symbol}: qty={decision.qty:.4f} — "
+                    f"no whole-share stop possible (floor=0); "
+                    f"position exits via engine signals only"
+                )
+
+        return result
 
     def cancel_order(self, order_id: str) -> bool:
         """Cancel an order by id. Returns True on success, False on failure."""

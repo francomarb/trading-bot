@@ -118,6 +118,15 @@ LIVE_SIZE_MULTIPLIER: float = float(os.getenv("LIVE_SIZE_MULTIPLIER", "0.25"))
 # Set DRY_RUN=true in the environment; never rely on code-level default alone.
 DRY_RUN: bool = os.getenv("DRY_RUN", "false").lower() in ("true", "1", "yes")
 
+# Fractional share sizing (Phase 10.G6).
+# When True: market orders use round(notional/price, 2) instead of floor(),
+# and the broker submits a DAY entry + standalone GTC stop (floor(qty) whole
+# shares). When False: exact current behaviour — floor() everywhere, OTO GTC
+# entry+stop submitted atomically. Disable once account exceeds ~$10k and
+# whole-share rounding error becomes negligible.
+# Applies to MARKET orders only — LIMIT/GTC orders (RSI) always use floor().
+FRACTIONAL_ENABLED: bool = True
+
 # ── Engine settings (Phase 8 / 10) ──────────────────────────────────────────
 ATR_LENGTH = 14                     # ATR window the engine uses for stops
 ENGINE_TIMEFRAME = "1Day"           # Bar timeframe for the live loop
