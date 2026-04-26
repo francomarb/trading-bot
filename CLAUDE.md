@@ -18,10 +18,10 @@ A Python-based algorithmic trading bot built incrementally, starting with paper 
 | Language | Python 3.12 |
 | Broker / Exchange | Alpaca Markets (paper trading → live) |
 | Data Manipulation | pandas |
-| Technical Indicators | Hand-rolled (SMA, EMA, ATR, RSI in `indicators/technicals.py`) |
+| Technical Indicators | Hand-rolled (SMA, EMA, ATR, RSI, ADX in `indicators/technicals.py`) |
 | Backtesting | vectorbt |
 | API Client | alpaca-py (official SDK) |
-| Trade Logging | sqlite3 (`data/trades.db`) |
+| Trade Logging | sqlite3 (`data/trades.db` paper / `data/trades_live.db` live) |
 | Environment Config | python-dotenv (loaded from `config/.env`) |
 | Logging | loguru (rotating file + console sinks) |
 
@@ -39,36 +39,48 @@ trading-bot/
 ├── main.py                    # Entry point
 ├── forward_test.py            # Launches engine for multi-week paper runs
 ├── start_bot.sh               # tmux + caffeinate launcher
+├── stop_bot.sh                # Graceful shutdown
+├── recycle_bot.sh             # stop + start (picks up code changes)
 ├── config/
-│   ├── .env                   # API keys (never committed)
+│   ├── .env                   # API keys and runtime flags (never committed)
 │   └── settings.py            # Centralized config (symbols, risk params, etc.)
 ├── data/
 │   ├── fetcher.py             # Market data retrieval via StockHistoricalDataClient
-│   ├── trades.db              # SQLite trade log (gitignored)
+│   ├── trades.db              # Paper SQLite trade log (gitignored)
+│   ├── trades_live.db         # Live SQLite trade log (gitignored)
 │   └── historical/            # Cached historical bars
 ├── indicators/
-│   └── technicals.py          # SMA, EMA, ATR, RSI (hand-rolled)
+│   └── technicals.py          # SMA, EMA, ATR, RSI, ADX (hand-rolled)
 ├── strategies/
-│   ├── base.py                # BaseStrategy, SignalFrame, StrategySlot, Scanner
+│   ├── base.py                # BaseStrategy, SignalFrame, StrategySlot, WatchlistSource
 │   ├── sma_crossover.py       # Trend-following: SMA crossover
-│   └── rsi_reversion.py       # Mean-reversion: RSI oversold/overbought
+│   ├── rsi_reversion.py       # Mean-reversion: RSI oversold/overbought
+│   └── filters/
+│       ├── common.py          # SPYTrendFilter (shared macro gate)
+│       ├── sma_crossover.py   # SMAEdgeFilter: stock > 200 SMA, volume expansion
+│       └── rsi_reversion.py   # RSIEdgeFilter: SPY dual macro, earnings blackout, liquidity, no-new-low
+├── regime/
+│   └── detector.py            # RegimeDetector: BEAR/VOLATILE/TRENDING/RANGING (ADX + ATR%)
 ├── engine/
 │   └── trader.py              # TradingEngine — the live loop orchestrator
 ├── backtest/
 │   ├── runner.py              # vectorbt backtesting harness
 │   └── reconcile.py           # Forward-test reconciliation (paper vs backtest)
 ├── execution/
-│   └── broker.py              # AlpacaBroker — TradingClient wrapper
+│   └── broker.py              # AlpacaBroker — TradingClient wrapper + fractional path
 ├── risk/
-│   └── manager.py             # RiskManager: sizing, drawdown, stop-loss
+│   ├── manager.py             # RiskManager: sizing, drawdown, stop-loss, kill switches
+│   └── allocator.py           # SleeveAllocator: per-strategy capital budgets
 ├── reporting/
 │   ├── logger.py              # TradeLogger — SQLite trade log
 │   ├── metrics.py             # Sharpe, drawdown, profit factor, win rate
 │   ├── pnl.py                 # PnLTracker — daily/weekly reports
 │   └── alerts.py              # AlertDispatcher with pluggable backends
 ├── scripts/
-│   └── gonogo.py              # Go/no-go checker for live readiness
-├── tests/                     # 352 unit tests (pytest)
+│   ├── preflight.py           # Pre-flight checklist (must exit 0 before live flip)
+│   ├── gonogo.py              # Go/no-go checker for live readiness
+│   └── *.py                   # Watchlist scanners and analysis scripts
+├── tests/                     # 646 unit tests (pytest)
 ├── logs/                      # Rotating log files (gitignored)
 └── phase*_verify.py           # Integration verification scripts per phase
 ```
@@ -80,10 +92,22 @@ trading-bot/
 Stored in `config/.env` (never commit this file):
 
 ```
-ALPACA_API_KEY=your_key_here
-ALPACA_SECRET_KEY=your_secret_here
-ALPACA_PAPER=true        # Set to false for live trading
+# Paper credentials (default)
+ALPACA_API_KEY=your_paper_key
+ALPACA_SECRET_KEY=your_paper_secret
+
+# Live credentials (only used when LIVE_TRADING=true)
+ALPACA_API_KEY_LIVE=your_live_key
+ALPACA_SECRET_KEY_LIVE=your_live_secret
+
+# Runtime flags
+LIVE_TRADING=false          # Set true only after preflight.py exits 0
+DRY_RUN=false               # Log orders without submitting (sanity check)
+LIVE_SIZE_MULTIPLIER=0.25   # Scale live position sizes to 25% at launch
 ```
+
+All credential and DB routing derives from `LIVE_TRADING`. Do not set
+`ALPACA_PAPER` directly — it is derived automatically in `config/settings.py`.
 
 ---
 
@@ -168,56 +192,58 @@ python phase2_verify.py
 
 ## Current Phase
 
-**Phase 10 — In Progress (2026-04-24). Phases 1–9 and 9.5 complete.**
+**Phase 10 — In Progress (2026-04-26). Phases 1–9 and 9.5 complete.**
+**Tagged: `v1.0.0-beta.0`**
 
-Only **SMA Crossover** is currently active in `forward_test.py`.
-RSI Reversion is implemented and backtested but not yet running. RSI activation
-is a Phase 10 paper-mode deliverable (10.F4).
+Both **SMA Crossover** and **RSI Reversion** are active in `forward_test.py`.
 
-Phase 10 completed to date (2026-04-24):
-- **10.B1** Live config separation (`LIVE_TRADING` flag, separate credentials, `trades_live.db`)
-- **10.B2** Pre-flight checklist (`scripts/preflight.py`)
-- **10.B3** `WatchlistSource` abstraction + `StaticWatchlistSource`; `forward_test.py` wired
-- **10.C1** Durable position ownership restored from trade DB on restart
-- **10.C2** Startup reconciliation with NORMAL / RESTRICTED fail-safe modes
-- **10.C3/C4** Tests + external-close detection with 3-cycle confirmation window
-- **10.E1** WebSocket order/fill streaming via `TradingStream` (stream-first, REST fallback)
-- **10.G1** `LIVE_SIZE_MULTIPLIER=0.25` applied in risk manager when live
-- **10.G4** `DRY_RUN` flag — broker logs orders without submitting
+### Phase 10 completed items
 
-Phase 10 completed to date (continued 2026-04-25):
-- **10.F3a** SMA edge filter: stock > 200 SMA + volume expansion; SPY > 200 SMA disabled (regime owns it)
-- **10.F3b** RSI edge filter: SPY dual macro + earnings blackout (3/2) + liquidity floor + no-new-low
-- **10.F2** Regime Detector: BEAR/VOLATILE/TRENDING/RANGING; SPY bars, TTL-cached; `add_adx()` in technicals
-- **10.F3** Engine regime gating: `StrategySlot.allowed_regimes`; per-slot block in `_run_one_cycle`; exits never blocked
-- **10.F1** Capital sleeve allocator: `SleeveAllocator` in `risk/allocator.py`; 50/50 SMA/RSI; `MAX_GROSS_EXPOSURE_PCT` → 0.80; `notional_cap` threaded into `RiskManager`
+| Item | Description |
+|---|---|
+| **10.B1** | Live config separation (`LIVE_TRADING` flag, separate credentials, `trades_live.db`) |
+| **10.B2** | Pre-flight checklist (`scripts/preflight.py`) |
+| **10.B3** | `WatchlistSource` abstraction + `StaticWatchlistSource`; `forward_test.py` wired |
+| **10.C1** | Durable position ownership restored from trade DB on restart |
+| **10.C2** | Startup reconciliation with NORMAL / RESTRICTED fail-safe modes |
+| **10.C3/C4** | External-close detection with 3-cycle confirmation window |
+| **10.E1** | WebSocket order/fill streaming via `TradingStream` (stream-first, REST fallback) |
+| **10.F1** | `SleeveAllocator` in `risk/allocator.py` — 50/50 SMA/RSI, $8k per-position cap, `MAX_GROSS_EXPOSURE_PCT` → 0.80 |
+| **10.F2** | `RegimeDetector` in `regime/detector.py` — BEAR/VOLATILE/TRENDING/RANGING (ADX + ATR% percentile) |
+| **10.F3** | Engine regime gating — `StrategySlot.allowed_regimes`; exits never blocked |
+| **10.F3a** | `SMAEdgeFilter` — stock > 200 SMA, volume expansion (10d > 30d avg) |
+| **10.F3b** | `RSIEdgeFilter` — SPY dual macro, earnings blackout (3/2), liquidity floor, no-new-low |
+| **10.F4** | RSI paper activation — both strategies running with full gating |
+| **10.G1** | `LIVE_SIZE_MULTIPLIER=0.25` in risk manager when live |
+| **10.G4** | `DRY_RUN` flag — broker logs orders without submitting |
+| **10.G6** | Fractional share sizing — `FRACTIONAL_ENABLED` flag; DAY entry + standalone GTC stop; disable at ~$10k |
 
-Phase 10 remaining blockers before live (see PLAN.md):
-- 10.D1/D2 Slippage kill switch calibration (needs ≥10 real fills)
-- 10.F4 RSI paper activation (requires F1 ✅ + filter ✅)
-- 10.F5 Portfolio concentration guardrails
-- 10.G2 Hard dollar cap config; 10.G5 Go/no-go verification
-- Minimum 2-week SMA + RSI combined paper run before any live flip
+### Phase 10 remaining before live flip
 
-Total: 630 unit tests passing.
+| Item | Description | Blocker |
+|---|---|---|
+| **10.D1** | Review paper fills, compute mean realized slippage | ≥10 fills needed |
+| **10.D2** | Enable `SLIPPAGE_DRIFT_ENABLED=True` | Blocked on D1 |
+| **10.F6** | Operational verify — both strategies gated and sleeve-capped in logs | Runs as bot runs |
+| **10.G2** | Set `HARD_DOLLAR_LOSS_CAP` in live `.env` (config only) | Anytime |
+| **10.G5** | Pre-flight passes on live endpoint; dry-run cycle; manual approval for first order | After G2 |
+| **10.H1–H5** | Cloud VPS, systemd service, key management, remote monitoring, log shipping | Post-paper |
 
-**Next steps:**
-1. Let `python forward_test.py` run through next market week (Monday 2026-04-28).
-2. After ≥10 real fills → enable slippage kill switch (10.D1/D2).
-3. Implement per-strategy capital allocation (10.F1).
-4. Then RSI paper activation (10.F4) + concentration guardrails (10.F5).
+Minimum gate before live flip: **D1 + D2 + G2 + G5 + ≥2 weeks combined SMA+RSI paper run.**
+
+**Total: 646 unit tests passing.**
 
 ---
 
 ## Manual Restart Verification (Phase 10 operational gate — completed 2026-04-24)
 
 Verified live with MU + NVDA open. Both restored from trade DB record; NORMAL
-mode confirmed. Expected startup log pattern for reference:
+mode confirmed. Expected startup log pattern for reference (2 slots active):
 
 **Position found and assigned from DB:**
 ```
 restart: assigned existing position MU → 'sma_crossover' (trade DB record)
-engine starting: 1 slot(s) [sma_crossover(16)], 16 unique symbol(s),
+engine starting: 2 slot(s) [sma_crossover(16), rsi_reversion(5)], 21 unique symbol(s),
   session_start_equity=$..., open_positions=2, open_orders=2
 ```
 

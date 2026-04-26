@@ -22,7 +22,7 @@
 | 8 | Trading Engine (Main Loop) | ✅ Complete |
 | 9 | Trade Reporting & P&L | ✅ Complete |
 | 9.5 | Forward-Test (Paper, Multi-Week) | 🔄 In Progress (infrastructure complete, awaiting multi-week run) |
-| 10 | Live Trading Transition | 🔄 In Progress (Groups A–C complete; paper-validating before Group D) |
+| 10 | Live Trading Transition | 🔄 In Progress — SMA + RSI both paper-live; tagged `v1.0.0-beta.0`; blocked on ≥10 fills for slippage gate + 2-week combined run |
 | 11 | Multi-Strategy, Regime Detection & Portfolio Layer | ⬜ Not Started *(post-live)* |
 
 **Legend:** ⬜ Not Started · 🔄 In Progress · ✅ Complete
