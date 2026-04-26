@@ -10,10 +10,11 @@ SMAEdgeFilter gates new entries on three active conditions:
      200 SMA ensures the crossover aligns with the long-term trend.
      Fails open (allows) when history is insufficient (<200 bars).
 
-  2. Volume expansion — 10-day average volume > 30-day average volume.
+  2. Volume expansion — 10-day median volume > 30-day median volume.
      A crossover on contracting volume is a weak signal; institutions are
      not participating. Expanding volume confirms that the move has
-     underlying demand behind it.
+     underlying demand behind it. Using median instead of mean prevents
+     false lockouts from massive single-day volume spikes.
      Fails open when insufficient bars or no volume column.
 
   3. Pre-earnings blackout — block new entries within 2 calendar days
@@ -78,7 +79,7 @@ class SMAEdgeFilter:
 
     Gates (all must pass for a new entry):
       1. Stock close > stock 200-day SMA  (structural strength)
-      2. 10-day avg volume > 30-day avg volume  (institutional participation)
+      2. 10-day median volume > 30-day median volume  (institutional participation)
       3. Not within 2 calendar days before earnings  (gap-risk protection)
 
     The SPY > 200 SMA gate is intentionally disabled — it is owned by
@@ -148,20 +149,21 @@ class SMAEdgeFilter:
 
     def _volume_expanding(self, df: pd.DataFrame) -> pd.Series:
         """
-        True where the short-window average volume > long-window average volume.
+        True where the short-window median volume > long-window median volume.
         Expanding volume confirms institutional participation in the crossover.
+        Using median protects against false lockouts from single-day volume outliers.
         Fails open when volume column is absent or there are insufficient bars.
         """
         if "volume" not in df.columns:
             return pd.Series(True, index=df.index, dtype=bool)
 
         vol = df["volume"].astype(float)
-        short_avg = vol.rolling(self._vol_short).mean()
-        long_avg  = vol.rolling(self._vol_long).mean()
-        expanding = short_avg > long_avg
+        short_med = vol.rolling(self._vol_short).median()
+        long_med  = vol.rolling(self._vol_long).median()
+        expanding = short_med > long_med
 
-        # Fail open when either average is NaN (insufficient history).
-        has_data = short_avg.notna() & long_avg.notna()
+        # Fail open when either median is NaN (insufficient history).
+        has_data = short_med.notna() & long_med.notna()
         expanding = expanding.where(has_data, other=True)
         return expanding.astype(bool)
 
@@ -200,7 +202,7 @@ class SMAEdgeFilter:
                 if not vol_ok:
                     reasons.append(
                         f"volume contracting "
-                        f"(avg{self._vol_short} ≤ avg{self._vol_long})"
+                        f"(med{self._vol_short} ≤ med{self._vol_long})"
                     )
                 if not earnings_ok:
                     reasons.append("earnings blackout (gap-risk protection)")

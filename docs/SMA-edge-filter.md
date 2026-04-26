@@ -53,10 +53,10 @@ This is computed from the same historical bars already fetched for the symbol �
 
 ### Gate 2 — Volume Expansion
 
-**Rule:** 10-day average volume > 30-day average volume
+**Rule:** 10-day median volume > 30-day median volume
 
 **Why:**
-A crossover on contracting volume is a weak signal. If institutions are not participating — volume is shrinking relative to the recent baseline — the move is likely noise rather than the start of a sustained trend. Expanding volume (10-day average exceeding 30-day average) confirms that demand is growing, not fading, at the point of the crossover.
+A crossover on contracting volume is a weak signal. If institutions are not participating — volume is shrinking relative to the recent baseline — the move is likely noise rather than the start of a sustained trend. Expanding volume (10-day median exceeding 30-day median) confirms that demand is growing, not fading, at the point of the crossover. We use the median rather than the mean to prevent a single massive volume spike (e.g. an old earnings event 25 days ago) from artificially inflating the 30-day baseline and causing false lockouts.
 
 **Fail-open:** if the `volume` column is absent or there are fewer than 30 bars of history (NaN rolling averages), the gate returns `True`. Volume data absence does not silently block trades.
 
@@ -113,9 +113,9 @@ DEBUG | SMAEdgeFilter: ALLOWED MU — stock>200SMA vol_expanding no_earnings_bla
 **Entry blocked** (all failing gates listed):
 ```
 INFO | SMAEdgeFilter: BLOCKED NVDA — stock 118.32 ≤ SMA200 124.57
-INFO | SMAEdgeFilter: BLOCKED WDC — volume contracting (avg10 ≤ avg30)
+INFO | SMAEdgeFilter: BLOCKED WDC — volume contracting (med10 ≤ med30)
 INFO | SMAEdgeFilter: BLOCKED DELL — earnings blackout (gap-risk protection)
-INFO | SMAEdgeFilter: BLOCKED CIEN — stock 42.10 ≤ SMA200 45.88, volume contracting (avg10 ≤ avg30)
+INFO | SMAEdgeFilter: BLOCKED CIEN — stock 42.10 ≤ SMA200 45.88, volume contracting (med10 ≤ med30)
 ```
 
 Allowed decisions log at DEBUG (high-frequency, not noise-worthy). Blocked decisions log at INFO (operator should know why a setup was suppressed).
