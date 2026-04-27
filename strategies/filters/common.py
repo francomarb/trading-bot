@@ -195,7 +195,10 @@ class EarningsBlackout:
             ticker = yf.Ticker(symbol)
             dates: list[datetime.date] = []
 
-            # Determine quote type using permanent cache to avoid rate limits
+            # Determine quote type using permanent cache to avoid rate limits.
+            # NOTE: We use yfinance for this because Alpaca groups all stocks and ETFs
+            # under the generic 'us_equity' asset class and does not expose a native
+            # quote_type or is_etf flag.
             qtype = self._quote_types.get(symbol)
             if not qtype:
                 with open(os.devnull, "w") as devnull:
