@@ -172,6 +172,8 @@ class EarningsBlackout:
         self._symbol: str = ""
         # Cache: symbol → (cache_date, list[date])
         self._cache: dict[str, tuple[datetime.date, list[datetime.date]]] = {}
+        # Permanent cache: symbol → quoteType (e.g. "EQUITY", "ETF")
+        self._quote_types: dict[str, str] = {}
 
     def set_symbol(self, symbol: str) -> None:
         """Called by BaseStrategy.generate_signals before __call__."""
@@ -193,7 +195,24 @@ class EarningsBlackout:
             ticker = yf.Ticker(symbol)
             dates: list[datetime.date] = []
 
-            # Suppress yfinance internal HTTP 404 / 'delisted' prints for ETFs
+            # Determine quote type using permanent cache to avoid rate limits
+            qtype = self._quote_types.get(symbol)
+            if not qtype:
+                with open(os.devnull, "w") as devnull:
+                    with contextlib.redirect_stdout(devnull), contextlib.redirect_stderr(devnull):
+                        # Use fast_info if possible, fallback to info
+                        try:
+                            qtype = str(ticker.info.get("quoteType", "EQUITY")).upper()
+                        except Exception:
+                            qtype = "EQUITY"
+                self._quote_types[symbol] = qtype
+
+            if qtype == "ETF":
+                # ETFs do not have quarterly earnings; skip the calendar fetch completely
+                self._cache[symbol] = (today, dates)
+                return dates
+
+            # Suppress yfinance internal prints for missing data
             with open(os.devnull, "w") as devnull:
                 with contextlib.redirect_stdout(devnull), contextlib.redirect_stderr(devnull):
                     cal = ticker.calendar
@@ -227,9 +246,15 @@ class EarningsBlackout:
                         pass
 
             self._cache[symbol] = (today, dates)
-            logger.debug(
-                f"EarningsBlackout: {symbol} — found {len(dates)} earnings dates"
-            )
+            if not dates:
+                logger.warning(
+                    f"EarningsBlackout: {symbol} — found 0 earnings dates. "
+                    f"This {qtype} is missing fundamental calendar data in Yahoo Finance!"
+                )
+            else:
+                logger.debug(
+                    f"EarningsBlackout: {symbol} — found {len(dates)} earnings dates"
+                )
             return dates
 
         except Exception as e:
