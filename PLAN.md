@@ -637,13 +637,14 @@ reason.
 | 11.10 | **Strategy health monitor** — rolling expectancy + rolling Sharpe per strategy; automatic capital reduction or disable when performance degrades beyond a threshold. | ⬜ |
 | 11.11 | **Strategy re-enable workflow** — disabled strategies require manual review + a fresh paper forward-test before being re-enabled. | ⬜ |
 | 11.12 | **Kelly criterion for evidence-based sleeve weight optimization** — Use fractional Kelly to suggest strategy weights based on real trade win rates and win/loss ratios. Advisory only, for dashboard tracking. | ⬜ |
-| 11.13 | **Dashboard / report** — per-strategy P&L, regime history, capital allocation over time. | ⬜ |
-| 11.14 | **Event-based backtester for limit orders** — supplement `runner.py` with an event-driven harness that models limit order fill realism (price must touch and hold). Required for honest RSI reversion backtesting. | ⬜ |
-| 11.15 | **Third strategy (optional): Volatility Breakout** — range compression + breakout, gated to volatility-expansion regime. | ⬜ |
-| 11.16 | **Intraday market-data stream** — `StockDataStream` for real-time bars/quotes/trades (deferred until intraday strategy exists). | ⬜ |
-| 11.17 | **Incremental online signal generation** — deque-based algorithm that processes one new bar at a time (needed for intraday). | ⬜ |
-| 11.18 | **ML edge filter** — train a direction classifier on lagged log-return features; plug it into `edge_filter`. | ⬜ |
-| 11.19 | **Sentiment overlay** — bidirectional signal design using scored headlines/sentiment data to confirm or block entries. Negative sentiment has hard veto power; positive sentiment is additive confirmation only. | ⬜ |
+| 11.13 | **Real-Time Mobile Awareness (Telegram Bot)** — implement a `TelegramAlertBackend` in `reporting/alerts.py`. Sends push notifications to a private channel for executed trades, regime shifts, end-of-day summaries, and kill-switch events. Optional: interactive commands (`/status`, `/halt`). | ⬜ |
+| 11.14 | **Read-Only Analytics Dashboard (Streamlit)** — a single `dashboard.py` running on the VPS to visualize bot internals. Connects to `trades.db` and daily P&L logs to chart equity curves, rolling Sharpe, strategy health, and active watchlists. Accessible via web browser. | ⬜ |
+| 11.15 | **Event-based backtester for limit orders** — supplement `runner.py` with an event-driven harness that models limit order fill realism (price must touch and hold). Required for honest RSI reversion backtesting. | ⬜ |
+| 11.16 | **Third strategy (optional): Volatility Breakout** — range compression + breakout, gated to volatility-expansion regime. | ⬜ |
+| 11.17 | **Intraday market-data stream** — `StockDataStream` for real-time bars/quotes/trades (deferred until intraday strategy exists). | ⬜ |
+| 11.18 | **Incremental online signal generation** — deque-based algorithm that processes one new bar at a time (needed for intraday). | ⬜ |
+| 11.19 | **ML edge filter** — train a direction classifier on lagged log-return features; plug it into `edge_filter`. | ⬜ |
+| 11.20 | **Sentiment overlay** — bidirectional signal design using scored headlines/sentiment data to confirm or block entries. Negative sentiment has hard veto power; positive sentiment is additive confirmation only. | ⬜ |
 
 **Exit Criteria:** Advanced portfolio enhancements run safely on top of the Phase 10
 SMA + RSI baseline. Optional third strategies, dynamic allocation, advanced concentration
