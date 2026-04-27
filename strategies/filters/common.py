@@ -79,7 +79,9 @@ class SPYTrendFilter:
             return self._spy_cache
         try:
             from data.fetcher import fetch_symbol
-            df = fetch_symbol("SPY", "1Day", lookback_days=self._lookback_days)
+            end = datetime.datetime.now(datetime.timezone.utc)
+            start = end - datetime.timedelta(days=self._lookback_days)
+            df, _stats = fetch_symbol("SPY", start, end, timeframe="1Day")
             self._spy_cache = df
             self._cache_time = now
             logger.debug(
@@ -185,11 +187,18 @@ class EarningsBlackout:
 
         try:
             import yfinance as yf
+            import os
+            import contextlib
+            
             ticker = yf.Ticker(symbol)
             dates: list[datetime.date] = []
 
-            # Upcoming earnings from .calendar
-            cal = ticker.calendar
+            # Suppress yfinance internal HTTP 404 / 'delisted' prints for ETFs
+            with open(os.devnull, "w") as devnull:
+                with contextlib.redirect_stdout(devnull), contextlib.redirect_stderr(devnull):
+                    cal = ticker.calendar
+                    hist = ticker.earnings_dates
+
             if cal is not None and not (
                 isinstance(cal, pd.DataFrame) and cal.empty
             ):
@@ -210,8 +219,6 @@ class EarningsBlackout:
                             except Exception:
                                 pass
 
-            # Historical earnings from .earnings_dates
-            hist = ticker.earnings_dates
             if hist is not None and not hist.empty:
                 for idx in hist.index:
                     try:
