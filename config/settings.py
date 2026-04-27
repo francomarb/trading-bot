@@ -138,7 +138,7 @@ ENGINE_HISTORY_LOOKBACK_DAYS = 300  # Calendar days of stock history per cycle.
                                     # 300 cd ≈ 206 trading days — required by
                                     # SMAEdgeFilter's stock 200-day SMA gate.
 ENGINE_CYCLE_INTERVAL_SECONDS = 300 # 5 min between cycles for daily strategy
-ENGINE_MAX_BAR_AGE_MULTIPLIER = 2.5 # Stale guard: refuse to trade if last bar
+ENGINE_MAX_BAR_AGE_MULTIPLIER = 4.0 # Stale guard: refuse to trade if last bar
                                     # is older than (bar_interval × multiplier)
 ENGINE_MARKET_HOURS_ONLY = True     # Only trade during regular session
 # Preserve OTO stop-loss legs across bot restarts. Manual liquidation paths
