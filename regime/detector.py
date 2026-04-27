@@ -187,7 +187,10 @@ class RegimeDetector:
 
         try:
             from data.fetcher import fetch_symbol
-            df = fetch_symbol("SPY", "1Day", lookback_days=self._lookback_days)
+            import datetime
+            end = datetime.datetime.now(datetime.timezone.utc)
+            start = end - datetime.timedelta(days=self._lookback_days)
+            df, _stats = fetch_symbol("SPY", start, end, timeframe="1Day")
             self._spy_cache      = df
             self._spy_cache_time = now
             logger.debug(f"RegimeDetector: fetched {len(df)} SPY bars")
