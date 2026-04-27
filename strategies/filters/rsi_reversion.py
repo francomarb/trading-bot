@@ -63,7 +63,7 @@ from strategies.filters.common import EarningsBlackout, SPYTrendFilter
 
 
 _VOL_MIN_WINDOW = 20       # days for average volume calculation
-_VOL_MIN_AVG    = 500_000  # minimum average daily share volume
+_NOTIONAL_MIN_AVG = 10_000_000  # minimum average daily dollar volume ($)
 _NEW_LOW_WINDOW = 20       # bars to look back for breakdown detection
 
 
@@ -74,7 +74,7 @@ class RSIEdgeFilter:
     Gates (all must pass for a new entry):
       1. SPY > 200 SMA AND SPY > 50 SMA
       2. Not within earnings blackout window
-      3. 20-day average volume ≥ vol_min_avg shares (liquidity floor)
+      3. 20-day average dollar volume ≥ notional_min_avg (liquidity floor)
       4. Current close > min close of prior new_low_window bars (no active breakdown)
 
     Args:
@@ -83,7 +83,7 @@ class RSIEdgeFilter:
         days_before:       Earnings blackout days before the event (default 3).
         days_after:        Earnings blackout days after the event (default 2).
         vol_min_window:    Rolling window for average volume check (default 20).
-        vol_min_avg:       Minimum average daily volume in shares (default 500_000).
+        notional_min_avg:  Minimum average daily dollar volume (default 10_000_000).
         new_low_window:    Bars to look back for new-low breakdown detection (default 20).
     """
 
@@ -95,7 +95,7 @@ class RSIEdgeFilter:
         days_before: int = 3,
         days_after: int = 2,
         vol_min_window: int = _VOL_MIN_WINDOW,
-        vol_min_avg: int = _VOL_MIN_AVG,
+        notional_min_avg: int = _NOTIONAL_MIN_AVG,
         new_low_window: int = _NEW_LOW_WINDOW,
     ) -> None:
         self._spy_filter = SPYTrendFilter(
@@ -108,7 +108,7 @@ class RSIEdgeFilter:
             days_after=days_after,
         )
         self._vol_min_window = vol_min_window
-        self._vol_min_avg    = vol_min_avg
+        self._notional_min_avg = notional_min_avg
         self._new_low_window = new_low_window
         self._symbol: str = ""
 
@@ -119,14 +119,14 @@ class RSIEdgeFilter:
 
     def _volume_liquid(self, df: pd.DataFrame) -> pd.Series:
         """
-        True where 20-day average volume ≥ vol_min_avg.
+        True where 20-day average dollar volume ≥ notional_min_avg.
         Fails open (True) when no volume column or insufficient history.
         """
-        if "volume" not in df.columns:
+        if "volume" not in df.columns or "close" not in df.columns:
             return pd.Series(True, index=df.index, dtype=bool)
-        vol = df["volume"].astype(float)
-        avg = vol.rolling(self._vol_min_window).mean()
-        liquid = avg >= self._vol_min_avg
+        dollar_vol = df["close"].astype(float) * df["volume"].astype(float)
+        avg = dollar_vol.rolling(self._vol_min_window).mean()
+        liquid = avg >= self._notional_min_avg
         # NaN (insufficient bars) → fail open
         liquid = liquid.where(avg.notna(), other=True)
         return liquid.astype(bool)
@@ -174,15 +174,15 @@ class RSIEdgeFilter:
                 if not earn_ok:
                     reasons.append("earnings blackout")
                 if not vol_ok:
-                    avg_vol = (
-                        df["volume"].astype(float)
-                        .rolling(self._vol_min_window).mean().iloc[-1]
-                        if "volume" in df.columns else float("nan")
-                    )
-                    avg_str = f"{avg_vol:,.0f}" if pd.notna(avg_vol) else "NaN"
+                    if "volume" in df.columns and "close" in df.columns:
+                        dollar_vol = df["close"].astype(float) * df["volume"].astype(float)
+                        avg_vol = dollar_vol.rolling(self._vol_min_window).mean().iloc[-1]
+                    else:
+                        avg_vol = float("nan")
+                    avg_str = f"${avg_vol:,.0f}" if pd.notna(avg_vol) else "NaN"
                     reasons.append(
-                        f"volume illiquid (avg{self._vol_min_window}={avg_str} "
-                        f"< {self._vol_min_avg:,})"
+                        f"liquidity too low (avg_dollar_vol{self._vol_min_window}={avg_str} "
+                        f"< ${self._notional_min_avg:,})"
                     )
                 if not low_ok:
                     reasons.append(
