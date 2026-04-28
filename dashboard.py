@@ -360,6 +360,68 @@ def render_dashboard() -> None:
 
     st.divider()
 
+    # ── Watchlists ───────────────────────────────────────────────────────
+    st.subheader("Active Watchlists")
+    strategy_watchlists = settings.STRATEGY_WATCHLISTS
+    strategy_allowed_regimes = settings.STRATEGY_ALLOWED_REGIMES
+    open_positions = state.get("open_positions") or {}
+
+    if not strategy_watchlists:
+        st.info("No strategy watchlists configured.")
+    else:
+        tabs = st.tabs([s.replace("_", " ").title() for s in strategy_watchlists])
+        for tab, (strat_name, symbols) in zip(tabs, strategy_watchlists.items()):
+            with tab:
+                allowed = strategy_allowed_regimes.get(strat_name, set())
+                regime_ok = (
+                    regime in allowed if regime else None
+                )
+                gate_label = (
+                    "✅ Entries allowed" if regime_ok
+                    else ("🚫 Entries blocked" if regime_ok is False else "⚪ Market closed")
+                )
+                st.caption(
+                    f"Regime: {_regime_color(regime)} {regime or '—'}  |  Gate: {gate_label}  |  "
+                    f"{len(symbols)} symbols"
+                )
+
+                # Last trade per symbol from the DB
+                strat_trades = (
+                    trades_df[trades_df["strategy"] == strat_name]
+                    if not trades_df.empty and "strategy" in trades_df.columns
+                    else pd.DataFrame()
+                )
+                last_trade: dict[str, dict] = {}
+                if not strat_trades.empty:
+                    for sym, grp in strat_trades.groupby("symbol"):
+                        last = grp.sort_values("timestamp").iloc[-1]
+                        last_trade[sym] = {
+                            "date": last["timestamp"].strftime("%Y-%m-%d") if pd.notna(last["timestamp"]) else "—",
+                            "side": last.get("side", ""),
+                            "price": last.get("avg_fill_price"),
+                        }
+
+                rows = []
+                for sym in symbols:
+                    is_open = sym in open_positions and open_positions[sym] == strat_name
+                    lt = last_trade.get(sym, {})
+                    price = lt.get("price")
+                    rows.append({
+                        "symbol": sym,
+                        "status": "🟢 Long" if is_open else "⚪ Flat",
+                        "last trade": lt.get("date", "—"),
+                        "last side": lt.get("side", "—").upper() if lt.get("side") else "—",
+                        "last price": f"${float(price):,.2f}" if price else "—",
+                    })
+
+                st.dataframe(
+                    pd.DataFrame(rows),
+                    use_container_width=True,
+                    hide_index=True,
+                )
+
+    st.divider()
+
     # ── Recent trades ────────────────────────────────────────────────────
     st.subheader("Recent Trades (last 20)")
     if trades_df.empty:

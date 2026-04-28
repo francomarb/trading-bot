@@ -61,6 +61,18 @@ RSI_WATCHLIST = [
 # SECTOR_MAP dictionary to ensure proper Relative Strength diagnostic reporting.
 WATCHLIST = list(dict.fromkeys(SMA_WATCHLIST + RSI_WATCHLIST))
 
+# ── Per-strategy dashboard metadata ─────────────────────────────────────────
+# Maps strategy_name → watchlist and allowed market regimes.
+# Add a new strategy here (one entry) and the dashboard picks it up automatically.
+STRATEGY_WATCHLISTS: dict[str, list[str]] = {
+    "sma_crossover": SMA_WATCHLIST,
+    "rsi_reversion":  RSI_WATCHLIST,
+}
+STRATEGY_ALLOWED_REGIMES: dict[str, set[str]] = {
+    "sma_crossover": {"TRENDING", "RANGING"},
+    "rsi_reversion":  {"TRENDING", "RANGING"},
+}
+
 # ── Capital allocation (Phase 10.F1) ────────────────────────────────────────
 # Per-strategy sleeve budgets. Each entry maps strategy_name →
 #   weight:        fraction of gross capital for this strategy (must sum ≤ 1.0)
