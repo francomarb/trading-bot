@@ -278,7 +278,7 @@ def render_dashboard() -> None:
                 xaxis=dict(gridcolor="rgba(255,255,255,0.05)"),
                 yaxis=dict(gridcolor="rgba(255,255,255,0.05)"),
             )
-            st.plotly_chart(fig, use_container_width=True)
+            st.plotly_chart(fig, width="stretch")
 
     with right:
         st.subheader("Performance Metrics")
@@ -325,7 +325,7 @@ def render_dashboard() -> None:
         display["win_rate"] = display["win_rate"].map("{:.1%}".format)
         display["total_pnl"] = display["total_pnl"].map("${:,.2f}".format)
         display["avg_slippage_bps"] = display["avg_slippage_bps"].map("{:.1f} bps".format)
-        st.dataframe(display, use_container_width=True, hide_index=True)
+        st.dataframe(display, width="stretch", hide_index=True)
 
     st.divider()
 
@@ -354,7 +354,7 @@ def render_dashboard() -> None:
                     "cost basis": f"${cost_basis:,.2f}" if cost_basis is not None else "—",
                     "unreal. P&L": f"${upnl:+,.2f}" if upnl is not None else "—",
                 })
-            st.dataframe(pd.DataFrame(pos_data), use_container_width=True, hide_index=True)
+            st.dataframe(pd.DataFrame(pos_data), width="stretch", hide_index=True)
 
     with sleeve_col:
         st.subheader("Sleeve Allocation")
@@ -371,7 +371,7 @@ def render_dashboard() -> None:
                 "open positions": f"{used_count}/{max_pos}",
             })
         if alloc_rows:
-            st.dataframe(pd.DataFrame(alloc_rows), use_container_width=True, hide_index=True)
+            st.dataframe(pd.DataFrame(alloc_rows), width="stretch", hide_index=True)
 
     st.divider()
 
@@ -431,7 +431,7 @@ def render_dashboard() -> None:
 
                 st.dataframe(
                     pd.DataFrame(rows),
-                    use_container_width=True,
+                    width="stretch",
                     hide_index=True,
                 )
 
@@ -454,7 +454,7 @@ def render_dashboard() -> None:
             recent["avg_fill_price"] = recent["avg_fill_price"].map(
                 lambda x: f"${x:,.2f}" if pd.notna(x) else "—"
             )
-        st.dataframe(recent[::-1], use_container_width=True, hide_index=True)
+        st.dataframe(recent[::-1], width="stretch", hide_index=True)
 
     # ── Auto-refresh ──────────────────────────────────────────────────────
     st.caption("Dashboard auto-refreshes every 30 seconds.")
