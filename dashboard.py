@@ -330,11 +330,13 @@ def render_dashboard() -> None:
                 entry = detail.get("avg_entry_price")
                 upnl = detail.get("unrealized_pnl")
                 qty = detail.get("qty")
+                cost_basis = (qty * entry) if (qty is not None and entry is not None) else None
                 pos_data.append({
                     "symbol": sym,
                     "strategy": strat,
                     "qty": qty,
                     "entry $": f"${entry:,.2f}" if entry is not None else "—",
+                    "cost basis": f"${cost_basis:,.2f}" if cost_basis is not None else "—",
                     "unreal. P&L": f"${upnl:+,.2f}" if upnl is not None else "—",
                 })
             st.dataframe(pd.DataFrame(pos_data), use_container_width=True, hide_index=True)
