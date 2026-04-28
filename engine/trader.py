@@ -255,6 +255,7 @@ class TradingEngine:
         # Capture truth-of-the-world before any decision.
         startup_snapshot = self.broker.sync_with_broker()
         self._session_start_equity = startup_snapshot.account.equity
+        self._last_snapshot = startup_snapshot
 
         all_symbols = []
         for slot in self.slots:
