@@ -5,6 +5,9 @@ __pycache__/
 .DS_Store
 data/db/*.db
 data/trades.db
+data/trades_live.db
+data/engine_state.json
+data/engine_state.json.tmp
 data/historical/
 logs/
 .env
