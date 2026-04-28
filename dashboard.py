@@ -291,7 +291,7 @@ def render_dashboard() -> None:
                 if pnl_list:
                     m = compute_metrics(pnl_list)
                     st.metric("Sharpe (annualized)", f"{m.sharpe_ratio:.2f}")
-                    st.metric("Max Drawdown", f"{m.max_drawdown:.1%}")
+                    st.metric("Max Drawdown", f"{m.max_drawdown_pct:.1%}")
                     st.metric("Profit Factor", f"{m.profit_factor:.2f}")
                     st.metric("Win Rate", f"{m.win_rate:.1%}")
                     st.metric("Avg W/L Ratio", f"{m.avg_win_loss_ratio:.2f}")
