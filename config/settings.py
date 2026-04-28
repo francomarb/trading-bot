@@ -35,7 +35,7 @@ ALPACA_BASE_URL = (
 SMA_WATCHLIST = [
     "TERN", "GOOG", "WT", "GOOGL", "TD", "IYZ", "RY", "MS",
     "CM", "JAZZ", "BK", "BMO", "WDC", "FIGS", "VLUE",
-    "MU", "NVDA",
+    "MU", "NVDA", "PG",
 ]
 # RSI Reversion — mean-reversion; static list promoted from:
 #   /Users/franco/trading-bot/scripts/rsi_watchlist_scan.py
@@ -47,7 +47,7 @@ SMA_WATCHLIST = [
 # RSI is implemented but not active in forward_test.py yet. Keep this as the
 # first paper-mode RSI pool unless the post-analysis guardrails are changed.
 RSI_WATCHLIST = [
-    "ALLY", "CDNS", "KBE", "SN", "DINO", "BA", "TFC",
+    "ALLY", "CDNS", "KBE", "SN", "DINO", "BA", "TFC", "HON", "TMUS", "JNJ",
 ]
 # Full engine universe — union of both lists; preserves paper-run continuity.
 #
