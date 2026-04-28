@@ -217,6 +217,7 @@ class TradingEngine:
         self._last_cycle_end: float = 0.0  # monotonic timestamp
         self._last_regime: str | None = None
         self._last_cycle_equity: float | None = None
+        self._last_snapshot: "BrokerSnapshot | None" = None
 
         # Position ownership: symbol → strategy_name.  Tracks which strategy
         # opened each position so that exit signals from a *different* strategy
@@ -355,6 +356,7 @@ class TradingEngine:
                     session_start_equity=self._session_start_equity
                 )
                 self._last_cycle_equity = snapshot.account.equity
+                self._last_snapshot = snapshot
             except Exception as e:
                 cycle_status = "sync_failed"
                 logger.error(f"sync_with_broker failed: {e}; skipping cycle")
@@ -1053,6 +1055,24 @@ class TradingEngine:
             path = settings.STATE_SNAPSHOT_PATH
             equity = self._last_cycle_equity or self._session_start_equity or 0.0
             start_equity = self._session_start_equity or equity
+            # Build enriched position map with entry price and unrealized P&L.
+            positions_detail: dict[str, dict] = {}
+            broker_positions = (
+                self._last_snapshot.account.open_positions
+                if self._last_snapshot else {}
+            )
+            for sym, strat in self._position_owners.items():
+                pos = broker_positions.get(sym)
+                positions_detail[sym] = {
+                    "strategy": strat,
+                    "qty": pos.qty if pos else None,
+                    "avg_entry_price": pos.avg_entry_price if pos else None,
+                    "market_value": pos.market_value if pos else None,
+                    "unrealized_pnl": (
+                        pos.market_value - pos.qty * pos.avg_entry_price
+                        if pos else None
+                    ),
+                }
             state = {
                 "timestamp": datetime.now(timezone.utc).isoformat(),
                 "running": self._running,
@@ -1062,6 +1082,7 @@ class TradingEngine:
                 "session_start_equity": start_equity,
                 "daily_pnl": equity - start_equity,
                 "open_positions": dict(self._position_owners),
+                "positions_detail": positions_detail,
                 "live_trading": settings.LIVE_TRADING,
             }
             parent = os.path.dirname(path)

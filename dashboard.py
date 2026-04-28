@@ -319,14 +319,24 @@ def render_dashboard() -> None:
 
     with pos_col:
         st.subheader("Open Positions")
+        positions_detail = state.get("positions_detail") or {}
         open_positions = state.get("open_positions") or {}
         if not open_positions:
             st.info("No open positions." if is_running else "Engine offline.")
         else:
-            pos_data = [
-                {"symbol": sym, "strategy": strat}
-                for sym, strat in open_positions.items()
-            ]
+            pos_data = []
+            for sym, strat in open_positions.items():
+                detail = positions_detail.get(sym, {})
+                entry = detail.get("avg_entry_price")
+                upnl = detail.get("unrealized_pnl")
+                qty = detail.get("qty")
+                pos_data.append({
+                    "symbol": sym,
+                    "strategy": strat,
+                    "qty": qty,
+                    "entry $": f"${entry:,.2f}" if entry is not None else "—",
+                    "unreal. P&L": f"${upnl:+,.2f}" if upnl is not None else "—",
+                })
             st.dataframe(pd.DataFrame(pos_data), use_container_width=True, hide_index=True)
 
     with sleeve_col:
