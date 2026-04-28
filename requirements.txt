@@ -26,3 +26,4 @@ loguru
 pytest
 pytest-cov
 freezegun
+lxml==6.1.0
