@@ -43,6 +43,8 @@ Design principles (CLAUDE.md / PLAN.md):
 
 from __future__ import annotations
 
+import json
+import os
 import signal
 import time
 from dataclasses import dataclass, field
@@ -213,6 +215,8 @@ class TradingEngine:
         self._session_start_equity: float | None = None
         self._cycle_count: int = 0
         self._last_cycle_end: float = 0.0  # monotonic timestamp
+        self._last_regime: str | None = None
+        self._last_cycle_equity: float | None = None
 
         # Position ownership: symbol → strategy_name.  Tracks which strategy
         # opened each position so that exit signals from a *different* strategy
@@ -350,6 +354,7 @@ class TradingEngine:
                 snapshot = self.broker.sync_with_broker(
                     session_start_equity=self._session_start_equity
                 )
+                self._last_cycle_equity = snapshot.account.equity
             except Exception as e:
                 cycle_status = "sync_failed"
                 logger.error(f"sync_with_broker failed: {e}; skipping cycle")
@@ -391,6 +396,13 @@ class TradingEngine:
             if self._regime_detector is not None:
                 try:
                     current_regime = self._regime_detector.detect()
+                    regime_str = current_regime.value
+                    if (
+                        self._last_regime is not None
+                        and regime_str != self._last_regime
+                    ):
+                        self.alerts.regime_shift(self._last_regime, regime_str)
+                    self._last_regime = regime_str
                 except Exception as exc:
                     logger.warning(
                         f"regime detection failed: {exc} — "
@@ -467,6 +479,7 @@ class TradingEngine:
                 f"duration={duration:.1f}s, "
                 f"next_cycle_in={self.config.cycle_interval_seconds:.0f}s"
             )
+            self._write_state_snapshot()
             # Close idle HTTP connections so they don't go stale during the
             # inter-cycle sleep (5 min default).  Fresh connections are cheap.
             close_connections()
@@ -555,6 +568,17 @@ class TradingEngine:
                 # close_position always uses MARKET (hard-risk exit).
                 self._record_fill(result, modeled_price=latest_close, order_type="market")
                 self._log_close(result, latest_close, strategy.name)
+                if result.status in {OrderStatus.FILLED, OrderStatus.PARTIAL}:
+                    close_price = result.avg_fill_price or latest_close
+                    close_qty = int(result.filled_qty or (position.qty if position else 0))
+                    self.alerts.trade_executed(
+                        symbol=symbol,
+                        strategy=strategy.name,
+                        side="sell",
+                        qty=close_qty,
+                        price=close_price,
+                        reason="exit signal",
+                    )
                 # Release ownership.
                 self._position_owners.pop(symbol, None)
             except Exception as e:
@@ -637,6 +661,14 @@ class TradingEngine:
                 self._position_owners[symbol] = strategy.name
                 fill_price = result.avg_fill_price or decision.entry_reference_price
                 fill_qty = int(result.filled_qty or decision.qty)
+                self.alerts.trade_executed(
+                    symbol=symbol,
+                    strategy=strategy.name,
+                    side="buy",
+                    qty=fill_qty,
+                    price=fill_price,
+                    reason=sig.reason,
+                )
                 return Position(
                     symbol=symbol,
                     qty=fill_qty,
@@ -1006,6 +1038,41 @@ class TradingEngine:
 
         logger.info("startup: NORMAL mode — ownership verified")
         return "NORMAL"
+
+    # ── State snapshot (Phase 11.14) ─────────────────────────────────────
+
+    def _write_state_snapshot(self) -> None:
+        """
+        Write a JSON snapshot of engine state to STATE_SNAPSHOT_PATH.
+
+        Written atomically (tmp → replace) so the dashboard never reads a
+        partial file. Errors are swallowed — a failed snapshot must not
+        affect the trading loop.
+        """
+        try:
+            path = settings.STATE_SNAPSHOT_PATH
+            equity = self._last_cycle_equity or self._session_start_equity or 0.0
+            start_equity = self._session_start_equity or equity
+            state = {
+                "timestamp": datetime.now(timezone.utc).isoformat(),
+                "running": self._running,
+                "cycle_count": self._cycle_count,
+                "regime": self._last_regime,
+                "equity": equity,
+                "session_start_equity": start_equity,
+                "daily_pnl": equity - start_equity,
+                "open_positions": dict(self._position_owners),
+                "live_trading": settings.LIVE_TRADING,
+            }
+            parent = os.path.dirname(path)
+            if parent:
+                os.makedirs(parent, exist_ok=True)
+            tmp = path + ".tmp"
+            with open(tmp, "w") as fh:
+                json.dump(state, fh, indent=2)
+            os.replace(tmp, path)
+        except Exception as exc:
+            logger.debug(f"_write_state_snapshot failed: {exc}")
 
     # ── Market hours ─────────────────────────────────────────────────────
 

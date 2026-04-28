@@ -171,3 +171,20 @@ FORWARD_TEST_DIR = "logs/forward_tests"          # Go/no-go decision docs
 FORWARD_TEST_RETURN_DIVERGENCE_PCT = 0.10        # 10 percentage points
 # Slippage gate: if mean realized slippage exceeds this, no-go.
 FORWARD_TEST_MAX_SLIPPAGE_BPS = 20.0             # 20 bps mean
+
+# ── Telegram / messaging (Phase 11.13) ──────────────────────────────────────
+# Set TELEGRAM_BOT_TOKEN and TELEGRAM_CHAT_ID in config/.env to enable.
+# Leave blank (default) to disable Telegram entirely — bot runs fine without it.
+TELEGRAM_BOT_TOKEN: str = os.getenv("TELEGRAM_BOT_TOKEN", "")
+TELEGRAM_CHAT_ID: str = os.getenv("TELEGRAM_CHAT_ID", "")
+# Set TELEGRAM_COMMANDS_ENABLED=true to enable /status and /halt commands.
+# Requires TELEGRAM_BOT_TOKEN + TELEGRAM_CHAT_ID to be set.
+TELEGRAM_COMMANDS_ENABLED: bool = (
+    os.getenv("TELEGRAM_COMMANDS_ENABLED", "false").lower() in ("true", "1", "yes")
+)
+
+# ── Dashboard (Phase 11.14) ──────────────────────────────────────────────────
+# Path where the engine writes a JSON state snapshot each cycle.
+# The Streamlit dashboard reads this file to show live bot status.
+STATE_SNAPSHOT_PATH: str = "data/engine_state.json"
+DASHBOARD_PORT: int = int(os.getenv("DASHBOARD_PORT", "8501"))

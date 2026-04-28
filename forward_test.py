@@ -42,7 +42,7 @@ from execution.broker import AlpacaBroker
 from execution.stream import StreamManager
 from regime.detector import MarketRegime, RegimeDetector
 from risk.allocator import SleeveAllocator
-from reporting.alerts import AlertDispatcher
+from reporting.alerts import AlertDispatcher, LogFileBackend, TelegramAlertBackend, TelegramCommandListener
 from reporting.logger import TradeLogger, install_json_sink
 from reporting.pnl import PnLTracker
 from risk.manager import RiskManager
@@ -155,7 +155,17 @@ def main() -> None:
     # Reporting.
     trade_logger = TradeLogger()
     pnl_tracker = PnLTracker()
-    alerts = AlertDispatcher()
+
+    # Pluggable alert backends — Telegram is opt-in via env vars.
+    alert_backends = [LogFileBackend()]
+    telegram_backend: TelegramAlertBackend | None = None
+    if settings.TELEGRAM_BOT_TOKEN and settings.TELEGRAM_CHAT_ID:
+        telegram_backend = TelegramAlertBackend(
+            settings.TELEGRAM_BOT_TOKEN, settings.TELEGRAM_CHAT_ID
+        )
+        alert_backends.append(telegram_backend)
+        logger.info("Telegram alert backend enabled")
+    alerts = AlertDispatcher(backends=alert_backends)
 
     # Engine config (engine-level only; symbols/timeframes live on slots).
     config = EngineConfig(
@@ -187,6 +197,15 @@ def main() -> None:
     logger.info("starting engine — Ctrl+C to stop")
     logger.info("after multi-week run, use backtest/reconcile.py to evaluate")
 
+    # Start Telegram command listener if configured (runs as daemon thread).
+    if (
+        telegram_backend is not None
+        and settings.TELEGRAM_COMMANDS_ENABLED
+    ):
+        cmd_listener = TelegramCommandListener(telegram_backend)
+        cmd_listener.start(engine)
+        logger.info("Telegram command listener started (/status, /halt)")
+
     try:
         engine.start()
     finally:
@@ -200,6 +219,15 @@ def main() -> None:
                 session_end_equity=snap.account.equity,
             )
             pnl_tracker.write_daily_report(summary)
+            # Fire EOD summary alert (Telegram + log).
+            total_trades = sum(s.trade_count for s in summary.strategies.values())
+            total_wins = sum(s.wins for s in summary.strategies.values())
+            overall_win_rate = total_wins / total_trades if total_trades > 0 else 0.0
+            alerts.eod_summary(
+                daily_pnl=summary.realized_pnl,
+                trade_count=total_trades,
+                win_rate=overall_win_rate,
+            )
         except Exception as e:
             logger.error(f"shutdown P&L report failed: {e}")
 
