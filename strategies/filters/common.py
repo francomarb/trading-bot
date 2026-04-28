@@ -236,6 +236,12 @@ class EarningsBlackout:
                 elif isinstance(cal, dict):
                     for key, val in cal.items():
                         if "earnings" in key.lower() and val is not None:
+                            # yfinance sometimes returns lists for 'Earnings Date' (e.g. [datetime.date(...)])
+                            # and floats for estimates like 'Earnings High'
+                            if isinstance(val, list) and len(val) > 0:
+                                val = val[0]
+                            if isinstance(val, (float, int)) and val < 10000:
+                                continue
                             try:
                                 dates.append(pd.Timestamp(val).date())
                             except Exception:
