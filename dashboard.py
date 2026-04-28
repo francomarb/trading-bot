@@ -219,8 +219,13 @@ def render_dashboard() -> None:
     col1, col2, col3, col4, col5, col6 = st.columns(6)
     col1.metric("Status", status_label)
     col2.metric("Mode", env_label)
-    col3.metric("Equity", f"${equity:,.2f}")
-    col4.metric("Daily P&L", f"${daily_pnl:+,.2f}")
+    session_start = state.get("session_start_equity", equity)
+    equity_delta = equity - session_start if session_start else None
+    col3.metric("Equity", f"${equity:,.2f}",
+                delta=f"${equity_delta:+,.2f}" if equity_delta is not None else None)
+    col4.metric("Daily P&L", f"${daily_pnl:+,.2f}",
+                delta=f"${daily_pnl:+,.2f}" if daily_pnl != 0 else None,
+                delta_color="normal")
     col5.metric("Regime", f"{_regime_color(regime)} {regime or '—'}")
     col6.metric("Cycles", cycle_count)
 
@@ -246,22 +251,32 @@ def render_dashboard() -> None:
         if equity_curve.empty:
             st.info("No closed trades yet.")
         else:
+            final_pnl = equity_curve["cumulative_pnl"].iloc[-1]
+            line_color = "#00b09b" if final_pnl >= 0 else "#ff4b4b"
+            fill_color = "rgba(0,176,155,0.15)" if final_pnl >= 0 else "rgba(255,75,75,0.15)"
             fig = go.Figure()
+            # Zero reference line
+            fig.add_hline(y=0, line_color="rgba(255,255,255,0.2)", line_width=1)
             fig.add_trace(go.Scatter(
                 x=equity_curve["timestamp"],
                 y=equity_curve["cumulative_pnl"],
                 mode="lines",
                 name="Cumulative P&L",
-                line=dict(color="#00b09b", width=2),
+                line=dict(color=line_color, width=2),
                 fill="tozeroy",
-                fillcolor="rgba(0,176,155,0.1)",
+                fillcolor=fill_color,
+                hovertemplate="<b>%{x|%Y-%m-%d}</b><br>P&L: $%{y:,.2f}<extra></extra>",
             ))
             fig.update_layout(
-                xaxis_title="Date",
+                xaxis_title=None,
                 yaxis_title="P&L ($)",
                 height=300,
                 margin=dict(l=0, r=0, t=10, b=0),
                 showlegend=False,
+                plot_bgcolor="rgba(0,0,0,0)",
+                paper_bgcolor="rgba(0,0,0,0)",
+                xaxis=dict(gridcolor="rgba(255,255,255,0.05)"),
+                yaxis=dict(gridcolor="rgba(255,255,255,0.05)"),
             )
             st.plotly_chart(fig, use_container_width=True)
 
