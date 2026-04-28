@@ -45,7 +45,7 @@ def _symbol_df(closes: list[float]) -> pd.DataFrame:
 
 def _make_spy_filter(spy_df: pd.DataFrame, *, windows: list[int] = [200]) -> SPYTrendFilter:
     f = SPYTrendFilter(sma_windows=windows, cache_ttl_seconds=0)
-    with patch("data.fetcher.fetch_symbol", return_value=spy_df):
+    with patch("data.fetcher.fetch_symbol", return_value=(spy_df, None)):
         f._fetch_spy()  # prime cache
     return f
 
@@ -57,7 +57,7 @@ class TestSPYTrendFilter:
     def _filter(self, closes: list[float], windows: list[int] = [200]) -> SPYTrendFilter:
         spy = _spy_df(closes)
         f = SPYTrendFilter(sma_windows=windows, cache_ttl_seconds=9999)
-        with patch("data.fetcher.fetch_symbol", return_value=spy):
+        with patch("data.fetcher.fetch_symbol", return_value=(spy, None)):
             result = f._fetch_spy()
         return f
 
@@ -126,7 +126,7 @@ class TestSPYTrendFilter:
     def test_fetch_failure_returns_stale_cache(self):
         spy = _spy_df(list(range(1, 211)))  # rising → allowed
         f = SPYTrendFilter(sma_windows=[200], cache_ttl_seconds=9999)
-        with patch("data.fetcher.fetch_symbol", return_value=spy):
+        with patch("data.fetcher.fetch_symbol", return_value=(spy, None)):
             f._fetch_spy()  # prime cache
         # Now fail the fetch — should use stale cache (still allowed)
         with patch("data.fetcher.fetch_symbol", side_effect=Exception("fail")):
@@ -136,7 +136,7 @@ class TestSPYTrendFilter:
     def test_cache_reuse_within_ttl(self):
         spy = _spy_df(list(range(1, 211)))
         f = SPYTrendFilter(sma_windows=[200], cache_ttl_seconds=9999)
-        with patch("data.fetcher.fetch_symbol", return_value=spy) as mock_fetch:
+        with patch("data.fetcher.fetch_symbol", return_value=(spy, None)) as mock_fetch:
             f(_symbol_df([100.0] * 3))
             f(_symbol_df([100.0] * 3))
             # Both calls should hit cache, so fetch_symbol called only once
@@ -535,7 +535,7 @@ class TestRSIEdgeFilter:
     # ── SPY gate ─────────────────────────────────────────────────────────────
 
     def test_spy_gate_allows(self):
-        f = RSIEdgeFilter(vol_min_avg=0)   # disable vol/low gates
+        f = RSIEdgeFilter(notional_min_avg=0)   # disable vol/low gates
         f.set_symbol("MU")
         self._spy_allows(f)
         self._clear_earnings(f)
@@ -543,7 +543,7 @@ class TestRSIEdgeFilter:
         assert gate.iloc[-1]
 
     def test_spy_gate_blocks(self):
-        f = RSIEdgeFilter(vol_min_avg=0)
+        f = RSIEdgeFilter(notional_min_avg=0)
         f.set_symbol("MU")
         self._spy_blocks(f)
         self._clear_earnings(f)
@@ -552,7 +552,7 @@ class TestRSIEdgeFilter:
 
     def test_spy_windows_both_required(self):
         """Both SPY 200SMA and 50SMA must pass."""
-        f = RSIEdgeFilter(vol_min_avg=0)
+        f = RSIEdgeFilter(notional_min_avg=0)
         f.set_symbol("MU")
         self._clear_earnings(f)
         df = _liquid_df(25, avg_vol=1_000_000)
@@ -566,7 +566,7 @@ class TestRSIEdgeFilter:
     # ── Earnings blackout gate ────────────────────────────────────────────────
 
     def test_earnings_blackout_blocks(self):
-        f = RSIEdgeFilter(days_before=3, days_after=2, vol_min_avg=0)
+        f = RSIEdgeFilter(days_before=3, days_after=2, notional_min_avg=0)
         f.set_symbol("MU")
         self._spy_allows(f)
         df = _today_df()
@@ -576,7 +576,7 @@ class TestRSIEdgeFilter:
         assert not f(df).iloc[-1]
 
     def test_earnings_far_away_allows(self):
-        f = RSIEdgeFilter(days_before=3, days_after=2, vol_min_avg=0)
+        f = RSIEdgeFilter(days_before=3, days_after=2, notional_min_avg=0)
         f.set_symbol("MU")
         self._spy_allows(f)
         far = datetime.date.today() + datetime.timedelta(days=30)
@@ -593,7 +593,7 @@ class TestRSIEdgeFilter:
     # ── Liquidity gate ────────────────────────────────────────────────────────
 
     def test_volume_above_threshold_allows(self):
-        f = RSIEdgeFilter(vol_min_window=5, vol_min_avg=500_000)
+        f = RSIEdgeFilter(vol_min_window=5, notional_min_avg=500_000)
         f.set_symbol("MU")
         self._spy_allows(f)
         self._clear_earnings(f)
@@ -602,17 +602,17 @@ class TestRSIEdgeFilter:
         assert gate.iloc[-1]
 
     def test_volume_below_threshold_blocks(self):
-        f = RSIEdgeFilter(vol_min_window=5, vol_min_avg=500_000)
+        f = RSIEdgeFilter(vol_min_window=5, notional_min_avg=500_000)
         f.set_symbol("MU")
         self._spy_allows(f)
         self._clear_earnings(f)
-        df = _liquid_df(25, avg_vol=100_000)     # 100K < 500K
+        df = _liquid_df(25, avg_vol=500)     # 500 * 25 (close) = 12.5K < 25K (downscaled)
         gate = f(df)
         assert not gate.iloc[-1]
 
     def test_volume_no_column_fails_open(self):
         """No volume column → fail open. Uses rising closes so new_low gate passes."""
-        f = RSIEdgeFilter(vol_min_window=5, vol_min_avg=500_000)
+        f = RSIEdgeFilter(vol_min_window=5, notional_min_avg=500_000)
         f.set_symbol("MU")
         self._spy_allows(f)
         self._clear_earnings(f)
@@ -624,7 +624,7 @@ class TestRSIEdgeFilter:
 
     def test_volume_nan_fails_open(self):
         """Fewer bars than vol_min_window → NaN avg → fail open."""
-        f = RSIEdgeFilter(vol_min_window=20, vol_min_avg=500_000)
+        f = RSIEdgeFilter(vol_min_window=20, notional_min_avg=500_000)
         f.set_symbol("MU")
         self._spy_allows(f)
         self._clear_earnings(f)
@@ -636,7 +636,7 @@ class TestRSIEdgeFilter:
 
     def test_no_new_low_allows(self):
         """Rising stock → last close above prior-N min → allowed."""
-        f = RSIEdgeFilter(new_low_window=5, vol_min_avg=0)
+        f = RSIEdgeFilter(new_low_window=5, notional_min_avg=0)
         f.set_symbol("MU")
         self._spy_allows(f)
         self._clear_earnings(f)
@@ -646,7 +646,7 @@ class TestRSIEdgeFilter:
 
     def test_new_low_blocks(self):
         """Stock making new 5-day low → blocked."""
-        f = RSIEdgeFilter(new_low_window=5, vol_min_avg=0)
+        f = RSIEdgeFilter(new_low_window=5, notional_min_avg=0)
         f.set_symbol("MU")
         self._spy_allows(f)
         self._clear_earnings(f)
@@ -663,7 +663,7 @@ class TestRSIEdgeFilter:
 
     def test_new_low_nan_fails_open(self):
         """Fewer bars than new_low_window + 1 → NaN prior_min → fail open."""
-        f = RSIEdgeFilter(new_low_window=20, vol_min_avg=0)
+        f = RSIEdgeFilter(new_low_window=20, notional_min_avg=0)
         f.set_symbol("MU")
         self._spy_allows(f)
         self._clear_earnings(f)
@@ -674,7 +674,7 @@ class TestRSIEdgeFilter:
     # ── Structural / combined ─────────────────────────────────────────────────
 
     def test_all_four_gates_pass(self):
-        f = RSIEdgeFilter(vol_min_window=5, vol_min_avg=500_000, new_low_window=5)
+        f = RSIEdgeFilter(vol_min_window=5, notional_min_avg=500_000, new_low_window=5)
         f.set_symbol("MU")
         self._spy_allows(f)
         self._clear_earnings(f)
@@ -695,7 +695,7 @@ class TestRSIEdgeFilter:
         assert f._earnings._symbol == "CDNS"
 
     def test_gate_series_aligned_to_df(self):
-        f = RSIEdgeFilter(vol_min_avg=0)
+        f = RSIEdgeFilter(notional_min_avg=0)
         f.set_symbol("MU")
         self._spy_allows(f)
         self._clear_earnings(f)

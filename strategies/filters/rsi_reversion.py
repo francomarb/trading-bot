@@ -59,6 +59,7 @@ from __future__ import annotations
 import pandas as pd
 from loguru import logger
 
+from config.settings import ALPACA_DATA_FEED
 from strategies.filters.common import EarningsBlackout, SPYTrendFilter
 
 
@@ -108,7 +109,13 @@ class RSIEdgeFilter:
             days_after=days_after,
         )
         self._vol_min_window = vol_min_window
-        self._notional_min_avg = notional_min_avg
+        
+        # IEX sees ~5% of consolidated market volume. Scale threshold accordingly.
+        if ALPACA_DATA_FEED == "iex":
+            self._notional_min_avg = int(notional_min_avg * 0.05)
+        else:
+            self._notional_min_avg = notional_min_avg
+            
         self._new_low_window = new_low_window
         self._symbol: str = ""
 

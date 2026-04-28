@@ -38,7 +38,7 @@ from alpaca.data.timeframe import TimeFrame
 from loguru import logger
 from requests.adapters import HTTPAdapter
 
-from config.settings import ALPACA_API_KEY, ALPACA_SECRET_KEY
+from config.settings import ALPACA_API_KEY, ALPACA_SECRET_KEY, ALPACA_DATA_FEED
 
 
 # ── Paths & constants ────────────────────────────────────────────────────────
@@ -362,7 +362,7 @@ def fetch_symbol(
     timeframe: str = "1Day",
     *,
     adjustment: str = "all",
-    feed: str = "iex",
+    feed: str = ALPACA_DATA_FEED,
     use_cache: bool = True,
 ) -> tuple[pd.DataFrame, FetchStats]:
     """
@@ -473,7 +473,7 @@ def fetch_symbols(
     timeframe: str = "1Day",
     *,
     adjustment: str = "all",
-    feed: str = "iex",
+    feed: str = ALPACA_DATA_FEED,
     use_cache: bool = True,
 ) -> dict[str, pd.DataFrame]:
     """

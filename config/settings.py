@@ -17,6 +17,11 @@ ALPACA_API_KEY: str | None = _ALPACA_API_KEY_LIVE if LIVE_TRADING else _ALPACA_A
 ALPACA_SECRET_KEY: str | None = _ALPACA_SECRET_KEY_LIVE if LIVE_TRADING else _ALPACA_SECRET_KEY_PAPER
 ALPACA_PAPER: bool = not LIVE_TRADING
 
+# Data feed selection (Phase 10)
+# Use 'sip' only if you pay for the $99/mo Algo Trader Plus subscription.
+# Otherwise, 'iex' is the required free tier feed for real-time market data.
+ALPACA_DATA_FEED: str = os.getenv("ALPACA_DATA_FEED", "iex").lower()
+
 # Derived base URL — used only by legacy verify scripts; alpaca-py uses the
 # `paper=` flag on TradingClient directly.
 ALPACA_BASE_URL = (
