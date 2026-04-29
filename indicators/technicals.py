@@ -5,12 +5,18 @@ Scope: the minimum set needed for the MVP strategy (SMA crossover, Phase 4),
 the ATR-based stop-loss in Phase 6 Risk, and the Regime Detector (Phase 10.F2).
 
 Currently provided:
-  - add_sma(df, length)   → df with 'sma_{length}'                 column appended
-  - add_ema(df, length)   → df with 'ema_{length}'                 column appended
-  - add_atr(df, length)   → df with 'atr_{length}'                 column appended (Wilder/RMA)
-  - add_rsi(df, length)   → df with 'rsi_{length}'                 column appended (Wilder/RMA)
-  - add_adx(df, length)   → df with 'adx_{length}', 'plus_di_{length}',
-                                     'minus_di_{length}'           columns appended
+  - add_sma(df, length)               → df with 'sma_{length}'                 column appended
+  - add_ema(df, length)               → df with 'ema_{length}'                 column appended
+  - add_atr(df, length)               → df with 'atr_{length}'                 column appended (Wilder/RMA)
+  - add_rsi(df, length)               → df with 'rsi_{length}'                 column appended (Wilder/RMA)
+  - add_adx(df, length)               → df with 'adx_{length}', 'plus_di_{length}',
+                                                'minus_di_{length}'            columns appended
+  - add_bollinger_bands(df, length, std_dev)
+                                      → df with 'bb_mid_{length}', 'bb_upper_{length}_{std_dev}',
+                                                'bb_lower_{length}_{std_dev}'  columns appended
+  - add_keltner_channels(df, length, atr_mult)
+                                      → df with 'kc_mid_{length}', 'kc_upper_{length}_{atr_mult}',
+                                                'kc_lower_{length}_{atr_mult}' columns appended
 
 Design notes:
   - Every function is pure: it returns a new DataFrame. Inputs are not mutated.
@@ -60,6 +66,13 @@ def _require_columns(df: pd.DataFrame, cols: list[str], indicator: str) -> None:
 def _require_length(length: int, indicator: str) -> None:
     if not isinstance(length, int) or length < 1:
         raise ValueError(f"{indicator}: length must be a positive int, got {length!r}")
+
+
+def _require_positive_float(value: float, name: str, indicator: str) -> None:
+    if not isinstance(value, (int, float)) or isinstance(value, bool) or value <= 0:
+        raise ValueError(
+            f"{indicator}: {name} must be a positive number, got {value!r}"
+        )
 
 
 # ── SMA ──────────────────────────────────────────────────────────────────────
@@ -318,4 +331,90 @@ def add_adx(df: pd.DataFrame, length: int = 14) -> pd.DataFrame:
     out[f"adx_{length}"]      = adx
     out[f"plus_di_{length}"]  = plus_di
     out[f"minus_di_{length}"] = minus_di
+    return out
+
+
+# ── Bollinger Bands ──────────────────────────────────────────────────────────
+
+
+def add_bollinger_bands(
+    df: pd.DataFrame,
+    length: int = 20,
+    std_dev: float = 2.0,
+    *,
+    source: str = "close",
+) -> pd.DataFrame:
+    """
+    Append Bollinger Bands of `source` (default: close) over `length` bars.
+
+    New columns:
+      bb_mid_{length}                       — SMA(length)
+      bb_upper_{length}_{std_dev}           — SMA + std_dev * rolling std
+      bb_lower_{length}_{std_dev}           — SMA - std_dev * rolling std
+
+    The first `length - 1` values are NaN. Standard deviation uses ddof=0
+    (population std), matching TradingView and most charting platforms.
+
+    The std_dev suffix in column names is formatted with `:g` so 2.0 → "2",
+    1.5 → "1.5". This keeps column names readable while supporting any
+    real-valued multiplier.
+    """
+    _require_length(length, "BollingerBands")
+    _require_positive_float(std_dev, "std_dev", "BollingerBands")
+    _require_columns(df, [source], "BollingerBands")
+
+    out = df.copy()
+    s = out[source]
+
+    mid = s.rolling(window=length, min_periods=length).mean()
+    # ddof=0 → population std, matches TradingView
+    std = s.rolling(window=length, min_periods=length).std(ddof=0)
+
+    suffix = f"{length}_{std_dev:g}"
+    out[f"bb_mid_{length}"]    = mid
+    out[f"bb_upper_{suffix}"]  = mid + std_dev * std
+    out[f"bb_lower_{suffix}"]  = mid - std_dev * std
+    return out
+
+
+# ── Keltner Channels ─────────────────────────────────────────────────────────
+
+
+def add_keltner_channels(
+    df: pd.DataFrame,
+    length: int = 20,
+    atr_mult: float = 1.5,
+) -> pd.DataFrame:
+    """
+    Append Keltner Channels of `length` bars.
+
+    New columns:
+      kc_mid_{length}                       — EMA(length) of close
+      kc_upper_{length}_{atr_mult}          — EMA + atr_mult * ATR(length)
+      kc_lower_{length}_{atr_mult}          — EMA - atr_mult * ATR(length)
+
+    The first `length - 1` values are NaN (both EMA and ATR have a length-1
+    NaN prefix; the maximum of the two is length-1 since they share `length`).
+
+    Reuses add_ema (close source) and add_atr (Wilder smoothing). The
+    atr_mult suffix in column names is formatted with `:g` so 1.5 → "1.5",
+    2.0 → "2".
+    """
+    _require_length(length, "KeltnerChannels")
+    _require_positive_float(atr_mult, "atr_mult", "KeltnerChannels")
+    _require_columns(df, OHLC_REQUIRED, "KeltnerChannels")
+
+    # Reuse add_ema and add_atr to keep behaviour consistent with the rest
+    # of the indicator suite (same warmup, same NaN handling).
+    with_ema = add_ema(df, length, source="close")
+    with_atr = add_atr(with_ema, length)
+
+    ema = with_atr[f"ema_{length}"]
+    atr = with_atr[f"atr_{length}"]
+
+    suffix = f"{length}_{atr_mult:g}"
+    out = df.copy()
+    out[f"kc_mid_{length}"]    = ema
+    out[f"kc_upper_{suffix}"]  = ema + atr_mult * atr
+    out[f"kc_lower_{suffix}"]  = ema - atr_mult * atr
     return out

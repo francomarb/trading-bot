@@ -20,7 +20,14 @@ import math
 import pandas as pd
 import pytest
 
-from indicators.technicals import add_atr, add_ema, add_rsi, add_sma
+from indicators.technicals import (
+    add_atr,
+    add_bollinger_bands,
+    add_ema,
+    add_keltner_channels,
+    add_rsi,
+    add_sma,
+)
 
 
 # ── Helpers ──────────────────────────────────────────────────────────────────
@@ -347,6 +354,225 @@ class TestRSI:
         df = _close_series([1, 2, 3])
         with pytest.raises(ValueError, match="positive int"):
             add_rsi(df, 0)
+
+
+# ── Bollinger Bands ──────────────────────────────────────────────────────────
+
+
+class TestBollingerBands:
+    def test_basic_values_n3_std2(self):
+        """
+        length=3, std_dev=2, closes=[1, 2, 3, 4, 5]
+
+        Population std (ddof=0) of any 3 consecutive integers k, k+1, k+2:
+          variance = ((k - (k+1))^2 + 0 + ((k+2) - (k+1))^2) / 3 = 2/3
+          std = sqrt(2/3) ≈ 0.81650
+
+        At idx 2: mid = 2,   upper = 2 + 2*sqrt(2/3),   lower = 2 - 2*sqrt(2/3)
+        At idx 3: mid = 3,   upper = 3 + 2*sqrt(2/3),   lower = 3 - 2*sqrt(2/3)
+        At idx 4: mid = 4,   upper = 4 + 2*sqrt(2/3),   lower = 4 - 2*sqrt(2/3)
+        """
+        df = _close_series([1, 2, 3, 4, 5])
+        result = add_bollinger_bands(df, length=3, std_dev=2.0)
+
+        std = math.sqrt(2 / 3)
+
+        _approx_equal(
+            result["bb_mid_3"].tolist(),
+            [float("nan"), float("nan"), 2.0, 3.0, 4.0],
+        )
+        _approx_equal(
+            result["bb_upper_3_2"].tolist(),
+            [float("nan"), float("nan"), 2 + 2 * std, 3 + 2 * std, 4 + 2 * std],
+        )
+        _approx_equal(
+            result["bb_lower_3_2"].tolist(),
+            [float("nan"), float("nan"), 2 - 2 * std, 3 - 2 * std, 4 - 2 * std],
+        )
+
+    def test_constant_series_zero_width(self):
+        """Constant prices → std=0 → upper == mid == lower."""
+        df = _close_series([5, 5, 5, 5, 5])
+        result = add_bollinger_bands(df, length=3, std_dev=2.0)
+        # First two NaN, then bands collapse to mid.
+        for col in ("bb_mid_3", "bb_upper_3_2", "bb_lower_3_2"):
+            vals = result[col].tolist()
+            assert math.isnan(vals[0]) and math.isnan(vals[1])
+            assert all(v == 5.0 for v in vals[2:])
+
+    def test_column_names_with_fractional_std(self):
+        df = _close_series([1, 2, 3, 4, 5])
+        result = add_bollinger_bands(df, length=3, std_dev=1.5)
+        assert "bb_mid_3" in result.columns
+        assert "bb_upper_3_1.5" in result.columns
+        assert "bb_lower_3_1.5" in result.columns
+
+    def test_default_params(self):
+        df = _close_series(list(range(1, 30)))
+        result = add_bollinger_bands(df)  # length=20, std_dev=2.0
+        assert "bb_mid_20" in result.columns
+        assert "bb_upper_20_2" in result.columns
+        assert "bb_lower_20_2" in result.columns
+
+    def test_input_not_mutated(self):
+        df = _close_series([1, 2, 3, 4, 5])
+        add_bollinger_bands(df, length=3)
+        for col in ("bb_mid_3", "bb_upper_3_2", "bb_lower_3_2"):
+            assert col not in df.columns
+
+    def test_length_longer_than_data_gives_all_nan(self):
+        df = _close_series([1, 2, 3])
+        result = add_bollinger_bands(df, length=5)
+        assert result["bb_mid_5"].isna().all()
+        assert result["bb_upper_5_2"].isna().all()
+        assert result["bb_lower_5_2"].isna().all()
+
+    def test_upper_above_mid_above_lower_when_volatile(self):
+        df = _close_series([1, 5, 2, 8, 3, 9, 4, 7, 6, 10])
+        result = add_bollinger_bands(df, length=3, std_dev=2.0)
+        usable = result.dropna()
+        assert (usable["bb_upper_3_2"] >= usable["bb_mid_3"]).all()
+        assert (usable["bb_mid_3"] >= usable["bb_lower_3_2"]).all()
+
+    def test_missing_source_column_raises(self):
+        df = pd.DataFrame({"open": [1, 2, 3]})
+        with pytest.raises(ValueError, match="missing required columns"):
+            add_bollinger_bands(df, length=2)
+
+    def test_invalid_length_raises(self):
+        df = _close_series([1, 2, 3])
+        with pytest.raises(ValueError, match="positive int"):
+            add_bollinger_bands(df, length=0)
+
+    def test_invalid_std_dev_raises(self):
+        df = _close_series([1, 2, 3])
+        with pytest.raises(ValueError, match="std_dev"):
+            add_bollinger_bands(df, length=2, std_dev=0)
+        with pytest.raises(ValueError, match="std_dev"):
+            add_bollinger_bands(df, length=2, std_dev=-1.0)
+
+
+# ── Keltner Channels ─────────────────────────────────────────────────────────
+
+
+class TestKeltnerChannels:
+    def test_basic_values_n3_mult1_5(self):
+        """
+        Hand-worked example, length=3, atr_mult=1.5
+
+        OHLC (matches TestATR.test_basic_values_n3):
+          highs=[10, 12, 13, 12, 14]
+          lows =[9,  10, 11, 10, 11]
+          closes=[9.5, 11, 12, 10.5, 13]
+
+        ATR(3): nan, nan, 5.5/3, ...   (computed in TestATR)
+        EMA(3) of closes (alpha=0.5):
+          seed at idx 2 = (9.5 + 11 + 12) / 3 = 32.5/3
+          ema[3] = 0.5*10.5 + 0.5*(32.5/3) = 5.25 + (32.5/6)
+          ema[4] = 0.5*13 + 0.5*ema[3]
+
+        KC at idx 2:
+          mid   = ema[2]   = 32.5/3
+          upper = mid + 1.5 * 5.5/3
+          lower = mid - 1.5 * 5.5/3
+        """
+        df = _ohlc(
+            highs=[10, 12, 13, 12, 14],
+            lows=[9, 10, 11, 10, 11],
+            closes=[9.5, 11, 12, 10.5, 13],
+        )
+        result = add_keltner_channels(df, length=3, atr_mult=1.5)
+
+        # Reproduce the EMA seed/recurrence
+        ema_seed = (9.5 + 11 + 12) / 3
+        ema_3 = 0.5 * 10.5 + 0.5 * ema_seed
+        ema_4 = 0.5 * 13 + 0.5 * ema_3
+
+        atr_2 = 5.5 / 3
+        atr_3 = (atr_2 * 2 + 2.0) / 3
+        atr_4 = (atr_3 * 2 + 3.5) / 3
+
+        _approx_equal(
+            result["kc_mid_3"].tolist(),
+            [float("nan"), float("nan"), ema_seed, ema_3, ema_4],
+        )
+        _approx_equal(
+            result["kc_upper_3_1.5"].tolist(),
+            [
+                float("nan"), float("nan"),
+                ema_seed + 1.5 * atr_2,
+                ema_3 + 1.5 * atr_3,
+                ema_4 + 1.5 * atr_4,
+            ],
+        )
+        _approx_equal(
+            result["kc_lower_3_1.5"].tolist(),
+            [
+                float("nan"), float("nan"),
+                ema_seed - 1.5 * atr_2,
+                ema_3 - 1.5 * atr_3,
+                ema_4 - 1.5 * atr_4,
+            ],
+        )
+
+    def test_constant_range_yields_constant_kc(self):
+        df = _ohlc(
+            highs=[12, 12, 12, 12, 12],
+            lows=[10, 10, 10, 10, 10],
+            closes=[11, 11, 11, 11, 11],
+        )
+        result = add_keltner_channels(df, length=3, atr_mult=2.0)
+        # Mid converges to 11 (constant close), ATR=2, so upper=15, lower=7.
+        for v in result["kc_mid_3"].dropna():
+            assert v == 11.0
+        for v in result["kc_upper_3_2"].dropna():
+            assert v == 15.0
+        for v in result["kc_lower_3_2"].dropna():
+            assert v == 7.0
+
+    def test_default_params(self):
+        df = _ohlc(
+            highs=[10 + i for i in range(30)],
+            lows=[9 + i for i in range(30)],
+            closes=[9.5 + i for i in range(30)],
+        )
+        result = add_keltner_channels(df)  # length=20, atr_mult=1.5
+        assert "kc_mid_20" in result.columns
+        assert "kc_upper_20_1.5" in result.columns
+        assert "kc_lower_20_1.5" in result.columns
+
+    def test_input_not_mutated(self):
+        df = _ohlc(
+            highs=[10, 11, 12, 13],
+            lows=[9, 10, 11, 12],
+            closes=[9.5, 10.5, 11.5, 12.5],
+        )
+        add_keltner_channels(df, length=2, atr_mult=1.5)
+        for col in ("kc_mid_2", "kc_upper_2_1.5", "kc_lower_2_1.5"):
+            assert col not in df.columns
+
+    def test_length_longer_than_data_gives_all_nan(self):
+        df = _ohlc(highs=[10, 11], lows=[9, 10], closes=[9.5, 10.5])
+        result = add_keltner_channels(df, length=5)
+        for col in ("kc_mid_5", "kc_upper_5_1.5", "kc_lower_5_1.5"):
+            assert result[col].isna().all()
+
+    def test_missing_ohlc_columns_raise(self):
+        df = pd.DataFrame({"close": [1, 2, 3]})
+        with pytest.raises(ValueError, match="missing required columns"):
+            add_keltner_channels(df, length=2)
+
+    def test_invalid_length_raises(self):
+        df = _ohlc(highs=[10], lows=[9], closes=[9.5])
+        with pytest.raises(ValueError, match="positive int"):
+            add_keltner_channels(df, length=0)
+
+    def test_invalid_atr_mult_raises(self):
+        df = _ohlc(highs=[10, 11, 12], lows=[9, 10, 11], closes=[9.5, 10.5, 11.5])
+        with pytest.raises(ValueError, match="atr_mult"):
+            add_keltner_channels(df, length=2, atr_mult=0)
+        with pytest.raises(ValueError, match="atr_mult"):
+            add_keltner_channels(df, length=2, atr_mult=-1.0)
 
 
 # ── Cross-cutting: indicators stack on a single DataFrame ────────────────────

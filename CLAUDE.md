@@ -50,15 +50,17 @@ trading-bot/
 │   ├── trades_live.db         # Live SQLite trade log (gitignored)
 │   └── historical/            # Cached historical bars
 ├── indicators/
-│   └── technicals.py          # SMA, EMA, ATR, RSI, ADX (hand-rolled)
+│   └── technicals.py          # SMA, EMA, ATR, RSI, ADX, Bollinger Bands, Keltner Channels (hand-rolled)
 ├── strategies/
 │   ├── base.py                # BaseStrategy, SignalFrame, StrategySlot, WatchlistSource
-│   ├── sma_crossover.py       # Trend-following: SMA crossover
-│   ├── rsi_reversion.py       # Mean-reversion: RSI oversold/overbought
+│   ├── sma_crossover.py       # Trend-following: SMA crossover (ACTIVE)
+│   ├── rsi_reversion.py       # Mean-reversion: RSI oversold/overbought (ACTIVE)
+│   ├── bollinger_squeeze.py   # Volatility breakout: TTM-style BB squeeze (IMPLEMENTED, NOT WIRED)
 │   └── filters/
 │       ├── common.py          # SPYTrendFilter (shared macro gate)
 │       ├── sma_crossover.py   # SMAEdgeFilter: stock > 200 SMA, volume expansion
-│       └── rsi_reversion.py   # RSIEdgeFilter: SPY dual macro, earnings blackout, liquidity, no-new-low
+│       ├── rsi_reversion.py   # RSIEdgeFilter: SPY dual macro, earnings blackout, liquidity, no-new-low
+│       └── bollinger_squeeze.py # BollingerSqueezeEdgeFilter: IEX-scaled liquidity, earnings blackout, exhaustion gate
 ├── regime/
 │   └── detector.py            # RegimeDetector: BEAR/VOLATILE/TRENDING/RANGING (ADX + ATR%)
 ├── engine/
@@ -196,6 +198,13 @@ python phase2_verify.py
 **Tagged: `v1.0.0-beta.0`**
 
 Both **SMA Crossover** and **RSI Reversion** are active in `forward_test.py`.
+
+**BollingerSqueeze** is implemented but NOT wired in `forward_test.py` — see
+[docs/bollinger_squeeze_universe_research.md](docs/bollinger_squeeze_universe_research.md)
+for the universe research that produced this decision (Sharpe +0.22 on Sector
+ETFs is a modest diversifier, not a return generator). Code is parked in a
+"ready to activate" state with the optimal sector-ETF watchlist already set
+in `BOLLINGER_WATCHLIST`.
 
 ### Phase 10 completed items
 

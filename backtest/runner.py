@@ -164,10 +164,22 @@ def run_backtest(
     config: BacktestConfig | None = None,
     *,
     symbol: str = "?",
+    atr_stop_mult: float | None = None,
+    atr_length: int = 14,
 ) -> BacktestResult:
     """
     Run `strategy` against `df` (must have 'open' and 'close' columns) under
     the given `config`. Returns a `BacktestResult`.
+
+    Args:
+        atr_stop_mult: If provided, simulate a per-trade stop-loss at
+            `entry_price - atr_stop_mult * ATR(atr_length)`. This mirrors
+            the engine's `ATR_STOP_MULTIPLIER` (production default 2.0).
+            Requires high/low columns on `df` (for ATR computation). When
+            None (default), no stop is simulated — the strategy's exit
+            signal is the only exit mechanism.
+        atr_length: ATR window for the stop calculation. Default 14
+            matches `config.settings.ATR_LENGTH`.
     """
     cfg = config or BacktestConfig()
     _required_cols(df)
@@ -175,6 +187,22 @@ def run_backtest(
     raw = strategy.generate_signals(df)
     entries = _shift_for_next_open(raw.entries)
     exits = _shift_for_next_open(raw.exits)
+
+    sl_stop = None
+    if atr_stop_mult is not None:
+        # Compute per-bar ATR-based stop fraction: stop_pct = atr_mult * ATR / close.
+        # vectorbt uses sl_stop[entry_bar] as the stop fraction for that trade,
+        # so we need the value AT the entry bar (post-shift).
+        from indicators.technicals import add_atr
+        if "high" not in df.columns or "low" not in df.columns:
+            raise ValueError(
+                "atr_stop_mult requires high/low columns for ATR computation"
+            )
+        with_atr = add_atr(df, atr_length)
+        atr_series = with_atr[f"atr_{atr_length}"]
+        sl_stop = (atr_stop_mult * atr_series / df["close"]).fillna(0.0)
+        # Floor at a tiny positive value to avoid vectorbt rejecting 0.0 stops.
+        sl_stop = sl_stop.clip(lower=1e-6)
 
     pf = vbt.Portfolio.from_signals(
         close=df["close"],
@@ -185,6 +213,7 @@ def run_backtest(
         slippage=cfg.slippage_bps / 10_000.0,   # vbt: fraction
         fixed_fees=cfg.commission_per_trade,    # per-trade $
         freq=cfg.freq,
+        sl_stop=sl_stop,
     )
 
     return BacktestResult(

@@ -54,23 +54,51 @@ SMA_WATCHLIST = [
 RSI_WATCHLIST = [
     "ALLY", "CDNS", "KBE", "SN", "DINO", "BA", "TFC", "HON", "TMUS", "JNJ",
 ]
-# Full engine universe — union of both lists; preserves paper-run continuity.
+# Bollinger Squeeze (TTM-style volatility breakout) — IMPLEMENTED BUT NOT
+# ACTIVE. Cross-universe research (docs/bollinger_squeeze_universe_research.md)
+# concluded sector ETFs are the optimal universe (Sharpe +0.22, MeanDD -7.7%
+# over 4y) — far better than the original AI/BigTech thesis which produced a
+# negative Sharpe. The strategy is parked in a "ready to activate" state:
+# this watchlist + the strategy code are correct for eventual deployment.
+#
+# To activate later: add a third StrategySlot in forward_test.py wired with
+#   BollingerSqueeze(bb_length=10, kc_length=10, min_squeeze_bars=6, roc_lookback=5,
+#                    edge_filter=BollingerSqueezeEdgeFilter())
+# and decide a sleeve weight (the strategy is a low-DD diversifier, not a
+# return generator — keep weight small).
+BOLLINGER_WATCHLIST = [
+    "XLF",   # Financials
+    "XLE",   # Energy
+    "XLU",   # Utilities
+    "XLV",   # Healthcare
+    "XLI",   # Industrials
+    "XLK",   # Technology
+    "XLP",   # Consumer Staples
+    "XLY",   # Consumer Discretionary
+    "XLB",   # Materials
+    "XLRE",  # Real Estate
+    "XLC",   # Communications
+]
+# Full engine universe — union of all lists; preserves paper-run continuity.
 #
 # IMPORTANT: When adding new symbols to any of these watchlists, remember to also
-# map them to their corresponding Sector ETF in `scripts/post_mortem.py`'s 
+# map them to their corresponding Sector ETF in `scripts/post_mortem.py`'s
 # SECTOR_MAP dictionary to ensure proper Relative Strength diagnostic reporting.
-WATCHLIST = list(dict.fromkeys(SMA_WATCHLIST + RSI_WATCHLIST))
+WATCHLIST = list(dict.fromkeys(SMA_WATCHLIST + RSI_WATCHLIST + BOLLINGER_WATCHLIST))
 
 # ── Per-strategy dashboard metadata ─────────────────────────────────────────
 # Maps strategy_name → watchlist and allowed market regimes.
 # Add a new strategy here (one entry) and the dashboard picks it up automatically.
 STRATEGY_WATCHLISTS: dict[str, list[str]] = {
-    "sma_crossover": SMA_WATCHLIST,
-    "rsi_reversion":  RSI_WATCHLIST,
+    "sma_crossover":     SMA_WATCHLIST,
+    "rsi_reversion":     RSI_WATCHLIST,
+    "bollinger_squeeze": BOLLINGER_WATCHLIST,
 }
 STRATEGY_ALLOWED_REGIMES: dict[str, set[str]] = {
-    "sma_crossover": {"TRENDING", "RANGING"},
-    "rsi_reversion":  {"TRENDING", "RANGING"},
+    "sma_crossover":     {"TRENDING", "RANGING"},
+    "rsi_reversion":     {"TRENDING", "RANGING"},
+    # Squeeze fires best after compression breaks (TRENDING) or during it (RANGING).
+    "bollinger_squeeze": {"TRENDING", "RANGING"},
 }
 
 # ── Capital allocation (Phase 10.F1) ────────────────────────────────────────

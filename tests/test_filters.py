@@ -763,3 +763,214 @@ class TestBaseStrategySymbolInjection:
         from strategies.sma_crossover import SMACrossover as _S
         raw = _S(fast=3, slow=5)._raw_signals(df)
         assert result.exits.equals(raw.exits)
+
+
+# ── TestBollingerSqueezeEdgeFilter ────────────────────────────────────────────
+
+
+def _liquid_ohlc_df(
+    n: int, *, close: float = 100.0, avg_vol: int = 1_000_000, range_pct: float = 0.02
+) -> pd.DataFrame:
+    """Synthetic OHLC df with steady price near `close`, range_pct width, and steady volume."""
+    idx = pd.date_range("2024-01-01", periods=n, freq="B")
+    half_range = close * range_pct / 2
+    closes = [close] * n
+    highs = [close + half_range] * n
+    lows = [close - half_range] * n
+    return pd.DataFrame(
+        {
+            "close": closes,
+            "open": closes,
+            "high": highs,
+            "low": lows,
+            "volume": [avg_vol] * n,
+        },
+        index=idx,
+    )
+
+
+class TestBollingerSqueezeEdgeFilterFeedScaling:
+    """
+    Verifies the SINGLE point of feed-conditionality in the BB squeeze stack.
+    These tests are the contract that says: a SIP transition is a one-env-var
+    flip — no scattered IEX assumptions.
+    """
+
+    BASE = 20_000_000
+
+    def test_iex_feed_scales_threshold_to_5_percent(self, monkeypatch):
+        from strategies.filters import bollinger_squeeze as bsq
+
+        monkeypatch.setattr(bsq, "ALPACA_DATA_FEED", "iex")
+        f = bsq.BollingerSqueezeEdgeFilter(notional_min_avg=self.BASE)
+        assert f._notional_min_avg == int(self.BASE * 0.05)
+
+    def test_sip_feed_threshold_unscaled(self, monkeypatch):
+        from strategies.filters import bollinger_squeeze as bsq
+
+        monkeypatch.setattr(bsq, "ALPACA_DATA_FEED", "sip")
+        f = bsq.BollingerSqueezeEdgeFilter(notional_min_avg=self.BASE)
+        assert f._notional_min_avg == self.BASE
+
+    def test_unknown_feed_threshold_unscaled(self, monkeypatch):
+        """Any non-'iex' value (covers future feeds) leaves the threshold unscaled."""
+        from strategies.filters import bollinger_squeeze as bsq
+
+        monkeypatch.setattr(bsq, "ALPACA_DATA_FEED", "future_paid_feed")
+        f = bsq.BollingerSqueezeEdgeFilter(notional_min_avg=self.BASE)
+        assert f._notional_min_avg == self.BASE
+
+
+class TestBollingerSqueezeEdgeFilterGates:
+    """End-to-end gate behaviour with a mocked symbol and earnings cache."""
+
+    def _filter(self, monkeypatch, *, feed: str = "sip", **overrides):
+        from strategies.filters import bollinger_squeeze as bsq
+
+        monkeypatch.setattr(bsq, "ALPACA_DATA_FEED", feed)
+        f = bsq.BollingerSqueezeEdgeFilter(**overrides)
+        f.set_symbol("NVDA")
+        # Seed earnings cache: no upcoming events.
+        f._earnings._cache["NVDA"] = (datetime.date.today(), [])
+        return f
+
+    def test_liquidity_above_threshold_allows(self, monkeypatch):
+        f = self._filter(
+            monkeypatch,
+            notional_min_avg=1_000_000,
+            vol_min_window=5,
+            exhaustion_atr_mult=10.0,  # disable exhaustion (very wide threshold)
+        )
+        # close=100, vol=20_000 → dollar_vol = 2M >> 1M threshold
+        df = _liquid_ohlc_df(25, close=100.0, avg_vol=20_000)
+        gate = f(df)
+        assert gate.iloc[-1]
+
+    def test_liquidity_below_threshold_blocks(self, monkeypatch):
+        f = self._filter(
+            monkeypatch,
+            notional_min_avg=10_000_000,
+            vol_min_window=5,
+            exhaustion_atr_mult=10.0,
+        )
+        # close=100, vol=20_000 → dollar_vol=2M << 10M threshold
+        df = _liquid_ohlc_df(25, close=100.0, avg_vol=20_000)
+        gate = f(df)
+        assert not gate.iloc[-1]
+
+    def test_liquidity_no_volume_column_fails_open(self, monkeypatch):
+        f = self._filter(
+            monkeypatch,
+            notional_min_avg=10_000_000,
+            vol_min_window=5,
+            exhaustion_atr_mult=10.0,
+        )
+        idx = pd.date_range("2024-01-01", periods=25, freq="B")
+        df = pd.DataFrame(
+            {"close": [100.0] * 25, "high": [101.0] * 25, "low": [99.0] * 25},
+            index=idx,
+        )  # no volume
+        gate = f(df)
+        assert gate.iloc[-1]
+
+    def test_liquidity_insufficient_history_fails_open(self, monkeypatch):
+        f = self._filter(
+            monkeypatch,
+            notional_min_avg=10_000_000,
+            vol_min_window=20,
+            exhaustion_atr_mult=10.0,
+        )
+        df = _liquid_ohlc_df(5, close=100.0, avg_vol=20_000)  # only 5 bars
+        gate = f(df)
+        assert gate.iloc[-1]  # NaN avg → fail open
+
+    def test_iex_scaling_makes_otherwise_blocked_pass(self, monkeypatch):
+        """
+        With $20M base threshold and a $5M dollar-volume series:
+          - On SIP the filter blocks (5M < 20M).
+          - On IEX the threshold is $1M, so 5M >> 1M → allows.
+        Proves the scaling is the only thing different.
+        """
+        # close=100, vol=50_000 → dollar_vol = 5M
+        df = _liquid_ohlc_df(25, close=100.0, avg_vol=50_000)
+
+        sip_filter = self._filter(
+            monkeypatch,
+            feed="sip",
+            notional_min_avg=20_000_000,
+            vol_min_window=5,
+            exhaustion_atr_mult=10.0,
+        )
+        assert not sip_filter(df).iloc[-1]
+
+        iex_filter = self._filter(
+            monkeypatch,
+            feed="iex",
+            notional_min_avg=20_000_000,
+            vol_min_window=5,
+            exhaustion_atr_mult=10.0,
+        )
+        assert iex_filter(df).iloc[-1]
+
+    def test_exhaustion_gate_blocks_extended_close(self, monkeypatch):
+        """
+        Hand-verified math:
+          bb_length=10, atr_length=10. 9 flat bars at 100, range 2. Final close=150.
+          BB(10): mid=105, std=15  → bb_upper = 105 + 2*15 = 135.
+          ATR(10) seed at idx 9 = mean(TR_0..TR_9) = (2*9 + 51)/10 = 6.9.
+          Threshold = 135 + 1.5*6.9 = 145.35. Close=150 > 145.35 → exhausted.
+        """
+        f = self._filter(
+            monkeypatch,
+            notional_min_avg=0,
+            bb_length=10,
+            bb_std=2.0,
+            atr_length=10,
+            exhaustion_atr_mult=1.5,
+        )
+        n = 10
+        idx = pd.date_range("2024-01-01", periods=n, freq="B")
+        closes = [100.0] * (n - 1) + [150.0]
+        highs = [101.0] * (n - 1) + [151.0]
+        lows = [99.0] * (n - 1) + [149.0]
+        df = pd.DataFrame(
+            {
+                "close": closes,
+                "high": highs,
+                "low": lows,
+                "volume": [10_000_000] * n,
+            },
+            index=idx,
+        )
+        gate = f(df)
+        assert not gate.iloc[-1]
+
+    def test_exhaustion_gate_allows_normal_close(self, monkeypatch):
+        f = self._filter(
+            monkeypatch,
+            notional_min_avg=0,
+            bb_length=5,
+            bb_std=2.0,
+            atr_length=5,
+            exhaustion_atr_mult=1.5,
+        )
+        df = _liquid_ohlc_df(15, close=100.0, avg_vol=10_000_000)  # flat → not exhausted
+        gate = f(df)
+        assert gate.iloc[-1]
+
+    def test_set_symbol_propagates_to_earnings(self, monkeypatch):
+        from strategies.filters import bollinger_squeeze as bsq
+
+        monkeypatch.setattr(bsq, "ALPACA_DATA_FEED", "sip")
+        f = bsq.BollingerSqueezeEdgeFilter()
+        f.set_symbol("AVGO")
+        assert f._symbol == "AVGO"
+        assert f._earnings._symbol == "AVGO"
+
+    def test_default_earnings_window_is_2_1(self, monkeypatch):
+        from strategies.filters import bollinger_squeeze as bsq
+
+        monkeypatch.setattr(bsq, "ALPACA_DATA_FEED", "sip")
+        f = bsq.BollingerSqueezeEdgeFilter()
+        assert f._earnings._days_before == 2
+        assert f._earnings._days_after == 1
