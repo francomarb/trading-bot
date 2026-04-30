@@ -23,6 +23,7 @@ import sqlite3
 import time
 from datetime import datetime, timezone
 from pathlib import Path
+from collections import deque
 
 import pandas as pd
 import plotly.graph_objects as go
@@ -36,24 +37,91 @@ from config import settings
 
 def load_trades(db_path: str) -> pd.DataFrame:
     """Load all rows from the trades table. Returns empty DataFrame if missing."""
-    path = Path(db_path)
-    if not path.exists():
-        return pd.DataFrame(columns=[
+    def _empty(error: str | None = None) -> pd.DataFrame:
+        df = pd.DataFrame(columns=[
             "id", "timestamp", "symbol", "side", "qty", "avg_fill_price",
             "order_id", "strategy", "reason", "stop_price",
             "entry_reference_price", "modeled_slippage_bps",
             "realized_slippage_bps", "order_type", "status",
             "requested_qty", "filled_qty",
         ])
+        if error is not None:
+            df.attrs["load_error"] = error
+        return df
+
+    path = Path(db_path)
+    if not path.exists():
+        return _empty()
     try:
-        conn = sqlite3.connect(str(path))
-        df = pd.read_sql_query("SELECT * FROM trades ORDER BY timestamp ASC", conn)
-        conn.close()
+        with sqlite3.connect(str(path)) as conn:
+            df = pd.read_sql_query("SELECT * FROM trades ORDER BY timestamp ASC", conn)
         if not df.empty and "timestamp" in df.columns:
             df["timestamp"] = pd.to_datetime(df["timestamp"], utc=True)
         return df
-    except Exception:
-        return pd.DataFrame()
+    except Exception as exc:
+        return _empty(f"Failed to load trades DB '{db_path}': {type(exc).__name__}: {exc}")
+
+
+def _realized_pnl_events(
+    trades_df: pd.DataFrame,
+    *,
+    key_columns: tuple[str, ...] = ("symbol",),
+) -> list[dict]:
+    """
+    FIFO-match buy lots to sells and return realized P&L events.
+
+    Partial exits are handled correctly: any remaining quantity stays on the
+    front lot until fully consumed by later sells.
+    """
+    if trades_df.empty or "side" not in trades_df.columns:
+        return []
+
+    open_lots: dict[tuple, deque] = {}
+    events: list[dict] = []
+
+    for _, row in trades_df.sort_values("timestamp").iterrows():
+        key = tuple(row.get(col, "") for col in key_columns)
+        side = (row.get("side") or "").lower()
+        qty = float(row.get("filled_qty") or row.get("qty") or 0)
+        price = float(row.get("avg_fill_price") or 0)
+        ts = row.get("timestamp")
+
+        if qty <= 0 or price <= 0:
+            continue
+
+        if side == "buy":
+            open_lots.setdefault(key, deque()).append([qty, price])
+            continue
+
+        if side != "sell":
+            continue
+
+        lots = open_lots.setdefault(key, deque())
+        remaining_qty = qty
+        realized_pnl = 0.0
+        matched_qty = 0.0
+
+        while remaining_qty > 0 and lots:
+            lot_qty, lot_price = lots[0]
+            fill_qty = min(remaining_qty, lot_qty)
+            realized_pnl += (price - lot_price) * fill_qty
+            matched_qty += fill_qty
+            remaining_qty -= fill_qty
+            lot_qty -= fill_qty
+
+            if lot_qty == 0:
+                lots.popleft()
+            else:
+                lots[0][0] = lot_qty
+
+        if matched_qty > 0:
+            events.append({
+                "timestamp": ts,
+                "pnl": realized_pnl,
+                "matched_qty": matched_qty,
+            })
+
+    return events
 
 
 def load_engine_state(path: str) -> dict:
@@ -78,26 +146,7 @@ def compute_equity_curve(trades_df: pd.DataFrame) -> pd.DataFrame:
     if trades_df.empty or "side" not in trades_df.columns:
         return pd.DataFrame(columns=["timestamp", "cumulative_pnl"])
 
-    rows = []
-    open_buys: dict[str, list[tuple]] = {}  # symbol → [(qty, price)]
-
-    for _, row in trades_df.iterrows():
-        symbol = row.get("symbol", "")
-        side = (row.get("side") or "").lower()
-        qty = float(row.get("filled_qty") or row.get("qty") or 0)
-        price = float(row.get("avg_fill_price") or 0)
-        ts = row.get("timestamp")
-
-        if side == "buy" and qty > 0 and price > 0:
-            open_buys.setdefault(symbol, []).append((qty, price))
-        elif side == "sell" and qty > 0 and price > 0:
-            buys = open_buys.get(symbol, [])
-            if buys:
-                buy_qty, buy_price = buys.pop(0)
-                matched_qty = min(qty, buy_qty)
-                pnl = (price - buy_price) * matched_qty
-                rows.append({"timestamp": ts, "pnl": pnl})
-
+    rows = _realized_pnl_events(trades_df, key_columns=("symbol",))
     if not rows:
         return pd.DataFrame(columns=["timestamp", "cumulative_pnl"])
 
@@ -140,24 +189,8 @@ def compute_strategy_stats(trades_df: pd.DataFrame) -> pd.DataFrame:
 
     results = []
     for strategy, group in trades_df.groupby("strategy"):
-        sells = group[group["side"].str.lower() == "sell"]
-        buys = group[group["side"].str.lower() == "buy"]
-
-        # Match buys to sells by symbol to compute P&L
-        pnls: list[float] = []
-        open_buys: dict[str, list[tuple]] = {}
-        for _, row in group.sort_values("timestamp").iterrows():
-            sym = row.get("symbol", "")
-            side = (row.get("side") or "").lower()
-            qty = float(row.get("filled_qty") or row.get("qty") or 0)
-            price = float(row.get("avg_fill_price") or 0)
-            if side == "buy" and qty > 0 and price > 0:
-                open_buys.setdefault(sym, []).append((qty, price))
-            elif side == "sell" and qty > 0 and price > 0:
-                _buys = open_buys.get(sym, [])
-                if _buys:
-                    bqty, bprice = _buys.pop(0)
-                    pnls.append((price - bprice) * min(qty, bqty))
+        events = _realized_pnl_events(group, key_columns=("symbol",))
+        pnls = [event["pnl"] for event in events]
 
         wins = sum(1 for p in pnls if p > 0)
         trade_count = len(pnls)
@@ -179,7 +212,168 @@ def compute_strategy_stats(trades_df: pd.DataFrame) -> pd.DataFrame:
     return pd.DataFrame(results)
 
 
+def compute_sleeve_usage(
+    state: dict,
+    *,
+    equity: float,
+    allocations: dict[str, dict],
+    total_gross_pct: float,
+) -> pd.DataFrame:
+    """Compute actual sleeve usage from the state snapshot's open positions."""
+    positions_detail = state.get("positions_detail") or {}
+    rows = []
+
+    for strategy_name, cfg in allocations.items():
+        weight = float(cfg.get("weight", 0.0) or 0.0)
+        budget = equity * total_gross_pct * weight
+        open_positions = [
+            detail for detail in positions_detail.values()
+            if detail.get("strategy") == strategy_name
+        ]
+        used_notional = 0.0
+        for detail in open_positions:
+            market_value = detail.get("market_value")
+            qty = detail.get("qty")
+            entry = detail.get("avg_entry_price")
+            if market_value is not None:
+                used_notional += abs(float(market_value))
+            elif qty is not None and entry is not None:
+                used_notional += abs(float(qty) * float(entry))
+        remaining = max(0.0, budget - used_notional)
+        utilization = (used_notional / budget) if budget > 0 else 0.0
+        rows.append({
+            "Strategy": strategy_name,
+            "Weight": weight,
+            "Budget": budget,
+            "Used Notional": used_notional,
+            "Remaining": remaining,
+            "Utilization": utilization,
+            "Open Positions": len(open_positions),
+            "Max Positions": cfg.get("max_positions", "?"),
+        })
+
+    return pd.DataFrame(rows)
+
+
 # ── Dashboard layout ─────────────────────────────────────────────────────────
+
+
+def inject_styles() -> None:
+    """Inject a small visual system on top of the default Streamlit theme."""
+    st.markdown(
+        """
+        <style>
+        .stApp {
+            background:
+                radial-gradient(circle at top right, rgba(0, 176, 155, 0.12), transparent 28%),
+                radial-gradient(circle at top left, rgba(255, 75, 75, 0.10), transparent 24%),
+                linear-gradient(180deg, #0f1318 0%, #11161d 100%);
+        }
+
+        .block-container {
+            padding-top: 4.25rem;
+            padding-bottom: 2.25rem;
+            max-width: 1400px;
+        }
+
+        div[data-testid="metric-container"] {
+            background: linear-gradient(180deg, rgba(255,255,255,0.05), rgba(255,255,255,0.025));
+            border: 1px solid rgba(255,255,255,0.08);
+            border-radius: 16px;
+            padding: 0.85rem 1rem;
+            box-shadow: 0 18px 45px rgba(0,0,0,0.18);
+        }
+
+        div[data-testid="metric-container"] label {
+            letter-spacing: 0.04em;
+        }
+
+        div[data-testid="stHorizontalBlock"] div[data-testid="metric-container"] p {
+            font-variant-numeric: tabular-nums;
+        }
+
+        .dashboard-title {
+            margin: 0 0 0.4rem 0;
+            font-size: 2rem;
+            font-weight: 700;
+            letter-spacing: -0.03em;
+        }
+
+        .dashboard-subtitle {
+            color: rgba(255,255,255,0.70);
+            margin-bottom: 1.1rem;
+        }
+
+        .section-kicker {
+            color: #88d6cb;
+            text-transform: uppercase;
+            letter-spacing: 0.12em;
+            font-size: 0.72rem;
+            font-weight: 700;
+            margin-bottom: 0.2rem;
+        }
+
+        .section-title {
+            font-size: 1.15rem;
+            font-weight: 650;
+            margin-bottom: 0.2rem;
+        }
+
+        .section-note {
+            color: rgba(255,255,255,0.64);
+            font-size: 0.93rem;
+            margin-bottom: 0.8rem;
+        }
+
+        div[data-testid="stDataFrame"] {
+            border: 1px solid rgba(255,255,255,0.08);
+            border-radius: 16px;
+            overflow: hidden;
+            box-shadow: 0 14px 36px rgba(0,0,0,0.12);
+        }
+
+        div[data-baseweb="tab-list"] {
+            gap: 0.35rem;
+        }
+
+        button[data-baseweb="tab"] {
+            border-radius: 999px;
+            border: 1px solid rgba(255,255,255,0.08);
+            background: rgba(255,255,255,0.04);
+            padding: 0.35rem 0.95rem;
+        }
+
+        button[data-baseweb="tab"][aria-selected="true"] {
+            background: linear-gradient(90deg, rgba(0,176,155,0.22), rgba(0,176,155,0.10));
+            border-color: rgba(0,176,155,0.35);
+        }
+
+        hr {
+            border-color: rgba(255,255,255,0.07);
+            margin-top: 1.15rem;
+            margin-bottom: 1.15rem;
+        }
+        </style>
+        """,
+        unsafe_allow_html=True,
+    )
+
+
+def render_section_header(title: str, note: str, *, kicker: str) -> None:
+    """Render a compact section heading with a visual hierarchy."""
+    st.markdown(
+        f"""
+        <div class="section-kicker">{kicker}</div>
+        <div class="section-title">{title}</div>
+        <div class="section-note">{note}</div>
+        """,
+        unsafe_allow_html=True,
+    )
+
+
+def symbol_url(symbol: str) -> str:
+    """Return the default external chart page for a ticker."""
+    return f"https://finance.yahoo.com/quote/{symbol}/"
 
 
 def _regime_color(regime: str | None) -> str:
@@ -189,7 +383,8 @@ def _regime_color(regime: str | None) -> str:
         "VOLATILE": "🟠",
         "BEAR": "🔴",
     }
-    return colors.get(regime or "", "⚪")
+    key = (regime or "").upper()
+    return colors.get(key, "⚪")
 
 
 def render_dashboard() -> None:
@@ -198,13 +393,27 @@ def render_dashboard() -> None:
         page_icon="📈",
         layout="wide",
     )
-    st.title("📈 Trading Bot — Analytics Dashboard")
+    inject_styles()
+    st.markdown(
+        """
+        <div class="dashboard-title">Trading Bot Dashboard</div>
+        <div class="dashboard-subtitle">
+            Live operational view of the paper/live engine, strategy sleeves,
+            and realized trade history.
+        </div>
+        """,
+        unsafe_allow_html=True,
+    )
 
     # ── Load data ────────────────────────────────────────────────────────
     state = load_engine_state(settings.STATE_SNAPSHOT_PATH)
     live_trading = state.get("live_trading", settings.LIVE_TRADING)
     db_path = settings.TRADE_LOG_DB_LIVE if live_trading else settings.TRADE_LOG_DB_PAPER
     trades_df = load_trades(db_path)
+    trades_load_error = trades_df.attrs.get("load_error")
+
+    if trades_load_error:
+        st.error(trades_load_error)
 
     # ── Header row ───────────────────────────────────────────────────────
     env_label = "🔴 LIVE" if live_trading else "📄 PAPER"
@@ -247,7 +456,11 @@ def render_dashboard() -> None:
     left, right = st.columns([2, 1])
 
     with left:
-        st.subheader("Equity Curve (Cumulative P&L)")
+        render_section_header(
+            "Equity Curve",
+            "Realized cumulative P&L from closed trades only.",
+            kicker="Performance",
+        )
         if equity_curve.empty:
             st.info("No closed trades yet.")
         else:
@@ -281,51 +494,60 @@ def render_dashboard() -> None:
             st.plotly_chart(fig, width="stretch")
 
     with right:
-        st.subheader("Performance Metrics")
+        render_section_header(
+            "Performance Metrics",
+            "Computed from realized trade outcomes in the trade log.",
+            kicker="Performance",
+        )
         if equity_curve.empty or len(equity_curve) < 3:
             st.info("Need more trades for metrics.")
         else:
             from reporting.metrics import compute_metrics
-            sells = trades_df[trades_df["side"].str.lower() == "sell"]
-            if not sells.empty and "avg_fill_price" in sells.columns:
-                # Approximate per-trade P&L for metric computation
-                open_buys_m: dict[str, list[tuple]] = {}
-                pnl_list: list[float] = []
-                for _, row in trades_df.sort_values("timestamp").iterrows():
-                    sym = row.get("symbol", "")
-                    side = (row.get("side") or "").lower()
-                    qty = float(row.get("filled_qty") or row.get("qty") or 0)
-                    price = float(row.get("avg_fill_price") or 0)
-                    if side == "buy" and qty > 0 and price > 0:
-                        open_buys_m.setdefault(sym, []).append((qty, price))
-                    elif side == "sell" and qty > 0 and price > 0:
-                        _bs = open_buys_m.get(sym, [])
-                        if _bs:
-                            bq, bp = _bs.pop(0)
-                            pnl_list.append((price - bp) * min(qty, bq))
-                if pnl_list:
-                    m = compute_metrics(pnl_list)
-                    st.metric("Sharpe (annualized)", f"{m.sharpe_ratio:.2f}")
-                    st.metric("Max Drawdown", f"{m.max_drawdown_pct:.1%}")
-                    st.metric("Profit Factor", f"{m.profit_factor:.2f}")
-                    st.metric("Win Rate", f"{m.win_rate:.1%}")
-                    st.metric("Avg W/L Ratio", f"{m.avg_win_loss_ratio:.2f}")
+            pnl_events = _realized_pnl_events(trades_df, key_columns=("symbol",))
+            pnl_list = [event["pnl"] for event in pnl_events]
+            if pnl_list:
+                m = compute_metrics(pnl_list)
+                st.metric("Sharpe (annualized)", f"{m.sharpe_ratio:.2f}")
+                st.metric("Max Drawdown", f"{m.max_drawdown_pct:.1%}")
+                st.metric("Profit Factor", f"{m.profit_factor:.2f}")
+                st.metric("Win Rate", f"{m.win_rate:.1%}")
+                st.metric("Avg W/L Ratio", f"{m.avg_win_loss_ratio:.2f}")
             else:
                 st.info("No closed trades yet.")
 
     st.divider()
 
     # ── Strategy health ───────────────────────────────────────────────────
-    st.subheader("Strategy Health")
+    render_section_header(
+        "Strategy Health",
+        "Closed-trade summary by strategy using realized P&L and slippage.",
+        kicker="Attribution",
+    )
     strategy_stats = compute_strategy_stats(trades_df)
     if strategy_stats.empty:
         st.info("No trades recorded yet.")
     else:
         display = strategy_stats.copy()
-        display["win_rate"] = display["win_rate"].map("{:.1%}".format)
-        display["total_pnl"] = display["total_pnl"].map("${:,.2f}".format)
-        display["avg_slippage_bps"] = display["avg_slippage_bps"].map("{:.1f} bps".format)
-        st.dataframe(display, width="stretch", hide_index=True)
+        display = display.rename(columns={
+            "strategy": "Strategy",
+            "trades": "Trades",
+            "wins": "Wins",
+            "win_rate": "Win Rate",
+            "total_pnl": "Total P&L",
+            "avg_slippage_bps": "Avg Slippage Bps",
+        })
+        st.dataframe(
+            display,
+            width="stretch",
+            hide_index=True,
+            column_config={
+                "Trades": st.column_config.NumberColumn(format="%d"),
+                "Wins": st.column_config.NumberColumn(format="%d"),
+                "Win Rate": st.column_config.NumberColumn(format="%.1f%%"),
+                "Total P&L": st.column_config.NumberColumn(format="$%.2f"),
+                "Avg Slippage Bps": st.column_config.NumberColumn(format="%.1f bps"),
+            },
+        )
 
     st.divider()
 
@@ -333,7 +555,11 @@ def render_dashboard() -> None:
     pos_col, sleeve_col = st.columns(2)
 
     with pos_col:
-        st.subheader("Open Positions")
+        render_section_header(
+            "Open Positions",
+            "Current owned positions from the latest engine snapshot.",
+            kicker="Exposure",
+        )
         positions_detail = state.get("positions_detail") or {}
         open_positions = state.get("open_positions") or {}
         if not open_positions:
@@ -347,39 +573,79 @@ def render_dashboard() -> None:
                 qty = detail.get("qty")
                 cost_basis = (qty * entry) if (qty is not None and entry is not None) else None
                 pos_data.append({
-                    "symbol": sym,
-                    "strategy": strat,
-                    "qty": qty,
-                    "entry $": f"${entry:,.2f}" if entry is not None else "—",
-                    "cost basis": f"${cost_basis:,.2f}" if cost_basis is not None else "—",
-                    "unreal. P&L": f"${upnl:+,.2f}" if upnl is not None else "—",
+                    "Symbol": symbol_url(sym),
+                    "Strategy": strat,
+                    "Qty": qty,
+                    "Entry": f"${entry:,.2f}" if entry is not None else "—",
+                    "Cost Basis": f"${cost_basis:,.2f}" if cost_basis is not None else "—",
+                    "Unrealized P&L": f"${upnl:+,.2f}" if upnl is not None else "—",
                 })
-            st.dataframe(pd.DataFrame(pos_data), width="stretch", hide_index=True)
+            st.dataframe(
+                pd.DataFrame(pos_data),
+                width="stretch",
+                hide_index=True,
+                column_config={
+                    "Symbol": st.column_config.LinkColumn(
+                        "Symbol",
+                        display_text=r"https://finance\.yahoo\.com/quote/([^/]+)/",
+                    ),
+                },
+            )
 
     with sleeve_col:
-        st.subheader("Sleeve Allocation")
-        # Derive sleeve allocation from open positions count and settings
-        open_pos = state.get("open_positions") or {}
-        alloc_rows = []
-        for name, cfg in settings.STRATEGY_ALLOCATIONS.items():
-            used_count = sum(1 for strat in open_pos.values() if strat == name)
-            max_pos = cfg.get("max_positions", "?")
-            weight = cfg.get("weight", 0)
-            alloc_rows.append({
-                "strategy": name,
-                "weight": f"{weight:.0%}",
-                "open positions": f"{used_count}/{max_pos}",
-            })
-        if alloc_rows:
-            st.dataframe(pd.DataFrame(alloc_rows), width="stretch", hide_index=True)
+        render_section_header(
+            "Sleeve Usage",
+            "Configured sleeve budgets against current open-position notional.",
+            kicker="Exposure",
+        )
+        sleeve_df = compute_sleeve_usage(
+            state,
+            equity=equity,
+            allocations=settings.STRATEGY_ALLOCATIONS,
+            total_gross_pct=settings.MAX_GROSS_EXPOSURE_PCT,
+        )
+        if not sleeve_df.empty:
+            display = sleeve_df.copy()
+            display["Open Positions"] = display.apply(
+                lambda row: f"{row['Open Positions']}/{row['Max Positions']}",
+                axis=1,
+            )
+            display = display.drop(columns=["Max Positions"])
+            st.dataframe(
+                display,
+                width="stretch",
+                hide_index=True,
+                column_config={
+                    "Weight": st.column_config.NumberColumn(format="%.0f%%"),
+                    "Budget": st.column_config.NumberColumn(format="$%.2f"),
+                    "Used Notional": st.column_config.NumberColumn(format="$%.2f"),
+                    "Remaining": st.column_config.NumberColumn(format="$%.2f"),
+                    "Utilization": st.column_config.ProgressColumn(
+                        "Utilization",
+                        help="Current sleeve notional usage vs configured budget.",
+                        format="%.1f%%",
+                        min_value=0.0,
+                        max_value=1.0,
+                    ),
+                },
+            )
+            st.caption(
+                "Uses current open-position notional from the engine snapshot. "
+                "Pending buy orders are not included here."
+            )
 
     st.divider()
 
     # ── Watchlists ───────────────────────────────────────────────────────
-    st.subheader("Active Watchlists")
+    render_section_header(
+        "Active Watchlists",
+        "Per-strategy universes with live regime gating and last-trade context.",
+        kicker="Universe",
+    )
     strategy_watchlists = settings.STRATEGY_WATCHLISTS
     strategy_allowed_regimes = settings.STRATEGY_ALLOWED_REGIMES
     open_positions = state.get("open_positions") or {}
+    watchlist_statuses = state.get("watchlist_statuses") or {}
 
     if not strategy_watchlists:
         st.info("No strategy watchlists configured.")
@@ -417,28 +683,42 @@ def render_dashboard() -> None:
                         }
 
                 rows = []
+                strategy_status_map = watchlist_statuses.get(strat_name, {})
                 for sym in symbols:
-                    is_open = sym in open_positions and open_positions[sym] == strat_name
+                    status = strategy_status_map.get(sym)
+                    if status is None:
+                        is_open = sym in open_positions and open_positions[sym] == strat_name
+                        status = "Long" if is_open else "Flat"
                     lt = last_trade.get(sym, {})
                     price = lt.get("price")
                     rows.append({
-                        "symbol": sym,
-                        "status": "🟢 Long" if is_open else "⚪ Flat",
-                        "last trade": lt.get("date", "—"),
-                        "last side": lt.get("side", "—").upper() if lt.get("side") else "—",
-                        "last price": f"${float(price):,.2f}" if price else "—",
+                        "Symbol": symbol_url(sym),
+                        "Status": status,
+                        "Last Trade": lt.get("date", "—"),
+                        "Last Side": lt.get("side", "—").upper() if lt.get("side") else "—",
+                        "Last Price": f"${float(price):,.2f}" if price else "—",
                     })
 
                 st.dataframe(
                     pd.DataFrame(rows),
                     width="stretch",
                     hide_index=True,
+                    column_config={
+                        "Symbol": st.column_config.LinkColumn(
+                            "Symbol",
+                            display_text=r"https://finance\.yahoo\.com/quote/([^/]+)/",
+                        ),
+                    },
                 )
 
     st.divider()
 
     # ── Recent trades ────────────────────────────────────────────────────
-    st.subheader("Recent Trades (last 20)")
+    render_section_header(
+        "Recent Trades",
+        "Most recent fills from the selected trade database.",
+        kicker="Audit Trail",
+    )
     if trades_df.empty:
         st.info("No trades in the database yet.")
     else:
@@ -454,7 +734,29 @@ def render_dashboard() -> None:
             recent["avg_fill_price"] = recent["avg_fill_price"].map(
                 lambda x: f"${x:,.2f}" if pd.notna(x) else "—"
             )
-        st.dataframe(recent[::-1], width="stretch", hide_index=True)
+        recent = recent.rename(columns={
+            "timestamp": "Timestamp",
+            "symbol": "Symbol",
+            "side": "Side",
+            "qty": "Qty",
+            "avg_fill_price": "Avg Fill Price",
+            "strategy": "Strategy",
+            "reason": "Reason",
+            "realized_slippage_bps": "Realized Slippage Bps",
+        })
+        if "Symbol" in recent.columns:
+            recent["Symbol"] = recent["Symbol"].map(symbol_url)
+        st.dataframe(
+            recent[::-1],
+            width="stretch",
+            hide_index=True,
+            column_config={
+                "Symbol": st.column_config.LinkColumn(
+                    "Symbol",
+                    display_text=r"https://finance\.yahoo\.com/quote/([^/]+)/",
+                ),
+            },
+        )
 
     # ── Auto-refresh ──────────────────────────────────────────────────────
     st.caption("Dashboard auto-refreshes every 30 seconds.")

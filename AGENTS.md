@@ -186,37 +186,48 @@ python phase2_verify.py
 
 ## Current Phase
 
-**Phase 10 — In Progress (2026-04-24). Phases 1–9 and 9.5 complete.**
+**Phase 10 — In Progress (2026-04-29). Phases 1–9 and 9.5 complete.**
 
-Only **SMA Crossover** is currently active in `forward_test.py`.
-RSI Reversion is implemented and backtested but not yet running. RSI activation
-is a Phase 10 paper-mode deliverable (10.F4).
+Both **SMA Crossover** and **RSI Reversion** are currently active in
+`forward_test.py` in paper mode. The bot is running in tmux for the combined
+Phase 10 paper-validation gate; this is now a multi-strategy operational test,
+not the earlier SMA-only forward run.
 
-Phase 10 completed to date (2026-04-24):
-- **10.B1** Live config separation (`LIVE_TRADING` flag, separate credentials, `trades_live.db`)
+Phase 10 completed to date:
+- **10.B1** Live config separation (`LIVE_TRADING`, separate credentials, `trades_live.db`)
 - **10.B2** Pre-flight checklist (`scripts/preflight.py`)
-- **10.B3** `WatchlistSource` abstraction + `StaticWatchlistSource`; `forward_test.py` wired
+- **10.B3** `WatchlistSource` abstraction + `StaticWatchlistSource`; per-strategy watchlists wired
 - **10.C1** Durable position ownership restored from trade DB on restart
 - **10.C2** Startup reconciliation with NORMAL / RESTRICTED fail-safe modes
 - **10.C3/C4** Tests + external-close detection with 3-cycle confirmation window
 - **10.E1** WebSocket order/fill streaming via `TradingStream` (stream-first, REST fallback)
+- **10.F1** Per-strategy capital sleeve allocator (`STRATEGY_ALLOCATIONS`, 50/50 sleeves)
+- **10.F2/F3** Regime detector + engine-level `allowed_regimes` gating
+- **10.F3a** SMA edge filter (`SPY > 200 SMA`, stock `> 200 SMA`, `10d vol > 30d vol`)
+- **10.F3b** RSI edge filter (`SPY > 200/50 SMA`, earnings blackout, liquidity floor, no new 20-day low)
+- **10.F4** RSI paper activation in `forward_test.py`
 - **10.G1** `LIVE_SIZE_MULTIPLIER=0.25` applied in risk manager when live
 - **10.G4** `DRY_RUN` flag — broker logs orders without submitting
+- **10.G6** Fractional share sizing (`FRACTIONAL_ENABLED=True`; fractional DAY entry + standalone whole-share stop path)
 
-Phase 10 remaining blockers before live (see PLAN.md):
-- 10.D1/D2 Slippage kill switch calibration (needs ≥10 real fills)
-- 10.F1–F5 Multi-strategy portfolio layer (capital allocation, regime gating, RSI activation)
-- 10.F3a/F3b SMA + RSI edge filters
-- 10.G2 Hard dollar cap config; 10.G5 Go/no-go verification
-- Minimum 2-week SMA + RSI combined paper run before any live flip
+Phase 10 current focus / remaining blockers before live (see `PLAN.md`):
+- **10.D1/D2** Slippage kill switch calibration and enablement — this is the active work now
+- **10.F6** Verify combined SMA + RSI paper logs: startup reconciliation, sleeve accounting, regime gating, attribution
+- **10.G2** Hard dollar cap config for live `.env`
+- **10.G5** Final live go/no-go verification
+- **10.H1-H5** VPS provisioning and deployment hardening before any live transition
+- Minimum **2-4 week combined SMA + RSI paper run** with documented GO/NO-GO before flipping live
 
-Total: 510 unit tests passing.
+Current local verification: **757 tests passing** via
+`/Users/franco/trading-bot/venv/bin/pytest` on 2026-04-30. `PLAN.md`'s latest
+recorded milestone is **646 unit tests passing** as of 2026-04-25, before the
+2026-04-28 dashboard work and 2026-04-29 Bollinger strategy additions.
 
-**Next steps:**
-1. Let `python forward_test.py` run through next market week (Monday 2026-04-28).
-2. After ≥10 real fills → enable slippage kill switch (10.D1/D2).
-3. Implement SMA edge filter (10.F3a) and RSI edge filter (10.F3b).
-4. Then capital allocation + regime gating (10.F1–F3) + RSI activation (10.F4).
+**Immediate operational next steps:**
+1. Keep `python forward_test.py` running and continue collecting real paper fills.
+2. After enough fills accumulate, calibrate realized slippage vs the 5 bps model (`10.D1`).
+3. If thresholds hold, enable `SLIPPAGE_DRIFT_ENABLED=True` (`10.D2`).
+4. Continue the combined SMA + RSI paper-validation window and produce the Phase 10 GO/NO-GO evidence package before any live flip.
 
 ---
 

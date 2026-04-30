@@ -13,6 +13,7 @@ import pytest
 from dashboard import (
     compute_equity_curve,
     compute_rolling_sharpe,
+    compute_sleeve_usage,
     compute_strategy_stats,
     load_engine_state,
     load_trades,
@@ -85,6 +86,19 @@ class TestLoadTrades:
         ])
         df = load_trades(str(db))
         assert pd.api.types.is_datetime64_any_dtype(df["timestamp"])
+
+    def test_db_read_failure_returns_empty_with_error_attr(self, tmp_path, monkeypatch):
+        db = tmp_path / "trades.db"
+        _make_db(db, [])
+
+        def _boom(*args, **kwargs):
+            raise sqlite3.DatabaseError("broken db")
+
+        monkeypatch.setattr(pd, "read_sql_query", _boom)
+        df = load_trades(str(db))
+        assert df.empty
+        assert "load_error" in df.attrs
+        assert "broken db" in df.attrs["load_error"]
 
 
 # ── load_engine_state ────────────────────────────────────────────────────────
@@ -170,6 +184,20 @@ class TestComputeEquityCurve:
         assert len(curve) == 2
         # First trade: +100; second trade: -20; cumulative at end = +80
         assert pytest.approx(curve["cumulative_pnl"].iloc[-1]) == 80.0
+
+    def test_partial_exit_keeps_remaining_lot_for_later_sell(self):
+        df = self._make_df([
+            {"symbol": "AAPL", "side": "buy", "qty": "10", "avg_fill_price": "100.0",
+             "filled_qty": "10", "timestamp": _ts(0)},
+            {"symbol": "AAPL", "side": "sell", "qty": "5", "avg_fill_price": "110.0",
+             "filled_qty": "5", "timestamp": _ts(1)},
+            {"symbol": "AAPL", "side": "sell", "qty": "5", "avg_fill_price": "120.0",
+             "filled_qty": "5", "timestamp": _ts(2)},
+        ])
+        curve = compute_equity_curve(df)
+        assert len(curve) == 2
+        assert pytest.approx(curve["cumulative_pnl"].iloc[0]) == 50.0
+        assert pytest.approx(curve["cumulative_pnl"].iloc[1]) == 150.0
 
 
 # ── compute_rolling_sharpe ───────────────────────────────────────────────────
@@ -279,3 +307,60 @@ class TestComputeStrategyStats:
         strategies = set(stats["strategy"])
         assert "sma_crossover" in strategies
         assert "rsi_reversion" in strategies
+
+    def test_partial_exit_counts_both_realized_closes(self):
+        df = self._make_df([
+            {"symbol": "AAPL", "side": "buy", "strategy": "sma_crossover",
+             "avg_fill_price": "100.0", "filled_qty": "10", "qty": "10",
+             "realized_slippage_bps": "0", "timestamp": _ts(0)},
+            {"symbol": "AAPL", "side": "sell", "strategy": "sma_crossover",
+             "avg_fill_price": "110.0", "filled_qty": "5", "qty": "5",
+             "realized_slippage_bps": "0", "timestamp": _ts(1)},
+            {"symbol": "AAPL", "side": "sell", "strategy": "sma_crossover",
+             "avg_fill_price": "120.0", "filled_qty": "5", "qty": "5",
+             "realized_slippage_bps": "0", "timestamp": _ts(2)},
+        ])
+        stats = compute_strategy_stats(df)
+        row = stats[stats["strategy"] == "sma_crossover"].iloc[0]
+        assert row["trades"] == 2
+        assert row["wins"] == 2
+        assert pytest.approx(row["total_pnl"]) == 150.0
+        assert pytest.approx(row["win_rate"]) == 1.0
+
+
+class TestComputeSleeveUsage:
+    def test_uses_market_value_not_position_count(self):
+        state = {
+            "positions_detail": {
+                "AAPL": {
+                    "strategy": "sma_crossover",
+                    "qty": 10,
+                    "avg_entry_price": 100.0,
+                    "market_value": 1250.0,
+                },
+                "MSFT": {
+                    "strategy": "rsi_reversion",
+                    "qty": 5,
+                    "avg_entry_price": 200.0,
+                    "market_value": 900.0,
+                },
+            }
+        }
+        allocations = {
+            "sma_crossover": {"weight": 0.50, "max_positions": 5},
+            "rsi_reversion": {"weight": 0.50, "max_positions": 5},
+        }
+        result = compute_sleeve_usage(
+            state,
+            equity=100_000.0,
+            allocations=allocations,
+            total_gross_pct=0.80,
+        )
+        sma = result[result["Strategy"] == "sma_crossover"].iloc[0]
+        rsi = result[result["Strategy"] == "rsi_reversion"].iloc[0]
+        assert pytest.approx(sma["Budget"]) == 40_000.0
+        assert pytest.approx(sma["Used Notional"]) == 1250.0
+        assert pytest.approx(sma["Remaining"]) == 38_750.0
+        assert pytest.approx(sma["Utilization"]) == 1250.0 / 40_000.0
+        assert sma["Open Positions"] == 1
+        assert pytest.approx(rsi["Used Notional"]) == 900.0

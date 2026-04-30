@@ -63,3 +63,24 @@ def tmp_cache_dir(tmp_path: Path, monkeypatch) -> Path:
 
     monkeypatch.setattr(fetcher, "CACHE_DIR", tmp_path)
     return tmp_path
+
+
+@pytest.fixture(autouse=True)
+def isolate_runtime_artifacts(tmp_path: Path, monkeypatch) -> None:
+    """
+    Redirect runtime write targets into pytest tmp space for every test.
+
+    This prevents unit tests from polluting real project files such as:
+      - data/trades.db
+      - data/trades_live.db
+      - data/engine_state.json
+      - logs/*.jsonl / alerts.log
+    """
+    from config import settings
+
+    monkeypatch.setattr(settings, "TRADE_LOG_DB_PAPER", str(tmp_path / "trades.db"))
+    monkeypatch.setattr(settings, "TRADE_LOG_DB_LIVE", str(tmp_path / "trades_live.db"))
+    monkeypatch.setattr(settings, "TRADE_LOG_DB", str(tmp_path / "trades.db"))
+    monkeypatch.setattr(settings, "STATE_SNAPSHOT_PATH", str(tmp_path / "engine_state.json"))
+    monkeypatch.setattr(settings, "JSON_LOG_FILE", str(tmp_path / "bot.jsonl"))
+    monkeypatch.setattr(settings, "ALERT_LOG_FILE", str(tmp_path / "alerts.log"))

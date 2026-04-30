@@ -65,8 +65,8 @@ class FakeStrategy(BaseStrategy):
     name = "fake_strategy"
     preferred_order_type = OrderType.MARKET
 
-    def __init__(self, *, entries: list[bool], exits: list[bool]):
-        super().__init__()
+    def __init__(self, *, entries: list[bool], exits: list[bool], edge_filter=None):
+        super().__init__(edge_filter=edge_filter)
         self._entries = entries
         self._exits = exits
 
@@ -175,7 +175,7 @@ def patch_fetch(monkeypatch):
 
 
 @pytest.fixture
-def engine_factory(patch_fetch):
+def engine_factory(patch_fetch, tmp_path):
     """Build an engine with one symbol, default risk, fake broker, fake strategy."""
 
     def _factory(
@@ -219,12 +219,14 @@ def engine_factory(patch_fetch):
         if config_overrides:
             cfg = EngineConfig(**{**cfg.__dict__, **config_overrides})
 
+        trade_logger = TradeLogger(path=str(tmp_path / "trades.db"))
         engine = TradingEngine(
             strategy=strategy,
             symbols=["AAPL"],
             risk=risk,
             broker=broker,
             config=cfg,
+            trade_logger=trade_logger,
             clock=lambda: T0,
         )
         return engine, broker
@@ -368,8 +370,50 @@ class TestRunOneCycle:
         engine._session_start_equity = 100_000.0
         engine._cycle_count = 1
         engine._run_one_cycle()
-        broker.sync_with_broker.assert_not_called()
+        broker.sync_with_broker.assert_called_once()
         broker.place_order.assert_not_called()
+
+    def test_market_closed_cycle_refreshes_watchlist_statuses_from_snapshot(
+        self, engine_factory
+    ):
+        positions = {"AAPL": Position("AAPL", 10, 100.0, 1010.0)}
+        snap = _snapshot(positions=positions)
+        engine, broker = engine_factory(
+            market_open=False,
+            snapshot=snap,
+            config_overrides={"market_hours_only": True},
+        )
+        engine._position_owners["AAPL"] = "fake_strategy"
+        engine._run_one_cycle()
+        broker.sync_with_broker.assert_called_once()
+        assert engine._watchlist_statuses["fake_strategy"]["AAPL"] == "Long"
+
+    def test_market_closed_cycle_preserves_blocked_status_when_flat(
+        self, engine_factory
+    ):
+        engine, broker = engine_factory(
+            market_open=False,
+            snapshot=_snapshot(),
+            config_overrides={"market_hours_only": True},
+        )
+        engine._watchlist_statuses = {"fake_strategy": {"AAPL": "Regime Blocked"}}
+        engine._run_one_cycle()
+        broker.sync_with_broker.assert_called_once()
+        assert engine._watchlist_statuses["fake_strategy"]["AAPL"] == "Regime Blocked"
+
+    def test_market_closed_cycle_updates_last_known_regime(self, engine_factory):
+        engine, broker = engine_factory(
+            market_open=False,
+            snapshot=_snapshot(),
+            config_overrides={"market_hours_only": True},
+        )
+        fake_regime = MagicMock()
+        fake_regime.detect.return_value = SimpleNamespace(value="ranging")
+        engine._regime_detector = fake_regime
+        engine._run_one_cycle()
+        broker.sync_with_broker.assert_called_once()
+        fake_regime.detect.assert_called_once()
+        assert engine._last_regime == "ranging"
 
     def test_market_closed_cycle_updates_sleep_gap_baseline(self, engine_factory):
         engine, broker = engine_factory(
@@ -383,7 +427,7 @@ class TestRunOneCycle:
         engine._run_one_cycle()
 
         assert engine._last_cycle_end >= before
-        broker.sync_with_broker.assert_not_called()
+        broker.sync_with_broker.assert_called_once()
 
     def test_sync_failure_skips_cycle_and_records_broker_error(
         self, engine_factory
@@ -541,7 +585,7 @@ class TestSlippageRecording:
 
 
 class TestMultiSlot:
-    def test_multi_slot_processes_all_slots(self, patch_fetch):
+    def test_multi_slot_processes_all_slots(self, patch_fetch, tmp_path):
         """Two slots with different strategies and symbols — both fire."""
         from strategies.base import StrategySlot
 
@@ -586,13 +630,14 @@ class TestMultiSlot:
             risk=risk,
             broker=broker,
             config=config,
+            trade_logger=TradeLogger(path=str(tmp_path / "trades.db")),
             clock=lambda: T0,
         )
         engine.start(max_cycles=1)
         # Both slots should have placed orders.
         assert broker.place_order.call_count == 2
 
-    def test_legacy_single_strategy_api_still_works(self, patch_fetch):
+    def test_legacy_single_strategy_api_still_works(self, patch_fetch, tmp_path):
         """Passing strategy= (no slots) still works via backward compat."""
         broker = MagicMock()
         broker.sync_with_broker.return_value = _snapshot()
@@ -614,6 +659,7 @@ class TestMultiSlot:
             risk=RiskManager(),
             broker=broker,
             config=config,
+            trade_logger=TradeLogger(path=str(tmp_path / "trades.db")),
             clock=lambda: T0,
         )
         assert len(engine.slots) == 1
@@ -698,6 +744,92 @@ class TestPositionOwnership:
         engine, broker = engine_factory(snapshot=_snapshot(positions=positions))
         engine.start(max_cycles=1)
         assert engine._position_owners["AAPL"] == "fake_strategy"
+
+
+class TestWatchlistStatuses:
+    def test_baseline_pending_entry_from_open_buy_order(self, engine_factory):
+        engine, _ = engine_factory()
+        snap = _snapshot(open_orders=[
+            OpenOrder(
+                order_id="buy-1",
+                symbol="AAPL",
+                side=Side.BUY,
+                qty=1,
+                order_type=OrderType.MARKET,
+                status="open",
+                submitted_at=T0,
+                limit_price=None,
+                stop_price=None,
+            )
+        ])
+        status = engine._baseline_watchlist_status(
+            "AAPL",
+            snap,
+            strategy_name="fake_strategy",
+            order_strategy={"buy-1": "fake_strategy"},
+        )
+        assert status == "Pending Entry"
+
+    def test_regime_blocked_status_uses_real_entry_signal(self, engine_factory):
+        engine, broker = engine_factory(entries=[False] * 59 + [True])
+        snap = _snapshot()
+        engine._session_start_equity = snap.account.equity
+        slot = engine.slots[0]
+        statuses = {"AAPL": "Flat"}
+        engine._process_symbol(
+            "AAPL",
+            snap,
+            snap.account,
+            slot.strategy,
+            slot.timeframe,
+            entry_allowed=False,
+            strategy_statuses=statuses,
+        )
+        assert statuses["AAPL"] == "Regime Blocked"
+        broker.place_order.assert_not_called()
+
+    def test_filter_blocked_status_when_raw_entry_vetoed(self, engine_factory):
+        edge_filter = lambda df: pd.Series([False] * len(df), index=df.index, dtype=bool)
+        strategy = FakeStrategy(
+            entries=[False] * 59 + [True],
+            exits=[False],
+            edge_filter=edge_filter,
+        )
+        engine, broker = engine_factory()
+        engine.slots[0].strategy = strategy
+        engine.strategy = strategy
+        snap = _snapshot()
+        engine._session_start_equity = snap.account.equity
+        statuses = {"AAPL": "Flat"}
+        engine._process_symbol(
+            "AAPL",
+            snap,
+            snap.account,
+            strategy,
+            engine.slots[0].timeframe,
+            strategy_statuses=statuses,
+        )
+        assert statuses["AAPL"] == "Filter Blocked"
+        broker.place_order.assert_not_called()
+
+    def test_state_snapshot_includes_watchlist_statuses(self, engine_factory):
+        import json
+        from config import settings
+
+        engine, _ = engine_factory()
+        engine._running = True
+        engine._cycle_count = 3
+        engine._last_regime = "TRENDING"
+        engine._session_start_equity = 100_000.0
+        engine._last_cycle_equity = 100_250.0
+        engine._watchlist_statuses = {
+            "sma_crossover": {"AAPL": "Long", "MSFT": "Regime Blocked"}
+        }
+        engine._write_state_snapshot()
+        with open(settings.STATE_SNAPSHOT_PATH) as fh:
+            state = json.load(fh)
+        assert state["watchlist_statuses"]["sma_crossover"]["AAPL"] == "Long"
+        assert state["watchlist_statuses"]["sma_crossover"]["MSFT"] == "Regime Blocked"
 
     def test_startup_repairs_missing_protective_stop(
         self, engine_factory, tmp_path

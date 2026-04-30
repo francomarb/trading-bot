@@ -235,6 +235,10 @@ class TradingEngine:
         # HALT → no new entries until manual reset_kill_switches().
         self._startup_mode: str = "NORMAL"
 
+        # Latest per-strategy watchlist statuses for dashboard display.
+        # strategy_name -> {symbol -> status}
+        self._watchlist_statuses: dict[str, dict[str, str]] = {}
+
     # ── Lifecycle ────────────────────────────────────────────────────────
 
     def start(self, *, max_cycles: int | None = None) -> None:
@@ -349,6 +353,38 @@ class TradingEngine:
 
             if not market_open:
                 cycle_status = "market_closed"
+                try:
+                    snapshot = self.broker.sync_with_broker(
+                        session_start_equity=self._session_start_equity
+                    )
+                    self._last_cycle_equity = snapshot.account.equity
+                    self._last_snapshot = snapshot
+                    if self._regime_detector is not None:
+                        try:
+                            current_regime = self._regime_detector.detect()
+                            regime_str = current_regime.value
+                            if (
+                                self._last_regime is not None
+                                and regime_str != self._last_regime
+                            ):
+                                self.alerts.regime_shift(self._last_regime, regime_str)
+                            self._last_regime = regime_str
+                        except Exception as exc:
+                            logger.warning(
+                                f"market-closed regime detection failed: {exc} — "
+                                "keeping last known regime"
+                            )
+                    order_strategy = self._attribute_orders(snapshot.open_orders)
+                    self._refresh_watchlist_statuses(
+                        snapshot,
+                        order_strategy=order_strategy,
+                        preserve_existing=True,
+                    )
+                except Exception as e:
+                    logger.warning(
+                        f"market-closed snapshot refresh failed: {e} — "
+                        "keeping last known watchlist statuses"
+                    )
                 logger.info(f"cycle {cycle_id} skipped: market closed")
                 return
 
@@ -418,6 +454,7 @@ class TradingEngine:
             # orders against the correct strategy's sleeve budget.
             order_strategy = self._attribute_orders(snapshot.open_orders)
 
+            self._watchlist_statuses = {}
             for slot in self.slots:
                 # Per-slot regime gate: block new entries if current regime is
                 # not in the slot's allowed set. Exits always proceed.
@@ -433,7 +470,15 @@ class TradingEngine:
                         )
 
                 symbols = slot.active_symbols()
+                strategy_statuses: dict[str, str] = {}
+                self._watchlist_statuses[slot.strategy.name] = strategy_statuses
                 for symbol in symbols:
+                    strategy_statuses[symbol] = self._baseline_watchlist_status(
+                        symbol,
+                        snapshot,
+                        strategy_name=slot.strategy.name,
+                        order_strategy=order_strategy,
+                    )
                     try:
                         processed_symbols += 1
                         filled = self._process_symbol(
@@ -444,6 +489,7 @@ class TradingEngine:
                             slot.timeframe,
                             entry_allowed=entry_allowed,
                             order_strategy=order_strategy,
+                            strategy_statuses=strategy_statuses,
                         )
                         if filled is not None:
                             new_positions += 1
@@ -498,6 +544,7 @@ class TradingEngine:
         *,
         entry_allowed: bool = True,
         order_strategy: dict[str, str] | None = None,
+        strategy_statuses: dict[str, str] | None = None,
     ) -> Position | None:
         """
         The full per-symbol decision path. Returns a Position if an entry was
@@ -538,7 +585,9 @@ class TradingEngine:
         latest_ts = df.index[-1]
 
         # 4. Signals.
+        raw_signals = strategy._raw_signals(df)
         signals = strategy.generate_signals(df, symbol=symbol)
+        raw_entry = bool(raw_signals.entries.iloc[-1])
         last_entry = bool(signals.entries.iloc[-1])
         last_exit = bool(signals.exits.iloc[-1])
 
@@ -562,6 +611,8 @@ class TradingEngine:
                 )
                 return
             if self._has_pending_close_order(symbol, snapshot):
+                if strategy_statuses is not None:
+                    strategy_statuses[symbol] = "Pending Exit"
                 logger.info(
                     f"{symbol}: exit signal but a close order is already pending — skipping"
                 )
@@ -572,6 +623,8 @@ class TradingEngine:
                 self._record_fill(result, modeled_price=latest_close, order_type="market")
                 self._log_close(result, latest_close, strategy.name)
                 if result.status in {OrderStatus.FILLED, OrderStatus.PARTIAL}:
+                    if strategy_statuses is not None:
+                        strategy_statuses[symbol] = "Flat"
                     close_price = result.avg_fill_price or latest_close
                     close_qty = int(result.filled_qty or (position.qty if position else 0))
                     self.alerts.trade_executed(
@@ -592,8 +645,17 @@ class TradingEngine:
 
         # 6. Entry branch — risk is the gate.
         if not last_entry:
+            if (
+                raw_entry
+                and position is None
+                and strategy_statuses is not None
+                and strategy_statuses.get(symbol) == "Flat"
+            ):
+                strategy_statuses[symbol] = "Filter Blocked"
             return
         if not entry_allowed:
+            if position is None and strategy_statuses is not None:
+                strategy_statuses[symbol] = "Regime Blocked"
             logger.debug(
                 f"[{strategy.name}] {symbol}: entry blocked by regime gate"
             )
@@ -662,6 +724,8 @@ class TradingEngine:
             self._log_entry(decision, result, latest_close)
             if result.status in {OrderStatus.FILLED, OrderStatus.PARTIAL}:
                 self._position_owners[symbol] = strategy.name
+                if strategy_statuses is not None:
+                    strategy_statuses[symbol] = "Long"
                 fill_price = result.avg_fill_price or decision.entry_reference_price
                 fill_qty = int(result.filled_qty or decision.qty)
                 self.alerts.trade_executed(
@@ -678,6 +742,8 @@ class TradingEngine:
                     avg_entry_price=fill_price,
                     market_value=fill_qty * fill_price,
                 )
+            if strategy_statuses is not None:
+                strategy_statuses[symbol] = "Pending Entry"
         except Exception as e:
             logger.error(f"{symbol}: place_order raised: {e}")
             self.risk.record_broker_error()
@@ -1084,6 +1150,7 @@ class TradingEngine:
                 "daily_pnl": equity - start_equity,
                 "open_positions": dict(self._position_owners),
                 "positions_detail": positions_detail,
+                "watchlist_statuses": self._watchlist_statuses,
                 "live_trading": settings.LIVE_TRADING,
             }
             parent = os.path.dirname(path)
@@ -1095,6 +1162,65 @@ class TradingEngine:
             os.replace(tmp, path)
         except Exception as exc:
             logger.debug(f"_write_state_snapshot failed: {exc}")
+
+    def _baseline_watchlist_status(
+        self,
+        symbol: str,
+        snapshot: BrokerSnapshot,
+        *,
+        strategy_name: str,
+        order_strategy: dict[str, str],
+    ) -> str:
+        """Best-known status before the current cycle's decision path runs."""
+        position = snapshot.account.open_positions.get(symbol)
+        owner = self._position_owners.get(symbol)
+        if position is not None and owner == strategy_name:
+            if self._has_pending_close_order(symbol, snapshot):
+                return "Pending Exit"
+            return "Long"
+
+        for order in snapshot.open_orders:
+            if (
+                order.symbol == symbol
+                and order.side is Side.BUY
+                and order_strategy.get(order.order_id) == strategy_name
+            ):
+                return "Pending Entry"
+
+        return "Flat"
+
+    def _refresh_watchlist_statuses(
+        self,
+        snapshot: BrokerSnapshot,
+        *,
+        order_strategy: dict[str, str],
+        preserve_existing: bool,
+    ) -> None:
+        """Refresh dashboard watchlist statuses from broker truth and prior state."""
+        previous = self._watchlist_statuses if preserve_existing else {}
+        refreshed: dict[str, dict[str, str]] = {}
+        for slot in self.slots:
+            strat_name = slot.strategy.name
+            strat_previous = previous.get(strat_name, {})
+            strat_statuses: dict[str, str] = {}
+            for symbol in slot.active_symbols():
+                baseline = self._baseline_watchlist_status(
+                    symbol,
+                    snapshot,
+                    strategy_name=strat_name,
+                    order_strategy=order_strategy,
+                )
+                prior = strat_previous.get(symbol)
+                if (
+                    preserve_existing
+                    and baseline == "Flat"
+                    and prior in {"Regime Blocked", "Filter Blocked"}
+                ):
+                    strat_statuses[symbol] = prior
+                else:
+                    strat_statuses[symbol] = baseline
+            refreshed[strat_name] = strat_statuses
+        self._watchlist_statuses = refreshed
 
     # ── Market hours ─────────────────────────────────────────────────────
 
