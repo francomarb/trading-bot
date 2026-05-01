@@ -750,3 +750,209 @@ class TestEngineSleeveGating:
         ):
             engine.start(max_cycles=1)
         broker.place_order.assert_not_called()
+
+
+# ── HWM Drawdown Gate ────────────────────────────────────────────────────────
+
+
+class TestSleeveDrawdownGateConstruction:
+    """Validate dd_threshold parameter acceptance and rejection."""
+
+    def test_zero_threshold_disables_gate(self):
+        a = _allocator(dd_threshold=0.0)
+        # Gate disabled — is_strategy_in_drawdown always False.
+        assert a.is_strategy_in_drawdown("sma_crossover", equity=100_000) is False
+
+    def test_valid_threshold_accepted(self):
+        a = _allocator(dd_threshold=0.15)
+        # No PnL recorded yet — at par, not in drawdown.
+        assert a.is_strategy_in_drawdown("sma_crossover", equity=100_000) is False
+
+    def test_threshold_exactly_zero_disables(self):
+        a = _allocator(dd_threshold=0.0)
+        assert a.is_strategy_in_drawdown("sma_crossover", equity=100_000) is False
+
+    def test_negative_threshold_rejected(self):
+        with pytest.raises(ValueError, match="dd_threshold"):
+            _allocator(dd_threshold=-0.01)
+
+    def test_threshold_one_rejected(self):
+        with pytest.raises(ValueError, match="dd_threshold"):
+            _allocator(dd_threshold=1.0)
+
+    def test_threshold_above_one_rejected(self):
+        with pytest.raises(ValueError, match="dd_threshold"):
+            _allocator(dd_threshold=1.5)
+
+
+class TestRecordRealizedPnl:
+    """record_realized_pnl correctly accumulates and advances HWM."""
+
+    def test_single_winning_trade_advances_hwm(self):
+        a = _allocator(dd_threshold=0.15)
+        a.record_realized_pnl("sma_crossover", 500.0)
+        summary = a.pnl_summary()["sma_crossover"]
+        assert summary["realized_pnl"] == pytest.approx(500.0)
+        assert summary["hwm"] == pytest.approx(500.0)
+
+    def test_losing_trade_does_not_advance_hwm(self):
+        a = _allocator(dd_threshold=0.15)
+        a.record_realized_pnl("sma_crossover", 500.0)
+        a.record_realized_pnl("sma_crossover", -200.0)
+        summary = a.pnl_summary()["sma_crossover"]
+        assert summary["realized_pnl"] == pytest.approx(300.0)
+        assert summary["hwm"] == pytest.approx(500.0)
+
+    def test_subsequent_gain_advances_hwm_further(self):
+        a = _allocator(dd_threshold=0.15)
+        a.record_realized_pnl("sma_crossover", 500.0)
+        a.record_realized_pnl("sma_crossover", -200.0)
+        a.record_realized_pnl("sma_crossover", 800.0)
+        summary = a.pnl_summary()["sma_crossover"]
+        assert summary["realized_pnl"] == pytest.approx(1100.0)
+        assert summary["hwm"] == pytest.approx(1100.0)
+
+    def test_multiple_losses_accumulate(self):
+        a = _allocator(dd_threshold=0.15)
+        a.record_realized_pnl("sma_crossover", -100.0)
+        a.record_realized_pnl("sma_crossover", -200.0)
+        a.record_realized_pnl("sma_crossover", -150.0)
+        summary = a.pnl_summary()["sma_crossover"]
+        assert summary["realized_pnl"] == pytest.approx(-450.0)
+        assert summary["hwm"] == pytest.approx(0.0)   # never rose above par
+
+    def test_unknown_strategy_silently_ignored(self):
+        a = _allocator(dd_threshold=0.15)
+        # Must not raise.
+        a.record_realized_pnl("does_not_exist", 999.0)
+        # Known strategies unaffected.
+        assert a.pnl_summary()["sma_crossover"]["realized_pnl"] == pytest.approx(0.0)
+
+    def test_independent_per_strategy_tracking(self):
+        a = _allocator(dd_threshold=0.15)
+        a.record_realized_pnl("sma_crossover", 1000.0)
+        a.record_realized_pnl("rsi_reversion", -500.0)
+        sma = a.pnl_summary()["sma_crossover"]
+        rsi = a.pnl_summary()["rsi_reversion"]
+        assert sma["realized_pnl"] == pytest.approx(1000.0)
+        assert rsi["realized_pnl"] == pytest.approx(-500.0)
+
+
+class TestIsStrategyInDrawdown:
+    """is_strategy_in_drawdown fires correctly relative to the gate threshold."""
+
+    # At $100k equity, SMA weight=0.50, gross=0.80:
+    # budget = $100k × 0.80 × 0.50 = $40,000
+    # 15% gate triggers when gap > $6,000
+    EQUITY = 100_000.0
+
+    def test_at_par_not_in_drawdown(self):
+        a = _allocator(dd_threshold=0.15)
+        assert a.is_strategy_in_drawdown("sma_crossover", self.EQUITY) is False
+
+    def test_loss_below_threshold_not_in_drawdown(self):
+        # Gap = $5,999 < $6,000 trigger → still OK.
+        a = _allocator(dd_threshold=0.15)
+        a.record_realized_pnl("sma_crossover", -5_999.0)
+        assert a.is_strategy_in_drawdown("sma_crossover", self.EQUITY) is False
+
+    def test_loss_exactly_at_threshold_not_in_drawdown(self):
+        # Gap == trigger ($6,000) — boundary: not strictly greater.
+        a = _allocator(dd_threshold=0.15)
+        a.record_realized_pnl("sma_crossover", -6_000.0)
+        assert a.is_strategy_in_drawdown("sma_crossover", self.EQUITY) is False
+
+    def test_loss_just_above_threshold_triggers_gate(self):
+        # Gap = $6,001 > $6,000 trigger → gate fires.
+        a = _allocator(dd_threshold=0.15)
+        a.record_realized_pnl("sma_crossover", -6_001.0)
+        assert a.is_strategy_in_drawdown("sma_crossover", self.EQUITY) is True
+
+    def test_gate_fires_after_peak_then_decline(self):
+        # Profitable run then drawdown.
+        a = _allocator(dd_threshold=0.15)
+        a.record_realized_pnl("sma_crossover", 10_000.0)   # HWM = $10k
+        a.record_realized_pnl("sma_crossover", -16_001.0)  # running = -$6,001; gap = $16,001 > $6k
+        assert a.is_strategy_in_drawdown("sma_crossover", self.EQUITY) is True
+
+    def test_gate_releases_after_recovery(self):
+        a = _allocator(dd_threshold=0.15)
+        a.record_realized_pnl("sma_crossover", 10_000.0)   # HWM = $10k
+        a.record_realized_pnl("sma_crossover", -16_001.0)  # in drawdown
+        assert a.is_strategy_in_drawdown("sma_crossover", self.EQUITY) is True
+        a.record_realized_pnl("sma_crossover", 10_001.0)   # recovered; running > old HWM
+        assert a.is_strategy_in_drawdown("sma_crossover", self.EQUITY) is False
+
+    def test_gate_disabled_when_threshold_zero(self):
+        a = _allocator(dd_threshold=0.0)
+        a.record_realized_pnl("sma_crossover", -999_999.0)
+        assert a.is_strategy_in_drawdown("sma_crossover", self.EQUITY) is False
+
+    def test_unknown_strategy_returns_false(self):
+        a = _allocator(dd_threshold=0.15)
+        assert a.is_strategy_in_drawdown("ghost_strategy", self.EQUITY) is False
+
+    def test_independent_strategies_dont_cross_contaminate(self):
+        a = _allocator(dd_threshold=0.15)
+        a.record_realized_pnl("sma_crossover", -10_000.0)  # SMA in drawdown
+        # RSI has no losses — should NOT be in drawdown.
+        assert a.is_strategy_in_drawdown("rsi_reversion", self.EQUITY) is False
+        assert a.is_strategy_in_drawdown("sma_crossover", self.EQUITY) is True
+
+
+class TestCheckDrawdownGate:
+    """check() returns SLEEVE_DRAWDOWN when gate fires."""
+
+    def _make_account(self, equity: float = 100_000.0) -> AccountState:
+        return AccountState(
+            equity=equity,
+            cash=equity,
+            session_start_equity=equity,
+            open_positions={},
+        )
+
+    def _make_args(self, strategy: str = "sma_crossover"):
+        return dict(
+            strategy_name=strategy,
+            account=self._make_account(),
+            open_orders=[],
+            position_owners={},
+            order_strategy={},
+        )
+
+    def test_check_returns_drawdown_rejection_when_gate_fires(self):
+        a = _allocator(dd_threshold=0.15)
+        # budget = $100k × 0.80 × 0.50 = $40k; trigger = $6k; push just over.
+        a.record_realized_pnl("sma_crossover", -6_001.0)
+        result = a.check(**self._make_args("sma_crossover"))
+        assert isinstance(result, SleeveRejection)
+        assert result.code is SleeveRejectionCode.SLEEVE_DRAWDOWN
+        assert result.strategy_name == "sma_crossover"
+
+    def test_check_approved_when_below_gate_threshold(self):
+        a = _allocator(dd_threshold=0.15)
+        a.record_realized_pnl("sma_crossover", -5_000.0)   # gap $5k < $6k
+        result = a.check(**self._make_args("sma_crossover"))
+        assert isinstance(result, SleeveCapacity)
+
+    def test_check_drawdown_gate_checked_before_position_limit(self):
+        # Even if positions < max, drawdown gate takes priority.
+        a = _allocator(dd_threshold=0.15)
+        a.record_realized_pnl("sma_crossover", -7_000.0)
+        result = a.check(**self._make_args("sma_crossover"))
+        assert isinstance(result, SleeveRejection)
+        assert result.code is SleeveRejectionCode.SLEEVE_DRAWDOWN
+
+    def test_unaffected_strategy_still_approved_during_peer_drawdown(self):
+        a = _allocator(dd_threshold=0.15)
+        a.record_realized_pnl("sma_crossover", -10_000.0)  # SMA in drawdown
+        # RSI check should still pass.
+        result = a.check(**self._make_args("rsi_reversion"))
+        assert isinstance(result, SleeveCapacity)
+
+    def test_gate_disabled_never_blocks(self):
+        a = _allocator(dd_threshold=0.0)
+        a.record_realized_pnl("sma_crossover", -999_999.0)
+        result = a.check(**self._make_args("sma_crossover"))
+        # Should be approved (assuming budget still positive, no position limit).
+        assert isinstance(result, SleeveCapacity)

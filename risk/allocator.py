@@ -1,5 +1,5 @@
 """
-Capital sleeve allocator (Phase 10.F1).
+Capital sleeve allocator (Phase 10.F1 + HWM drawdown gate).
 
 Enforces per-strategy gross-notional budgets ("sleeves") derived from
 account equity and configurable allocation weights. Sits upstream of
@@ -28,7 +28,8 @@ Flow
 ----
   1. Engine calls allocator.check() before risk.evaluate().
   2. allocator.check() returns SleeveCapacity (approved) or
-     SleeveRejection (max positions hit / sleeve full / unknown strategy).
+     SleeveRejection (max positions hit / sleeve full / unknown strategy /
+     strategy in HWM drawdown).
   3. On approval, engine passes SleeveCapacity.per_position_notional as
      `notional_cap` to risk.evaluate(), which caps position sizing to the
      per-position budget without changing the risk interface.
@@ -36,19 +37,35 @@ Flow
      switches) remain fully authoritative — the allocator only narrows
      the available notional, it never widens it.
 
-Configuration (2026-04-25 format)
-----------------------------------
+HWM drawdown gate (2026-05-01)
+-------------------------------
+When `dd_threshold > 0`, the allocator tracks cumulative realized P&L
+per strategy. If a strategy's running P&L drops more than
+`dd_threshold × sleeve_budget` below its historical peak (high-water
+mark), new entries are paused until P&L recovers. Exits are never
+blocked. This stops a losing strategy from digging deeper across
+multiple sessions.
+
+  record_realized_pnl(strategy_name, pnl) must be called by the engine
+  whenever a position closes (signal-based, stop-out, or external close).
+
+Configuration (current format)
+-------------------------------
   STRATEGY_ALLOCATIONS = {
-      "sma_crossover": {"weight": 0.50, "max_positions": 5},
-      "rsi_reversion":  {"weight": 0.50, "max_positions": 5},
+      "sma_crossover":    {"weight": 0.50, "max_positions": 5},
+      "rsi_reversion":    {"weight": 0.25, "max_positions": 5},
+      "donchian_breakout": {"weight": 0.25, "max_positions": 5},
   }
-  MAX_GROSS_EXPOSURE_PCT = 0.80    # already the global RiskManager cap
+  MAX_GROSS_EXPOSURE_PCT   = 0.80
+  STRATEGY_SLEEVE_DD_THRESHOLD = 0.15   # pause entries if down 15% of budget from HWM
 
   At $100k equity:
     SMA sleeve          = $100k × 0.80 × 0.50 = $40,000
     SMA per-position    = $40,000 ÷ 5          =  $8,000
-    RSI sleeve          = $100k × 0.80 × 0.50 = $40,000
-    RSI per-position    = $40,000 ÷ 5          =  $8,000
+    RSI sleeve          = $100k × 0.80 × 0.25 = $20,000
+    RSI per-position    = $20,000 ÷ 5          =  $4,000
+    Donchian sleeve     = $100k × 0.80 × 0.25 = $20,000
+    Donchian per-pos    = $20,000 ÷ 5          =  $4,000
     Unallocated         =  0 % (fully allocated)
 """
 
@@ -72,6 +89,7 @@ class SleeveRejectionCode(Enum):
     SLEEVE_FULL          = "sleeve_full"
     SLEEVE_MAX_POSITIONS = "sleeve_max_positions"
     UNKNOWN_STRATEGY     = "unknown_strategy"
+    SLEEVE_DRAWDOWN      = "sleeve_drawdown"
 
 
 @dataclass(frozen=True)
@@ -126,6 +144,11 @@ class SleeveAllocator:
                             so the two controls are consistent.
         min_trade_notional: Minimum remaining sleeve budget to permit a new
                             entry (prevents tiny residual positions). Default $100.
+        dd_threshold:       High-water-mark drawdown gate. If a strategy's
+                            cumulative realized P&L drops more than
+                            `dd_threshold × sleeve_budget` below its peak,
+                            new entries are paused. 0.0 disables the gate
+                            (default). Must be in [0, 1).
     """
 
     def __init__(
@@ -134,6 +157,7 @@ class SleeveAllocator:
         *,
         total_gross_pct: float,
         min_trade_notional: float = 100.0,
+        dd_threshold: float = 0.0,
     ) -> None:
         if not allocations:
             raise ValueError("allocations must not be empty")
@@ -154,7 +178,10 @@ class SleeveAllocator:
                     f"allocations['{name}']['max_positions'] must be ≥ 1, "
                     f"got {cfg['max_positions']}"
                 )
-            self._entries[name] = {"weight": float(cfg["weight"]), "max_positions": int(cfg["max_positions"])}
+            self._entries[name] = {
+                "weight": float(cfg["weight"]),
+                "max_positions": int(cfg["max_positions"]),
+            }
 
         total_weight = sum(e["weight"] for e in self._entries.values())
         if total_weight > 1.0 + 1e-6:
@@ -167,11 +194,78 @@ class SleeveAllocator:
             )
         if min_trade_notional <= 0:
             raise ValueError("min_trade_notional must be > 0")
+        if not (0.0 <= dd_threshold < 1.0):
+            raise ValueError(
+                f"dd_threshold must be in [0, 1), got {dd_threshold}"
+            )
 
         self._total_gross_pct = total_gross_pct
         self._min_notional    = min_trade_notional
+        self._dd_threshold    = dd_threshold
+
+        # HWM drawdown gate state — updated by record_realized_pnl().
+        # Keyed by strategy_name; initialized to 0.0 (break-even) for all
+        # configured strategies so the HWM starts at par, not negative.
+        self._strategy_realized_pnl: dict[str, float] = {
+            name: 0.0 for name in self._entries
+        }
+        self._strategy_pnl_hwm: dict[str, float] = {
+            name: 0.0 for name in self._entries
+        }
 
     # ── Public API ────────────────────────────────────────────────────────────
+
+    def record_realized_pnl(self, strategy_name: str, pnl: float) -> None:
+        """
+        Record a realized P&L event for a strategy (called by the engine on
+        every position close — signal-based exit, ATR stop, or external close).
+
+        Updates the running cumulative P&L and advances the HWM when the
+        strategy is at a new equity peak. If the gate subsequently trips,
+        check() returns SLEEVE_DRAWDOWN until P&L recovers.
+
+        Unknown strategy names are silently ignored (defensive — should not
+        happen in normal operation).
+        """
+        if strategy_name not in self._strategy_realized_pnl:
+            logger.warning(
+                f"record_realized_pnl: unknown strategy '{strategy_name}' — ignored"
+            )
+            return
+
+        prev = self._strategy_realized_pnl[strategy_name]
+        self._strategy_realized_pnl[strategy_name] = prev + pnl
+
+        # Advance HWM only on improvement.
+        running = self._strategy_realized_pnl[strategy_name]
+        if running > self._strategy_pnl_hwm[strategy_name]:
+            self._strategy_pnl_hwm[strategy_name] = running
+
+        logger.debug(
+            f"[{strategy_name}] realized_pnl update: "
+            f"trade={pnl:+.2f} cumulative={running:+.2f} "
+            f"hwm={self._strategy_pnl_hwm[strategy_name]:+.2f}"
+        )
+
+    def is_strategy_in_drawdown(self, strategy_name: str, equity: float) -> bool:
+        """
+        Return True if the strategy's cumulative realized P&L is more than
+        `dd_threshold × sleeve_budget` below its HWM.
+
+        Returns False when the gate is disabled (dd_threshold == 0) or the
+        strategy is unknown.
+        """
+        if self._dd_threshold == 0.0:
+            return False
+        if strategy_name not in self._entries:
+            return False
+
+        budget  = self._sleeve_budget_for(strategy_name, equity)
+        running = self._strategy_realized_pnl[strategy_name]
+        hwm     = self._strategy_pnl_hwm[strategy_name]
+        gap     = hwm - running          # positive when below HWM
+        trigger = self._dd_threshold * budget
+        return gap > trigger
 
     def check(
         self,
@@ -185,10 +279,12 @@ class SleeveAllocator:
         Check whether strategy_name has sleeve room for a new entry.
 
         Checks (in order):
-          1. Unknown strategy → UNKNOWN_STRATEGY rejection.
-          2. Position count at limit → SLEEVE_MAX_POSITIONS rejection.
-          3. Remaining sleeve budget < min_trade_notional → SLEEVE_FULL rejection.
-          4. All clear → SleeveCapacity with per_position_notional as the cap.
+          1. Unknown strategy       → UNKNOWN_STRATEGY rejection.
+          2. HWM drawdown gate      → SLEEVE_DRAWDOWN rejection (if enabled
+                                      and strategy P&L is below threshold).
+          3. Position count at limit → SLEEVE_MAX_POSITIONS rejection.
+          4. Remaining budget low   → SLEEVE_FULL rejection.
+          5. All clear              → SleeveCapacity.
 
         Args:
             strategy_name:   The strategy requesting a new entry.
@@ -229,6 +325,17 @@ class SleeveAllocator:
         )
         available = budget - used
 
+        # HWM drawdown gate diagnostic — always log at DEBUG regardless of gate state.
+        if self._dd_threshold > 0.0:
+            running = self._strategy_realized_pnl.get(strategy_name, 0.0)
+            hwm     = self._strategy_pnl_hwm.get(strategy_name, 0.0)
+            trigger = self._dd_threshold * budget
+            logger.debug(
+                f"[{strategy_name}] DD gate — "
+                f"realized={running:+.2f} hwm={hwm:+.2f} "
+                f"gap={hwm - running:.2f} trigger={trigger:.2f}"
+            )
+
         logger.debug(
             f"[{strategy_name}] sleeve check — "
             f"budget=${budget:,.0f} used=${used:,.0f} available=${available:,.0f} "
@@ -236,7 +343,29 @@ class SleeveAllocator:
             f"per_pos=${per_position_notional:,.0f}"
         )
 
-        # Check 1: position count limit.
+        # Check 1: HWM drawdown gate.
+        if self.is_strategy_in_drawdown(strategy_name, account.equity):
+            running = self._strategy_realized_pnl[strategy_name]
+            hwm     = self._strategy_pnl_hwm[strategy_name]
+            trigger = self._dd_threshold * budget
+            logger.warning(
+                f"[{strategy_name}] SLEEVE_DRAWDOWN — new entries paused: "
+                f"realized_pnl={running:+.2f} hwm={hwm:+.2f} "
+                f"gap={hwm - running:.2f} > trigger={trigger:.2f} "
+                f"({self._dd_threshold*100:.0f}% of ${budget:,.0f} budget). "
+                f"Entries resume when P&L recovers."
+            )
+            return SleeveRejection(
+                strategy_name=strategy_name,
+                code=SleeveRejectionCode.SLEEVE_DRAWDOWN,
+                message=(
+                    f"strategy in drawdown — realized_pnl={running:+.2f} "
+                    f"is {hwm - running:.2f} below HWM={hwm:+.2f} "
+                    f"(threshold={trigger:.2f})"
+                ),
+            )
+
+        # Check 2: position count limit.
         if positions_open >= max_positions:
             return SleeveRejection(
                 strategy_name=strategy_name,
@@ -247,7 +376,7 @@ class SleeveAllocator:
                 ),
             )
 
-        # Check 2: remaining budget.
+        # Check 3: remaining budget.
         if available < self._min_notional:
             return SleeveRejection(
                 strategy_name=strategy_name,
@@ -271,16 +400,32 @@ class SleeveAllocator:
 
     def sleeve_budget(self, strategy_name: str, equity: float) -> float:
         """Gross notional ceiling for a strategy at the given equity level."""
-        entry = self._entries.get(strategy_name)
-        if entry is None:
-            return 0.0
-        return equity * self._total_gross_pct * entry["weight"]
+        return self._sleeve_budget_for(strategy_name, equity)
 
     def strategies(self) -> list[str]:
         """Names of all configured strategies."""
         return list(self._entries.keys())
 
+    def pnl_summary(self) -> dict[str, dict[str, float]]:
+        """
+        Return per-strategy P&L tracking state. Useful for logging and
+        diagnostics. Keys: strategy_name → {"realized_pnl", "hwm"}.
+        """
+        return {
+            name: {
+                "realized_pnl": self._strategy_realized_pnl[name],
+                "hwm": self._strategy_pnl_hwm[name],
+            }
+            for name in self._entries
+        }
+
     # ── Internal ──────────────────────────────────────────────────────────────
+
+    def _sleeve_budget_for(self, strategy_name: str, equity: float) -> float:
+        entry = self._entries.get(strategy_name)
+        if entry is None:
+            return 0.0
+        return equity * self._total_gross_pct * entry["weight"]
 
     def _used_notional(
         self,

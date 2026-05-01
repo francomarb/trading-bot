@@ -42,17 +42,15 @@ SMA_WATCHLIST = [
     "CM", "JAZZ", "BK", "BMO", "WDC", "FIGS", "VLUE",
     "MU", "NVDA", "PG",
 ]
-# RSI Reversion — mean-reversion; static list promoted from:
-#   /Users/franco/trading-bot/scripts/rsi_watchlist_scan.py
-#   /Users/franco/trading-bot/scripts/rsi_candidate_validate.py
-#   /Users/franco/trading-bot/scripts/rsi_candidate_post_analysis.py
-#   scanner_rule=rsi_watchlist_v1, validation_rule=rsi_validation_v1,
-#   post_rule=rsi_post_analysis_v1, feed=sip, end_delay=60m
-#   generated 2026-04-26; report: logs/rsi_post_analysis_temp_v2.md
-# RSI is implemented but not active in forward_test.py yet. Keep this as the
-# first paper-mode RSI pool unless the post-analysis guardrails are changed.
+# RSI Reversion — mean-reversion; promoted from the 2026-04-30 expanded
+# backtest pass to increase signal density for the static paper-trading pool.
+# This list intentionally favors breadth over the earlier narrow scanner
+# snapshot so the RSI sleeve can accumulate enough trades for evaluation.
 RSI_WATCHLIST = [
-    "ALLY", "CDNS", "KBE", "SN", "DINO", "BA", "TFC", "HON", "TMUS", "JNJ",
+    "ALLY", "CDNS", "KBE", "SN", "BA", "TFC", "HON", "TMUS", "JNJ",
+    "CCK", "ABNB", "PG", "SPG", "MA", "LMT", "MCD", "AAPL", "ANET",
+    "CAT", "CIEN", "MCO", "AMZN", "EQIX", "RTX", "META", "HD",
+    "SOFI", "ARM",
 ]
 # Bollinger Squeeze (TTM-style volatility breakout) — IMPLEMENTED BUT NOT
 # ACTIVE. Cross-universe research (docs/bollinger_squeeze_universe_research.md)
@@ -79,26 +77,64 @@ BOLLINGER_WATCHLIST = [
     "XLRE",  # Real Estate
     "XLC",   # Communications
 ]
+# Donchian Breakout (Turtle System 1) — IMPLEMENTED, NOT YET WIRED into
+# forward_test.py. Trend-continuation strategy designed to capture relentless
+# uptrends in AI / Big-Tech / Semis (the user's directional thesis universe).
+# Activation gate: Sharpe ≥ +0.4, ≥ 50 trades, MeanDD ≤ 25% on AI/BigTech
+# backtest with 2× ATR stops. Until that gate passes, strategy is parked
+# (same pattern as BollingerSqueeze).
+#
+# This list is the PROPOSED initial universe; user will review/edit before
+# any backtest is run. See docs/donchian_breakout_strategy.md once written.
+DONCHIAN_WATCHLIST = [
+    # AI / Semis (primary)
+    "NVDA", "AMD", "AVGO", "SMCI", "TSM", "MU", "QCOM", "ARM", "MRVL",
+    # AI infrastructure / data-centre buildout
+    "ANET", "VRT",
+    # Big Tech
+    "MSFT", "AAPL", "GOOGL", "META", "AMZN", "ORCL", "TSLA",
+    # AI software (secondary)
+    "PLTR", "CRWD", "NOW",
+    # AI compute / quantum (post-IPO names with full 4y history)
+    "IREN", "IONQ",
+    # AI-adjacent: semiconductor equipment, networking, data-centre power,
+    # quantum computing — highly correlated with AI core but add breadth
+    "ASML",   # Semiconductor lithography — only supplier of EUV, AI capex pick-and-shovel
+    "CLS",    # Celestica — contract mfg for hyperscaler AI networking hardware
+    "CIEN",   # Ciena — optical networking; direct beneficiary of AI data-centre traffic
+    "CEG",    # Constellation Energy — nuclear power for AI data-centre load growth
+    "VST",    # Vistra — power generation; same AI-electricity demand thesis as CEG
+    "BE",     # Bloom Energy — fuel-cell backup power; AI data-centre resilience play
+    "PWR",    # Quanta Services — electrical infrastructure buildout for AI campuses
+    "RGTI",   # Rigetti Computing — quantum hardware; early-stage AI compute adjacency
+    "QBTS",   # D-Wave Quantum — quantum annealing; same early-stage bet as RGTI
+]
 # Full engine universe — union of all lists; preserves paper-run continuity.
 #
 # IMPORTANT: When adding new symbols to any of these watchlists, remember to also
 # map them to their corresponding Sector ETF in `scripts/post_mortem.py`'s
 # SECTOR_MAP dictionary to ensure proper Relative Strength diagnostic reporting.
-WATCHLIST = list(dict.fromkeys(SMA_WATCHLIST + RSI_WATCHLIST + BOLLINGER_WATCHLIST))
+WATCHLIST = list(dict.fromkeys(
+    SMA_WATCHLIST + RSI_WATCHLIST + BOLLINGER_WATCHLIST + DONCHIAN_WATCHLIST
+))
 
 # ── Per-strategy dashboard metadata ─────────────────────────────────────────
 # Maps strategy_name → watchlist and allowed market regimes.
 # Add a new strategy here (one entry) and the dashboard picks it up automatically.
 STRATEGY_WATCHLISTS: dict[str, list[str]] = {
-    "sma_crossover":     SMA_WATCHLIST,
-    "rsi_reversion":     RSI_WATCHLIST,
-    "bollinger_squeeze": BOLLINGER_WATCHLIST,
+    "sma_crossover":      SMA_WATCHLIST,
+    "rsi_reversion":      RSI_WATCHLIST,
+    "bollinger_squeeze":  BOLLINGER_WATCHLIST,
+    "donchian_breakout":  DONCHIAN_WATCHLIST,
 }
 STRATEGY_ALLOWED_REGIMES: dict[str, set[str]] = {
     "sma_crossover":     {"TRENDING", "RANGING"},
     "rsi_reversion":     {"TRENDING", "RANGING"},
     # Squeeze fires best after compression breaks (TRENDING) or during it (RANGING).
     "bollinger_squeeze": {"TRENDING", "RANGING"},
+    # Donchian whipsaws hard in RANGING regimes (every 20-day high gets faded).
+    # Restrict to TRENDING only — academic literature is unanimous on this.
+    "donchian_breakout": {"TRENDING"},
 }
 
 # ── Capital allocation (Phase 10.F1) ────────────────────────────────────────
@@ -115,12 +151,25 @@ STRATEGY_ALLOWED_REGIMES: dict[str, set[str]] = {
 #
 # Idle sleeve capital stays locked to its strategy (no cross-borrowing).
 # Dynamic reallocation is a Phase 11 item.
-# Weights start 50/50 — rebalance after ≥4 weeks of combined paper data.
+# Weights: SMA 0.50 / RSI 0.25 / Donchian 0.25 — sum = 1.0.
+# RSI reduced from 0.50 after paper observation: ~8 trades over 4y means the
+# full 0.50 sleeve was mostly idle. Donchian gets 0.25 following backtest
+# validation (Sharpe +0.80 on AI/Bigtech, Mid-range 30/15 variant).
 STRATEGY_ALLOCATIONS: dict[str, dict] = {
-    "sma_crossover": {"weight": 0.50, "max_positions": 5},
-    "rsi_reversion":  {"weight": 0.50, "max_positions": 5},
+    "sma_crossover":    {"weight": 0.50, "max_positions": 5},
+    "rsi_reversion":    {"weight": 0.25, "max_positions": 5},
+    "donchian_breakout": {"weight": 0.25, "max_positions": 5},
 }
 MIN_TRADE_NOTIONAL = 100.0      # Reject entries if sleeve available < this
+
+# Strategy-level high-water-mark drawdown gate (SleeveAllocator).
+# If a strategy's cumulative realized P&L drops more than this fraction
+# below its peak (HWM), new entries for that strategy are paused until
+# P&L recovers. Set to 0.0 to disable. Exits are never blocked.
+#   Example at $100k equity, Donchian weight 0.25:
+#   sleeve budget = $100k × 0.80 × 0.25 = $20k
+#   gate fires when realized PnL < HWM − 0.15 × $20k = HWM − $3k
+STRATEGY_SLEEVE_DD_THRESHOLD = 0.15
 
 # ── Risk settings (Phase 6) ──────────────────────────────────────────────────
 # Position sizing

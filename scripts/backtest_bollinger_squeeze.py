@@ -255,11 +255,87 @@ SWEEP_GRID: list[tuple[str, dict]] = [
 
 UNIVERSES: dict[str, list[str]] = {
     # AI / Big-Tech / Semis — the user's directional thesis universe.
-    # Mirrors config.settings.BOLLINGER_WATCHLIST.
+    # Kept in sync with config.settings.DONCHIAN_WATCHLIST (the deployment
+    # universe candidate for the Donchian Breakout strategy). Updated 2026-05-01
+    # to 32 names: original 23 AI core + 9 AI-adjacent names restored per user
+    # direction. AI-adjacent names (ASML, CLS, CIEN, CEG, VST, BE, PWR, RGTI,
+    # QBTS) capture AI infrastructure, data-centre power, quantum computing, and
+    # semiconductor-equipment themes. RGTI and QBTS have <4y history; backtest
+    # runs on available bars.
     "ai_bigtech": [
-        "NVDA", "AMD", "AVGO", "SMCI", "TSM", "MU", "QCOM", "ARM",
-        "MSFT", "AAPL", "GOOGL", "META", "AMZN",
+        # AI / Semis (primary)
+        "NVDA", "AMD", "AVGO", "SMCI", "TSM", "MU", "QCOM", "ARM", "MRVL",
+        # AI infrastructure / data-centre buildout
+        "ANET", "VRT",
+        # Big Tech
+        "MSFT", "AAPL", "GOOGL", "META", "AMZN", "ORCL", "TSLA",
+        # AI software (secondary)
         "PLTR", "CRWD", "NOW",
+        # AI compute / quantum
+        "IREN", "IONQ",
+        # AI-adjacent (semiconductor equipment, networking, power, quantum)
+        "ASML", "CLS", "CIEN", "CEG", "VST", "BE", "PWR", "RGTI", "QBTS",
+    ],
+    # Blended universe — AI core + diversifiers across non-AI sectors.
+    # Hypothesis: cross-sector diversification reduces concurrent stop-out
+    # cascades that drove ai_bigtech's -33.6% MeanDD on Donchian.
+    # Created 2026-04-30 as a DD-reduction experiment.
+    # Some names are AI-adjacent (ASML/CLS/CIEN/CEG/VST/BE/PWR/RGTI/QBTS)
+    # and may not provide as much diversification as the pure
+    # healthcare/financials/consumer/industrial names.
+    # QBTS and RGTI have <4y history (SPAC mergers in 2022) — backtest runs
+    # on whatever bars are available.
+    "ai_bigtech_blend": [
+        # AI core (23 — same as ai_bigtech)
+        "NVDA", "AMD", "AVGO", "SMCI", "TSM", "MU", "QCOM", "ARM", "MRVL",
+        "ANET", "VRT",
+        "MSFT", "AAPL", "GOOGL", "META", "AMZN", "ORCL", "TSLA",
+        "PLTR", "CRWD", "NOW",
+        "IREN", "IONQ",
+        # AI-adjacent expansions (likely correlated with AI core)
+        "ASML", "CLS", "CIEN", "CEG", "VST", "BE", "PWR", "RGTI", "QBTS",
+        # Healthcare (genuine diversifier)
+        "LLY", "NVO", "UNH", "GMED", "ISRG",
+        # Financials (genuine diversifier)
+        "JPM", "SPGI", "MCO", "SOFI",
+        # Defense (genuine diversifier)
+        "LMT", "RTX",
+        # Payments (genuine diversifier)
+        "V", "MA",
+        # Consumer (genuine diversifier)
+        "COST", "HD",
+        # Industrials (genuine diversifier)
+        "CAT", "ROP",
+        # Utilities (genuine diversifier)
+        "NEE",
+    ],
+    # Purified blend — 23 AI core + 18 genuine diversifiers (41 names).
+    # Removes the 9 AI-adjacent names (ASML, CLS, CIEN, CEG, VST, BE, PWR,
+    # RGTI, QBTS) that proved highly correlated with the AI core and therefore
+    # failed to reduce drawdown in the full 50-name blend test.
+    # Hypothesis: fewer but genuinely uncorrelated diversifiers improve DD
+    # without the Sharpe drag from correlated names.
+    "ai_bigtech_blend_pure": [
+        # AI core (23 — same as ai_bigtech)
+        "NVDA", "AMD", "AVGO", "SMCI", "TSM", "MU", "QCOM", "ARM", "MRVL",
+        "ANET", "VRT",
+        "MSFT", "AAPL", "GOOGL", "META", "AMZN", "ORCL", "TSLA",
+        "PLTR", "CRWD", "NOW",
+        "IREN", "IONQ",
+        # Healthcare (genuine diversifier)
+        "LLY", "NVO", "UNH", "GMED", "ISRG",
+        # Financials (genuine diversifier)
+        "JPM", "SPGI", "MCO", "SOFI",
+        # Defense (genuine diversifier)
+        "LMT", "RTX",
+        # Payments (genuine diversifier)
+        "V", "MA",
+        # Consumer (genuine diversifier)
+        "COST", "HD",
+        # Industrials (genuine diversifier)
+        "CAT", "ROP",
+        # Utilities (genuine diversifier)
+        "NEE",
     ],
     # GICS Sector SPDRs — textbook TTM Squeeze application. ETFs absorb single-
     # stock noise, consolidate cleanly during sector rotation, and tend to have

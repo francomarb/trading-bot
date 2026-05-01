@@ -103,6 +103,7 @@ def main() -> None:
         allocations=settings.STRATEGY_ALLOCATIONS,
         total_gross_pct=settings.MAX_GROSS_EXPOSURE_PCT,
         min_trade_notional=settings.MIN_TRADE_NOTIONAL,
+        dd_threshold=settings.STRATEGY_SLEEVE_DD_THRESHOLD,
     )
 
     # ── Regime detector (Phase 10.F2) ───────────────────────────────────
