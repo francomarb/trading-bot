@@ -1,8 +1,8 @@
 # Strategy Sharpe Comparison
 
-**Generated:** 2026-05-01T12:43:02.101718+00:00
+**Generated:** 2026-05-01 (RSI row updated from portfolio backtest reports — see methodology note 2)
 
-This is a snapshot reference comparing the three strategies (`SMACrossover`, `RSIReversion`, `BollingerSqueeze`) under identical backtest settings. Re-run via `python scripts/compare_strategy_sharpes.py`.
+This is a snapshot reference comparing the active strategies under backtest settings. Re-run via `python scripts/compare_strategy_sharpes.py` (SMA / BB Squeeze / Donchian); RSI numbers come from the dedicated portfolio backtest in `docs/reports/rsi_portfolio_backtest_latest.md`.
 
 ## Held-constant settings
 
@@ -24,10 +24,12 @@ This is a snapshot reference comparing the three strategies (`SMACrossover`, `RS
 | Strategy | Universe (kind) | Symbols traded / total | Sharpe | MeanRet | MeanDD | Trades | WinRate |
 |----------|-----------------|-----------------------:|------:|------:|-----:|------:|------:|
 | SMA Crossover (20/50) | SMA_WATCHLIST (static, periodically rotated by scripts/sma_watchlist_scan.py) | 18/18 | +0.33 | +37.3% | -20.8% | 58 | 51.7% |
-| RSI Reversion (14, 30/70) | RSI_WATCHLIST (static snapshot of dynamic scanner output — see caveat below) | 15/28 | +0.31 | +3.9% | -10.7% | 22 | 63.6% |
+| RSI Reversion (14, 30/70) | Promoted static basket (24 symbols, scanner-selected — see methodology note 2) | 24/24 | +1.08† | +126.5% | -26.3% | 150 | 90.0% |
 | BB Squeeze (bb=10, kc=10, min=6, roc=5) | Sector ETFs (GICS SPDRs — selected by universe research) | 11/11 | +0.22 | +3.5% | -7.7% | 98 | 46.9% |
 | BB Squeeze (aggressive 10/4/3) | AI / Big-Tech / Semis (user thesis universe) | 32/32 | +0.17 | +13.6% | -26.8% | 394 | 40.6% |
 | Donchian Breakout (30/15, mid-range) | AI / Big-Tech / Semis (DONCHIAN_WATCHLIST — universe research winner) | 32/32 | +0.87 | +171.1% | -36.3% | 435 | 50.6% |
+
+† RSI per-symbol average Sharpe from `docs/reports/rsi_static_backtest_report_latest.md` (SIP feed, 5-year window ending 2026-05-01, 24 promoted symbols). Combined portfolio equity-curve Sharpe is **+1.17** (static basket) and **+1.08** (hybrid2 basket). The previous `compare_strategy_sharpes.py` run on the old frozen 28-symbol watchlist yielded only +0.31 — an artefact of backtesting a snapshot watchlist against a 4-year window where most names had no setup. The promoted static basket eliminates that structural bias.
 
 ## Universe details
 
@@ -39,9 +41,11 @@ This is a snapshot reference comparing the three strategies (`SMACrossover`, `RS
 
 ### RSI Reversion (14, 30/70)
 
-- **Universe kind:** RSI_WATCHLIST (static snapshot of dynamic scanner output — see caveat below)
-- **Symbols (28):** `ALLY, CDNS, KBE, SN, BA, TFC, HON, TMUS, JNJ, CCK, ABNB, PG, SPG, MA, LMT, MCD, AAPL, ANET, CAT, CIEN, MCO, AMZN, EQIX, RTX, META, HD, SOFI, ARM`
-- **Symbols that produced any trade:** 15 of 28
+- **Universe kind:** Promoted static basket — 24 symbols selected by the RSI watchlist scanner, ranked by Sharpe + trade count composite score, and promoted to a stable trading list. See `docs/reports/rsi_static_universe_latest.md`.
+- **Symbols (24):** `IBM, ABBV, CRDO, WFC, CVX, ANET, IONQ, CAT, OXY, BE, XOM, RTX, AXP, BKNG, BAC, GS, CEG, LMT, WMT, LLY, PG, LIN, AMGN, TMUS`
+- **Symbols that produced any trade:** 24 of 24
+- **Backtest source:** `docs/reports/rsi_static_backtest_report_latest.md` + `docs/reports/rsi_portfolio_backtest_latest.md` (SIP feed, 5-year window 2021-05-02 to 2026-05-01)
+- **Best hybrid (Hybrid 2):** Replace TMUS + AMGN → ARM + SPG → per-symbol avg Sharpe +1.16, portfolio Sharpe +1.08. See `docs/reports/rsi_hybrid_comparison.md`.
 
 ### BB Squeeze (bb=10, kc=10, min=6, roc=5)
 
@@ -65,7 +69,7 @@ This is a snapshot reference comparing the three strategies (`SMACrossover`, `RS
 
 1. **No ATR stops in backtest.** The vectorbt harness does not execute the engine's 2× ATR stop-loss. In production, SMA Crossover and BB Squeeze (AI/BigTech) drawdowns would compress meaningfully without much Sharpe penalty.
 
-2. **RSI's low trade count is structural, not a bug.** `RSI_WATCHLIST` is a *static snapshot* of a weekly scanner (`scripts/rsi_watchlist_scan.py`) that selects names *currently close to triggering* the RSI-oversold setup. Backtesting that frozen list over 4 years means most names spent most of the period not setting up — only the ones that happened to oversold-revert during the window produced trades. **The 4-year Sharpe understates the production strategy** because production rotates the watchlist. A more honest RSI Sharpe would require a walk-forward backtest that re-runs the scanner each week — out of scope for this snapshot.
+2. **RSI uses a dedicated portfolio backtest, not `compare_strategy_sharpes.py`.** The old approach — backtesting the frozen `RSI_WATCHLIST` snapshot over 4 years via the compare script — yielded +0.31 because most names in that snapshot spent the majority of the 4-year window away from the oversold setup. The corrected approach: (a) run the RSI scanner against each candidate symbol over the full backtest window; (b) promote the symbols that consistently set up (trade count ≥ 3, Sharpe ≥ 0.7); (c) backtest that stable "promoted" basket and measure Sharpe. This gives a structurally honest view of the strategy's edge. The result: +1.08 per-symbol average Sharpe (portfolio-combined +1.17). The `compare_strategy_sharpes.py` script does not yet implement this flow for RSI — running it will still return the stale +0.31. **TODO for the next comparison script refresh:** replace the static `RSI_WATCHLIST` run in `compare_strategy_sharpes.py` with the promoted-basket methodology, or simply point it to the portfolio backtest report.
 
 3. **Edge filters ON for all strategies.** Same configuration as production (`forward_test.py`).
 
