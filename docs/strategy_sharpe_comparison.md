@@ -1,6 +1,6 @@
 # Strategy Sharpe Comparison
 
-**Generated:** 2026-04-29T23:18:56.023703+00:00
+**Generated:** 2026-04-30T12:10:25.219635+00:00
 
 This is a snapshot reference comparing the three strategies (`SMACrossover`, `RSIReversion`, `BollingerSqueeze`) under identical backtest settings. Re-run via `python scripts/compare_strategy_sharpes.py`.
 
@@ -26,7 +26,8 @@ This is a snapshot reference comparing the three strategies (`SMACrossover`, `RS
 | SMA Crossover (20/50) | SMA_WATCHLIST (static, periodically rotated by scripts/sma_watchlist_scan.py) | 18/18 | +0.33 | +37.3% | -20.8% | 58 | 51.7% |
 | RSI Reversion (14, 30/70) | RSI_WATCHLIST (static snapshot of dynamic scanner output — see caveat below) | 4/10 | +0.19 | +2.7% | -9.6% | 8 | 50.0% |
 | BB Squeeze (bb=10, kc=10, min=6, roc=5) | Sector ETFs (GICS SPDRs — selected by universe research) | 11/11 | +0.22 | +3.5% | -7.7% | 98 | 46.9% |
-| BB Squeeze (aggressive 10/4/3) | AI / Big-Tech / Semis (user thesis universe) | 16/16 | +0.16 | +11.5% | -24.5% | 227 | 42.3% |
+| BB Squeeze (aggressive 10/4/3) | AI / Big-Tech / Semis (user thesis universe) | 23/23 | +0.15 | +13.2% | -25.1% | 292 | 41.8% |
+| Donchian Breakout (30/15, mid-range) | AI / Big-Tech / Semis (DONCHIAN_WATCHLIST — universe research winner) | 23/23 | +0.80 | +144.8% | -35.1% | 323 | 50.2% |
 
 ## Universe details
 
@@ -51,8 +52,14 @@ This is a snapshot reference comparing the three strategies (`SMACrossover`, `RS
 ### BB Squeeze (aggressive 10/4/3)
 
 - **Universe kind:** AI / Big-Tech / Semis (user thesis universe)
-- **Symbols (16):** `NVDA, AMD, AVGO, SMCI, TSM, MU, QCOM, ARM, MSFT, AAPL, GOOGL, META, AMZN, PLTR, CRWD, NOW`
-- **Symbols that produced any trade:** 16 of 16
+- **Symbols (23):** `NVDA, AMD, AVGO, SMCI, TSM, MU, QCOM, ARM, MRVL, ANET, VRT, MSFT, AAPL, GOOGL, META, AMZN, ORCL, TSLA, PLTR, CRWD, NOW, IREN, IONQ`
+- **Symbols that produced any trade:** 23 of 23
+
+### Donchian Breakout (30/15, mid-range)
+
+- **Universe kind:** AI / Big-Tech / Semis (DONCHIAN_WATCHLIST — universe research winner)
+- **Symbols (23):** `NVDA, AMD, AVGO, SMCI, TSM, MU, QCOM, ARM, MRVL, ANET, VRT, MSFT, AAPL, GOOGL, META, AMZN, ORCL, TSLA, PLTR, CRWD, NOW, IREN, IONQ`
+- **Symbols that produced any trade:** 23 of 23
 
 ## Methodology caveats
 

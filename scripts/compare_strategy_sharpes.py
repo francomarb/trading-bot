@@ -1,13 +1,13 @@
 #!/usr/bin/env python3
 """
-Cross-strategy Sharpe comparison — SMA vs RSI vs BollingerSqueeze.
+Cross-strategy Sharpe comparison — SMA vs RSI vs BollingerSqueeze vs DonchianBreakout.
 
-Runs all three strategies through the SAME backtest harness with IDENTICAL
+Runs all four strategies through the SAME backtest harness with IDENTICAL
 settings (init cash, slippage, feed, date range), each on its own production
 watchlist, so the resulting Sharpes are directly comparable.
 
-This answers: "How does the BB Squeeze Sharpe stack up against what SMA and
-RSI deliver in this codebase under the same backtester?"
+This answers: "How does each strategy's Sharpe stack up against the others
+in this codebase under the same backtester?"
 
 Each strategy is run with edge filter ON for a fair production-equivalent
 comparison.
@@ -42,7 +42,9 @@ from scripts.backtest_bollinger_squeeze import (
     UNIVERSES, fetch_bars, run_one as run_squeeze, aggregate_metrics,
 )
 from strategies.bollinger_squeeze import BollingerSqueeze
+from strategies.donchian_breakout import DonchianBreakout
 from strategies.filters.bollinger_squeeze import BollingerSqueezeEdgeFilter
+from strategies.filters.donchian_breakout import DonchianEdgeFilter
 from strategies.filters.rsi_reversion import RSIEdgeFilter
 from strategies.filters.sma_crossover import SMAEdgeFilter
 from strategies.rsi_reversion import RSIReversion
@@ -142,6 +144,15 @@ def main() -> int:
             lambda: BollingerSqueeze(
                 bb_length=10, kc_length=10, min_squeeze_bars=4, roc_lookback=3,
                 edge_filter=BollingerSqueezeEdgeFilter(),
+            ),
+            UNIVERSES["ai_bigtech"],
+        ),
+        (
+            "Donchian Breakout (30/15, mid-range)",
+            "AI / Big-Tech / Semis (DONCHIAN_WATCHLIST — universe research winner)",
+            lambda: DonchianBreakout(
+                entry_window=30, exit_window=15,
+                edge_filter=DonchianEdgeFilter(),
             ),
             UNIVERSES["ai_bigtech"],
         ),

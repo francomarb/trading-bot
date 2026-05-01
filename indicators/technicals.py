@@ -17,6 +17,12 @@ Currently provided:
   - add_keltner_channels(df, length, atr_mult)
                                       → df with 'kc_mid_{length}', 'kc_upper_{length}_{atr_mult}',
                                                 'kc_lower_{length}_{atr_mult}' columns appended
+  - add_donchian_high(df, length, source="close")
+                                      → df with 'donchian_high_{length}'        column appended
+                                                (rolling max of PRIOR `length` bars — excludes today)
+  - add_donchian_low(df, length, source="close")
+                                      → df with 'donchian_low_{length}'         column appended
+                                                (rolling min of PRIOR `length` bars — excludes today)
 
 Design notes:
   - Every function is pure: it returns a new DataFrame. Inputs are not mutated.
@@ -417,4 +423,54 @@ def add_keltner_channels(
     out[f"kc_mid_{length}"]    = ema
     out[f"kc_upper_{suffix}"]  = ema + atr_mult * atr
     out[f"kc_lower_{suffix}"]  = ema - atr_mult * atr
+    return out
+
+
+# ── Donchian Channels (high/low) ─────────────────────────────────────────────
+
+
+def add_donchian_high(
+    df: pd.DataFrame, length: int, *, source: str = "close"
+) -> pd.DataFrame:
+    """
+    Append rolling max of `source` over the **prior** `length` bars.
+
+    New column: `donchian_high_{length}`. The first `length` values are NaN
+    because we shift by 1 to exclude the current bar — a "new high" at bar t
+    means today's close exceeded the maximum of bars t-length .. t-1.
+
+    Look-ahead safety: the shift(1) is critical. Using a plain
+    `rolling(length).max()` would include today's bar in its own comparison
+    and produce a meaningless signal that's True every bar.
+
+    Used by `DonchianBreakout` strategy for entry signals.
+    """
+    _require_length(length, "DonchianHigh")
+    _require_columns(df, [source], "DonchianHigh")
+
+    out = df.copy()
+    out[f"donchian_high_{length}"] = (
+        out[source].shift(1).rolling(window=length, min_periods=length).max()
+    )
+    return out
+
+
+def add_donchian_low(
+    df: pd.DataFrame, length: int, *, source: str = "close"
+) -> pd.DataFrame:
+    """
+    Append rolling min of `source` over the **prior** `length` bars.
+
+    New column: `donchian_low_{length}`. The first `length` values are NaN
+    (same shift-by-1 reasoning as `add_donchian_high`).
+
+    Used by `DonchianBreakout` strategy for exit signals.
+    """
+    _require_length(length, "DonchianLow")
+    _require_columns(df, [source], "DonchianLow")
+
+    out = df.copy()
+    out[f"donchian_low_{length}"] = (
+        out[source].shift(1).rolling(window=length, min_periods=length).min()
+    )
     return out

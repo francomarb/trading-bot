@@ -50,17 +50,19 @@ trading-bot/
 │   ├── trades_live.db         # Live SQLite trade log (gitignored)
 │   └── historical/            # Cached historical bars
 ├── indicators/
-│   └── technicals.py          # SMA, EMA, ATR, RSI, ADX, Bollinger Bands, Keltner Channels (hand-rolled)
+│   └── technicals.py          # SMA, EMA, ATR, RSI, ADX, Bollinger Bands, Keltner Channels, Donchian high/low (hand-rolled)
 ├── strategies/
 │   ├── base.py                # BaseStrategy, SignalFrame, StrategySlot, WatchlistSource
 │   ├── sma_crossover.py       # Trend-following: SMA crossover (ACTIVE)
 │   ├── rsi_reversion.py       # Mean-reversion: RSI oversold/overbought (ACTIVE)
-│   ├── bollinger_squeeze.py   # Volatility breakout: TTM-style BB squeeze (IMPLEMENTED, NOT WIRED)
+│   ├── bollinger_squeeze.py   # Volatility breakout: TTM-style BB squeeze (IMPLEMENTED, NOT WIRED — parked)
+│   ├── donchian_breakout.py   # Trend continuation: Turtle System 1 — N-day high/low (ACTIVE, 30/15, ai_bigtech 32-name universe)
 │   └── filters/
 │       ├── common.py          # SPYTrendFilter (shared macro gate)
 │       ├── sma_crossover.py   # SMAEdgeFilter: stock > 200 SMA, volume expansion
 │       ├── rsi_reversion.py   # RSIEdgeFilter: SPY dual macro, earnings blackout, liquidity, no-new-low
-│       └── bollinger_squeeze.py # BollingerSqueezeEdgeFilter: IEX-scaled liquidity, earnings blackout, exhaustion gate
+│       ├── bollinger_squeeze.py # BollingerSqueezeEdgeFilter: IEX-scaled liquidity, earnings blackout, exhaustion gate
+│       └── donchian_breakout.py # DonchianEdgeFilter: stock > 200 SMA, IEX-scaled liquidity, short earnings blackout
 ├── regime/
 │   └── detector.py            # RegimeDetector: BEAR/VOLATILE/TRENDING/RANGING (ADX + ATR%)
 ├── engine/
@@ -82,7 +84,7 @@ trading-bot/
 │   ├── preflight.py           # Pre-flight checklist (must exit 0 before live flip)
 │   ├── gonogo.py              # Go/no-go checker for live readiness
 │   └── *.py                   # Watchlist scanners and analysis scripts
-├── tests/                     # 646 unit tests (pytest)
+├── tests/                     # 846 unit tests (pytest)
 ├── logs/                      # Rotating log files (gitignored)
 └── phase*_verify.py           # Integration verification scripts per phase
 ```
@@ -194,17 +196,30 @@ python phase2_verify.py
 
 ## Current Phase
 
-**Phase 10 — In Progress (2026-04-26). Phases 1–9 and 9.5 complete.**
+**Phase 10 — In Progress (2026-05-01). Phases 1–9 and 9.5 complete.**
 **Tagged: `v1.0.0-beta.0`**
 
-Both **SMA Crossover** and **RSI Reversion** are active in `forward_test.py`.
+All three strategies — **SMA Crossover**, **RSI Reversion**, and **DonchianBreakout** — are active in `forward_test.py`.
 
-**BollingerSqueeze** is implemented but NOT wired in `forward_test.py` — see
+**Sleeve allocation (current):**
+- SMA Crossover: 0.50 weight, 5 max positions
+- RSI Reversion: 0.25 weight, 5 max positions (reduced from 0.50 — RSI generated only ~8 trades/4y in paper)
+- DonchianBreakout: 0.25 weight, 5 max positions (activated 2026-05-01)
+
+**BollingerSqueeze** is implemented but NOT wired — parked. See
 [docs/bollinger_squeeze_universe_research.md](docs/bollinger_squeeze_universe_research.md)
-for the universe research that produced this decision (Sharpe +0.22 on Sector
-ETFs is a modest diversifier, not a return generator). Code is parked in a
-"ready to activate" state with the optimal sector-ETF watchlist already set
-in `BOLLINGER_WATCHLIST`.
+(Sharpe +0.22 on Sector ETFs; parked because 50% of practitioner edge requires
+options/discretionary/multi-timeframe capabilities the bot lacks).
+
+**DonchianBreakout** (Turtle System 1, Mid-range 30/15) is **ACTIVE** in `forward_test.py`
+since 2026-05-01. Backtest on the 32-name ai_bigtech universe delivered
+Sharpe **+0.85**, MeanRet **+162.9%**, 457 trades. Universe: 23 AI core names +
+9 AI-adjacent names (semiconductor equipment, data-centre power, quantum).
+Protected by: TRENDING-only regime gate, 2× ATR stops, HWM drawdown gate
+(entries pause if cumulative realized P&L drops >15% of sleeve budget from peak),
+max 5 concurrent positions. See
+[docs/donchian_breakout_strategy.md](docs/donchian_breakout_strategy.md) for
+the full research doc including watchlist generation methodology.
 
 ### Phase 10 completed items
 
@@ -217,12 +232,14 @@ in `BOLLINGER_WATCHLIST`.
 | **10.C2** | Startup reconciliation with NORMAL / RESTRICTED fail-safe modes |
 | **10.C3/C4** | External-close detection with 3-cycle confirmation window |
 | **10.E1** | WebSocket order/fill streaming via `TradingStream` (stream-first, REST fallback) |
-| **10.F1** | `SleeveAllocator` in `risk/allocator.py` — 50/50 SMA/RSI, $8k per-position cap, `MAX_GROSS_EXPOSURE_PCT` → 0.80 |
+| **10.F1** | `SleeveAllocator` in `risk/allocator.py` — per-strategy capital sleeves; HWM drawdown gate (2026-05-01) |
 | **10.F2** | `RegimeDetector` in `regime/detector.py` — BEAR/VOLATILE/TRENDING/RANGING (ADX + ATR% percentile) |
 | **10.F3** | Engine regime gating — `StrategySlot.allowed_regimes`; exits never blocked |
 | **10.F3a** | `SMAEdgeFilter` — stock > 200 SMA, volume expansion (10d > 30d avg) |
 | **10.F3b** | `RSIEdgeFilter` — SPY dual macro, earnings blackout (3/2), liquidity floor, no-new-low |
+| **10.F3c** | `DonchianEdgeFilter` — stock > 200 SMA, IEX-scaled liquidity, short earnings blackout (1/0) |
 | **10.F4** | RSI paper activation — both strategies running with full gating |
+| **10.F5** | DonchianBreakout activated — 3rd slot, 30/15 Mid-range, TRENDING only, 32-name ai_bigtech universe |
 | **10.G1** | `LIVE_SIZE_MULTIPLIER=0.25` in risk manager when live |
 | **10.G4** | `DRY_RUN` flag — broker logs orders without submitting |
 | **10.G6** | Fractional share sizing — `FRACTIONAL_ENABLED` flag; DAY entry + standalone GTC stop; disable at ~$10k |
@@ -233,26 +250,26 @@ in `BOLLINGER_WATCHLIST`.
 |---|---|---|
 | **10.D1** | Review paper fills, compute mean realized slippage | ≥10 fills needed |
 | **10.D2** | Enable `SLIPPAGE_DRIFT_ENABLED=True` | Blocked on D1 |
-| **10.F6** | Operational verify — both strategies gated and sleeve-capped in logs | Runs as bot runs |
+| **10.F6** | Operational verify — all 3 strategies gated, sleeve-capped, and HWM gate logging in live cycles | Runs as bot runs |
 | **10.G2** | Set `HARD_DOLLAR_LOSS_CAP` in live `.env` (config only) | Anytime |
 | **10.G5** | Pre-flight passes on live endpoint; dry-run cycle; manual approval for first order | After G2 |
 | **10.H1–H5** | Cloud VPS, systemd service, key management, remote monitoring, log shipping | Post-paper |
 
-Minimum gate before live flip: **D1 + D2 + G2 + G5 + ≥2 weeks combined SMA+RSI paper run.**
+Minimum gate before live flip: **D1 + D2 + G2 + G5 + ≥2 weeks combined 3-strategy paper run.**
 
-**Total: 646 unit tests passing.**
+**Total: 846 unit tests passing.**
 
 ---
 
 ## Manual Restart Verification (Phase 10 operational gate — completed 2026-04-24)
 
 Verified live with MU + NVDA open. Both restored from trade DB record; NORMAL
-mode confirmed. Expected startup log pattern for reference (2 slots active):
+mode confirmed. Expected startup log pattern for reference (3 slots active as of 2026-05-01):
 
 **Position found and assigned from DB:**
 ```
 restart: assigned existing position MU → 'sma_crossover' (trade DB record)
-engine starting: 2 slot(s) [sma_crossover(16), rsi_reversion(5)], 21 unique symbol(s),
+engine starting: 3 slot(s) [sma_crossover(16), rsi_reversion(5), donchian_breakout(32)], N unique symbol(s),
   session_start_equity=$..., open_positions=2, open_orders=2
 ```
 

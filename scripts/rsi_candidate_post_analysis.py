@@ -41,12 +41,15 @@ DEFAULT_CONTROLS = ["NVDA", "MSFT", "AVGO", "AAPL"]
 class PostAnalysisConfig:
     """Promotion thresholds and scoring weights."""
 
-    min_events: int = 5
-    min_strategy_return: float = 0.20
-    min_profit_factor: float = 1.20
-    max_strategy_drawdown: float = -0.65
-    min_event_hit_rate: float = 0.35
-    max_stop_rate: float = 0.35
+    # Post-analysis originally optimized for a tiny "promote first" cohort.
+    # Relaxed defaults keep obviously broken names out while allowing a
+    # broader, trade-dense static RSI universe to survive review.
+    min_events: int = 4
+    min_strategy_return: float = 0.10
+    min_profit_factor: float = 1.10
+    max_strategy_drawdown: float = -0.60
+    min_event_hit_rate: float = 0.30
+    max_stop_rate: float = 0.40
 
 
 @dataclass(frozen=True)
@@ -114,7 +117,6 @@ def _verdict(result: SymbolValidation, config: PostAnalysisConfig) -> str:
     hard_fails = {
         "negative or weak exact strategy return",
         "profit factor below threshold",
-        "strategy drawdown too deep",
     }
     if any(reason in hard_fails for reason in reasons):
         return "REJECT"

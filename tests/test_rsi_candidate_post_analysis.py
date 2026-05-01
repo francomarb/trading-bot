@@ -91,7 +91,7 @@ class TestRankResults:
             config=PostAnalysisConfig(),
         )
 
-        assert ranked[0].verdict == "REJECT"
+        assert ranked[0].verdict == "WATCH"
         assert "strategy drawdown too deep" in ranked[0].reasons
 
     def test_rejects_weak_exact_strategy_return(self):
@@ -109,6 +109,24 @@ class TestRankResults:
 
         assert ranked[0].verdict == "REJECT"
         assert "negative or weak exact strategy return" in ranked[0].reasons
+
+    def test_relaxed_defaults_promote_borderline_but_viable_candidate(self):
+        ranked = rank_results(
+            [
+                _validation(
+                    "BORDER",
+                    total_return=0.12,
+                    max_drawdown=-0.55,
+                    profit_factor=1.15,
+                    events=4,
+                    stop_failures=1,
+                )
+            ],
+            config=PostAnalysisConfig(),
+        )
+
+        assert ranked[0].verdict == "PROMOTE"
+        assert ranked[0].reasons == []
 
     def test_ranks_higher_score_first(self):
         ranked = rank_results(

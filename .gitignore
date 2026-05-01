@@ -20,3 +20,5 @@ notebooks/
 .claude/
 docs/franco-notes.md
 docs/research/
+data/rsi_static_fundamentals_cache.json
+data/*_cache.json

@@ -166,6 +166,7 @@ def run_backtest(
     symbol: str = "?",
     atr_stop_mult: float | None = None,
     atr_length: int = 14,
+    atr_trail: bool = False,
 ) -> BacktestResult:
     """
     Run `strategy` against `df` (must have 'open' and 'close' columns) under
@@ -180,6 +181,13 @@ def run_backtest(
             signal is the only exit mechanism.
         atr_length: ATR window for the stop calculation. Default 14
             matches `config.settings.ATR_LENGTH`.
+        atr_trail: When True (and atr_stop_mult is set), the stop becomes a
+            **trailing** stop — it ratchets up as price moves favorably,
+            locking in gains. The trail distance is `atr_stop_mult × ATR`
+            from the highest close since entry. Strongly recommended for
+            trend-following strategies (Donchian Breakout); see
+            docs/donchian_breakout_strategy.md for the empirical case.
+            Has no effect when atr_stop_mult is None.
     """
     cfg = config or BacktestConfig()
     _required_cols(df)
@@ -192,7 +200,9 @@ def run_backtest(
     if atr_stop_mult is not None:
         # Compute per-bar ATR-based stop fraction: stop_pct = atr_mult * ATR / close.
         # vectorbt uses sl_stop[entry_bar] as the stop fraction for that trade,
-        # so we need the value AT the entry bar (post-shift).
+        # so we need the value AT the entry bar (post-shift). When sl_trail=True,
+        # vectorbt converts this fixed fraction into a trailing-stop distance
+        # measured from the high-water-mark of the trade.
         from indicators.technicals import add_atr
         if "high" not in df.columns or "low" not in df.columns:
             raise ValueError(
@@ -214,6 +224,7 @@ def run_backtest(
         fixed_fees=cfg.commission_per_trade,    # per-trade $
         freq=cfg.freq,
         sl_stop=sl_stop,
+        sl_trail=atr_trail if atr_stop_mult is not None else False,
     )
 
     return BacktestResult(

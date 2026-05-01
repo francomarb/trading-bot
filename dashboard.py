@@ -572,6 +572,10 @@ def render_dashboard() -> None:
                 upnl = detail.get("unrealized_pnl")
                 qty = detail.get("qty")
                 cost_basis = (qty * entry) if (qty is not None and entry is not None) else None
+                unrealized_pct = (
+                    (upnl / cost_basis) if (upnl is not None and cost_basis not in (None, 0))
+                    else None
+                )
                 pos_data.append({
                     "Symbol": symbol_url(sym),
                     "Strategy": strat,
@@ -579,6 +583,7 @@ def render_dashboard() -> None:
                     "Entry": f"${entry:,.2f}" if entry is not None else "—",
                     "Cost Basis": f"${cost_basis:,.2f}" if cost_basis is not None else "—",
                     "Unrealized P&L": f"${upnl:+,.2f}" if upnl is not None else "—",
+                    "Unrealized %": f"{unrealized_pct:+.2%}" if unrealized_pct is not None else "—",
                 })
             st.dataframe(
                 pd.DataFrame(pos_data),

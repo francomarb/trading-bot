@@ -57,16 +57,22 @@ class ScanConfig:
     min_bars: int = 260
     min_market_cap: float = 2_000_000_000.0
     min_price: float = 10.0
-    min_avg_volume_20: float = 1_000_000.0
-    min_avg_dollar_volume_50: float = 100_000_000.0
+    # Share-volume was too strict for large-cap, high-price names such as MA,
+    # MCD, and SPG. Lowering it keeps the universe liquid without excluding
+    # slower-turnover blue chips that still provide valid RSI opportunities.
+    min_avg_volume_20: float = 500_000.0
+    min_avg_dollar_volume_50: float = 50_000_000.0
     min_pct_of_52w_high: float = 0.60
     min_above_52w_low: float = 1.20
     min_atr_pct: float = 0.015
     max_atr_pct: float = 0.07
     min_bb_width_pct: float = 0.04
-    min_oversold_events: int = 3
-    min_reversion_hit_rate: float = 0.50
-    max_stop_failures: int = 2
+    # For a broader static RSI universe, requiring only 2-3 oversold events
+    # and a modest hit rate is more realistic than demanding a tiny set of
+    # near-perfect names.
+    min_oversold_events: int = 2
+    min_reversion_hit_rate: float = 0.35
+    max_stop_failures: int = 4
     reversion_window_days: int = 10
     oversold_threshold: float = 30.0
     reversion_threshold: float = 50.0

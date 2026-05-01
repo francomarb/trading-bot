@@ -23,6 +23,8 @@ import pytest
 from indicators.technicals import (
     add_atr,
     add_bollinger_bands,
+    add_donchian_high,
+    add_donchian_low,
     add_ema,
     add_keltner_channels,
     add_rsi,
@@ -573,6 +575,141 @@ class TestKeltnerChannels:
             add_keltner_channels(df, length=2, atr_mult=0)
         with pytest.raises(ValueError, match="atr_mult"):
             add_keltner_channels(df, length=2, atr_mult=-1.0)
+
+
+# ── Donchian high / low ──────────────────────────────────────────────────────
+
+
+class TestDonchianHigh:
+    def test_basic_values_n3(self):
+        """
+        length=3, closes=[10, 12, 11, 14, 13, 16].
+
+        donchian_high_3[t] = max(close[t-3], close[t-2], close[t-1])
+          t=0,1,2 → NaN (insufficient prior bars)
+          t=3 → max(10, 12, 11) = 12
+          t=4 → max(12, 11, 14) = 14
+          t=5 → max(11, 14, 13) = 14
+        """
+        df = _close_series([10, 12, 11, 14, 13, 16])
+        result = add_donchian_high(df, 3)
+        _approx_equal(
+            result["donchian_high_3"].tolist(),
+            [float("nan"), float("nan"), float("nan"), 12.0, 14.0, 14.0],
+        )
+
+    def test_excludes_current_bar(self):
+        """Critical look-ahead test: today's close must NOT be in the rolling max."""
+        # If today were included, donchian_high_3[3] would be max(12, 11, 14) = 14 (wrong)
+        # Correct: donchian_high_3[3] = max(close[0..2]) = max(10, 12, 11) = 12
+        df = _close_series([10, 12, 11, 14])
+        result = add_donchian_high(df, 3)
+        assert result["donchian_high_3"].iloc[3] == 12.0
+
+    def test_monotonic_uptrend(self):
+        # Each new bar strictly higher → donchian_high always equals close[t-1].
+        df = _close_series([1, 2, 3, 4, 5, 6, 7])
+        result = add_donchian_high(df, 3)
+        # NaN, NaN, NaN, max(1,2,3)=3, max(2,3,4)=4, max(3,4,5)=5, max(4,5,6)=6
+        _approx_equal(
+            result["donchian_high_3"].tolist(),
+            [float("nan"), float("nan"), float("nan"), 3.0, 4.0, 5.0, 6.0],
+        )
+
+    def test_truncating_input_preserves_past_values(self):
+        """Look-ahead guard: truncating must not change earlier values."""
+        df = _close_series([5, 8, 6, 12, 10, 9, 15, 14, 18])
+        full = add_donchian_high(df, 3)["donchian_high_3"].tolist()
+
+        for cut in range(4, len(df)):
+            partial = add_donchian_high(df.iloc[: cut + 1], 3)["donchian_high_3"].tolist()
+            _approx_equal(partial, full[: cut + 1])
+
+    def test_input_not_mutated(self):
+        df = _close_series([1, 2, 3, 4, 5])
+        add_donchian_high(df, 3)
+        assert "donchian_high_3" not in df.columns
+
+    def test_custom_source(self):
+        df = pd.DataFrame({"close": [1, 2, 3, 4], "high": [10, 20, 30, 40]})
+        result = add_donchian_high(df, 2, source="high")
+        # NaN, NaN, max(10,20)=20, max(20,30)=30
+        _approx_equal(
+            result["donchian_high_2"].tolist(),
+            [float("nan"), float("nan"), 20.0, 30.0],
+        )
+
+    def test_length_longer_than_data_gives_all_nan(self):
+        df = _close_series([1, 2, 3])
+        result = add_donchian_high(df, 5)
+        assert result["donchian_high_5"].isna().all()
+
+    def test_invalid_length_raises(self):
+        df = _close_series([1, 2, 3])
+        with pytest.raises(ValueError, match="positive int"):
+            add_donchian_high(df, 0)
+        with pytest.raises(ValueError, match="positive int"):
+            add_donchian_high(df, -1)
+
+    def test_missing_source_column_raises(self):
+        df = _close_series([1, 2, 3])
+        with pytest.raises(ValueError, match="missing required columns"):
+            add_donchian_high(df, 2, source="open")
+
+
+class TestDonchianLow:
+    def test_basic_values_n3(self):
+        """
+        length=3, closes=[10, 12, 11, 8, 13, 6].
+          t=0,1,2 → NaN
+          t=3 → min(10, 12, 11) = 10
+          t=4 → min(12, 11, 8)  = 8
+          t=5 → min(11, 8, 13)  = 8
+        """
+        df = _close_series([10, 12, 11, 8, 13, 6])
+        result = add_donchian_low(df, 3)
+        _approx_equal(
+            result["donchian_low_3"].tolist(),
+            [float("nan"), float("nan"), float("nan"), 10.0, 8.0, 8.0],
+        )
+
+    def test_excludes_current_bar(self):
+        """Today's close must NOT be in the rolling min."""
+        df = _close_series([10, 12, 11, 5])  # today=5; if included, min would be 5
+        result = add_donchian_low(df, 3)
+        # Correct: min(close[0..2]) = min(10, 12, 11) = 10
+        assert result["donchian_low_3"].iloc[3] == 10.0
+
+    def test_monotonic_downtrend(self):
+        df = _close_series([10, 9, 8, 7, 6, 5, 4])
+        result = add_donchian_low(df, 3)
+        # NaN×3, then min of prior 3 values each step.
+        _approx_equal(
+            result["donchian_low_3"].tolist(),
+            [float("nan"), float("nan"), float("nan"), 8.0, 7.0, 6.0, 5.0],
+        )
+
+    def test_truncating_input_preserves_past_values(self):
+        df = _close_series([15, 12, 14, 8, 10, 11, 5, 7, 9])
+        full = add_donchian_low(df, 3)["donchian_low_3"].tolist()
+        for cut in range(4, len(df)):
+            partial = add_donchian_low(df.iloc[: cut + 1], 3)["donchian_low_3"].tolist()
+            _approx_equal(partial, full[: cut + 1])
+
+    def test_input_not_mutated(self):
+        df = _close_series([1, 2, 3, 4, 5])
+        add_donchian_low(df, 3)
+        assert "donchian_low_3" not in df.columns
+
+    def test_length_longer_than_data_gives_all_nan(self):
+        df = _close_series([1, 2, 3])
+        result = add_donchian_low(df, 5)
+        assert result["donchian_low_5"].isna().all()
+
+    def test_invalid_length_raises(self):
+        df = _close_series([1, 2, 3])
+        with pytest.raises(ValueError, match="positive int"):
+            add_donchian_low(df, 0)
 
 
 # ── Cross-cutting: indicators stack on a single DataFrame ────────────────────

@@ -95,3 +95,28 @@ class TestScanCandidates:
         assert [candidate.symbol for candidate in candidates] == ["GOOD"]
         assert candidates[0].market_cap == pytest.approx(25_000_000_000.0)
         assert "Passed all enabled filters" in explanations["GOOD"]
+
+    def test_relaxed_defaults_allow_broader_liquid_large_caps(self, monkeypatch):
+        metric = _passing_metric()
+        metric["avg_volume_20"] = 600_000.0
+        metric["avg_dollar_volume_50"] = 60_000_000.0
+        metric["oversold_events"] = 2
+        metric["reversion_hit_rate"] = 0.35
+        metric["stop_failures"] = 4
+        monkeypatch.setattr(
+            "scripts.rsi_watchlist_scan._compute_metrics",
+            lambda _df, _config: metric,
+        )
+
+        candidates, rejections, _examples, explanations = scan_candidates(
+            [AssetInfo("BROAD", "Broad Candidate", "NYSE")],
+            {"BROAD": pd.DataFrame({"close": [120.0]})},
+            config=ScanConfig(),
+            include_fundamentals=False,
+            top=10,
+            explain_symbols={"BROAD"},
+        )
+
+        assert rejections == {}
+        assert [candidate.symbol for candidate in candidates] == ["BROAD"]
+        assert "Passed all enabled filters" in explanations["BROAD"]
