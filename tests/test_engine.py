@@ -129,6 +129,19 @@ def _filled_result(symbol: str, qty: int, avg: float) -> OrderResult:
     )
 
 
+def _unknown_result(symbol: str, qty: int, order_id: str = "ord-unknown") -> OrderResult:
+    return OrderResult(
+        status=OrderStatus.UNKNOWN,
+        order_id=order_id,
+        symbol=symbol,
+        requested_qty=qty,
+        filled_qty=0,
+        avg_fill_price=None,
+        raw_status=None,
+        message="submitted but not confirmed",
+    )
+
+
 def _open_sell_order(symbol: str = "AAPL") -> OpenOrder:
     return OpenOrder(
         order_id="o-sell",
@@ -901,6 +914,39 @@ class TestWatchlistStatuses:
         engine.start(max_cycles=1)
 
         broker.place_protective_stop.assert_called_once()
+
+    def test_suspect_order_recovery_adopts_position_and_restores_stop(
+        self, engine_factory
+    ):
+        startup = _snapshot()
+        cycle1 = _snapshot()
+        cycle2 = _snapshot(
+            positions={"AAPL": Position("AAPL", 10, 100.0, 1010.0)},
+            open_orders=[],
+        )
+        engine, broker = engine_factory(
+            entries=[False] * 59 + [True],
+            snapshot=startup,
+            place_result=_unknown_result("AAPL", 10, order_id="ord-suspect"),
+        )
+        broker.sync_with_broker.side_effect = [startup, cycle1, cycle2]
+        broker.reconcile_submitted_order.return_value = _filled_result("AAPL", 10, 100.5)
+        broker.place_protective_stop.return_value = _open_stop_order("AAPL", 95.0)
+
+        engine.start(max_cycles=2)
+
+        reconcile_call = broker.reconcile_submitted_order.call_args.kwargs
+        assert reconcile_call["order_id"] == "ord-suspect"
+        assert reconcile_call["symbol"] == "AAPL"
+        assert reconcile_call["requested_qty"] == pytest.approx(98.52)
+
+        stop_call = broker.place_protective_stop.call_args.kwargs
+        assert stop_call["symbol"] == "AAPL"
+        assert stop_call["qty"] == 10
+        assert round(stop_call["stop_price"], 2) == 96.94
+        assert stop_call["client_order_id_prefix"] == "fake_strategy-recover-stop"
+        assert engine._position_owners["AAPL"] == "fake_strategy"
+        assert engine.trade_logger.read_all_open_owners() == {"AAPL": "fake_strategy"}
 
 
 # ── Scanner cadence ────────────────────────────────────────────────────────

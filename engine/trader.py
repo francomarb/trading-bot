@@ -146,6 +146,15 @@ class EngineConfig:
             raise ValueError("external_close_confirm_cycles must be >= 1")
 
 
+@dataclass(frozen=True)
+class SuspectOrder:
+    """Bot-submitted order accepted by Alpaca but not yet locally confirmed."""
+
+    decision: RiskDecision
+    order_id: str
+    modeled_price: float
+
+
 # ── Engine ───────────────────────────────────────────────────────────────────
 
 
@@ -234,6 +243,12 @@ class TradingEngine:
         # Only after external_close_confirm_cycles consecutive misses do we
         # treat the position as genuinely gone (guards against API blips).
         self._external_close_suspects: dict[str, int] = {}
+
+        # Exact bot-submitted orders that were accepted by Alpaca but whose
+        # fill state could not be confirmed locally (e.g. stream/REST failure
+        # after submit). These are the only unknown positions we will ever try
+        # to adopt automatically.
+        self._suspect_orders: dict[str, SuspectOrder] = {}
 
         # Startup mode set by _reconcile_startup. NORMAL → full trading.
         # RESTRICTED → exits only (one cycle, then auto-clears to NORMAL).
@@ -414,6 +429,7 @@ class TradingEngine:
                 f"risk={risk_state}"
             )
 
+            self._recover_suspect_orders(snapshot)
             self._detect_external_closes(snapshot)
             self._process_stream_stop_fills()
             self._repair_missing_protective_stops(snapshot)
@@ -724,6 +740,13 @@ class TradingEngine:
 
         try:
             result = self.broker.place_order(decision)
+            if result.status is OrderStatus.UNKNOWN:
+                self._remember_suspect_order(
+                    decision, result, modeled_price=latest_close
+                )
+                if strategy_statuses is not None:
+                    strategy_statuses[symbol] = "Pending Entry"
+                return None
             self._record_fill(
                 result,
                 modeled_price=latest_close,
@@ -759,6 +782,141 @@ class TradingEngine:
             self.risk.record_broker_error()
             self.alerts.broker_error(f"{symbol} place_order: {e}")
         return None
+
+    def _remember_suspect_order(
+        self,
+        decision: RiskDecision,
+        result: OrderResult,
+        *,
+        modeled_price: float,
+    ) -> None:
+        """
+        Persist a narrow recovery handle for submit-succeeded/confirm-failed
+        entries. Recovery is tied to the exact order_id returned by Alpaca.
+        """
+        if result.order_id is None:
+            msg = (
+                f"{decision.symbol}: confirmation failed but no order_id was "
+                "returned; cannot stage suspect-order recovery"
+            )
+            logger.error(msg)
+            self.risk.record_broker_error()
+            self.alerts.broker_error(msg)
+            return
+
+        self._suspect_orders[decision.symbol] = SuspectOrder(
+            decision=decision,
+            order_id=result.order_id,
+            modeled_price=modeled_price,
+        )
+        logger.warning(
+            f"{decision.symbol}: staged suspect order recovery for "
+            f"{result.order_id} [{decision.strategy_name}]"
+        )
+
+    def _recover_suspect_orders(self, snapshot: BrokerSnapshot) -> None:
+        """Recover only exact bot-submitted orders that lost confirmation."""
+        for symbol, suspect in list(self._suspect_orders.items()):
+            try:
+                result = self.broker.reconcile_submitted_order(
+                    order_id=suspect.order_id,
+                    symbol=symbol,
+                    requested_qty=suspect.decision.qty,
+                )
+            except Exception as e:
+                logger.warning(
+                    f"{symbol}: suspect order {suspect.order_id} reconciliation "
+                    f"failed: {e}"
+                )
+                continue
+
+            if result.status in {OrderStatus.PENDING, OrderStatus.ACCEPTED}:
+                logger.warning(
+                    f"{symbol}: suspect order {suspect.order_id} still "
+                    f"{result.status.value}; waiting for next cycle"
+                )
+                continue
+
+            if result.status in {OrderStatus.CANCELED, OrderStatus.REJECTED, OrderStatus.TIMEOUT}:
+                logger.warning(
+                    f"{symbol}: suspect order {suspect.order_id} resolved as "
+                    f"{result.status.value}; dropping recovery state"
+                )
+                self._suspect_orders.pop(symbol, None)
+                continue
+
+            position = snapshot.account.open_positions.get(symbol)
+            if result.status in {OrderStatus.FILLED, OrderStatus.PARTIAL} and position is not None:
+                fill_price = result.avg_fill_price or suspect.decision.entry_reference_price
+                fill_qty = int(result.filled_qty or position.qty or suspect.decision.qty)
+                self._record_fill(
+                    result,
+                    modeled_price=suspect.modeled_price,
+                    order_type=suspect.decision.order_type.value,
+                )
+                self._log_entry(suspect.decision, result, suspect.modeled_price)
+                self._position_owners[symbol] = suspect.decision.strategy_name
+                self._entry_prices[symbol] = fill_price
+                self._ensure_recovered_protective_stop(
+                    snapshot=snapshot,
+                    position=position,
+                    decision=suspect.decision,
+                )
+                self.alerts.trade_executed(
+                    symbol=symbol,
+                    strategy=suspect.decision.strategy_name,
+                    side="buy",
+                    qty=fill_qty,
+                    price=fill_price,
+                    reason=f"{suspect.decision.reason} (recovered)",
+                )
+                logger.warning(
+                    f"{symbol}: recovered filled suspect order "
+                    f"{suspect.order_id}; adopted position for "
+                    f"'{suspect.decision.strategy_name}'"
+                )
+                self._suspect_orders.pop(symbol, None)
+                continue
+
+            logger.warning(
+                f"{symbol}: suspect order {suspect.order_id} resolved as "
+                f"{result.status.value} but no broker position was present; "
+                "dropping recovery state without adopting"
+            )
+            self._suspect_orders.pop(symbol, None)
+
+    def _ensure_recovered_protective_stop(
+        self,
+        *,
+        snapshot: BrokerSnapshot,
+        position: Position,
+        decision: RiskDecision,
+    ) -> None:
+        """Place the intended stop immediately for a recovered entry if missing."""
+        symbol = decision.symbol
+        if self._has_protective_stop_order(symbol, snapshot):
+            return
+
+        stop_qty = abs(int(position.qty))
+        if stop_qty < 1:
+            logger.warning(
+                f"{symbol}: recovered position qty={position.qty} has no "
+                "whole-share stop quantity; fractional remainder will rely on "
+                "strategy exits until reduced or closed"
+            )
+            return
+
+        repaired = self.broker.place_protective_stop(
+            symbol=symbol,
+            qty=stop_qty,
+            stop_price=decision.stop_price,
+            client_order_id_prefix=f"{decision.strategy_name}-recover-stop",
+        )
+        snapshot.open_orders.append(repaired)
+        logger.warning(
+            f"{symbol}: restored protective stop immediately after suspect "
+            f"order recovery at ${decision.stop_price:.2f}"
+        )
 
     # ── Post-fill bookkeeping ────────────────────────────────────────────
 

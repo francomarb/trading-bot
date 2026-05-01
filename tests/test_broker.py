@@ -614,3 +614,18 @@ class TestFractionalOrders:
 
         assert result.status is OrderStatus.FILLED
         api.submit_order.assert_not_called()
+
+    def test_fractional_confirmation_failure_returns_unknown_with_order_id(self):
+        """Accepted fractional entry + confirm failure returns UNKNOWN, not raise."""
+        api = MagicMock()
+        entry_order = _alpaca_order(id="entry-4", status="accepted", qty=8.5)
+        api.submit_order.return_value = entry_order
+        api.get_order_by_id.side_effect = ConnectionError("socket dropped")
+
+        broker = _broker_with_mock(api)
+        result = broker.place_order(_decision(qty=8.5), poll_timeout=0.1)
+
+        assert result.status is OrderStatus.UNKNOWN
+        assert result.order_id == "entry-4"
+        assert "socket dropped" in result.message
+        assert api.submit_order.call_count == 1

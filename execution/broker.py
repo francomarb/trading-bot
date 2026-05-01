@@ -105,6 +105,7 @@ class OrderStatus(str, Enum):
     REJECTED = "rejected"        # broker rejected — terminal
     CANCELED = "canceled"        # canceled before/during fill — terminal
     TIMEOUT = "timeout"          # poll deadline exceeded — terminal (caller decides next step)
+    UNKNOWN = "unknown"          # submitted, but terminal state could not be confirmed
 
 
 # Alpaca status → our enum. Anything not listed maps to PENDING and we keep polling.
@@ -141,6 +142,7 @@ class OrderResult:
             OrderStatus.REJECTED,
             OrderStatus.CANCELED,
             OrderStatus.TIMEOUT,
+            OrderStatus.UNKNOWN,
         }
 
 
@@ -468,14 +470,22 @@ class AlpacaBroker:
             for leg in getattr(order, "legs", None) or []:
                 self._stream_manager.register_stop_leg(str(leg.id))
 
-        return self._wait_for_fill(
-            order_id=order_id,
-            symbol=decision.symbol,
-            requested_qty=decision.qty,
-            timeout=poll_timeout,
-            interval=poll_interval,
-            stream_event=stream_event,
-        )
+        try:
+            return self._wait_for_fill(
+                order_id=order_id,
+                symbol=decision.symbol,
+                requested_qty=decision.qty,
+                timeout=poll_timeout,
+                interval=poll_interval,
+                stream_event=stream_event,
+            )
+        except Exception as e:
+            return self._unknown_after_submit(
+                order_id=order_id,
+                symbol=decision.symbol,
+                requested_qty=decision.qty,
+                error=e,
+            )
 
     def _place_fractional_order(
         self,
@@ -564,14 +574,22 @@ class AlpacaBroker:
         if self._stream_manager is not None:
             stream_event = self._stream_manager.watch(order_id)
 
-        result = self._wait_for_fill(
-            order_id=order_id,
-            symbol=decision.symbol,
-            requested_qty=decision.qty,
-            timeout=poll_timeout,
-            interval=poll_interval,
-            stream_event=stream_event,
-        )
+        try:
+            result = self._wait_for_fill(
+                order_id=order_id,
+                symbol=decision.symbol,
+                requested_qty=decision.qty,
+                timeout=poll_timeout,
+                interval=poll_interval,
+                stream_event=stream_event,
+            )
+        except Exception as e:
+            return self._unknown_after_submit(
+                order_id=order_id,
+                symbol=decision.symbol,
+                requested_qty=decision.qty,
+                error=e,
+            )
 
         # Submit standalone GTC stop for the whole-share portion after fill.
         # Alpaca stop orders require whole shares; fractional remainder exits
@@ -611,6 +629,35 @@ class AlpacaBroker:
                 )
 
         return result
+
+    def reconcile_submitted_order(
+        self,
+        *,
+        order_id: str,
+        symbol: str,
+        requested_qty: int,
+    ) -> OrderResult:
+        """
+        Reconcile a bot-submitted order whose post-submit confirmation failed.
+
+        This is intentionally narrow: callers must provide the exact order_id
+        returned by Alpaca. Unknown broker positions are not adopted through
+        this path.
+        """
+        order = self._with_retry(
+            lambda: self._api.get_order_by_id(order_id),
+            op_desc=f"reconcile_order({order_id})",
+        )
+        raw = order.status.value if isinstance(order.status, AlpacaOrderStatus) else str(order.status)
+        mapped = _ALPACA_TERMINAL.get(raw)
+        if mapped is not None and mapped is not OrderStatus.PARTIAL:
+            return self._build_result(order, symbol, requested_qty, mapped)
+
+        filled = int(float(order.filled_qty or 0))
+        if filled > 0:
+            return self._build_result(order, symbol, requested_qty, OrderStatus.PARTIAL)
+
+        return self._build_result(order, symbol, requested_qty, OrderStatus.PENDING)
 
     def cancel_order(self, order_id: str) -> bool:
         """Cancel an order by id. Returns True on success, False on failure."""
@@ -863,6 +910,29 @@ class AlpacaBroker:
             filled_qty=filled,
             avg_fill_price=avg_price,
             raw_status=order.status.value if hasattr(order.status, 'value') else str(order.status),
+            message=msg,
+        )
+
+    @staticmethod
+    def _unknown_after_submit(
+        *,
+        order_id: str,
+        symbol: str,
+        requested_qty: int,
+        error: Exception,
+    ) -> OrderResult:
+        msg = (
+            f"submitted as {order_id}, but fill confirmation failed: {error}"
+        )
+        logger.warning(f"{symbol} order {order_id}: {msg}")
+        return OrderResult(
+            status=OrderStatus.UNKNOWN,
+            order_id=order_id,
+            symbol=symbol,
+            requested_qty=requested_qty,
+            filled_qty=0,
+            avg_fill_price=None,
+            raw_status=None,
             message=msg,
         )
 
