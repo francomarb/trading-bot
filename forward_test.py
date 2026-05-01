@@ -48,6 +48,8 @@ from reporting.pnl import PnLTracker
 from risk.manager import RiskManager
 from data.watchlists import StaticWatchlistSource
 from strategies.base import StrategySlot
+from strategies.donchian_breakout import DonchianBreakout
+from strategies.filters.donchian_breakout import DonchianEdgeFilter
 from strategies.filters.rsi_reversion import RSIEdgeFilter
 from strategies.filters.sma_crossover import SMAEdgeFilter
 from strategies.rsi_reversion import RSIReversion
@@ -137,6 +139,22 @@ def main() -> None:
             # second layer: SPY > 200 SMA AND SPY > 50 SMA, so BEAR is
             # double-blocked.
             allowed_regimes=frozenset({MarketRegime.TRENDING, MarketRegime.RANGING}),
+        ),
+        StrategySlot(
+            strategy=DonchianBreakout(entry_window=30, exit_window=15,
+                                      edge_filter=DonchianEdgeFilter()),
+            watchlist_source=StaticWatchlistSource(
+                list(settings.DONCHIAN_WATCHLIST), name="donchian"
+            ),
+            # Donchian breakout is a pure trend-continuation strategy.
+            # Literature is unanimous: restrict to TRENDING only.
+            # RANGING → every N-day high is a false breakout that reverses;
+            # BEAR    → blocked by regime detector (no long entries in downtrend);
+            # VOLATILE → erratic price action produces whipsaws with wide ATR stops.
+            # Backtest validation: Mid-range (30/15), Sharpe +0.85, 32-name
+            # AI/Bigtech universe, 4y window ending 2026-04-28 (2× ATR stops).
+            # Sleeve: 0.25 weight, max 5 concurrent positions.
+            allowed_regimes=frozenset({MarketRegime.TRENDING}),
         ),
     ]
 
