@@ -15,8 +15,10 @@ from dashboard import (
     compute_rolling_sharpe,
     compute_sleeve_usage,
     compute_strategy_stats,
+    format_delta_currency,
     load_engine_state,
     load_trades,
+    resolve_account_metrics,
 )
 
 # ── Helpers ──────────────────────────────────────────────────────────────────
@@ -364,3 +366,79 @@ class TestComputeSleeveUsage:
         assert pytest.approx(sma["Utilization"]) == 1250.0 / 40_000.0
         assert sma["Open Positions"] == 1
         assert pytest.approx(rsi["Used Notional"]) == 900.0
+
+
+class TestFormatDeltaCurrency:
+    def test_positive_value_has_leading_plus(self):
+        assert format_delta_currency(123.45) == "+$123.45"
+
+    def test_negative_value_has_leading_minus(self):
+        assert format_delta_currency(-123.45) == "-$123.45"
+
+    def test_none_returns_none(self):
+        assert format_delta_currency(None) is None
+
+
+class TestResolveAccountMetrics:
+    def test_prefers_direct_broker_metrics_when_available(self):
+        state = {
+            "equity": 100_000.0,
+            "daily_pnl": 25.0,
+            "session_pnl": 10.0,
+            "session_start_equity": 99_990.0,
+            "previous_close_equity": 99_975.0,
+        }
+        broker_metrics = {
+            "equity": 100_325.82,
+            "daily_pnl": 325.82,
+            "session_pnl": 335.82,
+            "session_start_equity": 99_990.0,
+            "previous_close_equity": 100_000.0,
+            "source": "broker",
+        }
+
+        metrics, warning = resolve_account_metrics(state, broker_metrics)
+
+        assert warning is None
+        assert metrics["source"] == "broker"
+        assert metrics["equity"] == pytest.approx(100_325.82)
+        assert metrics["daily_pnl"] == pytest.approx(325.82)
+        assert metrics["equity_delta"] == pytest.approx(325.82)
+
+    def test_falls_back_to_snapshot_and_session_delta_without_previous_close(self):
+        state = {
+            "equity": 100_050.0,
+            "daily_pnl": 0.0,
+            "session_pnl": 50.0,
+            "session_start_equity": 100_000.0,
+            "previous_close_equity": None,
+        }
+
+        metrics, warning = resolve_account_metrics(state, broker_metrics=None)
+
+        assert warning is None
+        assert metrics["source"] == "snapshot"
+        assert metrics["equity"] == pytest.approx(100_050.0)
+        assert metrics["daily_pnl"] == pytest.approx(0.0)
+        assert metrics["equity_delta"] == pytest.approx(50.0)
+
+    def test_broker_error_keeps_snapshot_values_and_returns_warning(self):
+        state = {
+            "equity": 100_080.0,
+            "daily_pnl": 80.0,
+            "session_pnl": 60.0,
+            "session_start_equity": 100_020.0,
+            "previous_close_equity": 100_000.0,
+        }
+        broker_metrics = {
+            "error": "Direct broker account refresh unavailable: TimeoutError: slow",
+            "source": "snapshot",
+        }
+
+        metrics, warning = resolve_account_metrics(state, broker_metrics)
+
+        assert metrics["source"] == "snapshot"
+        assert metrics["equity"] == pytest.approx(100_080.0)
+        assert metrics["daily_pnl"] == pytest.approx(80.0)
+        assert warning is not None
+        assert "TimeoutError" in warning

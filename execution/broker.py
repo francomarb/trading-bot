@@ -128,8 +128,8 @@ class OrderResult:
     status: OrderStatus
     order_id: str | None
     symbol: str
-    requested_qty: int
-    filled_qty: int
+    requested_qty: float
+    filled_qty: float
     avg_fill_price: float | None
     raw_status: str | None     # Alpaca's status string (for logging/debug)
     message: str = ""          # human-readable summary or error text
@@ -153,7 +153,7 @@ class OpenOrder:
     order_id: str
     symbol: str
     side: Side
-    qty: int
+    qty: float
     order_type: OrderType
     status: str          # raw alpaca status (open / accepted / pending_new / ...)
     submitted_at: datetime
@@ -255,10 +255,12 @@ class AlpacaBroker:
         """
         acct = self._with_retry(self._api.get_account, op_desc="get_account")
         equity = float(acct.equity)
+        last_equity = float(acct.last_equity) if getattr(acct, "last_equity", None) is not None else None
         return AccountState(
             equity=equity,
             cash=float(acct.cash),
             session_start_equity=session_start_equity if session_start_equity is not None else equity,
+            previous_close_equity=last_equity,
             open_positions=self.get_positions(),
         )
 
@@ -269,7 +271,7 @@ class AlpacaBroker:
         for p in raw:
             out[p.symbol] = Position(
                 symbol=p.symbol,
-                qty=int(float(p.qty)),
+                qty=float(p.qty),
                 avg_entry_price=float(p.avg_entry_price),
                 market_value=float(p.market_value),
             )
@@ -330,7 +332,7 @@ class AlpacaBroker:
                 continue
             status_str = o.status.value if isinstance(o.status, AlpacaOrderStatus) else str(o.status)
             mapped = _ALPACA_TERMINAL.get(status_str, OrderStatus.CANCELED)
-            filled = int(float(o.filled_qty or 0))
+            filled = float(o.filled_qty or 0)
             avg = o.filled_avg_price
             avg_price = float(avg) if avg is not None else None
             side_str = o.side.value if isinstance(o.side, AlpacaOrderSide) else str(o.side)
@@ -338,7 +340,7 @@ class AlpacaBroker:
                 status=mapped,
                 order_id=str(o.id),
                 symbol=sym,
-                requested_qty=int(float(o.qty)),
+                requested_qty=float(o.qty),
                 filled_qty=filled,
                 avg_fill_price=avg_price,
                 raw_status=status_str,
@@ -635,7 +637,7 @@ class AlpacaBroker:
         *,
         order_id: str,
         symbol: str,
-        requested_qty: int,
+        requested_qty: float,
     ) -> OrderResult:
         """
         Reconcile a bot-submitted order whose post-submit confirmation failed.
@@ -653,7 +655,7 @@ class AlpacaBroker:
         if mapped is not None and mapped is not OrderStatus.PARTIAL:
             return self._build_result(order, symbol, requested_qty, mapped)
 
-        filled = int(float(order.filled_qty or 0))
+        filled = float(order.filled_qty or 0)
         if filled > 0:
             return self._build_result(order, symbol, requested_qty, OrderStatus.PARTIAL)
 
@@ -766,7 +768,7 @@ class AlpacaBroker:
         *,
         order_id: str,
         symbol: str,
-        requested_qty: int,
+        requested_qty: float,
         timeout: float,
         interval: float,
         stream_event: threading.Event | None,
@@ -815,7 +817,7 @@ class AlpacaBroker:
     def _build_result_from_stream(
         update: "TradeUpdate",
         symbol: str,
-        requested_qty: int,
+        requested_qty: float,
     ) -> "OrderResult":
         """Build an OrderResult from a terminal TradeUpdate (WebSocket path)."""
         from alpaca.trading.models import TradeUpdate  # local import avoids circular
@@ -833,7 +835,7 @@ class AlpacaBroker:
             "rejected": OrderStatus.REJECTED,
         }
         status = _STATUS_MAP.get(event_val, OrderStatus.FILLED)
-        filled_qty = int(float(update.qty or 0))
+        filled_qty = float(update.qty or 0)
         avg_price = float(update.price) if update.price is not None else None
         order_id = str(update.order.id)
         msg = (
@@ -857,7 +859,7 @@ class AlpacaBroker:
         *,
         order_id: str,
         symbol: str,
-        requested_qty: int,
+        requested_qty: float,
         timeout: float,
         interval: float,
     ) -> OrderResult:
@@ -879,7 +881,7 @@ class AlpacaBroker:
                 return self._build_result(order, symbol, requested_qty, mapped)
             if time.monotonic() >= deadline:
                 # Out of time. If we've got partial fills, surface them.
-                filled = int(float(order.filled_qty or 0))
+                filled = float(order.filled_qty or 0)
                 if filled > 0:
                     return self._build_result(
                         order, symbol, requested_qty, OrderStatus.PARTIAL
@@ -891,9 +893,9 @@ class AlpacaBroker:
 
     @staticmethod
     def _build_result(
-        order, symbol: str, requested_qty: int, status: OrderStatus
+        order, symbol: str, requested_qty: float, status: OrderStatus
     ) -> OrderResult:
-        filled = int(float(order.filled_qty or 0))
+        filled = float(order.filled_qty or 0)
         avg = order.filled_avg_price
         avg_price = float(avg) if avg is not None else None
         order_id = str(order.id) if order.id is not None else None
@@ -918,7 +920,7 @@ class AlpacaBroker:
         *,
         order_id: str,
         symbol: str,
-        requested_qty: int,
+        requested_qty: float,
         error: Exception,
     ) -> OrderResult:
         msg = (
@@ -955,7 +957,7 @@ class AlpacaBroker:
             order_id=order_id,
             symbol=o.symbol,
             side=Side(side_val),
-            qty=int(float(o.qty)),
+            qty=float(o.qty),
             order_type=OrderType(type_val) if type_val in {ot.value for ot in OrderType} else OrderType.MARKET,
             status=status_val,
             submitted_at=submitted,

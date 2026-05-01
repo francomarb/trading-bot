@@ -24,6 +24,7 @@ import time
 from datetime import datetime, timezone
 from pathlib import Path
 from collections import deque
+from typing import Any
 
 import pandas as pd
 import plotly.graph_objects as go
@@ -131,6 +132,101 @@ def load_engine_state(path: str) -> dict:
             return json.load(fh)
     except Exception:
         return {}
+
+
+@st.cache_data(ttl=15, show_spinner=False)
+def load_broker_account_metrics(
+    live_trading: bool,
+    session_start_equity: float | None,
+) -> dict[str, Any]:
+    """
+    Best-effort direct broker refresh for top account metrics.
+
+    This keeps Equity / Daily P&L closer to Alpaca than the engine snapshot
+    cadence alone. The dashboard remains read-only: it only issues broker
+    reads and falls back silently to the snapshot on failure.
+    """
+    del live_trading  # Environment selection is already derived from settings.
+    try:
+        from execution.broker import AlpacaBroker
+
+        account = AlpacaBroker().get_account(
+            session_start_equity=session_start_equity,
+        )
+        session_pnl = account.equity - account.session_start_equity
+        daily_pnl = (
+            account.equity - account.previous_close_equity
+            if account.previous_close_equity is not None
+            else session_pnl
+        )
+        return {
+            "equity": account.equity,
+            "session_start_equity": account.session_start_equity,
+            "previous_close_equity": account.previous_close_equity,
+            "daily_pnl": daily_pnl,
+            "session_pnl": session_pnl,
+            "positions_detail": {
+                symbol: {
+                    "qty": position.qty,
+                    "avg_entry_price": position.avg_entry_price,
+                    "market_value": position.market_value,
+                    "unrealized_pnl": (
+                        position.market_value - position.qty * position.avg_entry_price
+                    ),
+                }
+                for symbol, position in account.open_positions.items()
+            },
+            "source": "broker",
+        }
+    except Exception as exc:
+        return {
+            "error": (
+                f"Direct broker account refresh unavailable: "
+                f"{type(exc).__name__}: {exc}"
+            ),
+            "source": "snapshot",
+        }
+
+
+def resolve_account_metrics(
+    state: dict,
+    broker_metrics: dict[str, Any] | None = None,
+) -> tuple[dict[str, Any], str | None]:
+    """Merge snapshot and live broker account data for dashboard metrics."""
+    equity = float(state.get("equity", 0.0) or 0.0)
+    daily_pnl = float(state.get("daily_pnl", 0.0) or 0.0)
+    session_pnl = float(state.get("session_pnl", daily_pnl) or daily_pnl)
+    previous_close = state.get("previous_close_equity")
+    session_start_equity = float(state.get("session_start_equity", equity) or equity)
+    source = "snapshot"
+    warning = None
+
+    if broker_metrics:
+        if broker_metrics.get("error"):
+            warning = str(broker_metrics["error"])
+        else:
+            equity = float(broker_metrics.get("equity", equity) or equity)
+            daily_pnl = float(broker_metrics.get("daily_pnl", daily_pnl) or daily_pnl)
+            session_pnl = float(
+                broker_metrics.get("session_pnl", session_pnl) or session_pnl
+            )
+            previous_close = broker_metrics.get("previous_close_equity", previous_close)
+            session_start_equity = float(
+                broker_metrics.get("session_start_equity", session_start_equity)
+                or session_start_equity
+            )
+            source = str(broker_metrics.get("source", "broker"))
+
+    equity_delta = daily_pnl if previous_close is not None else session_pnl
+    return {
+        "equity": equity,
+        "daily_pnl": daily_pnl,
+        "session_pnl": session_pnl,
+        "previous_close_equity": previous_close,
+        "session_start_equity": session_start_equity,
+        "equity_delta": equity_delta,
+        "source": source,
+    }, warning
 
 
 def compute_equity_curve(trades_df: pd.DataFrame) -> pd.DataFrame:
@@ -376,6 +472,14 @@ def symbol_url(symbol: str) -> str:
     return f"https://finance.yahoo.com/quote/{symbol}/"
 
 
+def format_delta_currency(value: float | None) -> str | None:
+    """Format a metric delta so Streamlit can infer sign color correctly."""
+    if value is None:
+        return None
+    sign = "+" if value >= 0 else "-"
+    return f"{sign}${abs(value):,.2f}"
+
+
 def _regime_color(regime: str | None) -> str:
     colors = {
         "TRENDING": "🟢",
@@ -420,20 +524,43 @@ def render_dashboard() -> None:
     is_running = state.get("running", False)
     status_label = "🟢 Running" if is_running else "⚫ Offline"
     regime = state.get("regime")
-    equity = state.get("equity", 0.0)
-    daily_pnl = state.get("daily_pnl", 0.0)
     cycle_count = state.get("cycle_count", 0)
     ts = state.get("timestamp", "—")
+    broker_metrics = load_broker_account_metrics(
+        live_trading=live_trading,
+        session_start_equity=state.get("session_start_equity"),
+    )
+    account_metrics, account_warning = resolve_account_metrics(
+        state,
+        broker_metrics=broker_metrics,
+    )
+    display_state = dict(state)
+    broker_positions_detail = (
+        broker_metrics.get("positions_detail")
+        if broker_metrics and not broker_metrics.get("error")
+        else None
+    )
+    if broker_positions_detail:
+        positions_detail = {}
+        for sym, detail in broker_positions_detail.items():
+            enriched = dict(detail)
+            snapshot_detail = (state.get("positions_detail") or {}).get(sym, {})
+            if "strategy" not in enriched and snapshot_detail.get("strategy") is not None:
+                enriched["strategy"] = snapshot_detail["strategy"]
+            positions_detail[sym] = enriched
+        display_state["positions_detail"] = positions_detail
+    equity = account_metrics["equity"]
+    daily_pnl = account_metrics["daily_pnl"]
+    session_pnl = account_metrics["session_pnl"]
+    previous_close = account_metrics["previous_close_equity"]
 
     col1, col2, col3, col4, col5, col6 = st.columns(6)
     col1.metric("Status", status_label)
     col2.metric("Mode", env_label)
-    session_start = state.get("session_start_equity", equity)
-    equity_delta = equity - session_start if session_start else None
     col3.metric("Equity", f"${equity:,.2f}",
-                delta=f"${equity_delta:+,.2f}" if equity_delta is not None else None)
+                delta=format_delta_currency(account_metrics["equity_delta"]))
     col4.metric("Daily P&L", f"${daily_pnl:+,.2f}",
-                delta=f"${daily_pnl:+,.2f}" if daily_pnl != 0 else None,
+                delta=format_delta_currency(daily_pnl) if daily_pnl != 0 else None,
                 delta_color="normal")
     col5.metric("Regime", f"{_regime_color(regime)} {regime or '—'}")
     col6.metric("Cycles", cycle_count)
@@ -447,6 +574,18 @@ def render_dashboard() -> None:
             st.caption(f"Last engine cycle: {ts}")
     elif not is_running:
         st.info("Engine is offline. Showing historical data from trade database.")
+    st.caption(
+        "Account metrics source: "
+        + (
+            "live broker refresh"
+            if account_metrics["source"] == "broker"
+            else "engine snapshot fallback"
+        )
+    )
+    if previous_close is None:
+        st.caption("Daily P&L fallback: previous close unavailable, showing session-based change.")
+    if account_warning:
+        st.caption(account_warning)
 
     st.divider()
 
@@ -560,8 +699,8 @@ def render_dashboard() -> None:
             "Current owned positions from the latest engine snapshot.",
             kicker="Exposure",
         )
-        positions_detail = state.get("positions_detail") or {}
-        open_positions = state.get("open_positions") or {}
+        positions_detail = display_state.get("positions_detail") or {}
+        open_positions = display_state.get("open_positions") or {}
         if not open_positions:
             st.info("No open positions." if is_running else "Engine offline.")
         else:
@@ -604,13 +743,15 @@ def render_dashboard() -> None:
             kicker="Exposure",
         )
         sleeve_df = compute_sleeve_usage(
-            state,
+            display_state,
             equity=equity,
             allocations=settings.STRATEGY_ALLOCATIONS,
             total_gross_pct=settings.MAX_GROSS_EXPOSURE_PCT,
         )
         if not sleeve_df.empty:
             display = sleeve_df.copy()
+            display["Weight"] = display["Weight"].map("{:.0%}".format)
+            display["Utilization"] = display["Utilization"] * 100.0
             display["Open Positions"] = display.apply(
                 lambda row: f"{row['Open Positions']}/{row['Max Positions']}",
                 axis=1,
@@ -621,16 +762,15 @@ def render_dashboard() -> None:
                 width="stretch",
                 hide_index=True,
                 column_config={
-                    "Weight": st.column_config.NumberColumn(format="%.0f%%"),
                     "Budget": st.column_config.NumberColumn(format="$%.2f"),
                     "Used Notional": st.column_config.NumberColumn(format="$%.2f"),
                     "Remaining": st.column_config.NumberColumn(format="$%.2f"),
                     "Utilization": st.column_config.ProgressColumn(
                         "Utilization",
                         help="Current sleeve notional usage vs configured budget.",
-                        format="%.1f%%",
+                        format="%.0f%%",
                         min_value=0.0,
-                        max_value=1.0,
+                        max_value=100.0,
                     ),
                 },
             )
@@ -693,7 +833,7 @@ def render_dashboard() -> None:
                     status = strategy_status_map.get(sym)
                     if status is None:
                         is_open = sym in open_positions and open_positions[sym] == strat_name
-                        status = "Long" if is_open else "Flat"
+                        status = "Long" if is_open else "No Signal"
                     lt = last_trade.get(sym, {})
                     price = lt.get("price")
                     rows.append({

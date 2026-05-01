@@ -102,6 +102,7 @@ def _bars(n: int = 60, end: datetime = T0, base: float = 100.0) -> pd.DataFrame:
 def _snapshot(
     *,
     equity: float = 100_000.0,
+    previous_close_equity: float | None = None,
     positions: dict[str, Position] | None = None,
     open_orders: list[OpenOrder] | None = None,
 ) -> BrokerSnapshot:
@@ -110,6 +111,7 @@ def _snapshot(
             equity=equity,
             cash=equity,
             session_start_equity=equity,
+            previous_close_equity=previous_close_equity,
             open_positions=positions or {},
         ),
         open_orders=open_orders or [],
@@ -788,7 +790,7 @@ class TestWatchlistStatuses:
         snap = _snapshot()
         engine._session_start_equity = snap.account.equity
         slot = engine.slots[0]
-        statuses = {"AAPL": "Flat"}
+        statuses = {"AAPL": "No Signal"}
         engine._process_symbol(
             "AAPL",
             snap,
@@ -813,7 +815,33 @@ class TestWatchlistStatuses:
         engine.strategy = strategy
         snap = _snapshot()
         engine._session_start_equity = snap.account.equity
-        statuses = {"AAPL": "Flat"}
+        statuses = {"AAPL": "No Signal"}
+        engine._process_symbol(
+            "AAPL",
+            snap,
+            snap.account,
+            strategy,
+            engine.slots[0].timeframe,
+            strategy_statuses=statuses,
+        )
+        assert statuses["AAPL"] == "Filter Blocked"
+        broker.place_order.assert_not_called()
+
+    def test_filter_blocked_status_when_edge_filter_fails_without_raw_entry(
+        self, engine_factory
+    ):
+        edge_filter = lambda df: pd.Series([False] * len(df), index=df.index, dtype=bool)
+        strategy = FakeStrategy(
+            entries=[False] * 60,
+            exits=[False],
+            edge_filter=edge_filter,
+        )
+        engine, broker = engine_factory()
+        engine.slots[0].strategy = strategy
+        engine.strategy = strategy
+        snap = _snapshot()
+        engine._session_start_equity = snap.account.equity
+        statuses = {"AAPL": "No Signal"}
         engine._process_symbol(
             "AAPL",
             snap,
@@ -835,12 +863,19 @@ class TestWatchlistStatuses:
         engine._last_regime = "TRENDING"
         engine._session_start_equity = 100_000.0
         engine._last_cycle_equity = 100_250.0
+        engine._last_snapshot = _snapshot(
+            equity=100_250.0,
+            previous_close_equity=99_900.0,
+        )
         engine._watchlist_statuses = {
             "sma_crossover": {"AAPL": "Long", "MSFT": "Regime Blocked"}
         }
         engine._write_state_snapshot()
         with open(settings.STATE_SNAPSHOT_PATH) as fh:
             state = json.load(fh)
+        assert state["previous_close_equity"] == 99_900.0
+        assert state["daily_pnl"] == 350.0
+        assert state["session_pnl"] == 250.0
         assert state["watchlist_statuses"]["sma_crossover"]["AAPL"] == "Long"
         assert state["watchlist_statuses"]["sma_crossover"]["MSFT"] == "Regime Blocked"
 

@@ -414,6 +414,21 @@ class TestReadSide:
             symbol="AAPL", qty=3, avg_entry_price=100.5, market_value=305.10
         )
 
+    def test_get_positions_preserves_fractional_qty(self):
+        api = MagicMock()
+        api.get_all_positions.return_value = [
+            SimpleNamespace(
+                symbol="PWR", qty="5.54", avg_entry_price="727.67", market_value="4083.26"
+            ),
+        ]
+        positions = _broker_with_mock(api).get_positions()
+        assert positions["PWR"] == Position(
+            symbol="PWR",
+            qty=5.54,
+            avg_entry_price=727.67,
+            market_value=4083.26,
+        )
+
     def test_sync_bundles_account_positions_and_orders(self):
         api = MagicMock()
         api.get_account.return_value = SimpleNamespace(equity="100000", cash="50000")
@@ -429,10 +444,12 @@ class TestReadSide:
                 submitted_at="2026-04-15T14:30:00Z",
             )
         ]
+        api.get_account.return_value.last_equity = "99_700".replace("_", "")
         snap = _broker_with_mock(api).sync_with_broker(session_start_equity=99_000.0)
         assert isinstance(snap.account, AccountState)
         assert snap.account.equity == 100_000.0
         assert snap.account.session_start_equity == 99_000.0
+        assert snap.account.previous_close_equity == 99_700.0
         assert "AAPL" in snap.account.open_positions
         assert len(snap.open_orders) == 1
         assert snap.open_orders[0].order_id == "o1"
@@ -441,10 +458,15 @@ class TestReadSide:
 
     def test_get_account_defaults_session_start_to_current_equity(self):
         api = MagicMock()
-        api.get_account.return_value = SimpleNamespace(equity="50000", cash="50000")
+        api.get_account.return_value = SimpleNamespace(
+            equity="50000",
+            cash="50000",
+            last_equity="49750",
+        )
         api.get_all_positions.return_value = []
         acct = _broker_with_mock(api).get_account()
         assert acct.session_start_equity == acct.equity == 50_000.0
+        assert acct.previous_close_equity == 49_750.0
 
 
 # ── Retry wrapper ────────────────────────────────────────────────────────────

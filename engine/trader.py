@@ -524,6 +524,7 @@ class TradingEngine:
                                 equity=running_account.equity,
                                 cash=running_account.cash - filled.market_value,
                                 session_start_equity=running_account.session_start_equity,
+                                previous_close_equity=running_account.previous_close_equity,
                                 open_positions=updated_positions,
                             )
                     except Exception as e:
@@ -606,8 +607,10 @@ class TradingEngine:
         latest_ts = df.index[-1]
 
         # 4. Signals.
-        raw_signals = strategy._raw_signals(df)
-        signals = strategy.generate_signals(df, symbol=symbol)
+        raw_signals, signals, edge_allowed = strategy.inspect_signals(
+            df,
+            symbol=symbol,
+        )
         raw_entry = bool(raw_signals.entries.iloc[-1])
         last_entry = bool(signals.entries.iloc[-1])
         last_exit = bool(signals.exits.iloc[-1])
@@ -645,9 +648,9 @@ class TradingEngine:
                 self._log_close(result, latest_close, strategy.name)
                 if result.status in {OrderStatus.FILLED, OrderStatus.PARTIAL}:
                     if strategy_statuses is not None:
-                        strategy_statuses[symbol] = "Flat"
+                        strategy_statuses[symbol] = "No Signal"
                     close_price = result.avg_fill_price or latest_close
-                    close_qty = int(result.filled_qty or (position.qty if position else 0))
+                    close_qty = float(result.filled_qty or (position.qty if position else 0))
                     self.alerts.trade_executed(
                         symbol=symbol,
                         strategy=strategy.name,
@@ -669,13 +672,15 @@ class TradingEngine:
 
         # 6. Entry branch — risk is the gate.
         if not last_entry:
-            if (
-                raw_entry
-                and position is None
-                and strategy_statuses is not None
-                and strategy_statuses.get(symbol) == "Flat"
-            ):
-                strategy_statuses[symbol] = "Filter Blocked"
+            if position is None and strategy_statuses is not None:
+                current_status = strategy_statuses.get(symbol)
+                if raw_entry and current_status == "No Signal":
+                    strategy_statuses[symbol] = "Filter Blocked"
+                elif (
+                    edge_allowed is False
+                    and current_status == "No Signal"
+                ):
+                    strategy_statuses[symbol] = "Filter Blocked"
             return
         if not entry_allowed:
             if position is None and strategy_statuses is not None:
@@ -758,7 +763,7 @@ class TradingEngine:
                 if strategy_statuses is not None:
                     strategy_statuses[symbol] = "Long"
                 fill_price = result.avg_fill_price or decision.entry_reference_price
-                fill_qty = int(result.filled_qty or decision.qty)
+                fill_qty = float(result.filled_qty or decision.qty)
                 # Cache entry price for HWM P&L gate (used on close).
                 self._entry_prices[symbol] = fill_price
                 self.alerts.trade_executed(
@@ -848,7 +853,7 @@ class TradingEngine:
             position = snapshot.account.open_positions.get(symbol)
             if result.status in {OrderStatus.FILLED, OrderStatus.PARTIAL} and position is not None:
                 fill_price = result.avg_fill_price or suspect.decision.entry_reference_price
-                fill_qty = int(result.filled_qty or position.qty or suspect.decision.qty)
+                fill_qty = float(result.filled_qty or position.qty or suspect.decision.qty)
                 self._record_fill(
                     result,
                     modeled_price=suspect.modeled_price,
@@ -991,7 +996,7 @@ class TradingEngine:
         symbol: str,
         strategy_name: str,
         close_price: float,
-        qty: int,
+        qty: float,
     ) -> None:
         """
         Compute and report realized P&L for a closed position to the
@@ -1344,6 +1349,14 @@ class TradingEngine:
             path = settings.STATE_SNAPSHOT_PATH
             equity = self._last_cycle_equity or self._session_start_equity or 0.0
             start_equity = self._session_start_equity or equity
+            previous_close_equity = (
+                self._last_snapshot.account.previous_close_equity
+                if self._last_snapshot is not None else None
+            )
+            market_day_pnl = (
+                equity - previous_close_equity
+                if previous_close_equity is not None else equity - start_equity
+            )
             # Build enriched position map with entry price and unrealized P&L.
             positions_detail: dict[str, dict] = {}
             broker_positions = (
@@ -1369,7 +1382,9 @@ class TradingEngine:
                 "regime": self._last_regime,
                 "equity": equity,
                 "session_start_equity": start_equity,
-                "daily_pnl": equity - start_equity,
+                "previous_close_equity": previous_close_equity,
+                "daily_pnl": market_day_pnl,
+                "session_pnl": equity - start_equity,
                 "open_positions": dict(self._position_owners),
                 "positions_detail": positions_detail,
                 "watchlist_statuses": self._watchlist_statuses,
@@ -1409,7 +1424,7 @@ class TradingEngine:
             ):
                 return "Pending Entry"
 
-        return "Flat"
+        return "No Signal"
 
     def _refresh_watchlist_statuses(
         self,
@@ -1435,7 +1450,7 @@ class TradingEngine:
                 prior = strat_previous.get(symbol)
                 if (
                     preserve_existing
-                    and baseline == "Flat"
+                    and baseline == "No Signal"
                     and prior in {"Regime Blocked", "Filter Blocked"}
                 ):
                     strat_statuses[symbol] = prior

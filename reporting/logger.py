@@ -110,7 +110,7 @@ class TradeRecord:
     timestamp: str
     symbol: str
     side: str
-    qty: int
+    qty: float
     avg_fill_price: float | None
     order_id: str | None
     strategy: str
@@ -121,8 +121,8 @@ class TradeRecord:
     realized_slippage_bps: float
     order_type: str
     status: str
-    requested_qty: int
-    filled_qty: int
+    requested_qty: float
+    filled_qty: float
 
     def as_dict(self) -> dict:
         """Column-ordered dict (same interface as before migration)."""

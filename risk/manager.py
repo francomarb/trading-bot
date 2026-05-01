@@ -67,7 +67,7 @@ class Position:
     """Snapshot of a single open broker position."""
 
     symbol: str
-    qty: int
+    qty: float
     avg_entry_price: float
     market_value: float  # current market value (qty * last price)
 
@@ -85,6 +85,7 @@ class AccountState:
     equity: float
     cash: float
     session_start_equity: float
+    previous_close_equity: float | None = None
     open_positions: dict[str, Position] = field(default_factory=dict)
 
     def gross_exposure(self) -> float:

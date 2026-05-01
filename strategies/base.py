@@ -114,20 +114,12 @@ class BaseStrategy(ABC):
     def _raw_signals(self, df: pd.DataFrame) -> SignalFrame:
         """Compute entries/exits before edge-filter gating."""
 
-    def generate_signals(self, df: pd.DataFrame, *, symbol: str = "") -> SignalFrame:
-        """
-        Public entry point. Computes raw signals, then AND-gates entries
-        (but not exits — we always want to be able to exit) with the
-        edge filter if one is configured.
-
-        `symbol` is passed through to symbol-aware filters (those that
-        implement a `set_symbol` method, e.g. EarningsBlackout). Filters
-        that don't need the symbol ignore it — backwards compatible.
-        """
-        raw = self._raw_signals(df)
+    def _aligned_edge_gate(
+        self, df: pd.DataFrame, *, symbol: str = ""
+    ) -> pd.Series | None:
+        """Return the aligned edge-filter gate for `df`, if configured."""
         if self._edge_filter is None:
-            return raw
-
+            return None
         # Inject symbol into filters that declare set_symbol().
         if symbol and hasattr(self._edge_filter, "set_symbol"):
             self._edge_filter.set_symbol(symbol)
@@ -142,12 +134,41 @@ class BaseStrategy(ABC):
         # from raw values to sidestep the pandas fillna-downcast FutureWarning.
         reindexed = gate.reindex(df.index)
         values = [bool(v) if pd.notna(v) else False for v in reindexed]
-        gate_aligned = pd.Series(values, index=df.index, dtype=bool)
+        return pd.Series(values, index=df.index, dtype=bool)
 
-        return SignalFrame(
+    def inspect_signals(
+        self, df: pd.DataFrame, *, symbol: str = ""
+    ) -> tuple[SignalFrame, SignalFrame, bool | None]:
+        """
+        Return raw signals, filtered signals, and the current edge-filter state.
+
+        The final value is:
+          - `True` / `False` when an edge filter exists
+          - `None` when the strategy has no edge filter configured
+        """
+        raw = self._raw_signals(df)
+        gate_aligned = self._aligned_edge_gate(df, symbol=symbol)
+        if gate_aligned is None:
+            return raw, raw, None
+        filtered = SignalFrame(
             entries=(raw.entries & gate_aligned),
             exits=raw.exits,
         )
+        return raw, filtered, bool(gate_aligned.iloc[-1]) if not gate_aligned.empty else False
+
+    def generate_signals(self, df: pd.DataFrame, *, symbol: str = "") -> SignalFrame:
+        """
+        Public entry point. Computes raw signals, then AND-gates entries
+        (but not exits — we always want to be able to exit) with the
+        edge filter if one is configured.
+
+        `symbol` is passed through to symbol-aware filters (those that
+        implement a `set_symbol` method, e.g. EarningsBlackout). Filters
+        that don't need the symbol ignore it — backwards compatible.
+        """
+        _raw, filtered, _edge_allowed = self.inspect_signals(df, symbol=symbol)
+        return filtered
+
 
 
 # ── Scanner ─────────────────────────────────────────────────────────────────
