@@ -101,6 +101,7 @@ Research artifacts:
 - static-universe selection report: `docs/reports/rsi_static_universe_latest.md`
 - static-universe backtest report: `docs/reports/rsi_static_backtest_report_latest.md`
 - hybrid comparison report: `docs/reports/rsi_hybrid_comparison.md`
+- combined-portfolio backtest report: `docs/reports/rsi_portfolio_backtest_latest.md`
 
 ## Static Universe Rule
 
@@ -206,6 +207,41 @@ The first assembly step is mechanical, but final promotion is discretionary.
 The report should surface promising-but-imperfect names instead of silently
 dropping them.
 
+## Published Results
+
+### Per-Symbol Static Basket Summary
+
+From `docs/reports/rsi_static_backtest_report_latest.md` over
+`2021-05-02` to `2026-05-01` using the exact project RSI logic:
+
+- symbols tested: `24`
+- total trades across the basket: `150`
+- trades per month across the basket: `2.50`
+- average per-symbol strategy return: `126.5%`
+- median per-symbol strategy return: `116.3%`
+- average per-symbol Sharpe: `1.08`
+- median per-symbol Sharpe: `1.06`
+- average per-symbol max drawdown: `-26.3%`
+- median per-symbol max drawdown: `-24.5%`
+- average per-symbol win rate: `90.0%`
+
+This is a per-symbol aggregate, not a shared-capital portfolio simulation.
+
+### True Combined-Portfolio RSI Basket Summary
+
+From `docs/reports/rsi_portfolio_backtest_latest.md` using one shared-capital
+equity curve per basket, equal cash splits on same-day entries, and
+`max_positions=5`:
+
+| Basket | Return | CAGR | Sharpe | Sortino | MaxDD | Trades | Final Equity |
+|---|---:|---:|---:|---:|---:|---:|---:|
+| `current` | 193.4% | 24.1% | 0.86 | 1.18 | -39.6% | 18 | $293,389.32 |
+| `static` | 520.0% | 44.1% | 1.17 | 1.50 | -53.9% | 21 | $619,951.66 |
+| `hybrid2` | 450.2% | 40.7% | 1.08 | 1.36 | -53.9% | 18 | $550,156.92 |
+
+This table is the authoritative source for true portfolio-level Sharpe across
+the tested RSI baskets.
+
 ## Rebuild Workflow
 
 ### 1. Run The Focused Test Suite
@@ -253,8 +289,7 @@ Command used for the current static basket:
   --lookback-days 1825 \
   --feed sip \
   --end-delay-minutes 60 \
-  --output docs/reports/rsi_static_backtest_report_latest.md \
-  --chart-dir docs/reports/rsi_static_backtests
+  --output docs/reports/rsi_static_backtest_report_latest.md
 ```
 
 This reproduces the exact RSI backtest settings used for the published static
@@ -276,22 +311,60 @@ universe report:
 Outputs:
 
 - `docs/reports/rsi_static_backtest_report_latest.md`
-- `docs/reports/rsi_static_backtests/`
 
-### 4. Review The Result
+Optional local diagnostics:
+
+```bash
+/Users/franco/trading-bot/venv/bin/python scripts/rsi_backtest_report.py \
+  --symbols IBM ABBV CRDO WFC CVX ANET IONQ CAT OXY BE XOM RTX AXP BKNG BAC GS CEG LMT WMT LLY PG LIN AMGN TMUS \
+  --comparisons ARM SPG \
+  --lookback-days 1825 \
+  --feed sip \
+  --end-delay-minutes 60 \
+  --output docs/reports/rsi_static_backtest_report_latest.md \
+  --chart-dir docs/reports/rsi_static_backtests
+```
+
+The PNG charts are optional local research artifacts and do not need to be
+committed to GitHub to verify the published markdown results.
+
+### 4. Publish The True Combined-Portfolio Backtest
+
+```bash
+/Users/franco/trading-bot/venv/bin/python scripts/rsi_portfolio_backtest.py \
+  --feed sip \
+  --end-delay-minutes 60 \
+  --max-positions 5 \
+  --output docs/reports/rsi_portfolio_backtest_latest.md
+```
+
+Optional local portfolio charts:
+
+```bash
+/Users/franco/trading-bot/venv/bin/python scripts/rsi_portfolio_backtest.py \
+  --feed sip \
+  --end-delay-minutes 60 \
+  --max-positions 5 \
+  --output docs/reports/rsi_portfolio_backtest_latest.md \
+  --chart-dir docs/reports/rsi_portfolio_backtests
+```
+
+### 5. Review The Result
 
 Open:
 
 - `docs/reports/rsi_static_universe_latest.md`
 - `docs/reports/rsi_static_backtest_report_latest.md`
+- `docs/reports/rsi_portfolio_backtest_latest.md`
 
 Review, in order:
 
 1. final basket summary vs current `RSI_WATCHLIST`
 2. ranked universe and any `WATCH` names in the assembled basket
 3. near misses blocked by sector caps
-4. exact per-symbol backtest results and charts
-5. whether total basket trade count remains in the desired range
+4. exact per-symbol backtest results
+5. true combined-portfolio Sharpe, CAGR, and drawdown
+6. whether total basket trade count remains in the desired range
 
 ## Hybrid Follow-Up
 
@@ -318,9 +391,10 @@ Promote a new static RSI watchlist only after:
 
 1. the static-universe report is generated successfully
 2. the dedicated backtest report is published successfully
-3. the final basket clearly beats or justifies replacing the current promoted list
-4. any remaining `WATCH` names are reviewed manually
-5. the user approves the promoted basket
+3. the combined-portfolio backtest is published successfully
+4. the final basket clearly beats or justifies replacing the current promoted list
+5. any remaining `WATCH` names are reviewed manually
+6. the user approves the promoted basket
 
 ## Recommended Cadence
 
@@ -329,5 +403,6 @@ Quarterly rebuild:
 1. rerun the focused tests
 2. rebuild the static-universe report
 3. refresh the dedicated backtest report
-4. review any hybrid opportunities
-5. decide whether to keep, hybridize, or promote
+4. refresh the combined-portfolio backtest report
+5. review any hybrid opportunities
+6. decide whether to keep, hybridize, or promote

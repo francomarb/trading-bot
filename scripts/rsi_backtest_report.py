@@ -48,7 +48,24 @@ class SymbolBacktest:
     event_hit_rate: float
     avg_event_return: float
     stop_failures: int
-    chart_path: Path
+    chart_path: Path | None
+
+
+@dataclass(frozen=True)
+class BasketAggregate:
+    """Aggregate per-symbol summary metrics for one promoted basket."""
+
+    symbol_count: int
+    total_trades: int
+    trades_per_month: float
+    avg_return: float
+    median_return: float
+    avg_sharpe: float
+    median_sharpe: float
+    avg_max_drawdown: float
+    median_max_drawdown: float
+    avg_profit_factor_capped: float
+    avg_win_rate: float
 
 
 def run_symbol_backtests(
@@ -58,7 +75,7 @@ def run_symbol_backtests(
     comparisons: list[str],
     backtest_config: BacktestConfig,
     validation_config: ValidationConfig,
-    chart_dir: Path,
+    chart_dir: Path | None,
 ) -> list[SymbolBacktest]:
     """Run exact RSI backtests and save charts for all requested symbols."""
     out: list[SymbolBacktest] = []
@@ -80,7 +97,7 @@ def run_symbol_backtests(
             continue
 
         result = run_backtest(strategy, clean, backtest_config, symbol=symbol)
-        chart_path = save_equity_chart(result, chart_dir)
+        chart_path = save_equity_chart(result, chart_dir) if chart_dir is not None else None
         events = extract_oversold_events(clean, symbol=symbol, config=validation_config)
         buy_hold_return = float(clean["close"].iloc[-1] / clean["close"].iloc[0] - 1.0)
         out.append(
@@ -141,14 +158,12 @@ def render_report(
 
     lines.extend(
         [
-            "| Group | Symbol | Trades | Return | CAGR | Sharpe | Sortino | MaxDD | MaxDD Days | Win % | PF | Expectancy | Final Equity | Buy/Hold | Events | Hit % | Avg10d | Stops | Chart |",
-            "|---|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---|",
+            "| Group | Symbol | Trades | Return | CAGR | Sharpe | Sortino | MaxDD | MaxDD Days | Win % | PF | Expectancy | Final Equity | Buy/Hold | Events | Hit % | Avg10d | Stops |",
+            "|---|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|",
         ]
     )
     for row in sorted(rows, key=lambda r: (r.group != "promoted", r.symbol)):
         stats = row.result.stats
-        chart = row.chart_path
-        chart_link = f"[chart]({chart})"
         lines.append(
             "| "
             f"{row.group} | {row.symbol} | {int(stats['trade_count'])} | "
@@ -159,27 +174,28 @@ def render_report(
             f"${stats['expectancy']:,.2f} | ${stats['final_equity']:,.2f} | "
             f"{_fmt_pct(row.buy_hold_return)} | {row.event_count} | "
             f"{_fmt_pct(row.event_hit_rate)} | {_fmt_pct(row.avg_event_return)} | "
-            f"{row.stop_failures} | {chart_link} |"
+            f"{row.stop_failures} |"
         )
 
     promoted_rows = [row for row in rows if row.group == "promoted"]
     if promoted_rows:
-        avg_return = _mean([row.result.stats["total_return"] for row in promoted_rows])
-        avg_drawdown = _mean([row.result.stats["max_drawdown"] for row in promoted_rows])
-        avg_pf = _mean([
-            8.0 if math.isinf(row.result.stats["profit_factor"])
-            else row.result.stats["profit_factor"]
-            for row in promoted_rows
-        ])
+        aggregate = _summarize_rows(promoted_rows, start=start, end=end)
         lines.extend(
             [
                 "",
                 "## Promoted Pool Aggregate",
                 "",
-                f"- Average per-symbol strategy return: {_fmt_pct(avg_return)}",
-                f"- Average per-symbol max drawdown: {_fmt_pct(avg_drawdown)}",
-                f"- Average capped profit factor: {_fmt_float(avg_pf)}",
-                f"- Symbols tested: {len(promoted_rows)}",
+                f"- Symbols tested: {aggregate.symbol_count}",
+                f"- Total trades across the basket: {aggregate.total_trades}",
+                f"- Trades per month across the basket: {aggregate.trades_per_month:.2f}",
+                f"- Average per-symbol strategy return: {_fmt_pct(aggregate.avg_return)}",
+                f"- Median per-symbol strategy return: {_fmt_pct(aggregate.median_return)}",
+                f"- Average per-symbol Sharpe: {_fmt_float(aggregate.avg_sharpe)}",
+                f"- Median per-symbol Sharpe: {_fmt_float(aggregate.median_sharpe)}",
+                f"- Average per-symbol max drawdown: {_fmt_pct(aggregate.avg_max_drawdown)}",
+                f"- Median per-symbol max drawdown: {_fmt_pct(aggregate.median_max_drawdown)}",
+                f"- Average capped profit factor: {_fmt_float(aggregate.avg_profit_factor_capped)}",
+                f"- Average per-symbol win rate: {_fmt_pct(aggregate.avg_win_rate)}",
             ]
         )
 
@@ -193,7 +209,7 @@ def render_report(
             "- ATR stop counts are contextual event diagnostics; the vectorbt run does not execute broker OTO stop legs.",
             "- Buy/Hold is shown only as context. RSI is a tactical strategy, so it can lag buy-and-hold in strong trends.",
             "- Large max drawdown means the current RSI exit/stop behavior still needs paper validation before activation.",
-            "- Charts are saved alongside the report for visual inspection of equity curve pain periods.",
+            "- Equity charts are optional local artifacts and are not required to verify the published markdown metrics.",
         ]
     )
     return "\n".join(lines)
@@ -203,6 +219,43 @@ def _mean(values: list[float | bool]) -> float:
     if not values:
         return 0.0
     return float(sum(float(value) for value in values) / len(values))
+
+
+def _summarize_rows(
+    rows: list[SymbolBacktest],
+    *,
+    start: datetime,
+    end: datetime,
+) -> BasketAggregate:
+    """Aggregate per-symbol metrics for report-friendly basket summaries."""
+    returns = [float(row.result.stats["total_return"]) for row in rows]
+    sharpes = [float(row.result.stats.get("sharpe", float("nan"))) for row in rows]
+    max_dds = [float(row.result.stats["max_drawdown"]) for row in rows]
+    pfs = []
+    win_rates = []
+    total_trades = 0
+    for row in rows:
+        pf = float(row.result.stats["profit_factor"])
+        pfs.append(8.0 if math.isinf(pf) else pf)
+        win_rates.append(float(row.result.stats["win_rate"]))
+        total_trades += int(row.result.stats["trade_count"])
+
+    total_days = max((end - start).days, 1)
+    trades_per_month = total_trades / max(total_days / 30.4375, 1e-9)
+
+    return BasketAggregate(
+        symbol_count=len(rows),
+        total_trades=total_trades,
+        trades_per_month=trades_per_month,
+        avg_return=float(pd.Series(returns).mean()),
+        median_return=float(pd.Series(returns).median()),
+        avg_sharpe=float(pd.Series(sharpes).mean()),
+        median_sharpe=float(pd.Series(sharpes).median()),
+        avg_max_drawdown=float(pd.Series(max_dds).mean()),
+        median_max_drawdown=float(pd.Series(max_dds).median()),
+        avg_profit_factor_capped=float(pd.Series(pfs).mean()),
+        avg_win_rate=float(pd.Series(win_rates).mean()),
+    )
 
 
 def _fmt_pct(value: float) -> str:
@@ -262,8 +315,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--chart-dir",
         type=Path,
-        default=Path("logs/rsi_backtests"),
-        help="Directory for equity/drawdown charts.",
+        default=None,
+        help="Optional directory for equity/drawdown charts.",
     )
     parser.add_argument("--verbose", action="store_true", help="Enable debug logging.")
     return parser.parse_args()
