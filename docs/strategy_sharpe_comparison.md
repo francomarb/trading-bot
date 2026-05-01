@@ -1,6 +1,6 @@
 # Strategy Sharpe Comparison
 
-**Generated:** 2026-04-30T12:10:25.219635+00:00
+**Generated:** 2026-05-01T12:43:02.101718+00:00
 
 This is a snapshot reference comparing the three strategies (`SMACrossover`, `RSIReversion`, `BollingerSqueeze`) under identical backtest settings. Re-run via `python scripts/compare_strategy_sharpes.py`.
 
@@ -24,10 +24,10 @@ This is a snapshot reference comparing the three strategies (`SMACrossover`, `RS
 | Strategy | Universe (kind) | Symbols traded / total | Sharpe | MeanRet | MeanDD | Trades | WinRate |
 |----------|-----------------|-----------------------:|------:|------:|-----:|------:|------:|
 | SMA Crossover (20/50) | SMA_WATCHLIST (static, periodically rotated by scripts/sma_watchlist_scan.py) | 18/18 | +0.33 | +37.3% | -20.8% | 58 | 51.7% |
-| RSI Reversion (14, 30/70) | RSI_WATCHLIST (static snapshot of dynamic scanner output — see caveat below) | 4/10 | +0.19 | +2.7% | -9.6% | 8 | 50.0% |
+| RSI Reversion (14, 30/70) | RSI_WATCHLIST (static snapshot of dynamic scanner output — see caveat below) | 15/28 | +0.31 | +3.9% | -10.7% | 22 | 63.6% |
 | BB Squeeze (bb=10, kc=10, min=6, roc=5) | Sector ETFs (GICS SPDRs — selected by universe research) | 11/11 | +0.22 | +3.5% | -7.7% | 98 | 46.9% |
-| BB Squeeze (aggressive 10/4/3) | AI / Big-Tech / Semis (user thesis universe) | 23/23 | +0.15 | +13.2% | -25.1% | 292 | 41.8% |
-| Donchian Breakout (30/15, mid-range) | AI / Big-Tech / Semis (DONCHIAN_WATCHLIST — universe research winner) | 23/23 | +0.80 | +144.8% | -35.1% | 323 | 50.2% |
+| BB Squeeze (aggressive 10/4/3) | AI / Big-Tech / Semis (user thesis universe) | 32/32 | +0.17 | +13.6% | -26.8% | 394 | 40.6% |
+| Donchian Breakout (30/15, mid-range) | AI / Big-Tech / Semis (DONCHIAN_WATCHLIST — universe research winner) | 32/32 | +0.87 | +171.1% | -36.3% | 435 | 50.6% |
 
 ## Universe details
 
@@ -40,8 +40,8 @@ This is a snapshot reference comparing the three strategies (`SMACrossover`, `RS
 ### RSI Reversion (14, 30/70)
 
 - **Universe kind:** RSI_WATCHLIST (static snapshot of dynamic scanner output — see caveat below)
-- **Symbols (10):** `ALLY, CDNS, KBE, SN, DINO, BA, TFC, HON, TMUS, JNJ`
-- **Symbols that produced any trade:** 4 of 10
+- **Symbols (28):** `ALLY, CDNS, KBE, SN, BA, TFC, HON, TMUS, JNJ, CCK, ABNB, PG, SPG, MA, LMT, MCD, AAPL, ANET, CAT, CIEN, MCO, AMZN, EQIX, RTX, META, HD, SOFI, ARM`
+- **Symbols that produced any trade:** 15 of 28
 
 ### BB Squeeze (bb=10, kc=10, min=6, roc=5)
 
@@ -52,14 +52,14 @@ This is a snapshot reference comparing the three strategies (`SMACrossover`, `RS
 ### BB Squeeze (aggressive 10/4/3)
 
 - **Universe kind:** AI / Big-Tech / Semis (user thesis universe)
-- **Symbols (23):** `NVDA, AMD, AVGO, SMCI, TSM, MU, QCOM, ARM, MRVL, ANET, VRT, MSFT, AAPL, GOOGL, META, AMZN, ORCL, TSLA, PLTR, CRWD, NOW, IREN, IONQ`
-- **Symbols that produced any trade:** 23 of 23
+- **Symbols (32):** `NVDA, AMD, AVGO, SMCI, TSM, MU, QCOM, ARM, MRVL, ANET, VRT, MSFT, AAPL, GOOGL, META, AMZN, ORCL, TSLA, PLTR, CRWD, NOW, IREN, IONQ, ASML, CLS, CIEN, CEG, VST, BE, PWR, RGTI, QBTS`
+- **Symbols that produced any trade:** 32 of 32
 
 ### Donchian Breakout (30/15, mid-range)
 
 - **Universe kind:** AI / Big-Tech / Semis (DONCHIAN_WATCHLIST — universe research winner)
-- **Symbols (23):** `NVDA, AMD, AVGO, SMCI, TSM, MU, QCOM, ARM, MRVL, ANET, VRT, MSFT, AAPL, GOOGL, META, AMZN, ORCL, TSLA, PLTR, CRWD, NOW, IREN, IONQ`
-- **Symbols that produced any trade:** 23 of 23
+- **Symbols (32):** `NVDA, AMD, AVGO, SMCI, TSM, MU, QCOM, ARM, MRVL, ANET, VRT, MSFT, AAPL, GOOGL, META, AMZN, ORCL, TSLA, PLTR, CRWD, NOW, IREN, IONQ, ASML, CLS, CIEN, CEG, VST, BE, PWR, RGTI, QBTS`
+- **Symbols that produced any trade:** 32 of 32
 
 ## Methodology caveats
 
