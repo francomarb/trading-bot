@@ -141,6 +141,8 @@ SYMBOL_SECTOR_OVERRIDES: dict[str, str] = {
     "GOOGL": "technology",
     "META":  "technology",
     "IREN":  "technology",   # AI cloud services (Microsoft $9.7B contract); yfinance maps to financials via legacy Bitcoin mining SIC
+    "AMZN":  "technology",   # AWS + AI cloud dominate revenue and valuation; GICS maps to Consumer Discretionary
+    "TSLA":  "technology",   # AI, autonomous driving, software-defined vehicle; GICS maps to Consumer Discretionary
 }
 
 SECTOR_ETFS: dict[str, str] = {
