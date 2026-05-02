@@ -1,6 +1,6 @@
 # Sector Heat Report
 
-_Generated 2026-05-02 14:15 UTC_
+_Generated 2026-05-02 14:22 UTC_
 
 ## Summary
 
@@ -103,6 +103,7 @@ _No watched symbols in this sector._
 | GOOG | `SMA` |
 | GOOGL | `SMA` `DON` |
 | IONQ | `DON` |
+| IREN | `DON` |
 | META | `RSI` `DON` |
 | MSFT | `DON` |
 | NOW | `DON` |
@@ -130,7 +131,6 @@ _No watched symbols in this sector._
 | BK | `SMA` |
 | BMO | `SMA` |
 | CM | `SMA` |
-| IREN | `DON` |
 | MA | `RSI` |
 | MCO | `RSI` |
 | MS | `SMA` |
