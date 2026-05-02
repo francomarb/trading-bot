@@ -6,9 +6,14 @@ The gauge itself is a context provider (never blocks).  This filter
 translates gauge output into an edge-filter boolean using a configurable
 ``sector_entry_policy``:
 
-  "block"  → COLD sector returns False (entry blocked)
-  "warn"   → COLD sector logs a warning but returns True (entry allowed)
+  "block"  → triggered sector score returns False (entry blocked)
+  "warn"   → triggered sector score logs a warning but returns True (entry allowed)
   "pass"   → no action regardless of sector state
+
+By default the trigger is the global COLD classification (score ≤ -2).
+Pass ``score_threshold`` to override with a raw score boundary — useful
+for mean-reversion strategies that should only block on genuine freefall
+rather than a mild pullback (e.g. ``score_threshold=-3`` allows score=-2).
 
 Exits are never affected — this filter is only used on the entry path
 (enforced by ``BaseStrategy.generate_signals``).
@@ -36,9 +41,13 @@ class SectorMomentumFilter:
     resolver
         The ``SectorResolver`` for looking up a stock's sector.
     sector_entry_policy
-        What to do when the sector is COLD:
+        What to do when triggered:
         ``"block"`` (return False), ``"warn"`` (log + return True),
         ``"pass"`` (ignore).
+    score_threshold
+        Optional raw score boundary. When set, the filter triggers when
+        ``detail.score <= score_threshold`` instead of using the COLD
+        classification. Default ``None`` uses the global COLD threshold.
     """
 
     def __init__(
@@ -46,12 +55,14 @@ class SectorMomentumFilter:
         gauge: SectorMomentumGauge,
         resolver: SectorResolver,
         sector_entry_policy: str = "block",
+        score_threshold: int | None = None,
     ) -> None:
         if sector_entry_policy not in ("block", "warn", "pass"):
             raise ValueError(f"sector_entry_policy must be block/warn/pass, got {sector_entry_policy!r}")
         self._gauge = gauge
         self._resolver = resolver
         self._sector_entry_policy = sector_entry_policy
+        self._score_threshold = score_threshold
         self._symbol: str = ""
 
     def set_symbol(self, symbol: str) -> None:
@@ -72,7 +83,12 @@ class SectorMomentumFilter:
         detail = self._gauge.get_details(sector)
 
         from sector.gauge import SectorMomentum
-        if detail.classification == SectorMomentum.COLD:
+        if self._score_threshold is not None:
+            triggered = detail.score <= self._score_threshold
+        else:
+            triggered = detail.classification == SectorMomentum.COLD
+
+        if triggered:
             signal_str = (
                 f">SMA200={detail.above_sma200}, >SMA50={detail.above_sma50}, "
                 f"golden_cross={detail.golden_cross}, "
@@ -83,7 +99,7 @@ class SectorMomentumFilter:
                 logger.info(
                     f"SECTOR GATE [block]: {self._symbol} "
                     f"({sector}/{detail.etf_ticker}) "
-                    f"score={detail.score} [COLD]\n"
+                    f"score={detail.score}\n"
                     f"  signals: {signal_str}"
                 )
                 return pd.Series(False, index=df.index, dtype=bool)
@@ -91,7 +107,7 @@ class SectorMomentumFilter:
                 logger.info(
                     f"SECTOR GATE [warn]: {self._symbol} "
                     f"({sector}/{detail.etf_ticker}) "
-                    f"score={detail.score} [COLD]\n"
+                    f"score={detail.score}\n"
                     f"  signals: {signal_str}"
                 )
 

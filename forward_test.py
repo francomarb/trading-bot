@@ -161,6 +161,7 @@ def main() -> None:
                     SectorMomentumFilter(
                         gauge=sector_gauge, resolver=sector_resolver,
                         sector_entry_policy="block",
+                        score_threshold=-3,
                     ),
                 ]),
             ),

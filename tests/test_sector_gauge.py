@@ -305,6 +305,57 @@ class TestSectorMomentumFilter:
         assert result.all()
         resolver.resolve.assert_not_called()
 
+    def _make_detail(self, score: int, classification):
+        detail = MagicMock()
+        detail.score = score
+        detail.classification = classification
+        detail.etf_ticker = "SMH"
+        detail.above_sma200 = False
+        detail.above_sma50 = False
+        detail.golden_cross = False
+        detail.dist_sma50_pct = -0.05
+        detail.vol_confirm = False
+        return detail
+
+    def test_score_threshold_blocks_at_threshold(self):
+        """score_threshold=-3 blocks when score == -3."""
+        from strategies.filters.sector_momentum import SectorMomentumFilter
+        gauge = MagicMock()
+        resolver = MagicMock()
+        f = SectorMomentumFilter(gauge=gauge, resolver=resolver,
+                                 sector_entry_policy="block", score_threshold=-3)
+        resolver.resolve.return_value = "semiconductors"
+        gauge.get_details.return_value = self._make_detail(-3, SectorMomentum.COLD)
+        f.set_symbol("NVDA")
+        result = f(self._make_df())
+        assert not result.any()
+
+    def test_score_threshold_allows_score_above_threshold(self):
+        """score_threshold=-3 allows score == -2 (sector rolled over but not in freefall)."""
+        from strategies.filters.sector_momentum import SectorMomentumFilter
+        gauge = MagicMock()
+        resolver = MagicMock()
+        f = SectorMomentumFilter(gauge=gauge, resolver=resolver,
+                                 sector_entry_policy="block", score_threshold=-3)
+        resolver.resolve.return_value = "semiconductors"
+        gauge.get_details.return_value = self._make_detail(-2, SectorMomentum.COLD)
+        f.set_symbol("NVDA")
+        result = f(self._make_df())
+        assert result.all()
+
+    def test_score_threshold_none_falls_back_to_classification(self):
+        """No score_threshold → uses COLD classification (default behaviour)."""
+        from strategies.filters.sector_momentum import SectorMomentumFilter
+        gauge = MagicMock()
+        resolver = MagicMock()
+        f = SectorMomentumFilter(gauge=gauge, resolver=resolver,
+                                 sector_entry_policy="block", score_threshold=None)
+        resolver.resolve.return_value = "semiconductors"
+        gauge.get_details.return_value = self._make_detail(-2, SectorMomentum.COLD)
+        f.set_symbol("NVDA")
+        result = f(self._make_df())
+        assert not result.any()  # COLD classification still triggers without threshold
+
     def test_invalid_sector_entry_policy_raises(self):
         from strategies.filters.sector_momentum import SectorMomentumFilter
         gauge = MagicMock()
