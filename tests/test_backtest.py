@@ -256,9 +256,14 @@ class TestComputeStats:
 
 
 class TestSaveEquityChart:
-    def test_writes_png(self, tmp_path: Path):
+    def test_writes_png(self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
         df = _trending_df(150)
         r = run_backtest(SMACrossover(10, 30), df, symbol="SYN")
+
+        def fake_render(_result: BacktestResult, path: Path) -> None:
+            path.write_bytes(b"\x89PNG\r\n\x1a\n" + b"0" * 2048)
+
+        monkeypatch.setattr("backtest.runner._render_equity_chart", fake_render)
         p = save_equity_chart(r, out_dir=tmp_path)
         assert p.exists()
         assert p.suffix == ".png"

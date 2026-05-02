@@ -50,6 +50,7 @@ import time
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
 from typing import TYPE_CHECKING
+from zoneinfo import ZoneInfo
 
 import pandas as pd
 from loguru import logger
@@ -105,6 +106,8 @@ _CALENDAR_DAYS_PER_BAR: dict[str, float] = {
     "1Hour": 1.0 / 6.5,
     "1Min": 1.0 / (6.5 * 60),
 }
+
+_NEW_YORK_TZ = ZoneInfo("America/New_York")
 
 
 def _lookback_days(required_bars: int, timeframe: str, config_lookback: int) -> int:
@@ -261,6 +264,12 @@ class TradingEngine:
         # Latest per-strategy watchlist statuses for dashboard display.
         # strategy_name -> {symbol -> status}
         self._watchlist_statuses: dict[str, dict[str, str]] = {}
+
+        # Daily decision gate: (strategy_name, symbol, timeframe) → completed-bar
+        # timestamp already evaluated this session. This prevents the 5-minute
+        # loop from reprocessing the same daily signal bar all day long.
+        self._processed_signal_bars: dict[tuple[str, str, str], pd.Timestamp] = {}
+        self._processed_signal_statuses: dict[tuple[str, str, str], str] = {}
 
     # ── Lifecycle ────────────────────────────────────────────────────────
 
@@ -531,6 +540,7 @@ class TradingEngine:
                             running_account,
                             slot.strategy,
                             slot.timeframe,
+                            market_open=market_open,
                             entry_allowed=entry_allowed,
                             order_strategy=order_strategy,
                             strategy_statuses=strategy_statuses,
@@ -587,6 +597,7 @@ class TradingEngine:
         strategy: BaseStrategy,
         timeframe: str,
         *,
+        market_open: bool | None = None,
         entry_allowed: bool = True,
         order_strategy: dict[str, str] | None = None,
         strategy_statuses: dict[str, str] | None = None,
@@ -622,8 +633,27 @@ class TradingEngine:
             self.alerts.stale_data(symbol, str(e))
             return
 
+        decision_df, using_prior_completed_bar = self._decision_frame(
+            df, timeframe, market_open=market_open
+        )
+        if decision_df.empty:
+            logger.info(
+                f"[{strategy.name}] {symbol}: skipping — no completed {timeframe} bar available yet"
+            )
+            return
+
+        signal_bar = pd.Timestamp(decision_df.index[-1])
+        signal_key = (strategy.name, symbol, timeframe)
+        if self._should_skip_processed_signal_bar(signal_key, signal_bar):
+            if (
+                strategy_statuses is not None
+                and signal_key in self._processed_signal_statuses
+            ):
+                strategy_statuses[symbol] = self._processed_signal_statuses[signal_key]
+            return
+
         # 3. Indicators (just ATR — strategy adds its own).
-        df = add_atr(df, self.config.atr_length)
+        df = add_atr(decision_df, self.config.atr_length)
         atr_col = f"atr_{self.config.atr_length}"
         latest_atr = float(df[atr_col].iloc[-1])
         latest_close = float(df["close"].iloc[-1])
@@ -645,6 +675,11 @@ class TradingEngine:
             f"entry={last_entry} exit={last_exit} "
             f"position={'OPEN ' + str(position.qty) if position else 'flat'}"
         )
+        if using_prior_completed_bar:
+            logger.debug(
+                f"[{strategy.name}] {symbol}: using prior completed {timeframe} bar "
+                f"{latest_ts.isoformat()} for live decisions"
+            )
 
         # 5. Exit branch — close before considering entries (always safe to
         # reduce risk; never blocked by halt).
@@ -656,12 +691,18 @@ class TradingEngine:
                     f"[{strategy.name}] {symbol}: exit signal ignored — "
                     f"position owned by '{owner}'"
                 )
+                self._mark_signal_bar_processed(
+                    signal_key, signal_bar, strategy_statuses, symbol
+                )
                 return
             if self._has_pending_close_order(symbol, snapshot):
                 if strategy_statuses is not None:
                     strategy_statuses[symbol] = "Pending Exit"
                 logger.info(
                     f"{symbol}: exit signal but a close order is already pending — skipping"
+                )
+                self._mark_signal_bar_processed(
+                    signal_key, signal_bar, strategy_statuses, symbol
                 )
                 return
             try:
@@ -687,6 +728,9 @@ class TradingEngine:
                 # Release ownership and cached entry price.
                 self._position_owners.pop(symbol, None)
                 self._entry_prices.pop(symbol, None)
+                self._mark_signal_bar_processed(
+                    signal_key, signal_bar, strategy_statuses, symbol
+                )
             except Exception as e:
                 logger.error(f"{symbol}: close_position failed: {e}")
                 self.risk.record_broker_error()
@@ -704,6 +748,9 @@ class TradingEngine:
                     and current_status == "No Signal"
                 ):
                     strategy_statuses[symbol] = "Filter Blocked"
+            self._mark_signal_bar_processed(
+                signal_key, signal_bar, strategy_statuses, symbol
+            )
             return
         if not entry_allowed:
             if position is None and strategy_statuses is not None:
@@ -711,17 +758,26 @@ class TradingEngine:
             logger.debug(
                 f"[{strategy.name}] {symbol}: entry blocked by regime gate"
             )
+            self._mark_signal_bar_processed(
+                signal_key, signal_bar, strategy_statuses, symbol
+            )
             return
         if self._startup_mode != "NORMAL":
             logger.info(
                 f"[{strategy.name}] {symbol}: entry blocked — "
                 f"startup_mode={self._startup_mode}"
             )
+            self._mark_signal_bar_processed(
+                signal_key, signal_bar, strategy_statuses, symbol
+            )
             return
         if position is not None:
             # Already in this position — the crossover bar persists across
             # intra-day cycles, so this is expected noise, not a real signal.
             # Risk would reject anyway; skip to avoid spamming alerts.
+            self._mark_signal_bar_processed(
+                signal_key, signal_bar, strategy_statuses, symbol
+            )
             return
 
         # Sleeve check — must pass before risk sizing.
@@ -745,6 +801,9 @@ class TradingEngine:
                 self.alerts.order_rejection(
                     symbol, strategy.name, sleeve.message, sleeve.code.value
                 )
+                self._mark_signal_bar_processed(
+                    signal_key, signal_bar, strategy_statuses, symbol
+                )
                 return None
             notional_cap = sleeve.per_position_notional
 
@@ -763,6 +822,9 @@ class TradingEngine:
             self.alerts.order_rejection(
                 symbol, strategy.name, decision.message, decision.code.value
             )
+            self._mark_signal_bar_processed(
+                signal_key, signal_bar, strategy_statuses, symbol
+            )
             return None
         assert isinstance(decision, RiskDecision)
 
@@ -774,6 +836,9 @@ class TradingEngine:
                 )
                 if strategy_statuses is not None:
                     strategy_statuses[symbol] = "Pending Entry"
+                self._mark_signal_bar_processed(
+                    signal_key, signal_bar, strategy_statuses, symbol
+                )
                 return None
             self._record_fill(
                 result,
@@ -797,6 +862,9 @@ class TradingEngine:
                     price=fill_price,
                     reason=sig.reason,
                 )
+                self._mark_signal_bar_processed(
+                    signal_key, signal_bar, strategy_statuses, symbol
+                )
                 return Position(
                     symbol=symbol,
                     qty=fill_qty,
@@ -805,11 +873,76 @@ class TradingEngine:
                 )
             if strategy_statuses is not None:
                 strategy_statuses[symbol] = "Pending Entry"
+            self._mark_signal_bar_processed(
+                signal_key, signal_bar, strategy_statuses, symbol
+            )
         except Exception as e:
             logger.error(f"{symbol}: place_order raised: {e}")
             self.risk.record_broker_error()
             self.alerts.broker_error(f"{symbol} place_order: {e}")
         return None
+
+    def _decision_frame(
+        self,
+        df: pd.DataFrame,
+        timeframe: str,
+        *,
+        market_open: bool | None,
+    ) -> tuple[pd.DataFrame, bool]:
+        """
+        Return the bars that are safe for live signal generation.
+
+        For Alpaca daily bars, the latest bar during market hours is the current
+        in-progress session, emitted and updated throughout the day. For live
+        daily strategies we therefore drop that bar and trade only on the prior
+        completed daily candle so live matches the backtest contract
+        (signal at bar close, execute next bar open).
+        """
+        if (
+            timeframe != "1Day"
+            or not market_open
+            or df.empty
+        ):
+            return df, False
+
+        latest_ts = pd.Timestamp(df.index[-1])
+        latest_ny = latest_ts.tz_convert(_NEW_YORK_TZ)
+        now_ny = pd.Timestamp(self._clock()).tz_convert(_NEW_YORK_TZ)
+        is_daily_bucket_start = (
+            latest_ny.hour == 0
+            and latest_ny.minute == 0
+            and latest_ny.second == 0
+            and latest_ny.microsecond == 0
+        )
+        if is_daily_bucket_start and latest_ny.date() == now_ny.date():
+            return df.iloc[:-1], True
+        return df, False
+
+    def _should_skip_processed_signal_bar(
+        self,
+        key: tuple[str, str, str],
+        bar_ts: pd.Timestamp,
+    ) -> bool:
+        """True when this completed daily bar was already evaluated earlier."""
+        if key[2] != "1Day":
+            return False
+        return self._processed_signal_bars.get(key) == bar_ts
+
+    def _mark_signal_bar_processed(
+        self,
+        key: tuple[str, str, str],
+        bar_ts: pd.Timestamp,
+        strategy_statuses: dict[str, str] | None,
+        symbol: str,
+    ) -> None:
+        """Remember that this completed daily bar has been handled this session."""
+        if key[2] != "1Day":
+            return
+        self._processed_signal_bars[key] = bar_ts
+        if strategy_statuses is not None:
+            self._processed_signal_statuses[key] = strategy_statuses.get(
+                symbol, "No Signal"
+            )
 
     def _remember_suspect_order(
         self,

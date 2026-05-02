@@ -69,8 +69,10 @@ class FakeStrategy(BaseStrategy):
         super().__init__(edge_filter=edge_filter)
         self._entries = entries
         self._exits = exits
+        self.raw_calls = 0
 
     def _raw_signals(self, df: pd.DataFrame) -> SignalFrame:
+        self.raw_calls += 1
         # Pad/trim to df length.
         n = len(df)
         e = (self._entries + [False] * n)[:n]
@@ -486,6 +488,46 @@ class TestRunOneCycle:
 
         # Even with the first symbol failing, the second placed an order.
         assert broker.place_order.call_count == 1
+
+    def test_market_open_daily_cycle_ignores_in_progress_bar(
+        self, engine_factory, patch_fetch
+    ):
+        # Alpaca daily bars are bucketed at New York midnight. During market
+        # hours the latest such bar is still in progress and must be excluded
+        # from live signal generation.
+        patch_fetch["df"] = _bars(
+            end=datetime(2026, 4, 16, 4, 0, tzinfo=timezone.utc)
+        )
+        engine, broker = engine_factory(
+            entries=[False] * 59 + [True],
+            market_open=True,
+        )
+        engine._session_start_equity = 100_000.0
+        engine._cycle_count = 1
+
+        engine._run_one_cycle()
+
+        broker.place_order.assert_not_called()
+
+    def test_market_open_daily_cycle_processes_completed_bar_only_once(
+        self, engine_factory, patch_fetch
+    ):
+        patch_fetch["df"] = _bars(
+            end=datetime(2026, 4, 16, 4, 0, tzinfo=timezone.utc)
+        )
+        engine, broker = engine_factory(market_open=True)
+        engine._session_start_equity = 100_000.0
+
+        slot = engine.slots[0]
+        assert isinstance(slot.strategy, FakeStrategy)
+
+        engine._cycle_count = 1
+        engine._run_one_cycle()
+        engine._cycle_count = 2
+        engine._run_one_cycle()
+
+        assert slot.strategy.raw_calls == 1
+        broker.place_order.assert_not_called()
 
 
 # ── start() / stop() / max_cycles ────────────────────────────────────────────

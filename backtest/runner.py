@@ -339,28 +339,23 @@ def compute_stats(pf: vbt.Portfolio, initial_cash: float) -> dict[str, float]:
 # ── Equity / drawdown chart ─────────────────────────────────────────────────
 
 
-def save_equity_chart(result: BacktestResult, out_dir: str | Path = "logs/backtests") -> Path:
-    """
-    Save a 2-panel PNG (equity curve + drawdown) to
-    `<out_dir>/<UTC-timestamp>_<strategy>_<symbol>.png`. Returns the path.
-    """
-    # matplotlib import is local so headless test environments aren't forced
-    # to load it just to import this module.
+def _render_equity_chart(result: BacktestResult, path: Path) -> None:
+    """Render the equity/drawdown chart to an already-resolved PNG path."""
+    # Import the non-interactive Agg canvas directly so chart generation avoids
+    # pyplot's heavier global state and stays cheaper in test runs.
     import matplotlib
 
     matplotlib.use("Agg")
-    import matplotlib.pyplot as plt
-
-    out_dir = Path(out_dir)
-    out_dir.mkdir(parents=True, exist_ok=True)
+    from matplotlib.backends.backend_agg import FigureCanvasAgg
+    from matplotlib.figure import Figure
 
     equity = result.equity_curve()
     dd = result.drawdown()
-    ts = pd.Timestamp.utcnow().strftime("%Y%m%dT%H%M%SZ")
-    fname = f"{ts}_{result.strategy_name}_{result.symbol}.png"
-    path = out_dir / fname
 
-    fig, (ax_eq, ax_dd) = plt.subplots(2, 1, figsize=(12, 7), sharex=True)
+    fig = Figure(figsize=(10, 6), tight_layout=True)
+    FigureCanvasAgg(fig)
+    ax_eq = fig.add_subplot(2, 1, 1)
+    ax_dd = fig.add_subplot(2, 1, 2, sharex=ax_eq)
     ax_eq.plot(equity.index, equity.values, color="#1f77b4", lw=1.2)
     ax_eq.axhline(result.config.initial_cash, color="grey", ls="--", lw=0.7)
     ax_eq.set_ylabel("Equity ($)")
@@ -380,9 +375,21 @@ def save_equity_chart(result: BacktestResult, out_dir: str | Path = "logs/backte
     ax_dd.set_xlabel("Date")
     ax_dd.grid(alpha=0.3)
 
-    fig.tight_layout()
-    fig.savefig(path, dpi=120)
-    plt.close(fig)
+    fig.savefig(path, dpi=100)
+
+
+def save_equity_chart(result: BacktestResult, out_dir: str | Path = "logs/backtests") -> Path:
+    """
+    Save a 2-panel PNG (equity curve + drawdown) to
+    `<out_dir>/<UTC-timestamp>_<strategy>_<symbol>.png`. Returns the path.
+    """
+    out_dir = Path(out_dir)
+    out_dir.mkdir(parents=True, exist_ok=True)
+
+    ts = pd.Timestamp.utcnow().strftime("%Y%m%dT%H%M%SZ")
+    fname = f"{ts}_{result.strategy_name}_{result.symbol}.png"
+    path = out_dir / fname
+    _render_equity_chart(result, path)
     return path
 
 

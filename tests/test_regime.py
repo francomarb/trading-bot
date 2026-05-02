@@ -524,6 +524,7 @@ class TestEngineRegimeGate:
             alerts=MagicMock(spec=AlertDispatcher),
             regime_detector=fake_regime,
         )
+        engine._sleep = lambda _seconds: None
 
         return engine, fake_broker
 
@@ -619,8 +620,10 @@ class TestEngineRegimeGate:
         with patch("engine.trader.fetch_symbol", return_value=(bars, SimpleNamespace(api_calls=0))):
             engine.start(max_cycles=2)
 
-        # Both cycles should allow entries (TRENDING allowed).
-        assert broker.place_order.call_count == 2
+        # The signal bar is processed only once per session for daily slots.
+        # Cycle 2 still exercises the regime fallback path, but does not
+        # resubmit the same daily entry signal again.
+        assert broker.place_order.call_count == 1
         assert engine._regime_fail_count == 1
 
     def test_regime_detection_consecutive_failures_fall_to_bear(self):
