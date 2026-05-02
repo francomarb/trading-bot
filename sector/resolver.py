@@ -93,9 +93,19 @@ class SectorResolver:
     def resolve(self, symbol: str) -> str | None:
         """Return normalized sector label or ``None`` if unmappable.
 
-        Only reads from the in-memory cache — never triggers an API call.
+        Checks ``settings.SYMBOL_SECTOR_OVERRIDES`` first so manual
+        corrections survive cache refreshes.  Falls back to the JSON cache.
+        Only reads from cache — never triggers an API call.
         Call ``hydrate()`` at startup to populate the cache.
         """
+        try:
+            from config import settings
+            override = settings.SYMBOL_SECTOR_OVERRIDES.get(symbol)
+            if override is not None:
+                return override
+        except Exception:
+            pass
+
         entry = self._cache.get(symbol)
         if entry is None:
             return None

@@ -132,6 +132,16 @@ REGIME_MAX_CONSECUTIVE_FAILURES: int = 3
 # ── Sector Momentum Gauge ──────────────────────────────────────────────────
 # Normalized sector label → sector ETF ticker.  Used by SectorMomentumGauge
 # to compute per-sector heat scores (HOT / NEUTRAL / COLD).
+# Manual sector overrides — take precedence over yfinance/cache.
+# Use for GICS reclassifications that don't match trading behaviour
+# (e.g. Alphabet and Meta moved to Communication Services in 2018 but
+# trade as technology names).
+SYMBOL_SECTOR_OVERRIDES: dict[str, str] = {
+    "GOOG":  "technology",
+    "GOOGL": "technology",
+    "META":  "technology",
+}
+
 SECTOR_ETFS: dict[str, str] = {
     "technology":     "XLK",
     "semiconductors": "SMH",
