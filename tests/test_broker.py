@@ -315,6 +315,65 @@ class TestPlaceOrderTerminalStates:
         assert api.get_order_by_id.call_count == 2
 
 
+# ── _build_result_from_stream ─────────────────────────────────────────────────
+
+
+class TestBuildResultFromStream:
+    """_build_result_from_stream must use cumulative order fields, not per-event fields.
+
+    update.qty  = quantity filled in this single execution chunk.
+    update.price = price for this single execution chunk.
+    update.order.filled_qty        = cumulative total across all partial fills.
+    update.order.filled_avg_price  = VWAP across all partial fills.
+    Using the per-event fields undercounts position size on multi-execution orders.
+    """
+
+    def _make_update(self, event: str, chunk_qty: float, chunk_price: float,
+                     cum_qty: float, cum_avg_price: float, order_id: str = "ord-1"):
+        order = SimpleNamespace(
+            id=order_id,
+            filled_qty=str(cum_qty),
+            filled_avg_price=str(cum_avg_price),
+        )
+        update = SimpleNamespace(
+            event=SimpleNamespace(value=event),
+            qty=chunk_qty,
+            price=chunk_price,
+            order=order,
+        )
+        return update
+
+    def test_fill_uses_cumulative_qty_not_chunk(self):
+        # 3 partial fills of 4, 2, 0.31 then final chunk of 8 → total 14.31
+        update = self._make_update(
+            event="fill", chunk_qty=8.0, chunk_price=227.50,
+            cum_qty=14.31, cum_avg_price=227.10,
+        )
+        result = AlpacaBroker._build_result_from_stream(update, "AAPL", 14.31)
+        assert result.filled_qty == 14.31
+        assert result.status is OrderStatus.FILLED
+
+    def test_fill_uses_cumulative_avg_price_not_chunk_price(self):
+        # chunk price is the last execution only; avg should reflect VWAP
+        update = self._make_update(
+            event="fill", chunk_qty=2.0, chunk_price=190.00,
+            cum_qty=15.0, cum_avg_price=185.50,
+        )
+        result = AlpacaBroker._build_result_from_stream(update, "AMZN", 15.0)
+        assert result.avg_fill_price == 185.50
+
+    def test_chunk_qty_alone_would_undercount(self):
+        # Demonstrates what the bug looked like: chunk=8 != cumulative=14.31
+        update = self._make_update(
+            event="fill", chunk_qty=8.0, chunk_price=227.50,
+            cum_qty=14.31, cum_avg_price=227.10,
+        )
+        result = AlpacaBroker._build_result_from_stream(update, "AAPL", 14.31)
+        assert result.filled_qty != float(update.qty), (
+            "filled_qty must not equal the per-chunk qty"
+        )
+
+
 # ── cancel_order ─────────────────────────────────────────────────────────────
 
 

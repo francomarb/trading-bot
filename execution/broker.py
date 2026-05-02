@@ -835,8 +835,13 @@ class AlpacaBroker:
             "rejected": OrderStatus.REJECTED,
         }
         status = _STATUS_MAP.get(event_val, OrderStatus.FILLED)
-        filled_qty = float(update.qty or 0)
-        avg_price = float(update.price) if update.price is not None else None
+        # update.qty is the per-execution chunk for this event only.
+        # update.order.filled_qty is the cumulative total across all executions — correct for position sizing.
+        # Same issue applies to price: update.price is the last-execution price;
+        # update.order.filled_avg_price is the VWAP across all partial fills.
+        filled_qty = float(update.order.filled_qty or 0)
+        raw_avg = update.order.filled_avg_price
+        avg_price = float(raw_avg) if raw_avg is not None else None
         order_id = str(update.order.id)
         msg = (
             f"{status.value} (stream): filled {filled_qty}/{requested_qty} "
