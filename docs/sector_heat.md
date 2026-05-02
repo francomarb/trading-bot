@@ -1,6 +1,6 @@
 # Sector Heat Report
 
-_Generated 2026-05-02 14:22 UTC_
+_Generated 2026-05-02 14:25 UTC_
 
 ## Summary
 
@@ -34,13 +34,11 @@ _Generated 2026-05-02 14:22 UTC_
 | Symbol | Strategies |
 |---|---|
 | ABNB | `RSI` |
-| AMZN | `RSI` `DON` |
 | CCK | `RSI` |
 | FIGS | `SMA` |
 | HD | `RSI` |
 | MCD | `RSI` |
 | SN | `RSI` |
-| TSLA | `DON` |
 
 #### Energy — XLE | score +4
 
@@ -95,6 +93,7 @@ _No watched symbols in this sector._
 | Symbol | Strategies |
 |---|---|
 | AAPL | `RSI` `DON` |
+| AMZN | `RSI` `DON` |
 | ANET | `RSI` `DON` |
 | CDNS | `RSI` |
 | CIEN | `RSI` `DON` |
@@ -112,6 +111,7 @@ _No watched symbols in this sector._
 | QBTS | `DON` |
 | RGTI | `DON` |
 | SMCI | `DON` |
+| TSLA | `DON` |
 | WDC | `SMA` |
 
 #### Utilities — XLU | score +4
