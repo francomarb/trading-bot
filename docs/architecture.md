@@ -280,7 +280,7 @@ class BaseStrategy(ABC):
 - Strategy-specific edge filters live in `strategies/filters/<strategy_name>.py`
 - Shared filter helpers live in `strategies/filters/common.py` — includes `SPYTrendFilter` and `CompositeEdgeFilter`
 - `CompositeEdgeFilter` AND-chains multiple `EdgeFilter` callables; each strategy constructs its own composite
-- `SectorMomentumFilter` (`strategies/filters/sector_momentum.py`) is a reusable adapter that queries the `SectorMomentumGauge` and applies a configurable `cold_policy` ("block" | "warn" | "pass")
+- `SectorMomentumFilter` (`strategies/filters/sector_momentum.py`) is a reusable adapter that queries the `SectorMomentumGauge` and applies a configurable `sector_entry_policy` ("block" | "warn" | "pass")
 - Do not use edge filters for universe selection; `WatchlistSource` owns symbol selection
 
 **StrategySlot:**

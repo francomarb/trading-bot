@@ -121,7 +121,7 @@ def main() -> None:
     # ── Sector momentum gauge ──────────────────────────────────────────
     # Maps stock → sector via yfinance metadata (cached in JSON), then
     # scores each sector ETF as HOT / NEUTRAL / COLD.  Strategies choose
-    # how to act on the information via cold_policy.
+    # how to act on the information via sector_entry_policy.
     sector_resolver = SectorResolver(
         valid_sectors=set(settings.SECTOR_ETFS),
     )
@@ -141,7 +141,7 @@ def main() -> None:
                     SMAEdgeFilter(),
                     SectorMomentumFilter(
                         gauge=sector_gauge, resolver=sector_resolver,
-                        cold_policy="warn",
+                        sector_entry_policy="warn",
                     ),
                 ]),
             ),
@@ -160,7 +160,7 @@ def main() -> None:
                     RSIEdgeFilter(),
                     SectorMomentumFilter(
                         gauge=sector_gauge, resolver=sector_resolver,
-                        cold_policy="block",
+                        sector_entry_policy="block",
                     ),
                 ]),
             ),
@@ -183,7 +183,7 @@ def main() -> None:
                     DonchianEdgeFilter(),
                     SectorMomentumFilter(
                         gauge=sector_gauge, resolver=sector_resolver,
-                        cold_policy="warn",
+                        sector_entry_policy="warn",
                     ),
                 ]),
             ),

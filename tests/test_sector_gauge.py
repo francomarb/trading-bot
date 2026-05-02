@@ -204,11 +204,11 @@ class TestSectorMomentumFilter:
             index=idx,
         )
 
-    def _make_filter(self, cold_policy: str = "block"):
+    def _make_filter(self, sector_entry_policy: str = "block"):
         from strategies.filters.sector_momentum import SectorMomentumFilter
         gauge = MagicMock()
         resolver = MagicMock()
-        return SectorMomentumFilter(gauge=gauge, resolver=resolver, cold_policy=cold_policy), gauge, resolver
+        return SectorMomentumFilter(gauge=gauge, resolver=resolver, sector_entry_policy=sector_entry_policy), gauge, resolver
 
     def test_unmapped_symbol_passes_fail_open(self):
         f, gauge, resolver = self._make_filter()
@@ -219,7 +219,7 @@ class TestSectorMomentumFilter:
         assert result.all()
 
     def test_cold_block_policy_returns_false(self):
-        f, gauge, resolver = self._make_filter(cold_policy="block")
+        f, gauge, resolver = self._make_filter(sector_entry_policy="block")
         resolver.resolve.return_value = "semiconductors"
         detail = MagicMock()
         detail.classification = SectorMomentum.COLD
@@ -237,7 +237,7 @@ class TestSectorMomentumFilter:
         assert not result.any()
 
     def test_cold_warn_policy_returns_true(self):
-        f, gauge, resolver = self._make_filter(cold_policy="warn")
+        f, gauge, resolver = self._make_filter(sector_entry_policy="warn")
         resolver.resolve.return_value = "semiconductors"
         detail = MagicMock()
         detail.classification = SectorMomentum.COLD
@@ -255,7 +255,7 @@ class TestSectorMomentumFilter:
         assert result.all()
 
     def test_cold_pass_policy_returns_true(self):
-        f, gauge, resolver = self._make_filter(cold_policy="pass")
+        f, gauge, resolver = self._make_filter(sector_entry_policy="pass")
         resolver.resolve.return_value = "semiconductors"
         detail = MagicMock()
         detail.classification = SectorMomentum.COLD
@@ -273,7 +273,7 @@ class TestSectorMomentumFilter:
         assert result.all()
 
     def test_hot_sector_always_returns_true(self):
-        f, gauge, resolver = self._make_filter(cold_policy="block")
+        f, gauge, resolver = self._make_filter(sector_entry_policy="block")
         resolver.resolve.return_value = "semiconductors"
         detail = MagicMock()
         detail.classification = SectorMomentum.HOT
@@ -286,7 +286,7 @@ class TestSectorMomentumFilter:
         assert result.all()
 
     def test_neutral_sector_always_returns_true(self):
-        f, gauge, resolver = self._make_filter(cold_policy="block")
+        f, gauge, resolver = self._make_filter(sector_entry_policy="block")
         resolver.resolve.return_value = "semiconductors"
         detail = MagicMock()
         detail.classification = SectorMomentum.NEUTRAL
@@ -305,15 +305,15 @@ class TestSectorMomentumFilter:
         assert result.all()
         resolver.resolve.assert_not_called()
 
-    def test_invalid_cold_policy_raises(self):
+    def test_invalid_sector_entry_policy_raises(self):
         from strategies.filters.sector_momentum import SectorMomentumFilter
         gauge = MagicMock()
         resolver = MagicMock()
-        with pytest.raises(ValueError, match="cold_policy"):
-            SectorMomentumFilter(gauge=gauge, resolver=resolver, cold_policy="invalid")
+        with pytest.raises(ValueError, match="sector_entry_policy must be"):
+            SectorMomentumFilter(gauge=gauge, resolver=resolver, sector_entry_policy="invalid")
 
     def test_result_series_has_same_index_as_df(self):
-        f, gauge, resolver = self._make_filter(cold_policy="block")
+        f, gauge, resolver = self._make_filter(sector_entry_policy="block")
         resolver.resolve.return_value = None
         f.set_symbol("AAPL")
         df = self._make_df(n=10)

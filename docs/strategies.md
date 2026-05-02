@@ -62,7 +62,7 @@ All gates must pass for an entry to be allowed. Exits are never blocked.
 
 **Sector momentum filter (`strategies/filters/sector_momentum.py` — `SectorMomentumFilter`):**
 
-`cold_policy="warn"` — logs a warning when the stock's sector is COLD but does not block the entry. Trend-following can catch sector turns; a COLD sector is a flag, not a veto.
+`sector_entry_policy="warn"` — logs a warning when the stock's sector is COLD but does not block the entry. Trend-following can catch sector turns; a COLD sector is a flag, not a veto.
 
 **Regime gating:**
 
@@ -140,7 +140,7 @@ Note: the SPY macro gates provide a second BEAR block on top of the regime detec
 
 **Sector momentum filter (`strategies/filters/sector_momentum.py` — `SectorMomentumFilter`):**
 
-`cold_policy="block"` — entries are blocked when the stock's sector is COLD (score ≤ -2). Rationale: mean-reversion in a cold sector is cluster risk — the stock may be oversold precisely because its sector is in structural breakdown, and the expected reversion may never arrive.
+`sector_entry_policy="block"` — entries are blocked when the stock's sector is COLD (score ≤ -2). Rationale: mean-reversion in a cold sector is cluster risk — the stock may be oversold precisely because its sector is in structural breakdown, and the expected reversion may never arrive.
 
 **Regime gating:**
 
@@ -224,7 +224,7 @@ All gates must pass for an entry to be allowed. Exits are never blocked.
 
 **Sector momentum filter (`strategies/filters/sector_momentum.py` — `SectorMomentumFilter`):**
 
-`cold_policy="warn"` — logs a warning when the stock's sector is COLD but does not block the entry. Turtle-style breakout systems are specifically designed to catch turns at sector bottoms; a COLD sector is informational context, not a veto.
+`sector_entry_policy="warn"` — logs a warning when the stock's sector is COLD but does not block the entry. Turtle-style breakout systems are specifically designed to catch turns at sector bottoms; a COLD sector is informational context, not a veto.
 
 **Regime gating:**
 
