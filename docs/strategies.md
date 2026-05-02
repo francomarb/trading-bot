@@ -18,7 +18,7 @@ This document catalogues every strategy in the bot, its signal logic, edge filte
 
 ## Active Strategies
 
-Both strategies are running simultaneously in paper trading as of Phase 10 (2026-04-25). They share a single `RiskManager` and equity pool, divided via the `SleeveAllocator`.
+All three strategies are running simultaneously in paper trading as of Phase 10 (2026-05-01). They share a single `RiskManager` and equity pool, divided via the `SleeveAllocator`.
 
 ---
 
@@ -60,6 +60,10 @@ All gates must pass for an entry to be allowed. Exits are never blocked.
 | Volume expansion | 10-day avg volume > 30-day avg volume | Confirms institutional participation |
 | Pre-earnings blackout | No new entry within 2 days before earnings (`days_after=0`) | OTO stop cannot protect against an overnight gap; a 20% earnings miss bypasses `MAX_POSITION_PCT` entirely. Post-earnings entries allowed immediately to capture trend acceleration. |
 
+**Sector momentum filter (`strategies/filters/sector_momentum.py` — `SectorMomentumFilter`):**
+
+`cold_policy="warn"` — logs a warning when the stock's sector is COLD but does not block the entry. Trend-following can catch sector turns; a COLD sector is a flag, not a veto.
+
 **Regime gating:**
 
 | Regime | Allowed |
@@ -100,9 +104,9 @@ SMA crossover is the simplest trend-following signal. It captures sustained dire
 | Type | Mean-reversion |
 | Order type | LIMIT |
 | Status | **Paper Trading** |
-| Sleeve weight | 50% of gross capital |
+| Sleeve weight | 25% of gross capital |
 | Max positions | 5 |
-| Per-position budget | ~$8,000 at $100k paper equity |
+| Per-position budget | ~$4,000 at $100k paper equity |
 
 **Signal logic:**
 - **Entry:** RSI crosses *below* the oversold threshold (fading a sell-off)
@@ -133,6 +137,10 @@ All gates must pass for an entry to be allowed. Exits are never blocked.
 | No new 20-day low | `close > rolling(20).min()` of prior bars | Blocks entries in active individual breakdowns |
 
 Note: the SPY macro gates provide a second BEAR block on top of the regime detector, ensuring RSI does not enter mean-reversion trades in a broad downtrend even if the regime detector's TTL cache is stale.
+
+**Sector momentum filter (`strategies/filters/sector_momentum.py` — `SectorMomentumFilter`):**
+
+`cold_policy="block"` — entries are blocked when the stock's sector is COLD (score ≤ -2). Rationale: mean-reversion in a cold sector is cluster risk — the stock may be oversold precisely because its sector is in structural breakdown, and the expected reversion may never arrive.
 
 **Regime gating:**
 
@@ -165,18 +173,97 @@ RSI mean reversion profits when prices snap back from extremes. It performs well
 
 ---
 
+### Donchian Breakout
+
+| Field | Value |
+|---|---|
+| File | `strategies/donchian_breakout.py` |
+| Class | `DonchianBreakout` |
+| Type | Trend-continuation (Turtle System 1) |
+| Order type | MARKET |
+| Status | **Paper Trading** |
+| Sleeve weight | 25% of gross capital |
+| Max positions | 5 |
+| Per-position budget | ~$4,000 at $100k paper equity |
+| Activated | 2026-05-01 |
+
+**Signal logic:**
+- **Entry:** Close makes a new N-day high (Donchian breakout)
+- **Exit:** Close makes a new M-day low (Donchian reversal), where M < N
+
+Both signals are confirmed crossovers — the previous bar must have been below/above the channel boundary. Bars where the Donchian high/low is NaN (early warmup) produce no signal.
+
+**Default parameters:**
+
+| Parameter | Default | Description |
+|---|---|---|
+| `entry_window` | 30 | N-day high breakout window (bars) |
+| `exit_window` | 15 | M-day low exit window (bars) |
+
+**Required bars:** `entry_window` (30 with defaults)
+
+**Backtest performance (ai_bigtech 32-name universe, 4-year window ending 2026-04-28):**
+
+| Metric | Value |
+|---|---|
+| Sharpe | +0.85 |
+| Mean Return | +162.9% |
+| Total trades | 457 |
+| ATR stop | 2× ATR |
+| Entry/exit windows | 30/15 |
+
+**Edge filter (`strategies/filters/donchian_breakout.py` — `DonchianEdgeFilter`):**
+
+All gates must pass for an entry to be allowed. Exits are never blocked.
+
+| Gate | Rule | Rationale |
+|---|---|---|
+| Stock trend | `close > 200-day SMA` | Avoids breakouts in structurally broken names |
+| Liquidity floor | IEX-scaled 20-day avg volume ≥ threshold | Breakouts need sufficient volume to follow through |
+| Short earnings blackout | No entry within 1 day before earnings (`days_after=0`) | Binary events immediately after breakouts produce gap fills, not continuation |
+
+**Sector momentum filter (`strategies/filters/sector_momentum.py` — `SectorMomentumFilter`):**
+
+`cold_policy="warn"` — logs a warning when the stock's sector is COLD but does not block the entry. Turtle-style breakout systems are specifically designed to catch turns at sector bottoms; a COLD sector is informational context, not a veto.
+
+**Regime gating:**
+
+| Regime | Allowed |
+|---|---|
+| TRENDING | ✅ Yes |
+| RANGING | ❌ No |
+| VOLATILE | ❌ No |
+| BEAR | ❌ No |
+
+RANGING is explicitly blocked — in a sideways market every N-day high is a false breakout that reverses. Donchian needs a confirmed trend to produce positive expectancy.
+
+**Exit mechanics:**
+
+| Trigger | Mechanism | Code |
+|---|---|---|
+| M-day low reversal | Close hits new 15-day low → strategy emits exit signal | `strategies/donchian_breakout.py` |
+| ATR stop-loss | Price falls to `entry_price − (ATR × 2.0)` → broker stop fires | `risk/manager.py` |
+
+**Watchlist (`DONCHIAN_WATCHLIST` in `config/settings.py`):**
+32-name ai_bigtech universe: 23 AI core names (NVDA, MSFT, GOOGL, META, AMZN, etc.) + 9 AI-adjacent names (semiconductor equipment, data-centre power, quantum). See [`docs/donchian_breakout_strategy.md`](donchian_breakout_strategy.md) for the full universe methodology.
+
+**Why this strategy:**
+Donchian breakout is a pure trend-continuation system (Turtle Trading, System 1). It profits when a stock breaks to new highs with momentum and rides the trend until it reverses. It generates no signals in sideways or declining markets, making it naturally complementary to RSI Reversion. Restricted to the TRENDING regime only to eliminate false breakouts in range-bound conditions.
+
+---
+
 ## Strategy Diversification
 
-Running SMA Crossover and RSI Reversion together provides complementary coverage across market regimes:
+All three strategies provide complementary coverage across market regimes:
 
-| Market Regime | SMA Crossover | RSI Reversion |
-|---|---|---|
-| Strong trend | ✅ Profitable | ⚠️ Few signals (RSI rarely hits extremes) |
-| Sideways/range | ⚠️ Whipsawed (false crossovers) | ✅ Profitable (buys dips, sells rips) |
-| Volatile crash | ❌ Blocked by regime | ❌ Blocked by regime |
-| Bear market | ❌ Blocked by regime + edge filter | ❌ Blocked by regime + dual SPY gate |
+| Market Regime | SMA Crossover | RSI Reversion | Donchian Breakout |
+|---|---|---|---|
+| Strong trend | ✅ Profitable | ⚠️ Few signals (RSI rarely hits extremes) | ✅ Profitable (breakout continuation) |
+| Sideways/range | ⚠️ Whipsawed (false crossovers) | ✅ Profitable (buys dips, sells rips) | ❌ Blocked by regime (false breakouts) |
+| Volatile crash | ❌ Blocked by regime | ❌ Blocked by regime | ❌ Blocked by regime |
+| Bear market | ❌ Blocked by regime + edge filter | ❌ Blocked by regime + dual SPY gate | ❌ Blocked by regime |
 
-Both strategies share a single `RiskManager` and equity pool. Capital is divided by the `SleeveAllocator`: each strategy holds an independent sleeve (50% of gross, i.e. 40% of equity at 80% gross exposure). Idle sleeve capital stays locked to its strategy — no cross-borrowing until Phase 11.
+All three strategies share a single `RiskManager` and equity pool. Capital is divided by the `SleeveAllocator`: each strategy holds an independent sleeve. Idle sleeve capital stays locked to its strategy — no cross-borrowing until Phase 11.
 
 ---
 
@@ -186,24 +273,32 @@ Configured in `config/settings.py` under `STRATEGY_ALLOCATIONS`:
 
 ```python
 STRATEGY_ALLOCATIONS = {
-    "sma_crossover": {"weight": 0.50, "max_positions": 5},
-    "rsi_reversion":  {"weight": 0.50, "max_positions": 5},
+    "sma_crossover":     {"weight": 0.50, "max_positions": 5},
+    "rsi_reversion":     {"weight": 0.25, "max_positions": 5},
+    "donchian_breakout": {"weight": 0.25, "max_positions": 5},
 }
 MAX_GROSS_EXPOSURE_PCT = 0.80
 ```
 
 At $100k paper equity:
 - Gross ceiling: $100k × 0.80 = $80,000
-- Each sleeve: $80k × 0.50 = $40,000
-- Per-position cap: $40k ÷ 5 = $8,000
+- SMA sleeve: $80k × 0.50 = $40,000 → $8,000 per position
+- RSI sleeve: $80k × 0.25 = $20,000 → $4,000 per position
+- Donchian sleeve: $80k × 0.25 = $20,000 → $4,000 per position
 
-Weights start 50/50. Rebalance after ≥ 4 weeks of combined paper data based on per-strategy rolling Sharpe (Phase 11).
+Current weights (50/25/25) reflect RSI generating fewer signals (~8 trades/4y in paper) and Donchian being newer. Rebalance after ≥ 4 weeks of combined three-strategy data based on per-strategy rolling Sharpe (Phase 11).
+
+---
+
+## Parked Strategy
+
+**BollingerSqueeze** (`strategies/bollinger_squeeze.py`) is implemented but not wired into `forward_test.py`. Backtest: Sharpe +0.22 on Sector ETFs. Parked because ~50% of its practitioner edge requires options, discretionary overlays, or multi-timeframe capabilities the bot does not currently have. Revisit if those capabilities are added.
 
 ---
 
 ## Planned Strategies
 
-No additional strategies are currently planned. The go/no-go framework (`scripts/gonogo.py`) must confirm the existing two-strategy setup meets all thresholds before adding complexity. Phase 11 will add dynamic per-strategy weight rebalancing and cross-sleeve borrowing before any third strategy is considered.
+No additional strategies are planned at this time. The go/no-go framework (`scripts/gonogo.py`) must confirm the three-strategy paper run meets all thresholds before adding more complexity. Phase 11 will add dynamic per-strategy weight rebalancing and cross-sleeve borrowing.
 
 ---
 

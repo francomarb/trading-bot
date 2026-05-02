@@ -4,7 +4,7 @@
 
 This document defines the target architecture for the Alpaca trading bot. It is the source of truth for structural decisions, coding conventions, and the go/no-go framework for live capital deployment. All refactoring and new development should align with this guide.
 
-The bot is built in Python using `alpaca-py`. Both the SMA Crossover (trend-following) and RSI Reversion (mean-reversion) strategies are active in paper trading as of Phase 10. The final live GO/NO-GO gate is the combined SMA + RSI paper run after Phase 10 safety work is complete.
+The bot is built in Python using `alpaca-py`. All three strategies — SMA Crossover (trend-following), RSI Reversion (mean-reversion), and Donchian Breakout (trend-continuation) — are active in paper trading as of Phase 10. The final live GO/NO-GO gate is the combined three-strategy paper run after Phase 10 safety work is complete.
 
 ---
 
@@ -33,7 +33,7 @@ The bot is organized into seven layers. Each layer has a single responsibility a
 At the signal level, strategy entries pass through a narrower trade-permission pipeline:
 
 ```
-Watchlist → raw strategy signal → edge filter → regime gate → sleeve check → risk → execution
+Watchlist → raw strategy signal → edge filter (+ sector momentum) → regime gate → sleeve check → risk → execution
 ```
 
 - **Strategy** owns setup detection (crossover, RSI extreme)
@@ -68,7 +68,9 @@ trading-bot/
 │   ├── fetcher.py             # Fetches OHLCV bars via StockHistoricalDataClient
 │   ├── trades.db              # Paper SQLite trade log (gitignored)
 │   ├── trades_live.db         # Live SQLite trade log (gitignored)
-│   └── historical/            # Cached historical bars (Parquet, gitignored)
+│   ├── historical/            # Cached historical bars (Parquet, gitignored)
+│   └── cache/
+│       └── sector_map.json    # Persistent ticker→sector cache (populated at startup)
 │
 ├── indicators/
 │   ├── __init__.py
@@ -79,10 +81,18 @@ trading-bot/
 │   ├── base.py                # BaseStrategy, SignalFrame, StrategySlot, WatchlistSource
 │   ├── sma_crossover.py       # Trend-following: SMA crossover
 │   ├── rsi_reversion.py       # Mean-reversion: RSI oversold/overbought
+│   ├── donchian_breakout.py   # Trend-continuation: Turtle System 1 (30/15, ai_bigtech)
 │   └── filters/
-│       ├── common.py          # SPYTrendFilter (shared macro gate, TTL-cached)
+│       ├── common.py          # SPYTrendFilter + CompositeEdgeFilter
 │       ├── sma_crossover.py   # SMAEdgeFilter: stock > 200 SMA, volume expansion
-│       └── rsi_reversion.py   # RSIEdgeFilter: SPY dual macro, earnings, liquidity, no-new-low
+│       ├── rsi_reversion.py   # RSIEdgeFilter: SPY dual macro, earnings, liquidity, no-new-low
+│       ├── donchian_breakout.py # DonchianEdgeFilter: stock > 200 SMA, liquidity, earnings
+│       └── sector_momentum.py # SectorMomentumFilter: HOT/NEUTRAL/COLD gate adapter
+│
+├── sector/
+│   ├── __init__.py
+│   ├── resolver.py            # SectorResolver: ticker → sector (yfinance, JSON cache)
+│   └── gauge.py               # SectorMomentumGauge: ETF-based HOT/NEUTRAL/COLD scoring
 │
 ├── regime/
 │   ├── __init__.py
@@ -139,7 +149,9 @@ trading-bot/
 │   ├── test_metrics.py
 │   ├── test_regime.py
 │   ├── test_filters.py
-│   └── test_gonogo.py
+│   ├── test_gonogo.py
+│   ├── test_sector_gauge.py   # SectorMomentumGauge + SectorMomentumFilter + CompositeEdgeFilter
+│   └── test_sector_resolver.py # SectorResolver: cache, normalization, yfinance lookup, hydration
 │
 ├── docs/                      # Architecture and strategy documentation
 ├── logs/                      # Rotating log files (gitignored)
@@ -171,20 +183,48 @@ Key rules:
 
 **Four regimes:**
 
-| Regime | Condition | SMA entries | RSI entries |
-|---|---|---|---|
-| BEAR | SPY < 200-day SMA | ❌ blocked | ❌ blocked |
-| VOLATILE | ATR% above 80th percentile of trailing 126 bars | ❌ blocked | ❌ blocked |
-| TRENDING | ADX ≥ 25 | ✅ allowed | ✅ allowed |
-| RANGING | ADX ≤ 20 (or ambiguous zone, SMA50 slope tie-break) | ✅ allowed | ✅ allowed |
+| Regime | Condition | SMA entries | RSI entries | Donchian entries |
+|---|---|---|---|---|
+| BEAR | SPY < 200-day SMA | ❌ blocked | ❌ blocked | ❌ blocked |
+| VOLATILE | ATR% above 80th percentile of trailing 126 bars | ❌ blocked | ❌ blocked | ❌ blocked |
+| TRENDING | ADX ≥ 25 | ✅ allowed | ✅ allowed | ✅ allowed |
+| RANGING | ADX ≤ 20 (or ambiguous zone, SMA50 slope tie-break) | ✅ allowed | ✅ allowed | ❌ blocked |
 
 **Classification priority:** BEAR → VOLATILE → TRENDING/RANGING (ADX + slope).
 
-**Fail-safe:** returns last cached regime (or RANGING on first call) if the SPY fetch fails. Exits are never blocked by regime.
+**Graduated fail-safe:** on the first failure, the engine uses the last known regime (logged as WARNING). After `REGIME_MAX_CONSECUTIVE_FAILURES` (default 3) consecutive failures it falls back to BEAR (fail-closed, logged as ERROR). On the very first call with no prior regime it defaults to RANGING. The consecutive failure counter resets to 0 on any successful detection. Exits are never blocked by regime.
 
 **TTL caching:** SPY bars are fetched once per cycle and cached for `ENGINE_CYCLE_INTERVAL_SECONDS`. The detector is called once per cycle, not per symbol.
 
 Each `StrategySlot` declares `allowed_regimes: frozenset[MarketRegime] | None`. `None` means no gating. The engine checks the current regime against the slot's allowed set before processing entries.
+
+### 2b. Sector Momentum Gauge
+
+`sector/gauge.py` — `SectorMomentumGauge` is a **context provider**, not a gate. It scores each sector ETF as HOT, NEUTRAL, or COLD using a 5-signal composite score based on daily bars. Strategies and edge filters query it to make informed entry decisions. The gauge never directly blocks a trade — that decision belongs to the consuming filter.
+
+**Scoring (per sector ETF):**
+
+| Signal | Score |
+|---|---|
+| ETF close > SMA(200) | +1 (else -1) |
+| ETF close > SMA(50) | +1 (else -1) |
+| SMA(50) > SMA(200) — golden cross state | +1 (else -1) |
+| Distance from SMA(50) > +2% | +1 (if < -2% → -1, else 0) |
+| 10-day avg volume > 20-day avg volume | +1 (confirmation only, never -1) |
+
+**Classification:** HOT (score ≥ 3), COLD (score ≤ -2), NEUTRAL otherwise.
+
+**Fail behavior:** If ETF data is unavailable or fewer than 200 bars exist, returns NEUTRAL. The gauge has no opinion — it does not say "safe to trade."
+
+**TTL caching:** ETF bars and score results are cached per `cache_ttl_seconds` (default 600s, matching the RegimeDetector pattern). Called once per cycle via edge filters — not per symbol.
+
+`sector/resolver.py` — `SectorResolver` maps stock tickers to sector labels using yfinance metadata cached in `data/cache/sector_map.json`. Hydrated once at startup (`resolver.hydrate(all_symbols)`) so no API calls occur during the live trading loop. Industry takes priority over sector in normalization (NVDA → industry="Semiconductors" → `"semiconductors"`, not `"technology"`). ETFs return `None`. Unknown symbols fail open.
+
+**Sector ETF registry** (`SECTOR_ETFS` in `config/settings.py`): 12 sectors mapped to ETFs (SMH for semiconductors, XLK for technology, XLF for financials, etc.).
+
+See `docs/regime_flowchart.md` for the full regime + sector interaction diagram.
+
+---
 
 ### 3. Indicators
 
@@ -238,7 +278,9 @@ class BaseStrategy(ABC):
 
 **Filter file layout:**
 - Strategy-specific edge filters live in `strategies/filters/<strategy_name>.py`
-- Shared filter helpers live in `strategies/filters/common.py`
+- Shared filter helpers live in `strategies/filters/common.py` — includes `SPYTrendFilter` and `CompositeEdgeFilter`
+- `CompositeEdgeFilter` AND-chains multiple `EdgeFilter` callables; each strategy constructs its own composite
+- `SectorMomentumFilter` (`strategies/filters/sector_momentum.py`) is a reusable adapter that queries the `SectorMomentumGauge` and applies a configurable `cold_policy` ("block" | "warn" | "pass")
 - Do not use edge filters for universe selection; `WatchlistSource` owns symbol selection
 
 **StrategySlot:**
@@ -246,10 +288,11 @@ Each slot binds a strategy to its symbol universe, timeframe, and allowed regime
 
 **Current strategies:**
 
-| Strategy | File | Status | Order Type | Allowed Regimes |
-|---|---|---|---|---|
-| SMA Crossover | `sma_crossover.py` | **Paper Trading** | MARKET | TRENDING, RANGING |
-| RSI Reversion | `rsi_reversion.py` | **Paper Trading** | LIMIT | TRENDING, RANGING |
+| Strategy | File | Status | Order Type | Allowed Regimes | Sleeve |
+|---|---|---|---|---|---|
+| SMA Crossover | `sma_crossover.py` | **Paper Trading** | MARKET | TRENDING, RANGING | 50% |
+| RSI Reversion | `rsi_reversion.py` | **Paper Trading** | LIMIT | TRENDING, RANGING | 25% |
+| Donchian Breakout | `donchian_breakout.py` | **Paper Trading** | MARKET | TRENDING only | 25% |
 
 ### 5. Risk Manager + Sleeve Allocator
 
@@ -264,9 +307,10 @@ Sleeve budget       = equity × MAX_GROSS_EXPOSURE_PCT × weight
 Per-position budget = sleeve_budget / max_positions
 ```
 
-At $100k equity, 80% gross, 50/50 weights, max_positions=5:
-- Each sleeve = $100k × 0.80 × 0.50 = $40,000
-- Per-position cap = $40,000 ÷ 5 = $8,000
+At $100k equity, 80% gross, 50/25/25 weights, max_positions=5:
+- SMA sleeve = $100k × 0.80 × 0.50 = $40,000 → $8,000 per position
+- RSI sleeve = $100k × 0.80 × 0.25 = $20,000 → $4,000 per position
+- Donchian sleeve = $100k × 0.80 × 0.25 = $20,000 → $4,000 per position
 
 Rejection codes: `SLEEVE_FULL` (budget exhausted), `SLEEVE_MAX_POSITIONS` (count cap hit).
 Idle sleeve capital stays locked — no cross-borrowing between strategies (Phase 11 item).
