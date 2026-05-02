@@ -584,8 +584,8 @@ class TestEngineRegimeGate:
             engine.start(max_cycles=1)
         broker.place_order.assert_not_called()
 
-    def test_regime_detection_failure_does_not_crash_engine(self):
-        """If regime detector raises, engine logs a warning and continues."""
+    def test_regime_detection_failure_falls_back_to_ranging(self):
+        """First failure with no prior regime → RANGING fallback."""
         engine, broker = self._make_engine(
             regime=MarketRegime.TRENDING,  # won't be used — detect() raises
             allowed_regimes=frozenset({MarketRegime.TRENDING}),
@@ -597,6 +597,48 @@ class TestEngineRegimeGate:
         with patch("engine.trader.fetch_symbol", return_value=(bars, SimpleNamespace(api_calls=0))):
             engine.start(max_cycles=1)  # must not raise
 
-        # When regime detection fails, entry_allowed stays True →
-        # entry is NOT blocked by regime (still subject to risk / filter).
-        broker.place_order.assert_called_once()
+        # First failure with no prior regime → RANGING.
+        # allowed_regimes={TRENDING} → entry blocked.
+        broker.place_order.assert_not_called()
+        assert engine._regime_fail_count == 1
+
+    def test_regime_detection_failure_uses_last_known_regime(self):
+        """Failure with a prior known regime falls back to it."""
+        engine, broker = self._make_engine(
+            regime=MarketRegime.TRENDING,
+            allowed_regimes=frozenset({MarketRegime.TRENDING}),
+            entry_signal=True,
+        )
+        # First cycle succeeds (TRENDING), second fails → fallback to TRENDING
+        engine._regime_detector.detect.side_effect = [
+            MarketRegime.TRENDING,
+            RuntimeError("SPY down"),
+        ]
+
+        bars = self._bars()
+        with patch("engine.trader.fetch_symbol", return_value=(bars, SimpleNamespace(api_calls=0))):
+            engine.start(max_cycles=2)
+
+        # Both cycles should allow entries (TRENDING allowed).
+        assert broker.place_order.call_count == 2
+        assert engine._regime_fail_count == 1
+
+    def test_regime_detection_consecutive_failures_fall_to_bear(self):
+        """After N consecutive failures, fall back to BEAR (fail-closed)."""
+        engine, broker = self._make_engine(
+            regime=MarketRegime.TRENDING,
+            allowed_regimes=frozenset({MarketRegime.TRENDING, MarketRegime.RANGING}),
+            entry_signal=True,
+        )
+        engine._regime_detector.detect.side_effect = RuntimeError("SPY down")
+
+        bars = self._bars()
+        with patch("engine.trader.fetch_symbol", return_value=(bars, SimpleNamespace(api_calls=0))):
+            with patch("config.settings.REGIME_MAX_CONSECUTIVE_FAILURES", 2):
+                engine.start(max_cycles=3)
+
+        # Cycle 1: fail → RANGING (allowed) → entry placed
+        # Cycle 2: fail → BEAR (fail-closed, 2 consecutive) → blocked
+        # Cycle 3: fail → BEAR (still fail-closed) → blocked
+        assert broker.place_order.call_count == 1
+        assert engine._regime_fail_count == 3

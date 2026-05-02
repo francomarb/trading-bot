@@ -78,6 +78,8 @@ from reporting.logger import TradeLogger
 from reporting.pnl import PnLTracker
 from strategies.base import BaseStrategy, StrategySlot
 
+from regime.detector import MarketRegime
+
 if TYPE_CHECKING:
     from execution.stream import StreamManager
     from regime.detector import RegimeDetector
@@ -225,6 +227,7 @@ class TradingEngine:
         self._cycle_count: int = 0
         self._last_cycle_end: float = 0.0  # monotonic timestamp
         self._last_regime: str | None = None
+        self._regime_fail_count: int = 0
         self._last_cycle_equity: float | None = None
         self._last_snapshot: "BrokerSnapshot | None" = None
 
@@ -463,11 +466,31 @@ class TradingEngine:
                     ):
                         self.alerts.regime_shift(self._last_regime, regime_str)
                     self._last_regime = regime_str
+                    self._regime_fail_count = 0
                 except Exception as exc:
-                    logger.warning(
-                        f"regime detection failed: {exc} — "
-                        "proceeding without regime gate this cycle"
-                    )
+                    self._regime_fail_count += 1
+                    max_failures = settings.REGIME_MAX_CONSECUTIVE_FAILURES
+                    if self._regime_fail_count >= max_failures:
+                        logger.error(
+                            f"regime detection failed {self._regime_fail_count} "
+                            f"consecutive times: {exc} — falling back to BEAR "
+                            "(fail-closed)"
+                        )
+                        current_regime = MarketRegime.BEAR
+                    elif self._last_regime is not None:
+                        logger.warning(
+                            f"regime detection failed "
+                            f"({self._regime_fail_count}x): {exc} — using "
+                            f"last known regime: {self._last_regime}"
+                        )
+                        current_regime = MarketRegime(self._last_regime)
+                    else:
+                        logger.warning(
+                            f"regime detection failed "
+                            f"({self._regime_fail_count}x), no prior regime "
+                            "— defaulting to RANGING"
+                        )
+                        current_regime = MarketRegime.RANGING
 
             # Order attribution — computed once per cycle for sleeve accounting.
             # Maps order_id → strategy_name for pending buy entries using

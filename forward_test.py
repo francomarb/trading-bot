@@ -47,10 +47,14 @@ from reporting.logger import TradeLogger, install_json_sink
 from reporting.pnl import PnLTracker
 from risk.manager import RiskManager
 from data.watchlists import StaticWatchlistSource
+from sector.gauge import SectorMomentumGauge
+from sector.resolver import SectorResolver
 from strategies.base import StrategySlot
 from strategies.donchian_breakout import DonchianBreakout
+from strategies.filters.common import CompositeEdgeFilter
 from strategies.filters.donchian_breakout import DonchianEdgeFilter
 from strategies.filters.rsi_reversion import RSIEdgeFilter
+from strategies.filters.sector_momentum import SectorMomentumFilter
 from strategies.filters.sma_crossover import SMAEdgeFilter
 from strategies.rsi_reversion import RSIReversion
 from strategies.sma_crossover import SMACrossover
@@ -114,10 +118,33 @@ def main() -> None:
     # new entries; exits are never blocked.
     regime = RegimeDetector()
 
+    # ── Sector momentum gauge ──────────────────────────────────────────
+    # Maps stock → sector via yfinance metadata (cached in JSON), then
+    # scores each sector ETF as HOT / NEUTRAL / COLD.  Strategies choose
+    # how to act on the information via cold_policy.
+    sector_resolver = SectorResolver(
+        valid_sectors=set(settings.SECTOR_ETFS),
+    )
+    all_symbols = list(dict.fromkeys(
+        settings.SMA_WATCHLIST + settings.RSI_WATCHLIST + settings.DONCHIAN_WATCHLIST
+    ))
+    sector_resolver.hydrate(all_symbols)
+
+    sector_gauge = SectorMomentumGauge(sector_etfs=settings.SECTOR_ETFS)
+
     # ── Strategy slots ──────────────────────────────────────────────────
     slots = [
         StrategySlot(
-            strategy=SMACrossover(fast=20, slow=50, edge_filter=SMAEdgeFilter()),
+            strategy=SMACrossover(
+                fast=20, slow=50,
+                edge_filter=CompositeEdgeFilter([
+                    SMAEdgeFilter(),
+                    SectorMomentumFilter(
+                        gauge=sector_gauge, resolver=sector_resolver,
+                        cold_policy="warn",
+                    ),
+                ]),
+            ),
             watchlist_source=StaticWatchlistSource(
                 list(settings.SMA_WATCHLIST), name="sma"
             ),
@@ -127,8 +154,16 @@ def main() -> None:
             allowed_regimes=frozenset({MarketRegime.TRENDING, MarketRegime.RANGING}),
         ),
         StrategySlot(
-            strategy=RSIReversion(period=14, oversold=30, overbought=70,
-                                  edge_filter=RSIEdgeFilter()),
+            strategy=RSIReversion(
+                period=14, oversold=30, overbought=70,
+                edge_filter=CompositeEdgeFilter([
+                    RSIEdgeFilter(),
+                    SectorMomentumFilter(
+                        gauge=sector_gauge, resolver=sector_resolver,
+                        cold_policy="block",
+                    ),
+                ]),
+            ),
             watchlist_source=StaticWatchlistSource(
                 list(settings.RSI_WATCHLIST), name="rsi"
             ),
@@ -137,12 +172,21 @@ def main() -> None:
             # VOLATILE (fear-driven overshoots are unpredictable and the
             # snap-back timing is unreliable). The RSI edge filter adds a
             # second layer: SPY > 200 SMA AND SPY > 50 SMA, so BEAR is
-            # double-blocked.
+            # double-blocked. Sector momentum: COLD sectors BLOCK entries
+            # (mean-reversion in a cold sector = cluster risk).
             allowed_regimes=frozenset({MarketRegime.TRENDING, MarketRegime.RANGING}),
         ),
         StrategySlot(
-            strategy=DonchianBreakout(entry_window=30, exit_window=15,
-                                      edge_filter=DonchianEdgeFilter()),
+            strategy=DonchianBreakout(
+                entry_window=30, exit_window=15,
+                edge_filter=CompositeEdgeFilter([
+                    DonchianEdgeFilter(),
+                    SectorMomentumFilter(
+                        gauge=sector_gauge, resolver=sector_resolver,
+                        cold_policy="warn",
+                    ),
+                ]),
+            ),
             watchlist_source=StaticWatchlistSource(
                 list(settings.DONCHIAN_WATCHLIST), name="donchian"
             ),

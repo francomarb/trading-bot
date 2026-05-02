@@ -127,6 +127,26 @@ STRATEGY_WATCHLISTS: dict[str, list[str]] = {
     "bollinger_squeeze":  BOLLINGER_WATCHLIST,
     "donchian_breakout":  DONCHIAN_WATCHLIST,
 }
+REGIME_MAX_CONSECUTIVE_FAILURES: int = 3
+
+# ── Sector Momentum Gauge ──────────────────────────────────────────────────
+# Normalized sector label → sector ETF ticker.  Used by SectorMomentumGauge
+# to compute per-sector heat scores (HOT / NEUTRAL / COLD).
+SECTOR_ETFS: dict[str, str] = {
+    "technology":     "XLK",
+    "semiconductors": "SMH",
+    "financials":     "XLF",
+    "energy":         "XLE",
+    "utilities":      "XLU",
+    "healthcare":     "XLV",
+    "industrials":    "XLI",
+    "staples":        "XLP",
+    "discretionary":  "XLY",
+    "materials":      "XLB",
+    "real_estate":    "XLRE",
+    "communications": "XLC",
+}
+
 STRATEGY_ALLOWED_REGIMES: dict[str, set[str]] = {
     "sma_crossover":     {"TRENDING", "RANGING"},
     "rsi_reversion":     {"TRENDING", "RANGING"},

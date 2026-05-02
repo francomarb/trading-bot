@@ -142,6 +142,39 @@ class SPYTrendFilter:
         return pd.Series(allowed, index=df.index, dtype=bool)
 
 
+# ── CompositeEdgeFilter ──────────────────────────────────────────────────────
+
+
+class CompositeEdgeFilter:
+    """AND-chains multiple ``EdgeFilter`` callables into one.
+
+    Each child filter's ``set_symbol()`` is called if it exists, and
+    ``__call__`` results are AND-ed together.
+    """
+
+    def __init__(self, filters: list) -> None:
+        if not filters:
+            raise ValueError("CompositeEdgeFilter requires at least one filter")
+        self._filters = list(filters)
+
+    def set_symbol(self, symbol: str) -> None:
+        for f in self._filters:
+            setter = getattr(f, "set_symbol", None)
+            if callable(setter):
+                setter(symbol)
+
+    def __call__(self, df: pd.DataFrame) -> pd.Series:
+        result: pd.Series | None = None
+        for f in self._filters:
+            gate = f(df)
+            if result is None:
+                result = gate
+            else:
+                result = result & gate
+        assert result is not None
+        return result
+
+
 # ── EarningsBlackout ─────────────────────────────────────────────────────────
 
 
