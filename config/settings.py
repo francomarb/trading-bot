@@ -262,8 +262,12 @@ FRACTIONAL_ENABLED: bool = True
 ATR_LENGTH = 14                     # ATR window the engine uses for stops
 ENGINE_TIMEFRAME = "1Day"           # Bar timeframe for the live loop
 ENGINE_HISTORY_LOOKBACK_DAYS = 300  # Calendar days of stock history per cycle.
-                                    # 300 cd ≈ 206 trading days — required by
-                                    # SMAEdgeFilter's stock 200-day SMA gate.
+                                    # Keep this at >= 300 for 1Day live trading:
+                                    # 300 cd ≈ 206 trading days, which safely
+                                    # warms up stock/SPY 200-day SMA filters.
+                                    # Do not reduce casually — this is a
+                                    # central engine invariant, not something
+                                    # individual filters should have to enforce.
 ENGINE_CYCLE_INTERVAL_SECONDS = 300 # 5 min between cycles for daily strategy
 ENGINE_MAX_BAR_AGE_MULTIPLIER = 4.0 # Stale guard: refuse to trade if last bar
                                     # is older than (bar_interval × multiplier)
@@ -276,6 +280,12 @@ ENGINE_CANCEL_ORDERS_ON_SHUTDOWN = False
 # against transient API blips that return incomplete position data.
 # With WebSocket streaming (Phase 10), this becomes a fallback for gap periods.
 ENGINE_EXTERNAL_CLOSE_CONFIRM_CYCLES = 3
+
+if ENGINE_TIMEFRAME == "1Day" and ENGINE_HISTORY_LOOKBACK_DAYS < 300:
+    raise ValueError(
+        "ENGINE_HISTORY_LOOKBACK_DAYS must be >= 300 when ENGINE_TIMEFRAME='1Day' "
+        "to keep 200-day SMA-based filters warmed up safely"
+    )
 
 # ── Reporting settings (Phase 9) ────────────────────────────────────────────
 TRADE_LOG_CSV = "logs/trades.csv"           # Legacy CSV trade log (deprecated)

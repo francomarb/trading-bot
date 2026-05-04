@@ -223,6 +223,11 @@ Current local verification: **757 tests passing** via
 recorded milestone is **646 unit tests passing** as of 2026-04-25, before the
 2026-04-28 dashboard work and 2026-04-29 Bollinger strategy additions.
 
+**Operational preference:**
+- Do **not** create Git worktrees for this repo unless the user explicitly asks.
+  The user reports that Antigravity can hang when linked worktrees exist, so
+  normal in-place branch work is preferred.
+
 **Immediate operational next steps:**
 1. Keep `python forward_test.py` running and continue collecting real paper fills.
 2. After enough fills accumulate, calibrate realized slippage vs the 5 bps model (`10.D1`).

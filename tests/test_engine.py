@@ -263,6 +263,12 @@ class TestEngineConfig:
         with pytest.raises(ValueError):
             EngineConfig(max_bar_age_multiplier=1.0)
 
+    def test_daily_engine_default_keeps_200_sma_warmup_margin(self):
+        from config import settings
+
+        if settings.ENGINE_TIMEFRAME == "1Day":
+            assert settings.ENGINE_HISTORY_LOOKBACK_DAYS >= 300
+
 
 # ── _lookback_days helper ──────────────────────────────────────────────────
 
