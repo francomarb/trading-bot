@@ -227,6 +227,8 @@ recorded milestone is **646 unit tests passing** as of 2026-04-25, before the
 - Do **not** create Git worktrees for this repo unless the user explicitly asks.
   The user reports that Antigravity can hang when linked worktrees exist, so
   normal in-place branch work is preferred.
+- **Always use `./recycle_bot.sh`** when restarting or recycling the bot, rather
+  than manually killing the tmux session and calling `./start_bot.sh`.
 
 **Immediate operational next steps:**
 1. Keep `python forward_test.py` running and continue collecting real paper fills.

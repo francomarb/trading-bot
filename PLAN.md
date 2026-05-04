@@ -645,6 +645,7 @@ reason.
 | 11.18 | **Incremental online signal generation** — deque-based algorithm that processes one new bar at a time (needed for intraday). | ⬜ |
 | 11.19 | **ML edge filter** — train a direction classifier on lagged log-return features; plug it into `edge_filter`. | ⬜ |
 | 11.20 | **Sentiment overlay** — bidirectional signal design using scored headlines/sentiment data to confirm or block entries. Negative sentiment has hard veto power; positive sentiment is additive confirmation only. | ⬜ |
+| 11.21 | **WebSocket Reconnection Loop & State Re-sync** — rebuild `execution/stream.py` with an `asyncio` auto-reconnect loop, exponential backoff, and heartbeat monitoring. Required for sub-second execution in options or intraday trading where REST fallback latency is unacceptable. | ⬜ |
 
 **Exit Criteria:** Advanced portfolio enhancements run safely on top of the Phase 10
 SMA + RSI baseline. Optional third strategies, dynamic allocation, advanced concentration
