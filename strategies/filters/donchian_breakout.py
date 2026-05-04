@@ -19,14 +19,10 @@ new-N-day-high signal:
     3/2 because the strategy WANTS to participate in earnings-driven
     breakouts on the up-side.
 
-  Rule 3 — Minimum liquidity (IEX-scaled):
+  Rule 3 — Minimum liquidity:
     20-day average dollar volume ≥ notional_min_avg.
     Base threshold ($20M) is expressed in *consolidated tape* terms.
-    When ALPACA_DATA_FEED == "iex", multiply by 0.05 since IEX prints
-    only ~5% of consolidated volume. This is the SINGLE point of feed-
-    conditionality in the Donchian stack — flipping to SIP is a one-env-
-    var change. Mirrors the pattern in
-    strategies/filters/bollinger_squeeze.py and rsi_reversion.py.
+    The volume data is dynamically scaled to "Synthetic SIP" terms in the data fetcher.
     Fails open when volume column is missing or insufficient history.
 
   Rule 4 — Long-only mode:
@@ -41,8 +37,7 @@ that is enforced by BaseStrategy.
 
 Observability:
   - Every allow/block decision on the last bar is logged with the specific
-    reason(s) and the displayed liquidity threshold (so the IEX scaling
-    can be verified at runtime).
+    reason(s) and the displayed liquidity threshold.
 
 Usage:
     from strategies.filters.donchian_breakout import DonchianEdgeFilter
@@ -62,7 +57,6 @@ from strategies.filters.common import EarningsBlackout
 _STOCK_SMA_WINDOW = 200
 _VOL_MIN_WINDOW = 20
 _NOTIONAL_MIN_AVG = 20_000_000  # $20M consolidated-tape average daily dollar volume
-_IEX_VOLUME_FRACTION = 0.05     # IEX prints ~5% of consolidated volume
 
 _EARNINGS_DAYS_BEFORE = 1   # block 1 day before (avoid pre-earnings entry)
 _EARNINGS_DAYS_AFTER = 0    # allow immediately after (capture post-earnings continuation)
@@ -76,7 +70,7 @@ class DonchianEdgeFilter:
         stock_sma_window:    SMA period for the stock's own trend filter (default 200).
         vol_min_window:      Rolling window for average volume check (default 20).
         notional_min_avg:    Base $ threshold expressed in consolidated tape
-                             terms (default $20M). Scaled by 0.05 on IEX.
+                             terms (default $20M).
         days_before:         Earnings blackout days before announcement (default 1).
         days_after:          Earnings blackout days after announcement (default 0).
     """
@@ -93,13 +87,7 @@ class DonchianEdgeFilter:
         self._stock_sma_window = stock_sma_window
         self._vol_min_window = vol_min_window
 
-        # IEX sees ~5% of consolidated market volume. Scale ONLY when on IEX.
-        # Any other feed (sip, future paid feeds) leaves the threshold unscaled,
-        # so a SIP transition is a single env-var flip.
-        if ALPACA_DATA_FEED == "iex":
-            self._notional_min_avg = int(notional_min_avg * _IEX_VOLUME_FRACTION)
-        else:
-            self._notional_min_avg = int(notional_min_avg)
+        self._notional_min_avg = int(notional_min_avg)
 
         self._earnings = EarningsBlackout(
             days_before=days_before,

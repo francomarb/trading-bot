@@ -459,6 +459,12 @@ def fetch_symbol(
 
     # Slice to requested window.
     window = merged.loc[(merged.index >= start) & (merged.index <= end)]
+    
+    if feed.lower() == "iex":
+        from utils.market import apply_synthetic_sip_volume
+        is_daily = (timeframe == "1Day")
+        window = apply_synthetic_sip_volume(window, is_daily=is_daily)
+
     rows_from_cache = len(window) - rows_from_api
     # Clamp (overlap at merge seams can make this off by a few).
     rows_from_cache = max(rows_from_cache, 0)

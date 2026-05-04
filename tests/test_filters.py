@@ -789,38 +789,6 @@ def _liquid_ohlc_df(
     )
 
 
-class TestBollingerSqueezeEdgeFilterFeedScaling:
-    """
-    Verifies the SINGLE point of feed-conditionality in the BB squeeze stack.
-    These tests are the contract that says: a SIP transition is a one-env-var
-    flip — no scattered IEX assumptions.
-    """
-
-    BASE = 20_000_000
-
-    def test_iex_feed_scales_threshold_to_5_percent(self, monkeypatch):
-        from strategies.filters import bollinger_squeeze as bsq
-
-        monkeypatch.setattr(bsq, "ALPACA_DATA_FEED", "iex")
-        f = bsq.BollingerSqueezeEdgeFilter(notional_min_avg=self.BASE)
-        assert f._notional_min_avg == int(self.BASE * 0.05)
-
-    def test_sip_feed_threshold_unscaled(self, monkeypatch):
-        from strategies.filters import bollinger_squeeze as bsq
-
-        monkeypatch.setattr(bsq, "ALPACA_DATA_FEED", "sip")
-        f = bsq.BollingerSqueezeEdgeFilter(notional_min_avg=self.BASE)
-        assert f._notional_min_avg == self.BASE
-
-    def test_unknown_feed_threshold_unscaled(self, monkeypatch):
-        """Any non-'iex' value (covers future feeds) leaves the threshold unscaled."""
-        from strategies.filters import bollinger_squeeze as bsq
-
-        monkeypatch.setattr(bsq, "ALPACA_DATA_FEED", "future_paid_feed")
-        f = bsq.BollingerSqueezeEdgeFilter(notional_min_avg=self.BASE)
-        assert f._notional_min_avg == self.BASE
-
-
 class TestBollingerSqueezeEdgeFilterGates:
     """End-to-end gate behaviour with a mocked symbol and earnings cache."""
 
@@ -884,33 +852,7 @@ class TestBollingerSqueezeEdgeFilterGates:
         gate = f(df)
         assert gate.iloc[-1]  # NaN avg → fail open
 
-    def test_iex_scaling_makes_otherwise_blocked_pass(self, monkeypatch):
-        """
-        With $20M base threshold and a $5M dollar-volume series:
-          - On SIP the filter blocks (5M < 20M).
-          - On IEX the threshold is $1M, so 5M >> 1M → allows.
-        Proves the scaling is the only thing different.
-        """
-        # close=100, vol=50_000 → dollar_vol = 5M
-        df = _liquid_ohlc_df(25, close=100.0, avg_vol=50_000)
 
-        sip_filter = self._filter(
-            monkeypatch,
-            feed="sip",
-            notional_min_avg=20_000_000,
-            vol_min_window=5,
-            exhaustion_atr_mult=10.0,
-        )
-        assert not sip_filter(df).iloc[-1]
-
-        iex_filter = self._filter(
-            monkeypatch,
-            feed="iex",
-            notional_min_avg=20_000_000,
-            vol_min_window=5,
-            exhaustion_atr_mult=10.0,
-        )
-        assert iex_filter(df).iloc[-1]
 
     def test_exhaustion_gate_blocks_extended_close(self, monkeypatch):
         """
@@ -1012,35 +954,6 @@ def _donchian_ohlc_df(
     )
 
 
-class TestDonchianEdgeFilterFeedScaling:
-    """
-    The single point of feed-conditionality. These three tests are the contract
-    that says "SIP transition is a one-env-var flip" for the Donchian stack.
-    """
-
-    BASE = 20_000_000
-
-    def test_iex_feed_scales_threshold_to_5_percent(self, monkeypatch):
-        from strategies.filters import donchian_breakout as dbk
-
-        monkeypatch.setattr(dbk, "ALPACA_DATA_FEED", "iex")
-        f = dbk.DonchianEdgeFilter(notional_min_avg=self.BASE)
-        assert f._notional_min_avg == int(self.BASE * 0.05)
-
-    def test_sip_feed_threshold_unscaled(self, monkeypatch):
-        from strategies.filters import donchian_breakout as dbk
-
-        monkeypatch.setattr(dbk, "ALPACA_DATA_FEED", "sip")
-        f = dbk.DonchianEdgeFilter(notional_min_avg=self.BASE)
-        assert f._notional_min_avg == self.BASE
-
-    def test_unknown_feed_threshold_unscaled(self, monkeypatch):
-        """Any non-'iex' value (covers future feeds) leaves the threshold unscaled."""
-        from strategies.filters import donchian_breakout as dbk
-
-        monkeypatch.setattr(dbk, "ALPACA_DATA_FEED", "future_paid_feed")
-        f = dbk.DonchianEdgeFilter(notional_min_avg=self.BASE)
-        assert f._notional_min_avg == self.BASE
 
 
 class TestDonchianEdgeFilterGates:
@@ -1139,32 +1052,7 @@ class TestDonchianEdgeFilterGates:
         gate = f(df)
         assert gate.iloc[-1]
 
-    def test_iex_scaling_makes_otherwise_blocked_pass(self, monkeypatch):
-        """
-        With $20M base threshold and a $5M dollar-volume series:
-          - On SIP the filter blocks (5M < 20M)
-          - On IEX the threshold is $1M, so 5M >> 1M → allows
-        Proves the scaling is the only thing different.
-        """
-        df = _donchian_ohlc_df(25, close=100.0, avg_vol=50_000)  # $5M dollar vol
 
-        sip_filter = self._filter(
-            monkeypatch,
-            feed="sip",
-            stock_sma_window=10,
-            notional_min_avg=20_000_000,
-            vol_min_window=5,
-        )
-        assert not sip_filter(df).iloc[-1]
-
-        iex_filter = self._filter(
-            monkeypatch,
-            feed="iex",
-            stock_sma_window=10,
-            notional_min_avg=20_000_000,
-            vol_min_window=5,
-        )
-        assert iex_filter(df).iloc[-1]
 
     # ── Earnings + propagation ────────────────────────────────────────────────
 

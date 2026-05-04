@@ -273,8 +273,13 @@ ENGINE_MAX_BAR_AGE_MULTIPLIER = 4.0 # Stale guard: refuse to trade if last bar
                                     # is older than (bar_interval × multiplier)
 ENGINE_MARKET_HOURS_ONLY = True     # Only trade during regular session
 # Preserve OTO stop-loss legs across bot restarts. Manual liquidation paths
+# When True, the engine will read broker.get_open_orders() on stop() and
 # explicitly cancel sibling orders before closing a position.
 ENGINE_CANCEL_ORDERS_ON_SHUTDOWN = False
+
+# Maximum age in seconds for an unfilled entry LIMIT order before it is
+# considered stale and canceled by the engine. Default is 24 hours.
+STALE_LIMIT_MAX_AGE_SECONDS: int = int(os.getenv("STALE_LIMIT_MAX_AGE_SECONDS", 86400))
 # Consecutive cycles a managed position must be absent from the broker before
 # it is declared externally closed (stop-out / manual liquidation). Protects
 # against transient API blips that return incomplete position data.

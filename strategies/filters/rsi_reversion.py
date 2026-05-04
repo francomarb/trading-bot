@@ -110,11 +110,7 @@ class RSIEdgeFilter:
         )
         self._vol_min_window = vol_min_window
         
-        # IEX sees ~5% of consolidated market volume. Scale threshold accordingly.
-        if ALPACA_DATA_FEED == "iex":
-            self._notional_min_avg = int(notional_min_avg * 0.05)
-        else:
-            self._notional_min_avg = notional_min_avg
+        self._notional_min_avg = notional_min_avg
             
         self._new_low_window = new_low_window
         self._symbol: str = ""

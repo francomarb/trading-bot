@@ -4,14 +4,10 @@ Bollinger Squeeze edge filter.
 BollingerSqueezeEdgeFilter enforces three entry gates on top of the squeeze
 strategy's price/volatility signal:
 
-  Rule 1 — Minimum liquidity (IEX-scaled):
+  Rule 1 — Minimum liquidity:
     20-day average dollar volume ≥ notional_min_avg.
     The base threshold ($20M) is expressed in *consolidated tape* terms.
-    When ALPACA_DATA_FEED == "iex" we see only ~5% of consolidated volume,
-    so the threshold is multiplied by 0.05 (effective $1M on IEX). This is
-    the SINGLE point of feed-conditionality in the squeeze stack — flipping
-    to SIP later is a one-env-var change.
-    Mirrors strategies/filters/rsi_reversion.py:113-117.
+    The volume data is dynamically scaled to "Synthetic SIP" terms in the data fetcher.
     Fails open when volume column is missing or there is insufficient history.
 
   Rule 2 — Earnings blackout:
@@ -38,8 +34,7 @@ that is enforced by BaseStrategy.
 
 Observability:
   - Every allow/block decision on the last bar is logged with the specific
-    reason(s) and the displayed liquidity threshold (so the IEX scaling
-    can be verified at runtime).
+    reason(s) and the displayed liquidity threshold.
 
 Usage:
     from strategies.filters.bollinger_squeeze import BollingerSqueezeEdgeFilter
@@ -59,8 +54,6 @@ from strategies.filters.common import EarningsBlackout
 
 _VOL_MIN_WINDOW = 20
 _NOTIONAL_MIN_AVG = 20_000_000  # $20M consolidated-tape average daily dollar volume
-_IEX_VOLUME_FRACTION = 0.05     # IEX prints ~5% of consolidated volume
-
 _EARNINGS_DAYS_BEFORE = 2
 _EARNINGS_DAYS_AFTER = 1
 
@@ -77,8 +70,7 @@ class BollingerSqueezeEdgeFilter:
     Args:
         vol_min_window:        Rolling window for average dollar volume (default 20).
         notional_min_avg:      Base $ threshold expressed in consolidated tape
-                               terms (default $20M). When running on IEX,
-                               this value is scaled by 0.05.
+                               terms (default $20M).
         days_before:           Earnings blackout days before announcement (default 2).
         days_after:            Earnings blackout days after announcement (default 1).
         bb_length:             Bollinger Bands length used for the exhaustion check
@@ -105,13 +97,7 @@ class BollingerSqueezeEdgeFilter:
     ) -> None:
         self._vol_min_window = vol_min_window
 
-        # IEX sees ~5% of consolidated market volume. Scale ONLY when on IEX.
-        # Any other feed (sip, future paid feeds) leaves the threshold unscaled,
-        # so a SIP transition is a single env-var flip.
-        if ALPACA_DATA_FEED == "iex":
-            self._notional_min_avg = int(notional_min_avg * _IEX_VOLUME_FRACTION)
-        else:
-            self._notional_min_avg = int(notional_min_avg)
+        self._notional_min_avg = int(notional_min_avg)
 
         self._earnings = EarningsBlackout(
             days_before=days_before,

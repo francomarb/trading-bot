@@ -506,6 +506,10 @@ class TradingEngine:
             # watchlist membership. Used by SleeveAllocator to count open
             # orders against the correct strategy's sleeve budget.
             order_strategy = self._attribute_orders(snapshot.open_orders)
+            
+            # Cancel any entry limit orders that have exceeded the STALE_LIMIT_MAX_AGE_SECONDS
+            self._cleanup_stale_orders(snapshot, order_strategy)
+
 
             self._watchlist_statuses = {}
             for slot in self.slots:
@@ -1274,6 +1278,35 @@ class TradingEngine:
                 logger.error(msg)
                 self.risk.record_broker_error()
                 self.alerts.broker_error(msg)
+
+    def _cleanup_stale_orders(self, snapshot: BrokerSnapshot, order_strategy: dict[str, str]) -> None:
+        """
+        Cancel any entry LIMIT orders that have been open for too long.
+        This prevents 'ghost fills' where a limit order from days ago
+        suddenly executes after market conditions have completely changed.
+        """
+        now = datetime.now(timezone.utc)
+        max_age = settings.STALE_LIMIT_MAX_AGE_SECONDS
+        
+        for order in snapshot.open_orders:
+            # Only consider orders that are identified as ENTRY orders
+            strategy_name = order_strategy.get(order.order_id)
+            if not strategy_name:
+                continue
+                
+            # Only consider LIMIT orders
+            if getattr(order.order_type, "value", str(order.order_type)) != "limit":
+                continue
+                
+            # Check age
+            age_seconds = (now - order.submitted_at).total_seconds()
+            if age_seconds > max_age:
+                logger.warning(
+                    f"{order.symbol}: canceling stale entry limit order "
+                    f"{order.order_id} ({age_seconds:.0f}s old, max {max_age}s) "
+                    f"for strategy '{strategy_name}'"
+                )
+                self.broker.cancel_order(order.order_id)
 
     # ── Startup ownership + reconciliation (10.C1 / 10.C2) ─────────────
 
