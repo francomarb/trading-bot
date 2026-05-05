@@ -95,6 +95,7 @@ if TYPE_CHECKING:
 _BAR_INTERVAL: dict[str, timedelta] = {
     "1Day": timedelta(days=1),
     "1Hour": timedelta(hours=1),
+    "5Min": timedelta(minutes=5),
     "1Min": timedelta(minutes=1),
 }
 
@@ -104,6 +105,7 @@ _BAR_INTERVAL: dict[str, timedelta] = {
 _CALENDAR_DAYS_PER_BAR: dict[str, float] = {
     "1Day": 1.5,
     "1Hour": 1.0 / 6.5,
+    "5Min": 5.0 / (6.5 * 60),
     "1Min": 1.0 / (6.5 * 60),
 }
 
@@ -693,7 +695,7 @@ class TradingEngine:
         last_entry = bool(signals.entries.iloc[-1])
         last_exit = bool(signals.exits.iloc[-1])
 
-        position = account.open_positions.get(symbol)
+        position = self._get_position_for(symbol, snapshot)
         logger.info(
             f"[{strategy.name}] {symbol}: bar={latest_ts.isoformat()} "
             f"close=${latest_close:.2f} atr=${latest_atr:.2f} "
@@ -708,7 +710,16 @@ class TradingEngine:
 
         # 5. Exit branch — close before considering entries (always safe to
         # reduce risk; never blocked by halt).
-        if last_exit and position is not None:
+        emergency_exit = False
+        if not last_exit and position is not None:
+            try:
+                emergency_exit = strategy.inspect_open_positions(position, latest_close)
+                if emergency_exit:
+                    logger.warning(f"[{strategy.name}] {symbol}: EMERGENCY EXIT triggered by strategy hook.")
+            except Exception as e:
+                logger.error(f"[{strategy.name}] {symbol}: inspect_open_positions failed: {e}")
+
+        if (last_exit or emergency_exit) and position is not None:
             # Only the strategy that opened the position may close it.
             owner = self._position_owners.get(symbol)
             if owner is not None and owner != strategy.name:
@@ -733,7 +744,7 @@ class TradingEngine:
                 )
                 return
             try:
-                result = self.broker.close_position(symbol)
+                result = self.broker.close_position(position.symbol)
                 # close_position always uses MARKET (hard-risk exit).
                 self._record_fill(result, modeled_price=latest_close, order_type="market")
                 self._log_close(result, latest_close, strategy.name)
@@ -844,14 +855,36 @@ class TradingEngine:
                 return None
             notional_cap = sleeve.per_position_notional
 
+        target_symbol = symbol
+        target_price = latest_close
+        take_profit = None
+        stop_price = None
+
+        if hasattr(strategy, "build_option_execution"):
+            try:
+                opt_sym, opt_price, opt_tp, opt_sl = strategy.build_option_execution(symbol, latest_close)
+                target_symbol = opt_sym
+                target_price = opt_price
+                take_profit = opt_tp
+                stop_price = opt_sl
+                logger.info(f"[{strategy.name}] Option Execution override: {symbol} -> {target_symbol} at ${target_price:.2f}")
+            except Exception as e:
+                logger.error(f"[{strategy.name}] Failed to build option execution for {symbol}: {e}")
+                self._mark_signal_bar_processed(
+                    signal_key, signal_bar, strategy_statuses, strategy_reasons, symbol
+                )
+                return None
+
         sig = Signal(
-            symbol=symbol,
+            symbol=target_symbol,
             side=Side.BUY,
             strategy_name=strategy.name,
-            reference_price=latest_close,
+            reference_price=target_price,
             atr=latest_atr,
             reason=f"{strategy.name} entry @ {latest_ts.isoformat()}",
             order_type=strategy.preferred_order_type,
+            take_profit_price=take_profit,
+            stop_price_override=stop_price,
         )
         decision = self.risk.evaluate(sig, account, notional_cap=notional_cap)
         if isinstance(decision, RiskRejection):
@@ -1265,7 +1298,7 @@ class TradingEngine:
     def _has_pending_close_order(symbol: str, snapshot: BrokerSnapshot) -> bool:
         """True if there's already an open SELL order for this symbol."""
         return any(
-            o.symbol == symbol and o.side is Side.SELL
+            TradingEngine._is_matching_symbol(symbol, o.symbol) and o.side is Side.SELL
             for o in snapshot.open_orders
         )
 
@@ -1273,9 +1306,29 @@ class TradingEngine:
     def _has_protective_stop_order(symbol: str, snapshot: BrokerSnapshot) -> bool:
         """True if there's already an open SELL stop order for this symbol."""
         return any(
-            o.symbol == symbol and o.side is Side.SELL and o.stop_price is not None
+            TradingEngine._is_matching_symbol(symbol, o.symbol) and o.side is Side.SELL and o.stop_price is not None
             for o in snapshot.open_orders
         )
+
+    @staticmethod
+    def _get_position_for(symbol: str, snapshot: BrokerSnapshot):
+        """Get the position for the symbol or its corresponding option contract."""
+        position = snapshot.account.open_positions.get(symbol)
+        if position is not None:
+            return position
+        import re
+        for pos_symbol, pos in snapshot.account.open_positions.items():
+            if re.match(rf"^{symbol}[0-9]{{6}}[CP][0-9]{{8}}$", pos_symbol):
+                return pos
+        return None
+
+    @staticmethod
+    def _is_matching_symbol(target: str, actual: str) -> bool:
+        """Return True if actual matches target exactly or is an OCC option of target."""
+        if actual == target:
+            return True
+        import re
+        return bool(re.match(rf"^{target}[0-9]{{6}}[CP][0-9]{{8}}$", actual))
 
     def _repair_missing_protective_stops(self, snapshot: BrokerSnapshot) -> None:
         """
@@ -1380,7 +1433,7 @@ class TradingEngine:
         confirm = self.config.external_close_confirm_cycles
 
         for symbol in list(self._position_owners):
-            if symbol in snapshot.account.open_positions:
+            if self._get_position_for(symbol, snapshot) is not None:
                 # Position is present — reset any suspect counter and continue.
                 self._external_close_suspects.pop(symbol, None)
                 continue

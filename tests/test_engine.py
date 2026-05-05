@@ -289,7 +289,7 @@ class TestLookbackDays:
 
     def test_unknown_timeframe_uses_conservative_default(self):
         # Unknown → 1.5 days/bar (same as daily)
-        assert _lookback_days(100, "5Min", config_lookback=10) == int(100 * 1.5) + 5
+        assert _lookback_days(100, "2Min", config_lookback=10) == int(100 * 1.5) + 5
 
 
 # ── _process_symbol: every branch ────────────────────────────────────────────

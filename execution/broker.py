@@ -49,6 +49,7 @@ from typing import TYPE_CHECKING
 if TYPE_CHECKING:
     from execution.stream import StreamManager
 
+from execution.options_executor import OptionsExecutionWorker
 from alpaca.common.exceptions import APIError
 from alpaca.trading.client import TradingClient
 from alpaca.trading.enums import (
@@ -384,6 +385,29 @@ class AlpacaBroker:
         if math.floor(decision.qty) != decision.qty:
             return self._place_fractional_order(
                 decision, poll_timeout=poll_timeout, poll_interval=poll_interval
+            )
+            
+        import re
+        is_option = bool(re.match(r"^[A-Z]{1,6}[0-9]{6}[CP][0-9]{8}$", decision.symbol))
+        if is_option and decision.order_type is OrderType.LIMIT:
+            # Dispatch to background options worker
+            worker = OptionsExecutionWorker(
+                decision=decision,
+                api=self._api,
+                stream_manager=self._stream_manager
+            )
+            worker.start()
+            
+            # Return ACCEPTED immediately so engine is not blocked
+            return OrderResult(
+                status=OrderStatus.ACCEPTED,
+                order_id=f"opt-worker-{uuid.uuid4().hex[:10]}",
+                symbol=decision.symbol,
+                requested_qty=decision.qty,
+                filled_qty=0.0,
+                avg_fill_price=0.0,
+                raw_status="accepted",
+                message="dispatched to OptionsExecutionWorker",
             )
 
         # Build request object.

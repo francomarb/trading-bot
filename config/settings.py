@@ -126,6 +126,7 @@ STRATEGY_WATCHLISTS: dict[str, list[str]] = {
     "rsi_reversion":      RSI_WATCHLIST,
     "bollinger_squeeze":  BOLLINGER_WATCHLIST,
     "donchian_breakout":  DONCHIAN_WATCHLIST,
+    "spy_options_reversion": ["SPY"],
 }
 REGIME_MAX_CONSECUTIVE_FAILURES: int = 3
 
@@ -168,6 +169,7 @@ STRATEGY_ALLOWED_REGIMES: dict[str, set[str]] = {
     # Donchian whipsaws hard in RANGING regimes (every 20-day high gets faded).
     # Restrict to TRENDING only — academic literature is unanimous on this.
     "donchian_breakout": {"TRENDING"},
+    "spy_options_reversion": {"TRENDING", "RANGING"},
 }
 
 # ── Capital allocation (Phase 10.F1) ────────────────────────────────────────
@@ -189,9 +191,10 @@ STRATEGY_ALLOWED_REGIMES: dict[str, set[str]] = {
 # full 0.50 sleeve was mostly idle. Donchian gets 0.25 following backtest
 # validation (Sharpe +0.80 on AI/Bigtech, Mid-range 30/15 variant).
 STRATEGY_ALLOCATIONS: dict[str, dict] = {
-    "sma_crossover":    {"weight": 0.50, "max_positions": 5},
+    "sma_crossover":    {"weight": 0.45, "max_positions": 5},
     "rsi_reversion":    {"weight": 0.25, "max_positions": 5},
     "donchian_breakout": {"weight": 0.25, "max_positions": 5},
+    "spy_options_reversion": {"weight": 0.05, "max_positions": 1},
 }
 MIN_TRADE_NOTIONAL = 100.0      # Reject entries if sleeve available < this
 
