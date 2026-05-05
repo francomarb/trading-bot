@@ -117,6 +117,7 @@ class SMAEdgeFilter:
         self._vol_short = vol_short_window
         self._vol_long = vol_long_window
         self._symbol: str = ""
+        self._last_reasons: list[str] = []
 
         self._earnings = EarningsBlackout(
             days_before=days_before,
@@ -186,6 +187,7 @@ class SMAEdgeFilter:
             earnings_ok  = bool(earnings_gate.iloc[-1])
 
             if allowed:
+                self._last_reasons = []
                 logger.debug(
                     f"SMAEdgeFilter: ALLOWED {self._symbol} — "
                     f"stock>200SMA vol_expanding no_earnings_blackout"
@@ -206,9 +208,15 @@ class SMAEdgeFilter:
                     )
                 if not earnings_ok:
                     reasons.append("earnings blackout (gap-risk protection)")
+                self._last_reasons = reasons
                 logger.info(
                     f"SMAEdgeFilter: BLOCKED {self._symbol} — "
                     + ", ".join(reasons)
                 )
+        else:
+            self._last_reasons = []
 
         return combined
+
+    def get_last_block_reasons(self) -> list[str]:
+        return list(self._last_reasons)

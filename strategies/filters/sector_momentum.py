@@ -64,16 +64,19 @@ class SectorMomentumFilter:
         self._sector_entry_policy = sector_entry_policy
         self._score_threshold = score_threshold
         self._symbol: str = ""
+        self._last_reasons: list[str] = []
 
     def set_symbol(self, symbol: str) -> None:
         self._symbol = symbol
 
     def __call__(self, df: pd.DataFrame) -> pd.Series:
         if not self._symbol:
+            self._last_reasons = []
             return pd.Series(True, index=df.index, dtype=bool)
 
         sector = self._resolver.resolve(self._symbol)
         if sector is None:
+            self._last_reasons = []
             logger.debug(
                 f"SectorMomentumFilter: {self._symbol} has no sector mapping "
                 "— allowing entry (fail-open)"
@@ -89,6 +92,10 @@ class SectorMomentumFilter:
             triggered = detail.classification == SectorMomentum.COLD
 
         if triggered:
+            reason = (
+                f"cold sector {sector}/{detail.etf_ticker} "
+                f"(score={detail.score:+d}, class={detail.classification.value})"
+            )
             signal_str = (
                 f">SMA200={detail.above_sma200}, >SMA50={detail.above_sma50}, "
                 f"golden_cross={detail.golden_cross}, "
@@ -96,6 +103,7 @@ class SectorMomentumFilter:
                 f"vol_confirm={detail.vol_confirm}"
             )
             if self._sector_entry_policy == "block":
+                self._last_reasons = [reason]
                 logger.info(
                     f"SECTOR GATE [block]: {self._symbol} "
                     f"({sector}/{detail.etf_ticker}) "
@@ -104,6 +112,7 @@ class SectorMomentumFilter:
                 )
                 return pd.Series(False, index=df.index, dtype=bool)
             elif self._sector_entry_policy == "warn":
+                self._last_reasons = []
                 logger.info(
                     f"SECTOR GATE [warn]: {self._symbol} "
                     f"({sector}/{detail.etf_ticker}) "
@@ -112,10 +121,16 @@ class SectorMomentumFilter:
                 )
 
         elif detail.classification == SectorMomentum.HOT:
+            self._last_reasons = []
             logger.debug(
                 f"SectorMomentumFilter: {self._symbol} "
                 f"({sector}/{detail.etf_ticker}) "
                 f"score={detail.score} [HOT]"
             )
+        else:
+            self._last_reasons = []
 
         return pd.Series(True, index=df.index, dtype=bool)
+
+    def get_last_block_reasons(self) -> list[str]:
+        return list(self._last_reasons)

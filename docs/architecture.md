@@ -270,18 +270,25 @@ class BaseStrategy(ABC):
 - The engine shifts execution to bar t+1's open
 
 **Edge filter contract:**
-- A strategy may be constructed with `edge_filter(df) -> pd.Series[bool]`
+- The repo standard is a structured edge-filter decision carrying both `allowed` and `reasons`
+- `BaseStrategy` centrally normalizes both supported edge-filter return types:
+  - `EdgeFilterDecision` — preferred for new or upgraded filters
+  - `pd.Series[bool]` — compatibility-only fallback for legacy or trivial filters
+- `inspect_signals(...)` is the canonical observability seam: it exposes the raw signals, filtered signals, latest edge allow/block state, and latest block reasons
+- A strategy may still be constructed with a legacy `edge_filter(df) -> pd.Series[bool]` during the rollout
 - `_raw_signals(df)` computes the strategy's unfiltered setup first
 - `generate_signals(df)` AND-gates entries with the edge filter
 - Exits are never blocked by the edge filter
 - Missing, NaN, or false filter values block entries by default
+- The engine persists watchlist `Status` and `Reason` from this normalized decision path; the dashboard only renders what the engine writes
 
 **Filter file layout:**
 - Strategy-specific edge filters live in `strategies/filters/<strategy_name>.py`
 - Shared filter helpers live in `strategies/filters/common.py` — includes `SPYTrendFilter` and `CompositeEdgeFilter`
-- `CompositeEdgeFilter` AND-chains multiple `EdgeFilter` callables; each strategy constructs its own composite
+- `CompositeEdgeFilter` composes normalized edge-filter decisions internally and preserves all blocking reasons for the latest bar
 - `SectorMomentumFilter` (`strategies/filters/sector_momentum.py`) is a reusable adapter that queries the `SectorMomentumGauge` and applies a configurable `sector_entry_policy` ("block" | "warn" | "pass")
 - Do not use edge filters for universe selection; `WatchlistSource` owns symbol selection
+- New filters with meaningful operator-facing diagnostics should return `EdgeFilterDecision`; plain boolean `pd.Series` is being phased out as the primary authoring style
 
 **StrategySlot:**
 Each slot binds a strategy to its symbol universe, timeframe, and allowed regimes. The engine iterates over slots each cycle.
@@ -422,10 +429,11 @@ When implementing any new strategy:
 5. Implement `_raw_signals(df) -> SignalFrame` — entries/exits boolean Series
 6. Override `required_bars()` if the strategy needs more than 50 bars
 7. Create `strategies/filters/<strategy_name>.py` with an `EdgeFilter` subclass
-8. Add an entry to `STRATEGY_ALLOCATIONS` in `config/settings.py`
-9. Add unit tests in `tests/test_strategies.py` and `tests/test_filters.py`
-10. Add a `StrategySlot` with `allowed_regimes` in `forward_test.py`
-11. Update `docs/strategies.md`
+8. If the filter has meaningful block reasons, return `EdgeFilterDecision` rather than a plain boolean series
+9. Add an entry to `STRATEGY_ALLOCATIONS` in `config/settings.py`
+10. Add unit tests in `tests/test_strategies.py` and `tests/test_filters.py`
+11. Add a `StrategySlot` with `allowed_regimes` in `forward_test.py`
+12. Update `docs/strategies.md`
 
 ---
 

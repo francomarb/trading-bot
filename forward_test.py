@@ -33,6 +33,7 @@ from __future__ import annotations
 import sys
 import subprocess
 from datetime import datetime, timezone
+from collections import defaultdict
 
 from loguru import logger
 
@@ -74,6 +75,56 @@ logger.add(
     level="INFO",
 )
 logger.add("logs/forward_test.log", rotation="10 MB", retention="90 days", level="DEBUG")
+
+
+def _build_sector_heat_snapshot(
+    *,
+    gauge: SectorMomentumGauge,
+    resolver: SectorResolver,
+    slots: list[StrategySlot],
+) -> dict:
+    """Build a session-stable sector heat payload for the dashboard snapshot."""
+    details = {
+        sector: gauge.get_details(sector)
+        for sector in sorted(settings.SECTOR_ETFS)
+    }
+    counts = {"hot": 0, "neutral": 0, "cold": 0}
+    sectors_payload: dict[str, dict] = {}
+    symbol_map: dict[str, list[dict[str, object]]] = defaultdict(list)
+    unmapped: list[dict[str, object]] = []
+
+    for sector, detail in details.items():
+        counts[detail.classification.value] += 1
+        sectors_payload[sector] = {
+            "etf_ticker": detail.etf_ticker,
+            "score": int(detail.score),
+            "classification": detail.classification.value,
+            "above_sma200": bool(detail.above_sma200),
+            "above_sma50": bool(detail.above_sma50),
+            "golden_cross": bool(detail.golden_cross),
+            "dist_sma50_pct": float(detail.dist_sma50_pct),
+            "vol_confirm": bool(detail.vol_confirm),
+            "last_close": float(detail.last_close) if detail.last_close is not None else None,
+        }
+
+    for slot in slots:
+        strategy_name = slot.strategy.name
+        for symbol in slot.active_symbols():
+            sector = resolver.resolve(symbol)
+            item = {"symbol": symbol, "strategy": strategy_name}
+            if sector is None:
+                unmapped.append(item)
+            else:
+                symbol_map[sector].append(item)
+
+    return {
+        "generated_at": datetime.now(timezone.utc).isoformat(),
+        "counts": counts,
+        "sectors": sectors_payload,
+        "symbol_map": {sector: sorted(items, key=lambda x: (x["symbol"], x["strategy"]))
+                       for sector, items in sorted(symbol_map.items())},
+        "unmapped": sorted(unmapped, key=lambda x: (x["symbol"], x["strategy"])),
+    }
 
 
 def _git_version() -> str:
@@ -251,6 +302,11 @@ def main() -> None:
         stream_manager=stream,
         regime_detector=regime,
         allocator=allocator,
+    )
+    engine._sector_heat = _build_sector_heat_snapshot(
+        gauge=sector_gauge,
+        resolver=sector_resolver,
+        slots=slots,
     )
 
     slot_desc = ", ".join(

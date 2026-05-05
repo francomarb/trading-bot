@@ -114,6 +114,7 @@ class RSIEdgeFilter:
             
         self._new_low_window = new_low_window
         self._symbol: str = ""
+        self._last_reasons: list[str] = []
 
     def set_symbol(self, symbol: str) -> None:
         """Injected by BaseStrategy.generate_signals before __call__."""
@@ -165,6 +166,7 @@ class RSIEdgeFilter:
             low_ok    = bool(low_gate.iloc[-1])
 
             if allowed:
+                self._last_reasons = []
                 logger.info(
                     f"RSI_FILTER_ALLOWED {self._symbol} — "
                     f"SPY={spy_ok} earnings={earn_ok} "
@@ -191,9 +193,15 @@ class RSIEdgeFilter:
                     reasons.append(
                         f"new {self._new_low_window}-day low (active breakdown)"
                     )
+                self._last_reasons = reasons
                 logger.info(
                     f"RSI_FILTER_BLOCKED {self._symbol} — "
                     + ", ".join(reasons)
                 )
+        else:
+            self._last_reasons = []
 
         return combined
+
+    def get_last_block_reasons(self) -> list[str]:
+        return list(self._last_reasons)

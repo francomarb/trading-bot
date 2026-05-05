@@ -22,7 +22,9 @@ from unittest.mock import MagicMock, patch
 import pandas as pd
 import pytest
 
+from strategies.base import EdgeFilterDecision
 from strategies.filters.common import EarningsBlackout, SPYTrendFilter
+from strategies.filters.common import CompositeEdgeFilter
 from strategies.filters.sma_crossover import SMAEdgeFilter
 from strategies.filters.rsi_reversion import RSIEdgeFilter
 
@@ -811,8 +813,9 @@ class TestBollingerSqueezeEdgeFilterGates:
         )
         # close=100, vol=20_000 → dollar_vol = 2M >> 1M threshold
         df = _liquid_ohlc_df(25, close=100.0, avg_vol=20_000)
-        gate = f(df)
-        assert gate.iloc[-1]
+        decision = f(df)
+        assert decision.allowed.iloc[-1]
+        assert decision.latest_reasons == []
 
     def test_liquidity_below_threshold_blocks(self, monkeypatch):
         f = self._filter(
@@ -823,8 +826,9 @@ class TestBollingerSqueezeEdgeFilterGates:
         )
         # close=100, vol=20_000 → dollar_vol=2M << 10M threshold
         df = _liquid_ohlc_df(25, close=100.0, avg_vol=20_000)
-        gate = f(df)
-        assert not gate.iloc[-1]
+        decision = f(df)
+        assert not decision.allowed.iloc[-1]
+        assert any("liquidity too low" in reason for reason in decision.latest_reasons)
 
     def test_liquidity_no_volume_column_fails_open(self, monkeypatch):
         f = self._filter(
@@ -838,8 +842,9 @@ class TestBollingerSqueezeEdgeFilterGates:
             {"close": [100.0] * 25, "high": [101.0] * 25, "low": [99.0] * 25},
             index=idx,
         )  # no volume
-        gate = f(df)
-        assert gate.iloc[-1]
+        decision = f(df)
+        assert decision.allowed.iloc[-1]
+        assert decision.latest_reasons == []
 
     def test_liquidity_insufficient_history_fails_open(self, monkeypatch):
         f = self._filter(
@@ -849,8 +854,9 @@ class TestBollingerSqueezeEdgeFilterGates:
             exhaustion_atr_mult=10.0,
         )
         df = _liquid_ohlc_df(5, close=100.0, avg_vol=20_000)  # only 5 bars
-        gate = f(df)
-        assert gate.iloc[-1]  # NaN avg → fail open
+        decision = f(df)
+        assert decision.allowed.iloc[-1]  # NaN avg → fail open
+        assert decision.latest_reasons == []
 
 
 
@@ -884,8 +890,9 @@ class TestBollingerSqueezeEdgeFilterGates:
             },
             index=idx,
         )
-        gate = f(df)
-        assert not gate.iloc[-1]
+        decision = f(df)
+        assert not decision.allowed.iloc[-1]
+        assert any("exhausted" in reason for reason in decision.latest_reasons)
 
     def test_exhaustion_gate_allows_normal_close(self, monkeypatch):
         f = self._filter(
@@ -897,8 +904,9 @@ class TestBollingerSqueezeEdgeFilterGates:
             exhaustion_atr_mult=1.5,
         )
         df = _liquid_ohlc_df(15, close=100.0, avg_vol=10_000_000)  # flat → not exhausted
-        gate = f(df)
-        assert gate.iloc[-1]
+        decision = f(df)
+        assert decision.allowed.iloc[-1]
+        assert decision.latest_reasons == []
 
     def test_set_symbol_propagates_to_earnings(self, monkeypatch):
         from strategies.filters import bollinger_squeeze as bsq
@@ -916,6 +924,31 @@ class TestBollingerSqueezeEdgeFilterGates:
         f = bsq.BollingerSqueezeEdgeFilter()
         assert f._earnings._days_before == 2
         assert f._earnings._days_after == 1
+
+
+class TestCompositeEdgeFilter:
+    def test_merges_structured_and_legacy_reasons(self):
+        idx = pd.date_range("2024-01-01", periods=3, freq="B")
+        df = pd.DataFrame({"close": [1.0, 2.0, 3.0]}, index=idx)
+
+        class _StructuredFilter:
+            def __call__(self, df):
+                return EdgeFilterDecision(
+                    allowed=pd.Series([True, True, False], index=df.index, dtype=bool),
+                    reasons=pd.Series([[], [], ["earnings blackout"]], index=df.index, dtype=object),
+                )
+
+        class _LegacyFilter:
+            def __call__(self, df):
+                return pd.Series([True, True, False], index=df.index, dtype=bool)
+
+            def get_last_block_reasons(self):
+                return ["volume contracting"]
+
+        composite = CompositeEdgeFilter([_StructuredFilter(), _LegacyFilter()])
+        decision = composite(df)
+        assert decision.allowed.tolist() == [True, True, False]
+        assert decision.latest_reasons == ["earnings blackout", "volume contracting"]
 
 
 # ── TestDonchianEdgeFilter ────────────────────────────────────────────────────

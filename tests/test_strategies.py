@@ -20,7 +20,7 @@ from __future__ import annotations
 import pandas as pd
 import pytest
 
-from strategies.base import BaseStrategy, OrderType, SignalFrame
+from strategies.base import BaseStrategy, EdgeFilterDecision, OrderType, SignalFrame
 from strategies.rsi_reversion import RSIReversion
 from strategies.sma_crossover import SMACrossover
 
@@ -118,6 +118,37 @@ class TestEdgeFilter:
         gate = pd.Series([True, False, True, False, True], index=df.index)
         sig = self._always_true_strategy()(edge_filter=lambda _df: gate).generate_signals(df)
         assert sig.entries.tolist() == [True, False, True, False, True]
+
+    def test_structured_filter_blocks_entries_and_exposes_reasons(self):
+        df = _df([1, 2, 3, 4, 5])
+
+        def _edge_filter(_df: pd.DataFrame) -> EdgeFilterDecision:
+            allowed = pd.Series([True, True, True, True, False], index=_df.index, dtype=bool)
+            reasons = pd.Series([[], [], [], [], ["earnings blackout"]], index=_df.index, dtype=object)
+            return EdgeFilterDecision(allowed=allowed, reasons=reasons)
+
+        strategy = self._always_true_strategy()(edge_filter=_edge_filter)
+        raw, filtered, edge_allowed, edge_reasons = strategy.inspect_signals(df)
+        assert raw.entries.tolist() == [True, True, True, True, True]
+        assert filtered.entries.tolist() == [True, True, True, True, False]
+        assert edge_allowed is False
+        assert edge_reasons == ["earnings blackout"]
+
+    def test_legacy_filter_reasons_are_preserved_when_getter_exists(self):
+        df = _df([1, 2, 3])
+
+        class _LegacyFilter:
+            def __call__(self, _df: pd.DataFrame) -> pd.Series:
+                return pd.Series([True, True, False], index=_df.index, dtype=bool)
+
+            def get_last_block_reasons(self) -> list[str]:
+                return ["legacy block"]
+
+        strategy = self._always_true_strategy()(edge_filter=_LegacyFilter())
+        _raw, filtered, edge_allowed, edge_reasons = strategy.inspect_signals(df)
+        assert filtered.entries.tolist() == [True, True, False]
+        assert edge_allowed is False
+        assert edge_reasons == ["legacy block"]
 
     def test_filter_does_not_block_exits(self):
         class AlwaysExit(BaseStrategy):

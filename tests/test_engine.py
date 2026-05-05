@@ -50,7 +50,7 @@ from risk.manager import (
     RiskManager,
     Side,
 )
-from strategies.base import BaseStrategy, OrderType, SignalFrame
+from strategies.base import BaseStrategy, EdgeFilterDecision, OrderType, SignalFrame
 
 
 # ── Fakes ────────────────────────────────────────────────────────────────────
@@ -839,6 +839,7 @@ class TestWatchlistStatuses:
         engine._session_start_equity = snap.account.equity
         slot = engine.slots[0]
         statuses = {"AAPL": "No Signal"}
+        reasons = {"AAPL": []}
         engine._process_symbol(
             "AAPL",
             snap,
@@ -846,17 +847,30 @@ class TestWatchlistStatuses:
             slot.strategy,
             slot.timeframe,
             entry_allowed=False,
+            regime_block_reason="regime bear not in allowed set ['trending']",
             strategy_statuses=statuses,
+            strategy_reasons=reasons,
         )
         assert statuses["AAPL"] == "Regime Blocked"
+        assert reasons["AAPL"] == ["regime bear not in allowed set ['trending']"]
         broker.place_order.assert_not_called()
 
     def test_filter_blocked_status_when_raw_entry_vetoed(self, engine_factory):
-        edge_filter = lambda df: pd.Series([False] * len(df), index=df.index, dtype=bool)
+        class _BlockingFilter:
+            def __call__(self, df):
+                return EdgeFilterDecision(
+                    allowed=pd.Series([False] * len(df), index=df.index, dtype=bool),
+                    reasons=pd.Series(
+                        [["volume contracting", "earnings blackout"] for _ in range(len(df))],
+                        index=df.index,
+                        dtype=object,
+                    ),
+                )
+
         strategy = FakeStrategy(
             entries=[False] * 59 + [True],
             exits=[False],
-            edge_filter=edge_filter,
+            edge_filter=_BlockingFilter(),
         )
         engine, broker = engine_factory()
         engine.slots[0].strategy = strategy
@@ -864,6 +878,7 @@ class TestWatchlistStatuses:
         snap = _snapshot()
         engine._session_start_equity = snap.account.equity
         statuses = {"AAPL": "No Signal"}
+        reasons = {"AAPL": []}
         engine._process_symbol(
             "AAPL",
             snap,
@@ -871,8 +886,10 @@ class TestWatchlistStatuses:
             strategy,
             engine.slots[0].timeframe,
             strategy_statuses=statuses,
+            strategy_reasons=reasons,
         )
         assert statuses["AAPL"] == "Filter Blocked"
+        assert reasons["AAPL"] == ["volume contracting", "earnings blackout"]
         broker.place_order.assert_not_called()
 
     def test_filter_blocked_status_when_edge_filter_fails_without_raw_entry(
@@ -901,6 +918,41 @@ class TestWatchlistStatuses:
         assert statuses["AAPL"] == "Filter Blocked"
         broker.place_order.assert_not_called()
 
+    def test_filter_blocked_status_when_legacy_filter_exposes_reasons(
+        self, engine_factory
+    ):
+        class _LegacyBlockingFilter:
+            def __call__(self, df):
+                return pd.Series([False] * len(df), index=df.index, dtype=bool)
+
+            def get_last_block_reasons(self):
+                return ["legacy reason"]
+
+        strategy = FakeStrategy(
+            entries=[False] * 59 + [True],
+            exits=[False],
+            edge_filter=_LegacyBlockingFilter(),
+        )
+        engine, broker = engine_factory()
+        engine.slots[0].strategy = strategy
+        engine.strategy = strategy
+        snap = _snapshot()
+        engine._session_start_equity = snap.account.equity
+        statuses = {"AAPL": "No Signal"}
+        reasons = {"AAPL": []}
+        engine._process_symbol(
+            "AAPL",
+            snap,
+            snap.account,
+            strategy,
+            engine.slots[0].timeframe,
+            strategy_statuses=statuses,
+            strategy_reasons=reasons,
+        )
+        assert statuses["AAPL"] == "Filter Blocked"
+        assert reasons["AAPL"] == ["legacy reason"]
+        broker.place_order.assert_not_called()
+
     def test_state_snapshot_includes_watchlist_statuses(self, engine_factory):
         import json
         from config import settings
@@ -918,6 +970,35 @@ class TestWatchlistStatuses:
         engine._watchlist_statuses = {
             "sma_crossover": {"AAPL": "Long", "MSFT": "Regime Blocked"}
         }
+        engine._watchlist_reasons = {
+            "sma_crossover": {
+                "AAPL": [],
+                "MSFT": ["regime bear not in allowed set ['trending']"],
+            }
+        }
+        engine._sector_heat = {
+            "generated_at": "2026-05-01T12:00:00+00:00",
+            "counts": {"hot": 2, "neutral": 3, "cold": 1},
+            "sectors": {
+                "technology": {
+                    "etf_ticker": "XLK",
+                    "score": 4,
+                    "classification": "hot",
+                    "above_sma200": True,
+                    "above_sma50": True,
+                    "golden_cross": True,
+                    "dist_sma50_pct": 0.031,
+                    "vol_confirm": True,
+                    "last_close": 240.5,
+                }
+            },
+            "symbol_map": {
+                "technology": [
+                    {"symbol": "AAPL", "strategy": "sma_crossover"}
+                ]
+            },
+            "unmapped": [],
+        }
         engine._write_state_snapshot()
         with open(settings.STATE_SNAPSHOT_PATH) as fh:
             state = json.load(fh)
@@ -926,6 +1007,12 @@ class TestWatchlistStatuses:
         assert state["session_pnl"] == 250.0
         assert state["watchlist_statuses"]["sma_crossover"]["AAPL"] == "Long"
         assert state["watchlist_statuses"]["sma_crossover"]["MSFT"] == "Regime Blocked"
+        assert state["watchlist_reasons"]["sma_crossover"]["MSFT"] == [
+            "regime bear not in allowed set ['trending']"
+        ]
+        assert state["sector_heat"]["counts"]["hot"] == 2
+        assert state["sector_heat"]["sectors"]["technology"]["score"] == 4
+        assert state["sector_heat"]["symbol_map"]["technology"][0]["symbol"] == "AAPL"
 
     def test_startup_repairs_missing_protective_stop(
         self, engine_factory, tmp_path

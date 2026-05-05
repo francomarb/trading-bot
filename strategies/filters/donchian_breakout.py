@@ -95,6 +95,7 @@ class DonchianEdgeFilter:
         )
 
         self._symbol: str = ""
+        self._last_reasons: list[str] = []
 
     def set_symbol(self, symbol: str) -> None:
         """Injected by BaseStrategy.generate_signals before __call__."""
@@ -142,6 +143,7 @@ class DonchianEdgeFilter:
             threshold_str = f"${self._notional_min_avg:,}"
 
             if allowed:
+                self._last_reasons = []
                 logger.info(
                     f"DONCHIAN_FILTER_ALLOWED {self._symbol} — "
                     f"stock>200SMA={stock_ok} earnings={earn_ok} "
@@ -170,9 +172,15 @@ class DonchianEdgeFilter:
                         f"liquidity too low (avg_dollar_vol{self._vol_min_window}={avg_str} "
                         f"< {threshold_str}, feed={feed_label})"
                     )
+                self._last_reasons = reasons
                 logger.info(
                     f"DONCHIAN_FILTER_BLOCKED {self._symbol} — "
                     + ", ".join(reasons)
                 )
+        else:
+            self._last_reasons = []
 
         return combined
+
+    def get_last_block_reasons(self) -> list[str]:
+        return list(self._last_reasons)

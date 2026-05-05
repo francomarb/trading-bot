@@ -32,6 +32,8 @@ from typing import TYPE_CHECKING
 import pandas as pd
 from loguru import logger
 
+from strategies.base import EdgeFilterDecision, normalize_edge_filter_result
+
 if TYPE_CHECKING:
     pass
 
@@ -149,13 +151,22 @@ class CompositeEdgeFilter:
     """AND-chains multiple ``EdgeFilter`` callables into one.
 
     Each child filter's ``set_symbol()`` is called if it exists, and
-    ``__call__`` results are AND-ed together.
+    ``__call__`` results are normalized and AND-ed together. New filters
+    should return ``EdgeFilterDecision`` when they have meaningful block
+    reasons; plain boolean ``pd.Series`` remains a compatibility fallback.
+
+    Deprecation note:
+        The boolean-only filter style is being phased out for first-party
+        filters. Mixed-mode composition is still supported here so active
+        legacy filters can coexist with migrated structured filters during
+        rollout.
     """
 
     def __init__(self, filters: list) -> None:
         if not filters:
             raise ValueError("CompositeEdgeFilter requires at least one filter")
         self._filters = list(filters)
+        self._last_reasons: list[str] = []
 
     def set_symbol(self, symbol: str) -> None:
         for f in self._filters:
@@ -163,16 +174,34 @@ class CompositeEdgeFilter:
             if callable(setter):
                 setter(symbol)
 
-    def __call__(self, df: pd.DataFrame) -> pd.Series:
-        result: pd.Series | None = None
+    def __call__(self, df: pd.DataFrame) -> pd.Series | EdgeFilterDecision:
+        """
+        Compose child filters over ``df``.
+
+        Returns ``EdgeFilterDecision`` if any child already uses the structured
+        contract; otherwise returns the legacy boolean gate for compatibility
+        with older direct callers.
+        """
+        result: EdgeFilterDecision | None = None
+        saw_structured = False
         for f in self._filters:
-            gate = f(df)
-            if result is None:
-                result = gate
-            else:
-                result = result & gate
+            raw_result = f(df)
+            if isinstance(raw_result, EdgeFilterDecision):
+                saw_structured = True
+            getter = getattr(f, "get_last_block_reasons", None)
+            legacy_blocked_reasons = list(getter() or []) if callable(getter) else None
+            decision = normalize_edge_filter_result(
+                raw_result,
+                df.index,
+                legacy_blocked_reasons=legacy_blocked_reasons,
+            )
+            result = decision if result is None else result.and_with(decision)
         assert result is not None
-        return result
+        self._last_reasons = result.latest_reasons
+        return result if saw_structured else result.allowed
+
+    def get_last_block_reasons(self) -> list[str]:
+        return list(self._last_reasons)
 
 
 # ── EarningsBlackout ─────────────────────────────────────────────────────────

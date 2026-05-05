@@ -23,9 +23,11 @@ Design principles (from CLAUDE.md + PLAN.md):
      whose close triggered them.
 
   4. **Composable edge filters.** A strategy can be constructed with an
-     optional callable `edge_filter(df) -> pd.Series[bool]` that gates
-     entries. This is the minimal "regime awareness" hook: e.g. only emit
-     long entries when SPY > 200-day MA. Full regime detection is Phase 11.
+     optional callable edge filter that gates entries. The preferred contract
+     is `EdgeFilterDecision`; plain `pd.Series[bool]` remains supported only
+     as a compatibility path while legacy filters are phased out. This is the
+     minimal "regime awareness" hook: e.g. only emit long entries when
+     SPY > 200-day MA. Full regime detection is Phase 11.
 
   5. **Strategy declares its preferred order type.** Trend/breakout
      strategies prefer marketable orders; mean-reversion prefers limit. The
@@ -39,7 +41,7 @@ import time
 from abc import ABC, abstractmethod
 from dataclasses import dataclass, field
 from enum import Enum
-from typing import TYPE_CHECKING, Callable
+from typing import TYPE_CHECKING, Callable, Union
 
 import pandas as pd
 
@@ -78,7 +80,192 @@ class SignalFrame:
             raise ValueError("entries and exits must be boolean Series")
 
 
-EdgeFilter = Callable[[pd.DataFrame], pd.Series]
+EdgeFilter = Callable[[pd.DataFrame], Union[pd.Series, "EdgeFilterDecision"]]
+"""Callable edge-filter contract.
+
+Preferred return type: ``EdgeFilterDecision``.
+Compatibility return type: ``pd.Series[bool]``.
+
+Deprecation note:
+    Returning a plain boolean Series is the legacy authoring style and is
+    being phased out for first-party filters. It remains supported during the
+    migration so existing filters and simple external filters continue to work.
+"""
+
+
+@dataclass(frozen=True)
+class EdgeFilterDecision:
+    """
+    Normalized edge-filter result.
+
+    New filters that have meaningful operator-facing diagnostics should return
+    this type directly. Legacy filters may still return ``pd.Series[bool]`` and
+    are normalized centrally by ``BaseStrategy`` as a compatibility path.
+
+    Deprecation note:
+        ``pd.Series[bool]`` remains supported for older filters, but it is no
+        longer the preferred contract for first-party filters because it cannot
+        express structured block reasons on its own.
+    """
+
+    allowed: pd.Series
+    reasons: pd.Series
+
+    def __post_init__(self) -> None:
+        if not self.allowed.index.equals(self.reasons.index):
+            raise ValueError("allowed and reasons must share the same index")
+        if self.allowed.dtype != bool:
+            raise ValueError("allowed must be a boolean Series")
+
+        normalized = []
+        for allowed, raw_reasons in zip(
+            self.allowed.tolist(), self.reasons.tolist(), strict=False
+        ):
+            if raw_reasons is None:
+                reason_list: list[str] = []
+            elif isinstance(raw_reasons, str):
+                reason_list = [raw_reasons]
+            else:
+                reason_list = [str(reason) for reason in list(raw_reasons)]
+            normalized.append([] if allowed else reason_list)
+        object.__setattr__(
+            self,
+            "reasons",
+            pd.Series(normalized, index=self.reasons.index, dtype=object),
+        )
+
+    @classmethod
+    def allow_all(cls, index: pd.Index) -> "EdgeFilterDecision":
+        """Return an all-pass decision over ``index``."""
+        return cls(
+            allowed=pd.Series(True, index=index, dtype=bool),
+            reasons=pd.Series([[] for _ in range(len(index))], index=index, dtype=object),
+        )
+
+    @classmethod
+    def from_bool_series(
+        cls,
+        allowed: pd.Series,
+        *,
+        blocked_reasons: list[str] | None = None,
+    ) -> "EdgeFilterDecision":
+        """
+        Build a normalized decision from a boolean gate.
+
+        ``blocked_reasons`` is a compatibility helper for simple filters whose
+        latest block reason is known but which do not yet emit structured
+        reasons per bar.
+
+        Deprecation note:
+            This constructor exists to support the legacy boolean-only filter
+            path during migration. New filters should return
+            ``EdgeFilterDecision`` directly instead of relying on this adapter.
+        """
+        blocked = list(blocked_reasons or [])
+        reasons = [
+            [] if bool(ok) else list(blocked)
+            for ok in allowed.tolist()
+        ]
+        return cls(
+            allowed=allowed.astype(bool),
+            reasons=pd.Series(reasons, index=allowed.index, dtype=object),
+        )
+
+    def reindex(self, index: pd.Index) -> "EdgeFilterDecision":
+        """Align the decision to ``index`` and fail closed on missing bars."""
+        reindexed_allowed = self.allowed.reindex(index)
+        allowed_values = [bool(v) if pd.notna(v) else False for v in reindexed_allowed]
+
+        reindexed_reasons = self.reasons.reindex(index)
+        reasons_values = []
+        for allowed, raw_reasons in zip(
+            allowed_values, reindexed_reasons.tolist(), strict=False
+        ):
+            if raw_reasons is None:
+                normalized = []
+            elif isinstance(raw_reasons, str):
+                normalized = [raw_reasons]
+            else:
+                normalized = [str(reason) for reason in list(raw_reasons)]
+            reasons_values.append([] if allowed else normalized)
+        return EdgeFilterDecision(
+            allowed=pd.Series(allowed_values, index=index, dtype=bool),
+            reasons=pd.Series(reasons_values, index=index, dtype=object),
+        )
+
+    @property
+    def latest_allowed(self) -> bool:
+        """Latest-bar allow/block state."""
+        if self.allowed.empty:
+            return False
+        return bool(self.allowed.iloc[-1])
+
+    @property
+    def latest_reasons(self) -> list[str]:
+        """Latest-bar block reasons."""
+        if self.reasons.empty:
+            return []
+        return list(self.reasons.iloc[-1] or [])
+
+    def and_with(self, other: "EdgeFilterDecision") -> "EdgeFilterDecision":
+        """Logical AND composition that preserves all blocking reasons."""
+        if not self.allowed.index.equals(other.allowed.index):
+            raise ValueError("cannot compose EdgeFilterDecision with different indexes")
+
+        allowed = self.allowed & other.allowed
+        reasons = []
+        for left_ok, left_reasons, right_ok, right_reasons in zip(
+            self.allowed.tolist(),
+            self.reasons.tolist(),
+            other.allowed.tolist(),
+            other.reasons.tolist(),
+            strict=False,
+        ):
+            merged: list[str] = []
+            if not left_ok:
+                merged.extend(list(left_reasons or []))
+            if not right_ok:
+                merged.extend(list(right_reasons or []))
+            reasons.append(merged)
+        return EdgeFilterDecision(
+            allowed=allowed.astype(bool),
+            reasons=pd.Series(reasons, index=self.allowed.index, dtype=object),
+        )
+
+
+def normalize_edge_filter_result(
+    result: pd.Series | EdgeFilterDecision,
+    index: pd.Index,
+    *,
+    legacy_blocked_reasons: list[str] | None = None,
+) -> EdgeFilterDecision:
+    """
+    Normalize edge-filter output to ``EdgeFilterDecision``.
+
+    This keeps ``pd.Series`` support as a compatibility path while making the
+    richer structured contract the repo standard for new filters.
+
+    Deprecation note:
+        Plain boolean ``pd.Series`` output is the old filter contract. It is
+        still accepted here so existing filters keep working during rollout,
+        but new first-party filters should return ``EdgeFilterDecision``.
+    """
+    if isinstance(result, EdgeFilterDecision):
+        return result.reindex(index)
+    if not isinstance(result, pd.Series):
+        raise TypeError(
+            f"edge_filter must return a pd.Series or EdgeFilterDecision, got {type(result).__name__}"
+        )
+    reindexed = result.reindex(index)
+    normalized = pd.Series(
+        [bool(v) if pd.notna(v) else False for v in reindexed],
+        index=index,
+        dtype=bool,
+    )
+    return EdgeFilterDecision.from_bool_series(
+        normalized,
+        blocked_reasons=legacy_blocked_reasons,
+    )
 
 
 # ── Base class ───────────────────────────────────────────────────────────────
@@ -116,29 +303,26 @@ class BaseStrategy(ABC):
 
     def _aligned_edge_gate(
         self, df: pd.DataFrame, *, symbol: str = ""
-    ) -> pd.Series | None:
-        """Return the aligned edge-filter gate for `df`, if configured."""
+    ) -> EdgeFilterDecision | None:
+        """Return the normalized edge-filter decision for ``df``, if configured."""
         if self._edge_filter is None:
             return None
         # Inject symbol into filters that declare set_symbol().
         if symbol and hasattr(self._edge_filter, "set_symbol"):
             self._edge_filter.set_symbol(symbol)
 
-        gate = self._edge_filter(df)
-        if not isinstance(gate, pd.Series):
-            raise TypeError(
-                f"edge_filter must return a pd.Series, got {type(gate).__name__}"
-            )
-        # Reindex defensively; anywhere the filter is missing/NaN → treat as
-        # "regime not confirmed" → block the entry. Build the boolean Series
-        # from raw values to sidestep the pandas fillna-downcast FutureWarning.
-        reindexed = gate.reindex(df.index)
-        values = [bool(v) if pd.notna(v) else False for v in reindexed]
-        return pd.Series(values, index=df.index, dtype=bool)
+        result = self._edge_filter(df)
+        getter = getattr(self._edge_filter, "get_last_block_reasons", None)
+        legacy_blocked_reasons = list(getter() or []) if callable(getter) else None
+        return normalize_edge_filter_result(
+            result,
+            df.index,
+            legacy_blocked_reasons=legacy_blocked_reasons,
+        )
 
     def inspect_signals(
         self, df: pd.DataFrame, *, symbol: str = ""
-    ) -> tuple[SignalFrame, SignalFrame, bool | None]:
+    ) -> tuple[SignalFrame, SignalFrame, bool | None, list[str]]:
         """
         Return raw signals, filtered signals, and the current edge-filter state.
 
@@ -147,14 +331,19 @@ class BaseStrategy(ABC):
           - `None` when the strategy has no edge filter configured
         """
         raw = self._raw_signals(df)
-        gate_aligned = self._aligned_edge_gate(df, symbol=symbol)
-        if gate_aligned is None:
-            return raw, raw, None
+        edge_decision = self._aligned_edge_gate(df, symbol=symbol)
+        if edge_decision is None:
+            return raw, raw, None, []
         filtered = SignalFrame(
-            entries=(raw.entries & gate_aligned),
+            entries=(raw.entries & edge_decision.allowed),
             exits=raw.exits,
         )
-        return raw, filtered, bool(gate_aligned.iloc[-1]) if not gate_aligned.empty else False
+        return (
+            raw,
+            filtered,
+            edge_decision.latest_allowed,
+            edge_decision.latest_reasons,
+        )
 
     def generate_signals(self, df: pd.DataFrame, *, symbol: str = "") -> SignalFrame:
         """
@@ -166,7 +355,7 @@ class BaseStrategy(ABC):
         implement a `set_symbol` method, e.g. EarningsBlackout). Filters
         that don't need the symbol ignore it — backwards compatible.
         """
-        _raw, filtered, _edge_allowed = self.inspect_signals(df, symbol=symbol)
+        _raw, filtered, _edge_allowed, _reasons = self.inspect_signals(df, symbol=symbol)
         return filtered
 
 

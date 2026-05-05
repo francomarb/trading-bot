@@ -491,6 +491,15 @@ def _regime_color(regime: str | None) -> str:
     return colors.get(key, "⚪")
 
 
+def _sector_class_badge(classification: str | None) -> str:
+    labels = {
+        "hot": "🔥 HOT",
+        "neutral": "➖ NEUTRAL",
+        "cold": "🧊 COLD",
+    }
+    return labels.get((classification or "").lower(), "⚪ UNKNOWN")
+
+
 def render_dashboard() -> None:
     st.set_page_config(
         page_title="Trading Bot Dashboard",
@@ -719,10 +728,13 @@ def render_dashboard() -> None:
                     "Symbol": symbol_url(sym),
                     "Strategy": strat,
                     "Qty": qty,
-                    "Entry": f"${entry:,.2f}" if entry is not None else "—",
-                    "Cost Basis": f"${cost_basis:,.2f}" if cost_basis is not None else "—",
-                    "Unrealized P&L": f"${upnl:+,.2f}" if upnl is not None else "—",
-                    "Unrealized %": f"{unrealized_pct:+.2%}" if unrealized_pct is not None else "—",
+                    "Entry": entry,
+                    "Cost Basis": cost_basis,
+                    "Unrealized P&L": upnl,
+                    "Unrealized %": (
+                        unrealized_pct * 100.0
+                        if unrealized_pct is not None else None
+                    ),
                 })
             st.dataframe(
                 pd.DataFrame(pos_data),
@@ -733,6 +745,11 @@ def render_dashboard() -> None:
                         "Symbol",
                         display_text=r"https://finance\.yahoo\.com/quote/([^/]+)/",
                     ),
+                    "Qty": st.column_config.NumberColumn(format="%.2f"),
+                    "Entry": st.column_config.NumberColumn(format="$%.2f"),
+                    "Cost Basis": st.column_config.NumberColumn(format="$%.2f"),
+                    "Unrealized P&L": st.column_config.NumberColumn(format="$%.2f"),
+                    "Unrealized %": st.column_config.NumberColumn(format="%.2f%%"),
                 },
             )
 
@@ -781,6 +798,97 @@ def render_dashboard() -> None:
 
     st.divider()
 
+    # ── Sector heat ─────────────────────────────────────────────────────
+    sector_heat = state.get("sector_heat") or {}
+    if sector_heat:
+        left_col, right_col = st.columns([2, 1])
+        with left_col:
+            render_section_header(
+                "Sector Heat",
+                "Session-level sector momentum snapshot from the bot. Not recomputed on dashboard refresh.",
+                kicker="Context",
+            )
+            counts = sector_heat.get("counts") or {}
+            c1, c2, c3 = st.columns(3)
+            c1.metric("HOT Sectors", int(counts.get("hot", 0)))
+            c2.metric("Neutral Sectors", int(counts.get("neutral", 0)))
+            c3.metric("Cold Sectors", int(counts.get("cold", 0)))
+
+            sectors = sector_heat.get("sectors") or {}
+            if sectors:
+                sector_rows = []
+                for sector, detail in sectors.items():
+                    sector_rows.append({
+                        "Sector": sector.replace("_", " ").title(),
+                        "ETF": detail.get("etf_ticker"),
+                        "Score": detail.get("score"),
+                        "Status": _sector_class_badge(detail.get("classification")),
+                        "Last Close": detail.get("last_close"),
+                        "> SMA200": detail.get("above_sma200"),
+                        "> SMA50": detail.get("above_sma50"),
+                        "Golden Cross": detail.get("golden_cross"),
+                        "Dist SMA50": (
+                            float(detail["dist_sma50_pct"]) * 100.0
+                            if detail.get("dist_sma50_pct") is not None else None
+                        ),
+                        "Vol Confirm": detail.get("vol_confirm"),
+                    })
+                st.dataframe(
+                    pd.DataFrame(sector_rows).sort_values(["Score", "Sector"], ascending=[False, True]),
+                    width="stretch",
+                    hide_index=True,
+                    column_config={
+                        "Score": st.column_config.NumberColumn(format="%d"),
+                        "Last Close": st.column_config.NumberColumn(format="$%.2f"),
+                        "> SMA200": st.column_config.CheckboxColumn(),
+                        "> SMA50": st.column_config.CheckboxColumn(),
+                        "Golden Cross": st.column_config.CheckboxColumn(),
+                        "Dist SMA50": st.column_config.NumberColumn(format="%.1f%%"),
+                        "Vol Confirm": st.column_config.CheckboxColumn(),
+                    },
+                )
+            generated_at = sector_heat.get("generated_at")
+            if generated_at:
+                st.caption(f"Sector heat snapshot generated: {generated_at}")
+
+        with right_col:
+            render_section_header(
+                "Sector Exposure",
+                "Watched symbols grouped by resolved sector. Useful for spotting cold-cluster exposure.",
+                kicker="Context",
+            )
+            symbol_map = sector_heat.get("symbol_map") or {}
+            if symbol_map:
+                exposure_rows = []
+                for sector, items in sorted(symbol_map.items()):
+                    detail = (sector_heat.get("sectors") or {}).get(sector, {})
+                    by_symbol: dict[str, set[str]] = {}
+                    for item in items:
+                        by_symbol.setdefault(str(item["symbol"]), set()).add(str(item["strategy"]))
+                    symbols = ", ".join(sorted(by_symbol))
+                    strategies = ", ".join(
+                        sorted({strategy for strategy_set in by_symbol.values() for strategy in strategy_set})
+                    )
+                    exposure_rows.append({
+                        "Sector": sector.replace("_", " ").title(),
+                        "Status": _sector_class_badge(detail.get("classification")),
+                        "Symbols": symbols,
+                        "Strategies": strategies,
+                    })
+                st.dataframe(
+                    pd.DataFrame(exposure_rows),
+                    width="stretch",
+                    hide_index=True,
+                )
+            unmapped = sector_heat.get("unmapped") or []
+            if unmapped:
+                st.caption(
+                    "Unmapped symbols: "
+                    + ", ".join(sorted({item["symbol"] for item in unmapped}))
+                )
+
+        st.divider()
+
     # ── Watchlists ───────────────────────────────────────────────────────
     render_section_header(
         "Active Watchlists",
@@ -791,6 +899,7 @@ def render_dashboard() -> None:
     strategy_allowed_regimes = settings.STRATEGY_ALLOWED_REGIMES
     open_positions = state.get("open_positions") or {}
     watchlist_statuses = state.get("watchlist_statuses") or {}
+    watchlist_reasons = state.get("watchlist_reasons") or {}
 
     if not strategy_watchlists:
         st.info("No strategy watchlists configured.")
@@ -829,16 +938,19 @@ def render_dashboard() -> None:
 
                 rows = []
                 strategy_status_map = watchlist_statuses.get(strat_name, {})
+                strategy_reason_map = watchlist_reasons.get(strat_name, {})
                 for sym in symbols:
                     status = strategy_status_map.get(sym)
                     if status is None:
                         is_open = sym in open_positions and open_positions[sym] == strat_name
                         status = "Long" if is_open else "No Signal"
+                    reasons = strategy_reason_map.get(sym) or []
                     lt = last_trade.get(sym, {})
                     price = lt.get("price")
                     rows.append({
                         "Symbol": symbol_url(sym),
                         "Status": status,
+                        "Reason": "; ".join(reasons) if reasons else "—",
                         "Last Trade": lt.get("date", "—"),
                         "Last Side": lt.get("side", "—").upper() if lt.get("side") else "—",
                         "Last Price": f"${float(price):,.2f}" if price else "—",

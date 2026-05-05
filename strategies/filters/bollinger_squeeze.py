@@ -49,6 +49,7 @@ from loguru import logger
 
 from config.settings import ALPACA_DATA_FEED
 from indicators.technicals import add_atr, add_bollinger_bands
+from strategies.base import EdgeFilterDecision
 from strategies.filters.common import EarningsBlackout
 
 
@@ -149,21 +150,54 @@ class BollingerSqueezeEdgeFilter:
         not_exhausted = not_exhausted.where(threshold.notna(), other=True)
         return not_exhausted.astype(bool)
 
-    def __call__(self, df: pd.DataFrame) -> pd.Series:
+    def __call__(self, df: pd.DataFrame) -> EdgeFilterDecision:
         liquidity_gate  = self._liquidity_ok(df)
         earnings_gate   = self._earnings(df)
         exhaustion_gate = self._not_exhausted(df)
 
         combined = liquidity_gate & earnings_gate & exhaustion_gate
+        reasons_by_bar: list[list[str]] = []
+
+        feed_label = ALPACA_DATA_FEED
+        threshold_str = f"${self._notional_min_avg:,}"
+        if "volume" in df.columns and "close" in df.columns:
+            dollar_vol = df["close"].astype(float) * df["volume"].astype(float)
+            avg_dollar_vol = dollar_vol.rolling(self._vol_min_window).mean()
+        else:
+            avg_dollar_vol = None
+
+        for liq_ok, earn_ok, exhaust_ok in zip(
+            liquidity_gate.tolist(),
+            earnings_gate.tolist(),
+            exhaustion_gate.tolist(),
+            strict=False,
+        ):
+            row_reasons: list[str] = []
+            if not liq_ok:
+                avg_vol = float("nan") if avg_dollar_vol is None else avg_dollar_vol.iloc[len(reasons_by_bar)]
+                avg_str = f"${avg_vol:,.0f}" if pd.notna(avg_vol) else "NaN"
+                row_reasons.append(
+                    f"liquidity too low (avg_dollar_vol{self._vol_min_window}={avg_str} "
+                    f"< {threshold_str}, feed={feed_label})"
+                )
+            if not earn_ok:
+                row_reasons.append("earnings blackout")
+            if not exhaust_ok:
+                row_reasons.append(
+                    f"exhausted (close > BB_upper + {self._exhaustion_atr_mult:g}×ATR)"
+                )
+            reasons_by_bar.append(row_reasons)
+
+        decision = EdgeFilterDecision(
+            allowed=combined.astype(bool),
+            reasons=pd.Series(reasons_by_bar, index=df.index, dtype=object),
+        )
 
         if not df.empty:
-            allowed     = bool(combined.iloc[-1])
+            allowed     = decision.latest_allowed
             liq_ok      = bool(liquidity_gate.iloc[-1])
             earn_ok     = bool(earnings_gate.iloc[-1])
             exhaust_ok  = bool(exhaustion_gate.iloc[-1])
-
-            feed_label = ALPACA_DATA_FEED
-            threshold_str = f"${self._notional_min_avg:,}"
 
             if allowed:
                 logger.info(
@@ -193,7 +227,7 @@ class BollingerSqueezeEdgeFilter:
                     )
                 logger.info(
                     f"SQUEEZE_FILTER_BLOCKED {self._symbol} — "
-                    + ", ".join(reasons)
+                    + ", ".join(decision.latest_reasons)
                 )
 
-        return combined
+        return decision

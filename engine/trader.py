@@ -264,12 +264,15 @@ class TradingEngine:
         # Latest per-strategy watchlist statuses for dashboard display.
         # strategy_name -> {symbol -> status}
         self._watchlist_statuses: dict[str, dict[str, str]] = {}
+        self._watchlist_reasons: dict[str, dict[str, list[str]]] = {}
+        self._sector_heat: dict | None = None
 
         # Daily decision gate: (strategy_name, symbol, timeframe) → completed-bar
         # timestamp already evaluated this session. This prevents the 5-minute
         # loop from reprocessing the same daily signal bar all day long.
         self._processed_signal_bars: dict[tuple[str, str, str], pd.Timestamp] = {}
         self._processed_signal_statuses: dict[tuple[str, str, str], str] = {}
+        self._processed_signal_reasons: dict[tuple[str, str, str], list[str]] = {}
 
     # ── Lifecycle ────────────────────────────────────────────────────────
 
@@ -512,6 +515,7 @@ class TradingEngine:
 
 
             self._watchlist_statuses = {}
+            self._watchlist_reasons = {}
             for slot in self.slots:
                 # Per-slot regime gate: block new entries if current regime is
                 # not in the slot's allowed set. Exits always proceed.
@@ -528,7 +532,9 @@ class TradingEngine:
 
                 symbols = slot.active_symbols()
                 strategy_statuses: dict[str, str] = {}
+                strategy_reasons: dict[str, list[str]] = {}
                 self._watchlist_statuses[slot.strategy.name] = strategy_statuses
+                self._watchlist_reasons[slot.strategy.name] = strategy_reasons
                 for symbol in symbols:
                     strategy_statuses[symbol] = self._baseline_watchlist_status(
                         symbol,
@@ -536,6 +542,7 @@ class TradingEngine:
                         strategy_name=slot.strategy.name,
                         order_strategy=order_strategy,
                     )
+                    strategy_reasons[symbol] = []
                     try:
                         processed_symbols += 1
                         filled = self._process_symbol(
@@ -546,8 +553,15 @@ class TradingEngine:
                             slot.timeframe,
                             market_open=market_open,
                             entry_allowed=entry_allowed,
+                            regime_block_reason=(
+                                f"regime {current_regime.value} not in allowed set "
+                                f"{sorted(r.value for r in slot.allowed_regimes)}"
+                                if current_regime is not None and slot.allowed_regimes is not None and not entry_allowed
+                                else None
+                            ),
                             order_strategy=order_strategy,
                             strategy_statuses=strategy_statuses,
+                            strategy_reasons=strategy_reasons,
                         )
                         if filled is not None:
                             new_positions += 1
@@ -603,8 +617,10 @@ class TradingEngine:
         *,
         market_open: bool | None = None,
         entry_allowed: bool = True,
+        regime_block_reason: str | None = None,
         order_strategy: dict[str, str] | None = None,
         strategy_statuses: dict[str, str] | None = None,
+        strategy_reasons: dict[str, list[str]] | None = None,
     ) -> Position | None:
         """
         The full per-symbol decision path. Returns a Position if an entry was
@@ -654,6 +670,11 @@ class TradingEngine:
                 and signal_key in self._processed_signal_statuses
             ):
                 strategy_statuses[symbol] = self._processed_signal_statuses[signal_key]
+            if (
+                strategy_reasons is not None
+                and signal_key in self._processed_signal_reasons
+            ):
+                strategy_reasons[symbol] = list(self._processed_signal_reasons[signal_key])
             return
 
         # 3. Indicators (just ATR — strategy adds its own).
@@ -664,7 +685,7 @@ class TradingEngine:
         latest_ts = df.index[-1]
 
         # 4. Signals.
-        raw_signals, signals, edge_allowed = strategy.inspect_signals(
+        raw_signals, signals, edge_allowed, edge_reasons = strategy.inspect_signals(
             df,
             symbol=symbol,
         )
@@ -696,17 +717,19 @@ class TradingEngine:
                     f"position owned by '{owner}'"
                 )
                 self._mark_signal_bar_processed(
-                    signal_key, signal_bar, strategy_statuses, symbol
+                    signal_key, signal_bar, strategy_statuses, strategy_reasons, symbol
                 )
                 return
             if self._has_pending_close_order(symbol, snapshot):
                 if strategy_statuses is not None:
                     strategy_statuses[symbol] = "Pending Exit"
+                if strategy_reasons is not None:
+                    strategy_reasons[symbol] = []
                 logger.info(
                     f"{symbol}: exit signal but a close order is already pending — skipping"
                 )
                 self._mark_signal_bar_processed(
-                    signal_key, signal_bar, strategy_statuses, symbol
+                    signal_key, signal_bar, strategy_statuses, strategy_reasons, symbol
                 )
                 return
             try:
@@ -717,6 +740,8 @@ class TradingEngine:
                 if result.status in {OrderStatus.FILLED, OrderStatus.PARTIAL}:
                     if strategy_statuses is not None:
                         strategy_statuses[symbol] = "No Signal"
+                    if strategy_reasons is not None:
+                        strategy_reasons[symbol] = []
                     close_price = result.avg_fill_price or latest_close
                     close_qty = float(result.filled_qty or (position.qty if position else 0))
                     self.alerts.trade_executed(
@@ -733,7 +758,7 @@ class TradingEngine:
                 self._position_owners.pop(symbol, None)
                 self._entry_prices.pop(symbol, None)
                 self._mark_signal_bar_processed(
-                    signal_key, signal_bar, strategy_statuses, symbol
+                    signal_key, signal_bar, strategy_statuses, strategy_reasons, symbol
                 )
             except Exception as e:
                 logger.error(f"{symbol}: close_position failed: {e}")
@@ -747,23 +772,31 @@ class TradingEngine:
                 current_status = strategy_statuses.get(symbol)
                 if raw_entry and current_status == "No Signal":
                     strategy_statuses[symbol] = "Filter Blocked"
+                    if strategy_reasons is not None:
+                        strategy_reasons[symbol] = list(edge_reasons)
                 elif (
                     edge_allowed is False
                     and current_status == "No Signal"
                 ):
                     strategy_statuses[symbol] = "Filter Blocked"
+                    if strategy_reasons is not None:
+                        strategy_reasons[symbol] = list(edge_reasons)
             self._mark_signal_bar_processed(
-                signal_key, signal_bar, strategy_statuses, symbol
+                signal_key, signal_bar, strategy_statuses, strategy_reasons, symbol
             )
             return
         if not entry_allowed:
             if position is None and strategy_statuses is not None:
                 strategy_statuses[symbol] = "Regime Blocked"
+                if strategy_reasons is not None:
+                    strategy_reasons[symbol] = (
+                        [regime_block_reason] if regime_block_reason else []
+                    )
             logger.debug(
                 f"[{strategy.name}] {symbol}: entry blocked by regime gate"
             )
             self._mark_signal_bar_processed(
-                signal_key, signal_bar, strategy_statuses, symbol
+                signal_key, signal_bar, strategy_statuses, strategy_reasons, symbol
             )
             return
         if self._startup_mode != "NORMAL":
@@ -772,7 +805,7 @@ class TradingEngine:
                 f"startup_mode={self._startup_mode}"
             )
             self._mark_signal_bar_processed(
-                signal_key, signal_bar, strategy_statuses, symbol
+                signal_key, signal_bar, strategy_statuses, strategy_reasons, symbol
             )
             return
         if position is not None:
@@ -780,7 +813,7 @@ class TradingEngine:
             # intra-day cycles, so this is expected noise, not a real signal.
             # Risk would reject anyway; skip to avoid spamming alerts.
             self._mark_signal_bar_processed(
-                signal_key, signal_bar, strategy_statuses, symbol
+                signal_key, signal_bar, strategy_statuses, strategy_reasons, symbol
             )
             return
 
@@ -806,7 +839,7 @@ class TradingEngine:
                     symbol, strategy.name, sleeve.message, sleeve.code.value
                 )
                 self._mark_signal_bar_processed(
-                    signal_key, signal_bar, strategy_statuses, symbol
+                    signal_key, signal_bar, strategy_statuses, strategy_reasons, symbol
                 )
                 return None
             notional_cap = sleeve.per_position_notional
@@ -827,7 +860,7 @@ class TradingEngine:
                 symbol, strategy.name, decision.message, decision.code.value
             )
             self._mark_signal_bar_processed(
-                signal_key, signal_bar, strategy_statuses, symbol
+                signal_key, signal_bar, strategy_statuses, strategy_reasons, symbol
             )
             return None
         assert isinstance(decision, RiskDecision)
@@ -840,8 +873,10 @@ class TradingEngine:
                 )
                 if strategy_statuses is not None:
                     strategy_statuses[symbol] = "Pending Entry"
+                if strategy_reasons is not None:
+                    strategy_reasons[symbol] = []
                 self._mark_signal_bar_processed(
-                    signal_key, signal_bar, strategy_statuses, symbol
+                    signal_key, signal_bar, strategy_statuses, strategy_reasons, symbol
                 )
                 return None
             self._record_fill(
@@ -854,6 +889,8 @@ class TradingEngine:
                 self._position_owners[symbol] = strategy.name
                 if strategy_statuses is not None:
                     strategy_statuses[symbol] = "Long"
+                if strategy_reasons is not None:
+                    strategy_reasons[symbol] = []
                 fill_price = result.avg_fill_price or decision.entry_reference_price
                 fill_qty = float(result.filled_qty or decision.qty)
                 # Cache entry price for HWM P&L gate (used on close).
@@ -867,7 +904,7 @@ class TradingEngine:
                     reason=sig.reason,
                 )
                 self._mark_signal_bar_processed(
-                    signal_key, signal_bar, strategy_statuses, symbol
+                    signal_key, signal_bar, strategy_statuses, strategy_reasons, symbol
                 )
                 return Position(
                     symbol=symbol,
@@ -877,8 +914,10 @@ class TradingEngine:
                 )
             if strategy_statuses is not None:
                 strategy_statuses[symbol] = "Pending Entry"
+            if strategy_reasons is not None:
+                strategy_reasons[symbol] = []
             self._mark_signal_bar_processed(
-                signal_key, signal_bar, strategy_statuses, symbol
+                signal_key, signal_bar, strategy_statuses, strategy_reasons, symbol
             )
         except Exception as e:
             logger.error(f"{symbol}: place_order raised: {e}")
@@ -937,6 +976,7 @@ class TradingEngine:
         key: tuple[str, str, str],
         bar_ts: pd.Timestamp,
         strategy_statuses: dict[str, str] | None,
+        strategy_reasons: dict[str, list[str]] | None,
         symbol: str,
     ) -> None:
         """Remember that this completed daily bar has been handled this session."""
@@ -946,6 +986,10 @@ class TradingEngine:
         if strategy_statuses is not None:
             self._processed_signal_statuses[key] = strategy_statuses.get(
                 symbol, "No Signal"
+            )
+        if strategy_reasons is not None:
+            self._processed_signal_reasons[key] = list(
+                strategy_reasons.get(symbol, [])
             )
 
     def _remember_suspect_order(
@@ -1577,6 +1621,8 @@ class TradingEngine:
                 "open_positions": dict(self._position_owners),
                 "positions_detail": positions_detail,
                 "watchlist_statuses": self._watchlist_statuses,
+                "watchlist_reasons": self._watchlist_reasons,
+                "sector_heat": self._sector_heat,
                 "live_trading": settings.LIVE_TRADING,
             }
             parent = os.path.dirname(path)
@@ -1624,11 +1670,15 @@ class TradingEngine:
     ) -> None:
         """Refresh dashboard watchlist statuses from broker truth and prior state."""
         previous = self._watchlist_statuses if preserve_existing else {}
+        previous_reasons = self._watchlist_reasons if preserve_existing else {}
         refreshed: dict[str, dict[str, str]] = {}
+        refreshed_reasons: dict[str, dict[str, list[str]]] = {}
         for slot in self.slots:
             strat_name = slot.strategy.name
             strat_previous = previous.get(strat_name, {})
+            strat_previous_reasons = previous_reasons.get(strat_name, {})
             strat_statuses: dict[str, str] = {}
+            strat_reasons: dict[str, list[str]] = {}
             for symbol in slot.active_symbols():
                 baseline = self._baseline_watchlist_status(
                     symbol,
@@ -1637,16 +1687,21 @@ class TradingEngine:
                     order_strategy=order_strategy,
                 )
                 prior = strat_previous.get(symbol)
+                prior_reasons = strat_previous_reasons.get(symbol, [])
                 if (
                     preserve_existing
                     and baseline == "No Signal"
                     and prior in {"Regime Blocked", "Filter Blocked"}
                 ):
                     strat_statuses[symbol] = prior
+                    strat_reasons[symbol] = list(prior_reasons)
                 else:
                     strat_statuses[symbol] = baseline
+                    strat_reasons[symbol] = []
             refreshed[strat_name] = strat_statuses
+            refreshed_reasons[strat_name] = strat_reasons
         self._watchlist_statuses = refreshed
+        self._watchlist_reasons = refreshed_reasons
 
     # ── Market hours ─────────────────────────────────────────────────────
 
