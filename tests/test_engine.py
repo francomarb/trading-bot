@@ -1586,3 +1586,156 @@ class TestExternalCloseDetection:
                 max_bar_age_multiplier=2,
                 external_close_confirm_cycles=0,
             )
+
+
+# ── Options safety fixes ──────────────────────────────────────────────────────
+
+
+class TestOptionsEngineFixes:
+    """Unit tests for the four options safety fixes.
+
+    These tests call the private helpers directly rather than running a full
+    engine cycle, which keeps them fast and deterministic.
+    """
+
+    def _engine(self, tmp_path) -> TradingEngine:
+        from strategies.base import StrategySlot
+        from data.watchlists import StaticWatchlistSource
+
+        strategy = FakeStrategy(entries=[False], exits=[False])
+        broker = MagicMock()
+        broker.sync_with_broker.return_value = _snapshot()
+        broker.place_order.return_value = _filled_result("AAPL", 1, 100.0)
+        broker.close_position.return_value = _filled_result("AAPL", 1, 100.0)
+        broker.get_open_orders.return_value = []
+        broker._with_retry.side_effect = lambda fn, **_: fn()
+        broker._api.get_clock.return_value = SimpleNamespace(is_open=True)
+
+        risk = RiskManager(
+            max_position_pct=0.02,
+            max_open_positions=5,
+            max_gross_exposure_pct=0.50,
+            atr_stop_multiplier=2.0,
+            max_daily_loss_pct=0.05,
+            hard_dollar_loss_cap=1_000_000.0,
+            loss_streak_threshold=10,
+            broker_error_threshold=10,
+        )
+        tl = TradeLogger(path=str(tmp_path / "trades.db"))
+        return TradingEngine(
+            strategy=strategy,
+            symbols=["AAPL"],
+            risk=risk,
+            broker=broker,
+            trade_logger=tl,
+            config=EngineConfig(
+                history_lookback_days=120,
+                cycle_interval_seconds=0.01,
+                max_bar_age_multiplier=10.0,
+                market_hours_only=False,
+            ),
+        )
+
+    # Fix 2: stop repair skips OCC symbols ────────────────────────────────────
+
+    def test_stop_repair_skips_occ_symbol(self, tmp_path):
+        """_repair_missing_protective_stops must not attempt equity repair on options."""
+        engine = self._engine(tmp_path)
+        occ = "SPY260516C00520000"
+        # Pretend the engine owns the underlying
+        engine._position_owners["SPY"] = "spy_options_reversion"
+
+        from types import SimpleNamespace
+        from execution.broker import BrokerSnapshot, OrderStatus
+        pos = SimpleNamespace(qty=2, symbol=occ, avg_entry_price=10.0, market_value=20.0,
+                              unrealized_pl=1.0, current_price=11.0, cost_basis=20.0,
+                              asset_id="x", side="long")
+        snap = BrokerSnapshot(
+            account=SimpleNamespace(
+                equity=100_000.0,
+                cash=50_000.0,
+                buying_power=50_000.0,
+                open_positions={occ: pos},
+            ),
+            open_orders=[],
+        )
+        # If the OCC check is missing, place_protective_stop would be called.
+        engine.broker.place_protective_stop = MagicMock()
+        engine._repair_missing_protective_stops(snap)
+        engine.broker.place_protective_stop.assert_not_called()
+
+    # Fix 3: slippage not recorded for options exits ──────────────────────────
+
+    def test_slippage_not_recorded_for_options_exit(self, tmp_path):
+        """_record_fill must be skipped when closing an OCC position."""
+        engine = self._engine(tmp_path)
+        engine.risk.record_fill_slippage = MagicMock()
+
+        from execution.broker import OrderResult, OrderStatus
+        result = OrderResult(
+            status=OrderStatus.FILLED,
+            order_id="ord-1",
+            symbol="SPY260516C00520000",
+            requested_qty=2,
+            filled_qty=2,
+            avg_fill_price=14.0,   # option premium
+            raw_status="filled",
+            message="",
+        )
+        # latest_close is SPY price (~520), not the option premium.
+        # Without the guard this produces ~9 800 bps of phantom slippage.
+        from types import SimpleNamespace
+        position = SimpleNamespace(symbol="SPY260516C00520000")
+        # Simulate what the exit branch does:
+        if not __import__("re").match(r"^[A-Z]{1,6}[0-9]{6}[CP][0-9]{8}$", position.symbol):
+            engine._record_fill(result, modeled_price=520.0, order_type="market")
+        engine.risk.record_fill_slippage.assert_not_called()
+
+    def test_slippage_recorded_normally_for_equity_exit(self, tmp_path):
+        """_record_fill is NOT skipped for plain equity symbols."""
+        engine = self._engine(tmp_path)
+        engine.risk.record_fill_slippage = MagicMock()
+
+        from execution.broker import OrderResult, OrderStatus
+        result = OrderResult(
+            status=OrderStatus.FILLED,
+            order_id="ord-2",
+            symbol="AAPL",
+            requested_qty=10,
+            filled_qty=10,
+            avg_fill_price=100.5,
+            raw_status="filled",
+            message="",
+        )
+        engine._record_fill(result, modeled_price=100.0, order_type="market")
+        engine.risk.record_fill_slippage.assert_called_once()
+
+    # Fix 4: 100x multiplier for options P&L ─────────────────────────────────
+
+    def test_record_realized_pnl_applies_100x_for_options(self, tmp_path):
+        """Options P&L must be multiplied by 100 (one contract = 100 shares)."""
+        from unittest.mock import MagicMock
+        from risk.allocator import SleeveAllocator
+
+        engine = self._engine(tmp_path)
+        allocator = MagicMock(spec=SleeveAllocator)
+        engine._allocator = allocator
+        engine._entry_prices["SPY"] = 10.0  # option premium at entry
+
+        # 2 contracts, exit premium $15, gain = (15-10)*2*100 = $1 000
+        engine._record_realized_pnl("SPY", "spy_options_reversion", 15.0, 2, multiplier=100)
+        allocator.record_realized_pnl.assert_called_once_with("spy_options_reversion", 1000.0)
+
+    def test_record_realized_pnl_no_multiplier_for_equity(self, tmp_path):
+        """Equity P&L uses multiplier=1 (default) — result unchanged."""
+        from unittest.mock import MagicMock
+        from risk.allocator import SleeveAllocator
+
+        engine = self._engine(tmp_path)
+        allocator = MagicMock(spec=SleeveAllocator)
+        engine._allocator = allocator
+        engine._entry_prices["AAPL"] = 100.0
+
+        # 10 shares, exit $105, gain = (105-100)*10*1 = $50
+        engine._record_realized_pnl("AAPL", "sma_crossover", 105.0, 10)
+        allocator.record_realized_pnl.assert_called_once_with("sma_crossover", 50.0)

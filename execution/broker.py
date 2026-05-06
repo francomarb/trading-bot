@@ -387,6 +387,22 @@ class AlpacaBroker:
         import re
         is_option = bool(re.match(r"^[A-Z]{1,6}[0-9]{6}[CP][0-9]{8}$", decision.symbol))
         if is_option and decision.order_type is OrderType.LIMIT:
+            if self._dry_run:
+                logger.warning(
+                    f"DRY RUN — option order NOT dispatched: "
+                    f"{decision.qty} {decision.symbol}"
+                )
+                return OrderResult(
+                    status=OrderStatus.FILLED,
+                    order_id=f"dry-run-{uuid.uuid4().hex[:10]}",
+                    symbol=decision.symbol,
+                    requested_qty=decision.qty,
+                    filled_qty=decision.qty,
+                    avg_fill_price=decision.entry_reference_price,
+                    raw_status="dry_run",
+                    message="dry run — no option order dispatched",
+                )
+
             opt_worker_id = f"opt-worker-{uuid.uuid4().hex[:10]}"
 
             dec = decision  # capture for closure

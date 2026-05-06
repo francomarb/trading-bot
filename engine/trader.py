@@ -45,6 +45,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import signal
 import time
 from dataclasses import dataclass, field
@@ -85,6 +86,10 @@ if TYPE_CHECKING:
     from execution.stream import StreamManager
     from regime.detector import RegimeDetector
     from risk.allocator import SleeveAllocator
+
+
+# Matches any OCC option symbol: underlying (1–6 letters) + YYMMDD + C/P + 8-digit strike.
+_OCC_PAT = re.compile(r"^[A-Z]{1,6}[0-9]{6}[CP][0-9]{8}$")
 
 
 # ── Bar-interval helpers ─────────────────────────────────────────────────────
@@ -747,7 +752,11 @@ class TradingEngine:
             try:
                 result = self.broker.close_position(position.symbol)
                 # close_position always uses MARKET (hard-risk exit).
-                self._record_fill(result, modeled_price=latest_close, order_type="market")
+                # Skip slippage recording for options: latest_close is the SPY
+                # bar price, not the option premium — the comparison is meaningless
+                # and would inject thousands of spurious bps into the drift monitor.
+                if not _OCC_PAT.match(position.symbol):
+                    self._record_fill(result, modeled_price=latest_close, order_type="market")
                 self._log_close(result, latest_close, strategy.name)
                 if result.status in {OrderStatus.FILLED, OrderStatus.PARTIAL}:
                     if strategy_statuses is not None:
@@ -765,7 +774,9 @@ class TradingEngine:
                         reason="exit signal",
                     )
                     # Feed realized P&L into the HWM drawdown gate.
-                    self._record_realized_pnl(symbol, strategy.name, close_price, close_qty)
+                    # Options: multiply by 100 (each contract = 100 shares).
+                    _pnl_mult = 100 if _OCC_PAT.match(position.symbol) else 1
+                    self._record_realized_pnl(symbol, strategy.name, close_price, close_qty, multiplier=_pnl_mult)
                 # Release ownership and cached entry price.
                 self._position_owners.pop(symbol, None)
                 self._entry_prices.pop(symbol, None)
@@ -1254,6 +1265,7 @@ class TradingEngine:
         strategy_name: str,
         close_price: float,
         qty: float,
+        multiplier: int = 1,
     ) -> None:
         """
         Compute and report realized P&L for a closed position to the
@@ -1263,6 +1275,9 @@ class TradingEngine:
           - Signal-based exit (_process_symbol exit branch)
           - WebSocket stop-leg fill (_process_stream_stop_fills)
           - External close detection (_detect_external_closes) — approximate
+
+        Pass multiplier=100 for options contracts (each contract = 100 shares).
+        Equity callers omit it and get the default of 1.
 
         If no allocator is configured, or the entry price is unknown (e.g. the
         bot restarted mid-trade), the update is silently skipped. The HWM gate
@@ -1278,10 +1293,10 @@ class TradingEngine:
                 f"entry_price={entry_price} qty={qty}"
             )
             return
-        realized_pnl = (close_price - entry_price) * qty
+        realized_pnl = (close_price - entry_price) * qty * multiplier
         logger.debug(
             f"[{strategy_name}] {symbol}: realized_pnl={realized_pnl:+.2f} "
-            f"({qty} shares @ {close_price:.2f} vs entry {entry_price:.2f})"
+            f"({qty}x{multiplier} @ {close_price:.2f} vs entry {entry_price:.2f})"
         )
         self._allocator.record_realized_pnl(strategy_name, realized_pnl)
 
@@ -1361,6 +1376,10 @@ class TradingEngine:
         whenever a managed position has no broker-side stop order.
         """
         for symbol, position in snapshot.account.open_positions.items():
+            if _OCC_PAT.match(symbol):
+                # Options positions use Alpaca-managed bracket stop legs.
+                # Equity-style stop repair does not apply to OCC symbols.
+                continue
             owner = self._position_owners.get(symbol)
             if owner is None:
                 continue
