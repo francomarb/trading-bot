@@ -1614,23 +1614,39 @@ class TradingEngine:
         - If the DB has no record (new account or DB gap), fall back to
           best-effort slot-order match with a WARNING.
 
-        Returns the set of conflict symbols (DB owner no longer in any slot).
+        OCC option symbols (e.g. SPY260516C00520000) are keyed under their
+        underlying ticker ("SPY") in _position_owners, matching how the engine
+        tracks them during normal operation via _get_position_for().
+
+        Returns the set of conflict underlying keys (DB owner no longer in any slot).
         """
+        import re as _re
+        _OCC = _re.compile(r"^([A-Z]{1,6})[0-9]{6}[CP][0-9]{8}$")
+
         db_owners = self.trade_logger.read_all_open_owners()
         known_strategy_names = {slot.strategy.name for slot in self.slots}
         conflicts: set[str] = set()
 
         for sym in snapshot.account.open_positions:
-            if sym in self._position_owners:
+            # For OCC option symbols, ownership is stored under the underlying.
+            occ_m = _OCC.match(sym)
+            owner_key = occ_m.group(1) if occ_m else sym
+
+            if owner_key in self._position_owners:
                 continue  # already assigned (shouldn't happen at startup)
 
+            # DB lookup: try the exact broker symbol first (OCC string or equity),
+            # then fall back to the underlying ticker for options.
             db_owner = db_owners.get(sym)
+            if db_owner is None and occ_m:
+                db_owner = db_owners.get(owner_key)
+
             if db_owner is not None:
                 if db_owner in known_strategy_names:
-                    self._position_owners[sym] = db_owner
+                    self._position_owners[owner_key] = db_owner
                     logger.info(
                         f"restart: assigned existing position {sym} "
-                        f"→ '{db_owner}' (trade DB record)"
+                        f"→ '{db_owner}' (owner_key='{owner_key}', trade DB record)"
                     )
                 else:
                     logger.warning(
@@ -1638,24 +1654,28 @@ class TradingEngine:
                         f"'{db_owner}' which is no longer configured — "
                         "position will not be managed. Close it manually."
                     )
-                    conflicts.add(sym)
+                    conflicts.add(owner_key)
             else:
                 # No DB record — fall back to best-effort slot-order match.
+                # For options, match the underlying ticker against slot symbols.
+                lookup = owner_key if occ_m else sym
                 matched = False
                 for slot in self.slots:
-                    if sym in slot.active_symbols():
-                        self._position_owners[sym] = slot.strategy.name
+                    if lookup in slot.active_symbols():
+                        self._position_owners[owner_key] = slot.strategy.name
                         logger.warning(
                             f"restart: no DB record for {sym}; assigned to "
-                            f"'{slot.strategy.name}' (best-effort slot match)"
+                            f"'{slot.strategy.name}' via underlying '{lookup}' "
+                            "(best-effort slot match)"
                         )
                         matched = True
                         break
                 if not matched:
                     logger.warning(
-                        f"restart: open position {sym} does not belong to any "
-                        "configured slot — it will NOT be managed by this engine. "
-                        "Close it manually or add it to a strategy's symbol universe."
+                        f"restart: open position {sym} (owner_key='{owner_key}') "
+                        "does not belong to any configured slot — it will NOT be "
+                        "managed by this engine. Close it manually or add it to a "
+                        "strategy's symbol universe."
                     )
 
         return conflicts
@@ -1681,10 +1701,19 @@ class TradingEngine:
             return "RESTRICTED"
 
         # Check for broker positions with no ownership at all.
+        # OCC option positions are owned under their underlying ticker, so we
+        # must resolve the owner key before checking _position_owners.
+        import re as _re
+        _OCC = _re.compile(r"^([A-Z]{1,6})[0-9]{6}[CP][0-9]{8}$")
+
+        def _owner_key(s: str) -> str:
+            m = _OCC.match(s)
+            return m.group(1) if m else s
+
         unmanaged = [
             sym
             for sym in snapshot.account.open_positions
-            if sym not in self._position_owners
+            if _owner_key(sym) not in self._position_owners
         ]
         if unmanaged:
             logger.warning(
