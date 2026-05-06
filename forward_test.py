@@ -57,6 +57,7 @@ from strategies.filters.donchian_breakout import DonchianEdgeFilter
 from strategies.filters.rsi_reversion import RSIEdgeFilter
 from strategies.filters.sector_momentum import SectorMomentumFilter
 from strategies.filters.sma_crossover import SMAEdgeFilter
+from strategies.filters.spy_options_reversion import SPYOptionsEdgeFilter
 from strategies.rsi_reversion import RSIReversion
 from strategies.sma_crossover import SMACrossover
 from strategies.spy_options_reversion import SPYOptionsReversionStrategy
@@ -254,7 +255,11 @@ def main() -> None:
             allowed_regimes=frozenset({MarketRegime.TRENDING}),
         ),
         StrategySlot(
-            strategy=SPYOptionsReversionStrategy(rsi_length=14, rsi_threshold=30),
+            strategy=SPYOptionsReversionStrategy(
+                rsi_length=14,
+                rsi_threshold=30,
+                edge_filter=SPYOptionsEdgeFilter(),
+            ),
             watchlist_source=StaticWatchlistSource(
                 list(settings.STRATEGY_WATCHLISTS["spy_options_reversion"]), name="spy_options"
             ),

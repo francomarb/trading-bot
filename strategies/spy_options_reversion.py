@@ -22,8 +22,8 @@ class SPYOptionsReversionStrategy(BaseStrategy):
     name = "spy_options_reversion"
     preferred_order_type = OrderType.LIMIT
 
-    def __init__(self, rsi_length: int = 14, rsi_threshold: float = 30):
-        super().__init__()
+    def __init__(self, rsi_length: int = 14, rsi_threshold: float = 30, *, edge_filter=None):
+        super().__init__(edge_filter=edge_filter)
         self.rsi_length = rsi_length
         self.rsi_threshold = rsi_threshold
         # VIX cache: refreshed once per calendar day to avoid hot-loop HTTP calls.
