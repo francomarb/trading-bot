@@ -1574,11 +1574,21 @@ class TradingEngine:
                 self._record_realized_pnl(symbol, owner, price, qty, multiplier=_pnl_mult)
             self._entry_prices.pop(symbol, None)
             try:
-                self.trade_logger.log_external_close(
-                    symbol=raw_symbol,
-                    strategy=owner,
-                    reason="stop_triggered",
-                )
+                if price is not None and qty > 0:
+                    self.trade_logger.log_stop_fill(
+                        symbol=raw_symbol,
+                        strategy=owner,
+                        qty=qty,
+                        avg_fill_price=price,
+                        order_id=getattr(update.order, "order_id", None),
+                    )
+                else:
+                    # Price or qty unavailable — fall back to the synthetic record.
+                    self.trade_logger.log_external_close(
+                        symbol=raw_symbol,
+                        strategy=owner,
+                        reason="stop_triggered",
+                    )
             except Exception as e:
                 logger.error(f"{raw_symbol}: failed to log stop fill: {e}")
 

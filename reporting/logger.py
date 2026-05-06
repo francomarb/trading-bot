@@ -330,6 +330,42 @@ class TradeLogger:
         )
         self.log(record)
 
+    def log_stop_fill(
+        self,
+        *,
+        symbol: str,
+        strategy: str,
+        qty: float,
+        avg_fill_price: float,
+        order_id: str | None = None,
+    ) -> None:
+        """
+        Write a confirmed stop-fill record when the WebSocket stream delivers
+        an exact bracket stop execution (price and qty known).
+
+        Distinct from log_external_close, which is the fallback for positions
+        that disappear without a confirmed fill event.
+        """
+        record = TradeRecord(
+            timestamp=datetime.now(timezone.utc).isoformat(),
+            symbol=symbol,
+            side="sell",
+            qty=qty,
+            avg_fill_price=avg_fill_price,
+            order_id=order_id,
+            strategy=strategy,
+            reason="stop_triggered",
+            stop_price=avg_fill_price,
+            entry_reference_price=0.0,
+            modeled_slippage_bps=0.0,
+            realized_slippage_bps=0.0,
+            order_type="stop",
+            status="filled",
+            requested_qty=qty,
+            filled_qty=qty,
+        )
+        self.log(record)
+
     def read_owner_for_symbol(self, symbol: str) -> str | None:
         """
         Return the strategy_name that owns the currently-open position for

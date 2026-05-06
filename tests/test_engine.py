@@ -1906,3 +1906,102 @@ class TestOptionsEngineFixes:
         # P&L = (105 - 100) * 10 * 1 = $50
         allocator.record_realized_pnl.assert_called_once_with("sma_crossover", 50.0)
         assert "AAPL" not in engine._position_owners
+
+    # log_stop_fill: confirmed WebSocket stop-fill persists real price/qty ─────
+
+    def test_log_stop_fill_writes_correct_record(self, tmp_path):
+        """log_stop_fill stores the real fill price, qty, and order_type=stop."""
+        import sqlite3
+        from reporting.logger import TradeLogger
+
+        tl = TradeLogger(path=str(tmp_path / "trades.db"))
+        tl.log_stop_fill(
+            symbol="SPY260516C00520000",
+            strategy="spy_options_reversion",
+            qty=2,
+            avg_fill_price=7.50,
+            order_id="bracket-stop-abc",
+        )
+
+        conn = sqlite3.connect(str(tmp_path / "trades.db"))
+        row = conn.execute(
+            "SELECT symbol, side, qty, avg_fill_price, order_type, status, "
+            "filled_qty, reason, stop_price FROM trades ORDER BY rowid DESC LIMIT 1"
+        ).fetchone()
+        conn.close()
+
+        symbol, side, qty, price, order_type, status, filled_qty, reason, stop_price = row
+        assert symbol == "SPY260516C00520000"
+        assert side == "sell"
+        assert qty == 2
+        assert price == 7.50
+        assert order_type == "stop"
+        assert status == "filled"
+        assert filled_qty == 2
+        assert reason == "stop_triggered"
+        assert stop_price == 7.50
+
+    def test_stream_stop_fill_calls_log_stop_fill_not_external_close(self, tmp_path):
+        """When price and qty are known, _process_stream_stop_fills uses log_stop_fill."""
+        from unittest.mock import MagicMock, patch
+        from types import SimpleNamespace
+        from execution.stream import StreamManager
+
+        engine = self._engine(tmp_path)
+        occ = "SPY260516C00520000"
+        engine._position_owners["SPY"] = "spy_options_reversion"
+        engine._entry_prices["SPY"] = 10.0
+
+        fill_update = SimpleNamespace(
+            order=SimpleNamespace(symbol=occ, order_id="stop-ord-1"),
+            price="7.50",
+            qty="2",
+        )
+        stream = MagicMock(spec=StreamManager)
+        stream.drain_stop_fills.return_value = [fill_update]
+        engine._stream_manager = stream
+
+        engine.trade_logger.log_stop_fill = MagicMock()
+        engine.trade_logger.log_external_close = MagicMock()
+
+        engine._process_stream_stop_fills()
+
+        engine.trade_logger.log_stop_fill.assert_called_once_with(
+            symbol=occ,
+            strategy="spy_options_reversion",
+            qty=2,
+            avg_fill_price=7.50,
+            order_id="stop-ord-1",
+        )
+        engine.trade_logger.log_external_close.assert_not_called()
+
+    def test_stream_stop_fill_falls_back_to_external_close_when_price_missing(self, tmp_path):
+        """When price is missing from the stream event, fall back to log_external_close."""
+        from unittest.mock import MagicMock
+        from types import SimpleNamespace
+        from execution.stream import StreamManager
+
+        engine = self._engine(tmp_path)
+        engine._position_owners["AAPL"] = "sma_crossover"
+        engine._entry_prices["AAPL"] = 100.0
+
+        fill_update = SimpleNamespace(
+            order=SimpleNamespace(symbol="AAPL", order_id="stop-ord-2"),
+            price=None,
+            qty="10",
+        )
+        stream = MagicMock(spec=StreamManager)
+        stream.drain_stop_fills.return_value = [fill_update]
+        engine._stream_manager = stream
+
+        engine.trade_logger.log_stop_fill = MagicMock()
+        engine.trade_logger.log_external_close = MagicMock()
+
+        engine._process_stream_stop_fills()
+
+        engine.trade_logger.log_stop_fill.assert_not_called()
+        engine.trade_logger.log_external_close.assert_called_once_with(
+            symbol="AAPL",
+            strategy="sma_crossover",
+            reason="stop_triggered",
+        )
