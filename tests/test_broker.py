@@ -710,3 +710,51 @@ class TestFractionalOrders:
         assert result.order_id == "entry-4"
         assert "socket dropped" in result.message
         assert api.submit_order.call_count == 1
+
+
+# ── Options path: DRY_RUN guard ──────────────────────────────────────────────
+
+
+def _occ_decision(entry: float = 10.0) -> RiskDecision:
+    """RiskDecision for an OCC option symbol."""
+    return RiskDecision(
+        symbol="SPY260516C00520000",
+        side=Side.BUY,
+        qty=2,
+        entry_reference_price=entry,
+        stop_price=7.5,
+        strategy_name="spy_options_reversion",
+        reason="test",
+        order_type=OrderType.LIMIT,
+        limit_price=entry,
+    )
+
+
+class TestOptionsDryRun:
+    def test_dry_run_skips_option_worker_and_returns_filled(self):
+        """DRY_RUN=True must short-circuit before OptionsExecutionWorker is started."""
+        api = MagicMock()
+        broker = AlpacaBroker(client=api, max_attempts=1, base_delay=0.0, dry_run=True)
+
+        result = broker.place_order(_occ_decision())
+
+        api.submit_order.assert_not_called()
+        assert result.status is OrderStatus.FILLED
+        assert result.raw_status == "dry_run"
+        assert result.filled_qty == 2
+        assert result.avg_fill_price == 10.0
+
+    def test_live_mode_dispatches_worker(self):
+        """Without DRY_RUN, an OCC LIMIT decision must start the background worker."""
+        from unittest.mock import patch
+        api = MagicMock()
+        broker = AlpacaBroker(client=api, max_attempts=1, base_delay=0.0, dry_run=False)
+
+        with patch("execution.broker.OptionsExecutionWorker") as mock_worker_cls:
+            mock_worker_cls.return_value = MagicMock()
+            result = broker.place_order(_occ_decision())
+
+        mock_worker_cls.assert_called_once()
+        mock_worker_cls.return_value.start.assert_called_once()
+        assert result.status is OrderStatus.ACCEPTED
+        api.submit_order.assert_not_called()  # worker handles submission, not broker directly

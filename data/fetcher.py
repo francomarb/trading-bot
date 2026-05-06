@@ -34,7 +34,7 @@ from alpaca.common.exceptions import APIError
 from alpaca.data.enums import Adjustment, DataFeed
 from alpaca.data.historical import StockHistoricalDataClient
 from alpaca.data.requests import StockBarsRequest
-from alpaca.data.timeframe import TimeFrame
+from alpaca.data.timeframe import TimeFrame, TimeFrameUnit
 from loguru import logger
 from requests.adapters import HTTPAdapter
 
@@ -52,6 +52,7 @@ OHLCV_COLS = ["open", "high", "low", "close", "volume"]
 _TIMEFRAME_MAP: dict[str, tuple[TimeFrame, pd.Timedelta]] = {
     "1Day": (TimeFrame.Day, pd.Timedelta(days=1)),
     "1Hour": (TimeFrame.Hour, pd.Timedelta(hours=1)),
+    "5Min": (TimeFrame(5, TimeFrameUnit.Minute), pd.Timedelta(minutes=5)),
     "1Min": (TimeFrame.Minute, pd.Timedelta(minutes=1)),
 }
 

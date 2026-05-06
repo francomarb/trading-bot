@@ -31,3 +31,4 @@ pytest
 pytest-cov
 freezegun
 lxml==6.1.0
+blackscholes

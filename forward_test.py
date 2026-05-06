@@ -57,8 +57,10 @@ from strategies.filters.donchian_breakout import DonchianEdgeFilter
 from strategies.filters.rsi_reversion import RSIEdgeFilter
 from strategies.filters.sector_momentum import SectorMomentumFilter
 from strategies.filters.sma_crossover import SMAEdgeFilter
+from strategies.filters.spy_options_reversion import SPYOptionsEdgeFilter
 from strategies.rsi_reversion import RSIReversion
 from strategies.sma_crossover import SMACrossover
+from strategies.spy_options_reversion import SPYOptionsReversionStrategy
 
 
 # ── Logging ──────────────────────────────────────────────────────────────────
@@ -251,6 +253,20 @@ def main() -> None:
             # AI/Bigtech universe, 4y window ending 2026-04-28 (2× ATR stops).
             # Sleeve: 0.25 weight, max 5 concurrent positions.
             allowed_regimes=frozenset({MarketRegime.TRENDING}),
+        ),
+        StrategySlot(
+            strategy=SPYOptionsReversionStrategy(
+                rsi_length=14,
+                rsi_threshold=45,
+                edge_filter=SPYOptionsEdgeFilter(),
+            ),
+            watchlist_source=StaticWatchlistSource(
+                list(settings.STRATEGY_WATCHLISTS["spy_options_reversion"]), name="spy_options"
+            ),
+            timeframe="5Min",
+            # RSI reversion plays oversold bounces — avoid BEAR (stocks keep
+            # falling past RSI 30) and VOLATILE (unpredictable snap-backs).
+            allowed_regimes=frozenset({MarketRegime.TRENDING, MarketRegime.RANGING}),
         ),
     ]
 

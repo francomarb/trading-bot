@@ -296,6 +296,14 @@ class BaseStrategy(ABC):
         """
         return 50
 
+    def inspect_open_positions(self, position, latest_close: float) -> bool:
+        """
+        Hook called by the engine during the cycle loop to allow the strategy
+        to evaluate an emergency exit condition mid-trade.
+        Returns True to trigger an immediate market exit.
+        """
+        return False
+
     # Concrete strategies implement this.
     @abstractmethod
     def _raw_signals(self, df: pd.DataFrame) -> SignalFrame:

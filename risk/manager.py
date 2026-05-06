@@ -115,6 +115,9 @@ class Signal:
     order_type: OrderType = OrderType.MARKET
     # Required only when order_type is LIMIT.
     limit_price: float | None = None
+    # For bracket options orders
+    take_profit_price: float | None = None
+    stop_price_override: float | None = None
 
 
 class RejectionCode(str, Enum):
@@ -164,6 +167,7 @@ class RiskDecision:
     # accordingly. Defaults to MARKET so legacy construction still works.
     order_type: OrderType = OrderType.MARKET
     limit_price: float | None = None
+    take_profit_price: float | None = None
 
     def __post_init__(self) -> None:
         # Defensive: any caller that constructs this manually still has to pass
@@ -420,6 +424,8 @@ class RiskManager:
 
     def _stop_price_for(self, signal: Signal) -> float:
         """Compute ATR-based stop. Long: entry - k*ATR. Short: entry + k*ATR."""
+        if signal.stop_price_override is not None:
+            return signal.stop_price_override
         offset = self.atr_stop_multiplier * signal.atr
         if signal.side is Side.BUY:
             return signal.reference_price - offset
@@ -449,12 +455,16 @@ class RiskManager:
           Broker uses OTO GTC exactly as before — this path is byte-for-byte
           identical to the pre-fractional implementation.
         """
+        import re
+        is_option = bool(re.match(r"^[A-Z]{1,6}[0-9]{6}[CP][0-9]{8}$", signal.symbol))
+
         # Choose floor function based on fractional mode.
         # LIMIT orders (RSI reversion) always use whole shares — Alpaca GTC
-        # limit orders do not support fractional quantities.
+        # limit orders do not support fractional quantities. Options cannot be fractional.
         fractional = (
             settings.FRACTIONAL_ENABLED
             and signal.order_type is OrderType.MARKET
+            and not is_option
         )
         _floor = (lambda x: math.floor(x * 100) / 100) if fractional else math.floor
 
@@ -462,7 +472,10 @@ class RiskManager:
         stop_distance = abs(signal.reference_price - stop_price)
         if stop_distance <= 0:
             return 0
-        raw_qty = _floor(risk_dollars / stop_distance)
+            
+        multiplier = 100.0 if is_option else 1.0
+        
+        raw_qty = _floor(risk_dollars / (stop_distance * multiplier))
         if raw_qty <= 0:
             return 0
 
@@ -470,25 +483,25 @@ class RiskManager:
         # the whole sleeve in a single position.
         if signal.reference_price > 0:
             max_position_notional = account.equity * self.max_position_notional_pct
-            notional_qty_cap = _floor(max_position_notional / signal.reference_price)
+            notional_qty_cap = _floor(max_position_notional / (signal.reference_price * multiplier))
             raw_qty = min(raw_qty, notional_qty_cap)
 
         # Cap by remaining gross-exposure budget.
         max_gross = account.equity * self.max_gross_exposure_pct
         remaining_gross = max(0.0, max_gross - account.gross_exposure())
         if signal.reference_price > 0:
-            gross_qty_cap = _floor(remaining_gross / signal.reference_price)
+            gross_qty_cap = _floor(remaining_gross / (signal.reference_price * multiplier))
             raw_qty = min(raw_qty, gross_qty_cap)
 
         # Cap by cash on hand (a buy must be payable).
         if signal.side is Side.BUY and signal.reference_price > 0:
-            cash_qty_cap = _floor(max(0.0, account.cash) / signal.reference_price)
+            cash_qty_cap = _floor(max(0.0, account.cash) / (signal.reference_price * multiplier))
             raw_qty = min(raw_qty, cash_qty_cap)
 
         # Cap by sleeve budget (supplied by SleeveAllocator when active).
         # This prevents one strategy from consuming another's reserved capital.
         if notional_cap is not None and signal.reference_price > 0:
-            sleeve_qty_cap = _floor(notional_cap / signal.reference_price)
+            sleeve_qty_cap = _floor(notional_cap / (signal.reference_price * multiplier))
             if sleeve_qty_cap < raw_qty:
                 logger.debug(
                     f"[{signal.strategy_name}] {signal.symbol}: "

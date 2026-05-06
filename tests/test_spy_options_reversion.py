@@ -1,0 +1,375 @@
+"""
+Unit tests for SPYOptionsReversionStrategy.
+
+Time stop and Delta floor live in inspect_open_positions (they need the OCC
+symbol to know the specific contract's expiry).  _raw_signals only emits RSI
+entry signals; its exit series is always False.
+"""
+
+import re
+from datetime import date, datetime, timedelta, timezone
+from types import SimpleNamespace
+from unittest.mock import MagicMock, patch
+from zoneinfo import ZoneInfo
+
+import pandas as pd
+import pytest
+
+from strategies.spy_options_reversion import SPYOptionsReversionStrategy
+
+_ET = ZoneInfo("America/New_York")
+
+
+# ── helpers ──────────────────────────────────────────────────────────────────
+
+def _make_df(n: int = 30, close: float = 520.0) -> pd.DataFrame:
+    idx = pd.date_range("2026-01-02 09:30", periods=n, freq="5min", tz="US/Eastern")
+    return pd.DataFrame({"close": [close] * n}, index=idx)
+
+
+def _occ(underlying: str, expiry: date, call_put: str, strike: float) -> str:
+    exp = expiry.strftime("%y%m%d")
+    strike_str = f"{int(strike * 1000):08d}"
+    return f"{underlying}{exp}{call_put}{strike_str}"
+
+
+def _position(symbol: str) -> SimpleNamespace:
+    return SimpleNamespace(symbol=symbol)
+
+
+# ── _raw_signals ──────────────────────────────────────────────────────────────
+
+class TestRawSignals:
+    def test_returns_false_exits_always(self):
+        strat = SPYOptionsReversionStrategy()
+        df = _make_df(30)
+        signals = strat._raw_signals(df)
+        assert not signals.exits.any(), "_raw_signals should never emit exit signals"
+
+    def test_too_few_bars_returns_all_false(self):
+        strat = SPYOptionsReversionStrategy(rsi_length=14)
+        df = _make_df(10)
+        signals = strat._raw_signals(df)
+        assert not signals.entries.any()
+        assert not signals.exits.any()
+
+    def test_rsi_entry_fires_on_recovery_cross(self):
+        """Entry fires when RSI crosses 30 upward (prev < 30, current >= 30)."""
+        strat = SPYOptionsReversionStrategy(rsi_length=14, rsi_threshold=30)
+        # 20 flat bars to warm RSI, then a sharp dip, then recovery
+        closes = [520.0] * 20 + [480.0] * 5 + [521.0]
+        idx = pd.date_range("2026-01-02 09:30", periods=len(closes), freq="5min", tz="US/Eastern")
+        df = pd.DataFrame({"close": closes}, index=idx)
+        signals = strat._raw_signals(df)
+        # At least one entry should fire during/after the recovery
+        assert signals.entries.any()
+
+
+# ── inspect_open_positions: time stop ─────────────────────────────────────────
+
+class TestTimeStop:
+    def _strat(self) -> SPYOptionsReversionStrategy:
+        s = SPYOptionsReversionStrategy()
+        # Pre-cache VIX so yfinance is never called
+        s._vix_date = date.today()
+        s._vix_sigma = 0.18
+        return s
+
+    def _friday_expiry_two_weeks_out(self) -> date:
+        """Return a Friday at least 10 days from today."""
+        d = date.today() + timedelta(days=10)
+        while d.weekday() != 4:  # 4 = Friday
+            d += timedelta(days=1)
+        return d
+
+    def test_no_exit_before_expiry_wednesday(self):
+        expiry = self._friday_expiry_two_weeks_out()
+        expiry_wednesday = expiry - timedelta(days=2)
+        # Simulate: it's Tuesday (one day before expiry Wednesday), 4 PM ET
+        tuesday = expiry_wednesday - timedelta(days=1)
+        now = datetime.combine(tuesday, datetime.min.time().replace(hour=16), tzinfo=_ET)
+
+        strat = self._strat()
+        sym = _occ("SPY", expiry, "C", 520.0)
+        pos = _position(sym)
+
+        with patch("strategies.spy_options_reversion.datetime") as mock_dt:
+            mock_dt.now.side_effect = lambda tz=None: now if tz else datetime.now()
+            mock_dt.combine = datetime.combine
+            mock_dt.strptime = datetime.strptime
+            # Patch blackscholes to return safe delta
+            with patch("strategies.spy_options_reversion.BlackScholesCall", create=True) as mock_bs:
+                mock_bs.return_value.delta.return_value = 0.55
+                # Import patch
+                import sys
+                fake_bs = MagicMock()
+                fake_bs.BlackScholesCall.return_value.delta.return_value = 0.55
+                sys.modules.setdefault("blackscholes", fake_bs)
+                result = strat.inspect_open_positions(pos, 520.0)
+        assert not result, "Should not exit before expiry Wednesday"
+
+    def test_exit_on_expiry_wednesday_after_330(self):
+        expiry = self._friday_expiry_two_weeks_out()
+        expiry_wednesday = expiry - timedelta(days=2)
+        now_et = datetime.combine(
+            expiry_wednesday, datetime.min.time().replace(hour=15, minute=35), tzinfo=_ET
+        )
+
+        strat = self._strat()
+        sym = _occ("SPY", expiry, "C", 520.0)
+        pos = _position(sym)
+
+        with patch("strategies.spy_options_reversion.datetime") as mock_dt:
+            mock_dt.now.side_effect = lambda tz=None: now_et if tz == _ET else datetime.now(timezone.utc)
+            mock_dt.combine = datetime.combine
+            mock_dt.strptime = datetime.strptime
+            result = strat.inspect_open_positions(pos, 520.0)
+        assert result, "Should exit on expiry Wednesday after 3:30 PM ET"
+
+    def test_no_exit_on_expiry_wednesday_before_330(self):
+        expiry = self._friday_expiry_two_weeks_out()
+        expiry_wednesday = expiry - timedelta(days=2)
+        now_et = datetime.combine(
+            expiry_wednesday, datetime.min.time().replace(hour=15, minute=25), tzinfo=_ET
+        )
+
+        strat = self._strat()
+        sym = _occ("SPY", expiry, "C", 520.0)
+        pos = _position(sym)
+
+        with patch("strategies.spy_options_reversion.datetime") as mock_dt:
+            mock_dt.now.side_effect = lambda tz=None: now_et if tz == _ET else datetime.now(timezone.utc)
+            mock_dt.combine = datetime.combine
+            mock_dt.strptime = datetime.strptime
+            import sys, unittest.mock as _mock
+            fake_bs = _mock.MagicMock()
+            fake_bs.BlackScholesCall.return_value.delta.return_value = 0.55
+            sys.modules.setdefault("blackscholes", fake_bs)
+            result = strat.inspect_open_positions(pos, 520.0)
+        assert not result, "Should not exit on expiry Wednesday before 3:30 PM ET"
+
+    def test_ignores_put_contracts(self):
+        expiry = self._friday_expiry_two_weeks_out()
+        sym = _occ("SPY", expiry, "P", 520.0)  # PUT — not a call
+        strat = self._strat()
+        result = strat.inspect_open_positions(_position(sym), 520.0)
+        assert not result, "Should not exit puts (strategy only trades calls)"
+
+    def test_ignores_non_occ_symbol(self):
+        strat = self._strat()
+        result = strat.inspect_open_positions(_position("SPY"), 520.0)
+        assert not result
+
+
+# ── inspect_open_positions: Delta floor ──────────────────────────────────────
+
+class TestDeltaFloor:
+    def _strat_with_cached_vix(self) -> SPYOptionsReversionStrategy:
+        s = SPYOptionsReversionStrategy()
+        s._vix_date = date.today()
+        s._vix_sigma = 0.18
+        return s
+
+    def _safe_time_sym(self) -> tuple[str, datetime]:
+        """OCC symbol + a 'now' time safely before expiry Wednesday."""
+        expiry = date.today() + timedelta(days=14)
+        while expiry.weekday() != 4:
+            expiry += timedelta(days=1)
+        sym = _occ("SPY", expiry, "C", 520.0)
+        # Monday of that week, 10 AM ET — safely before Wednesday 3:30 PM
+        monday = expiry - timedelta(days=4)
+        now_et = datetime.combine(monday, datetime.min.time().replace(hour=10), tzinfo=_ET)
+        return sym, now_et
+
+    def _run(self, strat, sym, spy_price, delta_val, bs_price: float = 10.0) -> bool:
+        _, now_et = self._safe_time_sym()
+        pos = _position(sym)
+        import sys, unittest.mock as _mock
+        fake_bs = _mock.MagicMock()
+        call_obj = fake_bs.BlackScholesCall.return_value
+        call_obj.delta.return_value = delta_val
+        call_obj.price = bs_price  # Guard 3 reads call.price as an attribute
+        sys.modules["blackscholes"] = fake_bs
+
+        with patch("strategies.spy_options_reversion.datetime") as mock_dt:
+            mock_dt.now.side_effect = lambda tz=None: now_et if tz == _ET else datetime.now(timezone.utc)
+            mock_dt.combine = datetime.combine
+            mock_dt.strptime = datetime.strptime
+            return strat.inspect_open_positions(pos, spy_price)
+
+    def test_no_exit_above_floor(self):
+        strat = self._strat_with_cached_vix()
+        sym, _ = self._safe_time_sym()
+        assert not self._run(strat, sym, 520.0, 0.55)
+
+    def test_exit_below_floor(self):
+        strat = self._strat_with_cached_vix()
+        sym, _ = self._safe_time_sym()
+        assert self._run(strat, sym, 520.0, 0.25)
+
+    def test_exit_exactly_at_floor(self):
+        strat = self._strat_with_cached_vix()
+        sym, _ = self._safe_time_sym()
+        # 0.30 is below the floor threshold (delta < 0.30 triggers exit)
+        # exactly 0.30 should NOT trigger (condition is strict <)
+        assert not self._run(strat, sym, 520.0, 0.30)
+
+
+# ── inspect_open_positions: trailing stop ────────────────────────────────────
+
+class TestTrailingStop:
+    """Guard 3: HWM-based trailing stop — activates after trail_activation_pct gain,
+    exits when value drops trail_pct below peak."""
+
+    def _safe_expiry_and_sym(self) -> tuple[date, str, datetime]:
+        expiry = date.today() + timedelta(days=14)
+        while expiry.weekday() != 4:
+            expiry += timedelta(days=1)
+        sym = _occ("SPY", expiry, "C", 520.0)
+        monday = expiry - timedelta(days=4)
+        now_et = datetime.combine(monday, datetime.min.time().replace(hour=10), tzinfo=_ET)
+        return expiry, sym, now_et
+
+    def _run_cycle(self, strat, sym, now_et, bs_price: float, delta: float = 0.55) -> bool:
+        """Run one engine cycle with the given B-S price and delta."""
+        import sys, unittest.mock as _mock
+        fake_bs = _mock.MagicMock()
+        call_obj = fake_bs.BlackScholesCall.return_value
+        call_obj.delta.return_value = delta
+        call_obj.price = bs_price
+        sys.modules["blackscholes"] = fake_bs
+
+        pos = _position(sym)
+        with patch("strategies.spy_options_reversion.datetime") as mock_dt:
+            mock_dt.now.side_effect = lambda tz=None: now_et if tz == _ET else datetime.now(timezone.utc)
+            mock_dt.combine = datetime.combine
+            mock_dt.strptime = datetime.strptime
+            return strat.inspect_open_positions(pos, 520.0)
+
+    def _strat(self, activation=0.10, trail=0.15) -> SPYOptionsReversionStrategy:
+        s = SPYOptionsReversionStrategy(trail_activation_pct=activation, trail_pct=trail)
+        s._vix_date = date.today()
+        s._vix_sigma = 0.18
+        return s
+
+    def test_no_exit_before_activation_threshold(self):
+        """Value 5% above base — not past 10% activation, so no trail exit."""
+        _, sym, now_et = self._safe_expiry_and_sym()
+        strat = self._strat()
+        # First cycle sets base=10.0, HWM=10.0
+        result = self._run_cycle(strat, sym, now_et, bs_price=10.0)
+        assert not result
+        # Second cycle: value at 10.5 (+5%), HWM=10.5 — still below 11.0 (10% activation)
+        result = self._run_cycle(strat, sym, now_et, bs_price=10.5)
+        assert not result
+
+    def test_no_exit_when_above_trail_floor(self):
+        """Value exceeds activation threshold, then stays above trail floor — no exit."""
+        _, sym, now_et = self._safe_expiry_and_sym()
+        strat = self._strat(activation=0.10, trail=0.15)
+        # base = 10.0, cycle 1
+        self._run_cycle(strat, sym, now_et, bs_price=10.0)
+        # HWM = 12.0 — activates (20% above base > 10% threshold)
+        self._run_cycle(strat, sym, now_et, bs_price=12.0)
+        # Current = 11.0 — trail floor = 12.0 * 0.85 = 10.2. 11.0 > 10.2 → no exit
+        result = self._run_cycle(strat, sym, now_et, bs_price=11.0)
+        assert not result
+
+    def test_exit_when_below_trail_floor(self):
+        """After activation, value drops below HWM × (1 - trail_pct) — exit fires."""
+        _, sym, now_et = self._safe_expiry_and_sym()
+        strat = self._strat(activation=0.10, trail=0.15)
+        # base = 10.0
+        self._run_cycle(strat, sym, now_et, bs_price=10.0)
+        # HWM = 12.0 — activates (20% above base)
+        self._run_cycle(strat, sym, now_et, bs_price=12.0)
+        # Current = 9.0 — trail floor = 12.0 * 0.85 = 10.2. 9.0 < 10.2 → EXIT
+        result = self._run_cycle(strat, sym, now_et, bs_price=9.0)
+        assert result
+
+    def test_hwm_state_cleared_after_trail_exit(self):
+        """HWM and base dicts are emptied when the trailing stop fires."""
+        _, sym, now_et = self._safe_expiry_and_sym()
+        strat = self._strat(activation=0.10, trail=0.15)
+        self._run_cycle(strat, sym, now_et, bs_price=10.0)
+        self._run_cycle(strat, sym, now_et, bs_price=12.0)
+        self._run_cycle(strat, sym, now_et, bs_price=9.0)  # triggers exit
+        assert sym not in strat._position_hwm
+        assert sym not in strat._position_base
+
+    def test_hwm_tracks_new_highs(self):
+        """HWM updates to the highest value seen across cycles."""
+        _, sym, now_et = self._safe_expiry_and_sym()
+        strat = self._strat()
+        self._run_cycle(strat, sym, now_et, bs_price=10.0)
+        self._run_cycle(strat, sym, now_et, bs_price=14.0)
+        self._run_cycle(strat, sym, now_et, bs_price=12.0)  # pull-back, HWM stays at 14
+        assert abs(strat._position_hwm[sym] - 14.0) < 1e-6
+
+    def test_not_activated_below_threshold(self):
+        """A small gain (< activation) never triggers the trail check."""
+        _, sym, now_et = self._safe_expiry_and_sym()
+        strat = self._strat(activation=0.20, trail=0.15)  # 20% activation
+        self._run_cycle(strat, sym, now_et, bs_price=10.0)
+        # 15% gain — below 20% activation, so even a big drop won't trail-exit
+        result = self._run_cycle(strat, sym, now_et, bs_price=9.0)
+        assert not result  # Guard 3 inactive; SL at -25% would need 7.5, not 9.0
+
+    def test_hwm_state_cleared_after_time_stop(self):
+        """HWM state is cleaned up when Guard 1 (time stop) fires."""
+        expiry = date.today() + timedelta(days=14)
+        while expiry.weekday() != 4:
+            expiry += timedelta(days=1)
+        sym = _occ("SPY", expiry, "C", 520.0)
+        expiry_wednesday = expiry - timedelta(days=2)
+        now_et = datetime.combine(
+            expiry_wednesday, datetime.min.time().replace(hour=15, minute=35), tzinfo=_ET
+        )
+
+        strat = self._strat()
+        # Seed HWM state as if position was tracked
+        strat._position_hwm[sym] = 12.0
+        strat._position_base[sym] = 10.0
+
+        with patch("strategies.spy_options_reversion.datetime") as mock_dt:
+            mock_dt.now.side_effect = lambda tz=None: now_et if tz == _ET else datetime.now(timezone.utc)
+            mock_dt.combine = datetime.combine
+            mock_dt.strptime = datetime.strptime
+            result = strat.inspect_open_positions(_position(sym), 520.0)
+
+        assert result  # time stop fired
+        assert sym not in strat._position_hwm
+        assert sym not in strat._position_base
+
+
+# ── VIX cache ─────────────────────────────────────────────────────────────────
+
+class TestVixCache:
+    def test_caches_within_same_day(self):
+        strat = SPYOptionsReversionStrategy()
+        with patch("yfinance.Ticker") as mock_ticker:
+            mock_ticker.return_value.history.return_value = pd.DataFrame({"Close": [20.0]})
+            first = strat._fetch_vix()
+            second = strat._fetch_vix()
+            assert mock_ticker.call_count == 1, "Should only fetch once per day"
+        assert abs(first - 0.20) < 1e-6
+        assert first == second
+
+    def test_returns_fallback_on_yfinance_error(self):
+        strat = SPYOptionsReversionStrategy()
+        with patch("yfinance.Ticker", side_effect=RuntimeError("network down")):
+            sigma = strat._fetch_vix()
+        assert sigma == 0.15  # default fallback
+
+    def test_refreshes_on_new_day(self):
+        strat = SPYOptionsReversionStrategy()
+        yesterday = date.today() - timedelta(days=1)
+        strat._vix_date = yesterday
+        strat._vix_sigma = 0.12
+
+        with patch("yfinance.Ticker") as mock_ticker:
+            mock_ticker.return_value.history.return_value = pd.DataFrame({"Close": [25.0]})
+            sigma = strat._fetch_vix()
+
+        assert abs(sigma - 0.25) < 1e-6, "Should fetch fresh value on new day"
+        assert strat._vix_date == date.today()

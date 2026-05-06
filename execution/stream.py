@@ -113,6 +113,12 @@ class StreamManager:
         with self._lock:
             self._stop_legs.add(order_id)
 
+    def unwatch(self, order_id: str) -> None:
+        """Deregister a watched order, freeing internal state."""
+        with self._lock:
+            self._watched.pop(order_id, None)
+            self._updates.pop(order_id, None)
+
     def drain_stop_fills(self) -> list["TradeUpdate"]:
         """
         Return and clear all accumulated stop-leg fill events.
