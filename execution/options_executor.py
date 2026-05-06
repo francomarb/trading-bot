@@ -5,6 +5,7 @@ Background worker to handle options midpoint cancel/replace bracket orders.
 import threading
 import time
 import uuid
+from typing import Callable
 from loguru import logger
 from alpaca.trading.client import TradingClient
 from alpaca.trading.requests import LimitOrderRequest, TakeProfitRequest, StopLossRequest
@@ -13,13 +14,38 @@ from alpaca.trading.enums import OrderSide, OrderType as AlpacaOrderType, OrderC
 from risk.manager import RiskDecision, Side
 from execution.stream import StreamManager
 
+# Callback signature: (status_str, filled_qty, avg_fill_price, order_id)
+FillCallback = Callable[[str, float, "float | None", str], None]
+
+
 class OptionsExecutionWorker(threading.Thread):
-    def __init__(self, decision: RiskDecision, api: TradingClient, stream_manager: StreamManager | None = None):
+    def __init__(
+        self,
+        decision: RiskDecision,
+        api: TradingClient,
+        stream_manager: StreamManager | None = None,
+        on_fill: FillCallback | None = None,
+    ):
         super().__init__(daemon=True, name=f"OptionsExecutor-{decision.symbol}")
         self.decision = decision
         self.api = api
         self.stream_manager = stream_manager
+        self._on_fill = on_fill
         
+    def _report_fill(self, status: str, order_id: str, order=None) -> None:
+        if self._on_fill is None:
+            return
+        filled_qty = 0.0
+        avg_price = None
+        if order is not None:
+            filled_qty = float(order.filled_qty or 0)
+            avg = order.filled_avg_price
+            avg_price = float(avg) if avg is not None else None
+        try:
+            self._on_fill(status, filled_qty, avg_price, order_id)
+        except Exception as e:
+            logger.error(f"[{self.name}] on_fill callback raised: {e}")
+
     def run(self):
         logger.info(f"[{self.name}] Started background execution for {self.decision.symbol}")
         
@@ -69,29 +95,39 @@ class OptionsExecutionWorker(threading.Thread):
         # would fetch live quotes in a loop and use replace_order_by_id.
         if stream_event:
             filled = stream_event.wait(timeout=60.0)
+            self.stream_manager.unwatch(client_order_id)
             if filled:
                 logger.info(f"[{self.name}] Option order filled.")
+                try:
+                    final = self.api.get_order_by_id(order.id)
+                    self._report_fill("filled", str(order.id), final)
+                except Exception:
+                    self._report_fill("filled", str(order.id))
             else:
                 logger.warning(f"[{self.name}] Option limit order unfilled after 60s. Cancelling.")
                 try:
                     self.api.cancel_order_by_id(order.id)
                 except Exception as e:
                     logger.error(f"[{self.name}] Cancel failed: {e}")
-            self.stream_manager.unwatch(client_order_id)
+                self._report_fill("canceled", str(order.id))
         else:
             # Fallback REST polling
+            terminal_status = "canceled"
             for _ in range(12):
                 time.sleep(5)
                 try:
                     latest = self.api.get_order_by_client_id(client_order_id)
                     if latest.status in ("filled", "canceled", "rejected"):
                         logger.info(f"[{self.name}] Option order reached terminal state: {latest.status}")
+                        terminal_status = latest.status
+                        self._report_fill(terminal_status, str(latest.id), latest)
                         return
                 except Exception:
                     pass
-            
+
             logger.warning(f"[{self.name}] Option order unfilled after 60s via REST. Cancelling.")
             try:
                 self.api.cancel_order_by_id(order.id)
             except Exception as e:
                 pass
+            self._report_fill("canceled", str(order.id))

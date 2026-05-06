@@ -208,6 +208,10 @@ class AlpacaBroker:
         self._stream_manager = stream_manager
         # Dry-run: log orders but never submit. Defaults to settings.DRY_RUN.
         self._dry_run: bool = dry_run if dry_run is not None else DRY_RUN
+        # Async option fills reported by OptionsExecutionWorker threads.
+        # Drained by TradingEngine each cycle via drain_option_fills().
+        self._pending_option_fills: list[tuple] = []
+        self._pending_option_lock = threading.Lock()
 
     # ── Retry wrapper ────────────────────────────────────────────────────
 
@@ -378,6 +382,38 @@ class AlpacaBroker:
                 "Strategy signals must go through RiskManager.evaluate first."
             )
 
+        # Options path must come first — OCC symbols require the background
+        # worker regardless of qty, and must never fall into the fractional path.
+        import re
+        is_option = bool(re.match(r"^[A-Z]{1,6}[0-9]{6}[CP][0-9]{8}$", decision.symbol))
+        if is_option and decision.order_type is OrderType.LIMIT:
+            opt_worker_id = f"opt-worker-{uuid.uuid4().hex[:10]}"
+
+            dec = decision  # capture for closure
+
+            def _on_fill(status: str, filled_qty: float, avg_price: "float | None", order_id: str) -> None:
+                with self._pending_option_lock:
+                    self._pending_option_fills.append((dec, status, filled_qty, avg_price, order_id))
+
+            worker = OptionsExecutionWorker(
+                decision=decision,
+                api=self._api,
+                stream_manager=self._stream_manager,
+                on_fill=_on_fill,
+            )
+            worker.start()
+
+            return OrderResult(
+                status=OrderStatus.ACCEPTED,
+                order_id=opt_worker_id,
+                symbol=decision.symbol,
+                requested_qty=decision.qty,
+                filled_qty=0.0,
+                avg_fill_price=0.0,
+                raw_status="accepted",
+                message="dispatched to OptionsExecutionWorker",
+            )
+
         # Route fractional quantities to the DAY-entry + GTC-stop path.
         # When FRACTIONAL_ENABLED=False, _size_position always returns a whole
         # number so math.floor(qty) == qty is always True — this branch is
@@ -385,29 +421,6 @@ class AlpacaBroker:
         if math.floor(decision.qty) != decision.qty:
             return self._place_fractional_order(
                 decision, poll_timeout=poll_timeout, poll_interval=poll_interval
-            )
-            
-        import re
-        is_option = bool(re.match(r"^[A-Z]{1,6}[0-9]{6}[CP][0-9]{8}$", decision.symbol))
-        if is_option and decision.order_type is OrderType.LIMIT:
-            # Dispatch to background options worker
-            worker = OptionsExecutionWorker(
-                decision=decision,
-                api=self._api,
-                stream_manager=self._stream_manager
-            )
-            worker.start()
-            
-            # Return ACCEPTED immediately so engine is not blocked
-            return OrderResult(
-                status=OrderStatus.ACCEPTED,
-                order_id=f"opt-worker-{uuid.uuid4().hex[:10]}",
-                symbol=decision.symbol,
-                requested_qty=decision.qty,
-                filled_qty=0.0,
-                avg_fill_price=0.0,
-                raw_status="accepted",
-                message="dispatched to OptionsExecutionWorker",
             )
 
         # Build request object.
@@ -684,6 +697,17 @@ class AlpacaBroker:
             return self._build_result(order, symbol, requested_qty, OrderStatus.PARTIAL)
 
         return self._build_result(order, symbol, requested_qty, OrderStatus.PENDING)
+
+    def drain_option_fills(self) -> list[tuple]:
+        """
+        Return and clear all option fill events reported by background workers.
+        Each entry is (RiskDecision, status_str, filled_qty, avg_fill_price, order_id).
+        TradingEngine drains this each cycle to log fills and update position ownership.
+        """
+        with self._pending_option_lock:
+            fills = list(self._pending_option_fills)
+            self._pending_option_fills.clear()
+        return fills
 
     def cancel_order(self, order_id: str) -> bool:
         """Cancel an order by id. Returns True on success, False on failure."""

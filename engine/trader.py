@@ -449,6 +449,7 @@ class TradingEngine:
             self._recover_suspect_orders(snapshot)
             self._detect_external_closes(snapshot)
             self._process_stream_stop_fills()
+            self._drain_option_fills()
             self._repair_missing_protective_stops(snapshot)
 
             # Daily-loss / hard-dollar gates can fire on any signal; halt state
@@ -903,6 +904,24 @@ class TradingEngine:
             if result.status is OrderStatus.UNKNOWN:
                 self._remember_suspect_order(
                     decision, result, modeled_price=latest_close
+                )
+                if strategy_statuses is not None:
+                    strategy_statuses[symbol] = "Pending Entry"
+                if strategy_reasons is not None:
+                    strategy_reasons[symbol] = []
+                self._mark_signal_bar_processed(
+                    signal_key, signal_bar, strategy_statuses, strategy_reasons, symbol
+                )
+                return None
+            if result.status is OrderStatus.ACCEPTED:
+                # Options worker dispatched asynchronously — pre-register
+                # ownership so the position is managed when it arrives in the
+                # broker snapshot. The actual fill is logged via drain_option_fills().
+                self._position_owners[symbol] = strategy.name
+                self._entry_prices[symbol] = target_price
+                logger.info(
+                    f"[{strategy.name}] {symbol}: options order dispatched "
+                    f"({target_symbol}), ownership pre-registered"
                 )
                 if strategy_statuses is not None:
                     strategy_statuses[symbol] = "Pending Entry"
@@ -1526,6 +1545,62 @@ class TradingEngine:
                 )
             except Exception as e:
                 logger.error(f"{symbol}: failed to log stop fill: {e}")
+
+    def _drain_option_fills(self) -> None:
+        """
+        Process async fill events reported by OptionsExecutionWorker threads.
+
+        Each cycle, background workers may have resolved their option bracket
+        orders (fill or cancel).  This method logs fills to the trade DB and
+        updates entry prices; it cleans up pre-registered ownership on cancel
+        so external-close detection doesn't generate spurious warnings.
+        """
+        import re as _re
+        fills = self.broker.drain_option_fills()
+        for decision, status_str, filled_qty, avg_fill_price, order_id in fills:
+            mapped = {"filled": OrderStatus.FILLED, "partially_filled": OrderStatus.PARTIAL}.get(
+                status_str, OrderStatus.CANCELED
+            )
+            result = OrderResult(
+                status=mapped,
+                order_id=order_id,
+                symbol=decision.symbol,
+                requested_qty=decision.qty,
+                filled_qty=filled_qty,
+                avg_fill_price=avg_fill_price,
+                raw_status=status_str,
+                message=f"options async fill: {status_str}",
+            )
+            self._record_fill(result, modeled_price=decision.entry_reference_price, order_type="limit")
+            self._log_entry(decision, result, decision.entry_reference_price)
+            if result.status in {OrderStatus.FILLED, OrderStatus.PARTIAL}:
+                # Update entry price with actual fill price; find the underlying
+                # symbol that was pre-registered when the worker was dispatched.
+                m = _re.match(r"^([A-Z]{1,6})[0-9]{6}[CP][0-9]{8}$", decision.symbol)
+                if m and avg_fill_price:
+                    underlying = m.group(1)
+                    if underlying in self._position_owners:
+                        self._entry_prices[underlying] = avg_fill_price
+                self.alerts.trade_executed(
+                    symbol=decision.symbol,
+                    strategy=decision.strategy_name,
+                    side="buy",
+                    qty=filled_qty,
+                    price=avg_fill_price or decision.entry_reference_price,
+                    reason=f"{decision.strategy_name} options entry",
+                )
+            else:
+                # Order was canceled/rejected — remove pre-registered ownership
+                # so the symbol is not mistakenly tracked as an open position.
+                m = _re.match(r"^([A-Z]{1,6})[0-9]{6}[CP][0-9]{8}$", decision.symbol)
+                underlying = m.group(1) if m else None
+                if underlying and self._position_owners.get(underlying) == decision.strategy_name:
+                    logger.info(
+                        f"[{decision.strategy_name}] options order canceled/rejected "
+                        f"({decision.symbol}) — removing pre-registered ownership"
+                    )
+                    self._position_owners.pop(underlying, None)
+                    self._entry_prices.pop(underlying, None)
 
     def _restore_ownership_from_db(self, snapshot: BrokerSnapshot) -> set[str]:
         """
