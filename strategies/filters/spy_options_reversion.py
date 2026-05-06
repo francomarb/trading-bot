@@ -1,7 +1,7 @@
 """
 SPY Options Reversion edge filter.
 
-Single gate: SPY close must be above its 200-day SMA.
+Single gate: SPY close must be above its 100-day SMA.
 
 Rationale: this strategy buys SPY calls on RSI weakness. In a structural bear
 market (SPY below 200 SMA), every oversold bounce is a dead-cat setup and the
@@ -36,11 +36,11 @@ class SPYOptionsEdgeFilter:
     def __init__(
         self,
         *,
-        spy_lookback_days: int = 320,
+        spy_lookback_days: int = 180,
         spy_cache_ttl: float = 600.0,
     ) -> None:
         self._spy_filter = SPYTrendFilter(
-            sma_windows=[200],
+            sma_windows=[100],
             lookback_days=spy_lookback_days,
             cache_ttl_seconds=spy_cache_ttl,
         )
@@ -57,10 +57,10 @@ class SPYOptionsEdgeFilter:
         if not df.empty:
             if bool(allowed.iloc[-1]):
                 self._last_reasons = []
-                logger.info("SPY_OPTIONS_FILTER_ALLOWED — SPY above 200 SMA")
+                logger.info("SPY_OPTIONS_FILTER_ALLOWED — SPY above 100 SMA")
             else:
-                self._last_reasons = ["SPY below 200 SMA (bear regime)"]
-                logger.info("SPY_OPTIONS_FILTER_BLOCKED — SPY below 200 SMA (bear regime)")
+                self._last_reasons = ["SPY below 100 SMA (bear regime)"]
+                logger.info("SPY_OPTIONS_FILTER_BLOCKED — SPY below 100 SMA (bear regime)")
 
         return EdgeFilterDecision.from_bool_series(
             allowed,

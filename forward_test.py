@@ -257,7 +257,7 @@ def main() -> None:
         StrategySlot(
             strategy=SPYOptionsReversionStrategy(
                 rsi_length=14,
-                rsi_threshold=30,
+                rsi_threshold=45,
                 edge_filter=SPYOptionsEdgeFilter(),
             ),
             watchlist_source=StaticWatchlistSource(
