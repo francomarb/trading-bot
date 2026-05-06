@@ -22,13 +22,26 @@ class SPYOptionsReversionStrategy(BaseStrategy):
     name = "spy_options_reversion"
     preferred_order_type = OrderType.LIMIT
 
-    def __init__(self, rsi_length: int = 14, rsi_threshold: float = 30, *, edge_filter=None):
+    def __init__(
+        self,
+        rsi_length: int = 14,
+        rsi_threshold: float = 30,
+        *,
+        trail_activation_pct: float = 0.10,
+        trail_pct: float = 0.15,
+        edge_filter=None,
+    ):
         super().__init__(edge_filter=edge_filter)
         self.rsi_length = rsi_length
         self.rsi_threshold = rsi_threshold
+        self.trail_activation_pct = trail_activation_pct
+        self.trail_pct = trail_pct
         # VIX cache: refreshed once per calendar day to avoid hot-loop HTTP calls.
         self._vix_date: date | None = None
         self._vix_sigma: float = 0.15  # fallback: ~VIX 15
+        # Trailing stop state keyed by OCC symbol.
+        self._position_hwm: dict[str, float] = {}   # OCC → highest B-S value observed
+        self._position_base: dict[str, float] = {}  # OCC → first B-S value observed
 
     @property
     def required_bars(self) -> int:
@@ -57,34 +70,40 @@ class SPYOptionsReversionStrategy(BaseStrategy):
     def inspect_open_positions(self, position, latest_close: float) -> bool:
         """
         Called every engine cycle for each open position.  Returns True to
-        trigger an immediate market exit.  Two guards run in order:
+        trigger an immediate market exit.  Three guards run in order:
 
-        1. Time stop  — exit by Wednesday 3:30 PM ET of the contract's expiry
-                        week.  Prevents holding through the Theta cliff.
-        2. Delta floor — exit if approximated Delta < 0.30.  Signals the
-                         option has moved too far OTM to be a viable play.
+        1. Time stop      — exit by Wednesday 3:30 PM ET of the contract's
+                            expiry week.  Prevents holding through Theta cliff.
+        2. Delta floor    — exit if B-S Delta < 0.30.  Signals the option has
+                            moved too far OTM to be a viable play.
+        3. Trailing stop  — activate once the B-S value rises ≥ trail_activation_pct
+                            above the entry value; then exit if the current value
+                            drops ≥ trail_pct below the highest observed value.
+                            Lets winners run while protecting open profits.
         """
         match = _OCC_RE.match(position.symbol)
         if not match or match.group(3) != "C":
             return False
 
+        occ = position.symbol
         expiry_date = datetime.strptime(match.group(2), "%y%m%d").date()
         strike = float(match.group(4)) / 1000.0
 
         # ── Guard 1: time stop ───────────────────────────────────────────────
         # Exit on or after the Wednesday of expiry week at 3:30 PM ET.
-        # "Wednesday of expiry week" = expiry_date (Friday) - 2 days.
         now_et = datetime.now(_ET)
         expiry_wednesday = expiry_date - timedelta(days=2)
         at_or_past_330 = now_et.hour * 60 + now_et.minute >= 15 * 60 + 30
         if now_et.date() >= expiry_wednesday and at_or_past_330:
             logger.warning(
-                f"[{self.name}] Time stop: {position.symbol} — "
+                f"[{self.name}] Time stop: {occ} — "
                 f"expiry week Wednesday reached ({now_et.strftime('%a %Y-%m-%d %H:%M ET')})"
             )
+            self._position_hwm.pop(occ, None)
+            self._position_base.pop(occ, None)
             return True
 
-        # ── Guard 2: Delta floor ─────────────────────────────────────────────
+        # ── Guards 2 + 3: B-S valuation ─────────────────────────────────────
         # T = time to options market close (4 PM ET on expiry date) in years.
         expiry_close_et = datetime.combine(expiry_date, time(16, 0), tzinfo=_ET)
         t_days = (expiry_close_et - datetime.now(timezone.utc)).total_seconds() / 86400.0
@@ -96,18 +115,49 @@ class SPYOptionsReversionStrategy(BaseStrategy):
             from blackscholes import BlackScholesCall
             call = BlackScholesCall(S=latest_close, K=strike, T=T, r=0.05, sigma=sigma)
             delta = call.delta()
+            opt_val = float(call.price)
+
             logger.debug(
-                f"[{self.name}] {position.symbol} Delta={delta:.3f} "
+                f"[{self.name}] {occ} Delta={delta:.3f} price={opt_val:.2f} "
                 f"(S={latest_close:.2f}, K={strike:.2f}, T={T:.4f}y, σ={sigma:.2f})"
             )
+
+            # ── Guard 2: Delta floor ─────────────────────────────────────────
             if delta < 0.30:
                 logger.warning(
-                    f"[{self.name}] Delta floor: {position.symbol} — "
-                    f"Delta={delta:.3f} < 0.30, exiting"
+                    f"[{self.name}] Delta floor: {occ} — Delta={delta:.3f} < 0.30, exiting"
                 )
+                self._position_hwm.pop(occ, None)
+                self._position_base.pop(occ, None)
                 return True
+
+            # ── Guard 3: trailing stop ───────────────────────────────────────
+            if occ not in self._position_base:
+                self._position_base[occ] = opt_val
+            self._position_hwm[occ] = max(self._position_hwm.get(occ, opt_val), opt_val)
+
+            base = self._position_base[occ]
+            hwm = self._position_hwm[occ]
+
+            if hwm >= base * (1.0 + self.trail_activation_pct):
+                trail_floor = hwm * (1.0 - self.trail_pct)
+                logger.debug(
+                    f"[{self.name}] {occ} trailing stop active — "
+                    f"val={opt_val:.2f} hwm={hwm:.2f} floor={trail_floor:.2f}"
+                )
+                if opt_val < trail_floor:
+                    logger.warning(
+                        f"[{self.name}] Trailing stop: {occ} — "
+                        f"value={opt_val:.2f} < floor={trail_floor:.2f} "
+                        f"(hwm={hwm:.2f}, activation={self.trail_activation_pct:.0%}, "
+                        f"trail={self.trail_pct:.0%})"
+                    )
+                    self._position_hwm.pop(occ, None)
+                    self._position_base.pop(occ, None)
+                    return True
+
         except Exception as e:
-            logger.error(f"[{self.name}] Delta calculation failed for {position.symbol}: {e}")
+            logger.error(f"[{self.name}] B-S valuation failed for {occ}: {e}")
 
         return False
 
@@ -143,7 +193,7 @@ class SPYOptionsReversionStrategy(BaseStrategy):
         Raises ValueError on any rejection so the engine skips the trade.
         """
         occ_symbol = find_best_call(
-            symbol, underlying_price, min_dte=10, max_dte=21, target_delta=0.55
+            symbol, underlying_price, min_dte=14, max_dte=28, target_delta=0.55
         )
         if not occ_symbol:
             raise ValueError(f"No valid option contract found for {symbol}")
@@ -202,11 +252,13 @@ class SPYOptionsReversionStrategy(BaseStrategy):
         if premium <= 0:
             raise ValueError(f"{occ_symbol}: computed premium={premium:.2f} <= 0 — skipping trade.")
 
-        take_profit = round(premium * 1.20, 2)
-        stop_loss = round(premium * 0.70, 2)
+        # Hard SL at -25% (backtest validated). TP is a +200% safety valve —
+        # the trailing stop in inspect_open_positions handles real profit-taking.
+        take_profit = round(premium * 3.00, 2)
+        stop_loss = round(premium * 0.75, 2)
 
         logger.info(
             f"[{self.name}] {occ_symbol}: premium=${premium:.2f} "
-            f"spread={spread_pct:.1%} TP=${take_profit:.2f} SL=${stop_loss:.2f}"
+            f"spread={spread_pct:.1%} SL=${stop_loss:.2f} TP=${take_profit:.2f} (safety valve)"
         )
         return occ_symbol, premium, take_profit, stop_loss
