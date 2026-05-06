@@ -757,7 +757,14 @@ class TradingEngine:
                 # and would inject thousands of spurious bps into the drift monitor.
                 if not _OCC_PAT.match(position.symbol):
                     self._record_fill(result, modeled_price=latest_close, order_type="market")
-                self._log_close(result, latest_close, strategy.name)
+                # For options, modeled_price is the actual fill premium; using
+                # the underlying bar close (~$520) here would corrupt the audit trail.
+                _close_modeled = (
+                    result.avg_fill_price or 0.0
+                    if _OCC_PAT.match(position.symbol)
+                    else latest_close
+                )
+                self._log_close(result, _close_modeled, strategy.name)
                 if result.status in {OrderStatus.FILLED, OrderStatus.PARTIAL}:
                     if strategy_statuses is not None:
                         strategy_statuses[symbol] = "No Signal"
@@ -1537,10 +1544,16 @@ class TradingEngine:
             return
 
         for update in self._stream_manager.drain_stop_fills():
-            symbol = update.order.symbol
+            raw_symbol = update.order.symbol
+            # OCC bracket stop legs carry the full OCC string (e.g. SPY260516C00520000).
+            # _position_owners is keyed by the underlying ("SPY"), so normalise before
+            # lookup; keep raw_symbol for logging and trade-DB calls.
+            _occ_m = re.match(r"^([A-Z]{1,6})[0-9]", raw_symbol) if _OCC_PAT.match(raw_symbol) else None
+            symbol = _occ_m.group(1) if _occ_m else raw_symbol
+
             if symbol not in self._position_owners:
                 logger.debug(
-                    f"stream stop fill for unowned {symbol} — already handled"
+                    f"stream stop fill for unowned {raw_symbol} — already handled"
                 )
                 continue
 
@@ -1549,23 +1562,25 @@ class TradingEngine:
             price = float(update.price) if update.price is not None else None
             qty = int(float(update.qty or 0))
             msg = (
-                f"{symbol}: protective stop triggered (WebSocket) — "
+                f"{raw_symbol}: protective stop triggered (WebSocket) — "
                 f"qty={qty} price={price} strategy={owner}"
             )
             logger.warning(msg)
             self.alerts.broker_error(msg)
             # Feed realized P&L into the HWM drawdown gate.
+            # Options: multiply by 100 (each contract = 100 shares).
             if price is not None and qty > 0:
-                self._record_realized_pnl(symbol, owner, price, qty)
+                _pnl_mult = 100 if _occ_m else 1
+                self._record_realized_pnl(symbol, owner, price, qty, multiplier=_pnl_mult)
             self._entry_prices.pop(symbol, None)
             try:
                 self.trade_logger.log_external_close(
-                    symbol=symbol,
+                    symbol=raw_symbol,
                     strategy=owner,
                     reason="stop_triggered",
                 )
             except Exception as e:
-                logger.error(f"{symbol}: failed to log stop fill: {e}")
+                logger.error(f"{raw_symbol}: failed to log stop fill: {e}")
 
     def _drain_option_fills(self) -> None:
         """
