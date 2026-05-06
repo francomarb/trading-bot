@@ -2,7 +2,7 @@
 
 **Status:** ✅ **ACTIVE** — wired in `forward_test.py` on `gemini/options-wip-save` branch.
 
-**Last updated:** 2026-05-06
+**Last updated:** 2026-05-06 (trailing stop added)
 
 ---
 
@@ -40,8 +40,9 @@ human discretion lacks (greed, holding winners past the target).
 | Target delta at entry | ~0.55 (approximated geometrically; no live Greeks) |
 | Order type | LIMIT at OPRA bid/ask midpoint |
 | Spread guard | Reject if (ask − bid) / midpoint > 5% |
-| Take profit | **+25%** of entry premium |
-| Stop loss | **−25%** of entry premium |
+| Take profit | **+200% safety valve** only — trailing stop handles real exits |
+| Trailing stop | Activates once B-S value rises ≥ **10%** above entry value; exits if value drops ≥ **15%** below HWM |
+| Stop loss | **−25%** of entry premium (hard floor, always active) |
 | Time stop | Wednesday of expiry week at 3:30 PM ET |
 | Delta floor | Exit if Black-Scholes Delta < 0.30 (uses VIX as implied vol, cached daily) |
 | Edge filter | `SPYOptionsEdgeFilter`: SPY close > **100-day SMA** |
@@ -107,71 +108,104 @@ pricing with VIX as implied vol, r = 0.05, strike = close × 0.995.
 - The 100 SMA filter (used with the chosen combo) improves PF to 3.08 vs. 2.59 with 200 SMA.
 
 **Chosen configuration rationale:**
-RSI 45 / TP 25% / SL 25% / DTE 14–28 / max_pos=1 / 100 SMA filter.
-Prioritises per-trade quality over volume.  35 trades over 6 years ≈ ~6/year on daily bars;
+RSI 45 / trailing stop (act=10%, trail=15%) / SL 25% / DTE 14–28 / max_pos=1 / 100 SMA filter.
+Prioritises per-trade quality over volume.  39 trades over 6 years ≈ ~6/year on daily bars;
 the live 5-minute strategy will fire more frequently because intraday dips are shallower and
-more common than multi-day daily-bar dips.
+more common than multi-day daily-bar dips.  The trailing stop replaces the fixed TP to let
+winners run; see the trailing stop comparison section below.
 
 ---
 
-## Backtest results — chosen configuration
+## Backtest results — trailing stop (live configuration)
 
-**RSI 45 | TP +25% | SL −25% | DTE 14–28 | SPY > 100 SMA | 2019–2025**
+**RSI 45 | trailing stop (act=10%, trail=15%) | SL −25% | DTE 14–28 | SPY > 100 SMA | 2019–2025**
 
-| Metric | Value |
-|---|---|
-| Total trades | 35 |
-| Win rate | 71.4% |
-| Avg P&L per trade | +21.3% |
-| Cumulative P&L (sum of trade %) | +746% |
-| Profit factor | 3.08 |
-| Avg hold days | ~3.5 |
-| 2020 (COVID) | 5 trades / 4 wins / **+145%** |
-| 2021 | 11 trades / 8 wins / **+180%** |
-| 2022 (bear market) | **0 trades** — 100 SMA filter blocked all entries |
-| 2023 | 6 trades / 3 wins / +71% |
-| 2024 | 8 trades / 6 wins / **+216%** |
-| 2025 | 5 trades / 4 wins / +134% |
+| Metric | Baseline (fixed TP 20%) | **Trailing stop** | Δ |
+|---|---|---|---|
+| Trades | 40 | **39** | −1 |
+| Win rate | 67.5% | **46.2%** | −21pp (expected: larger winners trail below entry) |
+| Avg P&L / trade | +14.6% | **+29.8%** | +2× |
+| Cumulative P&L | +584% | **+1,164%** | **+2×** |
+| Profit factor | 2.27 | **3.31** | +46% |
+| Avg hold days | 3.3 | **8.1** | +2.4× |
+| 2020 (COVID) | +76% | **+187%** | |
+| 2022 (bear) | +26% | **−78%** | trade-off — see note |
+| 2023–2025 | +333% | **+705%** | |
 
-**Per-trade log (Black-Scholes modelled, daily close prices):**
+**Exit breakdown:**
+
+| Exit type | Baseline | Trailing |
+|---|---|---|
+| Fixed TP hits | 27 | 0 (replaced) |
+| Hard SL hits | 13 | 10 |
+| Time stops | 0 | 10 |
+| Trail exits | 0 | 19 |
+
+**Big winners unlocked by the trailing stop** (capped at 20% in the baseline):
+
+| Date | Baseline exit | Trailing exit |
+|---|---|---|
+| 2020-02-03 | +40.8% (tp) | **+147.4%** (time_stop) |
+| 2020-11-03 | +61.6% (tp) | **+91.2%** (time_stop) |
+| 2021-06-21 | +27.2% (tp) | **+89.9%** (time_stop) |
+| 2021-10-13 | +48.8% (tp) | **+149.8%** (time_stop) |
+| 2024-05-02 | +46.1% (tp) | **+246.1%** (time_stop) |
+| 2024-08-09 | +38.8% (tp) | **+192.1%** (time_stop) |
+| 2024-09-09 | +33.5% (tp) | **+144.6%** (time_stop) |
+| 2024-11-01 | +102.1% (tp) | **+146.6%** (time_stop) |
+
+**2022 trade-off:** The Jan/Feb 2022 trades (+26.8%, +36.0% with fixed TP) flip to losses
+(−25%, −16.6%) because the market bounced just enough to activate the trail then reversed
+hard.  This is a structural whipsaw risk.  A volatility gate or SMA re-tuning could address
+this but is deferred — the overall improvement across 6 years is unambiguous.  The 100 SMA
+filter already blocks the most dangerous 2022 entries (no trades after mid-Jan 2022).
+
+**Per-trade log — trailing stop (live configuration):**
 
 | Entry | Exit | SPY @ Entry | Strike | Expiry | Entry $ | Exit $ | P&L % | Reason |
 |---|---|---|---|---|---|---|---|---|
-| 2020-02-03 | 2020-02-04 | 296.20 | 294.72 | 2020-02-21 | 5.88 | 8.28 | +40.8% | tp |
+| 2020-02-03 | 2020-02-19 | 296.20 | 294.72 | 2020-02-21 | 5.88 | 14.56 | **+147.4%** | time_stop |
 | 2020-09-09 | 2020-09-10 | 313.72 | 312.15 | 2020-09-25 | 8.70 | 5.94 | −31.8% | sl |
-| 2020-09-11 | 2020-09-15 | 308.43 | 306.89 | 2020-09-25 | 7.57 | 9.90 | +30.7% | tp |
-| 2020-09-28 | 2020-10-08 | 309.79 | 308.24 | 2020-10-16 | 8.37 | 12.05 | +43.9% | tp |
-| 2020-11-03 | 2020-11-05 | 311.49 | 309.94 | 2020-11-20 | 10.68 | 17.25 | +61.6% | tp |
-| 2021-02-01 | 2021-02-04 | 350.25 | 348.49 | 2021-02-19 | 10.71 | 13.78 | +28.7% | tp |
+| 2020-09-11 | 2020-09-17 | 308.43 | 306.89 | 2020-09-25 | 7.57 | 6.78 | −10.4% | trail |
+| 2020-09-28 | 2020-10-02 | 309.79 | 308.24 | 2020-10-16 | 8.37 | 7.61 | −9.1% | trail |
+| 2020-11-03 | 2020-11-18 | 311.49 | 309.94 | 2020-11-20 | 10.68 | 20.41 | **+91.2%** | time_stop |
+| 2021-02-01 | 2021-02-17 | 350.25 | 348.49 | 2021-02-19 | 10.71 | 16.89 | **+57.7%** | time_stop |
 | 2021-03-01 | 2021-03-03 | 362.67 | 360.86 | 2021-03-19 | 8.90 | 5.72 | −35.8% | sl |
-| 2021-03-05 | 2021-03-11 | 357.13 | 355.35 | 2021-03-19 | 8.16 | 12.42 | +52.1% | tp |
-| 2021-05-13 | 2021-05-14 | 383.19 | 381.28 | 2021-05-28 | 8.57 | 10.91 | +27.3% | tp |
-| 2021-06-21 | 2021-06-25 | 394.36 | 392.39 | 2021-07-09 | 7.81 | 9.93 | +27.2% | tp |
-| 2021-07-20 | 2021-07-23 | 403.92 | 401.90 | 2021-08-06 | 8.41 | 12.73 | +51.2% | tp |
+| 2021-03-05 | 2021-03-17 | 357.13 | 355.35 | 2021-03-19 | 8.16 | 14.58 | **+78.6%** | time_stop |
+| 2021-05-13 | 2021-05-18 | 383.19 | 381.28 | 2021-05-28 | 8.57 | 7.62 | −11.1% | trail |
+| 2021-06-21 | 2021-07-07 | 394.36 | 392.39 | 2021-07-09 | 7.81 | 14.82 | **+89.9%** | time_stop |
+| 2021-07-20 | 2021-07-28 | 403.92 | 401.90 | 2021-08-06 | 8.41 | 11.11 | +32.0% | trail |
 | 2021-09-23 | 2021-09-28 | 416.61 | 414.52 | 2021-10-08 | 7.83 | 3.67 | −53.1% | sl |
-| 2021-10-06 | 2021-10-12 | 408.82 | 406.78 | 2021-10-22 | 8.71 | 6.06 | −30.4% | sl |
-| 2021-10-13 | 2021-10-14 | 409.09 | 407.04 | 2021-10-29 | 7.92 | 11.79 | +48.8% | tp |
-| 2021-12-02 | 2021-12-07 | 429.97 | 427.82 | 2021-12-17 | 11.27 | 14.77 | +31.0% | tp |
-| 2021-12-21 | 2021-12-23 | 436.82 | 434.64 | 2022-01-07 | 9.57 | 12.72 | +32.9% | tp |
-| 2023-01-06 | 2023-01-11 | 372.03 | 370.17 | 2023-01-20 | 7.49 | 11.04 | +47.4% | tp |
+| 2021-10-06 | 2021-10-11 | 408.82 | 406.78 | 2021-10-22 | 8.71 | 6.96 | −20.1% | trail |
+| 2021-10-13 | 2021-10-27 | 409.09 | 407.04 | 2021-10-29 | 7.92 | 19.79 | **+149.8%** | time_stop |
+| 2021-12-02 | 2021-12-09 | 429.97 | 427.82 | 2021-12-17 | 11.27 | 12.70 | +12.7% | trail |
+| 2021-12-21 | 2021-12-31 | 436.82 | 434.64 | 2022-01-07 | 9.57 | 14.29 | +49.3% | trail |
+| 2022-01-31 | 2022-02-03 | 424.42 | 422.30 | 2022-02-18 | 10.97 | 8.23 | −25.0% | trail |
+| 2022-02-04 | 2022-02-10 | 423.28 | 421.16 | 2022-02-18 | 9.20 | 7.68 | −16.6% | trail |
+| 2022-02-15 | 2022-02-17 | 420.83 | 418.72 | 2022-03-04 | 10.90 | 6.91 | −36.6% | sl |
 | 2023-02-23 | 2023-02-24 | 384.09 | 382.17 | 2023-03-10 | 7.98 | 5.75 | −28.0% | sl |
-| 2023-03-02 | 2023-03-03 | 381.36 | 379.45 | 2023-03-17 | 7.46 | 10.97 | +47.2% | tp |
+| 2023-03-02 | 2023-03-07 | 381.36 | 379.45 | 2023-03-17 | 7.46 | 6.49 | −13.0% | trail |
 | 2023-03-16 | 2023-03-22 | 379.73 | 377.83 | 2023-03-31 | 8.45 | 5.24 | −38.0% | sl |
 | 2023-08-23 | 2023-08-24 | 427.91 | 425.77 | 2023-09-08 | 7.36 | 4.55 | −38.2% | sl |
-| 2023-08-25 | 2023-08-29 | 424.96 | 422.83 | 2023-09-08 | 6.79 | 12.24 | +80.3% | tp |
+| 2023-08-25 | 2023-09-05 | 424.96 | 422.83 | 2023-09-08 | 6.79 | 11.29 | **+66.4%** | trail |
+| 2023-10-09 | 2023-10-12 | 419.01 | 416.92 | 2023-10-27 | 8.22 | 8.04 | −2.2% | trail |
+| 2023-11-01 | 2023-11-09 | 409.68 | 407.63 | 2023-11-17 | 7.34 | 13.66 | **+86.0%** | trail |
 | 2024-04-23 | 2024-04-30 | 493.64 | 491.17 | 2024-05-10 | 8.60 | 4.85 | −43.7% | sl |
-| 2024-05-02 | 2024-05-03 | 493.03 | 490.57 | 2024-05-17 | 7.73 | 11.29 | +46.1% | tp |
-| 2024-07-26 | 2024-07-31 | 533.22 | 530.55 | 2024-08-09 | 8.80 | 11.53 | +31.0% | tp |
-| 2024-07-31 | 2024-08-01 | 539.46 | 536.76 | 2024-08-16 | 9.44 | 6.25 | −33.8% | sl |
-| 2024-08-09 | 2024-08-13 | 522.01 | 519.40 | 2024-08-23 | 10.21 | 14.16 | +38.8% | tp |
-| 2024-09-09 | 2024-09-11 | 535.15 | 532.47 | 2024-09-27 | 11.32 | 15.11 | +33.5% | tp |
-| 2024-11-01 | 2024-11-06 | 560.99 | 558.18 | 2024-11-15 | 11.62 | 23.48 | +102.1% | tp |
-| 2024-12-20 | 2024-12-24 | 582.70 | 579.78 | 2025-01-03 | 10.50 | 14.88 | +41.8% | tp |
+| 2024-05-02 | 2024-05-15 | 493.03 | 490.57 | 2024-05-17 | 7.73 | 26.76 | **+246.1%** | time_stop |
+| 2024-07-26 | 2024-08-01 | 533.22 | 530.55 | 2024-08-09 | 8.80 | 6.80 | −22.8% | trail |
+| 2024-08-09 | 2024-08-21 | 522.01 | 519.40 | 2024-08-23 | 10.21 | 29.81 | **+192.1%** | time_stop |
+| 2024-09-09 | 2024-09-25 | 535.15 | 532.47 | 2024-09-27 | 11.32 | 27.68 | **+144.6%** | time_stop |
+| 2024-11-01 | 2024-11-13 | 560.99 | 558.18 | 2024-11-15 | 11.62 | 28.65 | **+146.6%** | time_stop |
+| 2024-12-20 | 2024-12-27 | 582.70 | 579.78 | 2025-01-03 | 10.50 | 9.57 | −8.8% | trail |
 | 2025-01-03 | 2025-01-07 | 583.49 | 580.57 | 2025-01-17 | 9.52 | 7.05 | −26.0% | sl |
-| 2025-01-15 | 2025-01-21 | 584.30 | 581.38 | 2025-01-31 | 10.11 | 15.19 | +50.2% | tp |
-| 2025-10-13 | 2025-10-24 | 659.29 | 655.99 | 2025-10-31 | 13.70 | 18.90 | +38.0% | tp |
-| 2025-11-24 | 2025-11-26 | 664.94 | 661.62 | 2025-12-12 | 14.68 | 19.39 | +32.1% | tp |
-| 2025-12-18 | 2025-12-22 | 672.64 | 669.28 | 2026-01-02 | 11.71 | 16.38 | +40.0% | tp |
+| 2025-01-15 | 2025-01-27 | 584.30 | 581.38 | 2025-01-31 | 10.11 | 10.87 | +7.4% | trail |
+| 2025-03-24 | 2025-03-26 | 567.57 | 564.74 | 2025-04-11 | 11.03 | 7.96 | −27.9% | sl |
+| 2025-10-13 | 2025-10-22 | 659.29 | 655.99 | 2025-10-31 | 13.70 | 12.90 | −5.9% | trail |
+| 2025-11-24 | 2025-12-09 | 664.94 | 661.62 | 2025-12-12 | 14.68 | 18.00 | +22.6% | trail |
+| 2025-12-18 | 2025-12-29 | 672.64 | 669.28 | 2026-01-02 | 11.71 | 17.25 | +47.4% | trail |
+
+**Future improvement noted:** 2022 whipsaw risk (Jan/Feb trades) could be addressed with a
+volatility gate (e.g. VIX > threshold) or SMA re-tuning.  Deferred pending paper run data.
 
 ---
 

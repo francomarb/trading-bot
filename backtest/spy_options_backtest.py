@@ -104,6 +104,9 @@ def _run(
     max_positions: int = 1,
     r: float = 0.05,
     itm_offset: float = 0.005,
+    # Trailing stop — if both are set, tp_pct is ignored
+    trail_activation_pct: float | None = None,
+    trail_pct: float | None = None,
 ) -> list[dict]:
     close = df["close"]
     vix = df["vix"]
@@ -129,6 +132,7 @@ def _run(
         sma_val = float(smas[i])
 
         # ── Check exits for all open positions ──────────────────────────────
+        use_trailing = trail_activation_pct is not None and trail_pct is not None
         still_open = []
         for pos in open_positions:
             T = max((pos["expiry"] - today).days / 365.0, 0.001)
@@ -139,10 +143,22 @@ def _run(
             exit_reason = None
             if today >= expiry_wednesday:
                 exit_reason = "time_stop"
-            elif pnl_pct >= tp_pct:
-                exit_reason = "tp"
             elif pnl_pct <= -sl_pct:
                 exit_reason = "sl"
+            elif use_trailing:
+                # Update HWM and check trailing stop
+                if "hwm" not in pos:
+                    pos["hwm"] = opt_val
+                else:
+                    pos["hwm"] = max(pos["hwm"], opt_val)
+                base = pos["entry_premium"]
+                hwm = pos["hwm"]
+                if hwm >= base * (1.0 + trail_activation_pct):
+                    trail_floor = hwm * (1.0 - trail_pct)
+                    if opt_val < trail_floor:
+                        exit_reason = "trail"
+            elif pnl_pct >= tp_pct:
+                exit_reason = "tp"
 
             if exit_reason:
                 trades.append({
@@ -368,3 +384,96 @@ if __name__ == "__main__":
             f"({len(bt)} trades  win={round(sum(1 for t in bt if t['pnl_pct']>0)/len(bt)*100,1) if bt else 0}%)",
             bt,
         )
+
+    # ═══════════════════════════════════════════════════════════════════════════
+    # TRAILING STOP COMPARISON
+    # Baseline: RSI 45, TP 20%, SL 25%, DTE 14-28 (calibrated params)
+    # Variants: same RSI/SL/DTE, trailing stop with different activation/trail combos
+    # ═══════════════════════════════════════════════════════════════════════════
+    print()
+    print("=" * 110)
+    print("TRAILING STOP COMPARISON  (RSI 45, SL 25%, DTE 14-28, max_pos=1, SMA-100 filter)")
+    print("Baseline = fixed TP 20% | Trailing = HWM trail replaces TP, SL stays at 25%")
+    print("=" * 110)
+
+    _BASE_RSI, _BASE_SL, _BASE_MIN_DTE, _BASE_MAX_DTE = 45, 0.25, 14, 28
+
+    baseline_trades = _run(
+        df, rsi_threshold=_BASE_RSI, min_dte=_BASE_MIN_DTE, max_dte=_BASE_MAX_DTE,
+        tp_pct=0.20, sl_pct=_BASE_SL, sma_filter=True, max_positions=1,
+    )
+
+    trail_variants = [
+        ("trail act=10% trail=15% (live default)", 0.10, 0.15),
+        ("trail act=10% trail=10%",                0.10, 0.10),
+        ("trail act=10% trail=20%",                0.10, 0.20),
+        ("trail act=15% trail=15%",                0.15, 0.15),
+        ("trail act=15% trail=10%",                0.15, 0.10),
+        ("trail act=20% trail=15%",                0.20, 0.15),
+    ]
+
+    comp_rows = []
+    all_variant_trades: dict[str, list[dict]] = {}
+
+    def _win_pct(t: list[dict]) -> float:
+        return round(sum(1 for x in t if x["pnl_pct"] > 0) / len(t) * 100, 1) if t else 0.0
+
+    bm = _metrics(baseline_trades)
+    comp_rows.append({
+        "variant":       "baseline TP=20%",
+        "trades":        bm["n_trades"],
+        "win_%":         round(bm["win_rate"] * 100, 1),
+        "avg_pnl_%":     round(bm["avg_pnl"] * 100, 2),
+        "total_pnl_%":   round(bm["total_pnl"] * 100, 1),
+        "pf":            round(bm["profit_factor"], 2) if not np.isinf(bm["profit_factor"]) else "∞",
+        "avg_hold_d":    round(bm["avg_hold_days"], 1),
+        "covid_%":       round(_period_pnl(baseline_trades, "covid", 2020, 2020) * 100, 1),
+        "2022_%":        round(_period_pnl(baseline_trades, "2022", 2022, 2022) * 100, 1),
+        "2023+_%":       round(_period_pnl(baseline_trades, "2023+", 2023, 2025) * 100, 1),
+        "sl_exits":      sum(1 for t in baseline_trades if t["exit_reason"] == "sl"),
+        "tp_exits":      sum(1 for t in baseline_trades if t["exit_reason"] == "tp"),
+        "time_exits":    sum(1 for t in baseline_trades if t["exit_reason"] == "time_stop"),
+        "trail_exits":   0,
+    })
+
+    for label, act, trail in trail_variants:
+        vt = _run(
+            df, rsi_threshold=_BASE_RSI, min_dte=_BASE_MIN_DTE, max_dte=_BASE_MAX_DTE,
+            tp_pct=0.20, sl_pct=_BASE_SL, sma_filter=True, max_positions=1,
+            trail_activation_pct=act, trail_pct=trail,
+        )
+        all_variant_trades[label] = vt
+        vm = _metrics(vt)
+        comp_rows.append({
+            "variant":       label,
+            "trades":        vm["n_trades"],
+            "win_%":         round(vm["win_rate"] * 100, 1),
+            "avg_pnl_%":     round(vm["avg_pnl"] * 100, 2),
+            "total_pnl_%":   round(vm["total_pnl"] * 100, 1),
+            "pf":            round(vm["profit_factor"], 2) if not np.isinf(vm["profit_factor"]) else "∞",
+            "avg_hold_d":    round(vm["avg_hold_days"], 1),
+            "covid_%":       round(_period_pnl(vt, "covid", 2020, 2020) * 100, 1),
+            "2022_%":        round(_period_pnl(vt, "2022", 2022, 2022) * 100, 1),
+            "2023+_%":       round(_period_pnl(vt, "2023+", 2023, 2025) * 100, 1),
+            "sl_exits":      sum(1 for t in vt if t["exit_reason"] == "sl"),
+            "tp_exits":      sum(1 for t in vt if t["exit_reason"] == "tp"),
+            "time_exits":    sum(1 for t in vt if t["exit_reason"] == "time_stop"),
+            "trail_exits":   sum(1 for t in vt if t["exit_reason"] == "trail"),
+        })
+
+    comp_df = pd.DataFrame(comp_rows)
+    print(comp_df.to_string(index=False))
+
+    # ── Per-trade detail for baseline vs live-default trailing stop ──
+    _show_trades(
+        f"Baseline (fixed TP=20%, SL=25%)  [{len(baseline_trades)} trades  "
+        f"win={_win_pct(baseline_trades)}%]",
+        baseline_trades,
+    )
+    live_label = "trail act=10% trail=15% (live default)"
+    live_trades = all_variant_trades[live_label]
+    _show_trades(
+        f"Live default (trailing act=10% trail=15%, SL=25%)  [{len(live_trades)} trades  "
+        f"win={_win_pct(live_trades)}%]",
+        live_trades,
+    )

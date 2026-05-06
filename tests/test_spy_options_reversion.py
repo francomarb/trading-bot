@@ -181,12 +181,14 @@ class TestDeltaFloor:
         now_et = datetime.combine(monday, datetime.min.time().replace(hour=10), tzinfo=_ET)
         return sym, now_et
 
-    def _run(self, strat, sym, spy_price, delta_val) -> bool:
+    def _run(self, strat, sym, spy_price, delta_val, bs_price: float = 10.0) -> bool:
         _, now_et = self._safe_time_sym()
         pos = _position(sym)
         import sys, unittest.mock as _mock
         fake_bs = _mock.MagicMock()
-        fake_bs.BlackScholesCall.return_value.delta.return_value = delta_val
+        call_obj = fake_bs.BlackScholesCall.return_value
+        call_obj.delta.return_value = delta_val
+        call_obj.price = bs_price  # Guard 3 reads call.price as an attribute
         sys.modules["blackscholes"] = fake_bs
 
         with patch("strategies.spy_options_reversion.datetime") as mock_dt:
@@ -211,6 +213,133 @@ class TestDeltaFloor:
         # 0.30 is below the floor threshold (delta < 0.30 triggers exit)
         # exactly 0.30 should NOT trigger (condition is strict <)
         assert not self._run(strat, sym, 520.0, 0.30)
+
+
+# ── inspect_open_positions: trailing stop ────────────────────────────────────
+
+class TestTrailingStop:
+    """Guard 3: HWM-based trailing stop — activates after trail_activation_pct gain,
+    exits when value drops trail_pct below peak."""
+
+    def _safe_expiry_and_sym(self) -> tuple[date, str, datetime]:
+        expiry = date.today() + timedelta(days=14)
+        while expiry.weekday() != 4:
+            expiry += timedelta(days=1)
+        sym = _occ("SPY", expiry, "C", 520.0)
+        monday = expiry - timedelta(days=4)
+        now_et = datetime.combine(monday, datetime.min.time().replace(hour=10), tzinfo=_ET)
+        return expiry, sym, now_et
+
+    def _run_cycle(self, strat, sym, now_et, bs_price: float, delta: float = 0.55) -> bool:
+        """Run one engine cycle with the given B-S price and delta."""
+        import sys, unittest.mock as _mock
+        fake_bs = _mock.MagicMock()
+        call_obj = fake_bs.BlackScholesCall.return_value
+        call_obj.delta.return_value = delta
+        call_obj.price = bs_price
+        sys.modules["blackscholes"] = fake_bs
+
+        pos = _position(sym)
+        with patch("strategies.spy_options_reversion.datetime") as mock_dt:
+            mock_dt.now.side_effect = lambda tz=None: now_et if tz == _ET else datetime.now(timezone.utc)
+            mock_dt.combine = datetime.combine
+            mock_dt.strptime = datetime.strptime
+            return strat.inspect_open_positions(pos, 520.0)
+
+    def _strat(self, activation=0.10, trail=0.15) -> SPYOptionsReversionStrategy:
+        s = SPYOptionsReversionStrategy(trail_activation_pct=activation, trail_pct=trail)
+        s._vix_date = date.today()
+        s._vix_sigma = 0.18
+        return s
+
+    def test_no_exit_before_activation_threshold(self):
+        """Value 5% above base — not past 10% activation, so no trail exit."""
+        _, sym, now_et = self._safe_expiry_and_sym()
+        strat = self._strat()
+        # First cycle sets base=10.0, HWM=10.0
+        result = self._run_cycle(strat, sym, now_et, bs_price=10.0)
+        assert not result
+        # Second cycle: value at 10.5 (+5%), HWM=10.5 — still below 11.0 (10% activation)
+        result = self._run_cycle(strat, sym, now_et, bs_price=10.5)
+        assert not result
+
+    def test_no_exit_when_above_trail_floor(self):
+        """Value exceeds activation threshold, then stays above trail floor — no exit."""
+        _, sym, now_et = self._safe_expiry_and_sym()
+        strat = self._strat(activation=0.10, trail=0.15)
+        # base = 10.0, cycle 1
+        self._run_cycle(strat, sym, now_et, bs_price=10.0)
+        # HWM = 12.0 — activates (20% above base > 10% threshold)
+        self._run_cycle(strat, sym, now_et, bs_price=12.0)
+        # Current = 11.0 — trail floor = 12.0 * 0.85 = 10.2. 11.0 > 10.2 → no exit
+        result = self._run_cycle(strat, sym, now_et, bs_price=11.0)
+        assert not result
+
+    def test_exit_when_below_trail_floor(self):
+        """After activation, value drops below HWM × (1 - trail_pct) — exit fires."""
+        _, sym, now_et = self._safe_expiry_and_sym()
+        strat = self._strat(activation=0.10, trail=0.15)
+        # base = 10.0
+        self._run_cycle(strat, sym, now_et, bs_price=10.0)
+        # HWM = 12.0 — activates (20% above base)
+        self._run_cycle(strat, sym, now_et, bs_price=12.0)
+        # Current = 9.0 — trail floor = 12.0 * 0.85 = 10.2. 9.0 < 10.2 → EXIT
+        result = self._run_cycle(strat, sym, now_et, bs_price=9.0)
+        assert result
+
+    def test_hwm_state_cleared_after_trail_exit(self):
+        """HWM and base dicts are emptied when the trailing stop fires."""
+        _, sym, now_et = self._safe_expiry_and_sym()
+        strat = self._strat(activation=0.10, trail=0.15)
+        self._run_cycle(strat, sym, now_et, bs_price=10.0)
+        self._run_cycle(strat, sym, now_et, bs_price=12.0)
+        self._run_cycle(strat, sym, now_et, bs_price=9.0)  # triggers exit
+        assert sym not in strat._position_hwm
+        assert sym not in strat._position_base
+
+    def test_hwm_tracks_new_highs(self):
+        """HWM updates to the highest value seen across cycles."""
+        _, sym, now_et = self._safe_expiry_and_sym()
+        strat = self._strat()
+        self._run_cycle(strat, sym, now_et, bs_price=10.0)
+        self._run_cycle(strat, sym, now_et, bs_price=14.0)
+        self._run_cycle(strat, sym, now_et, bs_price=12.0)  # pull-back, HWM stays at 14
+        assert abs(strat._position_hwm[sym] - 14.0) < 1e-6
+
+    def test_not_activated_below_threshold(self):
+        """A small gain (< activation) never triggers the trail check."""
+        _, sym, now_et = self._safe_expiry_and_sym()
+        strat = self._strat(activation=0.20, trail=0.15)  # 20% activation
+        self._run_cycle(strat, sym, now_et, bs_price=10.0)
+        # 15% gain — below 20% activation, so even a big drop won't trail-exit
+        result = self._run_cycle(strat, sym, now_et, bs_price=9.0)
+        assert not result  # Guard 3 inactive; SL at -25% would need 7.5, not 9.0
+
+    def test_hwm_state_cleared_after_time_stop(self):
+        """HWM state is cleaned up when Guard 1 (time stop) fires."""
+        expiry = date.today() + timedelta(days=14)
+        while expiry.weekday() != 4:
+            expiry += timedelta(days=1)
+        sym = _occ("SPY", expiry, "C", 520.0)
+        expiry_wednesday = expiry - timedelta(days=2)
+        now_et = datetime.combine(
+            expiry_wednesday, datetime.min.time().replace(hour=15, minute=35), tzinfo=_ET
+        )
+
+        strat = self._strat()
+        # Seed HWM state as if position was tracked
+        strat._position_hwm[sym] = 12.0
+        strat._position_base[sym] = 10.0
+
+        with patch("strategies.spy_options_reversion.datetime") as mock_dt:
+            mock_dt.now.side_effect = lambda tz=None: now_et if tz == _ET else datetime.now(timezone.utc)
+            mock_dt.combine = datetime.combine
+            mock_dt.strptime = datetime.strptime
+            result = strat.inspect_open_positions(_position(sym), 520.0)
+
+        assert result  # time stop fired
+        assert sym not in strat._position_hwm
+        assert sym not in strat._position_base
 
 
 # ── VIX cache ─────────────────────────────────────────────────────────────────
