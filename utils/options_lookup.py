@@ -13,12 +13,18 @@ from alpaca.trading.enums import AssetStatus, ContractType
 
 from config.settings import ALPACA_API_KEY, ALPACA_SECRET_KEY, ALPACA_PAPER
 
+_client: TradingClient | None = None
+
+
 def _get_client() -> TradingClient:
-    return TradingClient(
-        api_key=ALPACA_API_KEY,
-        secret_key=ALPACA_SECRET_KEY,
-        paper=ALPACA_PAPER,
-    )
+    global _client
+    if _client is None:
+        _client = TradingClient(
+            api_key=ALPACA_API_KEY,
+            secret_key=ALPACA_SECRET_KEY,
+            paper=ALPACA_PAPER,
+        )
+    return _client
 
 def find_best_call(
     symbol: str, 

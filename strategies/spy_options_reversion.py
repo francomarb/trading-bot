@@ -7,10 +7,10 @@ from datetime import date, datetime, time, timedelta, timezone
 from typing import Tuple
 from zoneinfo import ZoneInfo
 
-import numpy as np
 import pandas as pd
 from loguru import logger
 
+from indicators.technicals import add_rsi
 from strategies.base import BaseStrategy, SignalFrame, OrderType
 from utils.options_lookup import find_best_call
 
@@ -41,13 +41,8 @@ class SPYOptionsReversionStrategy(BaseStrategy):
         if len(df) < self.required_bars:
             return SignalFrame(entries=false_series, exits=false_series)
 
-        close = df["close"]
-
-        delta = close.diff()
-        gain = delta.where(delta > 0, 0).rolling(window=self.rsi_length).mean()
-        loss = (-delta.where(delta < 0, 0)).rolling(window=self.rsi_length).mean()
-        loss = loss.replace(0, np.nan)
-        rsi = (100 - (100 / (1 + gain / loss))).fillna(100)
+        df = add_rsi(df, self.rsi_length)
+        rsi = df[f"rsi_{self.rsi_length}"]
 
         prev_rsi = rsi.shift(1)
         entries = (prev_rsi < self.rsi_threshold) & (rsi >= self.rsi_threshold)

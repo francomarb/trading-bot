@@ -77,7 +77,7 @@ from risk.manager import (
 from reporting.alerts import AlertDispatcher
 from reporting.logger import TradeLogger
 from reporting.pnl import PnLTracker
-from strategies.base import BaseStrategy, StrategySlot
+from strategies.base import BaseStrategy, OrderType, StrategySlot
 
 from regime.detector import MarketRegime
 
@@ -884,6 +884,7 @@ class TradingEngine:
             atr=latest_atr,
             reason=f"{strategy.name} entry @ {latest_ts.isoformat()}",
             order_type=strategy.preferred_order_type,
+            limit_price=target_price if strategy.preferred_order_type is OrderType.LIMIT else None,
             take_profit_price=take_profit,
             stop_price_override=stop_price,
         )
@@ -1336,8 +1337,9 @@ class TradingEngine:
         if position is not None:
             return position
         import re
+        pat = re.compile(rf"^{re.escape(symbol)}[0-9]{{6}}[CP][0-9]{{8}}$")
         for pos_symbol, pos in snapshot.account.open_positions.items():
-            if re.match(rf"^{symbol}[0-9]{{6}}[CP][0-9]{{8}}$", pos_symbol):
+            if pat.match(pos_symbol):
                 return pos
         return None
 
@@ -1347,7 +1349,7 @@ class TradingEngine:
         if actual == target:
             return True
         import re
-        return bool(re.match(rf"^{target}[0-9]{{6}}[CP][0-9]{{8}}$", actual))
+        return bool(re.match(rf"^{re.escape(target)}[0-9]{{6}}[CP][0-9]{{8}}$", actual))
 
     def _repair_missing_protective_stops(self, snapshot: BrokerSnapshot) -> None:
         """
