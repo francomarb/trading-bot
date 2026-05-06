@@ -1580,7 +1580,7 @@ class TradingEngine:
                         strategy=owner,
                         qty=qty,
                         avg_fill_price=price,
-                        order_id=getattr(update.order, "order_id", None),
+                        order_id=getattr(update.order, "id", None),
                     )
                 else:
                     # Price or qty unavailable — fall back to the synthetic record.

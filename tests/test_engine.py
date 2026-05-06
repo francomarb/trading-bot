@@ -1953,7 +1953,7 @@ class TestOptionsEngineFixes:
         engine._entry_prices["SPY"] = 10.0
 
         fill_update = SimpleNamespace(
-            order=SimpleNamespace(symbol=occ, order_id="stop-ord-1"),
+            order=SimpleNamespace(symbol=occ, id="stop-ord-1"),
             price="7.50",
             qty="2",
         )
@@ -1986,7 +1986,7 @@ class TestOptionsEngineFixes:
         engine._entry_prices["AAPL"] = 100.0
 
         fill_update = SimpleNamespace(
-            order=SimpleNamespace(symbol="AAPL", order_id="stop-ord-2"),
+            order=SimpleNamespace(symbol="AAPL", id="stop-ord-2"),
             price=None,
             qty="10",
         )
