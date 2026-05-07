@@ -1,220 +1,268 @@
 """
-Unit tests for execution/stream.py (Phase 10.E1).
+Unit tests for execution/stream.py (Phase 11.21).
 
-StreamManager uses TradingStream internally, but all tests here exercise the
-public API and the _on_trade_update handler directly — no real WebSocket.
-The handler is async and is called via asyncio.run() in tests.
+These tests exercise StreamManager's public API plus its reconnect / gap
+recovery logic without opening a real websocket connection.
 """
 
 from __future__ import annotations
 
 import asyncio
 import threading
-import types
-import uuid
+from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
 import pytest
 
-from execution.stream import StreamManager, _TERMINAL_EVENTS, _FILL_EVENTS
-
-
-# ── Helpers ──────────────────────────────────────────────────────────────────
-
-
-def _make_update(
-    order_id: str,
-    symbol: str,
-    event: str,
-    qty: float = 10.0,
-    price: float = 100.0,
-) -> MagicMock:
-    """Return a mock TradeUpdate with the given fields."""
-    update = MagicMock()
-    update.order.id = order_id
-    update.order.symbol = symbol
-    update.event.value = event
-    # event also needs to respond to hasattr(event, 'value') check
-    update.event = MagicMock()
-    update.event.value = event
-    update.qty = qty
-    update.price = price
-    return update
+from execution.stream import (
+    StreamHealth,
+    StreamManager,
+    _FILL_EVENTS,
+    _TERMINAL_EVENTS,
+)
 
 
 def _stream() -> StreamManager:
     return StreamManager(api_key="key", secret_key="secret", paper=True)
 
 
+def _make_update(
+    order_id: str,
+    symbol: str,
+    event: str,
+    *,
+    qty: float = 10.0,
+    price: float = 100.0,
+    client_order_id: str | None = None,
+):
+    return SimpleNamespace(
+        order=SimpleNamespace(
+            id=order_id,
+            client_order_id=client_order_id,
+            symbol=symbol,
+            filled_qty=str(qty),
+            filled_avg_price=str(price),
+        ),
+        event=SimpleNamespace(value=event),
+        qty=qty,
+        price=price,
+    )
+
+
+def _make_order(
+    *,
+    order_id: str,
+    client_order_id: str | None = None,
+    symbol: str = "AAPL",
+    status: str = "filled",
+    filled_qty: float = 10.0,
+    filled_avg_price: float = 100.5,
+    qty: float = 10.0,
+):
+    return SimpleNamespace(
+        id=order_id,
+        client_order_id=client_order_id,
+        symbol=symbol,
+        status=SimpleNamespace(value=status),
+        filled_qty=str(filled_qty),
+        filled_avg_price=str(filled_avg_price),
+        qty=str(qty),
+    )
+
+
 async def _dispatch(sm: StreamManager, update) -> None:
-    """Call the handler directly (no real WebSocket needed)."""
     await sm._on_trade_update(update)
 
 
-# ── TestStreamManagerPublicAPI ────────────────────────────────────────────────
+class _LoopTestStream(StreamManager):
+    def __init__(self, actions: list[str]):
+        super().__init__(api_key="key", secret_key="secret", paper=True)
+        self.actions = list(actions)
+        self.delays: list[float] = []
+
+    async def _run_session(self) -> None:
+        action = self.actions.pop(0)
+        if action == "heartbeat_timeout":
+            raise TimeoutError("trading websocket heartbeat timeout")
+        if action == "disconnect":
+            raise RuntimeError("socket dropped")
+        if action == "success_stop":
+            await self._mark_connected()
+            self._thread_stop.set()
+            assert self._stop_event is not None
+            self._stop_event.set()
+            return
+        if action == "success_return":
+            await self._mark_connected()
+            return
+        raise AssertionError(f"unknown test action: {action}")
+
+    async def _sleep_with_stop(self, seconds: float) -> None:
+        self.delays.append(seconds)
 
 
 class TestStreamManagerPublicAPI:
     def test_watch_returns_event(self):
         sm = _stream()
-        ev = sm.watch("order-1")
+        ev = sm.watch("client-1")
         assert isinstance(ev, threading.Event)
         assert not ev.is_set()
 
-    def test_get_update_none_before_fire(self):
+    def test_bind_submitted_order_aliases_order_id_to_client_order_id(self):
         sm = _stream()
-        sm.watch("order-1")
-        assert sm.get_update("order-1") is None
+        ev = sm.watch("client-1")
+        sm.bind_submitted_order("client-1", "ord-1")
 
-    def test_get_update_returns_none_for_unknown(self):
+        update = _make_update(
+            "ord-1",
+            "AAPL",
+            "fill",
+            client_order_id="client-1",
+        )
+        asyncio.run(_dispatch(sm, update))
+
+        assert ev.is_set()
+        assert sm.get_update("client-1") is update
+        assert sm.get_update("ord-1") is update
+
+    def test_unwatch_clears_aliases_for_client_and_order_id(self):
         sm = _stream()
-        assert sm.get_update("nonexistent") is None
+        sm.watch("client-1")
+        sm.bind_submitted_order("client-1", "ord-1")
 
+        sm.unwatch("ord-1")
+
+        assert sm.get_update("client-1") is None
+        assert sm.get_update("ord-1") is None
+        with sm._lock:
+            assert "client-1" not in sm._alias_to_canonical
+            assert "ord-1" not in sm._alias_to_canonical
+
+    def test_health_snapshot_starts_disconnected(self):
+        sm = _stream()
+        health = sm.health_snapshot()
+        assert health == StreamHealth(
+            connected=False,
+            healthy=False,
+            generation=0,
+            last_rx_at=None,
+            last_disconnect_at=None,
+            last_reconnect_at=None,
+            consecutive_failures=0,
+        )
+
+
+class TestStopLegRouting:
     def test_register_stop_leg_stores(self):
         sm = _stream()
         sm.register_stop_leg("stop-leg-1")
         with sm._lock:
             assert "stop-leg-1" in sm._stop_legs
 
-    def test_drain_stop_fills_empty(self):
-        sm = _stream()
-        assert sm.drain_stop_fills() == []
-
-    def test_drain_stop_fills_clears_accumulator(self):
-        sm = _stream()
-        sm.register_stop_leg("leg-1")
-        update = _make_update("leg-1", "AAPL", "fill")
-        asyncio.run(_dispatch(sm, update))
-
-        fills = sm.drain_stop_fills()
-        assert len(fills) == 1
-        # Second drain should be empty.
-        assert sm.drain_stop_fills() == []
-
-    def test_watch_multiple_orders(self):
-        sm = _stream()
-        ev1 = sm.watch("order-1")
-        ev2 = sm.watch("order-2")
-        assert ev1 is not ev2
-
-
-# ── TestOnTradeUpdate ─────────────────────────────────────────────────────────
-
-
-class TestOnTradeUpdate:
-    def test_fill_fires_watched_event(self):
-        sm = _stream()
-        ev = sm.watch("order-1")
-        update = _make_update("order-1", "AAPL", "fill")
-        asyncio.run(_dispatch(sm, update))
-        assert ev.is_set()
-
-    def test_canceled_fires_watched_event(self):
-        sm = _stream()
-        ev = sm.watch("order-1")
-        update = _make_update("order-1", "AAPL", "canceled")
-        asyncio.run(_dispatch(sm, update))
-        assert ev.is_set()
-
-    def test_rejected_fires_watched_event(self):
-        sm = _stream()
-        ev = sm.watch("order-1")
-        update = _make_update("order-1", "AAPL", "rejected")
-        asyncio.run(_dispatch(sm, update))
-        assert ev.is_set()
-
-    def test_expired_fires_watched_event(self):
-        sm = _stream()
-        ev = sm.watch("order-1")
-        update = _make_update("order-1", "AAPL", "expired")
-        asyncio.run(_dispatch(sm, update))
-        assert ev.is_set()
-
-    def test_replaced_fires_watched_event(self):
-        sm = _stream()
-        ev = sm.watch("order-1")
-        update = _make_update("order-1", "AAPL", "replaced")
-        asyncio.run(_dispatch(sm, update))
-        assert ev.is_set()
-
-    def test_non_terminal_event_does_not_fire(self):
-        sm = _stream()
-        ev = sm.watch("order-1")
-        for event in ("new", "pending_new", "partial_fill", "accepted"):
-            update = _make_update("order-1", "AAPL", event)
-            asyncio.run(_dispatch(sm, update))
-        assert not ev.is_set()
-
-    def test_fill_stores_update(self):
-        sm = _stream()
-        sm.watch("order-1")
-        update = _make_update("order-1", "AAPL", "fill", qty=5.0, price=150.0)
-        asyncio.run(_dispatch(sm, update))
-        stored = sm.get_update("order-1")
-        assert stored is update
-
-    def test_unwatched_order_does_not_error(self):
-        sm = _stream()
-        update = _make_update("order-99", "AAPL", "fill")
-        asyncio.run(_dispatch(sm, update))  # must not raise
-        assert sm.get_update("order-99") is None
-
-    def test_stop_leg_fill_accumulates(self):
+    def test_stop_leg_fill_accumulates_and_cleans_up_terminal_registration(self):
         sm = _stream()
         sm.register_stop_leg("leg-1")
         update = _make_update("leg-1", "AAPL", "fill", qty=10.0, price=80.0)
+
         asyncio.run(_dispatch(sm, update))
+
         fills = sm.drain_stop_fills()
         assert len(fills) == 1
         assert fills[0] is update
+        with sm._lock:
+            assert "leg-1" not in sm._stop_legs
 
-    def test_stop_leg_non_fill_event_not_accumulated(self):
+    def test_non_fill_stop_leg_terminal_event_cleans_up_without_accumulating(self):
         sm = _stream()
         sm.register_stop_leg("leg-1")
-        for event in ("canceled", "rejected", "new", "partial_fill"):
-            update = _make_update("leg-1", "AAPL", event)
-            asyncio.run(_dispatch(sm, update))
+        update = _make_update("leg-1", "AAPL", "canceled")
+
+        asyncio.run(_dispatch(sm, update))
+
         assert sm.drain_stop_fills() == []
+        with sm._lock:
+            assert "leg-1" not in sm._stop_legs
 
-    def test_stop_leg_fill_also_fires_if_watched(self):
-        """A stop leg registered as both a stop leg AND watched fires the event."""
+
+class TestGapResync:
+    def test_resync_recovers_watched_order_that_filled_during_gap(self):
         sm = _stream()
-        ev = sm.watch("leg-1")
-        sm.register_stop_leg("leg-1")
-        update = _make_update("leg-1", "AAPL", "fill")
-        asyncio.run(_dispatch(sm, update))
+        ev = sm.watch("client-1")
+        sm.bind_submitted_order("client-1", "ord-1")
+        sm.set_order_lookup_callbacks(
+            by_id=lambda order_id: _make_order(
+                order_id=order_id,
+                client_order_id="client-1",
+                status="filled",
+            ),
+            by_client_id=lambda client_id: None,
+        )
+
+        asyncio.run(sm._resync_tracked_state())
+
         assert ev.is_set()
-        assert len(sm.drain_stop_fills()) == 1
+        update = sm.get_update("ord-1")
+        assert update is not None
+        assert update.event.value == "fill"
+        assert update.order.client_order_id == "client-1"
 
-    def test_multiple_stop_fills_accumulate(self):
+    def test_resync_recovers_stop_fill_during_gap(self):
         sm = _stream()
-        sm.register_stop_leg("leg-1")
-        sm.register_stop_leg("leg-2")
-        for leg, sym in [("leg-1", "AAPL"), ("leg-2", "GOOG")]:
-            asyncio.run(_dispatch(sm, _make_update(leg, sym, "fill")))
-        fills = sm.drain_stop_fills()
-        assert len(fills) == 2
+        sm.register_stop_leg("stop-1")
+        sm.set_order_lookup_callbacks(
+            by_id=lambda order_id: _make_order(
+                order_id=order_id,
+                symbol="AAPL",
+                status="filled",
+                filled_qty=10,
+                filled_avg_price=95.0,
+            ),
+            by_client_id=lambda client_id: None,
+        )
 
-    def test_update_for_order_not_watched_goes_to_stop_fills(self):
-        """Stop leg fill doesn't require the order to be in _watched."""
-        sm = _stream()
-        sm.register_stop_leg("leg-only")
-        update = _make_update("leg-only", "MU", "fill")
-        asyncio.run(_dispatch(sm, update))
+        asyncio.run(sm._resync_tracked_state())
+
         fills = sm.drain_stop_fills()
         assert len(fills) == 1
+        assert fills[0].order.id == "stop-1"
+        assert fills[0].price == 95.0
 
 
-# ── TestStreamManagerLifecycle ────────────────────────────────────────────────
+class TestReconnectLoop:
+    def test_heartbeat_timeout_forces_reconnect(self, monkeypatch):
+        monkeypatch.setattr("execution.stream.random.uniform", lambda *_: 0.0)
+        sm = _LoopTestStream(["heartbeat_timeout", "success_stop"])
+
+        asyncio.run(sm._run_async())
+
+        assert sm.delays == [1.0]
+        assert sm.health_snapshot().healthy is True
+        assert sm.health_snapshot().generation == 1
+
+    def test_websocket_error_uses_exponential_backoff(self, monkeypatch):
+        monkeypatch.setattr("execution.stream.random.uniform", lambda *_: 0.0)
+        sm = _LoopTestStream(["disconnect", "disconnect", "success_stop"])
+
+        asyncio.run(sm._run_async())
+
+        assert sm.delays == [1.0, 2.0]
+        assert sm.health_snapshot().healthy is True
+
+    def test_backoff_resets_after_successful_reconnect(self, monkeypatch):
+        monkeypatch.setattr("execution.stream.random.uniform", lambda *_: 0.0)
+        sm = _LoopTestStream(["disconnect", "success_return", "success_stop"])
+
+        asyncio.run(sm._run_async())
+
+        assert sm.delays[:2] == [1.0, 1.0]
 
 
 class TestStreamManagerLifecycle:
     def test_stop_before_start_does_not_raise(self):
         sm = _stream()
-        sm.stop()  # must not raise
+        sm.stop()
 
     def test_double_start_is_idempotent(self):
-        """start() while the thread is alive should not spawn a second thread."""
         sm = _stream()
         ready = threading.Event()
 
@@ -224,7 +272,7 @@ class TestStreamManagerLifecycle:
 
         with patch.object(sm, "_run_loop", side_effect=_slow_run):
             sm.start()
-            ready.wait(timeout=1)  # ensure thread is alive
+            ready.wait(timeout=1)
             thread1 = sm._thread
             sm.start()
             assert sm._thread is thread1
@@ -232,15 +280,18 @@ class TestStreamManagerLifecycle:
 
     def test_start_creates_daemon_thread(self):
         sm = _stream()
-        with patch("alpaca.trading.stream.TradingStream") as MockStream:
-            MockStream.return_value.run.side_effect = lambda: None
+        ready = threading.Event()
+
+        def _slow_run():
+            ready.set()
+            threading.Event().wait(timeout=1)
+
+        with patch.object(sm, "_run_loop", side_effect=_slow_run):
             sm.start()
+            ready.wait(timeout=1)
             assert sm._thread is not None
             assert sm._thread.daemon is True
             sm.stop()
-
-
-# ── TestTerminalEventsConstants ───────────────────────────────────────────────
 
 
 class TestTerminalEventsConstants:

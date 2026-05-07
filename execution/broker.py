@@ -212,6 +212,11 @@ class AlpacaBroker:
         # Drained by TradingEngine each cycle via drain_option_fills().
         self._pending_option_fills: list[tuple] = []
         self._pending_option_lock = threading.Lock()
+        if self._stream_manager is not None:
+            self._stream_manager.set_order_lookup_callbacks(
+                by_id=self._stream_lookup_order_by_id,
+                by_client_id=self._stream_lookup_order_by_client_id,
+            )
 
     # ── Retry wrapper ────────────────────────────────────────────────────
 
@@ -518,12 +523,18 @@ class AlpacaBroker:
 
         order_id = str(order.id)
 
-        # Re-register using the real Alpaca order ID (stream matches on order.id).
+        # Bind the real Alpaca order ID back to the pre-submit watch so either
+        # identifier can resolve the same terminal update.
         if self._stream_manager is not None:
-            stream_event = self._stream_manager.watch(order_id)
-            # Register stop-leg ID so stop-outs are captured by drain_stop_fills().
-            for leg in getattr(order, "legs", None) or []:
-                self._stream_manager.register_stop_leg(str(leg.id))
+            self._stream_manager.bind_submitted_order(
+                client_order_id=client_order_id,
+                order_id=order_id,
+                stop_leg_ids=[
+                    str(leg.id)
+                    for leg in (getattr(order, "legs", None) or [])
+                    if getattr(leg, "id", None) is not None
+                ],
+            )
 
         try:
             return self._wait_for_fill(
@@ -627,7 +638,10 @@ class AlpacaBroker:
 
         order_id = str(order.id)
         if self._stream_manager is not None:
-            stream_event = self._stream_manager.watch(order_id)
+            self._stream_manager.bind_submitted_order(
+                client_order_id=client_order_id,
+                order_id=order_id,
+            )
 
         try:
             result = self._wait_for_fill(
@@ -847,35 +861,39 @@ class AlpacaBroker:
 
         If no stream is wired, delegates directly to _poll_until_terminal.
         """
-        if stream_event is not None:
-            fired = stream_event.wait(timeout=timeout)
-            if fired:
-                update = (
-                    self._stream_manager.get_update(order_id)
-                    if self._stream_manager is not None
-                    else None
+        try:
+            if stream_event is not None:
+                fired = stream_event.wait(timeout=timeout)
+                if fired:
+                    update = (
+                        self._stream_manager.get_update(order_id)
+                        if self._stream_manager is not None
+                        else None
+                    )
+                    if update is not None:
+                        return self._build_result_from_stream(update, symbol, requested_qty)
+                # Stream timed out or update was None — fall back to a short REST check.
+                logger.debug(
+                    f"{symbol} order {order_id}: stream timeout, falling back to REST"
                 )
-                if update is not None:
-                    return self._build_result_from_stream(update, symbol, requested_qty)
-            # Stream timed out or update was None — fall back to a short REST check.
-            logger.debug(
-                f"{symbol} order {order_id}: stream timeout, falling back to REST"
-            )
+                return self._poll_until_terminal(
+                    order_id=order_id,
+                    symbol=symbol,
+                    requested_qty=requested_qty,
+                    timeout=interval * 3,
+                    interval=interval,
+                )
+
             return self._poll_until_terminal(
                 order_id=order_id,
                 symbol=symbol,
                 requested_qty=requested_qty,
-                timeout=interval * 3,
+                timeout=timeout,
                 interval=interval,
             )
-
-        return self._poll_until_terminal(
-            order_id=order_id,
-            symbol=symbol,
-            requested_qty=requested_qty,
-            timeout=timeout,
-            interval=interval,
-        )
+        finally:
+            if self._stream_manager is not None:
+                self._stream_manager.unwatch(order_id)
 
     @staticmethod
     def _build_result_from_stream(
@@ -1005,6 +1023,20 @@ class AlpacaBroker:
             avg_fill_price=None,
             raw_status=None,
             message=msg,
+        )
+
+    def _stream_lookup_order_by_id(self, order_id: str):
+        """Read-only lookup hook used by StreamManager gap recovery."""
+        return self._with_retry(
+            lambda: self._api.get_order_by_id(order_id),
+            op_desc=f"stream_get_order({order_id})",
+        )
+
+    def _stream_lookup_order_by_client_id(self, client_order_id: str):
+        """Read-only lookup hook used by StreamManager gap recovery."""
+        return self._with_retry(
+            lambda: self._api.get_order_by_client_id(client_order_id),
+            op_desc=f"stream_get_order_by_client_id({client_order_id})",
         )
 
     @staticmethod
