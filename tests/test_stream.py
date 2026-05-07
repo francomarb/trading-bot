@@ -257,6 +257,35 @@ class TestReconnectLoop:
         assert sm.delays[:2] == [1.0, 1.0]
 
 
+class TestRecvLoopDefensiveBehavior:
+    def test_recv_loop_ignores_idle_timeout(self):
+        sm = _stream()
+
+        class _FakeWS:
+            def __init__(self):
+                self.calls = 0
+
+            async def recv(self):
+                self.calls += 1
+                if self.calls == 1:
+                    raise asyncio.TimeoutError()
+                sm._thread_stop.set()
+                return "{\"stream\": \"status\"}"
+
+        sm._ws = _FakeWS()
+
+        asyncio.run(sm._recv_loop())
+
+        assert sm._ws.calls == 2
+
+    def test_dispatch_message_ignores_trade_update_without_data(self):
+        sm = _stream()
+
+        asyncio.run(sm._dispatch_message({"stream": "trade_updates"}))
+
+        assert sm.drain_stop_fills() == []
+
+
 class TestStreamManagerLifecycle:
     def test_stop_before_start_does_not_raise(self):
         sm = _stream()

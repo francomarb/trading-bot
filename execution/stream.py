@@ -385,7 +385,10 @@ class StreamManager:
     async def _recv_loop(self) -> None:
         assert self._ws is not None
         while not self._thread_stop.is_set():
-            raw = await asyncio.wait_for(self._ws.recv(), timeout=1.0)
+            try:
+                raw = await asyncio.wait_for(self._ws.recv(), timeout=1.0)
+            except asyncio.TimeoutError:
+                continue
             self._touch_rx()
             msg = json.loads(raw)
             await self._dispatch_message(msg)
@@ -407,7 +410,11 @@ class StreamManager:
     async def _dispatch_message(self, msg: dict[str, Any]) -> None:
         if msg.get("stream") != "trade_updates":
             return
-        update = TradeUpdate(**msg.get("data"))
+        data = msg.get("data")
+        if data is None:
+            logger.debug("stream manager: skipping malformed trade_updates payload with no data")
+            return
+        update = TradeUpdate(**data)
         await self._on_trade_update(update)
 
     async def _close_ws(self) -> None:
@@ -423,18 +430,17 @@ class StreamManager:
     async def _mark_connected(self) -> None:
         now = _utcnow()
         with self._lock:
+            generation = self._health.generation + 1
             self._health = StreamHealth(
                 connected=True,
                 healthy=True,
-                generation=self._health.generation + 1,
+                generation=generation,
                 last_rx_at=self._health.last_rx_at,
                 last_disconnect_at=self._health.last_disconnect_at,
                 last_reconnect_at=now,
                 consecutive_failures=0,
             )
-        logger.info(
-            f"stream manager: healthy (generation={self._health.generation})"
-        )
+        logger.info(f"stream manager: healthy (generation={generation})")
 
     async def _mark_disconnected(self, exc: Exception) -> None:
         await self._close_ws()
@@ -482,15 +488,17 @@ class StreamManager:
             if tracked.update is not None or tracked.event.is_set():
                 continue
             order = None
-            if tracked.order_id is not None and self._lookup_order_by_id is not None:
+            order_id = tracked.order_id
+            client_order_id = tracked.client_order_id
+            if order_id is not None and self._lookup_order_by_id is not None:
                 order = await self._lookup_safe(
-                    lambda: self._lookup_order_by_id(tracked.order_id),
-                    f"order_id={tracked.order_id}",
+                    lambda oid=order_id: self._lookup_order_by_id(oid),
+                    f"order_id={order_id}",
                 )
             if order is None and self._lookup_order_by_client_id is not None:
                 order = await self._lookup_safe(
-                    lambda: self._lookup_order_by_client_id(tracked.client_order_id),
-                    f"client_order_id={tracked.client_order_id}",
+                    lambda cid=client_order_id: self._lookup_order_by_client_id(cid),
+                    f"client_order_id={client_order_id}",
                 )
             if order is None:
                 continue
@@ -503,9 +511,10 @@ class StreamManager:
         for stop_leg_id in stop_leg_ids:
             if self._lookup_order_by_id is None:
                 break
+            stop_id = stop_leg_id
             order = await self._lookup_safe(
-                lambda: self._lookup_order_by_id(stop_leg_id),
-                f"stop_leg={stop_leg_id}",
+                lambda oid=stop_id: self._lookup_order_by_id(oid),
+                f"stop_leg={stop_id}",
             )
             if order is None:
                 continue
@@ -517,7 +526,7 @@ class StreamManager:
                 recovered_stops += 1
             else:
                 with self._lock:
-                    self._stop_legs.discard(stop_leg_id)
+                    self._stop_legs.discard(stop_id)
 
         if recovered_watches or recovered_stops:
             logger.info(
