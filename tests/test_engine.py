@@ -51,6 +51,7 @@ from risk.manager import (
     Side,
 )
 from strategies.base import BaseStrategy, EdgeFilterDecision, OrderType, SignalFrame
+from strategies.spy_options_reversion import OptionTradeRejected
 
 
 # ── Fakes ────────────────────────────────────────────────────────────────────
@@ -435,6 +436,34 @@ class TestProcessSymbol:
         engine._session_start_equity = snap.account.equity
         self._process(engine, "AAPL", snap)
         broker.close_position.assert_not_called()
+
+    def test_option_trade_rejected_logs_warning_and_skips_order(
+        self, engine_factory, monkeypatch
+    ):
+        class _OptionStrategy(FakeStrategy):
+            name = "spy_options_reversion"
+            preferred_order_type = OrderType.LIMIT
+
+            def build_option_execution(self, symbol, latest_close):
+                raise OptionTradeRejected(
+                    "SPY260521C00730000: spread 12.6% > 5% (bid=8.73 ask=9.90) — skipping trade."
+                )
+
+        engine, broker = engine_factory()
+        engine.slots[0].strategy = _OptionStrategy(entries=[False] * 59 + [True], exits=[False] * 60)
+        snap = _snapshot()
+        engine._session_start_equity = snap.account.equity
+
+        warnings: list[str] = []
+        errors: list[str] = []
+        monkeypatch.setattr("engine.trader.logger.warning", lambda msg: warnings.append(msg))
+        monkeypatch.setattr("engine.trader.logger.error", lambda msg: errors.append(msg))
+
+        self._process(engine, "SPY", snap)
+
+        broker.place_order.assert_not_called()
+        assert any("Option trade rejected for SPY" in msg for msg in warnings)
+        assert not any("Failed to build option execution for SPY" in msg for msg in errors)
 
 
 # ── _run_one_cycle ───────────────────────────────────────────────────────────

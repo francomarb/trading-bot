@@ -18,6 +18,10 @@ _ET = ZoneInfo("America/New_York")
 _OCC_RE = re.compile(r"^([A-Z]+)(\d{6})([CP])(\d{8})$")
 
 
+class OptionTradeRejected(ValueError):
+    """Expected option-entry veto such as wide spreads or missing quotes."""
+
+
 class SPYOptionsReversionStrategy(BaseStrategy):
     name = "spy_options_reversion"
     preferred_order_type = OrderType.LIMIT
@@ -195,7 +199,7 @@ class SPYOptionsReversionStrategy(BaseStrategy):
             symbol, underlying_price, min_dte=14, max_dte=28, target_delta=0.55
         )
         if not occ_symbol:
-            raise ValueError(f"No valid option contract found for {symbol}")
+            raise OptionTradeRejected(f"No valid option contract found for {symbol}")
 
         from alpaca.data.historical.option import OptionHistoricalDataClient
         from alpaca.data.requests import OptionSnapshotRequest
@@ -207,14 +211,14 @@ class SPYOptionsReversionStrategy(BaseStrategy):
         try:
             snapshot = data_client.get_option_snapshot(req)
         except Exception as e:
-            raise ValueError(
+            raise OptionTradeRejected(
                 f"OPRA snapshot unavailable for {occ_symbol}: {e}. "
                 "Cannot verify spread — skipping trade."
             )
 
         entry = snapshot.get(occ_symbol)
         if entry is None:
-            raise ValueError(
+            raise OptionTradeRejected(
                 f"No snapshot data returned for {occ_symbol}. "
                 "Cannot verify spread — skipping trade."
             )
@@ -225,31 +229,33 @@ class SPYOptionsReversionStrategy(BaseStrategy):
             bid = float(quote.bid_price)
             ask = float(quote.ask_price)
             if bid <= 0:
-                raise ValueError(
+                raise OptionTradeRejected(
                     f"{occ_symbol}: bid=${bid:.2f} — no valid quote. "
                     "Cannot verify spread — skipping trade."
                 )
             midpoint = (bid + ask) / 2.0
             spread_pct = (ask - bid) / midpoint
             if spread_pct > 0.05:
-                raise ValueError(
+                raise OptionTradeRejected(
                     f"{occ_symbol}: spread {spread_pct:.1%} > 5% "
                     f"(bid={bid:.2f} ask={ask:.2f}) — skipping trade."
                 )
             premium = midpoint
         elif entry.latest_trade is not None:
             # No quote available; use last trade price but cannot check spread.
-            raise ValueError(
+            raise OptionTradeRejected(
                 f"{occ_symbol}: no live quote (only last trade). "
                 "Cannot verify spread — skipping trade."
             )
         else:
-            raise ValueError(
+            raise OptionTradeRejected(
                 f"{occ_symbol}: no quote or trade data available — skipping trade."
             )
 
         if premium <= 0:
-            raise ValueError(f"{occ_symbol}: computed premium={premium:.2f} <= 0 — skipping trade.")
+            raise OptionTradeRejected(
+                f"{occ_symbol}: computed premium={premium:.2f} <= 0 — skipping trade."
+            )
 
         # Hard SL at -25% (backtest validated). TP is a +200% safety valve —
         # the trailing stop in inspect_open_positions handles real profit-taking.

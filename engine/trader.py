@@ -79,6 +79,7 @@ from reporting.alerts import AlertDispatcher
 from reporting.logger import TradeLogger
 from reporting.pnl import PnLTracker
 from strategies.base import BaseStrategy, OrderType, StrategySlot
+from strategies.spy_options_reversion import OptionTradeRejected
 
 from regime.detector import MarketRegime
 
@@ -889,6 +890,14 @@ class TradingEngine:
                 take_profit = opt_tp
                 stop_price = opt_sl
                 logger.info(f"[{strategy.name}] Option Execution override: {symbol} -> {target_symbol} at ${target_price:.2f}")
+            except OptionTradeRejected as e:
+                logger.warning(
+                    f"[{strategy.name}] Option trade rejected for {symbol}: {e}"
+                )
+                self._mark_signal_bar_processed(
+                    signal_key, signal_bar, strategy_statuses, strategy_reasons, symbol
+                )
+                return None
             except Exception as e:
                 logger.error(f"[{strategy.name}] Failed to build option execution for {symbol}: {e}")
                 self._mark_signal_bar_processed(
