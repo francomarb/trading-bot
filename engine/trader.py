@@ -1803,7 +1803,7 @@ class TradingEngine:
             f"reconnected_at={health.last_reconnect_at})"
         )
         logger.info(msg)
-        self.alerts.broker_error(msg)
+        self.alerts.broker_info(msg)
 
     def _write_state_snapshot(self) -> None:
         """

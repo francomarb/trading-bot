@@ -30,18 +30,13 @@ import threading
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from types import SimpleNamespace
-from typing import TYPE_CHECKING, Any, Callable
+from typing import Any, Callable
 
-import websockets
 from alpaca.common.enums import BaseURL
-from alpaca.trading.models import TradeUpdate
 from loguru import logger
-from websockets.legacy import client as websockets_legacy
+from websockets.asyncio.client import ClientConnection, connect
 
 from config import settings
-
-if TYPE_CHECKING:
-    from websockets.legacy.client import WebSocketClientProtocol
 
 
 _TERMINAL_EVENTS: frozenset[str] = frozenset({
@@ -133,7 +128,7 @@ class StreamManager:
         self._loop: asyncio.AbstractEventLoop | None = None
         self._stop_event: asyncio.Event | None = None
         self._thread_stop = threading.Event()
-        self._ws: WebSocketClientProtocol | None = None
+        self._ws: ClientConnection | None = None
 
         self._heartbeat_interval = settings.STREAM_HEARTBEAT_INTERVAL_SECONDS
         self._heartbeat_timeout = settings.STREAM_HEARTBEAT_TIMEOUT_SECONDS
@@ -353,7 +348,7 @@ class StreamManager:
             return
 
     async def _connect_and_subscribe(self) -> None:
-        self._ws = await websockets_legacy.connect(
+        self._ws = await connect(
             self._endpoint,
             ping_interval=None,
             ping_timeout=None,
@@ -414,7 +409,7 @@ class StreamManager:
         if data is None:
             logger.debug("stream manager: skipping malformed trade_updates payload with no data")
             return
-        update = TradeUpdate(**data)
+        update = self._make_update_from_payload(data)
         await self._on_trade_update(update)
 
     async def _close_ws(self) -> None:
@@ -583,6 +578,27 @@ class StreamManager:
                 filled_avg_price=(
                     None if avg_price is None else str(avg_price)
                 ),
+            ),
+        )
+
+    @staticmethod
+    def _make_update_from_payload(data: dict[str, Any]) -> Any:
+        order = data.get("order") or {}
+        event = data.get("event")
+        price = data.get("price")
+        qty = data.get("qty")
+        return SimpleNamespace(
+            event=SimpleNamespace(
+                value=(event.value if hasattr(event, "value") else str(event))
+            ),
+            qty=(0.0 if qty is None else float(qty)),
+            price=(None if price is None else float(price)),
+            order=SimpleNamespace(
+                id=str(order.get("id")),
+                client_order_id=order.get("client_order_id"),
+                symbol=order.get("symbol"),
+                filled_qty=str(order.get("filled_qty") or 0),
+                filled_avg_price=order.get("filled_avg_price"),
             ),
         )
 

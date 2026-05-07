@@ -303,9 +303,10 @@ class TestStreamHealthObservability:
         engine._observe_stream_health()  # no duplicate
         engine._observe_stream_health()  # recovery
 
-        assert engine.alerts.broker_error.call_count == 2
+        assert engine.alerts.broker_error.call_count == 1
+        assert engine.alerts.broker_info.call_count == 1
         outage_msg = engine.alerts.broker_error.call_args_list[0].args[0]
-        recovery_msg = engine.alerts.broker_error.call_args_list[1].args[0]
+        recovery_msg = engine.alerts.broker_info.call_args_list[0].args[0]
         assert "stream unhealthy" in outage_msg
         assert "stream healthy again" in recovery_msg
 

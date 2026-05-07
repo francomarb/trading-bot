@@ -338,3 +338,12 @@ class TestNewAlertTypes:
         assert alert.alert_type == AlertType.EOD_SUMMARY
         assert "500" in alert.message
         assert "5" in alert.message
+
+    def test_broker_info_fires_info_alert(self):
+        d = self._dispatcher()
+        with patch.object(d, "fire", return_value=True) as mock_fire:
+            d.broker_info("stream healthy again")
+        alert = mock_fire.call_args[0][0]
+        assert alert.alert_type == AlertType.BROKER_INFO
+        assert alert.severity == AlertSeverity.INFO
+        assert "stream healthy again" in alert.message

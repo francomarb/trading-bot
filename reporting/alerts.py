@@ -64,6 +64,7 @@ class AlertType(Enum):
     SLIPPAGE_DRIFT = "slippage_drift"
     POSITION_MISMATCH = "position_mismatch"
     BROKER_ERROR = "broker_error"
+    BROKER_INFO = "broker_info"
     ENGINE_HALT = "engine_halt"
     TRADE_EXECUTED = "trade_executed"
     REGIME_SHIFT = "regime_shift"
@@ -427,6 +428,13 @@ class AlertDispatcher:
             alert_type=AlertType.BROKER_ERROR,
             severity=AlertSeverity.WARNING,
             message=f"broker error: {error}",
+        ))
+
+    def broker_info(self, message: str) -> bool:
+        return self.fire(Alert(
+            alert_type=AlertType.BROKER_INFO,
+            severity=AlertSeverity.INFO,
+            message=f"broker info: {message}",
         ))
 
     def engine_halt(self, reason: str) -> bool:

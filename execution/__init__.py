@@ -1,18 +1,12 @@
-"""Execution layer (Phase 7).
+"""Execution layer exports.
 
-The broker is the only thing in the system that talks to Alpaca for order
-placement. Its `place_order` accepts only a `RiskDecision`, so unsafe orders
-are impossible by construction.
+Keep package import side effects minimal so importing `execution.stream`
+doesn't eagerly pull in Alpaca broker modules.
 """
 
-from execution.broker import (
-    AlpacaBroker,
-    BrokerError,
-    BrokerSnapshot,
-    OpenOrder,
-    OrderResult,
-    OrderStatus,
-)
+from __future__ import annotations
+
+from typing import Any
 
 __all__ = [
     "AlpacaBroker",
@@ -22,3 +16,26 @@ __all__ = [
     "OrderResult",
     "OrderStatus",
 ]
+
+
+def __getattr__(name: str) -> Any:
+    if name in __all__:
+        from execution.broker import (
+            AlpacaBroker,
+            BrokerError,
+            BrokerSnapshot,
+            OpenOrder,
+            OrderResult,
+            OrderStatus,
+        )
+
+        exports = {
+            "AlpacaBroker": AlpacaBroker,
+            "BrokerError": BrokerError,
+            "BrokerSnapshot": BrokerSnapshot,
+            "OpenOrder": OpenOrder,
+            "OrderResult": OrderResult,
+            "OrderStatus": OrderStatus,
+        }
+        return exports[name]
+    raise AttributeError(f"module 'execution' has no attribute {name}")

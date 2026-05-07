@@ -41,6 +41,7 @@ from __future__ import annotations
 import threading
 import time
 import uuid
+import warnings
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from enum import Enum
@@ -50,23 +51,29 @@ if TYPE_CHECKING:
     from execution.stream import StreamManager
 
 from execution.options_executor import OptionsExecutionWorker
-from alpaca.common.exceptions import APIError
-from alpaca.trading.client import TradingClient
-from alpaca.trading.enums import (
-    OrderClass as AlpacaOrderClass,
-    OrderSide as AlpacaOrderSide,
-    OrderStatus as AlpacaOrderStatus,
-    OrderType as AlpacaOrderType,
-    QueryOrderStatus,
-    TimeInForce,
-)
-from alpaca.trading.requests import (
-    GetOrdersRequest,
-    LimitOrderRequest,
-    MarketOrderRequest,
-    StopOrderRequest,
-    StopLossRequest,
-)
+with warnings.catch_warnings():
+    warnings.filterwarnings(
+        "ignore",
+        message=r"websockets\.legacy is deprecated.*",
+        category=DeprecationWarning,
+    )
+    from alpaca.common.exceptions import APIError
+    from alpaca.trading.client import TradingClient
+    from alpaca.trading.enums import (
+        OrderClass as AlpacaOrderClass,
+        OrderSide as AlpacaOrderSide,
+        OrderStatus as AlpacaOrderStatus,
+        OrderType as AlpacaOrderType,
+        QueryOrderStatus,
+        TimeInForce,
+    )
+    from alpaca.trading.requests import (
+        GetOrdersRequest,
+        LimitOrderRequest,
+        MarketOrderRequest,
+        StopOrderRequest,
+        StopLossRequest,
+    )
 from loguru import logger
 
 from data.fetcher import _install_timeout
@@ -897,13 +904,11 @@ class AlpacaBroker:
 
     @staticmethod
     def _build_result_from_stream(
-        update: "TradeUpdate",
+        update,
         symbol: str,
         requested_qty: float,
     ) -> "OrderResult":
         """Build an OrderResult from a terminal TradeUpdate (WebSocket path)."""
-        from alpaca.trading.models import TradeUpdate  # local import avoids circular
-
         event_val = (
             update.event.value
             if hasattr(update.event, "value")

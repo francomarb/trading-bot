@@ -5,11 +5,18 @@ Background worker to handle options midpoint cancel/replace bracket orders.
 import threading
 import time
 import uuid
+import warnings
 from typing import Callable
 from loguru import logger
-from alpaca.trading.client import TradingClient
-from alpaca.trading.requests import LimitOrderRequest, TakeProfitRequest, StopLossRequest
-from alpaca.trading.enums import OrderSide, OrderType as AlpacaOrderType, OrderClass, TimeInForce
+with warnings.catch_warnings():
+    warnings.filterwarnings(
+        "ignore",
+        message=r"websockets\.legacy is deprecated.*",
+        category=DeprecationWarning,
+    )
+    from alpaca.trading.client import TradingClient
+    from alpaca.trading.requests import LimitOrderRequest, TakeProfitRequest, StopLossRequest
+    from alpaca.trading.enums import OrderSide, OrderType as AlpacaOrderType, OrderClass, TimeInForce
 
 from risk.manager import RiskDecision, Side
 from execution.stream import StreamManager
