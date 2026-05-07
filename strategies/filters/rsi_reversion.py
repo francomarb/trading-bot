@@ -60,6 +60,7 @@ import pandas as pd
 from loguru import logger
 
 from config.settings import ALPACA_DATA_FEED
+from strategies.base import EdgeFilterDecision
 from strategies.filters.common import EarningsBlackout, SPYTrendFilter
 
 
@@ -109,12 +110,9 @@ class RSIEdgeFilter:
             days_after=days_after,
         )
         self._vol_min_window = vol_min_window
-        
         self._notional_min_avg = notional_min_avg
-            
         self._new_low_window = new_low_window
         self._symbol: str = ""
-        self._last_reasons: list[str] = []
 
     def set_symbol(self, symbol: str) -> None:
         """Injected by BaseStrategy.generate_signals before __call__."""
@@ -149,59 +147,71 @@ class RSIEdgeFilter:
         not_new_low = not_new_low.where(prior_min.notna(), other=True)
         return not_new_low.astype(bool)
 
-    def __call__(self, df: pd.DataFrame) -> pd.Series:
+    def __call__(self, df: pd.DataFrame) -> EdgeFilterDecision:
         spy_gate      = self._spy_filter(df)
         earnings_gate = self._earnings(df)
         vol_gate      = self._volume_liquid(df)
         low_gate      = self._no_new_low(df)
 
         combined = spy_gate & earnings_gate & vol_gate & low_gate
+        reasons_by_bar: list[list[str]] = []
+
+        if "volume" in df.columns and "close" in df.columns:
+            dollar_vol = df["close"].astype(float) * df["volume"].astype(float)
+            avg_dollar_vol = dollar_vol.rolling(self._vol_min_window).mean()
+        else:
+            avg_dollar_vol = None
+
+        for i, (spy_ok, earn_ok, vol_ok, low_ok) in enumerate(
+            zip(
+                spy_gate.tolist(),
+                earnings_gate.tolist(),
+                vol_gate.tolist(),
+                low_gate.tolist(),
+                strict=False,
+            )
+        ):
+            row_reasons: list[str] = []
+            if not spy_ok:
+                row_reasons.append("SPY trend gate failed (below 200 or 50 SMA)")
+            if not earn_ok:
+                row_reasons.append("earnings blackout")
+            if not vol_ok:
+                avg_vol = float("nan") if avg_dollar_vol is None else avg_dollar_vol.iloc[i]
+                avg_str = f"${avg_vol:,.0f}" if pd.notna(avg_vol) else "NaN"
+                row_reasons.append(
+                    f"liquidity too low (avg_dollar_vol{self._vol_min_window}={avg_str} "
+                    f"< ${self._notional_min_avg:,})"
+                )
+            if not low_ok:
+                row_reasons.append(
+                    f"new {self._new_low_window}-day low (active breakdown)"
+                )
+            reasons_by_bar.append(row_reasons)
+
+        decision = EdgeFilterDecision(
+            allowed=combined.astype(bool),
+            reasons=pd.Series(reasons_by_bar, index=df.index, dtype=object),
+        )
 
         # Detailed observability log on the last bar.
         if not df.empty:
-            allowed   = bool(combined.iloc[-1])
+            allowed   = decision.latest_allowed
             spy_ok    = bool(spy_gate.iloc[-1])
             earn_ok   = bool(earnings_gate.iloc[-1])
             vol_ok    = bool(vol_gate.iloc[-1])
             low_ok    = bool(low_gate.iloc[-1])
 
             if allowed:
-                self._last_reasons = []
                 logger.info(
                     f"RSI_FILTER_ALLOWED {self._symbol} — "
                     f"SPY={spy_ok} earnings={earn_ok} "
                     f"liquid={vol_ok} no_new_low={low_ok}"
                 )
             else:
-                reasons = []
-                if not spy_ok:
-                    reasons.append("SPY trend gate failed (below 200 or 50 SMA)")
-                if not earn_ok:
-                    reasons.append("earnings blackout")
-                if not vol_ok:
-                    if "volume" in df.columns and "close" in df.columns:
-                        dollar_vol = df["close"].astype(float) * df["volume"].astype(float)
-                        avg_vol = dollar_vol.rolling(self._vol_min_window).mean().iloc[-1]
-                    else:
-                        avg_vol = float("nan")
-                    avg_str = f"${avg_vol:,.0f}" if pd.notna(avg_vol) else "NaN"
-                    reasons.append(
-                        f"liquidity too low (avg_dollar_vol{self._vol_min_window}={avg_str} "
-                        f"< ${self._notional_min_avg:,})"
-                    )
-                if not low_ok:
-                    reasons.append(
-                        f"new {self._new_low_window}-day low (active breakdown)"
-                    )
-                self._last_reasons = reasons
                 logger.info(
                     f"RSI_FILTER_BLOCKED {self._symbol} — "
-                    + ", ".join(reasons)
+                    + ", ".join(decision.latest_reasons)
                 )
-        else:
-            self._last_reasons = []
 
-        return combined
-
-    def get_last_block_reasons(self) -> list[str]:
-        return list(self._last_reasons)
+        return decision
