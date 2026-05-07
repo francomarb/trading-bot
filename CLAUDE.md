@@ -18,9 +18,12 @@ A Python-based algorithmic trading bot built incrementally, starting with paper 
 | Language | Python 3.12 |
 | Broker / Exchange | Alpaca Markets (paper trading → live) |
 | Data Manipulation | pandas |
-| Technical Indicators | Hand-rolled (SMA, EMA, ATR, RSI, ADX in `indicators/technicals.py`) |
+| Technical Indicators | Hand-rolled (SMA, EMA, ATR, RSI, ADX, Bollinger Bands, Keltner Channels, Donchian in `indicators/technicals.py`) |
 | Backtesting | vectorbt |
 | API Client | alpaca-py (official SDK) |
+| Options Pricing | blackscholes (Black-Scholes Delta + price for exit guards) |
+| Sector Data | yfinance (sector resolver cache, VIX fetch for options strategy) |
+| Dashboard | streamlit + plotly (`dashboard.py` — read-only analytics) |
 | Trade Logging | sqlite3 (`data/trades.db` paper / `data/trades_live.db` live) |
 | Environment Config | python-dotenv (loaded from `config/.env`) |
 | Logging | loguru (rotating file + console sinks) |
@@ -46,6 +49,7 @@ trading-bot/
 │   └── settings.py            # Centralized config (symbols, risk params, etc.)
 ├── data/
 │   ├── fetcher.py             # Market data retrieval via StockHistoricalDataClient
+│   ├── watchlists.py          # WatchlistSource ABC + StaticWatchlistSource
 │   ├── trades.db              # Paper SQLite trade log (gitignored)
 │   ├── trades_live.db         # Live SQLite trade log (gitignored)
 │   └── historical/            # Cached historical bars
@@ -57,34 +61,45 @@ trading-bot/
 │   ├── rsi_reversion.py       # Mean-reversion: RSI oversold/overbought (ACTIVE)
 │   ├── bollinger_squeeze.py   # Volatility breakout: TTM-style BB squeeze (IMPLEMENTED, NOT WIRED — parked)
 │   ├── donchian_breakout.py   # Trend continuation: Turtle System 1 — N-day high/low (ACTIVE, 30/15, ai_bigtech 32-name universe)
+│   ├── spy_options_reversion.py # Options mean-reversion: SPY calls on RSI recovery (ACTIVE)
 │   └── filters/
 │       ├── common.py          # SPYTrendFilter (shared macro gate)
 │       ├── sma_crossover.py   # SMAEdgeFilter: stock > 200 SMA, volume expansion
 │       ├── rsi_reversion.py   # RSIEdgeFilter: SPY dual macro, earnings blackout, liquidity, no-new-low
 │       ├── bollinger_squeeze.py # BollingerSqueezeEdgeFilter: IEX-scaled liquidity, earnings blackout, exhaustion gate
-│       └── donchian_breakout.py # DonchianEdgeFilter: stock > 200 SMA, IEX-scaled liquidity, short earnings blackout
+│       ├── donchian_breakout.py # DonchianEdgeFilter: stock > 200 SMA, IEX-scaled liquidity, short earnings blackout
+│       └── spy_options_reversion.py # SPYOptionsEdgeFilter: SPY > 100 SMA
 ├── regime/
 │   └── detector.py            # RegimeDetector: BEAR/VOLATILE/TRENDING/RANGING (ADX + ATR%)
+├── sector/
+│   ├── resolver.py            # Ticker → GICS sector via yfinance (JSON cache)
+│   └── gauge.py               # Sector ETF HOT/NEUTRAL/COLD scoring + SectorMomentumFilter
 ├── engine/
 │   └── trader.py              # TradingEngine — the live loop orchestrator
 ├── backtest/
 │   ├── runner.py              # vectorbt backtesting harness
-│   └── reconcile.py           # Forward-test reconciliation (paper vs backtest)
+│   ├── reconcile.py           # Forward-test reconciliation (paper vs backtest)
+│   └── spy_options_backtest.py # SPY options RSI reversion backtest
 ├── execution/
-│   └── broker.py              # AlpacaBroker — TradingClient wrapper + fractional path
+│   ├── broker.py              # AlpacaBroker — TradingClient wrapper + fractional path
+│   ├── stream.py              # StreamManager — TradingStream WebSocket wrapper
+│   └── options_executor.py    # OptionsExecutionWorker — async bracket order thread
+├── utils/
+│   └── options_lookup.py      # OCC contract selection (find_best_call)
 ├── risk/
 │   ├── manager.py             # RiskManager: sizing, drawdown, stop-loss, kill switches
 │   └── allocator.py           # SleeveAllocator: per-strategy capital budgets
 ├── reporting/
 │   ├── logger.py              # TradeLogger — SQLite trade log
-│   ├── metrics.py             # Sharpe, drawdown, profit factor, win rate
+│   ├── metrics.py             # Sharpe, drawdown, profit factor, win rate, Kelly
 │   ├── pnl.py                 # PnLTracker — daily/weekly reports
-│   └── alerts.py              # AlertDispatcher with pluggable backends
+│   └── alerts.py              # AlertDispatcher — LogFile + TelegramAlertBackend + TelegramCommandListener
+├── dashboard.py               # Streamlit read-only analytics dashboard
 ├── scripts/
 │   ├── preflight.py           # Pre-flight checklist (must exit 0 before live flip)
 │   ├── gonogo.py              # Go/no-go checker for live readiness
 │   └── *.py                   # Watchlist scanners and analysis scripts
-├── tests/                     # 846 unit tests (pytest)
+├── tests/                     # Unit tests (pytest)
 ├── logs/                      # Rotating log files (gitignored)
 └── phase*_verify.py           # Integration verification scripts per phase
 ```
@@ -194,92 +209,6 @@ python phase2_verify.py
 
 ---
 
-## Current Phase
+## Current Phase and Progress
 
-**Phase 10 — In Progress (2026-05-01). Phases 1–9 and 9.5 complete.**
-**Tagged: `v1.0.0-beta.0`**
-
-All three strategies — **SMA Crossover**, **RSI Reversion**, and **DonchianBreakout** — are active in `forward_test.py`.
-
-**Sleeve allocation (current):**
-- SMA Crossover: 0.50 weight, 5 max positions
-- RSI Reversion: 0.25 weight, 5 max positions (reduced from 0.50 — RSI generated only ~8 trades/4y in paper)
-- DonchianBreakout: 0.25 weight, 5 max positions (activated 2026-05-01)
-
-**BollingerSqueeze** is implemented but NOT wired — parked. See
-[docs/bollinger_squeeze_universe_research.md](docs/bollinger_squeeze_universe_research.md)
-(Sharpe +0.22 on Sector ETFs; parked because 50% of practitioner edge requires
-options/discretionary/multi-timeframe capabilities the bot lacks).
-
-**DonchianBreakout** (Turtle System 1, Mid-range 30/15) is **ACTIVE** in `forward_test.py`
-since 2026-05-01. Backtest on the 32-name ai_bigtech universe delivered
-Sharpe **+0.85**, MeanRet **+162.9%**, 457 trades. Universe: 23 AI core names +
-9 AI-adjacent names (semiconductor equipment, data-centre power, quantum).
-Protected by: TRENDING-only regime gate, 2× ATR stops, HWM drawdown gate
-(entries pause if cumulative realized P&L drops >15% of sleeve budget from peak),
-max 5 concurrent positions. See
-[docs/donchian_breakout_strategy.md](docs/donchian_breakout_strategy.md) for
-the full research doc including watchlist generation methodology.
-
-### Phase 10 completed items
-
-| Item | Description |
-|---|---|
-| **10.B1** | Live config separation (`LIVE_TRADING` flag, separate credentials, `trades_live.db`) |
-| **10.B2** | Pre-flight checklist (`scripts/preflight.py`) |
-| **10.B3** | `WatchlistSource` abstraction + `StaticWatchlistSource`; `forward_test.py` wired |
-| **10.C1** | Durable position ownership restored from trade DB on restart |
-| **10.C2** | Startup reconciliation with NORMAL / RESTRICTED fail-safe modes |
-| **10.C3/C4** | External-close detection with 3-cycle confirmation window |
-| **10.E1** | WebSocket order/fill streaming via `TradingStream` (stream-first, REST fallback) |
-| **10.F1** | `SleeveAllocator` in `risk/allocator.py` — per-strategy capital sleeves; HWM drawdown gate (2026-05-01) |
-| **10.F2** | `RegimeDetector` in `regime/detector.py` — BEAR/VOLATILE/TRENDING/RANGING (ADX + ATR% percentile) |
-| **10.F3** | Engine regime gating — `StrategySlot.allowed_regimes`; exits never blocked |
-| **10.F3a** | `SMAEdgeFilter` — stock > 200 SMA, volume expansion (10d > 30d avg) |
-| **10.F3b** | `RSIEdgeFilter` — SPY dual macro, earnings blackout (3/2), liquidity floor, no-new-low |
-| **10.F3c** | `DonchianEdgeFilter` — stock > 200 SMA, IEX-scaled liquidity, short earnings blackout (1/0) |
-| **10.F4** | RSI paper activation — both strategies running with full gating |
-| **10.F5** | DonchianBreakout activated — 3rd slot, 30/15 Mid-range, TRENDING only, 32-name ai_bigtech universe |
-| **10.G1** | `LIVE_SIZE_MULTIPLIER=0.25` in risk manager when live |
-| **10.G4** | `DRY_RUN` flag — broker logs orders without submitting |
-| **10.G6** | Fractional share sizing — `FRACTIONAL_ENABLED` flag; DAY entry + standalone GTC stop; disable at ~$10k |
-
-### Phase 10 remaining before live flip
-
-| Item | Description | Blocker |
-|---|---|---|
-| **10.D1** | Review paper fills, compute mean realized slippage | ≥10 fills needed |
-| **10.D2** | Enable `SLIPPAGE_DRIFT_ENABLED=True` | Blocked on D1 |
-| **10.F6** | Operational verify — all 3 strategies gated, sleeve-capped, and HWM gate logging in live cycles | Runs as bot runs |
-| **10.G2** | Set `HARD_DOLLAR_LOSS_CAP` in live `.env` (config only) | Anytime |
-| **10.G5** | Pre-flight passes on live endpoint; dry-run cycle; manual approval for first order | After G2 |
-| **10.H1–H5** | Cloud VPS, systemd service, key management, remote monitoring, log shipping | Post-paper |
-
-Minimum gate before live flip: **D1 + D2 + G2 + G5 + ≥2 weeks combined 3-strategy paper run.**
-
-**Total: 846 unit tests passing.**
-
----
-
-## Manual Restart Verification (Phase 10 operational gate — completed 2026-04-24)
-
-Verified live with MU + NVDA open. Both restored from trade DB record; NORMAL
-mode confirmed. Expected startup log pattern for reference (3 slots active as of 2026-05-01):
-
-**Position found and assigned from DB:**
-```
-restart: assigned existing position MU → 'sma_crossover' (trade DB record)
-engine starting: 3 slot(s) [sma_crossover(16), rsi_reversion(5), donchian_breakout(32)], N unique symbol(s),
-  session_start_equity=$..., open_positions=2, open_orders=2
-```
-
-**Position not in any slot (unmanaged):**
-```
-WARNING | restart: open position TSLA does not belong to any configured slot —
-  it will NOT be managed by this engine. Close it manually or add it to a
-  strategy's symbol universe.
-```
-
-**What to do if you see the WARNING:**
-Close the unmanaged position manually on the Alpaca paper dashboard.
-It will not be touched by the engine until you add it to the watchlist.
+See [PLAN.md](PLAN.md) for the current phase, completed items, remaining blockers before live flip, and the notes/decisions log.

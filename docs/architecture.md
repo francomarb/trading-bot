@@ -4,7 +4,7 @@
 
 This document defines the target architecture for the Alpaca trading bot. It is the source of truth for structural decisions, coding conventions, and the go/no-go framework for live capital deployment. All refactoring and new development should align with this guide.
 
-The bot is built in Python using `alpaca-py`. All three strategies — SMA Crossover (trend-following), RSI Reversion (mean-reversion), and Donchian Breakout (trend-continuation) — are active in paper trading as of Phase 10. The final live GO/NO-GO gate is the combined three-strategy paper run after Phase 10 safety work is complete.
+The bot is built in Python using `alpaca-py`. Four strategies are active in paper trading as of Phase 10 (2026-05-06): SMA Crossover (trend-following), RSI Reversion (mean-reversion), Donchian Breakout (trend-continuation), and SPY Options RSI Reversion (options mean-reversion). The final live GO/NO-GO gate is the combined four-strategy paper run after Phase 10 safety work is complete.
 
 ---
 
@@ -25,6 +25,7 @@ The bot is organized into seven layers. Each layer has a single responsibility a
 │        Risk Manager + Allocator         │  Position sizing, sleeve budgets, kill switches
 ├─────────────────────────────────────────┤
 │         Execution Layer (alpaca-py)     │  TradingClient, order management, paper↔live
+│         Options Execution Worker        │  Async bracket-order thread for options
 ├─────────────────────────────────────────┤
 │         Reporting & Monitoring          │  Trade log (SQLite), PnL, metrics, alerts
 └─────────────────────────────────────────┘
@@ -36,12 +37,14 @@ At the signal level, strategy entries pass through a narrower trade-permission p
 Watchlist → raw strategy signal → edge filter (+ sector momentum) → regime gate → sleeve check → risk → execution
 ```
 
-- **Strategy** owns setup detection (crossover, RSI extreme)
+- **Strategy** owns setup detection (crossover, RSI extreme, breakout, options RSI recovery)
 - **Edge filter** owns current-condition permission (stock trend, macro state, earnings)
 - **Regime detector** gates entire strategies by market regime
 - **Sleeve allocator** enforces per-strategy capital budgets
 - **Risk manager** owns sizing, stops, exposure limits, and kill switches
 - **Execution** only places orders after all upstream gates pass
+
+For options, the execution path diverges after the risk manager: the broker detects the OCC symbol and dispatches an `OptionsExecutionWorker` thread that handles the async bracket order lifecycle independently of the engine loop.
 
 ---
 
@@ -82,11 +85,13 @@ trading-bot/
 │   ├── sma_crossover.py       # Trend-following: SMA crossover
 │   ├── rsi_reversion.py       # Mean-reversion: RSI oversold/overbought
 │   ├── donchian_breakout.py   # Trend-continuation: Turtle System 1 (30/15, ai_bigtech)
+│   ├── spy_options_reversion.py  # Options mean-reversion: SPY calls on RSI recovery
 │   └── filters/
 │       ├── common.py          # SPYTrendFilter + CompositeEdgeFilter
 │       ├── sma_crossover.py   # SMAEdgeFilter: stock > 200 SMA, volume expansion
 │       ├── rsi_reversion.py   # RSIEdgeFilter: SPY dual macro, earnings, liquidity, no-new-low
-│       ├── donchian_breakout.py # DonchianEdgeFilter: stock > 200 SMA, liquidity, earnings
+│       ├── donchian_breakout.py      # DonchianEdgeFilter: stock > 200 SMA, liquidity, earnings
+│       ├── spy_options_reversion.py  # SPYOptionsEdgeFilter: SPY > 100 SMA
 │       └── sector_momentum.py # SectorMomentumFilter: HOT/NEUTRAL/COLD gate adapter
 │
 ├── sector/
@@ -109,11 +114,16 @@ trading-bot/
 │
 ├── execution/
 │   ├── __init__.py
-│   └── broker.py              # AlpacaBroker — TradingClient wrapper + fractional path
+│   ├── broker.py              # AlpacaBroker — TradingClient wrapper + equity/options routing
+│   ├── options_executor.py    # OptionsExecutionWorker — async bracket-order thread
+│   └── stream.py              # StreamManager — WebSocket fill/order streaming
+│
+├── utils/
+│   └── options_lookup.py      # find_best_call: selects ITM call by delta + DTE from Alpaca chain
 │
 ├── reporting/
 │   ├── __init__.py
-│   ├── logger.py              # TradeLogger — writes to SQLite
+│   ├── logger.py              # TradeLogger — writes to SQLite (log, log_stop_fill, log_external_close)
 │   ├── metrics.py             # Computes Sharpe, drawdown, profit factor, win rate
 │   ├── pnl.py                 # PnLTracker — daily/weekly P&L reports
 │   └── alerts.py              # AlertDispatcher with pluggable backends
@@ -121,19 +131,21 @@ trading-bot/
 ├── backtest/
 │   ├── __init__.py
 │   ├── runner.py              # vectorbt backtesting harness
-│   └── reconcile.py           # Forward-test reconciliation (paper vs backtest)
+│   ├── reconcile.py           # Forward-test reconciliation (paper vs backtest)
+│   └── spy_options_backtest.py  # SPY options strategy backtester (daily proxy)
 │
 ├── scripts/
 │   ├── __init__.py
 │   ├── gonogo.py              # Go/no-go checker for live readiness
 │   ├── post_mortem.py         # Post-trade diagnostic reporting (RS, MA trends)
 │   ├── preflight.py           # Pre-flight checklist (must exit 0 before live flip)
-│   ├── rsi_backtest_report.py # Backtest reporter for RSI candidates
-│   ├── rsi_candidate_post_analysis.py # RSI guardrail evaluation (Drawdown, Profit Factor)
-│   ├── rsi_candidate_validate.py      # Stage 2 validation for RSI scanner candidates
-│   ├── rsi_watchlist_scan.py  # Stage 1 fundamental screener for RSI targets
-│   ├── sma_watchlist_scan.py  # Trend-following pipeline (Consolidation & Coil ranking)
-│   └── watchlist_review.py    # General fundamental/health strategy-fitness matrix
+│   ├── rsi_backtest_report.py
+│   ├── rsi_candidate_post_analysis.py
+│   ├── rsi_candidate_validate.py
+│   ├── rsi_watchlist_scan.py
+│   ├── sma_watchlist_scan.py
+│   └── watchlist_review.py
+│
 ├── tests/
 │   ├── conftest.py            # Shared fixtures (make_ohlcv, tmp_cache_dir, etc.)
 │   ├── test_strategies.py
@@ -150,8 +162,9 @@ trading-bot/
 │   ├── test_regime.py
 │   ├── test_filters.py
 │   ├── test_gonogo.py
-│   ├── test_sector_gauge.py   # SectorMomentumGauge + SectorMomentumFilter + CompositeEdgeFilter
-│   └── test_sector_resolver.py # SectorResolver: cache, normalization, yfinance lookup, hydration
+│   ├── test_sector_gauge.py
+│   ├── test_sector_resolver.py
+│   └── test_spy_options_reversion.py  # 21 tests: signals, guards, trailing stop, edge filter
 │
 ├── docs/                      # Architecture and strategy documentation
 ├── logs/                      # Rotating log files (gitignored)
@@ -183,12 +196,12 @@ Key rules:
 
 **Four regimes:**
 
-| Regime | Condition | SMA entries | RSI entries | Donchian entries |
-|---|---|---|---|---|
-| BEAR | SPY < 200-day SMA | ❌ blocked | ❌ blocked | ❌ blocked |
-| VOLATILE | ATR% above 80th percentile of trailing 126 bars | ❌ blocked | ❌ blocked | ❌ blocked |
-| TRENDING | ADX ≥ 25 | ✅ allowed | ✅ allowed | ✅ allowed |
-| RANGING | ADX ≤ 20 (or ambiguous zone, SMA50 slope tie-break) | ✅ allowed | ✅ allowed | ❌ blocked |
+| Regime | Condition | SMA | RSI | Donchian | SPY Options |
+|---|---|---|---|---|---|
+| BEAR | SPY < 200-day SMA | ❌ | ❌ | ❌ | ❌ |
+| VOLATILE | ATR% above 80th percentile of trailing 126 bars | ❌ | ❌ | ❌ | ❌ |
+| TRENDING | ADX ≥ 25 | ✅ | ✅ | ✅ | ✅ |
+| RANGING | ADX ≤ 20 (or ambiguous zone, SMA50 slope tie-break) | ✅ | ✅ | ❌ | ✅ |
 
 **Classification priority:** BEAR → VOLATILE → TRENDING/RANGING (ADX + slope).
 
@@ -214,9 +227,9 @@ Each `StrategySlot` declares `allowed_regimes: frozenset[MarketRegime] | None`. 
 
 **Classification:** HOT (score ≥ 3), COLD (score ≤ -2), NEUTRAL otherwise.
 
-**Fail behavior:** If ETF data is unavailable or fewer than 200 bars exist, returns NEUTRAL. The gauge has no opinion — it does not say "safe to trade."
+**Fail behavior:** If ETF data is unavailable or fewer than 200 bars exist, returns NEUTRAL.
 
-**TTL caching:** ETF bars and score results are cached per `cache_ttl_seconds` (default 600s, matching the RegimeDetector pattern). Called once per cycle via edge filters — not per symbol.
+**TTL caching:** ETF bars and score results are cached per `cache_ttl_seconds` (default 600s). Called once per cycle via edge filters — not per symbol.
 
 `sector/resolver.py` — `SectorResolver` maps stock tickers to sector labels using yfinance metadata cached in `data/cache/sector_map.json`. Hydrated once at startup (`resolver.hydrate(all_symbols)`) so no API calls occur during the live trading loop. Industry takes priority over sector in normalization (NVDA → industry="Semiconductors" → `"semiconductors"`, not `"technology"`). ETFs return `None`. Unknown symbols fail open.
 
@@ -269,25 +282,47 @@ class BaseStrategy(ABC):
 - Signals at bar t depend only on data up to and including t (no look-ahead)
 - The engine shifts execution to bar t+1's open
 
+**Options extension points on BaseStrategy:**
+
+Strategies that trade options may implement two additional methods:
+
+```python
+def build_option_execution(
+    self, symbol: str, underlying_price: float
+) -> tuple[str, float, float, float] | None:
+    """
+    Called by the broker when an options entry is approved.
+    Returns (occ_symbol, limit_price, take_profit, stop_loss)
+    or None to abort the entry (e.g. spread too wide, no suitable contract).
+    """
+
+def inspect_open_positions(self, position, latest_close: float) -> bool:
+    """
+    Called every engine cycle for each open position.
+    Returns True to trigger an immediate market exit.
+    Used for time stops, delta floors, trailing stops, or any mid-trade guard
+    that cannot be expressed as a bar-level exit signal.
+    """
+```
+
+Neither method has a default implementation in `BaseStrategy` — only strategies that trade options need them. The engine calls `inspect_open_positions` before processing the entry/exit signal branch for that symbol.
+
 **Edge filter contract:**
 - The repo standard is a structured edge-filter decision carrying both `allowed` and `reasons`
 - `BaseStrategy` centrally normalizes both supported edge-filter return types:
   - `EdgeFilterDecision` — preferred for new or upgraded filters
   - `pd.Series[bool]` — compatibility-only fallback for legacy or trivial filters
-- `inspect_signals(...)` is the canonical observability seam: it exposes the raw signals, filtered signals, latest edge allow/block state, and latest block reasons
-- A strategy may still be constructed with a legacy `edge_filter(df) -> pd.Series[bool]` during the rollout
+- `inspect_signals(...)` is the canonical observability seam: exposes raw signals, filtered signals, latest edge allow/block state, and latest block reasons
 - `_raw_signals(df)` computes the strategy's unfiltered setup first
 - `generate_signals(df)` AND-gates entries with the edge filter
 - Exits are never blocked by the edge filter
 - Missing, NaN, or false filter values block entries by default
-- The engine persists watchlist `Status` and `Reason` from this normalized decision path; the dashboard only renders what the engine writes
 
 **Filter file layout:**
 - Strategy-specific edge filters live in `strategies/filters/<strategy_name>.py`
 - Shared filter helpers live in `strategies/filters/common.py` — includes `SPYTrendFilter` and `CompositeEdgeFilter`
 - `CompositeEdgeFilter` composes normalized edge-filter decisions internally and preserves all blocking reasons for the latest bar
 - `SectorMomentumFilter` (`strategies/filters/sector_momentum.py`) is a reusable adapter that queries the `SectorMomentumGauge` and applies a configurable `sector_entry_policy` ("block" | "warn" | "pass")
-- Do not use edge filters for universe selection; `WatchlistSource` owns symbol selection
 - New filters with meaningful operator-facing diagnostics should return `EdgeFilterDecision`; plain boolean `pd.Series` is being phased out as the primary authoring style
 
 **StrategySlot:**
@@ -297,9 +332,10 @@ Each slot binds a strategy to its symbol universe, timeframe, and allowed regime
 
 | Strategy | File | Status | Order Type | Allowed Regimes | Sleeve |
 |---|---|---|---|---|---|
-| SMA Crossover | `sma_crossover.py` | **Paper Trading** | MARKET | TRENDING, RANGING | 50% |
+| SMA Crossover | `sma_crossover.py` | **Paper Trading** | MARKET | TRENDING, RANGING | 45% |
 | RSI Reversion | `rsi_reversion.py` | **Paper Trading** | LIMIT | TRENDING, RANGING | 25% |
 | Donchian Breakout | `donchian_breakout.py` | **Paper Trading** | MARKET | TRENDING only | 25% |
+| SPY Options RSI Reversion | `spy_options_reversion.py` | **Paper Trading** | LIMIT (async bracket) | TRENDING, RANGING | 5% |
 
 ### 5. Risk Manager + Sleeve Allocator
 
@@ -314,13 +350,16 @@ Sleeve budget       = equity × MAX_GROSS_EXPOSURE_PCT × weight
 Per-position budget = sleeve_budget / max_positions
 ```
 
-At $100k equity, 80% gross, 50/25/25 weights, max_positions=5:
-- SMA sleeve = $100k × 0.80 × 0.50 = $40,000 → $8,000 per position
-- RSI sleeve = $100k × 0.80 × 0.25 = $20,000 → $4,000 per position
-- Donchian sleeve = $100k × 0.80 × 0.25 = $20,000 → $4,000 per position
+At $100k equity, 80% gross, 45/25/25/5 weights:
+- SMA sleeve:     $100k × 0.80 × 0.45 = $36,000 → $7,200 per position (5 max)
+- RSI sleeve:     $100k × 0.80 × 0.25 = $20,000 → $4,000 per position (5 max)
+- Donchian sleeve: $100k × 0.80 × 0.25 = $20,000 → $4,000 per position (5 max)
+- Options sleeve:  $100k × 0.80 × 0.05 = $4,000  → $4,000 per position (1 max)
 
 Rejection codes: `SLEEVE_FULL` (budget exhausted), `SLEEVE_MAX_POSITIONS` (count cap hit).
 Idle sleeve capital stays locked — no cross-borrowing between strategies (Phase 11 item).
+
+The options sleeve uses the same `SleeveAllocator` and HWM drawdown gate as equity strategies. P&L is recorded with a 100× contract multiplier so the drawdown gate operates on real dollar amounts, not premium points.
 
 #### Risk Manager (`risk/manager.py`)
 
@@ -328,11 +367,13 @@ Idle sleeve capital stays locked — no cross-borrowing between strategies (Phas
 - Validate signals against current portfolio state
 - Enforce ATR-based position sizing (risk no more than 2% of equity per trade)
 - Enforce daily loss limits (halt bot if breached)
-- Apply stop-loss levels to every order (ATR-based)
+- Apply stop-loss levels to every order (ATR-based for equities; bracket legs for options)
 - Track current exposure per symbol and overall
 - Loss-streak cooldown per strategy
 - Broker-error-streak kill switch
 - Slippage-drift kill switch
+
+For options, fractional sizing is disabled (`and not is_option` guard in `_size_position()`). The 100× contract multiplier is applied only in P&L accounting — the risk manager sizes by contract count.
 
 **Key risk parameters (from `config/settings.py`):**
 
@@ -344,31 +385,63 @@ Idle sleeve capital stays locked — no cross-borrowing between strategies (Phas
 | `MAX_GROSS_EXPOSURE_PCT` | Max total gross notional as % of equity | 80% |
 | `MAX_DAILY_LOSS_PCT` | Halt for the session if equity down this much | 5% |
 | `HARD_DOLLAR_LOSS_CAP` | Absolute $ loss cap from session start | $2,000 |
-| `ATR_STOP_MULTIPLIER` | Stop = entry − k × ATR | 2.0 |
+| `ATR_STOP_MULTIPLIER` | Stop = entry − k × ATR (equities only) | 2.0 |
 | `LOSS_STREAK_THRESHOLD` | Disable strategy after N consecutive losses | 3 |
-| `STRATEGY_ALLOCATIONS` | Per-strategy weight + max_positions | 50/50, 5 each |
+| `STRATEGY_ALLOCATIONS` | Per-strategy weight + max_positions | see above |
 
 ### 6. Execution Layer
 
-A thin wrapper (`AlpacaBroker`) around `alpaca-py`'s `TradingClient`. Translates approved risk decisions into actual orders.
+A thin wrapper (`AlpacaBroker`) around `alpaca-py`'s `TradingClient`. Translates approved risk decisions into actual orders. The broker routes equity and options orders down separate paths detected by the OCC symbol format.
 
 **Paper vs live routing** is controlled by the `LIVE_TRADING` flag in `config/.env`. All credential and DB routing derives from this single flag — never set `ALPACA_PAPER` directly.
 
-**Order paths:**
+#### Equity order paths
 
 | Path | Condition | TIF | Stop |
 |---|---|---|---|
 | OTO GTC | Whole-share MARKET or LIMIT | GTC | Attached stop-loss leg (OTO bracket) |
 | Fractional DAY | `FRACTIONAL_ENABLED=True` and `floor(qty) ≠ qty` | DAY | Standalone GTC stop submitted after fill confirmation |
 
-**Fractional shares (`FRACTIONAL_ENABLED`):** Alpaca fractional orders require DAY TIF and cannot use OTO order class. The broker routes fractional quantities to `_place_fractional_order()`: DAY market entry first, then a standalone GTC stop for `floor(qty)` whole shares after confirmed fill. If `floor(qty) == 0` (qty < 1 share), no stop is submitted and the position exits via engine signals. Disable `FRACTIONAL_ENABLED` once the account exceeds ~$10k — whole-share rounding error becomes negligible at that scale and the simpler OTO path is preferred.
+**Fractional shares (`FRACTIONAL_ENABLED`):** Alpaca fractional orders require DAY TIF and cannot use OTO order class. The broker routes fractional quantities to `_place_fractional_order()`: DAY market entry first, then a standalone GTC stop for `floor(qty)` whole shares after confirmed fill. If `floor(qty) == 0` (qty < 1 share), no stop is submitted and the position exits via engine signals. Disable `FRACTIONAL_ENABLED` once the account exceeds ~$10k.
 
-**Other rules:**
+#### Options order path (`execution/options_executor.py`)
+
+Options orders are detected by matching the OCC symbol format (`^[A-Z]{1,6}[0-9]{6}[CP][0-9]{8}$`, compiled as `_OCC_PAT` at module level in `engine/trader.py`). When an OCC symbol is detected, the broker dispatches an `OptionsExecutionWorker` thread and returns `OrderResult(status=ACCEPTED)` immediately so the engine loop is not blocked.
+
+**OptionsExecutionWorker lifecycle:**
+
+1. Calls `build_option_execution(symbol, underlying_price)` on the strategy to get `(occ_symbol, limit_price, take_profit, stop_loss)`. If `None` is returned (e.g. spread too wide), the worker exits without placing an order.
+2. Submits a limit entry order for the OCC symbol via `TradingClient`.
+3. Polls `StreamManager` for a fill event for up to 60 seconds. If no fill arrives, cancels the order and exits.
+4. On confirmed fill: submits take-profit and stop-loss legs as a bracket OTO order.
+5. Reports the fill back to the engine via a queue drained by `drain_option_fills()` each cycle.
+
+**DRY_RUN guard:** the dry-run check fires before the worker is created — no thread is spawned and no order is submitted during dry runs.
+
+#### OCC symbol handling in the engine
+
+`_OCC_PAT` in `engine/trader.py` is the single authoritative regex for detecting options positions anywhere in the engine. All engine paths that behave differently for options key off this pattern:
+
+| Path | OCC-specific behaviour |
+|---|---|
+| `_repair_missing_protective_stops` | Skips OCC symbols — bracket stop legs are managed by Alpaca, not the engine |
+| `_record_fill` (slippage monitor) | Skipped for OCC exits — underlying bar price vs option premium produces meaningless bps |
+| `_log_close` | Uses `result.avg_fill_price` (option premium) as `modeled_price` instead of the underlying bar close |
+| `_record_realized_pnl` | Accepts `multiplier=100` for options; default 1 for equities |
+| `_process_stream_stop_fills` | Normalizes OCC → underlying before `_position_owners` lookup; logs with `log_stop_fill` |
+| `inspect_open_positions` exit | Calls `_OCC_PAT`-gated multiplier; skips `_record_fill`; uses premium as modeled price |
+
+**WebSocket stream stop fills:** When a bracket stop leg fills, the stream delivers the event with the OCC symbol. `_process_stream_stop_fills` normalizes the OCC string to the underlying ticker (the key in `_position_owners`), records the real P&L with the 100× multiplier, and calls `log_stop_fill` to persist the confirmed execution. If price or qty is absent from the stream event, it falls back to `log_external_close`.
+
+**Known limitation:** `_position_owners` is keyed by the underlying ticker (`"SPY"`), not the OCC string. Two options strategies trading the same underlying simultaneously would collide. Safe for any number of strategies on distinct underlyings. See PLAN.md item 11.23 for the migration plan.
+
+#### Other execution rules
+
 - `DRY_RUN=True` logs orders without submitting (final sanity check before live)
 - `LIVE_SIZE_MULTIPLIER=0.25` scales live position sizes to 25% at launch
 - Order errors are caught, logged, and never crash the bot
 - Position ownership is tracked per strategy to prevent cross-strategy interference
-- WebSocket streaming (10.E1) is the primary fill notification path; REST polling is the fallback
+- WebSocket streaming (Phase 10.E1) is the primary fill notification path; REST polling is the fallback
 
 ### 7. Reporting & Monitoring
 
@@ -378,7 +451,14 @@ Every trade is logged to SQLite for the go/no-go evaluation. This layer also com
 - `data/trades.db` — paper trading (never mixed with live data)
 - `data/trades_live.db` — live trading (separate file to prevent cross-contamination)
 
-The `TradeLogger` inserts a row for every fill (entry and exit). Schema includes timestamp, symbol, side, qty, avg_fill_price, strategy, slippage data, and status.
+The `TradeLogger` inserts a row for every fill. Three write paths:
+
+| Method | Used when | Fill price recorded |
+|---|---|---|
+| `log(build_record(...))` | Entry fills (all strategies) | `result.avg_fill_price` |
+| `log(build_close_record(...))` | Signal-based exit fills | `result.avg_fill_price`; `modeled_price` is the premium for options, bar close for equities |
+| `log_stop_fill(symbol, strategy, qty, avg_fill_price)` | Confirmed WebSocket bracket stop fills | Exact stream fill price and qty |
+| `log_external_close(symbol, strategy, reason)` | Inferred external closes (no confirmed fill event) | `NULL` — price unknown |
 
 **Metrics computed (`reporting/metrics.py`):**
 
@@ -405,7 +485,7 @@ Must exit 0 before any live capital is committed. Validates: credentials point t
 Before committing live capital, ALL of the following must be satisfied:
 
 1. Minimum **50 closed trades** in paper trading (statistical significance)
-2. Paper trading period spans **at least 4 weeks** across varying market conditions, with both SMA and RSI active
+2. Paper trading period spans **at least 4 weeks** across varying market conditions, with all four strategies active
 3. All five metrics meet their thresholds (see table above)
 4. Bot has run for at least **72 hours continuously** without crashes or errors
 5. Risk manager daily halt has never been triggered without being intentional
@@ -420,7 +500,7 @@ For slow daily-bar strategies, 50 closed trades may not be attainable in a 2–4
 
 ## Adding a New Strategy — Checklist
 
-When implementing any new strategy:
+When implementing any new equity strategy:
 
 1. Create `strategies/<strategy_name>.py`
 2. Inherit from `BaseStrategy`
@@ -428,12 +508,19 @@ When implementing any new strategy:
 4. Set `preferred_order_type` — `OrderType.MARKET` or `OrderType.LIMIT`
 5. Implement `_raw_signals(df) -> SignalFrame` — entries/exits boolean Series
 6. Override `required_bars()` if the strategy needs more than 50 bars
-7. Create `strategies/filters/<strategy_name>.py` with an `EdgeFilter` subclass
-8. If the filter has meaningful block reasons, return `EdgeFilterDecision` rather than a plain boolean series
-9. Add an entry to `STRATEGY_ALLOCATIONS` in `config/settings.py`
-10. Add unit tests in `tests/test_strategies.py` and `tests/test_filters.py`
-11. Add a `StrategySlot` with `allowed_regimes` in `forward_test.py`
-12. Update `docs/strategies.md`
+7. Create `strategies/filters/<strategy_name>.py` with an edge filter returning `EdgeFilterDecision`
+8. Add an entry to `STRATEGY_ALLOCATIONS` in `config/settings.py`
+9. Add unit tests in `tests/test_strategies.py` and `tests/test_filters.py`
+10. Add a `StrategySlot` with `allowed_regimes` in `forward_test.py`
+11. Update `docs/strategies.md`
+
+### Additional steps for options strategies
+
+12. Implement `build_option_execution(symbol, underlying_price) -> tuple | None` — returns `(occ_symbol, limit_price, take_profit, stop_loss)` or `None` to abort
+13. Implement `inspect_open_positions(position, latest_close) -> bool` — mid-trade exit guards (time stop, delta floor, trailing stop, etc.)
+14. Use `utils/options_lookup.find_best_call` (or an equivalent) to select the contract
+15. Add tests for `build_option_execution`, `inspect_open_positions`, and each exit guard in `tests/test_<strategy_name>.py`
+16. **Check PLAN.md item 11.23** before adding a second options strategy on the same underlying — `_position_owners` is keyed by the underlying ticker and two strategies on the same underlying would collide
 
 ---
 
@@ -447,6 +534,8 @@ When implementing any new strategy:
 | `loguru` | Structured logging (rotating file + console sinks) |
 | `sqlite3` | Trade logging (built into Python) |
 | `python-dotenv` | Environment variable management |
+| `blackscholes` | Black-Scholes option pricing for mid-trade delta and value guards |
+| `yfinance` | VIX daily fetch for Black-Scholes sigma input (options only) |
 
 ---
 
@@ -461,3 +550,5 @@ When implementing any new strategy:
 - Never use `pandas-ta` — indicators are hand-rolled to eliminate dependency risk
 - Never set `LIVE_TRADING=true` before `scripts/preflight.py` exits 0
 - Never mix paper and live trade logs — they are separate databases by design
+- Never call `build_option_execution` or `inspect_open_positions` from inside the risk manager — these are strategy concerns, called by the broker and engine respectively
+- Never key new options ownership state by the OCC string without first resolving the 11.23 migration — use the underlying ticker for now and document the limitation
