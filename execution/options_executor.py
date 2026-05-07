@@ -5,11 +5,18 @@ Background worker to handle options midpoint cancel/replace bracket orders.
 import threading
 import time
 import uuid
+import warnings
 from typing import Callable
 from loguru import logger
-from alpaca.trading.client import TradingClient
-from alpaca.trading.requests import LimitOrderRequest, TakeProfitRequest, StopLossRequest
-from alpaca.trading.enums import OrderSide, OrderType as AlpacaOrderType, OrderClass, TimeInForce
+with warnings.catch_warnings():
+    warnings.filterwarnings(
+        "ignore",
+        message=r"websockets\.legacy is deprecated.*",
+        category=DeprecationWarning,
+    )
+    from alpaca.trading.client import TradingClient
+    from alpaca.trading.requests import LimitOrderRequest, TakeProfitRequest, StopLossRequest
+    from alpaca.trading.enums import OrderSide, OrderType as AlpacaOrderType, OrderClass, TimeInForce
 
 from risk.manager import RiskDecision, Side
 from execution.stream import StreamManager
@@ -89,13 +96,24 @@ class OptionsExecutionWorker(threading.Thread):
                 self.stream_manager.unwatch(client_order_id)
             return
             
+        if self.stream_manager:
+            self.stream_manager.bind_submitted_order(
+                client_order_id=client_order_id,
+                order_id=str(order.id),
+                stop_leg_ids=[
+                    str(leg.id)
+                    for leg in (getattr(order, "legs", None) or [])
+                    if getattr(leg, "id", None) is not None
+                ],
+            )
+
         # The 60-second cancel/replace loop
         # Since we approximate Delta/Prices via paper feed without OPRA,
         # we will wait 60s and cancel if unfilled. A full OPRA implementation
         # would fetch live quotes in a loop and use replace_order_by_id.
         if stream_event:
             filled = stream_event.wait(timeout=60.0)
-            self.stream_manager.unwatch(client_order_id)
+            self.stream_manager.unwatch(str(order.id))
             if filled:
                 logger.info(f"[{self.name}] Option order filled.")
                 try:
@@ -104,12 +122,24 @@ class OptionsExecutionWorker(threading.Thread):
                 except Exception:
                     self._report_fill("filled", str(order.id))
             else:
+                try:
+                    latest = self.api.get_order_by_id(order.id)
+                    status = latest.status.value if hasattr(latest.status, "value") else str(latest.status)
+                    if status in ("filled", "partially_filled", "canceled", "rejected"):
+                        logger.info(
+                            f"[{self.name}] Option order resolved during stream gap: {status}"
+                        )
+                        self._report_fill(status, str(latest.id), latest)
+                        return
+                except Exception:
+                    latest = None
+
                 logger.warning(f"[{self.name}] Option limit order unfilled after 60s. Cancelling.")
                 try:
                     self.api.cancel_order_by_id(order.id)
                 except Exception as e:
                     logger.error(f"[{self.name}] Cancel failed: {e}")
-                self._report_fill("canceled", str(order.id))
+                self._report_fill("canceled", str(order.id), latest)
         else:
             # Fallback REST polling
             terminal_status = "canceled"

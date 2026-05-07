@@ -51,6 +51,7 @@ from risk.manager import (
     Side,
 )
 from strategies.base import BaseStrategy, EdgeFilterDecision, OrderType, SignalFrame
+from strategies.spy_options_reversion import OptionTradeRejected
 
 
 # ── Fakes ────────────────────────────────────────────────────────────────────
@@ -254,6 +255,63 @@ def engine_factory(patch_fetch, tmp_path):
 # ── EngineConfig ─────────────────────────────────────────────────────────────
 
 
+class TestStreamHealthObservability:
+    def test_outage_and_recovery_alert_once_per_transition(self, engine_factory):
+        engine, _broker = engine_factory()
+        engine.alerts = MagicMock()
+        engine._stream_manager = MagicMock()
+        engine._stream_manager.health_snapshot.side_effect = [
+            SimpleNamespace(
+                connected=True,
+                healthy=True,
+                generation=1,
+                last_rx_at=None,
+                last_disconnect_at=None,
+                last_reconnect_at=None,
+                consecutive_failures=0,
+            ),
+            SimpleNamespace(
+                connected=False,
+                healthy=False,
+                generation=1,
+                last_rx_at=None,
+                last_disconnect_at="2026-05-07T12:00:00+00:00",
+                last_reconnect_at=None,
+                consecutive_failures=1,
+            ),
+            SimpleNamespace(
+                connected=False,
+                healthy=False,
+                generation=1,
+                last_rx_at=None,
+                last_disconnect_at="2026-05-07T12:00:00+00:00",
+                last_reconnect_at=None,
+                consecutive_failures=2,
+            ),
+            SimpleNamespace(
+                connected=True,
+                healthy=True,
+                generation=2,
+                last_rx_at=None,
+                last_disconnect_at="2026-05-07T12:00:00+00:00",
+                last_reconnect_at="2026-05-07T12:01:00+00:00",
+                consecutive_failures=0,
+            ),
+        ]
+
+        engine._observe_stream_health()  # seed
+        engine._observe_stream_health()  # outage
+        engine._observe_stream_health()  # no duplicate
+        engine._observe_stream_health()  # recovery
+
+        assert engine.alerts.broker_error.call_count == 1
+        assert engine.alerts.broker_info.call_count == 1
+        outage_msg = engine.alerts.broker_error.call_args_list[0].args[0]
+        recovery_msg = engine.alerts.broker_info.call_args_list[0].args[0]
+        assert "stream unhealthy" in outage_msg
+        assert "stream healthy again" in recovery_msg
+
+
 class TestEngineConfig:
     def test_negative_cycle_interval_rejected(self):
         with pytest.raises(ValueError):
@@ -378,6 +436,34 @@ class TestProcessSymbol:
         engine._session_start_equity = snap.account.equity
         self._process(engine, "AAPL", snap)
         broker.close_position.assert_not_called()
+
+    def test_option_trade_rejected_logs_warning_and_skips_order(
+        self, engine_factory, monkeypatch
+    ):
+        class _OptionStrategy(FakeStrategy):
+            name = "spy_options_reversion"
+            preferred_order_type = OrderType.LIMIT
+
+            def build_option_execution(self, symbol, latest_close):
+                raise OptionTradeRejected(
+                    "SPY260521C00730000: spread 12.6% > 5% (bid=8.73 ask=9.90) — skipping trade."
+                )
+
+        engine, broker = engine_factory()
+        engine.slots[0].strategy = _OptionStrategy(entries=[False] * 59 + [True], exits=[False] * 60)
+        snap = _snapshot()
+        engine._session_start_equity = snap.account.equity
+
+        warnings: list[str] = []
+        errors: list[str] = []
+        monkeypatch.setattr("engine.trader.logger.warning", lambda msg: warnings.append(msg))
+        monkeypatch.setattr("engine.trader.logger.error", lambda msg: errors.append(msg))
+
+        self._process(engine, "SPY", snap)
+
+        broker.place_order.assert_not_called()
+        assert any("Option trade rejected for SPY" in msg for msg in warnings)
+        assert not any("Failed to build option execution for SPY" in msg for msg in errors)
 
 
 # ── _run_one_cycle ───────────────────────────────────────────────────────────
@@ -1877,6 +1963,42 @@ class TestOptionsEngineFixes:
         allocator.record_realized_pnl.assert_called_once_with(
             "spy_options_reversion", 1000.0
         )
+
+    def test_resynced_stop_fill_flows_through_engine_stop_processing(self, tmp_path):
+        """Gap-resynced stop fills should be handled exactly like live stream fills."""
+        from unittest.mock import MagicMock
+        from execution.stream import StreamManager
+
+        engine = self._engine(tmp_path)
+        occ = "SPY260516C00520000"
+        engine._position_owners["SPY"] = "spy_options_reversion"
+        engine._entry_prices["SPY"] = 10.0
+
+        order = SimpleNamespace(
+            id="stop-ord-gap",
+            symbol=occ,
+            status=SimpleNamespace(value="filled"),
+            filled_qty="2",
+            filled_avg_price="12.5",
+            qty="2",
+        )
+        fill_update = StreamManager._make_synthetic_update(order, "fill")
+
+        stream = MagicMock(spec=StreamManager)
+        stream.drain_stop_fills.return_value = [fill_update]
+        engine._stream_manager = stream
+        engine.trade_logger.log_stop_fill = MagicMock()
+
+        engine._process_stream_stop_fills()
+
+        engine.trade_logger.log_stop_fill.assert_called_once_with(
+            symbol=occ,
+            strategy="spy_options_reversion",
+            qty=2,
+            avg_fill_price=12.5,
+            order_id="stop-ord-gap",
+        )
+        assert "SPY" not in engine._position_owners
 
     def test_stream_stop_fill_equity_no_occ_normalization(self, tmp_path):
         """Plain equity stop fills still work without OCC normalization."""

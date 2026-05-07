@@ -29,6 +29,22 @@ ALPACA_BASE_URL = (
     else "https://api.alpaca.markets"
 )
 
+# WebSocket connection management (Phase 11.21)
+# Conservative defaults: detect dead sockets quickly, but do not churn on
+# minor blips. The stream manager owns ping/pong heartbeats directly.
+STREAM_HEARTBEAT_INTERVAL_SECONDS: float = float(
+    os.getenv("STREAM_HEARTBEAT_INTERVAL_SECONDS", "15")
+)
+STREAM_HEARTBEAT_TIMEOUT_SECONDS: float = float(
+    os.getenv("STREAM_HEARTBEAT_TIMEOUT_SECONDS", "10")
+)
+STREAM_RECONNECT_BASE_DELAY_SECONDS: float = float(
+    os.getenv("STREAM_RECONNECT_BASE_DELAY_SECONDS", "1")
+)
+STREAM_RECONNECT_MAX_DELAY_SECONDS: float = float(
+    os.getenv("STREAM_RECONNECT_MAX_DELAY_SECONDS", "30")
+)
+
 # Strategy-specific watchlists
 # SMA Crossover — trend-following; static list promoted from:
 #   /Users/franco/trading-bot/scripts/sma_watchlist_scan.py

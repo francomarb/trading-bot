@@ -25,7 +25,7 @@ loops are exercised.
 from __future__ import annotations
 
 from types import SimpleNamespace
-from unittest.mock import MagicMock
+from unittest.mock import MagicMock, patch
 
 import pytest
 from alpaca.common.exceptions import APIError
@@ -114,6 +114,28 @@ def _alpaca_order(
         limit_price=limit_price,
         stop_price=stop_price,
         submitted_at=submitted_at,
+    )
+
+
+def _stream_update(
+    *,
+    order_id: str = "ord-1",
+    client_order_id: str | None = None,
+    event: str = "fill",
+    filled_qty: float = 10.0,
+    filled_avg_price: float = 100.5,
+) -> SimpleNamespace:
+    return SimpleNamespace(
+        event=SimpleNamespace(value=event),
+        qty=filled_qty,
+        price=filled_avg_price,
+        order=SimpleNamespace(
+            id=order_id,
+            client_order_id=client_order_id,
+            filled_qty=str(filled_qty),
+            filled_avg_price=str(filled_avg_price),
+            symbol="AAPL",
+        ),
     )
 
 
@@ -229,6 +251,101 @@ class TestSubmitOrderKwargs:
         assert req.client_order_id.startswith("sma-repair-")
         assert result.side is Side.SELL
         assert result.stop_price == 95.5
+
+    def test_stream_submit_path_watches_binds_and_unwatches(self):
+        api = MagicMock()
+        stream = MagicMock()
+        stream_event = MagicMock()
+        stream_event.wait.return_value = False
+        stream.watch.return_value = stream_event
+        api.submit_order.return_value = _alpaca_order(
+            status="accepted",
+            id="ord-1",
+        )
+        api.get_order_by_id.return_value = _alpaca_order(
+            status="filled",
+            id="ord-1",
+            filled_qty=10,
+            filled_avg_price=100.5,
+        )
+        broker = AlpacaBroker(
+            client=api,
+            max_attempts=3,
+            base_delay=0.0,
+            stream_manager=stream,
+        )
+
+        broker.place_order(_decision(), poll_timeout=0.1, poll_interval=0.0)
+
+        watched_client_id = stream.watch.call_args.args[0]
+        assert watched_client_id.startswith("sma_crossover-")
+        stream.bind_submitted_order.assert_called_once()
+        bind_kwargs = stream.bind_submitted_order.call_args.kwargs
+        assert bind_kwargs["client_order_id"] == watched_client_id
+        assert bind_kwargs["order_id"] == "ord-1"
+        assert stream.unwatch.call_args.args == ("ord-1",)
+
+    def test_stream_terminal_update_builds_result_and_cleans_up_watch(self):
+        api = MagicMock()
+        stream = MagicMock()
+        stream_event = MagicMock()
+        stream_event.wait.return_value = True
+        stream.watch.return_value = stream_event
+        api.submit_order.return_value = _alpaca_order(status="accepted", id="ord-1")
+        stream.get_update.return_value = _stream_update(
+            order_id="ord-1",
+            client_order_id="sma_crossover-abc123",
+            event="fill",
+            filled_qty=10.0,
+            filled_avg_price=100.75,
+        )
+        broker = AlpacaBroker(
+            client=api,
+            max_attempts=3,
+            base_delay=0.0,
+            stream_manager=stream,
+        )
+
+        result = broker.place_order(_decision(), poll_timeout=0.1, poll_interval=0.0)
+
+        assert result.status is OrderStatus.FILLED
+        assert result.avg_fill_price == 100.75
+        api.get_order_by_id.assert_not_called()
+        stream.unwatch.assert_called_once_with("ord-1")
+
+    def test_fractional_path_uses_same_watch_bind_flow(self):
+        api = MagicMock()
+        stream = MagicMock()
+        stream_event = MagicMock()
+        stream_event.wait.return_value = False
+        stream.watch.return_value = stream_event
+        entry_order = _alpaca_order(id="entry-1", status="accepted", qty=8.5)
+        filled_order = _alpaca_order(
+            id="entry-1",
+            status="filled",
+            qty=8.5,
+            filled_qty=8.5,
+            filled_avg_price=100.5,
+        )
+        stop_order = _alpaca_order(id="stop-1", status="accepted", qty=8)
+        api.submit_order.side_effect = [entry_order, stop_order]
+        api.get_order_by_id.return_value = filled_order
+
+        broker = AlpacaBroker(
+            client=api,
+            max_attempts=3,
+            base_delay=0.0,
+            stream_manager=stream,
+        )
+        broker.place_order(_decision(qty=8.5), poll_timeout=0.1, poll_interval=0.0)
+
+        watched_client_id = stream.watch.call_args.args[0]
+        assert watched_client_id.startswith("sma_crossover-frac-")
+        stream.bind_submitted_order.assert_called_once_with(
+            client_order_id=watched_client_id,
+            order_id="entry-1",
+        )
+        stream.unwatch.assert_called_once_with("entry-1")
 
 
 # ── place_order: terminal-state mapping ──────────────────────────────────────

@@ -79,6 +79,7 @@ from reporting.alerts import AlertDispatcher
 from reporting.logger import TradeLogger
 from reporting.pnl import PnLTracker
 from strategies.base import BaseStrategy, OrderType, StrategySlot
+from strategies.spy_options_reversion import OptionTradeRejected
 
 from regime.detector import MarketRegime
 
@@ -240,6 +241,7 @@ class TradingEngine:
         self._regime_fail_count: int = 0
         self._last_cycle_equity: float | None = None
         self._last_snapshot: "BrokerSnapshot | None" = None
+        self._last_stream_healthy: bool | None = None
 
         # Position ownership: symbol → strategy_name.  Tracks which strategy
         # opened each position so that exit signals from a *different* strategy
@@ -451,6 +453,7 @@ class TradingEngine:
                 f"risk={risk_state}"
             )
 
+            self._observe_stream_health()
             self._recover_suspect_orders(snapshot)
             self._detect_external_closes(snapshot)
             self._process_stream_stop_fills()
@@ -887,6 +890,14 @@ class TradingEngine:
                 take_profit = opt_tp
                 stop_price = opt_sl
                 logger.info(f"[{strategy.name}] Option Execution override: {symbol} -> {target_symbol} at ${target_price:.2f}")
+            except OptionTradeRejected as e:
+                logger.warning(
+                    f"[{strategy.name}] Option trade rejected for {symbol}: {e}"
+                )
+                self._mark_signal_bar_processed(
+                    signal_key, signal_bar, strategy_statuses, strategy_reasons, symbol
+                )
+                return None
             except Exception as e:
                 logger.error(f"[{strategy.name}] Failed to build option execution for {symbol}: {e}")
                 self._mark_signal_bar_processed(
@@ -1773,6 +1784,36 @@ class TradingEngine:
 
     # ── State snapshot (Phase 11.14) ─────────────────────────────────────
 
+    def _observe_stream_health(self) -> None:
+        """Log/alert websocket outage and recovery transitions once per change."""
+        if self._stream_manager is None:
+            return
+
+        health = self._stream_manager.health_snapshot()
+        if self._last_stream_healthy is None:
+            self._last_stream_healthy = health.healthy
+            return
+
+        if health.healthy == self._last_stream_healthy:
+            return
+
+        self._last_stream_healthy = health.healthy
+        if not health.healthy:
+            msg = (
+                "stream unhealthy — websocket disconnected; REST/order "
+                "reconciliation fallbacks remain active"
+            )
+            logger.warning(msg)
+            self.alerts.broker_error(msg)
+            return
+
+        msg = (
+            f"stream healthy again (generation={health.generation}, "
+            f"reconnected_at={health.last_reconnect_at})"
+        )
+        logger.info(msg)
+        self.alerts.broker_info(msg)
+
     def _write_state_snapshot(self) -> None:
         """
         Write a JSON snapshot of engine state to STATE_SNAPSHOT_PATH.
@@ -1816,6 +1857,26 @@ class TradingEngine:
                 "running": self._running,
                 "cycle_count": self._cycle_count,
                 "regime": self._last_regime,
+                "stream_health": (
+                    None if self._stream_manager is None else {
+                        "connected": (health := self._stream_manager.health_snapshot()).connected,
+                        "healthy": health.healthy,
+                        "generation": health.generation,
+                        "last_rx_at": (
+                            health.last_rx_at.isoformat()
+                            if health.last_rx_at is not None else None
+                        ),
+                        "last_disconnect_at": (
+                            health.last_disconnect_at.isoformat()
+                            if health.last_disconnect_at is not None else None
+                        ),
+                        "last_reconnect_at": (
+                            health.last_reconnect_at.isoformat()
+                            if health.last_reconnect_at is not None else None
+                        ),
+                        "consecutive_failures": health.consecutive_failures,
+                    }
+                ),
                 "equity": equity,
                 "session_start_equity": start_equity,
                 "previous_close_equity": previous_close_equity,
