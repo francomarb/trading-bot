@@ -1,6 +1,6 @@
 # Trading Bot
 
-A modular, strategy-agnostic algorithmic trading bot built in Python. Currently paper trading on Alpaca with the SMA crossover strategy and a full go/no-go framework for live capital deployment.
+A modular, strategy-agnostic algorithmic trading bot built in Python. Four strategies running simultaneously in Alpaca paper trading, with a full go/no-go framework for live capital deployment.
 
 ## Stack
 
@@ -10,21 +10,24 @@ A modular, strategy-agnostic algorithmic trading bot built in Python. Currently 
 | Broker | Alpaca Markets (paper trading → live) |
 | SDK | alpaca-py (official) |
 | Data | pandas |
-| Indicators | Hand-rolled (SMA, EMA, ATR, RSI) |
+| Indicators | Hand-rolled (SMA, EMA, ATR, RSI, ADX, Bollinger Bands, Donchian) |
 | Backtesting | vectorbt |
-| Trade Log | SQLite (`data/trades.db`) |
+| Options Pricing | blackscholes (Black-Scholes Delta + price) |
+| Sector Data | yfinance (sector resolver, VIX) |
+| Dashboard | streamlit + plotly |
+| Trade Log | SQLite (`data/trades.db` paper / `data/trades_live.db` live) |
 | Logging | loguru |
 
 ## Strategies
 
-| Strategy | Type | Order Type | Status |
-|---|---|---|---|
-| SMA Crossover | Trend-following | Market | **Active — Paper Trading** |
-| RSI Reversion | Mean-reversion | Limit | Implemented, not yet active |
+| Strategy | Type | Order Type | Sleeve | Status |
+|---|---|---|---|---|
+| SMA Crossover | Trend-following | Market | 45% | **Active — Paper Trading** |
+| RSI Reversion | Mean-reversion | Limit | 25% | **Active — Paper Trading** |
+| Donchian Breakout | Trend continuation | Market | 25% | **Active — Paper Trading** |
+| SPY Options RSI Reversion | Options mean-reversion | Limit (OCC) | 5% | **Active — Paper Trading** |
 
-Only SMA crossover is currently running. RSI Reversion is implemented and backtested but will not be activated until the current SMA paper run has stabilized and Phase 10 safety work is complete. Phase 10 now requires fixed per-strategy capital allocation before SMA + RSI run together, so one strategy cannot consume the other's sleeve. After Phase 10, SMA + RSI must run together in Alpaca paper mode for at least 2 weeks, target 4 weeks, before any live GO/NO-GO decision.
-
-See [docs/strategies.md](docs/strategies.md) for full signal logic and parameters.
+See [docs/strategies.md](docs/strategies.md) for full signal logic, parameters, and exit guards.
 
 ## Architecture
 
@@ -90,11 +93,10 @@ Thresholds (from [architecture.md](docs/architecture.md)):
 | Win Rate | > 45% |
 | Avg Win / Avg Loss | > 1.5 |
 
-For the SMA-only Phase 10 paper run, 50 closed trades is unlikely on daily bars.
-Use `backtest/reconcile.py` and operational stability as the primary stabilization
-gates for that run. The final live GO/NO-GO gate is the post-Phase-10 SMA + RSI
-paper run; the 50-trade threshold remains a stricter live-readiness/statistical
-gate for that combined system.
+The 50-trade threshold is a statistical live-readiness gate. With four active
+strategies the combined trade rate is higher, but daily-bar trend strategies
+(SMA, Donchian) still generate trades slowly. Use `backtest/reconcile.py` and
+operational stability alongside the trade-count gate.
 
 ## Testing
 
@@ -111,22 +113,23 @@ python phase9_verify.py
 
 ## Project Status
 
-- Phases 1–9 and 9.5 complete (data, strategies, backtesting, risk, execution, reporting, reconciliation)
-- **Phase 10 in progress** — live-readiness hardening (510 tests passing)
-  - ✅ Live config separation, pre-flight checklist, WatchlistSource abstraction
-  - ✅ Durable position ownership from trade DB, startup reconciliation, external-close detection
-  - ✅ WebSocket order/fill streaming via `TradingStream` (stream-first, REST fallback)
-  - ✅ `LIVE_SIZE_MULTIPLIER`, `DRY_RUN` mode
-  - ⬜ Slippage kill switch calibration (needs ≥10 real fills)
-  - ⬜ SMA + RSI edge filters, capital allocation, regime gating, RSI paper activation
-- Currently running SMA crossover paper trading; RSI activates after Phase 10 portfolio layer is complete
+See [PLAN.md](PLAN.md) for the current phase, completed items, and remaining blockers before the live flip.
 
 ## Environment Variables
 
 Stored in `config/.env` (never committed):
 
 ```
-ALPACA_API_KEY=your_key_here
-ALPACA_SECRET_KEY=your_secret_here
-ALPACA_PAPER=true
+# Paper credentials (default)
+ALPACA_API_KEY=your_paper_key
+ALPACA_SECRET_KEY=your_paper_secret
+
+# Live credentials (only used when LIVE_TRADING=true)
+ALPACA_API_KEY_LIVE=your_live_key
+ALPACA_SECRET_KEY_LIVE=your_live_secret
+
+# Runtime flags
+LIVE_TRADING=false          # Set true only after preflight.py exits 0
+DRY_RUN=false               # Log orders without submitting
+LIVE_SIZE_MULTIPLIER=0.25   # Scale live position sizes to 25% at launch
 ```
