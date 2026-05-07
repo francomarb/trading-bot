@@ -23,6 +23,7 @@ import pytest
 from strategies.base import BaseStrategy, EdgeFilterDecision, OrderType, SignalFrame
 from strategies.rsi_reversion import RSIReversion
 from strategies.sma_crossover import SMACrossover
+from strategies.spy_options_reversion import SPYOptionsReversionStrategy
 
 
 # ── Helpers ──────────────────────────────────────────────────────────────────
@@ -355,6 +356,10 @@ class TestRequiredBars:
     def test_rsi_reversion_returns_period_plus_one(self):
         assert RSIReversion(period=14).required_bars() == 15
         assert RSIReversion(period=5).required_bars() == 6
+
+    def test_spy_options_reversion_returns_rsi_length_plus_five(self):
+        assert SPYOptionsReversionStrategy(rsi_length=14).required_bars() == 19
+        assert SPYOptionsReversionStrategy(rsi_length=5).required_bars() == 10
 
 
 # ── RSIReversion param validation ──────────────────────────────────────────

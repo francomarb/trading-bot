@@ -43,7 +43,6 @@ class SPYOptionsReversionStrategy(BaseStrategy):
         self._position_hwm: dict[str, float] = {}   # OCC → highest B-S value observed
         self._position_base: dict[str, float] = {}  # OCC → first B-S value observed
 
-    @property
     def required_bars(self) -> int:
         return self.rsi_length + 5
 
@@ -51,7 +50,7 @@ class SPYOptionsReversionStrategy(BaseStrategy):
 
     def _raw_signals(self, df: pd.DataFrame) -> SignalFrame:
         false_series = pd.Series(False, index=df.index)
-        if len(df) < self.required_bars:
+        if len(df) < self.required_bars():
             return SignalFrame(entries=false_series, exits=false_series)
 
         df = add_rsi(df, self.rsi_length)
