@@ -22,8 +22,8 @@
 | 8 | Trading Engine (Main Loop) | ✅ Complete |
 | 9 | Trade Reporting & P&L | ✅ Complete |
 | 9.5 | Forward-Test (Paper, Multi-Week) | ✅ Complete (merged into Phase 10) |
-| 10 | Pre-Live Stabilization & Paper Testing | 🔄 In Progress — SMA + RSI active in paper; running in tmux; awaiting 2-4 week paper validation and VPS provisioning before live transition |
-| 11 | Advanced Multi-Strategy Enhancements | ⬜ Not Started *(post-live / VPS deployment)* |
+| 10 | Pre-Live Stabilization & Paper Testing | 🔄 In Progress — SMA + RSI + Donchian + SPY Options active in paper; running in tmux; awaiting slippage calibration and VPS provisioning before live transition |
+| 11 | Advanced Multi-Strategy Enhancements | 🔄 In Progress — Telegram (11.13) and Dashboard (11.14) complete; remainder post-live |
 
 **Legend:** ⬜ Not Started · 🔄 In Progress · ✅ Complete
 
@@ -308,7 +308,7 @@ pre-live safeguards implemented.
 
 | # | Deliverable | Status |
 |---|---|---|
-| 9.5.1 | Run paper bot continuously for **minimum 2 weeks, target 4 weeks**, on target strategy + symbols | ⬜ (run `python forward_test.py`) |
+| 9.5.1 | Run paper bot continuously for **minimum 2 weeks, target 4 weeks**, on target strategy + symbols | ✅ (running since 2026-04-24; four strategies active as of 2026-05-06) |
 | 9.5.2 | `backtest/reconcile.py` — script that, given a date range, compares: (a) paper fills from trade DB vs. (b) backtest-predicted fills on the same bars | ✅ |
 | 9.5.3 | Report per-trade divergence: price deviation in bps, matched/unmatched fills | ✅ |
 | 9.5.4 | Report aggregate divergence: realized paper return vs. backtest return for the same window | ✅ |
@@ -332,7 +332,7 @@ promoted into Phase 10 blockers.
 ---
 
 ### Phase 10 — Pre-Live Stabilization & Paper Testing
-**Goal:** Run the multi-strategy portfolio (SMA + RSI) in a pure paper environment for 2-4 weeks to validate logic, guardrails, and slippage drift. We are **not** transitioning to live capital during this phase. The live transition will only occur once the forward-test is deemed satisfactory and a dedicated VPS server is provisioned and online.
+**Goal:** Run the multi-strategy portfolio (SMA + RSI + Donchian + SPY Options) in a pure paper environment for 2-4 weeks to validate logic, guardrails, and slippage drift. We are **not** transitioning to live capital during this phase. The live transition will only occur once the forward-test is deemed satisfactory and a dedicated VPS server is provisioned and online.
 
 **Implementation order matters.** Items are grouped by dependency and risk. Do not
 skip ahead. Each group must be paper-validated before the next begins.
@@ -419,13 +419,14 @@ skip ahead. Each group must be paper-validated before the next begins.
 | 10.F3b | **RSI edge filter** — `strategies/filters/rsi_reversion.py`. Four entry gates: (1) **SPY > 200 SMA AND SPY > 50 SMA** — dual macro gate; (2) **earnings blackout (3 days before / 2 days after)** — binary events and post-earnings follow-through; (3) **20-day avg volume ≥ 500K shares** — liquidity floor for limit-order fill quality; (4) **no new 20-day low** — blocks active individual stock breakdowns that the SPY gates cannot see. Stock 50-day SMA gate intentionally excluded: oversold RSI stocks are typically below their 50 SMA — filtering there removes exactly the trades the strategy is designed to take. Observability: `RSI_FILTER_ALLOWED` / `RSI_FILTER_BLOCKED` logged per signal with specific reasons. Phase 11 deferred: SPY 50 SMA cliff-edge smoothing (11.23). 58 filter unit tests. | Medium | 🔴 | ✅ (2026-04-25) |
 | 10.F4 | **RSI paper activation slot** — add `RSIReversion` to the paper engine with `settings.RSI_WATCHLIST`, RSI edge filter (10.F3b) wired in, strategy-specific allocation, limit-order behavior, and attribution verified. Do not enable live. | Medium | 🔴 | ✅ (2026-04-25) |
 | 10.F5 | **Minimum portfolio concentration guardrails** — deferred to Phase 11. Rationale: SMA and RSI watchlists have zero symbol overlap so shared-symbol double-exposure is moot; sector concentration risk is partially mitigated by the sleeve cap (max 5 positions × $8k) and regime gating; the real fix is watchlist curation rather than a code guardrail. See 11.6/11.7. | N/A | Moved to 11.6/11.7 |
-| 10.F6 | **Verified** — unit tests pass; startup reconciliation recomputes sleeve exposure before first entry; paper logs show both SMA and RSI gated by regime and allocation. | Operational | 🔴 | ⬜ |
+| 10.F6 | **Verified** — unit tests pass; startup reconciliation recomputes sleeve exposure before first entry; paper logs show all four strategies gated by regime and allocation. | Operational | 🔴 | ⬜ |
 | 10.F7 | **DonchianBreakout third strategy slot** (`strategies/donchian_breakout.py`) — Turtle System 1, Mid-range (30/15). Entry: N-day high breakout. Exit: M-day low reversal. `DonchianEdgeFilter`: stock > 200 SMA, IEX-scaled liquidity floor, short earnings blackout (1 day before / 0 days after). `allowed_regimes={TRENDING}` only — RANGING produces false breakouts. Sleeve: 0.25 weight, 5 max positions → $4k per position at $100k. Allocation rebalanced: SMA 0.50, RSI 0.25, Donchian 0.25 (RSI reduced from 0.50 — generated only ~8 trades over 4-year backtest period). Backtest (ai_bigtech 32-name universe, 2× ATR stops, 4y ending 2026-04-28): Sharpe +0.85, MeanRet +162.9%, 457 trades. `forward_test.py` wired with `CompositeEdgeFilter([DonchianEdgeFilter(), SectorMomentumFilter(..., sector_entry_policy="warn")])`. 916 total tests passing. | Medium | 🔴 | ✅ (2026-05-01) |
 | 10.F8 | **Regime detection graduated fallback** (`engine/trader.py`) — fixed bug where a single `detect()` exception left `current_regime=None` and bypassed all gating. New behavior: failure counter tracks consecutive exceptions; first failure reuses last known regime (WARNING log); after `REGIME_MAX_CONSECUTIVE_FAILURES` (default 3) consecutive failures falls back to BEAR (ERROR log, fail-closed); counter resets to 0 on success; no prior regime on first failure defaults to RANGING. `REGIME_MAX_CONSECUTIVE_FAILURES = 3` added to `config/settings.py`. 3 new engine regime tests. | Low | 🔴 | ✅ (2026-05-01) |
 | 10.F9 | **Sector Momentum Gauge** — `sector/resolver.py` + `sector/gauge.py`. Resolver maps ticker → sector via yfinance (industry-first normalization, JSON cache at `data/cache/sector_map.json`, hydrated at startup with retry/timeout). Gauge scores 12 sector ETFs as HOT/NEUTRAL/COLD (5-signal composite: SMA200, SMA50, golden cross, SMA50 distance, volume confirmation). `SectorMomentumFilter` adapter with configurable `sector_entry_policy` ("block"/"warn"/"pass"). `CompositeEdgeFilter` AND-chains any list of edge filters. Per-strategy policies: RSI `sector_entry_policy="block"` (cluster risk), SMA/Donchian `sector_entry_policy="warn"` (trend strategies can catch sector turns). All exits unaffected. 66 new tests (38 resolver + 28 gauge/filter/composite). | Medium | 🔴 | ✅ (2026-05-01) |
+| 10.F10 | **SPY Options RSI Reversion fourth strategy slot** (`strategies/spy_options_reversion.py`) — buys slightly-ITM SPY calls (0.55 delta, 14–28 DTE) when RSI recovers from oversold (<30 → crosses ≥30). `OptionsExecutionWorker` background thread handles bracket order execution (OTO limit entry + stop). Mid-trade exit guards: (1) time stop — exit by Wednesday 3:30 PM ET of expiry week; (2) Delta floor — exit if B-S Delta < 0.30; (3) trailing stop — activate once B-S value rises ≥10% above entry, trail 15% below HWM. `SPYOptionsEdgeFilter`: SPY > 100 SMA (fail-closed). Spread guard: reject if (ask−bid)/midpoint > 5%. Engine foundation: `_OCC_PAT` regex gates six engine paths; 100× P&L multiplier on all close paths; options exits use option premium not underlying price for `modeled_price`; stream stop fills normalize OCC → underlying for `_position_owners` lookup; `log_stop_fill` records confirmed bracket stop executions. Sleeve: 0.05 weight, 1 max position; allocation rebalanced SMA 0.45 / RSI 0.25 / Donchian 0.25 / Options 0.05. `forward_test.py` wired. 954 total tests passing. **Known limitation 11.23:** `_position_owners` keyed by underlying — two options strategies on the same underlying would collide. | High | 🔴 | ✅ (2026-05-06) |
 
-> **Pre-live three-strategy paper gate:** After Groups A-F are complete, run the combined
-> SMA + RSI + Donchian bot in Alpaca paper mode for **minimum 2 weeks, target 4 weeks**.
+> **Pre-live four-strategy paper gate:** After Groups A-F are complete, run the combined
+> SMA + RSI + Donchian + SPY Options bot in Alpaca paper mode for **minimum 2 weeks, target 4 weeks**.
 > The run must produce a documented GO/NO-GO report before any live flip.
 
 ---
@@ -611,15 +612,13 @@ trade DBs are separate files.
 ---
 
 ### Phase 11 — Advanced Multi-Strategy Portfolio Enhancements
-**Goal:** After the Phase 10 SMA + RSI pre-live gate is complete, improve portfolio
-intelligence beyond the minimum safe two-strategy launch: optional third strategy,
-dynamic allocation, richer concentration controls, health-based throttling, reporting,
-and intraday-specific infrastructure if needed.
+**Goal:** After the Phase 10 four-strategy pre-live gate is complete, improve portfolio
+intelligence: dynamic allocation, richer concentration controls, health-based throttling,
+additional strategies, and intraday-specific infrastructure if needed.
 
 **Boundary:** The critical pre-live subset moved into Phase 10 Group F. Regime detection,
-strategy regime gating, RSI paper activation, fixed per-strategy allocation, and minimum
-concentration guardrails are no longer Phase 11 nice-to-haves; they are blockers before
-SMA + RSI can trade live. Phase 11 should not be used to smuggle new complexity into the
+strategy regime gating, per-strategy allocation, and all four active strategy slots are
+Phase 10 deliverables. Phase 11 should not be used to smuggle new complexity into the
 pre-live checklist unless the item is promoted back into Phase 10 with a clear blocker
 reason.
 
@@ -637,16 +636,16 @@ reason.
 | 11.10 | **Strategy health monitor** — rolling expectancy + rolling Sharpe per strategy; automatic capital reduction or disable when performance degrades beyond a threshold. | ⬜ |
 | 11.11 | **Strategy re-enable workflow** — disabled strategies require manual review + a fresh paper forward-test before being re-enabled. | ⬜ |
 | 11.12 | **Kelly criterion for evidence-based sleeve weight optimization** — Use fractional Kelly to suggest strategy weights based on real trade win rates and win/loss ratios. Advisory only, for dashboard tracking. | ⬜ |
-| 11.13 | **Real-Time Mobile Awareness (Telegram Bot)** — implement a `TelegramAlertBackend` in `reporting/alerts.py`. Sends push notifications to a private channel for executed trades, regime shifts, end-of-day summaries, and kill-switch events. Optional: interactive commands (`/status`, `/halt`). | ⬜ |
-| 11.14 | **Read-Only Analytics Dashboard (Streamlit)** — a single `dashboard.py` running on the VPS to visualize bot internals. Connects to `trades.db` and daily P&L logs to chart equity curves, rolling Sharpe, strategy health, and active watchlists. Accessible via web browser. | ⬜ |
+| 11.13 | **Real-Time Mobile Awareness (Telegram Bot)** — implement a `TelegramAlertBackend` in `reporting/alerts.py`. Sends push notifications to a private channel for executed trades, regime shifts, end-of-day summaries, and kill-switch events. Optional: interactive commands (`/status`, `/halt`). | ✅ (2026-05-06 — `TelegramAlertBackend` + `TelegramCommandListener` with `/status` and `/halt` in `reporting/alerts.py`) |
+| 11.14 | **Read-Only Analytics Dashboard (Streamlit)** — a single `dashboard.py` running on the VPS to visualize bot internals. Connects to `trades.db` and daily P&L logs to chart equity curves, rolling Sharpe, strategy health, and active watchlists. Accessible via web browser. | ✅ (2026-05-06 — `dashboard.py`, 1025 lines; equity curve + rolling Sharpe + per-strategy P&L + sleeve allocation + positions + recent trades) |
 | 11.15 | **Event-based backtester for limit orders** — supplement `runner.py` with an event-driven harness that models limit order fill realism (price must touch and hold). Required for honest RSI reversion backtesting. | ⬜ |
-| 11.16 | **Third strategy (optional): Volatility Breakout** — range compression + breakout, gated to volatility-expansion regime. | ⬜ |
+| 11.16 | **Volatility Breakout strategy (optional fifth equity slot)** — range compression + breakout (BollingerSqueeze pattern), gated to volatility-expansion regime. Third slot is Donchian (active), fourth is SPY Options (active); this would be fifth. | ⬜ |
 | 11.17 | **Intraday market-data stream** — `StockDataStream` for real-time bars/quotes/trades (deferred until intraday strategy exists). | ⬜ |
 | 11.18 | **Incremental online signal generation** — deque-based algorithm that processes one new bar at a time (needed for intraday). | ⬜ |
 | 11.19 | **ML edge filter** — train a direction classifier on lagged log-return features; plug it into `edge_filter`. | ⬜ |
 | 11.20 | **Sentiment overlay** — bidirectional signal design using scored headlines/sentiment data to confirm or block entries. Negative sentiment has hard veto power; positive sentiment is additive confirmation only. | ⬜ |
 | 11.21 | **WebSocket Reconnection Loop & State Re-sync** — rebuild `execution/stream.py` with an `asyncio` auto-reconnect loop, exponential backoff, and heartbeat monitoring. Required for sub-second execution in options or intraday trading where REST fallback latency is unacceptable. | ⬜ |
-| 11.22 | **Phase 2 filter-decision migration** — complete the rollout of the new structured edge-filter decision contract (`allowed + reasons`) across active first-party filters after the mixed-mode Phase 1 observation window is deemed healthy. Phase 1 is complete: `BaseStrategy` now normalizes both legacy `pd.Series` filters and structured decision filters; `BollingerSqueezeEdgeFilter` is the first real migrated filter; engine snapshot and dashboard reason rendering work in mixed mode. The repo standard is now the structured contract; plain boolean `pd.Series` filters remain compatibility-only during the transition and should be treated as the old method being phased out. Phase 2 scope: migrate `SMAEdgeFilter`, `RSIEdgeFilter`, `DonchianEdgeFilter`, and `SectorMomentumFilter` off mutable `get_last_block_reasons()` side state; keep legacy `pd.Series` support only as compatibility scaffolding for trivial or external filters. Acceptance: active paper bot behavior unchanged, watchlist `Reason` column remains accurate, and the mutable side-channel can be removed from first-party filters. | ⬜ |
+| 11.22 | **Phase 2 filter-decision migration** — complete the rollout of the new structured edge-filter decision contract (`allowed + reasons`) across active first-party filters after the mixed-mode Phase 1 observation window is deemed healthy. Phase 1 is complete: `BaseStrategy` now normalizes both legacy `pd.Series` filters and structured decision filters; `BollingerSqueezeEdgeFilter` is the first real migrated filter; engine snapshot and dashboard reason rendering work in mixed mode. The repo standard is now the structured contract; plain boolean `pd.Series` filters remain compatibility-only during the transition and should be treated as the old method being phased out. Phase 2 scope: migrate `SMAEdgeFilter`, `RSIEdgeFilter`, `DonchianEdgeFilter`, and `SectorMomentumFilter` off mutable `get_last_block_reasons()` side state; keep legacy `pd.Series` support only as compatibility scaffolding for trivial or external filters. Acceptance: active paper bot behavior unchanged, watchlist `Reason` column remains accurate, and the mutable side-channel can be removed from first-party filters. | 🔄 (Phase 1 complete — see 2026-05-04 log entry; Phase 2 pending) |
 | 11.23 | **`_position_owners` OCC keying — prerequisite for same-underlying multi-strategy options** — `_position_owners` and `_entry_prices` in `engine/trader.py` are currently keyed by the underlying ticker (`"SPY"`) for all options positions. **Known limitation:** any two options strategies that trade options on the same underlying simultaneously will collide — the second strategy's fill overwrites the first's ownership record, leaving the first position unmanaged. Safe for any number of options strategies as long as each targets a distinct underlying. **When to do it:** before wiring a second options strategy that shares an underlying with an existing one. **Fix details:** rekey by the full OCC string instead of the underlying across ~12–15 call sites in `engine/trader.py`. The entry path requires a two-phase write: pre-register with the underlying at broker dispatch time (OCC string is not yet known), then swap the key to the confirmed OCC string inside `_drain_option_fills` when the async fill arrives. All other sites (`_detect_external_closes`, `_process_stream_stop_fills`, `_restore_ownership_from_db`) become simpler because the OCC → underlying normalization step is removed and the broker symbol is used directly. The `_position_owners` key type annotation widens to `dict[str, str]` (no type change — already `str`). Estimated effort: ~half a day + test updates. | ⬜ |
 
 **Exit Criteria:** Advanced portfolio enhancements run safely on top of the Phase 10
