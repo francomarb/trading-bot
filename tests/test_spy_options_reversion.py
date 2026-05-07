@@ -15,6 +15,8 @@ from zoneinfo import ZoneInfo
 import pandas as pd
 import pytest
 
+from strategies.base import EdgeFilterDecision
+from strategies.filters.spy_options_reversion import SPYOptionsEdgeFilter
 from strategies.spy_options_reversion import SPYOptionsReversionStrategy
 
 _ET = ZoneInfo("America/New_York")
@@ -63,6 +65,60 @@ class TestRawSignals:
         signals = strat._raw_signals(df)
         # At least one entry should fire during/after the recovery
         assert signals.entries.any()
+
+
+class TestSPYOptionsEdgeFilterDecision:
+    def test_returns_edge_filter_decision_when_allowed(self):
+        df = _make_df(30)
+        gate = pd.Series(True, index=df.index, dtype=bool)
+        edge = SPYOptionsEdgeFilter()
+        edge._spy_filter = MagicMock(return_value=gate)
+
+        decision = edge(df)
+
+        assert isinstance(decision, EdgeFilterDecision)
+        assert bool(decision.allowed.iloc[-1]) is True
+        assert decision.latest_reasons == []
+
+    def test_returns_edge_filter_decision_with_block_reason(self):
+        df = _make_df(30)
+        gate = pd.Series(False, index=df.index, dtype=bool)
+        edge = SPYOptionsEdgeFilter()
+        edge._spy_filter = MagicMock(return_value=gate)
+
+        decision = edge(df)
+
+        assert isinstance(decision, EdgeFilterDecision)
+        assert bool(decision.allowed.iloc[-1]) is False
+        assert decision.latest_reasons == ["SPY below 100 SMA (bear regime)"]
+
+
+class TestSPYOptionsStrategyEdgeFilterIntegration:
+    def test_raw_rsi_entry_can_be_vetoed_with_structured_reasons(self):
+        closes = [520.0] * 20 + [480.0] * 5 + [521.0]
+        idx = pd.date_range(
+            "2026-01-02 09:30",
+            periods=len(closes),
+            freq="5min",
+            tz="US/Eastern",
+        )
+        df = pd.DataFrame({"close": closes}, index=idx)
+
+        gate = pd.Series(False, index=df.index, dtype=bool)
+        edge = SPYOptionsEdgeFilter()
+        edge._spy_filter = MagicMock(return_value=gate)
+        strat = SPYOptionsReversionStrategy(
+            rsi_length=14,
+            rsi_threshold=30,
+            edge_filter=edge,
+        )
+
+        raw, filtered, edge_allowed, edge_reasons = strat.inspect_signals(df, symbol="SPY")
+
+        assert raw.entries.any()
+        assert not filtered.entries.any()
+        assert edge_allowed is False
+        assert edge_reasons == ["SPY below 100 SMA (bear regime)"]
 
 
 # ── inspect_open_positions: time stop ─────────────────────────────────────────
