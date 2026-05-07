@@ -205,7 +205,7 @@ class SPYOptionsReversionStrategy(BaseStrategy):
         req = OptionSnapshotRequest(symbol_or_symbols=occ_symbol)
 
         try:
-            snapshot = data_client.get_option_snapshots(req)
+            snapshot = data_client.get_option_snapshot(req)
         except Exception as e:
             raise ValueError(
                 f"OPRA snapshot unavailable for {occ_symbol}: {e}. "

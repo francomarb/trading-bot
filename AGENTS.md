@@ -124,6 +124,7 @@ sensitive values.
 - Config values (symbols, timeframes, thresholds) live in `config/settings.py`, never hardcoded.
 - Exceptions are caught and logged; the bot never silently swallows errors.
 - All monetary values are handled as `float`; quantities as `int` where Alpaca requires whole shares, or `float` for fractional.
+- If a code change completes, advances, or materially reframes a planned item already tracked in `PLAN.md`, update the relevant `PLAN.md` entry in the same workstream and include that plan sync in the same commit. Do not leave code and plan status out of sync for tracked roadmap items.
 
 ---
 

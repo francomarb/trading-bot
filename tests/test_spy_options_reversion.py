@@ -121,6 +121,30 @@ class TestSPYOptionsStrategyEdgeFilterIntegration:
         assert edge_reasons == ["SPY below 100 SMA (bear regime)"]
 
 
+class TestBuildOptionExecution:
+    def test_uses_sdk_singular_option_snapshot_method(self):
+        strat = SPYOptionsReversionStrategy()
+        occ_symbol = "SPY260521C00730000"
+        quote = SimpleNamespace(bid_price=4.80, ask_price=5.00)
+        snapshot_entry = SimpleNamespace(latest_quote=quote, latest_trade=None)
+        snapshot_payload = {occ_symbol: snapshot_entry}
+
+        with patch("strategies.spy_options_reversion.find_best_call", return_value=occ_symbol):
+            with patch("alpaca.data.historical.option.OptionHistoricalDataClient") as mock_client_cls:
+                client = mock_client_cls.return_value
+                client.get_option_snapshot.return_value = snapshot_payload
+
+                opt_sym, premium, take_profit, stop_loss = strat.build_option_execution(
+                    "SPY", 733.71
+                )
+
+        client.get_option_snapshot.assert_called_once()
+        assert opt_sym == occ_symbol
+        assert premium == 4.90
+        assert take_profit == 14.70
+        assert stop_loss == 3.68
+
+
 # ── inspect_open_positions: time stop ─────────────────────────────────────────
 
 class TestTimeStop:
