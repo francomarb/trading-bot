@@ -21,11 +21,15 @@ from unittest.mock import MagicMock
 
 import pandas as pd
 import pytest
+import requests
+from requests.adapters import HTTPAdapter
 
 from data import fetcher
 from data.fetcher import (
+    HTTP_TIMEOUT_SECONDS,
     DataValidationError,
     StaleDataError,
+    _TimeoutAdapter,
     _missing_ranges,
     _read_cache,
     _read_meta,
@@ -225,6 +229,53 @@ class TestCacheRoundTrip:
         # Write a bogus meta file; _read_meta should return (None, None), not crash.
         (tmp_cache_dir / "ABC_1Day_all.meta.json").write_text("not-json{{")
         assert _read_meta("ABC", "1Day", "all") == (None, None)
+
+
+class TestTimeoutAdapter:
+    def test_sets_default_timeout_when_missing(self, monkeypatch):
+        adapter = _TimeoutAdapter()
+        request = requests.Request("GET", "https://example.com").prepare()
+        captured: dict[str, object] = {}
+
+        def fake_send(self, req, **kwargs):
+            captured.update(kwargs)
+            return MagicMock()
+
+        monkeypatch.setattr(HTTPAdapter, "send", fake_send)
+
+        adapter.send(request)
+
+        assert captured["timeout"] == HTTP_TIMEOUT_SECONDS
+
+    def test_overrides_explicit_none_timeout(self, monkeypatch):
+        adapter = _TimeoutAdapter()
+        request = requests.Request("GET", "https://example.com").prepare()
+        captured: dict[str, object] = {}
+
+        def fake_send(self, req, **kwargs):
+            captured.update(kwargs)
+            return MagicMock()
+
+        monkeypatch.setattr(HTTPAdapter, "send", fake_send)
+
+        adapter.send(request, timeout=None)
+
+        assert captured["timeout"] == HTTP_TIMEOUT_SECONDS
+
+    def test_preserves_explicit_timeout(self, monkeypatch):
+        adapter = _TimeoutAdapter()
+        request = requests.Request("GET", "https://example.com").prepare()
+        captured: dict[str, object] = {}
+
+        def fake_send(self, req, **kwargs):
+            captured.update(kwargs)
+            return MagicMock()
+
+        monkeypatch.setattr(HTTPAdapter, "send", fake_send)
+
+        adapter.send(request, timeout=5)
+
+        assert captured["timeout"] == 5
 
 
 # ── _with_retry ──────────────────────────────────────────────────────────────

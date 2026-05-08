@@ -1044,6 +1044,10 @@ class AlpacaBroker:
             op_desc=f"stream_get_order_by_client_id({client_order_id})",
         )
 
+    def close_connections(self) -> None:
+        """Close idle broker HTTP connections between cycles."""
+        self._api._session.close()
+
     @staticmethod
     def _to_open_order(o) -> OpenOrder:
         # Handle both alpaca-py model objects and SimpleNamespace mocks.

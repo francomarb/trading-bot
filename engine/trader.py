@@ -616,6 +616,7 @@ class TradingEngine:
             # Close idle HTTP connections so they don't go stale during the
             # inter-cycle sleep (5 min default).  Fresh connections are cheap.
             close_connections()
+            self.broker.close_connections()
             self._last_cycle_end = time.monotonic()
 
     def _process_symbol(

@@ -91,7 +91,8 @@ class _TimeoutAdapter(HTTPAdapter):
     """HTTPAdapter that enforces a default timeout on every request."""
 
     def send(self, request, **kwargs):
-        kwargs.setdefault("timeout", HTTP_TIMEOUT_SECONDS)
+        if kwargs.get("timeout") is None:
+            kwargs["timeout"] = HTTP_TIMEOUT_SECONDS
         return super().send(request, **kwargs)
 
 

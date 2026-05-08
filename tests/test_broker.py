@@ -167,6 +167,17 @@ class TestPlaceOrderContract:
             broker.place_order(None)  # type: ignore[arg-type]
 
 
+class TestBrokerConnections:
+    def test_close_connections_closes_underlying_session(self):
+        api = MagicMock()
+        api._session = MagicMock()
+
+        broker = _broker_with_mock(api)
+        broker.close_connections()
+
+        api._session.close.assert_called_once_with()
+
+
 # ── place_order: kwargs built correctly ──────────────────────────────────────
 
 

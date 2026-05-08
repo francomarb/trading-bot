@@ -54,7 +54,7 @@ STREAM_RECONNECT_MAX_DELAY_SECONDS: float = float(
 # continuity while open paper positions exist. Remove them after the strategy
 # exits if they still fail the scan.
 SMA_WATCHLIST = [
-    "TERN", "GOOG", "WT", "TD", "IYZ", "RY", "MS",
+    "GOOG", "WT", "TD", "IYZ", "RY", "MS",
     "CM", "JAZZ", "BK", "BMO", "WDC", "FIGS", "VLUE",
     "MU", "NVDA", "AMD", "AMZN",
 ]
