@@ -28,7 +28,9 @@ _TRADE_COLUMNS = [
     "order_id", "strategy", "reason", "stop_price",
     "entry_reference_price", "modeled_slippage_bps",
     "realized_slippage_bps", "order_type", "status",
-    "requested_qty", "filled_qty",
+    "requested_qty", "filled_qty", "initial_stop_loss",
+    "initial_risk_per_share", "initial_risk_dollars",
+    "realized_pnl", "r_multiple", "entry_timestamp", "exit_timestamp",
 ]
 
 
@@ -331,7 +333,45 @@ class TestComputeStrategyStats:
 
 
 class TestComputeSleeveUsage:
-    def test_uses_market_value_not_position_count(self):
+    def test_uses_allocator_snapshot_when_available(self):
+        state = {
+            "allocator": {
+                "sma_crossover": {
+                    "target_budget": 36_000.0,
+                    "effective_budget": 41_400.0,
+                    "borrowed_budget": 5_400.0,
+                    "used": 1_250.0,
+                    "available": 40_150.0,
+                    "positions_open": 1,
+                    "hard_max_positions": 8,
+                    "max_position_notional": 16_560.0,
+                },
+                "rsi_reversion": {
+                    "target_budget": 40_000.0,
+                    "effective_budget": 40_000.0,
+                    "borrowed_budget": 0.0,
+                    "used": 900.0,
+                    "available": 39_100.0,
+                    "positions_open": 1,
+                    "hard_max_positions": 8,
+                    "max_position_notional": 16_000.0,
+                },
+            }
+        }
+        result = compute_sleeve_usage(
+            state,
+            equity=100_000.0,
+            allocations={},
+            total_gross_pct=0.80,
+        )
+        sma = result[result["Strategy"] == "sma_crossover"].iloc[0]
+        assert pytest.approx(sma["Target Budget"]) == 36_000.0
+        assert pytest.approx(sma["Effective Budget"]) == 41_400.0
+        assert pytest.approx(sma["Borrowed"]) == 5_400.0
+        assert pytest.approx(sma["Used Notional"]) == 1_250.0
+        assert pytest.approx(sma["Utilization"]) == 1_250.0 / 41_400.0
+
+    def test_falls_back_to_position_math_without_allocator_snapshot(self):
         state = {
             "positions_detail": {
                 "AAPL": {
@@ -349,8 +389,16 @@ class TestComputeSleeveUsage:
             }
         }
         allocations = {
-            "sma_crossover": {"weight": 0.50, "max_positions": 5},
-            "rsi_reversion": {"weight": 0.50, "max_positions": 5},
+            "sma_crossover": {
+                "target_pct": 0.50,
+                "hard_max_positions": 5,
+                "max_position_pct_of_sleeve": 0.40,
+            },
+            "rsi_reversion": {
+                "target_pct": 0.50,
+                "hard_max_positions": 5,
+                "max_position_pct_of_sleeve": 0.40,
+            },
         }
         result = compute_sleeve_usage(
             state,
@@ -360,7 +408,8 @@ class TestComputeSleeveUsage:
         )
         sma = result[result["Strategy"] == "sma_crossover"].iloc[0]
         rsi = result[result["Strategy"] == "rsi_reversion"].iloc[0]
-        assert pytest.approx(sma["Budget"]) == 40_000.0
+        assert pytest.approx(sma["Target Budget"]) == 40_000.0
+        assert pytest.approx(sma["Effective Budget"]) == 40_000.0
         assert pytest.approx(sma["Used Notional"]) == 1250.0
         assert pytest.approx(sma["Remaining"]) == 38_750.0
         assert pytest.approx(sma["Utilization"]) == 1250.0 / 40_000.0

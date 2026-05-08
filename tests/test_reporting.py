@@ -117,6 +117,11 @@ class TestTradeLogger:
         assert record.entry_reference_price == 150.0
         assert record.order_type == "market"
         assert record.status == "filled"
+        assert record.initial_stop_loss == 145.0
+        assert record.initial_risk_per_share == 5.0
+        assert record.initial_risk_dollars == 50.0
+        assert record.entry_timestamp is not None
+        assert record.exit_timestamp is None
 
     def test_slippage_calculation(self, sample_decision, sample_result):
         tl = TradeLogger(path="/dev/null")
@@ -146,6 +151,29 @@ class TestTradeLogger:
         assert record.strategy == "sma_crossover"
         assert record.reason == "exit signal"
         assert record.stop_price == 0.0
+        assert record.exit_timestamp is not None
+
+    def test_build_close_record_computes_realized_pnl_and_r(self, tmp_csv, sample_decision, sample_result):
+        tl = TradeLogger(path=tmp_csv)
+        tl.log(tl.build_record(sample_decision, sample_result, modeled_price=150.0))
+        close_result = OrderResult(
+            status=OrderStatus.FILLED,
+            order_id="sell-1",
+            symbol="AAPL",
+            requested_qty=10,
+            filled_qty=10,
+            avg_fill_price=160.0,
+            raw_status="filled",
+            message="filled 10 @ 160.0",
+        )
+        record = tl.build_close_record(
+            close_result,
+            strategy_name="sma_crossover",
+            modeled_price=160.0,
+        )
+        assert record.realized_pnl == pytest.approx(100.0)
+        assert record.initial_risk_dollars == pytest.approx(50.0)
+        assert record.r_multiple == pytest.approx(2.0)
 
     def test_as_dict_has_all_columns(self, sample_decision, sample_result):
         tl = TradeLogger(path="/dev/null")
@@ -195,6 +223,47 @@ class TestTradeLogger:
         # After close, read_all should still work (reconnects lazily)
         tl2 = TradeLogger(path=tmp_csv)
         assert len(tl2.read_all()) == 1
+
+    def test_existing_db_is_migrated_with_new_columns(self, tmp_csv):
+        conn = sqlite3.connect(tmp_csv)
+        conn.execute(
+            """
+            CREATE TABLE trades (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                timestamp TEXT NOT NULL,
+                symbol TEXT NOT NULL,
+                side TEXT NOT NULL,
+                qty REAL NOT NULL,
+                avg_fill_price REAL,
+                order_id TEXT,
+                strategy TEXT NOT NULL,
+                reason TEXT NOT NULL,
+                stop_price REAL,
+                entry_reference_price REAL,
+                modeled_slippage_bps REAL,
+                realized_slippage_bps REAL,
+                order_type TEXT,
+                status TEXT NOT NULL,
+                requested_qty REAL,
+                filled_qty REAL
+            )
+            """
+        )
+        conn.commit()
+        conn.close()
+
+        tl = TradeLogger(path=tmp_csv)
+        tl.read_all()
+
+        conn = sqlite3.connect(tmp_csv)
+        cols = {
+            row[1]
+            for row in conn.execute("PRAGMA table_info(trades)").fetchall()
+        }
+        conn.close()
+        assert "initial_risk_dollars" in cols
+        assert "r_multiple" in cols
+        assert "exit_timestamp" in cols
 
 
 # ── TestPnLTracker ──────────────────────────────────────────────────────────

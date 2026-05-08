@@ -363,7 +363,7 @@ All four strategies provide complementary coverage across market regimes:
 | Volatile crash | ❌ Blocked | ❌ Blocked | ❌ Blocked | ❌ Blocked |
 | Bear market | ❌ Blocked | ❌ Blocked | ❌ Blocked | ❌ Blocked |
 
-All four strategies share a single `RiskManager` and equity pool. Capital is divided by the `SleeveAllocator`: each strategy holds an independent sleeve. Idle sleeve capital stays locked to its strategy — no cross-borrowing until Phase 11.
+All four strategies share a single `RiskManager` and a portfolio allocator. The allocator splits deployable capital into a shared `equity` pool and an isolated options vault, then enforces per-strategy target budgets, concentration caps, and hard count ceilings. Risk sizing still lives in `RiskManager`; the allocator supplies strategy-level ceilings only.
 
 ---
 
@@ -372,23 +372,46 @@ All four strategies share a single `RiskManager` and equity pool. Capital is div
 Configured in `config/settings.py` under `STRATEGY_ALLOCATIONS`:
 
 ```python
+CAPITAL_POOLS = {
+    "equity": 0.95,
+    "isolated_options": 0.05,
+}
+
 STRATEGY_ALLOCATIONS = {
-    "sma_crossover":         {"weight": 0.45, "max_positions": 5},
-    "rsi_reversion":         {"weight": 0.25, "max_positions": 5},
-    "donchian_breakout":     {"weight": 0.25, "max_positions": 5},
-    "spy_options_reversion": {"weight": 0.05, "max_positions": 1},
+    "sma_crossover": {
+        "target_pct": 0.45, "type": "equity", "priority": 3,
+        "can_stretch": True, "hard_max_positions": 8,
+        "max_position_pct_of_sleeve": 0.40,
+    },
+    "rsi_reversion": {
+        "target_pct": 0.25, "type": "equity", "priority": 1,
+        "can_stretch": True, "hard_max_positions": 8,
+        "max_position_pct_of_sleeve": 0.40,
+    },
+    "donchian_breakout": {
+        "target_pct": 0.25, "type": "equity", "priority": 2,
+        "can_stretch": True, "hard_max_positions": 8,
+        "max_position_pct_of_sleeve": 0.40,
+    },
+    "spy_options_reversion": {
+        "target_pct": 0.05, "type": "isolated", "priority": 0,
+        "can_stretch": False, "hard_max_positions": 1,
+        "max_position_pct_of_sleeve": 1.00,
+    },
 }
 MAX_GROSS_EXPOSURE_PCT = 0.80
 ```
 
 At $100k paper equity:
 - Gross ceiling: $100k × 0.80 = $80,000
-- SMA sleeve: $80k × 0.45 = $36,000 → $7,200 per position
-- RSI sleeve: $80k × 0.25 = $20,000 → $4,000 per position
-- Donchian sleeve: $80k × 0.25 = $20,000 → $4,000 per position
-- Options sleeve: $80k × 0.05 = $4,000 → 1 position max
+- Equity pool: $80k × 0.95 = $76,000 shared by SMA / RSI / Donchian
+- Options vault: $80k × 0.05 = $4,000 reserved for SPY options
+- SMA target sleeve: $80k × 0.45 = $36,000, stretch cap $41,400, max single position $16,560
+- RSI target sleeve: $80k × 0.25 = $20,000, stretch cap $23,000, max single position $9,200
+- Donchian target sleeve: $80k × 0.25 = $20,000, stretch cap $23,000, max single position $9,200
+- Options target sleeve: $80k × 0.05 = $4,000, isolated, no stretch
 
-Current weights (45/25/25/5) reflect the options strategy being newly activated in paper. Rebalance after ≥ 4 weeks of combined four-strategy data based on per-strategy rolling Sharpe (Phase 11).
+Elastic borrowing is equity-only: idle equity capital may be borrowed up to 115% of target while total deployable utilization remains below 80%. `hard_max_positions` is now a safety ceiling, not the sizing formula.
 
 ---
 

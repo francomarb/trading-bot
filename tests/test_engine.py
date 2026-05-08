@@ -50,7 +50,7 @@ from risk.manager import (
     RiskManager,
     Side,
 )
-from strategies.base import BaseStrategy, EdgeFilterDecision, OrderType, SignalFrame
+from strategies.base import BaseStrategy, EdgeFilterDecision, OrderType, SignalFrame, StrategySlot
 from strategies.spy_options_reversion import OptionTradeRejected
 
 
@@ -1099,6 +1099,51 @@ class TestWatchlistStatuses:
         assert state["sector_heat"]["counts"]["hot"] == 2
         assert state["sector_heat"]["sectors"]["technology"]["score"] == 4
         assert state["sector_heat"]["symbol_map"]["technology"][0]["symbol"] == "AAPL"
+        assert state["allocator"] == {}
+        assert state["capital_pools"] == {}
+        assert state["pending_entry_notional"] == {"strategies": {}, "pools": {}}
+
+    def test_attribute_orders_uses_allocator_priority_when_symbols_overlap(
+        self, engine_factory
+    ):
+        from risk.allocator import SleeveAllocator
+
+        class LowPriorityStrategy(FakeStrategy):
+            name = "low_priority"
+
+        class HighPriorityStrategy(FakeStrategy):
+            name = "high_priority"
+
+        engine, _ = engine_factory()
+        engine.slots = [
+            StrategySlot(
+                strategy=LowPriorityStrategy(entries=[False], exits=[False]),
+                symbols=["AAPL"],
+            ),
+            StrategySlot(
+                strategy=HighPriorityStrategy(entries=[False], exits=[False]),
+                symbols=["AAPL"],
+            ),
+        ]
+        allocator = MagicMock(spec=SleeveAllocator)
+        allocator.strategy_priority.side_effect = lambda name: {
+            "high_priority": 0,
+            "low_priority": 5,
+        }[name]
+        engine._allocator = allocator
+
+        order = OpenOrder(
+            order_id="buy-1",
+            symbol="AAPL",
+            side=Side.BUY,
+            qty=10,
+            order_type=OrderType.LIMIT,
+            status="open",
+            submitted_at=T0,
+            limit_price=100.0,
+            stop_price=None,
+        )
+        assert engine._attribute_orders([order]) == {"buy-1": "high_priority"}
 
     def test_startup_repairs_missing_protective_stop(
         self, engine_factory, tmp_path
@@ -1372,6 +1417,13 @@ def _write_sell(tl: TradeLogger, symbol: str, strategy: str) -> None:
             status="filled",
             requested_qty=10,
             filled_qty=10,
+            initial_stop_loss=95.0,
+            initial_risk_per_share=5.0,
+            initial_risk_dollars=50.0,
+            realized_pnl=50.0,
+            r_multiple=1.0,
+            entry_timestamp="2026-04-22T10:00:00+00:00",
+            exit_timestamp="2026-04-23T10:00:00+00:00",
         )
     )
 

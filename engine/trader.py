@@ -527,7 +527,7 @@ class TradingEngine:
 
             self._watchlist_statuses = {}
             self._watchlist_reasons = {}
-            for slot in self.slots:
+            for slot in self._slots_by_priority():
                 # Per-slot regime gate: block new entries if current regime is
                 # not in the slot's allowed set. Exits always proceed.
                 entry_allowed = True
@@ -876,7 +876,7 @@ class TradingEngine:
                     signal_key, signal_bar, strategy_statuses, strategy_reasons, symbol
                 )
                 return None
-            notional_cap = sleeve.per_position_notional
+            notional_cap = sleeve.max_position_notional
 
         target_symbol = symbol
         target_price = latest_close
@@ -1336,17 +1336,30 @@ class TradingEngine:
         SleeveAllocator can count open limit orders against the correct sleeve.
         """
         result: dict[str, str] = {}
+        slots = self._slots_by_priority()
         for order in open_orders:
             if order.side is Side.SELL:
                 continue
             if order.symbol in self._position_owners:
                 # Close / reduce order for an existing position — skip.
                 continue
-            for slot in self.slots:
+            for slot in slots:
                 if order.symbol in slot.active_symbols():
                     result[order.order_id] = slot.strategy.name
                     break
         return result
+
+    def _slots_by_priority(self) -> list[StrategySlot]:
+        """Return slots ordered by allocator priority when available."""
+        if self._allocator is None:
+            return list(self.slots)
+        return sorted(
+            self.slots,
+            key=lambda slot: (
+                self._allocator.strategy_priority(slot.strategy.name),
+                self.slots.index(slot),
+            ),
+        )
 
     @staticmethod
     def _has_pending_close_order(symbol: str, snapshot: BrokerSnapshot) -> bool:
@@ -1853,6 +1866,35 @@ class TradingEngine:
                         if pos else None
                     ),
                 }
+
+            allocator_snapshot: dict[str, dict] = {"strategies": {}, "pools": {}}
+            sleeve_usage: dict[str, float] = {}
+            pending_entry_notional: dict[str, dict] = {
+                "strategies": {},
+                "pools": {},
+            }
+            if self._allocator is not None and self._last_snapshot is not None:
+                order_strategy = self._attribute_orders(self._last_snapshot.open_orders)
+                allocator_snapshot = self._allocator.snapshot(
+                    self._last_snapshot.account,
+                    self._last_snapshot.open_orders,
+                    self._position_owners,
+                    order_strategy,
+                )
+                sleeve_usage = {
+                    name: detail["used"]
+                    for name, detail in allocator_snapshot["strategies"].items()
+                }
+                pending_entry_notional = {
+                    "strategies": {
+                        name: detail["pending_entry_notional"]
+                        for name, detail in allocator_snapshot["strategies"].items()
+                    },
+                    "pools": {
+                        name: detail["pending_entry_notional"]
+                        for name, detail in allocator_snapshot["pools"].items()
+                    },
+                }
             state = {
                 "timestamp": datetime.now(timezone.utc).isoformat(),
                 "running": self._running,
@@ -1885,6 +1927,10 @@ class TradingEngine:
                 "session_pnl": equity - start_equity,
                 "open_positions": dict(self._position_owners),
                 "positions_detail": positions_detail,
+                "allocator": allocator_snapshot["strategies"],
+                "capital_pools": allocator_snapshot["pools"],
+                "pending_entry_notional": pending_entry_notional,
+                "sleeve_usage": sleeve_usage,
                 "watchlist_statuses": self._watchlist_statuses,
                 "watchlist_reasons": self._watchlist_reasons,
                 "sector_heat": self._sector_heat,
