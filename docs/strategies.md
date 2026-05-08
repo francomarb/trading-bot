@@ -84,6 +84,8 @@ A position closes when whichever of the following occurs first:
 
 There is no fixed take-profit target. The strategy lets winners run for as long as the trend holds and exits only when the trend reverses (crossunder) or the stop is hit.
 
+We intentionally do not add a trailing stop to SMA Crossover. The bearish crossunder already acts as the strategy's trend exit, and the 2x ATR stop already provides downside protection before the crossunder arrives. Adding a second trailing exit tends to reduce drawdown, but in testing it clipped winners more often than it improved overall risk-adjusted returns, so the strategy keeps the simpler crossunder-plus-ATR-stop design.
+
 **Watchlist (`SMA_WATCHLIST` in `config/settings.py`):**
 ```
 TERN, GOOG, WT, GOOGL, TD, IYZ, RY, MS, CM, JAZZ, BK, BMO, WDC, FIGS, VLUE, MU, NVDA

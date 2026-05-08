@@ -47,46 +47,7 @@ prioritization, and design guidance.
 
 ## 🔥 v1.1 — Immediate Post-Launch Improvements
 
-### 1. SMA Trailing Stop (High Impact)
-
-#### Problem
-
-SMA crossover exits are:
-
-- Slow
-- Lagging
-- Able to give back large gains
-
-#### Solution
-
-Add a **protective trailing stop**.
-
-#### Behavior
-
-Exit when:
-
-- Bearish crossover
-- Trailing stop hit
-
-#### Options
-
-ATR-based, recommended:
-
-- `stop = highest price - (2 * ATR)`
-
-Fixed percentage:
-
-- Example: 5% trailing
-
-#### Impact
-
-- Reduces drawdowns
-- Improves profit protection
-- Slightly reduces big winners
-
----
-
-### 2. RSI Filter Improvements
+### 1. RSI Filter Improvements
 
 #### Problem
 
@@ -112,7 +73,7 @@ Refine filters:
 
 ---
 
-### 3. Observability Upgrade
+### 2. Observability Upgrade
 
 #### Goal
 
@@ -142,7 +103,7 @@ Metrics:
 
 ## 🧭 v1.2 — Selection & Efficiency
 
-### 4. Dynamic Watchlist (Scanner)
+### 3. Dynamic Watchlist (Scanner)
 
 #### Problem
 
@@ -174,7 +135,7 @@ Universe → Scanner → Watchlist → Strategy
 
 ---
 
-### 5. Strategy Interaction Improvements
+### 4. Strategy Interaction Improvements
 
 #### Problem
 
@@ -199,7 +160,7 @@ Multiple strategies can:
 
 ## 🚀 v2.0 — New Strategy Layer (Real Edge Expansion)
 
-### 6. Breakout Strategy (High Value)
+### 5. Breakout Strategy (High Value)
 
 #### Concept
 
@@ -226,7 +187,7 @@ Buy strength, not weakness.
 
 ---
 
-### 7. Pullback-in-Trend Strategy (Hybrid)
+### 6. Pullback-in-Trend Strategy (Hybrid)
 
 #### Concept
 
@@ -254,7 +215,7 @@ Buy dips inside confirmed trends.
 
 ---
 
-### 8. Cross-Sectional Momentum
+### 7. Cross-Sectional Momentum
 
 #### Concept
 

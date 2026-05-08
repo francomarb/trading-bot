@@ -54,7 +54,7 @@ STREAM_RECONNECT_MAX_DELAY_SECONDS: float = float(
 # continuity while open paper positions exist. Remove them after the strategy
 # exits if they still fail the scan.
 SMA_WATCHLIST = [
-    "TERN", "GOOG", "WT", "GOOGL", "TD", "IYZ", "RY", "MS",
+    "TERN", "GOOG", "WT", "TD", "IYZ", "RY", "MS",
     "CM", "JAZZ", "BK", "BMO", "WDC", "FIGS", "VLUE",
     "MU", "NVDA", "PG",
 ]
@@ -108,7 +108,7 @@ DONCHIAN_WATCHLIST = [
     # AI infrastructure / data-centre buildout
     "ANET", "VRT",
     # Big Tech
-    "MSFT", "AAPL", "GOOGL", "META", "AMZN", "ORCL", "TSLA",
+    "MSFT", "AAPL", "GOOG", "META", "AMZN", "ORCL", "TSLA",
     # AI software (secondary)
     "PLTR", "CRWD", "NOW",
     # AI compute / quantum (post-IPO names with full 4y history)
