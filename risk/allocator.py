@@ -1,78 +1,18 @@
 """
-Capital sleeve allocator (Phase 10.F1 + HWM drawdown gate).
+Capital allocator with dual pools, elastic equity sleeves, and drawdown gate.
 
-Enforces per-strategy gross-notional budgets ("sleeves") derived from
-account equity and configurable allocation weights. Sits upstream of
-RiskManager.evaluate() — it narrows the capital available to a strategy
-without bypassing any global risk control.
+The allocator sits upstream of RiskManager and answers one question:
+"How much strategy capital is available for this new entry right now?"
 
-Design decisions (locked in 2026-04-25):
-  - Idle sleeve capital stays locked to its strategy (no cross-borrowing).
-    Dynamic reallocation is a Phase 11 item.
-  - Two strategies may hold the same symbol simultaneously (the user's
-    call: if both strategies are convinced it is the right trade, double
-    exposure is permitted). Sleeve accounting treats them independently.
-  - Open limit orders count against the sleeve at full notional (qty ×
-    limit_price). This is conservative but accurate: the capital is
-    genuinely committed until the order fills or is cancelled.
-
-Ownership model
----------------
-Positions  — attributed via `position_owners` (symbol → strategy_name),
-             maintained by the engine from the trade DB (10.C1).
-Orders     — attributed via `order_strategy` (order_id → strategy_name),
-             computed by the engine each cycle from watchlist membership
-             for pending buy entries (see engine._attribute_orders).
-
-Flow
-----
-  1. Engine calls allocator.check() before risk.evaluate().
-  2. allocator.check() returns SleeveCapacity (approved) or
-     SleeveRejection (max positions hit / sleeve full / unknown strategy /
-     strategy in HWM drawdown).
-  3. On approval, engine passes SleeveCapacity.per_position_notional as
-     `notional_cap` to risk.evaluate(), which caps position sizing to the
-     per-position budget without changing the risk interface.
-  4. Global caps in RiskManager (gross exposure, daily loss, kill
-     switches) remain fully authoritative — the allocator only narrows
-     the available notional, it never widens it.
-
-HWM drawdown gate (2026-05-01)
--------------------------------
-When `dd_threshold > 0`, the allocator tracks cumulative realized P&L
-per strategy. If a strategy's running P&L drops more than
-`dd_threshold × sleeve_budget` below its historical peak (high-water
-mark), new entries are paused until P&L recovers. Exits are never
-blocked. This stops a losing strategy from digging deeper across
-multiple sessions.
-
-  record_realized_pnl(strategy_name, pnl) must be called by the engine
-  whenever a position closes (signal-based, stop-out, or external close).
-
-Configuration (current format)
--------------------------------
-  STRATEGY_ALLOCATIONS = {
-      "sma_crossover":    {"weight": 0.50, "max_positions": 5},
-      "rsi_reversion":    {"weight": 0.25, "max_positions": 5},
-      "donchian_breakout": {"weight": 0.25, "max_positions": 5},
-  }
-  MAX_GROSS_EXPOSURE_PCT   = 0.80
-  STRATEGY_SLEEVE_DD_THRESHOLD = 0.15   # pause entries if down 15% of budget from HWM
-
-  At $100k equity:
-    SMA sleeve          = $100k × 0.80 × 0.50 = $40,000
-    SMA per-position    = $40,000 ÷ 5          =  $8,000
-    RSI sleeve          = $100k × 0.80 × 0.25 = $20,000
-    RSI per-position    = $20,000 ÷ 5          =  $4,000
-    Donchian sleeve     = $100k × 0.80 × 0.25 = $20,000
-    Donchian per-pos    = $20,000 ÷ 5          =  $4,000
-    Unallocated         =  0 % (fully allocated)
+RiskManager remains the sizing authority. It sizes from stop-risk first and
+then trims to the allocator-supplied notional ceiling.
 """
 
 from __future__ import annotations
 
 from dataclasses import dataclass
 from enum import Enum
+import re
 from typing import TYPE_CHECKING
 
 from loguru import logger
@@ -82,19 +22,28 @@ if TYPE_CHECKING:
     from risk.manager import AccountState
 
 
-# ── Return types ──────────────────────────────────────────────────────────────
+_OCC_OPTION_SYMBOL = re.compile(r"^[A-Z]{1,6}[0-9]{6}[CP][0-9]{8}$")
+
+
+def _contract_multiplier(symbol: str) -> int:
+    """Return the contract multiplier for equities vs OCC option symbols."""
+    return 100 if _OCC_OPTION_SYMBOL.match(symbol or "") else 1
+
+
+class PoolType(str, Enum):
+    EQUITY = "equity"
+    ISOLATED = "isolated"
 
 
 class SleeveRejectionCode(Enum):
-    SLEEVE_FULL          = "sleeve_full"
+    SLEEVE_FULL = "sleeve_full"
     SLEEVE_MAX_POSITIONS = "sleeve_max_positions"
-    UNKNOWN_STRATEGY     = "unknown_strategy"
-    SLEEVE_DRAWDOWN      = "sleeve_drawdown"
+    UNKNOWN_STRATEGY = "unknown_strategy"
+    SLEEVE_DRAWDOWN = "sleeve_drawdown"
 
 
 @dataclass(frozen=True)
 class SleeveRejection:
-    """Returned when a strategy's sleeve cannot accommodate a new entry."""
     strategy_name: str
     code: SleeveRejectionCode
     message: str
@@ -102,53 +51,36 @@ class SleeveRejection:
 
 @dataclass(frozen=True)
 class SleeveCapacity:
-    """
-    Returned when the sleeve has room for a new entry.
-
-    `per_position_notional` is passed to RiskManager.evaluate() as
-    `notional_cap` so every new position is capped to its fair share of
-    the sleeve budget, regardless of ATR-derived sizing.
-
-    Fields:
-        budget               — equity × total_gross_pct × weight
-        used                 — current gross exposure for this strategy
-                               (positions + pending buy orders)
-        available            — budget - used
-        positions_open       — positions currently owned by this strategy
-        max_positions        — configured cap on simultaneous positions
-        per_position_notional — budget / max_positions (the notional cap
-                               passed to risk.evaluate())
-    """
     strategy_name: str
-    budget:               float
-    used:                 float
-    available:            float
-    positions_open:       int
-    max_positions:        int
-    per_position_notional: float
+    pool_type: str
+    target_budget: float
+    effective_budget: float
+    borrowed_budget: float
+    used: float
+    available: float
+    positions_open: int
+    hard_max_positions: int
+    max_position_notional: float
 
 
-# ── Allocator ────────────────────────────────────────────────────────────────
+@dataclass(frozen=True)
+class PoolSnapshot:
+    pool_type: str
+    target_budget: float
+    used: float
+    available: float
+    utilization: float
+    pending_entry_notional: float
 
 
 class SleeveAllocator:
     """
-    Computes and enforces per-strategy capital sleeves.
-
-    Args:
-        allocations:        strategy_name → {"weight": float, "max_positions": int}.
-                            Weights must sum to ≤ 1.0. Unallocated weight
-                            (if sum < 1.0) sits idle.
-        total_gross_pct:    Fraction of equity available for all strategies
-                            combined. Should match RiskManager.max_gross_exposure_pct
-                            so the two controls are consistent.
-        min_trade_notional: Minimum remaining sleeve budget to permit a new
-                            entry (prevents tiny residual positions). Default $100.
-        dd_threshold:       High-water-mark drawdown gate. If a strategy's
-                            cumulative realized P&L drops more than
-                            `dd_threshold × sleeve_budget` below its peak,
-                            new entries are paused. 0.0 disables the gate
-                            (default). Must be in [0, 1).
+    Capital allocator with:
+      - dual pools: shared equity + isolated options
+      - elastic equity borrowing
+      - strategy priority metadata
+      - strategy-level HWM drawdown pause
+      - hard position-count ceiling separate from sizing
     """
 
     def __init__(
@@ -156,38 +88,14 @@ class SleeveAllocator:
         allocations: dict[str, dict],
         *,
         total_gross_pct: float,
+        capital_pools: dict[str, float],
+        stretch_utilization_threshold: float,
+        default_stretch_pct: float,
         min_trade_notional: float = 100.0,
         dd_threshold: float = 0.0,
     ) -> None:
         if not allocations:
             raise ValueError("allocations must not be empty")
-
-        self._entries: dict[str, dict] = {}
-        for name, cfg in allocations.items():
-            if not isinstance(cfg, dict):
-                raise TypeError(
-                    f"allocations['{name}'] must be a dict with 'weight' and "
-                    f"'max_positions' keys, got {type(cfg).__name__}"
-                )
-            if "weight" not in cfg:
-                raise ValueError(f"allocations['{name}'] missing 'weight' key")
-            if "max_positions" not in cfg:
-                raise ValueError(f"allocations['{name}'] missing 'max_positions' key")
-            if cfg["max_positions"] < 1:
-                raise ValueError(
-                    f"allocations['{name}']['max_positions'] must be ≥ 1, "
-                    f"got {cfg['max_positions']}"
-                )
-            self._entries[name] = {
-                "weight": float(cfg["weight"]),
-                "max_positions": int(cfg["max_positions"]),
-            }
-
-        total_weight = sum(e["weight"] for e in self._entries.values())
-        if total_weight > 1.0 + 1e-6:
-            raise ValueError(
-                f"allocation weights sum to {total_weight:.4f} — must be ≤ 1.0"
-            )
         if not (0.0 < total_gross_pct <= 1.0):
             raise ValueError(
                 f"total_gross_pct must be in (0, 1], got {total_gross_pct}"
@@ -195,77 +103,203 @@ class SleeveAllocator:
         if min_trade_notional <= 0:
             raise ValueError("min_trade_notional must be > 0")
         if not (0.0 <= dd_threshold < 1.0):
+            raise ValueError(f"dd_threshold must be in [0, 1), got {dd_threshold}")
+        if not (0.0 < stretch_utilization_threshold <= 1.0):
             raise ValueError(
-                f"dd_threshold must be in [0, 1), got {dd_threshold}"
+                "stretch_utilization_threshold must be in (0, 1]"
+            )
+        if default_stretch_pct < 0:
+            raise ValueError("default_stretch_pct must be >= 0")
+
+        required_pools = {PoolType.EQUITY.value, "isolated_options"}
+        if set(capital_pools) != required_pools:
+            raise ValueError(
+                f"capital_pools must define exactly {sorted(required_pools)}, "
+                f"got {sorted(capital_pools)}"
+            )
+
+        pool_total = sum(float(v) for v in capital_pools.values())
+        if abs(pool_total - 1.0) > 1e-6:
+            raise ValueError(
+                f"capital_pools sum to {pool_total:.4f} — must equal 1.0"
+            )
+
+        self._capital_pools = {
+            PoolType.EQUITY.value: float(capital_pools[PoolType.EQUITY.value]),
+            "isolated_options": float(capital_pools["isolated_options"]),
+        }
+        self._entries: dict[str, dict] = {}
+        priorities: set[int] = set()
+        target_total = 0.0
+        equity_total = 0.0
+        isolated_total = 0.0
+        for name, cfg in allocations.items():
+            if not isinstance(cfg, dict):
+                raise TypeError(
+                    f"allocations['{name}'] must be a dict, got {type(cfg).__name__}"
+                )
+
+            missing = {
+                "target_pct",
+                "type",
+                "priority",
+                "can_stretch",
+                "hard_max_positions",
+                "max_position_pct_of_sleeve",
+            } - set(cfg)
+            if missing:
+                raise ValueError(
+                    f"allocations['{name}'] missing keys: {sorted(missing)}"
+                )
+
+            target_pct = float(cfg["target_pct"])
+            pool_type = str(cfg["type"])
+            priority = int(cfg["priority"])
+            can_stretch = bool(cfg["can_stretch"])
+            hard_max_positions = int(cfg["hard_max_positions"])
+            max_position_pct = float(cfg["max_position_pct_of_sleeve"])
+            stretch_pct = float(cfg.get("stretch_pct", default_stretch_pct))
+
+            if pool_type not in {PoolType.EQUITY.value, PoolType.ISOLATED.value}:
+                raise ValueError(
+                    f"allocations['{name}']['type'] must be 'equity' or 'isolated', "
+                    f"got {pool_type!r}"
+                )
+            if priority < 0:
+                raise ValueError(
+                    f"allocations['{name}']['priority'] must be >= 0, got {priority}"
+                )
+            if priority in priorities:
+                raise ValueError(f"duplicate strategy priority {priority}")
+            priorities.add(priority)
+            if hard_max_positions < 1:
+                raise ValueError(
+                    f"allocations['{name}']['hard_max_positions'] must be >= 1, "
+                    f"got {hard_max_positions}"
+                )
+            if not (0.0 < target_pct <= 1.0):
+                raise ValueError(
+                    f"allocations['{name}']['target_pct'] must be in (0, 1], "
+                    f"got {target_pct}"
+                )
+            if not (0.0 < max_position_pct <= 1.0):
+                raise ValueError(
+                    f"allocations['{name}']['max_position_pct_of_sleeve'] must be in "
+                    f"(0, 1], got {max_position_pct}"
+                )
+            if stretch_pct < 0:
+                raise ValueError(
+                    f"allocations['{name}']['stretch_pct'] must be >= 0, got {stretch_pct}"
+                )
+            if pool_type == PoolType.ISOLATED.value and can_stretch:
+                raise ValueError(
+                    f"allocations['{name}'] is isolated and cannot stretch"
+                )
+
+            self._entries[name] = {
+                "target_pct": target_pct,
+                "pool_type": pool_type,
+                "priority": priority,
+                "can_stretch": can_stretch,
+                "hard_max_positions": hard_max_positions,
+                "max_position_pct_of_sleeve": max_position_pct,
+                "stretch_pct": stretch_pct,
+            }
+            target_total += target_pct
+            if pool_type == PoolType.EQUITY.value:
+                equity_total += target_pct
+            else:
+                isolated_total += target_pct
+
+        if abs(target_total - 1.0) > 1e-6:
+            raise ValueError(
+                f"strategy target_pct values sum to {target_total:.4f} — must equal 1.0"
+            )
+        if abs(equity_total - self._capital_pools[PoolType.EQUITY.value]) > 1e-6:
+            raise ValueError(
+                "equity strategy target_pct total must match CAPITAL_POOLS['equity']"
+            )
+        if abs(isolated_total - self._capital_pools["isolated_options"]) > 1e-6:
+            raise ValueError(
+                "isolated strategy target_pct total must match "
+                "CAPITAL_POOLS['isolated_options']"
             )
 
         self._total_gross_pct = total_gross_pct
-        self._min_notional    = min_trade_notional
-        self._dd_threshold    = dd_threshold
-
-        # HWM drawdown gate state — updated by record_realized_pnl().
-        # Keyed by strategy_name; initialized to 0.0 (break-even) for all
-        # configured strategies so the HWM starts at par, not negative.
-        self._strategy_realized_pnl: dict[str, float] = {
-            name: 0.0 for name in self._entries
-        }
-        self._strategy_pnl_hwm: dict[str, float] = {
-            name: 0.0 for name in self._entries
-        }
-
-    # ── Public API ────────────────────────────────────────────────────────────
+        self._stretch_utilization_threshold = stretch_utilization_threshold
+        self._default_stretch_pct = default_stretch_pct
+        self._min_notional = min_trade_notional
+        self._dd_threshold = dd_threshold
+        self._strategy_realized_pnl = {name: 0.0 for name in self._entries}
+        self._strategy_pnl_hwm = {name: 0.0 for name in self._entries}
 
     def record_realized_pnl(self, strategy_name: str, pnl: float) -> None:
-        """
-        Record a realized P&L event for a strategy (called by the engine on
-        every position close — signal-based exit, ATR stop, or external close).
-
-        Updates the running cumulative P&L and advances the HWM when the
-        strategy is at a new equity peak. If the gate subsequently trips,
-        check() returns SLEEVE_DRAWDOWN until P&L recovers.
-
-        Unknown strategy names are silently ignored (defensive — should not
-        happen in normal operation).
-        """
         if strategy_name not in self._strategy_realized_pnl:
             logger.warning(
                 f"record_realized_pnl: unknown strategy '{strategy_name}' — ignored"
             )
             return
 
-        prev = self._strategy_realized_pnl[strategy_name]
-        self._strategy_realized_pnl[strategy_name] = prev + pnl
-
-        # Advance HWM only on improvement.
+        self._strategy_realized_pnl[strategy_name] += pnl
         running = self._strategy_realized_pnl[strategy_name]
         if running > self._strategy_pnl_hwm[strategy_name]:
             self._strategy_pnl_hwm[strategy_name] = running
 
         logger.debug(
-            f"[{strategy_name}] realized_pnl update: "
-            f"trade={pnl:+.2f} cumulative={running:+.2f} "
-            f"hwm={self._strategy_pnl_hwm[strategy_name]:+.2f}"
+            f"[{strategy_name}] realized_pnl update: trade={pnl:+.2f} "
+            f"cumulative={running:+.2f} hwm={self._strategy_pnl_hwm[strategy_name]:+.2f}"
         )
 
+    def pnl_summary(self) -> dict[str, dict[str, float]]:
+        return {
+            name: {
+                "realized_pnl": self._strategy_realized_pnl[name],
+                "hwm": self._strategy_pnl_hwm[name],
+            }
+            for name in self._entries
+        }
+
+    def restore_pnl_summary(self, summary: dict[str, dict[str, float]]) -> None:
+        """Restore cumulative realized P&L / HWM state, typically from the trade log."""
+        for name in self._entries:
+            restored = summary.get(name, {})
+            realized_pnl = float(restored.get("realized_pnl", 0.0))
+            hwm = max(float(restored.get("hwm", 0.0)), realized_pnl)
+            self._strategy_realized_pnl[name] = realized_pnl
+            self._strategy_pnl_hwm[name] = hwm
+            logger.debug(
+                f"[{name}] restored allocator pnl state: "
+                f"cumulative={realized_pnl:+.2f} hwm={hwm:+.2f}"
+            )
+
+    def strategies(self) -> list[str]:
+        return list(self._entries.keys())
+
+    def strategy_priority(self, strategy_name: str) -> int:
+        entry = self._entries.get(strategy_name)
+        if entry is None:
+            return 1_000_000
+        return int(entry["priority"])
+
+    def strategy_pool_type(self, strategy_name: str) -> str | None:
+        entry = self._entries.get(strategy_name)
+        if entry is None:
+            return None
+        return str(entry["pool_type"])
+
+    def target_budget(self, strategy_name: str, equity: float) -> float:
+        entry = self._entries.get(strategy_name)
+        if entry is None:
+            return 0.0
+        return equity * self._total_gross_pct * float(entry["target_pct"])
+
     def is_strategy_in_drawdown(self, strategy_name: str, equity: float) -> bool:
-        """
-        Return True if the strategy's cumulative realized P&L is more than
-        `dd_threshold × sleeve_budget` below its HWM.
-
-        Returns False when the gate is disabled (dd_threshold == 0) or the
-        strategy is unknown.
-        """
-        if self._dd_threshold == 0.0:
+        if self._dd_threshold == 0.0 or strategy_name not in self._entries:
             return False
-        if strategy_name not in self._entries:
-            return False
-
-        budget  = self._sleeve_budget_for(strategy_name, equity)
+        target_budget = self.target_budget(strategy_name, equity)
         running = self._strategy_realized_pnl[strategy_name]
-        hwm     = self._strategy_pnl_hwm[strategy_name]
-        gap     = hwm - running          # positive when below HWM
-        trigger = self._dd_threshold * budget
-        return gap > trigger
+        hwm = self._strategy_pnl_hwm[strategy_name]
+        return (hwm - running) > (self._dd_threshold * target_budget)
 
     def check(
         self,
@@ -275,86 +309,39 @@ class SleeveAllocator:
         position_owners: dict[str, str],
         order_strategy: dict[str, str],
     ) -> SleeveCapacity | SleeveRejection:
-        """
-        Check whether strategy_name has sleeve room for a new entry.
-
-        Checks (in order):
-          1. Unknown strategy       → UNKNOWN_STRATEGY rejection.
-          2. HWM drawdown gate      → SLEEVE_DRAWDOWN rejection (if enabled
-                                      and strategy P&L is below threshold).
-          3. Position count at limit → SLEEVE_MAX_POSITIONS rejection.
-          4. Remaining budget low   → SLEEVE_FULL rejection.
-          5. All clear              → SleeveCapacity.
-
-        Args:
-            strategy_name:   The strategy requesting a new entry.
-            account:         Current account state (equity + open positions).
-            open_orders:     All open broker orders this cycle.
-            position_owners: symbol → strategy_name (engine's ownership map).
-            order_strategy:  order_id → strategy_name for pending buy entries,
-                             computed by the engine from watchlist membership.
-
-        Returns:
-            SleeveCapacity  — approved; pass .per_position_notional to
-                              risk.evaluate() as notional_cap.
-            SleeveRejection — blocked; log and skip this symbol.
-        """
         if strategy_name not in self._entries:
             return SleeveRejection(
                 strategy_name=strategy_name,
                 code=SleeveRejectionCode.UNKNOWN_STRATEGY,
                 message=(
-                    f"no sleeve defined for '{strategy_name}'; "
-                    f"known: {sorted(self._entries)}"
+                    f"no sleeve defined for '{strategy_name}'; known: "
+                    f"{sorted(self._entries)}"
                 ),
             )
 
-        entry         = self._entries[strategy_name]
-        weight        = entry["weight"]
-        max_positions = entry["max_positions"]
-        budget        = account.equity * self._total_gross_pct * weight
-        per_position_notional = budget / max_positions
-
-        # Count positions currently owned by this strategy.
-        positions_open = sum(
-            1 for strat in position_owners.values() if strat == strategy_name
+        snapshot = self._strategy_snapshot(
+            strategy_name,
+            account,
+            open_orders,
+            position_owners,
+            order_strategy,
         )
-
-        used      = self._used_notional(
-            strategy_name, account, open_orders, position_owners, order_strategy
-        )
-        available = budget - used
-
-        # HWM drawdown gate diagnostic — always log at DEBUG regardless of gate state.
-        if self._dd_threshold > 0.0:
-            running = self._strategy_realized_pnl.get(strategy_name, 0.0)
-            hwm     = self._strategy_pnl_hwm.get(strategy_name, 0.0)
-            trigger = self._dd_threshold * budget
-            logger.debug(
-                f"[{strategy_name}] DD gate — "
-                f"realized={running:+.2f} hwm={hwm:+.2f} "
-                f"gap={hwm - running:.2f} trigger={trigger:.2f}"
-            )
 
         logger.debug(
             f"[{strategy_name}] sleeve check — "
-            f"budget=${budget:,.0f} used=${used:,.0f} available=${available:,.0f} "
-            f"positions={positions_open}/{max_positions} "
-            f"per_pos=${per_position_notional:,.0f}"
+            f"target=${snapshot.target_budget:,.0f} "
+            f"effective=${snapshot.effective_budget:,.0f} "
+            f"borrowed=${snapshot.borrowed_budget:,.0f} "
+            f"used=${snapshot.used:,.0f} "
+            f"available=${snapshot.available:,.0f} "
+            f"positions={snapshot.positions_open}/{snapshot.hard_max_positions} "
+            f"max_pos=${snapshot.max_position_notional:,.0f}"
         )
 
-        # Check 1: HWM drawdown gate.
         if self.is_strategy_in_drawdown(strategy_name, account.equity):
             running = self._strategy_realized_pnl[strategy_name]
-            hwm     = self._strategy_pnl_hwm[strategy_name]
-            trigger = self._dd_threshold * budget
-            logger.warning(
-                f"[{strategy_name}] SLEEVE_DRAWDOWN — new entries paused: "
-                f"realized_pnl={running:+.2f} hwm={hwm:+.2f} "
-                f"gap={hwm - running:.2f} > trigger={trigger:.2f} "
-                f"({self._dd_threshold*100:.0f}% of ${budget:,.0f} budget). "
-                f"Entries resume when P&L recovers."
-            )
+            hwm = self._strategy_pnl_hwm[strategy_name]
+            trigger = self._dd_threshold * snapshot.target_budget
             return SleeveRejection(
                 strategy_name=strategy_name,
                 code=SleeveRejectionCode.SLEEVE_DRAWDOWN,
@@ -365,67 +352,194 @@ class SleeveAllocator:
                 ),
             )
 
-        # Check 2: position count limit.
-        if positions_open >= max_positions:
+        if snapshot.positions_open >= snapshot.hard_max_positions:
             return SleeveRejection(
                 strategy_name=strategy_name,
                 code=SleeveRejectionCode.SLEEVE_MAX_POSITIONS,
                 message=(
-                    f"max positions reached — {positions_open}/{max_positions} open "
-                    f"(budget=${budget:,.0f})"
+                    "hard max positions reached — "
+                    f"{snapshot.positions_open}/{snapshot.hard_max_positions} open "
+                    f"(available=${snapshot.available:,.0f})"
                 ),
             )
 
-        # Check 3: remaining budget.
-        if available < self._min_notional:
+        if snapshot.available < self._min_notional:
             return SleeveRejection(
                 strategy_name=strategy_name,
                 code=SleeveRejectionCode.SLEEVE_FULL,
                 message=(
-                    f"sleeve full — budget=${budget:,.0f}, "
-                    f"used=${used:,.0f}, available=${available:,.0f} "
+                    f"sleeve full — effective_budget=${snapshot.effective_budget:,.0f}, "
+                    f"used=${snapshot.used:,.0f}, available=${snapshot.available:,.0f} "
                     f"(min_trade=${self._min_notional:,.0f})"
                 ),
             )
 
+        return snapshot
+
+    def snapshot(
+        self,
+        account: "AccountState",
+        open_orders: list["OpenOrder"],
+        position_owners: dict[str, str],
+        order_strategy: dict[str, str],
+    ) -> dict[str, dict]:
+        strategies: dict[str, dict] = {}
+        pending_strategy_notional = self._pending_order_notional_by_strategy(
+            open_orders,
+            order_strategy,
+        )
+        for name in self._entries:
+            cap = self._strategy_snapshot(
+                name,
+                account,
+                open_orders,
+                position_owners,
+                order_strategy,
+            )
+            strategies[name] = {
+                "pool_type": cap.pool_type,
+                "priority": self._entries[name]["priority"],
+                "target_budget": cap.target_budget,
+                "effective_budget": cap.effective_budget,
+                "borrowed_budget": cap.borrowed_budget,
+                "used": cap.used,
+                "available": cap.available,
+                "positions_open": cap.positions_open,
+                "hard_max_positions": cap.hard_max_positions,
+                "max_position_notional": cap.max_position_notional,
+                "pending_entry_notional": pending_strategy_notional.get(name, 0.0),
+            }
+
+        pools: dict[str, dict] = {}
+        pool_pending = {
+            PoolType.EQUITY.value: 0.0,
+            "isolated_options": 0.0,
+        }
+        for strategy_name, notional in pending_strategy_notional.items():
+            pool_name = self._pool_name_for_strategy(strategy_name)
+            pool_pending[pool_name] += notional
+
+        for pool_type, share in self._capital_pools.items():
+            target_budget = account.equity * self._total_gross_pct * share
+            used = self._pool_used_notional(
+                pool_type,
+                account,
+                open_orders,
+                position_owners,
+                order_strategy,
+            )
+            available = max(0.0, target_budget - used)
+            pools[pool_type] = {
+                "target_budget": target_budget,
+                "used": used,
+                "available": available,
+                "utilization": (used / target_budget) if target_budget > 0 else 0.0,
+                "pending_entry_notional": pool_pending.get(pool_type, 0.0),
+            }
+
+        return {"strategies": strategies, "pools": pools}
+
+    def _strategy_snapshot(
+        self,
+        strategy_name: str,
+        account: "AccountState",
+        open_orders: list["OpenOrder"],
+        position_owners: dict[str, str],
+        order_strategy: dict[str, str],
+    ) -> SleeveCapacity:
+        entry = self._entries[strategy_name]
+        pool_type = entry["pool_type"]
+        target_budget = self.target_budget(strategy_name, account.equity)
+        used = self._used_notional(
+            strategy_name,
+            account,
+            open_orders,
+            position_owners,
+            order_strategy,
+        )
+        positions_open = sum(
+            1 for owner in position_owners.values() if owner == strategy_name
+        )
+        effective_budget = target_budget
+        borrowed_budget = 0.0
+        if pool_type == PoolType.EQUITY.value and entry["can_stretch"]:
+            deployable_capital = account.equity * self._total_gross_pct
+            pool_budget = deployable_capital * self._capital_pools[pool_type]
+            pool_used = self._pool_used_notional(
+                pool_type,
+                account,
+                open_orders,
+                position_owners,
+                order_strategy,
+            )
+            pool_slack = max(0.0, pool_budget - pool_used)
+            utilization = (
+                self._total_used_notional(
+                    account,
+                    open_orders,
+                    position_owners,
+                    order_strategy,
+                ) / deployable_capital
+                if deployable_capital > 0 else 1.0
+            )
+            if utilization < self._stretch_utilization_threshold and pool_slack > 0:
+                stretch_cap = target_budget * (1.0 + entry["stretch_pct"])
+                effective_budget = min(stretch_cap, target_budget + pool_slack)
+                borrowed_budget = max(0.0, effective_budget - target_budget)
+
+        available = max(0.0, effective_budget - used)
+        max_position_notional = min(
+            available,
+            effective_budget * entry["max_position_pct_of_sleeve"],
+        )
         return SleeveCapacity(
             strategy_name=strategy_name,
-            budget=budget,
+            pool_type=pool_type,
+            target_budget=target_budget,
+            effective_budget=effective_budget,
+            borrowed_budget=borrowed_budget,
             used=used,
             available=available,
             positions_open=positions_open,
-            max_positions=max_positions,
-            per_position_notional=per_position_notional,
+            hard_max_positions=entry["hard_max_positions"],
+            max_position_notional=max_position_notional,
         )
 
-    def sleeve_budget(self, strategy_name: str, equity: float) -> float:
-        """Gross notional ceiling for a strategy at the given equity level."""
-        return self._sleeve_budget_for(strategy_name, equity)
+    def _pool_name_for_strategy(self, strategy_name: str) -> str:
+        strategy_pool = self._entries[strategy_name]["pool_type"]
+        return strategy_pool if strategy_pool == PoolType.EQUITY.value else "isolated_options"
 
-    def strategies(self) -> list[str]:
-        """Names of all configured strategies."""
-        return list(self._entries.keys())
+    def _position_notional_by_strategy(
+        self,
+        account: "AccountState",
+        position_owners: dict[str, str],
+    ) -> dict[str, float]:
+        totals = {name: 0.0 for name in self._entries}
+        for symbol, pos in account.open_positions.items():
+            owner = position_owners.get(symbol)
+            if owner in totals:
+                totals[owner] += abs(pos.market_value)
+        return totals
 
-    def pnl_summary(self) -> dict[str, dict[str, float]]:
-        """
-        Return per-strategy P&L tracking state. Useful for logging and
-        diagnostics. Keys: strategy_name → {"realized_pnl", "hwm"}.
-        """
-        return {
-            name: {
-                "realized_pnl": self._strategy_realized_pnl[name],
-                "hwm": self._strategy_pnl_hwm[name],
-            }
-            for name in self._entries
-        }
+    def _pending_order_notional_by_strategy(
+        self,
+        open_orders: list["OpenOrder"],
+        order_strategy: dict[str, str],
+    ) -> dict[str, float]:
+        totals = {name: 0.0 for name in self._entries}
+        for order in open_orders:
+            strategy_name = order_strategy.get(order.order_id)
+            if strategy_name not in totals:
+                continue
+            from risk.manager import Side
 
-    # ── Internal ──────────────────────────────────────────────────────────────
-
-    def _sleeve_budget_for(self, strategy_name: str, equity: float) -> float:
-        entry = self._entries.get(strategy_name)
-        if entry is None:
-            return 0.0
-        return equity * self._total_gross_pct * entry["weight"]
+            if order.side is not Side.BUY:
+                continue
+            price = float(order.limit_price or 0.0)
+            totals[strategy_name] += (
+                float(order.qty) * price * _contract_multiplier(order.symbol)
+            )
+        return totals
 
     def _used_notional(
         self,
@@ -435,32 +549,49 @@ class SleeveAllocator:
         position_owners: dict[str, str],
         order_strategy: dict[str, str],
     ) -> float:
-        """
-        Gross notional currently consumed by strategy_name:
-          positions: sum of |market_value| for owned positions
-          orders:    sum of qty × limit_price for pending buy orders
-                     attributed to this strategy
-        """
-        # Open positions owned by this strategy.
-        position_exposure = sum(
-            abs(pos.market_value)
-            for sym, pos in account.open_positions.items()
-            if position_owners.get(sym) == strategy_name
+        positions = self._position_notional_by_strategy(account, position_owners)
+        pending = self._pending_order_notional_by_strategy(open_orders, order_strategy)
+        return positions.get(strategy_name, 0.0) + pending.get(strategy_name, 0.0)
+
+    def _pool_used_notional(
+        self,
+        pool_type: str,
+        account: "AccountState",
+        open_orders: list["OpenOrder"],
+        position_owners: dict[str, str],
+        order_strategy: dict[str, str],
+    ) -> float:
+        positions = self._position_notional_by_strategy(account, position_owners)
+        pending = self._pending_order_notional_by_strategy(open_orders, order_strategy)
+        total = 0.0
+        for strategy_name, entry in self._entries.items():
+            strategy_pool_name = (
+                entry["pool_type"]
+                if entry["pool_type"] == PoolType.EQUITY.value
+                else "isolated_options"
+            )
+            if strategy_pool_name != pool_type:
+                continue
+            total += positions.get(strategy_name, 0.0) + pending.get(strategy_name, 0.0)
+        return total
+
+    def _total_used_notional(
+        self,
+        account: "AccountState",
+        open_orders: list["OpenOrder"],
+        position_owners: dict[str, str],
+        order_strategy: dict[str, str],
+    ) -> float:
+        return self._pool_used_notional(
+            PoolType.EQUITY.value,
+            account,
+            open_orders,
+            position_owners,
+            order_strategy,
+        ) + self._pool_used_notional(
+            "isolated_options",
+            account,
+            open_orders,
+            position_owners,
+            order_strategy,
         )
-
-        # Pending buy orders attributed to this strategy.
-        # Sell / close orders are excluded — they reduce exposure, not add.
-        order_exposure = 0.0
-        for order in open_orders:
-            if order_strategy.get(order.order_id) != strategy_name:
-                continue
-            # Only count buy-side orders (entries consume sleeve budget).
-            from risk.manager import Side
-            if order.side is not Side.BUY:
-                continue
-            # Limit orders: use limit_price. Market orders: 0 (filled instantly,
-            # position will already be in open_positions by next cycle).
-            price = order.limit_price if order.limit_price is not None else 0.0
-            order_exposure += float(order.qty) * price
-
-        return position_exposure + order_exposure

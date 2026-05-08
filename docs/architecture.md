@@ -343,21 +343,21 @@ The Risk Manager sits between strategy signals and the execution layer. No order
 
 #### Sleeve Allocator (`risk/allocator.py`)
 
-`SleeveAllocator` divides the gross capital budget across strategies. Each strategy has a `weight` (fraction of gross capital) and `max_positions` (hard cap on simultaneous positions).
+`SleeveAllocator` divides deployable capital across strategy pools and strategies. Each strategy has a `target_pct`, a pool type (`equity` or isolated options), a concentration cap, and a hard count ceiling.
 
 ```
-Sleeve budget       = equity × MAX_GROSS_EXPOSURE_PCT × weight
-Per-position budget = sleeve_budget / max_positions
+Deployable capital  = equity × MAX_GROSS_EXPOSURE_PCT
+Target budget       = deployable_capital × target_pct
+Max one position    = effective_budget × max_position_pct_of_sleeve
 ```
 
-At $100k equity, 80% gross, 45/25/25/5 weights:
-- SMA sleeve:     $100k × 0.80 × 0.45 = $36,000 → $7,200 per position (5 max)
-- RSI sleeve:     $100k × 0.80 × 0.25 = $20,000 → $4,000 per position (5 max)
-- Donchian sleeve: $100k × 0.80 × 0.25 = $20,000 → $4,000 per position (5 max)
-- Options sleeve:  $100k × 0.80 × 0.05 = $4,000  → $4,000 per position (1 max)
+At $100k equity, 80% deployable gross, 95/5 pool split, and a 40% equity concentration cap:
+- SMA target sleeve: $100k × 0.80 × 0.45 = $36,000 → up to $16,560 in one position when stretched
+- RSI target sleeve: $100k × 0.80 × 0.25 = $20,000 → up to $9,200 in one position when stretched
+- Donchian target sleeve: $100k × 0.80 × 0.25 = $20,000 → up to $9,200 in one position when stretched
+- Options sleeve: $100k × 0.80 × 0.05 = $4,000 isolated → one position max
 
-Rejection codes: `SLEEVE_FULL` (budget exhausted), `SLEEVE_MAX_POSITIONS` (count cap hit).
-Idle sleeve capital stays locked — no cross-borrowing between strategies (Phase 11 item).
+RiskManager still sizes from stop-risk first; the allocator only caps strategy capital. Equity sleeves may borrow idle equity-pool capital up to 115% of target while total deployable utilization remains below 80%. Rejection codes remain `SLEEVE_FULL` (capital exhausted), `SLEEVE_MAX_POSITIONS` (hard safety ceiling), and `SLEEVE_DRAWDOWN`.
 
 The options sleeve uses the same `SleeveAllocator` and HWM drawdown gate as equity strategies. P&L is recorded with a 100× contract multiplier so the drawdown gate operates on real dollar amounts, not premium points.
 
@@ -387,7 +387,7 @@ For options, fractional sizing is disabled (`and not is_option` guard in `_size_
 | `HARD_DOLLAR_LOSS_CAP` | Absolute $ loss cap from session start | $2,000 |
 | `ATR_STOP_MULTIPLIER` | Stop = entry − k × ATR (equities only) | 2.0 |
 | `LOSS_STREAK_THRESHOLD` | Disable strategy after N consecutive losses | 3 |
-| `STRATEGY_ALLOCATIONS` | Per-strategy weight + max_positions | see above |
+| `STRATEGY_ALLOCATIONS` | Per-strategy target %, pool type, priority, hard count limit, and concentration cap | see above |
 
 ### 6. Execution Layer
 

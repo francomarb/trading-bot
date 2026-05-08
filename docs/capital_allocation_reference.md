@@ -168,6 +168,27 @@ This logic already aligns with the current risk-manager philosophy better than
 simple dollar-allocation thinking. The allocator should decide how much capital
 is available; the risk manager should still decide how much risk a trade may take.
 
+Implementation decision from paper trading:
+
+- early allocator versions tied per-trade sizing too closely to `max_positions`
+- in practice, paper trading showed repeated rejections from hitting the
+  strategy position-count ceiling even when that strategy still had deployable
+  capital left
+- because of that, the implementation moved away from `sleeve_budget / max_positions`
+  as the main sizing mechanism
+- the adopted model is capital-driven:
+  - the allocator computes strategy capital available now
+  - the risk manager still sizes from stop-risk first
+  - a separate per-position concentration cap limits how much one trade can consume
+  - a separate hard position-count ceiling remains only as a safety rail
+
+This better matches the intent of the allocator:
+
+- capital should be the main binding constraint
+- position count should prevent over-spreading, not determine normal trade size
+- the design transitions more cleanly into a later Kelly-based allocator where
+  strategy capital, concentration, and count limits remain distinct controls
+
 ### 3.5 Regime-Aware Capital Tilting
 
 An optional enhancement is to tilt capital between broad strategy buckets based

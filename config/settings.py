@@ -188,30 +188,67 @@ STRATEGY_ALLOWED_REGIMES: dict[str, set[str]] = {
     "spy_options_reversion": {"TRENDING", "RANGING"},
 }
 
-# ── Capital allocation (Phase 10.F1) ────────────────────────────────────────
-# Per-strategy sleeve budgets. Each entry maps strategy_name →
-#   weight:        fraction of gross capital for this strategy (must sum ≤ 1.0)
-#   max_positions: hard cap on simultaneous open positions for this strategy
+# ── Capital allocation (Immediate allocator enhancements) ───────────────────
+# The allocator works on deployable capital:
+#   deployable_capital = equity × MAX_GROSS_EXPOSURE_PCT
 #
-# Gross notional ceiling per strategy = equity × MAX_GROSS_EXPOSURE_PCT × weight
-# Per-position notional budget        = ceiling / max_positions
+# Strategy sizing remains risk-first in RiskManager. The allocator supplies
+# only strategy-level ceilings:
+#   - target_pct: baseline share of deployable capital
+#   - pool type: shared equity pool or isolated options vault
+#   - priority: lower number gets first access when capital is scarce
+#   - hard_max_positions: count-based safety ceiling only
+#   - max_position_pct_of_sleeve: concentration cap for one trade
 #
-# Example at $100k equity, 80% gross, 50/50, max_positions=5:
-#   each sleeve = $100k × 0.80 × 0.50 = $40,000
-#   per position = $40,000 ÷ 5          = $8,000
+# Example at $100k equity and 80% deployable gross:
+#   deployable capital = $80,000
+#   SMA target budget  = $80,000 × 0.45 = $36,000
+#   40% concentration  = $14,400 max notional in one SMA position
 #
-# Idle sleeve capital stays locked to its strategy (no cross-borrowing).
-# Dynamic reallocation is a Phase 11 item.
-# Weights: SMA 0.50 / RSI 0.25 / Donchian 0.25 — sum = 1.0.
-# RSI reduced from 0.50 after paper observation: ~8 trades over 4y means the
-# full 0.50 sleeve was mostly idle. Donchian gets 0.25 following backtest
-# validation (Sharpe +0.80 on AI/Bigtech, Mid-range 30/15 variant).
-STRATEGY_ALLOCATIONS: dict[str, dict] = {
-    "sma_crossover":    {"weight": 0.45, "max_positions": 5},
-    "rsi_reversion":    {"weight": 0.25, "max_positions": 5},
-    "donchian_breakout": {"weight": 0.25, "max_positions": 5},
-    "spy_options_reversion": {"weight": 0.05, "max_positions": 1},
+# Equity strategies may stretch up to 115% of target while total deployable
+# utilization remains below 80%, borrowing only from idle equity-pool capital.
+CAPITAL_POOLS: dict[str, float] = {
+    "equity": 0.95,
+    "isolated_options": 0.05,
 }
+
+STRATEGY_ALLOCATIONS: dict[str, dict] = {
+    "sma_crossover": {
+        "target_pct": 0.45,
+        "type": "equity",
+        "priority": 3,
+        "can_stretch": True,
+        "hard_max_positions": 8,
+        "max_position_pct_of_sleeve": 0.40,
+    },
+    "rsi_reversion": {
+        "target_pct": 0.25,
+        "type": "equity",
+        "priority": 1,
+        "can_stretch": True,
+        "hard_max_positions": 8,
+        "max_position_pct_of_sleeve": 0.40,
+    },
+    "donchian_breakout": {
+        "target_pct": 0.25,
+        "type": "equity",
+        "priority": 2,
+        "can_stretch": True,
+        "hard_max_positions": 8,
+        "max_position_pct_of_sleeve": 0.40,
+    },
+    "spy_options_reversion": {
+        "target_pct": 0.05,
+        "type": "isolated",
+        "priority": 0,
+        "can_stretch": False,
+        "hard_max_positions": 1,
+        "max_position_pct_of_sleeve": 1.00,
+    },
+}
+
+ALLOCATOR_STRETCH_UTILIZATION_THRESHOLD = 0.80
+ALLOCATOR_DEFAULT_STRETCH_PCT = 0.15
 MIN_TRADE_NOTIONAL = 100.0      # Reject entries if sleeve available < this
 
 # Strategy-level high-water-mark drawdown gate (SleeveAllocator).
@@ -226,7 +263,7 @@ STRATEGY_SLEEVE_DD_THRESHOLD = 0.15
 # ── Risk settings (Phase 6) ──────────────────────────────────────────────────
 # Position sizing
 MAX_POSITION_PCT = 0.02         # Risk no more than 2% of equity per trade (loss-to-stop)
-MAX_POSITION_NOTIONAL_PCT = 0.10 # Cap one position at 10% notional so 5 can fit in 80% gross
+MAX_POSITION_NOTIONAL_PCT = 0.10 # Global per-position cap; allocator adds strategy-level caps
 MAX_OPEN_POSITIONS = 10         # Global cap; per-strategy limit enforced by sleeve
 MAX_GROSS_EXPOSURE_PCT = 0.80   # 80% of equity tradeable across all strategies
 

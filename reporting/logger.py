@@ -23,6 +23,7 @@ Design principles:
 from __future__ import annotations
 
 import os
+import re
 import sqlite3
 from dataclasses import dataclass
 from datetime import datetime, timezone
@@ -30,6 +31,13 @@ from datetime import datetime, timezone
 from loguru import logger
 
 from config import settings
+
+_OCC_OPTION_SYMBOL = re.compile(r"^[A-Z]{1,6}[0-9]{6}[CP][0-9]{8}$")
+
+
+def _contract_multiplier(symbol: str) -> int:
+    """Return the contract multiplier for equities vs OCC option symbols."""
+    return 100 if _OCC_OPTION_SYMBOL.match(symbol or "") else 1
 
 
 # ── Structured JSON sink ────────────────────────────────────────────────────
@@ -71,6 +79,13 @@ TRADE_COLUMNS = [
     "status",
     "requested_qty",
     "filled_qty",
+    "initial_stop_loss",
+    "initial_risk_per_share",
+    "initial_risk_dollars",
+    "realized_pnl",
+    "r_multiple",
+    "entry_timestamp",
+    "exit_timestamp",
 ]
 
 # Keep the old name as an alias for backwards compatibility with tests
@@ -95,9 +110,26 @@ CREATE TABLE IF NOT EXISTS trades (
     order_type            TEXT,
     status                TEXT    NOT NULL,
     requested_qty         REAL,
-    filled_qty            REAL
+    filled_qty            REAL,
+    initial_stop_loss     REAL,
+    initial_risk_per_share REAL,
+    initial_risk_dollars  REAL,
+    realized_pnl          REAL,
+    r_multiple            REAL,
+    entry_timestamp       TEXT,
+    exit_timestamp        TEXT
 );
 """
+
+_MIGRATION_COLUMNS = {
+    "initial_stop_loss": "REAL",
+    "initial_risk_per_share": "REAL",
+    "initial_risk_dollars": "REAL",
+    "realized_pnl": "REAL",
+    "r_multiple": "REAL",
+    "entry_timestamp": "TEXT",
+    "exit_timestamp": "TEXT",
+}
 
 
 # ── Trade record ────────────────────────────────────────────────────────────
@@ -123,6 +155,13 @@ class TradeRecord:
     status: str
     requested_qty: float
     filled_qty: float
+    initial_stop_loss: float | None = None
+    initial_risk_per_share: float | None = None
+    initial_risk_dollars: float | None = None
+    realized_pnl: float | None = None
+    r_multiple: float | None = None
+    entry_timestamp: str | None = None
+    exit_timestamp: str | None = None
 
     def as_dict(self) -> dict:
         """Column-ordered dict (same interface as before migration)."""
@@ -153,6 +192,15 @@ class TradeLogger:
         os.makedirs(os.path.dirname(self._path) or ".", exist_ok=True)
         self._conn = sqlite3.connect(self._path)
         self._conn.execute(_CREATE_TABLE_SQL)
+        existing = {
+            row[1]
+            for row in self._conn.execute("PRAGMA table_info(trades)").fetchall()
+        }
+        for column, col_type in _MIGRATION_COLUMNS.items():
+            if column not in existing:
+                self._conn.execute(
+                    f"ALTER TABLE trades ADD COLUMN {column} {col_type}"
+                )
         self._conn.commit()
         return self._conn
 
@@ -178,6 +226,18 @@ class TradeLogger:
         modeled_bps = 0.0
         realized_bps = 0.0
         ref_price = modeled_price or decision.entry_reference_price
+        initial_stop_loss = float(decision.stop_price)
+        initial_risk_per_share = max(
+            0.0,
+            float(decision.entry_reference_price) - float(decision.stop_price),
+        )
+        multiplier = _contract_multiplier(decision.symbol)
+        initial_risk_dollars = (
+            initial_risk_per_share
+            * float(result.filled_qty or result.requested_qty or 0)
+            * multiplier
+        )
+        now_iso = datetime.now(timezone.utc).isoformat()
         if (
             result.avg_fill_price is not None
             and ref_price > 0
@@ -187,7 +247,7 @@ class TradeLogger:
             )
 
         return TradeRecord(
-            timestamp=datetime.now(timezone.utc).isoformat(),
+            timestamp=now_iso,
             symbol=decision.symbol,
             side=decision.side.value,
             qty=result.filled_qty,
@@ -203,6 +263,13 @@ class TradeLogger:
             status=result.status.value,
             requested_qty=result.requested_qty,
             filled_qty=result.filled_qty,
+            initial_stop_loss=initial_stop_loss,
+            initial_risk_per_share=initial_risk_per_share,
+            initial_risk_dollars=initial_risk_dollars,
+            realized_pnl=None,
+            r_multiple=None,
+            entry_timestamp=now_iso,
+            exit_timestamp=None,
         )
 
     def build_close_record(
@@ -217,15 +284,48 @@ class TradeLogger:
         a RiskDecision — they come from the strategy exit signal directly.
         """
         realized_bps = 0.0
+        context = self._read_latest_open_entry_context(
+            symbol=result.symbol,
+            strategy=strategy_name,
+        )
+        now_iso = datetime.now(timezone.utc).isoformat()
         if result.avg_fill_price is not None and modeled_price > 0:
             realized_bps = (
                 abs(result.avg_fill_price - modeled_price)
                 / modeled_price
                 * 10_000
             )
+        realized_pnl = None
+        r_multiple = None
+        initial_stop_loss = None
+        initial_risk_per_share = None
+        initial_risk_dollars = None
+        entry_timestamp = None
+        multiplier = _contract_multiplier(result.symbol)
+        if context is not None:
+            initial_stop_loss = context["initial_stop_loss"]
+            initial_risk_per_share = context["initial_risk_per_share"]
+            entry_timestamp = context["entry_timestamp"]
+            if initial_risk_per_share is not None:
+                initial_risk_dollars = (
+                    float(initial_risk_per_share)
+                    * float(result.filled_qty or 0)
+                    * multiplier
+                )
+            if (
+                result.avg_fill_price is not None
+                and context["entry_reference_price"] is not None
+            ):
+                realized_pnl = (
+                    (float(result.avg_fill_price) - float(context["entry_reference_price"]))
+                    * float(result.filled_qty or 0)
+                    * multiplier
+                )
+                if initial_risk_dollars and initial_risk_dollars > 0:
+                    r_multiple = realized_pnl / initial_risk_dollars
 
         return TradeRecord(
-            timestamp=datetime.now(timezone.utc).isoformat(),
+            timestamp=now_iso,
             symbol=result.symbol,
             side="sell",
             qty=result.filled_qty,
@@ -241,6 +341,13 @@ class TradeLogger:
             status=result.status.value,
             requested_qty=result.requested_qty,
             filled_qty=result.filled_qty,
+            initial_stop_loss=initial_stop_loss,
+            initial_risk_per_share=initial_risk_per_share,
+            initial_risk_dollars=initial_risk_dollars,
+            realized_pnl=realized_pnl,
+            r_multiple=r_multiple,
+            entry_timestamp=entry_timestamp,
+            exit_timestamp=now_iso,
         )
 
     def log(self, record: TradeRecord) -> None:
@@ -327,6 +434,13 @@ class TradeLogger:
             status="filled",
             requested_qty=0,
             filled_qty=0,
+            initial_stop_loss=None,
+            initial_risk_per_share=None,
+            initial_risk_dollars=None,
+            realized_pnl=None,
+            r_multiple=None,
+            entry_timestamp=None,
+            exit_timestamp=datetime.now(timezone.utc).isoformat(),
         )
         self.log(record)
 
@@ -346,8 +460,33 @@ class TradeLogger:
         Distinct from log_external_close, which is the fallback for positions
         that disappear without a confirmed fill event.
         """
+        context = self._read_latest_open_entry_context(
+            symbol=symbol,
+            strategy=strategy,
+        )
+        now_iso = datetime.now(timezone.utc).isoformat()
+        initial_stop_loss = None
+        initial_risk_per_share = None
+        initial_risk_dollars = None
+        realized_pnl = None
+        r_multiple = None
+        entry_timestamp = None
+        entry_reference_price = 0.0
+        multiplier = _contract_multiplier(symbol)
+        if context is not None:
+            initial_stop_loss = context["initial_stop_loss"]
+            initial_risk_per_share = context["initial_risk_per_share"]
+            entry_timestamp = context["entry_timestamp"]
+            entry_reference_price = float(context["entry_reference_price"] or 0.0)
+            if initial_risk_per_share is not None:
+                initial_risk_dollars = float(initial_risk_per_share) * qty * multiplier
+            if entry_reference_price > 0:
+                realized_pnl = (avg_fill_price - entry_reference_price) * qty * multiplier
+                if initial_risk_dollars and initial_risk_dollars > 0:
+                    r_multiple = realized_pnl / initial_risk_dollars
+
         record = TradeRecord(
-            timestamp=datetime.now(timezone.utc).isoformat(),
+            timestamp=now_iso,
             symbol=symbol,
             side="sell",
             qty=qty,
@@ -356,13 +495,20 @@ class TradeLogger:
             strategy=strategy,
             reason="stop_triggered",
             stop_price=avg_fill_price,
-            entry_reference_price=0.0,
+            entry_reference_price=entry_reference_price,
             modeled_slippage_bps=0.0,
             realized_slippage_bps=0.0,
             order_type="stop",
             status="filled",
             requested_qty=qty,
             filled_qty=qty,
+            initial_stop_loss=initial_stop_loss,
+            initial_risk_per_share=initial_risk_per_share,
+            initial_risk_dollars=initial_risk_dollars,
+            realized_pnl=realized_pnl,
+            r_multiple=r_multiple,
+            entry_timestamp=entry_timestamp,
+            exit_timestamp=now_iso,
         )
         self.log(record)
 
@@ -379,7 +525,10 @@ class TradeLogger:
         """
         if not os.path.exists(self._path):
             return None
-        conn = self._ensure_db()
+        try:
+            conn = self._ensure_db()
+        except sqlite3.Error:
+            return None
         conn.row_factory = sqlite3.Row
         cursor = conn.execute(
             "SELECT side, strategy "
@@ -405,7 +554,10 @@ class TradeLogger:
         """
         if not os.path.exists(self._path):
             return {}
-        conn = self._ensure_db()
+        try:
+            conn = self._ensure_db()
+        except sqlite3.Error:
+            return {}
         conn.row_factory = sqlite3.Row
         cursor = conn.execute(
             "SELECT symbol, strategy, side "
@@ -418,6 +570,48 @@ class TradeLogger:
             "AND side = 'buy'"
         )
         return {row["symbol"]: row["strategy"] for row in cursor.fetchall()}
+
+    def read_strategy_realized_pnl_summary(
+        self,
+        strategies: list[str] | set[str] | tuple[str, ...] | None = None,
+    ) -> dict[str, dict[str, float]]:
+        """
+        Reconstruct per-strategy cumulative realized P&L and HWM from the trade log.
+
+        Only sell-side rows with a non-null ``realized_pnl`` contribute. The HWM is
+        the running maximum of cumulative realized P&L in append order.
+        """
+        include = set(strategies or [])
+        summary = {
+            strategy: {"realized_pnl": 0.0, "hwm": 0.0}
+            for strategy in include
+        }
+        if not os.path.exists(self._path):
+            return summary
+        try:
+            conn = self._ensure_db()
+        except sqlite3.Error:
+            return summary
+        conn.row_factory = sqlite3.Row
+        cursor = conn.execute(
+            "SELECT strategy, realized_pnl "
+            "FROM trades "
+            "WHERE side = 'sell' "
+            "AND status IN ('filled', 'partial') "
+            "AND realized_pnl IS NOT NULL "
+            "ORDER BY id ASC"
+        )
+        for row in cursor.fetchall():
+            strategy = row["strategy"]
+            if include and strategy not in include:
+                continue
+            if strategy not in summary:
+                summary[strategy] = {"realized_pnl": 0.0, "hwm": 0.0}
+            running = summary[strategy]["realized_pnl"] + float(row["realized_pnl"])
+            summary[strategy]["realized_pnl"] = running
+            if running > summary[strategy]["hwm"]:
+                summary[strategy]["hwm"] = running
+        return summary
 
     def read_latest_open_stop_price(
         self, *, symbol: str, strategy: str
@@ -436,7 +630,10 @@ class TradeLogger:
         """
         if not os.path.exists(self._path):
             return None
-        conn = self._ensure_db()
+        try:
+            conn = self._ensure_db()
+        except sqlite3.Error:
+            return None
         conn.row_factory = sqlite3.Row
         cursor = conn.execute(
             "SELECT side, stop_price "
@@ -453,3 +650,48 @@ class TradeLogger:
             return None
         stop_price = float(row["stop_price"] or 0.0)
         return stop_price if stop_price > 0 else None
+
+    def _read_latest_open_entry_context(
+        self, *, symbol: str, strategy: str
+    ) -> dict | None:
+        """Return the latest still-open entry context for symbol/strategy."""
+        if not os.path.exists(self._path):
+            return None
+        try:
+            conn = self._ensure_db()
+        except sqlite3.Error:
+            return None
+        conn.row_factory = sqlite3.Row
+        cursor = conn.execute(
+            "SELECT side, entry_reference_price, initial_stop_loss, "
+            "initial_risk_per_share, entry_timestamp "
+            "FROM trades "
+            "WHERE symbol = ? AND strategy = ? "
+            "AND status IN ('filled', 'partial') "
+            "ORDER BY id DESC LIMIT 1",
+            (symbol, strategy),
+        )
+        row = cursor.fetchone()
+        if row is None or row["side"] != "buy":
+            return None
+        return {
+            "entry_reference_price": (
+                float(row["entry_reference_price"])
+                if row["entry_reference_price"] is not None else None
+            ),
+            "initial_stop_loss": (
+                float(row["initial_stop_loss"])
+                if row["initial_stop_loss"] is not None else None
+            ),
+            "initial_risk_per_share": (
+                float(row["initial_risk_per_share"])
+                if row["initial_risk_per_share"] is not None else None
+            ),
+            "entry_timestamp": row["entry_timestamp"],
+        }
+
+    def read_latest_open_entry_context(
+        self, *, symbol: str, strategy: str
+    ) -> dict | None:
+        """Public wrapper for the latest open entry context lookup."""
+        return self._read_latest_open_entry_context(symbol=symbol, strategy=strategy)

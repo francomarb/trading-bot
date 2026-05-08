@@ -44,7 +44,10 @@ def load_trades(db_path: str) -> pd.DataFrame:
             "order_id", "strategy", "reason", "stop_price",
             "entry_reference_price", "modeled_slippage_bps",
             "realized_slippage_bps", "order_type", "status",
-            "requested_qty", "filled_qty",
+            "requested_qty", "filled_qty", "initial_stop_loss",
+            "initial_risk_per_share", "initial_risk_dollars",
+            "realized_pnl", "r_multiple", "entry_timestamp",
+            "exit_timestamp",
         ])
         if error is not None:
             df.attrs["load_error"] = error
@@ -315,13 +318,37 @@ def compute_sleeve_usage(
     allocations: dict[str, dict],
     total_gross_pct: float,
 ) -> pd.DataFrame:
-    """Compute actual sleeve usage from the state snapshot's open positions."""
+    """Return allocator usage from snapshot, falling back to position math."""
+    allocator = state.get("allocator") or {}
+    if allocator:
+        rows = []
+        for strategy_name, detail in allocator.items():
+            effective_budget = float(detail.get("effective_budget", 0.0) or 0.0)
+            used_notional = float(detail.get("used", 0.0) or 0.0)
+            rows.append({
+                "Strategy": strategy_name,
+                "Target Budget": float(detail.get("target_budget", 0.0) or 0.0),
+                "Effective Budget": effective_budget,
+                "Borrowed": float(detail.get("borrowed_budget", 0.0) or 0.0),
+                "Used Notional": used_notional,
+                "Remaining": float(detail.get("available", 0.0) or 0.0),
+                "Utilization": (
+                    used_notional / effective_budget if effective_budget > 0 else 0.0
+                ),
+                "Open Positions": int(detail.get("positions_open", 0) or 0),
+                "Hard Max Positions": int(detail.get("hard_max_positions", 0) or 0),
+                "Max Position Notional": float(
+                    detail.get("max_position_notional", 0.0) or 0.0
+                ),
+            })
+        return pd.DataFrame(rows)
+
     positions_detail = state.get("positions_detail") or {}
     rows = []
 
     for strategy_name, cfg in allocations.items():
-        weight = float(cfg.get("weight", 0.0) or 0.0)
-        budget = equity * total_gross_pct * weight
+        target_pct = float(cfg.get("target_pct", 0.0) or 0.0)
+        budget = equity * total_gross_pct * target_pct
         open_positions = [
             detail for detail in positions_detail.values()
             if detail.get("strategy") == strategy_name
@@ -339,13 +366,17 @@ def compute_sleeve_usage(
         utilization = (used_notional / budget) if budget > 0 else 0.0
         rows.append({
             "Strategy": strategy_name,
-            "Weight": weight,
-            "Budget": budget,
+            "Target Budget": budget,
+            "Effective Budget": budget,
+            "Borrowed": 0.0,
             "Used Notional": used_notional,
             "Remaining": remaining,
             "Utilization": utilization,
             "Open Positions": len(open_positions),
-            "Max Positions": cfg.get("max_positions", "?"),
+            "Hard Max Positions": cfg.get("hard_max_positions", "?"),
+            "Max Position Notional": budget * float(
+                cfg.get("max_position_pct_of_sleeve", 0.0) or 0.0
+            ),
         })
 
     return pd.DataFrame(rows)
@@ -767,21 +798,23 @@ def render_dashboard() -> None:
         )
         if not sleeve_df.empty:
             display = sleeve_df.copy()
-            display["Weight"] = display["Weight"].map("{:.0%}".format)
             display["Utilization"] = display["Utilization"] * 100.0
             display["Open Positions"] = display.apply(
-                lambda row: f"{row['Open Positions']}/{row['Max Positions']}",
+                lambda row: f"{row['Open Positions']}/{row['Hard Max Positions']}",
                 axis=1,
             )
-            display = display.drop(columns=["Max Positions"])
+            display = display.drop(columns=["Hard Max Positions"])
             st.dataframe(
                 display,
                 width="stretch",
                 hide_index=True,
                 column_config={
-                    "Budget": st.column_config.NumberColumn(format="$%.2f"),
+                    "Target Budget": st.column_config.NumberColumn(format="$%.2f"),
+                    "Effective Budget": st.column_config.NumberColumn(format="$%.2f"),
+                    "Borrowed": st.column_config.NumberColumn(format="$%.2f"),
                     "Used Notional": st.column_config.NumberColumn(format="$%.2f"),
                     "Remaining": st.column_config.NumberColumn(format="$%.2f"),
+                    "Max Position Notional": st.column_config.NumberColumn(format="$%.2f"),
                     "Utilization": st.column_config.ProgressColumn(
                         "Utilization",
                         help="Current sleeve notional usage vs configured budget.",
@@ -792,8 +825,42 @@ def render_dashboard() -> None:
                 },
             )
             st.caption(
-                "Uses current open-position notional from the engine snapshot. "
-                "Pending buy orders are not included here."
+                "Uses allocator snapshot data when available, including stretched "
+                "budget and pending-order-aware usage."
+            )
+
+        pool_df = pd.DataFrame.from_dict(
+            display_state.get("capital_pools") or {}, orient="index"
+        )
+        if not pool_df.empty:
+            pool_df = pool_df.reset_index().rename(columns={"index": "Pool"})
+            pool_df["Utilization"] = pool_df["utilization"] * 100.0
+            pool_df = pool_df.rename(columns={
+                "target_budget": "Target Budget",
+                "used": "Used",
+                "available": "Available",
+                "pending_entry_notional": "Pending Entry Notional",
+            })
+            st.caption("Capital Pools")
+            st.dataframe(
+                pool_df[[
+                    "Pool", "Target Budget", "Used", "Available",
+                    "Pending Entry Notional", "Utilization",
+                ]],
+                width="stretch",
+                hide_index=True,
+                column_config={
+                    "Target Budget": st.column_config.NumberColumn(format="$%.2f"),
+                    "Used": st.column_config.NumberColumn(format="$%.2f"),
+                    "Available": st.column_config.NumberColumn(format="$%.2f"),
+                    "Pending Entry Notional": st.column_config.NumberColumn(format="$%.2f"),
+                    "Utilization": st.column_config.ProgressColumn(
+                        "Utilization",
+                        format="%.0f%%",
+                        min_value=0.0,
+                        max_value=100.0,
+                    ),
+                },
             )
 
     st.divider()

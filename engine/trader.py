@@ -313,6 +313,7 @@ class TradingEngine:
         # Restore position ownership from the trade DB (10.C1) and determine
         # startup mode (10.C2). This replaces the old best-effort slot-match.
         conflict_symbols = self._restore_ownership_from_db(startup_snapshot)
+        self._restore_runtime_state_from_db(startup_snapshot)
         self._startup_mode = self._reconcile_startup(
             startup_snapshot, conflict_symbols
         )
@@ -527,7 +528,7 @@ class TradingEngine:
 
             self._watchlist_statuses = {}
             self._watchlist_reasons = {}
-            for slot in self.slots:
+            for slot in self._slots_by_priority():
                 # Per-slot regime gate: block new entries if current regime is
                 # not in the slot's allowed set. Exits always proceed.
                 entry_allowed = True
@@ -876,7 +877,7 @@ class TradingEngine:
                     signal_key, signal_bar, strategy_statuses, strategy_reasons, symbol
                 )
                 return None
-            notional_cap = sleeve.per_position_notional
+            notional_cap = sleeve.max_position_notional
 
         target_symbol = symbol
         target_price = latest_close
@@ -1298,10 +1299,9 @@ class TradingEngine:
         Pass multiplier=100 for options contracts (each contract = 100 shares).
         Equity callers omit it and get the default of 1.
 
-        If no allocator is configured, or the entry price is unknown (e.g. the
-        bot restarted mid-trade), the update is silently skipped. The HWM gate
-        is conservative: missing one P&L update slightly underestimates the
-        true drawdown but never triggers a false pause.
+        Startup restores entry prices for still-open positions from the trade log,
+        so normal restart/reconcile flows continue feeding the HWM gate. If the
+        entry price is still unavailable, the update is conservatively skipped.
         """
         if self._allocator is None:
             return
@@ -1336,17 +1336,37 @@ class TradingEngine:
         SleeveAllocator can count open limit orders against the correct sleeve.
         """
         result: dict[str, str] = {}
+        slots = self._slots_by_priority()
         for order in open_orders:
             if order.side is Side.SELL:
                 continue
             if order.symbol in self._position_owners:
                 # Close / reduce order for an existing position — skip.
                 continue
-            for slot in self.slots:
-                if order.symbol in slot.active_symbols():
-                    result[order.order_id] = slot.strategy.name
-                    break
+            matches = [slot for slot in slots if order.symbol in slot.active_symbols()]
+            if not matches:
+                continue
+            chosen = matches[0]
+            result[order.order_id] = chosen.strategy.name
+            if len(matches) > 1:
+                logger.debug(
+                    f"{order.symbol}: attributed pending order {order.order_id} "
+                    f"to '{chosen.strategy.name}' via priority among "
+                    f"{[slot.strategy.name for slot in matches]}"
+                )
         return result
+
+    def _slots_by_priority(self) -> list[StrategySlot]:
+        """Return slots ordered by allocator priority when available."""
+        if self._allocator is None:
+            return list(self.slots)
+        return sorted(
+            self.slots,
+            key=lambda slot: (
+                self._allocator.strategy_priority(slot.strategy.name),
+                self.slots.index(slot),
+            ),
+        )
 
     @staticmethod
     def _has_pending_close_order(symbol: str, snapshot: BrokerSnapshot) -> bool:
@@ -1738,6 +1758,48 @@ class TradingEngine:
 
         return conflicts
 
+    def _restore_runtime_state_from_db(self, snapshot: BrokerSnapshot) -> None:
+        """Restore allocator P&L/HWM state and open-position entry prices from the trade log."""
+        self._restore_allocator_pnl_from_db()
+        self._restore_entry_prices_from_db(snapshot)
+
+    def _restore_allocator_pnl_from_db(self) -> None:
+        """Rehydrate allocator cumulative realized P&L / HWM from the trade log."""
+        if self._allocator is None:
+            return
+        summary = self.trade_logger.read_strategy_realized_pnl_summary(
+            self._allocator.strategies()
+        )
+        self._allocator.restore_pnl_summary(summary)
+
+    def _restore_entry_prices_from_db(self, snapshot: BrokerSnapshot) -> None:
+        """Restore entry prices for currently-open broker positions from the trade log."""
+        for sym in snapshot.account.open_positions:
+            occ_m = _OCC_PAT.match(sym)
+            owner_key = occ_m.group(1) if occ_m else sym
+            owner = self._position_owners.get(owner_key)
+            if owner is None:
+                continue
+            context = self.trade_logger.read_latest_open_entry_context(
+                symbol=sym,
+                strategy=owner,
+            )
+            if context is None and occ_m:
+                context = self.trade_logger.read_latest_open_entry_context(
+                    symbol=owner_key,
+                    strategy=owner,
+                )
+            if context is None:
+                continue
+            entry_price = float(context.get("entry_reference_price") or 0.0)
+            if entry_price <= 0.0:
+                continue
+            self._entry_prices[owner_key] = entry_price
+            logger.info(
+                f"restart: restored entry price for {sym} "
+                f"(owner_key='{owner_key}') at ${entry_price:.2f}"
+            )
+
     def _reconcile_startup(
         self, snapshot: BrokerSnapshot, conflict_symbols: set[str]
     ) -> str:
@@ -1853,6 +1915,35 @@ class TradingEngine:
                         if pos else None
                     ),
                 }
+
+            allocator_snapshot: dict[str, dict] = {"strategies": {}, "pools": {}}
+            sleeve_usage: dict[str, float] = {}
+            pending_entry_notional: dict[str, dict] = {
+                "strategies": {},
+                "pools": {},
+            }
+            if self._allocator is not None and self._last_snapshot is not None:
+                order_strategy = self._attribute_orders(self._last_snapshot.open_orders)
+                allocator_snapshot = self._allocator.snapshot(
+                    self._last_snapshot.account,
+                    self._last_snapshot.open_orders,
+                    self._position_owners,
+                    order_strategy,
+                )
+                sleeve_usage = {
+                    name: detail["used"]
+                    for name, detail in allocator_snapshot["strategies"].items()
+                }
+                pending_entry_notional = {
+                    "strategies": {
+                        name: detail["pending_entry_notional"]
+                        for name, detail in allocator_snapshot["strategies"].items()
+                    },
+                    "pools": {
+                        name: detail["pending_entry_notional"]
+                        for name, detail in allocator_snapshot["pools"].items()
+                    },
+                }
             state = {
                 "timestamp": datetime.now(timezone.utc).isoformat(),
                 "running": self._running,
@@ -1885,6 +1976,10 @@ class TradingEngine:
                 "session_pnl": equity - start_equity,
                 "open_positions": dict(self._position_owners),
                 "positions_detail": positions_detail,
+                "allocator": allocator_snapshot["strategies"],
+                "capital_pools": allocator_snapshot["pools"],
+                "pending_entry_notional": pending_entry_notional,
+                "sleeve_usage": sleeve_usage,
                 "watchlist_statuses": self._watchlist_statuses,
                 "watchlist_reasons": self._watchlist_reasons,
                 "sector_heat": self._sector_heat,

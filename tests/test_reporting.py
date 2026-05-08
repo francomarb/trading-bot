@@ -117,6 +117,11 @@ class TestTradeLogger:
         assert record.entry_reference_price == 150.0
         assert record.order_type == "market"
         assert record.status == "filled"
+        assert record.initial_stop_loss == 145.0
+        assert record.initial_risk_per_share == 5.0
+        assert record.initial_risk_dollars == 50.0
+        assert record.entry_timestamp is not None
+        assert record.exit_timestamp is None
 
     def test_slippage_calculation(self, sample_decision, sample_result):
         tl = TradeLogger(path="/dev/null")
@@ -146,6 +151,189 @@ class TestTradeLogger:
         assert record.strategy == "sma_crossover"
         assert record.reason == "exit signal"
         assert record.stop_price == 0.0
+        assert record.exit_timestamp is not None
+
+    def test_build_close_record_computes_realized_pnl_and_r(self, tmp_csv, sample_decision, sample_result):
+        tl = TradeLogger(path=tmp_csv)
+        tl.log(tl.build_record(sample_decision, sample_result, modeled_price=150.0))
+        close_result = OrderResult(
+            status=OrderStatus.FILLED,
+            order_id="sell-1",
+            symbol="AAPL",
+            requested_qty=10,
+            filled_qty=10,
+            avg_fill_price=160.0,
+            raw_status="filled",
+            message="filled 10 @ 160.0",
+        )
+        record = tl.build_close_record(
+            close_result,
+            strategy_name="sma_crossover",
+            modeled_price=160.0,
+        )
+        assert record.realized_pnl == pytest.approx(100.0)
+        assert record.initial_risk_dollars == pytest.approx(50.0)
+        assert record.r_multiple == pytest.approx(2.0)
+
+    def test_read_latest_open_entry_context_public_wrapper(self, tmp_csv, sample_decision, sample_result):
+        tl = TradeLogger(path=tmp_csv)
+        tl.log(tl.build_record(sample_decision, sample_result, modeled_price=150.0))
+
+        context = tl.read_latest_open_entry_context(
+            symbol="AAPL",
+            strategy="sma_crossover",
+        )
+
+        assert context is not None
+        assert context["entry_reference_price"] == pytest.approx(150.0)
+        assert context["initial_risk_per_share"] == pytest.approx(5.0)
+
+    def test_read_strategy_realized_pnl_summary_reconstructs_hwm(self, tmp_csv):
+        tl = TradeLogger(path=tmp_csv)
+        rows = [
+            TradeRecord(
+                timestamp="2026-04-22T10:00:00+00:00",
+                symbol=f"SYM{i}",
+                side="sell",
+                qty=1,
+                avg_fill_price=100.0,
+                order_id=f"sell-{i}",
+                strategy="sma_crossover",
+                reason="exit signal",
+                stop_price=0.0,
+                entry_reference_price=100.0,
+                modeled_slippage_bps=0.0,
+                realized_slippage_bps=0.0,
+                order_type="market",
+                status="filled",
+                requested_qty=1,
+                filled_qty=1,
+                initial_stop_loss=95.0,
+                initial_risk_per_share=5.0,
+                initial_risk_dollars=5.0,
+                realized_pnl=pnl,
+                r_multiple=None,
+                entry_timestamp="2026-04-21T10:00:00+00:00",
+                exit_timestamp="2026-04-22T10:00:00+00:00",
+            )
+            for i, pnl in enumerate([100.0, -50.0, 25.0], start=1)
+        ]
+        for row in rows:
+            tl.log(row)
+
+        summary = tl.read_strategy_realized_pnl_summary(["sma_crossover", "rsi_reversion"])
+
+        assert summary["sma_crossover"]["realized_pnl"] == pytest.approx(75.0)
+        assert summary["sma_crossover"]["hwm"] == pytest.approx(100.0)
+        assert summary["rsi_reversion"] == {"realized_pnl": 0.0, "hwm": 0.0}
+
+    def test_option_entry_uses_contract_multiplier_for_initial_risk(self):
+        tl = TradeLogger(path="/dev/null")
+        decision = RiskDecision(
+            symbol="SPY260616C00520000",
+            side=Side.BUY,
+            qty=2,
+            entry_reference_price=3.50,
+            stop_price=2.50,
+            strategy_name="spy_options_reversion",
+            reason="test option entry",
+            order_type=OrderType.LIMIT,
+            limit_price=3.50,
+        )
+        result = OrderResult(
+            status=OrderStatus.FILLED,
+            order_id="opt-buy-1",
+            symbol="SPY260616C00520000",
+            requested_qty=2,
+            filled_qty=2,
+            avg_fill_price=3.55,
+            raw_status="filled",
+            message="filled 2 @ 3.55",
+        )
+        record = tl.build_record(decision, result, modeled_price=3.50)
+        assert record.initial_risk_per_share == pytest.approx(1.0)
+        assert record.initial_risk_dollars == pytest.approx(200.0)
+
+    def test_option_close_uses_contract_multiplier_for_realized_pnl(self, tmp_csv):
+        tl = TradeLogger(path=tmp_csv)
+        decision = RiskDecision(
+            symbol="SPY260616C00520000",
+            side=Side.BUY,
+            qty=2,
+            entry_reference_price=3.50,
+            stop_price=2.50,
+            strategy_name="spy_options_reversion",
+            reason="test option entry",
+            order_type=OrderType.LIMIT,
+            limit_price=3.50,
+        )
+        entry_result = OrderResult(
+            status=OrderStatus.FILLED,
+            order_id="opt-buy-1",
+            symbol="SPY260616C00520000",
+            requested_qty=2,
+            filled_qty=2,
+            avg_fill_price=3.55,
+            raw_status="filled",
+            message="filled 2 @ 3.55",
+        )
+        tl.log(tl.build_record(decision, entry_result, modeled_price=3.50))
+        close_result = OrderResult(
+            status=OrderStatus.FILLED,
+            order_id="opt-sell-1",
+            symbol="SPY260616C00520000",
+            requested_qty=2,
+            filled_qty=2,
+            avg_fill_price=4.50,
+            raw_status="filled",
+            message="filled 2 @ 4.50",
+        )
+        record = tl.build_close_record(
+            close_result,
+            strategy_name="spy_options_reversion",
+            modeled_price=4.50,
+        )
+        assert record.initial_risk_dollars == pytest.approx(200.0)
+        assert record.realized_pnl == pytest.approx(200.0)
+        assert record.r_multiple == pytest.approx(1.0)
+
+    def test_option_stop_fill_uses_contract_multiplier(self, tmp_csv):
+        tl = TradeLogger(path=tmp_csv)
+        decision = RiskDecision(
+            symbol="SPY260616C00520000",
+            side=Side.BUY,
+            qty=2,
+            entry_reference_price=3.50,
+            stop_price=2.50,
+            strategy_name="spy_options_reversion",
+            reason="test option entry",
+            order_type=OrderType.LIMIT,
+            limit_price=3.50,
+        )
+        entry_result = OrderResult(
+            status=OrderStatus.FILLED,
+            order_id="opt-buy-1",
+            symbol="SPY260616C00520000",
+            requested_qty=2,
+            filled_qty=2,
+            avg_fill_price=3.55,
+            raw_status="filled",
+            message="filled 2 @ 3.55",
+        )
+        tl.log(tl.build_record(decision, entry_result, modeled_price=3.50))
+
+        tl.log_stop_fill(
+            symbol="SPY260616C00520000",
+            strategy="spy_options_reversion",
+            qty=2,
+            avg_fill_price=2.50,
+            order_id="opt-stop-1",
+        )
+
+        stop_record = tl.read_recent(1)[0]
+        assert stop_record["initial_risk_dollars"] == pytest.approx(200.0)
+        assert stop_record["realized_pnl"] == pytest.approx(-200.0)
+        assert stop_record["r_multiple"] == pytest.approx(-1.0)
 
     def test_as_dict_has_all_columns(self, sample_decision, sample_result):
         tl = TradeLogger(path="/dev/null")
@@ -195,6 +383,47 @@ class TestTradeLogger:
         # After close, read_all should still work (reconnects lazily)
         tl2 = TradeLogger(path=tmp_csv)
         assert len(tl2.read_all()) == 1
+
+    def test_existing_db_is_migrated_with_new_columns(self, tmp_csv):
+        conn = sqlite3.connect(tmp_csv)
+        conn.execute(
+            """
+            CREATE TABLE trades (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                timestamp TEXT NOT NULL,
+                symbol TEXT NOT NULL,
+                side TEXT NOT NULL,
+                qty REAL NOT NULL,
+                avg_fill_price REAL,
+                order_id TEXT,
+                strategy TEXT NOT NULL,
+                reason TEXT NOT NULL,
+                stop_price REAL,
+                entry_reference_price REAL,
+                modeled_slippage_bps REAL,
+                realized_slippage_bps REAL,
+                order_type TEXT,
+                status TEXT NOT NULL,
+                requested_qty REAL,
+                filled_qty REAL
+            )
+            """
+        )
+        conn.commit()
+        conn.close()
+
+        tl = TradeLogger(path=tmp_csv)
+        tl.read_all()
+
+        conn = sqlite3.connect(tmp_csv)
+        cols = {
+            row[1]
+            for row in conn.execute("PRAGMA table_info(trades)").fetchall()
+        }
+        conn.close()
+        assert "initial_risk_dollars" in cols
+        assert "r_multiple" in cols
+        assert "exit_timestamp" in cols
 
 
 # ── TestPnLTracker ──────────────────────────────────────────────────────────

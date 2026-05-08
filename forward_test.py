@@ -154,13 +154,17 @@ def main() -> None:
     # JSON structured log.
     install_json_sink()
 
-    # ── Capital sleeve allocator (Phase 10.F1) ──────────────────────────
-    # Enforces per-strategy gross-notional budgets so SMA cannot starve RSI
-    # (or vice versa). Weights are 50/50 until ≥4 weeks of combined paper
-    # data justify a rebalance. Idle sleeve capital stays locked.
+    # ── Capital allocator ────────────────────────────────────────────────
+    # Enforces per-strategy deployable-capital budgets, with a shared equity
+    # pool, isolated options vault, and limited equity-only stretch borrowing.
+    # Risk sizing remains in RiskManager; the allocator only supplies strategy
+    # capital ceilings and count/concentration guardrails.
     allocator = SleeveAllocator(
         allocations=settings.STRATEGY_ALLOCATIONS,
         total_gross_pct=settings.MAX_GROSS_EXPOSURE_PCT,
+        capital_pools=settings.CAPITAL_POOLS,
+        stretch_utilization_threshold=settings.ALLOCATOR_STRETCH_UTILIZATION_THRESHOLD,
+        default_stretch_pct=settings.ALLOCATOR_DEFAULT_STRETCH_PCT,
         min_trade_notional=settings.MIN_TRADE_NOTIONAL,
         dd_threshold=settings.STRATEGY_SLEEVE_DD_THRESHOLD,
     )
