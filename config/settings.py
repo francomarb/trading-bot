@@ -56,14 +56,14 @@ STREAM_RECONNECT_MAX_DELAY_SECONDS: float = float(
 SMA_WATCHLIST = [
     "TERN", "GOOG", "WT", "TD", "IYZ", "RY", "MS",
     "CM", "JAZZ", "BK", "BMO", "WDC", "FIGS", "VLUE",
-    "MU", "NVDA", "PG",
+    "MU", "NVDA", "AMD", "AMZN",
 ]
 # RSI Reversion — mean-reversion; promoted from the 2026-04-30 expanded
 # backtest pass to increase signal density for the static paper-trading pool.
 # This list intentionally favors breadth over the earlier narrow scanner
 # snapshot so the RSI sleeve can accumulate enough trades for evaluation.
 RSI_WATCHLIST = [
-    "ALLY", "CDNS", "KBE", "SN", "BA", "TFC", "HON", "TMUS", "JNJ",
+    "ALLY", "CDNS", "KBE", "SN", "BA", "TFC", "HON", "TMUS", "MSFT",
     "CCK", "ABNB", "PG", "SPG", "MA", "LMT", "MCD", "AAPL", "ANET",
     "CAT", "CIEN", "MCO", "AMZN", "EQIX", "RTX", "META", "HD",
     "SOFI", "ARM",

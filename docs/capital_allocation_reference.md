@@ -97,6 +97,16 @@ Recommended defaults:
 - a strategy may stretch up to `115%` of its target sleeve before needing
   explicit reallocation or the next rebalance cycle
 
+Implementation note:
+
+- when coding the `utilization < 80%` gate, prefer a conservative deployable-capital
+  measure rather than raw broker buying power alone
+- in a margin account, buying power can overstate what is safely available for
+  stretch allocation
+- if possible, base the check on settled cash, reserved cash, and clearly
+  identified pending credits or pending proceeds, so stretch logic does not
+  accidentally over-allocate capital that is not truly available yet
+
 Example:
 
 - SMA target = `45%`
