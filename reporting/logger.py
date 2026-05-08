@@ -23,6 +23,7 @@ Design principles:
 from __future__ import annotations
 
 import os
+import re
 import sqlite3
 from dataclasses import dataclass
 from datetime import datetime, timezone
@@ -30,6 +31,13 @@ from datetime import datetime, timezone
 from loguru import logger
 
 from config import settings
+
+_OCC_OPTION_SYMBOL = re.compile(r"^[A-Z]{1,6}[0-9]{6}[CP][0-9]{8}$")
+
+
+def _contract_multiplier(symbol: str) -> int:
+    """Return the contract multiplier for equities vs OCC option symbols."""
+    return 100 if _OCC_OPTION_SYMBOL.match(symbol or "") else 1
 
 
 # ── Structured JSON sink ────────────────────────────────────────────────────
@@ -223,8 +231,11 @@ class TradeLogger:
             0.0,
             float(decision.entry_reference_price) - float(decision.stop_price),
         )
+        multiplier = _contract_multiplier(decision.symbol)
         initial_risk_dollars = (
-            initial_risk_per_share * float(result.filled_qty or result.requested_qty or 0)
+            initial_risk_per_share
+            * float(result.filled_qty or result.requested_qty or 0)
+            * multiplier
         )
         now_iso = datetime.now(timezone.utc).isoformat()
         if (
@@ -290,13 +301,16 @@ class TradeLogger:
         initial_risk_per_share = None
         initial_risk_dollars = None
         entry_timestamp = None
+        multiplier = _contract_multiplier(result.symbol)
         if context is not None:
             initial_stop_loss = context["initial_stop_loss"]
             initial_risk_per_share = context["initial_risk_per_share"]
             entry_timestamp = context["entry_timestamp"]
             if initial_risk_per_share is not None:
                 initial_risk_dollars = (
-                    float(initial_risk_per_share) * float(result.filled_qty or 0)
+                    float(initial_risk_per_share)
+                    * float(result.filled_qty or 0)
+                    * multiplier
                 )
             if (
                 result.avg_fill_price is not None
@@ -305,6 +319,7 @@ class TradeLogger:
                 realized_pnl = (
                     (float(result.avg_fill_price) - float(context["entry_reference_price"]))
                     * float(result.filled_qty or 0)
+                    * multiplier
                 )
                 if initial_risk_dollars and initial_risk_dollars > 0:
                     r_multiple = realized_pnl / initial_risk_dollars
@@ -457,15 +472,16 @@ class TradeLogger:
         r_multiple = None
         entry_timestamp = None
         entry_reference_price = 0.0
+        multiplier = _contract_multiplier(symbol)
         if context is not None:
             initial_stop_loss = context["initial_stop_loss"]
             initial_risk_per_share = context["initial_risk_per_share"]
             entry_timestamp = context["entry_timestamp"]
             entry_reference_price = float(context["entry_reference_price"] or 0.0)
             if initial_risk_per_share is not None:
-                initial_risk_dollars = float(initial_risk_per_share) * qty
+                initial_risk_dollars = float(initial_risk_per_share) * qty * multiplier
             if entry_reference_price > 0:
-                realized_pnl = (avg_fill_price - entry_reference_price) * qty
+                realized_pnl = (avg_fill_price - entry_reference_price) * qty * multiplier
                 if initial_risk_dollars and initial_risk_dollars > 0:
                     r_multiple = realized_pnl / initial_risk_dollars
 
@@ -555,6 +571,48 @@ class TradeLogger:
         )
         return {row["symbol"]: row["strategy"] for row in cursor.fetchall()}
 
+    def read_strategy_realized_pnl_summary(
+        self,
+        strategies: list[str] | set[str] | tuple[str, ...] | None = None,
+    ) -> dict[str, dict[str, float]]:
+        """
+        Reconstruct per-strategy cumulative realized P&L and HWM from the trade log.
+
+        Only sell-side rows with a non-null ``realized_pnl`` contribute. The HWM is
+        the running maximum of cumulative realized P&L in append order.
+        """
+        include = set(strategies or [])
+        summary = {
+            strategy: {"realized_pnl": 0.0, "hwm": 0.0}
+            for strategy in include
+        }
+        if not os.path.exists(self._path):
+            return summary
+        try:
+            conn = self._ensure_db()
+        except sqlite3.Error:
+            return summary
+        conn.row_factory = sqlite3.Row
+        cursor = conn.execute(
+            "SELECT strategy, realized_pnl "
+            "FROM trades "
+            "WHERE side = 'sell' "
+            "AND status IN ('filled', 'partial') "
+            "AND realized_pnl IS NOT NULL "
+            "ORDER BY id ASC"
+        )
+        for row in cursor.fetchall():
+            strategy = row["strategy"]
+            if include and strategy not in include:
+                continue
+            if strategy not in summary:
+                summary[strategy] = {"realized_pnl": 0.0, "hwm": 0.0}
+            running = summary[strategy]["realized_pnl"] + float(row["realized_pnl"])
+            summary[strategy]["realized_pnl"] = running
+            if running > summary[strategy]["hwm"]:
+                summary[strategy]["hwm"] = running
+        return summary
+
     def read_latest_open_stop_price(
         self, *, symbol: str, strategy: str
     ) -> float | None:
@@ -631,3 +689,9 @@ class TradeLogger:
             ),
             "entry_timestamp": row["entry_timestamp"],
         }
+
+    def read_latest_open_entry_context(
+        self, *, symbol: str, strategy: str
+    ) -> dict | None:
+        """Public wrapper for the latest open entry context lookup."""
+        return self._read_latest_open_entry_context(symbol=symbol, strategy=strategy)

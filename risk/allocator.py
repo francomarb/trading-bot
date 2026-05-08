@@ -12,6 +12,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from enum import Enum
+import re
 from typing import TYPE_CHECKING
 
 from loguru import logger
@@ -19,6 +20,14 @@ from loguru import logger
 if TYPE_CHECKING:
     from execution.broker import OpenOrder
     from risk.manager import AccountState
+
+
+_OCC_OPTION_SYMBOL = re.compile(r"^[A-Z]{1,6}[0-9]{6}[CP][0-9]{8}$")
+
+
+def _contract_multiplier(symbol: str) -> int:
+    """Return the contract multiplier for equities vs OCC option symbols."""
+    return 100 if _OCC_OPTION_SYMBOL.match(symbol or "") else 1
 
 
 class PoolType(str, Enum):
@@ -249,6 +258,19 @@ class SleeveAllocator:
             }
             for name in self._entries
         }
+
+    def restore_pnl_summary(self, summary: dict[str, dict[str, float]]) -> None:
+        """Restore cumulative realized P&L / HWM state, typically from the trade log."""
+        for name in self._entries:
+            restored = summary.get(name, {})
+            realized_pnl = float(restored.get("realized_pnl", 0.0))
+            hwm = max(float(restored.get("hwm", 0.0)), realized_pnl)
+            self._strategy_realized_pnl[name] = realized_pnl
+            self._strategy_pnl_hwm[name] = hwm
+            logger.debug(
+                f"[{name}] restored allocator pnl state: "
+                f"cumulative={realized_pnl:+.2f} hwm={hwm:+.2f}"
+            )
 
     def strategies(self) -> list[str]:
         return list(self._entries.keys())
@@ -514,7 +536,9 @@ class SleeveAllocator:
             if order.side is not Side.BUY:
                 continue
             price = float(order.limit_price or 0.0)
-            totals[strategy_name] += float(order.qty) * price
+            totals[strategy_name] += (
+                float(order.qty) * price * _contract_multiplier(order.symbol)
+            )
         return totals
 
     def _used_notional(

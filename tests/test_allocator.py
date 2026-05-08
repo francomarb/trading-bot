@@ -221,6 +221,25 @@ class TestSleeveCheck:
         assert result.used == pytest.approx(10_000.0)
         assert result.available == pytest.approx(31_400.0)
 
+    def test_pending_option_orders_use_contract_multiplier(self):
+        order, order_strategy = _open_order(
+            "ord-opt",
+            "SPY260616C00520000",
+            strategy="spy_options_reversion",
+            qty=2,
+            limit_price=10.0,
+        )
+        result = _allocator().check(
+            "spy_options_reversion",
+            _account(),
+            [order],
+            {},
+            order_strategy,
+        )
+        assert isinstance(result, SleeveCapacity)
+        assert result.used == pytest.approx(2_000.0)
+        assert result.available == pytest.approx(2_000.0)
+
     def test_count_rejection_comes_only_from_hard_max_positions(self):
         positions = {
             f"SYM{i}": _position(f"SYM{i}", 1, 1_000.0)
@@ -290,6 +309,24 @@ class TestSleeveDrawdownGate:
         result = allocator.check("sma_crossover", _account(), [], {}, {})
         assert isinstance(result, SleeveRejection)
         assert result.code is SleeveRejectionCode.SLEEVE_DRAWDOWN
+
+    def test_restore_pnl_summary_rehydrates_cumulative_and_hwm(self):
+        allocator = _allocator(dd_threshold=0.15)
+        allocator.restore_pnl_summary(
+            {
+                "sma_crossover": {"realized_pnl": 75.0, "hwm": 100.0},
+                "rsi_reversion": {"realized_pnl": -25.0, "hwm": 0.0},
+            }
+        )
+        summary = allocator.pnl_summary()
+        assert summary["sma_crossover"] == {
+            "realized_pnl": pytest.approx(75.0),
+            "hwm": pytest.approx(100.0),
+        }
+        assert summary["rsi_reversion"] == {
+            "realized_pnl": pytest.approx(-25.0),
+            "hwm": pytest.approx(0.0),
+        }
 
 
 class TestRiskManagerNotionalCap:

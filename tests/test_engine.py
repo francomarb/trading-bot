@@ -1145,6 +1145,53 @@ class TestWatchlistStatuses:
         )
         assert engine._attribute_orders([order]) == {"buy-1": "high_priority"}
 
+    def test_attribute_orders_logs_priority_disambiguation(
+        self, engine_factory, monkeypatch
+    ):
+        from risk.allocator import SleeveAllocator
+
+        class FirstStrategy(FakeStrategy):
+            name = "first_strategy"
+
+        class SecondStrategy(FakeStrategy):
+            name = "second_strategy"
+
+        engine, _ = engine_factory()
+        engine.slots = [
+            StrategySlot(
+                strategy=FirstStrategy(entries=[False], exits=[False]),
+                symbols=["AAPL"],
+            ),
+            StrategySlot(
+                strategy=SecondStrategy(entries=[False], exits=[False]),
+                symbols=["AAPL"],
+            ),
+        ]
+        allocator = MagicMock(spec=SleeveAllocator)
+        allocator.strategy_priority.side_effect = lambda name: {
+            "first_strategy": 0,
+            "second_strategy": 1,
+        }[name]
+        engine._allocator = allocator
+        debug = MagicMock()
+        monkeypatch.setattr("engine.trader.logger.debug", debug)
+
+        order = OpenOrder(
+            order_id="buy-1",
+            symbol="AAPL",
+            side=Side.BUY,
+            qty=10,
+            order_type=OrderType.LIMIT,
+            status="open",
+            submitted_at=T0,
+            limit_price=100.0,
+            stop_price=None,
+        )
+
+        assert engine._attribute_orders([order]) == {"buy-1": "first_strategy"}
+        debug.assert_called_once()
+        assert "via priority among" in debug.call_args.args[0]
+
     def test_startup_repairs_missing_protective_stop(
         self, engine_factory, tmp_path
     ):
@@ -1332,7 +1379,14 @@ class TestScannerCadence:
 # ── Durable ownership from trade DB (10.C1) ───────────────────────────────
 
 
-def _engine_with_db(patch_fetch, tmp_path, *, positions=None, snapshot=None):
+def _engine_with_db(
+    patch_fetch,
+    tmp_path,
+    *,
+    positions=None,
+    snapshot=None,
+    allocator=None,
+):
     """Build an engine with a real TradeLogger backed by a tmp_path DB."""
     broker = MagicMock()
     snap = snapshot or _snapshot(positions=positions or {})
@@ -1370,6 +1424,7 @@ def _engine_with_db(patch_fetch, tmp_path, *, positions=None, snapshot=None):
         broker=broker,
         config=cfg,
         trade_logger=tl,
+        allocator=allocator,
         clock=lambda: T0,
     )
     return engine, broker, tl
@@ -1586,6 +1641,66 @@ class TestStartupReconciliation:
         slot = engine.slots[0]
         engine._process_symbol("AAPL", snap, snap.account, slot.strategy, slot.timeframe)
         broker.place_order.assert_called_once()
+
+    def test_start_restores_allocator_pnl_state_from_trade_log(
+        self, patch_fetch, tmp_path
+    ):
+        from risk.allocator import SleeveAllocator
+
+        allocator = SleeveAllocator(
+            allocations={
+                "fake_strategy": {
+                    "target_pct": 1.0,
+                    "type": "equity",
+                    "priority": 0,
+                    "can_stretch": True,
+                    "hard_max_positions": 8,
+                    "max_position_pct_of_sleeve": 0.4,
+                }
+            },
+            total_gross_pct=0.80,
+            capital_pools={"equity": 1.0, "isolated_options": 0.0},
+            stretch_utilization_threshold=0.80,
+            default_stretch_pct=0.15,
+            dd_threshold=0.15,
+        )
+        startup = _snapshot()
+        cycle = _snapshot()
+        engine, broker, tl = _engine_with_db(
+            patch_fetch,
+            tmp_path,
+            snapshot=startup,
+            allocator=allocator,
+        )
+        broker.sync_with_broker.side_effect = [startup, cycle]
+        _write_buy(tl, "AAPL", "fake_strategy")
+        _write_sell(tl, "AAPL", "fake_strategy")
+
+        engine.start(max_cycles=1)
+
+        assert allocator.pnl_summary()["fake_strategy"] == {
+            "realized_pnl": pytest.approx(50.0),
+            "hwm": pytest.approx(50.0),
+        }
+
+    def test_start_restores_entry_prices_for_open_positions(
+        self, patch_fetch, tmp_path
+    ):
+        positions = {"AAPL": Position("AAPL", 10, 100.0, 1000.0)}
+        startup = _snapshot(positions=positions)
+        cycle = _snapshot(positions=positions)
+        engine, broker, tl = _engine_with_db(
+            patch_fetch,
+            tmp_path,
+            positions=positions,
+            snapshot=startup,
+        )
+        broker.sync_with_broker.side_effect = [startup, cycle]
+        _write_buy(tl, "AAPL", "fake_strategy")
+
+        engine.start(max_cycles=1)
+
+        assert engine._entry_prices["AAPL"] == pytest.approx(100.0)
 
 
 # ── External close detection ──────────────────────────────────────────────
