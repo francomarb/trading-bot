@@ -329,7 +329,7 @@ def compute_sleeve_usage(
                 "Strategy": strategy_name,
                 "Target Budget": float(detail.get("target_budget", 0.0) or 0.0),
                 "Effective Budget": effective_budget,
-                "Borrowed": float(detail.get("borrowed_budget", 0.0) or 0.0),
+                "Stretch Headroom": float(detail.get("borrowed_budget", 0.0) or 0.0),
                 "Used Notional": used_notional,
                 "Remaining": float(detail.get("available", 0.0) or 0.0),
                 "Utilization": (
@@ -368,7 +368,7 @@ def compute_sleeve_usage(
             "Strategy": strategy_name,
             "Target Budget": budget,
             "Effective Budget": budget,
-            "Borrowed": 0.0,
+            "Stretch Headroom": 0.0,
             "Used Notional": used_notional,
             "Remaining": remaining,
             "Utilization": utilization,
@@ -811,7 +811,10 @@ def render_dashboard() -> None:
                 column_config={
                     "Target Budget": st.column_config.NumberColumn(format="$%.2f"),
                     "Effective Budget": st.column_config.NumberColumn(format="$%.2f"),
-                    "Borrowed": st.column_config.NumberColumn(format="$%.2f"),
+                    "Stretch Headroom": st.column_config.NumberColumn(
+                        format="$%.2f",
+                        help="Extra sleeve capacity temporarily granted by stretch logic.",
+                    ),
                     "Used Notional": st.column_config.NumberColumn(format="$%.2f"),
                     "Remaining": st.column_config.NumberColumn(format="$%.2f"),
                     "Max Position Notional": st.column_config.NumberColumn(format="$%.2f"),
