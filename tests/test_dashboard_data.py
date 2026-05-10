@@ -367,7 +367,7 @@ class TestComputeSleeveUsage:
         sma = result[result["Strategy"] == "sma_crossover"].iloc[0]
         assert pytest.approx(sma["Target Budget"]) == 36_000.0
         assert pytest.approx(sma["Effective Budget"]) == 41_400.0
-        assert pytest.approx(sma["Borrowed"]) == 5_400.0
+        assert pytest.approx(sma["Stretch Headroom"]) == 5_400.0
         assert pytest.approx(sma["Used Notional"]) == 1_250.0
         assert pytest.approx(sma["Utilization"]) == 1_250.0 / 41_400.0
 

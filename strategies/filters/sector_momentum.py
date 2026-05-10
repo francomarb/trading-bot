@@ -26,6 +26,8 @@ from typing import TYPE_CHECKING
 import pandas as pd
 from loguru import logger
 
+from strategies.base import EdgeFilterDecision
+
 if TYPE_CHECKING:
     from sector.gauge import SectorMomentumGauge
     from sector.resolver import SectorResolver
@@ -64,24 +66,21 @@ class SectorMomentumFilter:
         self._sector_entry_policy = sector_entry_policy
         self._score_threshold = score_threshold
         self._symbol: str = ""
-        self._last_reasons: list[str] = []
 
     def set_symbol(self, symbol: str) -> None:
         self._symbol = symbol
 
-    def __call__(self, df: pd.DataFrame) -> pd.Series:
+    def __call__(self, df: pd.DataFrame) -> EdgeFilterDecision:
         if not self._symbol:
-            self._last_reasons = []
-            return pd.Series(True, index=df.index, dtype=bool)
+            return EdgeFilterDecision.allow_all(df.index)
 
         sector = self._resolver.resolve(self._symbol)
         if sector is None:
-            self._last_reasons = []
             logger.debug(
                 f"SectorMomentumFilter: {self._symbol} has no sector mapping "
                 "— allowing entry (fail-open)"
             )
-            return pd.Series(True, index=df.index, dtype=bool)
+            return EdgeFilterDecision.allow_all(df.index)
 
         detail = self._gauge.get_details(sector)
 
@@ -103,16 +102,21 @@ class SectorMomentumFilter:
                 f"vol_confirm={detail.vol_confirm}"
             )
             if self._sector_entry_policy == "block":
-                self._last_reasons = [reason]
                 logger.info(
                     f"SECTOR GATE [block]: {self._symbol} "
                     f"({sector}/{detail.etf_ticker}) "
                     f"score={detail.score}\n"
                     f"  signals: {signal_str}"
                 )
-                return pd.Series(False, index=df.index, dtype=bool)
+                return EdgeFilterDecision(
+                    allowed=pd.Series(False, index=df.index, dtype=bool),
+                    reasons=pd.Series(
+                        [[reason] for _ in range(len(df.index))],
+                        index=df.index,
+                        dtype=object,
+                    ),
+                )
             elif self._sector_entry_policy == "warn":
-                self._last_reasons = []
                 logger.info(
                     f"SECTOR GATE [warn]: {self._symbol} "
                     f"({sector}/{detail.etf_ticker}) "
@@ -121,16 +125,10 @@ class SectorMomentumFilter:
                 )
 
         elif detail.classification == SectorMomentum.HOT:
-            self._last_reasons = []
             logger.debug(
                 f"SectorMomentumFilter: {self._symbol} "
                 f"({sector}/{detail.etf_ticker}) "
                 f"score={detail.score} [HOT]"
             )
-        else:
-            self._last_reasons = []
 
-        return pd.Series(True, index=df.index, dtype=bool)
-
-    def get_last_block_reasons(self) -> list[str]:
-        return list(self._last_reasons)
+        return EdgeFilterDecision.allow_all(df.index)

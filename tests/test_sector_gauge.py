@@ -13,6 +13,7 @@ import pandas as pd
 import pytest
 
 from sector.gauge import SectorMomentum, SectorMomentumGauge, SectorScoreDetail
+from strategies.base import EdgeFilterDecision
 
 
 SECTOR_ETFS = {
@@ -216,7 +217,9 @@ class TestSectorMomentumFilter:
         f.set_symbol("WEIRD")
         df = self._make_df()
         result = f(df)
-        assert result.all()
+        assert isinstance(result, EdgeFilterDecision)
+        assert result.allowed.all()
+        assert result.latest_reasons == []
 
     def test_cold_block_policy_returns_false(self):
         f, gauge, resolver = self._make_filter(sector_entry_policy="block")
@@ -234,7 +237,10 @@ class TestSectorMomentumFilter:
         f.set_symbol("NVDA")
         df = self._make_df()
         result = f(df)
-        assert not result.any()
+        assert not result.allowed.any()
+        assert result.latest_reasons == [
+            "cold sector semiconductors/SMH (score=-3, class=cold)"
+        ]
 
     def test_cold_warn_policy_returns_true(self):
         f, gauge, resolver = self._make_filter(sector_entry_policy="warn")
@@ -252,7 +258,8 @@ class TestSectorMomentumFilter:
         f.set_symbol("NVDA")
         df = self._make_df()
         result = f(df)
-        assert result.all()
+        assert result.allowed.all()
+        assert result.latest_reasons == []
 
     def test_cold_pass_policy_returns_true(self):
         f, gauge, resolver = self._make_filter(sector_entry_policy="pass")
@@ -270,7 +277,7 @@ class TestSectorMomentumFilter:
         f.set_symbol("NVDA")
         df = self._make_df()
         result = f(df)
-        assert result.all()
+        assert result.allowed.all()
 
     def test_hot_sector_always_returns_true(self):
         f, gauge, resolver = self._make_filter(sector_entry_policy="block")
@@ -283,7 +290,7 @@ class TestSectorMomentumFilter:
         f.set_symbol("NVDA")
         df = self._make_df()
         result = f(df)
-        assert result.all()
+        assert result.allowed.all()
 
     def test_neutral_sector_always_returns_true(self):
         f, gauge, resolver = self._make_filter(sector_entry_policy="block")
@@ -296,13 +303,13 @@ class TestSectorMomentumFilter:
         f.set_symbol("NVDA")
         df = self._make_df()
         result = f(df)
-        assert result.all()
+        assert result.allowed.all()
 
     def test_no_symbol_set_passes_through(self):
         f, gauge, resolver = self._make_filter()
         df = self._make_df()
         result = f(df)
-        assert result.all()
+        assert result.allowed.all()
         resolver.resolve.assert_not_called()
 
     def _make_detail(self, score: int, classification):
@@ -328,7 +335,7 @@ class TestSectorMomentumFilter:
         gauge.get_details.return_value = self._make_detail(-3, SectorMomentum.COLD)
         f.set_symbol("NVDA")
         result = f(self._make_df())
-        assert not result.any()
+        assert not result.allowed.any()
 
     def test_score_threshold_allows_score_above_threshold(self):
         """score_threshold=-3 allows score == -2 (sector rolled over but not in freefall)."""
@@ -341,7 +348,7 @@ class TestSectorMomentumFilter:
         gauge.get_details.return_value = self._make_detail(-2, SectorMomentum.COLD)
         f.set_symbol("NVDA")
         result = f(self._make_df())
-        assert result.all()
+        assert result.allowed.all()
 
     def test_score_threshold_none_falls_back_to_classification(self):
         """No score_threshold → uses COLD classification (default behaviour)."""
@@ -354,7 +361,7 @@ class TestSectorMomentumFilter:
         gauge.get_details.return_value = self._make_detail(-2, SectorMomentum.COLD)
         f.set_symbol("NVDA")
         result = f(self._make_df())
-        assert not result.any()  # COLD classification still triggers without threshold
+        assert not result.allowed.any()  # COLD classification still triggers without threshold
 
     def test_invalid_sector_entry_policy_raises(self):
         from strategies.filters.sector_momentum import SectorMomentumFilter
@@ -369,7 +376,8 @@ class TestSectorMomentumFilter:
         f.set_symbol("AAPL")
         df = self._make_df(n=10)
         result = f(df)
-        assert result.index.equals(df.index)
+        assert result.allowed.index.equals(df.index)
+        assert result.reasons.index.equals(df.index)
 
 
 class TestCompositeEdgeFilter:
