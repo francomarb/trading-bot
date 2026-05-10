@@ -346,8 +346,9 @@ class TestSMAEdgeFilter:
         """
         f = SMAEdgeFilter()
         # 5 bars → stock SMA NaN → fail open, vol NaN → fail open → allowed
-        gate = f(_symbol_df([100.0] * 5))
-        assert gate.all()
+        decision = f(_symbol_df([100.0] * 5))
+        assert isinstance(decision, EdgeFilterDecision)
+        assert decision.allowed.all()
 
     # ── Stock 200 SMA gate ───────────────────────────────────────────────────
 
@@ -355,8 +356,9 @@ class TestSMAEdgeFilter:
         """Rising stock > 200 SMA with expanding volume → allowed."""
         f = SMAEdgeFilter(stock_sma_window=200, vol_short_window=10, vol_long_window=30)
         df = _rising_df(210, vol_expanding=True)
-        gate = f(df)
-        assert gate.iloc[-1]
+        decision = f(df)
+        assert decision.allowed.iloc[-1]
+        assert decision.latest_reasons == []
 
     def test_stock_below_200sma_blocks(self):
         """Falling stock below its 200 SMA → blocked."""
@@ -369,14 +371,15 @@ class TestSMAEdgeFilter:
              "low": closes, "volume": volumes},
             index=idx,
         )
-        gate = f(df)
-        assert not gate.iloc[-1]
+        decision = f(df)
+        assert not decision.allowed.iloc[-1]
+        assert decision.latest_reasons == ["stock 1.00 ≤ SMA200 100.50"]
 
     def test_stock_nan_200sma_fails_open(self):
         """Fewer than 200 bars → SMA is NaN → fail open (allow)."""
         f = SMAEdgeFilter(stock_sma_window=200)
-        gate = f(_symbol_df([100.0] * 10))
-        assert gate.all()
+        decision = f(_symbol_df([100.0] * 10))
+        assert decision.allowed.all()
 
     # ── Volume expansion gate ────────────────────────────────────────────────
 
@@ -387,8 +390,8 @@ class TestSMAEdgeFilter:
              "volume": [100, 100, 100, 100, 200, 300, 400]},
             index=pd.date_range("2020-01-01", periods=7, freq="B"),
         )
-        gate = f(df)
-        assert gate.iloc[-1]
+        decision = f(df)
+        assert decision.allowed.iloc[-1]
 
     def test_volume_contracting_blocks(self):
         f = SMAEdgeFilter(stock_sma_window=5, vol_short_window=3, vol_long_window=5)
@@ -397,8 +400,9 @@ class TestSMAEdgeFilter:
              "volume": [400, 300, 200, 100, 50, 30, 10]},
             index=pd.date_range("2020-01-01", periods=7, freq="B"),
         )
-        gate = f(df)
-        assert not gate.iloc[-1]
+        decision = f(df)
+        assert not decision.allowed.iloc[-1]
+        assert decision.latest_reasons == ["volume contracting (med3 ≤ med5)"]
 
     def test_no_volume_column_fails_open(self):
         """No volume column → fail open. stock_sma_window=200 also NaN → open."""
@@ -407,14 +411,14 @@ class TestSMAEdgeFilter:
             {"close": [10.0] * 10},
             index=pd.date_range("2020-01-01", periods=10, freq="B"),
         )
-        gate = f(df)
-        assert gate.all()
+        decision = f(df)
+        assert decision.allowed.all()
 
     def test_volume_nan_fails_open(self):
         """Fewer bars than vol_long_window → NaN avg → fail open."""
         f = SMAEdgeFilter(vol_short_window=10, vol_long_window=30)
-        gate = f(_symbol_df([100.0] * 5))
-        assert gate.all()
+        decision = f(_symbol_df([100.0] * 5))
+        assert decision.allowed.all()
 
     # ── Combined / structural ────────────────────────────────────────────────
 
@@ -426,8 +430,8 @@ class TestSMAEdgeFilter:
              "volume": [100, 100, 100, 100, 100, 100, 100, 200, 300, 400, 500]},
             index=pd.date_range("2020-01-01", periods=11, freq="B"),
         )
-        gate = f(df)
-        assert gate.iloc[-1]
+        decision = f(df)
+        assert decision.allowed.iloc[-1]
 
     def test_set_symbol_stored_and_forwarded_to_earnings(self):
         f = SMAEdgeFilter()
@@ -438,8 +442,9 @@ class TestSMAEdgeFilter:
     def test_gate_series_aligned_to_df(self):
         f = SMAEdgeFilter()
         df = _symbol_df([100.0] * 8)
-        gate = f(df)
-        assert list(gate.index) == list(df.index)
+        decision = f(df)
+        assert list(decision.allowed.index) == list(df.index)
+        assert list(decision.reasons.index) == list(df.index)
 
     # ── Earnings blackout gate ────────────────────────────────────────────────
 
@@ -458,7 +463,9 @@ class TestSMAEdgeFilter:
         f = SMAEdgeFilter()
         f._earnings._cache["AAPL"] = (datetime.date.today(), [last + datetime.timedelta(days=1)])
         f.set_symbol("AAPL")
-        assert not f(df).iloc[-1]
+        decision = f(df)
+        assert not decision.allowed.iloc[-1]
+        assert decision.latest_reasons == ["earnings blackout (gap-risk protection)"]
 
     def test_earnings_two_days_before_blocks(self):
         """2 days before earnings (default days_before=2) → blocked."""
@@ -467,7 +474,9 @@ class TestSMAEdgeFilter:
         f = SMAEdgeFilter()
         f._earnings._cache["AAPL"] = (datetime.date.today(), [last + datetime.timedelta(days=2)])
         f.set_symbol("AAPL")
-        assert not f(df).iloc[-1]
+        decision = f(df)
+        assert not decision.allowed.iloc[-1]
+        assert decision.latest_reasons == ["earnings blackout (gap-risk protection)"]
 
     def test_earnings_day_after_allows(self):
         """Day after earnings → allowed (days_after=0, post-earnings trend ok)."""
@@ -476,7 +485,7 @@ class TestSMAEdgeFilter:
         f = SMAEdgeFilter()
         f._earnings._cache["AAPL"] = (datetime.date.today(), [last - datetime.timedelta(days=1)])
         f.set_symbol("AAPL")
-        assert f(df).iloc[-1]
+        assert f(df).allowed.iloc[-1]
 
     def test_earnings_far_away_allows(self):
         """Earnings 30 days out → not in blackout window → allowed."""
@@ -485,7 +494,7 @@ class TestSMAEdgeFilter:
         f = SMAEdgeFilter()
         f._earnings._cache["AAPL"] = (datetime.date.today(), [last + datetime.timedelta(days=30)])
         f.set_symbol("AAPL")
-        assert f(df).iloc[-1]
+        assert f(df).allowed.iloc[-1]
 
     def test_earnings_custom_days_before(self):
         """days_before param is respected."""
@@ -494,7 +503,7 @@ class TestSMAEdgeFilter:
         f = SMAEdgeFilter(days_before=5, days_after=0)
         f._earnings._cache["AAPL"] = (datetime.date.today(), [last + datetime.timedelta(days=5)])
         f.set_symbol("AAPL")
-        assert not f(df).iloc[-1]
+        assert not f(df).allowed.iloc[-1]
 
     def test_yfinance_failure_fails_open_on_earnings(self):
         """yfinance unavailable for earnings → fail open (allow), log warning."""
@@ -502,8 +511,8 @@ class TestSMAEdgeFilter:
         f = SMAEdgeFilter()
         f.set_symbol("AAPL")
         with _patch("yfinance.Ticker", side_effect=Exception("down")):
-            gate = f(_today_df(5))
-        assert gate.iloc[-1]  # earnings fail open; other gates also fail open
+            decision = f(_today_df(5))
+        assert decision.allowed.iloc[-1]  # earnings fail open; other gates also fail open
 
 
 # ── TestRSIEdgeFilter ─────────────────────────────────────────────────────────
@@ -1082,8 +1091,10 @@ class TestDonchianEdgeFilterGates:
         )
         df = _donchian_ohlc_df(25, close=100.0, avg_vol=10_000, rising=True)
         # close drifts up → above its SMA → gate allows
-        gate = f(df)
-        assert gate.iloc[-1]
+        decision = f(df)
+        assert isinstance(decision, EdgeFilterDecision)
+        assert decision.allowed.iloc[-1]
+        assert decision.latest_reasons == []
 
     def test_stock_below_sma_blocks(self, monkeypatch):
         f = self._filter(
@@ -1094,8 +1105,9 @@ class TestDonchianEdgeFilterGates:
         )
         df = _donchian_ohlc_df(25, close=100.0, avg_vol=10_000, rising=False)
         # close drifts down → below its SMA → gate blocks
-        gate = f(df)
-        assert not gate.iloc[-1]
+        decision = f(df)
+        assert not decision.allowed.iloc[-1]
+        assert decision.latest_reasons == ["stock 98.80 ≤ SMA10 99.03"]
 
     def test_stock_sma_fails_open_on_insufficient_history(self, monkeypatch):
         f = self._filter(
@@ -1106,8 +1118,8 @@ class TestDonchianEdgeFilterGates:
         )
         df = _donchian_ohlc_df(25, close=100.0, avg_vol=10_000, rising=True)
         # Only 25 bars; SMA200 is NaN → fail open (allow).
-        gate = f(df)
-        assert gate.iloc[-1]
+        decision = f(df)
+        assert decision.allowed.iloc[-1]
 
     # ── Liquidity gate ────────────────────────────────────────────────────────
 
@@ -1120,8 +1132,8 @@ class TestDonchianEdgeFilterGates:
         )
         # close=100, vol=20_000 → dollar_vol = 2M >> 1M threshold
         df = _donchian_ohlc_df(25, close=100.0, avg_vol=20_000)
-        gate = f(df)
-        assert gate.iloc[-1]
+        decision = f(df)
+        assert decision.allowed.iloc[-1]
 
     def test_liquidity_below_threshold_blocks(self, monkeypatch):
         f = self._filter(
@@ -1132,8 +1144,11 @@ class TestDonchianEdgeFilterGates:
         )
         # close=100, vol=20_000 → dollar_vol=2M << 10M threshold
         df = _donchian_ohlc_df(25, close=100.0, avg_vol=20_000)
-        gate = f(df)
-        assert not gate.iloc[-1]
+        decision = f(df)
+        assert not decision.allowed.iloc[-1]
+        assert decision.latest_reasons == [
+            "liquidity too low (avg_dollar_vol5=$2,022,000 < $10,000,000, feed=sip)"
+        ]
 
     def test_liquidity_no_volume_column_fails_open(self, monkeypatch):
         f = self._filter(
@@ -1151,8 +1166,8 @@ class TestDonchianEdgeFilterGates:
             },
             index=idx,
         )  # no volume
-        gate = f(df)
-        assert gate.iloc[-1]
+        decision = f(df)
+        assert decision.allowed.iloc[-1]
 
 
 

@@ -63,6 +63,7 @@ from loguru import logger
 
 # SPYTrendFilter import retained — needed if the SPY gate is re-enabled.
 # See the re-enable note in the module docstring above.
+from strategies.base import EdgeFilterDecision
 from strategies.filters.common import EarningsBlackout, SPYTrendFilter  # noqa: F401
 
 
@@ -117,7 +118,6 @@ class SMAEdgeFilter:
         self._vol_short = vol_short_window
         self._vol_long = vol_long_window
         self._symbol: str = ""
-        self._last_reasons: list[str] = []
 
         self._earnings = EarningsBlackout(
             days_before=days_before,
@@ -168,7 +168,7 @@ class SMAEdgeFilter:
         expanding = expanding.where(has_data, other=True)
         return expanding.astype(bool)
 
-    def __call__(self, df: pd.DataFrame) -> pd.Series:
+    def __call__(self, df: pd.DataFrame) -> EdgeFilterDecision:
         # SPY gate — disabled while RegimeDetector owns SPY > 200 SMA.
         # Re-enable by uncommenting and restoring `spy_gate &` in combined:
         # spy_gate = self._spy_filter(df)
@@ -179,44 +179,54 @@ class SMAEdgeFilter:
 
         # When re-enabling SPY gate: combined = spy_gate & stock_gate & vol_gate & earnings_gate
         combined = stock_gate & vol_gate & earnings_gate
+        reasons_by_bar: list[list[str]] = []
+
+        stock_sma = df["close"].rolling(self._stock_sma_window).mean()
+        for i, (stock_ok, vol_ok, earnings_ok) in enumerate(
+            zip(
+                stock_gate.tolist(),
+                vol_gate.tolist(),
+                earnings_gate.tolist(),
+                strict=False,
+            )
+        ):
+            row_reasons: list[str] = []
+            if not stock_ok:
+                close = df["close"].iloc[i]
+                sma_val = stock_sma.iloc[i]
+                sma_str = f"{sma_val:.2f}" if pd.notna(sma_val) else "NaN"
+                row_reasons.append(
+                    f"stock {close:.2f} ≤ SMA{self._stock_sma_window} {sma_str}"
+                )
+            if not vol_ok:
+                row_reasons.append(
+                    f"volume contracting "
+                    f"(med{self._vol_short} ≤ med{self._vol_long})"
+                )
+            if not earnings_ok:
+                row_reasons.append("earnings blackout (gap-risk protection)")
+            reasons_by_bar.append(row_reasons)
+
+        decision = EdgeFilterDecision(
+            allowed=combined.astype(bool),
+            reasons=pd.Series(reasons_by_bar, index=df.index, dtype=object),
+        )
 
         if not df.empty:
-            allowed      = bool(combined.iloc[-1])
+            allowed      = decision.latest_allowed
             stock_ok     = bool(stock_gate.iloc[-1])
             vol_ok       = bool(vol_gate.iloc[-1])
             earnings_ok  = bool(earnings_gate.iloc[-1])
 
             if allowed:
-                self._last_reasons = []
                 logger.debug(
                     f"SMAEdgeFilter: ALLOWED {self._symbol} — "
                     f"stock>200SMA vol_expanding no_earnings_blackout"
                 )
             else:
-                reasons = []
-                if not stock_ok:
-                    close = df["close"].iloc[-1]
-                    sma_val = df["close"].rolling(self._stock_sma_window).mean().iloc[-1]
-                    sma_str = f"{sma_val:.2f}" if pd.notna(sma_val) else "NaN"
-                    reasons.append(
-                        f"stock {close:.2f} ≤ SMA{self._stock_sma_window} {sma_str}"
-                    )
-                if not vol_ok:
-                    reasons.append(
-                        f"volume contracting "
-                        f"(med{self._vol_short} ≤ med{self._vol_long})"
-                    )
-                if not earnings_ok:
-                    reasons.append("earnings blackout (gap-risk protection)")
-                self._last_reasons = reasons
                 logger.info(
                     f"SMAEdgeFilter: BLOCKED {self._symbol} — "
-                    + ", ".join(reasons)
+                    + ", ".join(decision.latest_reasons)
                 )
-        else:
-            self._last_reasons = []
 
-        return combined
-
-    def get_last_block_reasons(self) -> list[str]:
-        return list(self._last_reasons)
+        return decision
