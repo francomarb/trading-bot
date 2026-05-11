@@ -622,7 +622,9 @@ Alpaca exposes multi-leg orders via `OrderClass.MLEG`. The current broker only h
 
 ### Critical non-code gate
 
-**Alpaca account must be at Level 3** (defined-risk spreads on cash accounts). If the account is Level 1 or 2, this entire strategy is off the table and the design needs rework. **Verify before any code is written.**
+**Alpaca account must be at Level 3** (defined-risk spreads on cash accounts). If the account is Level 1 or 2, this entire strategy is off the table and the design needs rework.
+
+**Verification status (2026-05-10):** Paper account confirmed Level 3 via `TradingClient.get_account()` (`options_approved_level=3`, `options_trading_level=3`, options buying power is sufficient for the planned sleeve). **Paper is unblocked.** Re-run the same check against live credentials (`LIVE_TRADING=true`) before the live flip — Alpaca paper and live approval levels can diverge, and live options buying power should be re-checked to size the real sleeve.
 
 ### Revised staging — 3 PRs
 
@@ -695,7 +697,7 @@ Larger than the original 2,250 LOC estimate because the position-abstraction ref
 
 ### What to decide before any code is written
 
-1. **Alpaca Level 3 verification** — the single biggest gate. Confirm the account is approved before PR 1 starts.
+1. ~~**Alpaca Level 3 verification**~~ — ✅ confirmed 2026-05-10 on paper (`options_trading_level: 3`). Re-verify on live before the live flip.
 2. **Confirm 3-PR staging** — vs single PR or different split.
 3. **Confirm 11.23 folds into PR 1** — close 11.23 as resolved by the position abstraction.
 4. **Confirm v1 underlyings** — SPY + QQQ at v1 (default), or SPY only first then QQQ in v1.1?
