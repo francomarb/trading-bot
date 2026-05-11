@@ -14,12 +14,13 @@ Pure logic only — no network, no real Alpaca/yfinance calls.
 from __future__ import annotations
 
 import json
-import sqlite3
+from datetime import datetime, timezone
 from pathlib import Path
 from unittest.mock import patch
 
 import pytest
 
+from reporting.logger import TradeLogger, TradeRecord
 from scripts.sma_watchlist_scan import (
     REJECTION_LABELS,
     RULE_VERSION,
@@ -225,113 +226,158 @@ class TestFirstTechnicalRejectionV2:
 # ── Open-position protection (trade-DB query) ────────────────────────────────
 
 
-def _build_trade_db(path: Path, rows: list[tuple]) -> None:
-    """Create a minimal trades table matching production schema."""
-    conn = sqlite3.connect(str(path))
-    try:
-        conn.execute(
-            """
-            CREATE TABLE trades (
-                id INTEGER PRIMARY KEY,
-                timestamp TEXT NOT NULL,
-                symbol TEXT NOT NULL,
-                side TEXT NOT NULL,
-                qty REAL NOT NULL,
-                filled_qty REAL,
-                strategy TEXT NOT NULL,
-                status TEXT NOT NULL
-            )
-            """
+def _log_trade(
+    tl: TradeLogger,
+    *,
+    symbol: str,
+    side: str,
+    qty: float,
+    strategy: str,
+    status: str = "filled",
+    filled_qty: float | None = None,
+    reason: str = "test",
+) -> None:
+    """Append a TradeRecord through the production logger.
+
+    Using the real logger guarantees the test DB has the same schema and
+    insert semantics as production, so this module's behavior is tested
+    against the actual contract — not a hand-rolled mirror.
+    """
+    tl.log(
+        TradeRecord(
+            timestamp=datetime.now(timezone.utc).isoformat(),
+            symbol=symbol,
+            side=side,
+            qty=qty,
+            avg_fill_price=100.0,
+            order_id=None,
+            strategy=strategy,
+            reason=reason,
+            stop_price=0.0,
+            entry_reference_price=0.0,
+            modeled_slippage_bps=0.0,
+            realized_slippage_bps=0.0,
+            order_type="market",
+            status=status,
+            requested_qty=qty,
+            filled_qty=qty if filled_qty is None else filled_qty,
+            initial_stop_loss=None,
+            initial_risk_per_share=None,
+            initial_risk_dollars=None,
+            realized_pnl=None,
+            r_multiple=None,
+            entry_timestamp=None,
+            exit_timestamp=None,
         )
-        conn.executemany(
-            "INSERT INTO trades (timestamp, symbol, side, qty, filled_qty, strategy, status) "
-            "VALUES (?, ?, ?, ?, ?, ?, ?)",
-            rows,
-        )
-        conn.commit()
-    finally:
-        conn.close()
+    )
 
 
 class TestGetOpenSmaPositions:
+    """``get_open_sma_positions`` must mirror the engine's ownership
+    reconstruction semantics exactly (``TradeLogger.read_all_open_owners``)
+    so the watchlist refresh never orphans a held position."""
+
     def test_missing_db_returns_empty_set(self, tmp_path):
         assert get_open_sma_positions(str(tmp_path / "nope.db")) == set()
 
-    def test_no_sma_rows_returns_empty(self, tmp_path):
+    def test_empty_db_returns_empty_set(self, tmp_path):
         db = tmp_path / "trades.db"
-        _build_trade_db(
-            db,
-            [
-                ("2026-01-01", "AAPL", "buy", 10, 10, "rsi_reversion", "filled"),
-                ("2026-01-02", "MSFT", "buy", 5, 5, "donchian_breakout", "filled"),
-            ],
-        )
+        tl = TradeLogger(path=str(db))
+        tl._ensure_db()  # create the schema without any rows
+        tl.close()
         assert get_open_sma_positions(str(db)) == set()
 
-    def test_net_positive_sma_position(self, tmp_path):
+    def test_simple_open_buy_is_returned(self, tmp_path):
         db = tmp_path / "trades.db"
-        _build_trade_db(
-            db,
-            [
-                ("2026-01-01", "NVDA", "buy", 49, 49, "sma_crossover", "filled"),
-            ],
-        )
+        tl = TradeLogger(path=str(db))
+        _log_trade(tl, symbol="NVDA", side="buy", qty=49, strategy="sma_crossover")
+        tl.close()
         assert get_open_sma_positions(str(db)) == {"NVDA"}
 
-    def test_net_zero_excluded(self, tmp_path):
+    def test_buy_then_sell_is_closed(self, tmp_path):
         db = tmp_path / "trades.db"
-        _build_trade_db(
-            db,
-            [
-                ("2026-01-01", "MU", "buy", 20, 20, "sma_crossover", "filled"),
-                ("2026-02-01", "MU", "sell", 20, 20, "sma_crossover", "filled"),
-            ],
-        )
+        tl = TradeLogger(path=str(db))
+        _log_trade(tl, symbol="MU", side="buy", qty=20, strategy="sma_crossover")
+        _log_trade(tl, symbol="MU", side="sell", qty=20, strategy="sma_crossover")
+        tl.close()
         assert get_open_sma_positions(str(db)) == set()
 
-    def test_partial_close_still_protected(self, tmp_path):
+    def test_only_sma_strategy_is_returned(self, tmp_path):
+        # RSI / Donchian positions must not be returned as SMA protected.
         db = tmp_path / "trades.db"
-        _build_trade_db(
-            db,
-            [
-                ("2026-01-01", "AMD", "buy", 50, 50, "sma_crossover", "filled"),
-                ("2026-02-01", "AMD", "sell", 20, 20, "sma_crossover", "filled"),
-            ],
+        tl = TradeLogger(path=str(db))
+        _log_trade(tl, symbol="NVDA", side="buy", qty=10, strategy="sma_crossover")
+        _log_trade(tl, symbol="TSLA", side="buy", qty=5, strategy="rsi_reversion")
+        _log_trade(tl, symbol="META", side="buy", qty=3, strategy="donchian_breakout")
+        tl.close()
+        assert get_open_sma_positions(str(db)) == {"NVDA"}
+
+    def test_partial_fill_is_protected(self, tmp_path):
+        # Regression: previous implementation filtered status='filled' only
+        # and would orphan partially-filled entries. The engine treats
+        # status='partial' as a real position; protect them.
+        db = tmp_path / "trades.db"
+        tl = TradeLogger(path=str(db))
+        _log_trade(
+            tl,
+            symbol="AMD",
+            side="buy",
+            qty=30,
+            filled_qty=20,
+            strategy="sma_crossover",
+            status="partial",
         )
+        tl.close()
         assert get_open_sma_positions(str(db)) == {"AMD"}
 
-    def test_only_filled_status_counted(self, tmp_path):
+    def test_external_close_marks_position_closed(self, tmp_path):
+        # Regression: log_external_close() writes a zero-qty filled sell
+        # marker when a position disappears externally (stop-out, manual
+        # liquidation). Net-quantity SUM would still see net > 0 and treat
+        # the symbol as open. Latest-row semantics correctly close it.
         db = tmp_path / "trades.db"
-        _build_trade_db(
-            db,
-            [
-                ("2026-01-01", "PENDING_SYM", "buy", 10, 0, "sma_crossover", "pending"),
-                ("2026-01-02", "CANCELLED_SYM", "buy", 10, 0, "sma_crossover", "cancelled"),
-            ],
+        tl = TradeLogger(path=str(db))
+        _log_trade(tl, symbol="WDC", side="buy", qty=49, strategy="sma_crossover")
+        tl.log_external_close(
+            symbol="WDC",
+            strategy="sma_crossover",
+            reason="manual_liquidation",
         )
+        tl.close()
         assert get_open_sma_positions(str(db)) == set()
 
-    def test_multiple_strategies_isolated(self, tmp_path):
+    def test_partial_close_via_smaller_sell_still_closed(self, tmp_path):
+        # In production a sell row — even one with smaller qty than the buy —
+        # marks the position as closed (the engine reconciles broker state
+        # separately). The trade-log view follows latest-row semantics.
         db = tmp_path / "trades.db"
-        _build_trade_db(
-            db,
-            [
-                ("2026-01-01", "NVDA", "buy", 10, 10, "sma_crossover", "filled"),
-                ("2026-01-02", "TSLA", "buy", 5, 5, "rsi_reversion", "filled"),
-            ],
-        )
-        assert get_open_sma_positions(str(db)) == {"NVDA"}
+        tl = TradeLogger(path=str(db))
+        _log_trade(tl, symbol="AMD", side="buy", qty=50, strategy="sma_crossover")
+        _log_trade(tl, symbol="AMD", side="sell", qty=20, strategy="sma_crossover")
+        tl.close()
+        assert get_open_sma_positions(str(db)) == set()
 
-    def test_filled_qty_null_falls_back_to_qty(self, tmp_path):
-        # Older rows may have NULL filled_qty; the query coalesces to qty.
+    def test_buy_after_sell_reopens(self, tmp_path):
+        # Latest-row semantics: a new buy after a sell makes the symbol
+        # owned again.
         db = tmp_path / "trades.db"
-        _build_trade_db(
-            db,
-            [
-                ("2026-01-01", "MU", "buy", 20, None, "sma_crossover", "filled"),
-            ],
-        )
+        tl = TradeLogger(path=str(db))
+        _log_trade(tl, symbol="MU", side="buy", qty=20, strategy="sma_crossover")
+        _log_trade(tl, symbol="MU", side="sell", qty=20, strategy="sma_crossover")
+        _log_trade(tl, symbol="MU", side="buy", qty=10, strategy="sma_crossover")
+        tl.close()
         assert get_open_sma_positions(str(db)) == {"MU"}
+
+    def test_non_terminal_statuses_ignored(self, tmp_path):
+        # 'pending'/'cancelled'/'rejected'/'accepted' rows must not count —
+        # only 'filled' and 'partial' represent real ownership.
+        db = tmp_path / "trades.db"
+        tl = TradeLogger(path=str(db))
+        _log_trade(tl, symbol="PEND", side="buy", qty=10, strategy="sma_crossover", status="pending")
+        _log_trade(tl, symbol="CANC", side="buy", qty=10, strategy="sma_crossover", status="cancelled")
+        _log_trade(tl, symbol="REJ", side="buy", qty=10, strategy="sma_crossover", status="rejected")
+        tl.close()
+        assert get_open_sma_positions(str(db)) == set()
 
 
 # ── Industry cache: don't persist empty yfinance responses ───────────────────

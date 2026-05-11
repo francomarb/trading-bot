@@ -25,7 +25,6 @@ from __future__ import annotations
 
 import argparse
 import math
-import sqlite3
 import sys
 import time
 from collections import Counter, defaultdict
@@ -249,33 +248,33 @@ def _hydrate_industry_cache(
 
 
 def get_open_sma_positions(db_path: str) -> set[str]:
-    """Return symbols with a net-positive filled SMA position in the trade DB.
+    """Return symbols currently owned by the SMA strategy in the trade DB.
 
-    Honoring these symbols on watchlist refresh prevents the engine from
-    orphaning open positions whose names no longer pass the scanner.
+    Delegates to ``TradeLogger.read_all_open_owners()`` so semantics match
+    the engine's ownership reconstruction exactly. Two failure modes a
+    bespoke net-quantity reconstruction would hit:
+
+    * ``log_external_close()`` writes a zero-quantity sell row to mark a
+      position closed without a real fill. A net-quantity SUM treats the
+      symbol as still open; latest-row semantics correctly close it.
+    * ``status='partial'`` rows represent partial fills the engine manages
+      as real positions. A ``status='filled'``-only filter would skip them
+      and let the engine orphan a partially-filled entry.
     """
-    path = Path(db_path)
-    if not path.exists():
+    if not Path(db_path).exists():
         return set()
     try:
-        conn = sqlite3.connect(str(path))
+        from reporting.logger import TradeLogger
+        trade_logger = TradeLogger(path=db_path)
         try:
-            cur = conn.cursor()
-            rows = cur.execute(
-                """
-                SELECT symbol,
-                       SUM(CASE WHEN side='buy' THEN COALESCE(filled_qty, qty)
-                                ELSE -COALESCE(filled_qty, qty) END) AS net
-                FROM trades
-                WHERE strategy='sma_crossover' AND status='filled'
-                GROUP BY symbol
-                HAVING net > 0
-                """
-            ).fetchall()
-            return {str(r[0]).upper() for r in rows}
+            owners = trade_logger.read_all_open_owners()
         finally:
-            conn.close()
-    except sqlite3.Error as exc:
+            trade_logger.close()
+        return {
+            sym.upper() for sym, strategy in owners.items()
+            if strategy == "sma_crossover"
+        }
+    except Exception as exc:
         logger.warning(f"open-positions query failed against {db_path}: {exc}")
         return set()
 
