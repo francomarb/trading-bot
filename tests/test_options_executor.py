@@ -31,7 +31,7 @@ def _submitted_order(order_id: str = "ord-1", *, status: str = "accepted"):
         filled_qty="0",
         filled_avg_price=None,
         symbol="SPY260516C00520000",
-        legs=[SimpleNamespace(id="stop-leg-1")],
+        legs=[],
     )
 
 
@@ -42,12 +42,12 @@ def _filled_order(order_id: str = "ord-1", *, status: str = "filled"):
         filled_qty="2",
         filled_avg_price="10.5",
         symbol="SPY260516C00520000",
-        legs=[SimpleNamespace(id="stop-leg-1")],
+        legs=[],
     )
 
 
 class TestOptionsExecutionWorker:
-    def test_binds_real_order_id_and_registers_stop_legs_after_submit(self):
+    def test_binds_real_order_id_after_submit(self):
         api = MagicMock()
         api.submit_order.return_value = _submitted_order("ord-1")
         api.get_order_by_id.return_value = _filled_order("ord-1")
@@ -70,9 +70,29 @@ class TestOptionsExecutionWorker:
         stream.bind_submitted_order.assert_called_once_with(
             client_order_id=watched_client_id,
             order_id="ord-1",
-            stop_leg_ids=["stop-leg-1"],
+            stop_leg_ids=[],
         )
         stream.unwatch.assert_called_once_with("ord-1")
+
+    def test_submit_failure_reports_rejected_and_cleans_watch(self):
+        api = MagicMock()
+        api.submit_order.side_effect = Exception("complex orders not supported for options trading")
+        stream = MagicMock()
+        stream_event = MagicMock()
+        stream.watch.return_value = stream_event
+        on_fill = MagicMock()
+
+        worker = OptionsExecutionWorker(
+            decision=_decision(),
+            api=api,
+            stream_manager=stream,
+            on_fill=on_fill,
+        )
+        worker.run()
+
+        watched_client_id = stream.watch.call_args.args[0]
+        stream.unwatch.assert_called_once_with(watched_client_id)
+        on_fill.assert_called_once_with("rejected", 0.0, None, watched_client_id)
 
     def test_timeout_reconciles_broker_state_before_canceling(self):
         api = MagicMock()

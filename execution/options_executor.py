@@ -1,5 +1,5 @@
 """
-Background worker to handle options midpoint cancel/replace bracket orders.
+Background worker to handle async single-leg options limit entries.
 """
 
 import threading
@@ -15,8 +15,8 @@ with warnings.catch_warnings():
         category=DeprecationWarning,
     )
     from alpaca.trading.client import TradingClient
-    from alpaca.trading.requests import LimitOrderRequest, TakeProfitRequest, StopLossRequest
-    from alpaca.trading.enums import OrderSide, OrderType as AlpacaOrderType, OrderClass, TimeInForce
+    from alpaca.trading.requests import LimitOrderRequest
+    from alpaca.trading.enums import OrderSide, OrderType as AlpacaOrderType, TimeInForce
 
 from risk.manager import RiskDecision, Side
 from execution.stream import StreamManager
@@ -63,22 +63,12 @@ class OptionsExecutionWorker(threading.Thread):
 
         client_order_id = f"opt-{self.decision.strategy_name}-{uuid.uuid4().hex[:8]}"
         
-        stop_loss = StopLossRequest(stop_price=round(self.decision.stop_price, 2))
-        take_profit = None
-        if self.decision.take_profit_price:
-            take_profit = TakeProfitRequest(limit_price=round(self.decision.take_profit_price, 2))
-            
-        order_class = OrderClass.BRACKET if take_profit else OrderClass.OTO
-            
         req = LimitOrderRequest(
             symbol=self.decision.symbol,
             qty=self.decision.qty,
             side=OrderSide.BUY if self.decision.side is Side.BUY else OrderSide.SELL,
             type=AlpacaOrderType.LIMIT,
             time_in_force=TimeInForce.DAY,
-            order_class=order_class,
-            stop_loss=stop_loss,
-            take_profit=take_profit,
             client_order_id=client_order_id,
             limit_price=round(limit_price, 2)
         )
@@ -89,28 +79,25 @@ class OptionsExecutionWorker(threading.Thread):
             
         try:
             order = self.api.submit_order(req)
-            logger.info(f"[{self.name}] Submitted option bracket order {order.id}")
+            logger.info(f"[{self.name}] Submitted option limit order {order.id}")
         except Exception as e:
-            logger.error(f"[{self.name}] Failed to submit option bracket order: {e}")
+            logger.error(f"[{self.name}] Failed to submit option limit order: {e}")
             if self.stream_manager:
                 self.stream_manager.unwatch(client_order_id)
+            self._report_fill("rejected", client_order_id)
             return
             
         if self.stream_manager:
             self.stream_manager.bind_submitted_order(
                 client_order_id=client_order_id,
                 order_id=str(order.id),
-                stop_leg_ids=[
-                    str(leg.id)
-                    for leg in (getattr(order, "legs", None) or [])
-                    if getattr(leg, "id", None) is not None
-                ],
+                stop_leg_ids=[],
             )
 
-        # The 60-second cancel/replace loop
+        # The 60-second entry watch loop.
         # Since we approximate Delta/Prices via paper feed without OPRA,
-        # we will wait 60s and cancel if unfilled. A full OPRA implementation
-        # would fetch live quotes in a loop and use replace_order_by_id.
+        # we wait 60s and cancel if the entry remains unresolved. A fuller
+        # implementation could retry/reprice with fresh quote data.
         if stream_event:
             filled = stream_event.wait(timeout=60.0)
             self.stream_manager.unwatch(str(order.id))

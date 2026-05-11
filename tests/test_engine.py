@@ -1917,6 +1917,32 @@ class TestOptionsEngineFixes:
         engine._repair_missing_protective_stops(snap)
         engine.broker.place_protective_stop.assert_not_called()
 
+    def test_drain_option_rejected_clears_pre_registered_underlying_ownership(self, tmp_path):
+        """Rejected option entries must clean up pre-registered underlying ownership immediately."""
+        engine = self._engine(tmp_path)
+        occ = "SPY260516C00520000"
+        engine._position_owners["SPY"] = "spy_options_reversion"
+        engine._entry_prices["SPY"] = 12.15
+        engine.broker.drain_option_fills = MagicMock(return_value=[
+            (
+                SimpleNamespace(
+                    symbol=occ,
+                    qty=3,
+                    entry_reference_price=12.15,
+                    strategy_name="spy_options_reversion",
+                ),
+                "rejected",
+                0.0,
+                None,
+                "opt-spy_options_reversion-abcd1234",
+            )
+        ])
+
+        engine._drain_option_fills()
+
+        assert "SPY" not in engine._position_owners
+        assert "SPY" not in engine._entry_prices
+
     # Fix 3: slippage not recorded for options exits ──────────────────────────
 
     def test_slippage_not_recorded_for_options_exit(self, tmp_path):

@@ -1698,10 +1698,11 @@ class TradingEngine:
         """
         Process async fill events reported by OptionsExecutionWorker threads.
 
-        Each cycle, background workers may have resolved their option bracket
-        orders (fill or cancel).  This method logs fills to the trade DB and
-        updates entry prices; it cleans up pre-registered ownership on cancel
-        so external-close detection doesn't generate spurious warnings.
+        Each cycle, background workers may have resolved their async option
+        entry orders (fill, cancel, or reject). This method logs fills to the
+        trade DB and updates entry prices; it cleans up pre-registered
+        ownership on non-fill outcomes so external-close detection doesn't
+        generate spurious warnings.
         """
         import re as _re
         fills = self.broker.drain_option_fills()
