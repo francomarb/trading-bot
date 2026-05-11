@@ -121,3 +121,113 @@ class TestIsStockLikeEdgeCases:
     def test_case_insensitive(self):
         # The match uses uppercased text — lower-case ETF should still be caught.
         assert is_stock_like("soxx", "ishares semiconductor etf", "nyse") is False
+
+
+class TestIsStockLikeWordBoundaries:
+    """Regression: matching must be word-bounded so substrings inside
+    real company names don't trigger false positives.
+
+    Pinned by code review: a raw 'UNIT' substring rejected UnitedHealth,
+    United Airlines, and Unity. Similar concern applies to other short
+    tokens that could appear inside legitimate names.
+    """
+
+    @pytest.mark.parametrize(
+        "symbol,name",
+        [
+            ("UNH", "UnitedHealth Group Incorporated Common Stock"),
+            ("UAL", "United Airlines Holdings Inc Common Stock"),
+            ("U", "Unity Software Inc Common Stock"),
+            ("UNP", "Union Pacific Corporation Common Stock"),
+        ],
+    )
+    def test_unit_does_not_match_united_or_unity(self, symbol, name):
+        # "UNIT" was removed from the exclusion list (replaced by "UNITS"
+        # plural) precisely so these pass. Even if it returns, the
+        # word-bound regex must not match substring-only occurrences.
+        assert is_stock_like(symbol, name, "NYSE") is True
+
+    def test_units_plural_still_rejected(self):
+        # SPAC pre-split unit naming convention. Must still be caught.
+        assert (
+            is_stock_like("ACME.U", "Acme Acquisition Corp Units", "NASDAQ")
+            is False
+        )
+
+    def test_bull_does_not_match_bulldog(self):
+        # Word-boundary: BULLDOG has 'BULL' as a prefix substring but is
+        # not a standalone 'BULL' token.
+        assert is_stock_like("BLDG", "Bulldog Industries Common Stock", "NASDAQ") is True
+
+    def test_bear_does_not_match_bearings(self):
+        # 'BEAR' inside 'BEARINGS' — substring match would be a false positive.
+        assert is_stock_like("NN", "NN Inc Ball Bearings Manufacturer", "NYSE") is True
+
+    def test_pref_does_not_match_prefer(self):
+        # 'PREF' inside 'PREFERENCE' — substring match would falsely exclude.
+        assert is_stock_like("XYZ", "Customer Preference Holdings Common Stock", "NYSE") is True
+
+    def test_bond_does_not_match_diamondback(self):
+        # 'BOND' as substring in 'DIAMONDBACK' — must not match.
+        # (Word-boundary: ND/BA boundary blocks the match anyway.)
+        assert is_stock_like("FANG", "Diamondback Energy Inc Common Stock", "NASDAQ") is True
+
+    def test_ultra_does_not_match_ultragenyx(self):
+        # 'ULTRA' inside 'ULTRAGENYX' — word boundary blocks the match.
+        # (This was a known false positive of the prior substring filter.)
+        assert is_stock_like("RARE", "Ultragenyx Pharmaceutical Inc Common Stock", "NASDAQ") is True
+
+    def test_short_does_not_match_company_with_short_in_name(self):
+        # Hypothetical: a company name containing 'short' as a regular word
+        # is not present in current Alpaca data, but boundary matching is
+        # the same. Standalone 'SHORT' is not in the exclusion list — only
+        # explicit leveraged-product terms.
+        assert is_stock_like("XYZ", "Shortwave Communications Inc", "NASDAQ") is True
+
+    def test_etf_suffix_word_bounded(self):
+        # 'ETF' must match as a token, not inside another word. Hypothetical
+        # 'METF' wouldn't trigger.
+        assert is_stock_like("METF", "Metformin Holdings Inc Common Stock", "NASDAQ") is True
+        assert (
+            is_stock_like("XLK", "Technology Select Sector SPDR ETF", "NYSEARCA")
+            is False
+        )
+
+    def test_index_does_not_match_indexing_word(self):
+        # Word-bound 'INDEX' shouldn't catch 'INDEXING' inside a real name.
+        assert is_stock_like("XYZ", "Smart Indexing Technology Corp", "NASDAQ") is True
+        # But standalone 'Index Fund' is still rejected.
+        assert is_stock_like("VOO", "Vanguard 500 Index Fund", "NYSEARCA") is False
+
+    def test_multi_word_phrase_global_x(self):
+        # Multi-word terms still match as a phrase.
+        assert (
+            is_stock_like("LIT", "Global X Lithium & Battery Tech ETF", "NYSEARCA")
+            is False
+        )
+        # But "Global Excellence" (different word after Global) passes.
+        assert is_stock_like("XYZ", "Global Excellence Holdings Inc", "NYSE") is True
+
+    def test_multi_word_phrase_daily_target(self):
+        assert (
+            is_stock_like("XYZ", "ProShares Daily Target Volatility Fund", "NYSEARCA")
+            is False
+        )
+        assert (
+            is_stock_like("XYZ", "Daily News Holdings Targeted Acquisitions Corp", "NYSE")
+            is True
+        )
+
+    def test_leveraged_token(self):
+        # 'LEVERAGED' standalone matches.
+        assert (
+            is_stock_like("XYZ", "ProShares Leveraged Long S&P 500", "NYSEARCA")
+            is False
+        )
+
+    def test_2x_3x_tokens(self):
+        # '3X' and '2X' as standalone tokens still caught.
+        assert is_stock_like("SOXL", "Direxion Daily Semiconductor Bull 3X Shares", "NYSEARCA") is False
+        assert is_stock_like("SSO", "ProShares Ultra 2X S&P 500", "NYSEARCA") is False
+        # But a name with '3xx' (no boundary) wouldn't match — hypothetical safety.
+        assert is_stock_like("XYZ", "Pi3xx Networks Inc", "NASDAQ") is True
