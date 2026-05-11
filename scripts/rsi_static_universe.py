@@ -188,46 +188,8 @@ def prefilter_assets(
 
 def _is_stock_like(asset: AssetInfo) -> bool:
     """Best-effort exclusion of ETFs, funds, trusts, and other wrappers."""
-    text = f"{asset.symbol} {asset.name} {asset.exchange}".upper()
-    symbol = asset.symbol.upper()
-    excluded_symbol_patterns = (
-        ".PR",
-        ".WS",
-        ".WT",
-        ".RT",
-    )
-    if any(pattern in symbol for pattern in excluded_symbol_patterns):
-        return False
-    excluded_terms = (
-        " ETF",
-        "ETN",
-        "FUND",
-        "TRUST",
-        "INDEX",
-        "ISHARES",
-        "SPDR",
-        "VANGUARD",
-        "INVESCO",
-        "PROSHARES",
-        "DIREXION",
-        "GLOBAL X",
-        "BOND",
-        "TREASURY",
-        "PREFERRED",
-        "PREFD",
-        "PREF",
-        "DEPOSITARY",
-        "RIGHT",
-        "WARRANT",
-        "UNIT",
-        "ULTRA",
-        "BEAR",
-        "BULL",
-        "LEVERAGED",
-        "2X",
-        "3X",
-    )
-    return not any(term in text for term in excluded_terms)
+    from utils.asset_filters import is_stock_like
+    return is_stock_like(asset.symbol, asset.name, asset.exchange)
 
 
 def _fetch_sector(symbol: str) -> str:

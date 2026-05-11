@@ -191,13 +191,28 @@ Required:
 - close > SMA200
 - SMA50 > SMA150
 - SMA150 > SMA200
-- SMA200 today > SMA200 from 20 trading days ago
 
 Rationale:
 
 This follows the same broad consensus as trend-template style screens: trade
 stocks already in sustained Stage 2-style uptrends, not stocks that merely
 look cheap or recently bounced.
+
+Note (v2): the v1 rule also required "SMA200 today > SMA200 from 20 trading
+days ago." It was retired in v2 because the long-term-direction concern it
+addressed is already covered twice:
+
+1. The engine-level BEAR regime gate (`RegimeDetector`: SPY < 200 SMA)
+   blocks SMA entries during macro downtrends regardless of per-symbol state.
+2. The per-symbol `close > SMA200` plus `SMA50 > SMA150 > SMA200`
+   alignment requirement already guarantees price is above a long-term
+   moving average that the shorter averages confirm.
+
+In addition, the rising-SMA200 rule was producing systematic lateness at
+bear-to-bull transitions: SMA200 can keep falling for 60-90 trading days
+after a real bottom, and a 20-day rising requirement adds another month on
+top of that. The result was missing the highest-edge Stage-2 emergence
+trades — exactly the entries the strategy is designed to capture.
 
 ### 4. 52-Week Strength
 
@@ -353,7 +368,16 @@ The dynamic selector must log:
 
 ## Rule Version
 
-Current rule version: `sma_watchlist_v1`
+Current rule version: `sma_watchlist_v2`
+
+History:
+
+- `sma_watchlist_v2`: dropped the "SMA200 rising over 20 trading days"
+  sub-rule from §3. The long-term-direction concern is owned by the
+  engine-level BEAR regime gate and by the in-§3 alignment requirement; the
+  rising-SMA200 clause added systematic lateness at bear-to-bull transitions
+  without independent edge.
+- `sma_watchlist_v1`: initial published rules.
 
 Changing any hard threshold creates a new rule version.
 

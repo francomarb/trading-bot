@@ -152,16 +152,35 @@ A crossover on a stock below its 50 SMA is a valid entry for trend-following if 
 
 ---
 
-## Relationship to the Regime Detector
+## Relationship to Selection and Regime Layers
 
-`SMAEdgeFilter` and `RegimeDetector` operate at different scopes:
+The SMA trade stack has three independent gating layers, each owning a
+distinct scope. `SMAEdgeFilter` is the third and innermost.
 
-| Layer | Scope | Blocks when |
-|---|---|---|
-| `RegimeDetector` (engine-level) | Entire strategy slot | BEAR (SPY < 200 SMA) or VOLATILE (high ATR%) |
-| `SMAEdgeFilter` (symbol-level) | Individual symbol | Stock below 200 SMA or volume contracting |
+| Layer | Cadence | Owner | Scope | Blocks when |
+|---|---|---|---|---|
+| Selection | Slow (offline refresh) | `scripts/sma_watchlist_scan.py` rules (see [sma-watchlist-selection.md](sma-watchlist-selection.md)) | Whole candidate universe | Name fails liquidity, trend alignment, RS percentile, ADX, ATR band, ETF/biotech industry, share-class dup |
+| Regime | Per-cycle | `RegimeDetector` | Entire strategy slot | BEAR (SPY < 200 SMA) or VOLATILE (high ATR%) |
+| Entry edge | Per-bar | `SMAEdgeFilter` | Individual symbol | Stock below 200 SMA, volume contracting, pre-earnings window |
 
-The regime detector fires first — if the regime is BEAR or VOLATILE, the engine skips entries entirely for the SMA slot and the filter is never called. The filter only evaluates individual symbols when the macro regime permits new entries.
+The layers fire outside-in. The regime detector skips the slot entirely
+during BEAR/VOLATILE and the edge filter is never called. The selection
+layer runs offline and updates the static watchlist; once a name is in,
+the edge filter judges every fresh bar.
+
+**v2 selection rules** — the watchlist scanner retired its "SMA200 rising
+over 20 trading days" sub-rule. The long-term-direction concern is owned
+by the BEAR regime gate plus the in-§3 close-above-SMA200 + alignment
+requirement; the rising-SMA200 clause was producing systematic lateness
+at bear-to-bull transitions. The edge filter's own `stock > SMA200`
+Gate 1 is unchanged — that's per-bar protection against intraperiod
+trend breaks, not a duplicate of the selection-time alignment check.
+
+v2 also added eager exclusion of ETFs (by name and yfinance `quoteType`)
+and binary-catalyst industries (Biotechnology, Drug Manufacturers —
+Specialty & Generic, Diagnostics & Research) and share-class
+deduplication (e.g. GOOG vs GOOGL). These are selection-layer concerns;
+the edge filter is unaffected.
 
 ---
 
