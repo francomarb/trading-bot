@@ -546,7 +546,163 @@ If both check out, ramp up concurrent positions to design defaults and add to li
 
 ---
 
-## 16. Future spread variants this strategy enables
+## 16. Prerequisites & staging
+
+The strategy itself is roughly 30% of the implementation. The remaining 70% is infrastructure the bot doesn't have yet. Most of that infrastructure is broadly useful — once it lands, future spread strategies (bear call, iron condor, calendar, diagonal) become small additions on top.
+
+### What's already in place (reused as-is)
+
+| Component | Used for |
+|---|---|
+| `utils/options_ranker.py` (11.25) | Extends with `rank_put_spread_candidates` |
+| `utils/options_lookup.py` chain query + pagination | Reused for picking both legs |
+| OPRA snapshot quote lookup | Reused, batched for both legs |
+| `OptionsExecutionWorker` async pattern | Pattern reused, worker itself needs extension |
+| `_OCC_PAT` engine gates | Reused as-is |
+| 100× P&L multiplier on close paths | Reused as-is |
+| `OptionTradeRejected` structured rejection | Reused as-is |
+| Stream manager + fill watcher | Reused, needs combo-event extension |
+| Earnings calendar (existing for SMA/RSI filters) | Reused for single-name underlyings |
+| Sleeve allocator | Reused with new sleeve entry |
+| Regime gating via `StrategySlot.allowed_regimes` | Reused as-is |
+| `blackscholes` library (in requirements) | Reused for delta estimation |
+
+### Hard prerequisites — must exist before strategy code can land
+
+#### Prereq 1 — Position abstraction
+
+Today the engine thinks `_position_owners: dict[symbol, strategy_name]`. For options it's keyed by underlying ticker (`"SPY"`) — the 11.23 known limitation. Credit spreads make this harder because **a single logical position is two OCC symbols simultaneously.**
+
+Generalize to a position-ID concept:
+
+```python
+_positions: dict[str, Position]   # position_id → Position
+# Position carries: strategy, legs[], entry_prices[], position_type
+# Single-leg options: one entry in legs
+# Spreads: two entries
+# Equities: position_id = equity symbol (backward compat)
+```
+
+Touch points (~10 sites in `engine/trader.py`):
+- `_restore_ownership_from_db`, `_reconcile_startup`
+- `_detect_external_closes`, `_process_stream_stop_fills`
+- `_drain_option_fills`, `_attribute_orders`
+- State snapshot for dashboard
+- `_record_realized_pnl`
+
+**Estimated:** ~400 LOC + significant test rewrites. **Subsumes 11.23 as a byproduct.**
+
+#### Prereq 2 — Trade DB schema migration
+
+Two new columns:
+- `position_id` (UUID, indexed) — groups legs of one logical position
+- `position_type` (`'single_leg'` | `'spread'`)
+
+Migration-safe column adds (the bot has done these before — see allocator state restore migrations). Backward compat: existing single-leg rows get `position_id = occ_symbol` and `position_type = 'single_leg'` in the migration.
+
+**Estimated:** ~80 LOC including migration + `TradeLogger` updates + tests.
+
+#### Prereq 3 — Multi-leg order support in `execution/broker.py`
+
+Alpaca exposes multi-leg orders via `OrderClass.MLEG`. The current broker only handles single-leg paths. Adds:
+- `place_spread_order()` — submits both legs as one combo order
+- `close_spread_order()` for exits
+- Atomic-fill / atomic-reject handling via Alpaca's combo semantics
+- `OptionsExecutionWorker` extension to await combo fills via the stream
+
+**Estimated:** ~350 LOC + tests.
+
+### Soft prerequisites — can ride inside the strategy PR
+
+| Item | Notes |
+|---|---|
+| Multi-strategy-name sleeve grouping | Use Option X from §6 (instances share a single strategy name `credit_spread`, underlying carried internally) — no allocator change needed |
+| IV proxy lookup utility | ~40 LOC, lives in the strategy PR |
+| Dashboard spread rendering | Follows naturally from the position abstraction; small dashboard update |
+
+### Critical non-code gate
+
+**Alpaca account must be at Level 3** (defined-risk spreads on cash accounts). If the account is Level 1 or 2, this entire strategy is off the table and the design needs rework. **Verify before any code is written.**
+
+### Revised staging — 3 PRs
+
+The original 2-PR plan combined the multi-leg broker with the strategy. Splitting at one more boundary makes the multi-leg broker testable on its own and keeps each PR review-sized.
+
+#### PR 1 — Position abstraction + Trade DB schema
+
+| Component | LOC |
+|---|---|
+| `Position` dataclass + engine refactor | ~400 |
+| Trade DB schema migration + `TradeLogger` updates | ~80 |
+| Backfill migration script (existing rows get `position_id`) | ~30 |
+| Tests | ~400 |
+| **Total** | **~910 LOC** |
+
+**Functional outcome:** No new strategies. The bot has a clean position abstraction; single-leg options continue working unchanged. **11.23 closed as a byproduct.**
+
+**Risk profile:** Lowest — pure refactor with backward-compat checks. The bot keeps running the existing strategies the whole time.
+
+**Validation gate before merge:** Recycle the bot, confirm existing positions reconcile cleanly under the new abstraction, run a paper cycle without errors.
+
+#### PR 2 — Multi-leg order support + spread ranker extension
+
+| Component | LOC |
+|---|---|
+| `AlpacaBroker.place_spread_order` + `close_spread_order` | ~200 |
+| `OptionsExecutionWorker` spread variant | ~150 |
+| Stream manager combo-event handling | ~50 |
+| `utils/options_ranker.rank_put_spread_candidates` | ~150 |
+| Multi-leg picker (chain query → ranker → `SpreadCandidate`) | ~130 |
+| Tests | ~450 |
+| **Total** | **~1,130 LOC** |
+
+**Functional outcome:** Bot can submit and track multi-leg orders. Ranker can score spread pairs. No strategy yet uses it.
+
+**Risk profile:** Medium — new broker code path, but unit-testable with mocked Alpaca client. Has a one-shot integration verify script that places and cancels a test spread order on paper to prove the pipeline.
+
+**Validation gate before merge:** Integration script places + cancels a real spread order on Alpaca paper without errors.
+
+#### PR 3 — Credit spread strategy
+
+| Component | LOC |
+|---|---|
+| `strategies/credit_spread.py` | ~450 |
+| `strategies/filters/credit_spread.py` (edge filter + IV proxy) | ~160 |
+| IV proxy utility (`utils/iv_proxy.py`) | ~40 |
+| Per-instrument config in `config/settings.py` | ~80 |
+| `forward_test.py` slot wiring for SPY + QQQ | ~30 |
+| Dashboard spread rendering | ~100 |
+| Strategy unit tests | ~500 |
+| Integration verify script | ~250 |
+| **Total** | **~1,610 LOC** |
+
+**Functional outcome:** Live credit spreads on SPY + QQQ paper trading.
+
+**Risk profile:** Strategy logic + parameter tuning. The hard plumbing is already in via PR 1 and PR 2, so review focuses on strategy correctness rather than infrastructure mechanics.
+
+**Validation gate before merge:** Integration verify passes, first 5 paper trades complete without infrastructure errors, paper-watch follow-up item logged in PLAN.md (analogous to 11.26).
+
+### Effort summary
+
+| PR | LOC | Days (focused) | Cumulative |
+|---|---|---|---|
+| PR 1 — Position abstraction | ~910 | 1.5 | 1.5 |
+| PR 2 — Multi-leg + ranker | ~1,130 | 1.5 | 3.0 |
+| PR 3 — Credit spread strategy | ~1,610 | 2.0 | 5.0 |
+| **Total** | **~3,650** | **5.0 days** | — |
+
+Larger than the original 2,250 LOC estimate because the position-abstraction refactor surfaces more touch points than the SPY-only proposal anticipated. Worth it: the abstraction is the right end state regardless of credit spreads.
+
+### What to decide before any code is written
+
+1. **Alpaca Level 3 verification** — the single biggest gate. Confirm the account is approved before PR 1 starts.
+2. **Confirm 3-PR staging** — vs single PR or different split.
+3. **Confirm 11.23 folds into PR 1** — close 11.23 as resolved by the position abstraction.
+4. **Confirm v1 underlyings** — SPY + QQQ at v1 (default), or SPY only first then QQQ in v1.1?
+
+---
+
+## 17. Future spread variants this strategy enables
 
 The infrastructure built for credit spreads makes these much cheaper to add later:
 
