@@ -199,10 +199,14 @@ class SPYOptionsReversionStrategy(BaseStrategy):
         premium efficiency). Hard filters drop unaffordable, broken-quote,
         outrageously-spread (>10%), or premium-outlier contracts.
 
-        ``notional_cap`` is the per-position sleeve budget (from the allocator).
-        It is converted to a per-contract cap by dividing by 100 (the standard
-        equity option multiplier), so the picker never returns a contract the
-        sleeve cannot afford.
+        ``notional_cap`` is the per-position dollar budget from the allocator
+        and is passed straight through to the ranker as ``max_premium_per_contract``.
+        The ranker computes each candidate's per-contract cost as ``mid × 100``
+        (standard equity option multiplier) and rejects candidates whose
+        per-contract cost exceeds that dollar budget. No conversion is needed
+        because the budget and the cost are both in the same dollars-per-contract
+        units. Do NOT divide ``notional_cap`` by 100 — that would shrink the
+        budget 100× and reject nearly every contract.
 
         Returns (occ_symbol, limit_price, take_profit, stop_loss).
         Raises ``OptionTradeRejected`` if no contract survives.
@@ -212,7 +216,10 @@ class SPYOptionsReversionStrategy(BaseStrategy):
                 f"{symbol}: notional_cap=${notional_cap} — sleeve has no room."
             )
 
-        max_premium_per_contract = notional_cap  # already $-per-contract scale
+        # Pass-through: notional_cap is the dollar budget for one position, and
+        # the ranker compares mid*100 (per-contract cost) against this same
+        # dollar figure. No /100 conversion — see docstring.
+        max_premium_per_contract = notional_cap
         quote_lookup = _build_quote_lookup()
 
         pick: ContractPick | None = find_best_call(
