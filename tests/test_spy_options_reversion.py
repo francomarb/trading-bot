@@ -122,27 +122,64 @@ class TestSPYOptionsStrategyEdgeFilterIntegration:
 
 
 class TestBuildOptionExecution:
-    def test_uses_sdk_singular_option_snapshot_method(self):
+    def test_passes_notional_cap_through_picker_and_returns_pick_premium(self):
+        """Strategy converts notional_cap to the per-contract budget cap
+        and trusts the ContractPick.premium that comes back."""
+        from utils.options_lookup import ContractPick
+        from utils.options_ranker import Candidate, Quote, ScoredPick
+
         strat = SPYOptionsReversionStrategy()
         occ_symbol = "SPY260521C00730000"
-        quote = SimpleNamespace(bid_price=4.80, ask_price=5.00)
-        snapshot_entry = SimpleNamespace(latest_quote=quote, latest_trade=None)
-        snapshot_payload = {occ_symbol: snapshot_entry}
+        pick = ContractPick(
+            occ_symbol=occ_symbol,
+            premium=4.90,
+            spread_pct=0.04,
+            score=0.85,
+            components={
+                "strike_proximity": 1.0,
+                "spread_quality": 0.20,
+                "premium_efficiency": 0.85,
+            },
+            runners_up=[],
+        )
 
-        with patch("strategies.spy_options_reversion.find_best_call", return_value=occ_symbol):
-            with patch("alpaca.data.historical.option.OptionHistoricalDataClient") as mock_client_cls:
-                client = mock_client_cls.return_value
-                client.get_option_snapshot.return_value = snapshot_payload
+        with patch(
+            "strategies.spy_options_reversion.find_best_call",
+            return_value=pick,
+        ) as mock_picker:
+            opt_sym, premium, take_profit, stop_loss = strat.build_option_execution(
+                "SPY", 733.71, notional_cap=2_000.0,
+            )
 
-                opt_sym, premium, take_profit, stop_loss = strat.build_option_execution(
-                    "SPY", 733.71
-                )
-
-        client.get_option_snapshot.assert_called_once()
+        kwargs = mock_picker.call_args.kwargs
+        assert kwargs["max_premium_per_contract"] == 2_000.0
+        assert callable(kwargs["quote_lookup"])
         assert opt_sym == occ_symbol
         assert premium == 4.90
         assert take_profit == 14.70
         assert stop_loss == 3.68
+
+    def test_rejects_when_no_pick_available(self):
+        from strategies.spy_options_reversion import OptionTradeRejected
+
+        strat = SPYOptionsReversionStrategy()
+        with patch(
+            "strategies.spy_options_reversion.find_best_call",
+            return_value=None,
+        ):
+            with pytest.raises(OptionTradeRejected, match="No tradeable option"):
+                strat.build_option_execution(
+                    "SPY", 733.71, notional_cap=2_000.0,
+                )
+
+    def test_rejects_when_notional_cap_missing(self):
+        from strategies.spy_options_reversion import OptionTradeRejected
+
+        strat = SPYOptionsReversionStrategy()
+        with pytest.raises(OptionTradeRejected, match="sleeve has no room"):
+            strat.build_option_execution(
+                "SPY", 733.71, notional_cap=0.0,
+            )
 
 
 # ── inspect_open_positions: time stop ─────────────────────────────────────────

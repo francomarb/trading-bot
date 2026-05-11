@@ -1,3 +1,12 @@
+"""
+Unit tests for ``utils.options_lookup.find_best_call`` (11.25).
+
+The picker takes a quote-lookup callback and a per-contract budget, then
+delegates ranking to ``utils.options_ranker``. These tests focus on the
+glue: chain query construction, the K-nearest pre-filter, plumbing
+between the chain response and the ranker, and graceful failure modes.
+"""
+
 from __future__ import annotations
 
 from datetime import date
@@ -6,7 +15,8 @@ from unittest.mock import MagicMock, patch
 
 from alpaca.trading.enums import AssetStatus, ContractType
 
-from utils.options_lookup import find_best_call
+from utils.options_lookup import ContractPick, find_best_call
+from utils.options_ranker import Quote
 
 
 def _contract(symbol: str, expiry: date, strike: float) -> SimpleNamespace:
@@ -17,12 +27,21 @@ def _contract(symbol: str, expiry: date, strike: float) -> SimpleNamespace:
     )
 
 
+def _quotes(d: dict[str, Quote]):
+    """Build a quote_lookup callback that returns the canned dict, with
+    every requested OCC symbol present (missing → None)."""
+
+    def _lookup(occ_symbols: list[str]) -> dict[str, Quote | None]:
+        return {occ: d.get(occ) for occ in occ_symbols}
+
+    return _lookup
+
+
 class TestFindBestCall:
-    def test_filters_to_target_strike_band_and_picks_nearest(self):
+    def test_chain_query_uses_band_and_dte_window(self):
         expiry = date(2026, 5, 22)
         response = SimpleNamespace(
             option_contracts=[
-                _contract("SPY260522C00720000", expiry, 720.0),
                 _contract("SPY260522C00730000", expiry, 730.0),
                 _contract("SPY260522C00735000", expiry, 735.0),
             ],
@@ -31,17 +50,31 @@ class TestFindBestCall:
         client = MagicMock()
         client.get_option_contracts.return_value = response
 
-        with patch("utils.options_lookup._get_client", return_value=client):
-            occ_symbol = find_best_call("SPY", 736.94, min_dte=14, max_dte=28)
+        quote_lookup = _quotes({
+            "SPY260522C00730000": Quote(bid=8.00, ask=8.05),
+            "SPY260522C00735000": Quote(bid=5.00, ask=5.05),
+        })
 
-        assert occ_symbol == "SPY260522C00735000"
+        with patch("utils.options_lookup._get_client", return_value=client):
+            pick = find_best_call(
+                "SPY", 736.94,
+                min_dte=14, max_dte=28,
+                max_premium_per_contract=2_000.0,
+                quote_lookup=quote_lookup,
+            )
+
+        # Request shape — verifies the band and option-type constraints.
         req = client.get_option_contracts.call_args.args[0]
         assert req.status == AssetStatus.ACTIVE
         assert req.type == ContractType.CALL
         assert req.strike_price_gte == "711.26"
         assert req.strike_price_lte == "755.25"
 
-    def test_paginates_and_uses_later_page_when_needed(self):
+        # A valid pick was returned (specific winner is the ranker's call).
+        assert isinstance(pick, ContractPick)
+        assert pick.occ_symbol in {"SPY260522C00730000", "SPY260522C00735000"}
+
+    def test_paginates_chain_until_token_exhausted(self):
         expiry = date(2026, 5, 22)
         first = SimpleNamespace(option_contracts=[], next_page_token="page-2")
         second = SimpleNamespace(
@@ -54,13 +87,25 @@ class TestFindBestCall:
         client = MagicMock()
         client.get_option_contracts.side_effect = [first, second]
 
+        quote_lookup = _quotes({
+            "SPY260522C00725000": Quote(bid=9.00, ask=9.05),
+            "SPY260522C00730000": Quote(bid=6.00, ask=6.05),
+        })
+
         with patch("utils.options_lookup._get_client", return_value=client):
-            occ_symbol = find_best_call("SPY", 733.71, min_dte=14, max_dte=28)
+            pick = find_best_call(
+                "SPY", 733.71,
+                min_dte=14, max_dte=28,
+                max_premium_per_contract=2_000.0,
+                quote_lookup=quote_lookup,
+            )
 
-        assert occ_symbol == "SPY260522C00730000"
         assert client.get_option_contracts.call_count == 2
+        assert pick is not None
+        assert pick.occ_symbol in {"SPY260522C00725000", "SPY260522C00730000"}
 
-    def test_returns_none_when_only_far_off_contract_would_have_been_old_bug(self):
+    def test_returns_none_when_chain_returns_only_far_off_contract(self):
+        # Regression for the 2026-05-08 hotfix — far-OTM contract outside band.
         expiry = date(2026, 5, 22)
         response = SimpleNamespace(
             option_contracts=[_contract("SPY260522C00659000", expiry, 659.0)],
@@ -69,7 +114,138 @@ class TestFindBestCall:
         client = MagicMock()
         client.get_option_contracts.return_value = response
 
-        with patch("utils.options_lookup._get_client", return_value=client):
-            occ_symbol = find_best_call("SPY", 736.94, min_dte=14, max_dte=28)
+        quote_lookup = _quotes({})
 
-        assert occ_symbol is None
+        with patch("utils.options_lookup._get_client", return_value=client):
+            pick = find_best_call(
+                "SPY", 736.94,
+                min_dte=14, max_dte=28,
+                max_premium_per_contract=2_000.0,
+                quote_lookup=quote_lookup,
+            )
+
+        assert pick is None
+
+    def test_returns_none_when_all_candidates_have_fatal_spreads(self):
+        expiry = date(2026, 5, 22)
+        response = SimpleNamespace(
+            option_contracts=[
+                _contract("SPY260522C00730000", expiry, 730.0),
+                _contract("SPY260522C00735000", expiry, 735.0),
+            ],
+            next_page_token=None,
+        )
+        client = MagicMock()
+        client.get_option_contracts.return_value = response
+
+        # Both have spreads above the 10% FATAL_SPREAD_PCT.
+        quote_lookup = _quotes({
+            "SPY260522C00730000": Quote(bid=5.00, ask=6.00),  # 18% spread
+            "SPY260522C00735000": Quote(bid=4.00, ask=5.00),  # 22% spread
+        })
+
+        with patch("utils.options_lookup._get_client", return_value=client):
+            pick = find_best_call(
+                "SPY", 736.94,
+                min_dte=14, max_dte=28,
+                max_premium_per_contract=2_000.0,
+                quote_lookup=quote_lookup,
+            )
+
+        assert pick is None
+
+    def test_quote_lookup_failure_returns_none(self):
+        expiry = date(2026, 5, 22)
+        response = SimpleNamespace(
+            option_contracts=[_contract("SPY260522C00730000", expiry, 730.0)],
+            next_page_token=None,
+        )
+        client = MagicMock()
+        client.get_option_contracts.return_value = response
+
+        def _raising(_):
+            raise RuntimeError("OPRA down")
+
+        with patch("utils.options_lookup._get_client", return_value=client):
+            pick = find_best_call(
+                "SPY", 736.94,
+                min_dte=14, max_dte=28,
+                max_premium_per_contract=2_000.0,
+                quote_lookup=_raising,
+            )
+
+        assert pick is None
+
+    def test_caps_quote_fetch_at_top_k_strike_nearest(self):
+        # Six candidates in band — only top-5 strike-nearest should be quoted.
+        expiry = date(2026, 5, 22)
+        target_strike = 736.94 * 0.995  # ~733.36
+        contracts = [
+            _contract("SPY260522C00725000", expiry, 725.0),
+            _contract("SPY260522C00730000", expiry, 730.0),
+            _contract("SPY260522C00733000", expiry, 733.0),  # closest
+            _contract("SPY260522C00735000", expiry, 735.0),
+            _contract("SPY260522C00740000", expiry, 740.0),
+            _contract("SPY260522C00745000", expiry, 745.0),  # farthest, should be cut
+        ]
+        response = SimpleNamespace(
+            option_contracts=contracts,
+            next_page_token=None,
+        )
+        client = MagicMock()
+        client.get_option_contracts.return_value = response
+
+        seen: list[list[str]] = []
+
+        def _capturing_lookup(occ_symbols: list[str]):
+            seen.append(list(occ_symbols))
+            return {occ: Quote(bid=5.00, ask=5.05) for occ in occ_symbols}
+
+        with patch("utils.options_lookup._get_client", return_value=client):
+            pick = find_best_call(
+                "SPY", 736.94,
+                min_dte=14, max_dte=28,
+                max_premium_per_contract=2_000.0,
+                quote_lookup=_capturing_lookup,
+            )
+
+        assert pick is not None
+        # Exactly one quote call, and at most 5 symbols requested.
+        assert len(seen) == 1
+        assert len(seen[0]) <= 5
+        # The most-distant candidate must not be in the quoted list.
+        assert "SPY260522C00745000" not in seen[0]
+
+    def test_pick_carries_score_breakdown_and_runners_up(self):
+        expiry = date(2026, 5, 22)
+        response = SimpleNamespace(
+            option_contracts=[
+                _contract("SPY260522C00730000", expiry, 730.0),
+                _contract("SPY260522C00735000", expiry, 735.0),
+                _contract("SPY260522C00740000", expiry, 740.0),
+            ],
+            next_page_token=None,
+        )
+        client = MagicMock()
+        client.get_option_contracts.return_value = response
+
+        quote_lookup = _quotes({
+            "SPY260522C00730000": Quote(bid=8.00, ask=8.05),
+            "SPY260522C00735000": Quote(bid=5.00, ask=5.05),
+            "SPY260522C00740000": Quote(bid=3.00, ask=3.05),
+        })
+
+        with patch("utils.options_lookup._get_client", return_value=client):
+            pick = find_best_call(
+                "SPY", 736.94,
+                min_dte=14, max_dte=28,
+                max_premium_per_contract=2_000.0,
+                quote_lookup=quote_lookup,
+            )
+
+        assert isinstance(pick, ContractPick)
+        assert set(pick.components.keys()) == {
+            "strike_proximity", "spread_quality", "premium_efficiency"
+        }
+        # Two surviving runners-up after the winner.
+        assert len(pick.runners_up) == 2

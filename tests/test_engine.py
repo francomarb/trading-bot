@@ -444,7 +444,7 @@ class TestProcessSymbol:
             name = "spy_options_reversion"
             preferred_order_type = OrderType.LIMIT
 
-            def build_option_execution(self, symbol, latest_close):
+            def build_option_execution(self, symbol, latest_close, *, notional_cap=None):
                 raise OptionTradeRejected(
                     "SPY260521C00730000: spread 12.6% > 5% (bid=8.73 ask=9.90) — skipping trade."
                 )

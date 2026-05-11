@@ -12,7 +12,8 @@ from loguru import logger
 
 from indicators.technicals import add_rsi
 from strategies.base import BaseStrategy, SignalFrame, OrderType
-from utils.options_lookup import find_best_call
+from utils.options_lookup import ContractPick, find_best_call
+from utils.options_ranker import Quote
 
 _ET = ZoneInfo("America/New_York")
 _OCC_RE = re.compile(r"^([A-Z]+)(\d{6})([CP])(\d{8})$")
@@ -184,77 +185,62 @@ class SPYOptionsReversionStrategy(BaseStrategy):
     # ── Option execution ─────────────────────────────────────────────────────
 
     def build_option_execution(
-        self, symbol: str, underlying_price: float
+        self,
+        symbol: str,
+        underlying_price: float,
+        *,
+        notional_cap: float,
     ) -> Tuple[str, float, float, float]:
         """
-        Resolve the best OCC contract and price it at the midpoint.
+        Pick the best-scoring affordable call contract and price it at midpoint.
 
-        Spread guard: rejects if (ask - bid) / midpoint > 5%.
-        No-quote guard: rejects if bid <= 0 or OPRA data unavailable.
+        Selection uses ``utils.options_ranker``: quotes the top-5 strike-nearest
+        candidates and scores each on (strike proximity, spread quality,
+        premium efficiency). Hard filters drop unaffordable, broken-quote,
+        outrageously-spread (>10%), or premium-outlier contracts.
+
+        ``notional_cap`` is the per-position dollar budget from the allocator
+        and is passed straight through to the ranker as ``max_premium_per_contract``.
+        The ranker computes each candidate's per-contract cost as ``mid × 100``
+        (standard equity option multiplier) and rejects candidates whose
+        per-contract cost exceeds that dollar budget. No conversion is needed
+        because the budget and the cost are both in the same dollars-per-contract
+        units. Do NOT divide ``notional_cap`` by 100 — that would shrink the
+        budget 100× and reject nearly every contract.
 
         Returns (occ_symbol, limit_price, take_profit, stop_loss).
-        Raises ValueError on any rejection so the engine skips the trade.
+        Raises ``OptionTradeRejected`` if no contract survives.
         """
-        occ_symbol = find_best_call(
-            symbol, underlying_price, min_dte=14, max_dte=28, target_delta=0.55
+        if notional_cap is None or notional_cap <= 0:
+            raise OptionTradeRejected(
+                f"{symbol}: notional_cap=${notional_cap} — sleeve has no room."
+            )
+
+        # Pass-through: notional_cap is the dollar budget for one position, and
+        # the ranker compares mid*100 (per-contract cost) against this same
+        # dollar figure. No /100 conversion — see docstring.
+        max_premium_per_contract = notional_cap
+        quote_lookup = _build_quote_lookup()
+
+        pick: ContractPick | None = find_best_call(
+            symbol,
+            underlying_price,
+            min_dte=14,
+            max_dte=28,
+            target_delta=0.55,
+            max_premium_per_contract=max_premium_per_contract,
+            quote_lookup=quote_lookup,
         )
-        if not occ_symbol:
-            raise OptionTradeRejected(f"No valid option contract found for {symbol}")
-
-        from alpaca.data.historical.option import OptionHistoricalDataClient
-        from alpaca.data.requests import OptionSnapshotRequest
-        from config.settings import ALPACA_API_KEY, ALPACA_SECRET_KEY
-
-        data_client = OptionHistoricalDataClient(ALPACA_API_KEY, ALPACA_SECRET_KEY)
-        req = OptionSnapshotRequest(symbol_or_symbols=occ_symbol)
-
-        try:
-            snapshot = data_client.get_option_snapshot(req)
-        except Exception as e:
+        if pick is None:
             raise OptionTradeRejected(
-                f"OPRA snapshot unavailable for {occ_symbol}: {e}. "
-                "Cannot verify spread — skipping trade."
+                f"No tradeable option contract for {symbol} "
+                f"(budget ${max_premium_per_contract:,.0f}/contract)."
             )
 
-        entry = snapshot.get(occ_symbol)
-        if entry is None:
-            raise OptionTradeRejected(
-                f"No snapshot data returned for {occ_symbol}. "
-                "Cannot verify spread — skipping trade."
-            )
-
-        # Prefer quote; fall back to last trade.
-        quote = entry.latest_quote
-        if quote is not None:
-            bid = float(quote.bid_price)
-            ask = float(quote.ask_price)
-            if bid <= 0:
-                raise OptionTradeRejected(
-                    f"{occ_symbol}: bid=${bid:.2f} — no valid quote. "
-                    "Cannot verify spread — skipping trade."
-                )
-            midpoint = (bid + ask) / 2.0
-            spread_pct = (ask - bid) / midpoint
-            if spread_pct > 0.05:
-                raise OptionTradeRejected(
-                    f"{occ_symbol}: spread {spread_pct:.1%} > 5% "
-                    f"(bid={bid:.2f} ask={ask:.2f}) — skipping trade."
-                )
-            premium = midpoint
-        elif entry.latest_trade is not None:
-            # No quote available; use last trade price but cannot check spread.
-            raise OptionTradeRejected(
-                f"{occ_symbol}: no live quote (only last trade). "
-                "Cannot verify spread — skipping trade."
-            )
-        else:
-            raise OptionTradeRejected(
-                f"{occ_symbol}: no quote or trade data available — skipping trade."
-            )
-
+        premium = pick.premium
         if premium <= 0:
             raise OptionTradeRejected(
-                f"{occ_symbol}: computed premium={premium:.2f} <= 0 — skipping trade."
+                f"{pick.occ_symbol}: computed premium={premium:.2f} <= 0 — skipping trade."
             )
 
         # Hard SL at -25% (backtest validated). TP is a +200% safety valve —
@@ -263,7 +249,49 @@ class SPYOptionsReversionStrategy(BaseStrategy):
         stop_loss = round(premium * 0.75, 2)
 
         logger.info(
-            f"[{self.name}] {occ_symbol}: premium=${premium:.2f} "
-            f"spread={spread_pct:.1%} SL=${stop_loss:.2f} TP=${take_profit:.2f} (safety valve)"
+            f"[{self.name}] {pick.occ_symbol}: premium=${premium:.2f} "
+            f"spread={pick.spread_pct:.1%} score={pick.score:.2f} "
+            f"SL=${stop_loss:.2f} TP=${take_profit:.2f} (safety valve)"
         )
-        return occ_symbol, premium, take_profit, stop_loss
+        return pick.occ_symbol, premium, take_profit, stop_loss
+
+
+def _build_quote_lookup():
+    """
+    Construct a quote-lookup callable that resolves a batch of OCC symbols
+    via Alpaca's option snapshot endpoint. Returns ``None`` for any symbol
+    without a valid live quote so the ranker drops it cleanly.
+    """
+    from alpaca.data.historical.option import OptionHistoricalDataClient
+    from alpaca.data.requests import OptionSnapshotRequest
+    from config.settings import ALPACA_API_KEY, ALPACA_SECRET_KEY
+
+    data_client = OptionHistoricalDataClient(ALPACA_API_KEY, ALPACA_SECRET_KEY)
+
+    def _lookup(occ_symbols: list[str]) -> dict[str, "Quote | None"]:
+        if not occ_symbols:
+            return {}
+        try:
+            snapshot = data_client.get_option_snapshot(
+                OptionSnapshotRequest(symbol_or_symbols=occ_symbols)
+            )
+        except Exception as e:
+            logger.warning(f"OPRA snapshot batch failed: {e}")
+            return {occ: None for occ in occ_symbols}
+
+        out: dict[str, "Quote | None"] = {}
+        for occ in occ_symbols:
+            entry = snapshot.get(occ)
+            if entry is None or entry.latest_quote is None:
+                out[occ] = None
+                continue
+            q = entry.latest_quote
+            bid = float(q.bid_price)
+            ask = float(q.ask_price)
+            if bid <= 0 or ask <= 0:
+                out[occ] = None
+                continue
+            out[occ] = Quote(bid=bid, ask=ask)
+        return out
+
+    return _lookup
