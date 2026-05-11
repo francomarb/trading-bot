@@ -55,16 +55,20 @@ ORDER_CONFIRM_TIMEOUT_SECONDS: float = float(
 
 # Strategy-specific watchlists
 # SMA Crossover — trend-following; static list promoted from:
-#   /Users/franco/trading-bot/scripts/sma_watchlist_scan.py
-#   rule=sma_watchlist_v1, feed=sip, end_delay=60m, fundamentals=True
-#   generated 2026-04-26; report: logs/sma_scan_v2.md
-# MU and NVDA are non-scanner exceptions, retained solely for ownership
-# continuity while open paper positions exist. Remove them after the strategy
-# exits if they still fail the scan.
+#   /Users/franco/trading-bot/scripts/sma_watchlist_scan.py --top 30 --feed sip
+#   rule=sma_watchlist_v2, feed=sip, end_delay=60m
+#   generated 2026-05-11; report: logs/sma_scan_top30.md
+#
+# Scanner-derived top 30 by composite score (the first 30 entries below).
+# NVDA is the lone non-scanner exception, retained as a protected open SMA
+# position (RS%=40.5 at scan time — clearly weak; let the strategy exit it
+# on its own signal, then remove from this list on next refresh).
 SMA_WATCHLIST = [
-    "GOOG", "WT", "TD", "IYZ", "RY", "MS",
-    "CM", "JAZZ", "BK", "BMO", "WDC", "FIGS", "VLUE",
-    "MU", "NVDA", "AMD", "AMZN",
+    "SNDK", "WDC", "STX", "GSAT", "POWL", "VIAV", "VSAT", "CIEN",
+    "MU", "FORM", "ALB", "CSTM", "DOCN", "TTMI", "FRO", "MTZ",
+    "DK", "ASX", "CAT", "HUT", "GLW", "AMD", "STRL", "INTC",
+    "BE", "ECG", "MRVL", "NVT", "SQM", "TSEM",
+    "NVDA",
 ]
 # RSI Reversion — mean-reversion; promoted from the 2026-04-30 expanded
 # backtest pass to increase signal density for the static paper-trading pool.
