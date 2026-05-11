@@ -45,6 +45,14 @@ STREAM_RECONNECT_MAX_DELAY_SECONDS: float = float(
     os.getenv("STREAM_RECONNECT_MAX_DELAY_SECONDS", "30")
 )
 
+# Broker order confirmation window
+# Give Alpaca enough time to stream or surface slower fills before we classify
+# an order as timed out. This especially matters for fractional entries, which
+# can fill in multiple chunks over more than a few seconds.
+ORDER_CONFIRM_TIMEOUT_SECONDS: float = float(
+    os.getenv("ORDER_CONFIRM_TIMEOUT_SECONDS", "240")
+)
+
 # Strategy-specific watchlists
 # SMA Crossover — trend-following; static list promoted from:
 #   /Users/franco/trading-bot/scripts/sma_watchlist_scan.py

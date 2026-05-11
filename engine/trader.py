@@ -1500,13 +1500,20 @@ class TradingEngine:
                 strategy=owner,
             )
             if stop_price is None:
-                msg = (
-                    f"{symbol}: managed position owned by '{owner}' has no "
-                    "protective stop and no recoverable stop price in trade log"
+                stop_price = self._reconstruct_missing_entry_context(
+                    snapshot=snapshot,
+                    symbol=symbol,
+                    owner=owner,
+                    position=position,
                 )
-                logger.error(msg)
-                self.alerts.broker_error(msg)
-                continue
+                if stop_price is None:
+                    msg = (
+                        f"{symbol}: managed position owned by '{owner}' has no "
+                        "protective stop and no recoverable stop price in trade log"
+                    )
+                    logger.error(msg)
+                    self.alerts.broker_error(msg)
+                    continue
 
             try:
                 repaired = self.broker.place_protective_stop(
@@ -1524,6 +1531,112 @@ class TradingEngine:
                 logger.error(msg)
                 self.risk.record_broker_error()
                 self.alerts.broker_error(msg)
+
+    def _reconstruct_missing_entry_context(
+        self,
+        *,
+        snapshot: BrokerSnapshot,
+        symbol: str,
+        owner: str,
+        position: Position,
+    ) -> float | None:
+        """
+        Best-effort fallback when a managed equity position has no trade-log context.
+
+        Uses the assigned strategy plus the latest completed bar to reconstruct
+        the original-style stop, then persists a recovered entry record from the
+        broker position so normal stop-repair can continue.
+        """
+        if _OCC_PAT.match(symbol):
+            return None
+
+        slot = next(
+            (
+                s
+                for s in self.slots
+                if s.strategy.name == owner and symbol in s.active_symbols()
+            ),
+            None,
+        )
+        if slot is None:
+            return None
+
+        end = self._clock()
+        lookback_days = _lookback_days(
+            slot.strategy.required_bars(),
+            slot.timeframe,
+            self.config.history_lookback_days,
+        )
+        start = end - timedelta(days=lookback_days)
+        try:
+            raw_df, _stats = fetch_symbol(symbol, start, end, timeframe=slot.timeframe)
+        except Exception as e:
+            logger.warning(
+                f"{symbol}: failed to reconstruct missing entry context from market data: {e}"
+            )
+            return None
+        if raw_df.empty:
+            return None
+
+        decision_df, _using_prior_completed_bar = self._decision_frame(
+            raw_df,
+            slot.timeframe,
+            market_open=self._market_open(),
+        )
+        if decision_df.empty:
+            return None
+
+        df = add_atr(decision_df, self.config.atr_length)
+        latest_atr = float(df[f"atr_{self.config.atr_length}"].iloc[-1])
+        latest_close = float(df["close"].iloc[-1])
+        entry_price = float(
+            getattr(position, "avg_entry_price", 0.0) or latest_close
+        )
+
+        signal = Signal(
+            symbol=symbol,
+            side=Side.BUY,
+            strategy_name=owner,
+            reference_price=latest_close,
+            atr=latest_atr,
+            reason=f"{owner} recovered entry context",
+            order_type=slot.strategy.preferred_order_type,
+            limit_price=latest_close
+            if slot.strategy.preferred_order_type is OrderType.LIMIT
+            else None,
+        )
+        stop_price = self.risk._stop_price_for(signal)
+
+        recovered_decision = RiskDecision(
+            symbol=symbol,
+            side=Side.BUY,
+            qty=float(position.qty),
+            entry_reference_price=entry_price,
+            stop_price=stop_price,
+            strategy_name=owner,
+            reason=f"{owner} recovered entry context",
+            order_type=slot.strategy.preferred_order_type,
+            limit_price=entry_price
+            if slot.strategy.preferred_order_type is OrderType.LIMIT
+            else None,
+        )
+        recovered_result = OrderResult(
+            status=OrderStatus.FILLED,
+            order_id=None,
+            symbol=symbol,
+            requested_qty=float(position.qty),
+            filled_qty=float(position.qty),
+            avg_fill_price=entry_price,
+            raw_status="recovered",
+            message="recovered from broker position",
+        )
+        self._log_entry(recovered_decision, recovered_result, latest_close)
+        self._entry_prices[symbol] = entry_price
+        logger.warning(
+            f"{symbol}: reconstructed missing entry context for '{owner}' "
+            f"using broker avg_entry=${entry_price:.2f} and ATR stop=${stop_price:.2f}"
+        )
+        return stop_price
 
     def _cleanup_stale_orders(self, snapshot: BrokerSnapshot, order_strategy: dict[str, str]) -> None:
         """

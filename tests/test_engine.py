@@ -1917,6 +1917,35 @@ class TestOptionsEngineFixes:
         engine._repair_missing_protective_stops(snap)
         engine.broker.place_protective_stop.assert_not_called()
 
+    def test_stop_repair_reconstructs_missing_entry_context_for_managed_equity(self, tmp_path, monkeypatch):
+        """If DB context is missing but broker position + owner exist, self-heal should reconstruct and repair."""
+        engine = self._engine(tmp_path)
+        engine._position_owners["AAPL"] = "fake_strategy"
+        engine.risk._stop_price_for = MagicMock(return_value=95.0)
+        engine.broker.place_protective_stop = MagicMock(return_value=_open_stop_order("AAPL", 95.0))
+        monkeypatch.setattr(
+            "engine.trader.fetch_symbol",
+            lambda symbol, start, end, timeframe="1Day": (_bars(), SimpleNamespace(api_calls=0)),
+        )
+
+        pos = Position("AAPL", 10, 100.0, 1000.0)
+        snap = _snapshot(
+            positions={"AAPL": pos},
+            open_orders=[],
+        )
+
+        engine._repair_missing_protective_stops(snap)
+
+        stop_call = engine.broker.place_protective_stop.call_args.kwargs
+        assert stop_call["symbol"] == "AAPL"
+        assert stop_call["qty"] == 10
+        assert stop_call["stop_price"] == 95.0
+        assert engine.trade_logger.read_all_open_owners() == {"AAPL": "fake_strategy"}
+        assert engine.trade_logger.read_latest_open_stop_price(
+            symbol="AAPL",
+            strategy="fake_strategy",
+        ) == 95.0
+
     def test_drain_option_rejected_clears_pre_registered_underlying_ownership(self, tmp_path):
         """Rejected option entries must clean up pre-registered underlying ownership immediately."""
         engine = self._engine(tmp_path)

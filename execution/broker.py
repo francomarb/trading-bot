@@ -86,6 +86,7 @@ from config.settings import (
     ALPACA_SECRET_KEY,
     DRY_RUN,
     FRACTIONAL_ENABLED,
+    ORDER_CONFIRM_TIMEOUT_SECONDS,
 )
 from risk.manager import AccountState, Position, RiskDecision, Side
 from strategies.base import OrderType
@@ -371,7 +372,7 @@ class AlpacaBroker:
         self,
         decision: RiskDecision,
         *,
-        poll_timeout: float = 30.0,
+        poll_timeout: float = ORDER_CONFIRM_TIMEOUT_SECONDS,
         poll_interval: float = 1.0,
     ) -> OrderResult:
         """
@@ -763,7 +764,7 @@ class AlpacaBroker:
         self,
         symbol: str,
         *,
-        poll_timeout: float = 30.0,
+        poll_timeout: float = ORDER_CONFIRM_TIMEOUT_SECONDS,
         poll_interval: float = 1.0,
     ) -> OrderResult:
         """
