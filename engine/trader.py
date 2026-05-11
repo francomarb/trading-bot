@@ -925,7 +925,9 @@ class TradingEngine:
 
         if hasattr(strategy, "build_option_execution"):
             try:
-                opt_sym, opt_price, opt_tp, opt_sl = strategy.build_option_execution(symbol, latest_close)
+                opt_sym, opt_price, opt_tp, opt_sl = strategy.build_option_execution(
+                    symbol, latest_close, notional_cap=notional_cap
+                )
                 target_symbol = opt_sym
                 target_price = opt_price
                 take_profit = opt_tp
