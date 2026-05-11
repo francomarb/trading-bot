@@ -2294,3 +2294,161 @@ class TestOptionsEngineFixes:
             strategy="sma_crossover",
             reason="stop_triggered",
         )
+
+
+# ── Shared-symbol conflict rejection (11.7 Part A) ─────────────────────────
+
+
+class TestSharedSymbolConflict:
+    """A second strategy cannot enter a symbol another strategy already owns."""
+
+    def _process(self, engine, symbol, snap, slot_index: int = 0):
+        slot = engine.slots[slot_index]
+        return engine._process_symbol(
+            symbol, snap, snap.account, slot.strategy, slot.timeframe
+        )
+
+    def test_entry_blocked_when_symbol_owned_by_other_strategy(self, engine_factory):
+        engine, broker = engine_factory(entries=[False] * 59 + [True])
+        engine._position_owners["AAPL"] = "rsi_reversion"
+        snap = _snapshot()
+        engine._session_start_equity = snap.account.equity
+        result = self._process(engine, "AAPL", snap)
+        assert result is None
+        broker.place_order.assert_not_called()
+        broker.close_position.assert_not_called()
+
+    def test_same_strategy_re_entry_not_blocked_by_conflict_check(self, engine_factory):
+        """Self-ownership must not trip the cross-strategy conflict rule.
+        (Risk DUPLICATE_POSITION handles same-strategy double entries separately.)"""
+        engine, broker = engine_factory(entries=[False] * 59 + [True])
+        engine._position_owners["AAPL"] = "fake_strategy"
+        snap = _snapshot()
+        engine._session_start_equity = snap.account.equity
+        # Reaches risk; risk will not raise — no broker position so no duplicate.
+        # The key assertion is: the conflict check itself does not block.
+        self._process(engine, "AAPL", snap)
+        # place_order called once means we got past the conflict gate.
+        assert broker.place_order.call_count == 1
+
+    def test_conflict_fires_alert_with_symbol_conflict_code(self, engine_factory):
+        engine, broker = engine_factory(entries=[False] * 59 + [True])
+        engine._position_owners["AAPL"] = "rsi_reversion"
+        engine.alerts = MagicMock()
+        snap = _snapshot()
+        engine._session_start_equity = snap.account.equity
+        self._process(engine, "AAPL", snap)
+        engine.alerts.order_rejection.assert_called_once()
+        _, kwargs = engine.alerts.order_rejection.call_args, engine.alerts.order_rejection.call_args.args
+        # 4th positional arg is the rejection code.
+        code = engine.alerts.order_rejection.call_args.args[3]
+        assert code == "SYMBOL_CONFLICT"
+
+    def test_conflict_marks_watchlist_status(self, engine_factory):
+        engine, _broker = engine_factory(entries=[False] * 59 + [True])
+        engine._position_owners["AAPL"] = "rsi_reversion"
+        snap = _snapshot()
+        engine._session_start_equity = snap.account.equity
+        statuses: dict[str, str] = {}
+        reasons: dict[str, list[str]] = {}
+        slot = engine.slots[0]
+        engine._process_symbol(
+            "AAPL",
+            snap,
+            snap.account,
+            slot.strategy,
+            slot.timeframe,
+            strategy_statuses=statuses,
+            strategy_reasons=reasons,
+        )
+        assert statuses["AAPL"] == "Symbol Conflict"
+        assert reasons["AAPL"] == ["owned by 'rsi_reversion'"]
+
+    def test_exit_path_unaffected_by_conflict_check(self, engine_factory):
+        """Exits must never be blocked by the symbol-conflict rule —
+        only entries pass through it."""
+        engine, broker = engine_factory(exits=[False] * 59 + [True])
+        # The owner-mismatch exit path is already gated by line 736 in
+        # _process_symbol (existing behavior). The new conflict check is
+        # only on the entry path. Confirm an exit still routes correctly.
+        engine._position_owners["AAPL"] = "fake_strategy"  # this strategy owns it
+        positions = {"AAPL": Position("AAPL", 10, 100.0, 1010.0)}
+        snap = _snapshot(positions=positions)
+        engine._session_start_equity = snap.account.equity
+        self._process(engine, "AAPL", snap)
+        broker.close_position.assert_called_once_with("AAPL")
+
+
+# ── Sector exposure observability (11.7 Part B) ────────────────────────────
+
+
+class TestSectorExposure:
+    """_compute_sector_exposure builds {sector_key: count} from owners."""
+
+    def _engine(self, engine_factory, resolver):
+        engine, _ = engine_factory()
+        engine._sector_resolver = resolver
+        return engine
+
+    def test_empty_when_no_positions(self, engine_factory):
+        resolver = MagicMock()
+        resolver.resolve.return_value = "technology"
+        engine = self._engine(engine_factory, resolver)
+        assert engine._compute_sector_exposure() == {}
+        resolver.resolve.assert_not_called()
+
+    def test_empty_when_no_resolver(self, engine_factory):
+        engine, _ = engine_factory()
+        engine._sector_resolver = None
+        engine._position_owners = {"AAPL": "fake_strategy"}
+        assert engine._compute_sector_exposure() == {}
+
+    def test_counts_aggregated_by_sector(self, engine_factory):
+        resolver = MagicMock()
+        resolver.resolve.side_effect = lambda s: {
+            "AAPL": "technology",
+            "MSFT": "technology",
+            "JPM": "financials",
+        }.get(s)
+        engine = self._engine(engine_factory, resolver)
+        engine._position_owners = {
+            "AAPL": "sma_crossover",
+            "MSFT": "sma_crossover",
+            "JPM": "rsi_reversion",
+        }
+        exposure = engine._compute_sector_exposure()
+        assert exposure == {"technology": 2, "financials": 1}
+
+    def test_unmapped_symbol_skipped(self, engine_factory):
+        resolver = MagicMock()
+        resolver.resolve.side_effect = lambda s: None if s == "XYZ" else "technology"
+        engine = self._engine(engine_factory, resolver)
+        engine._position_owners = {"AAPL": "sma_crossover", "XYZ": "sma_crossover"}
+        exposure = engine._compute_sector_exposure()
+        assert exposure == {"technology": 1}
+
+    def test_occ_option_symbol_excluded(self, engine_factory):
+        resolver = MagicMock()
+        resolver.resolve.return_value = "technology"
+        engine = self._engine(engine_factory, resolver)
+        # OCC contract symbol format: ROOT + YYMMDD + C/P + 8-digit strike
+        engine._position_owners = {
+            "AAPL": "sma_crossover",
+            "SPY251219C00450000": "spy_options_reversion",
+        }
+        exposure = engine._compute_sector_exposure()
+        assert exposure == {"technology": 1}
+        # Resolver never called for the OCC symbol.
+        assert all(
+            call.args[0] != "SPY251219C00450000"
+            for call in resolver.resolve.call_args_list
+        )
+
+    def test_resolver_exception_fails_open(self, engine_factory):
+        resolver = MagicMock()
+        resolver.resolve.side_effect = RuntimeError("yfinance down")
+        engine = self._engine(engine_factory, resolver)
+        engine._position_owners = {"AAPL": "sma_crossover"}
+        # Should not raise; counts that symbol as unmapped.
+        exposure = engine._compute_sector_exposure()
+        assert exposure == {}

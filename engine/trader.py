@@ -87,6 +87,7 @@ if TYPE_CHECKING:
     from execution.stream import StreamManager
     from regime.detector import RegimeDetector
     from risk.allocator import SleeveAllocator
+    from sector.resolver import SectorResolver
 
 
 # Matches any OCC option symbol: underlying (1–6 letters) + YYMMDD + C/P + 8-digit strike.
@@ -197,6 +198,7 @@ class TradingEngine:
         stream_manager: "StreamManager | None" = None,
         regime_detector: "RegimeDetector | None" = None,
         allocator: "SleeveAllocator | None" = None,
+        sector_resolver: "SectorResolver | None" = None,
         # Injection seam for tests — production should leave this as None.
         clock: callable = None,  # type: ignore[assignment]
     ) -> None:
@@ -231,6 +233,7 @@ class TradingEngine:
         self._stream_manager = stream_manager
         self._regime_detector = regime_detector
         self._allocator = allocator
+        self._sector_resolver = sector_resolver
         self._clock = clock or (lambda: datetime.now(timezone.utc))
 
         self._running: bool = False
@@ -275,6 +278,12 @@ class TradingEngine:
         self._watchlist_statuses: dict[str, dict[str, str]] = {}
         self._watchlist_reasons: dict[str, dict[str, list[str]]] = {}
         self._sector_heat: dict | None = None
+
+        # Sector exposure observability (11.7 Part B). Maps normalized sector
+        # key → count of open equity positions in that sector. OCC option
+        # symbols and unmapped tickers are excluded. Recomputed each cycle
+        # in _write_state_snapshot; INFO-logged on change. No auto-block.
+        self._last_sector_exposure: dict[str, int] = {}
 
         # Daily decision gate: (strategy_name, symbol, timeframe) → completed-bar
         # timestamp already evaluated this session. This prevents the 5-minute
@@ -852,6 +861,36 @@ class TradingEngine:
             )
             return
 
+        # Shared-symbol conflict (11.7 Part A) — another strategy already owns
+        # this symbol via ownership pre-registration (async options) or a
+        # confirmed entry that has not yet appeared in the broker snapshot.
+        # Two strategies cannot hold the same position simultaneously: the
+        # second strategy's fill would overwrite the first's ownership record
+        # and leave one position unmanaged. Same-cycle ties are resolved by
+        # allocator priority via _slots_by_priority — the higher-priority slot
+        # pre-registers first, so by the time the lower-priority slot reaches
+        # this check the owner is already set. Exits never reach this code path.
+        existing_owner = self._position_owners.get(symbol)
+        if existing_owner is not None and existing_owner != strategy.name:
+            logger.info(
+                f"[{strategy.name}] {symbol}: entry blocked — "
+                f"symbol already owned by '{existing_owner}'"
+            )
+            self.alerts.order_rejection(
+                symbol,
+                strategy.name,
+                f"symbol already owned by '{existing_owner}'",
+                "SYMBOL_CONFLICT",
+            )
+            if strategy_statuses is not None:
+                strategy_statuses[symbol] = "Symbol Conflict"
+            if strategy_reasons is not None:
+                strategy_reasons[symbol] = [f"owned by '{existing_owner}'"]
+            self._mark_signal_bar_processed(
+                signal_key, signal_bar, strategy_statuses, strategy_reasons, symbol
+            )
+            return None
+
         # Sleeve check — must pass before risk sizing.
         # Narrows the notional budget available to this strategy without
         # bypassing any global risk control. Exits are never sleeve-gated.
@@ -1355,6 +1394,31 @@ class TradingEngine:
                     f"{[slot.strategy.name for slot in matches]}"
                 )
         return result
+
+    def _compute_sector_exposure(self) -> dict[str, int]:
+        """
+        Build {sector_key: count} of open equity positions per sector (11.7 Part B).
+
+        Pure observability — never auto-blocks. OCC option symbols are excluded
+        (no meaningful sector mapping for index options). Tickers the resolver
+        cannot map are silently skipped (fail-open). Returns an empty dict if
+        no resolver was injected.
+        """
+        if self._sector_resolver is None or not self._position_owners:
+            return {}
+        counts: dict[str, int] = {}
+        for symbol in self._position_owners:
+            if _OCC_PAT.match(symbol):
+                continue
+            try:
+                sector = self._sector_resolver.resolve(symbol)
+            except Exception as exc:
+                logger.debug(f"sector resolve failed for {symbol}: {exc}")
+                continue
+            if sector is None:
+                continue
+            counts[sector] = counts.get(sector, 0) + 1
+        return counts
 
     def _slots_by_priority(self) -> list[StrategySlot]:
         """Return slots ordered by allocator priority when available."""
@@ -1944,6 +2008,20 @@ class TradingEngine:
                         for name, detail in allocator_snapshot["pools"].items()
                     },
                 }
+            # Sector exposure snapshot (11.7 Part B). Pure observability —
+            # log INFO when composition changes since the prior cycle so the
+            # operator can spot tilt drift in real time.
+            sector_exposure = self._compute_sector_exposure()
+            if sector_exposure != self._last_sector_exposure:
+                if sector_exposure:
+                    summary = ", ".join(
+                        f"{k}={v}" for k, v in sorted(sector_exposure.items())
+                    )
+                    logger.info(f"sector exposure changed: {{{summary}}}")
+                else:
+                    logger.info("sector exposure changed: (empty)")
+                self._last_sector_exposure = dict(sector_exposure)
+
             state = {
                 "timestamp": datetime.now(timezone.utc).isoformat(),
                 "running": self._running,
@@ -1983,6 +2061,7 @@ class TradingEngine:
                 "watchlist_statuses": self._watchlist_statuses,
                 "watchlist_reasons": self._watchlist_reasons,
                 "sector_heat": self._sector_heat,
+                "sector_exposure": sector_exposure,
                 "live_trading": settings.LIVE_TRADING,
             }
             parent = os.path.dirname(path)

@@ -322,6 +322,7 @@ def main() -> None:
         stream_manager=stream,
         regime_detector=regime,
         allocator=allocator,
+        sector_resolver=sector_resolver,
     )
     engine._sector_heat = _build_sector_heat_snapshot(
         gauge=sector_gauge,

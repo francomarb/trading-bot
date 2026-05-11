@@ -868,6 +868,27 @@ def render_dashboard() -> None:
 
     st.divider()
 
+    # ── Open Position Sector Exposure (11.7 Part B) ─────────────────────
+    # Live observability — count of open positions per resolved GICS sector.
+    # No auto-block; operator-facing only.
+    sector_exposure = state.get("sector_exposure") or {}
+    if sector_exposure:
+        render_section_header(
+            "Open Position Sector Exposure",
+            "Live count of held positions per resolved sector. Observability only — no auto-block.",
+            kicker="Concentration",
+        )
+        exposure_rows = [
+            {"Sector": sector.replace("_", " ").title(), "Positions": int(count)}
+            for sector, count in sorted(sector_exposure.items(), key=lambda kv: (-kv[1], kv[0]))
+        ]
+        st.dataframe(
+            pd.DataFrame(exposure_rows),
+            width="stretch",
+            hide_index=True,
+        )
+        st.divider()
+
     # ── Sector heat ─────────────────────────────────────────────────────
     sector_heat = state.get("sector_heat") or {}
     if sector_heat:
