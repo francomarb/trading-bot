@@ -2403,7 +2403,7 @@ class TestSectorExposure:
         engine._position_owners = {"AAPL": "fake_strategy"}
         assert engine._compute_sector_exposure() == {}
 
-    def test_counts_aggregated_by_sector(self, engine_factory):
+    def test_groups_symbols_and_strategies_by_sector(self, engine_factory):
         resolver = MagicMock()
         resolver.resolve.side_effect = lambda s: {
             "AAPL": "technology",
@@ -2413,11 +2413,23 @@ class TestSectorExposure:
         engine = self._engine(engine_factory, resolver)
         engine._position_owners = {
             "AAPL": "sma_crossover",
-            "MSFT": "sma_crossover",
+            "MSFT": "donchian_breakout",
             "JPM": "rsi_reversion",
         }
         exposure = engine._compute_sector_exposure()
-        assert exposure == {"technology": 2, "financials": 1}
+        assert set(exposure.keys()) == {"technology", "financials"}
+        # technology has both AAPL and MSFT with their respective owners
+        tech_items = {
+            (item["symbol"], item["strategy"]) for item in exposure["technology"]
+        }
+        assert tech_items == {
+            ("AAPL", "sma_crossover"),
+            ("MSFT", "donchian_breakout"),
+        }
+        # financials has just JPM
+        assert exposure["financials"] == [
+            {"symbol": "JPM", "strategy": "rsi_reversion"}
+        ]
 
     def test_unmapped_symbol_skipped(self, engine_factory):
         resolver = MagicMock()
@@ -2425,7 +2437,10 @@ class TestSectorExposure:
         engine = self._engine(engine_factory, resolver)
         engine._position_owners = {"AAPL": "sma_crossover", "XYZ": "sma_crossover"}
         exposure = engine._compute_sector_exposure()
-        assert exposure == {"technology": 1}
+        assert list(exposure.keys()) == ["technology"]
+        assert exposure["technology"] == [
+            {"symbol": "AAPL", "strategy": "sma_crossover"}
+        ]
 
     def test_occ_option_symbol_excluded(self, engine_factory):
         resolver = MagicMock()
@@ -2437,7 +2452,10 @@ class TestSectorExposure:
             "SPY251219C00450000": "spy_options_reversion",
         }
         exposure = engine._compute_sector_exposure()
-        assert exposure == {"technology": 1}
+        assert list(exposure.keys()) == ["technology"]
+        assert exposure["technology"] == [
+            {"symbol": "AAPL", "strategy": "sma_crossover"}
+        ]
         # Resolver never called for the OCC symbol.
         assert all(
             call.args[0] != "SPY251219C00450000"

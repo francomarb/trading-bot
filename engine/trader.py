@@ -1395,19 +1395,21 @@ class TradingEngine:
                 )
         return result
 
-    def _compute_sector_exposure(self) -> dict[str, int]:
+    def _compute_sector_exposure(self) -> dict[str, list[dict]]:
         """
-        Build {sector_key: count} of open equity positions per sector (11.7 Part B).
+        Build {sector_key: [{"symbol": s, "strategy": owner}, ...]} of open
+        equity positions per sector (11.7 Part B).
 
         Pure observability — never auto-blocks. OCC option symbols are excluded
         (no meaningful sector mapping for index options). Tickers the resolver
         cannot map are silently skipped (fail-open). Returns an empty dict if
-        no resolver was injected.
+        no resolver was injected. Use ``{k: len(v) for k, v in ...}`` for raw
+        counts.
         """
         if self._sector_resolver is None or not self._position_owners:
             return {}
-        counts: dict[str, int] = {}
-        for symbol in self._position_owners:
+        grouped: dict[str, list[dict]] = {}
+        for symbol, owner in self._position_owners.items():
             if _OCC_PAT.match(symbol):
                 continue
             try:
@@ -1417,8 +1419,10 @@ class TradingEngine:
                 continue
             if sector is None:
                 continue
-            counts[sector] = counts.get(sector, 0) + 1
-        return counts
+            grouped.setdefault(sector, []).append(
+                {"symbol": symbol, "strategy": owner}
+            )
+        return grouped
 
     def _slots_by_priority(self) -> list[StrategySlot]:
         """Return slots ordered by allocator priority when available."""
@@ -2012,15 +2016,16 @@ class TradingEngine:
             # log INFO when composition changes since the prior cycle so the
             # operator can spot tilt drift in real time.
             sector_exposure = self._compute_sector_exposure()
-            if sector_exposure != self._last_sector_exposure:
-                if sector_exposure:
+            exposure_counts = {k: len(v) for k, v in sector_exposure.items()}
+            if exposure_counts != self._last_sector_exposure:
+                if exposure_counts:
                     summary = ", ".join(
-                        f"{k}={v}" for k, v in sorted(sector_exposure.items())
+                        f"{k}={v}" for k, v in sorted(exposure_counts.items())
                     )
                     logger.info(f"sector exposure changed: {{{summary}}}")
                 else:
                     logger.info("sector exposure changed: (empty)")
-                self._last_sector_exposure = dict(sector_exposure)
+                self._last_sector_exposure = dict(exposure_counts)
 
             state = {
                 "timestamp": datetime.now(timezone.utc).isoformat(),

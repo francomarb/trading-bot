@@ -869,23 +869,45 @@ def render_dashboard() -> None:
     st.divider()
 
     # ── Open Position Sector Exposure (11.7 Part B) ─────────────────────
-    # Live observability — count of open positions per resolved GICS sector.
-    # No auto-block; operator-facing only.
+    # Live observability — open positions per resolved GICS sector with
+    # symbol + owning-strategy detail. No auto-block; operator-facing only.
     sector_exposure = state.get("sector_exposure") or {}
     if sector_exposure:
         render_section_header(
             "Open Position Sector Exposure",
-            "Live count of held positions per resolved sector. Observability only — no auto-block.",
+            "Live held positions grouped by resolved sector — symbols and owning strategies. Observability only.",
             kicker="Concentration",
         )
-        exposure_rows = [
-            {"Sector": sector.replace("_", " ").title(), "Positions": int(count)}
-            for sector, count in sorted(sector_exposure.items(), key=lambda kv: (-kv[1], kv[0]))
-        ]
+        exposure_rows = []
+        for sector, items in sorted(
+            sector_exposure.items(), key=lambda kv: (-len(kv[1]), kv[0])
+        ):
+            # items may be a list[dict{symbol, strategy}] (current shape) or
+            # an int (legacy). Defend against both so a stale snapshot does
+            # not break the dashboard during a rolling deploy.
+            if isinstance(items, int):
+                exposure_rows.append({
+                    "Sector": sector.replace("_", " ").title(),
+                    "Positions": int(items),
+                    "Symbols": "",
+                    "Strategies": "",
+                })
+                continue
+            symbols = sorted({i["symbol"] for i in items})
+            strategies = sorted({i["strategy"] for i in items})
+            exposure_rows.append({
+                "Sector": sector.replace("_", " ").title(),
+                "Positions": len(items),
+                "Symbols": ", ".join(symbols),
+                "Strategies": ", ".join(strategies),
+            })
         st.dataframe(
             pd.DataFrame(exposure_rows),
             width="stretch",
             hide_index=True,
+            column_config={
+                "Positions": st.column_config.NumberColumn(format="%d"),
+            },
         )
         st.divider()
 
