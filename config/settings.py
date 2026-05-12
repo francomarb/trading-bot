@@ -105,9 +105,9 @@ BOLLINGER_WATCHLIST = [
     "XLRE",  # Real Estate
     "XLC",   # Communications
 ]
-# Donchian Breakout (Turtle System 1) — IMPLEMENTED, NOT YET WIRED into
-# forward_test.py. Trend-continuation strategy designed to capture relentless
-# uptrends in AI / Big-Tech / Semis (the user's directional thesis universe).
+# Donchian Breakout (Turtle System 1) — IMPLEMENTED
+# Trend-continuation strategy designed to capture relentless
+# uptrends in AI / Big-Tech / Semis / NRG / Space (the user's directional thesis universe).
 # Activation gate: Sharpe ≥ +0.4, ≥ 50 trades, MeanDD ≤ 25% on AI/BigTech
 # backtest with 2× ATR stops. Until that gate passes, strategy is parked
 # (same pattern as BollingerSqueeze).
@@ -122,7 +122,7 @@ DONCHIAN_WATCHLIST = [
     # Big Tech
     "MSFT", "AAPL", "GOOG", "META", "AMZN", "ORCL", "TSLA",
     # AI software (secondary)
-    "PLTR", "CRWD", "NOW",
+    "PLTR", "CRWD", "NOW", "ADBE",
     # AI compute / quantum (post-IPO names with full 4y history)
     "IREN", "IONQ",
     # AI-adjacent: semiconductor equipment, networking, data-centre power,
@@ -136,6 +136,8 @@ DONCHIAN_WATCHLIST = [
     "PWR",    # Quanta Services — electrical infrastructure buildout for AI campuses
     "RGTI",   # Rigetti Computing — quantum hardware; early-stage AI compute adjacency
     "QBTS",   # D-Wave Quantum — quantum annealing; same early-stage bet as RGTI
+    "RKLB",   # Development of rocket launch and control systems for the space and defense industries
+    "ASTS",   # Space-based broadband cellular network
 ]
 # Full engine universe — union of all lists; preserves paper-run continuity.
 #
