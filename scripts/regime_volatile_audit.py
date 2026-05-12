@@ -1,19 +1,24 @@
 """
-Regime VOLATILE-gate audit (PLAN 11.6 prerequisite).
+Regime VOLATILE-gate audit (PLAN 11.6 / 11.6a).
 
-Replays the bot's RegimeDetector VOLATILE logic on ~7 years of SPY daily bars
-and asks one question: does the gate actually fire when a human would say
-"yeah, that was volatile"?
+Replays the bot's RegimeDetector VOLATILE logic on ~12 years of SPY daily
+bars and asks one question: does the gate actually fire when a human would
+say "yeah, that was volatile"?
 
-The current gate (regime/detector.py):
-    atr_pct  = ATR14(SPY) / close
-    window   = last 126 trading days of atr_pct
-    pct_rank = (window < current_atr_pct).mean()
-    VOLATILE := pct_rank >= 0.80
+This script tracks TWO gate variants in every section so future runs cannot
+confuse pre-fix and post-fix behaviour:
 
-This script computes that signal bar-by-bar, then evaluates it against:
-  1. A timeline of known stress events (2018 Q4, COVID, 2022 bear, SVB,
-     2024 Aug carry unwind, 2025 tariff selloff if present).
+  baseline : pct_rank >= 0.80                              (pre-PR / 11.6a)
+  shipped  : pct_rank >= 0.80 AND atr_pct >= SHIPPED_FLOOR  (current detector)
+
+The shipped gate matches `regime/detector.py` with default
+`vol_atr_pct_floor=0.012`. The baseline column is retained because the
+floor sweep section needs it as a reference point and headline sections
+contrast the two explicitly.
+
+The script evaluates each gate against:
+  1. A timeline of known stress events (Aug 2015, Feb 2018, Q4 2018, COVID,
+     2022 bear, SVB, 2024 Aug carry unwind, 2025 tariff selloff).
   2. Forward SPY returns conditional on VOLATILE firing.
   3. Whether the gate sustains through crises or "renormalises away" as the
      spike bars enter the rolling window.
@@ -94,9 +99,19 @@ VOL_PCT_THRESHOLD   = 0.80
 SMA_LONG_WINDOW     = 200       # for BEAR overlay
 LOOKBACK_YEARS      = 12        # ~Jan 2014 → today; captures Q4 2018, COVID, 2022 bear
 
-# Candidate absolute ATR% floors to sweep. The current gate is equivalent to
-# FLOORS = [0.0]. Any floor > 0 requires BOTH the percentile rank AND atr_pct
-# >= floor for the gate to fire.
+# Floor used by the SHIPPED detector (regime/detector.py default
+# `vol_atr_pct_floor`). Two `is_volatile_*` columns are produced:
+#   - is_volatile_baseline : pct_rank >= 0.80 only (the pre-floor gate; what
+#                            the bot did before this PR). Kept because the
+#                            floor sweep needs it as a starting point and the
+#                            headline sections explicitly contrast against it.
+#   - is_volatile_shipped  : pct_rank >= 0.80 AND atr_pct >= SHIPPED_FLOOR
+#                            (what regime/detector.py actually returns today).
+SHIPPED_FLOOR       = 0.012
+
+# Candidate absolute ATR% floors to sweep. floor=0.000 reproduces the
+# baseline (pre-floor) gate. Any floor > 0 requires BOTH percentile rank
+# AND atr_pct >= floor.
 FLOOR_CANDIDATES    = [0.000, 0.012, 0.015, 0.016, 0.018, 0.020]
 
 # Known stress windows. Edit as desired; script is robust to dates that don't
@@ -124,9 +139,14 @@ CALM_WINDOWS = [
 
 @dataclass
 class AuditFrame:
-    """SPY daily bars annotated with the VOLATILE signal."""
-    df: pd.DataFrame   # index: date. columns: close, atr_14, atr_pct, pct_rank,
-                       #                       is_volatile, sma_200, is_bear
+    """SPY daily bars annotated with both gate variants.
+
+    Columns:
+      close, atr_14, atr_pct, pct_rank,
+      is_volatile_baseline, is_volatile_shipped,
+      sma_200, is_bear, fwd_5d_ret
+    """
+    df: pd.DataFrame
 
     def slice(self, start: str, end: str) -> pd.DataFrame:
         return self.df.loc[start:end]
@@ -143,10 +163,15 @@ def build_audit_frame(spy: pd.DataFrame) -> AuditFrame:
     df["atr_pct"] = df[atr_col] / df["close"]
 
     # Bar-by-bar rolling percentile rank — strict less-than, exactly as the
-    # detector computes it.
+    # detector computes it. We compute TWO gate variants:
+    #   baseline: rank-only (the pre-PR gate, kept so the floor sweep has a
+    #              reference point and headline sections can contrast against
+    #             it explicitly).
+    #   shipped : rank AND atr_pct >= SHIPPED_FLOOR — what regime/detector.py
+    #             returns today with default `vol_atr_pct_floor`.
     atr_pct = df["atr_pct"]
     pct_rank = pd.Series(index=df.index, dtype=float)
-    is_volatile = pd.Series(False, index=df.index, dtype=bool)
+    is_vol_baseline = pd.Series(False, index=df.index, dtype=bool)
     for i in range(len(df)):
         cur = atr_pct.iloc[i]
         if pd.isna(cur):
@@ -157,11 +182,12 @@ def build_audit_frame(spy: pd.DataFrame) -> AuditFrame:
             continue
         r = float((window < cur).mean())
         pct_rank.iloc[i] = r
-        is_volatile.iloc[i] = (r >= VOL_PCT_THRESHOLD)
+        is_vol_baseline.iloc[i] = (r >= VOL_PCT_THRESHOLD)
 
-    df["pct_rank"]    = pct_rank
-    df["is_volatile"] = is_volatile
-    df["is_bear"]     = df["close"] < df[sma_col]
+    df["pct_rank"]             = pct_rank
+    df["is_volatile_baseline"] = is_vol_baseline
+    df["is_volatile_shipped"]  = is_vol_baseline & (atr_pct >= SHIPPED_FLOOR)
+    df["is_bear"]              = df["close"] < df[sma_col]
     # Forward 5-day SPY return for conditional analysis.
     df["fwd_5d_ret"]  = df["close"].pct_change(5).shift(-5)
     return AuditFrame(df=df)
@@ -191,31 +217,36 @@ def _streaks(series: pd.Series) -> list[tuple[pd.Timestamp, pd.Timestamp, int]]:
 def print_overall_summary(af: AuditFrame) -> None:
     df = af.df.dropna(subset=["pct_rank"])
     total = len(df)
-    vol = int(df["is_volatile"].sum())
-    bear = int(df["is_bear"].sum())
-    vol_and_bear = int((df["is_volatile"] & df["is_bear"]).sum())
+    base = df["is_volatile_baseline"]
+    ship = df["is_volatile_shipped"]
+    bear = df["is_bear"]
 
     print("=" * 78)
-    print("OVERALL")
+    print(f"OVERALL  (baseline = rank-only / pre-PR ; "
+          f"shipped = rank AND atr_pct ≥ {SHIPPED_FLOOR:.3f})")
     print("=" * 78)
     print(f"  Bars analysed:                  {total}")
     print(f"  Date range:                     {df.index[0].date()} → {df.index[-1].date()}")
-    print(f"  VOLATILE days:                  {vol} ({vol / total:.1%})")
-    print(f"  BEAR days (SPY < SMA200):       {bear} ({bear / total:.1%})")
-    print(f"  VOLATILE & BEAR days:           {vol_and_bear} "
-          f"({vol_and_bear / max(vol, 1):.1%} of VOLATILE)")
+    print(f"  VOLATILE days  (baseline):      {int(base.sum())} "
+          f"({base.mean():.1%})")
+    print(f"  VOLATILE days  (shipped):       {int(ship.sum())} "
+          f"({ship.mean():.1%})")
+    print(f"  BEAR days (SPY < SMA200):       {int(bear.sum())} "
+          f"({bear.mean():.1%})")
+    print(f"  VOLATILE & BEAR (shipped):      {int((ship & bear).sum())} "
+          f"({(ship & bear).sum() / max(int(ship.sum()), 1):.1%} of shipped VOLATILE)")
     print()
 
     print("  ATR% distribution on VOLATILE days vs all days:")
-    vd = df.loc[df["is_volatile"], "atr_pct"]
     ad = df["atr_pct"].dropna()
-    print(f"    all days   — p50={ad.quantile(0.5):.4f}  "
+    print(f"    all days              — p50={ad.quantile(0.5):.4f}  "
           f"p90={ad.quantile(0.9):.4f}  max={ad.max():.4f}")
-    if len(vd) > 0:
-        print(f"    VOLATILE   — p50={vd.quantile(0.5):.4f}  "
-              f"p90={vd.quantile(0.9):.4f}  max={vd.max():.4f}")
-        print(f"    VOLATILE   — min ATR% that triggered = {vd.min():.4f} "
-              f"({vd.min() * 100:.2f}% — absolute floor check)")
+    for label, mask in [("baseline VOLATILE", base), ("shipped  VOLATILE", ship)]:
+        vd = df.loc[mask, "atr_pct"]
+        if len(vd) > 0:
+            print(f"    {label}      — p50={vd.quantile(0.5):.4f}  "
+                  f"p90={vd.quantile(0.9):.4f}  max={vd.max():.4f}  "
+                  f"min={vd.min():.4f}")
     print()
 
 
@@ -224,54 +255,65 @@ def print_yearly_breakdown(af: AuditFrame) -> None:
     df["year"] = df.index.year
     g = df.groupby("year")
     print("=" * 78)
-    print("VOLATILE DAYS BY YEAR")
+    print("VOLATILE DAYS BY YEAR  (baseline = pre-PR rank-only | "
+          f"shipped = rank AND atr_pct ≥ {SHIPPED_FLOOR:.3f})")
     print("=" * 78)
-    print(f"  {'year':<6}{'days':>6}{'VOL':>6}{'VOL%':>8}{'mean ATR% on VOL':>22}")
+    print(f"  {'year':<6}{'days':>6}"
+          f"{'BASE_N':>8}{'BASE%':>7}{'BASE_mean':>11}"
+          f"{'SHIP_N':>8}{'SHIP%':>7}{'SHIP_mean':>11}")
     for year, sub in g:
-        nvol = int(sub["is_volatile"].sum())
-        mean_atr_pct_vol = (
-            sub.loc[sub["is_volatile"], "atr_pct"].mean()
-            if nvol > 0 else float("nan")
-        )
-        print(f"  {year:<6}{len(sub):>6}{nvol:>6}{nvol / len(sub):>8.1%}"
-              f"{mean_atr_pct_vol:>22.4f}")
+        base = sub["is_volatile_baseline"]
+        ship = sub["is_volatile_shipped"]
+        base_mean = sub.loc[base, "atr_pct"].mean() if base.any() else float("nan")
+        ship_mean = sub.loc[ship, "atr_pct"].mean() if ship.any() else float("nan")
+        print(f"  {year:<6}{len(sub):>6}"
+              f"{int(base.sum()):>8}{base.mean():>7.1%}{base_mean:>11.4f}"
+              f"{int(ship.sum()):>8}{ship.mean():>7.1%}{ship_mean:>11.4f}")
     print()
 
 
 def print_crisis_windows(af: AuditFrame) -> None:
     print("=" * 78)
-    print("KNOWN STRESS WINDOWS — gate behaviour")
+    print("KNOWN STRESS WINDOWS — gate behaviour "
+          f"(BASE = pre-PR rank-only | SHIP = shipped gate, floor={SHIPPED_FLOOR:.3f})")
     print("=" * 78)
-    print(f"  {'window':<28}{'days':>6}{'VOL':>6}{'VOL%':>8}"
-          f"{'maxDD':>9}{'first→last VOL':>22}")
+    print(f"  {'window':<28}{'days':>6}{'maxDD':>9}"
+          f"{'BASE_VOL%':>11}{'SHIP_VOL%':>11}{'first→last VOL (shipped)':>30}")
     for name, start, end in CRISIS_WINDOWS:
         sub = af.slice(start, end)
         if sub.empty:
             print(f"  {name:<28}  (no data)")
             continue
         n = len(sub)
-        nvol = int(sub["is_volatile"].sum())
         peak = sub["close"].cummax()
         dd = (sub["close"] / peak - 1.0).min()
-        vol_dates = sub.index[sub["is_volatile"]]
-        if len(vol_dates) > 0:
-            span = f"{vol_dates[0].date()}→{vol_dates[-1].date()}"
-        else:
-            span = "—"
-        print(f"  {name:<28}{n:>6}{nvol:>6}{nvol / n:>8.1%}"
-              f"{dd:>9.1%}  {span}")
+        base_vol = sub["is_volatile_baseline"].mean()
+        ship_vol = sub["is_volatile_shipped"].mean()
+        ship_dates = sub.index[sub["is_volatile_shipped"]]
+        span = (
+            f"{ship_dates[0].date()}→{ship_dates[-1].date()}"
+            if len(ship_dates) > 0 else "—"
+        )
+        print(f"  {name:<28}{n:>6}{dd:>9.1%}"
+              f"{base_vol:>11.1%}{ship_vol:>11.1%}  {span:<28}")
     print()
 
 
-def print_crisis_detail(af: AuditFrame) -> None:
+def print_crisis_detail(af: AuditFrame, gate_col: str = "is_volatile_shipped") -> None:
     """For each crisis: peak→trough → first VOLATILE bar, and whether the gate
-    shut off before the trough (the renormalisation-during-crisis concern)."""
+    shut off before the trough (the renormalisation-during-crisis concern).
+
+    Runs against `gate_col` — defaults to the shipped gate so future runs
+    diagnose current behaviour rather than the pre-PR rank-only behaviour.
+    Pass `gate_col="is_volatile_baseline"` to inspect the legacy gate.
+    """
+    label = "shipped" if gate_col == "is_volatile_shipped" else "baseline (pre-PR)"
     print("=" * 78)
-    print("CRISIS DETAIL — did the gate stay on through the drawdown?")
+    print(f"CRISIS DETAIL — did the {label} gate stay on through the drawdown?")
     print("=" * 78)
     for name, start, end in CRISIS_WINDOWS:
         sub = af.slice(start, end)
-        if sub.empty or sub["is_volatile"].sum() == 0:
+        if sub.empty or sub[gate_col].sum() == 0:
             continue
         # Find the max-drawdown trough: bar with greatest close/cummax-1 deficit.
         cummax = sub["close"].cummax()
@@ -285,8 +327,8 @@ def print_crisis_detail(af: AuditFrame) -> None:
         if len(peak_to_trough) < 2:
             continue
         n_p2t = len(peak_to_trough)
-        vol_p2t = int(peak_to_trough["is_volatile"].sum())
-        first_vol_after_peak = peak_to_trough.index[peak_to_trough["is_volatile"]]
+        vol_p2t = int(peak_to_trough[gate_col].sum())
+        first_vol_after_peak = peak_to_trough.index[peak_to_trough[gate_col]]
         first_vol_str = (
             first_vol_after_peak[0].date().isoformat()
             if len(first_vol_after_peak) > 0 else "(never)"
@@ -327,18 +369,23 @@ def print_forward_returns(af: AuditFrame) -> None:
     df = af.df.dropna(subset=["pct_rank", "fwd_5d_ret"])
     if df.empty:
         return
-    vol = df.loc[df["is_volatile"], "fwd_5d_ret"]
-    nonvol = df.loc[~df["is_volatile"], "fwd_5d_ret"]
     print("=" * 78)
     print("FORWARD 5-DAY SPY RETURN  conditional on gate state")
+    print(f"  (baseline = pre-PR rank-only ; shipped = rank AND "
+          f"atr_pct ≥ {SHIPPED_FLOOR:.3f})")
     print("=" * 78)
-    print(f"  {'state':<14}{'N':>7}{'mean':>10}{'median':>10}"
+    print(f"  {'state':<22}{'N':>7}{'mean':>10}{'median':>10}"
           f"{'p10':>10}{'p90':>10}{'P(<-1%)':>10}")
-    for label, s in [("VOLATILE", vol), ("non-VOLATILE", nonvol)]:
+    rows = [
+        ("baseline VOLATILE",     df.loc[df["is_volatile_baseline"],  "fwd_5d_ret"]),
+        ("shipped  VOLATILE",     df.loc[df["is_volatile_shipped"],   "fwd_5d_ret"]),
+        ("non-VOLATILE (shipped)", df.loc[~df["is_volatile_shipped"], "fwd_5d_ret"]),
+    ]
+    for label, s in rows:
         if len(s) == 0:
             continue
         p_loss = float((s < -0.01).mean())
-        print(f"  {label:<14}{len(s):>7}{s.mean():>10.3%}{s.median():>10.3%}"
+        print(f"  {label:<22}{len(s):>7}{s.mean():>10.3%}{s.median():>10.3%}"
               f"{s.quantile(0.1):>10.3%}{s.quantile(0.9):>10.3%}"
               f"{p_loss:>10.1%}")
     print()
@@ -349,15 +396,20 @@ def print_forward_returns(af: AuditFrame) -> None:
 
 def print_streaks(af: AuditFrame) -> None:
     df = af.df.dropna(subset=["pct_rank"])
-    streaks = _streaks(df["is_volatile"])
-    streaks.sort(key=lambda x: x[2], reverse=True)
     print("=" * 78)
-    print("TOP 10 LONGEST VOLATILE STREAKS")
+    print("TOP 10 LONGEST VOLATILE STREAKS  (baseline vs shipped)")
     print("=" * 78)
-    print(f"  {'#':>3}  {'start':<12}{'end':<12}{'length (bars)':>15}")
-    for i, (start, end, length) in enumerate(streaks[:10], 1):
-        print(f"  {i:>3}  {start.date()!s:<12}{end.date()!s:<12}{length:>15}")
-    print()
+    for col, label in [
+        ("is_volatile_baseline", "baseline (pre-PR, rank-only)"),
+        ("is_volatile_shipped",  f"shipped (rank AND atr_pct ≥ {SHIPPED_FLOOR:.3f})"),
+    ]:
+        streaks = _streaks(df[col])
+        streaks.sort(key=lambda x: x[2], reverse=True)
+        print(f"  {label}:")
+        print(f"    {'#':>3}  {'start':<12}{'end':<12}{'length (bars)':>15}")
+        for i, (start, end, length) in enumerate(streaks[:10], 1):
+            print(f"    {i:>3}  {start.date()!s:<12}{end.date()!s:<12}{length:>15}")
+        print()
 
 
 def print_floor_sweep(af: AuditFrame) -> None:
@@ -370,14 +422,16 @@ def print_floor_sweep(af: AuditFrame) -> None:
     print("=" * 78)
     print(f"  Gate definition:  pct_rank >= {VOL_PCT_THRESHOLD:.0%} "
           "AND atr_pct >= floor")
-    print(f"  floor=0.0 reproduces the bot's current gate exactly.")
+    print(f"  floor=0.000 reproduces the BASELINE (pre-PR rank-only) gate.")
+    print(f"  floor={SHIPPED_FLOOR:.3f} matches the SHIPPED gate "
+          f"(regime/detector.py default).")
     print()
 
     # ── Headline trade-off ────────────────────────────────────────────────────
     print(f"  {'floor':>7}  {'VOL%':>7}{'crisis_catch%':>16}{'calm_falseFire%':>18}"
           f"{'P(fwd5d<-1%)':>15}{'mean_fwd5d':>13}")
     for floor in FLOOR_CANDIDATES:
-        is_vol = df["is_volatile"] & (df["atr_pct"] >= floor)
+        is_vol = df["is_volatile_baseline"] & (df["atr_pct"] >= floor)
         # Crisis-window catch rate: fraction of crisis days flagged VOLATILE.
         crisis_days = []
         for _name, s, e in CRISIS_WINDOWS:
@@ -429,7 +483,7 @@ def print_floor_sweep(af: AuditFrame) -> None:
             continue
         row = f"  {name:<28}"
         for floor in FLOOR_CANDIDATES:
-            is_vol = sub["is_volatile"] & (sub["atr_pct"] >= floor)
+            is_vol = sub["is_volatile_baseline"] & (sub["atr_pct"] >= floor)
             row += f"{float(is_vol.mean()):>10.0%}"
         print(row)
     print()
@@ -445,7 +499,7 @@ def print_floor_sweep(af: AuditFrame) -> None:
             continue
         row = f"  {name:<28}"
         for floor in FLOOR_CANDIDATES:
-            is_vol = sub["is_volatile"] & (sub["atr_pct"] >= floor)
+            is_vol = sub["is_volatile_baseline"] & (sub["atr_pct"] >= floor)
             row += f"{float(is_vol.mean()):>10.0%}"
         print(row)
     print()
@@ -475,7 +529,7 @@ def print_oos_split(af: AuditFrame, split_date: str = "2023-01-01") -> None:
     print()
 
     def _metrics(slice_df: pd.DataFrame, floor: float) -> dict:
-        is_vol = slice_df["is_volatile"] & (slice_df["atr_pct"] >= floor)
+        is_vol = slice_df["is_volatile_baseline"] & (slice_df["atr_pct"] >= floor)
         crisis_idx = _union_indexes(
             [slice_df.loc[s:e].index for _n, s, e in CRISIS_WINDOWS]
         ).intersection(slice_df.index)
@@ -566,15 +620,18 @@ def main() -> int:
     print("=" * 78)
     print("Interpretation guide")
     print("=" * 78)
-    print("  • If VOLATILE% by year is HIGHER in calm years (e.g. 2017, 2024)")
-    print("    than in stressed years (2020, 2022), the gate is renormalising")
-    print("    and over-firing in calm regimes — diagnosed.")
-    print("  • If 'GATE SHUT OFF Nd before trough' appears repeatedly in the")
-    print("    crisis detail block, the gate is failing to sustain through")
-    print("    sustained stress — also renormalisation.")
-    print("  • If P(fwd 5d return < -1%) on VOLATILE days is NOT meaningfully")
-    print("    higher than on non-VOLATILE days, the gate isn't predictive of")
-    print("    downside and is paying for noise.")
+    print("  • Headline sections compare BASELINE (pre-PR rank-only) vs SHIPPED")
+    print(f"    (rank AND atr_pct ≥ {SHIPPED_FLOOR:.3f}). The 11.6a fix moved the")
+    print("    bot from baseline → shipped; SHIP_* columns reflect current")
+    print("    production behaviour.")
+    print("  • If SHIP_VOL% by year is meaningfully > 0 in calm years (e.g.")
+    print("    2017, 2024 H1), the shipped floor is still letting noise through.")
+    print("  • If 'GATE SHUT OFF Nd before trough' appears in the shipped")
+    print("    crisis detail block, the floor is not high enough to sustain the")
+    print("    gate during slow grinds. (2022 remains the known case.)")
+    print("  • If P(fwd 5d return < -1%) on shipped VOLATILE days is NOT")
+    print("    meaningfully higher than on non-VOLATILE days, the gate isn't")
+    print("    predictive of downside and is paying for noise.")
     return 0
 
 
