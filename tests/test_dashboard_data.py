@@ -12,6 +12,7 @@ import pytest
 
 from dashboard import (
     compute_equity_curve,
+    load_broker_account_curve,
     compute_rolling_sharpe,
     compute_sleeve_usage,
     compute_strategy_stats,
@@ -127,6 +128,76 @@ class TestLoadEngineState:
         assert result["running"] is True
         assert result["regime"] == "TRENDING"
         assert result["equity"] == 10000.0
+
+
+class TestLoadBrokerAccountCurve:
+    def test_broker_history_is_loaded(self, monkeypatch):
+        load_broker_account_curve.clear()
+
+        class _History:
+            timestamp = [1_700_000_000, 1_700_086_400]
+            equity = [100_000.0, 100_250.0]
+            profit_loss = [0.0, 250.0]
+            profit_loss_pct = [0.0, 0.0025]
+
+        class _Api:
+            def get_portfolio_history(self, request):
+                assert request.period == "1M"
+                return _History()
+
+        class _Broker:
+            def __init__(self):
+                self._api = _Api()
+
+        monkeypatch.setattr("execution.broker.AlpacaBroker", _Broker)
+        df = load_broker_account_curve(False, "1M")
+        assert list(df.columns) == ["timestamp", "equity", "profit_loss", "profit_loss_pct"]
+        assert len(df) == 2
+        assert pd.api.types.is_datetime64_any_dtype(df["timestamp"])
+        assert pytest.approx(df["equity"].iloc[-1]) == 100_250.0
+
+    def test_broker_history_uses_requested_period(self, monkeypatch):
+        load_broker_account_curve.clear()
+
+        seen = {}
+
+        class _History:
+            timestamp = [1_700_000_000]
+            equity = [100_000.0]
+            profit_loss = [0.0]
+            profit_loss_pct = [0.0]
+
+        class _Api:
+            def get_portfolio_history(self, request):
+                seen["period"] = request.period
+                return _History()
+
+        class _Broker:
+            def __init__(self):
+                self._api = _Api()
+
+        monkeypatch.setattr("execution.broker.AlpacaBroker", _Broker)
+        df = load_broker_account_curve(False, "1W")
+        assert len(df) == 1
+        assert seen["period"] == "1W"
+
+    def test_broker_history_failure_returns_empty_with_error_attr(self, monkeypatch):
+        load_broker_account_curve.clear()
+
+        class _Broker:
+            def __init__(self):
+                raise RuntimeError("no broker")
+
+        monkeypatch.setattr("execution.broker.AlpacaBroker", _Broker)
+        df = load_broker_account_curve(False, "1M")
+        assert df.empty
+        assert "load_error" in df.attrs
+        assert "no broker" in df.attrs["load_error"]
+
+    def test_invalid_period_raises(self):
+        load_broker_account_curve.clear()
+        with pytest.raises(ValueError, match="unsupported broker account curve period"):
+            load_broker_account_curve(False, "YTD")
 
 
 # ── compute_equity_curve ─────────────────────────────────────────────────────

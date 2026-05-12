@@ -137,6 +137,68 @@ def load_engine_state(path: str) -> dict:
         return {}
 
 
+@st.cache_data(ttl=60, show_spinner=False)
+def load_broker_account_curve(live_trading: bool, period: str = "1M") -> pd.DataFrame:
+    """
+    Best-effort broker portfolio history for the account equity curve.
+
+    The result is broker-reported account equity, so it includes unrealized
+    P&L and should track Alpaca more closely than the realized trade log.
+    """
+    del live_trading  # Environment selection is already derived from settings.
+    valid_periods = {"1W", "1M", "3M"}
+    if period not in valid_periods:
+        raise ValueError(f"unsupported broker account curve period: {period!r}")
+
+    request_period = {
+        "1W": "1W",
+        "1M": "1M",
+        "3M": "3M",
+    }[period]
+
+    def _empty(error: str | None = None) -> pd.DataFrame:
+        df = pd.DataFrame(columns=["timestamp", "equity", "profit_loss", "profit_loss_pct"])
+        if error is not None:
+            df.attrs["load_error"] = error
+        return df
+
+    try:
+        from alpaca.trading.requests import GetPortfolioHistoryRequest
+        from execution.broker import AlpacaBroker
+
+        history = AlpacaBroker()._api.get_portfolio_history(
+            GetPortfolioHistoryRequest(
+                period=request_period,
+                timeframe="1D",
+                extended_hours=False,
+            )
+        )
+        timestamps = list(getattr(history, "timestamp", []) or [])
+        equity = list(getattr(history, "equity", []) or [])
+        profit_loss = list(getattr(history, "profit_loss", []) or [])
+        profit_loss_pct = list(getattr(history, "profit_loss_pct", []) or [])
+        if not timestamps or not equity:
+            return _empty()
+
+        length = min(len(timestamps), len(equity))
+        if profit_loss:
+            length = min(length, len(profit_loss))
+        if profit_loss_pct:
+            length = min(length, len(profit_loss_pct))
+
+        df = pd.DataFrame({
+            "timestamp": pd.to_datetime(timestamps[:length], unit="s", utc=True),
+            "equity": pd.to_numeric(equity[:length], errors="coerce"),
+            "profit_loss": pd.to_numeric(profit_loss[:length], errors="coerce"),
+            "profit_loss_pct": pd.to_numeric(profit_loss_pct[:length], errors="coerce"),
+        }).dropna(subset=["timestamp", "equity"])
+        return df.sort_values("timestamp").reset_index(drop=True)
+    except Exception as exc:
+        return _empty(
+            f"Direct broker account curve unavailable: {type(exc).__name__}: {exc}"
+        )
+
+
 @st.cache_data(ttl=15, show_spinner=False)
 def load_broker_account_metrics(
     live_trading: bool,
@@ -629,6 +691,63 @@ def render_dashboard() -> None:
 
     st.divider()
 
+    # ── Broker account curve ─────────────────────────────────────────────
+    broker_curve_period = st.segmented_control(
+        "Broker curve window",
+        options=["1W", "1M", "3M"],
+        default="1M",
+        key="broker_account_curve_period",
+    )
+    broker_curve = load_broker_account_curve(
+        live_trading,
+        broker_curve_period or "1M",
+    )
+    broker_curve_error = broker_curve.attrs.get("load_error")
+    render_section_header(
+        "Broker Account Curve",
+        "Broker-reported account equity, including unrealized P&L.",
+        kicker="Performance",
+    )
+    if broker_curve.empty:
+        st.info("Broker account curve unavailable right now.")
+        if broker_curve_error:
+            st.caption(broker_curve_error)
+    else:
+        start_equity = float(broker_curve["equity"].iloc[0])
+        end_equity = float(broker_curve["equity"].iloc[-1])
+        line_color = "#00b09b" if end_equity >= start_equity else "#ff4b4b"
+        fill_color = (
+            "rgba(0,176,155,0.15)"
+            if end_equity >= start_equity else "rgba(255,75,75,0.15)"
+        )
+        fig = go.Figure()
+        fig.add_trace(go.Scatter(
+            x=broker_curve["timestamp"],
+            y=broker_curve["equity"],
+            mode="lines",
+            name="Account Equity",
+            line=dict(color=line_color, width=2),
+            fill="tozeroy",
+            fillcolor=fill_color,
+            hovertemplate="<b>%{x|%Y-%m-%d}</b><br>Equity: $%{y:,.2f}<extra></extra>",
+        ))
+        fig.update_layout(
+            xaxis_title=None,
+            yaxis_title="Equity ($)",
+            height=300,
+            margin=dict(l=0, r=0, t=10, b=0),
+            showlegend=False,
+            plot_bgcolor="rgba(0,0,0,0)",
+            paper_bgcolor="rgba(0,0,0,0)",
+            xaxis=dict(gridcolor="rgba(255,255,255,0.05)"),
+            yaxis=dict(gridcolor="rgba(255,255,255,0.05)"),
+        )
+        st.plotly_chart(fig, width="stretch")
+        if broker_curve_error:
+            st.caption(broker_curve_error)
+
+    st.divider()
+
     # ── Equity curve + rolling Sharpe ────────────────────────────────────
     equity_curve = compute_equity_curve(trades_df)
 
@@ -636,7 +755,7 @@ def render_dashboard() -> None:
 
     with left:
         render_section_header(
-            "Equity Curve",
+            "Equity Curve (Realized)",
             "Realized cumulative P&L from closed trades only.",
             kicker="Performance",
         )
