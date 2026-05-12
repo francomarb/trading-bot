@@ -212,6 +212,52 @@ class TestRegimeClassify:
         # Stable ATR → should not be VOLATILE.
         assert regime != MarketRegime.VOLATILE
 
+    def test_absolute_floor_blocks_calm_market_false_fire(self):
+        """
+        Rank hits 80th percentile but ATR% is far below the absolute floor —
+        gate must NOT fire. This is the calm-market false-fire case the
+        2026-05 audit identified (e.g. 2017 mean ATR%-on-VOLATILE = 0.68%).
+        """
+        # Build a very calm series: ATR% ≈ 0.1%. Then bump the last bar's
+        # range so its ATR% lands at ~0.3% — still way below the 1.2% floor
+        # but a clear top-rank within the calm window.
+        spy = _make_spy(210, start_price=400.0, trend=0.1)
+        spy["high"] = spy["close"] + 0.2
+        spy["low"]  = spy["close"] - 0.2
+        # Last bar: 4x the recent range → top rank but still tiny absolute ATR%.
+        spy.iloc[-1, spy.columns.get_loc("high")] = spy["close"].iloc[-1] + 1.6
+        spy.iloc[-1, spy.columns.get_loc("low")]  = spy["close"].iloc[-1] - 1.6
+        regime = self._detect_with(spy, vol_atr_pct_floor=0.012)
+        assert regime != MarketRegime.VOLATILE, (
+            "Floor should suppress VOLATILE when absolute ATR% is calm "
+            "despite a high percentile rank"
+        )
+
+    def test_absolute_floor_disabled_reproduces_old_gate(self):
+        """
+        With vol_atr_pct_floor=0.0 the gate must reduce to the pre-floor
+        behaviour exactly — same calm-market spike now trips VOLATILE.
+        """
+        spy = _make_spy(210, start_price=400.0, trend=0.1)
+        spy["high"] = spy["close"] + 0.2
+        spy["low"]  = spy["close"] - 0.2
+        spy.iloc[-1, spy.columns.get_loc("high")] = spy["close"].iloc[-1] + 1.6
+        spy.iloc[-1, spy.columns.get_loc("low")]  = spy["close"].iloc[-1] - 1.6
+        regime = self._detect_with(spy, vol_atr_pct_floor=0.0)
+        assert regime == MarketRegime.VOLATILE
+
+    def test_floor_does_not_block_genuine_volatility(self):
+        """
+        High pct_rank AND high absolute ATR% → VOLATILE fires as expected.
+        Sanity check that the floor does not break the real-stress case.
+        """
+        spy = _make_spy(210, start_price=400.0, trend=0.5)
+        # Spike last bar's range to push ATR% well above the 1.2% floor.
+        spy.iloc[-1, spy.columns.get_loc("high")] = spy["close"].iloc[-1] + 200
+        spy.iloc[-1, spy.columns.get_loc("low")]  = spy["close"].iloc[-1] - 200
+        regime = self._detect_with(spy, vol_atr_pct_floor=0.012)
+        assert regime == MarketRegime.VOLATILE
+
     # ── TRENDING ─────────────────────────────────────────────────────────────
 
     def test_trending_when_adx_above_threshold(self):
