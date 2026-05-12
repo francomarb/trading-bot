@@ -22,10 +22,16 @@ Regimes
   BEAR      SPY close < SPY 200-day SMA.
             No new long entries for any strategy. Hard stop.
 
-  VOLATILE  Current ATR% (ATR14 / close) is above the `vol_percentile_threshold`
-            (default 80th) of its trailing `vol_percentile_window` (default 126)
-            bar history. Signals a volatility spike that inflates slippage and
-            widens stops beyond modelled risk. No new entries.
+  VOLATILE  Current ATR% (ATR14 / close) BOTH ranks above the
+            `vol_percentile_threshold` (default 80th) of its trailing
+            `vol_percentile_window` (default 126) bar history AND exceeds an
+            absolute floor `vol_atr_pct_floor` (default 0.012 = 1.2%). The
+            absolute floor is required so the gate cannot fire on objectively
+            calm days that merely look "elevated" relative to an unusually quiet
+            rolling window — without it, mean ATR% on flagged days in 2017 was
+            0.68% (a textbook calm market). See scripts/regime_volatile_audit.py
+            for the 12-year calibration; 0.012 was the out-of-sample winner on
+            the crisis_catch − calm_false trade-off across 2014–2026.
 
   TRENDING  ADX(14) on SPY >= `adx_trend_threshold` (default 25).
             Trend-following (SMA crossover) has strong edge; mean-reversion
@@ -48,9 +54,15 @@ on stale data — if the cache is fresh enough it is used; otherwise RANGING.
 
 VIX integration
 ---------------
-Noted for Phase 11 once an Alpaca Plus subscription is in place. VIX would
-replace or supplement the ATR% percentile in the VOLATILE gate, providing a
-forward-looking volatility signal rather than a realised one.
+Considered and parked. ATR% on SPY and VIX percentile are highly correlated
+(daily-level ~0.85, percentile-level higher in stress); both rolling-percentile
+classifiers share the same renormalisation defect, so swapping data sources
+does not fix the underlying problem. The 2026-05 audit
+(scripts/regime_volatile_audit.py) showed the real fix was an absolute ATR%
+floor on top of the existing percentile rank. VIX remains a candidate for
+*different* use cases — e.g. term-structure inversion as a binary stress
+signal, or option-strategy entry confirmation — and should be reconsidered
+when one of those needs arises, not as a regime-detector replacement.
 
 Usage (forward_test.py)
 -----------------------
@@ -109,6 +121,10 @@ class RegimeDetector:
         atr_window:              ATR window for volatility calculation (default 14).
         vol_percentile_window:   Bars to use for ATR% percentile ranking (default 126 ≈ 6 mo).
         vol_percentile_threshold: ATR% percentile above which regime = VOLATILE (default 0.80).
+        vol_atr_pct_floor:       Absolute ATR% floor required IN ADDITION to the percentile
+                                 rank for VOLATILE to fire (default 0.012 = 1.2%). Anchors
+                                 the gate to absolute volatility so it does not over-fire in
+                                 unusually calm rolling-window samples.
         adx_window:              ADX window (default 14).
         adx_trend_threshold:     ADX >= this → TRENDING (default 25).
         adx_range_threshold:     ADX <= this → RANGING  (default 20).
@@ -125,6 +141,7 @@ class RegimeDetector:
         atr_window: int = 14,
         vol_percentile_window: int = 126,
         vol_percentile_threshold: float = 0.80,
+        vol_atr_pct_floor: float = 0.012,
         adx_window: int = 14,
         adx_trend_threshold: float = 25.0,
         adx_range_threshold: float = 20.0,
@@ -137,6 +154,7 @@ class RegimeDetector:
         self._atr_window             = atr_window
         self._vol_pct_window         = vol_percentile_window
         self._vol_pct_threshold      = vol_percentile_threshold
+        self._vol_atr_pct_floor      = vol_atr_pct_floor
         self._adx_window             = adx_window
         self._adx_trend              = adx_trend_threshold
         self._adx_range              = adx_range_threshold
@@ -240,13 +258,22 @@ class RegimeDetector:
             window_valid = window.dropna()
             if len(window_valid) >= 10:   # need enough history to rank
                 pct_rank = float((window_valid < current_atr_pct).mean())
-                if pct_rank >= self._vol_pct_threshold:
+                rank_hit  = pct_rank >= self._vol_pct_threshold
+                floor_hit = current_atr_pct >= self._vol_atr_pct_floor
+                if rank_hit and floor_hit:
                     logger.info(
                         f"REGIME=VOLATILE — ATR% {current_atr_pct:.4f} "
                         f"at {pct_rank:.0%} of trailing {len(window_valid)}-bar history "
-                        f"(threshold={self._vol_pct_threshold:.0%})"
+                        f"(rank_threshold={self._vol_pct_threshold:.0%}, "
+                        f"atr_pct_floor={self._vol_atr_pct_floor:.4f})"
                     )
                     return MarketRegime.VOLATILE
+                if rank_hit and not floor_hit:
+                    logger.debug(
+                        f"VOLATILE rank hit but absolute floor blocked it — "
+                        f"ATR% {current_atr_pct:.4f} < floor {self._vol_atr_pct_floor:.4f} "
+                        f"(pct_rank={pct_rank:.0%}); calm-market false-fire suppressed"
+                    )
 
         # ── 3 & 4. TRENDING / RANGING via ADX ────────────────────────────────
         spy_with_adx = add_adx(spy, self._adx_window)
