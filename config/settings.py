@@ -278,7 +278,7 @@ STRATEGY_SLEEVE_DD_THRESHOLD = 0.15
 # Position sizing
 MAX_POSITION_PCT = 0.02         # Risk no more than 2% of equity per trade (loss-to-stop)
 MAX_POSITION_NOTIONAL_PCT = 0.10 # Global per-position cap; allocator adds strategy-level caps
-MAX_OPEN_POSITIONS = 10         # Global cap; per-strategy limit enforced by sleeve
+MAX_OPEN_POSITIONS = 30         # Global cap; per-strategy limit enforced by sleeve
 MAX_GROSS_EXPOSURE_PCT = 0.80   # 80% of equity tradeable across all strategies
 
 # Stop-loss
