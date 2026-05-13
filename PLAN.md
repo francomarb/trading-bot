@@ -419,7 +419,7 @@ skip ahead. Each group must be paper-validated before the next begins.
 | 10.F3b | **RSI edge filter** — `strategies/filters/rsi_reversion.py`. Four entry gates: (1) **SPY > 200 SMA AND SPY > 50 SMA** — dual macro gate; (2) **earnings blackout (3 days before / 2 days after)** — binary events and post-earnings follow-through; (3) **20-day avg volume ≥ 500K shares** — liquidity floor for limit-order fill quality; (4) **no new 20-day low** — blocks active individual stock breakdowns that the SPY gates cannot see. Stock 50-day SMA gate intentionally excluded: oversold RSI stocks are typically below their 50 SMA — filtering there removes exactly the trades the strategy is designed to take. Observability: `RSI_FILTER_ALLOWED` / `RSI_FILTER_BLOCKED` logged per signal with specific reasons. Phase 11 deferred: SPY 50 SMA cliff-edge smoothing (11.23). 58 filter unit tests. | Medium | 🔴 | ✅ (2026-04-25) |
 | 10.F4 | **RSI paper activation slot** — add `RSIReversion` to the paper engine with `settings.RSI_WATCHLIST`, RSI edge filter (10.F3b) wired in, strategy-specific allocation, limit-order behavior, and attribution verified. Do not enable live. | Medium | 🔴 | ✅ (2026-04-25) |
 | 10.F5 | **Minimum portfolio concentration guardrails** — deferred to Phase 11. Rationale: SMA and RSI watchlists have zero symbol overlap so shared-symbol double-exposure is moot; sector concentration risk is partially mitigated by the sleeve cap (max 5 positions × $8k) and regime gating; the real fix is watchlist curation rather than a code guardrail. See 11.6/11.7. | N/A | Moved to 11.6/11.7 |
-| 10.F6 | **Verified** — unit tests pass; startup reconciliation recomputes sleeve exposure before first entry; paper logs show all four strategies gated by regime and allocation. | Operational | 🔴 | ⬜ |
+| 10.F6 | **Verified** — unit tests pass; startup reconciliation recomputes sleeve exposure before first entry; paper logs show all four strategies gated by regime and allocation. | Operational | 🔴 | ✅ (2026-05-13) |
 | 10.F7 | **DonchianBreakout third strategy slot** (`strategies/donchian_breakout.py`) — Turtle System 1, Mid-range (30/15). Entry: N-day high breakout. Exit: M-day low reversal. `DonchianEdgeFilter`: stock > 200 SMA, IEX-scaled liquidity floor, short earnings blackout (1 day before / 0 days after). `allowed_regimes={TRENDING}` only — RANGING produces false breakouts. Sleeve: 0.25 weight, 5 max positions → $4k per position at $100k. Allocation rebalanced: SMA 0.50, RSI 0.25, Donchian 0.25 (RSI reduced from 0.50 — generated only ~8 trades over 4-year backtest period). Backtest (ai_bigtech 32-name universe, 2× ATR stops, 4y ending 2026-04-28): Sharpe +0.85, MeanRet +162.9%, 457 trades. `forward_test.py` wired with `CompositeEdgeFilter([DonchianEdgeFilter(), SectorMomentumFilter(..., sector_entry_policy="warn")])`. 916 total tests passing. | Medium | 🔴 | ✅ (2026-05-01) |
 | 10.F8 | **Regime detection graduated fallback** (`engine/trader.py`) — fixed bug where a single `detect()` exception left `current_regime=None` and bypassed all gating. New behavior: failure counter tracks consecutive exceptions; first failure reuses last known regime (WARNING log); after `REGIME_MAX_CONSECUTIVE_FAILURES` (default 3) consecutive failures falls back to BEAR (ERROR log, fail-closed); counter resets to 0 on success; no prior regime on first failure defaults to RANGING. `REGIME_MAX_CONSECUTIVE_FAILURES = 3` added to `config/settings.py`. 3 new engine regime tests. | Low | 🔴 | ✅ (2026-05-01) |
 | 10.F9 | **Sector Momentum Gauge** — `sector/resolver.py` + `sector/gauge.py`. Resolver maps ticker → sector via yfinance (industry-first normalization, JSON cache at `data/cache/sector_map.json`, hydrated at startup with retry/timeout). Gauge scores 12 sector ETFs as HOT/NEUTRAL/COLD (5-signal composite: SMA200, SMA50, golden cross, SMA50 distance, volume confirmation). `SectorMomentumFilter` adapter with configurable `sector_entry_policy` ("block"/"warn"/"pass"). `CompositeEdgeFilter` AND-chains any list of edge filters. Per-strategy policies: RSI `sector_entry_policy="block"` (cluster risk), SMA/Donchian `sector_entry_policy="warn"` (trend strategies can catch sector turns). All exits unaffected. 66 new tests (38 resolver + 28 gauge/filter/composite). | Medium | 🔴 | ✅ (2026-05-01) |
@@ -439,90 +439,8 @@ skip ahead. Each group must be paper-validated before the next begins.
 | 10.G2 | **Hard dollar cap (launch-only circuit breaker)** — set `HARD_DOLLAR_LOSS_CAP = $500` in the live `.env` for the first live trading window. Sits parallel to `LIVE_SIZE_MULTIPLIER=0.25` as a static day-one bumper that protects against catastrophic-bug scenarios the percentage-based daily cap is too generous to catch quickly on a small account (e.g. sizing regression, runaway order loop, single-position stop-out at -50%). Already implemented in RiskManager; this is a config decision only. **Retire after the live bot has proven stable** — recommended trigger: 30 days of clean live operation with no kill-switch trips. Retirement = raise well above `MAX_DAILY_LOSS_PCT × equity` (effectively disabling) or remove from `.env`. Same lifecycle as `LIVE_SIZE_MULTIPLIER`. | Low (config) | 🟢 | ⬜ Set at live flip |
 | 10.G3 | **Manual approval prompt** — dropped; not needed given planned test coverage before going live. | N/A | N/A | 🚫 dropped |
 | 10.G4 | **Dry-run mode** — `DRY_RUN=True` config flag; broker logs orders instead of placing them. Final sanity check before real orders. | Low (~15 lines) | 🟢 | ✅ (2026-04-24) |
-| 10.G5 | **Verified** — pre-flight checklist passes; dry-run connects to live Alpaca endpoint and logs at least one cycle; first real order requires manual approval; hard cap enforced. | Operational | 🟢 | ⬜ |
+| 10.G5 | **Verified** — pre-flight checklist passes; dry-run connects to live Alpaca endpoint and logs at least one cycle; hard cap enforced. (Manual-approval gate dropped per 10.G3.) | Operational | 🟢 | ✅ (2026-05-13) |
 | 10.G6 | **Fractional share sizing** — `FRACTIONAL_ENABLED` flag in `config/settings.py`. When True: `risk/manager.py` uses `math.floor(x * 100) / 100` (2 dp) for MARKET orders; LIMIT/GTC orders always use `math.floor()`. `execution/broker.py` routes fractional qty (floor(qty) ≠ qty) to `_place_fractional_order()`: DAY entry + standalone GTC stop for floor(qty) whole shares. Live-size multiplier updated to use fractional floor when applicable. When False: byte-for-byte identical to original whole-share behaviour. Disable once account > ~$10k. Unit tests: 5 broker tests + risk sizing tests updated. | Medium (~80 lines) | 🟢 | ✅ (2026-04-25) |
-
----
-
-#### Design: Durable position ownership (10.C1)
-
-The trade DB already records `strategy` on every fill. On restart, query net open
-position per (symbol, strategy) pair instead of guessing from slot ordering.
-
-**Query:**
-```sql
-SELECT symbol, strategy,
-       SUM(CASE WHEN side='buy' THEN qty ELSE 0 END) -
-       SUM(CASE WHEN side='sell' THEN qty ELSE 0 END) AS net_qty
-FROM trades
-WHERE symbol = ?
-GROUP BY symbol, strategy
-HAVING net_qty > 0
-ORDER BY MAX(timestamp) DESC
-LIMIT 1;
-```
-
-**Startup flow:**
-```
-For each open broker position:
-  a. Run query against trade DB
-  b. If net_qty > 0 found → assign ownership from DB, log INFO
-  c. If no DB record → fallback to slot-order match, log WARNING ("fallback used")
-  d. If matches no slot at all → log WARNING ("unmanaged, will not be traded")
-  e. If two strategies both show net_qty > 0 → log CRITICAL, engage kill switch
-```
-
-**Edge cases:**
-- Partial fill with no exit: net_qty = filled qty, still positive → correctly open
-- Position opened before DB existed: no rows → falls through to slot-order fallback
-- Manually opened position (dashboard): no rows → fallback → WARNING
-- DB missing/corrupt: catch all exceptions, skip DB lookup, fallback for all symbols, log ERROR
-
-**Implementation location:** New `_restore_ownership_from_db()` method on `TradingEngine`,
-called from `start()` after `broker.sync_with_broker()`. See `TODO Phase 10` comment
-in `engine/trader.py`.
-
----
-
-#### Design: Startup reconciliation + fail-safe mode (10.C2)
-
-**Four sources cross-checked at startup:**
-- `broker_positions`: symbols with open shares (from broker snapshot)
-- `broker_open_orders`: symbols with pending orders (from broker snapshot)
-- `db_open_positions`: (symbol, strategy) pairs with net_qty > 0 (from trade DB)
-- `engine_owners`: what `_restore_ownership_from_db()` assigned
-
-**Mismatch classification:**
-
-| Check | Severity | Engine behavior |
-|---|---|---|
-| Broker position, DB record, slot match → all agree | — | NORMAL |
-| Broker position, no DB record | MEDIUM | RESTRICTED: log WARNING, assign fallback |
-| Broker position, no matching slot | MEDIUM | RESTRICTED: log WARNING, skip symbol |
-| DB open record, no broker position | LOW | Log INFO (position closed elsewhere) |
-| Orphan stop order (open order, no position) | MEDIUM | RESTRICTED: log WARNING |
-| Two DB strategies claim same symbol net_qty > 0 | HIGH | HALT: log CRITICAL, engage kill switch |
-
-**Startup modes:**
-```
-All checks clean    → NORMAL  (full operation)
-Any MEDIUM issue    → RESTRICTED (existing positions managed, no new entries)
-Any HIGH issue      → HALT (no new entries or exits; broker stops still protect positions)
-```
-
-**Fail-safe rules:**
-1. Exits always fire in RESTRICTED mode — never block risk reduction
-2. HALT mode requires operator `reset_kill_switches()` to clear
-3. RESTRICTED mode auto-clears after one clean cycle (MEDIUM issues may self-heal
-   as positions close naturally)
-4. Reconciliation verdict logged in startup summary and written to alert log
-5. Broker OTO stop legs remain active regardless of engine mode — they protect
-   positions even if the engine is fully halted
-
-**Implementation location:** New `_reconcile_startup()` method on `TradingEngine`,
-called from `start()` after `_restore_ownership_from_db()`. Returns
-`"NORMAL" | "RESTRICTED" | "HALT"`. Engine stores mode in `self._startup_mode`
-and checks it before opening new entries.
 
 ---
 
@@ -630,7 +548,7 @@ reason.
 |---|---|---|
 | 11.1 | **`DynamicWatchlistSource`** — implement the dynamic variant of the `WatchlistSource` abstraction. Config declares the source as dynamic and points to a scanner module; `DynamicWatchlistSource` calls the module and expects a `list[str]` back. Refresh cadence is configurable (daily recommended). Requires durable ownership and startup reconciliation to be proven stable. | ⬜ |
 | 11.2 | **SPY gate cliff-edge smoothing for RSI filter** — the current hard cutoff (SPY crosses 50 SMA → all RSI entries blocked immediately) is abrupt. Require SPY to be below the 50 SMA for N consecutive bars (e.g. 3) before engaging the block. **⚠️ Do not implement before auditing first.** The cliff-edge complaint is a hunch, not a finding — there is no evidence the hard cutoff has actually cost RSI any winning entries. Additionally, the 50 SMA arm of the gate is itself questionable: RSI reversion is a dip-buyer, and the 200 SMA already vetoes bear regimes, so blocking dips when SPY itself dips is partially in tension with the strategy's own thesis (Rule 4's no-new-low gate already handles individual-stock breakdown). **Required first step:** write `scripts/rsi_50sma_gate_audit.py` to mine `RSI_FILTER_BLOCKED ... SPY trend gate failed` log events, count single-bar vs multi-bar SPY < 50 SMA blocks, and forward-test the would-be entries. Based on findings, choose one of: (a) **drop the 50 SMA arm entirely** if blocks were mostly 1-bar dips that recovered; (b) **keep it strict** and close this item as "investigated, not worth changing" if blocks correlated with losing setups; (c) **then and only then** implement N-bar smoothing per the original proposal, if the audit shows a clear bimodal split where 1-bar dips were good entries and 3+ bar breaks were bad. Implementing smoothing without this audit is adding a tuning knob to a gate whose value hasn't been measured. | ⬜ |
-| 11.3 | **RSI-at-entry overbought gate for SMA crossover** — block SMA entries where RSI on the crossover bar is already ≥ 70. A crossover into overbought territory has significantly lower continuation probability. | ⬜ |
+| 11.3 | **RSI-at-entry overbought gate for SMA crossover** — block SMA entries where RSI on the crossover bar is already ≥ 70. A crossover into overbought territory has significantly lower continuation probability. **⚠️ Do not implement before auditing first.** Three concerns make this likely to be the wrong filter: (a) **framework cross-contamination** — RSI ≥ 70 is a mean-reversion overbought signal being grafted onto a trend-following strategy; published research (Connors/Alvarez TPS, 2-period RSI work) shows that in established trends RSI ≥ 70 acts as a *continuation* signal, not an exhaustion signal, so the filter may systematically suppress the winners SMA crossover is designed to capture; (b) **structural inevitability** — for the 50 SMA to cross above the 200 SMA, price must rally enough to drag the faster average past the slower one over months, so RSI is frequently 60–75 at the crossover bar by mechanical necessity (intuition unverified — that's exactly what the audit is for); (c) **arbitrary threshold** — 70/30 are Wilder's mean-reversion levels with no theoretical basis for application to a daily 50/200 trend strategy. **Required first step:** mine the bot's SMA paper trades from `data/trades.db` and/or a `backtest/runner.py` replay against the current SMA watchlist; compute RSI(14) on the crossover bar for every entry; compare forward 20-day and 60-day returns (mean, median, win rate) conditional on `RSI < 70` vs `RSI ≥ 70`. Outcomes: (1) **RSI ≥ 70 entries materially under-performed** → calibrate threshold against audit data (probably not 70); (2) **no difference or RSI ≥ 70 did better** → close as "investigated, framework mismatch confirmed"; (3) **sample too small to conclude** (very possible — golden crosses are rare on a 30-name watchlist) → also close, no point shipping a filter we cannot validate. SMA strategy already has SPY trend gate, volume expansion gate, and regime gating — adding another filter without evidence of a real failure mode is pre-emptive complexity. | ⬜ |
 | 11.4 | **Same-day concentration cap on correlated SMA signals** — when ≥ N symbols in the SMA watchlist all cross over on the same day, limit new entries to the top N ranked by volume expansion or crossover angle. Prevents deploying a large chunk of capital into highly correlated positions simultaneously. | ⬜ |
 | 11.5 | **Per-symbol cooldown after losing exit** — after a stop-out or other losing exit, block new entries in that same symbol for a configurable number of bars or hours unless a stronger re-entry rule is explicitly satisfied. **⚠️ Do not implement as a blanket cross-strategy rule.** Each active strategy has different re-entry semantics and a one-size-fits-all cooldown would fight several of them: (a) **Donchian breakout** descends from Turtle System 1, where the canonical rule is the *opposite* — take the next signal after a loser, since the loss-then-reload pattern is where the captured trends often start; a loss-cooldown would systematically suppress exactly that re-entry. (b) **RSI reversion** is already protected by Rule 4 (no new 20-day low), SPY trend gates, earnings blackout, and the liquidity floor — after a stop-out the stock has by definition just made a new low, so the existing gates already block the fresh-breakdown case a cooldown would target. (c) **SMA crossover** fires too infrequently per symbol for a cooldown to materially change outcomes, and the next crossover is by construction a new trend signal worth taking. (d) **SPY options reversion** is single-position single-underlying with time/delta/trailing exits — cooldown is a no-op. **Required first step:** audit `data/trades.db` for the actual pattern "losing exit on symbol X → re-entry on X within N bars → second losing exit," grouped by strategy. If the pattern doesn't show up meaningfully in the paper record, close this item as "investigated, not a real problem." If it does, scope the fix to the *one* strategy where it surfaces — do not generalize. The "unless a stronger re-entry rule is explicitly satisfied" escape hatch in the original wording already hints that the blanket form is wrong; each strategy needs its own re-entry semantics, not a shared bar-count veto. | ⬜ |
 | 11.6 | **VIX integration in the regime detector** — superseded by audit findings. The 2026-05 audit (`scripts/regime_volatile_audit.py`) showed the VOLATILE gate's actual defect was that a pure rolling-percentile classifier (a) over-fires in unusually calm windows because the 80th-percentile floor drifts down, and (b) renormalises during sustained stress (2022 bear: gate shut off 106 days before the trough). Both failure modes apply equally to a VIX-percentile classifier — same shape, same defect — so swapping data sources would not have fixed the problem. The actual fix was an **absolute ATR% floor of 1.2%** layered on top of the existing percentile rank, validated out-of-sample on 12 years of SPY (split 2014-2022 tune, 2023-2026 validate). VIX is **not the right tool for regime detection** but remains a candidate for other use cases as they arise — e.g. term-structure inversion (VIX9D / VIX) as a binary stress trigger, or options-strategy entry confirmation. Reconsider then, not now. | 🔁 Superseded by 11.6a |
