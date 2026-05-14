@@ -909,17 +909,18 @@ class TestPlaceSpreadOrder:
         api.submit_order.return_value = _alpaca_order(id="combo-1", status="accepted")
         broker = AlpacaBroker(client=api, max_attempts=1, base_delay=0.0, dry_run=False)
 
+        # Negative limit = net credit required (Alpaca MLEG sign convention).
         result = broker.place_spread_order(
             legs=_open_spread_legs(),
             qty=2,
-            limit_price=3.256,
+            limit_price=-3.256,
             strategy_name="credit_spread",
         )
 
         req = api.submit_order.call_args.args[0]
         assert req.order_class is AlpacaOrderClass.MLEG
         assert req.qty == 2
-        assert req.limit_price == 3.26
+        assert req.limit_price == -3.26
         assert len(req.legs) == 2
         assert result.status is OrderStatus.ACCEPTED
         assert result.order_id == "combo-1"
@@ -933,14 +934,14 @@ class TestPlaceSpreadOrder:
         result = broker.place_spread_order(
             legs=_open_spread_legs(),
             qty=1,
-            limit_price=3.25,
+            limit_price=-3.25,
             strategy_name="credit_spread",
         )
 
         api.submit_order.assert_not_called()
         assert result.status is OrderStatus.FILLED
         assert result.raw_status == "dry_run"
-        assert result.avg_fill_price == 3.25
+        assert result.avg_fill_price == -3.25
         assert result.symbol == _SHORT_OCC
 
     def test_api_error_returns_rejected(self):

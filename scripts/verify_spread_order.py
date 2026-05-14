@@ -39,6 +39,7 @@ from data.fetcher import fetch_symbol
 from execution.broker import AlpacaBroker, OrderStatus
 from execution.options_executor import SpreadLeg
 from risk.manager import Side
+from utils.option_symbols import owner_key_for
 from utils.options_lookup import find_best_put_spread
 from utils.options_ranker import Quote
 
@@ -132,14 +133,30 @@ def _latest_close(symbol: str = SYMBOL) -> float:
     return float(df["close"].iloc[-1])
 
 
-def _reset_lingering_mleg_orders(broker: AlpacaBroker) -> None:
-    """Cancel any working SPY option orders so the script is idempotent."""
+def _is_spy_option(symbol: str | None) -> bool:
+    """True for an OCC option contract on SYMBOL (excludes the equity)."""
+    return bool(symbol) and symbol != SYMBOL and owner_key_for(symbol) == SYMBOL
+
+
+def _reset_lingering_spy_options(broker: AlpacaBroker) -> None:
+    """
+    Cancel working SPY option orders AND close SPY option positions so the
+    script is idempotent across runs. Option legs are closed individually
+    with market orders — robust cleanup that does not depend on having the
+    original combo's leg list.
+    """
     snap = broker.sync_with_broker()
     for o in snap.open_orders:
-        # OCC option symbols start with the underlying ticker.
-        if o.symbol and o.symbol.startswith(SYMBOL) and len(o.symbol) > len(SYMBOL):
-            logger.info(f"pre-flight: canceling lingering option order {o.order_id}")
+        if _is_spy_option(o.symbol):
+            logger.info(f"cleanup: canceling lingering option order {o.order_id}")
             broker.cancel_order(o.order_id)
+    for occ in list(snap.account.open_positions):
+        if _is_spy_option(occ):
+            logger.info(f"cleanup: closing lingering option position {occ}")
+            try:
+                broker.close_position(occ, poll_timeout=15.0)
+            except Exception as e:
+                logger.warning(f"cleanup: failed to close {occ}: {e}")
     time.sleep(1.0)
 
 
@@ -156,8 +173,8 @@ def main() -> int:
     broker = AlpacaBroker()
 
     # ── 1. Pre-flight ───────────────────────────────────────────────────────
-    section("pre-flight — clear lingering SPY option orders")
-    _reset_lingering_mleg_orders(broker)
+    section("pre-flight — clear lingering SPY option orders + positions")
+    _reset_lingering_spy_options(broker)
     logger.info("pre-flight complete")
 
     # ── 2. Pick a real spread from the live chain ───────────────────────────
@@ -194,18 +211,21 @@ def main() -> int:
         SpreadLeg(occ_symbol=pick.short_occ, side=Side.SELL, opening=True),
         SpreadLeg(occ_symbol=pick.long_occ, side=Side.BUY, opening=True),
     ]
-    # Ask for a net credit == full width: an impossible fill, so the order
-    # stays working until we cancel it. This isolates "did Alpaca accept the
-    # MLEG shape?" from "did it fill?".
-    unfillable_credit = round(pick.width, 2)
+    # Alpaca MLEG limit-price convention (confirmed by this merge gate):
+    #   positive = net debit you will pay,  negative = net credit you require.
+    # Demand a near-impossible credit (≈ full width) so the order sits
+    # working until we cancel it — isolating "did Alpaca accept the MLEG
+    # shape?" from "did it fill?". A *positive* limit here would mean "pay
+    # any debit up to that amount" and fill instantly.
+    unfillable_limit = -round(SPREAD_WIDTH - 0.01, 2)
     logger.info(
-        f"submitting 1× combo at net credit ${unfillable_credit:.2f} "
-        "(intentionally unfillable)"
+        f"submitting 1× combo at limit {unfillable_limit:.2f} "
+        f"(demands a ${abs(unfillable_limit):.2f} credit — intentionally unfillable)"
     )
     result = broker.place_spread_order(
         legs=legs,
         qty=1,
-        limit_price=unfillable_credit,
+        limit_price=unfillable_limit,
         strategy_name="verify_spread",
     )
     logger.info(
@@ -246,6 +266,22 @@ def main() -> int:
 
     # ── 5. Cancel and confirm ───────────────────────────────────────────────
     section("cancel — leave nothing open")
+    # Check the pre-cancel state first: with the corrected negative limit the
+    # order should still be working, not filled.
+    pre_cancel_status = None
+    try:
+        pre = broker._api.get_order_by_id(result.order_id)
+        pre_cancel_status = (
+            pre.status.value if hasattr(pre.status, "value") else str(pre.status)
+        )
+    except Exception:
+        pass
+    check(
+        "order is still working before cancel (negative limit did not fill)",
+        pre_cancel_status not in {"filled", "partially_filled"},
+        f"pre-cancel status={pre_cancel_status}",
+    )
+
     canceled = broker.cancel_order(result.order_id)
     check("cancel_order returned True", canceled)
     time.sleep(1.5)
@@ -264,8 +300,13 @@ def main() -> int:
             f"status={final_status}",
         )
 
-    # Final safety net — make sure no SPY option order is still working.
-    _reset_lingering_mleg_orders(broker)
+    # Final safety net — cancel any working SPY option order and close any
+    # SPY option position (covers a freak fill despite the unfillable limit).
+    section("post-run cleanup — leave the paper account flat")
+    _reset_lingering_spy_options(broker)
+    snap = broker.sync_with_broker()
+    leftover = [s for s in snap.account.open_positions if _is_spy_option(s)]
+    check("no SPY option positions remain", not leftover, f"leftover={leftover}")
     return _summary()
 
 

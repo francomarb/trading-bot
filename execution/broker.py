@@ -769,9 +769,14 @@ class AlpacaBroker:
         script calls this directly; PR 3's credit-spread strategy will go
         through the worker.
 
-        ``limit_price`` is the net price of the combo. For a bull put credit
-        spread it is the net credit (positive). ``OrderResult.symbol`` is the
-        short (SELL) leg's OCC string — the spread's defining contract.
+        ``limit_price`` is the net price of the combo. Alpaca's MLEG sign
+        convention: **positive** is a net debit paid, **negative** is a net
+        credit required. A bull put credit spread collecting ~$1.40/share is
+        submitted with ``limit_price = -1.40`` — a positive value would mean
+        "pay any debit up to that amount" and fill near-instantly.
+
+        ``OrderResult.symbol`` is the short (SELL) leg's OCC string — the
+        spread's defining contract.
         """
         short_leg = next((leg for leg in legs if leg.side is Side.SELL), legs[0])
         rep_symbol = short_leg.occ_symbol

@@ -209,15 +209,16 @@ class TestSpreadLeg:
 
 class TestBuildMlegRequest:
     def test_builds_mleg_limit_request_with_both_legs(self):
+        # Negative limit = net credit required (Alpaca MLEG sign convention).
         req = build_mleg_request(
             legs=_open_legs(),
             qty=2,
-            limit_price=3.256,
+            limit_price=-3.256,
             client_order_id="spr-test-abc",
         )
         assert req.order_class is AlpacaOrderClass.MLEG
         assert req.qty == 2
-        assert req.limit_price == 3.26  # rounded to cents
+        assert req.limit_price == -3.26  # rounded to cents, sign preserved
         assert req.client_order_id == "spr-test-abc"
         assert len(req.legs) == 2
         assert {leg.symbol for leg in req.legs} == {_SHORT_OCC, _LONG_OCC}
@@ -226,13 +227,13 @@ class TestBuildMlegRequest:
         with pytest.raises(ValueError, match="≥ 2 legs"):
             build_mleg_request(
                 legs=[SpreadLeg(_SHORT_OCC, Side.SELL)],
-                qty=1, limit_price=1.0, client_order_id="x",
+                qty=1, limit_price=-1.0, client_order_id="x",
             )
 
     def test_rejects_non_positive_qty(self):
         with pytest.raises(ValueError, match="qty must be ≥ 1"):
             build_mleg_request(
-                legs=_open_legs(), qty=0, limit_price=1.0, client_order_id="x",
+                legs=_open_legs(), qty=0, limit_price=-1.0, client_order_id="x",
             )
 
 

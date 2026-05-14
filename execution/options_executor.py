@@ -111,10 +111,17 @@ def build_mleg_request(
     Build an Alpaca MLEG (multi-leg) limit order request.
 
     ``qty`` is the number of spreads; each leg's ``ratio_qty`` scales it.
-    ``limit_price`` is the net price of the combo — for a bull put credit
-    spread this is the net credit (a positive number), the minimum credit
-    the order will accept. Alpaca infers debit/credit direction from the
-    legs' sides and intents.
+
+    ``limit_price`` is the net price of the combo. Alpaca's MLEG sign
+    convention (verified against the paper API by
+    ``scripts/verify_spread_order.py``):
+
+      * **positive** → a net **debit** the order will pay up to;
+      * **negative** → a net **credit** the order requires at least.
+
+    So a bull put credit spread that should collect ~$1.40/share is
+    submitted with ``limit_price = -1.40``. Submitting a positive number
+    means "pay any debit up to that amount" and will fill near-instantly.
 
     Multi-leg orders carry no top-level ``symbol``/``side`` — those live on
     the individual ``OptionLegRequest`` legs.
