@@ -465,6 +465,60 @@ class TestProcessSymbol:
         assert any("Option trade rejected for SPY" in msg for msg in warnings)
         assert not any("Failed to build option execution for SPY" in msg for msg in errors)
 
+    def test_async_option_dispatch_registers_position_with_occ_leg(
+        self, engine_factory
+    ):
+        """The async (ACCEPTED) options path must register the Position with
+        the OCC contract as its leg symbol — not the strategy's underlying.
+
+        Regression: registering with `symbol` ("SPY") instead of
+        `target_symbol` (the OCC string) left primary_leg.symbol == "SPY",
+        which broke the single-leg-option contract and made
+        _compute_sector_exposure() miscount SPY options as equity exposure.
+        """
+        occ = "SPY260521C00730000"
+
+        class _OptionStrategy(FakeStrategy):
+            name = "spy_options_reversion"
+            preferred_order_type = OrderType.LIMIT
+
+            def build_option_execution(self, symbol, latest_close, *, notional_cap=None):
+                return (occ, 9.30, None, None)
+
+        accepted = OrderResult(
+            status=OrderStatus.ACCEPTED,
+            order_id="ord-async",
+            symbol=occ,
+            requested_qty=1,
+            filled_qty=0,
+            avg_fill_price=None,
+            raw_status="accepted",
+            message="dispatched to options worker",
+        )
+        engine, broker = engine_factory(place_result=accepted)
+        engine.slots[0].strategy = _OptionStrategy(
+            entries=[False] * 59 + [True], exits=[False] * 60
+        )
+        snap = _snapshot()
+        engine._session_start_equity = snap.account.equity
+
+        self._process(engine, "SPY", snap)
+
+        # Position is keyed by the underlying, but the leg carries the OCC.
+        assert "SPY" in engine._positions
+        pos = engine._positions["SPY"]
+        assert pos.position_id == "SPY"
+        assert pos.primary_leg is not None
+        assert pos.primary_leg.symbol == occ
+        assert pos.strategy_name == "spy_options_reversion"
+
+        # Sector exposure must exclude the option position (OCC leg).
+        resolver = MagicMock()
+        resolver.resolve.return_value = "technology"
+        engine._sector_resolver = resolver
+        assert engine._compute_sector_exposure() == {}
+        resolver.resolve.assert_not_called()
+
 
 # ── _run_one_cycle ───────────────────────────────────────────────────────────
 

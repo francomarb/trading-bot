@@ -1044,7 +1044,11 @@ class TradingEngine:
                 # Options worker dispatched asynchronously — pre-register
                 # ownership so the position is managed when it arrives in the
                 # broker snapshot. The actual fill is logged via drain_option_fills().
-                self._register_single_leg(strategy_name=strategy.name, symbol=symbol)
+                # Register with target_symbol (the OCC contract) so the
+                # Position's leg carries the real option symbol; owner_key_for()
+                # still keys the position by the underlying. _entry_prices stays
+                # keyed by `symbol` (== the owner key).
+                self._register_single_leg(strategy_name=strategy.name, symbol=target_symbol)
                 self._entry_prices[symbol] = target_price
                 logger.info(
                     f"[{strategy.name}] {symbol}: options order dispatched "
@@ -1065,7 +1069,10 @@ class TradingEngine:
             )
             self._log_entry(decision, result, latest_close)
             if result.status in {OrderStatus.FILLED, OrderStatus.PARTIAL}:
-                self._register_single_leg(strategy_name=strategy.name, symbol=symbol)
+                # target_symbol == symbol for equities; the OCC contract for
+                # synchronous option fills. Register with it so the leg carries
+                # the real traded symbol.
+                self._register_single_leg(strategy_name=strategy.name, symbol=target_symbol)
                 if strategy_statuses is not None:
                     strategy_statuses[symbol] = "Long"
                 if strategy_reasons is not None:
