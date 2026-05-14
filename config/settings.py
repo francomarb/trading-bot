@@ -274,6 +274,105 @@ MIN_TRADE_NOTIONAL = 100.0      # Reject entries if sleeve available < this
 #   gate fires when realized PnL < HWM − 0.15 × $20k = HWM − $3k
 STRATEGY_SLEEVE_DD_THRESHOLD = 0.15
 
+# ── Credit spread strategy (Phase 11.29) ─────────────────────────────────────
+# Per-instrument config for the underlying-agnostic bull put credit spread
+# strategy. v1 ships SPY + QQQ (both ETFs, both use VIX as the IV proxy).
+# IWM, single names, and leveraged ETFs are deferred — see
+# docs/credit_spread_strategy.md §15.
+#
+# Strategy LOGIC is hardcoded; only the thresholds below are configurable.
+# Every instrument block must define all _REQUIRED_CREDIT_SPREAD_KEYS — a
+# missing key fails loudly at import (see the validation loop below) rather
+# than silently at first trade.
+#
+# min_credit_pct_of_width is 0.13, not the design doc's 0.25 default: the
+# 11.28 merge gate showed real ~17Δ $10-wide SPY put spreads collect only
+# ~13–15% of width. 0.25 would reject nearly every spread. Revisit during
+# the paper-watch follow-up.
+CREDIT_SPREAD_INSTRUMENTS: dict[str, dict] = {
+    "SPY": {
+        # Entry
+        "short_leg_delta": 0.17,
+        "spread_width": 10,
+        "dte_min": 30,
+        "dte_max": 45,
+        "iv_proxy_source": "vix",
+        "min_iv_proxy": 14,                 # VIX index points
+        "min_credit_pct_of_width": 0.13,
+        # Position management
+        "max_concurrent_positions": 3,
+        "max_per_expiration": 1,
+        "min_dte_gap_between_opens": 7,
+        # Exits
+        "profit_target_pct": 0.50,
+        "stop_loss_multiple": 2.0,
+        "time_stop_dte": 21,
+        "exit_on_short_strike_breach": True,
+        "limit_timeout_seconds": 30,
+        # Earnings (ETF — no earnings; meaningful only for single names)
+        "earnings_blackout_days": 0,
+    },
+    "QQQ": {
+        "short_leg_delta": 0.17,
+        "spread_width": 15,                 # higher price → wider strikes
+        "dte_min": 30,
+        "dte_max": 45,
+        "iv_proxy_source": "vix",           # QQQ tracks SPX closely
+        "min_iv_proxy": 14,
+        "min_credit_pct_of_width": 0.13,
+        "max_concurrent_positions": 3,
+        "max_per_expiration": 1,
+        "min_dte_gap_between_opens": 7,
+        "profit_target_pct": 0.50,
+        "stop_loss_multiple": 2.0,
+        "time_stop_dte": 21,
+        "exit_on_short_strike_breach": True,
+        "limit_timeout_seconds": 30,
+        "earnings_blackout_days": 0,
+    },
+}
+
+# Every CREDIT_SPREAD_INSTRUMENTS block must define exactly these keys.
+_REQUIRED_CREDIT_SPREAD_KEYS: frozenset[str] = frozenset({
+    "short_leg_delta", "spread_width", "dte_min", "dte_max",
+    "iv_proxy_source", "min_iv_proxy", "min_credit_pct_of_width",
+    "max_concurrent_positions", "max_per_expiration", "min_dte_gap_between_opens",
+    "profit_target_pct", "stop_loss_multiple", "time_stop_dte",
+    "exit_on_short_strike_breach", "limit_timeout_seconds", "earnings_blackout_days",
+})
+
+for _cs_symbol, _cs_cfg in CREDIT_SPREAD_INSTRUMENTS.items():
+    _cs_missing = _REQUIRED_CREDIT_SPREAD_KEYS - _cs_cfg.keys()
+    _cs_extra = _cs_cfg.keys() - _REQUIRED_CREDIT_SPREAD_KEYS
+    if _cs_missing:
+        raise ValueError(
+            f"CREDIT_SPREAD_INSTRUMENTS['{_cs_symbol}'] is missing required "
+            f"key(s): {sorted(_cs_missing)}"
+        )
+    if _cs_extra:
+        raise ValueError(
+            f"CREDIT_SPREAD_INSTRUMENTS['{_cs_symbol}'] has unknown key(s): "
+            f"{sorted(_cs_extra)}"
+        )
+
+# Shared sleeve: all credit-spread instances draw from one budget. The
+# allocator wiring (STRATEGY_ALLOCATIONS entry, pool rebalance) lands with
+# the engine integration in PR 3b — these constants are config-only here.
+CREDIT_SPREAD_SLEEVE_BUDGET_PCT = 0.10
+# Global cap across ALL credit-spread instances combined — the safety net
+# for a correlated drawdown where every instrument's own cap is full.
+MAX_TOTAL_CONCURRENT_CREDIT_SPREADS = 8
+
+# Composite weights for utils.options_ranker.rank_put_spread_candidates.
+# Mirrors the ranker module's defaults; here so the values are reviewable
+# alongside the rest of the credit-spread config.
+CREDIT_SPREAD_RANKER_WEIGHTS: dict[str, float] = {
+    "delta": 0.40,
+    "credit": 0.30,
+    "spread_quality": 0.20,
+    "dte": 0.10,
+}
+
 # ── Risk settings (Phase 6) ──────────────────────────────────────────────────
 # Position sizing
 MAX_POSITION_PCT = 0.02         # Risk no more than 2% of equity per trade (loss-to-stop)
