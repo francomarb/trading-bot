@@ -24,6 +24,13 @@ from __future__ import annotations
 import sys
 import time
 from datetime import datetime, timedelta, timezone
+from pathlib import Path
+
+# Allow `python scripts/verify_spread_order.py` from the repo root — put the
+# project root on sys.path so `config`, `execution`, etc. import cleanly.
+ROOT = Path(__file__).resolve().parents[1]
+if str(ROOT) not in sys.path:
+    sys.path.insert(0, str(ROOT))
 
 from loguru import logger
 
