@@ -975,12 +975,14 @@ class TestPlaceSpreadOrder:
         assert result.status is OrderStatus.REJECTED
         assert "≥ 2 legs" in result.message
 
-    def test_close_spread_order_rebuilds_legs_with_closing_intents(self):
+    def test_close_spread_order_reverses_legs_to_flatten_the_spread(self):
         api = MagicMock()
         api.submit_order.return_value = _alpaca_order(id="combo-close", status="accepted")
         broker = AlpacaBroker(client=api, max_attempts=1, base_delay=0.0, dry_run=False)
 
-        # Pass the *opening* legs; close_spread_order must flip them to closing.
+        # Pass the *opening* legs (short SELL_TO_OPEN + long BUY_TO_OPEN).
+        # close_spread_order must reverse each side so the combo actually
+        # flattens: short BUY_TO_CLOSE + long SELL_TO_CLOSE.
         result = broker.close_spread_order(
             legs=_open_spread_legs(),
             qty=1,
@@ -989,8 +991,12 @@ class TestPlaceSpreadOrder:
         )
 
         req = api.submit_order.call_args.args[0]
-        from alpaca.trading.enums import PositionIntent
-        intents = {leg.symbol: leg.position_intent for leg in req.legs}
-        assert intents[_SHORT_OCC] is PositionIntent.SELL_TO_CLOSE
-        assert intents[_LONG_OCC] is PositionIntent.BUY_TO_CLOSE
+        from alpaca.trading.enums import OrderSide, PositionIntent
+        by_symbol = {leg.symbol: leg for leg in req.legs}
+        # Short leg: sold to open → bought to close.
+        assert by_symbol[_SHORT_OCC].side is OrderSide.BUY
+        assert by_symbol[_SHORT_OCC].position_intent is PositionIntent.BUY_TO_CLOSE
+        # Long leg: bought to open → sold to close.
+        assert by_symbol[_LONG_OCC].side is OrderSide.SELL
+        assert by_symbol[_LONG_OCC].position_intent is PositionIntent.SELL_TO_CLOSE
         assert result.status is OrderStatus.ACCEPTED

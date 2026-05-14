@@ -873,13 +873,19 @@ class AlpacaBroker:
         Submit a closing MLEG combo order for an open spread (11.28).
 
         Accepts the same ``legs`` used to open the spread and rebuilds them
-        with closing position intents (``*_TO_CLOSE``). ``limit_price`` is
-        the net debit paid to buy the spread back.
+        as the *reversing* trade: each leg's side is flipped and the intent
+        becomes ``*_TO_CLOSE``. For a bull put credit spread opened as
+        short SELL_TO_OPEN + long BUY_TO_OPEN, this produces short
+        BUY_TO_CLOSE + long SELL_TO_CLOSE — the trade that actually flattens
+        the position.
+
+        ``limit_price`` is the net debit paid to buy the spread back
+        (positive, per the Alpaca MLEG sign convention).
         """
         closing_legs = [
             SpreadLeg(
                 occ_symbol=leg.occ_symbol,
-                side=leg.side,
+                side=Side.BUY if leg.side is Side.SELL else Side.SELL,
                 opening=False,
                 ratio_qty=leg.ratio_qty,
             )
