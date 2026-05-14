@@ -173,6 +173,10 @@ LMT, MCD, AAPL, ANET, CAT, CIEN, MCO, AMZN, EQIX, RTX, META, HD, SOFI, ARM
 **Why this strategy:**
 RSI mean reversion profits when prices snap back from extremes. It performs well in ranging/sideways markets where SMA crossover suffers, providing natural regime diversification when both strategies run simultaneously.
 
+**Research notes:**
+
+- *2026-05-13 — crossing vs. state entry.* Tested replacing the edge-triggered entry `(rsi < oversold) & (prev_rsi >= oversold)` with a level-triggered version `(rsi < oversold)`, motivated by paper-run signal silence. On the current 28-name basket over 2021-05-13 to 2026-05-13 (SIP, 5 bps, `max_positions=5`): state entry roughly doubled trade count (19 → 38) and avg concurrent positions (1.53 → 2.96), but Sharpe fell 0.84 → 0.77 and MaxDD widened from −21.3% to −33.7%. Win rate improved (73.7% → 81.6%) but profit factor collapsed (13.75 → 4.46). Per-symbol metrics were nearly identical; the divergence comes entirely from portfolio-level collision behavior — more concurrent oversold names means a market dip clusters correlated exposure. Conclusion: density goal met but risk-adjusted return worse. Crossing rule retained.
+
 ---
 
 ### Donchian Breakout

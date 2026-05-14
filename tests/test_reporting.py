@@ -424,6 +424,120 @@ class TestTradeLogger:
         assert "initial_risk_dollars" in cols
         assert "r_multiple" in cols
         assert "exit_timestamp" in cols
+        assert "position_id" in cols
+        assert "position_type" in cols
+
+    def test_position_id_backfill_populates_existing_rows(self, tmp_csv):
+        """Pre-11.27 rows are backfilled to position_id = owner_key_for(symbol):
+        equities keep symbol, OCC options collapse to the underlying."""
+        conn = sqlite3.connect(tmp_csv)
+        conn.execute(
+            """
+            CREATE TABLE trades (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                timestamp TEXT NOT NULL,
+                symbol TEXT NOT NULL,
+                side TEXT NOT NULL,
+                qty REAL NOT NULL,
+                avg_fill_price REAL,
+                order_id TEXT,
+                strategy TEXT NOT NULL,
+                reason TEXT NOT NULL,
+                stop_price REAL,
+                entry_reference_price REAL,
+                modeled_slippage_bps REAL,
+                realized_slippage_bps REAL,
+                order_type TEXT,
+                status TEXT NOT NULL,
+                requested_qty REAL,
+                filled_qty REAL
+            )
+            """
+        )
+        # Seed two legacy rows that pre-date PR 11.27.
+        conn.executemany(
+            "INSERT INTO trades (timestamp, symbol, side, qty, strategy, reason, "
+            "status) VALUES (?, ?, ?, ?, ?, ?, ?)",
+            [
+                ("2026-04-01T00:00:00Z", "AAPL", "buy", 10, "sma_crossover", "entry", "filled"),
+                ("2026-04-02T00:00:00Z", "SPY260516C00520000", "buy", 1, "spy_options_reversion", "entry", "filled"),
+            ],
+        )
+        conn.commit()
+        conn.close()
+
+        # Opening the logger triggers the migration + backfill.
+        TradeLogger(path=tmp_csv).read_all()
+
+        conn = sqlite3.connect(tmp_csv)
+        rows = conn.execute(
+            "SELECT symbol, position_id, position_type FROM trades ORDER BY id"
+        ).fetchall()
+        conn.close()
+        # OCC option rows get normalized to the underlying ticker so the
+        # stored position_id matches engine.positions.owner_key_for().
+        assert rows == [
+            ("AAPL", "AAPL", "single_leg"),
+            ("SPY260516C00520000", "SPY", "single_leg"),
+        ]
+
+    def test_position_id_backfill_is_idempotent(self, tmp_csv, sample_decision, sample_result):
+        """Re-opening an already-migrated DB must not overwrite explicit position_ids."""
+        tl = TradeLogger(path=tmp_csv)
+        record = tl.build_record(sample_decision, sample_result)
+        tl.log(record)
+        tl.close()
+
+        # Hand-edit one row to a UUID (simulates a future spread write).
+        conn = sqlite3.connect(tmp_csv)
+        conn.execute(
+            "UPDATE trades SET position_id = 'deadbeef', position_type = 'spread' WHERE id = 1"
+        )
+        conn.commit()
+        conn.close()
+
+        # Re-open: backfill must NOT touch the row we hand-edited.
+        TradeLogger(path=tmp_csv).read_all()
+
+        conn = sqlite3.connect(tmp_csv)
+        row = conn.execute(
+            "SELECT position_id, position_type FROM trades WHERE id = 1"
+        ).fetchone()
+        conn.close()
+        assert row == ("deadbeef", "spread")
+
+    def test_new_record_writes_position_id_and_type(self, tmp_csv, sample_decision, sample_result):
+        tl = TradeLogger(path=tmp_csv)
+        record = tl.build_record(sample_decision, sample_result)
+        tl.log(record)
+        tl.close()
+
+        conn = sqlite3.connect(tmp_csv)
+        row = conn.execute(
+            "SELECT position_id, position_type FROM trades WHERE id = 1"
+        ).fetchone()
+        conn.close()
+        # sample_decision uses an equity ticker, so owner_key == symbol.
+        assert row == (sample_decision.symbol, "single_leg")
+
+    def test_option_record_writes_underlying_as_position_id(self, tmp_csv):
+        """OCC option fills must store position_id = underlying ticker."""
+        # build a synthetic option entry via log_external_close, which
+        # exercises the same owner_key_for() normalization path.
+        tl = TradeLogger(path=tmp_csv)
+        tl.log_external_close(
+            symbol="SPY260516C00520000",
+            strategy="spy_options_reversion",
+            reason="test_synthetic",
+        )
+        tl.close()
+
+        conn = sqlite3.connect(tmp_csv)
+        row = conn.execute(
+            "SELECT symbol, position_id, position_type FROM trades WHERE id = 1"
+        ).fetchone()
+        conn.close()
+        assert row == ("SPY260516C00520000", "SPY", "single_leg")
 
 
 # ── TestPnLTracker ──────────────────────────────────────────────────────────

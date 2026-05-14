@@ -31,6 +31,7 @@ from datetime import datetime, timezone
 from loguru import logger
 
 from config import settings
+from utils.option_symbols import owner_key_for
 
 _OCC_OPTION_SYMBOL = re.compile(r"^[A-Z]{1,6}[0-9]{6}[CP][0-9]{8}$")
 
@@ -86,6 +87,8 @@ TRADE_COLUMNS = [
     "r_multiple",
     "entry_timestamp",
     "exit_timestamp",
+    "position_id",
+    "position_type",
 ]
 
 # Keep the old name as an alias for backwards compatibility with tests
@@ -117,7 +120,9 @@ CREATE TABLE IF NOT EXISTS trades (
     realized_pnl          REAL,
     r_multiple            REAL,
     entry_timestamp       TEXT,
-    exit_timestamp        TEXT
+    exit_timestamp        TEXT,
+    position_id           TEXT,
+    position_type         TEXT
 );
 """
 
@@ -129,7 +134,31 @@ _MIGRATION_COLUMNS = {
     "r_multiple": "REAL",
     "entry_timestamp": "TEXT",
     "exit_timestamp": "TEXT",
+    "position_id": "TEXT",
+    "position_type": "TEXT",
 }
+
+# Index on position_id for fast spread leg grouping. Idempotent.
+_POSITION_ID_INDEX_SQL = (
+    "CREATE INDEX IF NOT EXISTS idx_trades_position_id "
+    "ON trades(position_id)"
+)
+
+# Backfill: existing rows pre-PR-11.27 are all single-leg, with
+# position_id = symbol. Run once per database after the ALTERs.
+# One-shot backfill for rows that pre-date PR 11.27. The OWNER_KEY() SQLite
+# UDF (registered in _ensure_db, wired to utils.option_symbols.owner_key_for)
+# collapses OCC option symbols to their underlying ticker — so legacy equity
+# rows store position_id = symbol, and legacy option rows store
+# position_id = underlying. This matches what engine.positions builds for
+# new positions, keeping the engine lookup key and the DB key consistent.
+# Guarded by `WHERE position_id IS NULL` so explicit writes (future spreads)
+# are never overwritten on subsequent startups.
+_BACKFILL_SQL = (
+    "UPDATE trades "
+    "SET position_id = OWNER_KEY(symbol), position_type = 'single_leg' "
+    "WHERE position_id IS NULL"
+)
 
 
 # ── Trade record ────────────────────────────────────────────────────────────
@@ -162,6 +191,8 @@ class TradeRecord:
     r_multiple: float | None = None
     entry_timestamp: str | None = None
     exit_timestamp: str | None = None
+    position_id: str | None = None
+    position_type: str | None = None
 
     def as_dict(self) -> dict:
         """Column-ordered dict (same interface as before migration)."""
@@ -191,6 +222,10 @@ class TradeLogger:
             return self._conn
         os.makedirs(os.path.dirname(self._path) or ".", exist_ok=True)
         self._conn = sqlite3.connect(self._path)
+        # Register OWNER_KEY() as a SQLite UDF so the backfill SQL can
+        # normalize OCC option symbols to their underlying. Keeps the
+        # stored position_id consistent with engine.positions.owner_key_for().
+        self._conn.create_function("OWNER_KEY", 1, owner_key_for, deterministic=True)
         self._conn.execute(_CREATE_TABLE_SQL)
         existing = {
             row[1]
@@ -201,6 +236,10 @@ class TradeLogger:
                 self._conn.execute(
                     f"ALTER TABLE trades ADD COLUMN {column} {col_type}"
                 )
+        # 11.27: backfill position_id/position_type on pre-existing rows, then
+        # ensure the lookup index exists. Both statements are idempotent.
+        self._conn.execute(_BACKFILL_SQL)
+        self._conn.execute(_POSITION_ID_INDEX_SQL)
         self._conn.commit()
         return self._conn
 
@@ -270,6 +309,8 @@ class TradeLogger:
             r_multiple=None,
             entry_timestamp=now_iso,
             exit_timestamp=None,
+            position_id=owner_key_for(decision.symbol),
+            position_type="single_leg",
         )
 
     def build_close_record(
@@ -348,6 +389,8 @@ class TradeLogger:
             r_multiple=r_multiple,
             entry_timestamp=entry_timestamp,
             exit_timestamp=now_iso,
+            position_id=owner_key_for(result.symbol),
+            position_type="single_leg",
         )
 
     def log(self, record: TradeRecord) -> None:
@@ -441,6 +484,8 @@ class TradeLogger:
             r_multiple=None,
             entry_timestamp=None,
             exit_timestamp=datetime.now(timezone.utc).isoformat(),
+            position_id=owner_key_for(symbol),
+            position_type="single_leg",
         )
         self.log(record)
 
@@ -509,6 +554,8 @@ class TradeLogger:
             r_multiple=r_multiple,
             entry_timestamp=entry_timestamp,
             exit_timestamp=now_iso,
+            position_id=owner_key_for(symbol),
+            position_type="single_leg",
         )
         self.log(record)
 
