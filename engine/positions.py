@@ -21,14 +21,14 @@ the engine no longer cares whether a position has one leg or many.
 
 from __future__ import annotations
 
-import re
 import uuid
 from dataclasses import dataclass, field
 from datetime import datetime
 from typing import Iterable
 
-
-_OCC_PAT = re.compile(r"^([A-Z]{1,6})[0-9]{6}[CP][0-9]{8}$")
+# Re-exported from utils.option_symbols so callers that don't want to pull
+# in the engine package can use the same normalizer.
+from utils.option_symbols import owner_key_for as _owner_key_for
 
 
 # ── Constants ───────────────────────────────────────────────────────────────
@@ -155,14 +155,12 @@ def owner_key_for(symbol: str) -> str:
     """
     Compute the engine's owner_key for a raw broker symbol.
 
-      - equity ticker  → unchanged.
-      - OCC option     → underlying ticker (e.g. SPY260516C00520000 → SPY).
+    Delegates to :func:`utils.option_symbols.owner_key_for`. Re-exported
+    here so engine call sites can keep the historical import path.
 
-    This is the same normalization the legacy ``_position_owners`` map used.
     For single-leg positions, owner_key == position_id by convention.
     """
-    match = _OCC_PAT.match(symbol)
-    return match.group(1) if match else symbol
+    return _owner_key_for(symbol)
 
 
 def make_single_leg(

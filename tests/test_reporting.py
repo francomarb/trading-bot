@@ -473,9 +473,11 @@ class TestTradeLogger:
             "SELECT symbol, position_id, position_type FROM trades ORDER BY id"
         ).fetchall()
         conn.close()
+        # OCC option rows get normalized to the underlying ticker so the
+        # stored position_id matches engine.positions.owner_key_for().
         assert rows == [
             ("AAPL", "AAPL", "single_leg"),
-            ("SPY260516C00520000", "SPY260516C00520000", "single_leg"),
+            ("SPY260516C00520000", "SPY", "single_leg"),
         ]
 
     def test_position_id_backfill_is_idempotent(self, tmp_csv, sample_decision, sample_result):
@@ -514,7 +516,27 @@ class TestTradeLogger:
             "SELECT position_id, position_type FROM trades WHERE id = 1"
         ).fetchone()
         conn.close()
+        # sample_decision uses an equity ticker, so owner_key == symbol.
         assert row == (sample_decision.symbol, "single_leg")
+
+    def test_option_record_writes_underlying_as_position_id(self, tmp_csv):
+        """OCC option fills must store position_id = underlying ticker."""
+        # build a synthetic option entry via log_external_close, which
+        # exercises the same owner_key_for() normalization path.
+        tl = TradeLogger(path=tmp_csv)
+        tl.log_external_close(
+            symbol="SPY260516C00520000",
+            strategy="spy_options_reversion",
+            reason="test_synthetic",
+        )
+        tl.close()
+
+        conn = sqlite3.connect(tmp_csv)
+        row = conn.execute(
+            "SELECT symbol, position_id, position_type FROM trades WHERE id = 1"
+        ).fetchone()
+        conn.close()
+        assert row == ("SPY260516C00520000", "SPY", "single_leg")
 
 
 # ── TestPnLTracker ──────────────────────────────────────────────────────────

@@ -31,6 +31,7 @@ from datetime import datetime, timezone
 from loguru import logger
 
 from config import settings
+from utils.option_symbols import owner_key_for
 
 _OCC_OPTION_SYMBOL = re.compile(r"^[A-Z]{1,6}[0-9]{6}[CP][0-9]{8}$")
 
@@ -145,9 +146,13 @@ _POSITION_ID_INDEX_SQL = (
 
 # Backfill: existing rows pre-PR-11.27 are all single-leg, with
 # position_id = symbol. Run once per database after the ALTERs.
+# Backfill uses the OWNER_KEY() SQLite UDF (registered in _ensure_db) to
+# collapse OCC option symbols to their underlying ticker. This keeps the
+# stored position_id consistent with what engine.positions.owner_key_for()
+# returns, so legacy option rows match the Position abstraction's lookup key.
 _BACKFILL_SQL = (
     "UPDATE trades "
-    "SET position_id = symbol, position_type = 'single_leg' "
+    "SET position_id = OWNER_KEY(symbol), position_type = 'single_leg' "
     "WHERE position_id IS NULL"
 )
 
@@ -213,6 +218,10 @@ class TradeLogger:
             return self._conn
         os.makedirs(os.path.dirname(self._path) or ".", exist_ok=True)
         self._conn = sqlite3.connect(self._path)
+        # Register OWNER_KEY() as a SQLite UDF so the backfill SQL can
+        # normalize OCC option symbols to their underlying. Keeps the
+        # stored position_id consistent with engine.positions.owner_key_for().
+        self._conn.create_function("OWNER_KEY", 1, owner_key_for, deterministic=True)
         self._conn.execute(_CREATE_TABLE_SQL)
         existing = {
             row[1]
@@ -296,7 +305,7 @@ class TradeLogger:
             r_multiple=None,
             entry_timestamp=now_iso,
             exit_timestamp=None,
-            position_id=decision.symbol,
+            position_id=owner_key_for(decision.symbol),
             position_type="single_leg",
         )
 
@@ -376,7 +385,7 @@ class TradeLogger:
             r_multiple=r_multiple,
             entry_timestamp=entry_timestamp,
             exit_timestamp=now_iso,
-            position_id=result.symbol,
+            position_id=owner_key_for(result.symbol),
             position_type="single_leg",
         )
 
@@ -471,7 +480,7 @@ class TradeLogger:
             r_multiple=None,
             entry_timestamp=None,
             exit_timestamp=datetime.now(timezone.utc).isoformat(),
-            position_id=symbol,
+            position_id=owner_key_for(symbol),
             position_type="single_leg",
         )
         self.log(record)
@@ -541,7 +550,7 @@ class TradeLogger:
             r_multiple=r_multiple,
             entry_timestamp=entry_timestamp,
             exit_timestamp=now_iso,
-            position_id=symbol,
+            position_id=owner_key_for(symbol),
             position_type="single_leg",
         )
         self.log(record)
