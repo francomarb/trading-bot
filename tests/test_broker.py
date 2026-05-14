@@ -36,6 +36,8 @@ from execution.broker import (
     OrderResult,
     OrderStatus,
 )
+from execution.options_executor import SpreadLeg
+from alpaca.trading.enums import OrderClass as AlpacaOrderClass
 from risk.manager import (
     AccountState,
     Position,
@@ -886,3 +888,115 @@ class TestOptionsDryRun:
         mock_worker_cls.return_value.start.assert_called_once()
         assert result.status is OrderStatus.ACCEPTED
         api.submit_order.assert_not_called()  # worker handles submission, not broker directly
+
+
+# ── place_spread_order / close_spread_order — MLEG (11.28) ───────────────────
+
+_SHORT_OCC = "SPY260620P00580000"
+_LONG_OCC = "SPY260620P00570000"
+
+
+def _open_spread_legs() -> list[SpreadLeg]:
+    return [
+        SpreadLeg(occ_symbol=_SHORT_OCC, side=Side.SELL, opening=True),
+        SpreadLeg(occ_symbol=_LONG_OCC, side=Side.BUY, opening=True),
+    ]
+
+
+class TestPlaceSpreadOrder:
+    def test_submits_mleg_request_and_returns_accepted(self):
+        api = MagicMock()
+        api.submit_order.return_value = _alpaca_order(id="combo-1", status="accepted")
+        broker = AlpacaBroker(client=api, max_attempts=1, base_delay=0.0, dry_run=False)
+
+        # Negative limit = net credit required (Alpaca MLEG sign convention).
+        result = broker.place_spread_order(
+            legs=_open_spread_legs(),
+            qty=2,
+            limit_price=-3.256,
+            strategy_name="credit_spread",
+        )
+
+        req = api.submit_order.call_args.args[0]
+        assert req.order_class is AlpacaOrderClass.MLEG
+        assert req.qty == 2
+        assert req.limit_price == -3.26
+        assert len(req.legs) == 2
+        assert result.status is OrderStatus.ACCEPTED
+        assert result.order_id == "combo-1"
+        # OrderResult.symbol is the short (SELL) leg — the spread's defining leg.
+        assert result.symbol == _SHORT_OCC
+
+    def test_dry_run_skips_submit_and_returns_synthetic_fill(self):
+        api = MagicMock()
+        broker = AlpacaBroker(client=api, max_attempts=1, base_delay=0.0, dry_run=True)
+
+        result = broker.place_spread_order(
+            legs=_open_spread_legs(),
+            qty=1,
+            limit_price=-3.25,
+            strategy_name="credit_spread",
+        )
+
+        api.submit_order.assert_not_called()
+        assert result.status is OrderStatus.FILLED
+        assert result.raw_status == "dry_run"
+        assert result.avg_fill_price == -3.25
+        assert result.symbol == _SHORT_OCC
+
+    def test_api_error_returns_rejected(self):
+        api = MagicMock()
+        api.submit_order.side_effect = _api_error(422, "MLEG not permitted")
+        broker = AlpacaBroker(client=api, max_attempts=1, base_delay=0.0, dry_run=False)
+
+        result = broker.place_spread_order(
+            legs=_open_spread_legs(),
+            qty=1,
+            limit_price=3.25,
+            strategy_name="credit_spread",
+        )
+
+        assert result.status is OrderStatus.REJECTED
+        assert result.order_id is None
+        assert "MLEG not permitted" in result.message
+
+    def test_single_leg_input_rejected_without_submitting(self):
+        api = MagicMock()
+        broker = AlpacaBroker(client=api, max_attempts=1, base_delay=0.0, dry_run=False)
+
+        result = broker.place_spread_order(
+            legs=[SpreadLeg(occ_symbol=_SHORT_OCC, side=Side.SELL)],
+            qty=1,
+            limit_price=3.25,
+            strategy_name="credit_spread",
+        )
+
+        api.submit_order.assert_not_called()
+        assert result.status is OrderStatus.REJECTED
+        assert "≥ 2 legs" in result.message
+
+    def test_close_spread_order_reverses_legs_to_flatten_the_spread(self):
+        api = MagicMock()
+        api.submit_order.return_value = _alpaca_order(id="combo-close", status="accepted")
+        broker = AlpacaBroker(client=api, max_attempts=1, base_delay=0.0, dry_run=False)
+
+        # Pass the *opening* legs (short SELL_TO_OPEN + long BUY_TO_OPEN).
+        # close_spread_order must reverse each side so the combo actually
+        # flattens: short BUY_TO_CLOSE + long SELL_TO_CLOSE.
+        result = broker.close_spread_order(
+            legs=_open_spread_legs(),
+            qty=1,
+            limit_price=1.10,
+            strategy_name="credit_spread",
+        )
+
+        req = api.submit_order.call_args.args[0]
+        from alpaca.trading.enums import OrderSide, PositionIntent
+        by_symbol = {leg.symbol: leg for leg in req.legs}
+        # Short leg: sold to open → bought to close.
+        assert by_symbol[_SHORT_OCC].side is OrderSide.BUY
+        assert by_symbol[_SHORT_OCC].position_intent is PositionIntent.BUY_TO_CLOSE
+        # Long leg: bought to open → sold to close.
+        assert by_symbol[_LONG_OCC].side is OrderSide.SELL
+        assert by_symbol[_LONG_OCC].position_intent is PositionIntent.SELL_TO_CLOSE
+        assert result.status is OrderStatus.ACCEPTED

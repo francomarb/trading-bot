@@ -338,3 +338,100 @@ class TestTerminalEventsConstants:
 
     def test_fill_events_subset_of_terminal(self):
         assert _FILL_EVENTS.issubset(_TERMINAL_EVENTS)
+
+
+# ── MLEG combo-payload handling (11.28) ─────────────────────────────────────
+
+
+class TestMlegPayloadHandling:
+    _SHORT = "SPY260620P00580000"
+    _LONG = "SPY260620P00570000"
+
+    def test_make_update_from_payload_extracts_leg_symbols(self):
+        data = {
+            "event": "fill",
+            "qty": "1",
+            "price": "3.25",
+            "order": {
+                "id": "combo-1",
+                "client_order_id": "spr-credit_spread-abc",
+                "symbol": None,  # MLEG parent — null top-level symbol
+                "filled_qty": "1",
+                "filled_avg_price": "3.25",
+                "legs": [{"symbol": self._SHORT}, {"symbol": self._LONG}],
+            },
+        }
+        update = StreamManager._make_update_from_payload(data)
+        assert update.is_combo is True
+        assert update.leg_symbols == [self._SHORT, self._LONG]
+        # Null parent symbol falls back to the first leg.
+        assert update.order.symbol == self._SHORT
+        assert update.event.value == "fill"
+        assert update.qty == 1.0
+        assert update.price == 3.25
+
+    def test_make_update_from_payload_single_leg_is_not_combo(self):
+        data = {
+            "event": "fill",
+            "qty": "10",
+            "price": "100.5",
+            "order": {
+                "id": "ord-1",
+                "client_order_id": None,
+                "symbol": "AAPL",
+                "filled_qty": "10",
+                "filled_avg_price": "100.5",
+            },
+        }
+        update = StreamManager._make_update_from_payload(data)
+        assert update.is_combo is False
+        assert update.leg_symbols == []
+        assert update.order.symbol == "AAPL"
+
+    def test_make_synthetic_update_handles_mleg_order_object(self):
+        order = SimpleNamespace(
+            id="combo-2",
+            client_order_id="spr-credit_spread-xyz",
+            symbol=None,
+            filled_qty="1",
+            filled_avg_price="2.80",
+            qty="1",
+            legs=[
+                SimpleNamespace(symbol=self._SHORT),
+                SimpleNamespace(symbol=self._LONG),
+            ],
+        )
+        update = StreamManager._make_synthetic_update(order, "fill")
+        assert update.is_combo is True
+        assert update.leg_symbols == [self._SHORT, self._LONG]
+        assert update.order.symbol == self._SHORT
+        assert update.order.id == "combo-2"
+
+    def test_leg_symbols_empty_for_plain_order(self):
+        assert StreamManager._leg_symbols({"id": "x"}) == []
+        assert StreamManager._leg_symbols(SimpleNamespace(id="x")) == []
+
+    def test_mleg_parent_terminal_event_sets_watched_event(self):
+        """A bound MLEG parent order's fill event must release its watcher."""
+        sm = _stream()
+        client_id = "spr-credit_spread-abc"
+        event = sm.watch(client_id)
+        sm.bind_submitted_order(
+            client_order_id=client_id, order_id="combo-1", stop_leg_ids=[]
+        )
+        update = StreamManager._make_update_from_payload({
+            "event": "fill",
+            "qty": "1",
+            "price": "3.25",
+            "order": {
+                "id": "combo-1",
+                "client_order_id": client_id,
+                "symbol": None,
+                "filled_qty": "1",
+                "filled_avg_price": "3.25",
+                "legs": [{"symbol": self._SHORT}, {"symbol": self._LONG}],
+            },
+        })
+        asyncio.run(sm._on_trade_update(update))
+        assert event.is_set()
+        assert sm.get_update("combo-1") is not None

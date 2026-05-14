@@ -5,7 +5,19 @@ from __future__ import annotations
 from types import SimpleNamespace
 from unittest.mock import MagicMock
 
-from execution.options_executor import OptionsExecutionWorker
+import pytest
+
+from alpaca.trading.enums import (
+    OrderClass as AlpacaOrderClass,
+    OrderSide,
+    PositionIntent,
+)
+from execution.options_executor import (
+    OptionsExecutionWorker,
+    SpreadExecutionWorker,
+    SpreadLeg,
+    build_mleg_request,
+)
 from risk.manager import RiskDecision, Side
 from strategies.base import OrderType
 
@@ -135,3 +147,170 @@ class TestOptionsExecutionWorker:
 
         api.cancel_order_by_id.assert_called_once_with("ord-1")
         on_fill.assert_called_once_with("canceled", 0.0, None, "ord-1")
+
+
+# ── Multi-leg (MLEG) construction (11.28) ───────────────────────────────────
+
+_SHORT_OCC = "SPY260620P00580000"
+_LONG_OCC = "SPY260620P00570000"
+
+
+def _open_legs() -> list[SpreadLeg]:
+    """A standard bull put credit spread: sell the higher strike, buy lower."""
+    return [
+        SpreadLeg(occ_symbol=_SHORT_OCC, side=Side.SELL, opening=True),
+        SpreadLeg(occ_symbol=_LONG_OCC, side=Side.BUY, opening=True),
+    ]
+
+
+def _mleg_submitted(order_id: str = "combo-1", *, status: str = "accepted"):
+    return SimpleNamespace(
+        id=order_id,
+        status=SimpleNamespace(value=status),
+        filled_qty="0",
+        filled_avg_price=None,
+        symbol=None,  # MLEG parents can carry a null top-level symbol
+        legs=[{"symbol": _SHORT_OCC}, {"symbol": _LONG_OCC}],
+    )
+
+
+def _mleg_filled(order_id: str = "combo-1"):
+    return SimpleNamespace(
+        id=order_id,
+        status=SimpleNamespace(value="filled"),
+        filled_qty="1",
+        filled_avg_price="3.25",
+        symbol=None,
+        legs=[{"symbol": _SHORT_OCC}, {"symbol": _LONG_OCC}],
+    )
+
+
+class TestSpreadLeg:
+    def test_open_short_leg_maps_to_sell_to_open(self):
+        leg = SpreadLeg(occ_symbol=_SHORT_OCC, side=Side.SELL, opening=True)
+        alpaca = leg.to_alpaca_leg()
+        assert alpaca.symbol == _SHORT_OCC
+        assert alpaca.side is OrderSide.SELL
+        assert alpaca.position_intent is PositionIntent.SELL_TO_OPEN
+        assert alpaca.ratio_qty == 1
+
+    def test_open_long_leg_maps_to_buy_to_open(self):
+        leg = SpreadLeg(occ_symbol=_LONG_OCC, side=Side.BUY, opening=True)
+        alpaca = leg.to_alpaca_leg()
+        assert alpaca.side is OrderSide.BUY
+        assert alpaca.position_intent is PositionIntent.BUY_TO_OPEN
+
+    def test_closing_legs_map_to_close_intents(self):
+        short_close = SpreadLeg(_SHORT_OCC, Side.SELL, opening=False).to_alpaca_leg()
+        long_close = SpreadLeg(_LONG_OCC, Side.BUY, opening=False).to_alpaca_leg()
+        assert short_close.position_intent is PositionIntent.SELL_TO_CLOSE
+        assert long_close.position_intent is PositionIntent.BUY_TO_CLOSE
+
+
+class TestBuildMlegRequest:
+    def test_builds_mleg_limit_request_with_both_legs(self):
+        # Negative limit = net credit required (Alpaca MLEG sign convention).
+        req = build_mleg_request(
+            legs=_open_legs(),
+            qty=2,
+            limit_price=-3.256,
+            client_order_id="spr-test-abc",
+        )
+        assert req.order_class is AlpacaOrderClass.MLEG
+        assert req.qty == 2
+        assert req.limit_price == -3.26  # rounded to cents, sign preserved
+        assert req.client_order_id == "spr-test-abc"
+        assert len(req.legs) == 2
+        assert {leg.symbol for leg in req.legs} == {_SHORT_OCC, _LONG_OCC}
+
+    def test_rejects_single_leg(self):
+        with pytest.raises(ValueError, match="≥ 2 legs"):
+            build_mleg_request(
+                legs=[SpreadLeg(_SHORT_OCC, Side.SELL)],
+                qty=1, limit_price=-1.0, client_order_id="x",
+            )
+
+    def test_rejects_non_positive_qty(self):
+        with pytest.raises(ValueError, match="qty must be ≥ 1"):
+            build_mleg_request(
+                legs=_open_legs(), qty=0, limit_price=-1.0, client_order_id="x",
+            )
+
+
+class TestSpreadExecutionWorker:
+    def test_binds_real_order_id_after_submit(self):
+        api = MagicMock()
+        api.submit_order.return_value = _mleg_submitted("combo-1")
+        api.get_order_by_id.return_value = _mleg_filled("combo-1")
+        stream = MagicMock()
+        stream_event = MagicMock()
+        stream_event.wait.return_value = True
+        stream.watch.return_value = stream_event
+        on_fill = MagicMock()
+
+        worker = SpreadExecutionWorker(
+            legs=_open_legs(),
+            qty=1,
+            limit_price=3.25,
+            strategy_name="credit_spread",
+            api=api,
+            stream_manager=stream,
+            on_fill=on_fill,
+        )
+        worker.run()
+
+        watched_client_id = stream.watch.call_args.args[0]
+        assert watched_client_id.startswith("spr-credit_spread-")
+        stream.bind_submitted_order.assert_called_once_with(
+            client_order_id=watched_client_id,
+            order_id="combo-1",
+            stop_leg_ids=[],
+        )
+        stream.unwatch.assert_called_once_with("combo-1")
+        on_fill.assert_called_once_with("filled", 1.0, 3.25, "combo-1")
+
+    def test_submit_failure_reports_rejected_and_cleans_watch(self):
+        api = MagicMock()
+        api.submit_order.side_effect = Exception("MLEG rejected by Alpaca")
+        stream = MagicMock()
+        stream.watch.return_value = MagicMock()
+        on_fill = MagicMock()
+
+        worker = SpreadExecutionWorker(
+            legs=_open_legs(),
+            qty=1,
+            limit_price=3.25,
+            strategy_name="credit_spread",
+            api=api,
+            stream_manager=stream,
+            on_fill=on_fill,
+        )
+        worker.run()
+
+        watched_client_id = stream.watch.call_args.args[0]
+        stream.unwatch.assert_called_once_with(watched_client_id)
+        on_fill.assert_called_once_with("rejected", 0.0, None, watched_client_id)
+
+    def test_unfilled_combo_cancels_after_timeout(self):
+        api = MagicMock()
+        api.submit_order.return_value = _mleg_submitted("combo-1")
+        api.get_order_by_id.return_value = _mleg_submitted("combo-1")  # still working
+        stream = MagicMock()
+        stream_event = MagicMock()
+        stream_event.wait.return_value = False
+        stream.watch.return_value = stream_event
+        on_fill = MagicMock()
+
+        worker = SpreadExecutionWorker(
+            legs=_open_legs(),
+            qty=1,
+            limit_price=3.25,
+            strategy_name="credit_spread",
+            api=api,
+            stream_manager=stream,
+            on_fill=on_fill,
+        )
+        worker.run()
+
+        api.cancel_order_by_id.assert_called_once_with("combo-1")
+        on_fill.assert_called_once_with("canceled", 0.0, None, "combo-1")
