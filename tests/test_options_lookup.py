@@ -1,21 +1,29 @@
 """
-Unit tests for ``utils.options_lookup.find_best_call`` (11.25).
+Unit tests for ``utils.options_lookup`` (11.25 single-leg, 11.28 spreads).
 
-The picker takes a quote-lookup callback and a per-contract budget, then
-delegates ranking to ``utils.options_ranker``. These tests focus on the
-glue: chain query construction, the K-nearest pre-filter, plumbing
+The pickers take a quote-lookup callback and budget/target constraints,
+then delegate ranking to ``utils.options_ranker``. These tests focus on
+the glue: chain query construction, the K-nearest pre-filter, plumbing
 between the chain response and the ranker, and graceful failure modes.
 """
 
 from __future__ import annotations
 
-from datetime import date
+from datetime import date, timedelta
 from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
+import pytest
+
 from alpaca.trading.enums import AssetStatus, ContractType
 
-from utils.options_lookup import ContractPick, find_best_call
+from utils.options_lookup import (
+    ContractPick,
+    SpreadPick,
+    estimate_put_delta,
+    find_best_call,
+    find_best_put_spread,
+)
 from utils.options_ranker import Quote
 
 
@@ -249,3 +257,209 @@ class TestFindBestCall:
         }
         # Two surviving runners-up after the winner.
         assert len(pick.runners_up) == 2
+
+
+# ── estimate_put_delta (11.28) ──────────────────────────────────────────────
+
+
+class TestEstimatePutDelta:
+    def test_returns_absolute_value_in_unit_interval(self):
+        d = estimate_put_delta(
+            underlying_price=590.0, strike=568.0, dte_days=37, iv=0.15
+        )
+        assert 0.0 < d < 1.0
+        # ~7% OTM put at 37 DTE / 15% IV sits near the 0.17-0.18 delta band.
+        assert d == pytest.approx(0.177, abs=0.02)
+
+    def test_deeper_otm_strike_has_smaller_delta(self):
+        near = estimate_put_delta(
+            underlying_price=590.0, strike=575.0, dte_days=37, iv=0.15
+        )
+        far = estimate_put_delta(
+            underlying_price=590.0, strike=545.0, dte_days=37, iv=0.15
+        )
+        assert far < near
+
+    def test_higher_iv_raises_otm_delta(self):
+        low = estimate_put_delta(
+            underlying_price=590.0, strike=560.0, dte_days=37, iv=0.12
+        )
+        high = estimate_put_delta(
+            underlying_price=590.0, strike=560.0, dte_days=37, iv=0.25
+        )
+        assert high > low
+
+
+# ── find_best_put_spread (11.28) ────────────────────────────────────────────
+
+# Expirations must be future-dated relative to date.today() because the
+# picker derives DTE from datetime.now().
+_SPREAD_EXPIRY = date.today() + timedelta(days=37)
+_SPREAD_STRIKES = [545, 550, 555, 558, 560, 562, 565, 568, 570, 572, 575]
+
+
+def _put_chain(expiry: date = _SPREAD_EXPIRY) -> SimpleNamespace:
+    return SimpleNamespace(
+        option_contracts=[
+            _contract(f"SPYP{k}", expiry, float(k)) for k in _SPREAD_STRIKES
+        ],
+        next_page_token=None,
+    )
+
+
+def _put_quote(strike: float) -> Quote:
+    """Monotonic-in-strike premium so a higher-strike short minus a
+    lower-strike long always yields a positive net credit. Tight bid/ask."""
+    mid = (strike - 545) * 0.30 + 1.0
+    return Quote(bid=round(mid - 0.025, 3), ask=round(mid + 0.025, 3))
+
+
+def _put_quote_lookup(occ_symbols: list[str]) -> dict[str, Quote | None]:
+    out: dict[str, Quote | None] = {}
+    for occ in occ_symbols:
+        strike = float(occ.removeprefix("SPYP"))
+        out[occ] = _put_quote(strike)
+    return out
+
+
+class TestFindBestPutSpread:
+    def test_chain_query_uses_put_type_and_strike_band(self):
+        client = MagicMock()
+        client.get_option_contracts.return_value = _put_chain()
+
+        with patch("utils.options_lookup._get_client", return_value=client):
+            pick = find_best_put_spread(
+                "SPY", 590.0,
+                min_dte=30, max_dte=45,
+                spread_width=10.0,
+                target_short_delta=0.17,
+                iv=0.15,
+                max_loss_per_position=5_000.0,
+                quote_lookup=_put_quote_lookup,
+            )
+
+        req = client.get_option_contracts.call_args.args[0]
+        assert req.status == AssetStatus.ACTIVE
+        assert req.type == ContractType.PUT
+        # Band: 0.80 × 590 = 472.00 floor, 590.00 ceiling.
+        assert req.strike_price_gte == "472.00"
+        assert req.strike_price_lte == "590.00"
+        assert isinstance(pick, SpreadPick)
+
+    def test_picks_spread_with_short_delta_nearest_target(self):
+        client = MagicMock()
+        client.get_option_contracts.return_value = _put_chain()
+
+        with patch("utils.options_lookup._get_client", return_value=client):
+            pick = find_best_put_spread(
+                "SPY", 590.0,
+                min_dte=30, max_dte=45,
+                spread_width=10.0,
+                target_short_delta=0.17,
+                iv=0.15,
+                max_loss_per_position=5_000.0,
+                quote_lookup=_put_quote_lookup,
+            )
+
+        assert pick is not None
+        # K=568 sits at ~0.177 delta — closest to the 0.17 target.
+        assert pick.short_strike == pytest.approx(568.0)
+        assert pick.long_strike == pytest.approx(558.0)
+        assert pick.width == pytest.approx(10.0)
+        # short mid 7.90 − long mid 4.90 = 3.00/sh credit; max loss (10−3)×100.
+        assert pick.net_credit == pytest.approx(3.0, abs=0.05)
+        assert pick.max_loss == pytest.approx(700.0, abs=5.0)
+        assert set(pick.components.keys()) == {
+            "short_delta", "net_credit", "spread_quality", "dte"
+        }
+
+    def test_long_leg_is_width_below_short(self):
+        client = MagicMock()
+        client.get_option_contracts.return_value = _put_chain()
+
+        with patch("utils.options_lookup._get_client", return_value=client):
+            pick = find_best_put_spread(
+                "SPY", 590.0,
+                min_dte=30, max_dte=45,
+                spread_width=5.0,
+                target_short_delta=0.17,
+                iv=0.15,
+                max_loss_per_position=5_000.0,
+                quote_lookup=_put_quote_lookup,
+            )
+
+        assert pick is not None
+        assert pick.short_strike - pick.long_strike == pytest.approx(5.0, abs=1.0)
+        assert pick.long_strike < pick.short_strike
+
+    def test_returns_none_when_no_contracts(self):
+        client = MagicMock()
+        client.get_option_contracts.return_value = SimpleNamespace(
+            option_contracts=[], next_page_token=None
+        )
+        with patch("utils.options_lookup._get_client", return_value=client):
+            pick = find_best_put_spread(
+                "SPY", 590.0,
+                min_dte=30, max_dte=45,
+                spread_width=10.0,
+                target_short_delta=0.17,
+                iv=0.15,
+                max_loss_per_position=5_000.0,
+                quote_lookup=_put_quote_lookup,
+            )
+        assert pick is None
+
+    def test_returns_none_when_max_loss_cap_rejects_all(self):
+        # All spreads have ~$700 max loss; a $300 cap rejects everything.
+        client = MagicMock()
+        client.get_option_contracts.return_value = _put_chain()
+        with patch("utils.options_lookup._get_client", return_value=client):
+            pick = find_best_put_spread(
+                "SPY", 590.0,
+                min_dte=30, max_dte=45,
+                spread_width=10.0,
+                target_short_delta=0.17,
+                iv=0.15,
+                max_loss_per_position=300.0,
+                quote_lookup=_put_quote_lookup,
+            )
+        assert pick is None
+
+    def test_quote_lookup_failure_returns_none(self):
+        client = MagicMock()
+        client.get_option_contracts.return_value = _put_chain()
+
+        def _raising(_):
+            raise RuntimeError("OPRA down")
+
+        with patch("utils.options_lookup._get_client", return_value=client):
+            pick = find_best_put_spread(
+                "SPY", 590.0,
+                min_dte=30, max_dte=45,
+                spread_width=10.0,
+                target_short_delta=0.17,
+                iv=0.15,
+                max_loss_per_position=5_000.0,
+                quote_lookup=_raising,
+            )
+        assert pick is None
+
+    def test_paginates_chain_until_token_exhausted(self):
+        first = SimpleNamespace(option_contracts=[], next_page_token="page-2")
+        second = _put_chain()
+        client = MagicMock()
+        client.get_option_contracts.side_effect = [first, second]
+
+        with patch("utils.options_lookup._get_client", return_value=client):
+            pick = find_best_put_spread(
+                "SPY", 590.0,
+                min_dte=30, max_dte=45,
+                spread_width=10.0,
+                target_short_delta=0.17,
+                iv=0.15,
+                max_loss_per_position=5_000.0,
+                quote_lookup=_put_quote_lookup,
+            )
+
+        assert client.get_option_contracts.call_count == 2
+        assert pick is not None

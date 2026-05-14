@@ -30,7 +30,10 @@ from utils.options_ranker import (
     Candidate,
     Quote,
     ScoredPick,
+    ScoredSpread,
+    SpreadCandidate,
     rank_call_candidates,
+    rank_put_spread_candidates,
 )
 
 _client: TradingClient | None = None
@@ -39,6 +42,13 @@ _STRIKE_WINDOW_PCT = 0.03
 _PAGE_LIMIT = 200
 _MAX_PAGES = 10
 _TOP_K_TO_QUOTE = 5  # cap quote fetches at this many strike-nearest candidates
+
+# ── Put-spread picker tunables (11.28) ──────────────────────────────────────
+_RISK_FREE_RATE = 0.05            # B-S risk-free rate; refresh quarterly
+_SPREAD_STRIKE_FLOOR_PCT = 0.80   # query put strikes down to this × underlying
+_SPREAD_DELTA_PREFILTER = 0.12    # keep shorts within this of target before quoting
+_SPREAD_WIDTH_MATCH_TOL = 1.00    # $ tolerance when matching the long-leg strike
+_SPREAD_TOP_K_TO_QUOTE = 6        # cap quote fetches at this many short candidates
 
 
 # Quote-lookup callback signature. Returns ``None`` for an OCC symbol that
@@ -244,6 +254,297 @@ def find_best_call(
         occ_symbol=top.occ_symbol,
         premium=top.quote.mid,
         spread_pct=top.quote.spread_pct,
+        score=top.score,
+        components=dict(top.components),
+        runners_up=runners_up,
+    )
+
+
+# ── Multi-leg put-spread picker (11.28) ─────────────────────────────────────
+
+
+@dataclass(frozen=True)
+class SpreadPick:
+    """
+    Result of ``find_best_put_spread`` — a chosen bull put credit spread plus
+    its economics, so the strategy can place a combo order without re-fetching
+    quotes.
+    """
+
+    short_occ: str
+    long_occ: str
+    short_strike: float
+    long_strike: float
+    expiration_date: object       # datetime.date
+    width: float                  # $/share
+    net_credit: float             # $/share (short mid − long mid)
+    max_loss: float               # $ per contract
+    short_leg_delta: float        # |delta| estimate for the short leg
+    score: float                  # composite 0.0–1.0
+    components: dict[str, float]
+    runners_up: list[ScoredSpread]
+
+
+def estimate_put_delta(
+    *,
+    underlying_price: float,
+    strike: float,
+    dte_days: float,
+    iv: float,
+    risk_free_rate: float = _RISK_FREE_RATE,
+) -> float:
+    """
+    Estimate the |delta| of a put via Black-Scholes.
+
+    Alpaca paper does not stream live Greeks, so the picker approximates
+    them. ``iv`` is supplied by the caller (PR 3 wires the per-instrument
+    IV proxy; until then callers pass an explicit volatility). Pure function
+    — no I/O, trivially testable.
+
+    Returns the absolute delta (puts have negative delta; the config and the
+    ranker both work with the magnitude, e.g. a "17-delta short put" → 0.17).
+    """
+    from blackscholes import BlackScholesPut
+
+    T = max(dte_days / 365.0, 0.001)
+    put = BlackScholesPut(
+        S=underlying_price, K=strike, T=T, r=risk_free_rate, sigma=iv
+    )
+    return abs(float(put.delta()))
+
+
+def find_best_put_spread(
+    symbol: str,
+    underlying_price: float,
+    *,
+    min_dte: int,
+    max_dte: int,
+    spread_width: float,
+    target_short_delta: float,
+    iv: float,
+    max_loss_per_position: float,
+    quote_lookup: QuoteLookup,
+    min_credit_pct_of_width: float = 0.25,
+    risk_free_rate: float = _RISK_FREE_RATE,
+) -> SpreadPick | None:
+    """
+    Find the best-scoring affordable bull put credit spread.
+
+    A bull put spread sells a higher-strike put and buys a put
+    ``spread_width`` below it (same expiration) to cap the loss.
+
+    Parameters
+    ----------
+    symbol
+        Underlying ticker (e.g. ``"SPY"``).
+    underlying_price
+        Current underlying close.
+    min_dte, max_dte
+        Days-to-expiration window for the chain query. The expiration whose
+        DTE is closest to the window midpoint is chosen.
+    spread_width
+        Target strike width in $ (short strike − long strike).
+    target_short_delta
+        Desired |delta| for the short leg (e.g. 0.17).
+    iv
+        Volatility for the Black-Scholes delta estimate. PR 3 supplies the
+        per-instrument IV proxy; callers pass an explicit value until then.
+    max_loss_per_position
+        Affordability cap in $ from the sleeve allocator.
+    quote_lookup
+        Callback ``list[occ_symbol] → {occ_symbol: Quote | None}``. Called
+        once for all legs of the short-listed candidates.
+    min_credit_pct_of_width
+        Thin-credit floor passed through to the ranker (default 25%).
+    risk_free_rate
+        Black-Scholes risk-free rate for the delta estimate.
+
+    Returns
+    -------
+    ``SpreadPick`` for the top-scoring spread, or ``None`` if no spread
+    survived candidate construction or ranking.
+    """
+    client = _get_client()
+
+    now = datetime.now(timezone.utc).date()
+    min_date = now + timedelta(days=min_dte)
+    max_date = now + timedelta(days=max_dte)
+
+    # Query OTM puts down to a floor below the underlying — wide enough to
+    # cover both the ~target-delta short strikes and their long legs.
+    strike_floor = round(underlying_price * _SPREAD_STRIKE_FLOOR_PCT, 2)
+    strike_ceiling = round(underlying_price, 2)
+
+    contracts = []
+    page_token: str | None = None
+    pages = 0
+    try:
+        while pages < _MAX_PAGES:
+            req = GetOptionContractsRequest(
+                underlying_symbols=[symbol],
+                status=AssetStatus.ACTIVE,
+                expiration_date_gte=min_date.isoformat(),
+                expiration_date_lte=max_date.isoformat(),
+                type=ContractType.PUT,
+                strike_price_gte=f"{strike_floor:.2f}",
+                strike_price_lte=f"{strike_ceiling:.2f}",
+                limit=_PAGE_LIMIT,
+                page_token=page_token,
+            )
+            response = client.get_option_contracts(req)
+            contracts.extend(response.option_contracts or [])
+            page_token = response.next_page_token
+            pages += 1
+            if not page_token:
+                break
+    except Exception as e:
+        logger.error(f"Failed to fetch put contracts for {symbol}: {e}")
+        return None
+
+    if not contracts:
+        logger.warning(
+            f"No active put contracts for {symbol} between {min_date} and "
+            f"{max_date} in strike band ${strike_floor:.2f}-${strike_ceiling:.2f}."
+        )
+        return None
+
+    # Group by expiration, choose the one closest to the DTE-window midpoint.
+    by_expiry: dict[object, list] = defaultdict(list)
+    for c in contracts:
+        by_expiry[c.expiration_date].append(c)
+    target_dte = (min_dte + max_dte) / 2.0
+    chosen_expiry = min(
+        by_expiry.keys(),
+        key=lambda exp: abs((exp - now).days - target_dte),
+    )
+    expiry_contracts = by_expiry[chosen_expiry]
+    chosen_dte = (chosen_expiry - now).days
+
+    # strike → contract for the chosen expiration (one contract per strike).
+    by_strike: dict[float, object] = {}
+    for c in expiry_contracts:
+        by_strike[float(c.strike_price)] = c
+    strikes_sorted = sorted(by_strike)
+
+    def _nearest_strike(target: float) -> float | None:
+        """Closest available strike within the width-match tolerance."""
+        if not strikes_sorted:
+            return None
+        nearest = min(strikes_sorted, key=lambda s: abs(s - target))
+        return nearest if abs(nearest - target) <= _SPREAD_WIDTH_MATCH_TOL else None
+
+    # Build short-leg candidates: estimate each strike's delta, keep those
+    # near the target, pair each with a long leg `spread_width` below.
+    scored_shorts: list[tuple[float, object, float]] = []  # (|Δ−target|, contract, delta)
+    for strike, contract in by_strike.items():
+        delta = estimate_put_delta(
+            underlying_price=underlying_price,
+            strike=strike,
+            dte_days=chosen_dte,
+            iv=iv,
+            risk_free_rate=risk_free_rate,
+        )
+        if abs(delta - target_short_delta) <= _SPREAD_DELTA_PREFILTER:
+            scored_shorts.append((abs(delta - target_short_delta), contract, delta))
+
+    if not scored_shorts:
+        logger.warning(
+            f"No put strikes near {target_short_delta:.2f} delta for {symbol} "
+            f"(expiry {chosen_expiry}, iv={iv:.2f})."
+        )
+        return None
+
+    scored_shorts.sort(key=lambda t: t[0])
+    candidates: list[SpreadCandidate] = []
+    for _, short_contract, short_delta in scored_shorts[:_SPREAD_TOP_K_TO_QUOTE]:
+        short_strike = float(short_contract.strike_price)
+        long_strike = _nearest_strike(short_strike - spread_width)
+        if long_strike is None or long_strike >= short_strike:
+            continue
+        long_contract = by_strike[long_strike]
+        candidates.append(SpreadCandidate(
+            short_leg=Candidate(
+                occ_symbol=short_contract.symbol,
+                strike=short_strike,
+                expiration_date=chosen_expiry,
+            ),
+            long_leg=Candidate(
+                occ_symbol=long_contract.symbol,
+                strike=long_strike,
+                expiration_date=chosen_expiry,
+            ),
+            short_leg_delta=short_delta,
+        ))
+
+    if not candidates:
+        logger.warning(
+            f"No put-spread pairs for {symbol} — could not match long legs "
+            f"${spread_width:.2f} below the short strikes (expiry {chosen_expiry})."
+        )
+        return None
+
+    leg_symbols = []
+    for c in candidates:
+        leg_symbols.append(c.short_leg.occ_symbol)
+        leg_symbols.append(c.long_leg.occ_symbol)
+    try:
+        quote_map = quote_lookup(leg_symbols)
+    except Exception as e:
+        logger.error(f"Quote lookup failed for {symbol} put spread: {e}")
+        return None
+    quotes: dict[str, Quote] = {
+        occ: q for occ, q in quote_map.items() if q is not None
+    }
+
+    result = rank_put_spread_candidates(
+        candidates,
+        quotes,
+        target_short_delta=target_short_delta,
+        target_dte=target_dte,
+        max_loss_per_position=max_loss_per_position,
+        min_credit_pct_of_width=min_credit_pct_of_width,
+    )
+
+    if result.best is None:
+        rejected_summary = "; ".join(
+            f"{c.short_leg.occ_symbol}/{c.long_leg.occ_symbol}: {r}"
+            for c, r in result.rejected
+        ) or "no candidates"
+        logger.warning(
+            f"No tradeable put spread for {symbol} "
+            f"(expiry {chosen_expiry}, target Δ {target_short_delta:.2f}) — "
+            f"{rejected_summary}"
+        )
+        return None
+
+    top = result.best
+    runners_up = result.picks[1:4]
+    runner_str = "; ".join(
+        f"{p.short_occ}/{p.long_occ} score={p.score:.2f}" for p in runners_up
+    ) or "none"
+    logger.info(
+        f"Resolved Put Spread: {top.short_occ} / {top.long_occ} "
+        f"strikes=${top.candidate.short_leg.strike:.2f}/"
+        f"${top.candidate.long_leg.strike:.2f} expiry={chosen_expiry} "
+        f"width=${top.width:.2f} net_credit=${top.net_credit:.2f}/sh "
+        f"max_loss=${top.max_loss:,.0f} shortΔ={top.candidate.short_leg_delta:.3f} "
+        f"score={top.score:.2f} "
+        f"[delta={top.components['short_delta']:.2f} "
+        f"credit={top.components['net_credit']:.2f} "
+        f"spread={top.components['spread_quality']:.2f} "
+        f"dte={top.components['dte']:.2f}] runners_up=[{runner_str}]"
+    )
+
+    return SpreadPick(
+        short_occ=top.short_occ,
+        long_occ=top.long_occ,
+        short_strike=top.candidate.short_leg.strike,
+        long_strike=top.candidate.long_leg.strike,
+        expiration_date=chosen_expiry,
+        width=top.width,
+        net_credit=top.net_credit,
+        max_loss=top.max_loss,
+        short_leg_delta=top.candidate.short_leg_delta,
         score=top.score,
         components=dict(top.components),
         runners_up=runners_up,
