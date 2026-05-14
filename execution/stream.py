@@ -561,19 +561,44 @@ class StreamManager:
         return status.value if hasattr(status, "value") else str(status)
 
     @staticmethod
-    def _make_synthetic_update(order: Any, event_val: str) -> Any:
+    def _leg_symbols(order: Any) -> list[str]:
+        """
+        Extract child-leg OCC symbols from an MLEG parent order, whether the
+        legs come from an SDK object (attribute) or a raw dict payload.
+        Returns ``[]`` for ordinary single-leg orders.
+        """
+        legs = order.get("legs") if isinstance(order, dict) else getattr(order, "legs", None)
+        if not legs:
+            return []
+        out: list[str] = []
+        for leg in legs:
+            sym = leg.get("symbol") if isinstance(leg, dict) else getattr(leg, "symbol", None)
+            if sym:
+                out.append(str(sym))
+        return out
+
+    @classmethod
+    def _make_synthetic_update(cls, order: Any, event_val: str) -> Any:
         filled_qty = float(getattr(order, "filled_qty", 0) or 0)
         filled_avg = getattr(order, "filled_avg_price", None)
         avg_price = float(filled_avg) if filled_avg is not None else None
         qty = filled_qty if filled_qty > 0 else float(getattr(order, "qty", 0) or 0)
+        leg_symbols = cls._leg_symbols(order)
+        # MLEG parent orders can carry a null top-level symbol — fall back to
+        # the first leg so downstream logging/lookup never sees ``None``.
+        symbol = getattr(order, "symbol", None)
+        if symbol is None and leg_symbols:
+            symbol = leg_symbols[0]
         return SimpleNamespace(
             event=SimpleNamespace(value=event_val),
             qty=qty,
             price=avg_price,
+            is_combo=bool(leg_symbols),
+            leg_symbols=leg_symbols,
             order=SimpleNamespace(
                 id=str(getattr(order, "id")),
                 client_order_id=getattr(order, "client_order_id", None),
-                symbol=getattr(order, "symbol"),
+                symbol=symbol,
                 filled_qty=str(filled_qty),
                 filled_avg_price=(
                     None if avg_price is None else str(avg_price)
@@ -581,22 +606,30 @@ class StreamManager:
             ),
         )
 
-    @staticmethod
-    def _make_update_from_payload(data: dict[str, Any]) -> Any:
+    @classmethod
+    def _make_update_from_payload(cls, data: dict[str, Any]) -> Any:
         order = data.get("order") or {}
         event = data.get("event")
         price = data.get("price")
         qty = data.get("qty")
+        leg_symbols = cls._leg_symbols(order)
+        # MLEG parent payloads may omit the top-level symbol — fall back to
+        # the first leg so downstream consumers always have a usable symbol.
+        symbol = order.get("symbol")
+        if symbol is None and leg_symbols:
+            symbol = leg_symbols[0]
         return SimpleNamespace(
             event=SimpleNamespace(
                 value=(event.value if hasattr(event, "value") else str(event))
             ),
             qty=(0.0 if qty is None else float(qty)),
             price=(None if price is None else float(price)),
+            is_combo=bool(leg_symbols),
+            leg_symbols=leg_symbols,
             order=SimpleNamespace(
                 id=str(order.get("id")),
                 client_order_id=order.get("client_order_id"),
-                symbol=order.get("symbol"),
+                symbol=symbol,
                 filled_qty=str(order.get("filled_qty") or 0),
                 filled_avg_price=order.get("filled_avg_price"),
             ),

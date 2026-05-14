@@ -50,7 +50,11 @@ from typing import TYPE_CHECKING
 if TYPE_CHECKING:
     from execution.stream import StreamManager
 
-from execution.options_executor import OptionsExecutionWorker
+from execution.options_executor import (
+    OptionsExecutionWorker,
+    SpreadLeg,
+    build_mleg_request,
+)
 with warnings.catch_warnings():
     warnings.filterwarnings(
         "ignore",
@@ -746,6 +750,142 @@ class AlpacaBroker:
             fills = list(self._pending_option_fills)
             self._pending_option_fills.clear()
         return fills
+
+    def place_spread_order(
+        self,
+        *,
+        legs: list[SpreadLeg],
+        qty: int,
+        limit_price: float,
+        strategy_name: str,
+    ) -> OrderResult:
+        """
+        Submit an atomic multi-leg (MLEG) limit order synchronously (11.28).
+
+        Low-level primitive: builds the combo request, submits it, and
+        returns the broker's initial ``OrderResult``. It does **not** run a
+        watch/cancel loop — the async lifecycle (stream watch + timeout
+        cancel) is ``SpreadExecutionWorker``'s job. The integration verify
+        script calls this directly; PR 3's credit-spread strategy will go
+        through the worker.
+
+        ``limit_price`` is the net price of the combo. For a bull put credit
+        spread it is the net credit (positive). ``OrderResult.symbol`` is the
+        short (SELL) leg's OCC string — the spread's defining contract.
+        """
+        short_leg = next((leg for leg in legs if leg.side is Side.SELL), legs[0])
+        rep_symbol = short_leg.occ_symbol
+
+        if self._dry_run:
+            logger.warning(
+                f"DRY RUN — MLEG spread order NOT submitted: {qty}× "
+                f"[{', '.join(leg.occ_symbol for leg in legs)}] @ net {limit_price:.2f}"
+            )
+            return OrderResult(
+                status=OrderStatus.FILLED,
+                order_id=f"dry-run-{uuid.uuid4().hex[:10]}",
+                symbol=rep_symbol,
+                requested_qty=qty,
+                filled_qty=qty,
+                avg_fill_price=round(limit_price, 2),
+                raw_status="dry_run",
+                message="dry run — no MLEG order submitted",
+            )
+
+        client_order_id = f"spr-{strategy_name}-{uuid.uuid4().hex[:10]}"
+        try:
+            req = build_mleg_request(
+                legs=legs,
+                qty=qty,
+                limit_price=limit_price,
+                client_order_id=client_order_id,
+            )
+        except ValueError as e:
+            logger.error(f"place_spread_order: invalid MLEG request: {e}")
+            return OrderResult(
+                status=OrderStatus.REJECTED,
+                order_id=None,
+                symbol=rep_symbol,
+                requested_qty=qty,
+                filled_qty=0,
+                avg_fill_price=None,
+                raw_status=None,
+                message=str(e),
+            )
+
+        try:
+            order = self._with_retry(
+                lambda: self._api.submit_order(req),
+                op_desc=f"place_spread_order({rep_symbol})",
+            )
+        except APIError as e:
+            logger.error(f"place_spread_order({rep_symbol}) rejected: {e}")
+            return OrderResult(
+                status=OrderStatus.REJECTED,
+                order_id=None,
+                symbol=rep_symbol,
+                requested_qty=qty,
+                filled_qty=0,
+                avg_fill_price=None,
+                raw_status=None,
+                message=str(e),
+            )
+
+        raw_status = (
+            order.status.value
+            if hasattr(order.status, "value")
+            else str(order.status)
+        )
+        status = _ALPACA_TERMINAL.get(raw_status, OrderStatus.ACCEPTED)
+        logger.info(
+            f"MLEG spread order {order.id} submitted ({rep_symbol}) — "
+            f"status={raw_status}"
+        )
+        return OrderResult(
+            status=status,
+            order_id=str(order.id),
+            symbol=rep_symbol,
+            requested_qty=qty,
+            filled_qty=float(getattr(order, "filled_qty", 0) or 0),
+            avg_fill_price=(
+                float(order.filled_avg_price)
+                if getattr(order, "filled_avg_price", None) is not None
+                else None
+            ),
+            raw_status=raw_status,
+            message="MLEG combo order submitted",
+        )
+
+    def close_spread_order(
+        self,
+        *,
+        legs: list[SpreadLeg],
+        qty: int,
+        limit_price: float,
+        strategy_name: str,
+    ) -> OrderResult:
+        """
+        Submit a closing MLEG combo order for an open spread (11.28).
+
+        Accepts the same ``legs`` used to open the spread and rebuilds them
+        with closing position intents (``*_TO_CLOSE``). ``limit_price`` is
+        the net debit paid to buy the spread back.
+        """
+        closing_legs = [
+            SpreadLeg(
+                occ_symbol=leg.occ_symbol,
+                side=leg.side,
+                opening=False,
+                ratio_qty=leg.ratio_qty,
+            )
+            for leg in legs
+        ]
+        return self.place_spread_order(
+            legs=closing_legs,
+            qty=qty,
+            limit_price=limit_price,
+            strategy_name=strategy_name,
+        )
 
     def cancel_order(self, order_id: str) -> bool:
         """Cancel an order by id. Returns True on success, False on failure."""
