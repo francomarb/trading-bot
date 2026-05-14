@@ -83,6 +83,14 @@ IV_FOR_DELTA_ESTIMATE = 0.15
 MIN_DTE = 30
 MAX_DTE = 45
 MAX_LOSS_PER_POSITION = 2_000.0
+# This is a *plumbing* check, not a strategy-tuning check — the script
+# overrides the submit limit price to the full width anyway, so the picked
+# spread's credit quality is irrelevant. A permissive floor just guarantees
+# the picker returns *a* structurally valid pair to submit. (The production
+# min_credit_pct_of_width for the credit-spread strategy is a PR 3 config
+# decision; observed real ~17Δ $10-wide SPY spreads collect ~13–17% of
+# width, so the design doc's 0.25 default needs revisiting there.)
+VERIFY_MIN_CREDIT_PCT = 0.05
 
 
 def _build_quote_lookup():
@@ -165,6 +173,7 @@ def main() -> int:
         target_short_delta=TARGET_SHORT_DELTA,
         iv=IV_FOR_DELTA_ESTIMATE,
         max_loss_per_position=MAX_LOSS_PER_POSITION,
+        min_credit_pct_of_width=VERIFY_MIN_CREDIT_PCT,
         quote_lookup=_build_quote_lookup(),
     )
     check("picker returned a spread", pick is not None)
