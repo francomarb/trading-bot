@@ -12,8 +12,10 @@ carry one or many legs:
 For single-leg positions, `position_id` equals the legacy `owner_key`:
   - equity:  position_id = ticker (e.g. "AAPL")
   - option:  position_id = underlying ticker (e.g. "SPY"), leg symbol = OCC
-This keeps the DB backfill trivial — existing rows get `position_id = symbol`
-and the engine treats that as the owner key it always used.
+The DB backfill mirrors this: legacy equity rows get
+`position_id = symbol`, and legacy option rows get
+`position_id = owner_key_for(symbol)` (the underlying), so engine
+lookups and stored rows key on the same value.
 
 Spread support arrives in PR 2/3. PR 1 only ships the abstraction so that
 the engine no longer cares whether a position has one leg or many.

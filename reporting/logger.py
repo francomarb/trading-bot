@@ -146,10 +146,14 @@ _POSITION_ID_INDEX_SQL = (
 
 # Backfill: existing rows pre-PR-11.27 are all single-leg, with
 # position_id = symbol. Run once per database after the ALTERs.
-# Backfill uses the OWNER_KEY() SQLite UDF (registered in _ensure_db) to
-# collapse OCC option symbols to their underlying ticker. This keeps the
-# stored position_id consistent with what engine.positions.owner_key_for()
-# returns, so legacy option rows match the Position abstraction's lookup key.
+# One-shot backfill for rows that pre-date PR 11.27. The OWNER_KEY() SQLite
+# UDF (registered in _ensure_db, wired to utils.option_symbols.owner_key_for)
+# collapses OCC option symbols to their underlying ticker — so legacy equity
+# rows store position_id = symbol, and legacy option rows store
+# position_id = underlying. This matches what engine.positions builds for
+# new positions, keeping the engine lookup key and the DB key consistent.
+# Guarded by `WHERE position_id IS NULL` so explicit writes (future spreads)
+# are never overwritten on subsequent startups.
 _BACKFILL_SQL = (
     "UPDATE trades "
     "SET position_id = OWNER_KEY(symbol), position_type = 'single_leg' "

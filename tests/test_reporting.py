@@ -428,7 +428,8 @@ class TestTradeLogger:
         assert "position_type" in cols
 
     def test_position_id_backfill_populates_existing_rows(self, tmp_csv):
-        """Pre-11.27 rows must be backfilled to position_id=symbol, single_leg."""
+        """Pre-11.27 rows are backfilled to position_id = owner_key_for(symbol):
+        equities keep symbol, OCC options collapse to the underlying."""
         conn = sqlite3.connect(tmp_csv)
         conn.execute(
             """
