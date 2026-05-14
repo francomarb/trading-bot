@@ -40,6 +40,12 @@ SPREAD = "spread"
 
 VALID_POSITION_TYPES = frozenset({SINGLE_LEG, SPREAD})
 
+# Order/leg side. Stored uppercase so spread net-credit math (which keys on
+# side == "SELL") cannot be silently broken by callers passing 'sell' / 'Sell'.
+BUY = "BUY"
+SELL = "SELL"
+VALID_SIDES = frozenset({BUY, SELL})
+
 
 # ── Dataclasses ─────────────────────────────────────────────────────────────
 
@@ -56,14 +62,28 @@ class PositionLeg:
         qty:          Signed share/contract quantity (positive = long).
         entry_price:  Per-share fill price at open (None if unknown).
         entry_time:   Fill timestamp (None if unknown).
-        side:         "BUY" or "SELL" at open (the side that opened the leg).
+        side:         "BUY" or "SELL" at open. Case-insensitive on input
+                      (e.g. "sell" / "Sell") but normalized to uppercase
+                      so net-credit math cannot silently flip sign.
     """
 
     symbol: str
     qty: float
     entry_price: float | None = None
     entry_time: datetime | None = None
-    side: str = "BUY"
+    side: str = BUY
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.side, str):
+            raise TypeError(
+                f"side must be a string, got {type(self.side).__name__}"
+            )
+        normalized = self.side.upper()
+        if normalized not in VALID_SIDES:
+            raise ValueError(
+                f"side must be one of {sorted(VALID_SIDES)}, got {self.side!r}"
+            )
+        self.side = normalized
 
 
 @dataclass
@@ -134,12 +154,14 @@ class Position:
             return self.legs[0].entry_price
         # Spread: net credit = short premium - long premium.
         # Convention: a leg opened by SELL contributes +entry_price,
-        # a leg opened by BUY contributes -entry_price.
+        # a leg opened by BUY contributes -entry_price. Side values are
+        # normalized to uppercase in PositionLeg.__post_init__ so the
+        # comparison below cannot be sidestepped by a 'sell' / 'Sell'.
         prices = []
         for leg in self.legs:
             if leg.entry_price is None:
                 return None
-            sign = 1.0 if leg.side == "SELL" else -1.0
+            sign = 1.0 if leg.side == SELL else -1.0
             prices.append(sign * leg.entry_price)
         return float(sum(prices))
 

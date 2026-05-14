@@ -44,6 +44,37 @@ class TestPositionLeg:
         assert leg.entry_price is None
         assert leg.side == "BUY"
 
+    def test_lowercase_side_is_normalized_to_uppercase(self) -> None:
+        assert PositionLeg(symbol="A", qty=1, side="sell").side == "SELL"
+        assert PositionLeg(symbol="A", qty=1, side="Buy").side == "BUY"
+
+    def test_invalid_side_is_rejected(self) -> None:
+        with pytest.raises(ValueError, match="side must be one of"):
+            PositionLeg(symbol="A", qty=1, side="SHORT")
+
+    def test_non_string_side_is_rejected(self) -> None:
+        with pytest.raises(TypeError, match="side must be a string"):
+            PositionLeg(symbol="A", qty=1, side=1)  # type: ignore[arg-type]
+
+    def test_lowercase_sell_does_not_flip_spread_sign(self) -> None:
+        """Regression: pre-normalization, side='sell' was treated as BUY,
+        flipping net-credit sign. Confirm normalized math is correct."""
+        from engine.positions import Position, SPREAD
+
+        pos = Position(
+            position_id="P",
+            position_type=SPREAD,
+            strategy_name="credit_spread",
+            legs=[
+                PositionLeg(symbol="A", qty=-1, entry_price=4.00, side="sell"),
+                PositionLeg(symbol="B", qty=1, entry_price=1.50, side="buy"),
+            ],
+        )
+        assert pos.legs[0].side == "SELL"
+        assert pos.legs[1].side == "BUY"
+        # Net credit = +4.00 - 1.50 = +2.50 (not -2.50).
+        assert pos.entry_price == pytest.approx(2.50)
+
 
 class TestPositionConstruction:
     def test_rejects_unknown_position_type(self) -> None:
