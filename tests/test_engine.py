@@ -465,6 +465,60 @@ class TestProcessSymbol:
         assert any("Option trade rejected for SPY" in msg for msg in warnings)
         assert not any("Failed to build option execution for SPY" in msg for msg in errors)
 
+    def test_async_option_dispatch_registers_position_with_occ_leg(
+        self, engine_factory
+    ):
+        """The async (ACCEPTED) options path must register the Position with
+        the OCC contract as its leg symbol — not the strategy's underlying.
+
+        Regression: registering with `symbol` ("SPY") instead of
+        `target_symbol` (the OCC string) left primary_leg.symbol == "SPY",
+        which broke the single-leg-option contract and made
+        _compute_sector_exposure() miscount SPY options as equity exposure.
+        """
+        occ = "SPY260521C00730000"
+
+        class _OptionStrategy(FakeStrategy):
+            name = "spy_options_reversion"
+            preferred_order_type = OrderType.LIMIT
+
+            def build_option_execution(self, symbol, latest_close, *, notional_cap=None):
+                return (occ, 9.30, None, None)
+
+        accepted = OrderResult(
+            status=OrderStatus.ACCEPTED,
+            order_id="ord-async",
+            symbol=occ,
+            requested_qty=1,
+            filled_qty=0,
+            avg_fill_price=None,
+            raw_status="accepted",
+            message="dispatched to options worker",
+        )
+        engine, broker = engine_factory(place_result=accepted)
+        engine.slots[0].strategy = _OptionStrategy(
+            entries=[False] * 59 + [True], exits=[False] * 60
+        )
+        snap = _snapshot()
+        engine._session_start_equity = snap.account.equity
+
+        self._process(engine, "SPY", snap)
+
+        # Position is keyed by the underlying, but the leg carries the OCC.
+        assert "SPY" in engine._positions
+        pos = engine._positions["SPY"]
+        assert pos.position_id == "SPY"
+        assert pos.primary_leg is not None
+        assert pos.primary_leg.symbol == occ
+        assert pos.strategy_name == "spy_options_reversion"
+
+        # Sector exposure must exclude the option position (OCC leg).
+        resolver = MagicMock()
+        resolver.resolve.return_value = "technology"
+        engine._sector_resolver = resolver
+        assert engine._compute_sector_exposure() == {}
+        resolver.resolve.assert_not_called()
+
 
 # ── _run_one_cycle ───────────────────────────────────────────────────────────
 
@@ -492,7 +546,7 @@ class TestRunOneCycle:
             snapshot=snap,
             config_overrides={"market_hours_only": True},
         )
-        engine._position_owners["AAPL"] = "fake_strategy"
+        engine._register_single_leg(strategy_name="fake_strategy", symbol="AAPL")
         engine._run_one_cycle()
         broker.sync_with_broker.assert_called_once()
         assert engine._watchlist_statuses["fake_strategy"]["AAPL"] == "Long"
@@ -840,7 +894,7 @@ class TestPositionOwnership:
         engine._session_start_equity = snap.account.equity
 
         # Mark AAPL as owned by a different strategy.
-        engine._position_owners["AAPL"] = "other_strategy"
+        engine._register_single_leg(strategy_name="other_strategy", symbol="AAPL")
 
         slot = engine.slots[0]
         engine._process_symbol("AAPL", snap, snap.account, slot.strategy, slot.timeframe)
@@ -856,13 +910,13 @@ class TestPositionOwnership:
         engine._session_start_equity = snap.account.equity
 
         # Mark AAPL as owned by this strategy.
-        engine._position_owners["AAPL"] = "fake_strategy"
+        engine._register_single_leg(strategy_name="fake_strategy", symbol="AAPL")
 
         slot = engine.slots[0]
         engine._process_symbol("AAPL", snap, snap.account, slot.strategy, slot.timeframe)
         broker.close_position.assert_called_once_with("AAPL")
         # Ownership cleared after close.
-        assert "AAPL" not in engine._position_owners
+        assert not engine._has_position("AAPL")
 
     def test_exit_allowed_when_no_owner_recorded(self, engine_factory):
         """Pre-existing positions (no recorded owner) can be closed by anyone."""
@@ -885,14 +939,14 @@ class TestPositionOwnership:
         slot = engine.slots[0]
         engine._process_symbol("AAPL", snap, snap.account, slot.strategy, slot.timeframe)
         assert broker.place_order.call_count == 1
-        assert engine._position_owners["AAPL"] == "fake_strategy"
+        assert engine._get_owner("AAPL") == "fake_strategy"
 
     def test_startup_seeds_ownership_from_broker(self, engine_factory):
         """On start(), existing broker positions are assigned to matching slots."""
         positions = {"AAPL": Position("AAPL", 10, 100.0, 1010.0)}
         engine, broker = engine_factory(snapshot=_snapshot(positions=positions))
         engine.start(max_cycles=1)
-        assert engine._position_owners["AAPL"] == "fake_strategy"
+        assert engine._get_owner("AAPL") == "fake_strategy"
 
 
 class TestWatchlistStatuses:
@@ -1293,7 +1347,7 @@ class TestWatchlistStatuses:
         assert stop_call["qty"] == 10
         assert round(stop_call["stop_price"], 2) == 96.94
         assert stop_call["client_order_id_prefix"] == "fake_strategy-recover-stop"
-        assert engine._position_owners["AAPL"] == "fake_strategy"
+        assert engine._get_owner("AAPL") == "fake_strategy"
         assert engine.trade_logger.read_all_open_owners() == {"AAPL": "fake_strategy"}
 
 
@@ -1495,7 +1549,7 @@ class TestDurableOwnershipFromDB:
         snap = _snapshot(positions=positions)
         conflicts = engine._restore_ownership_from_db(snap)
 
-        assert engine._position_owners["AAPL"] == "fake_strategy"
+        assert engine._get_owner("AAPL") == "fake_strategy"
         assert conflicts == set()
 
     def test_db_unknown_strategy_becomes_conflict(self, patch_fetch, tmp_path):
@@ -1507,7 +1561,7 @@ class TestDurableOwnershipFromDB:
         snap = _snapshot(positions=positions)
         conflicts = engine._restore_ownership_from_db(snap)
 
-        assert "AAPL" not in engine._position_owners
+        assert not engine._has_position("AAPL")
         assert "AAPL" in conflicts
 
     def test_no_db_record_falls_back_to_slot_match(self, patch_fetch, tmp_path):
@@ -1519,7 +1573,7 @@ class TestDurableOwnershipFromDB:
         snap = _snapshot(positions=positions)
         conflicts = engine._restore_ownership_from_db(snap)
 
-        assert engine._position_owners["AAPL"] == "fake_strategy"
+        assert engine._get_owner("AAPL") == "fake_strategy"
         assert conflicts == set()
 
     def test_db_sell_as_latest_falls_back(self, patch_fetch, tmp_path):
@@ -1534,7 +1588,7 @@ class TestDurableOwnershipFromDB:
         engine._restore_ownership_from_db(snap)
 
         # Fallback slot match still assigns ownership.
-        assert engine._position_owners["AAPL"] == "fake_strategy"
+        assert engine._get_owner("AAPL") == "fake_strategy"
 
     def test_read_all_open_owners_empty_db(self, tmp_path):
         """read_all_open_owners returns {} when the DB doesn't exist."""
@@ -1581,7 +1635,7 @@ class TestStartupReconciliation:
         positions = {"AAPL": Position("AAPL", 10, 100.0, 1000.0)}
         engine, _, tl = _engine_with_db(patch_fetch, tmp_path, positions=positions)
         # Pre-assign ownership so no unmanaged positions.
-        engine._position_owners["AAPL"] = "fake_strategy"
+        engine._register_single_leg(strategy_name="fake_strategy", symbol="AAPL")
         snap = _snapshot(positions=positions)
 
         mode = engine._reconcile_startup(snap, set())
@@ -1598,7 +1652,7 @@ class TestStartupReconciliation:
     def test_unmanaged_positions_give_restricted(self, patch_fetch, tmp_path):
         positions = {"AAPL": Position("AAPL", 10, 100.0, 1000.0)}
         engine, _, _ = _engine_with_db(patch_fetch, tmp_path, positions=positions)
-        # AAPL not in _position_owners → unmanaged.
+        # AAPL not in _positions → unmanaged.
         snap = _snapshot(positions=positions)
 
         mode = engine._reconcile_startup(snap, set())
@@ -1724,57 +1778,57 @@ class TestExternalCloseDetection:
     def test_single_absence_does_not_act(self, patch_fetch, tmp_path):
         """One absent cycle is a suspect — ownership not cleared yet."""
         engine, _, _ = _engine_with_confirm(patch_fetch, tmp_path, confirm=3)
-        engine._position_owners["AAPL"] = "fake_strategy"
+        engine._register_single_leg(strategy_name="fake_strategy", symbol="AAPL")
         engine._detect_external_closes(_snapshot())
-        assert "AAPL" in engine._position_owners
+        assert engine._has_position("AAPL")
         assert engine._external_close_suspects["AAPL"] == 1
 
     def test_two_absences_still_not_confirmed(self, patch_fetch, tmp_path):
         """Two absent cycles with confirm=3 → still suspect."""
         engine, _, _ = _engine_with_confirm(patch_fetch, tmp_path, confirm=3)
-        engine._position_owners["AAPL"] = "fake_strategy"
+        engine._register_single_leg(strategy_name="fake_strategy", symbol="AAPL")
         engine._detect_external_closes(_snapshot())
         engine._detect_external_closes(_snapshot())
-        assert "AAPL" in engine._position_owners
+        assert engine._has_position("AAPL")
         assert engine._external_close_suspects["AAPL"] == 2
 
     def test_confirmed_after_n_cycles_clears_ownership(self, patch_fetch, tmp_path):
         """After N consecutive absent cycles ownership is cleared."""
         engine, _, _ = _engine_with_confirm(patch_fetch, tmp_path, confirm=3)
-        engine._position_owners["AAPL"] = "fake_strategy"
+        engine._register_single_leg(strategy_name="fake_strategy", symbol="AAPL")
         for _ in range(3):
             engine._detect_external_closes(_snapshot())
-        assert "AAPL" not in engine._position_owners
+        assert not engine._has_position("AAPL")
         assert "AAPL" not in engine._external_close_suspects
 
     def test_blip_recovery_resets_counter(self, patch_fetch, tmp_path):
         """Position reappears after 2 absent cycles → counter resets, no action."""
         positions = {"AAPL": Position("AAPL", 10, 100.0, 1000.0)}
         engine, _, _ = _engine_with_confirm(patch_fetch, tmp_path, confirm=3)
-        engine._position_owners["AAPL"] = "fake_strategy"
+        engine._register_single_leg(strategy_name="fake_strategy", symbol="AAPL")
 
         engine._detect_external_closes(_snapshot())           # absent: count=1
         engine._detect_external_closes(_snapshot())           # absent: count=2
         engine._detect_external_closes(_snapshot(positions=positions))  # back
 
-        assert "AAPL" in engine._position_owners
+        assert engine._has_position("AAPL")
         assert "AAPL" not in engine._external_close_suspects
 
     def test_position_still_present_not_counted(self, patch_fetch, tmp_path):
         """Present position never increments suspect counter."""
         positions = {"AAPL": Position("AAPL", 10, 100.0, 1000.0)}
         engine, _, _ = _engine_with_confirm(patch_fetch, tmp_path, confirm=3)
-        engine._position_owners["AAPL"] = "fake_strategy"
+        engine._register_single_leg(strategy_name="fake_strategy", symbol="AAPL")
         snap = _snapshot(positions=positions)
         engine._detect_external_closes(snap)
-        assert engine._position_owners["AAPL"] == "fake_strategy"
+        assert engine._get_owner("AAPL") == "fake_strategy"
         assert "AAPL" not in engine._external_close_suspects
 
     def test_synthetic_sell_written_after_confirmation(self, patch_fetch, tmp_path):
         """Synthetic sell is written only after N cycles, not before."""
         engine, _, tl = _engine_with_confirm(patch_fetch, tmp_path, confirm=3)
         _write_buy(tl, "AAPL", "fake_strategy")
-        engine._position_owners["AAPL"] = "fake_strategy"
+        engine._register_single_leg(strategy_name="fake_strategy", symbol="AAPL")
 
         engine._detect_external_closes(_snapshot())  # cycle 1 — no action yet
         assert tl.read_all_open_owners() == {"AAPL": "fake_strategy"}
@@ -1789,7 +1843,7 @@ class TestExternalCloseDetection:
         """The confirmed synthetic sell row carries external_close_detected."""
         engine, _, tl = _engine_with_confirm(patch_fetch, tmp_path, confirm=2)
         _write_buy(tl, "AAPL", "fake_strategy")
-        engine._position_owners["AAPL"] = "fake_strategy"
+        engine._register_single_leg(strategy_name="fake_strategy", symbol="AAPL")
         for _ in range(2):
             engine._detect_external_closes(_snapshot())
 
@@ -1803,21 +1857,21 @@ class TestExternalCloseDetection:
         """Only positions that hit confirm threshold are cleared."""
         positions = {"MSFT": Position("MSFT", 5, 200.0, 1000.0)}
         engine, _, _ = _engine_with_confirm(patch_fetch, tmp_path, confirm=3)
-        engine._position_owners["AAPL"] = "fake_strategy"   # will go absent
-        engine._position_owners["MSFT"] = "fake_strategy"   # stays present
+        engine._register_single_leg(strategy_name="fake_strategy", symbol="AAPL")   # will go absent
+        engine._register_single_leg(strategy_name="fake_strategy", symbol="MSFT")   # stays present
 
         snap_with_msft = _snapshot(positions=positions)
         for _ in range(3):
             engine._detect_external_closes(snap_with_msft)
 
-        assert "AAPL" not in engine._position_owners
-        assert engine._position_owners["MSFT"] == "fake_strategy"
+        assert not engine._has_position("AAPL")
+        assert engine._get_owner("MSFT") == "fake_strategy"
 
     def test_no_owned_positions_no_op(self, patch_fetch, tmp_path):
         """With no owned positions, detect_external_closes is a no-op."""
         engine, _, _ = _engine_with_confirm(patch_fetch, tmp_path, confirm=3)
         engine._detect_external_closes(_snapshot())
-        assert engine._position_owners == {}
+        assert engine._positions == {}
 
     def test_log_external_close_closes_db_record(self, tmp_path):
         """log_external_close writes a sell row that closes the DB open record."""
@@ -1896,7 +1950,7 @@ class TestOptionsEngineFixes:
         engine = self._engine(tmp_path)
         occ = "SPY260516C00520000"
         # Pretend the engine owns the underlying
-        engine._position_owners["SPY"] = "spy_options_reversion"
+        engine._register_single_leg(strategy_name="spy_options_reversion", symbol="SPY")
 
         from types import SimpleNamespace
         from execution.broker import BrokerSnapshot, OrderStatus
@@ -1920,7 +1974,7 @@ class TestOptionsEngineFixes:
     def test_stop_repair_reconstructs_missing_entry_context_for_managed_equity(self, tmp_path, monkeypatch):
         """If DB context is missing but broker position + owner exist, self-heal should reconstruct and repair."""
         engine = self._engine(tmp_path)
-        engine._position_owners["AAPL"] = "fake_strategy"
+        engine._register_single_leg(strategy_name="fake_strategy", symbol="AAPL")
         engine.risk._stop_price_for = MagicMock(return_value=95.0)
         engine.broker.place_protective_stop = MagicMock(return_value=_open_stop_order("AAPL", 95.0))
         monkeypatch.setattr(
@@ -1950,7 +2004,7 @@ class TestOptionsEngineFixes:
         """Rejected option entries must clean up pre-registered underlying ownership immediately."""
         engine = self._engine(tmp_path)
         occ = "SPY260516C00520000"
-        engine._position_owners["SPY"] = "spy_options_reversion"
+        engine._register_single_leg(strategy_name="spy_options_reversion", symbol="SPY")
         engine._entry_prices["SPY"] = 12.15
         engine.broker.drain_option_fills = MagicMock(return_value=[
             (
@@ -1969,7 +2023,7 @@ class TestOptionsEngineFixes:
 
         engine._drain_option_fills()
 
-        assert "SPY" not in engine._position_owners
+        assert not engine._has_position("SPY")
         assert "SPY" not in engine._entry_prices
 
     # Fix 3: slippage not recorded for options exits ──────────────────────────
@@ -2130,14 +2184,14 @@ class TestOptionsEngineFixes:
     # Fix B: stream stop fill OCC → underlying normalisation ──────────────────
 
     def test_stream_stop_fill_normalizes_occ_to_underlying(self, tmp_path):
-        """OCC stop fills must be matched to the underlying key in _position_owners."""
+        """OCC stop fills must be matched to the underlying key in _positions."""
         from unittest.mock import MagicMock
         from types import SimpleNamespace
         from execution.stream import StreamManager
 
         engine = self._engine(tmp_path)
         occ = "SPY260516C00520000"
-        engine._position_owners["SPY"] = "spy_options_reversion"
+        engine._register_single_leg(strategy_name="spy_options_reversion", symbol="SPY")
         engine._entry_prices["SPY"] = 10.0
 
         fill_update = SimpleNamespace(
@@ -2152,7 +2206,7 @@ class TestOptionsEngineFixes:
         engine._process_stream_stop_fills()
 
         # Ownership must be cleared using the underlying key.
-        assert "SPY" not in engine._position_owners
+        assert not engine._has_position("SPY")
         assert "SPY" not in engine._entry_prices
 
     def test_stream_stop_fill_applies_100x_multiplier_for_options(self, tmp_path):
@@ -2164,7 +2218,7 @@ class TestOptionsEngineFixes:
 
         engine = self._engine(tmp_path)
         occ = "SPY260516C00520000"
-        engine._position_owners["SPY"] = "spy_options_reversion"
+        engine._register_single_leg(strategy_name="spy_options_reversion", symbol="SPY")
         engine._entry_prices["SPY"] = 10.0  # premium at entry
 
         allocator = MagicMock(spec=SleeveAllocator)
@@ -2193,7 +2247,7 @@ class TestOptionsEngineFixes:
 
         engine = self._engine(tmp_path)
         occ = "SPY260516C00520000"
-        engine._position_owners["SPY"] = "spy_options_reversion"
+        engine._register_single_leg(strategy_name="spy_options_reversion", symbol="SPY")
         engine._entry_prices["SPY"] = 10.0
 
         order = SimpleNamespace(
@@ -2220,7 +2274,7 @@ class TestOptionsEngineFixes:
             avg_fill_price=12.5,
             order_id="stop-ord-gap",
         )
-        assert "SPY" not in engine._position_owners
+        assert not engine._has_position("SPY")
 
     def test_stream_stop_fill_equity_no_occ_normalization(self, tmp_path):
         """Plain equity stop fills still work without OCC normalization."""
@@ -2230,7 +2284,7 @@ class TestOptionsEngineFixes:
         from risk.allocator import SleeveAllocator
 
         engine = self._engine(tmp_path)
-        engine._position_owners["AAPL"] = "sma_crossover"
+        engine._register_single_leg(strategy_name="sma_crossover", symbol="AAPL")
         engine._entry_prices["AAPL"] = 100.0
 
         allocator = MagicMock(spec=SleeveAllocator)
@@ -2249,7 +2303,7 @@ class TestOptionsEngineFixes:
 
         # P&L = (105 - 100) * 10 * 1 = $50
         allocator.record_realized_pnl.assert_called_once_with("sma_crossover", 50.0)
-        assert "AAPL" not in engine._position_owners
+        assert not engine._has_position("AAPL")
 
     # log_stop_fill: confirmed WebSocket stop-fill persists real price/qty ─────
 
@@ -2293,7 +2347,7 @@ class TestOptionsEngineFixes:
 
         engine = self._engine(tmp_path)
         occ = "SPY260516C00520000"
-        engine._position_owners["SPY"] = "spy_options_reversion"
+        engine._register_single_leg(strategy_name="spy_options_reversion", symbol="SPY")
         engine._entry_prices["SPY"] = 10.0
 
         fill_update = SimpleNamespace(
@@ -2326,7 +2380,7 @@ class TestOptionsEngineFixes:
         from execution.stream import StreamManager
 
         engine = self._engine(tmp_path)
-        engine._position_owners["AAPL"] = "sma_crossover"
+        engine._register_single_leg(strategy_name="sma_crossover", symbol="AAPL")
         engine._entry_prices["AAPL"] = 100.0
 
         fill_update = SimpleNamespace(
@@ -2365,7 +2419,7 @@ class TestSharedSymbolConflict:
 
     def test_entry_blocked_when_symbol_owned_by_other_strategy(self, engine_factory):
         engine, broker = engine_factory(entries=[False] * 59 + [True])
-        engine._position_owners["AAPL"] = "rsi_reversion"
+        engine._register_single_leg(strategy_name="rsi_reversion", symbol="AAPL")
         snap = _snapshot()
         engine._session_start_equity = snap.account.equity
         result = self._process(engine, "AAPL", snap)
@@ -2377,7 +2431,7 @@ class TestSharedSymbolConflict:
         """Self-ownership must not trip the cross-strategy conflict rule.
         (Risk DUPLICATE_POSITION handles same-strategy double entries separately.)"""
         engine, broker = engine_factory(entries=[False] * 59 + [True])
-        engine._position_owners["AAPL"] = "fake_strategy"
+        engine._register_single_leg(strategy_name="fake_strategy", symbol="AAPL")
         snap = _snapshot()
         engine._session_start_equity = snap.account.equity
         # Reaches risk; risk will not raise — no broker position so no duplicate.
@@ -2388,7 +2442,7 @@ class TestSharedSymbolConflict:
 
     def test_conflict_fires_alert_with_symbol_conflict_code(self, engine_factory):
         engine, broker = engine_factory(entries=[False] * 59 + [True])
-        engine._position_owners["AAPL"] = "rsi_reversion"
+        engine._register_single_leg(strategy_name="rsi_reversion", symbol="AAPL")
         engine.alerts = MagicMock()
         snap = _snapshot()
         engine._session_start_equity = snap.account.equity
@@ -2401,7 +2455,7 @@ class TestSharedSymbolConflict:
 
     def test_conflict_marks_watchlist_status(self, engine_factory):
         engine, _broker = engine_factory(entries=[False] * 59 + [True])
-        engine._position_owners["AAPL"] = "rsi_reversion"
+        engine._register_single_leg(strategy_name="rsi_reversion", symbol="AAPL")
         snap = _snapshot()
         engine._session_start_equity = snap.account.equity
         statuses: dict[str, str] = {}
@@ -2426,7 +2480,7 @@ class TestSharedSymbolConflict:
         # The owner-mismatch exit path is already gated by line 736 in
         # _process_symbol (existing behavior). The new conflict check is
         # only on the entry path. Confirm an exit still routes correctly.
-        engine._position_owners["AAPL"] = "fake_strategy"  # this strategy owns it
+        engine._register_single_leg(strategy_name="fake_strategy", symbol="AAPL")  # this strategy owns it
         positions = {"AAPL": Position("AAPL", 10, 100.0, 1010.0)}
         snap = _snapshot(positions=positions)
         engine._session_start_equity = snap.account.equity
@@ -2455,7 +2509,7 @@ class TestSectorExposure:
     def test_empty_when_no_resolver(self, engine_factory):
         engine, _ = engine_factory()
         engine._sector_resolver = None
-        engine._position_owners = {"AAPL": "fake_strategy"}
+        engine._register_single_leg(strategy_name="fake_strategy", symbol="AAPL")
         assert engine._compute_sector_exposure() == {}
 
     def test_groups_symbols_and_strategies_by_sector(self, engine_factory):
@@ -2466,11 +2520,9 @@ class TestSectorExposure:
             "JPM": "financials",
         }.get(s)
         engine = self._engine(engine_factory, resolver)
-        engine._position_owners = {
-            "AAPL": "sma_crossover",
-            "MSFT": "donchian_breakout",
-            "JPM": "rsi_reversion",
-        }
+        engine._register_single_leg(strategy_name="sma_crossover", symbol="AAPL")
+        engine._register_single_leg(strategy_name="donchian_breakout", symbol="MSFT")
+        engine._register_single_leg(strategy_name="rsi_reversion", symbol="JPM")
         exposure = engine._compute_sector_exposure()
         assert set(exposure.keys()) == {"technology", "financials"}
         # technology has both AAPL and MSFT with their respective owners
@@ -2490,7 +2542,8 @@ class TestSectorExposure:
         resolver = MagicMock()
         resolver.resolve.side_effect = lambda s: None if s == "XYZ" else "technology"
         engine = self._engine(engine_factory, resolver)
-        engine._position_owners = {"AAPL": "sma_crossover", "XYZ": "sma_crossover"}
+        engine._register_single_leg(strategy_name="sma_crossover", symbol="AAPL")
+        engine._register_single_leg(strategy_name="sma_crossover", symbol="XYZ")
         exposure = engine._compute_sector_exposure()
         assert list(exposure.keys()) == ["technology"]
         assert exposure["technology"] == [
@@ -2502,10 +2555,11 @@ class TestSectorExposure:
         resolver.resolve.return_value = "technology"
         engine = self._engine(engine_factory, resolver)
         # OCC contract symbol format: ROOT + YYMMDD + C/P + 8-digit strike
-        engine._position_owners = {
-            "AAPL": "sma_crossover",
-            "SPY251219C00450000": "spy_options_reversion",
-        }
+        engine._register_single_leg(strategy_name="sma_crossover", symbol="AAPL")
+        engine._register_single_leg(
+            strategy_name="spy_options_reversion",
+            symbol="SPY251219C00450000",
+        )
         exposure = engine._compute_sector_exposure()
         assert list(exposure.keys()) == ["technology"]
         assert exposure["technology"] == [
@@ -2521,7 +2575,7 @@ class TestSectorExposure:
         resolver = MagicMock()
         resolver.resolve.side_effect = RuntimeError("yfinance down")
         engine = self._engine(engine_factory, resolver)
-        engine._position_owners = {"AAPL": "sma_crossover"}
+        engine._register_single_leg(strategy_name="sma_crossover", symbol="AAPL")
         # Should not raise; counts that symbol as unmapped.
         exposure = engine._compute_sector_exposure()
         assert exposure == {}

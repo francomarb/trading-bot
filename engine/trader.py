@@ -59,6 +59,12 @@ from loguru import logger
 from config import settings
 from config.settings import SLIPPAGE_MODEL_MARKET_BPS
 from data.fetcher import StaleDataError, close_connections, fetch_symbol, require_fresh
+from engine.positions import (
+    Position,
+    make_single_leg,
+    owner_key_for,
+    view_owner_map,
+)
 from execution.broker import (
     AlpacaBroker,
     BrokerSnapshot,
@@ -246,10 +252,14 @@ class TradingEngine:
         self._last_snapshot: "BrokerSnapshot | None" = None
         self._last_stream_healthy: bool | None = None
 
-        # Position ownership: symbol → strategy_name.  Tracks which strategy
-        # opened each position so that exit signals from a *different* strategy
-        # watching the same symbol don't close someone else's trade.
-        self._position_owners: dict[str, str] = {}
+        # Position ownership: position_id → Position. Tracks which strategy
+        # opened each position so that exit signals from a *different*
+        # strategy watching the same symbol don't close someone else's trade.
+        # For single-leg positions the position_id == owner_key_for(symbol)
+        # (equity ticker, or option underlying for OCC). PR 1 part 2 only
+        # populates single-leg entries; spreads land with the credit-spread
+        # strategy in 11.28/11.29.
+        self._positions: dict[str, Position] = {}
 
         # Entry fill prices: symbol → avg fill price at entry ($/share).
         # Used to compute realized P&L when a position closes, which is fed
@@ -291,6 +301,50 @@ class TradingEngine:
         self._processed_signal_bars: dict[tuple[str, str, str], pd.Timestamp] = {}
         self._processed_signal_statuses: dict[tuple[str, str, str], str] = {}
         self._processed_signal_reasons: dict[tuple[str, str, str], list[str]] = {}
+
+    # ── Position bookkeeping helpers (PR 11.27) ──────────────────────────
+
+    def _owners_view(self) -> dict[str, str]:
+        """
+        Legacy ``dict[position_id, strategy_name]`` view of ``_positions``.
+
+        Used at the boundary with ``SleeveAllocator`` (which still consumes
+        the flat-dict shape) and in the state snapshot's ``open_positions``
+        field that the dashboard reads.
+        """
+        return view_owner_map(self._positions.values())
+
+    def _get_owner(self, symbol: str) -> str | None:
+        """Return owning strategy_name for a broker symbol (OCC-aware), or None."""
+        pos = self._positions.get(owner_key_for(symbol))
+        return pos.strategy_name if pos else None
+
+    def _has_position(self, symbol: str) -> bool:
+        """True if a Position is tracked for ``symbol`` (OCC-normalized)."""
+        return owner_key_for(symbol) in self._positions
+
+    def _register_single_leg(
+        self,
+        *,
+        strategy_name: str,
+        symbol: str,
+    ) -> Position:
+        """Create + store a single-leg Position keyed by its owner_key.
+
+        Idempotent: if a Position already exists for this owner_key,
+        returns the existing record (does not overwrite the strategy)."""
+        key = owner_key_for(symbol)
+        existing = self._positions.get(key)
+        if existing is not None:
+            return existing
+        pos = make_single_leg(strategy_name=strategy_name, symbol=symbol)
+        self._positions[pos.position_id] = pos
+        return pos
+
+    def _pop_position(self, symbol: str) -> str | None:
+        """Remove the Position for ``symbol`` (OCC-aware). Return strategy_name."""
+        pos = self._positions.pop(owner_key_for(symbol), None)
+        return pos.strategy_name if pos else None
 
     # ── Lifecycle ────────────────────────────────────────────────────────
 
@@ -741,7 +795,7 @@ class TradingEngine:
 
         if (last_exit or emergency_exit) and position is not None:
             # Only the strategy that opened the position may close it.
-            owner = self._position_owners.get(symbol)
+            owner = self._get_owner(symbol)
             if owner is not None and owner != strategy.name:
                 logger.info(
                     f"[{strategy.name}] {symbol}: exit signal ignored — "
@@ -799,7 +853,7 @@ class TradingEngine:
                     _pnl_mult = 100 if _OCC_PAT.match(position.symbol) else 1
                     self._record_realized_pnl(symbol, strategy.name, close_price, close_qty, multiplier=_pnl_mult)
                 # Release ownership and cached entry price.
-                self._position_owners.pop(symbol, None)
+                self._pop_position(symbol)
                 self._entry_prices.pop(symbol, None)
                 self._mark_signal_bar_processed(
                     signal_key, signal_bar, strategy_statuses, strategy_reasons, symbol
@@ -870,7 +924,7 @@ class TradingEngine:
         # allocator priority via _slots_by_priority — the higher-priority slot
         # pre-registers first, so by the time the lower-priority slot reaches
         # this check the owner is already set. Exits never reach this code path.
-        existing_owner = self._position_owners.get(symbol)
+        existing_owner = self._get_owner(symbol)
         if existing_owner is not None and existing_owner != strategy.name:
             logger.info(
                 f"[{strategy.name}] {symbol}: entry blocked — "
@@ -901,7 +955,7 @@ class TradingEngine:
                 strategy_name=strategy.name,
                 account=account,
                 open_orders=snapshot.open_orders,
-                position_owners=self._position_owners,
+                position_owners=self._owners_view(),
                 order_strategy=order_strategy or {},
             )
             if isinstance(sleeve, SleeveRejection):
@@ -990,7 +1044,11 @@ class TradingEngine:
                 # Options worker dispatched asynchronously — pre-register
                 # ownership so the position is managed when it arrives in the
                 # broker snapshot. The actual fill is logged via drain_option_fills().
-                self._position_owners[symbol] = strategy.name
+                # Register with target_symbol (the OCC contract) so the
+                # Position's leg carries the real option symbol; owner_key_for()
+                # still keys the position by the underlying. _entry_prices stays
+                # keyed by `symbol` (== the owner key).
+                self._register_single_leg(strategy_name=strategy.name, symbol=target_symbol)
                 self._entry_prices[symbol] = target_price
                 logger.info(
                     f"[{strategy.name}] {symbol}: options order dispatched "
@@ -1011,7 +1069,10 @@ class TradingEngine:
             )
             self._log_entry(decision, result, latest_close)
             if result.status in {OrderStatus.FILLED, OrderStatus.PARTIAL}:
-                self._position_owners[symbol] = strategy.name
+                # target_symbol == symbol for equities; the OCC contract for
+                # synchronous option fills. Register with it so the leg carries
+                # the real traded symbol.
+                self._register_single_leg(strategy_name=strategy.name, symbol=target_symbol)
                 if strategy_statuses is not None:
                     strategy_statuses[symbol] = "Long"
                 if strategy_reasons is not None:
@@ -1189,7 +1250,10 @@ class TradingEngine:
                     order_type=suspect.decision.order_type.value,
                 )
                 self._log_entry(suspect.decision, result, suspect.modeled_price)
-                self._position_owners[symbol] = suspect.decision.strategy_name
+                self._register_single_leg(
+                    strategy_name=suspect.decision.strategy_name,
+                    symbol=symbol,
+                )
                 self._entry_prices[symbol] = fill_price
                 self._ensure_recovered_protective_stop(
                     snapshot=snapshot,
@@ -1381,7 +1445,7 @@ class TradingEngine:
         for order in open_orders:
             if order.side is Side.SELL:
                 continue
-            if order.symbol in self._position_owners:
+            if self._has_position(order.symbol):
                 # Close / reduce order for an existing position — skip.
                 continue
             matches = [slot for slot in slots if order.symbol in slot.active_symbols()]
@@ -1408,12 +1472,18 @@ class TradingEngine:
         no resolver was injected. Use ``{k: len(v) for k, v in ...}`` for raw
         counts.
         """
-        if self._sector_resolver is None or not self._position_owners:
+        if self._sector_resolver is None or not self._positions:
             return {}
         grouped: dict[str, list[dict]] = {}
-        for symbol, owner in self._position_owners.items():
-            if _OCC_PAT.match(symbol):
+        for position_id, position in self._positions.items():
+            # OCC option positions: position_id is the underlying ticker but
+            # the leg carries the raw OCC string. Skip them — index options
+            # don't have a single tradable sector mapping.
+            leg = position.primary_leg
+            if leg is not None and _OCC_PAT.match(leg.symbol):
                 continue
+            symbol = position_id
+            owner = position.strategy_name
             try:
                 sector = self._sector_resolver.resolve(symbol)
             except Exception as exc:
@@ -1489,7 +1559,7 @@ class TradingEngine:
                 # Options positions use Alpaca-managed bracket stop legs.
                 # Equity-style stop repair does not apply to OCC symbols.
                 continue
-            owner = self._position_owners.get(symbol)
+            owner = self._get_owner(symbol)
             if owner is None:
                 continue
             if self._has_protective_stop_order(symbol, snapshot):
@@ -1694,7 +1764,7 @@ class TradingEngine:
         """
         confirm = self.config.external_close_confirm_cycles
 
-        for symbol in list(self._position_owners):
+        for symbol in list(self._positions):
             if self._get_position_for(symbol, snapshot) is not None:
                 # Position is present — reset any suspect counter and continue.
                 self._external_close_suspects.pop(symbol, None)
@@ -1711,7 +1781,7 @@ class TradingEngine:
                 continue
 
             # Confirmed absent for `confirm` consecutive cycles.
-            owner = self._position_owners.pop(symbol)
+            owner = self._pop_position(symbol)
             self._external_close_suspects.pop(symbol, None)
             msg = (
                 f"{symbol}: position owned by '{owner}' absent for "
@@ -1761,18 +1831,19 @@ class TradingEngine:
         for update in self._stream_manager.drain_stop_fills():
             raw_symbol = update.order.symbol
             # OCC bracket stop legs carry the full OCC string (e.g. SPY260516C00520000).
-            # _position_owners is keyed by the underlying ("SPY"), so normalise before
-            # lookup; keep raw_symbol for logging and trade-DB calls.
-            _occ_m = re.match(r"^([A-Z]{1,6})[0-9]", raw_symbol) if _OCC_PAT.match(raw_symbol) else None
-            symbol = _occ_m.group(1) if _occ_m else raw_symbol
+            # _positions is keyed by the underlying ("SPY") for OCC option fills,
+            # so normalise before lookup; keep raw_symbol for logging and
+            # trade-DB calls.
+            _occ_m = _OCC_PAT.match(raw_symbol)
+            symbol = owner_key_for(raw_symbol)
 
-            if symbol not in self._position_owners:
+            if not self._has_position(symbol):
                 logger.debug(
                     f"stream stop fill for unowned {raw_symbol} — already handled"
                 )
                 continue
 
-            owner = self._position_owners.pop(symbol)
+            owner = self._pop_position(symbol)
             self._external_close_suspects.pop(symbol, None)
             price = float(update.price) if update.price is not None else None
             qty = int(float(update.qty or 0))
@@ -1838,10 +1909,9 @@ class TradingEngine:
             if result.status in {OrderStatus.FILLED, OrderStatus.PARTIAL}:
                 # Update entry price with actual fill price; find the underlying
                 # symbol that was pre-registered when the worker was dispatched.
-                m = _re.match(r"^([A-Z]{1,6})[0-9]{6}[CP][0-9]{8}$", decision.symbol)
-                if m and avg_fill_price:
-                    underlying = m.group(1)
-                    if underlying in self._position_owners:
+                underlying = owner_key_for(decision.symbol)
+                if underlying != decision.symbol and avg_fill_price:
+                    if underlying in self._positions:
                         self._entry_prices[underlying] = avg_fill_price
                 self.alerts.trade_executed(
                     symbol=decision.symbol,
@@ -1854,19 +1924,23 @@ class TradingEngine:
             else:
                 # Order was canceled/rejected — remove pre-registered ownership
                 # so the symbol is not mistakenly tracked as an open position.
-                m = _re.match(r"^([A-Z]{1,6})[0-9]{6}[CP][0-9]{8}$", decision.symbol)
-                underlying = m.group(1) if m else None
-                if underlying and self._position_owners.get(underlying) == decision.strategy_name:
+                underlying = owner_key_for(decision.symbol)
+                pre_registered = self._positions.get(underlying)
+                if (
+                    underlying != decision.symbol
+                    and pre_registered is not None
+                    and pre_registered.strategy_name == decision.strategy_name
+                ):
                     logger.info(
                         f"[{decision.strategy_name}] options order canceled/rejected "
                         f"({decision.symbol}) — removing pre-registered ownership"
                     )
-                    self._position_owners.pop(underlying, None)
+                    self._pop_position(underlying)
                     self._entry_prices.pop(underlying, None)
 
     def _restore_ownership_from_db(self, snapshot: BrokerSnapshot) -> set[str]:
         """
-        Restore ``_position_owners`` from the trade DB (10.C1).
+        Restore ``_positions`` from the trade DB (10.C1).
 
         For each symbol in the broker's open positions:
         - If the trade DB records a still-open buy for that symbol, use the
@@ -1877,35 +1951,33 @@ class TradingEngine:
           best-effort slot-order match with a WARNING.
 
         OCC option symbols (e.g. SPY260516C00520000) are keyed under their
-        underlying ticker ("SPY") in _position_owners, matching how the engine
-        tracks them during normal operation via _get_position_for().
+        underlying ticker ("SPY") in _positions — owner_key_for() handles the
+        normalization, matching how the engine tracks options during normal
+        operation via _get_position_for().
 
         Returns the set of conflict underlying keys (DB owner no longer in any slot).
         """
-        import re as _re
-        _OCC = _re.compile(r"^([A-Z]{1,6})[0-9]{6}[CP][0-9]{8}$")
-
         db_owners = self.trade_logger.read_all_open_owners()
         known_strategy_names = {slot.strategy.name for slot in self.slots}
         conflicts: set[str] = set()
 
         for sym in snapshot.account.open_positions:
             # For OCC option symbols, ownership is stored under the underlying.
-            occ_m = _OCC.match(sym)
-            owner_key = occ_m.group(1) if occ_m else sym
+            owner_key = owner_key_for(sym)
+            is_option = owner_key != sym
 
-            if owner_key in self._position_owners:
+            if owner_key in self._positions:
                 continue  # already assigned (shouldn't happen at startup)
 
             # DB lookup: try the exact broker symbol first (OCC string or equity),
             # then fall back to the underlying ticker for options.
             db_owner = db_owners.get(sym)
-            if db_owner is None and occ_m:
+            if db_owner is None and is_option:
                 db_owner = db_owners.get(owner_key)
 
             if db_owner is not None:
                 if db_owner in known_strategy_names:
-                    self._position_owners[owner_key] = db_owner
+                    self._register_single_leg(strategy_name=db_owner, symbol=sym)
                     logger.info(
                         f"restart: assigned existing position {sym} "
                         f"→ '{db_owner}' (owner_key='{owner_key}', trade DB record)"
@@ -1920,11 +1992,14 @@ class TradingEngine:
             else:
                 # No DB record — fall back to best-effort slot-order match.
                 # For options, match the underlying ticker against slot symbols.
-                lookup = owner_key if occ_m else sym
+                lookup = owner_key if is_option else sym
                 matched = False
                 for slot in self.slots:
                     if lookup in slot.active_symbols():
-                        self._position_owners[owner_key] = slot.strategy.name
+                        self._register_single_leg(
+                            strategy_name=slot.strategy.name,
+                            symbol=sym,
+                        )
                         logger.warning(
                             f"restart: no DB record for {sym}; assigned to "
                             f"'{slot.strategy.name}' via underlying '{lookup}' "
@@ -1959,9 +2034,9 @@ class TradingEngine:
     def _restore_entry_prices_from_db(self, snapshot: BrokerSnapshot) -> None:
         """Restore entry prices for currently-open broker positions from the trade log."""
         for sym in snapshot.account.open_positions:
+            owner_key = owner_key_for(sym)
             occ_m = _OCC_PAT.match(sym)
-            owner_key = occ_m.group(1) if occ_m else sym
-            owner = self._position_owners.get(owner_key)
+            owner = self._get_owner(sym)
             if owner is None:
                 continue
             context = self.trade_logger.read_latest_open_entry_context(
@@ -2006,18 +2081,11 @@ class TradingEngine:
 
         # Check for broker positions with no ownership at all.
         # OCC option positions are owned under their underlying ticker, so we
-        # must resolve the owner key before checking _position_owners.
-        import re as _re
-        _OCC = _re.compile(r"^([A-Z]{1,6})[0-9]{6}[CP][0-9]{8}$")
-
-        def _owner_key(s: str) -> str:
-            m = _OCC.match(s)
-            return m.group(1) if m else s
-
+        # must resolve the owner key before checking _positions.
         unmanaged = [
             sym
             for sym in snapshot.account.open_positions
-            if _owner_key(sym) not in self._position_owners
+            if owner_key_for(sym) not in self._positions
         ]
         if unmanaged:
             logger.warning(
@@ -2087,7 +2155,7 @@ class TradingEngine:
                 self._last_snapshot.account.open_positions
                 if self._last_snapshot else {}
             )
-            for sym, strat in self._position_owners.items():
+            for sym, strat in self._owners_view().items():
                 pos = broker_positions.get(sym)
                 positions_detail[sym] = {
                     "strategy": strat,
@@ -2111,7 +2179,7 @@ class TradingEngine:
                 allocator_snapshot = self._allocator.snapshot(
                     self._last_snapshot.account,
                     self._last_snapshot.open_orders,
-                    self._position_owners,
+                    self._owners_view(),
                     order_strategy,
                 )
                 sleeve_usage = {
@@ -2173,7 +2241,7 @@ class TradingEngine:
                 "previous_close_equity": previous_close_equity,
                 "daily_pnl": market_day_pnl,
                 "session_pnl": equity - start_equity,
-                "open_positions": dict(self._position_owners),
+                "open_positions": self._owners_view(),
                 "positions_detail": positions_detail,
                 "allocator": allocator_snapshot["strategies"],
                 "capital_pools": allocator_snapshot["pools"],
@@ -2205,7 +2273,7 @@ class TradingEngine:
     ) -> str:
         """Best-known status before the current cycle's decision path runs."""
         position = snapshot.account.open_positions.get(symbol)
-        owner = self._position_owners.get(symbol)
+        owner = self._get_owner(symbol)
         if position is not None and owner == strategy_name:
             if self._has_pending_close_order(symbol, snapshot):
                 return "Pending Exit"

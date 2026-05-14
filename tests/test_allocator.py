@@ -453,7 +453,7 @@ class TestEngineAllocatorIntegration:
             alerts=MagicMock(spec=AlertDispatcher),
             allocator=_allocator(),
         )
-        engine._position_owners = {"MSFT": "sma_crossover"}
+        engine._register_single_leg(strategy_name="sma_crossover", symbol="MSFT")
 
         with patch(
             "engine.trader.fetch_symbol",

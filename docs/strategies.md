@@ -335,7 +335,7 @@ Options orders do not go through the standard equity broker path. The flow is:
 5. Mid-trade exits are triggered by `inspect_open_positions` → `broker.close_position(occ)`
 6. Bracket stop-leg fills are delivered by the WebSocket stream → `_process_stream_stop_fills`
 
-The engine's ownership dict (`_position_owners`) is keyed by the underlying ticker (`"SPY"`). See PLAN.md item 11.23 for the known limitation when two options strategies trade the same underlying simultaneously.
+The engine's ownership map (`_positions`) keys single-leg option positions by the underlying ticker (`"SPY"`) via `owner_key_for()`, and reserves UUID `position_id`s for multi-leg positions (see PLAN.md 11.27 and `engine/positions.py`). Future same-underlying or spread strategies set an explicit `position_id` and so cannot collide.
 
 **Backtest performance (SPY daily 2019–2025, RSI 45 oversold, trailing stop activated):**
 
@@ -445,4 +445,4 @@ The `spy_options_reversion` strategy lays the generic engine foundation for any 
 - `find_best_call` in `utils/options_lookup.py` — selects the best-fit call contract by delta and DTE from the Alpaca chain
 - All engine paths (slippage recording, audit trail, stop repair, stream stop fills, P&L multiplier) are OCC-aware and generic
 
-**Known limitation (PLAN.md 11.23):** `_position_owners` is keyed by the underlying ticker. Two options strategies trading the same underlying simultaneously would collide. Safe for any number of strategies on distinct underlyings. See PLAN.md item 11.23 for the migration plan.
+**Same-underlying collision (formerly 11.23):** resolved by the `Position` abstraction (PLAN.md 11.27, `engine/positions.py`). Single-leg options use `position_id = owner_key_for(symbol)` (underlying ticker); future same-underlying or multi-leg strategies set an explicit `position_id` (UUID) and so do not collide on the ownership map.

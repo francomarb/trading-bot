@@ -428,12 +428,12 @@ Options orders are detected by matching the OCC symbol format (`^[A-Z]{1,6}[0-9]
 | `_record_fill` (slippage monitor) | Skipped for OCC exits — underlying bar price vs option premium produces meaningless bps |
 | `_log_close` | Uses `result.avg_fill_price` (option premium) as `modeled_price` instead of the underlying bar close |
 | `_record_realized_pnl` | Accepts `multiplier=100` for options; default 1 for equities |
-| `_process_stream_stop_fills` | Normalizes OCC → underlying before `_position_owners` lookup; logs with `log_stop_fill` |
+| `_process_stream_stop_fills` | Normalizes OCC → underlying via `owner_key_for()` before `_positions` lookup; logs with `log_stop_fill` |
 | `inspect_open_positions` exit | Calls `_OCC_PAT`-gated multiplier; skips `_record_fill`; uses premium as modeled price |
 
-**WebSocket stream stop fills:** When a bracket stop leg fills, the stream delivers the event with the OCC symbol. `_process_stream_stop_fills` normalizes the OCC string to the underlying ticker (the key in `_position_owners`), records the real P&L with the 100× multiplier, and calls `log_stop_fill` to persist the confirmed execution. If price or qty is absent from the stream event, it falls back to `log_external_close`.
+**WebSocket stream stop fills:** When a bracket stop leg fills, the stream delivers the event with the OCC symbol. `_process_stream_stop_fills` normalizes the OCC string to the underlying ticker (the `position_id` in `_positions`), records the real P&L with the 100× multiplier, and calls `log_stop_fill` to persist the confirmed execution. If price or qty is absent from the stream event, it falls back to `log_external_close`.
 
-**Known limitation:** `_position_owners` is keyed by the underlying ticker (`"SPY"`), not the OCC string. Two options strategies trading the same underlying simultaneously would collide. Safe for any number of strategies on distinct underlyings. See PLAN.md item 11.23 for the migration plan.
+**Position ownership model (PLAN.md 11.27):** `_positions: dict[position_id, Position]` keys single-leg positions by `owner_key_for(symbol)` — equity ticker or option underlying — and reserves UUID `position_id`s for spreads. The earlier 11.23 limitation (two options strategies on the same underlying would collide because both were keyed by the underlying ticker) is superseded by this abstraction: future multi-leg or same-underlying strategies key on their own `position_id`. See `engine/positions.py`.
 
 #### Other execution rules
 
@@ -520,7 +520,7 @@ When implementing any new equity strategy:
 13. Implement `inspect_open_positions(position, latest_close) -> bool` — mid-trade exit guards (time stop, delta floor, trailing stop, etc.)
 14. Use `utils/options_lookup.find_best_call` (or an equivalent) to select the contract
 15. Add tests for `build_option_execution`, `inspect_open_positions`, and each exit guard in `tests/test_<strategy_name>.py`
-16. **Check PLAN.md item 11.23** before adding a second options strategy on the same underlying — `_position_owners` is keyed by the underlying ticker and two strategies on the same underlying would collide
+16. Multi-leg or same-underlying options strategies use the `Position` abstraction (PLAN.md 11.27, `engine/positions.py`): set an explicit `position_id` (UUID for spreads) so two strategies on the same underlying cannot collide on the engine's ownership map
 
 ---
 

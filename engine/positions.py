@@ -93,9 +93,9 @@ class Position:
     """
     A logical position composed of one or more legs, owned by one strategy.
 
-    The ``position_id`` is the engine's primary key:
+    The ``position_id`` is the engine's primary key in ``_positions``:
       - For single-leg positions, it equals the equity ticker or option
-        underlying — matching the legacy ``_position_owners`` key.
+        underlying (i.e. ``owner_key_for(symbol)``).
       - For spreads (PR 2/3), it is a UUID assigned at submission time.
 
     Attributes:
