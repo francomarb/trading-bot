@@ -1998,6 +1998,10 @@ class TradingEngine:
         Count open spread positions across ALL credit_spread instances — the
         global ``MAX_TOTAL_CONCURRENT_CREDIT_SPREADS`` counter passed into
         ``build_spread_execution``.
+
+        NOTE (PLAN.md 11.31): the ``"credit_spread"`` literal is correct while
+        that is the only multi-leg strategy. A second one would need this
+        filter generalized to the duck-typed ``build_spread_execution`` hook.
         """
         return sum(
             1 for p in self._positions.values()
@@ -2442,7 +2446,12 @@ class TradingEngine:
         return conflicts
 
     def _credit_spread_strategy_for(self, underlying: str) -> BaseStrategy | None:
-        """The configured CreditSpread instance trading ``underlying``, if any."""
+        """The configured CreditSpread instance trading ``underlying``, if any.
+
+        NOTE (PLAN.md 11.31): the ``"credit_spread"`` name check is correct
+        while that is the only multi-leg strategy. A second one would need
+        this generalized so its restarted spreads also reconstruct.
+        """
         for slot in self.slots:
             strategy = slot.strategy
             if (
