@@ -2265,9 +2265,24 @@ class TradingEngine:
                 close_qty = float(
                     filled_qty or (released.qty if released is not None else 1)
                 )
+                # Realized P&L = (credit collected − debit paid) × qty × 100.
+                # Feed it to the allocator's HWM / sleeve-drawdown gate and
+                # persist it on the close row so it survives a restart via
+                # read_strategy_realized_pnl_summary.
+                realized_pnl: float | None = None
+                if released is not None:
+                    realized_pnl = (
+                        (released.net_credit - net_debit) * close_qty * 100.0
+                    )
+                    if self._allocator is not None:
+                        self._allocator.record_realized_pnl(
+                            strategy_name, realized_pnl
+                        )
                 logger.info(
                     f"[{strategy_name}] credit spread CLOSED — "
                     f"position_id={position_id[:8]} net_debit=${net_debit:.2f}/sh "
+                    f"realized_pnl="
+                    f"{'n/a' if realized_pnl is None else f'${realized_pnl:+,.2f}'} "
                     f"order={order_id}"
                 )
                 self.trade_logger.log_spread_fill(
@@ -2279,6 +2294,7 @@ class TradingEngine:
                     net_price=net_debit,
                     order_id=order_id,
                     opening=False,
+                    realized_pnl=realized_pnl,
                 )
                 self.alerts.trade_executed(
                     symbol=short_occ,

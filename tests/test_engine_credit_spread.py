@@ -279,6 +279,47 @@ class TestDrainSpreadFills:
         # Short leg bought back to close, long leg sold.
         assert {r["side"] for r in close_rows} == {"buy", "sell"}
 
+    def test_close_filled_records_realized_pnl_to_allocator(self, tmp_path):
+        strategy = _strategy()
+        engine, broker = _engine(tmp_path, strategy)
+        # _open_spread default net_credit = 1.45.
+        self._pre_register(engine, strategy, "p1")
+        engine._allocator = MagicMock()
+        engine._spreads_pending_close.add("p1")
+        # Closed at a $0.60 debit → realized = (1.45 − 0.60) × 1 × 100 = 85.0.
+        broker.drain_spread_fills.return_value = [
+            ("p1", "credit_spread", True, "filled", 1.0, 0.60, "combo-close-1"),
+        ]
+        engine._drain_spread_fills()
+
+        engine._allocator.record_realized_pnl.assert_called_once()
+        name, pnl = engine._allocator.record_realized_pnl.call_args.args
+        assert name == "credit_spread"
+        assert pnl == pytest.approx(85.0)
+        # Persisted on the close row so it survives a restart.
+        close_rows = [
+            r for r in engine.trade_logger.read_all()
+            if r["reason"] == "spread exit" and r["realized_pnl"] is not None
+        ]
+        assert len(close_rows) == 1
+        assert close_rows[0]["realized_pnl"] == pytest.approx(85.0)
+
+    def test_close_filled_with_no_allocator_still_logs_pnl(self, tmp_path):
+        strategy = _strategy()
+        engine, broker = _engine(tmp_path, strategy)
+        self._pre_register(engine, strategy, "p1")
+        engine._allocator = None  # no allocator wired
+        engine._spreads_pending_close.add("p1")
+        broker.drain_spread_fills.return_value = [
+            ("p1", "credit_spread", True, "filled", 1.0, 0.60, "combo-close-1"),
+        ]
+        engine._drain_spread_fills()  # must not raise
+        close_rows = [
+            r for r in engine.trade_logger.read_all()
+            if r["reason"] == "spread exit" and r["realized_pnl"] is not None
+        ]
+        assert close_rows[0]["realized_pnl"] == pytest.approx(85.0)
+
     def test_close_canceled_keeps_position_for_retry(self, tmp_path):
         strategy = _strategy()
         engine, broker = _engine(tmp_path, strategy)

@@ -635,6 +635,63 @@ class TestSpreadLogging:
         opens = tl.read_open_spread_positions()
         assert {r["position_id"] for r in opens} == {"uuid-1", "uuid-2"}
 
+    def test_close_realized_pnl_rides_short_leg_row(self, tmp_csv):
+        tl = TradeLogger(path=tmp_csv)
+        tl.log_spread_fill(
+            position_id="uuid-1", strategy="credit_spread",
+            short_occ=self._SHORT, long_occ=self._LONG,
+            qty=1, net_price=2.54, opening=True,
+        )
+        # Close at a $0.80 debit → realized = (2.54 − 0.80) × 1 × 100 = 174.0.
+        tl.log_spread_fill(
+            position_id="uuid-1", strategy="credit_spread",
+            short_occ=self._SHORT, long_occ=self._LONG,
+            qty=1, net_price=0.80, opening=False, realized_pnl=174.0,
+        )
+        rows = tl.read_all()
+        close_rows = [r for r in rows if r["reason"] == "spread exit"]
+        # realized_pnl lands on exactly one row — the short leg (side='buy').
+        with_pnl = [r for r in close_rows if r["realized_pnl"] is not None]
+        assert len(with_pnl) == 1
+        assert with_pnl[0]["side"] == "buy"
+        assert with_pnl[0]["realized_pnl"] == pytest.approx(174.0)
+
+    def test_realized_pnl_summary_rolls_in_credit_spread_pnl(self, tmp_csv):
+        tl = TradeLogger(path=tmp_csv)
+        tl.log_spread_fill(
+            position_id="uuid-1", strategy="credit_spread",
+            short_occ=self._SHORT, long_occ=self._LONG,
+            qty=1, net_price=2.54, opening=True,
+        )
+        tl.log_spread_fill(
+            position_id="uuid-1", strategy="credit_spread",
+            short_occ=self._SHORT, long_occ=self._LONG,
+            qty=1, net_price=0.80, opening=False, realized_pnl=174.0,
+        )
+        summary = tl.read_strategy_realized_pnl_summary(["credit_spread"])
+        # Counted once (not double-counted across the two close-leg rows),
+        # and the spread open rows contribute nothing.
+        assert summary["credit_spread"]["realized_pnl"] == pytest.approx(174.0)
+        assert summary["credit_spread"]["hwm"] == pytest.approx(174.0)
+
+    def test_realized_pnl_summary_reflects_a_losing_spread(self, tmp_csv):
+        tl = TradeLogger(path=tmp_csv)
+        tl.log_spread_fill(
+            position_id="uuid-1", strategy="credit_spread",
+            short_occ=self._SHORT, long_occ=self._LONG,
+            qty=1, net_price=1.45, opening=True,
+        )
+        # Closed at a $3.00 debit → realized = (1.45 − 3.00) × 100 = −155.0.
+        tl.log_spread_fill(
+            position_id="uuid-1", strategy="credit_spread",
+            short_occ=self._SHORT, long_occ=self._LONG,
+            qty=1, net_price=3.00, opening=False, realized_pnl=-155.0,
+        )
+        summary = tl.read_strategy_realized_pnl_summary(["credit_spread"])
+        assert summary["credit_spread"]["realized_pnl"] == pytest.approx(-155.0)
+        # P&L never went positive — HWM stays at the 0.0 baseline.
+        assert summary["credit_spread"]["hwm"] == pytest.approx(0.0)
+
 
 # ── TestPnLTracker ──────────────────────────────────────────────────────────
 

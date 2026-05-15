@@ -500,6 +500,7 @@ class TradeLogger:
         net_price: float,
         order_id: str | None = None,
         opening: bool,
+        realized_pnl: float | None = None,
         reason: str = "",
     ) -> None:
         """
@@ -516,6 +517,12 @@ class TradeLogger:
         received on open, debit paid on close, both positive) go on the
         short-leg row; the long-leg row carries ``avg_fill_price=0.0``.
 
+        ``realized_pnl`` is the closed spread's net P&L
+        (``(net_credit − net_debit) × qty × 100``) — provided only on a close.
+        It is written to the short-leg row so
+        ``read_strategy_realized_pnl_summary`` (which counts spread rows)
+        rolls credit-spread P&L into the sleeve HWM / drawdown gate.
+
         ``position_type='spread'`` rows are deliberately excluded from
         ``read_all_open_owners`` / ``read_owner_for_symbol`` so the engine's
         single-leg ownership restore never mistakes a spread leg for a
@@ -528,7 +535,9 @@ class TradeLogger:
         short_side = "sell" if opening else "buy"
         long_side = "buy" if opening else "sell"
 
-        def _leg_record(symbol: str, side: str, price: float) -> TradeRecord:
+        def _leg_record(
+            symbol: str, side: str, price: float, pnl: float | None
+        ) -> TradeRecord:
             return TradeRecord(
                 timestamp=now_iso,
                 symbol=symbol,
@@ -549,7 +558,7 @@ class TradeLogger:
                 initial_stop_loss=None,
                 initial_risk_per_share=None,
                 initial_risk_dollars=None,
-                realized_pnl=None,
+                realized_pnl=pnl,
                 r_multiple=None,
                 entry_timestamp=now_iso if opening else None,
                 exit_timestamp=None if opening else now_iso,
@@ -557,8 +566,10 @@ class TradeLogger:
                 position_type="spread",
             )
 
-        self.log(_leg_record(short_occ, short_side, net_price))
-        self.log(_leg_record(long_occ, long_side, 0.0))
+        # realized_pnl rides the short-leg row alongside the net economics;
+        # the long-leg row stays at 0.0 / None.
+        self.log(_leg_record(short_occ, short_side, net_price, realized_pnl))
+        self.log(_leg_record(long_occ, long_side, 0.0, None))
         logger.info(
             f"spread {'entry' if opening else 'exit'} logged: {short_occ}/{long_occ} "
             f"qty={qty} net=${net_price:.2f}/sh [{strategy}] position_id={position_id[:8]}"
@@ -780,8 +791,10 @@ class TradeLogger:
         """
         Reconstruct per-strategy cumulative realized P&L and HWM from the trade log.
 
-        Only sell-side rows with a non-null ``realized_pnl`` contribute. The HWM is
-        the running maximum of cumulative realized P&L in append order.
+        Contributing rows: single-leg sell-side closes, plus credit-spread
+        rows (``position_type='spread'``) — both with a non-null
+        ``realized_pnl``. The HWM is the running maximum of cumulative
+        realized P&L in append order.
         """
         include = set(strategies or [])
         summary = {
@@ -795,10 +808,15 @@ class TradeLogger:
         except sqlite3.Error:
             return summary
         conn.row_factory = sqlite3.Row
+        # Single-leg closes are sell-side; credit-spread closes write
+        # realized_pnl on the short-leg row, which is side='buy' (bought to
+        # close) — so also accept position_type='spread' rows. The
+        # `realized_pnl IS NOT NULL` filter prevents double-counting: spread
+        # opens and the long-leg close row all carry NULL realized_pnl.
         cursor = conn.execute(
             "SELECT strategy, realized_pnl "
             "FROM trades "
-            "WHERE side = 'sell' "
+            "WHERE (side = 'sell' OR position_type = 'spread') "
             "AND status IN ('filled', 'partial') "
             "AND realized_pnl IS NOT NULL "
             "ORDER BY id ASC"
