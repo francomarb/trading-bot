@@ -2251,9 +2251,6 @@ class TradingEngine:
             # ── Spread CLOSE ─────────────────────────────────────────────
             self._spreads_pending_close.discard(position_id)
             if filled:
-                net_debit = (
-                    abs(avg_fill_price) if avg_fill_price is not None else 0.0
-                )
                 released = (
                     strategy.release_spread(position_id)
                     if strategy is not None else None
@@ -2265,26 +2262,45 @@ class TradingEngine:
                 close_qty = float(
                     filled_qty or (released.qty if released is not None else 1)
                 )
-                # Realized P&L = (credit collected − debit paid) × qty × 100.
-                # Feed it to the allocator's HWM / sleeve-drawdown gate and
-                # persist it on the close row so it survives a restart via
-                # read_strategy_realized_pnl_summary.
+
+                # The spread IS closed regardless — but only record P&L when
+                # we have a real fill price. A stream "filled" event whose
+                # REST follow-up failed reaches here with avg_fill_price=None;
+                # treating that as a $0 debit would fabricate a full-credit
+                # winner and inflate the allocator's HWM / drawdown gate. In
+                # that case leave realized P&L unset (not zero) and warn.
                 realized_pnl: float | None = None
-                if released is not None:
-                    realized_pnl = (
-                        (released.net_credit - net_debit) * close_qty * 100.0
+                exit_reason = "spread exit"
+                if avg_fill_price is None:
+                    net_debit = 0.0
+                    exit_reason = "spread exit (fill price unavailable)"
+                    logger.warning(
+                        f"[{strategy_name}] credit spread CLOSED but the combo "
+                        f"fill price was unavailable — position_id="
+                        f"{position_id[:8]} order={order_id}; realized P&L not "
+                        "recorded (position still released)"
                     )
-                    if self._allocator is not None:
-                        self._allocator.record_realized_pnl(
-                            strategy_name, realized_pnl
+                else:
+                    net_debit = abs(avg_fill_price)
+                    if released is not None:
+                        # Realized P&L = (credit collected − debit paid) × qty
+                        # × 100. Feed the allocator HWM / sleeve-drawdown gate
+                        # and persist it on the close row so it survives a
+                        # restart via read_strategy_realized_pnl_summary.
+                        realized_pnl = (
+                            (released.net_credit - net_debit) * close_qty * 100.0
                         )
-                logger.info(
-                    f"[{strategy_name}] credit spread CLOSED — "
-                    f"position_id={position_id[:8]} net_debit=${net_debit:.2f}/sh "
-                    f"realized_pnl="
-                    f"{'n/a' if realized_pnl is None else f'${realized_pnl:+,.2f}'} "
-                    f"order={order_id}"
-                )
+                        if self._allocator is not None:
+                            self._allocator.record_realized_pnl(
+                                strategy_name, realized_pnl
+                            )
+                    logger.info(
+                        f"[{strategy_name}] credit spread CLOSED — "
+                        f"position_id={position_id[:8]} "
+                        f"net_debit=${net_debit:.2f}/sh realized_pnl="
+                        f"{'n/a' if realized_pnl is None else f'${realized_pnl:+,.2f}'} "
+                        f"order={order_id}"
+                    )
                 self.trade_logger.log_spread_fill(
                     position_id=position_id,
                     strategy=strategy_name,
@@ -2295,6 +2311,7 @@ class TradingEngine:
                     order_id=order_id,
                     opening=False,
                     realized_pnl=realized_pnl,
+                    reason=exit_reason,
                 )
                 self.alerts.trade_executed(
                     symbol=short_occ,
@@ -2302,7 +2319,7 @@ class TradingEngine:
                     side="buy",
                     qty=close_qty,
                     price=net_debit,
-                    reason=f"{strategy_name} spread exit",
+                    reason=f"{strategy_name} {exit_reason}",
                 )
             else:
                 # Close did not fill — the position stays open. Clearing the

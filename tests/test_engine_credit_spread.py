@@ -320,6 +320,34 @@ class TestDrainSpreadFills:
         ]
         assert close_rows[0]["realized_pnl"] == pytest.approx(85.0)
 
+    def test_close_filled_with_no_fill_price_leaves_pnl_unset(self, tmp_path):
+        # Stream said "filled" but the REST follow-up to fetch the combo fill
+        # price failed → avg_fill_price=None reaches the drain. The position
+        # must still close, but P&L must NOT be fabricated (0.0 debit would
+        # record a bogus full-credit winner into the HWM gate).
+        strategy = _strategy()
+        engine, broker = _engine(tmp_path, strategy)
+        self._pre_register(engine, strategy, "p1")
+        engine._allocator = MagicMock()
+        engine._spreads_pending_close.add("p1")
+        broker.drain_spread_fills.return_value = [
+            ("p1", "credit_spread", True, "filled", 1.0, None, "combo-close-1"),
+        ]
+        engine._drain_spread_fills()
+
+        # Position released — the spread genuinely closed.
+        assert "p1" not in engine._positions
+        assert strategy.open_spreads == []
+        assert "p1" not in engine._spreads_pending_close
+        # But NO bogus P&L recorded.
+        engine._allocator.record_realized_pnl.assert_not_called()
+        close_rows = [
+            r for r in engine.trade_logger.read_all()
+            if r["position_type"] == "spread" and r["exit_timestamp"] is not None
+        ]
+        assert close_rows  # the close was still logged
+        assert all(r["realized_pnl"] is None for r in close_rows)
+
     def test_close_canceled_keeps_position_for_retry(self, tmp_path):
         strategy = _strategy()
         engine, broker = _engine(tmp_path, strategy)
