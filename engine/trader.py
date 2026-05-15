@@ -61,7 +61,10 @@ from config.settings import SLIPPAGE_MODEL_MARKET_BPS
 from data.fetcher import StaleDataError, close_connections, fetch_symbol, require_fresh
 from engine.positions import (
     Position,
+    PositionLeg,
     make_single_leg,
+    make_spread,
+    new_spread_id,
     owner_key_for,
     view_owner_map,
 )
@@ -71,6 +74,7 @@ from execution.broker import (
     OrderResult,
     OrderStatus,
 )
+from execution.options_executor import SpreadLeg
 from indicators.technicals import add_atr
 from risk.manager import (
     AccountState,
@@ -85,7 +89,9 @@ from reporting.alerts import AlertDispatcher
 from reporting.logger import TradeLogger
 from reporting.pnl import PnLTracker
 from strategies.base import BaseStrategy, OrderType, StrategySlot
+from strategies.credit_spread import CreditSpreadRejected, OpenSpread
 from strategies.spy_options_reversion import OptionTradeRejected
+from utils.option_symbols import parse_occ_symbol
 
 from regime.detector import MarketRegime
 
@@ -260,6 +266,19 @@ class TradingEngine:
         # populates single-leg entries; spreads land with the credit-spread
         # strategy in 11.28/11.29.
         self._positions: dict[str, Position] = {}
+
+        # Credit-spread positions (11.29 PR 3b): position_id → the owning
+        # CreditSpread strategy instance. Multiple credit_spread instances
+        # share one allocator sleeve but each manages its own underlying, so
+        # the spread-fill drain and exit paths need to route a position_id
+        # back to the instance that opened it.
+        self._spread_owner_strategy: dict[str, BaseStrategy] = {}
+        # position_id → SpreadExecutionPlan for spreads pending their async
+        # combo fill — lets _drain_spread_fills finalize or roll back.
+        self._pending_spread_plans: dict[str, object] = {}
+        # position_ids with a closing combo in flight — skipped by the exit
+        # path so a stale "should exit" signal cannot double-submit a close.
+        self._spreads_pending_close: set[str] = set()
 
         # Entry fill prices: symbol → avg fill price at entry ($/share).
         # Used to compute realized P&L when a position closes, which is fed
@@ -522,6 +541,7 @@ class TradingEngine:
             self._detect_external_closes(snapshot)
             self._process_stream_stop_fills()
             self._drain_option_fills()
+            self._drain_spread_fills()
             self._repair_missing_protective_stops(snapshot)
 
             # Daily-loss / hard-dollar gates can fire on any signal; halt state
@@ -782,6 +802,20 @@ class TradingEngine:
                 f"{latest_ts.isoformat()} for live decisions"
             )
 
+        # Credit-spread exit path (11.29 PR 3b). These strategies hold
+        # multi-leg positions the engine tracks by position_id, not by the
+        # underlying symbol — so the regular position-based exit branch below
+        # never sees them. Run it here, before any entry gating, so spread
+        # exits are never blocked by halt / regime / sleeve. Entry continues
+        # below: a credit-spread strategy can open new spreads while holding
+        # others, subject to its own per-instance caps.
+        if hasattr(strategy, "evaluate_spread_exit"):
+            self._process_credit_spread_exits(
+                strategy=strategy,
+                underlying=symbol,
+                underlying_close=latest_close,
+            )
+
         # 5. Exit branch — close before considering entries (always safe to
         # reduce risk; never blocked by halt).
         emergency_exit = False
@@ -906,7 +940,7 @@ class TradingEngine:
                 signal_key, signal_bar, strategy_statuses, strategy_reasons, symbol
             )
             return
-        if position is not None:
+        if self._entry_blocked_by_existing_position(strategy, position):
             # Already in this position — the crossover bar persists across
             # intra-day cycles, so this is expected noise, not a real signal.
             # Risk would reject anyway; skip to avoid spamming alerts.
@@ -971,6 +1005,25 @@ class TradingEngine:
                 )
                 return None
             notional_cap = sleeve.max_position_notional
+
+        # Credit-spread entry path (11.29 PR 3b). A credit-spread strategy
+        # exposes build_spread_execution and is dispatched as an atomic MLEG
+        # combo — it bypasses RiskManager.evaluate (the spread's defined-risk
+        # structure, capped by the sleeve notional, IS the risk control) but
+        # all the engine-level guards above (halt, daily-loss, broker-error,
+        # regime gate, sleeve) have already been applied.
+        if hasattr(strategy, "build_spread_execution"):
+            self._enter_credit_spread(
+                strategy=strategy,
+                symbol=symbol,
+                underlying_close=latest_close,
+                notional_cap=notional_cap,
+                signal_key=signal_key,
+                signal_bar=signal_bar,
+                strategy_statuses=strategy_statuses,
+                strategy_reasons=strategy_reasons,
+            )
+            return None
 
         target_symbol = symbol
         target_price = latest_close
@@ -1938,6 +1991,423 @@ class TradingEngine:
                     self._pop_position(underlying)
                     self._entry_prices.pop(underlying, None)
 
+    # ── Credit-spread entry / drain / exit (11.29 PR 3b) ─────────────────
+
+    @staticmethod
+    def _entry_blocked_by_existing_position(
+        strategy: BaseStrategy, position
+    ) -> bool:
+        """
+        The single-leg "already in this position, skip re-entry" guard.
+
+        **Skipped for multi-leg (credit-spread) strategies.** They manage
+        concurrency via their own per-instance caps inside
+        ``build_spread_execution`` (max_concurrent_positions,
+        max_per_expiration, DTE staggering) — and ``_get_position_for()``
+        regex-matches a spread *leg* OCC to the underlying, so a held spread
+        would otherwise look like an "existing position" and silently block
+        every subsequent spread on that underlying. The cross-strategy
+        symbol-conflict check (``_get_owner``) still runs afterward, so an
+        unrelated single-leg owner of the same symbol is still blocked.
+        """
+        if hasattr(strategy, "build_spread_execution"):
+            return False
+        return position is not None
+
+    def _count_open_credit_spreads(self) -> int:
+        """
+        Count open spread positions across ALL credit_spread instances — the
+        global ``MAX_TOTAL_CONCURRENT_CREDIT_SPREADS`` counter passed into
+        ``build_spread_execution``.
+
+        NOTE (PLAN.md 11.31): the ``"credit_spread"`` literal is correct while
+        that is the only multi-leg strategy. A second one would need this
+        filter generalized to the duck-typed ``build_spread_execution`` hook.
+        """
+        return sum(
+            1 for p in self._positions.values()
+            if p.is_spread and p.strategy_name == "credit_spread"
+        )
+
+    def _credit_spreads_snapshot(self) -> list[dict]:
+        """
+        Build the ``credit_spreads`` state-snapshot field — one dict per open
+        spread, with the economics the dashboard renders. Sourced from the
+        owning strategy's ``OpenSpread`` view (kept in sync by the entry /
+        drain paths).
+        """
+        out: list[dict] = []
+        for position_id, strategy in self._spread_owner_strategy.items():
+            getter = getattr(strategy, "get_open_spread", None)
+            spread = getter(position_id) if callable(getter) else None
+            if spread is None:
+                continue
+            out.append({
+                "position_id": position_id,
+                "strategy": strategy.name,
+                "underlying": owner_key_for(spread.short_occ),
+                "short_occ": spread.short_occ,
+                "long_occ": spread.long_occ,
+                "short_strike": spread.short_strike,
+                "long_strike": spread.long_strike,
+                "width": spread.width,
+                "expiration": str(spread.expiration_date),
+                "net_credit": spread.net_credit,
+                "qty": spread.qty,
+                "pending_close": position_id in self._spreads_pending_close,
+            })
+        return out
+
+    def _spread_positions_for(
+        self, underlying: str, strategy_name: str
+    ) -> list[Position]:
+        """Open spread Positions on ``underlying`` owned by ``strategy_name``.
+
+        The short leg's OCC string carries the underlying ticker, so a
+        spread belongs to ``underlying`` when ``owner_key_for(short_leg)``
+        matches it."""
+        out: list[Position] = []
+        for pos in self._positions.values():
+            if not pos.is_spread or pos.strategy_name != strategy_name:
+                continue
+            primary = pos.primary_leg
+            if primary is not None and owner_key_for(primary.symbol) == underlying:
+                out.append(pos)
+        return out
+
+    def _enter_credit_spread(
+        self,
+        *,
+        strategy: BaseStrategy,
+        symbol: str,
+        underlying_close: float,
+        notional_cap: float | None,
+        signal_key: tuple,
+        signal_bar: "pd.Timestamp",
+        strategy_statuses: dict[str, str] | None,
+        strategy_reasons: dict[str, list[str]] | None,
+    ) -> None:
+        """
+        Credit-spread entry: build the spread plan, dispatch the async MLEG
+        combo, and pre-register the spread Position. The combo fill confirms
+        asynchronously via ``_drain_spread_fills`` (or rolls the
+        pre-registration back on cancel/reject).
+        """
+        def _done(status: str) -> None:
+            if strategy_statuses is not None:
+                strategy_statuses[symbol] = status
+            if strategy_reasons is not None:
+                strategy_reasons[symbol] = []
+            self._mark_signal_bar_processed(
+                signal_key, signal_bar, strategy_statuses, strategy_reasons, symbol
+            )
+
+        if notional_cap is None or notional_cap <= 0:
+            logger.info(
+                f"[{strategy.name}] {symbol}: credit spread skipped — "
+                f"no sleeve notional available"
+            )
+            _done("No Signal")
+            return
+
+        total_open = self._count_open_credit_spreads()
+        try:
+            plan = strategy.build_spread_execution(
+                underlying_close,
+                notional_cap=notional_cap,
+                total_open_credit_spreads=total_open,
+            )
+        except CreditSpreadRejected as e:
+            logger.info(f"[{strategy.name}] {symbol}: credit spread rejected — {e}")
+            _done("No Signal")
+            return
+        except Exception as e:
+            logger.error(
+                f"[{strategy.name}] {symbol}: build_spread_execution failed: {e}"
+            )
+            _done("No Signal")
+            return
+
+        position_id = new_spread_id()
+        try:
+            result = self.broker.dispatch_spread_order(
+                legs=plan.legs,
+                qty=plan.qty,
+                limit_price=plan.limit_price,
+                strategy_name=strategy.name,
+                position_id=position_id,
+            )
+        except Exception as e:
+            logger.error(f"[{strategy.name}] {symbol}: dispatch_spread_order raised: {e}")
+            self.risk.record_broker_error()
+            self.alerts.broker_error(f"{symbol} dispatch_spread_order: {e}")
+            _done("No Signal")
+            return
+
+        if result.status is not OrderStatus.ACCEPTED:
+            logger.warning(
+                f"[{strategy.name}] {symbol}: spread dispatch returned "
+                f"{result.status.value} — not pre-registering"
+            )
+            _done("No Signal")
+            return
+
+        # Pre-register the spread Position + the strategy's open-spread view.
+        # The combo fill confirms via _drain_spread_fills (or rolls back).
+        legs = [
+            PositionLeg(symbol=plan.short_occ, qty=-float(plan.qty), side="SELL"),
+            PositionLeg(symbol=plan.long_occ, qty=float(plan.qty), side="BUY"),
+        ]
+        self._positions[position_id] = make_spread(
+            strategy_name=strategy.name,
+            position_id=position_id,
+            legs=legs,
+        )
+        self._spread_owner_strategy[position_id] = strategy
+        self._pending_spread_plans[position_id] = plan
+        strategy.register_spread(OpenSpread(
+            position_id=position_id,
+            short_occ=plan.short_occ,
+            long_occ=plan.long_occ,
+            short_strike=plan.short_strike,
+            long_strike=plan.long_strike,
+            expiration_date=plan.expiration_date,
+            net_credit=plan.net_credit,
+            width=plan.width,
+            qty=plan.qty,
+        ))
+        logger.info(
+            f"[{strategy.name}] {symbol}: credit spread dispatched "
+            f"{plan.short_occ}/{plan.long_occ} width=${plan.width:.0f} "
+            f"net_credit=${plan.net_credit:.2f}/sh max_loss=${plan.max_loss:,.0f} "
+            f"position_id={position_id[:8]} — pre-registered"
+        )
+        _done("Pending Entry")
+
+    def _drain_spread_fills(self) -> None:
+        """
+        Process async MLEG combo fill events from ``SpreadExecutionWorker``
+        threads.
+
+          * open  + FILLED   → finalize the pre-registered spread Position
+                               (log to the trade DB, fire the alert).
+          * open  + CANCELED → roll the pre-registration back.
+          * close + FILLED   → drop the Position, release it on the strategy,
+                               log the close to the trade DB.
+          * close + CANCELED → leave the Position open; clear the pending-close
+                               flag so the exit path re-evaluates next cycle.
+        """
+        for (
+            position_id, strategy_name, closing, status,
+            filled_qty, avg_fill_price, order_id,
+        ) in self.broker.drain_spread_fills():
+            strategy = self._spread_owner_strategy.get(position_id)
+            filled = status in ("filled", "partially_filled")
+
+            if not closing:
+                # ── Spread OPEN ──────────────────────────────────────────
+                plan = self._pending_spread_plans.pop(position_id, None)
+                if filled:
+                    net_credit = (
+                        abs(avg_fill_price)
+                        if avg_fill_price is not None
+                        else (plan.net_credit if plan is not None else 0.0)
+                    )
+                    logger.info(
+                        f"[{strategy_name}] credit spread OPENED — "
+                        f"position_id={position_id[:8]} qty={filled_qty} "
+                        f"net_credit=${net_credit:.2f}/sh order={order_id}"
+                    )
+                    if plan is not None:
+                        self.trade_logger.log_spread_fill(
+                            position_id=position_id,
+                            strategy=strategy_name,
+                            short_occ=plan.short_occ,
+                            long_occ=plan.long_occ,
+                            qty=float(filled_qty or plan.qty),
+                            net_price=net_credit,
+                            order_id=order_id,
+                            opening=True,
+                        )
+                        self.alerts.trade_executed(
+                            symbol=plan.short_occ,
+                            strategy=strategy_name,
+                            side="sell",
+                            qty=float(filled_qty or plan.qty),
+                            price=net_credit,
+                            reason=f"{strategy_name} spread entry",
+                        )
+                else:
+                    logger.info(
+                        f"[{strategy_name}] credit spread open {status} — "
+                        f"position_id={position_id[:8]} rolling back pre-registration"
+                    )
+                    self._pop_position(position_id)
+                    self._spread_owner_strategy.pop(position_id, None)
+                    if strategy is not None:
+                        strategy.release_spread(position_id)
+                continue
+
+            # ── Spread CLOSE ─────────────────────────────────────────────
+            self._spreads_pending_close.discard(position_id)
+            if filled:
+                released = (
+                    strategy.release_spread(position_id)
+                    if strategy is not None else None
+                )
+                self._pop_position(position_id)
+                self._spread_owner_strategy.pop(position_id, None)
+                short_occ = released.short_occ if released is not None else position_id
+                long_occ = released.long_occ if released is not None else ""
+                close_qty = float(
+                    filled_qty or (released.qty if released is not None else 1)
+                )
+
+                # The spread IS closed regardless — but only record P&L when
+                # we have a real fill price. A stream "filled" event whose
+                # REST follow-up failed reaches here with avg_fill_price=None;
+                # treating that as a $0 debit would fabricate a full-credit
+                # winner and inflate the allocator's HWM / drawdown gate. In
+                # that case leave realized P&L unset (not zero) and warn.
+                realized_pnl: float | None = None
+                exit_reason = "spread exit"
+                if avg_fill_price is None:
+                    net_debit = 0.0
+                    exit_reason = "spread exit (fill price unavailable)"
+                    logger.warning(
+                        f"[{strategy_name}] credit spread CLOSED but the combo "
+                        f"fill price was unavailable — position_id="
+                        f"{position_id[:8]} order={order_id}; realized P&L not "
+                        "recorded (position still released)"
+                    )
+                else:
+                    net_debit = abs(avg_fill_price)
+                    if released is not None:
+                        # Realized P&L = (credit collected − debit paid) × qty
+                        # × 100. Feed the allocator HWM / sleeve-drawdown gate
+                        # and persist it on the close row so it survives a
+                        # restart via read_strategy_realized_pnl_summary.
+                        realized_pnl = (
+                            (released.net_credit - net_debit) * close_qty * 100.0
+                        )
+                        if self._allocator is not None:
+                            self._allocator.record_realized_pnl(
+                                strategy_name, realized_pnl
+                            )
+                    logger.info(
+                        f"[{strategy_name}] credit spread CLOSED — "
+                        f"position_id={position_id[:8]} "
+                        f"net_debit=${net_debit:.2f}/sh realized_pnl="
+                        f"{'n/a' if realized_pnl is None else f'${realized_pnl:+,.2f}'} "
+                        f"order={order_id}"
+                    )
+                self.trade_logger.log_spread_fill(
+                    position_id=position_id,
+                    strategy=strategy_name,
+                    short_occ=short_occ,
+                    long_occ=long_occ,
+                    qty=close_qty,
+                    net_price=net_debit,
+                    order_id=order_id,
+                    opening=False,
+                    realized_pnl=realized_pnl,
+                    reason=exit_reason,
+                )
+                self.alerts.trade_executed(
+                    symbol=short_occ,
+                    strategy=strategy_name,
+                    side="buy",
+                    qty=close_qty,
+                    price=net_debit,
+                    reason=f"{strategy_name} {exit_reason}",
+                )
+            else:
+                # Close did not fill — the position stays open. Clearing the
+                # pending-close flag (above) lets the exit path retry next cycle.
+                logger.warning(
+                    f"[{strategy_name}] credit spread close {status} — "
+                    f"position_id={position_id[:8]} still open, will retry"
+                )
+
+    def _process_credit_spread_exits(
+        self,
+        *,
+        strategy: BaseStrategy,
+        underlying: str,
+        underlying_close: float,
+    ) -> None:
+        """
+        Evaluate exit triggers for every open spread this strategy holds and
+        dispatch a closing MLEG combo for any that fire. A position with a
+        close already in flight (``_spreads_pending_close``) is skipped so a
+        stale signal cannot double-submit.
+        """
+        open_spreads = getattr(strategy, "open_spreads", [])
+        if not open_spreads:
+            return
+        today = self._clock().date()
+        for open_spread in list(open_spreads):
+            position_id = open_spread.position_id
+            if position_id in self._spreads_pending_close:
+                continue
+            try:
+                should_exit, reason, spread_mid = strategy.evaluate_spread_exit(
+                    open_spread,
+                    underlying_close=underlying_close,
+                    today=today,
+                )
+            except Exception as e:
+                logger.error(
+                    f"[{strategy.name}] {underlying}: evaluate_spread_exit failed "
+                    f"for {position_id[:8]}: {e}"
+                )
+                continue
+            if not should_exit:
+                continue
+
+            # Close the spread: pass the original opening legs — the broker's
+            # dispatch_spread_order(closing=True) reverses them into the
+            # *_TO_CLOSE trade. limit_price is a positive net debit; use the
+            # current spread mid, falling back to the width (a marketable,
+            # generous debit) when the mid is unavailable.
+            debit = (
+                round(spread_mid, 2)
+                if spread_mid is not None and spread_mid > 0
+                else round(open_spread.width, 2)
+            )
+            legs = [
+                SpreadLeg(occ_symbol=open_spread.short_occ, side=Side.SELL, opening=True),
+                SpreadLeg(occ_symbol=open_spread.long_occ, side=Side.BUY, opening=True),
+            ]
+            logger.info(
+                f"[{strategy.name}] {underlying}: closing spread "
+                f"{open_spread.short_occ}/{open_spread.long_occ} "
+                f"position_id={position_id[:8]} — {reason} (debit ${debit:.2f})"
+            )
+            try:
+                result = self.broker.dispatch_spread_order(
+                    legs=legs,
+                    qty=open_spread.qty,
+                    limit_price=debit,
+                    strategy_name=strategy.name,
+                    position_id=position_id,
+                    closing=True,
+                )
+            except Exception as e:
+                logger.error(
+                    f"[{strategy.name}] {underlying}: spread close dispatch raised: {e}"
+                )
+                self.risk.record_broker_error()
+                self.alerts.broker_error(f"{underlying} spread close: {e}")
+                continue
+            if result.status is OrderStatus.ACCEPTED:
+                self._spreads_pending_close.add(position_id)
+            else:
+                logger.warning(
+                    f"[{strategy.name}] {underlying}: spread close dispatch returned "
+                    f"{result.status.value} for {position_id[:8]}"
+                )
+
     def _restore_ownership_from_db(self, snapshot: BrokerSnapshot) -> set[str]:
         """
         Restore ``_positions`` from the trade DB (10.C1).
@@ -1961,7 +2431,19 @@ class TradingEngine:
         known_strategy_names = {slot.strategy.name for slot in self.slots}
         conflicts: set[str] = set()
 
+        # Multi-leg credit spreads first: reconstruct the full two-leg
+        # Position (and the owning strategy's OpenSpread view) from the trade
+        # DB, and collect the leg OCC symbols so the single-leg loop below
+        # skips them. Without this, a spread leg would fall through to the
+        # best-effort slot match and get mis-assigned as a standalone
+        # position — for SPY, potentially to the spy_options_reversion slot,
+        # which could then close one leg and leave a naked short put.
+        spread_leg_occs = self._restore_spread_positions(snapshot, conflicts)
+
         for sym in snapshot.account.open_positions:
+            if sym in spread_leg_occs:
+                continue  # leg of a reconstructed spread — already handled
+
             # For OCC option symbols, ownership is stored under the underlying.
             owner_key = owner_key_for(sym)
             is_option = owner_key != sym
@@ -2016,6 +2498,118 @@ class TradingEngine:
                     )
 
         return conflicts
+
+    def _credit_spread_strategy_for(self, underlying: str) -> BaseStrategy | None:
+        """The configured CreditSpread instance trading ``underlying``, if any.
+
+        NOTE (PLAN.md 11.31): the ``"credit_spread"`` name check is correct
+        while that is the only multi-leg strategy. A second one would need
+        this generalized so its restarted spreads also reconstruct.
+        """
+        for slot in self.slots:
+            strategy = slot.strategy
+            if (
+                strategy.name == "credit_spread"
+                and hasattr(strategy, "build_spread_execution")
+                and underlying in slot.active_symbols()
+            ):
+                return strategy
+        return None
+
+    def _restore_spread_positions(
+        self, snapshot: BrokerSnapshot, conflicts: set[str]
+    ) -> set[str]:
+        """
+        Rebuild open multi-leg credit-spread Positions from the trade DB
+        (11.29 PR 3b).
+
+        For each open spread in the trade log:
+          - both leg OCCs must be present in the broker snapshot, and a
+            CreditSpread instance must be configured for the underlying —
+            otherwise the spread cannot be safely managed and its underlying
+            is added to ``conflicts`` (→ RESTRICTED startup mode);
+          - on success the two-leg ``Position``, ``_spread_owner_strategy``
+            entry, and the strategy's ``OpenSpread`` view are all rebuilt.
+
+        Returns the set of leg OCC symbols belonging to reconstructed spreads
+        so the single-leg restore loop skips them.
+        """
+        spread_leg_occs: set[str] = set()
+        for record in self.trade_logger.read_open_spread_positions():
+            position_id = record["position_id"]
+            leg_symbols = record["leg_symbols"]
+            strategy_name = record["strategy"]
+
+            # Parse both legs; a bull put spread's short leg is the higher strike.
+            try:
+                parsed = sorted(
+                    ((occ, parse_occ_symbol(occ)) for occ in leg_symbols),
+                    key=lambda pair: pair[1].strike,
+                )
+            except ValueError as e:
+                logger.warning(
+                    f"restart: spread {position_id[:8]} has an unparseable leg "
+                    f"({leg_symbols}) — {e}; left unmanaged"
+                )
+                continue
+            long_occ, long_leg = parsed[0]
+            short_occ, short_leg = parsed[1]
+            underlying = short_leg.root
+
+            # Both legs must still be open at the broker.
+            broker_positions = snapshot.account.open_positions
+            missing = [occ for occ in leg_symbols if occ not in broker_positions]
+            if missing:
+                logger.warning(
+                    f"restart: spread {position_id[:8]} ({underlying}) is open in "
+                    f"the trade DB but leg(s) {missing} are absent from the broker "
+                    "— declaring a conflict (RESTRICTED)"
+                )
+                conflicts.add(underlying)
+                spread_leg_occs.update(leg_symbols)
+                continue
+
+            strategy = self._credit_spread_strategy_for(underlying)
+            if strategy is None:
+                logger.warning(
+                    f"restart: spread {position_id[:8]} ({underlying}) has no "
+                    f"configured credit_spread strategy — declaring a conflict "
+                    "(RESTRICTED). Close it manually or restore the slot."
+                )
+                conflicts.add(underlying)
+                spread_leg_occs.update(leg_symbols)
+                continue
+
+            qty = int(record.get("qty") or 1)
+            net_credit = float(record.get("net_credit") or 0.0)
+            width = short_leg.strike - long_leg.strike
+            self._positions[position_id] = make_spread(
+                strategy_name=strategy_name,
+                position_id=position_id,
+                legs=[
+                    PositionLeg(symbol=short_occ, qty=-float(qty), side="SELL"),
+                    PositionLeg(symbol=long_occ, qty=float(qty), side="BUY"),
+                ],
+            )
+            self._spread_owner_strategy[position_id] = strategy
+            strategy.register_spread(OpenSpread(
+                position_id=position_id,
+                short_occ=short_occ,
+                long_occ=long_occ,
+                short_strike=short_leg.strike,
+                long_strike=long_leg.strike,
+                expiration_date=short_leg.expiration,
+                net_credit=net_credit,
+                width=width,
+                qty=qty,
+            ))
+            spread_leg_occs.update(leg_symbols)
+            logger.info(
+                f"restart: reconstructed spread {position_id[:8]} ({underlying}) "
+                f"{short_occ}/{long_occ} width=${width:.0f} "
+                f"net_credit=${net_credit:.2f}/sh → '{strategy_name}'"
+            )
+        return spread_leg_occs
 
     def _restore_runtime_state_from_db(self, snapshot: BrokerSnapshot) -> None:
         """Restore allocator P&L/HWM state and open-position entry prices from the trade log."""
@@ -2243,6 +2837,7 @@ class TradingEngine:
                 "session_pnl": equity - start_equity,
                 "open_positions": self._owners_view(),
                 "positions_detail": positions_detail,
+                "credit_spreads": self._credit_spreads_snapshot(),
                 "allocator": allocator_snapshot["strategies"],
                 "capital_pools": allocator_snapshot["pools"],
                 "pending_entry_notional": pending_entry_notional,

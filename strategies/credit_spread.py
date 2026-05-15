@@ -247,6 +247,10 @@ class CreditSpread(BaseStrategy):
         """The spreads this instance currently holds open."""
         return list(self._open_spreads.values())
 
+    def get_open_spread(self, position_id: str) -> OpenSpread | None:
+        """The open spread for ``position_id``, or None if not held."""
+        return self._open_spreads.get(position_id)
+
     # ── Entry caps ───────────────────────────────────────────────────────
 
     def _caps_reject_reason(
@@ -460,3 +464,49 @@ class CreditSpread(BaseStrategy):
             )
 
         return False, ""
+
+    def evaluate_spread_exit(
+        self,
+        spread: OpenSpread,
+        *,
+        underlying_close: float,
+        today: date | None = None,
+    ) -> tuple[bool, str, float | None]:
+        """
+        Engine-facing exit check (PR 3b). Quotes the spread's two legs via the
+        configured ``quote_lookup``, computes the current spread mid, and runs
+        ``should_exit_spread``.
+
+        Returns ``(should_exit, reason, spread_mid)``. ``spread_mid`` is the
+        current cost to close the spread ($/share, short mid − long mid); it
+        is ``None`` — and ``should_exit`` is ``False`` — when either leg
+        cannot be quoted. **Never exit on missing market data.**
+        """
+        if today is None:
+            today = date.today()
+        if self._quote_lookup is None:
+            return False, "", None
+        try:
+            quotes = self._quote_lookup([spread.short_occ, spread.long_occ])
+        except Exception as e:
+            logger.warning(
+                f"[{self.name}] {self.symbol}: spread-exit quote lookup failed "
+                f"for {spread.position_id[:8]}: {e}"
+            )
+            return False, "", None
+        short_q = quotes.get(spread.short_occ)
+        long_q = quotes.get(spread.long_occ)
+        if short_q is None or long_q is None:
+            logger.warning(
+                f"[{self.name}] {self.symbol}: missing quote for spread leg "
+                f"({spread.short_occ}/{spread.long_occ}) — holding"
+            )
+            return False, "", None
+        spread_mid = short_q.mid - long_q.mid
+        should_exit, reason = self.should_exit_spread(
+            spread,
+            spread_mid=spread_mid,
+            underlying_close=underlying_close,
+            today=today,
+        )
+        return should_exit, reason, spread_mid

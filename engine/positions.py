@@ -222,6 +222,31 @@ def new_spread_id() -> str:
     return uuid.uuid4().hex
 
 
+def make_spread(
+    *,
+    strategy_name: str,
+    position_id: str,
+    legs: list[PositionLeg],
+) -> Position:
+    """
+    Construct a multi-leg (spread) Position.
+
+    Unlike ``make_single_leg``, the ``position_id`` is caller-supplied — it
+    is a UUID (see ``new_spread_id``), not derived from a symbol, because a
+    spread spans multiple OCC contracts and has no single owner_key.
+    """
+    if len(legs) < 2:
+        raise ValueError(
+            f"make_spread requires at least 2 legs, got {len(legs)}"
+        )
+    return Position(
+        position_id=position_id,
+        position_type=SPREAD,
+        strategy_name=strategy_name,
+        legs=list(legs),
+    )
+
+
 def view_owner_map(positions: Iterable[Position]) -> dict[str, str]:
     """
     Build the legacy ``dict[owner_key, strategy_name]`` view from Position

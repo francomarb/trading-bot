@@ -865,6 +865,10 @@ def render_dashboard() -> None:
         else:
             pos_data = []
             for sym, strat in open_positions.items():
+                # Credit spreads are keyed by UUID, not a tradable symbol —
+                # they render in their own "Open Credit Spreads" section.
+                if strat == "credit_spread":
+                    continue
                 detail = positions_detail.get(sym, {})
                 entry = detail.get("avg_entry_price")
                 upnl = detail.get("unrealized_pnl")
@@ -886,22 +890,26 @@ def render_dashboard() -> None:
                         if unrealized_pct is not None else None
                     ),
                 })
-            st.dataframe(
-                pd.DataFrame(pos_data),
-                width="stretch",
-                hide_index=True,
-                column_config={
-                    "Symbol": st.column_config.LinkColumn(
-                        "Symbol",
-                        display_text=r"https://finance\.yahoo\.com/quote/([^/]+)/",
-                    ),
-                    "Qty": st.column_config.NumberColumn(format="%.2f"),
-                    "Entry": st.column_config.NumberColumn(format="$%.2f"),
-                    "Cost Basis": st.column_config.NumberColumn(format="$%.2f"),
-                    "Unrealized P&L": st.column_config.NumberColumn(format="$%.2f"),
-                    "Unrealized %": st.column_config.NumberColumn(format="%.2f%%"),
-                },
-            )
+            if not pos_data:
+                # Every open position is a credit spread — shown below.
+                st.info("No equity / single-leg positions open.")
+            else:
+                st.dataframe(
+                    pd.DataFrame(pos_data),
+                    width="stretch",
+                    hide_index=True,
+                    column_config={
+                        "Symbol": st.column_config.LinkColumn(
+                            "Symbol",
+                            display_text=r"https://finance\.yahoo\.com/quote/([^/]+)/",
+                        ),
+                        "Qty": st.column_config.NumberColumn(format="%.2f"),
+                        "Entry": st.column_config.NumberColumn(format="$%.2f"),
+                        "Cost Basis": st.column_config.NumberColumn(format="$%.2f"),
+                        "Unrealized P&L": st.column_config.NumberColumn(format="$%.2f"),
+                        "Unrealized %": st.column_config.NumberColumn(format="%.2f%%"),
+                    },
+                )
 
     with sleeve_col:
         render_section_header(
@@ -986,6 +994,50 @@ def render_dashboard() -> None:
             )
 
     st.divider()
+
+    # ── Open Credit Spreads (11.29) ─────────────────────────────────────
+    # Multi-leg positions are keyed by position_id, not a tradable symbol,
+    # so they get their own table sourced from the engine's `credit_spreads`
+    # snapshot field rather than the equity Open Positions table above.
+    credit_spreads = state.get("credit_spreads") or []
+    if credit_spreads:
+        render_section_header(
+            "Open Credit Spreads",
+            "Bull put credit spreads currently open, from the latest engine snapshot.",
+            kicker="Options",
+        )
+        spread_rows = []
+        for sp in credit_spreads:
+            net_credit = sp.get("net_credit") or 0.0
+            width = sp.get("width") or 0.0
+            qty = sp.get("qty") or 1
+            max_loss = max(0.0, (width - net_credit) * 100.0 * qty)
+            spread_rows.append({
+                "Underlying": sp.get("underlying", ""),
+                "Strikes": f"{sp.get('short_strike', 0):.0f} / {sp.get('long_strike', 0):.0f}",
+                "Expiration": sp.get("expiration", ""),
+                "Width": width,
+                "Qty": qty,
+                "Net Credit": net_credit * 100.0 * qty,
+                "Max Loss": max_loss,
+                "Status": "Closing" if sp.get("pending_close") else "Open",
+            })
+        st.dataframe(
+            pd.DataFrame(spread_rows),
+            width="stretch",
+            hide_index=True,
+            column_config={
+                "Width": st.column_config.NumberColumn(format="$%.0f"),
+                "Qty": st.column_config.NumberColumn(format="%d"),
+                "Net Credit": st.column_config.NumberColumn(
+                    format="$%.2f", help="Total credit collected at open."
+                ),
+                "Max Loss": st.column_config.NumberColumn(
+                    format="$%.2f", help="Defined-risk max loss = (width − credit) × 100 × qty."
+                ),
+            },
+        )
+        st.divider()
 
     # ── Open Position Sector Exposure (11.7 Part B) ─────────────────────
     # Live observability — open positions per resolved GICS sector with
