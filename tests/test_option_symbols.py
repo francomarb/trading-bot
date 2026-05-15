@@ -5,7 +5,11 @@ engine and the trade logger (no engine deps).
 
 from __future__ import annotations
 
-from utils.option_symbols import is_occ_option, owner_key_for
+from datetime import date
+
+import pytest
+
+from utils.option_symbols import is_occ_option, owner_key_for, parse_occ_symbol
 
 
 class TestOwnerKeyFor:
@@ -37,3 +41,37 @@ class TestIsOccOption:
 
     def test_malformed_is_not_option(self) -> None:
         assert is_occ_option("SPY260516X00520000") is False
+
+
+class TestParseOccSymbol:
+    def test_parses_put(self) -> None:
+        c = parse_occ_symbol("SPY260618P00689000")
+        assert c.root == "SPY"
+        assert c.expiration == date(2026, 6, 18)
+        assert c.option_type == "P"
+        assert c.strike == pytest.approx(689.0)
+
+    def test_parses_call(self) -> None:
+        c = parse_occ_symbol("QQQ260516C00520000")
+        assert c.root == "QQQ"
+        assert c.expiration == date(2026, 5, 16)
+        assert c.option_type == "C"
+        assert c.strike == pytest.approx(520.0)
+
+    def test_parses_fractional_strike(self) -> None:
+        # Strike 558.5 → 00558500.
+        c = parse_occ_symbol("SPY260618P00558500")
+        assert c.strike == pytest.approx(558.5)
+
+    def test_short_root_ticker(self) -> None:
+        c = parse_occ_symbol("F260516C00012000")
+        assert c.root == "F"
+        assert c.strike == pytest.approx(12.0)
+
+    def test_equity_ticker_raises(self) -> None:
+        with pytest.raises(ValueError, match="not a valid OCC option symbol"):
+            parse_occ_symbol("AAPL")
+
+    def test_malformed_raises(self) -> None:
+        with pytest.raises(ValueError, match="not a valid OCC option symbol"):
+            parse_occ_symbol("SPY260618X00689000")

@@ -91,6 +91,7 @@ from reporting.pnl import PnLTracker
 from strategies.base import BaseStrategy, OrderType, StrategySlot
 from strategies.credit_spread import CreditSpreadRejected, OpenSpread
 from strategies.spy_options_reversion import OptionTradeRejected
+from utils.option_symbols import parse_occ_symbol
 
 from regime.detector import MarketRegime
 
@@ -2372,7 +2373,19 @@ class TradingEngine:
         known_strategy_names = {slot.strategy.name for slot in self.slots}
         conflicts: set[str] = set()
 
+        # Multi-leg credit spreads first: reconstruct the full two-leg
+        # Position (and the owning strategy's OpenSpread view) from the trade
+        # DB, and collect the leg OCC symbols so the single-leg loop below
+        # skips them. Without this, a spread leg would fall through to the
+        # best-effort slot match and get mis-assigned as a standalone
+        # position — for SPY, potentially to the spy_options_reversion slot,
+        # which could then close one leg and leave a naked short put.
+        spread_leg_occs = self._restore_spread_positions(snapshot, conflicts)
+
         for sym in snapshot.account.open_positions:
+            if sym in spread_leg_occs:
+                continue  # leg of a reconstructed spread — already handled
+
             # For OCC option symbols, ownership is stored under the underlying.
             owner_key = owner_key_for(sym)
             is_option = owner_key != sym
@@ -2427,6 +2440,113 @@ class TradingEngine:
                     )
 
         return conflicts
+
+    def _credit_spread_strategy_for(self, underlying: str) -> BaseStrategy | None:
+        """The configured CreditSpread instance trading ``underlying``, if any."""
+        for slot in self.slots:
+            strategy = slot.strategy
+            if (
+                strategy.name == "credit_spread"
+                and hasattr(strategy, "build_spread_execution")
+                and underlying in slot.active_symbols()
+            ):
+                return strategy
+        return None
+
+    def _restore_spread_positions(
+        self, snapshot: BrokerSnapshot, conflicts: set[str]
+    ) -> set[str]:
+        """
+        Rebuild open multi-leg credit-spread Positions from the trade DB
+        (11.29 PR 3b).
+
+        For each open spread in the trade log:
+          - both leg OCCs must be present in the broker snapshot, and a
+            CreditSpread instance must be configured for the underlying —
+            otherwise the spread cannot be safely managed and its underlying
+            is added to ``conflicts`` (→ RESTRICTED startup mode);
+          - on success the two-leg ``Position``, ``_spread_owner_strategy``
+            entry, and the strategy's ``OpenSpread`` view are all rebuilt.
+
+        Returns the set of leg OCC symbols belonging to reconstructed spreads
+        so the single-leg restore loop skips them.
+        """
+        spread_leg_occs: set[str] = set()
+        for record in self.trade_logger.read_open_spread_positions():
+            position_id = record["position_id"]
+            leg_symbols = record["leg_symbols"]
+            strategy_name = record["strategy"]
+
+            # Parse both legs; a bull put spread's short leg is the higher strike.
+            try:
+                parsed = sorted(
+                    ((occ, parse_occ_symbol(occ)) for occ in leg_symbols),
+                    key=lambda pair: pair[1].strike,
+                )
+            except ValueError as e:
+                logger.warning(
+                    f"restart: spread {position_id[:8]} has an unparseable leg "
+                    f"({leg_symbols}) — {e}; left unmanaged"
+                )
+                continue
+            long_occ, long_leg = parsed[0]
+            short_occ, short_leg = parsed[1]
+            underlying = short_leg.root
+
+            # Both legs must still be open at the broker.
+            broker_positions = snapshot.account.open_positions
+            missing = [occ for occ in leg_symbols if occ not in broker_positions]
+            if missing:
+                logger.warning(
+                    f"restart: spread {position_id[:8]} ({underlying}) is open in "
+                    f"the trade DB but leg(s) {missing} are absent from the broker "
+                    "— declaring a conflict (RESTRICTED)"
+                )
+                conflicts.add(underlying)
+                spread_leg_occs.update(leg_symbols)
+                continue
+
+            strategy = self._credit_spread_strategy_for(underlying)
+            if strategy is None:
+                logger.warning(
+                    f"restart: spread {position_id[:8]} ({underlying}) has no "
+                    f"configured credit_spread strategy — declaring a conflict "
+                    "(RESTRICTED). Close it manually or restore the slot."
+                )
+                conflicts.add(underlying)
+                spread_leg_occs.update(leg_symbols)
+                continue
+
+            qty = int(record.get("qty") or 1)
+            net_credit = float(record.get("net_credit") or 0.0)
+            width = short_leg.strike - long_leg.strike
+            self._positions[position_id] = make_spread(
+                strategy_name=strategy_name,
+                position_id=position_id,
+                legs=[
+                    PositionLeg(symbol=short_occ, qty=-float(qty), side="SELL"),
+                    PositionLeg(symbol=long_occ, qty=float(qty), side="BUY"),
+                ],
+            )
+            self._spread_owner_strategy[position_id] = strategy
+            strategy.register_spread(OpenSpread(
+                position_id=position_id,
+                short_occ=short_occ,
+                long_occ=long_occ,
+                short_strike=short_leg.strike,
+                long_strike=long_leg.strike,
+                expiration_date=short_leg.expiration,
+                net_credit=net_credit,
+                width=width,
+                qty=qty,
+            ))
+            spread_leg_occs.update(leg_symbols)
+            logger.info(
+                f"restart: reconstructed spread {position_id[:8]} ({underlying}) "
+                f"{short_occ}/{long_occ} width=${width:.0f} "
+                f"net_credit=${net_credit:.2f}/sh → '{strategy_name}'"
+            )
+        return spread_leg_occs
 
     def _restore_runtime_state_from_db(self, snapshot: BrokerSnapshot) -> None:
         """Restore allocator P&L/HWM state and open-position entry prices from the trade log."""

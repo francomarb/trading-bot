@@ -237,12 +237,14 @@ class TestDrainSpreadFills:
         assert "p1" in engine._positions
         assert "p1" not in engine._pending_spread_plans
         assert len(strategy.open_spreads) == 1
-        # Logged to the trade DB as a spread entry.
+        # Logged to the trade DB as a spread entry — one row per leg, both
+        # keyed by the same position_id (needed for restart reconstruction).
         rows = engine.trade_logger.read_all()
-        assert len(rows) == 1
-        assert rows[0]["position_type"] == "spread"
-        assert rows[0]["position_id"] == "p1"
-        assert rows[0]["side"] == "sell"
+        assert len(rows) == 2
+        assert all(r["position_type"] == "spread" for r in rows)
+        assert all(r["position_id"] == "p1" for r in rows)
+        # Short leg sold to open, long leg bought to open.
+        assert {r["side"] for r in rows} == {"sell", "buy"}
 
     def test_open_canceled_rolls_back(self, tmp_path):
         strategy = _strategy()
@@ -269,9 +271,13 @@ class TestDrainSpreadFills:
         assert "p1" not in engine._spread_owner_strategy
         assert "p1" not in engine._spreads_pending_close
         assert strategy.open_spreads == []
+        # The close writes one row per leg, both position_type='spread'.
         rows = engine.trade_logger.read_all()
-        assert rows[-1]["side"] == "buy"  # closing the spread is a buy-back
-        assert rows[-1]["position_type"] == "spread"
+        close_rows = [r for r in rows if r["reason"] == "spread exit"]
+        assert len(close_rows) == 2
+        assert all(r["position_type"] == "spread" for r in close_rows)
+        # Short leg bought back to close, long leg sold.
+        assert {r["side"] for r in close_rows} == {"buy", "sell"}
 
     def test_close_canceled_keeps_position_for_retry(self, tmp_path):
         strategy = _strategy()
@@ -412,3 +418,115 @@ class TestCreditSpreadsSnapshot:
         strategy = _strategy()
         engine, _ = _engine(tmp_path, strategy)
         assert engine._credit_spreads_snapshot() == []
+
+
+# ── Startup reconciliation — spread reconstruction ──────────────────────────
+
+
+_SHORT_OCC = "SPY260618P00689000"   # strike 689 — the short (sold) leg
+_LONG_OCC = "SPY260618P00674000"    # strike 674 — the long (bought) leg
+
+
+def _snapshot_with(open_positions: dict):
+    return SimpleNamespace(
+        account=SimpleNamespace(open_positions=open_positions, equity=100_000.0),
+        open_orders=[],
+    )
+
+
+class TestRestoreSpreadPositions:
+    def _log_open_spread(self, engine, position_id="uuid-1", qty=1, net=2.54):
+        engine.trade_logger.log_spread_fill(
+            position_id=position_id, strategy="credit_spread",
+            short_occ=_SHORT_OCC, long_occ=_LONG_OCC,
+            qty=qty, net_price=net, opening=True,
+        )
+
+    def test_reconstructs_full_spread_from_db_and_broker_legs(self, tmp_path):
+        strategy = _strategy()
+        engine, _ = _engine(tmp_path, strategy)
+        self._log_open_spread(engine, "uuid-1", qty=2, net=2.54)
+        snapshot = _snapshot_with({_SHORT_OCC: object(), _LONG_OCC: object()})
+
+        conflicts: set[str] = set()
+        leg_occs = engine._restore_spread_positions(snapshot, conflicts)
+
+        assert conflicts == set()
+        assert leg_occs == {_SHORT_OCC, _LONG_OCC}
+        # Two-leg Position rebuilt, keyed by the UUID.
+        assert "uuid-1" in engine._positions
+        pos = engine._positions["uuid-1"]
+        assert pos.is_spread and pos.strategy_name == "credit_spread"
+        assert {leg.symbol for leg in pos.legs} == {_SHORT_OCC, _LONG_OCC}
+        # Owner-strategy map + the strategy's OpenSpread view rebuilt.
+        assert engine._spread_owner_strategy["uuid-1"] is strategy
+        spread = strategy.get_open_spread("uuid-1")
+        assert spread is not None
+        assert spread.short_strike == pytest.approx(689.0)
+        assert spread.long_strike == pytest.approx(674.0)
+        assert spread.width == pytest.approx(15.0)
+        assert spread.net_credit == pytest.approx(2.54)
+        assert spread.qty == 2
+
+    def test_single_leg_loop_skips_reconstructed_spread_legs(self, tmp_path):
+        # Full _restore_ownership_from_db: the spread legs must NOT be
+        # mis-assigned as single-leg positions (the naked-short risk).
+        strategy = _strategy()
+        engine, _ = _engine(tmp_path, strategy)
+        self._log_open_spread(engine, "uuid-1")
+        snapshot = _snapshot_with({_SHORT_OCC: object(), _LONG_OCC: object()})
+
+        conflicts = engine._restore_ownership_from_db(snapshot)
+
+        assert conflicts == set()
+        # Exactly one tracked position — the spread — keyed by UUID. Neither
+        # leg was registered as a standalone single-leg position.
+        assert set(engine._positions) == {"uuid-1"}
+        assert engine._positions["uuid-1"].is_spread
+
+    def test_missing_broker_leg_declares_conflict(self, tmp_path):
+        strategy = _strategy()
+        engine, _ = _engine(tmp_path, strategy)
+        self._log_open_spread(engine, "uuid-1")
+        # Only the short leg is present at the broker — the long leg vanished.
+        snapshot = _snapshot_with({_SHORT_OCC: object()})
+
+        conflicts: set[str] = set()
+        engine._restore_spread_positions(snapshot, conflicts)
+
+        assert "SPY" in conflicts          # → RESTRICTED startup mode
+        assert "uuid-1" not in engine._positions
+        assert strategy.open_spreads == []
+
+    def test_no_configured_strategy_declares_conflict(self, tmp_path):
+        # Engine built with an SMA-style strategy — no credit_spread slot.
+        strategy = _strategy()
+        engine, _ = _engine(tmp_path, strategy)
+        # Remove the credit_spread slot so _credit_spread_strategy_for finds none.
+        engine.slots = []
+        self._log_open_spread(engine, "uuid-1")
+        snapshot = _snapshot_with({_SHORT_OCC: object(), _LONG_OCC: object()})
+
+        conflicts: set[str] = set()
+        engine._restore_spread_positions(snapshot, conflicts)
+
+        assert "SPY" in conflicts
+        assert "uuid-1" not in engine._positions
+
+    def test_closed_spread_is_not_reconstructed(self, tmp_path):
+        strategy = _strategy()
+        engine, _ = _engine(tmp_path, strategy)
+        self._log_open_spread(engine, "uuid-1")
+        engine.trade_logger.log_spread_fill(
+            position_id="uuid-1", strategy="credit_spread",
+            short_occ=_SHORT_OCC, long_occ=_LONG_OCC,
+            qty=1, net_price=1.10, opening=False,
+        )
+        snapshot = _snapshot_with({})  # broker has nothing open
+
+        conflicts: set[str] = set()
+        leg_occs = engine._restore_spread_positions(snapshot, conflicts)
+
+        assert leg_occs == set()
+        assert conflicts == set()
+        assert engine._positions == {}

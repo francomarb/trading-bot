@@ -503,47 +503,62 @@ class TradeLogger:
         reason: str = "",
     ) -> None:
         """
-        Write a trade-log row for a multi-leg (MLEG) credit-spread fill (11.29).
+        Write trade-log rows for a multi-leg (MLEG) credit-spread fill (11.29).
 
-        Both the open and the close of a spread are recorded as single rows
-        keyed by ``position_id`` (``position_type='spread'``) — the open and
-        close share that id so the pair can be reconstructed on read-back.
+        **One row per leg**, both keyed by the same ``position_id`` with
+        ``position_type='spread'``. Recording both OCC legs is what lets
+        startup reconciliation rebuild the full spread Position after a
+        restart — a single short-leg row alone cannot identify the long leg.
 
-        ``net_price`` is the per-share net of the combo: the credit received
-        on the open, the debit paid on the close (both positive numbers).
-        ``symbol`` is the short leg's OCC string — the spread's defining leg.
+        Leg sides reflect the actual trade: opening a bull put credit spread
+        sells the short (higher-strike) put and buys the long (lower-strike)
+        put; closing reverses both. The net economics (``net_price`` — credit
+        received on open, debit paid on close, both positive) go on the
+        short-leg row; the long-leg row carries ``avg_fill_price=0.0``.
+
+        ``position_type='spread'`` rows are deliberately excluded from
+        ``read_all_open_owners`` / ``read_owner_for_symbol`` so the engine's
+        single-leg ownership restore never mistakes a spread leg for a
+        standalone position — see ``read_open_spread_positions`` for the
+        spread-aware restore path.
         """
         now_iso = datetime.now(timezone.utc).isoformat()
-        side = "sell" if opening else "buy"
         default_reason = "spread entry" if opening else "spread exit"
-        record = TradeRecord(
-            timestamp=now_iso,
-            symbol=short_occ,
-            side=side,
-            qty=qty,
-            avg_fill_price=net_price,
-            order_id=order_id,
-            strategy=strategy,
-            reason=reason or default_reason,
-            stop_price=0.0,
-            entry_reference_price=net_price,
-            modeled_slippage_bps=0.0,
-            realized_slippage_bps=0.0,
-            order_type="mleg",
-            status="filled",
-            requested_qty=qty,
-            filled_qty=qty,
-            initial_stop_loss=None,
-            initial_risk_per_share=None,
-            initial_risk_dollars=None,
-            realized_pnl=None,
-            r_multiple=None,
-            entry_timestamp=now_iso if opening else None,
-            exit_timestamp=None if opening else now_iso,
-            position_id=position_id,
-            position_type="spread",
-        )
-        self.log(record)
+        # Short leg: sold to open / bought to close. Long leg: the reverse.
+        short_side = "sell" if opening else "buy"
+        long_side = "buy" if opening else "sell"
+
+        def _leg_record(symbol: str, side: str, price: float) -> TradeRecord:
+            return TradeRecord(
+                timestamp=now_iso,
+                symbol=symbol,
+                side=side,
+                qty=qty,
+                avg_fill_price=price,
+                order_id=order_id,
+                strategy=strategy,
+                reason=reason or default_reason,
+                stop_price=0.0,
+                entry_reference_price=price,
+                modeled_slippage_bps=0.0,
+                realized_slippage_bps=0.0,
+                order_type="mleg",
+                status="filled",
+                requested_qty=qty,
+                filled_qty=qty,
+                initial_stop_loss=None,
+                initial_risk_per_share=None,
+                initial_risk_dollars=None,
+                realized_pnl=None,
+                r_multiple=None,
+                entry_timestamp=now_iso if opening else None,
+                exit_timestamp=None if opening else now_iso,
+                position_id=position_id,
+                position_type="spread",
+            )
+
+        self.log(_leg_record(short_occ, short_side, net_price))
+        self.log(_leg_record(long_occ, long_side, 0.0))
         logger.info(
             f"spread {'entry' if opening else 'exit'} logged: {short_occ}/{long_occ} "
             f"qty={qty} net=${net_price:.2f}/sh [{strategy}] position_id={position_id[:8]}"
@@ -637,11 +652,15 @@ class TradeLogger:
         except sqlite3.Error:
             return None
         conn.row_factory = sqlite3.Row
+        # Exclude position_type='spread' rows: a spread leg is never a
+        # standalone single-leg position. Spreads restore via
+        # read_open_spread_positions().
         cursor = conn.execute(
             "SELECT side, strategy "
             "FROM trades "
             "WHERE symbol = ? "
             "AND status IN ('filled', 'partial') "
+            "AND (position_type IS NULL OR position_type != 'spread') "
             "ORDER BY id DESC LIMIT 1",
             (symbol,),
         )
@@ -666,17 +685,93 @@ class TradeLogger:
         except sqlite3.Error:
             return {}
         conn.row_factory = sqlite3.Row
+        # Exclude position_type='spread' rows from the single-leg view: a
+        # spread leg's latest row (long leg side='buy' on open) would
+        # otherwise be mistaken for a standalone open position. Spreads are
+        # restored via read_open_spread_positions().
         cursor = conn.execute(
             "SELECT symbol, strategy, side "
             "FROM trades "
             "WHERE id IN ("
             "  SELECT MAX(id) FROM trades "
             "  WHERE status IN ('filled', 'partial') "
+            "  AND (position_type IS NULL OR position_type != 'spread') "
             "  GROUP BY symbol"
             ") "
             "AND side = 'buy'"
         )
         return {row["symbol"]: row["strategy"] for row in cursor.fetchall()}
+
+    def read_open_spread_positions(self) -> list[dict]:
+        """
+        Reconstruct currently-open multi-leg credit spreads from the trade log.
+
+        Returns one dict per open spread::
+
+            {
+              "position_id": str,
+              "strategy": str,
+              "leg_symbols": [occ, occ],   # both legs, append order
+              "net_credit": float,         # $/share collected at open
+              "qty": float,
+            }
+
+        A spread is *open* when its ``position_id`` has no row carrying an
+        ``exit_timestamp`` (the close writes ``exit_timestamp`` on both leg
+        rows). ``net_credit`` is taken from the open row whose
+        ``avg_fill_price`` is non-zero — ``log_spread_fill`` puts the combo
+        net on the short-leg row and 0.0 on the long-leg row.
+
+        Used by the engine on startup to rebuild spread ``Position`` records
+        instead of mis-assigning the legs as single-leg positions.
+        """
+        if not os.path.exists(self._path):
+            return []
+        try:
+            conn = self._ensure_db()
+        except sqlite3.Error:
+            return []
+        conn.row_factory = sqlite3.Row
+        cursor = conn.execute(
+            "SELECT position_id, strategy, symbol, side, avg_fill_price, "
+            "       qty, entry_timestamp, exit_timestamp, id "
+            "FROM trades "
+            "WHERE position_type = 'spread' "
+            "AND status IN ('filled', 'partial') "
+            "ORDER BY id"
+        )
+        grouped: dict[str, dict] = {}
+        for row in cursor.fetchall():
+            pid = row["position_id"]
+            if pid is None:
+                continue
+            entry = grouped.setdefault(
+                pid,
+                {
+                    "position_id": pid,
+                    "strategy": row["strategy"],
+                    "leg_symbols": [],
+                    "net_credit": 0.0,
+                    "qty": float(row["qty"] or 0.0),
+                    "_closed": False,
+                },
+            )
+            if row["exit_timestamp"] is not None:
+                entry["_closed"] = True
+                continue
+            # Open-side leg row.
+            sym = row["symbol"]
+            if sym not in entry["leg_symbols"]:
+                entry["leg_symbols"].append(sym)
+            price = float(row["avg_fill_price"] or 0.0)
+            if price > 0.0:
+                entry["net_credit"] = price
+                entry["qty"] = float(row["qty"] or entry["qty"])
+        return [
+            {k: v for k, v in entry.items() if k != "_closed"}
+            for entry in grouped.values()
+            if not entry["_closed"] and len(entry["leg_symbols"]) == 2
+        ]
 
     def read_strategy_realized_pnl_summary(
         self,

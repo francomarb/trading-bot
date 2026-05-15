@@ -540,6 +540,102 @@ class TestTradeLogger:
         assert row == ("SPY260516C00520000", "SPY", "single_leg")
 
 
+# ── TestSpreadLogging (11.29) ───────────────────────────────────────────────
+
+
+class TestSpreadLogging:
+    _SHORT = "SPY260618P00689000"
+    _LONG = "SPY260618P00674000"
+
+    def test_open_writes_one_row_per_leg(self, tmp_csv):
+        tl = TradeLogger(path=tmp_csv)
+        tl.log_spread_fill(
+            position_id="uuid-1", strategy="credit_spread",
+            short_occ=self._SHORT, long_occ=self._LONG,
+            qty=1, net_price=2.54, order_id="combo-1", opening=True,
+        )
+        rows = tl.read_all()
+        assert len(rows) == 2
+        assert all(r["position_id"] == "uuid-1" for r in rows)
+        assert all(r["position_type"] == "spread" for r in rows)
+        by_symbol = {r["symbol"]: r for r in rows}
+        # Short leg sold to open, carries the net credit; long leg bought, 0.0.
+        assert by_symbol[self._SHORT]["side"] == "sell"
+        assert by_symbol[self._SHORT]["avg_fill_price"] == pytest.approx(2.54)
+        assert by_symbol[self._LONG]["side"] == "buy"
+        assert by_symbol[self._LONG]["avg_fill_price"] == pytest.approx(0.0)
+
+    def test_close_reverses_leg_sides(self, tmp_csv):
+        tl = TradeLogger(path=tmp_csv)
+        tl.log_spread_fill(
+            position_id="uuid-1", strategy="credit_spread",
+            short_occ=self._SHORT, long_occ=self._LONG,
+            qty=1, net_price=1.10, order_id="combo-close", opening=False,
+        )
+        rows = tl.read_all()
+        by_symbol = {r["symbol"]: r for r in rows}
+        assert by_symbol[self._SHORT]["side"] == "buy"   # bought back to close
+        assert by_symbol[self._LONG]["side"] == "sell"   # long leg sold
+
+    def test_spread_legs_excluded_from_single_leg_owner_views(self, tmp_csv):
+        tl = TradeLogger(path=tmp_csv)
+        tl.log_spread_fill(
+            position_id="uuid-1", strategy="credit_spread",
+            short_occ=self._SHORT, long_occ=self._LONG,
+            qty=1, net_price=2.54, opening=True,
+        )
+        # The long-leg row is side='buy' — without the position_type filter
+        # it would be mistaken for a standalone open single-leg position.
+        assert tl.read_all_open_owners() == {}
+        assert tl.read_owner_for_symbol(self._LONG) is None
+        assert tl.read_owner_for_symbol(self._SHORT) is None
+
+    def test_read_open_spread_positions_reconstructs_open_spread(self, tmp_csv):
+        tl = TradeLogger(path=tmp_csv)
+        tl.log_spread_fill(
+            position_id="uuid-1", strategy="credit_spread",
+            short_occ=self._SHORT, long_occ=self._LONG,
+            qty=2, net_price=2.54, opening=True,
+        )
+        opens = tl.read_open_spread_positions()
+        assert len(opens) == 1
+        rec = opens[0]
+        assert rec["position_id"] == "uuid-1"
+        assert rec["strategy"] == "credit_spread"
+        assert set(rec["leg_symbols"]) == {self._SHORT, self._LONG}
+        assert rec["net_credit"] == pytest.approx(2.54)
+        assert rec["qty"] == pytest.approx(2)
+
+    def test_closed_spread_is_not_returned(self, tmp_csv):
+        tl = TradeLogger(path=tmp_csv)
+        tl.log_spread_fill(
+            position_id="uuid-1", strategy="credit_spread",
+            short_occ=self._SHORT, long_occ=self._LONG,
+            qty=1, net_price=2.54, opening=True,
+        )
+        tl.log_spread_fill(
+            position_id="uuid-1", strategy="credit_spread",
+            short_occ=self._SHORT, long_occ=self._LONG,
+            qty=1, net_price=1.10, opening=False,
+        )
+        assert tl.read_open_spread_positions() == []
+
+    def test_multiple_open_spreads_returned_separately(self, tmp_csv):
+        tl = TradeLogger(path=tmp_csv)
+        tl.log_spread_fill(
+            position_id="uuid-1", strategy="credit_spread",
+            short_occ=self._SHORT, long_occ=self._LONG,
+            qty=1, net_price=2.54, opening=True,
+        )
+        tl.log_spread_fill(
+            position_id="uuid-2", strategy="credit_spread",
+            short_occ="QQQ260618P00689000", long_occ="QQQ260618P00674000",
+            qty=1, net_price=2.10, opening=True,
+        )
+        opens = tl.read_open_spread_positions()
+        assert {r["position_id"] for r in opens} == {"uuid-1", "uuid-2"}
+
+
 # ── TestPnLTracker ──────────────────────────────────────────────────────────
 
 
