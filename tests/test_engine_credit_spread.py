@@ -378,3 +378,37 @@ class TestCountOpenCreditSpreads:
             legs=[PositionLeg("C", -1, side="SELL"), PositionLeg("D", 1, side="BUY")],
         )
         assert engine._count_open_credit_spreads() == 2
+
+
+# ── State-snapshot field ────────────────────────────────────────────────────
+
+
+class TestCreditSpreadsSnapshot:
+    def test_snapshot_renders_open_spreads(self, tmp_path):
+        strategy = _strategy()
+        engine, _ = _engine(tmp_path, strategy)
+        engine._spread_owner_strategy["p1"] = strategy
+        strategy.register_spread(_open_spread("p1", net_credit=1.45))
+
+        snap = engine._credit_spreads_snapshot()
+        assert len(snap) == 1
+        row = snap[0]
+        assert row["position_id"] == "p1"
+        assert row["strategy"] == "credit_spread"
+        assert row["underlying"] == "SPY"        # owner_key_for(short OCC)
+        assert row["net_credit"] == pytest.approx(1.45)
+        assert row["width"] == pytest.approx(10.0)
+        assert row["pending_close"] is False
+
+    def test_pending_close_flag_surfaces(self, tmp_path):
+        strategy = _strategy()
+        engine, _ = _engine(tmp_path, strategy)
+        engine._spread_owner_strategy["p1"] = strategy
+        strategy.register_spread(_open_spread("p1"))
+        engine._spreads_pending_close.add("p1")
+        assert engine._credit_spreads_snapshot()[0]["pending_close"] is True
+
+    def test_empty_when_no_spreads(self, tmp_path):
+        strategy = _strategy()
+        engine, _ = _engine(tmp_path, strategy)
+        assert engine._credit_spreads_snapshot() == []

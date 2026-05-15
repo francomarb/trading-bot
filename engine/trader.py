@@ -2003,6 +2003,35 @@ class TradingEngine:
             if p.is_spread and p.strategy_name == "credit_spread"
         )
 
+    def _credit_spreads_snapshot(self) -> list[dict]:
+        """
+        Build the ``credit_spreads`` state-snapshot field — one dict per open
+        spread, with the economics the dashboard renders. Sourced from the
+        owning strategy's ``OpenSpread`` view (kept in sync by the entry /
+        drain paths).
+        """
+        out: list[dict] = []
+        for position_id, strategy in self._spread_owner_strategy.items():
+            getter = getattr(strategy, "get_open_spread", None)
+            spread = getter(position_id) if callable(getter) else None
+            if spread is None:
+                continue
+            out.append({
+                "position_id": position_id,
+                "strategy": strategy.name,
+                "underlying": owner_key_for(spread.short_occ),
+                "short_occ": spread.short_occ,
+                "long_occ": spread.long_occ,
+                "short_strike": spread.short_strike,
+                "long_strike": spread.long_strike,
+                "width": spread.width,
+                "expiration": str(spread.expiration_date),
+                "net_credit": spread.net_credit,
+                "qty": spread.qty,
+                "pending_close": position_id in self._spreads_pending_close,
+            })
+        return out
+
     def _spread_positions_for(
         self, underlying: str, strategy_name: str
     ) -> list[Position]:
@@ -2625,6 +2654,7 @@ class TradingEngine:
                 "session_pnl": equity - start_equity,
                 "open_positions": self._owners_view(),
                 "positions_detail": positions_detail,
+                "credit_spreads": self._credit_spreads_snapshot(),
                 "allocator": allocator_snapshot["strategies"],
                 "capital_pools": allocator_snapshot["pools"],
                 "pending_entry_notional": pending_entry_notional,

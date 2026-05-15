@@ -247,6 +247,10 @@ class CreditSpread(BaseStrategy):
         """The spreads this instance currently holds open."""
         return list(self._open_spreads.values())
 
+    def get_open_spread(self, position_id: str) -> OpenSpread | None:
+        """The open spread for ``position_id``, or None if not held."""
+        return self._open_spreads.get(position_id)
+
     # ── Entry caps ───────────────────────────────────────────────────────
 
     def _caps_reject_reason(
