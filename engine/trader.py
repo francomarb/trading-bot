@@ -940,7 +940,7 @@ class TradingEngine:
                 signal_key, signal_bar, strategy_statuses, strategy_reasons, symbol
             )
             return
-        if position is not None:
+        if self._entry_blocked_by_existing_position(strategy, position):
             # Already in this position — the crossover bar persists across
             # intra-day cycles, so this is expected noise, not a real signal.
             # Risk would reject anyway; skip to avoid spamming alerts.
@@ -1992,6 +1992,27 @@ class TradingEngine:
                     self._entry_prices.pop(underlying, None)
 
     # ── Credit-spread entry / drain / exit (11.29 PR 3b) ─────────────────
+
+    @staticmethod
+    def _entry_blocked_by_existing_position(
+        strategy: BaseStrategy, position
+    ) -> bool:
+        """
+        The single-leg "already in this position, skip re-entry" guard.
+
+        **Skipped for multi-leg (credit-spread) strategies.** They manage
+        concurrency via their own per-instance caps inside
+        ``build_spread_execution`` (max_concurrent_positions,
+        max_per_expiration, DTE staggering) — and ``_get_position_for()``
+        regex-matches a spread *leg* OCC to the underlying, so a held spread
+        would otherwise look like an "existing position" and silently block
+        every subsequent spread on that underlying. The cross-strategy
+        symbol-conflict check (``_get_owner``) still runs afterward, so an
+        unrelated single-leg owner of the same symbol is still blocked.
+        """
+        if hasattr(strategy, "build_spread_execution"):
+            return False
+        return position is not None
 
     def _count_open_credit_spreads(self) -> int:
         """

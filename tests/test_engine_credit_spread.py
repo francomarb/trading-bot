@@ -530,3 +530,39 @@ class TestRestoreSpreadPositions:
         assert leg_occs == set()
         assert conflicts == set()
         assert engine._positions == {}
+
+
+# ── Entry guard — spread strategies bypass the single-leg position block ────
+
+
+class TestEntryBlockedByExistingPosition:
+    def test_single_leg_strategy_blocked_when_position_exists(self):
+        # A non-spread strategy is still blocked by an existing position —
+        # the original "skip re-entry, the bar persists" behavior.
+        from strategies.sma_crossover import SMACrossover
+        sma = SMACrossover()
+        assert TradingEngine._entry_blocked_by_existing_position(
+            sma, object()
+        ) is True
+
+    def test_single_leg_strategy_not_blocked_when_flat(self):
+        from strategies.sma_crossover import SMACrossover
+        sma = SMACrossover()
+        assert TradingEngine._entry_blocked_by_existing_position(
+            sma, None
+        ) is False
+
+    def test_credit_spread_strategy_never_blocked_by_existing_position(self):
+        # Regression: _get_position_for() regex-matches a spread *leg* OCC to
+        # the underlying, so a held spread looked like an "existing position"
+        # and silently disabled max_concurrent_positions / max_per_expiration
+        # / DTE staggering. Spread strategies must bypass this guard — their
+        # own per-instance caps are the concurrency control.
+        strategy = _strategy()  # a real CreditSpread instance
+        # Even with a (leg) position present, the guard must not block.
+        assert TradingEngine._entry_blocked_by_existing_position(
+            strategy, object()
+        ) is False
+        assert TradingEngine._entry_blocked_by_existing_position(
+            strategy, None
+        ) is False
