@@ -273,7 +273,11 @@ STRATEGY_ALLOCATIONS: dict[str, dict] = {
     "credit_spread": {
         "target_pct": 0.10,
         "type": "isolated",
-        "priority": 0,
+        # SleeveAllocator enforces unique priorities; spy_options_reversion
+        # already holds 0. Priority rarely binds inside the isolated_options
+        # pool (it is 15% with the two sleeves summing to it cleanly), so
+        # credit_spread takes the next free slot.
+        "priority": 4,
         "can_stretch": False,
         "hard_max_positions": 8,
         "max_position_pct_of_sleeve": 0.40,
