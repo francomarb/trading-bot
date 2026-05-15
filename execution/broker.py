@@ -52,6 +52,7 @@ if TYPE_CHECKING:
 
 from execution.options_executor import (
     OptionsExecutionWorker,
+    SpreadExecutionWorker,
     SpreadLeg,
     build_mleg_request,
 )
@@ -224,6 +225,10 @@ class AlpacaBroker:
         # Drained by TradingEngine each cycle via drain_option_fills().
         self._pending_option_fills: list[tuple] = []
         self._pending_option_lock = threading.Lock()
+        # Async MLEG combo fills reported by SpreadExecutionWorker threads.
+        # Drained by TradingEngine each cycle via drain_spread_fills().
+        self._pending_spread_fills: list[tuple] = []
+        self._pending_spread_lock = threading.Lock()
         if self._stream_manager is not None:
             self._stream_manager.set_order_lookup_callbacks(
                 by_id=self._stream_lookup_order_by_id,
@@ -897,6 +902,120 @@ class AlpacaBroker:
             limit_price=limit_price,
             strategy_name=strategy_name,
         )
+
+    def dispatch_spread_order(
+        self,
+        *,
+        legs: list[SpreadLeg],
+        qty: int,
+        limit_price: float,
+        strategy_name: str,
+        position_id: str,
+        closing: bool = False,
+    ) -> OrderResult:
+        """
+        Dispatch an asynchronous MLEG combo via ``SpreadExecutionWorker``
+        (11.29 PR 3b). Mirrors how ``place_order`` dispatches the single-leg
+        ``OptionsExecutionWorker``.
+
+        ``closing=False`` opens a spread; ``closing=True`` closes one — the
+        legs are reversed (each side flipped, ``opening=False``) into the
+        ``*_TO_CLOSE`` trade that flattens the position. ``limit_price``
+        follows the Alpaca MLEG sign convention: negative net credit to
+        open, positive net debit to close.
+
+        The worker submits the combo, watches for the atomic fill via the
+        stream, and cancels if unfilled past its timeout. Its terminal
+        outcome is pushed onto ``_pending_spread_fills`` tagged with
+        ``position_id`` and the ``closing`` flag so ``TradingEngine`` can
+        reconcile it against the tracked spread ``Position``.
+
+        Returns immediately with ``OrderResult(ACCEPTED)``. In DRY_RUN a
+        synthetic FILLED event is queued onto the drain instead — so the
+        engine's dispatch → drain-confirm flow is identical in both modes.
+        """
+        if closing:
+            legs = [
+                SpreadLeg(
+                    occ_symbol=leg.occ_symbol,
+                    side=Side.BUY if leg.side is Side.SELL else Side.SELL,
+                    opening=False,
+                    ratio_qty=leg.ratio_qty,
+                )
+                for leg in legs
+            ]
+        short_leg = next((leg for leg in legs if leg.side is Side.SELL), legs[0])
+        rep_symbol = short_leg.occ_symbol
+        action = "close" if closing else "open"
+
+        if self._dry_run:
+            logger.warning(
+                f"DRY RUN — MLEG spread {action} NOT dispatched: {qty}× "
+                f"[{', '.join(leg.occ_symbol for leg in legs)}] @ net {limit_price:.2f}"
+            )
+            with self._pending_spread_lock:
+                self._pending_spread_fills.append((
+                    position_id, strategy_name, closing, "filled", float(qty),
+                    round(limit_price, 2), f"dry-run-{uuid.uuid4().hex[:10]}",
+                ))
+            return OrderResult(
+                status=OrderStatus.ACCEPTED,
+                order_id=f"dry-run-{uuid.uuid4().hex[:10]}",
+                symbol=rep_symbol,
+                requested_qty=qty,
+                filled_qty=0.0,
+                avg_fill_price=0.0,
+                raw_status="dry_run",
+                message=f"dry run — synthetic spread {action} fill queued",
+            )
+
+        def _on_fill(
+            status: str,
+            filled_qty: float,
+            avg_price: "float | None",
+            order_id: str,
+        ) -> None:
+            with self._pending_spread_lock:
+                self._pending_spread_fills.append((
+                    position_id, strategy_name, closing, status,
+                    filled_qty, avg_price, order_id,
+                ))
+
+        worker = SpreadExecutionWorker(
+            legs=legs,
+            qty=qty,
+            limit_price=limit_price,
+            strategy_name=strategy_name,
+            api=self._api,
+            stream_manager=self._stream_manager,
+            on_fill=_on_fill,
+        )
+        worker.start()
+        return OrderResult(
+            status=OrderStatus.ACCEPTED,
+            order_id=f"spread-worker-{uuid.uuid4().hex[:10]}",
+            symbol=rep_symbol,
+            requested_qty=qty,
+            filled_qty=0.0,
+            avg_fill_price=0.0,
+            raw_status="accepted",
+            message=f"dispatched to SpreadExecutionWorker ({action})",
+        )
+
+    def drain_spread_fills(self) -> list[tuple]:
+        """
+        Return and clear all MLEG combo fill events reported by background
+        ``SpreadExecutionWorker`` threads.
+
+        Each entry is ``(position_id, strategy_name, closing, status_str,
+        filled_qty, avg_fill_price, order_id)`` — ``closing`` distinguishes a
+        spread open from a spread close. ``TradingEngine`` drains this each
+        cycle to confirm or roll back tracked spread ``Position`` records.
+        """
+        with self._pending_spread_lock:
+            fills = list(self._pending_spread_fills)
+            self._pending_spread_fills.clear()
+        return fills
 
     def cancel_order(self, order_id: str) -> bool:
         """Cancel an order by id. Returns True on success, False on failure."""

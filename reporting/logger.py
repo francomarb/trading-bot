@@ -489,6 +489,66 @@ class TradeLogger:
         )
         self.log(record)
 
+    def log_spread_fill(
+        self,
+        *,
+        position_id: str,
+        strategy: str,
+        short_occ: str,
+        long_occ: str,
+        qty: float,
+        net_price: float,
+        order_id: str | None = None,
+        opening: bool,
+        reason: str = "",
+    ) -> None:
+        """
+        Write a trade-log row for a multi-leg (MLEG) credit-spread fill (11.29).
+
+        Both the open and the close of a spread are recorded as single rows
+        keyed by ``position_id`` (``position_type='spread'``) — the open and
+        close share that id so the pair can be reconstructed on read-back.
+
+        ``net_price`` is the per-share net of the combo: the credit received
+        on the open, the debit paid on the close (both positive numbers).
+        ``symbol`` is the short leg's OCC string — the spread's defining leg.
+        """
+        now_iso = datetime.now(timezone.utc).isoformat()
+        side = "sell" if opening else "buy"
+        default_reason = "spread entry" if opening else "spread exit"
+        record = TradeRecord(
+            timestamp=now_iso,
+            symbol=short_occ,
+            side=side,
+            qty=qty,
+            avg_fill_price=net_price,
+            order_id=order_id,
+            strategy=strategy,
+            reason=reason or default_reason,
+            stop_price=0.0,
+            entry_reference_price=net_price,
+            modeled_slippage_bps=0.0,
+            realized_slippage_bps=0.0,
+            order_type="mleg",
+            status="filled",
+            requested_qty=qty,
+            filled_qty=qty,
+            initial_stop_loss=None,
+            initial_risk_per_share=None,
+            initial_risk_dollars=None,
+            realized_pnl=None,
+            r_multiple=None,
+            entry_timestamp=now_iso if opening else None,
+            exit_timestamp=None if opening else now_iso,
+            position_id=position_id,
+            position_type="spread",
+        )
+        self.log(record)
+        logger.info(
+            f"spread {'entry' if opening else 'exit'} logged: {short_occ}/{long_occ} "
+            f"qty={qty} net=${net_price:.2f}/sh [{strategy}] position_id={position_id[:8]}"
+        )
+
     def log_stop_fill(
         self,
         *,

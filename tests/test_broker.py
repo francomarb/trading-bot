@@ -1000,3 +1000,98 @@ class TestPlaceSpreadOrder:
         assert by_symbol[_LONG_OCC].side is OrderSide.SELL
         assert by_symbol[_LONG_OCC].position_intent is PositionIntent.SELL_TO_CLOSE
         assert result.status is OrderStatus.ACCEPTED
+
+
+# ── dispatch_spread_order / drain_spread_fills — async MLEG (11.29 PR 3b) ─────
+
+
+class TestDispatchSpreadOrder:
+    def test_live_mode_dispatches_worker_and_returns_accepted(self):
+        api = MagicMock()
+        broker = AlpacaBroker(client=api, max_attempts=1, base_delay=0.0, dry_run=False)
+        legs = _open_spread_legs()
+
+        with patch("execution.broker.SpreadExecutionWorker") as mock_worker_cls:
+            mock_worker_cls.return_value = MagicMock()
+            result = broker.dispatch_spread_order(
+                legs=legs, qty=1, limit_price=-1.45,
+                strategy_name="credit_spread", position_id="pos-1",
+            )
+
+        mock_worker_cls.assert_called_once()
+        mock_worker_cls.return_value.start.assert_called_once()
+        assert result.status is OrderStatus.ACCEPTED
+        assert result.symbol == _SHORT_OCC          # short leg is representative
+        # Worker handles submission — broker does not submit directly.
+        api.submit_order.assert_not_called()
+        # Nothing drained yet — the worker reports asynchronously.
+        assert broker.drain_spread_fills() == []
+
+    def test_dry_run_queues_synthetic_fill_and_returns_accepted(self):
+        api = MagicMock()
+        broker = AlpacaBroker(client=api, max_attempts=1, base_delay=0.0, dry_run=True)
+
+        with patch("execution.broker.SpreadExecutionWorker") as mock_worker_cls:
+            result = broker.dispatch_spread_order(
+                legs=_open_spread_legs(), qty=1, limit_price=-1.45,
+                strategy_name="credit_spread", position_id="pos-1",
+            )
+
+        mock_worker_cls.assert_not_called()  # dry run never starts a worker
+        assert result.status is OrderStatus.ACCEPTED
+        assert result.raw_status == "dry_run"
+        drained = broker.drain_spread_fills()
+        assert len(drained) == 1
+        position_id, strategy_name, closing, status, filled_qty, avg_price, order_id = drained[0]
+        assert position_id == "pos-1"
+        assert strategy_name == "credit_spread"
+        assert closing is False  # an open
+        assert status == "filled"
+        assert filled_qty == 1.0
+        assert avg_price == pytest.approx(-1.45)
+
+    def test_closing_dispatch_reverses_legs_and_tags_close(self):
+        api = MagicMock()
+        broker = AlpacaBroker(client=api, max_attempts=1, base_delay=0.0, dry_run=True)
+        result = broker.dispatch_spread_order(
+            legs=_open_spread_legs(), qty=1, limit_price=1.10,
+            strategy_name="credit_spread", position_id="pos-1", closing=True,
+        )
+        assert result.status is OrderStatus.ACCEPTED
+        drained = broker.drain_spread_fills()
+        position_id, strategy_name, closing, status, filled_qty, avg_price, order_id = drained[0]
+        assert closing is True
+        assert status == "filled"
+
+    def test_drain_spread_fills_returns_and_clears(self):
+        api = MagicMock()
+        broker = AlpacaBroker(client=api, max_attempts=1, base_delay=0.0, dry_run=True)
+        broker.dispatch_spread_order(
+            legs=_open_spread_legs(), qty=1, limit_price=-1.45,
+            strategy_name="credit_spread", position_id="pos-1",
+        )
+        first = broker.drain_spread_fills()
+        assert len(first) == 1
+        # Second drain is empty — the queue was cleared.
+        assert broker.drain_spread_fills() == []
+
+    def test_on_fill_callback_tags_fill_with_position_id(self):
+        api = MagicMock()
+        broker = AlpacaBroker(client=api, max_attempts=1, base_delay=0.0, dry_run=False)
+        captured = {}
+
+        def _capture_worker(*, on_fill, **kwargs):
+            captured["on_fill"] = on_fill
+            return MagicMock()
+
+        with patch("execution.broker.SpreadExecutionWorker", side_effect=_capture_worker):
+            broker.dispatch_spread_order(
+                legs=_open_spread_legs(), qty=2, limit_price=-1.45,
+                strategy_name="credit_spread", position_id="pos-99",
+            )
+        # Simulate the worker reporting a fill.
+        captured["on_fill"]("filled", 2.0, 1.50, "alpaca-combo-1")
+        drained = broker.drain_spread_fills()
+        assert drained == [
+            ("pos-99", "credit_spread", False, "filled", 2.0, 1.50, "alpaca-combo-1")
+        ]

@@ -51,8 +51,10 @@ from data.watchlists import StaticWatchlistSource
 from sector.gauge import SectorMomentumGauge
 from sector.resolver import SectorResolver
 from strategies.base import StrategySlot
+from strategies.credit_spread import CreditSpread, CreditSpreadConfig
 from strategies.donchian_breakout import DonchianBreakout
 from strategies.filters.common import CompositeEdgeFilter
+from strategies.filters.credit_spread import CreditSpreadEdgeFilter
 from strategies.filters.donchian_breakout import DonchianEdgeFilter
 from strategies.filters.rsi_reversion import RSIEdgeFilter
 from strategies.filters.sector_momentum import SectorMomentumFilter
@@ -61,6 +63,8 @@ from strategies.filters.spy_options_reversion import SPYOptionsEdgeFilter
 from strategies.rsi_reversion import RSIReversion
 from strategies.sma_crossover import SMACrossover
 from strategies.spy_options_reversion import SPYOptionsReversionStrategy
+from utils.iv_proxy import IVProxyResolver
+from utils.options_lookup import build_opra_quote_lookup
 
 
 # ── Logging ──────────────────────────────────────────────────────────────────
@@ -273,6 +277,36 @@ def main() -> None:
             allowed_regimes=frozenset({MarketRegime.TRENDING, MarketRegime.RANGING}),
         ),
     ]
+
+    # ── Credit spread slots (11.29) ──────────────────────────────────────
+    # One CreditSpread instance per underlying (SPY + QQQ at v1); all share
+    # the `credit_spread` allocator sleeve and one IV-proxy resolver + OPRA
+    # quote lookup. Daily bars — the trend gate is a 50-day SMA and DTE is
+    # measured in days. Never in BEAR/VOLATILE (a vol spike is exactly when
+    # short premium hits max loss).
+    _cs_iv_resolver = IVProxyResolver()
+    _cs_quote_lookup = build_opra_quote_lookup()
+    for _cs_symbol in settings.STRATEGY_WATCHLISTS["credit_spread"]:
+        _cs_config = CreditSpreadConfig.from_dict(
+            _cs_symbol, settings.CREDIT_SPREAD_INSTRUMENTS[_cs_symbol]
+        )
+        slots.append(StrategySlot(
+            strategy=CreditSpread(
+                _cs_config,
+                edge_filter=CreditSpreadEdgeFilter(
+                    iv_proxy_source=_cs_config.iv_proxy_source,
+                    min_iv_proxy=_cs_config.min_iv_proxy,
+                    earnings_blackout_days=_cs_config.earnings_blackout_days,
+                    iv_resolver=_cs_iv_resolver,
+                ),
+                iv_resolver=_cs_iv_resolver,
+                quote_lookup=_cs_quote_lookup,
+            ),
+            watchlist_source=StaticWatchlistSource(
+                [_cs_symbol], name=f"credit_spread_{_cs_symbol.lower()}"
+            ),
+            allowed_regimes=frozenset({MarketRegime.TRENDING, MarketRegime.RANGING}),
+        ))
 
     # Risk manager with production settings (shared across all slots).
     risk = RiskManager()

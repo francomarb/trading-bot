@@ -285,6 +285,46 @@ class SpreadPick:
     runners_up: list[ScoredSpread]
 
 
+def build_opra_quote_lookup() -> QuoteLookup:
+    """
+    Construct a ``QuoteLookup`` callback that resolves a batch of OCC symbols
+    to ``Quote`` objects via Alpaca's option-snapshot endpoint.
+
+    Returns ``None`` for any symbol without a valid live two-sided quote so
+    the ranker/picker drops it cleanly. Shared by the credit-spread strategy
+    (entry picker + spread-exit mid pricing); the single-leg
+    ``spy_options_reversion`` strategy still carries its own equivalent.
+    """
+    from alpaca.data.historical.option import OptionHistoricalDataClient
+    from alpaca.data.requests import OptionSnapshotRequest
+
+    data_client = OptionHistoricalDataClient(ALPACA_API_KEY, ALPACA_SECRET_KEY)
+
+    def _lookup(occ_symbols: list[str]) -> dict[str, "Quote | None"]:
+        if not occ_symbols:
+            return {}
+        try:
+            snapshot = data_client.get_option_snapshot(
+                OptionSnapshotRequest(symbol_or_symbols=occ_symbols)
+            )
+        except Exception as e:
+            logger.warning(f"OPRA snapshot batch failed: {e}")
+            return {occ: None for occ in occ_symbols}
+        out: dict[str, "Quote | None"] = {}
+        for occ in occ_symbols:
+            entry = snapshot.get(occ)
+            if entry is None or entry.latest_quote is None:
+                out[occ] = None
+                continue
+            q = entry.latest_quote
+            bid = float(q.bid_price)
+            ask = float(q.ask_price)
+            out[occ] = Quote(bid=bid, ask=ask) if bid > 0 and ask > 0 else None
+        return out
+
+    return _lookup
+
+
 def estimate_put_delta(
     *,
     underlying_price: float,

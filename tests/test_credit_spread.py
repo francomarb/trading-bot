@@ -25,6 +25,7 @@ from strategies.credit_spread import (
 )
 from utils.iv_proxy import IVProxyResolver
 from utils.options_lookup import SpreadPick
+from utils.options_ranker import Quote
 
 
 # ── Helpers ─────────────────────────────────────────────────────────────────
@@ -377,3 +378,90 @@ class TestShouldExitSpread:
             spread, spread_mid=0.80, underlying_close=745.0, today=self._TODAY,
         )
         assert exit_ is True and "profit target" in reason
+
+
+# ── evaluate_spread_exit — engine-facing wrapper (PR 3b) ────────────────────
+
+
+class TestEvaluateSpreadExit:
+    _TODAY = date(2026, 5, 14)
+
+    def _spread(self) -> OpenSpread:
+        return _open_spread(
+            position_id="p1",
+            expiration=self._TODAY + timedelta(days=40),
+            net_credit=2.00,
+            short_strike=700.0,
+        )
+
+    def _quotes(self, short: Quote | None, long: Quote | None):
+        def _lookup(occ_symbols):
+            return {"SPY_S": short, "SPY_L": long}
+        return _lookup
+
+    def test_computes_mid_and_triggers_profit_target(self):
+        # short mid 1.50, long mid 0.50 → spread mid 1.00 = 50% of 2.00 credit.
+        strat = CreditSpread(
+            _config(profit_target_pct=0.50),
+            iv_resolver=IVProxyResolver(fetch_fn=lambda t: 18.0),
+            quote_lookup=self._quotes(Quote(1.45, 1.55), Quote(0.45, 0.55)),
+        )
+        should_exit, reason, spread_mid = strat.evaluate_spread_exit(
+            self._spread(), underlying_close=745.0, today=self._TODAY,
+        )
+        assert should_exit is True
+        assert "profit target" in reason
+        assert spread_mid == pytest.approx(1.00)
+
+    def test_no_trigger_returns_false_with_mid(self):
+        # spread mid 1.80 — above profit target, below stop, not breached.
+        strat = CreditSpread(
+            _config(),
+            iv_resolver=IVProxyResolver(fetch_fn=lambda t: 18.0),
+            quote_lookup=self._quotes(Quote(2.45, 2.55), Quote(0.65, 0.75)),
+        )
+        should_exit, reason, spread_mid = strat.evaluate_spread_exit(
+            self._spread(), underlying_close=745.0, today=self._TODAY,
+        )
+        assert should_exit is False
+        assert reason == ""
+        assert spread_mid == pytest.approx(1.80)
+
+    def test_missing_leg_quote_holds_position(self):
+        # Never exit on missing market data.
+        strat = CreditSpread(
+            _config(),
+            iv_resolver=IVProxyResolver(fetch_fn=lambda t: 18.0),
+            quote_lookup=self._quotes(Quote(1.45, 1.55), None),
+        )
+        should_exit, reason, spread_mid = strat.evaluate_spread_exit(
+            self._spread(), underlying_close=745.0, today=self._TODAY,
+        )
+        assert should_exit is False
+        assert spread_mid is None
+
+    def test_quote_lookup_exception_holds_position(self):
+        def _raising(_):
+            raise RuntimeError("OPRA down")
+
+        strat = CreditSpread(
+            _config(),
+            iv_resolver=IVProxyResolver(fetch_fn=lambda t: 18.0),
+            quote_lookup=_raising,
+        )
+        should_exit, reason, spread_mid = strat.evaluate_spread_exit(
+            self._spread(), underlying_close=745.0, today=self._TODAY,
+        )
+        assert should_exit is False
+        assert spread_mid is None
+
+    def test_no_quote_lookup_wired_holds_position(self):
+        strat = CreditSpread(
+            _config(),
+            iv_resolver=IVProxyResolver(fetch_fn=lambda t: 18.0),
+        )
+        should_exit, _, spread_mid = strat.evaluate_spread_exit(
+            self._spread(), underlying_close=745.0, today=self._TODAY,
+        )
+        assert should_exit is False
+        assert spread_mid is None

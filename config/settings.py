@@ -157,6 +157,9 @@ STRATEGY_WATCHLISTS: dict[str, list[str]] = {
     "bollinger_squeeze":  BOLLINGER_WATCHLIST,
     "donchian_breakout":  DONCHIAN_WATCHLIST,
     "spy_options_reversion": ["SPY"],
+    # Kept in sync with CREDIT_SPREAD_INSTRUMENTS (defined later in this file);
+    # a validation check below asserts the two never drift apart.
+    "credit_spread": ["SPY", "QQQ"],
 }
 REGIME_MAX_CONSECUTIVE_FAILURES: int = 3
 
@@ -200,6 +203,9 @@ STRATEGY_ALLOWED_REGIMES: dict[str, set[str]] = {
     # Restrict to TRENDING only — academic literature is unanimous on this.
     "donchian_breakout": {"TRENDING"},
     "spy_options_reversion": {"TRENDING", "RANGING"},
+    # Credit spreads sell premium — never in BEAR or VOLATILE (a vol spike
+    # is exactly when defined-risk shorts hit max loss). See design doc §3.
+    "credit_spread": {"TRENDING", "RANGING"},
 }
 
 # ── Capital allocation (Immediate allocator enhancements) ───────────────────
@@ -222,13 +228,13 @@ STRATEGY_ALLOWED_REGIMES: dict[str, set[str]] = {
 # Equity strategies may stretch up to 115% of target while total deployable
 # utilization remains below 80%, borrowing only from idle equity-pool capital.
 CAPITAL_POOLS: dict[str, float] = {
-    "equity": 0.95,
-    "isolated_options": 0.05,
+    "equity": 0.85,
+    "isolated_options": 0.15,
 }
 
 STRATEGY_ALLOCATIONS: dict[str, dict] = {
     "sma_crossover": {
-        "target_pct": 0.45,
+        "target_pct": 0.40,
         "type": "equity",
         "priority": 3,
         "can_stretch": True,
@@ -236,7 +242,7 @@ STRATEGY_ALLOCATIONS: dict[str, dict] = {
         "max_position_pct_of_sleeve": 0.40,
     },
     "rsi_reversion": {
-        "target_pct": 0.25,
+        "target_pct": 0.20,
         "type": "equity",
         "priority": 1,
         "can_stretch": True,
@@ -258,6 +264,19 @@ STRATEGY_ALLOCATIONS: dict[str, dict] = {
         "can_stretch": False,
         "hard_max_positions": 1,
         "max_position_pct_of_sleeve": 1.00,
+    },
+    # Credit spread (11.29): shared sleeve across all CreditSpread instances
+    # (SPY + QQQ at v1). isolated pool — defined-risk, never stretches.
+    # hard_max_positions mirrors MAX_TOTAL_CONCURRENT_CREDIT_SPREADS; the
+    # per-instance caps live in CREDIT_SPREAD_INSTRUMENTS. 0.10 carved from
+    # SMA (0.45→0.40) and RSI (0.25→0.20); spy_options_reversion unchanged.
+    "credit_spread": {
+        "target_pct": 0.10,
+        "type": "isolated",
+        "priority": 0,
+        "can_stretch": False,
+        "hard_max_positions": 8,
+        "max_position_pct_of_sleeve": 0.40,
     },
 }
 
@@ -354,6 +373,15 @@ for _cs_symbol, _cs_cfg in CREDIT_SPREAD_INSTRUMENTS.items():
             f"CREDIT_SPREAD_INSTRUMENTS['{_cs_symbol}'] has unknown key(s): "
             f"{sorted(_cs_extra)}"
         )
+
+# STRATEGY_WATCHLISTS["credit_spread"] is hardcoded above (it precedes this
+# block in the file); assert it never drifts from CREDIT_SPREAD_INSTRUMENTS.
+if set(STRATEGY_WATCHLISTS["credit_spread"]) != set(CREDIT_SPREAD_INSTRUMENTS):
+    raise ValueError(
+        "STRATEGY_WATCHLISTS['credit_spread'] "
+        f"{sorted(STRATEGY_WATCHLISTS['credit_spread'])} does not match "
+        f"CREDIT_SPREAD_INSTRUMENTS keys {sorted(CREDIT_SPREAD_INSTRUMENTS)}"
+    )
 
 # Shared sleeve: all credit-spread instances draw from one budget. The
 # allocator wiring (STRATEGY_ALLOCATIONS entry, pool rebalance) lands with
