@@ -489,6 +489,80 @@ class TestCreditSpreadsSnapshot:
         assert engine._credit_spreads_snapshot() == []
 
 
+# ── External close detection ────────────────────────────────────────────────
+
+
+class TestSpreadExternalCloseDetection:
+    def _track_open_spread(self, engine, strategy, position_id="p1"):
+        from engine.positions import PositionLeg, make_spread
+
+        engine._positions[position_id] = make_spread(
+            strategy_name="credit_spread",
+            position_id=position_id,
+            legs=[
+                PositionLeg("SPY260618P00568000", -1, side="SELL"),
+                PositionLeg("SPY260618P00558000", 1, side="BUY"),
+            ],
+        )
+        engine._spread_owner_strategy[position_id] = strategy
+        strategy.register_spread(_open_spread(position_id))
+
+    def test_spread_with_both_broker_legs_is_not_externally_closed(self, tmp_path):
+        strategy = _strategy()
+        engine, _ = _engine(tmp_path, strategy)
+        object.__setattr__(engine.config, "external_close_confirm_cycles", 1)
+        self._track_open_spread(engine, strategy, "uuid-1")
+        engine.trade_logger.log_external_close = MagicMock()
+        engine.trade_logger.log_spread_fill = MagicMock()
+
+        engine._detect_external_closes(
+            _snapshot_with({
+                "SPY260618P00568000": object(),
+                "SPY260618P00558000": object(),
+            })
+        )
+
+        assert "uuid-1" in engine._positions
+        assert strategy.get_open_spread("uuid-1") is not None
+        engine.trade_logger.log_external_close.assert_not_called()
+        engine.trade_logger.log_spread_fill.assert_not_called()
+
+    def test_spread_with_all_legs_absent_logs_spread_close_not_single_leg_close(self, tmp_path):
+        strategy = _strategy()
+        engine, _ = _engine(tmp_path, strategy)
+        object.__setattr__(engine.config, "external_close_confirm_cycles", 1)
+        self._track_open_spread(engine, strategy, "uuid-1")
+        engine.trade_logger.log_external_close = MagicMock()
+        engine.trade_logger.log_spread_fill = MagicMock()
+
+        engine._detect_external_closes(_snapshot_with({}))
+
+        assert "uuid-1" not in engine._positions
+        assert strategy.get_open_spread("uuid-1") is None
+        engine.trade_logger.log_external_close.assert_not_called()
+        engine.trade_logger.log_spread_fill.assert_called_once()
+        assert engine.trade_logger.log_spread_fill.call_args.kwargs["position_id"] == "uuid-1"
+        assert engine.trade_logger.log_spread_fill.call_args.kwargs["opening"] is False
+        assert engine.trade_logger.log_spread_fill.call_args.kwargs["reason"] == "external_close_detected"
+
+    def test_spread_with_one_missing_leg_keeps_ownership_for_manual_reconciliation(self, tmp_path):
+        strategy = _strategy()
+        engine, _ = _engine(tmp_path, strategy)
+        object.__setattr__(engine.config, "external_close_confirm_cycles", 1)
+        self._track_open_spread(engine, strategy, "uuid-1")
+        engine.trade_logger.log_external_close = MagicMock()
+        engine.trade_logger.log_spread_fill = MagicMock()
+
+        engine._detect_external_closes(
+            _snapshot_with({"SPY260618P00568000": object()})
+        )
+
+        assert "uuid-1" in engine._positions
+        assert strategy.get_open_spread("uuid-1") is not None
+        engine.trade_logger.log_external_close.assert_not_called()
+        engine.trade_logger.log_spread_fill.assert_not_called()
+
+
 # ── Startup reconciliation — spread reconstruction ──────────────────────────
 
 
@@ -552,6 +626,18 @@ class TestRestoreSpreadPositions:
         # leg was registered as a standalone single-leg position.
         assert set(engine._positions) == {"uuid-1"}
         assert engine._positions["uuid-1"].is_spread
+
+    def test_reconcile_startup_treats_reconstructed_spread_legs_as_managed(self, tmp_path):
+        strategy = _strategy()
+        engine, _ = _engine(tmp_path, strategy)
+        self._log_open_spread(engine, "uuid-1")
+        snapshot = _snapshot_with({_SHORT_OCC: object(), _LONG_OCC: object()})
+
+        conflicts = engine._restore_ownership_from_db(snapshot)
+        mode = engine._reconcile_startup(snapshot, conflicts)
+
+        assert conflicts == set()
+        assert mode == "NORMAL"
 
     def test_missing_broker_leg_declares_conflict(self, tmp_path):
         strategy = _strategy()

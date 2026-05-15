@@ -10,4 +10,6 @@ echo "── Stopping ───────────────────�
 
 echo ""
 echo "── Starting ──────────────────────────────"
+# start_bot.sh independently refuses to launch if any bot process is still
+# present, so recycle fails closed instead of creating a duplicate runtime.
 ./start_bot.sh

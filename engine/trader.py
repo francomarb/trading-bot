@@ -1817,8 +1817,32 @@ class TradingEngine:
         """
         confirm = self.config.external_close_confirm_cycles
 
-        for symbol in list(self._positions):
-            if self._get_position_for(symbol, snapshot) is not None:
+        for symbol, tracked_position in list(self._positions.items()):
+            position_present = self._get_position_for(symbol, snapshot) is not None
+            if tracked_position.is_spread:
+                broker_symbols = set(snapshot.account.open_positions)
+                present_legs = [
+                    leg.symbol for leg in tracked_position.legs
+                    if leg.symbol in broker_symbols
+                ]
+                if len(present_legs) == len(tracked_position.legs):
+                    position_present = True
+                elif present_legs:
+                    missing_legs = [
+                        leg.symbol for leg in tracked_position.legs
+                        if leg.symbol not in broker_symbols
+                    ]
+                    msg = (
+                        f"{symbol}: spread owned by '{tracked_position.strategy_name}' "
+                        f"is partially present at broker; missing leg(s) {missing_legs}. "
+                        "Leaving ownership intact for manual reconciliation."
+                    )
+                    logger.warning(msg)
+                    self.alerts.broker_error(msg)
+                    self._external_close_suspects.pop(symbol, None)
+                    continue
+
+            if position_present:
                 # Position is present — reset any suspect counter and continue.
                 self._external_close_suspects.pop(symbol, None)
                 continue
@@ -1834,7 +1858,8 @@ class TradingEngine:
                 continue
 
             # Confirmed absent for `confirm` consecutive cycles.
-            owner = self._pop_position(symbol)
+            owner = tracked_position.strategy_name
+            self._pop_position(symbol)
             self._external_close_suspects.pop(symbol, None)
             msg = (
                 f"{symbol}: position owned by '{owner}' absent for "
@@ -1855,13 +1880,36 @@ class TradingEngine:
             if last_close and last_qty == 0:
                 # Approximate: record 0 P&L (no double-count; stop may have already fired via stream).
                 pass
-            self._entry_prices.pop(symbol, None)
             try:
-                self.trade_logger.log_external_close(
-                    symbol=symbol,
-                    strategy=owner,
-                    reason="external_close_detected",
-                )
+                if tracked_position.is_spread:
+                    strategy = self._spread_owner_strategy.pop(symbol, None)
+                    released = (
+                        strategy.release_spread(symbol)
+                        if strategy is not None and hasattr(strategy, "release_spread")
+                        else None
+                    )
+                    short_occ = released.short_occ if released is not None else tracked_position.legs[0].symbol
+                    long_occ = released.long_occ if released is not None else tracked_position.legs[1].symbol
+                    qty = float(released.qty if released is not None else abs(tracked_position.legs[0].qty))
+                    self.trade_logger.log_spread_fill(
+                        position_id=symbol,
+                        strategy=owner,
+                        short_occ=short_occ,
+                        long_occ=long_occ,
+                        qty=qty,
+                        net_price=0.0,
+                        order_id=None,
+                        opening=False,
+                        realized_pnl=None,
+                        reason="external_close_detected",
+                    )
+                else:
+                    self._entry_prices.pop(symbol, None)
+                    self.trade_logger.log_external_close(
+                        symbol=symbol,
+                        strategy=owner,
+                        reason="external_close_detected",
+                    )
             except Exception as e:
                 logger.error(f"{symbol}: failed to log external close: {e}")
 
@@ -2676,10 +2724,17 @@ class TradingEngine:
         # Check for broker positions with no ownership at all.
         # OCC option positions are owned under their underlying ticker, so we
         # must resolve the owner key before checking _positions.
+        managed_spread_legs = {
+            leg.symbol
+            for position in self._positions.values()
+            if position.is_spread
+            for leg in position.legs
+        }
         unmanaged = [
             sym
             for sym in snapshot.account.open_positions
             if owner_key_for(sym) not in self._positions
+            and sym not in managed_spread_legs
         ]
         if unmanaged:
             logger.warning(
