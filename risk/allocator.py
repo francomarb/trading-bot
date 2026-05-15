@@ -308,6 +308,7 @@ class SleeveAllocator:
         open_orders: list["OpenOrder"],
         position_owners: dict[str, str],
         order_strategy: dict[str, str],
+        additional_used_notional: dict[str, float] | None = None,
     ) -> SleeveCapacity | SleeveRejection:
         if strategy_name not in self._entries:
             return SleeveRejection(
@@ -325,6 +326,7 @@ class SleeveAllocator:
             open_orders,
             position_owners,
             order_strategy,
+            additional_used_notional,
         )
 
         logger.debug(
@@ -382,6 +384,7 @@ class SleeveAllocator:
         open_orders: list["OpenOrder"],
         position_owners: dict[str, str],
         order_strategy: dict[str, str],
+        additional_used_notional: dict[str, float] | None = None,
     ) -> dict[str, dict]:
         strategies: dict[str, dict] = {}
         pending_strategy_notional = self._pending_order_notional_by_strategy(
@@ -395,6 +398,7 @@ class SleeveAllocator:
                 open_orders,
                 position_owners,
                 order_strategy,
+                additional_used_notional,
             )
             strategies[name] = {
                 "pool_type": cap.pool_type,
@@ -427,6 +431,7 @@ class SleeveAllocator:
                 open_orders,
                 position_owners,
                 order_strategy,
+                additional_used_notional,
             )
             available = max(0.0, target_budget - used)
             pools[pool_type] = {
@@ -446,6 +451,7 @@ class SleeveAllocator:
         open_orders: list["OpenOrder"],
         position_owners: dict[str, str],
         order_strategy: dict[str, str],
+        additional_used_notional: dict[str, float] | None = None,
     ) -> SleeveCapacity:
         entry = self._entries[strategy_name]
         pool_type = entry["pool_type"]
@@ -456,6 +462,7 @@ class SleeveAllocator:
             open_orders,
             position_owners,
             order_strategy,
+            additional_used_notional,
         )
         positions_open = sum(
             1 for owner in position_owners.values() if owner == strategy_name
@@ -471,6 +478,7 @@ class SleeveAllocator:
                 open_orders,
                 position_owners,
                 order_strategy,
+                additional_used_notional,
             )
             pool_slack = max(0.0, pool_budget - pool_used)
             utilization = (
@@ -479,6 +487,7 @@ class SleeveAllocator:
                     open_orders,
                     position_owners,
                     order_strategy,
+                    additional_used_notional,
                 ) / deployable_capital
                 if deployable_capital > 0 else 1.0
             )
@@ -513,12 +522,16 @@ class SleeveAllocator:
         self,
         account: "AccountState",
         position_owners: dict[str, str],
+        additional_used_notional: dict[str, float] | None = None,
     ) -> dict[str, float]:
         totals = {name: 0.0 for name in self._entries}
         for symbol, pos in account.open_positions.items():
             owner = position_owners.get(symbol)
             if owner in totals:
                 totals[owner] += abs(pos.market_value)
+        for strategy_name, notional in (additional_used_notional or {}).items():
+            if strategy_name in totals:
+                totals[strategy_name] += max(0.0, float(notional))
         return totals
 
     def _pending_order_notional_by_strategy(
@@ -548,8 +561,11 @@ class SleeveAllocator:
         open_orders: list["OpenOrder"],
         position_owners: dict[str, str],
         order_strategy: dict[str, str],
+        additional_used_notional: dict[str, float] | None = None,
     ) -> float:
-        positions = self._position_notional_by_strategy(account, position_owners)
+        positions = self._position_notional_by_strategy(
+            account, position_owners, additional_used_notional
+        )
         pending = self._pending_order_notional_by_strategy(open_orders, order_strategy)
         return positions.get(strategy_name, 0.0) + pending.get(strategy_name, 0.0)
 
@@ -560,8 +576,11 @@ class SleeveAllocator:
         open_orders: list["OpenOrder"],
         position_owners: dict[str, str],
         order_strategy: dict[str, str],
+        additional_used_notional: dict[str, float] | None = None,
     ) -> float:
-        positions = self._position_notional_by_strategy(account, position_owners)
+        positions = self._position_notional_by_strategy(
+            account, position_owners, additional_used_notional
+        )
         pending = self._pending_order_notional_by_strategy(open_orders, order_strategy)
         total = 0.0
         for strategy_name, entry in self._entries.items():
@@ -581,6 +600,7 @@ class SleeveAllocator:
         open_orders: list["OpenOrder"],
         position_owners: dict[str, str],
         order_strategy: dict[str, str],
+        additional_used_notional: dict[str, float] | None = None,
     ) -> float:
         return self._pool_used_notional(
             PoolType.EQUITY.value,
@@ -588,10 +608,12 @@ class SleeveAllocator:
             open_orders,
             position_owners,
             order_strategy,
+            additional_used_notional,
         ) + self._pool_used_notional(
             "isolated_options",
             account,
             open_orders,
             position_owners,
             order_strategy,
+            additional_used_notional,
         )

@@ -991,6 +991,7 @@ class TradingEngine:
                 open_orders=snapshot.open_orders,
                 position_owners=self._owners_view(),
                 order_strategy=order_strategy or {},
+                additional_used_notional=self._multi_leg_risk_notional_by_strategy(),
             )
             if isinstance(sleeve, SleeveRejection):
                 logger.info(
@@ -2106,6 +2107,23 @@ class TradingEngine:
             })
         return out
 
+    def _multi_leg_risk_notional_by_strategy(self) -> dict[str, float]:
+        """
+        Defined-risk multi-leg positions consume sleeve by max loss, not by
+        broker leg market value. Kept strategy-name agnostic for future MLEG
+        strategies that expose the same ``get_open_spread`` view.
+        """
+        totals: dict[str, float] = {}
+        for position_id, strategy in self._spread_owner_strategy.items():
+            getter = getattr(strategy, "get_open_spread", None)
+            spread = getter(position_id) if callable(getter) else None
+            if spread is None:
+                continue
+            max_loss = max(0.0, float(spread.width) - float(spread.net_credit))
+            notional = max_loss * 100.0 * abs(float(spread.qty))
+            totals[strategy.name] = totals.get(strategy.name, 0.0) + notional
+        return totals
+
     def _spread_positions_for(
         self, underlying: str, strategy_name: str
     ) -> list[Position]:
@@ -2830,6 +2848,7 @@ class TradingEngine:
                     self._last_snapshot.open_orders,
                     self._owners_view(),
                     order_strategy,
+                    additional_used_notional=self._multi_leg_risk_notional_by_strategy(),
                 )
                 sleeve_usage = {
                     name: detail["used"]

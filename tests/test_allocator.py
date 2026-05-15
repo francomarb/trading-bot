@@ -240,6 +240,19 @@ class TestSleeveCheck:
         assert result.used == pytest.approx(2_000.0)
         assert result.available == pytest.approx(2_000.0)
 
+    def test_additional_used_notional_counts_against_strategy_and_pool(self):
+        result = _allocator().check(
+            "spy_options_reversion",
+            _account(),
+            [],
+            {},
+            {},
+            additional_used_notional={"spy_options_reversion": 850.0},
+        )
+        assert isinstance(result, SleeveCapacity)
+        assert result.used == pytest.approx(850.0)
+        assert result.available == pytest.approx(3_150.0)
+
     def test_count_rejection_comes_only_from_hard_max_positions(self):
         positions = {
             f"SYM{i}": _position(f"SYM{i}", 1, 1_000.0)
@@ -293,6 +306,17 @@ class TestSleeveCheck:
         assert snapshot["strategies"]["rsi_reversion"]["pending_entry_notional"] == pytest.approx(2_000.0)
         assert snapshot["pools"]["equity"]["pending_entry_notional"] == pytest.approx(2_000.0)
         assert snapshot["pools"]["isolated_options"]["used"] == pytest.approx(2_000.0)
+
+    def test_snapshot_includes_additional_used_notional(self):
+        snapshot = _allocator().snapshot(
+            _account(),
+            [],
+            {"spread-1": "spy_options_reversion"},
+            {},
+            additional_used_notional={"spy_options_reversion": 850.0},
+        )
+        assert snapshot["strategies"]["spy_options_reversion"]["used"] == pytest.approx(850.0)
+        assert snapshot["pools"]["isolated_options"]["used"] == pytest.approx(850.0)
 
 
 class TestSleeveDrawdownGate:

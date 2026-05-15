@@ -489,6 +489,29 @@ class TestCreditSpreadsSnapshot:
         assert engine._credit_spreads_snapshot() == []
 
 
+class TestMultiLegRiskNotional:
+    def test_credit_spread_uses_defined_max_loss_notional(self, tmp_path):
+        strategy = _strategy()
+        engine, _ = _engine(tmp_path, strategy)
+        engine._spread_owner_strategy["p1"] = strategy
+        strategy.register_spread(_open_spread("p1", net_credit=1.45))
+
+        usage = engine._multi_leg_risk_notional_by_strategy()
+
+        assert usage == {"credit_spread": pytest.approx(855.0)}
+
+    def test_non_credit_spread_strategy_name_is_supported(self, tmp_path):
+        strategy = _strategy()
+        strategy.name = "iron_condor"
+        engine, _ = _engine(tmp_path, strategy)
+        engine._spread_owner_strategy["p1"] = strategy
+        strategy.register_spread(_open_spread("p1", net_credit=2.00))
+
+        usage = engine._multi_leg_risk_notional_by_strategy()
+
+        assert usage == {"iron_condor": pytest.approx(800.0)}
+
+
 # ── External close detection ────────────────────────────────────────────────
 
 
