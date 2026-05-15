@@ -114,12 +114,20 @@ trading-bot/
 │
 ├── execution/
 │   ├── __init__.py
-│   ├── broker.py              # AlpacaBroker — TradingClient wrapper + equity/options routing
-│   ├── options_executor.py    # OptionsExecutionWorker — async bracket-order thread
-│   └── stream.py              # StreamManager — WebSocket fill/order streaming
+│   ├── broker.py              # AlpacaBroker — TradingClient wrapper + equity/options/MLEG routing
+│   ├── options_executor.py    # OptionsExecutionWorker (single-leg) + SpreadExecutionWorker (MLEG combo)
+│   └── stream.py              # StreamManager — WebSocket fill/order streaming (incl. MLEG parents)
+│
+├── engine/
+│   ├── __init__.py
+│   ├── trader.py              # TradingEngine — cycle loop, MLEG entry/drain/exit paths
+│   └── positions.py           # Position / PositionLeg / make_single_leg / make_spread (PLAN.md 11.27)
 │
 ├── utils/
-│   └── options_lookup.py      # find_best_call: selects ITM call by delta + DTE from Alpaca chain
+│   ├── option_symbols.py      # owner_key_for / parse_occ_symbol / is_occ_option
+│   ├── options_lookup.py      # find_best_call (single-leg) + find_best_put_spread + build_opra_quote_lookup
+│   ├── options_ranker.py      # rank_call_candidates + rank_put_spread_candidates
+│   └── iv_proxy.py            # VIX / RVX resolver for the credit-spread IV gate
 │
 ├── reporting/
 │   ├── __init__.py
@@ -144,6 +152,8 @@ trading-bot/
 │   ├── rsi_candidate_validate.py
 │   ├── rsi_watchlist_scan.py
 │   ├── sma_watchlist_scan.py
+│   ├── verify_spread_order.py    # 11.28 MLEG submit/cancel merge gate (real paper API)
+│   ├── verify_credit_spread.py   # 11.29 strategy decision pipeline against live paper data
 │   └── watchlist_review.py
 │
 ├── tests/
@@ -284,7 +294,7 @@ class BaseStrategy(ABC):
 
 **Options extension points on BaseStrategy:**
 
-Strategies that trade options may implement two additional methods:
+**Single-leg options** strategies implement two additional methods:
 
 ```python
 def build_option_execution(
@@ -305,7 +315,39 @@ def inspect_open_positions(self, position, latest_close: float) -> bool:
     """
 ```
 
-Neither method has a default implementation in `BaseStrategy` — only strategies that trade options need them. The engine calls `inspect_open_positions` before processing the entry/exit signal branch for that symbol.
+**Multi-leg (MLEG) combo** strategies (e.g. credit spreads) implement a duck-typed protocol the engine detects via `hasattr`:
+
+```python
+def build_spread_execution(
+    self, underlying_close: float, *,
+    notional_cap: float, total_open_credit_spreads: int,
+) -> SpreadExecutionPlan:
+    """
+    Called by the engine on entry. Runs the strategy's per-instance caps,
+    picks the spread from the live chain, and returns a plan with legs +
+    qty + limit_price (negative for a credit). Raises
+    CreditSpreadRejected if no entry is available.
+    """
+
+def evaluate_spread_exit(
+    self, spread: OpenSpread, *, underlying_close: float, today: date,
+) -> tuple[bool, str, float | None]:
+    """
+    Engine-facing exit check. Quotes both legs, computes the spread mid,
+    runs the exit triggers. Returns (should_exit, reason, spread_mid).
+    Returns (False, "", None) on missing market data — never exit on a
+    quote gap.
+    """
+
+# Plus the open-position view the engine keeps in sync:
+def register_spread(self, spread: OpenSpread) -> None: ...
+def release_spread(self, position_id: str) -> OpenSpread | None: ...
+@property
+def open_spreads(self) -> list[OpenSpread]: ...
+def get_open_spread(self, position_id: str) -> OpenSpread | None: ...
+```
+
+Detection is purely duck-typed: a strategy exposing `build_spread_execution` is routed through the MLEG engine path (§6, "Multi-leg combo (MLEG) order path"). None of the methods have defaults in `BaseStrategy` — only strategies that need them implement them. The engine calls `inspect_open_positions` (single-leg) or `_process_credit_spread_exits` (MLEG) before processing the entry/exit signal branch for that symbol.
 
 **Edge filter contract:**
 - The repo standard is a structured edge-filter decision carrying both `allowed` and `reasons`
@@ -332,10 +374,11 @@ Each slot binds a strategy to its symbol universe, timeframe, and allowed regime
 
 | Strategy | File | Status | Order Type | Allowed Regimes | Sleeve |
 |---|---|---|---|---|---|
-| SMA Crossover | `sma_crossover.py` | **Paper Trading** | MARKET | TRENDING, RANGING | 45% |
-| RSI Reversion | `rsi_reversion.py` | **Paper Trading** | LIMIT | TRENDING, RANGING | 25% |
-| Donchian Breakout | `donchian_breakout.py` | **Paper Trading** | MARKET | TRENDING only | 25% |
-| SPY Options RSI Reversion | `spy_options_reversion.py` | **Paper Trading** | LIMIT (async bracket) | TRENDING, RANGING | 5% |
+| SMA Crossover | `sma_crossover.py` | **Paper Trading** | MARKET | TRENDING, RANGING | 40% (equity) |
+| RSI Reversion | `rsi_reversion.py` | **Paper Trading** | LIMIT | TRENDING, RANGING | 20% (equity) |
+| Donchian Breakout | `donchian_breakout.py` | **Paper Trading** | MARKET | TRENDING only | 25% (equity) |
+| SPY Options RSI Reversion | `spy_options_reversion.py` | **Paper Trading** | LIMIT (async bracket) | TRENDING, RANGING | 5% (isolated) |
+| Credit Spread (SPY + QQQ) | `credit_spread.py` | **Paper Trading** | MLEG combo (async) | TRENDING, RANGING | 10% (isolated, shared across underlyings) |
 
 ### 5. Risk Manager + Sleeve Allocator
 
@@ -435,6 +478,47 @@ Options orders are detected by matching the OCC symbol format (`^[A-Z]{1,6}[0-9]
 
 **Position ownership model (PLAN.md 11.27):** `_positions: dict[position_id, Position]` keys single-leg positions by `owner_key_for(symbol)` — equity ticker or option underlying — and reserves UUID `position_id`s for spreads. The earlier 11.23 limitation (two options strategies on the same underlying would collide because both were keyed by the underlying ticker) is superseded by this abstraction: future multi-leg or same-underlying strategies key on their own `position_id`. See `engine/positions.py`.
 
+#### Multi-leg combo (MLEG) order path — credit spreads (PLAN.md 11.28 / 11.29)
+
+A second options dispatch path handles atomic multi-leg combos via Alpaca's `OrderClass.MLEG`. It's parallel to the single-leg path above and shares the worker-thread / async-drain pattern, but with a different request shape (`legs: list[OptionLegRequest]`, no top-level `symbol`/`side`) and atomic fill semantics (both legs fill or neither — no orphan-leg risk).
+
+**Detection.** A strategy that exposes `build_spread_execution(...)` is routed to the MLEG path. The engine's `_process_symbol` takes the dedicated spread branch:
+
+1. **Exit eval runs before any entry gating** — `_process_credit_spread_exits` iterates `strategy.open_spreads`, evaluates `evaluate_spread_exit` per spread, and dispatches a closing combo on a trigger. Exits are never blocked by halt / regime / sleeve.
+2. **Entry bypasses `RiskManager.evaluate`** — a defined-risk spread's max loss IS the risk control (capped by the sleeve notional). The engine-level guards above it (halt, daily-loss, broker-error streak, regime gate, sleeve allocator) still run.
+3. `_enter_credit_spread` calls `build_spread_execution`, which runs the strategy's own caps (`max_concurrent_positions`, `max_per_expiration`, `min_dte_gap_between_opens`, global `MAX_TOTAL_CONCURRENT_CREDIT_SPREADS`) and picks the spread from the live chain.
+
+**Dispatch (`broker.dispatch_spread_order`).** Builds an MLEG `LimitOrderRequest` and starts a `SpreadExecutionWorker` thread. Returns `ACCEPTED` immediately. A `closing=True` flag reverses the legs into the `*_TO_CLOSE` trade so opens and closes share one worker + drain path.
+
+| Direction | `limit_price` sign | Meaning |
+|---|---|---|
+| Open a credit spread | **Negative** (`-net_credit`) | Net credit required |
+| Close a credit spread | **Positive** (`+net_debit`) | Net debit paid to close |
+
+The MLEG limit-price sign convention was confirmed against the Alpaca paper API by `scripts/verify_spread_order.py` during 11.28: a positive limit on a credit spread means "pay any debit up to that number" and fills near-instantly — exactly backwards from the credit semantics.
+
+**Async fill drain (`broker.drain_spread_fills` → `engine._drain_spread_fills`).** Each worker reports its terminal outcome onto a queue tagged with `(position_id, strategy_name, closing, status, qty, price, order_id)`. Each cycle the engine drains:
+
+| Branch | Effect |
+|---|---|
+| `closing=False`, filled | Log entry to the trade DB, fire alert, keep the pre-registered `Position` |
+| `closing=False`, canceled/rejected | Roll back the pre-registered `Position` + the strategy's `OpenSpread` view |
+| `closing=True`, filled | Drop the `Position`, release on the strategy, compute realized P&L `= (net_credit − net_debit) × qty × 100`, feed the **allocator HWM / sleeve-drawdown gate**, log the close. If the fill price is unavailable (rare stream-fill + REST-failure case), the position still closes but realized P&L is **left unset, never fabricated** |
+| `closing=True`, canceled | Keep the position open; clear `_spreads_pending_close` so the exit path retries next cycle |
+
+**Pre-registration.** When a worker is dispatched, the engine immediately creates a two-leg `Position` (UUID `position_id`, `position_type='spread'`, both legs) and calls `strategy.register_spread(OpenSpread(...))`. The drain confirms or rolls back. `_spreads_pending_close` guards against double-submitting a close while one is in flight.
+
+**Trade-DB layout for spreads.** `log_spread_fill` writes **one row per leg** (both keyed by the same `position_id`, `position_type='spread'`). The net economics ride the short-leg row; the long-leg row carries `avg_fill_price=0.0`. Realized P&L on a close rides the short-leg close row so `read_strategy_realized_pnl_summary` (which now counts `position_type='spread'` rows alongside single-leg sells) folds spread P&L into the HWM gate after a restart. Spread rows are deliberately **excluded** from `read_all_open_owners` / `read_owner_for_symbol` — a spread leg is not a standalone single-leg position; the long-leg's `side='buy'` row would otherwise be mistaken for a single-leg open.
+
+**Startup spread reconstruction (`_restore_spread_positions`).** Runs before the single-leg restore loop. For each open spread in the trade DB:
+- Both leg OCCs must be present in the broker snapshot, AND a `CreditSpread` instance must be configured for the underlying — else the underlying is added to `conflicts` → **RESTRICTED** startup mode (exits only; close it manually or fix the slot configuration).
+- On success: rebuilds the two-leg `Position`, `_spread_owner_strategy[position_id] = strategy`, and the strategy's `OpenSpread` view. Strikes / expiration / width are parsed from the leg OCC strings via `parse_occ_symbol`.
+- Spread-leg OCCs are then **skipped** by the single-leg restore loop — without this, a leg would fall through to the best-effort slot-match and could be mis-assigned to the wrong strategy (e.g. a SPY spread leg handed to `spy_options_reversion`, which would then manage it as a single-leg position and could close one leg, leaving a naked short put).
+
+**Entry-guard bypass.** The standard "already hold this symbol, skip re-entry" guard in `_process_symbol` (`_entry_blocked_by_existing_position`) is **skipped** for spread strategies — `_get_position_for()` regex-matches a spread leg OCC to the underlying, so a held spread otherwise looked like an "existing position" and silently disabled the strategy's `max_concurrent_positions`. Concurrency is governed by the per-instance caps inside `build_spread_execution`. The cross-strategy symbol-conflict check (`_get_owner`) still runs immediately after, so an unrelated single-leg owner of the same symbol is still blocked.
+
+**Known generalization seam (PLAN.md 11.31).** Two engine helpers — `_count_open_credit_spreads` and `_credit_spread_strategy_for` — currently filter on `strategy_name == "credit_spread"`. A second multi-leg strategy with a different sleeve name would be missed by the global concurrent cap and by startup reconstruction. The rest of the MLEG plumbing (broker dispatch, worker, request builder, position model, drain) is leg-count-agnostic and duck-typed on the strategy hooks — replace those two name-literal filters with `hasattr(strategy, "build_spread_execution")` before adding strategy #2.
+
 #### Other execution rules
 
 - `DRY_RUN=True` logs orders without submitting (final sanity check before live)
@@ -451,14 +535,17 @@ Every trade is logged to SQLite for the go/no-go evaluation. This layer also com
 - `data/trades.db` — paper trading (never mixed with live data)
 - `data/trades_live.db` — live trading (separate file to prevent cross-contamination)
 
-The `TradeLogger` inserts a row for every fill. Three write paths:
+The `TradeLogger` inserts a row for every fill. Write paths:
 
 | Method | Used when | Fill price recorded |
 |---|---|---|
-| `log(build_record(...))` | Entry fills (all strategies) | `result.avg_fill_price` |
-| `log(build_close_record(...))` | Signal-based exit fills | `result.avg_fill_price`; `modeled_price` is the premium for options, bar close for equities |
+| `log(build_record(...))` | Entry fills (single-leg strategies) | `result.avg_fill_price` |
+| `log(build_close_record(...))` | Signal-based single-leg exit fills | `result.avg_fill_price`; `modeled_price` is the premium for options, bar close for equities |
 | `log_stop_fill(symbol, strategy, qty, avg_fill_price)` | Confirmed WebSocket bracket stop fills | Exact stream fill price and qty |
 | `log_external_close(symbol, strategy, reason)` | Inferred external closes (no confirmed fill event) | `NULL` — price unknown |
+| `log_spread_fill(position_id, short_occ, long_occ, qty, net_price, opening, realized_pnl=...)` | MLEG combo open / close (credit spreads, 11.29) | Writes **two rows per fill** (one per leg) keyed by the same `position_id`, `position_type='spread'`. Net economics on the short-leg row; realized P&L on the short-leg close row feeds the allocator HWM gate via `read_strategy_realized_pnl_summary`. |
+
+Every row carries a `position_id` and `position_type` (added in 11.27). For single-leg rows `position_id = owner_key_for(symbol)`; for spread rows it is the UUID assigned at dispatch. The legacy single-leg owner queries (`read_all_open_owners`, `read_owner_for_symbol`) exclude spread rows by construction — spreads restore via the dedicated `read_open_spread_positions` path used by `_restore_spread_positions`.
 
 **Metrics computed (`reporting/metrics.py`):**
 

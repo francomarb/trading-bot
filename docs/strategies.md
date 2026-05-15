@@ -335,7 +335,7 @@ Options orders do not go through the standard equity broker path. The flow is:
 5. Mid-trade exits are triggered by `inspect_open_positions` → `broker.close_position(occ)`
 6. Bracket stop-leg fills are delivered by the WebSocket stream → `_process_stream_stop_fills`
 
-The engine's ownership map (`_positions`) keys single-leg option positions by the underlying ticker (`"SPY"`) via `owner_key_for()`, and reserves UUID `position_id`s for multi-leg positions (see PLAN.md 11.27 and `engine/positions.py`). Future same-underlying or spread strategies set an explicit `position_id` and so cannot collide.
+The engine's ownership map (`_positions`) keys single-leg option positions by the underlying ticker (`"SPY"`) via `owner_key_for()`, and reserves UUID `position_id`s for multi-leg positions (see PLAN.md 11.27 and `engine/positions.py`). The credit-spread strategy below uses that UUID path; a same-underlying single-leg + spread combination cannot collide on the ownership map.
 
 **Backtest performance (SPY daily 2019–2025, RSI 45 oversold, trailing stop activated):**
 
@@ -356,18 +356,133 @@ The equity strategies are all long-biased and rely on sustained price trends. SP
 
 ---
 
+### Credit Spread
+
+| Field | Value |
+|---|---|
+| File | `strategies/credit_spread.py` |
+| Class | `CreditSpread` (one instance per underlying) |
+| Type | Defined-risk short premium (bull put credit spread) |
+| Instruments | SPY + QQQ at v1 (IWM / single names / leveraged ETFs deferred — see [`docs/credit_spread_strategy.md`](credit_spread_strategy.md) §15) |
+| Order type | Atomic MLEG combo (`OrderClass.MLEG`) via `SpreadExecutionWorker` |
+| Status | **Paper Trading** |
+| Sleeve weight | 10% of gross capital (shared across SPY + QQQ instances) |
+| Max positions | 8 total (`MAX_TOTAL_CONCURRENT_CREDIT_SPREADS`), 3 per underlying |
+| Per-position max loss | ~$850 (SPY $10 width) – ~$1,300 (QQQ $15 width) |
+| Activated | 2026-05-15 |
+
+**Signal logic:**
+- **Entry signal:** every bar is a candidate (`_raw_signals` returns all-True entries). The real gating is the edge filter (trend + IV + earnings), the per-instance caps inside `build_spread_execution` (concurrent / per-expiration / DTE stagger), and chain/spread availability.
+- **Exit signal:** never emitted by `_raw_signals`. Exits run through `evaluate_spread_exit` on every engine cycle — quote both legs, compute the current spread mid, evaluate the triggers in §4 of the design doc.
+
+A bull put credit spread sells the short (higher-strike) put and buys the long (lower-strike) put with the same expiration. The strategy is delta-neutral-ish at entry and theta-positive — it earns the time decay of the short leg minus the time decay of the long leg, defined-risk by the strike width.
+
+**Per-instrument config (`CREDIT_SPREAD_INSTRUMENTS` in `config/settings.py`):**
+
+| Parameter | SPY | QQQ | Notes |
+|---|---:|---:|---|
+| `short_leg_delta` | 0.17 | 0.17 | Target |Δ| of the short put |
+| `spread_width` | $10 | $15 | Long leg this many dollars below short |
+| `dte_min` / `dte_max` | 30 / 45 | 30 / 45 | DTE window for the picker |
+| `iv_proxy_source` | `vix` | `vix` | QQQ tracks SPX closely; VIX is the proxy |
+| `min_iv_proxy` | 14 | 14 | VIX index points — entry blocked when premium is thin |
+| `min_credit_pct_of_width` | 0.13 | 0.13 | Floor on net credit / width. **Note:** the design doc default is 0.25, but the 11.28 merge gate showed real ~17Δ $10-wide SPY spreads collect only ~13–15% of width — 0.25 would reject nearly every spread. SPY may still sit idle in normal-vol conditions while QQQ trades comfortably; PLAN.md 11.30 will revisit. |
+| `max_concurrent_positions` | 3 | 3 | Per instance |
+| `max_per_expiration` | 1 | 1 | Don't stack on one expiration |
+| `min_dte_gap_between_opens` | 7 | 7 | Calendar diversification |
+| `profit_target_pct` | 0.50 | 0.50 | Close at 50% of max profit (tastytrade-validated) |
+| `stop_loss_multiple` | 2.0 | 2.0 | Soft stop at 2× the credit collected |
+| `time_stop_dte` | 21 | 21 | Exit by 21 DTE — gamma exposure climbs in the last 3 weeks |
+| `exit_on_short_strike_breach` | True | True | Thesis broken when underlying ≤ short strike |
+| `earnings_blackout_days` | 0 | 0 | ETFs have no earnings; meaningful only for single names |
+
+**Entry gates (all must pass):**
+
+1. **Regime** — `{TRENDING, RANGING}` only (slot's `allowed_regimes`). Never sell puts in BEAR / VOLATILE — a vol spike is exactly when defined-risk shorts hit max loss.
+2. **Underlying trend** — close > its own 50-day SMA (edge filter).
+3. **IV proxy** — `VIX ≥ min_iv_proxy` (edge filter). Only sell premium when premium is rich.
+4. **DTE availability** — at least one expiration in `[dte_min, dte_max]` from the live chain.
+5. **Spread availability** — the multi-leg picker returns a valid pair (delta-target, min credit, valid quotes).
+6. **Per-instance concurrent cap** — `max_concurrent_positions` not yet hit.
+7. **Per-expiration cap** — at most `max_per_expiration` open on the picked expiration.
+8. **DTE staggering** — new expiration ≥ `min_dte_gap_between_opens` days from the most recently opened spread on this underlying.
+9. **Global concurrent cap** — `MAX_TOTAL_CONCURRENT_CREDIT_SPREADS` (8) not yet hit across all credit-spread instances combined.
+10. **Earnings blackout** (single-name only — no-op for v1 ETFs).
+
+**Exit triggers (any one — `should_exit_spread` / `evaluate_spread_exit`):**
+
+| Trigger | Condition | Rationale |
+|---|---|---|
+| Profit target | Spread mid ≤ `profit_target_pct` × initial credit | Closing at 50% of max profit dominates "hold to expiration" on Sharpe |
+| Stop loss | Spread mid ≥ `stop_loss_multiple` × initial credit | Don't ride losers all the way to max loss |
+| Time stop | DTE ≤ `time_stop_dte` | Gamma exposure becomes punishing in the last 3 weeks |
+| Short strike breach | Underlying close ≤ short strike | Thesis broken; freeing capital beats riding it out |
+| Regime exit | Regime shifts to BEAR mid-trade | Engine-level defensive override (exits never blocked by regime gate) |
+
+`evaluate_spread_exit` quotes both legs via OPRA, computes the spread mid (short mid − long mid = current cost to close), runs the triggers, and **holds the position on missing quote data** — never exit on a quote gap.
+
+**Edge filter (`strategies/filters/credit_spread.py` — `CreditSpreadEdgeFilter`):** trend gate (underlying > own 50 SMA, per bar) + IV-proxy floor (scalar VIX, broadcast) + earnings blackout (single names only). Fails **open** on an IV-fetch hiccup so a transient `yfinance` failure does not lock the strategy out.
+
+**Execution path (MLEG combo):**
+
+Entry:
+1. `_process_symbol` detects `hasattr(strategy, "build_spread_execution")` → takes the dedicated spread path. **Bypasses `RiskManager.evaluate`** (built for single-leg ATR-stop sizing — N/A to a defined-risk spread). Still passes every engine-level guard above it: halt, daily-loss, broker-error streak, regime gate, sleeve allocator.
+2. `_enter_credit_spread` calls `strategy.build_spread_execution(...)` — runs the caps, picks the spread from the live chain via `find_best_put_spread`, returns a `SpreadExecutionPlan` with a **negative** limit price (Alpaca MLEG sign convention: positive = net debit paid, negative = net credit required — confirmed by the 11.28 merge gate).
+3. `broker.dispatch_spread_order` builds the MLEG `LimitOrderRequest` and starts a `SpreadExecutionWorker` thread. Returns `ACCEPTED` immediately; the worker watches the combo via the WebSocket stream and cancels if unfilled past its timeout.
+4. The engine pre-registers a two-leg `Position` (keyed by a UUID `position_id`, `position_type='spread'`) and calls `strategy.register_spread(OpenSpread(...))`. Pre-registration is rolled back on cancel/reject.
+5. Each cycle `_drain_spread_fills` consumes the worker's terminal events: fills → log to trade DB and fire the alert; cancels → release the pre-registration.
+
+Exit:
+1. `_process_credit_spread_exits` runs before any entry gating (exits are never blocked by halt / regime / sleeve). Iterates `strategy.open_spreads`; for each runs `evaluate_spread_exit`.
+2. On a trigger: `broker.dispatch_spread_order(closing=True, position_id=<existing>)` — the broker reverses the legs into the `*_TO_CLOSE` trade and the same worker handles it. The `position_id` is added to `_spreads_pending_close` so the exit path doesn't double-submit.
+3. On the close fill: `_drain_spread_fills` close path drops the `Position`, releases it on the strategy, records realized P&L `= (net_credit − net_debit) × qty × 100` into the **allocator's HWM / sleeve-drawdown gate**, and writes the close row to the trade DB. **If the fill price is unavailable** (stream "filled" + REST follow-up failure) the position still closes but realized P&L is left unset, never fabricated to zero.
+
+**Trade-DB layout:** one row per leg per fill, both rows sharing the spread's `position_id` with `position_type='spread'`. Spread rows are excluded from `read_all_open_owners` / `read_owner_for_symbol` (a spread leg is not a standalone single-leg position) — they restore via the dedicated `read_open_spread_positions` path. Realized P&L on a close rides the short-leg row; `read_strategy_realized_pnl_summary` counts spread rows alongside single-leg sells so credit-spread P&L feeds the HWM gate on restart too.
+
+**Startup reconciliation:** `_restore_spread_positions` rebuilds the full two-leg `Position`, `_spread_owner_strategy`, and the strategy's `OpenSpread` view from the trade DB + the broker's leg positions. Strikes / expiration / width are parsed from the leg OCC strings (`parse_occ_symbol`). If either leg is missing from the broker, or no `CreditSpread` instance is configured for the underlying, the underlying is declared a conflict → RESTRICTED startup mode (no new entries this cycle). Spread leg OCCs are then skipped by the single-leg restore loop so a leg cannot be mis-assigned to a different strategy (e.g. spy_options_reversion) — that would risk one strategy closing one leg of a live spread, leaving a naked short put.
+
+**Regime gating:**
+
+| Regime | Allowed |
+|---|---|
+| TRENDING | ✅ Yes |
+| RANGING | ✅ Yes |
+| VOLATILE | ❌ No |
+| BEAR | ❌ No |
+
+**Watchlist:** `["SPY", "QQQ"]` (kept in sync with `CREDIT_SPREAD_INSTRUMENTS` via an import-time consistency check in `config/settings.py`).
+
+**Expected behavior (paper-projected, from the design doc):**
+
+| Metric | Expected range |
+|---|---|
+| Win rate per trade | 72–80% |
+| Average winner | ~50% of credit received |
+| Average loser | 1.5–2.5× credit received |
+| Trade cycles per year | 150–200 across SPY + QQQ |
+| Annual sleeve return | 30–60% in normal conditions |
+| Worst quarter | −10% to −25% of sleeve, plausibly more if positioned wrong into a vol spike |
+
+**Critical caveat — negative skew.** Many small wins, occasional large losers. Sharpe is high but the path is bumpy. There will be weeks where the sleeve looks ugly even while expectancy holds long-term. **Acceptance of this characteristic is a prerequisite for running the strategy.**
+
+**Why this strategy:** the existing strategies are all long-premium / long-direction. Credit spreads are structurally short-premium — they earn the volatility risk premium that retail option *buyers* pay, with defined risk capped by the strike width. The mechanics align with what works in retail options (collect theta, exit at 50% of max profit, time-stop the gamma cliff). The 10% sleeve keeps total exposure bounded while the strategy is paper-validated; PLAN.md **11.30** is the calibration pass after 20–30 paper cycles.
+
+---
+
 ## Strategy Diversification
 
-All four strategies provide complementary coverage across market regimes:
+All five strategies provide complementary coverage across market regimes:
 
-| Market Regime | SMA Crossover | RSI Reversion | Donchian Breakout | SPY Options |
-|---|---|---|---|---|
-| Strong trend | ✅ Profitable | ⚠️ Few signals | ✅ Profitable | ✅ Active |
-| Sideways/range | ⚠️ Whipsawed | ✅ Profitable | ❌ Blocked | ✅ Active |
-| Volatile crash | ❌ Blocked | ❌ Blocked | ❌ Blocked | ❌ Blocked |
-| Bear market | ❌ Blocked | ❌ Blocked | ❌ Blocked | ❌ Blocked |
+| Market Regime | SMA Crossover | RSI Reversion | Donchian Breakout | SPY Options | Credit Spread |
+|---|---|---|---|---|---|
+| Strong trend | ✅ Profitable | ⚠️ Few signals | ✅ Profitable | ✅ Active | ✅ Active |
+| Sideways/range | ⚠️ Whipsawed | ✅ Profitable | ❌ Blocked | ✅ Active | ✅ Active |
+| Volatile crash | ❌ Blocked | ❌ Blocked | ❌ Blocked | ❌ Blocked | ❌ Blocked |
+| Bear market | ❌ Blocked | ❌ Blocked | ❌ Blocked | ❌ Blocked | ❌ Blocked |
 
-All four strategies share a single `RiskManager` and a portfolio allocator. The allocator splits deployable capital into a shared `equity` pool and an isolated options vault, then enforces per-strategy target budgets, concentration caps, and hard count ceilings. Risk sizing still lives in `RiskManager`; the allocator supplies strategy-level ceilings only.
+The first four are long-premium / long-direction; the credit spread is short-premium / theta-positive — they earn opposite sides of the volatility risk premium, so the credit-spread sleeve diversifies the portfolio's volatility exposure (it earns when realized vol < implied vol, the others depend on directional moves).
+
+All five strategies share a single `RiskManager` and a portfolio allocator. The allocator splits deployable capital into a shared `equity` pool and an isolated options vault, then enforces per-strategy target budgets, concentration caps, and hard count ceilings. Risk sizing still lives in `RiskManager` — except for credit spreads, which bypass `RiskManager.evaluate` because their max loss is defined by the spread width and capped by the sleeve notional; the allocator HWM / sleeve-drawdown gate still applies via `record_realized_pnl` on every close.
 
 ---
 
@@ -377,18 +492,18 @@ Configured in `config/settings.py` under `STRATEGY_ALLOCATIONS`:
 
 ```python
 CAPITAL_POOLS = {
-    "equity": 0.95,
-    "isolated_options": 0.05,
+    "equity": 0.85,
+    "isolated_options": 0.15,
 }
 
 STRATEGY_ALLOCATIONS = {
     "sma_crossover": {
-        "target_pct": 0.45, "type": "equity", "priority": 3,
+        "target_pct": 0.40, "type": "equity", "priority": 3,
         "can_stretch": True, "hard_max_positions": 8,
         "max_position_pct_of_sleeve": 0.40,
     },
     "rsi_reversion": {
-        "target_pct": 0.25, "type": "equity", "priority": 1,
+        "target_pct": 0.20, "type": "equity", "priority": 1,
         "can_stretch": True, "hard_max_positions": 8,
         "max_position_pct_of_sleeve": 0.40,
     },
@@ -402,20 +517,28 @@ STRATEGY_ALLOCATIONS = {
         "can_stretch": False, "hard_max_positions": 1,
         "max_position_pct_of_sleeve": 1.00,
     },
+    "credit_spread": {
+        "target_pct": 0.10, "type": "isolated", "priority": 0,
+        "can_stretch": False, "hard_max_positions": 8,
+        "max_position_pct_of_sleeve": 0.40,
+    },
 }
 MAX_GROSS_EXPOSURE_PCT = 0.80
 ```
 
 At $100k paper equity:
 - Gross ceiling: $100k × 0.80 = $80,000
-- Equity pool: $80k × 0.95 = $76,000 shared by SMA / RSI / Donchian
-- Options vault: $80k × 0.05 = $4,000 reserved for SPY options
-- SMA target sleeve: $80k × 0.45 = $36,000, stretch cap $41,400, max single position $16,560
-- RSI target sleeve: $80k × 0.25 = $20,000, stretch cap $23,000, max single position $9,200
-- Donchian target sleeve: $80k × 0.25 = $20,000, stretch cap $23,000, max single position $9,200
-- Options target sleeve: $80k × 0.05 = $4,000, isolated, no stretch
+- Equity pool: $80k × 0.85 = $68,000 shared by SMA / RSI / Donchian
+- Options vault: $80k × 0.15 = $12,000 shared by SPY Options + Credit Spread (isolated, never stretches)
+- SMA target sleeve: $80k × 0.40 = $32,000, stretch cap $36,800, max single position $12,800
+- RSI target sleeve: $80k × 0.20 = $16,000, stretch cap $18,400, max single position $6,400
+- Donchian target sleeve: $80k × 0.25 = $20,000, stretch cap $23,000, max single position $8,000
+- Options (single-leg) target sleeve: $80k × 0.05 = $4,000, isolated, no stretch
+- Credit Spread target sleeve: $80k × 0.10 = $8,000, isolated, no stretch — shared across SPY + QQQ instances, per-position max loss capped at $80k × 0.10 × 0.40 = $3,200
 
-Elastic borrowing is equity-only: idle equity capital may be borrowed up to 115% of target while total deployable utilization remains below 80%. `hard_max_positions` is now a safety ceiling, not the sizing formula.
+The credit-spread rebalance trimmed SMA (0.45 → 0.40) and RSI (0.25 → 0.20) to fund the new 0.10 isolated sleeve; Donchian and SPY Options were left unchanged. The 11.30 paper-watch pass will revisit these weights once real fills accumulate.
+
+Elastic borrowing is equity-only: idle equity capital may be borrowed up to 115% of target while total deployable utilization remains below 80%. `hard_max_positions` is a safety ceiling, not the sizing formula.
 
 ---
 
@@ -427,7 +550,9 @@ Elastic borrowing is equity-only: idle equity capital may be borrowed up to 115%
 
 ## Planned Strategies
 
-No additional strategies are planned at this time. The go/no-go framework (`scripts/gonogo.py`) must confirm the four-strategy paper run meets all thresholds before adding more complexity. Phase 11 will add dynamic per-strategy weight rebalancing and cross-sleeve borrowing.
+No additional strategies are planned at this time. The go/no-go framework (`scripts/gonogo.py`) must confirm the five-strategy paper run meets all thresholds before adding more complexity. Phase 11 will add dynamic per-strategy weight rebalancing and cross-sleeve borrowing.
+
+A second multi-leg options strategy (iron condor, calendar, etc.) is intentionally easy to add — the engine MLEG path (`dispatch_spread_order`, `SpreadExecutionWorker`, the two-leg `Position` model, startup spread reconstruction) is leg-count-agnostic and duck-typed on the strategy hooks (`build_spread_execution`, `evaluate_spread_exit`, `register_spread`/`release_spread`, `open_spreads`). Two engine helpers still hardcode `strategy_name == "credit_spread"` (the global concurrent counter and the startup-reconstruction strategy lookup); see PLAN.md **11.31** — generalize them before adding strategy #2.
 
 ---
 
