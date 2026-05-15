@@ -53,6 +53,13 @@ ORDER_CONFIRM_TIMEOUT_SECONDS: float = float(
     os.getenv("ORDER_CONFIRM_TIMEOUT_SECONDS", "240")
 )
 
+# Multi-leg options entry watch window
+# Credit spreads often need longer than single-leg options to fill at a fair
+# net price. Give MLEG combo orders more time to work before we cancel them.
+MLEG_ENTRY_WATCH_TIMEOUT_SECONDS: float = float(
+    os.getenv("MLEG_ENTRY_WATCH_TIMEOUT_SECONDS", "180")
+)
+
 # Strategy-specific watchlists
 # SMA Crossover — trend-following; static list promoted from:
 #   /Users/franco/trading-bot/scripts/sma_watchlist_scan.py --top 30 --feed sip

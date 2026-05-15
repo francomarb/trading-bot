@@ -45,12 +45,13 @@ with warnings.catch_warnings():
 
 from risk.manager import RiskDecision, Side
 from execution.stream import StreamManager
+from config.settings import MLEG_ENTRY_WATCH_TIMEOUT_SECONDS
 
 # Callback signature: (status_str, filled_qty, avg_fill_price, order_id)
 FillCallback = Callable[[str, float, "float | None", str], None]
 
 # How long an unfilled limit order is allowed to work before we cancel it.
-_ENTRY_WATCH_TIMEOUT_SECONDS = 60.0
+_ENTRY_WATCH_TIMEOUT_SECONDS = MLEG_ENTRY_WATCH_TIMEOUT_SECONDS
 
 
 # ── Multi-leg order construction (11.28) ────────────────────────────────────
