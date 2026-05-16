@@ -467,7 +467,31 @@ class AlpacaBroker:
 
         tif = TimeInForce.DAY if self._time_in_force == "day" else TimeInForce.GTC
 
-        if decision.order_type is OrderType.LIMIT:
+        # PLAN 11.32: an entry price cap on a MARKET decision is submitted as a
+        # marketable DAY LIMIT + OTO at the cap. DAY (never GTC) so an unfilled
+        # capped entry expires at session close instead of ghost-filling later.
+        if (
+            decision.order_type is OrderType.MARKET
+            and decision.entry_max_price is not None
+        ):
+            cap = round(decision.entry_max_price, 2)
+            logger.info(
+                f"[entry-guard] {decision.symbol}: market entry capped at "
+                f"${cap:.2f} (ref ${decision.entry_reference_price:.2f}); "
+                f"submitting as DAY LIMIT + OTO"
+            )
+            order_request = LimitOrderRequest(
+                symbol=decision.symbol,
+                qty=decision.qty,
+                side=AlpacaOrderSide.BUY if decision.side is Side.BUY else AlpacaOrderSide.SELL,
+                type=AlpacaOrderType.LIMIT,
+                time_in_force=TimeInForce.DAY,
+                order_class=AlpacaOrderClass.OTO,
+                stop_loss=stop_loss,
+                client_order_id=client_order_id,
+                limit_price=cap,
+            )
+        elif decision.order_type is OrderType.LIMIT:
             if decision.limit_price is None:
                 raise ValueError("LIMIT decision missing limit_price")
             order_request = LimitOrderRequest(
@@ -597,6 +621,17 @@ class AlpacaBroker:
         routes directly to the OTO GTC path, which is byte-for-byte unchanged.
         """
         client_order_id = f"{decision.strategy_name}-frac-{uuid.uuid4().hex[:10]}"
+
+        # PLAN 11.32: entry price cap is not honored on fractional fills in v1.
+        # Alpaca restricts fractional orders to DAY + simple market — no limit,
+        # no OTO. Surface the gap loudly so an operator notices in logs.
+        if decision.entry_max_price is not None:
+            logger.warning(
+                f"[entry-guard] {decision.symbol}: entry_max_price "
+                f"${decision.entry_max_price:.2f} BYPASSED on fractional order "
+                f"(Alpaca fractional path is market-only). "
+                f"qty={decision.qty} strategy={decision.strategy_name}"
+            )
 
         logger.info(
             f"placing fractional market buy {decision.qty} {decision.symbol} "

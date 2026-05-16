@@ -118,6 +118,11 @@ class Signal:
     # For bracket options orders
     take_profit_price: float | None = None
     stop_price_override: float | None = None
+    # PLAN 11.32 entry price cap: worst-case fill ceiling (BUY) / floor (SELL).
+    # When set on a MARKET signal, the broker submits a marketable DAY LIMIT
+    # + OTO at exactly this price instead of an unbounded market order.
+    # LIMIT signals must not carry this — they already control their fill price.
+    entry_max_price: float | None = None
 
 
 class RejectionCode(str, Enum):
@@ -168,6 +173,10 @@ class RiskDecision:
     order_type: OrderType = OrderType.MARKET
     limit_price: float | None = None
     take_profit_price: float | None = None
+    # PLAN 11.32 — see Signal.entry_max_price. Set by the engine after
+    # gate_entry() decides to convert a MARKET entry to a capped marketable
+    # DAY LIMIT. Broker honors this regardless of order_type.
+    entry_max_price: float | None = None
 
     def __post_init__(self) -> None:
         # Defensive: any caller that constructs this manually still has to pass
@@ -199,6 +208,21 @@ class RiskDecision:
             )
         if self.order_type is OrderType.MARKET and self.limit_price is not None:
             raise ValueError("MARKET order must not carry a limit_price")
+        if self.entry_max_price is not None:
+            if self.entry_max_price <= 0:
+                raise ValueError(
+                    f"entry_max_price must be positive, got {self.entry_max_price}"
+                )
+            if self.order_type is OrderType.LIMIT:
+                raise ValueError(
+                    "entry_max_price is for capping MARKET entries; "
+                    "LIMIT orders set their fill price via limit_price"
+                )
+            if self.side is Side.BUY and self.entry_max_price < self.stop_price:
+                raise ValueError(
+                    f"BUY entry_max_price {self.entry_max_price} must be "
+                    f">= stop_price {self.stop_price}"
+                )
 
 
 # ── Manager ──────────────────────────────────────────────────────────────────
@@ -721,6 +745,7 @@ class RiskManager:
             reason=signal.reason or f"{signal.strategy_name} entry",
             order_type=signal.order_type,
             limit_price=signal.limit_price,
+            entry_max_price=signal.entry_max_price,
         )
         logger.info(
             f"risk approved {decision.symbol}: {decision.qty} shares @ "

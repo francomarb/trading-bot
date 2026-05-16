@@ -500,6 +500,34 @@ if ENGINE_TIMEFRAME == "1Day" and ENGINE_HISTORY_LOOKBACK_DAYS < 300:
         "to keep 200-day SMA-based filters warmed up safely"
     )
 
+# ── Entry price caps (PLAN 11.32) ────────────────────────────────────────────
+# Per-strategy worst-case fill ceiling for MARKET entries. When a policy is
+# set, the engine converts the market entry to a marketable DAY LIMIT + OTO
+# at min(reference + bps_cap, reference + atr_fraction * ATR). The exchange
+# enforces the limit — fills above the cap are impossible.
+#
+# Why this exists: the 2026-05-11 QCOM Donchian incident filled a MARKET BUY
+# at +1205 bps from the signal close. Sizing and ATR stop had been derived
+# from the signal close. See PLAN 11.32 and scripts/donchian_chase_distribution.py
+# for the calibration analysis (1326 ai_bigtech signals, 12 months).
+#
+# Donchian-only in v1. SMA and other MARKET strategies stay uncapped until
+# paper observation validates the gate.
+#
+# Cap interpretation: tighter of the two knobs wins. Setting only one is fine.
+from execution.entry_guard import EntryPriceCap  # noqa: E402
+
+ENTRY_PRICE_CAPS: dict[str, EntryPriceCap] = {
+    "donchian_breakout": EntryPriceCap(
+        # 500 bps blocks ~2.3% of historical signals; 2.0 ATR catches the
+        # high-vol low-price names (QBTS, IREN) that slip past the bps gate.
+        # Both together kill 100% of the top-5 historical outliers including
+        # the QCOM-class incident. Tighten on observed paper data.
+        max_chase_bps=500,
+        max_chase_atr_fraction=2.0,
+    ),
+}
+
 # ── Reporting settings (Phase 9) ────────────────────────────────────────────
 TRADE_LOG_CSV = "logs/trades.csv"           # Legacy CSV trade log (deprecated)
 TRADE_LOG_DB_PAPER = "data/trades.db"       # Paper-trading SQLite log
