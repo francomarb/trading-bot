@@ -42,7 +42,7 @@ import threading
 import time
 import uuid
 import warnings
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from datetime import datetime, timezone
 from enum import Enum
 from typing import TYPE_CHECKING
@@ -452,6 +452,47 @@ class AlpacaBroker:
                 message="dispatched to OptionsExecutionWorker",
             )
 
+        # PLAN 11.32: when an entry price cap is in effect, force the
+        # whole-share path so the capped DAY LIMIT + OTO branch applies.
+        # Alpaca's fractional path is market-only and cannot enforce a
+        # limit, so a fractional capped entry would otherwise silently
+        # bypass the guard — the exact class of bug that triggered this
+        # work (QCOM 2026-05-11 was fractional). Flooring loses at most
+        # 1 share of sizing precision (always conservative — never
+        # exceeds the original risk budget) and is acceptable for the
+        # equity-trend strategies that use caps.
+        if (
+            decision.entry_max_price is not None
+            and math.floor(decision.qty) != decision.qty
+        ):
+            floored = math.floor(decision.qty)
+            if floored < 1:
+                logger.warning(
+                    f"[entry-guard] {decision.symbol}: capped entry rounds "
+                    f"down to 0 whole shares (qty={decision.qty}, "
+                    f"cap=${decision.entry_max_price:.2f}); rejecting — a "
+                    f"sub-share fractional fill cannot be price-capped on Alpaca"
+                )
+                return OrderResult(
+                    status=OrderStatus.REJECTED,
+                    order_id=None,
+                    symbol=decision.symbol,
+                    requested_qty=decision.qty,
+                    filled_qty=0,
+                    avg_fill_price=None,
+                    raw_status=None,
+                    message=(
+                        f"capped entry rounds to 0 whole shares "
+                        f"(qty={decision.qty}, cap=${decision.entry_max_price:.2f})"
+                    ),
+                )
+            logger.info(
+                f"[entry-guard] {decision.symbol}: flooring fractional qty "
+                f"{decision.qty} -> {floored} so the entry_max_price cap "
+                f"can be enforced via DAY LIMIT + OTO"
+            )
+            decision = replace(decision, qty=float(floored))
+
         # Route fractional quantities to the DAY-entry + GTC-stop path.
         # When FRACTIONAL_ENABLED=False, _size_position always returns a whole
         # number so math.floor(qty) == qty is always True — this branch is
@@ -467,7 +508,31 @@ class AlpacaBroker:
 
         tif = TimeInForce.DAY if self._time_in_force == "day" else TimeInForce.GTC
 
-        if decision.order_type is OrderType.LIMIT:
+        # PLAN 11.32: an entry price cap on a MARKET decision is submitted as a
+        # marketable DAY LIMIT + OTO at the cap. DAY (never GTC) so an unfilled
+        # capped entry expires at session close instead of ghost-filling later.
+        if (
+            decision.order_type is OrderType.MARKET
+            and decision.entry_max_price is not None
+        ):
+            cap = round(decision.entry_max_price, 2)
+            logger.info(
+                f"[entry-guard] {decision.symbol}: market entry capped at "
+                f"${cap:.2f} (ref ${decision.entry_reference_price:.2f}); "
+                f"submitting as DAY LIMIT + OTO"
+            )
+            order_request = LimitOrderRequest(
+                symbol=decision.symbol,
+                qty=decision.qty,
+                side=AlpacaOrderSide.BUY if decision.side is Side.BUY else AlpacaOrderSide.SELL,
+                type=AlpacaOrderType.LIMIT,
+                time_in_force=TimeInForce.DAY,
+                order_class=AlpacaOrderClass.OTO,
+                stop_loss=stop_loss,
+                client_order_id=client_order_id,
+                limit_price=cap,
+            )
+        elif decision.order_type is OrderType.LIMIT:
             if decision.limit_price is None:
                 raise ValueError("LIMIT decision missing limit_price")
             order_request = LimitOrderRequest(
@@ -597,6 +662,19 @@ class AlpacaBroker:
         routes directly to the OTO GTC path, which is byte-for-byte unchanged.
         """
         client_order_id = f"{decision.strategy_name}-frac-{uuid.uuid4().hex[:10]}"
+
+        # PLAN 11.32: defense in depth. place_order() floors fractional qty
+        # to whole shares when entry_max_price is set so the capped DAY
+        # LIMIT + OTO path applies. If we ever reach this branch with a cap
+        # set, it means the floor logic was bypassed or removed — log an
+        # ERROR so it's loud in alerts.
+        if decision.entry_max_price is not None:
+            logger.error(
+                f"[entry-guard] {decision.symbol}: BUG — entry_max_price "
+                f"${decision.entry_max_price:.2f} reached the fractional path "
+                f"(qty={decision.qty}). The cap will NOT be enforced. "
+                f"Investigate place_order() floor logic."
+            )
 
         logger.info(
             f"placing fractional market buy {decision.qty} {decision.symbol} "

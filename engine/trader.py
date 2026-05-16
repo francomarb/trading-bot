@@ -68,6 +68,7 @@ from engine.positions import (
     owner_key_for,
     view_owner_map,
 )
+from execution.entry_guard import CapAction, gate_entry
 from execution.broker import (
     AlpacaBroker,
     BrokerSnapshot,
@@ -1056,6 +1057,33 @@ class TradingEngine:
                 )
                 return None
 
+        # PLAN 11.32: gate MARKET entries through the per-strategy price cap.
+        # Options/spread paths build their own envelopes upstream and pass
+        # `is_option`/strategy hooks; the cap is for plain equity MARKET entries
+        # only. We key the policy by strategy name and only act when the
+        # strategy itself declares MARKET as its preferred order type.
+        entry_max_price: float | None = None
+        if (
+            not hasattr(strategy, "build_option_execution")
+            and strategy.preferred_order_type is OrderType.MARKET
+        ):
+            policy = settings.ENTRY_PRICE_CAPS.get(strategy.name)
+            cap_decision = gate_entry(
+                reference_price=target_price,
+                atr=latest_atr,
+                side="buy",
+                order_type="market",
+                policy=policy,
+            )
+            if cap_decision.action is CapAction.CONVERT_TO_LIMIT:
+                entry_max_price = cap_decision.cap_price
+                logger.info(
+                    f"[entry-guard] {strategy.name} {symbol}: capping market "
+                    f"entry at ${entry_max_price:.2f} "
+                    f"(ref ${target_price:.2f}, atr {latest_atr:.2f}, "
+                    f"chase {cap_decision.diagnostics['chase_bps']:.1f}bps)"
+                )
+
         sig = Signal(
             symbol=target_symbol,
             side=Side.BUY,
@@ -1067,6 +1095,7 @@ class TradingEngine:
             limit_price=target_price if strategy.preferred_order_type is OrderType.LIMIT else None,
             take_profit_price=take_profit,
             stop_price_override=stop_price,
+            entry_max_price=entry_max_price,
         )
         decision = self.risk.evaluate(sig, account, notional_cap=notional_cap)
         if isinstance(decision, RiskRejection):

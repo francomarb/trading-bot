@@ -70,12 +70,13 @@ def _api_error(status_code: int, message: str = "boom") -> _FakeAPIError:
 def _decision(
     *,
     symbol: str = "AAPL",
-    qty: int = 10,
+    qty: float = 10,
     entry: float = 100.0,
     stop: float = 96.0,
     order_type: OrderType = OrderType.MARKET,
     limit_price: float | None = None,
     strategy: str = "sma_crossover",
+    entry_max_price: float | None = None,
 ) -> RiskDecision:
     return RiskDecision(
         symbol=symbol,
@@ -87,6 +88,7 @@ def _decision(
         reason="test",
         order_type=order_type,
         limit_price=limit_price,
+        entry_max_price=entry_max_price,
     )
 
 
@@ -359,6 +361,112 @@ class TestSubmitOrderKwargs:
             order_id="entry-1",
         )
         stream.unwatch.assert_called_once_with("entry-1")
+
+
+# ── place_order: PLAN 11.32 entry price cap ─────────────────────────────────
+
+
+class TestEntryMaxPriceCap:
+    """
+    Regression tests for PLAN 11.32. The QCOM 2026-05-11 incident was a
+    *fractional* MARKET entry that filled +1205 bps above the signal
+    reference. These tests prove:
+
+      1. A whole-share MARKET decision with `entry_max_price` is submitted
+         as a DAY LIMIT + OTO at the cap (not MARKET).
+      2. A *fractional* MARKET decision with `entry_max_price` is floored
+         to whole shares and routed through the same DAY LIMIT + OTO path —
+         the fractional bypass that would have re-enabled the QCOM class
+         of incident is closed.
+      3. When flooring would produce 0 shares, the order is rejected
+         rather than silently falling back to an uncapped market order.
+    """
+
+    def test_whole_share_market_with_cap_submits_day_limit_oto(self):
+        api = MagicMock()
+        api.submit_order.return_value = _alpaca_order(status="filled")
+        api.get_order_by_id.return_value = _alpaca_order(status="filled")
+        broker = _broker_with_mock(api)
+
+        broker.place_order(
+            _decision(qty=10, entry=219.19, stop=210.0, entry_max_price=230.15),
+            poll_timeout=0.1,
+        )
+
+        req = api.submit_order.call_args.args[0]
+        # MARKET decision becomes a LIMIT at the cap.
+        assert req.type.value == "limit"
+        assert req.limit_price == 230.15
+        # DAY TIF — never GTC. Capped entries must not ghost-fill the next day.
+        assert req.time_in_force.value == "day"
+        # OTO with the protective stop attached atomically.
+        assert req.order_class.value == "oto"
+        assert req.stop_loss.stop_price == 210.0
+
+    def test_fractional_market_with_cap_is_floored_then_capped(self):
+        """
+        The QCOM-class regression. A fractional MARKET decision with a cap
+        must NOT take the fractional (uncapped market) path. The broker
+        floors to whole shares and submits the capped DAY LIMIT + OTO.
+        """
+        api = MagicMock()
+        api.submit_order.return_value = _alpaca_order(status="filled")
+        api.get_order_by_id.return_value = _alpaca_order(status="filled")
+        broker = _broker_with_mock(api)
+
+        broker.place_order(
+            _decision(qty=2.73, entry=219.19, stop=210.0, entry_max_price=230.15),
+            poll_timeout=0.1,
+        )
+
+        # Exactly one submit_order call — the fractional path (which would
+        # have submitted a separate MARKET entry + standalone stop) was
+        # NOT taken.
+        assert api.submit_order.call_count == 1
+        req = api.submit_order.call_args.args[0]
+        assert req.qty == 2  # floor(2.73) == 2
+        assert req.type.value == "limit"
+        assert req.limit_price == 230.15
+        assert req.time_in_force.value == "day"
+        assert req.order_class.value == "oto"
+
+    def test_fractional_capped_qty_below_one_share_is_rejected(self):
+        api = MagicMock()
+        broker = _broker_with_mock(api)
+
+        result = broker.place_order(
+            _decision(qty=0.42, entry=219.19, stop=210.0, entry_max_price=230.15),
+            poll_timeout=0.1,
+        )
+
+        # No order was submitted — silent fallback to uncapped market is
+        # the exact failure mode this guard prevents.
+        api.submit_order.assert_not_called()
+        assert result.status is OrderStatus.REJECTED
+        assert result.filled_qty == 0
+        assert "0 whole shares" in result.message
+
+    def test_fractional_without_cap_still_uses_fractional_path(self):
+        """Negative control: strategies without a cap policy keep today's path."""
+        api = MagicMock()
+        api.submit_order.return_value = _alpaca_order(status="filled", qty=2.73)
+        api.get_order_by_id.return_value = _alpaca_order(status="filled", qty=2.73)
+        broker = _broker_with_mock(api)
+
+        broker.place_order(
+            _decision(qty=2.73, entry=219.19, stop=210.0),  # no entry_max_price
+            poll_timeout=0.1,
+        )
+
+        # Fractional path: separate MARKET DAY entry, no OTO, no limit.
+        req = api.submit_order.call_args_list[0].args[0]
+        assert req.type.value == "market"
+        assert req.time_in_force.value == "day"
+        # No order_class set (simple market) — bracket/OTO disallowed on fractional.
+        assert (
+            not hasattr(req, "order_class")
+            or getattr(req, "order_class", None) is None
+        )
 
 
 # ── place_order: terminal-state mapping ──────────────────────────────────────
