@@ -1,0 +1,511 @@
+# Strategy Health & Edge Monitor — v1 Design
+
+**Status:** Proposal — no code yet, iterating on design
+**PLAN.md item:** 11.10
+**Related items:** 11.9 (dynamic capital allocation — downstream consumer), 11.11 (re-enable workflow — manual gate for quarantined strategies), 11.12 (Kelly criterion — advisory, complementary), 11.14 (read-only dashboard — render target)
+**Future work:** see [strategy_health_future.md](strategy_health_future.md) for the follow-up roadmap (PSR/DSR/MinTRL, CUSUM, signal-lifecycle table, MAE/MFE, auto-throttle, etc.) — deliberately split out so this doc stays focused on what ships now.
+**Author note:** Written so future sessions can pick up cold. This doc records *why* each design choice was made. An earlier ChatGPT-drafted spec was reviewed and ingested — its strongest ideas (concrete verdict/recommendation labels, operator-facing sufficiency phrasing, schema thinking) are folded in; its weaker structural choice (Statistical inside Health) is not, with reasons in §3.5.
+
+---
+
+## 1. Objective
+
+Build a per-strategy assessment system that runs continuously and produces honest, actionable verdicts on whether each strategy is **(a) functioning correctly** and **(b) worth running**. The system must:
+
+- Catch the **silent-killer case** — a strategy with clean execution that is steadily losing money — loudly and early. This is the single most important detection.
+- Not over-react to **normal drawdown / small-sample noise**. Auto-disabling a healthy strategy during a routine 3-sigma drawdown is the failure mode that destroys edge.
+- Separate **the verdict** (keep / cut / reallocate — driven by Edge) from **the forensics** (what's broken or fragile — driven by Health). A profitable strategy with messy execution is still earning; operator alarm fatigue is worse than the noise.
+- **Inform the operator; never act autonomously.** Every operational decision stays with the operator. See §1.2.
+
+### 1.1 Success criteria — what the operator needs
+
+These four bullets are the user's stated priorities. **Every design decision must trace back to one or more of these.** If a choice doesn't, it is scope creep.
+
+| # | What the operator needs | How v1 delivers it |
+|---|---|---|
+| 1 | **Knowing whether each strategy is actually healthy in live paper conditions** | Weekly L1–L3 + EdgeReport per strategy written to disk; dashboard panel shows both scorecards; on-demand CLI. Operator never derives "is X healthy?" from raw logs. |
+| 2 | **Distinguishing "bad execution" from "bad edge"** | Edge/Health primacy inversion (§3): bad execution = `continue and monitor`, fix in parallel, do not throttle. Bad edge = silent-killer alarm + `pause and investigate`. Visually and operationally separable in every report. |
+| 3 | **Distinguishing "temporary drawdown" from "real degradation"** | `min_trades_for_verdict` floor per strategy + three independent statistical signals must agree for NEGATIVE + **3-week persistence requirement** before alarm fires (§9). A single bad week is exactly what normal variance looks like; three consecutive bad weeks is harder to write off. |
+| 4 | **Being able to make sizing / pause / continue decisions with confidence** | Four-label recommendation set (`continue` / `continue and monitor` / `reduce size` / `pause and investigate`) — each carries sufficiency, driving checks, and measured/inferred/envelope provenance (§11.5, §12.4). |
+
+**Failure modes this design is explicitly trying to prevent:**
+
+- *Silent bleeder.* (#1 + #2.) Strategy looks fine on the dashboard while losing money — caught by silent-killer alarm.
+- *Strategy-killer ratchet.* (#3.) Auto-disabling on noise — prevented by `min_trades` floor + persistence + advisory-only invariant.
+- *Alarm fatigue from cosmetic health issues.* (#2.) Telegram pings about slippage on a profitable strategy — prevented by Health alerts being INFO-only when Edge is positive.
+- *"The backtest said so" recommendations.* (#4.) Continuing a bleeding strategy because its backtest looked good — prevented by recommendations being derived from live observed Edge, not backtest opinion.
+- *Untraceable verdicts.* (#4.) Operator can't tell which numbers are measured vs inferred vs from backtest — prevented by in-text source labels on every metric.
+
+### 1.2 v1 invariant — the bot informs, the operator decides
+
+**This is the strongest design rule in v1 and overrides anything else in this document.** The bot's job in v1 is to **compute assessments and emit reports/alerts**. It does not take action. Every operational decision — change a sleeve weight, pause a strategy, reduce size, re-enable after quarantine — is made by the **operator reading the reports**, not by the bot acting on its own conclusions.
+
+**What the bot is allowed to do in v1:**
+- Compute `EdgeReport` and `HealthReport` per strategy on weekly/monthly cadence
+- Write markdown reports to `data/health_reports/`
+- Render a read-only dashboard panel
+- Send Telegram alerts on defined state transitions (including the silent-killer alarm)
+- Track persistence state across weekly checks (e.g. "this strategy has been NEGATIVE for 2 of 3 weeks") so the next assessment can use it
+- Attach a textual `recommendation` field to each report row as **a suggestion for the operator to consider**
+
+**What the bot is NOT allowed to do in v1:**
+- Modify `STRATEGY_ALLOCATIONS` or any sleeve weight
+- Halt a strategy, set it to cooldown, or skip its signals
+- Reduce position sizing or change `MAX_POSITION_PCT`
+- Cancel pending orders based on health verdicts
+- Trigger any change to `RiskManager`, `SleeveAllocator`, or `TradingEngine` *behavior* based on its own assessments
+- Track whether the operator followed a recommendation (this is not a feedback-loop system in v1)
+
+**The word "recommendation" in this doc always means "information the operator considers when deciding"** — never "an action the bot intends to take." If a future reader sees "recommendation" and thinks "automation," they are reading the doc wrong. The recommendation is text in a report; nothing in the bot's runtime reads it.
+
+**Why this invariant is non-negotiable for v1:** the bot acting on its own health assessments adds a new failure mode (wrong assessment → unwanted action → capital impact) on top of the already-hard problem of *correct* assessment. v1 must prove the assessments themselves are useful before we trust them to drive behavior.
+
+**When this invariant gets relaxed:** future work only (see [strategy_health_future.md](strategy_health_future.md)), only after lived experience with v1's recommendations, only with explicit per-feature gating, and only with auto-restore-to-baseline guardrails. The pattern will mirror existing automated risk controls (loss-streak cooldown, slippage drift kill switch).
+
+### 1.3 v1 acceptance test against success criteria
+
+| Criterion | v1 covers? | What does the covering |
+|---|---|---|
+| 1. Healthy in live paper conditions | ✅ | EdgeReport + HealthReport, weekly markdown, dashboard panel, CLI |
+| 2. Bad execution vs bad edge | ✅ | Edge/Health primacy inversion + decision matrix (§4) |
+| 3. Temporary drawdown vs real degradation | ✅ (heuristic, honest about it) | `min_trades_for_verdict` floor + three statistical signals must agree + **3-week persistence requirement** before NEGATIVE alarm (§9) |
+| 4. Sizing / pause / continue with confidence | ✅ | Four-label recommendation set including `reduce size` as advisory (§11.5); each carries sufficiency + driving checks + provenance |
+
+Note: rigorous-statistics replacements (PSR/DSR/MinTRL, CUSUM, block bootstrap) are deferred — see [strategy_health_future.md](strategy_health_future.md). v1's three-signal + persistence + floor is sufficient defense against the named failure modes; rigorous detectors are added only if v1 observation justifies them.
+
+### 1.4 Anti-goal: what the original PLAN.md framing got wrong
+
+The original 11.10 entry read: *"rolling expectancy + rolling Sharpe per strategy; automatic capital reduction or disable when performance degrades beyond a threshold."* Rejected for three reasons:
+
+1. **Sample size.** With per-strategy trade rates of 10–50 trades/year (SMA crossover lowest, Donchian batchy on 32 names highest), a rolling-window Sharpe is statistical noise on the time horizons that matter. A strategy with perfect edge will hit rolling Sharpe < 0.3 for multi-month stretches just from variance.
+2. **Auto-disable ratchet.** Killing a strategy on a noisy metric is irreversible (gated by 11.11 manual re-enable). One bad month kills the strategy for one good month back. Over time the bot loses every strategy.
+3. **Health/Edge conflation.** "Performance degrades" mixes operational issues, execution issues, and statistical underperformance into one number, hiding the most important diagnostic information — whether the strategy is bleeding because it broke or because the edge is gone.
+
+---
+
+## 2. Scope & non-goals
+
+**In scope (v1):**
+- Per-strategy `EdgeReport` and `HealthReport`, computed weekly (and on-demand)
+- Static reference envelope per strategy from `backtest/runner.py` (point estimate)
+- Streamlit dashboard panel rendering both scorecards
+- Telegram alerts for silent-killer + defined transitions
+- On-demand CLI for weekly/monthly/yearly reviews
+
+**Explicitly out of scope (v1):**
+- Auto-throttle (graduated sleeve weight reduction) — see future doc
+- Auto-disable / auto-quarantine — stays manual via 11.11 forever
+- Portfolio-level health (correlation drift, regime-mix performance) — sleeve allocator + 11.9 own portfolio capital decisions; 11.10 stays per-strategy
+- Cross-strategy comparison ranking — each strategy evaluated against its own envelope and benchmark
+- ML / model-based decay detection
+- Hybrid envelope recalibration from paper data — static envelope only in v1
+- Any new SQL tables — v1 reuses existing `data/trades.db`, `engine_state.json`, `logs/bot.jsonl`
+
+---
+
+## 3. Mental model — Edge is the verdict, Health is forensics
+
+The system produces **two scorecards per strategy, with strict primacy:**
+
+| Scorecard | Question it answers | Drives |
+|---|---|---|
+| **EdgeReport** | Is this strategy worth running? | `continue` / `reduce size` / `pause` recommendations |
+| **HealthReport** | Is the system functioning correctly? | Forensics + fragility warning; **never overrides Edge** |
+
+The primacy inversion is the most important rule in this design:
+
+- **A perfectly healthy strategy that is losing money is the case we most need to catch.** Everything looks green on a normal dashboard; the operator assumes things are fine; capital bleeds silently. This is the alarm the monitor exists to make loud.
+- **An unhealthy strategy that is profitable should be left alone.** Telegram noise about "slippage 28bps above modeled" or "RSI filter block rate elevated" is operator-fatigue spam when the strategy is earning. Log it, surface on dashboard for the curious, but no alarm and no throttle.
+
+### Health layers (forensics only)
+
+| Layer | Question | Examples |
+|---|---|---|
+| **L1 Operational** | Is the strategy *running* and *seeing the world correctly*? | Stream connected; regime gate firing; watchlist non-empty; sector resolver hits; cycle latency; reconciliation mismatches; missing stop repairs |
+| **L2 Execution** | When it does trade, is execution honest? | Realized vs modeled slippage; fill rate; order rejection rate; timeout/cancel rate; spread for options; signal-to-fill conversion |
+| **L3 Drift** | Is the live signal distribution diverging from backtest? *(Leading indicator of future edge loss.)* | Trade frequency vs envelope; hold-time distribution; edge-filter block rate; concurrent-position clustering |
+
+L3 is explicitly **leading-indicator** in nature — it warns of edge erosion before it shows up in PnL, but does not itself constitute an edge verdict. The realized statistical underperformance question moves entirely into EdgeReport.
+
+### 3.5 Cross-reference to the earlier ChatGPT draft
+
+The earlier draft proposed four Health categories (A Operational / B Execution / C Statistical / D Regime-Behavioral). Our design folds Statistical entirely into EdgeReport (where it drives the verdict) and splits Regime-Behavioral across L3 Drift and EdgeReport §5.4. Mapping for cross-spec navigation:
+
+| ChatGPT draft category | Our location | Why moved |
+|---|---|---|
+| A. Operational Health | `HealthReport.L1` | Same |
+| B. Execution Health | `HealthReport.L2` | Same |
+| C. Statistical Health | `EdgeReport` §5.1 + §5.2 | Statistical *is* the edge verdict — keeping it inside Health is what enabled the silent-killer case to hide. Moved out so verdict has somewhere clean to live. |
+| D. Regime / Behavioral Health | `HealthReport.L3` + `EdgeReport` §5.4 | Signal-shape drift → L3 (leading indicator). Capital efficiency → EdgeReport §5.4 (utilization is an economic question, not a health question). |
+
+### 3.6 Per-layer verdict labels
+
+Each layer's `CheckResult` carries one of four labels:
+
+- **HEALTHY** — check passes within expected envelope
+- **WATCH** — single soft signal, no action; surfaces on dashboard
+- **DEGRADED** — sustained or multi-signal deviation; investigation prompt
+- **BROKEN** — operational/execution failure that requires fix (L1/L2 only; L3 cannot be BROKEN — drift is by nature gradual)
+
+`HealthReport.overall_status` is the worst of the three layers. **A `BROKEN` Health verdict does not auto-disable the strategy** — per the Edge/Health primacy, only EdgeReport can recommend pause. A `BROKEN` Health on a profitable strategy still gets "keep untouched, fix in parallel."
+
+---
+
+## 4. Decision matrix
+
+| Edge verdict | Health state | Recommendation | Alert |
+|---|---|---|---|
+| POSITIVE, CONCLUSIVE | HEALTHY / WATCH | `continue` | none |
+| POSITIVE, CONCLUSIVE | DEGRADED / BROKEN | **`continue and monitor`** (keep earning; investigate health in parallel) | `STRATEGY_HEALTH_*` INFO only |
+| **NEGATIVE, CONCLUSIVE** | Any | **`pause and investigate` — SILENT KILLER** | `STRATEGY_EDGE_LOSS` CRITICAL |
+| BELOW-BENCHMARK + CONCLUSIVE | Any | `reduce size` (investigate regime mismatch) | `STRATEGY_EDGE_BELOW_BENCHMARK` WARN |
+| INDICATIVE + trending downward (2+ wk) | Any | `reduce size` (early warning) | none |
+| Health DEGRADED + low sleeve utilization | Any Edge | `reduce size` (over-allocated) | none |
+| INSUFFICIENT / INDICATIVE | HEALTHY / WATCH | `continue and monitor` | none |
+| INSUFFICIENT / INDICATIVE | BROKEN | `continue and monitor` + existing operational alert | existing health alert path |
+
+Two invariants:
+
+1. **No combination of Health alone can recommend `pause`.** Health drives operator visibility; only Edge drives keep/cut.
+2. **`STRATEGY_EDGE_LOSS` requires CONCLUSIVE sample + 3-week persistence.** Below either bar, system says nothing — refusing to declare a strategy dead on small samples is the discipline that protects edge during normal drawdowns.
+
+---
+
+## 5. EdgeReport — the verdict layer
+
+Three blocks. Every metric carries `(value, 95% CI, N, sufficiency)`.
+
+### 5.1 Profitability
+
+- Realized P&L (window + lifetime)
+- **Expectancy per trade with iid bootstrap 95% CI**
+- **Profit factor with bootstrap CI**
+- **Sleeve return on allocated capital** (PnL ÷ sleeve $ × days, time-weighted)
+- **Sleeve return on deployed capital** (only when actually in positions) — separates "strategy is bad" from "strategy is starved/idle"
+- **Realized expectancy vs envelope** — point estimate vs the envelope's expectancy CI band
+
+### 5.2 Edge verdict — v1 logic
+
+Two signals combine to produce the verdict:
+
+1. **Expectancy CI vs envelope** — observed expectancy CI excludes zero AND lies below envelope CI
+2. **One-sided t-test on expectancy against zero** — `H0: expectancy ≥ 0`, reject at α=0.05
+3. **Equity-curve EMA50/EMA100 crossover** — slower than 20/50 to filter routine drawdowns; matches the slower trade rate of our strategies
+
+**NEGATIVE verdict** requires all three signals to agree AND `N ≥ min_trades_for_verdict` AND the NEGATIVE state has held for **3 consecutive weekly checks** (§9).
+
+**POSITIVE verdict** requires expectancy CI > 0 AND realized expectancy within envelope CI band. No persistence requirement.
+
+**BELOW-BENCHMARK verdict** requires Edge POSITIVE AND realized return < benchmark return + CONCLUSIVE sample.
+
+### 5.3 Edge vs benchmark
+
+| Strategy | Benchmark | Edge metric |
+|---|---|---|
+| SMA crossover | Equal-weight BH of `SMA_WATCHLIST` over same window | Alpha = strategy return − benchmark return on same capital |
+| RSI reversion | Equal-weight BH of `RSI_WATCHLIST` | Alpha |
+| Donchian breakout | Equal-weight BH of `ai_bigtech` 32-name universe | Alpha |
+| SPY options reversion | Delta-equivalent SPY shares held over same windows | Premium efficiency = realized P&L ÷ premium paid |
+| Credit spreads | Underlying BH (SPY / QQQ buy-and-hold over assessment window) — v1 placeholder | Alpha vs underlying; richer short-vol replicator is a follow-up |
+
+**Choice of benchmark per strategy is canonical Grinold-Kahn** (*Active Portfolio Management*) — benchmark against the universe the strategy is *expressing a view on*, not against SPY. A trend strategy that returns +18% while SPY's same-watchlist BH returned +25% is destroying value despite positive raw P&L.
+
+### 5.4 Capital efficiency
+
+- **Sleeve utilization** — `mean(deployed capital ÷ sleeve cap)` over window. Low + positive expectancy → starved (signal for 11.9).
+- **Idle days** — % of session-hours with zero open positions.
+- **R-multiple distribution** — distribution of realized P&L in initial-risk units (`stop_distance × qty`).
+
+---
+
+## 6. HealthReport — the forensic layer
+
+### L1 Operational checks
+
+- Stream connectivity (websocket reconnection events in window)
+- Watchlist non-empty and source not throwing
+- Regime gate firing on schedule
+- Sector resolver cache hit rate
+- Cycle latency vs target
+- Edge filter throwing exceptions
+- Cycles processed in window vs expected
+- Stale-data incidents (last bar age above threshold per symbol)
+- Reconciliation mismatches (engine state vs broker position)
+- Missing stop repairs (positions without GTC stop after grace window)
+- Ownership conflicts (`SYMBOL_CONFLICT` events — already alerted at 11.7A)
+- External close detections (positions closed outside the engine)
+- Strategy halted / cooldown state (current state, time-in-state)
+- Alert frequency by severity in window (a baseline-aware spike is itself a signal)
+
+### L2 Execution checks
+
+- **Realized slippage in bps vs modeled** (existing slippage drift tracker at 6.11 — health monitor reads it, doesn't duplicate)
+- Order rejection rate (orders submitted vs rejected by broker)
+- Timeout / cancel rate (`ORDER_CONFIRM_TIMEOUT_SECONDS` exceedances)
+- Fill rate (orders submitted vs orders filled within session)
+- Signal-to-fill conversion (signals generated vs positions actually opened)
+- Average time from signal to fill (median + p95)
+- For options: realized spread at fill vs picked spread (the 11.26 audit data)
+- Stop-fill timing (broker-side stop trigger latency)
+- Partial fill rate
+
+### L3 Drift checks
+
+- **Trade frequency vs envelope band** — observed `trades_per_month` falls in the envelope's `[p10, p90]` interval?
+- **Hold-time distribution drift** — KS test of observed hold times vs envelope distribution
+- **Entry-bar chase distribution drift** — for strategies with entry caps (11.32)
+- **Average holding time** drift vs envelope
+- **Exposure utilization** drift (mean concurrent positions vs envelope)
+- **Concurrent-position clustering** (do entries cluster in time vs backtest expectation?)
+- **Edge-filter block rate** — strategy generating fewer/more signals than backtest baseline?
+
+MAE/MFE drift, longitudinal signal-lifecycle counters, and CUSUM are deferred — see [strategy_health_future.md](strategy_health_future.md).
+
+---
+
+## 7. Reference envelope
+
+Each strategy ships with a `StrategyEnvelope` JSON file derived from a **single backtest run at the strategy's current production config**:
+
+```
+data/envelopes/{strategy_name}.json
+{
+  "strategy": "donchian_breakout",
+  "built_at": "2026-05-18T...",
+  "backtest_config": {...},          // exact params used
+  "expectancy_dollars": 142.0,
+  "expectancy_ci_95": [85.0, 199.0], // bootstrap from backtest trades
+  "win_rate": 0.48,
+  "win_rate_ci_95": [0.41, 0.55],
+  "trades_per_month_band": [4, 11],  // p10, p90
+  "hold_days_band": [2, 18],
+  "p95_drawdown_pct": 0.12
+}
+```
+
+Built by `scripts/build_envelopes.py`. Operator-readable, git-friendly, regenerated when the strategy's production config changes. **Static** — no auto-recalibration in v1. Parameter-grid distribution + hybrid paper recalibration are follow-ups (see future doc).
+
+---
+
+## 8. Sufficiency framework
+
+v1 uses a simple per-strategy config:
+
+```python
+MIN_TRADES_FOR_VERDICT = {
+    "sma_crossover": 30,
+    "rsi_reversion": 25,         # lowered from initial 50 — RSI's tight filters
+                                 # (SPY trend, earnings blackout, no-new-low) gate
+                                 # very heavily in some regimes; observed 2-month
+                                 # zero-trade stretches in paper. 25 is reachable.
+                                 # The "RSI isn't firing" case is handled by L3
+                                 # Drift (trade-frequency vs envelope), not by
+                                 # withholding an Edge verdict forever.
+    "donchian_breakout": 50,
+    "spy_options_reversion": 40,
+    "credit_spread": 50,
+}
+```
+
+Numbers are conservative — err on the side of INSUFFICIENT, because declaring a strategy dead on a small sample is the failure mode we most want to avoid. Hand-picked heuristic; honest about being one. MinTRL-based rigorous replacement is a follow-up.
+
+**Important design separation:** if a strategy is producing zero trades, that surfaces via the L3 Drift check (`trade frequency vs envelope band`), not by the Edge verdict staying INSUFFICIENT forever. The two are independent — Edge verdict speaks to "is the strategy losing money when it trades?"; L3 Drift speaks to "is the strategy firing at the expected rate?" Operator sees both.
+
+Sufficiency tags + operator-facing phrasing in reports:
+
+| Tag | Threshold | Operator-facing phrasing |
+|---|---|---|
+| **INSUFFICIENT** | `N < 0.5 × min_trades_for_verdict` | *"Insufficient sample — no verdict yet. {N} of ~{floor} trades needed."* |
+| **INDICATIVE** | `0.5 × floor ≤ N < floor` | *"Operationally healthy but statistically inconclusive"* (Health OK) / *"Execution issue despite insufficient trade count"* (Health WARN/BROKEN) |
+| **CONCLUSIVE** | `N ≥ floor` | *"Statistically degraded after {N} trades / {M} days"* (Edge NEGATIVE) / *"Statistically confirmed working"* (Edge POSITIVE) |
+
+These phrasings go directly into the weekly/monthly markdown and the dashboard summary row — the operator should not have to translate sufficiency math themselves. Numbers grayed out at INSUFFICIENT; normally with CI at INDICATIVE+.
+
+Practical implication per active strategy (rough order of magnitude):
+
+| Strategy | Trades/year (estimate) | Time to CONCLUSIVE |
+|---|---|---|
+| SMA crossover | 10–30 | 1–3 years |
+| RSI reversion | 30–100 | 6–18 months |
+| Donchian breakout | 50–150 | 4–12 months |
+| SPY options reversion | 50–150 | 4–10 months |
+| Credit spreads | 60–200 | 3–10 months |
+
+This is the honest answer to Carver's "~10 years to distinguish skill from luck on a single strategy" — for low-rate strategies it really is long, and the system should say so rather than pretend otherwise. See §13.
+
+### 8.1 Inline thresholds per strategy
+
+v1 stores Health-check thresholds in `strategies/health/thresholds.py` — a flat dict per strategy with a handful of numbers per check (e.g. `{"slippage_warn_bps": 20, "slippage_degraded_bps": 50, "slippage_broken_bps": 100}`). No archetype abstraction. With 5 strategies, this is cleaner than abstracting prematurely. Archetype-based `HealthThresholdProfile` is a follow-up if strategy count grows past ~8.
+
+---
+
+## 9. Combining the Edge signals (v1)
+
+Three independent signals + persistence requirement:
+
+1. **Expectancy CI vs envelope** — observed expectancy CI (iid bootstrap) excludes zero AND lies below envelope CI
+2. **One-sided t-test on expectancy against zero** — `H0: expectancy ≥ 0`, reject at α=0.05
+3. **Equity-curve EMA50/EMA100 crossover** — slower than 20/50 to filter routine drawdowns
+
+**NEGATIVE verdict rule:** all three signals agree, AND `N ≥ min_trades_for_verdict`, AND the NEGATIVE state has held for **3 consecutive weekly checks**. The persistence requirement is the most important defense against false positives — a single bad week is exactly what normal variance looks like; three consecutive bad weeks is harder to write off.
+
+**POSITIVE verdict rule:** expectancy CI > 0 AND realized expectancy within envelope CI band. No persistence requirement.
+
+**Rationale:** false positives on the silent-killer alarm cause operator distrust of the whole system. The 3-week persistence window means up to ~3 weeks of bleeding before alarm — acceptable given the alternative (firing on every routine drawdown then crying wolf). Three statistical signals × three weeks is the v1 substitute for PSR/DSR's mathematical rigor.
+
+---
+
+## 10. Cadence
+
+| Cadence | What runs | Output |
+|---|---|---|
+| **Weekly (Sunday EOD)** | Full L1–L3 + EdgeReport per strategy | Markdown report in `data/health_reports/weekly_YYYY-WW.md`; Telegram summary |
+| **Monthly** | Same + envelope-vs-actual charts + prior-period comparison | Markdown in `data/health_reports/monthly_YYYY-MM.md`; Telegram summary |
+| **On-demand CLI** | `scripts/strategy_health_review.py --window {weekly,monthly,yearly} [--strategy X]` | stdout + markdown file |
+
+Continuous per-cycle L1/L2 in the engine snapshot is deferred — v1 ships weekly-report-only to keep engine surface area minimal.
+
+---
+
+## 11. Alert taxonomy
+
+New alert types in `reporting/alerts.py`:
+
+| Alert | Severity | Trigger | Auto-action |
+|---|---|---|---|
+| `STRATEGY_EDGE_LOSS` | CRITICAL | Edge NEGATIVE + CONCLUSIVE + 3-week persistence | None (advisory). Operator considers quarantine. |
+| `STRATEGY_EDGE_BELOW_BENCHMARK` | WARN | Edge positive but < benchmark + CONCLUSIVE | None. Investigate regime mismatch. |
+| `STRATEGY_HEALTH_DEGRADED` | INFO (forensic only) | L1/L2 DEGRADED, Edge positive | None. Surfaces on dashboard. |
+| `STRATEGY_HEALTH_BROKEN` | WARN | L1/L2 BROKEN, Edge positive | None. Investigation prompt. |
+| `STRATEGY_DRIFT_WARNING` | INFO | L3 drift detected, Edge positive | None. Leading indicator. |
+
+Health alerts are **deliberately INFO when Edge is positive** to prevent alarm fatigue. They never escalate to CRITICAL on Health alone.
+
+### 11.5 Recommendation taxonomy
+
+Each `(EdgeReport, HealthReport)` pair produces one of four concrete operator-facing recommendations:
+
+| Recommendation | When | Notes |
+|---|---|---|
+| **continue** | Edge POSITIVE + CONCLUSIVE + Health HEALTHY | Default state for a well-functioning strategy. |
+| **continue and monitor** | Edge POSITIVE INDICATIVE *or* Health WATCH/DEGRADED/BROKEN with Edge positive | Active observation, no capital change. Most common state during early paper. |
+| **reduce size** | (a) Edge INDICATIVE + trending downward across 2+ consecutive weekly checks; (b) Edge POSITIVE-but-BELOW-BENCHMARK + CONCLUSIVE; (c) Health DEGRADED + low sleeve utilization | **v1: advisory only — no auto-action, no specific weight multiplier.** Operator manually adjusts `STRATEGY_ALLOCATIONS` if they agree. |
+| **pause and investigate** | Edge NEGATIVE + CONCLUSIVE + persistence | The silent-killer alarm's recommendation. Operator decides whether to quarantine. |
+
+`disable pending review` is owned by 11.11, not 11.10. 11.10 only ever recommends.
+
+Recommendations are **derived from observed Edge + Health, never from backtest opinion alone** — the backtest envelope provides the reference distribution against which live behavior is measured, but the recommendation always reflects live data. This prevents the "the backtest said this would work" failure mode.
+
+---
+
+## 12. Architecture sketch
+
+New module `strategies/health/`:
+
+```
+strategies/health/
+├── __init__.py
+├── envelope.py        # StrategyEnvelope dataclass + JSON I/O (static, no recalibration)
+├── benchmarks.py      # Per-strategy benchmark return computation
+├── stats.py           # Bootstrap CI, t-test, EMA cross (pure functions)
+├── thresholds.py      # Per-strategy inline health thresholds
+├── assessor.py        # HealthAssessor: runs L1–L3 checks; returns HealthReport
+├── edge.py            # EdgeAssessor: computes EdgeReport; combines signals into verdict
+├── persistence.py     # Tracks NEGATIVE-verdict state across weekly checks (3-week rule)
+├── reports.py         # Dataclasses: HealthReport, EdgeReport, CheckResult, Sufficiency
+└── reviewer.py        # Weekly/monthly report rendering; Telegram summary
+```
+
+External pieces:
+
+- `scripts/build_envelopes.py` — one-shot per strategy; runs single backtest at production config and writes envelope JSON.
+- `scripts/strategy_health_review.py` — CLI for on-demand reviews.
+- `dashboard.py` — new "Strategy Health & Edge" panel rendering both scorecards per strategy.
+- `forward_test.py` — Sunday EOD hook to run weekly reviewer; monthly first-of-month hook for monthly reviewer.
+- `reporting/alerts.py` — new alert types (§11).
+
+**No changes to `risk/allocator.py`, `risk/manager.py`, or `engine/trader.py` runtime behavior in v1** (advisory only invariant).
+
+### 12.4 Data sources — no new SQL tables in v1
+
+v1 reads from existing infrastructure:
+
+- `trades` table — already carries `strategy`, `realized_pnl`, `position_id`, slippage. Read by assessor for per-strategy P&L, expectancy, win rate, profit factor (existing `read_strategy_realized_pnl_summary` extends naturally).
+- `engine_state.json` — sector exposure, positions, halt state. Read by L1 checks.
+- `logs/bot.jsonl` — alert frequency, broker errors, reconciliation events. Read by L1 checks via the existing log-parsing pattern used by `scripts/donchian_chase_distribution.py`.
+
+If v1 reveals real attribution gaps the log-parsing pattern cannot answer, the schema additions in the future doc become the upgrade path.
+
+### 12.5 Persistence state file
+
+The 3-week persistence rule needs to remember NEGATIVE-verdict state across weekly runs. Stored as `data/health_state.json`:
+
+```
+{
+  "donchian_breakout": {
+    "negative_weeks": 2,
+    "last_check": "2026-05-17",
+    "last_verdict": "NEGATIVE"
+  },
+  ...
+}
+```
+
+Reset to 0 on any non-NEGATIVE check. Operator-readable, git-ignored.
+
+### 12.6 Report output format
+
+**v1: markdown only.** `data/health_reports/weekly_YYYY-WW.md` — human-readable. Top section is the per-strategy summary table:
+
+| Strategy | Verdict | Confidence | Sample | Key metrics | Top failure reasons | Recommendation |
+|---|---|---|---|---|---|---|
+
+Below the table, one expandable section per strategy with the full EdgeReport + HealthReport breakdown. **In-text labels** distinguish what's measured vs inferred vs from the envelope (e.g. *"Expectancy $42 (measured from 23 trades); envelope band $30–$80 (from backtest)"*) — no machine-parseable `source` field needed in v1.
+
+JSON twin output is a follow-up; build when a consumer needs it.
+
+---
+
+## 13. The silent-killer case + Carver's caveat
+
+The silent killer is the design's reason to exist. Every report (weekly markdown, dashboard, on-demand CLI) **must surface the silent-killer status prominently** — not buried in a strategy's section.
+
+**Carver's caveat surfaced alongside every CONCLUSIVE verdict.** Carver (*Systematic Trading* ch.3) argues that for a single strategy with typical Sharpe, you cannot statistically distinguish skill from luck in under ~10 years of daily returns. This is empirically correct for trend-following on small N. Implication: even when v1 declares `CONCLUSIVE` with `STRATEGY_EDGE_LOSS`, the operator should know the underlying epistemic confidence is "reasonably sure given assumptions" — not "proven."
+
+Mitigation: every CONCLUSIVE verdict in the report includes a footer line like:
+
+> *Note: per Carver (Systematic Trading, ch.3), a single strategy on typical Sharpe requires ~10 years of daily returns to fully separate skill from luck. This verdict reflects our heuristic statistical confidence — operator should treat it as advisory, not proof. Recommended action: manual review of trade log before any capital change.*
+
+---
+
+## 14. Where industry practice is overruled
+
+1. **Carver's "monitor portfolio Sharpe only, not per-strategy."** Inapplicable here — we have 4–5 strategies with different theses and benchmarks. Portfolio-only health would say "the book is fine" while a specific strategy bleeds. Acknowledge Carver's epistemic caution (§13) but build per-strategy anyway.
+2. **Industry-standard graduated weight reduction at INDICATIVE sufficiency** ("pure advisory lets capital bleed while collecting N"). Deferred — research informs the design but does not override the user's stated risk tolerance (advisory only in v1).
+
+---
+
+## 15. v1-blocking open questions
+
+These need answers before implementation starts. Follow-up open questions live in [strategy_health_future.md](strategy_health_future.md).
+
+1. **`min_trades_for_verdict` per strategy.** Suggested starting points in §8 (30/50/50/40/50) are conservative defaults — confirm or adjust.
+2. **~~Benchmark recompute cost~~** — **RESOLVED.** `data/fetcher.py` already implements per-symbol Parquet caching with merge-on-fetch over arbitrary ranges; daily bars don't change retroactively so cache warms once and stays warm. Total benchmark universe ~40–50 unique symbols across SMA/RSI/Donchian watchlists. First-time fetch ~30s; subsequent runs near-zero. `strategies/health/benchmarks.py` is a thin `equal_weight_bh_return(symbols, start, end)` helper over `fetch_symbol()`. No fetcher changes needed.
+3. **~~Health WATCH vs DEGRADED vs BROKEN per check~~** — **RESOLVED.** v1 ships with sensible engineering defaults per check in `strategies/health/thresholds.py` erring toward WATCH (noisy but harmless) rather than BROKEN (cries wolf). Each default carries a `# TODO: calibrate after 4 weeks of paper` comment. A companion `scripts/calibrate_health_thresholds.py` reads N weeks of paper data and prints suggested values per check; operator runs after 4+ weeks and adjusts inline. Safe because v1 invariant is advisory-only — mis-tuned thresholds cause dashboard noise, not capital action. Per-strategy overrides for archetype-specific cases (e.g., RSI's limit-order fill rate stricter than market-order strategies').
+4. **~~Dashboard layout~~** — **RESOLVED.** Compact summary table (one row per strategy, columns: Verdict / Confidence / Sample / Key metrics / Top failure reasons / Recommendation) + expandable per-strategy detail. Matches the markdown report layout exactly so operators see the same shape in both formats.
+5. **~~Quarantine mechanics in v1~~** — **RESOLVED.** Operator edits `STRATEGY_ALLOCATIONS[strategy] = 0.0` in `config/settings.py` and runs `recycle_bot.sh`. Zero new code, honest about being manual. 11.11 will ship the proper re-enable workflow with hot-reload and review state machine.
+6. **~~Envelope build trigger~~** — **RESOLVED.** Manual: operator runs `scripts/build_envelopes.py` when strategy config changes. No detection logic in v1. Matches existing patterns for backtest re-runs (`phase5_verify.py` etc.). Operator discipline + the calibration-script TODO comments in `thresholds.py` are the v1 reminder pattern.
+7. **~~Credit-spread v1 benchmark~~** — **RESOLVED.** Underlying-BH (SPY / QQQ daily-bar BH over the assessment window) as v1 placeholder. Honest about being imperfect for a short-vol strategy; SVXY / static short-strangle replicator is documented as follow-up §F11.
+
+---
+
+## 16. Canonical references
+
+- Bailey, D. H., & López de Prado, M. M. (2014). **The Deflated Sharpe Ratio.** *Journal of Portfolio Management.* — PSR, DSR, MinTRL (referenced for follow-up).
+- López de Prado, M. M. (2018). **Advances in Financial Machine Learning.** Wiley. Chapters 11–17.
+- Carver, R. (2015). **Systematic Trading.** Harriman House. Chapters 3–4 (small-sample realism, skill-vs-luck horizons).
+- Chan, E. (2013). **Algorithmic Trading.** Wiley. Chapter 8 (equity-curve trading).
+- Grinold, R. C., & Kahn, R. N. (2000). **Active Portfolio Management.** McGraw-Hill. (Benchmark selection.)
+- Politis, D. N., & Romano, J. P. (1994). **The Stationary Bootstrap.** *JASA.* (Referenced for follow-up.)
+- Tharp, V. (1998). **Trade Your Way to Financial Freedom.** McGraw-Hill. (R-multiple framework.)
+- freqtrade `IProtection` interface — concrete API precedent: https://www.freqtrade.io/en/stable/includes/protections/
