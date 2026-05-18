@@ -56,6 +56,8 @@ These four bullets are the user's stated priorities. **Every design decision mus
 - Trigger any change to `RiskManager`, `SleeveAllocator`, or `TradingEngine` *behavior* based on its own assessments
 - Track whether the operator followed a recommendation (this is not a feedback-loop system in v1)
 
+**Interaction with existing automated risk controls.** The bot already has automated controls that *do* take action: per-strategy loss-streak cooldown (`RiskManager`), per-strategy sleeve drawdown (`SleeveAllocator`), daily-loss circuit breaker, slippage-drift kill switch, broker-error-streak kill switch, entry-price guard (11.32). **These remain fully active in v1 and v1+.** Strategy Health is purely additive — it *reads* their current state as inputs to its Health L1 checks (e.g. "strategy currently in cooldown for 2h:14m") but never disables, bypasses, or modifies them. The invariant above applies only to the new monitor; it does not relax existing automated risk controls.
+
 **The word "recommendation" in this doc always means "information the operator considers when deciding"** — never "an action the bot intends to take." If a future reader sees "recommendation" and thinks "automation," they are reading the doc wrong. The recommendation is text in a report; nothing in the bot's runtime reads it.
 
 **Why this invariant is non-negotiable for v1:** the bot acting on its own health assessments adds a new failure mode (wrong assessment → unwanted action → capital impact) on top of the already-hard problem of *correct* assessment. v1 must prove the assessments themselves are useful before we trust them to drive behavior.
@@ -72,6 +74,11 @@ These four bullets are the user's stated priorities. **Every design decision mus
 | 4. Sizing / pause / continue with confidence | ✅ | Four-label recommendation set including `reduce size` as advisory (§11.5); each carries sufficiency + driving checks + provenance |
 
 Note: rigorous-statistics replacements (PSR/DSR/MinTRL, CUSUM, block bootstrap) are deferred — see [strategy_health_future.md](strategy_health_future.md). v1's three-signal + persistence + floor is sufficient defense against the named failure modes; rigorous detectors are added only if v1 observation justifies them.
+
+**Reviewer-driven additions folded into v1 (after first review pass):**
+- §1.2 explicitly clarifies that existing automated risk controls (cooldown, sleeve drawdown, slippage drift halt, entry-price guard, etc.) remain fully active in v1+ — the invariant applies only to the new monitor and never relaxes existing controls.
+- §5.1 + §5.2 + §9 — R-multiple expectancy is promoted to first-class primary metric (dollar expectancy retained as secondary context). Sizing-invariant; reads existing `r_multiple` column in `trades` table at zero new instrumentation cost. Cumulative-R is also the equity curve used for the EMA50/EMA100 cross.
+- §12.4.1 — minimal weekly signal-lifecycle counters added to v1 (stored as JSON in `data/health_state.json`, not a new SQL table). Closes the gap where L3 drift claims would otherwise have been aspirational; full per-cycle `signal_lifecycle` SQL table remains follow-up §F6.
 
 ### 1.4 Anti-goal: what the original PLAN.md framing got wrong
 
@@ -177,26 +184,31 @@ Three blocks. Every metric carries `(value, 95% CI, N, sufficiency)`.
 
 ### 5.1 Profitability
 
-- Realized P&L (window + lifetime)
-- **Expectancy per trade with iid bootstrap 95% CI**
-- **Profit factor with bootstrap CI**
+Both **R-multiple expectancy** and **dollar expectancy** are reported. **R-expectancy is primary; dollar expectancy is secondary context.**
+
+Why R is primary: dollar expectancy shifts with sleeve weight changes (so a strategy looks "worse" simply because the operator reduced its allocation) and mixes options/equity strategies on incomparable scales. R-expectancy is sizing-normalized — `realized_pnl / initial_risk_dollars` — so it answers "is this strategy behaving as designed?" independent of capital allocated to it. `r_multiple` is already computed and stored per closed trade in `reporting/logger.py:R66/121/366`, so this is zero new instrumentation cost.
+
+- Realized P&L (window + lifetime), dollar
+- **R-expectancy per trade with iid bootstrap 95% CI** (primary verdict input)
+- **Dollar expectancy per trade with iid bootstrap 95% CI** (secondary)
+- **Profit factor with bootstrap CI** (computed on dollar P&L; PF is a ratio so it's already sizing-invariant)
 - **Sleeve return on allocated capital** (PnL ÷ sleeve $ × days, time-weighted)
 - **Sleeve return on deployed capital** (only when actually in positions) — separates "strategy is bad" from "strategy is starved/idle"
-- **Realized expectancy vs envelope** — point estimate vs the envelope's expectancy CI band
+- **Realized R-expectancy vs envelope** — point estimate vs the envelope's R-expectancy CI band (envelope JSON includes R-expectancy alongside dollar expectancy)
 
 ### 5.2 Edge verdict — v1 logic
 
-Two signals combine to produce the verdict:
+Three signals combine to produce the verdict, **all computed on R-expectancy (not dollars):**
 
-1. **Expectancy CI vs envelope** — observed expectancy CI excludes zero AND lies below envelope CI
-2. **One-sided t-test on expectancy against zero** — `H0: expectancy ≥ 0`, reject at α=0.05
-3. **Equity-curve EMA50/EMA100 crossover** — slower than 20/50 to filter routine drawdowns; matches the slower trade rate of our strategies
+1. **R-expectancy CI vs envelope** — observed R-expectancy CI excludes zero AND lies below envelope R-expectancy CI
+2. **One-sided t-test on R-expectancy against zero** — `H0: R-expectancy ≥ 0`, reject at α=0.05
+3. **Equity-curve EMA50/EMA100 crossover** — slower than 20/50 to filter routine drawdowns; matches the slower trade rate of our strategies. Equity curve here is **cumulative R** (not cumulative dollars), for the same sizing-invariance reason.
 
 **NEGATIVE verdict** requires all three signals to agree AND `N ≥ min_trades_for_verdict` AND the NEGATIVE state has held for **3 consecutive weekly checks** (§9).
 
-**POSITIVE verdict** requires expectancy CI > 0 AND realized expectancy within envelope CI band. No persistence requirement.
+**POSITIVE verdict** requires R-expectancy CI > 0 AND realized R-expectancy within envelope R-expectancy CI band. No persistence requirement.
 
-**BELOW-BENCHMARK verdict** requires Edge POSITIVE AND realized return < benchmark return + CONCLUSIVE sample.
+**BELOW-BENCHMARK verdict** requires Edge POSITIVE AND realized return < benchmark return + CONCLUSIVE sample. (Benchmark comparison stays in dollar/return space because benchmarks are buy-and-hold returns — there is no "R-equivalent" of a passive index.)
 
 ### 5.3 Edge vs benchmark
 
@@ -341,11 +353,11 @@ v1 stores Health-check thresholds in `strategies/health/thresholds.py` — a fla
 
 ## 9. Combining the Edge signals (v1)
 
-Three independent signals + persistence requirement:
+Three independent signals + persistence requirement. All operate on **R-expectancy (sizing-normalized), not dollar expectancy** — see §5.1 for why:
 
-1. **Expectancy CI vs envelope** — observed expectancy CI (iid bootstrap) excludes zero AND lies below envelope CI
-2. **One-sided t-test on expectancy against zero** — `H0: expectancy ≥ 0`, reject at α=0.05
-3. **Equity-curve EMA50/EMA100 crossover** — slower than 20/50 to filter routine drawdowns
+1. **R-expectancy CI vs envelope** — observed R-expectancy CI (iid bootstrap) excludes zero AND lies below envelope R-expectancy CI
+2. **One-sided t-test on R-expectancy against zero** — `H0: R-expectancy ≥ 0`, reject at α=0.05
+3. **Cumulative-R equity curve EMA50/EMA100 crossover** — slower than 20/50 to filter routine drawdowns
 
 **NEGATIVE verdict rule:** all three signals agree, AND `N ≥ min_trades_for_verdict`, AND the NEGATIVE state has held for **3 consecutive weekly checks**. The persistence requirement is the most important defense against false positives — a single bad week is exactly what normal variance looks like; three consecutive bad weeks is harder to write off.
 
@@ -430,11 +442,52 @@ External pieces:
 
 v1 reads from existing infrastructure:
 
-- `trades` table — already carries `strategy`, `realized_pnl`, `position_id`, slippage. Read by assessor for per-strategy P&L, expectancy, win rate, profit factor (existing `read_strategy_realized_pnl_summary` extends naturally).
-- `engine_state.json` — sector exposure, positions, halt state. Read by L1 checks.
+- `trades` table — already carries `strategy`, `realized_pnl`, `r_multiple`, `position_id`, slippage. Read by assessor for per-strategy P&L, expectancy (R and $), win rate, profit factor (existing `read_strategy_realized_pnl_summary` extends naturally).
+- `engine_state.json` — sector exposure, positions, halt state, current state of automated risk controls (cooldown, drift switches). Read by L1 checks.
 - `logs/bot.jsonl` — alert frequency, broker errors, reconciliation events. Read by L1 checks via the existing log-parsing pattern used by `scripts/donchian_chase_distribution.py`.
+- Weekly signal-lifecycle counters — see §12.4.1 below. Stored in `data/health_state.json`, *not* a new SQL table.
 
-If v1 reveals real attribution gaps the log-parsing pattern cannot answer, the schema additions in the future doc become the upgrade path.
+The full per-cycle SQL `signal_lifecycle` table (with `reasons_json`, `cycle_id`, etc.) remains follow-up §F6. v1 ships the minimal weekly aggregation needed to make L3 drift checks actually measurable.
+
+### 12.4.1 Minimal weekly event counters (v1)
+
+Without per-strategy signal flow counts, L3 drift claims like "edge-filter block rate vs envelope" are aspirational — log-parsing can answer them for ad-hoc audits but is operator-effort-heavy and not weekly-report friendly. v1 ships a lighter-than-§F6 version that closes this gap without a new SQL table.
+
+**Schema** — JSON, written by `engine/trader.py` weekly (Sunday EOD, same trigger as the weekly health report):
+
+```json
+data/health_state.json
+{
+  "persistence": { ... },                 // §12.5 NEGATIVE-verdict tracking
+  "weekly_counters": {
+    "2026-W20": {
+      "donchian_breakout": {
+        "raw_signals": 142,               // strategy.generate_signals() count
+        "regime_blocked": 11,             // blocked by regime gate
+        "edge_filter_blocked": 87,        // blocked by strategy edge filter
+        "sleeve_blocked": 4,              // blocked by SleeveAllocator
+        "submitted": 40,                  // orders submitted to broker
+        "filled": 38                      // orders filled
+      },
+      ...
+    }
+  }
+}
+```
+
+**Wiring** — each existing gate already emits log events when it blocks; the engine maintains a per-cycle counter dict that flushes weekly. ~30 LOC across `engine/trader.py` + `strategies/health/`. Reuses existing log infrastructure for ad-hoc audits (the lifecycle is already observable; this just aggregates).
+
+**What L3 drift checks become measurable:**
+
+- `raw_signals` weekly vs envelope's `raw_signals_per_week_band` → "is the strategy generating signals at the expected rate?"
+- `edge_filter_blocked / raw_signals` ratio drift → "is the edge filter rejecting an unusual fraction of signals (regime mismatch)?"
+- `regime_blocked / raw_signals` ratio → "is the regime gate doing more or less work than usual?"
+- `filled / submitted` ratio → "fill rate"
+- `submitted / (raw_signals - all_blocks)` ratio → "are signals reaching the broker when nothing should block them?"
+
+The envelope JSON gets corresponding bands (`raw_signals_per_week_band`, `edge_filter_block_rate`, etc.) derived from the backtest run.
+
+**Why this is v1, not follow-up:** without these counters, ~half of the §6 L3 Drift bullet list is hand-wavy. The cost (one JSON section + ~30 LOC of counter wiring + 5 envelope fields) is small enough that "ruthlessly minimal v1" can absorb it. Per-cycle granularity and `reasons_json` taxonomy remain follow-up §F6.
 
 ### 12.5 Persistence state file
 
