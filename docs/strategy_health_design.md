@@ -78,7 +78,7 @@ Note: rigorous-statistics replacements (PSR/DSR/MinTRL, CUSUM, block bootstrap) 
 **Reviewer-driven additions folded into v1 (after first review pass):**
 - §1.2 explicitly clarifies that existing automated risk controls (cooldown, sleeve drawdown, slippage drift halt, entry-price guard, etc.) remain fully active in v1+ — the invariant applies only to the new monitor and never relaxes existing controls.
 - §5.1 + §5.2 + §9 — R-multiple expectancy is promoted to first-class primary metric (dollar expectancy retained as secondary context). Sizing-invariant; reads existing `r_multiple` column in `trades` table at zero new instrumentation cost. Cumulative-R is also the equity curve used for the EMA50/EMA100 cross.
-- §12.4.1 — minimal weekly signal-lifecycle counters added to v1 (stored as JSON in `data/health_state.json`, not a new SQL table). Closes the gap where L3 drift claims would otherwise have been aspirational; full per-cycle `signal_lifecycle` SQL table remains follow-up §F6.
+- §12.4.1 — aggregate signal-lifecycle counters added to v1 as a new SQLite table `strategy_lifecycle_counters` (7 counter fields keyed by `(period_type, period_start, strategy_name)`). `data/health_state.json` is *separate* — small verdict-persistence state only (§12.4.2). Closes the gap where L3 drift claims would otherwise have been aspirational; full per-cycle `signal_lifecycle` SQL table with `reasons_json` taxonomy remains follow-up §F6.
 
 ### 1.4 Anti-goal: what the original PLAN.md framing got wrong
 
@@ -106,7 +106,7 @@ The original 11.10 entry read: *"rolling expectancy + rolling Sharpe per strateg
 - Cross-strategy comparison ranking — each strategy evaluated against its own envelope and benchmark
 - ML / model-based decay detection
 - Hybrid envelope recalibration from paper data — static envelope only in v1
-- Any new SQL tables — v1 reuses existing `data/trades.db`, `engine_state.json`, `logs/bot.jsonl`
+- Any per-cycle lifecycle SQL table or additional historical SQL tables beyond `strategy_lifecycle_counters` (the one aggregate table added in §12.4.1) — v1 otherwise reuses existing `data/trades.db`, `engine_state.json`, `logs/bot.jsonl`
 
 ---
 
@@ -271,7 +271,7 @@ Three signals combine to produce the verdict, **all computed on R-expectancy (no
 - **Concurrent-position clustering** (do entries cluster in time vs backtest expectation?)
 - **Edge-filter block rate** — strategy generating fewer/more signals than backtest baseline?
 
-MAE/MFE drift, longitudinal signal-lifecycle counters, and CUSUM are deferred — see [strategy_health_future.md](strategy_health_future.md).
+Per-cycle signal lifecycle with `reasons_json` taxonomy, MAE/MFE drift, and CUSUM are deferred — see [strategy_health_future.md](strategy_health_future.md). Aggregate lifecycle counters (raw_signals / regime_blocked / edge_filter_blocked / sleeve_blocked / risk_blocked / submitted / filled_entries per period) ship in v1 via the `strategy_lifecycle_counters` table — see §12.4.1.
 
 ---
 
