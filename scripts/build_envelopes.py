@@ -53,6 +53,7 @@ from strategies.filters.rsi_reversion import RSIEdgeFilter  # noqa: E402
 from strategies.filters.sma_crossover import SMAEdgeFilter  # noqa: E402
 from strategies.health.envelope import (  # noqa: E402
     ENVELOPE_SCHEMA_VERSION,
+    FilterFidelity,
     StrategyEnvelope,
     envelope_path,
 )
@@ -61,21 +62,52 @@ from strategies.rsi_reversion import RSIReversion  # noqa: E402
 from strategies.sma_crossover import SMACrossover  # noqa: E402
 
 
-# Build-time note appended to every equity envelope:
-# explains that SectorMomentumFilter is intentionally omitted from the
-# backtest because the sector gauge requires offline-unfriendly state
-# (sector ETF fetches + sector cache). The primary strategy-level edge
-# filter IS included so the envelope reflects production gating for
-# SPY-trend / earnings / liquidity. This is the same pattern the
-# existing backtest scripts use (scripts/backtest_bollinger_squeeze.py,
-# scripts/backtest_donchian_breakout.py).
-SECTOR_FILTER_OMITTED_NOTE = (
-    "envelope built with the strategy's primary edge filter (SPY-trend, "
-    "earnings blackout, liquidity floor) but WITHOUT SectorMomentumFilter "
-    "— sector gauge requires offline-unfriendly state. Production live "
-    "behavior may include additional sector-momentum rejections; the "
-    "11.10g calibration script (post-paper-watch) can re-tune trade "
-    "frequency expectations against actual sector-filtered counts."
+# PR #17 second pass — replaces the earlier "SectorMomentumFilter omitted"
+# note which was incomplete. The reviewer correctly identified that even
+# the wired filters don't faithfully replay production gating:
+#
+#   - **Stock-level gates DO replay correctly per-bar** (200-SMA, 20-day
+#     volume, 20-day low, IEX liquidity, ATR — all computed from the
+#     symbol's own historical df). These are real envelope-shaping
+#     filters and they work as intended.
+#
+#   - **Earnings blackout** is symbol-aware. The backtest now passes
+#     `symbol=` through `generate_signals` (backtest/runner.py was
+#     fixed in this PR), so EarningsBlackout can resolve. Whether
+#     it actually rejects depends on whether the offline earnings
+#     cache has data for the symbol over the backtest window.
+#
+#   - **SPY trend gate (SPYTrendFilter / SMA200 / SMA50)** is a
+#     live-cycle filter: it fetches CURRENT SPY state at filter
+#     construction. During the historical backtest, that same
+#     build-time SPY snapshot is applied to every bar, instead of
+#     replaying per-bar historical SPY state. This means an envelope
+#     built on a day when SPY > 200 SMA produces a different envelope
+#     than one built on a day when SPY < 200 SMA. **Real fix would
+#     require a historical-SPY-injection mode on SPYTrendFilter** —
+#     out of v1 scope; logged as follow-up §F-future (post-11.10h).
+#
+#   - **SectorMomentumFilter** is intentionally omitted entirely
+#     (offline-unfriendly state).
+#
+# Net effect: the envelope OVER-counts production-allowed signals
+# (live gating rejects more than we capture). Trade-frequency and
+# block-rate bands should be read with this caveat. The envelope is
+# tagged FilterFidelity.PARTIAL_STOCK_GATES_ONLY so the EdgeAssessor
+# (11.10d) widens its drift bands accordingly.
+FILTER_FIDELITY_NOTE = (
+    "filter_fidelity=partial_stock_gates_only. Stock-level gates "
+    "(200-SMA, volume, 20-day low, liquidity, ATR) replay per-bar "
+    "correctly from the symbol's df. Earnings blackout is symbol-aware "
+    "and now receives the symbol context (PR #17 fix to "
+    "backtest/runner.py), but its replay quality depends on whether the "
+    "offline earnings cache has data for the backtest window. SPY trend "
+    "gates (SMA200/SMA50) use the build-time SPY snapshot and apply "
+    "that same decision to every historical bar — not per-bar historical "
+    "SPY state. SectorMomentumFilter is omitted entirely (offline-"
+    "unfriendly). Net: envelope OVER-counts production-allowed signals; "
+    "trade-frequency / block-rate bands are upper bounds. The 11.10g "
+    "calibration script can re-tune from live paper counters."
 )
 
 
@@ -468,6 +500,7 @@ def build_envelope(
             backtest_window_start=start.date().isoformat(),
             backtest_window_end=end.date().isoformat(),
             backtest_config=backtest_config,
+            filter_fidelity=FilterFidelity.NOT_BACKTESTED,
             notes=tuple(notes),
         )
         path = envelope_path(strategy_name, root=out_dir)
@@ -487,6 +520,7 @@ def build_envelope(
             backtest_window_start=start.date().isoformat(),
             backtest_window_end=end.date().isoformat(),
             backtest_config=backtest_config,
+            filter_fidelity=FilterFidelity.PARTIAL_STOCK_GATES_ONLY,
             notes=tuple(notes),
         )
         path = envelope_path(strategy_name, root=out_dir)
@@ -511,6 +545,7 @@ def build_envelope(
             backtest_window_start=start.date().isoformat(),
             backtest_window_end=end.date().isoformat(),
             backtest_config=backtest_config,
+            filter_fidelity=FilterFidelity.PARTIAL_STOCK_GATES_ONLY,
             trade_count=0,
             trades_per_month_band=_trades_per_month_band(per_symbol),
             notes=tuple(notes),
@@ -599,10 +634,11 @@ def build_envelope(
             f"bootstrap resamples."
         )
 
-    # Document the sector-filter omission so the assessor / operator
-    # knows the envelope was built with the strategy's primary edge
-    # filter only (no SectorMomentumFilter).
-    notes.append(SECTOR_FILTER_OMITTED_NOTE)
+    # Document the filter-fidelity gap so the assessor and operator
+    # know exactly which gates are replayed correctly and which leak
+    # live-cycle state. See FILTER_FIDELITY_NOTE for the precise
+    # accounting.
+    notes.append(FILTER_FIDELITY_NOTE)
 
     envelope = StrategyEnvelope(
         schema_version=ENVELOPE_SCHEMA_VERSION,
@@ -611,6 +647,7 @@ def build_envelope(
         backtest_window_start=start.date().isoformat(),
         backtest_window_end=end.date().isoformat(),
         backtest_config=backtest_config,
+        filter_fidelity=FilterFidelity.PARTIAL_STOCK_GATES_ONLY,
         r_expectancy=r_expectancy,
         r_expectancy_ci_95=r_expectancy_ci,
         risk_unit_dollars=risk_unit,

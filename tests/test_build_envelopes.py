@@ -334,11 +334,12 @@ class TestProductionFilterWiring:
         assert strategy._edge_filter is not None
         assert type(strategy._edge_filter).__name__ == "DonchianEdgeFilter"
 
-    def test_envelope_notes_explain_sector_filter_omission(
+    def test_envelope_notes_explain_filter_fidelity_gap(
         self, tmp_path: Path, monkeypatch
     ):
-        """The envelope's notes must call out the SectorMomentumFilter
-        omission so the assessor and operator know about the gap."""
+        """The envelope's notes must spell out which filters replay
+        correctly and which leak live-cycle state, per PR #17 reviewer
+        second-pass feedback. Just naming the omission was incomplete."""
         bars = {"AAA": _synthetic_bars(seed=31)}
 
         def fake_fetch(sym, start, end, timeframe):
@@ -357,7 +358,87 @@ class TestProductionFilterWiring:
             out_dir=tmp_path,
         )
         notes_joined = " ".join(env.notes)
-        assert "SectorMomentumFilter" in notes_joined
+        # All four key facts must be present in the operator-facing notes:
+        assert "SPY trend" in notes_joined  # live-cycle leakage
+        assert "SectorMomentumFilter" in notes_joined  # omission
+        assert "stock-level" in notes_joined.lower()  # what replays
+        assert "OVER-counts" in notes_joined  # net effect
+
+    def test_equity_envelope_tagged_partial_fidelity(
+        self, tmp_path: Path, monkeypatch
+    ):
+        """Structured tag the EdgeAssessor reads programmatically.
+        Equity envelopes are partial-fidelity in v1, never claim to
+        be production-faithful."""
+        from strategies.health.envelope import FilterFidelity
+
+        bars = {"AAA": _synthetic_bars(seed=51)}
+
+        def fake_fetch(sym, start, end, timeframe):
+            return bars[sym], None
+
+        monkeypatch.setattr(build_envelopes, "fetch_symbol", fake_fetch)
+        monkeypatch.setitem(
+            build_envelopes.settings.STRATEGY_WATCHLISTS,
+            "sma_crossover",
+            ["AAA"],
+        )
+        env = build_envelopes.build_envelope(
+            "sma_crossover",
+            years=1.0,
+            end_date=datetime(2025, 1, 1, tzinfo=timezone.utc),
+            out_dir=tmp_path,
+        )
+        assert env.filter_fidelity == FilterFidelity.PARTIAL_STOCK_GATES_ONLY
+        # Must NEVER claim production-faithful with this build path.
+        assert env.filter_fidelity != FilterFidelity.PRODUCTION_FAITHFUL
+
+    def test_options_stub_tagged_not_backtested(self, tmp_path: Path):
+        """Options strategies that never ran a backtest must be tagged
+        NOT_BACKTESTED so the assessor doesn't apply trade-frequency
+        drift checks against null bands."""
+        from strategies.health.envelope import FilterFidelity
+
+        env = build_envelopes.build_envelope(
+            "spy_options_reversion",
+            years=1.0,
+            end_date=datetime(2025, 1, 1, tzinfo=timezone.utc),
+            out_dir=tmp_path,
+        )
+        assert env.filter_fidelity == FilterFidelity.NOT_BACKTESTED
+
+
+class TestSymbolPassedThroughBacktest:
+    """PR #17 second-pass fix to backtest/runner.py: the runner now
+    passes `symbol=` through to `strategy.generate_signals` so
+    symbol-aware filters (EarningsBlackout etc.) can resolve. Without
+    this fix they silently failed open in the backtest, defeating
+    parts of the production-filter wiring."""
+
+    def test_runner_passes_symbol_to_strategy(self, monkeypatch):
+        """Patch the strategy's generate_signals to record kwargs and
+        assert `symbol` was passed through."""
+        from backtest.runner import BacktestConfig, run_backtest
+        from strategies.base import SignalFrame
+
+        captured_kwargs: dict = {}
+
+        # Minimal strategy that captures kwargs and emits no signals.
+        class _SpyStrategy:
+            name = "spy_strategy"
+
+            def generate_signals(self, df, **kwargs):
+                captured_kwargs.update(kwargs)
+                idx = df.index
+                return SignalFrame(
+                    entries=pd.Series([False] * len(idx), index=idx),
+                    exits=pd.Series([False] * len(idx), index=idx),
+                )
+
+        bars = _synthetic_bars(seed=100, n=100)
+        cfg = BacktestConfig()
+        run_backtest(_SpyStrategy(), bars, cfg, symbol="QCOM")
+        assert captured_kwargs.get("symbol") == "QCOM"
 
 
 class TestNonFiniteCoercion:

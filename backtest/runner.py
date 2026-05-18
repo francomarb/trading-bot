@@ -192,7 +192,13 @@ def run_backtest(
     cfg = config or BacktestConfig()
     _required_cols(df)
 
-    raw = strategy.generate_signals(df)
+    # Pass `symbol` through so symbol-aware filters (EarningsBlackout,
+    # symbol-specific liquidity checks) can resolve correctly. Without
+    # this they silently fail open — see PR #17 reviewer feedback on
+    # PLAN 11.10b for the envelope-build implications. Strategies and
+    # filters that don't need the symbol ignore it (BaseStrategy
+    # docstring guarantees backwards compatibility).
+    raw = strategy.generate_signals(df, symbol=symbol)
     entries = _shift_for_next_open(raw.entries)
     exits = _shift_for_next_open(raw.exits)
 

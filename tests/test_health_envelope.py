@@ -20,6 +20,7 @@ import pytest
 
 from strategies.health.envelope import (
     ENVELOPE_SCHEMA_VERSION,
+    FilterFidelity,
     StrategyEnvelope,
     envelope_path,
 )
@@ -275,6 +276,32 @@ class TestNonFiniteJsonSafety:
         assert parsed["r_expectancy"] == 0.42
         assert parsed["profit_factor"] == 1.62
         assert parsed["r_expectancy_ci_95"] == [0.18, 0.65]
+
+    def test_filter_fidelity_default_is_unknown(self):
+        """Envelopes constructed without explicit fidelity default to
+        'unknown' — never silently claim production-faithful."""
+        env = _minimal_envelope()
+        assert env.filter_fidelity == "unknown"
+
+    def test_filter_fidelity_constants(self):
+        """The structured tag values used by the assessor."""
+        assert FilterFidelity.PRODUCTION_FAITHFUL == "production_faithful"
+        assert FilterFidelity.PARTIAL_STOCK_GATES_ONLY == "partial_stock_gates_only"
+        assert FilterFidelity.RAW_NO_FILTERS == "raw_no_filters"
+        assert FilterFidelity.NOT_BACKTESTED == "not_backtested"
+        assert FilterFidelity.UNKNOWN == "unknown"
+
+    def test_filter_fidelity_round_trip(self):
+        env = StrategyEnvelope(
+            schema_version=1,
+            strategy="x",
+            built_at="2026-01-01T00:00:00+00:00",
+            backtest_window_start="2024-01-01",
+            backtest_window_end="2026-01-01",
+            filter_fidelity=FilterFidelity.PARTIAL_STOCK_GATES_ONLY,
+        )
+        restored = StrategyEnvelope.from_json(env.to_json())
+        assert restored.filter_fidelity == FilterFidelity.PARTIAL_STOCK_GATES_ONLY
 
     def test_output_is_valid_standard_json(self):
         """jq-style strict parsers should accept the output. We

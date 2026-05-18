@@ -40,6 +40,42 @@ from typing import Any
 ENVELOPE_SCHEMA_VERSION = 1
 
 
+class FilterFidelity:
+    """Machine-readable labels for how faithfully the build script's
+    backtest reproduces production gating. Stored in
+    `StrategyEnvelope.filter_fidelity` so the EdgeAssessor can decide
+    how much trust to place in the envelope's trade-frequency /
+    block-rate expectations.
+
+    Hierarchy of "trust" (highest → lowest):
+      PRODUCTION_FAITHFUL  — every live filter replayed per-bar with
+                             correct historical state.
+      PARTIAL_STOCK_GATES_ONLY — stock-level price/volume/SMA gates
+                             replay correctly per-bar (the strategy's df
+                             carries them); macro/live-cycle gates may
+                             use build-time snapshots (SPY trend), and
+                             optional gates like SectorMomentumFilter
+                             are intentionally omitted. **This is the
+                             v1 default for all equity envelopes.**
+      RAW_NO_FILTERS       — strategy ran without any edge filter.
+      NOT_BACKTESTED       — stub envelope (options strategies that
+                             require live OPRA chains); filter fidelity
+                             is not applicable.
+      UNKNOWN              — default when not explicitly set; treat as
+                             low-trust.
+
+    Per the v1 invariant ("bot informs, operator decides"), the
+    assessor consumes this label and adjusts its drift bands but
+    never auto-disables a strategy on a low-fidelity envelope alone.
+    """
+
+    PRODUCTION_FAITHFUL = "production_faithful"
+    PARTIAL_STOCK_GATES_ONLY = "partial_stock_gates_only"
+    RAW_NO_FILTERS = "raw_no_filters"
+    NOT_BACKTESTED = "not_backtested"
+    UNKNOWN = "unknown"
+
+
 def _normalize_non_finite(obj: object) -> object:
     """Recursively replace any non-finite float (NaN, +Inf, -Inf) with None.
 
@@ -62,9 +98,17 @@ class StrategyEnvelope:
 
     `risk_unit_dollars` is the dollar value of 1R used to compute R metrics
     in this envelope. The EdgeAssessor must use the same unit when
-    comparing live R-expectancy. v1 approximation:
-        risk_unit_dollars = initial_cash * MAX_POSITION_PCT * approx_stop_pct
+    comparing live R-expectancy. v1 formula:
+        risk_unit_dollars = initial_cash * approx_stop_pct
+    (vectorbt sizes positions all-in, so position notional ≈ initial_cash.)
     Documented in the envelope so apples-to-apples comparison is auditable.
+
+    `filter_fidelity` is a structured tag the assessor reads programmatically
+    to know how closely the envelope reflects live production gating. See
+    `FilterFidelity` for values. A `partial_stock_gates_only` envelope is
+    expected to over-report trade frequency vs production (live filters
+    reject more signals); the assessor should widen its drift confidence
+    bands accordingly.
 
     Tuples are used instead of lists for frozen-collection immutability.
     Optional fields (lifecycle bands, R metrics) are nullable so the build
@@ -77,6 +121,11 @@ class StrategyEnvelope:
     backtest_window_start: str  # ISO date
     backtest_window_end: str
     backtest_config: dict[str, Any] = field(default_factory=dict)
+    # PR #17 reviewer feedback: explicit machine-readable label for how
+    # faithfully the backtest filters replay production. v1 envelopes ship
+    # as "partial_stock_gates_only" — see FilterFidelity values for the
+    # precise semantics.
+    filter_fidelity: str = "unknown"
 
     # ── Edge metrics (R-expectancy is primary; dollar secondary) ──
     r_expectancy: float | None = None
