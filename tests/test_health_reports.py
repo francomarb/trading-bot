@@ -112,11 +112,12 @@ class TestEnumValues:
 
 
 def _make_health_report() -> HealthReport:
+    """Build a HealthReport with L2=WATCH (so overall_status auto-computes
+    to WATCH per the worst-layer rule)."""
     return HealthReport(
         strategy="donchian_breakout",
         period_start=date(2026, 5, 18),
         period_end=date(2026, 5, 25),
-        overall_status=HealthStatus.HEALTHY,
         l1_status=HealthStatus.HEALTHY,
         l2_status=HealthStatus.WATCH,
         l3_status=HealthStatus.HEALTHY,
@@ -222,7 +223,8 @@ class TestToJson:
         text = to_json(report)
         parsed = json.loads(text)
         assert parsed["strategy"] == "donchian_breakout"
-        assert parsed["overall_status"] == "HEALTHY"
+        # overall_status is auto-computed to WATCH because l2_status=WATCH.
+        assert parsed["overall_status"] == "WATCH"
         assert parsed["period_start"] == "2026-05-18"
         assert parsed["checks"][0]["layer"] == "L2"
         assert parsed["checks"][0]["status"] == "WATCH"
@@ -247,7 +249,24 @@ class TestToJson:
         parsed = json.loads(text)
         assert parsed["recommendation"] == "continue"
         assert parsed["edge"]["verdict"] == "POSITIVE"
-        assert parsed["health"]["overall_status"] == "HEALTHY"
+        # _make_health_report has l2_status=WATCH so overall_status
+        # auto-computes to WATCH (worst-layer rule).
+        assert parsed["health"]["overall_status"] == "WATCH"
+
+    def test_overall_status_in_json_reflects_computed_value(self):
+        """Even if a downstream consumer reads only `overall_status`, it
+        sees the worst-layer value — never a contradictory underestimate.
+        This is the design contract the §1.2 invariant relies on."""
+        report = HealthReport(
+            strategy="x",
+            period_start=date(2026, 1, 1),
+            period_end=date(2026, 1, 8),
+            l1_status=HealthStatus.HEALTHY,
+            l2_status=HealthStatus.DEGRADED,  # worst
+            l3_status=HealthStatus.WATCH,
+        )
+        parsed = json.loads(to_json(report))
+        assert parsed["overall_status"] == "DEGRADED"
 
     def test_none_optional_fields_serialize_as_null(self):
         report = EdgeReport(
@@ -276,3 +295,171 @@ class TestToJson:
         parsed = json.loads(text)
         assert parsed["r_expectancy"] is None
         assert parsed["r_expectancy_ci_95"] is None
+
+
+# ── Reviewer-driven invariants (PR #16 second pass) ───────────────────
+
+
+class TestOverallStatusAutoComputed:
+    """`HealthReport.overall_status` is computed from the worst layer
+    status — `init=False` — so no caller can pass a value that
+    contradicts the layer fields. Closes the dashboard-understatement
+    hole the reviewer flagged."""
+
+    def test_overall_is_worst_layer(self):
+        r = HealthReport(
+            strategy="x",
+            period_start=date(2026, 1, 1),
+            period_end=date(2026, 1, 8),
+            l1_status=HealthStatus.HEALTHY,
+            l2_status=HealthStatus.DEGRADED,
+            l3_status=HealthStatus.WATCH,
+        )
+        assert r.overall_status == HealthStatus.DEGRADED
+
+    def test_all_healthy_means_overall_healthy(self):
+        r = HealthReport(
+            strategy="x",
+            period_start=date(2026, 1, 1),
+            period_end=date(2026, 1, 8),
+            l1_status=HealthStatus.HEALTHY,
+            l2_status=HealthStatus.HEALTHY,
+            l3_status=HealthStatus.HEALTHY,
+        )
+        assert r.overall_status == HealthStatus.HEALTHY
+
+    def test_l2_broken_promotes_overall_to_broken(self):
+        r = HealthReport(
+            strategy="x",
+            period_start=date(2026, 1, 1),
+            period_end=date(2026, 1, 8),
+            l1_status=HealthStatus.WATCH,
+            l2_status=HealthStatus.BROKEN,
+            l3_status=HealthStatus.HEALTHY,
+        )
+        assert r.overall_status == HealthStatus.BROKEN
+
+    def test_overall_status_not_a_constructor_kwarg(self):
+        """`overall_status` is init=False — passing it raises TypeError.
+        This is the contract that prevents contradictory states."""
+        with pytest.raises(TypeError):
+            HealthReport(
+                strategy="x",
+                period_start=date(2026, 1, 1),
+                period_end=date(2026, 1, 8),
+                l1_status=HealthStatus.HEALTHY,
+                l2_status=HealthStatus.HEALTHY,
+                l3_status=HealthStatus.HEALTHY,
+                overall_status=HealthStatus.BROKEN,  # type: ignore[call-arg]
+            )
+
+
+class TestL3BrokenRejected:
+    """Design §3.6 invariant: L3 drift cannot be BROKEN — enforced at
+    construction time on both CheckResult and HealthReport."""
+
+    def test_check_result_l3_broken_raises(self):
+        with pytest.raises(ValueError, match="L3 .* cannot be BROKEN"):
+            CheckResult(
+                name="trade_frequency_drift_pct",
+                layer=Layer.L3,
+                status=HealthStatus.BROKEN,
+            )
+
+    def test_check_result_l3_degraded_allowed(self):
+        # DEGRADED on L3 is legal — only BROKEN is rejected.
+        cr = CheckResult(
+            name="trade_frequency_drift_pct",
+            layer=Layer.L3,
+            status=HealthStatus.DEGRADED,
+        )
+        assert cr.status == HealthStatus.DEGRADED
+
+    def test_check_result_l1_l2_broken_allowed(self):
+        # L1/L2 can be BROKEN — operational/execution failures are
+        # legitimately "broken until fixed".
+        for layer in (Layer.L1, Layer.L2):
+            cr = CheckResult(
+                name="some_check", layer=layer, status=HealthStatus.BROKEN
+            )
+            assert cr.status == HealthStatus.BROKEN
+
+    def test_health_report_l3_broken_raises(self):
+        with pytest.raises(ValueError, match="l3_status cannot be BROKEN"):
+            HealthReport(
+                strategy="x",
+                period_start=date(2026, 1, 1),
+                period_end=date(2026, 1, 8),
+                l1_status=HealthStatus.HEALTHY,
+                l2_status=HealthStatus.HEALTHY,
+                l3_status=HealthStatus.BROKEN,
+            )
+
+
+class TestFrozenCollectionsAreImmutable:
+    """Frozen dataclasses must not silently expose mutable list state.
+    Mutations would propagate to JSON output and markdown rendering."""
+
+    def test_check_result_findings_is_tuple(self):
+        cr = CheckResult(
+            name="x",
+            layer=Layer.L1,
+            status=HealthStatus.HEALTHY,
+            findings=["a", "b"],
+        )
+        # List input → stored as tuple. `.append` is not available.
+        assert isinstance(cr.findings, tuple)
+        with pytest.raises(AttributeError):
+            cr.findings.append("c")  # type: ignore[attr-defined]
+
+    def test_health_report_checks_is_tuple(self):
+        cr = CheckResult(name="x", layer=Layer.L1, status=HealthStatus.HEALTHY)
+        r = HealthReport(
+            strategy="x",
+            period_start=date(2026, 1, 1),
+            period_end=date(2026, 1, 8),
+            l1_status=HealthStatus.HEALTHY,
+            l2_status=HealthStatus.HEALTHY,
+            l3_status=HealthStatus.HEALTHY,
+            checks=[cr],
+        )
+        assert isinstance(r.checks, tuple)
+        with pytest.raises(AttributeError):
+            r.checks.append(cr)  # type: ignore[attr-defined]
+
+    def test_edge_report_failure_reasons_is_tuple(self):
+        report = EdgeReport(
+            strategy="x",
+            period_start=date(2026, 1, 1),
+            period_end=date(2026, 1, 8),
+            verdict=EdgeVerdict.NEGATIVE,
+            sufficiency=Sufficiency.CONCLUSIVE,
+            trade_count=60,
+            min_trades_for_verdict=50,
+            r_expectancy=-0.1,
+            r_expectancy_ci_95=(-0.3, -0.01),
+            envelope_r_expectancy_ci_95=(0.2, 0.7),
+            realized_pnl=-500.0,
+            expectancy_dollars=-8.0,
+            expectancy_dollars_ci_95=(-25.0, -1.0),
+            profit_factor=0.75,
+            win_rate=0.40,
+            sleeve_utilization=0.65,
+            benchmark_return=0.04,
+            strategy_return=-0.01,
+            alpha=-0.05,
+            negative_persistence_weeks=3,
+            failure_reasons=["expectancy CI below zero", "EMA50<EMA100"],
+        )
+        assert isinstance(report.failure_reasons, tuple)
+        with pytest.raises(AttributeError):
+            report.failure_reasons.append("x")  # type: ignore[attr-defined]
+
+    def test_passing_tuple_directly_works(self):
+        cr = CheckResult(
+            name="x",
+            layer=Layer.L1,
+            status=HealthStatus.HEALTHY,
+            findings=("a", "b"),
+        )
+        assert cr.findings == ("a", "b")

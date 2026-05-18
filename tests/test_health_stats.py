@@ -242,3 +242,61 @@ class TestWinRate:
     def test_zero_not_counted_as_win(self):
         # Convention: zero (break-even) is not a win.
         assert win_rate([0, 0, 1]) == 1.0 / 3.0
+
+
+# ── Non-finite input rejection (PR #16 second pass) ───────────────────
+
+
+class TestNonFiniteInputRejection:
+    """Design §1.2: silent NaN propagation through the stats module
+    would mask Edge degradation — `t_test(nan) → reject_h0=False`
+    because `nan < 0` is False, turning missing data into a false
+    non-NEGATIVE signal. Stats functions raise on non-finite input;
+    the assessor (11.10d) filters at the data-fetch layer as an
+    explicit policy decision."""
+
+    @pytest.mark.parametrize("bad_value", [float("nan"), float("inf"), float("-inf")])
+    def test_bootstrap_rejects_non_finite(self, bad_value):
+        with pytest.raises(ValueError, match="non-finite"):
+            bootstrap_mean_ci([1.0, 2.0, bad_value, 3.0])
+
+    @pytest.mark.parametrize("bad_value", [float("nan"), float("inf"), float("-inf")])
+    def test_t_test_rejects_non_finite(self, bad_value):
+        with pytest.raises(ValueError, match="non-finite"):
+            one_sided_t_test_mean_gt_zero([1.0, 2.0, bad_value, 3.0])
+
+    @pytest.mark.parametrize("bad_value", [float("nan"), float("inf"), float("-inf")])
+    def test_ema_cross_rejects_non_finite(self, bad_value):
+        with pytest.raises(ValueError, match="non-finite"):
+            ema_cross_negative([1.0] * 50 + [bad_value] + [2.0] * 60)
+
+    @pytest.mark.parametrize("bad_value", [float("nan"), float("inf"), float("-inf")])
+    def test_profit_factor_rejects_non_finite(self, bad_value):
+        with pytest.raises(ValueError, match="non-finite"):
+            profit_factor([1.0, -2.0, bad_value])
+
+    @pytest.mark.parametrize("bad_value", [float("nan"), float("inf"), float("-inf")])
+    def test_win_rate_rejects_non_finite(self, bad_value):
+        with pytest.raises(ValueError, match="non-finite"):
+            win_rate([1.0, -1.0, bad_value])
+
+    def test_error_message_names_function_and_count(self):
+        """Error message tells the operator which stats call rejected
+        and how many bad values were found — for fast triage in logs."""
+        try:
+            bootstrap_mean_ci([1.0, float("nan"), float("nan"), 2.0])
+        except ValueError as exc:
+            msg = str(exc)
+            assert "bootstrap_mean_ci" in msg
+            assert "2" in msg  # n_bad count
+            assert "silent-killer" in msg.lower()  # rationale visible to operator
+        else:
+            pytest.fail("expected ValueError")
+
+    def test_empty_input_still_returns_none_not_error(self):
+        """Empty input is not 'non-finite' — it's just empty. Existing
+        contract: bootstrap/t-test return None on insufficient sample."""
+        assert bootstrap_mean_ci([]) is None
+        assert one_sided_t_test_mean_gt_zero([]) is None
+        assert profit_factor([]) is None
+        assert win_rate([]) is None

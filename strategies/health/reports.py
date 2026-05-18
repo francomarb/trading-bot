@@ -109,6 +109,14 @@ def sufficiency_for(n: int, floor: int) -> Sufficiency:
 # ── Result dataclasses ─────────────────────────────────────────────────
 
 
+_STATUS_RANK = {
+    HealthStatus.HEALTHY: 0,
+    HealthStatus.WATCH: 1,
+    HealthStatus.DEGRADED: 2,
+    HealthStatus.BROKEN: 3,
+}
+
+
 @dataclass(frozen=True)
 class CheckResult:
     """One Health check outcome.
@@ -117,6 +125,13 @@ class CheckResult:
     50)"). `numeric_value` is the underlying metric for dashboard/report
     rendering. `threshold_breached` names which threshold was hit (e.g.
     "degraded_above"); empty string if HEALTHY.
+
+    Design §3.6 invariant: L3 checks cannot be BROKEN (drift is gradual).
+    Construction with `layer=Layer.L3, status=HealthStatus.BROKEN` raises
+    `ValueError` — preserves the invariant at the type-construction boundary.
+
+    `findings` accepts a list for construction ergonomics but is stored
+    as a tuple so the frozen guarantee covers it.
     """
 
     name: str
@@ -124,25 +139,62 @@ class CheckResult:
     status: HealthStatus
     numeric_value: float | None = None
     threshold_breached: str = ""
-    findings: list[str] = field(default_factory=list)
+    findings: tuple[str, ...] = field(default_factory=tuple)
+
+    def __post_init__(self) -> None:
+        if self.layer is Layer.L3 and self.status is HealthStatus.BROKEN:
+            raise ValueError(
+                "L3 (drift) checks cannot be BROKEN — drift is gradual by "
+                "nature (design §3.6). Use DEGRADED for sustained drift."
+            )
+        # Coerce list/sequence inputs to tuple to preserve frozen semantics.
+        if not isinstance(self.findings, tuple):
+            object.__setattr__(self, "findings", tuple(self.findings))
 
 
 @dataclass(frozen=True)
 class HealthReport:
     """Per-strategy health report (design §6).
 
-    `overall_status` is the worst layer status. Per design's Edge/Health
-    primacy: a BROKEN HealthReport never auto-disables a strategy.
+    Per design's Edge/Health primacy: a BROKEN HealthReport never
+    auto-disables a strategy.
+
+    `overall_status` is **always computed** in `__post_init__` as the
+    worst layer status across L1/L2/L3. It is not a constructor
+    parameter — `init=False` — to close the contradictory-state hole
+    where a dashboard reading only `overall_status` could understate a
+    strategy's actual health.
+
+    Design §3.6 invariant: `l3_status` cannot be BROKEN. Construction
+    with `l3_status=HealthStatus.BROKEN` raises `ValueError`.
+
+    `checks` accepts a list for construction ergonomics but is stored
+    as a tuple so the frozen guarantee covers it.
     """
 
     strategy: str
     period_start: date
     period_end: date
-    overall_status: HealthStatus
     l1_status: HealthStatus
     l2_status: HealthStatus
     l3_status: HealthStatus
-    checks: list[CheckResult] = field(default_factory=list)
+    checks: tuple[CheckResult, ...] = field(default_factory=tuple)
+    overall_status: HealthStatus = field(init=False)
+
+    def __post_init__(self) -> None:
+        if self.l3_status is HealthStatus.BROKEN:
+            raise ValueError(
+                "l3_status cannot be BROKEN (design §3.6: L3 drift is "
+                "gradual by nature — use DEGRADED for sustained drift)."
+            )
+        computed = max(
+            (self.l1_status, self.l2_status, self.l3_status),
+            key=_STATUS_RANK.__getitem__,
+        )
+        object.__setattr__(self, "overall_status", computed)
+        # Coerce checks to tuple to preserve frozen semantics.
+        if not isinstance(self.checks, tuple):
+            object.__setattr__(self, "checks", tuple(self.checks))
 
 
 @dataclass(frozen=True)
@@ -184,8 +236,14 @@ class EdgeReport:
     alpha: float | None
     # Persistence (design §9)
     negative_persistence_weeks: int
-    # Top failure reasons (used in summary table) — empty when verdict POSITIVE
-    failure_reasons: list[str] = field(default_factory=list)
+    # Top failure reasons (used in summary table) — empty when verdict POSITIVE.
+    # Accepts a list for construction ergonomics but is stored as a tuple
+    # to preserve frozen semantics.
+    failure_reasons: tuple[str, ...] = field(default_factory=tuple)
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.failure_reasons, tuple):
+            object.__setattr__(self, "failure_reasons", tuple(self.failure_reasons))
 
 
 @dataclass(frozen=True)

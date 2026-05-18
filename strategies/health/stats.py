@@ -22,6 +22,38 @@ import pandas as pd
 from indicators.technicals import add_ema
 
 
+# ── Input validation ───────────────────────────────────────────────────
+
+
+def _to_finite_array(values: Sequence[float], *, name: str) -> np.ndarray:
+    """Convert input to float array; reject NaN / Inf.
+
+    Per design §1.2 the monitor exists to catch the silent-killer case
+    (clean execution + steady losses). A single NaN in a sample silently
+    propagates through bootstrap CI (→ nan bounds) and t-test
+    (→ sample_mean=nan, reject_h0=False because `nan < 0` is False) —
+    which would turn missing data into a false non-NEGATIVE Edge signal.
+    That defeats the whole monitor.
+
+    We raise instead of filtering: the assessor (11.10d) must make the
+    NaN-filtering decision explicitly at the data-fetch layer (e.g.
+    "drop rows where r_multiple IS NULL"), as a code-visible policy
+    rather than a silent stats-module behavior.
+    """
+    arr = np.asarray(list(values), dtype=float)
+    if arr.size == 0:
+        return arr
+    if not np.all(np.isfinite(arr)):
+        n_bad = int(np.sum(~np.isfinite(arr)))
+        raise ValueError(
+            f"{name}: input contains {n_bad} non-finite value(s) (NaN/Inf). "
+            f"Filter at the data-fetch layer before passing to the stats "
+            f"module — silent NaN propagation would mask Edge degradation "
+            f"(the silent-killer failure mode)."
+        )
+    return arr
+
+
 # ── Bootstrap CI ───────────────────────────────────────────────────────
 
 
@@ -49,7 +81,7 @@ def bootstrap_mean_ci(
         raise ValueError(f"confidence must be in (0,1), got {confidence}")
     if n_resamples < 100:
         raise ValueError(f"n_resamples must be >= 100, got {n_resamples}")
-    arr = np.asarray(list(values), dtype=float)
+    arr = _to_finite_array(values, name="bootstrap_mean_ci")
     n = arr.size
     if n < 2:
         return None
@@ -103,7 +135,7 @@ def one_sided_t_test_mean_gt_zero(
     """
     if not 0.0 < alpha < 1.0:
         raise ValueError(f"alpha must be in (0,1), got {alpha}")
-    arr = np.asarray(list(values), dtype=float)
+    arr = _to_finite_array(values, name="one_sided_t_test_mean_gt_zero")
     n = int(arr.size)
     if n < 2:
         return None
@@ -187,7 +219,7 @@ def ema_cross_negative(
         raise ValueError("EMA lengths must be ≥ 1")
     if fast_length >= slow_length:
         raise ValueError(f"fast_length ({fast_length}) must be < slow_length ({slow_length})")
-    arr = np.asarray(list(cumulative_r), dtype=float)
+    arr = _to_finite_array(cumulative_r, name="ema_cross_negative")
     n = arr.size
     if n < slow_length:
         return EmaCrossResult(False, None, None, None)
@@ -226,8 +258,10 @@ def profit_factor(values: Sequence[float]) -> float | None:
     Returns None on empty input, +inf when there are wins but no losses,
     0.0 when all values are non-positive. Matches the convention used
     in `reporting/metrics.py` and `reporting/pnl.py:StrategyStats`.
+
+    Raises ValueError on non-finite input (see _to_finite_array docstring).
     """
-    arr = np.asarray(list(values), dtype=float)
+    arr = _to_finite_array(values, name="profit_factor")
     if arr.size == 0:
         return None
     gross_win = float(arr[arr > 0].sum())
@@ -242,8 +276,10 @@ def win_rate(values: Sequence[float]) -> float | None:
 
     Zeroes (break-even trades) are not counted as wins — matches the
     convention used in `reporting/metrics.py`.
+
+    Raises ValueError on non-finite input (see _to_finite_array docstring).
     """
-    arr = np.asarray(list(values), dtype=float)
+    arr = _to_finite_array(values, name="win_rate")
     if arr.size == 0:
         return None
     return float((arr > 0).sum() / arr.size)
