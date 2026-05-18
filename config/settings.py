@@ -295,6 +295,28 @@ ALLOCATOR_STRETCH_UTILIZATION_THRESHOLD = 0.80
 ALLOCATOR_DEFAULT_STRETCH_PCT = 0.15
 MIN_TRADE_NOTIONAL = 100.0      # Reject entries if sleeve available < this
 
+# Strategy Health monitor (PLAN 11.10) — per-strategy minimum trade
+# count before the EdgeAssessor can emit a CONCLUSIVE verdict. Below
+# half this value the verdict is INSUFFICIENT; between half and the
+# floor it is INDICATIVE; at or above the floor the verdict can be
+# CONCLUSIVE (and the silent-killer alarm becomes possible).
+#
+# Numbers are hand-picked heuristics — honest about it. MinTRL-based
+# rigorous replacement is follow-up §F1. See docs/strategy_health_design.md §8.
+#
+# rsi_reversion is intentionally low (25) because the strategy's tight
+# filters (SPY trend, earnings blackout, no-new-low) gate heavily in
+# some regimes; observed 2-month zero-trade stretches in paper. The
+# "RSI isn't firing" case is handled by L3 Drift independently of
+# whether Edge ever reaches CONCLUSIVE.
+STRATEGY_MIN_TRADES_FOR_VERDICT: dict[str, int] = {
+    "sma_crossover": 30,
+    "rsi_reversion": 25,
+    "donchian_breakout": 50,
+    "spy_options_reversion": 40,
+    "credit_spread": 50,
+}
+
 # Strategy-level high-water-mark drawdown gate (SleeveAllocator).
 # If a strategy's cumulative realized P&L drops more than this fraction
 # below its peak (HWM), new entries for that strategy are paused until
