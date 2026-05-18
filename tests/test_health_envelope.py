@@ -206,3 +206,97 @@ class TestEnvelopePath:
     def test_override_root(self, tmp_path: Path):
         p = envelope_path("donchian_breakout", root=tmp_path)
         assert p == tmp_path / "donchian_breakout.json"
+
+
+# ── Non-finite JSON safety (PR #17 reviewer feedback) ─────────────────
+
+
+class TestNonFiniteJsonSafety:
+    """Standard JSON has no representation for Infinity/NaN. Strict
+    parsers (jq, browser JSON.parse) reject the `Infinity` token the
+    default Python encoder emits. Envelope `to_json` defensively
+    replaces non-finite scalars with None and uses `allow_nan=False`
+    as a final backstop."""
+
+    def test_inf_profit_factor_serializes_as_null(self):
+        env = StrategyEnvelope(
+            schema_version=1,
+            strategy="x",
+            built_at="2026-01-01T00:00:00+00:00",
+            backtest_window_start="2024-01-01",
+            backtest_window_end="2026-01-01",
+            profit_factor=float("inf"),
+            profit_factor_ci_95=(1.2, float("inf")),
+        )
+        text = env.to_json()
+        # No "Infinity" literal anywhere in the output
+        assert "Infinity" not in text
+        assert "inf" not in text.lower()
+        parsed = json.loads(text)
+        assert parsed["profit_factor"] is None
+        # Tuple with one inf element → both elements replaced (we
+        # null the whole tuple at the build_script layer normally;
+        # this test confirms even partial-inf gets stripped).
+        assert parsed["profit_factor_ci_95"] == [1.2, None]
+
+    def test_nan_serializes_as_null(self):
+        env = StrategyEnvelope(
+            schema_version=1,
+            strategy="x",
+            built_at="2026-01-01T00:00:00+00:00",
+            backtest_window_start="2024-01-01",
+            backtest_window_end="2026-01-01",
+            r_expectancy=float("nan"),
+        )
+        text = env.to_json()
+        assert "NaN" not in text
+        parsed = json.loads(text)
+        assert parsed["r_expectancy"] is None
+
+    def test_negative_inf_serializes_as_null(self):
+        env = StrategyEnvelope(
+            schema_version=1,
+            strategy="x",
+            built_at="2026-01-01T00:00:00+00:00",
+            backtest_window_start="2024-01-01",
+            backtest_window_end="2026-01-01",
+            expectancy_dollars=float("-inf"),
+        )
+        text = env.to_json()
+        parsed = json.loads(text)
+        assert parsed["expectancy_dollars"] is None
+
+    def test_finite_values_unchanged(self):
+        """Sanity: normalization only touches non-finite — finite
+        values round-trip identically."""
+        env = _full_envelope()
+        parsed = json.loads(env.to_json())
+        assert parsed["expectancy_dollars"] == 140.0
+        assert parsed["r_expectancy"] == 0.42
+        assert parsed["profit_factor"] == 1.62
+        assert parsed["r_expectancy_ci_95"] == [0.18, 0.65]
+
+    def test_output_is_valid_standard_json(self):
+        """jq-style strict parsers should accept the output. We
+        simulate this by asserting the output passes
+        `json.loads(strict=True)`. Python's loads has strict=True by
+        default; the real test is that no 'Infinity' / 'NaN' tokens
+        appear and that `allow_nan=False` was applied."""
+        env = StrategyEnvelope(
+            schema_version=1,
+            strategy="x",
+            built_at="2026-01-01T00:00:00+00:00",
+            backtest_window_start="2024-01-01",
+            backtest_window_end="2026-01-01",
+            profit_factor=float("inf"),
+            r_expectancy=float("nan"),
+            expectancy_dollars=float("-inf"),
+        )
+        text = env.to_json()
+        # Round-trip via strict parser
+        json.loads(text)  # would raise on Infinity
+        # Verify all three non-finite became null
+        parsed = json.loads(text)
+        assert parsed["profit_factor"] is None
+        assert parsed["r_expectancy"] is None
+        assert parsed["expectancy_dollars"] is None

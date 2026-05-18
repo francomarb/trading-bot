@@ -48,6 +48,9 @@ from backtest.runner import BacktestConfig, run_backtest  # noqa: E402
 from config import settings  # noqa: E402
 from data.fetcher import fetch_symbol  # noqa: E402
 from strategies.donchian_breakout import DonchianBreakout  # noqa: E402
+from strategies.filters.donchian_breakout import DonchianEdgeFilter  # noqa: E402
+from strategies.filters.rsi_reversion import RSIEdgeFilter  # noqa: E402
+from strategies.filters.sma_crossover import SMAEdgeFilter  # noqa: E402
 from strategies.health.envelope import (  # noqa: E402
     ENVELOPE_SCHEMA_VERSION,
     StrategyEnvelope,
@@ -56,6 +59,24 @@ from strategies.health.envelope import (  # noqa: E402
 from strategies.health.stats import bootstrap_mean_ci  # noqa: E402
 from strategies.rsi_reversion import RSIReversion  # noqa: E402
 from strategies.sma_crossover import SMACrossover  # noqa: E402
+
+
+# Build-time note appended to every equity envelope:
+# explains that SectorMomentumFilter is intentionally omitted from the
+# backtest because the sector gauge requires offline-unfriendly state
+# (sector ETF fetches + sector cache). The primary strategy-level edge
+# filter IS included so the envelope reflects production gating for
+# SPY-trend / earnings / liquidity. This is the same pattern the
+# existing backtest scripts use (scripts/backtest_bollinger_squeeze.py,
+# scripts/backtest_donchian_breakout.py).
+SECTOR_FILTER_OMITTED_NOTE = (
+    "envelope built with the strategy's primary edge filter (SPY-trend, "
+    "earnings blackout, liquidity floor) but WITHOUT SectorMomentumFilter "
+    "— sector gauge requires offline-unfriendly state. Production live "
+    "behavior may include additional sector-momentum rejections; the "
+    "11.10g calibration script (post-paper-watch) can re-tune trade "
+    "frequency expectations against actual sector-filtered counts."
+)
 
 
 # ── Per-strategy build spec ───────────────────────────────────────────
@@ -74,15 +95,22 @@ from strategies.sma_crossover import SMACrossover  # noqa: E402
 
 
 def _sma_builder():
-    return SMACrossover(fast=20, slow=50)
+    # Production wiring (forward_test.py) uses CompositeEdgeFilter([
+    # SMAEdgeFilter, SectorMomentumFilter]); we wire SMAEdgeFilter only —
+    # see SECTOR_FILTER_OMITTED_NOTE for rationale.
+    return SMACrossover(fast=20, slow=50, edge_filter=SMAEdgeFilter())
 
 
 def _rsi_builder():
-    return RSIReversion(period=14, oversold=30, overbought=70)
+    return RSIReversion(
+        period=14, oversold=30, overbought=70, edge_filter=RSIEdgeFilter()
+    )
 
 
 def _donchian_builder():
-    return DonchianBreakout(entry_window=30, exit_window=15)
+    return DonchianBreakout(
+        entry_window=30, exit_window=15, edge_filter=DonchianEdgeFilter()
+    )
 
 
 def _spy_options_builder():
@@ -359,6 +387,40 @@ def _profit_factor(arr: np.ndarray) -> float:
     return gp / gl
 
 
+def _is_finite(v: object) -> bool:
+    """True iff `v` is a finite scalar or a tuple of finite scalars."""
+    if v is None:
+        return True  # None is fine — represents "no value", not "non-finite"
+    if isinstance(v, (int, float)):
+        return bool(np.isfinite(v))
+    if isinstance(v, tuple):
+        return all(_is_finite(x) for x in v)
+    return True
+
+
+def _coerce_finite(
+    a: tuple[str, object],
+    b: tuple[str, object],
+) -> tuple[object, object, list[str]]:
+    """Return (a_value, b_value, dropped_names) replacing any non-finite
+    scalar / tuple-of-scalars with None.
+
+    Used to keep envelope JSON standard-compliant (no `Infinity` /
+    `NaN`). Caller appends `dropped_names` to envelope notes so the
+    operator knows which fields got nulled.
+    """
+    dropped: list[str] = []
+    a_name, a_val = a
+    b_name, b_val = b
+    if not _is_finite(a_val):
+        dropped.append(a_name)
+        a_val = None
+    if not _is_finite(b_val):
+        dropped.append(b_name)
+        b_val = None
+    return a_val, b_val, dropped
+
+
 # ── Build entry ───────────────────────────────────────────────────────
 
 
@@ -463,24 +525,38 @@ def build_envelope(
     expectancy_dollars = float(pnls_arr.mean())
     expectancy_dollars_ci = bootstrap_mean_ci(pnls, n_resamples=2000, seed=0)
 
-    # R-multiple approximation. Per the design + envelope module's
-    # `risk_unit_dollars` field: convert per-trade $ PnL to R using a
-    # constant risk unit derived from initial_cash * max_position_pct
-    # * approx_stop_pct. This is a v1 approximation — live R is exact
-    # from trades.r_multiple. The two are within ~order of magnitude;
-    # the bootstrap CI absorbs the scale uncertainty.
+    # R-multiple approximation. vectorbt uses all-in sizing by default
+    # (one position consumes ~all available cash), so the per-trade
+    # position notional is approximately `initial_cash`. The stop loss
+    # at `approx_stop_pct` therefore costs `initial_cash * approx_stop_pct`
+    # dollars if hit — that's 1R for envelope purposes.
+    #
+    # **Do not multiply by MAX_POSITION_PCT here.** MAX_POSITION_PCT is
+    # the *production* risk fraction (loss-to-stop ÷ equity); production
+    # sizes positions smaller (~40k notional for $100k equity at 2% risk
+    # and a 5% stop) but the live R-multiple from trades.r_multiple
+    # already normalizes for that. R is sizing-invariant by design — for
+    # the same underlying move, vectorbt-R and live-R should match if
+    # both denominators reflect their respective position notional.
+    #
+    # PR #17 reviewer caught the original `* MAX_POSITION_PCT` multiplication
+    # which deflated risk_unit_dollars ~50× and would have inflated
+    # envelope R-expectancy / CIs by the same factor, making
+    # live-vs-envelope comparison unusable.
     cfg = BacktestConfig()
     approx_stop_pct = spec.get("approx_stop_pct")
     if approx_stop_pct is not None:
-        risk_unit = cfg.initial_cash * settings.MAX_POSITION_PCT * approx_stop_pct
+        risk_unit = cfg.initial_cash * approx_stop_pct
         r_values = [p / risk_unit for p in pnls]
         r_arr = np.asarray(r_values, dtype=float)
         r_expectancy = float(r_arr.mean())
         r_expectancy_ci = bootstrap_mean_ci(r_values, n_resamples=2000, seed=0)
         notes.append(
-            f"r_expectancy uses constant risk_unit_dollars={risk_unit:.2f} "
-            f"(initial_cash * MAX_POSITION_PCT * approx_stop_pct={approx_stop_pct}). "
-            f"Live r_multiple is exact (per-trade); envelope R is an approximation."
+            f"r_expectancy uses risk_unit_dollars={risk_unit:.2f} "
+            f"(initial_cash * approx_stop_pct={approx_stop_pct}; "
+            f"vectorbt's all-in sizing means position notional ≈ initial_cash). "
+            f"Live r_multiple is exact (per-trade); envelope R is an "
+            f"approximation but is sizing-invariant when compared correctly."
         )
     else:
         risk_unit = None
@@ -491,6 +567,42 @@ def build_envelope(
     win_rate_ci = _bootstrap_metric(pnls, _win_rate)
     pf_pt = _profit_factor(pnls_arr)
     pf_ci = _bootstrap_metric(pnls, _profit_factor)
+
+    # ── Normalize non-finite numerics before envelope construction ──
+    # All-winning backtests produce profit_factor=+inf; bootstrap
+    # resamples can produce inf CI bounds (e.g. a resample of all-wins).
+    # Inf serializes as JSON "Infinity" which is not standard JSON and
+    # breaks strict parsers (jq, browser JSON.parse). Convert any
+    # non-finite to None and append a note so the operator knows.
+    pf_pt, pf_ci, drops = _coerce_finite(
+        ("profit_factor", pf_pt),
+        ("profit_factor_ci", pf_ci),
+    )
+    r_expectancy, r_expectancy_ci, r_drops = _coerce_finite(
+        ("r_expectancy", r_expectancy),
+        ("r_expectancy_ci", r_expectancy_ci),
+    )
+    expectancy_dollars_ci, _, ed_drops = _coerce_finite(
+        ("expectancy_dollars_ci", expectancy_dollars_ci),
+        ("_", None),
+    )
+    win_rate_ci, _, wr_drops = _coerce_finite(
+        ("win_rate_ci", win_rate_ci),
+        ("_", None),
+    )
+    if drops or r_drops or ed_drops or wr_drops:
+        dropped = drops + r_drops + ed_drops + wr_drops
+        notes.append(
+            f"non-finite values replaced with null (envelope JSON stays "
+            f"standard-compliant): {dropped}. Typically caused by "
+            f"all-winning backtests (profit_factor=+inf) or sparse-loss "
+            f"bootstrap resamples."
+        )
+
+    # Document the sector-filter omission so the assessor / operator
+    # knows the envelope was built with the strategy's primary edge
+    # filter only (no SectorMomentumFilter).
+    notes.append(SECTOR_FILTER_OMITTED_NOTE)
 
     envelope = StrategyEnvelope(
         schema_version=ENVELOPE_SCHEMA_VERSION,

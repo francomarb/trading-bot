@@ -31,12 +31,29 @@ on operator discipline).
 from __future__ import annotations
 
 import json
+import math
 from dataclasses import asdict, dataclass, field
 from datetime import date
 from pathlib import Path
 from typing import Any
 
 ENVELOPE_SCHEMA_VERSION = 1
+
+
+def _normalize_non_finite(obj: object) -> object:
+    """Recursively replace any non-finite float (NaN, +Inf, -Inf) with None.
+
+    Walks dicts, lists, tuples. Used by `StrategyEnvelope.to_json` to
+    keep envelope JSON standard-compliant. Build script catches
+    non-finite at construction time but this is defense-in-depth.
+    """
+    if isinstance(obj, float):
+        return None if not math.isfinite(obj) else obj
+    if isinstance(obj, dict):
+        return {k: _normalize_non_finite(v) for k, v in obj.items()}
+    if isinstance(obj, (list, tuple)):
+        return type(obj)(_normalize_non_finite(v) for v in obj)
+    return obj
 
 
 @dataclass(frozen=True)
@@ -105,7 +122,20 @@ class StrategyEnvelope:
                 object.__setattr__(self, fname, tuple(current))
 
     def to_json(self) -> str:
-        """Pretty-printed JSON, suitable for committing to git."""
+        """Pretty-printed JSON, suitable for committing to git.
+
+        Defensive: any non-finite float (NaN/Inf) anywhere in the
+        envelope is replaced with None before encoding. Standard JSON
+        has no representation for Infinity — strict parsers (jq,
+        browser JSON.parse) reject the `Infinity` token Python's
+        default encoder emits. `allow_nan=False` is set as a final
+        backstop so an accidental Infinity raises here rather than
+        silently producing non-compliant output.
+
+        Build script (scripts/build_envelopes.py) catches non-finite at
+        construction time and appends an explanatory note; this layer
+        is just defense in depth.
+        """
 
         def _default(obj: object) -> object:
             if isinstance(obj, date):
@@ -114,7 +144,8 @@ class StrategyEnvelope:
                 return list(obj)
             raise TypeError(f"unserializable: {type(obj).__name__}")
 
-        return json.dumps(asdict(self), default=_default, indent=2)
+        data = _normalize_non_finite(asdict(self))
+        return json.dumps(data, default=_default, indent=2, allow_nan=False)
 
     def write(self, path: str | Path) -> None:
         """Atomic write — tmp file + os.replace, mirrors the engine's

@@ -240,3 +240,182 @@ class TestStrategySpecsCoverage:
         for name, spec in build_envelopes.STRATEGY_SPECS.items():
             missing = required - spec.keys()
             assert not missing, f"{name}: spec missing keys {missing}"
+
+
+# ── PR #17 reviewer feedback (R-unit, filters, inf safety) ────────────
+
+
+class TestRiskUnitFormula:
+    """PR #17 reviewer caught a 20-50× R inflation bug: the original
+    `risk_unit = initial_cash × MAX_POSITION_PCT × approx_stop_pct`
+    included production sizing inside the denominator, but vectorbt
+    backtests all-in (position notional ≈ initial_cash). Fixed to
+    `risk_unit = initial_cash × approx_stop_pct` so vectorbt-R is
+    sizing-comparable with live R per the design's sizing-invariance
+    requirement."""
+
+    def test_risk_unit_excludes_max_position_pct(self, tmp_path: Path, monkeypatch):
+        """For a strategy with approx_stop_pct=0.05 and default
+        initial_cash=100k, risk_unit_dollars must be 5,000 — NOT
+        100 (the buggy value with `× MAX_POSITION_PCT=0.02`)."""
+        bars = {"AAA": _synthetic_bars(seed=11), "BBB": _synthetic_bars(seed=12)}
+
+        def fake_fetch(sym, start, end, timeframe):
+            return bars[sym], None
+
+        monkeypatch.setattr(build_envelopes, "fetch_symbol", fake_fetch)
+        monkeypatch.setitem(
+            build_envelopes.settings.STRATEGY_WATCHLISTS,
+            "sma_crossover",
+            ["AAA", "BBB"],
+        )
+        env = build_envelopes.build_envelope(
+            "sma_crossover",
+            years=1.0,
+            end_date=datetime(2025, 1, 1, tzinfo=timezone.utc),
+            out_dir=tmp_path,
+        )
+        # SMA spec has approx_stop_pct=0.05; default initial_cash=100k.
+        # Correct risk_unit = 100_000 × 0.05 = 5,000.
+        # Buggy risk_unit would be 100_000 × 0.02 × 0.05 = 100.
+        if env.risk_unit_dollars is not None:
+            assert env.risk_unit_dollars == pytest.approx(5000.0), (
+                f"risk_unit_dollars={env.risk_unit_dollars}; expected ~5000. "
+                f"If you see ~100, the MAX_POSITION_PCT multiplication has "
+                f"been re-introduced."
+            )
+
+    def test_risk_unit_for_donchian(self, tmp_path: Path, monkeypatch):
+        """Donchian uses approx_stop_pct=0.02 → 100_000 × 0.02 = 2,000."""
+        bars = {"AAA": _synthetic_bars(seed=21)}
+
+        def fake_fetch(sym, start, end, timeframe):
+            return bars[sym], None
+
+        monkeypatch.setattr(build_envelopes, "fetch_symbol", fake_fetch)
+        monkeypatch.setitem(
+            build_envelopes.settings.STRATEGY_WATCHLISTS,
+            "donchian_breakout",
+            ["AAA"],
+        )
+        env = build_envelopes.build_envelope(
+            "donchian_breakout",
+            years=1.0,
+            end_date=datetime(2025, 1, 1, tzinfo=timezone.utc),
+            out_dir=tmp_path,
+        )
+        if env.risk_unit_dollars is not None:
+            assert env.risk_unit_dollars == pytest.approx(2000.0)
+
+
+class TestProductionFilterWiring:
+    """PR #17 reviewer: envelopes must reflect production gating, not
+    raw-strategy behavior. The build script wires the primary edge
+    filter (SMAEdgeFilter / RSIEdgeFilter / DonchianEdgeFilter); the
+    SectorMomentumFilter is intentionally omitted with an explanatory
+    note (offline-unfriendly state)."""
+
+    def test_sma_builder_includes_edge_filter(self):
+        strategy = build_envelopes._sma_builder()
+        # BaseStrategy stores edge_filter as `_edge_filter` (private).
+        # Confirm a non-None filter was attached.
+        assert strategy._edge_filter is not None
+        # Class name match — must be SMAEdgeFilter (not None, not some
+        # unrelated filter).
+        assert type(strategy._edge_filter).__name__ == "SMAEdgeFilter"
+
+    def test_rsi_builder_includes_edge_filter(self):
+        strategy = build_envelopes._rsi_builder()
+        assert strategy._edge_filter is not None
+        assert type(strategy._edge_filter).__name__ == "RSIEdgeFilter"
+
+    def test_donchian_builder_includes_edge_filter(self):
+        strategy = build_envelopes._donchian_builder()
+        assert strategy._edge_filter is not None
+        assert type(strategy._edge_filter).__name__ == "DonchianEdgeFilter"
+
+    def test_envelope_notes_explain_sector_filter_omission(
+        self, tmp_path: Path, monkeypatch
+    ):
+        """The envelope's notes must call out the SectorMomentumFilter
+        omission so the assessor and operator know about the gap."""
+        bars = {"AAA": _synthetic_bars(seed=31)}
+
+        def fake_fetch(sym, start, end, timeframe):
+            return bars[sym], None
+
+        monkeypatch.setattr(build_envelopes, "fetch_symbol", fake_fetch)
+        monkeypatch.setitem(
+            build_envelopes.settings.STRATEGY_WATCHLISTS,
+            "sma_crossover",
+            ["AAA"],
+        )
+        env = build_envelopes.build_envelope(
+            "sma_crossover",
+            years=1.0,
+            end_date=datetime(2025, 1, 1, tzinfo=timezone.utc),
+            out_dir=tmp_path,
+        )
+        notes_joined = " ".join(env.notes)
+        assert "SectorMomentumFilter" in notes_joined
+
+
+class TestNonFiniteCoercion:
+    """Build script catches non-finite values (profit_factor=+inf on
+    all-winning backtests, inf CI bounds from sparse-loss resamples)
+    and replaces them with None before envelope construction, with a
+    note. Belt-and-suspenders defense in envelope.to_json provides
+    backstop coverage."""
+
+    def test_coerce_finite_passes_finite_through(self):
+        a, b, dropped = build_envelopes._coerce_finite(
+            ("x", 1.5), ("y", 2.5)
+        )
+        assert a == 1.5
+        assert b == 2.5
+        assert dropped == []
+
+    def test_coerce_finite_handles_none(self):
+        a, b, dropped = build_envelopes._coerce_finite(
+            ("x", None), ("y", 3.0)
+        )
+        assert a is None
+        assert b == 3.0
+        assert dropped == []
+
+    def test_coerce_finite_strips_inf_scalar(self):
+        a, b, dropped = build_envelopes._coerce_finite(
+            ("profit_factor", float("inf")), ("y", 1.0)
+        )
+        assert a is None
+        assert b == 1.0
+        assert dropped == ["profit_factor"]
+
+    def test_coerce_finite_strips_nan_scalar(self):
+        a, b, dropped = build_envelopes._coerce_finite(
+            ("x", float("nan")), ("y", 1.0)
+        )
+        assert a is None
+        assert dropped == ["x"]
+
+    def test_coerce_finite_strips_tuple_with_inf(self):
+        a, b, dropped = build_envelopes._coerce_finite(
+            ("ci", (1.0, float("inf"))), ("y", 1.0)
+        )
+        assert a is None
+        assert dropped == ["ci"]
+
+    def test_coerce_finite_keeps_finite_tuple(self):
+        a, b, dropped = build_envelopes._coerce_finite(
+            ("ci", (1.0, 2.0)), ("y", 1.0)
+        )
+        assert a == (1.0, 2.0)
+        assert dropped == []
+
+    def test_coerce_finite_both_bad(self):
+        a, b, dropped = build_envelopes._coerce_finite(
+            ("a", float("inf")), ("b", float("nan"))
+        )
+        assert a is None
+        assert b is None
+        assert dropped == ["a", "b"]
