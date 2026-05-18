@@ -38,7 +38,7 @@ from __future__ import annotations
 
 import sqlite3
 from dataclasses import dataclass, field
-from datetime import date
+from datetime import date, datetime
 
 
 LIFECYCLE_TABLE_SCHEMA_VERSION = 1
@@ -276,15 +276,31 @@ def list_strategies(conn: sqlite3.Connection) -> list[str]:
 def _to_iso_date(value: date | str) -> str:
     """Coerce date or ISO-string to a canonical YYYY-MM-DD.
 
-    Rejects timestamps with time components (period boundaries are
-    date-level — weekly = Mon→Mon, monthly = first→first). This is
-    deliberate: storing timestamps would silently allow drift between
-    "Mon 00:00" and "Mon 16:30" boundaries, breaking the UNIQUE
-    constraint's idempotency guarantee.
+    Rejects:
+      - `datetime` objects: Python's `datetime` is a subclass of `date`,
+        so an unguarded `isinstance(value, date)` check would accept
+        `datetime.now()` and serialize it with a time component. A flush
+        at `2026-05-18T00:00:00` vs `2026-05-18T16:30:00` would create
+        distinct UNIQUE keys instead of accumulating into the same
+        weekly row — fragmenting L3 lifecycle counts. The engine
+        wiring (11.10f) is likely to have datetime period values
+        available; rejecting them at this boundary forces an explicit
+        `.date()` coercion at the call site.
+      - Strings with a time component: `date.fromisoformat` only accepts
+        `YYYY-MM-DD` and raises `ValueError` on anything broader.
+
+    Raises `TypeError` for datetimes (category mistake) and `ValueError`
+    for malformed strings.
     """
+    # Order matters: check datetime BEFORE date (datetime IS a date in Python).
+    if isinstance(value, datetime):
+        raise TypeError(
+            f"datetime input rejected (got {value!r}); pass .date() "
+            f"explicitly. Period boundaries are date-level — a time "
+            f"component would fragment the UNIQUE(period_type, "
+            f"period_start, strategy_name) idempotency."
+        )
     if isinstance(value, date):
         return value.isoformat()
-    # If it's a string, parse it strictly as a date (no time component).
-    iso = str(value)
-    parsed = date.fromisoformat(iso)
-    return parsed.isoformat()
+    # Strict string path: rejects timestamps and malformed dates.
+    return date.fromisoformat(str(value)).isoformat()

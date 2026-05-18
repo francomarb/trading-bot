@@ -24,7 +24,7 @@ from __future__ import annotations
 
 import sqlite3
 import threading
-from datetime import date
+from datetime import date, datetime, timezone
 from pathlib import Path
 
 import pytest
@@ -313,6 +313,81 @@ class TestInputValidation:
                 strategy_name="x",
                 counters=LifecycleCounters(),
             )
+
+    def test_datetime_object_rejected(self, db_conn):
+        """PR #18 reviewer regression: datetime IS a date subclass.
+        An unguarded `isinstance(value, date)` would accept
+        `datetime.now()` and store a full ISO timestamp, fragmenting
+        UNIQUE keys between cycle flushes at different wall-clock
+        times. Reject explicitly so the engine wiring in 11.10f
+        has to call .date() at the call site."""
+        dt = datetime(2026, 5, 18, 16, 30, 0, tzinfo=timezone.utc)
+        with pytest.raises(TypeError, match="datetime input rejected"):
+            upsert_counters(
+                db_conn,
+                period_type="weekly",
+                period_start=dt,
+                period_end="2026-05-25",
+                strategy_name="x",
+                counters=LifecycleCounters(),
+            )
+
+    def test_naive_datetime_also_rejected(self, db_conn):
+        """Naive datetime (no tzinfo) is still a date subclass — reject."""
+        naive = datetime(2026, 5, 18, 0, 0, 0)
+        with pytest.raises(TypeError, match="datetime input rejected"):
+            upsert_counters(
+                db_conn,
+                period_type="weekly",
+                period_start="2026-05-18",
+                period_end=naive,
+                strategy_name="x",
+                counters=LifecycleCounters(),
+            )
+
+    def test_datetime_date_method_works(self, db_conn):
+        """Documented workaround: callers with a datetime call .date()."""
+        dt = datetime(2026, 5, 18, 16, 30, 0, tzinfo=timezone.utc)
+        upsert_counters(
+            db_conn,
+            period_type="weekly",
+            period_start=dt.date(),
+            period_end=date(2026, 5, 25),
+            strategy_name="x",
+            counters=LifecycleCounters(raw_signals=1),
+        )
+        row = db_conn.execute(
+            "SELECT period_start, period_end FROM strategy_lifecycle_counters "
+            "WHERE strategy_name='x'"
+        ).fetchone()
+        assert row == ("2026-05-18", "2026-05-25")
+
+    def test_two_flushes_with_different_times_same_day_accumulate(self, db_conn):
+        """Regression for the exact fragmentation scenario the reviewer
+        described: two cycle flushes within the same week, intended to
+        target the same period row. If the engine wiring (11.10f)
+        properly uses .date(), both upserts land on the UNIQUE key and
+        accumulate. (Pre-fix, passing the raw datetimes would have
+        produced two distinct rows.)"""
+        morning = datetime(2026, 5, 18, 9, 35, 0, tzinfo=timezone.utc)
+        afternoon = datetime(2026, 5, 18, 15, 50, 0, tzinfo=timezone.utc)
+        # The engine must coerce to .date() at the call site. This test
+        # documents the contract: when callers do so, accumulation works.
+        for ts, raw in [(morning, 3), (afternoon, 7)]:
+            upsert_counters(
+                db_conn,
+                period_type="weekly",
+                period_start=ts.date(),
+                period_end=date(2026, 5, 25),
+                strategy_name="x",
+                counters=LifecycleCounters(raw_signals=raw),
+            )
+        # One row, raw_signals = 10 (accumulated, not 2 rows of 3 + 7).
+        rows = db_conn.execute(
+            "SELECT COUNT(*), SUM(raw_signals) FROM strategy_lifecycle_counters "
+            "WHERE strategy_name='x'"
+        ).fetchone()
+        assert rows == (1, 10)
 
 
 # ── Read API ──────────────────────────────────────────────────────────

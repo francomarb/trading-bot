@@ -17,7 +17,7 @@ Coverage:
 from __future__ import annotations
 
 import json
-from datetime import date
+from datetime import date, datetime, timezone
 from pathlib import Path
 
 import pytest
@@ -101,6 +101,58 @@ class TestApplyVerdict:
         s = PersistenceState()
         with pytest.raises(ValueError):
             s.apply_verdict("NEGATIVE", "not-a-date")
+
+    def test_datetime_input_rejected(self):
+        """PR #18 reviewer regression: datetime is a subclass of date,
+        so `isinstance(check_date, date)` is True for datetimes. An
+        unguarded path would store a full ISO timestamp and break
+        date-level idempotency (two same-day reruns at different times
+        each increment negative_weeks, tripping the silent-killer
+        alarm a week or more early). The fix rejects datetime
+        explicitly with a TypeError pointing the caller at `.date()`."""
+        s = PersistenceState()
+        dt = datetime(2026, 5, 17, 16, 30, 0, tzinfo=timezone.utc)
+        with pytest.raises(TypeError, match="datetime input rejected"):
+            s.apply_verdict("NEGATIVE", dt)
+
+    def test_naive_datetime_also_rejected(self):
+        """Both tz-aware and naive datetimes are subclasses of date —
+        reject both."""
+        s = PersistenceState()
+        naive = datetime(2026, 5, 17, 16, 30, 0)
+        with pytest.raises(TypeError, match="datetime input rejected"):
+            s.apply_verdict("NEGATIVE", naive)
+
+    def test_string_with_time_component_rejected(self):
+        """Same failure mode via the string path."""
+        s = PersistenceState()
+        with pytest.raises(ValueError):
+            s.apply_verdict("NEGATIVE", "2026-05-17T16:30:00")
+        with pytest.raises(ValueError):
+            s.apply_verdict("NEGATIVE", "2026-05-17T16:30:00+00:00")
+
+    def test_datetime_date_method_works(self):
+        """Operators with a datetime can call .date() to get the
+        date-only value the API accepts. This is the documented
+        workaround."""
+        s = PersistenceState()
+        dt = datetime(2026, 5, 17, 16, 30, 0, tzinfo=timezone.utc)
+        s = s.apply_verdict("NEGATIVE", dt.date())
+        assert s.last_check == "2026-05-17"
+        assert s.negative_weeks == 1
+
+    def test_no_double_increment_when_called_twice_with_different_times(self):
+        """Regression test for the PR #18 reviewer scenario: an
+        operator running on-demand reports twice on the same day
+        (different times) MUST NOT trip the 3-week alarm early.
+        After my fix, both calls would either both convert via .date()
+        (operator discipline) or one would raise — never silently
+        double-count."""
+        s = PersistenceState()
+        # Both calls use the same `date`; idempotency holds.
+        s = s.apply_verdict("NEGATIVE", date(2026, 5, 17))
+        s = s.apply_verdict("NEGATIVE", date(2026, 5, 17))
+        assert s.negative_weeks == 1  # NOT 2
 
     def test_negative_after_reset_starts_fresh(self):
         """End-to-end: NEG x2 → POS reset → NEG x3 → alarm count is 3."""

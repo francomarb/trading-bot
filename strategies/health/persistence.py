@@ -88,14 +88,17 @@ class PersistenceState:
 
         Idempotent on the same date: re-applying the same verdict on the
         same check_date returns the identical state (no double-increment).
+
+        **datetime objects are rejected.** Python's `datetime` is a subclass
+        of `date`, so passing `datetime.now()` would otherwise serialize as
+        `"2026-05-18T16:30:00"` and break the date-level idempotency:
+        two same-day NEGATIVE reruns at different times would each get a
+        unique `last_check` and increment `negative_weeks` twice, tripping
+        the 3-week silent-killer alarm a week or more early. Callers with
+        a datetime should pass `.date()` explicitly so the conversion is
+        visible at the call site.
         """
-        if isinstance(check_date, date):
-            iso = check_date.isoformat()
-        else:
-            iso = str(check_date)
-            # Validate the format upfront — silently accepting "garbage" would
-            # poison downstream date math.
-            datetime.fromisoformat(iso)
+        iso = _to_iso_date(check_date)
 
         if iso == self.last_check and new_verdict == self.last_verdict:
             # Idempotent — same verdict on the same day is a no-op.
@@ -111,6 +114,36 @@ class PersistenceState:
             last_check=iso,
             last_verdict=new_verdict,
         )
+
+
+# ── Date coercion (shared with lifecycle.py via duplicated impl) ──────
+
+
+def _to_iso_date(value: date | str) -> str:
+    """Coerce a `date` or ISO `YYYY-MM-DD` string to canonical date string.
+
+    Rejects:
+      - `datetime` objects (subclass of `date`, but they carry a time
+        component that breaks date-level idempotency — see
+        `PersistenceState.apply_verdict` docstring for the failure mode).
+      - Strings with a time component — `date.fromisoformat` only
+        accepts `YYYY-MM-DD` and raises `ValueError` on anything
+        broader.
+
+    Raises `TypeError` for datetimes (category mistake) and `ValueError`
+    for malformed strings.
+    """
+    # Order matters: check datetime BEFORE date (datetime IS a date).
+    if isinstance(value, datetime):
+        raise TypeError(
+            f"datetime input rejected (got {value!r}); pass .date() "
+            f"explicitly. Date-level idempotency requires no time "
+            f"component — see PersistenceState.apply_verdict docstring."
+        )
+    if isinstance(value, date):
+        return value.isoformat()
+    # Strict string path: rejects timestamps and malformed dates.
+    return date.fromisoformat(str(value)).isoformat()
 
 
 # ── HealthStateFile (top-level container) ──────────────────────────────
