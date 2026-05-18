@@ -240,6 +240,11 @@ class TradeLogger:
         # ensure the lookup index exists. Both statements are idempotent.
         self._conn.execute(_BACKFILL_SQL)
         self._conn.execute(_POSITION_ID_INDEX_SQL)
+        # 11.10c: signal-lifecycle counter table for the Strategy Health
+        # Monitor. Local import avoids a circular dependency
+        # (strategies.health.* can import reporting.logger types).
+        from strategies.health.lifecycle import _CREATE_LIFECYCLE_TABLE_SQL
+        self._conn.execute(_CREATE_LIFECYCLE_TABLE_SQL)
         self._conn.commit()
         return self._conn
 
