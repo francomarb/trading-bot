@@ -17,7 +17,7 @@
 | F3 | Block bootstrap (Politis-Romano stationary) replacing iid bootstrap | CI widths visibly wrong on inspection of real data | §F3 |
 | F4 | Envelope as parameter-grid distribution (PBO defense) | Point envelope shown too brittle — live keeps falling outside it for non-real reasons | §F4 |
 | F5 | Hybrid paper recalibration of envelope | 6+ months of paper data AND static envelope drifts from reality | §F5 |
-| F6 | `signal_lifecycle` SQL table (per-cycle granularity + reasons taxonomy) | Weekly-aggregated JSON counters in v1 prove insufficient — need per-cycle attribution or stable reason codes for drift forensics | §F6 |
+| F6 | `signal_lifecycle` SQL table (per-cycle granularity + reasons taxonomy) | Aggregate SQLite counters in v1 prove insufficient — need per-cycle attribution or stable reason codes for drift forensics | §F6 |
 | F7 | `position_eod_marks` SQL table + bar-resolution MAE/MFE | Operator wants "are stops too tight / targets too greedy" diagnostics | §F7 |
 | F8 | `HealthThresholdProfile` archetype buckets | Strategy count grows past ~8 or threshold duplication becomes painful | §F8 |
 | F9 | Pluggable `IProtection`-style check architecture | Check count exceeds ~15 or third-party strategy contributions need custom checks | §F9 |
@@ -130,9 +130,9 @@ Stored as versioned JSON in `data/envelopes/{strategy_name}_v{N}.json`.
 
 ---
 
-## §F6 — `signal_lifecycle` SQL table (per-cycle granularity)
+## §F6 — `signal_lifecycle` SQL table (per-cycle granularity + reasons taxonomy)
 
-**v1 baseline:** weekly aggregated counters per strategy (raw_signals, regime_blocked, edge_filter_blocked, sleeve_blocked, submitted, filled) stored as JSON in `data/health_state.json` — see v1 §12.4.1. Sufficient for L3 drift checks at weekly resolution. Reasons taxonomy is unstructured; per-cycle granularity not captured.
+**v1 baseline:** **aggregate** SQLite table `strategy_lifecycle_counters` per `(period_type, period_start, strategy)` with 7 counter fields (raw_signals, regime_blocked, edge_filter_blocked, sleeve_blocked, risk_blocked, submitted, filled_entries) — see v1 §12.4.1. Sufficient for L3 drift checks at weekly/monthly resolution. Reasons taxonomy is unstructured; per-cycle granularity not captured.
 
 **Future addition:** per-cycle counters of how many signals progressed through each gate. Without this, L3 drift detection cannot attribute a change in fill rate to a specific cause (regime gate? edge filter? sleeve full?).
 
@@ -164,7 +164,7 @@ Indexed on `(strategy_name, ts)`. Rolled up by the assessor into block-rate dist
 - **Granularity.** Per-cycle row gives high fidelity but high row volume (every 5-minute cycle × N strategies). Acceptable, or roll up to per-symbol-per-day?
 - **`reasons_json` enum stability.** Block reasons today are free-form strings in `EdgeFilterDecision.reasons`. Stable enumeration needed for longitudinal counting — otherwise reason taxonomy drift breaks drift detection. Worth a small reason-code enumeration pass across all active edge filters before the schema lands.
 
-**Trigger to build:** v1's weekly-aggregated JSON counters (v1 §12.4.1) prove insufficient — either weekly resolution is too coarse to attribute a drift in time (need per-cycle), or operator questions require knowing *which specific reason code* drove a block-rate change (need `reasons_json` taxonomy). If weekly JSON aggregation answers operator questions adequately, this stays deferred.
+**Trigger to build:** v1's aggregate SQLite counters (v1 §12.4.1) prove insufficient — either weekly/monthly resolution is too coarse to attribute a drift in time (need per-cycle), or operator questions require knowing *which specific reason code* drove a block-rate change (need `reasons_json` taxonomy). If aggregate counters answer operator questions adequately, this stays deferred.
 
 ---
 

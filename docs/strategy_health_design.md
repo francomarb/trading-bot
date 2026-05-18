@@ -186,7 +186,7 @@ Three blocks. Every metric carries `(value, 95% CI, N, sufficiency)`.
 
 Both **R-multiple expectancy** and **dollar expectancy** are reported. **R-expectancy is primary; dollar expectancy is secondary context.**
 
-Why R is primary: dollar expectancy shifts with sleeve weight changes (so a strategy looks "worse" simply because the operator reduced its allocation) and mixes options/equity strategies on incomparable scales. R-expectancy is sizing-normalized — `realized_pnl / initial_risk_dollars` — so it answers "is this strategy behaving as designed?" independent of capital allocated to it. `r_multiple` is already computed and stored per closed trade in `reporting/logger.py:R66/121/366`, so this is zero new instrumentation cost.
+Why R is primary: dollar expectancy shifts with sleeve weight changes (so a strategy looks "worse" simply because the operator reduced its allocation) and mixes options/equity strategies on incomparable scales. R-expectancy is sizing-normalized — `realized_pnl / initial_risk_dollars` — so it answers "is this strategy behaving as designed?" independent of capital allocated to it. The `trades` table already has an `r_multiple` column populated for closed trades, so this is zero new instrumentation cost.
 
 - Realized P&L (window + lifetime), dollar
 - **R-expectancy per trade with iid bootstrap 95% CI** (primary verdict input)
@@ -282,20 +282,39 @@ Each strategy ships with a `StrategyEnvelope` JSON file derived from a **single 
 ```
 data/envelopes/{strategy_name}.json
 {
+  "schema_version": 1,
   "strategy": "donchian_breakout",
   "built_at": "2026-05-18T...",
-  "backtest_config": {...},          // exact params used
+  "backtest_config": {...},                     // exact params used
+
+  // Edge metrics — R-multiple is primary (sizing-invariant); dollars secondary
+  "r_expectancy": 0.42,                         // mean R per trade
+  "r_expectancy_ci_95": [0.18, 0.65],           // bootstrap from backtest trades
   "expectancy_dollars": 142.0,
-  "expectancy_ci_95": [85.0, 199.0], // bootstrap from backtest trades
+  "expectancy_dollars_ci_95": [85.0, 199.0],
   "win_rate": 0.48,
   "win_rate_ci_95": [0.41, 0.55],
-  "trades_per_month_band": [4, 11],  // p10, p90
+  "profit_factor": 1.62,
+  "profit_factor_ci_95": [1.21, 2.14],
+
+  // Behavior bands (used by L3 Drift checks in §6)
+  "trades_per_month_band": [4, 11],             // p10, p90
   "hold_days_band": [2, 18],
-  "p95_drawdown_pct": 0.12
+  "p95_drawdown_pct": 0.12,
+
+  // Signal-lifecycle bands (used by L3 Drift against §12.4.1 counters)
+  "raw_signals_per_week_band": [12, 38],        // p10, p90 across backtest weeks
+  "edge_filter_block_rate_band": [0.55, 0.78],  // edge_filter_blocked / raw_signals
+  "regime_block_rate_band": [0.02, 0.18],       // regime_blocked / raw_signals
+  "risk_block_rate_band": [0.00, 0.05],         // risk_blocked / raw_signals
+  "submitted_per_raw_signal_band": [0.08, 0.25],
+  "fill_rate_band": [0.85, 1.0]                 // filled_entries / submitted
 }
 ```
 
 Built by `scripts/build_envelopes.py`. Operator-readable, git-friendly, regenerated when the strategy's production config changes. **Static** — no auto-recalibration in v1. Parameter-grid distribution + hybrid paper recalibration are follow-ups (see future doc).
+
+The lifecycle bands are derived from the backtest by simulating the same gating pipeline (regime → edge filter → sleeve → risk) the live engine runs, so live counters compare apples-to-apples.
 
 ---
 
@@ -361,7 +380,7 @@ Three independent signals + persistence requirement. All operate on **R-expectan
 
 **NEGATIVE verdict rule:** all three signals agree, AND `N ≥ min_trades_for_verdict`, AND the NEGATIVE state has held for **3 consecutive weekly checks**. The persistence requirement is the most important defense against false positives — a single bad week is exactly what normal variance looks like; three consecutive bad weeks is harder to write off.
 
-**POSITIVE verdict rule:** expectancy CI > 0 AND realized expectancy within envelope CI band. No persistence requirement.
+**POSITIVE verdict rule:** **R-expectancy CI > 0** AND **realized R-expectancy within envelope R-expectancy CI band**. No persistence requirement.
 
 **Rationale:** false positives on the silent-killer alarm cause operator distrust of the whole system. The 3-week persistence window means up to ~3 weeks of bleeding before alarm — acceptable given the alternative (firing on every routine drawdown then crying wolf). Three statistical signals × three weeks is the v1 substitute for PSR/DSR's mathematical rigor.
 
@@ -436,65 +455,89 @@ External pieces:
 - `forward_test.py` — Sunday EOD hook to run weekly reviewer; monthly first-of-month hook for monthly reviewer.
 - `reporting/alerts.py` — new alert types (§11).
 
-**No changes to `risk/allocator.py`, `risk/manager.py`, or `engine/trader.py` runtime behavior in v1** (advisory only invariant).
+**No changes to trading decision behavior in `risk/allocator.py`, `risk/manager.py`, or `engine/trader.py`** — the advisory-only invariant (§1.2) is unchanged. v1 does add **observability-only wiring to `engine/trader.py`**: ~30 LOC to emit per-cycle gate counts (raw_signals, regime_blocked, edge_filter_blocked, sleeve_blocked, risk_blocked, submitted, filled_entries) into the new `strategy_lifecycle_counters` SQLite table (§12.4.1). These counter increments happen *after* each existing gate has already made its decision and have **zero influence on whether a signal is taken** — they are pure measurement of decisions the engine already made. Counter writes are also failure-tolerant: a write error is logged but never raises into the trading loop.
 
-### 12.4 Data sources — no new SQL tables in v1
+### 12.4 Data sources
 
-v1 reads from existing infrastructure:
+v1 reads from existing infrastructure where possible and adds **one new SQLite table** + **one small JSON state file**:
 
+**Existing (no changes):**
 - `trades` table — already carries `strategy`, `realized_pnl`, `r_multiple`, `position_id`, slippage. Read by assessor for per-strategy P&L, expectancy (R and $), win rate, profit factor (existing `read_strategy_realized_pnl_summary` extends naturally).
 - `engine_state.json` — sector exposure, positions, halt state, current state of automated risk controls (cooldown, drift switches). Read by L1 checks.
 - `logs/bot.jsonl` — alert frequency, broker errors, reconciliation events. Read by L1 checks via the existing log-parsing pattern used by `scripts/donchian_chase_distribution.py`.
-- Weekly signal-lifecycle counters — see §12.4.1 below. Stored in `data/health_state.json`, *not* a new SQL table.
 
-The full per-cycle SQL `signal_lifecycle` table (with `reasons_json`, `cycle_id`, etc.) remains follow-up §F6. v1 ships the minimal weekly aggregation needed to make L3 drift checks actually measurable.
+**New in v1:**
+- `strategy_lifecycle_counters` SQLite table (§12.4.1) — historical, query-shaped, growing. Aggregate counts per period; *not* per-cycle.
+- `data/health_state.json` (§12.4.2) — small, slow-changing verdict persistence state (3-week NEGATIVE tracking). Not historical; rewritten in place.
 
-### 12.4.1 Minimal weekly event counters (v1)
+The two are deliberately split: JSON for small operator-readable persistence; SQLite for anything historical/queryable. Per-cycle lifecycle data with `reasons_json` taxonomy remains follow-up §F6.
 
-Without per-strategy signal flow counts, L3 drift claims like "edge-filter block rate vs envelope" are aspirational — log-parsing can answer them for ad-hoc audits but is operator-effort-heavy and not weekly-report friendly. v1 ships a lighter-than-§F6 version that closes this gap without a new SQL table.
+### 12.4.1 `strategy_lifecycle_counters` SQLite table (v1)
 
-**Schema** — JSON, written by `engine/trader.py` weekly (Sunday EOD, same trigger as the weekly health report):
+Without per-strategy signal-flow counts, L3 drift claims like "edge-filter block rate vs envelope" are aspirational. v1 ships a compact aggregate table that closes the gap. **Aggregate (not per-cycle)** — full per-cycle granularity remains follow-up §F6.
+
+**Schema** (added via `CREATE TABLE IF NOT EXISTS` in `TradeLogger.__init__`, matches existing 11.27 migration-safe pattern):
+
+```sql
+CREATE TABLE IF NOT EXISTS strategy_lifecycle_counters (
+  id                  INTEGER PRIMARY KEY,
+  schema_version      INTEGER NOT NULL DEFAULT 1,
+  period_start        TEXT NOT NULL,           -- ISO date, inclusive
+  period_end          TEXT NOT NULL,           -- ISO date, exclusive
+  period_type         TEXT NOT NULL,           -- 'weekly' | 'monthly'
+  strategy_name       TEXT NOT NULL,
+  raw_signals         INTEGER NOT NULL,
+  regime_blocked      INTEGER NOT NULL,
+  edge_filter_blocked INTEGER NOT NULL,
+  sleeve_blocked      INTEGER NOT NULL,
+  risk_blocked        INTEGER NOT NULL,        -- RiskManager rejections
+  submitted           INTEGER NOT NULL,
+  filled_entries      INTEGER NOT NULL,        -- see counting unit below
+  UNIQUE(period_type, period_start, strategy_name)
+);
+```
+
+**Counter semantics — read carefully, this is where ambiguity bites:**
+
+- **Counting unit:** **one symbol-level entry candidate per increment.** Per-cycle scaling is achieved by summing across cycles in the period. Not per-cycle, not per-leg, not per-share — per (symbol, strategy, candidate-evaluation).
+- **Multi-leg / options:** one strategy entry candidate counts as **1**, regardless of leg count. A credit-spread entry attempt is `raw_signals += 1`, not `raw_signals += 2`. Same for fills: `filled_entries += 1` per completed multi-leg combo fill, not per leg.
+- **`filled_entries`** is explicitly named to distinguish from "shares filled" or "legs filled." Partial-quantity fills that still open the intended position count as 1; partial fills that fail to open (cancelled, expired before completion) count as 0.
+- **`raw_signals`** counts symbol-level candidates *after* strategy signal generation but *before* any gate evaluation. This is the "what the strategy proposed" baseline.
+- **Gate counts are mutually exclusive in time order:** `regime_blocked` is incremented only if the regime gate rejects; if regime passes but edge filter rejects, only `edge_filter_blocked` increments. Total blocks ≤ `raw_signals - submitted`.
+
+**Durability — bot can be offline at period boundary:**
+
+- Weekly reports aggregate by `period_start / period_end` (Mon 00:00 UTC → next Mon 00:00 UTC). The reviewer/CLI computes the period bounds first, then queries; the bot does not need to be running at Sunday EOD for the report to be correct.
+- If the bot is offline for part of a period, the row reflects only the time it was running — explicitly noted in the report when `(period_end - period_start) - actual_uptime > threshold`. Honest about partial coverage rather than pretending zero counts = no signals.
+- Engine writes incremental updates via upsert (`INSERT … ON CONFLICT(period_type, period_start, strategy_name) DO UPDATE SET ...`). Crash-safe: at worst we lose the deltas accumulated since the last flush.
+
+**Failure tolerance — counters are observability, never block trading:**
+
+- All counter writes are wrapped in a try/except that logs at WARN and continues. A counter table I/O error must never raise into the trading loop.
+- Counters are *strictly observability*. They are evaluated *after* each existing gate has already decided. **Counter logic never affects whether a signal is taken.** Stated as a hard rule in §12 and reinforced in code review.
+
+**Read pattern (assessor side):**
+
+```python
+def lifecycle_for_period(strategy: str, start: date, end: date) -> dict[str, int]:
+    """Sum counter rows in [start, end). Returns 6 ints + raw_signals."""
+```
+
+The assessor then derives ratios for L3 Drift comparison against envelope bands:
+- `raw_signals` vs envelope `raw_signals_per_week_band`
+- `edge_filter_blocked / raw_signals` vs `edge_filter_block_rate_band`
+- `regime_blocked / raw_signals` vs `regime_block_rate_band`
+- `risk_blocked / raw_signals` vs `risk_block_rate_band`
+- `submitted / raw_signals` vs `submitted_per_raw_signal_band`
+- `filled_entries / submitted` vs `fill_rate_band`
+
+### 12.4.2 `data/health_state.json` — small verdict persistence
+
+Small, slow-changing, operator-readable. **Only verdict persistence state** — no historical data, no counters.
 
 ```json
-data/health_state.json
 {
-  "persistence": { ... },                 // §12.5 NEGATIVE-verdict tracking
-  "weekly_counters": {
-    "2026-W20": {
-      "donchian_breakout": {
-        "raw_signals": 142,               // strategy.generate_signals() count
-        "regime_blocked": 11,             // blocked by regime gate
-        "edge_filter_blocked": 87,        // blocked by strategy edge filter
-        "sleeve_blocked": 4,              // blocked by SleeveAllocator
-        "submitted": 40,                  // orders submitted to broker
-        "filled": 38                      // orders filled
-      },
-      ...
-    }
-  }
-}
-```
-
-**Wiring** — each existing gate already emits log events when it blocks; the engine maintains a per-cycle counter dict that flushes weekly. ~30 LOC across `engine/trader.py` + `strategies/health/`. Reuses existing log infrastructure for ad-hoc audits (the lifecycle is already observable; this just aggregates).
-
-**What L3 drift checks become measurable:**
-
-- `raw_signals` weekly vs envelope's `raw_signals_per_week_band` → "is the strategy generating signals at the expected rate?"
-- `edge_filter_blocked / raw_signals` ratio drift → "is the edge filter rejecting an unusual fraction of signals (regime mismatch)?"
-- `regime_blocked / raw_signals` ratio → "is the regime gate doing more or less work than usual?"
-- `filled / submitted` ratio → "fill rate"
-- `submitted / (raw_signals - all_blocks)` ratio → "are signals reaching the broker when nothing should block them?"
-
-The envelope JSON gets corresponding bands (`raw_signals_per_week_band`, `edge_filter_block_rate`, etc.) derived from the backtest run.
-
-**Why this is v1, not follow-up:** without these counters, ~half of the §6 L3 Drift bullet list is hand-wavy. The cost (one JSON section + ~30 LOC of counter wiring + 5 envelope fields) is small enough that "ruthlessly minimal v1" can absorb it. Per-cycle granularity and `reasons_json` taxonomy remain follow-up §F6.
-
-### 12.5 Persistence state file
-
-The 3-week persistence rule needs to remember NEGATIVE-verdict state across weekly runs. Stored as `data/health_state.json`:
-
-```
-{
+  "schema_version": 1,
   "donchian_breakout": {
     "negative_weeks": 2,
     "last_check": "2026-05-17",
@@ -504,11 +547,23 @@ The 3-week persistence rule needs to remember NEGATIVE-verdict state across week
 }
 ```
 
-Reset to 0 on any non-NEGATIVE check. Operator-readable, git-ignored.
+Reset to 0 on any non-NEGATIVE check. Git-ignored.
 
 ### 12.6 Report output format
 
-**v1: markdown only.** `data/health_reports/weekly_YYYY-WW.md` — human-readable. Top section is the per-strategy summary table:
+**v1: markdown only.** `data/health_reports/weekly_YYYY-WW.md` — human-readable, with YAML front-matter for parseable metadata:
+
+```yaml
+---
+schema_version: 1
+period_start: 2026-05-18
+period_end: 2026-05-25
+period_type: weekly
+generated_at: 2026-05-25T22:14:00Z
+---
+```
+
+Top section is the per-strategy summary table:
 
 | Strategy | Verdict | Confidence | Sample | Key metrics | Top failure reasons | Recommendation |
 |---|---|---|---|---|---|---|
@@ -516,6 +571,66 @@ Reset to 0 on any non-NEGATIVE check. Operator-readable, git-ignored.
 Below the table, one expandable section per strategy with the full EdgeReport + HealthReport breakdown. **In-text labels** distinguish what's measured vs inferred vs from the envelope (e.g. *"Expectancy $42 (measured from 23 trades); envelope band $30–$80 (from backtest)"*) — no machine-parseable `source` field needed in v1.
 
 JSON twin output is a follow-up; build when a consumer needs it.
+
+---
+
+## 12.7 Implementation-ready v1 scope
+
+Single-list reference of exactly what ships in v1, so the eventual implementation plan has a clear target. Each item maps to a section above.
+
+**New code modules:**
+- `strategies/health/envelope.py` — `StrategyEnvelope` dataclass + JSON I/O (static, no recalibration). §7
+- `strategies/health/benchmarks.py` — `equal_weight_bh_return(symbols, start, end)` over existing `data/fetcher.py`. §5.3
+- `strategies/health/stats.py` — iid bootstrap CI, one-sided t-test, EMA cross (pure functions). §5.2, §9
+- `strategies/health/thresholds.py` — per-strategy inline Health thresholds with TODO calibration comments. §8.1
+- `strategies/health/assessor.py` — `HealthAssessor`: runs L1–L3 checks; returns `HealthReport`. §6
+- `strategies/health/edge.py` — `EdgeAssessor`: computes `EdgeReport`; combines three signals into verdict. §5
+- `strategies/health/persistence.py` — reads/writes `data/health_state.json` for 3-week NEGATIVE persistence. §12.4.2
+- `strategies/health/lifecycle.py` — reads/writes `strategy_lifecycle_counters` table; defines counter unit semantics. §12.4.1
+- `strategies/health/reports.py` — dataclasses: `HealthReport`, `EdgeReport`, `CheckResult`, `Sufficiency`, `Recommendation`.
+- `strategies/health/reviewer.py` — weekly/monthly report rendering; Telegram summary. §10, §12.6
+
+**New scripts:**
+- `scripts/build_envelopes.py` — one-shot per strategy; runs single backtest at production config and writes envelope JSON.
+- `scripts/strategy_health_review.py` — CLI for on-demand reviews.
+- `scripts/calibrate_health_thresholds.py` — reads N weeks of paper data and prints suggested Health threshold values.
+
+**New SQL table:**
+- `strategy_lifecycle_counters` — added via `CREATE TABLE IF NOT EXISTS` in `TradeLogger.__init__`. §12.4.1
+
+**New JSON file:**
+- `data/health_state.json` — small verdict persistence state. §12.4.2
+
+**Existing files touched (observability wiring only, no decision changes):**
+- `engine/trader.py` — ~30 LOC to emit per-cycle lifecycle counter updates (after each existing gate has already decided). §12.4.1
+- `forward_test.py` — Sunday EOD hook to run weekly reviewer; first-of-month hook for monthly reviewer. §10
+- `reporting/alerts.py` — five new alert types (`STRATEGY_EDGE_LOSS`, `STRATEGY_EDGE_BELOW_BENCHMARK`, `STRATEGY_HEALTH_DEGRADED`, `STRATEGY_HEALTH_BROKEN`, `STRATEGY_DRIFT_WARNING`). §11
+- `dashboard.py` — new "Strategy Health & Edge" panel: compact summary table + expandable detail. §10, Q4 resolution
+
+**Configuration:**
+- `config/settings.py` — `MIN_TRADES_FOR_VERDICT` dict per Q1 resolution.
+
+**Outputs:**
+- `data/envelopes/{strategy_name}.json` — one per strategy. `schema_version: 1`. §7
+- `data/health_reports/weekly_YYYY-WW.md` — Sunday EOD markdown. `schema_version: 1` in front-matter. §10, §12.6
+- `data/health_reports/monthly_YYYY-MM.md` — first-of-month markdown. `schema_version: 1` in front-matter.
+- Telegram alerts on defined transitions (silent killer + below-benchmark only; Health alerts INFO-only when Edge positive).
+
+**Explicitly NOT in v1** (mapped to follow-ups in [strategy_health_future.md](strategy_health_future.md)):
+- PSR / DSR / MinTRL rigorous statistics (§F1)
+- CUSUM / Page-Hinkley change-point detection (§F2)
+- Block bootstrap replacing iid bootstrap (§F3)
+- Envelope as parameter-grid distribution (§F4)
+- Hybrid paper recalibration of envelope (§F5)
+- Per-cycle `signal_lifecycle` table with `reasons_json` taxonomy (§F6)
+- `position_eod_marks` + bar-resolution MAE/MFE (§F7)
+- `HealthThresholdProfile` archetype buckets (§F8)
+- Pluggable IProtection-style check architecture (§F9)
+- Continuous L1/L2 per-cycle in engine snapshot (§F10)
+- Credit-spread short-vol benchmark (§F11)
+- JSON twin of weekly report (§F12)
+- `reduce size` auto-throttle mechanic (§F13)
+- Intraday excursion MAE/MFE (§F14)
 
 ---
 
