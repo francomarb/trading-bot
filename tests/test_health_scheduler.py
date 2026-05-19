@@ -26,15 +26,18 @@ from reporting.logger import TradeLogger
 from strategies.health.scheduler import HealthReviewScheduler
 
 
-# A Sunday (weekday=6).
+# A Monday (weekday=0). Weekly review fires here for the Mon→Mon
+# completed week ending at this Monday.
+_MONDAY = datetime(2026, 5, 18, 0, 30, tzinfo=timezone.utc)
+# A Sunday — should NOT fire the weekly review (in-progress week).
 _SUNDAY = datetime(2026, 5, 17, 18, 0, tzinfo=timezone.utc)
-# A Monday.
-_MONDAY = datetime(2026, 5, 18, 18, 0, tzinfo=timezone.utc)
-# First of month (June 1, 2026 is a Monday — also exercises the
-# "monthly fires on non-Sunday" case).
-_FIRST_OF_MONTH = datetime(2026, 6, 1, 18, 0, tzinfo=timezone.utc)
-# Sunday + first of month (Feb 1, 2026 is a Sunday).
-_SUNDAY_AND_FIRST = datetime(2026, 2, 1, 18, 0, tzinfo=timezone.utc)
+# A Tuesday — neither weekly nor monthly trigger.
+_TUESDAY = datetime(2026, 5, 19, 18, 0, tzinfo=timezone.utc)
+# First of month (June 1, 2026 is a Monday — exercises the overlap
+# case where BOTH weekly and monthly fire on the same day).
+_FIRST_OF_MONTH_AND_MONDAY = datetime(2026, 6, 1, 0, 30, tzinfo=timezone.utc)
+# First of month that is NOT a Monday: July 1, 2026 is a Wednesday.
+_FIRST_OF_MONTH_MIDWEEK = datetime(2026, 7, 1, 0, 30, tzinfo=timezone.utc)
 
 
 @pytest.fixture
@@ -69,8 +72,8 @@ def _make_scheduler(db_conn, *, clock_value: datetime):
 
 
 class TestWeeklyTrigger:
-    def test_sunday_fires_weekly(self, db_conn, mock_run_review):
-        scheduler = _make_scheduler(db_conn, clock_value=_SUNDAY)
+    def test_monday_fires_weekly(self, db_conn, mock_run_review):
+        scheduler = _make_scheduler(db_conn, clock_value=_MONDAY)
         scheduler()
         assert mock_run_review.call_count == 1
         # Verify the window passed had period_type='weekly'
@@ -80,52 +83,78 @@ class TestWeeklyTrigger:
         if window is None:
             window = args[0]
         assert window.period_type == "weekly"
-        assert window.period_end == _SUNDAY.date()
+        assert window.period_end == _MONDAY.date()
 
-    def test_monday_does_not_fire(self, db_conn, mock_run_review):
+    def test_monday_window_covers_completed_previous_week(
+        self, db_conn, mock_run_review,
+    ):
+        """PR #22 reviewer regression: the weekly window must cover
+        the *completed* previous Mon→Mon week, NOT a Sunday-to-Sunday
+        rolling window. Pin period_start = period_end - 7 days =
+        previous Monday."""
         scheduler = _make_scheduler(db_conn, clock_value=_MONDAY)
         scheduler()
-        # Monday is not Sunday, not first of month → no fire
+        args, kwargs = mock_run_review.call_args
+        window = args[0] if args else kwargs.get("window")
+        # this Monday is 2026-05-18; previous Monday is 2026-05-11
+        from datetime import date as _date
+        assert window.period_start == _date(2026, 5, 11)
+        assert window.period_end == _date(2026, 5, 18)
+        # Both bounds must be Mondays (weekday=0).
+        assert window.period_start.weekday() == 0
+        assert window.period_end.weekday() == 0
+
+    def test_sunday_does_not_fire_weekly(self, db_conn, mock_run_review):
+        """PR #22 reviewer regression: Sunday cycles must NOT fire
+        the weekly review — that would report on an in-progress
+        week and suppress the proper Monday fire."""
+        scheduler = _make_scheduler(db_conn, clock_value=_SUNDAY)
+        scheduler()
         assert mock_run_review.call_count == 0
 
-    @pytest.mark.parametrize("weekday_offset", [0, 1, 2, 3, 4, 5])
-    def test_no_fire_on_non_sunday_non_first(
+    def test_tuesday_does_not_fire(self, db_conn, mock_run_review):
+        scheduler = _make_scheduler(db_conn, clock_value=_TUESDAY)
+        scheduler()
+        assert mock_run_review.call_count == 0
+
+    @pytest.mark.parametrize("weekday_offset", [1, 2, 3, 4, 5, 6])
+    def test_no_fire_on_non_monday_non_first(
         self, db_conn, mock_run_review, weekday_offset,
     ):
-        # 2026-05-13 is a Wednesday. Walk through Mon-Sat.
+        # 2026-05-11 is a Monday. Walk through Tue–Sun.
         base = datetime(2026, 5, 11, 18, 0, tzinfo=timezone.utc)
         from datetime import timedelta
         clock = base + timedelta(days=weekday_offset)
-        # Skip dates that are first of month.
+        # Skip dates that are first of month (handled by monthly tests).
         if clock.day == 1:
             pytest.skip("first of month — covered by monthly tests")
         scheduler = _make_scheduler(db_conn, clock_value=clock)
         scheduler()
         assert mock_run_review.call_count == 0
 
-    def test_sunday_idempotent_within_same_day(
+    def test_monday_idempotent_within_same_day(
         self, db_conn, mock_run_review,
     ):
-        """Multiple cycle hooks on the same Sunday must fire the
+        """Multiple cycle hooks on the same Monday must fire the
         weekly review exactly once."""
-        scheduler = _make_scheduler(db_conn, clock_value=_SUNDAY)
+        scheduler = _make_scheduler(db_conn, clock_value=_MONDAY)
         for _ in range(10):
             scheduler()
         assert mock_run_review.call_count == 1
 
-    def test_next_sunday_fires_again(self, db_conn, mock_run_review):
-        """The next Sunday DOES fire again — the idempotency tracks
-        date, not 'ever fired'."""
+    def test_next_monday_fires_again(self, db_conn, mock_run_review):
+        """The next Monday DOES fire again — idempotency tracks date,
+        not 'ever fired'."""
         from datetime import timedelta
         scheduler = HealthReviewScheduler(
             conn_factory=lambda: db_conn,
             dispatcher=AlertDispatcher(),
-            clock=lambda: _SUNDAY,
+            clock=lambda: _MONDAY,
         )
         scheduler()
-        # Advance the clock to next Sunday by mutating the closure.
-        next_sunday = _SUNDAY + timedelta(days=7)
-        scheduler.clock = lambda: next_sunday
+        # Advance the clock to next Monday.
+        next_monday = _MONDAY + timedelta(days=7)
+        scheduler.clock = lambda: next_monday
         scheduler()
         assert mock_run_review.call_count == 2
 
@@ -134,12 +163,14 @@ class TestWeeklyTrigger:
 
 
 class TestMonthlyTrigger:
-    def test_first_of_month_fires_monthly(
+    def test_first_of_month_midweek_fires_monthly_only(
         self, db_conn, mock_run_review,
     ):
-        scheduler = _make_scheduler(db_conn, clock_value=_FIRST_OF_MONTH)
+        """July 1, 2026 is a Wednesday — only monthly should fire."""
+        scheduler = _make_scheduler(
+            db_conn, clock_value=_FIRST_OF_MONTH_MIDWEEK,
+        )
         scheduler()
-        # Was June 1 (a Monday — not a Sunday), so only monthly fires.
         assert mock_run_review.call_count == 1
         args, kwargs = mock_run_review.call_args
         window = args[0] if args else kwargs.get("window")
@@ -158,22 +189,25 @@ class TestMonthlyTrigger:
     def test_first_of_month_idempotent(
         self, db_conn, mock_run_review,
     ):
-        scheduler = _make_scheduler(db_conn, clock_value=_FIRST_OF_MONTH)
+        scheduler = _make_scheduler(
+            db_conn, clock_value=_FIRST_OF_MONTH_MIDWEEK,
+        )
         for _ in range(5):
             scheduler()
         assert mock_run_review.call_count == 1
 
 
-# ── Both fire on Sunday + first ───────────────────────────────────────
+# ── Both fire on Monday + first ───────────────────────────────────────
 
 
 class TestBothFireOnOverlap:
-    """When the 1st of the month is also a Sunday, BOTH weekly and
-    monthly reviews fire (independent state tracking)."""
+    """When the 1st of the month is also a Monday, BOTH weekly and
+    monthly reviews fire (independent state tracking). June 1, 2026
+    is a Monday."""
 
-    def test_sunday_first_fires_both(self, db_conn, mock_run_review):
+    def test_monday_first_fires_both(self, db_conn, mock_run_review):
         scheduler = _make_scheduler(
-            db_conn, clock_value=_SUNDAY_AND_FIRST,
+            db_conn, clock_value=_FIRST_OF_MONTH_AND_MONDAY,
         )
         scheduler()
         assert mock_run_review.call_count == 2
@@ -202,7 +236,7 @@ class TestFailureTolerance:
         monkeypatch.setattr(
             "strategies.health.scheduler.run_review", _raises,
         )
-        scheduler = _make_scheduler(db_conn, clock_value=_SUNDAY)
+        scheduler = _make_scheduler(db_conn, clock_value=_MONDAY)
         # Must NOT raise.
         scheduler()
 
@@ -212,7 +246,7 @@ class TestFailureTolerance:
         scheduler = HealthReviewScheduler(
             conn_factory=_bad_factory,
             dispatcher=AlertDispatcher(),
-            clock=lambda: _SUNDAY,
+            clock=lambda: _MONDAY,
         )
         # Must NOT raise even though conn_factory fails.
         scheduler()

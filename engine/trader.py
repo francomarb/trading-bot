@@ -394,7 +394,7 @@ class TradingEngine:
         `post_cycle_hook` (PLAN 11.10g) is an optional callable invoked
         after each completed cycle. The engine doesn't know what the
         callback does — it's the integration point for forward_test.py's
-        Sunday-EOD weekly + first-of-month monthly health-review
+        Monday-completed-week + first-of-month monthly health-review
         scheduler. The hook is wrapped in try/except so a hook failure
         cannot crash the trading loop (same hard rule as the lifecycle
         counter flush — design §12.4.1 invariant).

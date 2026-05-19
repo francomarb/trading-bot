@@ -1,13 +1,33 @@
 """
-Health-review scheduler — Sunday EOD weekly + first-of-month monthly hooks.
+Health-review scheduler — Monday-completed-week + first-of-month hooks.
 
 Consumed by forward_test.py as `engine.start(post_cycle_hook=...)`.
 The hook checks the current date and fires the appropriate reviewer
 window when the trigger conditions are met. Idempotent — calling
-twice on the same Sunday produces one report.
+multiple times on the same trigger day produces one report.
+
+**Why Monday and not Sunday EOD:** an earlier iteration fired on the
+first Sunday cycle, but that was the wrong shape for two reasons:
+  1. It fires on an in-progress week. Whenever the bot's first
+     Sunday cycle runs (often Sunday morning UTC = Saturday evening
+     US), the trailing-7-day window covers a still-open week, and
+     the in-memory idempotency suppresses any later Sunday-EOD
+     cycle. The canonical weekly report ends up based on an
+     incomplete week.
+  2. The lifecycle-counter table is keyed by ISO Monday (the engine
+     flush in PLAN 11.10f computes period_start = Monday of current
+     ISO week). A Sunday-to-Sunday rolling window misaligns with
+     that storage shape.
+
+Firing on Monday with `period_end = this Monday` gives a clean
+previous-Mon → this-Mon completed week that lines up with the
+lifecycle counter rows. Monday 00:00 UTC is also close to "right
+after the trading week ended" (Sunday evening US time), which is
+the operationally intended cadence.
 
 Per design §10 cadence + §1.2 invariant:
-  - Sunday EOD (UTC) → weekly report
+  - Monday (weekday=0, UTC) → weekly report for the *completed*
+    Mon→Mon week ending at the current Monday
   - First of month (UTC) → monthly report
   - The hook NEVER modifies trading state; it only triggers the
     reviewer which writes a markdown report + dispatches alerts.
@@ -22,6 +42,8 @@ Idempotency is double-protected:
      UNIQUE(period_type, period_start, strategy_name) constraint
      would dedupe upserts, and atomic-write of the markdown report
      would just overwrite the previous file.
+
+PR #22 reviewer caught the Sunday-firing bug; this is the fix.
 """
 
 from __future__ import annotations
@@ -38,8 +60,11 @@ from reporting.alerts import AlertDispatcher
 from strategies.health.reviewer import run_review, window_from_args
 
 
-# Sunday in Python's weekday() is 6 (Monday=0, ..., Sunday=6).
-_SUNDAY = 6
+# Monday in Python's weekday() is 0 (Monday=0, ..., Sunday=6). Firing
+# here means the weekly report covers the previous Mon → this Mon
+# completed week — aligned with the lifecycle counter table's ISO
+# Monday period_start.
+_MONDAY = 0
 
 
 @dataclass
@@ -88,15 +113,18 @@ class HealthReviewScheduler:
             )
 
     def _maybe_fire_weekly(self, today: date) -> None:
-        # Sunday only.
-        if today.weekday() != _SUNDAY:
+        # Monday only — fires the report for the previous Mon → this
+        # Mon completed week. window_from_args("weekly",
+        # end_date=Monday) gives period_start = previous Monday,
+        # period_end = this Monday (a clean completed-week window).
+        if today.weekday() != _MONDAY:
             return
-        # Once per Sunday.
+        # Once per Monday.
         if self.last_weekly_fired_date == today:
             return
         logger.info(
             f"health-review scheduler: firing WEEKLY review for "
-            f"period ending {today.isoformat()}"
+            f"completed week ending {today.isoformat()}"
         )
         window = window_from_args("weekly", end_date=today)
         self._run(window)

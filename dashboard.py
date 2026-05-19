@@ -686,7 +686,7 @@ def _render_health_and_edge_panel() -> None:
         if not health_state:
             st.info(
                 "No weekly health reports yet. The first report will "
-                "land after the next Sunday-EOD cycle (or run "
+                "land after the next Monday cycle (or run "
                 "`python scripts/strategy_health_review.py --window "
                 "weekly` on demand)."
             )

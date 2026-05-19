@@ -3,7 +3,7 @@
 Strategy Health & Edge review CLI (PLAN 11.10e).
 
 Operator-facing entry point for on-demand health reports. The same
-function used by the forward_test.py Sunday EOD hook (added in
+function used by the forward_test.py Monday-completed-week hook (added in
 11.10g) is reachable here via `--window weekly`.
 
 Per the v1 invariant (design §1.2): this script ONLY writes a
