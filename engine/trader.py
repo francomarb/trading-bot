@@ -62,6 +62,7 @@ from data.fetcher import StaleDataError, close_connections, fetch_symbol, requir
 from engine.positions import (
     Position,
     PositionLeg,
+    build_credit_spread_snapshot,
     make_single_leg,
     make_spread,
     new_spread_id,
@@ -320,6 +321,7 @@ class TradingEngine:
         self._watchlist_statuses: dict[str, dict[str, str]] = {}
         self._watchlist_reasons: dict[str, dict[str, list[str]]] = {}
         self._sector_heat: dict | None = None
+        self._last_underlying_prices: dict[str, float] = {}
 
         # Sector exposure observability (11.7 Part B). Maps normalized sector
         # key → count of open equity positions in that sector. OCC option
@@ -830,6 +832,7 @@ class TradingEngine:
         latest_atr = float(df[atr_col].iloc[-1])
         latest_close = float(df["close"].iloc[-1])
         latest_ts = df.index[-1]
+        self._last_underlying_prices[symbol] = latest_close
 
         # 4. Signals.
         raw_signals, signals, edge_allowed, edge_reasons = strategy.inspect_signals(
@@ -2268,6 +2271,49 @@ class TradingEngine:
             })
         return out
 
+    def _multi_leg_positions_snapshot(self) -> list[dict]:
+        """
+        Build the normalized multi-leg state snapshot consumed by the dashboard.
+
+        Credit spreads are the first producer. The shape is intentionally not
+        named after credit_spread so future MLEG strategies can reuse it.
+        """
+        out: list[dict] = []
+        broker_positions = (
+            self._last_snapshot.account.open_positions
+            if self._last_snapshot is not None else {}
+        )
+        today = self._clock().date()
+        for position_id, strategy in self._spread_owner_strategy.items():
+            getter = getattr(strategy, "get_open_spread", None)
+            spread = getter(position_id) if callable(getter) else None
+            if spread is None:
+                continue
+            underlying = owner_key_for(spread.short_occ)
+            config = getattr(strategy, "config", None)
+            out.append(build_credit_spread_snapshot(
+                position_id=position_id,
+                strategy=strategy.name,
+                underlying=underlying,
+                short_occ=spread.short_occ,
+                long_occ=spread.long_occ,
+                short_strike=spread.short_strike,
+                long_strike=spread.long_strike,
+                expiration=spread.expiration_date,
+                entry_net_price=spread.net_credit,
+                width=spread.width,
+                qty=spread.qty,
+                broker_positions=broker_positions,
+                underlying_price=self._last_underlying_prices.get(underlying),
+                pending_close=position_id in self._spreads_pending_close,
+                today=today,
+                stop_loss_multiple=float(
+                    getattr(config, "stop_loss_multiple", 2.0)
+                ),
+                time_stop_dte=getattr(config, "time_stop_dte", None),
+            ))
+        return out
+
     def _multi_leg_risk_notional_by_strategy(self) -> dict[str, float]:
         """
         Defined-risk multi-leg positions consume sleeve by max loss, not by
@@ -3192,6 +3238,7 @@ class TradingEngine:
                 "open_positions": self._owners_view(),
                 "positions_detail": positions_detail,
                 "credit_spreads": self._credit_spreads_snapshot(),
+                "multi_leg_positions": self._multi_leg_positions_snapshot(),
                 "allocator": allocator_snapshot["strategies"],
                 "capital_pools": allocator_snapshot["pools"],
                 "pending_entry_notional": pending_entry_notional,

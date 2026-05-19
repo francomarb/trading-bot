@@ -31,6 +31,7 @@ import plotly.graph_objects as go
 import streamlit as st
 
 from config import settings
+from engine.positions import build_credit_spread_snapshot
 
 
 # ── Data loading helpers (pure functions — tested independently) ─────────────
@@ -292,6 +293,49 @@ def resolve_account_metrics(
         "equity_delta": equity_delta,
         "source": source,
     }, warning
+
+
+def refresh_multi_leg_positions(
+    state: dict[str, Any],
+    broker_positions_detail: dict[str, Any] | None = None,
+) -> list[dict[str, Any]]:
+    """
+    Refresh normalized multi-leg snapshots with broker leg marks when available.
+
+    Falls back to the engine snapshot row on any missing data so the dashboard
+    stays read-only and resilient.
+    """
+    rows = list(state.get("multi_leg_positions") or [])
+    if not rows:
+        return []
+    if not broker_positions_detail:
+        return rows
+
+    refreshed: list[dict[str, Any]] = []
+    for row in rows:
+        if row.get("structure") != "put_credit_spread":
+            refreshed.append(row)
+            continue
+        try:
+            refreshed.append(build_credit_spread_snapshot(
+                position_id=str(row.get("position_id", "")),
+                strategy=str(row.get("strategy", "")),
+                underlying=str(row.get("underlying", "")),
+                short_occ=str(row.get("short_occ", "")),
+                long_occ=str(row.get("long_occ", "")),
+                short_strike=float(row.get("short_strike", 0.0) or 0.0),
+                long_strike=float(row.get("long_strike", 0.0) or 0.0),
+                expiration=str(row.get("expiration", "")),
+                entry_net_price=float(row.get("entry_net_price", 0.0) or 0.0),
+                width=float(row.get("width", 0.0) or 0.0),
+                qty=float(row.get("qty", 1.0) or 1.0),
+                broker_positions=broker_positions_detail,
+                underlying_price=row.get("underlying_price"),
+                pending_close=bool(row.get("pending_close", False)),
+            ))
+        except Exception:
+            refreshed.append(row)
+    return refreshed
 
 
 def compute_equity_curve(trades_df: pd.DataFrame) -> pd.DataFrame:
@@ -782,6 +826,10 @@ def render_dashboard() -> None:
                 enriched["strategy"] = snapshot_detail["strategy"]
             positions_detail[sym] = enriched
         display_state["positions_detail"] = positions_detail
+    display_state["multi_leg_positions"] = refresh_multi_leg_positions(
+        state,
+        broker_positions_detail=broker_positions_detail,
+    )
     equity = account_metrics["equity"]
     daily_pnl = account_metrics["daily_pnl"]
     session_pnl = account_metrics["session_pnl"]
@@ -1130,6 +1178,70 @@ def render_dashboard() -> None:
             )
 
     st.divider()
+
+    # ── Open Multi-Leg Positions (11.39) ────────────────────────────────
+    multi_leg_positions = display_state.get("multi_leg_positions") or []
+    if multi_leg_positions:
+        render_section_header(
+            "Open Multi-Leg Positions",
+            "Reusable live P/L and risk view for option structures.",
+            kicker="Options",
+        )
+        rows = []
+        for pos in multi_leg_positions:
+            short_strike = pos.get("short_strike")
+            long_strike = pos.get("long_strike")
+            distance_pct = pos.get("distance_to_short_strike_pct")
+            rows.append({
+                "Structure": str(pos.get("structure", "")).replace("_", " ").title(),
+                "Underlying": pos.get("underlying", ""),
+                "Strikes": (
+                    f"{short_strike:.0f} / {long_strike:.0f}"
+                    if short_strike is not None and long_strike is not None
+                    else ""
+                ),
+                "Expiration": pos.get("expiration", ""),
+                "DTE": pos.get("dte"),
+                "Entry Credit": (
+                    float(pos.get("entry_net_price") or 0.0)
+                    * 100.0 * float(pos.get("qty") or 0.0)
+                ),
+                "Mark Debit": (
+                    None if pos.get("current_exit_price") is None
+                    else float(pos.get("current_exit_price") or 0.0)
+                    * 100.0 * float(pos.get("qty") or 0.0)
+                ),
+                "Unrealized P&L": pos.get("unrealized_pnl"),
+                "Max Profit": pos.get("max_profit"),
+                "Max Loss": pos.get("max_loss"),
+                "Underlying Price": pos.get("underlying_price"),
+                "Distance": pos.get("distance_to_short_strike"),
+                "Distance %": (
+                    distance_pct * 100.0 if distance_pct is not None else None
+                ),
+                "Status": pos.get("status", ""),
+            })
+        st.dataframe(
+            pd.DataFrame(rows),
+            width="stretch",
+            hide_index=True,
+            column_config={
+                "DTE": st.column_config.NumberColumn(format="%d"),
+                "Entry Credit": st.column_config.NumberColumn(format="$%.2f"),
+                "Mark Debit": st.column_config.NumberColumn(format="$%.2f"),
+                "Unrealized P&L": st.column_config.NumberColumn(format="$%.2f"),
+                "Max Profit": st.column_config.NumberColumn(format="$%.2f"),
+                "Max Loss": st.column_config.NumberColumn(format="$%.2f"),
+                "Underlying Price": st.column_config.NumberColumn(format="$%.2f"),
+                "Distance": st.column_config.NumberColumn(format="$%.2f"),
+                "Distance %": st.column_config.NumberColumn(format="%.2f%%"),
+            },
+        )
+        st.caption(
+            "Uses dashboard broker refresh when available; otherwise falls back "
+            "to the engine's latest multi-leg snapshot."
+        )
+        st.divider()
 
     # ── Open Credit Spreads (11.29) ─────────────────────────────────────
     # Multi-leg positions are keyed by position_id, not a tradable symbol,

@@ -512,6 +512,46 @@ class TestMultiLegRiskNotional:
         assert usage == {"iron_condor": pytest.approx(800.0)}
 
 
+class TestMultiLegPositionsSnapshot:
+    def test_credit_spread_snapshot_includes_live_mark_pnl_and_distance(self, tmp_path):
+        strategy = _strategy()
+        engine, _ = _engine(tmp_path, strategy)
+        engine._spread_owner_strategy["p1"] = strategy
+        strategy.register_spread(_open_spread("p1", net_credit=1.45))
+        engine._last_underlying_prices["SPY"] = 580.0
+        engine._last_snapshot = _snapshot_with({
+            "SPY260618P00568000": SimpleNamespace(qty=-1, market_value=-300.0),
+            "SPY260618P00558000": SimpleNamespace(qty=1, market_value=200.0),
+        })
+
+        snap = engine._multi_leg_positions_snapshot()
+
+        assert len(snap) == 1
+        row = snap[0]
+        assert row["structure"] == "put_credit_spread"
+        assert row["position_id"] == "p1"
+        assert row["strategy"] == "credit_spread"
+        assert row["underlying"] == "SPY"
+        assert row["entry_net_price"] == pytest.approx(1.45)
+        assert row["current_exit_price"] == pytest.approx(1.0)
+        assert row["unrealized_pnl"] == pytest.approx(45.0)
+        assert row["max_loss"] == pytest.approx(855.0)
+        assert row["distance_to_short_strike"] == pytest.approx(12.0)
+
+    def test_missing_leg_marks_do_not_block_static_snapshot(self, tmp_path):
+        strategy = _strategy()
+        engine, _ = _engine(tmp_path, strategy)
+        engine._spread_owner_strategy["p1"] = strategy
+        strategy.register_spread(_open_spread("p1", net_credit=1.45))
+
+        row = engine._multi_leg_positions_snapshot()[0]
+
+        assert row["current_exit_price"] is None
+        assert row["unrealized_pnl"] is None
+        assert row["max_profit"] == pytest.approx(145.0)
+        assert row["risk_used"] == pytest.approx(855.0)
+
+
 # ── External close detection ────────────────────────────────────────────────
 
 

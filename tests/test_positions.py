@@ -6,6 +6,7 @@ of the credit spread work (PLAN.md 11.27).
 from __future__ import annotations
 
 from datetime import datetime, timezone
+from types import SimpleNamespace
 
 import pytest
 
@@ -14,6 +15,8 @@ from engine.positions import (
     SPREAD,
     Position,
     PositionLeg,
+    broker_position_current_price,
+    build_credit_spread_snapshot,
     make_single_leg,
     new_spread_id,
     owner_key_for,
@@ -210,3 +213,92 @@ class TestViewOwnerMap:
         )
         view = view_owner_map([p1, p2])
         assert view == {"AAPL": "sma", "SPY": "spy_options_reversion"}
+
+
+class TestBrokerPositionCurrentPrice:
+    def test_prefers_explicit_current_price(self) -> None:
+        pos = SimpleNamespace(qty=-1, market_value=-736.0, current_price=7.36)
+        assert broker_position_current_price("SPY260618P00714000", pos) == 7.36
+
+    def test_infers_option_premium_from_market_value(self) -> None:
+        pos = SimpleNamespace(qty=-1, market_value=-736.0)
+        assert broker_position_current_price("SPY260618P00714000", pos) == pytest.approx(7.36)
+
+    def test_infers_equity_price_from_market_value(self) -> None:
+        pos = SimpleNamespace(qty=10, market_value=1550.0)
+        assert broker_position_current_price("AAPL", pos) == pytest.approx(155.0)
+
+
+class TestCreditSpreadSnapshot:
+    def test_profitable_spread_valuation(self) -> None:
+        row = build_credit_spread_snapshot(
+            position_id="p1",
+            strategy="credit_spread",
+            underlying="SPY",
+            short_occ="SPY260618P00714000",
+            long_occ="SPY260618P00704000",
+            short_strike=714.0,
+            long_strike=704.0,
+            expiration="2026-06-18",
+            entry_net_price=1.49,
+            width=10.0,
+            qty=1,
+            broker_positions={
+                "SPY260618P00714000": SimpleNamespace(qty=-1, market_value=-500.0),
+                "SPY260618P00704000": SimpleNamespace(qty=1, market_value=400.0),
+            },
+            underlying_price=740.0,
+            today=datetime(2026, 5, 19, tzinfo=timezone.utc).date(),
+        )
+        assert row["current_exit_price"] == pytest.approx(1.0)
+        assert row["unrealized_pnl"] == pytest.approx(49.0)
+        assert row["max_profit"] == pytest.approx(149.0)
+        assert row["max_loss"] == pytest.approx(851.0)
+        assert row["risk_used"] == pytest.approx(851.0)
+        assert row["distance_to_short_strike"] == pytest.approx(26.0)
+        assert row["status"] == "healthy"
+
+    def test_losing_spread_valuation_is_watch(self) -> None:
+        row = build_credit_spread_snapshot(
+            position_id="p1",
+            strategy="credit_spread",
+            underlying="SPY",
+            short_occ="SPY260618P00714000",
+            long_occ="SPY260618P00704000",
+            short_strike=714.0,
+            long_strike=704.0,
+            expiration="2026-06-18",
+            entry_net_price=1.49,
+            width=10.0,
+            qty=1,
+            broker_positions={
+                "SPY260618P00714000": SimpleNamespace(qty=-1, market_value=-736.0),
+                "SPY260618P00704000": SimpleNamespace(qty=1, market_value=541.0),
+            },
+            underlying_price=731.86,
+            today=datetime(2026, 5, 19, tzinfo=timezone.utc).date(),
+        )
+        assert row["current_exit_price"] == pytest.approx(1.95)
+        assert row["unrealized_pnl"] == pytest.approx(-46.0)
+        assert row["status"] == "watch"
+
+    def test_missing_leg_mark_keeps_static_risk_fields(self) -> None:
+        row = build_credit_spread_snapshot(
+            position_id="p1",
+            strategy="credit_spread",
+            underlying="SPY",
+            short_occ="SPY260618P00714000",
+            long_occ="SPY260618P00704000",
+            short_strike=714.0,
+            long_strike=704.0,
+            expiration="2026-06-18",
+            entry_net_price=1.49,
+            width=10.0,
+            qty=1,
+            broker_positions={},
+            underlying_price=None,
+            today=datetime(2026, 5, 19, tzinfo=timezone.utc).date(),
+        )
+        assert row["current_exit_price"] is None
+        assert row["unrealized_pnl"] is None
+        assert row["max_loss"] == pytest.approx(851.0)

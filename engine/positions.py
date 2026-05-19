@@ -25,12 +25,15 @@ from __future__ import annotations
 
 import uuid
 from dataclasses import dataclass, field
-from datetime import datetime
-from typing import Iterable
+from datetime import date, datetime, timezone
+from typing import Any, Iterable
 
 # Re-exported from utils.option_symbols so callers that don't want to pull
 # in the engine package can use the same normalizer.
-from utils.option_symbols import owner_key_for as _owner_key_for
+from utils.option_symbols import (
+    is_occ_option,
+    owner_key_for as _owner_key_for,
+)
 
 
 # ── Constants ───────────────────────────────────────────────────────────────
@@ -47,6 +50,8 @@ VALID_POSITION_TYPES = frozenset({SINGLE_LEG, SPREAD})
 BUY = "BUY"
 SELL = "SELL"
 VALID_SIDES = frozenset({BUY, SELL})
+
+CONTRACT_MULTIPLIER = 100
 
 
 # ── Dataclasses ─────────────────────────────────────────────────────────────
@@ -257,3 +262,215 @@ def view_owner_map(positions: Iterable[Position]) -> dict[str, str]:
     *positions* per strategy, not legs).
     """
     return {pos.position_id: pos.strategy_name for pos in positions}
+
+
+def _field(obj: Any, name: str, default: Any = None) -> Any:
+    if isinstance(obj, dict):
+        return obj.get(name, default)
+    return getattr(obj, name, default)
+
+
+def _as_float(value: Any) -> float | None:
+    if value is None:
+        return None
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return None
+
+
+def broker_position_current_price(symbol: str, broker_position: Any) -> float | None:
+    """
+    Best-effort current per-share/contract price from a broker position object.
+
+    Alpaca reports option market value at contract multiplier scale
+    (premium × qty × 100). If ``current_price`` is unavailable, infer option
+    premium by dividing market value by qty and by ``CONTRACT_MULTIPLIER``.
+    """
+    if broker_position is None:
+        return None
+    explicit = _as_float(_field(broker_position, "current_price"))
+    if explicit is not None:
+        return explicit
+    qty = _as_float(_field(broker_position, "qty"))
+    market_value = _as_float(_field(broker_position, "market_value"))
+    if qty in (None, 0.0) or market_value is None:
+        return None
+    divisor = qty * (CONTRACT_MULTIPLIER if is_occ_option(symbol) else 1.0)
+    if divisor == 0:
+        return None
+    return abs(market_value / divisor)
+
+
+def _leg_snapshot(
+    *,
+    symbol: str,
+    role: str,
+    side: str,
+    qty: float,
+    broker_positions: dict[str, Any],
+) -> dict[str, Any]:
+    broker_pos = broker_positions.get(symbol)
+    return {
+        "symbol": symbol,
+        "role": role,
+        "side": side,
+        "qty": qty,
+        "avg_entry_price": _as_float(_field(broker_pos, "avg_entry_price")),
+        "current_price": broker_position_current_price(symbol, broker_pos),
+        "market_value": _as_float(_field(broker_pos, "market_value")),
+        "unrealized_pnl": _as_float(
+            _field(
+                broker_pos,
+                "unrealized_pl",
+                _field(broker_pos, "unrealized_pnl"),
+            )
+        ),
+    }
+
+
+def _credit_spread_status(
+    *,
+    entry_net_price: float,
+    current_exit_price: float | None,
+    underlying_price: float | None,
+    short_strike: float,
+    dte: int,
+    stop_loss_multiple: float,
+    time_stop_dte: int | None,
+) -> str:
+    if underlying_price is not None and underlying_price <= short_strike:
+        return "tested"
+    if (
+        current_exit_price is not None
+        and entry_net_price > 0
+        and current_exit_price >= stop_loss_multiple * entry_net_price
+    ):
+        return "tested"
+    if time_stop_dte is not None and dte <= time_stop_dte:
+        return "watch"
+    if (
+        current_exit_price is not None
+        and entry_net_price > 0
+        and current_exit_price > entry_net_price
+    ):
+        return "watch"
+    if underlying_price is not None and underlying_price > 0:
+        distance_pct = (underlying_price - short_strike) / underlying_price
+        if distance_pct <= 0.03:
+            return "watch"
+    return "healthy"
+
+
+def build_credit_spread_snapshot(
+    *,
+    position_id: str,
+    strategy: str,
+    underlying: str,
+    short_occ: str,
+    long_occ: str,
+    short_strike: float,
+    long_strike: float,
+    expiration: date | str,
+    entry_net_price: float,
+    width: float,
+    qty: int | float,
+    broker_positions: dict[str, Any] | None = None,
+    underlying_price: float | None = None,
+    pending_close: bool = False,
+    today: date | None = None,
+    stop_loss_multiple: float = 2.0,
+    time_stop_dte: int | None = None,
+) -> dict[str, Any]:
+    """
+    Build a normalized multi-leg valuation snapshot for a bull put credit spread.
+
+    The returned dict is intentionally JSON-serializable so it can be written
+    directly into ``engine_state.json`` and rendered by the dashboard.
+    """
+    broker_positions = broker_positions or {}
+    today = today or datetime.now(timezone.utc).date()
+    expiration_date = (
+        expiration
+        if isinstance(expiration, date)
+        else date.fromisoformat(str(expiration))
+    )
+    qty_f = abs(float(qty))
+    entry = float(entry_net_price)
+    width_f = float(width)
+    max_profit = entry * CONTRACT_MULTIPLIER * qty_f
+    max_loss = max(0.0, width_f - entry) * CONTRACT_MULTIPLIER * qty_f
+
+    short_leg = _leg_snapshot(
+        symbol=short_occ,
+        role="short",
+        side=SELL,
+        qty=-qty_f,
+        broker_positions=broker_positions,
+    )
+    long_leg = _leg_snapshot(
+        symbol=long_occ,
+        role="long",
+        side=BUY,
+        qty=qty_f,
+        broker_positions=broker_positions,
+    )
+    short_price = short_leg["current_price"]
+    long_price = long_leg["current_price"]
+    current_exit_price = (
+        max(0.0, short_price - long_price)
+        if short_price is not None and long_price is not None
+        else None
+    )
+    unrealized_pnl = (
+        (entry - current_exit_price) * CONTRACT_MULTIPLIER * qty_f
+        if current_exit_price is not None
+        else None
+    )
+    dte = (expiration_date - today).days
+    distance = (
+        underlying_price - float(short_strike)
+        if underlying_price is not None
+        else None
+    )
+    distance_pct = (
+        distance / underlying_price
+        if distance is not None and underlying_price not in (None, 0.0)
+        else None
+    )
+    status = _credit_spread_status(
+        entry_net_price=entry,
+        current_exit_price=current_exit_price,
+        underlying_price=underlying_price,
+        short_strike=float(short_strike),
+        dte=dte,
+        stop_loss_multiple=float(stop_loss_multiple),
+        time_stop_dte=time_stop_dte,
+    )
+
+    return {
+        "position_id": position_id,
+        "strategy": strategy,
+        "structure": "put_credit_spread",
+        "underlying": underlying,
+        "short_occ": short_occ,
+        "long_occ": long_occ,
+        "qty": qty_f,
+        "expiration": expiration_date.isoformat(),
+        "dte": dte,
+        "pending_close": bool(pending_close),
+        "entry_net_price": entry,
+        "current_exit_price": current_exit_price,
+        "unrealized_pnl": unrealized_pnl,
+        "max_profit": max_profit,
+        "max_loss": max_loss,
+        "risk_used": max_loss,
+        "underlying_price": underlying_price,
+        "short_strike": float(short_strike),
+        "long_strike": float(long_strike),
+        "width": width_f,
+        "distance_to_short_strike": distance,
+        "distance_to_short_strike_pct": distance_pct,
+        "status": status,
+        "legs": [short_leg, long_leg],
+    }

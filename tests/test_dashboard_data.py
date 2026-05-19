@@ -19,6 +19,7 @@ from dashboard import (
     format_delta_currency,
     load_engine_state,
     load_trades,
+    refresh_multi_leg_positions,
     resolve_account_metrics,
 )
 
@@ -198,6 +199,44 @@ class TestLoadBrokerAccountCurve:
         load_broker_account_curve.clear()
         with pytest.raises(ValueError, match="unsupported broker account curve period"):
             load_broker_account_curve(False, "YTD")
+
+
+class TestRefreshMultiLegPositions:
+    def test_returns_snapshot_rows_without_broker_refresh(self):
+        state = {
+            "multi_leg_positions": [{
+                "position_id": "p1",
+                "structure": "put_credit_spread",
+                "current_exit_price": 1.95,
+            }]
+        }
+        assert refresh_multi_leg_positions(state, None) == state["multi_leg_positions"]
+
+    def test_refreshes_credit_spread_marks_from_broker_positions(self):
+        state = {
+            "multi_leg_positions": [{
+                "position_id": "p1",
+                "strategy": "credit_spread",
+                "structure": "put_credit_spread",
+                "underlying": "SPY",
+                "short_occ": "SPY260618P00714000",
+                "long_occ": "SPY260618P00704000",
+                "short_strike": 714.0,
+                "long_strike": 704.0,
+                "expiration": "2026-06-18",
+                "entry_net_price": 1.49,
+                "width": 10.0,
+                "qty": 1,
+                "underlying_price": 731.86,
+            }]
+        }
+        rows = refresh_multi_leg_positions(state, {
+            "SPY260618P00714000": {"qty": -1, "market_value": -736.0},
+            "SPY260618P00704000": {"qty": 1, "market_value": 541.0},
+        })
+        assert rows[0]["current_exit_price"] == pytest.approx(1.95)
+        assert rows[0]["unrealized_pnl"] == pytest.approx(-46.0)
+        assert rows[0]["status"] == "watch"
 
 
 # ── compute_equity_curve ─────────────────────────────────────────────────────
