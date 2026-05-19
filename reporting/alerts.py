@@ -69,6 +69,15 @@ class AlertType(Enum):
     TRADE_EXECUTED = "trade_executed"
     REGIME_SHIFT = "regime_shift"
     EOD_SUMMARY = "eod_summary"
+    # PLAN 11.10e — Strategy Health & Edge Monitor (advisory only).
+    # STRATEGY_EDGE_LOSS is the silent-killer alarm (CRITICAL); the
+    # others are forensic/informational and never drive auto-action
+    # per the v1 invariant (design §1.2).
+    STRATEGY_EDGE_LOSS = "strategy_edge_loss"
+    STRATEGY_EDGE_BELOW_BENCHMARK = "strategy_edge_below_benchmark"
+    STRATEGY_HEALTH_DEGRADED = "strategy_health_degraded"
+    STRATEGY_HEALTH_BROKEN = "strategy_health_broken"
+    STRATEGY_DRIFT_WARNING = "strategy_drift_warning"
 
 
 @dataclass(frozen=True)
@@ -484,5 +493,159 @@ class AlertDispatcher:
                 "daily_pnl": daily_pnl,
                 "trade_count": trade_count,
                 "win_rate": win_rate,
+            },
+        ))
+
+    # ── Strategy Health & Edge Monitor (PLAN 11.10e) ────────────────────
+    # All five are advisory-only per the v1 invariant — they inform the
+    # operator but the bot never takes action. Only STRATEGY_EDGE_LOSS
+    # is CRITICAL (the silent-killer alarm); the others are forensic
+    # context to surface alongside it. Health alerts are explicitly
+    # INFO-level when Edge is positive (no alarm fatigue on a profitable
+    # strategy with messy execution) and only escalate to WARNING when
+    # actually BROKEN.
+
+    def strategy_edge_loss(
+        self,
+        strategy: str,
+        *,
+        r_expectancy: float | None,
+        trade_count: int,
+        negative_persistence_weeks: int,
+    ) -> bool:
+        """The silent-killer alarm — Edge verdict NEGATIVE + CONCLUSIVE
+        + persistence reached. Per design §13 this MUST surface
+        prominently; operator decides on quarantine."""
+        r_str = (
+            f"{r_expectancy:+.3f}R" if r_expectancy is not None else "n/a"
+        )
+        return self.fire(Alert(
+            alert_type=AlertType.STRATEGY_EDGE_LOSS,
+            severity=AlertSeverity.CRITICAL,
+            message=(
+                f"SILENT KILLER: strategy is losing money on clean "
+                f"execution — recommend pause and investigate "
+                f"(expectancy {r_str}, {trade_count} trades, "
+                f"{negative_persistence_weeks} weeks of negative signals)"
+            ),
+            strategy=strategy,
+            details={
+                "r_expectancy": r_expectancy,
+                "trade_count": trade_count,
+                "negative_persistence_weeks": negative_persistence_weeks,
+            },
+        ))
+
+    def strategy_edge_below_benchmark(
+        self,
+        strategy: str,
+        *,
+        strategy_return: float | None,
+        benchmark_return: float | None,
+        alpha: float | None,
+    ) -> bool:
+        """Strategy is profitable but underperforms its passive benchmark.
+        Recommend reduce_size — strategy is destroying value vs the
+        watchlist it's expressing a view on."""
+        return self.fire(Alert(
+            alert_type=AlertType.STRATEGY_EDGE_BELOW_BENCHMARK,
+            severity=AlertSeverity.WARNING,
+            message=(
+                f"below benchmark: strategy {strategy_return:+.1%} vs "
+                f"benchmark {benchmark_return:+.1%} "
+                f"(alpha {alpha:+.1%}) — recommend reduce size"
+            ),
+            strategy=strategy,
+            details={
+                "strategy_return": strategy_return,
+                "benchmark_return": benchmark_return,
+                "alpha": alpha,
+            },
+        ))
+
+    def strategy_health_degraded(
+        self,
+        strategy: str,
+        *,
+        layer: str,
+        edge_verdict: str,
+        findings: list[str],
+    ) -> bool:
+        """L1/L2/L3 DEGRADED. Severity is INFO when Edge is positive
+        (no alarm fatigue on profitable strategies) and WARNING
+        otherwise. Forensic — never auto-action."""
+        severity = (
+            AlertSeverity.INFO
+            if edge_verdict == "POSITIVE"
+            else AlertSeverity.WARNING
+        )
+        finding_summary = "; ".join(findings[:3]) if findings else "(no detail)"
+        return self.fire(Alert(
+            alert_type=AlertType.STRATEGY_HEALTH_DEGRADED,
+            severity=severity,
+            message=f"health {layer} DEGRADED — {finding_summary}",
+            strategy=strategy,
+            details={"layer": layer, "edge_verdict": edge_verdict},
+        ))
+
+    def strategy_health_broken(
+        self,
+        strategy: str,
+        *,
+        layer: str,
+        edge_verdict: str,
+        findings: list[str],
+    ) -> bool:
+        """L1/L2 BROKEN (L3 cannot be BROKEN per design §3.6).
+
+        **Always WARNING regardless of Edge verdict** — BROKEN is the
+        non-cosmetic operational tier; routing it through INFO when
+        the strategy happens to be profitable would hide a real
+        operational failure (stream disconnect, reconciliation
+        mismatch, etc.) behind a quiet log line.
+
+        PR #20 reviewer caught the original INFO-when-Edge-positive
+        ladder as a footgun. DEGRADED keeps the
+        INFO-when-positive/WARNING-otherwise ladder via
+        `strategy_health_degraded` (those are softer signals where
+        alarm fatigue on profitable strategies is the bigger risk);
+        BROKEN does not.
+
+        Operator should investigate; the bot still does not
+        auto-disable on Health alone (v1 invariant — design §1.2).
+        """
+        finding_summary = "; ".join(findings[:3]) if findings else "(no detail)"
+        return self.fire(Alert(
+            alert_type=AlertType.STRATEGY_HEALTH_BROKEN,
+            severity=AlertSeverity.WARNING,
+            message=f"health {layer} BROKEN — {finding_summary}",
+            strategy=strategy,
+            details={"layer": layer, "edge_verdict": edge_verdict},
+        ))
+
+    def strategy_drift_warning(
+        self,
+        strategy: str,
+        *,
+        check_name: str,
+        observed: float,
+        envelope_band: tuple[float, float],
+    ) -> bool:
+        """L3 drift detected (live behavior diverged from envelope band).
+        Leading indicator of future edge erosion — never auto-action."""
+        return self.fire(Alert(
+            alert_type=AlertType.STRATEGY_DRIFT_WARNING,
+            severity=AlertSeverity.INFO,
+            message=(
+                f"drift in {check_name}: observed {observed:.1%} "
+                f"vs envelope band "
+                f"[{envelope_band[0]:.1%}, {envelope_band[1]:.1%}]"
+            ),
+            strategy=strategy,
+            details={
+                "check": check_name,
+                "observed": observed,
+                "envelope_lo": envelope_band[0],
+                "envelope_hi": envelope_band[1],
             },
         ))
