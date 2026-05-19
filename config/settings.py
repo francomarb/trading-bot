@@ -317,6 +317,24 @@ STRATEGY_MIN_TRADES_FOR_VERDICT: dict[str, int] = {
     "credit_spread": 50,
 }
 
+# Strategy Health monitor (PLAN 11.10f) — feature flag for the
+# engine's lifecycle-counter emissions. Defaults True (ship with
+# observability on) but the operator can flip to False as an instant
+# revert if any unexpected behavior is observed. The flag gates the
+# ENTIRE counter emission/flush path — when disabled, no DB writes
+# happen and the trading loop behavior is bit-identical to pre-11.10f.
+#
+# Per the v1 invariant (design §1.2), counter writes are observability
+# only and wrapped in try/except: a write failure logs a warning and
+# continues; it never raises into the trading loop. The flag is
+# additional belt-and-suspenders defense for instant revert without
+# code changes.
+#
+# Removal target: after 4-8 weeks of clean paper operation, the flag
+# is removed in a follow-up PR. Tracked in the design doc as
+# intentionally temporary scaffolding.
+HEALTH_COUNTERS_ENABLED = True
+
 # Strategy-level high-water-mark drawdown gate (SleeveAllocator).
 # If a strategy's cumulative realized P&L drops more than this fraction
 # below its peak (HWM), new entries for that strategy are paused until

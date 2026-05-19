@@ -259,6 +259,18 @@ class TradingEngine:
         self._last_snapshot: "BrokerSnapshot | None" = None
         self._last_stream_healthy: bool | None = None
 
+        # PLAN 11.10f — Strategy Health lifecycle counter accumulator.
+        # Per-cycle counts are accumulated here in a local dict and
+        # flushed ONCE at end of cycle via lifecycle.upsert_counters
+        # — 1 DB write per (strategy, week-bucket), not 7 per symbol.
+        # Reset at start of every cycle so each cycle's counts are
+        # independent before flush. Gated by settings.HEALTH_COUNTERS_ENABLED
+        # — flag off = empty dict, no upsert, zero engine surface area.
+        # See design §12.4.1 for the contract: observability only,
+        # never affects trading decisions.
+        from strategies.health.lifecycle import LifecycleCounters as _LC  # noqa
+        self._cycle_lifecycle_counters: dict[str, _LC] = {}
+
         # Position ownership: position_id → Position. Tracks which strategy
         # opened each position so that exit signals from a *different*
         # strategy watching the same symbol don't close someone else's trade.
@@ -448,6 +460,12 @@ class TradingEngine:
         new_positions = 0
         error_count = 0
         cycle_status = "ok"
+
+        # PLAN 11.10f: reset the per-cycle lifecycle counter accumulator
+        # at the start of each cycle. Flushed via _flush_lifecycle_counters
+        # at end-of-cycle (in the finally block). Gated by the feature flag
+        # so flag=False keeps the dict empty and the flush no-ops.
+        self._cycle_lifecycle_counters = {}
 
         # Detect sleep gaps — if wall-clock time since the last cycle end is
         # much larger than the configured interval, the machine likely slept.
@@ -697,6 +715,11 @@ class TradingEngine:
                 f"duration={duration:.1f}s, "
                 f"next_cycle_in={self.config.cycle_interval_seconds:.0f}s"
             )
+            # PLAN 11.10f: flush per-cycle lifecycle counters via single
+            # upsert per strategy. Wrapped in try/except: a write
+            # failure logs WARNING and continues — must NEVER raise into
+            # the trading loop (design §12.4.1 hard rule).
+            self._flush_lifecycle_counters()
             self._write_state_snapshot()
             # Close idle HTTP connections so they don't go stale during the
             # inter-cycle sleep (5 min default).  Fresh connections are cheap.
@@ -789,6 +812,16 @@ class TradingEngine:
         raw_entry = bool(raw_signals.entries.iloc[-1])
         last_entry = bool(signals.entries.iloc[-1])
         last_exit = bool(signals.exits.iloc[-1])
+
+        # PLAN 11.10f: lifecycle counter — raw_signals counts every
+        # symbol-level entry candidate produced by inspect_signals
+        # (before any gate). Per design §12.4.1 the counting unit is
+        # "one symbol-level entry candidate per increment" — multi-leg
+        # / options entries that produce one entry candidate count as 1.
+        if raw_entry:
+            _lc = self._lifecycle_counter_for(strategy.name)
+            if _lc is not None:
+                _lc.raw_signals += 1
 
         position = self._get_position_for(symbol, snapshot)
         logger.info(
@@ -914,6 +947,14 @@ class TradingEngine:
                     strategy_statuses[symbol] = "Filter Blocked"
                     if strategy_reasons is not None:
                         strategy_reasons[symbol] = list(edge_reasons)
+            # PLAN 11.10f: lifecycle counter — edge_filter_blocked
+            # increments ONLY when a raw signal existed but the edge
+            # filter cut it. raw_entry=False means no candidate at
+            # all (not a block — just nothing to block).
+            if raw_entry:
+                _lc = self._lifecycle_counter_for(strategy.name)
+                if _lc is not None:
+                    _lc.edge_filter_blocked += 1
             self._mark_signal_bar_processed(
                 signal_key, signal_bar, strategy_statuses, strategy_reasons, symbol
             )
@@ -928,6 +969,14 @@ class TradingEngine:
             logger.debug(
                 f"[{strategy.name}] {symbol}: entry blocked by regime gate"
             )
+            # PLAN 11.10f: lifecycle counter — regime_blocked. We reach
+            # this branch only when last_entry=True (passed edge filter)
+            # but entry_allowed=False (regime rejected). Mutual
+            # exclusivity per design §12.4.1: if edge filter had already
+            # rejected, we'd have returned at the previous branch.
+            _lc = self._lifecycle_counter_for(strategy.name)
+            if _lc is not None:
+                _lc.regime_blocked += 1
             self._mark_signal_bar_processed(
                 signal_key, signal_bar, strategy_statuses, strategy_reasons, symbol
             )
@@ -1002,6 +1051,13 @@ class TradingEngine:
                 self.alerts.order_rejection(
                     symbol, strategy.name, sleeve.message, sleeve.code.value
                 )
+                # PLAN 11.10f: lifecycle counter — sleeve_blocked.
+                # Mutual exclusivity per design §12.4.1: edge filter
+                # and regime have already passed by the time we reach
+                # the sleeve check.
+                _lc = self._lifecycle_counter_for(strategy.name)
+                if _lc is not None:
+                    _lc.sleeve_blocked += 1
                 self._mark_signal_bar_processed(
                     signal_key, signal_bar, strategy_statuses, strategy_reasons, symbol
                 )
@@ -1103,6 +1159,12 @@ class TradingEngine:
             self.alerts.order_rejection(
                 symbol, strategy.name, decision.message, decision.code.value
             )
+            # PLAN 11.10f: lifecycle counter — risk_blocked.
+            # Mutual exclusivity per §12.4.1 — edge/regime/sleeve all
+            # passed.
+            _lc = self._lifecycle_counter_for(strategy.name)
+            if _lc is not None:
+                _lc.risk_blocked += 1
             self._mark_signal_bar_processed(
                 signal_key, signal_bar, strategy_statuses, strategy_reasons, symbol
             )
@@ -1111,6 +1173,13 @@ class TradingEngine:
 
         try:
             result = self.broker.place_order(decision)
+            # PLAN 11.10f: lifecycle counter — submitted increments
+            # once per place_order call (regardless of fill status).
+            # ACCEPTED, FILLED, PARTIAL, UNKNOWN all count as submitted
+            # — the order reached the broker.
+            _lc = self._lifecycle_counter_for(strategy.name)
+            if _lc is not None:
+                _lc.submitted += 1
             if result.status is OrderStatus.UNKNOWN:
                 self._remember_suspect_order(
                     decision, result, modeled_price=latest_close
@@ -1152,6 +1221,14 @@ class TradingEngine:
             )
             self._log_entry(decision, result, latest_close)
             if result.status in {OrderStatus.FILLED, OrderStatus.PARTIAL}:
+                # PLAN 11.10f: lifecycle counter — filled_entries.
+                # Per design §12.4.1: one entry that opened a position
+                # counts as 1, regardless of fill quantity. Partial
+                # fills that successfully opened the intended position
+                # count as 1; full fills also count as 1.
+                _lc = self._lifecycle_counter_for(strategy.name)
+                if _lc is not None:
+                    _lc.filled_entries += 1
                 # target_symbol == symbol for equities; the OCC contract for
                 # synchronous option fills. Register with it so the leg carries
                 # the real traded symbol.
@@ -2038,6 +2115,18 @@ class TradingEngine:
             self._record_fill(result, modeled_price=decision.entry_reference_price, order_type="limit")
             self._log_entry(decision, result, decision.entry_reference_price)
             if result.status in {OrderStatus.FILLED, OrderStatus.PARTIAL}:
+                # PLAN 11.10f: lifecycle counter — filled_entries for
+                # the async options fill path. The submitted++ already
+                # happened in _process_symbol when broker.place_order
+                # returned ACCEPTED; this is the deferred fill confirm.
+                # Counter accumulator is reset each cycle but option
+                # fills land asynchronously across cycles — that's OK,
+                # they just land in whichever cycle's bucket they
+                # arrive in, accumulated into the same weekly row via
+                # upsert ON CONFLICT.
+                _lc = self._lifecycle_counter_for(decision.strategy_name)
+                if _lc is not None:
+                    _lc.filled_entries += 1
                 # Update entry price with actual fill price; find the underlying
                 # symbol that was pre-registered when the worker was dispatched.
                 underlying = owner_key_for(decision.symbol)
@@ -2825,6 +2914,104 @@ class TradingEngine:
         logger.info(msg)
         self.alerts.broker_info(msg)
 
+    # ── PLAN 11.10f: Strategy Health lifecycle counters ───────────
+    # All counter operations are observability-only and gated by
+    # settings.HEALTH_COUNTERS_ENABLED. Per design §12.4.1 hard rule:
+    # counter writes MUST NEVER raise into the trading loop — every
+    # call site here is wrapped in try/except → logger.warning. The
+    # feature flag is the additional belt-and-suspenders revert path.
+
+    def _lifecycle_counter_for(self, strategy_name: str):
+        """Return the LifecycleCounters accumulator for `strategy_name`
+        in the current cycle, lazy-creating on first access. Returns
+        None when the feature flag is off — caller should test for
+        None before incrementing."""
+        if not settings.HEALTH_COUNTERS_ENABLED:
+            return None
+        from strategies.health.lifecycle import LifecycleCounters
+        if strategy_name not in self._cycle_lifecycle_counters:
+            self._cycle_lifecycle_counters[strategy_name] = LifecycleCounters()
+        return self._cycle_lifecycle_counters[strategy_name]
+
+    def _flush_lifecycle_counters(self) -> None:
+        """Flush the per-cycle accumulator to the
+        strategy_lifecycle_counters table via single upsert per
+        strategy. ON CONFLICT DO UPDATE accumulates into the existing
+        weekly row — see strategies/health/lifecycle.upsert_counters.
+
+        Period bucket = ISO Monday → next Monday (consistent week
+        alignment). Wrapped in try/except — counter write failure
+        must NEVER raise into the trading loop (design §12.4.1).
+        Per-cycle flush is one DB write per strategy, NOT 7 per
+        symbol — that's the §12.4.1 batching requirement.
+        """
+        if not settings.HEALTH_COUNTERS_ENABLED:
+            return
+        if not self._cycle_lifecycle_counters:
+            return
+        try:
+            from datetime import timedelta as _td
+            from strategies.health.lifecycle import upsert_counters
+            # Use the engine's injected clock so tests can pin the
+            # date deterministically; production passes the default
+            # `datetime.now(UTC)` lambda which gives wall-clock time.
+            today = self._clock().date()
+            # ISO Monday of the week containing `today` (weekday() returns 0 for Mon).
+            week_start = today - _td(days=today.weekday())
+            week_end = week_start + _td(days=7)
+            conn = self.trade_logger._ensure_db()
+            for strategy_name, counters in self._cycle_lifecycle_counters.items():
+                upsert_counters(
+                    conn,
+                    period_type="weekly",
+                    period_start=week_start,
+                    period_end=week_end,
+                    strategy_name=strategy_name,
+                    counters=counters,
+                )
+        except Exception as exc:
+            # Observability only — never let counter I/O affect trading.
+            logger.warning(
+                f"lifecycle counter flush failed (observability only, "
+                f"trading not affected): {exc}"
+            )
+
+    def _risk_controls_snapshot(self, equity: float) -> dict:
+        """Read-only snapshot of existing risk-control state for the
+        HealthAssessor L1 layer (PLAN 11.10f).
+
+        Calls the new accessors on RiskManager + SleeveAllocator
+        (added in this PR). Fail-safe: every field defaults to empty/
+        None if the underlying object doesn't expose the accessor —
+        keeps the snapshot writeable even with custom risk/allocator
+        subclasses that don't yet implement these methods.
+        """
+        out: dict = {
+            "is_halted": False,
+            "halt_reason": None,
+            "cooldown_state": {},
+            "sleeve_dd_state": {},
+        }
+        try:
+            out["is_halted"] = bool(self.risk.is_halted())
+            out["halt_reason"] = self.risk.halt_reason()
+        except Exception as exc:  # noqa: BLE001
+            logger.debug(f"risk halt accessor failed: {exc}")
+        try:
+            if hasattr(self.risk, "cooldown_snapshot"):
+                out["cooldown_state"] = self.risk.cooldown_snapshot()
+        except Exception as exc:  # noqa: BLE001
+            logger.debug(f"cooldown_snapshot failed: {exc}")
+        try:
+            if (
+                self._allocator is not None
+                and hasattr(self._allocator, "drawdown_snapshot")
+            ):
+                out["sleeve_dd_state"] = self._allocator.drawdown_snapshot(equity)
+        except Exception as exc:  # noqa: BLE001
+            logger.debug(f"drawdown_snapshot failed: {exc}")
+        return out
+
     def _write_state_snapshot(self) -> None:
         """
         Write a JSON snapshot of engine state to STATE_SNAPSHOT_PATH.
@@ -2950,6 +3137,13 @@ class TradingEngine:
                 "sector_heat": self._sector_heat,
                 "sector_exposure": sector_exposure,
                 "live_trading": settings.LIVE_TRADING,
+                # PLAN 11.10f: surface existing risk-control state for
+                # HealthAssessor L1 checks. ALL FIELDS ARE READ-ONLY
+                # SNAPSHOTS of state that already exists — no behavior
+                # change to RiskManager or SleeveAllocator. The fields
+                # consumed by HealthAssessor are documented in
+                # strategies/health/assessor.py:_l1_checks.
+                "risk_controls": self._risk_controls_snapshot(equity),
             }
             parent = os.path.dirname(path)
             if parent:

@@ -333,6 +333,33 @@ class RiskManager:
         self._halted = False
         self._halt_reason = None
 
+    def cooldown_snapshot(
+        self, *, now: datetime | None = None,
+    ) -> dict[str, dict]:
+        """Read-only per-strategy cooldown state.
+
+        Surfaces the loss-streak cooldown state for the engine state
+        snapshot. Consumed by HealthAssessor L1 checks (PLAN 11.10d/f)
+        to surface "strategy currently in cooldown" as a WATCH finding.
+        Pure read; no mutation.
+
+        Returns: `{strategy_name: {"active": bool, "until": ISO str
+        or None, "loss_streak": int}}` for every strategy that has a
+        loss_streak entry. Strategies with no recorded losses are
+        omitted.
+        """
+        now = now or datetime.now(timezone.utc)
+        out: dict[str, dict] = {}
+        for strategy_name, streak in self._loss_streak.items():
+            until = self._disabled_until.get(strategy_name)
+            active = until is not None and now < until
+            out[strategy_name] = {
+                "active": active,
+                "until": until.isoformat() if until else None,
+                "loss_streak": streak,
+            }
+        return out
+
     # ── External event recorders ─────────────────────────────────────────
 
     def record_trade_result(
