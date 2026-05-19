@@ -301,6 +301,32 @@ class SleeveAllocator:
         hwm = self._strategy_pnl_hwm[strategy_name]
         return (hwm - running) > (self._dd_threshold * target_budget)
 
+    def drawdown_snapshot(self, equity: float) -> dict[str, dict]:
+        """Read-only per-strategy HWM-drawdown state.
+
+        Surfaces the sleeve drawdown gate state for the engine state
+        snapshot. Consumed by HealthAssessor L1 checks (PLAN 11.10d/f)
+        to surface "strategy in sleeve drawdown" as a WATCH finding.
+        Pure read; no mutation.
+
+        Returns: `{strategy_name: {"in_drawdown": bool, "running_pnl":
+        float, "hwm_pnl": float, "drawdown_dollars": float}}` for
+        every registered strategy.
+        """
+        out: dict[str, dict] = {}
+        for strategy_name in self._entries:
+            running = self._strategy_realized_pnl.get(strategy_name, 0.0)
+            hwm = self._strategy_pnl_hwm.get(strategy_name, 0.0)
+            out[strategy_name] = {
+                "in_drawdown": self.is_strategy_in_drawdown(
+                    strategy_name, equity,
+                ),
+                "running_pnl": running,
+                "hwm_pnl": hwm,
+                "drawdown_dollars": max(hwm - running, 0.0),
+            }
+        return out
+
     def check(
         self,
         strategy_name: str,
