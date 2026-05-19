@@ -1779,10 +1779,19 @@ class TradingEngine:
                     self.alerts.broker_error(msg)
                     continue
 
+            stop_qty = abs(int(position.qty))
+            if stop_qty < 1:
+                logger.info(
+                    f"{symbol}: position qty={position.qty} has no whole-share "
+                    "stop quantity; fractional remainder will rely on strategy "
+                    "exits until reduced or closed"
+                )
+                continue
+
             try:
                 repaired = self.broker.place_protective_stop(
                     symbol=symbol,
-                    qty=abs(int(position.qty)),
+                    qty=stop_qty,
                     stop_price=stop_price,
                     client_order_id_prefix=f"{owner}-repair-stop",
                 )

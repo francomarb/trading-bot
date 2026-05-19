@@ -2000,6 +2000,38 @@ class TestOptionsEngineFixes:
             strategy="fake_strategy",
         ) == 95.0
 
+    def test_stop_repair_skips_fractional_residual_without_whole_share_qty(self, tmp_path):
+        """Managed sub-1-share remainders should not submit invalid zero-qty stop repairs."""
+        engine = self._engine(tmp_path)
+        engine._register_single_leg(strategy_name="fake_strategy", symbol="AAPL")
+        engine.trade_logger = TradeLogger(path=str(tmp_path / "trades.db"))
+        engine.trade_logger.log(engine.trade_logger.build_record(
+            decision=SimpleNamespace(
+                symbol="AAPL",
+                side=Side.BUY,
+                qty=10,
+                entry_reference_price=100.0,
+                stop_price=95.0,
+                strategy_name="fake_strategy",
+                reason="test",
+                order_type=OrderType.MARKET,
+            ),
+            result=_filled_result("AAPL", 10, 100.5),
+            modeled_price=100.0,
+        ))
+        engine.broker.place_protective_stop = MagicMock()
+        engine.alerts.broker_error = MagicMock()
+
+        snap = _snapshot(
+            positions={"AAPL": Position("AAPL", 0.39, 100.0, 39.0)},
+            open_orders=[],
+        )
+
+        engine._repair_missing_protective_stops(snap)
+
+        engine.broker.place_protective_stop.assert_not_called()
+        engine.alerts.broker_error.assert_not_called()
+
     def test_drain_option_rejected_clears_pre_registered_underlying_ownership(self, tmp_path):
         """Rejected option entries must clean up pre-registered underlying ownership immediately."""
         engine = self._engine(tmp_path)
