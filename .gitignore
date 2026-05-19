@@ -26,3 +26,12 @@ docs/research/
 data/rsi_static_fundamentals_cache.json
 data/*_cache.json
 data/cache/
+# PLAN 11.10 — Strategy Health & Edge Monitor artifacts
+# Envelopes are operator-generated via scripts/build_envelopes.py;
+# verdict-persistence state is rewritten each weekly run; reports
+# are generated weekly/monthly. None of these are committed.
+data/envelopes/
+data/envelopes/*.tmp
+data/health_state.json
+data/health_state.json.tmp
+data/health_reports/
