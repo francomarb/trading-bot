@@ -731,3 +731,261 @@ class TestRunReviewEndToEnd:
         )
         assert len(bundles) == 1
         assert bundles[0].strategy == "x"
+
+
+# ── PR #20 reviewer regressions ────────────────────────────────────────
+
+
+class TestDryRunIsSideEffectFree:
+    """PR #20 reviewer caught that dry-run still saved persistence
+    state. An operator running repeated previews could silently advance
+    the silent-killer counter outside the scheduled weekly cadence."""
+
+    def _seed_negative_trades_in_window(self, conn):
+        """Enough trades so projected verdict would advance the
+        persistence counter if we let it. EdgeAssessor handles signal
+        evaluation; we just need realistic data."""
+        for i in range(120):
+            day = 18 + (i % 7)
+            conn.execute(
+                "INSERT INTO trades ("
+                "timestamp, symbol, side, qty, avg_fill_price, order_id, "
+                "strategy, reason, stop_price, entry_reference_price, "
+                "modeled_slippage_bps, realized_slippage_bps, "
+                "order_type, status, requested_qty, filled_qty, "
+                "realized_pnl, r_multiple"
+                ") VALUES (?, 'X', 'sell', 1.0, 100.0, 'oid', 'x', 'exit', "
+                "95.0, 100.0, 5.0, 5.0, 'market', 'filled', 1.0, 1.0, ?, ?)",
+                (
+                    f"2026-05-{day:02d}T{i % 24:02d}:{i % 60:02d}:00",
+                    -200.0, -2.0,
+                ),
+            )
+        conn.commit()
+
+    def test_dry_run_does_not_write_state_file(
+        self, db_conn, tmp_path: Path, monkeypatch,
+    ):
+        """The exact reviewer scenario: dry-run preview must not
+        modify data/health_state.json."""
+        monkeypatch.setattr(
+            settings, "STRATEGY_MIN_TRADES_FOR_VERDICT", {"x": 50},
+        )
+        # Provide an envelope so the verdict logic actually evaluates
+        import strategies.health.reviewer as rev_module
+        env = StrategyEnvelope(
+            schema_version=ENVELOPE_SCHEMA_VERSION,
+            strategy="x",
+            built_at="2026-01-01T00:00:00+00:00",
+            backtest_window_start="2024-01-01",
+            backtest_window_end="2026-01-01",
+            r_expectancy=0.4,
+            r_expectancy_ci_95=(0.20, 0.70),
+            risk_unit_dollars=5000.0,
+        )
+        monkeypatch.setattr(rev_module, "_load_envelope_for", lambda s: env)
+        self._seed_negative_trades_in_window(db_conn)
+
+        state_path = tmp_path / "health_state.json"
+        window = ReviewWindow(
+            period_start=date(2026, 5, 18),
+            period_end=date(2026, 5, 25),
+            period_type="weekly",
+        )
+        # Dry-run preview
+        run_review(
+            window,
+            conn=db_conn,
+            output_dir=tmp_path / "reports",
+            state_path=state_path,
+            dry_run=True,
+        )
+        # State file MUST NOT have been created.
+        assert not state_path.exists()
+
+    def test_repeated_dry_runs_do_not_advance_persistence(
+        self, db_conn, tmp_path: Path, monkeypatch,
+    ):
+        """An operator could realistically preview many times in a
+        row. Persistence count must remain wherever the real scheduled
+        run left it."""
+        monkeypatch.setattr(
+            settings, "STRATEGY_MIN_TRADES_FOR_VERDICT", {"x": 50},
+        )
+        import strategies.health.reviewer as rev_module
+        env = StrategyEnvelope(
+            schema_version=ENVELOPE_SCHEMA_VERSION,
+            strategy="x",
+            built_at="2026-01-01T00:00:00+00:00",
+            backtest_window_start="2024-01-01",
+            backtest_window_end="2026-01-01",
+            r_expectancy=0.4,
+            r_expectancy_ci_95=(0.20, 0.70),
+            risk_unit_dollars=5000.0,
+        )
+        monkeypatch.setattr(rev_module, "_load_envelope_for", lambda s: env)
+        self._seed_negative_trades_in_window(db_conn)
+
+        # Seed pre-existing state at negative_weeks=1 (as if a real
+        # scheduled run last week left it there).
+        state_path = tmp_path / "health_state.json"
+        initial = HealthStateFile().with_updated(
+            "x",
+            PersistenceState(
+                negative_weeks=1,
+                last_check="2026-05-18",
+                last_verdict="NEGATIVE",
+            ),
+        )
+        state_path.write_text(initial.to_json())
+
+        window = ReviewWindow(
+            period_start=date(2026, 5, 18),
+            period_end=date(2026, 5, 25),
+            period_type="weekly",
+        )
+        # Run the dry-run preview 5 times in a row.
+        for _ in range(5):
+            run_review(
+                window,
+                conn=db_conn,
+                output_dir=tmp_path / "reports",
+                state_path=state_path,
+                dry_run=True,
+            )
+        # State file content unchanged — still negative_weeks=1.
+        data = json.loads(state_path.read_text())
+        assert data["x"]["negative_weeks"] == 1
+
+    def test_dry_run_verdict_still_reflects_projected_state(
+        self, db_conn, tmp_path: Path, monkeypatch,
+    ):
+        """Dry-run must still PROJECT the state (load + thread through
+        assessment) so verdicts are accurate — it just doesn't WRITE
+        the projection back."""
+        monkeypatch.setattr(
+            settings, "STRATEGY_MIN_TRADES_FOR_VERDICT", {"x": 50},
+        )
+        import strategies.health.reviewer as rev_module
+        env = StrategyEnvelope(
+            schema_version=ENVELOPE_SCHEMA_VERSION,
+            strategy="x",
+            built_at="2026-01-01T00:00:00+00:00",
+            backtest_window_start="2024-01-01",
+            backtest_window_end="2026-01-01",
+            r_expectancy=0.4,
+            r_expectancy_ci_95=(0.20, 0.70),
+            risk_unit_dollars=5000.0,
+        )
+        monkeypatch.setattr(rev_module, "_load_envelope_for", lambda s: env)
+        self._seed_negative_trades_in_window(db_conn)
+
+        state_path = tmp_path / "health_state.json"
+        # Pre-existing state: negative_weeks=2 (one more week to fire)
+        initial = HealthStateFile().with_updated(
+            "x",
+            PersistenceState(
+                negative_weeks=2,
+                last_check="2026-05-18",
+                last_verdict="NEGATIVE",
+            ),
+        )
+        state_path.write_text(initial.to_json())
+
+        window = ReviewWindow(
+            period_start=date(2026, 5, 18),
+            period_end=date(2026, 5, 25),
+            period_type="weekly",
+        )
+        _, bundles = run_review(
+            window,
+            conn=db_conn,
+            output_dir=tmp_path / "reports",
+            state_path=state_path,
+            dry_run=True,
+        )
+        # The preview correctly reflects what WOULD happen — the
+        # alarm fires (projected negative_weeks=3) — but state is NOT
+        # persisted, so the next scheduled run would still see
+        # negative_weeks=2 on read.
+        assert bundles[0].edge.verdict == EdgeVerdict.NEGATIVE
+        assert bundles[0].edge.negative_persistence_weeks == 3
+        # State file unchanged
+        data = json.loads(state_path.read_text())
+        assert data["x"]["negative_weeks"] == 2
+
+
+class TestStrategyHealthBrokenAlwaysWarning:
+    """PR #20 reviewer caught that strategy_health_broken downgraded
+    to INFO when Edge was POSITIVE. BROKEN is the non-cosmetic
+    operational tier; routing it through INFO when the strategy
+    happens to be profitable hides real failures (stream disconnect,
+    reconciliation mismatch). DEGRADED keeps the INFO-vs-WARNING
+    ladder; BROKEN does not."""
+
+    def test_broken_with_positive_edge_is_warning(self):
+        """Operational BROKEN should not be silenced just because the
+        strategy is profitable."""
+        d = AlertDispatcher()  # real dispatcher, not mock
+        # Capture the Alert that gets fired by overriding _backends
+        captured: list = []
+        captured_dispatcher = AlertDispatcher(
+            backends=[
+                type("CapBackend", (), {
+                    "send": lambda self, alert: captured.append(alert),
+                })(),
+            ],
+        )
+        captured_dispatcher.strategy_health_broken(
+            "x", layer="L1",
+            edge_verdict="POSITIVE",
+            findings=["stream disconnected 4 times today"],
+        )
+        assert len(captured) == 1
+        assert captured[0].severity == AlertSeverity.WARNING
+
+    def test_broken_with_negative_edge_is_warning(self):
+        """Sanity: BROKEN with non-positive Edge still WARNING (was
+        already correct pre-fix)."""
+        captured: list = []
+        d = AlertDispatcher(
+            backends=[
+                type("CapBackend", (), {
+                    "send": lambda self, alert: captured.append(alert),
+                })(),
+            ],
+        )
+        d.strategy_health_broken(
+            "x", layer="L2",
+            edge_verdict="NEGATIVE",
+            findings=["order rejection rate 15%"],
+        )
+        assert len(captured) == 1
+        assert captured[0].severity == AlertSeverity.WARNING
+
+    def test_degraded_keeps_severity_ladder(self):
+        """DEGRADED is softer — keep the ladder. Edge POSITIVE →
+        INFO; non-positive → WARNING. The asymmetry is intentional:
+        DEGRADED on a profitable strategy is more often alarm-fatigue
+        spam than a real fire; BROKEN is the actual fire."""
+        captured: list = []
+        d = AlertDispatcher(
+            backends=[
+                type("CapBackend", (), {
+                    "send": lambda self, alert: captured.append(alert),
+                })(),
+            ],
+        )
+        d.strategy_health_degraded(
+            "x", layer="L2",
+            edge_verdict="POSITIVE",
+            findings=["slippage 27 bps"],
+        )
+        d.strategy_health_degraded(
+            "y", layer="L2",
+            edge_verdict="NEGATIVE",
+            findings=["slippage 27 bps"],
+        )
+        assert len(captured) == 2
+        assert captured[0].severity == AlertSeverity.INFO  # positive Edge
+        assert captured[1].severity == AlertSeverity.WARNING  # non-positive

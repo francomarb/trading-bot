@@ -656,6 +656,7 @@ def assess_all_strategies(
     state_path: str | Path | None = None,
     engine_state_path: str | Path | None = None,
     strategies: Sequence[str] | None = None,
+    persist_state: bool = True,
 ) -> list[AssessmentBundle]:
     """Run the full assessment pipeline for all (or a filtered set of)
     strategies for the given window.
@@ -667,6 +668,16 @@ def assess_all_strategies(
 
     Benchmark returns are computed per benchmark-symbol-set so two
     strategies sharing a watchlist share a benchmark fetch.
+
+    **`persist_state=False` makes the call side-effect free** — the
+    state is loaded and threaded through assessment (so verdicts
+    reflect the correct projected counts), but the updated state is
+    NOT written back to disk. Used by dry-run preview to ensure
+    repeated operator-driven previews don't advance the silent-killer
+    persistence counter outside the real scheduled cadence.
+    PR #20 reviewer caught the original always-persist behavior as a
+    safety issue: a "safe preview" advancing `negative_weeks` could
+    trip the 3-week alarm prematurely.
     """
     state_file = load_state(state_path)
     engine_state = load_engine_state(engine_state_path)
@@ -726,8 +737,10 @@ def assess_all_strategies(
         bundles.append(bundle)
         state_file = state_file.with_updated(strategy_name, new_state)
 
-    # Save the threaded state ONCE at the end (atomic).
-    save_state(state_file, state_path)
+    # Save the threaded state ONCE at the end (atomic) — unless
+    # persist_state=False (dry-run preview). See docstring.
+    if persist_state:
+        save_state(state_file, state_path)
 
     return bundles
 
@@ -746,8 +759,13 @@ def run_review(
     """End-to-end: assess all strategies, render markdown, dispatch
     alerts. Returns (report_path, bundles).
 
-    Dry-run mode skips alert dispatch and report write — useful for
-    operator on-demand previews via the CLI.
+    Dry-run mode is **fully side-effect free**: skips alert dispatch,
+    skips report file write, AND skips persistence-state save. The
+    assessment still loads the existing persistence state and threads
+    it through so verdict projections are accurate, but the updated
+    state is not written back. This means an operator can run
+    dry-run previews repeatedly without inadvertently advancing the
+    silent-killer counter outside the scheduled weekly cadence.
     """
     bundles = assess_all_strategies(
         window,
@@ -755,6 +773,7 @@ def run_review(
         state_path=state_path,
         engine_state_path=engine_state_path,
         strategies=strategies,
+        persist_state=not dry_run,
     )
 
     markdown = render_markdown(bundles, window)

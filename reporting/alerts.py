@@ -597,18 +597,27 @@ class AlertDispatcher:
         findings: list[str],
     ) -> bool:
         """L1/L2 BROKEN (L3 cannot be BROKEN per design §3.6).
-        Severity escalates from INFO (Edge positive) to WARNING
-        (Edge non-positive). Operator should investigate but the
-        bot does not auto-disable on Health alone."""
-        severity = (
-            AlertSeverity.INFO
-            if edge_verdict == "POSITIVE"
-            else AlertSeverity.WARNING
-        )
+
+        **Always WARNING regardless of Edge verdict** — BROKEN is the
+        non-cosmetic operational tier; routing it through INFO when
+        the strategy happens to be profitable would hide a real
+        operational failure (stream disconnect, reconciliation
+        mismatch, etc.) behind a quiet log line.
+
+        PR #20 reviewer caught the original INFO-when-Edge-positive
+        ladder as a footgun. DEGRADED keeps the
+        INFO-when-positive/WARNING-otherwise ladder via
+        `strategy_health_degraded` (those are softer signals where
+        alarm fatigue on profitable strategies is the bigger risk);
+        BROKEN does not.
+
+        Operator should investigate; the bot still does not
+        auto-disable on Health alone (v1 invariant — design §1.2).
+        """
         finding_summary = "; ".join(findings[:3]) if findings else "(no detail)"
         return self.fire(Alert(
             alert_type=AlertType.STRATEGY_HEALTH_BROKEN,
-            severity=severity,
+            severity=AlertSeverity.WARNING,
             message=f"health {layer} BROKEN — {finding_summary}",
             strategy=strategy,
             details={"layer": layer, "edge_verdict": edge_verdict},
