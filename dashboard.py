@@ -593,6 +593,137 @@ def _sector_class_badge(classification: str | None) -> str:
     return labels.get((classification or "").lower(), "⚪ UNKNOWN")
 
 
+# ── Strategy Health & Edge panel (PLAN 11.10g) ──────────────────────────
+
+
+def _render_health_and_edge_panel() -> None:
+    """Render the Strategy Health & Edge Monitor section.
+
+    Operates on three data sources, all of which may legitimately be
+    missing on a fresh install (gracefully degrades to an empty-state
+    info message):
+      1. The latest weekly report markdown in data/health_reports/
+      2. The lifecycle_counters SQLite table (post-11.10f)
+      3. data/health_state.json — the 3-week persistence file
+
+    Per design §13: the silent-killer alarm gets a prominent banner
+    when any strategy has `negative_persistence_weeks >= 3` in the
+    state file. The full report content is rendered in an expander
+    below so the operator can drill in without scroll-burying the
+    summary.
+    """
+    render_section_header(
+        "Strategy Health & Edge",
+        "Latest weekly Edge + Health assessment per strategy.",
+        kicker="Health Monitor",
+    )
+
+    health_state = _load_health_state()
+    latest_report = _find_latest_weekly_report()
+
+    # ── Silent-killer banner ────────────────────────────────────────
+    killers = [
+        (strategy_name, state)
+        for strategy_name, state in (health_state or {}).items()
+        if isinstance(state, dict)
+        and state.get("negative_weeks", 0) >= 3
+    ]
+    if killers:
+        st.error(
+            "🚨 **SILENT-KILLER ALARM** — the following strategies have "
+            "clean execution but are losing money. Per design §13, this "
+            "is the case the monitor exists to catch loudly. **Operator "
+            "action: pause and investigate.**"
+        )
+        for strategy_name, state in killers:
+            st.markdown(
+                f"- **{strategy_name}** — {state.get('negative_weeks', '?')} "
+                f"consecutive weeks of negative signals "
+                f"(last check {state.get('last_check', '?')})"
+            )
+
+    # ── Per-strategy persistence summary ────────────────────────────
+    if health_state:
+        rows = []
+        for strategy_name, state in sorted(health_state.items()):
+            if not isinstance(state, dict):
+                continue  # skip schema_version etc.
+            rows.append({
+                "Strategy": strategy_name,
+                "Last Verdict": state.get("last_verdict", "—"),
+                "Negative-signal Weeks": state.get("negative_weeks", 0),
+                "Last Check": state.get("last_check", "—"),
+            })
+        if rows:
+            persistence_df = pd.DataFrame(rows)
+            st.dataframe(
+                persistence_df,
+                width="stretch",
+                hide_index=True,
+                column_config={
+                    "Negative-signal Weeks": st.column_config.NumberColumn(
+                        format="%d",
+                        help=(
+                            "Consecutive weeks where Edge signals tripped + "
+                            "sample was CONCLUSIVE. Alarm fires at 3 "
+                            "(design §9)."
+                        ),
+                    ),
+                },
+            )
+
+    # ── Latest report (expander) ────────────────────────────────────
+    if latest_report is not None:
+        with st.expander(
+            f"📄 Latest weekly report — `{latest_report.name}`",
+            expanded=False,
+        ):
+            try:
+                st.markdown(latest_report.read_text())
+            except Exception as exc:  # noqa: BLE001
+                st.warning(f"could not read report: {exc}")
+    else:
+        if not health_state:
+            st.info(
+                "No weekly health reports yet. The first report will "
+                "land after the next Monday cycle (or run "
+                "`python scripts/strategy_health_review.py --window "
+                "weekly` on demand)."
+            )
+
+
+def _load_health_state() -> dict | None:
+    """Read data/health_state.json or return None if missing/malformed.
+    Streamlit refresh tolerates missing — never crashes."""
+    path = (
+        Path(__file__).resolve().parent / "data" / "health_state.json"
+    )
+    if not path.exists():
+        return None
+    try:
+        with path.open() as fh:
+            data = json.load(fh)
+        # Drop the schema_version key so iteration only sees strategies.
+        return {k: v for k, v in data.items() if k != "schema_version"}
+    except (json.JSONDecodeError, OSError):
+        return None
+
+
+def _find_latest_weekly_report() -> Path | None:
+    """Return the most recently modified weekly_*.md, or None if absent."""
+    reports_dir = (
+        Path(__file__).resolve().parent / "data" / "health_reports"
+    )
+    if not reports_dir.exists():
+        return None
+    candidates = sorted(
+        reports_dir.glob("weekly_*.md"),
+        key=lambda p: p.stat().st_mtime,
+        reverse=True,
+    )
+    return candidates[0] if candidates else None
+
+
 def render_dashboard() -> None:
     st.set_page_config(
         page_title="Trading Bot Dashboard",
@@ -846,6 +977,11 @@ def render_dashboard() -> None:
                 "Avg Slippage Bps": st.column_config.NumberColumn(format="%.1f bps"),
             },
         )
+
+    st.divider()
+
+    # ── Strategy Health & Edge Monitor (PLAN 11.10g) ─────────────────────
+    _render_health_and_edge_panel()
 
     st.divider()
 
