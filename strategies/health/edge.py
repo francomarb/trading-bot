@@ -469,9 +469,22 @@ class EdgeAssessor:
                 trades.r_multiples, r_expectancy_ci, inputs.envelope,
             )
         )
-        projected_neg_weeks = (
-            inputs.persistence_state.negative_weeks + 1
-            if signals_tripped else 0
+
+        # Two-step apply_verdict so the verdict gate uses the post-update
+        # negative_weeks count, respecting apply_verdict's same-day
+        # idempotency. PR #19 reviewer caught the bug: incrementing
+        # directly from state.negative_weeks bypasses idempotency — if a
+        # week-2 NEGATIVE assessment has already been saved and the
+        # operator reruns the same period, projecting state.negative_weeks
+        # + 1 = 3 would fire the alarm prematurely even though
+        # apply_verdict's idempotency leaves state at 2.
+        #
+        # Step 1: provisional update with the eligibility flag. apply_verdict
+        # returns the same state when (last_check, last_verdict) match the
+        # current input, so a same-day rerun doesn't double-count.
+        eligibility_flag = "NEGATIVE" if signals_tripped else "_NOT_NEGATIVE"
+        projected_state = inputs.persistence_state.apply_verdict(
+            eligibility_flag, inputs.period_end,
         )
 
         decision = _compute_verdict(
@@ -482,19 +495,19 @@ class EdgeAssessor:
             sufficiency=sufficiency,
             benchmark_return=inputs.benchmark_return,
             strategy_return=strategy_return,
-            persistence_negative_weeks_after_update=projected_neg_weeks,
+            persistence_negative_weeks_after_update=projected_state.negative_weeks,
         )
 
-        # Apply to PersistenceState: "NEGATIVE" if signals tripped this
-        # week (the eligibility flag), else the final verdict (which
-        # will reset the counter). This keeps the state machine's
-        # `last_verdict` legible — "NEGATIVE" means "this week was
-        # signal-eligible for the alarm," not necessarily "alarm fired."
-        persistence_input = (
+        # Step 2: finalize PersistenceState with the actual verdict so
+        # last_verdict is operator-readable as the EdgeReport verdict
+        # (not the internal eligibility placeholder). apply_verdict
+        # treats anything != "NEGATIVE" as a counter reset and is
+        # idempotent on (date, verdict) — same-day reruns harmless.
+        final_input = (
             "NEGATIVE" if signals_tripped else decision.verdict.value
         )
         new_state = inputs.persistence_state.apply_verdict(
-            persistence_input, inputs.period_end,
+            final_input, inputs.period_end,
         )
 
         # Sleeve utilization (approximate; design §5.4).

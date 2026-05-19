@@ -558,3 +558,132 @@ class TestPersistenceThreading:
             else:
                 assert report.verdict == EdgeVerdict.NEGATIVE
                 assert state.negative_weeks == NEGATIVE_PERSISTENCE_WEEKS_REQUIRED
+
+
+# ── PR #19 reviewer regression: same-day rerun idempotency ────────────
+
+
+class TestSameDayRerunDoesNotTripEarly:
+    """The persistence projection used `state.negative_weeks + 1`
+    directly, bypassing apply_verdict's same-day-same-verdict
+    idempotency. If a week-2 NEGATIVE assessment had already been
+    saved (state: negative_weeks=2, last_check=period_end), an
+    operator re-running the same period would project 3 and fire
+    the alarm prematurely even though apply_verdict would correctly
+    leave state at 2.
+
+    The fix uses a two-step apply_verdict: provisional update with
+    the eligibility flag (so idempotency holds), then verdict
+    computation reads new_state.negative_weeks, then final apply
+    with the verdict for last_verdict accuracy."""
+
+    def _seed_overwhelming_negative_in_window(self, conn, *, n: int = 120):
+        for i in range(n):
+            day = 18 + (i % 7)
+            _seed_closed_trade(
+                conn, strategy="x",
+                timestamp=f"2026-05-{day:02d}T{i % 24:02d}:{i % 60:02d}:00",
+                realized_pnl=-200.0, r_multiple=-2.0,
+            )
+
+    def test_same_day_rerun_does_not_increment_persistence(self, db_conn):
+        """First run on 2026-05-25 with state.negative_weeks=2 saves
+        as negative_weeks=3 with last_check=2026-05-25 — alarm fires.
+        Second run on the SAME day must NOT push to negative_weeks=4
+        (idempotency)."""
+        self._seed_overwhelming_negative_in_window(db_conn)
+        env = _make_envelope(r_ci=(0.20, 0.70))
+        prev_state = PersistenceState(
+            negative_weeks=2, last_check="2026-05-18", last_verdict="NEGATIVE",
+        )
+        # First run: week 3, NEGATIVE fires
+        report1, state1 = EdgeAssessor().assess(EdgeInputs(
+            strategy_name="x",
+            period_start=date(2026, 5, 18),
+            period_end=date(2026, 5, 25),
+            envelope=env,
+            conn=db_conn,
+            persistence_state=prev_state,
+            min_trades_floor=50,
+        ))
+        assert report1.verdict == EdgeVerdict.NEGATIVE
+        assert state1.negative_weeks == 3
+        # Second run: same period, state already saved at 3.
+        report2, state2 = EdgeAssessor().assess(EdgeInputs(
+            strategy_name="x",
+            period_start=date(2026, 5, 18),
+            period_end=date(2026, 5, 25),
+            envelope=env,
+            conn=db_conn,
+            persistence_state=state1,  # the saved post-run state
+            min_trades_floor=50,
+        ))
+        # Verdict stays NEGATIVE (alarm already firing); state stays
+        # at 3, NOT incremented to 4.
+        assert report2.verdict == EdgeVerdict.NEGATIVE
+        assert state2.negative_weeks == 3
+
+    def test_same_day_rerun_at_week_2_does_not_trip_early(self, db_conn):
+        """The exact scenario the reviewer flagged: week-2 state saved,
+        operator reruns the SAME period — must NOT project negative_weeks
+        + 1 = 3 and fire the alarm. Pre-fix this bug fired NEGATIVE on
+        the rerun even though apply_verdict's idempotency would have
+        kept state at 2."""
+        self._seed_overwhelming_negative_in_window(db_conn)
+        env = _make_envelope(r_ci=(0.20, 0.70))
+        # State as if the week-2 assessment was already saved (last
+        # week's run completed and persisted as NEGATIVE-eligible).
+        saved_state = PersistenceState(
+            negative_weeks=2,
+            last_check="2026-05-25",  # this is the END of the week-2 period
+            last_verdict="NEGATIVE",
+        )
+        # Operator re-runs the SAME period (period_end=2026-05-25).
+        report, state = EdgeAssessor().assess(EdgeInputs(
+            strategy_name="x",
+            period_start=date(2026, 5, 18),
+            period_end=date(2026, 5, 25),
+            envelope=env,
+            conn=db_conn,
+            persistence_state=saved_state,
+            min_trades_floor=50,
+        ))
+        # Critical assertion: verdict must NOT be NEGATIVE; state must
+        # stay at 2. The alarm fires only at week 3 (the NEXT week's
+        # run with period_end=2026-06-01).
+        assert report.verdict != EdgeVerdict.NEGATIVE
+        assert state.negative_weeks == 2
+
+    def test_next_week_rerun_correctly_increments_to_3(self, db_conn):
+        """Sanity: the NEXT week (period_end=2026-06-01) DOES
+        increment to 3 and fire the alarm. Demonstrates the
+        idempotency fix didn't break the normal flow."""
+        # Seed both week-2 AND week-3 data so each period read is
+        # CONCLUSIVE on its own.
+        for week_start in [date(2026, 5, 18), date(2026, 5, 25)]:
+            for i in range(120):
+                day_offset = i % 7
+                day = (week_start.toordinal() + day_offset)
+                ts_date = date.fromordinal(day).isoformat()
+                _seed_closed_trade(
+                    db_conn, strategy="x",
+                    timestamp=f"{ts_date}T{i % 24:02d}:{i % 60:02d}:00",
+                    realized_pnl=-200.0, r_multiple=-2.0,
+                )
+        env = _make_envelope(r_ci=(0.20, 0.70))
+        saved_state = PersistenceState(
+            negative_weeks=2, last_check="2026-05-25", last_verdict="NEGATIVE",
+        )
+        # NEW period: period_end=2026-06-01
+        report, state = EdgeAssessor().assess(EdgeInputs(
+            strategy_name="x",
+            period_start=date(2026, 5, 25),
+            period_end=date(2026, 6, 1),
+            envelope=env,
+            conn=db_conn,
+            persistence_state=saved_state,
+            min_trades_floor=50,
+        ))
+        # Different date → not idempotent → counter increments → alarm fires
+        assert report.verdict == EdgeVerdict.NEGATIVE
+        assert state.negative_weeks == 3

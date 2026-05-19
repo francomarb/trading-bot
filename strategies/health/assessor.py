@@ -34,11 +34,14 @@ return WATCH or DEGRADED at most.
 from __future__ import annotations
 
 import json
+import math
 import sqlite3
 from dataclasses import dataclass
 from datetime import date
 from pathlib import Path
 from typing import Any
+
+import numpy as np
 
 from strategies.health.envelope import StrategyEnvelope
 from strategies.health.lifecycle import (
@@ -52,6 +55,35 @@ from strategies.health.reports import (
     Layer,
 )
 from strategies.health.thresholds import CheckThresholds, get_thresholds
+
+
+def _drift_from_band(observed: float, band: tuple[float, float]) -> float:
+    """Drift of `observed` from envelope band `[lo, hi]`.
+
+    Inside the band → 0 (the band IS the expected range; nothing to
+    flag). Outside the band → distance to the nearest bound, expressed
+    as a fraction of that bound's magnitude.
+
+    PR #19 reviewer caught the original midpoint-distance formula:
+    `abs(observed - midpoint) / midpoint` reported in-band values as
+    drift (a band of 10–30 with observed=10 was reported as 50% drift
+    even though 10 is the band's lower bound). The correct semantics
+    is "drift kicks in when we leave the band, measured from the
+    boundary we crossed."
+
+    Defensive: bound magnitude floors at 1e-9 to avoid divide-by-zero
+    on zero-anchored bands (e.g., a regime_block_rate_band like
+    (0.0, 0.10) is legal — most weeks see no regime blocks).
+    """
+    lo, hi = band
+    if lo <= observed <= hi:
+        return 0.0
+    if observed < lo:
+        denom = max(abs(lo), 1e-9)
+        return (lo - observed) / denom
+    # observed > hi
+    denom = max(abs(hi), 1e-9)
+    return (observed - hi) / denom
 
 
 # ── Inputs ───────────────────────────────────────────────────────────
@@ -295,11 +327,12 @@ def _slippage_p95_bps(
             continue
     if not deltas:
         return None
-    # p95 via numpy.percentile is overkill for a typically small list;
-    # sort + index is fine here.
-    deltas.sort()
-    idx = int(0.95 * (len(deltas) - 1))
-    return deltas[idx]
+    # PR #19 reviewer caught the original `int(0.95 * (n - 1))` floor:
+    # with n=2 it returned the lower sample as p95 (hiding the bad
+    # fill); with n=3 it returned the median. numpy.percentile uses
+    # the standard linear interpolation between order statistics —
+    # correct on small samples.
+    return float(np.percentile(deltas, 95))
 
 
 def _partial_fill_rate(
@@ -371,24 +404,20 @@ def _l3_checks(
         # Period length in weeks → expected raw_signals
         weeks = max((period_end - period_start).days / 7.0, 1e-9)
         observed_per_week = raw_signals_total / weeks
-        envelope_mid = (band[0] + band[1]) / 2.0
-        if envelope_mid > 0:
-            drift_pct = abs(observed_per_week - envelope_mid) / envelope_mid
-            thresh = get_thresholds(strategy_name, "trade_frequency_drift_pct")
-            status = _classify(drift_pct, thresh, layer=Layer.L3)
-            out.append(CheckResult(
-                name="trade_frequency_drift_pct",
-                layer=Layer.L3,
-                status=status,
-                numeric_value=drift_pct,
-                findings=[
-                    f"observed {observed_per_week:.1f}/wk vs envelope "
-                    f"band {band[0]:.1f}-{band[1]:.1f}/wk "
-                    f"(drift {drift_pct:.1%})"
-                ],
-            ))
-        else:
-            out.append(_no_envelope_band("trade_frequency_drift_pct", Layer.L3))
+        drift_pct = _drift_from_band(observed_per_week, band)
+        thresh = get_thresholds(strategy_name, "trade_frequency_drift_pct")
+        status = _classify(drift_pct, thresh, layer=Layer.L3)
+        out.append(CheckResult(
+            name="trade_frequency_drift_pct",
+            layer=Layer.L3,
+            status=status,
+            numeric_value=drift_pct,
+            findings=[
+                f"observed {observed_per_week:.1f}/wk vs envelope "
+                f"band {band[0]:.1f}-{band[1]:.1f}/wk "
+                f"(drift {drift_pct:.1%})"
+            ],
+        ))
 
     # ── Block-rate drift checks (edge filter, regime, fill rate) ──
     out.extend(_drift_ratio_check(
@@ -456,10 +485,7 @@ def _drift_ratio_check(
             ],
         )]
     observed = numerator / denominator
-    mid = (envelope_band[0] + envelope_band[1]) / 2.0
-    if mid <= 0:
-        return [_no_envelope_band(check_name, Layer.L3)]
-    drift_pct = abs(observed - mid) / mid
+    drift_pct = _drift_from_band(observed, envelope_band)
     thresh = get_thresholds(strategy_name, threshold_key)
     status = _classify(drift_pct, thresh, layer=Layer.L3)
     return [CheckResult(

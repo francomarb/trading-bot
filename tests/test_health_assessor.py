@@ -379,17 +379,18 @@ class TestL3DriftChecks:
         for c in l3_checks:
             assert c.status == HealthStatus.HEALTHY
 
-    def test_l3_block_rate_drift(self, db_conn):
-        """100 raw signals, 80 edge-filter blocked → 80% block rate.
-        Envelope mid is (0.40+0.80)/2 = 0.60. Drift = (0.80-0.60)/0.60
-        = 33%. Defaults watch=20%, degraded=50% → WATCH."""
+    def test_l3_block_rate_drift_above_band(self, db_conn):
+        """100 raw signals, 100 edge-filter blocked → 100% block rate.
+        Envelope band (0.40, 0.80) — 1.0 is outside upper bound. Drift
+        = (1.0 - 0.80) / 0.80 = 25%. Defaults watch=20%, degraded=50%
+        → WATCH."""
         upsert_counters(
             db_conn,
             period_type="weekly",
             period_start=date(2026, 5, 18),
             period_end=date(2026, 5, 25),
             strategy_name="x",
-            counters=LifecycleCounters(raw_signals=100, edge_filter_blocked=80),
+            counters=LifecycleCounters(raw_signals=100, edge_filter_blocked=100),
         )
         env = _make_envelope(edge_band=(0.40, 0.80))
         report = HealthAssessor().assess(
@@ -399,6 +400,7 @@ class TestL3DriftChecks:
             c for c in report.checks if c.name == "edge_filter_block_rate_drift_pct"
         )
         assert ef.status == HealthStatus.WATCH
+        assert ef.numeric_value == pytest.approx(0.25)
 
     def test_l3_fill_rate_drift_zero_submitted(self, db_conn):
         """Fill-rate uses submitted as denominator. Zero submitted →
@@ -470,3 +472,156 @@ class TestEmptyEverything:
         assert report.strategy == "x"
         # Checks were generated even with no data
         assert len(report.checks) > 0
+
+
+# ── PR #19 reviewer regressions (in-band drift + p95 floor) ───────────
+
+
+class TestInBandDriftRegression:
+    """PR #19 reviewer caught the midpoint-distance drift formula
+    reporting in-band values as drift. With band (10, 30) and observed
+    = 10, the old formula said 50% drift; the correct answer is 0
+    (10 IS the lower bound, fully inside the band)."""
+
+    def _seed(self, db_conn, raw: int):
+        upsert_counters(
+            db_conn,
+            period_type="weekly",
+            period_start=date(2026, 5, 18),
+            period_end=date(2026, 5, 25),
+            strategy_name="x",
+            counters=LifecycleCounters(raw_signals=raw),
+        )
+
+    def test_observed_equal_lower_bound_is_zero_drift(self, db_conn):
+        """Trade-freq band (10, 30); observed = 10/week → drift = 0,
+        status = HEALTHY. Pre-fix this returned 50% drift → WATCH."""
+        self._seed(db_conn, raw=10)  # 10 signals in 7 days ≈ 10/week
+        env = _make_envelope(raw_band=(10.0, 30.0))
+        report = HealthAssessor().assess(
+            _standard_inputs(db_conn, envelope=env)
+        )
+        tf = next(c for c in report.checks if c.name == "trade_frequency_drift_pct")
+        assert tf.status == HealthStatus.HEALTHY
+        assert tf.numeric_value == pytest.approx(0.0)
+
+    def test_observed_equal_upper_bound_is_zero_drift(self, db_conn):
+        """Observed = 30/week, band (10, 30) → drift = 0."""
+        self._seed(db_conn, raw=30)
+        env = _make_envelope(raw_band=(10.0, 30.0))
+        report = HealthAssessor().assess(
+            _standard_inputs(db_conn, envelope=env)
+        )
+        tf = next(c for c in report.checks if c.name == "trade_frequency_drift_pct")
+        assert tf.status == HealthStatus.HEALTHY
+        assert tf.numeric_value == pytest.approx(0.0)
+
+    def test_observed_in_middle_of_band_is_zero_drift(self, db_conn):
+        """Observed = 20/week, band (10, 30) → still drift = 0."""
+        self._seed(db_conn, raw=20)
+        env = _make_envelope(raw_band=(10.0, 30.0))
+        report = HealthAssessor().assess(
+            _standard_inputs(db_conn, envelope=env)
+        )
+        tf = next(c for c in report.checks if c.name == "trade_frequency_drift_pct")
+        assert tf.numeric_value == pytest.approx(0.0)
+
+    def test_observed_below_band_uses_lower_bound_as_denom(self, db_conn):
+        """Observed = 5/week, band (10, 30) → drift = (10-5)/10 = 50%
+        (NOT 75% which would be the old midpoint formula)."""
+        self._seed(db_conn, raw=5)
+        env = _make_envelope(raw_band=(10.0, 30.0))
+        report = HealthAssessor().assess(
+            _standard_inputs(db_conn, envelope=env)
+        )
+        tf = next(c for c in report.checks if c.name == "trade_frequency_drift_pct")
+        assert tf.numeric_value == pytest.approx(0.50)
+
+    def test_observed_above_band_uses_upper_bound_as_denom(self, db_conn):
+        """Observed = 60/week, band (10, 30) → drift = (60-30)/30 = 100%."""
+        self._seed(db_conn, raw=60)
+        env = _make_envelope(raw_band=(10.0, 30.0))
+        report = HealthAssessor().assess(
+            _standard_inputs(db_conn, envelope=env)
+        )
+        tf = next(c for c in report.checks if c.name == "trade_frequency_drift_pct")
+        assert tf.numeric_value == pytest.approx(1.0)
+
+    def test_block_rate_band_with_zero_lower_bound(self, db_conn):
+        """Regime block rate band (0, 0.10) — a zero-anchored band
+        should not divide-by-zero. Observed = 0.05 (in band) → 0 drift.
+        Observed = 0.20 → drift = (0.20 - 0.10)/0.10 = 100%."""
+        upsert_counters(
+            db_conn,
+            period_type="weekly",
+            period_start=date(2026, 5, 18),
+            period_end=date(2026, 5, 25),
+            strategy_name="x",
+            counters=LifecycleCounters(raw_signals=100, regime_blocked=5),
+        )
+        env = _make_envelope(regime_band=(0.0, 0.10))
+        report = HealthAssessor().assess(
+            _standard_inputs(db_conn, envelope=env)
+        )
+        rg = next(
+            c for c in report.checks if c.name == "regime_block_rate_drift_pct"
+        )
+        # 5/100 = 0.05 is in the band → drift = 0
+        assert rg.numeric_value == pytest.approx(0.0)
+        assert rg.status == HealthStatus.HEALTHY
+
+
+class TestP95SlippageRegression:
+    """PR #19 reviewer caught int(0.95 * (n - 1)) flooring: on n=2 it
+    returned the smaller sample as p95, hiding the bad fill entirely.
+    numpy.percentile uses linear interpolation between order statistics
+    — correct on small samples."""
+
+    def test_p95_of_two_samples_returns_near_larger(self, db_conn):
+        """Two fills: 0 bps slippage, 100 bps slippage. p95 must NOT
+        be 0 (which the old floor-formula returned, hiding the bad
+        fill)."""
+        _seed_filled_trade(
+            db_conn, strategy="x",
+            timestamp="2026-05-19T09:00:00",
+            realized_slippage_bps=5.0, modeled_slippage_bps=5.0,  # delta=0
+        )
+        _seed_filled_trade(
+            db_conn, strategy="x",
+            timestamp="2026-05-20T09:00:00",
+            realized_slippage_bps=105.0, modeled_slippage_bps=5.0,  # delta=100
+        )
+        report = HealthAssessor().assess(_standard_inputs(db_conn))
+        slip = next(
+            c for c in report.checks
+            if c.name == "slippage_realized_vs_modeled_bps_p95"
+        )
+        # numpy.percentile([0, 100], 95) = 95 (linear interpolation
+        # between 0 and 100 at the 0.95 mark of the [0, 1] range
+        # mapped onto two order statistics). Pre-fix this was 0.
+        assert slip.numeric_value == pytest.approx(95.0)
+        # 95 bps is well above the watch threshold (20) → DEGRADED
+        # (just under the broken threshold of 100).
+        assert slip.status == HealthStatus.DEGRADED
+
+    def test_p95_of_three_samples_not_median(self, db_conn):
+        """Three samples: pre-fix returned the median (the middle
+        sample), hiding the outlier. numpy.percentile correctly
+        weights toward the top."""
+        for delta, day in [(0, 18), (50, 19), (200, 20)]:
+            _seed_filled_trade(
+                db_conn, strategy="x",
+                timestamp=f"2026-05-{day:02d}T09:00:00",
+                realized_slippage_bps=delta + 5.0,
+                modeled_slippage_bps=5.0,
+            )
+        report = HealthAssessor().assess(_standard_inputs(db_conn))
+        slip = next(
+            c for c in report.checks
+            if c.name == "slippage_realized_vs_modeled_bps_p95"
+        )
+        # numpy.percentile([0, 50, 200], 95) = 185.0 by linear interp;
+        # certainly NOT 50 (the median, what the buggy floor returned).
+        assert slip.numeric_value > 100.0
+        assert slip.status == HealthStatus.BROKEN
+
