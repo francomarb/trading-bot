@@ -50,7 +50,7 @@ import signal
 import time
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Callable
 from zoneinfo import ZoneInfo
 
 import pandas as pd
@@ -380,11 +380,24 @@ class TradingEngine:
 
     # ── Lifecycle ────────────────────────────────────────────────────────
 
-    def start(self, *, max_cycles: int | None = None) -> None:
+    def start(
+        self,
+        *,
+        max_cycles: int | None = None,
+        post_cycle_hook: "Callable[[], None] | None" = None,
+    ) -> None:
         """
         Run the loop until SIGINT, `stop()`, or `max_cycles` (if set).
         `max_cycles` is for tests / verify scripts; production calls leave
         it None and rely on signal-driven shutdown.
+
+        `post_cycle_hook` (PLAN 11.10g) is an optional callable invoked
+        after each completed cycle. The engine doesn't know what the
+        callback does — it's the integration point for forward_test.py's
+        Sunday-EOD weekly + first-of-month monthly health-review
+        scheduler. The hook is wrapped in try/except so a hook failure
+        cannot crash the trading loop (same hard rule as the lifecycle
+        counter flush — design §12.4.1 invariant).
         """
         self._install_signal_handlers()
         self._running = True
@@ -431,6 +444,19 @@ class TradingEngine:
             while self._running:
                 self._cycle_count += 1
                 self._run_one_cycle()
+                # PLAN 11.10g: optional per-cycle hook (forward_test.py
+                # wires the Sunday/monthly health-review scheduler here).
+                # Wrapped in try/except so a hook failure never crashes
+                # the trading loop — same hard rule as
+                # _flush_lifecycle_counters.
+                if post_cycle_hook is not None:
+                    try:
+                        post_cycle_hook()
+                    except Exception as exc:  # noqa: BLE001
+                        logger.warning(
+                            f"post_cycle_hook failed (trading not "
+                            f"affected): {exc}"
+                        )
                 if max_cycles is not None and self._cycle_count >= max_cycles:
                     logger.info(f"reached max_cycles={max_cycles}, stopping")
                     break

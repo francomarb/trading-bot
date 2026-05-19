@@ -381,8 +381,20 @@ def main() -> None:
         cmd_listener.start(engine)
         logger.info("Telegram command listener started (/status, /halt)")
 
+    # PLAN 11.10g: Strategy Health & Edge review scheduler. Wired
+    # as engine's post_cycle_hook so the Sunday-EOD weekly + first-
+    # of-month monthly reviewer runs alongside the trading loop
+    # without needing an external cron / systemd timer. Hook failure
+    # is absorbed by the engine's try/except wrap — never crashes
+    # the trading loop.
+    from strategies.health.scheduler import HealthReviewScheduler
+    health_scheduler = HealthReviewScheduler(
+        conn_factory=lambda: trade_logger._ensure_db(),
+        dispatcher=alerts,
+    )
+
     try:
-        engine.start()
+        engine.start(post_cycle_hook=health_scheduler)
     finally:
         # Write a daily summary on shutdown.
         try:
