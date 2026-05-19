@@ -813,15 +813,31 @@ class TradingEngine:
         last_entry = bool(signals.entries.iloc[-1])
         last_exit = bool(signals.exits.iloc[-1])
 
-        # PLAN 11.10f: lifecycle counter — raw_signals counts every
-        # symbol-level entry candidate produced by inspect_signals
-        # (before any gate). Per design §12.4.1 the counting unit is
-        # "one symbol-level entry candidate per increment" — multi-leg
-        # / options entries that produce one entry candidate count as 1.
+        # PLAN 11.10f: lifecycle counter — raw_signals + gate-order
+        # attribution. Per design §12.4.1 the documented gate order is
+        # regime → edge filter → sleeve → risk. The trade-decision
+        # control flow below (`if not last_entry: return; if not
+        # entry_allowed: return`) returns at the first branch even
+        # when regime would also reject, so attributing in those
+        # inline branches would always credit edge_filter for the
+        # regime+filter overlap. We do the attribution HERE (before
+        # any decision returns) so regime_blocked is credited first
+        # when both conditions hold. The decision flow itself is
+        # unchanged — only the counter assignment.
+        # PR #21 reviewer fix.
         if raw_entry:
             _lc = self._lifecycle_counter_for(strategy.name)
             if _lc is not None:
                 _lc.raw_signals += 1
+                if not entry_allowed:
+                    # Regime gate takes priority per the design's
+                    # documented gate order.
+                    _lc.regime_blocked += 1
+                elif not last_entry:
+                    # Regime allowed but edge filter cut the candidate.
+                    _lc.edge_filter_blocked += 1
+                # else: candidate passes both gates; sleeve/risk
+                # counters increment downstream when applicable.
 
         position = self._get_position_for(symbol, snapshot)
         logger.info(
@@ -947,14 +963,10 @@ class TradingEngine:
                     strategy_statuses[symbol] = "Filter Blocked"
                     if strategy_reasons is not None:
                         strategy_reasons[symbol] = list(edge_reasons)
-            # PLAN 11.10f: lifecycle counter — edge_filter_blocked
-            # increments ONLY when a raw signal existed but the edge
-            # filter cut it. raw_entry=False means no candidate at
-            # all (not a block — just nothing to block).
-            if raw_entry:
-                _lc = self._lifecycle_counter_for(strategy.name)
-                if _lc is not None:
-                    _lc.edge_filter_blocked += 1
+            # PLAN 11.10f: edge_filter_blocked counter is now incremented
+            # by the gate-order attribution block at the top of
+            # _process_symbol (see comment there) so regime takes
+            # priority when both conditions hold.
             self._mark_signal_bar_processed(
                 signal_key, signal_bar, strategy_statuses, strategy_reasons, symbol
             )
@@ -969,14 +981,9 @@ class TradingEngine:
             logger.debug(
                 f"[{strategy.name}] {symbol}: entry blocked by regime gate"
             )
-            # PLAN 11.10f: lifecycle counter — regime_blocked. We reach
-            # this branch only when last_entry=True (passed edge filter)
-            # but entry_allowed=False (regime rejected). Mutual
-            # exclusivity per design §12.4.1: if edge filter had already
-            # rejected, we'd have returned at the previous branch.
-            _lc = self._lifecycle_counter_for(strategy.name)
-            if _lc is not None:
-                _lc.regime_blocked += 1
+            # PLAN 11.10f: regime_blocked counter incremented by the
+            # gate-order attribution block at the top of
+            # _process_symbol — see comment there.
             self._mark_signal_bar_processed(
                 signal_key, signal_bar, strategy_statuses, strategy_reasons, symbol
             )
@@ -2336,6 +2343,18 @@ class TradingEngine:
             _done("No Signal")
             return
 
+        # PLAN 11.10f: lifecycle counter — submitted++ for the
+        # credit-spread MLEG path. Equity/options strategies increment
+        # submitted after broker.place_order; credit_spread uses
+        # dispatch_spread_order so it needs its own increment site
+        # (the existing _enter_credit_spread path was previously
+        # missing this — PR #21 reviewer caught it). Without this,
+        # L3 submitted_per_raw_signal drift was unusable for
+        # credit_spread.
+        _lc = self._lifecycle_counter_for(strategy.name)
+        if _lc is not None:
+            _lc.submitted += 1
+
         # Pre-register the spread Position + the strategy's open-spread view.
         # The combo fill confirms via _drain_spread_fills (or rolls back).
         legs = [
@@ -2392,6 +2411,15 @@ class TradingEngine:
                 # ── Spread OPEN ──────────────────────────────────────────
                 plan = self._pending_spread_plans.pop(position_id, None)
                 if filled:
+                    # PLAN 11.10f: lifecycle counter — filled_entries++
+                    # for the credit-spread MLEG path. Multi-leg combo
+                    # = 1 entry per design §12.4.1, regardless of leg
+                    # count. Paired with the submitted++ in
+                    # _enter_credit_spread (after dispatch_spread_order
+                    # returned ACCEPTED). PR #21 reviewer fix.
+                    _lc = self._lifecycle_counter_for(strategy_name)
+                    if _lc is not None:
+                        _lc.filled_entries += 1
                     net_credit = (
                         abs(avg_fill_price)
                         if avg_fill_price is not None

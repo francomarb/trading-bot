@@ -577,6 +577,333 @@ class TestAllocatorDrawdownSnapshot:
 # ── Counter dict reset at cycle boundary ──────────────────────────────
 
 
+class TestGateOrderAttribution:
+    """PR #21 reviewer caught that when raw_entry=True, last_entry=False,
+    AND entry_allowed=False, the original implementation always
+    attributed the rejection to edge_filter_blocked because the
+    `not last_entry` branch returns first. Per design §12.4.1 the
+    documented gate order is regime → edge filter; regime should
+    take priority in the counter even when control flow returns at
+    the edge filter check."""
+
+    def test_regime_block_attributed_when_both_conditions_hold(
+        self, make_engine,
+    ):
+        """raw_entry=True + edge filter cuts the candidate +
+        regime not allowed → regime_blocked++ (NOT edge_filter_blocked).
+
+        The trade-decision flow STILL returns at `not last_entry`
+        (we don't change control flow), but the counter attribution
+        moves up to match the documented gate order."""
+
+        class _RejectingFilter:
+            def __call__(self, df, symbol=""):
+                return EdgeFilterDecision.from_bool_series(
+                    pd.Series(
+                        [False] * len(df), index=df.index, dtype=bool,
+                    ),
+                    blocked_reasons=["test: blocking all entries"],
+                )
+            def set_symbol(self, symbol): pass
+
+        engine, _, strategy, trade_logger = make_engine(
+            entry_on_last_bar=True,
+        )
+        strategy._edge_filter = _RejectingFilter()
+
+        # Inject a regime gate that blocks. We exploit the existing
+        # entry_allowed param by setting allowed_regimes on the slot
+        # to an empty set so any current regime gets rejected.
+        # The slot already exists from make_engine — we mutate it.
+        from strategies.base import StrategySlot
+        # The make_engine fixture builds a single-slot engine via
+        # the legacy symbols= argument; mock the regime block by
+        # directly invoking _process_symbol with entry_allowed=False.
+        from execution.broker import BrokerSnapshot
+        snapshot = engine.broker.sync_with_broker.return_value
+        engine._cycle_lifecycle_counters = {}  # fresh accumulator
+        engine._process_symbol(
+            "AAPL", snapshot, snapshot.account, strategy,
+            timeframe="1Day",
+            market_open=True,
+            entry_allowed=False,  # ← regime blocking
+            regime_block_reason="test regime block",
+            order_strategy={},
+            strategy_statuses={},
+            strategy_reasons={},
+        )
+        # The accumulator state in-memory should reflect regime_blocked,
+        # NOT edge_filter_blocked. (Flush hasn't run yet — we read
+        # directly from the in-memory counters to test attribution.)
+        counter = engine._cycle_lifecycle_counters["fake_strategy"]
+        assert counter.raw_signals == 1
+        assert counter.regime_blocked == 1, (
+            f"regime_blocked={counter.regime_blocked} — expected 1; "
+            f"if this is 0 and edge_filter_blocked is 1, the gate-order "
+            f"attribution fix has been reverted."
+        )
+        assert counter.edge_filter_blocked == 0, (
+            f"edge_filter_blocked={counter.edge_filter_blocked} — "
+            f"expected 0 (regime should take priority)"
+        )
+
+    def test_edge_filter_block_attributed_when_regime_allows(
+        self, make_engine,
+    ):
+        """Sanity: when regime allows but edge filter cuts the
+        candidate, the counter still credits edge_filter_blocked
+        correctly. (The gate-order fix must not break the standard
+        edge-filter case.)"""
+
+        class _RejectingFilter:
+            def __call__(self, df, symbol=""):
+                return EdgeFilterDecision.from_bool_series(
+                    pd.Series(
+                        [False] * len(df), index=df.index, dtype=bool,
+                    ),
+                    blocked_reasons=["test: blocking"],
+                )
+            def set_symbol(self, symbol): pass
+
+        engine, _, strategy, trade_logger = make_engine(
+            entry_on_last_bar=True,
+        )
+        strategy._edge_filter = _RejectingFilter()
+        snapshot = engine.broker.sync_with_broker.return_value
+        engine._cycle_lifecycle_counters = {}
+        engine._process_symbol(
+            "AAPL", snapshot, snapshot.account, strategy,
+            timeframe="1Day",
+            market_open=True,
+            entry_allowed=True,  # ← regime ALLOWS
+            regime_block_reason=None,
+            order_strategy={},
+            strategy_statuses={},
+            strategy_reasons={},
+        )
+        counter = engine._cycle_lifecycle_counters["fake_strategy"]
+        assert counter.raw_signals == 1
+        assert counter.edge_filter_blocked == 1
+        assert counter.regime_blocked == 0
+
+
+class TestCreditSpreadCounters:
+    """PR #21 reviewer caught that the credit-spread MLEG path (which
+    bypasses broker.place_order in favor of dispatch_spread_order)
+    never incremented submitted/filled_entries. raw_signals still
+    fired in the strategy-agnostic top block, so credit_spread would
+    show raw candidates with zero submitted/fill activity — making
+    L3 fill_rate / submitted_per_raw_signal drift unusable for one of
+    the configured v1 strategies.
+
+    Fix: submitted++ after dispatch_spread_order returns ACCEPTED;
+    filled_entries++ in the open-fill branch of _drain_spread_fills."""
+
+    def _config(self):
+        from datetime import date, timedelta
+        from strategies.credit_spread import CreditSpreadConfig
+        return CreditSpreadConfig.from_dict("SPY", {
+            "short_leg_delta": 0.17, "spread_width": 10,
+            "dte_min": 30, "dte_max": 45,
+            "iv_proxy_source": "vix", "min_iv_proxy": 14,
+            "min_credit_pct_of_width": 0.13,
+            "max_concurrent_positions": 3, "max_per_expiration": 1,
+            "min_dte_gap_between_opens": 7, "profit_target_pct": 0.50,
+            "stop_loss_multiple": 2.0, "time_stop_dte": 21,
+            "exit_on_short_strike_breach": True,
+            "limit_timeout_seconds": 30,
+            "earnings_blackout_days": 0,
+        })
+
+    def _strategy(self):
+        from strategies.credit_spread import CreditSpread
+        from utils.iv_proxy import IVProxyResolver
+        return CreditSpread(
+            self._config(),
+            iv_resolver=IVProxyResolver(fetch_fn=lambda t: 18.0),
+            quote_lookup=lambda occs: {o: None for o in occs},
+        )
+
+    def _pick(self):
+        from datetime import date, timedelta
+        from utils.options_lookup import SpreadPick
+        exp = date.today() + timedelta(days=37)
+        return SpreadPick(
+            short_occ="SPY260618P00568000",
+            long_occ="SPY260618P00558000",
+            short_strike=568.0, long_strike=558.0,
+            expiration_date=exp,
+            width=10.0, net_credit=1.45,
+            max_loss=(10.0 - 1.45) * 100, short_leg_delta=0.17,
+            score=0.7,
+            components={
+                "short_delta": 1.0, "net_credit": 0.15,
+                "spread_quality": 0.8, "dte": 0.9,
+            },
+            runners_up=[],
+        )
+
+    def _build_engine(self, tmp_path):
+        from execution.broker import OrderResult, OrderStatus
+        strategy = self._strategy()
+        broker = MagicMock()
+        broker.sync_with_broker.return_value = SimpleNamespace(
+            account=SimpleNamespace(open_positions={}, equity=100_000.0),
+            open_orders=[],
+        )
+        broker.dispatch_spread_order.return_value = OrderResult(
+            status=OrderStatus.ACCEPTED, order_id="spread-1",
+            symbol="SPY",
+            requested_qty=1, filled_qty=0.0,
+            avg_fill_price=0.0,
+            raw_status="accepted", message="",
+        )
+        risk = RiskManager(
+            max_position_pct=0.02, max_open_positions=5,
+            max_gross_exposure_pct=0.50, atr_stop_multiplier=2.0,
+            max_daily_loss_pct=0.05, hard_dollar_loss_cap=1_000_000.0,
+            loss_streak_threshold=10, broker_error_threshold=10,
+        )
+        cfg = EngineConfig(
+            history_lookback_days=120, cycle_interval_seconds=0.01,
+            max_bar_age_multiplier=10.0, market_hours_only=False,
+        )
+        tl = TradeLogger(path=str(tmp_path / "trades.db"))
+        engine = TradingEngine(
+            strategy=strategy, symbols=["SPY"],
+            risk=risk, broker=broker,
+            trade_logger=tl, config=cfg,
+            clock=lambda: T0,
+        )
+        return engine, broker, strategy
+
+    def test_submitted_increments_after_dispatch_spread_order_accepted(
+        self, tmp_path,
+    ):
+        """A successful dispatch_spread_order → submitted++ in the
+        credit_spread bucket."""
+        engine, broker, strategy = self._build_engine(tmp_path)
+        engine._cycle_lifecycle_counters = {}
+        with patch(
+            "strategies.credit_spread.find_best_put_spread",
+            return_value=self._pick(),
+        ):
+            engine._enter_credit_spread(
+                strategy=strategy, symbol="SPY",
+                underlying_close=745.0, notional_cap=2_000.0,
+                signal_key=("credit_spread", "SPY", "1Day"),
+                signal_bar="2026-05-14",
+                strategy_statuses={}, strategy_reasons={},
+            )
+        broker.dispatch_spread_order.assert_called_once()
+        counter = engine._cycle_lifecycle_counters["credit_spread"]
+        assert counter.submitted == 1
+        # filled_entries still 0 — that requires the fill drain.
+        assert counter.filled_entries == 0
+
+    def test_submitted_not_incremented_on_dispatch_rejection(
+        self, tmp_path,
+    ):
+        """If dispatch_spread_order returns non-ACCEPTED, submitted
+        does NOT increment (the order never reached the broker
+        accepted-state)."""
+        from execution.broker import OrderResult, OrderStatus
+        engine, broker, strategy = self._build_engine(tmp_path)
+        broker.dispatch_spread_order.return_value = OrderResult(
+            status=OrderStatus.REJECTED, order_id=None,
+            symbol="SPY", requested_qty=1, filled_qty=0.0,
+            avg_fill_price=None,
+            raw_status="rejected", message="rejected",
+        )
+        engine._cycle_lifecycle_counters = {}
+        with patch(
+            "strategies.credit_spread.find_best_put_spread",
+            return_value=self._pick(),
+        ):
+            engine._enter_credit_spread(
+                strategy=strategy, symbol="SPY",
+                underlying_close=745.0, notional_cap=2_000.0,
+                signal_key=("credit_spread", "SPY", "1Day"),
+                signal_bar="2026-05-14",
+                strategy_statuses={}, strategy_reasons={},
+            )
+        # Either no counter (no _lc lookup happened) or counter exists
+        # but submitted is 0.
+        assert engine._cycle_lifecycle_counters.get(
+            "credit_spread", LifecycleCounters(),
+        ).submitted == 0
+
+    def test_filled_entries_increments_in_drain_spread_fills_open(
+        self, tmp_path,
+    ):
+        """The async fill drain increments filled_entries when a
+        spread opens with a fill."""
+        from execution.broker import OrderResult, OrderStatus
+        engine, broker, strategy = self._build_engine(tmp_path)
+
+        # First dispatch the spread (sets up _pending_spread_plans
+        # and pre-registers position so _drain_spread_fills can find it).
+        engine._cycle_lifecycle_counters = {}
+        with patch(
+            "strategies.credit_spread.find_best_put_spread",
+            return_value=self._pick(),
+        ):
+            engine._enter_credit_spread(
+                strategy=strategy, symbol="SPY",
+                underlying_close=745.0, notional_cap=2_000.0,
+                signal_key=("credit_spread", "SPY", "1Day"),
+                signal_bar="2026-05-14",
+                strategy_statuses={}, strategy_reasons={},
+            )
+
+        # The pre-registered position now has a pending plan. Set up
+        # the broker's drain to return a FILLED open event.
+        position_id = next(iter(engine._pending_spread_plans.keys()))
+        # drain_spread_fills returns 7-tuples:
+        # (position_id, strategy_name, closing, status, filled_qty, avg_fill_price, order_id)
+        broker.drain_spread_fills.return_value = [
+            (position_id, "credit_spread", False, "filled", 1.0, -1.45, "spread-1"),
+        ]
+        engine._drain_spread_fills()
+
+        counter = engine._cycle_lifecycle_counters["credit_spread"]
+        # submitted++ from dispatch + filled_entries++ from drain
+        assert counter.submitted == 1
+        assert counter.filled_entries == 1
+
+    def test_filled_entries_not_incremented_on_failed_open(
+        self, tmp_path,
+    ):
+        """If the async drain reports the open as non-filled (e.g.
+        the worker timed out and the order was canceled), filled_entries
+        does NOT increment — the spread never opened."""
+        engine, broker, strategy = self._build_engine(tmp_path)
+        engine._cycle_lifecycle_counters = {}
+        with patch(
+            "strategies.credit_spread.find_best_put_spread",
+            return_value=self._pick(),
+        ):
+            engine._enter_credit_spread(
+                strategy=strategy, symbol="SPY",
+                underlying_close=745.0, notional_cap=2_000.0,
+                signal_key=("credit_spread", "SPY", "1Day"),
+                signal_bar="2026-05-14",
+                strategy_statuses={}, strategy_reasons={},
+            )
+        position_id = next(iter(engine._pending_spread_plans.keys()))
+        # Drain returns a NON-filled status (e.g. "canceled").
+        # 7-tuple: (position_id, strategy_name, closing, status,
+        # filled_qty, avg_fill_price, order_id)
+        broker.drain_spread_fills.return_value = [
+            (position_id, "credit_spread", False, "canceled", 0.0, None, "spread-1"),
+        ]
+        engine._drain_spread_fills()
+
+        counter = engine._cycle_lifecycle_counters["credit_spread"]
+        assert counter.submitted == 1  # dispatch went through
+        assert counter.filled_entries == 0  # but no fill
+
+
 class TestCycleResetIsolation:
     """Each cycle's counters are independent — reset at start of
     cycle. A bad counter state in cycle N+1 shouldn't be poisoned by
