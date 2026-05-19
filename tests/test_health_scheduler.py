@@ -1,14 +1,18 @@
 """
-Unit tests for strategies/health/scheduler.py — Sunday/monthly hook
-that forward_test.py wires as engine.start(post_cycle_hook=...).
+Unit tests for strategies/health/scheduler.py — Monday-completed-week
++ first-of-month hook that forward_test.py wires as
+engine.start(post_cycle_hook=...).
 
 Covers:
-  - Sunday → weekly fires; Monday → no fire
+  - Monday → weekly fires; Sunday / Tuesday-through-Saturday → no fire
   - First of month → monthly fires; non-first → no fire
   - Idempotent on same trigger day (fire once, then short-circuit)
+  - Weekly window covers the *completed* previous Mon→Mon week (PR #22
+    reviewer regression — Sunday-morning fires on in-progress week
+    must be impossible)
   - Hook never raises into the trading loop (engine's try/except is
     backup; scheduler's own try/except is primary defense)
-  - Both weekly + monthly can fire on the same date if Sunday is
+  - Both weekly + monthly can fire on the same date if Monday is
     also the 1st of the month (independent state tracking)
 """
 

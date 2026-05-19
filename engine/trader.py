@@ -445,7 +445,8 @@ class TradingEngine:
                 self._cycle_count += 1
                 self._run_one_cycle()
                 # PLAN 11.10g: optional per-cycle hook (forward_test.py
-                # wires the Sunday/monthly health-review scheduler here).
+                # wires the Monday-completed-week + first-of-month
+                # health-review scheduler here).
                 # Wrapped in try/except so a hook failure never crashes
                 # the trading loop — same hard rule as
                 # _flush_lifecycle_counters.
