@@ -267,9 +267,13 @@ def dispatch_alerts(
         with persistence reached
       - STRATEGY_EDGE_BELOW_BENCHMARK (WARNING) on BELOW_BENCHMARK
         verdict
-      - STRATEGY_HEALTH_BROKEN (WARNING when Edge non-positive, INFO
-        when positive) on L1/L2 BROKEN
-      - STRATEGY_HEALTH_DEGRADED (same severity ladder) on L1/L2
+      - STRATEGY_HEALTH_BROKEN (always WARNING regardless of Edge
+        verdict — BROKEN is the non-cosmetic operational tier; see
+        AlertDispatcher.strategy_health_broken docstring) on L1/L2
+        BROKEN
+      - STRATEGY_HEALTH_DEGRADED (INFO when Edge POSITIVE, WARNING
+        otherwise — DEGRADED is the softer tier where alarm fatigue
+        on profitable strategies is the real concern) on L1/L2
         DEGRADED
       - STRATEGY_DRIFT_WARNING (INFO) on L3 DEGRADED (drift)
     """
