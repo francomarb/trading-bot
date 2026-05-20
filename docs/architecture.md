@@ -71,6 +71,9 @@ trading-bot/
 │   ├── fetcher.py             # Fetches OHLCV bars via StockHistoricalDataClient
 │   ├── trades.db              # Paper SQLite trade log (gitignored)
 │   ├── trades_live.db         # Live SQLite trade log (gitignored)
+│   ├── envelopes/             # Per-strategy backtest envelopes (build_envelopes.py)
+│   ├── health_reports/        # Weekly/monthly strategy-health markdown reports
+│   ├── health_state.json      # Health-monitor NEGATIVE persistence state (gitignored)
 │   ├── historical/            # Cached historical bars (Parquet, gitignored)
 │   └── cache/
 │       └── sector_map.json    # Persistent ticker→sector cache (populated at startup)
@@ -86,13 +89,25 @@ trading-bot/
 │   ├── rsi_reversion.py       # Mean-reversion: RSI oversold/overbought
 │   ├── donchian_breakout.py   # Trend-continuation: Turtle System 1 (30/15, ai_bigtech)
 │   ├── spy_options_reversion.py  # Options mean-reversion: SPY calls on RSI recovery
-│   └── filters/
-│       ├── common.py          # SPYTrendFilter + CompositeEdgeFilter
-│       ├── sma_crossover.py   # SMAEdgeFilter: stock > 200 SMA, volume expansion
-│       ├── rsi_reversion.py   # RSIEdgeFilter: SPY dual macro, earnings, liquidity, no-new-low
-│       ├── donchian_breakout.py      # DonchianEdgeFilter: stock > 200 SMA, liquidity, earnings
-│       ├── spy_options_reversion.py  # SPYOptionsEdgeFilter: SPY > 100 SMA
-│       └── sector_momentum.py # SectorMomentumFilter: HOT/NEUTRAL/COLD gate adapter
+│   ├── filters/
+│   │   ├── common.py          # SPYTrendFilter + CompositeEdgeFilter
+│   │   ├── sma_crossover.py   # SMAEdgeFilter: stock > 200 SMA, volume expansion
+│   │   ├── rsi_reversion.py   # RSIEdgeFilter: SPY dual macro, earnings, liquidity, no-new-low
+│   │   ├── donchian_breakout.py      # DonchianEdgeFilter: stock > 200 SMA, liquidity, earnings
+│   │   ├── spy_options_reversion.py  # SPYOptionsEdgeFilter: SPY > 100 SMA
+│   │   └── sector_momentum.py # SectorMomentumFilter: HOT/NEUTRAL/COLD gate adapter
+│   └── health/                # Strategy Health & Edge Monitor v1 (PLAN.md 11.10 — advisory only)
+│       ├── stats.py           # Bootstrap CI, one-sided t-test, EMA50/100 cross detector
+│       ├── thresholds.py      # Per-strategy Health-check thresholds
+│       ├── reports.py         # HealthReport / EdgeReport / CheckResult dataclasses
+│       ├── benchmarks.py      # Per-strategy equal-weight buy-and-hold benchmark
+│       ├── envelope.py        # StrategyEnvelope — backtest reference bands + JSON I/O
+│       ├── persistence.py     # 3-week NEGATIVE persistence state (health_state.json)
+│       ├── lifecycle.py       # Gate lifecycle counter table I/O
+│       ├── assessor.py        # HealthAssessor — L1/L2/L3 forensic checks
+│       ├── edge.py            # EdgeAssessor — three-signal verdict + recommendation
+│       ├── reviewer.py        # Orchestrates assessors, renders reports, dispatches alerts
+│       └── scheduler.py       # HealthReviewScheduler — Monday + first-of-month hook
 │
 ├── sector/
 │   ├── __init__.py
@@ -145,6 +160,9 @@ trading-bot/
 ├── scripts/
 │   ├── __init__.py
 │   ├── gonogo.py              # Go/no-go checker for live readiness
+│   ├── build_envelopes.py     # Builds per-strategy backtest envelopes (health monitor)
+│   ├── calibrate_health_thresholds.py  # Health-threshold diff suggestions from N weeks of data
+│   ├── strategy_health_review.py  # On-demand strategy health/edge report CLI
 │   ├── post_mortem.py         # Post-trade diagnostic reporting (RS, MA trends)
 │   ├── preflight.py           # Pre-flight checklist (must exit 0 before live flip)
 │   ├── rsi_backtest_report.py
@@ -564,6 +582,19 @@ CLI tool that reads the trade DB, pairs buy/sell fills into round-trip P&Ls, com
 
 **Pre-flight checklist (`scripts/preflight.py`):**
 Must exit 0 before any live capital is committed. Validates: credentials point to the live endpoint, buying power meets minimum, `SLIPPAGE_DRIFT_ENABLED=True`, dry-run cycle passes, go/no-go file on disk with GO verdict.
+
+#### Strategy Health & Edge Monitor (`strategies/health/`, PLAN.md 11.10)
+
+A per-strategy assessment system that catches the *silent killer* — a strategy with clean execution that is steadily losing money. **Advisory only: the bot informs, the operator decides.** It never throttles, disables, or resizes a strategy; the existing automated controls (loss-streak cooldown, slippage-drift halt, sleeve drawdown) remain the only actors and are reported here as Health inputs.
+
+- **Edge vs Health primacy inversion** — *Edge* (is the strategy worth running?) drives the recommendation; *Health* (is execution functioning correctly?) is forensic-only and never overrides Edge. A profitable strategy with messy execution still earns.
+- **EdgeAssessor** (`edge.py`) issues a NEGATIVE verdict only when three independent statistical signals on R-expectancy agree (bootstrap CI vs envelope, one-sided t-test vs zero, EMA50/100 cross on cumulative-R) **and** the verdict persists 3 consecutive weeks — only then does `STRATEGY_EDGE_LOSS` fire. This guards against over-reacting to normal drawdown.
+- **HealthAssessor** (`assessor.py`) runs L1/L2/L3 forensic checks sourced from engine state, slippage/fill stats, and the lifecycle counter table.
+- **Lifecycle counters** — the engine emits per-cycle gate counts (`raw_signals`, `regime_blocked`, `edge_filter_blocked`, `sleeve_blocked`, `risk_blocked`, `submitted`, `filled_entries`) to the `strategy_lifecycle_counters` SQLite table. This wiring is **observability-only**, feature-flagged behind `HEALTH_COUNTERS_ENABLED` in `config/settings.py`, batched to one write per cycle, and wrapped in try/except — it can never affect whether a signal is taken or raise into the trading loop. The flag is temporary scaffolding, slated for removal after the paper-watch period.
+- **Cadence** — `HealthReviewScheduler` runs as a `post_cycle_hook` on `engine.start()`: a weekly review fires every Monday (covering the completed Mon→Mon week) and a monthly review on the first of the month. Reports land in `data/health_reports/`; a single Telegram digest is dispatched. On-demand runs use `scripts/strategy_health_review.py`.
+- **Dashboard** — a "Strategy Health & Edge" panel renders the latest verdicts, the silent-killer banner, and persistence state.
+
+Full v1 design and rationale: `docs/strategy_health_design.md`. Deliberately deferred work (PSR/DSR/MinTRL, CUSUM change-point detection, auto-throttle): `docs/strategy_health_future.md`.
 
 ---
 

@@ -1,6 +1,6 @@
 # Strategy Health & Edge Monitor — v1 Design
 
-**Status:** Proposal — no code yet, iterating on design
+**Status:** Implemented (v1) — shipped 2026-05-19 across PRs #16–#22 (PLAN.md 11.10a–g). Code lives in `strategies/health/`. The remaining open item is **11.10h** — a 4-week paper-watch + threshold calibration pass (no new code until the tuning PR). This doc is the as-built design reference; deviations made during implementation, if any, are noted inline.
 **PLAN.md item:** 11.10
 **Related items:** 11.9 (dynamic capital allocation — downstream consumer), 11.11 (re-enable workflow — manual gate for quarantined strategies), 11.12 (Kelly criterion — advisory, complementary), 11.14 (read-only dashboard — render target)
 **Future work:** see [strategy_health_future.md](strategy_health_future.md) for the follow-up roadmap (PSR/DSR/MinTRL, CUSUM, signal-lifecycle table, MAE/MFE, auto-throttle, etc.) — deliberately split out so this doc stays focused on what ships now.
@@ -323,7 +323,8 @@ The lifecycle bands are derived from the backtest by simulating the same gating 
 v1 uses a simple per-strategy config:
 
 ```python
-MIN_TRADES_FOR_VERDICT = {
+# As-built name in config/settings.py is STRATEGY_MIN_TRADES_FOR_VERDICT.
+STRATEGY_MIN_TRADES_FOR_VERDICT = {
     "sma_crossover": 30,
     "rsi_reversion": 25,         # lowered from initial 50 — RSI's tight filters
                                  # (SPY trend, earnings blackout, no-new-low) gate
@@ -390,7 +391,7 @@ Three independent signals + persistence requirement. All operate on **R-expectan
 
 | Cadence | What runs | Output |
 |---|---|---|
-| **Weekly (Sunday EOD)** | Full L1–L3 + EdgeReport per strategy | Markdown report in `data/health_reports/weekly_YYYY-WW.md`; Telegram summary |
+| **Weekly (Monday, completed Mon→Mon week)** | Full L1–L3 + EdgeReport per strategy | Markdown report in `data/health_reports/weekly_YYYY-WW.md`; Telegram summary |
 | **Monthly** | Same + envelope-vs-actual charts + prior-period comparison | Markdown in `data/health_reports/monthly_YYYY-MM.md`; Telegram summary |
 | **On-demand CLI** | `scripts/strategy_health_review.py --window {weekly,monthly,yearly} [--strategy X]` | stdout + markdown file |
 
@@ -452,7 +453,7 @@ External pieces:
 - `scripts/build_envelopes.py` — one-shot per strategy; runs single backtest at production config and writes envelope JSON.
 - `scripts/strategy_health_review.py` — CLI for on-demand reviews.
 - `dashboard.py` — new "Strategy Health & Edge" panel rendering both scorecards per strategy.
-- `forward_test.py` — Sunday EOD hook to run weekly reviewer; monthly first-of-month hook for monthly reviewer.
+- `forward_test.py` — wires `HealthReviewScheduler` as the engine `post_cycle_hook`: weekly reviewer on Monday (completed week), monthly reviewer on the first of the month.
 - `reporting/alerts.py` — new alert types (§11).
 
 **No changes to trading decision behavior in `risk/allocator.py`, `risk/manager.py`, or `engine/trader.py`** — the advisory-only invariant (§1.2) is unchanged. v1 does add **observability-only wiring to `engine/trader.py`**: ~30 LOC to emit per-cycle gate counts (raw_signals, regime_blocked, edge_filter_blocked, sleeve_blocked, risk_blocked, submitted, filled_entries) into the new `strategy_lifecycle_counters` SQLite table (§12.4.1). These counter increments happen *after* each existing gate has already made its decision and have **zero influence on whether a signal is taken** — they are pure measurement of decisions the engine already made. Counter writes are also failure-tolerant: a write error is logged but never raises into the trading loop.
@@ -507,7 +508,7 @@ CREATE TABLE IF NOT EXISTS strategy_lifecycle_counters (
 
 **Durability — bot can be offline at period boundary:**
 
-- Weekly reports aggregate by `period_start / period_end` (Mon 00:00 UTC → next Mon 00:00 UTC). The reviewer/CLI computes the period bounds first, then queries; the bot does not need to be running at Sunday EOD for the report to be correct.
+- Weekly reports aggregate by `period_start / period_end` (Mon 00:00 UTC → next Mon 00:00 UTC). The reviewer/CLI computes the period bounds first, then queries; the bot does not need to be running at the exact period boundary for the report to be correct.
 - If the bot is offline for part of a period, the row reflects only the time it was running — explicitly noted in the report when `(period_end - period_start) - actual_uptime > threshold`. Honest about partial coverage rather than pretending zero counts = no signals.
 - Engine writes incremental updates via upsert (`INSERT … ON CONFLICT(period_type, period_start, strategy_name) DO UPDATE SET ...`). Crash-safe: at worst we lose the deltas accumulated since the last flush.
 
@@ -603,16 +604,17 @@ Single-list reference of exactly what ships in v1, so the eventual implementatio
 
 **Existing files touched (observability wiring only, no decision changes):**
 - `engine/trader.py` — ~30 LOC to emit per-cycle lifecycle counter updates (after each existing gate has already decided). §12.4.1
-- `forward_test.py` — Sunday EOD hook to run weekly reviewer; first-of-month hook for monthly reviewer. §10
+- `forward_test.py` — wires `HealthReviewScheduler` via `engine.start(post_cycle_hook=...)`; the scheduler fires the weekly reviewer every Monday (completed Mon→Mon week) and the monthly reviewer on the first of the month. §10
+  *As-built note:* an earlier draft fired the weekly hook on Sunday EOD; PR #22 moved it to Monday so the window covers a completed week aligned with the lifecycle counter table's ISO Monday `period_start`.
 - `reporting/alerts.py` — five new alert types (`STRATEGY_EDGE_LOSS`, `STRATEGY_EDGE_BELOW_BENCHMARK`, `STRATEGY_HEALTH_DEGRADED`, `STRATEGY_HEALTH_BROKEN`, `STRATEGY_DRIFT_WARNING`). §11
 - `dashboard.py` — new "Strategy Health & Edge" panel: compact summary table + expandable detail. §10, Q4 resolution
 
 **Configuration:**
-- `config/settings.py` — `MIN_TRADES_FOR_VERDICT` dict per Q1 resolution.
+- `config/settings.py` — `STRATEGY_MIN_TRADES_FOR_VERDICT` dict per Q1 resolution; `HEALTH_COUNTERS_ENABLED` feature flag gating the engine lifecycle-counter wiring (temporary scaffolding).
 
 **Outputs:**
 - `data/envelopes/{strategy_name}.json` — one per strategy. `schema_version: 1`. §7
-- `data/health_reports/weekly_YYYY-WW.md` — Sunday EOD markdown. `schema_version: 1` in front-matter. §10, §12.6
+- `data/health_reports/weekly_YYYY-WW.md` — weekly markdown (written Monday for the completed week). `schema_version: 1` in front-matter. §10, §12.6
 - `data/health_reports/monthly_YYYY-MM.md` — first-of-month markdown. `schema_version: 1` in front-matter.
 - Telegram alerts on defined transitions (silent killer + below-benchmark only; Health alerts INFO-only when Edge positive).
 

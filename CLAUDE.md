@@ -52,6 +52,9 @@ trading-bot/
 │   ├── watchlists.py          # WatchlistSource ABC + StaticWatchlistSource
 │   ├── trades.db              # Paper SQLite trade log (gitignored)
 │   ├── trades_live.db         # Live SQLite trade log (gitignored)
+│   ├── envelopes/             # Per-strategy backtest envelopes (build_envelopes.py)
+│   ├── health_reports/        # Weekly/monthly strategy-health markdown reports
+│   ├── health_state.json      # Health-monitor NEGATIVE persistence state (gitignored)
 │   └── historical/            # Cached historical bars
 ├── indicators/
 │   └── technicals.py          # SMA, EMA, ATR, RSI, ADX, Bollinger Bands, Keltner Channels, Donchian high/low (hand-rolled)
@@ -62,13 +65,25 @@ trading-bot/
 │   ├── bollinger_squeeze.py   # Volatility breakout: TTM-style BB squeeze (IMPLEMENTED, NOT WIRED — parked)
 │   ├── donchian_breakout.py   # Trend continuation: Turtle System 1 — N-day high/low (ACTIVE, 30/15, ai_bigtech 32-name universe)
 │   ├── spy_options_reversion.py # Options mean-reversion: SPY calls on RSI recovery (ACTIVE)
-│   └── filters/
-│       ├── common.py          # SPYTrendFilter (shared macro gate)
-│       ├── sma_crossover.py   # SMAEdgeFilter: stock > 200 SMA, volume expansion
-│       ├── rsi_reversion.py   # RSIEdgeFilter: SPY dual macro, earnings blackout, liquidity, no-new-low
-│       ├── bollinger_squeeze.py # BollingerSqueezeEdgeFilter: IEX-scaled liquidity, earnings blackout, exhaustion gate
-│       ├── donchian_breakout.py # DonchianEdgeFilter: stock > 200 SMA, IEX-scaled liquidity, short earnings blackout
-│       └── spy_options_reversion.py # SPYOptionsEdgeFilter: SPY > 100 SMA
+│   ├── filters/
+│   │   ├── common.py          # SPYTrendFilter (shared macro gate)
+│   │   ├── sma_crossover.py   # SMAEdgeFilter: stock > 200 SMA, volume expansion
+│   │   ├── rsi_reversion.py   # RSIEdgeFilter: SPY dual macro, earnings blackout, liquidity, no-new-low
+│   │   ├── bollinger_squeeze.py # BollingerSqueezeEdgeFilter: IEX-scaled liquidity, earnings blackout, exhaustion gate
+│   │   ├── donchian_breakout.py # DonchianEdgeFilter: stock > 200 SMA, IEX-scaled liquidity, short earnings blackout
+│   │   └── spy_options_reversion.py # SPYOptionsEdgeFilter: SPY > 100 SMA
+│   └── health/                # Strategy Health & Edge Monitor v1 (PLAN 11.10 — advisory only)
+│       ├── stats.py           # Bootstrap CI, one-sided t-test, EMA50/100 cross detector
+│       ├── thresholds.py      # Per-strategy Health-check thresholds (calibration TODOs)
+│       ├── reports.py         # HealthReport / EdgeReport / CheckResult dataclasses
+│       ├── benchmarks.py      # Per-strategy equal-weight buy-and-hold benchmark
+│       ├── envelope.py        # StrategyEnvelope — backtest reference bands + JSON I/O
+│       ├── persistence.py     # 3-week NEGATIVE persistence state (health_state.json)
+│       ├── lifecycle.py       # Gate lifecycle counter table I/O (strategy_lifecycle_counters)
+│       ├── assessor.py        # HealthAssessor — L1/L2/L3 forensic checks
+│       ├── edge.py            # EdgeAssessor — three-signal verdict + recommendation
+│       ├── reviewer.py        # Orchestrates assessors, renders weekly/monthly reports + alerts
+│       └── scheduler.py       # HealthReviewScheduler — Monday + first-of-month post-cycle hook
 ├── regime/
 │   └── detector.py            # RegimeDetector: BEAR/VOLATILE/TRENDING/RANGING (ADX + ATR%)
 ├── sector/
@@ -98,6 +113,9 @@ trading-bot/
 ├── scripts/
 │   ├── preflight.py           # Pre-flight checklist (must exit 0 before live flip)
 │   ├── gonogo.py              # Go/no-go checker for live readiness
+│   ├── build_envelopes.py     # Builds per-strategy backtest envelopes for the health monitor
+│   ├── strategy_health_review.py # On-demand strategy health/edge report CLI
+│   ├── calibrate_health_thresholds.py # Suggests health-threshold diffs from N weeks of data
 │   └── *.py                   # Watchlist scanners and analysis scripts
 ├── tests/                     # Unit tests (pytest)
 ├── logs/                      # Rotating log files (gitignored)
