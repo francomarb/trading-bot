@@ -52,6 +52,7 @@ SELL = "SELL"
 VALID_SIDES = frozenset({BUY, SELL})
 
 CONTRACT_MULTIPLIER = 100
+MARK_PRICE_TOLERANCE = 0.01
 
 
 # ── Dataclasses ─────────────────────────────────────────────────────────────
@@ -338,6 +339,7 @@ def _credit_spread_status(
     dte: int,
     stop_loss_multiple: float,
     time_stop_dte: int | None,
+    mark_price_tolerance: float = MARK_PRICE_TOLERANCE,
 ) -> str:
     if underlying_price is not None and underlying_price <= short_strike:
         return "tested"
@@ -352,7 +354,7 @@ def _credit_spread_status(
     if (
         current_exit_price is not None
         and entry_net_price > 0
-        and current_exit_price > entry_net_price
+        and (current_exit_price - entry_net_price) > mark_price_tolerance + 1e-9
     ):
         return "watch"
     if underlying_price is not None and underlying_price > 0:

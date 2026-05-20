@@ -37,6 +37,38 @@ from engine.positions import build_credit_spread_snapshot
 # ── Data loading helpers (pure functions — tested independently) ─────────────
 
 
+def _as_float(value: Any) -> float | None:
+    if value is None:
+        return None
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return None
+
+
+def broker_position_detail(position: Any) -> dict[str, Any]:
+    """
+    Normalize a broker position for dashboard reads without recomputing P/L.
+
+    Alpaca already reports option P/L at the contract-multiplier scale. The
+    dashboard preserves those broker fields instead of deriving leg P/L from
+    market value, which is easy to get wrong for options.
+    """
+    unrealized_pl = _as_float(getattr(position, "unrealized_pl", None))
+    if unrealized_pl is None:
+        unrealized_pl = _as_float(getattr(position, "unrealized_pnl", None))
+    return {
+        "qty": _as_float(getattr(position, "qty", None)),
+        "avg_entry_price": _as_float(getattr(position, "avg_entry_price", None)),
+        "current_price": _as_float(getattr(position, "current_price", None)),
+        "market_value": _as_float(getattr(position, "market_value", None)),
+        "cost_basis": _as_float(getattr(position, "cost_basis", None)),
+        "unrealized_pl": unrealized_pl,
+        "unrealized_pnl": unrealized_pl,
+        "unrealized_plpc": _as_float(getattr(position, "unrealized_plpc", None)),
+    }
+
+
 def load_trades(db_path: str) -> pd.DataFrame:
     """Load all rows from the trades table. Returns empty DataFrame if missing."""
     def _empty(error: str | None = None) -> pd.DataFrame:
@@ -232,14 +264,7 @@ def load_broker_account_metrics(
             "daily_pnl": daily_pnl,
             "session_pnl": session_pnl,
             "positions_detail": {
-                symbol: {
-                    "qty": position.qty,
-                    "avg_entry_price": position.avg_entry_price,
-                    "market_value": position.market_value,
-                    "unrealized_pnl": (
-                        position.market_value - position.qty * position.avg_entry_price
-                    ),
-                }
+                symbol: broker_position_detail(position)
                 for symbol, position in account.open_positions.items()
             },
             "source": "broker",
@@ -336,6 +361,58 @@ def refresh_multi_leg_positions(
         except Exception:
             refreshed.append(row)
     return refreshed
+
+
+def multi_leg_display_rows(
+    multi_leg_positions: list[dict[str, Any]],
+) -> list[dict[str, Any]]:
+    """Build compact dashboard rows for normalized multi-leg positions."""
+    rows: list[dict[str, Any]] = []
+    for pos in multi_leg_positions:
+        short_strike = pos.get("short_strike")
+        long_strike = pos.get("long_strike")
+        distance_pct = pos.get("distance_to_short_strike_pct")
+        legs = pos.get("legs") or []
+        short_leg = next(
+            (leg for leg in legs if str(leg.get("role", "")).lower() == "short"),
+            {},
+        )
+        long_leg = next(
+            (leg for leg in legs if str(leg.get("role", "")).lower() == "long"),
+            {},
+        )
+        rows.append({
+            "Structure": str(pos.get("structure", "")).replace("_", " ").title(),
+            "Underlying": pos.get("underlying", ""),
+            "Strikes": (
+                f"{short_strike:.0f} / {long_strike:.0f}"
+                if short_strike is not None and long_strike is not None
+                else ""
+            ),
+            "Expiration": pos.get("expiration", ""),
+            "DTE": pos.get("dte"),
+            "Entry Credit": (
+                float(pos.get("entry_net_price") or 0.0)
+                * 100.0 * float(pos.get("qty") or 0.0)
+            ),
+            "Mark Debit": (
+                None if pos.get("current_exit_price") is None
+                else float(pos.get("current_exit_price") or 0.0)
+                * 100.0 * float(pos.get("qty") or 0.0)
+            ),
+            "Net Spread P&L": pos.get("unrealized_pnl"),
+            "Short Leg P&L": short_leg.get("unrealized_pnl"),
+            "Long Leg P&L": long_leg.get("unrealized_pnl"),
+            "Max Profit": pos.get("max_profit"),
+            "Max Loss": pos.get("max_loss"),
+            "Underlying Price": pos.get("underlying_price"),
+            "Distance": pos.get("distance_to_short_strike"),
+            "Distance %": (
+                distance_pct * 100.0 if distance_pct is not None else None
+            ),
+            "Status": pos.get("status", ""),
+        })
+    return rows
 
 
 def compute_equity_curve(trades_df: pd.DataFrame) -> pd.DataFrame:
@@ -1187,40 +1264,7 @@ def render_dashboard() -> None:
             "Reusable live P/L and risk view for option structures.",
             kicker="Options",
         )
-        rows = []
-        for pos in multi_leg_positions:
-            short_strike = pos.get("short_strike")
-            long_strike = pos.get("long_strike")
-            distance_pct = pos.get("distance_to_short_strike_pct")
-            rows.append({
-                "Structure": str(pos.get("structure", "")).replace("_", " ").title(),
-                "Underlying": pos.get("underlying", ""),
-                "Strikes": (
-                    f"{short_strike:.0f} / {long_strike:.0f}"
-                    if short_strike is not None and long_strike is not None
-                    else ""
-                ),
-                "Expiration": pos.get("expiration", ""),
-                "DTE": pos.get("dte"),
-                "Entry Credit": (
-                    float(pos.get("entry_net_price") or 0.0)
-                    * 100.0 * float(pos.get("qty") or 0.0)
-                ),
-                "Mark Debit": (
-                    None if pos.get("current_exit_price") is None
-                    else float(pos.get("current_exit_price") or 0.0)
-                    * 100.0 * float(pos.get("qty") or 0.0)
-                ),
-                "Unrealized P&L": pos.get("unrealized_pnl"),
-                "Max Profit": pos.get("max_profit"),
-                "Max Loss": pos.get("max_loss"),
-                "Underlying Price": pos.get("underlying_price"),
-                "Distance": pos.get("distance_to_short_strike"),
-                "Distance %": (
-                    distance_pct * 100.0 if distance_pct is not None else None
-                ),
-                "Status": pos.get("status", ""),
-            })
+        rows = multi_leg_display_rows(multi_leg_positions)
         st.dataframe(
             pd.DataFrame(rows),
             width="stretch",
@@ -1229,7 +1273,9 @@ def render_dashboard() -> None:
                 "DTE": st.column_config.NumberColumn(format="%d"),
                 "Entry Credit": st.column_config.NumberColumn(format="$%.2f"),
                 "Mark Debit": st.column_config.NumberColumn(format="$%.2f"),
-                "Unrealized P&L": st.column_config.NumberColumn(format="$%.2f"),
+                "Net Spread P&L": st.column_config.NumberColumn(format="$%.2f"),
+                "Short Leg P&L": st.column_config.NumberColumn(format="$%.2f"),
+                "Long Leg P&L": st.column_config.NumberColumn(format="$%.2f"),
                 "Max Profit": st.column_config.NumberColumn(format="$%.2f"),
                 "Max Loss": st.column_config.NumberColumn(format="$%.2f"),
                 "Underlying Price": st.column_config.NumberColumn(format="$%.2f"),

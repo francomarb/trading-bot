@@ -244,18 +244,52 @@ class TestCreditSpreadSnapshot:
             width=10.0,
             qty=1,
             broker_positions={
-                "SPY260618P00714000": SimpleNamespace(qty=-1, market_value=-500.0),
-                "SPY260618P00704000": SimpleNamespace(qty=1, market_value=400.0),
+                "SPY260618P00714000": SimpleNamespace(
+                    qty=-1,
+                    market_value=-500.0,
+                    unrealized_pl=150.0,
+                ),
+                "SPY260618P00704000": SimpleNamespace(
+                    qty=1,
+                    market_value=400.0,
+                    unrealized_pl=-101.0,
+                ),
             },
             underlying_price=740.0,
             today=datetime(2026, 5, 19, tzinfo=timezone.utc).date(),
         )
         assert row["current_exit_price"] == pytest.approx(1.0)
         assert row["unrealized_pnl"] == pytest.approx(49.0)
+        assert row["legs"][0]["unrealized_pnl"] == pytest.approx(150.0)
+        assert row["legs"][1]["unrealized_pnl"] == pytest.approx(-101.0)
         assert row["max_profit"] == pytest.approx(149.0)
         assert row["max_loss"] == pytest.approx(851.0)
         assert row["risk_used"] == pytest.approx(851.0)
         assert row["distance_to_short_strike"] == pytest.approx(26.0)
+        assert row["status"] == "healthy"
+
+    def test_flat_spread_within_mark_tolerance_is_healthy(self) -> None:
+        row = build_credit_spread_snapshot(
+            position_id="p1",
+            strategy="credit_spread",
+            underlying="QQQ",
+            short_occ="QQQ260626P00674000",
+            long_occ="QQQ260626P00660000",
+            short_strike=674.0,
+            long_strike=660.0,
+            expiration="2026-06-26",
+            entry_net_price=2.28,
+            width=14.0,
+            qty=1,
+            broker_positions={
+                "QQQ260626P00674000": SimpleNamespace(qty=-1, current_price=7.67),
+                "QQQ260626P00660000": SimpleNamespace(qty=1, current_price=5.38),
+            },
+            underlying_price=701.52,
+            today=datetime(2026, 5, 20, tzinfo=timezone.utc).date(),
+        )
+        assert row["current_exit_price"] == pytest.approx(2.29)
+        assert row["unrealized_pnl"] == pytest.approx(-1.0)
         assert row["status"] == "healthy"
 
     def test_losing_spread_valuation_is_watch(self) -> None:

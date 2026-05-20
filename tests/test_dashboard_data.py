@@ -6,11 +6,13 @@ import json
 import sqlite3
 from datetime import datetime, timezone
 from pathlib import Path
+from types import SimpleNamespace
 
 import pandas as pd
 import pytest
 
 from dashboard import (
+    broker_position_detail,
     compute_equity_curve,
     load_broker_account_curve,
     compute_rolling_sharpe,
@@ -19,6 +21,7 @@ from dashboard import (
     format_delta_currency,
     load_engine_state,
     load_trades,
+    multi_leg_display_rows,
     refresh_multi_leg_positions,
     resolve_account_metrics,
 )
@@ -202,6 +205,23 @@ class TestLoadBrokerAccountCurve:
 
 
 class TestRefreshMultiLegPositions:
+    def test_broker_position_detail_preserves_alpaca_option_pnl(self):
+        position = SimpleNamespace(
+            qty=1,
+            avg_entry_price=4.92,
+            current_price=3.72,
+            market_value=372.0,
+            cost_basis=492.0,
+            unrealized_pl=-120.0,
+            unrealized_plpc=-0.2439,
+        )
+        detail = broker_position_detail(position)
+        assert detail["current_price"] == pytest.approx(3.72)
+        assert detail["cost_basis"] == pytest.approx(492.0)
+        assert detail["unrealized_pl"] == pytest.approx(-120.0)
+        assert detail["unrealized_pnl"] == pytest.approx(-120.0)
+        assert detail["unrealized_plpc"] == pytest.approx(-0.2439)
+
     def test_returns_snapshot_rows_without_broker_refresh(self):
         state = {
             "multi_leg_positions": [{
@@ -237,6 +257,48 @@ class TestRefreshMultiLegPositions:
         assert rows[0]["current_exit_price"] == pytest.approx(1.95)
         assert rows[0]["unrealized_pnl"] == pytest.approx(-46.0)
         assert rows[0]["status"] == "watch"
+
+    def test_display_rows_include_short_long_and_net_pnl(self):
+        rows = multi_leg_display_rows([{
+            "structure": "put_credit_spread",
+            "underlying": "SPY",
+            "short_strike": 704.0,
+            "long_strike": 695.0,
+            "expiration": "2026-06-26",
+            "dte": 37,
+            "entry_net_price": 1.27,
+            "current_exit_price": 1.04,
+            "qty": 1,
+            "unrealized_pnl": 23.0,
+            "max_profit": 127.0,
+            "max_loss": 773.0,
+            "underlying_price": 740.67,
+            "distance_to_short_strike": 36.67,
+            "distance_to_short_strike_pct": 0.0495,
+            "status": "healthy",
+            "legs": [
+                {"role": "short", "unrealized_pnl": 143.0},
+                {"role": "long", "unrealized_pnl": -120.0},
+            ],
+        }])
+        assert rows[0].pop("Distance %") == pytest.approx(4.95)
+        assert rows == [{
+            "Structure": "Put Credit Spread",
+            "Underlying": "SPY",
+            "Strikes": "704 / 695",
+            "Expiration": "2026-06-26",
+            "DTE": 37,
+            "Entry Credit": 127.0,
+            "Mark Debit": 104.0,
+            "Net Spread P&L": 23.0,
+            "Short Leg P&L": 143.0,
+            "Long Leg P&L": -120.0,
+            "Max Profit": 127.0,
+            "Max Loss": 773.0,
+            "Underlying Price": 740.67,
+            "Distance": 36.67,
+            "Status": "healthy",
+        }]
 
 
 # ── compute_equity_curve ─────────────────────────────────────────────────────

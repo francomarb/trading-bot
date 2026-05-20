@@ -70,6 +70,10 @@ class Position:
     qty: float
     avg_entry_price: float
     market_value: float  # current market value (qty * last price)
+    current_price: float | None = None
+    cost_basis: float | None = None
+    unrealized_pl: float | None = None
+    unrealized_plpc: float | None = None
 
 
 @dataclass(frozen=True)

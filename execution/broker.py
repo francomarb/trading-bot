@@ -301,6 +301,26 @@ class AlpacaBroker:
                 qty=float(p.qty),
                 avg_entry_price=float(p.avg_entry_price),
                 market_value=float(p.market_value),
+                current_price=(
+                    float(p.current_price)
+                    if getattr(p, "current_price", None) is not None
+                    else None
+                ),
+                cost_basis=(
+                    float(p.cost_basis)
+                    if getattr(p, "cost_basis", None) is not None
+                    else None
+                ),
+                unrealized_pl=(
+                    float(p.unrealized_pl)
+                    if getattr(p, "unrealized_pl", None) is not None
+                    else None
+                ),
+                unrealized_plpc=(
+                    float(p.unrealized_plpc)
+                    if getattr(p, "unrealized_plpc", None) is not None
+                    else None
+                ),
             )
         return out
 
