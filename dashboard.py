@@ -461,7 +461,11 @@ def compute_strategy_stats(trades_df: pd.DataFrame) -> pd.DataFrame:
     Compute per-strategy summary: trades, wins, win_rate, total_pnl,
     avg_realized_slippage_bps.
 
-    A "win" is defined as a sell row where realized P&L > 0.
+    A "trade" is a fully closed position, aggregated across all exit rows that
+    share the same strategy / symbol / entry_timestamp. This prevents a
+    whole-share stop fill plus fractional residual cleanup from appearing as
+    two separate trades in Strategy Health. Positions whose logged exits do
+    not yet sum to the original entry quantity are skipped as incomplete.
     """
     if trades_df.empty or "strategy" not in trades_df.columns:
         return pd.DataFrame(columns=[
@@ -471,16 +475,63 @@ def compute_strategy_stats(trades_df: pd.DataFrame) -> pd.DataFrame:
 
     results = []
     for strategy, group in trades_df.groupby("strategy"):
-        events = _realized_pnl_events(group, key_columns=("symbol",))
-        pnls = [event["pnl"] for event in events]
+        entries = group[
+            (group.get("side", "").astype(str).str.lower() == "buy")
+            & group.get("entry_timestamp").notna()
+        ].copy()
+        exits = group[
+            (group.get("side", "").astype(str).str.lower() == "sell")
+            & group.get("entry_timestamp").notna()
+        ].copy()
+        if entries.empty or exits.empty:
+            pnls: list[float] = []
+            avg_slip = 0.0
+        else:
+            entries["filled_qty_num"] = pd.to_numeric(
+                entries["filled_qty"], errors="coerce"
+            ).fillna(0.0)
+            exits["realized_pnl"] = pd.to_numeric(exits["realized_pnl"], errors="coerce")
+            exits["realized_slippage_bps"] = pd.to_numeric(
+                exits["realized_slippage_bps"], errors="coerce"
+            )
+            exits["filled_qty_num"] = pd.to_numeric(
+                exits["filled_qty"], errors="coerce"
+            ).fillna(0.0)
+
+            entry_groups = entries.groupby(
+                ["symbol", "entry_timestamp"], dropna=True, sort=False
+            ).agg(entry_qty=("filled_qty_num", "sum"))
+            grouped = exits.groupby(
+                ["symbol", "entry_timestamp"], dropna=True, sort=False
+            ).agg(
+                realized_pnl=("realized_pnl", "sum"),
+                exit_qty=("filled_qty_num", "sum"),
+                slippage_numer=(
+                    "realized_slippage_bps",
+                    lambda s: float((s.fillna(0.0) * exits.loc[s.index, "filled_qty_num"]).sum()),
+                ),
+                slippage_denom=("filled_qty_num", "sum"),
+            )
+            grouped = grouped.join(entry_groups, how="inner")
+            grouped = grouped[
+                grouped["exit_qty"] >= (grouped["entry_qty"] - 1e-9)
+            ]
+
+            if grouped.empty:
+                pnls = []
+                avg_slip = 0.0
+            else:
+                pnls = grouped["realized_pnl"].fillna(0.0).tolist()
+                total_slippage_denom = float(grouped["slippage_denom"].sum())
+                avg_slip = (
+                    float(grouped["slippage_numer"].sum()) / total_slippage_denom
+                    if total_slippage_denom > 0 else 0.0
+                )
 
         wins = sum(1 for p in pnls if p > 0)
         trade_count = len(pnls)
         total_pnl = sum(pnls)
         win_rate = wins / trade_count if trade_count > 0 else 0.0
-        avg_slip = float(
-            pd.to_numeric(group["realized_slippage_bps"], errors="coerce").dropna().mean()
-        ) if "realized_slippage_bps" in group.columns else 0.0
 
         results.append({
             "strategy": strategy,
@@ -1073,9 +1124,9 @@ def render_dashboard() -> None:
 
     # ── Strategy health ───────────────────────────────────────────────────
     render_section_header(
-        "Strategy Health",
+        "Strategy Realized P&L",
         "Closed-trade summary by strategy using realized P&L and slippage.",
-        kicker="Attribution",
+        kicker="Strategy Realized P&L",
     )
     strategy_stats = compute_strategy_stats(trades_df)
     if strategy_stats.empty:

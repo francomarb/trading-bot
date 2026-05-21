@@ -267,6 +267,33 @@ class TestSubmitOrderKwargs:
         assert result.side is Side.SELL
         assert result.stop_price == 95.5
 
+    def test_repair_stop_registers_standalone_stop_leg_with_stream(self):
+        api = MagicMock()
+        api.submit_order.return_value = _alpaca_order(
+            id="repair-stop-1",
+            status="accepted",
+            side="sell",
+            type="stop",
+            stop_price="95.5",
+            qty=10,
+        )
+        stream = MagicMock()
+        broker = AlpacaBroker(
+            client=api,
+            max_attempts=3,
+            base_delay=0.0,
+            stream_manager=stream,
+        )
+
+        broker.place_protective_stop(
+            symbol="AAPL",
+            qty=10,
+            stop_price=95.5,
+            client_order_id_prefix="sma-repair",
+        )
+
+        stream.register_stop_leg.assert_called_once_with("repair-stop-1")
+
     def test_stream_submit_path_watches_binds_and_unwatches(self):
         api = MagicMock()
         stream = MagicMock()
@@ -890,6 +917,29 @@ class TestFractionalOrders:
         assert stop_req.type.value == "stop"
         assert stop_req.stop_price == 96.0
         assert stop_req.side.value == "sell"
+
+    def test_fractional_registers_standalone_stop_leg_with_stream(self):
+        """Whole-share stop for a fractional entry must be registered for stop-fill logging."""
+        api = MagicMock()
+        entry_order = _alpaca_order(id="entry-stream-1", status="accepted", qty=8.5)
+        filled_order = _alpaca_order(
+            id="entry-stream-1", status="filled", qty=8.5,
+            filled_qty=8.5, filled_avg_price=100.5,
+        )
+        stop_order = _alpaca_order(id="stop-stream-1", status="accepted", qty=8)
+        api.submit_order.side_effect = [entry_order, stop_order]
+        api.get_order_by_id.return_value = filled_order
+
+        stream = MagicMock()
+        broker = AlpacaBroker(
+            client=api,
+            max_attempts=3,
+            base_delay=0.0,
+            stream_manager=stream,
+        )
+        broker.place_order(_decision(qty=8.5, stop=96.0), poll_timeout=0.1)
+
+        stream.register_stop_leg.assert_called_once_with("stop-stream-1")
 
     def test_fractional_sub_one_share_no_stop_submitted(self):
         """When floor(qty) == 0 (qty < 1), no stop order is submitted."""

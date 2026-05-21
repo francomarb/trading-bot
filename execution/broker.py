@@ -791,10 +791,11 @@ class AlpacaBroker:
                     client_order_id=stop_client_id,
                 )
                 try:
-                    self._with_retry(
+                    stop_order = self._with_retry(
                         lambda: self._api.submit_order(stop_request),
                         op_desc=f"submit_frac_stop({decision.symbol})",
                     )
+                    self._register_standalone_stop_leg(stop_order)
                     logger.info(
                         f"[fractional] GTC stop: sell {stop_qty} "
                         f"{decision.symbol} @ ${decision.stop_price:.2f}"
@@ -1213,6 +1214,7 @@ class AlpacaBroker:
             lambda: self._api.submit_order(order_request),
             op_desc=f"submit_repair_stop({symbol})",
         )
+        self._register_standalone_stop_leg(order)
         return self._to_open_order(order)
 
     # ── Internals ────────────────────────────────────────────────────────
@@ -1398,6 +1400,15 @@ class AlpacaBroker:
             raw_status=None,
             message=msg,
         )
+
+    def _register_standalone_stop_leg(self, order) -> None:
+        """Register a standalone broker stop order so later stop fills get logged."""
+        if self._stream_manager is None:
+            return
+        order_id = getattr(order, "id", None)
+        if order_id is None:
+            return
+        self._stream_manager.register_stop_leg(str(order_id))
 
     def _stream_lookup_order_by_id(self, order_id: str):
         """Read-only lookup hook used by StreamManager gap recovery."""

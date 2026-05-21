@@ -427,10 +427,12 @@ class TestComputeStrategyStats:
         df = self._make_df([
             {"symbol": "AAPL", "side": "buy", "strategy": "sma_crossover",
              "avg_fill_price": "100.0", "filled_qty": "10", "qty": "10",
-             "realized_slippage_bps": "3.0", "timestamp": _ts(0)},
+             "realized_slippage_bps": "3.0", "timestamp": _ts(0),
+             "entry_timestamp": _ts(0)},
             {"symbol": "AAPL", "side": "sell", "strategy": "sma_crossover",
              "avg_fill_price": "120.0", "filled_qty": "10", "qty": "10",
-             "realized_slippage_bps": "4.0", "timestamp": _ts(1)},
+             "realized_slippage_bps": "4.0", "timestamp": _ts(1),
+             "entry_timestamp": _ts(0), "realized_pnl": "200.0"},
         ])
         stats = compute_strategy_stats(df)
         assert len(stats) == 1
@@ -446,16 +448,20 @@ class TestComputeStrategyStats:
             # Two trades: one win, one loss
             {"symbol": "AAPL", "side": "buy", "strategy": "sma_crossover",
              "avg_fill_price": "100.0", "filled_qty": "10", "qty": "10",
-             "realized_slippage_bps": "0", "timestamp": _ts(0)},
+             "realized_slippage_bps": "0", "timestamp": _ts(0),
+             "entry_timestamp": _ts(0)},
             {"symbol": "AAPL", "side": "sell", "strategy": "sma_crossover",
              "avg_fill_price": "110.0", "filled_qty": "10", "qty": "10",
-             "realized_slippage_bps": "0", "timestamp": _ts(1)},
+             "realized_slippage_bps": "0", "timestamp": _ts(1),
+             "entry_timestamp": _ts(0), "realized_pnl": "100.0"},
             {"symbol": "GOOG", "side": "buy", "strategy": "sma_crossover",
              "avg_fill_price": "200.0", "filled_qty": "5", "qty": "5",
-             "realized_slippage_bps": "0", "timestamp": _ts(2)},
+             "realized_slippage_bps": "0", "timestamp": _ts(2),
+             "entry_timestamp": _ts(2)},
             {"symbol": "GOOG", "side": "sell", "strategy": "sma_crossover",
              "avg_fill_price": "190.0", "filled_qty": "5", "qty": "5",
-             "realized_slippage_bps": "0", "timestamp": _ts(3)},
+             "realized_slippage_bps": "0", "timestamp": _ts(3),
+             "entry_timestamp": _ts(2), "realized_pnl": "-50.0"},
         ])
         stats = compute_strategy_stats(df)
         row = stats[stats["strategy"] == "sma_crossover"].iloc[0]
@@ -467,16 +473,20 @@ class TestComputeStrategyStats:
         df = self._make_df([
             {"symbol": "AAPL", "side": "buy", "strategy": "sma_crossover",
              "avg_fill_price": "100.0", "filled_qty": "10", "qty": "10",
-             "realized_slippage_bps": "2.0", "timestamp": _ts(0)},
+             "realized_slippage_bps": "2.0", "timestamp": _ts(0),
+             "entry_timestamp": _ts(0)},
             {"symbol": "AAPL", "side": "sell", "strategy": "sma_crossover",
              "avg_fill_price": "110.0", "filled_qty": "10", "qty": "10",
-             "realized_slippage_bps": "3.0", "timestamp": _ts(1)},
+             "realized_slippage_bps": "3.0", "timestamp": _ts(1),
+             "entry_timestamp": _ts(0), "realized_pnl": "100.0"},
             {"symbol": "ALLY", "side": "buy", "strategy": "rsi_reversion",
              "avg_fill_price": "50.0", "filled_qty": "20", "qty": "20",
-             "realized_slippage_bps": "5.0", "timestamp": _ts(2)},
+             "realized_slippage_bps": "5.0", "timestamp": _ts(2),
+             "entry_timestamp": _ts(2)},
             {"symbol": "ALLY", "side": "sell", "strategy": "rsi_reversion",
              "avg_fill_price": "48.0", "filled_qty": "20", "qty": "20",
-             "realized_slippage_bps": "4.0", "timestamp": _ts(3)},
+             "realized_slippage_bps": "4.0", "timestamp": _ts(3),
+             "entry_timestamp": _ts(2), "realized_pnl": "-40.0"},
         ])
         stats = compute_strategy_stats(df)
         assert len(stats) == 2
@@ -484,24 +494,67 @@ class TestComputeStrategyStats:
         assert "sma_crossover" in strategies
         assert "rsi_reversion" in strategies
 
-    def test_partial_exit_counts_both_realized_closes(self):
+    def test_partial_exit_for_same_position_counts_as_one_trade(self):
         df = self._make_df([
             {"symbol": "AAPL", "side": "buy", "strategy": "sma_crossover",
              "avg_fill_price": "100.0", "filled_qty": "10", "qty": "10",
-             "realized_slippage_bps": "0", "timestamp": _ts(0)},
+             "realized_slippage_bps": "0", "timestamp": _ts(0),
+             "entry_timestamp": _ts(0)},
             {"symbol": "AAPL", "side": "sell", "strategy": "sma_crossover",
              "avg_fill_price": "110.0", "filled_qty": "5", "qty": "5",
-             "realized_slippage_bps": "0", "timestamp": _ts(1)},
+             "realized_slippage_bps": "0", "timestamp": _ts(1),
+             "entry_timestamp": _ts(0), "realized_pnl": "50.0"},
             {"symbol": "AAPL", "side": "sell", "strategy": "sma_crossover",
              "avg_fill_price": "120.0", "filled_qty": "5", "qty": "5",
-             "realized_slippage_bps": "0", "timestamp": _ts(2)},
+             "realized_slippage_bps": "0", "timestamp": _ts(2),
+             "entry_timestamp": _ts(0), "realized_pnl": "100.0"},
         ])
         stats = compute_strategy_stats(df)
         row = stats[stats["strategy"] == "sma_crossover"].iloc[0]
-        assert row["trades"] == 2
-        assert row["wins"] == 2
+        assert row["trades"] == 1
+        assert row["wins"] == 1
         assert pytest.approx(row["total_pnl"]) == 150.0
         assert pytest.approx(row["win_rate"]) == 1.0
+
+    def test_fractional_cleanup_and_main_exit_aggregate_into_one_trade(self):
+        df = self._make_df([
+            {"symbol": "DK", "side": "buy", "strategy": "sma_crossover",
+             "avg_fill_price": "44.50", "filled_qty": "236.4", "qty": "236.4",
+             "realized_slippage_bps": "353.35", "timestamp": _ts(0),
+             "entry_timestamp": _ts(0)},
+            {"symbol": "DK", "side": "sell", "strategy": "sma_crossover",
+             "avg_fill_price": "41.92", "filled_qty": "236.0", "qty": "236.0",
+             "realized_slippage_bps": "0", "timestamp": _ts(1),
+             "entry_timestamp": _ts(0), "realized_pnl": str((41.92 - 44.50) * 236)},
+            {"symbol": "DK", "side": "sell", "strategy": "sma_crossover",
+             "avg_fill_price": "41.872", "filled_qty": "0.4", "qty": "0.4",
+             "realized_slippage_bps": "0", "timestamp": _ts(2),
+             "entry_timestamp": _ts(0), "realized_pnl": str((41.872 - 44.50) * 0.4)},
+        ])
+        stats = compute_strategy_stats(df)
+        row = stats.iloc[0]
+        assert row["trades"] == 1
+        assert row["wins"] == 0
+        assert pytest.approx(row["total_pnl"]) == pytest.approx(
+            (41.92 - 44.50) * 236 + (41.872 - 44.50) * 0.4
+        )
+
+    def test_incomplete_exit_is_skipped_until_full_close_is_logged(self):
+        df = self._make_df([
+            {"symbol": "TSLA", "side": "buy", "strategy": "donchian_breakout",
+             "avg_fill_price": "420.73", "filled_qty": "5.39", "qty": "5.39",
+             "realized_slippage_bps": "10.0", "timestamp": _ts(0),
+             "entry_timestamp": _ts(0)},
+            {"symbol": "TSLA", "side": "sell", "strategy": "donchian_breakout",
+             "avg_fill_price": "418.728", "filled_qty": "0.39", "qty": "0.39",
+             "realized_slippage_bps": "0", "timestamp": _ts(1),
+             "entry_timestamp": _ts(0), "realized_pnl": "-3.73698"},
+        ])
+        stats = compute_strategy_stats(df)
+        row = stats.iloc[0]
+        assert row["trades"] == 0
+        assert row["wins"] == 0
+        assert pytest.approx(row["total_pnl"]) == 0.0
 
 
 class TestComputeSleeveUsage:
