@@ -437,6 +437,36 @@ def compute_equity_curve(trades_df: pd.DataFrame) -> pd.DataFrame:
     return df[["timestamp", "cumulative_pnl"]]
 
 
+def filter_realized_curve_window(
+    curve_df: pd.DataFrame,
+    period: str,
+) -> pd.DataFrame:
+    """Filter a realized equity curve to 1W, 1M, or All."""
+    if curve_df.empty:
+        return curve_df
+    if period == "All":
+        return curve_df
+
+    latest_ts = pd.to_datetime(curve_df["timestamp"]).max()
+    if pd.isna(latest_ts):
+        return curve_df
+
+    if period == "1W":
+        cutoff = latest_ts - pd.Timedelta(days=7)
+    elif period == "1M":
+        cutoff = latest_ts - pd.Timedelta(days=31)
+    else:
+        raise ValueError(f"unsupported realized curve period: {period}")
+
+    filtered = curve_df[pd.to_datetime(curve_df["timestamp"]) >= cutoff].copy()
+    if filtered.empty:
+        return filtered
+
+    baseline = float(filtered["cumulative_pnl"].iloc[0])
+    filtered["cumulative_pnl"] = filtered["cumulative_pnl"] - baseline
+    return filtered
+
+
 def compute_rolling_sharpe(
     equity_series: pd.Series, window: int = 20
 ) -> pd.Series:
@@ -1057,6 +1087,16 @@ def render_dashboard() -> None:
 
     # ── Equity curve + rolling Sharpe ────────────────────────────────────
     equity_curve = compute_equity_curve(trades_df)
+    realized_curve_period = st.segmented_control(
+        "Realized curve window",
+        options=["1W", "1M", "All"],
+        default="All",
+        key="realized_curve_period",
+    )
+    displayed_equity_curve = filter_realized_curve_window(
+        equity_curve,
+        realized_curve_period or "All",
+    )
 
     left, right = st.columns([2, 1])
 
@@ -1066,18 +1106,18 @@ def render_dashboard() -> None:
             "Realized cumulative P&L from closed trades only.",
             kicker="Performance",
         )
-        if equity_curve.empty:
+        if displayed_equity_curve.empty:
             st.info("No closed trades yet.")
         else:
-            final_pnl = equity_curve["cumulative_pnl"].iloc[-1]
+            final_pnl = displayed_equity_curve["cumulative_pnl"].iloc[-1]
             line_color = "#00b09b" if final_pnl >= 0 else "#ff4b4b"
             fill_color = "rgba(0,176,155,0.15)" if final_pnl >= 0 else "rgba(255,75,75,0.15)"
             fig = go.Figure()
             # Zero reference line
             fig.add_hline(y=0, line_color="rgba(255,255,255,0.2)", line_width=1)
             fig.add_trace(go.Scatter(
-                x=equity_curve["timestamp"],
-                y=equity_curve["cumulative_pnl"],
+                x=displayed_equity_curve["timestamp"],
+                y=displayed_equity_curve["cumulative_pnl"],
                 mode="lines",
                 name="Cumulative P&L",
                 line=dict(color=line_color, width=2),
@@ -1104,21 +1144,24 @@ def render_dashboard() -> None:
             "Computed from realized trade outcomes in the trade log.",
             kicker="Performance",
         )
-        if equity_curve.empty or len(equity_curve) < 3:
-            st.info("Need more trades for metrics.")
+        pnl_events = _realized_pnl_events(trades_df, key_columns=("symbol",))
+        pnl_list = [event["pnl"] for event in pnl_events]
+        sample_size = len(pnl_list)
+        if not pnl_list:
+            st.info("No realized close events yet.")
+        elif sample_size < 5:
+            st.warning(
+                f"Insufficient realized sample for meaningful metrics "
+                f"({sample_size} event{'s' if sample_size != 1 else ''})."
+            )
         else:
             from reporting.metrics import compute_metrics
-            pnl_events = _realized_pnl_events(trades_df, key_columns=("symbol",))
-            pnl_list = [event["pnl"] for event in pnl_events]
-            if pnl_list:
-                m = compute_metrics(pnl_list)
-                st.metric("Sharpe (annualized)", f"{m.sharpe_ratio:.2f}")
-                st.metric("Max Drawdown", f"{m.max_drawdown_pct:.1%}")
-                st.metric("Profit Factor", f"{m.profit_factor:.2f}")
-                st.metric("Win Rate", f"{m.win_rate:.1%}")
-                st.metric("Avg W/L Ratio", f"{m.avg_win_loss_ratio:.2f}")
-            else:
-                st.info("No closed trades yet.")
+            m = compute_metrics(pnl_list)
+            st.metric("Sharpe (annualized)", f"{m.sharpe_ratio:.2f}")
+            st.metric("Max Drawdown", f"{m.max_drawdown_pct:.1%}")
+            st.metric("Profit Factor", f"{m.profit_factor:.2f}")
+            st.metric("Win Rate", f"{m.win_rate:.1%}")
+            st.metric("Avg W/L Ratio", f"{m.avg_win_loss_ratio:.2f}")
 
     st.divider()
 

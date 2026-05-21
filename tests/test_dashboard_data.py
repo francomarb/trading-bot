@@ -14,6 +14,7 @@ import pytest
 from dashboard import (
     broker_position_detail,
     compute_equity_curve,
+    filter_realized_curve_window,
     load_broker_account_curve,
     compute_rolling_sharpe,
     compute_sleeve_usage,
@@ -374,6 +375,36 @@ class TestComputeEquityCurve:
         assert len(curve) == 2
         assert pytest.approx(curve["cumulative_pnl"].iloc[0]) == 50.0
         assert pytest.approx(curve["cumulative_pnl"].iloc[1]) == 150.0
+
+
+class TestFilterRealizedCurveWindow:
+    def test_all_returns_original_curve(self):
+        curve = pd.DataFrame({
+            "timestamp": pd.to_datetime([_ts(0), _ts(10)], utc=True),
+            "cumulative_pnl": [10.0, 25.0],
+        })
+        filtered = filter_realized_curve_window(curve, "All")
+        pd.testing.assert_frame_equal(filtered, curve)
+
+    def test_1w_filters_and_rebases_to_zero(self):
+        curve = pd.DataFrame({
+            "timestamp": pd.to_datetime([_ts(0), _ts(3), _ts(10)], utc=True),
+            "cumulative_pnl": [10.0, 25.0, 40.0],
+        })
+        filtered = filter_realized_curve_window(curve, "1W")
+        assert len(filtered) == 2
+        assert pytest.approx(filtered["cumulative_pnl"].iloc[0]) == 0.0
+        assert pytest.approx(filtered["cumulative_pnl"].iloc[1]) == 15.0
+
+    def test_1m_keeps_full_curve_and_rebases_first_point(self):
+        curve = pd.DataFrame({
+            "timestamp": pd.to_datetime([_ts(0), _ts(5), _ts(10)], utc=True),
+            "cumulative_pnl": [-5.0, 10.0, 20.0],
+        })
+        filtered = filter_realized_curve_window(curve, "1M")
+        assert len(filtered) == 3
+        assert pytest.approx(filtered["cumulative_pnl"].iloc[0]) == 0.0
+        assert pytest.approx(filtered["cumulative_pnl"].iloc[-1]) == 25.0
 
 
 # ── compute_rolling_sharpe ───────────────────────────────────────────────────
