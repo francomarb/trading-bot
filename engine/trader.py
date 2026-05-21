@@ -1621,6 +1621,48 @@ class TradingEngine:
         )
         self._allocator.record_realized_pnl(strategy_name, realized_pnl)
 
+    def _close_fractional_residual_position(
+        self,
+        *,
+        snapshot: BrokerSnapshot,
+        symbol: str,
+        owner: str,
+        position: Position,
+    ) -> None:
+        """Auto-close a managed residual equity stub that cannot carry a broker stop."""
+        if self._has_pending_close_order(symbol, snapshot):
+            logger.info(
+                f"{symbol}: residual fractional position has a close order "
+                "pending — skipping duplicate dust cleanup"
+            )
+            return
+
+        logger.warning(
+            f"{symbol}: auto-closing residual fractional position qty={position.qty} "
+            "because it cannot carry a whole-share protective stop"
+        )
+        result = self.broker.close_position(position.symbol)
+        close_price = float(
+            result.avg_fill_price
+            or getattr(position, "current_price", 0.0)
+            or getattr(position, "avg_entry_price", 0.0)
+            or 0.0
+        )
+        self._log_close(result, close_price, owner)
+        if result.status in {OrderStatus.FILLED, OrderStatus.PARTIAL}:
+            close_qty = float(result.filled_qty or position.qty or 0.0)
+            self.alerts.trade_executed(
+                symbol=symbol,
+                strategy=owner,
+                side="sell",
+                qty=close_qty,
+                price=close_price,
+                reason="fractional residual cleanup",
+            )
+            self._record_realized_pnl(symbol, owner, close_price, close_qty)
+            self._pop_position(symbol)
+            self._entry_prices.pop(symbol, None)
+
     def _attribute_orders(
         self, open_orders: list
     ) -> dict[str, str]:
@@ -1784,10 +1826,11 @@ class TradingEngine:
 
             stop_qty = abs(int(position.qty))
             if stop_qty < 1:
-                logger.info(
-                    f"{symbol}: position qty={position.qty} has no whole-share "
-                    "stop quantity; fractional remainder will rely on strategy "
-                    "exits until reduced or closed"
+                self._close_fractional_residual_position(
+                    snapshot=snapshot,
+                    symbol=symbol,
+                    owner=owner,
+                    position=position,
                 )
                 continue
 
