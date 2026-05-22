@@ -86,6 +86,13 @@ def _utcnow() -> datetime:
     return datetime.now(timezone.utc)
 
 
+def _seconds_since(moment: datetime | None, now: datetime) -> float | None:
+    """Return elapsed seconds from `moment` to `now`, or None when unknown."""
+    if moment is None:
+        return None
+    return max(0.0, (now - moment).total_seconds())
+
+
 class StreamManager:
     """
     Owns the Trading API websocket lifecycle, reconnection policy, and
@@ -403,6 +410,16 @@ class StreamManager:
             self._touch_rx()
 
     async def _dispatch_message(self, msg: dict[str, Any]) -> None:
+        if msg.get("action") == "error":
+            error_message = msg.get("data", {}).get("error_message", "unknown")
+            logger.warning(f"stream manager: server error before disconnect ({error_message})")
+            return
+        if msg.get("stream") == "authorization":
+            logger.warning(f"stream manager: authorization update {msg.get('data')}")
+            return
+        if msg.get("stream") == "listening":
+            logger.debug(f"stream manager: listening ack {msg.get('data')}")
+            return
         if msg.get("stream") != "trade_updates":
             return
         data = msg.get("data")
@@ -425,6 +442,9 @@ class StreamManager:
     async def _mark_connected(self) -> None:
         now = _utcnow()
         with self._lock:
+            prior_disconnect_at = self._health.last_disconnect_at
+        downtime = _seconds_since(prior_disconnect_at, now)
+        with self._lock:
             generation = self._health.generation + 1
             self._health = StreamHealth(
                 connected=True,
@@ -435,24 +455,46 @@ class StreamManager:
                 last_reconnect_at=now,
                 consecutive_failures=0,
             )
-        logger.info(f"stream manager: healthy (generation={generation})")
+        if downtime is None:
+            logger.info(f"stream manager: healthy (generation={generation})")
+        else:
+            logger.info(
+                f"stream manager: healthy (generation={generation}, "
+                f"downtime={downtime:.1f}s)"
+            )
 
     async def _mark_disconnected(self, exc: Exception) -> None:
         await self._close_ws()
         now = _utcnow()
         with self._lock:
+            last_rx_at = self._health.last_rx_at
+            last_reconnect_at = self._health.last_reconnect_at
             self._health = StreamHealth(
                 connected=False,
                 healthy=False,
                 generation=self._health.generation,
-                last_rx_at=self._health.last_rx_at,
+                last_rx_at=last_rx_at,
                 last_disconnect_at=now,
-                last_reconnect_at=self._health.last_reconnect_at,
+                last_reconnect_at=last_reconnect_at,
                 consecutive_failures=self._health.consecutive_failures + 1,
             )
             failures = self._health.consecutive_failures
+        reason = self._disconnect_reason(exc)
+        details = self._disconnect_details(exc)
+        last_rx_age = _seconds_since(last_rx_at, now)
+        connected_for = _seconds_since(last_reconnect_at, now)
+        rx_fragment = (
+            f", last_rx_age={last_rx_age:.1f}s" if last_rx_age is not None else ""
+        )
+        conn_fragment = (
+            f", connected_for={connected_for:.1f}s"
+            if connected_for is not None
+            else ""
+        )
         logger.warning(
-            f"stream manager: disconnected ({type(exc).__name__}: {exc}) "
+            f"stream manager: disconnected "
+            f"(reason={reason}, exc={type(exc).__name__}: {exc}"
+            f"{details}{rx_fragment}{conn_fragment}) "
             f"[failures={failures}]"
         )
 
@@ -468,6 +510,85 @@ class StreamManager:
                 last_reconnect_at=self._health.last_reconnect_at,
                 consecutive_failures=self._health.consecutive_failures,
             )
+
+    @staticmethod
+    def _disconnect_reason(exc: Exception) -> str:
+        """Collapse noisy websocket exceptions into a small set of operator-facing buckets."""
+        msg = StreamManager._exception_text(exc)
+        if "heartbeat timeout" in msg:
+            return "heartbeat_timeout"
+        if "no close frame received or sent" in msg:
+            return "remote_close_no_frame"
+        if "timed out during opening handshake" in msg:
+            return "connect_timeout"
+        if "connection reset" in msg or "connection aborted" in msg:
+            return "connection_reset"
+        if (
+            "name or service not known" in msg
+            or "temporary failure in name resolution" in msg
+            or "nodename nor servname provided" in msg
+            or "could not resolve host" in msg
+        ):
+            return "dns_failure"
+        if "network is unreachable" in msg or "no route to host" in msg:
+            return "network_unreachable"
+        return type(exc).__name__.lower()
+
+    @staticmethod
+    def _disconnect_details(exc: Exception) -> str:
+        """Format concrete transport details for disconnect diagnostics."""
+        fragments: list[str] = []
+
+        rcvd = getattr(exc, "rcvd", None)
+        sent = getattr(exc, "sent", None)
+        if rcvd is not None:
+            fragments.append(
+                f"close_rcvd={rcvd.code}"
+                + (f":{rcvd.reason}" if rcvd.reason else "")
+            )
+        if sent is not None:
+            fragments.append(
+                f"close_sent={sent.code}"
+                + (f":{sent.reason}" if sent.reason else "")
+            )
+
+        errno_value = getattr(exc, "errno", None)
+        if errno_value is None:
+            for chained in StreamManager._iter_exception_chain(exc):
+                errno_value = getattr(chained, "errno", None)
+                if errno_value is not None:
+                    break
+        if errno_value is not None:
+            fragments.append(f"errno={errno_value}")
+
+        chain = [
+            f"{type(chained).__name__}: {chained}"
+            for chained in StreamManager._iter_exception_chain(exc)[1:]
+            if str(chained)
+        ]
+        if chain:
+            fragments.append("caused_by=" + " <- ".join(chain))
+
+        if not fragments:
+            return ""
+        return ", " + ", ".join(fragments)
+
+    @staticmethod
+    def _exception_text(exc: BaseException) -> str:
+        return " | ".join(
+            str(chained).lower()
+            for chained in StreamManager._iter_exception_chain(exc)
+            if str(chained)
+        )
+
+    @staticmethod
+    def _iter_exception_chain(exc: BaseException) -> list[BaseException]:
+        chain: list[BaseException] = []
+        current: BaseException | None = exc
+        while current is not None and current not in chain:
+            chain.append(current)
+            current = current.__cause__ or current.__context__
+        return chain
 
     # ── Gap recovery ─────────────────────────────────────────────────────
 

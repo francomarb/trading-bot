@@ -13,12 +13,15 @@ from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
 import pytest
+from websockets.exceptions import ConnectionClosedError
+from websockets.frames import Close
 
 from execution.stream import (
     StreamHealth,
     StreamManager,
     _FILL_EVENTS,
     _TERMINAL_EVENTS,
+    _utcnow,
 )
 
 
@@ -255,6 +258,105 @@ class TestReconnectLoop:
         asyncio.run(sm._run_async())
 
         assert sm.delays[:2] == [1.0, 1.0]
+
+
+class TestDisconnectObservability:
+    def test_disconnect_reason_buckets_known_cases(self):
+        assert StreamManager._disconnect_reason(
+            TimeoutError("trading websocket heartbeat timeout")
+        ) == "heartbeat_timeout"
+        assert StreamManager._disconnect_reason(
+            RuntimeError("timed out during opening handshake")
+        ) == "connect_timeout"
+        assert StreamManager._disconnect_reason(
+            RuntimeError("Connection reset by peer")
+        ) == "connection_reset"
+
+    def test_disconnect_reason_uses_cause_chain_for_network_errors(self):
+        exc = RuntimeError("stream failed")
+        exc.__cause__ = OSError(65, "No route to host")
+
+        assert StreamManager._disconnect_reason(exc) == "network_unreachable"
+
+    def test_mark_disconnected_logs_reason_and_timing_context(self, monkeypatch):
+        sm = _stream()
+        now = _utcnow()
+        with sm._lock:
+            sm._health = StreamHealth(
+                connected=True,
+                healthy=True,
+                generation=3,
+                last_rx_at=now,
+                last_disconnect_at=None,
+                last_reconnect_at=now,
+                consecutive_failures=0,
+            )
+        warning = MagicMock()
+        monkeypatch.setattr("execution.stream.logger.warning", warning)
+
+        asyncio.run(sm._mark_disconnected(TimeoutError("trading websocket heartbeat timeout")))
+
+        msg = warning.call_args.args[0]
+        assert "reason=heartbeat_timeout" in msg
+        assert "last_rx_age=" in msg
+        assert "connected_for=" in msg
+        assert "likely=" not in msg
+
+    def test_mark_disconnected_logs_close_codes_and_causes(self, monkeypatch):
+        sm = _stream()
+        warning = MagicMock()
+        monkeypatch.setattr("execution.stream.logger.warning", warning)
+        exc = ConnectionClosedError(None, Close(1001, "going away"))
+        exc.__cause__ = OSError(8, "nodename nor servname provided, or not known")
+
+        asyncio.run(sm._mark_disconnected(exc))
+
+        msg = warning.call_args.args[0]
+        assert "reason=dns_failure" in msg
+        assert "close_sent=1001:going away" in msg
+        assert "errno=8" in msg
+        assert (
+            "caused_by=OSError: [Errno 8] nodename nor servname provided, or not known"
+            in msg
+        )
+
+    def test_mark_connected_logs_downtime_after_disconnect(self, monkeypatch):
+        sm = _stream()
+        now = _utcnow()
+        with sm._lock:
+            sm._health = StreamHealth(
+                connected=False,
+                healthy=False,
+                generation=2,
+                last_rx_at=now,
+                last_disconnect_at=now,
+                last_reconnect_at=None,
+                consecutive_failures=1,
+            )
+        info = MagicMock()
+        monkeypatch.setattr("execution.stream.logger.info", info)
+
+        asyncio.run(sm._mark_connected())
+
+        msg = info.call_args.args[0]
+        assert "healthy (generation=3" in msg
+        assert "downtime=" in msg
+
+    def test_dispatch_message_logs_server_error_payload(self, monkeypatch):
+        sm = _stream()
+        warning = MagicMock()
+        monkeypatch.setattr("execution.stream.logger.warning", warning)
+
+        asyncio.run(
+            sm._dispatch_message(
+                {"action": "error", "data": {"error_message": "internal server error"}}
+            )
+        )
+
+        assert (
+            warning.call_args.args[0]
+            == "stream manager: server error before disconnect (internal server error)"
+        )
 
 
 class TestRecvLoopDefensiveBehavior:
