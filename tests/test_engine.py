@@ -1908,6 +1908,42 @@ class TestExternalCloseDetection:
         assert sell_rows[0]["order_id"] == "stop-aapl-1"
         assert sell_rows[0]["reason"] == "stop_triggered"
 
+    def test_recovered_stop_fill_uses_100x_multiplier_for_occ_symbol(self, patch_fetch, tmp_path):
+        """Broker-history stop recovery should apply the options contract multiplier when needed."""
+        from risk.allocator import SleeveAllocator
+
+        engine, _, _ = _engine_with_confirm(patch_fetch, tmp_path, confirm=1)
+        engine._entry_prices["SPY"] = 10.0
+        allocator = MagicMock(spec=SleeveAllocator)
+        engine._allocator = allocator
+
+        stop_fill = ClosedOrderInfo(
+            order_id="occ-stop-1",
+            client_order_id=None,
+            symbol="SPY260620C00730000",
+            side=Side.SELL,
+            order_type="stop",
+            status=OrderStatus.FILLED,
+            raw_status="filled",
+            qty=2.0,
+            filled_qty=2.0,
+            avg_fill_price=15.0,
+            stop_price=14.5,
+            submitted_at=T0,
+            filled_at=T0 + timedelta(minutes=1),
+        )
+
+        engine._record_recovered_stop_fill(
+            symbol="SPY",
+            owner="spy_options_reversion",
+            stop_fill=stop_fill,
+        )
+
+        allocator.record_realized_pnl.assert_called_once_with(
+            "spy_options_reversion",
+            1000.0,
+        )
+
     def test_multiple_positions_only_confirmed_ones_cleared(self, patch_fetch, tmp_path):
         """Only positions that hit confirm threshold are cleared."""
         positions = {"MSFT": Position("MSFT", 5, 200.0, 1000.0)}
@@ -2704,6 +2740,39 @@ class TestOptionsEngineFixes:
             strategy="sma_crossover",
             reason="stop_triggered",
         )
+
+    def test_stream_stop_fill_skips_duplicate_order_id(self, tmp_path):
+        """Duplicate stream stop-fill deliveries should be ignored once the order is recorded."""
+        from unittest.mock import MagicMock
+        from types import SimpleNamespace
+        from execution.stream import StreamManager
+
+        engine = self._engine(tmp_path)
+        engine._register_single_leg(strategy_name="fake_strategy", symbol="AAPL")
+        engine._entry_prices["AAPL"] = 100.0
+
+        fill_update = SimpleNamespace(
+            order=SimpleNamespace(symbol="AAPL", id="dup-stop-1"),
+            price="95.0",
+            qty="10",
+        )
+        stream = MagicMock(spec=StreamManager)
+        stream.drain_stop_fills.return_value = [fill_update]
+        engine._stream_manager = stream
+
+        engine.trade_logger.has_recorded_order_id = MagicMock(return_value=True)
+        engine.trade_logger.log_stop_fill = MagicMock()
+        engine.trade_logger.log_external_close = MagicMock()
+        engine.alerts.broker_error = MagicMock()
+        engine._allocator = MagicMock()
+
+        engine._process_stream_stop_fills(_snapshot())
+
+        engine.trade_logger.log_stop_fill.assert_not_called()
+        engine.trade_logger.log_external_close.assert_not_called()
+        engine.alerts.broker_error.assert_not_called()
+        engine._allocator.record_realized_pnl.assert_not_called()
+        assert engine._has_position("AAPL")
 
 
 # ── Shared-symbol conflict rejection (11.7 Part A) ─────────────────────────

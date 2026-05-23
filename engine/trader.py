@@ -1854,24 +1854,32 @@ class TradingEngine:
         """Persist a broker-recovered stop fill and feed realized P&L once."""
         price = stop_fill.avg_fill_price
         qty = float(stop_fill.filled_qty or 0.0)
+        raw_symbol = getattr(stop_fill, "symbol", None) or symbol
         if price is None or qty <= 0:
             self.trade_logger.log_external_close(
-                symbol=symbol,
+                symbol=raw_symbol,
                 strategy=owner,
                 reason="stop_triggered",
             )
             return False
 
         self.trade_logger.log_stop_fill(
-            symbol=symbol,
+            symbol=raw_symbol,
             strategy=owner,
             qty=qty,
             avg_fill_price=price,
             order_id=stop_fill.order_id,
         )
-        self._record_realized_pnl(symbol, owner, price, qty)
+        pnl_multiplier = 100 if _OCC_PAT.match(raw_symbol) else 1
+        self._record_realized_pnl(
+            symbol,
+            owner,
+            price,
+            qty,
+            multiplier=pnl_multiplier,
+        )
         logger.warning(
-            f"{symbol}: recovered missed protective stop fill from broker history "
+            f"{raw_symbol}: recovered missed protective stop fill from broker history "
             f"— qty={qty} price={price} order_id={stop_fill.order_id}"
         )
         return True
@@ -2249,6 +2257,13 @@ class TradingEngine:
                     f"stream stop fill for unowned {raw_symbol} — already handled"
                 )
                 continue
+            order_id = getattr(update.order, "id", None)
+            if self.trade_logger.has_recorded_order_id(order_id):
+                logger.debug(
+                    f"{raw_symbol}: duplicate protective stop fill "
+                    f"{order_id} ignored — already recorded"
+                )
+                continue
             msg = (
                 f"{raw_symbol}: protective stop triggered (WebSocket) — "
                 f"qty={qty} price={price} strategy={owner}"
@@ -2273,7 +2288,7 @@ class TradingEngine:
                         strategy=owner,
                         qty=qty,
                         avg_fill_price=price,
-                        order_id=getattr(update.order, "id", None),
+                        order_id=order_id,
                     )
                 else:
                     # Price or qty unavailable — fall back to the synthetic record.
