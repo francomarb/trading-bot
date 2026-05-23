@@ -218,6 +218,11 @@ class StreamManager:
         with self._lock:
             self._stop_legs.add(order_id)
 
+    def sync_stop_legs(self, order_ids: list[str] | tuple[str, ...] | set[str]) -> None:
+        """Replace tracked protective stop-leg ids with broker-rehydrated truth."""
+        with self._lock:
+            self._stop_legs = {str(order_id) for order_id in order_ids if order_id}
+
     def unwatch(self, order_id: str) -> None:
         """
         Remove watch/update bookkeeping for an entry order.

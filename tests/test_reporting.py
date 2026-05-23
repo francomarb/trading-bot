@@ -188,6 +188,51 @@ class TestTradeLogger:
         assert context["entry_reference_price"] == pytest.approx(150.0)
         assert context["initial_risk_per_share"] == pytest.approx(5.0)
 
+    def test_partial_stop_fill_preserves_open_owner_context(self, tmp_csv):
+        tl = TradeLogger(path=tmp_csv)
+        decision = RiskDecision(
+            symbol="GOOG",
+            side=Side.BUY,
+            qty=7.78,
+            entry_reference_price=391.0,
+            stop_price=378.85,
+            strategy_name="donchian_breakout",
+            reason="test entry",
+            order_type=OrderType.MARKET,
+        )
+        result = OrderResult(
+            status=OrderStatus.FILLED,
+            order_id="buy-goog",
+            symbol="GOOG",
+            requested_qty=7.78,
+            filled_qty=7.78,
+            avg_fill_price=391.2,
+            raw_status="filled",
+            message="filled 7.78 @ 391.2",
+        )
+        tl.log(tl.build_record(decision, result, modeled_price=391.0))
+        tl.log_stop_fill(
+            symbol="GOOG",
+            strategy="donchian_breakout",
+            qty=7.0,
+            avg_fill_price=378.85,
+            order_id="stop-goog-1",
+        )
+
+        assert tl.read_owner_for_symbol("GOOG") == "donchian_breakout"
+        assert tl.read_all_open_owners() == {"GOOG": "donchian_breakout"}
+        assert tl.read_latest_open_stop_price(
+            symbol="GOOG",
+            strategy="donchian_breakout",
+        ) == pytest.approx(378.85)
+        context = tl.read_latest_open_entry_context(
+            symbol="GOOG",
+            strategy="donchian_breakout",
+        )
+        assert context is not None
+        assert context["entry_reference_price"] == pytest.approx(391.0)
+        assert tl.has_recorded_order_id("stop-goog-1") is True
+
     def test_read_strategy_realized_pnl_summary_reconstructs_hwm(self, tmp_csv):
         tl = TradeLogger(path=tmp_csv)
         rows = [

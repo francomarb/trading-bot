@@ -346,16 +346,15 @@ class TestGetOpenSmaPositions:
         tl.close()
         assert get_open_sma_positions(str(db)) == set()
 
-    def test_partial_close_via_smaller_sell_still_closed(self, tmp_path):
-        # In production a sell row — even one with smaller qty than the buy —
-        # marks the position as closed (the engine reconciles broker state
-        # separately). The trade-log view follows latest-row semantics.
+    def test_partial_close_via_smaller_sell_still_open(self, tmp_path):
+        # The trade-log view now reconstructs open quantity, so a smaller
+        # sell after a buy still leaves the symbol open for the residual.
         db = tmp_path / "trades.db"
         tl = TradeLogger(path=str(db))
         _log_trade(tl, symbol="AMD", side="buy", qty=50, strategy="sma_crossover")
         _log_trade(tl, symbol="AMD", side="sell", qty=20, strategy="sma_crossover")
         tl.close()
-        assert get_open_sma_positions(str(db)) == set()
+        assert get_open_sma_positions(str(db)) == {"AMD"}
 
     def test_buy_after_sell_reopens(self, tmp_path):
         # Latest-row semantics: a new buy after a sell makes the symbol

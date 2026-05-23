@@ -186,6 +186,25 @@ class BrokerSnapshot:
     )
 
 
+@dataclass(frozen=True)
+class ClosedOrderInfo:
+    """Typed projection of a broker historical order used for reconciliation."""
+
+    order_id: str
+    client_order_id: str | None
+    symbol: str
+    side: Side
+    order_type: str | None
+    status: OrderStatus
+    raw_status: str
+    qty: float
+    filled_qty: float
+    avg_fill_price: float | None
+    stop_price: float | None
+    submitted_at: datetime | None
+    filled_at: datetime | None
+
+
 # ── Broker ───────────────────────────────────────────────────────────────────
 
 
@@ -394,6 +413,53 @@ class AlpacaBroker:
                 message=f"historical: {side_str} {o.qty} {sym} @ {avg_price}",
             ))
         return results
+
+    def find_recent_filled_stop_order(
+        self,
+        *,
+        symbol: str,
+        after: datetime | None = None,
+        until: datetime | None = None,
+        limit: int = 500,
+    ) -> ClosedOrderInfo | None:
+        """
+        Return the latest filled SELL stop order for ``symbol`` if one exists.
+
+        Used as a recovery path when the websocket missed a protective-stop
+        execution and the engine needs broker truth to reconstruct the exit.
+        """
+        request = GetOrdersRequest(
+            status=QueryOrderStatus.CLOSED,
+            limit=limit,
+            after=after,
+            until=until,
+            symbols=[symbol],
+        )
+        raw = self._with_retry(
+            lambda: self._api.get_orders(request),
+            op_desc=f"get_orders(closed_stop:{symbol})",
+        )
+
+        candidates: list[ClosedOrderInfo] = []
+        for order in raw:
+            info = self._to_closed_order_info(order)
+            if info.symbol != symbol:
+                continue
+            if info.side is not Side.SELL:
+                continue
+            if info.order_type != "stop":
+                continue
+            if info.status is not OrderStatus.FILLED:
+                continue
+            candidates.append(info)
+
+        if not candidates:
+            return None
+
+        candidates.sort(
+            key=lambda item: item.filled_at or item.submitted_at or datetime.min.replace(tzinfo=timezone.utc)
+        )
+        return candidates[-1]
 
     # ── Write-side: place / cancel / close ───────────────────────────────
 
@@ -1429,12 +1495,16 @@ class AlpacaBroker:
         self._api._session.close()
 
     @staticmethod
+    def _parse_datetime(value) -> datetime | None:
+        if isinstance(value, str):
+            return datetime.fromisoformat(value.replace("Z", "+00:00"))
+        return value
+
+    @staticmethod
     def _to_open_order(o) -> OpenOrder:
         # Handle both alpaca-py model objects and SimpleNamespace mocks.
-        submitted = getattr(o, "submitted_at", None)
-        if isinstance(submitted, str):
-            submitted = datetime.fromisoformat(submitted.replace("Z", "+00:00"))
-        elif submitted is None:
+        submitted = AlpacaBroker._parse_datetime(getattr(o, "submitted_at", None))
+        if submitted is None:
             submitted = datetime.now(timezone.utc)
 
         # Extract raw string values from enums or plain strings.
@@ -1453,4 +1523,39 @@ class AlpacaBroker:
             submitted_at=submitted,
             limit_price=float(o.limit_price) if getattr(o, "limit_price", None) else None,
             stop_price=float(o.stop_price) if getattr(o, "stop_price", None) else None,
+        )
+
+    @staticmethod
+    def _to_closed_order_info(o) -> ClosedOrderInfo:
+        side_val = o.side.value if hasattr(o.side, "value") else str(o.side)
+        type_val = (
+            o.type.value
+            if hasattr(o.type, "value")
+            else str(o.type)
+            if hasattr(o, "type") and o.type
+            else None
+        )
+        status_val = o.status.value if hasattr(o.status, "value") else str(o.status)
+        return ClosedOrderInfo(
+            order_id=str(o.id),
+            client_order_id=getattr(o, "client_order_id", None),
+            symbol=o.symbol,
+            side=Side(side_val),
+            order_type=type_val,
+            status=_ALPACA_TERMINAL.get(status_val, OrderStatus.CANCELED),
+            raw_status=status_val,
+            qty=float(o.qty or 0.0),
+            filled_qty=float(o.filled_qty or 0.0),
+            avg_fill_price=(
+                float(o.filled_avg_price)
+                if getattr(o, "filled_avg_price", None) is not None
+                else None
+            ),
+            stop_price=(
+                float(o.stop_price)
+                if getattr(o, "stop_price", None) is not None
+                else None
+            ),
+            submitted_at=AlpacaBroker._parse_datetime(getattr(o, "submitted_at", None)),
+            filled_at=AlpacaBroker._parse_datetime(getattr(o, "filled_at", None)),
         )

@@ -39,6 +39,7 @@ import pytest
 from engine.trader import EngineConfig, TradingEngine, _lookback_days
 from execution.broker import (
     BrokerSnapshot,
+    ClosedOrderInfo,
     OpenOrder,
     OrderResult,
     OrderStatus,
@@ -674,6 +675,28 @@ class TestRunOneCycle:
 
         assert slot.strategy.raw_calls == 1
         broker.place_order.assert_not_called()
+
+    def test_market_open_cycle_processes_stream_stop_fills_before_external_closes(
+        self, engine_factory
+    ):
+        engine, _ = engine_factory(market_open=True)
+        engine.slots[0].symbols = []
+        engine._session_start_equity = 100_000.0
+        engine._cycle_count = 1
+
+        call_order: list[str] = []
+        engine._sync_managed_stop_legs = lambda snapshot: call_order.append("sync")
+        engine._observe_stream_health = lambda: call_order.append("health")
+        engine._recover_suspect_orders = lambda snapshot: call_order.append("suspects")
+        engine._process_stream_stop_fills = lambda snapshot: call_order.append("stops")
+        engine._detect_external_closes = lambda snapshot: call_order.append("external")
+        engine._drain_option_fills = lambda: call_order.append("options")
+        engine._drain_spread_fills = lambda: call_order.append("spreads")
+        engine._repair_missing_protective_stops = lambda snapshot: call_order.append("repair")
+
+        engine._run_one_cycle()
+
+        assert call_order.index("stops") < call_order.index("external")
 
 
 # ── start() / stop() / max_cycles ────────────────────────────────────────────
@@ -1853,6 +1876,74 @@ class TestExternalCloseDetection:
         assert sell_rows[0]["reason"] == "external_close_detected"
         assert sell_rows[0]["strategy"] == "fake_strategy"
 
+    def test_external_close_prefers_recovered_broker_stop_fill(self, patch_fetch, tmp_path):
+        """If broker history proves a stop fill, use it instead of synthetic external close."""
+        engine, _, tl = _engine_with_confirm(patch_fetch, tmp_path, confirm=1)
+        _write_buy(tl, "AAPL", "fake_strategy")
+        engine._register_single_leg(strategy_name="fake_strategy", symbol="AAPL")
+        engine._entry_prices["AAPL"] = 100.0
+        engine.broker.find_recent_filled_stop_order = MagicMock(
+            return_value=ClosedOrderInfo(
+                order_id="stop-aapl-1",
+                client_order_id=None,
+                symbol="AAPL",
+                side=Side.SELL,
+                order_type="stop",
+                status=OrderStatus.FILLED,
+                raw_status="filled",
+                qty=10.0,
+                filled_qty=10.0,
+                avg_fill_price=95.0,
+                stop_price=95.0,
+                submitted_at=T0,
+                filled_at=T0 + timedelta(minutes=1),
+            )
+        )
+
+        engine._detect_external_closes(_snapshot())
+
+        assert not engine._has_position("AAPL")
+        sell_rows = [r for r in tl.read_all() if r["side"] == "sell"]
+        assert len(sell_rows) == 1
+        assert sell_rows[0]["order_id"] == "stop-aapl-1"
+        assert sell_rows[0]["reason"] == "stop_triggered"
+
+    def test_recovered_stop_fill_uses_100x_multiplier_for_occ_symbol(self, patch_fetch, tmp_path):
+        """Broker-history stop recovery should apply the options contract multiplier when needed."""
+        from risk.allocator import SleeveAllocator
+
+        engine, _, _ = _engine_with_confirm(patch_fetch, tmp_path, confirm=1)
+        engine._entry_prices["SPY"] = 10.0
+        allocator = MagicMock(spec=SleeveAllocator)
+        engine._allocator = allocator
+
+        stop_fill = ClosedOrderInfo(
+            order_id="occ-stop-1",
+            client_order_id=None,
+            symbol="SPY260620C00730000",
+            side=Side.SELL,
+            order_type="stop",
+            status=OrderStatus.FILLED,
+            raw_status="filled",
+            qty=2.0,
+            filled_qty=2.0,
+            avg_fill_price=15.0,
+            stop_price=14.5,
+            submitted_at=T0,
+            filled_at=T0 + timedelta(minutes=1),
+        )
+
+        engine._record_recovered_stop_fill(
+            symbol="SPY",
+            owner="spy_options_reversion",
+            stop_fill=stop_fill,
+        )
+
+        allocator.record_realized_pnl.assert_called_once_with(
+            "spy_options_reversion",
+            1000.0,
+        )
+
     def test_multiple_positions_only_confirmed_ones_cleared(self, patch_fetch, tmp_path):
         """Only positions that hit confirm threshold are cleared."""
         positions = {"MSFT": Position("MSFT", 5, 200.0, 1000.0)}
@@ -2000,6 +2091,65 @@ class TestOptionsEngineFixes:
             strategy="fake_strategy",
         ) == 95.0
 
+    def test_sync_managed_stop_legs_rehydrates_managed_equity_stops_only(self, tmp_path):
+        """Open broker stop orders are rehydrated into the stream manager from snapshot truth."""
+        engine = self._engine(tmp_path)
+        engine._register_single_leg(strategy_name="fake_strategy", symbol="AAPL")
+        engine._stream_manager = MagicMock()
+        snapshot = _snapshot(
+            positions={"AAPL": Position("AAPL", 10, 100.0, 1000.0)},
+            open_orders=[
+                OpenOrder(
+                    order_id="stop-aapl",
+                    symbol="AAPL",
+                    side=Side.SELL,
+                    qty=10,
+                    order_type=OrderType.MARKET,
+                    status="open",
+                    submitted_at=T0,
+                    limit_price=None,
+                    stop_price=95.0,
+                ),
+                OpenOrder(
+                    order_id="ignore-no-stop",
+                    symbol="AAPL",
+                    side=Side.SELL,
+                    qty=10,
+                    order_type=OrderType.MARKET,
+                    status="open",
+                    submitted_at=T0,
+                    limit_price=None,
+                    stop_price=None,
+                ),
+                OpenOrder(
+                    order_id="ignore-unowned",
+                    symbol="MSFT",
+                    side=Side.SELL,
+                    qty=5,
+                    order_type=OrderType.MARKET,
+                    status="open",
+                    submitted_at=T0,
+                    limit_price=None,
+                    stop_price=300.0,
+                ),
+                OpenOrder(
+                    order_id="ignore-option",
+                    symbol="SPY260516C00520000",
+                    side=Side.SELL,
+                    qty=1,
+                    order_type=OrderType.MARKET,
+                    status="open",
+                    submitted_at=T0,
+                    limit_price=None,
+                    stop_price=7.5,
+                ),
+            ],
+        )
+
+        engine._sync_managed_stop_legs(snapshot)
+
+        engine._stream_manager.sync_stop_legs.assert_called_once_with({"stop-aapl"})
+
     def test_stop_repair_auto_closes_fractional_residual_without_whole_share_qty(self, tmp_path):
         """Managed sub-1-share remainders should be closed instead of repaired with qty=0."""
         engine = self._engine(tmp_path)
@@ -2081,6 +2231,74 @@ class TestOptionsEngineFixes:
 
         engine.broker.place_protective_stop.assert_not_called()
         engine.broker.close_position.assert_not_called()
+
+    def test_stop_repair_fractional_residual_recovers_missing_stop_fill_before_cleanup(self, tmp_path):
+        """GOOG-style fractional residuals should log the missing whole-share stop fill before dust cleanup."""
+        engine = self._engine(tmp_path)
+        engine._register_single_leg(strategy_name="fake_strategy", symbol="GOOG")
+        engine.trade_logger = TradeLogger(path=str(tmp_path / "trades.db"))
+        engine.trade_logger.log(engine.trade_logger.build_record(
+            decision=SimpleNamespace(
+                symbol="GOOG",
+                side=Side.BUY,
+                qty=7.78,
+                entry_reference_price=391.0,
+                stop_price=378.85,
+                strategy_name="fake_strategy",
+                reason="test",
+                order_type=OrderType.MARKET,
+            ),
+            result=_filled_result("GOOG", 7.78, 391.2),
+            modeled_price=391.0,
+        ))
+        engine._entry_prices["GOOG"] = 391.0
+        engine.broker.find_recent_filled_stop_order = MagicMock(
+            return_value=ClosedOrderInfo(
+                order_id="goog-stop-1",
+                client_order_id=None,
+                symbol="GOOG",
+                side=Side.SELL,
+                order_type="stop",
+                status=OrderStatus.FILLED,
+                raw_status="filled",
+                qty=7.0,
+                filled_qty=7.0,
+                avg_fill_price=378.85,
+                stop_price=378.85,
+                submitted_at=T0,
+                filled_at=T0 + timedelta(minutes=1),
+            )
+        )
+        engine.broker.place_protective_stop = MagicMock()
+        engine.broker.close_position = MagicMock(
+            return_value=OrderResult(
+                status=OrderStatus.FILLED,
+                order_id="goog-dust-close",
+                symbol="GOOG",
+                requested_qty=0.78,
+                filled_qty=0.78,
+                avg_fill_price=379.184,
+                raw_status="filled",
+                message="ok",
+            )
+        )
+        engine.alerts.trade_executed = MagicMock()
+
+        snap = _snapshot(
+            positions={"GOOG": Position("GOOG", 0.78, 391.2, 295.76)},
+            open_orders=[],
+        )
+
+        engine._repair_missing_protective_stops(snap)
+
+        rows = engine.trade_logger.read_all()
+        sells = [r for r in rows if r["side"] == "sell"]
+        assert len(sells) == 2
+        assert sells[0]["order_id"] == "goog-stop-1"
+        assert sells[0]["qty"] == pytest.approx(7.0)
+        assert sells[0]["reason"] == "stop_triggered"
+        assert sells[1]["order_id"] == "goog-dust-close"
+        assert sells[1]["qty"] == pytest.approx(0.78)
 
     def test_drain_option_rejected_clears_pre_registered_underlying_ownership(self, tmp_path):
         """Rejected option entries must clean up pre-registered underlying ownership immediately."""
@@ -2285,7 +2503,7 @@ class TestOptionsEngineFixes:
         stream.drain_stop_fills.return_value = [fill_update]
         engine._stream_manager = stream
 
-        engine._process_stream_stop_fills()
+        engine._process_stream_stop_fills(_snapshot())
 
         # Ownership must be cleared using the underlying key.
         assert not engine._has_position("SPY")
@@ -2315,7 +2533,7 @@ class TestOptionsEngineFixes:
         stream.drain_stop_fills.return_value = [fill_update]
         engine._stream_manager = stream
 
-        engine._process_stream_stop_fills()
+        engine._process_stream_stop_fills(_snapshot())
 
         # P&L = (15 - 10) * 2 * 100 = $1 000
         allocator.record_realized_pnl.assert_called_once_with(
@@ -2347,7 +2565,7 @@ class TestOptionsEngineFixes:
         engine._stream_manager = stream
         engine.trade_logger.log_stop_fill = MagicMock()
 
-        engine._process_stream_stop_fills()
+        engine._process_stream_stop_fills(_snapshot())
 
         engine.trade_logger.log_stop_fill.assert_called_once_with(
             symbol=occ,
@@ -2381,11 +2599,48 @@ class TestOptionsEngineFixes:
         stream.drain_stop_fills.return_value = [fill_update]
         engine._stream_manager = stream
 
-        engine._process_stream_stop_fills()
+        engine._process_stream_stop_fills(_snapshot())
 
         # P&L = (105 - 100) * 10 * 1 = $50
         allocator.record_realized_pnl.assert_called_once_with("sma_crossover", 50.0)
         assert not engine._has_position("AAPL")
+
+    def test_stream_stop_fill_with_fractional_residual_preserves_ownership(self, tmp_path):
+        """A whole-share stop on a fractional position should leave ownership intact for residual cleanup."""
+        from unittest.mock import MagicMock
+        from types import SimpleNamespace
+        from execution.stream import StreamManager
+
+        engine = self._engine(tmp_path)
+        engine._register_single_leg(strategy_name="fake_strategy", symbol="GOOG")
+        engine._entry_prices["GOOG"] = 391.0
+        engine.trade_logger.log_stop_fill = MagicMock()
+
+        fill_update = SimpleNamespace(
+            order=SimpleNamespace(symbol="GOOG", id="goog-stop-1"),
+            price="378.85",
+            qty="7.0",
+        )
+        stream = MagicMock(spec=StreamManager)
+        stream.drain_stop_fills.return_value = [fill_update]
+        engine._stream_manager = stream
+
+        snapshot = _snapshot(
+            positions={"GOOG": Position("GOOG", 0.78, 391.2, 295.76)},
+            open_orders=[],
+        )
+
+        engine._process_stream_stop_fills(snapshot)
+
+        engine.trade_logger.log_stop_fill.assert_called_once_with(
+            symbol="GOOG",
+            strategy="fake_strategy",
+            qty=7.0,
+            avg_fill_price=378.85,
+            order_id="goog-stop-1",
+        )
+        assert engine._has_position("GOOG")
+        assert engine._entry_prices["GOOG"] == pytest.approx(391.0)
 
     # log_stop_fill: confirmed WebSocket stop-fill persists real price/qty ─────
 
@@ -2444,7 +2699,7 @@ class TestOptionsEngineFixes:
         engine.trade_logger.log_stop_fill = MagicMock()
         engine.trade_logger.log_external_close = MagicMock()
 
-        engine._process_stream_stop_fills()
+        engine._process_stream_stop_fills(_snapshot())
 
         engine.trade_logger.log_stop_fill.assert_called_once_with(
             symbol=occ,
@@ -2477,7 +2732,7 @@ class TestOptionsEngineFixes:
         engine.trade_logger.log_stop_fill = MagicMock()
         engine.trade_logger.log_external_close = MagicMock()
 
-        engine._process_stream_stop_fills()
+        engine._process_stream_stop_fills(_snapshot())
 
         engine.trade_logger.log_stop_fill.assert_not_called()
         engine.trade_logger.log_external_close.assert_called_once_with(
@@ -2485,6 +2740,39 @@ class TestOptionsEngineFixes:
             strategy="sma_crossover",
             reason="stop_triggered",
         )
+
+    def test_stream_stop_fill_skips_duplicate_order_id(self, tmp_path):
+        """Duplicate stream stop-fill deliveries should be ignored once the order is recorded."""
+        from unittest.mock import MagicMock
+        from types import SimpleNamespace
+        from execution.stream import StreamManager
+
+        engine = self._engine(tmp_path)
+        engine._register_single_leg(strategy_name="fake_strategy", symbol="AAPL")
+        engine._entry_prices["AAPL"] = 100.0
+
+        fill_update = SimpleNamespace(
+            order=SimpleNamespace(symbol="AAPL", id="dup-stop-1"),
+            price="95.0",
+            qty="10",
+        )
+        stream = MagicMock(spec=StreamManager)
+        stream.drain_stop_fills.return_value = [fill_update]
+        engine._stream_manager = stream
+
+        engine.trade_logger.has_recorded_order_id = MagicMock(return_value=True)
+        engine.trade_logger.log_stop_fill = MagicMock()
+        engine.trade_logger.log_external_close = MagicMock()
+        engine.alerts.broker_error = MagicMock()
+        engine._allocator = MagicMock()
+
+        engine._process_stream_stop_fills(_snapshot())
+
+        engine.trade_logger.log_stop_fill.assert_not_called()
+        engine.trade_logger.log_external_close.assert_not_called()
+        engine.alerts.broker_error.assert_not_called()
+        engine._allocator.record_realized_pnl.assert_not_called()
+        assert engine._has_position("AAPL")
 
 
 # ── Shared-symbol conflict rejection (11.7 Part A) ─────────────────────────
