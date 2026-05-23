@@ -33,6 +33,7 @@ from alpaca.common.exceptions import APIError
 from execution.broker import (
     AlpacaBroker,
     BrokerError,
+    ClosedOrderInfo,
     OrderResult,
     OrderStatus,
 )
@@ -180,6 +181,67 @@ class TestBrokerConnections:
         broker.close_connections()
 
         api._session.close.assert_called_once_with()
+
+
+class TestFindRecentFilledStopOrder:
+    def test_returns_latest_filled_sell_stop_for_symbol(self):
+        api = MagicMock()
+        api.get_orders.return_value = [
+            _alpaca_order(
+                id="old-stop",
+                status="filled",
+                side="sell",
+                symbol="AAPL",
+                qty=10,
+                type="stop",
+                stop_price="95.0",
+                filled_avg_price=95.0,
+                submitted_at="2026-05-20T14:30:00Z",
+            ),
+            _alpaca_order(
+                id="ignore-limit",
+                status="filled",
+                side="sell",
+                symbol="AAPL",
+                qty=10,
+                type="limit",
+                limit_price="101.0",
+                filled_avg_price=101.0,
+                submitted_at="2026-05-21T14:30:00Z",
+            ),
+            SimpleNamespace(
+                id="new-stop",
+                client_order_id="cid-1",
+                symbol="AAPL",
+                side=SimpleNamespace(value="sell"),
+                qty="10",
+                type=SimpleNamespace(value="stop"),
+                status=SimpleNamespace(value="filled"),
+                filled_qty="10",
+                filled_avg_price="94.5",
+                stop_price="95.0",
+                submitted_at="2026-05-22T14:30:00Z",
+                filled_at="2026-05-22T14:31:08Z",
+            ),
+        ]
+        broker = _broker_with_mock(api)
+
+        result = broker.find_recent_filled_stop_order(symbol="AAPL")
+
+        assert isinstance(result, ClosedOrderInfo)
+        assert result.order_id == "new-stop"
+        assert result.avg_fill_price == pytest.approx(94.5)
+        assert result.stop_price == pytest.approx(95.0)
+
+    def test_returns_none_when_no_filled_sell_stop_exists(self):
+        api = MagicMock()
+        api.get_orders.return_value = [
+            _alpaca_order(id="buy-stop", status="filled", side="buy", type="stop"),
+            _alpaca_order(id="sell-canceled", status="canceled", side="sell", type="stop"),
+        ]
+        broker = _broker_with_mock(api)
+
+        assert broker.find_recent_filled_stop_order(symbol="AAPL") is None
 
 
 # ── place_order: kwargs built correctly ──────────────────────────────────────

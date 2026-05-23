@@ -27,6 +27,7 @@ import re
 import sqlite3
 from dataclasses import dataclass
 from datetime import datetime, timezone
+from typing import Any
 
 from loguru import logger
 
@@ -655,68 +656,27 @@ class TradeLogger:
         Return the strategy_name that owns the currently-open position for
         `symbol` per the trade log, or None if the position is closed (or
         never traded).
-
-        The trade log is append-only and allows at most one open position per
-        symbol at a time. The most recent filled/partial row determines state:
-        - side='buy'  → position open, return strategy name
-        - side='sell' → position closed, return None
         """
-        if not os.path.exists(self._path):
+        state = self._read_single_leg_open_state().get(symbol)
+        if state is None or state["open_qty"] <= 0:
             return None
-        try:
-            conn = self._ensure_db()
-        except sqlite3.Error:
-            return None
-        conn.row_factory = sqlite3.Row
-        # Exclude position_type='spread' rows: a spread leg is never a
-        # standalone single-leg position. Spreads restore via
-        # read_open_spread_positions().
-        cursor = conn.execute(
-            "SELECT side, strategy "
-            "FROM trades "
-            "WHERE symbol = ? "
-            "AND status IN ('filled', 'partial') "
-            "AND (position_type IS NULL OR position_type != 'spread') "
-            "ORDER BY id DESC LIMIT 1",
-            (symbol,),
-        )
-        row = cursor.fetchone()
-        if row is None or row["side"] != "buy":
-            return None
-        return row["strategy"]
+        return state["strategy"]
 
     def read_all_open_owners(self) -> dict[str, str]:
         """
-        Return ``{symbol: strategy_name}`` for every symbol whose most recent
-        filled/partial trade is a ``'buy'``.
+        Return ``{symbol: strategy_name}`` for every still-open single-leg
+        position reconstructed from the append-only trade log.
 
         This is the trade log's view of currently-open positions and their
-        owning strategies. Used by the engine on startup to restore durable
-        ownership without guessing from slot order.
+        owning strategies, including positions that have been partially
+        reduced by one or more sell rows. Used by the engine on startup to
+        restore durable ownership without guessing from slot order.
         """
-        if not os.path.exists(self._path):
-            return {}
-        try:
-            conn = self._ensure_db()
-        except sqlite3.Error:
-            return {}
-        conn.row_factory = sqlite3.Row
-        # Exclude position_type='spread' rows from the single-leg view: a
-        # spread leg's latest row (long leg side='buy' on open) would
-        # otherwise be mistaken for a standalone open position. Spreads are
-        # restored via read_open_spread_positions().
-        cursor = conn.execute(
-            "SELECT symbol, strategy, side "
-            "FROM trades "
-            "WHERE id IN ("
-            "  SELECT MAX(id) FROM trades "
-            "  WHERE status IN ('filled', 'partial') "
-            "  AND (position_type IS NULL OR position_type != 'spread') "
-            "  GROUP BY symbol"
-            ") "
-            "AND side = 'buy'"
-        )
-        return {row["symbol"]: row["strategy"] for row in cursor.fetchall()}
+        return {
+            symbol: state["strategy"]
+            for symbol, state in self._read_single_leg_open_state().items()
+            if state["open_qty"] > 0 and state["strategy"]
+        }
 
     def read_open_spread_positions(self) -> list[dict]:
         """
@@ -844,76 +804,114 @@ class TradeLogger:
         """
         Return the original fixed stop price for the latest still-open trade
         on `symbol` owned by `strategy`.
-
-        The trade log is append-only and this engine allows at most one open
-        position per symbol. That means the latest filled/partial row for a
-        symbol/strategy pair tells us whether the trade is still open:
-
-        - latest row is `buy` with `stop_price > 0` -> position should still
-          be open, so return that original stop
-        - latest row is `sell` -> position was closed, return None
         """
-        if not os.path.exists(self._path):
+        state = self._read_single_leg_open_state().get(symbol)
+        if state is None or state["open_qty"] <= 0 or state["strategy"] != strategy:
             return None
-        try:
-            conn = self._ensure_db()
-        except sqlite3.Error:
-            return None
-        conn.row_factory = sqlite3.Row
-        cursor = conn.execute(
-            "SELECT side, stop_price "
-            "FROM trades "
-            "WHERE symbol = ? AND strategy = ? "
-            "AND status IN ('filled', 'partial') "
-            "ORDER BY id DESC LIMIT 1",
-            (symbol, strategy),
-        )
-        row = cursor.fetchone()
-        if row is None:
-            return None
-        if row["side"] != "buy":
-            return None
-        stop_price = float(row["stop_price"] or 0.0)
+        stop_price = float(state.get("stop_price") or 0.0)
         return stop_price if stop_price > 0 else None
 
     def _read_latest_open_entry_context(
         self, *, symbol: str, strategy: str
     ) -> dict | None:
         """Return the latest still-open entry context for symbol/strategy."""
-        if not os.path.exists(self._path):
+        state = self._read_single_leg_open_state().get(symbol)
+        if state is None or state["open_qty"] <= 0 or state["strategy"] != strategy:
             return None
+        return {
+            "entry_reference_price": state.get("entry_reference_price"),
+            "initial_stop_loss": state.get("initial_stop_loss"),
+            "initial_risk_per_share": state.get("initial_risk_per_share"),
+            "entry_timestamp": state.get("entry_timestamp"),
+        }
+
+    def has_recorded_order_id(self, order_id: str | None) -> bool:
+        """True if the trade log already contains ``order_id``."""
+        if not order_id or not os.path.exists(self._path):
+            return False
         try:
             conn = self._ensure_db()
         except sqlite3.Error:
-            return None
+            return False
+        cursor = conn.execute(
+            "SELECT 1 FROM trades WHERE order_id = ? LIMIT 1",
+            (order_id,),
+        )
+        return cursor.fetchone() is not None
+
+    def _read_single_leg_open_state(self) -> dict[str, dict[str, Any]]:
+        """Return the current single-leg open-position state keyed by symbol."""
+        if not os.path.exists(self._path):
+            return {}
+        try:
+            conn = self._ensure_db()
+        except sqlite3.Error:
+            return {}
         conn.row_factory = sqlite3.Row
         cursor = conn.execute(
-            "SELECT side, entry_reference_price, initial_stop_loss, "
-            "initial_risk_per_share, entry_timestamp "
+            "SELECT symbol, strategy, side, qty, filled_qty, stop_price, "
+            "entry_reference_price, initial_stop_loss, initial_risk_per_share, "
+            "entry_timestamp "
             "FROM trades "
-            "WHERE symbol = ? AND strategy = ? "
-            "AND status IN ('filled', 'partial') "
-            "ORDER BY id DESC LIMIT 1",
-            (symbol, strategy),
+            "WHERE status IN ('filled', 'partial') "
+            "AND (position_type IS NULL OR position_type != 'spread') "
+            "ORDER BY id"
         )
-        row = cursor.fetchone()
-        if row is None or row["side"] != "buy":
-            return None
-        return {
-            "entry_reference_price": (
-                float(row["entry_reference_price"])
-                if row["entry_reference_price"] is not None else None
-            ),
-            "initial_stop_loss": (
-                float(row["initial_stop_loss"])
-                if row["initial_stop_loss"] is not None else None
-            ),
-            "initial_risk_per_share": (
-                float(row["initial_risk_per_share"])
-                if row["initial_risk_per_share"] is not None else None
-            ),
-            "entry_timestamp": row["entry_timestamp"],
-        }
+
+        state: dict[str, dict[str, Any]] = {}
+        for row in cursor.fetchall():
+            symbol = row["symbol"]
+            side = str(row["side"] or "").lower()
+            qty_raw = row["filled_qty"] if row["filled_qty"] is not None else row["qty"]
+            qty = float(qty_raw or 0.0)
+            current = state.get(symbol)
+            if current is None:
+                current = {
+                    "strategy": None,
+                    "open_qty": 0.0,
+                    "stop_price": None,
+                    "entry_reference_price": None,
+                    "initial_stop_loss": None,
+                    "initial_risk_per_share": None,
+                    "entry_timestamp": None,
+                }
+                state[symbol] = current
+
+            if side == "buy":
+                if current["open_qty"] <= 0:
+                    current["strategy"] = row["strategy"]
+                    current["stop_price"] = (
+                        float(row["stop_price"]) if row["stop_price"] is not None else None
+                    )
+                    current["entry_reference_price"] = (
+                        float(row["entry_reference_price"])
+                        if row["entry_reference_price"] is not None else None
+                    )
+                    current["initial_stop_loss"] = (
+                        float(row["initial_stop_loss"])
+                        if row["initial_stop_loss"] is not None else None
+                    )
+                    current["initial_risk_per_share"] = (
+                        float(row["initial_risk_per_share"])
+                        if row["initial_risk_per_share"] is not None else None
+                    )
+                    current["entry_timestamp"] = row["entry_timestamp"]
+                current["open_qty"] += qty
+                continue
+
+            if side == "sell":
+                if qty <= 0:
+                    current["open_qty"] = 0.0
+                else:
+                    current["open_qty"] = max(0.0, current["open_qty"] - qty)
+                if current["open_qty"] <= 1e-9:
+                    current["strategy"] = None
+                    current["stop_price"] = None
+                    current["entry_reference_price"] = None
+                    current["initial_stop_loss"] = None
+                    current["initial_risk_per_share"] = None
+                    current["entry_timestamp"] = None
+        return state
 
     def read_latest_open_entry_context(
         self, *, symbol: str, strategy: str

@@ -162,6 +162,14 @@ class TestStopLegRouting:
         with sm._lock:
             assert "stop-leg-1" in sm._stop_legs
 
+    def test_sync_stop_legs_replaces_stale_registrations(self):
+        sm = _stream()
+        sm.register_stop_leg("old-stop")
+        sm.sync_stop_legs({"new-stop-1", "new-stop-2"})
+
+        with sm._lock:
+            assert sm._stop_legs == {"new-stop-1", "new-stop-2"}
+
     def test_stop_leg_fill_accumulates_and_cleans_up_terminal_registration(self):
         sm = _stream()
         sm.register_stop_leg("leg-1")

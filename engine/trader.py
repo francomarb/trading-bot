@@ -428,6 +428,7 @@ class TradingEngine:
             startup_snapshot, conflict_symbols
         )
 
+        self._sync_managed_stop_legs(startup_snapshot)
         self._repair_missing_protective_stops(startup_snapshot)
 
         slot_desc = ", ".join(
@@ -584,10 +585,11 @@ class TradingEngine:
                 f"risk={risk_state}"
             )
 
+            self._sync_managed_stop_legs(snapshot)
             self._observe_stream_health()
             self._recover_suspect_orders(snapshot)
+            self._process_stream_stop_fills(snapshot)
             self._detect_external_closes(snapshot)
-            self._process_stream_stop_fills()
             self._drain_option_fills()
             self._drain_spread_fills()
             self._repair_missing_protective_stops(snapshot)
@@ -1630,6 +1632,14 @@ class TradingEngine:
         position: Position,
     ) -> None:
         """Auto-close a managed residual equity stub that cannot carry a broker stop."""
+        stop_fill = self._lookup_recent_stop_fill(symbol=symbol, owner=owner)
+        if stop_fill is not None:
+            self._record_recovered_stop_fill(
+                symbol=symbol,
+                owner=owner,
+                stop_fill=stop_fill,
+            )
+
         if self._has_pending_close_order(symbol, snapshot):
             logger.info(
                 f"{symbol}: residual fractional position has a close order "
@@ -1783,6 +1793,88 @@ class TradingEngine:
             return True
         import re
         return bool(re.match(rf"^{re.escape(target)}[0-9]{{6}}[CP][0-9]{{8}}$", actual))
+
+    def _sync_managed_stop_legs(self, snapshot: BrokerSnapshot) -> None:
+        """Rehydrate tracked protective stop ids from broker open orders."""
+        if self._stream_manager is None:
+            return
+        stop_ids: set[str] = set()
+        for order in snapshot.open_orders:
+            if order.side is not Side.SELL or order.stop_price is None:
+                continue
+            if _OCC_PAT.match(order.symbol):
+                continue
+            if self._get_owner(order.symbol) is None:
+                continue
+            stop_ids.add(order.order_id)
+        self._stream_manager.sync_stop_legs(stop_ids)
+
+    def _lookup_recent_stop_fill(
+        self,
+        *,
+        symbol: str,
+        owner: str,
+        until: datetime | None = None,
+    ):
+        """Return a recoverable recent filled protective stop for ``symbol`` if present."""
+        context = self.trade_logger.read_latest_open_entry_context(
+            symbol=symbol,
+            strategy=owner,
+        )
+        after = None
+        if context is not None and context.get("entry_timestamp"):
+            try:
+                after = datetime.fromisoformat(str(context["entry_timestamp"]))
+            except Exception:
+                after = None
+        if after is None:
+            after = datetime.now(timezone.utc) - timedelta(days=30)
+
+        stop_fill = self.broker.find_recent_filled_stop_order(
+            symbol=symbol,
+            after=after,
+            until=until,
+        )
+        if stop_fill is None:
+            return None
+        order_id = getattr(stop_fill, "order_id", None)
+        if not isinstance(order_id, str) or not order_id:
+            return None
+        if self.trade_logger.has_recorded_order_id(order_id):
+            return None
+        return stop_fill
+
+    def _record_recovered_stop_fill(
+        self,
+        *,
+        symbol: str,
+        owner: str,
+        stop_fill,
+    ) -> bool:
+        """Persist a broker-recovered stop fill and feed realized P&L once."""
+        price = stop_fill.avg_fill_price
+        qty = float(stop_fill.filled_qty or 0.0)
+        if price is None or qty <= 0:
+            self.trade_logger.log_external_close(
+                symbol=symbol,
+                strategy=owner,
+                reason="stop_triggered",
+            )
+            return False
+
+        self.trade_logger.log_stop_fill(
+            symbol=symbol,
+            strategy=owner,
+            qty=qty,
+            avg_fill_price=price,
+            order_id=stop_fill.order_id,
+        )
+        self._record_realized_pnl(symbol, owner, price, qty)
+        logger.warning(
+            f"{symbol}: recovered missed protective stop fill from broker history "
+            f"— qty={qty} price={price} order_id={stop_fill.order_id}"
+        )
+        return True
 
     def _repair_missing_protective_stops(self, snapshot: BrokerSnapshot) -> None:
         """
@@ -2055,29 +2147,17 @@ class TradingEngine:
 
             # Confirmed absent for `confirm` consecutive cycles.
             owner = tracked_position.strategy_name
-            self._pop_position(symbol)
             self._external_close_suspects.pop(symbol, None)
-            msg = (
-                f"{symbol}: position owned by '{owner}' absent for "
-                f"{confirm} consecutive cycle(s) — declared externally closed "
-                "(stop-out, manual liquidation, or margin call)"
-            )
-            logger.warning(msg)
-            self.alerts.broker_error(msg)
-            # For external closes we don't have a confirmed fill price — use
-            # the last known close from the snapshot as best approximation.
-            # The HWM gate update is approximate here; the signal-based and
-            # stream stop-fill paths have exact prices.
-            last_close = snapshot.account.last_price.get(symbol) if hasattr(snapshot.account, "last_price") else None
-            if last_close is None:
-                # Fallback: use entry price (zero P&L) rather than skip entirely.
-                last_close = self._entry_prices.get(symbol, 0.0)
-            last_qty = 0  # qty is unavailable without position data; skip PnL update
-            if last_close and last_qty == 0:
-                # Approximate: record 0 P&L (no double-count; stop may have already fired via stream).
-                pass
             try:
                 if tracked_position.is_spread:
+                    self._pop_position(symbol)
+                    msg = (
+                        f"{symbol}: position owned by '{owner}' absent for "
+                        f"{confirm} consecutive cycle(s) — declared externally closed "
+                        "(stop-out, manual liquidation, or margin call)"
+                    )
+                    logger.warning(msg)
+                    self.alerts.broker_error(msg)
                     strategy = self._spread_owner_strategy.pop(symbol, None)
                     released = (
                         strategy.release_spread(symbol)
@@ -2100,16 +2180,37 @@ class TradingEngine:
                         reason="external_close_detected",
                     )
                 else:
+                    stop_fill = self._lookup_recent_stop_fill(symbol=symbol, owner=owner)
+                    self._pop_position(symbol)
+                    if stop_fill is not None:
+                        self._record_recovered_stop_fill(
+                            symbol=symbol,
+                            owner=owner,
+                            stop_fill=stop_fill,
+                        )
+                        logger.warning(
+                            f"{symbol}: position owned by '{owner}' absent for "
+                            f"{confirm} consecutive cycle(s) — reconciled as "
+                            "protective stop fill from broker history"
+                        )
+                    else:
+                        msg = (
+                            f"{symbol}: position owned by '{owner}' absent for "
+                            f"{confirm} consecutive cycle(s) — declared externally closed "
+                            "(stop-out, manual liquidation, or margin call)"
+                        )
+                        logger.warning(msg)
+                        self.alerts.broker_error(msg)
+                        self.trade_logger.log_external_close(
+                            symbol=symbol,
+                            strategy=owner,
+                            reason="external_close_detected",
+                        )
                     self._entry_prices.pop(symbol, None)
-                    self.trade_logger.log_external_close(
-                        symbol=symbol,
-                        strategy=owner,
-                        reason="external_close_detected",
-                    )
             except Exception as e:
                 logger.error(f"{symbol}: failed to log external close: {e}")
 
-    def _process_stream_stop_fills(self) -> None:
+    def _process_stream_stop_fills(self, snapshot: BrokerSnapshot) -> None:
         """
         Drain WebSocket stop-leg fill events from the stream manager.
 
@@ -2140,13 +2241,23 @@ class TradingEngine:
                 )
                 continue
 
-            owner = self._pop_position(symbol)
-            self._external_close_suspects.pop(symbol, None)
             price = float(update.price) if update.price is not None else None
-            qty = int(float(update.qty or 0))
+            qty = float(update.qty or 0)
+            owner = self._get_owner(symbol)
+            if owner is None:
+                logger.debug(
+                    f"stream stop fill for unowned {raw_symbol} — already handled"
+                )
+                continue
             msg = (
                 f"{raw_symbol}: protective stop triggered (WebSocket) — "
                 f"qty={qty} price={price} strategy={owner}"
+            )
+            residual_position = self._get_position_for(symbol, snapshot)
+            residual_qty = (
+                float(residual_position.qty)
+                if residual_position is not None and not _occ_m
+                else 0.0
             )
             logger.warning(msg)
             self.alerts.broker_error(msg)
@@ -2155,7 +2266,6 @@ class TradingEngine:
             if price is not None and qty > 0:
                 _pnl_mult = 100 if _occ_m else 1
                 self._record_realized_pnl(symbol, owner, price, qty, multiplier=_pnl_mult)
-            self._entry_prices.pop(symbol, None)
             try:
                 if price is not None and qty > 0:
                     self.trade_logger.log_stop_fill(
@@ -2174,6 +2284,17 @@ class TradingEngine:
                     )
             except Exception as e:
                 logger.error(f"{raw_symbol}: failed to log stop fill: {e}")
+
+            self._external_close_suspects.pop(symbol, None)
+            if residual_qty > 1e-9 and not _occ_m:
+                logger.info(
+                    f"{raw_symbol}: protective stop left residual qty={residual_qty} "
+                    "— preserving ownership for residual cleanup"
+                )
+                continue
+
+            self._pop_position(symbol)
+            self._entry_prices.pop(symbol, None)
 
     def _drain_option_fills(self) -> None:
         """
