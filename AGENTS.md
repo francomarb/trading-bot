@@ -179,6 +179,7 @@ python phase2_verify.py
 - Live trading base URL: `https://api.alpaca.markets`
 - Data API (market data): use `feed="iex"` on a paper account (SIP requires paid subscription).
 - Use `alpaca-py` (official SDK) — this project has migrated from the deprecated `alpaca-trade-api`. Do not use `alpaca-trade-api`.
+- For any broker-facing behavior, treat **Alpaca's SDK/docs as the first source of truth** — not just for orders/fills/stops, but overall. Before inventing a home-grown fix or local abstraction around execution, positions, order lifecycle, market clock/session state, streams, reconnects, reconciliation, or account behavior, **first check Alpaca's SDK/docs for the supported path, constraints, and recommended recovery model**. Prefer broker-native or SDK-recommended solutions whenever Alpaca already defines the behavior. If a custom workaround is still needed, document why the SDK/docs path was insufficient.
 - Orders: support market, limit, and stop-limit types.
 - Positions: always check existing positions before placing new orders.
 - GTC orders: Alpaca auto-cancels GTC orders after 90 days. The RSI mean reversion strategy uses limit orders — if any are submitted as GTC and sit open long enough, they will silently expire. The engine's startup reconciliation (`sync_with_broker`) catches this, but be aware of the 90-day ceiling.
