@@ -148,6 +148,19 @@ def _unknown_result(symbol: str, qty: int, order_id: str = "ord-unknown") -> Ord
     )
 
 
+def _rejected_result(symbol: str, qty: int) -> OrderResult:
+    return OrderResult(
+        status=OrderStatus.REJECTED,
+        order_id="ord-rejected",
+        symbol=symbol,
+        requested_qty=qty,
+        filled_qty=0,
+        avg_fill_price=None,
+        raw_status="rejected",
+        message="rejected",
+    )
+
+
 def _open_sell_order(symbol: str = "AAPL") -> OpenOrder:
     return OpenOrder(
         order_id="o-sell",
@@ -430,8 +443,10 @@ class TestProcessSymbol:
         strategy = _EmergencyExitStrategy()
         close_result = _filled_result(occ, 1, 9.0)
         engine, broker = engine_factory(close_result=close_result)
+        engine._allocator = MagicMock()
         engine.slots[0].strategy = strategy
         engine._register_single_leg(strategy_name=strategy.name, symbol=occ)
+        engine._entry_prices["SPY"] = 10.0
         signal_key = (strategy.name, "SPY", engine.slots[0].timeframe)
         engine._processed_signal_bars[signal_key] = pd.Timestamp(
             patch_fetch["df"].index[-1]
@@ -446,6 +461,46 @@ class TestProcessSymbol:
         assert strategy.raw_calls == 0
         broker.close_position.assert_called_once_with(occ)
         broker.place_order.assert_not_called()
+        assert not engine._has_position("SPY")
+        assert "SPY" not in engine._entry_prices
+        engine._allocator.record_realized_pnl.assert_called_once_with(
+            strategy.name,
+            -100.0,
+        )
+
+    def test_processed_bar_still_retries_single_leg_signal_exit(
+        self, engine_factory, patch_fetch
+    ):
+        engine, broker = engine_factory(exits=[False] * 59 + [True])
+        engine._register_single_leg(strategy_name="fake_strategy", symbol="AAPL")
+        signal_key = ("fake_strategy", "AAPL", engine.slots[0].timeframe)
+        engine._processed_signal_bars[signal_key] = pd.Timestamp(
+            patch_fetch["df"].index[-1]
+        )
+        positions = {"AAPL": Position("AAPL", 10, 100.0, 1_010.0)}
+        snap = _snapshot(positions=positions)
+        engine._session_start_equity = snap.account.equity
+
+        self._process(engine, "AAPL", snap)
+
+        broker.close_position.assert_called_once_with("AAPL")
+
+    def test_unfilled_single_leg_exit_retains_ownership_for_retry(self, engine_factory):
+        engine, broker = engine_factory(
+            exits=[False] * 59 + [True],
+            close_result=_rejected_result("AAPL", 10),
+        )
+        engine._register_single_leg(strategy_name="fake_strategy", symbol="AAPL")
+        engine._entry_prices["AAPL"] = 100.0
+        positions = {"AAPL": Position("AAPL", 10, 100.0, 1_010.0)}
+        snap = _snapshot(positions=positions)
+        engine._session_start_equity = snap.account.equity
+
+        self._process(engine, "AAPL", snap)
+
+        broker.close_position.assert_called_once_with("AAPL")
+        assert engine._has_position("AAPL")
+        assert engine._entry_prices["AAPL"] == 100.0
 
     def test_stale_data_skips_silently(self, engine_factory, patch_fetch):
         # Bars from 30 days ago — easily past max_bar_age (10×1day).
