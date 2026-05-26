@@ -834,6 +834,16 @@ class TradingEngine:
                     underlying=symbol,
                     underlying_close=latest_close,
                 )
+            else:
+                position = self._get_position_for(symbol, snapshot)
+                if position is not None:
+                    self._process_single_leg_emergency_exit(
+                        symbol=symbol,
+                        strategy=strategy,
+                        position=position,
+                        snapshot=snapshot,
+                        latest_close=latest_close,
+                    )
             if (
                 strategy_statuses is not None
                 and signal_key in self._processed_signal_statuses
@@ -2392,6 +2402,67 @@ class TradingEngine:
                     )
                     self._pop_position(underlying)
                     self._entry_prices.pop(underlying, None)
+
+    def _process_single_leg_emergency_exit(
+        self,
+        *,
+        symbol: str,
+        strategy: BaseStrategy,
+        position,
+        snapshot: BrokerSnapshot,
+        latest_close: float,
+    ) -> None:
+        """
+        Run risk-reducing strategy hooks even when the signal bar was already
+        processed. Entries stay de-duped; option time/delta/trailing exits do not.
+        """
+        try:
+            emergency_exit = strategy.inspect_open_positions(position, latest_close)
+        except Exception as e:
+            logger.error(f"[{strategy.name}] {symbol}: inspect_open_positions failed: {e}")
+            return
+        if not emergency_exit:
+            return
+
+        logger.warning(
+            f"[{strategy.name}] {symbol}: EMERGENCY EXIT triggered by strategy hook."
+        )
+        owner = self._get_owner(symbol)
+        if owner is not None and owner != strategy.name:
+            logger.info(
+                f"[{strategy.name}] {symbol}: emergency exit ignored — "
+                f"position owned by '{owner}'"
+            )
+            return
+        if self._has_pending_close_order(symbol, snapshot):
+            logger.info(
+                f"{symbol}: emergency exit but a close order is already pending — skipping"
+            )
+            return
+
+        try:
+            result = self.broker.close_position(position.symbol)
+            if not _OCC_PAT.match(position.symbol):
+                self._record_fill(result, modeled_price=latest_close, order_type="market")
+            close_modeled = (
+                result.avg_fill_price or 0.0
+                if _OCC_PAT.match(position.symbol)
+                else latest_close
+            )
+            self._log_close(result, close_modeled, strategy.name)
+            if result.status in {OrderStatus.FILLED, OrderStatus.PARTIAL}:
+                close_price = result.avg_fill_price or latest_close
+                close_qty = float(result.filled_qty or (position.qty if position else 0))
+                self.alerts.trade_executed(
+                    symbol=symbol,
+                    strategy=strategy.name,
+                    side="sell",
+                    qty=close_qty,
+                    price=close_price,
+                    reason="emergency exit",
+                )
+        except Exception as e:
+            logger.error(f"{symbol}: emergency close failed: {e}")
 
     # ── Credit-spread entry / drain / exit (11.29 PR 3b) ─────────────────
 

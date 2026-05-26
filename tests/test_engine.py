@@ -411,6 +411,42 @@ class TestProcessSymbol:
         broker.place_order.assert_not_called()
         broker.close_position.assert_not_called()
 
+    def test_processed_bar_still_runs_single_leg_emergency_exit(
+        self, engine_factory, patch_fetch
+    ):
+        occ = "SPY260626C00730000"
+
+        class _EmergencyExitStrategy(FakeStrategy):
+            name = "spy_options_reversion"
+
+            def __init__(self):
+                super().__init__(entries=[False], exits=[False])
+                self.inspect_calls = 0
+
+            def inspect_open_positions(self, position, latest_close: float) -> bool:
+                self.inspect_calls += 1
+                return True
+
+        strategy = _EmergencyExitStrategy()
+        close_result = _filled_result(occ, 1, 9.0)
+        engine, broker = engine_factory(close_result=close_result)
+        engine.slots[0].strategy = strategy
+        engine._register_single_leg(strategy_name=strategy.name, symbol=occ)
+        signal_key = (strategy.name, "SPY", engine.slots[0].timeframe)
+        engine._processed_signal_bars[signal_key] = pd.Timestamp(
+            patch_fetch["df"].index[-1]
+        )
+        position = Position(occ, 1, 10.0, 1_000.0, current_price=9.0)
+        snap = _snapshot(positions={occ: position})
+        engine._session_start_equity = snap.account.equity
+
+        self._process(engine, "SPY", snap)
+
+        assert strategy.inspect_calls == 1
+        assert strategy.raw_calls == 0
+        broker.close_position.assert_called_once_with(occ)
+        broker.place_order.assert_not_called()
+
     def test_stale_data_skips_silently(self, engine_factory, patch_fetch):
         # Bars from 30 days ago — easily past max_bar_age (10×1day).
         old_end = T0 - timedelta(days=30)
