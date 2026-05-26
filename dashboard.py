@@ -491,11 +491,10 @@ def compute_strategy_stats(trades_df: pd.DataFrame) -> pd.DataFrame:
     Compute per-strategy summary: trades, wins, win_rate, total_pnl,
     avg_realized_slippage_bps.
 
-    A "trade" is a fully closed position, aggregated across all exit rows that
-    share the same strategy / symbol / entry_timestamp. This prevents a
-    whole-share stop fill plus fractional residual cleanup from appearing as
-    two separate trades in Strategy Health. Positions whose logged exits do
-    not yet sum to the original entry quantity are skipped as incomplete.
+    Single-leg trades are fully closed positions aggregated across exit rows
+    that share strategy / symbol / entry_timestamp. Multi-leg trades are
+    realized-P&L close events keyed by position_id, so spreads do not need to
+    mimic single-leg buy/sell shape to show up in the dashboard.
     """
     if trades_df.empty or "strategy" not in trades_df.columns:
         return pd.DataFrame(columns=[
@@ -505,17 +504,27 @@ def compute_strategy_stats(trades_df: pd.DataFrame) -> pd.DataFrame:
 
     results = []
     for strategy, group in trades_df.groupby("strategy"):
-        entries = group[
-            (group.get("side", "").astype(str).str.lower() == "buy")
-            & group.get("entry_timestamp").notna()
+        position_type = group.get("position_type", pd.Series("", index=group.index))
+        is_mleg = position_type.astype(str).str.lower().isin({"spread", "mleg"})
+        single_leg_group = group[~is_mleg].copy()
+
+        single_leg_entry_ts = single_leg_group.get(
+            "entry_timestamp", pd.Series(index=single_leg_group.index)
+        )
+        entries = single_leg_group[
+            (single_leg_group.get("side", "").astype(str).str.lower() == "buy")
+            & single_leg_entry_ts.notna()
         ].copy()
-        exits = group[
-            (group.get("side", "").astype(str).str.lower() == "sell")
-            & group.get("entry_timestamp").notna()
+        exits = single_leg_group[
+            (single_leg_group.get("side", "").astype(str).str.lower() == "sell")
+            & single_leg_entry_ts.notna()
         ].copy()
+        pnls: list[float] = []
+        slippage_numer = 0.0
+        slippage_denom = 0.0
+
         if entries.empty or exits.empty:
-            pnls: list[float] = []
-            avg_slip = 0.0
+            pass
         else:
             entries["filled_qty_num"] = pd.to_numeric(
                 entries["filled_qty"], errors="coerce"
@@ -547,21 +556,48 @@ def compute_strategy_stats(trades_df: pd.DataFrame) -> pd.DataFrame:
                 grouped["exit_qty"] >= (grouped["entry_qty"] - 1e-9)
             ]
 
-            if grouped.empty:
-                pnls = []
-                avg_slip = 0.0
-            else:
-                pnls = grouped["realized_pnl"].fillna(0.0).tolist()
-                total_slippage_denom = float(grouped["slippage_denom"].sum())
-                avg_slip = (
-                    float(grouped["slippage_numer"].sum()) / total_slippage_denom
-                    if total_slippage_denom > 0 else 0.0
-                )
+            if not grouped.empty:
+                pnls.extend(grouped["realized_pnl"].fillna(0.0).tolist())
+                slippage_numer += float(grouped["slippage_numer"].sum())
+                slippage_denom += float(grouped["slippage_denom"].sum())
+
+        mleg_exits = group[
+            is_mleg
+            & group.get("position_id", pd.Series(index=group.index)).notna()
+            & group.get("realized_pnl", pd.Series(index=group.index)).notna()
+        ].copy()
+        if not mleg_exits.empty:
+            mleg_exits["realized_pnl"] = pd.to_numeric(
+                mleg_exits["realized_pnl"], errors="coerce"
+            )
+            mleg_exits["realized_slippage_bps"] = pd.to_numeric(
+                mleg_exits["realized_slippage_bps"], errors="coerce"
+            ).fillna(0.0)
+            mleg_exits["filled_qty_num"] = pd.to_numeric(
+                mleg_exits["filled_qty"], errors="coerce"
+            ).fillna(0.0)
+            mleg_grouped = mleg_exits.groupby(
+                "position_id", dropna=True, sort=False
+            ).agg(
+                realized_pnl=("realized_pnl", "sum"),
+                slippage_numer=(
+                    "realized_slippage_bps",
+                    lambda s: float(
+                        (s.fillna(0.0) * mleg_exits.loc[s.index, "filled_qty_num"]).sum()
+                    ),
+                ),
+                slippage_denom=("filled_qty_num", "sum"),
+            )
+            mleg_grouped = mleg_grouped[mleg_grouped["realized_pnl"].notna()]
+            pnls.extend(mleg_grouped["realized_pnl"].fillna(0.0).tolist())
+            slippage_numer += float(mleg_grouped["slippage_numer"].sum())
+            slippage_denom += float(mleg_grouped["slippage_denom"].sum())
 
         wins = sum(1 for p in pnls if p > 0)
         trade_count = len(pnls)
         total_pnl = sum(pnls)
         win_rate = wins / trade_count if trade_count > 0 else 0.0
+        avg_slip = slippage_numer / slippage_denom if slippage_denom > 0 else 0.0
 
         results.append({
             "strategy": strategy,
