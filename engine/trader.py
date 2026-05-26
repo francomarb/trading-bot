@@ -815,7 +815,25 @@ class TradingEngine:
 
         signal_bar = pd.Timestamp(decision_df.index[-1])
         signal_key = (strategy.name, symbol, timeframe)
-        if self._should_skip_processed_signal_bar(signal_key, signal_bar):
+        signal_bar_already_processed = self._should_skip_processed_signal_bar(
+            signal_key, signal_bar
+        )
+
+        # 3. Indicators (just ATR — strategy adds its own).
+        df = add_atr(decision_df, self.config.atr_length)
+        atr_col = f"atr_{self.config.atr_length}"
+        latest_atr = float(df[atr_col].iloc[-1])
+        latest_close = float(df["close"].iloc[-1])
+        latest_ts = df.index[-1]
+        self._last_underlying_prices[symbol] = latest_close
+
+        if signal_bar_already_processed:
+            if hasattr(strategy, "evaluate_spread_exit"):
+                self._process_credit_spread_exits(
+                    strategy=strategy,
+                    underlying=symbol,
+                    underlying_close=latest_close,
+                )
             if (
                 strategy_statuses is not None
                 and signal_key in self._processed_signal_statuses
@@ -827,14 +845,6 @@ class TradingEngine:
             ):
                 strategy_reasons[symbol] = list(self._processed_signal_reasons[signal_key])
             return
-
-        # 3. Indicators (just ATR — strategy adds its own).
-        df = add_atr(decision_df, self.config.atr_length)
-        atr_col = f"atr_{self.config.atr_length}"
-        latest_atr = float(df[atr_col].iloc[-1])
-        latest_close = float(df["close"].iloc[-1])
-        latest_ts = df.index[-1]
-        self._last_underlying_prices[symbol] = latest_close
 
         # 4. Signals.
         raw_signals, signals, edge_allowed, edge_reasons = strategy.inspect_signals(

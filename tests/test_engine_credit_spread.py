@@ -9,16 +9,17 @@ quote/IV lookups, and find_best_put_spread is patched where needed.
 
 from __future__ import annotations
 
-from datetime import date, timedelta
+from datetime import date, datetime, timedelta, timezone
 from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
+import pandas as pd
 import pytest
 
 from engine.trader import EngineConfig, TradingEngine
-from execution.broker import OrderResult, OrderStatus
+from execution.broker import BrokerSnapshot, OrderResult, OrderStatus
 from reporting.logger import TradeLogger
-from risk.manager import RiskManager
+from risk.manager import AccountState, RiskManager
 from strategies.credit_spread import CreditSpread, CreditSpreadConfig, OpenSpread
 from utils.iv_proxy import IVProxyResolver
 from utils.options_lookup import SpreadPick
@@ -429,6 +430,73 @@ class TestProcessCreditSpreadExits:
             strategy=strategy, underlying="SPY", underlying_close=745.0,
         )
         broker.dispatch_spread_order.assert_not_called()  # not double-submitted
+
+    def test_same_daily_bar_still_retries_exit_after_canceled_close(
+        self,
+        tmp_path,
+        monkeypatch,
+    ):
+        now = datetime(2026, 5, 26, 18, 30, tzinfo=timezone.utc)
+        idx = pd.date_range(end=now - timedelta(minutes=5), periods=60, freq="1D")
+        bars = pd.DataFrame(
+            {
+                "open": [745.0] * len(idx),
+                "high": [750.0] * len(idx),
+                "low": [740.0] * len(idx),
+                "close": [745.0] * len(idx),
+                "volume": [1_000_000] * len(idx),
+            },
+            index=idx,
+        )
+        monkeypatch.setattr(
+            "engine.trader.fetch_symbol",
+            lambda *args, **kwargs: (bars, SimpleNamespace(api_calls=0)),
+        )
+
+        quote_lookup = lambda occs: {
+            "SPY260618P00568000": Quote(1.45, 1.55),
+            "SPY260618P00558000": Quote(0.45, 0.55),
+        }
+        strategy = _strategy(_config(profit_target_pct=0.50), quote_lookup=quote_lookup)
+        engine, broker = _engine(tmp_path, strategy)
+        engine._clock = lambda: now
+        self._wire_open_spread(engine, strategy, "p1")
+        engine._processed_signal_bars[("credit_spread", "SPY", "1Day")] = pd.Timestamp(
+            bars.index[-1]
+        )
+        broker.dispatch_spread_order.return_value = OrderResult(
+            status=OrderStatus.ACCEPTED,
+            order_id="spread-worker-retry",
+            symbol="SPY",
+            requested_qty=1,
+            filled_qty=0.0,
+            avg_fill_price=0.0,
+            raw_status="accepted",
+            message="",
+        )
+        snapshot = BrokerSnapshot(
+            account=AccountState(
+                equity=100_000.0,
+                cash=100_000.0,
+                session_start_equity=100_000.0,
+                open_positions={},
+            ),
+            open_orders=[],
+        )
+
+        engine._process_symbol(
+            "SPY",
+            snapshot,
+            snapshot.account,
+            strategy,
+            "1Day",
+            market_open=True,
+        )
+
+        broker.dispatch_spread_order.assert_called_once()
+        assert broker.dispatch_spread_order.call_args.kwargs["closing"] is True
+        assert broker.dispatch_spread_order.call_args.kwargs["position_id"] == "p1"
+        assert "p1" in engine._spreads_pending_close
 
 
 # ── Global counter ──────────────────────────────────────────────────────────
