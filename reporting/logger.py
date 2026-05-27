@@ -42,6 +42,35 @@ def _contract_multiplier(symbol: str) -> int:
     return 100 if _OCC_OPTION_SYMBOL.match(symbol or "") else 1
 
 
+def single_leg_realized_slippage_bps(
+    *,
+    side: str,
+    reference_price: float | None,
+    actual_fill_price: float | None,
+) -> float:
+    """
+    Signed single-leg slippage against the intended reference price.
+
+    Positive is adverse execution; negative is price improvement. For buys,
+    paying more than the reference is adverse. For sells, receiving less than
+    the reference is adverse.
+    """
+    if reference_price is None or actual_fill_price is None:
+        return 0.0
+    reference = float(reference_price)
+    actual = float(actual_fill_price)
+    if reference <= 0:
+        return 0.0
+    normalized_side = side.lower()
+    if normalized_side == "buy":
+        bps = (actual - reference) / reference * 10_000
+    elif normalized_side == "sell":
+        bps = (reference - actual) / reference * 10_000
+    else:
+        bps = abs(actual - reference) / reference * 10_000
+    return round(bps, 2)
+
+
 def mleg_realized_slippage_bps(
     *,
     opening: bool,
@@ -298,6 +327,8 @@ class TradeLogger:
         modeled_bps = 0.0
         realized_bps = 0.0
         ref_price = modeled_price or decision.entry_reference_price
+        if modeled_price is not None and decision.order_type.value == "market":
+            modeled_bps = settings.SLIPPAGE_MODEL_MARKET_BPS
         initial_stop_loss = float(decision.stop_price)
         initial_risk_per_share = max(
             0.0,
@@ -314,8 +345,10 @@ class TradeLogger:
             result.avg_fill_price is not None
             and ref_price > 0
         ):
-            realized_bps = (
-                abs(result.avg_fill_price - ref_price) / ref_price * 10_000
+            realized_bps = single_leg_realized_slippage_bps(
+                side=decision.side.value,
+                reference_price=ref_price,
+                actual_fill_price=result.avg_fill_price,
             )
 
         return TradeRecord(
@@ -358,16 +391,17 @@ class TradeLogger:
         a RiskDecision — they come from the strategy exit signal directly.
         """
         realized_bps = 0.0
+        modeled_bps = settings.SLIPPAGE_MODEL_MARKET_BPS if modeled_price > 0 else 0.0
         context = self._read_latest_open_entry_context(
             symbol=result.symbol,
             strategy=strategy_name,
         )
         now_iso = datetime.now(timezone.utc).isoformat()
         if result.avg_fill_price is not None and modeled_price > 0:
-            realized_bps = (
-                abs(result.avg_fill_price - modeled_price)
-                / modeled_price
-                * 10_000
+            realized_bps = single_leg_realized_slippage_bps(
+                side="sell",
+                reference_price=modeled_price,
+                actual_fill_price=result.avg_fill_price,
             )
         realized_pnl = None
         r_multiple = None
@@ -409,7 +443,7 @@ class TradeLogger:
             reason="exit signal",
             stop_price=0.0,
             entry_reference_price=modeled_price,
-            modeled_slippage_bps=0.0,
+            modeled_slippage_bps=modeled_bps,
             realized_slippage_bps=round(realized_bps, 2),
             order_type="market",
             status=result.status.value,
@@ -687,6 +721,16 @@ class TradeLogger:
                 realized_pnl = (avg_fill_price - entry_reference_price) * qty * multiplier
                 if initial_risk_dollars and initial_risk_dollars > 0:
                     r_multiple = realized_pnl / initial_risk_dollars
+        realized_slippage_bps = 0.0
+        stop_reference_price = float(initial_stop_loss or 0.0)
+        modeled_slippage_bps = 0.0
+        if stop_reference_price > 0:
+            modeled_slippage_bps = settings.SLIPPAGE_MODEL_MARKET_BPS
+            realized_slippage_bps = single_leg_realized_slippage_bps(
+                side="sell",
+                reference_price=stop_reference_price,
+                actual_fill_price=avg_fill_price,
+            )
 
         record = TradeRecord(
             timestamp=now_iso,
@@ -699,8 +743,8 @@ class TradeLogger:
             reason="stop_triggered",
             stop_price=avg_fill_price,
             entry_reference_price=entry_reference_price,
-            modeled_slippage_bps=0.0,
-            realized_slippage_bps=0.0,
+            modeled_slippage_bps=modeled_slippage_bps,
+            realized_slippage_bps=round(realized_slippage_bps, 2),
             order_type="stop",
             status="filled",
             requested_qty=qty,

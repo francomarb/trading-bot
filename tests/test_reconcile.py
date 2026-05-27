@@ -300,6 +300,40 @@ class TestReconciler:
         assert result.go is False
         assert any("slippage" in r for r in result.reasons)
 
+    @patch("backtest.reconcile.fetch_symbol")
+    @patch("backtest.reconcile.run_backtest")
+    def test_slippage_gate_uses_adverse_component_only(
+        self, mock_bt, mock_fetch, tmp_csv, tmp_forward_dir
+    ):
+        rows = [
+            {
+                **_make_fill(side="buy", price=150.0),
+                "realized_slippage_bps": "-40.0",
+            },
+            {
+                **_make_fill(side="sell", price=151.0),
+                "realized_slippage_bps": "30.0",
+            },
+        ]
+        _write_trades(tmp_csv, rows)
+        mock_fetch.return_value = (pd.DataFrame(), {})
+
+        recon = Reconciler(
+            _DummyStrategy(),
+            ["AAPL"],
+            "2026-04-01",
+            "2026-04-30",
+            trade_csv_path=tmp_csv,
+            forward_test_dir=tmp_forward_dir,
+            return_divergence_threshold=0.50,
+            max_slippage_threshold=20.0,
+        )
+        result = recon.run()
+
+        assert result.mean_slippage_bps == pytest.approx(15.0)
+        assert result.max_slippage_bps == pytest.approx(30.0)
+        assert result.go is True
+
     def test_no_go_on_no_fills(self, tmp_csv, tmp_forward_dir):
         _write_trades(tmp_csv, [])
         recon = Reconciler(

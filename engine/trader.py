@@ -1547,6 +1547,8 @@ class TradingEngine:
         modeled_bps = (
             0.0 if order_type == "limit" else SLIPPAGE_MODEL_MARKET_BPS
         )
+        # The kill switch consumes unsigned magnitude samples by design;
+        # signed price-improvement/adverse attribution lives in the trade log.
         realized_bps = (
             abs(result.avg_fill_price - modeled_price) / modeled_price * 10_000
         )

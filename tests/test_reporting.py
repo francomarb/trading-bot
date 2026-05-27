@@ -36,6 +36,7 @@ from reporting.logger import (
     TradeRecord,
     install_json_sink,
     mleg_realized_slippage_bps,
+    single_leg_realized_slippage_bps,
 )
 from reporting.pnl import DailySummary, PnLTracker, StrategyStats
 from risk.manager import RiskDecision, Side
@@ -127,9 +128,21 @@ class TestTradeLogger:
     def test_slippage_calculation(self, sample_decision, sample_result):
         tl = TradeLogger(path="/dev/null")
         record = tl.build_record(sample_decision, sample_result, modeled_price=150.0)
-        # |150.05 - 150.0| / 150.0 * 10_000 = 3.33 bps
-        assert record.modeled_slippage_bps == 0.0
-        assert abs(record.realized_slippage_bps - 3.33) < 0.1
+        # Buy entry: paying above the modeled price is adverse.
+        assert record.modeled_slippage_bps == pytest.approx(5.0)
+        assert record.realized_slippage_bps == pytest.approx(3.33)
+
+    def test_single_leg_slippage_is_signed_by_side(self):
+        assert single_leg_realized_slippage_bps(
+            side="buy",
+            reference_price=100.0,
+            actual_fill_price=99.50,
+        ) == pytest.approx(-50.0)
+        assert single_leg_realized_slippage_bps(
+            side="sell",
+            reference_price=100.0,
+            actual_fill_price=99.50,
+        ) == pytest.approx(50.0)
 
     def test_append_multiple_records(self, tmp_csv, sample_decision, sample_result):
         tl = TradeLogger(path=tmp_csv)
@@ -153,6 +166,9 @@ class TestTradeLogger:
         assert record.reason == "exit signal"
         assert record.stop_price == 0.0
         assert record.exit_timestamp is not None
+        assert record.modeled_slippage_bps == pytest.approx(5.0)
+        # Sell exit: filling above the modeled price is price improvement.
+        assert record.realized_slippage_bps == pytest.approx(-3.33)
 
     def test_build_close_record_computes_realized_pnl_and_r(self, tmp_csv, sample_decision, sample_result):
         tl = TradeLogger(path=tmp_csv)
@@ -380,6 +396,78 @@ class TestTradeLogger:
         assert stop_record["initial_risk_dollars"] == pytest.approx(200.0)
         assert stop_record["realized_pnl"] == pytest.approx(-200.0)
         assert stop_record["r_multiple"] == pytest.approx(-1.0)
+
+    def test_stop_fill_records_slippage_against_intended_stop(self, tmp_csv):
+        tl = TradeLogger(path=tmp_csv)
+        decision = RiskDecision(
+            symbol="AAPL",
+            side=Side.BUY,
+            qty=10,
+            entry_reference_price=100.0,
+            stop_price=95.0,
+            strategy_name="sma_crossover",
+            reason="test entry",
+            order_type=OrderType.MARKET,
+        )
+        entry_result = OrderResult(
+            status=OrderStatus.FILLED,
+            order_id="entry-1",
+            symbol="AAPL",
+            requested_qty=10,
+            filled_qty=10,
+            avg_fill_price=100.0,
+            raw_status="filled",
+            message="filled",
+        )
+        tl.log(tl.build_record(decision, entry_result, modeled_price=100.0))
+
+        tl.log_stop_fill(
+            symbol="AAPL",
+            strategy="sma_crossover",
+            qty=10,
+            avg_fill_price=94.50,
+            order_id="stop-1",
+        )
+
+        stop_record = tl.read_recent(1)[0]
+        assert stop_record["modeled_slippage_bps"] == pytest.approx(5.0)
+        assert stop_record["realized_slippage_bps"] == pytest.approx(52.63)
+
+    def test_stop_fill_records_negative_slippage_for_price_improvement(self, tmp_csv):
+        tl = TradeLogger(path=tmp_csv)
+        decision = RiskDecision(
+            symbol="AAPL",
+            side=Side.BUY,
+            qty=10,
+            entry_reference_price=100.0,
+            stop_price=95.0,
+            strategy_name="sma_crossover",
+            reason="test entry",
+            order_type=OrderType.MARKET,
+        )
+        entry_result = OrderResult(
+            status=OrderStatus.FILLED,
+            order_id="entry-1",
+            symbol="AAPL",
+            requested_qty=10,
+            filled_qty=10,
+            avg_fill_price=100.0,
+            raw_status="filled",
+            message="filled",
+        )
+        tl.log(tl.build_record(decision, entry_result, modeled_price=100.0))
+
+        tl.log_stop_fill(
+            symbol="AAPL",
+            strategy="sma_crossover",
+            qty=10,
+            avg_fill_price=95.50,
+            order_id="stop-1",
+        )
+
+        stop_record = tl.read_recent(1)[0]
+        assert stop_record["modeled_slippage_bps"] == pytest.approx(5.0)
+        assert stop_record["realized_slippage_bps"] == pytest.approx(-52.63)
 
     def test_as_dict_has_all_columns(self, sample_decision, sample_result):
         tl = TradeLogger(path="/dev/null")
