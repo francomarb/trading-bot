@@ -23,6 +23,7 @@ from dashboard import (
     load_engine_state,
     load_trades,
     multi_leg_display_rows,
+    realized_trade_events,
     refresh_multi_leg_positions,
     resolve_account_metrics,
 )
@@ -328,9 +329,11 @@ class TestComputeEquityCurve:
     def test_single_profitable_trade(self):
         df = self._make_df([
             {"symbol": "AAPL", "side": "buy", "qty": "10", "avg_fill_price": "150.0",
-             "filled_qty": "10", "timestamp": _ts(0)},
+             "filled_qty": "10", "timestamp": _ts(0), "entry_timestamp": _ts(0),
+             "strategy": "sma_crossover"},
             {"symbol": "AAPL", "side": "sell", "qty": "10", "avg_fill_price": "160.0",
-             "filled_qty": "10", "timestamp": _ts(1)},
+             "filled_qty": "10", "timestamp": _ts(1), "entry_timestamp": _ts(0),
+             "realized_pnl": "100.0", "strategy": "sma_crossover"},
         ])
         curve = compute_equity_curve(df)
         assert len(curve) == 1
@@ -339,9 +342,11 @@ class TestComputeEquityCurve:
     def test_single_losing_trade(self):
         df = self._make_df([
             {"symbol": "AAPL", "side": "buy", "qty": "5", "avg_fill_price": "200.0",
-             "filled_qty": "5", "timestamp": _ts(0)},
+             "filled_qty": "5", "timestamp": _ts(0), "entry_timestamp": _ts(0),
+             "strategy": "sma_crossover"},
             {"symbol": "AAPL", "side": "sell", "qty": "5", "avg_fill_price": "190.0",
-             "filled_qty": "5", "timestamp": _ts(1)},
+             "filled_qty": "5", "timestamp": _ts(1), "entry_timestamp": _ts(0),
+             "realized_pnl": "-50.0", "strategy": "sma_crossover"},
         ])
         curve = compute_equity_curve(df)
         assert pytest.approx(curve["cumulative_pnl"].iloc[-1]) == -50.0  # (190-200)*5
@@ -349,32 +354,89 @@ class TestComputeEquityCurve:
     def test_two_trades_cumulative_pnl(self):
         df = self._make_df([
             {"symbol": "AAPL", "side": "buy", "qty": "10", "avg_fill_price": "100.0",
-             "filled_qty": "10", "timestamp": _ts(0)},
+             "filled_qty": "10", "timestamp": _ts(0), "entry_timestamp": _ts(0),
+             "strategy": "sma_crossover"},
             {"symbol": "AAPL", "side": "sell", "qty": "10", "avg_fill_price": "110.0",
-             "filled_qty": "10", "timestamp": _ts(1)},
+             "filled_qty": "10", "timestamp": _ts(1), "entry_timestamp": _ts(0),
+             "realized_pnl": "100.0", "strategy": "sma_crossover"},
             {"symbol": "GOOG", "side": "buy", "qty": "2", "avg_fill_price": "500.0",
-             "filled_qty": "2", "timestamp": _ts(2)},
+             "filled_qty": "2", "timestamp": _ts(2), "entry_timestamp": _ts(2),
+             "strategy": "sma_crossover"},
             {"symbol": "GOOG", "side": "sell", "qty": "2", "avg_fill_price": "490.0",
-             "filled_qty": "2", "timestamp": _ts(3)},
+             "filled_qty": "2", "timestamp": _ts(3), "entry_timestamp": _ts(2),
+             "realized_pnl": "-20.0", "strategy": "sma_crossover"},
         ])
         curve = compute_equity_curve(df)
         assert len(curve) == 2
         # First trade: +100; second trade: -20; cumulative at end = +80
         assert pytest.approx(curve["cumulative_pnl"].iloc[-1]) == 80.0
 
-    def test_partial_exit_keeps_remaining_lot_for_later_sell(self):
+    def test_partial_exit_aggregates_into_one_completed_trade_event(self):
         df = self._make_df([
             {"symbol": "AAPL", "side": "buy", "qty": "10", "avg_fill_price": "100.0",
-             "filled_qty": "10", "timestamp": _ts(0)},
+             "filled_qty": "10", "timestamp": _ts(0), "entry_timestamp": _ts(0),
+             "strategy": "sma_crossover"},
             {"symbol": "AAPL", "side": "sell", "qty": "5", "avg_fill_price": "110.0",
-             "filled_qty": "5", "timestamp": _ts(1)},
+             "filled_qty": "5", "timestamp": _ts(1), "entry_timestamp": _ts(0),
+             "realized_pnl": "50.0", "strategy": "sma_crossover"},
             {"symbol": "AAPL", "side": "sell", "qty": "5", "avg_fill_price": "120.0",
-             "filled_qty": "5", "timestamp": _ts(2)},
+             "filled_qty": "5", "timestamp": _ts(2), "entry_timestamp": _ts(0),
+             "realized_pnl": "100.0", "strategy": "sma_crossover"},
+        ])
+        curve = compute_equity_curve(df)
+        assert len(curve) == 1
+        assert pytest.approx(curve["cumulative_pnl"].iloc[0]) == 150.0
+
+    def test_includes_credit_spread_realized_events(self):
+        df = self._make_df([
+            {"symbol": "SPY260626P00704000", "side": "sell", "strategy": "credit_spread",
+             "filled_qty": "1", "timestamp": _ts(0), "position_id": "spread-1",
+             "position_type": "spread"},
+            {"symbol": "SPY260626P00695000", "side": "buy", "strategy": "credit_spread",
+             "filled_qty": "1", "timestamp": _ts(1), "position_id": "spread-1",
+             "position_type": "spread", "realized_pnl": "66.0"},
+            {"symbol": "SPY260618P00714000", "side": "sell", "strategy": "credit_spread",
+             "filled_qty": "1", "timestamp": _ts(2), "position_id": "spread-2",
+             "position_type": "spread"},
+            {"symbol": "SPY260618P00704000", "side": "buy", "strategy": "credit_spread",
+             "filled_qty": "1", "timestamp": _ts(3), "position_id": "spread-2",
+             "position_type": "spread", "realized_pnl": "75.0"},
         ])
         curve = compute_equity_curve(df)
         assert len(curve) == 2
-        assert pytest.approx(curve["cumulative_pnl"].iloc[0]) == 50.0
-        assert pytest.approx(curve["cumulative_pnl"].iloc[1]) == 150.0
+        assert pytest.approx(curve["cumulative_pnl"].iloc[0]) == 66.0
+        assert pytest.approx(curve["cumulative_pnl"].iloc[1]) == 141.0
+
+
+class TestRealizedTradeEvents:
+    def test_skips_incomplete_single_leg_exit(self):
+        df = pd.DataFrame([
+            {"symbol": "TSLA", "side": "buy", "strategy": "donchian_breakout",
+             "filled_qty": "5.39", "entry_timestamp": _ts(0), "timestamp": _ts(0)},
+            {"symbol": "TSLA", "side": "sell", "strategy": "donchian_breakout",
+             "filled_qty": "0.39", "realized_pnl": "-3.73698",
+             "entry_timestamp": _ts(0), "timestamp": _ts(1)},
+        ])
+        df["timestamp"] = pd.to_datetime(df["timestamp"], utc=True)
+        events = realized_trade_events(df)
+        assert events == []
+
+    def test_includes_single_leg_and_spread_events(self):
+        df = pd.DataFrame([
+            {"symbol": "AAPL", "side": "buy", "strategy": "sma_crossover",
+             "filled_qty": "10", "entry_timestamp": _ts(0), "timestamp": _ts(0)},
+            {"symbol": "AAPL", "side": "sell", "strategy": "sma_crossover",
+             "filled_qty": "10", "realized_pnl": "100.0",
+             "entry_timestamp": _ts(0), "timestamp": _ts(1)},
+            {"symbol": "SPY260626P00695000", "side": "buy", "strategy": "credit_spread",
+             "filled_qty": "1", "realized_pnl": "66.0",
+             "position_id": "spread-1", "position_type": "spread", "timestamp": _ts(2)},
+        ])
+        df["timestamp"] = pd.to_datetime(df["timestamp"], utc=True)
+        events = realized_trade_events(df)
+        assert len(events) == 2
+        assert pytest.approx(events[0]["pnl"]) == 100.0
+        assert pytest.approx(events[1]["pnl"]) == 66.0
 
 
 class TestFilterRealizedCurveWindow:

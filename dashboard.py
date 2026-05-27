@@ -161,6 +161,92 @@ def _realized_pnl_events(
     return events
 
 
+def realized_trade_events(trades_df: pd.DataFrame) -> list[dict]:
+    """
+    Return normalized realized-trade events across single-leg and spread trades.
+
+    Single-leg trades are counted only once the logged exit quantity fully
+    closes the original entry quantity. Spread trades are keyed by
+    ``position_id`` and use rows with non-null ``realized_pnl``.
+    """
+    if trades_df.empty or "strategy" not in trades_df.columns:
+        return []
+
+    events: list[dict] = []
+    position_type = trades_df.get(
+        "position_type", pd.Series("", index=trades_df.index)
+    )
+    is_mleg = position_type.astype(str).str.lower().isin({"spread", "mleg"})
+    single_leg_group = trades_df[~is_mleg].copy()
+    single_leg_entry_ts = single_leg_group.get(
+        "entry_timestamp", pd.Series(index=single_leg_group.index)
+    )
+    entries = single_leg_group[
+        (single_leg_group.get("side", "").astype(str).str.lower() == "buy")
+        & single_leg_entry_ts.notna()
+    ].copy()
+    exits = single_leg_group[
+        (single_leg_group.get("side", "").astype(str).str.lower() == "sell")
+        & single_leg_entry_ts.notna()
+    ].copy()
+
+    if not entries.empty and not exits.empty:
+        entries["filled_qty_num"] = pd.to_numeric(
+            entries["filled_qty"], errors="coerce"
+        ).fillna(0.0)
+        exits["filled_qty_num"] = pd.to_numeric(
+            exits["filled_qty"], errors="coerce"
+        ).fillna(0.0)
+        exits["realized_pnl"] = pd.to_numeric(
+            exits["realized_pnl"], errors="coerce"
+        )
+
+        entry_groups = entries.groupby(
+            ["strategy", "symbol", "entry_timestamp"], dropna=True, sort=False
+        ).agg(entry_qty=("filled_qty_num", "sum"))
+        grouped = exits.groupby(
+            ["strategy", "symbol", "entry_timestamp"], dropna=True, sort=False
+        ).agg(
+            realized_pnl=("realized_pnl", "sum"),
+            exit_qty=("filled_qty_num", "sum"),
+            timestamp=("timestamp", "max"),
+        )
+        grouped = grouped.join(entry_groups, how="inner")
+        grouped = grouped[grouped["exit_qty"] >= (grouped["entry_qty"] - 1e-9)]
+
+        for _, row in grouped.reset_index().iterrows():
+            events.append({
+                "timestamp": row["timestamp"],
+                "pnl": float(row["realized_pnl"] or 0.0),
+            })
+
+    mleg_exits = trades_df[
+        is_mleg
+        & trades_df.get("position_id", pd.Series(index=trades_df.index)).notna()
+        & trades_df.get("realized_pnl", pd.Series(index=trades_df.index)).notna()
+    ].copy()
+    if not mleg_exits.empty:
+        mleg_exits["realized_pnl"] = pd.to_numeric(
+            mleg_exits["realized_pnl"], errors="coerce"
+        )
+        grouped = mleg_exits.groupby(
+            ["strategy", "position_id"], dropna=True, sort=False
+        ).agg(
+            realized_pnl=("realized_pnl", "sum"),
+            timestamp=("timestamp", "max"),
+        )
+        for _, row in grouped.reset_index().iterrows():
+            if pd.isna(row["realized_pnl"]):
+                continue
+            events.append({
+                "timestamp": row["timestamp"],
+                "pnl": float(row["realized_pnl"]),
+            })
+
+    events.sort(key=lambda e: e["timestamp"])
+    return events
+
+
 def load_engine_state(path: str) -> dict:
     """Read engine_state.json. Returns {} if missing or malformed."""
     try:
@@ -428,7 +514,7 @@ def compute_equity_curve(trades_df: pd.DataFrame) -> pd.DataFrame:
     if trades_df.empty or "side" not in trades_df.columns:
         return pd.DataFrame(columns=["timestamp", "cumulative_pnl"])
 
-    rows = _realized_pnl_events(trades_df, key_columns=("symbol",))
+    rows = realized_trade_events(trades_df)
     if not rows:
         return pd.DataFrame(columns=["timestamp", "cumulative_pnl"])
 
@@ -1180,7 +1266,7 @@ def render_dashboard() -> None:
             "Computed from realized trade outcomes in the trade log.",
             kicker="Performance",
         )
-        pnl_events = _realized_pnl_events(trades_df, key_columns=("symbol",))
+        pnl_events = realized_trade_events(trades_df)
         pnl_list = [event["pnl"] for event in pnl_events]
         sample_size = len(pnl_list)
         if not pnl_list:
@@ -1220,6 +1306,7 @@ def render_dashboard() -> None:
             "total_pnl": "Total P&L",
             "avg_slippage_bps": "Avg Slippage Bps",
         })
+        display["Win Rate"] = display["Win Rate"] * 100.0
         st.dataframe(
             display,
             width="stretch",
