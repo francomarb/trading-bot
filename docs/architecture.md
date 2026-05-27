@@ -522,7 +522,7 @@ The MLEG limit-price sign convention was confirmed against the Alpaca paper API 
 | `closing=False`, filled | Log entry to the trade DB, fire alert, keep the pre-registered `Position` |
 | `closing=False`, canceled/rejected | Roll back the pre-registered `Position` + the strategy's `OpenSpread` view |
 | `closing=True`, filled | Drop the `Position`, release on the strategy, compute realized P&L `= (net_credit − net_debit) × qty × 100`, feed the **allocator HWM / sleeve-drawdown gate**, log the close. If the fill price is unavailable (rare stream-fill + REST-failure case), the position still closes but realized P&L is **left unset, never fabricated** |
-| `closing=True`, canceled | Keep the position open; clear `_spreads_pending_close` so the exit path retries next cycle |
+| `closing=True`, canceled | Keep the position open; clear `_spreads_pending_close` so the exit path retries next cycle. The current implementation does not escalate automatically to a more marketable debit or to a market order after timeout. |
 
 **Pre-registration.** When a worker is dispatched, the engine immediately creates a two-leg `Position` (UUID `position_id`, `position_type='spread'`, both legs) and calls `strategy.register_spread(OpenSpread(...))`. The drain confirms or rolls back. `_spreads_pending_close` guards against double-submitting a close while one is in flight.
 

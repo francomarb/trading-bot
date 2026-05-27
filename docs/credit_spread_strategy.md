@@ -102,7 +102,17 @@ A position closes when **any** of the following triggers fire:
 
 ### Exit mechanics
 
-Exits use **closing combo orders** at the spread bid. If the spread doesn't fill within `limit_timeout_seconds`, escalate to market.
+Exits use **closing combo orders** with a positive net-debit limit derived from the
+current quoted spread mid (`short mid − long mid`), rounded to cents. The worker
+lets the combo rest for the configured timeout and, if still unfilled, cancels the
+order and returns control to the engine. The engine keeps the spread open and
+retries on a later cycle if the exit trigger still holds.
+
+This is intentionally conservative for the first paper rollout: no forced
+"market-style" close is sent after a timeout, and the bot never exits solely
+because quote data is missing. The trade-off is that some MLEG closes can require
+many retries before the market will trade at the modeled debit. That behavior is
+tracked as a dedicated paper-watch tuning item in [PLAN.md](/Users/franco/trading-bot/PLAN.md) (`11.41`).
 
 ---
 

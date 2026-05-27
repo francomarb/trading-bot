@@ -434,8 +434,13 @@ Entry:
 
 Exit:
 1. `_process_credit_spread_exits` runs before any entry gating (exits are never blocked by halt / regime / sleeve). Iterates `strategy.open_spreads`; for each runs `evaluate_spread_exit`.
-2. On a trigger: `broker.dispatch_spread_order(closing=True, position_id=<existing>)` — the broker reverses the legs into the `*_TO_CLOSE` trade and the same worker handles it. The `position_id` is added to `_spreads_pending_close` so the exit path doesn't double-submit.
+2. On a trigger: `broker.dispatch_spread_order(closing=True, position_id=<existing>)` — the broker reverses the legs into the `*_TO_CLOSE` trade and the same worker handles it. The close order's positive debit limit is the current modeled spread mid (`short mid − long mid`), rounded to cents. The `position_id` is added to `_spreads_pending_close` so the exit path doesn't double-submit.
 3. On the close fill: `_drain_spread_fills` close path drops the `Position`, releases it on the strategy, records realized P&L `= (net_credit − net_debit) × qty × 100` into the **allocator's HWM / sleeve-drawdown gate**, and writes the close row to the trade DB. **If the fill price is unavailable** (stream "filled" + REST follow-up failure) the position still closes but realized P&L is left unset, never fabricated to zero.
+
+Current paper behavior on an unfilled close timeout is **cancel + retry later**,
+not immediate escalation to a more marketable debit or to a market order. That
+execution-quality trade-off is intentional for v1 and is tracked as a tuning
+follow-up in [PLAN.md](/Users/franco/trading-bot/PLAN.md) (`11.41`).
 
 **Trade-DB layout:** one row per leg per fill, both rows sharing the spread's `position_id` with `position_type='spread'`. Spread rows are excluded from `read_all_open_owners` / `read_owner_for_symbol` (a spread leg is not a standalone single-leg position) — they restore via the dedicated `read_open_spread_positions` path. Realized P&L on a close rides the short-leg row; `read_strategy_realized_pnl_summary` counts spread rows alongside single-leg sells so credit-spread P&L feeds the HWM gate on restart too.
 
