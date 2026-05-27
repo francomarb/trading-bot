@@ -582,8 +582,9 @@ ALERT_LOG_FILE = "logs/alerts.log"          # Dedicated alert log file
 FORWARD_TEST_DIR = "logs/forward_tests"          # Go/no-go decision docs
 # Divergence gate: if |paper_return - backtest_return| exceeds this, no-go.
 FORWARD_TEST_RETURN_DIVERGENCE_PCT = 0.10        # 10 percentage points
-# Slippage gate: if mean realized slippage exceeds this, no-go.
-FORWARD_TEST_MAX_SLIPPAGE_BPS = 20.0             # 20 bps mean
+# Slippage gate: if mean adverse slippage exceeds this, no-go. Signed
+# price-improvement rows count as 0 adverse bps for this reconciliation gate.
+FORWARD_TEST_MAX_SLIPPAGE_BPS = 20.0             # 20 bps mean adverse
 
 # ── Telegram / messaging (Phase 11.13) ──────────────────────────────────────
 # Set TELEGRAM_BOT_TOKEN and TELEGRAM_CHAT_ID in config/.env to enable.

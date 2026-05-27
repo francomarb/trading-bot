@@ -8,7 +8,7 @@ against backtest-predicted fills over the same date range. Produces:
      deviation, slippage, and signal-to-fill latency.
   2. **Aggregate divergence** — total paper return vs. backtest return.
   3. **Go/no-go gate** — automatic pass/fail against pre-committed thresholds
-     (return divergence %, mean slippage bps).
+     (return divergence %, mean adverse slippage bps).
   4. **Decision report** — written as markdown in `logs/forward_tests/`.
 
 Design principles:
@@ -161,11 +161,13 @@ class Reconciler:
         # 4. Per-trade divergence.
         divergences = self._match_trades(paper_fills, bt_results)
 
-        # 5. Slippage stats from paper fills.
+        # 5. Slippage stats from paper fills. Trade rows store signed
+        # slippage (positive=adverse, negative=improvement); the gate only
+        # penalizes adverse execution so improvements do not mask bad fills.
         slips = []
         for t in paper_fills:
             try:
-                slips.append(float(t.get("realized_slippage_bps", 0)))
+                slips.append(max(0.0, float(t.get("realized_slippage_bps", 0))))
             except (ValueError, TypeError):
                 pass
         mean_slip = sum(slips) / len(slips) if slips else 0.0
@@ -188,7 +190,7 @@ class Reconciler:
         if mean_slip > self._slippage_threshold:
             go = False
             reasons.append(
-                f"mean slippage {mean_slip:.1f}bps exceeds "
+                f"mean adverse slippage {mean_slip:.1f}bps exceeds "
                 f"threshold {self._slippage_threshold:.1f}bps"
             )
         if not paper_fills:
@@ -254,8 +256,8 @@ class Reconciler:
             "",
             "| Metric | Value |",
             "|---|---|",
-            f"| Mean realized | {result.mean_slippage_bps:.1f} bps |",
-            f"| Max realized | {result.max_slippage_bps:.1f} bps |",
+            f"| Mean adverse | {result.mean_slippage_bps:.1f} bps |",
+            f"| Max adverse | {result.max_slippage_bps:.1f} bps |",
             f"| Threshold | {result.slippage_threshold_bps:.1f} bps |",
             "",
             "## Gate Reasons",
