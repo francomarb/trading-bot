@@ -128,7 +128,7 @@ class TestTradeLogger:
         tl = TradeLogger(path="/dev/null")
         record = tl.build_record(sample_decision, sample_result, modeled_price=150.0)
         # |150.05 - 150.0| / 150.0 * 10_000 = 3.33 bps
-        assert record.modeled_slippage_bps == 0.0
+        assert record.modeled_slippage_bps == pytest.approx(5.0)
         assert abs(record.realized_slippage_bps - 3.33) < 0.1
 
     def test_append_multiple_records(self, tmp_csv, sample_decision, sample_result):
@@ -380,6 +380,42 @@ class TestTradeLogger:
         assert stop_record["initial_risk_dollars"] == pytest.approx(200.0)
         assert stop_record["realized_pnl"] == pytest.approx(-200.0)
         assert stop_record["r_multiple"] == pytest.approx(-1.0)
+
+    def test_stop_fill_records_slippage_against_intended_stop(self, tmp_csv):
+        tl = TradeLogger(path=tmp_csv)
+        decision = RiskDecision(
+            symbol="AAPL",
+            side=Side.BUY,
+            qty=10,
+            entry_reference_price=100.0,
+            stop_price=95.0,
+            strategy_name="sma_crossover",
+            reason="test entry",
+            order_type=OrderType.MARKET,
+        )
+        entry_result = OrderResult(
+            status=OrderStatus.FILLED,
+            order_id="entry-1",
+            symbol="AAPL",
+            requested_qty=10,
+            filled_qty=10,
+            avg_fill_price=100.0,
+            raw_status="filled",
+            message="filled",
+        )
+        tl.log(tl.build_record(decision, entry_result, modeled_price=100.0))
+
+        tl.log_stop_fill(
+            symbol="AAPL",
+            strategy="sma_crossover",
+            qty=10,
+            avg_fill_price=94.50,
+            order_id="stop-1",
+        )
+
+        stop_record = tl.read_recent(1)[0]
+        assert stop_record["modeled_slippage_bps"] == pytest.approx(5.0)
+        assert stop_record["realized_slippage_bps"] == pytest.approx(52.63)
 
     def test_as_dict_has_all_columns(self, sample_decision, sample_result):
         tl = TradeLogger(path="/dev/null")

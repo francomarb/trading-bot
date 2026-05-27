@@ -298,6 +298,8 @@ class TradeLogger:
         modeled_bps = 0.0
         realized_bps = 0.0
         ref_price = modeled_price or decision.entry_reference_price
+        if modeled_price is not None and decision.order_type.value == "market":
+            modeled_bps = settings.SLIPPAGE_MODEL_MARKET_BPS
         initial_stop_loss = float(decision.stop_price)
         initial_risk_per_share = max(
             0.0,
@@ -358,6 +360,7 @@ class TradeLogger:
         a RiskDecision — they come from the strategy exit signal directly.
         """
         realized_bps = 0.0
+        modeled_bps = settings.SLIPPAGE_MODEL_MARKET_BPS if modeled_price > 0 else 0.0
         context = self._read_latest_open_entry_context(
             symbol=result.symbol,
             strategy=strategy_name,
@@ -409,7 +412,7 @@ class TradeLogger:
             reason="exit signal",
             stop_price=0.0,
             entry_reference_price=modeled_price,
-            modeled_slippage_bps=0.0,
+            modeled_slippage_bps=modeled_bps,
             realized_slippage_bps=round(realized_bps, 2),
             order_type="market",
             status=result.status.value,
@@ -687,6 +690,16 @@ class TradeLogger:
                 realized_pnl = (avg_fill_price - entry_reference_price) * qty * multiplier
                 if initial_risk_dollars and initial_risk_dollars > 0:
                     r_multiple = realized_pnl / initial_risk_dollars
+        realized_slippage_bps = 0.0
+        stop_reference_price = float(initial_stop_loss or 0.0)
+        modeled_slippage_bps = 0.0
+        if stop_reference_price > 0:
+            modeled_slippage_bps = settings.SLIPPAGE_MODEL_MARKET_BPS
+            realized_slippage_bps = (
+                abs(float(avg_fill_price) - stop_reference_price)
+                / stop_reference_price
+                * 10_000
+            )
 
         record = TradeRecord(
             timestamp=now_iso,
@@ -699,8 +712,8 @@ class TradeLogger:
             reason="stop_triggered",
             stop_price=avg_fill_price,
             entry_reference_price=entry_reference_price,
-            modeled_slippage_bps=0.0,
-            realized_slippage_bps=0.0,
+            modeled_slippage_bps=modeled_slippage_bps,
+            realized_slippage_bps=round(realized_slippage_bps, 2),
             order_type="stop",
             status="filled",
             requested_qty=qty,
