@@ -46,6 +46,17 @@ The defined-risk credit spread captures roughly the same edge with **~$850 of co
 
 Both legs in one order means **no leg risk** — if the broker can't fill both at the combined credit, the order fails cleanly, no half-trade orphaned.
 
+### Combo slippage attribution
+
+The trade log records realized MLEG slippage against the submitted combo
+limit, not against a later reconstructed leg price. Opening credits compare
+the actual net credit received with the submitted credit limit; closing debits
+compare the actual net debit paid with the submitted debit limit. Positive bps
+means adverse execution versus the submitted combo limit, while negative bps
+means price improvement. The economic value is stored on the short-leg row
+alongside the combo net price so dashboard strategy stats can surface average
+execution quality for completed spreads.
+
 ### Concrete example — SPY at $737
 
 | Leg | Action | Strike | DTE | Premium |

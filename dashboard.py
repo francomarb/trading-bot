@@ -666,18 +666,39 @@ def compute_strategy_stats(trades_df: pd.DataFrame) -> pd.DataFrame:
                 "position_id", dropna=True, sort=False
             ).agg(
                 realized_pnl=("realized_pnl", "sum"),
-                slippage_numer=(
-                    "realized_slippage_bps",
-                    lambda s: float(
-                        (s.fillna(0.0) * mleg_exits.loc[s.index, "filled_qty_num"]).sum()
-                    ),
-                ),
-                slippage_denom=("filled_qty_num", "sum"),
             )
             mleg_grouped = mleg_grouped[mleg_grouped["realized_pnl"].notna()]
             pnls.extend(mleg_grouped["realized_pnl"].fillna(0.0).tolist())
-            slippage_numer += float(mleg_grouped["slippage_numer"].sum())
-            slippage_denom += float(mleg_grouped["slippage_denom"].sum())
+
+            # For completed MLEG positions, include the economic short-leg
+            # rows from both entry and close. The long-leg rows carry
+            # avg_fill_price=0.0 because the combo net economics live on the
+            # short-leg row.
+            completed_ids = set(mleg_grouped.index)
+            position_ids = group.get("position_id", pd.Series(index=group.index))
+            mleg_slippage_rows = group[
+                is_mleg & position_ids.isin(completed_ids)
+            ].copy()
+            if not mleg_slippage_rows.empty:
+                mleg_slippage_rows["avg_fill_price_num"] = pd.to_numeric(
+                    mleg_slippage_rows["avg_fill_price"], errors="coerce"
+                ).fillna(0.0)
+                mleg_slippage_rows["realized_slippage_bps"] = pd.to_numeric(
+                    mleg_slippage_rows["realized_slippage_bps"], errors="coerce"
+                ).fillna(0.0)
+                mleg_slippage_rows["filled_qty_num"] = pd.to_numeric(
+                    mleg_slippage_rows["filled_qty"], errors="coerce"
+                ).fillna(0.0)
+                mleg_slippage_rows = mleg_slippage_rows[
+                    mleg_slippage_rows["avg_fill_price_num"] > 0
+                ]
+                slippage_numer += float(
+                    (
+                        mleg_slippage_rows["realized_slippage_bps"]
+                        * mleg_slippage_rows["filled_qty_num"]
+                    ).sum()
+                )
+                slippage_denom += float(mleg_slippage_rows["filled_qty_num"].sum())
 
         wins = sum(1 for p in pnls if p > 0)
         trade_count = len(pnls)

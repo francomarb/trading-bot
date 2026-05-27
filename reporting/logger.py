@@ -42,6 +42,33 @@ def _contract_multiplier(symbol: str) -> int:
     return 100 if _OCC_OPTION_SYMBOL.match(symbol or "") else 1
 
 
+def mleg_realized_slippage_bps(
+    *,
+    opening: bool,
+    submitted_limit_price: float | None,
+    actual_net_price: float | None,
+) -> float:
+    """
+    Realized combo slippage vs the submitted MLEG limit.
+
+    Positive is adverse execution; negative is price improvement. Opening
+    credit orders prefer a larger credit, while closing debit orders prefer a
+    smaller debit. Prices may arrive signed from Alpaca, so compare absolute
+    net prices.
+    """
+    if submitted_limit_price is None or actual_net_price is None:
+        return 0.0
+    benchmark = abs(float(submitted_limit_price))
+    actual = abs(float(actual_net_price))
+    if benchmark <= 0:
+        return 0.0
+    if opening:
+        bps = (benchmark - actual) / benchmark * 10_000
+    else:
+        bps = (actual - benchmark) / benchmark * 10_000
+    return round(bps, 2)
+
+
 # ── Structured JSON sink ────────────────────────────────────────────────────
 
 
@@ -508,6 +535,8 @@ class TradeLogger:
         opening: bool,
         realized_pnl: float | None = None,
         reason: str = "",
+        submitted_limit_price: float | None = None,
+        realized_slippage_bps: float | None = None,
     ) -> None:
         """
         Write trade-log rows for a multi-leg (MLEG) credit-spread fill (11.29).
@@ -522,6 +551,9 @@ class TradeLogger:
         put; closing reverses both. The net economics (``net_price`` — credit
         received on open, debit paid on close, both positive) go on the
         short-leg row; the long-leg row carries ``avg_fill_price=0.0``.
+        When ``submitted_limit_price`` is provided, the short-leg
+        ``entry_reference_price`` stores the absolute submitted combo limit
+        used for slippage attribution rather than the actual net fill price.
 
         ``realized_pnl`` is the closed spread's net P&L
         (``(net_credit − net_debit) × qty × 100``) — provided only on a close.
@@ -540,9 +572,29 @@ class TradeLogger:
         # Short leg: sold to open / bought to close. Long leg: the reverse.
         short_side = "sell" if opening else "buy"
         long_side = "buy" if opening else "sell"
+        short_ref_price = (
+            abs(float(submitted_limit_price))
+            if submitted_limit_price is not None
+            else net_price
+        )
+        short_slippage_bps = (
+            round(float(realized_slippage_bps), 2)
+            if realized_slippage_bps is not None
+            else mleg_realized_slippage_bps(
+                opening=opening,
+                submitted_limit_price=submitted_limit_price,
+                actual_net_price=net_price,
+            )
+        )
 
         def _leg_record(
-            symbol: str, side: str, price: float, pnl: float | None
+            symbol: str,
+            side: str,
+            price: float,
+            pnl: float | None,
+            *,
+            entry_reference_price: float,
+            slippage_bps: float,
         ) -> TradeRecord:
             return TradeRecord(
                 timestamp=now_iso,
@@ -554,9 +606,9 @@ class TradeLogger:
                 strategy=strategy,
                 reason=reason or default_reason,
                 stop_price=0.0,
-                entry_reference_price=price,
+                entry_reference_price=entry_reference_price,
                 modeled_slippage_bps=0.0,
-                realized_slippage_bps=0.0,
+                realized_slippage_bps=slippage_bps,
                 order_type="mleg",
                 status="filled",
                 requested_qty=qty,
@@ -574,8 +626,22 @@ class TradeLogger:
 
         # realized_pnl rides the short-leg row alongside the net economics;
         # the long-leg row stays at 0.0 / None.
-        self.log(_leg_record(short_occ, short_side, net_price, realized_pnl))
-        self.log(_leg_record(long_occ, long_side, 0.0, None))
+        self.log(_leg_record(
+            short_occ,
+            short_side,
+            net_price,
+            realized_pnl,
+            entry_reference_price=short_ref_price,
+            slippage_bps=short_slippage_bps,
+        ))
+        self.log(_leg_record(
+            long_occ,
+            long_side,
+            0.0,
+            None,
+            entry_reference_price=0.0,
+            slippage_bps=0.0,
+        ))
         logger.info(
             f"spread {'entry' if opening else 'exit'} logged: {short_occ}/{long_occ} "
             f"qty={qty} net=${net_price:.2f}/sh [{strategy}] position_id={position_id[:8]}"

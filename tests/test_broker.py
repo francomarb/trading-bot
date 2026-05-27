@@ -1262,13 +1262,17 @@ class TestDispatchSpreadOrder:
         assert result.raw_status == "dry_run"
         drained = broker.drain_spread_fills()
         assert len(drained) == 1
-        position_id, strategy_name, closing, status, filled_qty, avg_price, order_id = drained[0]
+        (
+            position_id, strategy_name, closing, status, filled_qty,
+            avg_price, order_id, submitted_limit,
+        ) = drained[0]
         assert position_id == "pos-1"
         assert strategy_name == "credit_spread"
         assert closing is False  # an open
         assert status == "filled"
         assert filled_qty == 1.0
         assert avg_price == pytest.approx(-1.45)
+        assert submitted_limit == pytest.approx(-1.45)
 
     def test_closing_dispatch_reverses_legs_and_tags_close(self):
         api = MagicMock()
@@ -1279,9 +1283,13 @@ class TestDispatchSpreadOrder:
         )
         assert result.status is OrderStatus.ACCEPTED
         drained = broker.drain_spread_fills()
-        position_id, strategy_name, closing, status, filled_qty, avg_price, order_id = drained[0]
+        (
+            position_id, strategy_name, closing, status, filled_qty,
+            avg_price, order_id, submitted_limit,
+        ) = drained[0]
         assert closing is True
         assert status == "filled"
+        assert submitted_limit == pytest.approx(1.10)
 
     def test_drain_spread_fills_returns_and_clears(self):
         api = MagicMock()
@@ -1313,5 +1321,8 @@ class TestDispatchSpreadOrder:
         captured["on_fill"]("filled", 2.0, 1.50, "alpaca-combo-1")
         drained = broker.drain_spread_fills()
         assert drained == [
-            ("pos-99", "credit_spread", False, "filled", 2.0, 1.50, "alpaca-combo-1")
+            (
+                "pos-99", "credit_spread", False, "filled", 2.0,
+                1.50, "alpaca-combo-1", -1.45,
+            )
         ]

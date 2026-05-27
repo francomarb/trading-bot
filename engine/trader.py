@@ -2777,7 +2777,7 @@ class TradingEngine:
         """
         for (
             position_id, strategy_name, closing, status,
-            filled_qty, avg_fill_price, order_id,
+            filled_qty, avg_fill_price, order_id, submitted_limit_price,
         ) in self.broker.drain_spread_fills():
             strategy = self._spread_owner_strategy.get(position_id)
             filled = status in ("filled", "partially_filled")
@@ -2815,6 +2815,7 @@ class TradingEngine:
                             net_price=net_credit,
                             order_id=order_id,
                             opening=True,
+                            submitted_limit_price=submitted_limit_price,
                         )
                         self.alerts.trade_executed(
                             symbol=plan.short_occ,
@@ -2899,6 +2900,7 @@ class TradingEngine:
                     opening=False,
                     realized_pnl=realized_pnl,
                     reason=exit_reason,
+                    submitted_limit_price=submitted_limit_price,
                 )
                 self.alerts.trade_executed(
                     symbol=short_occ,

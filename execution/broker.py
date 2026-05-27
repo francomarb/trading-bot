@@ -1122,6 +1122,7 @@ class AlpacaBroker:
                 self._pending_spread_fills.append((
                     position_id, strategy_name, closing, "filled", float(qty),
                     round(limit_price, 2), f"dry-run-{uuid.uuid4().hex[:10]}",
+                    round(limit_price, 2),
                 ))
             return OrderResult(
                 status=OrderStatus.ACCEPTED,
@@ -1143,7 +1144,7 @@ class AlpacaBroker:
             with self._pending_spread_lock:
                 self._pending_spread_fills.append((
                     position_id, strategy_name, closing, status,
-                    filled_qty, avg_price, order_id,
+                    filled_qty, avg_price, order_id, round(limit_price, 2),
                 ))
 
         worker = SpreadExecutionWorker(
@@ -1173,9 +1174,10 @@ class AlpacaBroker:
         ``SpreadExecutionWorker`` threads.
 
         Each entry is ``(position_id, strategy_name, closing, status_str,
-        filled_qty, avg_fill_price, order_id)`` — ``closing`` distinguishes a
-        spread open from a spread close. ``TradingEngine`` drains this each
-        cycle to confirm or roll back tracked spread ``Position`` records.
+        filled_qty, avg_fill_price, order_id, submitted_limit_price)`` —
+        ``closing`` distinguishes a spread open from a spread close.
+        ``submitted_limit_price`` is the original signed combo limit used for
+        reusable MLEG slippage attribution.
         """
         with self._pending_spread_lock:
             fills = list(self._pending_spread_fills)
