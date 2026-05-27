@@ -686,6 +686,42 @@ class TestComputeStrategyStats:
         assert row["win_rate"] == pytest.approx(1.0)
         assert row["total_pnl"] == pytest.approx(141.0)
 
+    def test_mleg_spread_avg_slippage_uses_completed_entry_and_close_rows(self):
+        df = self._make_df([
+            {"symbol": "SPY260618P00714000", "side": "sell", "strategy": "credit_spread",
+             "avg_fill_price": "1.50", "filled_qty": "2", "qty": "2",
+             "realized_slippage_bps": "-100.0", "timestamp": _ts(0),
+             "position_id": "spread-1", "position_type": "spread",
+             "reason": "spread entry"},
+            {"symbol": "SPY260618P00704000", "side": "buy", "strategy": "credit_spread",
+             "avg_fill_price": "0", "filled_qty": "2", "qty": "2",
+             "realized_slippage_bps": "0", "timestamp": _ts(0),
+             "position_id": "spread-1", "position_type": "spread",
+             "reason": "spread entry"},
+            {"symbol": "SPY260618P00714000", "side": "buy", "strategy": "credit_spread",
+             "avg_fill_price": "0.63", "filled_qty": "2", "qty": "2",
+             "realized_slippage_bps": "50.0", "timestamp": _ts(1),
+             "position_id": "spread-1", "position_type": "spread",
+             "reason": "spread exit", "realized_pnl": "174.0"},
+            {"symbol": "SPY260618P00704000", "side": "sell", "strategy": "credit_spread",
+             "avg_fill_price": "0", "filled_qty": "2", "qty": "2",
+             "realized_slippage_bps": "0", "timestamp": _ts(1),
+             "position_id": "spread-1", "position_type": "spread",
+             "reason": "spread exit"},
+            # Still-open spread should not affect completed-trade slippage.
+            {"symbol": "QQQ260618P00674000", "side": "sell", "strategy": "credit_spread",
+             "avg_fill_price": "2.00", "filled_qty": "1", "qty": "1",
+             "realized_slippage_bps": "999.0", "timestamp": _ts(2),
+             "position_id": "spread-open", "position_type": "spread",
+             "reason": "spread entry"},
+        ])
+        stats = compute_strategy_stats(df)
+        row = stats[stats["strategy"] == "credit_spread"].iloc[0]
+
+        assert row["trades"] == 1
+        assert row["total_pnl"] == pytest.approx(174.0)
+        assert row["avg_slippage_bps"] == pytest.approx(-25.0)
+
 
 class TestComputeSleeveUsage:
     def test_uses_allocator_snapshot_when_available(self):

@@ -859,10 +859,14 @@ class TestCreditSpreadCounters:
         # The pre-registered position now has a pending plan. Set up
         # the broker's drain to return a FILLED open event.
         position_id = next(iter(engine._pending_spread_plans.keys()))
-        # drain_spread_fills returns 7-tuples:
-        # (position_id, strategy_name, closing, status, filled_qty, avg_fill_price, order_id)
+        # drain_spread_fills returns:
+        # (position_id, strategy_name, closing, status, filled_qty,
+        #  avg_fill_price, order_id, submitted_limit_price)
         broker.drain_spread_fills.return_value = [
-            (position_id, "credit_spread", False, "filled", 1.0, -1.45, "spread-1"),
+            (
+                position_id, "credit_spread", False, "filled", 1.0,
+                -1.45, "spread-1", -1.45,
+            ),
         ]
         engine._drain_spread_fills()
 
@@ -892,10 +896,13 @@ class TestCreditSpreadCounters:
             )
         position_id = next(iter(engine._pending_spread_plans.keys()))
         # Drain returns a NON-filled status (e.g. "canceled").
-        # 7-tuple: (position_id, strategy_name, closing, status,
-        # filled_qty, avg_fill_price, order_id)
+        # Shape: (position_id, strategy_name, closing, status, filled_qty,
+        # avg_fill_price, order_id, submitted_limit_price)
         broker.drain_spread_fills.return_value = [
-            (position_id, "credit_spread", False, "canceled", 0.0, None, "spread-1"),
+            (
+                position_id, "credit_spread", False, "canceled", 0.0,
+                None, "spread-1", -1.45,
+            ),
         ]
         engine._drain_spread_fills()
 

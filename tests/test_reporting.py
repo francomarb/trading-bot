@@ -35,6 +35,7 @@ from reporting.logger import (
     TradeLogger,
     TradeRecord,
     install_json_sink,
+    mleg_realized_slippage_bps,
 )
 from reporting.pnl import DailySummary, PnLTracker, StrategyStats
 from risk.manager import RiskDecision, Side
@@ -701,6 +702,36 @@ class TestSpreadLogging:
         assert with_pnl[0]["side"] == "buy"
         assert with_pnl[0]["realized_pnl"] == pytest.approx(174.0)
 
+    def test_open_credit_slippage_is_logged_on_short_leg(self, tmp_csv):
+        tl = TradeLogger(path=tmp_csv)
+        tl.log_spread_fill(
+            position_id="uuid-1", strategy="credit_spread",
+            short_occ=self._SHORT, long_occ=self._LONG,
+            qty=1, net_price=1.50, order_id="combo-1", opening=True,
+            submitted_limit_price=-1.45,
+        )
+        rows = tl.read_all()
+        by_symbol = {r["symbol"]: r for r in rows}
+
+        assert by_symbol[self._SHORT]["entry_reference_price"] == pytest.approx(1.45)
+        assert by_symbol[self._SHORT]["realized_slippage_bps"] == pytest.approx(-344.83)
+        assert by_symbol[self._LONG]["realized_slippage_bps"] == pytest.approx(0.0)
+
+    def test_close_debit_slippage_is_logged_on_short_leg(self, tmp_csv):
+        tl = TradeLogger(path=tmp_csv)
+        tl.log_spread_fill(
+            position_id="uuid-1", strategy="credit_spread",
+            short_occ=self._SHORT, long_occ=self._LONG,
+            qty=1, net_price=0.63, order_id="combo-close",
+            opening=False, realized_pnl=82.0, submitted_limit_price=0.60,
+        )
+        rows = tl.read_all()
+        by_symbol = {r["symbol"]: r for r in rows}
+
+        assert by_symbol[self._SHORT]["entry_reference_price"] == pytest.approx(0.60)
+        assert by_symbol[self._SHORT]["realized_slippage_bps"] == pytest.approx(500.0)
+        assert by_symbol[self._LONG]["realized_slippage_bps"] == pytest.approx(0.0)
+
     def test_realized_pnl_summary_rolls_in_credit_spread_pnl(self, tmp_csv):
         tl = TradeLogger(path=tmp_csv)
         tl.log_spread_fill(
@@ -736,6 +767,36 @@ class TestSpreadLogging:
         assert summary["credit_spread"]["realized_pnl"] == pytest.approx(-155.0)
         # P&L never went positive — HWM stays at the 0.0 baseline.
         assert summary["credit_spread"]["hwm"] == pytest.approx(0.0)
+
+
+class TestMlegRealizedSlippageBps:
+    def test_open_credit_improvement_is_negative(self):
+        assert mleg_realized_slippage_bps(
+            opening=True,
+            submitted_limit_price=-1.45,
+            actual_net_price=-1.50,
+        ) == pytest.approx(-344.83)
+
+    def test_open_credit_shortfall_is_positive(self):
+        assert mleg_realized_slippage_bps(
+            opening=True,
+            submitted_limit_price=-1.45,
+            actual_net_price=-1.40,
+        ) == pytest.approx(344.83)
+
+    def test_close_debit_improvement_is_negative(self):
+        assert mleg_realized_slippage_bps(
+            opening=False,
+            submitted_limit_price=0.60,
+            actual_net_price=0.58,
+        ) == pytest.approx(-333.33)
+
+    def test_close_debit_overpay_is_positive(self):
+        assert mleg_realized_slippage_bps(
+            opening=False,
+            submitted_limit_price=0.60,
+            actual_net_price=0.63,
+        ) == pytest.approx(500.0)
 
 
 # ── TestPnLTracker ──────────────────────────────────────────────────────────

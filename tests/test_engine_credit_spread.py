@@ -231,7 +231,7 @@ class TestDrainSpreadFills:
         engine, broker = _engine(tmp_path, strategy)
         self._pre_register(engine, strategy, "p1")
         broker.drain_spread_fills.return_value = [
-            ("p1", "credit_spread", False, "filled", 1.0, -1.50, "combo-1"),
+            ("p1", "credit_spread", False, "filled", 1.0, -1.50, "combo-1", -1.45),
         ]
         engine._drain_spread_fills()
         # Position stays; the plan is consumed.
@@ -247,12 +247,28 @@ class TestDrainSpreadFills:
         # Short leg sold to open, long leg bought to open.
         assert {r["side"] for r in rows} == {"sell", "buy"}
 
+    def test_open_filled_logs_slippage_vs_submitted_credit(self, tmp_path):
+        strategy = _strategy()
+        engine, broker = _engine(tmp_path, strategy)
+        self._pre_register(engine, strategy, "p1")
+        broker.drain_spread_fills.return_value = [
+            ("p1", "credit_spread", False, "filled", 1.0, -1.50, "combo-1", -1.45),
+        ]
+        engine._drain_spread_fills()
+
+        short_row = [
+            r for r in engine.trade_logger.read_all()
+            if r["symbol"] == "SPY260618P00568000"
+        ][0]
+        assert short_row["entry_reference_price"] == pytest.approx(1.45)
+        assert short_row["realized_slippage_bps"] == pytest.approx(-344.83)
+
     def test_open_canceled_rolls_back(self, tmp_path):
         strategy = _strategy()
         engine, broker = _engine(tmp_path, strategy)
         self._pre_register(engine, strategy, "p1")
         broker.drain_spread_fills.return_value = [
-            ("p1", "credit_spread", False, "canceled", 0.0, None, "combo-1"),
+            ("p1", "credit_spread", False, "canceled", 0.0, None, "combo-1", -1.45),
         ]
         engine._drain_spread_fills()
         assert "p1" not in engine._positions
@@ -265,7 +281,7 @@ class TestDrainSpreadFills:
         self._pre_register(engine, strategy, "p1")
         engine._spreads_pending_close.add("p1")
         broker.drain_spread_fills.return_value = [
-            ("p1", "credit_spread", True, "filled", 1.0, 0.60, "combo-close-1"),
+            ("p1", "credit_spread", True, "filled", 1.0, 0.60, "combo-close-1", 0.60),
         ]
         engine._drain_spread_fills()
         assert "p1" not in engine._positions
@@ -289,7 +305,7 @@ class TestDrainSpreadFills:
         engine._spreads_pending_close.add("p1")
         # Closed at a $0.60 debit → realized = (1.45 − 0.60) × 1 × 100 = 85.0.
         broker.drain_spread_fills.return_value = [
-            ("p1", "credit_spread", True, "filled", 1.0, 0.60, "combo-close-1"),
+            ("p1", "credit_spread", True, "filled", 1.0, 0.60, "combo-close-1", 0.60),
         ]
         engine._drain_spread_fills()
 
@@ -305,6 +321,24 @@ class TestDrainSpreadFills:
         assert len(close_rows) == 1
         assert close_rows[0]["realized_pnl"] == pytest.approx(85.0)
 
+    def test_close_filled_logs_slippage_vs_submitted_debit(self, tmp_path):
+        strategy = _strategy()
+        engine, broker = _engine(tmp_path, strategy)
+        self._pre_register(engine, strategy, "p1")
+        engine._spreads_pending_close.add("p1")
+        broker.drain_spread_fills.return_value = [
+            ("p1", "credit_spread", True, "filled", 1.0, 0.63, "combo-close-1", 0.60),
+        ]
+        engine._drain_spread_fills()
+
+        close_rows = [
+            r for r in engine.trade_logger.read_all()
+            if r["reason"] == "spread exit" and r["avg_fill_price"] > 0
+        ]
+        assert len(close_rows) == 1
+        assert close_rows[0]["entry_reference_price"] == pytest.approx(0.60)
+        assert close_rows[0]["realized_slippage_bps"] == pytest.approx(500.0)
+
     def test_close_filled_with_no_allocator_still_logs_pnl(self, tmp_path):
         strategy = _strategy()
         engine, broker = _engine(tmp_path, strategy)
@@ -312,7 +346,7 @@ class TestDrainSpreadFills:
         engine._allocator = None  # no allocator wired
         engine._spreads_pending_close.add("p1")
         broker.drain_spread_fills.return_value = [
-            ("p1", "credit_spread", True, "filled", 1.0, 0.60, "combo-close-1"),
+            ("p1", "credit_spread", True, "filled", 1.0, 0.60, "combo-close-1", 0.60),
         ]
         engine._drain_spread_fills()  # must not raise
         close_rows = [
@@ -332,7 +366,7 @@ class TestDrainSpreadFills:
         engine._allocator = MagicMock()
         engine._spreads_pending_close.add("p1")
         broker.drain_spread_fills.return_value = [
-            ("p1", "credit_spread", True, "filled", 1.0, None, "combo-close-1"),
+            ("p1", "credit_spread", True, "filled", 1.0, None, "combo-close-1", 0.60),
         ]
         engine._drain_spread_fills()
 
@@ -355,7 +389,7 @@ class TestDrainSpreadFills:
         self._pre_register(engine, strategy, "p1")
         engine._spreads_pending_close.add("p1")
         broker.drain_spread_fills.return_value = [
-            ("p1", "credit_spread", True, "canceled", 0.0, None, "combo-close-1"),
+            ("p1", "credit_spread", True, "canceled", 0.0, None, "combo-close-1", 0.60),
         ]
         engine._drain_spread_fills()
         # Position stays open; pending-close flag cleared so the exit path retries.
