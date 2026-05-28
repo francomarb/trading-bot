@@ -11,16 +11,14 @@ import pandas as pd
 from loguru import logger
 
 from indicators.technicals import add_rsi
-from strategies.base import BaseStrategy, SignalFrame, OrderType
+from strategies.base import BaseStrategy, OptionTradeRejected, OrderType, SignalFrame
 from utils.options_lookup import ContractPick, find_best_call
 from utils.options_ranker import Quote
 
 _ET = ZoneInfo("America/New_York")
 _OCC_RE = re.compile(r"^([A-Z]+)(\d{6})([CP])(\d{8})$")
 
-
-class OptionTradeRejected(ValueError):
-    """Expected option-entry veto such as wide spreads or missing quotes."""
+__all__ = ["OptionTradeRejected", "SPYOptionsReversionStrategy"]
 
 
 class SPYOptionsReversionStrategy(BaseStrategy):
