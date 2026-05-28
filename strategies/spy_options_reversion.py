@@ -49,10 +49,13 @@ class SPYOptionsReversionStrategy(BaseStrategy):
         self._position_hwm: dict[str, float] = {}   # OCC → highest B-S value observed
         self._position_base: dict[str, float] = {}  # OCC → first B-S value observed
         # Quote lookup: a callable resolving OCC symbols to live quotes.
-        # Production wires this once at startup (the engine builds a shared
-        # OptionHistoricalDataClient and passes it in). Tests inject stubs.
-        # Lazy default — only built on first use so importing the module
-        # doesn't require Alpaca credentials to be present.
+        # An explicit lookup may be injected (tests use this for stubs; a
+        # future cross-strategy wiring could share a single
+        # OptionHistoricalDataClient across options strategies). The default
+        # builds a per-instance lookup lazily on first build_option_execution
+        # call and caches it on `self`, so importing this module never
+        # requires Alpaca credentials and subsequent entries reuse the same
+        # client instead of churning one per signal bar.
         self._quote_lookup = quote_lookup
 
     def required_bars(self) -> int:
