@@ -57,29 +57,17 @@ This addendum supersedes the priority matrix in the original document. Of the or
 
 ### A3 — Anchor SPY-options trailing-stop activation base to the fill price
 
-**Severity:** Medium-High — material at live capital scale.
+**Status:** ✅ Shipped 2026-05-27 in PR [#28](https://github.com/francomarb/trading-bot/pull/28).
 
-**Verification:** [`strategies/spy_options_reversion.py:139-146`](strategies/spy_options_reversion.py:139):
-```python
-if occ not in self._position_base:
-    self._position_base[occ] = opt_val           # first B-S valuation, NOT fill premium
-self._position_hwm[occ] = max(self._position_hwm.get(occ, opt_val), opt_val)
-base = self._position_base[occ]
-hwm = self._position_hwm[occ]
-if hwm >= base * (1.0 + self.trail_activation_pct):
-    trail_floor = hwm * (1.0 - self.trail_pct)
-```
+**Severity (original):** Medium-High — material at live capital scale.
 
-`base` controls **when the trailing stop activates** (the trail floor itself uses `hwm`, not `base`, so the floor is fine). But the activation threshold drifts away from the position's actual cost basis whenever the first B-S valuation differs from what we paid — which it usually does because (a) `_fetch_vix` uses yesterday's VIX close, and (b) the underlying has often moved between fill and first `inspect_open_positions` call.
+**Why it mattered:** `_position_base` controlled *when* the trailing stop activated (the trail floor itself reads off `_position_hwm`, so the floor was fine). But the activation threshold drifted away from actual cost basis whenever the first Black-Scholes valuation differed from the real fill — which it usually did, because (a) `_fetch_vix` uses yesterday's VIX close and (b) the underlying often moved between fill and first `inspect_open_positions`. If the first B-S value was below the real fill cost, the trailing stop activated too easily. If above, too late.
 
-Practical effect: if the first B-S value is below the real fill cost, the trailing stop activates too easily (and may exit a position that is still underwater relative to entry). If it is above, the trailing stop activates too late.
+**What landed:** `SPYOptionsReversionStrategy.register_fill(occ, fill_premium)` sets `_position_base[occ] = fill_premium` and `_position_hwm[occ] = max(existing, fill_premium)` — the `max` preserves any higher HWM that `inspect_open_positions` already observed if it raced ahead of the fill confirmation. The engine's `_drain_option_fills` resolves the strategy from `decision.strategy_name` (via a new `_strategy_by_name` helper) and calls `register_fill` on FILLED / PARTIAL outcomes. The hook is opt-in via `getattr`, so strategies without trailing logic are unaffected, and any exception is caught so a `register_fill` bug cannot break the drain loop. Restored positions on engine restart receive no fill confirmation and continue using the lazy first-B-S seeding path — unchanged behavior on that path.
 
-**Fix:** add `register_fill(occ, fill_premium)` on the strategy and call it from the engine's option-fill confirmation path (`_drain_option_fills` or wherever the buy fill is observed). On the first `inspect_open_positions` call for that OCC, prefer the registered fill premium over the live B-S valuation. Keep current behavior as a fallback for positions restored from the broker on startup (no fill premium known).
-
-**Tests:**
-- `register_fill` sets `_position_base` and `_position_hwm` to the fill premium.
-- A subsequent `inspect_open_positions` call does not overwrite the registered base.
-- Without `register_fill`, behavior matches today (back-compat for restored positions).
+**Tests added:**
+- `TestRegisterFill` (strategy): anchors base + HWM to premium, preserves higher prior HWM in the race case, rejects invalid premiums, end-to-end overrides the lazy first B-S seeding.
+- `test_drain_option_filled_calls_register_fill_on_strategy` (engine): drain confirms a FILLED outcome calls `register_fill(occ, avg_fill_price)` on the strategy resolved from the decision's `strategy_name`.
 
 ---
 
@@ -192,16 +180,18 @@ File against future work; do not fix in Phase 11.
 
 ## Verification ledger (for future re-audits)
 
-| Item | Claim | Verified at | Verdict |
+Entries describe the *pre-fix* state observed during the audit. The Status column reflects what's true *now*; the Claim/Verified-at columns preserve the original finding for future re-audits.
+
+| Item | Claim at audit time | Verified at | Status |
 |---|---|---|---|
-| A1 | BEAR exit override required by design | `docs/credit_spread_strategy.md:112, 407` | ✓ |
-| A1 | BEAR exit override absent in engine | `engine/trader.py:614, 2923-2986` | ✓ |
-| A2 | Two hardcoded `"credit_spread"` literals remain | `engine/trader.py:2537, 3103` | ✓ |
-| A2 | Engine already dispatches via `hasattr` elsewhere | `engine/trader.py:831, 930, 1119, 2521` | ✓ |
-| A3 | `_position_base` set from first B-S, not fill | `strategies/spy_options_reversion.py:139-146` | ✓ |
-| A4 | Call picker selects earliest expiration | `utils/options_lookup.py:185-186` | ✓ |
-| A4 | Put-spread picker uses midpoint | `utils/options_lookup.py:455-459` | ✓ |
-| A5 | `_build_quote_lookup` instantiates client per call | `strategies/spy_options_reversion.py:223, 259-297` | ✓ |
-| A6 | `OptionTradeRejected` imported cross-module | `engine/trader.py:95`, `tests/test_engine.py:55`, `tests/test_spy_options_reversion.py:163` | ✓ |
-| A7 | `FATAL_SPREAD_PCT = 0.10` is the only hard spread cutoff (no 5% gate in strategy) | `utils/options_ranker.py:43`, `strategies/spy_options_reversion.py:213-256` | ✓ (and corrects the original audit) |
-| N1 | Daily VIX caching is documented design | `docs/architecture.md:656`, `docs/spy_options_reversion_strategy.md:47, 214-216` | ✓ |
+| A1 | BEAR exit override required by design | `docs/credit_spread_strategy.md:112, 407` | Design unchanged — exit override now wired (PR [#26](https://github.com/francomarb/trading-bot/pull/26)) |
+| A1 | BEAR exit override absent in engine | `engine/trader.py:614, 2923-2986` (pre-PR-26) | ✅ Addressed by PR [#26](https://github.com/francomarb/trading-bot/pull/26) |
+| A2 | Two hardcoded `"credit_spread"` literals remained | `engine/trader.py:2537, 3103` (pre-PR-27) | ✅ Addressed by PR [#27](https://github.com/francomarb/trading-bot/pull/27) |
+| A2 | Engine already dispatched via `hasattr` elsewhere | `engine/trader.py:831, 930, 1119, 2521` | Still true — extended to the renamed helpers in PR [#27](https://github.com/francomarb/trading-bot/pull/27) |
+| A3 | `_position_base` was set from first B-S, not fill | `strategies/spy_options_reversion.py:139-146` (pre-PR-28) | ✅ Addressed by PR [#28](https://github.com/francomarb/trading-bot/pull/28) |
+| A4 | Call picker selected earliest expiration | `utils/options_lookup.py:185-186` (pre-PR-29) | ✅ Addressed by PR [#29](https://github.com/francomarb/trading-bot/pull/29) |
+| A4 | Put-spread picker uses midpoint | `utils/options_lookup.py:455-459` | Reference design — call picker now mirrors it (PR [#29](https://github.com/francomarb/trading-bot/pull/29)) |
+| A5 | `_build_quote_lookup` instantiated client per call | `strategies/spy_options_reversion.py:223, 259-297` (pre-PR-29) | ✅ Addressed by PR [#29](https://github.com/francomarb/trading-bot/pull/29) |
+| A6 | `OptionTradeRejected` imported cross-module from a strategy module | `engine/trader.py:95`, `tests/test_engine.py:55`, `tests/test_spy_options_reversion.py:163` (pre-PR-27) | ✅ Addressed by PR [#27](https://github.com/francomarb/trading-bot/pull/27) — canonical location now `strategies/base.py`, re-exported for back-compat |
+| A7 | `FATAL_SPREAD_PCT = 0.10` is the only hard spread cutoff (no 5% gate in strategy) | `utils/options_ranker.py:43`, `strategies/spy_options_reversion.py:213-256` | ⏸ Deferred — paper-data review per `project_options_picker_spread_watch` memory |
+| N1 | Daily VIX caching is documented design | `docs/architecture.md:656`, `docs/spy_options_reversion_strategy.md:47, 214-216` | ✓ — future-work note only, no fix planned |
