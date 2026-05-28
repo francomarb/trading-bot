@@ -85,32 +85,31 @@ Practical effect: if the first B-S value is below the real fill cost, the traili
 
 ### A4 — `find_best_call` should pick the expiration closest to the DTE-window midpoint
 
-**Severity:** Medium — improves DTE consistency and matches the put-spread picker.
+**Status:** ✅ Shipped 2026-05-27 in PR [#29](https://github.com/francomarb/trading-bot/pull/29).
 
-**Verification:**
-- Call picker (broken): [`utils/options_lookup.py:185-186`](utils/options_lookup.py:185) — `expirations = sorted(...); best_expiry = expirations[0]` always selects the nearest expiration.
-- Put-spread picker (already correct): [`utils/options_lookup.py:455-459`](utils/options_lookup.py:455):
-  ```python
-  target_dte = (min_dte + max_dte) / 2.0
-  chosen_expiry = min(by_expiry.keys(), key=lambda exp: abs((exp - now).days - target_dte))
-  ```
-- For SPY (multiple weekly expirations in the configured 14–28 DTE window), the picker takes the 14-DTE expiration even when a 21-DTE expiration is tighter and gives better theta-per-dollar.
+**Severity (original):** Medium — improved DTE consistency and matched the put-spread picker.
 
-**Fix:** copy the put-spread picker's midpoint selection into `find_best_call`. Three-line change.
+**Why it mattered:** the old `expirations = sorted(...); best_expiry = expirations[0]` always picked the nearest expiration. For SPY, with multiple weekly expirations inside the configured 14–28 DTE window, this systematically biased the picker toward the shortest available DTE — even when a slightly longer-DTE contract had a tighter spread and better theta-per-dollar.
 
-**Tests:** given two candidate expirations bracketing the midpoint, the picker returns the one with smaller `|dte − midpoint|`.
+**What landed:** `find_best_call` now selects the expiration whose DTE is closest to `(min_dte + max_dte) / 2.0`, mirroring the put-spread picker. For SPY with the configured 14–28 DTE window, this targets ~21 DTE by default — same DTE the credit-spread picker has been using, removing the asymmetry between the two single-leg and multi-leg pickers.
+
+**Test added:** `test_picks_expiration_closest_to_dte_midpoint` — given two candidate expirations bracketing the midpoint, the picker returns the one with smaller `|dte − midpoint|`.
 
 ---
 
 ### A5 — Inject `quote_lookup` into `SPYOptionsReversionStrategy`
 
-**Severity:** Medium — symmetry with `CreditSpread`, better testability, removes per-bar client churn.
+**Status:** ✅ Shipped 2026-05-27 in PR [#29](https://github.com/francomarb/trading-bot/pull/29).
 
-**Verification:** [`strategies/spy_options_reversion.py:223`](strategies/spy_options_reversion.py:223) — `quote_lookup = _build_quote_lookup()` is called inside `build_option_execution`, and `_build_quote_lookup` itself ([`:259-297`](strategies/spy_options_reversion.py:259)) instantiates a fresh `OptionHistoricalDataClient` every call. At 5-min cycles this is wasteful but not broken; the real value is symmetry: `CreditSpread` accepts an injected `quote_lookup` and tests rely on injecting a stub.
+**Severity (original):** Medium — symmetry with `CreditSpread`, better testability, removed per-bar client churn.
 
-**Fix:** accept an optional `quote_lookup` in `__init__`, defaulting to `_build_quote_lookup()` produced once. Mirror the `CreditSpread` constructor signature. Wire the engine to construct a single shared lookup at startup and inject it into both options strategies.
+**Why it mattered:** `_build_quote_lookup()` was called inside `build_option_execution` on every entry attempt, and the builder itself instantiated a fresh `OptionHistoricalDataClient` each time. At 5-minute cycles this was wasteful rather than broken; the bigger issue was asymmetry with `CreditSpread`, which accepts an injected `quote_lookup` and lets tests inject stubs directly via the constructor.
 
-**Tests:** existing unit tests get a stub `quote_lookup` directly via constructor instead of monkey-patching; production path unchanged.
+**What landed:** `SPYOptionsReversionStrategy.__init__` now accepts an optional `quote_lookup`. When provided (production wiring or test stub), it's used directly. When omitted, a production default is built lazily on first use and cached on the instance — so subsequent entries reuse the same `OptionHistoricalDataClient` instead of building a fresh one per signal bar. Importing the strategy module no longer requires Alpaca credentials to be present, because the builder is invoked lazily on first call rather than at construction time. The cross-strategy shared `IVProxyResolver` wiring noted in audit item #14 becomes a natural next step once a second options strategy is added.
+
+**Tests added:**
+- `test_uses_injected_quote_lookup` — explicit injection bypasses the production builder entirely.
+- `test_lazy_default_quote_lookup_built_once_and_cached` — without injection, the builder is called exactly once on first use; subsequent entries reuse the cached lookup.
 
 ---
 
