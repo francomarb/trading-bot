@@ -614,6 +614,147 @@ class TestProcessCreditSpreadExits:
         assert "p1" in engine._spreads_pending_close
 
 
+# ── BEAR cycle-level sweep ──────────────────────────────────────────────────
+
+
+class TestSweepBearSpreadExits:
+    """The cycle-level BEAR sweep runs before _process_symbol, so the
+    defensive override is not gated by per-symbol bar fetches, freshness
+    checks, or empty decision frames."""
+
+    def _wire_open_spread(self, engine, strategy, position_id="p1"):
+        from engine.positions import make_spread, PositionLeg
+        engine._positions[position_id] = make_spread(
+            strategy_name="credit_spread", position_id=position_id,
+            legs=[PositionLeg("SPY260618P00568000", -1, side="SELL"),
+                  PositionLeg("SPY260618P00558000", 1, side="BUY")],
+        )
+        engine._spread_owner_strategy[position_id] = strategy
+        strategy.register_spread(_open_spread(position_id, net_credit=2.00))
+
+    def test_sweep_dispatches_close_for_open_spread(self, tmp_path):
+        # Quote lookup raises — the sweep must still close because BEAR
+        # override skips evaluate_spread_exit entirely.
+        def raising_lookup(occs):
+            raise RuntimeError("OPRA outage")
+        strategy = _strategy(quote_lookup=raising_lookup)
+        engine, broker = _engine(tmp_path, strategy)
+        self._wire_open_spread(engine, strategy, "p1")
+        broker.dispatch_spread_order.return_value = OrderResult(
+            status=OrderStatus.ACCEPTED, order_id="bear-sweep-1", symbol="SPY",
+            requested_qty=1, filled_qty=0.0, avg_fill_price=0.0,
+            raw_status="accepted", message="",
+        )
+
+        engine._sweep_bear_spread_exits()
+
+        broker.dispatch_spread_order.assert_called_once()
+        kw = broker.dispatch_spread_order.call_args.kwargs
+        assert kw["closing"] is True
+        assert kw["position_id"] == "p1"
+        # Width fallback — quote outage cannot suppress the defensive close.
+        assert kw["limit_price"] == 10.0
+        assert "p1" in engine._spreads_pending_close
+
+    def test_sweep_skips_strategies_without_open_spreads(self, tmp_path):
+        strategy = _strategy()  # no open spreads registered
+        engine, broker = _engine(tmp_path, strategy)
+        engine._sweep_bear_spread_exits()
+        broker.dispatch_spread_order.assert_not_called()
+
+    def test_sweep_skips_single_leg_strategies(self, tmp_path):
+        # An engine slot whose strategy has no evaluate_spread_exit hook
+        # must be ignored by the sweep.
+        strategy = _strategy()
+        engine, broker = _engine(tmp_path, strategy)
+        from strategies.base import BaseStrategy, StrategySlot
+        single_leg = MagicMock(spec=BaseStrategy)
+        single_leg.name = "sma_crossover"
+        del single_leg.evaluate_spread_exit  # force hasattr() to False
+        engine.slots = [
+            StrategySlot(strategy=single_leg, symbols=["AAPL"]),
+        ]
+        engine._sweep_bear_spread_exits()
+        broker.dispatch_spread_order.assert_not_called()
+
+    def test_sweep_respects_pending_close_set(self, tmp_path):
+        # A position whose close is already in flight must not be
+        # re-dispatched by the sweep.
+        strategy = _strategy()
+        engine, broker = _engine(tmp_path, strategy)
+        self._wire_open_spread(engine, strategy, "p1")
+        engine._spreads_pending_close.add("p1")
+        engine._sweep_bear_spread_exits()
+        broker.dispatch_spread_order.assert_not_called()
+
+    def test_sweep_continues_when_one_strategy_raises(self, tmp_path):
+        # If one strategy's sweep raises, the next strategy's spreads must
+        # still get the defensive close.
+        strategy_a = _strategy()
+        engine, broker = _engine(tmp_path, strategy_a)
+        # Strategy A: has an open spread; its open_spreads attribute is
+        # patched to raise when accessed by _process_credit_spread_exits.
+        self._wire_open_spread(engine, strategy_a, "pA")
+        # Strategy B: a second spread strategy with an open spread.
+        strategy_b = _strategy(quote_lookup=lambda occs: {o: None for o in occs})
+        from strategies.base import StrategySlot
+        engine.slots = engine.slots + [
+            StrategySlot(strategy=strategy_b, symbols=["SPY"]),
+        ]
+        from engine.positions import make_spread, PositionLeg
+        engine._positions["pB"] = make_spread(
+            strategy_name="credit_spread", position_id="pB",
+            legs=[PositionLeg("SPY260618P00568000", -1, side="SELL"),
+                  PositionLeg("SPY260618P00558000", 1, side="BUY")],
+        )
+        engine._spread_owner_strategy["pB"] = strategy_b
+        strategy_b.register_spread(_open_spread("pB", net_credit=2.00))
+
+        # Make strategy A's _process_credit_spread_exits raise; sweep must
+        # still close strategy B's position.
+        original = engine._process_credit_spread_exits
+        def selective_raiser(*, strategy, **kw):
+            if strategy is strategy_a:
+                raise RuntimeError("simulated failure")
+            return original(strategy=strategy, **kw)
+        engine._process_credit_spread_exits = selective_raiser
+
+        broker.dispatch_spread_order.return_value = OrderResult(
+            status=OrderStatus.ACCEPTED, order_id="bear-sweep-b", symbol="SPY",
+            requested_qty=1, filled_qty=0.0, avg_fill_price=0.0,
+            raw_status="accepted", message="",
+        )
+        engine._sweep_bear_spread_exits()
+
+        # B's close was dispatched even though A raised.
+        broker.dispatch_spread_order.assert_called_once()
+        assert broker.dispatch_spread_order.call_args.kwargs["position_id"] == "pB"
+
+    def test_per_symbol_call_is_idempotent_after_sweep(self, tmp_path):
+        # After the cycle-level sweep dispatches the close, the per-symbol
+        # _process_credit_spread_exits call in the slot loop must not
+        # re-dispatch (gated by _spreads_pending_close).
+        strategy = _strategy(quote_lookup=lambda occs: {o: None for o in occs})
+        engine, broker = _engine(tmp_path, strategy)
+        self._wire_open_spread(engine, strategy, "p1")
+        broker.dispatch_spread_order.return_value = OrderResult(
+            status=OrderStatus.ACCEPTED, order_id="bear-sweep-idem", symbol="SPY",
+            requested_qty=1, filled_qty=0.0, avg_fill_price=0.0,
+            raw_status="accepted", message="",
+        )
+
+        engine._sweep_bear_spread_exits()
+        # Second invocation — simulating the per-symbol call in the slot
+        # loop right after the sweep.
+        engine._process_credit_spread_exits(
+            strategy=strategy, underlying="SPY", underlying_close=745.0,
+            current_regime=MarketRegime.BEAR,
+        )
+
+        # Only one dispatch total.
+        broker.dispatch_spread_order.assert_called_once()
+
+
 # ── Global counter ──────────────────────────────────────────────────────────
 
 

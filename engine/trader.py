@@ -649,6 +649,15 @@ class TradingEngine:
                         )
                         current_regime = MarketRegime.RANGING
 
+            # BEAR defensive sweep — runs at cycle level so the override is
+            # never gated by per-symbol bar fetch failures, stale-data
+            # rejections, or empty decision frames. The slot loop below
+            # may still try the BEAR override per-symbol, but those calls
+            # become no-ops via _spreads_pending_close after the sweep
+            # already dispatched the close.
+            if current_regime is MarketRegime.BEAR:
+                self._sweep_bear_spread_exits()
+
             # Order attribution — computed once per cycle for sleeve accounting.
             # Maps order_id → strategy_name for pending buy entries using
             # watchlist membership. Used by SleeveAllocator to count open
@@ -2922,6 +2931,41 @@ class TradingEngine:
                 logger.warning(
                     f"[{strategy_name}] credit spread close {status} — "
                     f"position_id={position_id[:8]} still open, will retry"
+                )
+
+    def _sweep_bear_spread_exits(self) -> None:
+        """Cycle-level defensive close of every open spread when the regime
+        is BEAR.
+
+        Runs once per cycle, before ``_process_symbol``, so the override is
+        not gated by per-symbol data paths (bar fetch failure, stale-data
+        rejection, empty decision frame). The BEAR short-circuit in
+        ``_process_credit_spread_exits`` already skips the quote lookup and
+        ``evaluate_spread_exit`` — ``underlying_close`` is therefore unused
+        on this path and a sentinel ``0.0`` is passed.
+
+        Idempotent: positions already in ``_spreads_pending_close`` (from a
+        prior cycle or another caller in the same cycle) are skipped, so any
+        subsequent per-symbol invocation in the slot loop is a no-op.
+        """
+        for slot in self.slots:
+            strategy = slot.strategy
+            if not hasattr(strategy, "evaluate_spread_exit"):
+                continue
+            open_spreads = getattr(strategy, "open_spreads", None)
+            if not open_spreads:
+                continue
+            underlying = getattr(getattr(strategy, "config", None), "symbol", "?")
+            try:
+                self._process_credit_spread_exits(
+                    strategy=strategy,
+                    underlying=underlying,
+                    underlying_close=0.0,
+                    current_regime=MarketRegime.BEAR,
+                )
+            except Exception as e:
+                logger.error(
+                    f"[{strategy.name}] BEAR sweep failed for {underlying}: {e}"
                 )
 
     def _process_credit_spread_exits(
