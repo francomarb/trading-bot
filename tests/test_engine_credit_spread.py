@@ -18,6 +18,7 @@ import pytest
 
 from engine.trader import EngineConfig, TradingEngine
 from execution.broker import BrokerSnapshot, OrderResult, OrderStatus
+from regime.detector import MarketRegime
 from reporting.logger import TradeLogger
 from risk.manager import AccountState, RiskManager
 from strategies.credit_spread import CreditSpread, CreditSpreadConfig, OpenSpread
@@ -464,6 +465,86 @@ class TestProcessCreditSpreadExits:
             strategy=strategy, underlying="SPY", underlying_close=745.0,
         )
         broker.dispatch_spread_order.assert_not_called()  # not double-submitted
+
+    def test_bear_regime_triggers_defensive_close(self, tmp_path):
+        # Quotes that would NOT fire any normal trigger — only the BEAR
+        # override should cause an exit.
+        quote_lookup = lambda occs: {
+            "SPY260618P00568000": Quote(2.45, 2.55),
+            "SPY260618P00558000": Quote(0.65, 0.75),
+        }
+        strategy = _strategy(quote_lookup=quote_lookup)
+        engine, broker = _engine(tmp_path, strategy)
+        self._wire_open_spread(engine, strategy, "p1")
+        broker.dispatch_spread_order.return_value = OrderResult(
+            status=OrderStatus.ACCEPTED, order_id="spread-bear-close", symbol="SPY",
+            requested_qty=1, filled_qty=0.0, avg_fill_price=0.0,
+            raw_status="accepted", message="",
+        )
+        engine._process_credit_spread_exits(
+            strategy=strategy, underlying="SPY", underlying_close=745.0,
+            current_regime=MarketRegime.BEAR,
+        )
+        broker.dispatch_spread_order.assert_called_once()
+        kw = broker.dispatch_spread_order.call_args.kwargs
+        assert kw["closing"] is True
+        assert kw["position_id"] == "p1"
+        # No quote → falls back to spread width as a marketable debit.
+        assert kw["limit_price"] == 10.0
+        assert "p1" in engine._spreads_pending_close
+
+    def test_bear_regime_skips_already_pending_close(self, tmp_path):
+        # BEAR override must still respect _spreads_pending_close so the
+        # defensive exit cannot double-submit alongside an in-flight close.
+        strategy = _strategy(quote_lookup=lambda occs: {o: None for o in occs})
+        engine, broker = _engine(tmp_path, strategy)
+        self._wire_open_spread(engine, strategy, "p1")
+        engine._spreads_pending_close.add("p1")
+        engine._process_credit_spread_exits(
+            strategy=strategy, underlying="SPY", underlying_close=745.0,
+            current_regime=MarketRegime.BEAR,
+        )
+        broker.dispatch_spread_order.assert_not_called()
+
+    def test_bear_regime_exit_survives_quote_outage(self, tmp_path):
+        # quote_lookup raises — the normal exit path would swallow this and
+        # hold the position. BEAR override must still close.
+        def raising_lookup(occs):
+            raise RuntimeError("OPRA outage")
+        strategy = _strategy(quote_lookup=raising_lookup)
+        engine, broker = _engine(tmp_path, strategy)
+        self._wire_open_spread(engine, strategy, "p1")
+        broker.dispatch_spread_order.return_value = OrderResult(
+            status=OrderStatus.ACCEPTED, order_id="spread-bear-outage", symbol="SPY",
+            requested_qty=1, filled_qty=0.0, avg_fill_price=0.0,
+            raw_status="accepted", message="",
+        )
+        engine._process_credit_spread_exits(
+            strategy=strategy, underlying="SPY", underlying_close=745.0,
+            current_regime=MarketRegime.BEAR,
+        )
+        broker.dispatch_spread_order.assert_called_once()
+        assert "p1" in engine._spreads_pending_close
+
+    def test_non_bear_regime_falls_through_to_normal_exit_logic(self, tmp_path):
+        # Spread mid 1.80 — no normal trigger fires. Confirms the regime
+        # parameter is inert for non-BEAR values.
+        quote_lookup = lambda occs: {
+            "SPY260618P00568000": Quote(2.45, 2.55),
+            "SPY260618P00558000": Quote(0.65, 0.75),
+        }
+        strategy = _strategy(quote_lookup=quote_lookup)
+        engine, broker = _engine(tmp_path, strategy)
+        self._wire_open_spread(engine, strategy, "p1")
+        for regime in (MarketRegime.TRENDING, MarketRegime.RANGING,
+                       MarketRegime.VOLATILE, None):
+            broker.dispatch_spread_order.reset_mock()
+            engine._spreads_pending_close.clear()
+            engine._process_credit_spread_exits(
+                strategy=strategy, underlying="SPY", underlying_close=745.0,
+                current_regime=regime,
+            )
+            broker.dispatch_spread_order.assert_not_called()
 
     def test_same_daily_bar_still_retries_exit_after_canceled_close(
         self,
