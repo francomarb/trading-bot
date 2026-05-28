@@ -2159,6 +2159,43 @@ class TestOptionsEngineFixes:
         engine._repair_missing_protective_stops(snap)
         engine.broker.place_protective_stop.assert_not_called()
 
+    def test_state_snapshot_maps_occ_position_detail_to_owner_key(self, tmp_path):
+        """Options owned by an underlying key should still populate positions_detail."""
+        import json
+
+        from config import settings
+
+        engine = self._engine(tmp_path)
+        occ = "SPY260618C00746000"
+        engine._register_single_leg(strategy_name="spy_options_reversion", symbol="SPY")
+        pos = SimpleNamespace(
+            qty=3.0,
+            symbol=occ,
+            avg_entry_price=12.77,
+            market_value=4335.0,
+            unrealized_pl=504.0,
+            current_price=14.45,
+            cost_basis=3831.0,
+            asset_id="opt-1",
+            side="long",
+        )
+        engine._running = True
+        engine._session_start_equity = 100_000.0
+        engine._last_cycle_equity = 100_250.0
+        engine._last_snapshot = _snapshot(positions={occ: pos})
+
+        engine._write_state_snapshot()
+
+        with open(settings.STATE_SNAPSHOT_PATH) as fh:
+            state = json.load(fh)
+
+        assert state["open_positions"]["SPY"] == "spy_options_reversion"
+        assert state["positions_detail"]["SPY"]["qty"] == 3.0
+        assert state["positions_detail"]["SPY"]["avg_entry_price"] == 12.77
+        assert state["positions_detail"]["SPY"]["market_value"] == 4335.0
+        assert state["positions_detail"]["SPY"]["cost_basis"] == 3831.0
+        assert state["positions_detail"]["SPY"]["unrealized_pnl"] == 504.0
+
     def test_stop_repair_reconstructs_missing_entry_context_for_managed_equity(self, tmp_path, monkeypatch):
         """If DB context is missing but broker position + owner exist, self-heal should reconstruct and repair."""
         engine = self._engine(tmp_path)

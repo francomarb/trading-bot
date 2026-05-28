@@ -31,7 +31,7 @@ import plotly.graph_objects as go
 import streamlit as st
 
 from config import settings
-from engine.positions import build_credit_spread_snapshot
+from engine.positions import build_credit_spread_snapshot, owner_key_for
 
 
 # ── Data loading helpers (pure functions — tested independently) ─────────────
@@ -67,6 +67,40 @@ def broker_position_detail(position: Any) -> dict[str, Any]:
         "unrealized_pnl": unrealized_pl,
         "unrealized_plpc": _as_float(getattr(position, "unrealized_plpc", None)),
     }
+
+
+def merge_display_positions_detail(
+    state: dict[str, Any],
+    broker_positions_detail: dict[str, Any] | None,
+) -> dict[str, dict[str, Any]]:
+    """
+    Merge broker position detail onto snapshot-owned position keys.
+
+    The engine tracks single-leg options by their owner key (e.g. ``SPY``),
+    while Alpaca reports the raw OCC contract symbol. This helper normalizes
+    broker positions through ``owner_key_for`` so option positions still render
+    correctly in the Open Positions table.
+    """
+    if not broker_positions_detail:
+        return dict(state.get("positions_detail") or {})
+
+    positions_detail: dict[str, dict[str, Any]] = {}
+    snapshot_positions = state.get("positions_detail") or {}
+    for sym, detail in broker_positions_detail.items():
+        owner_key = owner_key_for(sym)
+        enriched = dict(detail)
+        snapshot_detail = (
+            snapshot_positions.get(owner_key)
+            or snapshot_positions.get(sym, {})
+        )
+        if "strategy" not in enriched and snapshot_detail.get("strategy") is not None:
+            enriched["strategy"] = snapshot_detail["strategy"]
+        positions_detail[owner_key] = enriched
+
+    for sym, detail in snapshot_positions.items():
+        positions_detail.setdefault(sym, dict(detail))
+
+    return positions_detail
 
 
 def load_trades(db_path: str) -> pd.DataFrame:
@@ -1119,14 +1153,10 @@ def render_dashboard() -> None:
         else None
     )
     if broker_positions_detail:
-        positions_detail = {}
-        for sym, detail in broker_positions_detail.items():
-            enriched = dict(detail)
-            snapshot_detail = (state.get("positions_detail") or {}).get(sym, {})
-            if "strategy" not in enriched and snapshot_detail.get("strategy") is not None:
-                enriched["strategy"] = snapshot_detail["strategy"]
-            positions_detail[sym] = enriched
-        display_state["positions_detail"] = positions_detail
+        display_state["positions_detail"] = merge_display_positions_detail(
+            state,
+            broker_positions_detail,
+        )
     display_state["multi_leg_positions"] = refresh_multi_leg_positions(
         state,
         broker_positions_detail=broker_positions_detail,
@@ -1372,7 +1402,9 @@ def render_dashboard() -> None:
                 entry = detail.get("avg_entry_price")
                 upnl = detail.get("unrealized_pnl")
                 qty = detail.get("qty")
-                cost_basis = (qty * entry) if (qty is not None and entry is not None) else None
+                cost_basis = detail.get("cost_basis")
+                if cost_basis is None and qty is not None and entry is not None:
+                    cost_basis = qty * entry
                 unrealized_pct = (
                     (upnl / cost_basis) if (upnl is not None and cost_basis not in (None, 0))
                     else None

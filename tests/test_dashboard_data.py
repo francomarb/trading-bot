@@ -22,6 +22,7 @@ from dashboard import (
     format_delta_currency,
     load_engine_state,
     load_trades,
+    merge_display_positions_detail,
     multi_leg_display_rows,
     realized_trade_events,
     refresh_multi_leg_positions,
@@ -119,6 +120,29 @@ class TestLoadEngineState:
     def test_missing_file_returns_empty_dict(self, tmp_path):
         result = load_engine_state(str(tmp_path / "nonexistent.json"))
         assert result == {}
+
+
+class TestMergeDisplayPositionsDetail:
+    def test_maps_occ_broker_symbol_back_to_owner_key(self):
+        state = {
+            "positions_detail": {
+                "SPY": {"strategy": "spy_options_reversion"}
+            }
+        }
+        broker_positions_detail = {
+            "SPY260618C00746000": {
+                "qty": 3.0,
+                "avg_entry_price": 12.77,
+                "market_value": 4335.0,
+                "cost_basis": 3831.0,
+                "unrealized_pnl": 504.0,
+            }
+        }
+        merged = merge_display_positions_detail(state, broker_positions_detail)
+        assert list(merged) == ["SPY"]
+        assert merged["SPY"]["strategy"] == "spy_options_reversion"
+        assert merged["SPY"]["qty"] == 3.0
+        assert merged["SPY"]["cost_basis"] == 3831.0
 
     def test_malformed_json_returns_empty_dict(self, tmp_path):
         f = tmp_path / "state.json"

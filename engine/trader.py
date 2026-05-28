@@ -3548,17 +3548,30 @@ class TradingEngine:
                 self._last_snapshot.account.open_positions
                 if self._last_snapshot else {}
             )
+            broker_positions_by_owner = {
+                owner_key_for(sym): pos for sym, pos in broker_positions.items()
+            }
             for sym, strat in self._owners_view().items():
-                pos = broker_positions.get(sym)
+                pos = broker_positions.get(sym) or broker_positions_by_owner.get(sym)
+                unrealized_pnl = None
+                cost_basis = None
+                current_price = None
+                if pos:
+                    unrealized_pnl = getattr(pos, "unrealized_pl", None)
+                    if unrealized_pnl is None:
+                        unrealized_pnl = getattr(pos, "unrealized_pnl", None)
+                    cost_basis = getattr(pos, "cost_basis", None)
+                    current_price = getattr(pos, "current_price", None)
+                    if unrealized_pnl is None:
+                        unrealized_pnl = pos.market_value - pos.qty * pos.avg_entry_price
                 positions_detail[sym] = {
                     "strategy": strat,
                     "qty": pos.qty if pos else None,
                     "avg_entry_price": pos.avg_entry_price if pos else None,
+                    "current_price": current_price,
                     "market_value": pos.market_value if pos else None,
-                    "unrealized_pnl": (
-                        pos.market_value - pos.qty * pos.avg_entry_price
-                        if pos else None
-                    ),
+                    "cost_basis": cost_basis,
+                    "unrealized_pnl": unrealized_pnl,
                 }
 
             allocator_snapshot: dict[str, dict] = {"strategies": {}, "pools": {}}

@@ -307,6 +307,23 @@ class TestSleeveCheck:
         assert snapshot["pools"]["equity"]["pending_entry_notional"] == pytest.approx(2_000.0)
         assert snapshot["pools"]["isolated_options"]["used"] == pytest.approx(2_000.0)
 
+    def test_snapshot_attributes_occ_option_position_to_underlying_owner(self):
+        positions = {
+            "SPY260618C00746000": _position("SPY260618C00746000", 3, 1_277.0),
+        }
+        owners = {
+            "SPY": "spy_options_reversion",
+        }
+        snapshot = _allocator().snapshot(
+            _account(positions=positions),
+            [],
+            owners,
+            {},
+        )
+        assert snapshot["strategies"]["spy_options_reversion"]["positions_open"] == 1
+        assert snapshot["strategies"]["spy_options_reversion"]["used"] == pytest.approx(3_831.0)
+        assert snapshot["pools"]["isolated_options"]["used"] == pytest.approx(3_831.0)
+
     def test_snapshot_includes_additional_used_notional(self):
         snapshot = _allocator().snapshot(
             _account(),
