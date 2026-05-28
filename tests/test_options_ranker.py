@@ -16,12 +16,14 @@ from datetime import timedelta
 
 from utils.options_ranker import (
     Candidate,
+    CallRankerConfig,
     Quote,
     FATAL_SPREAD_PCT,
     PREMIUM_OUTLIER_MULTIPLIER,
     SOFT_SPREAD_PCT,
     STRIKE_TOLERANCE_PCT,
     SpreadCandidate,
+    SpreadRankerConfig,
     WEIGHT_DTE,
     WEIGHT_NET_CREDIT,
     WEIGHT_PREMIUM_EFF,
@@ -151,6 +153,18 @@ class TestHardFilters:
         assert result.best.occ_symbol == "OK"
         rejected_syms = [c.occ_symbol for c, _ in result.rejected]
         assert "WIDE" in rejected_syms
+
+    def test_fatal_spread_threshold_is_configurable(self):
+        cands = [_c("WIDE", 100.0)]
+        quotes = {"WIDE": Quote(bid=1.80, ask=2.40)}  # ~28% spread
+        result = rank_call_candidates(
+            cands, quotes,
+            target_strike=100.0,
+            max_premium_per_contract=10_000.0,
+            config=CallRankerConfig(fatal_spread_pct=0.50),
+        )
+        assert result.best is not None
+        assert result.best.occ_symbol == "WIDE"
 
     def test_invalid_quote_dropped(self):
         cands = [_c("OK", 100.0), _c("BAD", 100.5)]
@@ -403,6 +417,19 @@ class TestSpreadHardFilters:
             [s], self._good_quotes("X"),
             target_short_delta=0.17, target_dte=37,
             max_loss_per_position=5_000.0,
+        )
+        assert result.best is not None
+
+    def test_short_delta_window_is_configurable(self):
+        s = _spread(
+            "X", short_strike=500.0, long_strike=490.0,
+            short_delta=0.30,
+        )
+        result = rank_put_spread_candidates(
+            [s], self._good_quotes("X"),
+            target_short_delta=0.17, target_dte=37,
+            max_loss_per_position=5_000.0,
+            config=SpreadRankerConfig(short_delta_window=0.15),
         )
         assert result.best is not None
 

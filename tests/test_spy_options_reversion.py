@@ -7,6 +7,7 @@ entry signals; its exit series is always False.
 """
 
 import re
+import sys
 from datetime import date, datetime, timedelta, timezone
 from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
@@ -17,9 +18,20 @@ import pytest
 
 from strategies.base import EdgeFilterDecision
 from strategies.filters.spy_options_reversion import SPYOptionsEdgeFilter
-from strategies.spy_options_reversion import SPYOptionsReversionStrategy
+from strategies.spy_options_reversion import SPYOptionsConfig, SPYOptionsReversionStrategy
 
 _ET = ZoneInfo("America/New_York")
+
+
+@pytest.fixture(autouse=True)
+def _restore_blackscholes_module():
+    """Tests install fake blackscholes modules; restore the real module afterward."""
+    original = sys.modules.get("blackscholes")
+    yield
+    if original is None:
+        sys.modules.pop("blackscholes", None)
+    else:
+        sys.modules["blackscholes"] = original
 
 
 # ── helpers ──────────────────────────────────────────────────────────────────
@@ -154,10 +166,53 @@ class TestBuildOptionExecution:
         kwargs = mock_picker.call_args.kwargs
         assert kwargs["max_premium_per_contract"] == 2_000.0
         assert callable(kwargs["quote_lookup"])
+        assert kwargs["min_dte"] == 14
+        assert kwargs["max_dte"] == 28
+        assert kwargs["target_delta"] == 0.55
+        assert kwargs["target_strike_pct"] == 0.995
         assert opt_sym == occ_symbol
         assert premium == 4.90
         assert take_profit == 14.70
         assert stop_loss == 3.68
+
+    def test_uses_configured_entry_picker_and_exit_multipliers(self):
+        from utils.options_lookup import ContractPick
+
+        config = SPYOptionsConfig(
+            min_dte=10,
+            max_dte=20,
+            target_delta=0.45,
+            target_strike_pct=1.01,
+            take_profit_multiple=2.5,
+            stop_loss_multiple=0.70,
+        )
+        injected_lookup = MagicMock(name="quote_lookup")
+        strat = SPYOptionsReversionStrategy(config=config, quote_lookup=injected_lookup)
+        pick = ContractPick(
+            occ_symbol="SPY260521C00730000",
+            premium=4.00,
+            spread_pct=0.04,
+            score=0.85,
+            components={},
+            runners_up=[],
+        )
+
+        with patch(
+            "strategies.spy_options_reversion.find_best_call",
+            return_value=pick,
+        ) as mock_picker:
+            _sym, _premium, take_profit, stop_loss = strat.build_option_execution(
+                "SPY", 733.71, notional_cap=2_000.0,
+            )
+
+        kwargs = mock_picker.call_args.kwargs
+        assert kwargs["min_dte"] == 10
+        assert kwargs["max_dte"] == 20
+        assert kwargs["target_delta"] == 0.45
+        assert kwargs["target_strike_pct"] == 1.01
+        assert kwargs["quote_lookup"] is injected_lookup
+        assert take_profit == 10.00
+        assert stop_loss == 2.80
 
     def test_rejects_when_no_pick_available(self):
         from strategies.spy_options_reversion import OptionTradeRejected
@@ -206,7 +261,7 @@ class TestBuildOptionExecution:
             "strategies.spy_options_reversion.find_best_call",
             return_value=pick,
         ) as mock_picker, patch(
-            "strategies.spy_options_reversion._build_quote_lookup"
+            "strategies.spy_options_reversion.build_opra_quote_lookup"
         ) as mock_builder:
             strat.build_option_execution("SPY", 733.71, notional_cap=2_000.0)
 
@@ -238,7 +293,7 @@ class TestBuildOptionExecution:
             "strategies.spy_options_reversion.find_best_call",
             return_value=pick,
         ), patch(
-            "strategies.spy_options_reversion._build_quote_lookup",
+            "strategies.spy_options_reversion.build_opra_quote_lookup",
             return_value=sentinel_lookup,
         ) as mock_builder:
             strat.build_option_execution("SPY", 733.71, notional_cap=2_000.0)

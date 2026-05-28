@@ -82,6 +82,35 @@ class TestFindBestCall:
         assert isinstance(pick, ContractPick)
         assert pick.occ_symbol in {"SPY260522C00730000", "SPY260522C00735000"}
 
+    def test_chain_query_uses_configured_target_strike_pct(self):
+        expiry = date.today() + timedelta(days=21)
+        response = SimpleNamespace(
+            option_contracts=[_contract("XYZ260522C00105000", expiry, 105.0)],
+            next_page_token=None,
+        )
+        client = MagicMock()
+        client.get_option_contracts.return_value = response
+
+        quote_lookup = _quotes({
+            "XYZ260522C00105000": Quote(bid=2.00, ask=2.05),
+        })
+
+        with patch("utils.options_lookup._get_client", return_value=client):
+            pick = find_best_call(
+                "XYZ", 100.0,
+                min_dte=14, max_dte=28,
+                max_premium_per_contract=2_000.0,
+                quote_lookup=quote_lookup,
+                target_delta=0.40,
+                target_strike_pct=1.05,
+            )
+
+        req = client.get_option_contracts.call_args.args[0]
+        assert req.strike_price_gte == "101.85"
+        assert req.strike_price_lte == "108.15"
+        assert pick is not None
+        assert pick.occ_symbol == "XYZ260522C00105000"
+
     def test_paginates_chain_until_token_exhausted(self):
         expiry = date(2026, 5, 22)
         first = SimpleNamespace(option_contracts=[], next_page_token="page-2")
