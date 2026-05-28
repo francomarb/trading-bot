@@ -28,9 +28,11 @@ from alpaca.trading.enums import AssetStatus, ContractType
 from config.settings import ALPACA_API_KEY, ALPACA_SECRET_KEY, ALPACA_PAPER
 from utils.options_ranker import (
     Candidate,
+    CallRankerConfig,
     Quote,
     ScoredPick,
     ScoredSpread,
+    SpreadRankerConfig,
     SpreadCandidate,
     rank_call_candidates,
     rank_put_spread_candidates,
@@ -90,7 +92,9 @@ def find_best_call(
     max_dte: int,
     max_premium_per_contract: float,
     quote_lookup: QuoteLookup,
-    target_delta: float = 0.55,  # accepted for symmetry; ITM proxy is fixed
+    target_delta: float = 0.55,
+    target_strike_pct: float = 0.995,
+    ranker_config: CallRankerConfig | None = None,
 ) -> ContractPick | None:
     """
     Find the best-scoring affordable call contract.
@@ -110,9 +114,17 @@ def find_best_call(
         Callback ``list[occ_symbol] → {occ_symbol: Quote | None}``. Called
         once for the top-K strike-nearest candidates.
     target_delta
-        Accepted for API symmetry. Alpaca paper does not stream live Greeks
-        so we approximate ~0.55 delta with a slightly-ITM strike target
-        (underlying × 0.995).
+        Desired call delta. Alpaca paper does not stream live Greeks for the
+        single-leg picker, so this is logged/API-symmetry context for the
+        configured strike proxy.
+    target_strike_pct
+        Moneyness proxy used to derive the strike target
+        (``underlying_price × target_strike_pct``). The SPY default of 0.995
+        approximates a slightly ITM ~0.55-delta call, but callers can tune it
+        per strategy instead of relying on a hidden picker constant.
+    ranker_config
+        Optional scoring/filter configuration for the pure ranker. Defaults
+        preserve the current SPY options behavior.
 
     Returns
     -------
@@ -126,7 +138,14 @@ def find_best_call(
     min_date = now + timedelta(days=min_dte)
     max_date = now + timedelta(days=max_dte)
 
-    target_strike = underlying_price * 0.995
+    if target_strike_pct <= 0:
+        logger.error(
+            f"Invalid target_strike_pct={target_strike_pct:.4f} for {symbol}; "
+            "must be > 0."
+        )
+        return None
+
+    target_strike = underlying_price * target_strike_pct
     strike_floor = round(target_strike * (1.0 - _STRIKE_WINDOW_PCT), 2)
     strike_ceiling = round(target_strike * (1.0 + _STRIKE_WINDOW_PCT), 2)
 
@@ -226,6 +245,7 @@ def find_best_call(
         quotes,
         target_strike=target_strike,
         max_premium_per_contract=max_premium_per_contract,
+        config=ranker_config,
     )
 
     if result.best is None:
@@ -250,6 +270,7 @@ def find_best_call(
         f"Resolved Option: {top.occ_symbol} "
         f"strike=${top.candidate.strike:.2f} expiry={top.candidate.expiration_date} "
         f"underlying=${underlying_price:.2f} target=${target_strike:.2f} "
+        f"targetΔ≈{target_delta:.2f} "
         f"premium=${top.quote.mid:.2f} spread={top.quote.spread_pct:.1%} "
         f"score={top.score:.2f} "
         f"[strike={top.components['strike_proximity']:.2f} "
@@ -299,9 +320,8 @@ def build_opra_quote_lookup() -> QuoteLookup:
     to ``Quote`` objects via Alpaca's option-snapshot endpoint.
 
     Returns ``None`` for any symbol without a valid live two-sided quote so
-    the ranker/picker drops it cleanly. Shared by the credit-spread strategy
-    (entry picker + spread-exit mid pricing); the single-leg
-    ``spy_options_reversion`` strategy still carries its own equivalent.
+    the ranker/picker drops it cleanly. Shared by single-leg and multi-leg
+    options strategies for entry picking and spread-exit mid pricing.
     """
     from alpaca.data.historical.option import OptionHistoricalDataClient
     from alpaca.data.requests import OptionSnapshotRequest
@@ -374,6 +394,7 @@ def find_best_put_spread(
     quote_lookup: QuoteLookup,
     min_credit_pct_of_width: float = 0.25,
     risk_free_rate: float = _RISK_FREE_RATE,
+    ranker_config: SpreadRankerConfig | None = None,
 ) -> SpreadPick | None:
     """
     Find the best-scoring affordable bull put credit spread.
@@ -406,6 +427,9 @@ def find_best_put_spread(
         Thin-credit floor passed through to the ranker (default 25%).
     risk_free_rate
         Black-Scholes risk-free rate for the delta estimate.
+    ranker_config
+        Optional scoring/filter configuration for the pure ranker. Defaults
+        preserve the current credit-spread behavior.
 
     Returns
     -------
@@ -551,6 +575,7 @@ def find_best_put_spread(
         target_dte=target_dte,
         max_loss_per_position=max_loss_per_position,
         min_credit_pct_of_width=min_credit_pct_of_width,
+        config=ranker_config,
     )
 
     if result.best is None:

@@ -90,8 +90,13 @@ from risk.manager import (
 from reporting.alerts import AlertDispatcher
 from reporting.logger import TradeLogger
 from reporting.pnl import PnLTracker
-from strategies.base import BaseStrategy, OptionTradeRejected, OrderType, StrategySlot
-from strategies.credit_spread import CreditSpreadRejected, OpenSpread
+from strategies.base import (
+    BaseStrategy,
+    MultiLegTradeRejected,
+    OptionTradeRejected,
+    OrderType,
+    StrategySlot,
+)
 from utils.option_symbols import parse_occ_symbol
 
 from regime.detector import MarketRegime
@@ -2564,7 +2569,7 @@ class TradingEngine:
         """
         Count every tracked multi-leg position — the engine-wide MLEG
         concurrency total passed into ``build_spread_execution`` as
-        ``total_open_credit_spreads``.
+        ``total_open_spreads``.
 
         Generalized from the original ``"credit_spread"``-only check (PLAN.md
         11.31): every spread strategy contributes to the same global total
@@ -2578,7 +2583,7 @@ class TradingEngine:
         """
         Build the ``credit_spreads`` state-snapshot field — one dict per open
         spread, with the economics the dashboard renders. Sourced from the
-        owning strategy's ``OpenSpread`` view (kept in sync by the entry /
+        owning strategy's open-spread view (kept in sync by the entry /
         drain paths).
         """
         out: list[dict] = []
@@ -2720,10 +2725,10 @@ class TradingEngine:
             plan = strategy.build_spread_execution(
                 underlying_close,
                 notional_cap=notional_cap,
-                total_open_credit_spreads=total_open,
+                total_open_spreads=total_open,
             )
-        except CreditSpreadRejected as e:
-            logger.info(f"[{strategy.name}] {symbol}: credit spread rejected — {e}")
+        except MultiLegTradeRejected as e:
+            logger.info(f"[{strategy.name}] {symbol}: multi-leg entry rejected — {e}")
             _done("No Signal")
             return
         except Exception as e:
@@ -2782,17 +2787,7 @@ class TradingEngine:
         )
         self._spread_owner_strategy[position_id] = strategy
         self._pending_spread_plans[position_id] = plan
-        strategy.register_spread(OpenSpread(
-            position_id=position_id,
-            short_occ=plan.short_occ,
-            long_occ=plan.long_occ,
-            short_strike=plan.short_strike,
-            long_strike=plan.long_strike,
-            expiration_date=plan.expiration_date,
-            net_credit=plan.net_credit,
-            width=plan.width,
-            qty=plan.qty,
-        ))
+        strategy.register_spread(plan.to_open_spread(position_id=position_id))
         logger.info(
             f"[{strategy.name}] {symbol}: credit spread dispatched "
             f"{plan.short_occ}/{plan.long_occ} width=${plan.width:.0f} "
@@ -3212,11 +3207,11 @@ class TradingEngine:
 
         For each open spread in the trade log:
           - both leg OCCs must be present in the broker snapshot, and a
-            CreditSpread instance must be configured for the underlying —
+            spread strategy instance must be configured for the underlying —
             otherwise the spread cannot be safely managed and its underlying
             is added to ``conflicts`` (→ RESTRICTED startup mode);
           - on success the two-leg ``Position``, ``_spread_owner_strategy``
-            entry, and the strategy's ``OpenSpread`` view are all rebuilt.
+            entry, and the strategy's open-spread view are all rebuilt.
 
         Returns the set of leg OCC symbols belonging to reconstructed spreads
         so the single-leg restore loop skips them.
@@ -3272,6 +3267,16 @@ class TradingEngine:
             qty = int(record.get("qty") or 1)
             net_credit = float(record.get("net_credit") or 0.0)
             width = short_leg.strike - long_leg.strike
+            build_record = getattr(strategy, "build_open_spread_record", None)
+            if not callable(build_record):
+                logger.warning(
+                    f"restart: spread {position_id[:8]} ({underlying}) strategy "
+                    f"'{strategy_name}' cannot rebuild an open spread record — "
+                    "declaring a conflict (RESTRICTED)."
+                )
+                conflicts.add(underlying)
+                spread_leg_occs.update(leg_symbols)
+                continue
             self._positions[position_id] = make_spread(
                 strategy_name=strategy_name,
                 position_id=position_id,
@@ -3281,7 +3286,7 @@ class TradingEngine:
                 ],
             )
             self._spread_owner_strategy[position_id] = strategy
-            strategy.register_spread(OpenSpread(
+            strategy.register_spread(build_record(
                 position_id=position_id,
                 short_occ=short_occ,
                 long_occ=long_occ,

@@ -7,19 +7,16 @@ One ``CreditSpread`` instance runs per underlying, configured from a
 allocator sleeve (``name`` is a fixed class attribute) — the per-instance
 identity is the configured underlying symbol.
 
-This module is the *logic* layer (PR 3a). It is fully unit-testable but is
-**not engine-wired** — nothing calls ``build_spread_execution`` /
-``should_exit_spread`` / ``register_spread`` yet. The engine MLEG-dispatch
-path, the ``forward_test.py`` slot, the ``STRATEGY_ALLOCATIONS`` rebalance,
-and the dashboard rendering all land in PR 3b.
+This module is the strategy logic layer. It is fully unit-testable; the engine
+wires the methods below through the generic multi-leg dispatch path.
 
-Interface the engine (PR 3b) will wire:
+Interface the engine wires:
 
   * ``_raw_signals`` — permissive: every bar is a candidate entry. The real
     gating is the edge filter (trend + IV + earnings), the per-instance
     position caps, and chain/spread availability.
   * ``build_spread_execution(underlying_price, *, notional_cap,
-    total_open_credit_spreads)`` — runs the caps, the multi-leg picker, and
+    total_open_spreads)`` — runs the caps, the multi-leg picker, and
     returns a ``SpreadExecutionPlan`` (legs + qty + a *negative* limit price,
     per the Alpaca MLEG credit convention). Raises ``CreditSpreadRejected``
     when no entry is available.
@@ -42,10 +39,10 @@ from loguru import logger
 
 from execution.options_executor import SpreadLeg
 from risk.manager import Side
-from strategies.base import BaseStrategy, EdgeFilter, SignalFrame
+from strategies.base import BaseStrategy, EdgeFilter, MultiLegTradeRejected, SignalFrame
 from utils.iv_proxy import IVProxyResolver
 from utils.options_lookup import SpreadPick, find_best_put_spread
-from utils.options_ranker import Quote
+from utils.options_ranker import Quote, SpreadRankerConfig
 
 
 # Quote-lookup callback: list[occ] → {occ: Quote | None}.
@@ -58,7 +55,7 @@ _CONTRACT_MULTIPLIER = 100
 _REQUIRED_BARS = 60  # enough history for the edge filter's 50-day SMA
 
 
-class CreditSpreadRejected(Exception):
+class CreditSpreadRejected(MultiLegTradeRejected):
     """Raised by ``build_spread_execution`` when no entry is available."""
 
 
@@ -91,6 +88,7 @@ class CreditSpreadConfig:
     exit_on_short_strike_breach: bool
     limit_timeout_seconds: int
     earnings_blackout_days: int
+    ranker_config: SpreadRankerConfig = field(default_factory=SpreadRankerConfig)
 
     _REQUIRED_KEYS = frozenset({
         "short_leg_delta", "spread_width", "dte_min", "dte_max",
@@ -156,6 +154,33 @@ class OpenSpread:
         default_factory=lambda: datetime.now(timezone.utc)
     )
 
+    @classmethod
+    def from_details(
+        cls,
+        *,
+        position_id: str,
+        short_occ: str,
+        long_occ: str,
+        short_strike: float,
+        long_strike: float,
+        expiration_date: date,
+        net_credit: float,
+        width: float,
+        qty: int,
+    ) -> "OpenSpread":
+        """Build an open-spread record from entry-plan or restart fields."""
+        return cls(
+            position_id=position_id,
+            short_occ=short_occ,
+            long_occ=long_occ,
+            short_strike=short_strike,
+            long_strike=long_strike,
+            expiration_date=expiration_date,
+            net_credit=net_credit,
+            width=width,
+            qty=qty,
+        )
+
 
 @dataclass(frozen=True)
 class SpreadExecutionPlan:
@@ -179,6 +204,20 @@ class SpreadExecutionPlan:
     net_credit: float            # $/share, positive
     max_loss: float              # $ per contract
     width: float
+
+    def to_open_spread(self, *, position_id: str) -> OpenSpread:
+        """Build the strategy's open-position record for a submitted entry."""
+        return OpenSpread.from_details(
+            position_id=position_id,
+            short_occ=self.short_occ,
+            long_occ=self.long_occ,
+            short_strike=self.short_strike,
+            long_strike=self.long_strike,
+            expiration_date=self.expiration_date,
+            net_credit=self.net_credit,
+            width=self.width,
+            qty=self.qty,
+        )
 
 
 # ── Strategy ────────────────────────────────────────────────────────────────
@@ -251,13 +290,39 @@ class CreditSpread(BaseStrategy):
         """The open spread for ``position_id``, or None if not held."""
         return self._open_spreads.get(position_id)
 
+    def build_open_spread_record(
+        self,
+        *,
+        position_id: str,
+        short_occ: str,
+        long_occ: str,
+        short_strike: float,
+        long_strike: float,
+        expiration_date: date,
+        net_credit: float,
+        width: float,
+        qty: int,
+    ) -> OpenSpread:
+        """Build an open-position record during restart reconstruction."""
+        return OpenSpread.from_details(
+            position_id=position_id,
+            short_occ=short_occ,
+            long_occ=long_occ,
+            short_strike=short_strike,
+            long_strike=long_strike,
+            expiration_date=expiration_date,
+            net_credit=net_credit,
+            width=width,
+            qty=qty,
+        )
+
     # ── Entry caps ───────────────────────────────────────────────────────
 
     def _caps_reject_reason(
         self,
         *,
         target_expiration: date,
-        total_open_credit_spreads: int,
+        total_open_spreads: int,
     ) -> str | None:
         """
         Return a human-readable reason if any position cap blocks a new entry
@@ -270,10 +335,10 @@ class CreditSpread(BaseStrategy):
         """
         from config.settings import MAX_TOTAL_CONCURRENT_CREDIT_SPREADS
 
-        if total_open_credit_spreads >= MAX_TOTAL_CONCURRENT_CREDIT_SPREADS:
+        if total_open_spreads >= MAX_TOTAL_CONCURRENT_CREDIT_SPREADS:
             return (
                 f"global cap reached "
-                f"({total_open_credit_spreads}/{MAX_TOTAL_CONCURRENT_CREDIT_SPREADS} "
+                f"({total_open_spreads}/{MAX_TOTAL_CONCURRENT_CREDIT_SPREADS} "
                 "concurrent credit spreads)"
             )
 
@@ -316,16 +381,17 @@ class CreditSpread(BaseStrategy):
         underlying_price: float,
         *,
         notional_cap: float,
-        total_open_credit_spreads: int = 0,
+        total_open_spreads: int | None = None,
+        total_open_credit_spreads: int | None = None,
     ) -> SpreadExecutionPlan:
         """
         Select a bull put credit spread and build the order plan.
 
         ``notional_cap`` is the sleeve's per-position dollar budget — for a
         defined-risk spread this is the collateral, i.e. the max loss cap
-        passed to the picker. ``total_open_credit_spreads`` is the live
-        global count across all credit-spread instances (the engine supplies
-        it in PR 3b; defaults to 0 for unit tests of a single instance).
+        passed to the picker. ``total_open_spreads`` is the live global count
+        across all spread instances. ``total_open_credit_spreads`` remains a
+        back-compat alias for existing tests/callers.
 
         Raises ``CreditSpreadRejected`` if a cap blocks the entry, no
         tradeable spread is available, or the picked spread violates a
@@ -339,13 +405,15 @@ class CreditSpread(BaseStrategy):
             raise CreditSpreadRejected(
                 f"{self.symbol}: no quote_lookup wired — cannot price the chain."
             )
+        if total_open_spreads is None:
+            total_open_spreads = total_open_credit_spreads or 0
 
         # Cheap caps first — concurrent/global caps don't need a chain query.
         # (The per-expiration / staggering caps need the picked expiration,
         # so they are re-checked after the picker runs.)
         early_reject = self._caps_reject_reason(
             target_expiration=date.max,  # placeholder — expiry caps re-checked below
-            total_open_credit_spreads=total_open_credit_spreads,
+            total_open_spreads=total_open_spreads,
         )
         # date.max can't trip the per-expiration / stagger caps, so a
         # non-None reason here is a true concurrent/global-cap block.
@@ -366,6 +434,7 @@ class CreditSpread(BaseStrategy):
             max_loss_per_position=notional_cap,
             min_credit_pct_of_width=self.config.min_credit_pct_of_width,
             quote_lookup=self._quote_lookup,
+            ranker_config=self.config.ranker_config,
         )
         if pick is None:
             raise CreditSpreadRejected(
@@ -378,7 +447,7 @@ class CreditSpread(BaseStrategy):
         # Now that we know the expiration, re-check the expiry-sensitive caps.
         cap_reject = self._caps_reject_reason(
             target_expiration=pick.expiration_date,
-            total_open_credit_spreads=total_open_credit_spreads,
+            total_open_spreads=total_open_spreads,
         )
         if cap_reject is not None:
             raise CreditSpreadRejected(f"{self.symbol}: {cap_reject}")

@@ -57,6 +57,32 @@ DTE_TOLERANCE_DAYS = 15.0     # DTE score reaches 0.0 this many days off target
 
 
 @dataclass(frozen=True)
+class CallRankerConfig:
+    """Per-strategy scoring/filter knobs for single-leg call candidates."""
+
+    weight_strike: float = WEIGHT_STRIKE
+    weight_spread: float = WEIGHT_SPREAD
+    weight_premium_efficiency: float = WEIGHT_PREMIUM_EFF
+    strike_tolerance_pct: float = STRIKE_TOLERANCE_PCT
+    fatal_spread_pct: float = FATAL_SPREAD_PCT
+    soft_spread_pct: float = SOFT_SPREAD_PCT
+    premium_outlier_multiplier: float = PREMIUM_OUTLIER_MULTIPLIER
+
+
+@dataclass(frozen=True)
+class SpreadRankerConfig:
+    """Per-strategy scoring/filter knobs for put-spread candidates."""
+
+    weight_short_delta: float = WEIGHT_SHORT_DELTA
+    weight_net_credit: float = WEIGHT_NET_CREDIT
+    weight_spread_quality: float = WEIGHT_SPREAD_QUALITY
+    weight_dte: float = WEIGHT_DTE
+    short_delta_window: float = SHORT_DELTA_WINDOW
+    dte_tolerance_days: float = DTE_TOLERANCE_DAYS
+    soft_spread_pct: float = SOFT_SPREAD_PCT
+
+
+@dataclass(frozen=True)
 class Quote:
     """A bid/ask snapshot for one OCC contract. ``mid`` is computed."""
 
@@ -111,19 +137,25 @@ class RankResult:
         return self.picks[0] if self.picks else None
 
 
-def _strike_proximity_score(strike: float, target_strike: float) -> float:
-    """1.0 at the target, 0.0 once we're STRIKE_TOLERANCE_PCT × target away."""
+def _strike_proximity_score(
+    strike: float, target_strike: float, tolerance_pct: float = STRIKE_TOLERANCE_PCT
+) -> float:
+    """1.0 at the target, 0.0 once we're tolerance_pct × target away."""
     if target_strike <= 0:
         return 0.0
+    if tolerance_pct <= 0:
+        return 0.0
     distance_pct = abs(strike - target_strike) / target_strike
-    return max(0.0, 1.0 - distance_pct / STRIKE_TOLERANCE_PCT)
+    return max(0.0, 1.0 - distance_pct / tolerance_pct)
 
 
-def _spread_score(spread_pct: float) -> float:
-    """1.0 at zero spread, 0.0 at SOFT_SPREAD_PCT, clamped."""
+def _spread_score(spread_pct: float, soft_spread_pct: float = SOFT_SPREAD_PCT) -> float:
+    """1.0 at zero spread, 0.0 at soft_spread_pct, clamped."""
     if spread_pct <= 0:
         return 1.0
-    return max(0.0, 1.0 - spread_pct / SOFT_SPREAD_PCT)
+    if soft_spread_pct <= 0:
+        return 0.0
+    return max(0.0, 1.0 - spread_pct / soft_spread_pct)
 
 
 def _premium_efficiency_score(premium: float, max_premium: float) -> float:
@@ -140,6 +172,7 @@ def rank_call_candidates(
     target_strike: float,
     max_premium_per_contract: float,
     contract_multiplier: int = 100,
+    config: CallRankerConfig | None = None,
 ) -> RankResult:
     """
     Rank a list of call candidates by composite quality.
@@ -153,10 +186,11 @@ def rank_call_candidates(
         ``{occ_symbol: Quote}`` for every candidate. Missing entries cause
         the candidate to be dropped (no quote → can't score spread).
     target_strike
-        Slightly-ITM target (underlying × 0.995 for ~0.55-delta call on SPY).
+        Strategy-supplied strike target.
     max_premium_per_contract
-        Per-contract budget in $ from the sleeve allocator (``notional_cap /
-        contract_multiplier``).
+        Per-contract budget in $ from the sleeve allocator. Candidate cost is
+        ``quote.mid × contract_multiplier`` and is compared directly to this
+        dollar cap.
     contract_multiplier
         Shares per contract; 100 for standard equity options.
 
@@ -165,6 +199,7 @@ def rank_call_candidates(
     RankResult with ``picks`` ranked best→worst and ``rejected`` listing
     every dropped candidate with a reason for log explainability.
     """
+    cfg = config or CallRankerConfig()
     rejected: list[tuple[Candidate, str]] = []
     survivors: list[tuple[Candidate, Quote, float]] = []  # (cand, quote, premium)
 
@@ -177,8 +212,11 @@ def rank_call_candidates(
         if q.bid <= 0 or q.ask <= 0 or q.ask < q.bid:
             rejected.append((cand, f"invalid quote bid={q.bid:.2f} ask={q.ask:.2f}"))
             continue
-        if q.spread_pct > FATAL_SPREAD_PCT:
-            rejected.append((cand, f"spread {q.spread_pct:.1%} > {FATAL_SPREAD_PCT:.0%}"))
+        if q.spread_pct > cfg.fatal_spread_pct:
+            rejected.append((
+                cand,
+                f"spread {q.spread_pct:.1%} > {cfg.fatal_spread_pct:.0%}",
+            ))
             continue
         premium = q.mid * contract_multiplier
         if premium > max_premium_per_contract:
@@ -195,13 +233,14 @@ def rank_call_candidates(
     # the budget. Needs at least 3 candidates to compute a stable median.
     if len(quoted_mids) >= 3:
         median_mid = statistics.median(quoted_mids)
-        ceiling = median_mid * PREMIUM_OUTLIER_MULTIPLIER
+        ceiling = median_mid * cfg.premium_outlier_multiplier
         cleaned: list[tuple[Candidate, Quote, float]] = []
         for cand, q, premium in survivors:
             if q.mid > ceiling:
                 rejected.append((
                     cand,
-                    f"premium outlier mid=${q.mid:.2f} > {PREMIUM_OUTLIER_MULTIPLIER:.0f}× median ${median_mid:.2f}",
+                    f"premium outlier mid=${q.mid:.2f} > "
+                    f"{cfg.premium_outlier_multiplier:.0f}× median ${median_mid:.2f}",
                 ))
                 continue
             cleaned.append((cand, q, premium))
@@ -209,13 +248,15 @@ def rank_call_candidates(
 
     picks: list[ScoredPick] = []
     for cand, q, premium in survivors:
-        s_strike = _strike_proximity_score(cand.strike, target_strike)
-        s_spread = _spread_score(q.spread_pct)
+        s_strike = _strike_proximity_score(
+            cand.strike, target_strike, cfg.strike_tolerance_pct
+        )
+        s_spread = _spread_score(q.spread_pct, cfg.soft_spread_pct)
         s_premium = _premium_efficiency_score(premium, max_premium_per_contract)
         score = (
-            WEIGHT_STRIKE * s_strike
-            + WEIGHT_SPREAD * s_spread
-            + WEIGHT_PREMIUM_EFF * s_premium
+            cfg.weight_strike * s_strike
+            + cfg.weight_spread * s_spread
+            + cfg.weight_premium_efficiency * s_premium
         )
         picks.append(ScoredPick(
             candidate=cand,
@@ -295,11 +336,13 @@ class SpreadRankResult:
         return self.picks[0] if self.picks else None
 
 
-def _short_delta_score(delta: float, target_delta: float) -> float:
-    """1.0 at the target delta, 0.0 once SHORT_DELTA_WINDOW away."""
-    if SHORT_DELTA_WINDOW <= 0:
+def _short_delta_score(
+    delta: float, target_delta: float, delta_window: float = SHORT_DELTA_WINDOW
+) -> float:
+    """1.0 at the target delta, 0.0 once delta_window away."""
+    if delta_window <= 0:
         return 0.0
-    return max(0.0, 1.0 - abs(delta - target_delta) / SHORT_DELTA_WINDOW)
+    return max(0.0, 1.0 - abs(delta - target_delta) / delta_window)
 
 
 def _net_credit_score(net_credit: float, width: float) -> float:
@@ -313,11 +356,13 @@ def _net_credit_score(net_credit: float, width: float) -> float:
     return max(0.0, min(1.0, net_credit / width))
 
 
-def _dte_score(dte: float, target_dte: float) -> float:
-    """1.0 at the target DTE, decaying to 0.0 DTE_TOLERANCE_DAYS away."""
-    if DTE_TOLERANCE_DAYS <= 0:
+def _dte_score(
+    dte: float, target_dte: float, tolerance_days: float = DTE_TOLERANCE_DAYS
+) -> float:
+    """1.0 at the target DTE, decaying to 0.0 tolerance_days away."""
+    if tolerance_days <= 0:
         return 0.0
-    return max(0.0, 1.0 - abs(dte - target_dte) / DTE_TOLERANCE_DAYS)
+    return max(0.0, 1.0 - abs(dte - target_dte) / tolerance_days)
 
 
 def rank_put_spread_candidates(
@@ -329,6 +374,7 @@ def rank_put_spread_candidates(
     max_loss_per_position: float,
     min_credit_pct_of_width: float = 0.25,
     contract_multiplier: int = 100,
+    config: SpreadRankerConfig | None = None,
 ) -> SpreadRankResult:
     """
     Rank bull put credit spreads by composite quality.
@@ -372,6 +418,7 @@ def rank_put_spread_candidates(
     """
     from datetime import date as _date
 
+    cfg = config or SpreadRankerConfig()
     rejected: list[tuple[SpreadCandidate, str]] = []
     survivors: list[tuple[SpreadCandidate, Quote, Quote, float, float, float]] = []
     # tuple: (candidate, short_quote, long_quote, net_credit, max_loss, dte)
@@ -398,11 +445,11 @@ def rank_put_spread_candidates(
                 break
         else:
             # Short-leg delta window.
-            if abs(cand.short_leg_delta - target_short_delta) > SHORT_DELTA_WINDOW:
+            if abs(cand.short_leg_delta - target_short_delta) > cfg.short_delta_window:
                 rejected.append((
                     cand,
                     f"short delta {cand.short_leg_delta:.3f} outside "
-                    f"{target_short_delta:.2f} ± {SHORT_DELTA_WINDOW:.2f}",
+                    f"{target_short_delta:.2f} ± {cfg.short_delta_window:.2f}",
                 ))
                 continue
 
@@ -436,18 +483,20 @@ def rank_put_spread_candidates(
 
     picks: list[ScoredSpread] = []
     for cand, short_q, long_q, net_credit, max_loss, dte in survivors:
-        s_delta = _short_delta_score(cand.short_leg_delta, target_short_delta)
+        s_delta = _short_delta_score(
+            cand.short_leg_delta, target_short_delta, cfg.short_delta_window
+        )
         s_credit = _net_credit_score(net_credit, cand.width)
         combined_spread_pct = statistics.mean(
             (short_q.spread_pct, long_q.spread_pct)
         )
-        s_spread = _spread_score(combined_spread_pct)
-        s_dte = _dte_score(dte, target_dte)
+        s_spread = _spread_score(combined_spread_pct, cfg.soft_spread_pct)
+        s_dte = _dte_score(dte, target_dte, cfg.dte_tolerance_days)
         score = (
-            WEIGHT_SHORT_DELTA * s_delta
-            + WEIGHT_NET_CREDIT * s_credit
-            + WEIGHT_SPREAD_QUALITY * s_spread
-            + WEIGHT_DTE * s_dte
+            cfg.weight_short_delta * s_delta
+            + cfg.weight_net_credit * s_credit
+            + cfg.weight_spread_quality * s_spread
+            + cfg.weight_dte * s_dte
         )
         picks.append(ScoredSpread(
             candidate=cand,

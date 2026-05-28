@@ -61,6 +61,10 @@ class OptionTradeRejected(ValueError):
     """
 
 
+class MultiLegTradeRejected(ValueError):
+    """Expected multi-leg option-entry veto raised by spread-style strategies."""
+
+
 class OrderType(Enum):
     MARKET = "market"
     LIMIT = "limit"

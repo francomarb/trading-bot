@@ -3,6 +3,7 @@ SPY Options RSI Reversion Strategy.
 """
 
 import re
+from dataclasses import dataclass, field
 from datetime import date, datetime, time, timedelta, timezone
 from typing import Tuple
 from zoneinfo import ZoneInfo
@@ -12,13 +13,32 @@ from loguru import logger
 
 from indicators.technicals import add_rsi
 from strategies.base import BaseStrategy, OptionTradeRejected, OrderType, SignalFrame
-from utils.options_lookup import ContractPick, find_best_call
-from utils.options_ranker import Quote
+from utils.options_lookup import ContractPick, build_opra_quote_lookup, find_best_call
+from utils.options_ranker import CallRankerConfig
 
 _ET = ZoneInfo("America/New_York")
 _OCC_RE = re.compile(r"^([A-Z]+)(\d{6})([CP])(\d{8})$")
 
-__all__ = ["OptionTradeRejected", "SPYOptionsReversionStrategy"]
+__all__ = ["OptionTradeRejected", "SPYOptionsConfig", "SPYOptionsReversionStrategy"]
+
+
+@dataclass(frozen=True)
+class SPYOptionsConfig:
+    """Tunables for the single-leg SPY call reversion strategy."""
+
+    min_dte: int = 14
+    max_dte: int = 28
+    target_delta: float = 0.55
+    target_strike_pct: float = 0.995
+    take_profit_multiple: float = 3.00
+    stop_loss_multiple: float = 0.75
+    time_stop_expiry_week_weekday: int = 2  # Wednesday
+    time_stop_hour: int = 15
+    time_stop_minute: int = 30
+    delta_floor: float = 0.30
+    risk_free_rate: float = 0.05
+    vix_fallback_sigma: float = 0.15
+    ranker_config: CallRankerConfig = field(default_factory=CallRankerConfig)
 
 
 class SPYOptionsReversionStrategy(BaseStrategy):
@@ -34,15 +54,17 @@ class SPYOptionsReversionStrategy(BaseStrategy):
         trail_pct: float = 0.15,
         edge_filter=None,
         quote_lookup=None,
+        config: SPYOptionsConfig | None = None,
     ):
         super().__init__(edge_filter=edge_filter)
+        self.config = config or SPYOptionsConfig()
         self.rsi_length = rsi_length
         self.rsi_threshold = rsi_threshold
         self.trail_activation_pct = trail_activation_pct
         self.trail_pct = trail_pct
         # VIX cache: refreshed once per calendar day to avoid hot-loop HTTP calls.
         self._vix_date: date | None = None
-        self._vix_sigma: float = 0.15  # fallback: ~VIX 15
+        self._vix_sigma: float = self.config.vix_fallback_sigma
         # Trailing stop state keyed by OCC symbol.
         self._position_hwm: dict[str, float] = {}   # OCC → highest B-S value observed
         self._position_base: dict[str, float] = {}  # OCC → first B-S value observed
@@ -108,9 +130,9 @@ class SPYOptionsReversionStrategy(BaseStrategy):
         Called every engine cycle for each open position.  Returns True to
         trigger an immediate market exit.  Three guards run in order:
 
-        1. Time stop      — exit by Wednesday 3:30 PM ET of the contract's
+        1. Time stop      — exit by the configured day/time of the contract's
                             expiry week.  Prevents holding through Theta cliff.
-        2. Delta floor    — exit if B-S Delta < 0.30.  Signals the option has
+        2. Delta floor    — exit if B-S Delta < configured floor.  Signals the option has
                             moved too far OTM to be a viable play.
         3. Trailing stop  — activate once the B-S value rises ≥ trail_activation_pct
                             above the entry value; then exit if the current value
@@ -128,12 +150,15 @@ class SPYOptionsReversionStrategy(BaseStrategy):
         # ── Guard 1: time stop ───────────────────────────────────────────────
         # Exit on or after the Wednesday of expiry week at 3:30 PM ET.
         now_et = datetime.now(_ET)
-        expiry_wednesday = expiry_date - timedelta(days=2)
-        at_or_past_330 = now_et.hour * 60 + now_et.minute >= 15 * 60 + 30
-        if now_et.date() >= expiry_wednesday and at_or_past_330:
+        cfg = self.config
+        days_before_expiry = (expiry_date.weekday() - cfg.time_stop_expiry_week_weekday) % 7
+        stop_date = expiry_date - timedelta(days=days_before_expiry)
+        stop_minutes = cfg.time_stop_hour * 60 + cfg.time_stop_minute
+        at_or_past_stop_time = now_et.hour * 60 + now_et.minute >= stop_minutes
+        if now_et.date() >= stop_date and at_or_past_stop_time:
             logger.warning(
                 f"[{self.name}] Time stop: {occ} — "
-                f"expiry week Wednesday reached ({now_et.strftime('%a %Y-%m-%d %H:%M ET')})"
+                f"expiry-week stop reached ({now_et.strftime('%a %Y-%m-%d %H:%M ET')})"
             )
             self._position_hwm.pop(occ, None)
             self._position_base.pop(occ, None)
@@ -149,7 +174,9 @@ class SPYOptionsReversionStrategy(BaseStrategy):
 
         try:
             from blackscholes import BlackScholesCall
-            call = BlackScholesCall(S=latest_close, K=strike, T=T, r=0.05, sigma=sigma)
+            call = BlackScholesCall(
+                S=latest_close, K=strike, T=T, r=cfg.risk_free_rate, sigma=sigma
+            )
             delta = call.delta()
             opt_val = float(call.price)
 
@@ -159,9 +186,10 @@ class SPYOptionsReversionStrategy(BaseStrategy):
             )
 
             # ── Guard 2: Delta floor ─────────────────────────────────────────
-            if delta < 0.30:
+            if delta < cfg.delta_floor:
                 logger.warning(
-                    f"[{self.name}] Delta floor: {occ} — Delta={delta:.3f} < 0.30, exiting"
+                    f"[{self.name}] Delta floor: {occ} — "
+                    f"Delta={delta:.3f} < {cfg.delta_floor:.2f}, exiting"
                 )
                 self._position_hwm.pop(occ, None)
                 self._position_base.pop(occ, None)
@@ -257,14 +285,16 @@ class SPYOptionsReversionStrategy(BaseStrategy):
             # Lazy production default — build once on first use and reuse
             # across subsequent entries (one OptionHistoricalDataClient
             # instead of one per signal bar).
-            self._quote_lookup = _build_quote_lookup()
+            self._quote_lookup = build_opra_quote_lookup()
 
         pick: ContractPick | None = find_best_call(
             symbol,
             underlying_price,
-            min_dte=14,
-            max_dte=28,
-            target_delta=0.55,
+            min_dte=self.config.min_dte,
+            max_dte=self.config.max_dte,
+            target_delta=self.config.target_delta,
+            target_strike_pct=self.config.target_strike_pct,
+            ranker_config=self.config.ranker_config,
             max_premium_per_contract=max_premium_per_contract,
             quote_lookup=self._quote_lookup,
         )
@@ -280,10 +310,10 @@ class SPYOptionsReversionStrategy(BaseStrategy):
                 f"{pick.occ_symbol}: computed premium={premium:.2f} <= 0 — skipping trade."
             )
 
-        # Hard SL at -25% (backtest validated). TP is a +200% safety valve —
+        # Hard SL and TP are configured from backtest-validated defaults.
         # the trailing stop in inspect_open_positions handles real profit-taking.
-        take_profit = round(premium * 3.00, 2)
-        stop_loss = round(premium * 0.75, 2)
+        take_profit = round(premium * self.config.take_profit_multiple, 2)
+        stop_loss = round(premium * self.config.stop_loss_multiple, 2)
 
         logger.info(
             f"[{self.name}] {pick.occ_symbol}: premium=${premium:.2f} "
@@ -291,44 +321,3 @@ class SPYOptionsReversionStrategy(BaseStrategy):
             f"SL=${stop_loss:.2f} TP=${take_profit:.2f} (safety valve)"
         )
         return pick.occ_symbol, premium, take_profit, stop_loss
-
-
-def _build_quote_lookup():
-    """
-    Construct a quote-lookup callable that resolves a batch of OCC symbols
-    via Alpaca's option snapshot endpoint. Returns ``None`` for any symbol
-    without a valid live quote so the ranker drops it cleanly.
-    """
-    from alpaca.data.historical.option import OptionHistoricalDataClient
-    from alpaca.data.requests import OptionSnapshotRequest
-    from config.settings import ALPACA_API_KEY, ALPACA_SECRET_KEY
-
-    data_client = OptionHistoricalDataClient(ALPACA_API_KEY, ALPACA_SECRET_KEY)
-
-    def _lookup(occ_symbols: list[str]) -> dict[str, "Quote | None"]:
-        if not occ_symbols:
-            return {}
-        try:
-            snapshot = data_client.get_option_snapshot(
-                OptionSnapshotRequest(symbol_or_symbols=occ_symbols)
-            )
-        except Exception as e:
-            logger.warning(f"OPRA snapshot batch failed: {e}")
-            return {occ: None for occ in occ_symbols}
-
-        out: dict[str, "Quote | None"] = {}
-        for occ in occ_symbols:
-            entry = snapshot.get(occ)
-            if entry is None or entry.latest_quote is None:
-                out[occ] = None
-                continue
-            q = entry.latest_quote
-            bid = float(q.bid_price)
-            ask = float(q.ask_price)
-            if bid <= 0 or ask <= 0:
-                out[occ] = None
-                continue
-            out[occ] = Quote(bid=bid, ask=ask)
-        return out
-
-    return _lookup
