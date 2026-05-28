@@ -758,12 +758,14 @@ class TestSweepBearSpreadExits:
 # ── Global counter ──────────────────────────────────────────────────────────
 
 
-class TestCountOpenCreditSpreads:
-    def test_counts_only_credit_spread_positions(self, tmp_path):
+class TestCountOpenSpreads:
+    def test_counts_every_spread_position_across_strategies(self, tmp_path):
         strategy = _strategy()
         engine, _ = _engine(tmp_path, strategy)
         from engine.positions import make_spread, make_single_leg, PositionLeg
         # Two credit spreads + one single-leg equity + one other spread.
+        # PLAN.md 11.31: all spread positions count toward the global MLEG
+        # concurrent total, regardless of which spread strategy owns them.
         for pid in ("cs-1", "cs-2"):
             engine._positions[pid] = make_spread(
                 strategy_name="credit_spread", position_id=pid,
@@ -776,7 +778,67 @@ class TestCountOpenCreditSpreads:
             strategy_name="some_other_spread_strat", position_id="other",
             legs=[PositionLeg("C", -1, side="SELL"), PositionLeg("D", 1, side="BUY")],
         )
-        assert engine._count_open_credit_spreads() == 2
+        assert engine._count_open_spreads() == 3
+
+
+# ── Spread strategy lookup (multi-MLEG ready) ───────────────────────────────
+
+
+class TestSpreadStrategyFor:
+    """PLAN.md 11.31 — _spread_strategy_for must duck-type on
+    build_spread_execution (not a hardcoded name) and disambiguate by
+    strategy_name when two spread strategies share an underlying.
+    """
+
+    def _stub_spread_strategy(self, name: str, symbols: tuple[str, ...]):
+        from strategies.base import BaseStrategy, StrategySlot
+        strategy = MagicMock(spec=BaseStrategy)
+        strategy.name = name
+        # build_spread_execution presence is the duck-type signal.
+        strategy.build_spread_execution = MagicMock()
+        slot = MagicMock(spec=StrategySlot)
+        slot.strategy = strategy
+        slot.active_symbols.return_value = list(symbols)
+        return strategy, slot
+
+    def test_resolves_by_duck_type_not_by_hardcoded_name(self, tmp_path):
+        strategy = _strategy()
+        engine, _ = _engine(tmp_path, strategy)
+        # A spread strategy with a non-credit_spread name still resolves.
+        future_strategy, future_slot = self._stub_spread_strategy(
+            "iron_condor", ("SPY",)
+        )
+        engine.slots = [future_slot]
+        assert engine._spread_strategy_for("SPY") is future_strategy
+
+    def test_disambiguates_by_strategy_name_when_supplied(self, tmp_path):
+        strategy = _strategy()
+        engine, _ = _engine(tmp_path, strategy)
+        cs_strat, cs_slot = self._stub_spread_strategy("credit_spread", ("SPY",))
+        ic_strat, ic_slot = self._stub_spread_strategy("iron_condor", ("SPY",))
+        engine.slots = [cs_slot, ic_slot]
+        # Both share SPY; the DB row's recorded strategy name picks the owner.
+        assert engine._spread_strategy_for(
+            "SPY", strategy_name="iron_condor"
+        ) is ic_strat
+        assert engine._spread_strategy_for(
+            "SPY", strategy_name="credit_spread"
+        ) is cs_strat
+
+    def test_skips_strategies_without_build_spread_execution(self, tmp_path):
+        from strategies.base import BaseStrategy, StrategySlot
+        strategy = _strategy()
+        engine, _ = _engine(tmp_path, strategy)
+        single_leg = MagicMock(spec=BaseStrategy)
+        single_leg.name = "sma_crossover"
+        # Force hasattr(strategy, "build_spread_execution") to be False on
+        # the MagicMock by deleting the auto-generated attribute.
+        del single_leg.build_spread_execution
+        slot = MagicMock(spec=StrategySlot)
+        slot.strategy = single_leg
+        slot.active_symbols.return_value = ["SPY"]
+        engine.slots = [slot]
+        assert engine._spread_strategy_for("SPY") is None
 
 
 # ── State-snapshot field ────────────────────────────────────────────────────
@@ -1044,7 +1106,7 @@ class TestRestoreSpreadPositions:
         # Engine built with an SMA-style strategy — no credit_spread slot.
         strategy = _strategy()
         engine, _ = _engine(tmp_path, strategy)
-        # Remove the credit_spread slot so _credit_spread_strategy_for finds none.
+        # Remove the credit_spread slot so _spread_strategy_for finds none.
         engine.slots = []
         self._log_open_spread(engine, "uuid-1")
         snapshot = _snapshot_with({_SHORT_OCC: object(), _LONG_OCC: object()})

@@ -90,9 +90,8 @@ from risk.manager import (
 from reporting.alerts import AlertDispatcher
 from reporting.logger import TradeLogger
 from reporting.pnl import PnLTracker
-from strategies.base import BaseStrategy, OrderType, StrategySlot
+from strategies.base import BaseStrategy, OptionTradeRejected, OrderType, StrategySlot
 from strategies.credit_spread import CreditSpreadRejected, OpenSpread
-from strategies.spy_options_reversion import OptionTradeRejected
 from utils.option_symbols import parse_occ_symbol
 
 from regime.detector import MarketRegime
@@ -2535,20 +2534,19 @@ class TradingEngine:
             return False
         return position is not None
 
-    def _count_open_credit_spreads(self) -> int:
+    def _count_open_spreads(self) -> int:
         """
-        Count open spread positions across ALL credit_spread instances — the
-        global ``MAX_TOTAL_CONCURRENT_CREDIT_SPREADS`` counter passed into
-        ``build_spread_execution``.
+        Count every tracked multi-leg position — the engine-wide MLEG
+        concurrency total passed into ``build_spread_execution`` as
+        ``total_open_credit_spreads``.
 
-        NOTE (PLAN.md 11.31): the ``"credit_spread"`` literal is correct while
-        that is the only multi-leg strategy. A second one would need this
-        filter generalized to the duck-typed ``build_spread_execution`` hook.
+        Generalized from the original ``"credit_spread"``-only check (PLAN.md
+        11.31): every spread strategy contributes to the same global total
+        because they all consume the same MLEG execution and buying-power
+        resources. A future spread strategy that wants its own independent
+        counter can introduce one alongside this.
         """
-        return sum(
-            1 for p in self._positions.values()
-            if p.is_spread and p.strategy_name == "credit_spread"
-        )
+        return sum(1 for p in self._positions.values() if p.is_spread)
 
     def _credit_spreads_snapshot(self) -> list[dict]:
         """
@@ -2691,7 +2689,7 @@ class TradingEngine:
             _done("No Signal")
             return
 
-        total_open = self._count_open_credit_spreads()
+        total_open = self._count_open_spreads()
         try:
             plan = strategy.build_spread_execution(
                 underlying_close,
@@ -3155,20 +3153,27 @@ class TradingEngine:
 
         return conflicts
 
-    def _credit_spread_strategy_for(self, underlying: str) -> BaseStrategy | None:
-        """The configured CreditSpread instance trading ``underlying``, if any.
+    def _spread_strategy_for(
+        self, underlying: str, *, strategy_name: str | None = None
+    ) -> BaseStrategy | None:
+        """The configured spread strategy that owns ``underlying``, if any.
 
-        NOTE (PLAN.md 11.31): the ``"credit_spread"`` name check is correct
-        while that is the only multi-leg strategy. A second one would need
-        this generalized so its restarted spreads also reconstruct.
+        Generalized from the original credit-spread-only lookup (PLAN.md
+        11.31). A slot qualifies when its strategy exposes the spread
+        dispatch hook (``build_spread_execution``) and lists ``underlying``
+        in its active symbols. When ``strategy_name`` is supplied (e.g. on
+        restart, where the DB row records which strategy owned the spread),
+        the match is narrowed to that exact strategy so a future second
+        spread strategy on the same underlying cannot accidentally claim
+        positions it did not open.
         """
         for slot in self.slots:
             strategy = slot.strategy
-            if (
-                strategy.name == "credit_spread"
-                and hasattr(strategy, "build_spread_execution")
-                and underlying in slot.active_symbols()
-            ):
+            if not hasattr(strategy, "build_spread_execution"):
+                continue
+            if strategy_name is not None and strategy.name != strategy_name:
+                continue
+            if underlying in slot.active_symbols():
                 return strategy
         return None
 
@@ -3225,12 +3230,14 @@ class TradingEngine:
                 spread_leg_occs.update(leg_symbols)
                 continue
 
-            strategy = self._credit_spread_strategy_for(underlying)
+            strategy = self._spread_strategy_for(
+                underlying, strategy_name=strategy_name
+            )
             if strategy is None:
                 logger.warning(
                     f"restart: spread {position_id[:8]} ({underlying}) has no "
-                    f"configured credit_spread strategy — declaring a conflict "
-                    "(RESTRICTED). Close it manually or restore the slot."
+                    f"configured spread strategy '{strategy_name}' — declaring a "
+                    "conflict (RESTRICTED). Close it manually or restore the slot."
                 )
                 conflicts.add(underlying)
                 spread_leg_occs.update(leg_symbols)

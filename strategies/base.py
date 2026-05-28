@@ -52,6 +52,15 @@ if TYPE_CHECKING:
 # ── Shared types ─────────────────────────────────────────────────────────────
 
 
+class OptionTradeRejected(ValueError):
+    """Expected option-entry veto raised by any options-buying strategy.
+
+    Lives here (not inside a specific strategy module) because the engine
+    catches it across strategies and a second options-buying strategy must
+    be able to raise the same type without importing from a sibling module.
+    """
+
+
 class OrderType(Enum):
     MARKET = "market"
     LIMIT = "limit"

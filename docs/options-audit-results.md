@@ -33,25 +33,16 @@ This addendum supersedes the priority matrix in the original document. Of the or
 
 ### A2 — Generalize the hardcoded `"credit_spread"` literals (PLAN.md 11.31)
 
-**Severity:** High — promoted from "deferred" because more MLEG strategies are planned, and each one will trip over this.
+**Status:** ✅ Shipped 2026-05-27 in PR [#27](https://github.com/francomarb/trading-bot/pull/27).
 
-**Verification:**
-- Hardcoded literal #1: [`engine/trader.py:2537`](engine/trader.py:2537), inside `_count_open_credit_spreads`, with NOTE comment at [`:2531`](engine/trader.py:2531).
-- Hardcoded literal #2: [`engine/trader.py:3103`](engine/trader.py:3103), inside `_credit_spread_strategy_for`, with NOTE comment at [`:3096`](engine/trader.py:3096).
-- The rest of the engine already dispatches MLEG behavior via duck-typing: `hasattr(strategy, "build_spread_execution")` (lines 1119, 2521) and `hasattr(strategy, "evaluate_spread_exit")` (lines 831, 930). Only the two paths above still gate on the literal.
+**Severity (original):** High — promoted from "deferred" because more MLEG strategies are planned, and each one would trip over this.
 
-**Fix:**
-1. Add an `is_spread_strategy: bool = False` class attribute (or property) on `BaseStrategy`, set `True` on `CreditSpread` and every future MLEG strategy. Alternative: duck-type via `hasattr(strategy, "build_spread_execution")`. Pick one and apply consistently — the existing engine already uses the `hasattr` form, so going that route is the smallest diff.
-2. `_count_open_credit_spreads` → rename to `_count_open_spreads` and count any `p.is_spread` position whose owner strategy is a spread strategy. Update its single caller (the global cap injected into `build_spread_execution`).
-3. `_credit_spread_strategy_for(underlying)` → rename to `_spread_strategy_for(underlying)` and match by `hasattr(strategy, "build_spread_execution")` (drop the name check). Audit its callers — restart-restore in particular ([`engine/trader.py:3163`](engine/trader.py:3163)) must still find the right owner for each spread.
-4. Audit `_spread_owner_strategy` and `_restore_spread_positions` paths for any other implicit single-strategy assumptions (e.g. iteration that assumes one spread type, log strings that hardcode "credit spread").
+**What landed:**
+- `_count_open_credit_spreads` → `_count_open_spreads`. Counts every `p.is_spread` position. All spread strategies now contribute to the same global MLEG concurrent total, which is the resource they actually share (execution slots, buying power).
+- `_credit_spread_strategy_for` → `_spread_strategy_for(underlying, *, strategy_name=None)`. Matches any slot whose strategy exposes `build_spread_execution`. The `strategy_name` argument is used by the restart path so the DB row's recorded strategy name disambiguates when two spread strategies cover the same underlying — preventing a second strategy from accidentally claiming the first's positions.
+- The kwarg `total_open_credit_spreads` on `CreditSpread.build_spread_execution` is **unchanged** — that's the strategy's contract. Generalize when strategy #2 lands. The `STRATEGY_WATCHLISTS` config literal is also unchanged — it's a config-shape concern, not engine plumbing.
 
-**Tests:**
-- A second mock spread strategy in the slot list — `_count_open_spreads` includes it, `_spread_strategy_for` resolves to the right instance per underlying.
-- Existing credit-spread tests still pass unchanged.
-- Restart-from-DB path: a synthetic open spread owned by a mock second strategy is correctly re-attached.
-
-**Coordinate with A5** — once `OptionTradeRejected` moves to a shared module, the same cleanup pass can update the spread literals.
+**Tests added (`TestSpreadStrategyFor`):** duck-type resolution against a non-`credit_spread` name; name disambiguation between two spread strategies on the same underlying; rejection of single-leg strategies (no `build_spread_execution`). Plus the renamed `TestCountOpenSpreads` proving every spread strategy contributes to the count.
 
 ---
 
@@ -116,15 +107,11 @@ Practical effect: if the first B-S value is below the real fill cost, the traili
 
 ### A6 — Move `OptionTradeRejected` out of `spy_options_reversion.py`
 
-**Severity:** Low standalone — but bundle with A2 since both target multi-strategy MLEG support.
+**Status:** ✅ Shipped 2026-05-27 in PR [#27](https://github.com/francomarb/trading-bot/pull/27).
 
-**Verification:**
-- Defined: [`strategies/spy_options_reversion.py:22`](strategies/spy_options_reversion.py:22).
-- Imported cross-module: [`engine/trader.py:95`](engine/trader.py:95), [`tests/test_engine.py:55`](tests/test_engine.py:55), [`tests/test_spy_options_reversion.py:163`](tests/test_spy_options_reversion.py:163).
+**Severity (original):** Low standalone — bundled with A2 since both target multi-strategy MLEG support.
 
-The engine importing an exception from a specific strategy module is a structural smell that becomes blocking when a second options-buying strategy ships and needs to raise the same expected-veto exception.
-
-**Fix:** move to `strategies/base.py` (or new `strategies/exceptions.py`); update the four import sites; re-export from `strategies.spy_options_reversion` for one cycle if any external code imports it (none in this repo). ~5 line change, no behavior change.
+**What landed:** `OptionTradeRejected` now lives in `strategies/base.py`. The engine and `tests/test_engine.py` import it from the canonical location. `strategies/spy_options_reversion.py` re-exports it via `__all__` so `from strategies.spy_options_reversion import OptionTradeRejected` continues to work — existing callers and `tests/test_spy_options_reversion.py` are unchanged.
 
 ---
 
