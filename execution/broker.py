@@ -350,7 +350,12 @@ class AlpacaBroker:
             lambda: self._api.get_orders(request),
             op_desc="get_orders(open)",
         )
-        return [self._to_open_order(o) for o in raw]
+        out: list[OpenOrder] = []
+        for order in raw:
+            projected = self._to_open_order(order)
+            if projected is not None:
+                out.append(projected)
+        return out
 
     def sync_with_broker(
         self, *, session_start_equity: float | None = None
@@ -1503,21 +1508,41 @@ class AlpacaBroker:
         return value
 
     @staticmethod
-    def _to_open_order(o) -> OpenOrder:
+    def _to_open_order(o) -> OpenOrder | None:
         # Handle both alpaca-py model objects and SimpleNamespace mocks.
         submitted = AlpacaBroker._parse_datetime(getattr(o, "submitted_at", None))
         if submitted is None:
             submitted = datetime.now(timezone.utc)
 
+        order_class = getattr(o, "order_class", None)
+        order_class_val = (
+            order_class.value if hasattr(order_class, "value") else str(order_class)
+            if order_class is not None else None
+        )
+
         # Extract raw string values from enums or plain strings.
-        side_val = o.side.value if hasattr(o.side, 'value') else str(o.side)
+        side_raw = getattr(o, "side", None)
+        symbol = getattr(o, "symbol", None)
+        if side_raw is None or symbol is None:
+            if order_class_val == "mleg":
+                logger.debug(
+                    "Skipping top-level MLEG parent order in open-order snapshot: "
+                    f"order_id={getattr(o, 'id', None)} side={side_raw!r} symbol={symbol!r}"
+                )
+                return None
+            raise ValueError(
+                f"open order {getattr(o, 'id', None)} missing required side/symbol "
+                f"(side={side_raw!r}, symbol={symbol!r})"
+            )
+
+        side_val = side_raw.value if hasattr(side_raw, 'value') else str(side_raw)
         type_val = o.type.value if hasattr(o.type, 'value') else str(o.type) if hasattr(o, 'type') and o.type else None
         status_val = o.status.value if hasattr(o.status, 'value') else str(o.status)
         order_id = str(o.id) if o.id is not None else None
 
         return OpenOrder(
             order_id=order_id,
-            symbol=o.symbol,
+            symbol=symbol,
             side=Side(side_val),
             qty=float(o.qty),
             order_type=OrderType(type_val) if type_val in {ot.value for ot in OrderType} else OrderType.MARKET,

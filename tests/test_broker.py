@@ -842,6 +842,38 @@ class TestReadSide:
         assert snap.open_orders[0].order_type is OrderType.LIMIT
         assert snap.open_orders[0].limit_price == 99.5
 
+    def test_sync_skips_top_level_mleg_parent_with_omitted_side_and_symbol(self):
+        api = MagicMock()
+        api.get_account.return_value = SimpleNamespace(equity="100000", cash="50000")
+        api.get_all_positions.return_value = []
+        api.get_orders.return_value = [
+            SimpleNamespace(
+                id="mleg-parent",
+                symbol=None,
+                side=None,
+                qty="1",
+                type="limit",
+                order_class="mleg",
+                status="new",
+                limit_price="-1.42",
+                stop_price=None,
+                submitted_at="2026-05-15T13:50:39Z",
+            ),
+            SimpleNamespace(
+                id="o1",
+                symbol="AAPL",
+                side="buy",
+                qty="1",
+                type="limit",
+                status="open",
+                limit_price="99.5",
+                stop_price=None,
+                submitted_at="2026-04-15T14:30:00Z",
+            ),
+        ]
+        snap = _broker_with_mock(api).sync_with_broker(session_start_equity=99_000.0)
+        assert [o.order_id for o in snap.open_orders] == ["o1"]
+
     def test_get_account_defaults_session_start_to_current_equity(self):
         api = MagicMock()
         api.get_account.return_value = SimpleNamespace(
