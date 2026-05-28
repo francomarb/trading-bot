@@ -182,8 +182,16 @@ def find_best_call(
     if not by_expiry:
         return None
 
-    expirations = sorted(list(by_expiry.keys()))
-    best_expiry = expirations[0]
+    # Pick the expiration closest to the DTE-window midpoint — mirrors
+    # find_best_put_spread. Earlier this took the nearest expiration, which
+    # for SPY (multiple weeklies in the 14–28 DTE window) systematically
+    # biased toward shorter DTE even when a slightly longer one had a
+    # tighter spread or better delta profile.
+    target_dte = (min_dte + max_dte) / 2.0
+    best_expiry = min(
+        by_expiry.keys(),
+        key=lambda exp: abs((exp - now).days - target_dte),
+    )
     expiry_contracts = by_expiry[best_expiry]
 
     # Cap quote fetches: pick the K closest-strike candidates for this

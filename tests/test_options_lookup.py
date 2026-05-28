@@ -258,6 +258,44 @@ class TestFindBestCall:
         # Two surviving runners-up after the winner.
         assert len(pick.runners_up) == 2
 
+    def test_picks_expiration_closest_to_dte_midpoint(self):
+        """A4 — with two expirations in the DTE window, the picker selects
+        the one whose DTE is closest to the (min_dte + max_dte) / 2 midpoint
+        instead of always taking the nearest expiration. Mirrors
+        find_best_put_spread's midpoint selection.
+        """
+        today = date.today()
+        # min_dte=14, max_dte=28 → midpoint 21. Place expirations at +15 and
+        # +21 days. The earlier expiry (15d) would win under the old
+        # "nearest" rule; the new rule prefers +21d (exactly the midpoint).
+        near_expiry = today + timedelta(days=15)
+        mid_expiry = today + timedelta(days=21)
+        response = SimpleNamespace(
+            option_contracts=[
+                _contract("SPY-NEAR-C00735000", near_expiry, 735.0),
+                _contract("SPY-MID-C00735000", mid_expiry, 735.0),
+            ],
+            next_page_token=None,
+        )
+        client = MagicMock()
+        client.get_option_contracts.return_value = response
+        quote_lookup = _quotes({
+            "SPY-NEAR-C00735000": Quote(bid=5.00, ask=5.05),
+            "SPY-MID-C00735000": Quote(bid=5.00, ask=5.05),
+        })
+
+        with patch("utils.options_lookup._get_client", return_value=client):
+            pick = find_best_call(
+                "SPY", 736.94,
+                min_dte=14, max_dte=28,
+                max_premium_per_contract=2_000.0,
+                quote_lookup=quote_lookup,
+            )
+
+        assert pick is not None
+        # The midpoint-DTE expiration is chosen over the nearer one.
+        assert pick.occ_symbol == "SPY-MID-C00735000"
+
 
 # ── estimate_put_delta (11.28) ──────────────────────────────────────────────
 
