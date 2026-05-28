@@ -181,6 +181,72 @@ class TestBuildOptionExecution:
                 "SPY", 733.71, notional_cap=0.0,
             )
 
+    def test_uses_injected_quote_lookup(self):
+        """A5 — when an explicit quote_lookup is injected at construction,
+        build_option_execution passes it through to the picker without
+        instantiating a production OptionHistoricalDataClient."""
+        from utils.options_lookup import ContractPick
+
+        injected_lookup = MagicMock(name="injected_quote_lookup")
+        strat = SPYOptionsReversionStrategy(quote_lookup=injected_lookup)
+        pick = ContractPick(
+            occ_symbol="SPY260521C00730000",
+            premium=4.90,
+            spread_pct=0.04,
+            score=0.85,
+            components={
+                "strike_proximity": 1.0,
+                "spread_quality": 0.20,
+                "premium_efficiency": 0.85,
+            },
+            runners_up=[],
+        )
+
+        with patch(
+            "strategies.spy_options_reversion.find_best_call",
+            return_value=pick,
+        ) as mock_picker, patch(
+            "strategies.spy_options_reversion._build_quote_lookup"
+        ) as mock_builder:
+            strat.build_option_execution("SPY", 733.71, notional_cap=2_000.0)
+
+        # The injected lookup is used directly; the production builder is not called.
+        assert mock_picker.call_args.kwargs["quote_lookup"] is injected_lookup
+        mock_builder.assert_not_called()
+
+    def test_lazy_default_quote_lookup_built_once_and_cached(self):
+        """A5 — without an injection, the production lookup is built once on
+        first use and reused on subsequent calls (was: rebuilt every call)."""
+        from utils.options_lookup import ContractPick
+
+        strat = SPYOptionsReversionStrategy()  # no injection
+        pick = ContractPick(
+            occ_symbol="SPY260521C00730000",
+            premium=4.90,
+            spread_pct=0.04,
+            score=0.85,
+            components={
+                "strike_proximity": 1.0,
+                "spread_quality": 0.20,
+                "premium_efficiency": 0.85,
+            },
+            runners_up=[],
+        )
+        sentinel_lookup = MagicMock(name="sentinel_quote_lookup")
+
+        with patch(
+            "strategies.spy_options_reversion.find_best_call",
+            return_value=pick,
+        ), patch(
+            "strategies.spy_options_reversion._build_quote_lookup",
+            return_value=sentinel_lookup,
+        ) as mock_builder:
+            strat.build_option_execution("SPY", 733.71, notional_cap=2_000.0)
+            strat.build_option_execution("SPY", 733.71, notional_cap=2_000.0)
+
+        mock_builder.assert_called_once()
+        assert strat._quote_lookup is sentinel_lookup
+
 
 # ── inspect_open_positions: time stop ─────────────────────────────────────────
 

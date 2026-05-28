@@ -35,6 +35,7 @@ class SPYOptionsReversionStrategy(BaseStrategy):
         trail_activation_pct: float = 0.10,
         trail_pct: float = 0.15,
         edge_filter=None,
+        quote_lookup=None,
     ):
         super().__init__(edge_filter=edge_filter)
         self.rsi_length = rsi_length
@@ -47,6 +48,12 @@ class SPYOptionsReversionStrategy(BaseStrategy):
         # Trailing stop state keyed by OCC symbol.
         self._position_hwm: dict[str, float] = {}   # OCC → highest B-S value observed
         self._position_base: dict[str, float] = {}  # OCC → first B-S value observed
+        # Quote lookup: a callable resolving OCC symbols to live quotes.
+        # Production wires this once at startup (the engine builds a shared
+        # OptionHistoricalDataClient and passes it in). Tests inject stubs.
+        # Lazy default — only built on first use so importing the module
+        # doesn't require Alpaca credentials to be present.
+        self._quote_lookup = quote_lookup
 
     def required_bars(self) -> int:
         return self.rsi_length + 5
@@ -220,7 +227,12 @@ class SPYOptionsReversionStrategy(BaseStrategy):
         # the ranker compares mid*100 (per-contract cost) against this same
         # dollar figure. No /100 conversion — see docstring.
         max_premium_per_contract = notional_cap
-        quote_lookup = _build_quote_lookup()
+
+        if self._quote_lookup is None:
+            # Lazy production default — build once on first use and reuse
+            # across subsequent entries (one OptionHistoricalDataClient
+            # instead of one per signal bar).
+            self._quote_lookup = _build_quote_lookup()
 
         pick: ContractPick | None = find_best_call(
             symbol,
@@ -229,7 +241,7 @@ class SPYOptionsReversionStrategy(BaseStrategy):
             max_dte=28,
             target_delta=0.55,
             max_premium_per_contract=max_premium_per_contract,
-            quote_lookup=quote_lookup,
+            quote_lookup=self._quote_lookup,
         )
         if pick is None:
             raise OptionTradeRejected(
