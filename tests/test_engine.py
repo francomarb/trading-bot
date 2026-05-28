@@ -2417,6 +2417,40 @@ class TestOptionsEngineFixes:
         assert not engine._has_position("SPY")
         assert "SPY" not in engine._entry_prices
 
+    def test_drain_option_filled_calls_register_fill_on_strategy(self, tmp_path):
+        """A3 — confirmed BUY fill must anchor the strategy's trailing-stop base
+        via register_fill(occ, avg_fill_price)."""
+        from strategies.base import StrategySlot
+
+        engine = self._engine(tmp_path)
+        occ = "SPY260516C00520000"
+        # Swap the default FakeStrategy slot for one that owns the SPY options
+        # strategy name and exposes register_fill — so _strategy_by_name finds it.
+        strat_mock = MagicMock()
+        strat_mock.name = "spy_options_reversion"
+        engine.slots = [StrategySlot(strategy=strat_mock, symbols=["SPY"])]
+        engine._register_single_leg(strategy_name="spy_options_reversion", symbol="SPY")
+        engine.broker.drain_option_fills = MagicMock(return_value=[
+            (
+                SimpleNamespace(
+                    symbol=occ,
+                    qty=3,
+                    entry_reference_price=12.15,
+                    strategy_name="spy_options_reversion",
+                ),
+                "filled",
+                3.0,
+                12.40,  # actual fill premium
+                "opt-spy_options_reversion-fill",
+            )
+        ])
+
+        engine._drain_option_fills()
+
+        strat_mock.register_fill.assert_called_once_with(occ, 12.40)
+        # Entry price tracking continues to use the fill price as before.
+        assert engine._entry_prices.get("SPY") == 12.40
+
     # Fix 3: slippage not recorded for options exits ──────────────────────────
 
     def test_slippage_not_recorded_for_options_exit(self, tmp_path):
