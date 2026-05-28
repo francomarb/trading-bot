@@ -459,6 +459,77 @@ class TestTrailingStop:
         assert sym not in strat._position_base
 
 
+# ── register_fill: trailing-stop base anchored to fill premium ───────────────
+
+class TestRegisterFill:
+    """A3 — register_fill anchors _position_base to the actual fill premium
+    so the trailing-stop activation threshold is measured against true cost
+    basis, not the first Black-Scholes valuation."""
+
+    def _strat(self) -> SPYOptionsReversionStrategy:
+        s = SPYOptionsReversionStrategy(trail_activation_pct=0.10, trail_pct=0.15)
+        s._vix_date = date.today()
+        s._vix_sigma = 0.18
+        return s
+
+    def test_anchors_base_and_hwm_to_premium(self):
+        strat = self._strat()
+        strat.register_fill("SPY260618C00520000", 4.20)
+        assert strat._position_base["SPY260618C00520000"] == 4.20
+        assert strat._position_hwm["SPY260618C00520000"] == 4.20
+
+    def test_preserves_higher_hwm_already_observed(self):
+        # Race: inspect_open_positions already saw a higher B-S value before
+        # the fill confirmation arrived. The higher HWM must be preserved so
+        # the trail floor doesn't regress.
+        strat = self._strat()
+        strat._position_hwm["SPY260618C00520000"] = 5.10
+        strat.register_fill("SPY260618C00520000", 4.20)
+        assert strat._position_base["SPY260618C00520000"] == 4.20
+        assert strat._position_hwm["SPY260618C00520000"] == 5.10
+
+    def test_ignores_invalid_premium(self):
+        strat = self._strat()
+        strat.register_fill("SPY260618C00520000", 0.0)
+        strat.register_fill("SPY260618C00520000", -1.0)
+        strat.register_fill("SPY260618C00520000", None)  # type: ignore[arg-type]
+        assert "SPY260618C00520000" not in strat._position_base
+        assert "SPY260618C00520000" not in strat._position_hwm
+
+    def test_anchored_base_overrides_lazy_first_bs_seeding(self):
+        # End-to-end: with register_fill called before the first cycle, the
+        # activation threshold is anchored to the fill premium — not the
+        # B-S value observed on cycle 1.
+        expiry = date.today() + timedelta(days=14)
+        while expiry.weekday() != 4:
+            expiry += timedelta(days=1)
+        sym = _occ("SPY", expiry, "C", 520.0)
+        monday = expiry - timedelta(days=4)
+        now_et = datetime.combine(
+            monday, datetime.min.time().replace(hour=10), tzinfo=_ET
+        )
+        strat = self._strat()
+        # Real fill at $4.00 — anchor the base.
+        strat.register_fill(sym, 4.00)
+
+        # Cycle 1: B-S happens to value at $5.00 (underlying moved post-fill).
+        # Without register_fill, base would be lazily set to 5.00 here and
+        # the trail wouldn't activate until 5.50. With register_fill, base
+        # stays at 4.00 and the trail activates at 4.40.
+        import sys, unittest.mock as _mock
+        fake_bs = _mock.MagicMock()
+        call_obj = fake_bs.BlackScholesCall.return_value
+        call_obj.delta.return_value = 0.55
+        call_obj.price = 5.00
+        sys.modules["blackscholes"] = fake_bs
+        with patch("strategies.spy_options_reversion.datetime") as mock_dt:
+            mock_dt.now.side_effect = lambda tz=None: now_et if tz == _ET else datetime.now(timezone.utc)
+            mock_dt.combine = datetime.combine
+            mock_dt.strptime = datetime.strptime
+            strat.inspect_open_positions(_position(sym), 520.0)
+        assert strat._position_base[sym] == 4.00  # not overwritten by 5.00
+
+
 # ── VIX cache ─────────────────────────────────────────────────────────────────
 
 class TestVixCache:

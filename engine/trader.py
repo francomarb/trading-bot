@@ -2379,6 +2379,21 @@ class TradingEngine:
                 if underlying != decision.symbol and avg_fill_price:
                     if underlying in self._positions:
                         self._entry_prices[underlying] = avg_fill_price
+                    # A3: anchor the strategy's trailing-stop base to the
+                    # confirmed fill premium so the activation threshold is
+                    # measured against actual cost basis, not the first
+                    # Black-Scholes valuation. Opt-in via register_fill so
+                    # strategies without trailing logic are unaffected.
+                    strategy = self._strategy_by_name(decision.strategy_name)
+                    register_fill = getattr(strategy, "register_fill", None)
+                    if register_fill is not None and avg_fill_price:
+                        try:
+                            register_fill(decision.symbol, float(avg_fill_price))
+                        except Exception as e:
+                            logger.warning(
+                                f"[{decision.strategy_name}] register_fill failed "
+                                f"for {decision.symbol}: {e}"
+                            )
                 self.alerts.trade_executed(
                     symbol=decision.symbol,
                     strategy=decision.strategy_name,
@@ -2510,6 +2525,17 @@ class TradingEngine:
             self._pop_position(symbol)
             self._entry_prices.pop(symbol, None)
         return True
+
+    def _strategy_by_name(self, name: str) -> BaseStrategy | None:
+        """Resolve a configured strategy instance from its ``name``.
+
+        Returns ``None`` if no slot is configured with that name (e.g. the
+        slot was removed but a previously-dispatched fill still drains).
+        """
+        for slot in self.slots:
+            if slot.strategy.name == name:
+                return slot.strategy
+        return None
 
     # ── Credit-spread entry / drain / exit (11.29 PR 3b) ─────────────────
 

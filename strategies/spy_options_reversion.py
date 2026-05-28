@@ -49,6 +49,30 @@ class SPYOptionsReversionStrategy(BaseStrategy):
     def required_bars(self) -> int:
         return self.rsi_length + 5
 
+    def register_fill(self, occ: str, fill_premium: float) -> None:
+        """Anchor the trailing-stop activation base to the actual fill premium.
+
+        Called by the engine on a confirmed option-buy fill. Without this
+        hook, ``_position_base`` is seeded lazily from the first
+        ``inspect_open_positions`` Black-Scholes valuation, which can drift
+        from real cost basis whenever (a) the underlying has moved between
+        fill and the first cycle, or (b) the daily-cached VIX sigma differs
+        from intraday IV. The trailing-stop activation threshold reads off
+        ``_position_base``, so an inaccurate base shifts when the trail
+        engages relative to the position's true entry cost.
+
+        Idempotent w.r.t. ``_position_hwm``: if a value has already been
+        observed (race with the first cycle), the higher of fill premium or
+        existing HWM is kept. Restored positions (engine restart) never
+        receive this call; they fall back to the lazy seeding path.
+        """
+        if fill_premium is None or fill_premium <= 0:
+            return
+        self._position_base[occ] = fill_premium
+        self._position_hwm[occ] = max(
+            self._position_hwm.get(occ, fill_premium), fill_premium
+        )
+
     # ── Signal generation ────────────────────────────────────────────────────
 
     def _raw_signals(self, df: pd.DataFrame) -> SignalFrame:
