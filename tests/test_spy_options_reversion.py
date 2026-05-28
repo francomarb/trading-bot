@@ -452,6 +452,24 @@ class TestDeltaFloor:
         # exactly 0.30 should NOT trigger (condition is strict <)
         assert not self._run(strat, sym, 520.0, 0.30)
 
+    def test_supports_blackscholes_price_method(self):
+        strat = self._strat_with_cached_vix()
+        sym, now_et = self._safe_time_sym()
+        pos = _position(sym)
+        import unittest.mock as _mock
+
+        fake_bs = _mock.MagicMock()
+        call_obj = fake_bs.BlackScholesCall.return_value
+        call_obj.delta.return_value = 0.55
+        call_obj.price.return_value = 10.0
+        sys.modules["blackscholes"] = fake_bs
+
+        with patch("strategies.spy_options_reversion.datetime") as mock_dt:
+            mock_dt.now.side_effect = lambda tz=None: now_et if tz == _ET else datetime.now(timezone.utc)
+            mock_dt.combine = datetime.combine
+            mock_dt.strptime = datetime.strptime
+            assert not strat.inspect_open_positions(pos, 520.0)
+
 
 # ── inspect_open_positions: trailing stop ────────────────────────────────────
 

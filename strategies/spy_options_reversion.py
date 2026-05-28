@@ -22,6 +22,12 @@ _OCC_RE = re.compile(r"^([A-Z]+)(\d{6})([CP])(\d{8})$")
 __all__ = ["OptionTradeRejected", "SPYOptionsConfig", "SPYOptionsReversionStrategy"]
 
 
+def _coerce_numeric(value_or_callable) -> float:
+    """Return a float from a numeric attribute or a zero-arg pricing method."""
+    value = value_or_callable() if callable(value_or_callable) else value_or_callable
+    return float(value)
+
+
 @dataclass(frozen=True)
 class SPYOptionsConfig:
     """Tunables for the single-leg SPY call reversion strategy."""
@@ -178,7 +184,7 @@ class SPYOptionsReversionStrategy(BaseStrategy):
                 S=latest_close, K=strike, T=T, r=cfg.risk_free_rate, sigma=sigma
             )
             delta = call.delta()
-            opt_val = float(call.price)
+            opt_val = _coerce_numeric(call.price)
 
             logger.debug(
                 f"[{self.name}] {occ} Delta={delta:.3f} price={opt_val:.2f} "
