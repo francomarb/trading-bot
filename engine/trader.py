@@ -649,6 +649,15 @@ class TradingEngine:
                         )
                         current_regime = MarketRegime.RANGING
 
+            # BEAR defensive sweep — runs at cycle level so the override is
+            # never gated by per-symbol bar fetch failures, stale-data
+            # rejections, or empty decision frames. The slot loop below
+            # may still try the BEAR override per-symbol, but those calls
+            # become no-ops via _spreads_pending_close after the sweep
+            # already dispatched the close.
+            if current_regime is MarketRegime.BEAR:
+                self._sweep_bear_spread_exits()
+
             # Order attribution — computed once per cycle for sleeve accounting.
             # Maps order_id → strategy_name for pending buy entries using
             # watchlist membership. Used by SleeveAllocator to count open
@@ -704,6 +713,7 @@ class TradingEngine:
                                 if current_regime is not None and slot.allowed_regimes is not None and not entry_allowed
                                 else None
                             ),
+                            current_regime=current_regime,
                             order_strategy=order_strategy,
                             strategy_statuses=strategy_statuses,
                             strategy_reasons=strategy_reasons,
@@ -769,6 +779,7 @@ class TradingEngine:
         market_open: bool | None = None,
         entry_allowed: bool = True,
         regime_block_reason: str | None = None,
+        current_regime: MarketRegime | None = None,
         order_strategy: dict[str, str] | None = None,
         strategy_statuses: dict[str, str] | None = None,
         strategy_reasons: dict[str, list[str]] | None = None,
@@ -833,6 +844,7 @@ class TradingEngine:
                     strategy=strategy,
                     underlying=symbol,
                     underlying_close=latest_close,
+                    current_regime=current_regime,
                 )
             else:
                 position = self._get_position_for(symbol, snapshot)
@@ -932,6 +944,7 @@ class TradingEngine:
                 strategy=strategy,
                 underlying=symbol,
                 underlying_close=latest_close,
+                current_regime=current_regime,
             )
 
         # 5. Exit branch — close before considering entries (always safe to
@@ -2920,39 +2933,91 @@ class TradingEngine:
                     f"position_id={position_id[:8]} still open, will retry"
                 )
 
+    def _sweep_bear_spread_exits(self) -> None:
+        """Cycle-level defensive close of every open spread when the regime
+        is BEAR.
+
+        Runs once per cycle, before ``_process_symbol``, so the override is
+        not gated by per-symbol data paths (bar fetch failure, stale-data
+        rejection, empty decision frame). The BEAR short-circuit in
+        ``_process_credit_spread_exits`` already skips the quote lookup and
+        ``evaluate_spread_exit`` — ``underlying_close`` is therefore unused
+        on this path and a sentinel ``0.0`` is passed.
+
+        Idempotent: positions already in ``_spreads_pending_close`` (from a
+        prior cycle or another caller in the same cycle) are skipped, so any
+        subsequent per-symbol invocation in the slot loop is a no-op.
+        """
+        for slot in self.slots:
+            strategy = slot.strategy
+            if not hasattr(strategy, "evaluate_spread_exit"):
+                continue
+            open_spreads = getattr(strategy, "open_spreads", None)
+            if not open_spreads:
+                continue
+            underlying = getattr(getattr(strategy, "config", None), "symbol", "?")
+            try:
+                self._process_credit_spread_exits(
+                    strategy=strategy,
+                    underlying=underlying,
+                    underlying_close=0.0,
+                    current_regime=MarketRegime.BEAR,
+                )
+            except Exception as e:
+                logger.error(
+                    f"[{strategy.name}] BEAR sweep failed for {underlying}: {e}"
+                )
+
     def _process_credit_spread_exits(
         self,
         *,
         strategy: BaseStrategy,
         underlying: str,
         underlying_close: float,
+        current_regime: MarketRegime | None = None,
     ) -> None:
         """
         Evaluate exit triggers for every open spread this strategy holds and
         dispatch a closing MLEG combo for any that fire. A position with a
         close already in flight (``_spreads_pending_close``) is skipped so a
         stale signal cannot double-submit.
+
+        When ``current_regime`` is ``BEAR`` the engine short-circuits to a
+        defensive close for every open spread (docs/credit_spread_strategy.md
+        — "Regime exit | Regime shifts to BEAR mid-trade | Defensive
+        override"). The override deliberately skips the strategy's quote-driven
+        ``evaluate_spread_exit`` so a quote outage cannot suppress the
+        defensive exit; ``limit_price`` falls back to the spread width, the
+        same marketable debit used elsewhere when no mid is available.
         """
         open_spreads = getattr(strategy, "open_spreads", [])
         if not open_spreads:
             return
+        bear_override = current_regime is MarketRegime.BEAR
         today = self._clock().date()
         for open_spread in list(open_spreads):
             position_id = open_spread.position_id
             if position_id in self._spreads_pending_close:
                 continue
-            try:
-                should_exit, reason, spread_mid = strategy.evaluate_spread_exit(
-                    open_spread,
-                    underlying_close=underlying_close,
-                    today=today,
+            if bear_override:
+                should_exit, reason, spread_mid = (
+                    True,
+                    "regime shift to BEAR — defensive override",
+                    None,
                 )
-            except Exception as e:
-                logger.error(
-                    f"[{strategy.name}] {underlying}: evaluate_spread_exit failed "
-                    f"for {position_id[:8]}: {e}"
-                )
-                continue
+            else:
+                try:
+                    should_exit, reason, spread_mid = strategy.evaluate_spread_exit(
+                        open_spread,
+                        underlying_close=underlying_close,
+                        today=today,
+                    )
+                except Exception as e:
+                    logger.error(
+                        f"[{strategy.name}] {underlying}: evaluate_spread_exit failed "
+                        f"for {position_id[:8]}: {e}"
+                    )
+                    continue
             if not should_exit:
                 continue
 
