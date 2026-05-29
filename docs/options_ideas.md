@@ -83,7 +83,7 @@ included for completeness with deeper takes.
 | **Covered calls** on existing equity | Income on long book (#1) | Single-leg path exists; needs assignment handling |
 | **Cash-secured puts** on ai_bigtech | Acquisition discount (#2) + income | Single-leg path exists; needs cash-reserve + assignment-to-equity |
 | **Wheel** (CSP → assigned → CC → assigned away → CSP …) | (#1) + (#2) combined | Composition of CSP + CC; needs state machine across the cycle |
-| **Iron Condor** (add bear call leg to credit spread) | Downside premium (#5) | Engine MLEG path is leg-count-agnostic; trivial extension |
+| **Iron Condor** (add bear call leg to credit spread) | Downside premium (#5) | Execution path reusable; lifecycle and attribution work still required (see Tier 2 B) |
 | **Jade Lizard** (short put + bear call spread; no upside risk) | (#5) + higher credit than IC | Sits on top of IC infrastructure; net premium ≥ call-spread width = no upside risk |
 | **Iron Butterfly** | Narrower IC, higher max profit, lower P(win) | Same as IC mechanically; just strike selection |
 | **Short strangle** (uncovered) | High premium | Skipped — undefined risk violates project stance |
@@ -93,7 +93,7 @@ included for completeness with deeper takes.
 | Strategy | Fills which gap | Architecture fit |
 |---|---|---|
 | **Long calls** (current `spy_options_reversion`) | — | Already in place |
-| **Bull call debit spread** (cap the long call) | Cheaper directional, defined max loss | Trivial refactor of `spy_options_reversion` when IV rich |
+| **Bull call debit spread** (cap the long call) | Cheaper directional, defined max loss | Execution path reusable via MLEG; new strategy class needed for clean Health attribution (see Tier 2 C) |
 | **Long straddle / strangle** around earnings | Long vol (#3) | Needs earnings calendar (RSI filter has one); but systematic earnings-vol edge is weak |
 
 ### Calendar / term structure
@@ -133,12 +133,15 @@ complexity.
 | Options single-leg | $4,000 | CSP cash-secure strike ≤ $40 |
 
 ### ai_bigtech reality
-Approximate share prices in the bot's primary equity universe: AAPL ~$200,
-MSFT ~$400, NVDA $400+, META $500+, GOOGL ~$170, AMD ~$140, AMZN ~$180. **No
+Approximate share prices in the bot's primary equity universe **as of
+2026-05-29 (snapshot — refresh before any decision):** AAPL ~$200, MSFT
+~$400, NVDA $400+, META $500+, GOOGL ~$170, AMD ~$140, AMZN ~$180. **No
 ai_bigtech name supports a single CC contract under current per-position
 budgets**, and CSP on these strikes would consume multiple sleeves' worth of
 cash secured per contract. Donchian/SMA positions today are 15–40 shares per
-name, not 100.
+name, not 100. The specific prices will drift over time; the durable rule
+is the budget math (per-position budget ÷ 100 = max underlying price for
+single-contract feasibility), not the snapshot itself.
 
 ### What this implies
 - **Covered calls and the wheel are not addable at current capital.** They're
@@ -197,6 +200,16 @@ flipping based on whether the strategy is short or long premium.
    `utils/iv_proxy.py`. Zero strategy dependencies. Daily-cached, same
    pattern as the existing sector resolver. **No paper-watch wait** — this
    can land anytime.
+
+   *Naming note:* keep "IV Rank" as the conceptual name (it's standard
+   practitioner usage), but the v1 implementation computes rank against
+   an **index-level IV proxy** (VIX for SPY, RVX for QQQ), not
+   chain-derived single-name IV. This is the right metric for SPY/QQQ
+   strategies — by construction, VIX *is* SPY's IV. It would be a weak
+   proxy for single-name strategies (e.g. a future AAPL CSP) where
+   earnings-event IV diverges sharply from the index. The utility should
+   document this limitation; true single-name IVR is a separate
+   future-work item that requires fetching option-chain IV history.
 
 2. **First application — credit spread filter.** New filter in
    `strategies/filters/credit_spread.py` consuming the utility. Three
@@ -278,6 +291,23 @@ the engine is already strategy-name-agnostic and leg-count-agnostic.
 - **Architecture decision:** new strategy class per §6 Q5 decision, sharing
   execution machinery with `CreditSpread` via the post-11.31 MLEG path. Not
   a config mode on the existing class.
+- **Lifecycle work that's *not* free** (correcting earlier "trivial
+  extension" framing): order submission via the MLEG path is reusable, but
+  each new MLEG strategy still needs its own:
+  - Restart reconciliation parallel (credit spread's `_restore_spread_positions`
+    pattern, verified for the new strategy's leg structure).
+  - Spread valuation and mark sources (PLAN 11.39's `multi_leg_positions`
+    snapshot extended to the new structure).
+  - Close retry behavior (PLAN 11.41 is an open follow-up for credit spread
+    close tuning; a new strategy inherits the same problem).
+  - Slippage attribution (PLAN 11.42 just shipped for credit spread; the
+    new strategy needs the same plumbing wired through).
+  - Strategy Health thresholds and verdict attribution.
+  - Dashboard state for the new structure.
+
+  None of these are blockers, but together they make any new MLEG
+  strategy a real piece of work — the equivalent of ~30–50% of the credit
+  spread integration, not a few-hour extension.
 - **Capital implication:** no new sleeve. Same max loss per position; just
   more credit collected when both legs are active.
 - **Gating:** 11.30 paper-watch on the bull put. If puts ride to 50% profit
@@ -286,7 +316,7 @@ the engine is already strategy-name-agnostic and leg-count-agnostic.
   IC doubles the whipsaw — IVR filter (Tier 1 #A) probably needs to land
   first.
 
-#### C. Convert SPY Options Reversion to bull call debit spread when IV is rich
+#### C. SPY Options debit-spread variant (new class, IV-rank-gated)
 Today `spy_options_reversion` buys naked SPY calls. In rich-IV regimes, the
 premium paid for that long call eats a meaningful chunk of the directional
 edge. A bull call debit spread caps upside but cuts cost and IV exposure.
@@ -294,12 +324,26 @@ edge. A bull call debit spread caps upside but cuts cost and IV exposure.
 - **Why:** the strategy's edge is directional (RSI recovery), not vol. Paying
   vol-rich premium for delta exposure is a leak. A debit spread keeps the
   delta exposure while shedding the vega.
-- **Architecture:** uses the existing MLEG path. Strategy gains a structure
-  toggle (`structure: "long_call" | "bull_call_spread"`) gated on IV rank.
+- **Architecture:** **new strategy class** (e.g. `SPYOptionsDebitSpread`),
+  not a config toggle on `spy_options_reversion`. This is enforced by §6 Q5
+  — toggles muddle Health attribution exactly when the two structures have
+  different risk profiles, fill behavior, and P&L distributions. The new
+  class shares the MLEG execution path with credit spread but gets its own
+  Health verdict, slippage tracking, and dashboard state. Same lifecycle
+  work as listed in Tier 2 #B applies — execution path reusable, lifecycle
+  and attribution not free.
+- **Trigger:** IV Rank (Tier 1 #A) gates which strategy class is active per
+  cycle. When IVR ≥ threshold → `SPYOptionsDebitSpread` fires; when IVR <
+  threshold → original `spy_options_reversion` fires. Mutually exclusive
+  by IVR — never both on the same signal.
 - **Capital implication:** lower per-trade premium → potentially more
   concurrent trades within the same sleeve, or smaller sleeve usage.
+  Shares the 5% options sleeve with `spy_options_reversion` (never run
+  simultaneously).
 - **Gating:** 11.30-equivalent paper-watch on existing long-call performance
-  vs. modeled spread performance. If long-call is fine, this is overengineering.
+  vs. modeled spread performance — needs evidence that long calls are
+  actually leaking edge in rich-IV regimes. If long-call is fine across
+  IVR regimes, this is overengineering.
 
 ---
 
@@ -335,11 +379,30 @@ idles.
     the front leg expiring worthless while the back leg retains time
     value. Closing at 5 DTE cuts before max theta extraction. Acceptable v1
     cost for an order-of-magnitude reduction in architectural lift.
-- **Realistic effort under the v1 simplification:** medium, comparable to
-  Iron Condor — new strategy class, same MLEG path, slightly different
-  entry signal (low IVR + ranging regime). The high-effort version is
-  available later if the v1 proves out and you want to capture more of
-  the natural P&L curve.
+- **Hard prerequisite even for v1:** the existing MLEG position model and
+  valuation paths assume same-expiry legs (both credit-spread legs share
+  one expiration, so DTE, distance-to-strike, and close construction all
+  collapse to a single date). Calendar — even with the close-as-unit
+  rule — needs:
+  - Per-leg expiration on the position model (the `Position` abstraction
+    needs to carry leg-level expiration rather than a single position-level
+    DTE).
+  - Unequal-expiry valuation (front-leg mark + back-leg mark, each
+    against its own expiration).
+  - Per-leg DTE calculations against the front leg specifically (close
+    triggers fire on front-leg DTE, not the back's).
+  - Close-order construction across two different expirations (the broker
+    accepts this; the engine's combo construction needs to support it).
+
+  Until that position-model extension lands, calendar is not addable. The
+  extension is independently useful (PMCC, diagonals, future calendar
+  refinements all depend on it) but it's real work — call it 2–3 weeks
+  before any calendar strategy work can start.
+- **Realistic effort under the v1 simplification, after the prerequisite
+  lands:** medium, comparable to Iron Condor — new strategy class, same
+  MLEG path (now per-leg-expiration aware), entry signal (low IVR +
+  ranging regime). The high-effort version is available later if the v1
+  proves out and you want to capture more of the natural P&L curve.
 - **Worth it only if:** the operator wants the options sleeve to be active
   in *every* regime, including quiet ones. If "sit on cash when IV is low"
   is acceptable, calendar is optional complexity even at v1 effort.
@@ -388,11 +451,15 @@ informed shelve/revive decisions over time.
 Sell OTM call spread above market in BEAR. Profits when underlying falls
 or stays put. The structural mirror of the existing bull put credit spread.
 
-- **Why high conviction:** identical infrastructure to the bull put credit
-  spread already in production — MLEG path, exit triggers (50% profit, 2×
-  credit stop, 21 DTE, short-strike breach), `find_best_put_spread`'s call
-  sibling. The only meaningfully new code is direction-aware strike
-  selection and an opposite regime gate.
+- **Why high conviction:** the *execution path* is identical to the bull
+  put credit spread already in production — MLEG path, exit triggers (50%
+  profit, 2× credit stop, 21 DTE, short-strike breach),
+  `find_best_put_spread`'s call sibling. The meaningfully new code is
+  direction-aware strike selection and an opposite regime gate.
+  **Important caveat:** the same MLEG lifecycle work listed in Tier 2 #B
+  applies here too — restart reconciliation, valuation, close retry,
+  slippage attribution, Health attribution, dashboard state. Execution
+  reuse does not mean lifecycle reuse.
 - **Architecture decision:** new strategy class `BearCallSpread` reusing the
   `CreditSpread` execution machinery, or a `direction` config mode on
   `CreditSpread` itself. New class is cleaner for paper-watch and health
@@ -434,8 +501,10 @@ OTM put. Active in confirmed BEAR with downside continuation thesis.
 - **Why:** capital-efficient alternative to candidate H. The debit spread
   caps both cost and max profit but removes the IV-decay risk of holding
   long puts.
-- **Architecture:** MLEG path; new strategy class sharing execution with
-  H (decision in §6 Q5 — new class, not config mode).
+- **Architecture:** MLEG path; new strategy class (e.g.
+  `BearPutDebitSpread`) sharing execution with H (decision in §6 Q5 — new
+  class, not config mode). Same lifecycle work as listed in Tier 2 #B
+  applies.
 - **Capital implication:** lower premium per trade than long puts; same
   sleeve.
 - **Gating:** decide after H — if naked puts work, the debit-spread
@@ -571,8 +640,13 @@ assigned → CC → called away → CSP …
    shelve/revive mechanism — WATCH / DEGRADED / BROKEN verdicts give the
    operator informed disable decisions over time. Regime-disjoint
    strategies (bull put credit spread in TRENDING/RANGING + bear call
-   credit spread in BEAR) effectively share a single roster slot since
-   they never run simultaneously.
+   credit spread in BEAR) share a **capital slot** since they never run
+   simultaneously — but they do not share operator burden. Each enabled
+   strategy, even one currently dormant by regime gate, still carries
+   code-maintenance surface area, config burden, Health threshold
+   calibration, cold-start risk on first activation, and an
+   incident-response path. Regime-disjoint is a real capital efficiency,
+   not a free operational lunch.
 
    *Operator note:* the 5–6 ceiling is on **enabled** strategies (those
    with `enabled=True` that the engine will consider per cycle), not on
@@ -619,9 +693,15 @@ assigned → CC → called away → CSP …
      before live BEAR arrives. Risky — synthetic conditions are not the
      same as live ones — but better than starting cold.
 
-   The honest accounting: SGOV parking will earn its keep on the first
-   day BEAR arrives; the bear options strategies are on a much slower
-   path to validated edge and should be sized accordingly.
+   The honest accounting: SGOV parking has a clearer edge thesis than the
+   bear options strategies once prolonged-BEAR confirmation fires (no
+   strategy edge to validate first, just T-bill yield on what would
+   otherwise be cash drag). The bear options strategies are on a much
+   slower path to validated edge and should be sized accordingly. SGOV's
+   actual activation is gated by the 20-day triple-confirmation in PLAN
+   11.44, so it doesn't earn anything in the first ~month of a downturn
+   either — but once confirmation fires, the thesis is operational
+   immediately rather than waiting on accumulated paper data.
 
 3. **New class per regime-active strategy (no config-mode multiplexing).**
    Decision (2026-05-28): Iron Condor (B), Bear call spread (G), Bear put
@@ -682,7 +762,9 @@ verdict during 11.30:
   application). Zero behavior change; builds evidence base in the
   background.
 - **SGOV defensive cash sweep** (PLAN 11.44). Independent of options
-  entirely; earns its keep on day-one of the first prolonged BEAR.
+  entirely; clearer edge thesis than bear-side options once
+  prolonged-BEAR confirmation fires (T-bill yield rather than strategy
+  edge to validate).
 
 **Track 2 — sequenced after 11.30 credit-spread paper-watch settles:**
 
