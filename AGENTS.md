@@ -227,8 +227,20 @@ recorded milestone is **646 unit tests passing** as of 2026-04-25, before the
 
 **Operational preference:**
 - Do **not** create Git worktrees for this repo unless the user explicitly asks.
-  The user reports that Antigravity can hang when linked worktrees exist, so
+  Gemini / Antigravity can hang or misbehave when linked worktrees exist, so
   normal in-place branch work is preferred.
+- Keep `.git/config` set to `extensions.worktreeConfig = false` for this repo.
+  If any linked worktrees were created temporarily, remove them afterward and
+  restore that setting to `false`.
+- **Never embed credentials in the git remote URL.** The remote must stay
+  token-free (`https://github.com/francomarb/trading-bot.git` or an SSH
+  remote). Do **not** run `git remote set-url origin https://user:$TOKEN@…`
+  to recover from auth failures, and do **not** grab `GH_TOKEN` from
+  `~/.zshrc` to inject into config — that pattern silently persists the
+  token into `.git/config` where any process can read it. If `git push`
+  fails on auth, ask the operator or fall back to the macOS Keychain via
+  the credential helper / `gh auth login`. Never paper over auth by
+  embedding a token.
 - **Always use `./recycle_bot.sh`** when restarting or recycling the bot, rather
   than manually killing the tmux session and calling `./start_bot.sh`.
 

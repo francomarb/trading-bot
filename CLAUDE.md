@@ -170,6 +170,34 @@ All credential and DB routing derives from `LIVE_TRADING`. Do not set
 
 ---
 
+## Git / Repository Conventions
+
+- **Never use git worktrees on this repo.** Worktrees break the live bot's data
+  paths (`data/trades.db`, `data/engine_state.json`, `logs/`, `data/health_state.json`)
+  because the running bot expects a single canonical checkout, and they have
+  caused issues with Gemini Antigravity in particular. Always operate directly
+  on the main repo checkout at `/Users/franco/trading-bot`. Use branches for
+  feature work, not worktrees.
+- **Enforced via `.git/config`:** `extensions.worktreeConfig = false` is set
+  to make worktree creation a deliberate override rather than a casual default.
+  Do not flip this on.
+- **Never embed credentials in the git remote URL.** The remote must stay
+  token-free (`https://github.com/francomarb/trading-bot.git` or an SSH
+  remote). Do **not** run `git remote set-url origin https://user:$TOKEN@…`
+  to recover from auth failures, and do **not** grab `GH_TOKEN` from
+  `~/.zshrc` to inject into config — that pattern silently persists the
+  token into `.git/config` where any process can read it. If `git push`
+  fails on auth, the right responses are: ask the operator, fall back to
+  the macOS Keychain via the credential helper, or use `gh auth login`.
+  Never paper over auth by embedding a token.
+- Branching: default to `main` for routine work, docs, and small hotfixes.
+  Use a feature branch + PR for substantive features or anything that wants
+  review before landing.
+- Bot lifecycle: use `start_bot.sh` / `stop_bot.sh` / `recycle_bot.sh` — never
+  send raw tmux keys to the bot session.
+
+---
+
 ## Testing Standard
 
 Testing is **non-negotiable** for this project — this code is meant to place orders with
