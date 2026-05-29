@@ -124,11 +124,20 @@ class IVProxyResolver:
 
     # ── Internal series resolution ───────────────────────────────────────────
 
-    def _resolve_series(self, source: str) -> tuple[str, pd.Series | None]:
+    def _resolve_series(
+        self, source: str, *, cache_only: bool = False
+    ) -> tuple[str, pd.Series | None]:
         """Return ``(canonical_source_key, series)`` for ``source``.
 
         On a fresh successful fetch the cache is refreshed; on a fetch failure
         the last cached series is returned if present, else ``None``.
+
+        When ``cache_only=True`` the network path is never taken — only the
+        in-memory cache is consulted. The today-keyed entry is preferred; a
+        stale entry from a prior day is returned if present. Returns
+        ``(key, None)`` if nothing is cached. This is what observation-only
+        log paths use so a cold cache cannot stall a critical decision (e.g.
+        a time-stop exit) on a synchronous yfinance fetch.
 
         Raises ``ValueError`` for an unknown source — a config typo should
         fail loudly, not silently trade on a fallback.
@@ -145,6 +154,13 @@ class IVProxyResolver:
         cached = self._cache.get(key)
         if cached is not None and cached[0] == today:
             return key, cached[1]
+
+        if cache_only:
+            # Never trigger a network fetch on this path. Return whatever's
+            # cached — including a stale prior-day series — or None.
+            if cached is not None:
+                return key, cached[1]
+            return key, None
 
         series = self._fetch_fn(ticker)
         if series is not None:
@@ -168,6 +184,26 @@ class IVProxyResolver:
             return key, cached[1]
 
         return key, None
+
+    @staticmethod
+    def _as_of_from_series(series: pd.Series | None) -> date:
+        """Derive the snapshot ``as_of`` date from the series index.
+
+        On weekends, holidays, pre-market, or stale-cache reuse the bot's
+        calendar date can be ahead of the data's last close date — for the
+        11.46b paper-watch audit, the snapshot must report the data's date,
+        not the wall-clock date. Falls back to ``date.today()`` when no
+        usable index is present.
+        """
+        if series is None or len(series) == 0:
+            return date.today()
+        last = series.index[-1]
+        if hasattr(last, "date"):
+            try:
+                return last.date()
+            except Exception:
+                pass
+        return date.today()
 
     # ── Public scalar API (bit-for-bit compatible with pre-11.46) ────────────
 
@@ -193,7 +229,9 @@ class IVProxyResolver:
 
     # ── Public IV Rank API (new in 11.46) ────────────────────────────────────
 
-    def resolve_rank(self, source: str) -> IVRankSnapshot:
+    def resolve_rank(
+        self, source: str, *, cache_only: bool = False
+    ) -> IVRankSnapshot:
         """
         Return today's IV proxy rank + percentile against the trailing-1y series.
 
@@ -210,9 +248,20 @@ class IVProxyResolver:
         Insufficient-history snapshots still report ``current`` (from the
         fallback if no series ever cached) and ``lookback_days_used`` so the
         operator can see how the cold-start is progressing.
+
+        ``as_of`` reflects the **data's** last close date (``series.index[-1]``)
+        when the series carries a datetime index — on weekends / holidays /
+        stale-cache reuse this avoids misreporting a wall-clock date for what
+        is really a prior market-day snapshot.
+
+        ``cache_only=True`` disables the network path entirely — only the
+        in-memory cache is consulted (today's or a stale prior-day entry).
+        Used by observation-only callers in critical decision paths (e.g.
+        the time-stop exit log in ``spy_options_reversion``) so a cold
+        cache cannot stall an exit on a synchronous yfinance fetch.
         """
-        key, series = self._resolve_series(source)
-        today = date.today()
+        key, series = self._resolve_series(source, cache_only=cache_only)
+        as_of = self._as_of_from_series(series)
 
         if series is None or len(series) == 0:
             return IVRankSnapshot(
@@ -221,7 +270,7 @@ class IVProxyResolver:
                 rank=None,
                 percentile=None,
                 lookback_days_used=0,
-                as_of=today,
+                as_of=as_of,
                 sufficient=False,
             )
 
@@ -239,7 +288,7 @@ class IVProxyResolver:
                 rank=None,
                 percentile=None,
                 lookback_days_used=lookback_days_used,
-                as_of=today,
+                as_of=as_of,
                 sufficient=False,
             )
 
@@ -253,7 +302,7 @@ class IVProxyResolver:
             rank=float(rank),
             percentile=float(percentile),
             lookback_days_used=lookback_days_used,
-            as_of=today,
+            as_of=as_of,
             sufficient=sufficient,
         )
 

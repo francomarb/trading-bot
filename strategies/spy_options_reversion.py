@@ -255,12 +255,19 @@ class SPYOptionsReversionStrategy(BaseStrategy):
         """Emit a structured ``SPY_OPTIONS_IVR`` log line for paper-watch
         evidence accumulation (PLAN 11.46b decision input).
 
-        Pure side-effect — never gates behavior, never raises. A failure in
-        the resolver path is swallowed at warning level so an IVR data
-        glitch can't take down an entry or exit decision.
+        Pure side-effect — never gates behavior, never raises, **and never
+        blocks a critical decision path on the network**: the resolver is
+        called with ``cache_only=True`` so a cold cache cannot stall an exit
+        (e.g. time stop) on a synchronous yfinance fetch. On a cold cache
+        the snapshot reports ``sufficient=False`` / ``lookback_days_used=0``
+        and the observation log still lands with that shape — the audit can
+        distinguish "no data yet" from a real signal. A failure in the
+        resolver path is swallowed at warning level.
         """
         try:
-            snap: IVRankSnapshot = self._iv_resolver.resolve_rank("vix")
+            snap: IVRankSnapshot = self._iv_resolver.resolve_rank(
+                "vix", cache_only=True
+            )
             rank_str = f"{snap.rank:.4f}" if snap.rank is not None else "None"
             pct_str = (
                 f"{snap.percentile:.4f}" if snap.percentile is not None else "None"
@@ -268,7 +275,8 @@ class SPYOptionsReversionStrategy(BaseStrategy):
             logger.info(
                 f"SPY_OPTIONS_IVR {event} symbol={symbol} "
                 f"rank={rank_str} percentile={pct_str} "
-                f"current={snap.current:.2f} sufficient={snap.sufficient}"
+                f"current={snap.current:.2f} sufficient={snap.sufficient} "
+                f"as_of={snap.as_of.isoformat()}"
             )
         except Exception as e:
             logger.warning(

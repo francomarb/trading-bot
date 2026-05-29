@@ -292,3 +292,98 @@ class TestResolveRank:
         snap = resolver.resolve_rank("vix")
         assert snap.lookback_days_used == 10
         assert snap.sufficient is True
+
+
+# ── resolve_rank(cache_only=True) — P2 fix (no synchronous fetch in
+#    observation paths so a cold cache cannot stall a critical decision) ──────
+
+
+class TestResolveRankCacheOnly:
+    def test_no_fetch_when_cache_empty(self) -> None:
+        calls = {"n": 0}
+
+        def _fetch(ticker: str) -> pd.Series:
+            calls["n"] += 1
+            return _series([10.0, 12.0, 14.0])
+
+        resolver = IVProxyResolver(fetch_fn=_fetch)
+        snap = resolver.resolve_rank("vix", cache_only=True)
+        # The network path was never taken — the cold-cache snapshot reports
+        # an empty lookback and not-sufficient. The fallback current is
+        # surfaced so the log line is still well-formed.
+        assert calls["n"] == 0
+        assert snap.lookback_days_used == 0
+        assert snap.sufficient is False
+        assert snap.rank is None
+        assert snap.percentile is None
+        assert snap.current == pytest.approx(15.0)  # fallback
+
+    def test_uses_cached_series_when_present(self) -> None:
+        # Warm the cache via a normal call, then assert cache_only=True
+        # reuses it without a second fetch.
+        calls = {"n": 0}
+
+        def _fetch(ticker: str) -> pd.Series:
+            calls["n"] += 1
+            return _series([10.0, 12.0, 14.0, 16.0, 20.0])
+
+        resolver = IVProxyResolver(fetch_fn=_fetch, lookback_floor=5)
+        resolver.resolve_rank("vix")  # warms cache
+        assert calls["n"] == 1
+        snap = resolver.resolve_rank("vix", cache_only=True)
+        assert calls["n"] == 1  # still no second fetch
+        assert snap.current == pytest.approx(20.0)
+        assert snap.rank == pytest.approx(1.0)
+        assert snap.sufficient is True
+
+    def test_uses_stale_prior_day_cache(self) -> None:
+        # A stale prior-day cache is still preferable to triggering a
+        # network call from a critical decision path.
+        s = _series([float(i) for i in range(1, 11)])
+        resolver = IVProxyResolver(
+            fetch_fn=lambda ticker: (_ for _ in ()).throw(
+                RuntimeError("fetch must not be called")
+            ),
+            lookback_floor=5,
+        )
+        resolver._cache["vix"] = (date.today() - timedelta(days=2), s)
+        snap = resolver.resolve_rank("vix", cache_only=True)
+        # No exception — fetch_fn was never invoked.
+        assert snap.lookback_days_used == 10
+        assert snap.sufficient is True
+
+
+# ── as_of derived from series.index[-1] — P3 fix (weekend/holiday/stale
+#    cache should report data date, not the bot's wall-clock date) ────────────
+
+
+class TestAsOfDerivation:
+    def test_as_of_reflects_last_close_date_not_today(self) -> None:
+        # Series ends two days ago (weekend / holiday scenario).
+        end = date.today() - timedelta(days=2)
+        s = _series([10.0, 12.0, 14.0], end=end)
+        resolver = IVProxyResolver(fetch_fn=lambda ticker: s)
+        snap = resolver.resolve_rank("vix")
+        assert snap.as_of == end
+        assert snap.as_of != date.today()
+
+    def test_as_of_falls_back_to_today_when_no_series(self) -> None:
+        resolver = IVProxyResolver(fetch_fn=lambda ticker: None)
+        snap = resolver.resolve_rank("vix")
+        assert snap.as_of == date.today()
+
+    def test_as_of_stale_cache_reports_stale_data_date(self) -> None:
+        # Stale series cached, fetch fails on next call → snapshot's as_of
+        # reflects the stale series's last index, not today.
+        stale_end = date.today() - timedelta(days=5)
+        stale_series = _series([10.0, 12.0, 14.0], end=stale_end)
+        resolver = IVProxyResolver(fetch_fn=lambda ticker: stale_series)
+        resolver.resolve_rank("vix")
+        # Backdate the cache so the next call re-fetches, then make fetch fail.
+        resolver._cache["vix"] = (
+            date.today() - timedelta(days=1),
+            stale_series,
+        )
+        resolver._fetch_fn = lambda ticker: None
+        snap = resolver.resolve_rank("vix")
+        assert snap.as_of == stale_end

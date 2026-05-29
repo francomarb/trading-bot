@@ -733,6 +733,11 @@ class TestIVRObservationLogging:
                 ),
                 lookback_floor=3,
             )
+            # Pre-warm the cache — production flow: the credit-spread filter
+            # warms the shared resolver earlier in the cycle, so by the time
+            # an entry's `cache_only=True` observation log fires, the cache
+            # is populated. We model that here explicitly.
+            resolver.resolve_rank("vix")
             strat = SPYOptionsReversionStrategy(iv_resolver=resolver)
             pick = ContractPick(
                 occ_symbol="SPY260521C00730000",
@@ -759,6 +764,8 @@ class TestIVRObservationLogging:
         assert "percentile=" in line
         assert "current=20.00" in line
         assert "sufficient=True" in line
+        # P3 — as_of reflects the data's last close date, not just today.
+        assert f"as_of={date.today().isoformat()}" in line
 
     def test_exit_time_stop_logs_ivr(self):
         from loguru import logger
@@ -790,6 +797,54 @@ class TestIVRObservationLogging:
 
         ivr_lines = [r for r in records if "SPY_OPTIONS_IVR" in r]
         assert any("exit_time_stop" in line and sym in line for line in ivr_lines)
+
+    def test_time_stop_does_not_trigger_resolver_fetch_on_cold_cache(self):
+        """P2 regression — the time-stop exit fires *before* `_fetch_vix`
+        warms the resolver cache, so the IVR observation log must use
+        ``cache_only=True``. On a cold cache it should log a sufficient=False
+        snapshot without invoking the network ``fetch_fn``."""
+        from loguru import logger
+
+        calls = {"n": 0}
+
+        def _fetch(ticker: str) -> pd.Series:
+            calls["n"] += 1
+            return pd.Series(
+                [18.0], index=[pd.Timestamp(date.today())]
+            )
+
+        records: list[str] = []
+        handler_id = logger.add(lambda msg: records.append(str(msg)), level="INFO")
+        try:
+            resolver = IVProxyResolver(fetch_fn=_fetch)  # cold cache
+            strat = SPYOptionsReversionStrategy(iv_resolver=resolver)
+            expiry = date.today() + timedelta(days=14)
+            while expiry.weekday() != 4:
+                expiry += timedelta(days=1)
+            sym = _occ("SPY", expiry, "C", 520.0)
+            expiry_wed = expiry - timedelta(days=2)
+            now_et = datetime.combine(
+                expiry_wed,
+                datetime.min.time().replace(hour=15, minute=35),
+                tzinfo=_ET,
+            )
+            with patch("strategies.spy_options_reversion.datetime") as mock_dt:
+                mock_dt.now.side_effect = (
+                    lambda tz=None: now_et if tz == _ET else datetime.now(timezone.utc)
+                )
+                mock_dt.combine = datetime.combine
+                mock_dt.strptime = datetime.strptime
+                assert strat.inspect_open_positions(_position(sym), 520.0) is True
+        finally:
+            logger.remove(handler_id)
+
+        # The critical assertion: no synchronous yfinance fetch landed in the
+        # time-stop exit path. The log line still emitted with sufficient=False.
+        assert calls["n"] == 0
+        ivr_lines = [r for r in records if "SPY_OPTIONS_IVR" in r]
+        assert len(ivr_lines) == 1
+        assert "exit_time_stop" in ivr_lines[0]
+        assert "sufficient=False" in ivr_lines[0]
 
     def test_resolver_failure_does_not_break_decision_path(self):
         """Defensive try/except: an IVR resolver glitch must never raise into
