@@ -19,8 +19,24 @@ import pytest
 from strategies.base import EdgeFilterDecision
 from strategies.filters.spy_options_reversion import SPYOptionsEdgeFilter
 from strategies.spy_options_reversion import SPYOptionsConfig, SPYOptionsReversionStrategy
+from utils.iv_proxy import IVProxyResolver
 
 _ET = ZoneInfo("America/New_York")
+
+
+def _stub_iv_resolver(sigma: float) -> IVProxyResolver:
+    """Build a stub IVProxyResolver such that ``resolve("vix") / 100.0 == sigma``.
+
+    The strategy's ``_fetch_vix()`` divides the resolver's index-points
+    scalar by 100, so injecting points = sigma * 100 makes the strategy see
+    the requested decimal sigma without touching yfinance.
+    """
+    points = sigma * 100.0
+    return IVProxyResolver(
+        fetch_fn=lambda ticker: pd.Series(
+            [points], index=[pd.Timestamp(date.today())]
+        )
+    )
 
 
 @pytest.fixture(autouse=True)
@@ -307,11 +323,8 @@ class TestBuildOptionExecution:
 
 class TestTimeStop:
     def _strat(self) -> SPYOptionsReversionStrategy:
-        s = SPYOptionsReversionStrategy()
-        # Pre-cache VIX so yfinance is never called
-        s._vix_date = date.today()
-        s._vix_sigma = 0.18
-        return s
+        # Stub resolver so the IVR observation log path doesn't need network.
+        return SPYOptionsReversionStrategy(iv_resolver=_stub_iv_resolver(0.18))
 
     def _friday_expiry_two_weeks_out(self) -> date:
         """Return a Friday at least 10 days from today."""
@@ -403,10 +416,7 @@ class TestTimeStop:
 
 class TestDeltaFloor:
     def _strat_with_cached_vix(self) -> SPYOptionsReversionStrategy:
-        s = SPYOptionsReversionStrategy()
-        s._vix_date = date.today()
-        s._vix_sigma = 0.18
-        return s
+        return SPYOptionsReversionStrategy(iv_resolver=_stub_iv_resolver(0.18))
 
     def _safe_time_sym(self) -> tuple[str, datetime]:
         """OCC symbol + a 'now' time safely before expiry Wednesday."""
@@ -503,10 +513,11 @@ class TestTrailingStop:
             return strat.inspect_open_positions(pos, 520.0)
 
     def _strat(self, activation=0.10, trail=0.15) -> SPYOptionsReversionStrategy:
-        s = SPYOptionsReversionStrategy(trail_activation_pct=activation, trail_pct=trail)
-        s._vix_date = date.today()
-        s._vix_sigma = 0.18
-        return s
+        return SPYOptionsReversionStrategy(
+            trail_activation_pct=activation,
+            trail_pct=trail,
+            iv_resolver=_stub_iv_resolver(0.18),
+        )
 
     def test_no_exit_before_activation_threshold(self):
         """Value 5% above base — not past 10% activation, so no trail exit."""
@@ -606,10 +617,11 @@ class TestRegisterFill:
     basis, not the first Black-Scholes valuation."""
 
     def _strat(self) -> SPYOptionsReversionStrategy:
-        s = SPYOptionsReversionStrategy(trail_activation_pct=0.10, trail_pct=0.15)
-        s._vix_date = date.today()
-        s._vix_sigma = 0.18
-        return s
+        return SPYOptionsReversionStrategy(
+            trail_activation_pct=0.10,
+            trail_pct=0.15,
+            iv_resolver=_stub_iv_resolver(0.18),
+        )
 
     def test_anchors_base_and_hwm_to_premium(self):
         strat = self._strat()
@@ -669,34 +681,144 @@ class TestRegisterFill:
         assert strat._position_base[sym] == 4.00  # not overwritten by 5.00
 
 
-# ── VIX cache ─────────────────────────────────────────────────────────────────
+# ── _fetch_vix delegation to shared resolver (11.46) ─────────────────────────
+#
+# The strategy's own VIX cache was removed in 11.46 — caching is now the
+# responsibility of the shared ``IVProxyResolver`` and is tested in
+# ``tests/test_iv_proxy.py``. The strategy is only responsible for the
+# conversion from index points to decimal sigma.
 
-class TestVixCache:
-    def test_caches_within_same_day(self):
-        strat = SPYOptionsReversionStrategy()
-        with patch("yfinance.Ticker") as mock_ticker:
-            mock_ticker.return_value.history.return_value = pd.DataFrame({"Close": [20.0]})
-            first = strat._fetch_vix()
-            second = strat._fetch_vix()
-            assert mock_ticker.call_count == 1, "Should only fetch once per day"
-        assert abs(first - 0.20) < 1e-6
-        assert first == second
 
-    def test_returns_fallback_on_yfinance_error(self):
-        strat = SPYOptionsReversionStrategy()
-        with patch("yfinance.Ticker", side_effect=RuntimeError("network down")):
-            sigma = strat._fetch_vix()
-        assert sigma == 0.15  # default fallback
+class TestFetchVixDelegation:
+    def test_divides_resolver_points_by_100(self):
+        strat = SPYOptionsReversionStrategy(iv_resolver=_stub_iv_resolver(0.20))
+        assert abs(strat._fetch_vix() - 0.20) < 1e-9
 
-    def test_refreshes_on_new_day(self):
-        strat = SPYOptionsReversionStrategy()
-        yesterday = date.today() - timedelta(days=1)
-        strat._vix_date = yesterday
-        strat._vix_sigma = 0.12
+    def test_uses_resolver_fallback_on_failure(self):
+        # No prior cache + failing fetch → resolver falls back to 15.0
+        # index points → 0.15 sigma.
+        resolver = IVProxyResolver(fetch_fn=lambda ticker: None, fallback_points=15.0)
+        strat = SPYOptionsReversionStrategy(iv_resolver=resolver)
+        assert strat._fetch_vix() == pytest.approx(0.15)
 
-        with patch("yfinance.Ticker") as mock_ticker:
-            mock_ticker.return_value.history.return_value = pd.DataFrame({"Close": [25.0]})
-            sigma = strat._fetch_vix()
 
-        assert abs(sigma - 0.25) < 1e-6, "Should fetch fresh value on new day"
-        assert strat._vix_date == date.today()
+# ── IVR observation logging (11.46) ──────────────────────────────────────────
+
+
+class TestIVRObservationLogging:
+    """The strategy emits a structured SPY_OPTIONS_IVR line at every entry
+    and at each exit trigger — pure evidence accumulation, never gates
+    behavior. PLAN 11.46b is the paper-watch verdict that consumes this
+    evidence base."""
+
+    def _capture_logs(self, monkeypatch):
+        from loguru import logger
+        records: list[str] = []
+        handler_id = logger.add(lambda msg: records.append(str(msg)), level="INFO")
+        yield records
+        logger.remove(handler_id)
+
+    def test_entry_logs_ivr_with_resolved_rank(self):
+        from loguru import logger
+        from utils.options_lookup import ContractPick
+
+        records: list[str] = []
+        handler_id = logger.add(lambda msg: records.append(str(msg)), level="INFO")
+        try:
+            # Resolver with enough series to compute a defined rank.
+            resolver = IVProxyResolver(
+                fetch_fn=lambda ticker: pd.Series(
+                    [10.0, 15.0, 20.0],
+                    index=pd.date_range(end=pd.Timestamp(date.today()), periods=3, freq="D"),
+                ),
+                lookback_floor=3,
+            )
+            strat = SPYOptionsReversionStrategy(iv_resolver=resolver)
+            pick = ContractPick(
+                occ_symbol="SPY260521C00730000",
+                premium=4.90,
+                spread_pct=0.04,
+                score=0.85,
+                components={},
+                runners_up=[],
+            )
+            with patch(
+                "strategies.spy_options_reversion.find_best_call",
+                return_value=pick,
+            ):
+                strat.build_option_execution("SPY", 733.71, notional_cap=2_000.0)
+        finally:
+            logger.remove(handler_id)
+
+        ivr_lines = [r for r in records if "SPY_OPTIONS_IVR" in r]
+        assert len(ivr_lines) == 1, ivr_lines
+        line = ivr_lines[0]
+        assert "entry" in line
+        assert "symbol=SPY260521C00730000" in line
+        assert "rank=" in line
+        assert "percentile=" in line
+        assert "current=20.00" in line
+        assert "sufficient=True" in line
+
+    def test_exit_time_stop_logs_ivr(self):
+        from loguru import logger
+
+        records: list[str] = []
+        handler_id = logger.add(lambda msg: records.append(str(msg)), level="INFO")
+        try:
+            strat = SPYOptionsReversionStrategy(iv_resolver=_stub_iv_resolver(0.18))
+            expiry = date.today() + timedelta(days=14)
+            while expiry.weekday() != 4:
+                expiry += timedelta(days=1)
+            sym = _occ("SPY", expiry, "C", 520.0)
+            # Wednesday of expiry week, 3:35 PM ET — past the time stop.
+            expiry_wed = expiry - timedelta(days=2)
+            now_et = datetime.combine(
+                expiry_wed,
+                datetime.min.time().replace(hour=15, minute=35),
+                tzinfo=_ET,
+            )
+            with patch("strategies.spy_options_reversion.datetime") as mock_dt:
+                mock_dt.now.side_effect = (
+                    lambda tz=None: now_et if tz == _ET else datetime.now(timezone.utc)
+                )
+                mock_dt.combine = datetime.combine
+                mock_dt.strptime = datetime.strptime
+                assert strat.inspect_open_positions(_position(sym), 520.0) is True
+        finally:
+            logger.remove(handler_id)
+
+        ivr_lines = [r for r in records if "SPY_OPTIONS_IVR" in r]
+        assert any("exit_time_stop" in line and sym in line for line in ivr_lines)
+
+    def test_resolver_failure_does_not_break_decision_path(self):
+        """Defensive try/except: an IVR resolver glitch must never raise into
+        the entry path. The strategy still returns a valid pick; the log
+        path emits a warning instead of a structured line."""
+        from utils.options_lookup import ContractPick
+
+        class _BrokenResolver:
+            def resolve(self, source: str) -> float:
+                return 15.0  # _fetch_vix path stays clean
+
+            def resolve_rank(self, source: str):
+                raise RuntimeError("resolver glitch")
+
+        strat = SPYOptionsReversionStrategy(iv_resolver=_BrokenResolver())
+        pick = ContractPick(
+            occ_symbol="SPY260521C00730000",
+            premium=4.90,
+            spread_pct=0.04,
+            score=0.85,
+            components={},
+            runners_up=[],
+        )
+        with patch(
+            "strategies.spy_options_reversion.find_best_call",
+            return_value=pick,
+        ):
+            occ, premium, *_ = strat.build_option_execution(
+                "SPY", 733.71, notional_cap=2_000.0
+            )
+        assert occ == "SPY260521C00730000"
+        assert premium == 4.90
