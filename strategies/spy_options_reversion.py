@@ -4,7 +4,7 @@ SPY Options RSI Reversion Strategy.
 
 import re
 from dataclasses import dataclass, field
-from datetime import date, datetime, time, timedelta, timezone
+from datetime import datetime, time, timedelta, timezone
 from typing import Tuple
 from zoneinfo import ZoneInfo
 
@@ -13,6 +13,7 @@ from loguru import logger
 
 from indicators.technicals import add_rsi
 from strategies.base import BaseStrategy, OptionTradeRejected, OrderType, SignalFrame
+from utils.iv_proxy import IVProxyResolver, IVRankSnapshot
 from utils.options_lookup import ContractPick, build_opra_quote_lookup, find_best_call
 from utils.options_ranker import CallRankerConfig
 
@@ -43,7 +44,6 @@ class SPYOptionsConfig:
     time_stop_minute: int = 30
     delta_floor: float = 0.30
     risk_free_rate: float = 0.05
-    vix_fallback_sigma: float = 0.15
     ranker_config: CallRankerConfig = field(default_factory=CallRankerConfig)
 
 
@@ -61,6 +61,7 @@ class SPYOptionsReversionStrategy(BaseStrategy):
         edge_filter=None,
         quote_lookup=None,
         config: SPYOptionsConfig | None = None,
+        iv_resolver: IVProxyResolver | None = None,
     ):
         super().__init__(edge_filter=edge_filter)
         self.config = config or SPYOptionsConfig()
@@ -68,9 +69,13 @@ class SPYOptionsReversionStrategy(BaseStrategy):
         self.rsi_threshold = rsi_threshold
         self.trail_activation_pct = trail_activation_pct
         self.trail_pct = trail_pct
-        # VIX cache: refreshed once per calendar day to avoid hot-loop HTTP calls.
-        self._vix_date: date | None = None
-        self._vix_sigma: float = self.config.vix_fallback_sigma
+        # Shared IV proxy data layer — consolidated under PLAN 11.46 to remove
+        # the private VIX fetch path. Production wiring (forward_test.py)
+        # injects one resolver shared with the credit-spread filter; tests
+        # pass a stub. The resolver's own daily cache + fallback handle the
+        # VIX miss path that the deleted ``_vix_date`` / ``_vix_sigma`` /
+        # ``vix_fallback_sigma`` machinery used to cover.
+        self._iv_resolver = iv_resolver or IVProxyResolver()
         # Trailing stop state keyed by OCC symbol.
         self._position_hwm: dict[str, float] = {}   # OCC → highest B-S value observed
         self._position_base: dict[str, float] = {}  # OCC → first B-S value observed
@@ -168,6 +173,7 @@ class SPYOptionsReversionStrategy(BaseStrategy):
             )
             self._position_hwm.pop(occ, None)
             self._position_base.pop(occ, None)
+            self._log_ivr_observation("exit_time_stop", occ)
             return True
 
         # ── Guards 2 + 3: B-S valuation ─────────────────────────────────────
@@ -199,6 +205,7 @@ class SPYOptionsReversionStrategy(BaseStrategy):
                 )
                 self._position_hwm.pop(occ, None)
                 self._position_base.pop(occ, None)
+                self._log_ivr_observation("exit_delta_floor", occ)
                 return True
 
             # ── Guard 3: trailing stop ───────────────────────────────────────
@@ -224,6 +231,7 @@ class SPYOptionsReversionStrategy(BaseStrategy):
                     )
                     self._position_hwm.pop(occ, None)
                     self._position_base.pop(occ, None)
+                    self._log_ivr_observation("exit_trailing_stop", occ)
                     return True
 
         except Exception as e:
@@ -232,21 +240,49 @@ class SPYOptionsReversionStrategy(BaseStrategy):
         return False
 
     def _fetch_vix(self) -> float:
-        """Return today's VIX as a decimal (e.g. 0.18 for VIX=18).
-        Fetches once per calendar day; reuses the cached value intraday."""
-        today = date.today()
-        if self._vix_date == today:
-            return self._vix_sigma
+        """Return today's VIX as a decimal sigma (e.g. 0.18 for VIX=18).
+
+        Thin wrapper over the shared ``IVProxyResolver``: the resolver does
+        its own daily cache + stale-cache reuse + fallback (PLAN 11.29 +
+        11.46), so this method just divides the index-points scalar by 100
+        to land in the Black-Scholes sigma convention.
+        """
+        return self._iv_resolver.resolve("vix") / 100.0
+
+    # ── IVR observation logging (11.46 — zero-behavior-change) ───────────────
+
+    def _log_ivr_observation(self, event: str, symbol: str) -> None:
+        """Emit a structured ``SPY_OPTIONS_IVR`` log line for paper-watch
+        evidence accumulation (PLAN 11.46b decision input).
+
+        Pure side-effect — never gates behavior, never raises, **and never
+        blocks a critical decision path on the network**: the resolver is
+        called with ``cache_only=True`` so a cold cache cannot stall an exit
+        (e.g. time stop) on a synchronous yfinance fetch. On a cold cache
+        the snapshot reports ``sufficient=False`` / ``lookback_days_used=0``
+        and the observation log still lands with that shape — the audit can
+        distinguish "no data yet" from a real signal. A failure in the
+        resolver path is swallowed at warning level.
+        """
         try:
-            import yfinance as yf
-            hist = yf.Ticker("^VIX").history(period="1d")
-            if not hist.empty:
-                self._vix_sigma = float(hist["Close"].iloc[-1]) / 100.0
-                self._vix_date = today
-                logger.debug(f"[{self.name}] VIX refreshed: {self._vix_sigma:.4f}")
+            snap: IVRankSnapshot = self._iv_resolver.resolve_rank(
+                "vix", cache_only=True
+            )
+            rank_str = f"{snap.rank:.4f}" if snap.rank is not None else "None"
+            pct_str = (
+                f"{snap.percentile:.4f}" if snap.percentile is not None else "None"
+            )
+            logger.info(
+                f"SPY_OPTIONS_IVR {event} symbol={symbol} "
+                f"rank={rank_str} percentile={pct_str} "
+                f"current={snap.current:.2f} sufficient={snap.sufficient} "
+                f"as_of={snap.as_of.isoformat()}"
+            )
         except Exception as e:
-            logger.debug(f"[{self.name}] VIX fetch failed, using {self._vix_sigma:.4f}: {e}")
-        return self._vix_sigma
+            logger.warning(
+                f"[{self.name}] SPY_OPTIONS_IVR {event} symbol={symbol} "
+                f"— resolver failed: {e}"
+            )
 
     # ── Option execution ─────────────────────────────────────────────────────
 
@@ -326,4 +362,9 @@ class SPYOptionsReversionStrategy(BaseStrategy):
             f"spread={pick.spread_pct:.1%} score={pick.score:.2f} "
             f"SL=${stop_loss:.2f} TP=${take_profit:.2f} (safety valve)"
         )
+
+        # 11.46 — observation-only IVR logging at entry. Pure evidence
+        # accumulation for the 11.46b paper-watch verdict; no behavior gate.
+        self._log_ivr_observation("entry", pick.occ_symbol)
+
         return pick.occ_symbol, premium, take_profit, stop_loss

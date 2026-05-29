@@ -193,6 +193,15 @@ def main() -> None:
 
     sector_gauge = SectorMomentumGauge(sector_etfs=settings.SECTOR_ETFS)
 
+    # ── Shared IV proxy data layer (PLAN 11.29 + 11.46) ─────────────────
+    # One IVProxyResolver instance is shared across every options strategy
+    # in the bot — credit-spread filter, SPY-options reversion observation
+    # logging, and any future MLEG strategy. Single daily VIX/RVX fetch per
+    # source. Before 11.46 each strategy ran its own VIX cache; the shared
+    # resolver now serves both the scalar (resolve) and IV-Rank (resolve_rank)
+    # paths off one trailing-1y series.
+    _iv_resolver = IVProxyResolver()
+
     # ── Strategy slots ──────────────────────────────────────────────────
     slots = [
         StrategySlot(
@@ -267,6 +276,7 @@ def main() -> None:
                 rsi_length=14,
                 rsi_threshold=45,
                 edge_filter=SPYOptionsEdgeFilter(),
+                iv_resolver=_iv_resolver,
             ),
             watchlist_source=StaticWatchlistSource(
                 list(settings.STRATEGY_WATCHLISTS["spy_options_reversion"]), name="spy_options"
@@ -280,11 +290,10 @@ def main() -> None:
 
     # ── Credit spread slots (11.29) ──────────────────────────────────────
     # One CreditSpread instance per underlying (SPY + QQQ at v1); all share
-    # the `credit_spread` allocator sleeve and one IV-proxy resolver + OPRA
-    # quote lookup. Daily bars — the trend gate is a 50-day SMA and DTE is
-    # measured in days. Never in BEAR/VOLATILE (a vol spike is exactly when
-    # short premium hits max loss).
-    _cs_iv_resolver = IVProxyResolver()
+    # the `credit_spread` allocator sleeve, the shared ``_iv_resolver``
+    # (PLAN 11.46), and one OPRA quote lookup. Daily bars — the trend gate
+    # is a 50-day SMA and DTE is measured in days. Never in BEAR/VOLATILE
+    # (a vol spike is exactly when short premium hits max loss).
     _cs_quote_lookup = build_opra_quote_lookup()
     for _cs_symbol in settings.STRATEGY_WATCHLISTS["credit_spread"]:
         _cs_config = CreditSpreadConfig.from_dict(
@@ -297,9 +306,9 @@ def main() -> None:
                     iv_proxy_source=_cs_config.iv_proxy_source,
                     min_iv_proxy=_cs_config.min_iv_proxy,
                     earnings_blackout_days=_cs_config.earnings_blackout_days,
-                    iv_resolver=_cs_iv_resolver,
+                    iv_resolver=_iv_resolver,
                 ),
-                iv_resolver=_cs_iv_resolver,
+                iv_resolver=_iv_resolver,
                 quote_lookup=_cs_quote_lookup,
             ),
             watchlist_source=StaticWatchlistSource(
