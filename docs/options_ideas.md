@@ -255,20 +255,36 @@ Layer a bear call spread on top of the bull put at the same expiration. Same
 DTE, same exit rules, same execution path. PLAN 11.31 shipped 2026-05-27, so
 the engine is already strategy-name-agnostic and leg-count-agnostic.
 
-- **Why:** symmetric premium collection on a strategy designed for symmetric
-  outcomes. Improves credit-to-width without raising max loss (both spreads
-  defined-risk). Genuinely direction-neutral, where the current bull put is
-  bullish-neutral.
-- **Architecture decision:** new strategy class vs. config mode on
-  `CreditSpread` (`structure: "bull_put" | "iron_condor"`). Strong preference
-  for config mode — reuses watchlist, sizing, exit rules; one paper-watch
-  covers both structures via the structure column.
+- **Why:** premium collection on both sides on a strategy designed for
+  range-bound outcomes. Improves credit-to-width without raising max loss
+  (both spreads defined-risk).
+- **Critical: symmetric ICs on equity indexes are a known trap.** US large-cap
+  indexes have structural upward drift and explosive rallies that
+  systematically tag short call strikes. A naive "same delta on both sides"
+  IC will see the call leg whipsaw far more often than the put leg in
+  bull/range markets. Two refinements address this:
+  - **Asymmetric deltas** — sell ~17Δ on the put side (matches the existing
+    bull put) but ~10Δ on the call side. The call side moves further OTM
+    to reflect the asymmetric drift, collecting less call premium but
+    surviving rallies that would tag a symmetric call strike.
+  - **Trend-conditional call leg** — only enable the call side when SPY is
+    below its 50-day SMA (or some equivalent trend-broken signal). This
+    turns the strategy into "bull put always + bear call when the trend is
+    actually broken," which is a more defensible posture in equity indexes
+    than blanket symmetric IC.
+  - Best practice is probably both — asymmetric deltas as the structural
+    default, and the trend gate as an additional filter that further
+    narrows when the call leg fires.
+- **Architecture decision:** new strategy class per §6 Q5 decision, sharing
+  execution machinery with `CreditSpread` via the post-11.31 MLEG path. Not
+  a config mode on the existing class.
 - **Capital implication:** no new sleeve. Same max loss per position; just
-  more credit collected.
+  more credit collected when both legs are active.
 - **Gating:** 11.30 paper-watch on the bull put. If puts ride to 50% profit
-  without testing strikes, the call side adds free premium. If puts are
-  getting whipsawed, IC doubles the whipsaw — IVR filter (Tier 1 #A) probably
-  needs to land first.
+  without testing strikes, the call side (with the asymmetric/trend
+  refinements above) adds genuine premium. If puts are getting whipsawed,
+  IC doubles the whipsaw — IVR filter (Tier 1 #A) probably needs to land
+  first.
 
 #### C. Convert SPY Options Reversion to bull call debit spread when IV is rich
 Today `spy_options_reversion` buys naked SPY calls. In rich-IV regimes, the
@@ -294,32 +310,61 @@ Sell front-month, buy back-month, same strike. Profits when near-term decays
 faster than long-term. Thrives in the exact regime where credit spread
 idles.
 
-- **Why this is Tier 3:** the existing MLEG path handles same-expiry atomic
-  spreads. Calendars have:
+- **The full version is high effort:** the existing MLEG path handles
+  same-expiry atomic spreads. A traditional calendar requires:
   - Unequal-expiry legs — the back leg lives on after the front expires.
-  - A front-leg roll/expiry handler distinct from the credit spread close path.
+  - A front-leg roll/expiry handler distinct from the credit spread close
+    path.
   - Different P&L and Greek behavior (vega-positive vs. credit spread's
     vega-negative).
-  - New exit rules: front-leg expiry, back-leg-only management post-roll,
-    spread-value drawdown threshold.
-- **Realistic effort:** medium-to-high, not "medium" as earlier versions of
-  this doc suggested. Probably 2x the credit-spread integration work.
-- **Worth it only if:** the operator wants the options sleeve to be active in
-  *every* regime, including quiet ones. If "sit on cash when IV is low" is
-  acceptable, calendar is optional complexity.
+  - New exit rules for the post-front-expiry phase: back-leg-only
+    management, separate drawdown threshold, separate close trigger.
+- **v1 simplification — never let the front leg expire.** Treat the calendar
+  as a same-day MLEG trade with a strict "close both legs together" rule.
+  Required exits:
+  - **DTE-based close:** unwind the full spread (both legs) at e.g. 5 DTE
+    on the front leg, before any assignment / expiry risk.
+  - **Profit target close:** unwind at e.g. 20% of max profit, well before
+    front-leg gamma starts dominating.
+  - **Stop-loss close:** unwind at e.g. 2× spread debit drawdown.
+  - At no point does the back leg live alone — every exit closes the
+    structure as a unit. This eliminates the front-leg-roll / back-leg-only
+    machinery and lets calendars reuse the same MLEG exit path as credit
+    spread.
+  - Tradeoff: gives up some natural calendar P&L. The full juice comes from
+    the front leg expiring worthless while the back leg retains time
+    value. Closing at 5 DTE cuts before max theta extraction. Acceptable v1
+    cost for an order-of-magnitude reduction in architectural lift.
+- **Realistic effort under the v1 simplification:** medium, comparable to
+  Iron Condor — new strategy class, same MLEG path, slightly different
+  entry signal (low IVR + ranging regime). The high-effort version is
+  available later if the v1 proves out and you want to capture more of
+  the natural P&L curve.
+- **Worth it only if:** the operator wants the options sleeve to be active
+  in *every* regime, including quiet ones. If "sit on cash when IV is low"
+  is acceptable, calendar is optional complexity even at v1 effort.
 
 #### E. Jade Lizard
 Short put + bear call spread. Net premium ≥ call-spread width = no upside
-risk by construction. Downside risk is the short put (cash-secured if
-configured that way).
+risk by construction.
 
 - **Why interesting:** higher credit than IC for the same defined-risk
-  envelope, with a structurally favorable risk graph (no loss on a rip up).
-- **Why Tier 3:** redundant with IC initially. Add only if IC paper data
-  shows the bot is consistently losing on call-side strikes (rallies tagging
-  the short call) but rarely on put-side — Jade Lizard captures the same
-  upside-rip profile without the call-spread loss. If IC is symmetric in
-  practice, Jade Lizard adds complexity without distinct edge.
+  envelope on the call side, with a structurally favorable risk graph (no
+  loss on a rip up).
+- **Why Tier 3 / why deferred:** the short put is defined-risk *only* when
+  cash-secured (strike × 100). That puts Jade Lizard in the same
+  capital-feasibility bucket as CSP and the Wheel — see §3. On ai_bigtech
+  names at $140–$700, securing the put consumes a full sleeve per
+  contract, the same wall that blocks the wheel at current capitalization.
+  This isn't a defined-risk policy violation (cash-secured is defined
+  risk); it's a capital constraint. Revisit when either:
+  - The wheel becomes addressable (account growth or cheap-underlying
+    watchlist — see §6 Q3), at which point Jade Lizard becomes a richer
+    variant of cash-secured-put income.
+  - IC paper data shows asymmetric losses (call side hit much more than
+    put side, rallies tagging the short call) — Jade Lizard captures the
+    same upside-rip profile without the call-spread loss, but only on
+    underlyings small enough for the secured put.
 
 #### F. Revive BollingerSqueeze paired with calendar
 Squeeze in low IV is a classic calendar entry. Unlocks the parked
@@ -586,61 +631,105 @@ assigned → CC → called away → CSP …
    attribution and create paper-watch noise. The engine already supports
    independent classes for free.
 
-### Open questions
+### Open questions (with leaning recommendations)
 
-4. **The cheap-underlying watchlist question.** Section §3 makes clear
-   that CC and CSP/Wheel on ai_bigtech are blocked by share-count
-   economics. The bypass is a separate sub-$80 universe (small ETFs,
-   cheaper single names). Real fork: either (a) accept that single-leg
-   short premium waits for live-account scale, or (b) introduce a
-   cheap-underlying sleeve as a distinct strategy with its own watchlist
-   and edge thesis. Path (b) is interesting but is not "covered calls on
-   the existing book" — it's a new business line.
+4. **The cheap-underlying watchlist question — default no.** Section §3
+   makes clear that CC and CSP/Wheel on ai_bigtech are blocked by
+   share-count economics. The bypass would be a sub-$80 universe (small
+   ETFs like SLV, GDX, KRE, HYG, or sub-$60 single names). **Recommend
+   default no:** the bot's existing edge — SMA crossover, RSI reversion,
+   Donchian breakout — was calibrated for large-cap US equities and
+   indexes. Backtesting on ai_bigtech does not transfer to commodity ETFs
+   (macro/interest-rate driven), regional banking ETFs (regulatory and
+   credit-cycle driven), or sub-$60 single names (typically less liquid,
+   more idiosyncratic). Introducing these names solely to satisfy the
+   100-share constraint would change the bot's identity and add tail
+   risks (regional banking crisis, commodity plunge) that the current
+   indicators are not designed to detect. The defensible alternative is
+   to accept that CC/CSP/Wheel wait for account growth, and use the
+   options sleeve for defined-risk spreads on SPY/QQQ/ai_bigtech where
+   the existing edge applies. Open the question only if a clear,
+   independently-backtested edge thesis emerges for a specific
+   sub-universe — not as a workaround for capital limits.
 
-5. **Capital reallocation appetite.** Is the bot willing to trim SMA from
+5. **Capital reallocation appetite — default no.** Trimming SMA from
    40% → 35% (or similar) to concentrate per-position budgets on a few
-   names that *would* support 100-share contracts? Or is per-position
-   diversification (15–40 share slices across many names) the right
-   posture for the equity strategies and options stay capped at 15%?
+   names that *would* support 100-share contracts is **strongly
+   discouraged**. The 15–40 share slice diversification across many names
+   is not a bug — it's the primary defense against single-stock gap risk
+   (earnings blowouts, fraud disclosures, takeover rumors). Concentrating
+   into 100-share blocks of 1–2 names trades systematic risk for
+   idiosyncratic risk, which is a worse tradeoff for a systematic
+   trend/reversion strategy: the bot can't react to overnight gaps, only
+   absorb them. Keep equity sleeves diversified; let options sleeves stay
+   capped at 15%; revisit only if the account grows to the point where
+   per-position budgets naturally cross 100-share thresholds.
 
 ---
 
-## 7. When to revisit this doc
+## 7. Roadmap and revisit triggers
 
-After the credit spread sleeve completes 11.30 paper-watch (≥ 20–30 cycles)
-and any threshold tuning lands. Re-rank against observed credit-spread
-behavior plus the regime-roster decision (§6 Q2):
+### Default linear path (if everything performs as designed)
 
-Bear-roster decision is recorded (§6 Q2 — fill with 1–2 strategies +
-SGOV parking). Two items have no paper-watch dependency and can ship
-anytime regardless of credit-spread outcome:
+The recommended default sequencing — independent of waiting for any
+single paper-watch — assuming credit spread reaches a settled, profitable
+verdict during 11.30:
 
-- **IVR utility (A, step 1)** — pure math helper, zero strategy
-  dependencies, immediately useful for every existing and future options
-  strategy. Ship whenever there's appetite.
-- **SGOV parking (PLAN 11.44)** — independent of options entirely; ships
-  on its own schedule.
+**Track 1 — ships immediately, no paper-watch dependency:**
+- **`utils/iv_rank.py` utility** (Tier 1 #A, step 1). Pure math helper.
+  Build it now.
+- **`spy_options_reversion` IVR observation logging** (Tier 1 #A, step 1
+  application). Zero behavior change; builds evidence base in the
+  background.
+- **SGOV defensive cash sweep** (PLAN 11.44). Independent of options
+  entirely; earns its keep on day-one of the first prolonged BEAR.
 
-Re-rank for the credit-spread-dependent items, applying the recorded
-bear-roster decision:
+**Track 2 — sequenced after 11.30 credit-spread paper-watch settles:**
 
-- If credit spread is solidly profitable → bear call credit spread (G) is
-  the highest-leverage next move; same infrastructure, fills the
-  most-empty regime slot, aligns with the recorded bear-roster decision.
-  IC (B) follows as the bull-side symmetric extension; IVR wiring (A,
-  step 2) tunes the credit-spread filter using 11.30 evidence.
-- If credit spread is marginal → debit-spread refinement to
-  `spy_options_reversion` (C) becomes the more interesting next move; it's
-  independent edge and doesn't depend on short-premium working. Holding
-  off on bear mirrors is correct here — they share the credit-spread
-  thesis.
-- If credit spread is structurally losing → re-open the project posture
+1. **IVR wiring into credit spread filter** (Tier 1 #A, step 2). Use
+   11.30 evidence to choose between replace-floor / AND-with-floor /
+   per-instrument-tuned. Conservative v1: AND with the existing absolute
+   floor.
+2. **Bull call debit spread switch for `spy_options_reversion`** (Tier 2
+   #C). High-conviction refinement that reduces vega leak on long calls
+   in rich-IV regimes. Reuses the MLEG path already shipped.
+3. **Iron Condor with the asymmetric / trend-conditional refinements**
+   (Tier 2 #B). Add the bear call leg per the asymmetric-delta and
+   below-50-SMA gating described in §4. Only after the bull put has run
+   smoothly long enough to validate the underlying thesis.
+
+**Track 3 — bear roster, separate paper-watch path:**
+- **Bear call credit spread** (§4 G) first — same infrastructure as IC's
+  bear call leg, but always-on in BEAR regime rather than gated within
+  the IC. Fractionally sized (~2% sleeve) until real BEAR cycles
+  accumulate.
+- **SPY long-put RSI mirror** (§4 H) and **bear put debit spread** (§4
+  I) follow only if H's backtest on historical BEAR windows shows real
+  edge.
+
+### Branching on the credit spread outcome
+
+The default linear path above assumes credit spread proves profitable
+during 11.30. If 11.30 lands somewhere else, the branching changes:
+
+- **Credit spread is solidly profitable** → default linear path above.
+  Bear call spread (G) is the highest-leverage Track-3 move and aligns
+  with the bear-roster decision (§6 Q2).
+- **Credit spread is marginal** → Track 2 steps 1–2 still ship (IVR
+  utility wiring + debit spread switch for SPY options reversion —
+  independent edge, doesn't depend on short-premium working). Hold off
+  on IC (Track 2 step 3) and bear call spread (Track 3) until the
+  credit-spread thesis recovers or the strategy is shelved.
+- **Credit spread is structurally losing** → re-open the project-posture
   question. The capital-gated wheel (K) is a different bet on the same
   theta thesis with a built-in acquisition hedge, and would justify the
-  reallocation needed to make it feasible. But this is a project-direction
-  decision, not a strategy add.
+  reallocation needed to make it feasible. But this is a
+  project-direction decision, not a strategy add.
 
-Strategy Health verdicts on the credit spread (and any future additions)
-are the canonical input to this re-rank — not raw P&L. A strategy in
-WATCH or DEGRADED is a signal to hold off on its mirrors and extensions
-until the verdict recovers or the operator shelves it.
+### What "settled verdict" means
+
+Strategy Health (PLAN 11.10) verdicts on the credit spread are the
+canonical input to this branching — not raw P&L. A strategy in WATCH or
+DEGRADED holds off its mirrors and extensions until the verdict recovers
+or the operator shelves it. A strategy in BROKEN goes to shelve; no
+extensions until the underlying thesis is reworked.
