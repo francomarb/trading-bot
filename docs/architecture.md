@@ -512,7 +512,7 @@ A second options dispatch path handles atomic multi-leg combos via Alpaca's `Ord
 
 1. **Exit eval runs before any entry gating** — `_process_credit_spread_exits` iterates `strategy.open_spreads`, evaluates `evaluate_spread_exit` per spread, and dispatches a closing combo on a trigger. Exits are never blocked by halt / regime / sleeve.
 2. **Entry bypasses `RiskManager.evaluate`** — a defined-risk spread's max loss IS the risk control (capped by the sleeve notional). The engine-level guards above it (halt, daily-loss, broker-error streak, regime gate, sleeve allocator) still run.
-3. `_enter_credit_spread` calls `build_spread_execution`, which runs the strategy's own caps (`max_concurrent_positions`, `max_per_expiration`, `min_dte_gap_between_opens`, global `MAX_TOTAL_CONCURRENT_CREDIT_SPREADS`) and picks the spread from the live chain.
+3. `_enter_multi_leg` (renamed from `_enter_credit_spread` in PLAN 11.44 to match the generalized MLEG plumbing) calls `build_spread_execution`, which runs the strategy's own caps (`max_concurrent_positions`, `max_per_expiration`, `min_dte_gap_between_opens`, global `MAX_TOTAL_CONCURRENT_CREDIT_SPREADS`) and picks the spread from the live chain. Immediately after the plan is built and before `dispatch_spread_order`, `_reject_if_contract_conflict` checks every leg OCC against `_contract_owner` and fires `CONTRACT_CONFLICT` if any leg collides with a contract already owned by another strategy (see "Cross-strategy conflict rule" above).
 
 **Dispatch (`broker.dispatch_spread_order`).** Builds an MLEG `LimitOrderRequest` and starts a `SpreadExecutionWorker` thread. Returns `ACCEPTED` immediately. A `closing=True` flag reverses the legs into the `*_TO_CLOSE` trade so opens and closes share one worker + drain path.
 

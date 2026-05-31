@@ -429,10 +429,11 @@ A bull put credit spread sells the short (higher-strike) put and buys the long (
 
 Entry:
 1. `_process_symbol` detects `hasattr(strategy, "build_spread_execution")` → takes the dedicated spread path. **Bypasses `RiskManager.evaluate`** (built for single-leg ATR-stop sizing — N/A to a defined-risk spread). Still passes every engine-level guard above it: halt, daily-loss, broker-error streak, regime gate, sleeve allocator.
-2. `_enter_credit_spread` calls `strategy.build_spread_execution(...)` — runs the caps, picks the spread from the live chain via `find_best_put_spread`, returns a `SpreadExecutionPlan` with a **negative** limit price (Alpaca MLEG sign convention: positive = net debit paid, negative = net credit required — confirmed by the 11.28 merge gate).
-3. `broker.dispatch_spread_order` builds the MLEG `LimitOrderRequest` and starts a `SpreadExecutionWorker` thread. Returns `ACCEPTED` immediately; the worker watches the combo via the WebSocket stream and cancels if unfilled past its timeout.
-4. The engine pre-registers a two-leg `Position` (keyed by a UUID `position_id`, `position_type='spread'`) and calls `strategy.register_spread(OpenSpread(...))`. Pre-registration is rolled back on cancel/reject.
-5. Each cycle `_drain_spread_fills` consumes the worker's terminal events: fills → log to trade DB and fire the alert; cancels → release the pre-registration.
+2. `_enter_multi_leg` (renamed from `_enter_credit_spread` in PLAN 11.44 — strategy-agnostic name matches the duck-typed MLEG plumbing) calls `strategy.build_spread_execution(...)` — runs the caps, picks the spread from the live chain via `find_best_put_spread`, returns a `SpreadExecutionPlan` with a **negative** limit price (Alpaca MLEG sign convention: positive = net debit paid, negative = net credit required — confirmed by the 11.28 merge gate).
+3. Before dispatch, `_reject_if_contract_conflict` checks every leg OCC against `_contract_owner` (PLAN 11.44); fires `CONTRACT_CONFLICT` and aborts if any leg collides with a contract already owned by another strategy.
+4. `broker.dispatch_spread_order` builds the MLEG `LimitOrderRequest` and starts a `SpreadExecutionWorker` thread. Returns `ACCEPTED` immediately; the worker watches the combo via the WebSocket stream and cancels if unfilled past its timeout.
+5. The engine pre-registers a two-leg `Position` (keyed by a UUID `position_id`, `position_type='spread'`) and calls `strategy.register_spread(OpenSpread(...))`. Pre-registration is rolled back on cancel/reject.
+6. Each cycle `_drain_spread_fills` consumes the worker's terminal events: fills → log to trade DB and fire the alert; cancels → release the pre-registration.
 
 Exit:
 1. `_process_credit_spread_exits` runs before any entry gating (exits are never blocked by halt / regime / sleeve). Iterates `strategy.open_spreads`; for each runs `evaluate_spread_exit`.
