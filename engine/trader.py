@@ -97,7 +97,7 @@ from strategies.base import (
     OrderType,
     StrategySlot,
 )
-from utils.option_symbols import parse_occ_symbol
+from utils.option_symbols import is_occ_option, parse_occ_symbol
 
 from regime.detector import MarketRegime
 
@@ -340,6 +340,21 @@ class TradingEngine:
         self._processed_signal_statuses: dict[tuple[str, str, str], str] = {}
         self._processed_signal_reasons: dict[tuple[str, str, str], list[str]] = {}
 
+        # Rolling rejection timestamps for HealthAssessor (24h windowed counts
+        # exposed via engine_state.json). PLAN 11.44:
+        #   symbol_conflicts  — equity-level cross-strategy collisions
+        #                       (e.g. two equity strategies trying to own AAPL).
+        #   contract_conflicts — leg-level cross-strategy collisions on the
+        #                       exact OCC contract (single-leg vs single-leg,
+        #                       single-leg vs MLEG leg, or MLEG leg vs MLEG leg).
+        # Two separate buckets because the remediation differs: symbol conflicts
+        # are usually a slot-config overlap; contract conflicts indicate two
+        # options pickers landing on the same strike/expiry and would corrupt
+        # ownership tracking if not blocked (positions aggregate at the broker
+        # by exact symbol).
+        self._symbol_conflicts: list[datetime] = []
+        self._contract_conflicts: list[datetime] = []
+
     # ── Position bookkeeping helpers (PR 11.27) ──────────────────────────
 
     def _owners_view(self) -> dict[str, str]:
@@ -383,6 +398,86 @@ class TradingEngine:
         """Remove the Position for ``symbol`` (OCC-aware). Return strategy_name."""
         pos = self._positions.pop(owner_key_for(symbol), None)
         return pos.strategy_name if pos else None
+
+    # ── Contract-level conflict (PLAN 11.44) ─────────────────────────────
+
+    def _contract_owner(self, occ: str) -> tuple[str, str] | None:
+        """
+        Return ``(strategy_name, position_id)`` for any tracked position that
+        already holds ``occ`` as a leg, else ``None``.
+
+        Leg-level, strategy-agnostic scan — applies equally to single-leg
+        option positions and to any leg of any multi-leg position. Used by
+        the dispatch-time contract-conflict guard.
+
+        Two strategies cannot independently hold the same OCC because the
+        broker aggregates positions by exact symbol: combined qty under a
+        single cost basis means the engine's per-strategy ownership map
+        physically cannot represent shared ownership. Long-vs-short
+        compounds the hazard — positions net at the broker and one
+        strategy's exit could silently flip the other into the wrong side.
+        """
+        for pos in self._positions.values():
+            for leg in pos.legs:
+                if leg.symbol == occ:
+                    return (pos.strategy_name, pos.position_id)
+        return None
+
+    def _reject_if_contract_conflict(
+        self,
+        *,
+        strategy_name: str,
+        symbol: str,
+        occs: "list[str]",
+    ) -> tuple[str, str] | None:
+        """
+        Check every OCC in ``occs`` against ``_contract_owner``. If any leg is
+        already owned by a different strategy, fire the ``CONTRACT_CONFLICT``
+        alert, increment the rolling counter, and return the first colliding
+        ``(other_strategy_name, occ)`` pair. Returns ``None`` when clear.
+
+        Side-effect on alerts/counters is intentional — keeps the two dispatch
+        paths (single-leg options and MLEG) symmetric and free of duplicated
+        rejection plumbing.
+        """
+        for occ in occs:
+            owner = self._contract_owner(occ)
+            if owner is not None and owner[0] != strategy_name:
+                other_strategy, _ = owner
+                reason = (
+                    f"contract {occ} already owned by '{other_strategy}'"
+                )
+                logger.info(
+                    f"[{strategy_name}] {symbol}: entry blocked — {reason}"
+                )
+                self.alerts.order_rejection(
+                    symbol, strategy_name, reason, "CONTRACT_CONFLICT"
+                )
+                self._contract_conflicts.append(datetime.now(timezone.utc))
+                return (other_strategy, occ)
+        return None
+
+    @staticmethod
+    def _prune_window(
+        timestamps: "list[datetime]", *, window: timedelta
+    ) -> int:
+        """In-place prune of ``timestamps`` older than ``window``. Returns the
+        remaining count.
+
+        Tiny helper shared by the conflict counters — keeps the list bounded
+        (entries are short-lived; in practice at most a handful per day) and
+        gives the snapshot writer the windowed count without a second pass.
+        """
+        cutoff = datetime.now(timezone.utc) - window
+        # Slice from the first index whose timestamp is still within the window.
+        keep_from = 0
+        for ts in timestamps:
+            if ts >= cutoff:
+                break
+            keep_from += 1
+        if keep_from:
+            del timestamps[:keep_from]
+        return len(timestamps)
 
     # ── Lifecycle ────────────────────────────────────────────────────────
 
@@ -1062,35 +1157,58 @@ class TradingEngine:
             )
             return
 
-        # Shared-symbol conflict (11.7 Part A) — another strategy already owns
-        # this symbol via ownership pre-registration (async options) or a
-        # confirmed entry that has not yet appeared in the broker snapshot.
-        # Two strategies cannot hold the same position simultaneously: the
-        # second strategy's fill would overwrite the first's ownership record
-        # and leave one position unmanaged. Same-cycle ties are resolved by
-        # allocator priority via _slots_by_priority — the higher-priority slot
-        # pre-registers first, so by the time the lower-priority slot reaches
-        # this check the owner is already set. Exits never reach this code path.
-        existing_owner = self._get_owner(symbol)
-        if existing_owner is not None and existing_owner != strategy.name:
-            logger.info(
-                f"[{strategy.name}] {symbol}: entry blocked — "
-                f"symbol already owned by '{existing_owner}'"
-            )
-            self.alerts.order_rejection(
-                symbol,
-                strategy.name,
-                f"symbol already owned by '{existing_owner}'",
-                "SYMBOL_CONFLICT",
-            )
-            if strategy_statuses is not None:
-                strategy_statuses[symbol] = "Symbol Conflict"
-            if strategy_reasons is not None:
-                strategy_reasons[symbol] = [f"owned by '{existing_owner}'"]
-            self._mark_signal_bar_processed(
-                signal_key, signal_bar, strategy_statuses, strategy_reasons, symbol
-            )
-            return None
+        # Shared-symbol conflict (11.7 Part A, refined by PLAN 11.44).
+        #
+        # Asymmetry by ownership-model keying:
+        #   * Equity and single-leg-options positions are keyed in ``_positions``
+        #     by ``owner_key_for(symbol)`` (equity ticker or option underlying).
+        #     Two of them on the same underlying ticker cannot coexist — the
+        #     map can only hold one record per owner_key, so a second
+        #     pre-registration would either be silently dropped (clobbering
+        #     ownership / entry-price attribution) or aggregate into one
+        #     broker position with ambiguous attribution. Both incoming
+        #     equity strategies and incoming single-leg options strategies
+        #     must therefore pass this check.
+        #   * MLEG (spread) positions are keyed by UUID and never occupy the
+        #     underlying slot, so MLEG strategies skip the underlying check
+        #     entirely. The contract-level guard at dispatch
+        #     (``_reject_if_contract_conflict``) is the operative safety net
+        #     for them — it blocks the exact-OCC overlap case (the only
+        #     scenario that would aggregate at the broker).
+        #
+        # ``_get_owner`` only finds single-leg owners by construction (the
+        # underlying-key lookup misses UUID-keyed spreads), so an existing
+        # spread on the same underlying does NOT block an incoming
+        # single-leg options strategy here — exactly the headline
+        # 2026-05-29 case (spy_options_reversion + credit_spread on SPY).
+        #
+        # Future expansion: allowing two single-leg options strategies on
+        # the same underlying requires moving single-leg option Positions
+        # off the underlying-keyed ``_positions`` slot (e.g. UUID or full
+        # OCC). Tracked as follow-up to PLAN 11.44.
+        is_mleg_strategy = hasattr(strategy, "build_spread_execution")
+        if not is_mleg_strategy:
+            existing_owner = self._get_owner(symbol)
+            if existing_owner is not None and existing_owner != strategy.name:
+                logger.info(
+                    f"[{strategy.name}] {symbol}: entry blocked — "
+                    f"symbol already owned by '{existing_owner}'"
+                )
+                self.alerts.order_rejection(
+                    symbol,
+                    strategy.name,
+                    f"symbol already owned by '{existing_owner}'",
+                    "SYMBOL_CONFLICT",
+                )
+                self._symbol_conflicts.append(datetime.now(timezone.utc))
+                if strategy_statuses is not None:
+                    strategy_statuses[symbol] = "Symbol Conflict"
+                if strategy_reasons is not None:
+                    strategy_reasons[symbol] = [f"owned by '{existing_owner}'"]
+                self._mark_signal_bar_processed(
+                    signal_key, signal_bar, strategy_statuses, strategy_reasons, symbol
+                )
+                return None
 
         # Sleeve check — must pass before risk sizing.
         # Narrows the notional budget available to this strategy without
@@ -1134,7 +1252,7 @@ class TradingEngine:
         # all the engine-level guards above (halt, daily-loss, broker-error,
         # regime gate, sleeve) have already been applied.
         if hasattr(strategy, "build_spread_execution"):
-            self._enter_credit_spread(
+            self._enter_multi_leg(
                 strategy=strategy,
                 symbol=symbol,
                 underlying_close=latest_close,
@@ -1175,6 +1293,33 @@ class TradingEngine:
                     signal_key, signal_bar, strategy_statuses, strategy_reasons, symbol
                 )
                 return None
+
+            # PLAN 11.44: contract-level conflict guard. The picker resolved
+            # the OCC; reject before order submission if another strategy
+            # already owns the exact contract. For single-leg options this
+            # is the second of two checks — the underlying-level
+            # ``_get_owner`` check above already blocks another single-leg
+            # owner of the same underlying (the single-leg ``_positions``
+            # slot can only hold one), so the case reached here is the
+            # exact-OCC clash against an MLEG leg owner (whose UUID-keyed
+            # position does not occupy the underlying slot).
+            if is_occ_option(target_symbol):
+                if self._reject_if_contract_conflict(
+                    strategy_name=strategy.name,
+                    symbol=symbol,
+                    occs=[target_symbol],
+                ) is not None:
+                    if strategy_statuses is not None:
+                        strategy_statuses[symbol] = "Contract Conflict"
+                    if strategy_reasons is not None:
+                        strategy_reasons[symbol] = [
+                            f"{target_symbol} owned by another strategy"
+                        ]
+                    self._mark_signal_bar_processed(
+                        signal_key, signal_bar, strategy_statuses,
+                        strategy_reasons, symbol,
+                    )
+                    return None
 
         # PLAN 11.32: gate MARKET entries through the per-strategy price cap.
         # Options/spread paths build their own envelopes upstream and pass
@@ -2685,7 +2830,7 @@ class TradingEngine:
                 out.append(pos)
         return out
 
-    def _enter_credit_spread(
+    def _enter_multi_leg(
         self,
         *,
         strategy: BaseStrategy,
@@ -2698,10 +2843,16 @@ class TradingEngine:
         strategy_reasons: dict[str, list[str]] | None,
     ) -> None:
         """
-        Credit-spread entry: build the spread plan, dispatch the async MLEG
-        combo, and pre-register the spread Position. The combo fill confirms
-        asynchronously via ``_drain_spread_fills`` (or rolls the
+        Generic MLEG entry path: build the spread plan, dispatch the async
+        MLEG combo, and pre-register the multi-leg Position. The combo fill
+        confirms asynchronously via ``_drain_spread_fills`` (or rolls the
         pre-registration back on cancel/reject).
+
+        Any strategy that exposes ``build_spread_execution`` is routed here —
+        credit spreads today, future iron condors / butterflies / ratio
+        spreads tomorrow. The naming is deliberately strategy-agnostic
+        (PLAN.md 11.31 generalized the MLEG plumbing; 11.44 renamed this
+        entry point to match).
         """
         def _done(status: str) -> None:
             if strategy_statuses is not None:
@@ -2738,6 +2889,21 @@ class TradingEngine:
             _done("No Signal")
             return
 
+        # PLAN 11.44: contract-level conflict guard. The plan resolved every
+        # leg OCC; reject before dispatch if any leg collides with a contract
+        # already owned by a different strategy. Distinct OCCs on the same
+        # underlying are intentionally allowed by the underlying-level skip
+        # upstream — only exact-contract overlap (which would aggregate at the
+        # broker into one shared position) is blocked here.
+        leg_occs = [leg.occ_symbol for leg in plan.legs]
+        if self._reject_if_contract_conflict(
+            strategy_name=strategy.name,
+            symbol=symbol,
+            occs=leg_occs,
+        ) is not None:
+            _done("Contract Conflict")
+            return
+
         position_id = new_spread_id()
         try:
             result = self.broker.dispatch_spread_order(
@@ -2766,7 +2932,7 @@ class TradingEngine:
         # credit-spread MLEG path. Equity/options strategies increment
         # submitted after broker.place_order; credit_spread uses
         # dispatch_spread_order so it needs its own increment site
-        # (the existing _enter_credit_spread path was previously
+        # (the existing _enter_multi_leg path was previously
         # missing this — PR #21 reviewer caught it). Without this,
         # L3 submitted_per_raw_signal drift was unusable for
         # credit_spread.
@@ -2824,7 +2990,7 @@ class TradingEngine:
                     # for the credit-spread MLEG path. Multi-leg combo
                     # = 1 entry per design §12.4.1, regardless of leg
                     # count. Paired with the submitted++ in
-                    # _enter_credit_spread (after dispatch_spread_order
+                    # _enter_multi_leg (after dispatch_spread_order
                     # returned ACCEPTED). PR #21 reviewer fix.
                     _lc = self._lifecycle_counter_for(strategy_name)
                     if _lc is not None:
@@ -3652,6 +3818,18 @@ class TradingEngine:
                 "positions_detail": positions_detail,
                 "credit_spreads": self._credit_spreads_snapshot(),
                 "multi_leg_positions": self._multi_leg_positions_snapshot(),
+                # PLAN 11.44: rolling 24h cross-strategy conflict counts for
+                # HealthAssessor L1. ``symbol_conflicts_24h`` covers the
+                # equity underlying-level rule (always was the documented
+                # field); ``contract_conflicts_24h`` is the new leg-level
+                # rule that catches two options strategies landing on the
+                # same exact OCC.
+                "symbol_conflicts_24h": self._prune_window(
+                    self._symbol_conflicts, window=timedelta(hours=24)
+                ),
+                "contract_conflicts_24h": self._prune_window(
+                    self._contract_conflicts, window=timedelta(hours=24)
+                ),
                 "allocator": allocator_snapshot["strategies"],
                 "capital_pools": allocator_snapshot["pools"],
                 "pending_entry_notional": pending_entry_notional,

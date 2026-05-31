@@ -1,6 +1,6 @@
 """
 Unit tests for the engine's credit-spread wiring (PLAN.md 11.29 PR 3b):
-the entry path (_enter_credit_spread), the async fill drain
+the entry path (_enter_multi_leg), the async fill drain
 (_drain_spread_fills), and the exit path (_process_credit_spread_exits).
 
 The broker is a MagicMock; the strategy is a real CreditSpread with stubbed
@@ -129,7 +129,7 @@ class TestEnterCreditSpread:
             raw_status="accepted", message="",
         )
         with patch("strategies.credit_spread.find_best_put_spread", return_value=_pick()):
-            engine._enter_credit_spread(
+            engine._enter_multi_leg(
                 strategy=strategy, symbol="SPY", underlying_close=745.0,
                 notional_cap=2_000.0, signal_key=_SIGNAL_KEY, signal_bar=_SIGNAL_BAR,
                 strategy_statuses={}, strategy_reasons={},
@@ -152,7 +152,7 @@ class TestEnterCreditSpread:
         strategy = _strategy()
         engine, broker = _engine(tmp_path, strategy)
         with patch("strategies.credit_spread.find_best_put_spread", return_value=None):
-            engine._enter_credit_spread(
+            engine._enter_multi_leg(
                 strategy=strategy, symbol="SPY", underlying_close=745.0,
                 notional_cap=2_000.0, signal_key=_SIGNAL_KEY, signal_bar=_SIGNAL_BAR,
                 strategy_statuses={}, strategy_reasons={},
@@ -164,7 +164,7 @@ class TestEnterCreditSpread:
     def test_no_notional_cap_skips_entry(self, tmp_path):
         strategy = _strategy()
         engine, broker = _engine(tmp_path, strategy)
-        engine._enter_credit_spread(
+        engine._enter_multi_leg(
             strategy=strategy, symbol="SPY", underlying_close=745.0,
             notional_cap=None, signal_key=_SIGNAL_KEY, signal_bar=_SIGNAL_BAR,
             strategy_statuses={}, strategy_reasons={},
@@ -181,7 +181,7 @@ class TestEnterCreditSpread:
             raw_status="rejected", message="rejected",
         )
         with patch("strategies.credit_spread.find_best_put_spread", return_value=_pick()):
-            engine._enter_credit_spread(
+            engine._enter_multi_leg(
                 strategy=strategy, symbol="SPY", underlying_close=745.0,
                 notional_cap=2_000.0, signal_key=_SIGNAL_KEY, signal_bar=_SIGNAL_BAR,
                 strategy_statuses={}, strategy_reasons={},
@@ -203,7 +203,7 @@ class TestEnterCreditSpread:
                 legs=[PositionLeg("A", -1, side="SELL"), PositionLeg("B", 1, side="BUY")],
             )
         with patch("strategies.credit_spread.find_best_put_spread") as picker:
-            engine._enter_credit_spread(
+            engine._enter_multi_leg(
                 strategy=strategy, symbol="SPY", underlying_close=745.0,
                 notional_cap=2_000.0, signal_key=_SIGNAL_KEY, signal_bar=_SIGNAL_BAR,
                 strategy_statuses={}, strategy_reasons={},

@@ -214,23 +214,35 @@ def _l1_checks(
     out.append(_not_yet_wired("cycle_latency_p95_ms", Layer.L1))
 
     # ── Ownership conflicts (already alerted, count in engine state) ──
-    # If engine_state surfaces a count of SYMBOL_CONFLICT events, use it.
-    conflicts = engine_state.get("symbol_conflicts_24h")
-    if conflicts is not None:
+    # Two parallel buckets (PLAN 11.44):
+    #   * symbol_conflicts_24h   — equity-level slot overlap rejections
+    #     (e.g. two equity strategies both want AAPL).
+    #   * contract_conflicts_24h — leg-level exact-OCC rejections across
+    #     single-leg and MLEG option strategies. Distinct from symbol
+    #     conflicts because the remediation differs (picker tuning vs
+    #     slot config) and an unblocked contract conflict would corrupt
+    #     ownership at the broker (positions aggregate by exact symbol).
+    for field, label in (
+        ("symbol_conflicts_24h", "symbol-conflict"),
+        ("contract_conflicts_24h", "contract-conflict"),
+    ):
+        value = engine_state.get(field)
+        if value is None:
+            continue
         try:
             thresh = get_thresholds(strategy_name, "reconciliation_mismatches_24h")
-            status = _classify(float(conflicts), thresh, layer=Layer.L1)
+            status = _classify(float(value), thresh, layer=Layer.L1)
             out.append(CheckResult(
-                name="symbol_conflicts_24h",
+                name=field,
                 layer=Layer.L1,
                 status=status,
-                numeric_value=float(conflicts),
+                numeric_value=float(value),
                 findings=[
-                    f"{int(conflicts)} symbol-conflict event(s) in last 24h"
+                    f"{int(value)} {label} event(s) in last 24h"
                 ],
             ))
         except KeyError:
-            out.append(_healthy("symbol_conflicts_24h", Layer.L1))
+            out.append(_healthy(field, Layer.L1))
 
     return out
 
