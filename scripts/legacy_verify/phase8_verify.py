@@ -10,7 +10,7 @@ no-op strategy (never trades) to verify:
   4. No positions opened (strategy emits no signals).
   5. Graceful shutdown with order-cancel sweep.
 
-Run: `python phase8_verify.py`
+Run: `python scripts/legacy_verify/phase8_verify.py`
 """
 
 from __future__ import annotations
@@ -18,7 +18,12 @@ from __future__ import annotations
 import sys
 import time
 from datetime import datetime, timedelta, timezone
+from pathlib import Path
 from unittest.mock import patch
+
+ROOT = Path(__file__).resolve().parents[2]
+if str(ROOT) not in sys.path:
+    sys.path.insert(0, str(ROOT))
 
 import pandas as pd
 from loguru import logger

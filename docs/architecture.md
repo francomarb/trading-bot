@@ -199,7 +199,8 @@ trading-bot/
 │
 ├── docs/                      # Architecture and strategy documentation
 ├── logs/                      # Rotating log files (gitignored)
-├── phase*_verify.py           # Integration verification scripts per phase
+├── scripts/legacy_verify/     # Historical paper integration checks
+├── phase_operator_a_identity_verify.py # Current operator-controls verification
 └── .gitignore
 ```
 

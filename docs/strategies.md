@@ -18,7 +18,7 @@ This document catalogues every strategy in the bot, its signal logic, edge filte
 
 ## Active Strategies
 
-All four strategies are running simultaneously in paper trading as of Phase 10 (2026-05-06). They share a single `RiskManager` and equity pool, divided via the `SleeveAllocator`.
+Five strategy sleeves are running simultaneously in paper trading: SMA, RSI, Donchian, SPY Options, and Credit Spread. They share a single `RiskManager`; the `SleeveAllocator` splits deployable capital into an equity pool and an isolated-options pool.
 
 ---
 
@@ -31,9 +31,9 @@ All four strategies are running simultaneously in paper trading as of Phase 10 (
 | Type | Trend-following |
 | Order type | MARKET |
 | Status | **Paper Trading** |
-| Sleeve weight | 45% of gross capital |
-| Max positions | 5 |
-| Per-position budget | ~$7,200 at $100k paper equity |
+| Sleeve weight | 40% of deployable gross capital |
+| Max positions | 8 |
+| Per-position budget | ~$12,800 max notional at $100k paper equity |
 
 **Signal logic:**
 - **Entry:** Fast SMA crosses *above* slow SMA (bullish crossover)

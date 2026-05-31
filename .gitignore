@@ -1,5 +1,6 @@
 config/.env
 __pycache__/
+.pytest_cache/
 *.pyc
 *.pyo
 .DS_Store
@@ -16,6 +17,7 @@ data/historical/
 logs/
 .env
 venv/
+/trading-bot/
 old/
 notebooks/
 *.egg-info/

@@ -1,6 +1,6 @@
 # Trading Bot
 
-A modular, strategy-agnostic algorithmic trading bot built in Python. Four strategies running simultaneously in Alpaca paper trading, with a full go/no-go framework for live capital deployment.
+A modular, strategy-agnostic algorithmic trading bot built in Python. Five strategy sleeves are running simultaneously in Alpaca paper trading, with a full go/no-go framework for live capital deployment.
 
 ## Stack
 
@@ -22,10 +22,11 @@ A modular, strategy-agnostic algorithmic trading bot built in Python. Four strat
 
 | Strategy | Type | Order Type | Sleeve | Status |
 |---|---|---|---|---|
-| SMA Crossover | Trend-following | Market | 45% | **Active — Paper Trading** |
-| RSI Reversion | Mean-reversion | Limit | 25% | **Active — Paper Trading** |
+| SMA Crossover | Trend-following | Market | 40% | **Active — Paper Trading** |
+| RSI Reversion | Mean-reversion | Limit | 20% | **Active — Paper Trading** |
 | Donchian Breakout | Trend continuation | Market | 25% | **Active — Paper Trading** |
 | SPY Options RSI Reversion | Options mean-reversion | Limit (OCC) | 5% | **Active — Paper Trading** |
+| Credit Spread | Short-premium options | Limit MLEG | 10% | **Active — Paper Trading** |
 
 See [docs/strategies.md](docs/strategies.md) for full signal logic, parameters, and exit guards.
 
@@ -35,7 +36,7 @@ See [docs/strategies.md](docs/strategies.md) for full signal logic, parameters, 
 Engine (live loop) → Data Layer → Indicators + Strategies → Risk Manager → Broker → Reporting
 ```
 
-The engine runs multiple strategy slots, each with its own symbol universe. Risk and execution are shared across all slots, and Phase 10 adds a portfolio allocation layer so each strategy has an explicit capital sleeve. Every trade is logged to SQLite and evaluated against go/no-go thresholds before live deployment.
+The engine runs multiple strategy slots, each with its own symbol universe. Risk and execution are shared across all slots, with an allocator that splits deployable capital into an 85% equity pool and a 15% isolated-options pool. Every trade is logged to SQLite and evaluated against go/no-go thresholds before live deployment.
 
 See [docs/architecture.md](docs/architecture.md) for the full architecture guide.
 
@@ -49,10 +50,7 @@ pip install -r requirements.txt
 cp config/.env.example config/.env
 # Edit config/.env with your Alpaca API key and secret
 
-# 3. Verify connection
-python phase1_connect.py
-
-# 4. Run tests
+# 3. Run tests
 pytest
 ```
 
@@ -93,10 +91,11 @@ Thresholds (from [architecture.md](docs/architecture.md)):
 | Win Rate | > 45% |
 | Avg Win / Avg Loss | > 1.5 |
 
-The 50-trade threshold is a statistical live-readiness gate. With four active
+The 50-trade threshold is a statistical live-readiness gate. With five active
 strategies the combined trade rate is higher, but daily-bar trend strategies
-(SMA, Donchian) still generate trades slowly. Use `backtest/reconcile.py` and
-operational stability alongside the trade-count gate.
+(SMA, Donchian) and defined-risk options spreads still need enough paper
+cycles to prove execution quality. Use `backtest/reconcile.py`, strategy
+health reports, and operational stability alongside the trade-count gate.
 
 ## Testing
 
@@ -107,8 +106,8 @@ pytest
 # With coverage
 pytest --cov=strategies --cov=indicators --cov=reporting --cov-report=term-missing
 
-# Integration checks (hits Alpaca paper — run manually)
-python phase9_verify.py
+# Legacy paper integration checks (hit Alpaca paper — run manually)
+python scripts/legacy_verify/phase9_verify.py
 ```
 
 ## Project Status

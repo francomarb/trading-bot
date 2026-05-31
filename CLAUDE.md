@@ -116,10 +116,11 @@ trading-bot/
 │   ├── build_envelopes.py     # Builds per-strategy backtest envelopes for the health monitor
 │   ├── strategy_health_review.py # On-demand strategy health/edge report CLI
 │   ├── calibrate_health_thresholds.py # Suggests health-threshold diffs from N weeks of data
+│   ├── legacy_verify/         # Historical paper integration checks (manual)
 │   └── *.py                   # Watchlist scanners and analysis scripts
 ├── tests/                     # Unit tests (pytest)
 ├── logs/                      # Rotating log files (gitignored)
-└── phase*_verify.py           # Integration verification scripts per phase
+└── phase_operator_a_identity_verify.py # Current operator-controls verification
 ```
 
 ---
@@ -201,23 +202,24 @@ All credential and DB routing derives from `LIVE_TRADING`. Do not set
 ## Testing Standard
 
 Testing is **non-negotiable** for this project — this code is meant to place orders with
-real money. Every phase has both:
+real money. Current changes must ship with focused unit tests. Broker-facing or
+operational changes may also require a targeted manual paper check.
 
-### Two test layers per phase
+### Test layers
 
 | Layer | Location | Runs | Purpose |
 |---|---|---|---|
 | **Unit tests** | `tests/test_*.py` | `pytest` (every change) | Fast, offline, deterministic. Cover pure logic: validation, transformations, state machines, error paths. Never hit live APIs. Mock external dependencies. |
-| **Integration / verification** | `phase<N>_verify.py` | Manually at phase boundaries | End-to-end against live Alpaca paper account. Proves the phase's exit criteria. Hits the network. |
+| **Manual paper checks** | `scripts/legacy_verify/*.py`, targeted scripts, or `phase_operator_a_identity_verify.py` | Manually when relevant | End-to-end or high-level checks against Alpaca paper/local DB. Hits the network when broker-facing. |
 
 ### Rules
 
-- **Every phase must ship unit tests.** A phase is not complete until both unit tests and the `phase<N>_verify.py` script pass.
+- **Every material change must ship unit tests.** Broker-facing or operational changes should also name the manual paper verification path used or deferred.
 - Unit tests go in `tests/<module>.py::Test<ClassName>::test_<behavior>` — grouped by class, one class per logical area.
 - Use the `make_ohlcv` / `clean_ohlcv` / `tmp_cache_dir` fixtures in `tests/conftest.py` for synthetic data. **Never** use live Alpaca data in unit tests.
 - Mark integration-requiring tests with `@pytest.mark.integration`; they are deselected by default.
 - Test the **contract**, not the implementation: accept clean input, reject every type of bad input, cover every documented error path.
-- Aim for ≥ 80% coverage on pure logic. Integration-only code (thin wrappers around Alpaca SDK) may be lower — it's exercised by `phase<N>_verify.py`.
+- Aim for ≥ 80% coverage on pure logic. Integration-only code (thin wrappers around Alpaca SDK) may be lower, but it needs targeted paper verification before live use.
 
 ### Running tests
 
@@ -237,8 +239,8 @@ pytest via its full path — never search outside the project directory:
 # With coverage
 /Users/franco/trading-bot/venv/bin/pytest --cov=<module> --cov-report=term-missing
 
-# Phase integration check (hits Alpaca paper)
-python phase2_verify.py
+# Example legacy paper check (hits Alpaca paper)
+python scripts/legacy_verify/phase9_verify.py
 ```
 
 ---

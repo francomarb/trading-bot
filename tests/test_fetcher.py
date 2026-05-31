@@ -2,7 +2,7 @@
 Unit tests for data/fetcher.py
 
 Scope: pure functions and cache round-trip. No live Alpaca calls — anything
-needing the real API lives in phase2_verify.py (integration) or behind the
+needing the real API belongs in a targeted manual paper check or behind the
 `integration` marker.
 
 Covers:

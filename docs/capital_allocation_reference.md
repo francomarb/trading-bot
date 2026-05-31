@@ -109,8 +109,8 @@ Implementation note:
 
 Example:
 
-- SMA target = `45%`
-- stretch cap = `45% x 1.15 = 51.75%`
+- SMA target = `40%`
+- stretch cap = `40% x 1.15 = 46%`
 
 This is not meant to create uncontrolled drift. It is a tactical efficiency
 patch for avoiding rejected high-conviction trades while another sleeve is idle.

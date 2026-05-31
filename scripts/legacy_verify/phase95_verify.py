@@ -13,7 +13,7 @@ Verifies that the forward-test tooling works end-to-end:
 The actual multi-week forward test is an operational step — this script
 validates that the infrastructure is ready to support it.
 
-Run: `python phase95_verify.py`
+Run: `python scripts/legacy_verify/phase95_verify.py`
 """
 
 from __future__ import annotations
@@ -22,6 +22,11 @@ import os
 import sys
 import time
 from datetime import datetime, timedelta, timezone
+from pathlib import Path
+
+ROOT = Path(__file__).resolve().parents[2]
+if str(ROOT) not in sys.path:
+    sys.path.insert(0, str(ROOT))
 
 from loguru import logger
 

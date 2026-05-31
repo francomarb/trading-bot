@@ -14,7 +14,7 @@ Drives the reporting stack end-to-end:
   7. **Engine wiring** — run 3 cycles with reporting attached, verify CSV
      and alerts are populated.
 
-Run: `python phase9_verify.py`
+Run: `python scripts/legacy_verify/phase9_verify.py`
 """
 
 from __future__ import annotations
@@ -24,7 +24,12 @@ import os
 import sys
 import time
 from datetime import datetime, timezone
+from pathlib import Path
 from unittest.mock import patch
+
+ROOT = Path(__file__).resolve().parents[2]
+if str(ROOT) not in sys.path:
+    sys.path.insert(0, str(ROOT))
 
 from loguru import logger
 

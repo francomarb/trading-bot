@@ -1,10 +1,11 @@
 #!/usr/bin/env python3
 """
-Cross-strategy Sharpe comparison — SMA vs RSI vs BollingerSqueeze vs DonchianBreakout.
+Cross-strategy Sharpe comparison — selected historical strategy candidates.
 
-Runs all four strategies through the SAME backtest harness with IDENTICAL
-settings (init cash, slippage, feed, date range), each on its own production
-watchlist, so the resulting Sharpes are directly comparable.
+Runs selected strategy candidates through the SAME backtest harness with
+IDENTICAL settings (init cash, slippage, feed, date range), each on its own
+research or production watchlist, so the resulting Sharpes are directly
+comparable.
 
 This answers: "How does each strategy's Sharpe stack up against the others
 in this codebase under the same backtester?"
@@ -162,8 +163,8 @@ def main() -> int:
     sections.append(
         f"# Strategy Sharpe Comparison\n\n"
         f"**Generated:** {datetime.now(timezone.utc).isoformat()}\n\n"
-        f"This is a snapshot reference comparing the three strategies "
-        f"(`SMACrossover`, `RSIReversion`, `BollingerSqueeze`) under identical "
+        f"This is a snapshot reference comparing selected strategy candidates "
+        f"(`SMACrossover`, `RSIReversion`, `BollingerSqueeze`, `DonchianBreakout`) under identical "
         f"backtest settings. Re-run via `python scripts/compare_strategy_sharpes.py`.\n"
     )
     sections.append(
@@ -177,7 +178,7 @@ def main() -> int:
         f"| Slippage | {cfg.slippage_bps} bps |\n"
         f"| Commission | ${cfg.commission_per_trade} per trade |\n"
         f"| Data feed | {settings.ALPACA_DATA_FEED} |\n"
-        f"| Edge filters | ON for all three strategies |\n"
+        f"| Edge filters | ON for all compared strategies |\n"
         f"| ATR stops in backtest | NO — vectorbt does not model the engine's "
         f"`ATR_STOP_MULTIPLIER=2.0` stop legs |\n"
         f"| Aggregation | Equally weighted across each strategy's universe |\n"

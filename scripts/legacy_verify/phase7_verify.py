@@ -14,7 +14,7 @@ Drives `AlpacaBroker` end-to-end against the live Alpaca paper account:
 Pre-flight: any pre-existing AAPL position or AAPL order is force-cleared
 first so the script is idempotent across runs.
 
-Run: `python phase7_verify.py`
+Run: `python scripts/legacy_verify/phase7_verify.py`
 """
 
 from __future__ import annotations
@@ -22,6 +22,11 @@ from __future__ import annotations
 import sys
 import time
 from datetime import datetime, timedelta, timezone
+from pathlib import Path
+
+ROOT = Path(__file__).resolve().parents[2]
+if str(ROOT) not in sys.path:
+    sys.path.insert(0, str(ROOT))
 
 from loguru import logger
 

@@ -15,7 +15,7 @@ This is a snapshot reference comparing the active strategies under backtest sett
 | Slippage | 5.0 bps |
 | Commission | $0.0 per trade |
 | Data feed | iex |
-| Edge filters | ON for all three strategies |
+| Edge filters | ON for all compared strategies |
 | ATR stops in backtest | NO — vectorbt does not model the engine's `ATR_STOP_MULTIPLIER=2.0` stop legs |
 | Aggregation | Equally weighted across each strategy's universe |
 
