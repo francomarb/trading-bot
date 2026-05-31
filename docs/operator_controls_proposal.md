@@ -30,6 +30,8 @@ The operator needs to be able to:
 
 The most important design requirement is unique position identity. Every new logical position must receive a globally unique, immutable ID. Operator commands should target that ID, not ambiguous labels like "close SMA NVDA."
 
+This is the load-bearing invariant for the whole proposal: without immutable per-lifecycle identity, close/reduce commands cannot be made precise, crash recovery cannot bind broker events back to the intended position, and audit trails collapse back into ambiguous symbol-level history.
+
 ---
 
 ## 2. Core Invariant
@@ -109,6 +111,8 @@ Proposed rule:
 Keep existing position_id / owner_key behavior for broker aggregation.
 Add position_uid for immutable lifecycle identity.
 ```
+
+For spreads, the existing `position_id` UUID remains the owner key used by the engine to track the multi-leg broker aggregate. `position_uid` is added alongside that existing spread `position_id`; it is not a rename or replacement. Do not repurpose the existing spread UUID as the lifecycle ID.
 
 ---
 
@@ -215,6 +219,7 @@ However, v1 should still enforce layered safety:
 
 - The operator command queue must be writable only by the bot OS user.
 - Destructive commands require `--reason`.
+- `--reason` values are local operational notes only; never copy them into committed docs, fixtures, or public artifacts if they contain sensitive context.
 - Destructive commands should require explicit confirmation, such as `--confirm <position_uid>` or a command-specific confirmation string.
 - All commands must be audited.
 - The bot validates commands before execution.
@@ -278,8 +283,9 @@ Recommended processing sequence:
 3. Engine generates deterministic command-scoped `client_order_id`.
 4. Engine writes `status='executing'`, `accepted_at`, and `client_order_id`.
 5. Engine commits the SQLite transaction.
-6. Engine sends the broker request.
-7. Engine records success/failure and final broker/order details.
+6. Engine registers the `client_order_id` with the stream manager before submit, matching the existing pre-submit watch pattern.
+7. Engine sends the broker request.
+8. Engine records success/failure and final broker/order details.
 
 On restart:
 
@@ -298,8 +304,10 @@ This is intentionally conservative. An operator can always re-issue the command 
 
 Implementation requirement:
 
-- `OPERATOR_COMMAND_EXPIRY_SECONDS = 60` should live in `config/settings.py`.
-- Operator command polling must run on a fast heartbeat independent of slow strategy cycles; otherwise use a longer expiry such as 180-300 seconds.
+- `OPERATOR_COMMAND_EXPIRY_SECONDS = 180` should live in `config/settings.py`.
+- `OPERATOR_COMMAND_HEARTBEAT_SECONDS = 5` should live in `config/settings.py`.
+- Operator command polling must run on this fast heartbeat independent of slow strategy cycles.
+- The expiry can be lowered to 60 seconds only after the fast heartbeat is implemented, verified, and shown not to miss valid commands during normal bot operation.
 - `client_order_id` strings must fit Alpaca's documented client order ID constraints. Keep generated IDs short and deterministic, for example `op_<command_uid_short>_<action_short>`, with the full mapping stored in SQLite.
 
 ---
@@ -386,7 +394,7 @@ Lifecycle state recommendation:
 2. First fill transitions to `open` or `partially_filled`.
 3. Additional entry fills update `current_qty` and `avg_entry_price`.
 4. Canceled entry with zero fills transitions to `canceled`.
-5. Canceled entry with partial fills remains open at the filled quantity.
+5. Canceled entry with partial fills remains `open` at the filled quantity. It must not transition to `canceled`.
 
 `created_at` means lifecycle creation/planning time, not first fill time. Fill timestamps belong in `trades`, `first_fill_at`, `last_fill_at`, or leg rows.
 
@@ -483,6 +491,14 @@ The lifecycle-level final R can then be computed from cumulative realized P&L ag
 
 Health/edge reporting must be reviewed so partial exits do not accidentally inflate trade count unless "trade count" is intentionally defined as fill/exit-event count. Lifecycle-level reporting should be able to distinguish one position with three partial exits from three independent positions.
 
+Quantity rounding policy for `--pct`:
+
+- Compute reduce quantity from current broker quantity at command execution time, not CLI creation time.
+- Round down for whole-share equities.
+- Fail/reject if the computed quantity is zero.
+- Show the computed reduce quantity in the confirmation prompt.
+- Fractional positions may use fractional quantities only where Alpaca/order type/time-in-force constraints allow them.
+
 ---
 
 ## 11. Stop/Order Interaction
@@ -515,6 +531,8 @@ Known race: a broker-side stop can fill while the bot is trying to cancel it. Th
 V1 order-type default:
 
 - For equity/manual SMA-style closes and reductions, default to market or marketable orders after stop cancellation confirmation to minimize the unprotected window.
+- Market orders are allowed only during regular trading hours, when the symbol is tradable/not halted, and when no operator `--limit` override is supplied.
+- Outside those conditions, use a marketable limit or reject until conditions are safe enough to execute.
 - For options and spreads, do not default to plain market orders. Use strategy-specific close logic or marketable limits because bid/ask behavior can be much worse.
 
 ### 11.1 Symbol-level locks
@@ -566,11 +584,13 @@ Possible implementation sequence:
 1. Add `position_uid` generation before order submission.
 2. Add `position_lifecycle` table and migrations.
 3. Add `position_lifecycle_legs` and write single-leg/spread leg rows.
-4. Attach `position_uid` to trade log rows and state snapshot.
-5. Add read-only `operator.py status`, `positions`, `show-position`, `commands`.
-6. Verify restart rehydrates lifecycle IDs correctly.
+4. Backfill currently open broker positions on first startup by synthesizing `position_uid` lifecycle rows from broker state plus existing trade-log context.
+5. Attach `position_uid` to trade log rows and state snapshot.
+6. Add read-only `scripts/operator.py status`, `positions`, `show-position`, `commands`.
+7. Add sticky `halt` through the operator queue and persisted control state.
+8. Verify restart rehydrates lifecycle IDs correctly.
 
-No broker-mutating operator commands should ship in Phase A. This lets reviewers validate the identity model before any operator command can trade.
+No broker-mutating operator commands should ship in Phase A. `halt` is allowed because it only blocks new bot activity and does not place/cancel broker orders. This lets reviewers validate the identity model before any operator command can trade.
 
 ### Phase B: soft and emergency controls
 
@@ -579,8 +599,9 @@ No broker-mutating operator commands should ship in Phase A. This lets reviewers
 3. Add fast command heartbeat, crash-safe command state transitions, command expiration, and `indeterminate` reconciliation state.
 4. Implement `pause-entries` and `resume-entries`.
 5. Implement `pause-strategy` and `resume-strategy`.
-6. Implement `halt` and `resume-after-halt`.
-7. Add alerts for all command state transitions.
+6. Implement `resume-after-halt`.
+7. Migrate the existing Telegram `/status` and `/halt` command path so it either becomes read-only or writes into `operator_commands`; do not leave it as a second direct control path.
+8. Add alerts for all command state transitions.
 
 ### Phase C: destructive position controls
 
@@ -592,6 +613,18 @@ No broker-mutating operator commands should ship in Phase A. This lets reviewers
 6. Wire manual close/reduce fills into lifecycle, trade log, PnL, and sleeve allocator state.
 7. Verify in dry-run and paper trading before any live use.
 
+### Phase C invariant: allocator and PnL reintegration
+
+Manual reduce/close fills must flow through the same accounting path as automatic exits.
+
+Required invariants:
+
+- Manual close/reduce releases the same sleeve capital the strategy reserved at entry.
+- Realized P&L updates strategy realized totals and allocator HWM state.
+- Health/edge reports see manual exits consistently with automatic exits.
+- The in-memory `Position` and `engine_state.json` remaining quantity update immediately after confirmed fills.
+- Unit tests include "operator close releases exactly the sleeve capital reserved at entry."
+
 ---
 
 ## 14. Testing Requirements
@@ -602,6 +635,7 @@ Unit tests should cover:
 - Closed IDs are never reused.
 - Same symbol reopened later gets a new `position_uid`.
 - Restart restores open position lifecycle IDs from SQLite.
+- First startup after migration synthesizes `position_uid` rows for already-open broker positions.
 - Operator cannot act on a closed `position_uid`.
 - Operator cannot act on an unknown `position_uid`.
 - Operator cannot reduce more than current broker qty.
@@ -616,16 +650,19 @@ Unit tests should cover:
 - `executing` command with `client_order_id` reconciles on restart.
 - Destructive command with ambiguous broker reconciliation becomes `indeterminate` / `needs_operator_review`, not auto-retried.
 - Generated `client_order_id` fits Alpaca constraints and maps back to the full command/position IDs.
+- Operator orders pre-register `client_order_id` with `StreamManager` before broker submit.
 - Manual close/reduce updates sleeve allocator realized P&L and releases used capital.
+- Operator close releases exactly the sleeve capital reserved at entry.
 - Direct external close maps to the open lifecycle and marks `external_closed`.
 - Partial exits do not distort lifecycle-level trade counts in health/edge reports.
 - `position_lifecycle_legs` restores single-leg and spread positions correctly.
 - Symbol-level lock blocks competing strategy/operator mutation.
 - Symbol-level lock is checked immediately before every broker dispatch path, including async option/spread workers.
 - Broker-side stop fill during operator command marks the operator command superseded/indeterminate rather than double-closing.
-- Halt blocks entries.
+- Halt blocks entries and is available before destructive position controls.
 - Halt does not cancel existing broker-side protective stops.
 - Resume after halt requires reconciliation/preflight.
+- Telegram `/halt` does not bypass the operator command queue once the queue exists.
 
 Integration/manual paper checks should cover:
 
@@ -642,12 +679,12 @@ Integration/manual paper checks should cover:
 Claude/Gemini reviewers should specifically audit the remaining unresolved or high-risk choices:
 
 1. Is the proposed crash-recovery sequence sufficient to prevent double dispatch?
-2. Is 60 seconds the right expiration window if command processing runs on a fast heartbeat, or should it be longer?
+2. Is `OPERATOR_COMMAND_EXPIRY_SECONDS = 180` with `OPERATOR_COMMAND_HEARTBEAT_SECONDS = 5` conservative enough for v1?
 3. Is the stop cancel/recreate sequence safe enough for fast markets with equity market/marketable exits?
 4. Which strategy-driven exits, if any, are allowed to supersede an operator lock, and how should that be audited?
 5. Does `position_lifecycle_legs` cover every options/spread restart case already present in the engine?
 6. Do `first_fill_at` / `last_fill_at` plus trade rows provide enough lifecycle timing detail?
-7. Should short-prefix matching be allowed for destructive commands if interactive confirmation is present, or should v1 require full IDs only?
+7. Does the resolved short-prefix policy need any additional guard beyond interactive-only confirmation?
 8. Should Alpaca `suspend_trade=true` stay fully deferred, or should the doc mention it only as an out-of-band Alpaca dashboard action?
 9. Are there lifecycle/PnL edge cases for partial closes that would distort existing health/edge reports?
 10. Are there places in the current engine where symbol-level locks could be bypassed by async options/spread workers?
@@ -662,9 +699,11 @@ Recommended defaults for v1:
 - Store `position_uid` in both a lifecycle table and each trade row.
 - Generate `position_uid` before broker submission.
 - Create lifecycle records in `pending` state before dispatch.
+- Backfill already-open broker positions with synthetic `position_uid` rows at migration/startup.
 - Mark operator commands `executing` and persist `client_order_id` before broker dispatch.
+- Pre-register operator `client_order_id` with `StreamManager` before broker dispatch.
 - Expire stale pending commands rather than executing old intent.
-- Use a fast operator-command heartbeat if `OPERATOR_COMMAND_EXPIRY_SECONDS = 60`; otherwise choose a longer expiry.
+- Use `OPERATOR_COMMAND_EXPIRY_SECONDS = 180` and `OPERATOR_COMMAND_HEARTBEAT_SECONDS = 5` as v1 defaults.
 - Mark ambiguous destructive-command reconciliation as `indeterminate` / `needs_operator_review`; do not auto-retry.
 - Add `position_lifecycle_legs`.
 - Require full `position_uid` for destructive commands in non-interactive mode.
@@ -672,8 +711,10 @@ Recommended defaults for v1:
 - Require `--reason` for every state-changing command.
 - Require confirmation for `close-position`, `reduce-position`, and `halt`.
 - Keep the CLI local-only.
+- Put the CLI at `scripts/operator.py`.
 - Have the CLI write a command request, not call Alpaca directly.
 - Let the engine validate and execute commands.
+- Migrate existing Telegram commands so they do not bypass the operator queue.
 - Keep existing broker-side protective stops active during `halt`.
 - Defer Alpaca `suspend_trade=true` from v1.
 - Serialize state-changing activity with symbol/owner-key locks.
