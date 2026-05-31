@@ -788,7 +788,7 @@ class TestCreditSpreadCounters:
             "strategies.credit_spread.find_best_put_spread",
             return_value=self._pick(),
         ):
-            engine._enter_credit_spread(
+            engine._enter_multi_leg(
                 strategy=strategy, symbol="SPY",
                 underlying_close=745.0, notional_cap=2_000.0,
                 signal_key=("credit_spread", "SPY", "1Day"),
@@ -820,7 +820,7 @@ class TestCreditSpreadCounters:
             "strategies.credit_spread.find_best_put_spread",
             return_value=self._pick(),
         ):
-            engine._enter_credit_spread(
+            engine._enter_multi_leg(
                 strategy=strategy, symbol="SPY",
                 underlying_close=745.0, notional_cap=2_000.0,
                 signal_key=("credit_spread", "SPY", "1Day"),
@@ -848,7 +848,7 @@ class TestCreditSpreadCounters:
             "strategies.credit_spread.find_best_put_spread",
             return_value=self._pick(),
         ):
-            engine._enter_credit_spread(
+            engine._enter_multi_leg(
                 strategy=strategy, symbol="SPY",
                 underlying_close=745.0, notional_cap=2_000.0,
                 signal_key=("credit_spread", "SPY", "1Day"),
@@ -887,7 +887,7 @@ class TestCreditSpreadCounters:
             "strategies.credit_spread.find_best_put_spread",
             return_value=self._pick(),
         ):
-            engine._enter_credit_spread(
+            engine._enter_multi_leg(
                 strategy=strategy, symbol="SPY",
                 underlying_close=745.0, notional_cap=2_000.0,
                 signal_key=("credit_spread", "SPY", "1Day"),

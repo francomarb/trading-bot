@@ -337,6 +337,8 @@ Options orders do not go through the standard equity broker path. The flow is:
 
 The engine's ownership map (`_positions`) keys single-leg option positions by the underlying ticker (`"SPY"`) via `owner_key_for()`, and reserves UUID `position_id`s for multi-leg positions (see PLAN.md 11.27 and `engine/positions.py`). The credit-spread strategy below uses that UUID path; a same-underlying single-leg + spread combination cannot collide on the ownership map.
 
+**Cross-strategy conflict rule (PLAN.md 11.44).** Options strategies are deliberately exempt from the underlying-level conflict check that gates equity strategies — `spy_options_reversion` holding a SPY call no longer blocks a SPY credit spread, and two future single-leg SPY option strategies with non-overlapping strike/expiry selection can run in parallel. The safety check that matters — preventing two strategies from dispatching against the *exact same OCC contract*, which would aggregate into one broker position with corrupt ownership — is enforced at dispatch time by `_reject_if_contract_conflict` in `engine/trader.py` (fires `CONTRACT_CONFLICT` alerts and increments the `contract_conflicts_24h` health counter on collision). The same guard runs for any leg of any MLEG strategy. The rule is direction-agnostic by design: long vs short on the same OCC would net at the broker just as badly as long vs long.
+
 **Backtest performance (SPY daily 2019–2025, RSI 45 oversold, trailing stop activated):**
 
 | Metric | Baseline (fixed TP +20%) | Trailing stop (activate +10%, trail 15%) |
