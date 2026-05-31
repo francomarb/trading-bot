@@ -585,23 +585,23 @@ Possible implementation sequence:
 2. Add `position_lifecycle` table and migrations.
 3. Add `position_lifecycle_legs` and write single-leg/spread leg rows.
 4. Backfill currently open broker positions on first startup by synthesizing `position_uid` lifecycle rows from broker state plus existing trade-log context.
-5. Attach `position_uid` to trade log rows and state snapshot.
-6. Add read-only `scripts/operator.py status`, `positions`, `show-position`, `commands`.
-7. Add sticky `halt` through the operator queue and persisted control state.
-8. Verify restart rehydrates lifecycle IDs correctly.
+5. Add `operator_commands` queue table.
+6. Attach `position_uid` to trade log rows and state snapshot.
+7. Add read-only `scripts/operator.py status`, `positions`, `show-position`, `commands`.
+8. Add sticky `halt` through the operator queue and persisted control state.
+9. Verify restart rehydrates lifecycle IDs correctly.
 
 No broker-mutating operator commands should ship in Phase A. `halt` is allowed because it only blocks new bot activity and does not place/cancel broker orders. This lets reviewers validate the identity model before any operator command can trade.
 
 ### Phase B: soft and emergency controls
 
-1. Add `operator_commands` queue table.
-2. Add engine polling/processing of pending operator commands.
-3. Add fast command heartbeat, crash-safe command state transitions, command expiration, and `indeterminate` reconciliation state.
-4. Implement `pause-entries` and `resume-entries`.
-5. Implement `pause-strategy` and `resume-strategy`.
-6. Implement `resume-after-halt`.
-7. Migrate the existing Telegram `/status` and `/halt` command path so it either becomes read-only or writes into `operator_commands`; do not leave it as a second direct control path.
-8. Add alerts for all command state transitions.
+1. Add engine polling/processing of pending operator commands.
+2. Add fast command heartbeat, crash-safe command state transitions, command expiration, and `indeterminate` reconciliation state.
+3. Implement `pause-entries` and `resume-entries`.
+4. Implement `pause-strategy` and `resume-strategy`.
+5. Implement `resume-after-halt`.
+6. Migrate the existing Telegram `/status` and `/halt` command path so it either becomes read-only or writes into `operator_commands`; do not leave it as a second direct control path.
+7. Add alerts for all command state transitions.
 
 ### Phase C: destructive position controls
 
