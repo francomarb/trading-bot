@@ -1798,6 +1798,7 @@ class TradingEngine:
         multiplier: int = 1,
         *,
         external: bool = False,
+        is_full_close: bool = True,
     ) -> None:
         """
         Compute and report realized P&L for a closed position to the
@@ -1812,6 +1813,24 @@ class TradingEngine:
         Pass multiplier=100 for options contracts (each contract = 100 shares).
         Equity callers omit it and get the default of 1.
 
+        ``is_full_close`` controls whether the lifecycle row gets
+        transitioned to a terminal status:
+
+          - ``True``  (default): the close was full — mark the row
+                      ``closed`` (or ``external_closed`` when
+                      ``external=True``). All stop-fill / external-close
+                      / fractional-residual call sites use this — the
+                      semantic at those sites is always "position fully
+                      gone."
+          - ``False``: the broker reported a PARTIAL close result, so a
+                      residual broker/engine position remains. Leave
+                      the lifecycle row open so the operator CLI keeps
+                      surfacing it. ``current_qty`` is intentionally
+                      NOT updated to the residual in Phase A — partial-
+                      close lifecycle accounting is a Phase C concern
+                      (see implementation plan). Better to show stale
+                      qty than to hide a real residual.
+
         Startup restores entry prices for still-open positions from the trade log,
         so normal restart/reconcile flows continue feeding the HWM gate. If the
         entry price is still unavailable, the update is conservatively skipped.
@@ -1824,10 +1843,11 @@ class TradingEngine:
         # Done first so it happens regardless of whether the allocator
         # update below proceeds. Best-effort: wrapped in try/except so
         # store failures never propagate into the close path.
-        self._close_lifecycle_for_owner_key(
-            owner_key=owner_key_for(symbol),
-            external=external,
-        )
+        if is_full_close:
+            self._close_lifecycle_for_owner_key(
+                owner_key=owner_key_for(symbol),
+                external=external,
+            )
 
         if self._allocator is None:
             return
@@ -2573,6 +2593,14 @@ class TradingEngine:
                         strategy=owner,
                         reason="stop_triggered",
                     )
+                    # Operator Controls Phase A — _record_realized_pnl
+                    # was skipped on this branch (no price/qty), so we
+                    # close the lifecycle row directly. Matches the
+                    # trade-log call above which records as external.
+                    self._close_lifecycle_for_owner_key(
+                        owner_key=owner_key_for(raw_symbol),
+                        external=True,
+                    )
             except Exception as e:
                 logger.error(f"{raw_symbol}: failed to log stop fill: {e}")
 
@@ -2769,12 +2797,19 @@ class TradingEngine:
             reason=alert_reason,
         )
         pnl_mult = 100 if _OCC_PAT.match(position.symbol) else 1
+        # Operator Controls Phase A — only close the lifecycle row when
+        # this exit was actually full. On a PARTIAL result a residual
+        # position is still tracked by the broker and engine
+        # (ownership is preserved by the if-FILLED guard below), so the
+        # lifecycle row must stay open or the operator CLI will hide a
+        # real managed residual.
         self._record_realized_pnl(
             symbol,
             strategy.name,
             close_price,
             close_qty,
             multiplier=pnl_mult,
+            is_full_close=(result.status is OrderStatus.FILLED),
         )
         if result.status is OrderStatus.FILLED:
             self._pop_position(symbol)

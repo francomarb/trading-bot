@@ -386,3 +386,137 @@ class TestDryRunSkipsLifecycle:
         )
         assert result.status == OrderStatus.FILLED
         assert store.get_open() == []
+
+
+# ─────────────────────────────────────────────────────────────────────
+# F6 — partial close must NOT close the lifecycle row
+# ─────────────────────────────────────────────────────────────────────
+
+
+class TestPartialCloseLeavesLifecycleOpen:
+    """Reviewer F6: _close_single_leg_position calls _record_realized_pnl
+    for both FILLED and PARTIAL results, but only removes engine
+    ownership on FILLED. So a PARTIAL close has a residual broker/engine
+    position. If _record_realized_pnl unconditionally closes the
+    lifecycle row, the operator CLI hides a real managed residual."""
+
+    def test_partial_close_keeps_lifecycle_open(self, tmp_path):
+        from engine.trader import TradingEngine
+
+        db_path = tmp_path / "trades.db"
+        tl = TradeLogger(path=str(db_path))
+        store = PositionLifecycleStore(tl._ensure_db())
+
+        uid = new_position_uid()
+        store.create_pending(
+            position_uid=uid,
+            symbol="NVDA", owner_key="NVDA",
+            strategy="sma_crossover", position_type="single_leg",
+            entry_qty=10.0,
+        )
+        store.mark_open(
+            position_uid=uid, avg_entry_price=884.20, current_qty=10.0,
+        )
+
+        engine = TradingEngine.__new__(TradingEngine)
+        engine.lifecycle_store = store
+        engine._allocator = None
+        engine._entry_prices = {"NVDA": 884.20}
+
+        # Simulate the PARTIAL-close branch of _close_single_leg_position.
+        engine._record_realized_pnl(
+            symbol="NVDA",
+            strategy_name="sma_crossover",
+            close_price=900.0,
+            qty=4.0,  # only 4 of 10 shares filled
+            is_full_close=False,
+        )
+
+        row = store.get_by_position_uid(uid)
+        assert row.status == "open", (
+            "PARTIAL close must leave lifecycle row open — the engine "
+            "still tracks the residual, so the operator CLI must keep "
+            "surfacing the position."
+        )
+
+    def test_full_close_still_closes_lifecycle(self, tmp_path):
+        """Sanity: the default is_full_close=True path still closes the row."""
+        from engine.trader import TradingEngine
+
+        db_path = tmp_path / "trades.db"
+        tl = TradeLogger(path=str(db_path))
+        store = PositionLifecycleStore(tl._ensure_db())
+
+        uid = new_position_uid()
+        store.create_pending(
+            position_uid=uid,
+            symbol="NVDA", owner_key="NVDA",
+            strategy="sma_crossover", position_type="single_leg",
+            entry_qty=10.0,
+        )
+        store.mark_open(
+            position_uid=uid, avg_entry_price=884.20, current_qty=10.0,
+        )
+
+        engine = TradingEngine.__new__(TradingEngine)
+        engine.lifecycle_store = store
+        engine._allocator = None
+        engine._entry_prices = {"NVDA": 884.20}
+
+        engine._record_realized_pnl(
+            symbol="NVDA",
+            strategy_name="sma_crossover",
+            close_price=900.0,
+            qty=10.0,
+            # is_full_close defaults to True
+        )
+        assert store.get_by_position_uid(uid).status == "closed"
+
+
+# ─────────────────────────────────────────────────────────────────────
+# F7 — stop-fill fallback (missing price/qty) must close the lifecycle
+# ─────────────────────────────────────────────────────────────────────
+
+
+class TestStopFillFallbackClosesLifecycle:
+    """Reviewer F7: when a WebSocket stop-fill event arrives without a
+    usable price/qty, _process_stream_stop_fills falls back to
+    log_external_close. The lifecycle row must also be closed
+    (external=True) so the operator CLI is not left showing the
+    position as open until restart."""
+
+    def test_fallback_branch_closes_lifecycle_external(self, tmp_path):
+        from engine.trader import TradingEngine
+
+        db_path = tmp_path / "trades.db"
+        tl = TradeLogger(path=str(db_path))
+        store = PositionLifecycleStore(tl._ensure_db())
+
+        uid = new_position_uid()
+        store.create_pending(
+            position_uid=uid,
+            symbol="NVDA", owner_key="NVDA",
+            strategy="sma_crossover", position_type="single_leg",
+            entry_qty=10.0,
+        )
+        store.mark_open(
+            position_uid=uid, avg_entry_price=884.20, current_qty=10.0,
+        )
+
+        engine = TradingEngine.__new__(TradingEngine)
+        engine.lifecycle_store = store
+
+        # Drive the fallback close path directly: this mirrors what the
+        # stop-fill fallback at engine/trader.py:2569 does after this
+        # patch.
+        engine._close_lifecycle_for_owner_key(
+            owner_key="NVDA",
+            external=True,
+        )
+
+        row = store.get_by_position_uid(uid)
+        assert row.status == "external_closed", (
+            "Stop-fill fallback (no price/qty) must transition the "
+            "lifecycle row in-process — leaving it open would let the "
+            "operator CLI keep showing the position until next restart."
+        )
