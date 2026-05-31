@@ -724,3 +724,19 @@ Recommended defaults for v1:
 - Start with read-only commands and identity persistence before adding broker-mutating controls.
 
 The main principle: operator controls should reduce ambiguity and reduce risk. They should not create a second uncontrolled trading path.
+
+---
+
+## 17. Cross-subsystem opportunities (deferred)
+
+`position_uid` is project-wide lifecycle identity, not an operator-CLI-private field. The operator controls work is the first consumer, but several existing subsystems would benefit when they are next revised. None of the items below are in scope for v1; they are documented here so the field is not treated as private to the operator queue, and so future implementers do not re-derive these conclusions or, worse, miss them.
+
+- **Strategy Health & Edge Monitor.** Lifecycle ID makes "trade count" unambiguous and removes the partial-exit accounting concern raised in §10. Per-lifecycle realized R becomes a direct query rather than a symbol+time-window heuristic.
+- **Sleeve allocator.** Reserve/release keyed by `(strategy, position_uid)` makes reopened symbols within the same strategy provably distinct from positions that were never closed.
+- **PnL and R-multiple reporting.** Per-lifecycle final R, win/loss attribution, and reopened-symbol distinction all become single-query operations.
+- **Backtest ↔ forward-test reconciliation.** `backtest/reconcile.py` matching becomes a join rather than a fuzzy match if backtest-side lifecycles synthesize equivalent IDs.
+- **Engine state snapshot.** Restart can distinguish "same lifecycle the bot was tracking" from "broker still holds this symbol but the prior lifecycle ended overnight via a stop fill."
+- **Stop-recovery and order-repair paths.** Embedding `position_uid` in `client_order_id` for repaired/recovered stops makes "this stop belongs to this lifecycle" provable rather than inferred from symbol + strategy.
+- **Alerts.** Fill/exit alerts can include `position_uid`, making the alert stream actionable — the operator can copy-paste the ID straight into `show-position`.
+
+Recommendation: let each subsystem adopt `position_uid` organically when it is next touched. A standalone "wire it everywhere" PR is not recommended — the value is uneven across subsystems and a horizontal refactor would dilute focus and produce a large diff that is hard to review.
