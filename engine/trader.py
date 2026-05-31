@@ -1823,13 +1823,15 @@ class TradingEngine:
                       semantic at those sites is always "position fully
                       gone."
           - ``False``: the broker reported a PARTIAL close result, so a
-                      residual broker/engine position remains. Leave
-                      the lifecycle row open so the operator CLI keeps
-                      surfacing it. ``current_qty`` is intentionally
-                      NOT updated to the residual in Phase A — partial-
-                      close lifecycle accounting is a Phase C concern
-                      (see implementation plan). Better to show stale
-                      qty than to hide a real residual.
+                      residual broker/engine position remains. The
+                      lifecycle row stays open at the residual quantity
+                      — ``_reduce_lifecycle_for_owner_key`` subtracts
+                      the closed qty from ``current_qty`` via
+                      ``mark_residual`` so the operator CLI shows
+                      accurate size. Full partial-close accounting
+                      (per-event realized R, ``net_realized_pnl``
+                      accumulation) remains a Phase C concern per the
+                      implementation plan.
 
         Startup restores entry prices for still-open positions from the trade log,
         so normal restart/reconcile flows continue feeding the HWM gate. If the
@@ -2214,6 +2216,15 @@ class TradingEngine:
                 symbol=raw_symbol,
                 strategy=owner,
                 reason="stop_triggered",
+            )
+            # Operator Controls Phase A — _record_realized_pnl is not
+            # called on this fallback (missing price/qty), so close
+            # the lifecycle row directly. Matches the log_external_close
+            # semantic above. Mirrors the WebSocket stop-fill fallback
+            # fix from the F7 patch.
+            self._close_lifecycle_for_owner_key(
+                owner_key=owner_key_for(raw_symbol),
+                external=True,
             )
             return False
 

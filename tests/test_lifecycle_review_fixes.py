@@ -603,3 +603,49 @@ class TestStopFillFallbackClosesLifecycle:
             "lifecycle row in-process — leaving it open would let the "
             "operator CLI keep showing the position until next restart."
         )
+
+    def test_recovered_stop_fill_fallback_closes_lifecycle(self, tmp_path):
+        """Reviewer follow-up: _record_recovered_stop_fill's missing-
+        price/qty fallback (engine/trader.py:2213) logs an external
+        close in the trade DB but must also close the lifecycle row.
+        Symmetric with the WebSocket stop-fill fallback fix from F7."""
+        from engine.trader import TradingEngine
+
+        db_path = tmp_path / "trades.db"
+        tl = TradeLogger(path=str(db_path))
+        store = PositionLifecycleStore(tl._ensure_db())
+
+        uid = new_position_uid()
+        store.create_pending(
+            position_uid=uid,
+            symbol="NVDA", owner_key="NVDA",
+            strategy="sma_crossover", position_type="single_leg",
+            entry_qty=10.0,
+        )
+        store.mark_open(
+            position_uid=uid, avg_entry_price=884.20, current_qty=10.0,
+        )
+
+        engine = TradingEngine.__new__(TradingEngine)
+        engine.lifecycle_store = store
+        engine.trade_logger = tl
+        engine._allocator = None
+        engine._entry_prices = {}
+
+        stop_fill = MagicMock()
+        stop_fill.avg_fill_price = None
+        stop_fill.filled_qty = 0
+        stop_fill.symbol = "NVDA"
+        stop_fill.order_id = "alpaca-recovered-1"
+
+        result = engine._record_recovered_stop_fill(
+            symbol="NVDA",
+            owner="sma_crossover",
+            stop_fill=stop_fill,
+        )
+        assert result is False
+        assert store.get_by_position_uid(uid).status == "external_closed", (
+            "_record_recovered_stop_fill's no-price/no-qty fallback "
+            "must close the lifecycle row, otherwise it leaks open "
+            "until the next restart."
+        )
