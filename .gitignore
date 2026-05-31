@@ -11,6 +11,7 @@ data/**/*.db-*
 data/**/*.db.*
 data/engine_state.json
 data/engine_state.json.tmp
+data/engine_state.json.bak.*
 data/historical/
 logs/
 .env
@@ -34,4 +35,5 @@ data/envelopes/
 data/envelopes/*.tmp
 data/health_state.json
 data/health_state.json.tmp
+data/health_state.json.bak.*
 data/health_reports/
