@@ -246,6 +246,25 @@ class TradingEngine:
         self.risk = risk
         self.broker = broker
         self.trade_logger = trade_logger or TradeLogger()
+        # Operator Controls Phase A — wire the lifecycle store to the
+        # broker so equity entry paths persist `position_uid` pending →
+        # open transitions. Best-effort: if the broker already has a
+        # store wired (e.g. tests injecting one), don't overwrite.
+        # Sharing the TradeLogger's connection keeps all schema in one
+        # DB and ensures _ensure_db() has run before the store is used.
+        try:
+            from engine.lifecycle import PositionLifecycleStore
+            self.lifecycle_store = PositionLifecycleStore(
+                self.trade_logger._ensure_db()
+            )
+            if (
+                hasattr(self.broker, "_lifecycle_store")
+                and getattr(self.broker, "_lifecycle_store", None) is None
+            ):
+                self.broker._lifecycle_store = self.lifecycle_store
+        except Exception as exc:
+            logger.warning(f"lifecycle store init skipped: {exc}")
+            self.lifecycle_store = None
         self.pnl_tracker = pnl_tracker or PnLTracker()
         self.alerts = alerts or AlertDispatcher()
         self._stream_manager = stream_manager
@@ -526,6 +545,15 @@ class TradingEngine:
         self._startup_mode = self._reconcile_startup(
             startup_snapshot, conflict_symbols
         )
+
+        # Operator Controls Phase A — reconcile lifecycle table with
+        # broker reality after startup. Forward direction: synthesize
+        # lifecycle rows for broker-open positions with no row yet (so
+        # the operator CLI can see and act on them). Reverse direction:
+        # mark lifecycle rows closed if their owner_key no longer has a
+        # broker position (catches overnight stop fills, external
+        # closes, etc.). Best-effort: never raises into the cycle path.
+        self._reconcile_position_lifecycle(startup_snapshot)
 
         self._sync_managed_stop_legs(startup_snapshot)
         self._repair_missing_protective_stops(startup_snapshot)
@@ -1728,8 +1756,15 @@ class TradingEngine:
         if result.status not in {OrderStatus.FILLED, OrderStatus.PARTIAL}:
             return
         try:
+            # Operator Controls Phase A — thread position_uid through
+            # to the trade row when the broker attached one. None for
+            # legacy/options/spread paths is harmless (column is
+            # nullable and indexed for show-position joins).
             record = self.trade_logger.build_record(
-                decision, result, modeled_price=modeled_price
+                decision,
+                result,
+                modeled_price=modeled_price,
+                position_uid=getattr(result, "position_uid", None),
             )
             self.trade_logger.log(record)
         except Exception as e:
@@ -3557,6 +3592,84 @@ class TradingEngine:
 
         logger.info("startup: NORMAL mode — ownership verified")
         return "NORMAL"
+
+    # ── Position lifecycle reconciliation (Operator Controls Phase A) ──
+
+    def _reconcile_position_lifecycle(self, snapshot: "BrokerSnapshot") -> None:
+        """Make the `position_lifecycle` table consistent with broker reality.
+
+        Two passes, both idempotent and best-effort (any DB error is
+        logged and swallowed so the cycle is never affected):
+
+        1. **Forward (backfill)**: for each broker-open equity position
+           with no matching open lifecycle row, synthesize a row in
+           `open` status. Lets the operator CLI see and act on
+           positions that existed before this code shipped (or were
+           opened in a window where lifecycle persistence failed).
+
+        2. **Reverse (close-reconcile)**: for each open lifecycle row
+           whose `owner_key` is no longer present in broker positions,
+           mark the row `external_closed`. Catches overnight stop
+           fills, manual broker-side closes, and any other path that
+           closed a position without the bot's normal close flow.
+
+        Spread / options lifecycle integration is deferred — see the
+        operator controls implementation plan. Phase A reconciles
+        equity single-leg positions only; the spread/options paths
+        will join the lifecycle table when Phase B/C wires them.
+        """
+        if self.lifecycle_store is None:
+            return
+        try:
+            # Forward pass — synthesize for any unmanaged equity broker
+            # position that lacks an open lifecycle row.
+            for sym, qty in snapshot.account.open_positions.items():
+                # Skip OCC option symbols — Phase A only reconciles
+                # equity entries; options legs will be handled when
+                # Phase B/C plumbs the options worker through the
+                # store.
+                if _OCC_PAT.match(sym):
+                    continue
+                owner = owner_key_for(sym)
+                existing = self.lifecycle_store.get_open_for_owner_key(owner)
+                if existing is not None:
+                    continue
+                pos = self._positions.get(owner)
+                strategy = pos.strategy_name if pos is not None else "unknown"
+                self.lifecycle_store.synthesize_for_existing(
+                    symbol=sym,
+                    owner_key=owner,
+                    strategy=strategy,
+                    position_type="single_leg",
+                    current_qty=float(qty),
+                    avg_entry_price=None,
+                )
+        except Exception as exc:
+            logger.warning(f"lifecycle backfill failed: {exc}")
+
+        try:
+            # Reverse pass — close any lifecycle row whose owner_key is
+            # no longer at the broker. We only act on rows the engine
+            # could plausibly track (equity single_leg in Phase A).
+            broker_owners = {
+                owner_key_for(s) for s in snapshot.account.open_positions
+            }
+            for row in self.lifecycle_store.get_open():
+                if row.position_type != "single_leg":
+                    continue  # Phase A scope: equity only
+                if row.owner_key in broker_owners:
+                    continue
+                self.lifecycle_store.mark_closed(
+                    position_uid=row.position_uid,
+                    external=True,
+                )
+                logger.info(
+                    f"lifecycle: marked {row.position_uid[:18]}… "
+                    f"({row.owner_key}) external_closed — no longer "
+                    f"at broker"
+                )
+        except Exception as exc:
+            logger.warning(f"lifecycle close-reconcile failed: {exc}")
 
     # ── State snapshot (Phase 11.14) ─────────────────────────────────────
 

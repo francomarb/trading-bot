@@ -146,6 +146,7 @@ TRADE_COLUMNS = [
     "exit_timestamp",
     "position_id",
     "position_type",
+    "position_uid",
 ]
 
 # Keep the old name as an alias for backwards compatibility with tests
@@ -179,7 +180,8 @@ CREATE TABLE IF NOT EXISTS trades (
     entry_timestamp       TEXT,
     exit_timestamp        TEXT,
     position_id           TEXT,
-    position_type         TEXT
+    position_type         TEXT,
+    position_uid          TEXT
 );
 """
 
@@ -193,12 +195,28 @@ _MIGRATION_COLUMNS = {
     "exit_timestamp": "TEXT",
     "position_id": "TEXT",
     "position_type": "TEXT",
+    # Operator Controls Phase A — immutable per-lifecycle ID. Added as a
+    # nullable column; pre-existing rows are NULL (no consumer in
+    # Phase A relies on backfilling them). New trades passed
+    # `position_uid=...` populate it. The other three columns from
+    # proposal §8 (parent_position_uid, operator_command_uid,
+    # client_order_id) are deferred to Phase C bundle per the
+    # implementation plan — they will be added when their first
+    # consumer ships.
+    "position_uid": "TEXT",
 }
 
 # Index on position_id for fast spread leg grouping. Idempotent.
 _POSITION_ID_INDEX_SQL = (
     "CREATE INDEX IF NOT EXISTS idx_trades_position_id "
     "ON trades(position_id)"
+)
+
+# Operator Controls Phase A — index on position_uid for fast
+# show-position lookups in the operator CLI.
+_POSITION_UID_INDEX_SQL = (
+    "CREATE INDEX IF NOT EXISTS idx_trades_position_uid "
+    "ON trades(position_uid)"
 )
 
 # Backfill: existing rows pre-PR-11.27 are all single-leg, with
@@ -250,6 +268,11 @@ class TradeRecord:
     exit_timestamp: str | None = None
     position_id: str | None = None
     position_type: str | None = None
+    # Operator Controls Phase A — immutable per-lifecycle ID. Optional
+    # because exit/close records built without an entry-side lifecycle
+    # reference can still log; the broker entry path passes it through
+    # from `engine.lifecycle.new_position_uid()`.
+    position_uid: str | None = None
 
     def as_dict(self) -> dict:
         """Column-ordered dict (same interface as before migration)."""
@@ -297,11 +320,26 @@ class TradeLogger:
         # ensure the lookup index exists. Both statements are idempotent.
         self._conn.execute(_BACKFILL_SQL)
         self._conn.execute(_POSITION_ID_INDEX_SQL)
+        self._conn.execute(_POSITION_UID_INDEX_SQL)
         # 11.10c: signal-lifecycle counter table for the Strategy Health
         # Monitor. Local import avoids a circular dependency
         # (strategies.health.* can import reporting.logger types).
         from strategies.health.lifecycle import _CREATE_LIFECYCLE_TABLE_SQL
         self._conn.execute(_CREATE_LIFECYCLE_TABLE_SQL)
+        # Operator Controls Phase A — position_lifecycle and
+        # position_lifecycle_legs. Created by the same migration path
+        # so all schema lives behind one connection bootstrap. Local
+        # import keeps `engine.lifecycle` standalone-importable; this
+        # is the only place that pulls the DDL constants.
+        from engine.lifecycle import (
+            _CREATE_POSITION_LIFECYCLE_SQL,
+            _CREATE_POSITION_LIFECYCLE_LEGS_SQL,
+            _CREATE_POSITION_LIFECYCLE_INDEXES_SQL,
+        )
+        self._conn.execute(_CREATE_POSITION_LIFECYCLE_SQL)
+        self._conn.execute(_CREATE_POSITION_LIFECYCLE_LEGS_SQL)
+        for index_sql in _CREATE_POSITION_LIFECYCLE_INDEXES_SQL:
+            self._conn.execute(index_sql)
         self._conn.commit()
         return self._conn
 
@@ -317,6 +355,7 @@ class TradeLogger:
         result,    # OrderResult
         *,
         modeled_price: float | None = None,
+        position_uid: str | None = None,
     ) -> TradeRecord:
         """
         Build a TradeRecord from a RiskDecision + OrderResult.
@@ -377,6 +416,7 @@ class TradeLogger:
             exit_timestamp=None,
             position_id=owner_key_for(decision.symbol),
             position_type="single_leg",
+            position_uid=position_uid,
         )
 
     def build_close_record(
