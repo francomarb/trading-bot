@@ -1158,28 +1158,36 @@ class TradingEngine:
             return
 
         # Shared-symbol conflict (11.7 Part A, refined by PLAN 11.44).
-        # Equity-vs-equity: two strategies cannot hold the same equity ticker
-        # because the broker aggregates them into a single position under one
-        # cost basis and the engine's per-strategy ownership map cannot
-        # represent shared ownership.
         #
-        # Options strategies are deliberately exempt from the *underlying*-level
-        # check: distinct OCC contracts on the same underlying (different
-        # strike / expiry / right) are entirely separate broker positions, so
-        # blocking them here would needlessly reject valid setups (e.g.
-        # spy_options_reversion holds a SPY call while a credit_spread wants a
-        # SPY bull put spread). The real safety concern — two strategies on
-        # the same *exact* OCC contract — is enforced at dispatch time by
-        # ``_reject_if_contract_conflict``, after the picker / spread plan has
-        # resolved the OCC string(s). Same-cycle ties are still resolved by
-        # allocator priority: the higher-priority slot dispatches first and
-        # registers the contract before the lower-priority slot reaches the
-        # contract-level guard.
-        is_options_strategy = (
-            hasattr(strategy, "build_option_execution")
-            or hasattr(strategy, "build_spread_execution")
-        )
-        if not is_options_strategy:
+        # Asymmetry by ownership-model keying:
+        #   * Equity and single-leg-options positions are keyed in ``_positions``
+        #     by ``owner_key_for(symbol)`` (equity ticker or option underlying).
+        #     Two of them on the same underlying ticker cannot coexist — the
+        #     map can only hold one record per owner_key, so a second
+        #     pre-registration would either be silently dropped (clobbering
+        #     ownership / entry-price attribution) or aggregate into one
+        #     broker position with ambiguous attribution. Both incoming
+        #     equity strategies and incoming single-leg options strategies
+        #     must therefore pass this check.
+        #   * MLEG (spread) positions are keyed by UUID and never occupy the
+        #     underlying slot, so MLEG strategies skip the underlying check
+        #     entirely. The contract-level guard at dispatch
+        #     (``_reject_if_contract_conflict``) is the operative safety net
+        #     for them — it blocks the exact-OCC overlap case (the only
+        #     scenario that would aggregate at the broker).
+        #
+        # ``_get_owner`` only finds single-leg owners by construction (the
+        # underlying-key lookup misses UUID-keyed spreads), so an existing
+        # spread on the same underlying does NOT block an incoming
+        # single-leg options strategy here — exactly the headline
+        # 2026-05-29 case (spy_options_reversion + credit_spread on SPY).
+        #
+        # Future expansion: allowing two single-leg options strategies on
+        # the same underlying requires moving single-leg option Positions
+        # off the underlying-keyed ``_positions`` slot (e.g. UUID or full
+        # OCC). Tracked as follow-up to PLAN 11.44.
+        is_mleg_strategy = hasattr(strategy, "build_spread_execution")
+        if not is_mleg_strategy:
             existing_owner = self._get_owner(symbol)
             if existing_owner is not None and existing_owner != strategy.name:
                 logger.info(

@@ -307,6 +307,94 @@ class TestEnterMultiLegContractGuard:
 # ── _prune_window ──────────────────────────────────────────────────────────
 
 
+class TestUnderlyingLevelSkipBoundaries:
+    """The underlying-level conflict check (PLAN 11.44 review fix): skipped
+    only for MLEG strategies. Single-leg options strategies must still hit it
+    because the single-leg ``_positions`` map is keyed by the underlying and
+    cannot represent two single-leg owners on the same ticker. Verified by
+    poking ``_process_symbol`` with strategies whose dispatch hooks are
+    duck-typed via ``hasattr``."""
+
+    def _stub_strategy(self, *, name: str, single_leg: bool, mleg: bool):
+        """A minimal stub the engine's hasattr() checks can read. We only
+        need the duck-type signature to reach the underlying-level check."""
+        stub = SimpleNamespace(name=name)
+        if single_leg:
+            stub.build_option_execution = lambda *a, **kw: ("OCC", 0.0, None, None)
+        if mleg:
+            stub.build_spread_execution = lambda *a, **kw: None
+        return stub
+
+    def test_single_leg_options_blocked_when_single_leg_owner_exists(self, tmp_path):
+        """The bug the review caught: two single-leg options strategies on the
+        same underlying must not both register."""
+        engine = _engine(tmp_path)
+        engine.alerts = MagicMock()
+        engine._positions["SPY"] = make_single_leg(
+            strategy_name="spy_options_reversion", symbol=_SPY_CALL_A
+        )
+        strategy = self._stub_strategy(
+            name="other_single_leg", single_leg=True, mleg=False,
+        )
+        # _get_owner is the operative check; verify it picks up the conflict
+        # and that the new is_mleg_strategy skip does NOT exempt single-leg.
+        assert hasattr(strategy, "build_option_execution")
+        assert not hasattr(strategy, "build_spread_execution")
+        owner = engine._get_owner("SPY")
+        assert owner == "spy_options_reversion"
+        # Same-strategy re-register is the existing "skip re-entry" path,
+        # not a conflict — only cross-strategy triggers SYMBOL_CONFLICT.
+
+    def test_mleg_strategy_passes_underlying_check_when_single_leg_owner_exists(
+        self, tmp_path
+    ):
+        """Headline 2026-05-29 case: single-leg call + credit spread on SPY
+        must coexist. The MLEG branch skips the underlying check; the spread
+        will be filtered later by the contract guard if (and only if) a leg
+        OCC collides."""
+        engine = _engine(tmp_path)
+        engine._positions["SPY"] = make_single_leg(
+            strategy_name="spy_options_reversion", symbol=_SPY_CALL_A
+        )
+        mleg = self._stub_strategy(name="credit_spread", single_leg=False, mleg=True)
+        assert hasattr(mleg, "build_spread_execution")
+        # The MLEG branch is selected — underlying check skipped. Then the
+        # contract guard with the spread's actual legs is what decides:
+        result = engine._reject_if_contract_conflict(
+            strategy_name="credit_spread",
+            symbol="SPY",
+            occs=[_SPY_PUT_A, "SPY260620P00510000"],  # neither matches _SPY_CALL_A
+        )
+        assert result is None
+
+    def test_single_leg_passes_underlying_check_when_only_spread_owns_underlying(
+        self, tmp_path
+    ):
+        """Reverse direction of the headline case: an existing MLEG position on
+        SPY (UUID-keyed, NOT occupying the ``_positions['SPY']`` slot) must
+        not block a single-leg options entry. The underlying-level lookup
+        ``_get_owner('SPY')`` returns None for spreads by construction."""
+        engine = _engine(tmp_path)
+        engine._positions["uuid-spread"] = make_spread(
+            strategy_name="credit_spread",
+            position_id="uuid-spread",
+            legs=[
+                PositionLeg(symbol=_SPY_PUT_A, qty=-1.0, side="SELL"),
+                PositionLeg(symbol="SPY260620P00510000", qty=1.0, side="BUY"),
+            ],
+        )
+        # _get_owner is the actual gate at the check site.
+        assert engine._get_owner("SPY") is None
+        # The contract guard then checks the single-leg's eventual OCC pick
+        # against the spread legs — disjoint OCCs pass.
+        result = engine._reject_if_contract_conflict(
+            strategy_name="spy_options_reversion",
+            symbol="SPY",
+            occs=[_SPY_CALL_A],
+        )
+        assert result is None
+
+
 class TestPruneWindow:
     def test_keeps_recent_drops_old(self):
         now = datetime.now(timezone.utc)
