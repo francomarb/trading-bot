@@ -246,6 +246,25 @@ class TradingEngine:
         self.risk = risk
         self.broker = broker
         self.trade_logger = trade_logger or TradeLogger()
+        # Operator Controls Phase A — wire the lifecycle store to the
+        # broker so equity entry paths persist `position_uid` pending →
+        # open transitions. Best-effort: if the broker already has a
+        # store wired (e.g. tests injecting one), don't overwrite.
+        # Sharing the TradeLogger's connection keeps all schema in one
+        # DB and ensures _ensure_db() has run before the store is used.
+        try:
+            from engine.lifecycle import PositionLifecycleStore
+            self.lifecycle_store = PositionLifecycleStore(
+                self.trade_logger._ensure_db()
+            )
+            if (
+                hasattr(self.broker, "_lifecycle_store")
+                and getattr(self.broker, "_lifecycle_store", None) is None
+            ):
+                self.broker._lifecycle_store = self.lifecycle_store
+        except Exception as exc:
+            logger.warning(f"lifecycle store init skipped: {exc}")
+            self.lifecycle_store = None
         self.pnl_tracker = pnl_tracker or PnLTracker()
         self.alerts = alerts or AlertDispatcher()
         self._stream_manager = stream_manager
@@ -526,6 +545,15 @@ class TradingEngine:
         self._startup_mode = self._reconcile_startup(
             startup_snapshot, conflict_symbols
         )
+
+        # Operator Controls Phase A — reconcile lifecycle table with
+        # broker reality after startup. Forward direction: synthesize
+        # lifecycle rows for broker-open positions with no row yet (so
+        # the operator CLI can see and act on them). Reverse direction:
+        # mark lifecycle rows closed if their owner_key no longer has a
+        # broker position (catches overnight stop fills, external
+        # closes, etc.). Best-effort: never raises into the cycle path.
+        self._reconcile_position_lifecycle(startup_snapshot)
 
         self._sync_managed_stop_legs(startup_snapshot)
         self._repair_missing_protective_stops(startup_snapshot)
@@ -1728,8 +1756,15 @@ class TradingEngine:
         if result.status not in {OrderStatus.FILLED, OrderStatus.PARTIAL}:
             return
         try:
+            # Operator Controls Phase A — thread position_uid through
+            # to the trade row when the broker attached one. None for
+            # legacy/options/spread paths is harmless (column is
+            # nullable and indexed for show-position joins).
             record = self.trade_logger.build_record(
-                decision, result, modeled_price=modeled_price
+                decision,
+                result,
+                modeled_price=modeled_price,
+                position_uid=getattr(result, "position_uid", None),
             )
             self.trade_logger.log(record)
         except Exception as e:
@@ -1761,23 +1796,73 @@ class TradingEngine:
         close_price: float,
         qty: float,
         multiplier: int = 1,
+        *,
+        external: bool = False,
+        is_full_close: bool = True,
     ) -> None:
         """
         Compute and report realized P&L for a closed position to the
-        SleeveAllocator's HWM drawdown gate.
+        SleeveAllocator's HWM drawdown gate, and close the matching
+        position_lifecycle row (Operator Controls Phase A).
 
         Called from all three close paths:
-          - Signal-based exit (_process_symbol exit branch)
-          - WebSocket stop-leg fill (_process_stream_stop_fills)
-          - External close detection (_detect_external_closes) — approximate
+          - Signal-based exit (_process_symbol exit branch) — external=False
+          - WebSocket stop-leg fill (_process_stream_stop_fills) — external=False
+          - External close detection (_detect_external_closes) — external=True
 
         Pass multiplier=100 for options contracts (each contract = 100 shares).
         Equity callers omit it and get the default of 1.
 
+        ``is_full_close`` controls whether the lifecycle row gets
+        transitioned to a terminal status:
+
+          - ``True``  (default): the close was full — mark the row
+                      ``closed`` (or ``external_closed`` when
+                      ``external=True``). All stop-fill / external-close
+                      / fractional-residual call sites use this — the
+                      semantic at those sites is always "position fully
+                      gone."
+          - ``False``: the broker reported a PARTIAL close result, so a
+                      residual broker/engine position remains. The
+                      lifecycle row stays open at the residual quantity
+                      — ``_reduce_lifecycle_for_owner_key`` subtracts
+                      the closed qty from ``current_qty`` via
+                      ``mark_residual`` so the operator CLI shows
+                      accurate size. Full partial-close accounting
+                      (per-event realized R, ``net_realized_pnl``
+                      accumulation) remains a Phase C concern per the
+                      implementation plan.
+
         Startup restores entry prices for still-open positions from the trade log,
         so normal restart/reconcile flows continue feeding the HWM gate. If the
         entry price is still unavailable, the update is conservatively skipped.
+
+        The lifecycle close is done first and is independent of whether
+        the realized-PnL update can proceed — operator CLI accuracy
+        must not depend on entry-price availability.
         """
+        # Operator Controls Phase A — update the matching lifecycle
+        # row. Done first so it happens regardless of whether the
+        # allocator update below proceeds. Best-effort: wrapped in
+        # try/except so store failures never propagate into the close
+        # path.
+        if is_full_close:
+            self._close_lifecycle_for_owner_key(
+                owner_key=owner_key_for(symbol),
+                external=external,
+            )
+        else:
+            # Partial close — drop current_qty by the close qty so the
+            # operator CLI shows the residual rather than the stale
+            # entry quantity. If the reduction takes the row to zero
+            # (shouldn't happen on a PARTIAL result, but defensive
+            # against fill-event rounding) the helper falls back to a
+            # full close so the row reaches a terminal status.
+            self._reduce_lifecycle_for_owner_key(
+                owner_key=owner_key_for(symbol),
+                reduced_by=float(qty),
+            )
+
         if self._allocator is None:
             return
         entry_price = self._entry_prices.get(symbol)
@@ -1793,6 +1878,106 @@ class TradingEngine:
             f"({qty}x{multiplier} @ {close_price:.2f} vs entry {entry_price:.2f})"
         )
         self._allocator.record_realized_pnl(strategy_name, realized_pnl)
+
+    def _reduce_lifecycle_for_owner_key(
+        self,
+        *,
+        owner_key: str,
+        reduced_by: float,
+    ) -> None:
+        """Best-effort lifecycle reduction after an in-process partial
+        close.
+
+        Looks up the single open lifecycle row for ``owner_key``,
+        subtracts ``reduced_by`` from its ``current_qty`` and writes
+        the residual via ``mark_residual``. If the residual reaches
+        zero (e.g. when fill-event rounding ends up at exactly the
+        entry qty), falls back to ``mark_closed`` so the row reaches a
+        terminal status rather than sitting at qty=0 indefinitely.
+
+        Phase A scope: equity single-leg only. Spread / options
+        partial reductions land with the Phase C lifecycle wiring
+        for those workers. Wrapped in try/except so store failures
+        never raise into the close path.
+        """
+        if self.lifecycle_store is None:
+            return
+        try:
+            row = self.lifecycle_store.get_open_for_owner_key(owner_key)
+            if row is None:
+                return
+            if row.position_type != "single_leg":
+                return
+            prior_qty = float(row.current_qty or 0.0)
+            residual = prior_qty - float(reduced_by)
+            if residual <= 0.0:
+                # Defensive: the engine called us with is_full_close=False
+                # but the math says the position is now flat. Mark closed.
+                self.lifecycle_store.mark_closed(
+                    position_uid=row.position_uid,
+                    external=False,
+                )
+                logger.debug(
+                    f"lifecycle: partial reduce zeroed out "
+                    f"{row.position_uid[:18]}… ({owner_key}) — marked closed"
+                )
+                return
+            self.lifecycle_store.mark_residual(
+                position_uid=row.position_uid,
+                current_qty=residual,
+            )
+            logger.debug(
+                f"lifecycle: {row.position_uid[:18]}… ({owner_key}) "
+                f"reduced to current_qty={residual} (was {prior_qty})"
+            )
+        except Exception as exc:
+            logger.warning(
+                f"lifecycle reduce failed for {owner_key}: {exc}"
+            )
+
+    def _close_lifecycle_for_owner_key(
+        self,
+        *,
+        owner_key: str,
+        external: bool = False,
+    ) -> None:
+        """Best-effort lifecycle close for an in-process exit.
+
+        Looks up the single open lifecycle row for `owner_key` and
+        transitions it to `closed` (or `external_closed` if `external`
+        is True). Silently no-ops if no open row exists or if the
+        lifecycle store is unavailable.
+
+        This is what makes the operator CLI's `positions` accurate
+        between restarts: every close path (signal exit, stop fill,
+        external close) flows through `_record_realized_pnl`, which
+        delegates here.
+        """
+        if self.lifecycle_store is None:
+            return
+        try:
+            row = self.lifecycle_store.get_open_for_owner_key(owner_key)
+            if row is None:
+                return
+            # Phase A scope: only act on equity single-leg rows. Spread
+            # and options lifecycle close transitions are bundled into
+            # Phase C with the rest of the options/spread lifecycle
+            # wiring.
+            if row.position_type != "single_leg":
+                return
+            self.lifecycle_store.mark_closed(
+                position_uid=row.position_uid,
+                external=external,
+            )
+            logger.debug(
+                f"lifecycle: marked {row.position_uid[:18]}… "
+                f"({owner_key}) "
+                f"{'external_closed' if external else 'closed'}"
+            )
+        except Exception as exc:
+            logger.warning(
+                f"lifecycle close failed for {owner_key}: {exc}"
+            )
 
     def _close_fractional_residual_position(
         self,
@@ -2031,6 +2216,15 @@ class TradingEngine:
                 symbol=raw_symbol,
                 strategy=owner,
                 reason="stop_triggered",
+            )
+            # Operator Controls Phase A — _record_realized_pnl is not
+            # called on this fallback (missing price/qty), so close
+            # the lifecycle row directly. Matches the log_external_close
+            # semantic above. Mirrors the WebSocket stop-fill fallback
+            # fix from the F7 patch.
+            self._close_lifecycle_for_owner_key(
+                owner_key=owner_key_for(raw_symbol),
+                external=True,
             )
             return False
 
@@ -2385,6 +2579,16 @@ class TradingEngine:
                             strategy=owner,
                             reason="external_close_detected",
                         )
+                        # Operator Controls Phase A — close the
+                        # lifecycle row as external_closed. The
+                        # _record_realized_pnl path is not invoked on
+                        # this branch (no fill price/qty), so we close
+                        # the row directly here. external=True so the
+                        # row is correctly labeled.
+                        self._close_lifecycle_for_owner_key(
+                            owner_key=owner_key_for(symbol),
+                            external=True,
+                        )
                     self._entry_prices.pop(symbol, None)
             except Exception as e:
                 logger.error(f"{symbol}: failed to log external close: {e}")
@@ -2467,6 +2671,14 @@ class TradingEngine:
                         symbol=raw_symbol,
                         strategy=owner,
                         reason="stop_triggered",
+                    )
+                    # Operator Controls Phase A — _record_realized_pnl
+                    # was skipped on this branch (no price/qty), so we
+                    # close the lifecycle row directly. Matches the
+                    # trade-log call above which records as external.
+                    self._close_lifecycle_for_owner_key(
+                        owner_key=owner_key_for(raw_symbol),
+                        external=True,
                     )
             except Exception as e:
                 logger.error(f"{raw_symbol}: failed to log stop fill: {e}")
@@ -2664,12 +2876,19 @@ class TradingEngine:
             reason=alert_reason,
         )
         pnl_mult = 100 if _OCC_PAT.match(position.symbol) else 1
+        # Operator Controls Phase A — only close the lifecycle row when
+        # this exit was actually full. On a PARTIAL result a residual
+        # position is still tracked by the broker and engine
+        # (ownership is preserved by the if-FILLED guard below), so the
+        # lifecycle row must stay open or the operator CLI will hide a
+        # real managed residual.
         self._record_realized_pnl(
             symbol,
             strategy.name,
             close_price,
             close_qty,
             multiplier=pnl_mult,
+            is_full_close=(result.status is OrderStatus.FILLED),
         )
         if result.status is OrderStatus.FILLED:
             self._pop_position(symbol)
@@ -3557,6 +3776,94 @@ class TradingEngine:
 
         logger.info("startup: NORMAL mode — ownership verified")
         return "NORMAL"
+
+    # ── Position lifecycle reconciliation (Operator Controls Phase A) ──
+
+    def _reconcile_position_lifecycle(self, snapshot: "BrokerSnapshot") -> None:
+        """Make the `position_lifecycle` table consistent with broker reality.
+
+        Two passes, both idempotent and best-effort (any DB error is
+        logged and swallowed so the cycle is never affected):
+
+        1. **Forward (backfill)**: for each broker-open equity position
+           with no matching open lifecycle row, synthesize a row in
+           `open` status. Lets the operator CLI see and act on
+           positions that existed before this code shipped (or were
+           opened in a window where lifecycle persistence failed).
+
+        2. **Reverse (close-reconcile)**: for each open lifecycle row
+           whose `owner_key` is no longer present in broker positions,
+           mark the row `external_closed`. Catches overnight stop
+           fills, manual broker-side closes, and any other path that
+           closed a position without the bot's normal close flow.
+
+        Spread / options lifecycle integration is deferred — see the
+        operator controls implementation plan. Phase A reconciles
+        equity single-leg positions only; the spread/options paths
+        will join the lifecycle table when Phase B/C wires them.
+        """
+        if self.lifecycle_store is None:
+            return
+        try:
+            # Forward pass — synthesize for any unmanaged equity broker
+            # position that lacks an open lifecycle row.
+            #
+            # snapshot.account.open_positions maps str -> risk.manager.Position
+            # (a frozen dataclass with .qty / .avg_entry_price). Reading
+            # the dataclass fields directly is mandatory — calling
+            # float(position) raises TypeError and (because the outer
+            # except is broad) silently skipped every backfill in the
+            # PR-1 first cut.
+            for sym, position in snapshot.account.open_positions.items():
+                # Skip OCC option symbols — Phase A only reconciles
+                # equity entries; options legs will be handled when
+                # Phase B/C plumbs the options worker through the
+                # store.
+                if _OCC_PAT.match(sym):
+                    continue
+                owner = owner_key_for(sym)
+                existing = self.lifecycle_store.get_open_for_owner_key(owner)
+                if existing is not None:
+                    continue
+                pos = self._positions.get(owner)
+                strategy = pos.strategy_name if pos is not None else "unknown"
+                qty_val = float(getattr(position, "qty", 0.0) or 0.0)
+                avg_val = getattr(position, "avg_entry_price", None)
+                avg_val = float(avg_val) if avg_val else None
+                self.lifecycle_store.synthesize_for_existing(
+                    symbol=sym,
+                    owner_key=owner,
+                    strategy=strategy,
+                    position_type="single_leg",
+                    current_qty=qty_val,
+                    avg_entry_price=avg_val,
+                )
+        except Exception as exc:
+            logger.warning(f"lifecycle backfill failed: {exc}")
+
+        try:
+            # Reverse pass — close any lifecycle row whose owner_key is
+            # no longer at the broker. We only act on rows the engine
+            # could plausibly track (equity single_leg in Phase A).
+            broker_owners = {
+                owner_key_for(s) for s in snapshot.account.open_positions
+            }
+            for row in self.lifecycle_store.get_open():
+                if row.position_type != "single_leg":
+                    continue  # Phase A scope: equity only
+                if row.owner_key in broker_owners:
+                    continue
+                self.lifecycle_store.mark_closed(
+                    position_uid=row.position_uid,
+                    external=True,
+                )
+                logger.info(
+                    f"lifecycle: marked {row.position_uid[:18]}… "
+                    f"({row.owner_key}) external_closed — no longer "
+                    f"at broker"
+                )
+        except Exception as exc:
+            logger.warning(f"lifecycle close-reconcile failed: {exc}")
 
     # ── State snapshot (Phase 11.14) ─────────────────────────────────────
 

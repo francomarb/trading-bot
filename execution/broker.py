@@ -49,6 +49,7 @@ from typing import TYPE_CHECKING
 
 if TYPE_CHECKING:
     from execution.stream import StreamManager
+    from engine.lifecycle import PositionLifecycleStore
 
 from execution.options_executor import (
     OptionsExecutionWorker,
@@ -147,6 +148,13 @@ class OrderResult:
     avg_fill_price: float | None
     raw_status: str | None     # Alpaca's status string (for logging/debug)
     message: str = ""          # human-readable summary or error text
+    # Operator Controls Phase A — immutable lifecycle ID generated at
+    # order-build time by `engine.lifecycle.new_position_uid()`. Carried
+    # back to the engine so trade-log rows can be tagged with it. Always
+    # populated for new entries; None for legacy callers that haven't
+    # passed a lifecycle store through (e.g. close paths in Phase A,
+    # tests that construct OrderResult directly).
+    position_uid: str | None = None
 
     @property
     def is_terminal(self) -> bool:
@@ -226,6 +234,7 @@ class AlpacaBroker:
         time_in_force: str = "gtc",
         stream_manager: "StreamManager | None" = None,
         dry_run: bool | None = None,
+        lifecycle_store: "PositionLifecycleStore | None" = None,
     ) -> None:
         self._api = client or TradingClient(
             api_key=ALPACA_API_KEY,
@@ -238,6 +247,13 @@ class AlpacaBroker:
         self._base_delay = base_delay
         self._time_in_force = time_in_force
         self._stream_manager = stream_manager
+        # Operator Controls Phase A — optional store. When set, the
+        # broker writes lifecycle rows for each new entry (best-effort,
+        # wrapped in try/except so persistence failure never aborts an
+        # order). When None (legacy callers, tests), all lifecycle
+        # writes are silently skipped and behavior is byte-for-byte
+        # unchanged from before Phase A.
+        self._lifecycle_store = lifecycle_store
         # Dry-run: log orders but never submit. Defaults to settings.DRY_RUN.
         self._dry_run: bool = dry_run if dry_run is not None else DRY_RUN
         # Async option fills reported by OptionsExecutionWorker threads.
@@ -252,6 +268,129 @@ class AlpacaBroker:
             self._stream_manager.set_order_lookup_callbacks(
                 by_id=self._stream_lookup_order_by_id,
                 by_client_id=self._stream_lookup_order_by_client_id,
+            )
+
+    # ── Lifecycle helpers (Operator Controls Phase A) ───────────────────
+    #
+    # Every call site is wrapped in try/except → logger.warning so a DB
+    # I/O failure can NEVER abort an order. This is the same discipline
+    # used by `strategies.health.lifecycle` for the signal-lifecycle
+    # counter table. Phase A is purely additive — when
+    # `self._lifecycle_store is None`, these helpers are no-ops and the
+    # broker's behavior is byte-for-byte identical to pre-Phase-A.
+
+    def _lifecycle_begin(
+        self,
+        *,
+        decision: "RiskDecision",
+        client_order_id: str,
+        position_type: str = "single_leg",
+        owner_key: str | None = None,
+    ) -> str | None:
+        """Generate a position_uid and write a `pending` lifecycle row
+        before the broker submission. Returns the uid (or None if no
+        store is configured / persistence failed)."""
+        if self._lifecycle_store is None:
+            return None
+        try:
+            from engine.lifecycle import new_position_uid
+            from engine.positions import owner_key_for
+            uid = new_position_uid()
+            self._lifecycle_store.create_pending(
+                position_uid=uid,
+                symbol=decision.symbol,
+                owner_key=owner_key or owner_key_for(decision.symbol),
+                strategy=decision.strategy_name,
+                position_type=position_type,
+                entry_qty=float(decision.qty),
+                entry_client_order_id=client_order_id,
+            )
+            return uid
+        except Exception as exc:
+            logger.warning(
+                f"lifecycle.create_pending failed for {decision.symbol} "
+                f"({decision.strategy_name}): {exc}"
+            )
+            return None
+
+    def _lifecycle_mark_filled(
+        self,
+        *,
+        position_uid: str | None,
+        result: OrderResult,
+    ) -> None:
+        """Best-effort lifecycle transition after the broker reaches a
+        terminal outcome for an entry order.
+
+        Handles every terminal status that ``_wait_for_fill`` /
+        ``_unknown_after_submit`` can return:
+
+          - FILLED with qty>0       → mark_open
+          - PARTIAL with qty>0      → mark_partially_filled
+          - CANCELED/REJECTED, qty=0→ mark_canceled (zero-fill cancel
+                                       after broker acceptance)
+          - CANCELED/REJECTED, qty>0→ leave as partially_filled at the
+                                       filled qty (proposal §8.1 — a
+                                       partial-then-cancel must NOT
+                                       become 'canceled')
+          - TIMEOUT/UNKNOWN         → leave the lifecycle row alone so
+                                       the next startup reconciliation
+                                       observes broker truth
+
+        Without this discipline the pending row leaks indefinitely
+        whenever Alpaca terminally rejects after accepting submission.
+        """
+        if position_uid is None or self._lifecycle_store is None:
+            return
+        filled_qty = float(result.filled_qty or 0.0)
+        avg = result.avg_fill_price
+        try:
+            if result.status is OrderStatus.FILLED and avg is not None and filled_qty > 0:
+                self._lifecycle_store.mark_open(
+                    position_uid=position_uid,
+                    avg_entry_price=float(avg),
+                    current_qty=filled_qty,
+                )
+            elif result.status is OrderStatus.PARTIAL and avg is not None and filled_qty > 0:
+                self._lifecycle_store.mark_partially_filled(
+                    position_uid=position_uid,
+                    avg_entry_price=float(avg),
+                    current_qty=filled_qty,
+                )
+            elif result.status in {OrderStatus.CANCELED, OrderStatus.REJECTED}:
+                if filled_qty > 0 and avg is not None:
+                    # Partial fill then broker-side cancel — proposal
+                    # §8.1: must stay open/partially_filled. Update the
+                    # row to reflect the realized partial.
+                    self._lifecycle_store.mark_partially_filled(
+                        position_uid=position_uid,
+                        avg_entry_price=float(avg),
+                        current_qty=filled_qty,
+                    )
+                else:
+                    # Zero fills — clean cancel of the pending row.
+                    self._lifecycle_store.mark_canceled(
+                        position_uid=position_uid,
+                    )
+            # TIMEOUT / UNKNOWN — leave the row pending so a future
+            # reconcile pass observes broker truth and acts on it.
+        except Exception as exc:
+            logger.warning(
+                f"lifecycle.mark_filled failed for {position_uid}: {exc}"
+            )
+
+    def _lifecycle_mark_canceled(self, position_uid: str | None) -> None:
+        """Best-effort cancel transition for zero-fill rejections.
+        Safe to call even if the row had partial fills — the store's
+        own §8.1 invariant will refuse the transition in that case
+        and we log + move on."""
+        if position_uid is None or self._lifecycle_store is None:
+            return
+        try:
+            self._lifecycle_store.mark_canceled(position_uid=position_uid)
+        except Exception as exc:
+            logger.warning(
+                f"lifecycle.mark_canceled skipped for {position_uid}: {exc}"
             )
 
     # ── Retry wrapper ────────────────────────────────────────────────────
@@ -595,6 +734,12 @@ class AlpacaBroker:
 
         # Build request object.
         client_order_id = f"{decision.strategy_name}-{uuid.uuid4().hex[:10]}"
+        # Operator Controls Phase A — position_uid is created later,
+        # AFTER the dry-run guard. Creating it before would persist a
+        # pending lifecycle row that no broker order ever backs (a
+        # preflight dry run would leak rows that look like real
+        # positions to the operator CLI).
+        position_uid: str | None = None
         stop_loss = StopLossRequest(stop_price=round(decision.stop_price, 2))
 
         tif = TimeInForce.DAY if self._time_in_force == "day" else TimeInForce.GTC
@@ -671,6 +816,14 @@ class AlpacaBroker:
                 message="dry run — no order submitted",
             )
 
+        # Operator Controls Phase A — write the pending lifecycle row
+        # only after the dry-run guard passes, so a preflight dry run
+        # never leaks pending positions to the operator CLI.
+        position_uid = self._lifecycle_begin(
+            decision=decision,
+            client_order_id=client_order_id,
+        )
+
         # Register with the stream before submitting to avoid a fill-before-watch race.
         stream_event: threading.Event | None = None
         if self._stream_manager is not None:
@@ -683,6 +836,9 @@ class AlpacaBroker:
             )
         except APIError as e:
             logger.error(f"broker rejected {decision.symbol}: {e}")
+            # Lifecycle: zero-fill rejection — mark canceled so the row
+            # doesn't sit indefinitely as 'pending'.
+            self._lifecycle_mark_canceled(position_uid)
             return OrderResult(
                 status=OrderStatus.REJECTED,
                 order_id=None,
@@ -692,6 +848,7 @@ class AlpacaBroker:
                 avg_fill_price=None,
                 raw_status=None,
                 message=str(e),
+                position_uid=position_uid,
             )
 
         order_id = str(order.id)
@@ -710,7 +867,7 @@ class AlpacaBroker:
             )
 
         try:
-            return self._wait_for_fill(
+            result = self._wait_for_fill(
                 order_id=order_id,
                 symbol=decision.symbol,
                 requested_qty=decision.qty,
@@ -719,12 +876,17 @@ class AlpacaBroker:
                 stream_event=stream_event,
             )
         except Exception as e:
-            return self._unknown_after_submit(
+            result = self._unknown_after_submit(
                 order_id=order_id,
                 symbol=decision.symbol,
                 requested_qty=decision.qty,
                 error=e,
             )
+        # Lifecycle: best-effort fill transition. Returns the result
+        # with position_uid attached so the engine can pass it to
+        # TradeLogger.log().
+        self._lifecycle_mark_filled(position_uid=position_uid, result=result)
+        return replace(result, position_uid=position_uid)
 
     def _place_fractional_order(
         self,
@@ -753,6 +915,9 @@ class AlpacaBroker:
         routes directly to the OTO GTC path, which is byte-for-byte unchanged.
         """
         client_order_id = f"{decision.strategy_name}-frac-{uuid.uuid4().hex[:10]}"
+        # Operator Controls Phase A — position_uid created after the
+        # dry-run guard below; same reasoning as in place_order().
+        position_uid: str | None = None
 
         # PLAN 11.32: defense in depth. place_order() floors fractional qty
         # to whole shares when entry_max_price is set so the capped DAY
@@ -789,6 +954,13 @@ class AlpacaBroker:
                 message="dry run — no order submitted",
             )
 
+        # Operator Controls Phase A — pending lifecycle row written
+        # only after the dry-run guard passes.
+        position_uid = self._lifecycle_begin(
+            decision=decision,
+            client_order_id=client_order_id,
+        )
+
         order_request = MarketOrderRequest(
             symbol=decision.symbol,
             qty=decision.qty,
@@ -811,6 +983,7 @@ class AlpacaBroker:
             )
         except APIError as e:
             logger.error(f"broker rejected fractional {decision.symbol}: {e}")
+            self._lifecycle_mark_canceled(position_uid)
             return OrderResult(
                 status=OrderStatus.REJECTED,
                 order_id=None,
@@ -820,6 +993,7 @@ class AlpacaBroker:
                 avg_fill_price=None,
                 raw_status=None,
                 message=str(e),
+                position_uid=position_uid,
             )
 
         order_id = str(order.id)
@@ -839,12 +1013,14 @@ class AlpacaBroker:
                 stream_event=stream_event,
             )
         except Exception as e:
-            return self._unknown_after_submit(
+            result = self._unknown_after_submit(
                 order_id=order_id,
                 symbol=decision.symbol,
                 requested_qty=decision.qty,
                 error=e,
             )
+            self._lifecycle_mark_filled(position_uid=position_uid, result=result)
+            return replace(result, position_uid=position_uid)
 
         # Submit standalone GTC stop for the whole-share portion after fill.
         # Alpaca stop orders require whole shares; fractional remainder exits
@@ -884,7 +1060,10 @@ class AlpacaBroker:
                     f"position exits via engine signals only"
                 )
 
-        return result
+        # Operator Controls Phase A — lifecycle transition on the
+        # success path. Best-effort.
+        self._lifecycle_mark_filled(position_uid=position_uid, result=result)
+        return replace(result, position_uid=position_uid)
 
     def reconcile_submitted_order(
         self,

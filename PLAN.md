@@ -66,12 +66,13 @@ These are the items that must be green before any live flip.
 | Five-sleeve paper GO/NO-GO | The current bot is broader than the old SMA/RSI gate; evidence must cover all active sleeves | Documented GO/NO-GO report covering entries, exits, attribution, startup reconciliation, allocator behavior, health reports |
 | VPS/systemd deployment | Local Mac + tmux is acceptable for paper, not for real capital | VPS provisioned, secrets deployed safely, `systemd` restarts bot on crash/boot, logs are recoverable |
 | Live `.env` hard cap | Launch-only protection against sizing or order-loop bugs | `HARD_DOLLAR_LOSS_CAP` set conservatively for live launch and verified by preflight |
+| Operator controls Phase A (`docs/operator_controls_proposal.md`) | Live trading needs precise, audited operator intervention rather than only the blunt stop/edit/restart options available today | `position_uid` lifecycle identity persisted in SQLite; backfill for open positions; read-only operator CLI + sticky `halt` shipped and verified on paper; restart preserves `position_uid` |
 
 ### P1 — Paper-Watch And Calibration
 
 | Item | Why It Matters | Acceptance |
 |---|---|---|
-| `11.10h` Strategy Health paper-watch | Health/Edge monitor is advisory but noisy thresholds can create operator fatigue | ≥4 weeks reports reviewed; `calibrate_health_thresholds.py` output reconciled with operator judgment |
+| `11.10h` Strategy Health paper-watch | Health/Edge monitor is advisory but noisy thresholds can create operator fatigue | ≥4 weeks reports reviewed; `calibrate_health_thresholds.py` output reconciled with operator judgment. *Once `position_uid` ships (Operator Controls Phase A), fold in the partial-exit trade-count fix per `docs/operator_controls_proposal.md` §17.* |
 | `11.26` SPY options picker audit | The 10% fatal-spread threshold is paper-tested, not proven | 10-20 fills audited for spread distribution, fill rate, and realized slippage |
 | `11.30` Credit-spread paper-watch | Short-premium strategy needs real fill and risk evidence before live | 20-30 completed cycles/attempts audited; IV floor, credit floor, and risk assumptions either confirmed or adjusted |
 | `11.34` Credit-spread exit paper-watch | Exit triggers and paper close reliability need evidence | Exit reasons, close attempts, retry counts, and realized close prices reviewed |
@@ -84,9 +85,14 @@ These are the items that must be green before any live flip.
 |---|---|---|
 | Dynamic watchlists (`11.1`) | Static universes are operationally simple; dynamic rotation needs durable ownership proven first | Dynamic source supports refresh cadence and never abandons open positions |
 | Calibrated sector caps (`11.8`) | Sector exposure is observable; caps should be data-driven, not blanket | Add targeted caps only if paper exposure shows a real concentration problem |
-| Dynamic strategy allocation (`11.9`) | Could improve capital efficiency once each sleeve has enough live/paper evidence | Weight suggestions based on expectancy/Sharpe with operator approval |
+| Dynamic strategy allocation (`11.9`) | Could improve capital efficiency once each sleeve has enough live/paper evidence | Weight suggestions based on expectancy/Sharpe with operator approval. *When implemented, key `SleeveAllocator` reserve/release on `(strategy, position_uid)` per `docs/operator_controls_proposal.md` §17.* |
 | Defensive cash sweep (`11.45`) | Idle capital during prolonged BEAR/VOLATILE regimes loses purchasing power | SGOV/BIL-style posture only after strict prolonged-BEAR confirmation and recovery state machine |
 | Same-underlying single-leg options ownership | Needed before adding a second single-leg options strategy on SPY/QQQ | Single-leg options can use OCC/UUID position ids without breaking exits, DB restore, allocator, dashboard |
+| Operator controls Phase B (soft controls + alerts integration) | Once Phase A bakes, the operator needs `pause-entries` / `pause-strategy` / `resume-after-halt` plus Telegram migration into the queue | Per `docs/operator_controls_proposal.md` §13 Phase B. Includes `position_uid` in fill/exit alerts per §17. |
+| Operator controls Phase C (destructive controls + Phase A deferrals) | Destructive `reduce-position` / `close-position` / `cancel-position-orders` plus the Phase A nice-to-haves: `Position.position_uid` field, in-memory startup re-attach, `operator_command_uid`/`client_order_id` columns on `trades`, `position_uid` in `engine_state.json` snapshot | Per `docs/operator_controls_proposal.md` §13 Phase C. Symbol-level locks, stop cancel/recreate, allocator/PnL reintegration. Deferred until Phase B ships and bakes. |
+| Operator controls dashboard integration | Once Phase C lands `position_uid` in `engine_state.json`, surface it in the dashboard open-positions table | Per `docs/operator_controls_proposal.md` §17. |
+| Backtest reconcile by lifecycle ID | Join paper vs backtest by synthesized lifecycle ID once `position_uid` has ≥4 weeks of paper data | Per `docs/operator_controls_proposal.md` §17. Refactor `backtest/reconcile.py`. |
+| `trades.parent_position_uid` column | For rolls/derived positions | Add when the rolls/derived-positions feature is designed — bundle into that PR. Per `docs/operator_controls_proposal.md` §8. |
 
 ---
 
@@ -140,6 +146,7 @@ These are the items that must be green before any live flip.
 - Options and spreads must use broker-supported Alpaca SDK paths; avoid home-grown execution behavior when the SDK provides a native route.
 - Do not add a second same-underlying single-leg options strategy until the ownership model supports it.
 - Do not tune paper-watch parameters pre-emptively; audit first, change second.
+- `position_uid` is project-wide lifecycle identity — generated by `engine.lifecycle.new_position_uid()` before broker submission, persisted in the `position_lifecycle` table. Phase A wires it through the operator CLI only; other subsystems (health monitor, allocator, reconcile, alerts, dashboard) integrate later, each in its own PR, per `docs/operator_controls_proposal.md` §17.
 
 ---
 
