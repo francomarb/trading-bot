@@ -1796,15 +1796,18 @@ class TradingEngine:
         close_price: float,
         qty: float,
         multiplier: int = 1,
+        *,
+        external: bool = False,
     ) -> None:
         """
         Compute and report realized P&L for a closed position to the
-        SleeveAllocator's HWM drawdown gate.
+        SleeveAllocator's HWM drawdown gate, and close the matching
+        position_lifecycle row (Operator Controls Phase A).
 
         Called from all three close paths:
-          - Signal-based exit (_process_symbol exit branch)
-          - WebSocket stop-leg fill (_process_stream_stop_fills)
-          - External close detection (_detect_external_closes) — approximate
+          - Signal-based exit (_process_symbol exit branch) — external=False
+          - WebSocket stop-leg fill (_process_stream_stop_fills) — external=False
+          - External close detection (_detect_external_closes) — external=True
 
         Pass multiplier=100 for options contracts (each contract = 100 shares).
         Equity callers omit it and get the default of 1.
@@ -1812,7 +1815,20 @@ class TradingEngine:
         Startup restores entry prices for still-open positions from the trade log,
         so normal restart/reconcile flows continue feeding the HWM gate. If the
         entry price is still unavailable, the update is conservatively skipped.
+
+        The lifecycle close is done first and is independent of whether
+        the realized-PnL update can proceed — operator CLI accuracy
+        must not depend on entry-price availability.
         """
+        # Operator Controls Phase A — close the matching lifecycle row.
+        # Done first so it happens regardless of whether the allocator
+        # update below proceeds. Best-effort: wrapped in try/except so
+        # store failures never propagate into the close path.
+        self._close_lifecycle_for_owner_key(
+            owner_key=owner_key_for(symbol),
+            external=external,
+        )
+
         if self._allocator is None:
             return
         entry_price = self._entry_prices.get(symbol)
@@ -1828,6 +1844,50 @@ class TradingEngine:
             f"({qty}x{multiplier} @ {close_price:.2f} vs entry {entry_price:.2f})"
         )
         self._allocator.record_realized_pnl(strategy_name, realized_pnl)
+
+    def _close_lifecycle_for_owner_key(
+        self,
+        *,
+        owner_key: str,
+        external: bool = False,
+    ) -> None:
+        """Best-effort lifecycle close for an in-process exit.
+
+        Looks up the single open lifecycle row for `owner_key` and
+        transitions it to `closed` (or `external_closed` if `external`
+        is True). Silently no-ops if no open row exists or if the
+        lifecycle store is unavailable.
+
+        This is what makes the operator CLI's `positions` accurate
+        between restarts: every close path (signal exit, stop fill,
+        external close) flows through `_record_realized_pnl`, which
+        delegates here.
+        """
+        if self.lifecycle_store is None:
+            return
+        try:
+            row = self.lifecycle_store.get_open_for_owner_key(owner_key)
+            if row is None:
+                return
+            # Phase A scope: only act on equity single-leg rows. Spread
+            # and options lifecycle close transitions are bundled into
+            # Phase C with the rest of the options/spread lifecycle
+            # wiring.
+            if row.position_type != "single_leg":
+                return
+            self.lifecycle_store.mark_closed(
+                position_uid=row.position_uid,
+                external=external,
+            )
+            logger.debug(
+                f"lifecycle: marked {row.position_uid[:18]}… "
+                f"({owner_key}) "
+                f"{'external_closed' if external else 'closed'}"
+            )
+        except Exception as exc:
+            logger.warning(
+                f"lifecycle close failed for {owner_key}: {exc}"
+            )
 
     def _close_fractional_residual_position(
         self,
@@ -2419,6 +2479,16 @@ class TradingEngine:
                             symbol=symbol,
                             strategy=owner,
                             reason="external_close_detected",
+                        )
+                        # Operator Controls Phase A — close the
+                        # lifecycle row as external_closed. The
+                        # _record_realized_pnl path is not invoked on
+                        # this branch (no fill price/qty), so we close
+                        # the row directly here. external=True so the
+                        # row is correctly labeled.
+                        self._close_lifecycle_for_owner_key(
+                            owner_key=owner_key_for(symbol),
+                            external=True,
                         )
                     self._entry_prices.pop(symbol, None)
             except Exception as e:
@@ -3623,7 +3693,14 @@ class TradingEngine:
         try:
             # Forward pass — synthesize for any unmanaged equity broker
             # position that lacks an open lifecycle row.
-            for sym, qty in snapshot.account.open_positions.items():
+            #
+            # snapshot.account.open_positions maps str -> risk.manager.Position
+            # (a frozen dataclass with .qty / .avg_entry_price). Reading
+            # the dataclass fields directly is mandatory — calling
+            # float(position) raises TypeError and (because the outer
+            # except is broad) silently skipped every backfill in the
+            # PR-1 first cut.
+            for sym, position in snapshot.account.open_positions.items():
                 # Skip OCC option symbols — Phase A only reconciles
                 # equity entries; options legs will be handled when
                 # Phase B/C plumbs the options worker through the
@@ -3636,13 +3713,16 @@ class TradingEngine:
                     continue
                 pos = self._positions.get(owner)
                 strategy = pos.strategy_name if pos is not None else "unknown"
+                qty_val = float(getattr(position, "qty", 0.0) or 0.0)
+                avg_val = getattr(position, "avg_entry_price", None)
+                avg_val = float(avg_val) if avg_val else None
                 self.lifecycle_store.synthesize_for_existing(
                     symbol=sym,
                     owner_key=owner,
                     strategy=strategy,
                     position_type="single_leg",
-                    current_qty=float(qty),
-                    avg_entry_price=None,
+                    current_qty=qty_val,
+                    avg_entry_price=avg_val,
                 )
         except Exception as exc:
             logger.warning(f"lifecycle backfill failed: {exc}")

@@ -593,7 +593,7 @@ Possible implementation sequence:
 
 No broker-mutating operator commands should ship in Phase A. `halt` is allowed because it only blocks new bot activity and does not place/cancel broker orders. This lets reviewers validate the identity model before any operator command can trade.
 
-**Phase A scope notes (implementation):** PR-1 wires `position_uid` lifecycle only for **equity single-leg** entry paths (whole-share + fractional). Options async and spread async paths use `OptionsExecutionWorker` / `SpreadExecutionWorker` with their own fill-callback structure; their lifecycle integration is bundled into the Phase C deferred-items group along with `Position.position_uid` and the additional `trades` columns. The operator CLI in Phase A still shows options/spread positions via the startup backfill pass — they just don't get pending→open transitions until Phase C.
+**Phase A scope notes (implementation):** PR-1 wires `position_uid` lifecycle only for **equity single-leg** entry paths (whole-share + fractional). Options async and spread async paths use `OptionsExecutionWorker` / `SpreadExecutionWorker` with their own fill-callback structure; their lifecycle integration — including the startup backfill pass for already-open option/spread positions — is bundled into the Phase C deferred-items group along with `Position.position_uid` and the additional `trades` columns. The operator CLI in Phase A therefore lists equity positions only; option and spread positions appear when Phase C wires the option/spread workers through the lifecycle store.
 
 ### Phase B: soft and emergency controls
 
