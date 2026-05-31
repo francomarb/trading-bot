@@ -429,6 +429,50 @@ class PositionLifecycleStore:
         )
         self._conn.commit()
 
+    def mark_residual(
+        self,
+        *,
+        position_uid: str,
+        current_qty: float,
+        last_fill_at: str | None = None,
+    ) -> None:
+        """Update ``current_qty`` after a partial close.
+
+        Does NOT change ``status`` — a partially-closed row stays in
+        whatever non-terminal status it was already in (``open`` or
+        ``partially_filled``). For Phase A the operator CLI keys off
+        ``status`` for the open/closed split and off ``current_qty``
+        for the displayed size; that's enough to surface "this
+        position is still open but smaller than entry."
+
+        Full partial-close lifecycle accounting (per-event realized R,
+        ``net_realized_pnl`` accumulation, a dedicated
+        ``partially_closed`` state if needed) is bundled into Phase C
+        per the operator-controls implementation plan. This helper is
+        the minimum needed so the operator CLI does not show stale
+        entry quantity after a partial-fill exit.
+
+        Raises ValueError when ``current_qty <= 0`` — those cases must
+        use ``mark_closed`` instead so the row reaches a terminal
+        status. The engine's reduce helper handles that branch before
+        calling here.
+        """
+        _validate_position_uid(position_uid)
+        if current_qty <= 0:
+            raise ValueError(
+                f"current_qty must be > 0 for residual update; got "
+                f"{current_qty}. Use mark_closed for a fully exited "
+                f"position."
+            )
+        last = last_fill_at or _utc_now_iso()
+        self._conn.execute(
+            "UPDATE position_lifecycle "
+            "SET current_qty = ?, last_fill_at = ? "
+            "WHERE position_uid = ?",
+            (float(current_qty), last, position_uid),
+        )
+        self._conn.commit()
+
     def mark_canceled(self, *, position_uid: str) -> None:
         """Transition ``pending`` → ``canceled`` for an entry that
         cancelled with **zero fills**.

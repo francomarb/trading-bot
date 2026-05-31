@@ -1839,14 +1839,26 @@ class TradingEngine:
         the realized-PnL update can proceed — operator CLI accuracy
         must not depend on entry-price availability.
         """
-        # Operator Controls Phase A — close the matching lifecycle row.
-        # Done first so it happens regardless of whether the allocator
-        # update below proceeds. Best-effort: wrapped in try/except so
-        # store failures never propagate into the close path.
+        # Operator Controls Phase A — update the matching lifecycle
+        # row. Done first so it happens regardless of whether the
+        # allocator update below proceeds. Best-effort: wrapped in
+        # try/except so store failures never propagate into the close
+        # path.
         if is_full_close:
             self._close_lifecycle_for_owner_key(
                 owner_key=owner_key_for(symbol),
                 external=external,
+            )
+        else:
+            # Partial close — drop current_qty by the close qty so the
+            # operator CLI shows the residual rather than the stale
+            # entry quantity. If the reduction takes the row to zero
+            # (shouldn't happen on a PARTIAL result, but defensive
+            # against fill-event rounding) the helper falls back to a
+            # full close so the row reaches a terminal status.
+            self._reduce_lifecycle_for_owner_key(
+                owner_key=owner_key_for(symbol),
+                reduced_by=float(qty),
             )
 
         if self._allocator is None:
@@ -1864,6 +1876,62 @@ class TradingEngine:
             f"({qty}x{multiplier} @ {close_price:.2f} vs entry {entry_price:.2f})"
         )
         self._allocator.record_realized_pnl(strategy_name, realized_pnl)
+
+    def _reduce_lifecycle_for_owner_key(
+        self,
+        *,
+        owner_key: str,
+        reduced_by: float,
+    ) -> None:
+        """Best-effort lifecycle reduction after an in-process partial
+        close.
+
+        Looks up the single open lifecycle row for ``owner_key``,
+        subtracts ``reduced_by`` from its ``current_qty`` and writes
+        the residual via ``mark_residual``. If the residual reaches
+        zero (e.g. when fill-event rounding ends up at exactly the
+        entry qty), falls back to ``mark_closed`` so the row reaches a
+        terminal status rather than sitting at qty=0 indefinitely.
+
+        Phase A scope: equity single-leg only. Spread / options
+        partial reductions land with the Phase C lifecycle wiring
+        for those workers. Wrapped in try/except so store failures
+        never raise into the close path.
+        """
+        if self.lifecycle_store is None:
+            return
+        try:
+            row = self.lifecycle_store.get_open_for_owner_key(owner_key)
+            if row is None:
+                return
+            if row.position_type != "single_leg":
+                return
+            prior_qty = float(row.current_qty or 0.0)
+            residual = prior_qty - float(reduced_by)
+            if residual <= 0.0:
+                # Defensive: the engine called us with is_full_close=False
+                # but the math says the position is now flat. Mark closed.
+                self.lifecycle_store.mark_closed(
+                    position_uid=row.position_uid,
+                    external=False,
+                )
+                logger.debug(
+                    f"lifecycle: partial reduce zeroed out "
+                    f"{row.position_uid[:18]}… ({owner_key}) — marked closed"
+                )
+                return
+            self.lifecycle_store.mark_residual(
+                position_uid=row.position_uid,
+                current_qty=residual,
+            )
+            logger.debug(
+                f"lifecycle: {row.position_uid[:18]}… ({owner_key}) "
+                f"reduced to current_qty={residual} (was {prior_qty})"
+            )
+        except Exception as exc:
+            logger.warning(
+                f"lifecycle reduce failed for {owner_key}: {exc}"
+            )
 
     def _close_lifecycle_for_owner_key(
         self,

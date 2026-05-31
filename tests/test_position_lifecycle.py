@@ -329,6 +329,58 @@ class TestTransitions:
         assert row.status == "external_closed"
 
 
+class TestMarkResidual:
+    """`mark_residual` updates current_qty after a partial close
+    without changing status — the row stays open at the residual
+    quantity."""
+
+    def _seed_open(self, store) -> str:
+        uid = new_position_uid()
+        store.create_pending(
+            position_uid=uid,
+            symbol="NVDA", owner_key="NVDA",
+            strategy="sma_crossover", position_type="single_leg",
+            entry_qty=10.0,
+        )
+        store.mark_open(
+            position_uid=uid, avg_entry_price=884.20, current_qty=10.0,
+        )
+        return uid
+
+    def test_updates_current_qty_only(self, store):
+        uid = self._seed_open(store)
+        store.mark_residual(position_uid=uid, current_qty=6.0)
+        row = store.get_by_position_uid(uid)
+        assert row.status == "open"  # status unchanged
+        assert row.current_qty == 6.0
+        assert row.entry_qty == 10.0  # entry intent preserved
+        assert row.avg_entry_price == 884.20  # avg entry preserved
+
+    def test_updates_last_fill_at(self, store):
+        uid = self._seed_open(store)
+        store.mark_residual(
+            position_uid=uid, current_qty=6.0,
+            last_fill_at="2026-05-31T15:30:00+00:00",
+        )
+        row = store.get_by_position_uid(uid)
+        assert row.last_fill_at == "2026-05-31T15:30:00+00:00"
+
+    def test_rejects_zero_or_negative(self, store):
+        uid = self._seed_open(store)
+        with pytest.raises(ValueError, match="mark_closed"):
+            store.mark_residual(position_uid=uid, current_qty=0.0)
+        with pytest.raises(ValueError, match="mark_closed"):
+            store.mark_residual(position_uid=uid, current_qty=-1.0)
+
+    def test_preserves_first_fill_at(self, store):
+        """Partial-close residual updates must NOT overwrite the
+        original entry fill timestamp."""
+        uid = self._seed_open(store)
+        original = store.get_by_position_uid(uid).first_fill_at
+        store.mark_residual(position_uid=uid, current_qty=6.0)
+        assert store.get_by_position_uid(uid).first_fill_at == original
+
+
 class TestReads:
     def _seed_three(self, store) -> tuple[str, str, str]:
         uid_a, uid_b, uid_c = (new_position_uid() for _ in range(3))

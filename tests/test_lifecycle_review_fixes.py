@@ -439,6 +439,89 @@ class TestPartialCloseLeavesLifecycleOpen:
             "surfacing the position."
         )
 
+    def test_partial_close_reduces_current_qty_to_residual(self, tmp_path):
+        """After a partial close, current_qty must reflect the residual
+        position size, not the original entry quantity, so the operator
+        CLI shows accurate size."""
+        from engine.trader import TradingEngine
+
+        db_path = tmp_path / "trades.db"
+        tl = TradeLogger(path=str(db_path))
+        store = PositionLifecycleStore(tl._ensure_db())
+
+        uid = new_position_uid()
+        store.create_pending(
+            position_uid=uid,
+            symbol="NVDA", owner_key="NVDA",
+            strategy="sma_crossover", position_type="single_leg",
+            entry_qty=10.0,
+        )
+        store.mark_open(
+            position_uid=uid, avg_entry_price=884.20, current_qty=10.0,
+        )
+
+        engine = TradingEngine.__new__(TradingEngine)
+        engine.lifecycle_store = store
+        engine._allocator = None
+        engine._entry_prices = {"NVDA": 884.20}
+
+        # Partial close: 4 of 10 shares filled at exit.
+        engine._record_realized_pnl(
+            symbol="NVDA",
+            strategy_name="sma_crossover",
+            close_price=900.0,
+            qty=4.0,
+            is_full_close=False,
+        )
+
+        row = store.get_by_position_uid(uid)
+        assert row.status == "open"
+        assert row.current_qty == 6.0, (
+            f"expected residual current_qty=6.0 after closing 4 of 10, "
+            f"got {row.current_qty}"
+        )
+        assert row.entry_qty == 10.0, (
+            "entry_qty must be preserved — it represents intent, not "
+            "current state"
+        )
+
+    def test_partial_close_zero_residual_falls_back_to_closed(self, tmp_path):
+        """Defensive: if the partial close math ends up at exactly zero
+        residual (rounding edge case), the row must reach a terminal
+        status rather than sitting at qty=0 indefinitely."""
+        from engine.trader import TradingEngine
+
+        db_path = tmp_path / "trades.db"
+        tl = TradeLogger(path=str(db_path))
+        store = PositionLifecycleStore(tl._ensure_db())
+
+        uid = new_position_uid()
+        store.create_pending(
+            position_uid=uid,
+            symbol="NVDA", owner_key="NVDA",
+            strategy="sma_crossover", position_type="single_leg",
+            entry_qty=10.0,
+        )
+        store.mark_open(
+            position_uid=uid, avg_entry_price=884.20, current_qty=10.0,
+        )
+
+        engine = TradingEngine.__new__(TradingEngine)
+        engine.lifecycle_store = store
+        engine._allocator = None
+        engine._entry_prices = {"NVDA": 884.20}
+
+        # "Partial" close that actually equals the full quantity —
+        # caller mis-flagged is_full_close=False but the math is full.
+        engine._record_realized_pnl(
+            symbol="NVDA",
+            strategy_name="sma_crossover",
+            close_price=900.0,
+            qty=10.0,
+            is_full_close=False,
+        )
+        assert store.get_by_position_uid(uid).status == "closed"
+
     def test_full_close_still_closes_lifecycle(self, tmp_path):
         """Sanity: the default is_full_close=True path still closes the row."""
         from engine.trader import TradingEngine
