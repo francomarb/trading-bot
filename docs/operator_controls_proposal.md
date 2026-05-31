@@ -260,6 +260,41 @@ Commands should be append-only from the operator's perspective. The bot updates 
 
 Important: The command audit trail should not contain secrets, raw account balances, or sensitive broker payloads. Store high-level state and IDs.
 
+### 7.1 Crash recovery and idempotency
+
+The command queue must be designed so a bot crash cannot double-dispatch an operator order.
+
+Required rule:
+
+```text
+Before sending any network request to Alpaca, the engine must durably mark the
+command as executing and persist the intended client_order_id.
+```
+
+Recommended processing sequence:
+
+1. Engine reads one `pending` command.
+2. Engine validates the command.
+3. Engine generates deterministic command-scoped `client_order_id`.
+4. Engine writes `status='executing'`, `accepted_at`, and `client_order_id`.
+5. Engine commits the SQLite transaction.
+6. Engine sends the broker request.
+7. Engine records success/failure and final broker/order details.
+
+On restart:
+
+- Stale `pending` commands older than a short expiration window should be rejected, not executed.
+- `executing` commands with a `client_order_id` should be reconciled against Alpaca orders before any retry.
+- A command with an existing `client_order_id` must never dispatch a second order until reconciliation proves no broker-side order exists.
+
+Suggested v1 expiration:
+
+```text
+pending command older than 60 seconds at engine pickup or startup => rejected_expired
+```
+
+This is intentionally conservative. An operator can always re-issue the command after checking current state.
+
 ---
 
 ## 8. Trade Log Schema Changes
@@ -293,18 +328,40 @@ Potential separate table: `position_lifecycle`
 | Column | Type | Notes |
 |---|---|---|
 | `position_uid` | TEXT PRIMARY KEY | Immutable ID |
-| `created_at` | TEXT NOT NULL | First accepted/opening event |
+| `created_at` | TEXT NOT NULL | Lifecycle creation timestamp |
 | `closed_at` | TEXT nullable | When fully closed |
 | `symbol` | TEXT NOT NULL | Broker symbol at open |
 | `owner_key` | TEXT NOT NULL | Current engine/broker aggregation key |
 | `strategy` | TEXT NOT NULL | Owning strategy |
 | `position_type` | TEXT NOT NULL | `single_leg`, `spread`, etc. |
-| `status` | TEXT NOT NULL | `opening`, `open`, `reducing`, `closing`, `closed`, `external_closed`, `error` |
+| `status` | TEXT NOT NULL | `pending`, `open`, `partially_filled`, `reducing`, `closing`, `closed`, `canceled`, `external_closed`, `error` |
+| `entry_qty` | REAL | Intended or final entry quantity |
+| `current_qty` | REAL | Remaining open quantity |
+| `avg_entry_price` | REAL | VWAP of entry fills |
+| `net_realized_pnl` | REAL | Running realized P&L for partial/full exits |
 | `entry_order_id` | TEXT nullable | Alpaca opening order id |
 | `entry_client_order_id` | TEXT nullable | Bot opening client order id |
 | `metadata_json` | TEXT | Non-sensitive lifecycle metadata |
 
 This table gives the operator a stable source for `positions`, `show-position`, and history.
+
+### 8.1 Lifecycle creation timing
+
+`position_uid` should be generated before broker submission, at order planning/building time.
+
+Rationale:
+
+- The bot can embed or map it into `client_order_id`.
+- Async fills and REST order lookups can immediately map back to the intended lifecycle.
+- Entry intents that are accepted, partially filled, canceled, or rejected still have a durable audit identity.
+
+Lifecycle state recommendation:
+
+1. Create `position_lifecycle` with `status='pending'` before dispatch.
+2. First fill transitions to `open` or `partially_filled`.
+3. Additional entry fills update `current_qty` and `avg_entry_price`.
+4. Canceled entry with zero fills transitions to `canceled`.
+5. Canceled entry with partial fills remains open at the filled quantity.
 
 ---
 
@@ -344,9 +401,12 @@ For `halt`:
 
 1. Set sticky `HALTED` state.
 2. Block new entries.
-3. Decide explicitly whether protective exits continue or all automation stops. This must be documented before implementation.
-4. Optionally call Alpaca `suspend_trade=true` as a future or separate hard-broker-control command, not necessarily v1 default.
-5. Require `resume-after-halt` with reconciliation before new entries can resume.
+3. Keep existing broker-side protective stops active.
+4. Do not cancel existing protective stops as part of normal `halt`.
+5. Optionally expose Alpaca `suspend_trade=true` later as a separate hard-broker-lock command, not as the default v1 halt behavior.
+6. Require `resume-after-halt` with reconciliation before new entries can resume.
+
+Rationale: a bot halt should stop the bot from increasing or reshaping risk, but canceling broker-resident protective stops can leave existing positions unprotected. Account-level `suspend_trade=true` may also block risk-reducing orders and should be reserved for a separate, heavily confirmed emergency command.
 
 ---
 
@@ -386,6 +446,14 @@ Record each partial close as a realized event linked to the same `position_uid`.
 - unrealized P&L on remaining qty
 - total lifecycle P&L once fully closed
 
+For R-multiple reporting, calculate each partial close event against the initial risk allocated to the closed portion:
+
+```text
+event_r = realized_pnl / (initial_risk_per_share * closed_qty * multiplier)
+```
+
+The lifecycle-level final R can then be computed from cumulative realized P&L against the total initial risk once the position is fully closed.
+
 ---
 
 ## 11. Stop/Order Interaction
@@ -398,11 +466,34 @@ For v1, before a manual reduce/close:
 
 - Find open orders linked to `position_uid`, symbol, strategy, or current close-side orders.
 - If there is a pending close order, reject the command unless the operator explicitly cancels it first.
-- If there is a protective stop, cancel it before the reduce/close.
+- If there is a protective stop, cancel it before the reduce/close and wait for cancellation confirmation through stream or REST.
 - After a partial reduce fill, submit a new protective stop for the remaining quantity if strategy/risk rules require it.
 - After a full close fill, do not re-create a stop.
 
 This should be tested carefully.
+
+Recommended sequence:
+
+1. Lock the symbol/position lifecycle as `reducing` or `closing`.
+2. Freeze strategy decisions for that symbol while the operator command is active.
+3. Cancel the existing stop and wait for broker confirmation.
+4. Submit the reduce/close order.
+5. After fill, recreate a correctly sized stop if quantity remains.
+6. Release the lock after broker and local state reconcile.
+
+Known race: a broker-side stop can fill while the bot is trying to cancel it. The implementation must treat this as a first-class reconciliation path: if the stop fills, the operator command should be rejected or marked superseded rather than submitting an additional reduce/close.
+
+### 11.1 Symbol-level locks
+
+Because Alpaca aggregates positions by symbol, the engine must serialize state-changing actions at the symbol/owner-key level.
+
+While a position is `opening`, `reducing`, or `closing`:
+
+- No other operator command may mutate the same symbol/owner key.
+- No strategy may submit a new entry for the same symbol/owner key.
+- No strategy-driven exit should compete with the operator command unless explicitly designed as a protective emergency path.
+
+This is required even with unique `position_uid`; broker reality is still symbol-aggregated for equities.
 
 ---
 
@@ -428,26 +519,35 @@ These can be considered later, but they are not needed to solve the safety probl
 
 Possible implementation sequence:
 
-1. Add `position_uid` generation and persistence.
+### Phase A: read-only identity
+
+1. Add `position_uid` generation before order submission.
 2. Add `position_lifecycle` table and migrations.
 3. Attach `position_uid` to trade log rows and state snapshot.
 4. Add read-only `operator.py status`, `positions`, `show-position`, `commands`.
-5. Add `operator_commands` queue table.
-6. Add engine polling/processing of pending operator commands.
-7. Implement `pause-entries` and `resume-entries`.
-8. Implement `close-position`.
-9. Implement `reduce-position`.
-10. Implement `halt` and `resume-after-halt`.
-11. Add alerts for all command state transitions.
-12. Add tests for identity uniqueness, restart recovery, command validation, stop interaction, and rejection paths.
+5. Verify restart rehydrates lifecycle IDs correctly.
 
-Suggested first PR:
+No broker-mutating operator commands should ship in Phase A. This lets reviewers validate the identity model before any operator command can trade.
 
-- `position_uid` schema + generation + restart persistence
-- read-only `positions` command
-- no broker mutations yet
+### Phase B: soft and emergency controls
 
-This lets reviewers validate the identity model before any operator command can trade.
+1. Add `operator_commands` queue table.
+2. Add engine polling/processing of pending operator commands.
+3. Add crash-safe command state transitions and command expiration.
+4. Implement `pause-entries` and `resume-entries`.
+5. Implement `pause-strategy` and `resume-strategy`.
+6. Implement `halt` and `resume-after-halt`.
+7. Add alerts for all command state transitions.
+
+### Phase C: destructive position controls
+
+1. Implement symbol/owner-key locks.
+2. Implement `cancel-position-orders`.
+3. Implement `close-position`.
+4. Implement `reduce-position`.
+5. Implement stop cancel/recreate handling.
+6. Wire manual close/reduce fills into lifecycle, trade log, PnL, and sleeve allocator state.
+7. Verify in dry-run and paper trading before any live use.
 
 ---
 
@@ -467,7 +567,15 @@ Unit tests should cover:
 - Partial reduce keeps lifecycle open.
 - Full close marks lifecycle closed only after fill confirmation.
 - Stop quantity is not left oversized after partial reduce.
+- Stop-fill-during-cancel race is reconciled without double-closing.
+- Command marked `executing` before broker dispatch is not double-dispatched after restart.
+- Stale pending command expires without execution.
+- `executing` command with `client_order_id` reconciles on restart.
+- Manual close/reduce updates sleeve allocator realized P&L and releases used capital.
+- Direct external close maps to the open lifecycle and marks `external_closed`.
+- Symbol-level lock blocks competing strategy/operator mutation.
 - Halt blocks entries.
+- Halt does not cancel existing broker-side protective stops.
 - Resume after halt requires reconciliation/preflight.
 
 Integration/manual paper checks should cover:
@@ -482,18 +590,18 @@ Integration/manual paper checks should cover:
 
 ## 15. Review Questions
 
-Claude/Gemini reviewers should specifically audit:
+Claude/Gemini reviewers should specifically audit the remaining unresolved or high-risk choices:
 
-1. Is `position_uid` added at the correct lifecycle point: before submission, after accepted order, or after first fill?
-2. Should `position_uid` live directly in `trades`, in a new `position_lifecycle` table, or both?
-3. How should partial fills on entry affect lifecycle creation?
-4. How should partial closes affect R-multiple and strategy performance stats?
-5. What is the safest stop-order sequence during manual reduce?
-6. Should `halt` keep protective exits active, or should it block all automation?
-7. Should Alpaca `suspend_trade=true` be exposed in v1 or reserved for a separate hard-broker-lock command?
-8. Is local OS-level access enough for v1 authentication?
-9. Should short-prefix matching of `position_uid` be allowed for convenience, or should destructive commands require the full ID?
-10. Are there edge cases where Alpaca's symbol-level position model can still make a `position_uid` action ambiguous?
+1. Is the proposed crash-recovery sequence sufficient to prevent double dispatch?
+2. Is 60 seconds the right expiration window for stale pending commands?
+3. Is the stop cancel/recreate sequence safe enough for fast markets, or should v1 require market close orders only after stop cancellation confirms?
+4. Should strategy-driven protective emergency exits be allowed while an operator command lock is active?
+5. Is the `position_lifecycle` table missing any fields required for options and spreads?
+6. Should `created_at` mean lifecycle planned time or first-fill time? Current recommendation: planned time, with separate entry/fill timestamps in metadata or trade rows.
+7. Should short-prefix matching be allowed for destructive commands if interactive confirmation is present, or should v1 require full IDs only?
+8. Should Alpaca `suspend_trade=true` be exposed as a separate `broker-suspend` command in v1, or deferred?
+9. Are there lifecycle/PnL edge cases for partial closes that would distort existing health/edge reports?
+10. Are there places in the current engine where symbol-level locks could be bypassed by async options/spread workers?
 
 ---
 
@@ -503,13 +611,21 @@ Recommended defaults for v1:
 
 - Use `position_uid = "pos_" + uuid.uuid4().hex`.
 - Store `position_uid` in both a lifecycle table and each trade row.
-- Require full `position_uid` for destructive commands.
-- Allow short display IDs only in read-only output.
+- Generate `position_uid` before broker submission.
+- Create lifecycle records in `pending` state before dispatch.
+- Mark operator commands `executing` and persist `client_order_id` before broker dispatch.
+- Expire stale pending commands rather than executing old intent.
+- Require full `position_uid` for destructive commands in non-interactive mode.
+- Allow short-prefix matching only in interactive mode with resolved position details and explicit confirmation.
 - Require `--reason` for every state-changing command.
 - Require confirmation for `close-position`, `reduce-position`, and `halt`.
 - Keep the CLI local-only.
 - Have the CLI write a command request, not call Alpaca directly.
 - Let the engine validate and execute commands.
+- Keep existing broker-side protective stops active during `halt`.
+- Reserve Alpaca `suspend_trade=true` for a separate hard-broker-lock command.
+- Serialize state-changing activity with symbol/owner-key locks.
+- Wire manual close/reduce fills into trade logging, lifecycle state, PnL, and sleeve allocator updates.
 - Start with read-only commands and identity persistence before adding broker-mutating controls.
 
 The main principle: operator controls should reduce ambiguity and reduce risk. They should not create a second uncontrolled trading path.
