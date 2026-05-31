@@ -4,7 +4,7 @@
 
 This document defines the target architecture for the Alpaca trading bot. It is the source of truth for structural decisions, coding conventions, and the go/no-go framework for live capital deployment. All refactoring and new development should align with this guide.
 
-The bot is built in Python using `alpaca-py`. Four strategies are active in paper trading as of Phase 10 (2026-05-06): SMA Crossover (trend-following), RSI Reversion (mean-reversion), Donchian Breakout (trend-continuation), and SPY Options RSI Reversion (options mean-reversion). The final live GO/NO-GO gate is the combined four-strategy paper run after Phase 10 safety work is complete.
+The bot is built in Python using `alpaca-py`. Five strategy sleeves are active in paper trading: SMA Crossover (trend-following), RSI Reversion (mean-reversion), Donchian Breakout (trend-continuation), SPY Options RSI Reversion (single-leg options mean-reversion), and Credit Spread (SPY + QQQ bull put spreads). The current live GO/NO-GO gate is the combined five-strategy paper run after the Phase 10/11 safety and execution-calibration work is complete.
 
 ---
 
@@ -20,12 +20,12 @@ The bot is organized into seven layers. Each layer has a single responsibility a
 ├─────────────────────────────────────────┤
 │              Data Layer                 │  Historical bars, freshness checks
 ├─────────────────────────────────────────┤
-│     Indicators + Strategy Interface     │  Technical indicators, BaseStrategy
+│     Indicators + Strategy Interface     │  Technical indicators, BaseStrategy, MLEG hooks
 ├─────────────────────────────────────────┤
 │        Risk Manager + Allocator         │  Position sizing, sleeve budgets, kill switches
 ├─────────────────────────────────────────┤
 │         Execution Layer (alpaca-py)     │  TradingClient, order management, paper↔live
-│         Options Execution Worker        │  Async bracket-order thread for options
+│         Options Execution Workers       │  Async single-leg brackets + MLEG combos
 ├─────────────────────────────────────────┤
 │         Reporting & Monitoring          │  Trade log (SQLite), PnL, metrics, alerts
 └─────────────────────────────────────────┘
@@ -34,17 +34,18 @@ The bot is organized into seven layers. Each layer has a single responsibility a
 At the signal level, strategy entries pass through a narrower trade-permission pipeline:
 
 ```
-Watchlist → raw strategy signal → edge filter (+ sector momentum) → regime gate → sleeve check → risk → execution
+Watchlist → raw strategy signal → edge filter (+ sector momentum/IV) → regime gate → sleeve check → risk/defined-risk check → execution
 ```
 
-- **Strategy** owns setup detection (crossover, RSI extreme, breakout, options RSI recovery)
+- **Strategy** owns setup detection (crossover, RSI extreme, breakout, options RSI recovery, spread candidate)
 - **Edge filter** owns current-condition permission (stock trend, macro state, earnings)
 - **Regime detector** gates entire strategies by market regime
 - **Sleeve allocator** enforces per-strategy capital budgets
-- **Risk manager** owns sizing, stops, exposure limits, and kill switches
+- **Risk manager** owns single-leg sizing, stops, exposure limits, and kill switches
+- **Defined-risk spread path** sizes from max loss and sleeve capacity, then dispatches atomic MLEG orders
 - **Execution** only places orders after all upstream gates pass
 
-For options, the execution path diverges after the risk manager: the broker detects the OCC symbol and dispatches an `OptionsExecutionWorker` thread that handles the async bracket order lifecycle independently of the engine loop.
+For single-leg options, the execution path diverges after the risk manager: the broker detects the OCC symbol and dispatches an `OptionsExecutionWorker` thread that handles the async limit-entry + bracket lifecycle independently of the engine loop. Multi-leg options strategies such as credit spreads bypass `RiskManager.evaluate` after the sleeve check because max loss is defined by the spread; they route through the MLEG combo path and `SpreadExecutionWorker`.
 
 ---
 
@@ -53,6 +54,7 @@ For options, the execution path diverges after the risk manager: the broker dete
 ```
 trading-bot/
 │
+├── AGENTS.md                  # Codex persistent project context
 ├── CLAUDE.md                  # Claude Code session context
 ├── PLAN.md                    # Phased build plan and progress tracker
 ├── requirements.txt           # Pinned dependencies
@@ -89,12 +91,14 @@ trading-bot/
 │   ├── rsi_reversion.py       # Mean-reversion: RSI oversold/overbought
 │   ├── donchian_breakout.py   # Trend-continuation: Turtle System 1 (30/15, ai_bigtech)
 │   ├── spy_options_reversion.py  # Options mean-reversion: SPY calls on RSI recovery
+│   ├── credit_spread.py       # Defined-risk bull put credit spreads (SPY + QQQ)
 │   ├── filters/
 │   │   ├── common.py          # SPYTrendFilter + CompositeEdgeFilter
 │   │   ├── sma_crossover.py   # SMAEdgeFilter: stock > 200 SMA, volume expansion
 │   │   ├── rsi_reversion.py   # RSIEdgeFilter: SPY dual macro, earnings, liquidity, no-new-low
 │   │   ├── donchian_breakout.py      # DonchianEdgeFilter: stock > 200 SMA, liquidity, earnings
 │   │   ├── spy_options_reversion.py  # SPYOptionsEdgeFilter: SPY > 100 SMA
+│   │   ├── credit_spread.py   # CreditSpreadEdgeFilter: trend + IV proxy + earnings
 │   │   └── sector_momentum.py # SectorMomentumFilter: HOT/NEUTRAL/COLD gate adapter
 │   └── health/                # Strategy Health & Edge Monitor v1 (PLAN.md 11.10 — advisory only)
 │       ├── stats.py           # Bootstrap CI, one-sided t-test, EMA50/100 cross detector
@@ -117,10 +121,6 @@ trading-bot/
 ├── regime/
 │   ├── __init__.py
 │   └── detector.py            # RegimeDetector: BEAR/VOLATILE/TRENDING/RANGING
-│
-├── engine/
-│   ├── __init__.py
-│   └── trader.py              # TradingEngine — the live loop orchestrator
 │
 ├── risk/
 │   ├── __init__.py
@@ -192,7 +192,10 @@ trading-bot/
 │   ├── test_gonogo.py
 │   ├── test_sector_gauge.py
 │   ├── test_sector_resolver.py
-│   └── test_spy_options_reversion.py  # 21 tests: signals, guards, trailing stop, edge filter
+│   ├── test_spy_options_reversion.py  # Signals, guards, trailing stop, edge filter
+│   ├── test_credit_spread.py          # Strategy caps, entry/exit logic, spread state
+│   ├── test_credit_spread_filter.py   # Trend / IV / earnings filter
+│   └── test_engine_credit_spread.py   # Engine MLEG entry, fill drain, exit path
 │
 ├── docs/                      # Architecture and strategy documentation
 ├── logs/                      # Rotating log files (gitignored)
@@ -224,12 +227,12 @@ Key rules:
 
 **Four regimes:**
 
-| Regime | Condition | SMA | RSI | Donchian | SPY Options |
-|---|---|---|---|---|---|
-| BEAR | SPY < 200-day SMA | ❌ | ❌ | ❌ | ❌ |
-| VOLATILE | ATR% above 80th percentile of trailing 126 bars | ❌ | ❌ | ❌ | ❌ |
-| TRENDING | ADX ≥ 25 | ✅ | ✅ | ✅ | ✅ |
-| RANGING | ADX ≤ 20 (or ambiguous zone, SMA50 slope tie-break) | ✅ | ✅ | ❌ | ✅ |
+| Regime | Condition | SMA | RSI | Donchian | SPY Options | Credit Spread |
+|---|---|---|---|---|---|---|
+| BEAR | SPY < 200-day SMA | ❌ | ❌ | ❌ | ❌ | ❌ |
+| VOLATILE | ATR% above 80th percentile of trailing 126 bars | ❌ | ❌ | ❌ | ❌ | ❌ |
+| TRENDING | ADX ≥ 25 | ✅ | ✅ | ✅ | ✅ | ✅ |
+| RANGING | ADX ≤ 20 (or ambiguous zone, SMA50 slope tie-break) | ✅ | ✅ | ❌ | ✅ | ✅ |
 
 **Classification priority:** BEAR → VOLATILE → TRENDING/RANGING (ADX + slope).
 
@@ -338,7 +341,7 @@ def inspect_open_positions(self, position, latest_close: float) -> bool:
 ```python
 def build_spread_execution(
     self, underlying_close: float, *,
-    notional_cap: float, total_open_credit_spreads: int,
+    notional_cap: float, total_open_spreads: int,
 ) -> SpreadExecutionPlan:
     """
     Called by the engine on entry. Runs the strategy's per-instance caps,
@@ -400,7 +403,7 @@ Each slot binds a strategy to its symbol universe, timeframe, and allowed regime
 
 ### 5. Risk Manager + Sleeve Allocator
 
-The Risk Manager sits between strategy signals and the execution layer. No order reaches the broker without passing through it. The Sleeve Allocator enforces per-strategy capital budgets before the risk manager is invoked.
+The Risk Manager sits between single-leg strategy signals and the execution layer. No equity or single-leg option order reaches the broker without passing through it. Defined-risk MLEG spreads are the deliberate exception: they pass the sleeve allocator and engine-level kill switches, then size from strategy-computed max loss instead of `RiskManager.evaluate`. The Sleeve Allocator enforces per-strategy capital budgets before either path can submit.
 
 #### Sleeve Allocator (`risk/allocator.py`)
 
@@ -412,15 +415,16 @@ Target budget       = deployable_capital × target_pct
 Max one position    = effective_budget × max_position_pct_of_sleeve
 ```
 
-At $100k equity, 80% deployable gross, 95/5 pool split, and a 40% equity concentration cap:
-- SMA target sleeve: $100k × 0.80 × 0.45 = $36,000 → up to $16,560 in one position when stretched
-- RSI target sleeve: $100k × 0.80 × 0.25 = $20,000 → up to $9,200 in one position when stretched
+At $100k equity, 80% deployable gross, 85/15 pool split, and a 40% concentration cap on equity/credit-spread sleeves:
+- SMA target sleeve: $100k × 0.80 × 0.40 = $32,000 → up to $14,720 in one position when stretched
+- RSI target sleeve: $100k × 0.80 × 0.20 = $16,000 → up to $7,360 in one position when stretched
 - Donchian target sleeve: $100k × 0.80 × 0.25 = $20,000 → up to $9,200 in one position when stretched
-- Options sleeve: $100k × 0.80 × 0.05 = $4,000 isolated → one position max
+- SPY options sleeve: $100k × 0.80 × 0.05 = $4,000 isolated → one position max
+- Credit-spread sleeve: $100k × 0.80 × 0.10 = $8,000 isolated, shared by SPY + QQQ → up to $3,200 max loss in one spread
 
 RiskManager still sizes from stop-risk first; the allocator only caps strategy capital. Equity sleeves may borrow idle equity-pool capital up to 115% of target while total deployable utilization remains below 80%. Rejection codes remain `SLEEVE_FULL` (capital exhausted), `SLEEVE_MAX_POSITIONS` (hard safety ceiling), and `SLEEVE_DRAWDOWN`.
 
-The options sleeve uses the same `SleeveAllocator` and HWM drawdown gate as equity strategies. P&L is recorded with a 100× contract multiplier so the drawdown gate operates on real dollar amounts, not premium points.
+The isolated options pool uses the same `SleeveAllocator` and HWM drawdown gate as equity strategies. Single-leg option P&L is recorded with a 100× contract multiplier so the drawdown gate operates on real dollar amounts, not premium points. Credit-spread sleeve usage is based on defined max loss (`width − credit`) × contracts × 100, and realized spread P&L is fed back into the same allocator HWM gate on close.
 
 #### Risk Manager (`risk/manager.py`)
 
@@ -434,7 +438,7 @@ The options sleeve uses the same `SleeveAllocator` and HWM drawdown gate as equi
 - Broker-error-streak kill switch
 - Slippage-drift kill switch
 
-For options, fractional sizing is disabled (`and not is_option` guard in `_size_position()`). The 100× contract multiplier is applied only in P&L accounting — the risk manager sizes by contract count.
+For single-leg options, fractional sizing is disabled (`and not is_option` guard in `_size_position()`). The 100× contract multiplier is applied only in P&L accounting — the risk manager sizes by contract count. MLEG spreads do not call `_size_position`; their quantity is chosen inside `build_spread_execution` from sleeve notional, width, credit, and max-loss caps.
 
 **Key risk parameters (from `config/settings.py`):**
 
@@ -442,7 +446,7 @@ For options, fractional sizing is disabled (`and not is_option` guard in `_size_
 |---|---|---|
 | `MAX_POSITION_PCT` | Max % of equity risked per trade (loss-to-stop) | 2% |
 | `MAX_POSITION_NOTIONAL_PCT` | Max notional for one position as % of equity | 10% |
-| `MAX_OPEN_POSITIONS` | Max concurrent global positions | 10 |
+| `MAX_OPEN_POSITIONS` | Max concurrent global positions; per-strategy caps are enforced by the sleeve allocator | 30 |
 | `MAX_GROSS_EXPOSURE_PCT` | Max total gross notional as % of equity | 80% |
 | `MAX_DAILY_LOSS_PCT` | Halt for the session if equity down this much | 5% |
 | `HARD_DOLLAR_LOSS_CAP` | Absolute $ loss cap from session start | $2,000 |
@@ -473,7 +477,7 @@ Options orders are detected by matching the OCC symbol format (`^[A-Z]{1,6}[0-9]
 
 1. Calls `build_option_execution(symbol, underlying_price)` on the strategy to get `(occ_symbol, limit_price, take_profit, stop_loss)`. If `None` is returned (e.g. spread too wide), the worker exits without placing an order.
 2. Submits a limit entry order for the OCC symbol via `TradingClient`.
-3. Polls `StreamManager` for a fill event for up to 60 seconds. If no fill arrives, cancels the order and exits.
+3. Polls `StreamManager` for a fill event for up to `MLEG_ENTRY_WATCH_TIMEOUT_SECONDS` seconds (default 180; shared by the async options workers). If no fill arrives, cancels the order and exits.
 4. On confirmed fill: submits take-profit and stop-loss legs as a bracket OTO order.
 5. Reports the fill back to the engine via a queue drained by `drain_option_fills()` each cycle.
 
@@ -494,7 +498,7 @@ Options orders are detected by matching the OCC symbol format (`^[A-Z]{1,6}[0-9]
 
 **WebSocket stream stop fills:** When a bracket stop leg fills, the stream delivers the event with the OCC symbol. `_process_stream_stop_fills` normalizes the OCC string to the underlying ticker (the `position_id` in `_positions`), records the real P&L with the 100× multiplier, and calls `log_stop_fill` to persist the confirmed execution. If price or qty is absent from the stream event, it falls back to `log_external_close`.
 
-**Position ownership model (PLAN.md 11.27):** `_positions: dict[position_id, Position]` keys single-leg positions by `owner_key_for(symbol)` — equity ticker or option underlying — and reserves UUID `position_id`s for spreads. The earlier 11.23 limitation (two options strategies on the same underlying would collide because both were keyed by the underlying ticker) is superseded by this abstraction: future multi-leg or same-underlying strategies key on their own `position_id`. See `engine/positions.py`.
+**Position ownership model (PLAN.md 11.27):** `_positions: dict[position_id, Position]` keys single-leg positions by `owner_key_for(symbol)` — equity ticker or option underlying — and reserves UUID `position_id`s for spreads. That abstraction is what lets a single-leg SPY option and a SPY credit spread coexist: the single-leg option owns the `"SPY"` slot, while the spread owns a UUID. Two single-leg options strategies on the same underlying are still intentionally blocked by the underlying-level conflict check until single-leg option positions are moved off the underlying-keyed slot. See `engine/positions.py` and the PLAN.md 11.44 follow-up.
 
 **Cross-strategy conflict rule (PLAN.md 11.44).** The guard is split by ownership-model keying, not by asset class:
 
@@ -611,7 +615,7 @@ Full v1 design and rationale: `docs/strategy_health_design.md`. Deliberately def
 Before committing live capital, ALL of the following must be satisfied:
 
 1. Minimum **50 closed trades** in paper trading (statistical significance)
-2. Paper trading period spans **at least 4 weeks** across varying market conditions, with all four strategies active
+2. Paper trading period spans **at least 4 weeks** across varying market conditions, with all five active strategy sleeves running
 3. All five metrics meet their thresholds (see table above)
 4. Bot has run for at least **72 hours continuously** without crashes or errors
 5. Risk manager daily halt has never been triggered without being intentional
@@ -646,7 +650,9 @@ When implementing any new equity strategy:
 13. Implement `inspect_open_positions(position, latest_close) -> bool` — mid-trade exit guards (time stop, delta floor, trailing stop, etc.)
 14. Use `utils/options_lookup.find_best_call` (or an equivalent) to select the contract
 15. Add tests for `build_option_execution`, `inspect_open_positions`, and each exit guard in `tests/test_<strategy_name>.py`
-16. Multi-leg or same-underlying options strategies use the `Position` abstraction (PLAN.md 11.27, `engine/positions.py`): set an explicit `position_id` (UUID for spreads) so two strategies on the same underlying cannot collide on the engine's ownership map
+16. For a multi-leg options strategy, implement the MLEG duck-typed hooks (`build_spread_execution`, `evaluate_spread_exit`, `register_spread`, `release_spread`, `open_spreads`, `get_open_spread`) and route entries through `_enter_multi_leg`
+17. Use UUID `position_id`s for spreads and add startup reconstruction through the spread restore path so broker legs cannot be mis-assigned as standalone options
+18. For a second single-leg options strategy on an already-used underlying, first change the single-leg option ownership model away from the underlying-keyed slot; otherwise the underlying-level `SYMBOL_CONFLICT` rule will correctly block it
 
 ---
 
@@ -661,7 +667,7 @@ When implementing any new equity strategy:
 | `sqlite3` | Trade logging (built into Python) |
 | `python-dotenv` | Environment variable management |
 | `blackscholes` | Black-Scholes option pricing for mid-trade delta and value guards |
-| `yfinance` | VIX daily fetch for Black-Scholes sigma input (options only) |
+| `yfinance` | Sector metadata cache plus VIX/RVX IV proxy series for options filters, Black-Scholes sigma, and IV-rank observation |
 
 ---
 
@@ -676,5 +682,5 @@ When implementing any new equity strategy:
 - Never use `pandas-ta` — indicators are hand-rolled to eliminate dependency risk
 - Never set `LIVE_TRADING=true` before `scripts/preflight.py` exits 0
 - Never mix paper and live trade logs — they are separate databases by design
-- Never call `build_option_execution` or `inspect_open_positions` from inside the risk manager — these are strategy concerns, called by the broker and engine respectively
-- Never key new options ownership state by the OCC string without first resolving the 11.23 migration — use the underlying ticker for now and document the limitation
+- Never call `build_option_execution`, `inspect_open_positions`, or MLEG strategy hooks from inside the risk manager — these are strategy/engine execution concerns
+- Never add a second same-underlying single-leg options strategy without first changing the single-leg option ownership model; today those positions are intentionally keyed by underlying and protected by `SYMBOL_CONFLICT`
