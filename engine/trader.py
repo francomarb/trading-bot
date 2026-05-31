@@ -1296,9 +1296,13 @@ class TradingEngine:
 
             # PLAN 11.44: contract-level conflict guard. The picker resolved
             # the OCC; reject before order submission if another strategy
-            # already owns the exact contract. Distinct OCCs on the same
-            # underlying are intentionally allowed by the underlying-level
-            # skip above.
+            # already owns the exact contract. For single-leg options this
+            # is the second of two checks — the underlying-level
+            # ``_get_owner`` check above already blocks another single-leg
+            # owner of the same underlying (the single-leg ``_positions``
+            # slot can only hold one), so the case reached here is the
+            # exact-OCC clash against an MLEG leg owner (whose UUID-keyed
+            # position does not occupy the underlying slot).
             if is_occ_option(target_symbol):
                 if self._reject_if_contract_conflict(
                     strategy_name=strategy.name,
