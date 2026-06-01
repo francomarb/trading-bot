@@ -301,20 +301,30 @@ MIN_TRADE_NOTIONAL = 100.0      # Reject entries if sleeve available < this
 # floor it is INDICATIVE; at or above the floor the verdict can be
 # CONCLUSIVE (and the silent-killer alarm becomes possible).
 #
-# Numbers are hand-picked heuristics — honest about it. MinTRL-based
-# rigorous replacement is follow-up §F1. See docs/strategy_health_design.md §8.
+# Calibration philosophy (re-anchored 2026-06): floors target
+# "CONCLUSIVE reachable within ~6 months of live operation" against
+# observed paper cadence, not "ideal sample size for statistical
+# confidence." The latter framing produced floors of 30–50 that were
+# unreachable inside multi-year windows for slow strategies (SMA
+# closed ~17 trades/year in paper, RSI ~0–6/year because of heavy
+# gating). The trade-off is explicit: lower floors weaken per-verdict
+# statistical power, but they make INDICATIVE/CONCLUSIVE bands a
+# usable operator signal instead of dead code. MinTRL-based rigorous
+# replacement remains follow-up §F1.
 #
-# rsi_reversion is intentionally low (25) because the strategy's tight
-# filters (SPY trend, earnings blackout, no-new-low) gate heavily in
-# some regimes; observed 2-month zero-trade stretches in paper. The
-# "RSI isn't firing" case is handled by L3 Drift independently of
-# whether Edge ever reaches CONCLUSIVE.
+# rsi_reversion stays the lowest (8) because its tight filters
+# (SPY trend, earnings blackout, no-new-low) produce observed
+# multi-month zero-trade stretches. The "RSI isn't firing" case is
+# still handled by L3 Drift independently of whether Edge ever
+# reaches CONCLUSIVE.
+#
+# See docs/strategy_health_design.md §8.
 STRATEGY_MIN_TRADES_FOR_VERDICT: dict[str, int] = {
-    "sma_crossover": 30,
-    "rsi_reversion": 25,
-    "donchian_breakout": 50,
-    "spy_options_reversion": 40,
-    "credit_spread": 50,
+    "sma_crossover": 25,
+    "rsi_reversion": 8,
+    "donchian_breakout": 25,
+    "spy_options_reversion": 15,
+    "credit_spread": 25,
 }
 
 # Strategy Health monitor (PLAN 11.10f) — feature flag for the
