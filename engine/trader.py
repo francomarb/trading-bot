@@ -1184,6 +1184,23 @@ class TradingEngine:
                 signal_key, signal_bar, strategy_statuses, strategy_reasons, symbol
             )
             return
+        if self._has_pending_entry_order(
+            symbol,
+            strategy.name,
+            snapshot,
+            order_strategy or {},
+        ):
+            if strategy_statuses is not None:
+                strategy_statuses[symbol] = "Pending Entry"
+            if strategy_reasons is not None:
+                strategy_reasons[symbol] = []
+            logger.info(
+                f"[{strategy.name}] {symbol}: entry skipped — a buy order is already pending"
+            )
+            self._mark_signal_bar_processed(
+                signal_key, signal_bar, strategy_statuses, strategy_reasons, symbol
+            )
+            return
 
         # Shared-symbol conflict (11.7 Part A, refined by PLAN 11.44).
         #
@@ -2053,6 +2070,14 @@ class TradingEngine:
             if self._has_position(order.symbol):
                 # Close / reduce order for an existing position — skip.
                 continue
+            client_order_id = getattr(order, "client_order_id", None)
+            if isinstance(client_order_id, str) and client_order_id:
+                for slot in slots:
+                    if client_order_id.startswith(f"{slot.strategy.name}-"):
+                        result[order.order_id] = slot.strategy.name
+                        break
+                if order.order_id in result:
+                    continue
             matches = [slot for slot in slots if order.symbol in slot.active_symbols()]
             if not matches:
                 continue
@@ -2065,6 +2090,21 @@ class TradingEngine:
                     f"{[slot.strategy.name for slot in matches]}"
                 )
         return result
+
+    @staticmethod
+    def _has_pending_entry_order(
+        symbol: str,
+        strategy_name: str,
+        snapshot: BrokerSnapshot,
+        order_strategy: dict[str, str],
+    ) -> bool:
+        """True when the broker already has a pending BUY entry for this strategy/symbol."""
+        return any(
+            o.symbol == symbol
+            and o.side is Side.BUY
+            and order_strategy.get(o.order_id) == strategy_name
+            for o in snapshot.open_orders
+        )
 
     def _compute_sector_exposure(self) -> dict[str, list[dict]]:
         """

@@ -1376,6 +1376,85 @@ class TestWatchlistStatuses:
         debug.assert_called_once()
         assert "via priority among" in debug.call_args.args[0]
 
+    def test_attribute_orders_prefers_client_order_id_strategy_match(
+        self, engine_factory
+    ):
+        from risk.allocator import SleeveAllocator
+
+        class FirstStrategy(FakeStrategy):
+            name = "first_strategy"
+
+        class SecondStrategy(FakeStrategy):
+            name = "second_strategy"
+
+        engine, _ = engine_factory()
+        engine.slots = [
+            StrategySlot(
+                strategy=FirstStrategy(entries=[False], exits=[False]),
+                symbols=["ARM"],
+            ),
+            StrategySlot(
+                strategy=SecondStrategy(entries=[False], exits=[False]),
+                symbols=["ARM"],
+            ),
+        ]
+        allocator = MagicMock(spec=SleeveAllocator)
+        allocator.strategy_priority.side_effect = lambda name: {
+            "first_strategy": 0,
+            "second_strategy": 1,
+        }[name]
+        engine._allocator = allocator
+
+        order = OpenOrder(
+            order_id="buy-1",
+            symbol="ARM",
+            side=Side.BUY,
+            qty=1,
+            order_type=OrderType.LIMIT,
+            status="open",
+            submitted_at=T0,
+            limit_price=370.79,
+            stop_price=None,
+            client_order_id="second_strategy-abc123",
+        )
+
+        assert engine._attribute_orders([order]) == {"buy-1": "second_strategy"}
+
+    def test_has_pending_entry_order_blocks_duplicate_for_same_strategy(
+        self, engine_factory
+    ):
+        engine, _ = engine_factory()
+        snapshot = _snapshot(
+            open_orders=[
+                OpenOrder(
+                    order_id="buy-1",
+                    symbol="ARM",
+                    side=Side.BUY,
+                    qty=1,
+                    order_type=OrderType.LIMIT,
+                    status="open",
+                    submitted_at=T0,
+                    limit_price=370.79,
+                    stop_price=None,
+                    client_order_id="donchian_breakout-abc123",
+                )
+            ]
+        )
+        order_strategy = {"buy-1": "donchian_breakout"}
+
+        assert engine._has_pending_entry_order(
+            "ARM",
+            "donchian_breakout",
+            snapshot,
+            order_strategy,
+        )
+        assert not engine._has_pending_entry_order(
+            "ARM",
+            "rsi_reversion",
+            snapshot,
+            order_strategy,
+        )
+
     def test_startup_repairs_missing_protective_stop(
         self, engine_factory, tmp_path
     ):

@@ -181,6 +181,7 @@ class OpenOrder:
     submitted_at: datetime
     limit_price: float | None
     stop_price: float | None
+    client_order_id: str | None = None
 
 
 @dataclass(frozen=True)
@@ -1731,6 +1732,7 @@ class AlpacaBroker:
             submitted_at=submitted,
             limit_price=float(o.limit_price) if getattr(o, "limit_price", None) else None,
             stop_price=float(o.stop_price) if getattr(o, "stop_price", None) else None,
+            client_order_id=getattr(o, "client_order_id", None),
         )
 
     @staticmethod
