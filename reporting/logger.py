@@ -22,6 +22,7 @@ Design principles:
 
 from __future__ import annotations
 
+import math
 import os
 import re
 import sqlite3
@@ -611,6 +612,7 @@ class TradeLogger:
         reason: str = "",
         submitted_limit_price: float | None = None,
         realized_slippage_bps: float | None = None,
+        initial_risk_dollars: float | None = None,
     ) -> None:
         """
         Write trade-log rows for a multi-leg (MLEG) credit-spread fill (11.29).
@@ -634,6 +636,20 @@ class TradeLogger:
         It is written to the short-leg row so
         ``read_strategy_realized_pnl_summary`` (which counts spread rows)
         rolls credit-spread P&L into the sleeve HWM / drawdown gate.
+
+        ``initial_risk_dollars`` is the spread's max-loss basis at open
+        (``(width − net_credit) × 100 × qty``). The caller computes it from
+        the ``SpreadExecutionPlan`` / ``OpenSpread`` in scope. On the open
+        path it is written to the short-leg row so the close path can read
+        it back. On the close path, it is combined with ``realized_pnl`` to
+        produce the R-multiple: ``r_multiple = realized_pnl /
+        initial_risk_dollars``. If the caller omits it on the close path
+        (e.g. external-close detection without an in-memory ``OpenSpread``),
+        the close path falls back to the most recent open row for
+        ``position_id``. When neither source yields a finite positive
+        basis, ``r_multiple`` stays NULL — the Strategy Health design
+        (§5.1, edge.py:149-156) tolerates this and falls back to dollar
+        metrics.
 
         ``position_type='spread'`` rows are deliberately excluded from
         ``read_all_open_owners`` / ``read_owner_for_symbol`` so the engine's
@@ -661,6 +677,26 @@ class TradeLogger:
             )
         )
 
+        # On a close, fall back to the open row's stored basis when the
+        # caller didn't supply one (external-close path can lose `released`).
+        if not opening and initial_risk_dollars is None:
+            initial_risk_dollars = self._read_latest_open_spread_risk_basis(
+                position_id=position_id,
+            )
+
+        basis = (
+            float(initial_risk_dollars)
+            if initial_risk_dollars is not None
+            and math.isfinite(float(initial_risk_dollars))
+            and float(initial_risk_dollars) > 0
+            else None
+        )
+        r_multiple: float | None = None
+        if not opening and basis is not None and realized_pnl is not None:
+            pnl_f = float(realized_pnl)
+            if math.isfinite(pnl_f):
+                r_multiple = pnl_f / basis
+
         def _leg_record(
             symbol: str,
             side: str,
@@ -669,6 +705,8 @@ class TradeLogger:
             *,
             entry_reference_price: float,
             slippage_bps: float,
+            risk_dollars: float | None,
+            r_mult: float | None,
         ) -> TradeRecord:
             return TradeRecord(
                 timestamp=now_iso,
@@ -689,17 +727,17 @@ class TradeLogger:
                 filled_qty=qty,
                 initial_stop_loss=None,
                 initial_risk_per_share=None,
-                initial_risk_dollars=None,
+                initial_risk_dollars=risk_dollars,
                 realized_pnl=pnl,
-                r_multiple=None,
+                r_multiple=r_mult,
                 entry_timestamp=now_iso if opening else None,
                 exit_timestamp=None if opening else now_iso,
                 position_id=position_id,
                 position_type="spread",
             )
 
-        # realized_pnl rides the short-leg row alongside the net economics;
-        # the long-leg row stays at 0.0 / None.
+        # realized_pnl, initial_risk_dollars, and r_multiple ride the short-leg
+        # row alongside the net economics; the long-leg row stays at 0.0 / None.
         self.log(_leg_record(
             short_occ,
             short_side,
@@ -707,6 +745,8 @@ class TradeLogger:
             realized_pnl,
             entry_reference_price=short_ref_price,
             slippage_bps=short_slippage_bps,
+            risk_dollars=basis,
+            r_mult=r_multiple,
         ))
         self.log(_leg_record(
             long_occ,
@@ -715,11 +755,51 @@ class TradeLogger:
             None,
             entry_reference_price=0.0,
             slippage_bps=0.0,
+            risk_dollars=None,
+            r_mult=None,
         ))
         logger.info(
             f"spread {'entry' if opening else 'exit'} logged: {short_occ}/{long_occ} "
             f"qty={qty} net=${net_price:.2f}/sh [{strategy}] position_id={position_id[:8]}"
         )
+
+    def _read_latest_open_spread_risk_basis(
+        self, *, position_id: str
+    ) -> float | None:
+        """Return the most recent open spread row's initial_risk_dollars
+        for ``position_id``, or None if no usable basis exists.
+
+        Used by the close path in ``log_spread_fill`` when the caller did
+        not pass an explicit basis (external-close detection has no
+        in-memory ``OpenSpread``). Matches the spread leg open by
+        ``position_type='spread'``, ``side='sell'`` (the short leg, which
+        carries the basis), ``realized_pnl IS NULL`` (open rows, not prior
+        closes), and ``initial_risk_dollars IS NOT NULL``.
+        """
+        if not os.path.exists(self._path):
+            return None
+        try:
+            conn = self._ensure_db()
+        except sqlite3.Error:
+            return None
+        cursor = conn.execute(
+            "SELECT initial_risk_dollars FROM trades "
+            "WHERE position_id = ? "
+            "AND position_type = 'spread' "
+            "AND side = 'sell' "
+            "AND realized_pnl IS NULL "
+            "AND initial_risk_dollars IS NOT NULL "
+            "ORDER BY id DESC LIMIT 1",
+            (position_id,),
+        )
+        row = cursor.fetchone()
+        if row is None:
+            return None
+        try:
+            value = float(row[0])
+        except (TypeError, ValueError):
+            return None
+        return value if math.isfinite(value) and value > 0 else None
 
     def log_stop_fill(
         self,
