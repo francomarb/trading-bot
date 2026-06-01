@@ -857,6 +857,152 @@ class TestSpreadLogging:
         assert summary["credit_spread"]["hwm"] == pytest.approx(0.0)
 
 
+class TestSpreadRMultiple:
+    """log_spread_fill must populate initial_risk_dollars + r_multiple so
+    the EdgeAssessor (strategies/health/edge.py:413) can count credit-spread
+    closes as R-multiple-bearing trades. Per design §5.1, R-multiple is the
+    primary verdict input; before this wiring spreads were structurally
+    excluded from the Edge sample.
+    """
+
+    _SHORT = "SPY260618P00689000"
+    _LONG = "SPY260618P00674000"
+
+    def test_open_writes_initial_risk_dollars_on_short_leg(self, tmp_csv):
+        tl = TradeLogger(path=tmp_csv)
+        # Bull put: width=15, net_credit=2.54/sh → max_loss/contract = $1246;
+        # one contract → $1246 initial_risk_dollars.
+        tl.log_spread_fill(
+            position_id="uuid-1", strategy="credit_spread",
+            short_occ=self._SHORT, long_occ=self._LONG,
+            qty=1, net_price=2.54, opening=True,
+            initial_risk_dollars=1246.0,
+        )
+        rows = tl.read_all()
+        by_symbol = {r["symbol"]: r for r in rows}
+        assert by_symbol[self._SHORT]["initial_risk_dollars"] == pytest.approx(1246.0)
+        assert by_symbol[self._LONG]["initial_risk_dollars"] is None
+        # No r_multiple on open rows — it is meaningful only on closes.
+        assert by_symbol[self._SHORT]["r_multiple"] is None
+        assert by_symbol[self._LONG]["r_multiple"] is None
+
+    def test_close_computes_r_multiple_from_caller_supplied_basis(self, tmp_csv):
+        tl = TradeLogger(path=tmp_csv)
+        # Close at $0.80 debit → realized = (2.54−0.80)×100 = 174.0.
+        # r_multiple = 174.0 / 1246.0 ≈ 0.1397.
+        tl.log_spread_fill(
+            position_id="uuid-1", strategy="credit_spread",
+            short_occ=self._SHORT, long_occ=self._LONG,
+            qty=1, net_price=0.80, opening=False,
+            realized_pnl=174.0, initial_risk_dollars=1246.0,
+        )
+        rows = tl.read_all()
+        by_symbol = {r["symbol"]: r for r in rows}
+        assert by_symbol[self._SHORT]["initial_risk_dollars"] == pytest.approx(1246.0)
+        assert by_symbol[self._SHORT]["r_multiple"] == pytest.approx(174.0 / 1246.0)
+        # Long leg stays clean.
+        assert by_symbol[self._LONG]["initial_risk_dollars"] is None
+        assert by_symbol[self._LONG]["r_multiple"] is None
+
+    def test_close_falls_back_to_open_row_basis(self, tmp_csv):
+        tl = TradeLogger(path=tmp_csv)
+        tl.log_spread_fill(
+            position_id="uuid-1", strategy="credit_spread",
+            short_occ=self._SHORT, long_occ=self._LONG,
+            qty=1, net_price=2.54, opening=True,
+            initial_risk_dollars=1246.0,
+        )
+        # Caller omits initial_risk_dollars (external-close path) — logger
+        # must look up the open row's stored basis to compute r_multiple.
+        tl.log_spread_fill(
+            position_id="uuid-1", strategy="credit_spread",
+            short_occ=self._SHORT, long_occ=self._LONG,
+            qty=1, net_price=0.80, opening=False, realized_pnl=174.0,
+        )
+        rows = tl.read_all()
+        close_short = next(
+            r for r in rows
+            if r["symbol"] == self._SHORT and r["realized_pnl"] is not None
+        )
+        assert close_short["initial_risk_dollars"] == pytest.approx(1246.0)
+        assert close_short["r_multiple"] == pytest.approx(174.0 / 1246.0)
+
+    def test_close_with_no_realized_pnl_leaves_r_multiple_null(self, tmp_csv):
+        tl = TradeLogger(path=tmp_csv)
+        # external_close_detected path: realized_pnl unknown, basis known.
+        tl.log_spread_fill(
+            position_id="uuid-1", strategy="credit_spread",
+            short_occ=self._SHORT, long_occ=self._LONG,
+            qty=1, net_price=0.0, opening=False,
+            realized_pnl=None, initial_risk_dollars=1246.0,
+            reason="external_close_detected",
+        )
+        rows = tl.read_all()
+        by_symbol = {r["symbol"]: r for r in rows}
+        # Basis recorded for audit, r_multiple stays NULL.
+        assert by_symbol[self._SHORT]["initial_risk_dollars"] == pytest.approx(1246.0)
+        assert by_symbol[self._SHORT]["r_multiple"] is None
+
+    def test_close_with_no_basis_available_leaves_r_multiple_null(self, tmp_csv):
+        tl = TradeLogger(path=tmp_csv)
+        # Legacy/pre-fix open row had no initial_risk_dollars.
+        tl.log_spread_fill(
+            position_id="uuid-1", strategy="credit_spread",
+            short_occ=self._SHORT, long_occ=self._LONG,
+            qty=1, net_price=2.54, opening=True,
+        )
+        tl.log_spread_fill(
+            position_id="uuid-1", strategy="credit_spread",
+            short_occ=self._SHORT, long_occ=self._LONG,
+            qty=1, net_price=0.80, opening=False, realized_pnl=174.0,
+        )
+        # Close still writes — design §5.1 tolerates NULL r_multiple and the
+        # dollar P&L still flows to the allocator's HWM/drawdown gate.
+        close_short = next(
+            r for r in tl.read_all()
+            if r["symbol"] == self._SHORT and r["realized_pnl"] is not None
+        )
+        assert close_short["initial_risk_dollars"] is None
+        assert close_short["r_multiple"] is None
+        assert close_short["realized_pnl"] == pytest.approx(174.0)
+
+    def test_close_handles_zero_basis_without_division_error(self, tmp_csv):
+        tl = TradeLogger(path=tmp_csv)
+        # Defensive: a degenerate (width − net_credit) ≤ 0 must not raise.
+        tl.log_spread_fill(
+            position_id="uuid-1", strategy="credit_spread",
+            short_occ=self._SHORT, long_occ=self._LONG,
+            qty=1, net_price=0.80, opening=False,
+            realized_pnl=174.0, initial_risk_dollars=0.0,
+        )
+        close_short = next(
+            r for r in tl.read_all()
+            if r["symbol"] == self._SHORT and r["realized_pnl"] is not None
+        )
+        # Zero basis is treated as "no basis" — r_multiple stays NULL and
+        # the column is not coerced to a spurious value.
+        assert close_short["initial_risk_dollars"] is None
+        assert close_short["r_multiple"] is None
+
+    def test_multi_contract_basis_scales_with_qty(self, tmp_csv):
+        tl = TradeLogger(path=tmp_csv)
+        # 5 contracts × $1246 max loss = $6230 basis; realized = 5×174 = $870;
+        # r_multiple = 870 / 6230 ≈ 0.1397 — identical to single-contract case
+        # (R-multiple is sizing-invariant per design §5.1).
+        tl.log_spread_fill(
+            position_id="uuid-5", strategy="credit_spread",
+            short_occ=self._SHORT, long_occ=self._LONG,
+            qty=5, net_price=0.80, opening=False,
+            realized_pnl=870.0, initial_risk_dollars=6230.0,
+        )
+        close_short = next(
+            r for r in tl.read_all()
+            if r["symbol"] == self._SHORT and r["realized_pnl"] is not None
+        )
+        assert close_short["r_multiple"] == pytest.approx(870.0 / 6230.0)
+        assert close_short["r_multiple"] == pytest.approx(174.0 / 1246.0)
+
+
 class TestMlegRealizedSlippageBps:
     def test_open_credit_improvement_is_negative(self):
         assert mleg_realized_slippage_bps(

@@ -2582,6 +2582,17 @@ class TradingEngine:
                     short_occ = released.short_occ if released is not None else tracked_position.legs[0].symbol
                     long_occ = released.long_occ if released is not None else tracked_position.legs[1].symbol
                     qty = float(released.qty if released is not None else abs(tracked_position.legs[0].qty))
+                    # Recompute basis when `released` is available so the
+                    # external-close row carries initial_risk_dollars even
+                    # though realized_pnl is unknown. Falls back to the
+                    # logger's DB lookup when released is None.
+                    ext_close_risk_dollars: float | None = None
+                    if released is not None:
+                        ext_spread_max_loss = (
+                            (released.width - released.net_credit) * 100.0
+                        )
+                        if ext_spread_max_loss > 0:
+                            ext_close_risk_dollars = ext_spread_max_loss * qty
                     self.trade_logger.log_spread_fill(
                         position_id=symbol,
                         strategy=owner,
@@ -2593,6 +2604,7 @@ class TradingEngine:
                         opening=False,
                         realized_pnl=None,
                         reason="external_close_detected",
+                        initial_risk_dollars=ext_close_risk_dollars,
                     )
                 else:
                     stop_fill = self._lookup_recent_stop_fill(symbol=symbol, owner=owner)
@@ -3277,16 +3289,27 @@ class TradingEngine:
                         f"net_credit=${net_credit:.2f}/sh order={order_id}"
                     )
                     if plan is not None:
+                        open_qty = float(filled_qty or plan.qty)
+                        # plan.max_loss is $/contract; multiplier of 100 is
+                        # already folded in by SpreadExecutionPlan. The
+                        # short-leg row stores this so the close path can
+                        # recover the R-multiple basis without depending on
+                        # `released` being in scope.
+                        spread_risk_dollars = (
+                            float(plan.max_loss) * open_qty
+                            if plan.max_loss > 0 else None
+                        )
                         self.trade_logger.log_spread_fill(
                             position_id=position_id,
                             strategy=strategy_name,
                             short_occ=plan.short_occ,
                             long_occ=plan.long_occ,
-                            qty=float(filled_qty or plan.qty),
+                            qty=open_qty,
                             net_price=net_credit,
                             order_id=order_id,
                             opening=True,
                             submitted_limit_price=submitted_limit_price,
+                            initial_risk_dollars=spread_risk_dollars,
                         )
                         self.alerts.trade_executed(
                             symbol=plan.short_occ,
@@ -3360,6 +3383,18 @@ class TradingEngine:
                         f"{'n/a' if realized_pnl is None else f'${realized_pnl:+,.2f}'} "
                         f"order={order_id}"
                     )
+                # `released` (OpenSpread) carries width and net_credit from
+                # the original entry. When present, recompute the max-loss
+                # basis the EdgeAssessor uses for R-multiple. When absent
+                # (restart edge case), the logger falls back to the open
+                # row's stored basis.
+                close_risk_dollars: float | None = None
+                if released is not None:
+                    spread_max_loss = (
+                        (released.width - released.net_credit) * 100.0
+                    )
+                    if spread_max_loss > 0:
+                        close_risk_dollars = spread_max_loss * close_qty
                 self.trade_logger.log_spread_fill(
                     position_id=position_id,
                     strategy=strategy_name,
@@ -3372,6 +3407,7 @@ class TradingEngine:
                     realized_pnl=realized_pnl,
                     reason=exit_reason,
                     submitted_limit_price=submitted_limit_price,
+                    initial_risk_dollars=close_risk_dollars,
                 )
                 self.alerts.trade_executed(
                     symbol=short_occ,
