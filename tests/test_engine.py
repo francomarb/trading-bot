@@ -535,6 +535,16 @@ class TestProcessSymbol:
         self._process(engine, "AAPL", snap)
         broker.close_position.assert_not_called()
 
+    def test_protective_stop_does_not_block_signal_close(self, engine_factory):
+        engine, broker = engine_factory(exits=[False] * 59 + [True])
+        positions = {"AAPL": Position("AAPL", 10, 100.0, 1010.0)}
+        snap = _snapshot(positions=positions, open_orders=[_open_stop_order("AAPL")])
+        engine._session_start_equity = snap.account.equity
+
+        self._process(engine, "AAPL", snap)
+
+        broker.close_position.assert_called_once_with("AAPL")
+
     def test_option_trade_rejected_logs_warning_and_skips_order(
         self, engine_factory, monkeypatch
     ):

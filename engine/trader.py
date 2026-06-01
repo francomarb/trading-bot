@@ -2115,9 +2115,11 @@ class TradingEngine:
 
     @staticmethod
     def _has_pending_close_order(symbol: str, snapshot: BrokerSnapshot) -> bool:
-        """True if there's already an open SELL order for this symbol."""
+        """True if there's already a non-stop SELL close order for this symbol."""
         return any(
-            TradingEngine._is_matching_symbol(symbol, o.symbol) and o.side is Side.SELL
+            TradingEngine._is_matching_symbol(symbol, o.symbol)
+            and o.side is Side.SELL
+            and o.stop_price is None
             for o in snapshot.open_orders
         )
 
