@@ -496,18 +496,48 @@ def _parse_args(argv: Sequence[str] | None) -> argparse.Namespace:
     parser.add_argument(
         "--end-date",
         default=None,
-        help="ISO date for the window end (default: today UTC).",
+        help=(
+            "ISO date for the window end (default: most recent completed "
+            "Monday). Passing a non-Monday here is allowed but you will "
+            "fall under the same partial-week truncation the default is "
+            "designed to avoid."
+        ),
     )
     return parser.parse_args(argv)
+
+
+def _most_recent_completed_monday(today: date) -> date:
+    """Return the Monday on which the most recent completed week ended.
+
+    The `strategy_lifecycle_counters` table is keyed on ISO Mon→Mon
+    weeks: `period_start` is a Monday and `period_end` is the following
+    Monday (exclusive). The reader filter is
+    `period_start >= start AND period_end <= end`, so any `end_date`
+    that isn't a Monday excludes the current partial week (correct) AND
+    drops the leading partial week (the reviewer's catch on PR #34) —
+    `--weeks 4` then sees only 3 rows.
+
+    Snapping `end_date` to the most recent completed Monday makes the
+    default window align with the table's grid: Monday→Monday buckets
+    inclusive on the start, exclusive on the end.
+
+    Convention: `today.weekday()` returns 0 for Monday, 6 for Sunday.
+    The most recent completed week's `period_end` is the Monday at the
+    start of *this* week. If today is Monday, that boundary is today
+    itself (this morning's 00:00 UTC).
+    """
+    return today - timedelta(days=today.weekday())
 
 
 def main(argv: Sequence[str] | None = None) -> int:
     args = _parse_args(argv)
 
-    end_date = (
-        date.fromisoformat(args.end_date)
-        if args.end_date else datetime.now(timezone.utc).date()
-    )
+    if args.end_date:
+        end_date = date.fromisoformat(args.end_date)
+    else:
+        end_date = _most_recent_completed_monday(
+            datetime.now(timezone.utc).date(),
+        )
     start_date = end_date - timedelta(weeks=args.weeks)
 
     db_path = args.db or settings.TRADE_LOG_DB

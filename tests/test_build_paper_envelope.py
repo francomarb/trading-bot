@@ -24,6 +24,7 @@ from scripts.build_paper_envelope import (
     EXIT_INSUFFICIENT_LIFECYCLE,
     EXIT_INSUFFICIENT_TRADES,
     PaperEnvelopeError,
+    _most_recent_completed_monday,
     build_envelope,
 )
 from strategies.health.envelope import StrategyEnvelope, envelope_path
@@ -357,3 +358,62 @@ class TestEnvelopeBuilding:
         assert reloaded.strategy == envelope.strategy
         assert reloaded.trade_count == envelope.trade_count
         assert reloaded.r_expectancy == pytest.approx(envelope.r_expectancy)
+
+
+class TestMostRecentCompletedMonday:
+    """Snap helper for the default CLI window. Reviewer catch on PR #34:
+    a non-Monday `end_date` excludes the current partial week (correct)
+    AND drops the leading partial week, so `--weeks 4` often saw only 3
+    rows even after 4 full weeks of paper operation.
+    """
+
+    def test_monday_returns_itself(self):
+        # 2026-06-01 is a Monday. The most recent completed week's
+        # `period_end` is today's 00:00 UTC.
+        assert _most_recent_completed_monday(date(2026, 6, 1)) == date(2026, 6, 1)
+
+    def test_tuesday_snaps_back_one_day(self):
+        # Tuesday → most recent completed week ended yesterday (Monday).
+        assert _most_recent_completed_monday(date(2026, 6, 2)) == date(2026, 6, 1)
+
+    def test_sunday_snaps_back_six_days(self):
+        # Sunday → most recent completed week ended last Monday.
+        assert _most_recent_completed_monday(date(2026, 6, 7)) == date(2026, 6, 1)
+
+    def test_friday_snaps_back_four_days(self):
+        assert _most_recent_completed_monday(date(2026, 6, 5)) == date(2026, 6, 1)
+
+    def test_window_aligned_to_counter_grid_gives_full_week_count(self, db_conn):
+        # Concrete reviewer scenario: today is Wednesday 2026-06-03 and the
+        # bot has been writing 4 consecutive weekly counter rows (period_start
+        # = 2026-05-04, 05-11, 05-18, 05-25). The unsnapped default would
+        # compute end_date=2026-06-03 → window 2026-05-06..2026-06-03 →
+        # period_start=2026-05-04 fails the `>= start` test, leaving 3 rows
+        # → EXIT_INSUFFICIENT_LIFECYCLE. The snap helper makes end_date the
+        # most recent completed Monday (2026-06-01), so start_date snaps to
+        # 2026-05-04 and all four rows match.
+        today = date(2026, 6, 3)  # Wednesday
+        snapped_end = _most_recent_completed_monday(today)
+        assert snapped_end == date(2026, 6, 1)
+        snapped_start = snapped_end - timedelta(weeks=4)
+        assert snapped_start == date(2026, 5, 4)
+        # Anchor the trade seed to the snapped start so all 12 trades fall
+        # inside the [snapped_start, snapped_end) window (otherwise the
+        # window-boundary filter would skip the leading trades and the
+        # build would fail EXIT_INSUFFICIENT_TRADES instead).
+        _seed_n_closed_trades(
+            db_conn, strategy="credit_spread", n=12,
+            base_date=snapped_start, r_value=0.3,
+        )
+        _seed_four_weeks_of_counters(
+            db_conn, strategy="credit_spread",
+            first_week_monday=snapped_start,
+        )
+        envelope = build_envelope(
+            db_conn,
+            strategy="credit_spread",
+            period_start=snapped_start,
+            period_end=snapped_end,
+            min_trades=10,
+        )
+        assert envelope.backtest_config["n_weekly_lifecycle_rows"] == 4
