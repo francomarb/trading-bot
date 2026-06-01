@@ -200,9 +200,11 @@ STRATEGY_SPECS: dict[str, dict] = {
         "skip_reason": (
             "spy_options_reversion requires live OPRA quote lookup at "
             "strategy construction; offline backtest harness cannot replay "
-            "the options chain. Envelope will be populated from paper data "
-            "by scripts/calibrate_health_thresholds.py (11.10g) after 4 "
-            "weeks of operation."
+            "the options chain. Build the envelope from paper data once "
+            "≥10 closed trades have accumulated: "
+            "`scripts/build_paper_envelope.py --strategy spy_options_reversion "
+            "--weeks N`. (Note: scripts/calibrate_health_thresholds.py tunes "
+            "L1/L2/L3 Health thresholds only; it does not build Edge envelopes.)"
         ),
     },
     "credit_spread": {
@@ -215,9 +217,11 @@ STRATEGY_SPECS: dict[str, dict] = {
         "skip_reason": (
             "credit_spread requires live OPRA quote lookup + IVProxyResolver "
             "at strategy construction; offline backtest cannot replay "
-            "multi-leg fills. Envelope will be populated from paper data "
-            "by scripts/calibrate_health_thresholds.py (11.10g) after 4 "
-            "weeks of operation."
+            "multi-leg fills. Build the envelope from paper data once "
+            "≥10 closed trades have accumulated: "
+            "`scripts/build_paper_envelope.py --strategy credit_spread "
+            "--weeks N`. (Note: scripts/calibrate_health_thresholds.py tunes "
+            "L1/L2/L3 Health thresholds only; it does not build Edge envelopes.)"
         ),
     },
 }
