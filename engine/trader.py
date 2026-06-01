@@ -2666,8 +2666,18 @@ class TradingEngine:
                 )
                 continue
 
-            price = float(update.price) if update.price is not None else None
-            qty = float(update.qty or 0)
+            raw_cum_qty = getattr(update.order, "filled_qty", None)
+            cum_qty = float(raw_cum_qty or 0) if raw_cum_qty is not None else 0.0
+            raw_cum_avg = getattr(update.order, "filled_avg_price", None)
+            cum_avg = float(raw_cum_avg) if raw_cum_avg is not None else None
+            # Stream trade updates carry per-execution chunk fields on
+            # update.qty/update.price, but stop-fill accounting must use the
+            # cumulative order fill quantity / VWAP to avoid under-recording
+            # multi-execution stop orders.
+            qty = cum_qty if cum_qty > 0 else float(update.qty or 0)
+            price = cum_avg if cum_avg is not None else (
+                float(update.price) if update.price is not None else None
+            )
             owner = self._get_owner(symbol)
             if owner is None:
                 logger.debug(

@@ -2899,6 +2899,55 @@ class TestOptionsEngineFixes:
         assert engine._has_position("GOOG")
         assert engine._entry_prices["GOOG"] == pytest.approx(391.0)
 
+    def test_stream_stop_fill_uses_cumulative_order_qty_and_avg_price(self, tmp_path):
+        """Stop-fill accounting must use cumulative broker order fields, not the last execution chunk."""
+        from unittest.mock import MagicMock
+        from types import SimpleNamespace
+        from execution.stream import StreamManager
+        from risk.allocator import SleeveAllocator
+
+        engine = self._engine(tmp_path)
+        engine._register_single_leg(strategy_name="donchian_breakout", symbol="PWR")
+        engine._entry_prices["PWR"] = 727.67
+        engine.trade_logger.log_stop_fill = MagicMock()
+
+        allocator = MagicMock(spec=SleeveAllocator)
+        engine._allocator = allocator
+
+        fill_update = SimpleNamespace(
+            order=SimpleNamespace(
+                symbol="PWR",
+                id="pwr-stop-1",
+                filled_qty="5",
+                filled_avg_price="684.11",
+            ),
+            price="684.11",
+            qty="1",
+        )
+        stream = MagicMock(spec=StreamManager)
+        stream.drain_stop_fills.return_value = [fill_update]
+        engine._stream_manager = stream
+
+        snapshot = _snapshot(
+            positions={"PWR": Position("PWR", 0.54, 727.67, 393.0)},
+            open_orders=[],
+        )
+
+        engine._process_stream_stop_fills(snapshot)
+
+        engine.trade_logger.log_stop_fill.assert_called_once_with(
+            symbol="PWR",
+            strategy="donchian_breakout",
+            qty=5.0,
+            avg_fill_price=684.11,
+            order_id="pwr-stop-1",
+        )
+        allocator.record_realized_pnl.assert_called_once_with(
+            "donchian_breakout",
+            pytest.approx((684.11 - 727.67) * 5.0),
+        )
+        assert engine._has_position("PWR")
+
     # log_stop_fill: confirmed WebSocket stop-fill persists real price/qty ─────
 
     def test_log_stop_fill_writes_correct_record(self, tmp_path):
