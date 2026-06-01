@@ -243,6 +243,46 @@ class TestFindRecentFilledStopOrder:
 
         assert broker.find_recent_filled_stop_order(symbol="AAPL") is None
 
+    def test_skips_top_level_mleg_parent_with_omitted_side_and_symbol(self):
+        api = MagicMock()
+        api.get_orders.return_value = [
+            SimpleNamespace(
+                id="mleg-parent",
+                client_order_id="mleg-parent-cid",
+                symbol=None,
+                side=None,
+                qty="1",
+                type=SimpleNamespace(value="limit"),
+                status=SimpleNamespace(value="filled"),
+                filled_qty="0",
+                filled_avg_price=None,
+                stop_price=None,
+                order_class="mleg",
+                submitted_at="2026-06-01T13:44:02Z",
+                filled_at=None,
+            ),
+            SimpleNamespace(
+                id="real-stop",
+                client_order_id="cid-stop",
+                symbol="AAPL",
+                side=SimpleNamespace(value="sell"),
+                qty="10",
+                type=SimpleNamespace(value="stop"),
+                status=SimpleNamespace(value="filled"),
+                filled_qty="10",
+                filled_avg_price="94.5",
+                stop_price="95.0",
+                submitted_at="2026-06-01T13:45:00Z",
+                filled_at="2026-06-01T13:45:30Z",
+            ),
+        ]
+        broker = _broker_with_mock(api)
+
+        result = broker.find_recent_filled_stop_order(symbol="AAPL")
+
+        assert isinstance(result, ClosedOrderInfo)
+        assert result.order_id == "real-stop"
+
 
 # ── place_order: kwargs built correctly ──────────────────────────────────────
 

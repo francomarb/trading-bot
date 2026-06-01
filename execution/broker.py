@@ -587,6 +587,8 @@ class AlpacaBroker:
         candidates: list[ClosedOrderInfo] = []
         for order in raw:
             info = self._to_closed_order_info(order)
+            if info is None:
+                continue
             if info.symbol != symbol:
                 continue
             if info.side is not Side.SELL:
@@ -1732,8 +1734,27 @@ class AlpacaBroker:
         )
 
     @staticmethod
-    def _to_closed_order_info(o) -> ClosedOrderInfo:
-        side_val = o.side.value if hasattr(o.side, "value") else str(o.side)
+    def _to_closed_order_info(o) -> ClosedOrderInfo | None:
+        order_class = getattr(o, "order_class", None)
+        order_class_val = (
+            order_class.value if hasattr(order_class, "value") else str(order_class)
+            if order_class is not None else None
+        )
+        side_raw = getattr(o, "side", None)
+        symbol = getattr(o, "symbol", None)
+        if side_raw is None or symbol is None:
+            if order_class_val == "mleg":
+                logger.debug(
+                    "Skipping top-level MLEG parent order in closed-order recovery: "
+                    f"order_id={getattr(o, 'id', None)} side={side_raw!r} symbol={symbol!r}"
+                )
+                return None
+            raise ValueError(
+                f"closed order {getattr(o, 'id', None)} missing required side/symbol "
+                f"(side={side_raw!r}, symbol={symbol!r})"
+            )
+
+        side_val = side_raw.value if hasattr(side_raw, "value") else str(side_raw)
         type_val = (
             o.type.value
             if hasattr(o.type, "value")
