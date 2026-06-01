@@ -538,24 +538,23 @@ class AlpacaBroker:
 
         results: list[OrderResult] = []
         for o in raw:
-            sym = o.symbol
-            if symbols and sym not in symbols:
+            info = self._to_closed_order_info(o)
+            if info is None:
                 continue
-            status_str = o.status.value if isinstance(o.status, AlpacaOrderStatus) else str(o.status)
-            mapped = _ALPACA_TERMINAL.get(status_str, OrderStatus.CANCELED)
-            filled = float(o.filled_qty or 0)
-            avg = o.filled_avg_price
-            avg_price = float(avg) if avg is not None else None
-            side_str = o.side.value if isinstance(o.side, AlpacaOrderSide) else str(o.side)
+            if symbols and info.symbol not in symbols:
+                continue
             results.append(OrderResult(
-                status=mapped,
-                order_id=str(o.id),
-                symbol=sym,
-                requested_qty=float(o.qty),
-                filled_qty=filled,
-                avg_fill_price=avg_price,
-                raw_status=status_str,
-                message=f"historical: {side_str} {o.qty} {sym} @ {avg_price}",
+                status=info.status,
+                order_id=info.order_id,
+                symbol=info.symbol,
+                requested_qty=info.qty,
+                filled_qty=info.filled_qty,
+                avg_fill_price=info.avg_fill_price,
+                raw_status=info.raw_status,
+                message=(
+                    f"historical: {info.side.value} {info.qty} "
+                    f"{info.symbol} @ {info.avg_fill_price}"
+                ),
             ))
         return results
 
