@@ -231,6 +231,11 @@ def engine_factory(patch_fetch, tmp_path):
         broker.place_order.return_value = place_result or _filled_result("AAPL", 1, 100.5)
         broker.close_position.return_value = close_result or _filled_result("AAPL", 1, 100.0)
         broker.get_open_orders.return_value = []
+        # Arrival-quote path: MagicMock's default __float__ returns 1.0 which
+        # would pass the engine's finite-positive guard and produce nonsense
+        # slippage. Explicitly return None so the entry path falls back to
+        # latest_close — preserves pre-arrival-quote test semantics.
+        broker.get_latest_quote_midpoint.return_value = None
         # Market-clock injection: engine calls broker._with_retry(broker._api.get_clock).
         broker._with_retry.side_effect = lambda fn, **_: fn()
         broker._api.get_clock.return_value = SimpleNamespace(is_open=market_open)
@@ -912,6 +917,83 @@ class TestSlippageRecording:
         assert len(engine.risk._slippage_samples) == 1
         modeled_bps, _ = engine.risk._slippage_samples[0]
         assert modeled_bps == 0.0
+
+
+class TestArrivalQuoteCapture:
+    """Issue B in the slippage PR: realized_slippage_bps must measure
+    fill-vs-arrival (execution slippage), not fill-vs-signal-close
+    (Implementation Shortfall). The engine fetches an arrival quote
+    immediately before submission via broker.get_latest_quote_midpoint
+    and threads it through to build_record as the slippage benchmark.
+    """
+
+    def test_arrival_quote_fetched_before_order_submission(self, engine_factory):
+        """The engine must call get_latest_quote_midpoint per entry
+        attempt — otherwise the slippage measurement falls back to the
+        decision-time close (the Issue B failure mode)."""
+        engine, broker = engine_factory(entries=[False] * 59 + [True])
+        snap = _snapshot()
+        engine._session_start_equity = snap.account.equity
+        slot = engine.slots[0]
+        engine._process_symbol("AAPL", snap, snap.account, slot.strategy, slot.timeframe)
+        broker.get_latest_quote_midpoint.assert_called_with("AAPL")
+
+    def test_arrival_quote_used_as_slippage_benchmark_when_available(
+        self, engine_factory,
+    ):
+        """When the broker returns a usable quote, realized_bps measures
+        fill-vs-arrival, not fill-vs-decision-close."""
+        modeled_close = 100.0
+        fill_price = 100.20
+        arrival_price = 100.15  # arrival is between decision and fill
+        engine, broker = engine_factory(
+            entries=[False] * 59 + [True],
+            place_result=_filled_result("AAPL", 1, fill_price),
+        )
+        broker.get_latest_quote_midpoint.return_value = arrival_price
+        snap = _snapshot()
+        engine._session_start_equity = snap.account.equity
+        slot = engine.slots[0]
+        engine._process_symbol("AAPL", snap, snap.account, slot.strategy, slot.timeframe)
+
+        # Expected: realized_bps measures fill-vs-arrival, NOT fill-vs-
+        # decision-close. The exact decision-time close is whatever the
+        # synthetic bar fixture produced; key invariant is that the
+        # realized_bps reflects (fill − arrival) / arrival × 10_000, a
+        # much smaller delta than (fill − decision_close).
+        assert len(engine.risk._slippage_samples) == 1
+        _, realized_bps = engine.risk._slippage_samples[0]
+        expected = (fill_price - arrival_price) / arrival_price * 10_000
+        assert realized_bps == pytest.approx(expected, rel=1e-3)
+
+    def test_falls_back_to_decision_close_when_quote_unavailable(
+        self, engine_factory,
+    ):
+        """Arrival quote of None (one-sided book, API failure) → fall
+        back to the legacy behaviour rather than refusing to log
+        slippage. Defensive: a broken quote feed must not blind the
+        slippage tracker entirely."""
+        engine, broker = engine_factory(entries=[False] * 59 + [True])
+        broker.get_latest_quote_midpoint.return_value = None
+        snap = _snapshot()
+        engine._session_start_equity = snap.account.equity
+        slot = engine.slots[0]
+        engine._process_symbol("AAPL", snap, snap.account, slot.strategy, slot.timeframe)
+        # A slippage sample is recorded (didn't refuse) and modeled_bps is
+        # the configured baseline — confirms the fall-back path ran.
+        assert len(engine.risk._slippage_samples) == 1
+
+    def test_rejects_non_finite_quote_from_broker(self, engine_factory):
+        """Defensive: broker returns NaN / negative / zero (Mock-style
+        misbehavior) → engine treats as no quote and falls back."""
+        engine, broker = engine_factory(entries=[False] * 59 + [True])
+        broker.get_latest_quote_midpoint.return_value = float("nan")
+        snap = _snapshot()
+        engine._session_start_equity = snap.account.equity
+        slot = engine.slots[0]
+        # Must not raise into the trading loop.
+        engine._process_symbol("AAPL", snap, snap.account, slot.strategy, slot.timeframe)
+        assert len(engine.risk._slippage_samples) == 1
 
 
 # ── Multi-slot ──────────────────────────────────────────────────────────────

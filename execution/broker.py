@@ -432,6 +432,23 @@ class AlpacaBroker:
 
     # ── Read-side: account, positions, orders ────────────────────────────
 
+    def get_latest_quote_midpoint(self, symbol: str) -> float | None:
+        """Return the NBBO midpoint (arrival price) for `symbol` at submission time.
+
+        Thin convenience wrapper around `data.fetcher.fetch_latest_quote_midpoint`
+        so the engine's entry-flow code reads as `broker.get_latest_quote_midpoint(...)`.
+        Returns None on quote-fetch failure or one-sided book — never raises.
+
+        Used by the trading loop to capture the canonical pre-trade
+        benchmark for execution-quality slippage measurement
+        (arrival-price methodology per TCA practice). Equity entries
+        call this immediately before submission so the eventual fill's
+        slippage attribution reflects broker execution quality at the
+        moment of submission, not the bar close at decision time.
+        """
+        from data.fetcher import fetch_latest_quote_midpoint
+        return fetch_latest_quote_midpoint(symbol)
+
     def get_account(self, *, session_start_equity: float | None = None) -> AccountState:
         """
         Return the current account as Phase 6's `AccountState`. The optional

@@ -338,3 +338,59 @@ class TestWithRetry:
         fn = MagicMock(side_effect=[ConnectionError("net"), "ok"])
         assert _with_retry(fn, max_attempts=3, base_delay=0) == "ok"
         assert fn.call_count == 2
+
+
+# ── Arrival-price quote ──────────────────────────────────────────────────────
+
+
+class TestFetchLatestQuoteMidpoint:
+    """`fetch_latest_quote_midpoint` is the arrival-price benchmark for
+    execution-quality slippage measurement (Issue B in the slippage PR).
+    It must be defensive: a malformed quote, one-sided book, or API
+    failure must return None rather than raising into the trading loop.
+    """
+
+    @pytest.fixture
+    def mock_client(self, monkeypatch):
+        client = MagicMock()
+        monkeypatch.setattr(fetcher, "_get_client", lambda: client)
+        return client
+
+    def test_returns_midpoint_of_two_sided_quote(self, mock_client):
+        quote = MagicMock(bid_price=100.0, ask_price=100.20)
+        mock_client.get_stock_latest_quote.return_value = {"AAPL": quote}
+        assert fetcher.fetch_latest_quote_midpoint("AAPL") == pytest.approx(100.10)
+
+    def test_returns_none_on_zero_bid(self, mock_client):
+        """One-sided book (pre-market, halt, illiquid) is not a usable
+        arrival price — return None rather than synthesizing a midpoint."""
+        quote = MagicMock(bid_price=0.0, ask_price=100.20)
+        mock_client.get_stock_latest_quote.return_value = {"AAPL": quote}
+        assert fetcher.fetch_latest_quote_midpoint("AAPL") is None
+
+    def test_returns_none_on_zero_ask(self, mock_client):
+        quote = MagicMock(bid_price=100.0, ask_price=0.0)
+        mock_client.get_stock_latest_quote.return_value = {"AAPL": quote}
+        assert fetcher.fetch_latest_quote_midpoint("AAPL") is None
+
+    def test_returns_none_on_missing_symbol(self, mock_client):
+        mock_client.get_stock_latest_quote.return_value = {}
+        assert fetcher.fetch_latest_quote_midpoint("AAPL") is None
+
+    def test_returns_none_on_api_error(self, mock_client):
+        from alpaca.common.exceptions import APIError
+        mock_client.get_stock_latest_quote.side_effect = APIError(
+            {"message": "rate limited"}
+        )
+        # Must not raise — broker quote failures cannot stop the trading loop.
+        assert fetcher.fetch_latest_quote_midpoint("AAPL") is None
+
+    def test_returns_none_on_empty_symbol(self, mock_client):
+        # Defensive: empty / None input doesn't even hit the API.
+        assert fetcher.fetch_latest_quote_midpoint("") is None
+        mock_client.get_stock_latest_quote.assert_not_called()
+
+    def test_returns_none_on_unparseable_prices(self, mock_client):
+        quote = MagicMock(bid_price="not a number", ask_price=100.20)
+        mock_client.get_stock_latest_quote.return_value = {"AAPL": quote}
+        assert fetcher.fetch_latest_quote_midpoint("AAPL") is None

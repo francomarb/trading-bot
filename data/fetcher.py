@@ -33,7 +33,7 @@ import pandas as pd
 from alpaca.common.exceptions import APIError
 from alpaca.data.enums import Adjustment, DataFeed
 from alpaca.data.historical import StockHistoricalDataClient
-from alpaca.data.requests import StockBarsRequest
+from alpaca.data.requests import StockBarsRequest, StockLatestQuoteRequest
 from alpaca.data.timeframe import TimeFrame, TimeFrameUnit
 from loguru import logger
 from requests.adapters import HTTPAdapter
@@ -196,6 +196,55 @@ def require_fresh(df: pd.DataFrame, max_age: timedelta, symbol: str, now: dateti
         raise StaleDataError(
             f"{symbol}: latest bar {last} is older than {max_age}"
         )
+
+
+# ── Arrival-price quote ──────────────────────────────────────────────────────
+
+
+def fetch_latest_quote_midpoint(symbol: str) -> float | None:
+    """Fetch the latest NBBO quote midpoint for `symbol` (the arrival price).
+
+    Returns ``(bid + ask) / 2`` when both sides of the book are finite and
+    positive. Returns ``None`` when the quote is unavailable, malformed,
+    or one side is zero (e.g. crossed / locked book, pre-market quoting
+    gap, illiquid symbol).
+
+    This is the canonical pre-trade arrival price for execution-quality
+    slippage measurement per industry TCA practice (Implementation
+    Shortfall vs Arrival Price; see Talos/QuestDB TCA references).
+    Callers in the engine fetch this immediately before submitting an
+    order so that any subsequent fill can be compared against the
+    market state at order-submission time, rather than against the
+    decision-time bar close (which would conflate execution slippage
+    with signal-to-fill alpha decay).
+
+    Paper-trading note: with the IEX feed (the only one available on a
+    paper Alpaca subscription), the quote represents IEX BBO only, not
+    full SIP NBBO. The midpoint is still the cleanest available
+    arrival-price proxy; production should switch to SIP via the
+    feed override at the client construction layer.
+    """
+    if not symbol:
+        return None
+    try:
+        client = _get_client()
+        result = client.get_stock_latest_quote(
+            StockLatestQuoteRequest(symbol_or_symbols=symbol, feed=DataFeed.IEX)
+        )
+    except (APIError, Exception) as exc:  # noqa: BLE001 — never raise into trading loop
+        logger.warning(f"{symbol}: latest-quote fetch failed: {exc}")
+        return None
+    quote = result.get(symbol) if isinstance(result, dict) else None
+    if quote is None:
+        return None
+    try:
+        bid = float(getattr(quote, "bid_price", 0.0) or 0.0)
+        ask = float(getattr(quote, "ask_price", 0.0) or 0.0)
+    except (TypeError, ValueError):
+        return None
+    if bid <= 0 or ask <= 0:
+        return None
+    return (bid + ask) / 2.0
 
 
 # ── Cache ────────────────────────────────────────────────────────────────────
