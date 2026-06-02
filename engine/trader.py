@@ -1454,9 +1454,19 @@ class TradingEngine:
         # `_finite_or_none` guard rejects any non-numeric / non-finite
         # return so a misbehaving broker can never inject a Mock / NaN
         # into the slippage math.
-        arrival_price = _finite_or_none(
-            self.broker.get_latest_quote_midpoint(target_symbol)
-        )
+        #
+        # Skip the fetch for OCC option symbols entirely — they belong to
+        # OPRA, not the stock quote endpoint, so a `get_stock_latest_quote`
+        # call against `SPY260618C00746000` would raise on every cycle
+        # (caught and logged warning, but noisy). Options entries are
+        # LIMIT-typed and gated by build_record's market-only slippage
+        # check anyway, so the fetch's result wouldn't be used.
+        if is_occ_option(target_symbol):
+            arrival_price: float | None = None
+        else:
+            arrival_price = _finite_or_none(
+                self.broker.get_latest_quote_midpoint(target_symbol)
+            )
         slippage_ref = arrival_price if arrival_price is not None else latest_close
         try:
             result = self.broker.place_order(decision)
