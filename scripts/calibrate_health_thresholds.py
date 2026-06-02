@@ -118,7 +118,18 @@ def _collect_slippage_observations(
     start: date,
     end: date,
 ) -> list[float]:
-    """Per-trade |realized - modeled| slippage deltas for L2."""
+    """Per-trade |realized - modeled| slippage deltas for L2.
+
+    Defensive filter (mirrors `strategies.health.assessor._slippage_p95_bps`):
+    rows whose `reason` carries the `recovered entry context` marker have
+    no honest pre-trade benchmark — they were written by the engine's
+    crash-recovery path before the slippage PR landed, with
+    realized_bps reflecting price drift since entry rather than
+    execution quality. Including them in the calibration window
+    would learn from phantom slippage and propose inflated WATCH/
+    DEGRADED/BROKEN thresholds, even though the live L2 check has
+    already learned to skip them.
+    """
     cursor = conn.execute(
         "SELECT realized_slippage_bps, modeled_slippage_bps "
         "FROM trades "
@@ -126,6 +137,7 @@ def _collect_slippage_observations(
         "AND status IN ('filled', 'partial') "
         "AND realized_slippage_bps IS NOT NULL "
         "AND modeled_slippage_bps IS NOT NULL "
+        "AND (reason IS NULL OR reason NOT LIKE '%recovered entry context%') "
         "AND timestamp >= ? AND timestamp < ?",
         (strategy_name, start.isoformat(), end.isoformat()),
     )

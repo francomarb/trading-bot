@@ -1774,20 +1774,24 @@ class TradingEngine:
     ) -> None:
         """
         Feed the realized vs. modeled slippage into the Phase 6 drift kill
-        switch. Modeled fill = the bar close we acted on; realized fill =
-        what Alpaca actually gave us.
+        switch. Modeled fill = the arrival price at submission (NBBO mid);
+        realized fill = what Alpaca actually gave us.
 
-        Modeled slippage uses SLIPPAGE_MODEL_MARKET_BPS for MARKET orders
-        (matches the backtest default of 5 bps) and 0 bps for LIMIT orders
-        (the fill price is controlled by the limit).
+        MARKET orders only. LIMIT orders are skipped because arrival
+        price is not a meaningful execution-quality benchmark for them —
+        a resting limit at $100 filled at $95 looks like -500 bps against
+        arrival but is a clean fill against the limit. Feeding that
+        signal into the unsigned-magnitude drift kill switch could trip
+        the halt on good limit fills. LIMIT execution quality belongs in
+        a separate (out-of-scope here) limit-fill-vs-limit-price metric.
         """
         if result.status not in {OrderStatus.FILLED, OrderStatus.PARTIAL}:
             return
+        if order_type != "market":
+            return
         if result.avg_fill_price is None or modeled_price <= 0:
             return
-        modeled_bps = (
-            0.0 if order_type == "limit" else SLIPPAGE_MODEL_MARKET_BPS
-        )
+        modeled_bps = SLIPPAGE_MODEL_MARKET_BPS
         # The kill switch consumes unsigned magnitude samples by design;
         # signed price-improvement/adverse attribution lives in the trade log.
         realized_bps = (

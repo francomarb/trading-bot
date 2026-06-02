@@ -1092,6 +1092,69 @@ class TestBuildRecordSlippageSemantics:
             (1.00 - 0.95) / 100.95 * 10_000, rel=1e-2,
         )
 
+    def test_limit_order_writes_null_on_both_slippage_columns(self, tmp_csv):
+        """Reviewer P2 #2: LIMIT orders must not record execution-slippage
+        bps against the arrival price. A buy limit at $100 filled at $95
+        is good execution (or alpha capture, depending on framing) — the
+        arrival-price formula would mark it as -500 bps and the L2
+        check's abs() wrapper would flag it as BROKEN. NULL on both
+        columns is the honest answer; the IS NOT NULL filter on the L2
+        query naturally excludes them."""
+        from execution.broker import OrderResult, OrderStatus
+        from risk.manager import RiskDecision, Side
+        from strategies.base import OrderType
+
+        decision = RiskDecision(
+            symbol="AAPL",
+            side=Side.BUY,
+            qty=10,
+            entry_reference_price=100.0,
+            stop_price=95.0,
+            strategy_name="rsi_reversion",
+            reason="rsi limit entry",
+            order_type=OrderType.LIMIT,
+            limit_price=100.0,
+        )
+        result = OrderResult(
+            status=OrderStatus.FILLED, order_id="x", symbol="AAPL",
+            requested_qty=10, filled_qty=10,
+            avg_fill_price=95.0,   # filled well below limit — good fill
+            raw_status="filled", message="ok",
+        )
+        tl = TradeLogger(path=tmp_csv)
+        # Even with arrival-price-style modeled_price supplied, LIMIT is
+        # gated and writes NULL on both columns.
+        record = tl.build_record(decision, result, modeled_price=100.05)
+        assert record.modeled_slippage_bps is None
+        assert record.realized_slippage_bps is None
+
+    def test_market_order_with_arrival_price_still_records(self, tmp_csv):
+        """Sanity: MARKET orders with arrival-price modeled_price continue
+        to record real slippage (regression guard against over-broadly
+        gating the LIMIT carve-out)."""
+        from execution.broker import OrderResult, OrderStatus
+        from risk.manager import RiskDecision, Side
+        from strategies.base import OrderType
+
+        decision = RiskDecision(
+            symbol="AAPL", side=Side.BUY, qty=10,
+            entry_reference_price=100.0, stop_price=95.0,
+            strategy_name="t", reason="t",
+            order_type=OrderType.MARKET,
+        )
+        result = OrderResult(
+            status=OrderStatus.FILLED, order_id="x", symbol="AAPL",
+            requested_qty=10, filled_qty=10, avg_fill_price=100.10,
+            raw_status="filled", message="ok",
+        )
+        tl = TradeLogger(path=tmp_csv)
+        record = tl.build_record(decision, result, modeled_price=100.05)
+        assert record.modeled_slippage_bps is not None
+        assert record.realized_slippage_bps is not None
+        # Realized measured against arrival ($100.05), not decision ($100).
+        expected = (100.10 - 100.05) / 100.05 * 10_000
+        assert record.realized_slippage_bps == pytest.approx(expected, rel=1e-2)
+
     def test_record_slippage_false_still_populates_risk_basis(
         self, tmp_csv, sample_decision, sample_result,
     ):

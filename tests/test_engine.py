@@ -885,8 +885,14 @@ class TestSlippageRecording:
         assert modeled_bps == pytest.approx(SLIPPAGE_MODEL_MARKET_BPS)
         assert realized_bps == pytest.approx(0.20 / modeled_close * 10_000, rel=1e-3)
 
-    def test_limit_order_models_zero_bps(self, engine_factory):
-        """LIMIT entries model 0 bps — the fill price is controlled by the limit."""
+    def test_limit_order_skips_slippage_recording(self, engine_factory):
+        """LIMIT entries do not record execution slippage — arrival price
+        is not a meaningful benchmark for a resting limit fill. A buy
+        limit at $100 filled at $95 is a clean fill against the limit;
+        recording -500 bps against arrival would falsely trip the drift
+        kill switch and the L2 health check. LIMIT execution quality
+        belongs in a separate limit-fill-vs-limit-price metric (not in
+        this PR's scope)."""
         modeled_close = 101.5
         engine, broker = engine_factory(
             entries=[False] * 59 + [True],
@@ -895,10 +901,7 @@ class TestSlippageRecording:
         snap = _snapshot()
         engine._session_start_equity = snap.account.equity
         slot = engine.slots[0]
-        # Override the strategy's preferred order type so the Signal carries LIMIT.
         slot.strategy.preferred_order_type = OrderType.LIMIT
-        # Risk also needs a limit_price on the signal — patch evaluate to return
-        # a valid LIMIT RiskDecision instead of going through full sizing logic.
         from risk.manager import RiskDecision, Side
         limit_decision = RiskDecision(
             symbol="AAPL",
@@ -913,10 +916,9 @@ class TestSlippageRecording:
         )
         engine.risk.evaluate = MagicMock(return_value=limit_decision)
         engine._process_symbol("AAPL", snap, snap.account, slot.strategy, slot.timeframe)
-
-        assert len(engine.risk._slippage_samples) == 1
-        modeled_bps, _ = engine.risk._slippage_samples[0]
-        assert modeled_bps == 0.0
+        # No slippage sample recorded — the kill switch is not fed from
+        # LIMIT entries (the assertion that flipped vs. the old test).
+        assert len(engine.risk._slippage_samples) == 0
 
 
 class TestArrivalQuoteCapture:
