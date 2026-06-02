@@ -19,6 +19,7 @@ It auto-refreshes every 30 seconds while the page is open.
 from __future__ import annotations
 
 import json
+import re
 import sqlite3
 import time
 from datetime import datetime, timezone
@@ -998,7 +999,8 @@ def _render_health_and_edge_panel() -> None:
     )
 
     health_state = _load_health_state()
-    latest_report = _find_latest_weekly_report()
+    latest_weekly = _find_latest_report("weekly_*.md")
+    latest_monthly = _find_latest_report("monthly_*.md")
 
     # ── Silent-killer banner ────────────────────────────────────────
     killers = [
@@ -1051,23 +1053,37 @@ def _render_health_and_edge_panel() -> None:
                 },
             )
 
-    # ── Latest report (expander) ────────────────────────────────────
-    if latest_report is not None:
-        with st.expander(
-            f"📄 Latest weekly report — `{latest_report.name}`",
-            expanded=False,
-        ):
-            try:
-                st.markdown(latest_report.read_text())
-            except Exception as exc:  # noqa: BLE001
-                st.warning(f"could not read report: {exc}")
-    else:
+    # ── Latest report (tabbed: Weekly | Monthly) ────────────────────
+    if latest_weekly is None and latest_monthly is None:
         if not health_state:
             st.info(
-                "No weekly health reports yet. The first report will "
+                "No health reports yet. The first weekly report will "
                 "land after the next Monday cycle (or run "
                 "`python scripts/strategy_health_review.py --window "
-                "weekly` on demand)."
+                "weekly` on demand). Monthlies land on the first of "
+                "each month."
+            )
+    else:
+        weekly_tab, monthly_tab = st.tabs(["🗓 Weekly", "📅 Monthly"])
+        with weekly_tab:
+            _render_report_card(
+                latest_weekly,
+                cadence="weekly",
+                empty_hint=(
+                    "No weekly report yet — runs every Monday post-cycle, "
+                    "or on demand via `scripts/strategy_health_review.py "
+                    "--window weekly`."
+                ),
+            )
+        with monthly_tab:
+            _render_report_card(
+                latest_monthly,
+                cadence="monthly",
+                empty_hint=(
+                    "No monthly report yet — runs on the first of each "
+                    "month, or on demand via `scripts/strategy_health_review.py "
+                    "--window monthly`."
+                ),
             )
 
 
@@ -1088,19 +1104,109 @@ def _load_health_state() -> dict | None:
         return None
 
 
-def _find_latest_weekly_report() -> Path | None:
-    """Return the most recently modified weekly_*.md, or None if absent."""
+def _find_latest_report(glob_pattern: str) -> Path | None:
+    """Return the most recently modified report matching `glob_pattern`,
+    or None if the reports directory is missing or empty for that pattern.
+
+    Patterns the dashboard cares about:
+      - ``weekly_*.md`` for the weekly Strategy Health & Edge cadence
+      - ``monthly_*.md`` for the monthly cadence
+    """
     reports_dir = (
         Path(__file__).resolve().parent / "data" / "health_reports"
     )
     if not reports_dir.exists():
         return None
-    candidates = sorted(
-        reports_dir.glob("weekly_*.md"),
-        key=lambda p: p.stat().st_mtime,
-        reverse=True,
-    )
+    # Backup files (e.g. weekly_*.md.bak.<utc>) also match `weekly_*.md`
+    # via fnmatch — exclude them so the operator-facing card always shows
+    # the canonical report, not whatever was preserved before a rewrite.
+    candidates = [
+        p for p in reports_dir.glob(glob_pattern)
+        if ".bak." not in p.name
+    ]
+    candidates.sort(key=lambda p: p.stat().st_mtime, reverse=True)
     return candidates[0] if candidates else None
+
+
+_REPORT_FRONT_MATTER_RE = re.compile(
+    r"^---\s*\n(.*?)\n---\s*\n", re.DOTALL,
+)
+
+
+def _parse_report_metadata(text: str) -> tuple[dict[str, str], str]:
+    """Pull the YAML front-matter block out of a report.
+
+    Returns ``(metadata, body_without_front_matter)``. The dashboard
+    strips the front matter from the rendered body so the report doesn't
+    open with a wall of `---` / key-value lines; the meaningful fields
+    (period, generated_at) move into a compact caption above the body.
+    """
+    match = _REPORT_FRONT_MATTER_RE.match(text)
+    if match is None:
+        return {}, text
+    raw = match.group(1)
+    metadata: dict[str, str] = {}
+    for line in raw.splitlines():
+        if ":" not in line:
+            continue
+        key, _, value = line.partition(":")
+        metadata[key.strip()] = value.strip()
+    body = text[match.end():]
+    return metadata, body
+
+
+def _format_generated_at(value: str) -> str:
+    """Render an ISO8601 timestamp as a compact UTC string for the caption.
+
+    Falls back to the raw value if parsing fails — the report's
+    front-matter is normally well-formed but we don't want a malformed
+    field to break the panel.
+    """
+    if not value:
+        return "—"
+    try:
+        # Python's fromisoformat accepts the Z-less +00:00 form the
+        # reviewer writes; older 3.10 didn't accept "Z" suffixes but the
+        # bot ships 3.12 (CLAUDE.md / requirements).
+        ts = datetime.fromisoformat(value)
+    except ValueError:
+        return value
+    if ts.tzinfo is None:
+        ts = ts.replace(tzinfo=timezone.utc)
+    return ts.astimezone(timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
+
+
+def _render_report_card(
+    report_path: Path | None, *, cadence: str, empty_hint: str,
+) -> None:
+    """Render one cadence's latest report inside a tab.
+
+    Layout: a small metadata caption (period · generated · filename) on
+    top, then a collapsed expander with the report body. Mirrors the
+    Streamlit "card" pattern without an extra container border so it
+    sits cleanly next to the other tab.
+    """
+    if report_path is None:
+        st.info(empty_hint)
+        return
+    try:
+        text = report_path.read_text()
+    except OSError as exc:
+        st.warning(f"could not read {report_path.name}: {exc}")
+        return
+    metadata, body = _parse_report_metadata(text)
+    period_start = metadata.get("period_start", "—")
+    period_end = metadata.get("period_end", "—")
+    generated = _format_generated_at(metadata.get("generated_at", ""))
+    # Compact one-line caption: period · generated · filename. Streamlit's
+    # caption colour is muted so the report body remains visually primary.
+    st.caption(
+        f"**Period:** {period_start} → {period_end} &nbsp;·&nbsp; "
+        f"**Generated:** {generated} &nbsp;·&nbsp; "
+        f"**File:** `{report_path.name}`"
+    )
+    with st.expander(f"Show full {cadence} report", expanded=False):
+        st.markdown(body)
 
 
 def render_dashboard() -> None:

@@ -18,8 +18,10 @@ from unittest.mock import MagicMock, patch
 import pytest
 
 from dashboard import (
-    _find_latest_weekly_report,
+    _find_latest_report,
+    _format_generated_at,
     _load_health_state,
+    _parse_report_metadata,
 )
 
 
@@ -82,26 +84,26 @@ class TestLoadHealthState:
         assert state["rsi_reversion"]["negative_weeks"] == 3
 
 
-# ── _find_latest_weekly_report ────────────────────────────────────────
+# ── _find_latest_report ───────────────────────────────────────────────
 
 
-class TestFindLatestWeeklyReport:
+class TestFindLatestReport:
     def test_returns_none_when_dir_missing(self, monkeypatch, tmp_path):
         monkeypatch.setattr(
             "dashboard.__file__", str(tmp_path / "dashboard.py"),
         )
-        assert _find_latest_weekly_report() is None
+        assert _find_latest_report("weekly_*.md") is None
+        assert _find_latest_report("monthly_*.md") is None
 
     def test_returns_none_when_dir_empty(self, monkeypatch, tmp_path):
         monkeypatch.setattr(
             "dashboard.__file__", str(tmp_path / "dashboard.py"),
         )
         (tmp_path / "data" / "health_reports").mkdir(parents=True)
-        assert _find_latest_weekly_report() is None
+        assert _find_latest_report("weekly_*.md") is None
+        assert _find_latest_report("monthly_*.md") is None
 
     def test_returns_most_recent_by_mtime(self, monkeypatch, tmp_path):
-        """Three weekly reports — should return the one with the
-        latest mtime."""
         monkeypatch.setattr(
             "dashboard.__file__", str(tmp_path / "dashboard.py"),
         )
@@ -112,13 +114,15 @@ class TestFindLatestWeeklyReport:
             p = reports / name
             p.write_text(f"# {name}")
             _time.sleep(0.01)  # ensure distinct mtimes
-        latest = _find_latest_weekly_report()
+        latest = _find_latest_report("weekly_*.md")
         assert latest is not None
         assert latest.name == "weekly_2026-W21.md"
 
-    def test_only_returns_weekly_files(self, monkeypatch, tmp_path):
-        """Monthly files should not be considered by the weekly-
-        report finder."""
+    def test_weekly_pattern_excludes_monthly_files(
+        self, monkeypatch, tmp_path,
+    ):
+        """The two patterns are disjoint — `weekly_*.md` must not pick
+        up `monthly_*.md` and vice versa."""
         monkeypatch.setattr(
             "dashboard.__file__", str(tmp_path / "dashboard.py"),
         )
@@ -126,6 +130,105 @@ class TestFindLatestWeeklyReport:
         reports.mkdir(parents=True)
         (reports / "monthly_2026-05.md").write_text("monthly")
         (reports / "weekly_2026-W20.md").write_text("weekly")
-        latest = _find_latest_weekly_report()
+        weekly = _find_latest_report("weekly_*.md")
+        monthly = _find_latest_report("monthly_*.md")
+        assert weekly is not None and weekly.name == "weekly_2026-W20.md"
+        assert monthly is not None and monthly.name == "monthly_2026-05.md"
+
+    def test_backup_files_are_excluded(self, monkeypatch, tmp_path):
+        """Operator backups (e.g. weekly_*.md.bak.<utc>) match `weekly_*.md`
+        via fnmatch but must not surface as the canonical report."""
+        monkeypatch.setattr(
+            "dashboard.__file__", str(tmp_path / "dashboard.py"),
+        )
+        reports = tmp_path / "data" / "health_reports"
+        reports.mkdir(parents=True)
+        # The .bak file's mtime is newer, but the canonical file must win.
+        canonical = reports / "weekly_2026-W22.md"
+        canonical.write_text("canonical")
+        import time as _time
+        _time.sleep(0.01)
+        backup = reports / "weekly_2026-W22.md.bak.20260602-120000"
+        backup.write_text("backup")
+        latest = _find_latest_report("weekly_*.md")
         assert latest is not None
-        assert latest.name == "weekly_2026-W20.md"
+        assert latest.name == "weekly_2026-W22.md"
+
+
+# ── _parse_report_metadata ────────────────────────────────────────────
+
+
+class TestParseReportMetadata:
+    def test_extracts_front_matter_and_strips_body(self):
+        text = (
+            "---\n"
+            "schema_version: 1\n"
+            "period_start: 2026-05-25\n"
+            "period_end: 2026-06-01\n"
+            "period_type: weekly\n"
+            "generated_at: 2026-06-02T12:30:00+00:00\n"
+            "---\n"
+            "# Strategy Health & Edge Report — Week 2026-W22\n"
+        )
+        metadata, body = _parse_report_metadata(text)
+        assert metadata["period_start"] == "2026-05-25"
+        assert metadata["period_end"] == "2026-06-01"
+        assert metadata["period_type"] == "weekly"
+        # Body must start at the title — front-matter removed entirely
+        # so the operator-facing render doesn't show YAML cruft.
+        assert body.startswith("# Strategy Health & Edge Report")
+        assert "schema_version" not in body
+        assert "---" not in body[:5]
+
+    def test_handles_missing_front_matter(self):
+        # Legacy or malformed report without YAML — return whole body
+        # and an empty metadata dict so the panel still renders.
+        text = "# Just a markdown title\n\nBody."
+        metadata, body = _parse_report_metadata(text)
+        assert metadata == {}
+        assert body == text
+
+    def test_skips_keyless_lines(self):
+        # A YAML line without ":" should not crash the simple parser.
+        text = (
+            "---\n"
+            "period_start: 2026-05-25\n"
+            "this_is_a_garbage_line\n"
+            "period_end: 2026-06-01\n"
+            "---\n"
+            "body"
+        )
+        metadata, body = _parse_report_metadata(text)
+        assert metadata["period_start"] == "2026-05-25"
+        assert metadata["period_end"] == "2026-06-01"
+        assert body == "body"
+
+
+# ── _format_generated_at ──────────────────────────────────────────────
+
+
+class TestFormatGeneratedAt:
+    def test_renders_iso_as_compact_utc(self):
+        # The reviewer writes ISO with +00:00 — already UTC.
+        out = _format_generated_at("2026-06-02T12:30:00+00:00")
+        assert out == "2026-06-02 12:30 UTC"
+
+    def test_converts_offset_to_utc(self):
+        # Non-UTC offset should be normalized so the displayed time
+        # always matches the panel's UTC convention.
+        out = _format_generated_at("2026-06-02T08:30:00-04:00")
+        assert out == "2026-06-02 12:30 UTC"
+
+    def test_renders_naive_as_utc(self):
+        # Some legacy reports may omit the offset; assume UTC rather
+        # than crash.
+        out = _format_generated_at("2026-06-02T12:30:00")
+        assert out == "2026-06-02 12:30 UTC"
+
+    def test_falls_back_on_unparseable(self):
+        # Malformed timestamp — surface the raw value rather than raise.
+        out = _format_generated_at("not-a-date")
+        assert out == "not-a-date"
+
+    def test_empty_renders_as_dash(self):
+        assert _format_generated_at("") == "—"
