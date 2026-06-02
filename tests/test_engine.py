@@ -1009,27 +1009,79 @@ class TestOptionsPathSlippageContract:
     here for completeness.
     """
 
-    def test_occ_option_symbol_skips_arrival_quote_fetch(self, engine_factory):
-        """OCC option symbols belong to OPRA, not the stock quote
-        endpoint. The engine must short-circuit rather than call
-        get_stock_latest_quote on every cycle (which would emit a
-        warning per attempt). Fix: is_occ_option short-circuits the
-        fetch entirely."""
-        from utils.option_symbols import is_occ_option
+    def test_occ_target_skips_arrival_quote_fetch_end_to_end(
+        self, engine_factory,
+    ):
+        """Drive _process_symbol with a strategy that overrides
+        target_symbol to an OCC string (the spy_options_reversion
+        pattern). The engine must NOT call broker.get_latest_quote_midpoint
+        with the OCC — Alpaca's stock quote endpoint can't resolve an
+        OPRA symbol and would emit a warning per cycle. If the
+        `is_occ_option(target_symbol)` short-circuit at trader.py:1464
+        is accidentally removed, this test fails. The previous
+        coverage check only verified the helper's regex, not the
+        wiring — caught by code review on PR #37."""
+        from execution.broker import OrderResult, OrderStatus
+        from risk.manager import RiskDecision, Side
 
-        # Sanity: the regex recognizes the SPY call from the May
-        # paper-trading log.
-        assert is_occ_option("SPY260618C00746000") is True
-        assert is_occ_option("SPY") is False
+        engine, broker = engine_factory(entries=[False] * 59 + [True])
+        slot = engine.slots[0]
+        occ_symbol = "SPY260618C00746000"
 
-        # Direct unit-test on the helper module — no end-to-end engine
-        # cycle needed. Confirms the short-circuit logic is in
-        # _process_symbol (line ~1464 in trader.py).
-        from engine import trader
-        # The is_occ_option import resolution is the load-bearing
-        # behavioral check; if the engine wires it incorrectly we'd see
-        # an AttributeError here.
-        assert hasattr(trader, "is_occ_option")
+        # Trigger the options branch: build_option_execution returns the
+        # OCC contract, mirroring what the real spy_options_reversion
+        # strategy does at decision time.
+        slot.strategy.build_option_execution = (
+            lambda *_args, **_kwargs: (occ_symbol, 12.77, 18.00, 10.00)
+        )
+        slot.strategy.preferred_order_type = OrderType.LIMIT
+
+        # Bypass the contract-conflict gate — irrelevant to this test.
+        engine._reject_if_contract_conflict = MagicMock(return_value=None)
+
+        # Patch risk.evaluate to return a valid LIMIT decision so the
+        # flow reaches the arrival-quote site rather than rejecting at
+        # the risk layer.
+        decision = RiskDecision(
+            symbol=occ_symbol, side=Side.BUY, qty=1,
+            entry_reference_price=12.77, stop_price=10.00,
+            strategy_name="fake_strategy", reason="opt entry",
+            order_type=OrderType.LIMIT, limit_price=12.85,
+        )
+        engine.risk.evaluate = MagicMock(return_value=decision)
+
+        # Options entries route via the async ACCEPTED branch — return
+        # ACCEPTED so the engine pre-registers and exits cleanly.
+        broker.place_order.return_value = OrderResult(
+            status=OrderStatus.ACCEPTED, order_id="async-1", symbol=occ_symbol,
+            requested_qty=1, filled_qty=0, avg_fill_price=None,
+            raw_status="accepted", message="dispatched",
+        )
+
+        snap = _snapshot()
+        engine._session_start_equity = snap.account.equity
+        engine._process_symbol(
+            "AAPL", snap, snap.account, slot.strategy, slot.timeframe,
+        )
+
+        # Load-bearing assertion: arrival quote was never fetched for
+        # the OCC target. If trader.py:1464's short-circuit regresses
+        # this fails immediately.
+        broker.get_latest_quote_midpoint.assert_not_called()
+
+    def test_equity_target_does_fetch_arrival_quote(self, engine_factory):
+        """Symmetry guard for the test above: when the target is a
+        normal equity symbol the engine MUST fetch the arrival quote.
+        Confirms the OCC short-circuit isn't accidentally broadened to
+        skip equities too."""
+        engine, broker = engine_factory(entries=[False] * 59 + [True])
+        snap = _snapshot()
+        engine._session_start_equity = snap.account.equity
+        slot = engine.slots[0]
+        engine._process_symbol(
+            "AAPL", snap, snap.account, slot.strategy, slot.timeframe,
+        )
+        broker.get_latest_quote_midpoint.assert_called_with("AAPL")
 
     def test_options_limit_decision_writes_null_on_both_columns(self, tmp_path):
         """An options entry (LIMIT, OCC symbol) through build_record
@@ -1039,7 +1091,6 @@ class TestOptionsPathSlippageContract:
         from execution.broker import OrderResult, OrderStatus
         from reporting.logger import TradeLogger
         from risk.manager import RiskDecision, Side
-        from strategies.base import OrderType
 
         occ_symbol = "SPY260618C00746000"
         decision = RiskDecision(
