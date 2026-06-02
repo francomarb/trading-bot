@@ -150,6 +150,41 @@ class TestSlippageCollector:
         )
         assert out == [30.0]
 
+    def test_excludes_recovered_context_rows(self, db_conn):
+        """Reviewer P2 #1: calibration must apply the same defensive
+        filter as the live L2 check. Legacy recovered-entry-context
+        rows carry phantom slippage (1200+ bps) that would skew the
+        proposed WATCH/DEGRADED/BROKEN thresholds upward — even though
+        the live assessor learned to skip them in PR #37."""
+        _seed_slippage_trade(
+            db_conn, strategy="x", timestamp="2026-04-15T10:00:00",
+            realized=10.0, modeled=5.0,  # clean fill, delta=5
+        )
+        # Mimic the legacy recovered-context shape: same columns, but
+        # `reason` carries the marker the engine's recovery path used to
+        # write. Use the raw INSERT so we can override the `reason`
+        # column (the helper hardcodes 'exit').
+        db_conn.execute(
+            "INSERT INTO trades ("
+            "timestamp, symbol, side, qty, avg_fill_price, order_id, "
+            "strategy, reason, stop_price, entry_reference_price, "
+            "modeled_slippage_bps, realized_slippage_bps, "
+            "order_type, status, requested_qty, filled_qty"
+            ") VALUES ('2026-04-16T10:00:00', 'X', 'buy', 1.0, 100.0, "
+            "'oid', 'x', 'x recovered entry context', 95.0, 100.0, "
+            "0.0, 1205.3, 'market', 'filled', 1.0, 1.0)"
+        )
+        db_conn.commit()
+        out = _collect_slippage_observations(
+            db_conn, "x",
+            start=date(2026, 4, 1), end=date(2026, 5, 1),
+        )
+        # Only the clean fill survives — the phantom 1205.3 bps row is
+        # excluded by the defensive `reason NOT LIKE` filter. Without
+        # the filter, calibration would learn p90/p95/p99 from a sample
+        # of [5.0, 1205.3] and propose massively inflated thresholds.
+        assert out == [5.0]
+
 
 class TestDriftCollector:
     def test_empty_returns_zero_lists(self, db_conn):

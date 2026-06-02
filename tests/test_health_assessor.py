@@ -625,3 +625,109 @@ class TestP95SlippageRegression:
         assert slip.numeric_value > 100.0
         assert slip.status == HealthStatus.BROKEN
 
+
+def _seed_recovered_context_trade(
+    conn: sqlite3.Connection,
+    *,
+    strategy: str,
+    timestamp: str,
+    realized_slippage_bps: float,
+    modeled_slippage_bps: float,
+) -> None:
+    """Legacy recovered-entry-context row: reason carries the marker, both
+    slippage columns are populated with nonsense values (the pre-fix
+    failure mode that produced QCOM's 1205 bps phantom slippage)."""
+    conn.execute(
+        "INSERT INTO trades ("
+        "timestamp, symbol, side, qty, avg_fill_price, order_id, "
+        "strategy, reason, stop_price, entry_reference_price, "
+        "modeled_slippage_bps, realized_slippage_bps, "
+        "order_type, status, requested_qty, filled_qty"
+        ") VALUES (?, 'X', 'buy', 1.0, 100.0, 'oid', ?, ?, "
+        "95.0, 100.0, ?, ?, 'market', 'filled', 1.0, 1.0)",
+        (
+            timestamp, strategy,
+            f"{strategy} recovered entry context",
+            modeled_slippage_bps, realized_slippage_bps,
+        ),
+    )
+    conn.commit()
+
+
+class TestRecoveredContextSlippageFilter:
+    """Issue A defensive filter: rows whose `reason` carries the
+    `recovered entry context` marker have no honest pre-trade
+    benchmark (their original arrival quote happened in a previous
+    process). Pre-PR these rows wrote large phantom realized_bps
+    against modeled_bps=0 and dominated the L2 p95. Post-PR the
+    engine writes NULL on both columns and the IS NOT NULL clause
+    filters them naturally; this defensive `reason NOT LIKE` clause
+    handles the legacy rows already on disk in a running operator's
+    trades.db.
+    """
+
+    def test_recovered_rows_excluded_from_p95(self, db_conn):
+        # One clean fill (5 bps delta) + one legacy recovered row
+        # carrying a 1200 bps phantom delta. Without the filter,
+        # p95 ≈ 1140; with the filter, p95 = 5.
+        _seed_filled_trade(
+            db_conn, strategy="x",
+            timestamp="2026-05-19T09:00:00",
+            realized_slippage_bps=10.0, modeled_slippage_bps=5.0,
+        )
+        _seed_recovered_context_trade(
+            db_conn, strategy="x",
+            timestamp="2026-05-20T09:00:00",
+            realized_slippage_bps=1205.3, modeled_slippage_bps=0.0,
+        )
+        report = HealthAssessor().assess(_standard_inputs(db_conn))
+        slip = next(
+            c for c in report.checks
+            if c.name == "slippage_realized_vs_modeled_bps_p95"
+        )
+        # Single remaining sample (delta=5) → p95 = 5; the legacy
+        # phantom row was excluded by the reason filter.
+        assert slip.numeric_value == pytest.approx(5.0)
+        assert slip.status == HealthStatus.HEALTHY
+
+    def test_recovered_rows_excluded_even_when_only_rows(self, db_conn):
+        """If all rows in the window are recovered-context, the check
+        reports NO DATA rather than degrading on phantom slippage —
+        operator can tell the difference between "no fills" and
+        "all fills had bad benchmarks."""
+        _seed_recovered_context_trade(
+            db_conn, strategy="x",
+            timestamp="2026-05-19T09:00:00",
+            realized_slippage_bps=1205.3, modeled_slippage_bps=0.0,
+        )
+        _seed_recovered_context_trade(
+            db_conn, strategy="x",
+            timestamp="2026-05-20T09:00:00",
+            realized_slippage_bps=600.0, modeled_slippage_bps=0.0,
+        )
+        report = HealthAssessor().assess(_standard_inputs(db_conn))
+        slip = next(
+            c for c in report.checks
+            if c.name == "slippage_realized_vs_modeled_bps_p95"
+        )
+        # NO_DATA result — no numeric_value, status reflects insufficient sample.
+        assert slip.numeric_value is None
+
+    def test_non_recovered_rows_pass_through_normally(self, db_conn):
+        """Sanity: the filter only catches the marker; ordinary
+        `reason` values still flow into the check."""
+        for delta, day in [(5.0, 18), (50.0, 19), (200.0, 20)]:
+            _seed_filled_trade(
+                db_conn, strategy="x",
+                timestamp=f"2026-05-{day:02d}T09:00:00",
+                realized_slippage_bps=5.0 + delta,
+                modeled_slippage_bps=5.0,
+            )
+        report = HealthAssessor().assess(_standard_inputs(db_conn))
+        slip = next(
+            c for c in report.checks
+            if c.name == "slippage_realized_vs_modeled_bps_p95"
+        )
+        # All three rows participate; p95 of [5, 50, 200] is ≈ 185 by
+        # linear interpolation — matches TestP95SlippageRegression.
+        assert slip.numeric_value > 100.0

@@ -231,6 +231,11 @@ def engine_factory(patch_fetch, tmp_path):
         broker.place_order.return_value = place_result or _filled_result("AAPL", 1, 100.5)
         broker.close_position.return_value = close_result or _filled_result("AAPL", 1, 100.0)
         broker.get_open_orders.return_value = []
+        # Arrival-quote path: MagicMock's default __float__ returns 1.0 which
+        # would pass the engine's finite-positive guard and produce nonsense
+        # slippage. Explicitly return None so the entry path falls back to
+        # latest_close — preserves pre-arrival-quote test semantics.
+        broker.get_latest_quote_midpoint.return_value = None
         # Market-clock injection: engine calls broker._with_retry(broker._api.get_clock).
         broker._with_retry.side_effect = lambda fn, **_: fn()
         broker._api.get_clock.return_value = SimpleNamespace(is_open=market_open)
@@ -880,8 +885,14 @@ class TestSlippageRecording:
         assert modeled_bps == pytest.approx(SLIPPAGE_MODEL_MARKET_BPS)
         assert realized_bps == pytest.approx(0.20 / modeled_close * 10_000, rel=1e-3)
 
-    def test_limit_order_models_zero_bps(self, engine_factory):
-        """LIMIT entries model 0 bps — the fill price is controlled by the limit."""
+    def test_limit_order_skips_slippage_recording(self, engine_factory):
+        """LIMIT entries do not record execution slippage — arrival price
+        is not a meaningful benchmark for a resting limit fill. A buy
+        limit at $100 filled at $95 is a clean fill against the limit;
+        recording -500 bps against arrival would falsely trip the drift
+        kill switch and the L2 health check. LIMIT execution quality
+        belongs in a separate limit-fill-vs-limit-price metric (not in
+        this PR's scope)."""
         modeled_close = 101.5
         engine, broker = engine_factory(
             entries=[False] * 59 + [True],
@@ -890,10 +901,7 @@ class TestSlippageRecording:
         snap = _snapshot()
         engine._session_start_equity = snap.account.equity
         slot = engine.slots[0]
-        # Override the strategy's preferred order type so the Signal carries LIMIT.
         slot.strategy.preferred_order_type = OrderType.LIMIT
-        # Risk also needs a limit_price on the signal — patch evaluate to return
-        # a valid LIMIT RiskDecision instead of going through full sizing logic.
         from risk.manager import RiskDecision, Side
         limit_decision = RiskDecision(
             symbol="AAPL",
@@ -908,10 +916,204 @@ class TestSlippageRecording:
         )
         engine.risk.evaluate = MagicMock(return_value=limit_decision)
         engine._process_symbol("AAPL", snap, snap.account, slot.strategy, slot.timeframe)
+        # No slippage sample recorded — the kill switch is not fed from
+        # LIMIT entries (the assertion that flipped vs. the old test).
+        assert len(engine.risk._slippage_samples) == 0
 
+
+class TestArrivalQuoteCapture:
+    """Issue B in the slippage PR: realized_slippage_bps must measure
+    fill-vs-arrival (execution slippage), not fill-vs-signal-close
+    (Implementation Shortfall). The engine fetches an arrival quote
+    immediately before submission via broker.get_latest_quote_midpoint
+    and threads it through to build_record as the slippage benchmark.
+    """
+
+    def test_arrival_quote_fetched_before_order_submission(self, engine_factory):
+        """The engine must call get_latest_quote_midpoint per entry
+        attempt — otherwise the slippage measurement falls back to the
+        decision-time close (the Issue B failure mode)."""
+        engine, broker = engine_factory(entries=[False] * 59 + [True])
+        snap = _snapshot()
+        engine._session_start_equity = snap.account.equity
+        slot = engine.slots[0]
+        engine._process_symbol("AAPL", snap, snap.account, slot.strategy, slot.timeframe)
+        broker.get_latest_quote_midpoint.assert_called_with("AAPL")
+
+    def test_arrival_quote_used_as_slippage_benchmark_when_available(
+        self, engine_factory,
+    ):
+        """When the broker returns a usable quote, realized_bps measures
+        fill-vs-arrival, not fill-vs-decision-close."""
+        modeled_close = 100.0
+        fill_price = 100.20
+        arrival_price = 100.15  # arrival is between decision and fill
+        engine, broker = engine_factory(
+            entries=[False] * 59 + [True],
+            place_result=_filled_result("AAPL", 1, fill_price),
+        )
+        broker.get_latest_quote_midpoint.return_value = arrival_price
+        snap = _snapshot()
+        engine._session_start_equity = snap.account.equity
+        slot = engine.slots[0]
+        engine._process_symbol("AAPL", snap, snap.account, slot.strategy, slot.timeframe)
+
+        # Expected: realized_bps measures fill-vs-arrival, NOT fill-vs-
+        # decision-close. The exact decision-time close is whatever the
+        # synthetic bar fixture produced; key invariant is that the
+        # realized_bps reflects (fill − arrival) / arrival × 10_000, a
+        # much smaller delta than (fill − decision_close).
         assert len(engine.risk._slippage_samples) == 1
-        modeled_bps, _ = engine.risk._slippage_samples[0]
-        assert modeled_bps == 0.0
+        _, realized_bps = engine.risk._slippage_samples[0]
+        expected = (fill_price - arrival_price) / arrival_price * 10_000
+        assert realized_bps == pytest.approx(expected, rel=1e-3)
+
+    def test_falls_back_to_decision_close_when_quote_unavailable(
+        self, engine_factory,
+    ):
+        """Arrival quote of None (one-sided book, API failure) → fall
+        back to the legacy behaviour rather than refusing to log
+        slippage. Defensive: a broken quote feed must not blind the
+        slippage tracker entirely."""
+        engine, broker = engine_factory(entries=[False] * 59 + [True])
+        broker.get_latest_quote_midpoint.return_value = None
+        snap = _snapshot()
+        engine._session_start_equity = snap.account.equity
+        slot = engine.slots[0]
+        engine._process_symbol("AAPL", snap, snap.account, slot.strategy, slot.timeframe)
+        # A slippage sample is recorded (didn't refuse) and modeled_bps is
+        # the configured baseline — confirms the fall-back path ran.
+        assert len(engine.risk._slippage_samples) == 1
+
+    def test_rejects_non_finite_quote_from_broker(self, engine_factory):
+        """Defensive: broker returns NaN / negative / zero (Mock-style
+        misbehavior) → engine treats as no quote and falls back."""
+        engine, broker = engine_factory(entries=[False] * 59 + [True])
+        broker.get_latest_quote_midpoint.return_value = float("nan")
+        snap = _snapshot()
+        engine._session_start_equity = snap.account.equity
+        slot = engine.slots[0]
+        # Must not raise into the trading loop.
+        engine._process_symbol("AAPL", snap, snap.account, slot.strategy, slot.timeframe)
+        assert len(engine.risk._slippage_samples) == 1
+
+
+class TestOptionsPathSlippageContract:
+    """Verify the LIMIT + arrival-quote fix covers the options strategies
+    (spy_options_reversion + credit_spread). The options paths share the
+    same gates (build_record's market-only slippage, _record_fill's
+    market-only kill-switch feed) so neither produces false L2 findings
+    after this PR. credit_spread's MLEG fill writes through
+    log_spread_fill which has its own correct fill-vs-limit slippage
+    measurement — out of scope for the arrival-quote fix but verified
+    here for completeness.
+    """
+
+    def test_occ_target_skips_arrival_quote_fetch_end_to_end(
+        self, engine_factory,
+    ):
+        """Drive _process_symbol with a strategy that overrides
+        target_symbol to an OCC string (the spy_options_reversion
+        pattern). The engine must NOT call broker.get_latest_quote_midpoint
+        with the OCC — Alpaca's stock quote endpoint can't resolve an
+        OPRA symbol and would emit a warning per cycle. If the
+        `is_occ_option(target_symbol)` short-circuit at trader.py:1464
+        is accidentally removed, this test fails. The previous
+        coverage check only verified the helper's regex, not the
+        wiring — caught by code review on PR #37."""
+        from execution.broker import OrderResult, OrderStatus
+        from risk.manager import RiskDecision, Side
+
+        engine, broker = engine_factory(entries=[False] * 59 + [True])
+        slot = engine.slots[0]
+        occ_symbol = "SPY260618C00746000"
+
+        # Trigger the options branch: build_option_execution returns the
+        # OCC contract, mirroring what the real spy_options_reversion
+        # strategy does at decision time.
+        slot.strategy.build_option_execution = (
+            lambda *_args, **_kwargs: (occ_symbol, 12.77, 18.00, 10.00)
+        )
+        slot.strategy.preferred_order_type = OrderType.LIMIT
+
+        # Bypass the contract-conflict gate — irrelevant to this test.
+        engine._reject_if_contract_conflict = MagicMock(return_value=None)
+
+        # Patch risk.evaluate to return a valid LIMIT decision so the
+        # flow reaches the arrival-quote site rather than rejecting at
+        # the risk layer.
+        decision = RiskDecision(
+            symbol=occ_symbol, side=Side.BUY, qty=1,
+            entry_reference_price=12.77, stop_price=10.00,
+            strategy_name="fake_strategy", reason="opt entry",
+            order_type=OrderType.LIMIT, limit_price=12.85,
+        )
+        engine.risk.evaluate = MagicMock(return_value=decision)
+
+        # Options entries route via the async ACCEPTED branch — return
+        # ACCEPTED so the engine pre-registers and exits cleanly.
+        broker.place_order.return_value = OrderResult(
+            status=OrderStatus.ACCEPTED, order_id="async-1", symbol=occ_symbol,
+            requested_qty=1, filled_qty=0, avg_fill_price=None,
+            raw_status="accepted", message="dispatched",
+        )
+
+        snap = _snapshot()
+        engine._session_start_equity = snap.account.equity
+        engine._process_symbol(
+            "AAPL", snap, snap.account, slot.strategy, slot.timeframe,
+        )
+
+        # Load-bearing assertion: arrival quote was never fetched for
+        # the OCC target. If trader.py:1464's short-circuit regresses
+        # this fails immediately.
+        broker.get_latest_quote_midpoint.assert_not_called()
+
+    def test_equity_target_does_fetch_arrival_quote(self, engine_factory):
+        """Symmetry guard for the test above: when the target is a
+        normal equity symbol the engine MUST fetch the arrival quote.
+        Confirms the OCC short-circuit isn't accidentally broadened to
+        skip equities too."""
+        engine, broker = engine_factory(entries=[False] * 59 + [True])
+        snap = _snapshot()
+        engine._session_start_equity = snap.account.equity
+        slot = engine.slots[0]
+        engine._process_symbol(
+            "AAPL", snap, snap.account, slot.strategy, slot.timeframe,
+        )
+        broker.get_latest_quote_midpoint.assert_called_with("AAPL")
+
+    def test_options_limit_decision_writes_null_on_both_columns(self, tmp_path):
+        """An options entry (LIMIT, OCC symbol) through build_record
+        produces NULL on both slippage columns — covered by the
+        market-only gate. Repros the spy_options_reversion path's
+        post-fix contract."""
+        from execution.broker import OrderResult, OrderStatus
+        from reporting.logger import TradeLogger
+        from risk.manager import RiskDecision, Side
+
+        occ_symbol = "SPY260618C00746000"
+        decision = RiskDecision(
+            symbol=occ_symbol,
+            side=Side.BUY,
+            qty=3,
+            entry_reference_price=12.77,
+            stop_price=10.00,
+            strategy_name="spy_options_reversion",
+            reason="spy_options_reversion entry @ 2026-05-28T13:59:00+00:00",
+            order_type=OrderType.LIMIT,
+            limit_price=12.85,
+        )
+        result = OrderResult(
+            status=OrderStatus.FILLED, order_id="opt-1", symbol=occ_symbol,
+            requested_qty=3, filled_qty=3,
+            avg_fill_price=12.78, raw_status="filled", message="ok",
+        )
+        tl = TradeLogger(path=str(tmp_path / "trades.db"))
+        record = tl.build_record(decision, result, modeled_price=12.77)
+        # LIMIT gate fires regardless of OCC vs equity — both columns NULL.
+        assert record.modeled_slippage_bps is None
+        assert record.realized_slippage_bps is None
 
 
 # ── Multi-slot ──────────────────────────────────────────────────────────────

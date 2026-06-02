@@ -1003,6 +1003,182 @@ class TestSpreadRMultiple:
         assert close_short["r_multiple"] == pytest.approx(174.0 / 1246.0)
 
 
+class TestBuildRecordSlippageSemantics:
+    """`build_record` now distinguishes "honest measurement" from "no
+    benchmark available." When the engine cannot provide an arrival
+    price (Issue A: recovered-entry-context), both slippage columns
+    must be NULL so the L2 Health check naturally excludes the row.
+    When the engine does provide an arrival price (Issue B: equity
+    entries), the realized bps measures fill-vs-arrival, the canonical
+    execution-quality benchmark per industry TCA practice.
+    """
+
+    def test_record_slippage_false_writes_null_on_both_columns(
+        self, tmp_csv, sample_decision, sample_result,
+    ):
+        tl = TradeLogger(path=tmp_csv)
+        record = tl.build_record(
+            sample_decision, sample_result,
+            modeled_price=150.0,        # would normally drive slippage
+            record_slippage=False,      # but caller knows there's no honest benchmark
+        )
+        tl.log(record)
+        conn = sqlite3.connect(tmp_csv)
+        row = conn.execute(
+            "SELECT modeled_slippage_bps, realized_slippage_bps "
+            "FROM trades WHERE symbol = ?",
+            (sample_decision.symbol,),
+        ).fetchone()
+        assert row[0] is None  # modeled_slippage_bps
+        assert row[1] is None  # realized_slippage_bps
+
+    def test_record_slippage_default_true_preserves_old_behavior(
+        self, tmp_csv, sample_decision, sample_result,
+    ):
+        tl = TradeLogger(path=tmp_csv)
+        record = tl.build_record(
+            sample_decision, sample_result, modeled_price=150.0,
+        )
+        tl.log(record)
+        conn = sqlite3.connect(tmp_csv)
+        row = conn.execute(
+            "SELECT modeled_slippage_bps, realized_slippage_bps "
+            "FROM trades WHERE symbol = ?",
+            (sample_decision.symbol,),
+        ).fetchone()
+        # MARKET order with modeled_price set → modeled stub is the configured
+        # baseline; realized is computed against modeled_price.
+        assert row[0] is not None
+        assert row[1] is not None
+
+    def test_realized_bps_computed_against_arrival_price_not_signal_close(
+        self, tmp_csv,
+    ):
+        """The Issue B fix: realized_slippage_bps measures fill-vs-arrival,
+        not fill-vs-signal-close. Same fill price, different `modeled_price`
+        → different realized bps."""
+        from execution.broker import OrderResult, OrderStatus
+        from risk.manager import RiskDecision, Side
+        from strategies.base import OrderType
+
+        decision = RiskDecision(
+            symbol="AAPL",
+            side=Side.BUY,
+            qty=10,
+            entry_reference_price=100.0,   # decision-time bar close
+            stop_price=95.0,
+            strategy_name="t",
+            reason="t",
+            order_type=OrderType.MARKET,
+        )
+        result = OrderResult(
+            status=OrderStatus.FILLED, order_id="x", symbol="AAPL",
+            requested_qty=10, filled_qty=10,
+            avg_fill_price=101.0,           # actual fill price
+            raw_status="filled", message="ok",
+        )
+        tl = TradeLogger(path=tmp_csv)
+        # Case 1: arrival price IS the signal close → realized bps
+        # reflects pure execution slippage from $100 to $101 = 100 bps.
+        rec_old = tl.build_record(decision, result, modeled_price=100.0)
+        # Case 2: arrival price is $100.95 (price drifted toward the
+        # fill before submission) → realized bps shrinks because the
+        # arrival benchmark already absorbed most of the drift; only
+        # ($101.00 - $100.95) / $100.95 × 10000 ≈ 5 bps left as
+        # execution slippage.
+        rec_new = tl.build_record(decision, result, modeled_price=100.95)
+        assert rec_old.realized_slippage_bps == pytest.approx(100.0, rel=1e-3)
+        assert rec_new.realized_slippage_bps == pytest.approx(
+            (1.00 - 0.95) / 100.95 * 10_000, rel=1e-2,
+        )
+
+    def test_limit_order_writes_null_on_both_slippage_columns(self, tmp_csv):
+        """Reviewer P2 #2: LIMIT orders must not record execution-slippage
+        bps against the arrival price. A buy limit at $100 filled at $95
+        is good execution (or alpha capture, depending on framing) — the
+        arrival-price formula would mark it as -500 bps and the L2
+        check's abs() wrapper would flag it as BROKEN. NULL on both
+        columns is the honest answer; the IS NOT NULL filter on the L2
+        query naturally excludes them."""
+        from execution.broker import OrderResult, OrderStatus
+        from risk.manager import RiskDecision, Side
+        from strategies.base import OrderType
+
+        decision = RiskDecision(
+            symbol="AAPL",
+            side=Side.BUY,
+            qty=10,
+            entry_reference_price=100.0,
+            stop_price=95.0,
+            strategy_name="rsi_reversion",
+            reason="rsi limit entry",
+            order_type=OrderType.LIMIT,
+            limit_price=100.0,
+        )
+        result = OrderResult(
+            status=OrderStatus.FILLED, order_id="x", symbol="AAPL",
+            requested_qty=10, filled_qty=10,
+            avg_fill_price=95.0,   # filled well below limit — good fill
+            raw_status="filled", message="ok",
+        )
+        tl = TradeLogger(path=tmp_csv)
+        # Even with arrival-price-style modeled_price supplied, LIMIT is
+        # gated and writes NULL on both columns.
+        record = tl.build_record(decision, result, modeled_price=100.05)
+        assert record.modeled_slippage_bps is None
+        assert record.realized_slippage_bps is None
+
+    def test_market_order_with_arrival_price_still_records(self, tmp_csv):
+        """Sanity: MARKET orders with arrival-price modeled_price continue
+        to record real slippage (regression guard against over-broadly
+        gating the LIMIT carve-out)."""
+        from execution.broker import OrderResult, OrderStatus
+        from risk.manager import RiskDecision, Side
+        from strategies.base import OrderType
+
+        decision = RiskDecision(
+            symbol="AAPL", side=Side.BUY, qty=10,
+            entry_reference_price=100.0, stop_price=95.0,
+            strategy_name="t", reason="t",
+            order_type=OrderType.MARKET,
+        )
+        result = OrderResult(
+            status=OrderStatus.FILLED, order_id="x", symbol="AAPL",
+            requested_qty=10, filled_qty=10, avg_fill_price=100.10,
+            raw_status="filled", message="ok",
+        )
+        tl = TradeLogger(path=tmp_csv)
+        record = tl.build_record(decision, result, modeled_price=100.05)
+        assert record.modeled_slippage_bps is not None
+        assert record.realized_slippage_bps is not None
+        # Realized measured against arrival ($100.05), not decision ($100).
+        expected = (100.10 - 100.05) / 100.05 * 10_000
+        assert record.realized_slippage_bps == pytest.approx(expected, rel=1e-2)
+
+    def test_record_slippage_false_still_populates_risk_basis(
+        self, tmp_csv, sample_decision, sample_result,
+    ):
+        """record_slippage=False only suppresses slippage columns; the
+        risk-basis fields (initial_stop_loss, initial_risk_per_share,
+        initial_risk_dollars) still get populated so R-multiple math
+        works on the close row."""
+        tl = TradeLogger(path=tmp_csv)
+        record = tl.build_record(
+            sample_decision, sample_result,
+            modeled_price=150.0, record_slippage=False,
+        )
+        tl.log(record)
+        conn = sqlite3.connect(tmp_csv)
+        row = conn.execute(
+            "SELECT initial_stop_loss, initial_risk_per_share, initial_risk_dollars "
+            "FROM trades WHERE symbol = ?",
+            (sample_decision.symbol,),
+        ).fetchone()
+        assert row[0] is not None
+        assert row[1] is not None
+        assert row[2] is not None
+
+
 class TestMlegRealizedSlippageBps:
     def test_open_credit_improvement_is_negative(self):
         assert mleg_realized_slippage_bps(

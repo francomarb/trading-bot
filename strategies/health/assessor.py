@@ -320,6 +320,15 @@ def _slippage_p95_bps(
 ) -> float | None:
     """p95 of |realized_slippage_bps - modeled_slippage_bps| over the
     window. None if no fills with slippage data."""
+    # Defensive filter for the Issue A failure mode: rows written by the
+    # recovered-entry-context path before slippage_pr landed could not
+    # honestly compute slippage (no arrival-price benchmark was captured
+    # at the original submission, which happened in a prior process).
+    # New recovered rows from the post-PR code write NULL on both
+    # slippage columns and are excluded by the IS NOT NULL filter; this
+    # `reason NOT LIKE` clause excludes the legacy rows already on disk
+    # whose modeled_bps=0 / realized_bps=large would otherwise dominate
+    # the p95.
     cursor = conn.execute(
         "SELECT realized_slippage_bps, modeled_slippage_bps "
         "FROM trades "
@@ -327,6 +336,7 @@ def _slippage_p95_bps(
         "AND status IN ('filled', 'partial') "
         "AND realized_slippage_bps IS NOT NULL "
         "AND modeled_slippage_bps IS NOT NULL "
+        "AND (reason IS NULL OR reason NOT LIKE '%recovered entry context%') "
         "AND timestamp >= ? "
         "AND timestamp < ?",
         (strategy_name, period_start.isoformat(), period_end.isoformat()),

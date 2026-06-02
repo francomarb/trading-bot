@@ -44,6 +44,7 @@ Design principles (CLAUDE.md / PLAN.md):
 from __future__ import annotations
 
 import json
+import math
 import os
 import re
 import signal
@@ -142,6 +143,24 @@ def _lookback_days(required_bars: int, timeframe: str, config_lookback: int) -> 
     days_per_bar = _CALENDAR_DAYS_PER_BAR.get(timeframe, 1.5)
     strategy_days = int(required_bars * days_per_bar) + 5  # +5 day buffer
     return max(strategy_days, config_lookback)
+
+
+def _finite_or_none(value) -> float | None:
+    """Return ``float(value)`` when finite and positive, else ``None``.
+
+    Used by the arrival-price capture path so a misbehaving broker
+    (returning Mock / NaN / negative / zero) can never inject a bad
+    number into the slippage benchmark. Zero is rejected because a
+    zero quote midpoint isn't a valid arrival price for any equity and
+    would produce a divide-by-zero downstream.
+    """
+    try:
+        f = float(value)
+    except (TypeError, ValueError):
+        return None
+    if not math.isfinite(f) or f <= 0:
+        return None
+    return f
 
 
 # ── Config ───────────────────────────────────────────────────────────────────
@@ -1424,6 +1443,31 @@ class TradingEngine:
             return None
         assert isinstance(decision, RiskDecision)
 
+        # Arrival-price benchmark for execution-quality slippage measurement
+        # (industry TCA: Implementation Shortfall vs Arrival Price). Capture
+        # the NBBO midpoint immediately before submission so the eventual
+        # fill is compared against the live market state, not against the
+        # decision-time bar close (which would conflate execution slippage
+        # with signal-to-fill alpha decay — Issue B in the slippage PR).
+        # Falls back to latest_close when the quote is unavailable (one-sided
+        # book, pre-market gap, API failure, broker mock in tests); the
+        # `_finite_or_none` guard rejects any non-numeric / non-finite
+        # return so a misbehaving broker can never inject a Mock / NaN
+        # into the slippage math.
+        #
+        # Skip the fetch for OCC option symbols entirely — they belong to
+        # OPRA, not the stock quote endpoint, so a `get_stock_latest_quote`
+        # call against `SPY260618C00746000` would raise on every cycle
+        # (caught and logged warning, but noisy). Options entries are
+        # LIMIT-typed and gated by build_record's market-only slippage
+        # check anyway, so the fetch's result wouldn't be used.
+        if is_occ_option(target_symbol):
+            arrival_price: float | None = None
+        else:
+            arrival_price = _finite_or_none(
+                self.broker.get_latest_quote_midpoint(target_symbol)
+            )
+        slippage_ref = arrival_price if arrival_price is not None else latest_close
         try:
             result = self.broker.place_order(decision)
             # PLAN 11.10f: lifecycle counter — submitted increments
@@ -1435,7 +1479,7 @@ class TradingEngine:
                 _lc.submitted += 1
             if result.status is OrderStatus.UNKNOWN:
                 self._remember_suspect_order(
-                    decision, result, modeled_price=latest_close
+                    decision, result, modeled_price=slippage_ref
                 )
                 if strategy_statuses is not None:
                     strategy_statuses[symbol] = "Pending Entry"
@@ -1469,10 +1513,10 @@ class TradingEngine:
                 return None
             self._record_fill(
                 result,
-                modeled_price=latest_close,
+                modeled_price=slippage_ref,
                 order_type=decision.order_type.value,
             )
-            self._log_entry(decision, result, latest_close)
+            self._log_entry(decision, result, slippage_ref)
             if result.status in {OrderStatus.FILLED, OrderStatus.PARTIAL}:
                 # PLAN 11.10f: lifecycle counter — filled_entries.
                 # Per design §12.4.1: one entry that opened a position
@@ -1740,20 +1784,24 @@ class TradingEngine:
     ) -> None:
         """
         Feed the realized vs. modeled slippage into the Phase 6 drift kill
-        switch. Modeled fill = the bar close we acted on; realized fill =
-        what Alpaca actually gave us.
+        switch. Modeled fill = the arrival price at submission (NBBO mid);
+        realized fill = what Alpaca actually gave us.
 
-        Modeled slippage uses SLIPPAGE_MODEL_MARKET_BPS for MARKET orders
-        (matches the backtest default of 5 bps) and 0 bps for LIMIT orders
-        (the fill price is controlled by the limit).
+        MARKET orders only. LIMIT orders are skipped because arrival
+        price is not a meaningful execution-quality benchmark for them —
+        a resting limit at $100 filled at $95 looks like -500 bps against
+        arrival but is a clean fill against the limit. Feeding that
+        signal into the unsigned-magnitude drift kill switch could trip
+        the halt on good limit fills. LIMIT execution quality belongs in
+        a separate (out-of-scope here) limit-fill-vs-limit-price metric.
         """
         if result.status not in {OrderStatus.FILLED, OrderStatus.PARTIAL}:
             return
+        if order_type != "market":
+            return
         if result.avg_fill_price is None or modeled_price <= 0:
             return
-        modeled_bps = (
-            0.0 if order_type == "limit" else SLIPPAGE_MODEL_MARKET_BPS
-        )
+        modeled_bps = SLIPPAGE_MODEL_MARKET_BPS
         # The kill switch consumes unsigned magnitude samples by design;
         # signed price-improvement/adverse attribution lives in the trade log.
         realized_bps = (
@@ -1768,8 +1816,18 @@ class TradingEngine:
         decision: RiskDecision,
         result: OrderResult,
         modeled_price: float,
+        *,
+        record_slippage: bool = True,
     ) -> None:
-        """Log an entry fill to the trade database."""
+        """Log an entry fill to the trade database.
+
+        ``record_slippage=False`` is used by the recovered-entry-context
+        path. When the engine reconstructs a position whose original
+        arrival quote is unrecoverable (Issue A in the slippage PR), no
+        honest pre-trade benchmark exists; writing NULL on both slippage
+        columns is correct, vs. synthesizing a phantom number from the
+        current bar close that would inflate the L2 health check's p95.
+        """
         if result.status not in {OrderStatus.FILLED, OrderStatus.PARTIAL}:
             return
         try:
@@ -1782,6 +1840,7 @@ class TradingEngine:
                 result,
                 modeled_price=modeled_price,
                 position_uid=getattr(result, "position_uid", None),
+                record_slippage=record_slippage,
             )
             self.trade_logger.log(record)
         except Exception as e:
@@ -2456,7 +2515,19 @@ class TradingEngine:
             raw_status="recovered",
             message="recovered from broker position",
         )
-        self._log_entry(recovered_decision, recovered_result, latest_close)
+        # Issue A: recovered rows have no honest arrival-price benchmark
+        # — the original submission happened before the bot's current
+        # process started. Write NULL on slippage columns rather than
+        # synthesizing a phantom from the gap between today's bar close
+        # and the historical broker avg_entry. Defensive double-fix
+        # paired with the assessor filter for legacy rows already
+        # written prior to this change.
+        self._log_entry(
+            recovered_decision,
+            recovered_result,
+            latest_close,
+            record_slippage=False,
+        )
         self._entry_prices[symbol] = entry_price
         logger.warning(
             f"{symbol}: reconstructed missing entry context for '{owner}' "

@@ -254,8 +254,8 @@ class TradeRecord:
     reason: str
     stop_price: float
     entry_reference_price: float
-    modeled_slippage_bps: float
-    realized_slippage_bps: float
+    modeled_slippage_bps: float | None
+    realized_slippage_bps: float | None
     order_type: str
     status: str
     requested_qty: float
@@ -357,18 +357,60 @@ class TradeLogger:
         *,
         modeled_price: float | None = None,
         position_uid: str | None = None,
+        record_slippage: bool = True,
     ) -> TradeRecord:
         """
         Build a TradeRecord from a RiskDecision + OrderResult.
 
-        `modeled_price` is the bar close the engine acted on. If provided,
-        slippage is computed; otherwise both slippage fields are 0.
+        `modeled_price` is the arrival-price benchmark for execution-quality
+        slippage measurement — the NBBO midpoint at order submission. The
+        engine fetches this via ``broker.get_latest_quote_midpoint(symbol)``
+        immediately before placing the order. Industry TCA practice
+        (Implementation Shortfall framework, Talos/QuestDB references)
+        treats arrival price as the canonical pre-trade benchmark, distinct
+        from the decision-time price; the latter remains available in
+        ``decision.entry_reference_price`` for downstream Implementation-
+        Shortfall analysis.
+
+        `record_slippage=False` writes NULL on both slippage columns. Used
+        by the recovered-entry-context path in ``engine.trader`` where the
+        bot reconstructs an open position whose original arrival quote is
+        unrecoverable — recording an honest NULL is correct rather than
+        synthesizing a misleading number from the current bar close (the
+        Issue A failure mode that produced QCOM's 1205 bps phantom
+        slippage on the May 11 recovery row).
         """
-        modeled_bps = 0.0
-        realized_bps = 0.0
-        ref_price = modeled_price or decision.entry_reference_price
-        if modeled_price is not None and decision.order_type.value == "market":
-            modeled_bps = settings.SLIPPAGE_MODEL_MARKET_BPS
+        # Arrival-price slippage is only a meaningful execution-quality
+        # signal for MARKET orders. A resting LIMIT fill at $95 against a
+        # $100 limit is excellent execution — the operator got the price
+        # they asked for or better — but the arrival-price formula would
+        # mark it as a -500 bps slippage and the L2 check's abs() wrapper
+        # would flag it as BROKEN. RSI mean-reversion entries are all
+        # LIMIT (strategies/rsi_reversion.py), so applying arrival-price
+        # slippage to them would manufacture false L2 findings on every
+        # good fill. The cleanest answer for LIMIT is to write NULL on
+        # both slippage columns: the IS NOT NULL filter on the L2 query
+        # naturally excludes them; LIMIT execution quality lives in a
+        # separate (out-of-PR-scope) limit-fill-vs-limit-price metric.
+        is_market_order = decision.order_type.value == "market"
+        if record_slippage and is_market_order:
+            modeled_bps: float | None = 0.0
+            realized_bps: float | None = 0.0
+            ref_price = modeled_price or decision.entry_reference_price
+            if modeled_price is not None:
+                modeled_bps = settings.SLIPPAGE_MODEL_MARKET_BPS
+            if (
+                result.avg_fill_price is not None
+                and ref_price > 0
+            ):
+                realized_bps = single_leg_realized_slippage_bps(
+                    side=decision.side.value,
+                    reference_price=ref_price,
+                    actual_fill_price=result.avg_fill_price,
+                )
+        else:
+            modeled_bps = None
+            realized_bps = None
         initial_stop_loss = float(decision.stop_price)
         initial_risk_per_share = max(
             0.0,
@@ -381,15 +423,6 @@ class TradeLogger:
             * multiplier
         )
         now_iso = datetime.now(timezone.utc).isoformat()
-        if (
-            result.avg_fill_price is not None
-            and ref_price > 0
-        ):
-            realized_bps = single_leg_realized_slippage_bps(
-                side=decision.side.value,
-                reference_price=ref_price,
-                actual_fill_price=result.avg_fill_price,
-            )
 
         return TradeRecord(
             timestamp=now_iso,
@@ -403,7 +436,9 @@ class TradeLogger:
             stop_price=decision.stop_price,
             entry_reference_price=decision.entry_reference_price,
             modeled_slippage_bps=modeled_bps,
-            realized_slippage_bps=round(realized_bps, 2),
+            realized_slippage_bps=(
+                round(realized_bps, 2) if realized_bps is not None else None
+            ),
             order_type=decision.order_type.value,
             status=result.status.value,
             requested_qty=result.requested_qty,
