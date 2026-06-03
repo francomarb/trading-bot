@@ -505,6 +505,38 @@ class TestProcessSymbol:
 
         broker.close_position.assert_called_once_with("AAPL")
 
+    def test_processed_bar_signal_exit_respects_position_owner(
+        self, engine_factory, patch_fetch
+    ):
+        engine, broker = engine_factory(exits=[False] * 59 + [True])
+        engine._register_single_leg(strategy_name="donchian_breakout", symbol="AAPL")
+        signal_key = ("fake_strategy", "AAPL", engine.slots[0].timeframe)
+        engine._processed_signal_bars[signal_key] = pd.Timestamp(
+            patch_fetch["df"].index[-1]
+        )
+        positions = {"AAPL": Position("AAPL", 10, 100.0, 1_010.0)}
+        snap = _snapshot(positions=positions)
+        engine._session_start_equity = snap.account.equity
+        engine._processed_signal_statuses[signal_key] = "No Signal"
+        engine._processed_signal_reasons[signal_key] = ["owner mismatch"]
+        statuses = {"AAPL": "stale"}
+        reasons = {"AAPL": ["stale"]}
+
+        engine._process_symbol(
+            "AAPL",
+            snap,
+            snap.account,
+            engine.slots[0].strategy,
+            engine.slots[0].timeframe,
+            strategy_statuses=statuses,
+            strategy_reasons=reasons,
+        )
+
+        broker.close_position.assert_not_called()
+        assert engine._get_owner("AAPL") == "donchian_breakout"
+        assert statuses["AAPL"] == "No Signal"
+        assert reasons["AAPL"] == ["owner mismatch"]
+
     def test_unfilled_single_leg_exit_retains_ownership_for_retry(self, engine_factory):
         engine, broker = engine_factory(
             exits=[False] * 59 + [True],
