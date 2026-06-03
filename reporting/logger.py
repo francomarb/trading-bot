@@ -390,15 +390,17 @@ class TradeLogger:
         # Arrival-price slippage is only a meaningful execution-quality
         # signal for MARKET orders. A resting LIMIT fill at $95 against a
         # $100 limit is excellent execution — the operator got the price
-        # they asked for or better — but the arrival-price formula would
-        # mark it as a -500 bps slippage and the L2 check's abs() wrapper
-        # would flag it as BROKEN. RSI mean-reversion entries are all
-        # LIMIT (strategies/rsi_reversion.py), so applying arrival-price
-        # slippage to them would manufacture false L2 findings on every
-        # good fill. The cleanest answer for LIMIT is to write NULL on
-        # both slippage columns: the IS NOT NULL filter on the L2 query
-        # naturally excludes them; LIMIT execution quality lives in a
-        # separate (out-of-PR-scope) limit-fill-vs-limit-price metric.
+        # they asked for or better. The signed `realized_slippage_bps`
+        # would store −500 bps (price improvement); the L2 alarm now
+        # uses adverse-only semantics (max(0, realized − modeled)) so
+        # price improvement no longer trips it directly, but writing a
+        # large negative value into the row still pollutes downstream
+        # consumers and the operator-facing column. RSI mean-reversion
+        # entries are all LIMIT (strategies/rsi_reversion.py), so the
+        # cleanest answer for LIMIT is to write NULL on both slippage
+        # columns: the IS NOT NULL filter on the L2 query naturally
+        # excludes them; LIMIT execution quality lives in a separate
+        # (out-of-PR-scope) limit-fill-vs-limit-price metric.
         is_market_order = decision.order_type.value == "market"
         if record_slippage and is_market_order:
             modeled_bps: float | None = 0.0
