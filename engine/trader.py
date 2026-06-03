@@ -1006,6 +1006,13 @@ class TradingEngine:
                         try:
                             signals = strategy._raw_signals(df)
                             if bool(signals.exits.iloc[-1]):
+                                owner = self._get_owner(symbol)
+                                if owner is not None and owner != strategy.name:
+                                    logger.info(
+                                        f"[{strategy.name}] {symbol}: processed-bar exit ignored — "
+                                        f"position owned by '{owner}'"
+                                    )
+                                    return
                                 self._close_single_leg_position(
                                     symbol=symbol,
                                     strategy=strategy,
