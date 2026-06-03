@@ -731,3 +731,97 @@ class TestRecoveredContextSlippageFilter:
         # All three rows participate; p95 of [5, 50, 200] is ≈ 185 by
         # linear interpolation — matches TestP95SlippageRegression.
         assert slip.numeric_value > 100.0
+
+
+class TestAdverseOnlySlippageSemantics:
+    """The L2 check measures **adverse** drift, not absolute drift.
+    `realized_slippage_bps` is signed by the slippage helpers (positive =
+    paid more / got less; negative = price improvement). Pre-fix the
+    check used `abs(realized - modeled)` which conflated improvement
+    with adverse — credit_spread's two price-improvement MLEG fills
+    (-134 and -77 bps) were dominating the p95 and flagging the sleeve
+    as DEGRADED even though it was getting better fills than asked.
+    """
+
+    def test_price_improvement_does_not_inflate_p95(self, db_conn):
+        # Two zero-drift fills + one price-improvement fill at -150 bps.
+        # Pre-fix p95 would be ~142 (abs of -150); post-fix p95 = 0.
+        _seed_filled_trade(
+            db_conn, strategy="x",
+            timestamp="2026-05-19T09:00:00",
+            realized_slippage_bps=5.0, modeled_slippage_bps=5.0,
+        )
+        _seed_filled_trade(
+            db_conn, strategy="x",
+            timestamp="2026-05-20T09:00:00",
+            realized_slippage_bps=5.0, modeled_slippage_bps=5.0,
+        )
+        _seed_filled_trade(
+            db_conn, strategy="x",
+            timestamp="2026-05-21T09:00:00",
+            realized_slippage_bps=-145.0, modeled_slippage_bps=5.0,
+        )
+        report = HealthAssessor().assess(_standard_inputs(db_conn))
+        slip = next(
+            c for c in report.checks
+            if c.name == "slippage_realized_vs_modeled_bps_p95"
+        )
+        # All three contributions clamp to 0 — clean execution, no alarm.
+        assert slip.numeric_value == pytest.approx(0.0)
+        assert slip.status == HealthStatus.HEALTHY
+
+    def test_adverse_drift_still_inflates_p95(self, db_conn):
+        # Symmetry guard: regular adverse drift continues to flag.
+        # If the new semantics over-clamped (e.g. returned 0 for all
+        # rows), this would falsely pass — the regression catch.
+        _seed_filled_trade(
+            db_conn, strategy="x",
+            timestamp="2026-05-19T09:00:00",
+            realized_slippage_bps=5.0, modeled_slippage_bps=5.0,
+        )
+        _seed_filled_trade(
+            db_conn, strategy="x",
+            timestamp="2026-05-20T09:00:00",
+            realized_slippage_bps=125.0, modeled_slippage_bps=5.0,
+        )
+        report = HealthAssessor().assess(_standard_inputs(db_conn))
+        slip = next(
+            c for c in report.checks
+            if c.name == "slippage_realized_vs_modeled_bps_p95"
+        )
+        # Adverse 120 bps drift is captured; p95 between 0 and 120.
+        assert slip.numeric_value > 100.0
+        assert slip.status in (HealthStatus.DEGRADED, HealthStatus.BROKEN)
+
+    def test_credit_spread_price_improvement_pattern_passes(self, db_conn):
+        """Reproduction of the credit_spread false-positive: 8 zero-
+        slippage MLEG rows + 2 price-improvement rows at -76.6 and
+        -134.5 bps (modeled=0 on mleg). Pre-fix p95 was 87.4 bps →
+        DEGRADED. Post-fix p95 = 0 → HEALTHY (or WATCH with broader
+        thresholds, but never DEGRADED on price improvement alone)."""
+        for i in range(8):
+            _seed_filled_trade(
+                db_conn, strategy="x",
+                timestamp=f"2026-05-{19 + i:02d}T09:00:00",
+                realized_slippage_bps=0.0, modeled_slippage_bps=0.0,
+            )
+        _seed_filled_trade(
+            db_conn, strategy="x",
+            timestamp="2026-05-27T09:00:00",
+            realized_slippage_bps=-76.6, modeled_slippage_bps=0.0,
+        )
+        _seed_filled_trade(
+            db_conn, strategy="x",
+            timestamp="2026-05-28T09:00:00",
+            realized_slippage_bps=-134.5, modeled_slippage_bps=0.0,
+        )
+        report = HealthAssessor().assess(_standard_inputs(db_conn))
+        slip = next(
+            c for c in report.checks
+            if c.name == "slippage_realized_vs_modeled_bps_p95"
+        )
+        # All ten samples are non-adverse → p95 = 0; sleeve is HEALTHY.
+        # This is exactly the inverse of the W22 87.4 bps DEGRADED
+        # finding pre-fix.
+        assert slip.numeric_value == pytest.approx(0.0)
+        assert slip.status == HealthStatus.HEALTHY

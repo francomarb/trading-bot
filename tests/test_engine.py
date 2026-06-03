@@ -894,6 +894,48 @@ class TestSlippageRecording:
         assert modeled_bps == pytest.approx(SLIPPAGE_MODEL_MARKET_BPS)
         assert realized_bps == pytest.approx(0.20 / modeled_close * 10_000, rel=1e-3)
 
+    def test_buy_adverse_fill_records_positive_signed_bps(self, engine_factory):
+        """Kill-switch path uses adverse-only semantics now. A BUY filled
+        ABOVE the arrival benchmark = paid more = positive signed bps,
+        which is exactly the kind of drift the kill switch is supposed
+        to catch. Sample should record the adverse magnitude."""
+        modeled_close = 100.0
+        engine, broker = engine_factory(
+            entries=[False] * 59 + [True],
+            place_result=_filled_result("AAPL", 1, 100.20),  # paid 20¢ more
+        )
+        broker.get_latest_quote_midpoint.return_value = modeled_close
+        snap = _snapshot()
+        engine._session_start_equity = snap.account.equity
+        slot = engine.slots[0]
+        engine._process_symbol("AAPL", snap, snap.account, slot.strategy, slot.timeframe)
+        assert len(engine.risk._slippage_samples) == 1
+        _, realized = engine.risk._slippage_samples[0]
+        # Adverse fill → positive signed bps; not clamped.
+        assert realized == pytest.approx((0.20 / 100.0) * 10_000, rel=1e-3)
+
+    def test_buy_price_improvement_clamps_to_zero(self, engine_factory):
+        """Symmetry guard: a BUY filled BELOW the arrival benchmark = got
+        a better price than expected. Adverse-only semantics clamps to 0
+        so a run of unusually good fills can't trip the drift kill
+        switch on improvement that the strategy should be happy about.
+        Mirrors the credit_spread MLEG false-positive at the engine
+        kill-switch layer."""
+        modeled_close = 100.0
+        engine, broker = engine_factory(
+            entries=[False] * 59 + [True],
+            place_result=_filled_result("AAPL", 1, 99.80),  # paid 20¢ less
+        )
+        broker.get_latest_quote_midpoint.return_value = modeled_close
+        snap = _snapshot()
+        engine._session_start_equity = snap.account.equity
+        slot = engine.slots[0]
+        engine._process_symbol("AAPL", snap, snap.account, slot.strategy, slot.timeframe)
+        assert len(engine.risk._slippage_samples) == 1
+        _, realized = engine.risk._slippage_samples[0]
+        # Price improvement → clamped to 0; kill switch sees a clean fill.
+        assert realized == pytest.approx(0.0)
+
     def test_limit_order_skips_slippage_recording(self, engine_factory):
         """LIMIT entries do not record execution slippage — arrival price
         is not a meaningful benchmark for a resting limit fill. A buy
@@ -2806,6 +2848,7 @@ class TestOptionsEngineFixes:
                     qty=3,
                     entry_reference_price=12.15,
                     strategy_name="spy_options_reversion",
+                    side=Side.BUY,
                 ),
                 "rejected",
                 0.0,
@@ -2839,6 +2882,7 @@ class TestOptionsEngineFixes:
                     qty=3,
                     entry_reference_price=12.15,
                     strategy_name="spy_options_reversion",
+                    side=Side.BUY,
                 ),
                 "filled",
                 3.0,

@@ -344,7 +344,17 @@ def _slippage_p95_bps(
     deltas = []
     for realized, modeled in cursor.fetchall():
         try:
-            deltas.append(abs(float(realized) - float(modeled)))
+            # Adverse-only semantics. `realized_slippage_bps` is signed
+            # by `single_leg_realized_slippage_bps` / `mleg_realized_
+            # slippage_bps`: positive = adverse fill (paid more / got
+            # less), negative = price improvement (broker filled at a
+            # better price than submitted). The L2 check is asking
+            # "how bad is execution drift?" — price improvement should
+            # contribute 0, not be flipped into an inflated p95 by an
+            # abs() wrapper. This was the false-positive that flagged
+            # credit_spread as DEGRADED on a sample of 6 zero-slippage
+            # fills + 2 price-improvement fills.
+            deltas.append(max(0.0, float(realized) - float(modeled)))
         except (TypeError, ValueError):
             continue
     if not deltas:

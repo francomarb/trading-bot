@@ -144,7 +144,12 @@ def _collect_slippage_observations(
     out: list[float] = []
     for realized, modeled in cursor.fetchall():
         try:
-            out.append(abs(float(realized) - float(modeled)))
+            # Adverse-only semantics — mirrors strategies/health/
+            # assessor.py:_slippage_p95_bps. Calibrating against the
+            # abs() of price improvement would propose elevated
+            # thresholds based on good fills, even though the live L2
+            # check is asking about adverse drift only.
+            out.append(max(0.0, float(realized) - float(modeled)))
         except (TypeError, ValueError):
             continue
     return out
