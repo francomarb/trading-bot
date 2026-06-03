@@ -118,17 +118,22 @@ def _collect_slippage_observations(
     start: date,
     end: date,
 ) -> list[float]:
-    """Per-trade |realized - modeled| slippage deltas for L2.
+    """Per-trade adverse slippage deltas (max(0, realized - modeled)) for L2.
 
-    Defensive filter (mirrors `strategies.health.assessor._slippage_p95_bps`):
-    rows whose `reason` carries the `recovered entry context` marker have
-    no honest pre-trade benchmark — they were written by the engine's
-    crash-recovery path before the slippage PR landed, with
-    realized_bps reflecting price drift since entry rather than
-    execution quality. Including them in the calibration window
-    would learn from phantom slippage and propose inflated WATCH/
-    DEGRADED/BROKEN thresholds, even though the live L2 check has
-    already learned to skip them.
+    Adverse-only semantics matches `strategies.health.assessor.
+    _slippage_p95_bps`: positive `realized - modeled` (paid more / got
+    less) contributes its magnitude; negative `realized - modeled`
+    (price improvement) clamps to 0. Calibration learns from the same
+    distribution the live L2 check sees, so threshold suggestions
+    aren't inflated by good fills.
+
+    Defensive filter (also mirrors the assessor): rows whose `reason`
+    carries the `recovered entry context` marker have no honest pre-
+    trade benchmark — they were written by the engine's crash-recovery
+    path before the slippage PR landed, with realized_bps reflecting
+    price drift since entry rather than execution quality. Including
+    them in the calibration window would learn from phantom slippage
+    and propose inflated WATCH/DEGRADED/BROKEN thresholds.
     """
     cursor = conn.execute(
         "SELECT realized_slippage_bps, modeled_slippage_bps "
@@ -144,7 +149,12 @@ def _collect_slippage_observations(
     out: list[float] = []
     for realized, modeled in cursor.fetchall():
         try:
-            out.append(abs(float(realized) - float(modeled)))
+            # Adverse-only semantics — mirrors strategies/health/
+            # assessor.py:_slippage_p95_bps. Calibrating against the
+            # abs() of price improvement would propose elevated
+            # thresholds based on good fills, even though the live L2
+            # check is asking about adverse drift only.
+            out.append(max(0.0, float(realized) - float(modeled)))
         except (TypeError, ValueError):
             continue
     return out

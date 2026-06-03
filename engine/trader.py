@@ -89,7 +89,7 @@ from risk.manager import (
     Signal,
 )
 from reporting.alerts import AlertDispatcher
-from reporting.logger import TradeLogger
+from reporting.logger import TradeLogger, single_leg_realized_slippage_bps
 from reporting.pnl import PnLTracker
 from strategies.base import (
     BaseStrategy,
@@ -1515,6 +1515,7 @@ class TradingEngine:
                 result,
                 modeled_price=slippage_ref,
                 order_type=decision.order_type.value,
+                side=decision.side.value,
             )
             self._log_entry(decision, result, slippage_ref)
             if result.status in {OrderStatus.FILLED, OrderStatus.PARTIAL}:
@@ -1705,6 +1706,7 @@ class TradingEngine:
                     result,
                     modeled_price=suspect.modeled_price,
                     order_type=suspect.decision.order_type.value,
+                    side=suspect.decision.side.value,
                 )
                 self._log_entry(
                     suspect.decision,
@@ -1786,6 +1788,7 @@ class TradingEngine:
         *,
         modeled_price: float,
         order_type: str = "market",
+        side: str = "buy",
     ) -> None:
         """
         Feed the realized vs. modeled slippage into the Phase 6 drift kill
@@ -1795,10 +1798,16 @@ class TradingEngine:
         MARKET orders only. LIMIT orders are skipped because arrival
         price is not a meaningful execution-quality benchmark for them —
         a resting limit at $100 filled at $95 looks like -500 bps against
-        arrival but is a clean fill against the limit. Feeding that
-        signal into the unsigned-magnitude drift kill switch could trip
-        the halt on good limit fills. LIMIT execution quality belongs in
-        a separate (out-of-scope here) limit-fill-vs-limit-price metric.
+        arrival but is a clean fill against the limit.
+
+        The kill switch consumes **adverse-only** magnitude. We compute
+        signed slippage via single_leg_realized_slippage_bps (positive =
+        adverse fill / negative = price improvement) and clamp negatives
+        to 0 before recording. A run of unusually good fills must not
+        trip the drift halt — that's the conceptual bug shared with the
+        L2 Health check's previous abs() semantics (PR follow-up after
+        the credit_spread DEGRADED false positive on a sample of
+        zero-slippage + price-improvement fills).
         """
         if result.status not in {OrderStatus.FILLED, OrderStatus.PARTIAL}:
             return
@@ -1807,11 +1816,12 @@ class TradingEngine:
         if result.avg_fill_price is None or modeled_price <= 0:
             return
         modeled_bps = SLIPPAGE_MODEL_MARKET_BPS
-        # The kill switch consumes unsigned magnitude samples by design;
-        # signed price-improvement/adverse attribution lives in the trade log.
-        realized_bps = (
-            abs(result.avg_fill_price - modeled_price) / modeled_price * 10_000
+        signed_bps = single_leg_realized_slippage_bps(
+            side=side,
+            reference_price=modeled_price,
+            actual_fill_price=result.avg_fill_price,
         )
+        realized_bps = max(0.0, signed_bps)
         self.risk.record_fill_slippage(
             modeled_bps=modeled_bps, realized_bps=realized_bps
         )
@@ -2913,7 +2923,12 @@ class TradingEngine:
                 raw_status=status_str,
                 message=f"options async fill: {status_str}",
             )
-            self._record_fill(result, modeled_price=decision.entry_reference_price, order_type="limit")
+            self._record_fill(
+                result,
+                modeled_price=decision.entry_reference_price,
+                order_type="limit",
+                side=decision.side.value,
+            )
             self._log_entry(decision, result, decision.entry_reference_price)
             if result.status in {OrderStatus.FILLED, OrderStatus.PARTIAL}:
                 # PLAN 11.10f: lifecycle counter — filled_entries for
@@ -3044,7 +3059,14 @@ class TradingEngine:
             return False
 
         if not _OCC_PAT.match(position.symbol):
-            self._record_fill(result, modeled_price=latest_close, order_type="market")
+            # Close path is a SELL for long equity positions — side
+            # matters for the kill switch's signed slippage so adverse
+            # close fills (sold below modeled) are captured and price-
+            # improvement close fills (sold above modeled) clamp to 0.
+            self._record_fill(
+                result, modeled_price=latest_close,
+                order_type="market", side="sell",
+            )
         close_modeled = (
             result.avg_fill_price or 0.0
             if _OCC_PAT.match(position.symbol)

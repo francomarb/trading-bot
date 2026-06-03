@@ -118,12 +118,17 @@ class TestSlippageCollector:
         )
         assert out == []
 
-    def test_returns_abs_delta(self, db_conn):
-        # Three trades: deltas 0, 30, 100 bps
+    def test_returns_adverse_delta_only(self, db_conn):
+        """Adverse-only semantics: only positive `realized - modeled`
+        contributes to the calibration sample. Price improvement
+        (negative `realized - modeled`) clamps to 0. Mirrors the live
+        L2 check's `max(0, realized - modeled)` so calibration learns
+        from the same distribution the assessor sees."""
         for ts, realized, modeled in [
-            ("2026-04-15T10:00:00", 5.0, 5.0),  # delta=0
-            ("2026-04-16T10:00:00", 35.0, 5.0),  # delta=30
-            ("2026-04-17T10:00:00", -95.0, 5.0),  # |delta|=100
+            ("2026-04-15T10:00:00", 5.0, 5.0),     # zero drift → 0
+            ("2026-04-16T10:00:00", 35.0, 5.0),    # adverse +30 → 30
+            ("2026-04-17T10:00:00", -95.0, 5.0),   # price-improvement → 0
+            ("2026-04-18T10:00:00", 105.0, 5.0),   # adverse +100 → 100
         ]:
             _seed_slippage_trade(
                 db_conn, strategy="x", timestamp=ts,
@@ -133,7 +138,10 @@ class TestSlippageCollector:
             db_conn, "x",
             start=date(2026, 4, 1), end=date(2026, 5, 1),
         )
-        assert sorted(out) == [0.0, 30.0, 100.0]
+        # Adverse-only: two zeros + two adverse drifts; the -95 row
+        # (which the old abs() formula would have counted as 100)
+        # contributes 0 under the new semantics.
+        assert sorted(out) == [0.0, 0.0, 30.0, 100.0]
 
     def test_excludes_other_strategies(self, db_conn):
         _seed_slippage_trade(

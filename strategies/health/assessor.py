@@ -318,8 +318,16 @@ def _slippage_p95_bps(
     period_start: date,
     period_end: date,
 ) -> float | None:
-    """p95 of |realized_slippage_bps - modeled_slippage_bps| over the
-    window. None if no fills with slippage data."""
+    """p95 of adverse slippage (max(0, realized - modeled)) over the
+    window. None if no fills with slippage data.
+
+    Adverse-only semantics: `realized_slippage_bps` is signed by the
+    slippage helpers (positive = adverse fill / paid more / got less;
+    negative = price improvement / broker filled at a better price than
+    submitted). The L2 alarm asks "how bad is execution drift?" — price
+    improvement contributes 0, not its absolute magnitude. See PR #38
+    for the credit_spread W22 false-positive that motivated the change.
+    """
     # Defensive filter for the Issue A failure mode: rows written by the
     # recovered-entry-context path before slippage_pr landed could not
     # honestly compute slippage (no arrival-price benchmark was captured
@@ -344,7 +352,17 @@ def _slippage_p95_bps(
     deltas = []
     for realized, modeled in cursor.fetchall():
         try:
-            deltas.append(abs(float(realized) - float(modeled)))
+            # Adverse-only semantics. `realized_slippage_bps` is signed
+            # by `single_leg_realized_slippage_bps` / `mleg_realized_
+            # slippage_bps`: positive = adverse fill (paid more / got
+            # less), negative = price improvement (broker filled at a
+            # better price than submitted). The L2 check is asking
+            # "how bad is execution drift?" — price improvement should
+            # contribute 0, not be flipped into an inflated p95 by an
+            # abs() wrapper. This was the false-positive that flagged
+            # credit_spread as DEGRADED on a sample of 6 zero-slippage
+            # fills + 2 price-improvement fills.
+            deltas.append(max(0.0, float(realized) - float(modeled)))
         except (TypeError, ValueError):
             continue
     if not deltas:
