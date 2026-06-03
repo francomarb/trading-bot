@@ -49,7 +49,7 @@ import os
 import re
 import signal
 import time
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from datetime import datetime, timedelta, timezone
 from typing import TYPE_CHECKING, Callable
 from zoneinfo import ZoneInfo
@@ -1706,7 +1706,12 @@ class TradingEngine:
                     modeled_price=suspect.modeled_price,
                     order_type=suspect.decision.order_type.value,
                 )
-                self._log_entry(suspect.decision, result, suspect.modeled_price)
+                self._log_entry(
+                    suspect.decision,
+                    result,
+                    suspect.modeled_price,
+                    timestamp_override=result.filled_at or result.submitted_at,
+                )
                 self._register_single_leg(
                     strategy_name=suspect.decision.strategy_name,
                     symbol=symbol,
@@ -1818,6 +1823,7 @@ class TradingEngine:
         modeled_price: float,
         *,
         record_slippage: bool = True,
+        timestamp_override: datetime | None = None,
     ) -> None:
         """Log an entry fill to the trade database.
 
@@ -1827,6 +1833,12 @@ class TradingEngine:
         honest pre-trade benchmark exists; writing NULL on both slippage
         columns is correct, vs. synthesizing a phantom number from the
         current bar close that would inflate the L2 health check's p95.
+
+        ``timestamp_override`` is reserved for recovery / reconciliation
+        paths. When Alpaca broker history exposes the original execution
+        time (``filled_at``), recovered rows should use that broker time
+        rather than the later cycle when the engine noticed and repaired
+        the gap.
         """
         if result.status not in {OrderStatus.FILLED, OrderStatus.PARTIAL}:
             return
@@ -1841,6 +1853,7 @@ class TradingEngine:
                 modeled_price=modeled_price,
                 position_uid=getattr(result, "position_uid", None),
                 record_slippage=record_slippage,
+                timestamp_override=timestamp_override,
             )
             self.trade_logger.log(record)
         except Exception as e:
@@ -2308,7 +2321,13 @@ class TradingEngine:
         owner: str,
         stop_fill,
     ) -> bool:
-        """Persist a broker-recovered stop fill and feed realized P&L once."""
+        """Persist a broker-recovered stop fill and feed realized P&L once.
+
+        Recovery rows should preserve the broker's original execution time
+        when available (``filled_at`` / ``submitted_at``) so the audit trail
+        reflects when the stop actually happened, not when the engine later
+        discovered the missed fill.
+        """
         price = stop_fill.avg_fill_price
         qty = float(stop_fill.filled_qty or 0.0)
         raw_symbol = getattr(stop_fill, "symbol", None) or symbol
@@ -2335,6 +2354,7 @@ class TradingEngine:
             qty=qty,
             avg_fill_price=price,
             order_id=stop_fill.order_id,
+            timestamp_override=stop_fill.filled_at or stop_fill.submitted_at,
         )
         pnl_multiplier = 100 if _OCC_PAT.match(raw_symbol) else 1
         self._record_realized_pnl(
@@ -2431,6 +2451,11 @@ class TradingEngine:
         Uses the assigned strategy plus the latest completed bar to reconstruct
         the original-style stop, then persists a recovered entry record from the
         broker position so normal stop-repair can continue.
+
+        When Alpaca order history can identify the original filled entry,
+        the recovered trade row should reuse broker ``filled_at`` rather
+        than the later restart/recovery time. The row is a reconstruction,
+        not a new fill.
         """
         if _OCC_PAT.match(symbol):
             return None
@@ -2515,6 +2540,18 @@ class TradingEngine:
             raw_status="recovered",
             message="recovered from broker position",
         )
+        recovered_fill = None
+        try:
+            recovered_fill = self.broker.find_recent_filled_entry_order(symbol=symbol)
+        except Exception as e:
+            logger.warning(
+                f"{symbol}: could not fetch historical filled entry for recovery timestamp: {e}"
+            )
+        if recovered_fill is not None:
+            recovered_result = replace(
+                recovered_result,
+                order_id=recovered_fill.order_id,
+            )
         # Issue A: recovered rows have no honest arrival-price benchmark
         # — the original submission happened before the bot's current
         # process started. Write NULL on slippage columns rather than
@@ -2522,11 +2559,16 @@ class TradingEngine:
         # and the historical broker avg_entry. Defensive double-fix
         # paired with the assessor filter for legacy rows already
         # written prior to this change.
+        recovered_timestamp = None
+        if recovered_fill is not None:
+            recovered_timestamp = recovered_fill.filled_at or recovered_fill.submitted_at
+
         self._log_entry(
             recovered_decision,
             recovered_result,
             latest_close,
             record_slippage=False,
+            timestamp_override=recovered_timestamp,
         )
         self._entry_prices[symbol] = entry_price
         logger.warning(
@@ -2793,12 +2835,28 @@ class TradingEngine:
                 self._record_realized_pnl(symbol, owner, price, qty, multiplier=_pnl_mult)
             try:
                 if price is not None and qty > 0:
+                    stop_log_kwargs = {
+                        "symbol": raw_symbol,
+                        "strategy": owner,
+                        "qty": qty,
+                        "avg_fill_price": price,
+                        "order_id": order_id,
+                    }
+                    stop_timestamp = (
+                        getattr(update.order, "filled_at", None)
+                        or getattr(update.order, "submitted_at", None)
+                    )
+                    if isinstance(stop_timestamp, str):
+                        try:
+                            stop_timestamp = datetime.fromisoformat(
+                                stop_timestamp.replace("Z", "+00:00")
+                            )
+                        except ValueError:
+                            stop_timestamp = None
+                    if stop_timestamp is not None:
+                        stop_log_kwargs["timestamp_override"] = stop_timestamp
                     self.trade_logger.log_stop_fill(
-                        symbol=raw_symbol,
-                        strategy=owner,
-                        qty=qty,
-                        avg_fill_price=price,
-                        order_id=order_id,
+                        **stop_log_kwargs,
                     )
                 else:
                     # Price or qty unavailable — fall back to the synthetic record.

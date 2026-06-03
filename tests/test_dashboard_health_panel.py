@@ -208,22 +208,20 @@ class TestParseReportMetadata:
 
 
 class TestFormatGeneratedAt:
-    def test_renders_iso_as_compact_utc(self):
-        # The reviewer writes ISO with +00:00 — already UTC.
+    def test_renders_iso_as_compact_local_time(self):
+        # The reviewer writes ISO with +00:00 — display in the host's local zone.
         out = _format_generated_at("2026-06-02T12:30:00+00:00")
-        assert out == "2026-06-02 12:30 UTC"
+        assert out == "2026-06-02 07:30 CDT"
 
-    def test_converts_offset_to_utc(self):
-        # Non-UTC offset should be normalized so the displayed time
-        # always matches the panel's UTC convention.
+    def test_converts_offset_to_local_time(self):
+        # Non-UTC offsets should still normalize to the host's local zone.
         out = _format_generated_at("2026-06-02T08:30:00-04:00")
-        assert out == "2026-06-02 12:30 UTC"
+        assert out == "2026-06-02 07:30 CDT"
 
-    def test_renders_naive_as_utc(self):
-        # Some legacy reports may omit the offset; assume UTC rather
-        # than crash.
+    def test_renders_naive_as_utc_then_converts_local(self):
+        # Some legacy reports may omit the offset; assume UTC, then convert local.
         out = _format_generated_at("2026-06-02T12:30:00")
-        assert out == "2026-06-02 12:30 UTC"
+        assert out == "2026-06-02 07:30 CDT"
 
     def test_falls_back_on_unparseable(self):
         # Malformed timestamp — surface the raw value rather than raise.

@@ -22,7 +22,7 @@ import json
 import re
 import sqlite3
 import time
-from datetime import datetime, timezone
+from datetime import datetime, timezone, tzinfo
 from pathlib import Path
 from collections import deque
 from typing import Any
@@ -102,6 +102,45 @@ def merge_display_positions_detail(
         positions_detail.setdefault(sym, dict(detail))
 
     return positions_detail
+
+
+def _local_timezone() -> tzinfo:
+    """Best-effort local timezone for the host running Streamlit."""
+    return datetime.now().astimezone().tzinfo or timezone.utc
+
+
+def format_local_timestamp(
+    value: Any,
+    *,
+    target_tz: tzinfo | None = None,
+    include_zone: bool = True,
+) -> str:
+    """
+    Format a timestamp in the host's local timezone.
+
+    Accepts pandas timestamps, datetimes, or ISO-ish strings. Naive values are
+    treated as UTC because the trade log and engine snapshot persist UTC.
+    """
+    if value is None or (isinstance(value, float) and pd.isna(value)):
+        return "—"
+
+    tz = target_tz or _local_timezone()
+    try:
+        ts = pd.Timestamp(value)
+    except Exception:
+        return str(value)
+
+    if pd.isna(ts):
+        return "—"
+
+    if ts.tzinfo is None:
+        ts = ts.tz_localize(timezone.utc)
+    else:
+        ts = ts.tz_convert(timezone.utc)
+
+    local_ts = ts.tz_convert(tz)
+    fmt = "%Y-%m-%d %H:%M %Z" if include_zone else "%Y-%m-%d %H:%M"
+    return local_ts.strftime(fmt)
 
 
 def load_trades(db_path: str) -> pd.DataFrame:
@@ -1156,7 +1195,7 @@ def _parse_report_metadata(text: str) -> tuple[dict[str, str], str]:
 
 
 def _format_generated_at(value: str) -> str:
-    """Render an ISO8601 timestamp as a compact UTC string for the caption.
+    """Render an ISO8601 timestamp as a compact local-time string for the caption.
 
     Falls back to the raw value if parsing fails — the report's
     front-matter is normally well-formed but we don't want a malformed
@@ -1164,16 +1203,7 @@ def _format_generated_at(value: str) -> str:
     """
     if not value:
         return "—"
-    try:
-        # Python's fromisoformat accepts the Z-less +00:00 form the
-        # reviewer writes; older 3.10 didn't accept "Z" suffixes but the
-        # bot ships 3.12 (CLAUDE.md / requirements).
-        ts = datetime.fromisoformat(value)
-    except ValueError:
-        return value
-    if ts.tzinfo is None:
-        ts = ts.replace(tzinfo=timezone.utc)
-    return ts.astimezone(timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
+    return format_local_timestamp(value)
 
 
 def _render_report_card(
@@ -1287,9 +1317,11 @@ def render_dashboard() -> None:
         try:
             last_update = datetime.fromisoformat(ts)
             age_s = (datetime.now(timezone.utc) - last_update).total_seconds()
-            st.caption(f"Last engine cycle: {ts} ({age_s:.0f}s ago)")
+            st.caption(
+                f"Last engine cycle: {format_local_timestamp(ts)} ({age_s:.0f}s ago)"
+            )
         except Exception:
-            st.caption(f"Last engine cycle: {ts}")
+            st.caption(f"Last engine cycle: {format_local_timestamp(ts)}")
     elif not is_running:
         st.info("Engine is offline. Showing historical data from trade database.")
     st.caption(
@@ -1940,7 +1972,7 @@ def render_dashboard() -> None:
         available = [c for c in display_cols if c in trades_df.columns]
         recent = trades_df[available].tail(20).copy()
         if "timestamp" in recent.columns:
-            recent["timestamp"] = recent["timestamp"].dt.strftime("%Y-%m-%d %H:%M")
+            recent["timestamp"] = recent["timestamp"].map(format_local_timestamp)
         if "avg_fill_price" in recent.columns:
             recent["avg_fill_price"] = recent["avg_fill_price"].map(
                 lambda x: f"${x:,.2f}" if pd.notna(x) else "—"

@@ -329,6 +329,72 @@ class TestGetClosedOrders:
         assert results[0].status is OrderStatus.FILLED
 
 
+class TestFindRecentFilledEntryOrder:
+    def test_returns_latest_filled_buy_order_for_symbol(self):
+        api = MagicMock()
+        api.get_orders.return_value = [
+            SimpleNamespace(
+                id="older-buy",
+                client_order_id="cid-old-buy",
+                symbol="AAPL",
+                side=SimpleNamespace(value="buy"),
+                qty="10",
+                type=SimpleNamespace(value="limit"),
+                status=SimpleNamespace(value="filled"),
+                filled_qty="10",
+                filled_avg_price="100.0",
+                stop_price=None,
+                submitted_at="2026-05-22T14:30:00Z",
+                filled_at="2026-05-22T14:31:08Z",
+            ),
+            SimpleNamespace(
+                id="ignore-sell",
+                client_order_id="cid-ignore-sell",
+                symbol="AAPL",
+                side=SimpleNamespace(value="sell"),
+                qty="10",
+                type=SimpleNamespace(value="limit"),
+                status=SimpleNamespace(value="filled"),
+                filled_qty="10",
+                filled_avg_price="101.0",
+                stop_price=None,
+                submitted_at="2026-05-22T14:30:00Z",
+                filled_at="2026-05-22T14:31:08Z",
+            ),
+            SimpleNamespace(
+                id="new-buy",
+                client_order_id="cid-1",
+                symbol="AAPL",
+                side=SimpleNamespace(value="buy"),
+                qty="10",
+                type=SimpleNamespace(value="limit"),
+                status=SimpleNamespace(value="filled"),
+                filled_qty="10",
+                filled_avg_price="102.5",
+                stop_price=None,
+                submitted_at="2026-05-23T14:30:00Z",
+                filled_at="2026-05-23T14:31:08Z",
+            ),
+        ]
+        broker = _broker_with_mock(api)
+
+        result = broker.find_recent_filled_entry_order(symbol="AAPL")
+
+        assert isinstance(result, ClosedOrderInfo)
+        assert result.order_id == "new-buy"
+        assert result.avg_fill_price == pytest.approx(102.5)
+
+    def test_returns_none_when_no_filled_buy_order_exists(self):
+        api = MagicMock()
+        api.get_orders.return_value = [
+            _alpaca_order(id="sell-only", status="filled", side="sell", symbol="AAPL", type="limit"),
+            _alpaca_order(id="canceled-buy", status="canceled", side="buy", symbol="AAPL", type="limit"),
+        ]
+        broker = _broker_with_mock(api)
+
+        assert broker.find_recent_filled_entry_order(symbol="AAPL") is None
+
+
 # ── place_order: kwargs built correctly ──────────────────────────────────────
 
 

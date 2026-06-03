@@ -128,7 +128,14 @@ def _snapshot(
     )
 
 
-def _filled_result(symbol: str, qty: int, avg: float) -> OrderResult:
+def _filled_result(
+    symbol: str,
+    qty: int,
+    avg: float,
+    *,
+    submitted_at: datetime | None = None,
+    filled_at: datetime | None = None,
+) -> OrderResult:
     return OrderResult(
         status=OrderStatus.FILLED,
         order_id="ord-1",
@@ -138,6 +145,8 @@ def _filled_result(symbol: str, qty: int, avg: float) -> OrderResult:
         avg_fill_price=avg,
         raw_status="filled",
         message="ok",
+        submitted_at=submitted_at,
+        filled_at=filled_at,
     )
 
 
@@ -1743,7 +1752,13 @@ class TestWatchlistStatuses:
             place_result=_unknown_result("AAPL", 10, order_id="ord-suspect"),
         )
         broker.sync_with_broker.side_effect = [startup, cycle1, cycle2]
-        broker.reconcile_submitted_order.return_value = _filled_result("AAPL", 10, 100.5)
+        broker.reconcile_submitted_order.return_value = _filled_result(
+            "AAPL",
+            10,
+            100.5,
+            submitted_at=T0,
+            filled_at=T0 + timedelta(minutes=2),
+        )
         broker.place_protective_stop.return_value = _open_stop_order("AAPL", 95.0)
 
         engine.start(max_cycles=2)
@@ -1760,6 +1775,13 @@ class TestWatchlistStatuses:
         assert stop_call["client_order_id_prefix"] == "fake_strategy-recover-stop"
         assert engine._get_owner("AAPL") == "fake_strategy"
         assert engine.trade_logger.read_all_open_owners() == {"AAPL": "fake_strategy"}
+        buy_rows = [
+            r for r in engine.trade_logger.read_all()
+            if r["side"] == "buy" and r["symbol"] == "AAPL"
+        ]
+        assert len(buy_rows) == 1
+        assert buy_rows[0]["timestamp"] == (T0 + timedelta(minutes=2)).isoformat()
+        assert buy_rows[0]["entry_timestamp"] == (T0 + timedelta(minutes=2)).isoformat()
 
 
 # ── Scanner cadence ────────────────────────────────────────────────────────
@@ -2493,6 +2515,7 @@ class TestOptionsEngineFixes:
         engine._register_single_leg(strategy_name="fake_strategy", symbol="AAPL")
         engine.risk._stop_price_for = MagicMock(return_value=95.0)
         engine.broker.place_protective_stop = MagicMock(return_value=_open_stop_order("AAPL", 95.0))
+        engine.broker.find_recent_filled_entry_order = MagicMock(return_value=None)
         monkeypatch.setattr(
             "engine.trader.fetch_symbol",
             lambda symbol, start, end, timeframe="1Day": (_bars(), SimpleNamespace(api_calls=0)),
@@ -2515,6 +2538,49 @@ class TestOptionsEngineFixes:
             symbol="AAPL",
             strategy="fake_strategy",
         ) == 95.0
+
+    def test_recovered_entry_uses_broker_filled_at_timestamp(self, tmp_path, monkeypatch):
+        """Recovery rows should use Alpaca's original filled_at timestamp when available."""
+        engine = self._engine(tmp_path)
+        engine._register_single_leg(strategy_name="fake_strategy", symbol="AAPL")
+        engine.risk._stop_price_for = MagicMock(return_value=61.36)
+        engine.broker.place_protective_stop = MagicMock(return_value=_open_stop_order("AAPL", 61.36))
+        engine.broker.find_recent_filled_entry_order = MagicMock(
+            return_value=ClosedOrderInfo(
+                order_id="aapl-entry-1",
+                client_order_id="cid-aapl",
+                symbol="AAPL",
+                side=Side.BUY,
+                order_type="limit",
+                status=OrderStatus.FILLED,
+                raw_status="filled",
+                qty=10.0,
+                filled_qty=10.0,
+                avg_fill_price=100.0,
+                stop_price=None,
+                submitted_at=T0,
+                filled_at=T0 + timedelta(minutes=5),
+            )
+        )
+        monkeypatch.setattr(
+            "engine.trader.fetch_symbol",
+            lambda symbol, start, end, timeframe="1Day": (_bars(base=100.0), SimpleNamespace(api_calls=0)),
+        )
+
+        pos = Position("AAPL", 10, 100.0, 1000.0)
+        snap = _snapshot(
+            positions={"AAPL": pos},
+            open_orders=[],
+        )
+
+        engine._repair_missing_protective_stops(snap)
+
+        rows = engine.trade_logger.read_all()
+        buy_rows = [r for r in rows if r["side"] == "buy" and r["symbol"] == "AAPL"]
+        assert len(buy_rows) == 1
+        assert buy_rows[0]["timestamp"] == (T0 + timedelta(minutes=5)).isoformat()
+        assert buy_rows[0]["entry_timestamp"] == (T0 + timedelta(minutes=5)).isoformat()
+        assert buy_rows[0]["order_id"] == "aapl-entry-1"
 
     def test_sync_managed_stop_legs_rehydrates_managed_equity_stops_only(self, tmp_path):
         """Open broker stop orders are rehydrated into the stream manager from snapshot truth."""
@@ -2722,6 +2788,8 @@ class TestOptionsEngineFixes:
         assert sells[0]["order_id"] == "goog-stop-1"
         assert sells[0]["qty"] == pytest.approx(7.0)
         assert sells[0]["reason"] == "stop_triggered"
+        assert sells[0]["timestamp"] == (T0 + timedelta(minutes=1)).isoformat()
+        assert sells[0]["exit_timestamp"] == (T0 + timedelta(minutes=1)).isoformat()
         assert sells[1]["order_id"] == "goog-dust-close"
         assert sells[1]["qty"] == pytest.approx(0.78)
 

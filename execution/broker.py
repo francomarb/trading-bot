@@ -148,6 +148,8 @@ class OrderResult:
     avg_fill_price: float | None
     raw_status: str | None     # Alpaca's status string (for logging/debug)
     message: str = ""          # human-readable summary or error text
+    submitted_at: datetime | None = None
+    filled_at: datetime | None = None
     # Operator Controls Phase A — immutable lifecycle ID generated at
     # order-build time by `engine.lifecycle.new_position_uid()`. Carried
     # back to the engine so trade-log rows can be tagged with it. Always
@@ -621,6 +623,56 @@ class AlpacaBroker:
 
         candidates.sort(
             key=lambda item: item.filled_at or item.submitted_at or datetime.min.replace(tzinfo=timezone.utc)
+        )
+        return candidates[-1]
+
+    def find_recent_filled_entry_order(
+        self,
+        *,
+        symbol: str,
+        after: datetime | None = None,
+        until: datetime | None = None,
+        limit: int = 500,
+    ) -> ClosedOrderInfo | None:
+        """
+        Return the latest filled BUY entry order for ``symbol`` if one exists.
+
+        Used by recovery paths that reconstruct a missing entry record from an
+        already-open broker position and want the original broker ``filled_at``
+        instead of the later recovery time.
+        """
+        request = GetOrdersRequest(
+            status=QueryOrderStatus.CLOSED,
+            limit=limit,
+            after=after,
+            until=until,
+            symbols=[symbol],
+        )
+        raw = self._with_retry(
+            lambda: self._api.get_orders(request),
+            op_desc=f"get_orders(closed_entry:{symbol})",
+        )
+
+        candidates: list[ClosedOrderInfo] = []
+        for order in raw:
+            info = self._to_closed_order_info(order)
+            if info is None:
+                continue
+            if info.symbol != symbol:
+                continue
+            if info.side is not Side.BUY:
+                continue
+            if info.status is not OrderStatus.FILLED:
+                continue
+            candidates.append(info)
+
+        if not candidates:
+            return None
+
+        candidates.sort(
+            key=lambda item: item.filled_at
+            or item.submitted_at
+            or datetime.min.replace(tzinfo=timezone.utc)
         )
         return candidates[-1]
 
@@ -1586,6 +1638,8 @@ class AlpacaBroker:
             avg_fill_price=avg_price,
             raw_status=event_val,
             message=msg,
+            submitted_at=AlpacaBroker._parse_datetime(getattr(update.order, "submitted_at", None)),
+            filled_at=AlpacaBroker._parse_datetime(getattr(update.order, "filled_at", None)),
         )
 
     def _poll_until_terminal(
@@ -1647,6 +1701,8 @@ class AlpacaBroker:
             avg_fill_price=avg_price,
             raw_status=order.status.value if hasattr(order.status, 'value') else str(order.status),
             message=msg,
+            submitted_at=AlpacaBroker._parse_datetime(getattr(order, "submitted_at", None)),
+            filled_at=AlpacaBroker._parse_datetime(getattr(order, "filled_at", None)),
         )
 
     @staticmethod

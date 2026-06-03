@@ -358,6 +358,7 @@ class TradeLogger:
         modeled_price: float | None = None,
         position_uid: str | None = None,
         record_slippage: bool = True,
+        timestamp_override: datetime | None = None,
     ) -> TradeRecord:
         """
         Build a TradeRecord from a RiskDecision + OrderResult.
@@ -379,6 +380,12 @@ class TradeLogger:
         synthesizing a misleading number from the current bar close (the
         Issue A failure mode that produced QCOM's 1205 bps phantom
         slippage on the May 11 recovery row).
+
+        `timestamp_override` exists for recovery / reconciliation writes.
+        When broker history gives us the original execution time
+        (typically Alpaca ``filled_at``), we should preserve that broker
+        timestamp instead of stamping "time of reconstruction", which would
+        make recovered rows look like after-the-fact fills.
         """
         # Arrival-price slippage is only a meaningful execution-quality
         # signal for MARKET orders. A resting LIMIT fill at $95 against a
@@ -422,7 +429,8 @@ class TradeLogger:
             * float(result.filled_qty or result.requested_qty or 0)
             * multiplier
         )
-        now_iso = datetime.now(timezone.utc).isoformat()
+        timestamp_dt = timestamp_override or datetime.now(timezone.utc)
+        now_iso = timestamp_dt.astimezone(timezone.utc).isoformat()
 
         return TradeRecord(
             timestamp=now_iso,
@@ -844,6 +852,7 @@ class TradeLogger:
         qty: float,
         avg_fill_price: float,
         order_id: str | None = None,
+        timestamp_override: datetime | None = None,
     ) -> None:
         """
         Write a confirmed stop-fill record when the WebSocket stream delivers
@@ -851,12 +860,18 @@ class TradeLogger:
 
         Distinct from log_external_close, which is the fallback for positions
         that disappear without a confirmed fill event.
+
+        `timestamp_override` is used by recovery/reconciliation paths that
+        discover a missed stop fill later from broker history. When broker
+        truth includes the original execution time, prefer that timestamp
+        over the later time we noticed and reconstructed the event.
         """
         context = self._read_latest_open_entry_context(
             symbol=symbol,
             strategy=strategy,
         )
-        now_iso = datetime.now(timezone.utc).isoformat()
+        timestamp_dt = timestamp_override or datetime.now(timezone.utc)
+        now_iso = timestamp_dt.astimezone(timezone.utc).isoformat()
         initial_stop_loss = None
         initial_risk_per_share = None
         initial_risk_dollars = None

@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import json
 import sqlite3
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -19,6 +19,7 @@ from dashboard import (
     compute_rolling_sharpe,
     compute_sleeve_usage,
     compute_strategy_stats,
+    format_local_timestamp,
     format_delta_currency,
     load_engine_state,
     load_trades,
@@ -120,6 +121,20 @@ class TestLoadEngineState:
     def test_missing_file_returns_empty_dict(self, tmp_path):
         result = load_engine_state(str(tmp_path / "nonexistent.json"))
         assert result == {}
+
+
+class TestFormatLocalTimestamp:
+    def test_converts_utc_timestamp_to_requested_local_timezone(self):
+        ts = pd.Timestamp("2026-06-02T18:30:00+00:00")
+        cdt = timezone(timedelta(hours=-5), name="CDT")
+        formatted = format_local_timestamp(ts, target_tz=cdt)
+        assert formatted == "2026-06-02 13:30 CDT"
+
+    def test_treats_naive_timestamp_as_utc(self):
+        naive = datetime(2026, 6, 2, 18, 30)
+        cdt = timezone(timedelta(hours=-5), name="CDT")
+        formatted = format_local_timestamp(naive, target_tz=cdt, include_zone=False)
+        assert formatted == "2026-06-02 13:30"
 
 
 class TestMergeDisplayPositionsDetail:
