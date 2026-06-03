@@ -517,11 +517,25 @@ class TestProcessSymbol:
         positions = {"AAPL": Position("AAPL", 10, 100.0, 1_010.0)}
         snap = _snapshot(positions=positions)
         engine._session_start_equity = snap.account.equity
+        engine._processed_signal_statuses[signal_key] = "No Signal"
+        engine._processed_signal_reasons[signal_key] = ["owner mismatch"]
+        statuses = {"AAPL": "stale"}
+        reasons = {"AAPL": ["stale"]}
 
-        self._process(engine, "AAPL", snap)
+        engine._process_symbol(
+            "AAPL",
+            snap,
+            snap.account,
+            engine.slots[0].strategy,
+            engine.slots[0].timeframe,
+            strategy_statuses=statuses,
+            strategy_reasons=reasons,
+        )
 
         broker.close_position.assert_not_called()
         assert engine._get_owner("AAPL") == "donchian_breakout"
+        assert statuses["AAPL"] == "No Signal"
+        assert reasons["AAPL"] == ["owner mismatch"]
 
     def test_unfilled_single_leg_exit_retains_ownership_for_retry(self, engine_factory):
         engine, broker = engine_factory(

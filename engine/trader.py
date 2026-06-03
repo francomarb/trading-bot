@@ -985,6 +985,7 @@ class TradingEngine:
         self._last_underlying_prices[symbol] = latest_close
 
         if signal_bar_already_processed:
+            processed_owner_conflict = False
             if hasattr(strategy, "evaluate_spread_exit"):
                 self._process_credit_spread_exits(
                     strategy=strategy,
@@ -1008,19 +1009,20 @@ class TradingEngine:
                             if bool(signals.exits.iloc[-1]):
                                 owner = self._get_owner(symbol)
                                 if owner is not None and owner != strategy.name:
-                                    logger.info(
+                                    processed_owner_conflict = True
+                                    logger.debug(
                                         f"[{strategy.name}] {symbol}: processed-bar exit ignored — "
                                         f"position owned by '{owner}'"
                                     )
-                                    return
-                                self._close_single_leg_position(
-                                    symbol=symbol,
-                                    strategy=strategy,
-                                    position=position,
-                                    snapshot=snapshot,
-                                    latest_close=latest_close,
-                                    alert_reason="exit signal",
-                                )
+                                else:
+                                    self._close_single_leg_position(
+                                        symbol=symbol,
+                                        strategy=strategy,
+                                        position=position,
+                                        snapshot=snapshot,
+                                        latest_close=latest_close,
+                                        alert_reason="exit signal",
+                                    )
                         except Exception as e:
                             logger.error(
                                 f"[{strategy.name}] {symbol}: processed-bar exit check failed: {e}"
@@ -1035,6 +1037,8 @@ class TradingEngine:
                 and signal_key in self._processed_signal_reasons
             ):
                 strategy_reasons[symbol] = list(self._processed_signal_reasons[signal_key])
+            if processed_owner_conflict:
+                return
             return
 
         # 4. Signals.
