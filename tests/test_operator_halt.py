@@ -442,7 +442,7 @@ class TestF1CommandsProcessedWhenMarketClosed:
         next poll."""
         from config import settings
         expiry = settings.OPERATOR_COMMAND_EXPIRY_SECONDS
-        cycle = getattr(settings, "CYCLE_INTERVAL_SECONDS", 300)
+        cycle = settings.ENGINE_CYCLE_INTERVAL_SECONDS
         # At minimum 2x cycle interval, providing one missed-cycle buffer.
         assert expiry >= cycle * 2, (
             f"OPERATOR_COMMAND_EXPIRY_SECONDS={expiry} must be >= "
