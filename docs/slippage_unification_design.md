@@ -266,15 +266,6 @@ This is a risk-protection erosion metric, not a broker-quality metric.
 
 For stop orders this is often the operator-facing number that matters most.
 
-### D. Limit surplus / passive fill quality
-
-Question answered:
-
-- "How favorable was the limit fill relative to the submitted limit?"
-
-This is the right place for passive fills that are currently written as
-slippage `NULL`.
-
 ## Proposed Persistence Model
 
 ### Recommendation
@@ -300,11 +291,11 @@ Add these columns:
 - `slippage_measurement_quality TEXT`
 - `slippage_signed_bps REAL`
 - `slippage_adverse_bps REAL`
-- `slippage_expected_bps REAL`
 
 Optional but strongly recommended for stop rows:
 
 - `stop_trigger_price REAL`
+- `current_stop_price REAL`
 
 Column semantics:
 
@@ -313,6 +304,7 @@ Column semantics:
 - `slippage_benchmark_kind`
   - `arrival_midpoint`
   - `decision_price`
+  - `fallback_latest_close`
   - `active_stop_price`
   - `combo_limit`
   - `limit_price`
@@ -328,10 +320,11 @@ Column semantics:
   - positive = adverse, negative = price improvement
 - `slippage_adverse_bps`
   - `max(0, slippage_signed_bps)` for rows where slippage exists
-- `slippage_expected_bps`
-  - currently the modeled bps used by controls, e.g. `5.0` for market orders
 - `stop_trigger_price`
   - the actual active stop threshold that released the stop-market order
+- `current_stop_price`
+  - the latest durable active protective stop for the open position before any
+    stop fill occurs
 
 ### Legacy column treatment
 
@@ -348,7 +341,7 @@ But redefine their role during migration:
   - no longer treated as the slippage benchmark unless the row explicitly says
     `slippage_benchmark_kind='decision_price'`
 - `modeled_slippage_bps`
-  - legacy compatibility mirror of `slippage_expected_bps`
+  - legacy compatibility mirror of the current modeled/control value
 - `realized_slippage_bps`
   - legacy compatibility mirror of `slippage_signed_bps`
 
@@ -374,17 +367,15 @@ Must write:
 - `slippage_measurement_quality='primary'`
 - `slippage_signed_bps`
 - `slippage_adverse_bps`
-- `slippage_expected_bps`
 
 Fallback:
 
-- if arrival midpoint unavailable, either
-  - write no slippage metric at all, or
-  - write `slippage_benchmark_kind='decision_price'` with
-    `slippage_measurement_quality='fallback'`
+- if arrival midpoint unavailable, write:
+  - `slippage_benchmark_kind='fallback_latest_close'`
+  - `slippage_measurement_quality='fallback'`
+  - the signed/adverse values against that fallback benchmark
 
-Preferred default: write the fallback explicitly so the row stays queryable,
-but make it trivially filterable.
+This keeps the row queryable and trivially filterable.
 
 ### 2. Normal single-leg limit entry
 
@@ -413,7 +404,6 @@ Must write:
 - `slippage_measurement_quality='primary'` or `fallback`
 - `slippage_signed_bps`
 - `slippage_adverse_bps`
-- `slippage_expected_bps`
 
 ### 4. WebSocket protective stop fill
 
@@ -424,11 +414,19 @@ Path:
 Must write:
 
 - `stop_trigger_price` = active stop that actually triggered
+- `current_stop_price` must already reflect the active stop from the latest
+  submit/replace path
 - `slippage_benchmark_kind='active_stop_price'`
 - `slippage_measurement_quality='primary'`
 - `slippage_signed_bps` = fill vs active stop
 - `slippage_adverse_bps`
-- `slippage_expected_bps`
+
+Critical implementation rule:
+
+- `log_stop_fill(...)` must read the stop benchmark from `current_stop_price`
+- if `current_stop_price` is unavailable, it may fall back to
+  `initial_stop_loss`
+- that fallback must stay explicit and audit-visible
 
 ### 5. Broker-history recovered stop fill
 
@@ -526,7 +524,6 @@ Must write:
 - `slippage_measurement_quality='primary'`
 - `slippage_signed_bps`
 - `slippage_adverse_bps`
-- `slippage_expected_bps=0.0` unless we later define a modeled combo threshold
 
 Keep the short-leg row as the economic row; long-leg rows should carry `NULL`
 slippage fields rather than structural zeros when possible.
@@ -557,7 +554,6 @@ filterable.
 Persist:
 
 - no `execution_slippage` vs arrival price
-- optional `limit_surplus` vs submitted limit
 - optional `implementation_shortfall` if desired
 
 ### 3. Discretionary market exit
@@ -592,7 +588,6 @@ thing.
 Persist:
 
 - no arrival-price execution slippage
-- optional `limit_surplus`
 
 ### 6. MLEG spread entry/exit
 
@@ -635,9 +630,13 @@ Minimal requirement:
 
 Preferred lightweight implementation:
 
-- extend the existing open-position context logic so stop submit/replace paths
-  update the current active stop reference in a durable way,
-- rather than adding a full new event table immediately.
+- add `current_stop_price` to the existing open-position context in `trades`,
+- update it on every stop submit / replace path:
+  - normal OTO entry stop
+  - fractional standalone stop
+  - repair stop
+  - option trailing stop replace
+- have `log_stop_fill(...)` read this value at fill time
 
 If later audits show we need a complete stop-event ledger, we can add it then.
 It should not be phase 1 of this fix.
@@ -690,6 +689,8 @@ Optionally also add:
   - if we want pure TCA-style reporting
 
 The current ambiguity should be removed.
+To reduce operator churn, phase 1 can keep the legacy label with a caption or
+briefly show both labels during the consumer-migration release.
 
 ## Migration Plan
 
@@ -699,7 +700,9 @@ The current ambiguity should be removed.
 - keep writing legacy slippage columns for backward compatibility
 - start dual-writing:
   - `realized_slippage_bps` mirrors `slippage_signed_bps`
-  - `modeled_slippage_bps` mirrors `slippage_expected_bps`
+  - `modeled_slippage_bps` continues mirroring the current modeled/control value
+- add `current_stop_price` to the durable open-position context and update it
+  on every stop submit / replace path
 
 ### Phase 2 — Consumer migration
 
@@ -710,7 +713,11 @@ The current ambiguity should be removed.
 
 ### Phase 3 — Historical cleanup
 
-- null or annotate known-bad legacy recovery rows
+- null or annotate known-bad legacy recovery rows using a deterministic
+  migration predicate:
+  - `reason LIKE '%recovered entry context%'`
+  - `realized_slippage_bps IS NOT NULL`
+  - `timestamp < '2026-06-02T18:20:37+00:00'` (pre-`32e21c2`)
 - backfill new slippage columns only where the benchmark is provably reconstructable
 - do not force speculative backfills
 
@@ -750,15 +757,11 @@ problem is real, but the smallest solid fix is still enough here.
 
 These should be answered before implementation starts:
 
-1. For market-entry rows where arrival midpoint is unavailable, do we:
-   - write a tagged fallback metric, or
-   - write no execution-slippage metric at all?
-2. Do we want to surface both signed and adverse execution slippage in the
+1. Do we want to surface both signed and adverse execution slippage in the
    dashboard, or keep signed only in the audit views?
-3. For LIMIT orders, do we want a first-class `limit_surplus` metric now, or
-   keep them metric-silent outside realized P&L?
-4. For stop orders, do we accept `stop_gap` first and defer true
-   trigger-time `execution_slippage` until quote-capture support exists?
+2. For stop orders, do we accept `active_stop_price` benchmarking first and
+   defer any separate trigger-time market benchmark until quote-capture support
+   exists?
 
 ## Recommendation Summary
 
