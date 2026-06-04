@@ -357,8 +357,9 @@ def cmd_halt(args: argparse.Namespace) -> int:
     print(f"queued halt: {uid}")
     print(f"reason:      {args.reason}")
     print(
-        "engine will engage the kill switch on its next cycle "
-        f"(~{settings.OPERATOR_COMMAND_EXPIRY_SECONDS}s expiry window)."
+        "engine drains the queue once per cycle (~5 min in Phase A); "
+        f"expiry after {settings.OPERATOR_COMMAND_EXPIRY_SECONDS}s if "
+        "the bot is stalled."
     )
     return 0
 

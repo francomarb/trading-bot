@@ -125,8 +125,12 @@ class TestHaltHandler:
 
 class TestResumeAfterHaltHandler:
     def _setup_resume(self, tmp_path, monkeypatch, *, mode):
+        # halt_reason must match the operator-halt prefix so the F2
+        # safety check in _apply_operator_resume_after_halt allows the
+        # resume to proceed. Non-operator halts (daily_loss etc.) are
+        # tested explicitly in TestF2OperatorResumeScope.
         engine, store, state_path = _build_engine(
-            tmp_path, halted=True, halt_reason="prior"
+            tmp_path, halted=True, halt_reason="operator_halt: prior",
         )
         monkeypatch.setattr(
             "config.settings.OPERATOR_CONTROL_STATE_PATH", state_path
@@ -272,6 +276,178 @@ class TestStickyHaltRestore:
         # Must NOT raise — best-effort restore.
         engine._restore_sticky_halt_state()
         engine.risk._engage_kill_switch.assert_not_called()
+
+
+class TestF2OperatorResumeScope:
+    """PR-2 reviewer finding F2 — resume-after-halt must not erase
+    independent RiskManager halts.
+
+    `RiskManager.reset_kill_switches()` is a global clear. If we
+    permissively resume on any active halt, an operator who issued
+    `resume-after-halt` would silently erase daily-loss / hard-dollar /
+    broker-error / slippage-drift halts that the operator never
+    intended to address.
+    """
+
+    def test_resume_refused_on_non_operator_halt(
+        self, tmp_path, monkeypatch
+    ):
+        engine, store, state_path = _build_engine(
+            tmp_path,
+            halted=True,
+            halt_reason="daily_loss_floor_breach: equity -$2500",
+        )
+        monkeypatch.setattr(
+            "config.settings.OPERATOR_CONTROL_STATE_PATH", state_path
+        )
+        engine.broker.sync_with_broker = MagicMock(return_value=MagicMock())
+        engine._restore_ownership_from_db = MagicMock(return_value=set())
+        engine._reconcile_startup = MagicMock(return_value="NORMAL")
+
+        uid = new_command_uid()
+        store.insert(
+            command_uid=uid, action="resume-after-halt",
+            reason="operator confused state",
+        )
+        engine._process_operator_commands()
+
+        # Kill switch NOT cleared — would erase the daily-loss halt.
+        engine.risk.reset_kill_switches.assert_not_called()
+        # Reconcile not even attempted — refused at the gate.
+        engine.broker.sync_with_broker.assert_not_called()
+
+        row = store.get_by_command_uid(uid)
+        assert row.status == "rejected_validation"
+        result = row.result or {}
+        assert "not an operator halt" in result.get("note", "")
+        assert "daily_loss" in result.get("active_halt_reason", "")
+
+    def test_resume_allowed_on_operator_halt(
+        self, tmp_path, monkeypatch
+    ):
+        engine, store, state_path = _build_engine(
+            tmp_path,
+            halted=True,
+            halt_reason="operator_halt: market event",
+        )
+        monkeypatch.setattr(
+            "config.settings.OPERATOR_CONTROL_STATE_PATH", state_path
+        )
+        engine.broker.sync_with_broker = MagicMock(return_value=MagicMock())
+        engine._restore_ownership_from_db = MagicMock(return_value=set())
+        engine._reconcile_startup = MagicMock(return_value="NORMAL")
+
+        uid = new_command_uid()
+        store.insert(
+            command_uid=uid, action="resume-after-halt",
+            reason="event passed",
+        )
+        engine._process_operator_commands()
+
+        engine.risk.reset_kill_switches.assert_called_once()
+        assert store.get_by_command_uid(uid).status == "succeeded"
+
+    def test_resume_allowed_on_sticky_operator_halt(
+        self, tmp_path, monkeypatch
+    ):
+        engine, store, state_path = _build_engine(
+            tmp_path,
+            halted=True,
+            halt_reason="operator_halt_sticky: from prior session",
+        )
+        monkeypatch.setattr(
+            "config.settings.OPERATOR_CONTROL_STATE_PATH", state_path
+        )
+        engine.broker.sync_with_broker = MagicMock(return_value=MagicMock())
+        engine._restore_ownership_from_db = MagicMock(return_value=set())
+        engine._reconcile_startup = MagicMock(return_value="NORMAL")
+
+        uid = new_command_uid()
+        store.insert(
+            command_uid=uid, action="resume-after-halt",
+            reason="checked state, clear to resume",
+        )
+        engine._process_operator_commands()
+
+        engine.risk.reset_kill_switches.assert_called_once()
+        assert store.get_by_command_uid(uid).status == "succeeded"
+
+
+class TestF3StickyRestoreIndependentOfQueue:
+    """PR-2 reviewer finding F3 — sticky-halt restore must NOT depend
+    on the operator command store being initialized.
+
+    The sticky-halt JSON lives outside the SQLite DB precisely so DB
+    corruption (or migration failure) cannot defeat halt recovery.
+    The restore path only needs the file and the risk manager.
+    """
+
+    def test_restore_works_when_queue_store_is_none(
+        self, tmp_path, monkeypatch
+    ):
+        engine, store, state_path = _build_engine(tmp_path)
+        monkeypatch.setattr(
+            "config.settings.OPERATOR_CONTROL_STATE_PATH", state_path
+        )
+        # Simulate DB-store init failure — sticky restore must still work.
+        engine.operator_command_store = None
+        with open(state_path, "w") as fh:
+            json.dump(
+                {
+                    "halted": True,
+                    "reason": "from prior session (DB unavailable)",
+                    "command_uid": "cmd_" + "0" * 32,
+                },
+                fh,
+            )
+
+        engine._restore_sticky_halt_state()
+
+        # Kill switch engaged despite queue store being unavailable.
+        engine.risk._engage_kill_switch.assert_called_once()
+        engage_arg = engine.risk._engage_kill_switch.call_args.args[0]
+        assert "operator_halt_sticky" in engage_arg
+        assert "DB unavailable" in engage_arg
+
+
+class TestF1CommandsProcessedWhenMarketClosed:
+    """PR-2 reviewer finding F1 — operator commands must be processed
+    even when the market is closed; otherwise after-hours halts can
+    sit until expiry.
+
+    The fix moved `_process_operator_commands` to run BEFORE the
+    market-closed early return in `_run_one_cycle`. This test directly
+    asserts that wiring is in place by exercising the placement in
+    the source file (the cycle method itself is too tightly coupled
+    to broker/snapshot machinery to drive end-to-end in a unit test).
+    """
+
+    def test_command_poll_runs_before_market_open_check(self):
+        import inspect
+        from engine.trader import TradingEngine
+        src = inspect.getsource(TradingEngine._run_one_cycle)
+        # The hook must appear before the `if not market_open:` branch.
+        poll_idx = src.find("self._process_operator_commands()")
+        market_idx = src.find("if not market_open:")
+        assert poll_idx != -1, "operator command poll missing from cycle"
+        assert market_idx != -1, "market_open branch missing from cycle"
+        assert poll_idx < market_idx, (
+            "operator command poll must precede the market-closed early "
+            "return so after-hours halts get picked up immediately"
+        )
+
+    def test_expiry_safely_exceeds_cycle_interval(self):
+        """Expiry must be > cycle interval + jitter so a command
+        queued just after a poll is not rejected_expired before the
+        next poll."""
+        from config import settings
+        expiry = settings.OPERATOR_COMMAND_EXPIRY_SECONDS
+        cycle = getattr(settings, "CYCLE_INTERVAL_SECONDS", 300)
+        # At minimum 2x cycle interval, providing one missed-cycle buffer.
+        assert expiry >= cycle * 2, (
+            f"OPERATOR_COMMAND_EXPIRY_SECONDS={expiry} must be >= "
+            f"2 * cycle interval ({cycle}s) to survive one missed cycle"
+        )
 
 
 class TestUnsupportedActions:

@@ -146,6 +146,24 @@ def _lookback_days(required_bars: int, timeframe: str, config_lookback: int) -> 
     return max(strategy_days, config_lookback)
 
 
+_OPERATOR_HALT_REASON_PREFIXES = ("operator_halt:", "operator_halt_sticky:")
+
+
+def _is_operator_halt_reason(reason: str) -> bool:
+    """Return True when the active RiskManager halt was engaged by an
+    operator command (vs. an independent risk gate).
+
+    Per F2 (PR-2 review): `RiskManager.reset_kill_switches()` is a
+    global clear, so the operator CLI's `resume-after-halt` must
+    refuse unless the halt it would clear is specifically an
+    operator-issued one. The two prefixes here are the exact strings
+    `_apply_operator_halt` and `_restore_sticky_halt_state` write.
+    """
+    if not reason:
+        return False
+    return any(reason.startswith(p) for p in _OPERATOR_HALT_REASON_PREFIXES)
+
+
 def _finite_or_none(value) -> float | None:
     """Return ``float(value)`` when finite and positive, else ``None``.
 
@@ -701,6 +719,16 @@ class TradingEngine:
                 f"slots={len(self.slots)}"
             )
 
+            # Operator Controls Phase A PR-2 — F1 fix.
+            # Drain queued operator commands BEFORE the market-closed
+            # early return so a halt or resume-after-halt issued
+            # outside RTH gets picked up on the very next cycle (not
+            # only when the market reopens). Best-effort: queue I/O
+            # failure logs and never aborts the cycle. Phase B will
+            # add a fast heartbeat thread so the operator does not
+            # have to wait up to one full cycle interval.
+            self._process_operator_commands()
+
             if not market_open:
                 cycle_status = "market_closed"
                 try:
@@ -768,13 +796,9 @@ class TradingEngine:
             self._drain_spread_fills()
             self._sync_option_trailing_stops(snapshot)
             self._repair_missing_protective_stops(snapshot)
-            # Operator Controls Phase A PR-2 — drain queued operator
-            # commands. In Phase A only halt / resume-after-halt are
-            # routed; Phase B/C actions get rejected_unsupported_phase_a
-            # so the operator sees an audited refusal rather than a
-            # silent no-op. Best-effort: a queue I/O failure logs a
-            # warning and never aborts the cycle.
-            self._process_operator_commands()
+            # Operator command poll moved earlier in the cycle so it
+            # runs even when the market is closed — see the F1-fix
+            # block before the `if not market_open` branch.
 
             # Daily-loss / hard-dollar gates can fire on any signal; halt state
             # is sticky until manual reset, so we don't need to short-circuit
@@ -2126,6 +2150,11 @@ class TradingEngine:
             )
 
     # ── Operator Controls Phase A PR-2 — command queue + sticky halt ──
+    # `operator_halt:` / `operator_halt_sticky:` are the two reason
+    # prefixes _apply_operator_halt and _restore_sticky_halt_state set
+    # on the RiskManager. Any other halt reason came from
+    # daily-loss / hard-dollar / broker-error / slippage-drift gates
+    # and must NOT be cleared by an operator resume.
 
     def _restore_sticky_halt_state(self) -> None:
         """Re-engage the kill switch if a halt was active before the
@@ -2139,9 +2168,13 @@ class TradingEngine:
         no halt. This prevents a malformed JSON from locking the bot
         out of startup. The operator can manually re-issue halt via
         the CLI if needed.
+
+        **Intentionally independent of the operator command store.**
+        The sticky-halt JSON lives outside the SQLite DB precisely so
+        DB corruption cannot defeat halt recovery. The only
+        prerequisite is the risk manager — read the file, engage the
+        kill switch, done. (PR-2 reviewer finding F3.)
         """
-        if self.operator_command_store is None:
-            return
         path = settings.OPERATOR_CONTROL_STATE_PATH
         try:
             if not os.path.exists(path):
@@ -2329,6 +2362,15 @@ class TradingEngine:
         On success: clears the kill switch via
         ``RiskManager.reset_kill_switches`` (existing primitive),
         deletes the sticky-halt file, records ``succeeded``.
+
+        **F2 fix:** `RiskManager.reset_kill_switches` is a global
+        clear — it erases daily-loss, hard-dollar, broker-error, and
+        slippage-drift halts in addition to operator halts. We must
+        refuse to resume unless the active halt is specifically an
+        operator halt (reason matching `operator_halt:` or
+        `operator_halt_sticky:`). A non-operator risk halt has its
+        own recovery semantics and must not be cleared by the
+        operator CLI as a side effect of a "resume" command.
         """
         # Refuse if no halt is engaged — the operator may be confused
         # about state. Audit the refusal rather than silently no-op.
@@ -2344,6 +2386,32 @@ class TradingEngine:
             )
             # Clear any stale sticky-halt file defensively.
             self._persist_sticky_halt(halted=False, reason=None, command_uid=None)
+            return
+
+        # F2: refuse to resume if the active halt isn't an operator halt.
+        # `RiskManager.reset_kill_switches` clears every halt cause, so
+        # a permissive resume would silently erase independent risk
+        # gates (daily-loss, hard-dollar, broker-error, slippage-drift)
+        # the operator never intended to touch.
+        current_reason = self.risk.halt_reason() or ""
+        if not _is_operator_halt_reason(current_reason):
+            self.operator_command_store.mark_rejected(
+                command_uid=command.command_uid,
+                status="rejected_validation",
+                result={
+                    "note": (
+                        "active halt is not an operator halt — refusing "
+                        "to resume because RiskManager.reset_kill_switches "
+                        "would also clear independent risk-gate halts"
+                    ),
+                    "active_halt_reason": current_reason,
+                },
+            )
+            logger.warning(
+                f"operator resume-after-halt {command.command_uid[:18]}…: "
+                f"refused — active halt is not an operator halt "
+                f"(reason={current_reason!r})"
+            )
             return
 
         # Re-reconcile against a fresh broker snapshot before clearing.

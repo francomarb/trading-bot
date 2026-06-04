@@ -623,9 +623,18 @@ DASHBOARD_PORT: int = int(os.getenv("DASHBOARD_PORT", "8501"))
 #   current state, so a stale halt or future destructive command should not
 #   auto-fire.
 #
+#   PR-2 reviewer fix F1: in Phase A the engine polls once per main cycle
+#   (every CYCLE_INTERVAL_SECONDS = 300s). The expiry must be safely
+#   greater than one cycle interval plus jitter, otherwise a halt queued
+#   right after a poll will get rejected_expired before the next poll
+#   sees it. 1800s gives the bot up to 5 missed cycles (or a brief
+#   restart) to drain the queue before any operator command auto-expires.
+#   Phase B will add a fast heartbeat (~5s) and this value can drop
+#   back to 180-300s at that point.
+#
 # OPERATOR_COMMAND_HEARTBEAT_SECONDS: target poll cadence for processing the
 #   queue. Defined here for Phase B's fast heartbeat thread; Phase A still
-#   polls once per main engine cycle (5 min), which is fine for halt only.
+#   polls once per main engine cycle (5 min) — see the F1 note above.
 #
 # OPERATOR_CONTROL_STATE_PATH: durable record of sticky halt state. Read at
 #   engine startup so a halt issued before a restart re-engages immediately.
@@ -639,7 +648,7 @@ DASHBOARD_PORT: int = int(os.getenv("DASHBOARD_PORT", "8501"))
 #   `_lifecycle_mark_filled`. Older pending rows are still closed (almost
 #   certainly orphaned from a crashed submit). 5 min is longer than the
 #   longest fill-confirm window (BROKER_ORDER_CONFIRM_WINDOW_SECONDS).
-OPERATOR_COMMAND_EXPIRY_SECONDS: int = 180
+OPERATOR_COMMAND_EXPIRY_SECONDS: int = 1800  # 30 minutes (PR-2 F1 fix)
 OPERATOR_COMMAND_HEARTBEAT_SECONDS: int = 5
 OPERATOR_CONTROL_STATE_PATH: str = "data/operator_control_state.json"
 LIFECYCLE_PENDING_GRACE_SECONDS: int = 300
