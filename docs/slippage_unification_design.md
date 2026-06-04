@@ -291,9 +291,6 @@ Add these columns:
 - `slippage_measurement_quality TEXT`
 - `slippage_signed_bps REAL`
 - `slippage_adverse_bps REAL`
-
-Optional but strongly recommended for stop rows:
-
 - `stop_trigger_price REAL`
 - `current_stop_price REAL`
 
@@ -703,6 +700,10 @@ briefly show both labels during the consumer-migration release.
   - `modeled_slippage_bps` continues mirroring the current modeled/control value
 - add `current_stop_price` to the durable open-position context and update it
   on every stop submit / replace path
+- passive MLEG legs will write `NULL` instead of `0.0`; consumers using
+  `SUM(...)` / `AVG(...)` over legacy slippage columns should be audited.
+  `AVG` over `NULL` is naturally safe, but `SUM` semantics shift and any
+  weighted average that divides by `COUNT(*)` will move.
 
 ### Phase 2 — Consumer migration
 
@@ -718,6 +719,9 @@ briefly show both labels during the consumer-migration release.
   - `reason LIKE '%recovered entry context%'`
   - `realized_slippage_bps IS NOT NULL`
   - `timestamp < '2026-06-02T18:20:37+00:00'` (pre-`32e21c2`)
+- comparison relies on ISO-8601 timestamp ordering; the migration script
+  should verify the stored suffix format matches `TradeRecord.timestamp`
+  before executing the cleanup query.
 - backfill new slippage columns only where the benchmark is provably reconstructable
 - do not force speculative backfills
 
