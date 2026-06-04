@@ -66,7 +66,7 @@ These are the items that must be green before any live flip.
 | Five-sleeve paper GO/NO-GO | The current bot is broader than the old SMA/RSI gate; evidence must cover all active sleeves | Documented GO/NO-GO report covering entries, exits, attribution, startup reconciliation, allocator behavior, health reports |
 | VPS/systemd deployment | Local Mac + tmux is acceptable for paper, not for real capital | VPS provisioned, secrets deployed safely, `systemd` restarts bot on crash/boot, logs are recoverable |
 | Live `.env` hard cap | Launch-only protection against sizing or order-loop bugs | `HARD_DOLLAR_LOSS_CAP` set conservatively for live launch and verified by preflight |
-| Operator controls Phase A (`docs/operator_controls_proposal.md`) | Live trading needs precise, audited operator intervention rather than only the blunt stop/edit/restart options available today | `position_uid` lifecycle identity persisted in SQLite; backfill for open positions; read-only operator CLI + sticky `halt` shipped and verified on paper; restart preserves `position_uid` |
+| Operator controls Phase A (`docs/operator_controls_proposal.md`) | Live trading needs precise, audited operator intervention rather than only the blunt stop/edit/restart options available today | PR-1: `position_uid` lifecycle identity ✅ shipped + baked 4 days; PR-2: `operator_commands` queue + `scripts/operator.py` CLI + sticky halt + gap fixes (entry recovery, reverse-reconcile grace) shipped; ready to bake on paper before destructive controls (Phase C) |
 
 ### P1 — Paper-Watch And Calibration
 
