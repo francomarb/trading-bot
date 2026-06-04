@@ -2309,6 +2309,22 @@ class TradingEngine:
             hard_floor = max(hard_floor, hwm_premium * (1.0 - trail_pct))
         return round(max(hard_floor, 0.01), 2)
 
+    def _recent_option_stop_submit_pending(self, row) -> bool:
+        """True when a just-submitted option stop may not show in snapshots yet."""
+        if row is None or not row.alpaca_stop_order_id:
+            return False
+        if row.stop_order_status not in {"accepted", "new", "pending_new", "open"}:
+            return False
+        try:
+            updated_at = datetime.fromisoformat(row.last_updated_at)
+        except (TypeError, ValueError):
+            return False
+        if updated_at.tzinfo is None:
+            updated_at = updated_at.replace(tzinfo=timezone.utc)
+        age = datetime.now(timezone.utc) - updated_at.astimezone(timezone.utc)
+        retry_grace = max(120.0, float(self.config.cycle_interval_seconds) * 2.0)
+        return 0.0 <= age.total_seconds() <= retry_grace
+
     def _sync_option_trailing_stops(self, snapshot: BrokerSnapshot) -> None:
         """Create/ratchet DAY broker stops for managed single-leg options."""
         if self.option_trailing_store is None:
@@ -2373,6 +2389,28 @@ class TradingEngine:
             )
             qty = abs(float(getattr(position, "qty", 0.0) or 0.0))
             existing = open_stop_by_occ.get(occ)
+            if existing is None and self._recent_option_stop_submit_pending(row):
+                self.option_trailing_store.upsert(
+                    position_uid=lifecycle_row.position_uid,
+                    occ_symbol=occ,
+                    strategy=owner,
+                    owner_key=owner_key,
+                    qty=qty,
+                    entry_premium=entry_premium,
+                    hwm_premium=hwm,
+                    trail_activation_pct=trail_activation_pct,
+                    trail_pct=trail_pct,
+                    current_stop_price=desired_stop,
+                    alpaca_stop_order_id=row.alpaca_stop_order_id,
+                    stop_order_status=row.stop_order_status,
+                    last_observed_premium=current_premium,
+                )
+                logger.debug(
+                    f"[{owner}] {occ}: recently submitted option stop "
+                    f"{row.alpaca_stop_order_id} not present in snapshot yet; "
+                    "skipping duplicate submit"
+                )
+                continue
 
             # If an adequate DAY stop is already open, just persist its identity.
             if existing is not None and (existing.stop_price or 0.0) >= desired_stop:
@@ -2394,6 +2432,9 @@ class TradingEngine:
                 continue
 
             # Replace only when the stop can ratchet upward or no DAY stop exists.
+            # We intentionally cancel first: submitting the replacement before
+            # canceling the old stop could leave two live SELL stops on the same
+            # option contract and oversell if both trigger.
             if existing is not None:
                 self.broker.cancel_order(existing.order_id)
             try:
@@ -2420,7 +2461,7 @@ class TradingEngine:
                     trail_activation_pct=trail_activation_pct,
                     trail_pct=trail_pct,
                     current_stop_price=desired_stop,
-                    alpaca_stop_order_id=existing.order_id if existing else None,
+                    alpaca_stop_order_id=None,
                     stop_order_status="submit_failed",
                     last_observed_premium=current_premium,
                 )
@@ -3119,12 +3160,7 @@ class TradingEngine:
         """
         import re as _re
         fills = self.broker.drain_option_fills()
-        for fill in fills:
-            if len(fill) == 6:
-                decision, status_str, filled_qty, avg_fill_price, order_id, position_uid = fill
-            else:
-                decision, status_str, filled_qty, avg_fill_price, order_id = fill
-                position_uid = None
+        for decision, status_str, filled_qty, avg_fill_price, order_id, position_uid in fills:
             mapped = {"filled": OrderStatus.FILLED, "partially_filled": OrderStatus.PARTIAL}.get(
                 status_str, OrderStatus.CANCELED
             )

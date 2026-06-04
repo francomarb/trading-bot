@@ -2884,11 +2884,12 @@ class TestOptionsEngineFixes:
                     side=Side.BUY,
                 ),
                 "rejected",
-                0.0,
-                None,
-                "opt-spy_options_reversion-abcd1234",
-            )
-        ])
+	                0.0,
+	                None,
+	                "opt-spy_options_reversion-abcd1234",
+	                "pos_rejected",
+	            )
+	        ])
 
         engine._drain_option_fills()
 
@@ -2918,11 +2919,12 @@ class TestOptionsEngineFixes:
                     side=Side.BUY,
                 ),
                 "filled",
-                3.0,
-                12.40,  # actual fill premium
-                "opt-spy_options_reversion-fill",
-            )
-        ])
+	                3.0,
+	                12.40,  # actual fill premium
+	                "opt-spy_options_reversion-fill",
+	                "pos_filled",
+	            )
+	        ])
 
         engine._drain_option_fills()
 
@@ -3601,6 +3603,98 @@ class TestGenericSingleLegOptionTrailingStops:
         row = engine.option_trailing_store.get_by_occ("SPY260618C00746000")
         assert row.hwm_premium == pytest.approx(22.00)
         assert row.current_stop_price == pytest.approx(18.70)
+
+    def test_submit_failure_clears_canceled_order_id(self, tmp_path):
+        engine, broker = self._engine(tmp_path)
+        stale = replace(
+            _open_stop_order("SPY260618C00746000", stop_price=17.14),
+            order_id="old-stop",
+            qty=3,
+        )
+        broker.submit_option_day_stop.side_effect = RuntimeError("api down")
+        snapshot = _snapshot(
+            positions={
+                "SPY260618C00746000": Position(
+                    symbol="SPY260618C00746000",
+                    qty=3,
+                    avg_entry_price=12.77,
+                    market_value=6_600.0,
+                    current_price=22.00,
+                )
+            },
+            open_orders=[stale],
+        )
+
+        engine._sync_option_trailing_stops(snapshot)
+
+        broker.cancel_order.assert_called_once_with("old-stop")
+        row = engine.option_trailing_store.get_by_occ("SPY260618C00746000")
+        assert row.stop_order_status == "submit_failed"
+        assert row.alpaca_stop_order_id is None
+        assert row.current_stop_price == pytest.approx(18.70)
+
+    def test_recent_submit_missing_from_snapshot_does_not_duplicate(self, tmp_path):
+        engine, broker = self._engine(tmp_path)
+        engine.option_trailing_store.upsert(
+            position_uid="pos_abc123",
+            occ_symbol="SPY260618C00746000",
+            strategy="generic_single_leg_options",
+            owner_key="SPY",
+            qty=3,
+            entry_premium=12.77,
+            hwm_premium=20.16,
+            trail_activation_pct=0.10,
+            trail_pct=0.15,
+            current_stop_price=17.14,
+            alpaca_stop_order_id="new-stop",
+            stop_order_status="accepted",
+            last_observed_premium=20.16,
+        )
+        snapshot = _snapshot(
+            positions={
+                "SPY260618C00746000": Position(
+                    symbol="SPY260618C00746000",
+                    qty=3,
+                    avg_entry_price=12.77,
+                    market_value=4_650.0,
+                    current_price=15.50,
+                )
+            },
+            open_orders=[],
+        )
+
+        engine._sync_option_trailing_stops(snapshot)
+
+        broker.submit_option_day_stop.assert_not_called()
+        row = engine.option_trailing_store.get_by_occ("SPY260618C00746000")
+        assert row.alpaca_stop_order_id == "new-stop"
+        assert row.stop_order_status == "accepted"
+
+    def test_external_close_cleans_option_trailing_state(self, tmp_path):
+        engine, _broker = self._engine(tmp_path)
+        engine.config = replace(engine.config, external_close_confirm_cycles=1)
+        engine.option_trailing_store.upsert(
+            position_uid="pos_abc123",
+            occ_symbol="SPY260618C00746000",
+            strategy="generic_single_leg_options",
+            owner_key="SPY",
+            qty=3,
+            entry_premium=12.77,
+            hwm_premium=20.16,
+            trail_activation_pct=0.10,
+            trail_pct=0.15,
+            current_stop_price=17.14,
+            alpaca_stop_order_id="new-stop",
+            stop_order_status="accepted",
+            last_observed_premium=20.16,
+        )
+        engine._lookup_recent_stop_fill = MagicMock(return_value=None)
+        engine.trade_logger.log_external_close = MagicMock()
+        engine.alerts.broker_error = MagicMock()
+
+        engine._detect_external_closes(_snapshot(positions={}))
+
+        assert engine.option_trailing_store.get_by_occ("SPY260618C00746000") is None
 
 
 # ── Shared-symbol conflict rejection (11.7 Part A) ─────────────────────────
