@@ -463,6 +463,91 @@ class TestReads:
         assert sides == {"buy", "sell"}
 
 
+class TestReverseReconcileGrace:
+    """PR-2 Gap 2: pending lifecycle rows younger than
+    `settings.LIFECYCLE_PENDING_GRACE_SECONDS` are skipped by the
+    engine's reverse-reconcile pass (see
+    `engine/trader.py:_reconcile_position_lifecycle`).
+
+    Without this grace, a bot restart mid-submit would mass-close
+    legitimate pending rows as `external_closed` before
+    `_lifecycle_mark_filled` has a chance to transition them.
+
+    The actual reverse-reconcile code lives in trader.py and isn't
+    easily exercised here without the full engine. Instead this test
+    locks in the contract: a fresh pending row's age is < the grace
+    window, and an old pending row's age is > the grace window — so
+    the engine's age-based filter has the data it needs to make the
+    right decision.
+    """
+
+    def test_pending_row_age_is_observable(self, store):
+        """The reverse-pass needs `row.created_at` to compute age.
+        Confirm the store exposes it and that it parses as ISO 8601
+        in UTC, since the engine uses datetime.fromisoformat()."""
+        from datetime import datetime, timezone
+
+        uid = new_position_uid()
+        store.create_pending(
+            position_uid=uid, symbol="NVDA", owner_key="NVDA",
+            strategy="sma_crossover", position_type="single_leg",
+            entry_qty=10.0,
+        )
+        row = store.get_by_position_uid(uid)
+        # Must be ISO 8601 + tz-aware so the engine's
+        # `datetime.fromisoformat(row.created_at)` returns a tz-aware
+        # datetime that can be subtracted from a tz-aware utcnow().
+        parsed = datetime.fromisoformat(row.created_at)
+        assert parsed.tzinfo is not None
+        assert (datetime.now(timezone.utc) - parsed).total_seconds() < 60
+
+    def test_grace_constant_present_and_sensible(self):
+        """`LIFECYCLE_PENDING_GRACE_SECONDS` must exist in settings
+        and be larger than the broker order confirm window so a
+        legitimate in-flight entry has time to land on the broker
+        side before reverse-reconcile considers it orphaned."""
+        from config import settings
+        assert hasattr(settings, "LIFECYCLE_PENDING_GRACE_SECONDS")
+        grace = settings.LIFECYCLE_PENDING_GRACE_SECONDS
+        assert isinstance(grace, int)
+        assert grace >= 60  # at least a minute
+        confirm = getattr(settings, "BROKER_ORDER_CONFIRM_WINDOW_SECONDS", 0)
+        if confirm:
+            assert grace > confirm, (
+                "pending grace must exceed broker order confirm window — "
+                "otherwise the reverse pass can close an in-flight entry "
+                "before _lifecycle_mark_filled gets a chance to transition it"
+            )
+
+    def test_old_pending_row_qualifies_for_close(self, store):
+        """An old pending row (older than the grace window) is the
+        case the reverse-pass IS supposed to close. Verify the row
+        is reachable via `get_open()` so the pass can find it."""
+        from datetime import datetime, timedelta, timezone
+
+        old_uid = new_position_uid()
+        old_iso = (datetime.now(timezone.utc) - timedelta(hours=2)).isoformat()
+        store._conn.execute(
+            "INSERT INTO position_lifecycle ("
+            "schema_version, position_uid, created_at, symbol, owner_key, "
+            "strategy, position_type, status, entry_qty, current_qty, "
+            "avg_entry_price, net_realized_pnl"
+            ") VALUES (1, ?, ?, ?, ?, ?, ?, 'pending', ?, ?, ?, 0.0)",
+            (old_uid, old_iso, "NVDA", "NVDA", "sma_crossover",
+             "single_leg", 10.0, 0.0, None),
+        )
+        store._conn.commit()
+
+        open_rows = store.get_open()
+        uids = {r.position_uid for r in open_rows}
+        assert old_uid in uids
+        # The row's age confirms it would be closed by the engine's
+        # reverse pass (grace_seconds defaults to 300).
+        from datetime import datetime as dt2
+        age = (dt2.now(timezone.utc) - dt2.fromisoformat(old_iso)).total_seconds()
+        assert age > 300
+
+
 class TestValidatorsAndInvariants:
     def test_all_valid_statuses_are_known(self):
         """Documentation invariant — keeps the enum and the docstring

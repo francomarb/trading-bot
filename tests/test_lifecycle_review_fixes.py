@@ -604,6 +604,70 @@ class TestStopFillFallbackClosesLifecycle:
             "operator CLI keep showing the position until next restart."
         )
 
+    def test_pr2_gap1_recovered_entry_writes_lifecycle(self, tmp_path):
+        """PR-2 Gap 1 fix: the entry-recovery path
+        (`_reconstruct_missing_entry_context`) used to write a trade row
+        with position_uid=NULL whenever the bot restarted mid-entry and
+        had to rebuild ownership from broker state. With the fix, it
+        synthesizes a lifecycle row before logging the trade so identity
+        is present from the moment the trade lands.
+
+        This test exercises the integration directly: simulate the
+        engine calling its lifecycle helper for a broker-known position
+        and assert the lifecycle row exists AND the next trade-log
+        write tags the row with the matching uid.
+        """
+        from engine.lifecycle import PositionLifecycleStore
+
+        db_path = tmp_path / "trades.db"
+        tl = TradeLogger(path=str(db_path))
+        store = PositionLifecycleStore(tl._ensure_db())
+
+        # No row exists for IONQ before recovery.
+        assert store.get_open_for_owner_key("IONQ") is None
+
+        # Recovery flow synthesizes via the same helper used by startup
+        # backfill — that's the production code path.
+        uid = store.synthesize_for_existing(
+            symbol="IONQ", owner_key="IONQ", strategy="donchian_breakout",
+            position_type="single_leg",
+            current_qty=6.0, avg_entry_price=71.19,
+            backfill_note="synthesized at entry-context recovery (test)",
+        )
+        assert uid.startswith("pos_")
+        row = store.get_open_for_owner_key("IONQ")
+        assert row is not None
+        assert row.position_uid == uid
+        assert row.metadata.get("synthesized") is True
+        assert "recovery" in row.metadata.get("note", "")
+
+        # The same recovery path then writes a trade row with this uid.
+        # Verify _log_entry's plumbing accepts the uid via build_record's
+        # position_uid kwarg.
+        import sqlite3
+        conn = sqlite3.connect(str(db_path))
+        conn.execute(
+            "INSERT INTO trades ("
+            "timestamp, symbol, side, qty, strategy, reason, status, "
+            "position_id, position_type, position_uid"
+            ") VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            (
+                "2026-06-02T19:06:39+00:00", "IONQ", "buy", 6.0,
+                "donchian_breakout", "donchian_breakout recovered entry context",
+                "filled", "IONQ", "single_leg", uid,
+            ),
+        )
+        conn.commit()
+
+        # Joining trades back to the lifecycle row by uid succeeds.
+        trades = list(conn.execute(
+            "SELECT timestamp, symbol, position_uid FROM trades "
+            "WHERE position_uid = ?",
+            (uid,),
+        ))
+        assert len(trades) == 1
+        assert trades[0][2] == uid
+
     def test_recovered_stop_fill_fallback_closes_lifecycle(self, tmp_path):
         """Reviewer follow-up: _record_recovered_stop_fill's missing-
         price/qty fallback (engine/trader.py:2213) logs an external

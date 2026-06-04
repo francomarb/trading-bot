@@ -612,3 +612,34 @@ TELEGRAM_COMMANDS_ENABLED: bool = (
 # The Streamlit dashboard reads this file to show live bot status.
 STATE_SNAPSHOT_PATH: str = "data/engine_state.json"
 DASHBOARD_PORT: int = int(os.getenv("DASHBOARD_PORT", "8501"))
+
+# ── Operator controls (Phase A — PR-2) ──────────────────────────────────────
+# Operator command queue + sticky halt. See docs/operator_controls_proposal.md
+# §13 Phase A and the operator-controls implementation plan.
+#
+# OPERATOR_COMMAND_EXPIRY_SECONDS: how old a `pending` operator command may
+#   be before the engine rejects it on pickup with status='rejected_expired'.
+#   Defensive: an old command is operator intent that may no longer match
+#   current state, so a stale halt or future destructive command should not
+#   auto-fire.
+#
+# OPERATOR_COMMAND_HEARTBEAT_SECONDS: target poll cadence for processing the
+#   queue. Defined here for Phase B's fast heartbeat thread; Phase A still
+#   polls once per main engine cycle (5 min), which is fine for halt only.
+#
+# OPERATOR_CONTROL_STATE_PATH: durable record of sticky halt state. Read at
+#   engine startup so a halt issued before a restart re-engages immediately.
+#   Lives outside the SQLite DB so corruption in one file does not lock out
+#   the other.
+#
+# LIFECYCLE_PENDING_GRACE_SECONDS: PR-2 gap 2 fix. The reverse-reconcile
+#   pass of `_reconcile_position_lifecycle` skips `pending` lifecycle rows
+#   younger than this — gives an in-flight entry submitted just before a
+#   bot restart time to either confirm at the broker or transition via
+#   `_lifecycle_mark_filled`. Older pending rows are still closed (almost
+#   certainly orphaned from a crashed submit). 5 min is longer than the
+#   longest fill-confirm window (BROKER_ORDER_CONFIRM_WINDOW_SECONDS).
+OPERATOR_COMMAND_EXPIRY_SECONDS: int = 180
+OPERATOR_COMMAND_HEARTBEAT_SECONDS: int = 5
+OPERATOR_CONTROL_STATE_PATH: str = "data/operator_control_state.json"
+LIFECYCLE_PENDING_GRACE_SECONDS: int = 300

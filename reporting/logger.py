@@ -348,6 +348,16 @@ class TradeLogger:
         self._conn.execute(_CREATE_OPTION_TRAILING_STOPS_SQL)
         for index_sql in _OPTION_TRAILING_STOPS_INDEXES_SQL:
             self._conn.execute(index_sql)
+        # Operator Controls Phase A PR-2 — operator_commands queue.
+        # Same migration scaffolding; local import keeps
+        # engine.operator_queue independently importable.
+        from engine.operator_queue import (
+            _CREATE_OPERATOR_COMMANDS_SQL,
+            _CREATE_OPERATOR_COMMANDS_INDEXES_SQL,
+        )
+        self._conn.execute(_CREATE_OPERATOR_COMMANDS_SQL)
+        for index_sql in _CREATE_OPERATOR_COMMANDS_INDEXES_SQL:
+            self._conn.execute(index_sql)
         self._conn.commit()
         return self._conn
 

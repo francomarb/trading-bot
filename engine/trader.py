@@ -292,6 +292,18 @@ class TradingEngine:
         except Exception as exc:
             logger.warning(f"option trailing store init skipped: {exc}")
             self.option_trailing_store = None
+        # Operator Controls Phase A PR-2 — operator command queue store.
+        # Same DB connection as the lifecycle store. Used by per-cycle
+        # `_process_operator_commands()` to drain queued halt /
+        # resume-after-halt commands written by `scripts/operator.py`.
+        try:
+            from engine.operator_queue import OperatorCommandStore
+            self.operator_command_store = OperatorCommandStore(
+                self.trade_logger._ensure_db()
+            )
+        except Exception as exc:
+            logger.warning(f"operator command store init skipped: {exc}")
+            self.operator_command_store = None
         self.pnl_tracker = pnl_tracker or PnLTracker()
         self.alerts = alerts or AlertDispatcher()
         self._stream_manager = stream_manager
@@ -582,6 +594,13 @@ class TradingEngine:
         # closes, etc.). Best-effort: never raises into the cycle path.
         self._reconcile_position_lifecycle(startup_snapshot)
 
+        # Operator Controls Phase A PR-2 — restore sticky halt from disk.
+        # If a halt was engaged before the previous shutdown, re-engage
+        # the kill switch immediately so the first cycle blocks entries.
+        # Persisted state lives outside the SQLite DB so corruption in
+        # one file does not lock out the other.
+        self._restore_sticky_halt_state()
+
         self._sync_managed_stop_legs(startup_snapshot)
         self._sync_option_trailing_stops(startup_snapshot)
         self._repair_missing_protective_stops(startup_snapshot)
@@ -749,6 +768,13 @@ class TradingEngine:
             self._drain_spread_fills()
             self._sync_option_trailing_stops(snapshot)
             self._repair_missing_protective_stops(snapshot)
+            # Operator Controls Phase A PR-2 — drain queued operator
+            # commands. In Phase A only halt / resume-after-halt are
+            # routed; Phase B/C actions get rejected_unsupported_phase_a
+            # so the operator sees an audited refusal rather than a
+            # silent no-op. Best-effort: a queue I/O failure logs a
+            # warning and never aborts the cycle.
+            self._process_operator_commands()
 
             # Daily-loss / hard-dollar gates can fire on any signal; halt state
             # is sticky until manual reset, so we don't need to short-circuit
@@ -2099,6 +2125,284 @@ class TradingEngine:
                 f"lifecycle close failed for {owner_key}: {exc}"
             )
 
+    # ── Operator Controls Phase A PR-2 — command queue + sticky halt ──
+
+    def _restore_sticky_halt_state(self) -> None:
+        """Re-engage the kill switch if a halt was active before the
+        previous shutdown.
+
+        Reads ``settings.OPERATOR_CONTROL_STATE_PATH``. The file is
+        written by `_persist_sticky_halt` whenever the operator queue
+        engages or clears a halt. Absent file → no halt (normal startup).
+
+        Best-effort: file-format errors log a warning and continue with
+        no halt. This prevents a malformed JSON from locking the bot
+        out of startup. The operator can manually re-issue halt via
+        the CLI if needed.
+        """
+        if self.operator_command_store is None:
+            return
+        path = settings.OPERATOR_CONTROL_STATE_PATH
+        try:
+            if not os.path.exists(path):
+                return
+            with open(path, "r") as fh:
+                state = json.load(fh)
+            if not isinstance(state, dict) or not state.get("halted"):
+                return
+            reason = str(state.get("reason") or "sticky halt from prior session")
+            command_uid = state.get("command_uid")
+            note = f"operator_halt_sticky: {reason}"
+            if command_uid:
+                note = f"{note} (cmd={command_uid[:18]}…)"
+            # Engage the existing kill switch. The risk manager owns
+            # the halt state machine — we add no new state machine here.
+            try:
+                self.risk._engage_kill_switch(note)
+            except Exception as exc:
+                logger.warning(
+                    f"sticky halt restore: kill switch engage failed: {exc}"
+                )
+                return
+            logger.warning(
+                f"sticky halt restored from {path}: {reason}"
+            )
+        except Exception as exc:
+            logger.warning(
+                f"sticky halt restore skipped (path={path}): {exc}"
+            )
+
+    def _persist_sticky_halt(
+        self,
+        *,
+        halted: bool,
+        reason: str | None,
+        command_uid: str | None,
+    ) -> None:
+        """Write the sticky halt state to disk via atomic rename."""
+        path = settings.OPERATOR_CONTROL_STATE_PATH
+        parent = os.path.dirname(path)
+        if parent:
+            try:
+                os.makedirs(parent, exist_ok=True)
+            except Exception as exc:
+                logger.warning(
+                    f"sticky halt persist: makedirs failed: {exc}"
+                )
+                return
+        try:
+            if halted:
+                payload = {
+                    "halted": True,
+                    "reason": reason or "",
+                    "command_uid": command_uid,
+                    "set_at": datetime.now(timezone.utc).isoformat(),
+                }
+                tmp = path + ".tmp"
+                with open(tmp, "w") as fh:
+                    json.dump(payload, fh, indent=2)
+                os.replace(tmp, path)
+            else:
+                # Clear: remove the file.
+                if os.path.exists(path):
+                    os.remove(path)
+        except Exception as exc:
+            logger.warning(f"sticky halt persist failed: {exc}")
+
+    def _process_operator_commands(self) -> None:
+        """Drain one queued operator command per cycle.
+
+        Phase A routes only ``halt`` and ``resume-after-halt``. Every
+        other action is terminated with
+        ``status='rejected_unsupported_phase_a'`` so the operator sees
+        an audited refusal rather than a silent no-op.
+
+        Best-effort: a queue I/O failure logs a warning and never
+        aborts the cycle. Same discipline as
+        ``_reconcile_position_lifecycle`` and the trade-log paths.
+        """
+        if self.operator_command_store is None:
+            return
+        try:
+            claimed = self.operator_command_store.claim_next_pending(
+                expiry_seconds=settings.OPERATOR_COMMAND_EXPIRY_SECONDS,
+            )
+        except Exception as exc:
+            logger.warning(f"operator queue: claim failed: {exc}")
+            return
+        if claimed is None:
+            return
+
+        logger.info(
+            f"operator command: action={claimed.action} "
+            f"cmd={claimed.command_uid[:18]}… by={claimed.requested_by} "
+            f"reason={claimed.reason!r}"
+        )
+
+        try:
+            if claimed.action == "halt":
+                self._apply_operator_halt(claimed)
+            elif claimed.action == "resume-after-halt":
+                self._apply_operator_resume_after_halt(claimed)
+            else:
+                # Defensive — claim_next_pending only returns rows
+                # written via insert(), which validates against
+                # VALID_ACTIONS. But Phase B/C may extend the table;
+                # be explicit until those handlers exist.
+                self.operator_command_store.mark_rejected(
+                    command_uid=claimed.command_uid,
+                    status="rejected_unsupported_phase_a",
+                    result={
+                        "note": f"action {claimed.action!r} not implemented in Phase A",
+                    },
+                )
+                logger.warning(
+                    f"operator command {claimed.command_uid[:18]}…: "
+                    f"action {claimed.action!r} not supported in Phase A"
+                )
+        except Exception as exc:
+            logger.error(
+                f"operator command {claimed.command_uid[:18]}…: "
+                f"handler raised: {exc}"
+            )
+            try:
+                self.operator_command_store.mark_failed(
+                    command_uid=claimed.command_uid,
+                    result={"error": str(exc)},
+                )
+            except Exception as inner:
+                logger.warning(
+                    f"operator command failed-mark also failed: {inner}"
+                )
+
+    def _apply_operator_halt(self, command) -> None:
+        """Handle the ``halt`` operator command.
+
+        Engages the existing kill switch via
+        ``RiskManager._engage_kill_switch`` (no new halt state
+        machine). Persists the sticky-halt JSON so the next restart
+        re-engages immediately. Records ``succeeded`` with the
+        engaged-state result.
+        """
+        prior_halted = bool(self.risk.is_halted())
+        prior_reason = self.risk.halt_reason()
+        note = f"operator_halt: {command.reason}"
+        try:
+            self.risk._engage_kill_switch(note)
+        except Exception as exc:
+            self.operator_command_store.mark_failed(
+                command_uid=command.command_uid,
+                result={"error": f"kill switch engage failed: {exc}"},
+            )
+            return
+        self._persist_sticky_halt(
+            halted=True,
+            reason=command.reason,
+            command_uid=command.command_uid,
+        )
+        try:
+            self.alerts.engine_halt(
+                f"operator halt: {command.reason} "
+                f"(cmd={command.command_uid[:18]}…)"
+            )
+        except Exception as exc:
+            logger.warning(f"operator halt alert failed: {exc}")
+        self.operator_command_store.mark_succeeded(
+            command_uid=command.command_uid,
+            result={
+                "halted": True,
+                "prior_halted": prior_halted,
+                "prior_reason": prior_reason,
+            },
+        )
+        logger.warning(f"engine halted by operator: {command.reason}")
+
+    def _apply_operator_resume_after_halt(self, command) -> None:
+        """Handle the ``resume-after-halt`` operator command.
+
+        Per proposal §5.4 the resume path requires reconciliation
+        before clearing the halt — we re-run the existing
+        ``_reconcile_startup`` against a fresh snapshot. On
+        RESTRICTED, the resume is refused and the operator is told to
+        re-check state before re-issuing.
+
+        On success: clears the kill switch via
+        ``RiskManager.reset_kill_switches`` (existing primitive),
+        deletes the sticky-halt file, records ``succeeded``.
+        """
+        # Refuse if no halt is engaged — the operator may be confused
+        # about state. Audit the refusal rather than silently no-op.
+        if not self.risk.is_halted():
+            self.operator_command_store.mark_rejected(
+                command_uid=command.command_uid,
+                status="rejected_validation",
+                result={"note": "no active halt to resume"},
+            )
+            logger.info(
+                f"operator resume-after-halt {command.command_uid[:18]}…: "
+                "no active halt"
+            )
+            # Clear any stale sticky-halt file defensively.
+            self._persist_sticky_halt(halted=False, reason=None, command_uid=None)
+            return
+
+        # Re-reconcile against a fresh broker snapshot before clearing.
+        try:
+            snapshot = self.broker.sync_with_broker(
+                session_start_equity=self._session_start_equity
+            )
+        except Exception as exc:
+            self.operator_command_store.mark_failed(
+                command_uid=command.command_uid,
+                result={"error": f"sync_with_broker failed: {exc}"},
+            )
+            return
+        try:
+            conflict_symbols = self._restore_ownership_from_db(snapshot)
+            mode = self._reconcile_startup(snapshot, conflict_symbols)
+        except Exception as exc:
+            self.operator_command_store.mark_failed(
+                command_uid=command.command_uid,
+                result={"error": f"reconcile failed: {exc}"},
+            )
+            return
+        if mode != "NORMAL":
+            self.operator_command_store.mark_rejected(
+                command_uid=command.command_uid,
+                status="rejected_validation",
+                result={
+                    "note": "reconciliation did not yield NORMAL mode",
+                    "mode": mode,
+                },
+            )
+            logger.warning(
+                f"operator resume-after-halt {command.command_uid[:18]}…: "
+                f"refused — reconcile mode={mode}"
+            )
+            return
+
+        try:
+            self.risk.reset_kill_switches()
+        except Exception as exc:
+            self.operator_command_store.mark_failed(
+                command_uid=command.command_uid,
+                result={"error": f"reset_kill_switches failed: {exc}"},
+            )
+            return
+        self._persist_sticky_halt(halted=False, reason=None, command_uid=None)
+        try:
+            self.alerts.engine_halt(
+                f"operator resume-after-halt: {command.reason} "
+                f"(cmd={command.command_uid[:18]}…) — kill switch cleared"
+            )
+        except Exception as exc:
+            logger.warning(f"operator resume alert failed: {exc}")
+        self.operator_command_store.mark_succeeded(
+            command_uid=command.command_uid,
+            result={"halted": False, "reconcile_mode": mode},
+        )
+        logger.info(f"engine resumed by operator: {command.reason}")
+
     def _close_fractional_residual_position(
         self,
         *,
@@ -2813,6 +3117,45 @@ class TradingEngine:
         recovered_timestamp = None
         if recovered_fill is not None:
             recovered_timestamp = recovered_fill.filled_at or recovered_fill.submitted_at
+
+        # Operator Controls Phase A PR-2 — Gap 1 fix.
+        # The recovery path reconstructs a position the engine
+        # already missed; without this hook the trade-log row
+        # lands with position_uid=NULL until the next startup
+        # backfill rescues it. Synthesize the lifecycle row now
+        # so the operator CLI sees identity right away and so
+        # downstream subsystems (option_trailing) can key off
+        # position_uid for this recovered position.
+        # synthesize_for_existing is idempotent: if a row already
+        # exists for the owner_key, it returns that uid unchanged.
+        if self.lifecycle_store is not None:
+            try:
+                owner_key_val = owner_key_for(symbol)
+                recovered_uid = self.lifecycle_store.synthesize_for_existing(
+                    symbol=symbol,
+                    owner_key=owner_key_val,
+                    strategy=owner,
+                    position_type="single_leg",
+                    current_qty=float(position.qty),
+                    avg_entry_price=entry_price,
+                    first_fill_at=(
+                        recovered_timestamp.isoformat()
+                        if recovered_timestamp is not None
+                        else None
+                    ),
+                    backfill_note=(
+                        "synthesized at entry-context recovery "
+                        f"from broker position (qty={float(position.qty)})"
+                    ),
+                )
+                recovered_result = replace(
+                    recovered_result,
+                    position_uid=recovered_uid,
+                )
+            except Exception as exc:
+                logger.warning(
+                    f"{symbol}: recovery lifecycle synthesis failed: {exc}"
+                )
 
         self._log_entry(
             recovered_decision,
@@ -4413,14 +4756,39 @@ class TradingEngine:
         try:
             # Reverse pass — close any lifecycle row whose owner_key is
             # no longer at the broker.
+            #
+            # PR-2 gap 2 fix: pending rows younger than
+            # LIFECYCLE_PENDING_GRACE_SECONDS are skipped — they may
+            # represent an in-flight entry whose broker confirmation
+            # hasn't landed yet. Without this grace, a bot restart
+            # mid-submit would mass-close legitimate pending rows as
+            # external_closed before _lifecycle_mark_filled gets a
+            # chance to transition them.
             broker_owners = {
                 owner_key_for(s) for s in snapshot.account.open_positions
             }
+            grace_seconds = int(settings.LIFECYCLE_PENDING_GRACE_SECONDS)
+            now_utc = datetime.now(timezone.utc)
             for row in self.lifecycle_store.get_open():
                 if row.position_type != "single_leg":
                     continue
                 if row.owner_key in broker_owners:
                     continue
+                if row.status == "pending":
+                    try:
+                        created = datetime.fromisoformat(row.created_at)
+                    except (ValueError, TypeError):
+                        created = None
+                    if (
+                        created is not None
+                        and (now_utc - created).total_seconds() < grace_seconds
+                    ):
+                        logger.debug(
+                            f"lifecycle: skipping pending row "
+                            f"{row.position_uid[:18]}… ({row.owner_key}) "
+                            f"within {grace_seconds}s grace window"
+                        )
+                        continue
                 self.lifecycle_store.mark_closed(
                     position_uid=row.position_uid,
                     external=True,
