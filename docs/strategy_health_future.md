@@ -26,6 +26,8 @@
 | F12 | Machine-readable JSON twin of weekly report | A consumer exists (11.9 dynamic allocation, external dashboard) | §F12 |
 | F13 | `reduce size` auto-throttle mechanic | Silent-killer alarm fires too late under pure-advisory AND capital bleeds noticeably between alarm and operator response | §F13 |
 | F14 | Intraday excursion capture for true MAE/MFE | Bar-resolution MAE/MFE shown diagnostically insufficient | §F14 |
+| F15 | **Mark-to-Market block on EdgeReport** (per-strategy unrealized P&L + open-position runner context) | Operator-priority gap: closed-trade-only view under-represents runner-friendly strategies (Donchian, SMA) during runner periods, producing reports that look bad while the sleeve carries large unrealized winners. Surfaced 2026-06 after May report read R=-0.84 on donchian while open positions held +$15k+ unrealized. | §F15 |
+| F16 | **Total-P&L-aware recommendation prose** (closed-trade R-expectancy negative + total P&L positive must not say "pause and investigate") | Operator stance: profitability including unrealized is the bottom-line gate; closed-trade metrics are diagnostic. The §11.5 decision matrix currently recommends "pause and investigate" on Edge NEGATIVE regardless of mark-to-market context. | §F16 |
 
 ---
 
@@ -311,6 +313,71 @@ class HealthCheck(Protocol):
 
 ---
 
+## §F15 — Mark-to-Market block on EdgeReport
+
+**v1 baseline:** the EdgeReport markdown per-strategy section shows realized P&L (window), R-expectancy with bootstrap CI, dollar expectancy, win rate, profit factor, sleeve utilization, benchmark return, strategy return, alpha — **all computed from closed trades only**. Open positions are invisible to the report; a reader of the markdown alone cannot tell whether a sleeve with `R = -0.84 / 0% WR / DEGRADED` is actually losing money or is a runner-friendly trend strategy mid-runner with $15k+ unrealized winners that will eventually crystallize.
+
+**Concrete example (2026-06):**
+- donchian_breakout May monthly: realized -$998, R=-0.843, win rate 0%, alpha vs benchmark -28.7%.
+- Same sleeve's open positions at month-end: AMD +$1,857 (+46%), CIEN +$752 (+19%), AVGO +$512 (+17%), AAPL +$469 (+12%), QCOM +$170 (+5%), SMCI +$27 (+6%), AMZN -$186 (-5%). **Aggregate unrealized: +$3,601.**
+- True May contribution including the open winners is **+$2,603**, not -$998. The report as written tells the wrong story.
+
+**Future addition:** add a "Mark-to-Market (advisory)" block to each per-strategy section of the weekly + monthly markdown. Fields:
+
+| Metric | Source |
+|---|---|
+| Realized P&L (window) | existing — duplicated here for adjacency |
+| Open positions count + list of symbols | `engine_state.json::positions_detail` filtered by `strategy_name` |
+| Unrealized P&L | `(current_price - avg_entry_price) × qty × multiplier` per position, summed |
+| Total P&L (realized + unrealized) | sum of the above |
+| Top open winner / loser | for context |
+| Runner-bias note | when total P&L > 0 but closed-trade R-expectancy < 0: render an explicit note that closed-trade R under-represents this strategy during a runner period (trend strategies' losers-cut / winners-trend asymmetry) |
+
+**Why deferred to follow-up vs. v1:** v1's design §5.1 made R-multiple primacy the verdict input; mark-to-market is a different epistemic category (point-in-time snapshot, not a sample distribution) and didn't fit the verdict math. Adding it as a separate *advisory* block (no verdict role) is the right shape — keeps the closed-trade verdict math intact while addressing the operator-facing reporting gap.
+
+**Why deferred vs. pre-emptively building:** the gap only became operator-visible when actual runner periods produced reports that mismatched operator intuition. Pre-merge there was no concrete example to ground the field choices against. The 2026-06 May report is now that example.
+
+**Trigger to build:** any time after v1 ships AND a runner-period report misreads the sleeve. The 2026-06 trigger has fired. Reasonable to bundle into the 11.10h tuning PR.
+
+**Data source contract:** `engine_state.json::positions_detail` is the canonical snapshot the engine writes per cycle. It already carries `avg_entry_price`, `current_price`, `qty`, `multiplier`, `strategy_name` (or `strategy` / `owner` fallback). No engine code change needed — pure read-side enhancement to the reviewer.
+
+**Risks / design notes:**
+- Options positions need `multiplier=100` (the existing `engine_state.json` field may not always set this for options — confirm during build).
+- Spreads have `realized_pnl` rolled in at close; mark-to-market for an open spread requires the leg current prices. v1 punt: show "spread open, MTM unavailable" rather than synthesize.
+- Mark-to-market is a snapshot at report-generation time, not the window's average. Document this in the block header so operator doesn't read it as a window-aggregated number.
+
+---
+
+## §F16 — Total-P&L-aware recommendation prose
+
+**v1 baseline:** the §11.5 recommendation matrix maps `(EdgeVerdict, HealthStatus)` pairs to four prose recommendations: `continue` / `continue and monitor` / `reduce size` / `pause and investigate`. The mapping is computed purely from closed-trade math + Health forensics; it does not know about mark-to-market.
+
+**Concrete failure mode:** a runner-friendly trend strategy with closed-trade R-expectancy going negative during a runner period (because losers cut early and the winners haven't closed yet) currently produces `Edge NEGATIVE → pause and investigate`. That recommendation is operator-misleading when the sleeve's total P&L (realized + unrealized) is positive — the strategy is making money, not losing it. The bot's §1.2 invariant prevents the recommendation from being *acted on* automatically, but operator-facing prose still says "pause" when the right read is "continue."
+
+**Future addition:** extend the §11.5 mapping to take mark-to-market context as a third input. Proposed logic:
+
+```
+if Edge.verdict == NEGATIVE:
+    if mark_to_market.total_pnl > 0:
+        recommendation = "continue and monitor — closed-trade verdict negative
+                          but total P&L (realized + unrealized) positive; runner
+                          bias likely. Manual review before any sizing change."
+        alert_severity = WARN  # demoted from CRITICAL
+    else:
+        recommendation = "pause and investigate"  # current behaviour
+        alert_severity = CRITICAL
+```
+
+Symmetrically, a sleeve with closed-trade R positive but total P&L negative (degenerate but possible — many small wins masking a large open loser) should escalate the recommendation, not soften it.
+
+**Why deferred to follow-up:** v1's §1.2 invariant already prevents auto-action, so the failure mode is operator-prose-only, not operator-action. The downside of carrying it into v1 was that the change requires the §F15 Mark-to-Market block to be in place first — the mapping can't reference data the report doesn't have.
+
+**Trigger to build:** §F15 ships AND a NEGATIVE verdict fires on a sleeve whose total P&L is positive. Likely concurrent with §F15 unless §F15 ships first and observes that the prose actually does land in operator-actionable form before being formally rewired.
+
+**Open question (blocks build):** does "total P&L positive" need a magnitude qualifier? A sleeve with realized -$10k + unrealized +$0.50 should probably not get the softer recommendation. Threshold candidates: `unrealized > |realized|`, or `total_pnl > k × sleeve_drawdown_floor`, or operator-set magnitude. Resolve when actually building.
+
+---
+
 ## Open questions (follow-up only)
 
 These block their respective sub-items, not v1:
@@ -327,6 +394,8 @@ These block their respective sub-items, not v1:
 - **`HealthThresholdProfile` archetype initial values** — blocks §F8
 - **Auto-throttle weight-multiplier schedule + restore trigger + floor** — blocks §F13
 - **Operationally measuring "silent-killer alarm fired too late"** — blocks §F13
+- **Mark-to-market multiplier handling for options/spread positions** — blocks §F15
+- **Magnitude qualifier for "total P&L positive" softer recommendation** — blocks §F16
 
 ---
 
