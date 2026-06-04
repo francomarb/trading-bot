@@ -67,15 +67,19 @@ MLEG_ENTRY_WATCH_TIMEOUT_SECONDS: float = float(
 #   generated 2026-05-11; report: logs/sma_scan_top30.md
 #
 # Scanner-derived top 30 by composite score (the first 30 entries below).
+# Manual additions can also come from a quick external 20/50 SMA crossover
+# screen, then verified against local Alpaca daily bars and existing bot
+# watchlists before inclusion. Example: DUOL was added 2026-06-04 from
+# stock-screener.org/20-50-day-moving-average-crossover after this filter.
 # NVDA is the lone non-scanner exception, retained as a protected open SMA
 # position (RS%=40.5 at scan time — clearly weak; let the strategy exit it
 # on its own signal, then remove from this list on next refresh).
 SMA_WATCHLIST = [
-    "SNDK", "WDC", "STX", "GSAT", "POWL", "VIAV", "VSAT", "CIEN",
+    "SNDK", "WDC", "STX", "GSAT", "POWL", "VIAV", "VSAT", "CIEN", "ASML", "MSTR",
     "MU", "FORM", "ALB", "CSTM", "DOCN", "TTMI", "FRO", "MTZ",
     "DK", "ASX", "CAT", "HUT", "GLW", "AMD", "STRL", "INTC",
-    "BE", "ECG", "MRVL", "NVT", "SQM", "TSEM",
-    "NVDA",
+    "BE", "ECG", "MRVL", "NVT", "SQM", "TSEM", "PL", "UBER",
+    "NVDA", "ADBE", "ANET", "META", "PLTR", "DUOL",
 ]
 # RSI Reversion — mean-reversion; promoted from the 2026-04-30 expanded
 # backtest pass to increase signal density for the static paper-trading pool.
@@ -85,7 +89,7 @@ RSI_WATCHLIST = [
     "ALLY", "CDNS", "KBE", "SN", "BA", "TFC", "HON", "TMUS", "MSFT",
     "CCK", "ABNB", "PG", "SPG", "MA", "LMT", "MCD", "AAPL", "ANET",
     "CAT", "CIEN", "MCO", "AMZN", "EQIX", "RTX", "META", "HD",
-    "SOFI", "ARM",
+    "SOFI", "ARM", "MSTR",
 ]
 # Bollinger Squeeze (TTM-style volatility breakout) — IMPLEMENTED BUT NOT
 # ACTIVE. Cross-universe research (docs/bollinger_squeeze_universe_research.md)
@@ -129,7 +133,7 @@ DONCHIAN_WATCHLIST = [
     # Big Tech
     "MSFT", "AAPL", "GOOG", "META", "AMZN", "ORCL", "TSLA",
     # AI software (secondary)
-    "PLTR", "CRWD", "NOW", "ADBE",
+    "PLTR", "CRWD", "NOW", "ALAB", "CRWV", "NBIS",
     # AI compute / quantum (post-IPO names with full 4y history)
     "IREN", "IONQ",
     # AI-adjacent: semiconductor equipment, networking, data-centre power,
@@ -141,10 +145,17 @@ DONCHIAN_WATCHLIST = [
     "VST",    # Vistra — power generation; same AI-electricity demand thesis as CEG
     "BE",     # Bloom Energy — fuel-cell backup power; AI data-centre resilience play
     "PWR",    # Quanta Services — electrical infrastructure buildout for AI campuses
+    "OKLO",   # Oklo — advanced nuclear power; AI data-centre electricity demand thesis
+    "SMR",    # NuScale Power — small modular reactors; AI power infrastructure thesis
+    "ONDS",   # Ondas — autonomous systems and industrial wireless; AI/defense adjacency
+    "PL",     # Planet Labs — satellite imagery/data platform; space and AI data adjacency
     "RGTI",   # Rigetti Computing — quantum hardware; early-stage AI compute adjacency
     "QBTS",   # D-Wave Quantum — quantum annealing; same early-stage bet as RGTI
     "RKLB",   # Development of rocket launch and control systems for the space and defense industries
+    "RDW",    # Redwire — space infrastructure and defense-adjacent systems
     "ASTS",   # Space-based broadband cellular network
+    # Leopold Aschenbrenner picks
+    "APLD", "RIOT", "WYFI", "CORZ",
 ]
 # Full engine universe — union of all lists; preserves paper-run continuity.
 #
