@@ -341,6 +341,13 @@ class TradeLogger:
         self._conn.execute(_CREATE_POSITION_LIFECYCLE_LEGS_SQL)
         for index_sql in _CREATE_POSITION_LIFECYCLE_INDEXES_SQL:
             self._conn.execute(index_sql)
+        from engine.option_trailing import (
+            _CREATE_OPTION_TRAILING_STOPS_SQL,
+            _OPTION_TRAILING_STOPS_INDEXES_SQL,
+        )
+        self._conn.execute(_CREATE_OPTION_TRAILING_STOPS_SQL)
+        for index_sql in _OPTION_TRAILING_STOPS_INDEXES_SQL:
+            self._conn.execute(index_sql)
         self._conn.commit()
         return self._conn
 

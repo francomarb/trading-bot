@@ -70,6 +70,7 @@ from engine.positions import (
     owner_key_for,
     view_owner_map,
 )
+from engine.option_trailing import OptionTrailingStopStore
 from execution.entry_guard import CapAction, gate_entry
 from execution.broker import (
     AlpacaBroker,
@@ -284,6 +285,13 @@ class TradingEngine:
         except Exception as exc:
             logger.warning(f"lifecycle store init skipped: {exc}")
             self.lifecycle_store = None
+        try:
+            self.option_trailing_store = OptionTrailingStopStore(
+                self.trade_logger._ensure_db()
+            )
+        except Exception as exc:
+            logger.warning(f"option trailing store init skipped: {exc}")
+            self.option_trailing_store = None
         self.pnl_tracker = pnl_tracker or PnLTracker()
         self.alerts = alerts or AlertDispatcher()
         self._stream_manager = stream_manager
@@ -575,6 +583,7 @@ class TradingEngine:
         self._reconcile_position_lifecycle(startup_snapshot)
 
         self._sync_managed_stop_legs(startup_snapshot)
+        self._sync_option_trailing_stops(startup_snapshot)
         self._repair_missing_protective_stops(startup_snapshot)
 
         slot_desc = ", ".join(
@@ -738,6 +747,7 @@ class TradingEngine:
             self._detect_external_closes(snapshot)
             self._drain_option_fills()
             self._drain_spread_fills()
+            self._sync_option_trailing_stops(snapshot)
             self._repair_missing_protective_stops(snapshot)
 
             # Daily-loss / hard-dollar gates can fire on any signal; halt state
@@ -2265,6 +2275,177 @@ class TradingEngine:
         )
 
     @staticmethod
+    def _option_position_premium(position) -> float | None:
+        """Best-effort option premium from a broker position snapshot."""
+        current = getattr(position, "current_price", None)
+        if current is not None:
+            try:
+                premium = float(current)
+                if premium > 0:
+                    return premium
+            except (TypeError, ValueError):
+                pass
+        try:
+            qty = abs(float(getattr(position, "qty", 0.0) or 0.0))
+            market_value = abs(float(getattr(position, "market_value", 0.0) or 0.0))
+        except (TypeError, ValueError):
+            return None
+        if qty <= 0 or market_value <= 0:
+            return None
+        return market_value / (qty * 100.0)
+
+    @staticmethod
+    def _compute_option_trailing_floor(
+        *,
+        entry_premium: float,
+        hwm_premium: float,
+        trail_activation_pct: float,
+        trail_pct: float,
+        stop_loss_multiple: float,
+    ) -> float:
+        """Return the broker stop price implied by the durable trail state."""
+        hard_floor = entry_premium * stop_loss_multiple
+        if hwm_premium >= entry_premium * (1.0 + trail_activation_pct):
+            hard_floor = max(hard_floor, hwm_premium * (1.0 - trail_pct))
+        return round(max(hard_floor, 0.01), 2)
+
+    def _sync_option_trailing_stops(self, snapshot: BrokerSnapshot) -> None:
+        """Create/ratchet DAY broker stops for managed single-leg options."""
+        if self.option_trailing_store is None:
+            return
+        open_stop_by_occ = {
+            o.symbol: o
+            for o in snapshot.open_orders
+            if is_occ_option(o.symbol) and o.side is Side.SELL and o.stop_price is not None
+        }
+        for occ, position in snapshot.account.open_positions.items():
+            if not is_occ_option(occ):
+                continue
+            owner_key = owner_key_for(occ)
+            owner = self._get_owner(owner_key)
+            if owner is None:
+                continue
+            lifecycle_row = (
+                self.lifecycle_store.get_open_for_owner_key(owner_key)
+                if self.lifecycle_store is not None
+                else None
+            )
+            if lifecycle_row is None:
+                logger.warning(
+                    f"[{owner}] {occ}: cannot sync option trailing stop — "
+                    "missing position_uid lifecycle row"
+                )
+                continue
+            strategy = self._strategy_by_name(owner)
+            if strategy is None or not hasattr(strategy, "trail_pct"):
+                continue
+            entry_premium = float(
+                self._entry_prices.get(owner_key)
+                or getattr(position, "avg_entry_price", 0.0)
+                or 0.0
+            )
+            current_premium = self._option_position_premium(position)
+            if entry_premium <= 0 and current_premium is not None:
+                entry_premium = current_premium
+            if entry_premium <= 0:
+                logger.warning(
+                    f"[{owner}] {occ}: cannot sync option trailing stop — "
+                    "missing entry premium"
+                )
+                continue
+
+            row = self.option_trailing_store.get_by_occ(occ)
+            hwm = max(
+                entry_premium,
+                row.hwm_premium if row is not None else entry_premium,
+                current_premium if current_premium is not None else entry_premium,
+            )
+            trail_activation_pct = float(getattr(strategy, "trail_activation_pct", 0.10))
+            trail_pct = float(getattr(strategy, "trail_pct", 0.15))
+            config = getattr(strategy, "config", None)
+            stop_loss_multiple = float(getattr(config, "stop_loss_multiple", 0.75))
+            desired_stop = self._compute_option_trailing_floor(
+                entry_premium=entry_premium,
+                hwm_premium=hwm,
+                trail_activation_pct=trail_activation_pct,
+                trail_pct=trail_pct,
+                stop_loss_multiple=stop_loss_multiple,
+            )
+            qty = abs(float(getattr(position, "qty", 0.0) or 0.0))
+            existing = open_stop_by_occ.get(occ)
+
+            # If an adequate DAY stop is already open, just persist its identity.
+            if existing is not None and (existing.stop_price or 0.0) >= desired_stop:
+                self.option_trailing_store.upsert(
+                    position_uid=lifecycle_row.position_uid,
+                    occ_symbol=occ,
+                    strategy=owner,
+                    owner_key=owner_key,
+                    qty=qty,
+                    entry_premium=entry_premium,
+                    hwm_premium=hwm,
+                    trail_activation_pct=trail_activation_pct,
+                    trail_pct=trail_pct,
+                    current_stop_price=float(existing.stop_price or desired_stop),
+                    alpaca_stop_order_id=existing.order_id,
+                    stop_order_status=existing.status,
+                    last_observed_premium=current_premium,
+                )
+                continue
+
+            # Replace only when the stop can ratchet upward or no DAY stop exists.
+            if existing is not None:
+                self.broker.cancel_order(existing.order_id)
+            try:
+                new_order = self.broker.submit_option_day_stop(
+                    symbol=occ,
+                    qty=qty,
+                    stop_price=desired_stop,
+                )
+            except Exception as exc:
+                logger.error(
+                    f"[{owner}] {occ}: failed to submit option DAY trailing stop "
+                    f"@ ${desired_stop:.2f}: {exc}"
+                )
+                self.risk.record_broker_error()
+                self.alerts.broker_error(f"{occ} option trailing stop: {exc}")
+                self.option_trailing_store.upsert(
+                    position_uid=lifecycle_row.position_uid,
+                    occ_symbol=occ,
+                    strategy=owner,
+                    owner_key=owner_key,
+                    qty=qty,
+                    entry_premium=entry_premium,
+                    hwm_premium=hwm,
+                    trail_activation_pct=trail_activation_pct,
+                    trail_pct=trail_pct,
+                    current_stop_price=desired_stop,
+                    alpaca_stop_order_id=existing.order_id if existing else None,
+                    stop_order_status="submit_failed",
+                    last_observed_premium=current_premium,
+                )
+                continue
+            self.option_trailing_store.upsert(
+                position_uid=lifecycle_row.position_uid,
+                occ_symbol=occ,
+                strategy=owner,
+                owner_key=owner_key,
+                qty=qty,
+                entry_premium=entry_premium,
+                hwm_premium=hwm,
+                trail_activation_pct=trail_activation_pct,
+                trail_pct=trail_pct,
+                current_stop_price=desired_stop,
+                alpaca_stop_order_id=new_order.order_id,
+                stop_order_status=new_order.status,
+                last_observed_premium=current_premium,
+            )
+            logger.info(
+                f"[{owner}] {occ}: option DAY trailing stop synced — "
+                f"hwm=${hwm:.2f} stop=${desired_stop:.2f}"
+            )
+
+    @staticmethod
     def _get_position_for(symbol: str, snapshot: BrokerSnapshot):
         """Get the position for the symbol or its corresponding option contract."""
         position = snapshot.account.open_positions.get(symbol)
@@ -2777,6 +2958,16 @@ class TradingEngine:
                             owner_key=owner_key_for(symbol),
                             external=True,
                         )
+                    if self.option_trailing_store is not None:
+                        leg = tracked_position.primary_leg
+                        if leg is not None and is_occ_option(leg.symbol):
+                            try:
+                                self.option_trailing_store.delete_by_occ(leg.symbol)
+                            except Exception as exc:
+                                logger.warning(
+                                    f"{leg.symbol}: option trailing cleanup failed "
+                                    f"after external close: {exc}"
+                                )
                     self._entry_prices.pop(symbol, None)
             except Exception as e:
                 logger.error(f"{symbol}: failed to log external close: {e}")
@@ -2907,6 +3098,14 @@ class TradingEngine:
 
             self._pop_position(symbol)
             self._entry_prices.pop(symbol, None)
+            if _occ_m and self.option_trailing_store is not None:
+                try:
+                    self.option_trailing_store.delete_by_occ(raw_symbol)
+                except Exception as exc:
+                    logger.warning(
+                        f"{raw_symbol}: option trailing cleanup failed after "
+                        f"stream stop fill: {exc}"
+                    )
 
     def _drain_option_fills(self) -> None:
         """
@@ -2920,7 +3119,12 @@ class TradingEngine:
         """
         import re as _re
         fills = self.broker.drain_option_fills()
-        for decision, status_str, filled_qty, avg_fill_price, order_id in fills:
+        for fill in fills:
+            if len(fill) == 6:
+                decision, status_str, filled_qty, avg_fill_price, order_id, position_uid = fill
+            else:
+                decision, status_str, filled_qty, avg_fill_price, order_id = fill
+                position_uid = None
             mapped = {"filled": OrderStatus.FILLED, "partially_filled": OrderStatus.PARTIAL}.get(
                 status_str, OrderStatus.CANCELED
             )
@@ -2933,6 +3137,7 @@ class TradingEngine:
                 avg_fill_price=avg_fill_price,
                 raw_status=status_str,
                 message=f"options async fill: {status_str}",
+                position_uid=position_uid,
             )
             self._record_fill(
                 result,
@@ -2960,12 +3165,45 @@ class TradingEngine:
                 if underlying != decision.symbol and avg_fill_price:
                     if underlying in self._positions:
                         self._entry_prices[underlying] = avg_fill_price
+                    strategy = self._strategy_by_name(decision.strategy_name)
+                    if self.option_trailing_store is not None:
+                        try:
+                            self.option_trailing_store.upsert(
+                                position_uid=position_uid,
+                                occ_symbol=decision.symbol,
+                                strategy=decision.strategy_name,
+                                owner_key=underlying,
+                                qty=float(filled_qty or decision.qty),
+                                entry_premium=float(avg_fill_price),
+                                hwm_premium=float(avg_fill_price),
+                                trail_activation_pct=float(
+                                    getattr(strategy, "trail_activation_pct", 0.10)
+                                ),
+                                trail_pct=float(getattr(strategy, "trail_pct", 0.15)),
+                                current_stop_price=round(
+                                    float(avg_fill_price)
+                                    * float(
+                                        getattr(
+                                            getattr(strategy, "config", None),
+                                            "stop_loss_multiple",
+                                            0.75,
+                                        )
+                                    ),
+                                    2,
+                                ),
+                                stop_order_status="pending_sync",
+                                last_observed_premium=float(avg_fill_price),
+                            )
+                        except Exception as e:
+                            logger.warning(
+                                f"[{decision.strategy_name}] option trailing "
+                                f"state seed failed for {decision.symbol}: {e}"
+                            )
                     # A3: anchor the strategy's trailing-stop base to the
                     # confirmed fill premium so the activation threshold is
                     # measured against actual cost basis, not the first
                     # Black-Scholes valuation. Opt-in via register_fill so
                     # strategies without trailing logic are unaffected.
-                    strategy = self._strategy_by_name(decision.strategy_name)
                     register_fill = getattr(strategy, "register_fill", None)
                     if register_fill is not None and avg_fill_price:
                         try:
@@ -3119,6 +3357,14 @@ class TradingEngine:
         if result.status is OrderStatus.FILLED:
             self._pop_position(symbol)
             self._entry_prices.pop(symbol, None)
+            if _OCC_PAT.match(position.symbol) and self.option_trailing_store is not None:
+                try:
+                    self.option_trailing_store.delete_by_occ(position.symbol)
+                except Exception as exc:
+                    logger.warning(
+                        f"[{strategy.name}] {position.symbol}: option trailing "
+                        f"cleanup failed after close: {exc}"
+                    )
         return True
 
     def _strategy_by_name(self, name: str) -> BaseStrategy | None:

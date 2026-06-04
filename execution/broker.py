@@ -727,18 +727,43 @@ class AlpacaBroker:
                 )
 
             opt_worker_id = f"opt-worker-{uuid.uuid4().hex[:10]}"
+            client_order_id = f"opt-{decision.strategy_name}-{uuid.uuid4().hex[:8]}"
+            position_uid = self._lifecycle_begin(
+                decision=decision,
+                client_order_id=client_order_id,
+            )
 
             dec = decision  # capture for closure
 
             def _on_fill(status: str, filled_qty: float, avg_price: "float | None", order_id: str) -> None:
+                result = OrderResult(
+                    status={
+                        "filled": OrderStatus.FILLED,
+                        "partially_filled": OrderStatus.PARTIAL,
+                    }.get(status, OrderStatus.CANCELED),
+                    order_id=order_id,
+                    symbol=dec.symbol,
+                    requested_qty=dec.qty,
+                    filled_qty=filled_qty,
+                    avg_fill_price=avg_price,
+                    raw_status=status,
+                    message=f"options async fill: {status}",
+                )
+                self._lifecycle_mark_filled(
+                    position_uid=position_uid,
+                    result=result,
+                )
                 with self._pending_option_lock:
-                    self._pending_option_fills.append((dec, status, filled_qty, avg_price, order_id))
+                    self._pending_option_fills.append(
+                        (dec, status, filled_qty, avg_price, order_id, position_uid)
+                    )
 
             worker = OptionsExecutionWorker(
                 decision=decision,
                 api=self._api,
                 stream_manager=self._stream_manager,
                 on_fill=_on_fill,
+                client_order_id=client_order_id,
             )
             worker.start()
 
@@ -1536,6 +1561,47 @@ class AlpacaBroker:
         order = self._with_retry(
             lambda: self._api.submit_order(order_request),
             op_desc=f"submit_repair_stop({symbol})",
+        )
+        self._register_standalone_stop_leg(order)
+        return self._to_open_order(order)
+
+    def submit_option_day_stop(
+        self,
+        *,
+        symbol: str,
+        qty: float,
+        stop_price: float,
+        client_order_id_prefix: str = "opt-trail-stop",
+    ) -> OpenOrder:
+        """Submit a DAY SELL stop for a single-leg option position."""
+        if qty <= 0:
+            raise BrokerError(f"option stop qty must be positive for {symbol}: {qty}")
+        whole_qty = int(qty)
+        if abs(float(qty) - whole_qty) > 1e-9:
+            raise BrokerError(
+                f"option stop qty must be a whole contract for {symbol}: {qty}"
+            )
+        if stop_price <= 0:
+            raise BrokerError(
+                f"option stop price must be positive for {symbol}: {stop_price}"
+            )
+        client_order_id = f"{client_order_id_prefix}-{uuid.uuid4().hex[:10]}"
+        order_request = StopOrderRequest(
+            symbol=symbol,
+            qty=whole_qty,
+            side=AlpacaOrderSide.SELL,
+            time_in_force=TimeInForce.DAY,
+            stop_price=round(stop_price, 2),
+            client_order_id=client_order_id,
+        )
+        logger.warning(
+            f"submitting option DAY trailing stop for {symbol}: "
+            f"sell {qty:g} stop @ ${stop_price:.2f} "
+            f"(client_id={client_order_id})"
+        )
+        order = self._with_retry(
+            lambda: self._api.submit_order(order_request),
+            op_desc=f"submit_option_day_stop({symbol})",
         )
         self._register_standalone_stop_leg(order)
         return self._to_open_order(order)
