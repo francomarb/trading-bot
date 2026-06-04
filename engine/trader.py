@@ -4293,15 +4293,15 @@ class TradingEngine:
            fills, manual broker-side closes, and any other path that
            closed a position without the bot's normal close flow.
 
-        Spread / options lifecycle integration is deferred — see the
-        operator controls implementation plan. Phase A reconciles
-        equity single-leg positions only; the spread/options paths
-        will join the lifecycle table when Phase B/C wires them.
+        Multi-leg spread lifecycle integration remains deferred. Managed
+        single-leg OCC options are included here because option trailing
+        stops require a durable ``position_uid`` before their DAY broker
+        stops can be recreated on startup.
         """
         if self.lifecycle_store is None:
             return
         try:
-            # Forward pass — synthesize for any unmanaged equity broker
+            # Forward pass — synthesize for any managed broker
             # position that lacks an open lifecycle row.
             #
             # snapshot.account.open_positions maps str -> risk.manager.Position
@@ -4310,22 +4310,45 @@ class TradingEngine:
             # float(position) raises TypeError and (because the outer
             # except is broad) silently skipped every backfill in the
             # PR-1 first cut.
+            managed_spread_legs = {
+                leg.symbol
+                for tracked in self._positions.values()
+                if tracked.is_spread
+                for leg in tracked.legs
+            }
             for sym, position in snapshot.account.open_positions.items():
-                # Skip OCC option symbols — Phase A only reconciles
-                # equity entries; options legs will be handled when
-                # Phase B/C plumbs the options worker through the
-                # store.
-                if _OCC_PAT.match(sym):
-                    continue
                 owner = owner_key_for(sym)
                 existing = self.lifecycle_store.get_open_for_owner_key(owner)
                 if existing is not None:
                     continue
                 pos = self._positions.get(owner)
+                is_occ = bool(_OCC_PAT.match(sym))
+                if is_occ:
+                    if sym in managed_spread_legs:
+                        continue
+                    if (
+                        pos is None
+                        or not pos.is_single_leg
+                        or pos.primary_leg is None
+                        or pos.primary_leg.symbol != sym
+                    ):
+                        continue
                 strategy = pos.strategy_name if pos is not None else "unknown"
                 qty_val = float(getattr(position, "qty", 0.0) or 0.0)
                 avg_val = getattr(position, "avg_entry_price", None)
                 avg_val = float(avg_val) if avg_val else None
+                legs = ()
+                if is_occ:
+                    from engine.lifecycle import PositionLifecycleLeg
+                    legs = (
+                        PositionLifecycleLeg(
+                            position_uid="pending",
+                            symbol=sym,
+                            side="BUY",
+                            qty=qty_val,
+                            avg_entry_price=avg_val,
+                        ),
+                    )
                 self.lifecycle_store.synthesize_for_existing(
                     symbol=sym,
                     owner_key=owner,
@@ -4333,20 +4356,25 @@ class TradingEngine:
                     position_type="single_leg",
                     current_qty=qty_val,
                     avg_entry_price=avg_val,
+                    legs=legs,
+                    backfill_note=(
+                        "synthesized at startup from broker OCC option state"
+                        if is_occ
+                        else "synthesized at startup from broker state"
+                    ),
                 )
         except Exception as exc:
             logger.warning(f"lifecycle backfill failed: {exc}")
 
         try:
             # Reverse pass — close any lifecycle row whose owner_key is
-            # no longer at the broker. We only act on rows the engine
-            # could plausibly track (equity single_leg in Phase A).
+            # no longer at the broker.
             broker_owners = {
                 owner_key_for(s) for s in snapshot.account.open_positions
             }
             for row in self.lifecycle_store.get_open():
                 if row.position_type != "single_leg":
-                    continue  # Phase A scope: equity only
+                    continue
                 if row.owner_key in broker_owners:
                     continue
                 self.lifecycle_store.mark_closed(

@@ -3436,7 +3436,7 @@ class TestGenericSingleLegOptionTrailingStops:
         trail_pct = 0.15
         config = SimpleNamespace(stop_loss_multiple=0.75)
 
-    def _engine(self, tmp_path):
+    def _engine(self, tmp_path, *, create_lifecycle: bool = True):
         strategy = self.GenericOptionStrategy(entries=[False], exits=[False])
         broker = MagicMock()
         broker.get_open_orders.return_value = []
@@ -3475,19 +3475,20 @@ class TestGenericSingleLegOptionTrailingStops:
             symbol="SPY260618C00746000",
         )
         engine._entry_prices["SPY"] = 12.77
-        engine.lifecycle_store.create_pending(
-            position_uid="pos_abc123",
-            symbol="SPY260618C00746000",
-            owner_key="SPY",
-            strategy=strategy.name,
-            position_type="single_leg",
-            entry_qty=3,
-        )
-        engine.lifecycle_store.mark_open(
-            position_uid="pos_abc123",
-            avg_entry_price=12.77,
-            current_qty=3,
-        )
+        if create_lifecycle:
+            engine.lifecycle_store.create_pending(
+                position_uid="pos_abc123",
+                symbol="SPY260618C00746000",
+                owner_key="SPY",
+                strategy=strategy.name,
+                position_type="single_leg",
+                entry_qty=3,
+            )
+            engine.lifecycle_store.mark_open(
+                position_uid="pos_abc123",
+                avg_entry_price=12.77,
+                current_qty=3,
+            )
         return engine, broker
 
     def test_recreates_day_stop_from_persisted_hwm(self, tmp_path):
@@ -3530,6 +3531,40 @@ class TestGenericSingleLegOptionTrailingStops:
         assert row.position_uid == "pos_abc123"
         assert row.hwm_premium == pytest.approx(20.16)
         assert row.alpaca_stop_order_id == "new-stop"
+
+    def test_startup_backfills_legacy_occ_lifecycle_then_recreates_stop(self, tmp_path):
+        engine, broker = self._engine(tmp_path, create_lifecycle=False)
+        snapshot = _snapshot(
+            positions={
+                "SPY260618C00746000": Position(
+                    symbol="SPY260618C00746000",
+                    qty=3,
+                    avg_entry_price=12.77,
+                    market_value=4_650.0,
+                    current_price=15.50,
+                )
+            },
+            open_orders=[],
+        )
+
+        engine._reconcile_position_lifecycle(snapshot)
+        engine._sync_option_trailing_stops(snapshot)
+
+        lifecycle_row = engine.lifecycle_store.get_open_for_owner_key("SPY")
+        assert lifecycle_row is not None
+        assert lifecycle_row.symbol == "SPY260618C00746000"
+        assert lifecycle_row.strategy == "generic_single_leg_options"
+        assert lifecycle_row.metadata["synthesized"] is True
+        assert lifecycle_row.legs[0].symbol == "SPY260618C00746000"
+        broker.submit_option_day_stop.assert_called_once_with(
+            symbol="SPY260618C00746000",
+            qty=3.0,
+            stop_price=13.17,
+        )
+        trailing_row = engine.option_trailing_store.get_by_occ("SPY260618C00746000")
+        assert trailing_row.position_uid == lifecycle_row.position_uid
+        assert trailing_row.entry_premium == pytest.approx(12.77)
+        assert trailing_row.hwm_premium == pytest.approx(15.50)
 
     def test_ratchets_hwm_and_replaces_stale_stop_intraday(self, tmp_path):
         engine, broker = self._engine(tmp_path)
