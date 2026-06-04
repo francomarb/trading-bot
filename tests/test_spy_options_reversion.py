@@ -639,6 +639,19 @@ class TestRegisterFill:
         assert strat._position_base["SPY260618C00520000"] == 4.20
         assert strat._position_hwm["SPY260618C00520000"] == 5.10
 
+    def test_restore_trailing_state_rehydrates_without_lowering_hwm(self):
+        strat = self._strat()
+        strat._position_hwm["SPY260618C00520000"] = 22.00
+
+        strat.restore_trailing_state(
+            "SPY260618C00520000",
+            entry_premium=12.77,
+            hwm_premium=20.16,
+        )
+
+        assert strat._position_base["SPY260618C00520000"] == 12.77
+        assert strat._position_hwm["SPY260618C00520000"] == 22.00
+
     def test_ignores_invalid_premium(self):
         strat = self._strat()
         strat.register_fill("SPY260618C00520000", 0.0)

@@ -1293,6 +1293,37 @@ class TestOptionsDryRun:
         api.submit_order.assert_not_called()  # worker handles submission, not broker directly
 
 
+class TestOptionDayStops:
+    def test_submit_option_day_stop_uses_day_sell_stop(self):
+        api = MagicMock()
+        api.submit_order.return_value = _alpaca_order(
+            id="stop-1",
+            status="accepted",
+            symbol="SPY260618C00746000",
+            side="sell",
+            qty=3,
+            type="stop",
+            stop_price="17.13",
+        )
+
+        result = AlpacaBroker(
+            client=api, max_attempts=1, base_delay=0.0
+        ).submit_option_day_stop(
+            symbol="SPY260618C00746000",
+            qty=3,
+            stop_price=17.13,
+        )
+
+        req = api.submit_order.call_args.args[0]
+        assert req.symbol == "SPY260618C00746000"
+        assert req.qty == 3
+        assert req.side.value == "sell"
+        assert req.time_in_force.value == "day"
+        assert req.stop_price == 17.13
+        assert result.order_id == "stop-1"
+        assert result.stop_price == pytest.approx(17.13)
+
+
 # ── place_spread_order / close_spread_order — MLEG (11.28) ───────────────────
 
 _SHORT_OCC = "SPY260620P00580000"

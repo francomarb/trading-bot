@@ -275,6 +275,7 @@ class OptionsExecutionWorker(_BaseExecutionWorker):
         api: TradingClient,
         stream_manager: StreamManager | None = None,
         on_fill: FillCallback | None = None,
+        client_order_id: str | None = None,
     ) -> None:
         super().__init__(
             name=f"OptionsExecutor-{decision.symbol}",
@@ -283,6 +284,7 @@ class OptionsExecutionWorker(_BaseExecutionWorker):
             on_fill=on_fill,
         )
         self.decision = decision
+        self.client_order_id = client_order_id
 
     def run(self) -> None:
         logger.info(
@@ -293,7 +295,10 @@ class OptionsExecutionWorker(_BaseExecutionWorker):
             logger.error(f"[{self.name}] Options execution requires a limit price.")
             return
 
-        client_order_id = f"opt-{self.decision.strategy_name}-{uuid.uuid4().hex[:8]}"
+        client_order_id = (
+            self.client_order_id
+            or f"opt-{self.decision.strategy_name}-{uuid.uuid4().hex[:8]}"
+        )
         req = LimitOrderRequest(
             symbol=self.decision.symbol,
             qty=self.decision.qty,

@@ -29,6 +29,7 @@ Coverage map (one class per concern):
 from __future__ import annotations
 
 import time
+from dataclasses import replace
 from datetime import datetime, timedelta, timezone
 from types import SimpleNamespace
 from unittest.mock import MagicMock
@@ -2883,11 +2884,12 @@ class TestOptionsEngineFixes:
                     side=Side.BUY,
                 ),
                 "rejected",
-                0.0,
-                None,
-                "opt-spy_options_reversion-abcd1234",
-            )
-        ])
+	                0.0,
+	                None,
+	                "opt-spy_options_reversion-abcd1234",
+	                "pos_rejected",
+	            )
+	        ])
 
         engine._drain_option_fills()
 
@@ -2917,17 +2919,19 @@ class TestOptionsEngineFixes:
                     side=Side.BUY,
                 ),
                 "filled",
-                3.0,
-                12.40,  # actual fill premium
-                "opt-spy_options_reversion-fill",
-            )
-        ])
+	                3.0,
+	                12.40,  # actual fill premium
+	                "opt-spy_options_reversion-fill",
+	                "pos_filled",
+	            )
+	        ])
 
         engine._drain_option_fills()
 
         strat_mock.register_fill.assert_called_once_with(occ, 12.40)
         # Entry price tracking continues to use the fill price as before.
         assert engine._entry_prices.get("SPY") == 12.40
+
 
     # Fix 3: slippage not recorded for options exits ──────────────────────────
 
@@ -3425,6 +3429,292 @@ class TestOptionsEngineFixes:
         engine.alerts.broker_error.assert_not_called()
         engine._allocator.record_realized_pnl.assert_not_called()
         assert engine._has_position("AAPL")
+
+
+class TestGenericSingleLegOptionTrailingStops:
+    class GenericOptionStrategy(FakeStrategy):
+        name = "generic_single_leg_options"
+        trail_activation_pct = 0.10
+        trail_pct = 0.15
+        config = SimpleNamespace(stop_loss_multiple=0.75)
+
+        def __init__(self, *, entries: list[bool], exits: list[bool], edge_filter=None):
+            super().__init__(entries=entries, exits=exits, edge_filter=edge_filter)
+            self.restored_trailing_state: list[dict] = []
+
+        def restore_trailing_state(
+            self, occ: str, *, entry_premium: float, hwm_premium: float
+        ) -> None:
+            self.restored_trailing_state.append(
+                {
+                    "occ": occ,
+                    "entry_premium": entry_premium,
+                    "hwm_premium": hwm_premium,
+                }
+            )
+
+    def _engine(self, tmp_path, *, create_lifecycle: bool = True):
+        strategy = self.GenericOptionStrategy(entries=[False], exits=[False])
+        broker = MagicMock()
+        broker.get_open_orders.return_value = []
+        broker.submit_option_day_stop.return_value = OpenOrder(
+            order_id="new-stop",
+            symbol="SPY260618C00746000",
+            side=Side.SELL,
+            qty=3,
+            order_type=OrderType.MARKET,
+            status="accepted",
+            submitted_at=T0,
+            limit_price=None,
+            stop_price=17.14,
+        )
+        risk = RiskManager(
+            max_position_pct=0.02,
+            max_open_positions=5,
+            max_gross_exposure_pct=0.50,
+            atr_stop_multiplier=2.0,
+            max_daily_loss_pct=0.05,
+            hard_dollar_loss_cap=1_000_000.0,
+            loss_streak_threshold=10,
+            broker_error_threshold=10,
+        )
+        engine = TradingEngine(
+            strategy=strategy,
+            symbols=["SPY"],
+            risk=risk,
+            broker=broker,
+            config=EngineConfig(market_hours_only=False),
+            trade_logger=TradeLogger(path=str(tmp_path / "trades.db")),
+            clock=lambda: T0,
+        )
+        engine._register_single_leg(
+            strategy_name=strategy.name,
+            symbol="SPY260618C00746000",
+        )
+        engine._entry_prices["SPY"] = 12.77
+        if create_lifecycle:
+            engine.lifecycle_store.create_pending(
+                position_uid="pos_abc123",
+                symbol="SPY260618C00746000",
+                owner_key="SPY",
+                strategy=strategy.name,
+                position_type="single_leg",
+                entry_qty=3,
+            )
+            engine.lifecycle_store.mark_open(
+                position_uid="pos_abc123",
+                avg_entry_price=12.77,
+                current_qty=3,
+            )
+        return engine, broker
+
+    def test_recreates_day_stop_from_persisted_hwm(self, tmp_path):
+        engine, broker = self._engine(tmp_path)
+        engine.option_trailing_store.upsert(
+            position_uid="pos_abc123",
+            occ_symbol="SPY260618C00746000",
+            strategy="generic_single_leg_options",
+            owner_key="SPY",
+            qty=3,
+            entry_premium=12.77,
+            hwm_premium=20.16,
+            trail_activation_pct=0.10,
+            trail_pct=0.15,
+            current_stop_price=17.14,
+            stop_order_status="expired",
+            last_observed_premium=15.50,
+        )
+        snapshot = _snapshot(
+            positions={
+                "SPY260618C00746000": Position(
+                    symbol="SPY260618C00746000",
+                    qty=3,
+                    avg_entry_price=12.77,
+                    market_value=4_650.0,
+                    current_price=15.50,
+                )
+            },
+            open_orders=[],
+        )
+
+        engine._sync_option_trailing_stops(snapshot)
+
+        broker.submit_option_day_stop.assert_called_once_with(
+            symbol="SPY260618C00746000",
+            qty=3.0,
+            stop_price=17.14,
+        )
+        row = engine.option_trailing_store.get_by_occ("SPY260618C00746000")
+        assert row.position_uid == "pos_abc123"
+        assert row.hwm_premium == pytest.approx(20.16)
+        assert row.alpaca_stop_order_id == "new-stop"
+        assert engine.strategy.restored_trailing_state[-1] == {
+            "occ": "SPY260618C00746000",
+            "entry_premium": 12.77,
+            "hwm_premium": 20.16,
+        }
+
+    def test_startup_backfills_legacy_occ_lifecycle_then_recreates_stop(self, tmp_path):
+        engine, broker = self._engine(tmp_path, create_lifecycle=False)
+        snapshot = _snapshot(
+            positions={
+                "SPY260618C00746000": Position(
+                    symbol="SPY260618C00746000",
+                    qty=3,
+                    avg_entry_price=12.77,
+                    market_value=4_650.0,
+                    current_price=15.50,
+                )
+            },
+            open_orders=[],
+        )
+
+        engine._reconcile_position_lifecycle(snapshot)
+        engine._sync_option_trailing_stops(snapshot)
+
+        lifecycle_row = engine.lifecycle_store.get_open_for_owner_key("SPY")
+        assert lifecycle_row is not None
+        assert lifecycle_row.symbol == "SPY260618C00746000"
+        assert lifecycle_row.strategy == "generic_single_leg_options"
+        assert lifecycle_row.metadata["synthesized"] is True
+        assert lifecycle_row.legs[0].symbol == "SPY260618C00746000"
+        broker.submit_option_day_stop.assert_called_once_with(
+            symbol="SPY260618C00746000",
+            qty=3.0,
+            stop_price=13.17,
+        )
+        trailing_row = engine.option_trailing_store.get_by_occ("SPY260618C00746000")
+        assert trailing_row.position_uid == lifecycle_row.position_uid
+        assert trailing_row.entry_premium == pytest.approx(12.77)
+        assert trailing_row.hwm_premium == pytest.approx(15.50)
+
+    def test_ratchets_hwm_and_replaces_stale_stop_intraday(self, tmp_path):
+        engine, broker = self._engine(tmp_path)
+        stale = replace(
+            _open_stop_order("SPY260618C00746000", stop_price=17.14),
+            order_id="old-stop",
+            qty=3,
+        )
+        broker.submit_option_day_stop.return_value = replace(
+            broker.submit_option_day_stop.return_value,
+            stop_price=18.70,
+        )
+        snapshot = _snapshot(
+            positions={
+                "SPY260618C00746000": Position(
+                    symbol="SPY260618C00746000",
+                    qty=3,
+                    avg_entry_price=12.77,
+                    market_value=6_600.0,
+                    current_price=22.00,
+                )
+            },
+            open_orders=[stale],
+        )
+
+        engine._sync_option_trailing_stops(snapshot)
+
+        broker.cancel_order.assert_called_once_with("old-stop")
+        broker.submit_option_day_stop.assert_called_once_with(
+            symbol="SPY260618C00746000",
+            qty=3.0,
+            stop_price=18.70,
+        )
+        row = engine.option_trailing_store.get_by_occ("SPY260618C00746000")
+        assert row.hwm_premium == pytest.approx(22.00)
+        assert row.current_stop_price == pytest.approx(18.70)
+
+    def test_submit_failure_clears_canceled_order_id(self, tmp_path):
+        engine, broker = self._engine(tmp_path)
+        stale = replace(
+            _open_stop_order("SPY260618C00746000", stop_price=17.14),
+            order_id="old-stop",
+            qty=3,
+        )
+        broker.submit_option_day_stop.side_effect = RuntimeError("api down")
+        snapshot = _snapshot(
+            positions={
+                "SPY260618C00746000": Position(
+                    symbol="SPY260618C00746000",
+                    qty=3,
+                    avg_entry_price=12.77,
+                    market_value=6_600.0,
+                    current_price=22.00,
+                )
+            },
+            open_orders=[stale],
+        )
+
+        engine._sync_option_trailing_stops(snapshot)
+
+        broker.cancel_order.assert_called_once_with("old-stop")
+        row = engine.option_trailing_store.get_by_occ("SPY260618C00746000")
+        assert row.stop_order_status == "submit_failed"
+        assert row.alpaca_stop_order_id is None
+        assert row.current_stop_price == pytest.approx(18.70)
+
+    def test_recent_submit_missing_from_snapshot_does_not_duplicate(self, tmp_path):
+        engine, broker = self._engine(tmp_path)
+        engine.option_trailing_store.upsert(
+            position_uid="pos_abc123",
+            occ_symbol="SPY260618C00746000",
+            strategy="generic_single_leg_options",
+            owner_key="SPY",
+            qty=3,
+            entry_premium=12.77,
+            hwm_premium=20.16,
+            trail_activation_pct=0.10,
+            trail_pct=0.15,
+            current_stop_price=17.14,
+            alpaca_stop_order_id="new-stop",
+            stop_order_status="accepted",
+            last_observed_premium=20.16,
+        )
+        snapshot = _snapshot(
+            positions={
+                "SPY260618C00746000": Position(
+                    symbol="SPY260618C00746000",
+                    qty=3,
+                    avg_entry_price=12.77,
+                    market_value=4_650.0,
+                    current_price=15.50,
+                )
+            },
+            open_orders=[],
+        )
+
+        engine._sync_option_trailing_stops(snapshot)
+
+        broker.submit_option_day_stop.assert_not_called()
+        row = engine.option_trailing_store.get_by_occ("SPY260618C00746000")
+        assert row.alpaca_stop_order_id == "new-stop"
+        assert row.stop_order_status == "accepted"
+
+    def test_external_close_cleans_option_trailing_state(self, tmp_path):
+        engine, _broker = self._engine(tmp_path)
+        engine.config = replace(engine.config, external_close_confirm_cycles=1)
+        engine.option_trailing_store.upsert(
+            position_uid="pos_abc123",
+            occ_symbol="SPY260618C00746000",
+            strategy="generic_single_leg_options",
+            owner_key="SPY",
+            qty=3,
+            entry_premium=12.77,
+            hwm_premium=20.16,
+            trail_activation_pct=0.10,
+            trail_pct=0.15,
+            current_stop_price=17.14,
+            alpaca_stop_order_id="new-stop",
+            stop_order_status="accepted",
+            last_observed_premium=20.16,
+        )
+        engine._lookup_recent_stop_fill = MagicMock(return_value=None)
+        engine.trade_logger.log_external_close = MagicMock()
+        engine.alerts.broker_error = MagicMock()
+
+        engine._detect_external_closes(_snapshot(positions={}))
+
+        assert engine.option_trailing_store.get_by_occ("SPY260618C00746000") is None
 
 
 # ── Shared-symbol conflict rejection (11.7 Part A) ─────────────────────────
