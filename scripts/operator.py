@@ -203,19 +203,28 @@ def cmd_positions(args: argparse.Namespace) -> int:
     state = _load_engine_state(args.state_path)
 
     # Join lifecycle rows with snapshot positions_detail by owner_key.
+    # `positions_detail` is a dict keyed by the engine's owner_key
+    # (ticker for single-leg, spread UUID for spreads). Values carry
+    # qty / avg_entry_price / market_value / unrealized_pnl. An older
+    # version of this code iterated positions_detail as if it were a
+    # list — that crashed on live state because iterating a dict
+    # yields keys (str), not entries.
     snapshot_by_owner: dict[str, dict] = {}
     if state:
-        for entry in (state.get("positions_detail") or []):
-            owner = entry.get("owner") or entry.get("symbol")
-            if owner:
-                snapshot_by_owner[str(owner)] = entry
+        raw = state.get("positions_detail") or {}
+        if isinstance(raw, dict):
+            for owner, entry in raw.items():
+                if isinstance(entry, dict):
+                    snapshot_by_owner[str(owner)] = entry
 
     rows = []
     for row in lifecycle.get_open():
         snap = snapshot_by_owner.get(row.owner_key, {})
         qty = snap.get("qty") if snap else row.current_qty
+        if qty is None:
+            qty = row.current_qty
         market_value = snap.get("market_value")
-        upnl = snap.get("unrealized_pl")
+        upnl = snap.get("unrealized_pnl")
         rows.append([
             _short(row.position_uid, 28),
             row.symbol,

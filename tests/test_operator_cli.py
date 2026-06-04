@@ -178,6 +178,81 @@ class TestReadOnlyCommands:
         assert "sma_crossover" in out
         assert "open" in out
 
+    def test_positions_joins_with_real_snapshot_shape(self, db_paths):
+        """`positions_detail` in the live engine_state.json is a
+        `dict[owner_key, dict]`, not a list of dicts. An earlier
+        version of the CLI iterated it as a list and crashed on
+        production state. This test locks in the real shape.
+        """
+        import json
+        import sqlite3
+
+        db_path, state_path = db_paths
+        store = PositionLifecycleStore(sqlite3.connect(db_path))
+        uid = new_position_uid()
+        store.create_pending(
+            position_uid=uid, symbol="NVDA", owner_key="NVDA",
+            strategy="sma_crossover", position_type="single_leg",
+            entry_qty=10.0,
+        )
+        store.mark_open(
+            position_uid=uid, avg_entry_price=884.20, current_qty=10.0,
+        )
+
+        # Real engine_state.json structure (dict keyed by owner_key).
+        with open(state_path, "w") as fh:
+            json.dump({
+                "positions_detail": {
+                    "NVDA": {
+                        "strategy": "sma_crossover",
+                        "qty": 10.0,
+                        "avg_entry_price": 884.20,
+                        "market_value": 9010.0,
+                        "unrealized_pnl": 125.50,
+                    },
+                },
+            }, fh)
+
+        rc, out, _ = _run([
+            "--db", db_path, "--state-path", state_path,
+            "positions",
+        ])
+        assert rc == 0, "positions must not crash on real engine_state.json shape"
+        # The snapshot-supplied market_value / unrealized_pnl should
+        # show up in the rendered table.
+        assert "9,010" in out
+        assert "+125.50" in out
+
+    def test_positions_tolerates_unexpected_state_shapes(self, db_paths):
+        """Defensive: an unexpected `positions_detail` shape (e.g. a
+        list or a string) must not crash the CLI; it should fall back
+        to lifecycle-only rendering."""
+        import json
+        import sqlite3
+
+        db_path, state_path = db_paths
+        store = PositionLifecycleStore(sqlite3.connect(db_path))
+        uid = new_position_uid()
+        store.create_pending(
+            position_uid=uid, symbol="NVDA", owner_key="NVDA",
+            strategy="sma_crossover", position_type="single_leg",
+            entry_qty=10.0,
+        )
+        store.mark_open(
+            position_uid=uid, avg_entry_price=884.20, current_qty=10.0,
+        )
+
+        # Wrong shape — list of strings.
+        with open(state_path, "w") as fh:
+            json.dump({"positions_detail": ["NVDA", "MU"]}, fh)
+
+        rc, out, _ = _run([
+            "--db", db_path, "--state-path", state_path,
+            "positions",
+        ])
+        assert rc == 0
+        assert "NVDA" in out
+
     def test_show_position_unknown_returns_error(self, db_paths):
         db_path, state_path = db_paths
         rc, _, err = _run([
