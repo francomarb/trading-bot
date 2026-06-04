@@ -2376,6 +2376,14 @@ class TradingEngine:
                 row.hwm_premium if row is not None else entry_premium,
                 current_premium if current_premium is not None else entry_premium,
             )
+            restore = getattr(strategy, "restore_trailing_state", None)
+            if restore is not None:
+                try:
+                    restore(occ, entry_premium=entry_premium, hwm_premium=hwm)
+                except Exception as exc:
+                    logger.warning(
+                        f"[{owner}] {occ}: strategy trailing-state restore failed: {exc}"
+                    )
             trail_activation_pct = float(getattr(strategy, "trail_activation_pct", 0.10))
             trail_pct = float(getattr(strategy, "trail_pct", 0.15))
             config = getattr(strategy, "config", None)

@@ -3438,6 +3438,21 @@ class TestGenericSingleLegOptionTrailingStops:
         trail_pct = 0.15
         config = SimpleNamespace(stop_loss_multiple=0.75)
 
+        def __init__(self, *, entries: list[bool], exits: list[bool], edge_filter=None):
+            super().__init__(entries=entries, exits=exits, edge_filter=edge_filter)
+            self.restored_trailing_state: list[dict] = []
+
+        def restore_trailing_state(
+            self, occ: str, *, entry_premium: float, hwm_premium: float
+        ) -> None:
+            self.restored_trailing_state.append(
+                {
+                    "occ": occ,
+                    "entry_premium": entry_premium,
+                    "hwm_premium": hwm_premium,
+                }
+            )
+
     def _engine(self, tmp_path, *, create_lifecycle: bool = True):
         strategy = self.GenericOptionStrategy(entries=[False], exits=[False])
         broker = MagicMock()
@@ -3533,6 +3548,11 @@ class TestGenericSingleLegOptionTrailingStops:
         assert row.position_uid == "pos_abc123"
         assert row.hwm_premium == pytest.approx(20.16)
         assert row.alpaca_stop_order_id == "new-stop"
+        assert engine.strategy.restored_trailing_state[-1] == {
+            "occ": "SPY260618C00746000",
+            "entry_premium": 12.77,
+            "hwm_premium": 20.16,
+        }
 
     def test_startup_backfills_legacy_occ_lifecycle_then_recreates_stop(self, tmp_path):
         engine, broker = self._engine(tmp_path, create_lifecycle=False)

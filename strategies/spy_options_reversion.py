@@ -116,6 +116,22 @@ class SPYOptionsReversionStrategy(BaseStrategy):
             self._position_hwm.get(occ, fill_premium), fill_premium
         )
 
+    def restore_trailing_state(
+        self, occ: str, *, entry_premium: float, hwm_premium: float
+    ) -> None:
+        """Rehydrate trailing-stop state from durable storage after restart.
+
+        Called by the engine when reconciling option positions whose
+        in-memory high-water mark was lost. Never lowers an existing
+        in-memory HWM.
+        """
+        if entry_premium is not None and entry_premium > 0:
+            self._position_base[occ] = entry_premium
+        if hwm_premium is not None and hwm_premium > 0:
+            self._position_hwm[occ] = max(
+                self._position_hwm.get(occ, hwm_premium), hwm_premium
+            )
+
     # ── Signal generation ────────────────────────────────────────────────────
 
     def _raw_signals(self, df: pd.DataFrame) -> SignalFrame:
