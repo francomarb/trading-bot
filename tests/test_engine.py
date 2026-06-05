@@ -2309,7 +2309,7 @@ class TestStartupReconciliation:
     def test_start_restores_entry_prices_for_open_positions(
         self, patch_fetch, tmp_path
     ):
-        positions = {"AAPL": Position("AAPL", 10, 100.0, 1000.0)}
+        positions = {"AAPL": Position("AAPL", 10, 100.25, 1002.5)}
         startup = _snapshot(positions=positions)
         cycle = _snapshot(positions=positions)
         engine, broker, tl = _engine_with_db(
@@ -2319,11 +2319,25 @@ class TestStartupReconciliation:
             snapshot=startup,
         )
         broker.sync_with_broker.side_effect = [startup, cycle]
-        _write_buy(tl, "AAPL", "fake_strategy")
+        decision = SimpleNamespace(
+            symbol="AAPL",
+            side=Side.BUY,
+            qty=10,
+            entry_reference_price=100.0,
+            stop_price=95.0,
+            strategy_name="fake_strategy",
+            reason="test entry",
+            order_type=OrderType.MARKET,
+        )
+        tl.log(tl.build_record(
+            decision,
+            _filled_result("AAPL", 10, 100.25),
+            modeled_price=100.0,
+        ))
 
         engine.start(max_cycles=1)
 
-        assert engine._entry_prices["AAPL"] == pytest.approx(100.0)
+        assert engine._entry_prices["AAPL"] == pytest.approx(100.25)
 
 
 # ── External close detection ──────────────────────────────────────────────

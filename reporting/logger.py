@@ -707,10 +707,10 @@ class TradeLogger:
                 )
             if (
                 result.avg_fill_price is not None
-                and context["entry_reference_price"] is not None
+                and context["entry_fill_price"] is not None
             ):
                 realized_pnl = (
-                    (float(result.avg_fill_price) - float(context["entry_reference_price"]))
+                    (float(result.avg_fill_price) - float(context["entry_fill_price"]))
                     * float(result.filled_qty or 0)
                     * multiplier
                 )
@@ -1211,16 +1211,18 @@ class TradeLogger:
         r_multiple = None
         entry_timestamp = None
         entry_reference_price = 0.0
+        entry_fill_price = 0.0
         multiplier = _contract_multiplier(symbol)
         if context is not None:
             initial_stop_loss = context["initial_stop_loss"]
             initial_risk_per_share = context["initial_risk_per_share"]
             entry_timestamp = context["entry_timestamp"]
             entry_reference_price = float(context["entry_reference_price"] or 0.0)
+            entry_fill_price = float(context["entry_fill_price"] or 0.0)
             if initial_risk_per_share is not None:
                 initial_risk_dollars = float(initial_risk_per_share) * qty * multiplier
-            if entry_reference_price > 0:
-                realized_pnl = (avg_fill_price - entry_reference_price) * qty * multiplier
+            if entry_fill_price > 0:
+                realized_pnl = (avg_fill_price - entry_fill_price) * qty * multiplier
                 if initial_risk_dollars and initial_risk_dollars > 0:
                     r_multiple = realized_pnl / initial_risk_dollars
 
@@ -1494,12 +1496,13 @@ class TradeLogger:
     def _read_latest_open_entry_context(
         self, *, symbol: str, strategy: str
     ) -> dict | None:
-        """Return the latest still-open entry context for symbol/strategy."""
+        """Return decision context and actual fill basis for an open position."""
         state = self._read_single_leg_open_state().get(symbol)
         if state is None or state["open_qty"] <= 0 or state["strategy"] != strategy:
             return None
         return {
             "entry_reference_price": state.get("entry_reference_price"),
+            "entry_fill_price": state.get("entry_fill_price"),
             "initial_stop_loss": state.get("initial_stop_loss"),
             "initial_risk_per_share": state.get("initial_risk_per_share"),
             "entry_timestamp": state.get("entry_timestamp"),
@@ -1520,7 +1523,7 @@ class TradeLogger:
         return cursor.fetchone() is not None
 
     def _read_single_leg_open_state(self) -> dict[str, dict[str, Any]]:
-        """Return the current single-leg open-position state keyed by symbol."""
+        """Return open state keyed by symbol, including weighted fill basis."""
         if not os.path.exists(self._path):
             return {}
         try:
@@ -1530,8 +1533,8 @@ class TradeLogger:
         conn.row_factory = sqlite3.Row
         cursor = conn.execute(
             "SELECT symbol, strategy, side, qty, filled_qty, stop_price, "
-            "entry_reference_price, initial_stop_loss, initial_risk_per_share, "
-            "entry_timestamp "
+            "avg_fill_price, entry_reference_price, initial_stop_loss, "
+            "initial_risk_per_share, entry_timestamp "
             "FROM trades "
             "WHERE status IN ('filled', 'partial') "
             "AND (position_type IS NULL OR position_type != 'spread') "
@@ -1551,6 +1554,7 @@ class TradeLogger:
                     "open_qty": 0.0,
                     "stop_price": None,
                     "entry_reference_price": None,
+                    "entry_fill_price": None,
                     "initial_stop_loss": None,
                     "initial_risk_per_share": None,
                     "entry_timestamp": None,
@@ -1576,6 +1580,23 @@ class TradeLogger:
                         if row["initial_risk_per_share"] is not None else None
                     )
                     current["entry_timestamp"] = row["entry_timestamp"]
+                fill_price_raw = (
+                    row["avg_fill_price"]
+                    if row["avg_fill_price"] is not None
+                    else row["entry_reference_price"]
+                )
+                fill_price = (
+                    float(fill_price_raw) if fill_price_raw is not None else None
+                )
+                if fill_price is not None and fill_price > 0 and qty > 0:
+                    existing_qty = max(0.0, float(current["open_qty"]))
+                    existing_price = current["entry_fill_price"]
+                    if existing_qty <= 0 or existing_price is None:
+                        current["entry_fill_price"] = fill_price
+                    else:
+                        current["entry_fill_price"] = (
+                            float(existing_price) * existing_qty + fill_price * qty
+                        ) / (existing_qty + qty)
                 current["open_qty"] += qty
                 continue
 
@@ -1588,6 +1609,7 @@ class TradeLogger:
                     current["strategy"] = None
                     current["stop_price"] = None
                     current["entry_reference_price"] = None
+                    current["entry_fill_price"] = None
                     current["initial_stop_loss"] = None
                     current["initial_risk_per_share"] = None
                     current["entry_timestamp"] = None

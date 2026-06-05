@@ -4835,7 +4835,7 @@ class TradingEngine:
         self._allocator.restore_pnl_summary(summary)
 
     def _restore_entry_prices_from_db(self, snapshot: BrokerSnapshot) -> None:
-        """Restore entry prices for currently-open broker positions from the trade log."""
+        """Restore actual fill bases for currently-open broker positions."""
         for sym in snapshot.account.open_positions:
             owner_key = owner_key_for(sym)
             occ_m = _OCC_PAT.match(sym)
@@ -4853,7 +4853,7 @@ class TradingEngine:
                 )
             if context is None:
                 continue
-            entry_price = float(context.get("entry_reference_price") or 0.0)
+            entry_price = float(context.get("entry_fill_price") or 0.0)
             if entry_price <= 0.0:
                 continue
             self._entry_prices[owner_key] = entry_price

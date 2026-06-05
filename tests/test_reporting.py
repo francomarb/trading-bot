@@ -188,9 +188,9 @@ class TestTradeLogger:
             strategy_name="sma_crossover",
             modeled_price=160.0,
         )
-        assert record.realized_pnl == pytest.approx(100.0)
+        assert record.realized_pnl == pytest.approx(99.5)
         assert record.initial_risk_dollars == pytest.approx(50.0)
-        assert record.r_multiple == pytest.approx(2.0)
+        assert record.r_multiple == pytest.approx(1.99)
 
     def test_read_latest_open_entry_context_public_wrapper(self, tmp_csv, sample_decision, sample_result):
         tl = TradeLogger(path=tmp_csv)
@@ -203,7 +203,107 @@ class TestTradeLogger:
 
         assert context is not None
         assert context["entry_reference_price"] == pytest.approx(150.0)
+        assert context["entry_fill_price"] == pytest.approx(150.05)
         assert context["initial_risk_per_share"] == pytest.approx(5.0)
+
+    def test_open_entry_context_tracks_weighted_fill_basis_after_partial_sell(
+        self, tmp_csv
+    ):
+        tl = TradeLogger(path=tmp_csv)
+        first_decision = RiskDecision(
+            symbol="AAPL",
+            side=Side.BUY,
+            qty=10,
+            entry_reference_price=99.0,
+            stop_price=95.0,
+            strategy_name="sma_crossover",
+            reason="first entry",
+            order_type=OrderType.MARKET,
+        )
+        first_result = OrderResult(
+            status=OrderStatus.FILLED,
+            order_id="buy-1",
+            symbol="AAPL",
+            requested_qty=10,
+            filled_qty=10,
+            avg_fill_price=100.0,
+            raw_status="filled",
+            message="filled",
+        )
+        tl.log(tl.build_record(first_decision, first_result, modeled_price=99.0))
+        partial_close = OrderResult(
+            status=OrderStatus.PARTIAL,
+            order_id="sell-1",
+            symbol="AAPL",
+            requested_qty=10,
+            filled_qty=4,
+            avg_fill_price=110.0,
+            raw_status="partially_filled",
+            message="partial",
+        )
+        tl.log(tl.build_close_record(
+            partial_close,
+            strategy_name="sma_crossover",
+            modeled_price=110.0,
+        ))
+        second_decision = RiskDecision(
+            symbol="AAPL",
+            side=Side.BUY,
+            qty=2,
+            entry_reference_price=119.0,
+            stop_price=114.0,
+            strategy_name="sma_crossover",
+            reason="add",
+            order_type=OrderType.MARKET,
+        )
+        second_result = OrderResult(
+            status=OrderStatus.FILLED,
+            order_id="buy-2",
+            symbol="AAPL",
+            requested_qty=2,
+            filled_qty=2,
+            avg_fill_price=120.0,
+            raw_status="filled",
+            message="filled",
+        )
+        tl.log(tl.build_record(second_decision, second_result, modeled_price=119.0))
+
+        context = tl.read_latest_open_entry_context(
+            symbol="AAPL",
+            strategy="sma_crossover",
+        )
+
+        assert context is not None
+        assert context["entry_fill_price"] == pytest.approx(105.0)
+        assert context["entry_reference_price"] == pytest.approx(99.0)
+
+    def test_open_entry_context_falls_back_for_legacy_missing_fill_price(
+        self, tmp_csv, sample_decision
+    ):
+        tl = TradeLogger(path=tmp_csv)
+        legacy_result = OrderResult(
+            status=OrderStatus.FILLED,
+            order_id="legacy-buy",
+            symbol="AAPL",
+            requested_qty=10,
+            filled_qty=10,
+            avg_fill_price=None,
+            raw_status="filled",
+            message="legacy row",
+        )
+        tl.log(tl.build_record(
+            sample_decision,
+            legacy_result,
+            modeled_price=150.0,
+        ))
+
+        context = tl.read_latest_open_entry_context(
+            symbol="AAPL",
+            strategy="sma_crossover",
+        )
+
+        assert context is not None
+        assert context["entry_fill_price"] == pytest.approx(150.0)
 
     def test_partial_stop_fill_preserves_open_owner_context(self, tmp_csv):
         tl = TradeLogger(path=tmp_csv)
@@ -248,6 +348,9 @@ class TestTradeLogger:
         )
         assert context is not None
         assert context["entry_reference_price"] == pytest.approx(391.0)
+        assert context["entry_fill_price"] == pytest.approx(391.2)
+        stop_record = tl.read_recent(1)[0]
+        assert stop_record["realized_pnl"] == pytest.approx(-86.45)
         assert tl.has_recorded_order_id("stop-goog-1") is True
 
     def test_read_strategy_realized_pnl_summary_reconstructs_hwm(self, tmp_csv):
@@ -356,8 +459,8 @@ class TestTradeLogger:
             modeled_price=4.50,
         )
         assert record.initial_risk_dollars == pytest.approx(200.0)
-        assert record.realized_pnl == pytest.approx(200.0)
-        assert record.r_multiple == pytest.approx(1.0)
+        assert record.realized_pnl == pytest.approx(190.0)
+        assert record.r_multiple == pytest.approx(0.95)
 
     def test_option_stop_fill_uses_contract_multiplier(self, tmp_csv):
         tl = TradeLogger(path=tmp_csv)
@@ -394,8 +497,8 @@ class TestTradeLogger:
 
         stop_record = tl.read_recent(1)[0]
         assert stop_record["initial_risk_dollars"] == pytest.approx(200.0)
-        assert stop_record["realized_pnl"] == pytest.approx(-200.0)
-        assert stop_record["r_multiple"] == pytest.approx(-1.0)
+        assert stop_record["realized_pnl"] == pytest.approx(-210.0)
+        assert stop_record["r_multiple"] == pytest.approx(-1.05)
 
     def test_stop_fill_records_slippage_against_intended_stop(self, tmp_csv):
         tl = TradeLogger(path=tmp_csv)
