@@ -73,8 +73,8 @@ What did NOT land in Phase 1 (deferred as planned):
 
 | Phase | Scope | Branch | PR | Status |
 |---|---|---|---|---|
-| 1 | Schema + writers + dual-write to legacy + 13 codepath tests | `feature/slippage-unification-phase1` | — | ✅ Ready for review |
-| Smoke check | 2 days paper run; spot-check rows per codepath | (no branch) | — | ⬜ Not started |
+| 1 | Schema + writers + dual-write to legacy + 13 codepath tests | `feature/slippage-unification-phase1` | #43 merged `bf16b5a` | ✅ Merged |
+| Smoke check | 2 days paper run on main; spot-check rows per codepath | main | — | 🔄 In progress |
 | 2 + 4 | Consumer migration (health, risk, calibration, dashboard) + dashboard denominator dilution fix + drop legacy dual-writes | `feature/slippage-unification-phase2` | — | ⬜ Not started |
 | 3 | Historical cleanup migration (phantom recovery rows + pre-`8316e64` LIMIT rows) | `feature/slippage-unification-phase3` | — | ⬜ Not started |
 
@@ -149,15 +149,50 @@ Enum values (enforced via `Literal[...]` in `TradeRecord`):
 
 ## Smoke check plan (between Phase 1 and Phase 2)
 
-Goal: confirm writers fire correctly across codepaths that actually trigger in
-two paper days. Not exhaustive — coverage gaps get caught in Phase 2 review.
+Goal: confirm writers fire correctly across codepaths that actually trigger
+in ~2 paper days on main after PR #43 merged. Not exhaustive — coverage
+gaps get caught in Phase 2 review.
 
-- [ ] Bot recycles cleanly on Phase 1 branch (no schema migration errors)
+**Operator action required after merge:** `./recycle_bot.sh` to pick up the
+new code. Migration runs idempotently on the first `_ensure_db()` call.
+
+Checklist:
+
+- [ ] Bot recycles cleanly on main (no schema migration errors in logs)
 - [ ] Spot-check 5+ entry rows: `slippage_benchmark_kind IS NOT NULL`
-- [ ] Spot-check any exit rows: `slippage_signed_bps` matches legacy `realized_slippage_bps` exactly
+- [ ] Spot-check any exit rows: parity holds where expected
 - [ ] If any stop fires: confirm `stop_trigger_price IS NOT NULL`, `kind='active_stop_price'`
 - [ ] If any spread fills: confirm long-leg row has NULL slippage, not `0.0`
 - [ ] Dashboard still renders without errors (consumers still read legacy columns)
+- [ ] Health report still runs (`scripts/strategy_health_review.py`)
+- [ ] Risk kill switch does not trip on bogus values
+
+Spot-check queries (run against `data/trades.db`):
+
+```sql
+-- 1. Writers populate new columns across all kinds we expect to see
+SELECT slippage_benchmark_kind, slippage_measurement_quality, COUNT(*)
+FROM trades
+WHERE timestamp >= '<merge-date>'
+GROUP BY slippage_benchmark_kind, slippage_measurement_quality;
+
+-- 2. Parity guard — zero rows expected
+SELECT COUNT(*) AS drifted
+FROM trades
+WHERE slippage_signed_bps IS NOT NULL
+  AND realized_slippage_bps IS NOT NULL
+  AND ABS(realized_slippage_bps - slippage_signed_bps) > 0.01;
+
+-- 3. External close rows write NULL on both column families
+SELECT realized_slippage_bps, slippage_signed_bps, COUNT(*)
+FROM trades
+WHERE reason LIKE '%external%' AND timestamp >= '<merge-date>'
+GROUP BY realized_slippage_bps, slippage_signed_bps;
+```
+
+Rollback plan if smoke surfaces a regression: `git revert bf16b5a && ./recycle_bot.sh`.
+New writes return to legacy-only behavior; pre-existing rows untouched;
+smoke-period rows keep their new columns populated but no consumer reads them.
 
 ---
 
