@@ -1972,6 +1972,27 @@ class TestLogStopFillSlippageContract:
         assert row["realized_slippage_bps"] == pytest.approx(row["slippage_signed_bps"])
         assert row["modeled_slippage_bps"] > 0  # SLIPPAGE_MODEL_MARKET_BPS
 
+    def test_non_finite_broker_stop_writes_unavailable(self, tmp_csv):
+        """Defect 4 fix — +inf / -inf / NaN as stop_price must be
+        rejected. log_stop_fill writes the row as 'unavailable' rather
+        than benchmarking against a poisoned value."""
+        import math as _math
+        tl = TradeLogger(path=tmp_csv)
+        for bad in (_math.inf, -_math.inf, _math.nan):
+            tl.log_stop_fill(
+                symbol="AAPL",
+                strategy="sma_crossover",
+                qty=10.0,
+                avg_fill_price=144.50,
+                stop_price=bad,
+                order_id=f"stop-bad-{bad}",
+            )
+            row = self._read_one_stop_row(tmp_csv)
+            assert row["slippage_benchmark_kind"] == "unavailable", (
+                f"non-finite stop_price={bad} should produce 'unavailable'"
+            )
+            assert row["slippage_signed_bps"] is None
+
     def test_legacy_columns_keep_initial_stop_loss_fallback_when_broker_missing(self, tmp_csv):
         """
         Phase 1 compat: when broker stop is None, new cols go `unavailable`

@@ -1170,10 +1170,17 @@ class TradeLogger:
                     r_multiple = realized_pnl / initial_risk_dollars
 
         # ── Slippage unification (Phase 1) ──
-        # Broker stop_price is the authoritative benchmark. When absent,
-        # the new columns honestly report `unavailable`; legacy columns
-        # retain their pre-unification fallback for Phase 1 compat.
-        broker_stop_available = stop_price is not None and float(stop_price) > 0
+        # Broker stop_price is the authoritative benchmark. When absent
+        # or non-finite (Defect 4 defense-in-depth — engine callers
+        # already filter via _finite_or_none, but this guard catches
+        # any future caller that forgets), the new columns honestly
+        # report `unavailable`; legacy columns retain their
+        # pre-unification fallback for Phase 1 compat.
+        broker_stop_available = (
+            stop_price is not None
+            and math.isfinite(float(stop_price))
+            and float(stop_price) > 0
+        )
         new_slippage_benchmark_price: float | None = None
         new_slippage_benchmark_kind: SlippageBenchmarkKind = "unavailable"
         new_slippage_benchmark_timestamp: str | None = None

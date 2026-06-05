@@ -3060,16 +3060,12 @@ class TradingEngine:
         # order's actual stop_price so the slippage benchmark matches
         # the active stop that fired, not the original initial_stop_loss.
         # quality='recovered' tags the row for downstream consumers per
-        # codepath §5 in docs/slippage_unification_design.md.
-        recovered_stop_price: float | None = None
-        raw_recovered_stop = getattr(stop_fill, "stop_price", None)
-        if raw_recovered_stop is not None:
-            try:
-                candidate = float(raw_recovered_stop)
-            except (TypeError, ValueError):
-                candidate = None
-            if candidate is not None and candidate > 0:
-                recovered_stop_price = candidate
+        # codepath §5 in docs/slippage_unification_design.md. Defect 4
+        # fix: use _finite_or_none so NaN/+inf/-inf can't poison the
+        # benchmark.
+        recovered_stop_price = _finite_or_none(
+            getattr(stop_fill, "stop_price", None)
+        )
         self.trade_logger.log_stop_fill(
             symbol=raw_symbol,
             strategy=owner,
@@ -3618,16 +3614,13 @@ class TradingEngine:
                     # order's actual stop trigger price so log_stop_fill can
                     # benchmark against the active stop that fired, not the
                     # original initial_stop_loss. See codepath §4 in
-                    # docs/slippage_unification_design.md.
-                    raw_stop = getattr(update.order, "stop_price", None)
-                    broker_stop_price: float | None = None
-                    if raw_stop is not None:
-                        try:
-                            candidate = float(raw_stop)
-                        except (TypeError, ValueError):
-                            candidate = None
-                        if candidate is not None and candidate > 0:
-                            broker_stop_price = candidate
+                    # docs/slippage_unification_design.md. Defect 4 fix:
+                    # use _finite_or_none so NaN/+inf/-inf can't poison
+                    # the benchmark even if a misbehaving stream payload
+                    # delivers a malformed stop_price.
+                    broker_stop_price = _finite_or_none(
+                        getattr(update.order, "stop_price", None)
+                    )
                     stop_log_kwargs = {
                         "symbol": raw_symbol,
                         "strategy": owner,
