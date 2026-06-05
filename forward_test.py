@@ -328,7 +328,10 @@ def main() -> None:
     )
 
     # Broker (paper) — stream wired for stream-first fill detection.
-    broker = AlpacaBroker(stream_manager=stream)
+    broker = AlpacaBroker(
+        stream_manager=stream,
+        entry_allowed=lambda: not risk.is_halted(),
+    )
 
     # Reporting.
     trade_logger = TradeLogger()

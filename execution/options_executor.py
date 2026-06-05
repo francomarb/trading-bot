@@ -49,6 +49,7 @@ from config.settings import MLEG_ENTRY_WATCH_TIMEOUT_SECONDS
 
 # Callback signature: (status_str, filled_qty, avg_fill_price, order_id)
 FillCallback = Callable[[str, float, "float | None", str], None]
+EntryAllowedCallback = Callable[[], bool]
 
 # How long an unfilled limit order is allowed to work before we cancel it.
 _ENTRY_WATCH_TIMEOUT_SECONDS = MLEG_ENTRY_WATCH_TIMEOUT_SECONDS
@@ -276,6 +277,7 @@ class OptionsExecutionWorker(_BaseExecutionWorker):
         stream_manager: StreamManager | None = None,
         on_fill: FillCallback | None = None,
         client_order_id: str | None = None,
+        entry_allowed: EntryAllowedCallback | None = None,
     ) -> None:
         super().__init__(
             name=f"OptionsExecutor-{decision.symbol}",
@@ -285,6 +287,7 @@ class OptionsExecutionWorker(_BaseExecutionWorker):
         )
         self.decision = decision
         self.client_order_id = client_order_id
+        self._entry_allowed = entry_allowed
 
     def run(self) -> None:
         logger.info(
@@ -312,6 +315,15 @@ class OptionsExecutionWorker(_BaseExecutionWorker):
         stream_event = None
         if self.stream_manager is not None:
             stream_event = self.stream_manager.watch(client_order_id)
+
+        if self._entry_allowed is not None and not self._entry_allowed():
+            logger.warning(
+                f"[{self.name}] Entry canceled before submit: global risk halt active"
+            )
+            if self.stream_manager is not None:
+                self.stream_manager.unwatch(client_order_id)
+            self._report_fill("rejected", client_order_id)
+            return
 
         try:
             order = self.api.submit_order(req)
@@ -362,6 +374,7 @@ class SpreadExecutionWorker(_BaseExecutionWorker):
         api: TradingClient,
         stream_manager: StreamManager | None = None,
         on_fill: FillCallback | None = None,
+        entry_allowed: EntryAllowedCallback | None = None,
     ) -> None:
         # The short leg is the defining symbol for logging/identification.
         short_leg = next(
@@ -377,6 +390,7 @@ class SpreadExecutionWorker(_BaseExecutionWorker):
         self.qty = qty
         self.limit_price = limit_price
         self.strategy_name = strategy_name
+        self._entry_allowed = entry_allowed
 
     def run(self) -> None:
         logger.info(
@@ -400,6 +414,15 @@ class SpreadExecutionWorker(_BaseExecutionWorker):
         stream_event = None
         if self.stream_manager is not None:
             stream_event = self.stream_manager.watch(client_order_id)
+
+        if self._entry_allowed is not None and not self._entry_allowed():
+            logger.warning(
+                f"[{self.name}] Entry canceled before submit: global risk halt active"
+            )
+            if self.stream_manager is not None:
+                self.stream_manager.unwatch(client_order_id)
+            self._report_fill("rejected", client_order_id)
+            return
 
         try:
             order = self.api.submit_order(req)

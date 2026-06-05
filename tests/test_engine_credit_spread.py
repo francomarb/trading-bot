@@ -120,6 +120,57 @@ _SIGNAL_BAR = "2026-05-14"
 
 
 class TestEnterCreditSpread:
+    def test_existing_global_halt_blocks_mleg_dispatch(self, tmp_path):
+        strategy = _strategy()
+        engine, broker = _engine(tmp_path, strategy)
+        engine.risk.record_broker_error()
+        engine.risk.record_broker_error()
+        for _ in range(8):
+            engine.risk.record_broker_error()
+        assert engine.risk.is_halted()
+
+        with patch("strategies.credit_spread.find_best_put_spread") as picker:
+            engine._enter_multi_leg(
+                strategy=strategy,
+                symbol="SPY",
+                underlying_close=745.0,
+                notional_cap=2_000.0,
+                signal_key=_SIGNAL_KEY,
+                signal_bar=_SIGNAL_BAR,
+                strategy_statuses={},
+                strategy_reasons={},
+            )
+
+        picker.assert_not_called()
+        broker.dispatch_spread_order.assert_not_called()
+
+    def test_halt_during_plan_build_blocks_mleg_dispatch(self, tmp_path):
+        strategy = _strategy()
+        engine, broker = _engine(tmp_path, strategy)
+
+        def _pick_and_halt(*args, **kwargs):
+            for _ in range(10):
+                engine.risk.record_broker_error()
+            return _pick()
+
+        with patch(
+            "strategies.credit_spread.find_best_put_spread",
+            side_effect=_pick_and_halt,
+        ):
+            engine._enter_multi_leg(
+                strategy=strategy,
+                symbol="SPY",
+                underlying_close=745.0,
+                notional_cap=2_000.0,
+                signal_key=_SIGNAL_KEY,
+                signal_bar=_SIGNAL_BAR,
+                strategy_statuses={},
+                strategy_reasons={},
+            )
+
+        assert engine.risk.is_halted()
+        broker.dispatch_spread_order.assert_not_called()
+
     def test_happy_path_dispatches_and_pre_registers(self, tmp_path):
         strategy = _strategy()
         engine, broker = _engine(tmp_path, strategy)

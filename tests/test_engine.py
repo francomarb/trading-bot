@@ -429,6 +429,19 @@ class TestProcessSymbol:
         broker.close_position.assert_called_once_with("AAPL")
         broker.place_order.assert_not_called()
 
+    def test_global_halt_does_not_block_exit(self, engine_factory):
+        engine, broker = engine_factory(exits=[False] * 59 + [True])
+        positions = {"AAPL": Position("AAPL", 10, 100.0, 1010.0)}
+        snap = _snapshot(positions=positions)
+        for _ in range(10):
+            engine.risk.record_broker_error()
+        assert engine.risk.is_halted()
+
+        self._process(engine, "AAPL", snap)
+
+        broker.close_position.assert_called_once_with("AAPL")
+        broker.place_order.assert_not_called()
+
     def test_exit_signal_with_no_position_does_nothing(self, engine_factory):
         engine, broker = engine_factory(exits=[False] * 59 + [True])
         snap = _snapshot()
@@ -679,6 +692,26 @@ class TestProcessSymbol:
 
 
 class TestRunOneCycle:
+    def test_broker_snapshot_engages_restart_safe_account_halt(
+        self, engine_factory
+    ):
+        snap = _snapshot(equity=98_000.0, previous_close_equity=100_000.0)
+        engine, broker = engine_factory(
+            entries=[False] * 59 + [True],
+            snapshot=snap,
+            market_open=True,
+        )
+        engine.risk.hard_dollar_loss_cap = 2_000.0
+        engine.risk.max_daily_loss_pct = 0.99
+        engine._session_start_equity = 98_000.0
+        engine._cycle_count = 1
+
+        engine._run_one_cycle()
+
+        assert engine.risk.is_halted()
+        assert "previous close" in (engine.risk.halt_reason() or "")
+        broker.place_order.assert_not_called()
+
     def test_market_closed_skips_cycle(self, engine_factory):
         engine, broker = engine_factory(
             entries=[False] * 59 + [True],
