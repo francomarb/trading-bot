@@ -292,7 +292,6 @@ Add these columns:
 - `slippage_signed_bps REAL`
 - `slippage_adverse_bps REAL`
 - `stop_trigger_price REAL`
-- `current_stop_price REAL`
 
 Column semantics:
 
@@ -319,9 +318,6 @@ Column semantics:
   - `max(0, slippage_signed_bps)` for rows where slippage exists
 - `stop_trigger_price`
   - the actual active stop threshold that released the stop-market order
-- `current_stop_price`
-  - the latest durable active protective stop for the open position before any
-    stop fill occurs
 
 ### Legacy column treatment
 
@@ -411,8 +407,6 @@ Path:
 Must write:
 
 - `stop_trigger_price` = active stop that actually triggered
-- `current_stop_price` must already reflect the active stop from the latest
-  submit/replace path
 - `slippage_benchmark_kind='active_stop_price'`
 - `slippage_measurement_quality='primary'`
 - `slippage_signed_bps` = fill vs active stop
@@ -420,10 +414,11 @@ Must write:
 
 Critical implementation rule:
 
-- `log_stop_fill(...)` must read the stop benchmark from `current_stop_price`
-- if `current_stop_price` is unavailable, it may fall back to
-  `initial_stop_loss`
-- that fallback must stay explicit and audit-visible
+- `log_stop_fill(...)` must accept `stop_price: float | None`
+- on the WebSocket path, populate it from `update.order.stop_price`
+- if the broker stop price is unavailable, write `NULL` slippage with
+  `slippage_benchmark_kind='unavailable'` and
+  `slippage_measurement_quality='unavailable'`
 
 ### 5. Broker-history recovered stop fill
 
@@ -437,10 +432,15 @@ Must write:
 - `slippage_measurement_quality='recovered'`
 - broker `filled_at` timestamp override
 
-If the active stop price cannot be reconstructed honestly:
+Implementation rule:
+
+- populate the benchmark directly from the recovered broker order object's
+  `stop_price`
+
+If the broker stop price is unavailable:
 
 - write no slippage metric
-- do not synthesize from entry price or current stop guess
+- do not synthesize from entry price or any reconstructed guess
 
 ### 6. Standalone repair-stop fill
 
@@ -448,7 +448,8 @@ Path:
 
 - missing protective stop repaired via `place_protective_stop(...)`, later filled
 
-Must write exactly the same shape as any other stop fill.
+Must write exactly the same shape as any other stop fill, using the filled stop
+order's own broker `stop_price` as the benchmark.
 
 This codepath is historically high risk and must not be special-cased.
 
@@ -524,6 +525,31 @@ Must write:
 
 Keep the short-leg row as the economic row; long-leg rows should carry `NULL`
 slippage fields rather than structural zeros when possible.
+
+### 12. Single-leg external close
+
+Path:
+
+- disappearance confirmed by reconcile path → `log_external_close(...)`
+
+Must write:
+
+- `slippage_benchmark_kind='unavailable'`
+- `slippage_measurement_quality='unavailable'`
+- slippage fields as `NULL`
+
+This path must never invent slippage from stale entry or current market data.
+
+### 13. Spread external close
+
+Path:
+
+- spread disappears and is reconciled externally
+
+Must write:
+
+- the same `unavailable` slippage contract as single-leg external close on the
+  generated close rows
 
 ## Proposed Fill-Type Contract
 
@@ -616,24 +642,22 @@ Default rule:
 
 ## Stop Lifecycle Requirement
 
-The current fill-only trade table is not enough to guarantee correct stop-gap
-measurement once stops are repaired or trailed.
+The current implementation should prefer stateless broker truth over mutable DB
+state for stop-fill benchmarking.
 
-Minimal requirement:
+Phase-1 requirement:
 
-- whenever a protective stop is submitted or replaced, the latest open-position
-  context in the DB must reflect the active stop price that would be used if
-  the stop filled next.
+- when a stop fill is logged, the benchmark should come directly from the
+  broker order object that actually filled:
+  - `update.order.stop_price` on the WebSocket path
+  - `ClosedOrderInfo.stop_price` on the broker-history recovery path
 
-Preferred lightweight implementation:
+Why this is better:
 
-- add `current_stop_price` to the existing open-position context in `trades`,
-- update it on every stop submit / replace path:
-  - normal OTO entry stop
-  - fractional standalone stop
-  - repair stop
-  - option trailing stop replace
-- have `log_stop_fill(...)` read this value at fill time
+- it matches the actual order that filled,
+- it naturally handles trailed/repaired stops,
+- it avoids race conditions between stop replacement and DB state updates,
+- and it keeps the design aligned with the append-only preference.
 
 If later audits show we need a complete stop-event ledger, we can add it then.
 It should not be phase 1 of this fix.
@@ -698,8 +722,6 @@ briefly show both labels during the consumer-migration release.
 - start dual-writing:
   - `realized_slippage_bps` mirrors `slippage_signed_bps`
   - `modeled_slippage_bps` continues mirroring the current modeled/control value
-- add `current_stop_price` to the durable open-position context and update it
-  on every stop submit / replace path
 - passive MLEG legs will write `NULL` instead of `0.0`; consumers using
   `SUM(...)` / `AVG(...)` over legacy slippage columns should be audited.
   `AVG` over `NULL` is naturally safe, but `SUM` semantics shift and any
@@ -711,6 +733,8 @@ briefly show both labels during the consumer-migration release.
 - move calibration script to `slippage_adverse_bps`
 - move dashboard recent-trades display to the new benchmark fields
 - move strategy-level average slippage to an explicit chosen field
+- fix dashboard weighted-average dilution so rows with `NULL` slippage do not
+  contribute quantity to the denominator
 
 ### Phase 3 — Historical cleanup
 
@@ -719,6 +743,10 @@ briefly show both labels during the consumer-migration release.
   - `reason LIKE '%recovered entry context%'`
   - `realized_slippage_bps IS NOT NULL`
   - `timestamp < '2026-06-02T18:20:37+00:00'` (pre-`32e21c2`)
+- null or annotate pre-LIMIT-carve-out rows using:
+  - `order_type = 'limit'`
+  - `realized_slippage_bps IS NOT NULL`
+  - `timestamp < '2026-06-02T23:31:45+00:00'` (pre-`8316e64`)
 - comparison relies on ISO-8601 timestamp ordering; the migration script
   should verify the stored suffix format matches `TradeRecord.timestamp`
   before executing the cleanup query.
