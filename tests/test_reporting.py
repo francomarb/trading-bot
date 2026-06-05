@@ -2496,17 +2496,19 @@ class TestAlertDispatcher:
         dispatcher.stale_data("MSFT", "2 days old")
         dispatcher.broker_error("timeout")
         dispatcher.broker_info("reconnected")
+        dispatcher.option_trailing_state_unverified("SPY260618C00746000", "spy", 12.5)
         dispatcher.engine_halt("hard dollar cap")
         dispatcher.slippage_drift(15.0, 3.0)
         dispatcher.loss_streak_cooldown("sma", 3, 24.0)
 
-        assert len(backend.alerts) == 8
+        assert len(backend.alerts) == 9
         types = {a.alert_type for a in backend.alerts}
         assert AlertType.ORDER_REJECTION in types
         assert AlertType.CIRCUIT_BREAKER in types
         assert AlertType.STALE_DATA in types
         assert AlertType.BROKER_ERROR in types
         assert AlertType.BROKER_INFO in types
+        assert AlertType.OPTION_TRAILING_STATE_UNVERIFIED in types
         assert AlertType.ENGINE_HALT in types
         assert AlertType.SLIPPAGE_DRIFT in types
         assert AlertType.LOSS_STREAK_COOLDOWN in types

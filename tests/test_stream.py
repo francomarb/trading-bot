@@ -162,6 +162,15 @@ class TestStopLegRouting:
         with sm._lock:
             assert "stop-leg-1" in sm._stop_legs
 
+    def test_unregister_stop_leg_discards_superseded_order(self):
+        sm = _stream()
+        sm.register_stop_leg("old-stop")
+
+        sm.unregister_stop_leg("old-stop")
+
+        with sm._lock:
+            assert "old-stop" not in sm._stop_legs
+
     def test_sync_stop_legs_replaces_stale_registrations(self):
         sm = _stream()
         sm.register_stop_leg("old-stop")

@@ -3645,7 +3645,7 @@ class TestGenericSingleLegOptionTrailingStops:
         strategy = self.GenericOptionStrategy(entries=[False], exits=[False])
         broker = MagicMock()
         broker.get_open_orders.return_value = []
-        broker.submit_option_day_stop.return_value = OpenOrder(
+        broker.submit_option_gtc_stop.return_value = OpenOrder(
             order_id="new-stop",
             symbol="SPY260618C00746000",
             side=Side.SELL,
@@ -3655,6 +3655,19 @@ class TestGenericSingleLegOptionTrailingStops:
             submitted_at=T0,
             limit_price=None,
             stop_price=17.14,
+            time_in_force="gtc",
+        )
+        broker.replace_option_stop.return_value = OpenOrder(
+            order_id="replacement-stop",
+            symbol="SPY260618C00746000",
+            side=Side.SELL,
+            qty=3,
+            order_type=OrderType.MARKET,
+            status="accepted",
+            submitted_at=T0,
+            limit_price=None,
+            stop_price=18.70,
+            time_in_force="gtc",
         )
         risk = RiskManager(
             max_position_pct=0.02,
@@ -3696,7 +3709,7 @@ class TestGenericSingleLegOptionTrailingStops:
             )
         return engine, broker
 
-    def test_recreates_day_stop_from_persisted_hwm(self, tmp_path):
+    def test_recreates_gtc_stop_from_persisted_hwm(self, tmp_path):
         engine, broker = self._engine(tmp_path)
         engine.option_trailing_store.upsert(
             position_uid="pos_abc123",
@@ -3727,7 +3740,7 @@ class TestGenericSingleLegOptionTrailingStops:
 
         engine._sync_option_trailing_stops(snapshot)
 
-        broker.submit_option_day_stop.assert_called_once_with(
+        broker.submit_option_gtc_stop.assert_called_once_with(
             symbol="SPY260618C00746000",
             qty=3.0,
             stop_price=17.14,
@@ -3744,6 +3757,7 @@ class TestGenericSingleLegOptionTrailingStops:
 
     def test_startup_backfills_legacy_occ_lifecycle_then_recreates_stop(self, tmp_path):
         engine, broker = self._engine(tmp_path, create_lifecycle=False)
+        engine.alerts.option_trailing_state_unverified = MagicMock()
         snapshot = _snapshot(
             positions={
                 "SPY260618C00746000": Position(
@@ -3759,6 +3773,7 @@ class TestGenericSingleLegOptionTrailingStops:
 
         engine._reconcile_position_lifecycle(snapshot)
         engine._sync_option_trailing_stops(snapshot)
+        engine._sync_option_trailing_stops(snapshot)
 
         lifecycle_row = engine.lifecycle_store.get_open_for_owner_key("SPY")
         assert lifecycle_row is not None
@@ -3766,7 +3781,7 @@ class TestGenericSingleLegOptionTrailingStops:
         assert lifecycle_row.strategy == "generic_single_leg_options"
         assert lifecycle_row.metadata["synthesized"] is True
         assert lifecycle_row.legs[0].symbol == "SPY260618C00746000"
-        broker.submit_option_day_stop.assert_called_once_with(
+        broker.submit_option_gtc_stop.assert_called_once_with(
             symbol="SPY260618C00746000",
             qty=3.0,
             stop_price=13.17,
@@ -3775,6 +3790,55 @@ class TestGenericSingleLegOptionTrailingStops:
         assert trailing_row.position_uid == lifecycle_row.position_uid
         assert trailing_row.entry_premium == pytest.approx(12.77)
         assert trailing_row.hwm_premium == pytest.approx(15.50)
+        engine.alerts.option_trailing_state_unverified.assert_called_once_with(
+            "SPY260618C00746000",
+            "generic_single_leg_options",
+            15.50,
+        )
+
+    def test_adequate_gtc_stop_is_left_unchanged(self, tmp_path):
+        engine, broker = self._engine(tmp_path)
+        gtc_stop = replace(
+            _open_stop_order("SPY260618C00746000", stop_price=17.14),
+            order_id="gtc-stop",
+            qty=3,
+            time_in_force="gtc",
+        )
+        engine.option_trailing_store.upsert(
+            position_uid="pos_abc123",
+            occ_symbol="SPY260618C00746000",
+            strategy="generic_single_leg_options",
+            owner_key="SPY",
+            qty=3,
+            entry_premium=12.77,
+            hwm_premium=20.16,
+            trail_activation_pct=0.10,
+            trail_pct=0.15,
+            current_stop_price=17.14,
+            alpaca_stop_order_id="gtc-stop",
+            stop_order_status="accepted",
+            last_observed_premium=15.50,
+        )
+        snapshot = _snapshot(
+            positions={
+                "SPY260618C00746000": Position(
+                    symbol="SPY260618C00746000",
+                    qty=3,
+                    avg_entry_price=12.77,
+                    market_value=4_650.0,
+                    current_price=15.50,
+                )
+            },
+            open_orders=[gtc_stop],
+        )
+
+        engine._sync_option_trailing_stops(snapshot)
+
+        broker.replace_option_stop.assert_not_called()
+        broker.submit_option_gtc_stop.assert_not_called()
+        row = engine.option_trailing_store.get_by_occ("SPY260618C00746000")
+        assert row.alpaca_stop_order_id == "gtc-stop"
+        assert row.current_stop_price == pytest.approx(17.14)
 
     def test_ratchets_hwm_and_replaces_stale_stop_intraday(self, tmp_path):
         engine, broker = self._engine(tmp_path)
@@ -3782,9 +3846,10 @@ class TestGenericSingleLegOptionTrailingStops:
             _open_stop_order("SPY260618C00746000", stop_price=17.14),
             order_id="old-stop",
             qty=3,
+            time_in_force="gtc",
         )
-        broker.submit_option_day_stop.return_value = replace(
-            broker.submit_option_day_stop.return_value,
+        broker.replace_option_stop.return_value = replace(
+            broker.replace_option_stop.return_value,
             stop_price=18.70,
         )
         snapshot = _snapshot(
@@ -3802,24 +3867,27 @@ class TestGenericSingleLegOptionTrailingStops:
 
         engine._sync_option_trailing_stops(snapshot)
 
-        broker.cancel_order.assert_called_once_with("old-stop")
-        broker.submit_option_day_stop.assert_called_once_with(
-            symbol="SPY260618C00746000",
+        broker.replace_option_stop.assert_called_once_with(
+            order_id="old-stop",
             qty=3.0,
             stop_price=18.70,
         )
+        broker.cancel_order.assert_not_called()
+        broker.submit_option_gtc_stop.assert_not_called()
         row = engine.option_trailing_store.get_by_occ("SPY260618C00746000")
         assert row.hwm_premium == pytest.approx(22.00)
         assert row.current_stop_price == pytest.approx(18.70)
+        assert row.alpaca_stop_order_id == "replacement-stop"
 
-    def test_submit_failure_clears_canceled_order_id(self, tmp_path):
+    def test_replace_failure_keeps_existing_stop_live(self, tmp_path):
         engine, broker = self._engine(tmp_path)
         stale = replace(
             _open_stop_order("SPY260618C00746000", stop_price=17.14),
             order_id="old-stop",
             qty=3,
+            time_in_force="gtc",
         )
-        broker.submit_option_day_stop.side_effect = RuntimeError("api down")
+        broker.replace_option_stop.side_effect = RuntimeError("api down")
         snapshot = _snapshot(
             positions={
                 "SPY260618C00746000": Position(
@@ -3835,11 +3903,148 @@ class TestGenericSingleLegOptionTrailingStops:
 
         engine._sync_option_trailing_stops(snapshot)
 
-        broker.cancel_order.assert_called_once_with("old-stop")
+        broker.cancel_order.assert_not_called()
+        broker.submit_option_gtc_stop.assert_not_called()
         row = engine.option_trailing_store.get_by_occ("SPY260618C00746000")
-        assert row.stop_order_status == "submit_failed"
-        assert row.alpaca_stop_order_id is None
-        assert row.current_stop_price == pytest.approx(18.70)
+        assert row.stop_order_status == "replace_failed"
+        assert row.alpaca_stop_order_id == "old-stop"
+        assert row.current_stop_price == pytest.approx(17.14)
+
+    def test_adequate_day_stop_is_migrated_to_gtc(self, tmp_path):
+        engine, broker = self._engine(tmp_path)
+        day_stop = replace(
+            _open_stop_order("SPY260618C00746000", stop_price=17.14),
+            order_id="day-stop",
+            qty=3,
+            time_in_force="day",
+        )
+        broker.replace_option_stop.return_value = replace(
+            broker.replace_option_stop.return_value,
+            stop_price=17.14,
+        )
+        engine.option_trailing_store.upsert(
+            position_uid="pos_abc123",
+            occ_symbol="SPY260618C00746000",
+            strategy="generic_single_leg_options",
+            owner_key="SPY",
+            qty=3,
+            entry_premium=12.77,
+            hwm_premium=20.16,
+            trail_activation_pct=0.10,
+            trail_pct=0.15,
+            current_stop_price=17.14,
+            alpaca_stop_order_id="day-stop",
+            stop_order_status="accepted",
+            last_observed_premium=15.50,
+        )
+        snapshot = _snapshot(
+            positions={
+                "SPY260618C00746000": Position(
+                    symbol="SPY260618C00746000",
+                    qty=3,
+                    avg_entry_price=12.77,
+                    market_value=4_650.0,
+                    current_price=15.50,
+                )
+            },
+            open_orders=[day_stop],
+        )
+
+        engine._sync_option_trailing_stops(snapshot)
+
+        broker.replace_option_stop.assert_called_once_with(
+            order_id="day-stop",
+            qty=3.0,
+            stop_price=17.14,
+        )
+
+    def test_qty_mismatch_is_corrected_with_atomic_replace(self, tmp_path):
+        engine, broker = self._engine(tmp_path)
+        undersized_stop = replace(
+            _open_stop_order("SPY260618C00746000", stop_price=17.14),
+            order_id="undersized-stop",
+            qty=2,
+            time_in_force="gtc",
+        )
+        engine.option_trailing_store.upsert(
+            position_uid="pos_abc123",
+            occ_symbol="SPY260618C00746000",
+            strategy="generic_single_leg_options",
+            owner_key="SPY",
+            qty=2,
+            entry_premium=12.77,
+            hwm_premium=20.16,
+            trail_activation_pct=0.10,
+            trail_pct=0.15,
+            current_stop_price=17.14,
+            alpaca_stop_order_id="undersized-stop",
+            stop_order_status="accepted",
+            last_observed_premium=15.50,
+        )
+        broker.replace_option_stop.return_value = replace(
+            broker.replace_option_stop.return_value,
+            stop_price=17.14,
+        )
+        snapshot = _snapshot(
+            positions={
+                "SPY260618C00746000": Position(
+                    symbol="SPY260618C00746000",
+                    qty=3,
+                    avg_entry_price=12.77,
+                    market_value=4_650.0,
+                    current_price=15.50,
+                )
+            },
+            open_orders=[undersized_stop],
+        )
+
+        engine._sync_option_trailing_stops(snapshot)
+
+        broker.replace_option_stop.assert_called_once_with(
+            order_id="undersized-stop",
+            qty=3.0,
+            stop_price=17.14,
+        )
+
+    def test_missing_tif_uses_matching_durable_gtc_identity(self, tmp_path):
+        engine, broker = self._engine(tmp_path)
+        projected_stop = replace(
+            _open_stop_order("SPY260618C00746000", stop_price=17.14),
+            order_id="known-stop",
+            qty=3,
+            time_in_force=None,
+        )
+        engine.option_trailing_store.upsert(
+            position_uid="pos_abc123",
+            occ_symbol="SPY260618C00746000",
+            strategy="generic_single_leg_options",
+            owner_key="SPY",
+            qty=3,
+            entry_premium=12.77,
+            hwm_premium=20.16,
+            trail_activation_pct=0.10,
+            trail_pct=0.15,
+            current_stop_price=17.14,
+            alpaca_stop_order_id="known-stop",
+            stop_order_status="accepted",
+            last_observed_premium=15.50,
+        )
+        snapshot = _snapshot(
+            positions={
+                "SPY260618C00746000": Position(
+                    symbol="SPY260618C00746000",
+                    qty=3,
+                    avg_entry_price=12.77,
+                    market_value=4_650.0,
+                    current_price=15.50,
+                )
+            },
+            open_orders=[projected_stop],
+        )
+
+        engine._sync_option_trailing_stops(snapshot)
+
+        broker.replace_option_stop.assert_not_called()
 
     def test_recent_submit_missing_from_snapshot_does_not_duplicate(self, tmp_path):
         engine, broker = self._engine(tmp_path)
@@ -3873,7 +4078,7 @@ class TestGenericSingleLegOptionTrailingStops:
 
         engine._sync_option_trailing_stops(snapshot)
 
-        broker.submit_option_day_stop.assert_not_called()
+        broker.submit_option_gtc_stop.assert_not_called()
         row = engine.option_trailing_store.get_by_occ("SPY260618C00746000")
         assert row.alpaca_stop_order_id == "new-stop"
         assert row.stop_order_status == "accepted"

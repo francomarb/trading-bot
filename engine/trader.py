@@ -2808,7 +2808,7 @@ class TradingEngine:
         return 0.0 <= age.total_seconds() <= retry_grace
 
     def _sync_option_trailing_stops(self, snapshot: BrokerSnapshot) -> None:
-        """Create/ratchet DAY broker stops for managed single-leg options."""
+        """Create or atomically ratchet durable GTC single-leg option stops."""
         if self.option_trailing_store is None:
             return
         open_stop_by_occ = {
@@ -2858,6 +2858,14 @@ class TradingEngine:
                 row.hwm_premium if row is not None else entry_premium,
                 current_premium if current_premium is not None else entry_premium,
             )
+            if row is None:
+                logger.warning(
+                    f"[{owner}] {occ}: no durable option HWM was recoverable; "
+                    f"initializing conservatively at ${hwm:.2f}"
+                )
+                self.alerts.option_trailing_state_unverified(
+                    occ, owner, hwm
+                )
             restore = getattr(strategy, "restore_trailing_state", None)
             if restore is not None:
                 try:
@@ -2902,8 +2910,29 @@ class TradingEngine:
                 )
                 continue
 
-            # If an adequate DAY stop is already open, just persist its identity.
-            if existing is not None and (existing.stop_price or 0.0) >= desired_stop:
+            existing_tif = (
+                str(existing.time_in_force).lower()
+                if existing is not None and existing.time_in_force is not None
+                else None
+            )
+            existing_is_known_gtc = existing_tif == "gtc" or (
+                existing is not None
+                and existing_tif is None
+                and row is not None
+                and row.alpaca_stop_order_id == existing.order_id
+                and row.stop_order_status
+                in {"accepted", "new", "pending_new", "open", "replace_failed"}
+            )
+            existing_qty_matches = (
+                existing is not None and abs(float(existing.qty) - qty) <= 1e-9
+            )
+            # Keep an adequate durable stop. Legacy DAY stops are replaced with GTC.
+            if (
+                existing is not None
+                and (existing.stop_price or 0.0) >= desired_stop
+                and existing_is_known_gtc
+                and existing_qty_matches
+            ):
                 self.option_trailing_store.upsert(
                     position_uid=lifecycle_row.position_uid,
                     occ_symbol=occ,
@@ -2921,21 +2950,73 @@ class TradingEngine:
                 )
                 continue
 
-            # Replace only when the stop can ratchet upward or no DAY stop exists.
-            # We intentionally cancel first: submitting the replacement before
-            # canceling the old stop could leave two live SELL stops on the same
-            # option contract and oversell if both trigger.
+            # Alpaca's replace endpoint keeps protection at the broker boundary:
+            # a rejected replacement leaves the existing stop in place.
             if existing is not None:
-                self.broker.cancel_order(existing.order_id)
+                try:
+                    new_order = self.broker.replace_option_stop(
+                        order_id=existing.order_id,
+                        qty=qty,
+                        stop_price=max(
+                            desired_stop,
+                            float(existing.stop_price or desired_stop),
+                        ),
+                    )
+                except Exception as exc:
+                    logger.error(
+                        f"[{owner}] {occ}: failed to replace option trailing stop "
+                        f"{existing.order_id} with GTC @ ${desired_stop:.2f}: {exc}"
+                    )
+                    self.risk.record_broker_error()
+                    self.alerts.broker_error(
+                        f"{occ} option trailing stop replacement: {exc}"
+                    )
+                    self.option_trailing_store.upsert(
+                        position_uid=lifecycle_row.position_uid,
+                        occ_symbol=occ,
+                        strategy=owner,
+                        owner_key=owner_key,
+                        qty=qty,
+                        entry_premium=entry_premium,
+                        hwm_premium=hwm,
+                        trail_activation_pct=trail_activation_pct,
+                        trail_pct=trail_pct,
+                        current_stop_price=float(existing.stop_price or desired_stop),
+                        alpaca_stop_order_id=existing.order_id,
+                        stop_order_status="replace_failed",
+                        last_observed_premium=current_premium,
+                    )
+                    continue
+                self.option_trailing_store.upsert(
+                    position_uid=lifecycle_row.position_uid,
+                    occ_symbol=occ,
+                    strategy=owner,
+                    owner_key=owner_key,
+                    qty=qty,
+                    entry_premium=entry_premium,
+                    hwm_premium=hwm,
+                    trail_activation_pct=trail_activation_pct,
+                    trail_pct=trail_pct,
+                    current_stop_price=float(new_order.stop_price or desired_stop),
+                    alpaca_stop_order_id=new_order.order_id,
+                    stop_order_status=new_order.status,
+                    last_observed_premium=current_premium,
+                )
+                logger.info(
+                    f"[{owner}] {occ}: option GTC trailing stop replaced — "
+                    f"hwm=${hwm:.2f} stop=${float(new_order.stop_price or desired_stop):.2f}"
+                )
+                continue
+
             try:
-                new_order = self.broker.submit_option_day_stop(
+                new_order = self.broker.submit_option_gtc_stop(
                     symbol=occ,
                     qty=qty,
                     stop_price=desired_stop,
                 )
             except Exception as exc:
                 logger.error(
-                    f"[{owner}] {occ}: failed to submit option DAY trailing stop "
+                    f"[{owner}] {occ}: failed to submit option GTC trailing stop "
                     f"@ ${desired_stop:.2f}: {exc}"
                 )
                 self.risk.record_broker_error()
@@ -2972,7 +3053,7 @@ class TradingEngine:
                 last_observed_premium=current_premium,
             )
             logger.info(
-                f"[{owner}] {occ}: option DAY trailing stop synced — "
+                f"[{owner}] {occ}: option GTC trailing stop synced — "
                 f"hwm=${hwm:.2f} stop=${desired_stop:.2f}"
             )
 

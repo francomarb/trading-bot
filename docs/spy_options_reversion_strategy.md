@@ -41,7 +41,7 @@ human discretion lacks (greed, holding winners past the target).
 | Order type | LIMIT at OPRA bid/ask midpoint |
 | Spread guard | Reject if (ask − bid) / midpoint > 5% |
 | Take profit | **+200% safety valve** only — trailing stop handles real exits |
-| Trailing stop | Activates once B-S value rises ≥ **10%** above entry value; exits if value drops ≥ **15%** below HWM |
+| Trailing stop | Activates once Alpaca's observed premium rises ≥ **10%** above entry premium; exits if premium drops ≥ **15%** below the durable HWM |
 | Stop loss | **−25%** of entry premium (hard floor, always active) |
 | Time stop | Wednesday of expiry week at 3:30 PM ET |
 | Delta floor | Exit if Black-Scholes Delta < 0.30 (uses VIX as implied vol, cached daily) |
@@ -49,6 +49,17 @@ human discretion lacks (greed, holding winners past the target).
 | Regime gate | `TRENDING` or `RANGING` — blocked in BEAR and VOLATILE |
 | Sleeve weight | 0.05 of gross capital |
 | Max positions | 1 concurrent |
+
+The trailing HWM is durable across restarts and is shared by the strategy's
+software guard and its broker-side protective stop. Alpaca supports `gtc` for
+single-leg option stop orders, so the engine keeps one GTC stop open and uses
+the SDK replace-order endpoint when ratcheting it upward. Black-Scholes remains
+an input to the Delta floor only; it is not treated as an executable premium.
+When Alpaca does not provide a usable premium, the software trail leaves its
+HWM unchanged and skips that cycle rather than substituting a theoretical value.
+If an already-open option is adopted without a recoverable HWM, the engine
+alerts and bootstraps conservatively from the higher of entry premium and the
+current Alpaca position premium.
 
 **Capital math at $100k equity:**
 - Sleeve budget = $100k × 0.80 × 0.05 = **$4,000**
