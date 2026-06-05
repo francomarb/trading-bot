@@ -7,6 +7,48 @@ Status legend: ✅ done · 🔄 in progress · ⬜ not started · ⏸ blocked
 
 ---
 
+## Phase 1 — As-built summary
+
+Phase 1 is complete on `feature/slippage-unification-phase1` (9 commits,
+~1450 LOC including tests, 2083/2083 tests passing). The PR is open for
+review by ChatGPT + Gemini.
+
+What landed:
+
+- **6 nullable taxonomy columns** on `trades` (`slippage_benchmark_price`,
+  `slippage_benchmark_kind`, `slippage_benchmark_timestamp`,
+  `slippage_measurement_quality`, `slippage_signed_bps`,
+  `slippage_adverse_bps`) plus `stop_trigger_price`. Idempotent ALTER on
+  every bootstrap; pre-existing rows stay NULL.
+- **`Literal[...]` enum aliases** (`SlippageBenchmarkKind`,
+  `SlippageMeasurementQuality`) in `reporting.logger` so every writer
+  call site is type-checked.
+- **Stateless stop benchmarking** — `log_stop_fill` now accepts
+  `stop_price: float | None` directly from the broker order at fill
+  time. WebSocket path reads `update.order.stop_price`; recovery path
+  reads `ClosedOrderInfo.stop_price`. No mutable open-position state.
+  This is the load-bearing fix from the design.
+- **All 13 codepaths** tag rows with explicit benchmark kind + quality.
+  Default inference in `build_record` / `build_close_record` preserves
+  prior behavior for any future caller that omits the parameters.
+- **Dual-write preserved** — every populated row writes both the new
+  taxonomy columns and the legacy `realized_slippage_bps` /
+  `modeled_slippage_bps`. Where both are non-NULL they MUST agree, and
+  five focused parity tests guard against drift.
+- **Honest unavailable rows** — `log_external_close` no longer
+  fabricates `0.0` for rows that never had real measurements (a
+  deliberate change from the prior placeholder; Phase 2 consumers
+  must handle NULL).
+
+What did NOT land in Phase 1 (deferred as planned):
+
+- Consumer migration (health, risk, calibration, dashboard) — Phase 2.
+- Dashboard denominator dilution fix — Phase 2.
+- Stop legacy dual-writes — Phase 2 (folded in from prior Phase 4).
+- Historical row cleanup migration — Phase 3.
+
+---
+
 ## Phase plan (Option A)
 
 | Phase | Scope | Branch | PR | Status |
@@ -28,13 +70,13 @@ Branch: `feature/slippage-unification-phase1`
 |---|---|---:|---:|---|
 | 0 | Implementation tracker + PLAN.md pointer | ~50 | — | ✅ `c9d4cb3` |
 | 1 | Add slippage taxonomy columns to trades schema (idempotent ALTER TABLE) | ~70 | 4 | ✅ `be33be7` |
-| 2 | Add `stop_price` parameter to `log_stop_fill`; dual-write legacy | ~110 | 5 | 🔄 In progress |
-| 3 | Wire WebSocket stop fill to broker `stop_price` (codepath 4) | ~30 | 1 + 3 existing assertion updates | 🔄 In progress |
-| 4 | Wire recovery stop fill to broker `stop_price` (codepaths 5, 6) | ~30 | 2 | 🔄 In progress |
-| 5 | Tag single-leg entry/exit codepaths with benchmark kind (codepaths 1, 2, 3, 7, 9); add `benchmark_kind` + `benchmark_price` params to `build_close_record` | ~200 | 10 | 🔄 In progress |
-| 6 | Tag option and spread codepaths (10, 11) | ~110 | 3 | 🔄 In progress |
-| 7 | Tag external-close and recovered-context codepaths (8, 12, 13); stop writing `0.0` from `log_external_close` | ~80 | 3 | 🔄 In progress |
-| 8 | Cross-cutting legacy-mirror parity assertion | ~120 | 5 | 🔄 In progress |
+| 2 | Add `stop_price` parameter to `log_stop_fill`; dual-write legacy | ~110 | 5 | ✅ `f0113a7` |
+| 3 | Wire WebSocket stop fill to broker `stop_price` (codepath 4) | ~30 | 1 + 3 existing assertion updates | ✅ `793f7fb` |
+| 4 | Wire recovery stop fill to broker `stop_price` (codepaths 5, 6) | ~30 | 2 | ✅ `df0812c` |
+| 5 | Tag single-leg entry/exit codepaths with benchmark kind (codepaths 1, 2, 3, 7, 9); add `benchmark_kind` + `benchmark_price` params to `build_close_record` | ~200 | 10 | ✅ `b5e05fe` |
+| 6 | Tag option and spread codepaths (10, 11) | ~110 | 3 | ✅ `5b3d879` |
+| 7 | Tag external-close and recovered-context codepaths (8, 12, 13); stop writing `0.0` from `log_external_close` | ~80 | 3 | ✅ `0c0d508` |
+| 8 | Cross-cutting legacy-mirror parity assertion | ~120 | 5 | ✅ `e7c85b2` |
 
 Total estimate: ~325 LOC + ~250 LOC tests.
 
