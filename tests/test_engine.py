@@ -2429,6 +2429,77 @@ class TestExternalCloseDetection:
             1000.0,
         )
 
+    def test_recovered_stop_fill_passes_broker_stop_price_and_recovered_quality(
+        self, patch_fetch, tmp_path
+    ):
+        """
+        Slippage unification Phase 1 codepath §5 — recovery path forwards
+        ClosedOrderInfo.stop_price as the benchmark and tags the row
+        measurement_quality='recovered'.
+        """
+        engine, _, _ = _engine_with_confirm(patch_fetch, tmp_path, confirm=1)
+        engine._entry_prices["AAPL"] = 150.0
+
+        stop_fill = ClosedOrderInfo(
+            order_id="recovered-aapl-1",
+            client_order_id=None,
+            symbol="AAPL",
+            side=Side.SELL,
+            order_type="stop",
+            status=OrderStatus.FILLED,
+            raw_status="filled",
+            qty=10.0,
+            filled_qty=10.0,
+            avg_fill_price=144.50,
+            stop_price=145.00,
+            submitted_at=T0,
+            filled_at=T0 + timedelta(minutes=1),
+        )
+
+        engine.trade_logger.log_stop_fill = MagicMock()
+        engine._record_recovered_stop_fill(
+            symbol="AAPL",
+            owner="sma_crossover",
+            stop_fill=stop_fill,
+        )
+        kwargs = engine.trade_logger.log_stop_fill.call_args.kwargs
+        assert kwargs["stop_price"] == pytest.approx(145.00)
+        assert kwargs["measurement_quality"] == "recovered"
+
+    def test_recovered_stop_fill_forwards_none_when_broker_stop_price_missing(
+        self, patch_fetch, tmp_path
+    ):
+        """When the recovered broker order has no stop_price, log_stop_fill
+        receives stop_price=None and writes the row as 'unavailable'."""
+        engine, _, _ = _engine_with_confirm(patch_fetch, tmp_path, confirm=1)
+        engine._entry_prices["AAPL"] = 150.0
+
+        stop_fill = ClosedOrderInfo(
+            order_id="recovered-aapl-2",
+            client_order_id=None,
+            symbol="AAPL",
+            side=Side.SELL,
+            order_type="stop",
+            status=OrderStatus.FILLED,
+            raw_status="filled",
+            qty=10.0,
+            filled_qty=10.0,
+            avg_fill_price=144.50,
+            stop_price=None,
+            submitted_at=T0,
+            filled_at=T0 + timedelta(minutes=1),
+        )
+
+        engine.trade_logger.log_stop_fill = MagicMock()
+        engine._record_recovered_stop_fill(
+            symbol="AAPL",
+            owner="sma_crossover",
+            stop_fill=stop_fill,
+        )
+        kwargs = engine.trade_logger.log_stop_fill.call_args.kwargs
+        assert kwargs["stop_price"] is None
+        assert kwargs["measurement_quality"] == "recovered"
+
     def test_multiple_positions_only_confirmed_ones_cleared(self, patch_fetch, tmp_path):
         """Only positions that hit confirm threshold are cleared."""
         positions = {"MSFT": Position("MSFT", 5, 200.0, 1000.0)}
@@ -3179,6 +3250,7 @@ class TestOptionsEngineFixes:
             strategy="spy_options_reversion",
             qty=2,
             avg_fill_price=12.5,
+            stop_price=None,
             order_id="stop-ord-gap",
         )
         assert not engine._has_position("SPY")
@@ -3244,6 +3316,7 @@ class TestOptionsEngineFixes:
             strategy="fake_strategy",
             qty=7.0,
             avg_fill_price=378.85,
+            stop_price=None,
             order_id="goog-stop-1",
         )
         assert engine._has_position("GOOG")
@@ -3290,6 +3363,7 @@ class TestOptionsEngineFixes:
             strategy="donchian_breakout",
             qty=5.0,
             avg_fill_price=684.11,
+            stop_price=None,
             order_id="pwr-stop-1",
         )
         allocator.record_realized_pnl.assert_called_once_with(
@@ -3344,7 +3418,7 @@ class TestOptionsEngineFixes:
         engine._entry_prices["SPY"] = 10.0
 
         fill_update = SimpleNamespace(
-            order=SimpleNamespace(symbol=occ, id="stop-ord-1"),
+            order=SimpleNamespace(symbol=occ, id="stop-ord-1", stop_price="8.00"),
             price="7.50",
             qty="2",
         )
@@ -3362,9 +3436,42 @@ class TestOptionsEngineFixes:
             strategy="spy_options_reversion",
             qty=2,
             avg_fill_price=7.50,
+            stop_price=8.00,
             order_id="stop-ord-1",
         )
         engine.trade_logger.log_external_close.assert_not_called()
+
+    def test_stream_stop_fill_forwards_none_when_broker_stop_price_missing(self, tmp_path):
+        """
+        Slippage unification Phase 1 codepath §4 — when the broker order
+        carries no stop_price, the engine must forward stop_price=None
+        rather than synthesizing a fallback. log_stop_fill itself handles
+        the unavailable case by writing NULL slippage with kind/quality
+        of 'unavailable'.
+        """
+        from unittest.mock import MagicMock
+        from types import SimpleNamespace
+        from execution.stream import StreamManager
+
+        engine = self._engine(tmp_path)
+        engine._register_single_leg(strategy_name="sma_crossover", symbol="AAPL")
+        engine._entry_prices["AAPL"] = 100.0
+
+        fill_update = SimpleNamespace(
+            # Note: no stop_price attribute on the order.
+            order=SimpleNamespace(symbol="AAPL", id="stop-ord-no-stop"),
+            price="99.40",
+            qty="10",
+        )
+        stream = MagicMock(spec=StreamManager)
+        stream.drain_stop_fills.return_value = [fill_update]
+        engine._stream_manager = stream
+
+        engine.trade_logger.log_stop_fill = MagicMock()
+        engine._process_stream_stop_fills(_snapshot())
+
+        kwargs = engine.trade_logger.log_stop_fill.call_args.kwargs
+        assert kwargs["stop_price"] is None
 
     def test_stream_stop_fill_falls_back_to_external_close_when_price_missing(self, tmp_path):
         """When price is missing from the stream event, fall back to log_external_close."""
@@ -3891,3 +3998,255 @@ class TestSectorExposure:
         # Should not raise; counts that symbol as unmapped.
         exposure = engine._compute_sector_exposure()
         assert exposure == {}
+
+
+# ── Slippage unification Defect 1 fix ──────────────────────────────────────
+
+
+class TestExitPathBenchmarkKind:
+    """
+    Codepath §3 — discretionary market exits. The exit path never
+    fetches an arrival midpoint; it passes latest_close (equities) or
+    the fill price itself (options) as ``modeled_price``. Phase 1
+    Defect 1 fix changes the tagging so:
+
+      - equity exits → benchmark_kind='fallback_latest_close', quality='fallback'
+      - option exits → benchmark_kind='unavailable', quality='unavailable'
+
+    Previously both were tagged 'arrival_midpoint' / 'primary', which
+    was a false claim for equities and a fabricated zero-slippage
+    measurement for options.
+    """
+
+    def _engine_with_real_logger(self, tmp_path):
+        from strategies.base import StrategySlot
+        from data.watchlists import StaticWatchlistSource
+        from execution.broker import BrokerSnapshot
+
+        strategy = FakeStrategy(entries=[False], exits=[False])
+        broker = MagicMock()
+        broker.sync_with_broker.return_value = _snapshot()
+        broker.close_position.return_value = _filled_result("AAPL", 10, 149.50)
+        broker.get_open_orders.return_value = []
+        broker._with_retry.side_effect = lambda fn, **_: fn()
+        broker._api.get_clock.return_value = SimpleNamespace(is_open=True)
+
+        risk = RiskManager(
+            max_position_pct=0.02,
+            max_open_positions=5,
+            max_gross_exposure_pct=0.50,
+            atr_stop_multiplier=2.0,
+            max_daily_loss_pct=0.05,
+            hard_dollar_loss_cap=1_000_000.0,
+            loss_streak_threshold=10,
+            broker_error_threshold=10,
+        )
+        tl = TradeLogger(path=str(tmp_path / "trades.db"))
+        return TradingEngine(
+            strategy=strategy,
+            symbols=["AAPL"],
+            risk=risk,
+            broker=broker,
+            trade_logger=tl,
+            config=EngineConfig(
+                history_lookback_days=120,
+                cycle_interval_seconds=0.01,
+                max_bar_age_multiplier=10.0,
+                market_hours_only=False,
+            ),
+        ), broker
+
+    def test_equity_exit_tags_fallback_latest_close(self, tmp_path):
+        engine, broker = self._engine_with_real_logger(tmp_path)
+        from execution.broker import BrokerSnapshot
+        position = SimpleNamespace(
+            qty=10, symbol="AAPL", avg_entry_price=148.0,
+            market_value=1480.0, unrealized_pl=0.0,
+            current_price=148.0, cost_basis=1480.0,
+            asset_id="x", side="long",
+        )
+        snap = BrokerSnapshot(
+            account=SimpleNamespace(
+                equity=100_000.0,
+                cash=50_000.0,
+                buying_power=50_000.0,
+                open_positions={"AAPL": position},
+            ),
+            open_orders=[],
+        )
+        engine._log_close = MagicMock()
+        engine._close_single_leg_position(
+            symbol="AAPL",
+            strategy=engine.strategy,
+            position=position,
+            snapshot=snap,
+            latest_close=149.00,
+            alert_reason="exit signal",
+        )
+        kwargs = engine._log_close.call_args.kwargs
+        assert kwargs["benchmark_kind"] == "fallback_latest_close"
+        assert kwargs["measurement_quality"] == "fallback"
+
+    def test_option_exit_tags_unavailable(self, tmp_path):
+        engine, broker = self._engine_with_real_logger(tmp_path)
+        occ = "SPY260620C00520000"
+        broker.close_position.return_value = _filled_result(occ, 2, 12.50)
+        from execution.broker import BrokerSnapshot
+        position = SimpleNamespace(
+            qty=2, symbol=occ, avg_entry_price=10.0,
+            market_value=2000.0, unrealized_pl=500.0,
+            current_price=12.5, cost_basis=2000.0,
+            asset_id="x", side="long",
+        )
+        snap = BrokerSnapshot(
+            account=SimpleNamespace(
+                equity=100_000.0,
+                cash=50_000.0,
+                buying_power=50_000.0,
+                open_positions={occ: position},
+            ),
+            open_orders=[],
+        )
+        engine._log_close = MagicMock()
+        engine._close_single_leg_position(
+            symbol="SPY",
+            strategy=engine.strategy,
+            position=position,
+            snapshot=snap,
+            latest_close=12.50,
+            alert_reason="exit signal",
+        )
+        kwargs = engine._log_close.call_args.kwargs
+        # Options have no honest benchmark at exit — must be unavailable,
+        # never the fill price masquerading as 'arrival_midpoint'.
+        assert kwargs["benchmark_kind"] == "unavailable"
+        assert kwargs["measurement_quality"] == "unavailable"
+
+
+# ── Slippage unification Defect 2 fix ──────────────────────────────────────
+
+
+class TestSuspectOrderBenchmarkProvenance:
+    """
+    Defect 2 (Medium): SuspectOrder previously stored only the resolved
+    modeled_price, not whether the submission used an arrival_midpoint
+    or a latest_close fallback. Recovery hardcoded
+    benchmark_kind='arrival_midpoint', so a row that originally fell
+    into the fallback branch would be mislabeled on recovery.
+
+    Fix preserves modeled_price_kind on SuspectOrder and threads it
+    back through _log_entry at recovery time.
+    """
+
+    def test_recovery_preserves_fallback_kind(self, tmp_path):
+        from execution.broker import BrokerSnapshot, OrderStatus
+        from engine.trader import SuspectOrder
+        from risk.manager import RiskDecision
+
+        # Build a minimal engine via the same fixture as TestExitPathBenchmarkKind.
+        helper = TestExitPathBenchmarkKind()
+        engine, broker = helper._engine_with_real_logger(tmp_path)
+
+        decision = RiskDecision(
+            symbol="AAPL",
+            side=Side.BUY,
+            qty=10,
+            stop_price=145.0,
+            entry_reference_price=150.0,
+            strategy_name="sma_crossover",
+            reason="entry signal",
+            order_type=OrderType.MARKET,
+        )
+        # Simulate a suspect-order originally captured under the
+        # fallback_latest_close branch (no arrival quote available).
+        engine._suspect_orders["AAPL"] = SuspectOrder(
+            decision=decision,
+            order_id="ord-suspect-1",
+            modeled_price=150.0,
+            modeled_price_kind="fallback_latest_close",
+        )
+
+        broker.reconcile_submitted_order.return_value = _filled_result(
+            "AAPL",
+            10,
+            150.05,
+            submitted_at=T0,
+            filled_at=T0 + timedelta(minutes=1),
+        )
+
+        snap = BrokerSnapshot(
+            account=SimpleNamespace(
+                equity=100_000.0,
+                cash=50_000.0,
+                buying_power=50_000.0,
+                open_positions={"AAPL": SimpleNamespace(
+                    qty=10, symbol="AAPL", avg_entry_price=150.05,
+                    market_value=1500.5, unrealized_pl=0.0,
+                    current_price=150.05, cost_basis=1500.5,
+                    asset_id="x", side="long",
+                )},
+            ),
+            open_orders=[],
+        )
+        engine._log_entry = MagicMock()
+        engine._ensure_recovered_protective_stop = MagicMock()
+        engine._recover_suspect_orders(snap)
+
+        kwargs = engine._log_entry.call_args.kwargs
+        assert kwargs["benchmark_kind"] == "fallback_latest_close"
+        assert kwargs["measurement_quality"] == "recovered"
+
+    def test_recovery_preserves_arrival_kind(self, tmp_path):
+        from execution.broker import BrokerSnapshot, OrderStatus
+        from engine.trader import SuspectOrder
+        from risk.manager import RiskDecision
+
+        helper = TestExitPathBenchmarkKind()
+        engine, broker = helper._engine_with_real_logger(tmp_path)
+
+        decision = RiskDecision(
+            symbol="AAPL",
+            side=Side.BUY,
+            qty=10,
+            stop_price=145.0,
+            entry_reference_price=150.0,
+            strategy_name="sma_crossover",
+            reason="entry signal",
+            order_type=OrderType.MARKET,
+        )
+        engine._suspect_orders["AAPL"] = SuspectOrder(
+            decision=decision,
+            order_id="ord-suspect-2",
+            modeled_price=150.0,
+            modeled_price_kind="arrival_midpoint",
+        )
+
+        broker.reconcile_submitted_order.return_value = _filled_result(
+            "AAPL",
+            10,
+            150.05,
+            submitted_at=T0,
+            filled_at=T0 + timedelta(minutes=1),
+        )
+
+        snap = BrokerSnapshot(
+            account=SimpleNamespace(
+                equity=100_000.0,
+                cash=50_000.0,
+                buying_power=50_000.0,
+                open_positions={"AAPL": SimpleNamespace(
+                    qty=10, symbol="AAPL", avg_entry_price=150.05,
+                    market_value=1500.5, unrealized_pl=0.0,
+                    current_price=150.05, cost_basis=1500.5,
+                    asset_id="x", side="long",
+                )},
+            ),
+            open_orders=[],
+        )
+        engine._log_entry = MagicMock()
+        engine._ensure_recovered_protective_stop = MagicMock()
+        engine._recover_suspect_orders(snap)
+
+        kwargs = engine._log_entry.call_args.kwargs
+        assert kwargs["benchmark_kind"] == "arrival_midpoint"
+        assert kwargs["measurement_quality"] == "recovered"

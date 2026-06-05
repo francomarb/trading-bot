@@ -1209,6 +1209,927 @@ class TestMlegRealizedSlippageBps:
         ) == pytest.approx(500.0)
 
 
+# ── TestSlippageUnificationSchema ──────────────────────────────────────────
+
+
+class TestSlippageUnificationSchema:
+    """
+    Phase 1 of slippage unification — see docs/slippage_unification_design.md.
+
+    Asserts that the additive schema columns exist on freshly created DBs
+    and that the migration path (ALTER TABLE) is idempotent for pre-existing
+    DBs that lack the columns.
+    """
+
+    _NEW_COLUMNS = [
+        "slippage_benchmark_price",
+        "slippage_benchmark_kind",
+        "slippage_benchmark_timestamp",
+        "slippage_measurement_quality",
+        "slippage_signed_bps",
+        "slippage_adverse_bps",
+        "stop_trigger_price",
+    ]
+
+    def _column_set(self, db_path: str) -> set[str]:
+        conn = sqlite3.connect(db_path)
+        try:
+            return {row[1] for row in conn.execute("PRAGMA table_info(trades)").fetchall()}
+        finally:
+            conn.close()
+
+    def test_fresh_db_has_all_slippage_columns(self, tmp_csv):
+        TradeLogger(path=tmp_csv)._ensure_db()
+        columns = self._column_set(tmp_csv)
+        for col in self._NEW_COLUMNS:
+            assert col in columns, f"missing column on fresh DB: {col}"
+
+    def test_migration_adds_columns_to_legacy_db(self, tmp_path):
+        """A pre-existing DB without the new columns gets them via ALTER."""
+        db_path = str(tmp_path / "legacy.db")
+        conn = sqlite3.connect(db_path)
+        conn.execute(
+            """
+            CREATE TABLE trades (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                timestamp TEXT NOT NULL,
+                symbol TEXT NOT NULL,
+                side TEXT NOT NULL,
+                qty REAL NOT NULL,
+                strategy TEXT NOT NULL,
+                reason TEXT NOT NULL,
+                status TEXT NOT NULL
+            )
+            """
+        )
+        conn.commit()
+        conn.close()
+
+        before = self._column_set(db_path)
+        for col in self._NEW_COLUMNS:
+            assert col not in before, f"precondition: {col} should be absent"
+
+        TradeLogger(path=db_path)._ensure_db()
+
+        after = self._column_set(db_path)
+        for col in self._NEW_COLUMNS:
+            assert col in after, f"migration failed to add: {col}"
+
+    def test_ensure_db_is_idempotent(self, tmp_csv):
+        """Running _ensure_db twice on the same DB must not error."""
+        TradeLogger(path=tmp_csv)._ensure_db()
+        # Re-open and re-bootstrap — proves ALTER guards work.
+        TradeLogger(path=tmp_csv)._ensure_db()
+        columns = self._column_set(tmp_csv)
+        for col in self._NEW_COLUMNS:
+            assert col in columns
+
+    def test_bootstrap_failure_does_not_cache_poisoned_connection(self, tmp_path):
+        """Defect 3 fix — if any step of _ensure_db raises after the
+        connection is opened, the connection must NOT be cached.
+        The next call to _ensure_db should retry from scratch and
+        succeed (assuming the underlying issue is gone).
+
+        Simulates failure by patching a downstream DDL import to raise
+        once, then succeed on retry."""
+        from unittest.mock import patch
+
+        db_path = str(tmp_path / "boot_fail.db")
+        tl = TradeLogger(path=db_path)
+
+        # Inject failure at one of the deferred-import DDL constants.
+        # The real import path is exercised inside _ensure_db.
+        call_count = {"n": 0}
+        real_import = __import__
+
+        def flaky_import(name, *args, **kwargs):
+            if name == "engine.lifecycle" and call_count["n"] == 0:
+                call_count["n"] += 1
+                raise RuntimeError("simulated mid-bootstrap failure")
+            return real_import(name, *args, **kwargs)
+
+        with patch("builtins.__import__", side_effect=flaky_import):
+            with pytest.raises(RuntimeError, match="simulated"):
+                tl._ensure_db()
+
+        # Cached connection must NOT have been published after the failure.
+        assert tl._conn is None, "poisoned connection cached after bootstrap failure"
+
+        # Retry succeeds — proves the migration is idempotent across the
+        # post-failure recovery path.
+        conn = tl._ensure_db()
+        assert conn is not None
+        # All new columns are present after the successful retry.
+        existing = {r[1] for r in conn.execute("PRAGMA table_info(trades)").fetchall()}
+        for col in self._NEW_COLUMNS:
+            assert col in existing
+
+    def test_trade_record_dataclass_defaults_remain_none(self):
+        """Direct dataclass construction without writer logic leaves new
+        fields None. This guards against any future caller that builds a
+        TradeRecord directly bypassing the writer-side default inference."""
+        record = TradeRecord(
+            timestamp="2026-06-05T00:00:00+00:00",
+            symbol="AAPL",
+            side="buy",
+            qty=1.0,
+            avg_fill_price=100.0,
+            order_id="x",
+            strategy="s",
+            reason="r",
+            stop_price=0.0,
+            entry_reference_price=100.0,
+            modeled_slippage_bps=None,
+            realized_slippage_bps=None,
+            order_type="market",
+            status="filled",
+            requested_qty=1.0,
+            filled_qty=1.0,
+        )
+        for col in self._NEW_COLUMNS:
+            assert getattr(record, col) is None
+
+
+# ── TestBuildRecordSlippageContract ────────────────────────────────────────
+
+
+class TestBuildRecordSlippageContract:
+    """
+    Phase 1 commit 5 of slippage unification — codepaths §1, §2 in
+    docs/slippage_unification_design.md. build_record now populates the
+    new taxonomy columns and accepts explicit benchmark_kind/quality
+    parameters so callers can declare arrival vs fallback.
+    """
+
+    def test_market_entry_with_arrival_midpoint_writes_primary(
+        self, sample_decision, sample_result
+    ):
+        tl = TradeLogger(path="/dev/null")
+        record = tl.build_record(
+            sample_decision,
+            sample_result,
+            modeled_price=150.0,
+            benchmark_kind="arrival_midpoint",
+        )
+        assert record.slippage_benchmark_kind == "arrival_midpoint"
+        assert record.slippage_measurement_quality == "primary"
+        assert record.slippage_benchmark_price == pytest.approx(150.0)
+        assert record.slippage_benchmark_timestamp is not None
+        assert record.slippage_signed_bps is not None
+        assert record.slippage_adverse_bps == max(0.0, record.slippage_signed_bps)
+
+    def test_market_entry_with_fallback_close_writes_fallback_quality(
+        self, sample_decision, sample_result
+    ):
+        tl = TradeLogger(path="/dev/null")
+        record = tl.build_record(
+            sample_decision,
+            sample_result,
+            modeled_price=150.0,
+            benchmark_kind="fallback_latest_close",
+        )
+        assert record.slippage_benchmark_kind == "fallback_latest_close"
+        assert record.slippage_measurement_quality == "fallback"
+
+    def test_market_entry_without_benchmark_writes_unavailable(
+        self, sample_decision, sample_result
+    ):
+        tl = TradeLogger(path="/dev/null")
+        record = tl.build_record(
+            sample_decision,
+            sample_result,
+            modeled_price=None,
+        )
+        assert record.slippage_benchmark_kind == "unavailable"
+        assert record.slippage_measurement_quality == "unavailable"
+        assert record.slippage_signed_bps is None
+        assert record.slippage_adverse_bps is None
+
+    def test_market_entry_without_benchmark_legacy_still_uses_decision_price(
+        self, sample_decision, sample_result
+    ):
+        """Defect 5 — documented Phase 1 divergence. When modeled_price
+        is None on a market entry, the legacy realized_slippage_bps
+        column falls back to ``decision.entry_reference_price`` as the
+        benchmark, while the new column honestly says 'unavailable'.
+        Aligning legacy with new here would change consumer-visible
+        numbers for live SMA / Donchian / Bollinger fills today and
+        therefore belongs in Phase 2 consumer migration. This test
+        pins the current intentional divergence so any future change
+        is deliberate."""
+        tl = TradeLogger(path="/dev/null")
+        record = tl.build_record(
+            sample_decision,
+            sample_result,
+            modeled_price=None,
+        )
+        # New cols: honestly unavailable.
+        assert record.slippage_signed_bps is None
+        # Legacy cols: still populated against decision price (the
+        # pre-unification fallback). Divergence is documented and
+        # deliberate for Phase 1; Phase 2 may reconcile.
+        assert record.realized_slippage_bps is not None
+        assert record.modeled_slippage_bps is not None
+
+    def test_limit_entry_writes_limit_price_unavailable(self, sample_result):
+        from risk.manager import RiskDecision
+        decision = RiskDecision(
+            symbol="AAPL",
+            side=Side.BUY,
+            qty=10,
+            stop_price=145.0,
+            entry_reference_price=150.0,
+            strategy_name="rsi_reversion",
+            reason="rsi oversold",
+            order_type=OrderType.LIMIT,
+            limit_price=149.50,
+        )
+        tl = TradeLogger(path="/dev/null")
+        record = tl.build_record(decision, sample_result, modeled_price=150.0)
+        assert record.slippage_benchmark_kind == "limit_price"
+        assert record.slippage_measurement_quality == "unavailable"
+        assert record.slippage_signed_bps is None
+        assert record.slippage_adverse_bps is None
+        # Legacy columns also NULL — preserves the LIMIT carve-out (8316e64).
+        assert record.realized_slippage_bps is None
+
+    def test_record_slippage_false_writes_unavailable(
+        self, sample_decision, sample_result
+    ):
+        tl = TradeLogger(path="/dev/null")
+        record = tl.build_record(
+            sample_decision,
+            sample_result,
+            modeled_price=150.0,
+            record_slippage=False,
+        )
+        assert record.slippage_benchmark_kind == "unavailable"
+        assert record.slippage_measurement_quality == "unavailable"
+
+    def test_measurement_quality_recovered_override(
+        self, sample_decision, sample_result
+    ):
+        """Codepath §9 — suspect-order recovery tags rows quality='recovered'."""
+        tl = TradeLogger(path="/dev/null")
+        record = tl.build_record(
+            sample_decision,
+            sample_result,
+            modeled_price=150.0,
+            benchmark_kind="arrival_midpoint",
+            measurement_quality="recovered",
+        )
+        assert record.slippage_benchmark_kind == "arrival_midpoint"
+        assert record.slippage_measurement_quality == "recovered"
+
+    def test_legacy_dual_write_matches_new_signed_on_market(
+        self, sample_decision, sample_result
+    ):
+        tl = TradeLogger(path="/dev/null")
+        record = tl.build_record(
+            sample_decision,
+            sample_result,
+            modeled_price=150.0,
+            benchmark_kind="arrival_midpoint",
+        )
+        # Both compute against the same modeled_price → must match.
+        assert record.realized_slippage_bps == pytest.approx(record.slippage_signed_bps)
+
+
+# ── TestBuildCloseRecordSlippageContract ───────────────────────────────────
+
+
+class TestBuildCloseRecordSlippageContract:
+    """
+    Phase 1 commit 5 of slippage unification — codepaths §3, §7.
+    build_close_record accepts benchmark_kind/quality so the fractional
+    residual cleanup path can honestly declare 'unavailable' rather than
+    inheriting the stop-fill slippage.
+    """
+
+    def _make_close_result(self):
+        return OrderResult(
+            status=OrderStatus.FILLED,
+            order_id="exit-1",
+            symbol="AAPL",
+            requested_qty=10,
+            filled_qty=10,
+            avg_fill_price=152.0,
+            raw_status="filled",
+        )
+
+    def test_default_kind_is_unavailable_safe(self):
+        """Defect 1 fix — caller that omits benchmark_kind gets a safe
+        'unavailable' tag, never a fabricated 'arrival_midpoint'. The
+        real exit caller in engine/trader.py declares fallback or
+        unavailable per equity-vs-option as appropriate."""
+        tl = TradeLogger(path="/dev/null")
+        record = tl.build_close_record(
+            self._make_close_result(),
+            strategy_name="sma_crossover",
+            modeled_price=151.50,
+        )
+        assert record.slippage_benchmark_kind == "unavailable"
+        assert record.slippage_measurement_quality == "unavailable"
+        assert record.slippage_signed_bps is None
+        assert record.slippage_adverse_bps is None
+
+    def test_explicit_arrival_midpoint_kind_writes_primary(self):
+        """When the caller declares an honest arrival_midpoint benchmark,
+        the row gets primary quality and the computed slippage."""
+        tl = TradeLogger(path="/dev/null")
+        record = tl.build_close_record(
+            self._make_close_result(),
+            strategy_name="sma_crossover",
+            modeled_price=151.50,
+            benchmark_kind="arrival_midpoint",
+        )
+        assert record.slippage_benchmark_kind == "arrival_midpoint"
+        assert record.slippage_measurement_quality == "primary"
+        assert record.slippage_benchmark_price == pytest.approx(151.50)
+        assert record.slippage_signed_bps is not None
+
+    def test_explicit_fallback_kind_writes_fallback_quality(self):
+        """Defect 1 fix — equity exits using latest_close as a fallback
+        proxy must be tagged fallback_latest_close / fallback."""
+        tl = TradeLogger(path="/dev/null")
+        record = tl.build_close_record(
+            self._make_close_result(),
+            strategy_name="sma_crossover",
+            modeled_price=151.50,
+            benchmark_kind="fallback_latest_close",
+        )
+        assert record.slippage_benchmark_kind == "fallback_latest_close"
+        assert record.slippage_measurement_quality == "fallback"
+        assert record.slippage_benchmark_price == pytest.approx(151.50)
+        assert record.slippage_signed_bps is not None
+
+    def test_unavailable_kind_writes_null_metrics(self):
+        """Fractional residual cleanup contract — pass 'unavailable' to
+        opt out of metric computation entirely."""
+        tl = TradeLogger(path="/dev/null")
+        record = tl.build_close_record(
+            self._make_close_result(),
+            strategy_name="sma_crossover",
+            modeled_price=152.0,  # fill price itself — not a real benchmark
+            benchmark_kind="unavailable",
+            measurement_quality="unavailable",
+        )
+        assert record.slippage_benchmark_kind == "unavailable"
+        assert record.slippage_measurement_quality == "unavailable"
+        assert record.slippage_benchmark_price is None
+        assert record.slippage_signed_bps is None
+        assert record.slippage_adverse_bps is None
+
+    def test_modeled_price_zero_forces_unavailable(self):
+        tl = TradeLogger(path="/dev/null")
+        record = tl.build_close_record(
+            self._make_close_result(),
+            strategy_name="sma_crossover",
+            modeled_price=0.0,
+        )
+        assert record.slippage_benchmark_kind == "unavailable"
+        assert record.slippage_measurement_quality == "unavailable"
+        assert record.slippage_signed_bps is None
+
+    def test_explicit_unavailable_also_nulls_legacy_columns(self):
+        """Defect 5 fix — when caller declares benchmark_kind='unavailable'
+        (codepath §7 fractional residual cleanup), legacy columns must
+        also be NULL. Without this, legacy realized_slippage_bps would
+        carry a structural ~0 value computed against the fill price
+        itself, while the new columns honestly say 'unavailable' —
+        legacy and new would silently divergence on a 'no measurement'
+        case."""
+        tl = TradeLogger(path="/dev/null")
+        record = tl.build_close_record(
+            self._make_close_result(),
+            strategy_name="sma_crossover",
+            modeled_price=152.0,  # fill price; no honest benchmark
+            benchmark_kind="unavailable",
+            measurement_quality="unavailable",
+        )
+        assert record.slippage_benchmark_kind == "unavailable"
+        assert record.slippage_signed_bps is None
+        # Legacy columns also NULL — no fabricated value.
+        assert record.realized_slippage_bps is None
+        assert record.modeled_slippage_bps is None
+
+
+# ── TestSlippageDualWriteParity ────────────────────────────────────────────
+
+
+class TestSlippageDualWriteParity:
+    """
+    Phase 1 commit 8 of slippage unification — cross-cutting safety net.
+
+    Where both legacy (realized_slippage_bps) and new (slippage_signed_bps)
+    columns carry a value, they MUST agree. This guards against any
+    future writer change drifting the two paths apart while Phase 1
+    dual-write is in force. Phase 2 consumer migration relies on the
+    new columns being a strict superset of legacy behavior.
+
+    Codepaths where parity is expected (both non-NULL):
+      - Codepath §1 market entry with benchmark
+      - Codepath §3 discretionary market exit
+      - Codepath §4/§5 stop fills with broker stop_price
+      - Codepath §11 short leg of spread fills
+
+    Codepaths where the legacy and new column legitimately diverge
+    (legacy NULL, new 'unavailable'; or legacy retains 0.0/value
+    while new goes NULL) are NOT covered here — they are pinned by
+    their respective codepath tests above.
+    """
+
+    def _open_db(self, path: str):
+        conn = sqlite3.connect(path)
+        conn.row_factory = sqlite3.Row
+        return conn
+
+    def test_market_entry_legacy_matches_new(
+        self, tmp_csv, sample_decision, sample_result
+    ):
+        tl = TradeLogger(path=tmp_csv)
+        record = tl.build_record(
+            sample_decision,
+            sample_result,
+            modeled_price=150.0,
+            benchmark_kind="arrival_midpoint",
+        )
+        tl.log(record)
+        conn = self._open_db(tmp_csv)
+        try:
+            row = dict(conn.execute(
+                "SELECT realized_slippage_bps, slippage_signed_bps FROM trades "
+                "WHERE reason = ? ORDER BY id DESC LIMIT 1",
+                (sample_decision.reason,),
+            ).fetchone())
+        finally:
+            conn.close()
+        assert row["realized_slippage_bps"] == pytest.approx(row["slippage_signed_bps"])
+
+    def test_market_exit_legacy_matches_new(self, tmp_csv):
+        tl = TradeLogger(path=tmp_csv)
+        result = OrderResult(
+            status=OrderStatus.FILLED,
+            order_id="exit-parity-1",
+            symbol="AAPL",
+            requested_qty=10,
+            filled_qty=10,
+            avg_fill_price=152.0,
+            raw_status="filled",
+        )
+        # Defect 1 fix — caller must declare an honest kind for new
+        # cols to populate. Parity then holds: legacy and new
+        # benchmark against the same modeled_price.
+        record = tl.build_close_record(
+            result,
+            strategy_name="sma_crossover",
+            modeled_price=151.50,
+            benchmark_kind="arrival_midpoint",
+        )
+        tl.log(record)
+        conn = self._open_db(tmp_csv)
+        try:
+            row = dict(conn.execute(
+                "SELECT realized_slippage_bps, slippage_signed_bps FROM trades "
+                "WHERE order_id = 'exit-parity-1'"
+            ).fetchone())
+        finally:
+            conn.close()
+        assert row["realized_slippage_bps"] == pytest.approx(row["slippage_signed_bps"])
+
+    def test_stop_fill_with_broker_stop_legacy_matches_new(self, tmp_csv):
+        tl = TradeLogger(path=tmp_csv)
+        tl.log_stop_fill(
+            symbol="AAPL",
+            strategy="sma_crossover",
+            qty=10.0,
+            avg_fill_price=144.50,
+            stop_price=145.00,
+            order_id="stop-parity-1",
+        )
+        conn = self._open_db(tmp_csv)
+        try:
+            row = dict(conn.execute(
+                "SELECT realized_slippage_bps, slippage_signed_bps FROM trades "
+                "WHERE order_id = 'stop-parity-1'"
+            ).fetchone())
+        finally:
+            conn.close()
+        assert row["realized_slippage_bps"] == pytest.approx(row["slippage_signed_bps"])
+
+    def test_spread_short_leg_legacy_matches_new(self, tmp_csv):
+        tl = TradeLogger(path=tmp_csv)
+        tl.log_spread_fill(
+            position_id="spread-parity-1",
+            strategy="credit_spread",
+            short_occ="SPY260620P00510000",
+            long_occ="SPY260620P00505000",
+            qty=1.0,
+            net_price=0.55,
+            submitted_limit_price=0.60,
+            opening=True,
+            initial_risk_dollars=445.0,
+        )
+        conn = self._open_db(tmp_csv)
+        try:
+            row = dict(conn.execute(
+                "SELECT realized_slippage_bps, slippage_signed_bps FROM trades "
+                "WHERE side='sell' AND position_id='spread-parity-1'"
+            ).fetchone())
+        finally:
+            conn.close()
+        assert row["realized_slippage_bps"] == pytest.approx(row["slippage_signed_bps"])
+
+    def test_adverse_is_signed_clamped_to_zero(self, tmp_csv):
+        """Adverse_bps is max(0, signed_bps) on every row where signed is
+        non-NULL. The clamp lives in writer code, not at read time."""
+        tl = TradeLogger(path=tmp_csv)
+        # Sell @ 145.50 vs stop 145.00 — favorable execution (signed < 0)
+        tl.log_stop_fill(
+            symbol="AAPL",
+            strategy="sma_crossover",
+            qty=10.0,
+            avg_fill_price=145.50,
+            stop_price=145.00,
+            order_id="stop-favorable-1",
+        )
+        conn = self._open_db(tmp_csv)
+        try:
+            row = dict(conn.execute(
+                "SELECT slippage_signed_bps, slippage_adverse_bps FROM trades "
+                "WHERE order_id = 'stop-favorable-1'"
+            ).fetchone())
+        finally:
+            conn.close()
+        assert row["slippage_signed_bps"] < 0  # price improvement
+        assert row["slippage_adverse_bps"] == 0.0
+
+
+# ── TestExternalCloseAndRecoveredContextContract ───────────────────────────
+
+
+class TestExternalCloseAndRecoveredContextContract:
+    """
+    Phase 1 commit 7 of slippage unification — codepaths §8, §12, §13.
+
+    §8 — Recovered missing-entry-context row: build_record with
+        record_slippage=False; quality='recovered' so consumers can
+        isolate reconstruction rows.
+    §12 — log_external_close: row writes 'unavailable' on the new
+        columns and NULL on legacy columns (replacing the prior 0.0
+        placeholder).
+    §13 — Spread external close: log_spread_fill called without
+        submitted_limit_price → 'unavailable' on both legs (covered
+        by commit 6 tests already; one regression check here).
+    """
+
+    def test_log_external_close_writes_unavailable_and_null(self, tmp_csv):
+        tl = TradeLogger(path=tmp_csv)
+        tl.log_external_close(
+            symbol="AAPL",
+            strategy="sma_crossover",
+            reason="external_close_detected",
+        )
+        conn = sqlite3.connect(tmp_csv)
+        conn.row_factory = sqlite3.Row
+        try:
+            row = dict(conn.execute(
+                "SELECT * FROM trades ORDER BY id DESC LIMIT 1"
+            ).fetchone())
+        finally:
+            conn.close()
+        assert row["slippage_benchmark_kind"] == "unavailable"
+        assert row["slippage_measurement_quality"] == "unavailable"
+        assert row["slippage_signed_bps"] is None
+        assert row["slippage_adverse_bps"] is None
+        # Legacy column also moves to NULL — these rows never had real
+        # measurements. Phase 2 consumer migration adapts to the change.
+        assert row["realized_slippage_bps"] is None
+        assert row["modeled_slippage_bps"] is None
+
+    def test_recovered_entry_context_writes_quality_recovered(
+        self, sample_decision, sample_result
+    ):
+        """Codepath §8 — when record_slippage=False AND caller passes
+        measurement_quality='recovered', the row gets quality='recovered'
+        with kind='unavailable' and NULL metrics."""
+        tl = TradeLogger(path="/dev/null")
+        record = tl.build_record(
+            sample_decision,
+            sample_result,
+            modeled_price=150.0,
+            record_slippage=False,
+            measurement_quality="recovered",
+        )
+        assert record.slippage_benchmark_kind == "unavailable"
+        assert record.slippage_measurement_quality == "recovered"
+        assert record.slippage_signed_bps is None
+        assert record.slippage_adverse_bps is None
+
+    def test_spread_external_close_writes_unavailable(self, tmp_csv):
+        """Codepath §13 — spread external close calls log_spread_fill
+        without submitted_limit_price. Both legs get 'unavailable'."""
+        tl = TradeLogger(path=tmp_csv)
+        tl.log_spread_fill(
+            position_id="spread-ext-1",
+            strategy="credit_spread",
+            short_occ="SPY260620P00510000",
+            long_occ="SPY260620P00505000",
+            qty=1.0,
+            net_price=0.0,
+            opening=False,
+            realized_pnl=None,
+            reason="external_close_detected",
+        )
+        conn = sqlite3.connect(tmp_csv)
+        conn.row_factory = sqlite3.Row
+        try:
+            rows = [dict(r) for r in conn.execute(
+                "SELECT * FROM trades WHERE position_id='spread-ext-1'"
+            )]
+        finally:
+            conn.close()
+        assert len(rows) == 2
+        for row in rows:
+            assert row["slippage_benchmark_kind"] == "unavailable"
+            assert row["slippage_measurement_quality"] == "unavailable"
+            assert row["slippage_signed_bps"] is None
+            assert row["slippage_adverse_bps"] is None
+
+
+# ── TestOptionAndSpreadSlippageContract ────────────────────────────────────
+
+
+class TestOptionAndSpreadSlippageContract:
+    """
+    Phase 1 commit 6 of slippage unification — codepaths §10, §11 in
+    docs/slippage_unification_design.md.
+
+    Codepath §10 (async single-leg option fill) routes through _log_entry
+    with a LIMIT decision, so it inherits build_record's limit_price /
+    unavailable contract automatically; this class pins that contract.
+
+    Codepath §11 (spread fill) is bespoke — the short leg carries the
+    economic combo_limit measurement; the long leg writes NULL on the
+    new columns to distinguish structural zeros from real measurements.
+    """
+
+    def test_limit_option_entry_writes_limit_price_unavailable(self, sample_result):
+        """Codepath §10 — single-leg options are LIMIT-typed and produce
+        the same limit_price / unavailable shape as any other LIMIT entry."""
+        from risk.manager import RiskDecision
+        decision = RiskDecision(
+            symbol="SPY260620C00520000",
+            side=Side.BUY,
+            qty=2,
+            stop_price=0.01,
+            entry_reference_price=10.00,
+            strategy_name="spy_options_reversion",
+            reason="rsi recovery",
+            order_type=OrderType.LIMIT,
+            limit_price=10.00,
+        )
+        tl = TradeLogger(path="/dev/null")
+        record = tl.build_record(decision, sample_result, modeled_price=10.00)
+        assert record.slippage_benchmark_kind == "limit_price"
+        assert record.slippage_measurement_quality == "unavailable"
+        assert record.slippage_signed_bps is None
+        assert record.slippage_adverse_bps is None
+
+    def test_spread_short_leg_writes_combo_limit_primary(self, tmp_csv):
+        """Codepath §11 — short leg carries the economic combo_limit measurement."""
+        tl = TradeLogger(path=tmp_csv)
+        tl.log_spread_fill(
+            position_id="spread-1",
+            strategy="credit_spread",
+            short_occ="SPY260620P00510000",
+            long_occ="SPY260620P00505000",
+            qty=1.0,
+            net_price=0.55,
+            submitted_limit_price=0.60,
+            opening=True,
+            initial_risk_dollars=445.0,
+        )
+        conn = sqlite3.connect(tmp_csv)
+        conn.row_factory = sqlite3.Row
+        try:
+            short_row = dict(conn.execute(
+                "SELECT * FROM trades WHERE side='sell' AND position_id='spread-1'"
+            ).fetchone())
+            long_row = dict(conn.execute(
+                "SELECT * FROM trades WHERE side='buy' AND position_id='spread-1'"
+            ).fetchone())
+        finally:
+            conn.close()
+        # Short leg: economic measurement
+        assert short_row["slippage_benchmark_kind"] == "combo_limit"
+        assert short_row["slippage_measurement_quality"] == "primary"
+        assert short_row["slippage_benchmark_price"] == pytest.approx(0.60)
+        assert short_row["slippage_signed_bps"] is not None
+        # Opening credit short of 0.55 vs limit 0.60 — credit shortfall
+        # is adverse: (0.60 - 0.55) / 0.60 * 10_000 ≈ 833.33 bps.
+        assert short_row["slippage_signed_bps"] == pytest.approx(833.33, abs=0.1)
+        assert short_row["slippage_adverse_bps"] == pytest.approx(833.33, abs=0.1)
+        # Long leg: structural — NULL on new columns
+        assert long_row["slippage_benchmark_kind"] == "unavailable"
+        assert long_row["slippage_measurement_quality"] == "unavailable"
+        assert long_row["slippage_signed_bps"] is None
+        assert long_row["slippage_adverse_bps"] is None
+        # Legacy column on long leg keeps the 0.0 structural value
+        # for Phase 1 SUM/AVG consumer compat.
+        assert long_row["realized_slippage_bps"] == 0.0
+
+    def test_spread_without_submitted_limit_writes_unavailable(self, tmp_csv):
+        """When no submitted_limit_price is provided, both legs write
+        'unavailable' rather than fabricating a benchmark."""
+        tl = TradeLogger(path=tmp_csv)
+        tl.log_spread_fill(
+            position_id="spread-2",
+            strategy="credit_spread",
+            short_occ="SPY260620P00510000",
+            long_occ="SPY260620P00505000",
+            qty=1.0,
+            net_price=0.55,
+            submitted_limit_price=None,
+            opening=True,
+            initial_risk_dollars=445.0,
+        )
+        conn = sqlite3.connect(tmp_csv)
+        conn.row_factory = sqlite3.Row
+        try:
+            short_row = dict(conn.execute(
+                "SELECT * FROM trades WHERE side='sell' AND position_id='spread-2'"
+            ).fetchone())
+        finally:
+            conn.close()
+        assert short_row["slippage_benchmark_kind"] == "unavailable"
+        assert short_row["slippage_measurement_quality"] == "unavailable"
+        assert short_row["slippage_signed_bps"] is None
+
+
+# ── TestLogStopFillSlippageContract ────────────────────────────────────────
+
+
+class TestLogStopFillSlippageContract:
+    """
+    Phase 1 commit 2 of slippage unification — see codepath §4 in
+    docs/slippage_unification_design.md. log_stop_fill now reads its
+    benchmark from the broker-provided stop_price (not initial_stop_loss),
+    populates the new taxonomy columns, and dual-writes the legacy
+    columns for Phase 1 compatibility.
+    """
+
+    def _read_one_stop_row(self, db_path: str) -> dict:
+        conn = sqlite3.connect(db_path)
+        conn.row_factory = sqlite3.Row
+        try:
+            row = conn.execute(
+                "SELECT * FROM trades WHERE reason = 'stop_triggered' ORDER BY id DESC LIMIT 1"
+            ).fetchone()
+        finally:
+            conn.close()
+        assert row is not None, "expected one stop row"
+        return dict(row)
+
+    def test_with_broker_stop_writes_active_stop_primary(self, tmp_csv):
+        tl = TradeLogger(path=tmp_csv)
+        tl.log_stop_fill(
+            symbol="AAPL",
+            strategy="sma_crossover",
+            qty=10.0,
+            avg_fill_price=144.50,
+            stop_price=145.00,
+            order_id="stop-broker-1",
+        )
+        row = self._read_one_stop_row(tmp_csv)
+        assert row["slippage_benchmark_kind"] == "active_stop_price"
+        assert row["slippage_measurement_quality"] == "primary"
+        assert row["slippage_benchmark_price"] == pytest.approx(145.00)
+        assert row["stop_trigger_price"] == pytest.approx(145.00)
+        assert row["slippage_benchmark_timestamp"] is not None
+        # Sell @ 144.50 vs reference 145.00 → adverse by 50/145 ≈ 34.48 bps
+        assert row["slippage_signed_bps"] == pytest.approx(34.48, abs=0.05)
+        assert row["slippage_adverse_bps"] == pytest.approx(34.48, abs=0.05)
+
+    def test_without_broker_stop_writes_unavailable(self, tmp_csv):
+        tl = TradeLogger(path=tmp_csv)
+        tl.log_stop_fill(
+            symbol="AAPL",
+            strategy="sma_crossover",
+            qty=10.0,
+            avg_fill_price=144.50,
+            stop_price=None,
+            order_id="stop-no-broker",
+        )
+        row = self._read_one_stop_row(tmp_csv)
+        assert row["slippage_benchmark_kind"] == "unavailable"
+        assert row["slippage_measurement_quality"] == "unavailable"
+        assert row["slippage_benchmark_price"] is None
+        assert row["slippage_signed_bps"] is None
+        assert row["slippage_adverse_bps"] is None
+        assert row["stop_trigger_price"] is None
+
+    def test_recovery_path_can_set_quality_recovered(self, tmp_csv):
+        tl = TradeLogger(path=tmp_csv)
+        tl.log_stop_fill(
+            symbol="AAPL",
+            strategy="sma_crossover",
+            qty=10.0,
+            avg_fill_price=144.50,
+            stop_price=145.00,
+            measurement_quality="recovered",
+            order_id="stop-recovered-1",
+        )
+        row = self._read_one_stop_row(tmp_csv)
+        assert row["slippage_benchmark_kind"] == "active_stop_price"
+        assert row["slippage_measurement_quality"] == "recovered"
+
+    def test_dual_writes_legacy_columns_to_match_signed_when_broker_provides(self, tmp_csv):
+        tl = TradeLogger(path=tmp_csv)
+        tl.log_stop_fill(
+            symbol="AAPL",
+            strategy="sma_crossover",
+            qty=10.0,
+            avg_fill_price=144.50,
+            stop_price=145.00,
+            order_id="stop-parity-1",
+        )
+        row = self._read_one_stop_row(tmp_csv)
+        # Legacy column must mirror the new signed bps when the broker
+        # stop is available — both benchmark against the same value.
+        assert row["realized_slippage_bps"] == pytest.approx(row["slippage_signed_bps"])
+        assert row["modeled_slippage_bps"] > 0  # SLIPPAGE_MODEL_MARKET_BPS
+
+    def test_malformed_broker_stop_writes_unavailable(self, tmp_csv):
+        """Defect 4 fix — every form of malformed stop_price must be
+        rejected without raising. Covers: +inf, -inf, NaN, zero,
+        negative, and non-numeric strings like 'bad' (which would
+        raise ValueError on float() if not caught). log_stop_fill
+        writes the row as 'unavailable' for all of them."""
+        import math as _math
+        tl = TradeLogger(path=tmp_csv)
+        bad_values: list = [_math.inf, -_math.inf, _math.nan, 0.0, -1.50, "bad", "1.2.3"]
+        for i, bad in enumerate(bad_values):
+            tl.log_stop_fill(
+                symbol="AAPL",
+                strategy="sma_crossover",
+                qty=10.0,
+                avg_fill_price=144.50,
+                stop_price=bad,
+                order_id=f"stop-bad-{i}",
+            )
+            row = self._read_one_stop_row(tmp_csv)
+            assert row["slippage_benchmark_kind"] == "unavailable", (
+                f"malformed stop_price={bad!r} should produce 'unavailable'"
+            )
+            assert row["slippage_signed_bps"] is None
+
+    def test_legacy_columns_keep_initial_stop_loss_fallback_when_broker_missing(self, tmp_csv):
+        """
+        Phase 1 compat: when broker stop is None, new cols go `unavailable`
+        but the legacy columns still fall back to initial_stop_loss so
+        unmigrated consumers see the same numbers they always did.
+        """
+        tl = TradeLogger(path=tmp_csv)
+        # Seed an open entry context so initial_stop_loss is populated.
+        # Build a minimal opening row using build_record's machinery.
+        conn = tl._ensure_db()
+        conn.execute(
+            """
+            INSERT INTO trades (
+                timestamp, symbol, side, qty, avg_fill_price, strategy,
+                reason, status, requested_qty, filled_qty,
+                initial_stop_loss, initial_risk_per_share, entry_reference_price,
+                entry_timestamp, position_id, position_type
+            ) VALUES (?, ?, 'buy', 10, 150.0, 'sma_crossover', 'entry', 'filled',
+                      10, 10, 145.0, 5.0, 150.0, ?, ?, 'single_leg')
+            """,
+            (
+                datetime.now(timezone.utc).isoformat(),
+                "AAPL",
+                datetime.now(timezone.utc).isoformat(),
+                "AAPL",
+            ),
+        )
+        conn.commit()
+
+        tl.log_stop_fill(
+            symbol="AAPL",
+            strategy="sma_crossover",
+            qty=10.0,
+            avg_fill_price=144.50,
+            stop_price=None,
+            order_id="stop-legacy-fallback",
+        )
+        row = self._read_one_stop_row(tmp_csv)
+        # New cols: unavailable
+        assert row["slippage_benchmark_kind"] == "unavailable"
+        assert row["slippage_signed_bps"] is None
+        # Legacy: still benchmarked against the open context's
+        # initial_stop_loss of 145.0 → 34.48 bps adverse for a sell @ 144.50.
+        assert row["realized_slippage_bps"] == pytest.approx(34.48, abs=0.05)
+
+
 # ── TestPnLTracker ──────────────────────────────────────────────────────────
 
 

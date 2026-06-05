@@ -28,7 +28,25 @@ import re
 import sqlite3
 from dataclasses import dataclass
 from datetime import datetime, timezone
-from typing import Any
+from typing import Any, Literal
+
+
+SlippageBenchmarkKind = Literal[
+    "arrival_midpoint",
+    "decision_price",
+    "fallback_latest_close",
+    "active_stop_price",
+    "combo_limit",
+    "limit_price",
+    "unavailable",
+]
+
+SlippageMeasurementQuality = Literal[
+    "primary",
+    "fallback",
+    "recovered",
+    "unavailable",
+]
 
 from loguru import logger
 
@@ -148,6 +166,13 @@ TRADE_COLUMNS = [
     "position_id",
     "position_type",
     "position_uid",
+    "slippage_benchmark_price",
+    "slippage_benchmark_kind",
+    "slippage_benchmark_timestamp",
+    "slippage_measurement_quality",
+    "slippage_signed_bps",
+    "slippage_adverse_bps",
+    "stop_trigger_price",
 ]
 
 # Keep the old name as an alias for backwards compatibility with tests
@@ -182,7 +207,14 @@ CREATE TABLE IF NOT EXISTS trades (
     exit_timestamp        TEXT,
     position_id           TEXT,
     position_type         TEXT,
-    position_uid          TEXT
+    position_uid          TEXT,
+    slippage_benchmark_price     REAL,
+    slippage_benchmark_kind      TEXT,
+    slippage_benchmark_timestamp TEXT,
+    slippage_measurement_quality TEXT,
+    slippage_signed_bps          REAL,
+    slippage_adverse_bps         REAL,
+    stop_trigger_price           REAL
 );
 """
 
@@ -205,6 +237,17 @@ _MIGRATION_COLUMNS = {
     # implementation plan — they will be added when their first
     # consumer ships.
     "position_uid": "TEXT",
+    # Slippage unification — see docs/slippage_unification_design.md and
+    # docs/slippage_unification_tracker.md. All nullable; pre-existing
+    # rows remain NULL. Writers populate these per the per-codepath
+    # contract over Phase 1; legacy columns continue to dual-write.
+    "slippage_benchmark_price": "REAL",
+    "slippage_benchmark_kind": "TEXT",
+    "slippage_benchmark_timestamp": "TEXT",
+    "slippage_measurement_quality": "TEXT",
+    "slippage_signed_bps": "REAL",
+    "slippage_adverse_bps": "REAL",
+    "stop_trigger_price": "REAL",
 }
 
 # Index on position_id for fast spread leg grouping. Idempotent.
@@ -274,6 +317,17 @@ class TradeRecord:
     # reference can still log; the broker entry path passes it through
     # from `engine.lifecycle.new_position_uid()`.
     position_uid: str | None = None
+    # Slippage unification — see docs/slippage_unification_design.md.
+    # Populated per-codepath by writers over Phase 1. Legacy columns
+    # (modeled_slippage_bps / realized_slippage_bps) continue to
+    # dual-write until consumers migrate in Phase 2.
+    slippage_benchmark_price: float | None = None
+    slippage_benchmark_kind: SlippageBenchmarkKind | None = None
+    slippage_benchmark_timestamp: str | None = None
+    slippage_measurement_quality: SlippageMeasurementQuality | None = None
+    slippage_signed_bps: float | None = None
+    slippage_adverse_bps: float | None = None
+    stop_trigger_price: float | None = None
 
     def as_dict(self) -> dict:
         """Column-ordered dict (same interface as before migration)."""
@@ -298,67 +352,90 @@ class TradeLogger:
         self._conn: sqlite3.Connection | None = None
 
     def _ensure_db(self) -> sqlite3.Connection:
-        """Create the database and table if they don't exist yet."""
+        """Create the database and table if they don't exist yet.
+
+        Defect 3 fix (slippage unification follow-up): the bootstrap
+        path runs many ALTER TABLE and CREATE TABLE statements. SQLite
+        auto-commits each one, so partial failure can leave the file
+        with some new columns / tables and not others. To avoid
+        publishing a half-migrated connection that the next caller
+        would then reuse without retry, we work on a *local* `conn`
+        and only assign `self._conn` once every bootstrap step has
+        succeeded. On any exception we close the local connection and
+        re-raise so the next call retries from scratch.
+        """
         if self._conn is not None:
             return self._conn
         os.makedirs(os.path.dirname(self._path) or ".", exist_ok=True)
-        self._conn = sqlite3.connect(self._path)
-        # Register OWNER_KEY() as a SQLite UDF so the backfill SQL can
-        # normalize OCC option symbols to their underlying. Keeps the
-        # stored position_id consistent with engine.positions.owner_key_for().
-        self._conn.create_function("OWNER_KEY", 1, owner_key_for, deterministic=True)
-        self._conn.execute(_CREATE_TABLE_SQL)
-        existing = {
-            row[1]
-            for row in self._conn.execute("PRAGMA table_info(trades)").fetchall()
-        }
-        for column, col_type in _MIGRATION_COLUMNS.items():
-            if column not in existing:
-                self._conn.execute(
-                    f"ALTER TABLE trades ADD COLUMN {column} {col_type}"
-                )
-        # 11.27: backfill position_id/position_type on pre-existing rows, then
-        # ensure the lookup index exists. Both statements are idempotent.
-        self._conn.execute(_BACKFILL_SQL)
-        self._conn.execute(_POSITION_ID_INDEX_SQL)
-        self._conn.execute(_POSITION_UID_INDEX_SQL)
-        # 11.10c: signal-lifecycle counter table for the Strategy Health
-        # Monitor. Local import avoids a circular dependency
-        # (strategies.health.* can import reporting.logger types).
-        from strategies.health.lifecycle import _CREATE_LIFECYCLE_TABLE_SQL
-        self._conn.execute(_CREATE_LIFECYCLE_TABLE_SQL)
-        # Operator Controls Phase A — position_lifecycle and
-        # position_lifecycle_legs. Created by the same migration path
-        # so all schema lives behind one connection bootstrap. Local
-        # import keeps `engine.lifecycle` standalone-importable; this
-        # is the only place that pulls the DDL constants.
-        from engine.lifecycle import (
-            _CREATE_POSITION_LIFECYCLE_SQL,
-            _CREATE_POSITION_LIFECYCLE_LEGS_SQL,
-            _CREATE_POSITION_LIFECYCLE_INDEXES_SQL,
-        )
-        self._conn.execute(_CREATE_POSITION_LIFECYCLE_SQL)
-        self._conn.execute(_CREATE_POSITION_LIFECYCLE_LEGS_SQL)
-        for index_sql in _CREATE_POSITION_LIFECYCLE_INDEXES_SQL:
-            self._conn.execute(index_sql)
-        from engine.option_trailing import (
-            _CREATE_OPTION_TRAILING_STOPS_SQL,
-            _OPTION_TRAILING_STOPS_INDEXES_SQL,
-        )
-        self._conn.execute(_CREATE_OPTION_TRAILING_STOPS_SQL)
-        for index_sql in _OPTION_TRAILING_STOPS_INDEXES_SQL:
-            self._conn.execute(index_sql)
-        # Operator Controls Phase A PR-2 — operator_commands queue.
-        # Same migration scaffolding; local import keeps
-        # engine.operator_queue independently importable.
-        from engine.operator_queue import (
-            _CREATE_OPERATOR_COMMANDS_SQL,
-            _CREATE_OPERATOR_COMMANDS_INDEXES_SQL,
-        )
-        self._conn.execute(_CREATE_OPERATOR_COMMANDS_SQL)
-        for index_sql in _CREATE_OPERATOR_COMMANDS_INDEXES_SQL:
-            self._conn.execute(index_sql)
-        self._conn.commit()
+        conn = sqlite3.connect(self._path)
+        try:
+            # Register OWNER_KEY() as a SQLite UDF so the backfill SQL can
+            # normalize OCC option symbols to their underlying. Keeps the
+            # stored position_id consistent with engine.positions.owner_key_for().
+            conn.create_function("OWNER_KEY", 1, owner_key_for, deterministic=True)
+            conn.execute(_CREATE_TABLE_SQL)
+            existing = {
+                row[1]
+                for row in conn.execute("PRAGMA table_info(trades)").fetchall()
+            }
+            for column, col_type in _MIGRATION_COLUMNS.items():
+                if column not in existing:
+                    conn.execute(
+                        f"ALTER TABLE trades ADD COLUMN {column} {col_type}"
+                    )
+            # 11.27: backfill position_id/position_type on pre-existing rows, then
+            # ensure the lookup index exists. Both statements are idempotent.
+            conn.execute(_BACKFILL_SQL)
+            conn.execute(_POSITION_ID_INDEX_SQL)
+            conn.execute(_POSITION_UID_INDEX_SQL)
+            # 11.10c: signal-lifecycle counter table for the Strategy Health
+            # Monitor. Local import avoids a circular dependency
+            # (strategies.health.* can import reporting.logger types).
+            from strategies.health.lifecycle import _CREATE_LIFECYCLE_TABLE_SQL
+            conn.execute(_CREATE_LIFECYCLE_TABLE_SQL)
+            # Operator Controls Phase A — position_lifecycle and
+            # position_lifecycle_legs. Created by the same migration path
+            # so all schema lives behind one connection bootstrap. Local
+            # import keeps `engine.lifecycle` standalone-importable; this
+            # is the only place that pulls the DDL constants.
+            from engine.lifecycle import (
+                _CREATE_POSITION_LIFECYCLE_SQL,
+                _CREATE_POSITION_LIFECYCLE_LEGS_SQL,
+                _CREATE_POSITION_LIFECYCLE_INDEXES_SQL,
+            )
+            conn.execute(_CREATE_POSITION_LIFECYCLE_SQL)
+            conn.execute(_CREATE_POSITION_LIFECYCLE_LEGS_SQL)
+            for index_sql in _CREATE_POSITION_LIFECYCLE_INDEXES_SQL:
+                conn.execute(index_sql)
+            from engine.option_trailing import (
+                _CREATE_OPTION_TRAILING_STOPS_SQL,
+                _OPTION_TRAILING_STOPS_INDEXES_SQL,
+            )
+            conn.execute(_CREATE_OPTION_TRAILING_STOPS_SQL)
+            for index_sql in _OPTION_TRAILING_STOPS_INDEXES_SQL:
+                conn.execute(index_sql)
+            # Operator Controls Phase A PR-2 — operator_commands queue.
+            # Same migration scaffolding; local import keeps
+            # engine.operator_queue independently importable.
+            from engine.operator_queue import (
+                _CREATE_OPERATOR_COMMANDS_SQL,
+                _CREATE_OPERATOR_COMMANDS_INDEXES_SQL,
+            )
+            conn.execute(_CREATE_OPERATOR_COMMANDS_SQL)
+            for index_sql in _CREATE_OPERATOR_COMMANDS_INDEXES_SQL:
+                conn.execute(index_sql)
+            conn.commit()
+        except Exception:
+            # Bootstrap failed — close the partially-prepared connection
+            # so the next _ensure_db() call retries cleanly rather than
+            # returning a poisoned cached handle that's missing columns
+            # or tables.
+            try:
+                conn.close()
+            except Exception:
+                pass
+            raise
+        self._conn = conn
         return self._conn
 
     def close(self) -> None:
@@ -376,6 +453,8 @@ class TradeLogger:
         position_uid: str | None = None,
         record_slippage: bool = True,
         timestamp_override: datetime | None = None,
+        benchmark_kind: SlippageBenchmarkKind | None = None,
+        measurement_quality: SlippageMeasurementQuality | None = None,
     ) -> TradeRecord:
         """
         Build a TradeRecord from a RiskDecision + OrderResult.
@@ -437,6 +516,57 @@ class TradeLogger:
         else:
             modeled_bps = None
             realized_bps = None
+
+        # ── Slippage unification (Phase 1) ──
+        # Default benchmark_kind / quality inference preserves current
+        # behavior when callers don't pass explicit values. Engine call
+        # sites tag rows with the precise kind (arrival_midpoint vs
+        # fallback_latest_close) where they know the answer.
+        new_benchmark_price: float | None = None
+        new_benchmark_kind: SlippageBenchmarkKind
+        new_benchmark_timestamp: str | None = None
+        new_quality: SlippageMeasurementQuality
+        new_signed_bps: float | None = None
+        new_adverse_bps: float | None = None
+
+        if not record_slippage:
+            # No metric is computed, but the caller may still want to
+            # tag the row's measurement_quality (e.g. 'recovered' for
+            # codepath §8 reconstructed entries) so downstream consumers
+            # can isolate reconstruction rows from honest live measurements.
+            new_benchmark_kind = "unavailable"
+            new_quality = measurement_quality or "unavailable"
+        elif not is_market_order:
+            # Limit orders: passive fills are not measured against an
+            # arrival-price benchmark — see build_record docstring.
+            new_benchmark_kind = "limit_price"
+            new_quality = "unavailable"
+        elif modeled_price is None or modeled_price <= 0:
+            # Market order but no benchmark available — honestly unavailable.
+            new_benchmark_kind = "unavailable"
+            new_quality = "unavailable"
+        else:
+            # Market order with benchmark — caller may declare arrival vs
+            # fallback explicitly; default to arrival_midpoint.
+            new_benchmark_kind = benchmark_kind or "arrival_midpoint"
+            if measurement_quality is not None:
+                new_quality = measurement_quality
+            elif new_benchmark_kind == "fallback_latest_close":
+                new_quality = "fallback"
+            else:
+                new_quality = "primary"
+            new_benchmark_price = float(modeled_price)
+            if (
+                result.avg_fill_price is not None
+                and new_benchmark_price > 0
+            ):
+                signed = single_leg_realized_slippage_bps(
+                    side=decision.side.value,
+                    reference_price=new_benchmark_price,
+                    actual_fill_price=result.avg_fill_price,
+                )
+                new_signed_bps = signed
+                new_adverse_bps = max(0.0, signed)
         initial_stop_loss = float(decision.stop_price)
         initial_risk_per_share = max(
             0.0,
@@ -450,6 +580,8 @@ class TradeLogger:
         )
         timestamp_dt = timestamp_override or datetime.now(timezone.utc)
         now_iso = timestamp_dt.astimezone(timezone.utc).isoformat()
+        if new_benchmark_price is not None:
+            new_benchmark_timestamp = now_iso
 
         return TradeRecord(
             timestamp=now_iso,
@@ -480,6 +612,16 @@ class TradeLogger:
             position_id=owner_key_for(decision.symbol),
             position_type="single_leg",
             position_uid=position_uid,
+            slippage_benchmark_price=new_benchmark_price,
+            slippage_benchmark_kind=new_benchmark_kind,
+            slippage_benchmark_timestamp=new_benchmark_timestamp,
+            slippage_measurement_quality=new_quality,
+            slippage_signed_bps=(
+                round(new_signed_bps, 2) if new_signed_bps is not None else None
+            ),
+            slippage_adverse_bps=(
+                round(new_adverse_bps, 2) if new_adverse_bps is not None else None
+            ),
         )
 
     def build_close_record(
@@ -488,19 +630,59 @@ class TradeLogger:
         *,
         strategy_name: str,
         modeled_price: float,
+        benchmark_kind: SlippageBenchmarkKind | None = None,
+        measurement_quality: SlippageMeasurementQuality | None = None,
     ) -> TradeRecord:
         """
         Build a TradeRecord for a position close (exit). Closes don't have
         a RiskDecision — they come from the strategy exit signal directly.
+
+        `benchmark_kind` lets the caller declare which kind of benchmark
+        ``modeled_price`` represents. Defaults to ``unavailable`` (safe
+        — never fabricates a benchmark claim) after the Defect 1 fix.
+        Real callers declare honestly:
+
+          - ``_close_single_leg_position`` (codepath §3): equity exits
+            pass ``fallback_latest_close`` / ``fallback`` because the
+            exit path uses the latest bar close as a proxy benchmark;
+            option exits pass ``unavailable`` / ``unavailable`` because
+            ``modeled_price`` is the fill price itself, which yields a
+            structural zero-slippage measurement.
+          - ``_close_fractional_residual_position`` (codepath §7):
+            ``unavailable`` / ``unavailable`` because the close_price
+            fallback chain is not a slippage benchmark.
+
+        Pass ``unavailable`` explicitly for any path where
+        ``modeled_price`` is not a proper benchmark — Defect 5 fix
+        ensures legacy columns also write NULL in that case rather
+        than computing against the non-benchmark value.
         """
-        realized_bps = 0.0
-        modeled_bps = settings.SLIPPAGE_MODEL_MARKET_BPS if modeled_price > 0 else 0.0
+        # Defect 5 fix — when the caller explicitly declares
+        # benchmark_kind='unavailable', the legacy columns should not
+        # compute a slippage value either. Without this, codepath §7
+        # (fractional residual cleanup) would write a structural ~0
+        # legacy slippage value (fill vs fill) while the new columns
+        # honestly say 'unavailable'. Align legacy with new for the
+        # explicit-unavailable case so consumers see consistent
+        # 'no measurement' across both column families.
+        legacy_metric_suppressed = benchmark_kind == "unavailable"
+        realized_bps: float | None = 0.0
+        modeled_bps: float | None = (
+            settings.SLIPPAGE_MODEL_MARKET_BPS if modeled_price > 0 else 0.0
+        )
+        if legacy_metric_suppressed:
+            realized_bps = None
+            modeled_bps = None
         context = self._read_latest_open_entry_context(
             symbol=result.symbol,
             strategy=strategy_name,
         )
         now_iso = datetime.now(timezone.utc).isoformat()
-        if result.avg_fill_price is not None and modeled_price > 0:
+        if (
+            not legacy_metric_suppressed
+            and result.avg_fill_price is not None
+            and modeled_price > 0
+        ):
             realized_bps = single_leg_realized_slippage_bps(
                 side="sell",
                 reference_price=modeled_price,
@@ -535,6 +717,41 @@ class TradeLogger:
                 if initial_risk_dollars and initial_risk_dollars > 0:
                     r_multiple = realized_pnl / initial_risk_dollars
 
+        # ── Slippage unification (Phase 1) ──
+        # Default kind = 'unavailable' is the safe behavior — no caller
+        # gets a fabricated 'arrival_midpoint' tag if it forgot to
+        # declare what kind of price it passed. The real exit caller
+        # (`_close_single_leg_position`) declares 'fallback_latest_close'
+        # for equities and 'unavailable' for options; the fractional
+        # residual cleanup declares 'unavailable'. See codepaths §3, §7
+        # in docs/slippage_unification_design.md.
+        new_benchmark_price: float | None = None
+        new_benchmark_kind: SlippageBenchmarkKind = benchmark_kind or "unavailable"
+        new_benchmark_timestamp: str | None = None
+        new_quality: SlippageMeasurementQuality
+        new_signed_bps: float | None = None
+        new_adverse_bps: float | None = None
+
+        if new_benchmark_kind == "unavailable" or modeled_price <= 0:
+            new_benchmark_kind = "unavailable"
+            new_quality = measurement_quality or "unavailable"
+        else:
+            new_quality = measurement_quality or (
+                "fallback"
+                if new_benchmark_kind == "fallback_latest_close"
+                else "primary"
+            )
+            new_benchmark_price = float(modeled_price)
+            new_benchmark_timestamp = now_iso
+            if result.avg_fill_price is not None:
+                signed = single_leg_realized_slippage_bps(
+                    side="sell",
+                    reference_price=new_benchmark_price,
+                    actual_fill_price=result.avg_fill_price,
+                )
+                new_signed_bps = signed
+                new_adverse_bps = max(0.0, signed)
+
         return TradeRecord(
             timestamp=now_iso,
             symbol=result.symbol,
@@ -547,7 +764,9 @@ class TradeLogger:
             stop_price=0.0,
             entry_reference_price=modeled_price,
             modeled_slippage_bps=modeled_bps,
-            realized_slippage_bps=round(realized_bps, 2),
+            realized_slippage_bps=(
+                round(realized_bps, 2) if realized_bps is not None else None
+            ),
             order_type="market",
             status=result.status.value,
             requested_qty=result.requested_qty,
@@ -561,6 +780,16 @@ class TradeLogger:
             exit_timestamp=now_iso,
             position_id=owner_key_for(result.symbol),
             position_type="single_leg",
+            slippage_benchmark_price=new_benchmark_price,
+            slippage_benchmark_kind=new_benchmark_kind,
+            slippage_benchmark_timestamp=new_benchmark_timestamp,
+            slippage_measurement_quality=new_quality,
+            slippage_signed_bps=(
+                round(new_signed_bps, 2) if new_signed_bps is not None else None
+            ),
+            slippage_adverse_bps=(
+                round(new_adverse_bps, 2) if new_adverse_bps is not None else None
+            ),
         )
 
     def log(self, record: TradeRecord) -> None:
@@ -629,6 +858,13 @@ class TradeLogger:
 
         Fill price is None because we don't know the exact execution price.
         The reason field carries the detection context.
+
+        Slippage unification (Phase 1) codepath §12 — these rows have no
+        honest fill price let alone a benchmark, so all new slippage
+        columns write 'unavailable' and the metric values stay NULL.
+        Legacy columns dual-write NULL too (a change from the prior
+        0.0 placeholder) — these rows never had real measurements and
+        consumers should distinguish 'no fill' from 'zero slippage'.
         """
         record = TradeRecord(
             timestamp=datetime.now(timezone.utc).isoformat(),
@@ -641,8 +877,8 @@ class TradeLogger:
             reason=reason,
             stop_price=0.0,
             entry_reference_price=0.0,
-            modeled_slippage_bps=0.0,
-            realized_slippage_bps=0.0,
+            modeled_slippage_bps=None,
+            realized_slippage_bps=None,
             order_type="unknown",
             status="filled",
             requested_qty=0,
@@ -656,6 +892,13 @@ class TradeLogger:
             exit_timestamp=datetime.now(timezone.utc).isoformat(),
             position_id=owner_key_for(symbol),
             position_type="single_leg",
+            slippage_benchmark_price=None,
+            slippage_benchmark_kind="unavailable",
+            slippage_benchmark_timestamp=None,
+            slippage_measurement_quality="unavailable",
+            slippage_signed_bps=None,
+            slippage_adverse_bps=None,
+            stop_trigger_price=None,
         )
         self.log(record)
 
@@ -759,6 +1002,31 @@ class TradeLogger:
             if math.isfinite(pnl_f):
                 r_multiple = pnl_f / basis
 
+        # ── Slippage unification (Phase 1) codepath §11 ──
+        # The short leg carries the economic measurement against the
+        # submitted combo limit; the long leg is structural and writes
+        # NULL slippage on the new columns. Legacy columns dual-write
+        # zeros on the long leg for Phase 1 consumer compat (the
+        # passive-leg NULL transition for SUM/AVG consumers is a Phase 2
+        # follow-up — see tracker migration plan).
+        short_new_kind: SlippageBenchmarkKind
+        short_new_quality: SlippageMeasurementQuality
+        short_new_benchmark_price: float | None
+        short_new_signed_bps: float | None
+        short_new_adverse_bps: float | None
+        if submitted_limit_price is not None and abs(float(submitted_limit_price)) > 0:
+            short_new_kind = "combo_limit"
+            short_new_quality = "primary"
+            short_new_benchmark_price = abs(float(submitted_limit_price))
+            short_new_signed_bps = float(short_slippage_bps)
+            short_new_adverse_bps = max(0.0, short_new_signed_bps)
+        else:
+            short_new_kind = "unavailable"
+            short_new_quality = "unavailable"
+            short_new_benchmark_price = None
+            short_new_signed_bps = None
+            short_new_adverse_bps = None
+
         def _leg_record(
             symbol: str,
             side: str,
@@ -769,6 +1037,11 @@ class TradeLogger:
             slippage_bps: float,
             risk_dollars: float | None,
             r_mult: float | None,
+            new_benchmark_kind: SlippageBenchmarkKind,
+            new_measurement_quality: SlippageMeasurementQuality,
+            new_benchmark_price: float | None,
+            new_signed_bps: float | None,
+            new_adverse_bps: float | None,
         ) -> TradeRecord:
             return TradeRecord(
                 timestamp=now_iso,
@@ -796,6 +1069,16 @@ class TradeLogger:
                 exit_timestamp=None if opening else now_iso,
                 position_id=position_id,
                 position_type="spread",
+                slippage_benchmark_price=new_benchmark_price,
+                slippage_benchmark_kind=new_benchmark_kind,
+                slippage_benchmark_timestamp=now_iso if new_benchmark_price is not None else None,
+                slippage_measurement_quality=new_measurement_quality,
+                slippage_signed_bps=(
+                    round(new_signed_bps, 2) if new_signed_bps is not None else None
+                ),
+                slippage_adverse_bps=(
+                    round(new_adverse_bps, 2) if new_adverse_bps is not None else None
+                ),
             )
 
         # realized_pnl, initial_risk_dollars, and r_multiple ride the short-leg
@@ -809,7 +1092,15 @@ class TradeLogger:
             slippage_bps=short_slippage_bps,
             risk_dollars=basis,
             r_mult=r_multiple,
+            new_benchmark_kind=short_new_kind,
+            new_measurement_quality=short_new_quality,
+            new_benchmark_price=short_new_benchmark_price,
+            new_signed_bps=short_new_signed_bps,
+            new_adverse_bps=short_new_adverse_bps,
         ))
+        # Long leg is structural — new columns write NULL/'unavailable'
+        # so SUM/AVG consumers can distinguish structural zeros from
+        # real measurements once they migrate. Legacy 0.0 retained.
         self.log(_leg_record(
             long_occ,
             long_side,
@@ -819,6 +1110,11 @@ class TradeLogger:
             slippage_bps=0.0,
             risk_dollars=None,
             r_mult=None,
+            new_benchmark_kind="unavailable",
+            new_measurement_quality="unavailable",
+            new_benchmark_price=None,
+            new_signed_bps=None,
+            new_adverse_bps=None,
         ))
         logger.info(
             f"spread {'entry' if opening else 'exit'} logged: {short_occ}/{long_occ} "
@@ -870,6 +1166,8 @@ class TradeLogger:
         strategy: str,
         qty: float,
         avg_fill_price: float,
+        stop_price: float | None = None,
+        measurement_quality: SlippageMeasurementQuality = "primary",
         order_id: str | None = None,
         timestamp_override: datetime | None = None,
     ) -> None:
@@ -879,6 +1177,21 @@ class TradeLogger:
 
         Distinct from log_external_close, which is the fallback for positions
         that disappear without a confirmed fill event.
+
+        `stop_price` is the broker order's actual stop trigger at fill time
+        (from ``update.order.stop_price`` on the WebSocket path, or
+        ``ClosedOrderInfo.stop_price`` on the recovery path). It is the
+        authoritative slippage benchmark for stop fills — see
+        docs/slippage_unification_design.md §Stop Lifecycle. When None or
+        non-positive, the new slippage columns are written as
+        ``unavailable`` and signed/adverse values stay NULL; legacy
+        ``realized_slippage_bps`` / ``modeled_slippage_bps`` retain their
+        old behavior (fall back to ``initial_stop_loss``) for Phase 1
+        consumer compatibility.
+
+        `measurement_quality` lets the recovery path tag rows as
+        ``recovered`` rather than ``primary``. Forced to ``unavailable``
+        when no broker stop_price is provided.
 
         `timestamp_override` is used by recovery/reconciliation paths that
         discover a missed stop fill later from broker history. When broker
@@ -910,14 +1223,67 @@ class TradeLogger:
                 realized_pnl = (avg_fill_price - entry_reference_price) * qty * multiplier
                 if initial_risk_dollars and initial_risk_dollars > 0:
                     r_multiple = realized_pnl / initial_risk_dollars
+
+        # ── Slippage unification (Phase 1) ──
+        # Broker stop_price is the authoritative benchmark. When absent,
+        # non-finite, or non-numeric (Defect 4 defense-in-depth — engine
+        # callers already filter via _finite_or_none, but this guard
+        # also catches any future caller that passes a raw broker
+        # payload such as a string), the new columns honestly report
+        # `unavailable`; legacy columns retain their pre-unification
+        # fallback for Phase 1 compat.
+        coerced_stop: float | None = None
+        if stop_price is not None:
+            try:
+                coerced_stop = float(stop_price)
+            except (TypeError, ValueError):
+                coerced_stop = None
+        broker_stop_available = (
+            coerced_stop is not None
+            and math.isfinite(coerced_stop)
+            and coerced_stop > 0
+        )
+        new_slippage_benchmark_price: float | None = None
+        new_slippage_benchmark_kind: SlippageBenchmarkKind = "unavailable"
+        new_slippage_benchmark_timestamp: str | None = None
+        new_slippage_quality: SlippageMeasurementQuality = "unavailable"
+        new_slippage_signed_bps: float | None = None
+        new_slippage_adverse_bps: float | None = None
+        new_stop_trigger_price: float | None = None
+
+        if broker_stop_available:
+            # Use the already-coerced value rather than re-coercing
+            # raw stop_price (which could be a string and raise).
+            benchmark = coerced_stop
+            signed = single_leg_realized_slippage_bps(
+                side="sell",
+                reference_price=benchmark,
+                actual_fill_price=avg_fill_price,
+            )
+            new_slippage_benchmark_price = benchmark
+            new_slippage_benchmark_kind = "active_stop_price"
+            new_slippage_benchmark_timestamp = now_iso
+            new_slippage_quality = measurement_quality
+            new_slippage_signed_bps = signed
+            new_slippage_adverse_bps = max(0.0, signed)
+            new_stop_trigger_price = benchmark
+
+        # ── Legacy dual-write (Phase 1 compat) ──
+        # Prefer broker stop_price when available so legacy consumers
+        # immediately benefit from the more accurate benchmark; otherwise
+        # fall back to initial_stop_loss exactly as before this change.
+        legacy_reference = (
+            coerced_stop
+            if broker_stop_available
+            else float(initial_stop_loss or 0.0)
+        )
         realized_slippage_bps = 0.0
-        stop_reference_price = float(initial_stop_loss or 0.0)
         modeled_slippage_bps = 0.0
-        if stop_reference_price > 0:
+        if legacy_reference > 0:
             modeled_slippage_bps = settings.SLIPPAGE_MODEL_MARKET_BPS
             realized_slippage_bps = single_leg_realized_slippage_bps(
                 side="sell",
-                reference_price=stop_reference_price,
+                reference_price=legacy_reference,
                 actual_fill_price=avg_fill_price,
             )
 
@@ -947,6 +1313,21 @@ class TradeLogger:
             exit_timestamp=now_iso,
             position_id=owner_key_for(symbol),
             position_type="single_leg",
+            slippage_benchmark_price=new_slippage_benchmark_price,
+            slippage_benchmark_kind=new_slippage_benchmark_kind,
+            slippage_benchmark_timestamp=new_slippage_benchmark_timestamp,
+            slippage_measurement_quality=new_slippage_quality,
+            slippage_signed_bps=(
+                round(new_slippage_signed_bps, 2)
+                if new_slippage_signed_bps is not None
+                else None
+            ),
+            slippage_adverse_bps=(
+                round(new_slippage_adverse_bps, 2)
+                if new_slippage_adverse_bps is not None
+                else None
+            ),
+            stop_trigger_price=new_stop_trigger_price,
         )
         self.log(record)
 

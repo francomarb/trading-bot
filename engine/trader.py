@@ -218,11 +218,19 @@ class EngineConfig:
 
 @dataclass(frozen=True)
 class SuspectOrder:
-    """Bot-submitted order accepted by Alpaca but not yet locally confirmed."""
+    """Bot-submitted order accepted by Alpaca but not yet locally confirmed.
+
+    ``modeled_price_kind`` preserves the slippage benchmark provenance
+    captured at submission so the recovery row gets the same tagging
+    the live row would have written. Defaults to 'unavailable' so
+    legacy SuspectOrder constructions remain safe — recovery then
+    writes NULL slippage rather than fabricating a kind.
+    """
 
     decision: RiskDecision
     order_id: str
     modeled_price: float
+    modeled_price_kind: str = "unavailable"
 
 
 # ── Engine ───────────────────────────────────────────────────────────────────
@@ -1539,6 +1547,16 @@ class TradingEngine:
                 self.broker.get_latest_quote_midpoint(target_symbol)
             )
         slippage_ref = arrival_price if arrival_price is not None else latest_close
+        # Slippage unification (Phase 1) — tag which benchmark we're
+        # actually using so the new taxonomy columns are honest. See
+        # codepath §1 in docs/slippage_unification_design.md.
+        slippage_kind: str | None
+        if arrival_price is not None:
+            slippage_kind = "arrival_midpoint"
+        elif latest_close is not None:
+            slippage_kind = "fallback_latest_close"
+        else:
+            slippage_kind = None  # build_record will default to 'unavailable'
         try:
             result = self.broker.place_order(decision)
             # PLAN 11.10f: lifecycle counter — submitted increments
@@ -1549,8 +1567,14 @@ class TradingEngine:
             if _lc is not None:
                 _lc.submitted += 1
             if result.status is OrderStatus.UNKNOWN:
+                # Preserve the benchmark provenance so the recovery row
+                # (codepath §9) tags the right kind/quality if this
+                # submission later resolves filled. Defect 2 fix.
                 self._remember_suspect_order(
-                    decision, result, modeled_price=slippage_ref
+                    decision,
+                    result,
+                    modeled_price=slippage_ref,
+                    modeled_price_kind=slippage_kind or "unavailable",
                 )
                 if strategy_statuses is not None:
                     strategy_statuses[symbol] = "Pending Entry"
@@ -1588,7 +1612,12 @@ class TradingEngine:
                 order_type=decision.order_type.value,
                 side=decision.side.value,
             )
-            self._log_entry(decision, result, slippage_ref)
+            self._log_entry(
+                decision,
+                result,
+                slippage_ref,
+                benchmark_kind=slippage_kind,
+            )
             if result.status in {OrderStatus.FILLED, OrderStatus.PARTIAL}:
                 # PLAN 11.10f: lifecycle counter — filled_entries.
                 # Per design §12.4.1: one entry that opened a position
@@ -1713,10 +1742,17 @@ class TradingEngine:
         result: OrderResult,
         *,
         modeled_price: float,
+        modeled_price_kind: str = "unavailable",
     ) -> None:
         """
         Persist a narrow recovery handle for submit-succeeded/confirm-failed
         entries. Recovery is tied to the exact order_id returned by Alpaca.
+
+        ``modeled_price_kind`` preserves the slippage-benchmark provenance
+        captured at submission ('arrival_midpoint' or
+        'fallback_latest_close') so the recovered row gets the same
+        kind/quality tagging the live row would have written. Defect 2
+        of the first-pass review fix.
         """
         if result.order_id is None:
             msg = (
@@ -1732,6 +1768,7 @@ class TradingEngine:
             decision=decision,
             order_id=result.order_id,
             modeled_price=modeled_price,
+            modeled_price_kind=modeled_price_kind,
         )
         logger.warning(
             f"{decision.symbol}: staged suspect order recovery for "
@@ -1779,11 +1816,20 @@ class TradingEngine:
                     order_type=suspect.decision.order_type.value,
                     side=suspect.decision.side.value,
                 )
+                # Slippage unification (Phase 1) codepath §9 — the
+                # suspect-order recovery state preserves the original
+                # benchmark kind (arrival_midpoint vs fallback_latest_close
+                # vs unavailable) so the recovered row tags the same kind
+                # the live row would have written. Quality is forced to
+                # 'recovered' so downstream consumers can isolate
+                # reconstructed rows. Defect 2 fix.
                 self._log_entry(
                     suspect.decision,
                     result,
                     suspect.modeled_price,
                     timestamp_override=result.filled_at or result.submitted_at,
+                    benchmark_kind=suspect.modeled_price_kind,
+                    measurement_quality="recovered",
                 )
                 self._register_single_leg(
                     strategy_name=suspect.decision.strategy_name,
@@ -1905,6 +1951,8 @@ class TradingEngine:
         *,
         record_slippage: bool = True,
         timestamp_override: datetime | None = None,
+        benchmark_kind: str | None = None,
+        measurement_quality: str | None = None,
     ) -> None:
         """Log an entry fill to the trade database.
 
@@ -1920,6 +1968,16 @@ class TradingEngine:
         time (``filled_at``), recovered rows should use that broker time
         rather than the later cycle when the engine noticed and repaired
         the gap.
+
+        ``benchmark_kind`` lets the call site declare whether
+        ``modeled_price`` represents an arrival midpoint or a fallback
+        (latest_close). Passed through to ``build_record`` for the new
+        slippage taxonomy columns. See codepath §1 in
+        docs/slippage_unification_design.md.
+
+        ``measurement_quality`` is set to 'recovered' by the suspect-order
+        recovery path (codepath §9). Default inference picks 'primary' or
+        'fallback' based on benchmark_kind.
         """
         if result.status not in {OrderStatus.FILLED, OrderStatus.PARTIAL}:
             return
@@ -1935,6 +1993,8 @@ class TradingEngine:
                 position_uid=getattr(result, "position_uid", None),
                 record_slippage=record_slippage,
                 timestamp_override=timestamp_override,
+                benchmark_kind=benchmark_kind,
+                measurement_quality=measurement_quality,
             )
             self.trade_logger.log(record)
         except Exception as e:
@@ -1945,8 +2005,18 @@ class TradingEngine:
         result: OrderResult,
         modeled_price: float,
         strategy_name: str = "",
+        *,
+        benchmark_kind: str | None = None,
+        measurement_quality: str | None = None,
     ) -> None:
-        """Log an exit fill to the trade database."""
+        """Log an exit fill to the trade database.
+
+        ``benchmark_kind`` defaults to None which makes ``build_close_record``
+        assume 'arrival_midpoint' (correct for normal discretionary
+        exits). The fractional residual cleanup call site passes
+        'unavailable' so the row honestly reports no benchmark — see
+        codepath §7 in docs/slippage_unification_design.md.
+        """
         if result.status not in {OrderStatus.FILLED, OrderStatus.PARTIAL}:
             return
         try:
@@ -1954,6 +2024,8 @@ class TradingEngine:
                 result,
                 strategy_name=strategy_name or self.strategy.name,
                 modeled_price=modeled_price,
+                benchmark_kind=benchmark_kind,
+                measurement_quality=measurement_quality,
             )
             self.trade_logger.log(record)
         except Exception as e:
@@ -2506,7 +2578,20 @@ class TradingEngine:
             or getattr(position, "avg_entry_price", 0.0)
             or 0.0
         )
-        self._log_close(result, close_price, owner)
+        # Slippage unification (Phase 1) codepath §7 — fractional
+        # residual cleanups have no honest arrival benchmark (the
+        # close_price fallback chain is the fill price itself or
+        # position.current_price, neither of which is a slippage
+        # benchmark). Tag the row 'unavailable' so the new taxonomy
+        # columns honestly report no measurement; the whole-share stop
+        # row already carries the meaningful exit slippage.
+        self._log_close(
+            result,
+            close_price,
+            owner,
+            benchmark_kind="unavailable",
+            measurement_quality="unavailable",
+        )
         if result.status in {OrderStatus.FILLED, OrderStatus.PARTIAL}:
             close_qty = float(result.filled_qty or position.qty or 0.0)
             self.alerts.trade_executed(
@@ -2971,11 +3056,23 @@ class TradingEngine:
             )
             return False
 
+        # Slippage unification (Phase 1) — pass the recovered broker
+        # order's actual stop_price so the slippage benchmark matches
+        # the active stop that fired, not the original initial_stop_loss.
+        # quality='recovered' tags the row for downstream consumers per
+        # codepath §5 in docs/slippage_unification_design.md. Defect 4
+        # fix: use _finite_or_none so NaN/+inf/-inf can't poison the
+        # benchmark.
+        recovered_stop_price = _finite_or_none(
+            getattr(stop_fill, "stop_price", None)
+        )
         self.trade_logger.log_stop_fill(
             symbol=raw_symbol,
             strategy=owner,
             qty=qty,
             avg_fill_price=price,
+            stop_price=recovered_stop_price,
+            measurement_quality="recovered",
             order_id=stop_fill.order_id,
             timestamp_override=stop_fill.filled_at or stop_fill.submitted_at,
         )
@@ -3225,12 +3322,18 @@ class TradingEngine:
                     f"{symbol}: recovery lifecycle synthesis failed: {exc}"
                 )
 
+        # Slippage unification (Phase 1) codepath §8 — reconstructed
+        # entry context has no honest arrival benchmark (the live
+        # submission predates this process), but the row is still
+        # tagged quality='recovered' so consumers can isolate
+        # reconstruction rows from real live entries.
         self._log_entry(
             recovered_decision,
             recovered_result,
             latest_close,
             record_slippage=False,
             timestamp_override=recovered_timestamp,
+            measurement_quality="recovered",
         )
         self._entry_prices[symbol] = entry_price
         logger.warning(
@@ -3507,11 +3610,23 @@ class TradingEngine:
                 self._record_realized_pnl(symbol, owner, price, qty, multiplier=_pnl_mult)
             try:
                 if price is not None and qty > 0:
+                    # Slippage unification (Phase 1) — extract the broker
+                    # order's actual stop trigger price so log_stop_fill can
+                    # benchmark against the active stop that fired, not the
+                    # original initial_stop_loss. See codepath §4 in
+                    # docs/slippage_unification_design.md. Defect 4 fix:
+                    # use _finite_or_none so NaN/+inf/-inf can't poison
+                    # the benchmark even if a misbehaving stream payload
+                    # delivers a malformed stop_price.
+                    broker_stop_price = _finite_or_none(
+                        getattr(update.order, "stop_price", None)
+                    )
                     stop_log_kwargs = {
                         "symbol": raw_symbol,
                         "strategy": owner,
                         "qty": qty,
                         "avg_fill_price": price,
+                        "stop_price": broker_stop_price,
                         "order_id": order_id,
                     }
                     stop_timestamp = (
@@ -3771,12 +3886,28 @@ class TradingEngine:
                 result, modeled_price=latest_close,
                 order_type="market", side="sell",
             )
-        close_modeled = (
-            result.avg_fill_price or 0.0
-            if _OCC_PAT.match(position.symbol)
-            else latest_close
+        # Slippage unification (Phase 1) Defect 1 fix — the exit path
+        # never fetches an arrival midpoint, so tagging the row as
+        # 'arrival_midpoint' was a false claim. For equities we still
+        # have the latest bar close as a measurement reference, which
+        # is honestly a fallback; for options we have nothing better
+        # than the fill price itself, which yields a structural zero
+        # and must be reported as 'unavailable' instead.
+        if _OCC_PAT.match(position.symbol):
+            close_modeled = result.avg_fill_price or 0.0
+            close_benchmark_kind: str = "unavailable"
+            close_measurement_quality: str = "unavailable"
+        else:
+            close_modeled = latest_close
+            close_benchmark_kind = "fallback_latest_close"
+            close_measurement_quality = "fallback"
+        self._log_close(
+            result,
+            close_modeled,
+            strategy.name,
+            benchmark_kind=close_benchmark_kind,
+            measurement_quality=close_measurement_quality,
         )
-        self._log_close(result, close_modeled, strategy.name)
         if result.status not in {OrderStatus.FILLED, OrderStatus.PARTIAL}:
             logger.warning(
                 f"[{strategy.name}] {symbol}: close did not fill "
