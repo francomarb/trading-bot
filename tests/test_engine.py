@@ -2429,6 +2429,77 @@ class TestExternalCloseDetection:
             1000.0,
         )
 
+    def test_recovered_stop_fill_passes_broker_stop_price_and_recovered_quality(
+        self, patch_fetch, tmp_path
+    ):
+        """
+        Slippage unification Phase 1 codepath §5 — recovery path forwards
+        ClosedOrderInfo.stop_price as the benchmark and tags the row
+        measurement_quality='recovered'.
+        """
+        engine, _, _ = _engine_with_confirm(patch_fetch, tmp_path, confirm=1)
+        engine._entry_prices["AAPL"] = 150.0
+
+        stop_fill = ClosedOrderInfo(
+            order_id="recovered-aapl-1",
+            client_order_id=None,
+            symbol="AAPL",
+            side=Side.SELL,
+            order_type="stop",
+            status=OrderStatus.FILLED,
+            raw_status="filled",
+            qty=10.0,
+            filled_qty=10.0,
+            avg_fill_price=144.50,
+            stop_price=145.00,
+            submitted_at=T0,
+            filled_at=T0 + timedelta(minutes=1),
+        )
+
+        engine.trade_logger.log_stop_fill = MagicMock()
+        engine._record_recovered_stop_fill(
+            symbol="AAPL",
+            owner="sma_crossover",
+            stop_fill=stop_fill,
+        )
+        kwargs = engine.trade_logger.log_stop_fill.call_args.kwargs
+        assert kwargs["stop_price"] == pytest.approx(145.00)
+        assert kwargs["measurement_quality"] == "recovered"
+
+    def test_recovered_stop_fill_forwards_none_when_broker_stop_price_missing(
+        self, patch_fetch, tmp_path
+    ):
+        """When the recovered broker order has no stop_price, log_stop_fill
+        receives stop_price=None and writes the row as 'unavailable'."""
+        engine, _, _ = _engine_with_confirm(patch_fetch, tmp_path, confirm=1)
+        engine._entry_prices["AAPL"] = 150.0
+
+        stop_fill = ClosedOrderInfo(
+            order_id="recovered-aapl-2",
+            client_order_id=None,
+            symbol="AAPL",
+            side=Side.SELL,
+            order_type="stop",
+            status=OrderStatus.FILLED,
+            raw_status="filled",
+            qty=10.0,
+            filled_qty=10.0,
+            avg_fill_price=144.50,
+            stop_price=None,
+            submitted_at=T0,
+            filled_at=T0 + timedelta(minutes=1),
+        )
+
+        engine.trade_logger.log_stop_fill = MagicMock()
+        engine._record_recovered_stop_fill(
+            symbol="AAPL",
+            owner="sma_crossover",
+            stop_fill=stop_fill,
+        )
+        kwargs = engine.trade_logger.log_stop_fill.call_args.kwargs
+        assert kwargs["stop_price"] is None
+        assert kwargs["measurement_quality"] == "recovered"
+
     def test_multiple_positions_only_confirmed_ones_cleared(self, patch_fetch, tmp_path):
         """Only positions that hit confirm threshold are cleared."""
         positions = {"MSFT": Position("MSFT", 5, 200.0, 1000.0)}

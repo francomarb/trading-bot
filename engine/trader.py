@@ -2971,11 +2971,27 @@ class TradingEngine:
             )
             return False
 
+        # Slippage unification (Phase 1) — pass the recovered broker
+        # order's actual stop_price so the slippage benchmark matches
+        # the active stop that fired, not the original initial_stop_loss.
+        # quality='recovered' tags the row for downstream consumers per
+        # codepath §5 in docs/slippage_unification_design.md.
+        recovered_stop_price: float | None = None
+        raw_recovered_stop = getattr(stop_fill, "stop_price", None)
+        if raw_recovered_stop is not None:
+            try:
+                candidate = float(raw_recovered_stop)
+            except (TypeError, ValueError):
+                candidate = None
+            if candidate is not None and candidate > 0:
+                recovered_stop_price = candidate
         self.trade_logger.log_stop_fill(
             symbol=raw_symbol,
             strategy=owner,
             qty=qty,
             avg_fill_price=price,
+            stop_price=recovered_stop_price,
+            measurement_quality="recovered",
             order_id=stop_fill.order_id,
             timestamp_override=stop_fill.filled_at or stop_fill.submitted_at,
         )
