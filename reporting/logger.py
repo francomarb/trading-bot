@@ -1580,6 +1580,8 @@ class TradeLogger:
                         if row["initial_risk_per_share"] is not None else None
                     )
                     current["entry_timestamp"] = row["entry_timestamp"]
+                # Legacy rows may lack a broker fill, so preserve the old
+                # reference-price fallback without using it for newer rows.
                 fill_price_raw = (
                     row["avg_fill_price"]
                     if row["avg_fill_price"] is not None

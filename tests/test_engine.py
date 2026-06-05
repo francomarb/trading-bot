@@ -1918,6 +1918,12 @@ class TestWatchlistStatuses:
         assert len(buy_rows) == 1
         assert buy_rows[0]["timestamp"] == (T0 + timedelta(minutes=2)).isoformat()
         assert buy_rows[0]["entry_timestamp"] == (T0 + timedelta(minutes=2)).isoformat()
+        assert buy_rows[0]["avg_fill_price"] == pytest.approx(100.5)
+
+        engine._entry_prices.clear()
+        engine._restore_entry_prices_from_db(cycle2)
+
+        assert engine._entry_prices["AAPL"] == pytest.approx(100.5)
 
 
 # ── Scanner cadence ────────────────────────────────────────────────────────

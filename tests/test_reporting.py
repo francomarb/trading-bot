@@ -241,11 +241,13 @@ class TestTradeLogger:
             raw_status="partially_filled",
             message="partial",
         )
-        tl.log(tl.build_close_record(
+        partial_close_record = tl.build_close_record(
             partial_close,
             strategy_name="sma_crossover",
             modeled_price=110.0,
-        ))
+        )
+        assert partial_close_record.realized_pnl == pytest.approx(40.0)
+        tl.log(partial_close_record)
         second_decision = RiskDecision(
             symbol="AAPL",
             side=Side.BUY,
