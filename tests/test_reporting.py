@@ -1493,6 +1493,153 @@ class TestBuildCloseRecordSlippageContract:
         assert record.slippage_signed_bps is None
 
 
+# ── TestSlippageDualWriteParity ────────────────────────────────────────────
+
+
+class TestSlippageDualWriteParity:
+    """
+    Phase 1 commit 8 of slippage unification — cross-cutting safety net.
+
+    Where both legacy (realized_slippage_bps) and new (slippage_signed_bps)
+    columns carry a value, they MUST agree. This guards against any
+    future writer change drifting the two paths apart while Phase 1
+    dual-write is in force. Phase 2 consumer migration relies on the
+    new columns being a strict superset of legacy behavior.
+
+    Codepaths where parity is expected (both non-NULL):
+      - Codepath §1 market entry with benchmark
+      - Codepath §3 discretionary market exit
+      - Codepath §4/§5 stop fills with broker stop_price
+      - Codepath §11 short leg of spread fills
+
+    Codepaths where the legacy and new column legitimately diverge
+    (legacy NULL, new 'unavailable'; or legacy retains 0.0/value
+    while new goes NULL) are NOT covered here — they are pinned by
+    their respective codepath tests above.
+    """
+
+    def _open_db(self, path: str):
+        conn = sqlite3.connect(path)
+        conn.row_factory = sqlite3.Row
+        return conn
+
+    def test_market_entry_legacy_matches_new(
+        self, tmp_csv, sample_decision, sample_result
+    ):
+        tl = TradeLogger(path=tmp_csv)
+        record = tl.build_record(
+            sample_decision,
+            sample_result,
+            modeled_price=150.0,
+            benchmark_kind="arrival_midpoint",
+        )
+        tl.log(record)
+        conn = self._open_db(tmp_csv)
+        try:
+            row = dict(conn.execute(
+                "SELECT realized_slippage_bps, slippage_signed_bps FROM trades "
+                "WHERE reason = ? ORDER BY id DESC LIMIT 1",
+                (sample_decision.reason,),
+            ).fetchone())
+        finally:
+            conn.close()
+        assert row["realized_slippage_bps"] == pytest.approx(row["slippage_signed_bps"])
+
+    def test_market_exit_legacy_matches_new(self, tmp_csv):
+        tl = TradeLogger(path=tmp_csv)
+        result = OrderResult(
+            status=OrderStatus.FILLED,
+            order_id="exit-parity-1",
+            symbol="AAPL",
+            requested_qty=10,
+            filled_qty=10,
+            avg_fill_price=152.0,
+            raw_status="filled",
+        )
+        record = tl.build_close_record(
+            result,
+            strategy_name="sma_crossover",
+            modeled_price=151.50,
+        )
+        tl.log(record)
+        conn = self._open_db(tmp_csv)
+        try:
+            row = dict(conn.execute(
+                "SELECT realized_slippage_bps, slippage_signed_bps FROM trades "
+                "WHERE order_id = 'exit-parity-1'"
+            ).fetchone())
+        finally:
+            conn.close()
+        assert row["realized_slippage_bps"] == pytest.approx(row["slippage_signed_bps"])
+
+    def test_stop_fill_with_broker_stop_legacy_matches_new(self, tmp_csv):
+        tl = TradeLogger(path=tmp_csv)
+        tl.log_stop_fill(
+            symbol="AAPL",
+            strategy="sma_crossover",
+            qty=10.0,
+            avg_fill_price=144.50,
+            stop_price=145.00,
+            order_id="stop-parity-1",
+        )
+        conn = self._open_db(tmp_csv)
+        try:
+            row = dict(conn.execute(
+                "SELECT realized_slippage_bps, slippage_signed_bps FROM trades "
+                "WHERE order_id = 'stop-parity-1'"
+            ).fetchone())
+        finally:
+            conn.close()
+        assert row["realized_slippage_bps"] == pytest.approx(row["slippage_signed_bps"])
+
+    def test_spread_short_leg_legacy_matches_new(self, tmp_csv):
+        tl = TradeLogger(path=tmp_csv)
+        tl.log_spread_fill(
+            position_id="spread-parity-1",
+            strategy="credit_spread",
+            short_occ="SPY260620P00510000",
+            long_occ="SPY260620P00505000",
+            qty=1.0,
+            net_price=0.55,
+            submitted_limit_price=0.60,
+            opening=True,
+            initial_risk_dollars=445.0,
+        )
+        conn = self._open_db(tmp_csv)
+        try:
+            row = dict(conn.execute(
+                "SELECT realized_slippage_bps, slippage_signed_bps FROM trades "
+                "WHERE side='sell' AND position_id='spread-parity-1'"
+            ).fetchone())
+        finally:
+            conn.close()
+        assert row["realized_slippage_bps"] == pytest.approx(row["slippage_signed_bps"])
+
+    def test_adverse_is_signed_clamped_to_zero(self, tmp_csv):
+        """Adverse_bps is max(0, signed_bps) on every row where signed is
+        non-NULL. The clamp lives in writer code, not at read time."""
+        tl = TradeLogger(path=tmp_csv)
+        # Sell @ 145.50 vs stop 145.00 — favorable execution (signed < 0)
+        tl.log_stop_fill(
+            symbol="AAPL",
+            strategy="sma_crossover",
+            qty=10.0,
+            avg_fill_price=145.50,
+            stop_price=145.00,
+            order_id="stop-favorable-1",
+        )
+        conn = self._open_db(tmp_csv)
+        try:
+            row = dict(conn.execute(
+                "SELECT slippage_signed_bps, slippage_adverse_bps FROM trades "
+                "WHERE order_id = 'stop-favorable-1'"
+            ).fetchone())
+        finally:
+            conn.close()
+        assert row["slippage_signed_bps"] < 0  # price improvement
+        assert row["slippage_adverse_bps"] == 0.0
+
+
 # ── TestExternalCloseAndRecoveredContextContract ───────────────────────────
 
 

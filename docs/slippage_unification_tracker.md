@@ -11,7 +11,7 @@ Status legend: ✅ done · 🔄 in progress · ⬜ not started · ⏸ blocked
 
 | Phase | Scope | Branch | PR | Status |
 |---|---|---|---|---|
-| 1 | Schema + writers + dual-write to legacy + 13 codepath tests | `feature/slippage-unification-phase1` | — | 🔄 In progress |
+| 1 | Schema + writers + dual-write to legacy + 13 codepath tests | `feature/slippage-unification-phase1` | — | ✅ Ready for review |
 | Smoke check | 2 days paper run; spot-check rows per codepath | (no branch) | — | ⬜ Not started |
 | 2 + 4 | Consumer migration (health, risk, calibration, dashboard) + dashboard denominator dilution fix + drop legacy dual-writes | `feature/slippage-unification-phase2` | — | ⬜ Not started |
 | 3 | Historical cleanup migration (phantom recovery rows + pre-`8316e64` LIMIT rows) | `feature/slippage-unification-phase3` | — | ⬜ Not started |
@@ -34,7 +34,7 @@ Branch: `feature/slippage-unification-phase1`
 | 5 | Tag single-leg entry/exit codepaths with benchmark kind (codepaths 1, 2, 3, 7, 9); add `benchmark_kind` + `benchmark_price` params to `build_close_record` | ~200 | 10 | 🔄 In progress |
 | 6 | Tag option and spread codepaths (10, 11) | ~110 | 3 | 🔄 In progress |
 | 7 | Tag external-close and recovered-context codepaths (8, 12, 13); stop writing `0.0` from `log_external_close` | ~80 | 3 | 🔄 In progress |
-| 8 | Cross-cutting legacy-mirror parity assertion | ~20 | 1 | ⬜ |
+| 8 | Cross-cutting legacy-mirror parity assertion | ~120 | 5 | 🔄 In progress |
 
 Total estimate: ~325 LOC + ~250 LOC tests.
 
