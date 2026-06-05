@@ -3998,3 +3998,126 @@ class TestSectorExposure:
         # Should not raise; counts that symbol as unmapped.
         exposure = engine._compute_sector_exposure()
         assert exposure == {}
+
+
+# ── Slippage unification Defect 1 fix ──────────────────────────────────────
+
+
+class TestExitPathBenchmarkKind:
+    """
+    Codepath §3 — discretionary market exits. The exit path never
+    fetches an arrival midpoint; it passes latest_close (equities) or
+    the fill price itself (options) as ``modeled_price``. Phase 1
+    Defect 1 fix changes the tagging so:
+
+      - equity exits → benchmark_kind='fallback_latest_close', quality='fallback'
+      - option exits → benchmark_kind='unavailable', quality='unavailable'
+
+    Previously both were tagged 'arrival_midpoint' / 'primary', which
+    was a false claim for equities and a fabricated zero-slippage
+    measurement for options.
+    """
+
+    def _engine_with_real_logger(self, tmp_path):
+        from strategies.base import StrategySlot
+        from data.watchlists import StaticWatchlistSource
+        from execution.broker import BrokerSnapshot
+
+        strategy = FakeStrategy(entries=[False], exits=[False])
+        broker = MagicMock()
+        broker.sync_with_broker.return_value = _snapshot()
+        broker.close_position.return_value = _filled_result("AAPL", 10, 149.50)
+        broker.get_open_orders.return_value = []
+        broker._with_retry.side_effect = lambda fn, **_: fn()
+        broker._api.get_clock.return_value = SimpleNamespace(is_open=True)
+
+        risk = RiskManager(
+            max_position_pct=0.02,
+            max_open_positions=5,
+            max_gross_exposure_pct=0.50,
+            atr_stop_multiplier=2.0,
+            max_daily_loss_pct=0.05,
+            hard_dollar_loss_cap=1_000_000.0,
+            loss_streak_threshold=10,
+            broker_error_threshold=10,
+        )
+        tl = TradeLogger(path=str(tmp_path / "trades.db"))
+        return TradingEngine(
+            strategy=strategy,
+            symbols=["AAPL"],
+            risk=risk,
+            broker=broker,
+            trade_logger=tl,
+            config=EngineConfig(
+                history_lookback_days=120,
+                cycle_interval_seconds=0.01,
+                max_bar_age_multiplier=10.0,
+                market_hours_only=False,
+            ),
+        ), broker
+
+    def test_equity_exit_tags_fallback_latest_close(self, tmp_path):
+        engine, broker = self._engine_with_real_logger(tmp_path)
+        from execution.broker import BrokerSnapshot
+        position = SimpleNamespace(
+            qty=10, symbol="AAPL", avg_entry_price=148.0,
+            market_value=1480.0, unrealized_pl=0.0,
+            current_price=148.0, cost_basis=1480.0,
+            asset_id="x", side="long",
+        )
+        snap = BrokerSnapshot(
+            account=SimpleNamespace(
+                equity=100_000.0,
+                cash=50_000.0,
+                buying_power=50_000.0,
+                open_positions={"AAPL": position},
+            ),
+            open_orders=[],
+        )
+        engine._log_close = MagicMock()
+        engine._close_single_leg_position(
+            symbol="AAPL",
+            strategy=engine.strategy,
+            position=position,
+            snapshot=snap,
+            latest_close=149.00,
+            alert_reason="exit signal",
+        )
+        kwargs = engine._log_close.call_args.kwargs
+        assert kwargs["benchmark_kind"] == "fallback_latest_close"
+        assert kwargs["measurement_quality"] == "fallback"
+
+    def test_option_exit_tags_unavailable(self, tmp_path):
+        engine, broker = self._engine_with_real_logger(tmp_path)
+        occ = "SPY260620C00520000"
+        broker.close_position.return_value = _filled_result(occ, 2, 12.50)
+        from execution.broker import BrokerSnapshot
+        position = SimpleNamespace(
+            qty=2, symbol=occ, avg_entry_price=10.0,
+            market_value=2000.0, unrealized_pl=500.0,
+            current_price=12.5, cost_basis=2000.0,
+            asset_id="x", side="long",
+        )
+        snap = BrokerSnapshot(
+            account=SimpleNamespace(
+                equity=100_000.0,
+                cash=50_000.0,
+                buying_power=50_000.0,
+                open_positions={occ: position},
+            ),
+            open_orders=[],
+        )
+        engine._log_close = MagicMock()
+        engine._close_single_leg_position(
+            symbol="SPY",
+            strategy=engine.strategy,
+            position=position,
+            snapshot=snap,
+            latest_close=12.50,
+            alert_reason="exit signal",
+        )
+        kwargs = engine._log_close.call_args.kwargs
+        # Options have no honest benchmark at exit — must be unavailable,
+        # never the fill price masquerading as 'arrival_midpoint'.
+        assert kwargs["benchmark_kind"] == "unavailable"
+        assert kwargs["measurement_quality"] == "unavailable"

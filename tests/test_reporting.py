@@ -1451,18 +1451,51 @@ class TestBuildCloseRecordSlippageContract:
             raw_status="filled",
         )
 
-    def test_default_kind_is_arrival_midpoint_primary(self):
+    def test_default_kind_is_unavailable_safe(self):
+        """Defect 1 fix — caller that omits benchmark_kind gets a safe
+        'unavailable' tag, never a fabricated 'arrival_midpoint'. The
+        real exit caller in engine/trader.py declares fallback or
+        unavailable per equity-vs-option as appropriate."""
         tl = TradeLogger(path="/dev/null")
         record = tl.build_close_record(
             self._make_close_result(),
             strategy_name="sma_crossover",
             modeled_price=151.50,
         )
+        assert record.slippage_benchmark_kind == "unavailable"
+        assert record.slippage_measurement_quality == "unavailable"
+        assert record.slippage_signed_bps is None
+        assert record.slippage_adverse_bps is None
+
+    def test_explicit_arrival_midpoint_kind_writes_primary(self):
+        """When the caller declares an honest arrival_midpoint benchmark,
+        the row gets primary quality and the computed slippage."""
+        tl = TradeLogger(path="/dev/null")
+        record = tl.build_close_record(
+            self._make_close_result(),
+            strategy_name="sma_crossover",
+            modeled_price=151.50,
+            benchmark_kind="arrival_midpoint",
+        )
         assert record.slippage_benchmark_kind == "arrival_midpoint"
         assert record.slippage_measurement_quality == "primary"
         assert record.slippage_benchmark_price == pytest.approx(151.50)
         assert record.slippage_signed_bps is not None
-        assert record.slippage_adverse_bps is not None
+
+    def test_explicit_fallback_kind_writes_fallback_quality(self):
+        """Defect 1 fix — equity exits using latest_close as a fallback
+        proxy must be tagged fallback_latest_close / fallback."""
+        tl = TradeLogger(path="/dev/null")
+        record = tl.build_close_record(
+            self._make_close_result(),
+            strategy_name="sma_crossover",
+            modeled_price=151.50,
+            benchmark_kind="fallback_latest_close",
+        )
+        assert record.slippage_benchmark_kind == "fallback_latest_close"
+        assert record.slippage_measurement_quality == "fallback"
+        assert record.slippage_benchmark_price == pytest.approx(151.50)
+        assert record.slippage_signed_bps is not None
 
     def test_unavailable_kind_writes_null_metrics(self):
         """Fractional residual cleanup contract — pass 'unavailable' to
@@ -1556,10 +1589,14 @@ class TestSlippageDualWriteParity:
             avg_fill_price=152.0,
             raw_status="filled",
         )
+        # Defect 1 fix — caller must declare an honest kind for new
+        # cols to populate. Parity then holds: legacy and new
+        # benchmark against the same modeled_price.
         record = tl.build_close_record(
             result,
             strategy_name="sma_crossover",
             modeled_price=151.50,
+            benchmark_kind="arrival_midpoint",
         )
         tl.log(record)
         conn = self._open_db(tmp_csv)

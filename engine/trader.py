@@ -3869,12 +3869,28 @@ class TradingEngine:
                 result, modeled_price=latest_close,
                 order_type="market", side="sell",
             )
-        close_modeled = (
-            result.avg_fill_price or 0.0
-            if _OCC_PAT.match(position.symbol)
-            else latest_close
+        # Slippage unification (Phase 1) Defect 1 fix — the exit path
+        # never fetches an arrival midpoint, so tagging the row as
+        # 'arrival_midpoint' was a false claim. For equities we still
+        # have the latest bar close as a measurement reference, which
+        # is honestly a fallback; for options we have nothing better
+        # than the fill price itself, which yields a structural zero
+        # and must be reported as 'unavailable' instead.
+        if _OCC_PAT.match(position.symbol):
+            close_modeled = result.avg_fill_price or 0.0
+            close_benchmark_kind: str = "unavailable"
+            close_measurement_quality: str = "unavailable"
+        else:
+            close_modeled = latest_close
+            close_benchmark_kind = "fallback_latest_close"
+            close_measurement_quality = "fallback"
+        self._log_close(
+            result,
+            close_modeled,
+            strategy.name,
+            benchmark_kind=close_benchmark_kind,
+            measurement_quality=close_measurement_quality,
         )
-        self._log_close(result, close_modeled, strategy.name)
         if result.status not in {OrderStatus.FILLED, OrderStatus.PARTIAL}:
             logger.warning(
                 f"[{strategy.name}] {symbol}: close did not fill "

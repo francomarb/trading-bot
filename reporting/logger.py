@@ -665,10 +665,15 @@ class TradeLogger:
                     r_multiple = realized_pnl / initial_risk_dollars
 
         # ── Slippage unification (Phase 1) ──
-        # Default kind = arrival_midpoint preserves prior behavior; the
-        # fractional-residual call site overrides to 'unavailable'.
+        # Default kind = 'unavailable' is the safe behavior — no caller
+        # gets a fabricated 'arrival_midpoint' tag if it forgot to
+        # declare what kind of price it passed. The real exit caller
+        # (`_close_single_leg_position`) declares 'fallback_latest_close'
+        # for equities and 'unavailable' for options; the fractional
+        # residual cleanup declares 'unavailable'. See codepaths §3, §7
+        # in docs/slippage_unification_design.md.
         new_benchmark_price: float | None = None
-        new_benchmark_kind: SlippageBenchmarkKind = benchmark_kind or "arrival_midpoint"
+        new_benchmark_kind: SlippageBenchmarkKind = benchmark_kind or "unavailable"
         new_benchmark_timestamp: str | None = None
         new_quality: SlippageMeasurementQuality
         new_signed_bps: float | None = None
