@@ -55,8 +55,11 @@ software guard and its broker-side protective stop. Alpaca supports `gtc` for
 single-leg option stop orders, so the engine keeps one GTC stop open and uses
 the SDK replace-order endpoint when ratcheting it upward. Black-Scholes remains
 an input to the Delta floor only; it is not treated as an executable premium.
+When Alpaca does not provide a usable premium, the software trail leaves its
+HWM unchanged and skips that cycle rather than substituting a theoretical value.
 If an already-open option is adopted without a recoverable HWM, the engine
-alerts and bootstraps conservatively from the current Alpaca position premium.
+alerts and bootstraps conservatively from the higher of entry premium and the
+current Alpaca position premium.
 
 **Capital math at $100k equity:**
 - Sleeve budget = $100k × 0.80 × 0.05 = **$4,000**

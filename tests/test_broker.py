@@ -1420,6 +1420,7 @@ class TestOptionGtcStops:
 
     def test_replace_option_stop_ratchets_atomically_and_enforces_gtc(self):
         api = MagicMock()
+        stream = MagicMock()
         api.replace_order_by_id.return_value = _alpaca_order(
             id="stop-2",
             status="accepted",
@@ -1431,19 +1432,27 @@ class TestOptionGtcStops:
             time_in_force="gtc",
         )
 
-        result = AlpacaBroker(
-            client=api, max_attempts=1, base_delay=0.0
-        ).replace_option_stop(
+        broker = AlpacaBroker(
+            client=api,
+            max_attempts=1,
+            base_delay=0.0,
+            stream_manager=stream,
+        )
+        result = broker.replace_option_stop(
             order_id="stop-1",
+            qty=3,
             stop_price=18.70,
         )
 
         order_id, req = api.replace_order_by_id.call_args.args
         assert order_id == "stop-1"
+        assert req.qty == 3
         assert req.stop_price == 18.70
         assert req.time_in_force.value == "gtc"
         assert result.order_id == "stop-2"
         assert result.time_in_force == "gtc"
+        stream.unregister_stop_leg.assert_called_once_with("stop-1")
+        stream.register_stop_leg.assert_called_once_with("stop-2")
 
 
 # ── place_spread_order / close_spread_order — MLEG (11.28) ───────────────────

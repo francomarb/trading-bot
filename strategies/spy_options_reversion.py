@@ -228,11 +228,10 @@ class SPYOptionsReversionStrategy(BaseStrategy):
             delta = call.delta()
             opt_val = _coerce_numeric(call.price)
             broker_premium = self._position_premium(position)
-            observed_premium = broker_premium or opt_val
 
             logger.debug(
                 f"[{self.name}] {occ} Delta={delta:.3f} "
-                f"broker_premium=${observed_premium:.2f} theoretical=${opt_val:.2f} "
+                f"broker_premium={broker_premium!r} theoretical=${opt_val:.2f} "
                 f"(S={latest_close:.2f}, K={strike:.2f}, T={T:.4f}y, σ={sigma:.2f})"
             )
 
@@ -248,6 +247,13 @@ class SPYOptionsReversionStrategy(BaseStrategy):
                 return True
 
             # ── Guard 3: trailing stop ───────────────────────────────────────
+            if broker_premium is None:
+                logger.warning(
+                    f"[{self.name}] {occ}: broker premium unavailable; "
+                    "skipping software trailing-stop evaluation this cycle"
+                )
+                return False
+            observed_premium = broker_premium
             if occ not in self._position_base:
                 self._position_base[occ] = observed_premium
             self._position_hwm[occ] = max(

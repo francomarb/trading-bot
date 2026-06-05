@@ -448,18 +448,18 @@ class AlertDispatcher:
         ))
 
     def option_trailing_state_unverified(
-        self, symbol: str, strategy: str, observed_premium: float
+        self, symbol: str, strategy: str, hwm_premium: float
     ) -> bool:
         return self.fire(Alert(
             alert_type=AlertType.OPTION_TRAILING_STATE_UNVERIFIED,
             severity=AlertSeverity.WARNING,
             message=(
                 "open option had no durable high-water mark; "
-                "initialized from current broker premium"
+                "initialized conservatively from available broker/entry evidence"
             ),
             symbol=symbol,
             strategy=strategy,
-            details={"observed_premium": observed_premium},
+            details={"hwm_premium": hwm_premium},
         ))
 
     def engine_halt(self, reason: str) -> bool:

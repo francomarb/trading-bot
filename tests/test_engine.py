@@ -3869,6 +3869,7 @@ class TestGenericSingleLegOptionTrailingStops:
 
         broker.replace_option_stop.assert_called_once_with(
             order_id="old-stop",
+            qty=3.0,
             stop_price=18.70,
         )
         broker.cancel_order.assert_not_called()
@@ -3953,8 +3954,97 @@ class TestGenericSingleLegOptionTrailingStops:
 
         broker.replace_option_stop.assert_called_once_with(
             order_id="day-stop",
+            qty=3.0,
             stop_price=17.14,
         )
+
+    def test_qty_mismatch_is_corrected_with_atomic_replace(self, tmp_path):
+        engine, broker = self._engine(tmp_path)
+        undersized_stop = replace(
+            _open_stop_order("SPY260618C00746000", stop_price=17.14),
+            order_id="undersized-stop",
+            qty=2,
+            time_in_force="gtc",
+        )
+        engine.option_trailing_store.upsert(
+            position_uid="pos_abc123",
+            occ_symbol="SPY260618C00746000",
+            strategy="generic_single_leg_options",
+            owner_key="SPY",
+            qty=2,
+            entry_premium=12.77,
+            hwm_premium=20.16,
+            trail_activation_pct=0.10,
+            trail_pct=0.15,
+            current_stop_price=17.14,
+            alpaca_stop_order_id="undersized-stop",
+            stop_order_status="accepted",
+            last_observed_premium=15.50,
+        )
+        broker.replace_option_stop.return_value = replace(
+            broker.replace_option_stop.return_value,
+            stop_price=17.14,
+        )
+        snapshot = _snapshot(
+            positions={
+                "SPY260618C00746000": Position(
+                    symbol="SPY260618C00746000",
+                    qty=3,
+                    avg_entry_price=12.77,
+                    market_value=4_650.0,
+                    current_price=15.50,
+                )
+            },
+            open_orders=[undersized_stop],
+        )
+
+        engine._sync_option_trailing_stops(snapshot)
+
+        broker.replace_option_stop.assert_called_once_with(
+            order_id="undersized-stop",
+            qty=3.0,
+            stop_price=17.14,
+        )
+
+    def test_missing_tif_uses_matching_durable_gtc_identity(self, tmp_path):
+        engine, broker = self._engine(tmp_path)
+        projected_stop = replace(
+            _open_stop_order("SPY260618C00746000", stop_price=17.14),
+            order_id="known-stop",
+            qty=3,
+            time_in_force=None,
+        )
+        engine.option_trailing_store.upsert(
+            position_uid="pos_abc123",
+            occ_symbol="SPY260618C00746000",
+            strategy="generic_single_leg_options",
+            owner_key="SPY",
+            qty=3,
+            entry_premium=12.77,
+            hwm_premium=20.16,
+            trail_activation_pct=0.10,
+            trail_pct=0.15,
+            current_stop_price=17.14,
+            alpaca_stop_order_id="known-stop",
+            stop_order_status="accepted",
+            last_observed_premium=15.50,
+        )
+        snapshot = _snapshot(
+            positions={
+                "SPY260618C00746000": Position(
+                    symbol="SPY260618C00746000",
+                    qty=3,
+                    avg_entry_price=12.77,
+                    market_value=4_650.0,
+                    current_price=15.50,
+                )
+            },
+            open_orders=[projected_stop],
+        )
+
+        engine._sync_option_trailing_stops(snapshot)
+
+        broker.replace_option_stop.assert_not_called()
 
     def test_recent_submit_missing_from_snapshot_does_not_duplicate(self, tmp_path):
         engine, broker = self._engine(tmp_path)

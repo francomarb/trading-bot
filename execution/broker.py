@@ -1679,30 +1679,42 @@ class AlpacaBroker:
         self,
         *,
         order_id: str,
+        qty: float,
         stop_price: float,
         client_order_id_prefix: str = "opt-trail-stop",
     ) -> OpenOrder:
         """Atomically ratchet an open option stop and enforce GTC duration."""
         if not order_id:
             raise BrokerError("option stop replacement requires an order id")
+        if qty <= 0:
+            raise BrokerError(f"option replacement qty must be positive: {qty}")
+        whole_qty = int(qty)
+        if abs(float(qty) - whole_qty) > 1e-9:
+            raise BrokerError(
+                f"option replacement qty must be a whole contract: {qty}"
+            )
         if stop_price <= 0:
             raise BrokerError(
                 f"option replacement stop price must be positive: {stop_price}"
             )
         client_order_id = f"{client_order_id_prefix}-{uuid.uuid4().hex[:10]}"
         request = ReplaceOrderRequest(
+            qty=whole_qty,
             time_in_force=TimeInForce.GTC,
             stop_price=round(stop_price, 2),
             client_order_id=client_order_id,
         )
         logger.warning(
             f"replacing option trailing stop {order_id}: "
-            f"new GTC stop @ ${stop_price:.2f} (client_id={client_order_id})"
+            f"sell {whole_qty} new GTC stop @ ${stop_price:.2f} "
+            f"(client_id={client_order_id})"
         )
         order = self._with_retry(
             lambda: self._api.replace_order_by_id(order_id, request),
             op_desc=f"replace_option_stop({order_id})",
         )
+        if self._stream_manager is not None:
+            self._stream_manager.unregister_stop_leg(order_id)
         self._register_standalone_stop_leg(order)
         return self._to_open_order(order)
 
@@ -1960,10 +1972,12 @@ class AlpacaBroker:
         status_val = o.status.value if hasattr(o.status, 'value') else str(o.status)
         order_id = str(o.id) if o.id is not None else None
         tif_raw = getattr(o, "time_in_force", None)
-        tif_val = (
-            tif_raw.value if hasattr(tif_raw, "value") else str(tif_raw)
-            if tif_raw is not None else None
-        )
+        if hasattr(tif_raw, "value"):
+            tif_val = tif_raw.value
+        elif tif_raw is not None:
+            tif_val = str(tif_raw)
+        else:
+            tif_val = None
 
         return OpenOrder(
             order_id=order_id,

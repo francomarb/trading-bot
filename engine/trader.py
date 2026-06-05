@@ -2853,20 +2853,19 @@ class TradingEngine:
                 continue
 
             row = self.option_trailing_store.get_by_occ(occ)
-            if row is None:
-                bootstrap_premium = current_premium or entry_premium
-                logger.warning(
-                    f"[{owner}] {occ}: no durable option HWM was recoverable; "
-                    f"initializing from broker premium ${bootstrap_premium:.2f}"
-                )
-                self.alerts.option_trailing_state_unverified(
-                    occ, owner, bootstrap_premium
-                )
             hwm = max(
                 entry_premium,
                 row.hwm_premium if row is not None else entry_premium,
                 current_premium if current_premium is not None else entry_premium,
             )
+            if row is None:
+                logger.warning(
+                    f"[{owner}] {occ}: no durable option HWM was recoverable; "
+                    f"initializing conservatively at ${hwm:.2f}"
+                )
+                self.alerts.option_trailing_state_unverified(
+                    occ, owner, hwm
+                )
             restore = getattr(strategy, "restore_trailing_state", None)
             if restore is not None:
                 try:
@@ -2916,11 +2915,23 @@ class TradingEngine:
                 if existing is not None and existing.time_in_force is not None
                 else None
             )
+            existing_is_known_gtc = existing_tif == "gtc" or (
+                existing is not None
+                and existing_tif is None
+                and row is not None
+                and row.alpaca_stop_order_id == existing.order_id
+                and row.stop_order_status
+                in {"accepted", "new", "pending_new", "open", "replace_failed"}
+            )
+            existing_qty_matches = (
+                existing is not None and abs(float(existing.qty) - qty) <= 1e-9
+            )
             # Keep an adequate durable stop. Legacy DAY stops are replaced with GTC.
             if (
                 existing is not None
                 and (existing.stop_price or 0.0) >= desired_stop
-                and existing_tif == "gtc"
+                and existing_is_known_gtc
+                and existing_qty_matches
             ):
                 self.option_trailing_store.upsert(
                     position_uid=lifecycle_row.position_uid,
@@ -2945,6 +2956,7 @@ class TradingEngine:
                 try:
                     new_order = self.broker.replace_option_stop(
                         order_id=existing.order_id,
+                        qty=qty,
                         stop_price=max(
                             desired_stop,
                             float(existing.stop_price or desired_stop),

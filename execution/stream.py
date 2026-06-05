@@ -218,6 +218,11 @@ class StreamManager:
         with self._lock:
             self._stop_legs.add(order_id)
 
+    def unregister_stop_leg(self, order_id: str) -> None:
+        """Remove a superseded standalone stop-leg order id."""
+        with self._lock:
+            self._stop_legs.discard(order_id)
+
     def sync_stop_legs(self, order_ids: list[str] | tuple[str, ...] | set[str]) -> None:
         """Replace tracked protective stop-leg ids with broker-rehydrated truth."""
         with self._lock:

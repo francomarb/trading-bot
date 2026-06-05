@@ -516,7 +516,12 @@ class TestTrailingStop:
         call_obj.price = bs_price
         sys.modules["blackscholes"] = fake_bs
 
-        pos = _position(sym)
+        pos = _position(
+            sym,
+            current_price=bs_price,
+            qty=1,
+            market_value=bs_price * 100.0,
+        )
         with patch("strategies.spy_options_reversion.datetime") as mock_dt:
             mock_dt.now.side_effect = lambda tz=None: now_et if tz == _ET else datetime.now(timezone.utc)
             mock_dt.combine = datetime.combine
@@ -608,6 +613,34 @@ class TestTrailingStop:
 
         assert not result
         assert strat._position_hwm[sym] == pytest.approx(10.50)
+
+    def test_missing_broker_premium_skips_trail_without_mutating_hwm(self):
+        _, sym, now_et = self._safe_expiry_and_sym()
+        strat = self._strat(activation=0.10, trail=0.15)
+        strat.restore_trailing_state(
+            sym,
+            entry_premium=10.0,
+            hwm_premium=15.0,
+        )
+
+        import sys, unittest.mock as _mock
+        fake_bs = _mock.MagicMock()
+        call_obj = fake_bs.BlackScholesCall.return_value
+        call_obj.delta.return_value = 0.55
+        call_obj.price = 20.0
+        sys.modules["blackscholes"] = fake_bs
+
+        with patch("strategies.spy_options_reversion.datetime") as mock_dt:
+            mock_dt.now.side_effect = (
+                lambda tz=None: now_et if tz == _ET else datetime.now(timezone.utc)
+            )
+            mock_dt.combine = datetime.combine
+            mock_dt.strptime = datetime.strptime
+            result = strat.inspect_open_positions(_position(sym), 520.0)
+
+        assert not result
+        assert strat._position_hwm[sym] == pytest.approx(15.0)
+        assert strat._position_base[sym] == pytest.approx(10.0)
 
     def test_durable_broker_hwm_triggers_on_current_broker_premium(self):
         _, sym, now_et = self._safe_expiry_and_sym()
