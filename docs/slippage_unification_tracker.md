@@ -26,8 +26,8 @@ Branch: `feature/slippage-unification-phase1`
 
 | # | Commit | LOC est. | Tests | Status |
 |---|---|---:|---:|---|
-| 0 | Implementation tracker + PLAN.md pointer | ~50 | — | 🔄 In progress |
-| 1 | Add slippage taxonomy columns to trades schema (idempotent ALTER TABLE) | ~30 | 1 | ⬜ |
+| 0 | Implementation tracker + PLAN.md pointer | ~50 | — | ✅ `c9d4cb3` |
+| 1 | Add slippage taxonomy columns to trades schema (idempotent ALTER TABLE) | ~70 | 4 | 🔄 In progress |
 | 2 | Add `stop_price` parameter to `log_stop_fill`; dual-write legacy | ~80 | 1 | ⬜ |
 | 3 | Wire WebSocket stop fill to broker `stop_price` (codepath 4) | ~10 | 1 | ⬜ |
 | 4 | Wire recovery stop fill to broker `stop_price` (codepaths 5, 6) | ~15 | 1 | ⬜ |

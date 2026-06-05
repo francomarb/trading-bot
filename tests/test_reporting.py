@@ -1209,6 +1209,90 @@ class TestMlegRealizedSlippageBps:
         ) == pytest.approx(500.0)
 
 
+# ── TestSlippageUnificationSchema ──────────────────────────────────────────
+
+
+class TestSlippageUnificationSchema:
+    """
+    Phase 1 of slippage unification — see docs/slippage_unification_design.md.
+
+    Asserts that the additive schema columns exist on freshly created DBs
+    and that the migration path (ALTER TABLE) is idempotent for pre-existing
+    DBs that lack the columns.
+    """
+
+    _NEW_COLUMNS = [
+        "slippage_benchmark_price",
+        "slippage_benchmark_kind",
+        "slippage_benchmark_timestamp",
+        "slippage_measurement_quality",
+        "slippage_signed_bps",
+        "slippage_adverse_bps",
+        "stop_trigger_price",
+    ]
+
+    def _column_set(self, db_path: str) -> set[str]:
+        conn = sqlite3.connect(db_path)
+        try:
+            return {row[1] for row in conn.execute("PRAGMA table_info(trades)").fetchall()}
+        finally:
+            conn.close()
+
+    def test_fresh_db_has_all_slippage_columns(self, tmp_csv):
+        TradeLogger(path=tmp_csv)._ensure_db()
+        columns = self._column_set(tmp_csv)
+        for col in self._NEW_COLUMNS:
+            assert col in columns, f"missing column on fresh DB: {col}"
+
+    def test_migration_adds_columns_to_legacy_db(self, tmp_path):
+        """A pre-existing DB without the new columns gets them via ALTER."""
+        db_path = str(tmp_path / "legacy.db")
+        conn = sqlite3.connect(db_path)
+        conn.execute(
+            """
+            CREATE TABLE trades (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                timestamp TEXT NOT NULL,
+                symbol TEXT NOT NULL,
+                side TEXT NOT NULL,
+                qty REAL NOT NULL,
+                strategy TEXT NOT NULL,
+                reason TEXT NOT NULL,
+                status TEXT NOT NULL
+            )
+            """
+        )
+        conn.commit()
+        conn.close()
+
+        before = self._column_set(db_path)
+        for col in self._NEW_COLUMNS:
+            assert col not in before, f"precondition: {col} should be absent"
+
+        TradeLogger(path=db_path)._ensure_db()
+
+        after = self._column_set(db_path)
+        for col in self._NEW_COLUMNS:
+            assert col in after, f"migration failed to add: {col}"
+
+    def test_ensure_db_is_idempotent(self, tmp_csv):
+        """Running _ensure_db twice on the same DB must not error."""
+        TradeLogger(path=tmp_csv)._ensure_db()
+        # Re-open and re-bootstrap — proves ALTER guards work.
+        TradeLogger(path=tmp_csv)._ensure_db()
+        columns = self._column_set(tmp_csv)
+        for col in self._NEW_COLUMNS:
+            assert col in columns
+
+    def test_trade_record_defaults_to_none_on_new_fields(self, sample_decision, sample_result):
+        tl = TradeLogger(path="/dev/null")
+        record = tl.build_record(sample_decision, sample_result, modeled_price=150.0)
+        # Phase 1 commit 1: writers do not populate these yet. Defaults
+        # must be None so the schema additions are non-disruptive.
+        for col in self._NEW_COLUMNS:
+            assert getattr(record, col) is None, f"{col} should default to None pre-writer"
+
+
 # ── TestPnLTracker ──────────────────────────────────────────────────────────
 
 

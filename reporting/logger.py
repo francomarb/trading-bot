@@ -28,7 +28,25 @@ import re
 import sqlite3
 from dataclasses import dataclass
 from datetime import datetime, timezone
-from typing import Any
+from typing import Any, Literal
+
+
+SlippageBenchmarkKind = Literal[
+    "arrival_midpoint",
+    "decision_price",
+    "fallback_latest_close",
+    "active_stop_price",
+    "combo_limit",
+    "limit_price",
+    "unavailable",
+]
+
+SlippageMeasurementQuality = Literal[
+    "primary",
+    "fallback",
+    "recovered",
+    "unavailable",
+]
 
 from loguru import logger
 
@@ -148,6 +166,13 @@ TRADE_COLUMNS = [
     "position_id",
     "position_type",
     "position_uid",
+    "slippage_benchmark_price",
+    "slippage_benchmark_kind",
+    "slippage_benchmark_timestamp",
+    "slippage_measurement_quality",
+    "slippage_signed_bps",
+    "slippage_adverse_bps",
+    "stop_trigger_price",
 ]
 
 # Keep the old name as an alias for backwards compatibility with tests
@@ -182,7 +207,14 @@ CREATE TABLE IF NOT EXISTS trades (
     exit_timestamp        TEXT,
     position_id           TEXT,
     position_type         TEXT,
-    position_uid          TEXT
+    position_uid          TEXT,
+    slippage_benchmark_price     REAL,
+    slippage_benchmark_kind      TEXT,
+    slippage_benchmark_timestamp TEXT,
+    slippage_measurement_quality TEXT,
+    slippage_signed_bps          REAL,
+    slippage_adverse_bps         REAL,
+    stop_trigger_price           REAL
 );
 """
 
@@ -205,6 +237,17 @@ _MIGRATION_COLUMNS = {
     # implementation plan — they will be added when their first
     # consumer ships.
     "position_uid": "TEXT",
+    # Slippage unification — see docs/slippage_unification_design.md and
+    # docs/slippage_unification_tracker.md. All nullable; pre-existing
+    # rows remain NULL. Writers populate these per the per-codepath
+    # contract over Phase 1; legacy columns continue to dual-write.
+    "slippage_benchmark_price": "REAL",
+    "slippage_benchmark_kind": "TEXT",
+    "slippage_benchmark_timestamp": "TEXT",
+    "slippage_measurement_quality": "TEXT",
+    "slippage_signed_bps": "REAL",
+    "slippage_adverse_bps": "REAL",
+    "stop_trigger_price": "REAL",
 }
 
 # Index on position_id for fast spread leg grouping. Idempotent.
@@ -274,6 +317,17 @@ class TradeRecord:
     # reference can still log; the broker entry path passes it through
     # from `engine.lifecycle.new_position_uid()`.
     position_uid: str | None = None
+    # Slippage unification — see docs/slippage_unification_design.md.
+    # Populated per-codepath by writers over Phase 1. Legacy columns
+    # (modeled_slippage_bps / realized_slippage_bps) continue to
+    # dual-write until consumers migrate in Phase 2.
+    slippage_benchmark_price: float | None = None
+    slippage_benchmark_kind: SlippageBenchmarkKind | None = None
+    slippage_benchmark_timestamp: str | None = None
+    slippage_measurement_quality: SlippageMeasurementQuality | None = None
+    slippage_signed_bps: float | None = None
+    slippage_adverse_bps: float | None = None
+    stop_trigger_price: float | None = None
 
     def as_dict(self) -> dict:
         """Column-ordered dict (same interface as before migration)."""
