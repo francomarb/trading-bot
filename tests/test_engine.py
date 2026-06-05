@@ -752,6 +752,48 @@ class TestRunOneCycle:
         broker.sync_with_broker.assert_called_once()
         broker.place_order.assert_not_called()
 
+    def test_market_closed_cycle_still_checks_protective_stop_durability(
+        self, engine_factory
+    ):
+        snap = _snapshot(
+            positions={"AAPL": Position("AAPL", 10, 100.0, 1010.0)}
+        )
+        engine, broker = engine_factory(
+            market_open=False,
+            snapshot=snap,
+            config_overrides={"market_hours_only": True},
+        )
+        engine._repair_missing_protective_stops = MagicMock()
+
+        engine._run_one_cycle()
+
+        engine._repair_missing_protective_stops.assert_called_once_with(
+            snap,
+            allow_residual_cleanup=False,
+        )
+        broker.place_order.assert_not_called()
+
+    def test_market_closed_stop_check_does_not_close_fractional_residual(
+        self, engine_factory
+    ):
+        snap = _snapshot(
+            positions={"AAPL": Position("AAPL", 0.5, 100.0, 50.0)}
+        )
+        engine, _broker = engine_factory(
+            market_open=False,
+            snapshot=snap,
+            config_overrides={"market_hours_only": True},
+        )
+        engine._register_single_leg(strategy_name="fake_strategy", symbol="AAPL")
+        engine.trade_logger.read_latest_open_stop_price = MagicMock(
+            return_value=95.0
+        )
+        engine._close_fractional_residual_position = MagicMock()
+
+        engine._run_one_cycle()
+
+        engine._close_fractional_residual_position.assert_not_called()
+
     def test_market_closed_cycle_refreshes_watchlist_statuses_from_snapshot(
         self, engine_factory
     ):
@@ -1873,6 +1915,60 @@ class TestWatchlistStatuses:
 
         broker.place_protective_stop.assert_called_once()
 
+    def test_reconciliation_promotes_existing_day_stop_to_gtc(
+        self, engine_factory
+    ):
+        day_stop = replace(
+            _open_stop_order("AAPL", 95.0),
+            order_id="day-stop",
+            qty=10,
+            time_in_force="day",
+        )
+        promoted = replace(
+            day_stop,
+            order_id="gtc-stop",
+            status="accepted",
+            time_in_force="gtc",
+        )
+        snapshot = _snapshot(
+            positions={"AAPL": Position("AAPL", 10, 100.0, 1010.0)},
+            open_orders=[day_stop],
+        )
+        engine, broker = engine_factory(snapshot=snapshot)
+        engine._register_single_leg(strategy_name="fake_strategy", symbol="AAPL")
+        broker.promote_equity_stop_to_gtc.return_value = promoted
+
+        engine._repair_missing_protective_stops(snapshot)
+
+        broker.promote_equity_stop_to_gtc.assert_called_once_with(
+            parent_order_id=None,
+            stop_order_id="day-stop",
+            qty=10,
+            stop_price=95.0,
+            client_order_id_prefix="fake_strategy-repair-stop-gtc",
+        )
+        assert snapshot.open_orders == [promoted]
+        broker.place_protective_stop.assert_not_called()
+
+    def test_reconciliation_leaves_gtc_stop_unchanged(self, engine_factory):
+        gtc_stop = replace(
+            _open_stop_order("AAPL", 95.0),
+            order_id="gtc-stop",
+            qty=10,
+            time_in_force="gtc",
+        )
+        snapshot = _snapshot(
+            positions={"AAPL": Position("AAPL", 10, 100.0, 1010.0)},
+            open_orders=[gtc_stop],
+        )
+        engine, broker = engine_factory(snapshot=snapshot)
+        engine._register_single_leg(strategy_name="fake_strategy", symbol="AAPL")
+
+        engine._repair_missing_protective_stops(snapshot)
+
+        broker.promote_equity_stop_to_gtc.assert_not_called()
+        broker.place_protective_stop.assert_not_called()
+
     def test_suspect_order_recovery_adopts_position_and_restores_stop(
         self, engine_factory
     ):
@@ -1924,6 +2020,53 @@ class TestWatchlistStatuses:
         engine._restore_entry_prices_from_db(cycle2)
 
         assert engine._entry_prices["AAPL"] == pytest.approx(100.5)
+
+    def test_suspect_recovery_promotes_existing_day_child_stop(
+        self, engine_factory
+    ):
+        day_stop = replace(
+            _open_stop_order("AAPL", 95.0),
+            order_id="day-stop",
+            qty=10,
+            time_in_force="day",
+        )
+        promoted = replace(
+            day_stop,
+            order_id="gtc-stop",
+            status="accepted",
+            time_in_force="gtc",
+        )
+        startup = _snapshot()
+        cycle1 = _snapshot()
+        cycle2 = _snapshot(
+            positions={"AAPL": Position("AAPL", 10, 100.0, 1010.0)},
+            open_orders=[day_stop],
+        )
+        engine, broker = engine_factory(
+            entries=[False] * 59 + [True],
+            snapshot=startup,
+            place_result=_unknown_result("AAPL", 10, order_id="ord-suspect"),
+        )
+        broker.sync_with_broker.side_effect = [startup, cycle1, cycle2]
+        broker.reconcile_submitted_order.return_value = _filled_result(
+            "AAPL",
+            10,
+            100.5,
+            submitted_at=T0,
+            filled_at=T0 + timedelta(minutes=2),
+        )
+        broker.promote_equity_stop_to_gtc.return_value = promoted
+
+        engine.start(max_cycles=2)
+
+        broker.promote_equity_stop_to_gtc.assert_called_once_with(
+            parent_order_id=None,
+            stop_order_id="day-stop",
+            qty=10,
+            stop_price=95.0,
+            client_order_id_prefix="fake_strategy-recover-stop-gtc",
+        )
+        broker.place_protective_stop.assert_not_called()
 
 
 # ── Scanner cadence ────────────────────────────────────────────────────────
