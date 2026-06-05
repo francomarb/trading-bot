@@ -3507,11 +3507,26 @@ class TradingEngine:
                 self._record_realized_pnl(symbol, owner, price, qty, multiplier=_pnl_mult)
             try:
                 if price is not None and qty > 0:
+                    # Slippage unification (Phase 1) — extract the broker
+                    # order's actual stop trigger price so log_stop_fill can
+                    # benchmark against the active stop that fired, not the
+                    # original initial_stop_loss. See codepath §4 in
+                    # docs/slippage_unification_design.md.
+                    raw_stop = getattr(update.order, "stop_price", None)
+                    broker_stop_price: float | None = None
+                    if raw_stop is not None:
+                        try:
+                            candidate = float(raw_stop)
+                        except (TypeError, ValueError):
+                            candidate = None
+                        if candidate is not None and candidate > 0:
+                            broker_stop_price = candidate
                     stop_log_kwargs = {
                         "symbol": raw_symbol,
                         "strategy": owner,
                         "qty": qty,
                         "avg_fill_price": price,
+                        "stop_price": broker_stop_price,
                         "order_id": order_id,
                     }
                     stop_timestamp = (

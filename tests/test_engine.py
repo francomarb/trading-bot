@@ -3179,6 +3179,7 @@ class TestOptionsEngineFixes:
             strategy="spy_options_reversion",
             qty=2,
             avg_fill_price=12.5,
+            stop_price=None,
             order_id="stop-ord-gap",
         )
         assert not engine._has_position("SPY")
@@ -3244,6 +3245,7 @@ class TestOptionsEngineFixes:
             strategy="fake_strategy",
             qty=7.0,
             avg_fill_price=378.85,
+            stop_price=None,
             order_id="goog-stop-1",
         )
         assert engine._has_position("GOOG")
@@ -3290,6 +3292,7 @@ class TestOptionsEngineFixes:
             strategy="donchian_breakout",
             qty=5.0,
             avg_fill_price=684.11,
+            stop_price=None,
             order_id="pwr-stop-1",
         )
         allocator.record_realized_pnl.assert_called_once_with(
@@ -3344,7 +3347,7 @@ class TestOptionsEngineFixes:
         engine._entry_prices["SPY"] = 10.0
 
         fill_update = SimpleNamespace(
-            order=SimpleNamespace(symbol=occ, id="stop-ord-1"),
+            order=SimpleNamespace(symbol=occ, id="stop-ord-1", stop_price="8.00"),
             price="7.50",
             qty="2",
         )
@@ -3362,9 +3365,42 @@ class TestOptionsEngineFixes:
             strategy="spy_options_reversion",
             qty=2,
             avg_fill_price=7.50,
+            stop_price=8.00,
             order_id="stop-ord-1",
         )
         engine.trade_logger.log_external_close.assert_not_called()
+
+    def test_stream_stop_fill_forwards_none_when_broker_stop_price_missing(self, tmp_path):
+        """
+        Slippage unification Phase 1 codepath §4 — when the broker order
+        carries no stop_price, the engine must forward stop_price=None
+        rather than synthesizing a fallback. log_stop_fill itself handles
+        the unavailable case by writing NULL slippage with kind/quality
+        of 'unavailable'.
+        """
+        from unittest.mock import MagicMock
+        from types import SimpleNamespace
+        from execution.stream import StreamManager
+
+        engine = self._engine(tmp_path)
+        engine._register_single_leg(strategy_name="sma_crossover", symbol="AAPL")
+        engine._entry_prices["AAPL"] = 100.0
+
+        fill_update = SimpleNamespace(
+            # Note: no stop_price attribute on the order.
+            order=SimpleNamespace(symbol="AAPL", id="stop-ord-no-stop"),
+            price="99.40",
+            qty="10",
+        )
+        stream = MagicMock(spec=StreamManager)
+        stream.drain_stop_fills.return_value = [fill_update]
+        engine._stream_manager = stream
+
+        engine.trade_logger.log_stop_fill = MagicMock()
+        engine._process_stream_stop_fills(_snapshot())
+
+        kwargs = engine.trade_logger.log_stop_fill.call_args.kwargs
+        assert kwargs["stop_price"] is None
 
     def test_stream_stop_fill_falls_back_to_external_close_when_price_missing(self, tmp_path):
         """When price is missing from the stream event, fall back to log_external_close."""

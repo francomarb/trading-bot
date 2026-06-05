@@ -29,7 +29,7 @@ Branch: `feature/slippage-unification-phase1`
 | 0 | Implementation tracker + PLAN.md pointer | ~50 | — | ✅ `c9d4cb3` |
 | 1 | Add slippage taxonomy columns to trades schema (idempotent ALTER TABLE) | ~70 | 4 | ✅ `be33be7` |
 | 2 | Add `stop_price` parameter to `log_stop_fill`; dual-write legacy | ~110 | 5 | 🔄 In progress |
-| 3 | Wire WebSocket stop fill to broker `stop_price` (codepath 4) | ~10 | 1 | ⬜ |
+| 3 | Wire WebSocket stop fill to broker `stop_price` (codepath 4) | ~30 | 1 + 3 existing assertion updates | 🔄 In progress |
 | 4 | Wire recovery stop fill to broker `stop_price` (codepaths 5, 6) | ~15 | 1 | ⬜ |
 | 5 | Tag single-leg entry/exit codepaths with benchmark kind (codepaths 1, 2, 3, 7, 9); add `benchmark_kind` + `benchmark_price` params to `build_close_record` | ~80 | 5 | ⬜ |
 | 6 | Tag option and spread codepaths (10, 11) | ~50 | 2 | ⬜ |
@@ -51,7 +51,7 @@ test.
 | 1 | Single-leg market entry | `engine/trader.py:1591` `_log_entry` | `arrival_midpoint` / `fallback_latest_close` | `primary` / `fallback` | ⬜ |
 | 2 | Single-leg limit entry | `reporting/logger.py:425` `build_record` | `limit_price` | `unavailable` | ⬜ |
 | 3 | Discretionary market exit | `reporting/logger.py:504` `build_close_record` | `arrival_midpoint` | `primary` | ⬜ |
-| 4 | WebSocket stop fill | `engine/trader.py:3530` | `active_stop_price` | `primary` | ⬜ |
+| 4 | WebSocket stop fill | `engine/trader.py:3530` | `active_stop_price` | `primary` | ✅ |
 | 5 | Broker-history recovered stop fill | `engine/trader.py:2974` | `active_stop_price` | `recovered` | ⬜ |
 | 6 | Standalone repair-stop fill | (falls through 4/5) | `active_stop_price` | `primary`/`recovered` | ⬜ |
 | 7 | Fractional residual cleanup exit | `engine/trader.py:2509` `_log_close` via `_close_fractional_residual_position` | `unavailable` | `unavailable` | ⬜ |
