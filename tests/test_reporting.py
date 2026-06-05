@@ -1284,6 +1284,46 @@ class TestSlippageUnificationSchema:
         for col in self._NEW_COLUMNS:
             assert col in columns
 
+    def test_bootstrap_failure_does_not_cache_poisoned_connection(self, tmp_path):
+        """Defect 3 fix — if any step of _ensure_db raises after the
+        connection is opened, the connection must NOT be cached.
+        The next call to _ensure_db should retry from scratch and
+        succeed (assuming the underlying issue is gone).
+
+        Simulates failure by patching a downstream DDL import to raise
+        once, then succeed on retry."""
+        from unittest.mock import patch
+
+        db_path = str(tmp_path / "boot_fail.db")
+        tl = TradeLogger(path=db_path)
+
+        # Inject failure at one of the deferred-import DDL constants.
+        # The real import path is exercised inside _ensure_db.
+        call_count = {"n": 0}
+        real_import = __import__
+
+        def flaky_import(name, *args, **kwargs):
+            if name == "engine.lifecycle" and call_count["n"] == 0:
+                call_count["n"] += 1
+                raise RuntimeError("simulated mid-bootstrap failure")
+            return real_import(name, *args, **kwargs)
+
+        with patch("builtins.__import__", side_effect=flaky_import):
+            with pytest.raises(RuntimeError, match="simulated"):
+                tl._ensure_db()
+
+        # Cached connection must NOT have been published after the failure.
+        assert tl._conn is None, "poisoned connection cached after bootstrap failure"
+
+        # Retry succeeds — proves the migration is idempotent across the
+        # post-failure recovery path.
+        conn = tl._ensure_db()
+        assert conn is not None
+        # All new columns are present after the successful retry.
+        existing = {r[1] for r in conn.execute("PRAGMA table_info(trades)").fetchall()}
+        for col in self._NEW_COLUMNS:
+            assert col in existing
+
     def test_trade_record_dataclass_defaults_remain_none(self):
         """Direct dataclass construction without writer logic leaves new
         fields None. This guards against any future caller that builds a

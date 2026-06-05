@@ -352,67 +352,90 @@ class TradeLogger:
         self._conn: sqlite3.Connection | None = None
 
     def _ensure_db(self) -> sqlite3.Connection:
-        """Create the database and table if they don't exist yet."""
+        """Create the database and table if they don't exist yet.
+
+        Defect 3 fix (slippage unification follow-up): the bootstrap
+        path runs many ALTER TABLE and CREATE TABLE statements. SQLite
+        auto-commits each one, so partial failure can leave the file
+        with some new columns / tables and not others. To avoid
+        publishing a half-migrated connection that the next caller
+        would then reuse without retry, we work on a *local* `conn`
+        and only assign `self._conn` once every bootstrap step has
+        succeeded. On any exception we close the local connection and
+        re-raise so the next call retries from scratch.
+        """
         if self._conn is not None:
             return self._conn
         os.makedirs(os.path.dirname(self._path) or ".", exist_ok=True)
-        self._conn = sqlite3.connect(self._path)
-        # Register OWNER_KEY() as a SQLite UDF so the backfill SQL can
-        # normalize OCC option symbols to their underlying. Keeps the
-        # stored position_id consistent with engine.positions.owner_key_for().
-        self._conn.create_function("OWNER_KEY", 1, owner_key_for, deterministic=True)
-        self._conn.execute(_CREATE_TABLE_SQL)
-        existing = {
-            row[1]
-            for row in self._conn.execute("PRAGMA table_info(trades)").fetchall()
-        }
-        for column, col_type in _MIGRATION_COLUMNS.items():
-            if column not in existing:
-                self._conn.execute(
-                    f"ALTER TABLE trades ADD COLUMN {column} {col_type}"
-                )
-        # 11.27: backfill position_id/position_type on pre-existing rows, then
-        # ensure the lookup index exists. Both statements are idempotent.
-        self._conn.execute(_BACKFILL_SQL)
-        self._conn.execute(_POSITION_ID_INDEX_SQL)
-        self._conn.execute(_POSITION_UID_INDEX_SQL)
-        # 11.10c: signal-lifecycle counter table for the Strategy Health
-        # Monitor. Local import avoids a circular dependency
-        # (strategies.health.* can import reporting.logger types).
-        from strategies.health.lifecycle import _CREATE_LIFECYCLE_TABLE_SQL
-        self._conn.execute(_CREATE_LIFECYCLE_TABLE_SQL)
-        # Operator Controls Phase A — position_lifecycle and
-        # position_lifecycle_legs. Created by the same migration path
-        # so all schema lives behind one connection bootstrap. Local
-        # import keeps `engine.lifecycle` standalone-importable; this
-        # is the only place that pulls the DDL constants.
-        from engine.lifecycle import (
-            _CREATE_POSITION_LIFECYCLE_SQL,
-            _CREATE_POSITION_LIFECYCLE_LEGS_SQL,
-            _CREATE_POSITION_LIFECYCLE_INDEXES_SQL,
-        )
-        self._conn.execute(_CREATE_POSITION_LIFECYCLE_SQL)
-        self._conn.execute(_CREATE_POSITION_LIFECYCLE_LEGS_SQL)
-        for index_sql in _CREATE_POSITION_LIFECYCLE_INDEXES_SQL:
-            self._conn.execute(index_sql)
-        from engine.option_trailing import (
-            _CREATE_OPTION_TRAILING_STOPS_SQL,
-            _OPTION_TRAILING_STOPS_INDEXES_SQL,
-        )
-        self._conn.execute(_CREATE_OPTION_TRAILING_STOPS_SQL)
-        for index_sql in _OPTION_TRAILING_STOPS_INDEXES_SQL:
-            self._conn.execute(index_sql)
-        # Operator Controls Phase A PR-2 — operator_commands queue.
-        # Same migration scaffolding; local import keeps
-        # engine.operator_queue independently importable.
-        from engine.operator_queue import (
-            _CREATE_OPERATOR_COMMANDS_SQL,
-            _CREATE_OPERATOR_COMMANDS_INDEXES_SQL,
-        )
-        self._conn.execute(_CREATE_OPERATOR_COMMANDS_SQL)
-        for index_sql in _CREATE_OPERATOR_COMMANDS_INDEXES_SQL:
-            self._conn.execute(index_sql)
-        self._conn.commit()
+        conn = sqlite3.connect(self._path)
+        try:
+            # Register OWNER_KEY() as a SQLite UDF so the backfill SQL can
+            # normalize OCC option symbols to their underlying. Keeps the
+            # stored position_id consistent with engine.positions.owner_key_for().
+            conn.create_function("OWNER_KEY", 1, owner_key_for, deterministic=True)
+            conn.execute(_CREATE_TABLE_SQL)
+            existing = {
+                row[1]
+                for row in conn.execute("PRAGMA table_info(trades)").fetchall()
+            }
+            for column, col_type in _MIGRATION_COLUMNS.items():
+                if column not in existing:
+                    conn.execute(
+                        f"ALTER TABLE trades ADD COLUMN {column} {col_type}"
+                    )
+            # 11.27: backfill position_id/position_type on pre-existing rows, then
+            # ensure the lookup index exists. Both statements are idempotent.
+            conn.execute(_BACKFILL_SQL)
+            conn.execute(_POSITION_ID_INDEX_SQL)
+            conn.execute(_POSITION_UID_INDEX_SQL)
+            # 11.10c: signal-lifecycle counter table for the Strategy Health
+            # Monitor. Local import avoids a circular dependency
+            # (strategies.health.* can import reporting.logger types).
+            from strategies.health.lifecycle import _CREATE_LIFECYCLE_TABLE_SQL
+            conn.execute(_CREATE_LIFECYCLE_TABLE_SQL)
+            # Operator Controls Phase A — position_lifecycle and
+            # position_lifecycle_legs. Created by the same migration path
+            # so all schema lives behind one connection bootstrap. Local
+            # import keeps `engine.lifecycle` standalone-importable; this
+            # is the only place that pulls the DDL constants.
+            from engine.lifecycle import (
+                _CREATE_POSITION_LIFECYCLE_SQL,
+                _CREATE_POSITION_LIFECYCLE_LEGS_SQL,
+                _CREATE_POSITION_LIFECYCLE_INDEXES_SQL,
+            )
+            conn.execute(_CREATE_POSITION_LIFECYCLE_SQL)
+            conn.execute(_CREATE_POSITION_LIFECYCLE_LEGS_SQL)
+            for index_sql in _CREATE_POSITION_LIFECYCLE_INDEXES_SQL:
+                conn.execute(index_sql)
+            from engine.option_trailing import (
+                _CREATE_OPTION_TRAILING_STOPS_SQL,
+                _OPTION_TRAILING_STOPS_INDEXES_SQL,
+            )
+            conn.execute(_CREATE_OPTION_TRAILING_STOPS_SQL)
+            for index_sql in _OPTION_TRAILING_STOPS_INDEXES_SQL:
+                conn.execute(index_sql)
+            # Operator Controls Phase A PR-2 — operator_commands queue.
+            # Same migration scaffolding; local import keeps
+            # engine.operator_queue independently importable.
+            from engine.operator_queue import (
+                _CREATE_OPERATOR_COMMANDS_SQL,
+                _CREATE_OPERATOR_COMMANDS_INDEXES_SQL,
+            )
+            conn.execute(_CREATE_OPERATOR_COMMANDS_SQL)
+            for index_sql in _CREATE_OPERATOR_COMMANDS_INDEXES_SQL:
+                conn.execute(index_sql)
+            conn.commit()
+        except Exception:
+            # Bootstrap failed — close the partially-prepared connection
+            # so the next _ensure_db() call retries cleanly rather than
+            # returning a poisoned cached handle that's missing columns
+            # or tables.
+            try:
+                conn.close()
+            except Exception:
+                pass
+            raise
+        self._conn = conn
         return self._conn
 
     def close(self) -> None:
