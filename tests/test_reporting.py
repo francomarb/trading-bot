@@ -1293,6 +1293,145 @@ class TestSlippageUnificationSchema:
             assert getattr(record, col) is None, f"{col} should default to None pre-writer"
 
 
+# ── TestLogStopFillSlippageContract ────────────────────────────────────────
+
+
+class TestLogStopFillSlippageContract:
+    """
+    Phase 1 commit 2 of slippage unification — see codepath §4 in
+    docs/slippage_unification_design.md. log_stop_fill now reads its
+    benchmark from the broker-provided stop_price (not initial_stop_loss),
+    populates the new taxonomy columns, and dual-writes the legacy
+    columns for Phase 1 compatibility.
+    """
+
+    def _read_one_stop_row(self, db_path: str) -> dict:
+        conn = sqlite3.connect(db_path)
+        conn.row_factory = sqlite3.Row
+        try:
+            row = conn.execute(
+                "SELECT * FROM trades WHERE reason = 'stop_triggered' ORDER BY id DESC LIMIT 1"
+            ).fetchone()
+        finally:
+            conn.close()
+        assert row is not None, "expected one stop row"
+        return dict(row)
+
+    def test_with_broker_stop_writes_active_stop_primary(self, tmp_csv):
+        tl = TradeLogger(path=tmp_csv)
+        tl.log_stop_fill(
+            symbol="AAPL",
+            strategy="sma_crossover",
+            qty=10.0,
+            avg_fill_price=144.50,
+            stop_price=145.00,
+            order_id="stop-broker-1",
+        )
+        row = self._read_one_stop_row(tmp_csv)
+        assert row["slippage_benchmark_kind"] == "active_stop_price"
+        assert row["slippage_measurement_quality"] == "primary"
+        assert row["slippage_benchmark_price"] == pytest.approx(145.00)
+        assert row["stop_trigger_price"] == pytest.approx(145.00)
+        assert row["slippage_benchmark_timestamp"] is not None
+        # Sell @ 144.50 vs reference 145.00 → adverse by 50/145 ≈ 34.48 bps
+        assert row["slippage_signed_bps"] == pytest.approx(34.48, abs=0.05)
+        assert row["slippage_adverse_bps"] == pytest.approx(34.48, abs=0.05)
+
+    def test_without_broker_stop_writes_unavailable(self, tmp_csv):
+        tl = TradeLogger(path=tmp_csv)
+        tl.log_stop_fill(
+            symbol="AAPL",
+            strategy="sma_crossover",
+            qty=10.0,
+            avg_fill_price=144.50,
+            stop_price=None,
+            order_id="stop-no-broker",
+        )
+        row = self._read_one_stop_row(tmp_csv)
+        assert row["slippage_benchmark_kind"] == "unavailable"
+        assert row["slippage_measurement_quality"] == "unavailable"
+        assert row["slippage_benchmark_price"] is None
+        assert row["slippage_signed_bps"] is None
+        assert row["slippage_adverse_bps"] is None
+        assert row["stop_trigger_price"] is None
+
+    def test_recovery_path_can_set_quality_recovered(self, tmp_csv):
+        tl = TradeLogger(path=tmp_csv)
+        tl.log_stop_fill(
+            symbol="AAPL",
+            strategy="sma_crossover",
+            qty=10.0,
+            avg_fill_price=144.50,
+            stop_price=145.00,
+            measurement_quality="recovered",
+            order_id="stop-recovered-1",
+        )
+        row = self._read_one_stop_row(tmp_csv)
+        assert row["slippage_benchmark_kind"] == "active_stop_price"
+        assert row["slippage_measurement_quality"] == "recovered"
+
+    def test_dual_writes_legacy_columns_to_match_signed_when_broker_provides(self, tmp_csv):
+        tl = TradeLogger(path=tmp_csv)
+        tl.log_stop_fill(
+            symbol="AAPL",
+            strategy="sma_crossover",
+            qty=10.0,
+            avg_fill_price=144.50,
+            stop_price=145.00,
+            order_id="stop-parity-1",
+        )
+        row = self._read_one_stop_row(tmp_csv)
+        # Legacy column must mirror the new signed bps when the broker
+        # stop is available — both benchmark against the same value.
+        assert row["realized_slippage_bps"] == pytest.approx(row["slippage_signed_bps"])
+        assert row["modeled_slippage_bps"] > 0  # SLIPPAGE_MODEL_MARKET_BPS
+
+    def test_legacy_columns_keep_initial_stop_loss_fallback_when_broker_missing(self, tmp_csv):
+        """
+        Phase 1 compat: when broker stop is None, new cols go `unavailable`
+        but the legacy columns still fall back to initial_stop_loss so
+        unmigrated consumers see the same numbers they always did.
+        """
+        tl = TradeLogger(path=tmp_csv)
+        # Seed an open entry context so initial_stop_loss is populated.
+        # Build a minimal opening row using build_record's machinery.
+        conn = tl._ensure_db()
+        conn.execute(
+            """
+            INSERT INTO trades (
+                timestamp, symbol, side, qty, avg_fill_price, strategy,
+                reason, status, requested_qty, filled_qty,
+                initial_stop_loss, initial_risk_per_share, entry_reference_price,
+                entry_timestamp, position_id, position_type
+            ) VALUES (?, ?, 'buy', 10, 150.0, 'sma_crossover', 'entry', 'filled',
+                      10, 10, 145.0, 5.0, 150.0, ?, ?, 'single_leg')
+            """,
+            (
+                datetime.now(timezone.utc).isoformat(),
+                "AAPL",
+                datetime.now(timezone.utc).isoformat(),
+                "AAPL",
+            ),
+        )
+        conn.commit()
+
+        tl.log_stop_fill(
+            symbol="AAPL",
+            strategy="sma_crossover",
+            qty=10.0,
+            avg_fill_price=144.50,
+            stop_price=None,
+            order_id="stop-legacy-fallback",
+        )
+        row = self._read_one_stop_row(tmp_csv)
+        # New cols: unavailable
+        assert row["slippage_benchmark_kind"] == "unavailable"
+        assert row["slippage_signed_bps"] is None
+        # Legacy: still benchmarked against the open context's
+        # initial_stop_loss of 145.0 → 34.48 bps adverse for a sell @ 144.50.
+        assert row["realized_slippage_bps"] == pytest.approx(34.48, abs=0.05)
+
+
 # ── TestPnLTracker ──────────────────────────────────────────────────────────
 
 

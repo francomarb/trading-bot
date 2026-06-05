@@ -924,6 +924,8 @@ class TradeLogger:
         strategy: str,
         qty: float,
         avg_fill_price: float,
+        stop_price: float | None = None,
+        measurement_quality: SlippageMeasurementQuality = "primary",
         order_id: str | None = None,
         timestamp_override: datetime | None = None,
     ) -> None:
@@ -933,6 +935,21 @@ class TradeLogger:
 
         Distinct from log_external_close, which is the fallback for positions
         that disappear without a confirmed fill event.
+
+        `stop_price` is the broker order's actual stop trigger at fill time
+        (from ``update.order.stop_price`` on the WebSocket path, or
+        ``ClosedOrderInfo.stop_price`` on the recovery path). It is the
+        authoritative slippage benchmark for stop fills — see
+        docs/slippage_unification_design.md §Stop Lifecycle. When None or
+        non-positive, the new slippage columns are written as
+        ``unavailable`` and signed/adverse values stay NULL; legacy
+        ``realized_slippage_bps`` / ``modeled_slippage_bps`` retain their
+        old behavior (fall back to ``initial_stop_loss``) for Phase 1
+        consumer compatibility.
+
+        `measurement_quality` lets the recovery path tag rows as
+        ``recovered`` rather than ``primary``. Forced to ``unavailable``
+        when no broker stop_price is provided.
 
         `timestamp_override` is used by recovery/reconciliation paths that
         discover a missed stop fill later from broker history. When broker
@@ -964,14 +981,51 @@ class TradeLogger:
                 realized_pnl = (avg_fill_price - entry_reference_price) * qty * multiplier
                 if initial_risk_dollars and initial_risk_dollars > 0:
                     r_multiple = realized_pnl / initial_risk_dollars
+
+        # ── Slippage unification (Phase 1) ──
+        # Broker stop_price is the authoritative benchmark. When absent,
+        # the new columns honestly report `unavailable`; legacy columns
+        # retain their pre-unification fallback for Phase 1 compat.
+        broker_stop_available = stop_price is not None and float(stop_price) > 0
+        new_slippage_benchmark_price: float | None = None
+        new_slippage_benchmark_kind: SlippageBenchmarkKind = "unavailable"
+        new_slippage_benchmark_timestamp: str | None = None
+        new_slippage_quality: SlippageMeasurementQuality = "unavailable"
+        new_slippage_signed_bps: float | None = None
+        new_slippage_adverse_bps: float | None = None
+        new_stop_trigger_price: float | None = None
+
+        if broker_stop_available:
+            benchmark = float(stop_price)
+            signed = single_leg_realized_slippage_bps(
+                side="sell",
+                reference_price=benchmark,
+                actual_fill_price=avg_fill_price,
+            )
+            new_slippage_benchmark_price = benchmark
+            new_slippage_benchmark_kind = "active_stop_price"
+            new_slippage_benchmark_timestamp = now_iso
+            new_slippage_quality = measurement_quality
+            new_slippage_signed_bps = signed
+            new_slippage_adverse_bps = max(0.0, signed)
+            new_stop_trigger_price = benchmark
+
+        # ── Legacy dual-write (Phase 1 compat) ──
+        # Prefer broker stop_price when available so legacy consumers
+        # immediately benefit from the more accurate benchmark; otherwise
+        # fall back to initial_stop_loss exactly as before this change.
+        legacy_reference = (
+            float(stop_price)
+            if broker_stop_available
+            else float(initial_stop_loss or 0.0)
+        )
         realized_slippage_bps = 0.0
-        stop_reference_price = float(initial_stop_loss or 0.0)
         modeled_slippage_bps = 0.0
-        if stop_reference_price > 0:
+        if legacy_reference > 0:
             modeled_slippage_bps = settings.SLIPPAGE_MODEL_MARKET_BPS
             realized_slippage_bps = single_leg_realized_slippage_bps(
                 side="sell",
-                reference_price=stop_reference_price,
+                reference_price=legacy_reference,
                 actual_fill_price=avg_fill_price,
             )
 
@@ -1001,6 +1055,21 @@ class TradeLogger:
             exit_timestamp=now_iso,
             position_id=owner_key_for(symbol),
             position_type="single_leg",
+            slippage_benchmark_price=new_slippage_benchmark_price,
+            slippage_benchmark_kind=new_slippage_benchmark_kind,
+            slippage_benchmark_timestamp=new_slippage_benchmark_timestamp,
+            slippage_measurement_quality=new_slippage_quality,
+            slippage_signed_bps=(
+                round(new_slippage_signed_bps, 2)
+                if new_slippage_signed_bps is not None
+                else None
+            ),
+            slippage_adverse_bps=(
+                round(new_slippage_adverse_bps, 2)
+                if new_slippage_adverse_bps is not None
+                else None
+            ),
+            stop_trigger_price=new_stop_trigger_price,
         )
         self.log(record)
 
