@@ -292,6 +292,10 @@ class TradingEngine:
 
         self.risk = risk
         self.broker = broker
+        # Every engine-owned AlpacaBroker gets the same last-mile entry guard.
+        # bind_entry_guard preserves any stricter callback supplied by the
+        # caller, while making the safety net independent of entrypoint wiring.
+        self.broker.bind_entry_guard(lambda: not self.risk.is_halted())
         self.trade_logger = trade_logger or TradeLogger()
         # Operator Controls Phase A — wire the lifecycle store to the
         # broker so equity entry paths persist `position_uid` pending →

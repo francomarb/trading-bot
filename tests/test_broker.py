@@ -178,7 +178,20 @@ class TestPlaceOrderContract:
         assert result.status is OrderStatus.REJECTED
         assert result.raw_status == "risk_halted"
         api.submit_order.assert_not_called()
-        api.submit_order.assert_not_called()
+
+    def test_bind_entry_guard_preserves_explicit_policy(self):
+        def explicit_guard() -> bool:
+            return False
+
+        broker = AlpacaBroker(
+            client=MagicMock(),
+            entry_allowed=explicit_guard,
+        )
+
+        installed = broker.bind_entry_guard(lambda: True)
+
+        assert installed is False
+        assert broker._entry_allowed is explicit_guard
 
     def test_rejects_none(self):
         api = MagicMock()

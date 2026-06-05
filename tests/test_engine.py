@@ -39,6 +39,7 @@ import pytest
 
 from engine.trader import EngineConfig, TradingEngine, _lookback_days
 from execution.broker import (
+    AlpacaBroker,
     BrokerSnapshot,
     ClosedOrderInfo,
     OpenOrder,
@@ -348,6 +349,33 @@ class TestStreamHealthObservability:
 
 
 class TestEngineConfig:
+    def test_engine_binds_broker_entry_guard(self, tmp_path):
+        api = MagicMock()
+        broker = AlpacaBroker(client=api)
+        risk = RiskManager(
+            max_position_pct=0.02,
+            max_open_positions=5,
+            max_gross_exposure_pct=0.50,
+            atr_stop_multiplier=2.0,
+            max_daily_loss_pct=0.05,
+            hard_dollar_loss_cap=1_000_000.0,
+            loss_streak_threshold=10,
+            broker_error_threshold=1,
+        )
+
+        TradingEngine(
+            strategy=FakeStrategy(entries=[False], exits=[False]),
+            symbols=["AAPL"],
+            risk=risk,
+            broker=broker,
+            trade_logger=TradeLogger(path=str(tmp_path / "trades.db")),
+        )
+        assert broker._entries_allowed()
+
+        risk.record_broker_error()
+
+        assert not broker._entries_allowed()
+
     def test_negative_cycle_interval_rejected(self):
         with pytest.raises(ValueError):
             EngineConfig(cycle_interval_seconds=0)

@@ -280,6 +280,18 @@ class AlpacaBroker:
         callback = getattr(self, "_entry_allowed", None)
         return callback is None or callback()
 
+    def bind_entry_guard(self, callback: Callable[[], bool]) -> bool:
+        """
+        Install an entry-submit guard when none was supplied at construction.
+
+        Returns True when the callback was installed. An explicitly configured
+        guard is preserved so an engine cannot weaken a stricter caller policy.
+        """
+        if getattr(self, "_entry_allowed", None) is not None:
+            return False
+        self._entry_allowed = callback
+        return True
+
     @staticmethod
     def _entry_halt_result(symbol: str, requested_qty: float) -> OrderResult:
         return OrderResult(
