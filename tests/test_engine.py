@@ -4121,3 +4121,132 @@ class TestExitPathBenchmarkKind:
         # never the fill price masquerading as 'arrival_midpoint'.
         assert kwargs["benchmark_kind"] == "unavailable"
         assert kwargs["measurement_quality"] == "unavailable"
+
+
+# ── Slippage unification Defect 2 fix ──────────────────────────────────────
+
+
+class TestSuspectOrderBenchmarkProvenance:
+    """
+    Defect 2 (Medium): SuspectOrder previously stored only the resolved
+    modeled_price, not whether the submission used an arrival_midpoint
+    or a latest_close fallback. Recovery hardcoded
+    benchmark_kind='arrival_midpoint', so a row that originally fell
+    into the fallback branch would be mislabeled on recovery.
+
+    Fix preserves modeled_price_kind on SuspectOrder and threads it
+    back through _log_entry at recovery time.
+    """
+
+    def test_recovery_preserves_fallback_kind(self, tmp_path):
+        from execution.broker import BrokerSnapshot, OrderStatus
+        from engine.trader import SuspectOrder
+        from risk.manager import RiskDecision
+
+        # Build a minimal engine via the same fixture as TestExitPathBenchmarkKind.
+        helper = TestExitPathBenchmarkKind()
+        engine, broker = helper._engine_with_real_logger(tmp_path)
+
+        decision = RiskDecision(
+            symbol="AAPL",
+            side=Side.BUY,
+            qty=10,
+            stop_price=145.0,
+            entry_reference_price=150.0,
+            strategy_name="sma_crossover",
+            reason="entry signal",
+            order_type=OrderType.MARKET,
+        )
+        # Simulate a suspect-order originally captured under the
+        # fallback_latest_close branch (no arrival quote available).
+        engine._suspect_orders["AAPL"] = SuspectOrder(
+            decision=decision,
+            order_id="ord-suspect-1",
+            modeled_price=150.0,
+            modeled_price_kind="fallback_latest_close",
+        )
+
+        broker.reconcile_submitted_order.return_value = _filled_result(
+            "AAPL",
+            10,
+            150.05,
+            submitted_at=T0,
+            filled_at=T0 + timedelta(minutes=1),
+        )
+
+        snap = BrokerSnapshot(
+            account=SimpleNamespace(
+                equity=100_000.0,
+                cash=50_000.0,
+                buying_power=50_000.0,
+                open_positions={"AAPL": SimpleNamespace(
+                    qty=10, symbol="AAPL", avg_entry_price=150.05,
+                    market_value=1500.5, unrealized_pl=0.0,
+                    current_price=150.05, cost_basis=1500.5,
+                    asset_id="x", side="long",
+                )},
+            ),
+            open_orders=[],
+        )
+        engine._log_entry = MagicMock()
+        engine._ensure_recovered_protective_stop = MagicMock()
+        engine._recover_suspect_orders(snap)
+
+        kwargs = engine._log_entry.call_args.kwargs
+        assert kwargs["benchmark_kind"] == "fallback_latest_close"
+        assert kwargs["measurement_quality"] == "recovered"
+
+    def test_recovery_preserves_arrival_kind(self, tmp_path):
+        from execution.broker import BrokerSnapshot, OrderStatus
+        from engine.trader import SuspectOrder
+        from risk.manager import RiskDecision
+
+        helper = TestExitPathBenchmarkKind()
+        engine, broker = helper._engine_with_real_logger(tmp_path)
+
+        decision = RiskDecision(
+            symbol="AAPL",
+            side=Side.BUY,
+            qty=10,
+            stop_price=145.0,
+            entry_reference_price=150.0,
+            strategy_name="sma_crossover",
+            reason="entry signal",
+            order_type=OrderType.MARKET,
+        )
+        engine._suspect_orders["AAPL"] = SuspectOrder(
+            decision=decision,
+            order_id="ord-suspect-2",
+            modeled_price=150.0,
+            modeled_price_kind="arrival_midpoint",
+        )
+
+        broker.reconcile_submitted_order.return_value = _filled_result(
+            "AAPL",
+            10,
+            150.05,
+            submitted_at=T0,
+            filled_at=T0 + timedelta(minutes=1),
+        )
+
+        snap = BrokerSnapshot(
+            account=SimpleNamespace(
+                equity=100_000.0,
+                cash=50_000.0,
+                buying_power=50_000.0,
+                open_positions={"AAPL": SimpleNamespace(
+                    qty=10, symbol="AAPL", avg_entry_price=150.05,
+                    market_value=1500.5, unrealized_pl=0.0,
+                    current_price=150.05, cost_basis=1500.5,
+                    asset_id="x", side="long",
+                )},
+            ),
+            open_orders=[],
+        )
+        engine._log_entry = MagicMock()
+        engine._ensure_recovered_protective_stop = MagicMock()
+        engine._recover_suspect_orders(snap)
+
+        kwargs = engine._log_entry.call_args.kwargs
+        assert kwargs["benchmark_kind"] == "arrival_midpoint"
+        assert kwargs["measurement_quality"] == "recovered"

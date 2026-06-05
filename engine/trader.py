@@ -218,11 +218,19 @@ class EngineConfig:
 
 @dataclass(frozen=True)
 class SuspectOrder:
-    """Bot-submitted order accepted by Alpaca but not yet locally confirmed."""
+    """Bot-submitted order accepted by Alpaca but not yet locally confirmed.
+
+    ``modeled_price_kind`` preserves the slippage benchmark provenance
+    captured at submission so the recovery row gets the same tagging
+    the live row would have written. Defaults to 'unavailable' so
+    legacy SuspectOrder constructions remain safe — recovery then
+    writes NULL slippage rather than fabricating a kind.
+    """
 
     decision: RiskDecision
     order_id: str
     modeled_price: float
+    modeled_price_kind: str = "unavailable"
 
 
 # ── Engine ───────────────────────────────────────────────────────────────────
@@ -1559,8 +1567,14 @@ class TradingEngine:
             if _lc is not None:
                 _lc.submitted += 1
             if result.status is OrderStatus.UNKNOWN:
+                # Preserve the benchmark provenance so the recovery row
+                # (codepath §9) tags the right kind/quality if this
+                # submission later resolves filled. Defect 2 fix.
                 self._remember_suspect_order(
-                    decision, result, modeled_price=slippage_ref
+                    decision,
+                    result,
+                    modeled_price=slippage_ref,
+                    modeled_price_kind=slippage_kind or "unavailable",
                 )
                 if strategy_statuses is not None:
                     strategy_statuses[symbol] = "Pending Entry"
@@ -1728,10 +1742,17 @@ class TradingEngine:
         result: OrderResult,
         *,
         modeled_price: float,
+        modeled_price_kind: str = "unavailable",
     ) -> None:
         """
         Persist a narrow recovery handle for submit-succeeded/confirm-failed
         entries. Recovery is tied to the exact order_id returned by Alpaca.
+
+        ``modeled_price_kind`` preserves the slippage-benchmark provenance
+        captured at submission ('arrival_midpoint' or
+        'fallback_latest_close') so the recovered row gets the same
+        kind/quality tagging the live row would have written. Defect 2
+        of the first-pass review fix.
         """
         if result.order_id is None:
             msg = (
@@ -1747,6 +1768,7 @@ class TradingEngine:
             decision=decision,
             order_id=result.order_id,
             modeled_price=modeled_price,
+            modeled_price_kind=modeled_price_kind,
         )
         logger.warning(
             f"{decision.symbol}: staged suspect order recovery for "
@@ -1795,16 +1817,18 @@ class TradingEngine:
                     side=suspect.decision.side.value,
                 )
                 # Slippage unification (Phase 1) codepath §9 — the
-                # suspect-order recovery state preserved the original
-                # arrival benchmark, so the row gets the same kind as a
-                # live market entry but tagged quality='recovered' so
-                # downstream consumers can isolate reconstructed rows.
+                # suspect-order recovery state preserves the original
+                # benchmark kind (arrival_midpoint vs fallback_latest_close
+                # vs unavailable) so the recovered row tags the same kind
+                # the live row would have written. Quality is forced to
+                # 'recovered' so downstream consumers can isolate
+                # reconstructed rows. Defect 2 fix.
                 self._log_entry(
                     suspect.decision,
                     result,
                     suspect.modeled_price,
                     timestamp_override=result.filled_at or result.submitted_at,
-                    benchmark_kind="arrival_midpoint",
+                    benchmark_kind=suspect.modeled_price_kind,
                     measurement_quality="recovered",
                 )
                 self._register_single_leg(
