@@ -645,14 +645,32 @@ class TradeLogger:
         (e.g. the fill price itself, position.current_price). See codepath
         §7 in docs/slippage_unification_design.md.
         """
-        realized_bps = 0.0
-        modeled_bps = settings.SLIPPAGE_MODEL_MARKET_BPS if modeled_price > 0 else 0.0
+        # Defect 5 fix — when the caller explicitly declares
+        # benchmark_kind='unavailable', the legacy columns should not
+        # compute a slippage value either. Without this, codepath §7
+        # (fractional residual cleanup) would write a structural ~0
+        # legacy slippage value (fill vs fill) while the new columns
+        # honestly say 'unavailable'. Align legacy with new for the
+        # explicit-unavailable case so consumers see consistent
+        # 'no measurement' across both column families.
+        legacy_metric_suppressed = benchmark_kind == "unavailable"
+        realized_bps: float | None = 0.0
+        modeled_bps: float | None = (
+            settings.SLIPPAGE_MODEL_MARKET_BPS if modeled_price > 0 else 0.0
+        )
+        if legacy_metric_suppressed:
+            realized_bps = None
+            modeled_bps = None
         context = self._read_latest_open_entry_context(
             symbol=result.symbol,
             strategy=strategy_name,
         )
         now_iso = datetime.now(timezone.utc).isoformat()
-        if result.avg_fill_price is not None and modeled_price > 0:
+        if (
+            not legacy_metric_suppressed
+            and result.avg_fill_price is not None
+            and modeled_price > 0
+        ):
             realized_bps = single_leg_realized_slippage_bps(
                 side="sell",
                 reference_price=modeled_price,
@@ -734,7 +752,9 @@ class TradeLogger:
             stop_price=0.0,
             entry_reference_price=modeled_price,
             modeled_slippage_bps=modeled_bps,
-            realized_slippage_bps=round(realized_bps, 2),
+            realized_slippage_bps=(
+                round(realized_bps, 2) if realized_bps is not None else None
+            ),
             order_type="market",
             status=result.status.value,
             requested_qty=result.requested_qty,

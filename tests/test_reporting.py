@@ -1405,6 +1405,32 @@ class TestBuildRecordSlippageContract:
         assert record.slippage_signed_bps is None
         assert record.slippage_adverse_bps is None
 
+    def test_market_entry_without_benchmark_legacy_still_uses_decision_price(
+        self, sample_decision, sample_result
+    ):
+        """Defect 5 — documented Phase 1 divergence. When modeled_price
+        is None on a market entry, the legacy realized_slippage_bps
+        column falls back to ``decision.entry_reference_price`` as the
+        benchmark, while the new column honestly says 'unavailable'.
+        Aligning legacy with new here would change consumer-visible
+        numbers for live SMA / Donchian / Bollinger fills today and
+        therefore belongs in Phase 2 consumer migration. This test
+        pins the current intentional divergence so any future change
+        is deliberate."""
+        tl = TradeLogger(path="/dev/null")
+        record = tl.build_record(
+            sample_decision,
+            sample_result,
+            modeled_price=None,
+        )
+        # New cols: honestly unavailable.
+        assert record.slippage_signed_bps is None
+        # Legacy cols: still populated against decision price (the
+        # pre-unification fallback). Divergence is documented and
+        # deliberate for Phase 1; Phase 2 may reconcile.
+        assert record.realized_slippage_bps is not None
+        assert record.modeled_slippage_bps is not None
+
     def test_limit_entry_writes_limit_price_unavailable(self, sample_result):
         from risk.manager import RiskDecision
         decision = RiskDecision(
@@ -1564,6 +1590,28 @@ class TestBuildCloseRecordSlippageContract:
         assert record.slippage_benchmark_kind == "unavailable"
         assert record.slippage_measurement_quality == "unavailable"
         assert record.slippage_signed_bps is None
+
+    def test_explicit_unavailable_also_nulls_legacy_columns(self):
+        """Defect 5 fix — when caller declares benchmark_kind='unavailable'
+        (codepath §7 fractional residual cleanup), legacy columns must
+        also be NULL. Without this, legacy realized_slippage_bps would
+        carry a structural ~0 value computed against the fill price
+        itself, while the new columns honestly say 'unavailable' —
+        legacy and new would silently divergence on a 'no measurement'
+        case."""
+        tl = TradeLogger(path="/dev/null")
+        record = tl.build_close_record(
+            self._make_close_result(),
+            strategy_name="sma_crossover",
+            modeled_price=152.0,  # fill price; no honest benchmark
+            benchmark_kind="unavailable",
+            measurement_quality="unavailable",
+        )
+        assert record.slippage_benchmark_kind == "unavailable"
+        assert record.slippage_signed_bps is None
+        # Legacy columns also NULL — no fabricated value.
+        assert record.realized_slippage_bps is None
+        assert record.modeled_slippage_bps is None
 
 
 # ── TestSlippageDualWriteParity ────────────────────────────────────────────

@@ -9,9 +9,29 @@ Status legend: ✅ done · 🔄 in progress · ⬜ not started · ⏸ blocked
 
 ## Phase 1 — As-built summary
 
-Phase 1 is complete on `feature/slippage-unification-phase1` (9 commits,
-~1450 LOC including tests, 2083/2083 tests passing). The PR is open for
-review by ChatGPT + Gemini.
+Phase 1 is complete on `feature/slippage-unification-phase1` with five
+review-response commits added after the first ChatGPT/Gemini pass. Total
+~1700 LOC including tests, 2093/2093 tests passing.
+
+Review-response commits (review-1):
+
+| Defect | Severity | Fix commit |
+|---|---|---|
+| 1. Exit path mis-tagged as arrival_midpoint | High | `5b4e3ff` |
+| 2. SuspectOrder loses fallback provenance | Medium | `4c727ae` |
+| 3. Migration failure poisoned cached connection | Medium | `a059406` |
+| 4. Non-finite stop_price accepted | Medium | `78d4567` |
+| 5. Undocumented parity exceptions | Low | (this commit) |
+
+Documented Phase 1 divergence (intentional, deferred to Phase 2 consumer
+migration):
+
+- **Market entry without `modeled_price`** — legacy
+  `realized_slippage_bps` still falls back to
+  `decision.entry_reference_price`; new `slippage_signed_bps` is NULL.
+  Aligning would change consumer-visible numbers today; defer to
+  Phase 2. Pinned by
+  `test_market_entry_without_benchmark_legacy_still_uses_decision_price`.
 
 What landed:
 
@@ -152,6 +172,7 @@ Branch: `feature/slippage-unification-phase2`
 - [ ] `dashboard.py:710` denominator dilution fix — `IS NOT NULL` mask on slippage_denom
 - [ ] Stop dual-writing `realized_slippage_bps` / `modeled_slippage_bps` on new rows (Phase 4 fold-in)
 - [ ] Update tests that read legacy columns
+- [ ] **Reconcile Phase 1 divergence**: market-entry path without `modeled_price` — align legacy `realized_slippage_bps` with new (NULL instead of decision-price fallback). See `test_market_entry_without_benchmark_legacy_still_uses_decision_price` for the pinned current behavior.
 
 ---
 
