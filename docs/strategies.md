@@ -285,7 +285,7 @@ Entry targets slightly in-the-money SPY calls: `find_best_call` selects the cont
 |---|---|---|
 | `rsi_length` | 14 | RSI lookback period (bars) |
 | `rsi_threshold` | 30 | Oversold recovery threshold |
-| `trail_activation_pct` | 10% | Trailing stop activates when B-S value rises ≥ 10% above entry value |
+| `trail_activation_pct` | 10% | Trailing stop activates when broker-observed premium rises ≥ 10% above entry premium |
 | `trail_pct` | 15% | Trail distance below the high-water-mark once activated |
 
 **Bracket order parameters:**
@@ -303,9 +303,9 @@ Entry targets slightly in-the-money SPY calls: `find_best_call` selects the cont
 |---|---|---|
 | **1 — Time stop** | Wednesday of expiry week at or after 3:30 PM ET | Avoids the theta cliff in the final two trading days |
 | **2 — Delta floor** | Black-Scholes Δ < 0.30 | Option has moved too far OTM to recover; exit rather than ride to zero |
-| **3 — Trailing stop** | B-S value drops ≥ `trail_pct` below the HWM, after HWM has risen ≥ `trail_activation_pct` above entry value | Locks in profits on big winners; does nothing until the activation threshold is crossed |
+| **3 — Trailing stop** | Broker-observed premium drops ≥ `trail_pct` below the durable HWM, after HWM has risen ≥ `trail_activation_pct` above entry premium | Locks in profits on big winners; does nothing until the activation threshold is crossed |
 
-Guards run in order: if Guard 1 fires, Guards 2 and 3 are skipped. VIX is fetched via `yfinance` once per calendar day for the Black-Scholes sigma input; fallback is σ=0.15 if the fetch fails.
+Guards run in order: if Guard 1 fires, Guards 2 and 3 are skipped. VIX is fetched via `yfinance` once per calendar day for the Black-Scholes Delta input; fallback is σ=0.15 if the fetch fails. Black-Scholes remains advisory for the Delta floor, while trailing protection uses Alpaca's position premium and the engine's SQLite-backed HWM. The engine maintains a GTC single-leg option stop and ratchets it with Alpaca's replace-order endpoint so a rejected update leaves the prior stop live.
 
 **Edge filter (`strategies/filters/spy_options_reversion.py` — `SPYOptionsEdgeFilter`):**
 

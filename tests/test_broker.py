@@ -105,6 +105,7 @@ def _alpaca_order(
     type: str = "market",
     limit_price: str | None = None,
     stop_price: str | None = None,
+    time_in_force: str | None = None,
     submitted_at: str = "2026-04-15T14:30:00Z",
 ) -> SimpleNamespace:
     return SimpleNamespace(
@@ -118,6 +119,7 @@ def _alpaca_order(
         type=type,
         limit_price=limit_price,
         stop_price=stop_price,
+        time_in_force=time_in_force,
         submitted_at=submitted_at,
     )
 
@@ -1386,8 +1388,8 @@ class TestOptionsDryRun:
         api.submit_order.assert_not_called()  # worker handles submission, not broker directly
 
 
-class TestOptionDayStops:
-    def test_submit_option_day_stop_uses_day_sell_stop(self):
+class TestOptionGtcStops:
+    def test_submit_option_gtc_stop_uses_gtc_sell_stop(self):
         api = MagicMock()
         api.submit_order.return_value = _alpaca_order(
             id="stop-1",
@@ -1401,7 +1403,7 @@ class TestOptionDayStops:
 
         result = AlpacaBroker(
             client=api, max_attempts=1, base_delay=0.0
-        ).submit_option_day_stop(
+        ).submit_option_gtc_stop(
             symbol="SPY260618C00746000",
             qty=3,
             stop_price=17.13,
@@ -1411,10 +1413,37 @@ class TestOptionDayStops:
         assert req.symbol == "SPY260618C00746000"
         assert req.qty == 3
         assert req.side.value == "sell"
-        assert req.time_in_force.value == "day"
+        assert req.time_in_force.value == "gtc"
         assert req.stop_price == 17.13
         assert result.order_id == "stop-1"
         assert result.stop_price == pytest.approx(17.13)
+
+    def test_replace_option_stop_ratchets_atomically_and_enforces_gtc(self):
+        api = MagicMock()
+        api.replace_order_by_id.return_value = _alpaca_order(
+            id="stop-2",
+            status="accepted",
+            symbol="SPY260618C00746000",
+            side="sell",
+            qty=3,
+            type="stop",
+            stop_price="18.70",
+            time_in_force="gtc",
+        )
+
+        result = AlpacaBroker(
+            client=api, max_attempts=1, base_delay=0.0
+        ).replace_option_stop(
+            order_id="stop-1",
+            stop_price=18.70,
+        )
+
+        order_id, req = api.replace_order_by_id.call_args.args
+        assert order_id == "stop-1"
+        assert req.stop_price == 18.70
+        assert req.time_in_force.value == "gtc"
+        assert result.order_id == "stop-2"
+        assert result.time_in_force == "gtc"
 
 
 # ── place_spread_order / close_spread_order — MLEG (11.28) ───────────────────

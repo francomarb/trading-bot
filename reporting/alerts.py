@@ -65,6 +65,7 @@ class AlertType(Enum):
     POSITION_MISMATCH = "position_mismatch"
     BROKER_ERROR = "broker_error"
     BROKER_INFO = "broker_info"
+    OPTION_TRAILING_STATE_UNVERIFIED = "option_trailing_state_unverified"
     ENGINE_HALT = "engine_halt"
     TRADE_EXECUTED = "trade_executed"
     REGIME_SHIFT = "regime_shift"
@@ -444,6 +445,21 @@ class AlertDispatcher:
             alert_type=AlertType.BROKER_INFO,
             severity=AlertSeverity.INFO,
             message=f"broker info: {message}",
+        ))
+
+    def option_trailing_state_unverified(
+        self, symbol: str, strategy: str, observed_premium: float
+    ) -> bool:
+        return self.fire(Alert(
+            alert_type=AlertType.OPTION_TRAILING_STATE_UNVERIFIED,
+            severity=AlertSeverity.WARNING,
+            message=(
+                "open option had no durable high-water mark; "
+                "initialized from current broker premium"
+            ),
+            symbol=symbol,
+            strategy=strategy,
+            details={"observed_premium": observed_premium},
         ))
 
     def engine_halt(self, reason: str) -> bool:

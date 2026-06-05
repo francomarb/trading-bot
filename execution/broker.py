@@ -77,6 +77,7 @@ with warnings.catch_warnings():
         GetOrdersRequest,
         LimitOrderRequest,
         MarketOrderRequest,
+        ReplaceOrderRequest,
         StopOrderRequest,
         StopLossRequest,
     )
@@ -184,6 +185,7 @@ class OpenOrder:
     limit_price: float | None
     stop_price: float | None
     client_order_id: str | None = None
+    time_in_force: str | None = None
 
 
 @dataclass(frozen=True)
@@ -1632,7 +1634,7 @@ class AlpacaBroker:
         self._register_standalone_stop_leg(order)
         return self._to_open_order(order)
 
-    def submit_option_day_stop(
+    def submit_option_gtc_stop(
         self,
         *,
         symbol: str,
@@ -1640,7 +1642,7 @@ class AlpacaBroker:
         stop_price: float,
         client_order_id_prefix: str = "opt-trail-stop",
     ) -> OpenOrder:
-        """Submit a DAY SELL stop for a single-leg option position."""
+        """Submit a durable GTC SELL stop for a single-leg option position."""
         if qty <= 0:
             raise BrokerError(f"option stop qty must be positive for {symbol}: {qty}")
         whole_qty = int(qty)
@@ -1657,18 +1659,49 @@ class AlpacaBroker:
             symbol=symbol,
             qty=whole_qty,
             side=AlpacaOrderSide.SELL,
-            time_in_force=TimeInForce.DAY,
+            time_in_force=TimeInForce.GTC,
             stop_price=round(stop_price, 2),
             client_order_id=client_order_id,
         )
         logger.warning(
-            f"submitting option DAY trailing stop for {symbol}: "
+            f"submitting option GTC trailing stop for {symbol}: "
             f"sell {qty:g} stop @ ${stop_price:.2f} "
             f"(client_id={client_order_id})"
         )
         order = self._with_retry(
             lambda: self._api.submit_order(order_request),
-            op_desc=f"submit_option_day_stop({symbol})",
+            op_desc=f"submit_option_gtc_stop({symbol})",
+        )
+        self._register_standalone_stop_leg(order)
+        return self._to_open_order(order)
+
+    def replace_option_stop(
+        self,
+        *,
+        order_id: str,
+        stop_price: float,
+        client_order_id_prefix: str = "opt-trail-stop",
+    ) -> OpenOrder:
+        """Atomically ratchet an open option stop and enforce GTC duration."""
+        if not order_id:
+            raise BrokerError("option stop replacement requires an order id")
+        if stop_price <= 0:
+            raise BrokerError(
+                f"option replacement stop price must be positive: {stop_price}"
+            )
+        client_order_id = f"{client_order_id_prefix}-{uuid.uuid4().hex[:10]}"
+        request = ReplaceOrderRequest(
+            time_in_force=TimeInForce.GTC,
+            stop_price=round(stop_price, 2),
+            client_order_id=client_order_id,
+        )
+        logger.warning(
+            f"replacing option trailing stop {order_id}: "
+            f"new GTC stop @ ${stop_price:.2f} (client_id={client_order_id})"
+        )
+        order = self._with_retry(
+            lambda: self._api.replace_order_by_id(order_id, request),
+            op_desc=f"replace_option_stop({order_id})",
         )
         self._register_standalone_stop_leg(order)
         return self._to_open_order(order)
@@ -1926,6 +1959,11 @@ class AlpacaBroker:
         type_val = o.type.value if hasattr(o.type, 'value') else str(o.type) if hasattr(o, 'type') and o.type else None
         status_val = o.status.value if hasattr(o.status, 'value') else str(o.status)
         order_id = str(o.id) if o.id is not None else None
+        tif_raw = getattr(o, "time_in_force", None)
+        tif_val = (
+            tif_raw.value if hasattr(tif_raw, "value") else str(tif_raw)
+            if tif_raw is not None else None
+        )
 
         return OpenOrder(
             order_id=order_id,
@@ -1938,6 +1976,7 @@ class AlpacaBroker:
             limit_price=float(o.limit_price) if getattr(o, "limit_price", None) else None,
             stop_price=float(o.stop_price) if getattr(o, "stop_price", None) else None,
             client_order_id=getattr(o, "client_order_id", None),
+            time_in_force=tif_val,
         )
 
     @staticmethod

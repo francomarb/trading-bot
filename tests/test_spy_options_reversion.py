@@ -63,8 +63,19 @@ def _occ(underlying: str, expiry: date, call_put: str, strike: float) -> str:
     return f"{underlying}{exp}{call_put}{strike_str}"
 
 
-def _position(symbol: str) -> SimpleNamespace:
-    return SimpleNamespace(symbol=symbol)
+def _position(
+    symbol: str,
+    *,
+    current_price: float | None = None,
+    qty: float | None = None,
+    market_value: float | None = None,
+) -> SimpleNamespace:
+    return SimpleNamespace(
+        symbol=symbol,
+        current_price=current_price,
+        qty=qty,
+        market_value=market_value,
+    )
 
 
 # ── _raw_signals ──────────────────────────────────────────────────────────────
@@ -572,6 +583,59 @@ class TestTrailingStop:
         self._run_cycle(strat, sym, now_et, bs_price=14.0)
         self._run_cycle(strat, sym, now_et, bs_price=12.0)  # pull-back, HWM stays at 14
         assert abs(strat._position_hwm[sym] - 14.0) < 1e-6
+
+    def test_broker_premium_drives_trail_instead_of_theoretical_value(self):
+        """A high B-S estimate cannot create or trigger a phantom premium HWM."""
+        _, sym, now_et = self._safe_expiry_and_sym()
+        strat = self._strat(activation=0.10, trail=0.15)
+        strat.register_fill(sym, 10.0)
+
+        import sys, unittest.mock as _mock
+        fake_bs = _mock.MagicMock()
+        call_obj = fake_bs.BlackScholesCall.return_value
+        call_obj.delta.return_value = 0.55
+        call_obj.price = 20.0
+        sys.modules["blackscholes"] = fake_bs
+
+        pos = _position(sym, current_price=10.50, qty=1, market_value=1_050.0)
+        with patch("strategies.spy_options_reversion.datetime") as mock_dt:
+            mock_dt.now.side_effect = (
+                lambda tz=None: now_et if tz == _ET else datetime.now(timezone.utc)
+            )
+            mock_dt.combine = datetime.combine
+            mock_dt.strptime = datetime.strptime
+            result = strat.inspect_open_positions(pos, 520.0)
+
+        assert not result
+        assert strat._position_hwm[sym] == pytest.approx(10.50)
+
+    def test_durable_broker_hwm_triggers_on_current_broker_premium(self):
+        _, sym, now_et = self._safe_expiry_and_sym()
+        strat = self._strat(activation=0.10, trail=0.15)
+        strat.restore_trailing_state(
+            sym,
+            entry_premium=10.0,
+            hwm_premium=15.0,
+        )
+
+        import sys, unittest.mock as _mock
+        fake_bs = _mock.MagicMock()
+        call_obj = fake_bs.BlackScholesCall.return_value
+        call_obj.delta.return_value = 0.55
+        call_obj.price = 16.0
+        sys.modules["blackscholes"] = fake_bs
+
+        pos = _position(sym, current_price=12.0, qty=1, market_value=1_200.0)
+        with patch("strategies.spy_options_reversion.datetime") as mock_dt:
+            mock_dt.now.side_effect = (
+                lambda tz=None: now_et if tz == _ET else datetime.now(timezone.utc)
+            )
+            mock_dt.combine = datetime.combine
+            mock_dt.strptime = datetime.strptime
+            result = strat.inspect_open_positions(pos, 520.0)
+
+        assert result
+        assert sym not in strat._position_hwm
 
     def test_not_activated_below_threshold(self):
         """A small gain (< activation) never triggers the trail check."""

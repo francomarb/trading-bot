@@ -77,8 +77,8 @@ class SPYOptionsReversionStrategy(BaseStrategy):
         # ``vix_fallback_sigma`` machinery used to cover.
         self._iv_resolver = iv_resolver or IVProxyResolver()
         # Trailing stop state keyed by OCC symbol.
-        self._position_hwm: dict[str, float] = {}   # OCC → highest B-S value observed
-        self._position_base: dict[str, float] = {}  # OCC → first B-S value observed
+        self._position_hwm: dict[str, float] = {}   # OCC → highest premium observed
+        self._position_base: dict[str, float] = {}  # OCC → actual entry premium
         # Quote lookup: a callable resolving OCC symbols to live quotes.
         # An explicit lookup may be injected (tests use this for stubs; a
         # future cross-strategy wiring could share a single
@@ -152,6 +152,26 @@ class SPYOptionsReversionStrategy(BaseStrategy):
 
     # ── Mid-trade exit guards ────────────────────────────────────────────────
 
+    @staticmethod
+    def _position_premium(position) -> float | None:
+        """Read the current option premium from Alpaca's position snapshot."""
+        current = getattr(position, "current_price", None)
+        if current is not None:
+            try:
+                premium = float(current)
+                if premium > 0:
+                    return premium
+            except (TypeError, ValueError):
+                pass
+        try:
+            qty = abs(float(getattr(position, "qty", 0.0) or 0.0))
+            market_value = abs(float(getattr(position, "market_value", 0.0) or 0.0))
+        except (TypeError, ValueError):
+            return None
+        if qty <= 0 or market_value <= 0:
+            return None
+        return market_value / (qty * 100.0)
+
     def inspect_open_positions(self, position, latest_close: float) -> bool:
         """
         Called every engine cycle for each open position.  Returns True to
@@ -161,9 +181,9 @@ class SPYOptionsReversionStrategy(BaseStrategy):
                             expiry week.  Prevents holding through Theta cliff.
         2. Delta floor    — exit if B-S Delta < configured floor.  Signals the option has
                             moved too far OTM to be a viable play.
-        3. Trailing stop  — activate once the B-S value rises ≥ trail_activation_pct
-                            above the entry value; then exit if the current value
-                            drops ≥ trail_pct below the highest observed value.
+        3. Trailing stop  — activate once the broker premium rises by
+                            trail_activation_pct above entry; then exit if the
+                            broker premium drops trail_pct below the durable HWM.
                             Lets winners run while protecting open profits.
         """
         match = _OCC_RE.match(position.symbol)
@@ -207,9 +227,12 @@ class SPYOptionsReversionStrategy(BaseStrategy):
             )
             delta = call.delta()
             opt_val = _coerce_numeric(call.price)
+            broker_premium = self._position_premium(position)
+            observed_premium = broker_premium or opt_val
 
             logger.debug(
-                f"[{self.name}] {occ} Delta={delta:.3f} price={opt_val:.2f} "
+                f"[{self.name}] {occ} Delta={delta:.3f} "
+                f"broker_premium=${observed_premium:.2f} theoretical=${opt_val:.2f} "
                 f"(S={latest_close:.2f}, K={strike:.2f}, T={T:.4f}y, σ={sigma:.2f})"
             )
 
@@ -226,8 +249,11 @@ class SPYOptionsReversionStrategy(BaseStrategy):
 
             # ── Guard 3: trailing stop ───────────────────────────────────────
             if occ not in self._position_base:
-                self._position_base[occ] = opt_val
-            self._position_hwm[occ] = max(self._position_hwm.get(occ, opt_val), opt_val)
+                self._position_base[occ] = observed_premium
+            self._position_hwm[occ] = max(
+                self._position_hwm.get(occ, observed_premium),
+                observed_premium,
+            )
 
             base = self._position_base[occ]
             hwm = self._position_hwm[occ]
@@ -236,12 +262,13 @@ class SPYOptionsReversionStrategy(BaseStrategy):
                 trail_floor = hwm * (1.0 - self.trail_pct)
                 logger.debug(
                     f"[{self.name}] {occ} trailing stop active — "
-                    f"val={opt_val:.2f} hwm={hwm:.2f} floor={trail_floor:.2f}"
+                    f"premium={observed_premium:.2f} "
+                    f"hwm={hwm:.2f} floor={trail_floor:.2f}"
                 )
-                if opt_val < trail_floor:
+                if observed_premium < trail_floor:
                     logger.warning(
                         f"[{self.name}] Trailing stop: {occ} — "
-                        f"value={opt_val:.2f} < floor={trail_floor:.2f} "
+                        f"premium={observed_premium:.2f} < floor={trail_floor:.2f} "
                         f"(hwm={hwm:.2f}, activation={self.trail_activation_pct:.0%}, "
                         f"trail={self.trail_pct:.0%})"
                     )
