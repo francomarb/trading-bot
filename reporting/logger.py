@@ -507,8 +507,12 @@ class TradeLogger:
         new_adverse_bps: float | None = None
 
         if not record_slippage:
+            # No metric is computed, but the caller may still want to
+            # tag the row's measurement_quality (e.g. 'recovered' for
+            # codepath §8 reconstructed entries) so downstream consumers
+            # can isolate reconstruction rows from honest live measurements.
             new_benchmark_kind = "unavailable"
-            new_quality = "unavailable"
+            new_quality = measurement_quality or "unavailable"
         elif not is_market_order:
             # Limit orders: passive fills are not measured against an
             # arrival-price benchmark — see build_record docstring.
@@ -794,6 +798,13 @@ class TradeLogger:
 
         Fill price is None because we don't know the exact execution price.
         The reason field carries the detection context.
+
+        Slippage unification (Phase 1) codepath §12 — these rows have no
+        honest fill price let alone a benchmark, so all new slippage
+        columns write 'unavailable' and the metric values stay NULL.
+        Legacy columns dual-write NULL too (a change from the prior
+        0.0 placeholder) — these rows never had real measurements and
+        consumers should distinguish 'no fill' from 'zero slippage'.
         """
         record = TradeRecord(
             timestamp=datetime.now(timezone.utc).isoformat(),
@@ -806,8 +817,8 @@ class TradeLogger:
             reason=reason,
             stop_price=0.0,
             entry_reference_price=0.0,
-            modeled_slippage_bps=0.0,
-            realized_slippage_bps=0.0,
+            modeled_slippage_bps=None,
+            realized_slippage_bps=None,
             order_type="unknown",
             status="filled",
             requested_qty=0,
@@ -821,6 +832,13 @@ class TradeLogger:
             exit_timestamp=datetime.now(timezone.utc).isoformat(),
             position_id=owner_key_for(symbol),
             position_type="single_leg",
+            slippage_benchmark_price=None,
+            slippage_benchmark_kind="unavailable",
+            slippage_benchmark_timestamp=None,
+            slippage_measurement_quality="unavailable",
+            slippage_signed_bps=None,
+            slippage_adverse_bps=None,
+            stop_trigger_price=None,
         )
         self.log(record)
 

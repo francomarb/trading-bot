@@ -33,7 +33,7 @@ Branch: `feature/slippage-unification-phase1`
 | 4 | Wire recovery stop fill to broker `stop_price` (codepaths 5, 6) | ~30 | 2 | 🔄 In progress |
 | 5 | Tag single-leg entry/exit codepaths with benchmark kind (codepaths 1, 2, 3, 7, 9); add `benchmark_kind` + `benchmark_price` params to `build_close_record` | ~200 | 10 | 🔄 In progress |
 | 6 | Tag option and spread codepaths (10, 11) | ~110 | 3 | 🔄 In progress |
-| 7 | Tag external-close and recovered-context codepaths (8, 12, 13); stop writing `0.0` from `log_external_close` | ~40 | 3 | ⬜ |
+| 7 | Tag external-close and recovered-context codepaths (8, 12, 13); stop writing `0.0` from `log_external_close` | ~80 | 3 | 🔄 In progress |
 | 8 | Cross-cutting legacy-mirror parity assertion | ~20 | 1 | ⬜ |
 
 Total estimate: ~325 LOC + ~250 LOC tests.
@@ -55,12 +55,12 @@ test.
 | 5 | Broker-history recovered stop fill | `engine/trader.py:2974` | `active_stop_price` | `recovered` | ✅ |
 | 6 | Standalone repair-stop fill | (falls through 4/5) | `active_stop_price` | `primary`/`recovered` | ✅ (via 4/5) |
 | 7 | Fractional residual cleanup exit | `engine/trader.py:2509` `_log_close` via `_close_fractional_residual_position` | `unavailable` | `unavailable` | ✅ |
-| 8 | Recovered missing-entry-context row | `engine/trader.py:3135, 3150` | `unavailable` | `recovered` | ⬜ |
+| 8 | Recovered missing-entry-context row | `engine/trader.py:3135, 3150` | `unavailable` | `recovered` | ✅ |
 | 9 | Suspect-order recovery resolved filled | `engine/trader.py:1774` | `arrival_midpoint` (benchmark preserved) | `recovered` | ✅ |
 | 10 | Async single-leg option fill | `engine/trader.py` `_drain_option_fills` | `limit_price` | `unavailable` | ✅ (via build_record) |
 | 11 | Spread entry/exit fill | `reporting/logger.py:662` `log_spread_fill` | short leg `combo_limit` / long leg `unavailable` | `primary` / `unavailable` | ✅ |
-| 12 | Single-leg external close | `reporting/logger.py:624` `log_external_close` | `unavailable` | `unavailable` | ⬜ |
-| 13 | Spread external close | `engine/trader.py:3381` | `unavailable` | `unavailable` | ⬜ |
+| 12 | Single-leg external close | `reporting/logger.py:624` `log_external_close` | `unavailable` | `unavailable` | ✅ |
+| 13 | Spread external close | `engine/trader.py:3381` | `unavailable` | `unavailable` | ✅ (via log_spread_fill) |
 
 ---
 

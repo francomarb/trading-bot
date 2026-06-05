@@ -3302,12 +3302,18 @@ class TradingEngine:
                     f"{symbol}: recovery lifecycle synthesis failed: {exc}"
                 )
 
+        # Slippage unification (Phase 1) codepath §8 — reconstructed
+        # entry context has no honest arrival benchmark (the live
+        # submission predates this process), but the row is still
+        # tagged quality='recovered' so consumers can isolate
+        # reconstruction rows from real live entries.
         self._log_entry(
             recovered_decision,
             recovered_result,
             latest_close,
             record_slippage=False,
             timestamp_override=recovered_timestamp,
+            measurement_quality="recovered",
         )
         self._entry_prices[symbol] = entry_price
         logger.warning(

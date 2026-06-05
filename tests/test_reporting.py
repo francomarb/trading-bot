@@ -1493,6 +1493,98 @@ class TestBuildCloseRecordSlippageContract:
         assert record.slippage_signed_bps is None
 
 
+# ── TestExternalCloseAndRecoveredContextContract ───────────────────────────
+
+
+class TestExternalCloseAndRecoveredContextContract:
+    """
+    Phase 1 commit 7 of slippage unification — codepaths §8, §12, §13.
+
+    §8 — Recovered missing-entry-context row: build_record with
+        record_slippage=False; quality='recovered' so consumers can
+        isolate reconstruction rows.
+    §12 — log_external_close: row writes 'unavailable' on the new
+        columns and NULL on legacy columns (replacing the prior 0.0
+        placeholder).
+    §13 — Spread external close: log_spread_fill called without
+        submitted_limit_price → 'unavailable' on both legs (covered
+        by commit 6 tests already; one regression check here).
+    """
+
+    def test_log_external_close_writes_unavailable_and_null(self, tmp_csv):
+        tl = TradeLogger(path=tmp_csv)
+        tl.log_external_close(
+            symbol="AAPL",
+            strategy="sma_crossover",
+            reason="external_close_detected",
+        )
+        conn = sqlite3.connect(tmp_csv)
+        conn.row_factory = sqlite3.Row
+        try:
+            row = dict(conn.execute(
+                "SELECT * FROM trades ORDER BY id DESC LIMIT 1"
+            ).fetchone())
+        finally:
+            conn.close()
+        assert row["slippage_benchmark_kind"] == "unavailable"
+        assert row["slippage_measurement_quality"] == "unavailable"
+        assert row["slippage_signed_bps"] is None
+        assert row["slippage_adverse_bps"] is None
+        # Legacy column also moves to NULL — these rows never had real
+        # measurements. Phase 2 consumer migration adapts to the change.
+        assert row["realized_slippage_bps"] is None
+        assert row["modeled_slippage_bps"] is None
+
+    def test_recovered_entry_context_writes_quality_recovered(
+        self, sample_decision, sample_result
+    ):
+        """Codepath §8 — when record_slippage=False AND caller passes
+        measurement_quality='recovered', the row gets quality='recovered'
+        with kind='unavailable' and NULL metrics."""
+        tl = TradeLogger(path="/dev/null")
+        record = tl.build_record(
+            sample_decision,
+            sample_result,
+            modeled_price=150.0,
+            record_slippage=False,
+            measurement_quality="recovered",
+        )
+        assert record.slippage_benchmark_kind == "unavailable"
+        assert record.slippage_measurement_quality == "recovered"
+        assert record.slippage_signed_bps is None
+        assert record.slippage_adverse_bps is None
+
+    def test_spread_external_close_writes_unavailable(self, tmp_csv):
+        """Codepath §13 — spread external close calls log_spread_fill
+        without submitted_limit_price. Both legs get 'unavailable'."""
+        tl = TradeLogger(path=tmp_csv)
+        tl.log_spread_fill(
+            position_id="spread-ext-1",
+            strategy="credit_spread",
+            short_occ="SPY260620P00510000",
+            long_occ="SPY260620P00505000",
+            qty=1.0,
+            net_price=0.0,
+            opening=False,
+            realized_pnl=None,
+            reason="external_close_detected",
+        )
+        conn = sqlite3.connect(tmp_csv)
+        conn.row_factory = sqlite3.Row
+        try:
+            rows = [dict(r) for r in conn.execute(
+                "SELECT * FROM trades WHERE position_id='spread-ext-1'"
+            )]
+        finally:
+            conn.close()
+        assert len(rows) == 2
+        for row in rows:
+            assert row["slippage_benchmark_kind"] == "unavailable"
+            assert row["slippage_measurement_quality"] == "unavailable"
+            assert row["slippage_signed_bps"] is None
+            assert row["slippage_adverse_bps"] is None
+
+
 # ── TestOptionAndSpreadSlippageContract ────────────────────────────────────
 
 
