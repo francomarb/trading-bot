@@ -55,12 +55,14 @@ def _account(
     equity: float = 100_000.0,
     cash: float | None = None,
     session_start: float | None = None,
+    previous_close: float | None = None,
     positions: dict[str, Position] | None = None,
 ) -> AccountState:
     return AccountState(
         equity=equity,
         cash=equity if cash is None else cash,
         session_start_equity=equity if session_start is None else session_start,
+        previous_close_equity=previous_close,
         open_positions=positions or {},
     )
 
@@ -467,6 +469,41 @@ class TestHardDollarCap:
         assert isinstance(rej, RiskRejection)
         assert rej.code is RejectionCode.HARD_DOLLAR_CAP
         assert mgr.is_halted()
+
+    def test_account_check_prefers_alpaca_previous_close(self):
+        mgr = _mgr(hard_dollar_loss_cap=2_000.0, max_daily_loss_pct=0.99)
+        code = mgr.evaluate_account(
+            _account(
+                equity=98_000.0,
+                session_start=98_000.0,
+                previous_close=100_000.0,
+            )
+        )
+        assert code is RejectionCode.HARD_DOLLAR_CAP
+        assert mgr.is_halted()
+        assert "previous close" in (mgr.halt_reason() or "")
+
+    def test_account_check_falls_back_to_process_session_start(self):
+        mgr = _mgr(hard_dollar_loss_cap=2_000.0, max_daily_loss_pct=0.99)
+        code = mgr.evaluate_account(
+            _account(equity=98_000.0, session_start=100_000.0)
+        )
+        assert code is RejectionCode.HARD_DOLLAR_CAP
+        assert "session start" in (mgr.halt_reason() or "")
+
+    def test_signal_evaluation_uses_previous_close_after_restart(self):
+        mgr = _mgr(hard_dollar_loss_cap=2_000.0, max_daily_loss_pct=0.99)
+        rej = mgr.evaluate(
+            _signal(),
+            _account(
+                equity=98_000.0,
+                session_start=98_000.0,
+                previous_close=100_000.0,
+            ),
+            now=T0,
+        )
+        assert isinstance(rej, RiskRejection)
+        assert rej.code is RejectionCode.HARD_DOLLAR_CAP
 
 
 # ── Strategy cooldown ───────────────────────────────────────────────────────

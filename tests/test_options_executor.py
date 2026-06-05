@@ -59,6 +59,26 @@ def _filled_order(order_id: str = "ord-1", *, status: str = "filled"):
 
 
 class TestOptionsExecutionWorker:
+    def test_halt_after_dispatch_blocks_sdk_submit(self):
+        api = MagicMock()
+        stream = MagicMock()
+        stream.watch.return_value = MagicMock()
+        on_fill = MagicMock()
+
+        worker = OptionsExecutionWorker(
+            decision=_decision(),
+            api=api,
+            stream_manager=stream,
+            on_fill=on_fill,
+            client_order_id="opt-test",
+            entry_allowed=lambda: False,
+        )
+        worker.run()
+
+        api.submit_order.assert_not_called()
+        stream.unwatch.assert_called_once_with("opt-test")
+        on_fill.assert_called_once_with("rejected", 0.0, None, "opt-test")
+
     def test_binds_real_order_id_after_submit(self):
         api = MagicMock()
         api.submit_order.return_value = _submitted_order("ord-1")
@@ -238,6 +258,31 @@ class TestBuildMlegRequest:
 
 
 class TestSpreadExecutionWorker:
+    def test_halt_after_dispatch_blocks_sdk_submit(self):
+        api = MagicMock()
+        stream = MagicMock()
+        stream.watch.return_value = MagicMock()
+        on_fill = MagicMock()
+
+        worker = SpreadExecutionWorker(
+            legs=_open_legs(),
+            qty=1,
+            limit_price=-1.45,
+            strategy_name="credit_spread",
+            api=api,
+            stream_manager=stream,
+            on_fill=on_fill,
+            entry_allowed=lambda: False,
+        )
+        worker.run()
+
+        api.submit_order.assert_not_called()
+        watched_client_id = stream.watch.call_args.args[0]
+        stream.unwatch.assert_called_once_with(watched_client_id)
+        on_fill.assert_called_once_with(
+            "rejected", 0.0, None, watched_client_id
+        )
+
     def test_binds_real_order_id_after_submit(self):
         api = MagicMock()
         api.submit_order.return_value = _mleg_submitted("combo-1")

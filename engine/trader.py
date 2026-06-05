@@ -83,6 +83,7 @@ from indicators.technicals import add_atr
 from risk.manager import (
     AccountState,
     Position,
+    RejectionCode,
     RiskDecision,
     RiskManager,
     RiskRejection,
@@ -291,6 +292,10 @@ class TradingEngine:
 
         self.risk = risk
         self.broker = broker
+        # Every engine-owned AlpacaBroker gets the same last-mile entry guard.
+        # bind_entry_guard preserves any stricter callback supplied by the
+        # caller, while making the safety net independent of entrypoint wiring.
+        self.broker.bind_entry_guard(lambda: not self.risk.is_halted())
         self.trade_logger = trade_logger or TradeLogger()
         # Operator Controls Phase A — wire the lifecycle store to the
         # broker so equity entry paths persist `position_uid` pending →
@@ -787,6 +792,7 @@ class TradingEngine:
                 self.alerts.broker_error(str(e))
                 return
 
+            self.risk.evaluate_account(snapshot.account)
             risk_state = self.risk.halt_reason() or "healthy"
             logger.info(
                 f"cycle {cycle_id} broker state: "
@@ -1300,6 +1306,26 @@ class TradingEngine:
             )
             return
 
+        if self.risk.is_halted():
+            reason = self.risk.halt_reason() or "global risk halt active"
+            logger.info(
+                f"[{strategy.name}] {symbol}: entry blocked — {reason}"
+            )
+            self.alerts.order_rejection(
+                symbol, strategy.name, reason, RejectionCode.HALTED.value
+            )
+            if strategy_statuses is not None:
+                strategy_statuses[symbol] = "Risk Blocked"
+            if strategy_reasons is not None:
+                strategy_reasons[symbol] = [reason]
+            _lc = self._lifecycle_counter_for(strategy.name)
+            if _lc is not None:
+                _lc.risk_blocked += 1
+            self._mark_signal_bar_processed(
+                signal_key, signal_bar, strategy_statuses, strategy_reasons, symbol
+            )
+            return None
+
         # Shared-symbol conflict (11.7 Part A, refined by PLAN 11.44).
         #
         # Asymmetry by ownership-model keying:
@@ -1390,10 +1416,9 @@ class TradingEngine:
 
         # Credit-spread entry path (11.29 PR 3b). A credit-spread strategy
         # exposes build_spread_execution and is dispatched as an atomic MLEG
-        # combo — it bypasses RiskManager.evaluate (the spread's defined-risk
-        # structure, capped by the sleeve notional, IS the risk control) but
-        # all the engine-level guards above (halt, daily-loss, broker-error,
-        # regime gate, sleeve) have already been applied.
+        # combo. Defined-risk sizing is capped by the sleeve notional; global
+        # account loss limits and sticky halts are enforced by the universal
+        # entry gate above and again at the broker's final submit boundary.
         if hasattr(strategy, "build_spread_execution"):
             self._enter_multi_leg(
                 strategy=strategy,
@@ -4140,6 +4165,17 @@ class TradingEngine:
                 signal_key, signal_bar, strategy_statuses, strategy_reasons, symbol
             )
 
+        if self.risk.is_halted():
+            reason = self.risk.halt_reason() or "global risk halt active"
+            logger.info(
+                f"[{strategy.name}] {symbol}: MLEG entry blocked — {reason}"
+            )
+            self.alerts.order_rejection(
+                symbol, strategy.name, reason, RejectionCode.HALTED.value
+            )
+            _done("Risk Blocked")
+            return
+
         if notional_cap is None or notional_cap <= 0:
             logger.info(
                 f"[{strategy.name}] {symbol}: credit spread skipped — "
@@ -4179,6 +4215,18 @@ class TradingEngine:
             occs=leg_occs,
         ) is not None:
             _done("Contract Conflict")
+            return
+
+        if self.risk.is_halted():
+            reason = self.risk.halt_reason() or "global risk halt active"
+            logger.info(
+                f"[{strategy.name}] {symbol}: MLEG entry canceled before "
+                f"dispatch — {reason}"
+            )
+            self.alerts.order_rejection(
+                symbol, strategy.name, reason, RejectionCode.HALTED.value
+            )
+            _done("Risk Blocked")
             return
 
         position_id = new_spread_id()

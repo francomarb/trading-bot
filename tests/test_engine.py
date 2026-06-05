@@ -39,6 +39,7 @@ import pytest
 
 from engine.trader import EngineConfig, TradingEngine, _lookback_days
 from execution.broker import (
+    AlpacaBroker,
     BrokerSnapshot,
     ClosedOrderInfo,
     OpenOrder,
@@ -348,6 +349,33 @@ class TestStreamHealthObservability:
 
 
 class TestEngineConfig:
+    def test_engine_binds_broker_entry_guard(self, tmp_path):
+        api = MagicMock()
+        broker = AlpacaBroker(client=api)
+        risk = RiskManager(
+            max_position_pct=0.02,
+            max_open_positions=5,
+            max_gross_exposure_pct=0.50,
+            atr_stop_multiplier=2.0,
+            max_daily_loss_pct=0.05,
+            hard_dollar_loss_cap=1_000_000.0,
+            loss_streak_threshold=10,
+            broker_error_threshold=1,
+        )
+
+        TradingEngine(
+            strategy=FakeStrategy(entries=[False], exits=[False]),
+            symbols=["AAPL"],
+            risk=risk,
+            broker=broker,
+            trade_logger=TradeLogger(path=str(tmp_path / "trades.db")),
+        )
+        assert broker._entries_allowed()
+
+        risk.record_broker_error()
+
+        assert not broker._entries_allowed()
+
     def test_negative_cycle_interval_rejected(self):
         with pytest.raises(ValueError):
             EngineConfig(cycle_interval_seconds=0)
@@ -426,6 +454,19 @@ class TestProcessSymbol:
         snap = _snapshot(positions=positions)
         engine._session_start_equity = snap.account.equity
         self._process(engine, "AAPL", snap)
+        broker.close_position.assert_called_once_with("AAPL")
+        broker.place_order.assert_not_called()
+
+    def test_global_halt_does_not_block_exit(self, engine_factory):
+        engine, broker = engine_factory(exits=[False] * 59 + [True])
+        positions = {"AAPL": Position("AAPL", 10, 100.0, 1010.0)}
+        snap = _snapshot(positions=positions)
+        for _ in range(10):
+            engine.risk.record_broker_error()
+        assert engine.risk.is_halted()
+
+        self._process(engine, "AAPL", snap)
+
         broker.close_position.assert_called_once_with("AAPL")
         broker.place_order.assert_not_called()
 
@@ -679,6 +720,26 @@ class TestProcessSymbol:
 
 
 class TestRunOneCycle:
+    def test_broker_snapshot_engages_restart_safe_account_halt(
+        self, engine_factory
+    ):
+        snap = _snapshot(equity=98_000.0, previous_close_equity=100_000.0)
+        engine, broker = engine_factory(
+            entries=[False] * 59 + [True],
+            snapshot=snap,
+            market_open=True,
+        )
+        engine.risk.hard_dollar_loss_cap = 2_000.0
+        engine.risk.max_daily_loss_pct = 0.99
+        engine._session_start_equity = 98_000.0
+        engine._cycle_count = 1
+
+        engine._run_one_cycle()
+
+        assert engine.risk.is_halted()
+        assert "previous close" in (engine.risk.halt_reason() or "")
+        broker.place_order.assert_not_called()
+
     def test_market_closed_skips_cycle(self, engine_factory):
         engine, broker = engine_factory(
             entries=[False] * 59 + [True],

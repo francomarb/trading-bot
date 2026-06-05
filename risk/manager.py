@@ -81,9 +81,10 @@ class AccountState:
     """
     Snapshot of broker state passed into `RiskManager.evaluate`.
 
-    `session_start_equity` is the equity at the start of the current trading
-    session — used by the daily-loss and hard-dollar kill switches. The engine
-    is responsible for capturing this once at session open.
+    `previous_close_equity` is Alpaca's prior trading-day close and is the
+    preferred baseline for daily-loss and hard-dollar kill switches. The
+    process-local `session_start_equity` is retained as a conservative fallback
+    when the broker does not provide prior-close equity.
     """
 
     equity: float
@@ -336,6 +337,53 @@ class RiskManager:
             )
         self._halted = False
         self._halt_reason = None
+
+    def _account_limit_breach(
+        self, account: AccountState
+    ) -> tuple[RejectionCode, str] | None:
+        """Return the first account-level loss-limit breach, if any."""
+        baseline = getattr(account, "previous_close_equity", None)
+        baseline_name = "previous close"
+        if baseline is None or baseline <= 0:
+            baseline = getattr(account, "session_start_equity", 0.0)
+            baseline_name = "session start"
+        if baseline <= 0:
+            return None
+
+        drawdown_pct = (baseline - account.equity) / baseline
+        if drawdown_pct >= self.max_daily_loss_pct:
+            return (
+                RejectionCode.DAILY_LOSS_LIMIT,
+                f"daily loss {drawdown_pct * 100:.2f}% >= "
+                f"{self.max_daily_loss_pct * 100:.2f}% from {baseline_name}",
+            )
+
+        dollar_loss = baseline - account.equity
+        if dollar_loss >= self.hard_dollar_loss_cap:
+            return (
+                RejectionCode.HARD_DOLLAR_CAP,
+                f"dollar loss ${dollar_loss:.2f} >= "
+                f"cap ${self.hard_dollar_loss_cap:.2f} from {baseline_name}",
+            )
+        return None
+
+    def evaluate_account(self, account: AccountState) -> RejectionCode | None:
+        """
+        Evaluate account-wide kill switches without requiring an entry signal.
+
+        This is run from each fresh broker snapshot so defined-risk strategies
+        that do not use signal sizing cannot bypass global loss limits. Using
+        Alpaca's prior-close equity also makes the halt re-engage after a bot
+        recycle during the same trading day.
+        """
+        if self._halted:
+            return RejectionCode.HALTED
+        breach = self._account_limit_breach(account)
+        if breach is None:
+            return None
+        code, message = breach
+        self._engage_kill_switch(message)
+        return code
 
     def cooldown_snapshot(
         self, *, now: datetime | None = None,
@@ -649,32 +697,13 @@ class RiskManager:
                 signal,
             )
 
-        # Daily-loss circuit breaker (% drawdown from session start).
-        sess_start = account.session_start_equity
-        if sess_start > 0:
-            drawdown_pct = (sess_start - account.equity) / sess_start
-            if drawdown_pct >= self.max_daily_loss_pct:
-                self._engage_kill_switch(
-                    f"daily loss limit hit: down "
-                    f"{drawdown_pct * 100:.2f}% from session start"
-                )
-                return self._reject(
-                    RejectionCode.DAILY_LOSS_LIMIT,
-                    f"daily loss {drawdown_pct * 100:.2f}% >= "
-                    f"{self.max_daily_loss_pct * 100:.2f}%",
-                    signal,
-                )
-
-        # Hard dollar cap (absolute $ loss from session start).
-        dollar_loss = sess_start - account.equity
-        if dollar_loss >= self.hard_dollar_loss_cap:
-            self._engage_kill_switch(
-                f"hard dollar loss cap hit: down ${dollar_loss:.2f} "
-                f"(cap ${self.hard_dollar_loss_cap:.2f})"
-            )
+        breach = self._account_limit_breach(account)
+        if breach is not None:
+            code, message = breach
+            self._engage_kill_switch(message)
             return self._reject(
-                RejectionCode.HARD_DOLLAR_CAP,
-                f"dollar loss ${dollar_loss:.2f} >= cap ${self.hard_dollar_loss_cap:.2f}",
+                code,
+                message,
                 signal,
             )
 

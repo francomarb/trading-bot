@@ -163,7 +163,35 @@ class TestPlaceOrderContract:
         broker = _broker_with_mock(api)
         with pytest.raises(TypeError, match="RiskDecision"):
             broker.place_order({"symbol": "AAPL", "qty": 1})  # type: ignore[arg-type]
+
+    def test_halted_equity_entry_is_rejected_before_submit(self):
+        api = MagicMock()
+        broker = AlpacaBroker(
+            client=api,
+            max_attempts=1,
+            base_delay=0.0,
+            entry_allowed=lambda: False,
+        )
+
+        result = broker.place_order(_decision())
+
+        assert result.status is OrderStatus.REJECTED
+        assert result.raw_status == "risk_halted"
         api.submit_order.assert_not_called()
+
+    def test_bind_entry_guard_preserves_explicit_policy(self):
+        def explicit_guard() -> bool:
+            return False
+
+        broker = AlpacaBroker(
+            client=MagicMock(),
+            entry_allowed=explicit_guard,
+        )
+
+        installed = broker.bind_entry_guard(lambda: True)
+
+        assert installed is False
+        assert broker._entry_allowed is explicit_guard
 
     def test_rejects_none(self):
         api = MagicMock()
@@ -479,6 +507,31 @@ class TestSubmitOrderKwargs:
         assert req.client_order_id.startswith("sma-repair-")
         assert result.side is Side.SELL
         assert result.stop_price == 95.5
+
+    def test_halted_state_does_not_block_protective_stop(self):
+        api = MagicMock()
+        api.submit_order.return_value = _alpaca_order(
+            status="accepted",
+            side="sell",
+            type="stop",
+            stop_price="95.5",
+            qty=10,
+        )
+        broker = AlpacaBroker(
+            client=api,
+            max_attempts=1,
+            base_delay=0.0,
+            entry_allowed=lambda: False,
+        )
+
+        result = broker.place_protective_stop(
+            symbol="AAPL",
+            qty=10,
+            stop_price=95.5,
+        )
+
+        api.submit_order.assert_called_once()
+        assert result.side is Side.SELL
 
     def test_repair_stop_registers_standalone_stop_leg_with_stream(self):
         api = MagicMock()
@@ -872,6 +925,30 @@ class TestCancelOrder:
 
 
 class TestClosePosition:
+    def test_halted_state_does_not_block_close(self):
+        api = MagicMock()
+        api.get_all_positions.return_value = [
+            SimpleNamespace(
+                symbol="AAPL", qty="10", avg_entry_price="100", market_value="1010"
+            )
+        ]
+        api.get_orders.return_value = []
+        api.close_position.return_value = _alpaca_order(status="accepted")
+        api.get_order_by_id.return_value = _alpaca_order(
+            status="filled", filled_qty=10, filled_avg_price=101.0
+        )
+        broker = AlpacaBroker(
+            client=api,
+            max_attempts=1,
+            base_delay=0.0,
+            entry_allowed=lambda: False,
+        )
+
+        result = broker.close_position("AAPL", poll_timeout=0.0)
+
+        assert result.status is OrderStatus.FILLED
+        api.close_position.assert_called_once_with("AAPL")
+
     def test_closes_existing_position_with_market(self):
         api = MagicMock()
         # get_positions called inside close_position
@@ -1264,6 +1341,22 @@ def _occ_decision(entry: float = 10.0) -> RiskDecision:
 
 
 class TestOptionsDryRun:
+    def test_halted_option_entry_is_rejected_before_dry_run_fill(self):
+        api = MagicMock()
+        broker = AlpacaBroker(
+            client=api,
+            max_attempts=1,
+            base_delay=0.0,
+            dry_run=True,
+            entry_allowed=lambda: False,
+        )
+
+        result = broker.place_order(_occ_decision())
+
+        assert result.status is OrderStatus.REJECTED
+        assert result.raw_status == "risk_halted"
+        api.submit_order.assert_not_called()
+
     def test_dry_run_skips_option_worker_and_returns_filled(self):
         """DRY_RUN=True must short-circuit before OptionsExecutionWorker is started."""
         api = MagicMock()
@@ -1440,6 +1533,54 @@ class TestPlaceSpreadOrder:
 
 
 class TestDispatchSpreadOrder:
+    def test_halted_open_is_rejected_without_worker(self):
+        api = MagicMock()
+        broker = AlpacaBroker(
+            client=api,
+            max_attempts=1,
+            base_delay=0.0,
+            dry_run=False,
+            entry_allowed=lambda: False,
+        )
+
+        with patch("execution.broker.SpreadExecutionWorker") as mock_worker_cls:
+            result = broker.dispatch_spread_order(
+                legs=_open_spread_legs(),
+                qty=1,
+                limit_price=-1.45,
+                strategy_name="credit_spread",
+                position_id="pos-1",
+            )
+
+        assert result.status is OrderStatus.REJECTED
+        assert result.raw_status == "risk_halted"
+        mock_worker_cls.assert_not_called()
+
+    def test_halted_state_does_not_block_spread_close(self):
+        api = MagicMock()
+        broker = AlpacaBroker(
+            client=api,
+            max_attempts=1,
+            base_delay=0.0,
+            dry_run=False,
+            entry_allowed=lambda: False,
+        )
+
+        with patch("execution.broker.SpreadExecutionWorker") as mock_worker_cls:
+            mock_worker_cls.return_value = MagicMock()
+            result = broker.dispatch_spread_order(
+                legs=_open_spread_legs(),
+                qty=1,
+                limit_price=1.10,
+                strategy_name="credit_spread",
+                position_id="pos-1",
+                closing=True,
+            )
+
+        assert result.status is OrderStatus.ACCEPTED
+        assert mock_worker_cls.call_args.kwargs["entry_allowed"] is None
+        mock_worker_cls.return_value.start.assert_called_once()
+
     def test_live_mode_dispatches_worker_and_returns_accepted(self):
         api = MagicMock()
         broker = AlpacaBroker(client=api, max_attempts=1, base_delay=0.0, dry_run=False)

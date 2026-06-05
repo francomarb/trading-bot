@@ -45,7 +45,7 @@ import warnings
 from dataclasses import dataclass, field, replace
 from datetime import datetime, timezone
 from enum import Enum
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Callable
 
 if TYPE_CHECKING:
     from execution.stream import StreamManager
@@ -238,6 +238,7 @@ class AlpacaBroker:
         stream_manager: "StreamManager | None" = None,
         dry_run: bool | None = None,
         lifecycle_store: "PositionLifecycleStore | None" = None,
+        entry_allowed: Callable[[], bool] | None = None,
     ) -> None:
         self._api = client or TradingClient(
             api_key=ALPACA_API_KEY,
@@ -257,6 +258,7 @@ class AlpacaBroker:
         # writes are silently skipped and behavior is byte-for-byte
         # unchanged from before Phase A.
         self._lifecycle_store = lifecycle_store
+        self._entry_allowed = entry_allowed
         # Dry-run: log orders but never submit. Defaults to settings.DRY_RUN.
         self._dry_run: bool = dry_run if dry_run is not None else DRY_RUN
         # Async option fills reported by OptionsExecutionWorker threads.
@@ -272,6 +274,36 @@ class AlpacaBroker:
                 by_id=self._stream_lookup_order_by_id,
                 by_client_id=self._stream_lookup_order_by_client_id,
             )
+
+    def _entries_allowed(self) -> bool:
+        """Return whether a new opening order may be submitted right now."""
+        callback = getattr(self, "_entry_allowed", None)
+        return callback is None or callback()
+
+    def bind_entry_guard(self, callback: Callable[[], bool]) -> bool:
+        """
+        Install an entry-submit guard when none was supplied at construction.
+
+        Returns True when the callback was installed. An explicitly configured
+        guard is preserved so an engine cannot weaken a stricter caller policy.
+        """
+        if getattr(self, "_entry_allowed", None) is not None:
+            return False
+        self._entry_allowed = callback
+        return True
+
+    @staticmethod
+    def _entry_halt_result(symbol: str, requested_qty: float) -> OrderResult:
+        return OrderResult(
+            status=OrderStatus.REJECTED,
+            order_id=None,
+            symbol=symbol,
+            requested_qty=requested_qty,
+            filled_qty=0,
+            avg_fill_price=None,
+            raw_status="risk_halted",
+            message="entry blocked: global risk halt active",
+        )
 
     # ── Lifecycle helpers (Operator Controls Phase A) ───────────────────
     #
@@ -704,6 +736,12 @@ class AlpacaBroker:
                 f"place_order requires a RiskDecision (got {type(decision).__name__}). "
                 "Strategy signals must go through RiskManager.evaluate first."
             )
+        if not self._entries_allowed():
+            logger.warning(
+                f"entry blocked before broker dispatch: {decision.symbol} "
+                "(global risk halt active)"
+            )
+            return self._entry_halt_result(decision.symbol, decision.qty)
 
         # Options path must come first — OCC symbols require the background
         # worker regardless of qty, and must never fall into the fractional path.
@@ -764,6 +802,7 @@ class AlpacaBroker:
                 stream_manager=self._stream_manager,
                 on_fill=_on_fill,
                 client_order_id=client_order_id,
+                entry_allowed=self._entry_allowed,
             )
             worker.start()
 
@@ -925,6 +964,16 @@ class AlpacaBroker:
         if self._stream_manager is not None:
             stream_event = self._stream_manager.watch(client_order_id)
 
+        if not self._entries_allowed():
+            logger.warning(
+                f"entry canceled before Alpaca submit: {decision.symbol} "
+                "(global risk halt active)"
+            )
+            if self._stream_manager is not None:
+                self._stream_manager.unwatch(client_order_id)
+            self._lifecycle_mark_canceled(position_uid)
+            return self._entry_halt_result(decision.symbol, decision.qty)
+
         try:
             order = self._with_retry(
                 lambda: self._api.submit_order(order_request),
@@ -1071,6 +1120,16 @@ class AlpacaBroker:
         stream_event: threading.Event | None = None
         if self._stream_manager is not None:
             stream_event = self._stream_manager.watch(client_order_id)
+
+        if not self._entries_allowed():
+            logger.warning(
+                f"fractional entry canceled before Alpaca submit: "
+                f"{decision.symbol} (global risk halt active)"
+            )
+            if self._stream_manager is not None:
+                self._stream_manager.unwatch(client_order_id)
+            self._lifecycle_mark_canceled(position_uid)
+            return self._entry_halt_result(decision.symbol, decision.qty)
 
         try:
             order = self._with_retry(
@@ -1393,6 +1452,13 @@ class AlpacaBroker:
         rep_symbol = short_leg.occ_symbol
         action = "close" if closing else "open"
 
+        if not closing and not self._entries_allowed():
+            logger.warning(
+                f"MLEG spread entry blocked before dispatch: {rep_symbol} "
+                "(global risk halt active)"
+            )
+            return self._entry_halt_result(rep_symbol, qty)
+
         if self._dry_run:
             logger.warning(
                 f"DRY RUN — MLEG spread {action} NOT dispatched: {qty}× "
@@ -1435,6 +1501,7 @@ class AlpacaBroker:
             api=self._api,
             stream_manager=self._stream_manager,
             on_fill=_on_fill,
+            entry_allowed=None if closing else self._entry_allowed,
         )
         worker.start()
         return OrderResult(
