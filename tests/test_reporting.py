@@ -1493,6 +1493,116 @@ class TestBuildCloseRecordSlippageContract:
         assert record.slippage_signed_bps is None
 
 
+# ── TestOptionAndSpreadSlippageContract ────────────────────────────────────
+
+
+class TestOptionAndSpreadSlippageContract:
+    """
+    Phase 1 commit 6 of slippage unification — codepaths §10, §11 in
+    docs/slippage_unification_design.md.
+
+    Codepath §10 (async single-leg option fill) routes through _log_entry
+    with a LIMIT decision, so it inherits build_record's limit_price /
+    unavailable contract automatically; this class pins that contract.
+
+    Codepath §11 (spread fill) is bespoke — the short leg carries the
+    economic combo_limit measurement; the long leg writes NULL on the
+    new columns to distinguish structural zeros from real measurements.
+    """
+
+    def test_limit_option_entry_writes_limit_price_unavailable(self, sample_result):
+        """Codepath §10 — single-leg options are LIMIT-typed and produce
+        the same limit_price / unavailable shape as any other LIMIT entry."""
+        from risk.manager import RiskDecision
+        decision = RiskDecision(
+            symbol="SPY260620C00520000",
+            side=Side.BUY,
+            qty=2,
+            stop_price=0.01,
+            entry_reference_price=10.00,
+            strategy_name="spy_options_reversion",
+            reason="rsi recovery",
+            order_type=OrderType.LIMIT,
+            limit_price=10.00,
+        )
+        tl = TradeLogger(path="/dev/null")
+        record = tl.build_record(decision, sample_result, modeled_price=10.00)
+        assert record.slippage_benchmark_kind == "limit_price"
+        assert record.slippage_measurement_quality == "unavailable"
+        assert record.slippage_signed_bps is None
+        assert record.slippage_adverse_bps is None
+
+    def test_spread_short_leg_writes_combo_limit_primary(self, tmp_csv):
+        """Codepath §11 — short leg carries the economic combo_limit measurement."""
+        tl = TradeLogger(path=tmp_csv)
+        tl.log_spread_fill(
+            position_id="spread-1",
+            strategy="credit_spread",
+            short_occ="SPY260620P00510000",
+            long_occ="SPY260620P00505000",
+            qty=1.0,
+            net_price=0.55,
+            submitted_limit_price=0.60,
+            opening=True,
+            initial_risk_dollars=445.0,
+        )
+        conn = sqlite3.connect(tmp_csv)
+        conn.row_factory = sqlite3.Row
+        try:
+            short_row = dict(conn.execute(
+                "SELECT * FROM trades WHERE side='sell' AND position_id='spread-1'"
+            ).fetchone())
+            long_row = dict(conn.execute(
+                "SELECT * FROM trades WHERE side='buy' AND position_id='spread-1'"
+            ).fetchone())
+        finally:
+            conn.close()
+        # Short leg: economic measurement
+        assert short_row["slippage_benchmark_kind"] == "combo_limit"
+        assert short_row["slippage_measurement_quality"] == "primary"
+        assert short_row["slippage_benchmark_price"] == pytest.approx(0.60)
+        assert short_row["slippage_signed_bps"] is not None
+        # Opening credit short of 0.55 vs limit 0.60 — credit shortfall
+        # is adverse: (0.60 - 0.55) / 0.60 * 10_000 ≈ 833.33 bps.
+        assert short_row["slippage_signed_bps"] == pytest.approx(833.33, abs=0.1)
+        assert short_row["slippage_adverse_bps"] == pytest.approx(833.33, abs=0.1)
+        # Long leg: structural — NULL on new columns
+        assert long_row["slippage_benchmark_kind"] == "unavailable"
+        assert long_row["slippage_measurement_quality"] == "unavailable"
+        assert long_row["slippage_signed_bps"] is None
+        assert long_row["slippage_adverse_bps"] is None
+        # Legacy column on long leg keeps the 0.0 structural value
+        # for Phase 1 SUM/AVG consumer compat.
+        assert long_row["realized_slippage_bps"] == 0.0
+
+    def test_spread_without_submitted_limit_writes_unavailable(self, tmp_csv):
+        """When no submitted_limit_price is provided, both legs write
+        'unavailable' rather than fabricating a benchmark."""
+        tl = TradeLogger(path=tmp_csv)
+        tl.log_spread_fill(
+            position_id="spread-2",
+            strategy="credit_spread",
+            short_occ="SPY260620P00510000",
+            long_occ="SPY260620P00505000",
+            qty=1.0,
+            net_price=0.55,
+            submitted_limit_price=None,
+            opening=True,
+            initial_risk_dollars=445.0,
+        )
+        conn = sqlite3.connect(tmp_csv)
+        conn.row_factory = sqlite3.Row
+        try:
+            short_row = dict(conn.execute(
+                "SELECT * FROM trades WHERE side='sell' AND position_id='spread-2'"
+            ).fetchone())
+        finally:
+            conn.close()
+        assert short_row["slippage_benchmark_kind"] == "unavailable"
+        assert short_row["slippage_measurement_quality"] == "unavailable"
+        assert short_row["slippage_signed_bps"] is None
+
+
 # ── TestLogStopFillSlippageContract ────────────────────────────────────────
 
 

@@ -924,6 +924,31 @@ class TradeLogger:
             if math.isfinite(pnl_f):
                 r_multiple = pnl_f / basis
 
+        # ── Slippage unification (Phase 1) codepath §11 ──
+        # The short leg carries the economic measurement against the
+        # submitted combo limit; the long leg is structural and writes
+        # NULL slippage on the new columns. Legacy columns dual-write
+        # zeros on the long leg for Phase 1 consumer compat (the
+        # passive-leg NULL transition for SUM/AVG consumers is a Phase 2
+        # follow-up — see tracker migration plan).
+        short_new_kind: SlippageBenchmarkKind
+        short_new_quality: SlippageMeasurementQuality
+        short_new_benchmark_price: float | None
+        short_new_signed_bps: float | None
+        short_new_adverse_bps: float | None
+        if submitted_limit_price is not None and abs(float(submitted_limit_price)) > 0:
+            short_new_kind = "combo_limit"
+            short_new_quality = "primary"
+            short_new_benchmark_price = abs(float(submitted_limit_price))
+            short_new_signed_bps = float(short_slippage_bps)
+            short_new_adverse_bps = max(0.0, short_new_signed_bps)
+        else:
+            short_new_kind = "unavailable"
+            short_new_quality = "unavailable"
+            short_new_benchmark_price = None
+            short_new_signed_bps = None
+            short_new_adverse_bps = None
+
         def _leg_record(
             symbol: str,
             side: str,
@@ -934,6 +959,11 @@ class TradeLogger:
             slippage_bps: float,
             risk_dollars: float | None,
             r_mult: float | None,
+            new_benchmark_kind: SlippageBenchmarkKind,
+            new_measurement_quality: SlippageMeasurementQuality,
+            new_benchmark_price: float | None,
+            new_signed_bps: float | None,
+            new_adverse_bps: float | None,
         ) -> TradeRecord:
             return TradeRecord(
                 timestamp=now_iso,
@@ -961,6 +991,16 @@ class TradeLogger:
                 exit_timestamp=None if opening else now_iso,
                 position_id=position_id,
                 position_type="spread",
+                slippage_benchmark_price=new_benchmark_price,
+                slippage_benchmark_kind=new_benchmark_kind,
+                slippage_benchmark_timestamp=now_iso if new_benchmark_price is not None else None,
+                slippage_measurement_quality=new_measurement_quality,
+                slippage_signed_bps=(
+                    round(new_signed_bps, 2) if new_signed_bps is not None else None
+                ),
+                slippage_adverse_bps=(
+                    round(new_adverse_bps, 2) if new_adverse_bps is not None else None
+                ),
             )
 
         # realized_pnl, initial_risk_dollars, and r_multiple ride the short-leg
@@ -974,7 +1014,15 @@ class TradeLogger:
             slippage_bps=short_slippage_bps,
             risk_dollars=basis,
             r_mult=r_multiple,
+            new_benchmark_kind=short_new_kind,
+            new_measurement_quality=short_new_quality,
+            new_benchmark_price=short_new_benchmark_price,
+            new_signed_bps=short_new_signed_bps,
+            new_adverse_bps=short_new_adverse_bps,
         ))
+        # Long leg is structural — new columns write NULL/'unavailable'
+        # so SUM/AVG consumers can distinguish structural zeros from
+        # real measurements once they migrate. Legacy 0.0 retained.
         self.log(_leg_record(
             long_occ,
             long_side,
@@ -984,6 +1032,11 @@ class TradeLogger:
             slippage_bps=0.0,
             risk_dollars=None,
             r_mult=None,
+            new_benchmark_kind="unavailable",
+            new_measurement_quality="unavailable",
+            new_benchmark_price=None,
+            new_signed_bps=None,
+            new_adverse_bps=None,
         ))
         logger.info(
             f"spread {'entry' if opening else 'exit'} logged: {short_occ}/{long_occ} "
