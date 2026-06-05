@@ -112,7 +112,7 @@ test.
 |---|---|---|---|---|---|
 | 1 | Single-leg market entry | `engine/trader.py:1591` `_log_entry` | `arrival_midpoint` / `fallback_latest_close` | `primary` / `fallback` | ✅ |
 | 2 | Single-leg limit entry | `reporting/logger.py:425` `build_record` | `limit_price` | `unavailable` | ✅ |
-| 3 | Discretionary market exit | `reporting/logger.py:504` `build_close_record` | `arrival_midpoint` | `primary` | ✅ |
+| 3 | Discretionary market exit | `reporting/logger.py:504` `build_close_record` via `_close_single_leg_position` | equity `fallback_latest_close` / option `unavailable` (Defect 1 fix) | `fallback` / `unavailable` | ✅ |
 | 4 | WebSocket stop fill | `engine/trader.py:3530` | `active_stop_price` | `primary` | ✅ |
 | 5 | Broker-history recovered stop fill | `engine/trader.py:2974` | `active_stop_price` | `recovered` | ✅ |
 | 6 | Standalone repair-stop fill | (falls through 4/5) | `active_stop_price` | `primary`/`recovered` | ✅ (via 4/5) |

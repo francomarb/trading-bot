@@ -638,12 +638,24 @@ class TradeLogger:
         a RiskDecision — they come from the strategy exit signal directly.
 
         `benchmark_kind` lets the caller declare which kind of benchmark
-        ``modeled_price`` represents. Defaults to ``arrival_midpoint`` for
-        normal discretionary market exits (preserves prior behavior).
-        Pass ``unavailable`` for fractional residual cleanup or any other
-        path where ``modeled_price`` is not a proper slippage benchmark
-        (e.g. the fill price itself, position.current_price). See codepath
-        §7 in docs/slippage_unification_design.md.
+        ``modeled_price`` represents. Defaults to ``unavailable`` (safe
+        — never fabricates a benchmark claim) after the Defect 1 fix.
+        Real callers declare honestly:
+
+          - ``_close_single_leg_position`` (codepath §3): equity exits
+            pass ``fallback_latest_close`` / ``fallback`` because the
+            exit path uses the latest bar close as a proxy benchmark;
+            option exits pass ``unavailable`` / ``unavailable`` because
+            ``modeled_price`` is the fill price itself, which yields a
+            structural zero-slippage measurement.
+          - ``_close_fractional_residual_position`` (codepath §7):
+            ``unavailable`` / ``unavailable`` because the close_price
+            fallback chain is not a slippage benchmark.
+
+        Pass ``unavailable`` explicitly for any path where
+        ``modeled_price`` is not a proper benchmark — Defect 5 fix
+        ensures legacy columns also write NULL in that case rather
+        than computing against the non-benchmark value.
         """
         # Defect 5 fix — when the caller explicitly declares
         # benchmark_kind='unavailable', the legacy columns should not
@@ -1213,16 +1225,23 @@ class TradeLogger:
                     r_multiple = realized_pnl / initial_risk_dollars
 
         # ── Slippage unification (Phase 1) ──
-        # Broker stop_price is the authoritative benchmark. When absent
-        # or non-finite (Defect 4 defense-in-depth — engine callers
-        # already filter via _finite_or_none, but this guard catches
-        # any future caller that forgets), the new columns honestly
-        # report `unavailable`; legacy columns retain their
-        # pre-unification fallback for Phase 1 compat.
+        # Broker stop_price is the authoritative benchmark. When absent,
+        # non-finite, or non-numeric (Defect 4 defense-in-depth — engine
+        # callers already filter via _finite_or_none, but this guard
+        # also catches any future caller that passes a raw broker
+        # payload such as a string), the new columns honestly report
+        # `unavailable`; legacy columns retain their pre-unification
+        # fallback for Phase 1 compat.
+        coerced_stop: float | None = None
+        if stop_price is not None:
+            try:
+                coerced_stop = float(stop_price)
+            except (TypeError, ValueError):
+                coerced_stop = None
         broker_stop_available = (
-            stop_price is not None
-            and math.isfinite(float(stop_price))
-            and float(stop_price) > 0
+            coerced_stop is not None
+            and math.isfinite(coerced_stop)
+            and coerced_stop > 0
         )
         new_slippage_benchmark_price: float | None = None
         new_slippage_benchmark_kind: SlippageBenchmarkKind = "unavailable"
@@ -1233,7 +1252,9 @@ class TradeLogger:
         new_stop_trigger_price: float | None = None
 
         if broker_stop_available:
-            benchmark = float(stop_price)
+            # Use the already-coerced value rather than re-coercing
+            # raw stop_price (which could be a string and raise).
+            benchmark = coerced_stop
             signed = single_leg_realized_slippage_bps(
                 side="sell",
                 reference_price=benchmark,
@@ -1252,7 +1273,7 @@ class TradeLogger:
         # immediately benefit from the more accurate benchmark; otherwise
         # fall back to initial_stop_loss exactly as before this change.
         legacy_reference = (
-            float(stop_price)
+            coerced_stop
             if broker_stop_available
             else float(initial_stop_loss or 0.0)
         )

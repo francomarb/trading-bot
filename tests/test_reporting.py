@@ -2060,24 +2060,27 @@ class TestLogStopFillSlippageContract:
         assert row["realized_slippage_bps"] == pytest.approx(row["slippage_signed_bps"])
         assert row["modeled_slippage_bps"] > 0  # SLIPPAGE_MODEL_MARKET_BPS
 
-    def test_non_finite_broker_stop_writes_unavailable(self, tmp_csv):
-        """Defect 4 fix — +inf / -inf / NaN as stop_price must be
-        rejected. log_stop_fill writes the row as 'unavailable' rather
-        than benchmarking against a poisoned value."""
+    def test_malformed_broker_stop_writes_unavailable(self, tmp_csv):
+        """Defect 4 fix — every form of malformed stop_price must be
+        rejected without raising. Covers: +inf, -inf, NaN, zero,
+        negative, and non-numeric strings like 'bad' (which would
+        raise ValueError on float() if not caught). log_stop_fill
+        writes the row as 'unavailable' for all of them."""
         import math as _math
         tl = TradeLogger(path=tmp_csv)
-        for bad in (_math.inf, -_math.inf, _math.nan):
+        bad_values: list = [_math.inf, -_math.inf, _math.nan, 0.0, -1.50, "bad", "1.2.3"]
+        for i, bad in enumerate(bad_values):
             tl.log_stop_fill(
                 symbol="AAPL",
                 strategy="sma_crossover",
                 qty=10.0,
                 avg_fill_price=144.50,
                 stop_price=bad,
-                order_id=f"stop-bad-{bad}",
+                order_id=f"stop-bad-{i}",
             )
             row = self._read_one_stop_row(tmp_csv)
             assert row["slippage_benchmark_kind"] == "unavailable", (
-                f"non-finite stop_price={bad} should produce 'unavailable'"
+                f"malformed stop_price={bad!r} should produce 'unavailable'"
             )
             assert row["slippage_signed_bps"] is None
 
