@@ -1284,13 +1284,213 @@ class TestSlippageUnificationSchema:
         for col in self._NEW_COLUMNS:
             assert col in columns
 
-    def test_trade_record_defaults_to_none_on_new_fields(self, sample_decision, sample_result):
-        tl = TradeLogger(path="/dev/null")
-        record = tl.build_record(sample_decision, sample_result, modeled_price=150.0)
-        # Phase 1 commit 1: writers do not populate these yet. Defaults
-        # must be None so the schema additions are non-disruptive.
+    def test_trade_record_dataclass_defaults_remain_none(self):
+        """Direct dataclass construction without writer logic leaves new
+        fields None. This guards against any future caller that builds a
+        TradeRecord directly bypassing the writer-side default inference."""
+        record = TradeRecord(
+            timestamp="2026-06-05T00:00:00+00:00",
+            symbol="AAPL",
+            side="buy",
+            qty=1.0,
+            avg_fill_price=100.0,
+            order_id="x",
+            strategy="s",
+            reason="r",
+            stop_price=0.0,
+            entry_reference_price=100.0,
+            modeled_slippage_bps=None,
+            realized_slippage_bps=None,
+            order_type="market",
+            status="filled",
+            requested_qty=1.0,
+            filled_qty=1.0,
+        )
         for col in self._NEW_COLUMNS:
-            assert getattr(record, col) is None, f"{col} should default to None pre-writer"
+            assert getattr(record, col) is None
+
+
+# ── TestBuildRecordSlippageContract ────────────────────────────────────────
+
+
+class TestBuildRecordSlippageContract:
+    """
+    Phase 1 commit 5 of slippage unification — codepaths §1, §2 in
+    docs/slippage_unification_design.md. build_record now populates the
+    new taxonomy columns and accepts explicit benchmark_kind/quality
+    parameters so callers can declare arrival vs fallback.
+    """
+
+    def test_market_entry_with_arrival_midpoint_writes_primary(
+        self, sample_decision, sample_result
+    ):
+        tl = TradeLogger(path="/dev/null")
+        record = tl.build_record(
+            sample_decision,
+            sample_result,
+            modeled_price=150.0,
+            benchmark_kind="arrival_midpoint",
+        )
+        assert record.slippage_benchmark_kind == "arrival_midpoint"
+        assert record.slippage_measurement_quality == "primary"
+        assert record.slippage_benchmark_price == pytest.approx(150.0)
+        assert record.slippage_benchmark_timestamp is not None
+        assert record.slippage_signed_bps is not None
+        assert record.slippage_adverse_bps == max(0.0, record.slippage_signed_bps)
+
+    def test_market_entry_with_fallback_close_writes_fallback_quality(
+        self, sample_decision, sample_result
+    ):
+        tl = TradeLogger(path="/dev/null")
+        record = tl.build_record(
+            sample_decision,
+            sample_result,
+            modeled_price=150.0,
+            benchmark_kind="fallback_latest_close",
+        )
+        assert record.slippage_benchmark_kind == "fallback_latest_close"
+        assert record.slippage_measurement_quality == "fallback"
+
+    def test_market_entry_without_benchmark_writes_unavailable(
+        self, sample_decision, sample_result
+    ):
+        tl = TradeLogger(path="/dev/null")
+        record = tl.build_record(
+            sample_decision,
+            sample_result,
+            modeled_price=None,
+        )
+        assert record.slippage_benchmark_kind == "unavailable"
+        assert record.slippage_measurement_quality == "unavailable"
+        assert record.slippage_signed_bps is None
+        assert record.slippage_adverse_bps is None
+
+    def test_limit_entry_writes_limit_price_unavailable(self, sample_result):
+        from risk.manager import RiskDecision
+        decision = RiskDecision(
+            symbol="AAPL",
+            side=Side.BUY,
+            qty=10,
+            stop_price=145.0,
+            entry_reference_price=150.0,
+            strategy_name="rsi_reversion",
+            reason="rsi oversold",
+            order_type=OrderType.LIMIT,
+            limit_price=149.50,
+        )
+        tl = TradeLogger(path="/dev/null")
+        record = tl.build_record(decision, sample_result, modeled_price=150.0)
+        assert record.slippage_benchmark_kind == "limit_price"
+        assert record.slippage_measurement_quality == "unavailable"
+        assert record.slippage_signed_bps is None
+        assert record.slippage_adverse_bps is None
+        # Legacy columns also NULL — preserves the LIMIT carve-out (8316e64).
+        assert record.realized_slippage_bps is None
+
+    def test_record_slippage_false_writes_unavailable(
+        self, sample_decision, sample_result
+    ):
+        tl = TradeLogger(path="/dev/null")
+        record = tl.build_record(
+            sample_decision,
+            sample_result,
+            modeled_price=150.0,
+            record_slippage=False,
+        )
+        assert record.slippage_benchmark_kind == "unavailable"
+        assert record.slippage_measurement_quality == "unavailable"
+
+    def test_measurement_quality_recovered_override(
+        self, sample_decision, sample_result
+    ):
+        """Codepath §9 — suspect-order recovery tags rows quality='recovered'."""
+        tl = TradeLogger(path="/dev/null")
+        record = tl.build_record(
+            sample_decision,
+            sample_result,
+            modeled_price=150.0,
+            benchmark_kind="arrival_midpoint",
+            measurement_quality="recovered",
+        )
+        assert record.slippage_benchmark_kind == "arrival_midpoint"
+        assert record.slippage_measurement_quality == "recovered"
+
+    def test_legacy_dual_write_matches_new_signed_on_market(
+        self, sample_decision, sample_result
+    ):
+        tl = TradeLogger(path="/dev/null")
+        record = tl.build_record(
+            sample_decision,
+            sample_result,
+            modeled_price=150.0,
+            benchmark_kind="arrival_midpoint",
+        )
+        # Both compute against the same modeled_price → must match.
+        assert record.realized_slippage_bps == pytest.approx(record.slippage_signed_bps)
+
+
+# ── TestBuildCloseRecordSlippageContract ───────────────────────────────────
+
+
+class TestBuildCloseRecordSlippageContract:
+    """
+    Phase 1 commit 5 of slippage unification — codepaths §3, §7.
+    build_close_record accepts benchmark_kind/quality so the fractional
+    residual cleanup path can honestly declare 'unavailable' rather than
+    inheriting the stop-fill slippage.
+    """
+
+    def _make_close_result(self):
+        return OrderResult(
+            status=OrderStatus.FILLED,
+            order_id="exit-1",
+            symbol="AAPL",
+            requested_qty=10,
+            filled_qty=10,
+            avg_fill_price=152.0,
+            raw_status="filled",
+        )
+
+    def test_default_kind_is_arrival_midpoint_primary(self):
+        tl = TradeLogger(path="/dev/null")
+        record = tl.build_close_record(
+            self._make_close_result(),
+            strategy_name="sma_crossover",
+            modeled_price=151.50,
+        )
+        assert record.slippage_benchmark_kind == "arrival_midpoint"
+        assert record.slippage_measurement_quality == "primary"
+        assert record.slippage_benchmark_price == pytest.approx(151.50)
+        assert record.slippage_signed_bps is not None
+        assert record.slippage_adverse_bps is not None
+
+    def test_unavailable_kind_writes_null_metrics(self):
+        """Fractional residual cleanup contract — pass 'unavailable' to
+        opt out of metric computation entirely."""
+        tl = TradeLogger(path="/dev/null")
+        record = tl.build_close_record(
+            self._make_close_result(),
+            strategy_name="sma_crossover",
+            modeled_price=152.0,  # fill price itself — not a real benchmark
+            benchmark_kind="unavailable",
+            measurement_quality="unavailable",
+        )
+        assert record.slippage_benchmark_kind == "unavailable"
+        assert record.slippage_measurement_quality == "unavailable"
+        assert record.slippage_benchmark_price is None
+        assert record.slippage_signed_bps is None
+        assert record.slippage_adverse_bps is None
+
+    def test_modeled_price_zero_forces_unavailable(self):
+        tl = TradeLogger(path="/dev/null")
+        record = tl.build_close_record(
+            self._make_close_result(),
+            strategy_name="sma_crossover",
+            modeled_price=0.0,
+        )
+        assert record.slippage_benchmark_kind == "unavailable"
+        assert record.slippage_measurement_quality == "unavailable"
+        assert record.slippage_signed_bps is None
 
 
 # ── TestLogStopFillSlippageContract ────────────────────────────────────────

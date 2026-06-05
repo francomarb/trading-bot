@@ -430,6 +430,8 @@ class TradeLogger:
         position_uid: str | None = None,
         record_slippage: bool = True,
         timestamp_override: datetime | None = None,
+        benchmark_kind: SlippageBenchmarkKind | None = None,
+        measurement_quality: SlippageMeasurementQuality | None = None,
     ) -> TradeRecord:
         """
         Build a TradeRecord from a RiskDecision + OrderResult.
@@ -491,6 +493,53 @@ class TradeLogger:
         else:
             modeled_bps = None
             realized_bps = None
+
+        # ── Slippage unification (Phase 1) ──
+        # Default benchmark_kind / quality inference preserves current
+        # behavior when callers don't pass explicit values. Engine call
+        # sites tag rows with the precise kind (arrival_midpoint vs
+        # fallback_latest_close) where they know the answer.
+        new_benchmark_price: float | None = None
+        new_benchmark_kind: SlippageBenchmarkKind
+        new_benchmark_timestamp: str | None = None
+        new_quality: SlippageMeasurementQuality
+        new_signed_bps: float | None = None
+        new_adverse_bps: float | None = None
+
+        if not record_slippage:
+            new_benchmark_kind = "unavailable"
+            new_quality = "unavailable"
+        elif not is_market_order:
+            # Limit orders: passive fills are not measured against an
+            # arrival-price benchmark — see build_record docstring.
+            new_benchmark_kind = "limit_price"
+            new_quality = "unavailable"
+        elif modeled_price is None or modeled_price <= 0:
+            # Market order but no benchmark available — honestly unavailable.
+            new_benchmark_kind = "unavailable"
+            new_quality = "unavailable"
+        else:
+            # Market order with benchmark — caller may declare arrival vs
+            # fallback explicitly; default to arrival_midpoint.
+            new_benchmark_kind = benchmark_kind or "arrival_midpoint"
+            if measurement_quality is not None:
+                new_quality = measurement_quality
+            elif new_benchmark_kind == "fallback_latest_close":
+                new_quality = "fallback"
+            else:
+                new_quality = "primary"
+            new_benchmark_price = float(modeled_price)
+            if (
+                result.avg_fill_price is not None
+                and new_benchmark_price > 0
+            ):
+                signed = single_leg_realized_slippage_bps(
+                    side=decision.side.value,
+                    reference_price=new_benchmark_price,
+                    actual_fill_price=result.avg_fill_price,
+                )
+                new_signed_bps = signed
+                new_adverse_bps = max(0.0, signed)
         initial_stop_loss = float(decision.stop_price)
         initial_risk_per_share = max(
             0.0,
@@ -504,6 +553,8 @@ class TradeLogger:
         )
         timestamp_dt = timestamp_override or datetime.now(timezone.utc)
         now_iso = timestamp_dt.astimezone(timezone.utc).isoformat()
+        if new_benchmark_price is not None:
+            new_benchmark_timestamp = now_iso
 
         return TradeRecord(
             timestamp=now_iso,
@@ -534,6 +585,16 @@ class TradeLogger:
             position_id=owner_key_for(decision.symbol),
             position_type="single_leg",
             position_uid=position_uid,
+            slippage_benchmark_price=new_benchmark_price,
+            slippage_benchmark_kind=new_benchmark_kind,
+            slippage_benchmark_timestamp=new_benchmark_timestamp,
+            slippage_measurement_quality=new_quality,
+            slippage_signed_bps=(
+                round(new_signed_bps, 2) if new_signed_bps is not None else None
+            ),
+            slippage_adverse_bps=(
+                round(new_adverse_bps, 2) if new_adverse_bps is not None else None
+            ),
         )
 
     def build_close_record(
@@ -542,10 +603,20 @@ class TradeLogger:
         *,
         strategy_name: str,
         modeled_price: float,
+        benchmark_kind: SlippageBenchmarkKind | None = None,
+        measurement_quality: SlippageMeasurementQuality | None = None,
     ) -> TradeRecord:
         """
         Build a TradeRecord for a position close (exit). Closes don't have
         a RiskDecision — they come from the strategy exit signal directly.
+
+        `benchmark_kind` lets the caller declare which kind of benchmark
+        ``modeled_price`` represents. Defaults to ``arrival_midpoint`` for
+        normal discretionary market exits (preserves prior behavior).
+        Pass ``unavailable`` for fractional residual cleanup or any other
+        path where ``modeled_price`` is not a proper slippage benchmark
+        (e.g. the fill price itself, position.current_price). See codepath
+        §7 in docs/slippage_unification_design.md.
         """
         realized_bps = 0.0
         modeled_bps = settings.SLIPPAGE_MODEL_MARKET_BPS if modeled_price > 0 else 0.0
@@ -589,6 +660,36 @@ class TradeLogger:
                 if initial_risk_dollars and initial_risk_dollars > 0:
                     r_multiple = realized_pnl / initial_risk_dollars
 
+        # ── Slippage unification (Phase 1) ──
+        # Default kind = arrival_midpoint preserves prior behavior; the
+        # fractional-residual call site overrides to 'unavailable'.
+        new_benchmark_price: float | None = None
+        new_benchmark_kind: SlippageBenchmarkKind = benchmark_kind or "arrival_midpoint"
+        new_benchmark_timestamp: str | None = None
+        new_quality: SlippageMeasurementQuality
+        new_signed_bps: float | None = None
+        new_adverse_bps: float | None = None
+
+        if new_benchmark_kind == "unavailable" or modeled_price <= 0:
+            new_benchmark_kind = "unavailable"
+            new_quality = measurement_quality or "unavailable"
+        else:
+            new_quality = measurement_quality or (
+                "fallback"
+                if new_benchmark_kind == "fallback_latest_close"
+                else "primary"
+            )
+            new_benchmark_price = float(modeled_price)
+            new_benchmark_timestamp = now_iso
+            if result.avg_fill_price is not None:
+                signed = single_leg_realized_slippage_bps(
+                    side="sell",
+                    reference_price=new_benchmark_price,
+                    actual_fill_price=result.avg_fill_price,
+                )
+                new_signed_bps = signed
+                new_adverse_bps = max(0.0, signed)
+
         return TradeRecord(
             timestamp=now_iso,
             symbol=result.symbol,
@@ -615,6 +716,16 @@ class TradeLogger:
             exit_timestamp=now_iso,
             position_id=owner_key_for(result.symbol),
             position_type="single_leg",
+            slippage_benchmark_price=new_benchmark_price,
+            slippage_benchmark_kind=new_benchmark_kind,
+            slippage_benchmark_timestamp=new_benchmark_timestamp,
+            slippage_measurement_quality=new_quality,
+            slippage_signed_bps=(
+                round(new_signed_bps, 2) if new_signed_bps is not None else None
+            ),
+            slippage_adverse_bps=(
+                round(new_adverse_bps, 2) if new_adverse_bps is not None else None
+            ),
         )
 
     def log(self, record: TradeRecord) -> None:

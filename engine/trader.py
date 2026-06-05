@@ -1539,6 +1539,16 @@ class TradingEngine:
                 self.broker.get_latest_quote_midpoint(target_symbol)
             )
         slippage_ref = arrival_price if arrival_price is not None else latest_close
+        # Slippage unification (Phase 1) — tag which benchmark we're
+        # actually using so the new taxonomy columns are honest. See
+        # codepath §1 in docs/slippage_unification_design.md.
+        slippage_kind: str | None
+        if arrival_price is not None:
+            slippage_kind = "arrival_midpoint"
+        elif latest_close is not None:
+            slippage_kind = "fallback_latest_close"
+        else:
+            slippage_kind = None  # build_record will default to 'unavailable'
         try:
             result = self.broker.place_order(decision)
             # PLAN 11.10f: lifecycle counter — submitted increments
@@ -1588,7 +1598,12 @@ class TradingEngine:
                 order_type=decision.order_type.value,
                 side=decision.side.value,
             )
-            self._log_entry(decision, result, slippage_ref)
+            self._log_entry(
+                decision,
+                result,
+                slippage_ref,
+                benchmark_kind=slippage_kind,
+            )
             if result.status in {OrderStatus.FILLED, OrderStatus.PARTIAL}:
                 # PLAN 11.10f: lifecycle counter — filled_entries.
                 # Per design §12.4.1: one entry that opened a position
@@ -1779,11 +1794,18 @@ class TradingEngine:
                     order_type=suspect.decision.order_type.value,
                     side=suspect.decision.side.value,
                 )
+                # Slippage unification (Phase 1) codepath §9 — the
+                # suspect-order recovery state preserved the original
+                # arrival benchmark, so the row gets the same kind as a
+                # live market entry but tagged quality='recovered' so
+                # downstream consumers can isolate reconstructed rows.
                 self._log_entry(
                     suspect.decision,
                     result,
                     suspect.modeled_price,
                     timestamp_override=result.filled_at or result.submitted_at,
+                    benchmark_kind="arrival_midpoint",
+                    measurement_quality="recovered",
                 )
                 self._register_single_leg(
                     strategy_name=suspect.decision.strategy_name,
@@ -1905,6 +1927,8 @@ class TradingEngine:
         *,
         record_slippage: bool = True,
         timestamp_override: datetime | None = None,
+        benchmark_kind: str | None = None,
+        measurement_quality: str | None = None,
     ) -> None:
         """Log an entry fill to the trade database.
 
@@ -1920,6 +1944,16 @@ class TradingEngine:
         time (``filled_at``), recovered rows should use that broker time
         rather than the later cycle when the engine noticed and repaired
         the gap.
+
+        ``benchmark_kind`` lets the call site declare whether
+        ``modeled_price`` represents an arrival midpoint or a fallback
+        (latest_close). Passed through to ``build_record`` for the new
+        slippage taxonomy columns. See codepath §1 in
+        docs/slippage_unification_design.md.
+
+        ``measurement_quality`` is set to 'recovered' by the suspect-order
+        recovery path (codepath §9). Default inference picks 'primary' or
+        'fallback' based on benchmark_kind.
         """
         if result.status not in {OrderStatus.FILLED, OrderStatus.PARTIAL}:
             return
@@ -1935,6 +1969,8 @@ class TradingEngine:
                 position_uid=getattr(result, "position_uid", None),
                 record_slippage=record_slippage,
                 timestamp_override=timestamp_override,
+                benchmark_kind=benchmark_kind,
+                measurement_quality=measurement_quality,
             )
             self.trade_logger.log(record)
         except Exception as e:
@@ -1945,8 +1981,18 @@ class TradingEngine:
         result: OrderResult,
         modeled_price: float,
         strategy_name: str = "",
+        *,
+        benchmark_kind: str | None = None,
+        measurement_quality: str | None = None,
     ) -> None:
-        """Log an exit fill to the trade database."""
+        """Log an exit fill to the trade database.
+
+        ``benchmark_kind`` defaults to None which makes ``build_close_record``
+        assume 'arrival_midpoint' (correct for normal discretionary
+        exits). The fractional residual cleanup call site passes
+        'unavailable' so the row honestly reports no benchmark — see
+        codepath §7 in docs/slippage_unification_design.md.
+        """
         if result.status not in {OrderStatus.FILLED, OrderStatus.PARTIAL}:
             return
         try:
@@ -1954,6 +2000,8 @@ class TradingEngine:
                 result,
                 strategy_name=strategy_name or self.strategy.name,
                 modeled_price=modeled_price,
+                benchmark_kind=benchmark_kind,
+                measurement_quality=measurement_quality,
             )
             self.trade_logger.log(record)
         except Exception as e:
@@ -2506,7 +2554,20 @@ class TradingEngine:
             or getattr(position, "avg_entry_price", 0.0)
             or 0.0
         )
-        self._log_close(result, close_price, owner)
+        # Slippage unification (Phase 1) codepath §7 — fractional
+        # residual cleanups have no honest arrival benchmark (the
+        # close_price fallback chain is the fill price itself or
+        # position.current_price, neither of which is a slippage
+        # benchmark). Tag the row 'unavailable' so the new taxonomy
+        # columns honestly report no measurement; the whole-share stop
+        # row already carries the meaningful exit slippage.
+        self._log_close(
+            result,
+            close_price,
+            owner,
+            benchmark_kind="unavailable",
+            measurement_quality="unavailable",
+        )
         if result.status in {OrderStatus.FILLED, OrderStatus.PARTIAL}:
             close_qty = float(result.filled_qty or position.qty or 0.0)
             self.alerts.trade_executed(
