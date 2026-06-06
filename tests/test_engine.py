@@ -1969,6 +1969,61 @@ class TestWatchlistStatuses:
         broker.promote_equity_stop_to_gtc.assert_not_called()
         broker.place_protective_stop.assert_not_called()
 
+    def test_reconciliation_reports_repeated_day_stop_promotion_failure_once(
+        self, engine_factory
+    ):
+        day_stop = replace(
+            _open_stop_order("AAPL", 95.0),
+            order_id="day-stop",
+            qty=10,
+            time_in_force="day",
+        )
+        snapshot = _snapshot(
+            positions={"AAPL": Position("AAPL", 10, 100.0, 1010.0)},
+            open_orders=[day_stop],
+        )
+        engine, broker = engine_factory(snapshot=snapshot)
+        engine._register_single_leg(strategy_name="fake_strategy", symbol="AAPL")
+        broker.promote_equity_stop_to_gtc.side_effect = RuntimeError(
+            "order is temporarily not replaceable"
+        )
+        engine.risk.record_broker_error = MagicMock()
+        engine.alerts.broker_error = MagicMock()
+
+        engine._repair_missing_protective_stops(snapshot)
+        engine._repair_missing_protective_stops(snapshot)
+
+        assert broker.promote_equity_stop_to_gtc.call_count == 2
+        engine.risk.record_broker_error.assert_called_once()
+        engine.alerts.broker_error.assert_called_once()
+
+    def test_reconciliation_does_not_promote_fractional_day_stop(
+        self, engine_factory
+    ):
+        day_stop = replace(
+            _open_stop_order("AAPL", 95.0),
+            order_id="day-stop",
+            qty=0.5,
+            time_in_force="day",
+        )
+        snapshot = _snapshot(
+            positions={"AAPL": Position("AAPL", 0.5, 100.0, 50.0)},
+            open_orders=[day_stop],
+        )
+        engine, broker = engine_factory(snapshot=snapshot)
+        engine._register_single_leg(strategy_name="fake_strategy", symbol="AAPL")
+        engine._close_fractional_residual_position = MagicMock()
+
+        engine._repair_missing_protective_stops(snapshot)
+
+        broker.promote_equity_stop_to_gtc.assert_not_called()
+        engine._close_fractional_residual_position.assert_called_once_with(
+            snapshot=snapshot,
+            symbol="AAPL",
+            owner="fake_strategy",
+            position=snapshot.account.open_positions["AAPL"],
+        )
+
     def test_suspect_order_recovery_adopts_position_and_restores_stop(
         self, engine_factory
     ):

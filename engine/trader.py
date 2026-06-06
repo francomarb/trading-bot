@@ -404,6 +404,11 @@ class TradingEngine:
         # to adopt automatically.
         self._suspect_orders: dict[str, SuspectOrder] = {}
 
+        # DAY-stop promotion is retried from every broker snapshot, but a
+        # persistent rejection should count as one broker incident rather than
+        # tripping the rolling broker-error halt on the same order each cycle.
+        self._reported_stop_promotion_failures: set[tuple[str, str]] = set()
+
         # Startup mode set by _reconcile_startup. NORMAL → full trading.
         # RESTRICTED → exits only (one cycle, then auto-clears to NORMAL).
         # HALT → no new entries until manual reset_kill_switches().
@@ -3246,18 +3251,35 @@ class TradingEngine:
             owner = self._get_owner(symbol)
             if owner is None:
                 continue
+            stop_qty = abs(int(position.qty))
             existing = self._protective_stop_order(symbol, snapshot)
             if existing is not None:
                 if str(existing.time_in_force or "").lower() != "day":
                     continue
+                if stop_qty < 1:
+                    if allow_residual_cleanup:
+                        self._close_fractional_residual_position(
+                            snapshot=snapshot,
+                            symbol=symbol,
+                            owner=owner,
+                            position=position,
+                        )
+                    else:
+                        logger.debug(
+                            f"{symbol}: deferring fractional residual cleanup "
+                            "and DAY-stop promotion until a market-open cycle"
+                        )
+                    continue
+                failure_key = (symbol, existing.order_id)
                 try:
                     promoted = self.broker.promote_equity_stop_to_gtc(
                         parent_order_id=None,
                         stop_order_id=existing.order_id,
-                        qty=abs(int(position.qty)),
+                        qty=stop_qty,
                         stop_price=float(existing.stop_price),
                         client_order_id_prefix=f"{owner}-repair-stop-gtc",
                     )
+                    self._reported_stop_promotion_failures.discard(failure_key)
                     snapshot.open_orders.remove(existing)
                     snapshot.open_orders.append(promoted)
                     logger.warning(
@@ -3269,9 +3291,13 @@ class TradingEngine:
                         f"{symbol}: failed to promote DAY protective stop "
                         f"{existing.order_id} to GTC: {e}"
                     )
-                    logger.error(msg)
-                    self.risk.record_broker_error()
-                    self.alerts.broker_error(msg)
+                    if failure_key not in self._reported_stop_promotion_failures:
+                        self._reported_stop_promotion_failures.add(failure_key)
+                        logger.error(msg)
+                        self.risk.record_broker_error()
+                        self.alerts.broker_error(msg)
+                    else:
+                        logger.debug(f"{msg} (already reported; retrying)")
                 continue
 
             stop_price = self.trade_logger.read_latest_open_stop_price(
@@ -3294,7 +3320,6 @@ class TradingEngine:
                     self.alerts.broker_error(msg)
                     continue
 
-            stop_qty = abs(int(position.qty))
             if stop_qty < 1:
                 if allow_residual_cleanup:
                     self._close_fractional_residual_position(
