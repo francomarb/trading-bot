@@ -49,7 +49,7 @@ These are the items that must be green before any live flip.
 | Slippage drift enabled (`10.D2`) | ⬜ Blocked by calibration | Set `SLIPPAGE_DRIFT_ENABLED=True` only after calibration is sane |
 | Strategy Health threshold watch (`11.10h`) | 🔄 In progress | Run ≥4 weeks of reports, then tune false-positive thresholds |
 | Credit-spread paper-watch (`11.30`, `11.41`) | 🔄 In progress | Audit open/close attempts, close timeout behavior, and execution quality |
-| SPY option trailing durability | 🔄 Fix PR | Use broker-premium durable HWM, GTC stop protection, atomic Alpaca replacements, and alert on unrecoverable legacy HWM |
+| SPY option trailing durability | ✅ Complete | PR #46 merged: broker-premium durable HWM, GTC stop protection, atomic Alpaca replacements, missing-HWM alerting, and paper-verified GTC acceptance |
 | Live hard dollar cap (`10.G2`) | ⬜ Set at live flip | Configure launch-only cap in live `.env` |
 | Preflight + dry run (`10.G5`) | ✅ Code complete | Re-run immediately before live flip |
 | VPS deployment (`10.H1-H5`) | ⬜ Not started | Provision production runtime, systemd, secure env, log shipping |
@@ -63,6 +63,7 @@ These are the items that must be green before any live flip.
 
 | Item | Why It Matters | Acceptance |
 |---|---|---|
+| Capped equity entry stop durability | The entry-price guard submits capped whole-share MARKET decisions as DAY LIMIT + OTO; Alpaca propagates DAY to the attached stop child, which expires at the closing auction. Market-closed cycles currently return before stop repair, leaving the position unprotected overnight until restart or the next market-open repair cycle. Confirmed on ASML on 2026-06-05. | Preserve the DAY entry cap without a ghost fill while ensuring the protective stop becomes durable GTC immediately after the entry fills. Cover all capped equity entry paths, preserve atomic/no-gap protection, and verify parent/child lifecycle against Alpaca paper. |
 | Slippage kill-switch calibration | Live trading must halt if execution quality drifts beyond modeled edge | Paper fill audit shows thresholds are reasonable; `SLIPPAGE_DRIFT_ENABLED=True` before live |
 | Five-sleeve paper GO/NO-GO | The current bot is broader than the old SMA/RSI gate; evidence must cover all active sleeves | Documented GO/NO-GO report covering entries, exits, attribution, startup reconciliation, allocator behavior, health reports |
 | VPS/systemd deployment | Local Mac + tmux is acceptable for paper, not for real capital | VPS provisioned, secrets deployed safely, `systemd` restarts bot on crash/boot, logs are recoverable |

@@ -106,6 +106,7 @@ def _alpaca_order(
     limit_price: str | None = None,
     stop_price: str | None = None,
     time_in_force: str | None = None,
+    legs: list[SimpleNamespace] | None = None,
     submitted_at: str = "2026-04-15T14:30:00Z",
 ) -> SimpleNamespace:
     return SimpleNamespace(
@@ -120,6 +121,7 @@ def _alpaca_order(
         limit_price=limit_price,
         stop_price=stop_price,
         time_in_force=time_in_force,
+        legs=legs,
         submitted_at=submitted_at,
     )
 
@@ -697,6 +699,206 @@ class TestEntryMaxPriceCap:
         # OTO with the protective stop attached atomically.
         assert req.order_class.value == "oto"
         assert req.stop_loss.stop_price == 210.0
+
+    def test_filled_capped_entry_promotes_attached_stop_to_gtc(self):
+        api = MagicMock()
+        stop_leg = SimpleNamespace(
+            id="day-stop-1",
+            type="stop",
+            side="sell",
+        )
+        api.submit_order.return_value = _alpaca_order(
+            id="entry-1",
+            status="accepted",
+            legs=[stop_leg],
+        )
+        api.get_order_by_id.return_value = _alpaca_order(
+            id="entry-1",
+            status="filled",
+            filled_qty=10,
+            filled_avg_price=100.5,
+        )
+        api.replace_order_by_id.return_value = _alpaca_order(
+            id="gtc-stop-1",
+            status="accepted",
+            side="sell",
+            qty=10,
+            type="stop",
+            stop_price="95.0",
+            time_in_force="gtc",
+        )
+        broker = _broker_with_mock(api)
+
+        result = broker.place_order(
+            _decision(qty=10, stop=95.0, entry_max_price=105.0),
+            poll_timeout=0.0,
+            poll_interval=0.0,
+        )
+
+        assert result.status is OrderStatus.FILLED
+        stop_id, req = api.replace_order_by_id.call_args.args
+        assert stop_id == "day-stop-1"
+        assert req.qty == 10
+        assert req.time_in_force.value == "gtc"
+        assert req.stop_price == 95.0
+
+    def test_promotion_resolves_child_from_nested_parent_when_submit_omits_legs(self):
+        api = MagicMock()
+        api.submit_order.return_value = _alpaca_order(
+            id="entry-1",
+            status="accepted",
+            legs=None,
+        )
+        filled = _alpaca_order(
+            id="entry-1",
+            status="filled",
+            filled_qty=10,
+            filled_avg_price=100.5,
+        )
+        nested = _alpaca_order(
+            id="entry-1",
+            status="filled",
+            legs=[SimpleNamespace(id="day-stop-1", type="stop", side="sell")],
+        )
+        api.get_order_by_id.side_effect = [filled, nested]
+        api.replace_order_by_id.return_value = _alpaca_order(
+            id="gtc-stop-1",
+            status="accepted",
+            side="sell",
+            qty=10,
+            type="stop",
+            stop_price="95.0",
+            time_in_force="gtc",
+        )
+        broker = _broker_with_mock(api)
+
+        result = broker.place_order(
+            _decision(qty=10, stop=95.0, entry_max_price=105.0),
+            poll_timeout=0.0,
+            poll_interval=0.0,
+        )
+
+        assert result.status is OrderStatus.FILLED
+        nested_call = api.get_order_by_id.call_args_list[1]
+        assert nested_call.args[0] == "entry-1"
+        assert nested_call.args[1].nested is True
+        assert api.replace_order_by_id.call_args.args[0] == "day-stop-1"
+
+    def test_promotion_failure_preserves_truthful_filled_result(self):
+        api = MagicMock()
+        api.submit_order.return_value = _alpaca_order(
+            id="entry-1",
+            status="accepted",
+            legs=[SimpleNamespace(id="day-stop-1", type="stop", side="sell")],
+        )
+        api.get_order_by_id.return_value = _alpaca_order(
+            id="entry-1",
+            status="filled",
+            filled_qty=10,
+            filled_avg_price=100.5,
+        )
+        api.replace_order_by_id.side_effect = RuntimeError("replace unavailable")
+        broker = _broker_with_mock(api)
+
+        result = broker.place_order(
+            _decision(qty=10, stop=95.0, entry_max_price=105.0),
+            poll_timeout=0.0,
+            poll_interval=0.0,
+        )
+
+        assert result.status is OrderStatus.FILLED
+        assert result.filled_qty == 10
+
+    def test_stream_confirmed_capped_fill_also_promotes_stop(self):
+        api = MagicMock()
+        stream = MagicMock()
+        stream_event = MagicMock()
+        stream_event.wait.return_value = True
+        stream.watch.return_value = stream_event
+        api.submit_order.return_value = _alpaca_order(
+            id="entry-1",
+            status="accepted",
+            legs=[SimpleNamespace(id="day-stop-1", type="stop", side="sell")],
+        )
+        stream.get_update.return_value = _stream_update(
+            order_id="entry-1",
+            event="fill",
+            filled_qty=10,
+            filled_avg_price=100.5,
+        )
+        api.replace_order_by_id.return_value = _alpaca_order(
+            id="gtc-stop-1",
+            status="accepted",
+            side="sell",
+            qty=10,
+            type="stop",
+            stop_price="95.0",
+            time_in_force="gtc",
+        )
+        broker = AlpacaBroker(
+            client=api,
+            max_attempts=1,
+            base_delay=0.0,
+            stream_manager=stream,
+        )
+
+        result = broker.place_order(
+            _decision(qty=10, stop=95.0, entry_max_price=105.0),
+            poll_timeout=0.1,
+            poll_interval=0.0,
+        )
+
+        assert result.status is OrderStatus.FILLED
+        assert api.replace_order_by_id.call_args.args[0] == "day-stop-1"
+        stream.unregister_stop_leg.assert_called_once_with("day-stop-1")
+        stream.register_stop_leg.assert_called_once_with("gtc-stop-1")
+
+    def test_partial_capped_fill_defers_promotion_to_reconciliation(self):
+        api = MagicMock()
+        api.submit_order.return_value = _alpaca_order(
+            id="entry-1",
+            status="accepted",
+            legs=[SimpleNamespace(id="day-stop-1", type="stop", side="sell")],
+        )
+        api.get_order_by_id.return_value = _alpaca_order(
+            id="entry-1",
+            status="partially_filled",
+            filled_qty=5,
+            filled_avg_price=100.5,
+        )
+        broker = _broker_with_mock(api)
+
+        result = broker.place_order(
+            _decision(qty=10, stop=95.0, entry_max_price=105.0),
+            poll_timeout=0.0,
+            poll_interval=0.0,
+        )
+
+        assert result.status is OrderStatus.PARTIAL
+        api.replace_order_by_id.assert_not_called()
+
+    def test_non_capped_entry_does_not_promote_gtc_oto_stop(self):
+        api = MagicMock()
+        api.submit_order.return_value = _alpaca_order(
+            id="entry-1",
+            status="accepted",
+            legs=[SimpleNamespace(id="stop-1", type="stop", side="sell")],
+        )
+        api.get_order_by_id.return_value = _alpaca_order(
+            id="entry-1",
+            status="filled",
+            filled_qty=10,
+            filled_avg_price=100.5,
+        )
+        broker = _broker_with_mock(api)
+
+        broker.place_order(
+            _decision(qty=10, stop=95.0),
+            poll_timeout=0.0,
+            poll_interval=0.0,
+        )
+
+        api.replace_order_by_id.assert_not_called()
 
     def test_fractional_market_with_cap_is_floored_then_capped(self):
         """

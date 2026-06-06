@@ -74,6 +74,7 @@ with warnings.catch_warnings():
         TimeInForce,
     )
     from alpaca.trading.requests import (
+        GetOrderByIdRequest,
         GetOrdersRequest,
         LimitOrderRequest,
         MarketOrderRequest,
@@ -999,6 +1000,9 @@ class AlpacaBroker:
             )
 
         order_id = str(order.id)
+        capped_stop_leg_id = None
+        if decision.entry_max_price is not None:
+            capped_stop_leg_id = self._find_stop_leg_id(order)
 
         # Bind the real Alpaca order ID back to the pre-submit watch so either
         # identifier can resolve the same terminal update.
@@ -1029,6 +1033,24 @@ class AlpacaBroker:
                 requested_qty=decision.qty,
                 error=e,
             )
+        if (
+            decision.entry_max_price is not None
+            and result.status is OrderStatus.FILLED
+        ):
+            try:
+                self.promote_equity_stop_to_gtc(
+                    parent_order_id=order_id,
+                    stop_order_id=capped_stop_leg_id,
+                    qty=result.filled_qty,
+                    stop_price=decision.stop_price,
+                )
+            except Exception as exc:
+                # The entry is already filled. Preserve the truthful fill result
+                # and let engine reconciliation retry promotion immediately.
+                logger.error(
+                    f"{decision.symbol}: capped entry filled but attached stop "
+                    f"GTC promotion failed: {exc}"
+                )
         # Lifecycle: best-effort fill transition. Returns the result
         # with position_uid attached so the engine can pass it to
         # TradeLogger.log().
@@ -1634,6 +1656,64 @@ class AlpacaBroker:
         self._register_standalone_stop_leg(order)
         return self._to_open_order(order)
 
+    def promote_equity_stop_to_gtc(
+        self,
+        *,
+        parent_order_id: str | None,
+        stop_order_id: str | None,
+        qty: float,
+        stop_price: float,
+        client_order_id_prefix: str = "equity-stop-gtc",
+    ) -> OpenOrder:
+        """Promote an activated equity OTO child stop to durable GTC."""
+        whole_qty = int(qty)
+        if whole_qty < 1 or abs(float(qty) - whole_qty) > 1e-9:
+            raise BrokerError(
+                f"equity stop promotion requires positive whole-share qty: {qty}"
+            )
+        if stop_price <= 0:
+            raise BrokerError(
+                f"equity stop promotion requires positive stop price: {stop_price}"
+            )
+        resolved_stop_id = stop_order_id
+        if resolved_stop_id is None:
+            if not parent_order_id:
+                raise BrokerError(
+                    "equity stop promotion requires parent or child order id"
+                )
+            parent = self._with_retry(
+                lambda: self._api.get_order_by_id(
+                    parent_order_id,
+                    GetOrderByIdRequest(nested=True),
+                ),
+                op_desc=f"get_nested_order({parent_order_id})",
+            )
+            resolved_stop_id = self._find_stop_leg_id(parent)
+        if resolved_stop_id is None:
+            raise BrokerError(
+                f"no attached stop leg found for parent order {parent_order_id}"
+            )
+
+        client_order_id = f"{client_order_id_prefix}-{uuid.uuid4().hex[:10]}"
+        request = ReplaceOrderRequest(
+            qty=whole_qty,
+            time_in_force=TimeInForce.GTC,
+            stop_price=round(stop_price, 2),
+            client_order_id=client_order_id,
+        )
+        logger.warning(
+            f"promoting equity stop {resolved_stop_id} to GTC: "
+            f"sell {whole_qty} @ ${stop_price:.2f}"
+        )
+        replacement = self._with_retry(
+            lambda: self._api.replace_order_by_id(resolved_stop_id, request),
+            op_desc=f"promote_equity_stop_to_gtc({resolved_stop_id})",
+        )
+        if self._stream_manager is not None:
+            self._stream_manager.unregister_stop_leg(resolved_stop_id)
+        self._register_standalone_stop_leg(replacement)
+        return self._to_open_order(replacement)
+
     def submit_option_gtc_stop(
         self,
         *,
@@ -1914,6 +1994,27 @@ class AlpacaBroker:
         if order_id is None:
             return
         self._stream_manager.register_stop_leg(str(order_id))
+
+    @staticmethod
+    def _find_stop_leg_id(order) -> str | None:
+        """Return the SELL stop child id from a nested OTO/bracket order."""
+        for leg in getattr(order, "legs", None) or []:
+            leg_id = getattr(leg, "id", None)
+            leg_type = getattr(leg, "type", None)
+            leg_type_val = (
+                leg_type.value if hasattr(leg_type, "value") else str(leg_type)
+                if leg_type is not None else None
+            )
+            leg_side = getattr(leg, "side", None)
+            leg_side_val = (
+                leg_side.value if hasattr(leg_side, "value") else str(leg_side)
+                if leg_side is not None else None
+            )
+            if leg_id is not None and leg_type_val in {"stop", "stop_limit"} and (
+                leg_side_val in {None, "sell"}
+            ):
+                return str(leg_id)
+        return None
 
     def _stream_lookup_order_by_id(self, order_id: str):
         """Read-only lookup hook used by StreamManager gap recovery."""
