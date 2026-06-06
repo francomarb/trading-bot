@@ -20,9 +20,14 @@ This document catalogues every strategy in the bot, its signal logic, edge filte
 
 Five strategy sleeves are running simultaneously in paper trading: SMA, RSI, Donchian, SPY Options, and Credit Spread. They share a single `RiskManager`; the `SleeveAllocator` splits deployable capital into an equity pool and an isolated-options pool.
 
+> **Live configuration lives in the per-strategy deployment guides linked under each section below.** This catalog summarises signal logic, edge filters, and sleeve mechanics; it may lag the dedicated guides on day-to-day parameter changes (watchlist composition, sleeve weights, etc.). When in doubt, treat the deployment guide as the source of truth.
+
 ---
 
 ### SMA Crossover
+
+> 📘 **Deployment guide:** [`sma_crossover_strategy.md`](sma_crossover_strategy.md) — full spec, signal logic, filter stack, methodology.
+> 🔬 **Optimization notes:** [`sma_crossover_optimizations.md`](sma_crossover_optimizations.md) — audit findings and ranked optimization opportunities.
 
 | Field | Value |
 |---|---|
@@ -98,6 +103,8 @@ SMA crossover is the simplest trend-following signal. It captures sustained dire
 ---
 
 ### RSI Mean Reversion
+
+> 📘 **Deployment guide:** [`rsi_reversion_strategy.md`](rsi_reversion_strategy.md) — full spec, signal logic, filter stack, methodology.
 
 | Field | Value |
 |---|---|
@@ -181,6 +188,8 @@ RSI mean reversion profits when prices snap back from extremes. It performs well
 
 ### Donchian Breakout
 
+> 📘 **Deployment guide:** [`donchian_breakout_strategy.md`](donchian_breakout_strategy.md) — full spec, watchlist methodology, activation gate, backtest results.
+
 | Field | Value |
 |---|---|
 | File | `strategies/donchian_breakout.py` |
@@ -259,6 +268,8 @@ Donchian breakout is a pure trend-continuation system (Turtle Trading, System 1)
 ---
 
 ### SPY Options RSI Reversion
+
+> 📘 **Deployment guide:** [`spy_options_reversion_strategy.md`](spy_options_reversion_strategy.md) — full spec, parameter grid, backtest results, methodology.
 
 | Field | Value |
 |---|---|
@@ -359,6 +370,8 @@ The equity strategies are all long-biased and rely on sustained price trends. SP
 ---
 
 ### Credit Spread
+
+> 📘 **Deployment guide:** [`credit_spread_strategy.md`](credit_spread_strategy.md) — live deployment config at the top; original design proposal preserved below as research/rationale record.
 
 | Field | Value |
 |---|---|
@@ -553,6 +566,8 @@ Elastic borrowing is equity-only: idle equity capital may be borrowed up to 115%
 ## Parked Strategy
 
 **BollingerSqueeze** (`strategies/bollinger_squeeze.py`) is implemented but not wired into `forward_test.py`. Backtest: Sharpe +0.22 on Sector ETFs. Parked because ~50% of its practitioner edge requires options, discretionary overlays, or multi-timeframe capabilities the bot does not currently have. Revisit if those capabilities are added.
+
+Research-style doc: [`bollinger_squeeze_universe_research.md`](bollinger_squeeze_universe_research.md). If/when activated, it should get a deployment guide matching the SMA / RSI / Donchian / SPY Options pattern.
 
 ---
 
