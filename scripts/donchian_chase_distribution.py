@@ -105,6 +105,8 @@ def main() -> int:
     args = ap.parse_args()
     configure_logging(args.verbose)
 
+    from config import settings
+    backtest_feed = settings.BACKTEST_DATA_FEED
     symbols = UNIVERSES[args.universe]
     end = datetime.now(timezone.utc) - timedelta(minutes=60)
     start = end - timedelta(days=int(365 * args.years) + 60)
@@ -112,7 +114,7 @@ def main() -> int:
     all_rows = []
     for sym in symbols:
         try:
-            df, _ = fetch_symbol(sym, start, end, "1Day")
+            df, _ = fetch_symbol(sym, start, end, "1Day", feed=backtest_feed)
         except Exception as exc:  # noqa: BLE001
             logger.warning(f"{sym}: fetch failed — {exc}")
             continue

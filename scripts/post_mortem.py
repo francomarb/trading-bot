@@ -67,9 +67,20 @@ def analyze_trades(days: int):
         # Engine needs 200 days for SMA200, so fetch 300 calendar days prior
         start_fetch = ts - timedelta(days=300)
         end_fetch = ts
-        
+
+        # Execution replay must use the SAME feed the live bot saw at decision
+        # time. The bot reads ALPACA_DATA_FEED (default "iex" on paper); using
+        # SIP here would compare apples to oranges since the bot evaluated IEX
+        # volume against the synthetic 20× scaling. Pass feed explicitly so
+        # this carve-out is visible in code, not just convention.
+        from config.settings import ALPACA_DATA_FEED
+        replay_feed = ALPACA_DATA_FEED
+
         try:
-            df, _ = fetch_symbol(sym, start_fetch, end_fetch, "1Day", use_cache=True)
+            df, _ = fetch_symbol(
+                sym, start_fetch, end_fetch, "1Day",
+                feed=replay_feed, use_cache=True,
+            )
             if df.empty:
                 continue
                 
@@ -95,7 +106,10 @@ def analyze_trades(days: int):
             # Calculate SPY 20-day Relative Strength
             rs_spy_20 = float("nan")
             try:
-                spy_df, _ = fetch_symbol("SPY", start_fetch, end_fetch, "1Day", use_cache=True)
+                spy_df, _ = fetch_symbol(
+                    "SPY", start_fetch, end_fetch, "1Day",
+                    feed=replay_feed, use_cache=True,
+                )
                 spy_df = spy_df[spy_df.index < ts].copy()
                 if len(spy_df) >= 20 and len(df) >= 20:
                     spy_ret = (spy_df["close"].iloc[-1] - spy_df["close"].iloc[-20]) / spy_df["close"].iloc[-20]
@@ -109,7 +123,10 @@ def analyze_trades(days: int):
             sector_etf = SECTOR_MAP.get(sym)
             if sector_etf:
                 try:
-                    sec_df, _ = fetch_symbol(sector_etf, start_fetch, end_fetch, "1Day", use_cache=True)
+                    sec_df, _ = fetch_symbol(
+                        sector_etf, start_fetch, end_fetch, "1Day",
+                        feed=replay_feed, use_cache=True,
+                    )
                     sec_df = sec_df[sec_df.index < ts].copy()
                     if len(sec_df) >= 20 and len(df) >= 20:
                         sec_ret = (sec_df["close"].iloc[-1] - sec_df["close"].iloc[-20]) / sec_df["close"].iloc[-20]

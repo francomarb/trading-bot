@@ -257,10 +257,12 @@ def _fetch_bars(
 ) -> dict[str, pd.DataFrame]:
     """Cache-backed daily-bar fetch for a watchlist. Skips symbols with
     fetch failures or insufficient bars."""
+    from config import settings
+    backtest_feed = settings.BACKTEST_DATA_FEED
     bars: dict[str, pd.DataFrame] = {}
     for sym in symbols:
         try:
-            df, _ = fetch_symbol(sym, start, end, timeframe)
+            df, _ = fetch_symbol(sym, start, end, timeframe, feed=backtest_feed)
         except Exception as exc:  # noqa: BLE001
             logger.warning(f"{sym}: fetch failed — {exc}")
             continue

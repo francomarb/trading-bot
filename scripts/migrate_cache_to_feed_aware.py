@@ -21,7 +21,10 @@ per-batch what to do:
     --confirm-assumed-feed``. You'll be required to acknowledge the
     unverifiable claim. Files move into ``iex/`` and the fetcher reads them
     as IEX going forward (with the 20× synthetic-SIP volume scaling applied
-    at read time).
+    at read time). **This works at any later point** — the script scans
+    both top-level legacy files AND already-quarantined files when
+    ``--assume-feed`` is provided, so you can quarantine first, decide
+    later, and promote the quarantine in a second run.
   - **Not sure / cache may be mixed?** Leave files in
     ``legacy_unknown_feed/`` and let the fetcher repopulate from the API as
     each symbol is touched. The next live-bot cycle that needs MSFT will
@@ -130,6 +133,7 @@ def main() -> int:
         )
 
     cache_dir = fetcher.CACHE_DIR
+    quarantine_dir = cache_dir / _QUARANTINE_SUBDIR
     logger.info(f"cache root: {cache_dir}")
     logger.info(f"destination: {dest_dir}")
 
@@ -137,19 +141,42 @@ def main() -> int:
         logger.warning(f"cache dir does not exist: {cache_dir}")
         return 0
 
-    # Discover legacy top-level files. Anything inside an existing subdir
-    # has already been migrated (or was never legacy).
-    legacy_parquets = [p for p in cache_dir.glob("*.parquet") if p.is_file()]
-    legacy_metas = [p for p in cache_dir.glob("*.meta.json") if p.is_file()]
+    # Discover sources to migrate. The two-source design supports the
+    # documented "quarantine first, decide later" workflow:
+    #
+    #   1. First run: no --assume-feed → top-level legacy files move to
+    #      legacy_unknown_feed/. (Default mode; safe.)
+    #   2. Later, once operator is confident: --assume-feed=iex
+    #      --confirm-assumed-feed → both top-level legacy AND already-
+    #      quarantined files get promoted into iex/.
+    #
+    # In default mode we only scan the top level. With explicit
+    # --assume-feed, we additionally scan the quarantine subdir — promoting
+    # already-quarantined files into the named feed subdir. This makes the
+    # documented recovery path actually work (reviewer P2).
+    sources: list[Path] = []
+    sources += [p for p in cache_dir.glob("*.parquet") if p.is_file()]
+    sources += [p for p in cache_dir.glob("*.meta.json") if p.is_file()]
+    promoting_from_quarantine = (
+        args.assume_feed is not None and quarantine_dir.exists()
+    )
+    if promoting_from_quarantine:
+        sources += [p for p in quarantine_dir.glob("*.parquet") if p.is_file()]
+        sources += [p for p in quarantine_dir.glob("*.meta.json") if p.is_file()]
+
+    legacy_parquets = [p for p in sources if p.suffix == ".parquet"]
+    legacy_metas = [p for p in sources if p.name.endswith(".meta.json")]
     legacy_total = len(legacy_parquets) + len(legacy_metas)
 
     if legacy_total == 0:
-        logger.info("no legacy top-level cache files found — nothing to migrate")
+        logger.info("no legacy cache files found — nothing to migrate")
         return 0
 
+    quarantine_count = sum(1 for p in sources if p.parent == quarantine_dir)
+    top_level_count = legacy_total - quarantine_count
     logger.info(
-        f"found {len(legacy_parquets)} parquet + {len(legacy_metas)} meta = "
-        f"{legacy_total} legacy file(s) to migrate"
+        f"found {top_level_count} top-level + {quarantine_count} quarantined "
+        f"= {legacy_total} legacy file(s) to migrate"
     )
 
     if not args.dry_run:

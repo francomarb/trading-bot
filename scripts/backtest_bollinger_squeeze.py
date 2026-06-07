@@ -88,10 +88,12 @@ def fetch_bars(
         end = end.replace(tzinfo=timezone.utc)
     start = end - timedelta(days=int(365 * years) + 30)
 
+    from config import settings
+    backtest_feed = settings.BACKTEST_DATA_FEED
     out: dict[str, pd.DataFrame] = {}
     for symbol in symbols:
         try:
-            df, stats = fetch_symbol(symbol, start, end, "1Day")
+            df, stats = fetch_symbol(symbol, start, end, "1Day", feed=backtest_feed)
         except Exception as exc:  # noqa: BLE001
             logger.warning(f"{symbol}: fetch failed — {exc}")
             continue

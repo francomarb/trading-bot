@@ -307,8 +307,18 @@ class Reconciler:
             start_dt = datetime.fromisoformat(self.start_date + "T00:00:00+00:00")
             # Need lookback for indicators to warm up.
             fetch_start = start_dt - timedelta(days=self._lookback)
+            # Reconciliation is execution replay — it MUST use the same feed
+            # the live bot actually saw at decision time (ALPACA_DATA_FEED,
+            # default "iex" on paper). Using SIP here would compare apples to
+            # oranges: the bot's filter thresholds were evaluated against IEX
+            # volume with the synthetic 20× scaling, so replay numbers must
+            # come from the same source. Pass feed explicitly so this carve-out
+            # is enforced in code, not just convention. See CLAUDE.md +
+            # AGENTS.md "Execution replay" section.
+            from config.settings import ALPACA_DATA_FEED
             df, _ = fetch_symbol(
-                symbol, fetch_start, end_dt, timeframe=self._timeframe
+                symbol, fetch_start, end_dt, timeframe=self._timeframe,
+                feed=ALPACA_DATA_FEED,
             )
             if df.empty:
                 logger.warning(f"reconcile: no bars for {symbol}")
