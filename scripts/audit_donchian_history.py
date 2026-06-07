@@ -3,9 +3,13 @@
 One-shot audit: how far back does each ai_bigtech symbol have data, and which
 regime years can it actually participate in?
 
-Side-effect: backfills the project's parquet cache by requesting
-2021-01-01 -> now for every symbol. The fetcher only hits the API for
-missing ranges, so this is idempotent on a warm cache.
+Side-effect: backfills the project's parquet cache by requesting bars from
+2018-11-01 -> now for every symbol plus SPY (regime context). The fetcher
+only hits the API for missing ranges, so this is idempotent on a warm cache.
+The deep start lets the API return whatever each symbol actually has — SPY
+back to 2018-11-01, individual mega-caps to 2020-07-27 on IEX, with per-symbol
+variation. (Switching the underlying feed to SIP unlocks bars back to
+2016-01-04 for most names; see PR #50 and the feed-aware cache layout.)
 
 Output: a markdown table to stdout AND to
 logs/backtests/<timestamp>_donchian_history_audit.md.

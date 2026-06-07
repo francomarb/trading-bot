@@ -139,20 +139,48 @@ EOD), no-look-ahead invariants, identical-sizing assertion, and the new
 
 Audit script: [scripts/audit_donchian_history.py](../scripts/audit_donchian_history.py).
 
-**Hard constraint** (corrected post-merge from initial PR write-up):
-Alpaca IEX paper-feed depth varies **per symbol**. SPY itself goes back to
-2018-11-01, but coverage for individual `ai_bigtech` mega-caps (NVDA, AAPL,
-MSFT, AMZN, META, GOOGL, AMD, AVGO, ANET, MRVL, MU, QCOM, ORCL, TSLA, TSM,
-SMCI, CRWD, NOW, ASML, CLS, CIEN, VST, BE, PWR, VRT) begins **2020-07-27**.
-Later-listed names (PLTR, IONQ, QBTS, RGTI, IREN, CEG, ARM) start at their
-listing dates. So 2018 / 2019 / early 2020 windows are not reachable for a
-stock-level stop comparison on this universe — running on SPY alone wouldn't
-answer the same question. The earliest meaningful comparison window starts
-at 2021-04-01, where indicators have had ~5 months of warmup on most stocks
-and SMA200 is comfortably populated by the window boundary. Going pre-2020
-would need a deeper-history vendor (Polygon, yfinance, paid Alpaca extended
-history) — not a SIP subscription, because the IEX/SIP axis isn't the binding
-constraint here; the per-symbol coverage start date is.
+**Coverage constraint — IEX, partially corrected post-merge** (and now
+acknowledged to be partially **wrong** about SIP):
+
+The Alpaca IEX paper-feed coverage for individual `ai_bigtech` mega-caps
+begins **2020-07-27** (SPY itself goes back to 2018-11-01). Later-listed
+names start at their listing dates. So on IEX, 2018 / 2019 / early 2020
+windows are not reachable for a stock-level stop comparison.
+
+**Reviewer correction (PR #49 round-3 audit, 2026-06-07)**: the original
+PR claim that "pre-2020 evidence would need Polygon, yfinance, or paid
+Alpaca extended history" was **wrong**. Alpaca's basic-tier **delayed
+SIP feed** (free, 15-min delay — fine for backtests) returns AAPL /
+MSFT / NVDA daily bars from **2016-01-04**, verified empirically
+post-review. The 2018 Q4 vol shock and 2020 COVID crash — the exact
+regimes the PLAN concern originally cited — **are reachable** on SIP
+via the basic tier. The IEX-only investigation simply tested the
+wrong window because it inherited an IEX-by-default cache.
+
+**This investigation as it stands** therefore tests 2021-04-01 →
+2024-12-31, which covers chop / bear / rally but **not** the
+catastrophic-gap regimes that motivated the question. The "park the
+change" recommendation applies to the IEX-reachable window; it cannot
+honestly close the question for pre-2021 regimes without running on
+SIP. PR #50 (feed-aware cache + SIP-default backtest infrastructure)
+is the blocking dependency; once it lands, this investigation should be
+re-run on the same universe with `feed="sip"` and a 2016-01-01 →
+2024-12-31 window to test the trail variants against the gap-down
+regimes the question is actually about.
+
+**Additionally — SMA200 gap on the 2021 window** (reviewer P2,
+2026-06-07): April 1, 2021 is only 172 trading days after most
+stocks' first IEX bar at 2020-07-27. `DonchianEdgeFilter` rule 1
+(stock > 200 SMA) needs 200 bars for SMA200 to be computable; before
+that the filter fails open. Mature mega-caps' first valid SMA200 is
+~May 11, 2021. So for the first ~5 weeks of the 2021 window the filter
+allowed entries that production would have evaluated against a real
+SMA200. The same biased entries fed all three stop variants, so the
+A/B comparison between them is preserved — but the absolute 2021
+numbers (51 trades) over-state what production would actually have
+traded in that sub-window. This is another reason the SIP re-test
+matters: SIP gives 4.5+ years of pre-2021 history per symbol, so
+SMA200 is populated comfortably before any 2021 boundary.
 
 Symbol participation within the reachable range:
 
@@ -275,22 +303,33 @@ aggregate edge because:
 
 ## 7. Recommendation and re-open conditions
 
-**Recommendation: keep the static `entry − 2×ATR` broker stop.** With
-production-realistic gates applied, the variants are within noise of each
-other on the reachable 3.75 years. Neither trail variant clears the bar.
+**Conditional recommendation: keep the static `entry − 2×ATR` broker stop
+on the IEX-reachable window.** With production-realistic gates applied,
+the variants are within noise of each other across 2021-2024. Neither
+trail variant clears the bar on chop, bear, or rally regimes.
 
-Re-open only with one of:
+**This is not a full closure.** The 2018 Q4 vol shock and 2020 COVID
+crash were the original motivation for the PLAN concern and **were not
+tested** in this round. SIP makes them reachable (verified post-review,
+2026-06-07); PR #50 makes SIP the backtest default. Once that lands, the
+SIP re-test is the blocking step before this question can move to fully
+closed.
 
-- **Deeper-history pre-2020 evidence** — re-run the simulator across 2018 vol
-  shock and 2020 COVID crash regimes. The script is ready; the data isn't on
-  the Alpaca IEX paper feed (individual stocks start 2020-07-27) and would
-  need a different vendor (Polygon, yfinance, paid Alpaca extended history).
-  Those are the regimes most likely to produce the catastrophic gap-through
-  the static stop is bad at.
+Re-open / next-step paths:
+
+- **SIP re-test (planned, post-PR #50)** — re-run the simulator on the
+  same `ai_bigtech` universe with `feed="sip"` and a 2016-01-01 →
+  2024-12-31 window. The SIP feed provides individual-stock coverage
+  back to 2016-01-04 for most mega-caps (verified). If the trail
+  variants still wash on 2018 Q4 and March 2020 catastrophic-gap
+  regimes, the closure is complete and the recommendation upgrades to
+  unconditional. If chandelier or Donchian-low trail materially
+  outperforms static on those specific regimes, that's the evidence
+  the PLAN concern was asking for.
 - **Live giveback event** — if real paper or live trading produces a
-  documented case where the static stop visibly surrendered material P&L on
-  a gap-down through a then-vestigial level, that single case study can
-  override the aggregate evidence.
+  documented case where the static stop visibly surrendered material P&L
+  on a gap-down through a then-vestigial level, that single case study
+  can override the aggregate evidence regardless of regime testing.
 
 ## 8. Reproducing the work
 

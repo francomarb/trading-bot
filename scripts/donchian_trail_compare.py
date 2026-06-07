@@ -74,9 +74,14 @@ WINDOWS: list[RegimeWindow] = [
         start="2021-04-01",
         end="2021-12-31",
         description="2021 melt-up Q2-Q4 — quiet uptrend, tests trail whipsaw cost. "
-                    "Window starts April so the 200-SMA filter has time to "
-                    "populate (individual ai_bigtech stocks' first available "
-                    "bar on the Alpaca IEX paper feed is 2020-07-27).",
+                    "⚠ SMA200 LIMITATION on IEX: stocks' first IEX bar is "
+                    "2020-07-27 → April 1, 2021 has only 172 prior bars → "
+                    "SMA200 isn't populated until ~May 11, 2021. The "
+                    "DonchianEdgeFilter rule 1 fails open for ~5 weeks of this "
+                    "window. Same biased entries fed all 3 stop variants so "
+                    "the A/B comparison is preserved, but absolute 2021 numbers "
+                    "over-state production. SIP re-test (PR #50 follow-up) "
+                    "removes this gap (4.5y+ pre-window history per symbol).",
     ),
     RegimeWindow(
         name="2022_bear",
