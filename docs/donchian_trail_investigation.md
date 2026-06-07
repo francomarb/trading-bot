@@ -1,6 +1,9 @@
-# Donchian trailing broker stop — investigation (2026-06-06 / updated 2026-06-07 R2)
+# Donchian trailing broker stop — investigation (2026-06-06 / updated 2026-06-07 R3)
 
-> **Status:** Investigated and closed. Listed under `PLAN.md` → *Deferred Or Parked Ideas*.
+> **Status:** Investigated; **parked pending SIP re-test** on Q4 2018 / Q1 2020 regimes.
+> The retest is tracked as an active **P2** item in `PLAN.md` → *Active Work Queue
+> § P2*, with explicit acceptance criteria. The historical "Parked Ideas" row
+> captures the IEX-only investigation results; it does NOT track the retest.
 > **TL;DR:** On the ai_bigtech universe with **production-realistic entry
 > gating** (SPY TRENDING regime + DonchianEdgeFilter) over 2021-04-01 →
 > 2024-12-31, replacing the static `entry − 2×ATR` broker stop with either a
@@ -8,9 +11,31 @@
 > risk-adjusted returns. Differences vs static are within noise. The static
 > stop's known weakness (gap-down past the rising 15-day-low) is real but
 > rare, and the strategy's own daily-close signal exit already handles most
-> trend failures one bar later.
+> trend failures one bar later. **What's not closed**: the 2018 Q4 vol shock
+> and 2020 COVID crash regimes that originally motivated the PLAN concern
+> were not testable on IEX (individual-stock coverage begins 2020-07-27) but
+> ARE reachable on basic-tier delayed SIP (AAPL/MSFT/NVDA back to 2016-01-04,
+> verified). The SIP retest is the blocking step before this can move to
+> full closure.
 
 ## Revision history
+
+- **2026-06-07 (R3) — addressed PR #49 third-round audit.** Three more fixes:
+  1. **SIP-will-not-help premise was wrong**: empirically AAPL/MSFT/NVDA SIP
+     daily bars go back to 2016-01-04 on Alpaca's basic delayed tier.
+     The 2018 Q4 vol shock and 2020 COVID crash that originally motivated the
+     PLAN concern are reachable on SIP — not on IEX, but on SIP. PR #50
+     establishes the SIP backtest infrastructure; the actual SIP retest is
+     now tracked as an active P2 roadmap item, not a Parked Ideas footnote.
+  2. **SMA200 wasn't populated at 2021-04-01**: stocks' first IEX bar is
+     2020-07-27, so April 1, 2021 has only 172 prior bars. SMA200 needs 200
+     bars and isn't populated until ~May 11, 2021. The `DonchianEdgeFilter`
+     rule 1 fails open for ~5 weeks of the 2021 window. Same biased entries
+     fed all three stop variants so the A/B is preserved, but absolute 2021
+     numbers (51 trades) over-state production behavior. Documented in §4
+     and reflected in the participation table.
+  3. **Audit-script docstring sync**: said "fetches from 2021-01-01" while
+     the implementation has been at 2018-11-01 for a while. Trivial.
 
 - **2026-06-07 (R2) — addressed PR #49 follow-up audit.** Three additional
   fixes landed on top of R1:
@@ -186,7 +211,7 @@ Symbol participation within the reachable range:
 
 | Window | Symbols traded / 32 | Notes |
 |---|---:|---|
-| 2021 melt-up (Q2-Q4) | 28 | Window starts 2021-04-01 to give the 200-SMA filter time to populate from stocks' actual first bar (2020-07-27). IREN, CEG, ARM excluded (later listings); RGTI is borderline. |
+| 2021 melt-up (Q2-Q4) | 28 | Window starts 2021-04-01. ⚠ SMA200 is **not** populated at the window boundary — stocks have only 172 prior bars (first IEX bar 2020-07-27), SMA200 needs 200 → first valid SMA200 ~May 11, 2021. `DonchianEdgeFilter` rule 1 fails open for ~5 weeks of the window. Absolute 2021 numbers (51 trades) over-state production. IREN, CEG, ARM excluded (later listings); RGTI is borderline. SIP retest removes this gap (4.5y+ pre-window history per symbol). |
 | 2022 bear | 29 | IREN, CEG, ARM excluded |
 | 2023 rally | 31 | ARM only excluded (Sep 2023 IPO) |
 | 2024 rally | 32 | All names trade |
