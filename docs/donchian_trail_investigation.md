@@ -343,14 +343,35 @@ closed.
 Re-open / next-step paths:
 
 - **SIP re-test (planned, post-PR #50)** — re-run the simulator on the
-  same `ai_bigtech` universe with `feed="sip"` and a 2016-01-01 →
-  2024-12-31 window. The SIP feed provides individual-stock coverage
-  back to 2016-01-04 for most mega-caps (verified). If the trail
-  variants still wash on 2018 Q4 and March 2020 catastrophic-gap
-  regimes, the closure is complete and the recommendation upgrades to
-  unconditional. If chandelier or Donchian-low trail materially
-  outperforms static on those specific regimes, that's the evidence
-  the PLAN concern was asking for.
+  same `ai_bigtech` universe with `feed="sip"`. **Critical window
+  design**: `run_window()` passes `window.start` as `trade_start` to
+  `simulate_symbol`, which blocks entries before that boundary. The
+  catastrophic-gap test is specifically about positions opened during
+  the prior trend and then carried into the crash, so the window's
+  entry boundary must begin BEFORE the crash. Use:
+    - `2018_q4_vol_shock`: **2018-07-01 → 2018-12-31** (entries from
+      July; crash days Oct 3 - Dec 24). A 2018-10-01 boundary would
+      have excluded every pre-crash entry — which IS the case the
+      PLAN concern is about.
+    - `2020_covid_crash`: **2019-09-01 → 2020-05-31** (entries from
+      Sep 2019; crash days Feb 20 - Mar 23, 2020).
+  Plus the existing four windows + a combined 2016-2024 run.
+
+  **Minimum sample requirements** (mandatory before any closure
+  verdict): each of the two new sub-windows must have ≥ 25 total
+  trades AND ≥ 10 trades open during the named crash days. If either
+  floor isn't met, document the gap and **abstain** from closure —
+  "no difference observed on 5 trades" is sample noise, not evidence.
+
+  **Closure thresholds** (apply only after minimum samples met): if
+  all three variants stay within 0.3 pp mean return / 0.05 Sharpe /
+  1.0 pp MaxDD on each of the two new sub-windows AND there's no
+  meaningful divergence in the per-variant R-distribution on the
+  crash-exposed trade subset, the closure is complete. If chandelier
+  or Donchian-low trail materially outperforms static on either
+  catastrophic-gap regime — particularly on the crash-exposed trade
+  subset — that's the evidence the PLAN concern was asking for, and
+  the change gets a 4-6 week paper A/B before live promotion.
 - **Live giveback event** — if real paper or live trading produces a
   documented case where the static stop visibly surrendered material P&L
   on a gap-down through a then-vestigial level, that single case study
