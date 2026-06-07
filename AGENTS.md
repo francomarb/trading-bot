@@ -179,7 +179,32 @@ python scripts/legacy_verify/phase9_verify.py
 
 - Paper trading base URL: `https://paper-api.alpaca.markets`
 - Live trading base URL: `https://api.alpaca.markets`
-- Data API (market data): use `feed="iex"` on a paper account (SIP requires paid subscription).
+- Data API (market data) — feed strategy:
+  - **SIP subscription tiers**: real-time SIP requires the paid Algo Trader Plus
+    subscription (~$99/mo). **Delayed SIP** (bars ≥15 minutes old) is available on
+    the basic, no-cost tier — perfect for any offline work.
+  - **Live engine, paper account**: `feed="iex"` (free real-time bars on basic
+    tier). Default in `ALPACA_DATA_FEED` env var.
+  - **Live engine, live account**: `feed="sip"` real-time (needs the paid
+    subscription).
+  - **Backtests, audits, calibration, watchlist scanners — any offline work**:
+    `feed="sip"` using the free delayed tier. `data/fetcher.py` enforces the
+    15-minute end-clamp automatically. Scripts should read from
+    `BACKTEST_DATA_FEED` in `config/settings.py` (default `"sip"`).
+  - **Why offline ≠ live feed**: SIP is the consolidated tape (all venues), so
+    volume and liquidity-floor thresholds are interpretable in plain English.
+    IEX is one venue (~2-3% of consolidated volume); `utils.market.apply_synthetic_sip_volume`
+    multiplies daily IEX volume by 20× as an approximation. Acceptable for the
+    live engine on paper (no choice); not acceptable for offline analysis.
+  - **Cache layout**: bars are stored at
+    `data/historical/{feed}/{symbol}_{timeframe}_{adjustment}.parquet`.
+    Pre-feed-aware layout (top-level files) is read as IEX via a fallback path.
+    Run `scripts/migrate_cache_to_feed_aware.py` once to move legacy files into
+    `data/historical/iex/`.
+  - **Per-symbol SIP coverage** (verified 2026-06-07): SPY and major ETFs ~2016-01-04;
+    most mega-cap stocks ~2016-01-04; mid-caps 2017-2019; recent IPOs / de-SPACs at
+    listing date. IEX coverage is ~4.5 years shallower for most names. Always probe
+    per symbol with a wide range before generalizing.
 - Use `alpaca-py` (official SDK) — this project has migrated from the deprecated `alpaca-trade-api`. Do not use `alpaca-trade-api`.
 - For any broker-facing behavior, treat **Alpaca's SDK/docs as the first source of truth** — not just for orders/fills/stops, but overall. Before inventing a home-grown fix or local abstraction around execution, positions, order lifecycle, market clock/session state, streams, reconnects, reconciliation, or account behavior, **first check Alpaca's SDK/docs for the supported path, constraints, and recommended recovery model**. Prefer broker-native or SDK-recommended solutions whenever Alpaca already defines the behavior. If a custom workaround is still needed, document why the SDK/docs path was insufficient.
 - Orders: support market, limit, and stop-limit types.
