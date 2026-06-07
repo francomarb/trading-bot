@@ -316,6 +316,87 @@ class TestSimulatorBehavior:
 # ── Aggregation ─────────────────────────────────────────────────────────────
 
 
+class TestTradeStartAndEntryMask:
+    """
+    Guards against the warmup-leak bug reviewers flagged: production-realistic
+    backtests need indicators warmed up on bars before window.start, but no
+    entry should fill on those bars and no warmup bar should pollute the
+    window's equity-curve metrics.
+    """
+
+    def test_trade_start_blocks_pre_window_entries(self) -> None:
+        # Build a frame where the warmup region triggers an entry too. Without
+        # trade_start that entry counts in the trade list and skews returns.
+        df = _build_synthetic_breakout(n_warmup=50, n_trend=20)
+        # Choose trade_start AFTER the breakout would have occurred so the
+        # gated run records zero trades — proves the gate works.
+        trade_start = df.index[60]  # 10 bars into the trend
+        result_ungated = simulate_symbol(
+            "T", df, StaticATRStop(k=2.0), slippage_bps=0.0,
+        )
+        result_gated = simulate_symbol(
+            "T", df, StaticATRStop(k=2.0), slippage_bps=0.0,
+            trade_start=trade_start,
+        )
+        # Ungated had at least one trade (the breakout near bar 50).
+        assert result_ungated.trade_count >= 1
+        # Gated: every trade's entry_date >= trade_start.
+        for t in result_gated.trades:
+            assert t.entry_date >= trade_start
+
+    def test_warmup_excluded_from_metrics(self) -> None:
+        # equity_curve is sliced to in-window; total_return is computed off
+        # the in-window starting cash, not the pre-warmup starting cash.
+        df = _build_synthetic_breakout(n_warmup=50, n_trend=20)
+        trade_start = df.index[55]
+        result = simulate_symbol(
+            "T", df, StaticATRStop(k=2.0), slippage_bps=0.0,
+            trade_start=trade_start,
+        )
+        assert result.equity_curve.index[0] >= trade_start
+        # bars now reflects in-window bar count, not the full frame.
+        assert result.bars == len(df) - 55
+
+    def test_entry_mask_blocks_entries(self) -> None:
+        # Mask all entries off → zero trades regardless of how strong the
+        # breakout is.
+        df = _build_synthetic_breakout(n_warmup=50, n_trend=20)
+        mask = pd.Series(False, index=df.index, dtype=bool)
+        result = simulate_symbol(
+            "T", df, StaticATRStop(k=2.0), slippage_bps=0.0,
+            entry_mask=mask,
+        )
+        assert result.trade_count == 0
+
+    def test_entry_mask_index_mismatch_raises(self) -> None:
+        df = _build_synthetic_breakout(n_warmup=50, n_trend=20)
+        bad_mask = pd.Series(True, index=df.index[:-1], dtype=bool)
+        with pytest.raises(ValueError, match="entry_mask"):
+            simulate_symbol(
+                "T", df, StaticATRStop(k=2.0), slippage_bps=0.0,
+                entry_mask=bad_mask,
+            )
+
+    def test_entry_mask_partial_allow(self) -> None:
+        # Allow only a window in the middle of the trend. Entries outside that
+        # window must not fire.
+        df = _build_synthetic_breakout(n_warmup=50, n_trend=20)
+        mask = pd.Series(False, index=df.index, dtype=bool)
+        mask.iloc[55:65] = True  # allow only bars 55..64
+        result = simulate_symbol(
+            "T", df, StaticATRStop(k=2.0), slippage_bps=0.0,
+            entry_mask=mask,
+        )
+        for t in result.trades:
+            # The triggering close was on bar i-1; the entry fills on bar i.
+            # Mask is read on the signal bar (close). Just check the trade
+            # entered within (or shortly after) the mask window.
+            entry_pos = df.index.get_loc(t.entry_date)
+            assert 56 <= entry_pos <= 66, (
+                f"trade entered at position {entry_pos}, outside expected window"
+            )
+
+
 class TestAggregate:
     def test_empty_results_raises(self) -> None:
         with pytest.raises(ValueError):

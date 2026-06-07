@@ -33,14 +33,16 @@ from scripts.backtest_bollinger_squeeze import UNIVERSES  # noqa: E402
 
 # Regime-window starts. A symbol "participates" in a window if its earliest
 # bar is at least `warmup_trading_days` before the window start (so indicators
-# can warm up).
+# can warm up). Must stay in sync with scripts/donchian_trail_compare.py
+# WINDOWS — when those change, update both.
 REGIME_STARTS = [
-    ("2021_melt_up", "2021-01-01"),
+    ("2021_melt_up", "2021-04-01"),  # matches compare script; 50-bar warmup
+                                     # from 2021-01-04 (IEX feed start)
     ("2022_bear",    "2022-01-01"),
     ("2023_rally",   "2023-01-01"),
     ("2024_rally",   "2024-01-01"),
 ]
-WARMUP_TRADING_DAYS = 60
+WARMUP_TRADING_DAYS = 50  # matches compare script's slice_window default
 
 
 def main() -> int:

@@ -233,6 +233,8 @@ def simulate_symbol(
     initial_cash: float = 100_000.0,
     risk_per_trade_pct: float = 0.02,
     slippage_bps: float = 5.0,
+    trade_start: pd.Timestamp | None = None,
+    entry_mask: pd.Series | None = None,
 ) -> SymbolResult:
     """
     Walk daily bars and produce a per-symbol equity curve and trade list under
@@ -244,6 +246,24 @@ def simulate_symbol(
 
     `slippage_bps` is applied symmetrically to every fill price (entry, signal
     exit at open, stop fills). Matches `backtest.runner.BacktestConfig` default.
+
+    Args:
+        trade_start: When set, entries are blocked until this timestamp. Bars
+            before `trade_start` are still walked so indicators warm up, but
+            no entry can fill before then, and reported equity-curve stats
+            (total_return, cagr, sharpe, max_drawdown, buy_hold_return) are
+            computed only on the in-window slice. The trade list is also
+            filtered to trades whose entry date falls on or after
+            `trade_start`. This is how the comparison harness keeps warmup
+            from polluting regime-window metrics.
+        entry_mask: Boolean Series aligned to df.index. When provided, a new
+            entry signal on bar t (close-based) is blocked unless
+            `entry_mask[t]` is True. Mirrors how production combines the
+            strategy's raw signal with an `EdgeFilter` decision and the
+            engine's `RegimeDetector` — without this, the simulator trades
+            every Donchian high regardless of macro regime or per-symbol
+            structural strength, which is materially different from live
+            behavior.
     """
     required = {"open", "high", "low", "close"}
     missing = required - set(df.columns)
@@ -254,6 +274,13 @@ def simulate_symbol(
             f"{symbol}: only {len(df)} bars; need at least "
             f"{entry_window + atr_length + 5} for warmup"
         )
+
+    if entry_mask is not None:
+        if not entry_mask.index.equals(df.index):
+            raise ValueError(
+                f"{symbol}: entry_mask index must equal df.index "
+                f"(got {len(entry_mask)} vs {len(df)} bars)"
+            )
 
     out, atr, dhigh, dlow = _compute_indicators(
         df,
@@ -274,6 +301,22 @@ def simulate_symbol(
     # Signal series (close-based, aligned to bar t — fill at t+1 open).
     entries = close > dhigh_a
     exits = close < dlow_a
+
+    # Production-realistic entry gating. `entry_mask[t]` is the engine's
+    # combined "go" decision at bar t close (RegimeDetector + EdgeFilter).
+    # When False, the entry signal at t is suppressed before fill at t+1.
+    if entry_mask is not None:
+        entries = entries & entry_mask.to_numpy(dtype=bool)
+
+    # Warmup gate: entries can only fill on or after `trade_start`. Indicators
+    # still warm up using all bars; only the fill date is constrained.
+    if trade_start is not None:
+        trade_start_ts = pd.Timestamp(trade_start)
+        if trade_start_ts.tz is None and dates.tz is not None:
+            trade_start_ts = trade_start_ts.tz_localize(dates.tz)
+        trade_start_pos = int(dates.searchsorted(trade_start_ts, side="left"))
+    else:
+        trade_start_pos = 0
 
     n = len(out)
     cash = initial_cash
@@ -370,8 +413,15 @@ def simulate_symbol(
             _mark_equity(i)
             continue
 
-        # Not in position: check if yesterday emitted an entry signal
-        if i >= 1 and entries[i - 1] and not np.isnan(atr_a[i - 1]):
+        # Not in position: check if yesterday emitted an entry signal.
+        # Block fills before trade_start so warmup bars don't enter the
+        # in-window trade record.
+        if (
+            i >= 1
+            and i >= trade_start_pos
+            and entries[i - 1]
+            and not np.isnan(atr_a[i - 1])
+        ):
             fill = open_[i] * (1.0 + slip)
             atr_at_entry = atr_a[i - 1]
             init_stop = policy.initial_stop(fill, atr_at_entry)
@@ -434,15 +484,33 @@ def simulate_symbol(
         equity[i] = cash
 
     equity_series = pd.Series(equity, index=dates, name=f"{symbol}_{policy.name}")
-    stats = _compute_stats(equity_series, initial_cash, trades, df)
+
+    # For metrics: slice to the in-window range so warmup never shows up in
+    # totals/Sharpe/MaxDD. Trades are also filtered to the in-window region.
+    if trade_start_pos > 0:
+        in_window_equity = equity_series.iloc[trade_start_pos:]
+        in_window_df = df.iloc[trade_start_pos:]
+    else:
+        in_window_equity = equity_series
+        in_window_df = df
+
+    in_window_trades = [
+        t for t in trades
+        if dates.searchsorted(t.entry_date, side="left") >= trade_start_pos
+    ]
+    # The equity series for an in-window slice starts at cash held at the
+    # first in-window bar, not at the original initial_cash. Rescale stats
+    # so total_return / cagr are correct relative to the in-window start.
+    stats_init_cash = float(in_window_equity.iloc[0]) if len(in_window_equity) else initial_cash
+    stats = _compute_stats(in_window_equity, stats_init_cash, in_window_trades, in_window_df)
 
     return SymbolResult(
         symbol=symbol,
         policy_name=policy.name,
-        bars=n,
-        trades=trades,
-        equity_curve=equity_series,
-        initial_cash=initial_cash,
+        bars=len(in_window_equity),
+        trades=in_window_trades,
+        equity_curve=in_window_equity,
+        initial_cash=stats_init_cash,
         **stats,
     )
 

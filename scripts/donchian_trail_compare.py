@@ -53,6 +53,7 @@ from backtest.donchian_trail_sim import (  # noqa: E402
     aggregate,
     simulate_symbol,
 )
+from indicators.technicals import add_adx, add_atr, add_sma  # noqa: E402
 from scripts.backtest_bollinger_squeeze import UNIVERSES  # noqa: E402
 
 
@@ -106,6 +107,120 @@ def build_policies() -> list[StopPolicy]:
         DonchianLowTrail(initial_k=2.0, buffer_atr=0.5),
         ChandelierStop(initial_k=2.0, k=3.0),
     ]
+
+
+# ── Production-realistic entry gates ────────────────────────────────────────
+#
+# These mirror the live engine's combined "go" decision at bar t close. Without
+# them the simulator trades every Donchian high regardless of macro regime or
+# per-symbol structural strength, which is materially different from live
+# behavior and inflates the trade count under all three stop variants. PR #49
+# review flagged this; fixed here.
+#
+# What's modeled:
+#   1. SPY regime — TRENDING only (live: StrategySlot.allowed_regimes =
+#      {MarketRegime.TRENDING}). Per-bar classification replicates
+#      regime.detector.RegimeDetector._classify() priority:
+#        BEAR     → SPY close < SPY 200-SMA
+#        VOLATILE → ATR%(14) percentile >= 90% AND absolute floor >= 1.2%
+#        TRENDING → ADX(14) >= 25, OR (ADX in 20..25 AND SPY 50-SMA slope > 0)
+#        RANGING  → otherwise
+#   2. Stock structural strength — close > 200-SMA (DonchianEdgeFilter rule 1)
+#   3. Liquidity — 20-day avg dollar volume >= $20M (DonchianEdgeFilter rule 3)
+#
+# What's NOT modeled (limitation, documented in the writeup):
+#   - Earnings blackout (DonchianEdgeFilter rule 2) — needs offline earnings
+#     calendar; production reads from yfinance/cache. Skipping it means we
+#     allow a small fraction of trades that production would block; the
+#     direction of the bias is the same across all three stop variants so it
+#     doesn't favor one over the other.
+#   - Sector momentum "warn" mode — doesn't block entries in production for
+#     Donchian (it's a soft filter that only warns), so no effect.
+
+
+def classify_spy_regime(spy: pd.DataFrame, *,
+                        sma_long: int = 200, atr_window: int = 14,
+                        adx_window: int = 14, sma_short: int = 50,
+                        vol_pct_window: int = 252, vol_pct_threshold: float = 0.9,
+                        vol_atr_pct_floor: float = 0.012,
+                        adx_trend: float = 25.0, adx_range: float = 20.0,
+                        sma_slope_bars: int = 20) -> pd.Series:
+    """
+    Per-bar SPY regime classification, replicating RegimeDetector._classify().
+    Returns a Series of strings ('BEAR' | 'VOLATILE' | 'TRENDING' | 'RANGING')
+    aligned to spy.index. NaN values during warmup are reported as 'RANGING'
+    (the conservative default matching the live detector).
+    """
+    df = add_sma(spy, sma_long)
+    df = add_sma(df, sma_short)
+    df = add_atr(df, atr_window)
+    df = add_adx(df, adx_window)
+
+    close = df["close"]
+    sma_long_s = df[f"sma_{sma_long}"]
+    sma_short_s = df[f"sma_{sma_short}"]
+    atr_pct = df[f"atr_{atr_window}"] / close
+    adx_s = df[f"adx_{adx_window}"]
+
+    # Rolling ATR% percentile rank over a 252-bar window.
+    atr_pct_rank = atr_pct.rolling(vol_pct_window, min_periods=10).apply(
+        lambda w: (w[:-1] < w[-1]).mean() if len(w) > 1 else 0.0,
+        raw=True,
+    )
+
+    # 50-SMA slope: simple level diff over `sma_slope_bars`.
+    sma_short_slope = sma_short_s.diff(sma_slope_bars)
+
+    regimes = pd.Series("RANGING", index=df.index, dtype=object)
+
+    # BEAR has highest priority.
+    bear_mask = (close < sma_long_s) & sma_long_s.notna()
+    regimes[bear_mask] = "BEAR"
+
+    # VOLATILE (only on bars not already BEAR).
+    volatile_mask = (
+        ~bear_mask
+        & (atr_pct_rank >= vol_pct_threshold)
+        & (atr_pct >= vol_atr_pct_floor)
+        & atr_pct_rank.notna()
+    )
+    regimes[volatile_mask] = "VOLATILE"
+
+    # TRENDING / RANGING from ADX + slope tiebreaker (only on bars not already labelled).
+    remaining = ~(bear_mask | volatile_mask)
+    high_adx = (adx_s >= adx_trend) & adx_s.notna()
+    low_adx = (adx_s <= adx_range) & adx_s.notna()
+    ambiguous = adx_s.notna() & ~high_adx & ~low_adx
+
+    trending_mask = remaining & (high_adx | (ambiguous & (sma_short_slope > 0)))
+    regimes[trending_mask] = "TRENDING"
+    # All other `remaining` bars stay as 'RANGING' (default).
+
+    return regimes
+
+
+def per_symbol_filter_mask(
+    df: pd.DataFrame, *, sma_window: int = 200,
+    vol_window: int = 20, notional_min_avg: float = 20_000_000.0,
+) -> pd.Series:
+    """
+    Per-bar DonchianEdgeFilter gate (rules 1 + 3; rule 2 earnings blackout
+    deferred). True on bars where entries are allowed under the filter.
+    Mirrors strategies.filters.donchian_breakout.DonchianEdgeFilter logic:
+    fails open during warmup (NaN SMA / NaN avg volume → allow).
+    """
+    close = df["close"].astype(float)
+    sma = close.rolling(sma_window).mean()
+    stock_above = (close > sma).where(sma.notna(), other=True).astype(bool)
+
+    if "volume" in df.columns:
+        dollar_vol = close * df["volume"].astype(float)
+        avg = dollar_vol.rolling(vol_window).mean()
+        liq = (avg >= notional_min_avg).where(avg.notna(), other=True).astype(bool)
+    else:
+        liq = pd.Series(True, index=df.index, dtype=bool)
+
+    return (stock_above & liq).astype(bool)
 
 
 # ── Bar loading from cache only ─────────────────────────────────────────────
@@ -175,6 +290,8 @@ def run_window(
     initial_cash: float,
     risk_per_trade_pct: float,
     slippage_bps: float,
+    spy_regime: pd.Series,
+    apply_production_gates: bool,
 ) -> WindowRun:
     logger.info(f"window {window.name}: loading bars for {len(symbols)} symbols")
     bars_by_sym: dict[str, pd.DataFrame] = {}
@@ -190,6 +307,8 @@ def run_window(
     if not bars_by_sym:
         logger.warning(f"window {window.name}: zero symbols had usable cached bars")
 
+    trade_start_ts = pd.Timestamp(window.start, tz="UTC")
+
     policy_aggregates: dict[str, PortfolioAggregate] = {}
     symbols_traded: dict[str, list[str]] = {}
     per_symbol: dict[str, list[SymbolResult]] = {}
@@ -198,6 +317,14 @@ def run_window(
         results: list[SymbolResult] = []
         traded: list[str] = []
         for sym, df in bars_by_sym.items():
+            entry_mask: pd.Series | None = None
+            if apply_production_gates:
+                # SPY regime aligned to this symbol's bars; default to RANGING
+                # for missing dates (conservative, blocks entries).
+                spy_aligned = spy_regime.reindex(df.index).fillna("RANGING")
+                regime_ok = (spy_aligned == "TRENDING")
+                filter_ok = per_symbol_filter_mask(df)
+                entry_mask = (regime_ok & filter_ok).astype(bool)
             try:
                 res = simulate_symbol(
                     sym, df, policy,
@@ -207,6 +334,8 @@ def run_window(
                     initial_cash=initial_cash,
                     risk_per_trade_pct=risk_per_trade_pct,
                     slippage_bps=slippage_bps,
+                    trade_start=trade_start_ts,
+                    entry_mask=entry_mask,
                 )
             except Exception as exc:  # noqa: BLE001
                 logger.warning(f"{sym} [{policy.name}]: {exc}")
@@ -396,6 +525,12 @@ def main() -> int:
         help="Risk per trade as fraction of initial cash (default 2%%)",
     )
     parser.add_argument(
+        "--no-production-gates", action="store_true",
+        help="Skip production entry gates (SPY TRENDING regime + Donchian "
+             "edge filter). Use for sanity comparison against an ungated run. "
+             "Default: gates ON (matches live behavior).",
+    )
+    parser.add_argument(
         "--output", type=str, default=None,
         help="Optional markdown output path (defaults to logs/backtests/<timestamp>_donchian_trail_compare.md)",
     )
@@ -411,6 +546,29 @@ def main() -> int:
 
     symbols = list(UNIVERSES[args.universe])
     policies = build_policies()
+    apply_gates = not args.no_production_gates
+
+    # Load SPY history once and classify regime per bar. SPY is needed even
+    # in --no-production-gates mode because we always want the regime context
+    # in the report. If SPY is unavailable, fall back to a permissive series.
+    spy_df = load_cached_bars("SPY")
+    if spy_df is None:
+        if apply_gates:
+            logger.error(
+                "Production gates requested but SPY bars not in cache. "
+                "Run scripts/audit_donchian_history.py to backfill, then "
+                "re-run. Aborting."
+            )
+            return 1
+        spy_regime = pd.Series(dtype=object)
+    else:
+        spy_regime = classify_spy_regime(spy_df)
+        regime_counts = spy_regime.value_counts().to_dict()
+        logger.info(
+            f"SPY regime distribution over {len(spy_regime)} bars: "
+            f"{regime_counts}"
+        )
+
     runs: list[WindowRun] = []
     for window in WINDOWS:
         runs.append(run_window(
@@ -421,6 +579,8 @@ def main() -> int:
             initial_cash=args.initial_cash,
             risk_per_trade_pct=args.risk_per_trade_pct,
             slippage_bps=args.slippage_bps,
+            spy_regime=spy_regime,
+            apply_production_gates=apply_gates,
         ))
 
     combined = next((r for r in runs if r.window.name == "2021_2024_combined"), None)
@@ -436,6 +596,7 @@ def main() -> int:
         f"- Universe: {args.universe} ({len(symbols)} symbols)",
         f"- Strategy params: entry={args.entry_window}, exit={args.exit_window}, ATR={args.atr_length}",
         f"- Slippage: {args.slippage_bps} bps, init_cash: ${args.initial_cash:,.0f}, risk/trade: {args.risk_per_trade_pct*100:.1f}%",
+        f"- Production gates: {'ON (SPY TRENDING-only + DonchianEdgeFilter rules 1+3)' if apply_gates else 'OFF (ungated — every Donchian high entered)'}",
         "- Stop variants compared:",
         "  - **static_atr** — entry - 2 x ATR_at_entry (current production)",
         "  - **donchian_low_trail** — initial = entry - 2 x ATR; ratchets up with rolling 15-low minus 0.5 x ATR buffer",
