@@ -139,16 +139,26 @@ EOD), no-look-ahead invariants, identical-sizing assertion, and the new
 
 Audit script: [scripts/audit_donchian_history.py](../scripts/audit_donchian_history.py).
 
-**Hard constraint**: the Alpaca IEX paper feed serves data back to ~2021-01-04
-only. Pre-2021 windows (2018 vol shock, 2020 COVID crash) are not reachable
-without a SIP paid subscription, so the PLAN's original ask of "2018 / 2020 /
-2021 / 2022 / 2023-24" was reduced to the reachable subset.
+**Hard constraint** (corrected post-merge from initial PR write-up):
+Alpaca IEX paper-feed depth varies **per symbol**. SPY itself goes back to
+2018-11-01, but coverage for individual `ai_bigtech` mega-caps (NVDA, AAPL,
+MSFT, AMZN, META, GOOGL, AMD, AVGO, ANET, MRVL, MU, QCOM, ORCL, TSLA, TSM,
+SMCI, CRWD, NOW, ASML, CLS, CIEN, VST, BE, PWR, VRT) begins **2020-07-27**.
+Later-listed names (PLTR, IONQ, QBTS, RGTI, IREN, CEG, ARM) start at their
+listing dates. So 2018 / 2019 / early 2020 windows are not reachable for a
+stock-level stop comparison on this universe — running on SPY alone wouldn't
+answer the same question. The earliest meaningful comparison window starts
+at 2021-04-01, where indicators have had ~5 months of warmup on most stocks
+and SMA200 is comfortably populated by the window boundary. Going pre-2020
+would need a deeper-history vendor (Polygon, yfinance, paid Alpaca extended
+history) — not a SIP subscription, because the IEX/SIP axis isn't the binding
+constraint here; the per-symbol coverage start date is.
 
 Symbol participation within the reachable range:
 
 | Window | Symbols traded / 32 | Notes |
 |---|---:|---|
-| 2021 melt-up (Q2-Q4) | 28 | Window starts 2021-04-01 because the IEX feed begins 2021-01-04 and we need 50 trading days of warmup. IREN, CEG, ARM, RGTI excluded (later listings). |
+| 2021 melt-up (Q2-Q4) | 28 | Window starts 2021-04-01 to give the 200-SMA filter time to populate from stocks' actual first bar (2020-07-27). IREN, CEG, ARM excluded (later listings); RGTI is borderline. |
 | 2022 bear | 29 | IREN, CEG, ARM excluded |
 | 2023 rally | 31 | ARM only excluded (Sep 2023 IPO) |
 | 2024 rally | 32 | All names trade |
@@ -271,10 +281,12 @@ other on the reachable 3.75 years. Neither trail variant clears the bar.
 
 Re-open only with one of:
 
-- **SIP-feed pre-2021 evidence** — re-run the simulator across 2018 vol
-  shock and 2020 COVID crash regimes (script is ready; only the data is
-  missing). Those are the regimes most likely to produce the catastrophic
-  gap-through the static stop is bad at.
+- **Deeper-history pre-2020 evidence** — re-run the simulator across 2018 vol
+  shock and 2020 COVID crash regimes. The script is ready; the data isn't on
+  the Alpaca IEX paper feed (individual stocks start 2020-07-27) and would
+  need a different vendor (Polygon, yfinance, paid Alpaca extended history).
+  Those are the regimes most likely to produce the catastrophic gap-through
+  the static stop is bad at.
 - **Live giveback event** — if real paper or live trading produces a
   documented case where the static stop visibly surrendered material P&L on
   a gap-down through a then-vestigial level, that single case study can

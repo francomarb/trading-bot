@@ -36,8 +36,10 @@ from scripts.backtest_bollinger_squeeze import UNIVERSES  # noqa: E402
 # can warm up). Must stay in sync with scripts/donchian_trail_compare.py
 # WINDOWS — when those change, update both.
 REGIME_STARTS = [
-    ("2021_melt_up", "2021-04-01"),  # matches compare script; 50-bar warmup
-                                     # from 2021-01-04 (IEX feed start)
+    ("2021_melt_up", "2021-04-01"),  # matches compare script; chosen so
+                                     # 200-SMA filter is populated by window
+                                     # boundary given individual stocks' IEX
+                                     # first-bar = 2020-07-27
     ("2022_bear",    "2022-01-01"),
     ("2023_rally",   "2023-01-01"),
     ("2024_rally",   "2024-01-01"),
@@ -50,7 +52,13 @@ def main() -> int:
     logger.add(sys.stderr, level="INFO", format="<level>{level: <8}</level> | {message}")
 
     symbols = list(UNIVERSES["ai_bigtech"])
-    start = datetime(2021, 1, 1, tzinfo=timezone.utc)
+    # Probe deep — let the API return whatever it has per symbol. The Alpaca
+    # IEX paper feed depth varies per symbol: SPY back to 2018-11-01, most
+    # individual ai_bigtech mega-caps to 2020-07-27, later-listed names at
+    # their listing dates. A wide start range surfaces the true first bar
+    # rather than gating us to whatever the previous job happened to fetch.
+    # See feedback_audit_reachable_data_first.md in user memory.
+    start = datetime(2018, 11, 1, tzinfo=timezone.utc)
     end = datetime.now(timezone.utc)
 
     # SPY is required by scripts/donchian_trail_compare.py for per-bar regime
@@ -108,8 +116,12 @@ def main() -> int:
         f"- Generated: {datetime.now(timezone.utc).isoformat()}\n",
         f"- Universe: ai_bigtech ({len(symbols)} symbols) + SPY (regime context)",
         f"- Warmup requirement: {WARMUP_TRADING_DAYS} trading days before window start (~{int(WARMUP_TRADING_DAYS*1.4)} calendar days)",
-        f"- Note: Alpaca IEX paper feed serves data back to ~2021-01-04 only; "
-        f"pre-2021 windows are not accessible without a SIP subscription.\n",
+        f"- Note: Alpaca IEX paper-feed depth varies per symbol. SPY back to "
+        f"2018-11-01, most individual ai_bigtech mega-caps to 2020-07-27, "
+        f"later-listed names at their listing dates. Pre-2020 stock-level "
+        f"testing would need a different vendor (Polygon / yfinance / paid "
+        f"Alpaca extended history) — not a SIP subscription, which is a "
+        f"different axis.\n",
         "| Symbol | First bar | Bars | 2021 melt-up | 2022 bear | 2023 rally | 2024 rally |",
         "|--------|-----------|-----:|:---:|:---:|:---:|:---:|",
     ]

@@ -74,8 +74,9 @@ WINDOWS: list[RegimeWindow] = [
         start="2021-04-01",
         end="2021-12-31",
         description="2021 melt-up Q2-Q4 — quiet uptrend, tests trail whipsaw cost. "
-                    "Window starts April because IEX feed only goes back to "
-                    "2021-01-04 (no full warmup before Jan).",
+                    "Window starts April so the 200-SMA filter has time to "
+                    "populate (individual ai_bigtech stocks' first available "
+                    "bar on the Alpaca IEX paper feed is 2020-07-27).",
     ),
     RegimeWindow(
         name="2022_bear",
