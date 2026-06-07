@@ -16,6 +16,7 @@ Covers:
 
 from __future__ import annotations
 
+import json
 from datetime import datetime, timedelta, timezone
 from unittest.mock import MagicMock
 
@@ -194,9 +195,9 @@ class TestCacheRoundTrip:
     ):
         cov_start = utc_now - timedelta(days=10)
         cov_end = utc_now
-        _write_cache(clean_ohlcv, "AAPL", "1Day", "all", cov_start, cov_end)
+        _write_cache(clean_ohlcv, "AAPL", "1Day", "all", cov_start, cov_end, "iex")
 
-        back = _read_cache("AAPL", "1Day", "all")
+        back = _read_cache("AAPL", "1Day", "all", "iex")
         assert not back.empty
         assert back.index.tz is not None
         pd.testing.assert_frame_equal(back, clean_ohlcv)
@@ -204,9 +205,9 @@ class TestCacheRoundTrip:
     def test_meta_round_trip(self, tmp_cache_dir, clean_ohlcv, utc_now):
         cov_start = utc_now - timedelta(days=10)
         cov_end = utc_now
-        _write_cache(clean_ohlcv, "AAPL", "1Day", "all", cov_start, cov_end)
+        _write_cache(clean_ohlcv, "AAPL", "1Day", "all", cov_start, cov_end, "iex")
 
-        start, end = _read_meta("AAPL", "1Day", "all")
+        start, end = _read_meta("AAPL", "1Day", "all", "iex")
         assert start == cov_start
         assert end == cov_end
 
@@ -218,17 +219,186 @@ class TestCacheRoundTrip:
             "all",
             utc_now,
             utc_now + timedelta(days=1),
+            "iex",
         )
-        assert list(tmp_cache_dir.iterdir()) == []
+        # Neither legacy nor feed-aware paths should have been written.
+        # The feed subdir may not even exist if _write_cache returned early.
+        assert not (tmp_cache_dir / "EMPTY_1Day_all.parquet").exists()
+        assert not (tmp_cache_dir / "iex" / "EMPTY_1Day_all.parquet").exists()
 
     def test_read_missing_returns_empty(self, tmp_cache_dir):
-        assert _read_cache("NOTHERE", "1Day", "all").empty
-        assert _read_meta("NOTHERE", "1Day", "all") == (None, None)
+        assert _read_cache("NOTHERE", "1Day", "all", "iex").empty
+        assert _read_meta("NOTHERE", "1Day", "all", "iex") == (None, None)
 
     def test_corrupt_meta_is_ignored(self, tmp_cache_dir):
-        # Write a bogus meta file; _read_meta should return (None, None), not crash.
-        (tmp_cache_dir / "ABC_1Day_all.meta.json").write_text("not-json{{")
-        assert _read_meta("ABC", "1Day", "all") == (None, None)
+        # Write a bogus meta file at the feed-aware path; _read_meta should
+        # return (None, None), not crash.
+        (tmp_cache_dir / "iex").mkdir(parents=True, exist_ok=True)
+        (tmp_cache_dir / "iex" / "ABC_1Day_all.meta.json").write_text("not-json{{")
+        assert _read_meta("ABC", "1Day", "all", "iex") == (None, None)
+
+
+class TestFeedAwareCacheLayout:
+    """
+    PR review on PR #49 surfaced that the cache used to silently mix bars
+    from different data feeds in the same parquet file. This test family
+    pins the feed-aware layout:
+
+      data/historical/{feed}/{symbol}_{timeframe}_{adjustment}.parquet
+
+    Writes always go to the feed-aware path; reads check there first and
+    fall back to the legacy top-level path for IEX only (so the live bot
+    keeps working between the code deploy and the migration script run).
+    """
+
+    def test_write_creates_feed_subdir(self, tmp_cache_dir, clean_ohlcv, utc_now):
+        _write_cache(
+            clean_ohlcv, "AAPL", "1Day", "all",
+            utc_now - timedelta(days=10), utc_now,
+            "iex",
+        )
+        assert (tmp_cache_dir / "iex" / "AAPL_1Day_all.parquet").exists()
+        assert (tmp_cache_dir / "iex" / "AAPL_1Day_all.meta.json").exists()
+        # Nothing at the legacy top level.
+        assert not (tmp_cache_dir / "AAPL_1Day_all.parquet").exists()
+
+    def test_writes_to_different_feeds_are_isolated(
+        self, tmp_cache_dir, make_ohlcv, utc_now
+    ):
+        # Two writes for the same symbol but different feeds must land in
+        # separate subdirs and not clobber each other.
+        iex_df = make_ohlcv(utc_now - timedelta(days=10), 10, base_price=100.0)
+        sip_df = make_ohlcv(utc_now - timedelta(days=10), 10, base_price=200.0)
+
+        _write_cache(iex_df, "AAPL", "1Day", "all", utc_now - timedelta(days=10), utc_now, "iex")
+        _write_cache(sip_df, "AAPL", "1Day", "all", utc_now - timedelta(days=10), utc_now, "sip")
+
+        back_iex = _read_cache("AAPL", "1Day", "all", "iex")
+        back_sip = _read_cache("AAPL", "1Day", "all", "sip")
+        assert back_iex["close"].iloc[0] == 100.0
+        assert back_sip["close"].iloc[0] == 200.0
+
+    def test_iex_read_falls_back_to_legacy_path(
+        self, tmp_cache_dir, clean_ohlcv, utc_now
+    ):
+        # Simulate a pre-migration state: legacy top-level file exists, no
+        # iex/ subdir. Reading with feed="iex" must find it via fallback.
+        clean_ohlcv.to_parquet(tmp_cache_dir / "LEGACY_1Day_all.parquet")
+        meta = {
+            "covered_start": (utc_now - timedelta(days=10)).isoformat(),
+            "covered_end": utc_now.isoformat(),
+        }
+        (tmp_cache_dir / "LEGACY_1Day_all.meta.json").write_text(
+            json.dumps(meta)
+        )
+        back = _read_cache("LEGACY", "1Day", "all", "iex")
+        assert not back.empty
+        cov_start, cov_end = _read_meta("LEGACY", "1Day", "all", "iex")
+        assert cov_start is not None and cov_end is not None
+
+    def test_sip_read_does_not_fall_back_to_legacy(
+        self, tmp_cache_dir, clean_ohlcv, utc_now
+    ):
+        # Legacy files were always IEX-fed. A SIP read MUST NOT silently
+        # serve them — that would reintroduce the cross-feed cache mixing
+        # bug this PR is fixing.
+        clean_ohlcv.to_parquet(tmp_cache_dir / "LEGACY_1Day_all.parquet")
+        (tmp_cache_dir / "LEGACY_1Day_all.meta.json").write_text(json.dumps({
+            "covered_start": (utc_now - timedelta(days=10)).isoformat(),
+            "covered_end": utc_now.isoformat(),
+        }))
+        back = _read_cache("LEGACY", "1Day", "all", "sip")
+        assert back.empty
+        assert _read_meta("LEGACY", "1Day", "all", "sip") == (None, None)
+
+    def test_feed_aware_takes_precedence_over_legacy(
+        self, tmp_cache_dir, make_ohlcv, utc_now
+    ):
+        # If both legacy and feed-aware paths exist for IEX, the feed-aware
+        # one wins (it's newer by definition).
+        legacy_df = make_ohlcv(utc_now - timedelta(days=10), 10, base_price=999.0)
+        new_df = make_ohlcv(utc_now - timedelta(days=10), 10, base_price=42.0)
+
+        legacy_df.to_parquet(tmp_cache_dir / "OVL_1Day_all.parquet")
+        _write_cache(
+            new_df, "OVL", "1Day", "all",
+            utc_now - timedelta(days=10), utc_now, "iex",
+        )
+        back = _read_cache("OVL", "1Day", "all", "iex")
+        assert back["close"].iloc[0] == 42.0  # the feed-aware one
+
+
+class TestSipEndClamp:
+    """
+    Basic Alpaca accounts can query SIP historical data only for bars whose
+    timestamp is at least 15 minutes old. The fetcher must clamp the
+    requested `end` rather than letting the API return 422. Captured by
+    monkeypatching the bars-API hook and asserting what `end` it sees.
+    """
+
+    @pytest.fixture
+    def captured_api(self, monkeypatch, tmp_cache_dir):
+        # Stub _fetch_bars_api to capture the (start, end) it gets called with
+        # and return an empty frame so fetch_symbol doesn't try to merge data.
+        captured: dict = {}
+
+        def fake_api(symbol, timeframe, start, end, adjustment, feed):
+            captured["start"] = start
+            captured["end"] = end
+            captured["feed"] = feed
+            return pd.DataFrame()
+
+        monkeypatch.setattr(fetcher, "_fetch_bars_api", fake_api)
+        # Force every call to be a "missing range" so the API gets hit.
+        return captured
+
+    def test_sip_end_is_clamped_when_too_recent(self, captured_api, utc_now):
+        # Asking for end = now should get clamped to ~now-15min for SIP.
+        sip_cutoff_window = timedelta(minutes=16)  # generous margin
+        fetcher.fetch_symbol(
+            "AAPL",
+            start=utc_now - timedelta(days=30),
+            end=utc_now,
+            timeframe="1Day",
+            use_cache=False,
+            feed="sip",
+        )
+        # captured["end"] is the end the API was called with, AFTER the
+        # clamp. It must be at least 15 minutes before now.
+        delta_to_now = datetime.now(timezone.utc) - captured_api["end"]
+        assert delta_to_now >= timedelta(minutes=15) - timedelta(seconds=5), (
+            f"SIP end was not clamped: captured end={captured_api['end']}, "
+            f"now-end delta={delta_to_now}"
+        )
+        assert delta_to_now < sip_cutoff_window  # not over-clamped
+
+    def test_iex_end_is_not_clamped(self, captured_api, utc_now):
+        # IEX has no 15-min restriction; the captured end must equal what
+        # the caller asked for.
+        requested_end = utc_now
+        fetcher.fetch_symbol(
+            "AAPL",
+            start=utc_now - timedelta(days=30),
+            end=requested_end,
+            timeframe="1Day",
+            use_cache=False,
+            feed="iex",
+        )
+        assert captured_api["end"] == requested_end
+
+    def test_sip_end_well_in_past_is_left_alone(self, captured_api, utc_now):
+        # SIP backtests on bars from years ago must not see any clamping —
+        # the requested end is already comfortably past the 15-min cutoff.
+        old_end = utc_now - timedelta(days=365)
+        fetcher.fetch_symbol(
+            "AAPL",
+            start=utc_now - timedelta(days=400),
+            end=old_end,
+            timeframe="1Day",
+            use_cache=False,
+            feed="sip",
+        )
+        assert captured_api["end"] == old_end
 
 
 class TestTimeoutAdapter:

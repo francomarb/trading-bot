@@ -249,7 +249,13 @@ python scripts/legacy_verify/phase9_verify.py
 
 - Paper trading base URL: `https://paper-api.alpaca.markets`
 - Live trading base URL: `https://api.alpaca.markets`
-- Data API (market data): use `feed="iex"` on a paper account (SIP requires paid subscription).
+- Data API (market data) — feed strategy:
+  - **Live engine, paper account**: `feed="iex"` (free real-time bars). Default in `ALPACA_DATA_FEED` env var.
+  - **Live engine, live account**: `feed="sip"` real-time (needs paid Algo Trader Plus, $99/mo).
+  - **Backtests, audits, calibration, watchlist scanners — any offline work**: `feed="sip"` with the 15-minute end-clamp. Basic Alpaca accounts get full SIP historical data at no extra cost provided the request `end` is ≥15 min in the past. `data/fetcher.py` enforces this clamp automatically; backtest scripts should read from `BACKTEST_DATA_FEED` in `config/settings.py` (default `"sip"`).
+  - **Why offline ≠ live feed**: SIP is the consolidated tape (all venues), so volume numbers and liquidity-floor thresholds are interpretable in plain English. IEX is one venue (~2-3% of consolidated volume); `utils.market.apply_synthetic_sip_volume` multiplies daily IEX volume by 20× as an approximation. The approximation is acceptable for the live engine which has no choice on a paper account, but offline analysis should use real SIP.
+  - **Cache layout**: bars are stored at `data/historical/{feed}/{symbol}_{timeframe}_{adjustment}.parquet`. Pre-feed-aware layout (top-level files) is read as IEX via a fallback path. Run `scripts/migrate_cache_to_feed_aware.py` once to move legacy files into `data/historical/iex/`.
+  - **SIP coverage depth varies per symbol** — SPY back to 2016-01-04, most ai_bigtech mega-caps to 2016-01-04 (deeper than IEX by ~4.5 years), later listings at their listing dates. Always probe per symbol with a wide range before generalizing.
 - Use `alpaca-py` (official SDK) — this project has migrated from the deprecated `alpaca-trade-api`. Do not use `alpaca-trade-api`.
 - Orders: support market, limit, and stop-limit types.
 - Positions: always check existing positions before placing new orders.
