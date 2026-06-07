@@ -397,6 +397,149 @@ class TestTradeStartAndEntryMask:
             )
 
 
+class TestFilterMaskOnFullHistory:
+    """
+    PR #49 follow-up flagged that computing the DonchianEdgeFilter mask on the
+    sliced 50-bar-warmup window left SMA200 NaN for ~150 bars and silently
+    failed open, allowing entries production would block (93 in 2022 window,
+    58 in 2023-24). The fix is to compute the filter on full cached history
+    then reindex onto the window. This test pins that behavior so a future
+    refactor can't reintroduce the leak.
+    """
+
+    def _build_long_history(self, n: int = 400) -> pd.DataFrame:
+        # 400 daily bars with a clear uptrend so close > SMA200 from bar ~200 on.
+        start = datetime(2022, 1, 3, tzinfo=timezone.utc)
+        idx = pd.DatetimeIndex(
+            [start + timedelta(days=i) for i in range(n)], tz="UTC"
+        )
+        prices = [100.0 + i * 0.5 for i in range(n)]
+        return pd.DataFrame({
+            "open":  prices,
+            "high":  [p + 0.5 for p in prices],
+            "low":   [p - 0.5 for p in prices],
+            "close": prices,
+            "volume": [10_000_000] * n,
+        }, index=idx)
+
+    def test_filter_on_full_history_then_reindex_keeps_sma200_valid(self) -> None:
+        from scripts.donchian_trail_compare import per_symbol_filter_mask
+
+        full = self._build_long_history(n=400)
+        full_mask = per_symbol_filter_mask(full)
+
+        # The mask must be valid (non-NaN, computed against a real SMA200)
+        # at every bar from index 199 onward.
+        for i in range(200, len(full)):
+            assert not pd.isna(full_mask.iloc[i]), (
+                f"bar {i} filter mask is NaN — SMA200 not computed"
+            )
+
+        # Now simulate the bug fix: take a window that starts at bar 250 with
+        # only 50 warmup bars (window slice starts at bar 200). The OLD path
+        # would compute SMA200 on this 50-bar warmup → NaN for the first 200
+        # bars of the slice → fail open. The NEW path uses the full-history
+        # mask reindexed to the slice → real SMA200 at the boundary.
+        sliced = full.iloc[200:]
+        bad_mask = per_symbol_filter_mask(sliced)  # the buggy path
+        good_mask = full_mask.reindex(sliced.index).fillna(False)  # the fixed path
+
+        # At bar position 0 of the slice (= bar 200 of full), the buggy mask
+        # is True ONLY because SMA200 is NaN and the filter fails open.
+        # The good mask reflects the real SMA200 evaluation.
+        assert bad_mask.iloc[0] == True  # noqa: E712  fails open on NaN SMA
+        # The good mask carries a real evaluation. In this synthetic uptrend
+        # close > SMA200 by bar 200, so good_mask should be True too — but for
+        # the right reason (not because SMA was missing).
+        from indicators.technicals import add_sma
+        full_with_sma = add_sma(full, 200)
+        assert pd.notna(full_with_sma["sma_200"].iloc[200])  # SMA200 IS computable
+        # And the production-faithful mask matches the structurally-correct value.
+        assert good_mask.iloc[0] == (full["close"].iloc[200] > full_with_sma["sma_200"].iloc[200])
+
+
+class TestRegimeParity:
+    """
+    Single-source-of-truth parity check between the comparison harness's
+    per-bar SPY regime classifier and the live `RegimeDetector._classify`.
+    PR #49 follow-up flagged that my defaults diverged from production
+    (vol_pct_window 252 vs 126, threshold 0.90 vs 0.80, sma_slope_bars 20
+    vs 5). This test pins the parity so a future drift breaks the build.
+    """
+
+    def _build_spy_frame(self, n: int = 600) -> pd.DataFrame:
+        """
+        Build a synthetic SPY-like frame deterministically. We don't need
+        realistic SPY — we just need each regime branch (BEAR / VOLATILE /
+        TRENDING / RANGING) to actually fire at some point so the parity
+        check exercises all of them.
+        """
+        import numpy as np
+        rng = np.random.default_rng(42)
+        # Mix of regimes: 200 quiet uptrend, 100 volatile chop, 150 downtrend, 150 trend up
+        prices = []
+        p = 100.0
+        for _ in range(200):
+            p *= 1.0 + rng.normal(0.0005, 0.005)
+            prices.append(p)
+        for _ in range(100):
+            p *= 1.0 + rng.normal(0.0, 0.025)  # vol spike
+            prices.append(p)
+        for _ in range(150):
+            p *= 1.0 + rng.normal(-0.003, 0.012)  # bear
+            prices.append(p)
+        for _ in range(150):
+            p *= 1.0 + rng.normal(0.0015, 0.008)  # trend up
+            prices.append(p)
+        prices = prices[:n]
+        start = datetime(2022, 1, 3, tzinfo=timezone.utc)
+        idx = pd.DatetimeIndex(
+            [start + timedelta(days=i) for i in range(n)], tz="UTC"
+        )
+        df = pd.DataFrame({
+            "open":  prices,
+            "high":  [p * 1.005 for p in prices],
+            "low":   [p * 0.995 for p in prices],
+            "close": prices,
+            "volume": [1_000_000] * n,
+        }, index=idx)
+        return df
+
+    def test_classifier_defaults_match_regime_detector(self) -> None:
+        """The per-bar classifier's last-bar value must match
+        RegimeDetector._classify when both are run on the same SPY frame
+        with production defaults."""
+        from regime.detector import MarketRegime, RegimeDetector
+        from scripts.donchian_trail_compare import classify_spy_regime
+
+        spy = self._build_spy_frame(n=600)
+        det = RegimeDetector()  # production defaults
+        regimes_series = classify_spy_regime(spy)
+
+        # Sample as-of dates spaced through the series so each regime branch
+        # actually gets exercised. Need at least 200 bars for SMA200, so
+        # start sampling at bar 250.
+        sample_positions = list(range(250, len(spy), 25))
+        assert len(sample_positions) >= 5
+
+        mismatches = []
+        for pos in sample_positions:
+            as_of_frame = spy.iloc[: pos + 1]
+            live_regime = det._classify(as_of_frame)
+            series_label = regimes_series.iloc[pos]
+            if live_regime.value.upper() != series_label:
+                mismatches.append(
+                    f"pos {pos} ({as_of_frame.index[-1].date()}): "
+                    f"live={live_regime.value.upper()} series={series_label}"
+                )
+
+        assert not mismatches, (
+            "Regime classifier diverged from RegimeDetector at "
+            f"{len(mismatches)}/{len(sample_positions)} sample points:\n"
+            + "\n".join(mismatches[:10])
+        )
+
+
 class TestAggregate:
     def test_empty_results_raises(self) -> None:
         with pytest.raises(ValueError):

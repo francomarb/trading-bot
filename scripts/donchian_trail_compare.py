@@ -141,15 +141,20 @@ def build_policies() -> list[StopPolicy]:
 def classify_spy_regime(spy: pd.DataFrame, *,
                         sma_long: int = 200, atr_window: int = 14,
                         adx_window: int = 14, sma_short: int = 50,
-                        vol_pct_window: int = 252, vol_pct_threshold: float = 0.9,
+                        vol_pct_window: int = 126, vol_pct_threshold: float = 0.80,
                         vol_atr_pct_floor: float = 0.012,
                         adx_trend: float = 25.0, adx_range: float = 20.0,
-                        sma_slope_bars: int = 20) -> pd.Series:
+                        sma_slope_bars: int = 5) -> pd.Series:
     """
     Per-bar SPY regime classification, replicating RegimeDetector._classify().
     Returns a Series of strings ('BEAR' | 'VOLATILE' | 'TRENDING' | 'RANGING')
     aligned to spy.index. NaN values during warmup are reported as 'RANGING'
     (the conservative default matching the live detector).
+
+    Defaults track ``regime.detector.RegimeDetector`` exactly:
+    vol_pct_window=126 (~6 mo), vol_pct_threshold=0.80, sma_slope_bars=5.
+    Parity is exercised by
+    ``tests/test_donchian_trail_sim.py::TestRegimeParity``.
     """
     df = add_sma(spy, sma_long)
     df = add_sma(df, sma_short)
@@ -162,9 +167,13 @@ def classify_spy_regime(spy: pd.DataFrame, *,
     atr_pct = df[f"atr_{atr_window}"] / close
     adx_s = df[f"adx_{adx_window}"]
 
-    # Rolling ATR% percentile rank over a 252-bar window.
+    # Rolling ATR% percentile rank, matching RegimeDetector._classify exactly:
+    # `(window_valid < current_atr_pct).mean()` where window_valid is the
+    # current `vol_pct_window` slice including the current bar. The current
+    # bar contributes False to the comparison (not strictly less than itself),
+    # so the denominator is N (not N-1).
     atr_pct_rank = atr_pct.rolling(vol_pct_window, min_periods=10).apply(
-        lambda w: (w[:-1] < w[-1]).mean() if len(w) > 1 else 0.0,
+        lambda w: (w < w[-1]).mean(),
         raw=True,
     )
 
@@ -294,14 +303,23 @@ def run_window(
     apply_production_gates: bool,
 ) -> WindowRun:
     logger.info(f"window {window.name}: loading bars for {len(symbols)} symbols")
+    # Keep BOTH the full-history bars (for filter computation — DonchianEdge
+    # filter rule 1 needs SMA200, which requires 200 bars of warmup) AND the
+    # window-sliced bars (for the simulator). PR #49 follow-up flagged that
+    # computing filters on the sliced 50-bar-warmup window left SMA200 NaN
+    # for ~150 bars and silently failed open, allowing entries production
+    # would block. Mirror live behavior: filter mask uses full cached history,
+    # then is reindexed onto the sliced window.
+    bars_full_by_sym: dict[str, pd.DataFrame] = {}
     bars_by_sym: dict[str, pd.DataFrame] = {}
     for sym in symbols:
-        df = load_cached_bars(sym)
-        if df is None:
+        df_full = load_cached_bars(sym)
+        if df_full is None:
             continue
-        sliced = slice_window(df, window)
+        sliced = slice_window(df_full, window)
         if sliced is None:
             continue
+        bars_full_by_sym[sym] = df_full
         bars_by_sym[sym] = sliced
 
     if not bars_by_sym:
@@ -323,7 +341,11 @@ def run_window(
                 # for missing dates (conservative, blocks entries).
                 spy_aligned = spy_regime.reindex(df.index).fillna("RANGING")
                 regime_ok = (spy_aligned == "TRENDING")
-                filter_ok = per_symbol_filter_mask(df)
+                # Filter on full history then reindex — keeps SMA200 valid at
+                # the window boundary when there are enough pre-window bars
+                # (>=200 for the first valid SMA200 value).
+                filter_full = per_symbol_filter_mask(bars_full_by_sym[sym])
+                filter_ok = filter_full.reindex(df.index).fillna(False).astype(bool)
                 entry_mask = (regime_ok & filter_ok).astype(bool)
             try:
                 res = simulate_symbol(

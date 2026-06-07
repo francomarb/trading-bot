@@ -53,6 +53,19 @@ def main() -> int:
     start = datetime(2021, 1, 1, tzinfo=timezone.utc)
     end = datetime.now(timezone.utc)
 
+    # SPY is required by scripts/donchian_trail_compare.py for per-bar regime
+    # classification. PR #49 follow-up flagged that the documented
+    # reproduction path didn't backfill it. Fetch it here alongside the
+    # universe so a clean-cache reviewer can reproduce in one command.
+    try:
+        spy_df, _ = fetch_symbol("SPY", start, end, "1Day", use_cache=True)
+        logger.info(
+            f"SPY backfilled: {len(spy_df)} bars from {spy_df.index[0].date()} "
+            f"to {spy_df.index[-1].date()}"
+        )
+    except Exception as exc:  # noqa: BLE001
+        logger.warning(f"SPY backfill failed — {exc}")
+
     rows: list[dict] = []
     for sym in symbols:
         try:
@@ -93,7 +106,7 @@ def main() -> int:
     lines = [
         f"# ai_bigtech historical coverage audit\n",
         f"- Generated: {datetime.now(timezone.utc).isoformat()}\n",
-        f"- Universe: ai_bigtech ({len(symbols)} symbols)",
+        f"- Universe: ai_bigtech ({len(symbols)} symbols) + SPY (regime context)",
         f"- Warmup requirement: {WARMUP_TRADING_DAYS} trading days before window start (~{int(WARMUP_TRADING_DAYS*1.4)} calendar days)",
         f"- Note: Alpaca IEX paper feed serves data back to ~2021-01-04 only; "
         f"pre-2021 windows are not accessible without a SIP subscription.\n",

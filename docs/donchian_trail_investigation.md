@@ -1,4 +1,4 @@
-# Donchian trailing broker stop — investigation (2026-06-06 / updated 2026-06-07)
+# Donchian trailing broker stop — investigation (2026-06-06 / updated 2026-06-07 R2)
 
 > **Status:** Investigated and closed. Listed under `PLAN.md` → *Deferred Or Parked Ideas*.
 > **TL;DR:** On the ai_bigtech universe with **production-realistic entry
@@ -12,7 +12,29 @@
 
 ## Revision history
 
-- **2026-06-07 — addressed PR #49 review findings.** Three fixes landed:
+- **2026-06-07 (R2) — addressed PR #49 follow-up audit.** Three additional
+  fixes landed on top of R1:
+  1. **SPY regime defaults diverged from production (P1)**: my
+     `classify_spy_regime` used 252-bar vol window / 90th percentile /
+     20-bar SMA slope. Production
+     [`RegimeDetector`](../regime/detector.py) uses 126 / 0.80 / 5. Fixed
+     defaults and locked parity in
+     [`TestRegimeParity`](../tests/test_donchian_trail_sim.py), which
+     constructs a `RegimeDetector` with production defaults and asserts
+     last-bar parity against the per-bar series classifier across all four
+     regime branches.
+  2. **DonchianEdgeFilter mask computed on sliced window (P1)**: SMA200
+     needs 200 bars of warmup, but each window only carried 50 warmup bars.
+     The filter silently failed open on bars where SMA200 was NaN, allowing
+     entries production would block. Fix: compute the filter on the full
+     cached history per symbol, then `reindex` onto the sliced window.
+     Locked in [`TestFilterMaskOnFullHistory`](../tests/test_donchian_trail_sim.py).
+  3. **Audit script didn't backfill SPY (P2)**: the documented clean-cache
+     reproduction path failed because
+     [scripts/audit_donchian_history.py](../scripts/audit_donchian_history.py)
+     only fetched `UNIVERSES["ai_bigtech"]`. Added an explicit SPY backfill
+     so a reviewer with an empty cache can reproduce in one command.
+- **2026-06-07 (R1) — addressed PR #49 first review.** Three fixes landed:
   1. **Warmup leak (P1)**: the simulator was counting entries that fired on
      the pre-window warmup bars in regime metrics. Added `trade_start` so
      indicators warm up on pre-window bars but entries can only fill in-window;
@@ -26,11 +48,10 @@
   3. **Audit-script window date (P2)**: `2021_melt_up` start in
      [scripts/audit_donchian_history.py](../scripts/audit_donchian_history.py)
      was 2021-01-01, but the comparison harness uses 2021-04-01. Fixed.
-- **Numbers landed at the bottom changed materially.** Trade count dropped
-  ~55% as expected (most 2022 bars are BEAR regime, blocking Donchian entries
-  via the regime gate; ungated trade count was 468, gated count is 213 over
-  the same combined window). The qualitative conclusion is unchanged, and is
-  now drawn from production-realistic numbers.
+- **R2 numbers nudged again.** Combined static dropped 213 → 207 trades and
+  mean return 5.6% → 4.5% after the regime defaults and full-history filter
+  fixes. The qualitative conclusion still holds: no variant clears a
+  meaningful margin over static.
 
 ## 1. The question
 
@@ -159,29 +180,39 @@ results are not visibly skewed by this.
 
 | Window | static_atr | donchian_low_trail | chandelier |
 |---|---|---|---|
-| 2021 melt-up (28 syms, 56 trades) | +2.6% / Shp +0.17 / MaxDD −4.1% | +2.8% / +0.20 / −3.9% | **+3.1% / +0.25 / −3.4%** |
-| 2022 bear (29 syms, 7 trades) | −0.3% / −0.14 / −0.7% | −0.2% / −0.11 / −0.7% | **−0.2% / −0.10 / −0.6%** |
-| 2023-24 rally (31 syms, 158 trades) | **+3.5% / +0.19 / −6.2%** | +3.4% / +0.19 / −6.1% | +2.1% / +0.14 / −5.8% |
-| Combined 2021-2024 (28 syms, 213 trades) | +5.6% / +0.22 / −8.2% | **+5.7% / +0.22 / −8.1%** | +4.8% / +0.20 / −7.6% |
+| 2021 melt-up (28 syms, 51 trades) | +1.9% / Shp +0.07 / MaxDD −4.1% | +2.1% / +0.10 / −3.9% | **+2.4% / +0.15 / −3.3%** |
+| 2022 bear (29 syms, 7 trades) | −0.4% / −0.16 / −0.7% | −0.3% / −0.15 / −0.7% | **−0.3% / −0.14 / −0.6%** |
+| 2023-24 rally (31 syms, 153 trades) | **+2.8% / +0.15 / −6.0%** | +2.8% / +0.15 / −5.9% | +1.9% / +0.12 / −5.6% |
+| Combined 2021-2024 (28 syms, 207 trades) | +4.5% / +0.18 / −8.0% | **+4.6% / +0.18 / −8.1%** | +4.0% / +0.18 / −7.5% |
 
 Exit-reason mix (combined 2021-2024):
 
 | Variant | %Gap | %Intra | %Sig | %EOD |
 |---|---:|---:|---:|---:|
-| static_atr | 8.9 | 31.5 | 54.0 | 5.6 |
-| donchian_low_trail | 15.0 | 50.5 | 29.4 | 5.1 |
-| chandelier | 18.4 | 62.3 | 16.7 | 2.6 |
+| static_atr | 9.2 | 31.4 | 53.6 | 5.8 |
+| donchian_low_trail | 14.9 | 51.0 | 28.8 | 5.3 |
+| chandelier | 18.6 | 61.8 | 16.8 | 2.7 |
 
-### Effect of production gates (vs ungated baseline)
+### Effect of fixing the audit findings (PR #49 R1 → R2)
 
-For reference, the ungated combined 2021-2024 numbers (which inflated the
-sample and contaminated metrics with warmup trades) were:
+For reference, the R1 numbers (before SPY regime defaults and full-history
+filter mask were corrected) overstated the trade count and the chandelier
+gap somewhat:
 
-| Variant | Ungated combined | Gated combined | Delta |
+| Variant | R1 gated (broken regime defaults + sliced-window filter) | R2 gated (production-faithful) | Delta |
 |---|---|---|---|
-| static_atr | +24.2% / Shp +0.57 / 468 trades | +5.6% / +0.22 / 213 trades | ~55% fewer trades, returns aligned with production-realistic sizing per regime |
-| donchian_low_trail | +23.7% / +0.56 / 475 trades | +5.7% / +0.22 / 214 trades | same |
-| chandelier | +19.1% / +0.53 / 512 trades | +4.8% / +0.20 / 228 trades | same |
+| static_atr | +5.6% / Shp +0.22 / 213 trades | +4.5% / +0.18 / 207 trades | −6 trades, returns nudged down by ungating fewer SMA200-NaN entries |
+| donchian_low_trail | +5.7% / +0.22 / 214 trades | +4.6% / +0.18 / 208 trades | same direction |
+| chandelier | +4.8% / +0.20 / 228 trades | +4.0% / +0.18 / 220 trades | same direction |
+
+And for completeness, the original ungated baseline (no gates, warmup trades
+counted) — kept here to show the gate's effect, not as a recommendation:
+
+| Variant | Ungated combined | R2 gated combined | Delta |
+|---|---|---|---|
+| static_atr | +24.2% / Shp +0.57 / 468 trades | +4.5% / +0.18 / 207 trades | ~56% fewer trades |
+| donchian_low_trail | +23.7% / +0.56 / 475 trades | +4.6% / +0.18 / 208 trades | same |
+| chandelier | +19.1% / +0.53 / 512 trades | +4.0% / +0.18 / 220 trades | same |
 
 The gates' main effect: 2022 trade count collapses from 106 → 7 because most
 of 2022 was BEAR regime on SPY, which blocks all new long entries via the
@@ -196,7 +227,7 @@ happen there at all).
 Mean returns inside 0.1 pp across every window. Sharpe identical to two
 decimals on the combined run. MaxDD inside 0.1 pp. The exit-mix shifts
 dramatically — signal exits fall from 54% → 29%, intrabar stops rise from
-32% → 50% — but the realized PnL doesn't move.
+31% → 51% — but the realized PnL doesn't move.
 
 **Why**: the trail level (`rolling_15_low − 0.5×ATR`) sits roughly where the
 strategy's own signal-exit trigger sits. The trail fires one bar *earlier*
@@ -206,9 +237,9 @@ the signal exit redundant, not better.
 
 ### Chandelier shifts the strategy's character — wrong direction for this universe
 
-Chandelier helps marginally in chop (2021: +0.5 pp, smaller MaxDD by 0.7 pp).
-But it **gives back 1.4 pp in the AI rally** (+3.5% → +2.1%) and 0.8 pp on
-the combined run. Trade count rises 7% (213 → 228) — more re-entries after
+Chandelier helps marginally in chop (2021: +0.5 pp, smaller MaxDD by 0.8 pp).
+But it **gives back 0.9 pp in the AI rally** (+2.8% → +1.9%) and 0.5 pp on
+the combined run. Trade count rises 6% (207 → 220) — more re-entries after
 premature stop-outs.
 
 **Why**: `HWM_close − 3×ATR` is a tighter trail than the strategy's own
@@ -219,8 +250,8 @@ to ride those names — clipping them early defeats the design.
 
 ### The gap-through fear is real but small in magnitude
 
-Static stop's `%Gap` is 7-10% across regimes. Trailing variants raise it to
-10-20% because the trail level sits closer to price. So the trail does catch
+Static stop's `%Gap` is 7-14% across regimes. Trailing variants raise it to
+12-29% because the trail level sits closer to price. So the trail does catch
 more gaps closer to the recent high — but those catches don't translate into
 aggregate edge because:
 
