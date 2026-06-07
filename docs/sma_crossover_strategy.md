@@ -25,7 +25,7 @@ pullbacks.
 **Why 20/50 and not 50/200 (classic "golden cross"):**
 The 50/200 golden cross is iconic but fires a few times per decade per
 name — far too rare to be a workable strategy at the watchlist scale we
-run (35 names). The 20/50 cross fires multiple times per name per year,
+run (40 names). The 20/50 cross fires multiple times per name per year,
 which is what makes the sleeve generate enough trades to be statistically
 meaningful. The 200 SMA *is* used elsewhere — as a gate in
 `SMAEdgeFilter` (stock above its 200 SMA) and in `SPYTrendFilter` (macro
@@ -44,7 +44,7 @@ SPY > 200 SMA). 200 SMA is a *structural gate*; 20/50 is the *trigger*.
 | Edge filter | `SMAEdgeFilter` + `SectorMomentumFilter` | `forward_test.py:210-216` |
 | Sleeve weight | 0.40 of equity (target) — carved from 0.45 when credit_spread was added | `settings.STRATEGY_ALLOCATIONS["sma_crossover"]["target_pct"]` |
 | ATR stop | `entry − 2.0 × ATR(14)` (static) | `settings.ATR_STOP_MULTIPLIER` |
-| Watchlist | `SMA_WATCHLIST` (35 names) | `config/settings.py` |
+| Watchlist | `SMA_WATCHLIST` (40 names) | `config/settings.py` |
 | Stop time-in-force | GTC (DAY at submit → promoted to GTC) | `engine/trader.py` |
 | Fractional shares | Enabled when MARKET path active | `settings.FRACTIONAL_ENABLED` |
 
@@ -164,27 +164,49 @@ baseline is established by the **giveback audit**:
 
 - Script: `scripts/sma_giveback_audit.py`
 - Window: 2018-11-01 → 2026-06-05 (~7.5 years of Alpaca IEX daily bars)
-- Universe: 40-name historical SMA_WATCHLIST
-- Output: 546 round-trip trades, 31.9% headline win rate, 61.5% capture
-  ratio of peak open profit on winning trades.
+- Universe: 40-name pinned `AUDIT_UNIVERSE` (frozen for reproducibility;
+  not `settings.SMA_WATCHLIST` which drifts)
+- Output: 571 entries, **34.9% headline win rate**, baseline net P&L
+  **$8,277 per-share unit**, 61.5% capture ratio of peak open profit on
+  the 174 death-cross winners.
 
 Full results — including the failed exit-overlay experiments
-(chandelier trail, profit-gated trail, fixed take-profit) and the
-per-symbol profit-concentration analysis — are in
+(chandelier trail, profit-gated trail, fixed take-profit), the
+per-symbol profit-concentration analysis, and the methodology gates
+required before any operational change — are in
 [`sma_crossover_optimizations.md`](sma_crossover_optimizations.md).
+
+The Phase 5 vectorbt harness (`backtest/runner.py`) was used for
+*initial* signal-logic validation and remains the right tool for
+parameter sensitivity / walk-forward studies; the giveback audit is a
+purpose-built simulator with stricter intrabar semantics for the
+exit-policy comparison.
 
 ---
 
 ## Methodology and limitations
 
-**Look-ahead.** Signals fire on bar `t`'s close; execution shifts to bar
-`t+1`'s open. Backtests use the same `_shift_for_next_open` helper as
-production routes through, so backtest fills and live fills are
-methodologically identical (modulo slippage realization).
+**Look-ahead — signal generation.** Signals fire on bar `t`'s close;
+execution shifts to bar `t+1`'s open. The vectorbt harness uses the
+`_shift_for_next_open` helper in `backtest/runner.py`; the giveback
+audit uses an equivalent open-of-next-bar convention implemented
+directly in the per-policy simulators.
 
-**Cost model.** Backtests apply 5 bps slippage and zero commission
-(Alpaca default). Live realized slippage is logged per fill via
-`reporting.logger` (`realized_slippage_bps`, `slippage_signed_bps`).
+**Look-ahead — intrabar exits.** The giveback audit avoids intrabar
+look-ahead on the entry bar: the chandelier / gated-trail policies
+enforce only the static disaster stop on entry day (since the trail
+level would otherwise reference the entry bar's close, which prints
+after the bar's high/low). The trail engages from the bar after entry
+onward. Documented and unit-tested in
+`tests/test_sma_giveback_audit.py::TestPolicyChandelierEntryBarNoLookahead`.
+
+**Cost model.** The vectorbt harness applies 5 bps slippage and zero
+commission (Alpaca default). The giveback audit (`sma_giveback_audit.py`)
+runs **without slippage or commissions** — it's a *relative* policy
+comparison and the same costs would apply to every policy, so they
+cancel from the comparison. Live realized slippage is logged per fill
+via `reporting.logger` (`realized_slippage_bps`, `slippage_signed_bps`)
+regardless of which research tool is run.
 
 **Data feed.** Production runs on Alpaca's IEX feed (paper-account
 constraint; SIP requires paid subscription). Backtests use the same

@@ -264,7 +264,15 @@ def _policy_chandelier(
     """
     Death-cross exit + 2.0×ATR disaster stop + chandelier trail (HWM−k·ATR).
     Whichever fires first wins. See _policy_baseline for the entry-bar
-    semantics.
+    semantics on the disaster stop.
+
+    Entry-bar look-ahead avoidance: the chandelier trail uses HWM, which
+    is initialized from the entry bar's CLOSE. The close prints after the
+    bar's high and low, so a trail level derived from it didn't exist yet
+    during the bar's intraday range. We therefore enforce ONLY the static
+    disaster stop on the entry bar; the chandelier engages from the bar
+    after entry onward, by which time HWM is grounded in a close that
+    actually preceded the bar being evaluated.
     """
     entry_price = bars.opens[entry_idx]
     entry_atr = bars.atr[entry_idx - 1]
@@ -274,10 +282,19 @@ def _policy_chandelier(
     n = len(bars.closes)
 
     for i in range(entry_idx, n):
-        trail_stop = hwm_close - k * entry_atr
-        effective_stop = max(disaster_stop, trail_stop)
+        # Entry bar: disaster stop only — no look-ahead trail check.
+        # Subsequent bars: max(disaster, trail) with trail using yesterday's
+        # HWM (HWM is updated AFTER the stop check below).
+        if i == entry_idx:
+            effective_stop = disaster_stop
+        else:
+            trail_stop = hwm_close - k * entry_atr
+            effective_stop = max(disaster_stop, trail_stop)
         if bars.lows[i] <= effective_stop:
-            reason = "trail" if trail_stop >= disaster_stop else "atr_stop"
+            reason = (
+                "trail" if i > entry_idx and effective_stop > disaster_stop
+                else "atr_stop"
+            )
             return (i, _fill_through_stop(bars.lows[i], effective_stop),
                     reason, hwm_close, hwm_idx)
         if bars.closes[i] > hwm_close:
@@ -296,8 +313,12 @@ def _policy_gated_trail(
 ) -> tuple[int, float, str, float, int]:
     """
     Death-cross + 2.0×ATR disaster + chandelier trail that ARMS only after
-    unrealized close-profit ≥ activation_k × ATR. See _policy_baseline for
-    the entry-bar semantics.
+    unrealized close-profit ≥ activation_k × ATR.
+
+    Same entry-bar semantics as _policy_chandelier: only the static disaster
+    stop on the entry bar (the trail would otherwise reference a close that
+    hadn't printed yet when the bar's low was set). Arming logic also runs
+    only from the bar after entry — same rationale.
     """
     entry_price = bars.opens[entry_idx]
     entry_atr = bars.atr[entry_idx - 1]
@@ -308,18 +329,27 @@ def _policy_gated_trail(
     n = len(bars.closes)
 
     for i in range(entry_idx, n):
-        if armed:
+        # Entry bar: disaster only, no arming.
+        if i == entry_idx:
+            effective_stop = disaster_stop
+        elif armed:
             effective_stop = max(disaster_stop, hwm_close - trail_k * entry_atr)
         else:
             effective_stop = disaster_stop
         if bars.lows[i] <= effective_stop:
-            reason = "trail" if armed and effective_stop > disaster_stop else "atr_stop"
+            reason = (
+                "trail" if i > entry_idx and armed and effective_stop > disaster_stop
+                else "atr_stop"
+            )
             return (i, _fill_through_stop(bars.lows[i], effective_stop),
                     reason, hwm_close, hwm_idx)
         if bars.closes[i] > hwm_close:
             hwm_close = bars.closes[i]
             hwm_idx = i
-        if not armed and (bars.closes[i] - entry_price) >= activation_k * entry_atr:
+        # Arming runs only from the bar after entry (the close used for the
+        # arming check must precede any future intrabar evaluation).
+        if (i > entry_idx and not armed
+                and (bars.closes[i] - entry_price) >= activation_k * entry_atr):
             armed = True
         if i > entry_idx and (
             bars.fast[i] < bars.slow[i] and bars.fast[i - 1] >= bars.slow[i - 1]

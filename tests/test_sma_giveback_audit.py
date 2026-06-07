@@ -286,6 +286,74 @@ class TestPolicyBaselineOpenAtEnd:
         assert exit_idx == len(bars.closes) - 1
 
 
+class TestPolicyChandelierEntryBarNoLookahead:
+    """
+    The chandelier's HWM is initialized from entry_idx's close, which
+    prints AFTER the bar's high/low. Evaluating a trail derived from that
+    close against the same bar's low is intrabar look-ahead. The entry
+    bar must enforce ONLY the static disaster stop; the trail engages
+    from the next bar onward.
+    """
+
+    def test_entry_bar_low_below_trail_does_not_trigger_trail(self):
+        # Arrange a setup where on the entry bar:
+        #   - the disaster stop is FAR below entry (large ATR), so it does
+        #     not trigger
+        #   - a hypothetical chandelier trail at HWM - 0.5*ATR DOES sit
+        #     above the bar's low, so a look-ahead check would fire
+        # Under the corrected policy, neither fires on the entry bar.
+        df = _up_only_frame()
+        bars = _prepare_bars(df)
+        entries = _iter_entries(bars)
+        assert entries
+        trimmed_entry = entries[0]
+        entry_close = bars.closes[trimmed_entry]
+        entry_atr = bars.atr[trimmed_entry - 1]
+
+        # Engineer the entry bar's low to sit between disaster_stop (very
+        # low) and a hypothetical tight chandelier trail (HWM - 0.5*ATR).
+        # A buggy implementation would treat this as a trail hit.
+        target_low = entry_close - 0.5 * entry_atr  # tight; above disaster
+
+        u_idx = trimmed_entry + (len(df) - len(bars.closes))
+        df.iloc[u_idx, df.columns.get_loc("low")] = target_low
+
+        bars = _prepare_bars(df)
+        exit_idx, _, exit_reason, *_ = _policy_chandelier(
+            bars, trimmed_entry, k=0.5
+        )
+        # Under the corrected policy: no trail check on entry bar →
+        # position survives past the entry bar.
+        assert exit_idx > trimmed_entry
+        # And if it later exits via the chandelier, that's after entry.
+        assert exit_reason in ("trail", "death_cross", "atr_stop", "eod")
+
+    def test_entry_bar_disaster_stop_still_triggers(self):
+        # The static disaster stop is computed from the entry open and is
+        # known before the bar trades — it CAN trigger on the entry bar.
+        # This pins that the entry-bar look-ahead fix did NOT also turn off
+        # the legitimate disaster-stop check.
+        df = _up_only_frame()
+        bars = _prepare_bars(df)
+        entries = _iter_entries(bars)
+        assert entries
+        trimmed_entry = entries[0]
+        entry_price = bars.opens[trimmed_entry]
+        entry_atr = bars.atr[trimmed_entry - 1]
+        disaster_stop = entry_price - ATR_STOP_MULT * entry_atr
+
+        u_idx = trimmed_entry + (len(df) - len(bars.closes))
+        df.iloc[u_idx, df.columns.get_loc("low")] = disaster_stop - 0.01
+
+        bars = _prepare_bars(df)
+        exit_idx, exit_price, exit_reason, *_ = _policy_chandelier(
+            bars, trimmed_entry, k=3.0
+        )
+        assert exit_idx == trimmed_entry
+        assert exit_reason == "atr_stop"
+        assert exit_price == pytest.approx(disaster_stop)
+
+
 class TestPolicyChandelierExitFiresBeforeDeathCross:
     def test_chandelier_can_exit_before_death_cross(self):
         df = _golden_then_death_cross_frame()

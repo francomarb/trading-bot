@@ -221,7 +221,7 @@ whether it's tight enough.
 
 | | Status | Action |
 |---|---|---|
-| Replay false starts with stricter filters | TODO | Replay the 546 historical entries with stricter filter configs (higher volume-expansion threshold, hotter sector floor, longer SPY trend window). For each config, report *winners blocked* vs *losers avoided*. |
+| Replay false starts with stricter filters | TODO | Replay the 571 historical entries with stricter filter configs (higher volume-expansion threshold, hotter sector floor, longer SPY trend window). For each config, report *winners blocked* vs *losers avoided*. |
 | Symmetric false-negative check | TODO | Are any current gates blocking eventual winners? E.g., winners that entered on a NEUTRAL-sector bar that rotated HOT shortly after — `SectorMomentumFilter` would have blocked them. |
 
 ### 3. Regime allocation — MEDIUM LEVERAGE
@@ -233,7 +233,7 @@ strategies.
 
 | | Status | Action |
 |---|---|---|
-| Bucket the 546 audit trades by regime-at-entry | TODO | Report win rate, expectancy, and giveback per regime. |
+| Bucket the 571 audit trades by regime-at-entry | TODO | Report win rate, expectancy, and giveback per regime. |
 | Drop dead regimes if signal is clear | TODO | If a regime is clearly negative-expectancy, gate the sleeve more tightly and rebalance `SLEEVE_TARGETS`. |
 
 ### 4. Position sizing — MEDIUM LEVERAGE
