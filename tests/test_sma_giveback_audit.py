@@ -1,12 +1,24 @@
 """
 Unit tests for scripts/sma_giveback_audit.py.
 
-Covers the failure modes flagged in the ChatGPT review:
-  - Entry/stop ordering on the entry bar (no same-bar stop hit)
-  - Gap-through-stop pricing (fill at stop, not at the gap-down open)
-  - Alternative-policy comparisons fire on every entry, not just winners
-  - Open positions at end of dataset are recorded with reason='eod'
-  - Universe pinning makes results reproducible
+Covers the failure modes flagged across the ChatGPT review rounds:
+  - Entry-bar stop and take-profit ARE honored (production's OTO stop
+    attaches as soon as the parent fills at the open, so an entry-day
+    gap CAN exit on the same bar). The death-cross check, by contrast,
+    is intentionally one bar later — see _policy_baseline docstring.
+  - Chandelier / gated-trail trail-stops are NOT enforced on the entry
+    bar (the trail level would reference the entry-day close, which
+    prints after the bar's high/low — that would be intrabar look-ahead).
+    The static disaster stop still applies on the entry bar.
+  - Gated-trail ARMING does run on the entry-bar close: today's close
+    prints before tomorrow's session opens, so end-of-day arming to
+    protect the next bar is legitimate (NOT look-ahead).
+  - Gap-through-stop pricing fills at the stop level, not at the
+    gap-down open (documented limitation, pinned by test).
+  - Alternative-policy comparisons fire on every entry, not just
+    death-cross winners.
+  - Open positions at end of dataset are recorded with reason='eod'.
+  - Universe pinning makes results reproducible.
 """
 from __future__ import annotations
 

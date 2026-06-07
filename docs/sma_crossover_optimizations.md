@@ -209,10 +209,16 @@ the universe materially changes or someone proposes a new exit variant.
 
 ### 1. Watchlist composition — HIGHEST LEVERAGE
 
-Profit concentration analysis: **70% of lifetime profit comes from 5 of
-40 names**, and the bottom 20 collectively *lose* money. Every dollar
-spent improving watchlist composition is worth more than every dollar
-spent on entry/exit logic.
+Profit concentration analysis: **60% of lifetime profit comes from 5 of
+40 names** (top contributors: SNDK, ASML, STRL, MU, STX), and only **5
+of 40 names are net-negative** over the window (combined drag −$263).
+The bottom half collectively contributes a small positive (+$222). The
+strategy still has a long-tail-of-monster-winners character — the top
+5 produce $5,004 of an $8,277 total — but it is *not* the case that
+the bottom half is dead weight. Every dollar spent improving watchlist
+composition is still high leverage, but the bar for cutting a name is
+"is it consistently negative under filtered, sized, OOS conditions"
+rather than "is its unit-share P&L positive."
 
 | | Status | Action |
 |---|---|---|
