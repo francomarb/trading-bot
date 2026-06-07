@@ -75,21 +75,19 @@ MLEG_ENTRY_WATCH_TIMEOUT_SECONDS: float = float(
 # position (RS%=40.5 at scan time — clearly weak; let the strategy exit it
 # on its own signal, then remove from this list on next refresh).
 SMA_WATCHLIST = [
-    "SNDK", "WDC", "STX", "GSAT", "POWL", "ASML", "MSTR",
-    "MU", "FORM", "CSTM", "DOCN", "TTMI", "FRO", "MTZ",
-    "DK", "ASX", "CAT", "HUT", "GLW", "AMD", "STRL",
+    "SNDK", "WDC", "STX", "GSAT", "POWL", "VIAV", "VSAT", "CIEN", "ASML", "MSTR",
+    "MU", "FORM", "ALB", "CSTM", "DOCN", "TTMI", "FRO", "MTZ",
+    "DK", "ASX", "CAT", "HUT", "GLW", "AMD", "STRL", "INTC",
     "BE", "ECG", "MRVL", "NVT", "SQM", "TSEM", "PL", "UBER",
     "NVDA", "ADBE", "ANET", "META", "PLTR", "DUOL",
 ]
-# Watchlist culling — 2026-06-06: removed 5 chronic underperformers identified
-# by scripts/sma_giveback_audit.py over a 7.5y window (2018-11 → 2026-06):
-#   VIAV (-$2),  VSAT (-$31),  CIEN (-$19),  ALB (-$79),  INTC (-$8)
-# Combined drag: -$139/share. Each had 12-20 trades, win rate 14-23%, and
-# never produced a runner large enough to outweigh the stop-outs over a full
-# market cycle (incl. 2020 melt-up, 2022 bear, 2024 AI rally).
-# ADBE retained despite -$132 audit drag: operator thesis — AI-driven sell-off
-# similar to NOW, expected to mean-revert as Adobe's GenAI product line lands.
-# Revisit on next sma_watchlist_scan.py refresh (target: quarterly cadence).
+# Cull deferred 2026-06-06 — an earlier audit (scripts/sma_giveback_audit.py)
+# flagged VIAV, VSAT, CIEN, ALB, INTC as chronic underperformers and removed
+# them. Reviewer correctly pointed out the audit used unit-share, unfiltered,
+# in-sample P&L; production uses ATR-risk sizing plus regime + SPY + SMA edge
+# + sector + earnings filters. The cull was reverted pending a filter-aware,
+# walk-forward, OOS-validated re-audit. See sma_crossover_optimizations.md
+# for the gating conditions before any cull is re-promoted.
 # RSI Reversion — mean-reversion; promoted from the 2026-04-30 expanded
 # backtest pass to increase signal density for the static paper-trading pool.
 # This list intentionally favors breadth over the earlier narrow scanner

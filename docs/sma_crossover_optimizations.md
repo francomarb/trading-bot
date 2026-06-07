@@ -15,23 +15,56 @@ out, and what's worth investigating next.
 
 ## Empirical baseline (2018-11 → 2026-06)
 
-Source: `scripts/sma_giveback_audit.py`. Walks every 20/50 round trip on
-daily Alpaca IEX bars across the full historical SMA_WATCHLIST. Unit
-shares; no filter overlays applied to the simulation (pure strategy
-mechanics with the production ATR stop at 2.0 × ATR(14)).
+Source: `scripts/sma_giveback_audit.py` on the **pinned 40-symbol
+`AUDIT_UNIVERSE`** (frozen at the time of the original audit; not
+`settings.SMA_WATCHLIST` which drifts). Daily Alpaca IEX bars.
 
-### Trade outcomes (546 round trips, 40-name universe)
+### Methodology disclosures
+
+This audit measures *strategy mechanics in isolation*. It does **not**:
+
+- apply production entry filters (`SMAEdgeFilter`, `SectorMomentumFilter`,
+  `SPYTrendFilter`, regime gate, earnings blackout) — every signal bar
+  trades;
+- model position sizing — unit shares throughout, so $-magnitudes are
+  comparable across policies but not to live equity-curve impact;
+- perform walk-forward / OOS validation — the same window generates
+  signals and evaluates policies;
+- model gap-through-stop fills accurately — a violent gap-down fills at
+  the stop level, not at the gap-down open (`_fill_through_stop` in the
+  script pins this assumption with a unit test).
+
+Any operational decision (e.g., culling a name from production)
+**requires an audit that addresses these limits.** See the
+[Methodology gates](#methodology-gates-before-acting-on-this-audit)
+section below.
+
+### Trade outcomes (571 entries, 40-name pinned universe)
+
+Run `venv/bin/python -m scripts.sma_giveback_audit --universe audit`
+to reproduce.
 
 | | Count | Notes |
 |---|---|---|
-| Total round trips | 546 | |
-| Exited at ATR stop | 336 (62%) | False-start entries |
-| Exited at death cross | 210 (38%) | Trend ran to its natural end |
+| Total entries | 571 | Every 20/50 golden cross, non-overlapping |
+| Exited at ATR stop | 336 (59%) | False-start entries |
+| Exited at death cross | 209 (37%) | Trend ran to its natural end |
+| Still open at end-of-data | 26 (5%) | `reason="eod"` — not silently dropped |
 | ↳ death-cross winners | 174 | 83% win rate *given* death-cross exit |
-| ↳ death-cross losers | 36 | Signal flipped before stop got hit |
 
-**Headline win rate across all entries: 31.9%.** Low-win-rate, high-skew
-strategy by design — most entries fail; a few runners pay for everything.
+**Baseline net P&L across all 571 entries: $8,277 (per-share unit).**
+**Headline win rate: 34.9%** (199 of 571 trades positive). Low-win-rate,
+high-skew strategy by design — most entries fail; a few runners pay for
+everything.
+
+> **Note on earlier headline numbers.** An earlier version of this doc
+> reported "546 round trips" and "$4,917 captured." Both were artifacts
+> of the previous script structure: 546 excluded the 26 EOD-open
+> positions (silently dropped), and $4,917 was the sum across **death-
+> cross winners only** rather than all entries — making the
+> alternative-exit comparison apples-to-oranges. The unified-policy
+> script fixes both. The qualitative conclusions are unchanged; the
+> exact numbers in the comparison tables below shifted.
 
 ### Profit concentration
 
@@ -69,47 +102,72 @@ remainder is the price paid for not exiting early.
 
 ## Completed experiments (all ruled out)
 
-Three alternative exit rules were tested against the death-cross baseline
-on the 174 winning trades. Each one **lost** money vs. baseline; the
-death-cross exit is the empirical optimum on this universe.
+Three families of alternative exit rules were tested under the **unified
+policy comparison** — every entry replayed under each *complete* exit
+policy (death cross + 2.0×ATR disaster stop + overlay), with aggregate
+net P&L on all 571 entries as the comparison metric. Each policy lost
+to the baseline; the death cross is the empirical optimum on this
+universe.
 
 ### 1. Chandelier ATR trail (HWM − K · ATR)
 
-| K | Captured | Δ vs baseline | Bit early on |
-|---|---|---|---|
-| Baseline (death cross) | $4,917 | — | — |
-| 2.5 | $2,181 | −$2,736 (−55.6%) | 157/174 winners (90%) |
-| 3.0 | $2,427 | −$2,489 (−50.6%) | 154/174 |
-| 3.5 | $2,777 | −$2,140 (−43.5%) | 147/174 |
+| K | Net P&L | Δ vs baseline | Win rate | Avg trade |
+|---|---|---|---|---|
+| Baseline (death cross + 2.0 ATR) | $8,277 | — | 34.9% | $14.50 |
+| 2.5 | $2,011 | −$6,266 (−76%) | 44.0% | $3.52 |
+| 3.0 | $2,444 | −$5,832 (−70%) | 41.3% | $4.28 |
+| 3.5 | $2,813 | −$5,464 (−66%) | 41.0% | $4.93 |
 
 **Why it fails:** SMA winners typically push +5 ATR, pull back 3–5 ATR
 during consolidation, then resume up. The trail catches the consolidation
 and treats it as reversal. The 20/50 cross is slow enough to ride through.
+Win rate goes *up* (a chandelier exits some atr-stop losers at a smaller
+loss) but the cumulative loss-of-runner-upside dwarfs the savings.
 
 ### 2. Profit-gated trail (arm only after profit ≥ N · ATR)
 
-| Activation | Trail K | Captured | Δ vs baseline |
-|---|---|---|---|
-| 3 ATR | 5 ATR | $3,967 | −$950 (−19%) |
-| 4 ATR | 5 ATR | $4,024 | −$892 (−18%) |
-| 5 ATR | 5 ATR | $4,041 | −$876 (−18%) |
+| Activation | Trail K | Net P&L | Δ vs baseline | Win rate |
+|---|---|---|---|---|
+| 3 ATR | 5 ATR | $4,004 | −$4,273 (−52%) | 36.8% |
+| 4 ATR | 5 ATR | $4,032 | −$4,245 (−51%) | 37.0% |
+| 5 ATR | 5 ATR | $4,026 | −$4,251 (−51%) | 37.7% |
+| 4 ATR | 3 ATR | $2,595 | −$5,682 (−69%) | 40.6% |
+| 5 ATR | 4 ATR | $3,175 | −$5,102 (−62%) | 37.7% |
 
 **Why it fails:** even with a 5-ATR activation, the trail bites early on
-71% of armed winners. The pullback-then-resume pattern is too common in
-this universe for any trail-based rule to survive.
+the pullback-then-resume pattern. Wider trails (K=5) help but still
+underperform — once the trail arms, *any* consolidation deeper than the
+trail distance exits before the runner finishes.
 
 ### 3. Fixed-% take-profit
 
-| Target | Captured | Δ vs baseline |
-|---|---|---|
-| +10% | $1,593 | −$3,214 (−67%) |
-| +50% | $3,693 | −$1,114 (−23%) |
-| +100% | $4,396 | −$411 (−8.5%) |
-| +150% | $4,775 | −$32 (−0.7%) |
+| Target | Net P&L | Δ vs baseline | Win rate | Avg trade |
+|---|---|---|---|---|
+| +10% | $837 | −$7,440 (−90%) | 49.7% | $1.47 |
+| +20% | $1,797 | −$6,480 (−78%) | 38.7% | $3.15 |
+| +30% | $2,295 | −$5,981 (−72%) | 36.1% | $4.02 |
+| +50% | $3,464 | −$4,813 (−58%) | 35.2% | $6.07 |
+| +75% | $4,538 | −$3,739 (−45%) | 34.9% | $7.95 |
+| +100% | $5,183 | −$3,094 (−37%) | 34.9% | $9.08 |
+| +150% | $5,946 | −$2,331 (−28%) | 34.9% | $10.41 |
 
 **Why it fails:** the strategy's profit comes from a small number of
-+200%–+400% runners. Even a +150% target caps the tail and bleeds value;
-tighter targets bleed disastrously.
++200%–+400% runners. Every TP threshold tested caps that tail.
+Interestingly, *even with the selection-bias fix*, no take-profit
+threshold approaches the baseline — earlier doc said +150% was within
+$32 of baseline, but that was comparing winner-only sums. On the full
+571-entry sample, +150% still loses $2,331 because some "losing" trades
+that briefly popped above +150% never had a chance to roll into the
+catastrophic ones.
+
+### Behavioral observation worth flagging
+
+Look at the **win rate** column. Tight take-profits push win rate from
+35% → 50%. That *feels* great psychologically — you're "right" more
+often. The math is the opposite: avg trade collapses from $14.50 to
+$1.47. This is the textbook trend-follower psychology trap: small wins
+feel like skill; the rare monster runner that pays for all of it gets
+sliced.
 
 ### What NOT to revisit
 
@@ -138,10 +196,10 @@ spent on entry/exit logic.
 
 | | Status | Action |
 |---|---|---|
-| Cull chronic underperformers | ✅ DONE 2026-06-06 | Removed VIAV, VSAT, CIEN, ALB, INTC. ADBE retained on operator AI-rebound thesis. |
+| Cull chronic underperformers | ⛔ DEFERRED 2026-06-06 | Briefly removed VIAV, VSAT, CIEN, ALB, INTC; reverted after reviewer correctly noted the audit was unit-share, unfiltered, and in-sample — see *Methodology gates* below. Re-promote only after the gated audit signs off. |
 | Quarterly automatic regeneration | TODO | Schedule `scripts/sma_watchlist_scan.py` via cron / scheduled task. Diff before promoting to settings. |
 | Scanner ranking criterion audit | TODO | Audit `sma_watchlist_v2` rule in `sma_watchlist_scan.py`. Does it select for *trend-friendliness* (clean directional moves, high ATR-adjusted returns) or just historical price action? |
-| Chronic-loser eject rule | TODO | Add a scanner rule: any name with negative net P&L on the strategy over a rolling 3y window is auto-excluded from the next regeneration. |
+| Chronic-loser eject rule | TODO | Add a scanner rule: any name with negative net P&L on the strategy over a rolling 3y window is auto-excluded from the next regeneration. Must use the filtered/sized audit, not the raw one. |
 
 ### 2. Filter calibration — MEDIUM-HIGH LEVERAGE
 
@@ -193,12 +251,45 @@ spike with bad neighbors, we're overfit and need to back off.
 
 ---
 
+## Methodology gates before acting on this audit
+
+The audit as it stands is sufficient for **directional research questions**
+(does adding a trail / take-profit beat the death cross? Probably not.).
+It is **not** sufficient for **operational decisions** (e.g., culling a
+name from the live watchlist).
+
+Before any operational change is promoted based on this audit, **all
+four** of the following must be true:
+
+1. **Filter-aware replay** — the audit must apply the production filter
+   stack (`SMAEdgeFilter`, `SectorMomentumFilter`, `SPYTrendFilter`,
+   regime gate, earnings blackout) at the entry bar. A name that looks
+   terrible in unfiltered sim may be fine once production gates remove
+   the bad entries.
+2. **Production-equivalent sizing** — fixed-fractional ATR-risk
+   position sizing, not unit shares. Per-share P&L can be very different
+   from equity-curve impact.
+3. **Walk-forward / OOS validation** — the rule deriving the change
+   (e.g., "this name's net P&L is negative") must hold *out-of-sample*
+   on at least one held-out fold of comparable length to the proposed
+   change's expected life.
+4. **Operator review** — quantitative signal alone is not enough. The
+   operator must sign off after seeing both the quantitative result and
+   their independent thesis on the name. (See: ADBE was nominally
+   negative in the audit but retained on operator AI-rebound thesis.)
+
+These gates exist because of the 2026-06-06 false-start: a watchlist
+cull was promoted based on raw audit P&L, reviewed by ChatGPT, found to
+be unsupportable on methodology, and reverted before merge.
+
 ## Change log
 
 | Date | Change | Source / Rationale |
 |---|---|---|
 | 2026-06-06 | Created this doc | Capture findings from giveback audit; separated from strategy spec doc per pattern of other sleeves. |
-| 2026-06-06 | Removed VIAV, VSAT, CIEN, ALB, INTC from `SMA_WATCHLIST` | Chronic losers over 7.5y backtest (negative cumulative P&L, no producing runner). ADBE retained on operator thesis: AI-driven sell-off similar to NOW, expected to mean-revert as Adobe's GenAI products land. |
+| 2026-06-06 | **Reverted** removal of VIAV, VSAT, CIEN, ALB, INTC from `SMA_WATCHLIST` | Reviewer correctly identified the audit was unit-share / unfiltered / in-sample; not a sufficient basis for an operational change. Cull deferred until the *Methodology gates* are satisfied. |
+| 2026-06-06 | Restructured audit script to a **unified policy comparison** | Earlier version simulated alternative exits only on death-cross winners — selection-biased. New version replays every entry under each *complete* policy; aggregate net P&L is the comparison metric. Headline numbers in this doc updated accordingly. |
+| 2026-06-06 | Pinned audit universe (`AUDIT_UNIVERSE` constant in script) | Earlier version read `settings.SMA_WATCHLIST` and would silently drift. Now the documented numbers reproduce exactly via `--universe audit` (default). |
 
 ---
 

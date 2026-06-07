@@ -1,25 +1,51 @@
 """
-SMA Crossover giveback audit — measures profit surrendered between high-water
-mark and the 20/50 death-cross exit, and compares vs. a chandelier trail.
+SMA Crossover audit — replays every 20/50 SMA round trip on daily Alpaca
+IEX bars and compares full exit policies (baseline death-cross+ATR stop vs
+alternative exits) on an apples-to-apples basis.
 
-For each symbol in SMA_WATCHLIST:
-  1. Pull daily bars over the maximum available Alpaca range.
-  2. Walk every 20/50 SMA crossover round trip on close-to-close logic:
-       entry  = bar where SMA20 crosses above SMA50  (exec next open)
-       exit_A = bar where SMA20 crosses below SMA50  (exec next open)
-       exit_B = static ATR stop (entry - 2 * ATR14)  if hit first
-  3. For each WINNING trade exited on the death cross, compute:
-       giveback_$   = HWM_close - exit_price
-       giveback_pct = (HWM - exit) / (HWM - entry)   # fraction of peak profit
-       giveback_atr = (HWM - exit) / ATR_at_entry    # ATR units
-  4. Simulate a chandelier overlay (HWM_close - K * ATR14) for K in {2.5, 3.0, 3.5}
-     and report captured profit vs. the death-cross baseline.
+Methodology notes (reviewed against ChatGPT P1 feedback 2026-06-06)
+------------------------------------------------------------------
 
-Output is print-only (tabular). No DB writes, no log spam.
+**Universe is pinned, not read from settings.** The documented results
+use a frozen 40-symbol audit universe (`AUDIT_UNIVERSE` below). This is
+the universe the docs and the historical numbers refer to. The current
+production watchlist (`settings.SMA_WATCHLIST`) drifts as names are
+added or culled — auditing against it would make every doc number a
+moving target. Use `--universe current` to override.
+
+**Alternative exits are replayed on every entry, not just death-cross
+winners.** An earlier version of this audit only simulated chandelier /
+gated-trail / take-profit overlays on the 174 death-cross winners,
+excluding the 336 trades that died at the ATR stop. That was
+selection-biased: a chandelier could have cut a losing trade earlier (or
+later, or made no difference); a +10% take-profit could have captured a
+small win on a trade that subsequently failed at the ATR stop. The
+current implementation simulates each *complete* exit policy (death
+cross + ATR stop + optional overlay) from entry to exit and compares
+aggregate net P&L across **all** entries.
+
+**Limitations not addressed by this audit.**
+
+- Unit shares; no ATR-risk position sizing. P&L is per-share, comparable
+  across policies but not to live equity-curve impact.
+- No entry filters applied. Production runs `SMAEdgeFilter`,
+  `SectorMomentumFilter`, `SPYTrendFilter`, regime gate, and earnings
+  blackout. None of those are replayed here.
+- In-sample: the full window is used for both signal generation and
+  policy comparison. Walk-forward / OOS validation has not been
+  performed.
+- Gap-through-stop fills at the stop level, not at the gap-down open.
+  This understates losses on gappy names — see the `_fill_through_stop`
+  helper for the assumption.
+
+Any operational decision (e.g., cull a name from the production
+watchlist) should be supported by an audit that addresses these
+limitations.
 """
 from __future__ import annotations
 
-from dataclasses import dataclass
+import argparse
+from dataclasses import dataclass, field
 from datetime import datetime, timezone
 import statistics
 import sys
@@ -32,20 +58,18 @@ from data.fetcher import fetch_symbol
 from indicators.technicals import add_sma, add_atr
 
 
+# ── Audit configuration (pinned for reproducibility) ────────────────────────
+
 FAST = 20
 SLOW = 50
 ATR_LEN = 14
 ATR_STOP_MULT = 2.0
 TRAIL_KS = (2.5, 3.0, 3.5)
+PROFIT_TARGETS_PCT = (0.10, 0.20, 0.30, 0.50, 0.75, 1.00, 1.50)
 
 # Profit-gated trail grid: activation threshold (in ATR units of unrealized
 # profit) × trail distance (in ATR units below HWM).
-# - activation = 0   → trail is live from entry (equivalent to plain chandelier)
-# - activation = N   → trail arms only after (close - entry) >= N * ATR
-PROFIT_TARGETS_PCT = (0.10, 0.20, 0.30, 0.50, 0.75, 1.00, 1.50)
-
 GATED_GRID = [
-    # (activation_atr, trail_atr)
     (2.0, 3.0),
     (2.0, 4.0),
     (3.0, 3.0),
@@ -58,26 +82,38 @@ GATED_GRID = [
     (5.0, 5.0),
 ]
 
+# Audited universe — 40 symbols, frozen at the time of the original audit.
+# Docs reference results computed on this set. Do not change without bumping
+# the audit doc baseline.
+AUDIT_UNIVERSE: tuple[str, ...] = (
+    "SNDK", "WDC", "STX", "GSAT", "POWL", "VIAV", "VSAT", "CIEN", "ASML",
+    "MSTR", "MU", "FORM", "ALB", "CSTM", "DOCN", "TTMI", "FRO", "MTZ",
+    "DK", "ASX", "CAT", "HUT", "GLW", "AMD", "STRL", "INTC", "BE", "ECG",
+    "MRVL", "NVT", "SQM", "TSEM", "PL", "UBER", "NVDA", "ADBE", "ANET",
+    "META", "PLTR", "DUOL",
+)
+
+AUDIT_START = datetime(2018, 11, 1, tzinfo=timezone.utc)
+AUDIT_END = datetime(2026, 6, 5, tzinfo=timezone.utc)
+
+
+# ── Trade data model ────────────────────────────────────────────────────────
+
 
 @dataclass
 class Trade:
+    """A single round-trip trade under a single exit policy."""
+
     symbol: str
+    policy: str                          # human-readable policy name
     entry_date: pd.Timestamp
     entry_price: float
     exit_date: pd.Timestamp
     exit_price: float
-    exit_reason: str          # "death_cross" | "atr_stop"
-    hwm_close: float
+    exit_reason: str                     # "death_cross" | "atr_stop" | "trail" | "take_profit" | "eod"
+    hwm_close: float                     # max close from entry to exit
     hwm_date: pd.Timestamp
     atr_at_entry: float
-    # Chandelier-overlay results (only populated when exit_reason='death_cross')
-    chandelier_exits: dict = None  # {k: (exit_date, exit_price)}
-    # Profit-gated trail overlays — keyed by (activation_atr, trail_atr).
-    # Value is (exit_date, exit_price, armed_bool).
-    gated_exits: dict = None
-    # Fixed-% take-profit overlays — keyed by target pct (0.50 = +50%).
-    # Value is (exit_date, exit_price, hit_bool).
-    pt_exits: dict = None
 
     @property
     def pnl(self) -> float:
@@ -104,177 +140,338 @@ class Trade:
         return self.giveback_dollars / self.atr_at_entry
 
 
-def simulate_symbol(symbol: str, df: pd.DataFrame) -> list[Trade]:
-    """Walk through every 20/50 crossover round trip on the bar series."""
+# ── Exit policies ───────────────────────────────────────────────────────────
+
+
+def _fill_through_stop(low: float, stop: float) -> float:
+    """
+    Assumed fill price when intrabar low touches the stop. Returns the stop
+    level (best-case: clean stop-limit fill at the trigger). A gappy bar
+    that opens below the stop would fill worse in production; this audit
+    intentionally understates that loss because the magnitude is
+    instrument-specific and the audit's job is *relative* comparison
+    across policies. Documented as a known limitation.
+    """
+    # If the gap was so violent the *low* was already well below the stop,
+    # the live fill would also be below the stop. We do not model that.
+    return stop
+
+
+@dataclass
+class _BarsView:
+    """Cached per-symbol arrays passed into the exit-policy simulators."""
+
+    dates: pd.DatetimeIndex
+    opens: np.ndarray
+    highs: np.ndarray
+    lows: np.ndarray
+    closes: np.ndarray
+    fast: np.ndarray
+    slow: np.ndarray
+    atr: np.ndarray
+
+
+def _prepare_bars(df: pd.DataFrame) -> _BarsView | None:
+    """Add SMAs + ATR, drop warmup NaNs, and freeze arrays for the loops."""
     df = add_sma(df, FAST)
     df = add_sma(df, SLOW)
     df = add_atr(df, ATR_LEN)
     df = df.dropna(subset=[f"sma_{FAST}", f"sma_{SLOW}", f"atr_{ATR_LEN}"]).copy()
     if df.empty:
+        return None
+    return _BarsView(
+        dates=df.index,
+        opens=df["open"].to_numpy(),
+        highs=df["high"].to_numpy(),
+        lows=df["low"].to_numpy(),
+        closes=df["close"].to_numpy(),
+        fast=df[f"sma_{FAST}"].to_numpy(),
+        slow=df[f"sma_{SLOW}"].to_numpy(),
+        atr=df[f"atr_{ATR_LEN}"].to_numpy(),
+    )
+
+
+def _iter_entries(bars: _BarsView) -> list[int]:
+    """
+    Return the entry bar indices (i+1 — execution shifts to next open)
+    for every golden-cross signal. We pair entries to exits trade-by-trade
+    in the policy simulators; this helper just identifies the signal bars.
+    """
+    entry_indices: list[int] = []
+    n = len(bars.closes)
+    for i in range(1, n):
+        if bars.fast[i] > bars.slow[i] and bars.fast[i - 1] <= bars.slow[i - 1]:
+            if i + 1 < n:
+                entry_indices.append(i + 1)
+    return entry_indices
+
+
+# Each policy is a function:
+#   (bars: _BarsView, entry_idx: int) -> (exit_idx: int, exit_price: float,
+#                                          exit_reason: str, hwm_close: float,
+#                                          hwm_idx: int)
+# entry_idx is the bar where we *fill* the entry (one bar after the signal).
+# The simulator walks forward from entry_idx until the policy's stop fires
+# or the dataset ends.
+
+
+def _policy_baseline(
+    bars: _BarsView, entry_idx: int
+) -> tuple[int, float, str, float, int]:
+    """Death-cross exit + 2.0×ATR static stop (the current production policy)."""
+    entry_price = bars.opens[entry_idx]
+    entry_atr = bars.atr[entry_idx - 1]    # ATR available at signal-bar close
+    stop_level = entry_price - ATR_STOP_MULT * entry_atr
+    hwm_close = bars.closes[entry_idx]
+    hwm_idx = entry_idx
+    n = len(bars.closes)
+
+    for i in range(entry_idx + 1, n):
+        # Stop check first — intrabar low touching the stop exits at the stop.
+        if bars.lows[i] <= stop_level:
+            return (i, _fill_through_stop(bars.lows[i], stop_level),
+                    "atr_stop", hwm_close, hwm_idx)
+        # Update HWM on close.
+        if bars.closes[i] > hwm_close:
+            hwm_close = bars.closes[i]
+            hwm_idx = i
+        # Death cross at bar i → exit at bar i+1 open.
+        if (bars.fast[i] < bars.slow[i] and bars.fast[i - 1] >= bars.slow[i - 1]
+                and i + 1 < n):
+            return (i + 1, bars.opens[i + 1], "death_cross", hwm_close, hwm_idx)
+
+    # Walked off the end — close at last bar.
+    return (n - 1, bars.closes[n - 1], "eod", hwm_close, hwm_idx)
+
+
+def _policy_chandelier(
+    bars: _BarsView, entry_idx: int, k: float
+) -> tuple[int, float, str, float, int]:
+    """
+    Death-cross exit + 2.0×ATR disaster stop + chandelier trail (HWM−k·ATR).
+    Whichever fires first wins.
+    """
+    entry_price = bars.opens[entry_idx]
+    entry_atr = bars.atr[entry_idx - 1]
+    disaster_stop = entry_price - ATR_STOP_MULT * entry_atr
+    hwm_close = bars.closes[entry_idx]
+    hwm_idx = entry_idx
+    n = len(bars.closes)
+
+    for i in range(entry_idx + 1, n):
+        trail_stop = hwm_close - k * entry_atr
+        # The trail stop is below HWM by k·ATR. The disaster stop is fixed at
+        # entry − 2·ATR. Effective stop on this bar is max(both) since either
+        # firing ends the trade.
+        effective_stop = max(disaster_stop, trail_stop)
+        if bars.lows[i] <= effective_stop:
+            reason = "trail" if trail_stop >= disaster_stop else "atr_stop"
+            return (i, _fill_through_stop(bars.lows[i], effective_stop),
+                    reason, hwm_close, hwm_idx)
+        if bars.closes[i] > hwm_close:
+            hwm_close = bars.closes[i]
+            hwm_idx = i
+        if (bars.fast[i] < bars.slow[i] and bars.fast[i - 1] >= bars.slow[i - 1]
+                and i + 1 < n):
+            return (i + 1, bars.opens[i + 1], "death_cross", hwm_close, hwm_idx)
+
+    return (n - 1, bars.closes[n - 1], "eod", hwm_close, hwm_idx)
+
+
+def _policy_gated_trail(
+    bars: _BarsView, entry_idx: int, activation_k: float, trail_k: float
+) -> tuple[int, float, str, float, int]:
+    """
+    Death-cross + 2.0×ATR disaster + chandelier trail that ARMS only after
+    unrealized close-profit ≥ activation_k × ATR.
+    """
+    entry_price = bars.opens[entry_idx]
+    entry_atr = bars.atr[entry_idx - 1]
+    disaster_stop = entry_price - ATR_STOP_MULT * entry_atr
+    hwm_close = bars.closes[entry_idx]
+    hwm_idx = entry_idx
+    armed = False
+    n = len(bars.closes)
+
+    for i in range(entry_idx + 1, n):
+        # Effective stop depends on whether the trail has armed.
+        if armed:
+            effective_stop = max(disaster_stop, hwm_close - trail_k * entry_atr)
+        else:
+            effective_stop = disaster_stop
+        if bars.lows[i] <= effective_stop:
+            reason = "trail" if armed and effective_stop > disaster_stop else "atr_stop"
+            return (i, _fill_through_stop(bars.lows[i], effective_stop),
+                    reason, hwm_close, hwm_idx)
+        if bars.closes[i] > hwm_close:
+            hwm_close = bars.closes[i]
+            hwm_idx = i
+        if not armed and (bars.closes[i] - entry_price) >= activation_k * entry_atr:
+            armed = True
+        if (bars.fast[i] < bars.slow[i] and bars.fast[i - 1] >= bars.slow[i - 1]
+                and i + 1 < n):
+            return (i + 1, bars.opens[i + 1], "death_cross", hwm_close, hwm_idx)
+
+    return (n - 1, bars.closes[n - 1], "eod", hwm_close, hwm_idx)
+
+
+def _policy_take_profit(
+    bars: _BarsView, entry_idx: int, target_pct: float
+) -> tuple[int, float, str, float, int]:
+    """
+    Death-cross + 2.0×ATR disaster + fixed-% take-profit at
+    entry × (1 + target_pct). Intrabar HIGH touching the target fills at
+    the target price.
+    """
+    entry_price = bars.opens[entry_idx]
+    entry_atr = bars.atr[entry_idx - 1]
+    disaster_stop = entry_price - ATR_STOP_MULT * entry_atr
+    target_price = entry_price * (1.0 + target_pct)
+    hwm_close = bars.closes[entry_idx]
+    hwm_idx = entry_idx
+    n = len(bars.closes)
+
+    for i in range(entry_idx + 1, n):
+        # Order on the bar: stop first (conservative — assume worst-case
+        # ordering of intrabar prices). Then take-profit. Then death cross.
+        if bars.lows[i] <= disaster_stop:
+            return (i, _fill_through_stop(bars.lows[i], disaster_stop),
+                    "atr_stop", hwm_close, hwm_idx)
+        if bars.highs[i] >= target_price:
+            return (i, target_price, "take_profit", hwm_close, hwm_idx)
+        if bars.closes[i] > hwm_close:
+            hwm_close = bars.closes[i]
+            hwm_idx = i
+        if (bars.fast[i] < bars.slow[i] and bars.fast[i - 1] >= bars.slow[i - 1]
+                and i + 1 < n):
+            return (i + 1, bars.opens[i + 1], "death_cross", hwm_close, hwm_idx)
+
+    return (n - 1, bars.closes[n - 1], "eod", hwm_close, hwm_idx)
+
+
+# ── Per-symbol simulator ────────────────────────────────────────────────────
+
+
+def simulate_symbol(
+    symbol: str, df: pd.DataFrame, policy_name: str = "baseline",
+    policy_args: tuple = (),
+) -> list[Trade]:
+    """
+    Walk every 20/50 round trip in df under the named exit policy.
+
+    policy_name in {"baseline", "chandelier", "gated", "take_profit"}.
+    policy_args is positional args for the policy beyond (bars, entry_idx).
+    """
+    bars = _prepare_bars(df)
+    if bars is None:
         return []
 
-    fast = df[f"sma_{FAST}"].values
-    slow = df[f"sma_{SLOW}"].values
-    atr = df[f"atr_{ATR_LEN}"].values
-    opens = df["open"].values
-    closes = df["close"].values
-    lows = df["low"].values
-    highs = df["high"].values
-    dates = df.index
+    policy_fn = {
+        "baseline":     _policy_baseline,
+        "chandelier":   _policy_chandelier,
+        "gated":        _policy_gated_trail,
+        "take_profit":  _policy_take_profit,
+    }[policy_name]
 
     trades: list[Trade] = []
-    in_pos = False
-    entry_idx = None
-    entry_price = None
-    entry_atr = None
-    stop_level = None
-    hwm_close = None
-    hwm_idx = None
-
-    n = len(df)
-    for i in range(1, n):
-        diff_now = fast[i] - slow[i]
-        diff_prev = fast[i - 1] - slow[i - 1]
-
-        if not in_pos:
-            # Golden cross at bar i → enter at bar i+1's open.
-            if diff_now > 0 and diff_prev <= 0 and i + 1 < n:
-                entry_idx = i + 1
-                entry_price = opens[i + 1]
-                entry_atr = atr[i]
-                stop_level = entry_price - ATR_STOP_MULT * entry_atr
-                hwm_close = closes[entry_idx]
-                hwm_idx = entry_idx
-                in_pos = True
+    n = len(bars.closes)
+    next_allowed_entry = 0
+    for entry_idx in _iter_entries(bars):
+        # Cannot enter while in a prior position — skip overlapping signals.
+        if entry_idx < next_allowed_entry:
             continue
-
-        # In a position — check stop first (intrabar low touches stop),
-        # then check death cross at this bar's close → exit next open.
-        if lows[i] <= stop_level:
-            trades.append(Trade(
-                symbol=symbol,
-                entry_date=dates[entry_idx],
-                entry_price=entry_price,
-                exit_date=dates[i],
-                exit_price=stop_level,
-                exit_reason="atr_stop",
-                hwm_close=hwm_close,
-                hwm_date=dates[hwm_idx],
-                atr_at_entry=entry_atr,
-            ))
-            in_pos = False
-            continue
-
-        # Update HWM on this bar's close.
-        if closes[i] > hwm_close:
-            hwm_close = closes[i]
-            hwm_idx = i
-
-        # Death cross at bar i → exit at bar i+1's open.
-        if diff_now < 0 and diff_prev >= 0 and i + 1 < n:
-            exit_price = opens[i + 1]
-            # Chandelier overlay on the same trade: walk forward from
-            # entry, compute trailing stop each bar, record when it
-            # would have fired (or fall back to the death-cross exit).
-            chandelier_exits = {}
-            for k in TRAIL_KS:
-                hwm_k = closes[entry_idx]
-                trail_exit_price = None
-                trail_exit_date = None
-                for j in range(entry_idx, i + 1):
-                    if closes[j] > hwm_k:
-                        hwm_k = closes[j]
-                    trail_stop = hwm_k - k * entry_atr
-                    # Check intrabar low against trail stop, but only
-                    # starting the bar AFTER entry (no same-bar stop hit).
-                    if j > entry_idx and lows[j] <= trail_stop:
-                        trail_exit_price = trail_stop
-                        trail_exit_date = dates[j]
-                        break
-                if trail_exit_price is None:
-                    # Trail never fired — same exit as death cross.
-                    chandelier_exits[k] = (dates[i + 1], exit_price)
-                else:
-                    chandelier_exits[k] = (trail_exit_date, trail_exit_price)
-
-            # Profit-gated trail overlays.
-            gated_exits = {}
-            for activation_k, trail_k in GATED_GRID:
-                hwm_g = closes[entry_idx]
-                armed = False
-                g_exit_price = None
-                g_exit_date = None
-                for j in range(entry_idx, i + 1):
-                    if closes[j] > hwm_g:
-                        hwm_g = closes[j]
-                    # Arm the trail once unrealized close-profit clears the
-                    # activation threshold. Once armed, stays armed.
-                    if not armed and (closes[j] - entry_price) >= activation_k * entry_atr:
-                        armed = True
-                    if armed and j > entry_idx:
-                        trail_stop = hwm_g - trail_k * entry_atr
-                        if lows[j] <= trail_stop:
-                            g_exit_price = trail_stop
-                            g_exit_date = dates[j]
-                            break
-                if g_exit_price is None:
-                    gated_exits[(activation_k, trail_k)] = (dates[i + 1], exit_price, armed)
-                else:
-                    gated_exits[(activation_k, trail_k)] = (g_exit_date, g_exit_price, armed)
-
-            # Fixed-% take-profit overlays.
-            pt_exits = {}
-            for tgt in PROFIT_TARGETS_PCT:
-                target_price = entry_price * (1.0 + tgt)
-                pt_exit_price = None
-                pt_exit_date = None
-                # Walk bars from the day AFTER entry through the death-cross
-                # exit bar. If the intrabar high touches target, fill at target.
-                for j in range(entry_idx + 1, i + 2):
-                    if j >= n:
-                        break
-                    if highs[j] >= target_price:
-                        pt_exit_price = target_price
-                        pt_exit_date = dates[j]
-                        break
-                if pt_exit_price is None:
-                    pt_exits[tgt] = (dates[i + 1], exit_price, False)
-                else:
-                    pt_exits[tgt] = (pt_exit_date, pt_exit_price, True)
-
-            trades.append(Trade(
-                symbol=symbol,
-                entry_date=dates[entry_idx],
-                entry_price=entry_price,
-                exit_date=dates[i + 1],
-                exit_price=exit_price,
-                exit_reason="death_cross",
-                hwm_close=hwm_close,
-                hwm_date=dates[hwm_idx],
-                atr_at_entry=entry_atr,
-                chandelier_exits=chandelier_exits,
-                gated_exits=gated_exits,
-                pt_exits=pt_exits,
-            ))
-            in_pos = False
-
+        exit_idx, exit_price, exit_reason, hwm_close, hwm_idx = policy_fn(
+            bars, entry_idx, *policy_args
+        )
+        trades.append(Trade(
+            symbol=symbol,
+            policy=f"{policy_name}{policy_args or ''}",
+            entry_date=bars.dates[entry_idx],
+            entry_price=bars.opens[entry_idx],
+            exit_date=bars.dates[exit_idx],
+            exit_price=exit_price,
+            exit_reason=exit_reason,
+            hwm_close=hwm_close,
+            hwm_date=bars.dates[hwm_idx],
+            atr_at_entry=bars.atr[entry_idx - 1],
+        ))
+        next_allowed_entry = exit_idx + 1
+        if next_allowed_entry >= n:
+            break
     return trades
 
 
-def fmt_pct(x: float) -> str:
-    if x != x:  # NaN
+# ── Audit reporting ─────────────────────────────────────────────────────────
+
+
+@dataclass
+class PolicyResult:
+    name: str
+    trades: list[Trade] = field(default_factory=list)
+
+    @property
+    def net_pnl(self) -> float:
+        return sum(t.pnl for t in self.trades)
+
+    @property
+    def n(self) -> int:
+        return len(self.trades)
+
+    @property
+    def n_winners(self) -> int:
+        return sum(1 for t in self.trades if t.pnl > 0)
+
+    @property
+    def win_rate(self) -> float:
+        return self.n_winners / self.n if self.n else float("nan")
+
+    @property
+    def avg_trade(self) -> float:
+        return self.net_pnl / self.n if self.n else float("nan")
+
+
+def _fmt_pct(x: float) -> str:
+    if x != x:
         return "  n/a"
     return f"{x*100:5.1f}%"
 
 
-def main() -> None:
-    start = datetime(2018, 11, 1, tzinfo=timezone.utc)
-    end = datetime(2026, 6, 5, tzinfo=timezone.utc)
+def _pct(arr: list[float], p: float) -> float:
+    if not arr:
+        return float("nan")
+    return float(np.percentile(arr, p))
 
-    symbols = list(settings.SMA_WATCHLIST)
-    print(f"Auditing {len(symbols)} symbols from {start.date()} to {end.date()}", file=sys.stderr)
 
-    all_trades: list[Trade] = []
+def main(argv: list[str] | None = None) -> int:
+    p = argparse.ArgumentParser(description=__doc__)
+    p.add_argument(
+        "--universe", choices=("audit", "current"), default="audit",
+        help="audit = frozen 40-symbol AUDIT_UNIVERSE (reproduces docs); "
+             "current = settings.SMA_WATCHLIST (current production list).",
+    )
+    p.add_argument(
+        "--start", default=AUDIT_START.date().isoformat(),
+        help="Start date (YYYY-MM-DD). Default: 2018-11-01.",
+    )
+    p.add_argument(
+        "--end", default=AUDIT_END.date().isoformat(),
+        help="End date (YYYY-MM-DD). Default: 2026-06-05.",
+    )
+    args = p.parse_args(argv)
+
+    if args.universe == "audit":
+        symbols = list(AUDIT_UNIVERSE)
+    else:
+        symbols = list(settings.SMA_WATCHLIST)
+
+    start = datetime.fromisoformat(args.start).replace(tzinfo=timezone.utc)
+    end = datetime.fromisoformat(args.end).replace(tzinfo=timezone.utc)
+
+    print(f"Auditing universe={args.universe} ({len(symbols)} symbols), "
+          f"window={start.date()} → {end.date()}", file=sys.stderr)
+
+    # Fetch all symbols once; rerun every policy on the same cached bars.
+    bar_cache: dict[str, pd.DataFrame] = {}
     for sym in symbols:
         try:
             df, _ = fetch_symbol(sym, start, end, timeframe="1Day", use_cache=True)
@@ -284,213 +481,92 @@ def main() -> None:
         if len(df) < SLOW + 5:
             print(f"  {sym}: only {len(df)} bars — skipped", file=sys.stderr)
             continue
-        trades = simulate_symbol(sym, df)
-        all_trades.extend(trades)
-        n_dc = sum(1 for t in trades if t.exit_reason == "death_cross")
-        n_st = sum(1 for t in trades if t.exit_reason == "atr_stop")
-        print(f"  {sym:<6} bars={len(df)} trades={len(trades)} (death_cross={n_dc}, atr_stop={n_st})",
-              file=sys.stderr)
+        bar_cache[sym] = df
 
-    # ── Aggregate stats ─────────────────────────────────────────────────
-    print()
-    print("=" * 76)
-    print("SMA CROSSOVER — GIVEBACK AUDIT")
-    print("=" * 76)
-    print(f"Window: {start.date()} → {end.date()}")
-    print(f"Watchlist: {len(symbols)} symbols")
-    print(f"Total round trips: {len(all_trades)}")
-
-    dc = [t for t in all_trades if t.exit_reason == "death_cross"]
-    st = [t for t in all_trades if t.exit_reason == "atr_stop"]
-    print(f"  Death-cross exits: {len(dc)}")
-    print(f"  ATR-stop exits:    {len(st)}")
-
-    dc_winners = [t for t in dc if t.pnl > 0]
-    dc_losers = [t for t in dc if t.pnl <= 0]
-    print(f"  Death-cross winners: {len(dc_winners)}")
-    print(f"  Death-cross losers (cross fired before stop): {len(dc_losers)}")
-
-    if not dc_winners:
-        print("\nNo winning death-cross trades found — nothing to analyze.")
-        return
-
-    print()
-    print("─" * 76)
-    print("GIVEBACK ON WINNING DEATH-CROSS TRADES")
-    print("─" * 76)
-
-    gb_pct = sorted([t.giveback_pct for t in dc_winners if t.giveback_pct == t.giveback_pct])
-    gb_atr = sorted([t.giveback_atr for t in dc_winners if t.giveback_atr == t.giveback_atr])
-    gb_dol = sorted([t.giveback_dollars for t in dc_winners])
-
-    def pct(arr, p):
-        if not arr: return float("nan")
-        return float(np.percentile(arr, p))
-
-    print(f"  Giveback as % of peak open profit:")
-    print(f"    median  = {fmt_pct(pct(gb_pct, 50))}")
-    print(f"    mean    = {fmt_pct(statistics.mean(gb_pct))}")
-    print(f"    P25     = {fmt_pct(pct(gb_pct, 25))}")
-    print(f"    P75     = {fmt_pct(pct(gb_pct, 75))}")
-    print(f"    P90     = {fmt_pct(pct(gb_pct, 90))}")
-    print(f"    max     = {fmt_pct(max(gb_pct))}")
-
-    print(f"  Giveback in ATR-units (at entry):")
-    print(f"    median  = {pct(gb_atr, 50):5.2f} ATR")
-    print(f"    mean    = {statistics.mean(gb_atr):5.2f} ATR")
-    print(f"    P75     = {pct(gb_atr, 75):5.2f} ATR")
-    print(f"    P90     = {pct(gb_atr, 90):5.2f} ATR")
-
-    # ── Chandelier comparison ──────────────────────────────────────────
-    print()
-    print("─" * 76)
-    print("CHANDELIER OVERLAY — DEATH-CROSS WINNERS ONLY")
-    print("(captured profit per trade vs. waiting for the death cross)")
-    print("─" * 76)
-    baseline_pnl = sum(t.pnl for t in dc_winners)
-    baseline_peak = sum(t.peak_open_profit for t in dc_winners)
-    print(f"  Baseline (death-cross exit):")
-    print(f"    sum captured  = ${baseline_pnl:>10,.0f}")
-    print(f"    sum peak open = ${baseline_peak:>10,.0f}")
-    print(f"    capture ratio = {baseline_pnl/baseline_peak*100:5.1f}% of peak")
-
+    # ── Policies to compare ─────────────────────────────────────────────
+    policies: list[tuple[str, str, tuple]] = [
+        ("baseline (death cross + 2.0 ATR stop)", "baseline", ()),
+    ]
     for k in TRAIL_KS:
-        captured = 0.0
-        early_exits = 0
-        same_as_dc = 0
-        for t in dc_winners:
-            ex_date, ex_price = t.chandelier_exits[k]
-            captured += (ex_price - t.entry_price)
-            if ex_date < t.exit_date:
-                early_exits += 1
-            else:
-                same_as_dc += 1
-        print(f"  Chandelier K={k}:")
-        print(f"    sum captured  = ${captured:>10,.0f}  "
-              f"(Δ vs death-cross: ${captured-baseline_pnl:+,.0f}, "
-              f"{(captured-baseline_pnl)/baseline_pnl*100:+5.1f}%)")
-        print(f"    capture ratio = {captured/baseline_peak*100:5.1f}% of peak")
-        print(f"    trail bit early on {early_exits}/{len(dc_winners)} winners "
-              f"({early_exits/len(dc_winners)*100:.0f}%)")
-
-    # ── Profit-gated trail comparison ──────────────────────────────────
-    print()
-    print("─" * 76)
-    print("PROFIT-GATED TRAIL — DEATH-CROSS WINNERS ONLY")
-    print("(arm trail only after unrealized profit >= activation_atr * ATR)")
-    print("─" * 76)
-    print(f"  Baseline (death-cross): captured ${baseline_pnl:,.0f}, "
-          f"capture ratio {baseline_pnl/baseline_peak*100:.1f}%")
-    print()
-    print(f"  {'activation':>10} {'trail K':>8} {'captured':>10} "
-          f"{'Δ vs base':>10} {'capture%':>9} {'armed%':>7} "
-          f"{'bit early':>10} {'med gb%':>8}")
-    for activation_k, trail_k in GATED_GRID:
-        captured = 0.0
-        armed_count = 0
-        early_count = 0
-        givebacks_pct = []
-        for t in dc_winners:
-            ex_date, ex_price, armed = t.gated_exits[(activation_k, trail_k)]
-            captured += (ex_price - t.entry_price)
-            if armed:
-                armed_count += 1
-            if ex_date < t.exit_date:
-                early_count += 1
-            # Giveback under this rule: HWM_close - exit_price
-            gb = t.hwm_close - ex_price
-            peak = t.hwm_close - t.entry_price
-            if peak > 0:
-                givebacks_pct.append(gb / peak)
-        med_gb = statistics.median(givebacks_pct) if givebacks_pct else float("nan")
-        print(f"  {activation_k:>10.1f} {trail_k:>8.1f} "
-              f"${captured:>9,.0f} "
-              f"{captured-baseline_pnl:>+9,.0f} "
-              f"{captured/baseline_peak*100:>8.1f}% "
-              f"{armed_count/len(dc_winners)*100:>6.0f}% "
-              f"{early_count:>4}/{len(dc_winners):<4} "
-              f"{med_gb*100:>7.1f}%")
-
-    # ── Fixed-% take-profit comparison ─────────────────────────────────
-    print()
-    print("─" * 76)
-    print("FIXED PROFIT-TARGET — APPLIED TO ALL DEATH-CROSS TRADES")
-    print("(if intrabar high touches entry*(1+target), exit at target instead)")
-    print("─" * 76)
-    # For ALL death-cross trades (winners + losers): under the take-profit rule,
-    # a trade exits at target if it ever traded there; otherwise it exits where
-    # the death cross would have. Losers were already losers — the TP doesn't
-    # fire on them. So sum captured = TP winners + non-TP-fired trades at their
-    # death-cross exit.
-    dc_all = dc  # all 210 death-cross trades (incl. losers)
-    dc_baseline_pnl = sum(t.pnl for t in dc_all)
-    print(f"  Baseline (all {len(dc_all)} death-cross trades, no TP):")
-    print(f"    sum pnl       = ${dc_baseline_pnl:>10,.0f}")
-    print(f"    winners       = {len(dc_winners)}/{len(dc_all)}")
-    print()
-    print(f"  {'target':>8} {'hit count':>10} {'hit rate':>9} "
-          f"{'captured':>10} {'Δ vs base':>11} {'win rate':>9} "
-          f"{'avg trade':>10}")
+        policies.append((f"chandelier K={k}",   "chandelier", (k,)))
+    for ak, tk in GATED_GRID:
+        policies.append(
+            (f"gated trail arm={ak} ATR / k={tk} ATR", "gated", (ak, tk))
+        )
     for tgt in PROFIT_TARGETS_PCT:
-        captured = 0.0
-        hits = 0
-        wins = 0
-        for t in dc_all:
-            ex_date, ex_price, hit = t.pt_exits[tgt]
-            trade_pnl = ex_price - t.entry_price
-            captured += trade_pnl
-            if hit:
-                hits += 1
-            if trade_pnl > 0:
-                wins += 1
-        avg = captured / len(dc_all)
-        delta = captured - dc_baseline_pnl
-        print(f"  {tgt*100:>6.0f}%  {hits:>6}/{len(dc_all):<4} "
-              f"{hits/len(dc_all)*100:>7.1f}% "
-              f"${captured:>9,.0f} "
-              f"${delta:>+10,.0f} "
-              f"{wins/len(dc_all)*100:>7.1f}% "
-              f"${avg:>9.2f}")
+        policies.append((f"take-profit +{int(tgt*100)}%", "take_profit", (tgt,)))
 
-    # Show per-target lift on winners alone (since losers are unaffected,
-    # this isolates the take-profit's contribution).
-    print()
-    print(f"  Among the {len(dc_winners)} winners only:")
-    print(f"  {'target':>8} {'hit on winners':>16} {'capped $':>10} "
-          f"{'rode out $':>11} {'net captured':>13}")
-    for tgt in PROFIT_TARGETS_PCT:
-        capped = 0.0
-        rode = 0.0
-        n_hit = 0
-        for t in dc_winners:
-            ex_date, ex_price, hit = t.pt_exits[tgt]
-            if hit:
-                capped += (ex_price - t.entry_price)
-                n_hit += 1
-            else:
-                rode += t.pnl
-        net = capped + rode
-        delta = net - baseline_pnl
-        print(f"  {tgt*100:>6.0f}%  {n_hit:>6}/{len(dc_winners):<4} "
-              f"({n_hit/len(dc_winners)*100:>4.0f}%) "
-              f"${capped:>9,.0f} "
-              f"${rode:>10,.0f} "
-              f"${net:>10,.0f} "
-              f"(Δ ${delta:+,.0f})")
+    results: list[PolicyResult] = []
+    for label, name, pargs in policies:
+        result = PolicyResult(name=label)
+        for sym, df in bar_cache.items():
+            result.trades.extend(simulate_symbol(sym, df, name, pargs))
+        results.append(result)
 
-    # ── Per-symbol summary (top contributors) ──────────────────────────
+    # ── Report ─────────────────────────────────────────────────────────
+    baseline = results[0]
     print()
-    print("─" * 76)
-    print("TOP 10 WORST GIVEBACKS (single trades, by $)")
-    print("─" * 76)
-    print(f"  {'symbol':<8} {'entry':>10} {'exit':>10} {'hwm':>10} "
-          f"{'gb $':>10} {'gb %peak':>10} {'gb ATR':>9}")
-    for t in sorted(dc_winners, key=lambda x: -x.giveback_dollars)[:10]:
-        print(f"  {t.symbol:<8} {str(t.entry_date.date()):>10} "
-              f"{str(t.exit_date.date()):>10} {str(t.hwm_date.date()):>10} "
-              f"{t.giveback_dollars:>9.2f} {fmt_pct(t.giveback_pct):>10} "
-              f"{t.giveback_atr:>8.2f}x")
+    print("=" * 80)
+    print("SMA CROSSOVER — UNIFIED EXIT-POLICY COMPARISON")
+    print("=" * 80)
+    print(f"Window: {start.date()} → {end.date()}")
+    print(f"Universe: {args.universe} ({len(bar_cache)} symbols with sufficient bars)")
+    print(f"Baseline: {baseline.name}")
+    print(f"  Total entries: {baseline.n}")
+    print(f"  Net P&L:       ${baseline.net_pnl:>12,.0f}")
+    print(f"  Win rate:      {baseline.win_rate*100:5.1f}%")
+    print(f"  Avg trade:     ${baseline.avg_trade:>9.2f}")
+
+    # Exit-reason breakdown for the baseline (to recover the old "336 ATR
+    # stops / 210 death-crosses" headline).
+    reason_counts: dict[str, int] = {}
+    for t in baseline.trades:
+        reason_counts[t.exit_reason] = reason_counts.get(t.exit_reason, 0) + 1
+    print("  Exit reasons:  " + ", ".join(
+        f"{k}={v}" for k, v in sorted(reason_counts.items(), key=lambda kv: -kv[1])
+    ))
+
+    # ── Baseline giveback distribution ─────────────────────────────────
+    print()
+    print("─" * 80)
+    print("BASELINE GIVEBACK DISTRIBUTION (death-cross WINNERS only)")
+    print("─" * 80)
+    dc_winners = [t for t in baseline.trades
+                  if t.exit_reason == "death_cross" and t.pnl > 0]
+    print(f"  N = {len(dc_winners)} winners that rode the trend to its natural exit")
+    if dc_winners:
+        gb_pct = sorted([t.giveback_pct for t in dc_winners if t.giveback_pct == t.giveback_pct])
+        gb_atr = sorted([t.giveback_atr for t in dc_winners if t.giveback_atr == t.giveback_atr])
+        print(f"  Giveback as % of peak open profit:")
+        print(f"    median={_fmt_pct(_pct(gb_pct, 50))}  "
+              f"mean={_fmt_pct(statistics.mean(gb_pct))}  "
+              f"P75={_fmt_pct(_pct(gb_pct, 75))}  "
+              f"P90={_fmt_pct(_pct(gb_pct, 90))}  "
+              f"max={_fmt_pct(max(gb_pct))}")
+        print(f"  Giveback in ATR-units (at entry):")
+        print(f"    median={_pct(gb_atr, 50):4.2f}  "
+              f"P75={_pct(gb_atr, 75):4.2f}  "
+              f"P90={_pct(gb_atr, 90):4.2f}")
+        baseline_peak = sum(t.peak_open_profit for t in dc_winners)
+        baseline_dc_pnl = sum(t.pnl for t in dc_winners)
+        if baseline_peak > 0:
+            print(f"  Capture ratio: {baseline_dc_pnl/baseline_peak*100:5.1f}% of peak open profit")
+
+    # ── Policy comparison table (the headline output) ──────────────────
+    print()
+    print("─" * 80)
+    print("FULL POLICY COMPARISON — all entries, every policy")
+    print("(net P&L Δ is the apples-to-apples comparison)")
+    print("─" * 80)
+    print(f"  {'policy':<46} {'n':>5} {'net $':>10} {'Δ vs base':>11} "
+          f"{'win%':>6} {'avg':>7}")
+    for r in results:
+        delta = r.net_pnl - baseline.net_pnl
+        print(f"  {r.name:<46} {r.n:>5} ${r.net_pnl:>9,.0f} "
+              f"${delta:>+10,.0f} {r.win_rate*100:>5.1f}% ${r.avg_trade:>6.2f}")
+
+    return 0
 
 
 if __name__ == "__main__":
-    main()
+    raise SystemExit(main())
