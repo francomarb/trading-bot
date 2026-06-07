@@ -32,7 +32,16 @@ This audit measures *strategy mechanics in isolation*. It does **not**:
   signals and evaluates policies;
 - model gap-through-stop fills accurately — a violent gap-down fills at
   the stop level, not at the gap-down open (`_fill_through_stop` in the
-  script pins this assumption with a unit test).
+  script pins this assumption with a unit test);
+- model transaction costs — runs with zero slippage and zero commission.
+  An earlier exit under one policy can permit a later golden cross to
+  fire as a new entry that the baseline never reaches, so trade counts
+  and entry/exit prices differ across policies. Per-fill slippage also
+  differs by exit mechanism (a stop-out fills through the trigger; a
+  market sell on a death-cross signal fills at the next-open quote; a
+  take-profit fills at the target). The relative ranking of policies is
+  the audit's deliverable; absolute $-magnitudes don't represent live
+  P&L impact.
 
 Any operational decision (e.g., culling a name from production)
 **requires an audit that addresses these limits.** See the

@@ -391,6 +391,49 @@ class TestPolicyGatedTrailArming:
                                            activation_k=1000.0, trail_k=3.0)
         assert base_result == gated_result
 
+    def test_gated_trail_arms_on_entry_close_protects_next_bar(self):
+        """
+        End-of-day arming: if the entry bar's CLOSE has already pushed
+        profit above the activation threshold, the trail should be live
+        before the next session opens. A buggy implementation that gates
+        arming on `i > entry_idx` would arm one bar late, leaving the
+        next bar unprotected by the trail.
+        """
+        df = _up_only_frame()
+        bars = _prepare_bars(df)
+        entries = _iter_entries(bars)
+        assert entries
+        trimmed_entry = entries[0]
+        entry_price = bars.opens[trimmed_entry]
+        entry_atr = bars.atr[trimmed_entry - 1]
+
+        # Engineer entry-day close above the activation threshold.
+        # activation = 1.0 * ATR → close must be entry + 1 ATR or more.
+        entry_close_target = entry_price + 1.5 * entry_atr
+        u_entry = trimmed_entry + (len(df) - len(bars.closes))
+        df.iloc[u_entry, df.columns.get_loc("close")] = entry_close_target
+        df.iloc[u_entry, df.columns.get_loc("high")] = max(
+            entry_close_target + 0.1, df.iloc[u_entry]["high"]
+        )
+
+        # Next bar: inject a low that touches the trail level (HWM - k*ATR)
+        # but stays well above the disaster stop. If the trail armed on
+        # the entry close, this fires the trail; if not, the position
+        # survives (disaster stop is much lower).
+        u_next = u_entry + 1
+        trail_floor = entry_close_target - 2.0 * entry_atr  # k=2.0 trail
+        # Sanity: trail floor is above disaster stop (entry - 2 ATR).
+        assert trail_floor > entry_price - 2.0 * entry_atr
+        df.iloc[u_next, df.columns.get_loc("low")] = trail_floor - 0.01
+
+        bars = _prepare_bars(df)
+        exit_idx, exit_price, exit_reason, *_ = _policy_gated_trail(
+            bars, trimmed_entry, activation_k=1.0, trail_k=2.0
+        )
+        # Correct behavior: trail armed on entry close, fires next bar.
+        assert exit_reason == "trail"
+        assert exit_idx == trimmed_entry + 1
+
 
 class TestPolicyTakeProfitFiresOnEveryEntry:
     """The selection-bias fix: take-profit must be evaluated on losers too."""

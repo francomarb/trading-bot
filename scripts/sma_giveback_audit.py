@@ -329,7 +329,8 @@ def _policy_gated_trail(
     n = len(bars.closes)
 
     for i in range(entry_idx, n):
-        # Entry bar: disaster only, no arming.
+        # Entry bar: disaster only — the trail level would otherwise
+        # reference today's close, which prints after today's low.
         if i == entry_idx:
             effective_stop = disaster_stop
         elif armed:
@@ -346,10 +347,13 @@ def _policy_gated_trail(
         if bars.closes[i] > hwm_close:
             hwm_close = bars.closes[i]
             hwm_idx = i
-        # Arming runs only from the bar after entry (the close used for the
-        # arming check must precede any future intrabar evaluation).
-        if (i > entry_idx and not armed
-                and (bars.closes[i] - entry_price) >= activation_k * entry_atr):
+        # Arming uses today's close. Today's intrabar stop check has
+        # already been evaluated above; today's close prints at end-of-day,
+        # which is BEFORE tomorrow's session opens. So arming on the entry
+        # bar is legitimate — it protects the next bar onward — and is NOT
+        # the same look-ahead issue as the trail-stop evaluation. Without
+        # this, the trail arms one session late.
+        if not armed and (bars.closes[i] - entry_price) >= activation_k * entry_atr:
             armed = True
         if i > entry_idx and (
             bars.fast[i] < bars.slow[i] and bars.fast[i - 1] >= bars.slow[i - 1]

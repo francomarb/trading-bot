@@ -201,12 +201,23 @@ onward. Documented and unit-tested in
 `tests/test_sma_giveback_audit.py::TestPolicyChandelierEntryBarNoLookahead`.
 
 **Cost model.** The vectorbt harness applies 5 bps slippage and zero
-commission (Alpaca default). The giveback audit (`sma_giveback_audit.py`)
-runs **without slippage or commissions** — it's a *relative* policy
-comparison and the same costs would apply to every policy, so they
-cancel from the comparison. Live realized slippage is logged per fill
-via `reporting.logger` (`realized_slippage_bps`, `slippage_signed_bps`)
-regardless of which research tool is run.
+commission (Alpaca default).
+
+The giveback audit (`sma_giveback_audit.py`) runs **without slippage or
+commissions** — this is a known limitation, not a costs-cancel
+argument. An earlier exit under one policy can permit a later golden
+cross to fire as a new entry that the baseline policy never reaches,
+so the trade count and entry/exit prices differ across policies. Per-
+fill slippage also differs by exit mechanism: a stop-out fills through
+the trigger level, a market sell on a death-cross signal fills at the
+next-open quote, and a take-profit fills at the target. Treat the
+audit's policy-comparison numbers as a relative-mechanics study —
+adding production-equivalent costs is a known follow-up before any
+operational decision is taken on the results.
+
+Live realized slippage is logged per fill via `reporting.logger`
+(`realized_slippage_bps`, `slippage_signed_bps`) regardless of which
+research tool is run.
 
 **Data feed.** Production runs on Alpaca's IEX feed (paper-account
 constraint; SIP requires paid subscription). Backtests use the same
