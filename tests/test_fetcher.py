@@ -328,6 +328,70 @@ class TestFeedAwareCacheLayout:
         assert back["close"].iloc[0] == 42.0  # the feed-aware one
 
 
+class TestStrictFeedValidation:
+    """
+    PR #50 review caught: pre-validation, ``_FEED_MAP.get(feed, DataFeed.IEX)``
+    silently fell through to IEX for unknown feeds while the cache layer still
+    used the raw string for its subdir name. A typo like ``feed="six"`` would
+    create ``data/historical/six/`` with IEX bars in it, then on the next call
+    the IEX synthetic-SIP volume scaling was NOT applied (only the exact string
+    "iex" triggers it). Strict validation prevents the silently-wrong-volume
+    failure mode.
+    """
+
+    def test_unknown_feed_string_raises(self, tmp_cache_dir, utc_now):
+        with pytest.raises(ValueError, match="feed must be one of"):
+            fetcher.fetch_symbol(
+                "AAPL",
+                start=utc_now - timedelta(days=30),
+                end=utc_now,
+                timeframe="1Day",
+                use_cache=False,
+                feed="six",  # typo
+            )
+
+    def test_empty_feed_string_raises(self, tmp_cache_dir, utc_now):
+        with pytest.raises(ValueError, match="feed must be one of"):
+            fetcher.fetch_symbol(
+                "AAPL",
+                start=utc_now - timedelta(days=30),
+                end=utc_now,
+                timeframe="1Day",
+                use_cache=False,
+                feed="",
+            )
+
+    def test_non_string_feed_raises(self, tmp_cache_dir, utc_now):
+        with pytest.raises(ValueError, match="feed must be a str"):
+            fetcher.fetch_symbol(
+                "AAPL",
+                start=utc_now - timedelta(days=30),
+                end=utc_now,
+                timeframe="1Day",
+                use_cache=False,
+                feed=42,  # type: ignore[arg-type]
+            )
+
+    def test_case_insensitive_accepted(self, tmp_cache_dir, utc_now, monkeypatch):
+        # ``IEX`` and ``Iex`` should be accepted as well, normalised to lower-case.
+        captured: dict = {}
+
+        def fake_api(symbol, timeframe, start, end, adjustment, feed):
+            captured["feed"] = feed
+            return pd.DataFrame()
+
+        monkeypatch.setattr(fetcher, "_fetch_bars_api", fake_api)
+        fetcher.fetch_symbol(
+            "AAPL",
+            start=utc_now - timedelta(days=30),
+            end=utc_now,
+            timeframe="1Day",
+            use_cache=False,
+            feed="IEX",
+        )
+        assert captured["feed"] == "iex"
+
+
 class TestSipEndClamp:
     """
     Basic Alpaca accounts can query SIP historical data only for bars whose
@@ -399,6 +463,22 @@ class TestSipEndClamp:
             feed="sip",
         )
         assert captured_api["end"] == old_end
+
+    def test_sip_window_entirely_in_delay_raises(self, captured_api, utc_now):
+        # Reviewer P2: a recent-only SIP request (start=now-10min, end=now-5min)
+        # passes the initial start<end check, but the SIP end-clamp collapses
+        # end to now-15min, making end < start. Without re-validation the
+        # caller gets a misleading "no bars" return instead of a clear error.
+        now = datetime.now(timezone.utc)
+        with pytest.raises(ValueError, match="SIP window collapsed"):
+            fetcher.fetch_symbol(
+                "AAPL",
+                start=now - timedelta(minutes=10),
+                end=now - timedelta(minutes=5),
+                timeframe="1Day",
+                use_cache=False,
+                feed="sip",
+            )
 
 
 class TestTimeoutAdapter:

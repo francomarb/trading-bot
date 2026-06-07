@@ -1,32 +1,56 @@
 #!/usr/bin/env python3
 """
-One-shot migration: move legacy top-level cache files into the feed-aware
-subdir (`data/historical/iex/`).
+One-shot migration: move legacy top-level cache files into a feed-aware subdir.
 
-Before this PR the fetcher cached every parquet as
+Before PR #50 the fetcher cached every parquet as
 ``data/historical/{SYMBOL}_{timeframe}_{adjustment}.parquet`` regardless of
-the data feed they came from. With the feed-aware layout the same files
-belong at ``data/historical/iex/...`` (we treat all legacy bars as IEX-fed
-because that was the historical default value of ``ALPACA_DATA_FEED``).
+the data feed they came from. With the feed-aware layout the cache must be
+partitioned by feed (``data/historical/iex/...`` and
+``data/historical/sip/...``) so synthetic-SIP volume scaling on IEX bars
+doesn't get applied to SIP bars and vice versa.
+
+**Provenance problem.** Legacy files have no recorded feed. They might be
+IEX (the historical default), SIP (if anyone ran with ``ALPACA_DATA_FEED=sip``
+or via the watchlist scanners), or mixed (if the env var was flipped during a
+single cache file's life). Without provenance, the safe default is
+**quarantine** — move legacy files into ``data/historical/legacy_unknown_feed/``
+where the fetcher will not read them. From there the operator decides
+per-batch what to do:
+
+  - **Confident the bars are IEX?** Re-run with ``--assume-feed=iex
+    --confirm-assumed-feed``. You'll be required to acknowledge the
+    unverifiable claim. Files move into ``iex/`` and the fetcher reads them
+    as IEX going forward (with the 20× synthetic-SIP volume scaling applied
+    at read time).
+  - **Not sure / cache may be mixed?** Leave files in
+    ``legacy_unknown_feed/`` and let the fetcher repopulate from the API as
+    each symbol is touched. The next live-bot cycle that needs MSFT will
+    write a fresh ``iex/MSFT_1Day_all.parquet`` from the API; the next
+    backtest that asks for ``feed="sip"`` will write a fresh
+    ``sip/MSFT_1Day_all.parquet``. The quarantined files can be deleted
+    once everything you care about has been refreshed.
 
 Run this once during a bot recycle window:
 
     ./stop_bot.sh
-    venv/bin/python scripts/migrate_cache_to_feed_aware.py
+    venv/bin/python scripts/migrate_cache_to_feed_aware.py            # quarantine
+    # or, if confident all legacy bars are IEX:
+    # venv/bin/python scripts/migrate_cache_to_feed_aware.py \\
+    #     --assume-feed=iex --confirm-assumed-feed
     ./start_bot.sh
 
 The script is idempotent: re-running it after migration is a no-op.
 
-The fetcher already has a legacy-read fallback so the bot doesn't break if
-you forget to run this — but the fallback is dead-weight and SHOULD be
-removed in a follow-up once migration is confirmed complete on every
-machine. Run this so we can clean that up.
+The fetcher already has a legacy-read fallback for IEX, so the bot won't
+break if you forget to run this — but the fallback is dead-weight after
+migration and SHOULD be removed in a follow-up once migration is confirmed
+done on every machine. Run this so we can clean that up.
 
 Flags:
-    --dry-run         Show what would move without touching the filesystem.
-    --feed iex|sip    Destination subdir for legacy files (default: iex).
-                      You almost certainly want the default; this is here
-                      for completeness only.
+    --dry-run                  Show what would move without touching the filesystem.
+    --assume-feed=iex|sip      Explicitly claim provenance for the legacy files.
+    --confirm-assumed-feed     Required alongside --assume-feed (acknowledges
+                               the claim is operator-verified, not derivable).
 """
 
 from __future__ import annotations
@@ -44,6 +68,9 @@ if str(ROOT) not in sys.path:
 from data import fetcher  # noqa: E402
 
 
+_QUARANTINE_SUBDIR = "legacy_unknown_feed"
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument(
@@ -51,9 +78,19 @@ def main() -> int:
         help="Show what would move without touching the filesystem.",
     )
     parser.add_argument(
-        "--feed", default="iex", choices=["iex", "sip"],
-        help="Destination subdir for legacy files (default: iex — almost "
-             "certainly what you want).",
+        "--assume-feed", default=None, choices=["iex", "sip"],
+        help="Explicitly claim provenance for legacy files and route them to "
+             "that feed's subdir. Requires --confirm-assumed-feed because the "
+             "claim is unverifiable from the file alone. Without this flag, "
+             "legacy files are quarantined into data/historical/"
+             f"{_QUARANTINE_SUBDIR}/ where the fetcher will not read them.",
+    )
+    parser.add_argument(
+        "--confirm-assumed-feed", action="store_true",
+        help="Required alongside --assume-feed. By passing this you acknowledge "
+             "the feed provenance claim is operator-verified and not derivable "
+             "from the file. If wrong, downstream synthetic-SIP volume scaling "
+             "will produce silently wrong numbers.",
     )
     parser.add_argument("--verbose", action="store_true")
     args = parser.parse_args()
@@ -65,8 +102,34 @@ def main() -> int:
         format="<level>{level: <8}</level> | {message}",
     )
 
+    # Decide destination
+    if args.assume_feed is not None:
+        if not args.confirm_assumed_feed:
+            logger.error(
+                f"--assume-feed={args.assume_feed} requires "
+                "--confirm-assumed-feed to acknowledge the unverifiable "
+                "provenance claim. Aborting."
+            )
+            return 2
+        dest_label = args.assume_feed.lower()
+        dest_dir = fetcher.CACHE_DIR / dest_label
+        logger.warning(
+            f"OPERATOR-CLAIMED PROVENANCE: legacy files will be moved into "
+            f"{dest_dir} and read as {dest_label} from now on. If this claim "
+            f"is wrong, synthetic-SIP volume scaling on read will produce "
+            f"silently wrong numbers."
+        )
+    else:
+        dest_label = _QUARANTINE_SUBDIR
+        dest_dir = fetcher.CACHE_DIR / _QUARANTINE_SUBDIR
+        logger.info(
+            f"DEFAULT MODE: legacy files will be quarantined into {dest_dir}. "
+            f"The fetcher will not read them. Use --assume-feed=iex --confirm-"
+            f"assumed-feed to instead route into iex/ (and acknowledge the "
+            f"unverifiable provenance claim)."
+        )
+
     cache_dir = fetcher.CACHE_DIR
-    dest_dir = cache_dir / args.feed.lower()
     logger.info(f"cache root: {cache_dir}")
     logger.info(f"destination: {dest_dir}")
 
@@ -114,11 +177,11 @@ def main() -> int:
     if args.dry_run:
         logger.info(f"DRY-RUN summary: {moved} would move, {skipped} would skip")
     else:
-        logger.info(f"migration complete: {moved} moved, {skipped} skipped")
+        logger.info(f"migration complete: {moved} moved, {skipped} skipped (→ {dest_label})")
 
     if skipped:
         logger.warning(
-            "skipped files mean the feed-aware path already had something at "
+            "skipped files mean the destination already had something at "
             "the same name — usually means migration was already partially "
             "done, or both IEX and SIP caches existed at the legacy layer. "
             "Inspect and resolve before assuming the cache is consistent."

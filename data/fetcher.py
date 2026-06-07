@@ -69,6 +69,30 @@ _FEED_MAP: dict[str, DataFeed] = {
     "iex": DataFeed.IEX,
     "sip": DataFeed.SIP,
 }
+_VALID_FEEDS: frozenset[str] = frozenset(_FEED_MAP.keys())
+
+
+def _validate_feed(feed: str) -> str:
+    """
+    Strict feed validation. Returns the lowercased feed string if valid;
+    raises ValueError otherwise.
+
+    Pre-PR #50 the API path used .get(feed, DataFeed.IEX) which silently
+    fell through to IEX for unknown feeds while caching under the raw
+    string. Net effect: a typo (e.g. ``feed="six"``) created a cache
+    directory ``data/historical/six/`` containing IEX bars, then on the
+    next call the IEX synthetic-SIP volume scaling was NOT applied
+    (only IEX-cased input triggers it), silently producing wrong volume
+    numbers. Strict validation prevents this.
+    """
+    if not isinstance(feed, str):
+        raise ValueError(f"feed must be a str, got {type(feed).__name__}")
+    normalized = feed.lower()
+    if normalized not in _VALID_FEEDS:
+        raise ValueError(
+            f"feed must be one of {sorted(_VALID_FEEDS)}; got {feed!r}"
+        )
+    return normalized
 
 
 # ── Exceptions ───────────────────────────────────────────────────────────────
@@ -406,7 +430,9 @@ def _fetch_bars_api(
     client = _get_client()
 
     adj_enum = _ADJUSTMENT_MAP.get(adjustment, Adjustment.ALL)
-    feed_enum = _FEED_MAP.get(feed, DataFeed.IEX)
+    # Strict feed lookup — _validate_feed at the public entry has already
+    # normalized this, so a KeyError here would indicate a bypass bug.
+    feed_enum = _FEED_MAP[feed]
 
     request = StockBarsRequest(
         symbol_or_symbols=symbol,
@@ -470,6 +496,10 @@ def fetch_symbol(
             f"Unsupported timeframe '{timeframe}'. Supported: {list(_TIMEFRAME_MAP)}"
         )
 
+    # Strict feed validation — rejects typos / unknown feeds before they
+    # reach the cache layer (which used to silently create mis-tagged subdirs).
+    feed = _validate_feed(feed)
+
     start = _to_utc(start)
     end = _to_utc(end)
     if start >= end:
@@ -483,7 +513,7 @@ def fetch_symbol(
     # passes `end=now`, the API returns 422. Clamp here so callers don't
     # have to think about it. Watchlist scanners enforce the same rule via
     # --end-delay-minutes (default 60).
-    if feed.lower() == "sip":
+    if feed == "sip":
         sip_end_cutoff = datetime.now(timezone.utc) - timedelta(minutes=15)
         if end > sip_end_cutoff:
             logger.warning(
@@ -491,6 +521,19 @@ def fetch_symbol(
                 f"{end.isoformat()} → {sip_end_cutoff.isoformat()}"
             )
             end = sip_end_cutoff
+            # Re-validate the interval — if the caller asked for a window
+            # entirely within the 15-min SIP delay (e.g. start=now-10min,
+            # end=now), clamping collapses end below start. That's a real
+            # caller error, not something to swallow.
+            if start >= end:
+                raise ValueError(
+                    f"{symbol}: requested SIP window collapsed after 15-min "
+                    f"end-clamp (start={start.isoformat()}, "
+                    f"clamped end={end.isoformat()}). The interval was "
+                    f"entirely within the SIP delay window. Pass an earlier "
+                    f"`end` or wait 15 minutes for the bars to become "
+                    f"available."
+                )
 
     cached = _read_cache(symbol, timeframe, adjustment, feed) if use_cache else pd.DataFrame()
     cov_start, cov_end = (

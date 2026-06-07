@@ -55,25 +55,31 @@ def main() -> int:
     logger.remove()
     logger.add(sys.stderr, level="INFO", format="<level>{level: <8}</level> | {message}")
 
+    from config import settings
+    backtest_feed = settings.BACKTEST_DATA_FEED
     symbols = list(UNIVERSES["ai_bigtech"])
     # Probe deep — let the API return whatever it has per symbol. The Alpaca
     # IEX paper feed depth varies per symbol: SPY back to 2018-11-01, most
     # individual ai_bigtech mega-caps to 2020-07-27, later-listed names at
-    # their listing dates. A wide start range surfaces the true first bar
-    # rather than gating us to whatever the previous job happened to fetch.
-    # See feedback_audit_reachable_data_first.md in user memory.
-    start = datetime(2018, 11, 1, tzinfo=timezone.utc)
+    # their listing dates. SIP (the backtest default after PR #50) reaches
+    # 2016-01-04 for most names — a wide start range surfaces the true first
+    # bar regardless of feed. See feedback_audit_reachable_data_first.md in
+    # user memory.
+    start = datetime(2015, 1, 1, tzinfo=timezone.utc)
     end = datetime.now(timezone.utc)
+    logger.info(f"audit running with feed={backtest_feed} (BACKTEST_DATA_FEED)")
 
     # SPY is required by scripts/donchian_trail_compare.py for per-bar regime
     # classification. PR #49 follow-up flagged that the documented
     # reproduction path didn't backfill it. Fetch it here alongside the
     # universe so a clean-cache reviewer can reproduce in one command.
     try:
-        spy_df, _ = fetch_symbol("SPY", start, end, "1Day", use_cache=True)
+        spy_df, _ = fetch_symbol(
+            "SPY", start, end, "1Day", feed=backtest_feed, use_cache=True
+        )
         logger.info(
-            f"SPY backfilled: {len(spy_df)} bars from {spy_df.index[0].date()} "
-            f"to {spy_df.index[-1].date()}"
+            f"SPY backfilled ({backtest_feed}): {len(spy_df)} bars from "
+            f"{spy_df.index[0].date()} to {spy_df.index[-1].date()}"
         )
     except Exception as exc:  # noqa: BLE001
         logger.warning(f"SPY backfill failed — {exc}")
@@ -81,7 +87,9 @@ def main() -> int:
     rows: list[dict] = []
     for sym in symbols:
         try:
-            df, stats = fetch_symbol(sym, start, end, "1Day", use_cache=True)
+            df, stats = fetch_symbol(
+                sym, start, end, "1Day", feed=backtest_feed, use_cache=True
+            )
         except Exception as exc:  # noqa: BLE001
             logger.warning(f"{sym}: fetch failed — {exc}")
             rows.append({"symbol": sym, "first_bar": None, "n_bars": 0})
@@ -118,6 +126,7 @@ def main() -> int:
     lines = [
         f"# ai_bigtech historical coverage audit\n",
         f"- Generated: {datetime.now(timezone.utc).isoformat()}\n",
+        f"- Data feed: **{backtest_feed}** (from `settings.BACKTEST_DATA_FEED`)",
         f"- Universe: ai_bigtech ({len(symbols)} symbols) + SPY (regime context)",
         f"- Warmup requirement: {WARMUP_TRADING_DAYS} trading days before window start (~{int(WARMUP_TRADING_DAYS*1.4)} calendar days)",
         f"- Note: Alpaca IEX paper-feed depth varies per symbol. SPY back to "

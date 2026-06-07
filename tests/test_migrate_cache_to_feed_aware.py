@@ -43,24 +43,63 @@ def _seed_legacy_file(cache_dir: Path, symbol: str, content: pd.DataFrame) -> No
     }))
 
 
+_QUARANTINE = "legacy_unknown_feed"
+
+
 class TestMigration:
-    def test_moves_legacy_files_to_iex_subdir(
+    def test_default_quarantines_legacy_files(
         self, migration, monkeypatch, tmp_cache_dir, clean_ohlcv
     ):
+        # Default mode (no --assume-feed) MUST quarantine — provenance is
+        # unverifiable so we don't pretend the bars are IEX.
         _seed_legacy_file(tmp_cache_dir, "AAPL", clean_ohlcv)
         _seed_legacy_file(tmp_cache_dir, "MSFT", clean_ohlcv)
 
         monkeypatch.setattr(sys, "argv", ["migrate_cache_to_feed_aware.py"])
         assert migration.main() == 0
 
-        iex_dir = tmp_cache_dir / "iex"
-        assert (iex_dir / "AAPL_1Day_all.parquet").exists()
-        assert (iex_dir / "AAPL_1Day_all.meta.json").exists()
-        assert (iex_dir / "MSFT_1Day_all.parquet").exists()
-        assert (iex_dir / "MSFT_1Day_all.meta.json").exists()
+        quarantine = tmp_cache_dir / _QUARANTINE
+        assert (quarantine / "AAPL_1Day_all.parquet").exists()
+        assert (quarantine / "AAPL_1Day_all.meta.json").exists()
+        assert (quarantine / "MSFT_1Day_all.parquet").exists()
+        # MUST NOT have created iex/ — that would be the silent-IEX-assumption
+        # bug this whole quarantine design exists to prevent.
+        assert not (tmp_cache_dir / "iex").exists()
         # Legacy paths are gone.
         assert not (tmp_cache_dir / "AAPL_1Day_all.parquet").exists()
-        assert not (tmp_cache_dir / "MSFT_1Day_all.parquet").exists()
+
+    def test_assume_feed_iex_with_confirmation_routes_to_iex(
+        self, migration, monkeypatch, tmp_cache_dir, clean_ohlcv
+    ):
+        # With explicit --assume-feed=iex --confirm-assumed-feed, operator
+        # is claiming provenance; files move into iex/.
+        _seed_legacy_file(tmp_cache_dir, "AAPL", clean_ohlcv)
+
+        monkeypatch.setattr(sys, "argv", [
+            "migrate_cache_to_feed_aware.py",
+            "--assume-feed=iex",
+            "--confirm-assumed-feed",
+        ])
+        assert migration.main() == 0
+        assert (tmp_cache_dir / "iex" / "AAPL_1Day_all.parquet").exists()
+        assert not (tmp_cache_dir / _QUARANTINE).exists()
+
+    def test_assume_feed_without_confirmation_aborts(
+        self, migration, monkeypatch, tmp_cache_dir, clean_ohlcv
+    ):
+        # Passing --assume-feed=iex alone (no confirm) must abort without
+        # moving files — this guard prevents accidental IEX-assumption.
+        _seed_legacy_file(tmp_cache_dir, "AAPL", clean_ohlcv)
+
+        monkeypatch.setattr(sys, "argv", [
+            "migrate_cache_to_feed_aware.py",
+            "--assume-feed=iex",
+        ])
+        assert migration.main() == 2  # explicit non-zero abort code
+        # Legacy file untouched, neither destination created.
+        assert (tmp_cache_dir / "AAPL_1Day_all.parquet").exists()
+        assert not (tmp_cache_dir / "iex").exists()
+        assert not (tmp_cache_dir / _QUARANTINE).exists()
 
     def test_idempotent_on_clean_cache(self, migration, monkeypatch, tmp_cache_dir):
         # No legacy files → migration is a no-op (and exits 0).
@@ -75,20 +114,22 @@ class TestMigration:
         monkeypatch.setattr(sys, "argv", ["migrate_cache_to_feed_aware.py", "--dry-run"])
         assert migration.main() == 0
 
-        # Legacy file is untouched; iex/ either does not exist or is empty.
+        # Legacy file is untouched; quarantine subdir either does not exist
+        # or contains no AAPL file.
         assert (tmp_cache_dir / "AAPL_1Day_all.parquet").exists()
-        if (tmp_cache_dir / "iex").exists():
-            assert not (tmp_cache_dir / "iex" / "AAPL_1Day_all.parquet").exists()
+        quarantine = tmp_cache_dir / _QUARANTINE
+        if quarantine.exists():
+            assert not (quarantine / "AAPL_1Day_all.parquet").exists()
 
-    def test_refuses_to_clobber_existing_feed_aware_file(
+    def test_refuses_to_clobber_existing_destination_file(
         self, migration, monkeypatch, tmp_cache_dir, clean_ohlcv
     ):
-        # Legacy file at top-level AND a file already at iex/ with the same
-        # name. Migration must skip the conflict, not silently overwrite.
+        # Legacy file at top-level AND a file already at the quarantine
+        # subdir with the same name. Migration must skip the conflict.
         _seed_legacy_file(tmp_cache_dir, "AAPL", clean_ohlcv)
-        iex_dir = tmp_cache_dir / "iex"
-        iex_dir.mkdir(parents=True, exist_ok=True)
-        _seed_legacy_file(iex_dir, "AAPL", clean_ohlcv)
+        quarantine = tmp_cache_dir / _QUARANTINE
+        quarantine.mkdir(parents=True, exist_ok=True)
+        _seed_legacy_file(quarantine, "AAPL", clean_ohlcv)
 
         monkeypatch.setattr(sys, "argv", ["migrate_cache_to_feed_aware.py"])
         # Skipped files raise the exit code to 1 so CI can flag the

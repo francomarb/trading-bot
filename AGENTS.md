@@ -187,20 +187,32 @@ python scripts/legacy_verify/phase9_verify.py
     tier). Default in `ALPACA_DATA_FEED` env var.
   - **Live engine, live account**: `feed="sip"` real-time (needs the paid
     subscription).
-  - **Backtests, audits, calibration, watchlist scanners — any offline work**:
-    `feed="sip"` using the free delayed tier. `data/fetcher.py` enforces the
-    15-minute end-clamp automatically. Scripts should read from
-    `BACKTEST_DATA_FEED` in `config/settings.py` (default `"sip"`).
-  - **Why offline ≠ live feed**: SIP is the consolidated tape (all venues), so
-    volume and liquidity-floor thresholds are interpretable in plain English.
-    IEX is one venue (~2-3% of consolidated volume); `utils.market.apply_synthetic_sip_volume`
-    multiplies daily IEX volume by 20× as an approximation. Acceptable for the
-    live engine on paper (no choice); not acceptable for offline analysis.
+  - **Research / backtests / audits / calibration**: `feed="sip"` (delayed,
+    free on basic tier). `data/fetcher.py` enforces the 15-minute end-clamp
+    automatically. Scripts should read from `BACKTEST_DATA_FEED` in
+    `config/settings.py` (default `"sip"`). SIP gives consolidated-tape volume
+    so liquidity-floor thresholds are interpretable in plain English.
+  - **Execution replay / reconciliation / post-mortems**: `feed="iex"`.
+    Reconciling paper or live fills against what the bot expected requires
+    the **same feed the bot actually saw**. Using SIP would compare apples to
+    oranges. `backtest/reconcile.py` and `scripts/post_mortem.py` stay on IEX
+    regardless of `BACKTEST_DATA_FEED`.
+  - **Why offline ≠ live feed for research**: IEX is one venue (~2-3% of
+    consolidated volume); `utils.market.apply_synthetic_sip_volume` multiplies
+    daily IEX volume by 20× as an approximation. Acceptable for the live
+    engine on paper (no choice); not acceptable for offline research where
+    real consolidated volume matters.
   - **Cache layout**: bars are stored at
     `data/historical/{feed}/{symbol}_{timeframe}_{adjustment}.parquet`.
-    Pre-feed-aware layout (top-level files) is read as IEX via a fallback path.
-    Run `scripts/migrate_cache_to_feed_aware.py` once to move legacy files into
-    `data/historical/iex/`.
+    Pre-feed-aware legacy files (top-level paths) are read as IEX via a
+    fallback path for backward compat. The migration script
+    (`scripts/migrate_cache_to_feed_aware.py`) defaults to **quarantining**
+    them into `data/historical/legacy_unknown_feed/` because legacy files
+    have no recorded provenance. Pass `--assume-feed=iex
+    --confirm-assumed-feed` only if you're sure the bars were IEX.
+  - **Feed validation**: `data/fetcher.py` strictly validates `feed` against
+    `{iex, sip}` — typos raise `ValueError` rather than silently creating
+    mis-tagged cache dirs.
   - **Per-symbol SIP coverage** (verified 2026-06-07): SPY and major ETFs ~2016-01-04;
     most mega-cap stocks ~2016-01-04; mid-caps 2017-2019; recent IPOs / de-SPACs at
     listing date. IEX coverage is ~4.5 years shallower for most names. Always probe
