@@ -1,10 +1,170 @@
-# Credit Spread Strategy — Design Proposal (Agnostic)
+# Credit Spread — Strategy Research & Deployment Guide
 
-**Status:** Proposal — no code yet, awaiting implementation
-**Suggested strategy ID:** `credit_spread` (instances named `credit_spread_spy`, `credit_spread_qqq`, etc.)
-**Proposed branch on implementation:** `feat/credit-spread-strategy`
-**Related PR:** follows [#6](https://github.com/francomarb/trading-bot/pull/6) (11.25 — composite-score options picker)
-**Author note:** This is the proposal that came out of the post-PR-#6 conversation about "if you had to pick one options strategy with profitability as top priority, what would it be?" — written so future sessions can pick it up cold. Originally drafted SPY-only; rewritten on the same day to be underlying-agnostic with per-instrument config blocks after the user correctly observed that strategy logic should be portable.
+**Status:** ✅ **ACTIVE** — wired in `forward_test.py` since PLAN 11.29.
+Running on **SPY + QQQ** in paper mode for several weeks as of this
+update; allocated 10% of equity in the isolated-options pool.
+
+**Last updated:** 2026-06-06
+
+**Strategy ID:** `credit_spread` (instances run per underlying:
+`credit_spread_spy`, `credit_spread_qqq`).
+
+> **Document structure.** This doc was originally written as a *design
+> proposal* before the strategy existed. The original proposal text is
+> preserved below (sections 1–15) as the rationale and research record —
+> it explains *why* the strategy looks the way it does. The
+> **Deployment configuration** section immediately below this header
+> captures the *live* parameters as of the last-updated date. When the
+> two disagree, settings.py and `forward_test.py` are the source of
+> truth; the proposal below is research, not spec.
+
+---
+
+## Deployment configuration (live)
+
+### Sleeve mechanics
+
+| Parameter | Value | Source |
+|---|---|---|
+| Pool type | Isolated options (defined-risk, never stretches) | `settings.STRATEGY_ALLOCATIONS["credit_spread"]` |
+| Sleeve weight | 0.10 of equity (target) | same |
+| Shared max concurrent positions | 8 across all underlyings | `settings.MAX_TOTAL_CONCURRENT_CREDIT_SPREADS` |
+| Regime gate | `TRENDING`, `RANGING` only | `settings.STRATEGY_ALLOWED_REGIMES["credit_spread"]` |
+| Sleeve budget pct | 0.10 | `settings.CREDIT_SPREAD_SLEEVE_BUDGET_PCT` |
+| Min trades for health verdict | 25 | `settings.STRATEGY_MIN_TRADES_FOR_VERDICT` |
+| Instruments | SPY, QQQ | `settings.CREDIT_SPREAD_INSTRUMENTS` |
+
+The sleeve is **shared** across all instances: SPY + QQQ draw from the
+same 10% budget rather than each getting their own. This is by design
+— credit spreads on SPY and QQQ are highly correlated (QQQ tracks SPX
+closely), and isolating each underlying would understate the cluster
+risk.
+
+The 0.10 sleeve was carved from the existing equity weights when credit
+spread was added (PLAN 11.29): SMA 0.45 → 0.40 and RSI 0.25 → 0.20.
+SPY Options Reversion (0.05) and Donchian (0.25) were not touched.
+
+### Per-instrument config (current `CREDIT_SPREAD_INSTRUMENTS`)
+
+Both SPY and QQQ share identical entry/exit logic, differing only in
+`spread_width` (SPY uses $10-wide strikes; QQQ uses $15-wide to
+compensate for the higher underlying price).
+
+| Parameter | SPY | QQQ | Notes |
+|---|---|---|---|
+| `short_leg_delta` | 0.17 | 0.17 | Sell strike at ~17Δ — well OTM bull put |
+| `spread_width` | 10 | 15 | Long strike = short strike − width |
+| `dte_min` | 30 | 30 | Earliest entry expiry |
+| `dte_max` | 45 | 45 | Latest entry expiry |
+| `iv_proxy_source` | `vix` | `vix` | QQQ tracks SPX vol closely enough |
+| `min_iv_proxy` | 14 | 14 | VIX must be ≥ 14 for entry (premium floor) |
+| `min_credit_pct_of_width` | 0.13 | 0.13 | Credit ≥ 13% of spread width |
+| `max_concurrent_positions` | 3 | 3 | Per-instance cap |
+| `max_per_expiration` | 1 | 1 | One spread per expiry, per underlying |
+| `min_dte_gap_between_opens` | 7 | 7 | Stagger entries across calendar |
+| `profit_target_pct` | 0.50 | 0.50 | Close at 50% of max profit |
+| `stop_loss_multiple` | 2.0 | 2.0 | Stop at 2× initial credit received |
+| `time_stop_dte` | 21 | 21 | Force close inside 21 DTE |
+| `exit_on_short_strike_breach` | True | True | Close immediately if short strike goes ITM |
+| `limit_timeout_seconds` | 30 | 30 | Cancel-and-retry stale entry limits |
+| `earnings_blackout_days` | 0 | 0 | ETFs — no earnings (single-name overrides exist) |
+
+**Validation enforced at import time:** every block in
+`CREDIT_SPREAD_INSTRUMENTS` must define all of `_REQUIRED_CREDIT_SPREAD_KEYS`;
+extra keys raise on settings load. `STRATEGY_WATCHLISTS["credit_spread"]`
+must match the instrument-block keys. This catches drift between the
+two sources.
+
+### Wiring (`forward_test.py:291-318`)
+
+```python
+_cs_quote_lookup = build_opra_quote_lookup()
+for _cs_symbol in settings.STRATEGY_WATCHLISTS["credit_spread"]:
+    _cs_config = CreditSpreadConfig.from_dict(
+        _cs_symbol, settings.CREDIT_SPREAD_INSTRUMENTS[_cs_symbol]
+    )
+    slots.append(StrategySlot(
+        strategy=CreditSpread(
+            _cs_config,
+            edge_filter=CreditSpreadEdgeFilter(
+                iv_proxy_source=_cs_config.iv_proxy_source,
+                min_iv_proxy=_cs_config.min_iv_proxy,
+                earnings_blackout_days=_cs_config.earnings_blackout_days,
+                iv_resolver=_iv_resolver,
+            ),
+            iv_resolver=_iv_resolver,
+            quote_lookup=_cs_quote_lookup,
+        ),
+        watchlist_source=StaticWatchlistSource(
+            [_cs_symbol], name=f"credit_spread_{_cs_symbol.lower()}"
+        ),
+        allowed_regimes=frozenset({MarketRegime.TRENDING, MarketRegime.RANGING}),
+    ))
+```
+
+The strategy is constructed **once per underlying** and they share the
+same `_iv_resolver` (PLAN 11.46 — single VIX cache) and one OPRA quote
+lookup. The allocator routes them through a single shared sleeve.
+
+### Implementation files (live)
+
+- `strategies/credit_spread.py` — `CreditSpread` strategy + `CreditSpreadConfig`.
+- `strategies/filters/credit_spread.py` — `CreditSpreadEdgeFilter`.
+- `utils/options_ranker.py` — two-leg composite-score ranker (extended from 11.25).
+- `execution/options_executor.py` — async bracket / MLEG order worker.
+- `engine/trader.py` — `dispatch_spread_order`, `SpreadExecutionWorker`,
+  spread-aware position model, startup spread reconstruction.
+- `config/settings.py` — `CREDIT_SPREAD_INSTRUMENTS`, sleeve config,
+  validation.
+- `forward_test.py` — slot wiring (lines 291–318).
+
+### Operational status
+
+- Paper-trading on SPY + QQQ since PLAN 11.29 landed.
+- Allocated 10% of equity in the isolated-options pool (shared sleeve).
+- Health monitor floor: 25 trades for `CONCLUSIVE` verdict; the sleeve
+  takes a while to accumulate that many trades because each instance is
+  capped at 3 concurrent and per-expiration entries are throttled.
+- Watch items: (1) per-side fill quality on the two-leg combo, (2)
+  realized credit-to-width ratio vs. the 0.13 floor, (3) frequency of
+  short-strike-breach exits in volatile sessions.
+
+### Known doc gaps vs. live implementation
+
+The proposal below was written before the engine acquired the MLEG path
+and the spread-aware position model. Some §9 ("Infrastructure changes")
+items are now done:
+
+- ✅ `dispatch_spread_order` + `SpreadExecutionWorker` (engine MLEG path).
+- ✅ Two-leg `Position` model + startup spread reconstruction.
+- ✅ Trade-DB schema extended for spread legs (`position_lifecycle_legs`).
+- ✅ Per-instrument config blocks + validation (§7).
+- ✅ Shared sleeve across instances (§6).
+- ⚠️ Two engine helpers still hardcode `strategy_name == "credit_spread"`
+  (the global concurrent counter and the startup-reconstruction strategy
+  lookup); see PLAN.md **11.31** for the cleanup needed before adding a
+  second multi-leg strategy.
+
+---
+
+## Related docs
+
+- [`strategies.md`](strategies.md) — top-level strategy catalog.
+- [`spy_options_reversion_strategy.md`](spy_options_reversion_strategy.md) —
+  the long-premium options sleeve that preceded credit spreads.
+- [`capital_allocation_reference.md`](capital_allocation_reference.md) —
+  sleeve weights and the isolated-options pool design.
+- [`regime_flowchart.md`](regime_flowchart.md) — regime classification.
+
+---
+
+# Original design proposal (preserved as research record)
+
+The remainder of this document is the **original design proposal** that
+preceded the implementation. It captures the rationale for the trade
+structure, the per-instrument knob choices, the sleeve model, and the
+infrastructure plan. Treat it as research / rationale; the
+**Deployment configuration** section above is the live truth.
 
 ---
 

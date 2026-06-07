@@ -81,6 +81,13 @@ SMA_WATCHLIST = [
     "BE", "ECG", "MRVL", "NVT", "SQM", "TSEM", "PL", "UBER",
     "NVDA", "ADBE", "ANET", "META", "PLTR", "DUOL",
 ]
+# Cull deferred 2026-06-06 — an earlier audit (scripts/sma_giveback_audit.py)
+# flagged VIAV, VSAT, CIEN, ALB, INTC as chronic underperformers and removed
+# them. Reviewer correctly pointed out the audit used unit-share, unfiltered,
+# in-sample P&L; production uses ATR-risk sizing plus regime + SPY + SMA edge
+# + sector + earnings filters. The cull was reverted pending a filter-aware,
+# walk-forward, OOS-validated re-audit. See sma_crossover_optimizations.md
+# for the gating conditions before any cull is re-promoted.
 # RSI Reversion — mean-reversion; promoted from the 2026-04-30 expanded
 # backtest pass to increase signal density for the static paper-trading pool.
 # This list intentionally favors breadth over the earlier narrow scanner
