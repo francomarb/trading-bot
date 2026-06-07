@@ -146,10 +146,13 @@ Composition is dynamic and lives in `config/settings.py::SMA_WATCHLIST`.
 Findings about *what* to put on the list and how often to refresh it are
 tracked in [`sma_crossover_optimizations.md`](sma_crossover_optimizations.md).
 
-**Current composition (2026-06-06):** 35 names, derived from
+**Current composition (2026-06-06):** 40 names, derived from
 `scripts/sma_watchlist_scan.py` (composite-score top 30 from 2026-05-11)
-plus manual additions (NVDA, DUOL) and recent culls (VIAV, VSAT, CIEN,
-ALB, INTC removed per giveback audit).
+plus manual additions (NVDA, DUOL). An audit-driven cull was attempted
+and reverted in the same session — see
+[`sma_crossover_optimizations.md`](sma_crossover_optimizations.md) for
+the methodology gates that must be satisfied before any cull is
+re-promoted.
 
 ---
 

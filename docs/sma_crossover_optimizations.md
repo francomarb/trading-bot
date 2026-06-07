@@ -68,18 +68,29 @@ everything.
 
 ### Profit concentration
 
+Reproducible from the per-symbol baseline section of
+`scripts/sma_giveback_audit.py` output (`--universe audit`).
+
 | Tier | Symbols | Net P&L (per-share units) |
 |---|---|---|
-| Top 5 (ASML, CAT, STRL, STX, MU) | 5 | **+$1,871 (70% of total)** |
-| Middle 15 | 15 | +$956 |
-| Bottom 20 | 20 | **−$149 (net loss)** |
-| ↳ chronic losers (negative net) | 6 (ADBE, ALB, VSAT, INTC, CIEN, VIAV) | combined drag |
+| Top 5 | SNDK, ASML, STRL, MU, STX | **+$5,004 (60% of total)** |
+| Middle 15 | Range +$148 to +$585 | +$3,051 |
+| Bottom half (20 symbols) | Range −$132 to +$92 | +$222 |
+| ↳ net-negative names | 5: VIAV, CIEN, VSAT, ALB, ADBE | combined −$263 |
 
-Total net across 40 symbols: **+$2,678** per-share-unit.
+Total net across 40 symbols: **+$8,277** per-share unit (baseline policy
+across all 571 entries, no production filters, no sizing).
 
 This is the textbook signature of a trend-following strategy: a handful
 of monster runners subsidize all the choppy losing trades. The watchlist
 composition is the dominant lever on overall P&L.
+
+> **A note on SNDK in the top 5.** SNDK shows the highest single-name
+> contribution ($1,715 on 2 trades) but is a *tiny sample*. Both of its
+> trades won; the apparent dominance is more luck than signal. A
+> filter-aware audit (see *Methodology gates* below) would likely
+> reweight which names actually contribute reliably vs. which got
+> lucky on a small N.
 
 ### Giveback (winners only)
 
@@ -290,6 +301,8 @@ be unsupportable on methodology, and reverted before merge.
 | 2026-06-06 | **Reverted** removal of VIAV, VSAT, CIEN, ALB, INTC from `SMA_WATCHLIST` | Reviewer correctly identified the audit was unit-share / unfiltered / in-sample; not a sufficient basis for an operational change. Cull deferred until the *Methodology gates* are satisfied. |
 | 2026-06-06 | Restructured audit script to a **unified policy comparison** | Earlier version simulated alternative exits only on death-cross winners — selection-biased. New version replays every entry under each *complete* policy; aggregate net P&L is the comparison metric. Headline numbers in this doc updated accordingly. |
 | 2026-06-06 | Pinned audit universe (`AUDIT_UNIVERSE` constant in script) | Earlier version read `settings.SMA_WATCHLIST` and would silently drift. Now the documented numbers reproduce exactly via `--universe audit` (default). |
+| 2026-06-06 | Entry-bar stop/take-profit honored | Reviewer identified that simulation skipped the entry bar entirely. Production's OTO stop attaches as soon as the parent fills at the open, so the stop can trigger same-day. Loops now check stops + take-profits starting at `entry_idx`; the death-cross check still starts at `entry_idx + 1` (a same-bar cross would only be observed by production on the next engine cycle). Per-symbol numbers shifted: **INTC turned out to be net-positive (+$46) under the corrected policy**, validating the reviewer's broader point that the original cull was not supported by the data. Negative-net names reduced from 6 to 5. |
+| 2026-06-06 | Per-symbol output added to `scripts/sma_giveback_audit.py` | Profit-concentration section in this doc is now reproducible by running the audit — addresses reviewer's "script emits no per-symbol P&L table" finding. |
 
 ---
 

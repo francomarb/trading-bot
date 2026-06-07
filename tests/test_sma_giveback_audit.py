@@ -145,36 +145,88 @@ class TestIterEntries:
         assert entries == []
 
 
-class TestPolicyBaselineEntryStopOrdering:
-    """Entry-bar stop ordering: no same-bar stop hit on the entry bar."""
+class TestPolicyEntryBarStopAndTakeProfit:
+    """
+    Entry-bar checks: in production the OTO stop attaches as soon as the
+    parent fills at the open, so the stop (and a take-profit if any) can
+    trigger on the same bar. The simulator must honor that.
 
-    def test_entry_bar_does_not_trigger_stop_even_if_low_below_stop(self):
-        # Build a frame where the entry bar's low is below the entry-time
-        # ATR stop, then prices recover. The simulator must enter and not
-        # immediately exit on the entry bar.
-        n = SLOW + 40
-        closes = np.concatenate([
-            np.full(60, 100.0),                # warmup
-            np.linspace(100.0, 120.0, 20),     # golden cross by ~bar 80
-            np.full(n - 80, 120.0),
-        ])
-        df = _ohlcv_from_closes(closes)
-        # Force the entry bar's low far below the entry price — this would
-        # trigger the disaster stop on the entry bar if we checked it there.
+    The DEATH-CROSS check still starts one bar after entry — see
+    _policy_baseline docstring for why.
+    """
+
+    def _entry_idx_in_trimmed_frame(self, df):
         bars = _prepare_bars(df)
         entries = _iter_entries(bars)
         assert entries, "fixture must produce at least one entry"
-        entry_idx = entries[0]
-        # Stuff a deep wick on the entry bar.
-        df.iloc[entry_idx, df.columns.get_loc("low")] = 1.0
+        return bars, entries[0]
+
+    def _untrimmed_index(self, df, bars, trimmed_idx):
+        """Map a trimmed-frame index back to the untrimmed df index."""
+        return trimmed_idx + (len(df) - len(bars.closes))
+
+    def test_entry_bar_stop_triggers_when_low_below_stop(self):
+        # Inject a wick that pierces the disaster stop on the entry bar.
+        df = _up_only_frame()
+        bars, trimmed_entry = self._entry_idx_in_trimmed_frame(df)
+        entry_price = bars.opens[trimmed_entry]
+        entry_atr = bars.atr[trimmed_entry - 1]
+        assert entry_atr > 0
+        expected_stop = entry_price - ATR_STOP_MULT * entry_atr
+
+        # Map back to untrimmed index and inject a low that touches the stop.
+        u_idx = self._untrimmed_index(df, bars, trimmed_entry)
+        df.iloc[u_idx, df.columns.get_loc("low")] = expected_stop - 0.01
 
         bars = _prepare_bars(df)
-        result = _policy_baseline(bars, entries[0])
-        exit_idx, exit_price, exit_reason, *_ = result
-        # The position must survive past the entry bar.
-        assert exit_idx > entries[0]
-        # And in this rising fixture should NOT exit at the atr_stop.
+        exit_idx, exit_price, exit_reason, *_ = _policy_baseline(bars, trimmed_entry)
+        assert exit_reason == "atr_stop"
+        assert exit_idx == trimmed_entry  # SAME bar
+        assert exit_price == pytest.approx(expected_stop)
+
+    def test_entry_bar_take_profit_triggers_when_high_above_target(self):
+        # Inject a high spike that touches the +10% target on the entry bar.
+        df = _up_only_frame()
+        bars, trimmed_entry = self._entry_idx_in_trimmed_frame(df)
+        entry_price = bars.opens[trimmed_entry]
+        target = entry_price * 1.10
+
+        u_idx = self._untrimmed_index(df, bars, trimmed_entry)
+        df.iloc[u_idx, df.columns.get_loc("high")] = target + 0.01
+
+        bars = _prepare_bars(df)
+        exit_idx, exit_price, exit_reason, *_ = _policy_take_profit(
+            bars, trimmed_entry, target_pct=0.10
+        )
+        assert exit_reason == "take_profit"
+        assert exit_idx == trimmed_entry  # SAME bar
+        assert exit_price == pytest.approx(target)
+
+    def test_entry_bar_no_trigger_when_range_inside_band(self):
+        # Vanilla entry bar — low above stop, high below TP, close above
+        # open. Nothing fires on the entry bar.
+        df = _up_only_frame()
+        bars, trimmed_entry = self._entry_idx_in_trimmed_frame(df)
+        # Just run baseline — the up_only fixture shouldn't trip anything
+        # on the entry bar by construction.
+        exit_idx, _, exit_reason, *_ = _policy_baseline(bars, trimmed_entry)
+        assert exit_idx > trimmed_entry  # survived the entry bar
         assert exit_reason in ("death_cross", "eod")
+
+    def test_entry_bar_death_cross_does_not_exit_immediately(self):
+        # Even if the entry bar's fast/slow could be interpreted as a
+        # death cross relative to the prior bar (extreme corner), the
+        # policy never exits on the death cross on the entry bar itself.
+        df = _golden_then_death_cross_frame()
+        bars = _prepare_bars(df)
+        entries = _iter_entries(bars)
+        assert entries
+        entry_idx = entries[0]
+        # No injection — just verify the baseline does not exit on entry bar
+        # via death cross even if the cross math happens to satisfy on that bar.
+        exit_idx, _, exit_reason, *_ = _policy_baseline(bars, entry_idx)
+        assert exit_idx > entry_idx  # never exits ON entry bar via death cross
+        assert exit_reason in ("death_cross", "atr_stop", "eod")
 
 
 class TestPolicyBaselineGapThroughStop:

@@ -218,7 +218,20 @@ def _iter_entries(bars: _BarsView) -> list[int]:
 def _policy_baseline(
     bars: _BarsView, entry_idx: int
 ) -> tuple[int, float, str, float, int]:
-    """Death-cross exit + 2.0×ATR static stop (the current production policy)."""
+    """Death-cross exit + 2.0×ATR static stop (the current production policy).
+
+    Production fills the parent order at the open of entry_idx and attaches
+    a GTC stop child as soon as the parent fills. The stop can therefore
+    trigger on the same bar — i.e., a gappy entry day where the post-open
+    intraday low touches the stop level. The simulation must check the
+    stop starting at entry_idx, not entry_idx + 1.
+
+    The DEATH-CROSS check still starts at entry_idx + 1: a death-cross
+    signal "on" the entry bar means the same bar's close prints fast < slow
+    after the prior bar's golden cross — production would observe this on
+    the NEXT engine cycle (the current cycle just placed the parent order),
+    so attributing an immediate exit to the entry bar would be unrealistic.
+    """
     entry_price = bars.opens[entry_idx]
     entry_atr = bars.atr[entry_idx - 1]    # ATR available at signal-bar close
     stop_level = entry_price - ATR_STOP_MULT * entry_atr
@@ -226,7 +239,7 @@ def _policy_baseline(
     hwm_idx = entry_idx
     n = len(bars.closes)
 
-    for i in range(entry_idx + 1, n):
+    for i in range(entry_idx, n):
         # Stop check first — intrabar low touching the stop exits at the stop.
         if bars.lows[i] <= stop_level:
             return (i, _fill_through_stop(bars.lows[i], stop_level),
@@ -235,9 +248,10 @@ def _policy_baseline(
         if bars.closes[i] > hwm_close:
             hwm_close = bars.closes[i]
             hwm_idx = i
-        # Death cross at bar i → exit at bar i+1 open.
-        if (bars.fast[i] < bars.slow[i] and bars.fast[i - 1] >= bars.slow[i - 1]
-                and i + 1 < n):
+        # Death cross only checked on bars AFTER entry (see docstring).
+        if i > entry_idx and (
+            bars.fast[i] < bars.slow[i] and bars.fast[i - 1] >= bars.slow[i - 1]
+        ) and i + 1 < n:
             return (i + 1, bars.opens[i + 1], "death_cross", hwm_close, hwm_idx)
 
     # Walked off the end — close at last bar.
@@ -249,7 +263,8 @@ def _policy_chandelier(
 ) -> tuple[int, float, str, float, int]:
     """
     Death-cross exit + 2.0×ATR disaster stop + chandelier trail (HWM−k·ATR).
-    Whichever fires first wins.
+    Whichever fires first wins. See _policy_baseline for the entry-bar
+    semantics.
     """
     entry_price = bars.opens[entry_idx]
     entry_atr = bars.atr[entry_idx - 1]
@@ -258,11 +273,8 @@ def _policy_chandelier(
     hwm_idx = entry_idx
     n = len(bars.closes)
 
-    for i in range(entry_idx + 1, n):
+    for i in range(entry_idx, n):
         trail_stop = hwm_close - k * entry_atr
-        # The trail stop is below HWM by k·ATR. The disaster stop is fixed at
-        # entry − 2·ATR. Effective stop on this bar is max(both) since either
-        # firing ends the trade.
         effective_stop = max(disaster_stop, trail_stop)
         if bars.lows[i] <= effective_stop:
             reason = "trail" if trail_stop >= disaster_stop else "atr_stop"
@@ -271,8 +283,9 @@ def _policy_chandelier(
         if bars.closes[i] > hwm_close:
             hwm_close = bars.closes[i]
             hwm_idx = i
-        if (bars.fast[i] < bars.slow[i] and bars.fast[i - 1] >= bars.slow[i - 1]
-                and i + 1 < n):
+        if i > entry_idx and (
+            bars.fast[i] < bars.slow[i] and bars.fast[i - 1] >= bars.slow[i - 1]
+        ) and i + 1 < n:
             return (i + 1, bars.opens[i + 1], "death_cross", hwm_close, hwm_idx)
 
     return (n - 1, bars.closes[n - 1], "eod", hwm_close, hwm_idx)
@@ -283,7 +296,8 @@ def _policy_gated_trail(
 ) -> tuple[int, float, str, float, int]:
     """
     Death-cross + 2.0×ATR disaster + chandelier trail that ARMS only after
-    unrealized close-profit ≥ activation_k × ATR.
+    unrealized close-profit ≥ activation_k × ATR. See _policy_baseline for
+    the entry-bar semantics.
     """
     entry_price = bars.opens[entry_idx]
     entry_atr = bars.atr[entry_idx - 1]
@@ -293,8 +307,7 @@ def _policy_gated_trail(
     armed = False
     n = len(bars.closes)
 
-    for i in range(entry_idx + 1, n):
-        # Effective stop depends on whether the trail has armed.
+    for i in range(entry_idx, n):
         if armed:
             effective_stop = max(disaster_stop, hwm_close - trail_k * entry_atr)
         else:
@@ -308,8 +321,9 @@ def _policy_gated_trail(
             hwm_idx = i
         if not armed and (bars.closes[i] - entry_price) >= activation_k * entry_atr:
             armed = True
-        if (bars.fast[i] < bars.slow[i] and bars.fast[i - 1] >= bars.slow[i - 1]
-                and i + 1 < n):
+        if i > entry_idx and (
+            bars.fast[i] < bars.slow[i] and bars.fast[i - 1] >= bars.slow[i - 1]
+        ) and i + 1 < n:
             return (i + 1, bars.opens[i + 1], "death_cross", hwm_close, hwm_idx)
 
     return (n - 1, bars.closes[n - 1], "eod", hwm_close, hwm_idx)
@@ -320,8 +334,10 @@ def _policy_take_profit(
 ) -> tuple[int, float, str, float, int]:
     """
     Death-cross + 2.0×ATR disaster + fixed-% take-profit at
-    entry × (1 + target_pct). Intrabar HIGH touching the target fills at
-    the target price.
+    entry × (1 + target_pct). The take-profit can fire on the entry bar
+    (a gappy entry day that runs straight to the target). Both stop and
+    TP are intrabar; if both could hit on the same bar, the disaster stop
+    wins (conservative — pessimistic intrabar ordering).
     """
     entry_price = bars.opens[entry_idx]
     entry_atr = bars.atr[entry_idx - 1]
@@ -331,9 +347,7 @@ def _policy_take_profit(
     hwm_idx = entry_idx
     n = len(bars.closes)
 
-    for i in range(entry_idx + 1, n):
-        # Order on the bar: stop first (conservative — assume worst-case
-        # ordering of intrabar prices). Then take-profit. Then death cross.
+    for i in range(entry_idx, n):
         if bars.lows[i] <= disaster_stop:
             return (i, _fill_through_stop(bars.lows[i], disaster_stop),
                     "atr_stop", hwm_close, hwm_idx)
@@ -342,8 +356,9 @@ def _policy_take_profit(
         if bars.closes[i] > hwm_close:
             hwm_close = bars.closes[i]
             hwm_idx = i
-        if (bars.fast[i] < bars.slow[i] and bars.fast[i - 1] >= bars.slow[i - 1]
-                and i + 1 < n):
+        if i > entry_idx and (
+            bars.fast[i] < bars.slow[i] and bars.fast[i - 1] >= bars.slow[i - 1]
+        ) and i + 1 < n:
             return (i + 1, bars.opens[i + 1], "death_cross", hwm_close, hwm_idx)
 
     return (n - 1, bars.closes[n - 1], "eod", hwm_close, hwm_idx)
@@ -564,6 +579,48 @@ def main(argv: list[str] | None = None) -> int:
         delta = r.net_pnl - baseline.net_pnl
         print(f"  {r.name:<46} {r.n:>5} ${r.net_pnl:>9,.0f} "
               f"${delta:>+10,.0f} {r.win_rate*100:>5.1f}% ${r.avg_trade:>6.2f}")
+
+    # ── Per-symbol baseline P&L (the profit-concentration section) ─────
+    print()
+    print("─" * 80)
+    print("PER-SYMBOL BASELINE P&L (sorted by net descending)")
+    print("Reproduces the profit-concentration section of the optimization doc.")
+    print("Unit shares; pure baseline policy (death cross + 2.0 ATR stop).")
+    print("─" * 80)
+
+    per_sym: dict[str, list[Trade]] = {}
+    for t in baseline.trades:
+        per_sym.setdefault(t.symbol, []).append(t)
+
+    rows = []
+    for sym, trades in per_sym.items():
+        n = len(trades)
+        winners = [t for t in trades if t.pnl > 0]
+        losers = [t for t in trades if t.pnl <= 0]
+        net = sum(t.pnl for t in trades)
+        gw = sum(t.pnl for t in winners)
+        gl = sum(t.pnl for t in losers)
+        rows.append((sym, n, len(winners), net, gw, gl))
+    rows.sort(key=lambda r: -r[3])
+
+    print(f"  {'sym':<6} {'trades':>6} {'wins':>5} {'net':>9} "
+          f"{'gross_w':>9} {'gross_l':>9} {'win%':>6}")
+    for sym, n, w, net, gw, gl in rows:
+        print(f"  {sym:<6} {n:>6} {w:>5} {net:>9.0f} "
+              f"{gw:>9.0f} {gl:>9.0f} {w/n*100:>5.0f}%")
+
+    # Concentration tiers (top-5 / middle / bottom-half).
+    if rows:
+        total_net = sum(r[3] for r in rows)
+        top5_net = sum(r[3] for r in rows[:5])
+        bottom_half_net = sum(r[3] for r in rows[len(rows) // 2:])
+        n_negative = sum(1 for r in rows if r[3] < 0)
+        print()
+        print(f"  Total net (all {len(rows)} symbols): ${total_net:,.0f}")
+        print(f"  Top 5 contributors: ${top5_net:,.0f}  "
+              f"({top5_net/total_net*100:.0f}% of total)" if total_net else "")
+        print(f"  Bottom-half symbols: ${bottom_half_net:,.0f}")
+        print(f"  Symbols with negative net P&L over window: {n_negative}/{len(rows)}")
 
     return 0
 
