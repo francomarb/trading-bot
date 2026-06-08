@@ -84,6 +84,7 @@ class DonchianEdgeFilter:
         notional_min_avg: int = _NOTIONAL_MIN_AVG,
         days_before: int = _EARNINGS_DAYS_BEFORE,
         days_after: int = _EARNINGS_DAYS_AFTER,
+        feed_label: str | None = None,
     ) -> None:
         self._stock_sma_window = stock_sma_window
         self._vol_min_window = vol_min_window
@@ -95,6 +96,14 @@ class DonchianEdgeFilter:
             days_after=days_after,
         )
 
+        # `feed_label` is the data feed the bars in `df` were fetched on.
+        # Defaults to ALPACA_DATA_FEED (the live engine path); research
+        # callers that pass `feed=settings.BACKTEST_DATA_FEED` to the
+        # fetcher should pass the same string here so the diagnostic log
+        # reflects what was actually used. Without this override the log
+        # said "feed=iex" even when SIP bars were being filtered, which
+        # defeated provenance tracking in backtest reports.
+        self._feed_label_override = feed_label
         self._symbol: str = ""
 
     def set_symbol(self, symbol: str) -> None:
@@ -133,7 +142,7 @@ class DonchianEdgeFilter:
 
         combined = stock_gate & earnings_gate & liquidity_gate
         reasons_by_bar: list[list[str]] = []
-        feed_label = ALPACA_DATA_FEED
+        feed_label = self._feed_label_override or ALPACA_DATA_FEED
         threshold_str = f"${self._notional_min_avg:,}"
 
         stock_sma = df["close"].rolling(self._stock_sma_window).mean()

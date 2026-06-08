@@ -95,6 +95,7 @@ class BollingerSqueezeEdgeFilter:
         bb_std: float = _BB_STD,
         atr_length: int = _ATR_LENGTH,
         exhaustion_atr_mult: float = _EXHAUSTION_ATR_MULT,
+        feed_label: str | None = None,
     ) -> None:
         self._vol_min_window = vol_min_window
 
@@ -110,6 +111,8 @@ class BollingerSqueezeEdgeFilter:
         self._atr_length = atr_length
         self._exhaustion_atr_mult = float(exhaustion_atr_mult)
 
+        # See DonchianEdgeFilter for the rationale on `feed_label`.
+        self._feed_label_override = feed_label
         self._symbol: str = ""
 
     def set_symbol(self, symbol: str) -> None:
@@ -158,7 +161,7 @@ class BollingerSqueezeEdgeFilter:
         combined = liquidity_gate & earnings_gate & exhaustion_gate
         reasons_by_bar: list[list[str]] = []
 
-        feed_label = ALPACA_DATA_FEED
+        feed_label = self._feed_label_override or ALPACA_DATA_FEED
         threshold_str = f"${self._notional_min_avg:,}"
         if "volume" in df.columns and "close" in df.columns:
             dollar_vol = df["close"].astype(float) * df["volume"].astype(float)

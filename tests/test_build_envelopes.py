@@ -70,7 +70,7 @@ class TestEquityEnvelopeBuild:
             "BBB": _synthetic_bars(seed=2),
         }
 
-        def fake_fetch(sym, start, end, timeframe):
+        def fake_fetch(sym, start, end, timeframe, **kwargs):
             if sym not in bars:
                 raise RuntimeError(f"no bars for {sym}")
             return bars[sym], None
@@ -152,7 +152,7 @@ class TestEmptyCases:
     def test_no_bars_writes_stub(self, tmp_path: Path, monkeypatch):
         """All fetch attempts fail → stub envelope with explanatory notes."""
 
-        def fake_fetch(sym, start, end, timeframe):
+        def fake_fetch(sym, start, end, timeframe, **kwargs):
             raise RuntimeError("simulated outage")
 
         monkeypatch.setattr(build_envelopes, "fetch_symbol", fake_fetch)
@@ -188,7 +188,7 @@ class TestIdempotency:
         identical Edge metrics (built_at timestamp will differ)."""
         bars = {"AAA": _synthetic_bars(seed=42), "BBB": _synthetic_bars(seed=43)}
 
-        def fake_fetch(sym, start, end, timeframe):
+        def fake_fetch(sym, start, end, timeframe, **kwargs):
             return bars[sym], None
 
         monkeypatch.setattr(build_envelopes, "fetch_symbol", fake_fetch)
@@ -260,7 +260,7 @@ class TestRiskUnitFormula:
         100 (the buggy value with `× MAX_POSITION_PCT=0.02`)."""
         bars = {"AAA": _synthetic_bars(seed=11), "BBB": _synthetic_bars(seed=12)}
 
-        def fake_fetch(sym, start, end, timeframe):
+        def fake_fetch(sym, start, end, timeframe, **kwargs):
             return bars[sym], None
 
         monkeypatch.setattr(build_envelopes, "fetch_symbol", fake_fetch)
@@ -289,7 +289,7 @@ class TestRiskUnitFormula:
         """Donchian uses approx_stop_pct=0.02 → 100_000 × 0.02 = 2,000."""
         bars = {"AAA": _synthetic_bars(seed=21)}
 
-        def fake_fetch(sym, start, end, timeframe):
+        def fake_fetch(sym, start, end, timeframe, **kwargs):
             return bars[sym], None
 
         monkeypatch.setattr(build_envelopes, "fetch_symbol", fake_fetch)
@@ -342,7 +342,7 @@ class TestProductionFilterWiring:
         second-pass feedback. Just naming the omission was incomplete."""
         bars = {"AAA": _synthetic_bars(seed=31)}
 
-        def fake_fetch(sym, start, end, timeframe):
+        def fake_fetch(sym, start, end, timeframe, **kwargs):
             return bars[sym], None
 
         monkeypatch.setattr(build_envelopes, "fetch_symbol", fake_fetch)
@@ -374,7 +374,7 @@ class TestProductionFilterWiring:
 
         bars = {"AAA": _synthetic_bars(seed=51)}
 
-        def fake_fetch(sym, start, end, timeframe):
+        def fake_fetch(sym, start, end, timeframe, **kwargs):
             return bars[sym], None
 
         monkeypatch.setattr(build_envelopes, "fetch_symbol", fake_fetch)

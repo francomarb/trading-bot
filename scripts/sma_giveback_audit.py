@@ -520,10 +520,15 @@ def main(argv: list[str] | None = None) -> int:
           f"window={start.date()} → {end.date()}", file=sys.stderr)
 
     # Fetch all symbols once; rerun every policy on the same cached bars.
+    from config import settings
+    backtest_feed = settings.BACKTEST_DATA_FEED
     bar_cache: dict[str, pd.DataFrame] = {}
     for sym in symbols:
         try:
-            df, _ = fetch_symbol(sym, start, end, timeframe="1Day", use_cache=True)
+            df, _ = fetch_symbol(
+                sym, start, end, timeframe="1Day",
+                feed=backtest_feed, use_cache=True,
+            )
         except Exception as exc:
             print(f"  {sym}: fetch failed — {exc}", file=sys.stderr)
             continue

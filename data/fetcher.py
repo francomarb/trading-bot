@@ -69,6 +69,30 @@ _FEED_MAP: dict[str, DataFeed] = {
     "iex": DataFeed.IEX,
     "sip": DataFeed.SIP,
 }
+_VALID_FEEDS: frozenset[str] = frozenset(_FEED_MAP.keys())
+
+
+def _validate_feed(feed: str) -> str:
+    """
+    Strict feed validation. Returns the lowercased feed string if valid;
+    raises ValueError otherwise.
+
+    Pre-PR #50 the API path used .get(feed, DataFeed.IEX) which silently
+    fell through to IEX for unknown feeds while caching under the raw
+    string. Net effect: a typo (e.g. ``feed="six"``) created a cache
+    directory ``data/historical/six/`` containing IEX bars, then on the
+    next call the IEX synthetic-SIP volume scaling was NOT applied
+    (only IEX-cased input triggers it), silently producing wrong volume
+    numbers. Strict validation prevents this.
+    """
+    if not isinstance(feed, str):
+        raise ValueError(f"feed must be a str, got {type(feed).__name__}")
+    normalized = feed.lower()
+    if normalized not in _VALID_FEEDS:
+        raise ValueError(
+            f"feed must be one of {sorted(_VALID_FEEDS)}; got {feed!r}"
+        )
+    return normalized
 
 
 # ── Exceptions ───────────────────────────────────────────────────────────────
@@ -250,18 +274,49 @@ def fetch_latest_quote_midpoint(symbol: str) -> float | None:
 # ── Cache ────────────────────────────────────────────────────────────────────
 
 
-def _cache_path(symbol: str, timeframe: str, adjustment: str) -> Path:
+def _legacy_cache_path(symbol: str, timeframe: str, adjustment: str) -> Path:
+    """Top-level (pre-feed-aware) cache path. Read fallback only — never written.
+
+    All bars cached before the feed-aware layout landed live here. The fallback
+    keeps the live bot from seeing an empty cache after the new fetcher deploys
+    but before scripts/migrate_cache_to_feed_aware.py has been run. Once
+    migration is complete, this path is empty and the fallback becomes dead
+    code (safe to delete in a follow-up).
+    """
     return CACHE_DIR / f"{symbol.upper()}_{timeframe}_{adjustment}.parquet"
 
 
-def _meta_path(symbol: str, timeframe: str, adjustment: str) -> Path:
+def _legacy_meta_path(symbol: str, timeframe: str, adjustment: str) -> Path:
     return CACHE_DIR / f"{symbol.upper()}_{timeframe}_{adjustment}.meta.json"
 
 
-def _read_cache(symbol: str, timeframe: str, adjustment: str) -> pd.DataFrame:
-    path = _cache_path(symbol, timeframe, adjustment)
+def _cache_path(symbol: str, timeframe: str, adjustment: str, feed: str) -> Path:
+    """Feed-aware cache path. Writes go here; reads check here first."""
+    return CACHE_DIR / feed.lower() / f"{symbol.upper()}_{timeframe}_{adjustment}.parquet"
+
+
+def _meta_path(symbol: str, timeframe: str, adjustment: str, feed: str) -> Path:
+    return CACHE_DIR / feed.lower() / f"{symbol.upper()}_{timeframe}_{adjustment}.meta.json"
+
+
+def _read_cache(symbol: str, timeframe: str, adjustment: str, feed: str) -> pd.DataFrame:
+    """Read cached bars. Tries feed-aware path first, falls back to legacy.
+
+    The fallback exists for graceful deploy before migration. New writes always
+    go to the feed-aware path, so once a symbol is touched after the fetcher
+    upgrade, only the feed-aware path is consulted for it from then on.
+    """
+    path = _cache_path(symbol, timeframe, adjustment, feed)
     if not path.exists():
-        return pd.DataFrame()
+        # Legacy fallback — pre-feed-aware layout. Only applies for the IEX
+        # feed because that's what every cache file was tagged as before
+        # the migration.
+        if feed.lower() == "iex":
+            path = _legacy_cache_path(symbol, timeframe, adjustment)
+            if not path.exists():
+                return pd.DataFrame()
+        else:
+            return pd.DataFrame()
     df = pd.read_parquet(path)
     # Parquet round-trip should preserve tz, but belt-and-suspenders.
     if isinstance(df.index, pd.DatetimeIndex) and df.index.tz is None:
@@ -270,12 +325,21 @@ def _read_cache(symbol: str, timeframe: str, adjustment: str) -> pd.DataFrame:
 
 
 def _read_meta(
-    symbol: str, timeframe: str, adjustment: str
+    symbol: str, timeframe: str, adjustment: str, feed: str
 ) -> tuple[datetime | None, datetime | None]:
-    """Return (covered_start, covered_end) from sidecar, or (None, None)."""
-    path = _meta_path(symbol, timeframe, adjustment)
+    """Return (covered_start, covered_end) from sidecar, or (None, None).
+
+    Tries feed-aware sidecar first, falls back to legacy top-level sidecar
+    (IEX feed only).
+    """
+    path = _meta_path(symbol, timeframe, adjustment, feed)
     if not path.exists():
-        return None, None
+        if feed.lower() == "iex":
+            path = _legacy_meta_path(symbol, timeframe, adjustment)
+            if not path.exists():
+                return None, None
+        else:
+            return None, None
     try:
         data = json.loads(path.read_text())
         start = datetime.fromisoformat(data["covered_start"])
@@ -293,11 +357,14 @@ def _write_cache(
     adjustment: str,
     covered_start: datetime,
     covered_end: datetime,
+    feed: str,
 ) -> None:
     if df.empty:
         return
-    df.to_parquet(_cache_path(symbol, timeframe, adjustment))
-    _meta_path(symbol, timeframe, adjustment).write_text(
+    cache_path = _cache_path(symbol, timeframe, adjustment, feed)
+    cache_path.parent.mkdir(parents=True, exist_ok=True)
+    df.to_parquet(cache_path)
+    _meta_path(symbol, timeframe, adjustment, feed).write_text(
         json.dumps(
             {
                 "covered_start": covered_start.isoformat(),
@@ -363,7 +430,9 @@ def _fetch_bars_api(
     client = _get_client()
 
     adj_enum = _ADJUSTMENT_MAP.get(adjustment, Adjustment.ALL)
-    feed_enum = _FEED_MAP.get(feed, DataFeed.IEX)
+    # Strict feed lookup — _validate_feed at the public entry has already
+    # normalized this, so a KeyError here would indicate a bypass bug.
+    feed_enum = _FEED_MAP[feed]
 
     request = StockBarsRequest(
         symbol_or_symbols=symbol,
@@ -427,14 +496,48 @@ def fetch_symbol(
             f"Unsupported timeframe '{timeframe}'. Supported: {list(_TIMEFRAME_MAP)}"
         )
 
+    # Strict feed validation — rejects typos / unknown feeds before they
+    # reach the cache layer (which used to silently create mis-tagged subdirs).
+    feed = _validate_feed(feed)
+
     start = _to_utc(start)
     end = _to_utc(end)
     if start >= end:
         raise ValueError(f"start ({start}) must be < end ({end})")
 
-    cached = _read_cache(symbol, timeframe, adjustment) if use_cache else pd.DataFrame()
+    # Basic Alpaca tier rule: SIP historical queries are only allowed for
+    # bars whose timestamp is at least 15 minutes old. Real-time SIP needs
+    # the Algo Trader Plus subscription. For backtests / offline analysis
+    # the 15-min delay is irrelevant — we're typically asking for bars far
+    # older than that — but the moment a forward-test or recent-data audit
+    # passes `end=now`, the API returns 422. Clamp here so callers don't
+    # have to think about it. Watchlist scanners enforce the same rule via
+    # --end-delay-minutes (default 60).
+    if feed == "sip":
+        sip_end_cutoff = datetime.now(timezone.utc) - timedelta(minutes=15)
+        if end > sip_end_cutoff:
+            logger.warning(
+                f"{symbol}: SIP requires end <= now-15min; clamping end "
+                f"{end.isoformat()} → {sip_end_cutoff.isoformat()}"
+            )
+            end = sip_end_cutoff
+            # Re-validate the interval — if the caller asked for a window
+            # entirely within the 15-min SIP delay (e.g. start=now-10min,
+            # end=now), clamping collapses end below start. That's a real
+            # caller error, not something to swallow.
+            if start >= end:
+                raise ValueError(
+                    f"{symbol}: requested SIP window collapsed after 15-min "
+                    f"end-clamp (start={start.isoformat()}, "
+                    f"clamped end={end.isoformat()}). The interval was "
+                    f"entirely within the SIP delay window. Pass an earlier "
+                    f"`end` or wait 15 minutes for the bars to become "
+                    f"available."
+                )
+
+    cached = _read_cache(symbol, timeframe, adjustment, feed) if use_cache else pd.DataFrame()
     cov_start, cov_end = (
-        _read_meta(symbol, timeframe, adjustment) if use_cache else (None, None)
+        _read_meta(symbol, timeframe, adjustment, feed) if use_cache else (None, None)
     )
 
     # Clamp a future-dated covered_end to now so a backtest or verify script
@@ -489,7 +592,7 @@ def fetch_symbol(
             merged = merged[~merged.index.duplicated(keep="last")]
         merged = _validate(merged, symbol)
         _write_cache(
-            merged, symbol, timeframe, adjustment, new_cov_start, new_cov_end
+            merged, symbol, timeframe, adjustment, new_cov_start, new_cov_end, feed
         )
     else:
         merged = cached
@@ -500,7 +603,7 @@ def fetch_symbol(
             cov_start != new_cov_start or cov_end != new_cov_end
         ):
             _write_cache(
-                merged, symbol, timeframe, adjustment, new_cov_start, new_cov_end
+                merged, symbol, timeframe, adjustment, new_cov_start, new_cov_end, feed
             )
 
     rows_from_api = sum(len(f) for f in fetched_frames)

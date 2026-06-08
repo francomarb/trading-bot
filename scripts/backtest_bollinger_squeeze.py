@@ -88,10 +88,12 @@ def fetch_bars(
         end = end.replace(tzinfo=timezone.utc)
     start = end - timedelta(days=int(365 * years) + 30)
 
+    from config import settings
+    backtest_feed = settings.BACKTEST_DATA_FEED
     out: dict[str, pd.DataFrame] = {}
     for symbol in symbols:
         try:
-            df, stats = fetch_symbol(symbol, start, end, "1Day")
+            df, stats = fetch_symbol(symbol, start, end, "1Day", feed=backtest_feed)
         except Exception as exc:  # noqa: BLE001
             logger.warning(f"{symbol}: fetch failed — {exc}")
             continue
@@ -131,7 +133,7 @@ def run_one(
     strategy_params: dict | None = None,
     atr_stop_mult: float | None = None,
 ) -> SymbolReport:
-    edge = BollingerSqueezeEdgeFilter() if use_filter else None
+    edge = BollingerSqueezeEdgeFilter(feed_label=settings.BACKTEST_DATA_FEED) if use_filter else None
     params = strategy_params or {}
     strategy = BollingerSqueeze(edge_filter=edge, **params)
     result = run_backtest(
@@ -481,7 +483,7 @@ def main() -> int:
         f"- Bars range: {bar_start.date()} → {bar_end.date()} ({args.years}y nominal)\n"
         f"- Universe: {universe_label} — {len(bars_by_sym)} of {len(symbols)} symbols\n"
         f"- Symbols: {', '.join(sorted(bars_by_sym.keys()))}\n"
-        f"- Data feed: {settings.ALPACA_DATA_FEED}\n"
+        f"- Data feed: {settings.BACKTEST_DATA_FEED} (from `settings.BACKTEST_DATA_FEED`)\n"
         f"- Slippage: {cfg.slippage_bps} bps, init_cash: ${cfg.initial_cash:,.0f}\n"
         f"- Edge filter: {'ON' if not args.no_filter else 'OFF'}\n"
     )

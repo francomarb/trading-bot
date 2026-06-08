@@ -241,27 +241,57 @@ def per_symbol_filter_mask(
 # ── Bar loading from cache only ─────────────────────────────────────────────
 
 
-def load_cached_bars(symbol: str) -> pd.DataFrame | None:
+def load_bars(symbol: str, *, feed: str | None = None) -> pd.DataFrame | None:
     """
-    Read the all-history parquet for `symbol` from data/historical/.
-    Returns None if missing or unreadable. Never touches the network.
+    Load bars for `symbol` via the feed-aware fetcher. By default uses
+    ``settings.BACKTEST_DATA_FEED`` (= ``"sip"``) so the Donchian comparison
+    runs against consolidated-tape volume and the deeper SIP history that
+    PR #50 unlocked.
+
+    Returns None if the fetcher returns no bars (e.g. the symbol has no
+    coverage on the chosen feed). Hits the network if the cache is cold.
+
+    Pre-PR #50 this function read top-level legacy paquet paths directly
+    (``data/historical/{symbol}_1Day_all.parquet``). After the cache
+    migration, those files move into ``data/historical/iex/`` or are
+    quarantined under ``legacy_unknown_feed/``, so a direct top-level read
+    returns empty for every symbol. Going through ``fetch_symbol`` keeps
+    this script working post-migration and aligns it with PR #50's
+    feed-aware contract.
     """
-    path = ROOT / "data" / "historical" / f"{symbol}_1Day_all.parquet"
-    if not path.exists():
-        return None
+    from config import settings
+    from data.fetcher import fetch_symbol
+
+    chosen_feed = (feed or settings.BACKTEST_DATA_FEED).lower()
+    # Probe deep — let the API return whatever it has per symbol.
+    # See `feedback_audit_reachable_data_first.md` in user memory.
+    start = datetime(2015, 1, 1, tzinfo=timezone.utc)
+    end = datetime.now(timezone.utc)
     try:
-        df = pd.read_parquet(path)
+        df, _ = fetch_symbol(
+            symbol, start, end, timeframe="1Day",
+            feed=chosen_feed, use_cache=True,
+        )
     except Exception as exc:  # noqa: BLE001
-        logger.warning(f"{symbol}: failed to read {path.name} — {exc}")
+        logger.warning(f"{symbol}: fetch_symbol failed on feed={chosen_feed} — {exc}")
+        return None
+    if df is None or df.empty:
         return None
     cols = {"open", "high", "low", "close"}
     if not cols.issubset(set(df.columns)):
-        logger.warning(f"{symbol}: missing OHLC cols in cache")
+        logger.warning(f"{symbol}: missing OHLC cols in fetched bars")
         return None
     df = df[["open", "high", "low", "close", "volume"]].dropna().sort_index()
     if df.index.tz is None:
         df.index = df.index.tz_localize("UTC")
     return df
+
+
+# Backwards-compat alias kept for any external caller. Will be removed in a
+# follow-up once the audit script and any other consumers move to load_bars().
+def load_cached_bars(symbol: str) -> pd.DataFrame | None:
+    """Deprecated: use load_bars(). Reads bars via the feed-aware fetcher."""
+    return load_bars(symbol)
 
 
 def slice_window(df: pd.DataFrame, window: RegimeWindow, *, warmup_bars: int = 50) -> pd.DataFrame | None:
@@ -617,11 +647,14 @@ def main() -> int:
         per_year = per_year_slice_aggregates(combined, years=[2021, 2022, 2023, 2024])
         per_year_tables = render_per_year_tables(combined, per_year)
 
+    from config import settings
+    backtest_feed = settings.BACKTEST_DATA_FEED
     sections = [
         "# Donchian Trail-Stop Comparison",
         "",
         f"- Generated: {datetime.now(timezone.utc).isoformat()}",
         f"- Universe: {args.universe} ({len(symbols)} symbols)",
+        f"- Data feed: **{backtest_feed}** (from `settings.BACKTEST_DATA_FEED`)",
         f"- Strategy params: entry={args.entry_window}, exit={args.exit_window}, ATR={args.atr_length}",
         f"- Slippage: {args.slippage_bps} bps, init_cash: ${args.initial_cash:,.0f}, risk/trade: {args.risk_per_trade_pct*100:.1f}%",
         f"- Production gates: {'ON (SPY TRENDING-only + DonchianEdgeFilter rules 1+3)' if apply_gates else 'OFF (ungated — every Donchian high entered)'}",

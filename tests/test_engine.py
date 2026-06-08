@@ -212,7 +212,7 @@ def patch_fetch(monkeypatch):
     holder dict to set the next df / next exception."""
     holder: dict = {"df": _bars(), "raises": None}
 
-    def _fetch(symbol, start, end, timeframe="1Day"):
+    def _fetch(symbol, start, end, timeframe="1Day", **kwargs):
         if holder["raises"] is not None:
             raise holder["raises"]
         # Return whatever the test pinned. Stats is not used by the engine,
@@ -876,7 +876,7 @@ class TestRunOneCycle:
         # First call raises, then we let it succeed.
         original = patch_fetch["df"]
 
-        def _fetch_with_first_bad(symbol, start, end, timeframe="1Day"):
+        def _fetch_with_first_bad(symbol, start, end, timeframe="1Day", **kwargs):
             if symbol == "BAD":
                 raise RuntimeError("fetch boom")
             return original, SimpleNamespace(api_calls=0)
@@ -2943,7 +2943,7 @@ class TestOptionsEngineFixes:
         engine.broker.find_recent_filled_entry_order = MagicMock(return_value=None)
         monkeypatch.setattr(
             "engine.trader.fetch_symbol",
-            lambda symbol, start, end, timeframe="1Day": (_bars(), SimpleNamespace(api_calls=0)),
+            lambda symbol, start, end, timeframe="1Day", **kwargs: (_bars(), SimpleNamespace(api_calls=0)),
         )
 
         pos = Position("AAPL", 10, 100.0, 1000.0)
@@ -2989,7 +2989,7 @@ class TestOptionsEngineFixes:
         )
         monkeypatch.setattr(
             "engine.trader.fetch_symbol",
-            lambda symbol, start, end, timeframe="1Day": (_bars(base=100.0), SimpleNamespace(api_calls=0)),
+            lambda symbol, start, end, timeframe="1Day", **kwargs: (_bars(base=100.0), SimpleNamespace(api_calls=0)),
         )
 
         pos = Position("AAPL", 10, 100.0, 1000.0)

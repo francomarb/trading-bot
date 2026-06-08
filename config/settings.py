@@ -18,9 +18,27 @@ ALPACA_SECRET_KEY: str | None = _ALPACA_SECRET_KEY_LIVE if LIVE_TRADING else _AL
 ALPACA_PAPER: bool = not LIVE_TRADING
 
 # Data feed selection (Phase 10)
-# Use 'sip' only if you pay for the $99/mo Algo Trader Plus subscription.
-# Otherwise, 'iex' is the required free tier feed for real-time market data.
+#
+# Live engine on a paper account uses 'iex' (free, real-time). The paid
+# Algo Trader Plus subscription ($99/mo) is required for real-time SIP, used
+# only when the engine goes live with real money.
 ALPACA_DATA_FEED: str = os.getenv("ALPACA_DATA_FEED", "iex").lower()
+
+# Offline / backtest data feed. Basic Alpaca accounts can query SIP
+# historical data with a 15-minute delay at no extra cost — perfect for
+# backtests, calibration jobs, walkforward audits, and any analysis that
+# doesn't need real-time bars. The fetcher enforces the 15-min cutoff
+# automatically (see data/fetcher.py SIP end-clamp). Use this constant in
+# backtest/audit scripts; the live engine continues to read
+# ALPACA_DATA_FEED (= 'iex' on paper).
+#
+# Why this matters: SIP gives true consolidated-tape volume, so filter
+# liquidity floors are interpretable in plain English. With 'iex' the
+# fetcher applies a static 20x synthetic-SIP volume multiplier
+# (utils.market.apply_synthetic_sip_volume), which is approximately right
+# for liquid mega-caps and noticeably off for less-liquid names. Switching
+# offline analysis to SIP removes the approximation.
+BACKTEST_DATA_FEED: str = os.getenv("BACKTEST_DATA_FEED", "sip").lower()
 
 # Derived base URL — used only by legacy verify scripts; alpaca-py uses the
 # `paper=` flag on TradingClient directly.

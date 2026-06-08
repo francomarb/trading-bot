@@ -70,7 +70,7 @@ class TestEqualWeightBHReturn:
         Average of +10% and -5% should be +2.5%."""
         call_count = {"n": 0}
 
-        def fake_fetch(sym, start, end, timeframe):
+        def fake_fetch(sym, start, end, timeframe, **kwargs):
             call_count["n"] += 1
             if sym == "AAA":
                 df = pd.DataFrame({"open": [100, 0], "close": [0, 110]})  # +10%
@@ -88,7 +88,7 @@ class TestEqualWeightBHReturn:
     def test_skips_symbols_with_fetch_failure(self, monkeypatch):
         """A single failed fetch shouldn't poison the benchmark."""
 
-        def fake_fetch(sym, start, end, timeframe):
+        def fake_fetch(sym, start, end, timeframe, **kwargs):
             if sym == "BAD":
                 raise RuntimeError("simulated fetch error")
             df = pd.DataFrame({"open": [100, 0], "close": [0, 120]})  # +20%
@@ -102,7 +102,7 @@ class TestEqualWeightBHReturn:
         assert result == pytest.approx(0.20)
 
     def test_skips_empty_dfs(self, monkeypatch):
-        def fake_fetch(sym, start, end, timeframe):
+        def fake_fetch(sym, start, end, timeframe, **kwargs):
             if sym == "EMPTY":
                 return pd.DataFrame({"open": [], "close": []}), None
             df = pd.DataFrame({"open": [100, 0], "close": [0, 105]})  # +5%
@@ -119,7 +119,7 @@ class TestEqualWeightBHReturn:
         EdgeAssessor interprets 0.0 benchmark as 'no comparison
         available' rather than 'strategy beat the benchmark'."""
 
-        def fake_fetch(sym, start, end, timeframe):
+        def fake_fetch(sym, start, end, timeframe, **kwargs):
             raise RuntimeError("all fetches fail")
 
         monkeypatch.setattr(bm, "fetch_symbol", fake_fetch)

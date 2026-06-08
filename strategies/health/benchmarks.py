@@ -79,10 +79,16 @@ def equal_weight_bh_return(
     sym_list = [s for s in symbols if s]
     if not sym_list:
         return 0.0
+    # Strategy-health benchmark is research/analytics — it compares to
+    # envelopes built by scripts/build_envelopes.py which uses
+    # BACKTEST_DATA_FEED. Use the same feed here so the comparison is
+    # apples-to-apples. The post-cycle-hook timing is incidental; the
+    # benchmark is not an execution-replay tool.
+    from config.settings import BACKTEST_DATA_FEED
     returns: list[float] = []
     for sym in sym_list:
         try:
-            df, _ = fetch_symbol(sym, start, end, timeframe)
+            df, _ = fetch_symbol(sym, start, end, timeframe, feed=BACKTEST_DATA_FEED)
         except Exception as exc:  # noqa: BLE001
             logger.warning(
                 f"benchmark fetch failed for {sym} [{start.date()}..{end.date()}]: {exc}"
