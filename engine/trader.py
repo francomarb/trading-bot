@@ -2169,6 +2169,7 @@ class TradingEngine:
         benchmark_kind: str = "unavailable",
         alert_reason: str = "broker-history exit recovery",
         is_full_close: bool | None = None,
+        external: bool = False,
     ) -> bool:
         """Persist one broker-confirmed non-stop exit exactly once."""
         order_id = getattr(exit_fill, "order_id", None)
@@ -2217,6 +2218,7 @@ class TradingEngine:
             float(price),
             qty,
             multiplier=100 if _OCC_PAT.match(result.symbol) else 1,
+            external=external,
             is_full_close=is_full_close,
         )
         self.alerts.trade_executed(
@@ -3355,10 +3357,10 @@ class TradingEngine:
             if not self.trade_logger.has_recorded_order_id(fill.order_id)
         ]
         recovered_qty = sum(float(fill.filled_qty or 0.0) for fill in unrecorded)
-        if recovered_qty + 1e-9 < open_qty:
+        if abs(recovered_qty - open_qty) > 1e-9:
             logger.warning(
-                f"{symbol}: broker history found only {recovered_qty} of "
-                f"{open_qty} unrecorded SELL quantity; refusing partial "
+                f"{symbol}: broker history found {recovered_qty} versus "
+                f"{open_qty} open unrecorded SELL quantity; refusing mismatched "
                 "vanished-position reconstruction"
             )
             return []
@@ -3403,6 +3405,7 @@ class TradingEngine:
                         exit_fill=exit_fill,
                         alert_reason="startup_broker_history_sell_recovered",
                         is_full_close=index == len(exit_fills) - 1,
+                        external=True,
                     )
                 logger.warning(
                     f"restart: reconciled vanished {symbol} from "
@@ -3963,6 +3966,7 @@ class TradingEngine:
                                     exit_fill=exit_fill,
                                     alert_reason="broker_history_sell_recovered",
                                     is_full_close=index == len(exit_fills) - 1,
+                                    external=True,
                                 )
                             logger.warning(
                                 f"{symbol}: position owned by '{owner}' absent for "

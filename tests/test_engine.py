@@ -2572,6 +2572,7 @@ class TestStartupReconciliation:
                 filled_at=T0 + timedelta(minutes=2),
             )
         ]
+        engine._record_realized_pnl = MagicMock()
 
         engine.start(max_cycles=1)
 
@@ -2580,6 +2581,8 @@ class TestStartupReconciliation:
         assert len(sell_rows) == 1
         assert sell_rows[0]["order_id"] == "startup-exit-1"
         assert sell_rows[0]["reason"] == "startup_broker_history_sell_recovered"
+        engine._record_realized_pnl.assert_called_once()
+        assert engine._record_realized_pnl.call_args.kwargs["external"] is True
 
 
 # ── External close detection ──────────────────────────────────────────────
@@ -2736,6 +2739,7 @@ class TestExternalCloseDetection:
                 )
             ]
         )
+        engine._record_realized_pnl = MagicMock()
 
         engine._detect_external_closes(_snapshot())
 
@@ -2749,6 +2753,7 @@ class TestExternalCloseDetection:
         assert sell_rows[0]["timestamp"] == (
             T0 + timedelta(minutes=2)
         ).isoformat()
+        assert engine._record_realized_pnl.call_args.kwargs["external"] is True
 
     def test_external_close_recovers_multiple_filled_sells_in_order(
         self, patch_fetch, tmp_path
@@ -2807,6 +2812,40 @@ class TestExternalCloseDetection:
                     raw_status="filled",
                     qty=4.0,
                     filled_qty=4.0,
+                    avg_fill_price=99.0,
+                    stop_price=None,
+                    submitted_at=T0,
+                    filled_at=T0,
+                )
+            ]
+        )
+
+        engine._detect_external_closes(_snapshot())
+
+        sell_rows = [row for row in tl.read_all() if row["side"] == "sell"]
+        assert len(sell_rows) == 1
+        assert sell_rows[0]["reason"] == "external_close_detected"
+        assert sell_rows[0]["order_id"] is None
+
+    def test_external_close_does_not_recover_excess_sell_quantity(
+        self, patch_fetch, tmp_path
+    ):
+        engine, _, tl = _engine_with_confirm(patch_fetch, tmp_path, confirm=1)
+        _write_buy(tl, "AAPL", "fake_strategy")
+        engine._register_single_leg(strategy_name="fake_strategy", symbol="AAPL")
+        engine.broker.find_recent_filled_stop_order = MagicMock(return_value=None)
+        engine.broker.find_recent_filled_sell_orders = MagicMock(
+            return_value=[
+                ClosedOrderInfo(
+                    order_id="excess-sell",
+                    client_order_id=None,
+                    symbol="AAPL",
+                    side=Side.SELL,
+                    order_type="market",
+                    status=OrderStatus.FILLED,
+                    raw_status="filled",
+                    qty=12.0,
+                    filled_qty=12.0,
                     avg_fill_price=99.0,
                     stop_price=None,
                     submitted_at=T0,
@@ -4815,6 +4854,7 @@ class TestExitPathBenchmarkKind:
             submitted_at=T0,
             filled_at=T0 + timedelta(minutes=4),
         )
+        engine._record_realized_pnl = MagicMock()
         engine._recover_suspect_exit_orders(_snapshot())
 
         assert "AAPL" not in engine._suspect_exit_orders
@@ -4825,6 +4865,7 @@ class TestExitPathBenchmarkKind:
         assert len(sell_rows) == 1
         assert sell_rows[0]["order_id"] == "close-aapl-unknown"
         assert sell_rows[0]["slippage_measurement_quality"] == "recovered"
+        assert engine._record_realized_pnl.call_args.kwargs["external"] is False
 
 
 # ── Slippage unification Defect 2 fix ──────────────────────────────────────
