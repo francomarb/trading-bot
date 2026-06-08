@@ -388,9 +388,10 @@ SIP re-test (2026-06-08) closed the remaining open question from R2
 PLAN concern named?"). With production-realistic gates applied across
 the full reachable SIP range (2016-04 → 2024-12, 21 symbols, 536
 combined trades), neither trail variant clears the bar in any regime —
-including March 2020, where the crash-exposed subset specifically shows
-chandelier under-performing static by 1.19 R per trade. Section 5
-contains the canonical numbers; Section 6 the mechanism.
+including March 2020, where the chandelier policy path averaged −0.16R
+versus +1.03R for the static policy path on their respective
+crash-exposed cohorts. Section 5 contains the canonical numbers;
+Section 6 the mechanism.
 
 **Cohort caveat for comparative reads**: because each stop policy
 changes exits and the subsequent re-entries, the trade cohorts under
@@ -431,10 +432,6 @@ the 2018 vol shock sub-window's small sample is a regime-gate artifact
 data-availability artifact. Further historical depth (Polygon,
 yfinance, paid Alpaca extended) would not change this — production
 behavior would be the same: regime-gate-out of BEAR regimes.
-- **Live giveback event** — if real paper or live trading produces a
-  documented case where the static stop visibly surrendered material P&L
-  on a gap-down through a then-vestigial level, that single case study
-  can override the aggregate evidence regardless of regime testing.
 
 ## 8. Reproducing the work
 
