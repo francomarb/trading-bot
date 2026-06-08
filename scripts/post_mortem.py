@@ -36,7 +36,9 @@ SECTOR_MAP = {
     # Financials
     "ALLY": "XLF", "TFC": "XLF",
     # Materials
-    "CCK": "XLB", "ATI": "XLB", "AA": "XLB"
+    "CCK": "XLB", "AA": "XLB",
+    # Industrials
+    "ATI": "XLI"
 }
 
 def analyze_trades(days: int):
