@@ -66,22 +66,46 @@ class RegimeWindow:
     start: str  # YYYY-MM-DD
     end: str
     description: str
+    # Crash-day pair (start, end) used to compute the crash-exposed-trade
+    # subset metric. A trade is "crash-exposed" if its [entry_date, exit_date]
+    # interval overlaps the named crash days. Only set for the catastrophic-gap
+    # sub-windows the PLAN P2 retest specifically targets.
+    crash_days: tuple[str, str] | None = None
 
 
 WINDOWS: list[RegimeWindow] = [
+    # SIP-only window: pre-PR #50 IEX coverage didn't reach 2018.
+    RegimeWindow(
+        name="2018_q4_vol_shock",
+        start="2018-07-01",
+        end="2018-12-31",
+        description="2018 Q4 vol shock — entries from July (pre-crash trend "
+                    "lead-in so positions are open by the gap-down days). "
+                    "Crash days Oct 3 → Dec 24. Tests whether trailing variants "
+                    "catch the catastrophic-gap-down scenarios the static stop "
+                    "rides through.",
+        crash_days=("2018-10-03", "2018-12-24"),
+    ),
+    # SIP-only window: pre-PR #50 IEX coverage didn't reach 2020.
+    RegimeWindow(
+        name="2020_covid_crash",
+        start="2019-09-01",
+        end="2020-05-31",
+        description="2020 COVID crash — entries from Sep 2019 (pre-crash "
+                    "trend lead-in). Crash days Feb 20 → Mar 23 2020. The "
+                    "fastest gap-down regime in this dataset; the strongest "
+                    "test of static-vs-trailing stop behavior.",
+        crash_days=("2020-02-20", "2020-03-23"),
+    ),
     RegimeWindow(
         name="2021_melt_up",
-        start="2021-04-01",
+        start="2021-01-01",
         end="2021-12-31",
-        description="2021 melt-up Q2-Q4 — quiet uptrend, tests trail whipsaw cost. "
-                    "⚠ SMA200 LIMITATION on IEX: stocks' first IEX bar is "
-                    "2020-07-27 → April 1, 2021 has only 172 prior bars → "
-                    "SMA200 isn't populated until ~May 11, 2021. The "
-                    "DonchianEdgeFilter rule 1 fails open for ~5 weeks of this "
-                    "window. Same biased entries fed all 3 stop variants so "
-                    "the A/B comparison is preserved, but absolute 2021 numbers "
-                    "over-state production. SIP re-test (PR #50 follow-up) "
-                    "removes this gap (4.5y+ pre-window history per symbol).",
+        description="2021 melt-up full year — quiet uptrend, tests trail "
+                    "whipsaw cost. With SIP cache going back to 2016-01-04 "
+                    "for mega-caps, SMA200 is comfortably populated by Jan 1 "
+                    "(unlike the IEX R2 run which started April due to "
+                    "shallow IEX coverage).",
     ),
     RegimeWindow(
         name="2022_bear",
@@ -96,10 +120,13 @@ WINDOWS: list[RegimeWindow] = [
         description="2023-24 AI rally — deployment-target regime, large running winners",
     ),
     RegimeWindow(
-        name="2021_2024_combined",
-        start="2021-04-01",
+        name="2016_2024_combined",
+        start="2016-04-01",
         end="2024-12-31",
-        description="Combined 2021-2024 — full sweep; per-year slice tables below",
+        description="Combined 2016-2024 — full sweep on SIP; per-year slice tables below. "
+                    "Window starts April so the 50-bar warmup requirement can be "
+                    "satisfied from the SIP feed's first available bar (2016-01-04 "
+                    "for mega-caps).",
     ),
 ]
 
@@ -484,6 +511,89 @@ def per_year_slice_aggregates(
 # ── Rendering ───────────────────────────────────────────────────────────────
 
 
+@dataclass(frozen=True)
+class CrashExposureRow:
+    """Per-policy stats on trades whose lifetime overlaps the named crash days.
+
+    PLAN P2 retest spec: a "wash on aggregate" verdict is only honest if the
+    catastrophic-gap subset doesn't show one variant systematically
+    out-performing on those trades specifically. This dataclass holds the
+    numbers used to evaluate that.
+    """
+    policy_name: str
+    trades_open_during_crash: int
+    mean_r_on_crash_trades: float
+    median_r_on_crash_trades: float
+    win_rate_on_crash_trades: float
+    pct_gap_exits_on_crash_trades: float
+
+
+def crash_exposure_rows(
+    run: WindowRun, crash_start: pd.Timestamp, crash_end: pd.Timestamp
+) -> list[CrashExposureRow]:
+    """Compute per-policy crash-exposed trade stats for this WindowRun.
+
+    A trade is "crash-exposed" if [entry_date, exit_date] overlaps the
+    [crash_start, crash_end] interval. Returns one row per policy.
+    """
+    rows: list[CrashExposureRow] = []
+    for policy_name, results in run.per_symbol.items():
+        crash_trades = []
+        for r in results:
+            for t in r.trades:
+                if t.entry_date <= crash_end and t.exit_date >= crash_start:
+                    crash_trades.append(t)
+        n = len(crash_trades)
+        if n == 0:
+            rows.append(CrashExposureRow(
+                policy_name=policy_name,
+                trades_open_during_crash=0,
+                mean_r_on_crash_trades=0.0,
+                median_r_on_crash_trades=0.0,
+                win_rate_on_crash_trades=0.0,
+                pct_gap_exits_on_crash_trades=0.0,
+            ))
+            continue
+        rs = sorted(t.r_multiple for t in crash_trades)
+        mean_r = sum(rs) / n
+        median_r = rs[n // 2] if n % 2 else 0.5 * (rs[n // 2 - 1] + rs[n // 2])
+        wins = sum(1 for t in crash_trades if t.pnl_pct > 0)
+        gap_exits = sum(1 for t in crash_trades if t.exit_reason == "stop_gap")
+        rows.append(CrashExposureRow(
+            policy_name=policy_name,
+            trades_open_during_crash=n,
+            mean_r_on_crash_trades=mean_r,
+            median_r_on_crash_trades=median_r,
+            win_rate_on_crash_trades=wins / n,
+            pct_gap_exits_on_crash_trades=gap_exits / n,
+        ))
+    return rows
+
+
+def render_crash_exposure_table(
+    run: WindowRun, rows: list[CrashExposureRow]
+) -> str:
+    """Render the crash-exposed-trade subset for a regime window."""
+    crash_start, crash_end = run.window.crash_days
+    out = [
+        "",
+        f"**Crash-exposed subset** — trades with lifetime overlapping {crash_start} → {crash_end}:",
+        "",
+        "| Policy             | CrashTrades | MeanR | MedianR | Win% | %Gap exits |",
+        "|--------------------|------------:|------:|--------:|-----:|-----------:|",
+    ]
+    for row in rows:
+        out.append(
+            f"| {row.policy_name:<18} | "
+            f"{row.trades_open_during_crash:>11} | "
+            f"{row.mean_r_on_crash_trades:>+5.2f} | "
+            f"{row.median_r_on_crash_trades:>+7.2f} | "
+            f"{row.win_rate_on_crash_trades*100:>4.1f} | "
+            f"{row.pct_gap_exits_on_crash_trades*100:>9.1f}% |"
+        )
+    return "\n".join(out) + "\n"
+
+
 def render_window_table(run: WindowRun) -> str:
     lines = [
         f"### {run.window.name} — {run.window.description}",
@@ -516,6 +626,32 @@ def render_window_table(run: WindowRun) -> str:
             f"{agg.pct_signal_exit*100:>4.1f} | "
             f"{agg.pct_eod*100:>4.1f} |"
         )
+
+    # Crash-exposed subset for the targeted gap regimes
+    if run.window.crash_days is not None:
+        crash_start = pd.Timestamp(run.window.crash_days[0], tz="UTC")
+        crash_end = pd.Timestamp(run.window.crash_days[1], tz="UTC")
+        rows = crash_exposure_rows(run, crash_start, crash_end)
+        # Minimum-sample check per PLAN P2 acceptance criteria
+        total_trades = max(agg.total_trades for agg in run.policy_aggregates.values())
+        crash_trades = max(r.trades_open_during_crash for r in rows)
+        min_total = 25
+        min_crash = 10
+        lines.append("")
+        if total_trades < min_total or crash_trades < min_crash:
+            lines.append(
+                f"⚠ **Minimum-sample floor NOT met** "
+                f"(total {total_trades} / {min_total} required; "
+                f"crash-exposed {crash_trades} / {min_crash} required). "
+                f"Closure abstains for this sub-window."
+            )
+        else:
+            lines.append(
+                f"✓ Minimum-sample floor met: total {total_trades} ≥ {min_total}, "
+                f"crash-exposed {crash_trades} ≥ {min_crash}."
+            )
+        lines.append(render_crash_exposure_table(run, rows))
+
     return "\n".join(lines) + "\n"
 
 
@@ -641,10 +777,12 @@ def main() -> int:
             apply_production_gates=apply_gates,
         ))
 
-    combined = next((r for r in runs if r.window.name == "2021_2024_combined"), None)
+    combined = next((r for r in runs if r.window.name == "2016_2024_combined"), None)
     per_year_tables = ""
     if combined is not None and combined.policy_aggregates:
-        per_year = per_year_slice_aggregates(combined, years=[2021, 2022, 2023, 2024])
+        per_year = per_year_slice_aggregates(
+            combined, years=[2016, 2017, 2018, 2019, 2020, 2021, 2022, 2023, 2024]
+        )
         per_year_tables = render_per_year_tables(combined, per_year)
 
     from config import settings
