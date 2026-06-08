@@ -80,10 +80,10 @@ SMA_WATCHLIST = [
     "DK", "ASX", "CAT", "HUT", "GLW", "AMD", "STRL", "INTC",
     "BE", "ECG", "MRVL", "NVT", "SQM", "TSEM", "PL", "UBER",
     "NVDA", "ADBE", "ANET", "META", "PLTR", "DUOL",
-    # Scanned additions (2026-06-08)
+    # Scanned additions passing fundamentals check (2026-06-08)
     # MANUAL OVERRIDE: Added mid-paper-run to capitalize on the active AI/Semiconductor uptrend,
     # temporarily bypassing the 3-per-sector cap and mid-run freeze per operator direction.
-    "TSM", "DELL", "LSCC", "LRCX", "NOK", "FLEX", "VECO", "SANM", "ACLS", "ATI", "COHU", "AA",
+    "TSM", "DELL", "LSCC", "LRCX", "NOK", "FLEX", "SANM", "ATI", "COHU", "AA",
 ]
 # Cull deferred 2026-06-06 — an earlier audit (scripts/sma_giveback_audit.py)
 # flagged VIAV, VSAT, CIEN, ALB, INTC as chronic underperformers and removed

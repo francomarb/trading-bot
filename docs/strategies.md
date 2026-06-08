@@ -91,9 +91,9 @@ There is no fixed take-profit target. The strategy lets winners run for as long 
 
 We intentionally do not add a trailing stop to SMA Crossover. The bearish crossunder already acts as the strategy's trend exit, and the 2x ATR stop already provides downside protection before the crossunder arrives. Adding a second trailing exit tends to reduce drawdown, but in testing it clipped winners more often than it improved overall risk-adjusted returns, so the strategy keeps the simpler crossunder-plus-ATR-stop design.
 
-**Watchlist:** 40 names in `SMA_WATCHLIST` (`config/settings.py`).
+**Watchlist:** 50 names in `SMA_WATCHLIST` (`config/settings.py`).
 Originally derived from `scripts/sma_watchlist_scan.py` rule
-`sma_watchlist_v2` (2026-05-11) with a few manual additions. Treat the
+`sma_watchlist_v2` (2026-05-11, with 10 fundamentals-sanitized additions on 2026-06-08) with a few manual additions. Treat the
 deployment guide as the live source of truth — the list rotates more
 often than this catalog gets updated.
 

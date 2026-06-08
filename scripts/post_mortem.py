@@ -31,8 +31,8 @@ SECTOR_MAP = {
     "NVDA": "XLK", "MU": "XLK", "DELL": "XLK", "WDC": "XLK", "TER": "XLK",
     "AMKR": "XLK", "MPWR": "XLK", "COHR": "XLK", "FORM": "XLK", "CIEN": "XLK",
     "CLS": "XLK", "BE": "XLK", "MTZ": "XLK", "TIGO": "XLK", "SN": "XLK", "CDNS": "XLK",
-    "TSM": "XLK", "LSCC": "XLK", "LRCX": "XLK", "NOK": "XLK", "FLEX": "XLK", "VECO": "XLK",
-    "SANM": "XLK", "ACLS": "XLK", "COHU": "XLK",
+    "TSM": "XLK", "LSCC": "XLK", "LRCX": "XLK", "NOK": "XLK", "FLEX": "XLK",
+    "SANM": "XLK", "COHU": "XLK",
     # Financials
     "ALLY": "XLF", "TFC": "XLF",
     # Materials
