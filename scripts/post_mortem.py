@@ -31,10 +31,14 @@ SECTOR_MAP = {
     "NVDA": "XLK", "MU": "XLK", "DELL": "XLK", "WDC": "XLK", "TER": "XLK",
     "AMKR": "XLK", "MPWR": "XLK", "COHR": "XLK", "FORM": "XLK", "CIEN": "XLK",
     "CLS": "XLK", "BE": "XLK", "MTZ": "XLK", "TIGO": "XLK", "SN": "XLK", "CDNS": "XLK",
+    "TSM": "XLK", "LSCC": "XLK", "LRCX": "XLK", "NOK": "XLK", "FLEX": "XLK",
+    "SANM": "XLK", "COHU": "XLK",
     # Financials
     "ALLY": "XLF", "TFC": "XLF",
     # Materials
-    "CCK": "XLB"
+    "CCK": "XLB", "AA": "XLB",
+    # Industrials
+    "ATI": "XLI"
 }
 
 def analyze_trades(days: int):

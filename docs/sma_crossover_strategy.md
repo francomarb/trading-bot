@@ -25,7 +25,7 @@ pullbacks.
 **Why 20/50 and not 50/200 (classic "golden cross"):**
 The 50/200 golden cross is iconic but fires a few times per decade per
 name — far too rare to be a workable strategy at the watchlist scale we
-run (40 names). The 20/50 cross fires multiple times per name per year,
+run (50 names). The 20/50 cross fires multiple times per name per year,
 which is what makes the sleeve generate enough trades to be statistically
 meaningful. The 200 SMA *is* used elsewhere — as a gate in
 `SMAEdgeFilter` (stock above its 200 SMA) and in `SPYTrendFilter` (macro
@@ -44,7 +44,7 @@ SPY > 200 SMA). 200 SMA is a *structural gate*; 20/50 is the *trigger*.
 | Edge filter | `SMAEdgeFilter` + `SectorMomentumFilter` | `forward_test.py:210-216` |
 | Sleeve weight | 0.40 of equity (target) — carved from 0.45 when credit_spread was added | `settings.STRATEGY_ALLOCATIONS["sma_crossover"]["target_pct"]` |
 | ATR stop | `entry − 2.0 × ATR(14)` (static) | `settings.ATR_STOP_MULTIPLIER` |
-| Watchlist | `SMA_WATCHLIST` (40 names) | `config/settings.py` |
+| Watchlist | `SMA_WATCHLIST` (50 names) | `config/settings.py` |
 | Stop time-in-force | GTC (DAY at submit → promoted to GTC) | `engine/trader.py` |
 | Fractional shares | Enabled when MARKET path active | `settings.FRACTIONAL_ENABLED` |
 
@@ -146,9 +146,11 @@ Composition is dynamic and lives in `config/settings.py::SMA_WATCHLIST`.
 Findings about *what* to put on the list and how often to refresh it are
 tracked in [`sma_crossover_optimizations.md`](sma_crossover_optimizations.md).
 
-**Current composition (2026-06-06):** 40 names, derived from
-`scripts/sma_watchlist_scan.py` (composite-score top 30 from 2026-05-11)
-plus manual additions (NVDA, DUOL). An audit-driven cull was attempted
+**Current composition (2026-06-08):** 50 names, derived from
+`scripts/sma_watchlist_scan.py` (composite-score top 30 from 2026-05-11, plus 10 fundamentals-sanitized additions on 2026-06-08)
+plus manual additions (NVDA, DUOL).
+* **Operational Boundary (June 8, 2026):** Marks the transition from the initial 40-symbol cohort to the expanded 50-symbol watchlist. The 40-symbol period is closed as an operational baseline with one completed lifecycle and two open positions (not as a statistical performance baseline). Existing positions are kept running normally, and pre/post-boundary results will be reported separately.
+An audit-driven cull was attempted
 and reverted in the same session — see
 [`sma_crossover_optimizations.md`](sma_crossover_optimizations.md) for
 the methodology gates that must be satisfied before any cull is
