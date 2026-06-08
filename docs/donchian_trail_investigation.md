@@ -1,24 +1,59 @@
-# Donchian trailing broker stop — investigation (2026-06-06 / updated 2026-06-07 R3)
+# Donchian trailing broker stop — investigation (2026-06-06 / updated 2026-06-08 R5)
 
-> **Status:** Investigated; **parked pending SIP re-test** on Q4 2018 / Q1 2020 regimes.
-> The retest is tracked as an active **P2** item in `PLAN.md` → *Active Work Queue
-> § P2*, with explicit acceptance criteria. The historical "Parked Ideas" row
-> captures the IEX-only investigation results; it does NOT track the retest.
-> **TL;DR:** On the ai_bigtech universe with **production-realistic entry
-> gating** (SPY TRENDING regime + DonchianEdgeFilter) over 2021-04-01 →
-> 2024-12-31, replacing the static `entry − 2×ATR` broker stop with either a
-> 15-day-low trail or a chandelier `HWM − 3×ATR` trail does **not** improve
-> risk-adjusted returns. Differences vs static are within noise. The static
-> stop's known weakness (gap-down past the rising 15-day-low) is real but
-> rare, and the strategy's own daily-close signal exit already handles most
-> trend failures one bar later. **What's not closed**: the 2018 Q4 vol shock
-> and 2020 COVID crash regimes that originally motivated the PLAN concern
-> were not testable on IEX (individual-stock coverage begins 2020-07-27) but
-> ARE reachable on basic-tier delayed SIP (AAPL/MSFT/NVDA back to 2016-01-04,
-> verified). The SIP retest is the blocking step before this can move to
-> full closure.
+> **Status: CLOSED — static stop retained.** SIP re-test on 2016-2024
+> confirms the IEX-only conclusion. Neither trailing variant clears the
+> bar in any reachable regime, including the catastrophic-gap regimes
+> (March 2020 COVID crash) that originally motivated the PLAN concern.
+> Q4 2018 vol shock is technically under-sampled (6 trades; production
+> regime gate kept the strategy out of BEAR Q4 — which is what production
+> would also do).
+>
+> **TL;DR:** Across 2016-04 → 2024-12 on the ai_bigtech universe with
+> production-realistic gating (SPY TRENDING + DonchianEdgeFilter), the
+> static `entry − 2×ATR` broker stop, a 15-day-low trail, and a
+> chandelier `HWM − 3×ATR` trail produce essentially identical
+> risk-adjusted returns. On the combined 536-trade run: static +18.4% /
+> Sharpe +0.28 / MaxDD −14.3%; low_trail +17.3% / +0.27 / −13.8%;
+> chandelier +15.7% / +0.27 / −12.9%. On the COVID-crash-exposed subset
+> specifically (16 trades), chandelier UNDER-performs static by 1.19 R
+> per trade — the opposite of the hypothesis. Donchian-low trail washes
+> vs static everywhere. **The recommendation is to keep the static stop.**
 
 ## Revision history
+
+- **2026-06-08 (R5) — SIP re-test landed; closure confirmed.** The active
+  P2 retest (post-PR #50 SIP infrastructure) ran on SIP data 2016-04 →
+  2024-12. Findings:
+  1. **2018 Q4 vol shock**: 6 total trades, 4 crash-exposed. Under the
+     PLAN-spec minimum-sample floors (25 total, 10 crash-exposed) →
+     closure abstains for this sub-window. The SPY TRENDING-only regime
+     gate kept the strategy out of most BEAR Q4 entries (Wall Street's
+     worst Q4 since 1931 was largely BEAR regime). The "stop policy is
+     moot for trades that don't exist" pattern from R2's 2022 bear window
+     repeats here.
+  2. **2020 COVID crash**: 53 total trades, 16 crash-exposed — floors met.
+     Aggregate: static +1.7%, low_trail +1.5%, chandelier +1.9% (max-min
+     0.4 pp > 0.3 pp threshold; Sharpes 0.02 / −0.04 / 0.02). The
+     crash-exposed subset is the decisive read: static mean R +1.03,
+     low_trail +1.14, **chandelier −0.16**. Chandelier's tighter trail
+     stopped out gap-down trades at worse prices than static, the
+     opposite of what the PLAN concern hypothesized. Donchian-low trail
+     within noise.
+  3. **2021-2024 sub-windows**: same pattern as R2 — chandelier gives back
+     3.9 pp in the 2023-24 rally (clips trending winners); Donchian-low
+     trail washes vs static.
+  4. **Combined 2016-04 → 2024-12, 21 syms, 536 trades**: static +18.4% /
+     Shp +0.28 / MaxDD −14.3%; low_trail +17.3% / +0.27 / −13.8%;
+     chandelier +15.7% / +0.27 / −12.9%. Variants within 0.04 Sharpe and
+     1.4 pp MaxDD; chandelier −2.7 pp on returns vs static.
+
+  **Verdict**: The retest confirms the R2 conclusion on a much wider
+  dataset (4× the trades, 4.5y deeper history, both catastrophic-gap
+  regimes the PLAN concern named). The static stop is retained. PLAN row
+  moves from "Active P2 retest" to fully-closed "Parked Ideas" with the
+  retest evidence cited.
+
+
 
 - **2026-06-07 (R3) — addressed PR #49 third-round audit.** Three more fixes:
   1. **SIP-will-not-help premise was wrong**: empirically AAPL/MSFT/NVDA SIP
