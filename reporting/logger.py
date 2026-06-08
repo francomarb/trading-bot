@@ -632,6 +632,8 @@ class TradeLogger:
         modeled_price: float,
         benchmark_kind: SlippageBenchmarkKind | None = None,
         measurement_quality: SlippageMeasurementQuality | None = None,
+        timestamp_override: datetime | None = None,
+        reason: str = "exit signal",
     ) -> TradeRecord:
         """
         Build a TradeRecord for a position close (exit). Closes don't have
@@ -677,7 +679,8 @@ class TradeLogger:
             symbol=result.symbol,
             strategy=strategy_name,
         )
-        now_iso = datetime.now(timezone.utc).isoformat()
+        timestamp_dt = timestamp_override or datetime.now(timezone.utc)
+        now_iso = timestamp_dt.astimezone(timezone.utc).isoformat()
         if (
             not legacy_metric_suppressed
             and result.avg_fill_price is not None
@@ -760,7 +763,7 @@ class TradeLogger:
             avg_fill_price=result.avg_fill_price,
             order_id=result.order_id,
             strategy=strategy_name,
-            reason="exit signal",
+            reason=reason,
             stop_price=0.0,
             entry_reference_price=modeled_price,
             modeled_slippage_bps=modeled_bps,
@@ -1506,6 +1509,7 @@ class TradeLogger:
             "initial_stop_loss": state.get("initial_stop_loss"),
             "initial_risk_per_share": state.get("initial_risk_per_share"),
             "entry_timestamp": state.get("entry_timestamp"),
+            "open_qty": state.get("open_qty"),
         }
 
     def has_recorded_order_id(self, order_id: str | None) -> bool:

@@ -234,6 +234,19 @@ class SuspectOrder:
     modeled_price_kind: str = "unavailable"
 
 
+@dataclass(frozen=True)
+class SuspectExitOrder:
+    """Exact submitted close whose terminal state was not confirmed locally."""
+
+    order_id: str
+    symbol: str
+    owner: str
+    requested_qty: float
+    modeled_price: float
+    benchmark_kind: str
+    alert_reason: str
+
+
 # ── Engine ───────────────────────────────────────────────────────────────────
 
 
@@ -403,6 +416,7 @@ class TradingEngine:
         # after submit). These are the only unknown positions we will ever try
         # to adopt automatically.
         self._suspect_orders: dict[str, SuspectOrder] = {}
+        self._suspect_exit_orders: dict[str, SuspectExitOrder] = {}
 
         # DAY-stop promotion is retried from every broker snapshot, but a
         # persistent rejection should count as one broker incident rather than
@@ -608,6 +622,12 @@ class TradingEngine:
         self._session_start_equity = startup_snapshot.account.equity
         self._last_snapshot = startup_snapshot
 
+        # Recover broker-proven exits before ownership restoration. A position
+        # that filled while the process was down is absent from the snapshot,
+        # so it would never enter _positions and the normal cycle-level
+        # external-close detector could not reconcile its stale DB row.
+        self._reconcile_vanished_db_positions(startup_snapshot)
+
         all_symbols = []
         for slot in self.slots:
             all_symbols.extend(slot.active_symbols())
@@ -772,6 +792,7 @@ class TradingEngine:
                             )
                     order_strategy = self._attribute_orders(snapshot.open_orders)
                     self._sync_managed_stop_legs(snapshot)
+                    self._recover_suspect_exit_orders(snapshot)
                     self._repair_missing_protective_stops(
                         snapshot,
                         allow_residual_cleanup=False,
@@ -814,6 +835,7 @@ class TradingEngine:
             self._sync_managed_stop_legs(snapshot)
             self._observe_stream_health()
             self._recover_suspect_orders(snapshot)
+            self._recover_suspect_exit_orders(snapshot)
             self._process_stream_stop_fills(snapshot)
             self._detect_external_closes(snapshot)
             self._drain_option_fills()
@@ -1949,6 +1971,56 @@ class TradingEngine:
             f"order recovery at ${decision.stop_price:.2f}"
         )
 
+    def _recover_suspect_exit_orders(self, snapshot: BrokerSnapshot) -> None:
+        """Reconcile exact close orders whose post-submit confirmation failed."""
+        for symbol, suspect in list(self._suspect_exit_orders.items()):
+            try:
+                result = self.broker.reconcile_submitted_order(
+                    order_id=suspect.order_id,
+                    symbol=suspect.symbol,
+                    requested_qty=suspect.requested_qty,
+                )
+            except Exception as exc:
+                logger.warning(
+                    f"{symbol}: suspect exit {suspect.order_id} reconciliation "
+                    f"failed: {exc}"
+                )
+                continue
+
+            if result.status in {OrderStatus.PENDING, OrderStatus.ACCEPTED}:
+                logger.warning(
+                    f"{symbol}: suspect exit {suspect.order_id} still "
+                    f"{result.status.value}; waiting for next cycle"
+                )
+                continue
+            if result.status in {
+                OrderStatus.CANCELED,
+                OrderStatus.REJECTED,
+                OrderStatus.TIMEOUT,
+            }:
+                logger.warning(
+                    f"{symbol}: suspect exit {suspect.order_id} resolved as "
+                    f"{result.status.value}; dropping recovery state"
+                )
+                self._suspect_exit_orders.pop(symbol, None)
+                continue
+            if result.status not in {OrderStatus.FILLED, OrderStatus.PARTIAL}:
+                continue
+
+            self._record_recovered_exit_fill(
+                symbol=symbol,
+                owner=suspect.owner,
+                exit_fill=result,
+                modeled_price=suspect.modeled_price,
+                benchmark_kind=suspect.benchmark_kind,
+                alert_reason=f"{suspect.alert_reason} (recovered)",
+            )
+            self._suspect_exit_orders.pop(symbol, None)
+            if result.status is OrderStatus.FILLED:
+                self._pop_position(symbol)
+                self._entry_prices.pop(symbol, None)
+                self._external_close_suspects.pop(symbol, None)
+
     # ── Post-fill bookkeeping ────────────────────────────────────────────
 
     def _record_fill(
@@ -2060,6 +2132,8 @@ class TradingEngine:
         *,
         benchmark_kind: str | None = None,
         measurement_quality: str | None = None,
+        timestamp_override: datetime | None = None,
+        reason: str = "exit signal",
     ) -> None:
         """Log an exit fill to the trade database.
 
@@ -2078,10 +2152,86 @@ class TradingEngine:
                 modeled_price=modeled_price,
                 benchmark_kind=benchmark_kind,
                 measurement_quality=measurement_quality,
+                timestamp_override=timestamp_override,
+                reason=reason,
             )
             self.trade_logger.log(record)
         except Exception as e:
             logger.error(f"trade logging (close) failed: {e}")
+
+    def _record_recovered_exit_fill(
+        self,
+        *,
+        symbol: str,
+        owner: str,
+        exit_fill,
+        modeled_price: float = 0.0,
+        benchmark_kind: str = "unavailable",
+        alert_reason: str = "broker-history exit recovery",
+        is_full_close: bool | None = None,
+    ) -> bool:
+        """Persist one broker-confirmed non-stop exit exactly once."""
+        order_id = getattr(exit_fill, "order_id", None)
+        if not order_id or self.trade_logger.has_recorded_order_id(order_id):
+            return False
+        price = getattr(exit_fill, "avg_fill_price", None)
+        qty = float(getattr(exit_fill, "filled_qty", 0.0) or 0.0)
+        if price is None or qty <= 0:
+            return False
+        result = (
+            exit_fill
+            if isinstance(exit_fill, OrderResult)
+            else OrderResult(
+                status=exit_fill.status,
+                order_id=exit_fill.order_id,
+                symbol=exit_fill.symbol,
+                requested_qty=exit_fill.qty,
+                filled_qty=exit_fill.filled_qty,
+                avg_fill_price=exit_fill.avg_fill_price,
+                raw_status=exit_fill.raw_status,
+                submitted_at=exit_fill.submitted_at,
+                filled_at=exit_fill.filled_at,
+            )
+        )
+        quality = "recovered" if benchmark_kind != "unavailable" else "unavailable"
+        self._record_fill(
+            result,
+            modeled_price=modeled_price,
+            order_type="market",
+            side="sell",
+        )
+        self._log_close(
+            result,
+            modeled_price,
+            owner,
+            benchmark_kind=benchmark_kind,
+            measurement_quality=quality,
+            timestamp_override=result.filled_at or result.submitted_at,
+            reason=alert_reason,
+        )
+        if is_full_close is None:
+            is_full_close = result.status is OrderStatus.FILLED
+        self._record_realized_pnl(
+            symbol,
+            owner,
+            float(price),
+            qty,
+            multiplier=100 if _OCC_PAT.match(result.symbol) else 1,
+            is_full_close=is_full_close,
+        )
+        self.alerts.trade_executed(
+            symbol=symbol,
+            strategy=owner,
+            side="sell",
+            qty=qty,
+            price=float(price),
+            reason=alert_reason,
+        )
+        logger.warning(
+            f"{symbol}: recovered missed exit fill from broker truth — "
+            f"qty={qty} price={price} order_id={order_id}"
+        )
+        return True
 
     def _record_realized_pnl(
         self,
@@ -3165,6 +3315,105 @@ class TradingEngine:
             return None
         return stop_fill
 
+    def _lookup_recent_exit_fills(
+        self,
+        *,
+        symbol: str,
+        owner: str,
+        until: datetime | None = None,
+    ) -> list:
+        """
+        Return unrecorded filled SELL orders that fully explain a vanished position.
+
+        A valid entry timestamp is required so an older lifecycle's sale cannot
+        be attached to the current trade. Partial exits are returned
+        chronologically only when their cumulative quantity accounts for the
+        remaining trade-log quantity.
+        """
+        context = self.trade_logger.read_latest_open_entry_context(
+            symbol=symbol,
+            strategy=owner,
+        )
+        if context is None or not context.get("entry_timestamp"):
+            return []
+        try:
+            after = datetime.fromisoformat(str(context["entry_timestamp"]))
+        except (TypeError, ValueError):
+            return []
+        open_qty = float(context.get("open_qty") or 0.0)
+        if open_qty <= 0:
+            return []
+
+        fills = self.broker.find_recent_filled_sell_orders(
+            symbol=symbol,
+            after=after,
+            until=until,
+        )
+        unrecorded = [
+            fill
+            for fill in fills
+            if not self.trade_logger.has_recorded_order_id(fill.order_id)
+        ]
+        recovered_qty = sum(float(fill.filled_qty or 0.0) for fill in unrecorded)
+        if recovered_qty + 1e-9 < open_qty:
+            logger.warning(
+                f"{symbol}: broker history found only {recovered_qty} of "
+                f"{open_qty} unrecorded SELL quantity; refusing partial "
+                "vanished-position reconstruction"
+            )
+            return []
+        return unrecorded
+
+    def _reconcile_vanished_db_positions(self, snapshot: BrokerSnapshot) -> None:
+        """Recover broker-proven exits for DB-open positions absent at startup."""
+        broker_symbols = set(snapshot.account.open_positions)
+        broker_owner_keys = {owner_key_for(symbol) for symbol in broker_symbols}
+        for symbol, owner in self.trade_logger.read_all_open_owners().items():
+            if symbol in broker_symbols or owner_key_for(symbol) in broker_owner_keys:
+                continue
+            try:
+                stop_fill = self._lookup_recent_stop_fill(
+                    symbol=symbol,
+                    owner=owner,
+                    until=snapshot.fetched_at,
+                )
+                if stop_fill is not None:
+                    self._record_recovered_stop_fill(
+                        symbol=symbol,
+                        owner=owner,
+                        stop_fill=stop_fill,
+                    )
+                    continue
+                exit_fills = self._lookup_recent_exit_fills(
+                    symbol=symbol,
+                    owner=owner,
+                    until=snapshot.fetched_at,
+                )
+                if not exit_fills:
+                    logger.warning(
+                        f"restart: {symbol} is open in the trade DB but absent "
+                        "from Alpaca, with no complete broker fill history to "
+                        "reconstruct the close"
+                    )
+                    continue
+                for index, exit_fill in enumerate(exit_fills):
+                    self._record_recovered_exit_fill(
+                        symbol=symbol,
+                        owner=owner,
+                        exit_fill=exit_fill,
+                        alert_reason="startup_broker_history_sell_recovered",
+                        is_full_close=index == len(exit_fills) - 1,
+                    )
+                logger.warning(
+                    f"restart: reconciled vanished {symbol} from "
+                    f"{len(exit_fills)} filled SELL order(s) in Alpaca history"
+                )
+            except Exception as exc:
+                logger.warning(
+                    f"restart: broker-history reconciliation failed for "
+                    f"{symbol}: {exc}"
+                )
+
     def _record_recovered_stop_fill(
         self,
         *,
@@ -3702,28 +3951,44 @@ class TradingEngine:
                             "protective stop fill from broker history"
                         )
                     else:
-                        msg = (
-                            f"{symbol}: position owned by '{owner}' absent for "
-                            f"{confirm} consecutive cycle(s) — declared externally closed "
-                            "(stop-out, manual liquidation, or margin call)"
-                        )
-                        logger.warning(msg)
-                        self.alerts.broker_error(msg)
-                        self.trade_logger.log_external_close(
+                        exit_fills = self._lookup_recent_exit_fills(
                             symbol=symbol,
-                            strategy=owner,
-                            reason="external_close_detected",
+                            owner=owner,
                         )
-                        # Operator Controls Phase A — close the
-                        # lifecycle row as external_closed. The
-                        # _record_realized_pnl path is not invoked on
-                        # this branch (no fill price/qty), so we close
-                        # the row directly here. external=True so the
-                        # row is correctly labeled.
-                        self._close_lifecycle_for_owner_key(
-                            owner_key=owner_key_for(symbol),
-                            external=True,
-                        )
+                        if exit_fills:
+                            for index, exit_fill in enumerate(exit_fills):
+                                self._record_recovered_exit_fill(
+                                    symbol=symbol,
+                                    owner=owner,
+                                    exit_fill=exit_fill,
+                                    alert_reason="broker_history_sell_recovered",
+                                    is_full_close=index == len(exit_fills) - 1,
+                                )
+                            logger.warning(
+                                f"{symbol}: position owned by '{owner}' absent for "
+                                f"{confirm} consecutive cycle(s) — reconciled from "
+                                f"{len(exit_fills)} filled SELL order(s) in broker history"
+                            )
+                        else:
+                            msg = (
+                                f"{symbol}: position owned by '{owner}' absent for "
+                                f"{confirm} consecutive cycle(s) — declared externally closed "
+                                "(stop-out, manual liquidation, or margin call)"
+                            )
+                            logger.warning(msg)
+                            self.alerts.broker_error(msg)
+                            self.trade_logger.log_external_close(
+                                symbol=symbol,
+                                strategy=owner,
+                                reason="external_close_detected",
+                            )
+                            # Operator Controls Phase A — close the
+                            # lifecycle row directly when no real fill can
+                            # be recovered from broker history.
+                            self._close_lifecycle_for_owner_key(
+                                owner_key=owner_key_for(symbol),
+                                external=True,
+                            )
                     if self.option_trailing_store is not None:
                         leg = tracked_position.primary_leg
                         if leg is not None and is_occ_option(leg.symbol):
@@ -4112,6 +4377,22 @@ class TradingEngine:
             measurement_quality=close_measurement_quality,
         )
         if result.status not in {OrderStatus.FILLED, OrderStatus.PARTIAL}:
+            if result.status is OrderStatus.UNKNOWN and result.order_id:
+                self._suspect_exit_orders[symbol] = SuspectExitOrder(
+                    order_id=result.order_id,
+                    symbol=position.symbol,
+                    owner=strategy.name,
+                    requested_qty=float(
+                        result.requested_qty or getattr(position, "qty", 0.0) or 0.0
+                    ),
+                    modeled_price=close_modeled,
+                    benchmark_kind=close_benchmark_kind,
+                    alert_reason=alert_reason,
+                )
+                logger.warning(
+                    f"{symbol}: staged suspect exit recovery for "
+                    f"{result.order_id} [{strategy.name}]"
+                )
             logger.warning(
                 f"[{strategy.name}] {symbol}: close did not fill "
                 f"(status={result.status.value}); ownership retained for retry"

@@ -711,6 +711,55 @@ class AlpacaBroker:
         )
         return candidates[-1]
 
+    def find_recent_filled_sell_orders(
+        self,
+        *,
+        symbol: str,
+        after: datetime,
+        until: datetime | None = None,
+        limit: int = 500,
+    ) -> list[ClosedOrderInfo]:
+        """
+        Return filled SELL orders for ``symbol`` after the current entry.
+
+        This is the broker-history safety net for vanished positions whose
+        close fill was missed by both synchronous confirmation and streaming.
+        Results are chronological so callers can reconstruct multiple partial
+        exits without relying on "latest order wins".
+        """
+        request = GetOrdersRequest(
+            status=QueryOrderStatus.CLOSED,
+            limit=limit,
+            after=after,
+            until=until,
+            symbols=[symbol],
+            side=AlpacaOrderSide.SELL,
+        )
+        raw = self._with_retry(
+            lambda: self._api.get_orders(request),
+            op_desc=f"get_orders(closed_sell:{symbol})",
+        )
+
+        candidates: list[ClosedOrderInfo] = []
+        for order in raw:
+            info = self._to_closed_order_info(order)
+            if info is None:
+                continue
+            if info.symbol != symbol or info.side is not Side.SELL:
+                continue
+            if info.status is not OrderStatus.FILLED:
+                continue
+            if info.filled_qty <= 0 or info.avg_fill_price is None:
+                continue
+            candidates.append(info)
+
+        candidates.sort(
+            key=lambda item: item.filled_at
+            or item.submitted_at
+            or datetime.min.replace(tzinfo=timezone.utc)
+        )
+        return candidates
+
     # ── Write-side: place / cancel / close ───────────────────────────────
 
     def place_order(
@@ -1613,14 +1662,33 @@ class AlpacaBroker:
                 raw_status=None,
                 message=str(e),
             )
-        return self._wait_for_fill(
-            order_id=str(order.id),
-            symbol=symbol,
-            requested_qty=qty,
-            timeout=poll_timeout,
-            interval=poll_interval,
-            stream_event=None,  # close_position doesn't pre-register with stream
-        )
+        order_id = str(order.id)
+        stream_event: threading.Event | None = None
+        if self._stream_manager is not None:
+            client_order_id = str(
+                getattr(order, "client_order_id", None) or order_id
+            )
+            stream_event = self._stream_manager.watch(client_order_id)
+            self._stream_manager.bind_submitted_order(
+                client_order_id=client_order_id,
+                order_id=order_id,
+            )
+        try:
+            return self._wait_for_fill(
+                order_id=order_id,
+                symbol=symbol,
+                requested_qty=qty,
+                timeout=poll_timeout,
+                interval=poll_interval,
+                stream_event=stream_event,
+            )
+        except Exception as e:
+            return self._unknown_after_submit(
+                order_id=order_id,
+                symbol=symbol,
+                requested_qty=qty,
+                error=e,
+            )
 
     def place_protective_stop(
         self,
