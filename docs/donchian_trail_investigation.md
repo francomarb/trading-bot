@@ -15,9 +15,12 @@
 > risk-adjusted returns. On the combined 536-trade run: static +18.4% /
 > Sharpe +0.28 / MaxDD −14.3%; low_trail +17.3% / +0.27 / −13.8%;
 > chandelier +15.7% / +0.27 / −12.9%. On the COVID-crash-exposed subset
-> specifically (16 trades), chandelier UNDER-performs static by 1.19 R
-> per trade — the opposite of the hypothesis. Donchian-low trail washes
-> vs static everywhere. **The recommendation is to keep the static stop.**
+> specifically (each policy's own 16 crash-exposed trades), the chandelier
+> policy path produced mean R −0.16 vs the static policy path's +1.03 on
+> its own cohort — the opposite of the hypothesis (cohort caveat: each
+> policy's exits and re-entries differ, so this is a policy-path
+> comparison, not a same-trade comparison). Donchian-low trail washes vs
+> static everywhere. **The recommendation is to keep the static stop.**
 
 ## Revision history
 
@@ -34,11 +37,16 @@
   2. **2020 COVID crash**: 53 total trades, 16 crash-exposed — floors met.
      Aggregate: static +1.7%, low_trail +1.5%, chandelier +1.9% (max-min
      0.4 pp > 0.3 pp threshold; Sharpes 0.02 / −0.04 / 0.02). The
-     crash-exposed subset is the decisive read: static mean R +1.03,
-     low_trail +1.14, **chandelier −0.16**. Chandelier's tighter trail
-     stopped out gap-down trades at worse prices than static, the
-     opposite of what the PLAN concern hypothesized. Donchian-low trail
-     within noise.
+     crash-exposed subset (each policy's own crash-exposed cohort) is
+     the decisive read: static-policy-path mean R +1.03,
+     low_trail-policy-path +1.14, **chandelier-policy-path −0.16**.
+     The chandelier policy-path stopped out its crash-exposed cohort at
+     worse prices than the static policy-path on its cohort — opposite
+     of what the PLAN concern hypothesized. Donchian-low trail within
+     noise. (Cohort caveat: because each policy's exits and re-entries
+     differ, the crash-exposed cohorts are not identical across
+     variants. The comparison is over complete policy paths, not over a
+     fixed set of identical trades.)
   3. **2021-2024 sub-windows**: same pattern as R2 — chandelier gives back
      3.9 pp in the 2023-24 rally (clips trending winners); Donchian-low
      trail washes vs static.
@@ -65,10 +73,13 @@
   2. **SMA200 wasn't populated at 2021-04-01**: stocks' first IEX bar is
      2020-07-27, so April 1, 2021 has only 172 prior bars. SMA200 needs 200
      bars and isn't populated until ~May 11, 2021. The `DonchianEdgeFilter`
-     rule 1 fails open for ~5 weeks of the 2021 window. Same biased entries
-     fed all three stop variants so the A/B is preserved, but absolute 2021
-     numbers (51 trades) over-state production behavior. Documented in §4
-     and reflected in the participation table.
+     rule 1 fails open for ~5 weeks of the 2021 window. The same biased
+     entry signals fed all three stop variants — though the resulting trade
+     cohorts diverge after each policy's first exit, so the comparison is
+     over complete policy paths rather than over identical trades. Absolute
+     2021 numbers (51 trades) over-state production behavior. Documented in
+     §4 and reflected in the participation table. (R5 SIP run is not subject
+     to this gap.)
   3. **Audit-script docstring sync**: said "fetches from 2021-01-01" while
      the implementation has been at 2018-11-01 for a while. Trivial.
 
@@ -228,29 +239,37 @@ re-run on the same universe with `feed="sip"` and a 2016-01-01 →
 2024-12-31 window to test the trail variants against the gap-down
 regimes the question is actually about.
 
-**Additionally — SMA200 gap on the 2021 window** (reviewer P2,
-2026-06-07): April 1, 2021 is only 172 trading days after most
+**Additionally — SMA200 gap on the IEX 2021 window** (reviewer P2,
+2026-06-07): April 1, 2021 was only 172 trading days after most
 stocks' first IEX bar at 2020-07-27. `DonchianEdgeFilter` rule 1
 (stock > 200 SMA) needs 200 bars for SMA200 to be computable; before
-that the filter fails open. Mature mega-caps' first valid SMA200 is
-~May 11, 2021. So for the first ~5 weeks of the 2021 window the filter
-allowed entries that production would have evaluated against a real
-SMA200. The same biased entries fed all three stop variants, so the
-A/B comparison between them is preserved — but the absolute 2021
-numbers (51 trades) over-state what production would actually have
-traded in that sub-window. This is another reason the SIP re-test
-matters: SIP gives 4.5+ years of pre-2021 history per symbol, so
-SMA200 is populated comfortably before any 2021 boundary.
+that the filter fails open. Mature mega-caps' first valid SMA200 was
+~May 11, 2021. So for the first ~5 weeks of the IEX 2021 window the
+filter allowed entries that production would have evaluated against a
+real SMA200. **This affected R2 only; R5 SIP runs from 2016-01-04 onward
+so SMA200 is populated by every regime boundary.** The R5 numbers in
+Section 5 are not subject to this caveat.
 
-Symbol participation within the reachable range:
+Symbol participation — IEX R2 windows (historical):
 
 | Window | Symbols traded / 32 | Notes |
 |---|---:|---|
-| 2021 melt-up (Q2-Q4) | 28 | Window starts 2021-04-01. ⚠ SMA200 is **not** populated at the window boundary — stocks have only 172 prior bars (first IEX bar 2020-07-27), SMA200 needs 200 → first valid SMA200 ~May 11, 2021. `DonchianEdgeFilter` rule 1 fails open for ~5 weeks of the window. Absolute 2021 numbers (51 trades) over-state production. IREN, CEG, ARM excluded (later listings); RGTI is borderline. SIP retest removes this gap (4.5y+ pre-window history per symbol). |
+| 2021 melt-up (Q2-Q4) | 28 | Window starts 2021-04-01. ⚠ SMA200 was **not** populated at the window boundary — stocks have only 172 prior bars (first IEX bar 2020-07-27), SMA200 needs 200 → first valid SMA200 ~May 11, 2021. `DonchianEdgeFilter` rule 1 failed open for ~5 weeks of the window. Absolute 2021 numbers (51 trades) over-state production. IREN, CEG, ARM excluded (later listings); RGTI is borderline. The R5 SIP run resolved this gap (4.5y+ pre-window history per symbol). |
 | 2022 bear | 29 | IREN, CEG, ARM excluded |
 | 2023 rally | 31 | ARM only excluded (Sep 2023 IPO) |
 | 2024 rally | 32 | All names trade |
 | Combined 2021-04 → 2024-12 | 28 | Limited by 2021 entrants |
+
+Symbol participation — R5 SIP windows (canonical for Section 5 numbers):
+
+| Window | Symbols traded / 32 | Notes |
+|---|---:|---|
+| 2018_q4_vol_shock (2018-07 → 2018-12) | 22 | Mega-caps reach 2016-01-04 on SIP; mid-caps later (VST 2017-05, BE 2018-07, VRT 2018-07, CRWD 2019-06). Under-samples (6 trades) — regime gate kept the strategy out of BEAR Q4. |
+| 2020_covid_crash (2019-09 → 2020-05) | 25 | Adds CRWD (post-Jun-2019). Floors met (53 trades, 16 crash-exposed). |
+| 2021 melt-up full year | 26 | SMA200 populated by Jan 1 (no R2 IEX gap). |
+| 2022 bear | 29 | IREN, CEG, ARM excluded. |
+| 2023-24 AI rally | 31 | ARM excluded (Sep 2023 IPO). |
+| Combined 2016-04 → 2024-12 | 21 | Limited by mid-2018+ entrants needing pre-window history. |
 
 The de-SPAC names (QBTS, RGTI, IONQ) have pre-merger SPAC bars in the feed.
 Those bars participate as ordinary OHLC; we did not strip them. The aggregate
@@ -363,50 +382,55 @@ aggregate edge because:
 
 ## 7. Recommendation and re-open conditions
 
-**Conditional recommendation: keep the static `entry − 2×ATR` broker stop
-on the IEX-reachable window.** With production-realistic gates applied,
-the variants are within noise of each other across 2021-2024. Neither
-trail variant clears the bar on chop, bear, or rally regimes.
+**Recommendation: keep the static `entry − 2×ATR` broker stop.** The R5
+SIP re-test (2026-06-08) closed the remaining open question from R2
+("does the conclusion survive on the catastrophic-gap regimes the
+PLAN concern named?"). With production-realistic gates applied across
+the full reachable SIP range (2016-04 → 2024-12, 21 symbols, 536
+combined trades), neither trail variant clears the bar in any regime —
+including March 2020, where the crash-exposed subset specifically shows
+chandelier under-performing static by 1.19 R per trade. Section 5
+contains the canonical numbers; Section 6 the mechanism.
 
-**This is not a full closure.** The 2018 Q4 vol shock and 2020 COVID
-crash were the original motivation for the PLAN concern and **were not
-tested** in this round. SIP makes them reachable (verified post-review,
-2026-06-07); PR #50 makes SIP the backtest default. Once that lands, the
-SIP re-test is the blocking step before this question can move to fully
-closed.
+**Cohort caveat for comparative reads**: because each stop policy
+changes exits and the subsequent re-entries, the trade cohorts under
+each variant are NOT identical — they're close (same entry signals
+and gates fed all three), but not strict apples-to-apples on a
+per-trade basis. The report compares **complete policy paths** (all
+trades produced by the policy across the window), not identical
+trades. This means a claim like "chandelier under-performed static by
+1.19 R on the same trades" is technically wrong; the correct
+statement is "the complete chandelier policy path produced an average
+crash-exposed R of −0.16 vs the static policy path's +1.03 on its
+own crash-exposed cohort." The conclusion (chandelier hurts in this
+regime) stands, but the language must reflect that we're comparing
+policies-as-systems, not trade-to-trade outcomes.
 
-Re-open / next-step paths:
+**Re-open conditions (unchanged from R2 list, but bar is now higher
+post-closure)**:
 
-- **SIP re-test (planned, post-PR #50)** — re-run the simulator on the
-  same `ai_bigtech` universe with `feed="sip"`. **Critical window
-  design**: `run_window()` passes `window.start` as `trade_start` to
-  `simulate_symbol`, which blocks entries before that boundary. The
-  catastrophic-gap test is specifically about positions opened during
-  the prior trend and then carried into the crash, so the window's
-  entry boundary must begin BEFORE the crash. Use:
-    - `2018_q4_vol_shock`: **2018-07-01 → 2018-12-31** (entries from
-      July; crash days Oct 3 - Dec 24). A 2018-10-01 boundary would
-      have excluded every pre-crash entry — which IS the case the
-      PLAN concern is about.
-    - `2020_covid_crash`: **2019-09-01 → 2020-05-31** (entries from
-      Sep 2019; crash days Feb 20 - Mar 23, 2020).
-  Plus the existing four windows + a combined 2016-2024 run.
+- **Live giveback event** — a documented paper or live trade where
+  the static stop visibly surrendered material P&L on a gap-down
+  through a then-vestigial level. This is the only re-open path that
+  can override the aggregate evidence collected here. Hypothetical
+  reasoning about gap-downs is no longer sufficient: the data was
+  tested on both catastrophic-gap regimes the PLAN concern named
+  (2018 Q4, March 2020 with full 16-trade crash-exposed subset), and
+  the trail variants didn't help.
+- **Universe expansion to non-ai_bigtech names** that materially
+  changes the gap-through distribution. The aggregate evidence here is
+  for ai_bigtech mega-caps; small/mid caps with different gap risk
+  profiles could in principle shift the verdict. Would require a fresh
+  PLAN P2 row with explicit acceptance criteria, not a re-run of this
+  experiment.
 
-  **Minimum sample requirements** (mandatory before any closure
-  verdict): each of the two new sub-windows must have ≥ 25 total
-  trades AND ≥ 10 trades open during the named crash days. If either
-  floor isn't met, document the gap and **abstain** from closure —
-  "no difference observed on 5 trades" is sample noise, not evidence.
-
-  **Closure thresholds** (apply only after minimum samples met): if
-  all three variants stay within 0.3 pp mean return / 0.05 Sharpe /
-  1.0 pp MaxDD on each of the two new sub-windows AND there's no
-  meaningful divergence in the per-variant R-distribution on the
-  crash-exposed trade subset, the closure is complete. If chandelier
-  or Donchian-low trail materially outperforms static on either
-  catastrophic-gap regime — particularly on the crash-exposed trade
-  subset — that's the evidence the PLAN concern was asking for, and
-  the change gets a 4-6 week paper A/B before live promotion.
+Pre-2020 data availability is **not** a re-open path. SIP coverage
+already provides 2016-01-04 onward for the mega-caps used here, and
+the 2018 vol shock sub-window's small sample is a regime-gate artifact
+(SPY BEAR blocks Donchian entries — what production does too), not a
+data-availability artifact. Further historical depth (Polygon,
+yfinance, paid Alpaca extended) would not change this — production
+behavior would be the same: regime-gate-out of BEAR regimes.
 - **Live giveback event** — if real paper or live trading produces a
   documented case where the static stop visibly surrendered material P&L
   on a gap-down through a then-vestigial level, that single case study
