@@ -141,7 +141,8 @@ def _rsi_builder():
 
 def _donchian_builder():
     return DonchianBreakout(
-        entry_window=30, exit_window=15, edge_filter=DonchianEdgeFilter()
+        entry_window=30, exit_window=15,
+        edge_filter=DonchianEdgeFilter(feed_label=settings.BACKTEST_DATA_FEED)
     )
 
 

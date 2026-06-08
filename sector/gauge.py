@@ -144,11 +144,15 @@ class SectorMomentumGauge:
 
         try:
             import datetime
+            from config.settings import ALPACA_DATA_FEED
             from data.fetcher import fetch_symbol
 
             end = datetime.datetime.now(datetime.timezone.utc)
             start = end - datetime.timedelta(days=self._lookback_days)
-            df, _stats = fetch_symbol(ticker, start, end, timeframe="1Day")
+            # Live engine path — match the bot's runtime feed.
+            df, _stats = fetch_symbol(
+                ticker, start, end, timeframe="1Day", feed=ALPACA_DATA_FEED
+            )
             self._etf_cache[ticker] = (df, now)
             logger.debug(
                 f"SectorMomentumGauge: fetched {len(df)} bars for {ticker}"

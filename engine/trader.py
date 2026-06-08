@@ -1028,7 +1028,11 @@ class TradingEngine:
         )
         start = end - timedelta(days=lookback_days)
         try:
-            df, stats = fetch_symbol(symbol, start, end, timeframe=timeframe)
+            # Live engine path — use the bot's runtime data feed.
+            from config.settings import ALPACA_DATA_FEED
+            df, stats = fetch_symbol(
+                symbol, start, end, timeframe=timeframe, feed=ALPACA_DATA_FEED
+            )
         except Exception as e:
             logger.error(f"{symbol}: fetch failed: {e}")
             return
@@ -3394,7 +3398,11 @@ class TradingEngine:
         )
         start = end - timedelta(days=lookback_days)
         try:
-            raw_df, _stats = fetch_symbol(symbol, start, end, timeframe=slot.timeframe)
+            # Live engine path — same feed as the original trading cycle.
+            from config.settings import ALPACA_DATA_FEED
+            raw_df, _stats = fetch_symbol(
+                symbol, start, end, timeframe=slot.timeframe, feed=ALPACA_DATA_FEED
+            )
         except Exception as e:
             logger.warning(
                 f"{symbol}: failed to reconstruct missing entry context from market data: {e}"

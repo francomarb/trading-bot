@@ -96,7 +96,7 @@ def run_one(
     atr_stop_mult: float | None = None,
     atr_trail: bool = False,
 ) -> SymbolReport:
-    edge = DonchianEdgeFilter() if use_filter else None
+    edge = DonchianEdgeFilter(feed_label=settings.BACKTEST_DATA_FEED) if use_filter else None
     params = strategy_params or {}
     strategy = DonchianBreakout(edge_filter=edge, **params)
     result = run_backtest(
@@ -272,7 +272,7 @@ def main() -> int:
         f"- Bars range: {bar_start.date()} → {bar_end.date()} ({args.years}y nominal)\n"
         f"- Universe: {universe_label} — {len(bars_by_sym)} of {len(symbols)} symbols\n"
         f"- Symbols: {', '.join(sorted(bars_by_sym.keys()))}\n"
-        f"- Data feed: {settings.ALPACA_DATA_FEED}\n"
+        f"- Data feed: {settings.BACKTEST_DATA_FEED} (from `settings.BACKTEST_DATA_FEED`)\n"
         f"- Slippage: {cfg.slippage_bps} bps, init_cash: ${cfg.initial_cash:,.0f}\n"
         f"- Edge filter: {'ON' if not args.no_filter else 'OFF'}\n"
         f"- ATR stops: {f'{args.atr_stop_mult}× ATR' + (' (TRAILING)' if args.atr_trail else ' (fixed)') if args.atr_stop_mult else 'OFF (signal exit only)'}\n"

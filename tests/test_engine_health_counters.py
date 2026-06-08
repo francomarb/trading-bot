@@ -135,7 +135,7 @@ def _filled_result(symbol="AAPL", qty=1, avg=100.5):
 def patch_fetch(monkeypatch):
     holder = {"df": _bars()}
 
-    def _fetch(symbol, start, end, timeframe="1Day"):
+    def _fetch(symbol, start, end, timeframe="1Day", **kwargs):
         return holder["df"], SimpleNamespace(api_calls=0)
 
     monkeypatch.setattr("engine.trader.fetch_symbol", _fetch)

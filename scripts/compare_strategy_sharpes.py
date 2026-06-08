@@ -135,7 +135,7 @@ def main() -> int:
             "Sector ETFs (GICS SPDRs — selected by universe research)",
             lambda: BollingerSqueeze(
                 bb_length=10, kc_length=10, min_squeeze_bars=6, roc_lookback=5,
-                edge_filter=BollingerSqueezeEdgeFilter(),
+                edge_filter=BollingerSqueezeEdgeFilter(feed_label=settings.BACKTEST_DATA_FEED),
             ),
             UNIVERSES["sector_etfs"],
         ),
@@ -144,7 +144,7 @@ def main() -> int:
             "AI / Big-Tech / Semis (user thesis universe)",
             lambda: BollingerSqueeze(
                 bb_length=10, kc_length=10, min_squeeze_bars=4, roc_lookback=3,
-                edge_filter=BollingerSqueezeEdgeFilter(),
+                edge_filter=BollingerSqueezeEdgeFilter(feed_label=settings.BACKTEST_DATA_FEED),
             ),
             UNIVERSES["ai_bigtech"],
         ),
@@ -153,7 +153,7 @@ def main() -> int:
             "AI / Big-Tech / Semis (DONCHIAN_WATCHLIST — universe research winner)",
             lambda: DonchianBreakout(
                 entry_window=30, exit_window=15,
-                edge_filter=DonchianEdgeFilter(),
+                edge_filter=DonchianEdgeFilter(feed_label=settings.BACKTEST_DATA_FEED),
             ),
             UNIVERSES["ai_bigtech"],
         ),
@@ -177,7 +177,7 @@ def main() -> int:
         f"| Initial cash | ${cfg.initial_cash:,.0f} per symbol |\n"
         f"| Slippage | {cfg.slippage_bps} bps |\n"
         f"| Commission | ${cfg.commission_per_trade} per trade |\n"
-        f"| Data feed | {settings.ALPACA_DATA_FEED} |\n"
+        f"| Data feed | {settings.BACKTEST_DATA_FEED} (from `settings.BACKTEST_DATA_FEED`) |\n"
         f"| Edge filters | ON for all compared strategies |\n"
         f"| ATR stops in backtest | NO — vectorbt does not model the engine's "
         f"`ATR_STOP_MULTIPLIER=2.0` stop legs |\n"
@@ -193,7 +193,7 @@ def main() -> int:
     universe_blocks: list[str] = []
 
     print(f"# Strategy Sharpe Comparison")
-    print(f"- Bar range end: {end_date.date()}, history {years}y, init_cash=${cfg.initial_cash:,.0f}, slippage={cfg.slippage_bps} bps, feed={settings.ALPACA_DATA_FEED}")
+    print(f"- Bar range end: {end_date.date()}, history {years}y, init_cash=${cfg.initial_cash:,.0f}, slippage={cfg.slippage_bps} bps, feed={settings.BACKTEST_DATA_FEED}")
     print()
     print("| Strategy | Universe | Symbols | Sharpe | MeanRet | MeanDD | Trades | WinRate |")
     print("|----------|---------:|--------:|-------:|--------:|-------:|-------:|--------:|")

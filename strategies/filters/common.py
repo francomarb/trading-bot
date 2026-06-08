@@ -80,10 +80,14 @@ class SPYTrendFilter:
         ):
             return self._spy_cache
         try:
+            from config.settings import ALPACA_DATA_FEED
             from data.fetcher import fetch_symbol
             end = datetime.datetime.now(datetime.timezone.utc)
             start = end - datetime.timedelta(days=self._lookback_days)
-            df, _stats = fetch_symbol("SPY", start, end, timeframe="1Day")
+            # Live engine path — SPYTrendFilter is evaluated each cycle.
+            df, _stats = fetch_symbol(
+                "SPY", start, end, timeframe="1Day", feed=ALPACA_DATA_FEED
+            )
             self._spy_cache = df
             self._cache_time = now
             logger.debug(
