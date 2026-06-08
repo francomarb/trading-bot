@@ -24,6 +24,7 @@ loops are exercised.
 
 from __future__ import annotations
 
+from datetime import datetime, timezone
 from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
@@ -108,6 +109,7 @@ def _alpaca_order(
     time_in_force: str | None = None,
     legs: list[SimpleNamespace] | None = None,
     submitted_at: str = "2026-04-15T14:30:00Z",
+    filled_at: str | None = None,
 ) -> SimpleNamespace:
     return SimpleNamespace(
         id=id,
@@ -123,6 +125,7 @@ def _alpaca_order(
         time_in_force=time_in_force,
         legs=legs,
         submitted_at=submitted_at,
+        filled_at=filled_at,
     )
 
 
@@ -314,6 +317,60 @@ class TestFindRecentFilledStopOrder:
 
         assert isinstance(result, ClosedOrderInfo)
         assert result.order_id == "real-stop"
+
+
+class TestFindRecentFilledSellOrders:
+    def test_returns_chronological_filled_sells_only(self):
+        api = MagicMock()
+        api.get_orders.return_value = [
+            _alpaca_order(
+                id="sell-2",
+                symbol="AAPL",
+                side="sell",
+                type="market",
+                status="filled",
+                qty="6",
+                filled_qty="6",
+                filled_avg_price="99",
+                submitted_at="2026-06-08T14:35:00Z",
+                filled_at="2026-06-08T14:36:00Z",
+            ),
+            _alpaca_order(
+                id="buy-ignored",
+                symbol="AAPL",
+                side="buy",
+                status="filled",
+                qty="10",
+                filled_qty="10",
+                filled_avg_price="100",
+            ),
+            _alpaca_order(
+                id="sell-1",
+                symbol="AAPL",
+                side="sell",
+                type="limit",
+                status="filled",
+                qty="4",
+                filled_qty="4",
+                filled_avg_price="101",
+                submitted_at="2026-06-08T14:30:00Z",
+                filled_at="2026-06-08T14:31:00Z",
+            ),
+            _alpaca_order(
+                id="sell-canceled",
+                symbol="AAPL",
+                side="sell",
+                status="canceled",
+            ),
+        ]
+        broker = _broker_with_mock(api)
+
+        results = broker.find_recent_filled_sell_orders(
+            symbol="AAPL",
+            after=datetime(2026, 6, 8, tzinfo=timezone.utc),
+        )
+
+        assert [result.order_id for result in results] == ["sell-1", "sell-2"]
 
 
 class TestGetClosedOrders:
@@ -1210,6 +1267,64 @@ class TestClosePosition:
         assert result.status is OrderStatus.FILLED
         # Only the AAPL sibling was canceled, not the unrelated MSFT order.
         api.cancel_order_by_id.assert_called_once_with("aapl-stop")
+
+    def test_confirmation_error_returns_unknown_with_exact_order_id(self):
+        api = MagicMock()
+        api.get_all_positions.return_value = [
+            SimpleNamespace(
+                symbol="AAPL", qty="10", avg_entry_price="100", market_value="1010"
+            )
+        ]
+        api.get_orders.return_value = []
+        api.close_position.return_value = _alpaca_order(
+            id="close-aapl-1",
+            status="accepted",
+        )
+        api.get_order_by_id.side_effect = TimeoutError("status request timed out")
+        broker = AlpacaBroker(client=api, max_attempts=1, base_delay=0.0)
+
+        result = broker.close_position("AAPL", poll_timeout=0.0)
+
+        assert result.status is OrderStatus.UNKNOWN
+        assert result.order_id == "close-aapl-1"
+        assert result.requested_qty == pytest.approx(10.0)
+
+    def test_close_uses_stream_with_rest_fallback(self):
+        api = MagicMock()
+        api.get_all_positions.return_value = [
+            SimpleNamespace(
+                symbol="AAPL", qty="10", avg_entry_price="100", market_value="1010"
+            )
+        ]
+        api.get_orders.return_value = []
+        api.close_position.return_value = _alpaca_order(
+            id="close-aapl-stream",
+            status="accepted",
+        )
+        api.get_order_by_id.return_value = _alpaca_order(
+            id="close-aapl-stream",
+            status="filled",
+            filled_qty=10,
+            filled_avg_price=101.0,
+        )
+        stream = MagicMock()
+        stream.watch.return_value = MagicMock()
+        stream.watch.return_value.wait.return_value = False
+        broker = AlpacaBroker(
+            client=api,
+            max_attempts=1,
+            base_delay=0.0,
+            stream_manager=stream,
+        )
+
+        result = broker.close_position("AAPL", poll_timeout=0.0)
+
+        assert result.status is OrderStatus.FILLED
+        stream.watch.assert_called_once()
+        stream.bind_submitted_order.assert_called_once_with(
+            client_order_id=stream.watch.call_args.args[0],
+            order_id="close-aapl-stream",
+        )
 
 
 # ── Read-side: positions + sync ──────────────────────────────────────────────

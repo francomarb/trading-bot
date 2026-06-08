@@ -2543,6 +2543,47 @@ class TestStartupReconciliation:
 
         assert engine._entry_prices["AAPL"] == pytest.approx(100.25)
 
+    def test_startup_recovers_db_open_position_already_absent_at_broker(
+        self, patch_fetch, tmp_path
+    ):
+        startup = _snapshot()
+        engine, broker, tl = _engine_with_db(
+            patch_fetch,
+            tmp_path,
+            snapshot=startup,
+        )
+        broker.sync_with_broker.side_effect = [startup, startup]
+        _write_buy(tl, "AAPL", "fake_strategy")
+        broker.find_recent_filled_stop_order.return_value = None
+        broker.find_recent_filled_sell_orders.return_value = [
+            ClosedOrderInfo(
+                order_id="startup-exit-1",
+                client_order_id=None,
+                symbol="AAPL",
+                side=Side.SELL,
+                order_type="market",
+                status=OrderStatus.FILLED,
+                raw_status="filled",
+                qty=10.0,
+                filled_qty=10.0,
+                avg_fill_price=99.0,
+                stop_price=None,
+                submitted_at=T0 + timedelta(minutes=1),
+                filled_at=T0 + timedelta(minutes=2),
+            )
+        ]
+        engine._record_realized_pnl = MagicMock()
+
+        engine.start(max_cycles=1)
+
+        assert tl.read_all_open_owners() == {}
+        sell_rows = [row for row in tl.read_all() if row["side"] == "sell"]
+        assert len(sell_rows) == 1
+        assert sell_rows[0]["order_id"] == "startup-exit-1"
+        assert sell_rows[0]["reason"] == "startup_broker_history_sell_recovered"
+        engine._record_realized_pnl.assert_called_once()
+        assert engine._record_realized_pnl.call_args.kwargs["external"] is True
+
 
 # ── External close detection ──────────────────────────────────────────────
 
@@ -2671,6 +2712,154 @@ class TestExternalCloseDetection:
         assert len(sell_rows) == 1
         assert sell_rows[0]["order_id"] == "stop-aapl-1"
         assert sell_rows[0]["reason"] == "stop_triggered"
+
+    def test_external_close_recovers_filled_market_sell(self, patch_fetch, tmp_path):
+        """CIEN regression: a timed-out market close is rebuilt from broker history."""
+        engine, _, tl = _engine_with_confirm(patch_fetch, tmp_path, confirm=1)
+        _write_buy(tl, "AAPL", "fake_strategy")
+        engine._register_single_leg(strategy_name="fake_strategy", symbol="AAPL")
+        engine._entry_prices["AAPL"] = 100.5
+        engine.broker.find_recent_filled_stop_order = MagicMock(return_value=None)
+        engine.broker.find_recent_filled_sell_orders = MagicMock(
+            return_value=[
+                ClosedOrderInfo(
+                    order_id="market-exit-1",
+                    client_order_id=None,
+                    symbol="AAPL",
+                    side=Side.SELL,
+                    order_type="market",
+                    status=OrderStatus.FILLED,
+                    raw_status="filled",
+                    qty=10.0,
+                    filled_qty=10.0,
+                    avg_fill_price=99.0,
+                    stop_price=None,
+                    submitted_at=T0 + timedelta(minutes=1),
+                    filled_at=T0 + timedelta(minutes=2),
+                )
+            ]
+        )
+        engine._record_realized_pnl = MagicMock()
+
+        engine._detect_external_closes(_snapshot())
+
+        sell_rows = [row for row in tl.read_all() if row["side"] == "sell"]
+        assert len(sell_rows) == 1
+        assert sell_rows[0]["order_id"] == "market-exit-1"
+        assert sell_rows[0]["qty"] == pytest.approx(10.0)
+        assert sell_rows[0]["avg_fill_price"] == pytest.approx(99.0)
+        assert sell_rows[0]["realized_pnl"] == pytest.approx(-15.0)
+        assert sell_rows[0]["reason"] == "broker_history_sell_recovered"
+        assert sell_rows[0]["timestamp"] == (
+            T0 + timedelta(minutes=2)
+        ).isoformat()
+        assert engine._record_realized_pnl.call_args.kwargs["external"] is True
+
+    def test_external_close_recovers_multiple_filled_sells_in_order(
+        self, patch_fetch, tmp_path
+    ):
+        engine, _, tl = _engine_with_confirm(patch_fetch, tmp_path, confirm=1)
+        _write_buy(tl, "AAPL", "fake_strategy")
+        engine._register_single_leg(strategy_name="fake_strategy", symbol="AAPL")
+        engine._entry_prices["AAPL"] = 100.5
+        engine.broker.find_recent_filled_stop_order = MagicMock(return_value=None)
+        engine.broker.find_recent_filled_sell_orders = MagicMock(
+            return_value=[
+                ClosedOrderInfo(
+                    order_id=f"market-exit-{index}",
+                    client_order_id=None,
+                    symbol="AAPL",
+                    side=Side.SELL,
+                    order_type="market",
+                    status=OrderStatus.FILLED,
+                    raw_status="filled",
+                    qty=qty,
+                    filled_qty=qty,
+                    avg_fill_price=price,
+                    stop_price=None,
+                    submitted_at=T0 + timedelta(minutes=index),
+                    filled_at=T0 + timedelta(minutes=index),
+                )
+                for index, qty, price in [(1, 4.0, 101.0), (2, 6.0, 99.0)]
+            ]
+        )
+
+        engine._detect_external_closes(_snapshot())
+
+        sell_rows = [row for row in tl.read_all() if row["side"] == "sell"]
+        assert [row["order_id"] for row in sell_rows] == [
+            "market-exit-1",
+            "market-exit-2",
+        ]
+        assert tl.read_all_open_owners() == {}
+
+    def test_external_close_does_not_recover_insufficient_sell_quantity(
+        self, patch_fetch, tmp_path
+    ):
+        engine, _, tl = _engine_with_confirm(patch_fetch, tmp_path, confirm=1)
+        _write_buy(tl, "AAPL", "fake_strategy")
+        engine._register_single_leg(strategy_name="fake_strategy", symbol="AAPL")
+        engine.broker.find_recent_filled_stop_order = MagicMock(return_value=None)
+        engine.broker.find_recent_filled_sell_orders = MagicMock(
+            return_value=[
+                ClosedOrderInfo(
+                    order_id="partial-only",
+                    client_order_id=None,
+                    symbol="AAPL",
+                    side=Side.SELL,
+                    order_type="market",
+                    status=OrderStatus.FILLED,
+                    raw_status="filled",
+                    qty=4.0,
+                    filled_qty=4.0,
+                    avg_fill_price=99.0,
+                    stop_price=None,
+                    submitted_at=T0,
+                    filled_at=T0,
+                )
+            ]
+        )
+
+        engine._detect_external_closes(_snapshot())
+
+        sell_rows = [row for row in tl.read_all() if row["side"] == "sell"]
+        assert len(sell_rows) == 1
+        assert sell_rows[0]["reason"] == "external_close_detected"
+        assert sell_rows[0]["order_id"] is None
+
+    def test_external_close_does_not_recover_excess_sell_quantity(
+        self, patch_fetch, tmp_path
+    ):
+        engine, _, tl = _engine_with_confirm(patch_fetch, tmp_path, confirm=1)
+        _write_buy(tl, "AAPL", "fake_strategy")
+        engine._register_single_leg(strategy_name="fake_strategy", symbol="AAPL")
+        engine.broker.find_recent_filled_stop_order = MagicMock(return_value=None)
+        engine.broker.find_recent_filled_sell_orders = MagicMock(
+            return_value=[
+                ClosedOrderInfo(
+                    order_id="excess-sell",
+                    client_order_id=None,
+                    symbol="AAPL",
+                    side=Side.SELL,
+                    order_type="market",
+                    status=OrderStatus.FILLED,
+                    raw_status="filled",
+                    qty=12.0,
+                    filled_qty=12.0,
+                    avg_fill_price=99.0,
+                    stop_price=None,
+                    submitted_at=T0,
+                    filled_at=T0,
+                )
+            ]
+        )
+
+        engine._detect_external_closes(_snapshot())
+
+        sell_rows = [row for row in tl.read_all() if row["side"] == "sell"]
+        assert len(sell_rows) == 1
+        assert sell_rows[0]["reason"] == "external_close_detected"
+        assert sell_rows[0]["order_id"] is None
 
     def test_recovered_stop_fill_uses_100x_multiplier_for_occ_symbol(self, patch_fetch, tmp_path):
         """Broker-history stop recovery should apply the options contract multiplier when needed."""
@@ -4605,6 +4794,78 @@ class TestExitPathBenchmarkKind:
         # never the fill price masquerading as 'arrival_midpoint'.
         assert kwargs["benchmark_kind"] == "unavailable"
         assert kwargs["measurement_quality"] == "unavailable"
+
+    def test_unknown_exit_is_staged_and_reconciled_by_exact_order_id(self, tmp_path):
+        engine, broker = self._engine_with_real_logger(tmp_path)
+        _write_buy(engine.trade_logger, "AAPL", "fake_strategy")
+        engine._register_single_leg(strategy_name="fake_strategy", symbol="AAPL")
+        engine._entry_prices["AAPL"] = 100.5
+        position = SimpleNamespace(
+            qty=10,
+            symbol="AAPL",
+            avg_entry_price=100.5,
+            market_value=1000.0,
+            unrealized_pl=0.0,
+            current_price=100.0,
+            cost_basis=1005.0,
+            asset_id="x",
+            side="long",
+        )
+        snapshot = BrokerSnapshot(
+            account=SimpleNamespace(
+                equity=100_000.0,
+                cash=50_000.0,
+                buying_power=50_000.0,
+                open_positions={"AAPL": position},
+            ),
+            open_orders=[],
+        )
+        broker.close_position.return_value = OrderResult(
+            status=OrderStatus.UNKNOWN,
+            order_id="close-aapl-unknown",
+            symbol="AAPL",
+            requested_qty=10.0,
+            filled_qty=0.0,
+            avg_fill_price=None,
+            raw_status=None,
+            message="confirmation timed out",
+        )
+
+        closed = engine._close_single_leg_position(
+            symbol="AAPL",
+            strategy=engine.strategy,
+            position=position,
+            snapshot=snapshot,
+            latest_close=100.0,
+            alert_reason="exit signal",
+        )
+
+        assert closed is False
+        assert engine._suspect_exit_orders["AAPL"].order_id == "close-aapl-unknown"
+
+        broker.reconcile_submitted_order.return_value = OrderResult(
+            status=OrderStatus.FILLED,
+            order_id="close-aapl-unknown",
+            symbol="AAPL",
+            requested_qty=10.0,
+            filled_qty=10.0,
+            avg_fill_price=99.0,
+            raw_status="filled",
+            submitted_at=T0,
+            filled_at=T0 + timedelta(minutes=4),
+        )
+        engine._record_realized_pnl = MagicMock()
+        engine._recover_suspect_exit_orders(_snapshot())
+
+        assert "AAPL" not in engine._suspect_exit_orders
+        assert not engine._has_position("AAPL")
+        sell_rows = [
+            row for row in engine.trade_logger.read_all() if row["side"] == "sell"
+        ]
+        assert len(sell_rows) == 1
+        assert sell_rows[0]["order_id"] == "close-aapl-unknown"
+        assert sell_rows[0]["slippage_measurement_quality"] == "recovered"
+        assert engine._record_realized_pnl.call_args.kwargs["external"] is False
 
 
 # ── Slippage unification Defect 2 fix ──────────────────────────────────────
