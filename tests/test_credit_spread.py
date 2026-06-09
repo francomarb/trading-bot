@@ -465,3 +465,119 @@ class TestEvaluateSpreadExit:
         )
         assert should_exit is False
         assert spread_mid is None
+
+
+class TestEvaluateClose:
+    """Typed close decision used by the engine's walk-and-market dispatch."""
+
+    _TODAY = date(2026, 5, 14)
+
+    def _spread(self) -> OpenSpread:
+        return _open_spread(
+            position_id="p1",
+            expiration=self._TODAY + timedelta(days=40),
+            net_credit=2.00,
+            short_strike=700.0,
+        )
+
+    def _quotes(self, short: Quote | None, long: Quote | None):
+        def _lookup(occ_symbols):
+            return {"SPY_S": short, "SPY_L": long}
+        return _lookup
+
+    def test_profit_target_maps_to_typed_reason(self):
+        strat = CreditSpread(
+            _config(profit_target_pct=0.50),
+            iv_resolver=IVProxyResolver(fetch_fn=lambda t: 18.0),
+            quote_lookup=self._quotes(Quote(1.45, 1.55), Quote(0.45, 0.55)),
+        )
+        decision = strat.evaluate_close(
+            self._spread(), underlying_close=745.0, today=self._TODAY,
+        )
+        assert decision.should_close is True
+        assert decision.reason == "profit_target"
+        assert "profit target" in decision.detail
+        assert decision.position_id == "p1"
+        assert decision.initial_mid == pytest.approx(1.00)
+        # Net bid/ask of the spread: short_bid - long_ask, short_ask - long_bid
+        assert decision.initial_bid == pytest.approx(1.45 - 0.55)
+        assert decision.initial_ask == pytest.approx(1.55 - 0.45)
+
+    def test_stop_loss_maps_to_typed_reason(self):
+        # Short 2.45/2.55, Long 0.20/0.30 → spread mid 2.10 = stop at 2.0×1.00 credit.
+        strat = CreditSpread(
+            _config(stop_loss_multiple=2.0),
+            iv_resolver=IVProxyResolver(fetch_fn=lambda t: 18.0),
+            quote_lookup=self._quotes(Quote(2.45, 2.55), Quote(0.20, 0.30)),
+        )
+        # Custom spread with net_credit = 1.00 so stop trigger fires.
+        spread = _open_spread(
+            position_id="p1",
+            expiration=self._TODAY + timedelta(days=40),
+            net_credit=1.00,
+            short_strike=700.0,
+        )
+        decision = strat.evaluate_close(
+            spread, underlying_close=745.0, today=self._TODAY,
+        )
+        assert decision.reason == "stop_loss"
+
+    def test_time_stop_maps_to_typed_reason(self):
+        strat = CreditSpread(
+            _config(time_stop_dte=21),
+            iv_resolver=IVProxyResolver(fetch_fn=lambda t: 18.0),
+            quote_lookup=self._quotes(Quote(1.95, 2.05), Quote(0.45, 0.55)),
+        )
+        spread = _open_spread(
+            position_id="p1",
+            # 20 days from today — below the 21-DTE threshold.
+            expiration=self._TODAY + timedelta(days=20),
+            net_credit=2.00,
+            short_strike=700.0,
+        )
+        decision = strat.evaluate_close(
+            spread, underlying_close=745.0, today=self._TODAY,
+        )
+        assert decision.reason == "time_stop"
+
+    def test_short_strike_breach_maps_to_defensive_breach(self):
+        # exit_on_short_strike_breach=True; underlying below short strike fires.
+        strat = CreditSpread(
+            _config(exit_on_short_strike_breach=True),
+            iv_resolver=IVProxyResolver(fetch_fn=lambda t: 18.0),
+            quote_lookup=self._quotes(Quote(1.95, 2.05), Quote(0.45, 0.55)),
+        )
+        decision = strat.evaluate_close(
+            self._spread(),
+            underlying_close=699.0,  # below 700 short strike
+            today=self._TODAY,
+        )
+        assert decision.reason == "defensive_breach"
+
+    def test_no_trigger_returns_no_close(self):
+        strat = CreditSpread(
+            _config(),
+            iv_resolver=IVProxyResolver(fetch_fn=lambda t: 18.0),
+            quote_lookup=self._quotes(Quote(2.45, 2.55), Quote(0.65, 0.75)),
+        )
+        decision = strat.evaluate_close(
+            self._spread(), underlying_close=745.0, today=self._TODAY,
+        )
+        assert decision.should_close is False
+        assert decision.reason is None
+        assert decision.detail == ""
+
+    def test_missing_quote_returns_no_close_with_nan_quotes(self):
+        # Never close on missing market data.
+        strat = CreditSpread(
+            _config(),
+            iv_resolver=IVProxyResolver(fetch_fn=lambda t: 18.0),
+            quote_lookup=self._quotes(Quote(1.45, 1.55), None),
+        )
+        decision = strat.evaluate_close(
+            self._spread(), underlying_close=745.0, today=self._TODAY,
+        )
+        assert decision.should_close is False
+        # NaN sentinel — caller distinguishes from a real 0.0 mid.
+        import math
+        assert math.isnan(decision.initial_mid)

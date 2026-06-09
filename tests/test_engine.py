@@ -348,6 +348,65 @@ class TestStreamHealthObservability:
         assert "stream healthy again" in recovery_msg
 
 
+class TestMlegEndOfSessionBypass:
+    """Engine should skip the walk and submit market when too close to the bell.
+
+    Pinning the threshold semantics here means a future timezone or
+    DST change can't silently break the EOS protection."""
+
+    def _make_engine(self, tmp_path) -> TradingEngine:
+        api = MagicMock()
+        broker = AlpacaBroker(client=api)
+        risk = RiskManager(
+            max_position_pct=0.02, max_open_positions=5,
+            max_gross_exposure_pct=0.50, atr_stop_multiplier=2.0,
+            max_daily_loss_pct=0.05, hard_dollar_loss_cap=1_000_000.0,
+            loss_streak_threshold=10, broker_error_threshold=1,
+        )
+        return TradingEngine(
+            strategy=FakeStrategy(entries=[False], exits=[False]),
+            symbols=["AAPL"], risk=risk, broker=broker,
+            trade_logger=TradeLogger(path=str(tmp_path / "trades.db")),
+        )
+
+    def _et(self, year, month, day, hour, minute):
+        # Build a UTC datetime that represents the given Eastern wall time.
+        # America/New_York is UTC-4 (EDT) in June.
+        from zoneinfo import ZoneInfo
+        return datetime(year, month, day, hour, minute, tzinfo=ZoneInfo("America/New_York"))
+
+    def test_no_bypass_in_morning(self, tmp_path):
+        engine = self._make_engine(tmp_path)
+        # 09:35 ET — plenty of session left.
+        morning = self._et(2026, 6, 8, 9, 35)
+        assert engine._mleg_should_bypass_walk(now=morning) is False
+
+    def test_bypass_fires_in_final_minutes(self, tmp_path):
+        engine = self._make_engine(tmp_path)
+        # 15:58 ET — 120 seconds to close, well under the 210s threshold.
+        late = self._et(2026, 6, 8, 15, 58)
+        assert engine._mleg_should_bypass_walk(now=late) is True
+
+    def test_no_bypass_in_safe_window(self, tmp_path):
+        engine = self._make_engine(tmp_path)
+        # 15:52 ET — 480 seconds to close, above the 210s threshold.
+        safe = self._et(2026, 6, 8, 15, 52)
+        assert engine._mleg_should_bypass_walk(now=safe) is False
+
+    def test_no_bypass_after_session_close(self, tmp_path):
+        engine = self._make_engine(tmp_path)
+        # 16:30 ET — session ended; the engine shouldn't be dispatching
+        # closes here, but defensively we return False not True.
+        after = self._et(2026, 6, 8, 16, 30)
+        assert engine._mleg_should_bypass_walk(now=after) is False
+
+    def test_no_bypass_before_session_open(self, tmp_path):
+        engine = self._make_engine(tmp_path)
+        # 08:30 ET — pre-market.
+        pre = self._et(2026, 6, 8, 8, 30)
+        assert engine._mleg_should_bypass_walk(now=pre) is False
+
+
 class TestEngineConfig:
     def test_engine_binds_broker_entry_guard(self, tmp_path):
         api = MagicMock()

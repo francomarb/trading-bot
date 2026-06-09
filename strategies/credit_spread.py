@@ -484,6 +484,52 @@ class CreditSpread(BaseStrategy):
 
     # ── Exit triggers ────────────────────────────────────────────────────
 
+    def _classify_exit(
+        self,
+        spread: OpenSpread,
+        *,
+        spread_mid: float,
+        underlying_close: float,
+        today: date,
+    ) -> tuple[str | None, str]:
+        """
+        Internal exit classifier — returns ``(reason_code, detail)``.
+
+        ``reason_code`` is one of the canonical
+        ``settings.MLEG_CLOSE_REASONS`` values, or ``None`` if no exit
+        trigger fires. ``detail`` is the human-readable explanation
+        (empty when no trigger fires).
+
+        This is the single place exit conditions are evaluated; both
+        ``should_exit_spread`` (backward-compat) and ``evaluate_close``
+        (typed MLEG path) read from here.
+        """
+        cfg = self.config
+        credit = spread.net_credit
+
+        if credit > 0 and spread_mid <= cfg.profit_target_pct * credit:
+            return "profit_target", (
+                f"profit target — mid ${spread_mid:.2f} ≤ "
+                f"{cfg.profit_target_pct:.0%} × ${credit:.2f} credit"
+            )
+        if credit > 0 and spread_mid >= cfg.stop_loss_multiple * credit:
+            return "stop_loss", (
+                f"stop loss — mid ${spread_mid:.2f} ≥ "
+                f"{cfg.stop_loss_multiple:.1f}× ${credit:.2f} credit"
+            )
+
+        dte = (spread.expiration_date - today).days
+        if dte <= cfg.time_stop_dte:
+            return "time_stop", f"time stop — {dte} DTE ≤ {cfg.time_stop_dte}"
+
+        if cfg.exit_on_short_strike_breach and underlying_close <= spread.short_strike:
+            return "defensive_breach", (
+                f"short strike breach — underlying ${underlying_close:.2f} ≤ "
+                f"short strike ${spread.short_strike:.2f}"
+            )
+
+        return None, ""
+
     def should_exit_spread(
         self,
         spread: OpenSpread,
@@ -507,32 +553,16 @@ class CreditSpread(BaseStrategy):
 
         The regime-exit override (BEAR mid-trade) is an engine-level concern
         and is not evaluated here.
+
+        Backward-compat shim: prefer ``evaluate_close`` for new callers.
         """
-        cfg = self.config
-        credit = spread.net_credit
-
-        if credit > 0 and spread_mid <= cfg.profit_target_pct * credit:
-            return True, (
-                f"profit target — mid ${spread_mid:.2f} ≤ "
-                f"{cfg.profit_target_pct:.0%} × ${credit:.2f} credit"
-            )
-        if credit > 0 and spread_mid >= cfg.stop_loss_multiple * credit:
-            return True, (
-                f"stop loss — mid ${spread_mid:.2f} ≥ "
-                f"{cfg.stop_loss_multiple:.1f}× ${credit:.2f} credit"
-            )
-
-        dte = (spread.expiration_date - today).days
-        if dte <= cfg.time_stop_dte:
-            return True, f"time stop — {dte} DTE ≤ {cfg.time_stop_dte}"
-
-        if cfg.exit_on_short_strike_breach and underlying_close <= spread.short_strike:
-            return True, (
-                f"short strike breach — underlying ${underlying_close:.2f} ≤ "
-                f"short strike ${spread.short_strike:.2f}"
-            )
-
-        return False, ""
+        code, detail = self._classify_exit(
+            spread,
+            spread_mid=spread_mid,
+            underlying_close=underlying_close,
+            today=today,
+        )
+        return (code is not None), detail
 
     def evaluate_spread_exit(
         self,
@@ -579,3 +609,152 @@ class CreditSpread(BaseStrategy):
             today=today,
         )
         return should_exit, reason, spread_mid
+
+    # ── Typed MLEG close decision (PR: walk-and-market) ─────────────────
+
+    def build_close_quote_provider(
+        self, spread: OpenSpread,
+    ) -> "Callable[[], MlegQuote | None]":
+        """
+        Build a callable that returns a fresh net spread ``MlegQuote`` each
+        call, or ``None`` if quotes are unavailable / inverted.
+
+        The walk-and-market scheduler in ``execution/options_executor.py``
+        calls this between steps so each walk step's limit price is
+        computed against the latest market data — not a stale mid captured
+        at decision time.
+
+        This is the strategy-side hook of the generic MLEG close protocol:
+        any future MLEG strategy implements ``build_close_quote_provider``
+        with the same signature so the engine wiring stays strategy-agnostic.
+        """
+        from execution.mleg_close import MlegQuote
+
+        quote_lookup = self._quote_lookup
+        short_occ, long_occ = spread.short_occ, spread.long_occ
+        name = self.name
+        symbol = self.symbol
+
+        def _provider() -> "MlegQuote | None":
+            if quote_lookup is None:
+                return None
+            try:
+                quotes = quote_lookup([short_occ, long_occ])
+            except Exception as e:
+                logger.warning(
+                    f"[{name}] {symbol}: walk quote lookup raised: {e}"
+                )
+                return None
+            short_q = quotes.get(short_occ)
+            long_q = quotes.get(long_occ)
+            if short_q is None or long_q is None:
+                return None
+            bid = short_q.bid - long_q.ask
+            mid = short_q.mid - long_q.mid
+            ask = short_q.ask - long_q.bid
+            if not (bid <= mid <= ask):
+                # Inverted or stale — return None so the walk skips this step.
+                return None
+            try:
+                return MlegQuote(mid=mid, bid=bid, ask=ask)
+            except ValueError:
+                return None
+
+        return _provider
+
+
+    def evaluate_close(
+        self,
+        spread: OpenSpread,
+        *,
+        underlying_close: float,
+        today: date | None = None,
+    ) -> "MlegCloseDecision":
+        """
+        Engine-facing typed close decision for the walk-and-market path.
+
+        Returns an ``MlegCloseDecision`` with:
+          - ``should_close`` — True iff an exit trigger fires
+          - ``reason`` — one of ``settings.MLEG_CLOSE_REASONS`` when
+            ``should_close`` is True; ``None`` otherwise
+          - ``detail`` — human-readable explanation
+          - ``initial_mid/bid/ask`` — net spread bid/mid/ask at decision
+            time, for telemetry and as inputs to the close scheduler
+            (the bid/ask widths drive the walk-step prices)
+
+        Strategy-agnostic in shape: this is the protocol the engine uses
+        to dispatch close work to the generic MLEG walk-and-market
+        scheduler. Any future MLEG strategy implements the same shape.
+
+        Quote outages → returns ``should_close=False`` with empty detail.
+        **Never close on missing market data.**
+        """
+        from execution.mleg_close import MlegCloseDecision
+
+        if today is None:
+            today = date.today()
+
+        def _none_decision() -> "MlegCloseDecision":
+            return MlegCloseDecision(
+                should_close=False, reason=None, detail="",
+                position_id=spread.position_id,
+                initial_mid=float("nan"), initial_bid=float("nan"),
+                initial_ask=float("nan"),
+            )
+
+        if self._quote_lookup is None:
+            return _none_decision()
+        try:
+            quotes = self._quote_lookup([spread.short_occ, spread.long_occ])
+        except Exception as e:
+            logger.warning(
+                f"[{self.name}] {self.symbol}: spread-exit quote lookup failed "
+                f"for {spread.position_id[:8]}: {e}"
+            )
+            return _none_decision()
+        short_q = quotes.get(spread.short_occ)
+        long_q = quotes.get(spread.long_occ)
+        if short_q is None or long_q is None:
+            logger.warning(
+                f"[{self.name}] {self.symbol}: missing quote for spread leg "
+                f"({spread.short_occ}/{spread.long_occ}) — holding"
+            )
+            return _none_decision()
+
+        # Net spread quote — closing cost (debit) = buy short back, sell long.
+        # bid/mid/ask of the spread:
+        #   spread_bid = short_bid - long_ask   (worst close price)
+        #   spread_mid = short_mid - long_mid
+        #   spread_ask = short_ask - long_bid   (best close price)
+        # These follow naturally from the leg sides on the closing trade.
+        spread_bid = short_q.bid - long_q.ask
+        spread_mid = short_q.mid - long_q.mid
+        spread_ask = short_q.ask - long_q.bid
+
+        # Defensive: if the leg quotes are wide/stale enough to invert,
+        # clamp into a degenerate (bid==mid==ask=mid) quote so MlegQuote's
+        # invariant holds. The walk logic will then collapse to "always
+        # the mid" which is the safe-fallback behaviour.
+        if not (spread_bid <= spread_mid <= spread_ask):
+            logger.warning(
+                f"[{self.name}] {self.symbol}: inverted spread quote "
+                f"(bid={spread_bid:.2f}, mid={spread_mid:.2f}, ask={spread_ask:.2f}) "
+                f"— clamping to mid"
+            )
+            spread_bid = spread_ask = spread_mid
+
+        code, detail = self._classify_exit(
+            spread,
+            spread_mid=spread_mid,
+            underlying_close=underlying_close,
+            today=today,
+        )
+        return MlegCloseDecision(
+            should_close=(code is not None),
+            reason=code,
+            detail=detail,
+            position_id=spread.position_id,
+            initial_mid=spread_mid,
+            initial_bid=spread_bid,
+            initial_ask=spread_ask,
+        )

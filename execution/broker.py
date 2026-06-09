@@ -50,6 +50,7 @@ from typing import TYPE_CHECKING, Callable
 if TYPE_CHECKING:
     from execution.stream import StreamManager
     from engine.lifecycle import PositionLifecycleStore
+    from execution.mleg_close import MlegCloseScheduler, MlegQuote
 
 from execution.options_executor import (
     OptionsExecutionWorker,
@@ -1489,6 +1490,9 @@ class AlpacaBroker:
         strategy_name: str,
         position_id: str,
         closing: bool = False,
+        close_scheduler: "MlegCloseScheduler | None" = None,
+        quote_provider: "Callable[[], MlegQuote | None] | None" = None,
+        on_walk_step: "Callable[..., None] | None" = None,
     ) -> OrderResult:
         """
         Dispatch an asynchronous MLEG combo via ``SpreadExecutionWorker``
@@ -1575,6 +1579,9 @@ class AlpacaBroker:
             stream_manager=self._stream_manager,
             on_fill=_on_fill,
             entry_allowed=None if closing else self._entry_allowed,
+            close_scheduler=close_scheduler,
+            quote_provider=quote_provider,
+            on_walk_step=on_walk_step,
         )
         worker.start()
         return OrderResult(
