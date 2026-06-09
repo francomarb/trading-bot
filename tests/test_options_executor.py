@@ -524,3 +524,57 @@ class TestSpreadExecutionWorkerWalkAndMarket:
         # 3 walk-step callbacks total (skipped step 1 + limit step 2 + market).
         statuses = [c.kwargs["terminal_status"] for c in on_walk_step.call_args_list]
         assert "skipped" in statuses
+
+    def test_quote_outage_at_market_step_still_submits_market(self):
+        """
+        Regression test for the autonomous-fallback guarantee.
+
+        Even if the quote provider returns None at the moment the walk
+        has advanced to the market step, the worker MUST still submit
+        the market order — that step doesn't need a quote, and skipping
+        it would defeat the entire point of the design (the strongest
+        exit signal becoming the most fragile to network glitches).
+        """
+        api = MagicMock()
+        # Submit accepts both orders.
+        api.submit_order.return_value = _mleg_submitted("combo-final")
+        # First step (limit): REST check during stream gap shows still
+        # working → worker cancels and advances. Second step (market):
+        # stream fires filled.
+        api.get_order_by_id.side_effect = [
+            _mleg_submitted("combo-limit"),       # limit REST-gap check
+            _mleg_filled("combo-market"),         # market fill confirmation
+        ]
+        stream = MagicMock()
+        stream_event = MagicMock()
+        # First step: times out (False). Market step: fills via stream (True).
+        stream_event.wait.side_effect = [False, True]
+        stream.watch.return_value = stream_event
+        on_walk_step = MagicMock()
+
+        # Profile: one limit + market. Quote provider returns valid for
+        # step 1 (limit) then None for the market step.
+        sched = self._scheduler([("mid", 30), ("market", 0)])
+        quotes = [self._quote(), None]
+        idx = {"i": 0}
+        def _provider():
+            i = idx["i"]
+            idx["i"] += 1
+            return quotes[i] if i < len(quotes) else None
+
+        worker = SpreadExecutionWorker(
+            legs=_open_legs(), qty=1, limit_price=3.25,
+            strategy_name="credit_spread", api=api, stream_manager=stream,
+            close_scheduler=sched,
+            quote_provider=_provider,
+            on_walk_step=on_walk_step,
+        )
+        worker.run()
+
+        # Two submits — the limit step plus the market step. The market
+        # step submitted DESPITE quote_provider returning None.
+        assert api.submit_order.call_count == 2
+        # Last step recorded the market submission, not a skip.
+        last_call = on_walk_step.call_args_list[-1].kwargs
+        assert last_call["is_market"] is True
+        assert last_call["terminal_status"] != "skipped"

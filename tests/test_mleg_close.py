@@ -251,6 +251,42 @@ class TestSchedulerIteration:
         step2 = s.next_step(realistic_quote)
         assert step1 == step2
 
+    def test_current_step_is_market_reflects_position(self, stop_loss_profile):
+        # On a profile that ends in market, the property is False until
+        # we advance to the last step.
+        s = MlegCloseScheduler(
+            stop_loss_profile, reason="stop_loss", position_id="p1",
+        )
+        assert s.current_step_is_market is False  # step 1 = mid
+        for _ in range(s.total_steps - 1):
+            s.advance()
+        assert s.current_step_is_market is True   # now at market
+        s.advance()
+        assert s.current_step_is_market is False  # exhausted
+
+    def test_next_step_at_market_does_not_require_quote(self, stop_loss_profile):
+        # The core of the autonomous-fallback guarantee: a quote outage
+        # at the moment the walk reaches market must NOT prevent us
+        # building the market step's request.
+        s = MlegCloseScheduler(
+            stop_loss_profile, reason="stop_loss", position_id="p1",
+        )
+        for _ in range(s.total_steps - 1):
+            s.advance()
+        # No quote argument — must still resolve a valid market step.
+        step = s.next_step()
+        assert step is not None
+        assert step.is_market is True
+
+    def test_next_step_limit_step_requires_quote(self, stop_loss_profile):
+        # The mirror: a limit step demands a quote and raises if not given.
+        s = MlegCloseScheduler(
+            stop_loss_profile, reason="stop_loss", position_id="p1",
+        )
+        assert s.current_step_is_market is False
+        with pytest.raises(ValueError, match="requires a quote"):
+            s.next_step()  # no quote → must raise on limit step
+
     def test_market_step_has_nan_price(self, stop_loss_profile, realistic_quote):
         s = MlegCloseScheduler(
             stop_loss_profile, reason="stop_loss", position_id="p1",

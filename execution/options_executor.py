@@ -642,29 +642,38 @@ class SpreadExecutionWorker(_BaseExecutionWorker):
         terminal_order = None
         try:
             while not scheduler.exhausted:
-                quote = quote_provider()
-                if quote is None:
-                    logger.warning(
-                        f"[{self.name}] walk step {scheduler.current_step_number}: "
-                        f"quote_provider returned None — skipping this step"
-                    )
-                    if self._on_walk_step is not None:
-                        try:
-                            self._on_walk_step(
-                                step_number=scheduler.current_step_number,
-                                total_steps=scheduler.total_steps,
-                                price_expr="(no quote)",
-                                is_market=False,
-                                limit_price=float("nan"),
-                                duration_seconds=0,
-                                terminal_status="skipped",
-                            )
-                        except Exception as exc:
-                            logger.error(
-                                f"[{self.name}] on_walk_step raised: {exc}"
-                            )
-                    scheduler.advance()
-                    continue
+                # Only fetch a quote for limit steps. The market sentinel
+                # doesn't need market data to build its request, and we
+                # must NEVER skip the market step on a quote outage —
+                # that would defeat the autonomous-fallback guarantee
+                # (the strongest exit signal becoming the most fragile to
+                # network conditions, which is exactly backwards).
+                if scheduler.current_step_is_market:
+                    quote = None
+                else:
+                    quote = quote_provider()
+                    if quote is None:
+                        logger.warning(
+                            f"[{self.name}] walk step {scheduler.current_step_number}: "
+                            f"quote_provider returned None — skipping this limit step"
+                        )
+                        if self._on_walk_step is not None:
+                            try:
+                                self._on_walk_step(
+                                    step_number=scheduler.current_step_number,
+                                    total_steps=scheduler.total_steps,
+                                    price_expr="(no quote)",
+                                    is_market=False,
+                                    limit_price=float("nan"),
+                                    duration_seconds=0,
+                                    terminal_status="skipped",
+                                )
+                            except Exception as exc:
+                                logger.error(
+                                    f"[{self.name}] on_walk_step raised: {exc}"
+                                )
+                        scheduler.advance()
+                        continue
 
                 step = scheduler.next_step(quote)
                 if step is None:

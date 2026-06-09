@@ -244,6 +244,70 @@ sqlite3 data/trades.db   # plus a small jq pass over bot.jsonl
   trigger data accumulates and shows what queries we actually need, a
   follow-up adds dedicated columns to `position_lifecycle`.
 
+## Known operational considerations
+
+### Autonomous-fallback guarantee under quote outages
+
+The market step must execute regardless of quote availability. The
+scheduler exposes `current_step_is_market` so the executor can decide
+to fetch a quote (limit step) or skip the fetch entirely (market step).
+A quote outage at the moment the walk reaches market will *not* skip
+the market order — that would defeat the autonomous-exit guarantee
+(the strongest exit signal becoming the most fragile to network
+glitches, which is exactly backwards).
+
+Pinned by `test_quote_outage_at_market_step_still_submits_market` in
+`tests/test_options_executor.py` and the scheduler-side property
+tests in `tests/test_mleg_close.py`.
+
+### Cancel-then-submit race (broker-side)
+
+When a limit step's wait window expires, the executor submits a cancel
+request via `api.cancel_order_by_id(order_id)`, records the step as
+`canceled`, and the walk loop immediately submits the next step's
+order. Because Alpaca processes cancels asynchronously, there is a
+brief window where the prior order is still working at the venue
+while the new order is being placed. If the older (less aggressive)
+order fills at the precise moment the cancel is in-flight AND the new
+order also fills, the position double-closes.
+
+**Likelihood:** Low. The walk escalates *toward* more aggressive prices,
+so the older order is by construction less likely to clear at the
+moment we walk past it. The race window is typically also short —
+Alpaca cancels usually ack within tens to hundreds of milliseconds.
+
+**Mitigation in this PR:** None code-side. Each walk step uses a
+unique `client_order_id` (`spr-{strategy}-walk{NN}-{8-char-uuid}`) so
+any late fill is unambiguously attributable in the trade log, and the
+reconciliation path on the next engine cycle detects the mismatched
+state.
+
+**Mitigation to consider if the race is observed in paper:**
+
+1. **`replace_order` (Alpaca atomic mleg replace).** Alpaca documents
+   mleg orders as cancellable / replaceable *as a whole*. Replacing
+   atomically eliminates the cancel-then-submit window. Verify the
+   alpaca-py SDK exposes this for mleg combos first.
+2. **Block on cancel ack before next submit.** Adds 100–500 ms per
+   step but eliminates the race. Acceptable cost given step durations
+   are 30 seconds.
+3. **Post-cancel REST verification.** Poll `get_order_by_id` until the
+   status is terminal before submitting the next step.
+
+**Detecting the race in paper data:** during the 4–8-week paper
+review, search `bot.jsonl` for fills tagged with a walk-step
+`client_order_id` (prefix `spr-credit_spread-walk`) where the
+corresponding `mleg_walk_step` event logged `terminal_status` as
+`canceled`. A non-zero count is the smoking gun.
+
+### Day-TIF interaction
+
+All Alpaca mleg orders are day-TIF only. A market step submitted
+exactly at session close may not fill. The
+`MLEG_END_OF_SESSION_BYPASS_SECONDS = 210` threshold and the engine's
+`_mleg_should_bypass_walk` together ensure the walk doesn't start a
+walk-then-market sequence too close to the bell.
+
 ## Implementation files
 
 - `utils/safe_expr.py` — price-formula parser (33 unit tests)

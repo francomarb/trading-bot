@@ -267,14 +267,40 @@ class MlegCloseScheduler:
         """True if the profile ends with a market step."""
         return self._compiled[-1][2] if self._compiled else False
 
+    @property
+    def current_step_is_market(self) -> bool:
+        """
+        True iff the *current* step (the one ``next_step`` would resolve) is
+        the market sentinel.
+
+        Lets the executor decide whether to fetch a quote before advancing —
+        market steps don't need market data to build the request. Critical
+        for the autonomous-fallback guarantee: a quote outage at the
+        moment the walk reaches market must NOT cause us to skip the
+        market order. Otherwise the bot's strongest exit signal becomes
+        the most fragile to network conditions — exactly backwards.
+        """
+        if self.exhausted:
+            return False
+        return self._compiled[self._current_step][2]
+
     # ── Iteration ───────────────────────────────────────────────────────
 
-    def next_step(self, quote: MlegQuote) -> MlegCloseStep | None:
+    def next_step(self, quote: "MlegQuote | None" = None) -> MlegCloseStep | None:
         """
-        Resolve and return the current step using ``quote``.
+        Resolve and return the current step.
 
         Returns None if the scheduler is exhausted. Does NOT advance; the
         caller must call ``advance()`` after the step's wait window expires.
+
+        ``quote`` is required for limit steps (the price expression needs
+        ``bid``/``mid``/``ask`` bindings). For market steps it is ignored —
+        callers may pass ``None``. This split lets the walk loop execute
+        the market fallback even when the quote feed is temporarily down,
+        preserving the autonomous-exit guarantee.
+
+        Raises ``ValueError`` if ``quote`` is None and the current step
+        is a limit step.
         """
         if self.exhausted:
             return None
@@ -282,6 +308,11 @@ class MlegCloseScheduler:
         if is_market:
             limit_price = float("nan")
         else:
+            if quote is None:
+                raise ValueError(
+                    f"MlegCloseScheduler: step {self._current_step + 1} "
+                    f"({expr!r}) is a limit step and requires a quote"
+                )
             assert fn is not None  # defensive — compile guarantees this
             limit_price = fn(quote.as_bindings())
         return MlegCloseStep(
