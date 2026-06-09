@@ -359,3 +359,222 @@ class TestSpreadExecutionWorker:
 
         api.cancel_order_by_id.assert_called_once_with("combo-1")
         on_fill.assert_called_once_with("canceled", 0.0, None, "combo-1")
+
+
+# ── Walk-and-market close path (PR: MLEG walk-and-market) ──────────────────
+
+
+class TestSpreadExecutionWorkerWalkAndMarket:
+    """Walk-and-market mode: scheduler-driven multi-step closes.
+
+    The single-shot path is unchanged when no scheduler is supplied;
+    these tests pin the new behaviour when both close_scheduler and
+    quote_provider are set.
+    """
+
+    def _quote(self, mid: float = 4.60, bid: float = 4.12, ask: float = 5.08):
+        from execution.mleg_close import MlegQuote
+        return MlegQuote(mid=mid, bid=bid, ask=ask)
+
+    def _scheduler(self, profile, *, reason="stop_loss", position_id="p1"):
+        from execution.mleg_close import MlegCloseScheduler
+        return MlegCloseScheduler(profile, reason=reason, position_id=position_id)
+
+    def test_construction_requires_both_scheduler_and_provider(self):
+        # Mismatched (one set, one None) is rejected at construction.
+        sched = self._scheduler([("mid", 30), ("market", 0)])
+        with pytest.raises(ValueError, match="both be set or both be None"):
+            SpreadExecutionWorker(
+                legs=_open_legs(), qty=1, limit_price=3.25,
+                strategy_name="credit_spread", api=MagicMock(),
+                close_scheduler=sched, quote_provider=None,
+            )
+
+    def test_walk_mode_property_off_when_no_scheduler(self):
+        worker = SpreadExecutionWorker(
+            legs=_open_legs(), qty=1, limit_price=3.25,
+            strategy_name="credit_spread", api=MagicMock(),
+        )
+        assert worker.walk_and_market_mode is False
+
+    def test_walk_mode_property_on_when_scheduler_supplied(self):
+        sched = self._scheduler([("mid", 30), ("market", 0)])
+        worker = SpreadExecutionWorker(
+            legs=_open_legs(), qty=1, limit_price=3.25,
+            strategy_name="credit_spread", api=MagicMock(),
+            close_scheduler=sched,
+            quote_provider=lambda: self._quote(),
+        )
+        assert worker.walk_and_market_mode is True
+
+    def test_first_step_fills_terminates_walk(self):
+        # Step 1 (mid) fills immediately — no further steps walked.
+        api = MagicMock()
+        api.submit_order.return_value = _mleg_submitted("combo-1")
+        api.get_order_by_id.return_value = _mleg_filled("combo-1")
+        stream = MagicMock()
+        stream_event = MagicMock()
+        stream_event.wait.return_value = True  # filled via stream
+        stream.watch.return_value = stream_event
+        on_fill = MagicMock()
+        on_walk_step = MagicMock()
+
+        sched = self._scheduler([
+            ("mid",                   30),
+            ("mid + 0.25*(ask-mid)",  30),
+            ("market",                 0),
+        ])
+        worker = SpreadExecutionWorker(
+            legs=_open_legs(), qty=1, limit_price=3.25,
+            strategy_name="credit_spread", api=api, stream_manager=stream,
+            on_fill=on_fill,
+            close_scheduler=sched,
+            quote_provider=lambda: self._quote(),
+            on_walk_step=on_walk_step,
+        )
+        worker.run()
+
+        # Only one submit happens — step 1 fills.
+        assert api.submit_order.call_count == 1
+        # Terminal fill reported via outer on_fill exactly once.
+        assert on_fill.call_count == 1
+        terminal_call = on_fill.call_args_list[0]
+        assert terminal_call.args[0] == "filled"
+        # on_walk_step gets one call for step 1.
+        assert on_walk_step.call_count == 1
+        kwargs = on_walk_step.call_args.kwargs
+        assert kwargs["step_number"] == 1
+        assert kwargs["terminal_status"] == "filled"
+        assert kwargs["is_market"] is False
+
+    def test_market_fallback_fires_after_walk_exhausted(self):
+        # All limit steps unfilled → walk advances to market → submits market.
+        api = MagicMock()
+        api.submit_order.return_value = _mleg_submitted("combo-x")
+        api.get_order_by_id.return_value = _mleg_submitted("combo-x")
+        stream = MagicMock()
+        # All steps time out (wait returns False) — except the market step
+        # which we treat as filled.
+        stream_event = MagicMock()
+        stream_event.wait.return_value = False  # times out on every step
+        stream.watch.return_value = stream_event
+        on_fill = MagicMock()
+        on_walk_step = MagicMock()
+
+        # Two limit steps + market.
+        sched = self._scheduler([
+            ("mid",  30),
+            ("ask",  30),
+            ("market", 0),
+        ])
+        worker = SpreadExecutionWorker(
+            legs=_open_legs(), qty=1, limit_price=3.25,
+            strategy_name="credit_spread", api=api, stream_manager=stream,
+            on_fill=on_fill,
+            close_scheduler=sched,
+            quote_provider=lambda: self._quote(),
+            on_walk_step=on_walk_step,
+        )
+        worker.run()
+
+        # Three submits: 2 limits + 1 market.
+        assert api.submit_order.call_count == 3
+        # Three step callbacks recorded.
+        assert on_walk_step.call_count == 3
+        # Last step is the market fallback.
+        last = on_walk_step.call_args_list[-1].kwargs
+        assert last["step_number"] == 3
+        assert last["is_market"] is True
+
+    def test_walk_skips_step_when_quote_provider_returns_none(self):
+        # Quote outages should not crash the walk — they should skip the
+        # step and advance.
+        api = MagicMock()
+        api.submit_order.return_value = _mleg_submitted("combo-y")
+        api.get_order_by_id.return_value = _mleg_submitted("combo-y")
+        stream = MagicMock()
+        stream_event = MagicMock()
+        stream_event.wait.return_value = False
+        stream.watch.return_value = stream_event
+        on_walk_step = MagicMock()
+
+        # Two limit steps then market. Quote provider returns None first call,
+        # quote second call. The market step doesn't need a quote.
+        quotes = [None, self._quote(), self._quote()]
+        provider_calls = {"n": 0}
+        def _provider():
+            i = provider_calls["n"]
+            provider_calls["n"] += 1
+            return quotes[i] if i < len(quotes) else self._quote()
+
+        sched = self._scheduler([
+            ("mid",  30),
+            ("ask",  30),
+            ("market", 0),
+        ])
+        worker = SpreadExecutionWorker(
+            legs=_open_legs(), qty=1, limit_price=3.25,
+            strategy_name="credit_spread", api=api, stream_manager=stream,
+            close_scheduler=sched,
+            quote_provider=_provider,
+            on_walk_step=on_walk_step,
+        )
+        worker.run()
+
+        # 3 walk-step callbacks total (skipped step 1 + limit step 2 + market).
+        statuses = [c.kwargs["terminal_status"] for c in on_walk_step.call_args_list]
+        assert "skipped" in statuses
+
+    def test_quote_outage_at_market_step_still_submits_market(self):
+        """
+        Regression test for the autonomous-fallback guarantee.
+
+        Even if the quote provider returns None at the moment the walk
+        has advanced to the market step, the worker MUST still submit
+        the market order — that step doesn't need a quote, and skipping
+        it would defeat the entire point of the design (the strongest
+        exit signal becoming the most fragile to network glitches).
+        """
+        api = MagicMock()
+        # Submit accepts both orders.
+        api.submit_order.return_value = _mleg_submitted("combo-final")
+        # First step (limit): REST check during stream gap shows still
+        # working → worker cancels and advances. Second step (market):
+        # stream fires filled.
+        api.get_order_by_id.side_effect = [
+            _mleg_submitted("combo-limit"),       # limit REST-gap check
+            _mleg_filled("combo-market"),         # market fill confirmation
+        ]
+        stream = MagicMock()
+        stream_event = MagicMock()
+        # First step: times out (False). Market step: fills via stream (True).
+        stream_event.wait.side_effect = [False, True]
+        stream.watch.return_value = stream_event
+        on_walk_step = MagicMock()
+
+        # Profile: one limit + market. Quote provider returns valid for
+        # step 1 (limit) then None for the market step.
+        sched = self._scheduler([("mid", 30), ("market", 0)])
+        quotes = [self._quote(), None]
+        idx = {"i": 0}
+        def _provider():
+            i = idx["i"]
+            idx["i"] += 1
+            return quotes[i] if i < len(quotes) else None
+
+        worker = SpreadExecutionWorker(
+            legs=_open_legs(), qty=1, limit_price=3.25,
+            strategy_name="credit_spread", api=api, stream_manager=stream,
+            close_scheduler=sched,
+            quote_provider=_provider,
+            on_walk_step=on_walk_step,
+        )
+        worker.run()
+
+        # Two submits — the limit step plus the market step. The market
+        # step submitted DESPITE quote_provider returning None.
+        assert api.submit_order.call_count == 2
+        # Last step recorded the market submission, not a skip.
+        last_call = on_walk_step.call_args_list[-1].kwargs
+        assert last_call["is_market"] is True
+        assert last_call["terminal_status"] != "skipped"

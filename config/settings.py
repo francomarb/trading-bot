@@ -78,6 +78,169 @@ MLEG_ENTRY_WATCH_TIMEOUT_SECONDS: float = float(
     os.getenv("MLEG_ENTRY_WATCH_TIMEOUT_SECONDS", "180")
 )
 
+# ── MLEG close-walk profiles ────────────────────────────────────────────────
+#
+# Generic walk-and-market close logic for ANY multi-leg options strategy.
+# A profile is a list of (price_expression, duration_seconds) tuples. The
+# executor submits a limit at the computed price, waits ``duration``
+# seconds for a fill, then cancels and advances to the next step. The
+# `"market"` price expression is a sentinel — it submits a market order
+# and does not wait (Alpaca fills it).
+#
+# Price expressions are parsed by ``utils.safe_expr`` against the
+# whitelist {"mid", "bid", "ask"}. Compile-time validation runs at
+# settings-load (see the validation loop below) so a typo blows up the
+# bot at startup, not during a stop-loss close.
+#
+# Each MLEG strategy emits an exit-reason code from a fixed taxonomy when
+# it decides to close a position. The engine looks up the matching
+# profile and dispatches to the executor.
+#
+# Resolution order for picking a profile at runtime:
+#   1. Per-instrument override (e.g. CREDIT_SPREAD_INSTRUMENTS["SPY"]["close_profiles"])
+#   2. Per-strategy override (MLEG_CLOSE_PROFILE_OVERRIDES_BY_STRATEGY)
+#   3. Global default (MLEG_CLOSE_PROFILES — this dict)
+#
+# Missing exit-reason keys in any override fall through to the next
+# layer, so partial overrides are supported.
+
+MLEG_CLOSE_REASONS: frozenset[str] = frozenset({
+    "profit_target",       # winner — patient close, never escalate to market
+    "stop_loss",           # loss — urgent close
+    "time_stop",           # DTE-driven — moderately urgent
+    "defensive_breach",    # defensive emergency (e.g. short strike ITM) — fast close
+})
+
+MLEG_CLOSE_PROFILES: dict[str, list[tuple[str, int]]] = {
+    "stop_loss": [
+        ("mid",                   30),
+        ("mid + 0.25*(ask-mid)",  30),
+        ("mid + 0.50*(ask-mid)",  30),
+        ("mid + 0.75*(ask-mid)",  30),
+        ("ask",                   30),
+        ("market",                 0),
+    ],
+    "time_stop": [
+        ("mid",                   30),
+        ("mid + 0.33*(ask-mid)",  30),
+        ("mid + 0.67*(ask-mid)",  30),
+        ("ask",                   30),
+        ("market",                 0),
+    ],
+    "defensive_breach": [
+        ("mid + 0.50*(ask-mid)",  30),
+        ("ask",                   30),
+        ("market",                 0),
+    ],
+    "profit_target": [
+        ("mid",                   30),
+        ("mid + 0.25*(ask-mid)",  30),
+        ("mid + 0.50*(ask-mid)",  30),
+        # No market step — winners cancel cleanly and let the strategy
+        # re-evaluate next cycle. A profit target that can't capture
+        # after 90s of walking probably isn't actually at target anymore.
+    ],
+}
+
+# Per-strategy overrides (partial; missing reasons inherit from MLEG_CLOSE_PROFILES).
+# Empty by default; add entries here when a strategy needs different pacing.
+# Example:
+#   MLEG_CLOSE_PROFILE_OVERRIDES_BY_STRATEGY = {
+#       "iron_condor": {
+#           "stop_loss": [("mid", 45), ("ask", 30), ("market", 0)],
+#       },
+#   }
+MLEG_CLOSE_PROFILE_OVERRIDES_BY_STRATEGY: dict[str, dict[str, list[tuple[str, int]]]] = {}
+
+# End-of-session bypass: if remaining seconds in the regular session is below
+# this threshold when a close decision fires, skip the walk and submit market
+# directly. The default (210s ≈ 3.5 min) covers the longest walk
+# (stop_loss: 5 × 30s = 150s) plus a 60s safety buffer for cancel/replace
+# latency and fill-confirmation roundtrip.
+#
+# Rationale: Alpaca's mleg orders are day-TIF only, so a partial walk active
+# at 15:59 EDT may not get its remaining steps in before session close.
+# Better to take the market fill at 15:56 than to leave the position open
+# overnight without a working stop.
+MLEG_END_OF_SESSION_BYPASS_SECONDS: int = int(
+    os.getenv("MLEG_END_OF_SESSION_BYPASS_SECONDS", "210")
+)
+
+
+def _validate_mleg_close_profile(
+    reason: str,
+    steps: list[tuple[str, int]],
+    *,
+    context: str,
+) -> None:
+    """Validate a single profile at config-load time. Raises on bad config."""
+    from utils.safe_expr import UnsafeExpressionError, compile_price_expression
+
+    if not isinstance(steps, list) or not steps:
+        raise ValueError(
+            f"{context}: profile for reason '{reason}' must be a non-empty list"
+        )
+    saw_market = False
+    for i, step in enumerate(steps):
+        if not isinstance(step, tuple) or len(step) != 2:
+            raise ValueError(
+                f"{context}: profile['{reason}'][{i}] must be a (expr, duration) tuple"
+            )
+        expr, duration = step
+        if not isinstance(expr, str) or not isinstance(duration, int):
+            raise ValueError(
+                f"{context}: profile['{reason}'][{i}] expected (str, int), got "
+                f"({type(expr).__name__}, {type(duration).__name__})"
+            )
+        if duration < 0:
+            raise ValueError(
+                f"{context}: profile['{reason}'][{i}] duration must be non-negative"
+            )
+        if expr == "market":
+            # Sentinel — must be the last step, and the only "market" step.
+            if saw_market:
+                raise ValueError(
+                    f"{context}: profile['{reason}'] has multiple 'market' steps"
+                )
+            if i != len(steps) - 1:
+                raise ValueError(
+                    f"{context}: profile['{reason}'] 'market' step must be last"
+                )
+            saw_market = True
+        else:
+            # All non-sentinel steps must be parseable price expressions.
+            try:
+                compile_price_expression(expr, allowed={"mid", "bid", "ask"})
+            except UnsafeExpressionError as exc:
+                raise ValueError(
+                    f"{context}: profile['{reason}'][{i}] bad expression {expr!r}: {exc}"
+                ) from exc
+
+
+# Validate the global profiles at module import.
+for _reason, _steps in MLEG_CLOSE_PROFILES.items():
+    if _reason not in MLEG_CLOSE_REASONS:
+        raise ValueError(
+            f"MLEG_CLOSE_PROFILES: unknown reason '{_reason}'; "
+            f"must be one of {sorted(MLEG_CLOSE_REASONS)}"
+        )
+    _validate_mleg_close_profile(
+        _reason, _steps, context="MLEG_CLOSE_PROFILES"
+    )
+
+# Validate per-strategy overrides.
+for _strat, _overrides in MLEG_CLOSE_PROFILE_OVERRIDES_BY_STRATEGY.items():
+    for _reason, _steps in _overrides.items():
+        if _reason not in MLEG_CLOSE_REASONS:
+            raise ValueError(
+                f"MLEG_CLOSE_PROFILE_OVERRIDES_BY_STRATEGY['{_strat}']: "
+                f"unknown reason '{_reason}'"
+            )
+        _validate_mleg_close_profile(
+            _reason, _steps,
+            context=f"MLEG_CLOSE_PROFILE_OVERRIDES_BY_STRATEGY['{_strat}']",
+        )
+
 # Strategy-specific watchlists
 # SMA Crossover — trend-following; static list promoted from:
 #   /Users/franco/trading-bot/scripts/sma_watchlist_scan.py --top 30 --feed sip

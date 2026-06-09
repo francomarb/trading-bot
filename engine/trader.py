@@ -79,6 +79,11 @@ from execution.broker import (
     OrderStatus,
 )
 from execution.options_executor import SpreadLeg
+from execution.mleg_close import (
+    MlegCloseScheduler,
+    MlegQuote,
+    resolve_mleg_close_profile,
+)
 from indicators.technicals import add_atr
 from risk.manager import (
     AccountState,
@@ -4965,6 +4970,45 @@ class TradingEngine:
                     f"[{strategy.name}] BEAR sweep failed for {underlying}: {e}"
                 )
 
+    def _mleg_should_bypass_walk(self, *, now: datetime) -> bool:
+        """
+        True iff the time remaining in the regular session is below
+        ``settings.MLEG_END_OF_SESSION_BYPASS_SECONDS``.
+
+        When True, the close-dispatch path substitutes a market-only
+        profile so the position closes autonomously before the bell —
+        Alpaca's mleg orders are day-TIF only, and an unfilled walk
+        active at 15:59 EDT would not get its remaining steps in.
+
+        Outside regular trading hours, returns False — the engine's
+        ``market_hours_only`` config already gates whether the close
+        cycle runs at all.
+        """
+        # NYSE close is 16:00 America/New_York. Use zoneinfo (3.9+).
+        try:
+            from zoneinfo import ZoneInfo
+        except ImportError:  # pragma: no cover — Python <3.9 not supported
+            return False
+        eastern = ZoneInfo("America/New_York")
+        now_et = now.astimezone(eastern)
+        # If outside the session entirely, no bypass (the engine shouldn't
+        # be dispatching closes during the pre/after hours window — but be
+        # defensive).
+        close_today = now_et.replace(
+            hour=16, minute=0, second=0, microsecond=0,
+        )
+        if now_et >= close_today:
+            return False
+        # Only the regular session matters; if it's before 09:30 ET we are
+        # not in a session and the threshold doesn't apply.
+        open_today = now_et.replace(
+            hour=9, minute=30, second=0, microsecond=0,
+        )
+        if now_et < open_today:
+            return False
+        seconds_left = (close_today - now_et).total_seconds()
+        return seconds_left < settings.MLEG_END_OF_SESSION_BYPASS_SECONDS
+
     def _process_credit_spread_exits(
         self,
         *,
@@ -4996,18 +5040,45 @@ class TradingEngine:
             position_id = open_spread.position_id
             if position_id in self._spreads_pending_close:
                 continue
+            # Build the typed close decision. BEAR override produces a
+            # synthetic decision; otherwise the strategy decides.
             if bear_override:
-                should_exit, reason, spread_mid = (
-                    True,
-                    "regime shift to BEAR — defensive override",
-                    None,
-                )
-            else:
+                decision_reason = "defensive_breach"
+                decision_detail = "regime shift to BEAR — defensive override"
+                decision_should_close = True
+                # Quote-less defensive close — the scheduler will be
+                # short-circuited to a market-only profile below.
+                decision_mid = float("nan")
+            elif hasattr(strategy, "evaluate_close"):
                 try:
-                    should_exit, reason, spread_mid = strategy.evaluate_spread_exit(
+                    decision = strategy.evaluate_close(
                         open_spread,
                         underlying_close=underlying_close,
                         today=today,
+                    )
+                except Exception as e:
+                    logger.error(
+                        f"[{strategy.name}] {underlying}: evaluate_close failed "
+                        f"for {position_id[:8]}: {e}"
+                    )
+                    continue
+                decision_reason = decision.reason
+                decision_detail = decision.detail
+                decision_should_close = decision.should_close
+                decision_mid = decision.initial_mid
+            else:
+                # Backward-compat: strategy implements only the legacy
+                # ``evaluate_spread_exit`` shape. Map to the typed reason set
+                # by parsing the legacy detail string. This path is
+                # intentionally lossy and exists only so older test fixtures
+                # / future MLEG strategies that haven't migrated still work.
+                try:
+                    legacy_exit, legacy_reason, legacy_mid = (
+                        strategy.evaluate_spread_exit(
+                            open_spread,
+                            underlying_close=underlying_close,
+                            today=today,
+                        )
                     )
                 except Exception as e:
                     logger.error(
@@ -5015,28 +5086,182 @@ class TradingEngine:
                         f"for {position_id[:8]}: {e}"
                     )
                     continue
-            if not should_exit:
+                decision_should_close = legacy_exit
+                decision_detail = legacy_reason
+                decision_mid = legacy_mid if legacy_mid is not None else float("nan")
+                # Best-effort string → typed mapping.
+                _detail_lc = legacy_reason.lower()
+                if "profit" in _detail_lc:
+                    decision_reason = "profit_target"
+                elif "stop" in _detail_lc:
+                    decision_reason = "stop_loss"
+                elif "time" in _detail_lc:
+                    decision_reason = "time_stop"
+                else:
+                    decision_reason = "defensive_breach"
+
+            if not decision_should_close:
                 continue
 
-            # Close the spread: pass the original opening legs — the broker's
-            # dispatch_spread_order(closing=True) reverses them into the
-            # *_TO_CLOSE trade. limit_price is a positive net debit; use the
-            # current spread mid, falling back to the width (a marketable,
-            # generous debit) when the mid is unavailable.
+            # Resolve the close profile from settings (instrument override
+            # → per-strategy override → global default). The BEAR
+            # short-circuit and the EOS bypass both substitute a
+            # market-only profile to guarantee an autonomous exit.
+            instrument_overrides = None
+            instrument_cfg = getattr(strategy.config, "_instrument_overrides", None) \
+                if hasattr(strategy, "config") else None
+            if isinstance(instrument_cfg, dict):
+                instrument_overrides = instrument_cfg
+            try:
+                resolved_profile = resolve_mleg_close_profile(
+                    reason=decision_reason or "stop_loss",
+                    strategy_name=strategy.name,
+                    instrument_overrides=instrument_overrides,
+                )
+            except KeyError as e:
+                logger.error(
+                    f"[{strategy.name}] {underlying}: profile resolution failed "
+                    f"for {position_id[:8]}: {e} — using market-only fallback"
+                )
+                resolved_profile = [("market", 0)]
+
+            # End-of-session bypass: if there's not enough time left in the
+            # regular session for the full walk + safety buffer, skip the
+            # walk and submit market directly.
+            eos_bypass = self._mleg_should_bypass_walk(now=self._clock())
+            if bear_override or eos_bypass:
+                effective_profile = [("market", 0)]
+            else:
+                effective_profile = list(resolved_profile)
+
+            try:
+                scheduler = MlegCloseScheduler(
+                    effective_profile,
+                    reason=decision_reason or "stop_loss",
+                    position_id=position_id,
+                )
+            except Exception as e:
+                logger.error(
+                    f"[{strategy.name}] {underlying}: scheduler construction "
+                    f"failed for {position_id[:8]}: {e} — falling back to market"
+                )
+                scheduler = MlegCloseScheduler(
+                    [("market", 0)],
+                    reason=decision_reason or "stop_loss",
+                    position_id=position_id,
+                )
+
+            # Quote provider for the walk steps. BEAR override + EOS bypass
+            # use a market-only profile so a quote isn't required, but we
+            # still pass a provider (it returns None safely if needed).
+            if hasattr(strategy, "build_close_quote_provider"):
+                try:
+                    quote_provider = strategy.build_close_quote_provider(open_spread)
+                except Exception as e:
+                    logger.warning(
+                        f"[{strategy.name}] {underlying}: build_close_quote_provider "
+                        f"raised: {e} — using market-only profile"
+                    )
+                    scheduler = MlegCloseScheduler(
+                        [("market", 0)],
+                        reason=decision_reason or "stop_loss",
+                        position_id=position_id,
+                    )
+                    quote_provider = lambda: None  # noqa: E731
+            else:
+                # Strategy doesn't expose a quote provider — degrade to market.
+                scheduler = MlegCloseScheduler(
+                    [("market", 0)],
+                    reason=decision_reason or "stop_loss",
+                    position_id=position_id,
+                )
+                quote_provider = lambda: None  # noqa: E731
+
+            # limit_price is the *initial* submitted hint; the actual prices
+            # used during the walk come from the scheduler. We pass the
+            # decision's initial_mid (or width as fallback) for telemetry
+            # consistency with the existing dispatch contract.
             debit = (
-                round(spread_mid, 2)
-                if spread_mid is not None and spread_mid > 0
+                round(decision_mid, 2)
+                if (decision_mid == decision_mid and decision_mid > 0)  # NaN check
                 else round(open_spread.width, 2)
             )
             legs = [
                 SpreadLeg(occ_symbol=open_spread.short_occ, side=Side.SELL, opening=True),
                 SpreadLeg(occ_symbol=open_spread.long_occ, side=Side.BUY, opening=True),
             ]
+            walk_mode = "market-only" if effective_profile == [("market", 0)] else "walk-and-market"
             logger.info(
                 f"[{strategy.name}] {underlying}: closing spread "
                 f"{open_spread.short_occ}/{open_spread.long_occ} "
-                f"position_id={position_id[:8]} — {reason} (debit ${debit:.2f})"
+                f"position_id={position_id[:8]} — {decision_detail} "
+                f"(reason={decision_reason}, mode={walk_mode}, debit-hint ${debit:.2f})"
             )
+            # FYI-only alert at walk start — operator sees it via Telegram
+            # post-fact; does not block any decisions.
+            try:
+                self.alerts.mleg_close_walk_started(
+                    strategy_name=strategy.name,
+                    underlying=underlying,
+                    position_id=position_id,
+                    reason=decision_reason or "unknown",
+                    mode=walk_mode,
+                    initial_mid=decision_mid,
+                )
+            except Exception:
+                pass  # alert failures must never block the close
+
+            # Closure capturing the close context for per-step telemetry.
+            # Each step the worker executes calls this back with the
+            # resolved price, status, and timings — we log structured
+            # records that future analysis (per the review trigger in
+            # docs/credit_spread_strategy.md) can grep from bot.jsonl.
+            _close_strategy = strategy.name
+            _close_underlying = underlying
+            _close_position_id = position_id
+            _close_reason = decision_reason
+            _alerts = self.alerts
+            def _on_walk_step(
+                *,
+                step_number: int,
+                total_steps: int,
+                price_expr: str,
+                is_market: bool,
+                limit_price: float,
+                duration_seconds: int,
+                terminal_status: str,
+            ) -> None:
+                logger.bind(
+                    event="mleg_walk_step",
+                    strategy=_close_strategy,
+                    underlying=_close_underlying,
+                    position_id=_close_position_id,
+                    reason=_close_reason,
+                    step_number=step_number,
+                    total_steps=total_steps,
+                    price_expr=price_expr,
+                    is_market=is_market,
+                    limit_price=None if is_market else limit_price,
+                    duration_seconds=duration_seconds,
+                    terminal_status=terminal_status,
+                ).info(
+                    f"[{_close_strategy}] {_close_underlying}: walk step "
+                    f"{step_number}/{total_steps} {terminal_status} "
+                    f"(expr={price_expr!r}, market={is_market})"
+                )
+                # FYI alert when we hit the market fallback step.
+                if is_market and terminal_status in ("filled", "rejected"):
+                    try:
+                        _alerts.mleg_close_market_fallback(
+                            strategy_name=_close_strategy,
+                            underlying=_close_underlying,
+                            position_id=_close_position_id,
+                            reason=_close_reason or "unknown",
+                            terminal_status=terminal_status,
+                        )
+                    except Exception:
+                        pass
+
             try:
                 result = self.broker.dispatch_spread_order(
                     legs=legs,
@@ -5045,6 +5270,9 @@ class TradingEngine:
                     strategy_name=strategy.name,
                     position_id=position_id,
                     closing=True,
+                    close_scheduler=scheduler,
+                    quote_provider=quote_provider,
+                    on_walk_step=_on_walk_step,
                 )
             except Exception as e:
                 logger.error(
