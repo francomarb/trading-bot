@@ -734,6 +734,13 @@ class StreamManager:
                 filled_avg_price=(
                     None if avg_price is None else str(avg_price)
                 ),
+                # Slippage unification Phase 1 hotfix — preserve stop_price
+                # on the gap-resync path so a stop fill discovered after
+                # a stream reconnect still benchmarks against the broker's
+                # actual stop trigger. Without this, recovered stop fills
+                # silently write 'unavailable' on the new slippage
+                # taxonomy columns.
+                stop_price=getattr(order, "stop_price", None),
             ),
         )
 
@@ -763,6 +770,15 @@ class StreamManager:
                 symbol=symbol,
                 filled_qty=str(order.get("filled_qty") or 0),
                 filled_avg_price=order.get("filled_avg_price"),
+                # Slippage unification Phase 1 hotfix — stop_price must
+                # round-trip from the Alpaca trade_updates payload so
+                # log_stop_fill can benchmark against the actual broker
+                # stop. Without this, every WebSocket stop fill writes
+                # 'unavailable' on the new slippage taxonomy columns and
+                # the load-bearing design fix dies on the wire.
+                # Evidence on 2026-06-09: QCOM + SMCI WebSocket stop fills
+                # both wrote 'unavailable' instead of 'active_stop_price'.
+                stop_price=order.get("stop_price"),
             ),
         )
 

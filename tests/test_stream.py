@@ -507,6 +507,64 @@ class TestMlegPayloadHandling:
         assert update.leg_symbols == []
         assert update.order.symbol == "AAPL"
 
+    def test_make_update_from_payload_preserves_stop_price(self):
+        """Slippage unification Phase 1 hotfix — the order
+        SimpleNamespace must surface stop_price so log_stop_fill can
+        benchmark against the broker's actual stop trigger. Without
+        this, stop fills silently write 'unavailable' on the new
+        slippage taxonomy columns and the load-bearing design fix
+        dies on the wire. Real-world evidence on 2026-06-09: QCOM
+        and SMCI WebSocket stop fills both wrote 'unavailable'."""
+        data = {
+            "event": "fill",
+            "qty": "10",
+            "price": "144.50",
+            "order": {
+                "id": "stop-1",
+                "client_order_id": None,
+                "symbol": "AAPL",
+                "filled_qty": "10",
+                "filled_avg_price": "144.50",
+                "stop_price": "145.00",
+            },
+        }
+        update = StreamManager._make_update_from_payload(data)
+        assert update.order.stop_price == "145.00"
+
+    def test_make_update_from_payload_missing_stop_price_yields_none(self):
+        """A trade update for a non-stop order (e.g. plain market entry)
+        carries no stop_price field. The reconstructor must surface
+        None rather than raising AttributeError."""
+        data = {
+            "event": "fill",
+            "qty": "10",
+            "price": "100.5",
+            "order": {
+                "id": "ord-1",
+                "client_order_id": None,
+                "symbol": "AAPL",
+                "filled_qty": "10",
+                "filled_avg_price": "100.5",
+            },
+        }
+        update = StreamManager._make_update_from_payload(data)
+        assert update.order.stop_price is None
+
+    def test_make_synthetic_update_preserves_stop_price(self):
+        """Gap-resync path also rebuilds the SimpleNamespace from a
+        broker Order object. Must surface stop_price the same way."""
+        order = SimpleNamespace(
+            id="stop-2",
+            client_order_id=None,
+            symbol="AAPL",
+            filled_qty="10",
+            filled_avg_price="144.50",
+            qty="10",
+            stop_price="145.00",
+        )
+        update = StreamManager._make_synthetic_update(order, "fill")
+        assert update.order.stop_price == "145.00"
+
     def test_make_synthetic_update_handles_mleg_order_object(self):
         order = SimpleNamespace(
             id="combo-2",
