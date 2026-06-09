@@ -5197,6 +5197,71 @@ class TradingEngine:
                 f"position_id={position_id[:8]} — {decision_detail} "
                 f"(reason={decision_reason}, mode={walk_mode}, debit-hint ${debit:.2f})"
             )
+            # FYI-only alert at walk start — operator sees it via Telegram
+            # post-fact; does not block any decisions.
+            try:
+                self.alerts.mleg_close_walk_started(
+                    strategy_name=strategy.name,
+                    underlying=underlying,
+                    position_id=position_id,
+                    reason=decision_reason or "unknown",
+                    mode=walk_mode,
+                    initial_mid=decision_mid,
+                )
+            except Exception:
+                pass  # alert failures must never block the close
+
+            # Closure capturing the close context for per-step telemetry.
+            # Each step the worker executes calls this back with the
+            # resolved price, status, and timings — we log structured
+            # records that future analysis (per the review trigger in
+            # docs/credit_spread_strategy.md) can grep from bot.jsonl.
+            _close_strategy = strategy.name
+            _close_underlying = underlying
+            _close_position_id = position_id
+            _close_reason = decision_reason
+            _alerts = self.alerts
+            def _on_walk_step(
+                *,
+                step_number: int,
+                total_steps: int,
+                price_expr: str,
+                is_market: bool,
+                limit_price: float,
+                duration_seconds: int,
+                terminal_status: str,
+            ) -> None:
+                logger.bind(
+                    event="mleg_walk_step",
+                    strategy=_close_strategy,
+                    underlying=_close_underlying,
+                    position_id=_close_position_id,
+                    reason=_close_reason,
+                    step_number=step_number,
+                    total_steps=total_steps,
+                    price_expr=price_expr,
+                    is_market=is_market,
+                    limit_price=None if is_market else limit_price,
+                    duration_seconds=duration_seconds,
+                    terminal_status=terminal_status,
+                ).info(
+                    f"[{_close_strategy}] {_close_underlying}: walk step "
+                    f"{step_number}/{total_steps} {terminal_status} "
+                    f"(expr={price_expr!r}, market={is_market})"
+                )
+                # FYI alert when we hit the market fallback step.
+                if is_market and terminal_status in ("filled", "rejected"):
+                    try:
+                        _alerts.mleg_close_market_fallback(
+                            strategy_name=_close_strategy,
+                            underlying=_close_underlying,
+                            position_id=_close_position_id,
+                            reason=_close_reason or "unknown",
+                            terminal_status=terminal_status,
+                        )
+                    except Exception:
+                        pass
+
             try:
                 result = self.broker.dispatch_spread_order(
                     legs=legs,
@@ -5207,6 +5272,7 @@ class TradingEngine:
                     closing=True,
                     close_scheduler=scheduler,
                     quote_provider=quote_provider,
+                    on_walk_step=_on_walk_step,
                 )
             except Exception as e:
                 logger.error(

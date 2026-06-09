@@ -66,6 +66,10 @@ class AlertType(Enum):
     BROKER_ERROR = "broker_error"
     BROKER_INFO = "broker_info"
     OPTION_TRAILING_STATE_UNVERIFIED = "option_trailing_state_unverified"
+    # MLEG walk-and-market close events. Both are FYI only — the bot
+    # never blocks on these; the operator sees them post-fact.
+    MLEG_CLOSE_WALK_STARTED = "mleg_close_walk_started"
+    MLEG_CLOSE_MARKET_FALLBACK = "mleg_close_market_fallback"
     ENGINE_HALT = "engine_halt"
     TRADE_EXECUTED = "trade_executed"
     REGIME_SHIFT = "regime_shift"
@@ -445,6 +449,60 @@ class AlertDispatcher:
             alert_type=AlertType.BROKER_INFO,
             severity=AlertSeverity.INFO,
             message=f"broker info: {message}",
+        ))
+
+    def mleg_close_walk_started(
+        self,
+        *,
+        strategy_name: str,
+        underlying: str,
+        position_id: str,
+        reason: str,
+        mode: str,
+        initial_mid: float,
+    ) -> bool:
+        """FYI alert — walk-and-market close kicking off.
+
+        Mode is "walk-and-market" or "market-only" (latter is EOS bypass
+        or BEAR override). initial_mid is the net spread mid at decision
+        time, in $/share. Fires once per close attempt; never blocks.
+        """
+        mid_str = (
+            f"{initial_mid:.2f}"
+            if initial_mid == initial_mid  # NaN check
+            else "n/a"
+        )
+        return self.fire(Alert(
+            alert_type=AlertType.MLEG_CLOSE_WALK_STARTED,
+            severity=AlertSeverity.INFO,
+            message=(
+                f"[{strategy_name}] {underlying} {position_id[:8]}: "
+                f"close started — reason={reason}, mode={mode}, mid=${mid_str}"
+            ),
+        ))
+
+    def mleg_close_market_fallback(
+        self,
+        *,
+        strategy_name: str,
+        underlying: str,
+        position_id: str,
+        reason: str,
+        terminal_status: str,
+    ) -> bool:
+        """FYI alert — walk exhausted, market fallback fired.
+
+        terminal_status is the final outcome of the market step:
+        "filled" or "rejected". Fires at most once per close attempt.
+        """
+        return self.fire(Alert(
+            alert_type=AlertType.MLEG_CLOSE_MARKET_FALLBACK,
+            severity=AlertSeverity.WARNING,
+            message=(
+                f"[{strategy_name}] {underlying} {position_id[:8]}: "
+                f"walk exhausted → market close {terminal_status} "
+                f"(reason={reason})"
+            ),
         ))
 
     def option_trailing_state_unverified(

@@ -127,7 +127,57 @@ lookup. The allocator routes them through a single shared sleeve.
   capped at 3 concurrent and per-expiration entries are throttled.
 - Watch items: (1) per-side fill quality on the two-leg combo, (2)
   realized credit-to-width ratio vs. the 0.13 floor, (3) frequency of
-  short-strike-breach exits in volatile sessions.
+  short-strike-breach exits in volatile sessions, (4) walk-and-market
+  close-fill distribution (see *Close-walk tuning review* below).
+
+### Close path — walk-and-market
+
+The 2026-06-08 PR replaced the single-shot limit-at-mid close with a
+generic walk-and-market scheduler. The strategy now emits a typed
+`MlegCloseDecision` from `evaluate_close()`; the engine resolves a
+profile, applies the EOS bypass, builds an `MlegCloseScheduler`, and
+hands it to `SpreadExecutionWorker`. The worker walks the limit through
+several escalating prices (mid → walk steps → ask), and falls back to
+market as the autonomous final step.
+
+See [`mleg_close_design.md`](mleg_close_design.md) for the full design.
+
+Live mapping of credit-spread triggers → typed reasons:
+
+| Internal trigger | Typed reason | Behaviour |
+|---|---|---|
+| profit-target hit | `profit_target` | 3 walk steps, no market fallback (winners cancel and retry) |
+| stop-loss hit | `stop_loss` | 5 walk steps + market fallback |
+| time-stop (DTE ≤ `time_stop_dte`) | `time_stop` | 4 walk steps + market fallback |
+| short-strike breach | `defensive_breach` | 2 walk steps + market fallback (defensive) |
+| BEAR regime override | `defensive_breach` | Market-only (no walk) |
+
+### Close-walk tuning review
+
+After ~10–20 paper closes accumulate (4–8 weeks of live paper running),
+review the walk-step fill distribution. The data lives in
+`logs/bot.jsonl` as structured `mleg_walk_step` events; grep them out
+with:
+
+```bash
+jq -c 'select(.record.extra.event == "mleg_walk_step")' \
+    logs/bot.jsonl
+```
+
+Decision matrix:
+
+| Pattern | Verdict |
+|---|---|
+| >60% fills at the market step | Walk isn't catching fills — tune more aggressive starting point |
+| >60% fills at step 1 (mid) | Walk over-engineered for this universe — consider simplifying |
+| Steps 2–4 capture most fills | Walking is doing what it should — leave alone |
+| Avg fill price within $0.05 of starting ask | Walk isn't generating meaningful value |
+| Avg fill price meaningfully below starting ask | Walk is paying for itself |
+
+The defaults shipped in `settings.MLEG_CLOSE_PROFILES` are 30-second
+steps with 4–5 patient escalations before market. Tuned for residential
+network latency and the actual Alpaca paper-API roundtrip, not low-
+latency colocated rails.
 
 ### Known doc gaps vs. live implementation
 
