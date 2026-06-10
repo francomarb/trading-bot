@@ -153,6 +153,32 @@ class TestSectorMomentumGaugeScoring:
         # Strong uptrend → close well above SMA50
         assert detail.dist_sma50_pct > 0
 
+    def test_score_smoothing(self):
+        # Create a series of bars where price suddenly drops below SMA50 on the last day
+        # Raw scores for the last 3 days would be +3, +3, -3
+        # Smoothed score (3 days) should be 1.0 (NEUTRAL)
+        # Smoothed score (1 day) should be -3.0 (COLD)
+        df = _make_etf_bars(n=250, base_price=100.0, trend=0.0)
+        
+        # Override the last 3 closes to create a sudden drop
+        close = df["close"].copy()
+        close.iloc[-3] = 110.0 # Well above SMA50/SMA200 (SMA will be ~100)
+        close.iloc[-2] = 110.0 # Well above
+        close.iloc[-1] = 80.0  # Sharp drop below both SMAs
+        df["close"] = close
+
+        # No smoothing (smooth_window=1) -> should see the sudden drop (-3.0 / COLD)
+        gauge_raw = SectorMomentumGauge(sector_etfs=SECTOR_ETFS, smooth_window=1)
+        detail_raw = gauge_raw._compute("semiconductors", "SMH", df)
+        assert detail_raw.score <= -2.0
+        assert detail_raw.classification == SectorMomentum.COLD
+
+        # 3-day smoothing -> should smooth out the sudden drop to NEUTRAL
+        gauge_smoothed = SectorMomentumGauge(sector_etfs=SECTOR_ETFS, smooth_window=3)
+        detail_smoothed = gauge_smoothed._compute("semiconductors", "SMH", df)
+        assert detail_smoothed.score > -2.0
+        assert detail_smoothed.classification == SectorMomentum.NEUTRAL
+
 
 class TestSectorMomentumGaugeCaching:
     def test_classify_uses_score_cache(self):

@@ -43,7 +43,7 @@ class SectorScoreDetail:
 
     sector: str
     etf_ticker: str
-    score: int
+    score: float
     classification: SectorMomentum
     above_sma200: bool
     above_sma50: bool
@@ -53,7 +53,7 @@ class SectorScoreDetail:
     last_close: float | None
 
 
-# ── Thresholds ────────────��──────────────────────────────────────────────────
+# ── Thresholds ───────────────────────────────────────────────────────────────
 
 _HOT_THRESHOLD = 3
 _COLD_THRESHOLD = -2
@@ -75,6 +75,9 @@ class SectorMomentumGauge:
     lookback_days
         Calendar days of ETF history to fetch (default 300, covers 200
         trading days with buffer for weekends/holidays).
+    smooth_window
+        Optional smoothing window size (in days). If not specified, falls back
+        to ``config.settings.SECTOR_MOMENTUM_SMOOTH_WINDOW`` (default 5).
     """
 
     def __init__(
@@ -82,10 +85,20 @@ class SectorMomentumGauge:
         sector_etfs: dict[str, str],
         cache_ttl_seconds: float = 600.0,
         lookback_days: int = 300,
+        smooth_window: int | None = None,
     ) -> None:
         self._sector_etfs = dict(sector_etfs)
         self._cache_ttl = cache_ttl_seconds
         self._lookback_days = lookback_days
+
+        if smooth_window is None:
+            try:
+                from config import settings
+                smooth_window = getattr(settings, "SECTOR_MOMENTUM_SMOOTH_WINDOW", 5)
+            except Exception:
+                smooth_window = 5
+        self._smooth_window = smooth_window
+
         self._etf_cache: dict[str, tuple[pd.DataFrame, float]] = {}
         self._score_cache: dict[str, tuple[SectorScoreDetail, float]] = {}
 
@@ -100,7 +113,7 @@ class SectorMomentumGauge:
         """Batch classify all configured sectors."""
         return {s: self.classify(s) for s in self._sector_etfs}
 
-    def get_score(self, sector: str) -> int:
+    def get_score(self, sector: str) -> float:
         """Raw numeric score for strategies that want granularity."""
         return self.get_details(sector).score
 
@@ -116,7 +129,7 @@ class SectorMomentumGauge:
             detail = SectorScoreDetail(
                 sector=sector,
                 etf_ticker="N/A",
-                score=0,
+                score=0.0,
                 classification=SectorMomentum.NEUTRAL,
                 above_sma200=False,
                 above_sma50=False,
@@ -133,7 +146,7 @@ class SectorMomentumGauge:
         self._score_cache[sector] = (detail, now)
         return detail
 
-    # ── Data fetching ───────────────��────────────────────────────────────
+    # ── Data fetching ────────────────────────────────────────────────────
 
     def _fetch_etf(self, ticker: str) -> pd.DataFrame | None:
         """Fetch ETF bars, reusing cache within TTL."""
@@ -173,7 +186,7 @@ class SectorMomentumGauge:
             self._etf_cache[ticker] = (pd.DataFrame(), now)
             return None
 
-    # ── Scoring ──────────────��───────────────────────────────────────────
+    # ── Scoring ──────────────────────────────────────────────────────────
 
     def _compute(
         self, sector: str, etf_ticker: str, df: pd.DataFrame | None
@@ -183,7 +196,7 @@ class SectorMomentumGauge:
             return SectorScoreDetail(
                 sector=sector,
                 etf_ticker=etf_ticker,
-                score=0,
+                score=0.0,
                 classification=SectorMomentum.NEUTRAL,
                 above_sma200=False,
                 above_sma50=False,
@@ -196,37 +209,61 @@ class SectorMomentumGauge:
         df = add_sma(df, 200)
         df = add_sma(df, 50)
 
-        last = df.iloc[-1]
-        close = float(last["close"])
-        sma200 = float(last["sma_200"])
-        sma50 = float(last["sma_50"])
+        # Vectorized calculation of component signals for the entire series
+        close = df["close"].astype(float)
+        sma200 = df["sma_200"].astype(float)
+        sma50 = df["sma_50"].astype(float)
 
-        above_sma200 = close > sma200
-        above_sma50 = close > sma50
-        golden_cross = sma50 > sma200
-        dist_sma50_pct = (close - sma50) / sma50 if sma50 != 0 else 0.0
+        above_sma200_series = close > sma200
+        above_sma50_series = close > sma50
+        golden_cross_series = sma50 > sma200
+        dist_sma50_pct_series = (close - sma50) / sma50 if not (sma50 == 0).all() else pd.Series(0.0, index=df.index)
 
-        vol_confirm = False
+        vol_confirm_series = pd.Series(False, index=df.index)
         if "volume" in df.columns:
             vol = df["volume"].astype(float)
-            vol_10d = vol.iloc[-10:].mean() if len(vol) >= 10 else 0.0
-            vol_20d = vol.iloc[-20:].mean() if len(vol) >= 20 else 0.0
-            vol_confirm = vol_10d > vol_20d and vol_20d > 0
+            vol_10d = vol.rolling(10).mean()
+            vol_20d = vol.rolling(20).mean()
+            vol_confirm_series = (vol_10d > vol_20d) & (vol_20d > 0)
 
-        score = 0
-        score += 1 if above_sma200 else -1
-        score += 1 if above_sma50 else -1
-        score += 1 if golden_cross else -1
-        if dist_sma50_pct > _DIST_SMA50_HOT_PCT:
-            score += 1
-        elif dist_sma50_pct < _DIST_SMA50_COLD_PCT:
-            score -= 1
-        if vol_confirm:
-            score += 1
+        # Build raw daily scores
+        raw_scores = (
+            above_sma200_series.astype(int) * 2 - 1 +
+            above_sma50_series.astype(int) * 2 - 1 +
+            golden_cross_series.astype(int) * 2 - 1
+        )
 
-        if score >= _HOT_THRESHOLD:
+        dist_bonus = (dist_sma50_pct_series > _DIST_SMA50_HOT_PCT).astype(int)
+        dist_penalty = (dist_sma50_pct_series < _DIST_SMA50_COLD_PCT).astype(int)
+        raw_scores += dist_bonus - dist_penalty
+        raw_scores += vol_confirm_series.astype(int)
+
+        # Set scores to NaN where SMAs are not yet calculated
+        nan_mask = df["sma_200"].isna() | df["sma_50"].isna()
+        raw_scores[nan_mask] = float("nan")
+
+        # Apply rolling mean smoothing
+        if self._smooth_window > 1:
+            smoothed_scores = raw_scores.rolling(window=self._smooth_window).mean()
+        else:
+            smoothed_scores = raw_scores
+
+        # Extract last values for the output detail
+        last_score = float(smoothed_scores.iloc[-1]) if pd.notna(smoothed_scores.iloc[-1]) else 0.0
+        # Round the score to 1 decimal place for readability
+        last_score = round(last_score, 1)
+
+        # The individual flags should represent the raw last day's status
+        above_sma200 = bool(above_sma200_series.iloc[-1])
+        above_sma50 = bool(above_sma50_series.iloc[-1])
+        golden_cross = bool(golden_cross_series.iloc[-1])
+        dist_sma50_pct = float(dist_sma50_pct_series.iloc[-1])
+        vol_confirm = bool(vol_confirm_series.iloc[-1])
+        last_close = float(close.iloc[-1])
+
+        if last_score >= _HOT_THRESHOLD:
             classification = SectorMomentum.HOT
-        elif score <= _COLD_THRESHOLD:
+        elif last_score <= _COLD_THRESHOLD:
             classification = SectorMomentum.COLD
         else:
             classification = SectorMomentum.NEUTRAL
@@ -234,12 +271,12 @@ class SectorMomentumGauge:
         return SectorScoreDetail(
             sector=sector,
             etf_ticker=etf_ticker,
-            score=score,
+            score=last_score,
             classification=classification,
             above_sma200=above_sma200,
             above_sma50=above_sma50,
             golden_cross=golden_cross,
             dist_sma50_pct=dist_sma50_pct,
             vol_confirm=vol_confirm,
-            last_close=close,
+            last_close=last_close,
         )
