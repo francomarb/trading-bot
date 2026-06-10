@@ -401,6 +401,89 @@ class TestTradeLogger:
             "trade_count": 0.0, "seen_position_uids": [],
         }
 
+    def test_partial_close_row_alone_does_not_increment_trade_count(self, tmp_csv):
+        """PR #56 R3: a partial-close row whose position has not yet
+        been fully closed must NOT count as a completed round trip
+        during restart restoration. The reviewer's bug scenario:
+
+          - Strategy at N=floor-1 (catastrophic tier).
+          - Position opens, partially closes → row with status='partial',
+            position_uid='X', realized_pnl=partial-P&L.
+          - Bot restarts. Restart reads the partial row.
+          - Before the fix: trade_count was prematurely incremented at
+            restart, flipping the gate to normal tier while the residual
+            was still open.
+          - After the fix: trade_count only advances when the eventual
+            status='filled' row is written.
+
+        Live and restart must use the same definition of "completed
+        round trip" — matching the live allocator's is_full_close=True
+        gating.
+        """
+        tl = TradeLogger(path=tmp_csv)
+
+        def _close_row(*, status: str, uid: str | None, pnl: float, i: int) -> TradeRecord:
+            return TradeRecord(
+                timestamp=f"2026-04-22T10:0{i}:00+00:00",
+                symbol=f"SYM{i}",
+                side="sell",
+                qty=1, avg_fill_price=100.0,
+                order_id=f"close-{i}",
+                strategy="sma_crossover",
+                reason="exit signal",
+                stop_price=0.0, entry_reference_price=100.0,
+                modeled_slippage_bps=0.0, realized_slippage_bps=0.0,
+                order_type="market", status=status,
+                requested_qty=1, filled_qty=1,
+                initial_stop_loss=95.0, initial_risk_per_share=5.0,
+                initial_risk_dollars=5.0,
+                realized_pnl=pnl, r_multiple=None,
+                entry_timestamp="2026-04-21T10:00:00+00:00",
+                exit_timestamp=f"2026-04-22T10:0{i}:00+00:00",
+                position_uid=uid,
+            )
+
+        # Step 1: a partial-close row exists, residual still open.
+        tl.log(_close_row(status="partial", uid="pos-mid-trade", pnl=-50.0, i=0))
+        summary = tl.read_strategy_realized_pnl_summary(["sma_crossover"])
+        # P&L from the partial IS counted — dollar math is honest.
+        assert summary["sma_crossover"]["realized_pnl"] == pytest.approx(-50.0)
+        # But trade_count is NOT incremented — round trip incomplete.
+        assert summary["sma_crossover"]["trade_count"] == 0
+        # And the UID is NOT marked as seen, so when the full close
+        # arrives later it will correctly count once.
+        assert summary["sma_crossover"]["seen_position_uids"] == []
+
+        # Step 2: the residual eventually fully closes.
+        tl.log(_close_row(status="filled", uid="pos-mid-trade", pnl=-25.0, i=1))
+        summary = tl.read_strategy_realized_pnl_summary(["sma_crossover"])
+        # Cumulative P&L = -50 + -25 = -75 (both events contribute).
+        assert summary["sma_crossover"]["realized_pnl"] == pytest.approx(-75.0)
+        # NOW trade_count increments to 1 (one completed round trip).
+        assert summary["sma_crossover"]["trade_count"] == 1
+        assert summary["sma_crossover"]["seen_position_uids"] == ["pos-mid-trade"]
+
+    def test_partial_only_with_legacy_uid_also_excluded(self, tmp_csv):
+        """The status='filled' gate applies even to legacy rows without
+        a position_uid. A partial row with no UID still contributes to
+        P&L but does not increment trade_count."""
+        tl = TradeLogger(path=tmp_csv)
+        tl.log(TradeRecord(
+            timestamp="2026-04-22T10:00:00+00:00",
+            symbol="X", side="sell", qty=1, avg_fill_price=100.0,
+            order_id="c-0", strategy="sma_crossover",
+            reason="exit signal",
+            stop_price=0.0, entry_reference_price=100.0,
+            modeled_slippage_bps=0.0, realized_slippage_bps=0.0,
+            order_type="market", status="partial",
+            requested_qty=1, filled_qty=1,
+            realized_pnl=-100.0,
+            position_uid=None,  # legacy
+        ))
+        summary = tl.read_strategy_realized_pnl_summary(["sma_crossover"])
+        assert summary["sma_crossover"]["realized_pnl"] == pytest.approx(-100.0)
+        assert summary["sma_crossover"]["trade_count"] == 0
+
     def test_close_records_with_position_uid_dedup_on_restart(self, tmp_csv):
         """PR #56 R2: when close rows have position_uid (the live path
         after the logger fix), restart reconstruction must count

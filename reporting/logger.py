@@ -1456,17 +1456,24 @@ class TradeLogger:
 
         Contributing rows: single-leg sell-side closes, plus credit-spread
         rows (``position_type='spread'``) — both with a non-null
-        ``realized_pnl``. The HWM is the running maximum of cumulative
-        realized P&L in append order.
+        ``realized_pnl`` and status in {filled, partial}. The HWM is the
+        running maximum of cumulative realized P&L in append order.
 
         **trade_count counts completed round trips, not contributing rows.**
-        Two partial-close events for the same position_uid count once.
-        Rows without a position_uid (legacy data, or non-lifecycle paths)
-        each count as one trade — there's no identifier to deduplicate
-        against. ``seen_position_uids`` is the deduplication set returned
-        as a sorted list so the allocator can restore the same dedup
-        state on restart (and a future partial close of a pre-restart
-        position correctly does NOT increment the count again).
+        A row's contribution to trade_count is gated by ``status='filled'``
+        — partial-close rows update P&L and HWM (dollar math is honest)
+        but do NOT increment the completed-trades counter. This matches
+        the live allocator's ``is_full_close=True`` gating, so a bot
+        restart in the middle of a partial-close-then-residual sequence
+        sees the same trade_count the live engine would have seen at
+        that moment (PR #56 R3).
+
+        Two ``status='filled'`` events for the same position_uid count
+        once. Rows without a position_uid (legacy data) each count as
+        one trade — there's no identifier to deduplicate against.
+        ``seen_position_uids`` is the deduplication set returned as a
+        sorted list so the allocator can restore the same dedup state
+        on restart.
         """
         include = set(strategies or [])
         summary: dict[str, dict] = {
@@ -1495,10 +1502,11 @@ class TradeLogger:
         # close) — so also accept position_type='spread' rows. The
         # `realized_pnl IS NOT NULL` filter prevents double-counting: spread
         # opens and the long-leg close row all carry NULL realized_pnl.
-        # We also pull position_uid so trade_count counts distinct
-        # round trips, not P&L rows.
+        # status='partial' rows ARE included so their P&L contributes,
+        # but they do NOT increment trade_count (that gate lives in
+        # the loop body below).
         cursor = conn.execute(
-            "SELECT strategy, realized_pnl, position_uid "
+            "SELECT strategy, realized_pnl, position_uid, status "
             "FROM trades "
             "WHERE (side = 'sell' OR position_type = 'spread') "
             "AND status IN ('filled', 'partial') "
@@ -1516,20 +1524,28 @@ class TradeLogger:
                     "trade_count": 0.0,
                     "seen_position_uids": set(),
                 }
+            # Realized P&L and HWM include ALL fill events (filled +
+            # partial). The dollar math is honest about every contribution.
             running = summary[strategy]["realized_pnl"] + float(row["realized_pnl"])
             summary[strategy]["realized_pnl"] = running
+            if running > summary[strategy]["hwm"]:
+                summary[strategy]["hwm"] = running
+
+            # trade_count and seen_position_uids only update on FULL
+            # closes. Partial-close rows update P&L (above) but do NOT
+            # mark a position as completed — matching the live
+            # allocator's is_full_close=True gating (PR #56 R3).
+            if row["status"] != "filled":
+                continue
             position_uid = row["position_uid"] if "position_uid" in row.keys() else None
-            # Increment trade_count only for new positions. Rows without
-            # a position_uid (legacy data, non-lifecycle paths) each
-            # count as one — no identifier to deduplicate against.
             if position_uid:
                 if position_uid not in summary[strategy]["seen_position_uids"]:
                     summary[strategy]["seen_position_uids"].add(position_uid)
                     summary[strategy]["trade_count"] += 1
             else:
+                # Legacy path — no identifier to dedup against; each
+                # filled row counts.
                 summary[strategy]["trade_count"] += 1
-            if running > summary[strategy]["hwm"]:
-                summary[strategy]["hwm"] = running
         # Convert sets to sorted lists for stable return values (callers
         # convert back to sets if needed).
         for s in summary.values():
