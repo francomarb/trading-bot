@@ -4943,6 +4943,17 @@ class TradingEngine:
                 # that case leave realized P&L unset (not zero) and warn.
                 realized_pnl: float | None = None
                 exit_reason = "spread exit"
+                # PR #56 R1+R2+R4: determine full/partial close status ONCE,
+                # outside both the price-availability branches AND the
+                # allocator/log paths, so a single value drives the trade-log
+                # row's status column and the allocator's is_full_close. Only
+                # depends on released and close_qty — independent of whether
+                # the fill price was available. Spreads are treated as fully
+                # closed when the close fill quantity matches the open qty.
+                full_close = (
+                    released is not None
+                    and close_qty >= released.qty
+                )
                 if avg_fill_price is None:
                     net_debit = 0.0
                     exit_reason = "spread exit (fill price unavailable)"
@@ -4963,20 +4974,6 @@ class TradingEngine:
                             (released.net_credit - net_debit) * close_qty * 100.0
                         )
                         if self._allocator is not None:
-                            # PR #56 R1+R2: pass position_uid (== position_id
-                            # for spreads) so partial / repeated closes don't
-                            # double-count in the allocator's trade tally,
-                            # and pass is_full_close so a partial fill
-                            # doesn't prematurely promote the strategy past
-                            # its min-trades floor. Spreads are treated as
-                            # fully closed when the close fill quantity
-                            # matches the open qty; partial fills happen
-                            # rarely on combo orders but we honour them
-                            # for consistency with single-leg semantics.
-                            full_close = (
-                                released is not None
-                                and close_qty >= released.qty
-                            )
                             self._allocator.record_realized_pnl(
                                 strategy_name, realized_pnl,
                                 position_uid=position_id,
@@ -5001,6 +4998,12 @@ class TradingEngine:
                     )
                     if spread_max_loss > 0:
                         close_risk_dollars = spread_max_loss * close_qty
+                # PR #56 R4: pass is_full_close so the trade-log row's
+                # status column matches what the live allocator saw
+                # (full_close computed above against released.qty).
+                # Without this, restart restoration via R3's
+                # status='filled' gate would mis-count a partial close
+                # as a completed round trip.
                 self.trade_logger.log_spread_fill(
                     position_id=position_id,
                     strategy=strategy_name,
@@ -5012,6 +5015,7 @@ class TradingEngine:
                     opening=False,
                     realized_pnl=realized_pnl,
                     reason=exit_reason,
+                    is_full_close=full_close,
                     submitted_limit_price=submitted_limit_price,
                     initial_risk_dollars=close_risk_dollars,
                 )

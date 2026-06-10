@@ -956,6 +956,91 @@ class TestSpreadLogging:
         assert by_symbol[self._SHORT]["side"] == "buy"   # bought back to close
         assert by_symbol[self._LONG]["side"] == "sell"   # long leg sold
 
+    def test_open_writes_status_filled(self, tmp_csv):
+        """Spread opens are atomic — always written as status='filled'.
+
+        The is_full_close parameter doesn't apply to opens; the logger
+        treats opening=True as always-full regardless.
+        """
+        tl = TradeLogger(path=tmp_csv)
+        # Even with is_full_close=False, opens are still 'filled'.
+        tl.log_spread_fill(
+            position_id="uuid-1", strategy="credit_spread",
+            short_occ=self._SHORT, long_occ=self._LONG,
+            qty=1, net_price=2.54, opening=True,
+            is_full_close=False,
+        )
+        rows = tl.read_all()
+        assert all(r["status"] == "filled" for r in rows)
+
+    def test_partial_close_writes_status_partial(self, tmp_csv):
+        """PR #56 R4: a partial close (is_full_close=False) writes
+        status='partial' so restart restoration via the R3 filter
+        correctly does NOT count it as a completed round trip."""
+        tl = TradeLogger(path=tmp_csv)
+        tl.log_spread_fill(
+            position_id="uuid-1", strategy="credit_spread",
+            short_occ=self._SHORT, long_occ=self._LONG,
+            qty=1, net_price=2.54, order_id="combo-open", opening=True,
+        )
+        tl.log_spread_fill(
+            position_id="uuid-1", strategy="credit_spread",
+            short_occ=self._SHORT, long_occ=self._LONG,
+            qty=1, net_price=1.10, order_id="combo-partial", opening=False,
+            realized_pnl=-150.0,
+            is_full_close=False,
+        )
+        rows = tl.read_all()
+        # Open rows are 'filled' (atomic). Close rows are 'partial'.
+        statuses = {(r["side"], r["status"]) for r in rows[2:]}  # close rows
+        assert statuses == {("buy", "partial"), ("sell", "partial")}
+
+    def test_partial_spread_close_does_not_inflate_restart_trade_count(self, tmp_csv):
+        """Full end-to-end R4 invariant: a partial spread close logged
+        via log_spread_fill must NOT count as a completed round trip
+        when the trade log is replayed at restart. Matches the live
+        allocator's is_full_close=False semantic.
+
+        This is the smoking-gun integration test for the R4 fix:
+        before R4, partial spread closes silently wrote status='filled'
+        and restart would mis-count them.
+        """
+        tl = TradeLogger(path=tmp_csv)
+        # Open the spread.
+        tl.log_spread_fill(
+            position_id="uuid-X", strategy="credit_spread",
+            short_occ=self._SHORT, long_occ=self._LONG,
+            qty=2, net_price=2.50, opening=True,
+        )
+        # Partial close — half the contracts.
+        tl.log_spread_fill(
+            position_id="uuid-X", strategy="credit_spread",
+            short_occ=self._SHORT, long_occ=self._LONG,
+            qty=1, net_price=1.20, opening=False,
+            realized_pnl=-130.0,
+            is_full_close=False,
+        )
+        # Restart: read back the summary.
+        summary = tl.read_strategy_realized_pnl_summary(["credit_spread"])
+        # P&L of the partial IS counted (dollar math is honest).
+        assert summary["credit_spread"]["realized_pnl"] == pytest.approx(-130.0)
+        # But trade_count is NOT incremented — round trip incomplete.
+        assert summary["credit_spread"]["trade_count"] == 0
+        assert summary["credit_spread"]["seen_position_uids"] == []
+
+        # The residual eventually fully closes — NOW the round trip counts.
+        tl.log_spread_fill(
+            position_id="uuid-X", strategy="credit_spread",
+            short_occ=self._SHORT, long_occ=self._LONG,
+            qty=1, net_price=1.10, opening=False,
+            realized_pnl=-120.0,
+            is_full_close=True,
+        )
+        summary = tl.read_strategy_realized_pnl_summary(["credit_spread"])
+        assert summary["credit_spread"]["realized_pnl"] == pytest.approx(-250.0)
+        assert summary["credit_spread"]["trade_count"] == 1
+        assert summary["credit_spread"]["seen_position_uids"] == ["uuid-X"]
+
     def test_spread_legs_excluded_from_single_leg_owner_views(self, tmp_csv):
         tl = TradeLogger(path=tmp_csv)
         tl.log_spread_fill(

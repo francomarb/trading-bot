@@ -927,6 +927,7 @@ class TradeLogger:
         submitted_limit_price: float | None = None,
         realized_slippage_bps: float | None = None,
         initial_risk_dollars: float | None = None,
+        is_full_close: bool = True,
     ) -> None:
         """
         Write trade-log rows for a multi-leg (MLEG) credit-spread fill (11.29).
@@ -998,6 +999,15 @@ class TradeLogger:
                 position_id=position_id,
             )
 
+        # PR #56 R4: the row's `status` column must reflect whether the
+        # event was a partial or full close, so restart restoration via
+        # read_strategy_realized_pnl_summary can apply the same
+        # is_full_close gate the live allocator applies. Opens are
+        # atomic (MLEG combo orders fill or reject as a whole, per
+        # Alpaca semantics) and always written as 'filled'. Closes use
+        # the engine-supplied flag.
+        row_status = "filled" if (opening or is_full_close) else "partial"
+
         basis = (
             float(initial_risk_dollars)
             if initial_risk_dollars is not None
@@ -1066,7 +1076,7 @@ class TradeLogger:
                 modeled_slippage_bps=0.0,
                 realized_slippage_bps=slippage_bps,
                 order_type="mleg",
-                status="filled",
+                status=row_status,
                 requested_qty=qty,
                 filled_qty=qty,
                 initial_stop_loss=None,
@@ -1078,6 +1088,12 @@ class TradeLogger:
                 exit_timestamp=None if opening else now_iso,
                 position_id=position_id,
                 position_type="spread",
+                # PR #56 R4: persist position_uid so restart restoration
+                # via read_strategy_realized_pnl_summary's dedup set
+                # matches the live allocator's (which receives
+                # position_uid=position_id for spreads — see the
+                # credit-spread close path in engine/trader.py).
+                position_uid=position_id,
                 slippage_benchmark_price=new_benchmark_price,
                 slippage_benchmark_kind=new_benchmark_kind,
                 slippage_benchmark_timestamp=now_iso if new_benchmark_price is not None else None,
