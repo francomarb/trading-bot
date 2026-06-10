@@ -5,6 +5,20 @@
 
 ---
 
+## Reading order — non-negotiable
+
+**Before generating any code, read [PLAN.md](PLAN.md).** Not "skim it" — read the sections relevant to where the work is going to land.
+
+The reason: this codebase has several phased rollouts in flight simultaneously (`position_uid` lifecycle, slippage unification, strategy health monitor, MLEG close walk-and-market, etc.). A field, column, or invariant being present in one code path does NOT mean it's wired through every code path — the design docs explicitly defer parts to later phases.
+
+If your change depends on any of these moving pieces, **follow the links from PLAN.md to the corresponding `docs/*.md` design doc** and check which phase the relevant field/invariant is currently in. Then verify the assumption against the actual code (`grep` for the field, read the call sites).
+
+**Lesson from the PR #56 audit (2026-06-10):** four reviewer rounds caught bugs that all traced back to one root cause — building on top of `position_uid` as if it were fully wired when in fact only Phase A (equity entries → Operator CLI) was deployed. Close paths, options paths, and restart reconstruction were all explicitly deferred. Reading the Phase A commit's scope note would have caught all four in the original implementation.
+
+When in doubt: check PLAN.md → follow the link → verify in code. Trust the design docs to be honest about what's deployed; do not trust your assumptions about "this field is obviously there everywhere."
+
+---
+
 ## Project Overview
 
 A Python-based algorithmic trading bot built incrementally, starting with paper trading and progressing toward live trading. The bot is designed to be modular, testable, and strategy-agnostic.
