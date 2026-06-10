@@ -634,6 +634,7 @@ class TradeLogger:
         measurement_quality: SlippageMeasurementQuality | None = None,
         timestamp_override: datetime | None = None,
         reason: str = "exit signal",
+        position_uid: str | None = None,
     ) -> TradeRecord:
         """
         Build a TradeRecord for a position close (exit). Closes don't have
@@ -783,6 +784,11 @@ class TradeLogger:
             exit_timestamp=now_iso,
             position_id=owner_key_for(result.symbol),
             position_type="single_leg",
+            # PR #56 R1: persist position_uid so restart reconstruction
+            # of the allocator's trade-count dedup state matches live
+            # behavior. Caller passes None on legacy paths where no
+            # lifecycle row exists for this position.
+            position_uid=position_uid,
             slippage_benchmark_price=new_benchmark_price,
             slippage_benchmark_kind=new_benchmark_kind,
             slippage_benchmark_timestamp=new_benchmark_timestamp,
@@ -1173,6 +1179,7 @@ class TradeLogger:
         measurement_quality: SlippageMeasurementQuality = "primary",
         order_id: str | None = None,
         timestamp_override: datetime | None = None,
+        position_uid: str | None = None,
     ) -> None:
         """
         Write a confirmed stop-fill record when the WebSocket stream delivers
@@ -1318,6 +1325,10 @@ class TradeLogger:
             exit_timestamp=now_iso,
             position_id=owner_key_for(symbol),
             position_type="single_leg",
+            # PR #56 R1: persist position_uid so restart reconstruction
+            # of the allocator's trade-count dedup state matches live
+            # behavior.
+            position_uid=position_uid,
             slippage_benchmark_price=new_slippage_benchmark_price,
             slippage_benchmark_kind=new_slippage_benchmark_kind,
             slippage_benchmark_timestamp=new_slippage_benchmark_timestamp,

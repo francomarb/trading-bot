@@ -366,6 +366,39 @@ class TestSleeveDrawdownGate:
         assert isinstance(result, SleeveRejection)
         assert result.code is SleeveRejectionCode.SLEEVE_DRAWDOWN
 
+    def test_check_rejection_message_reports_normal_tier_above_floor(self):
+        """PR #56 R2: above-floor rejections show the normal threshold."""
+        allocator = _allocator(dd_threshold=0.15)
+        self._seed_above_floor(allocator, "sma_crossover")
+        # target_budget = 100k * 0.80 * 0.45 = $36,000. Normal threshold
+        # 15% = $5,400. Trigger with -$5,401.
+        allocator.record_realized_pnl("sma_crossover", -5_401.0)
+        result = allocator.check("sma_crossover", _account(), [], {}, {})
+        assert isinstance(result, SleeveRejection)
+        assert "tier=normal" in result.message
+        # threshold value in message = 15% * 36000 = $5,400
+        assert "threshold=5400" in result.message
+
+    def test_check_rejection_message_reports_catastrophic_tier_below_floor(self):
+        """PR #56 R2: below-floor rejections show the catastrophic
+        threshold, not the normal one. The operator log was previously
+        misleading at exactly the moment context matters most."""
+        allocator = _allocator(dd_threshold=0.05)
+        # spy_options_reversion: floor=15. Stay at N=1 (below floor).
+        # target_budget = 100k * 0.80 * 0.05 = $4,000.
+        # Catastrophic threshold 35% = $1,400. Trigger with -$1,401.
+        allocator.record_realized_pnl(
+            "spy_options_reversion", -1_401.0,
+            position_uid="pos-cata", is_full_close=True,
+        )
+        result = allocator.check("spy_options_reversion", _account(), [], {}, {})
+        assert isinstance(result, SleeveRejection)
+        assert "tier=catastrophic" in result.message
+        # threshold value in message = 35% * 4000 = $1,400 (NOT $200 from 5%)
+        assert "threshold=1400" in result.message
+        # n=1/15 should also be in the message for context
+        assert "n=1/15" in result.message
+
     def test_restore_pnl_summary_rehydrates_cumulative_and_hwm(self):
         allocator = _allocator(dd_threshold=0.15)
         allocator.restore_pnl_summary(
@@ -622,6 +655,86 @@ class TestSleeveDrawdownPartialCloseAccounting:
             "sma_crossover", -25.0, position_uid="pos-B",
         )
         assert allocator.pnl_summary()["sma_crossover"]["trade_count"] == pytest.approx(2.0)
+
+    def test_partial_close_does_not_increment_trade_count(self):
+        """A partial close is NOT a completed round trip. The increment
+        must wait for is_full_close=True so a mid-trade partial fill
+        doesn't prematurely arm the normal threshold (PR #56 R2)."""
+        allocator = _allocator()
+        # First half of a position closes — partial.
+        allocator.record_realized_pnl(
+            "sma_crossover", -100.0,
+            position_uid="pos-X", is_full_close=False,
+        )
+        summary = allocator.pnl_summary()
+        # P&L is still recorded immediately — the dollar math is honest.
+        assert summary["sma_crossover"]["realized_pnl"] == pytest.approx(-100.0)
+        # But trade_count does NOT increment yet.
+        assert summary["sma_crossover"]["trade_count"] == pytest.approx(0.0)
+        # The UID is also not yet marked as seen — so when the full
+        # close eventually fires for the same UID, it WILL be counted.
+        assert summary["sma_crossover"]["seen_position_uids"] == []
+
+    def test_full_close_after_partial_increments_exactly_once(self):
+        """Partial close → full close for the same UID counts as 1 trade."""
+        allocator = _allocator()
+        allocator.record_realized_pnl(
+            "sma_crossover", -50.0,
+            position_uid="pos-Y", is_full_close=False,
+        )
+        allocator.record_realized_pnl(
+            "sma_crossover", -25.0,
+            position_uid="pos-Y", is_full_close=True,
+        )
+        summary = allocator.pnl_summary()
+        assert summary["sma_crossover"]["realized_pnl"] == pytest.approx(-75.0)
+        assert summary["sma_crossover"]["trade_count"] == pytest.approx(1.0)
+
+    def test_partial_close_does_not_prematurely_arm_normal_tier(self):
+        """Reviewer's concrete R2 scenario: a partial close at N=floor-1
+        must NOT push N past the floor and switch from catastrophic to
+        normal threshold mid-trade.
+
+        Setup: sma_crossover, floor=25. Seed 24 completed round trips
+        (all 0 P&L), then a 25th position opens and partially closes.
+        Before R2: that partial would push trade_count to 25 and arm
+        the normal threshold. After R2: trade_count stays at 24 until
+        the 25th position fully closes.
+        """
+        allocator = _allocator(dd_threshold=0.05)
+        for i in range(24):
+            allocator.record_realized_pnl(
+                "sma_crossover", 0.0,
+                position_uid=f"pos-{i}", is_full_close=True,
+            )
+        # N=24, floor=25 → catastrophic tier still active.
+        snap = allocator.drawdown_snapshot(100_000.0)
+        assert snap["sma_crossover"]["trade_count"] == 24
+        assert snap["sma_crossover"]["gate_armed"] is False
+        # Trade #25 opens, takes a partial close.
+        allocator.record_realized_pnl(
+            "sma_crossover", -100.0,
+            position_uid="pos-25", is_full_close=False,
+        )
+        snap = allocator.drawdown_snapshot(100_000.0)
+        # Trade count MUST stay at 24 — round trip 25 isn't complete.
+        assert snap["sma_crossover"]["trade_count"] == 24
+        assert snap["sma_crossover"]["gate_armed"] is False
+        assert snap["sma_crossover"]["effective_threshold_pct"] == pytest.approx(
+            0.35  # catastrophic
+        )
+        # Now the full close for the same UID fires — NOW trade_count
+        # increments. Gate transitions to normal tier from this point.
+        allocator.record_realized_pnl(
+            "sma_crossover", -50.0,
+            position_uid="pos-25", is_full_close=True,
+        )
+        snap = allocator.drawdown_snapshot(100_000.0)
+        assert snap["sma_crossover"]["trade_count"] == 25
+        assert snap["sma_crossover"]["gate_armed"] is True
+        assert snap["sma_crossover"]["effective_threshold_pct"] == pytest.approx(
+            0.05  # normal dd_threshold
+        )
 
     def test_catastrophic_gate_uses_distinct_position_count(self):
         """The catastrophic-threshold tier (R1) depends on the same

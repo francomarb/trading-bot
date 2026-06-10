@@ -401,6 +401,56 @@ class TestTradeLogger:
             "trade_count": 0.0, "seen_position_uids": [],
         }
 
+    def test_close_records_with_position_uid_dedup_on_restart(self, tmp_csv):
+        """PR #56 R2: when close rows have position_uid (the live path
+        after the logger fix), restart reconstruction must count
+        distinct positions — partial closes of the same position do
+        NOT inflate trade_count."""
+        tl = TradeLogger(path=tmp_csv)
+        # Position pos-A: two partial closes (-50 + -25). One round trip.
+        # Position pos-B: one close (+100). One round trip.
+        # Position pos-C: one close (-30). One round trip.
+        # Two legacy rows: no position_uid. Each counts as one.
+        rows = [
+            ("pos-A", -50.0),
+            ("pos-A", -25.0),       # second partial of same position
+            ("pos-B", 100.0),
+            ("pos-C", -30.0),
+            (None, -10.0),          # legacy
+            (None, -5.0),           # legacy
+        ]
+        for i, (uid, pnl) in enumerate(rows):
+            tl.log(TradeRecord(
+                timestamp=f"2026-04-22T10:0{i}:00+00:00",
+                symbol=f"SYM{i}",
+                side="sell",
+                qty=1, avg_fill_price=100.0,
+                order_id=f"close-{i}",
+                strategy="sma_crossover",
+                reason="exit signal",
+                stop_price=0.0, entry_reference_price=100.0,
+                modeled_slippage_bps=0.0, realized_slippage_bps=0.0,
+                order_type="market", status="filled",
+                requested_qty=1, filled_qty=1,
+                initial_stop_loss=95.0, initial_risk_per_share=5.0,
+                initial_risk_dollars=5.0,
+                realized_pnl=pnl, r_multiple=None,
+                entry_timestamp="2026-04-21T10:00:00+00:00",
+                exit_timestamp=f"2026-04-22T10:0{i}:00+00:00",
+                position_uid=uid,
+            ))
+
+        summary = tl.read_strategy_realized_pnl_summary(["sma_crossover"])
+        # Realized P&L sums everything: -50 -25 +100 -30 -10 -5 = -20
+        assert summary["sma_crossover"]["realized_pnl"] == pytest.approx(-20.0)
+        # trade_count: 3 distinct UIDs + 2 legacy = 5 round trips
+        # (the two pos-A rows count as 1).
+        assert summary["sma_crossover"]["trade_count"] == pytest.approx(5.0)
+        # seen_position_uids reflects the distinct UIDs.
+        assert summary["sma_crossover"]["seen_position_uids"] == [
+            "pos-A", "pos-B", "pos-C",
+        ]
+
     def test_option_entry_uses_contract_multiplier_for_initial_risk(self):
         tl = TradeLogger(path="/dev/null")
         decision = RiskDecision(
