@@ -234,6 +234,12 @@ class SleeveAllocator:
         self._dd_threshold = dd_threshold
         self._strategy_realized_pnl = {name: 0.0 for name in self._entries}
         self._strategy_pnl_hwm = {name: 0.0 for name in self._entries}
+        # Trade count per strategy — used by the sleeve-drawdown gate's
+        # min-trades guard. Restored from the trade log on startup; live
+        # writes increment in ``record_realized_pnl``.
+        self._strategy_trade_count: dict[str, int] = {
+            name: 0 for name in self._entries
+        }
 
     def record_realized_pnl(self, strategy_name: str, pnl: float) -> None:
         if strategy_name not in self._strategy_realized_pnl:
@@ -243,13 +249,15 @@ class SleeveAllocator:
             return
 
         self._strategy_realized_pnl[strategy_name] += pnl
+        self._strategy_trade_count[strategy_name] += 1
         running = self._strategy_realized_pnl[strategy_name]
         if running > self._strategy_pnl_hwm[strategy_name]:
             self._strategy_pnl_hwm[strategy_name] = running
 
         logger.debug(
             f"[{strategy_name}] realized_pnl update: trade={pnl:+.2f} "
-            f"cumulative={running:+.2f} hwm={self._strategy_pnl_hwm[strategy_name]:+.2f}"
+            f"cumulative={running:+.2f} hwm={self._strategy_pnl_hwm[strategy_name]:+.2f} "
+            f"n={self._strategy_trade_count[strategy_name]}"
         )
 
     def pnl_summary(self) -> dict[str, dict[str, float]]:
@@ -257,21 +265,29 @@ class SleeveAllocator:
             name: {
                 "realized_pnl": self._strategy_realized_pnl[name],
                 "hwm": self._strategy_pnl_hwm[name],
+                "trade_count": float(self._strategy_trade_count[name]),
             }
             for name in self._entries
         }
 
     def restore_pnl_summary(self, summary: dict[str, dict[str, float]]) -> None:
-        """Restore cumulative realized P&L / HWM state, typically from the trade log."""
+        """Restore cumulative realized P&L / HWM / trade count, typically from the trade log.
+
+        Backward-compatible: summaries that don't carry ``trade_count``
+        restore the count to 0. This is safe under the new min-trades
+        guard — N=0 keeps the gate failing open until trades accumulate.
+        """
         for name in self._entries:
             restored = summary.get(name, {})
             realized_pnl = float(restored.get("realized_pnl", 0.0))
             hwm = max(float(restored.get("hwm", 0.0)), realized_pnl)
+            trade_count = int(restored.get("trade_count", 0))
             self._strategy_realized_pnl[name] = realized_pnl
             self._strategy_pnl_hwm[name] = hwm
+            self._strategy_trade_count[name] = trade_count
             logger.debug(
                 f"[{name}] restored allocator pnl state: "
-                f"cumulative={realized_pnl:+.2f} hwm={hwm:+.2f}"
+                f"cumulative={realized_pnl:+.2f} hwm={hwm:+.2f} n={trade_count}"
             )
 
     def strategies(self) -> list[str]:
@@ -295,8 +311,38 @@ class SleeveAllocator:
             return 0.0
         return equity * self._total_gross_pct * float(entry["target_pct"])
 
+    def _min_trades_for_drawdown_gate(self, strategy_name: str) -> int:
+        """Per-strategy minimum trade count before the drawdown gate may fire.
+
+        Resolves ``settings.STRATEGY_MIN_TRADES_FOR_DRAWDOWN_GATE`` with a
+        sensible default. Below this floor, ``is_strategy_in_drawdown`` always
+        returns False — i.e. the gate fails open. The daily-loss and
+        hard-dollar kill switches remain the active line of defense.
+        """
+        from config import settings as _s
+        override = _s.STRATEGY_MIN_TRADES_FOR_DRAWDOWN_GATE.get(strategy_name)
+        if override is not None:
+            return int(override)
+        return int(_s.STRATEGY_DEFAULT_MIN_TRADES_FOR_DRAWDOWN_GATE)
+
     def is_strategy_in_drawdown(self, strategy_name: str, equity: float) -> bool:
+        """True iff the strategy's sleeve-drawdown gate should halt new entries.
+
+        The check is gated by a minimum trade count: below the floor, this
+        method returns False unconditionally. With too few trades the
+        HWM-vs-running ratio is dominated by noise (a single bad trade —
+        buggy code, atypical market, ordinary variance — produces an
+        indefinite lockout that doesn't reflect the strategy's true
+        behavior). The daily-loss and hard-dollar cap kill switches
+        remain the active line of defense at low sample sizes.
+
+        See ``settings.STRATEGY_MIN_TRADES_FOR_DRAWDOWN_GATE`` for the
+        rationale and motivating case.
+        """
         if self._dd_threshold == 0.0 or strategy_name not in self._entries:
+            return False
+        # Min-trades guard — see docstring.
+        if self._strategy_trade_count[strategy_name] < self._min_trades_for_drawdown_gate(strategy_name):
             return False
         target_budget = self.target_budget(strategy_name, equity)
         running = self._strategy_realized_pnl[strategy_name]
@@ -312,13 +358,22 @@ class SleeveAllocator:
         Pure read; no mutation.
 
         Returns: `{strategy_name: {"in_drawdown": bool, "running_pnl":
-        float, "hwm_pnl": float, "drawdown_dollars": float}}` for
-        every registered strategy.
+        float, "hwm_pnl": float, "drawdown_dollars": float,
+        "trade_count": int, "min_trades_for_gate": int,
+        "gate_armed": bool}}` for every registered strategy.
+
+        ``gate_armed`` reflects whether the sample-size guard is
+        satisfied (i.e. the gate is *eligible* to fire). When False, the
+        gate fails open regardless of the drawdown math — which means
+        ``in_drawdown`` is also False even if the dollar math would
+        otherwise have triggered.
         """
         out: dict[str, dict] = {}
         for strategy_name in self._entries:
             running = self._strategy_realized_pnl.get(strategy_name, 0.0)
             hwm = self._strategy_pnl_hwm.get(strategy_name, 0.0)
+            trade_count = self._strategy_trade_count.get(strategy_name, 0)
+            min_trades = self._min_trades_for_drawdown_gate(strategy_name)
             out[strategy_name] = {
                 "in_drawdown": self.is_strategy_in_drawdown(
                     strategy_name, equity,
@@ -326,6 +381,9 @@ class SleeveAllocator:
                 "running_pnl": running,
                 "hwm_pnl": hwm,
                 "drawdown_dollars": max(hwm - running, 0.0),
+                "trade_count": trade_count,
+                "min_trades_for_gate": min_trades,
+                "gate_armed": trade_count >= min_trades,
             }
         return out
 

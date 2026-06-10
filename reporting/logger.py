@@ -1439,16 +1439,20 @@ class TradeLogger:
         strategies: list[str] | set[str] | tuple[str, ...] | None = None,
     ) -> dict[str, dict[str, float]]:
         """
-        Reconstruct per-strategy cumulative realized P&L and HWM from the trade log.
+        Reconstruct per-strategy cumulative realized P&L, HWM, and contributing
+        trade count from the trade log.
 
         Contributing rows: single-leg sell-side closes, plus credit-spread
         rows (``position_type='spread'``) — both with a non-null
         ``realized_pnl``. The HWM is the running maximum of cumulative
-        realized P&L in append order.
+        realized P&L in append order. ``trade_count`` is the number of
+        contributing rows — used by the sleeve-drawdown gate's min-trades
+        guard so a single bad data point can't lock the strategy out
+        indefinitely.
         """
         include = set(strategies or [])
-        summary = {
-            strategy: {"realized_pnl": 0.0, "hwm": 0.0}
+        summary: dict[str, dict[str, float]] = {
+            strategy: {"realized_pnl": 0.0, "hwm": 0.0, "trade_count": 0.0}
             for strategy in include
         }
         if not os.path.exists(self._path):
@@ -1476,9 +1480,12 @@ class TradeLogger:
             if include and strategy not in include:
                 continue
             if strategy not in summary:
-                summary[strategy] = {"realized_pnl": 0.0, "hwm": 0.0}
+                summary[strategy] = {
+                    "realized_pnl": 0.0, "hwm": 0.0, "trade_count": 0.0,
+                }
             running = summary[strategy]["realized_pnl"] + float(row["realized_pnl"])
             summary[strategy]["realized_pnl"] = running
+            summary[strategy]["trade_count"] += 1
             if running > summary[strategy]["hwm"]:
                 summary[strategy]["hwm"] = running
         return summary

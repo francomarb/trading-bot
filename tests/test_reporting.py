@@ -392,7 +392,12 @@ class TestTradeLogger:
 
         assert summary["sma_crossover"]["realized_pnl"] == pytest.approx(75.0)
         assert summary["sma_crossover"]["hwm"] == pytest.approx(100.0)
-        assert summary["rsi_reversion"] == {"realized_pnl": 0.0, "hwm": 0.0}
+        # trade_count must reflect the contributing rows so the allocator
+        # min-trades-for-drawdown-gate guard sees a faithful count.
+        assert summary["sma_crossover"]["trade_count"] == pytest.approx(3.0)
+        assert summary["rsi_reversion"] == {
+            "realized_pnl": 0.0, "hwm": 0.0, "trade_count": 0.0,
+        }
 
     def test_option_entry_uses_contract_multiplier_for_initial_risk(self):
         tl = TradeLogger(path="/dev/null")

@@ -337,8 +337,22 @@ class TestSleeveCheck:
 
 
 class TestSleeveDrawdownGate:
+    def _seed_above_floor(
+        self, allocator: SleeveAllocator, strategy: str, count: int = 30,
+    ) -> None:
+        """Push enough no-op trades through to clear the min-trades guard.
+
+        The new min-trades guard (see settings.STRATEGY_MIN_TRADES_FOR_DRAWDOWN_GATE)
+        unconditionally returns False below the floor — so any test that wants
+        to exercise the dollar-math part of the gate needs to seed enough
+        trades for the guard to arm.
+        """
+        for _ in range(count):
+            allocator.record_realized_pnl(strategy, 0.0)
+
     def test_drawdown_uses_target_budget_not_stretched_budget(self):
         allocator = _allocator(dd_threshold=0.15)
+        self._seed_above_floor(allocator, "sma_crossover")
         allocator.record_realized_pnl("sma_crossover", -5_400.0)
         assert allocator.is_strategy_in_drawdown("sma_crossover", 100_000.0) is False
         allocator.record_realized_pnl("sma_crossover", -1.0)
@@ -346,6 +360,7 @@ class TestSleeveDrawdownGate:
 
     def test_check_returns_drawdown_rejection(self):
         allocator = _allocator(dd_threshold=0.15)
+        self._seed_above_floor(allocator, "sma_crossover")
         allocator.record_realized_pnl("sma_crossover", -5_401.0)
         result = allocator.check("sma_crossover", _account(), [], {}, {})
         assert isinstance(result, SleeveRejection)
@@ -355,19 +370,131 @@ class TestSleeveDrawdownGate:
         allocator = _allocator(dd_threshold=0.15)
         allocator.restore_pnl_summary(
             {
-                "sma_crossover": {"realized_pnl": 75.0, "hwm": 100.0},
-                "rsi_reversion": {"realized_pnl": -25.0, "hwm": 0.0},
+                "sma_crossover": {"realized_pnl": 75.0, "hwm": 100.0, "trade_count": 30},
+                "rsi_reversion": {"realized_pnl": -25.0, "hwm": 0.0, "trade_count": 12},
             }
         )
         summary = allocator.pnl_summary()
         assert summary["sma_crossover"] == {
             "realized_pnl": pytest.approx(75.0),
             "hwm": pytest.approx(100.0),
+            "trade_count": pytest.approx(30.0),
         }
         assert summary["rsi_reversion"] == {
             "realized_pnl": pytest.approx(-25.0),
             "hwm": pytest.approx(0.0),
+            "trade_count": pytest.approx(12.0),
         }
+
+
+class TestSleeveDrawdownMinTradesGuard:
+    """The min-trades guard prevents the drawdown gate from firing
+    when a strategy has too few trades to make HWM-vs-running meaningful.
+
+    Motivating case (2026-06-10): spy_options_reversion had exactly ONE
+    closed trade — a −$1,269 exit fired against still-buggy trailing-stop
+    code that has since been fixed (PR #46 hardening). That single
+    data point tripped the gate indefinitely. The guard removes that
+    failure mode: below the floor, the gate fails open and the
+    daily-loss / hard-dollar kill switches remain the active defense.
+    """
+
+    def test_gate_fails_open_below_floor(self):
+        # spy_options_reversion floor = 15 (settings).
+        allocator = _allocator(dd_threshold=0.05)
+        allocator.record_realized_pnl("spy_options_reversion", -50_000.0)
+        # Even with a catastrophic loss, N=1 must not trip the gate.
+        assert allocator.is_strategy_in_drawdown(
+            "spy_options_reversion", 100_000.0,
+        ) is False
+
+    def test_gate_arms_at_floor(self):
+        allocator = _allocator(dd_threshold=0.05)
+        # rsi_reversion floor = 8 (settings) — quickest to set up.
+        for _ in range(7):
+            allocator.record_realized_pnl("rsi_reversion", 0.0)
+        # 7 no-op trades — below floor.
+        allocator.record_realized_pnl("rsi_reversion", -10_000.0)
+        # N=8 now (the loss is the 8th). Floor is 8 — guard armed.
+        # Gate fires because the math is in drawdown.
+        assert allocator.is_strategy_in_drawdown(
+            "rsi_reversion", 100_000.0,
+        ) is True
+
+    def test_unknown_strategy_returns_false(self):
+        # Pre-existing invariant — unaffected by the guard.
+        allocator = _allocator(dd_threshold=0.05)
+        assert allocator.is_strategy_in_drawdown("nonexistent", 100_000.0) is False
+
+    def test_dd_threshold_zero_disables_gate_regardless(self):
+        # Pre-existing invariant — disabling the gate is unconditional.
+        allocator = _allocator(dd_threshold=0.0)
+        for _ in range(100):
+            allocator.record_realized_pnl("sma_crossover", -1_000.0)
+        assert allocator.is_strategy_in_drawdown(
+            "sma_crossover", 100_000.0,
+        ) is False
+
+    def test_floor_default_used_for_unmapped_strategy(self, monkeypatch):
+        # When a strategy is in the allocator but NOT in the
+        # min-trades-for-drawdown-gate map, the default floor applies.
+        from config import settings as _s
+        monkeypatch.setattr(_s, "STRATEGY_MIN_TRADES_FOR_DRAWDOWN_GATE", {})
+        monkeypatch.setattr(_s, "STRATEGY_DEFAULT_MIN_TRADES_FOR_DRAWDOWN_GATE", 5)
+        allocator = _allocator(dd_threshold=0.05)
+        for _ in range(4):
+            allocator.record_realized_pnl("sma_crossover", -100.0)
+        # 4 trades — below default of 5.
+        assert allocator.is_strategy_in_drawdown(
+            "sma_crossover", 100_000.0,
+        ) is False
+        # One more — N=5, guard armed, math still in drawdown.
+        allocator.record_realized_pnl("sma_crossover", -10_000.0)
+        assert allocator.is_strategy_in_drawdown(
+            "sma_crossover", 100_000.0,
+        ) is True
+
+    def test_drawdown_snapshot_exposes_guard_state(self):
+        # The snapshot used for observability/health must surface the
+        # trade count, the floor, and whether the guard is armed.
+        allocator = _allocator(dd_threshold=0.05)
+        allocator.record_realized_pnl("spy_options_reversion", -1_269.0)
+        snap = allocator.drawdown_snapshot(100_000.0)
+        entry = snap["spy_options_reversion"]
+        assert entry["trade_count"] == 1
+        assert entry["min_trades_for_gate"] == 15  # settings value
+        assert entry["gate_armed"] is False
+        assert entry["in_drawdown"] is False  # because gate not armed
+        # The dollar math is preserved for diagnostic display.
+        assert entry["drawdown_dollars"] == pytest.approx(1_269.0)
+        assert entry["running_pnl"] == pytest.approx(-1_269.0)
+
+    def test_record_realized_pnl_increments_trade_count(self):
+        allocator = _allocator()
+        for i in range(5):
+            allocator.record_realized_pnl("sma_crossover", float(i))
+        summary = allocator.pnl_summary()
+        assert summary["sma_crossover"]["trade_count"] == pytest.approx(5.0)
+
+    def test_restore_pnl_summary_handles_missing_trade_count_field(self):
+        # Backward-compat: legacy summaries lacking trade_count restore N=0.
+        # Combined with the guard, this is safe: legacy startups can't have
+        # the gate fire on first cycle, but the guard reads the live count
+        # going forward. Trade count is then re-counted from the trade log.
+        allocator = _allocator(dd_threshold=0.05)
+        allocator.restore_pnl_summary(
+            {
+                "sma_crossover": {"realized_pnl": -10_000.0, "hwm": 0.0},
+                # no "trade_count" key — pre-fix summary shape
+            }
+        )
+        # N=0 (defaulted) → guard not armed → gate returns False.
+        assert allocator.is_strategy_in_drawdown(
+            "sma_crossover", 100_000.0,
+        ) is False
+        snap = allocator.drawdown_snapshot(100_000.0)
+        assert snap["sma_crossover"]["trade_count"] == 0
+        assert snap["sma_crossover"]["gate_armed"] is False
 
 
 class TestRiskManagerNotionalCap:

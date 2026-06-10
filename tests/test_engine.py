@@ -2567,6 +2567,10 @@ class TestStartupReconciliation:
         assert allocator.pnl_summary()["fake_strategy"] == {
             "realized_pnl": pytest.approx(50.0),
             "hwm": pytest.approx(50.0),
+            # trade_count restored from the trade log alongside P&L/HWM —
+            # the sleeve-drawdown gate's min-trades guard needs a faithful
+            # count to know whether it's eligible to fire.
+            "trade_count": pytest.approx(1.0),
         }
 
     def test_start_restores_entry_prices_for_open_positions(
