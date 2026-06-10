@@ -370,8 +370,16 @@ class TestSleeveDrawdownGate:
         allocator = _allocator(dd_threshold=0.15)
         allocator.restore_pnl_summary(
             {
-                "sma_crossover": {"realized_pnl": 75.0, "hwm": 100.0, "trade_count": 30},
-                "rsi_reversion": {"realized_pnl": -25.0, "hwm": 0.0, "trade_count": 12},
+                "sma_crossover": {
+                    "realized_pnl": 75.0, "hwm": 100.0,
+                    "trade_count": 30,
+                    "seen_position_uids": ["pos-a", "pos-b"],
+                },
+                "rsi_reversion": {
+                    "realized_pnl": -25.0, "hwm": 0.0,
+                    "trade_count": 12,
+                    "seen_position_uids": [],
+                },
             }
         )
         summary = allocator.pnl_summary()
@@ -379,11 +387,13 @@ class TestSleeveDrawdownGate:
             "realized_pnl": pytest.approx(75.0),
             "hwm": pytest.approx(100.0),
             "trade_count": pytest.approx(30.0),
+            "seen_position_uids": ["pos-a", "pos-b"],
         }
         assert summary["rsi_reversion"] == {
             "realized_pnl": pytest.approx(-25.0),
             "hwm": pytest.approx(0.0),
             "trade_count": pytest.approx(12.0),
+            "seen_position_uids": [],
         }
 
 
@@ -399,14 +409,43 @@ class TestSleeveDrawdownMinTradesGuard:
     daily-loss / hard-dollar kill switches remain the active defense.
     """
 
-    def test_gate_fails_open_below_floor(self):
-        # spy_options_reversion floor = 15 (settings).
+    def test_gate_uses_catastrophic_threshold_below_floor(self):
+        # Sample size MUST NOT disable protection entirely (PR #56 R1).
+        # Below the floor, the catastrophic threshold (35% of
+        # target_budget by default) applies — NOT the normal 5%/15%.
+        #
+        # spy_options_reversion: floor=15, target_pct=0.10 in the
+        # test allocator, total_gross_pct=0.80, equity=100_000.
+        # target_budget = 100_000 * 0.80 * 0.10 = $8_000.
+        # Normal threshold: 5% of $8_000 = $400 — would trip on small loss.
+        # Catastrophic threshold: 35% of $8_000 = $2_800 — does NOT trip
+        # on small loss, DOES trip on a major one.
         allocator = _allocator(dd_threshold=0.05)
-        allocator.record_realized_pnl("spy_options_reversion", -50_000.0)
-        # Even with a catastrophic loss, N=1 must not trip the gate.
+
+        # Small loss (well above 5% normal, below 35% catastrophic).
+        # Drawdown of $1,000 is 12.5% of target — would trip the
+        # normal threshold, but the catastrophic threshold protects
+        # against this misfire at low sample size.
+        allocator.record_realized_pnl("spy_options_reversion", -1_000.0)
         assert allocator.is_strategy_in_drawdown(
             "spy_options_reversion", 100_000.0,
-        ) is False
+        ) is False, (
+            "small loss at N=1 must not trip the catastrophic gate"
+        )
+
+    def test_catastrophic_loss_below_floor_DOES_trip_gate(self):
+        # The other half of R1: a truly catastrophic loss MUST still
+        # trip the gate even below the min-trades floor. Sample size
+        # is not an excuse to disable protection entirely.
+        allocator = _allocator(dd_threshold=0.05)
+        # target_budget = $8_000; catastrophic threshold 35% = $2_800.
+        # A −$5_000 loss is 62.5% drawdown — well above catastrophic.
+        allocator.record_realized_pnl("spy_options_reversion", -5_000.0)
+        assert allocator.is_strategy_in_drawdown(
+            "spy_options_reversion", 100_000.0,
+        ) is True, (
+            "catastrophic loss at N=1 MUST trip the gate"
+        )
 
     def test_gate_arms_at_floor(self):
         allocator = _allocator(dd_threshold=0.05)
@@ -456,45 +495,152 @@ class TestSleeveDrawdownMinTradesGuard:
 
     def test_drawdown_snapshot_exposes_guard_state(self):
         # The snapshot used for observability/health must surface the
-        # trade count, the floor, and whether the guard is armed.
+        # trade count, the floor, the active threshold, and whether the
+        # gate is in the "normal-armed" tier or the "catastrophic-only"
+        # tier.
         allocator = _allocator(dd_threshold=0.05)
-        allocator.record_realized_pnl("spy_options_reversion", -1_269.0)
+        allocator.record_realized_pnl(
+            "spy_options_reversion", -1_269.0, position_uid="pos-spy-1",
+        )
         snap = allocator.drawdown_snapshot(100_000.0)
         entry = snap["spy_options_reversion"]
         assert entry["trade_count"] == 1
         assert entry["min_trades_for_gate"] == 15  # settings value
+        # gate_armed=False means the normal threshold does NOT apply;
+        # the catastrophic threshold is active instead. Protection is
+        # NEVER fully disabled.
         assert entry["gate_armed"] is False
-        assert entry["in_drawdown"] is False  # because gate not armed
-        # The dollar math is preserved for diagnostic display.
+        # The catastrophic threshold (35% default) governs this tier.
+        assert entry["effective_threshold_pct"] == pytest.approx(0.35)
+        # −$1,269 at $8k target = 15.9% drawdown → below catastrophic.
+        assert entry["in_drawdown"] is False
         assert entry["drawdown_dollars"] == pytest.approx(1_269.0)
         assert entry["running_pnl"] == pytest.approx(-1_269.0)
 
     def test_record_realized_pnl_increments_trade_count(self):
         allocator = _allocator()
         for i in range(5):
-            allocator.record_realized_pnl("sma_crossover", float(i))
+            allocator.record_realized_pnl(
+                "sma_crossover", float(i), position_uid=f"pos-{i}",
+            )
         summary = allocator.pnl_summary()
         assert summary["sma_crossover"]["trade_count"] == pytest.approx(5.0)
 
-    def test_restore_pnl_summary_handles_missing_trade_count_field(self):
-        # Backward-compat: legacy summaries lacking trade_count restore N=0.
-        # Combined with the guard, this is safe: legacy startups can't have
-        # the gate fire on first cycle, but the guard reads the live count
-        # going forward. Trade count is then re-counted from the trade log.
+    def test_restore_pnl_summary_handles_missing_fields(self):
+        # Backward-compat: legacy summaries lacking trade_count /
+        # seen_position_uids restore N=0 and empty set. Combined with
+        # the catastrophic-tier guard, this is safe: an isolated bad
+        # loss still won't fire the normal gate but a sleeve-scale
+        # disaster will fire the catastrophic one.
         allocator = _allocator(dd_threshold=0.05)
         allocator.restore_pnl_summary(
             {
-                "sma_crossover": {"realized_pnl": -10_000.0, "hwm": 0.0},
-                # no "trade_count" key — pre-fix summary shape
+                # Small loss, no trade_count/seen_uids.
+                "sma_crossover": {"realized_pnl": -200.0, "hwm": 0.0},
             }
         )
-        # N=0 (defaulted) → guard not armed → gate returns False.
+        # Below catastrophic (sma target=$20k, 35% = $7k) → False.
         assert allocator.is_strategy_in_drawdown(
             "sma_crossover", 100_000.0,
         ) is False
         snap = allocator.drawdown_snapshot(100_000.0)
         assert snap["sma_crossover"]["trade_count"] == 0
         assert snap["sma_crossover"]["gate_armed"] is False
+        assert snap["sma_crossover"]["effective_threshold_pct"] == pytest.approx(0.35)
+
+
+class TestSleeveDrawdownPartialCloseAccounting:
+    """A single position closed in multiple partial fills must count as
+    ONE round trip, not many (PR #56 R1).
+
+    Live accounting and restart reconstruction must use the same
+    definition (count distinct position_uid) so the gate's sample-size
+    semantics are consistent across restarts.
+    """
+
+    def test_partial_closes_of_same_position_count_as_one_trade(self):
+        allocator = _allocator()
+        # Same position, three partial-close fills.
+        allocator.record_realized_pnl(
+            "sma_crossover", -100.0, position_uid="pos-A",
+        )
+        allocator.record_realized_pnl(
+            "sma_crossover", -50.0, position_uid="pos-A",
+        )
+        allocator.record_realized_pnl(
+            "sma_crossover", -75.0, position_uid="pos-A",
+        )
+        summary = allocator.pnl_summary()
+        # All three contribute to realized P&L and HWM.
+        assert summary["sma_crossover"]["realized_pnl"] == pytest.approx(-225.0)
+        # But trade_count is ONE — one position, one round trip.
+        assert summary["sma_crossover"]["trade_count"] == pytest.approx(1.0)
+        # Seen-uid set reflects the single position.
+        assert summary["sma_crossover"]["seen_position_uids"] == ["pos-A"]
+
+    def test_two_positions_count_as_two_trades(self):
+        allocator = _allocator()
+        allocator.record_realized_pnl(
+            "sma_crossover", -100.0, position_uid="pos-A",
+        )
+        allocator.record_realized_pnl(
+            "sma_crossover", -200.0, position_uid="pos-B",
+        )
+        assert allocator.pnl_summary()["sma_crossover"]["trade_count"] == pytest.approx(2.0)
+
+    def test_call_without_position_uid_still_counts(self):
+        # Legacy callers without position_uid — each call counts as
+        # one trade (no identifier to deduplicate against).
+        allocator = _allocator()
+        for _ in range(3):
+            allocator.record_realized_pnl("sma_crossover", -10.0)
+        assert allocator.pnl_summary()["sma_crossover"]["trade_count"] == pytest.approx(3.0)
+
+    def test_restart_dedup_preserved_across_restore(self):
+        """After restart, a partial close of a pre-restart position MUST
+        NOT count as a new trade. The seen_position_uids set restored
+        from the summary makes the post-restart dedup behaviour
+        consistent with what would have happened in-process."""
+        allocator = _allocator()
+        # Pretend the trade log surfaced a position already partially closed
+        # in a previous session — trade_count=1, seen={"pos-A"}.
+        allocator.restore_pnl_summary({
+            "sma_crossover": {
+                "realized_pnl": -100.0, "hwm": 0.0,
+                "trade_count": 1, "seen_position_uids": ["pos-A"],
+            },
+        })
+        # Post-restart partial close of the SAME position fires.
+        allocator.record_realized_pnl(
+            "sma_crossover", -50.0, position_uid="pos-A",
+        )
+        # trade_count must still be 1 (not 2).
+        assert allocator.pnl_summary()["sma_crossover"]["trade_count"] == pytest.approx(1.0)
+        assert allocator.pnl_summary()["sma_crossover"]["realized_pnl"] == pytest.approx(-150.0)
+        # A genuinely new position post-restart DOES increment.
+        allocator.record_realized_pnl(
+            "sma_crossover", -25.0, position_uid="pos-B",
+        )
+        assert allocator.pnl_summary()["sma_crossover"]["trade_count"] == pytest.approx(2.0)
+
+    def test_catastrophic_gate_uses_distinct_position_count(self):
+        """The catastrophic-threshold tier (R1) depends on the same
+        trade-count definition — fragmented closes of a single
+        catastrophic position must not be mistaken for many small ones."""
+        allocator = _allocator(dd_threshold=0.05)
+        # spy_options_reversion: floor=15, target_budget=$8k,
+        # catastrophic=35% of $8k = $2,800.
+        # One position closes in 3 chunks for −$5k total.
+        for chunk in (-2000.0, -2000.0, -1000.0):
+            allocator.record_realized_pnl(
+                "spy_options_reversion", chunk, position_uid="pos-big-loss",
+            )
+        # trade_count = 1 (one position), but dollar math still −$5k —
+        # well above the $2,800 catastrophic floor.
+        assert allocator.pnl_summary()["spy_options_reversion"]["trade_count"] == pytest.approx(1.0)
+        assert allocator.is_strategy_in_drawdown(
+            "spy_options_reversion", 100_000.0,
+        ) is True
 
 
 class TestRiskManagerNotionalCap:

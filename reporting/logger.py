@@ -1437,29 +1437,46 @@ class TradeLogger:
     def read_strategy_realized_pnl_summary(
         self,
         strategies: list[str] | set[str] | tuple[str, ...] | None = None,
-    ) -> dict[str, dict[str, float]]:
+    ) -> dict[str, dict]:
         """
-        Reconstruct per-strategy cumulative realized P&L, HWM, and contributing
-        trade count from the trade log.
+        Reconstruct per-strategy cumulative realized P&L, HWM, completed
+        round-trip count, and the set of seen position_uids from the trade
+        log.
 
         Contributing rows: single-leg sell-side closes, plus credit-spread
         rows (``position_type='spread'``) — both with a non-null
         ``realized_pnl``. The HWM is the running maximum of cumulative
-        realized P&L in append order. ``trade_count`` is the number of
-        contributing rows — used by the sleeve-drawdown gate's min-trades
-        guard so a single bad data point can't lock the strategy out
-        indefinitely.
+        realized P&L in append order.
+
+        **trade_count counts completed round trips, not contributing rows.**
+        Two partial-close events for the same position_uid count once.
+        Rows without a position_uid (legacy data, or non-lifecycle paths)
+        each count as one trade — there's no identifier to deduplicate
+        against. ``seen_position_uids`` is the deduplication set returned
+        as a sorted list so the allocator can restore the same dedup
+        state on restart (and a future partial close of a pre-restart
+        position correctly does NOT increment the count again).
         """
         include = set(strategies or [])
-        summary: dict[str, dict[str, float]] = {
-            strategy: {"realized_pnl": 0.0, "hwm": 0.0, "trade_count": 0.0}
+        summary: dict[str, dict] = {
+            strategy: {
+                "realized_pnl": 0.0,
+                "hwm": 0.0,
+                "trade_count": 0.0,
+                "seen_position_uids": set(),
+            }
             for strategy in include
         }
         if not os.path.exists(self._path):
+            # Convert sets to sorted lists for stable return values.
+            for s in summary.values():
+                s["seen_position_uids"] = sorted(s["seen_position_uids"])
             return summary
         try:
             conn = self._ensure_db()
         except sqlite3.Error:
+            for s in summary.values():
+                s["seen_position_uids"] = sorted(s["seen_position_uids"])
             return summary
         conn.row_factory = sqlite3.Row
         # Single-leg closes are sell-side; credit-spread closes write
@@ -1467,8 +1484,10 @@ class TradeLogger:
         # close) — so also accept position_type='spread' rows. The
         # `realized_pnl IS NOT NULL` filter prevents double-counting: spread
         # opens and the long-leg close row all carry NULL realized_pnl.
+        # We also pull position_uid so trade_count counts distinct
+        # round trips, not P&L rows.
         cursor = conn.execute(
-            "SELECT strategy, realized_pnl "
+            "SELECT strategy, realized_pnl, position_uid "
             "FROM trades "
             "WHERE (side = 'sell' OR position_type = 'spread') "
             "AND status IN ('filled', 'partial') "
@@ -1481,13 +1500,29 @@ class TradeLogger:
                 continue
             if strategy not in summary:
                 summary[strategy] = {
-                    "realized_pnl": 0.0, "hwm": 0.0, "trade_count": 0.0,
+                    "realized_pnl": 0.0,
+                    "hwm": 0.0,
+                    "trade_count": 0.0,
+                    "seen_position_uids": set(),
                 }
             running = summary[strategy]["realized_pnl"] + float(row["realized_pnl"])
             summary[strategy]["realized_pnl"] = running
-            summary[strategy]["trade_count"] += 1
+            position_uid = row["position_uid"] if "position_uid" in row.keys() else None
+            # Increment trade_count only for new positions. Rows without
+            # a position_uid (legacy data, non-lifecycle paths) each
+            # count as one — no identifier to deduplicate against.
+            if position_uid:
+                if position_uid not in summary[strategy]["seen_position_uids"]:
+                    summary[strategy]["seen_position_uids"].add(position_uid)
+                    summary[strategy]["trade_count"] += 1
+            else:
+                summary[strategy]["trade_count"] += 1
             if running > summary[strategy]["hwm"]:
                 summary[strategy]["hwm"] = running
+        # Convert sets to sorted lists for stable return values (callers
+        # convert back to sets if needed).
+        for s in summary.values():
+            s["seen_position_uids"] = sorted(s["seen_position_uids"])
         return summary
 
     def read_latest_open_stop_price(

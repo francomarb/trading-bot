@@ -571,6 +571,23 @@ STRATEGY_MIN_TRADES_FOR_DRAWDOWN_GATE: dict[str, int] = {
 }
 STRATEGY_DEFAULT_MIN_TRADES_FOR_DRAWDOWN_GATE: int = 10
 
+# Catastrophic drawdown threshold (PR #56 R1) — even below the min-trades
+# floor, sample size MUST NOT disable protection entirely. A second-tier
+# threshold gates against catastrophic loss while the strategy is still
+# in its "we don't have enough sample to evaluate normally" window.
+#
+# Two-tier semantics in SleeveAllocator.is_strategy_in_drawdown:
+#   - trade_count <  floor: gate fires at  STRATEGY_CATASTROPHIC_DRAWDOWN_THRESHOLD
+#                           × target_budget (default: 35%)
+#   - trade_count >= floor: gate fires at  dd_threshold × target_budget
+#                           (the configured normal threshold, e.g. 15%)
+#
+# The catastrophic level is intentionally generous — it should NOT fire on
+# ordinary single-trade variance, but it MUST fire on a 35%+ sleeve loss
+# (which on the spy_options_reversion case would have been ~-$3,500+ on a
+# ~$10k target budget — clearly beyond "noise from one bad trade").
+STRATEGY_CATASTROPHIC_DRAWDOWN_THRESHOLD: float = 0.35
+
 # Strategy Health monitor (PLAN 11.10f) — feature flag for the
 # engine's lifecycle-counter emissions. Defaults True (ship with
 # observability on) but the operator can flip to False as an instant

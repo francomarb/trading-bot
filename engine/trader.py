@@ -2292,6 +2292,23 @@ class TradingEngine:
         the realized-PnL update can proceed — operator CLI accuracy
         must not depend on entry-price availability.
         """
+        # Look up position_uid BEFORE the lifecycle close transition —
+        # the row may be flipped to closed below and become harder to
+        # find. The allocator uses this for trade-count deduplication
+        # (partial closes of the same position must not double-count).
+        position_uid: str | None = None
+        try:
+            row = self.lifecycle_store.get_open_for_owner_key(
+                owner_key_for(symbol),
+            )
+            if row is not None:
+                position_uid = row.position_uid
+        except Exception as exc:
+            logger.debug(
+                f"[{strategy_name}] {symbol}: position_uid lookup raised "
+                f"{type(exc).__name__}: {exc} — proceeding without"
+            )
+
         # Operator Controls Phase A — update the matching lifecycle
         # row. Done first so it happens regardless of whether the
         # allocator update below proceeds. Best-effort: wrapped in
@@ -2328,7 +2345,11 @@ class TradingEngine:
             f"[{strategy_name}] {symbol}: realized_pnl={realized_pnl:+.2f} "
             f"({qty}x{multiplier} @ {close_price:.2f} vs entry {entry_price:.2f})"
         )
-        self._allocator.record_realized_pnl(strategy_name, realized_pnl)
+        # Pass position_uid so the allocator deduplicates trade_count
+        # across partial closes of the same position (PR #56 R1 fix).
+        self._allocator.record_realized_pnl(
+            strategy_name, realized_pnl, position_uid=position_uid,
+        )
 
     def _reduce_lifecycle_for_owner_key(
         self,
@@ -4883,8 +4904,13 @@ class TradingEngine:
                             (released.net_credit - net_debit) * close_qty * 100.0
                         )
                         if self._allocator is not None:
+                            # PR #56 R1: pass position_uid (== position_id
+                            # on the spread close path) so partial /
+                            # repeated closes of the same spread don't
+                            # double-count in the allocator's trade tally.
                             self._allocator.record_realized_pnl(
-                                strategy_name, realized_pnl
+                                strategy_name, realized_pnl,
+                                position_uid=position_id,
                             )
                     logger.info(
                         f"[{strategy_name}] credit spread CLOSED — "
