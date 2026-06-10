@@ -103,7 +103,7 @@ def _build_sector_heat_snapshot(
         counts[detail.classification.value] += 1
         sectors_payload[sector] = {
             "etf_ticker": detail.etf_ticker,
-            "score": int(detail.score),
+            "score": float(detail.score),
             "classification": detail.classification.value,
             "above_sma200": bool(detail.above_sma200),
             "above_sma50": bool(detail.above_sma50),

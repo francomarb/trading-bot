@@ -153,6 +153,32 @@ class TestSectorMomentumGaugeScoring:
         # Strong uptrend → close well above SMA50
         assert detail.dist_sma50_pct > 0
 
+    def test_score_smoothing(self):
+        # Create a series of bars where price suddenly drops below SMA50 on the last day
+        # Raw scores for the last 3 days would be +3, +3, -3
+        # Smoothed score (3 days) should be 1.0 (NEUTRAL)
+        # Smoothed score (1 day) should be -3.0 (COLD)
+        df = _make_etf_bars(n=250, base_price=100.0, trend=0.0)
+        
+        # Override the last 3 closes to create a sudden drop
+        close = df["close"].copy()
+        close.iloc[-3] = 110.0 # Well above SMA50/SMA200 (SMA will be ~100)
+        close.iloc[-2] = 110.0 # Well above
+        close.iloc[-1] = 80.0  # Sharp drop below both SMAs
+        df["close"] = close
+
+        # No smoothing (smooth_window=1) -> should see the sudden drop (-3.0 / COLD)
+        gauge_raw = SectorMomentumGauge(sector_etfs=SECTOR_ETFS, smooth_window=1)
+        detail_raw = gauge_raw._compute("semiconductors", "SMH", df)
+        assert detail_raw.score <= -2.0
+        assert detail_raw.classification == SectorMomentum.COLD
+
+        # 3-day smoothing -> should smooth out the sudden drop to NEUTRAL
+        gauge_smoothed = SectorMomentumGauge(sector_etfs=SECTOR_ETFS, smooth_window=3)
+        detail_smoothed = gauge_smoothed._compute("semiconductors", "SMH", df)
+        assert detail_smoothed.score > -2.0
+        assert detail_smoothed.classification == SectorMomentum.NEUTRAL
+
 
 class TestSectorMomentumGaugeCaching:
     def test_classify_uses_score_cache(self):
@@ -239,7 +265,7 @@ class TestSectorMomentumFilter:
         result = f(df)
         assert not result.allowed.any()
         assert result.latest_reasons == [
-            "cold sector semiconductors/SMH (score=-3, class=cold)"
+            "cold sector semiconductors/SMH (score=-3.0, class=cold)"
         ]
 
     def test_cold_warn_policy_returns_true(self):
@@ -378,6 +404,37 @@ class TestSectorMomentumFilter:
         result = f(df)
         assert result.allowed.index.equals(df.index)
         assert result.reasons.index.equals(df.index)
+
+    def test_filter_processes_float_score_without_crash(self):
+        """Verify that SectorMomentumFilter works with float scores and does not crash on string formatting."""
+        from strategies.filters.sector_momentum import SectorMomentumFilter
+        
+        # Create synthetic bars where sector ETF price is declining (leads to COLD)
+        df_etf = _make_declining_etf_bars(n=250, base_price=100.0)
+        
+        gauge = SectorMomentumGauge(sector_etfs=SECTOR_ETFS, smooth_window=3)
+        resolver = MagicMock()
+        resolver.resolve.return_value = "semiconductors"
+        
+        with patch.object(gauge, "_fetch_etf", return_value=df_etf):
+            f = SectorMomentumFilter(
+                gauge=gauge,
+                resolver=resolver,
+                sector_entry_policy="block",
+                score_threshold=None
+            )
+            f.set_symbol("NVDA")
+            
+            df_stock = self._make_df()
+            result = f(df_stock)
+            
+            # Should successfully process and evaluate as COLD
+            assert not result.allowed.any()
+            assert "score=" in result.latest_reasons[0]
+            # Verify it prints float score representation (e.g. score=-3.0 or score=+2.5)
+            import re
+            assert re.search(r"score=[-+]\d+\.\d+", result.latest_reasons[0]) is not None
+
 
 
 class TestCompositeEdgeFilter:

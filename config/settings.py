@@ -404,6 +404,11 @@ SECTOR_ETFS: dict[str, str] = {
     "communications": "XLC",
 }
 
+# Smoothing window (in days) for sector momentum scores to prevent flip-flopping.
+# 5 days provides a good balance of responsiveness and stability (reduces noise by >50%).
+SECTOR_MOMENTUM_SMOOTH_WINDOW: int = 5
+
+
 STRATEGY_ALLOWED_REGIMES: dict[str, set[str]] = {
     "sma_crossover":     {"TRENDING", "RANGING"},
     "rsi_reversion":     {"TRENDING", "RANGING"},

@@ -93,7 +93,7 @@ class SectorMomentumFilter:
         if triggered:
             reason = (
                 f"cold sector {sector}/{detail.etf_ticker} "
-                f"(score={detail.score:+d}, class={detail.classification.value})"
+                f"(score={detail.score:+.1f}, class={detail.classification.value})"
             )
             signal_str = (
                 f">SMA200={detail.above_sma200}, >SMA50={detail.above_sma50}, "
@@ -105,7 +105,7 @@ class SectorMomentumFilter:
                 logger.info(
                     f"SECTOR GATE [block]: {self._symbol} "
                     f"({sector}/{detail.etf_ticker}) "
-                    f"score={detail.score}\n"
+                    f"score={detail.score:+.1f}\n"
                     f"  signals: {signal_str}"
                 )
                 return EdgeFilterDecision(
@@ -120,7 +120,7 @@ class SectorMomentumFilter:
                 logger.info(
                     f"SECTOR GATE [warn]: {self._symbol} "
                     f"({sector}/{detail.etf_ticker}) "
-                    f"score={detail.score}\n"
+                    f"score={detail.score:+.1f}\n"
                     f"  signals: {signal_str}"
                 )
 
@@ -128,7 +128,7 @@ class SectorMomentumFilter:
             logger.debug(
                 f"SectorMomentumFilter: {self._symbol} "
                 f"({sector}/{detail.etf_ticker}) "
-                f"score={detail.score} [HOT]"
+                f"score={detail.score:+.1f} [HOT]"
             )
 
         return EdgeFilterDecision.allow_all(df.index)
