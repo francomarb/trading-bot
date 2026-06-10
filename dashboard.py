@@ -1824,7 +1824,7 @@ def render_dashboard() -> None:
                     width="stretch",
                     hide_index=True,
                     column_config={
-                        "Score": st.column_config.NumberColumn(format="%d"),
+                        "Score": st.column_config.NumberColumn(format="%.1f"),
                         "Last Close": st.column_config.NumberColumn(format="$%.2f"),
                         "> SMA200": st.column_config.CheckboxColumn(),
                         "> SMA50": st.column_config.CheckboxColumn(),

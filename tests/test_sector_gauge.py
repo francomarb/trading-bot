@@ -265,7 +265,7 @@ class TestSectorMomentumFilter:
         result = f(df)
         assert not result.allowed.any()
         assert result.latest_reasons == [
-            "cold sector semiconductors/SMH (score=-3, class=cold)"
+            "cold sector semiconductors/SMH (score=-3.0, class=cold)"
         ]
 
     def test_cold_warn_policy_returns_true(self):
@@ -404,6 +404,36 @@ class TestSectorMomentumFilter:
         result = f(df)
         assert result.allowed.index.equals(df.index)
         assert result.reasons.index.equals(df.index)
+
+    def test_filter_processes_float_score_without_crash(self):
+        """Verify that SectorMomentumFilter works with float scores and does not crash on string formatting."""
+        from strategies.filters.sector_momentum import SectorMomentumFilter
+        
+        # Create synthetic bars where sector ETF price is declining (leads to COLD)
+        df_etf = _make_declining_etf_bars(n=250, base_price=100.0)
+        
+        gauge = SectorMomentumGauge(sector_etfs=SECTOR_ETFS, smooth_window=3)
+        resolver = MagicMock()
+        resolver.resolve.return_value = "semiconductors"
+        
+        with patch.object(gauge, "_fetch_etf", return_value=df_etf):
+            f = SectorMomentumFilter(
+                gauge=gauge,
+                resolver=resolver,
+                sector_entry_policy="block",
+                score_threshold=None
+            )
+            f.set_symbol("NVDA")
+            
+            df_stock = self._make_df()
+            result = f(df_stock)
+            
+            # Should successfully process and evaluate as COLD
+            assert not result.allowed.any()
+            assert "score=" in result.latest_reasons[0]
+            # Verify it prints float score representation (e.g. '.0' or another decimal)
+            assert ".0" in result.latest_reasons[0] or "." in result.latest_reasons[0]
+
 
 
 class TestCompositeEdgeFilter:

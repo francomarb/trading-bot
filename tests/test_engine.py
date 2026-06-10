@@ -1700,7 +1700,7 @@ class TestWatchlistStatuses:
             "sectors": {
                 "technology": {
                     "etf_ticker": "XLK",
-                    "score": 4,
+                    "score": 4.0,
                     "classification": "hot",
                     "above_sma200": True,
                     "above_sma50": True,
@@ -1729,7 +1729,7 @@ class TestWatchlistStatuses:
             "regime bear not in allowed set ['trending']"
         ]
         assert state["sector_heat"]["counts"]["hot"] == 2
-        assert state["sector_heat"]["sectors"]["technology"]["score"] == 4
+        assert state["sector_heat"]["sectors"]["technology"]["score"] == 4.0
         assert state["sector_heat"]["symbol_map"]["technology"][0]["symbol"] == "AAPL"
         assert state["allocator"] == {}
         assert state["capital_pools"] == {}

@@ -138,7 +138,7 @@ def write_report(
             signals = _signal_row(d)
             close_str = f"${d.last_close:.2f}" if d.last_close else "N/A"
             lines.append(
-                f"| {sector} | {etf} ({close_str}) | **{d.score:+d}** | {status} | {signals} |"
+                f"| {sector} | {etf} ({close_str}) | **{d.score:+.1f}** | {status} | {signals} |"
             )
 
     lines.append("")
@@ -158,7 +158,7 @@ def write_report(
             etf = settings.SECTOR_ETFS.get(sector, "N/A")
             syms = symbol_map.get(sector, [])
 
-            lines.append(f"#### {sector.replace('_', ' ').title()} — {etf} | score {d.score:+d}")
+            lines.append(f"#### {sector.replace('_', ' ').title()} — {etf} | score {d.score:+.1f}")
             lines.append("")
 
             if syms:
@@ -212,7 +212,7 @@ def main() -> None:
         d = gauge.get_details(sector)
         etf = settings.SECTOR_ETFS[sector]
         label = d.classification.value.upper()
-        logger.info(f"  {sector:<16} {etf:<5} score={d.score:+d}  [{label}]")
+        logger.info(f"  {sector:<16} {etf:<5} score={d.score:+.1f}  [{label}]")
 
     write_report(gauge, resolver, OUTPUT_PATH)
     logger.info(f"done — open {OUTPUT_PATH} to review")
