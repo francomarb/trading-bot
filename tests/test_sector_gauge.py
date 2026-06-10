@@ -431,8 +431,9 @@ class TestSectorMomentumFilter:
             # Should successfully process and evaluate as COLD
             assert not result.allowed.any()
             assert "score=" in result.latest_reasons[0]
-            # Verify it prints float score representation (e.g. '.0' or another decimal)
-            assert ".0" in result.latest_reasons[0] or "." in result.latest_reasons[0]
+            # Verify it prints float score representation (e.g. score=-3.0 or score=+2.5)
+            import re
+            assert re.search(r"score=[-+]\d+\.\d+", result.latest_reasons[0]) is not None
 
 
 
