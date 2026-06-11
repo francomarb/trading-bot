@@ -355,6 +355,52 @@ class TestTradeLogger:
         assert stop_record["realized_pnl"] == pytest.approx(-86.45)
         assert tl.has_recorded_order_id("stop-goog-1") is True
 
+    def test_read_realized_pnl_events_for_day_filters_by_exit_date(self, tmp_csv):
+        """The EOD-summary helper returns only closes whose
+        ``exit_timestamp`` falls on the supplied UTC date — and includes
+        single-leg AND spread, filled AND partial."""
+        tl = TradeLogger(path=tmp_csv)
+
+        def _close_row(*, day, pnl, status, position_type="single_leg",
+                       side="sell", uid=None) -> TradeRecord:
+            ts = f"{day}T15:30:00+00:00"
+            return TradeRecord(
+                timestamp=ts, symbol="X", side=side, qty=1,
+                avg_fill_price=100.0,
+                order_id=f"c-{day}-{pnl}",
+                strategy="sma_crossover", reason="exit signal",
+                stop_price=0.0, entry_reference_price=100.0,
+                modeled_slippage_bps=0.0, realized_slippage_bps=0.0,
+                order_type="market", status=status,
+                requested_qty=1, filled_qty=1,
+                realized_pnl=pnl,
+                entry_timestamp=f"{day}T13:00:00+00:00",
+                exit_timestamp=ts,
+                position_type=position_type, position_uid=uid,
+            )
+
+        tl.log(_close_row(day="2026-06-09", pnl=100.0, status="filled"))
+        tl.log(_close_row(day="2026-06-09", pnl=-50.0, status="filled"))
+        # Same UID partial → still contributes its dollar slice for the day.
+        tl.log(_close_row(day="2026-06-09", pnl=-20.0, status="partial",
+                          uid="pos-X"))
+        # Different day — must NOT appear.
+        tl.log(_close_row(day="2026-06-10", pnl=300.0, status="filled"))
+
+        events = tl.read_realized_pnl_events_for_day("2026-06-09")
+        assert sorted(p for _, p in events) == [-50.0, -20.0, 100.0]
+        # 06-10 only sees its own row.
+        assert tl.read_realized_pnl_events_for_day("2026-06-10") == [
+            ("sma_crossover", 300.0),
+        ]
+        # Unknown day returns empty without raising.
+        assert tl.read_realized_pnl_events_for_day("2026-06-30") == []
+
+    def test_read_realized_pnl_events_for_day_handles_missing_db(self, tmp_csv):
+        """Missing-DB path returns []; never raises."""
+        tl = TradeLogger(path="/nonexistent/path/trades.db")
+        assert tl.read_realized_pnl_events_for_day("2026-06-09") == []
+
     def test_read_strategy_realized_pnl_summary_reconstructs_hwm(self, tmp_csv):
         tl = TradeLogger(path=tmp_csv)
         rows = [
@@ -2556,6 +2602,87 @@ class TestPnLTracker:
         assert summary.realized_pnl == 50.0
         assert summary.largest_win == 100.0
         assert summary.largest_loss == -50.0
+
+    def test_eod_summary_reads_trade_log_when_no_in_memory_events(
+        self, tmp_csv, tmp_daily_dir,
+    ):
+        """The well-known EOD bug: production never calls record_trade_pnl,
+        so the in-memory list was always empty and EOD reported
+        ``P&L=$+0.00, trades=0`` even when the trade DB had real closes.
+
+        The fix sources events from ``read_realized_pnl_events_for_day``
+        — restart-safe and matches the actual trade log.
+        """
+        # Write real close rows to the trade DB — simulating what the
+        # engine actually logs during a normal cycle.
+        tl = TradeLogger(path=tmp_csv)
+        for i, pnl in enumerate([100.0, -50.0, 25.0], start=1):
+            tl.log(TradeRecord(
+                timestamp=f"2026-06-09T15:{i:02d}:00+00:00",
+                symbol=f"SYM{i}", side="sell", qty=1, avg_fill_price=100.0,
+                order_id=f"close-{i}",
+                strategy="sma_crossover", reason="exit signal",
+                stop_price=0.0, entry_reference_price=100.0,
+                modeled_slippage_bps=0.0, realized_slippage_bps=0.0,
+                order_type="market", status="filled",
+                requested_qty=1, filled_qty=1,
+                realized_pnl=pnl,
+                entry_timestamp="2026-06-09T13:00:00+00:00",
+                exit_timestamp=f"2026-06-09T15:{i:02d}:00+00:00",
+                position_type="single_leg",
+            ))
+
+        # PnLTracker wired to the SAME DB — but no record_trade_pnl ever called.
+        tracker = PnLTracker(
+            trade_csv_path=tmp_csv, daily_pnl_dir=tmp_daily_dir,
+        )
+        summary = tracker.generate_daily_summary(day="2026-06-09")
+
+        # Before the fix: total_trades=0, realized_pnl=0.0.
+        # After: the trade log is the source of truth.
+        assert summary.total_trades == 3, (
+            "EOD must read the trade log, not the empty in-memory list"
+        )
+        assert summary.realized_pnl == pytest.approx(75.0)
+        assert summary.largest_win == pytest.approx(100.0)
+        assert summary.largest_loss == pytest.approx(-50.0)
+        # Per-strategy attribution still works.
+        assert summary.strategies["sma_crossover"].trade_count == 3
+
+    def test_eod_summary_survives_bot_recycle_midday(
+        self, tmp_csv, tmp_daily_dir,
+    ):
+        """The original symptom on 2026-06-05 / 06-09 was that a midday
+        bot recycle wiped the in-memory accumulator, so EOD showed 0
+        trades even though the trade DB had the morning's closes. The
+        DB-backed source is restart-safe.
+        """
+        tl = TradeLogger(path=tmp_csv)
+        # Morning close (pre-recycle).
+        tl.log(TradeRecord(
+            timestamp="2026-06-09T11:25:00+00:00",
+            symbol="QCOM", side="sell", qty=16, avg_fill_price=195.51,
+            order_id="qcom-close-1",
+            strategy="donchian_breakout", reason="exit signal",
+            stop_price=0.0, entry_reference_price=236.58,
+            modeled_slippage_bps=0.0, realized_slippage_bps=0.0,
+            order_type="market", status="filled",
+            requested_qty=16, filled_qty=16,
+            realized_pnl=-657.04,
+            entry_timestamp="2026-04-22T13:00:00+00:00",
+            exit_timestamp="2026-06-09T11:25:00+00:00",
+            position_type="single_leg",
+        ))
+        # Simulate bot recycle — a FRESH PnLTracker (in-memory state empty).
+        tracker = PnLTracker(
+            trade_csv_path=tmp_csv, daily_pnl_dir=tmp_daily_dir,
+        )
+        # EOD fires later in the day (after recycle).
+        summary = tracker.generate_daily_summary(day="2026-06-09")
+        # The morning close is faithfully in the summary.
+        assert summary.total_trades == 1
+        assert summary.realized_pnl == pytest.approx(-657.04)
+        assert summary.strategies["donchian_breakout"].trade_count == 1
 
     def test_per_strategy_attribution(self, tmp_csv, tmp_daily_dir):
         tracker = PnLTracker(

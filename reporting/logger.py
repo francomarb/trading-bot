@@ -1509,6 +1509,46 @@ class TradeLogger:
             })
         return results
 
+    def read_realized_pnl_events_for_day(
+        self, day: str,
+    ) -> list[tuple[str, float]]:
+        """Return ``(strategy, realized_pnl)`` for every realized-P&L row
+        whose ``exit_timestamp`` falls on the given UTC date.
+
+        Used by the EOD summary path so the daily report reflects the
+        trade log (the source of truth) instead of an in-memory
+        accumulator that resets on every bot recycle and was never
+        populated in production (no caller of ``record_trade_pnl``).
+
+        ``day`` is the UTC date in ``YYYY-MM-DD`` format. Each row
+        with a non-null ``realized_pnl`` that closed on that day —
+        single-leg sell-side close rows AND credit-spread close rows —
+        contributes exactly one tuple. Partial-close rows
+        (``status='partial'``) are included: their dollar contribution
+        is real and belongs in the day's realized P&L total, the same
+        way the live allocator's running P&L counts them.
+        """
+        if not day or not os.path.exists(self._path):
+            return []
+        try:
+            conn = self._ensure_db()
+        except sqlite3.Error:
+            return []
+        conn.row_factory = sqlite3.Row
+        cursor = conn.execute(
+            "SELECT strategy, realized_pnl FROM trades "
+            "WHERE (side = 'sell' OR position_type = 'spread') "
+            "AND status IN ('filled', 'partial') "
+            "AND realized_pnl IS NOT NULL "
+            "AND substr(exit_timestamp, 1, 10) = ? "
+            "ORDER BY id ASC",
+            (day,),
+        )
+        return [
+            (row["strategy"], float(row["realized_pnl"]))
+            for row in cursor.fetchall()
+        ]
+
     def read_strategy_realized_pnl_summary(
         self,
         strategies: list[str] | set[str] | tuple[str, ...] | None = None,

@@ -166,14 +166,39 @@ class PnLTracker:
         unrealized_pnl: float = 0.0,
     ) -> DailySummary:
         """
-        Build a DailySummary from the in-memory trade P&Ls recorded today,
-        plus the trade CSV for slippage stats.
+        Build a DailySummary from the day's realized-P&L events on disk
+        (the trade log is the source of truth) plus DB slippage stats.
+
+        The in-memory ``_trade_pnls`` list is no longer used as the
+        primary source — the engine has never wired ``record_trade_pnl``
+        and the list was always empty in production, producing the
+        well-known "P&L=$+0.00, trades=0" EOD bug. We now query the
+        trade log directly via ``read_realized_pnl_events_for_day``,
+        which is restart-safe (a bot recycle mid-day no longer wipes
+        the day's progress from the summary).
+
+        Backward-compat: if any callers DID push events to
+        ``_trade_pnls`` via ``record_trade_pnl`` (legacy verify scripts,
+        tests), those are merged in on top of the DB-sourced events so
+        no existing harness silently regresses.
         """
         day = day or self._today or datetime.now(timezone.utc).strftime("%Y-%m-%d")
 
+        # Authoritative source: every realized-P&L close row whose
+        # exit_timestamp falls on ``day``. Includes single-leg + spread
+        # closes and partial rows (their dollar contribution is honest).
+        events: list[tuple[str, float]] = list(
+            self._trade_logger.read_realized_pnl_events_for_day(day)
+        )
+        # Backward-compat: merge any in-memory events from
+        # record_trade_pnl callers (legacy / tests). Duplicates are
+        # acceptable here because the legacy path was never wired in
+        # production; in practice this list will be empty for live runs.
+        events.extend(self._trade_pnls)
+
         # Per-strategy breakdown.
         strats: dict[str, StrategyStats] = {}
-        for strat_name, pnl in self._trade_pnls:
+        for strat_name, pnl in events:
             if strat_name not in strats:
                 strats[strat_name] = StrategyStats(strategy_name=strat_name)
             s = strats[strat_name]
@@ -189,8 +214,8 @@ class PnLTracker:
                 if pnl < s.largest_loss:
                     s.largest_loss = pnl
 
-        # Aggregate.
-        all_pnls = [p for _, p in self._trade_pnls]
+        # Aggregate (over the same merged events used above).
+        all_pnls = [p for _, p in events]
         total_trades = len(all_pnls)
         realized = sum(all_pnls)
         largest_win = max(all_pnls) if all_pnls else 0.0
