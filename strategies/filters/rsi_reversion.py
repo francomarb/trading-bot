@@ -150,6 +150,7 @@ class RSIEdgeFilter:
 
     def __call__(self, df: pd.DataFrame) -> EdgeFilterDecision:
         spy_gate      = self._spy_filter(df)
+        spy_reason    = self._spy_filter.last_reason
         earnings_gate = self._earnings(df)
         vol_gate      = self._volume_liquid(df)
         low_gate      = self._no_new_low(df)
@@ -174,10 +175,7 @@ class RSIEdgeFilter:
         ):
             row_reasons: list[str] = []
             if not spy_ok:
-                row_reasons.append(
-                    "SPY trend gate failed (below or insufficient history for "
-                    "200/50 SMA)"
-                )
+                row_reasons.append(f"SPY trend gate failed: {spy_reason}")
             if not earn_ok:
                 row_reasons.append("earnings blackout")
             if not vol_ok:

@@ -71,6 +71,12 @@ class SPYTrendFilter:
         self._cache_ttl = cache_ttl_seconds
         self._spy_cache: pd.DataFrame | None = None
         self._cache_time: float = 0.0
+        self._last_reason: str = ""
+
+    @property
+    def last_reason(self) -> str:
+        """Return the reason produced by the most recent gate evaluation."""
+        return self._last_reason
 
     def _fetch_spy(self) -> pd.DataFrame | None:
         """Fetch SPY bars, reusing cache within TTL."""
@@ -142,6 +148,7 @@ class SPYTrendFilter:
 
     def __call__(self, df: pd.DataFrame) -> pd.Series:
         allowed, reason = self._check()
+        self._last_reason = reason
         if not allowed:
             logger.info(f"SPYTrendFilter: BLOCKED — {reason}")
         else:

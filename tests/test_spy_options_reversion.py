@@ -112,6 +112,7 @@ class TestSPYOptionsEdgeFilterDecision:
         gate = pd.Series(True, index=df.index, dtype=bool)
         edge = SPYOptionsEdgeFilter()
         edge._spy_filter = MagicMock(return_value=gate)
+        edge._spy_filter.last_reason = "SPY above all SMAs [100]"
 
         decision = edge(df)
 
@@ -124,12 +125,29 @@ class TestSPYOptionsEdgeFilterDecision:
         gate = pd.Series(False, index=df.index, dtype=bool)
         edge = SPYOptionsEdgeFilter()
         edge._spy_filter = MagicMock(return_value=gate)
+        edge._spy_filter.last_reason = "SPY 480.00 ≤ SMA100 500.00"
 
         decision = edge(df)
 
         assert isinstance(decision, EdgeFilterDecision)
         assert bool(decision.allowed.iloc[-1]) is False
-        assert decision.latest_reasons == ["SPY below 100 SMA (bear regime)"]
+        assert decision.latest_reasons == [
+            "SPY trend gate failed: SPY 480.00 ≤ SMA100 500.00"
+        ]
+
+    def test_reports_insufficient_history_reason(self):
+        df = _make_df(30)
+        edge = SPYOptionsEdgeFilter()
+        edge._spy_filter._spy_cache = _make_df(75)
+        edge._spy_filter._cache_time = float("inf")
+
+        decision = edge(df)
+
+        assert not decision.latest_allowed
+        assert decision.latest_reasons == [
+            "SPY trend gate failed: insufficient SPY history for SMA100: "
+            "75 bars available, 100 required"
+        ]
 
 
 class TestSPYOptionsStrategyEdgeFilterIntegration:
@@ -146,6 +164,7 @@ class TestSPYOptionsStrategyEdgeFilterIntegration:
         gate = pd.Series(False, index=df.index, dtype=bool)
         edge = SPYOptionsEdgeFilter()
         edge._spy_filter = MagicMock(return_value=gate)
+        edge._spy_filter.last_reason = "SPY 480.00 ≤ SMA100 500.00"
         strat = SPYOptionsReversionStrategy(
             rsi_length=14,
             rsi_threshold=30,
@@ -157,7 +176,9 @@ class TestSPYOptionsStrategyEdgeFilterIntegration:
         assert raw.entries.any()
         assert not filtered.entries.any()
         assert edge_allowed is False
-        assert edge_reasons == ["SPY below 100 SMA (bear regime)"]
+        assert edge_reasons == [
+            "SPY trend gate failed: SPY 480.00 ≤ SMA100 500.00"
+        ]
 
 
 class TestBuildOptionExecution:

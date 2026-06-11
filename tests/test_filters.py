@@ -568,7 +568,7 @@ class TestRSIEdgeFilter:
         decision = f(_liquid_df(25, avg_vol=1_000_000))
         assert not decision.allowed.iloc[-1]
         assert decision.latest_reasons == [
-            "SPY trend gate failed (below or insufficient history for 200/50 SMA)"
+            "SPY trend gate failed: SPY 1.00 ≤ SMA50 25.50"
         ]
 
     def test_spy_gate_blocks_when_sma200_history_is_short(self):
@@ -582,7 +582,8 @@ class TestRSIEdgeFilter:
 
         assert not decision.allowed.iloc[-1]
         assert decision.latest_reasons == [
-            "SPY trend gate failed (below or insufficient history for 200/50 SMA)"
+            "SPY trend gate failed: insufficient SPY history for SMA200: "
+            "192 bars available, 200 required"
         ]
 
     def test_spy_history_lookback_has_trading_day_buffer(self):
@@ -602,9 +603,7 @@ class TestRSIEdgeFilter:
         with patch.object(f._spy_filter, "_check", return_value=(False, "below 50SMA")):
             decision = f(df)
             assert not decision.allowed.iloc[-1]
-            assert decision.latest_reasons == [
-                "SPY trend gate failed (below or insufficient history for 200/50 SMA)"
-            ]
+            assert decision.latest_reasons == ["SPY trend gate failed: below 50SMA"]
 
     # ── Earnings blackout gate ────────────────────────────────────────────────
 
@@ -777,7 +776,7 @@ class TestRSIEdgeFilter:
 
         assert not decision.allowed.iloc[-1]
         assert decision.latest_reasons == [
-            "SPY trend gate failed (below or insufficient history for 200/50 SMA)",
+            "SPY trend gate failed: SPY 1.00 ≤ SMA50 25.50",
             "earnings blackout",
             "liquidity too low (avg_dollar_vol5=$6,300 < $500,000)",
             "new 5-day low (active breakdown)",
@@ -807,9 +806,7 @@ class TestRSIEdgeFilter:
         assert raw.entries.any()
         assert not filtered.entries.any()
         assert edge_allowed is False
-        assert edge_reasons == [
-            "SPY trend gate failed (below or insufficient history for 200/50 SMA)"
-        ]
+        assert edge_reasons == ["SPY trend gate failed: SPY 1.00 ≤ SMA50 25.50"]
 
 
 # ── TestBaseStrategySymbolInjection ───────────────────────────────────────────

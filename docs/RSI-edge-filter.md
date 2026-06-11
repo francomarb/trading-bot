@@ -143,7 +143,7 @@ INFO | RSI_FILTER_ALLOWED ALLY — SPY=True earnings=True liquid=True no_new_low
 
 **Entry blocked** (one or more gates failed, all failing gates listed):
 ```
-INFO | RSI_FILTER_BLOCKED CDNS — SPY trend gate failed (below or insufficient history for 200/50 SMA)
+INFO | RSI_FILTER_BLOCKED CDNS — SPY trend gate failed: SPY 650.00 ≤ SMA50 655.00
 INFO | RSI_FILTER_BLOCKED CCK — earnings blackout
 INFO | RSI_FILTER_BLOCKED SN — volume illiquid (avg20=312,450 < 500,000)
 INFO | RSI_FILTER_BLOCKED TFC — new 20-day low (active breakdown)
