@@ -1974,7 +1974,10 @@ class TradingEngine:
             # Only close orphans owned by strategies that use STOP_LIMIT
             # entries. Other fractional residual paths handle their own
             # cleanup via _repair_missing_protective_stops.
-            slot = self.slots.get(owner)
+            slot = next(
+                (s for s in self.slots if s.strategy.name == owner),
+                None,
+            )
             if slot is None:
                 continue
             if slot.strategy.preferred_order_type is not OrderType.STOP_LIMIT:

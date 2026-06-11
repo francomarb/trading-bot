@@ -79,6 +79,7 @@ def _decision(
     limit_price: float | None = None,
     strategy: str = "sma_crossover",
     entry_max_price: float | None = None,
+    entry_trigger_price: float | None = None,
 ) -> RiskDecision:
     return RiskDecision(
         symbol=symbol,
@@ -91,6 +92,7 @@ def _decision(
         order_type=order_type,
         limit_price=limit_price,
         entry_max_price=entry_max_price,
+        entry_trigger_price=entry_trigger_price,
     )
 
 
@@ -523,6 +525,58 @@ class TestSubmitOrderKwargs:
         req = api.submit_order.call_args.args[0]
         assert req.type.value == "limit"
         assert req.limit_price == 99.12  # rounded to 2dp
+
+    def test_stop_limit_order_constructs_with_stop_and_limit_prices(self):
+        """PLAN 11.47: STOP_LIMIT entries submit StopLimitOrderRequest with
+        DAY TIF + OTO + protective stop, stop_price = entry_trigger_price,
+        limit_price = entry_max_price."""
+        api = MagicMock()
+        api.submit_order.return_value = _alpaca_order(status="accepted")
+        api.get_order_by_id.return_value = _alpaca_order(status="accepted", filled_qty=0)
+        broker = _broker_with_mock(api)
+
+        broker.place_order(
+            _decision(
+                strategy="donchian_breakout",
+                order_type=OrderType.STOP_LIMIT,
+                entry=245.0,
+                stop=230.0,
+                entry_trigger_price=245.0,
+                entry_max_price=257.123,
+            ),
+            poll_timeout=0.0,
+            poll_interval=0.0,
+        )
+        req = api.submit_order.call_args.args[0]
+        assert req.type.value == "stop_limit"
+        assert req.stop_price == 245.0
+        assert req.limit_price == 257.12  # rounded to 2dp
+        assert req.order_class.value == "oto"
+        assert req.stop_loss.stop_price == 230.0
+        assert req.time_in_force.value == "day"
+        assert req.client_order_id.startswith("donchian_breakout-")
+
+    def test_stop_limit_missing_trigger_price_raises(self):
+        api = MagicMock()
+        broker = _broker_with_mock(api)
+        # Direct broker dict bypass to construct an invalid STOP_LIMIT
+        # decision — RiskDecision's __post_init__ would normally block
+        # construction; this exercises the broker-side defense.
+        decision = MagicMock(spec=RiskDecision)
+        decision.order_type = OrderType.STOP_LIMIT
+        decision.entry_trigger_price = None
+        decision.entry_max_price = 257.0
+        decision.symbol = "AAPL"
+        decision.side = Side.BUY
+        decision.qty = 5
+        decision.entry_reference_price = 245.0
+        decision.stop_price = 230.0
+        decision.strategy_name = "donchian_breakout"
+        decision.reason = "test"
+        decision.limit_price = None
+        decision.take_profit_price = None
+        with pytest.raises(ValueError, match="entry_trigger_price"):
+            broker.place_order(decision, poll_timeout=0.0, poll_interval=0.0)
 
     def test_atr_computed_stop_price_rounded_to_2dp(self):
         """ATR-based stops produce long decimals (e.g. entry - k*ATR).

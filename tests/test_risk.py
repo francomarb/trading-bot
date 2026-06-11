@@ -694,6 +694,58 @@ class TestRiskDecisionInvariant:
             )
 
 
+class TestStopLimitDecisionInvariant:
+    """PLAN 11.47: STOP_LIMIT-specific shape rules."""
+
+    def _base(self, **overrides) -> dict:
+        params = dict(
+            symbol="QCOM",
+            side=Side.BUY,
+            qty=5,
+            entry_reference_price=245.0,
+            stop_price=230.0,
+            strategy_name="donchian_breakout",
+            reason="test",
+            order_type=OrderType.STOP_LIMIT,
+            entry_trigger_price=245.0,
+            entry_max_price=257.0,
+        )
+        params.update(overrides)
+        return params
+
+    def test_valid_stop_limit_decision_constructs(self):
+        d = RiskDecision(**self._base())
+        assert d.order_type is OrderType.STOP_LIMIT
+        assert d.entry_trigger_price == 245.0
+        assert d.entry_max_price == 257.0
+
+    def test_stop_limit_requires_trigger(self):
+        with pytest.raises(ValueError, match="entry_trigger_price"):
+            RiskDecision(**self._base(entry_trigger_price=None))
+
+    def test_stop_limit_requires_max_price(self):
+        with pytest.raises(ValueError, match="entry_max_price"):
+            RiskDecision(**self._base(entry_max_price=None))
+
+    def test_stop_limit_rejects_limit_price(self):
+        with pytest.raises(ValueError, match="limit_price must remain None"):
+            RiskDecision(**self._base(limit_price=250.0))
+
+    def test_buy_stop_limit_requires_max_at_or_above_trigger(self):
+        with pytest.raises(ValueError, match=r"entry_max_price.*>=.*entry_trigger_price"):
+            RiskDecision(**self._base(entry_trigger_price=257.0, entry_max_price=245.0))
+
+    def test_buy_stop_limit_requires_trigger_above_protective_stop(self):
+        # trigger ($229) below protective stop ($230) is incoherent — entry above
+        # the protective stop is what defines a long breakout
+        with pytest.raises(ValueError, match=r"entry_trigger_price.*>.*protective stop_price"):
+            RiskDecision(**self._base(entry_trigger_price=229.0, entry_max_price=240.0))
+
+    def test_non_stop_limit_cannot_carry_trigger_price(self):
+        with pytest.raises(ValueError, match="entry_trigger_price is only valid for STOP_LIMIT"):
+            RiskDecision(**self._base(order_type=OrderType.MARKET, entry_trigger_price=245.0, entry_max_price=None))
+
+
 # ── Halt behaviour ──────────────────────────────────────────────────────────
 
 

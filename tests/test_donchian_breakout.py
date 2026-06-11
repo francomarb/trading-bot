@@ -209,3 +209,40 @@ class TestDonchianBreakoutPurity:
         original_cols = set(df.columns)
         _strategy().generate_signals(df)
         assert set(df.columns) == original_cols
+
+
+# ── PLAN 11.47: trigger price for STOP_LIMIT entries ────────────────────────
+
+
+class TestDonchianTriggerPrice:
+    def test_latest_trigger_returns_prior_n_day_high(self):
+        # entry_window=5 → the latest trigger is max(close[-6:-1]).
+        # Closes: ... 12, 13, 14, 15, 16. Prior-5 max = 16.
+        closes = [10.0, 11.0, 12.0, 13.0, 14.0, 15.0, 16.0, 13.0]
+        df = _df(closes)
+        trigger = _strategy(entry_window=5, exit_window=3).latest_trigger_price(df)
+        assert trigger == 16.0
+
+    def test_latest_trigger_returns_none_on_insufficient_history(self):
+        # Fewer bars than entry_window → donchian_high is NaN at the latest bar.
+        df = _df([10.0, 11.0])
+        trigger = _strategy(entry_window=5, exit_window=3).latest_trigger_price(df)
+        assert trigger is None
+
+    def test_latest_trigger_returns_none_on_empty_df(self):
+        df = _df([])
+        trigger = _strategy().latest_trigger_price(df)
+        assert trigger is None
+
+    def test_latest_trigger_returns_none_when_close_column_missing(self):
+        idx = pd.date_range("2026-01-01", periods=3, freq="D", tz="UTC")
+        df = pd.DataFrame({"open": [1.0, 2.0, 3.0]}, index=idx)
+        trigger = _strategy().latest_trigger_price(df)
+        assert trigger is None
+
+    def test_latest_trigger_is_float_not_numpy(self):
+        # Float type matters for the broker — Alpaca's StopLimitOrderRequest
+        # rejects numpy scalars (pydantic strict typing).
+        df = _df(list(range(10, 25)))
+        trigger = _strategy(entry_window=5, exit_window=3).latest_trigger_price(df)
+        assert isinstance(trigger, float)
