@@ -243,7 +243,8 @@ def main() -> None:
             # VOLATILE (fear-driven overshoots are unpredictable and the
             # snap-back timing is unreliable). The RSI edge filter adds a
             # second layer: SPY > 200 SMA AND SPY > 50 SMA, so BEAR is
-            # double-blocked. Sector momentum: COLD sectors BLOCK entries
+            # double-blocked. Missing SMA history fails closed. Sector
+            # momentum: COLD sectors BLOCK entries
             # (mean-reversion in a cold sector = cluster risk).
             allowed_regimes=frozenset({MarketRegime.TRENDING, MarketRegime.RANGING}),
         ),

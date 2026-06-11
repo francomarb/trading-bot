@@ -90,12 +90,16 @@ class TestSPYTrendFilter:
         gate = f(_symbol_df([50.0] * 3))
         assert gate.all() == allowed
 
-    def test_nan_sma_skipped_does_not_block(self):
-        # Only 5 bars — SMA200 will be NaN → skip, allow
+    def test_insufficient_history_blocks(self):
+        # A mandatory macro gate must never disappear because history is short.
         closes = [100.0, 101.0, 102.0, 103.0, 104.0]
         f = self._filter(closes, windows=[200])
         gate = f(_symbol_df([50.0] * 3))
-        assert gate.all()  # NaN → fail open
+        assert not gate.any()
+        assert f._check() == (
+            False,
+            "insufficient SPY history for SMA200: 5 bars available, 200 required",
+        )
 
     def test_fetch_failure_with_no_cache_blocks(self):
         # Cold-start failure with no prior cache → fail closed.
@@ -563,7 +567,27 @@ class TestRSIEdgeFilter:
         self._clear_earnings(f)
         decision = f(_liquid_df(25, avg_vol=1_000_000))
         assert not decision.allowed.iloc[-1]
-        assert decision.latest_reasons == ["SPY trend gate failed (below 200 or 50 SMA)"]
+        assert decision.latest_reasons == [
+            "SPY trend gate failed (below or insufficient history for 200/50 SMA)"
+        ]
+
+    def test_spy_gate_blocks_when_sma200_history_is_short(self):
+        f = RSIEdgeFilter(notional_min_avg=0)
+        f.set_symbol("MU")
+        self._clear_earnings(f)
+        f._spy_filter._spy_cache = _spy_df(list(range(1, 193)))
+        f._spy_filter._cache_time = float("inf")
+
+        decision = f(_liquid_df(25, avg_vol=1_000_000))
+
+        assert not decision.allowed.iloc[-1]
+        assert decision.latest_reasons == [
+            "SPY trend gate failed (below or insufficient history for 200/50 SMA)"
+        ]
+
+    def test_spy_history_lookback_has_trading_day_buffer(self):
+        f = RSIEdgeFilter()
+        assert f._spy_filter._lookback_days == 320
 
     def test_spy_windows_both_required(self):
         """Both SPY 200SMA and 50SMA must pass."""
@@ -578,7 +602,9 @@ class TestRSIEdgeFilter:
         with patch.object(f._spy_filter, "_check", return_value=(False, "below 50SMA")):
             decision = f(df)
             assert not decision.allowed.iloc[-1]
-            assert decision.latest_reasons == ["SPY trend gate failed (below 200 or 50 SMA)"]
+            assert decision.latest_reasons == [
+                "SPY trend gate failed (below or insufficient history for 200/50 SMA)"
+            ]
 
     # ── Earnings blackout gate ────────────────────────────────────────────────
 
@@ -751,7 +777,7 @@ class TestRSIEdgeFilter:
 
         assert not decision.allowed.iloc[-1]
         assert decision.latest_reasons == [
-            "SPY trend gate failed (below 200 or 50 SMA)",
+            "SPY trend gate failed (below or insufficient history for 200/50 SMA)",
             "earnings blackout",
             "liquidity too low (avg_dollar_vol5=$6,300 < $500,000)",
             "new 5-day low (active breakdown)",
@@ -781,7 +807,9 @@ class TestRSIEdgeFilter:
         assert raw.entries.any()
         assert not filtered.entries.any()
         assert edge_allowed is False
-        assert edge_reasons == ["SPY trend gate failed (below 200 or 50 SMA)"]
+        assert edge_reasons == [
+            "SPY trend gate failed (below or insufficient history for 200/50 SMA)"
+        ]
 
 
 # ── TestBaseStrategySymbolInjection ───────────────────────────────────────────

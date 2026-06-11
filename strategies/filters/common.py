@@ -16,6 +16,8 @@ Design principles (from docs/RSI-edge-filter.md and docs/strategies.md):
   - SPYTrendFilter fails CLOSED on cold-start API failure (no prior cache).
     If a prior cache exists, stale data is reused and a WARNING is logged —
     last known SPY state is a safe proxy for brief outages.
+  - Every configured SPY SMA is mandatory. Insufficient history fails closed
+    rather than silently weakening a macro entry gate.
   - EarningsBlackout fails open — missing earnings data affects one symbol
     at a time; yfinance outages are common; silent blocking would be worse.
   - Exits are NEVER blocked — that responsibility lives in BaseStrategy.
@@ -51,8 +53,7 @@ class SPYTrendFilter:
 
     Args:
         sma_windows: SMA periods to check (e.g. [200] for SMA, [200, 50] for RSI).
-        lookback_days: Calendar days of SPY history to fetch (default 280 covers
-                       200 trading days with weekends/holidays).
+        lookback_days: Calendar days of SPY history to fetch (default 320).
         cache_ttl_seconds: How long to reuse a cached SPY fetch (default 600 s).
     """
 
@@ -60,7 +61,7 @@ class SPYTrendFilter:
         self,
         *,
         sma_windows: list[int],
-        lookback_days: int = 280,
+        lookback_days: int = 320,
         cache_ttl_seconds: float = 600.0,
     ) -> None:
         if not sma_windows:
@@ -126,11 +127,11 @@ class SPYTrendFilter:
             sma = close.rolling(window).mean()
             sma_val = sma.iloc[-1]
             if pd.isna(sma_val):
-                logger.debug(
-                    f"SPYTrendFilter: SMA{window} is NaN (insufficient bars) "
-                    "— skipping this window"
+                reason = (
+                    f"insufficient SPY history for SMA{window}: "
+                    f"{len(close)} bars available, {window} required"
                 )
-                continue
+                return False, reason
             if last_close <= sma_val:
                 reason = (
                     f"SPY {last_close:.2f} ≤ SMA{window} {sma_val:.2f}"

@@ -48,14 +48,15 @@ All four gates must be `True` on a given bar for an entry to be allowed on that 
 - 200 SMA: structural bear market gate — RSI reversion into a broad bear is catching a falling knife, not a mean-reversion setup
 - 50 SMA: intermediate downtrend gate — even in a long-term bull, a SPY below its 50 SMA signals deteriorating momentum where individual oversold setups are more likely to extend than revert
 
-**SPY data:** fetched once per engine cycle with a 600-second TTL cache. All symbols in one cycle share the same SPY fetch — no repeated API calls.
+**SPY data:** fetched once per engine cycle with a 600-second TTL cache. All symbols in one cycle share the same SPY fetch — no repeated API calls. The default 320-calendar-day lookback provides a holiday-aware buffer beyond the 200 trading sessions required by SMA200.
 
-**Failure behaviour — two distinct cases:**
+**Failure behaviour:**
 
 | Situation | Behaviour | Rationale |
 |---|---|---|
 | Cold-start: no prior cache exists | **Fail closed** — block all entries, log ERROR | No SPY data at all during a potential crash is the highest-risk scenario. Deploying the entire RSI sleeve into a collapsing market because the data API is down is unacceptable. |
 | Warm: prior cache exists, fetch failed | **Use stale cache**, log WARNING | Last known SPY state (at most one TTL interval old) is a reasonable proxy during brief outages. Daily SMA values do not change materially in 10 minutes. |
+| Fewer bars than any configured SMA requires | **Fail closed** — block all entries and report available/required bars | A mandatory macro gate must not silently disappear because a calendar lookback contains fewer trading sessions than expected. |
 
 The TTL is 600 seconds. After a failed fetch `cache_time` is still advanced, so the API is retried no more than once per TTL interval rather than every cycle.
 
@@ -112,7 +113,7 @@ This gate blocks those entries without penalising normal pullbacks, which is wha
 
 | Parameter | Default | Description |
 |---|---|---|
-| `spy_lookback_days` | 280 | Calendar days of SPY history to fetch (covers 200 trading days) |
+| `spy_lookback_days` | 320 | Calendar days of SPY history to fetch (buffered beyond 200 trading days) |
 | `spy_cache_ttl` | 600.0 s | SPY cache TTL — reused across all symbols in one cycle |
 | `days_before` | 3 | Earnings blackout: calendar days before announcement |
 | `days_after` | 2 | Earnings blackout: calendar days after announcement |
@@ -142,7 +143,7 @@ INFO | RSI_FILTER_ALLOWED ALLY — SPY=True earnings=True liquid=True no_new_low
 
 **Entry blocked** (one or more gates failed, all failing gates listed):
 ```
-INFO | RSI_FILTER_BLOCKED CDNS — SPY trend gate failed (below 200 or 50 SMA)
+INFO | RSI_FILTER_BLOCKED CDNS — SPY trend gate failed (below or insufficient history for 200/50 SMA)
 INFO | RSI_FILTER_BLOCKED CCK — earnings blackout
 INFO | RSI_FILTER_BLOCKED SN — volume illiquid (avg20=312,450 < 500,000)
 INFO | RSI_FILTER_BLOCKED TFC — new 20-day low (active breakdown)
