@@ -111,6 +111,17 @@ class DonchianBreakout(BaseStrategy):
             return None
         return float(latest)
 
+    def trigger_prices(self, df: pd.DataFrame) -> pd.Series | None:
+        """PLAN 11.47 backtest parity: per-bar trigger price (the prior-N-day
+        high indexed identically to df). The backtest runner pairs each
+        signal bar with the trigger level used at submission time so the
+        gap-up no-fill, gap-down no-trigger, and intraday-cross fill
+        cases match production. Returns None when close is missing."""
+        if "close" not in df.columns or len(df) == 0:
+            return None
+        with_high = add_donchian_high(df, self.entry_window)
+        return with_high[f"donchian_high_{self.entry_window}"]
+
     def _raw_signals(self, df: pd.DataFrame) -> SignalFrame:
         if "close" not in df.columns:
             raise ValueError("DonchianBreakout requires a 'close' column")

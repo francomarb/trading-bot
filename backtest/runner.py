@@ -158,6 +158,71 @@ def _shift_for_next_open(s: pd.Series) -> pd.Series:
     return pd.Series(values, index=s.index, dtype=bool)
 
 
+def _apply_stop_limit_semantics(
+    df: pd.DataFrame,
+    entries: pd.Series,
+    trigger_prices: pd.Series,
+    *,
+    chase_bps: float,
+    chase_atr_fraction: float | None,
+    atr_series: pd.Series | None,
+) -> tuple[pd.Series, pd.Series]:
+    """PLAN 11.47 backtest parity. Given the shifted entry signals and the
+    per-bar trigger price series (also shifted to align with execution
+    bar t+1), apply broker-side stop-limit semantics:
+
+      - If bar t+1 high < trigger: stop never fires → no fill.
+      - If bar t+1 open > limit (gap above cap): stop fires but limit
+        refuses → no fill.
+      - Otherwise: fill at max(stop_price, bar.open) — never above limit.
+
+    `chase_bps` / `chase_atr_fraction` mirror the production
+    EntryPriceCap policy; passing both takes the tighter cap, matching
+    `execution/entry_guard.compute_cap_price` exactly.
+
+    Returns (entries_with_stop_limit_filter, fill_price_series).
+    fill_price_series is suitable to pass as `price=` to vectorbt.
+    """
+    open_ = df["open"]
+    high = df["high"]
+    # Shift trigger so that the bar t signal's trigger aligns with the
+    # execution bar t+1, matching how entries were shifted.
+    trigger_at_exec = trigger_prices.shift(1)
+
+    # Per-bar limit = trigger * (1 + tighter of bps and atr knobs).
+    bps_cushion = trigger_at_exec * (chase_bps / 1e4)
+    if chase_atr_fraction is not None and atr_series is not None:
+        atr_at_exec = atr_series.shift(1)
+        atr_cushion = chase_atr_fraction * atr_at_exec
+        cushion = pd.concat([bps_cushion, atr_cushion], axis=1).min(axis=1)
+    else:
+        cushion = bps_cushion
+    limit_at_exec = trigger_at_exec + cushion
+
+    valid = entries & trigger_at_exec.notna() & high.notna() & open_.notna()
+    fires = valid & (high >= trigger_at_exec) & (open_ <= limit_at_exec)
+
+    # Fill price: max(trigger, open) — if open >= trigger, fill at open
+    # (limit fires immediately); if open < trigger, fill at trigger
+    # (trigger fires intraday).
+    fill_price = pd.Series(
+        [
+            max(float(t), float(o)) if fired else float("nan")
+            for t, o, fired in zip(
+                trigger_at_exec.fillna(0.0).tolist(),
+                open_.fillna(0.0).tolist(),
+                fires.tolist(),
+                strict=False,
+            )
+        ],
+        index=df.index,
+    )
+    # Fall back to bar open for bars where stop-limit was not applied
+    # (vbt expects a price for every bar even when entries are False).
+    fill_price = fill_price.where(fires, open_)
+    return fires.astype(bool), fill_price
+
+
 def run_backtest(
     strategy: BaseStrategy,
     df: pd.DataFrame,
@@ -167,6 +232,9 @@ def run_backtest(
     atr_stop_mult: float | None = None,
     atr_length: int = 14,
     atr_trail: bool = False,
+    stop_limit_entries: bool = False,
+    stop_limit_chase_bps: float = 500.0,
+    stop_limit_chase_atr_fraction: float | None = 2.0,
 ) -> BacktestResult:
     """
     Run `strategy` against `df` (must have 'open' and 'close' columns) under
@@ -188,6 +256,18 @@ def run_backtest(
             trend-following strategies (Donchian Breakout); see
             docs/donchian_breakout_strategy.md for the empirical case.
             Has no effect when atr_stop_mult is None.
+        stop_limit_entries: PLAN 11.47 backtest parity. When True and the
+            strategy implements ``trigger_prices(df)``, simulate broker-side
+            stop-limit semantics for entries: a bar's signal only fills
+            when the execution bar's high reaches the trigger AND the
+            execution bar's open is at-or-below the chase-capped limit.
+            Without this flag, a STOP_LIMIT strategy's backtest silently
+            falls back to next-open fills and diverges from production.
+        stop_limit_chase_bps: Maximum chase above the trigger in bps;
+            paired with stop_limit_chase_atr_fraction (tighter wins).
+            Defaults match settings.ENTRY_PRICE_CAPS['donchian_breakout'].
+        stop_limit_chase_atr_fraction: Maximum chase in ATR units; pair
+            with bps. Set None to disable the ATR side of the cap.
     """
     cfg = config or BacktestConfig()
     _required_cols(df)
@@ -201,6 +281,40 @@ def run_backtest(
     raw = strategy.generate_signals(df, symbol=symbol)
     entries = _shift_for_next_open(raw.entries)
     exits = _shift_for_next_open(raw.exits)
+
+    # PLAN 11.47 — stop-limit fill semantics for production parity.
+    entry_price_series = df["open"]
+    if stop_limit_entries:
+        trigger_prices = strategy.trigger_prices(df)
+        if trigger_prices is None:
+            raise ValueError(
+                f"stop_limit_entries=True but {type(strategy).__name__} "
+                "does not implement trigger_prices(df); cannot simulate "
+                "stop-limit semantics"
+            )
+        if "high" not in df.columns:
+            raise ValueError(
+                "stop_limit_entries=True requires a 'high' column to "
+                "evaluate the trigger crossing"
+            )
+        atr_series_for_cap: pd.Series | None = None
+        if stop_limit_chase_atr_fraction is not None:
+            from indicators.technicals import add_atr
+            if "low" not in df.columns:
+                raise ValueError(
+                    "stop_limit_chase_atr_fraction requires high/low "
+                    "columns for ATR computation"
+                )
+            with_atr_local = add_atr(df, atr_length)
+            atr_series_for_cap = with_atr_local[f"atr_{atr_length}"]
+        entries, entry_price_series = _apply_stop_limit_semantics(
+            df,
+            entries,
+            trigger_prices,
+            chase_bps=stop_limit_chase_bps,
+            chase_atr_fraction=stop_limit_chase_atr_fraction,
+            atr_series=atr_series_for_cap,
+        )
 
     sl_stop = None
     if atr_stop_mult is not None:
@@ -224,7 +338,7 @@ def run_backtest(
         close=df["close"],
         entries=entries,
         exits=exits,
-        price=df["open"],                       # fill at the bar's open
+        price=entry_price_series,               # per-bar fill price (stop-limit-aware)
         init_cash=cfg.initial_cash,
         slippage=cfg.slippage_bps / 10_000.0,   # vbt: fraction
         fixed_fees=cfg.commission_per_trade,    # per-trade $

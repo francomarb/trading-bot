@@ -340,3 +340,172 @@ class TestParameterSensitivity:
                 {"fast": [50], "slow": [20]},   # only invalid combo
                 df,
             )
+
+
+# ── PLAN 11.47: stop-limit entry semantics in backtest ──────────────────────
+
+
+class TestStopLimitBacktestSemantics:
+    """The backtest must simulate broker stop-limit fill behavior or any
+    Donchian audit comparing paper vs backtest will diverge invisibly."""
+
+    def _df_with_explicit_oh(self, rows: list[tuple[float, float, float, float]]) -> pd.DataFrame:
+        # rows = [(open, high, low, close), ...]
+        idx = pd.date_range("2026-01-01", periods=len(rows), freq="D", tz="UTC")
+        return pd.DataFrame(
+            {
+                "open":  [r[0] for r in rows],
+                "high":  [r[1] for r in rows],
+                "low":   [r[2] for r in rows],
+                "close": [r[3] for r in rows],
+                "volume": [1_000_000] * len(rows),
+            },
+            index=idx,
+        )
+
+    class _FixedTriggerStrategy(BaseStrategy):
+        """Always signal entry at the given index; trigger is a constant."""
+
+        name = "fixed_trigger"
+
+        def __init__(self, *, entry_idx: int, trigger: float):
+            super().__init__()
+            self._entry_idx = entry_idx
+            self._trigger = trigger
+
+        def _raw_signals(self, df: pd.DataFrame) -> SignalFrame:
+            n = len(df)
+            e = pd.Series([i == self._entry_idx for i in range(n)], index=df.index)
+            x = pd.Series(False, index=df.index)
+            return SignalFrame(entries=e, exits=x)
+
+        def trigger_prices(self, df: pd.DataFrame) -> pd.Series:
+            return pd.Series([self._trigger] * len(df), index=df.index)
+
+    def test_gap_up_over_limit_no_fill(self):
+        """Entry signal fires at bar 5 (trigger=245). Bar 6 opens at $277
+        — well above the 500 bps cap of ~$257. Limit refuses → no fill."""
+        from backtest.runner import run_backtest, BacktestConfig
+
+        rows = []
+        # Bars 0-5: flat at $240, then entry signal at bar 5.
+        for _ in range(5):
+            rows.append((240.0, 241.0, 239.0, 240.0))
+        # Bar 5 (signal): close at $245 (= trigger).
+        rows.append((242.0, 246.0, 241.0, 245.0))
+        # Bar 6 (execution): gap up to $277.
+        rows.append((277.0, 280.0, 275.0, 278.0))
+        # Bars 7-10: hold.
+        for _ in range(4):
+            rows.append((278.0, 279.0, 277.0, 278.0))
+        df = self._df_with_explicit_oh(rows)
+
+        result = run_backtest(
+            self._FixedTriggerStrategy(entry_idx=5, trigger=245.0),
+            df,
+            BacktestConfig(initial_cash=10_000.0),
+            stop_limit_entries=True,
+            stop_limit_chase_bps=500,
+            stop_limit_chase_atr_fraction=None,
+        )
+        # No trade should have executed.
+        assert result.portfolio.trades.records.shape[0] == 0
+
+    def test_gap_down_below_trigger_no_fill(self):
+        """Signal at bar 5 (trigger=$245). Bar 6 opens at $228, never
+        rallies above $240. Stop never triggers → no fill."""
+        from backtest.runner import run_backtest, BacktestConfig
+
+        rows = []
+        for _ in range(5):
+            rows.append((240.0, 241.0, 239.0, 240.0))
+        rows.append((242.0, 246.0, 241.0, 245.0))
+        # Bar 6: gap down, never reaches trigger.
+        rows.append((228.0, 240.0, 227.0, 235.0))
+        for _ in range(4):
+            rows.append((235.0, 236.0, 234.0, 235.0))
+        df = self._df_with_explicit_oh(rows)
+
+        result = run_backtest(
+            self._FixedTriggerStrategy(entry_idx=5, trigger=245.0),
+            df,
+            BacktestConfig(initial_cash=10_000.0),
+            stop_limit_entries=True,
+            stop_limit_chase_bps=500,
+            stop_limit_chase_atr_fraction=None,
+        )
+        assert result.portfolio.trades.records.shape[0] == 0
+
+    def test_clean_intraday_breakout_fills_at_trigger(self):
+        """Signal at bar 5 (trigger=$245). Bar 6 opens at $244 (below
+        trigger), rallies through $245 intraday to $250. Stop fires at
+        $245, limit allows → fill at $245."""
+        from backtest.runner import run_backtest, BacktestConfig
+
+        rows = []
+        for _ in range(5):
+            rows.append((240.0, 241.0, 239.0, 240.0))
+        rows.append((242.0, 246.0, 241.0, 245.0))
+        # Bar 6: open below trigger, high crosses trigger.
+        rows.append((244.0, 250.0, 243.0, 249.0))
+        for _ in range(4):
+            rows.append((249.0, 250.0, 248.0, 249.0))
+        df = self._df_with_explicit_oh(rows)
+
+        result = run_backtest(
+            self._FixedTriggerStrategy(entry_idx=5, trigger=245.0),
+            df,
+            BacktestConfig(initial_cash=10_000.0),
+            stop_limit_entries=True,
+            stop_limit_chase_bps=500,
+            stop_limit_chase_atr_fraction=None,
+        )
+        assert result.portfolio.trades.records.shape[0] == 1
+        # Fill at max(trigger, open) = max(245, 244) = 245.
+        # (slippage in vectorbt is applied multiplicatively from this base.)
+        entry_price = result.portfolio.trades.records["entry_price"].iloc[0]
+        assert entry_price == pytest.approx(245.0, rel=0.01)
+
+    def test_modest_gap_up_within_cap_fills_at_open(self):
+        """Signal at bar 5 (trigger=$245). Bar 6 opens at $250 (within
+        500 bps cap of $257.25). Stop fires immediately at open, limit
+        allows → fill at $250."""
+        from backtest.runner import run_backtest, BacktestConfig
+
+        rows = []
+        for _ in range(5):
+            rows.append((240.0, 241.0, 239.0, 240.0))
+        rows.append((242.0, 246.0, 241.0, 245.0))
+        rows.append((250.0, 253.0, 249.0, 252.0))
+        for _ in range(4):
+            rows.append((252.0, 253.0, 251.0, 252.0))
+        df = self._df_with_explicit_oh(rows)
+
+        result = run_backtest(
+            self._FixedTriggerStrategy(entry_idx=5, trigger=245.0),
+            df,
+            BacktestConfig(initial_cash=10_000.0),
+            stop_limit_entries=True,
+            stop_limit_chase_bps=500,
+            stop_limit_chase_atr_fraction=None,
+        )
+        assert result.portfolio.trades.records.shape[0] == 1
+        entry_price = result.portfolio.trades.records["entry_price"].iloc[0]
+        # Fill at max(trigger, open) = max(245, 250) = 250.
+        assert entry_price == pytest.approx(250.0, rel=0.01)
+
+    def test_strategy_without_trigger_prices_raises_when_flag_set(self):
+        """If a non-STOP_LIMIT strategy is run with stop_limit_entries=True,
+        the runner must fail loudly rather than silently fall back to
+        next-open semantics (which would silently diverge from production)."""
+        from backtest.runner import run_backtest, BacktestConfig
+
+        rows = [(100.0, 101.0, 99.0, 100.0)] * 10
+        df = self._df_with_explicit_oh(rows)
+        with pytest.raises(ValueError, match="trigger_prices"):
+            run_backtest(
+                _ScriptedStrategy(entry_idx=[5], exit_idx=[]),
+                df,
+                BacktestConfig(initial_cash=10_000.0),
+                stop_limit_entries=True,
+            )

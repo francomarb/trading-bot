@@ -331,6 +331,18 @@ class BaseStrategy(ABC):
         """
         return None
 
+    def trigger_prices(self, df: pd.DataFrame) -> pd.Series | None:
+        """
+        For STOP_LIMIT strategies: the per-bar trigger price series, indexed
+        identically to df. Default is None; subclasses that use STOP_LIMIT
+        and need backtest parity must override (Donchian: the prior-N-day
+        high series). Used by the backtest runner to simulate stop-limit
+        entry semantics — without it, a backtest of a STOP_LIMIT strategy
+        falls back to next-bar-open fills and silently diverges from
+        production. PLAN 11.47 backtest parity.
+        """
+        return None
+
     # Concrete strategies implement this.
     @abstractmethod
     def _raw_signals(self, df: pd.DataFrame) -> SignalFrame:
