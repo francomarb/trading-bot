@@ -475,6 +475,16 @@ class TestDrainSpreadFills:
         # The strategy must still hold the spread (state preserved).
         assert len(strategy.open_spreads) == 1
         assert strategy.open_spreads[0].position_id == "p1"
+        # PR #56 R6: position MUST stay in _spreads_pending_close so the
+        # next cycle's _process_credit_spread_exits does NOT dispatch a
+        # duplicate close order at the original full qty. The original
+        # partial-fill order may still be working at the broker (the worker
+        # exits on partially_filled per options_executor.py:275); a fresh
+        # close dispatch would risk over-closing.
+        assert "p1" in engine._spreads_pending_close, (
+            "partial close must keep the position pending to prevent a "
+            "duplicate close dispatch on the next cycle"
+        )
         # Allocator was called with is_full_close=False — partial P&L
         # contributes to dollar math but does NOT increment trade_count.
         engine._allocator.record_realized_pnl.assert_called_once()
@@ -492,6 +502,54 @@ class TestDrainSpreadFills:
             if r["position_type"] == "spread" and r["status"] == "partial"
         ]
         assert len(partial_rows) == 2  # one row per leg
+
+    def test_partial_close_pending_state_blocks_next_cycle_dispatch(self, tmp_path):
+        """PR #56 R6: the operational guarantee of the previous test.
+
+        After a partial-fill drain leaves the position in
+        _spreads_pending_close, _process_credit_spread_exits MUST skip
+        the position on the next cycle — even though the strategy
+        would otherwise want to close it. Without this, the engine
+        would dispatch a duplicate close at the original qty while
+        the first order may still be residual at the broker.
+        """
+        from datetime import date
+        strategy = _strategy()
+        engine, broker = _engine(tmp_path, strategy)
+        # Pre-register a 2-contract spread and put it in pending-close
+        # (simulating the state right after the R6 partial branch fires).
+        from engine.positions import make_spread, PositionLeg
+        engine._positions["p1"] = make_spread(
+            strategy_name="credit_spread", position_id="p1",
+            legs=[PositionLeg("SPY260618P00568000", -2, side="SELL"),
+                  PositionLeg("SPY260618P00558000", 2, side="BUY")],
+        )
+        engine._spread_owner_strategy["p1"] = strategy
+        strategy.register_spread(OpenSpread(
+            position_id="p1", short_occ="SPY260618P00568000",
+            long_occ="SPY260618P00558000", short_strike=568.0,
+            long_strike=558.0, expiration_date=_EXP,
+            net_credit=1.45, width=10.0, qty=2,
+        ))
+        # Critical: pending-close re-armed by R6.
+        engine._spreads_pending_close.add("p1")
+        # The broker dispatch must NOT be called this cycle.
+        broker.dispatch_spread_order.reset_mock()
+
+        # Run the close-exit evaluation directly (the path the cycle
+        # would take). Even if the strategy says "yes close," the
+        # pending guard must short-circuit BEFORE dispatch.
+        engine._process_credit_spread_exits(
+            strategy=strategy,
+            underlying=strategy.symbol,
+            underlying_close=1.0,  # well below short strike -> would force exit
+            current_regime=None,
+        )
+
+        # No new dispatch — the position is still pending the residual.
+        broker.dispatch_spread_order.assert_not_called()
+        # And it's still pending.
+        assert "p1" in engine._spreads_pending_close
 
     def test_close_canceled_keeps_position_for_retry(self, tmp_path):
         strategy = _strategy()

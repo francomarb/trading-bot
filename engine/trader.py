@@ -4949,11 +4949,23 @@ class TradingEngine:
                     # at the strategy/engine level; the residual stream event
                     # (when the rest fills) will land here again with
                     # full_close_combo=True and proceed normally.
+                    #
+                    # PR #56 R6: re-add to _spreads_pending_close so the
+                    # next cycle's _process_credit_spread_exits skips this
+                    # position and does NOT dispatch a duplicate close
+                    # order at the original full qty. The position remains
+                    # "pending close" until the broker reconciles the
+                    # residual fill (or the operator intervenes).
+                    # Line 4924's unconditional `discard` cleared the
+                    # pending state at the top of the close branch; this
+                    # re-arms it.
+                    self._spreads_pending_close.add(position_id)
                     logger.critical(
                         f"[{strategy_name}] credit spread PARTIAL close detected — "
                         f"position_id={position_id[:8]} close_qty={close_qty} < "
                         f"open_qty={peeked.qty} — state NOT released; "
-                        f"awaiting residual fill. Operator review recommended."
+                        f"position remains pending close (no duplicate dispatch); "
+                        f"awaiting residual fill or operator reconciliation."
                     )
                     try:
                         self.alerts.broker_error(
