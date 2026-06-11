@@ -4959,6 +4959,18 @@ class TradingEngine:
                     # Line 4924's unconditional `discard` cleared the
                     # pending state at the top of the close branch; this
                     # re-arms it.
+                    #
+                    # KNOWN RESIDUAL RISK (PLAN.md P2 follow-up):
+                    # _spreads_pending_close is in-memory only. A bot
+                    # restart between this partial detection and the
+                    # residual fill loses the marker — restart restores
+                    # the spread as open with residual qty (R5), this set
+                    # starts empty, and the next cycle may dispatch a
+                    # duplicate close. The CRITICAL alert below is the
+                    # current mitigation: operator reconciliation closes
+                    # the gap within minutes (the typical restart window).
+                    # See PLAN.md "MLEG partial-close residual
+                    # reconciliation" for the design space.
                     self._spreads_pending_close.add(position_id)
                     logger.critical(
                         f"[{strategy_name}] credit spread PARTIAL close detected — "
