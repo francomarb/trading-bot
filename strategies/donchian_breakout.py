@@ -25,8 +25,17 @@ maximum, not the maximum that includes today.
 
 Order type
 ----------
-MARKET — breakouts are price-sensitive. Missing the fill is worse than
-paying a few bps slippage. Same as SMACrossover.
+STOP_LIMIT (PLAN 11.47) — the broker holds a resting stop-limit at the
+breakout level. Trigger fires only when price actually crosses the prior
+N-day high (no overnight gap-up chase, no failed-breakout fill on gap-down).
+The chase cap from PLAN 11.32 becomes the limit price, so a gap-up that
+overshoots the cap simply doesn't fill. The bot's decision cadence remains
+"completed bars only" — yesterday's closed bars set the trigger; the broker
+handles the intraday trigger event.
+
+Hybrid sizing: the stop-limit leg uses whole shares (Alpaca constraint).
+Any fractional residual the sizer produces is submitted by the engine as a
+separately-gated market entry (PLAN 11.47 §residual gate).
 
 Why this strategy fits trending mega-caps
 -----------------------------------------
@@ -55,7 +64,9 @@ from strategies.base import BaseStrategy, EdgeFilter, OrderType, SignalFrame
 
 class DonchianBreakout(BaseStrategy):
     name = "donchian_breakout"
-    preferred_order_type = OrderType.MARKET
+    # PLAN 11.47: broker-resting stop-limit at the breakout level; chase cap
+    # baked into the limit price. See module docstring.
+    preferred_order_type = OrderType.STOP_LIMIT
 
     def __init__(
         self,
@@ -85,6 +96,20 @@ class DonchianBreakout(BaseStrategy):
         # max requires entry_window bars before today). Add a 5-bar safety buffer
         # to avoid edge cases on the first valid bar.
         return self.entry_window + 5
+
+    def latest_trigger_price(self, df: pd.DataFrame) -> float | None:
+        """PLAN 11.47: the prior-N-day high at the most recent bar — the
+        broker-side stop trigger. Returns None if the level cannot be
+        computed (not enough history); engine will skip the entry in that
+        case rather than fall back to MARKET silently."""
+        if "close" not in df.columns or len(df) == 0:
+            return None
+        with_high = add_donchian_high(df, self.entry_window)
+        series = with_high[f"donchian_high_{self.entry_window}"]
+        latest = series.iloc[-1]
+        if pd.isna(latest) or latest <= 0:
+            return None
+        return float(latest)
 
     def _raw_signals(self, df: pd.DataFrame) -> SignalFrame:
         if "close" not in df.columns:

@@ -322,6 +322,15 @@ class BaseStrategy(ABC):
         """
         return False
 
+    def latest_trigger_price(self, df: pd.DataFrame) -> float | None:
+        """
+        For STOP_LIMIT strategies: the broker-side stop trigger price at the
+        latest bar. Default is None; subclasses that use STOP_LIMIT must
+        override (Donchian: prior-N-day high). Engine fails the entry if
+        STOP_LIMIT is declared but no trigger price is returned.
+        """
+        return None
+
     # Concrete strategies implement this.
     @abstractmethod
     def _raw_signals(self, df: pd.DataFrame) -> SignalFrame:

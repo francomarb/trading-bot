@@ -44,8 +44,10 @@ class TestDonchianBreakoutParams:
         assert s.entry_window == 20
         assert s.exit_window == 10
 
-    def test_default_order_type_is_market(self):
-        assert DonchianBreakout().preferred_order_type == OrderType.MARKET
+    def test_default_order_type_is_stop_limit(self):
+        # PLAN 11.47: Donchian uses broker-side stop-limit so the trigger
+        # condition refuses gap-up chase and failed-breakout fills.
+        assert DonchianBreakout().preferred_order_type == OrderType.STOP_LIMIT
 
     def test_name_attribute(self):
         assert DonchianBreakout.name == "donchian_breakout"

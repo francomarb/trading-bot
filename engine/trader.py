@@ -1535,7 +1535,14 @@ class TradingEngine:
         # `is_option`/strategy hooks; the cap is for plain equity MARKET entries
         # only. We key the policy by strategy name and only act when the
         # strategy itself declares MARKET as its preferred order type.
+        #
+        # PLAN 11.47: STOP_LIMIT strategies (Donchian) use the same cap math
+        # but apply it structurally — the cap becomes the limit price baked
+        # into the broker-side stop-limit. The strategy's latest_trigger_price
+        # hook supplies the breakout level; we skip the entry (rather than
+        # silently degrade to MARKET) if the level is unavailable.
         entry_max_price: float | None = None
+        entry_trigger_price: float | None = None
         if (
             not hasattr(strategy, "build_option_execution")
             and strategy.preferred_order_type is OrderType.MARKET
@@ -1556,12 +1563,56 @@ class TradingEngine:
                     f"(ref ${target_price:.2f}, atr {latest_atr:.2f}, "
                     f"chase {cap_decision.diagnostics['chase_bps']:.1f}bps)"
                 )
+        elif (
+            not hasattr(strategy, "build_option_execution")
+            and strategy.preferred_order_type is OrderType.STOP_LIMIT
+        ):
+            trigger = strategy.latest_trigger_price(df)
+            if trigger is None or trigger <= 0:
+                logger.warning(
+                    f"[entry-guard] {strategy.name} {symbol}: STOP_LIMIT "
+                    f"strategy did not produce a trigger price; skipping entry"
+                )
+                self._mark_signal_bar_processed(
+                    signal_key, signal_bar, strategy_statuses, strategy_reasons, symbol
+                )
+                return None
+            policy = settings.ENTRY_PRICE_CAPS.get(strategy.name)
+            if policy is None:
+                logger.warning(
+                    f"[entry-guard] {strategy.name} {symbol}: STOP_LIMIT "
+                    f"strategy has no ENTRY_PRICE_CAPS policy; skipping entry"
+                )
+                self._mark_signal_bar_processed(
+                    signal_key, signal_bar, strategy_statuses, strategy_reasons, symbol
+                )
+                return None
+            from execution.entry_guard import compute_cap_price
+            cap_price = compute_cap_price(
+                reference_price=float(trigger),
+                atr=latest_atr,
+                side="buy",
+                policy=policy,
+            )
+            entry_trigger_price = float(trigger)
+            entry_max_price = float(cap_price)
+            chase_bps = (entry_max_price / entry_trigger_price - 1.0) * 1e4
+            logger.info(
+                f"[entry-guard] {strategy.name} {symbol}: STOP_LIMIT "
+                f"trigger=${entry_trigger_price:.2f} limit=${entry_max_price:.2f} "
+                f"(latest_close=${target_price:.2f} atr=${latest_atr:.2f} "
+                f"chase={chase_bps:.1f}bps)"
+            )
 
         sig = Signal(
             symbol=target_symbol,
             side=Side.BUY,
             strategy_name=strategy.name,
-            reference_price=target_price,
+            reference_price=(
+                entry_trigger_price
+                if entry_trigger_price is not None
+                else target_price
+            ),
             atr=latest_atr,
             reason=f"{strategy.name} entry @ {latest_ts.isoformat()}",
             order_type=strategy.preferred_order_type,
@@ -1569,6 +1620,7 @@ class TradingEngine:
             take_profit_price=take_profit,
             stop_price_override=stop_price,
             entry_max_price=entry_max_price,
+            entry_trigger_price=entry_trigger_price,
         )
         decision = self.risk.evaluate(sig, account, notional_cap=notional_cap)
         if isinstance(decision, RiskRejection):
