@@ -128,6 +128,10 @@ class Signal:
     # + OTO at exactly this price instead of an unbounded market order.
     # LIMIT signals must not carry this — they already control their fill price.
     entry_max_price: float | None = None
+    # PLAN 11.47 stop-limit entries: the broker-side trigger price (the
+    # breakout level). Required when order_type is STOP_LIMIT; ignored
+    # otherwise. The chase cap (entry_max_price) becomes the limit price.
+    entry_trigger_price: float | None = None
 
 
 class RejectionCode(str, Enum):
@@ -182,6 +186,10 @@ class RiskDecision:
     # gate_entry() decides to convert a MARKET entry to a capped marketable
     # DAY LIMIT. Broker honors this regardless of order_type.
     entry_max_price: float | None = None
+    # PLAN 11.47 — broker-side stop trigger for STOP_LIMIT entries.
+    # When order_type is STOP_LIMIT, the broker submits a stop-limit at
+    # (stop=entry_trigger_price, limit=entry_max_price).
+    entry_trigger_price: float | None = None
 
     def __post_init__(self) -> None:
         # Defensive: any caller that constructs this manually still has to pass
@@ -213,6 +221,36 @@ class RiskDecision:
             )
         if self.order_type is OrderType.MARKET and self.limit_price is not None:
             raise ValueError("MARKET order must not carry a limit_price")
+        if self.order_type is OrderType.STOP_LIMIT:
+            if self.entry_trigger_price is None or self.entry_trigger_price <= 0:
+                raise ValueError(
+                    "STOP_LIMIT order requires a positive entry_trigger_price, "
+                    f"got {self.entry_trigger_price!r}"
+                )
+            if self.entry_max_price is None or self.entry_max_price <= 0:
+                raise ValueError(
+                    "STOP_LIMIT order requires entry_max_price to be set as the "
+                    f"limit price, got {self.entry_max_price!r}"
+                )
+            if self.limit_price is not None:
+                raise ValueError(
+                    "STOP_LIMIT order uses entry_max_price as its limit; "
+                    "limit_price must remain None"
+                )
+            if self.side is Side.BUY and self.entry_max_price < self.entry_trigger_price:
+                raise ValueError(
+                    f"BUY STOP_LIMIT entry_max_price {self.entry_max_price} "
+                    f"must be >= entry_trigger_price {self.entry_trigger_price}"
+                )
+            if self.side is Side.BUY and self.entry_trigger_price <= self.stop_price:
+                raise ValueError(
+                    f"BUY STOP_LIMIT entry_trigger_price {self.entry_trigger_price} "
+                    f"must be > protective stop_price {self.stop_price}"
+                )
+        elif self.entry_trigger_price is not None:
+            raise ValueError(
+                "entry_trigger_price is only valid for STOP_LIMIT orders"
+            )
         if self.entry_max_price is not None:
             if self.entry_max_price <= 0:
                 raise ValueError(
@@ -564,9 +602,13 @@ class RiskManager:
         # Choose floor function based on fractional mode.
         # LIMIT orders (RSI reversion) always use whole shares — Alpaca GTC
         # limit orders do not support fractional quantities. Options cannot be fractional.
+        # STOP_LIMIT (Donchian, PLAN 11.47): the stop-limit leg itself only
+        # supports whole shares, but engine splits the sized qty into
+        # whole + fractional residual at submission time. Size as fractional
+        # here so the residual is preserved; engine does the split.
         fractional = (
             settings.FRACTIONAL_ENABLED
-            and signal.order_type is OrderType.MARKET
+            and signal.order_type in (OrderType.MARKET, OrderType.STOP_LIMIT)
             and not is_option
         )
         _floor = (lambda x: math.floor(x * 100) / 100) if fractional else math.floor
@@ -756,7 +798,7 @@ class RiskManager:
         if settings.LIVE_TRADING and settings.LIVE_SIZE_MULTIPLIER != 1.0:
             _is_fractional = (
                 settings.FRACTIONAL_ENABLED
-                and signal.order_type is OrderType.MARKET
+                and signal.order_type in (OrderType.MARKET, OrderType.STOP_LIMIT)
             )
             if _is_fractional:
                 qty = max(

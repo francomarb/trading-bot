@@ -68,6 +68,11 @@ class MultiLegTradeRejected(ValueError):
 class OrderType(Enum):
     MARKET = "market"
     LIMIT = "limit"
+    # Stop-limit: broker triggers a limit at `entry_trigger_price`, with the
+    # limit capped at `entry_max_price`. Used by price-level breakout
+    # strategies (Donchian) per PLAN 11.47 to delegate the intraday trigger
+    # to the broker while keeping the chase cap structurally enforced.
+    STOP_LIMIT = "stop_limit"
 
 
 @dataclass(frozen=True)
