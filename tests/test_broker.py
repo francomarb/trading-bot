@@ -574,6 +574,43 @@ class TestSubmitOrderKwargs:
         )
         broker._lifecycle_begin.assert_not_called()
 
+    def test_skip_lifecycle_threads_through_fractional_path(self):
+        """PR #58 R3 P1: the residual MARKET is fractional, so
+        place_order routes to _place_fractional_order BEFORE its own
+        skip_lifecycle guard runs. The flag must be honored in the
+        fractional path too, or the residual still mints a second
+        position_uid."""
+        from unittest.mock import patch
+        api = MagicMock()
+        api.submit_order.return_value = _alpaca_order(status="filled")
+        api.get_order_by_id.return_value = _alpaca_order(status="filled")
+        broker = _broker_with_mock(api)
+        broker._lifecycle_begin = MagicMock()
+
+        # Force the FRACTIONAL_ENABLED gate so the fractional path is
+        # actually taken (otherwise risk manager would have whole-floored).
+        with patch("config.settings.FRACTIONAL_ENABLED", True):
+            broker.place_order(
+                _decision(qty=0.88),
+                poll_timeout=0.1,
+                skip_lifecycle=True,
+            )
+        broker._lifecycle_begin.assert_not_called()
+
+    def test_fractional_path_default_still_mints_position_uid(self):
+        """Sanity: without skip_lifecycle, the fractional path still
+        creates a lifecycle row — existing behavior preserved."""
+        from unittest.mock import patch
+        api = MagicMock()
+        api.submit_order.return_value = _alpaca_order(status="filled")
+        api.get_order_by_id.return_value = _alpaca_order(status="filled")
+        broker = _broker_with_mock(api)
+        broker._lifecycle_begin = MagicMock(return_value="pos-uid-frac")
+
+        with patch("config.settings.FRACTIONAL_ENABLED", True):
+            broker.place_order(_decision(qty=0.88), poll_timeout=0.1)
+        broker._lifecycle_begin.assert_called_once()
+
     def test_default_lifecycle_path_still_mints_position_uid(self):
         """Sanity: skip_lifecycle defaults to False and the existing
         lifecycle path is unchanged."""

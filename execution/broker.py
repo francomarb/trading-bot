@@ -929,7 +929,10 @@ class AlpacaBroker:
         # never entered and the OTO path below is byte-for-byte unchanged.
         if math.floor(decision.qty) != decision.qty:
             return self._place_fractional_order(
-                decision, poll_timeout=poll_timeout, poll_interval=poll_interval
+                decision,
+                poll_timeout=poll_timeout,
+                poll_interval=poll_interval,
+                skip_lifecycle=skip_lifecycle,
             )
 
         # Build request object.
@@ -1172,6 +1175,7 @@ class AlpacaBroker:
         *,
         poll_timeout: float,
         poll_interval: float,
+        skip_lifecycle: bool = False,
     ) -> OrderResult:
         """
         Fractional market entry path — only reached when FRACTIONAL_ENABLED=True
@@ -1191,6 +1195,13 @@ class AlpacaBroker:
 
         When FRACTIONAL_ENABLED=False this method is never called — place_order()
         routes directly to the OTO GTC path, which is byte-for-byte unchanged.
+
+        Args:
+            skip_lifecycle: PLAN 11.47 (PR #58 R3 P1). When True, do NOT
+                mint a fresh position_uid via _lifecycle_begin. Used by
+                the hybrid residual MARKET path where the primary
+                STOP_LIMIT already minted the position_uid; the residual
+                aggregates into the same broker-side position.
         """
         client_order_id = f"{decision.strategy_name}-frac-{uuid.uuid4().hex[:10]}"
         # Operator Controls Phase A — position_uid created after the
@@ -1234,10 +1245,20 @@ class AlpacaBroker:
 
         # Operator Controls Phase A — pending lifecycle row written
         # only after the dry-run guard passes.
-        position_uid = self._lifecycle_begin(
-            decision=decision,
-            client_order_id=client_order_id,
-        )
+        #
+        # PR #58 R3 P1: thread skip_lifecycle through the fractional
+        # path. The residual market is fractional (0.88 ASML shares,
+        # etc.) so place_order routes here BEFORE it reaches its own
+        # skip_lifecycle guard. Without honoring it here too, the
+        # residual would mint a second position_uid for what the broker
+        # treats as one symbol-level position.
+        if skip_lifecycle:
+            position_uid = None
+        else:
+            position_uid = self._lifecycle_begin(
+                decision=decision,
+                client_order_id=client_order_id,
+            )
 
         order_request = MarketOrderRequest(
             symbol=decision.symbol,
