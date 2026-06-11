@@ -1640,6 +1640,23 @@ class TradingEngine:
             return None
         assert isinstance(decision, RiskDecision)
 
+        # PLAN 11.47 hybrid submission split — Donchian-style STOP_LIMIT
+        # entries with fractional sizing are submitted as two orders: a
+        # whole-share stop-limit (broker-side trigger + chase cap as the
+        # limit) plus a fractional residual MARKET capped via the existing
+        # 11.32 entry_max_price path. The residual is gated on the live
+        # quote being at-or-above the breakout level (refuses to fill the
+        # residual on a failed-breakout gap-down). Helper returns:
+        #   primary: the decision actually submitted (may be the original,
+        #            a whole-share rewrite, or a MARKET-only rewrite when
+        #            the position rounded entirely to a fractional residual)
+        #   residual: the fractional MARKET decision to submit after the
+        #             primary, or None if no residual is needed/gated out
+        primary_decision, residual_decision = self._prepare_stop_limit_split(
+            decision, target_symbol
+        )
+        decision = primary_decision
+
         # Arrival-price benchmark for execution-quality slippage measurement
         # (industry TCA: Implementation Shortfall vs Arrival Price). Capture
         # the NBBO midpoint immediately before submission so the eventual
@@ -1736,6 +1753,15 @@ class TradingEngine:
                 slippage_ref,
                 benchmark_kind=slippage_kind,
             )
+            # PLAN 11.47 hybrid path — fire the fractional residual MARKET
+            # after the whole-share STOP_LIMIT has been submitted. Whether
+            # the primary is FILLED/PARTIAL (rare, only if the broker
+            # triggered the stop immediately at submission because live was
+            # already at/above the trigger) or ACCEPTED (the resting case),
+            # we want the residual now so the position fills to intended
+            # sizing. Residual failures are logged but never raise.
+            if residual_decision is not None:
+                self._submit_stop_limit_residual(residual_decision, strategy.name)
             if result.status in {OrderStatus.FILLED, OrderStatus.PARTIAL}:
                 # PLAN 11.10f: lifecycle counter — filled_entries.
                 # Per design §12.4.1: one entry that opened a position
@@ -1853,6 +1879,158 @@ class TradingEngine:
             self._processed_signal_reasons[key] = list(
                 strategy_reasons.get(symbol, [])
             )
+
+    def _prepare_stop_limit_split(
+        self,
+        decision: RiskDecision,
+        target_symbol: str,
+    ) -> tuple[RiskDecision, RiskDecision | None]:
+        """PLAN 11.47 hybrid submission split.
+
+        For a STOP_LIMIT decision with fractional qty, split into:
+          - whole-share STOP_LIMIT (the structural protection)
+          - fractional MARKET residual (existing 11.32 cap applies)
+
+        The residual is gated on the live quote being at-or-above the
+        trigger so a failed-breakout gap-down does not fill the residual
+        as a 'cheap' entry on an invalid signal.
+
+        Returns (primary_decision, residual_decision_or_None). The primary
+        decision is what gets submitted first; the residual (if non-None)
+        is submitted after.
+
+        Edge cases:
+          - Non-STOP_LIMIT decision → returns (decision, None) unchanged.
+          - Integer qty → returns (decision, None) unchanged.
+          - whole_qty == 0 (entire qty is fractional, e.g. high-priced
+            symbol that sized to less than one whole share) → returns a
+            MARKET-only rewrite (no stop-limit submission possible) and
+            None residual. Logs that the structural stop-limit protection
+            was unavailable for this entry; 11.32 still caps the MARKET.
+        """
+        if decision.order_type is not OrderType.STOP_LIMIT:
+            return decision, None
+        # Fractional residual = decision.qty's two-decimal fractional part.
+        whole_qty = int(decision.qty)
+        residual_qty = round(float(decision.qty) - whole_qty, 2)
+        if residual_qty <= 0:
+            # Clean whole-share STOP_LIMIT — no residual.
+            return decision, None
+        trigger = decision.entry_trigger_price
+        if trigger is None or trigger <= 0:
+            # Should be impossible given RiskDecision validation; defensive.
+            logger.warning(
+                f"[entry-guard] {decision.symbol}: STOP_LIMIT decision "
+                f"missing trigger price during split; submitting unchanged"
+            )
+            return decision, None
+
+        if whole_qty == 0:
+            # The position rounded entirely to a fractional residual — the
+            # stop-limit path is unavailable for this entry (whole_qty=0
+            # would be rejected by Alpaca). Fall back to a MARKET-only
+            # submission with the existing 11.32 cap.
+            logger.warning(
+                f"[entry-guard] {decision.symbol}: STOP_LIMIT sized to "
+                f"qty={decision.qty} < 1 whole share; falling back to "
+                f"MARKET with cap=${decision.entry_max_price:.2f} "
+                f"(structural stop-limit protection unavailable; 11.32 "
+                f"chase cap still applies)"
+            )
+            return (
+                replace(
+                    decision,
+                    qty=residual_qty,
+                    order_type=OrderType.MARKET,
+                    entry_trigger_price=None,
+                ),
+                None,
+            )
+
+        # Residual gate: only submit the fractional residual if the live
+        # quote is already at or above the breakout level.
+        live = _finite_or_none(
+            self.broker.get_latest_quote_midpoint(target_symbol)
+        )
+        if live is None or live < trigger:
+            logger.info(
+                f"[entry-guard] {decision.symbol}: residual MARKET gated "
+                f"out (live="
+                f"{f'${live:.2f}' if live is not None else 'unavailable'}, "
+                f"trigger=${trigger:.2f}) — submitting whole-share "
+                f"STOP_LIMIT for {whole_qty} shares only "
+                f"(dropping {residual_qty} fractional residual)"
+            )
+            whole = replace(decision, qty=whole_qty)
+            return whole, None
+
+        whole = replace(decision, qty=whole_qty)
+        residual = replace(
+            decision,
+            qty=residual_qty,
+            order_type=OrderType.MARKET,
+            entry_trigger_price=None,
+        )
+        logger.info(
+            f"[entry-guard] {decision.symbol}: hybrid split — whole "
+            f"STOP_LIMIT qty={whole_qty}, residual MARKET qty={residual_qty} "
+            f"(live=${live:.2f} >= trigger=${trigger:.2f})"
+        )
+        return whole, residual
+
+    def _submit_stop_limit_residual(
+        self,
+        residual: RiskDecision,
+        strategy_name: str,
+    ) -> None:
+        """Submit the fractional MARKET residual after the primary
+        STOP_LIMIT has been placed. Logged, slippage-recorded via the
+        existing _record_fill path, but does NOT re-register ownership
+        or fire trade_executed alerts — the primary submission already
+        did that and the residual just adds to the same position.
+
+        Failures are logged but never re-raise: a residual submission
+        failure must not undo or alert on the successful primary entry."""
+        try:
+            arrival_price = _finite_or_none(
+                self.broker.get_latest_quote_midpoint(residual.symbol)
+            )
+            slippage_ref = (
+                arrival_price
+                if arrival_price is not None
+                else residual.entry_reference_price
+            )
+            result = self.broker.place_order(residual)
+            logger.info(
+                f"[{strategy_name}] {residual.symbol}: residual MARKET "
+                f"qty={residual.qty} status={result.status.value} "
+                f"filled_qty={result.filled_qty} "
+                f"avg_fill=${(result.avg_fill_price or 0):.2f}"
+            )
+            if result.status in {OrderStatus.FILLED, OrderStatus.PARTIAL}:
+                self._record_fill(
+                    result,
+                    modeled_price=slippage_ref,
+                    order_type=residual.order_type.value,
+                    side=residual.side.value,
+                )
+                self._log_entry(
+                    residual,
+                    result,
+                    slippage_ref,
+                    benchmark_kind=(
+                        "arrival_midpoint" if arrival_price is not None
+                        else "fallback_reference_price"
+                    ),
+                )
+        except Exception as e:
+            logger.warning(
+                f"[{strategy_name}] {residual.symbol}: residual MARKET "
+                f"submission failed: {e} (primary STOP_LIMIT already "
+                f"submitted; position will be undersized by "
+                f"{residual.qty} fractional shares)"
+            )
+            self.risk.record_broker_error()
 
     def _remember_suspect_order(
         self,
