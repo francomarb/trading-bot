@@ -634,6 +634,7 @@ class TradeLogger:
         measurement_quality: SlippageMeasurementQuality | None = None,
         timestamp_override: datetime | None = None,
         reason: str = "exit signal",
+        position_uid: str | None = None,
     ) -> TradeRecord:
         """
         Build a TradeRecord for a position close (exit). Closes don't have
@@ -783,6 +784,11 @@ class TradeLogger:
             exit_timestamp=now_iso,
             position_id=owner_key_for(result.symbol),
             position_type="single_leg",
+            # PR #56 R1: persist position_uid so restart reconstruction
+            # of the allocator's trade-count dedup state matches live
+            # behavior. Caller passes None on legacy paths where no
+            # lifecycle row exists for this position.
+            position_uid=position_uid,
             slippage_benchmark_price=new_benchmark_price,
             slippage_benchmark_kind=new_benchmark_kind,
             slippage_benchmark_timestamp=new_benchmark_timestamp,
@@ -921,6 +927,7 @@ class TradeLogger:
         submitted_limit_price: float | None = None,
         realized_slippage_bps: float | None = None,
         initial_risk_dollars: float | None = None,
+        is_full_close: bool = True,
     ) -> None:
         """
         Write trade-log rows for a multi-leg (MLEG) credit-spread fill (11.29).
@@ -992,6 +999,15 @@ class TradeLogger:
                 position_id=position_id,
             )
 
+        # PR #56 R4: the row's `status` column must reflect whether the
+        # event was a partial or full close, so restart restoration via
+        # read_strategy_realized_pnl_summary can apply the same
+        # is_full_close gate the live allocator applies. Opens are
+        # atomic (MLEG combo orders fill or reject as a whole, per
+        # Alpaca semantics) and always written as 'filled'. Closes use
+        # the engine-supplied flag.
+        row_status = "filled" if (opening or is_full_close) else "partial"
+
         basis = (
             float(initial_risk_dollars)
             if initial_risk_dollars is not None
@@ -1060,7 +1076,7 @@ class TradeLogger:
                 modeled_slippage_bps=0.0,
                 realized_slippage_bps=slippage_bps,
                 order_type="mleg",
-                status="filled",
+                status=row_status,
                 requested_qty=qty,
                 filled_qty=qty,
                 initial_stop_loss=None,
@@ -1072,6 +1088,12 @@ class TradeLogger:
                 exit_timestamp=None if opening else now_iso,
                 position_id=position_id,
                 position_type="spread",
+                # PR #56 R4: persist position_uid so restart restoration
+                # via read_strategy_realized_pnl_summary's dedup set
+                # matches the live allocator's (which receives
+                # position_uid=position_id for spreads — see the
+                # credit-spread close path in engine/trader.py).
+                position_uid=position_id,
                 slippage_benchmark_price=new_benchmark_price,
                 slippage_benchmark_kind=new_benchmark_kind,
                 slippage_benchmark_timestamp=now_iso if new_benchmark_price is not None else None,
@@ -1173,6 +1195,7 @@ class TradeLogger:
         measurement_quality: SlippageMeasurementQuality = "primary",
         order_id: str | None = None,
         timestamp_override: datetime | None = None,
+        position_uid: str | None = None,
     ) -> None:
         """
         Write a confirmed stop-fill record when the WebSocket stream delivers
@@ -1318,6 +1341,10 @@ class TradeLogger:
             exit_timestamp=now_iso,
             position_id=owner_key_for(symbol),
             position_type="single_leg",
+            # PR #56 R1: persist position_uid so restart reconstruction
+            # of the allocator's trade-count dedup state matches live
+            # behavior.
+            position_uid=position_uid,
             slippage_benchmark_price=new_slippage_benchmark_price,
             slippage_benchmark_kind=new_slippage_benchmark_kind,
             slippage_benchmark_timestamp=new_slippage_benchmark_timestamp,
@@ -1377,14 +1404,21 @@ class TradeLogger:
               "qty": float,
             }
 
-        A spread is *open* when its ``position_id`` has no row carrying an
-        ``exit_timestamp`` (the close writes ``exit_timestamp`` on both leg
-        rows). ``net_credit`` is taken from the open row whose
-        ``avg_fill_price`` is non-zero — ``log_spread_fill`` puts the combo
-        net on the short-leg row and 0.0 on the long-leg row.
+        A spread is *fully closed* when its ``position_id`` has a close
+        row with ``status='filled'`` (a full-close MLEG event). Rows with
+        ``status='partial'`` represent partial closes that leave a
+        residual still open at the broker — they reduce the reconstructed
+        ``qty`` but do NOT mark the position as closed (PR #56 R5 fix).
+        Previously, any row carrying an ``exit_timestamp`` marked the
+        position closed, silently dropping spreads that had been only
+        partially closed before restart.
 
-        Used by the engine on startup to rebuild spread ``Position`` records
-        instead of mis-assigning the legs as single-leg positions.
+        ``net_credit`` is taken from the open row whose ``avg_fill_price``
+        is non-zero — ``log_spread_fill`` puts the combo net on the
+        short-leg row and 0.0 on the long-leg row.
+
+        Used by the engine on startup to rebuild spread ``Position``
+        records instead of mis-assigning the legs as single-leg positions.
         """
         if not os.path.exists(self._path):
             return []
@@ -1395,7 +1429,7 @@ class TradeLogger:
         conn.row_factory = sqlite3.Row
         cursor = conn.execute(
             "SELECT position_id, strategy, symbol, side, avg_fill_price, "
-            "       qty, entry_timestamp, exit_timestamp, id "
+            "       qty, entry_timestamp, exit_timestamp, status, id "
             "FROM trades "
             "WHERE position_type = 'spread' "
             "AND status IN ('filled', 'partial') "
@@ -1415,47 +1449,116 @@ class TradeLogger:
                     "net_credit": 0.0,
                     "qty": float(row["qty"] or 0.0),
                     "_closed": False,
+                    # Track the cumulative partial-close qty per position
+                    # so we can report a residual qty on partial-only
+                    # spreads. Only the short-leg close row's qty counts
+                    # (the long-leg row mirrors it for spreads).
+                    "_partial_close_qty": 0.0,
+                    # `_open_qty` tracks what was opened (from open rows)
+                    # so we can compute open_qty - partial_close_qty for
+                    # the residual.
+                    "_open_qty": 0.0,
                 },
             )
-            if row["exit_timestamp"] is not None:
-                entry["_closed"] = True
+            row_status = row["status"]
+            row_exit = row["exit_timestamp"]
+            if row_exit is not None:
+                # Close-side row. Only a status='filled' close marks the
+                # position fully closed. status='partial' rows accumulate
+                # qty toward the residual computation but leave the
+                # position open.
+                if row_status == "filled":
+                    entry["_closed"] = True
+                elif row["side"] == "buy":
+                    # Spread close: short leg is bought back; long leg
+                    # is sold. Only count one leg's qty to avoid
+                    # double-counting.
+                    entry["_partial_close_qty"] += float(row["qty"] or 0.0)
                 continue
             # Open-side leg row.
             sym = row["symbol"]
             if sym not in entry["leg_symbols"]:
                 entry["leg_symbols"].append(sym)
             price = float(row["avg_fill_price"] or 0.0)
+            # On open, the short leg carries the net credit and the
+            # canonical qty. Capture both there.
             if price > 0.0:
                 entry["net_credit"] = price
                 entry["qty"] = float(row["qty"] or entry["qty"])
-        return [
-            {k: v for k, v in entry.items() if k != "_closed"}
-            for entry in grouped.values()
-            if not entry["_closed"] and len(entry["leg_symbols"]) == 2
-        ]
+                entry["_open_qty"] = float(row["qty"] or entry["_open_qty"])
+
+        # Apply residual qty before returning. If a spread has had a
+        # partial close but no full close, the reconstructed qty is
+        # open_qty - cumulative_partial_close_qty.
+        results: list[dict] = []
+        for entry in grouped.values():
+            if entry["_closed"]:
+                continue
+            if len(entry["leg_symbols"]) != 2:
+                continue
+            residual_qty = entry["_open_qty"] - entry["_partial_close_qty"]
+            if residual_qty <= 0:
+                # All open qty has been partially closed but no
+                # status='filled' row was written. Treat as effectively
+                # closed (defensive — should be rare).
+                continue
+            entry["qty"] = residual_qty
+            results.append({
+                k: v for k, v in entry.items()
+                if not k.startswith("_")
+            })
+        return results
 
     def read_strategy_realized_pnl_summary(
         self,
         strategies: list[str] | set[str] | tuple[str, ...] | None = None,
-    ) -> dict[str, dict[str, float]]:
+    ) -> dict[str, dict]:
         """
-        Reconstruct per-strategy cumulative realized P&L and HWM from the trade log.
+        Reconstruct per-strategy cumulative realized P&L, HWM, completed
+        round-trip count, and the set of seen position_uids from the trade
+        log.
 
         Contributing rows: single-leg sell-side closes, plus credit-spread
         rows (``position_type='spread'``) — both with a non-null
-        ``realized_pnl``. The HWM is the running maximum of cumulative
-        realized P&L in append order.
+        ``realized_pnl`` and status in {filled, partial}. The HWM is the
+        running maximum of cumulative realized P&L in append order.
+
+        **trade_count counts completed round trips, not contributing rows.**
+        A row's contribution to trade_count is gated by ``status='filled'``
+        — partial-close rows update P&L and HWM (dollar math is honest)
+        but do NOT increment the completed-trades counter. This matches
+        the live allocator's ``is_full_close=True`` gating, so a bot
+        restart in the middle of a partial-close-then-residual sequence
+        sees the same trade_count the live engine would have seen at
+        that moment (PR #56 R3).
+
+        Two ``status='filled'`` events for the same position_uid count
+        once. Rows without a position_uid (legacy data) each count as
+        one trade — there's no identifier to deduplicate against.
+        ``seen_position_uids`` is the deduplication set returned as a
+        sorted list so the allocator can restore the same dedup state
+        on restart.
         """
         include = set(strategies or [])
-        summary = {
-            strategy: {"realized_pnl": 0.0, "hwm": 0.0}
+        summary: dict[str, dict] = {
+            strategy: {
+                "realized_pnl": 0.0,
+                "hwm": 0.0,
+                "trade_count": 0.0,
+                "seen_position_uids": set(),
+            }
             for strategy in include
         }
         if not os.path.exists(self._path):
+            # Convert sets to sorted lists for stable return values.
+            for s in summary.values():
+                s["seen_position_uids"] = sorted(s["seen_position_uids"])
             return summary
         try:
             conn = self._ensure_db()
         except sqlite3.Error:
+            for s in summary.values():
+                s["seen_position_uids"] = sorted(s["seen_position_uids"])
             return summary
         conn.row_factory = sqlite3.Row
         # Single-leg closes are sell-side; credit-spread closes write
@@ -1463,8 +1566,11 @@ class TradeLogger:
         # close) — so also accept position_type='spread' rows. The
         # `realized_pnl IS NOT NULL` filter prevents double-counting: spread
         # opens and the long-leg close row all carry NULL realized_pnl.
+        # status='partial' rows ARE included so their P&L contributes,
+        # but they do NOT increment trade_count (that gate lives in
+        # the loop body below).
         cursor = conn.execute(
-            "SELECT strategy, realized_pnl "
+            "SELECT strategy, realized_pnl, position_uid, status "
             "FROM trades "
             "WHERE (side = 'sell' OR position_type = 'spread') "
             "AND status IN ('filled', 'partial') "
@@ -1476,11 +1582,38 @@ class TradeLogger:
             if include and strategy not in include:
                 continue
             if strategy not in summary:
-                summary[strategy] = {"realized_pnl": 0.0, "hwm": 0.0}
+                summary[strategy] = {
+                    "realized_pnl": 0.0,
+                    "hwm": 0.0,
+                    "trade_count": 0.0,
+                    "seen_position_uids": set(),
+                }
+            # Realized P&L and HWM include ALL fill events (filled +
+            # partial). The dollar math is honest about every contribution.
             running = summary[strategy]["realized_pnl"] + float(row["realized_pnl"])
             summary[strategy]["realized_pnl"] = running
             if running > summary[strategy]["hwm"]:
                 summary[strategy]["hwm"] = running
+
+            # trade_count and seen_position_uids only update on FULL
+            # closes. Partial-close rows update P&L (above) but do NOT
+            # mark a position as completed — matching the live
+            # allocator's is_full_close=True gating (PR #56 R3).
+            if row["status"] != "filled":
+                continue
+            position_uid = row["position_uid"] if "position_uid" in row.keys() else None
+            if position_uid:
+                if position_uid not in summary[strategy]["seen_position_uids"]:
+                    summary[strategy]["seen_position_uids"].add(position_uid)
+                    summary[strategy]["trade_count"] += 1
+            else:
+                # Legacy path — no identifier to dedup against; each
+                # filled row counts.
+                summary[strategy]["trade_count"] += 1
+        # Convert sets to sorted lists for stable return values (callers
+        # convert back to sets if needed).
+        for s in summary.values():
+            s["seen_position_uids"] = sorted(s["seen_position_uids"])
         return summary
 
     def read_latest_open_stop_price(

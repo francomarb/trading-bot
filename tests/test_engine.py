@@ -587,6 +587,8 @@ class TestProcessSymbol:
         engine._allocator.record_realized_pnl.assert_called_once_with(
             strategy.name,
             -100.0,
+            position_uid=None,
+            is_full_close=True,
         )
 
     def test_processed_bar_still_retries_single_leg_signal_exit(
@@ -2567,6 +2569,11 @@ class TestStartupReconciliation:
         assert allocator.pnl_summary()["fake_strategy"] == {
             "realized_pnl": pytest.approx(50.0),
             "hwm": pytest.approx(50.0),
+            # trade_count + seen_position_uids restored from the trade
+            # log alongside P&L/HWM (PR #56 R1) — partial closes of the
+            # same position correctly count as one round trip.
+            "trade_count": pytest.approx(1.0),
+            "seen_position_uids": [],
         }
 
     def test_start_restores_entry_prices_for_open_positions(
@@ -2954,6 +2961,8 @@ class TestExternalCloseDetection:
         allocator.record_realized_pnl.assert_called_once_with(
             "spy_options_reversion",
             1000.0,
+            position_uid=None,
+            is_full_close=True,
         )
 
     def test_recovered_stop_fill_passes_broker_stop_price_and_recovered_quality(
@@ -3591,7 +3600,7 @@ class TestOptionsEngineFixes:
 
         # 2 contracts, exit premium $15, gain = (15-10)*2*100 = $1 000
         engine._record_realized_pnl("SPY", "spy_options_reversion", 15.0, 2, multiplier=100)
-        allocator.record_realized_pnl.assert_called_once_with("spy_options_reversion", 1000.0)
+        allocator.record_realized_pnl.assert_called_once_with("spy_options_reversion", 1000.0, position_uid=None, is_full_close=True)
 
     def test_record_realized_pnl_no_multiplier_for_equity(self, tmp_path):
         """Equity P&L uses multiplier=1 (default) — result unchanged."""
@@ -3605,7 +3614,7 @@ class TestOptionsEngineFixes:
 
         # 10 shares, exit $105, gain = (105-100)*10*1 = $50
         engine._record_realized_pnl("AAPL", "sma_crossover", 105.0, 10)
-        allocator.record_realized_pnl.assert_called_once_with("sma_crossover", 50.0)
+        allocator.record_realized_pnl.assert_called_once_with("sma_crossover", 50.0, position_uid=None, is_full_close=True)
 
     # Fix A: _log_close uses option premium, not underlying bar price ──────────
 
@@ -3742,7 +3751,8 @@ class TestOptionsEngineFixes:
 
         # P&L = (15 - 10) * 2 * 100 = $1 000
         allocator.record_realized_pnl.assert_called_once_with(
-            "spy_options_reversion", 1000.0
+            "spy_options_reversion", 1000.0,
+            position_uid=None, is_full_close=True,
         )
 
     def test_resynced_stop_fill_flows_through_engine_stop_processing(self, tmp_path):
@@ -3779,6 +3789,7 @@ class TestOptionsEngineFixes:
             avg_fill_price=12.5,
             stop_price=None,
             order_id="stop-ord-gap",
+            position_uid=None,
         )
         assert not engine._has_position("SPY")
 
@@ -3808,7 +3819,7 @@ class TestOptionsEngineFixes:
         engine._process_stream_stop_fills(_snapshot())
 
         # P&L = (105 - 100) * 10 * 1 = $50
-        allocator.record_realized_pnl.assert_called_once_with("sma_crossover", 50.0)
+        allocator.record_realized_pnl.assert_called_once_with("sma_crossover", 50.0, position_uid=None, is_full_close=True)
         assert not engine._has_position("AAPL")
 
     def test_stream_stop_fill_with_fractional_residual_preserves_ownership(self, tmp_path):
@@ -3845,6 +3856,7 @@ class TestOptionsEngineFixes:
             avg_fill_price=378.85,
             stop_price=None,
             order_id="goog-stop-1",
+            position_uid=None,
         )
         assert engine._has_position("GOOG")
         assert engine._entry_prices["GOOG"] == pytest.approx(391.0)
@@ -3892,10 +3904,13 @@ class TestOptionsEngineFixes:
             avg_fill_price=684.11,
             stop_price=None,
             order_id="pwr-stop-1",
+            position_uid=None,
         )
         allocator.record_realized_pnl.assert_called_once_with(
             "donchian_breakout",
             pytest.approx((684.11 - 727.67) * 5.0),
+            position_uid=None,
+            is_full_close=True,
         )
         assert engine._has_position("PWR")
 
@@ -3965,6 +3980,7 @@ class TestOptionsEngineFixes:
             avg_fill_price=7.50,
             stop_price=8.00,
             order_id="stop-ord-1",
+            position_uid=None,
         )
         engine.trade_logger.log_external_close.assert_not_called()
 

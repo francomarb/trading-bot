@@ -535,6 +535,59 @@ STRATEGY_MIN_TRADES_FOR_VERDICT: dict[str, int] = {
     "credit_spread": 25,
 }
 
+# Sleeve-drawdown gate — minimum closed trades a strategy must have before
+# its allocator-level drawdown check (HWM−running vs target_budget × threshold)
+# is allowed to halt new entries. With too few trades the check is noise,
+# not signal: any single bad trade — buggy code, atypical market, ordinary
+# variance — produces an indefinite lockout that doesn't reflect the
+# strategy's true behavior.
+#
+# Motivating case (2026-06-10): the `spy_options_reversion` sleeve had
+# exactly ONE round trip on record (entry 2026-05-28, exit 2026-06-05 with
+# −$1,269 realized P&L). That trade was executed against the legacy fixed
+# stop and the still-in-flight trailing-stop migration (PR #46 hardening
+# landed 2026-06-05 but the exit fired before it). The sleeve-drawdown
+# gate locked the strategy out of new entries indefinitely based on that
+# single, code-bug-tainted data point. The lockout would persist until a
+# real win offset the historical loss, but the gate itself prevented
+# accumulating any new trades to either confirm a real drawdown or to
+# work the strategy back to its HWM. Classic chicken-and-egg.
+#
+# Floors mirror STRATEGY_MIN_TRADES_FOR_VERDICT (above) because the
+# conceptual question is identical: "how many trades do we need before we
+# trust this strategy's realized P&L as a verdict?" Below the floor, the
+# gate fails open (does not halt) and the daily-loss / hard-dollar cap
+# kill switches remain the active line of defense.
+#
+# The default for strategies not in the map is high (10) to ensure new
+# strategies aren't gated out on their first bad day. Adjust per-strategy
+# overrides when calibration data exists.
+STRATEGY_MIN_TRADES_FOR_DRAWDOWN_GATE: dict[str, int] = {
+    "sma_crossover": 25,
+    "rsi_reversion": 8,
+    "donchian_breakout": 25,
+    "spy_options_reversion": 15,
+    "credit_spread": 25,
+}
+STRATEGY_DEFAULT_MIN_TRADES_FOR_DRAWDOWN_GATE: int = 10
+
+# Catastrophic drawdown threshold (PR #56 R1) — even below the min-trades
+# floor, sample size MUST NOT disable protection entirely. A second-tier
+# threshold gates against catastrophic loss while the strategy is still
+# in its "we don't have enough sample to evaluate normally" window.
+#
+# Two-tier semantics in SleeveAllocator.is_strategy_in_drawdown:
+#   - trade_count <  floor: gate fires at  STRATEGY_CATASTROPHIC_DRAWDOWN_THRESHOLD
+#                           × target_budget (default: 35%)
+#   - trade_count >= floor: gate fires at  dd_threshold × target_budget
+#                           (the configured normal threshold, e.g. 15%)
+#
+# The catastrophic level is intentionally generous — it should NOT fire on
+# ordinary single-trade variance, but it MUST fire on a 35%+ sleeve loss
+# (which on the spy_options_reversion case would have been ~-$3,500+ on a
+# ~$10k target budget — clearly beyond "noise from one bad trade").
+STRATEGY_CATASTROPHIC_DRAWDOWN_THRESHOLD: float = 0.35
+
 # Strategy Health monitor (PLAN 11.10f) — feature flag for the
 # engine's lifecycle-counter emissions. Defaults True (ship with
 # observability on) but the operator can flip to False as an instant

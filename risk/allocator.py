@@ -234,8 +234,58 @@ class SleeveAllocator:
         self._dd_threshold = dd_threshold
         self._strategy_realized_pnl = {name: 0.0 for name in self._entries}
         self._strategy_pnl_hwm = {name: 0.0 for name in self._entries}
+        # Per-strategy completed-round-trip count — used by the
+        # sleeve-drawdown gate's min-trades guard. A "round trip" is one
+        # position from entry to flat. Partial fills and partial closes
+        # of the SAME position count as one trade, not many; the engine
+        # passes ``position_uid`` so this allocator can deduplicate.
+        # Restored from the trade log on startup using the same definition
+        # (count distinct position_uid).
+        self._strategy_trade_count: dict[str, int] = {
+            name: 0 for name in self._entries
+        }
+        # The set of position_uids whose realized P&L has already
+        # contributed to the trade count. Used for live deduplication
+        # so that a second partial close of the same position does NOT
+        # increment the count. Restored from the trade log on startup.
+        # Positions without a stable position_uid (legacy rows or
+        # callers that don't supply one) count as one trade each — no
+        # dedup possible without an identifier.
+        self._strategy_seen_position_uids: dict[str, set[str]] = {
+            name: set() for name in self._entries
+        }
 
-    def record_realized_pnl(self, strategy_name: str, pnl: float) -> None:
+    def record_realized_pnl(
+        self,
+        strategy_name: str,
+        pnl: float,
+        *,
+        position_uid: str | None = None,
+        is_full_close: bool = True,
+    ) -> None:
+        """Record a realized-P&L event from a (partial or full) close.
+
+        ``pnl`` is always added to cumulative realized P&L and HWM —
+        every event contributes to the running totals immediately.
+
+        ``trade_count`` (the completed-round-trip counter that drives
+        the sleeve-drawdown min-trades guard) only increments when
+        **both** of these are true:
+
+          1. ``is_full_close=True`` — the position is now flat. A
+             partial close that leaves residual quantity open is NOT a
+             completed round trip and must not flip the gate's tier.
+          2. ``position_uid`` is new (or absent, the legacy path).
+
+        These two together ensure that fragmented exits and pre-restart
+        positions never double-count, and that mid-trade partial fills
+        don't prematurely promote the strategy past its min-trades
+        floor.
+
+        Callers that omit ``position_uid`` (legacy paths) increment
+        trade_count on every full-close call — no identifier to
+        deduplicate against, so each call is treated as one trade.
+        """
         if strategy_name not in self._strategy_realized_pnl:
             logger.warning(
                 f"record_realized_pnl: unknown strategy '{strategy_name}' — ignored"
@@ -243,35 +293,82 @@ class SleeveAllocator:
             return
 
         self._strategy_realized_pnl[strategy_name] += pnl
+
+        # Trade-count increment is gated by BOTH the full-close flag
+        # and position_uid novelty. We also only mark the UID as
+        # "seen" on the full-close event — so a partial close → full
+        # close sequence for the same position cleanly counts as one
+        # trade at the full-close step.
+        counted = False
+        if is_full_close:
+            if position_uid is None:
+                # Legacy caller — no dedup possible, count this call.
+                self._strategy_trade_count[strategy_name] += 1
+                counted = True
+            elif position_uid not in self._strategy_seen_position_uids[strategy_name]:
+                self._strategy_seen_position_uids[strategy_name].add(position_uid)
+                self._strategy_trade_count[strategy_name] += 1
+                counted = True
+            # else: already-seen UID on a full close → noop (defensive
+            # against a duplicate-fill event for the same UID).
+
         running = self._strategy_realized_pnl[strategy_name]
         if running > self._strategy_pnl_hwm[strategy_name]:
             self._strategy_pnl_hwm[strategy_name] = running
 
         logger.debug(
             f"[{strategy_name}] realized_pnl update: trade={pnl:+.2f} "
-            f"cumulative={running:+.2f} hwm={self._strategy_pnl_hwm[strategy_name]:+.2f}"
+            f"cumulative={running:+.2f} hwm={self._strategy_pnl_hwm[strategy_name]:+.2f} "
+            f"n={self._strategy_trade_count[strategy_name]} "
+            f"position_uid={position_uid or '(none)'} "
+            f"full_close={is_full_close} counted={counted}"
         )
 
-    def pnl_summary(self) -> dict[str, dict[str, float]]:
+    def pnl_summary(self) -> dict[str, dict]:
+        """Return per-strategy P&L state suitable for restart restoration.
+
+        ``trade_count`` is the count of distinct position_uids (i.e.
+        completed round trips), NOT the count of realized-P&L rows.
+        ``seen_position_uids`` is the deduplication set, returned as a
+        sorted list for stable serialization.
+        """
         return {
             name: {
                 "realized_pnl": self._strategy_realized_pnl[name],
                 "hwm": self._strategy_pnl_hwm[name],
+                "trade_count": float(self._strategy_trade_count[name]),
+                "seen_position_uids": sorted(
+                    self._strategy_seen_position_uids[name]
+                ),
             }
             for name in self._entries
         }
 
-    def restore_pnl_summary(self, summary: dict[str, dict[str, float]]) -> None:
-        """Restore cumulative realized P&L / HWM state, typically from the trade log."""
+    def restore_pnl_summary(self, summary: dict[str, dict]) -> None:
+        """Restore cumulative realized P&L, HWM, trade count, and the seen-uid set.
+
+        Backward-compatible:
+          - Summaries without ``trade_count`` restore N=0 (the gate then
+            fails open via the min-trades guard until live trades fire).
+          - Summaries without ``seen_position_uids`` restore an empty
+            set — meaning a partial close of a pre-restart position will
+            (incorrectly) count as a new trade. Restart paths that
+            include the field round-trip the dedup state faithfully.
+        """
         for name in self._entries:
             restored = summary.get(name, {})
             realized_pnl = float(restored.get("realized_pnl", 0.0))
             hwm = max(float(restored.get("hwm", 0.0)), realized_pnl)
+            trade_count = int(restored.get("trade_count", 0))
+            seen_uids = set(restored.get("seen_position_uids", []))
             self._strategy_realized_pnl[name] = realized_pnl
             self._strategy_pnl_hwm[name] = hwm
+            self._strategy_trade_count[name] = trade_count
+            self._strategy_seen_position_uids[name] = seen_uids
             logger.debug(
                 f"[{name}] restored allocator pnl state: "
-                f"cumulative={realized_pnl:+.2f} hwm={hwm:+.2f}"
+                f"cumulative={realized_pnl:+.2f} hwm={hwm:+.2f} n={trade_count} "
+                f"seen_uids={len(seen_uids)}"
             )
 
     def strategies(self) -> list[str]:
@@ -295,13 +392,72 @@ class SleeveAllocator:
             return 0.0
         return equity * self._total_gross_pct * float(entry["target_pct"])
 
+    def _min_trades_for_drawdown_gate(self, strategy_name: str) -> int:
+        """Per-strategy minimum trade count before the *normal* drawdown
+        threshold applies. See ``is_strategy_in_drawdown`` for the
+        two-tier semantics (catastrophic threshold below floor, normal
+        threshold at/after floor).
+        """
+        from config import settings as _s
+        override = _s.STRATEGY_MIN_TRADES_FOR_DRAWDOWN_GATE.get(strategy_name)
+        if override is not None:
+            return int(override)
+        return int(_s.STRATEGY_DEFAULT_MIN_TRADES_FOR_DRAWDOWN_GATE)
+
+    def _catastrophic_drawdown_threshold(self) -> float:
+        """The drawdown threshold applied when trade_count is below the
+        min-trades floor. Generous enough not to fire on ordinary
+        single-trade variance, but tight enough to catch a true sleeve
+        catastrophe (default: 35% of target budget).
+        """
+        from config import settings as _s
+        return float(_s.STRATEGY_CATASTROPHIC_DRAWDOWN_THRESHOLD)
+
+    def _effective_drawdown_threshold(self, strategy_name: str) -> float:
+        """Return the threshold (fraction of target_budget) that the
+        gate would currently apply for ``strategy_name``.
+
+        Picks the catastrophic tier when ``trade_count < min_floor``,
+        the normal ``dd_threshold`` otherwise. Used by both
+        ``is_strategy_in_drawdown`` and ``check()`` (rejection message)
+        so the operator-visible threshold value is always the one that
+        actually fired.
+        """
+        if self._strategy_trade_count[strategy_name] < self._min_trades_for_drawdown_gate(strategy_name):
+            return self._catastrophic_drawdown_threshold()
+        return self._dd_threshold
+
     def is_strategy_in_drawdown(self, strategy_name: str, equity: float) -> bool:
+        """True iff the strategy's sleeve-drawdown gate should halt new entries.
+
+        **Two-tier threshold semantics** (PR #56 R1 fix):
+
+          - ``trade_count <  floor`` → catastrophic threshold applies
+            (default 35% of target budget). Sample size MUST NOT disable
+            protection entirely — a true sleeve catastrophe still trips
+            the gate even at low N.
+
+          - ``trade_count >= floor`` → normal threshold applies
+            (``dd_threshold``, typically 5–15% of target budget).
+
+        The min-trades guard exists because with too few trades the
+        HWM-vs-running ratio is dominated by noise — a single bad trade
+        (buggy code, atypical market, ordinary variance) produces an
+        indefinite lockout that doesn't reflect the strategy's true
+        behaviour. The catastrophic tier ensures we still halt on a
+        loss large enough to be unambiguous regardless of sample size.
+
+        See ``settings.STRATEGY_MIN_TRADES_FOR_DRAWDOWN_GATE`` and
+        ``settings.STRATEGY_CATASTROPHIC_DRAWDOWN_THRESHOLD`` for the
+        rationale and motivating case.
+        """
         if self._dd_threshold == 0.0 or strategy_name not in self._entries:
             return False
         target_budget = self.target_budget(strategy_name, equity)
         running = self._strategy_realized_pnl[strategy_name]
         hwm = self._strategy_pnl_hwm[strategy_name]
-        return (hwm - running) > (self._dd_threshold * target_budget)
+        effective_threshold = self._effective_drawdown_threshold(strategy_name)
+        return (hwm - running) > (effective_threshold * target_budget)
 
     def drawdown_snapshot(self, equity: float) -> dict[str, dict]:
         """Read-only per-strategy HWM-drawdown state.
@@ -312,13 +468,29 @@ class SleeveAllocator:
         Pure read; no mutation.
 
         Returns: `{strategy_name: {"in_drawdown": bool, "running_pnl":
-        float, "hwm_pnl": float, "drawdown_dollars": float}}` for
-        every registered strategy.
+        float, "hwm_pnl": float, "drawdown_dollars": float,
+        "trade_count": int, "min_trades_for_gate": int,
+        "gate_armed": bool}}` for every registered strategy.
+
+        ``gate_armed`` reflects whether the strategy has accumulated
+        enough trades for the *normal* sleeve-drawdown threshold to
+        apply. When True, the gate uses ``dd_threshold`` (typically
+        5–15% of target_budget). When False (sample below the min-trades
+        floor), the gate uses the **catastrophic** threshold instead —
+        default 35% of target_budget per
+        ``settings.STRATEGY_CATASTROPHIC_DRAWDOWN_THRESHOLD``. The gate
+        is NEVER fully disabled: a true sleeve catastrophe still trips
+        the gate even at low N. The ``effective_threshold_pct`` field
+        below surfaces whichever threshold is currently active.
         """
         out: dict[str, dict] = {}
         for strategy_name in self._entries:
             running = self._strategy_realized_pnl.get(strategy_name, 0.0)
             hwm = self._strategy_pnl_hwm.get(strategy_name, 0.0)
+            trade_count = self._strategy_trade_count.get(strategy_name, 0)
+            min_trades = self._min_trades_for_drawdown_gate(strategy_name)
+            below_floor = trade_count < min_trades
+            effective_threshold = self._effective_drawdown_threshold(strategy_name)
             out[strategy_name] = {
                 "in_drawdown": self.is_strategy_in_drawdown(
                     strategy_name, equity,
@@ -326,6 +498,13 @@ class SleeveAllocator:
                 "running_pnl": running,
                 "hwm_pnl": hwm,
                 "drawdown_dollars": max(hwm - running, 0.0),
+                "trade_count": trade_count,
+                "min_trades_for_gate": min_trades,
+                # gate_armed=True means the *normal* threshold applies;
+                # gate_armed=False means the catastrophic threshold
+                # applies (it is NEVER disabled entirely).
+                "gate_armed": not below_floor,
+                "effective_threshold_pct": effective_threshold,
             }
         return out
 
@@ -371,14 +550,26 @@ class SleeveAllocator:
         if self.is_strategy_in_drawdown(strategy_name, account.equity):
             running = self._strategy_realized_pnl[strategy_name]
             hwm = self._strategy_pnl_hwm[strategy_name]
-            trigger = self._dd_threshold * snapshot.target_budget
+            # Use the EFFECTIVE threshold (catastrophic if below floor,
+            # normal otherwise) in the operator-visible message so the
+            # rejection reason shows the value that actually fired.
+            effective_pct = self._effective_drawdown_threshold(strategy_name)
+            trigger = effective_pct * snapshot.target_budget
+            tier_label = (
+                "catastrophic" if effective_pct == self._catastrophic_drawdown_threshold()
+                and self._strategy_trade_count[strategy_name] < self._min_trades_for_drawdown_gate(strategy_name)
+                else "normal"
+            )
             return SleeveRejection(
                 strategy_name=strategy_name,
                 code=SleeveRejectionCode.SLEEVE_DRAWDOWN,
                 message=(
                     f"strategy in drawdown — realized_pnl={running:+.2f} "
                     f"is {hwm - running:.2f} below HWM={hwm:+.2f} "
-                    f"(threshold={trigger:.2f})"
+                    f"(threshold={trigger:.2f}, "
+                    f"tier={tier_label}, "
+                    f"n={self._strategy_trade_count[strategy_name]}/"
+                    f"{self._min_trades_for_drawdown_gate(strategy_name)})"
                 ),
             )
 

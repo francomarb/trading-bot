@@ -2147,9 +2147,30 @@ class TradingEngine:
         exits). The fractional residual cleanup call site passes
         'unavailable' so the row honestly reports no benchmark — see
         codepath §7 in docs/slippage_unification_design.md.
+
+        PR #56 R1: look up the open lifecycle row's position_uid so it
+        gets persisted on the close row. Without this, restart
+        reconstruction of the allocator's trade-count dedup state would
+        fall through to "each row counts as one" for single-leg closes.
         """
         if result.status not in {OrderStatus.FILLED, OrderStatus.PARTIAL}:
             return
+        # Look up position_uid from the lifecycle store. Best-effort —
+        # failures don't block the log write, but the record is
+        # written with position_uid=None and restart dedup will treat
+        # it as legacy.
+        position_uid: str | None = None
+        try:
+            row = self.lifecycle_store.get_open_for_owner_key(
+                owner_key_for(result.symbol),
+            )
+            if row is not None:
+                position_uid = row.position_uid
+        except Exception as exc:
+            logger.debug(
+                f"_log_close: position_uid lookup raised "
+                f"{type(exc).__name__}: {exc} — proceeding without"
+            )
         try:
             record = self.trade_logger.build_close_record(
                 result,
@@ -2159,6 +2180,7 @@ class TradingEngine:
                 measurement_quality=measurement_quality,
                 timestamp_override=timestamp_override,
                 reason=reason,
+                position_uid=position_uid,
             )
             self.trade_logger.log(record)
         except Exception as e:
@@ -2292,6 +2314,23 @@ class TradingEngine:
         the realized-PnL update can proceed — operator CLI accuracy
         must not depend on entry-price availability.
         """
+        # Look up position_uid BEFORE the lifecycle close transition —
+        # the row may be flipped to closed below and become harder to
+        # find. The allocator uses this for trade-count deduplication
+        # (partial closes of the same position must not double-count).
+        position_uid: str | None = None
+        try:
+            row = self.lifecycle_store.get_open_for_owner_key(
+                owner_key_for(symbol),
+            )
+            if row is not None:
+                position_uid = row.position_uid
+        except Exception as exc:
+            logger.debug(
+                f"[{strategy_name}] {symbol}: position_uid lookup raised "
+                f"{type(exc).__name__}: {exc} — proceeding without"
+            )
+
         # Operator Controls Phase A — update the matching lifecycle
         # row. Done first so it happens regardless of whether the
         # allocator update below proceeds. Best-effort: wrapped in
@@ -2328,7 +2367,16 @@ class TradingEngine:
             f"[{strategy_name}] {symbol}: realized_pnl={realized_pnl:+.2f} "
             f"({qty}x{multiplier} @ {close_price:.2f} vs entry {entry_price:.2f})"
         )
-        self._allocator.record_realized_pnl(strategy_name, realized_pnl)
+        # Pass position_uid + is_full_close so the allocator
+        # deduplicates and only increments trade_count when the round
+        # trip is complete (PR #56 R1 + R2 fixes). A partial close
+        # event contributes to realized P&L but does NOT increment the
+        # completed-trades counter — the round trip isn't done yet.
+        self._allocator.record_realized_pnl(
+            strategy_name, realized_pnl,
+            position_uid=position_uid,
+            is_full_close=is_full_close,
+        )
 
     def _reduce_lifecycle_for_owner_key(
         self,
@@ -3466,6 +3514,21 @@ class TradingEngine:
         recovered_stop_price = _finite_or_none(
             getattr(stop_fill, "stop_price", None)
         )
+        # PR #56 R1: source position_uid for the stop-fill record so
+        # restart reconstruction of the allocator's trade-count dedup
+        # matches live behavior.
+        stop_fill_position_uid: str | None = None
+        try:
+            _row = self.lifecycle_store.get_open_for_owner_key(
+                owner_key_for(raw_symbol),
+            )
+            if _row is not None:
+                stop_fill_position_uid = _row.position_uid
+        except Exception as exc:
+            logger.debug(
+                f"log_stop_fill: position_uid lookup raised "
+                f"{type(exc).__name__}: {exc} — proceeding without"
+            )
         self.trade_logger.log_stop_fill(
             symbol=raw_symbol,
             strategy=owner,
@@ -3475,6 +3538,7 @@ class TradingEngine:
             measurement_quality="recovered",
             order_id=stop_fill.order_id,
             timestamp_override=stop_fill.filled_at or stop_fill.submitted_at,
+            position_uid=stop_fill_position_uid,
         )
         pnl_multiplier = 100 if _OCC_PAT.match(raw_symbol) else 1
         self._record_realized_pnl(
@@ -4098,6 +4162,21 @@ class TradingEngine:
                     broker_stop_price = _finite_or_none(
                         getattr(update.order, "stop_price", None)
                     )
+                    # PR #56 R1: source position_uid for the stop-fill
+                    # record so restart reconstruction of the
+                    # allocator's trade-count dedup matches live behavior.
+                    _stop_position_uid: str | None = None
+                    try:
+                        _row = self.lifecycle_store.get_open_for_owner_key(
+                            owner_key_for(raw_symbol),
+                        )
+                        if _row is not None:
+                            _stop_position_uid = _row.position_uid
+                    except Exception as exc:
+                        logger.debug(
+                            f"log_stop_fill: position_uid lookup raised "
+                            f"{type(exc).__name__}: {exc} — proceeding without"
+                        )
                     stop_log_kwargs = {
                         "symbol": raw_symbol,
                         "strategy": owner,
@@ -4105,6 +4184,7 @@ class TradingEngine:
                         "avg_fill_price": price,
                         "stop_price": broker_stop_price,
                         "order_id": order_id,
+                        "position_uid": _stop_position_uid,
                     }
                     stop_timestamp = (
                         getattr(update.order, "filled_at", None)
@@ -4843,6 +4923,106 @@ class TradingEngine:
             # ── Spread CLOSE ─────────────────────────────────────────────
             self._spreads_pending_close.discard(position_id)
             if filled:
+                # PR #56 R5: peek at the open spread BEFORE releasing so
+                # we can detect a partial close (close_qty < released.qty)
+                # and refuse to corrupt state. Alpaca documents MLEG
+                # combos as atomic per-leg, but quantity-wise a 2-contract
+                # close fill of 1 contract is structurally possible.
+                # Previously the engine released the entire position
+                # unconditionally → residual at the broker, orphaned at
+                # the strategy.
+                peeked: OpenSpread | None = (
+                    strategy.get_open_spread(position_id)
+                    if strategy is not None
+                    and hasattr(strategy, "get_open_spread")
+                    else None
+                )
+                close_qty = float(
+                    filled_qty or (peeked.qty if peeked is not None else 1)
+                )
+                full_close_combo: bool = (
+                    peeked is None or close_qty >= peeked.qty
+                )
+                if not full_close_combo:
+                    # Defensive: don't release/pop/log. Fire CRITICAL so the
+                    # operator reconciles manually. The position stays open
+                    # at the strategy/engine level; the residual stream event
+                    # (when the rest fills) will land here again with
+                    # full_close_combo=True and proceed normally.
+                    #
+                    # PR #56 R6: re-add to _spreads_pending_close so the
+                    # next cycle's _process_credit_spread_exits skips this
+                    # position and does NOT dispatch a duplicate close
+                    # order at the original full qty. The position remains
+                    # "pending close" until the broker reconciles the
+                    # residual fill (or the operator intervenes).
+                    # Line 4924's unconditional `discard` cleared the
+                    # pending state at the top of the close branch; this
+                    # re-arms it.
+                    #
+                    # KNOWN RESIDUAL RISK (PLAN.md P2 follow-up):
+                    # _spreads_pending_close is in-memory only. A bot
+                    # restart between this partial detection and the
+                    # residual fill loses the marker — restart restores
+                    # the spread as open with residual qty (R5), this set
+                    # starts empty, and the next cycle may dispatch a
+                    # duplicate close. The CRITICAL alert below is the
+                    # current mitigation: operator reconciliation closes
+                    # the gap within minutes (the typical restart window).
+                    # See PLAN.md "MLEG partial-close residual
+                    # reconciliation" for the design space.
+                    self._spreads_pending_close.add(position_id)
+                    logger.critical(
+                        f"[{strategy_name}] credit spread PARTIAL close detected — "
+                        f"position_id={position_id[:8]} close_qty={close_qty} < "
+                        f"open_qty={peeked.qty} — state NOT released; "
+                        f"position remains pending close (no duplicate dispatch); "
+                        f"awaiting residual fill or operator reconciliation."
+                    )
+                    try:
+                        self.alerts.broker_error(
+                            f"credit_spread partial close: "
+                            f"position_id={position_id[:8]} "
+                            f"close_qty={close_qty}/{peeked.qty} "
+                            f"(state preserved, awaiting residual)"
+                        )
+                    except Exception:
+                        pass
+                    # Still log the partial event so the trade-log is
+                    # honest about what happened and the dollar math
+                    # reflects the partial P&L.
+                    if peeked is not None and avg_fill_price is not None:
+                        partial_net_debit = abs(avg_fill_price)
+                        partial_pnl = (
+                            (peeked.net_credit - partial_net_debit)
+                            * close_qty * 100.0
+                        )
+                        if self._allocator is not None:
+                            self._allocator.record_realized_pnl(
+                                strategy_name, partial_pnl,
+                                position_uid=position_id,
+                                is_full_close=False,
+                            )
+                        try:
+                            self.trade_logger.log_spread_fill(
+                                position_id=position_id,
+                                strategy=strategy_name,
+                                short_occ=peeked.short_occ,
+                                long_occ=peeked.long_occ,
+                                qty=close_qty,
+                                net_price=partial_net_debit,
+                                order_id=order_id,
+                                opening=False,
+                                realized_pnl=partial_pnl,
+                                reason="spread exit (partial)",
+                                is_full_close=False,
+                            )
+                        except Exception as exc:
+                            logger.error(
+                                f"[{strategy_name}] partial-close trade-log "
+                                f"write failed: {exc}"
+                            )
+                    continue
                 released = (
                     strategy.release_spread(position_id)
                     if strategy is not None else None
@@ -4851,9 +5031,6 @@ class TradingEngine:
                 self._spread_owner_strategy.pop(position_id, None)
                 short_occ = released.short_occ if released is not None else position_id
                 long_occ = released.long_occ if released is not None else ""
-                close_qty = float(
-                    filled_qty or (released.qty if released is not None else 1)
-                )
 
                 # The spread IS closed regardless — but only record P&L when
                 # we have a real fill price. A stream "filled" event whose
@@ -4863,6 +5040,17 @@ class TradingEngine:
                 # that case leave realized P&L unset (not zero) and warn.
                 realized_pnl: float | None = None
                 exit_reason = "spread exit"
+                # PR #56 R1+R2+R4: determine full/partial close status ONCE,
+                # outside both the price-availability branches AND the
+                # allocator/log paths, so a single value drives the trade-log
+                # row's status column and the allocator's is_full_close. Only
+                # depends on released and close_qty — independent of whether
+                # the fill price was available. Spreads are treated as fully
+                # closed when the close fill quantity matches the open qty.
+                full_close = (
+                    released is not None
+                    and close_qty >= released.qty
+                )
                 if avg_fill_price is None:
                     net_debit = 0.0
                     exit_reason = "spread exit (fill price unavailable)"
@@ -4884,7 +5072,9 @@ class TradingEngine:
                         )
                         if self._allocator is not None:
                             self._allocator.record_realized_pnl(
-                                strategy_name, realized_pnl
+                                strategy_name, realized_pnl,
+                                position_uid=position_id,
+                                is_full_close=full_close,
                             )
                     logger.info(
                         f"[{strategy_name}] credit spread CLOSED — "
@@ -4905,6 +5095,12 @@ class TradingEngine:
                     )
                     if spread_max_loss > 0:
                         close_risk_dollars = spread_max_loss * close_qty
+                # PR #56 R4: pass is_full_close so the trade-log row's
+                # status column matches what the live allocator saw
+                # (full_close computed above against released.qty).
+                # Without this, restart restoration via R3's
+                # status='filled' gate would mis-count a partial close
+                # as a completed round trip.
                 self.trade_logger.log_spread_fill(
                     position_id=position_id,
                     strategy=strategy_name,
@@ -4916,6 +5112,7 @@ class TradingEngine:
                     opening=False,
                     realized_pnl=realized_pnl,
                     reason=exit_reason,
+                    is_full_close=full_close,
                     submitted_limit_price=submitted_limit_price,
                     initial_risk_dollars=close_risk_dollars,
                 )

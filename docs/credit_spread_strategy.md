@@ -195,6 +195,45 @@ items are now done:
   lookup); see PLAN.md **11.31** for the cleanup needed before adding a
   second multi-leg strategy.
 
+### Partial-close handling (PR #56 R6 + follow-up)
+
+Credit-spread partial closes are rare in practice — Alpaca documents
+MLEG combos as atomic per-leg — but quantity-wise partial fills are
+structurally possible (a 2-contract close fill of 1 contract).
+
+**Current behavior (live, post PR #56 R6):**
+
+- The engine peeks at the open spread via `strategy.get_open_spread`
+  BEFORE releasing it.
+- If `close_qty < open_qty`: position state is **preserved** (no
+  release, no pop), partial fill row is logged with
+  `status='partial'`, allocator receives `is_full_close=False`,
+  CRITICAL log + `broker_error` alert fires, and
+  `_spreads_pending_close` is re-armed to block a duplicate close
+  dispatch on the next cycle.
+- On restart, `read_open_spread_positions` honors the same semantics:
+  spreads with only partial close rows are restored with residual
+  qty; only `status='filled'` close rows mark the position closed.
+
+**Known residual risk:**
+
+`_spreads_pending_close` is in-memory only. A bot restart between the
+partial detection and the residual fill loses the pending marker —
+the next cycle could dispatch a duplicate close at residual qty
+while the original partial order may still be working at the broker.
+
+**Today's mitigation:** the CRITICAL log + `broker_error` alert tells
+the operator that manual reconciliation is needed. The recycle window
+is typically minutes, not hours — the broker usually resolves the
+residual within that span.
+
+**Status:** **tracked as a separate follow-up PR**, not blocking PR #56
+or any other work. See PLAN.md P2 "MLEG partial-close residual
+reconciliation" for the design space (engine_state.json persistence,
+lifecycle-derived inference, or snapshot-based residual tracking) and
+the worker-side decision (whether `options_executor.py:275` should
+cancel-and-retry on `partially_filled` or wait).
+
 ---
 
 ## Related docs

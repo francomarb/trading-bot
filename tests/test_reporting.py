@@ -392,7 +392,147 @@ class TestTradeLogger:
 
         assert summary["sma_crossover"]["realized_pnl"] == pytest.approx(75.0)
         assert summary["sma_crossover"]["hwm"] == pytest.approx(100.0)
-        assert summary["rsi_reversion"] == {"realized_pnl": 0.0, "hwm": 0.0}
+        # trade_count counts distinct positions (PR #56 R1). The three
+        # legacy rows in this fixture have no position_uid → each counts
+        # as one, so trade_count is 3.
+        assert summary["sma_crossover"]["trade_count"] == pytest.approx(3.0)
+        assert summary["rsi_reversion"] == {
+            "realized_pnl": 0.0, "hwm": 0.0,
+            "trade_count": 0.0, "seen_position_uids": [],
+        }
+
+    def test_partial_close_row_alone_does_not_increment_trade_count(self, tmp_csv):
+        """PR #56 R3: a partial-close row whose position has not yet
+        been fully closed must NOT count as a completed round trip
+        during restart restoration. The reviewer's bug scenario:
+
+          - Strategy at N=floor-1 (catastrophic tier).
+          - Position opens, partially closes → row with status='partial',
+            position_uid='X', realized_pnl=partial-P&L.
+          - Bot restarts. Restart reads the partial row.
+          - Before the fix: trade_count was prematurely incremented at
+            restart, flipping the gate to normal tier while the residual
+            was still open.
+          - After the fix: trade_count only advances when the eventual
+            status='filled' row is written.
+
+        Live and restart must use the same definition of "completed
+        round trip" — matching the live allocator's is_full_close=True
+        gating.
+        """
+        tl = TradeLogger(path=tmp_csv)
+
+        def _close_row(*, status: str, uid: str | None, pnl: float, i: int) -> TradeRecord:
+            return TradeRecord(
+                timestamp=f"2026-04-22T10:0{i}:00+00:00",
+                symbol=f"SYM{i}",
+                side="sell",
+                qty=1, avg_fill_price=100.0,
+                order_id=f"close-{i}",
+                strategy="sma_crossover",
+                reason="exit signal",
+                stop_price=0.0, entry_reference_price=100.0,
+                modeled_slippage_bps=0.0, realized_slippage_bps=0.0,
+                order_type="market", status=status,
+                requested_qty=1, filled_qty=1,
+                initial_stop_loss=95.0, initial_risk_per_share=5.0,
+                initial_risk_dollars=5.0,
+                realized_pnl=pnl, r_multiple=None,
+                entry_timestamp="2026-04-21T10:00:00+00:00",
+                exit_timestamp=f"2026-04-22T10:0{i}:00+00:00",
+                position_uid=uid,
+            )
+
+        # Step 1: a partial-close row exists, residual still open.
+        tl.log(_close_row(status="partial", uid="pos-mid-trade", pnl=-50.0, i=0))
+        summary = tl.read_strategy_realized_pnl_summary(["sma_crossover"])
+        # P&L from the partial IS counted — dollar math is honest.
+        assert summary["sma_crossover"]["realized_pnl"] == pytest.approx(-50.0)
+        # But trade_count is NOT incremented — round trip incomplete.
+        assert summary["sma_crossover"]["trade_count"] == 0
+        # And the UID is NOT marked as seen, so when the full close
+        # arrives later it will correctly count once.
+        assert summary["sma_crossover"]["seen_position_uids"] == []
+
+        # Step 2: the residual eventually fully closes.
+        tl.log(_close_row(status="filled", uid="pos-mid-trade", pnl=-25.0, i=1))
+        summary = tl.read_strategy_realized_pnl_summary(["sma_crossover"])
+        # Cumulative P&L = -50 + -25 = -75 (both events contribute).
+        assert summary["sma_crossover"]["realized_pnl"] == pytest.approx(-75.0)
+        # NOW trade_count increments to 1 (one completed round trip).
+        assert summary["sma_crossover"]["trade_count"] == 1
+        assert summary["sma_crossover"]["seen_position_uids"] == ["pos-mid-trade"]
+
+    def test_partial_only_with_legacy_uid_also_excluded(self, tmp_csv):
+        """The status='filled' gate applies even to legacy rows without
+        a position_uid. A partial row with no UID still contributes to
+        P&L but does not increment trade_count."""
+        tl = TradeLogger(path=tmp_csv)
+        tl.log(TradeRecord(
+            timestamp="2026-04-22T10:00:00+00:00",
+            symbol="X", side="sell", qty=1, avg_fill_price=100.0,
+            order_id="c-0", strategy="sma_crossover",
+            reason="exit signal",
+            stop_price=0.0, entry_reference_price=100.0,
+            modeled_slippage_bps=0.0, realized_slippage_bps=0.0,
+            order_type="market", status="partial",
+            requested_qty=1, filled_qty=1,
+            realized_pnl=-100.0,
+            position_uid=None,  # legacy
+        ))
+        summary = tl.read_strategy_realized_pnl_summary(["sma_crossover"])
+        assert summary["sma_crossover"]["realized_pnl"] == pytest.approx(-100.0)
+        assert summary["sma_crossover"]["trade_count"] == 0
+
+    def test_close_records_with_position_uid_dedup_on_restart(self, tmp_csv):
+        """PR #56 R2: when close rows have position_uid (the live path
+        after the logger fix), restart reconstruction must count
+        distinct positions — partial closes of the same position do
+        NOT inflate trade_count."""
+        tl = TradeLogger(path=tmp_csv)
+        # Position pos-A: two partial closes (-50 + -25). One round trip.
+        # Position pos-B: one close (+100). One round trip.
+        # Position pos-C: one close (-30). One round trip.
+        # Two legacy rows: no position_uid. Each counts as one.
+        rows = [
+            ("pos-A", -50.0),
+            ("pos-A", -25.0),       # second partial of same position
+            ("pos-B", 100.0),
+            ("pos-C", -30.0),
+            (None, -10.0),          # legacy
+            (None, -5.0),           # legacy
+        ]
+        for i, (uid, pnl) in enumerate(rows):
+            tl.log(TradeRecord(
+                timestamp=f"2026-04-22T10:0{i}:00+00:00",
+                symbol=f"SYM{i}",
+                side="sell",
+                qty=1, avg_fill_price=100.0,
+                order_id=f"close-{i}",
+                strategy="sma_crossover",
+                reason="exit signal",
+                stop_price=0.0, entry_reference_price=100.0,
+                modeled_slippage_bps=0.0, realized_slippage_bps=0.0,
+                order_type="market", status="filled",
+                requested_qty=1, filled_qty=1,
+                initial_stop_loss=95.0, initial_risk_per_share=5.0,
+                initial_risk_dollars=5.0,
+                realized_pnl=pnl, r_multiple=None,
+                entry_timestamp="2026-04-21T10:00:00+00:00",
+                exit_timestamp=f"2026-04-22T10:0{i}:00+00:00",
+                position_uid=uid,
+            ))
+
+        summary = tl.read_strategy_realized_pnl_summary(["sma_crossover"])
+        # Realized P&L sums everything: -50 -25 +100 -30 -10 -5 = -20
+        assert summary["sma_crossover"]["realized_pnl"] == pytest.approx(-20.0)
+        # trade_count: 3 distinct UIDs + 2 legacy = 5 round trips
+        # (the two pos-A rows count as 1).
+        assert summary["sma_crossover"]["trade_count"] == pytest.approx(5.0)
+        # seen_position_uids reflects the distinct UIDs.
+        assert summary["sma_crossover"]["seen_position_uids"] == [
+            "pos-A", "pos-B", "pos-C",
+        ]
 
     def test_option_entry_uses_contract_multiplier_for_initial_risk(self):
         tl = TradeLogger(path="/dev/null")
@@ -815,6 +955,171 @@ class TestSpreadLogging:
         by_symbol = {r["symbol"]: r for r in rows}
         assert by_symbol[self._SHORT]["side"] == "buy"   # bought back to close
         assert by_symbol[self._LONG]["side"] == "sell"   # long leg sold
+
+    def test_open_writes_status_filled(self, tmp_csv):
+        """Spread opens are atomic — always written as status='filled'.
+
+        The is_full_close parameter doesn't apply to opens; the logger
+        treats opening=True as always-full regardless.
+        """
+        tl = TradeLogger(path=tmp_csv)
+        # Even with is_full_close=False, opens are still 'filled'.
+        tl.log_spread_fill(
+            position_id="uuid-1", strategy="credit_spread",
+            short_occ=self._SHORT, long_occ=self._LONG,
+            qty=1, net_price=2.54, opening=True,
+            is_full_close=False,
+        )
+        rows = tl.read_all()
+        assert all(r["status"] == "filled" for r in rows)
+
+    def test_partial_close_writes_status_partial(self, tmp_csv):
+        """PR #56 R4: a partial close (is_full_close=False) writes
+        status='partial' so restart restoration via the R3 filter
+        correctly does NOT count it as a completed round trip."""
+        tl = TradeLogger(path=tmp_csv)
+        tl.log_spread_fill(
+            position_id="uuid-1", strategy="credit_spread",
+            short_occ=self._SHORT, long_occ=self._LONG,
+            qty=1, net_price=2.54, order_id="combo-open", opening=True,
+        )
+        tl.log_spread_fill(
+            position_id="uuid-1", strategy="credit_spread",
+            short_occ=self._SHORT, long_occ=self._LONG,
+            qty=1, net_price=1.10, order_id="combo-partial", opening=False,
+            realized_pnl=-150.0,
+            is_full_close=False,
+        )
+        rows = tl.read_all()
+        # Open rows are 'filled' (atomic). Close rows are 'partial'.
+        statuses = {(r["side"], r["status"]) for r in rows[2:]}  # close rows
+        assert statuses == {("buy", "partial"), ("sell", "partial")}
+
+    def test_partial_spread_close_reconstructs_with_residual_qty(self, tmp_csv):
+        """PR #56 R5: a 2-contract spread with a 1-contract partial
+        close must reconstruct as OPEN with residual qty=1, not as
+        empty (dropped) or full qty=2.
+
+        Reviewer's smoking-gun: prior to R5, read_open_spread_positions
+        treated any exit_timestamp as fully closed, dropping the
+        spread entirely. The remaining 1 contract was orphaned at
+        the broker.
+        """
+        tl = TradeLogger(path=tmp_csv)
+        # Open a 2-contract spread.
+        tl.log_spread_fill(
+            position_id="uuid-X", strategy="credit_spread",
+            short_occ=self._SHORT, long_occ=self._LONG,
+            qty=2, net_price=2.50, opening=True,
+        )
+        # Partial close — 1 contract.
+        tl.log_spread_fill(
+            position_id="uuid-X", strategy="credit_spread",
+            short_occ=self._SHORT, long_occ=self._LONG,
+            qty=1, net_price=1.20, opening=False,
+            realized_pnl=-130.0,
+            is_full_close=False,
+        )
+        # Restart: read_open_spread_positions must return the spread
+        # with residual qty=1, not [].
+        opens = tl.read_open_spread_positions()
+        assert len(opens) == 1
+        rec = opens[0]
+        assert rec["position_id"] == "uuid-X"
+        assert rec["qty"] == pytest.approx(1.0)
+        assert rec["net_credit"] == pytest.approx(2.50)
+        assert set(rec["leg_symbols"]) == {self._SHORT, self._LONG}
+
+    def test_full_spread_close_still_reconstructs_as_closed(self, tmp_csv):
+        """The R5 fix must NOT break the existing full-close path.
+        A status='filled' close row drops the spread from open positions.
+        """
+        tl = TradeLogger(path=tmp_csv)
+        tl.log_spread_fill(
+            position_id="uuid-X", strategy="credit_spread",
+            short_occ=self._SHORT, long_occ=self._LONG,
+            qty=2, net_price=2.50, opening=True,
+        )
+        # Full close — status='filled' (default is_full_close=True).
+        tl.log_spread_fill(
+            position_id="uuid-X", strategy="credit_spread",
+            short_occ=self._SHORT, long_occ=self._LONG,
+            qty=2, net_price=1.10, opening=False,
+            realized_pnl=-280.0,
+        )
+        assert tl.read_open_spread_positions() == []
+
+    def test_partial_then_full_close_reconstructs_as_closed(self, tmp_csv):
+        """Partial → eventual full close: spread is fully closed.
+        The full-close row's status='filled' marks the position closed
+        regardless of any preceding partial rows."""
+        tl = TradeLogger(path=tmp_csv)
+        tl.log_spread_fill(
+            position_id="uuid-X", strategy="credit_spread",
+            short_occ=self._SHORT, long_occ=self._LONG,
+            qty=2, net_price=2.50, opening=True,
+        )
+        tl.log_spread_fill(
+            position_id="uuid-X", strategy="credit_spread",
+            short_occ=self._SHORT, long_occ=self._LONG,
+            qty=1, net_price=1.20, opening=False,
+            realized_pnl=-130.0,
+            is_full_close=False,
+        )
+        tl.log_spread_fill(
+            position_id="uuid-X", strategy="credit_spread",
+            short_occ=self._SHORT, long_occ=self._LONG,
+            qty=1, net_price=1.10, opening=False,
+            realized_pnl=-140.0,
+            is_full_close=True,
+        )
+        assert tl.read_open_spread_positions() == []
+
+    def test_partial_spread_close_does_not_inflate_restart_trade_count(self, tmp_csv):
+        """Full end-to-end R4 invariant: a partial spread close logged
+        via log_spread_fill must NOT count as a completed round trip
+        when the trade log is replayed at restart. Matches the live
+        allocator's is_full_close=False semantic.
+
+        This is the smoking-gun integration test for the R4 fix:
+        before R4, partial spread closes silently wrote status='filled'
+        and restart would mis-count them.
+        """
+        tl = TradeLogger(path=tmp_csv)
+        # Open the spread.
+        tl.log_spread_fill(
+            position_id="uuid-X", strategy="credit_spread",
+            short_occ=self._SHORT, long_occ=self._LONG,
+            qty=2, net_price=2.50, opening=True,
+        )
+        # Partial close — half the contracts.
+        tl.log_spread_fill(
+            position_id="uuid-X", strategy="credit_spread",
+            short_occ=self._SHORT, long_occ=self._LONG,
+            qty=1, net_price=1.20, opening=False,
+            realized_pnl=-130.0,
+            is_full_close=False,
+        )
+        # Restart: read back the summary.
+        summary = tl.read_strategy_realized_pnl_summary(["credit_spread"])
+        # P&L of the partial IS counted (dollar math is honest).
+        assert summary["credit_spread"]["realized_pnl"] == pytest.approx(-130.0)
+        # But trade_count is NOT incremented — round trip incomplete.
+        assert summary["credit_spread"]["trade_count"] == 0
+        assert summary["credit_spread"]["seen_position_uids"] == []
+
+        # The residual eventually fully closes — NOW the round trip counts.
+        tl.log_spread_fill(
+            position_id="uuid-X", strategy="credit_spread",
+            short_occ=self._SHORT, long_occ=self._LONG,
+            qty=1, net_price=1.10, opening=False,
+            realized_pnl=-120.0,
+            is_full_close=True,
+        )
+        summary = tl.read_strategy_realized_pnl_summary(["credit_spread"])
+        assert summary["credit_spread"]["realized_pnl"] == pytest.approx(-250.0)
+        assert summary["credit_spread"]["trade_count"] == 1
+        assert summary["credit_spread"]["seen_position_uids"] == ["uuid-X"]
 
     def test_spread_legs_excluded_from_single_leg_owner_views(self, tmp_csv):
         tl = TradeLogger(path=tmp_csv)
