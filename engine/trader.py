@@ -807,6 +807,25 @@ class TradingEngine:
                         order_strategy=order_strategy,
                         preserve_existing=True,
                     )
+                    # PLAN 11.47 EOD hygiene — defensive cancel of any
+                    # STOP_LIMIT entry that survived TIF.DAY (paper edge
+                    # cases) plus cleanup of orphan fractional residuals
+                    # whose whole-share leg never triggered. Idempotent
+                    # across repeated market-closed cycles.
+                    try:
+                        self._cancel_stale_stop_limit_entries(snapshot)
+                    except Exception as exc:
+                        logger.warning(
+                            f"market-closed STOP_LIMIT entry sweep "
+                            f"failed: {exc}"
+                        )
+                    try:
+                        self._close_orphan_stop_limit_residuals(snapshot)
+                    except Exception as exc:
+                        logger.warning(
+                            f"market-closed STOP_LIMIT orphan residual "
+                            f"sweep failed: {exc}"
+                        )
                 except Exception as e:
                     logger.warning(
                         f"market-closed snapshot refresh failed: {e} — "
@@ -1879,6 +1898,107 @@ class TradingEngine:
             self._processed_signal_reasons[key] = list(
                 strategy_reasons.get(symbol, [])
             )
+
+    def _cancel_stale_stop_limit_entries(self, snapshot) -> None:
+        """PLAN 11.47: defensive cancel of unfilled STOP_LIMIT entry orders.
+
+        Primary mechanism is TimeInForce.DAY (Alpaca auto-cancels at
+        session close so the order does not carry into the next session
+        with a stale breakout level). This sweep runs on market-closed
+        cycles as belt-and-braces against paper API edge cases or
+        cross-restart TIF resets that could leave a stop-limit entry
+        order resting against a level that no longer matches today's
+        recomputed prior-N-day high.
+
+        Idempotent — when there are no STOP_LIMIT entries open, this is
+        a no-op. Runs every market-closed cycle; multiple sweeps over
+        the same closed session see nothing to cancel after the first
+        one succeeds.
+        """
+        for order in getattr(snapshot, "open_orders", []) or []:
+            order_type = getattr(order, "order_type", None)
+            if order_type is None:
+                continue
+            order_type_val = (
+                order_type.value if hasattr(order_type, "value") else str(order_type)
+            ).lower()
+            if order_type_val != "stop_limit":
+                continue
+            side = getattr(order, "side", None)
+            side_val = (
+                side.value if hasattr(side, "value") else str(side or "")
+            ).lower()
+            if side_val != "buy":
+                # Only entry-side stop-limits — exits do not use this type.
+                continue
+            order_id = getattr(order, "order_id", None) or getattr(order, "id", None)
+            if not order_id:
+                continue
+            try:
+                ok = self.broker.cancel_order(str(order_id))
+                if ok:
+                    logger.info(
+                        f"[PLAN 11.47] cancelled stale STOP_LIMIT entry "
+                        f"{order_id} for {getattr(order, 'symbol', '?')} "
+                        f"(defensive EOD sweep)"
+                    )
+            except Exception as e:
+                logger.warning(
+                    f"[PLAN 11.47] failed to cancel stale STOP_LIMIT "
+                    f"entry {order_id}: {e}"
+                )
+
+    def _close_orphan_stop_limit_residuals(self, snapshot) -> None:
+        """PLAN 11.47: close orphan fractional positions where the
+        whole-share STOP_LIMIT leg never triggered.
+
+        Edge case: live quote was at-or-above the trigger at submission
+        time so the fractional residual MARKET fired, but the broker
+        never triggered the whole-share STOP_LIMIT (price reverted below
+        the trigger before any tick crossed it). Result: a tiny
+        fractional position with no whole-share companion.
+
+        Detection: a position owned by a STOP_LIMIT strategy with
+        absolute qty strictly less than one whole share. The existing
+        `_close_fractional_residual_position` path already handles the
+        liquidation mechanics.
+
+        Runs on market-closed cycles. Idempotent — no orphan, no op.
+        """
+        for symbol, position in snapshot.account.open_positions.items():
+            if _OCC_PAT.match(symbol):
+                continue
+            owner = self._get_owner(symbol)
+            if owner is None:
+                continue
+            # Only close orphans owned by strategies that use STOP_LIMIT
+            # entries. Other fractional residual paths handle their own
+            # cleanup via _repair_missing_protective_stops.
+            slot = self.slots.get(owner)
+            if slot is None:
+                continue
+            if slot.strategy.preferred_order_type is not OrderType.STOP_LIMIT:
+                continue
+            abs_qty = abs(float(position.qty))
+            if abs_qty == 0 or abs_qty >= 1.0:
+                continue
+            logger.warning(
+                f"[PLAN 11.47] {symbol}: orphan STOP_LIMIT residual "
+                f"detected (qty={position.qty}, owner={owner}); the "
+                f"whole-share leg never triggered. Closing the residual."
+            )
+            try:
+                self._close_fractional_residual_position(
+                    snapshot=snapshot,
+                    symbol=symbol,
+                    owner=owner,
+                    position=position,
+                )
+            except Exception as e:
+                logger.warning(
+                    f"[PLAN 11.47] {symbol}: orphan residual cleanup "
+                    f"failed: {e}"
+                )
 
     def _prepare_stop_limit_split(
         self,
