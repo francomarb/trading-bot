@@ -472,11 +472,16 @@ class SleeveAllocator:
         "trade_count": int, "min_trades_for_gate": int,
         "gate_armed": bool}}` for every registered strategy.
 
-        ``gate_armed`` reflects whether the sample-size guard is
-        satisfied (i.e. the gate is *eligible* to fire). When False, the
-        gate fails open regardless of the drawdown math — which means
-        ``in_drawdown`` is also False even if the dollar math would
-        otherwise have triggered.
+        ``gate_armed`` reflects whether the strategy has accumulated
+        enough trades for the *normal* sleeve-drawdown threshold to
+        apply. When True, the gate uses ``dd_threshold`` (typically
+        5–15% of target_budget). When False (sample below the min-trades
+        floor), the gate uses the **catastrophic** threshold instead —
+        default 35% of target_budget per
+        ``settings.STRATEGY_CATASTROPHIC_DRAWDOWN_THRESHOLD``. The gate
+        is NEVER fully disabled: a true sleeve catastrophe still trips
+        the gate even at low N. The ``effective_threshold_pct`` field
+        below surfaces whichever threshold is currently active.
         """
         out: dict[str, dict] = {}
         for strategy_name in self._entries:

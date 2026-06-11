@@ -435,6 +435,64 @@ class TestDrainSpreadFills:
         assert close_rows  # the close was still logged
         assert all(r["realized_pnl"] is None for r in close_rows)
 
+    def test_partial_close_preserves_position_and_fires_alert(self, tmp_path):
+        """PR #56 R5: a partial-quantity spread close (close_qty <
+        open_qty) must NOT release the spread. State stays intact for
+        the residual fill event to handle; operator is alerted via
+        broker_error so they can reconcile manually.
+        """
+        strategy = _strategy()
+        engine, broker = _engine(tmp_path, strategy)
+        # Pre-register a 2-contract spread.
+        from engine.positions import make_spread, PositionLeg
+        engine._positions["p1"] = make_spread(
+            strategy_name="credit_spread", position_id="p1",
+            legs=[PositionLeg("SPY260618P00568000", -2, side="SELL"),
+                  PositionLeg("SPY260618P00558000", 2, side="BUY")],
+        )
+        engine._spread_owner_strategy["p1"] = strategy
+        engine._pending_spread_plans["p1"] = _pick()
+        # Register the open spread at qty=2.
+        strategy.register_spread(OpenSpread(
+            position_id="p1", short_occ="SPY260618P00568000",
+            long_occ="SPY260618P00558000", short_strike=568.0,
+            long_strike=558.0, expiration_date=_EXP,
+            net_credit=1.45, width=10.0, qty=2,
+        ))
+        engine._spreads_pending_close.add("p1")
+        engine.alerts = MagicMock()
+        engine._allocator = MagicMock()
+        # Drain a CLOSE event reporting only 1 of 2 contracts filled.
+        broker.drain_spread_fills.return_value = [
+            ("p1", "credit_spread", True, "filled", 1.0, 0.80, "combo-close-partial", 0.60),
+        ]
+
+        engine._drain_spread_fills()
+
+        # Position MUST stay open in the engine.
+        assert "p1" in engine._positions
+        assert "p1" in engine._spread_owner_strategy
+        # The strategy must still hold the spread (state preserved).
+        assert len(strategy.open_spreads) == 1
+        assert strategy.open_spreads[0].position_id == "p1"
+        # Allocator was called with is_full_close=False — partial P&L
+        # contributes to dollar math but does NOT increment trade_count.
+        engine._allocator.record_realized_pnl.assert_called_once()
+        kwargs = engine._allocator.record_realized_pnl.call_args.kwargs
+        assert kwargs["position_uid"] == "p1"
+        assert kwargs["is_full_close"] is False
+        # Operator alerted via broker_error.
+        engine.alerts.broker_error.assert_called_once()
+        alert_msg = engine.alerts.broker_error.call_args.args[0]
+        assert "partial close" in alert_msg
+        assert "p1" in alert_msg
+        # The partial fill row was logged with status='partial'.
+        partial_rows = [
+            r for r in engine.trade_logger.read_all()
+            if r["position_type"] == "spread" and r["status"] == "partial"
+        ]
+        assert len(partial_rows) == 2  # one row per leg
+
     def test_close_canceled_keeps_position_for_retry(self, tmp_path):
         strategy = _strategy()
         engine, broker = _engine(tmp_path, strategy)

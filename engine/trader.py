@@ -4923,6 +4923,82 @@ class TradingEngine:
             # ── Spread CLOSE ─────────────────────────────────────────────
             self._spreads_pending_close.discard(position_id)
             if filled:
+                # PR #56 R5: peek at the open spread BEFORE releasing so
+                # we can detect a partial close (close_qty < released.qty)
+                # and refuse to corrupt state. Alpaca documents MLEG
+                # combos as atomic per-leg, but quantity-wise a 2-contract
+                # close fill of 1 contract is structurally possible.
+                # Previously the engine released the entire position
+                # unconditionally → residual at the broker, orphaned at
+                # the strategy.
+                peeked: OpenSpread | None = (
+                    strategy.get_open_spread(position_id)
+                    if strategy is not None
+                    and hasattr(strategy, "get_open_spread")
+                    else None
+                )
+                close_qty = float(
+                    filled_qty or (peeked.qty if peeked is not None else 1)
+                )
+                full_close_combo: bool = (
+                    peeked is None or close_qty >= peeked.qty
+                )
+                if not full_close_combo:
+                    # Defensive: don't release/pop/log. Fire CRITICAL so the
+                    # operator reconciles manually. The position stays open
+                    # at the strategy/engine level; the residual stream event
+                    # (when the rest fills) will land here again with
+                    # full_close_combo=True and proceed normally.
+                    logger.critical(
+                        f"[{strategy_name}] credit spread PARTIAL close detected — "
+                        f"position_id={position_id[:8]} close_qty={close_qty} < "
+                        f"open_qty={peeked.qty} — state NOT released; "
+                        f"awaiting residual fill. Operator review recommended."
+                    )
+                    try:
+                        self.alerts.broker_error(
+                            f"credit_spread partial close: "
+                            f"position_id={position_id[:8]} "
+                            f"close_qty={close_qty}/{peeked.qty} "
+                            f"(state preserved, awaiting residual)"
+                        )
+                    except Exception:
+                        pass
+                    # Still log the partial event so the trade-log is
+                    # honest about what happened and the dollar math
+                    # reflects the partial P&L.
+                    if peeked is not None and avg_fill_price is not None:
+                        partial_net_debit = abs(avg_fill_price)
+                        partial_pnl = (
+                            (peeked.net_credit - partial_net_debit)
+                            * close_qty * 100.0
+                        )
+                        if self._allocator is not None:
+                            self._allocator.record_realized_pnl(
+                                strategy_name, partial_pnl,
+                                position_uid=position_id,
+                                is_full_close=False,
+                            )
+                        try:
+                            self.trade_logger.log_spread_fill(
+                                position_id=position_id,
+                                strategy=strategy_name,
+                                short_occ=peeked.short_occ,
+                                long_occ=peeked.long_occ,
+                                qty=close_qty,
+                                net_price=partial_net_debit,
+                                order_id=order_id,
+                                opening=False,
+                                realized_pnl=partial_pnl,
+                                reason="spread exit (partial)",
+                                is_full_close=False,
+                            )
+                        except Exception as exc:
+                            logger.error(
+                                f"[{strategy_name}] partial-close trade-log "
+                                f"write failed: {exc}"
+                            )
+                    continue
                 released = (
                     strategy.release_spread(position_id)
                     if strategy is not None else None
@@ -4931,9 +5007,6 @@ class TradingEngine:
                 self._spread_owner_strategy.pop(position_id, None)
                 short_occ = released.short_occ if released is not None else position_id
                 long_occ = released.long_occ if released is not None else ""
-                close_qty = float(
-                    filled_qty or (released.qty if released is not None else 1)
-                )
 
                 # The spread IS closed regardless — but only record P&L when
                 # we have a real fill price. A stream "filled" event whose

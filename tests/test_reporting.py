@@ -995,6 +995,86 @@ class TestSpreadLogging:
         statuses = {(r["side"], r["status"]) for r in rows[2:]}  # close rows
         assert statuses == {("buy", "partial"), ("sell", "partial")}
 
+    def test_partial_spread_close_reconstructs_with_residual_qty(self, tmp_csv):
+        """PR #56 R5: a 2-contract spread with a 1-contract partial
+        close must reconstruct as OPEN with residual qty=1, not as
+        empty (dropped) or full qty=2.
+
+        Reviewer's smoking-gun: prior to R5, read_open_spread_positions
+        treated any exit_timestamp as fully closed, dropping the
+        spread entirely. The remaining 1 contract was orphaned at
+        the broker.
+        """
+        tl = TradeLogger(path=tmp_csv)
+        # Open a 2-contract spread.
+        tl.log_spread_fill(
+            position_id="uuid-X", strategy="credit_spread",
+            short_occ=self._SHORT, long_occ=self._LONG,
+            qty=2, net_price=2.50, opening=True,
+        )
+        # Partial close — 1 contract.
+        tl.log_spread_fill(
+            position_id="uuid-X", strategy="credit_spread",
+            short_occ=self._SHORT, long_occ=self._LONG,
+            qty=1, net_price=1.20, opening=False,
+            realized_pnl=-130.0,
+            is_full_close=False,
+        )
+        # Restart: read_open_spread_positions must return the spread
+        # with residual qty=1, not [].
+        opens = tl.read_open_spread_positions()
+        assert len(opens) == 1
+        rec = opens[0]
+        assert rec["position_id"] == "uuid-X"
+        assert rec["qty"] == pytest.approx(1.0)
+        assert rec["net_credit"] == pytest.approx(2.50)
+        assert set(rec["leg_symbols"]) == {self._SHORT, self._LONG}
+
+    def test_full_spread_close_still_reconstructs_as_closed(self, tmp_csv):
+        """The R5 fix must NOT break the existing full-close path.
+        A status='filled' close row drops the spread from open positions.
+        """
+        tl = TradeLogger(path=tmp_csv)
+        tl.log_spread_fill(
+            position_id="uuid-X", strategy="credit_spread",
+            short_occ=self._SHORT, long_occ=self._LONG,
+            qty=2, net_price=2.50, opening=True,
+        )
+        # Full close — status='filled' (default is_full_close=True).
+        tl.log_spread_fill(
+            position_id="uuid-X", strategy="credit_spread",
+            short_occ=self._SHORT, long_occ=self._LONG,
+            qty=2, net_price=1.10, opening=False,
+            realized_pnl=-280.0,
+        )
+        assert tl.read_open_spread_positions() == []
+
+    def test_partial_then_full_close_reconstructs_as_closed(self, tmp_csv):
+        """Partial → eventual full close: spread is fully closed.
+        The full-close row's status='filled' marks the position closed
+        regardless of any preceding partial rows."""
+        tl = TradeLogger(path=tmp_csv)
+        tl.log_spread_fill(
+            position_id="uuid-X", strategy="credit_spread",
+            short_occ=self._SHORT, long_occ=self._LONG,
+            qty=2, net_price=2.50, opening=True,
+        )
+        tl.log_spread_fill(
+            position_id="uuid-X", strategy="credit_spread",
+            short_occ=self._SHORT, long_occ=self._LONG,
+            qty=1, net_price=1.20, opening=False,
+            realized_pnl=-130.0,
+            is_full_close=False,
+        )
+        tl.log_spread_fill(
+            position_id="uuid-X", strategy="credit_spread",
+            short_occ=self._SHORT, long_occ=self._LONG,
+            qty=1, net_price=1.10, opening=False,
+            realized_pnl=-140.0,
+            is_full_close=True,
+        )
+        assert tl.read_open_spread_positions() == []
+
     def test_partial_spread_close_does_not_inflate_restart_trade_count(self, tmp_csv):
         """Full end-to-end R4 invariant: a partial spread close logged
         via log_spread_fill must NOT count as a completed round trip

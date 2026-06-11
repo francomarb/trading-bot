@@ -1404,14 +1404,21 @@ class TradeLogger:
               "qty": float,
             }
 
-        A spread is *open* when its ``position_id`` has no row carrying an
-        ``exit_timestamp`` (the close writes ``exit_timestamp`` on both leg
-        rows). ``net_credit`` is taken from the open row whose
-        ``avg_fill_price`` is non-zero — ``log_spread_fill`` puts the combo
-        net on the short-leg row and 0.0 on the long-leg row.
+        A spread is *fully closed* when its ``position_id`` has a close
+        row with ``status='filled'`` (a full-close MLEG event). Rows with
+        ``status='partial'`` represent partial closes that leave a
+        residual still open at the broker — they reduce the reconstructed
+        ``qty`` but do NOT mark the position as closed (PR #56 R5 fix).
+        Previously, any row carrying an ``exit_timestamp`` marked the
+        position closed, silently dropping spreads that had been only
+        partially closed before restart.
 
-        Used by the engine on startup to rebuild spread ``Position`` records
-        instead of mis-assigning the legs as single-leg positions.
+        ``net_credit`` is taken from the open row whose ``avg_fill_price``
+        is non-zero — ``log_spread_fill`` puts the combo net on the
+        short-leg row and 0.0 on the long-leg row.
+
+        Used by the engine on startup to rebuild spread ``Position``
+        records instead of mis-assigning the legs as single-leg positions.
         """
         if not os.path.exists(self._path):
             return []
@@ -1422,7 +1429,7 @@ class TradeLogger:
         conn.row_factory = sqlite3.Row
         cursor = conn.execute(
             "SELECT position_id, strategy, symbol, side, avg_fill_price, "
-            "       qty, entry_timestamp, exit_timestamp, id "
+            "       qty, entry_timestamp, exit_timestamp, status, id "
             "FROM trades "
             "WHERE position_type = 'spread' "
             "AND status IN ('filled', 'partial') "
@@ -1442,24 +1449,65 @@ class TradeLogger:
                     "net_credit": 0.0,
                     "qty": float(row["qty"] or 0.0),
                     "_closed": False,
+                    # Track the cumulative partial-close qty per position
+                    # so we can report a residual qty on partial-only
+                    # spreads. Only the short-leg close row's qty counts
+                    # (the long-leg row mirrors it for spreads).
+                    "_partial_close_qty": 0.0,
+                    # `_open_qty` tracks what was opened (from open rows)
+                    # so we can compute open_qty - partial_close_qty for
+                    # the residual.
+                    "_open_qty": 0.0,
                 },
             )
-            if row["exit_timestamp"] is not None:
-                entry["_closed"] = True
+            row_status = row["status"]
+            row_exit = row["exit_timestamp"]
+            if row_exit is not None:
+                # Close-side row. Only a status='filled' close marks the
+                # position fully closed. status='partial' rows accumulate
+                # qty toward the residual computation but leave the
+                # position open.
+                if row_status == "filled":
+                    entry["_closed"] = True
+                elif row["side"] == "buy":
+                    # Spread close: short leg is bought back; long leg
+                    # is sold. Only count one leg's qty to avoid
+                    # double-counting.
+                    entry["_partial_close_qty"] += float(row["qty"] or 0.0)
                 continue
             # Open-side leg row.
             sym = row["symbol"]
             if sym not in entry["leg_symbols"]:
                 entry["leg_symbols"].append(sym)
             price = float(row["avg_fill_price"] or 0.0)
+            # On open, the short leg carries the net credit and the
+            # canonical qty. Capture both there.
             if price > 0.0:
                 entry["net_credit"] = price
                 entry["qty"] = float(row["qty"] or entry["qty"])
-        return [
-            {k: v for k, v in entry.items() if k != "_closed"}
-            for entry in grouped.values()
-            if not entry["_closed"] and len(entry["leg_symbols"]) == 2
-        ]
+                entry["_open_qty"] = float(row["qty"] or entry["_open_qty"])
+
+        # Apply residual qty before returning. If a spread has had a
+        # partial close but no full close, the reconstructed qty is
+        # open_qty - cumulative_partial_close_qty.
+        results: list[dict] = []
+        for entry in grouped.values():
+            if entry["_closed"]:
+                continue
+            if len(entry["leg_symbols"]) != 2:
+                continue
+            residual_qty = entry["_open_qty"] - entry["_partial_close_qty"]
+            if residual_qty <= 0:
+                # All open qty has been partially closed but no
+                # status='filled' row was written. Treat as effectively
+                # closed (defensive — should be rare).
+                continue
+            entry["qty"] = residual_qty
+            results.append({
+                k: v for k, v in entry.items()
+                if not k.startswith("_")
+            })
+        return results
 
     def read_strategy_realized_pnl_summary(
         self,
