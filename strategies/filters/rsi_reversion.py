@@ -6,6 +6,7 @@ RSIEdgeFilter enforces four entry gates:
   Rule 1 — Market trend (mandatory):
     SPY close > SPY 200-day SMA   (avoid bear markets)
     SPY close > SPY 50-day SMA    (avoid macro downtrends)
+    Both windows must be computable; insufficient SPY history blocks entries.
 
   Rule 2 — Earnings blackout:
     Block new entries within 3 calendar days before / 2 days after earnings.
@@ -80,7 +81,7 @@ class RSIEdgeFilter:
       4. Current close > min close of prior new_low_window bars (no active breakdown)
 
     Args:
-        spy_lookback_days: Calendar days of SPY history to fetch (default 280).
+        spy_lookback_days: Calendar days of SPY history to fetch (default 320).
         spy_cache_ttl:     Seconds to reuse cached SPY data (default 600).
         days_before:       Earnings blackout days before the event (default 3).
         days_after:        Earnings blackout days after the event (default 2).
@@ -92,7 +93,7 @@ class RSIEdgeFilter:
     def __init__(
         self,
         *,
-        spy_lookback_days: int = 280,
+        spy_lookback_days: int = 320,
         spy_cache_ttl: float = 600.0,
         days_before: int = 3,
         days_after: int = 2,
@@ -149,6 +150,7 @@ class RSIEdgeFilter:
 
     def __call__(self, df: pd.DataFrame) -> EdgeFilterDecision:
         spy_gate      = self._spy_filter(df)
+        spy_reason    = self._spy_filter.last_reason
         earnings_gate = self._earnings(df)
         vol_gate      = self._volume_liquid(df)
         low_gate      = self._no_new_low(df)
@@ -173,7 +175,7 @@ class RSIEdgeFilter:
         ):
             row_reasons: list[str] = []
             if not spy_ok:
-                row_reasons.append("SPY trend gate failed (below 200 or 50 SMA)")
+                row_reasons.append(f"SPY trend gate failed: {spy_reason}")
             if not earn_ok:
                 row_reasons.append("earnings blackout")
             if not vol_ok:

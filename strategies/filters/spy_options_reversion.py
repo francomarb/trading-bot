@@ -29,7 +29,7 @@ class SPYOptionsEdgeFilter:
     Gate: SPY close > 100-day SMA.
 
     Args:
-        spy_lookback_days: Calendar days of SPY history to fetch (default 320).
+        spy_lookback_days: Calendar days of SPY history to fetch (default 180).
         spy_cache_ttl:     Seconds to reuse cached SPY data (default 600).
     """
 
@@ -51,12 +51,13 @@ class SPYOptionsEdgeFilter:
 
     def __call__(self, df: pd.DataFrame) -> EdgeFilterDecision:
         gate: pd.Series = self._spy_filter(df)
+        spy_reason = self._spy_filter.last_reason
         allowed = gate.astype(bool)
         reasons = pd.Series(
             [
                 []
                 if bool(ok)
-                else ["SPY below 100 SMA (bear regime)"]
+                else [f"SPY trend gate failed: {spy_reason}"]
                 for ok in allowed.tolist()
             ],
             index=allowed.index,
@@ -67,7 +68,7 @@ class SPYOptionsEdgeFilter:
             if bool(allowed.iloc[-1]):
                 logger.info("SPY_OPTIONS_FILTER_ALLOWED — SPY above 100 SMA")
             else:
-                logger.info("SPY_OPTIONS_FILTER_BLOCKED — SPY below 100 SMA (bear regime)")
+                logger.info(f"SPY_OPTIONS_FILTER_BLOCKED — {spy_reason}")
 
         return EdgeFilterDecision(
             allowed=allowed,

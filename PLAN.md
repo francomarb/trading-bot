@@ -147,6 +147,8 @@ These are the items that must be green before any live flip.
 - Strategies are pure signal generators; execution and risk live outside strategies.
 - Single-leg trades pass through `RiskManager.evaluate`; defined-risk MLEG spreads use strategy max-loss sizing plus sleeve gates.
 - Exits are never blocked by edge filters, regime gates, or sleeve capacity.
+- Mandatory macro SMA entry gates fail closed when history is insufficient;
+  an unavailable indicator must never silently weaken an entry policy.
 - New filters should return `EdgeFilterDecision`, not only boolean Series.
 - Options and spreads must use broker-supported Alpaca SDK paths; avoid home-grown execution behavior when the SDK provides a native route.
 - Slippage metrics must separate execution quality, implementation shortfall, and stop-gap erosion; no operator-facing slippage number should exist without an explicit stored benchmark contract. See `docs/slippage_unification_design.md`.
