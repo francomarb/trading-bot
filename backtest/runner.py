@@ -38,6 +38,7 @@ from typing import Any, Callable, Iterable
 import numpy as np
 import pandas as pd
 import vectorbt as vbt
+from loguru import logger
 
 from reporting.metrics import kelly_fraction
 from strategies.base import BaseStrategy
@@ -185,6 +186,7 @@ def _apply_stop_limit_semantics(
     """
     open_ = df["open"]
     high = df["high"]
+    low = df["low"]
     # Shift trigger so that the bar t signal's trigger aligns with the
     # execution bar t+1, matching how entries were shifted.
     trigger_at_exec = trigger_prices.shift(1)
@@ -199,18 +201,41 @@ def _apply_stop_limit_semantics(
         cushion = bps_cushion
     limit_at_exec = trigger_at_exec + cushion
 
-    valid = entries & trigger_at_exec.notna() & high.notna() & open_.notna()
-    fires = valid & (high >= trigger_at_exec) & (open_ <= limit_at_exec)
+    # PR #58 review P2 #4 fix: a stop-limit BUY fills when both
+    # conditions hold during the execution bar:
+    #   (1) bar high >= trigger  → the stop trigger fires (price crossed it)
+    #   (2) bar low  <= limit    → at some point a matching offer at-or-below
+    #                              the limit was available (so the now-active
+    #                              limit could match)
+    # The earlier gate `open <= limit` was too strict: a bar that GAPS over
+    # the limit at the open but then RETRACES intraday to below the limit
+    # still fills in production (the triggered limit sits in the book until
+    # someone offers at-or-below it). Using `low <= limit` captures the
+    # gap-and-retrace case.
+    valid = (
+        entries
+        & trigger_at_exec.notna()
+        & high.notna()
+        & low.notna()
+        & open_.notna()
+    )
+    fires = valid & (high >= trigger_at_exec) & (low <= limit_at_exec)
 
-    # Fill price: max(trigger, open) — if open >= trigger, fill at open
-    # (limit fires immediately); if open < trigger, fill at trigger
-    # (trigger fires intraday).
+    # Fill price model:
+    #   - open <= limit: fill at max(trigger, open) — limit fires at open
+    #     (clean intraday breakout: trigger; modest gap-up: open).
+    #   - open >  limit: gap-and-retrace — fill clamps at the limit (the
+    #     highest acceptable price; production fills somewhere between the
+    #     post-retrace low and the limit — backtest is mildly conservative
+    #     by using the limit as the assumed worst case for the fired bar).
+    # Combined: fill = min(max(trigger, open), limit)
     fill_price = pd.Series(
         [
-            max(float(t), float(o)) if fired else float("nan")
-            for t, o, fired in zip(
+            min(max(float(t), float(o)), float(li)) if fired else float("nan")
+            for t, o, li, fired in zip(
                 trigger_at_exec.fillna(0.0).tolist(),
                 open_.fillna(0.0).tolist(),
+                limit_at_exec.fillna(0.0).tolist(),
                 fires.tolist(),
                 strict=False,
             )
@@ -283,6 +308,22 @@ def run_backtest(
     exits = _shift_for_next_open(raw.exits)
 
     # PLAN 11.47 — stop-limit fill semantics for production parity.
+    # PR #58 review P1 #2 fix: auto-enable for any strategy that declares
+    # STOP_LIMIT as its preferred entry type. Otherwise every Donchian
+    # caller (envelope builder, reports, reconciliation) silently uses
+    # next-open fills and diverges from production — exactly the kind of
+    # silent backtest-vs-paper drift the memory note warns about.
+    from strategies.base import OrderType as _BaseOrderType
+    if (
+        not stop_limit_entries
+        and getattr(strategy, "preferred_order_type", None) is _BaseOrderType.STOP_LIMIT
+        and strategy.trigger_prices(df) is not None
+    ):
+        stop_limit_entries = True
+        logger.info(
+            f"backtest auto-enabled stop_limit_entries for "
+            f"{strategy.name} (preferred_order_type=STOP_LIMIT)"
+        )
     entry_price_series = df["open"]
     if stop_limit_entries:
         trigger_prices = strategy.trigger_prices(df)
@@ -292,10 +333,11 @@ def run_backtest(
                 "does not implement trigger_prices(df); cannot simulate "
                 "stop-limit semantics"
             )
-        if "high" not in df.columns:
+        if "high" not in df.columns or "low" not in df.columns:
             raise ValueError(
-                "stop_limit_entries=True requires a 'high' column to "
-                "evaluate the trigger crossing"
+                "stop_limit_entries=True requires 'high' and 'low' "
+                "columns to evaluate trigger crossing and gap-and-retrace "
+                "fills"
             )
         atr_series_for_cap: pd.Series | None = None
         if stop_limit_chase_atr_fraction is not None:

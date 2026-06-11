@@ -509,3 +509,119 @@ class TestStopLimitBacktestSemantics:
                 BacktestConfig(initial_cash=10_000.0),
                 stop_limit_entries=True,
             )
+
+    # ── PR #58 review P2 #4: gap-and-retrace fills ───────────────────────
+
+    def test_gap_up_over_limit_with_retrace_fills_at_limit(self):
+        """Signal at bar 5 (trigger=$245). Bar 6 opens at $260 (above the
+        500 bps cap of $257.25) BUT retraces to a low of $250 intraday.
+        Production behavior: the triggered limit rests in the book and
+        fills when a matching offer at-or-below the limit becomes
+        available. Backtest must model this — earlier `open <= limit`
+        gate incorrectly rejected this case."""
+        from backtest.runner import run_backtest, BacktestConfig
+
+        rows = []
+        for _ in range(5):
+            rows.append((240.0, 241.0, 239.0, 240.0))
+        rows.append((242.0, 246.0, 241.0, 245.0))
+        # Bar 6: gap up (open=$260, above limit), but retrace down to $250
+        # (below limit). High=$262, Low=$250.
+        rows.append((260.0, 262.0, 250.0, 254.0))
+        for _ in range(4):
+            rows.append((254.0, 255.0, 253.0, 254.0))
+        df = self._df_with_explicit_oh(rows)
+
+        result = run_backtest(
+            self._FixedTriggerStrategy(entry_idx=5, trigger=245.0),
+            df,
+            BacktestConfig(initial_cash=10_000.0),
+            stop_limit_entries=True,
+            stop_limit_chase_bps=500,  # limit ≈ $257.25
+            stop_limit_chase_atr_fraction=None,
+        )
+        # Trade fires — the limit was reachable on the retrace.
+        assert result.portfolio.trades.records.shape[0] == 1
+        entry_price = result.portfolio.trades.records["entry_price"].iloc[0]
+        # Fill price clamps at the limit ($257.25), not the open ($260).
+        # vbt adds default 5 bps slippage on top → ~$257.38.
+        assert entry_price == pytest.approx(257.25, rel=0.001)
+
+    def test_gap_up_over_limit_without_retrace_still_no_fill(self):
+        """Sanity: even with the new `low <= limit` gate, a bar that
+        gaps above the limit AND never retraces back down still rejects.
+        This locks in the original 'no chase' guarantee."""
+        from backtest.runner import run_backtest, BacktestConfig
+
+        rows = []
+        for _ in range(5):
+            rows.append((240.0, 241.0, 239.0, 240.0))
+        rows.append((242.0, 246.0, 241.0, 245.0))
+        # Bar 6: gap up, low stays above limit ($257.25 cap).
+        rows.append((277.0, 280.0, 275.0, 278.0))
+        for _ in range(4):
+            rows.append((278.0, 279.0, 277.0, 278.0))
+        df = self._df_with_explicit_oh(rows)
+
+        result = run_backtest(
+            self._FixedTriggerStrategy(entry_idx=5, trigger=245.0),
+            df,
+            BacktestConfig(initial_cash=10_000.0),
+            stop_limit_entries=True,
+            stop_limit_chase_bps=500,
+            stop_limit_chase_atr_fraction=None,
+        )
+        assert result.portfolio.trades.records.shape[0] == 0
+
+    # ── PR #58 review P1 #2: auto-enable for STOP_LIMIT strategies ───────
+
+    def test_stop_limit_entries_auto_enables_for_stop_limit_strategies(self):
+        """A strategy that declares preferred_order_type=STOP_LIMIT MUST
+        get stop-limit fill semantics in the backtest even when callers
+        don't explicitly pass stop_limit_entries=True. Otherwise every
+        Donchian backtest silently uses next-open fills and diverges from
+        production."""
+        from backtest.runner import run_backtest, BacktestConfig
+        from strategies.base import OrderType
+
+        # A strategy whose default order type is STOP_LIMIT.
+        class _AutoStopLimitStrategy(self._FixedTriggerStrategy.__bases__[0]):
+            name = "auto_stop_limit"
+            preferred_order_type = OrderType.STOP_LIMIT
+
+            def __init__(self, *, entry_idx, trigger):
+                super().__init__()
+                self._entry_idx = entry_idx
+                self._trigger = trigger
+
+            def _raw_signals(self, df):
+                n = len(df)
+                e = pd.Series([i == self._entry_idx for i in range(n)], index=df.index)
+                x = pd.Series(False, index=df.index)
+                return SignalFrame(entries=e, exits=x)
+
+            def trigger_prices(self, df):
+                return pd.Series([self._trigger] * len(df), index=df.index)
+
+        rows = []
+        for _ in range(5):
+            rows.append((240.0, 241.0, 239.0, 240.0))
+        rows.append((242.0, 246.0, 241.0, 245.0))
+        # Bar 6: gap up well above the limit AND no retrace. Production
+        # would refuse this fill; if auto-enable did NOT fire, vbt would
+        # use the bar.open ($277) as the entry price and we'd see a trade.
+        rows.append((277.0, 280.0, 275.0, 278.0))
+        for _ in range(4):
+            rows.append((278.0, 279.0, 277.0, 278.0))
+        df = self._df_with_explicit_oh(rows)
+
+        result = run_backtest(
+            _AutoStopLimitStrategy(entry_idx=5, trigger=245.0),
+            df,
+            BacktestConfig(initial_cash=10_000.0),
+            # NOTE: stop_limit_entries NOT passed — should auto-enable.
+        )
+        # If auto-enable fires, the gap-up over the limit is rejected.
+        # If it did NOT fire, vbt would fill at bar.open ($277) and we'd
+        # see one trade record.
+        assert result.portfolio.trades.records.shape[0] == 0

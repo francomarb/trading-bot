@@ -1720,6 +1720,20 @@ class TradingEngine:
             _lc = self._lifecycle_counter_for(strategy.name)
             if _lc is not None:
                 _lc.submitted += 1
+            # PLAN 11.47 fix (PR #58 review P1 #1b): fire the residual
+            # immediately after the primary is confirmed at the broker,
+            # NOT after _record_fill / _log_entry. The primary STOP_LIMIT
+            # rests at Alpaca as a non-terminal order, which the broker
+            # adapter maps to ACCEPTED — the early-return at the ACCEPTED
+            # branch below would otherwise skip the residual entirely on
+            # the normal happy path. Skip residual only when the primary
+            # state itself is ambiguous (UNKNOWN) — a residual on top of
+            # an unconfirmed primary would compound the uncertainty.
+            if (
+                residual_decision is not None
+                and result.status is not OrderStatus.UNKNOWN
+            ):
+                self._submit_stop_limit_residual(residual_decision, strategy.name)
             if result.status is OrderStatus.UNKNOWN:
                 # Preserve the benchmark provenance so the recovery row
                 # (codepath §9) tags the right kind/quality if this
@@ -1772,15 +1786,6 @@ class TradingEngine:
                 slippage_ref,
                 benchmark_kind=slippage_kind,
             )
-            # PLAN 11.47 hybrid path — fire the fractional residual MARKET
-            # after the whole-share STOP_LIMIT has been submitted. Whether
-            # the primary is FILLED/PARTIAL (rare, only if the broker
-            # triggered the stop immediately at submission because live was
-            # already at/above the trigger) or ACCEPTED (the resting case),
-            # we want the residual now so the position fills to intended
-            # sizing. Residual failures are logged but never raise.
-            if residual_decision is not None:
-                self._submit_stop_limit_residual(residual_decision, strategy.name)
             if result.status in {OrderStatus.FILLED, OrderStatus.PARTIAL}:
                 # PLAN 11.10f: lifecycle counter — filled_entries.
                 # Per design §12.4.1: one entry that opened a position
@@ -1910,11 +1915,20 @@ class TradingEngine:
         order resting against a level that no longer matches today's
         recomputed prior-N-day high.
 
-        Idempotent — when there are no STOP_LIMIT entries open, this is
-        a no-op. Runs every market-closed cycle; multiple sweeps over
-        the same closed session see nothing to cancel after the first
-        one succeeds.
+        Ownership scope (PR #58 review P1 #3 fix): only cancels orders
+        whose client_order_id matches one of the bot's known strategy
+        name prefixes. A manually-placed stop-limit BUY in the Alpaca UI
+        (operator hedge, research order, etc.) will NEVER carry such a
+        prefix and is therefore safe from this sweep.
+
+        Idempotent — when there are no bot-owned STOP_LIMIT entries
+        open, this is a no-op. Runs every market-closed cycle; multiple
+        sweeps over the same closed session see nothing to cancel after
+        the first one succeeds.
         """
+        known_prefixes = tuple(f"{slot.strategy.name}-" for slot in self.slots)
+        if not known_prefixes:
+            return
         for order in getattr(snapshot, "open_orders", []) or []:
             order_type = getattr(order, "order_type", None)
             if order_type is None:
@@ -1931,6 +1945,14 @@ class TradingEngine:
             if side_val != "buy":
                 # Only entry-side stop-limits — exits do not use this type.
                 continue
+            client_id = getattr(order, "client_order_id", None)
+            if not isinstance(client_id, str) or not client_id:
+                # No client_order_id ⇒ cannot have been placed by the
+                # bot. Leave it alone.
+                continue
+            if not client_id.startswith(known_prefixes):
+                # Foreign order — operator or external. Do not cancel.
+                continue
             order_id = getattr(order, "order_id", None) or getattr(order, "id", None)
             if not order_id:
                 continue
@@ -1940,7 +1962,7 @@ class TradingEngine:
                     logger.info(
                         f"[PLAN 11.47] cancelled stale STOP_LIMIT entry "
                         f"{order_id} for {getattr(order, 'symbol', '?')} "
-                        f"(defensive EOD sweep)"
+                        f"(client_id={client_id}, defensive EOD sweep)"
                     )
             except Exception as e:
                 logger.warning(
@@ -2088,16 +2110,26 @@ class TradingEngine:
             return whole, None
 
         whole = replace(decision, qty=whole_qty)
+        # PLAN 11.47 fix (PR #58 review P1 #1a): the fractional residual
+        # MUST NOT carry entry_max_price. Alpaca's fractional path is
+        # market-only and the broker's PLAN 11.32 guard explicitly
+        # rejects sub-1-share capped entries (see broker.py around the
+        # "capped entry rounds to 0 whole shares" branch). The residual
+        # gate above (live >= trigger) is already the equivalent
+        # protection for this fractional sliver; the cap is redundant and
+        # would just cause every residual to be rejected.
         residual = replace(
             decision,
             qty=residual_qty,
             order_type=OrderType.MARKET,
             entry_trigger_price=None,
+            entry_max_price=None,
         )
         logger.info(
             f"[entry-guard] {decision.symbol}: hybrid split — whole "
             f"STOP_LIMIT qty={whole_qty}, residual MARKET qty={residual_qty} "
-            f"(live=${live:.2f} >= trigger=${trigger:.2f})"
+            f"(live=${live:.2f} >= trigger=${trigger:.2f}, cap dropped on "
+            f"residual per fractional-path constraint)"
         )
         return whole, residual
 
