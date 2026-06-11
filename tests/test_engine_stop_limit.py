@@ -199,19 +199,52 @@ class TestPrepareStopLimitSplit:
         # No quote → can't verify trigger crossing → skip residual.
         assert residual is None
 
-    def test_pure_fractional_qty_falls_back_to_market(self, tmp_path):
+    def test_pure_fractional_qty_with_live_above_trigger_falls_back_to_market(
+        self, tmp_path,
+    ):
         """If sizing produces qty < 1 (entire position is fractional —
-        e.g. ASML at $1700 sized to 0.6 shares), the STOP_LIMIT path is
-        unavailable. Fall back to MARKET with the 11.32 cap intact."""
+        e.g. ASML at $1700 sized to 0.6 shares) AND the live quote is
+        above the trigger, fall back to a plain MARKET — but with cap
+        cleared (PR #58 R2 P1 #2). Keeping the cap would cause the
+        broker's capped-fractional guard to reject the submission."""
         engine = _engine(tmp_path)
         engine.broker.get_latest_quote_midpoint.return_value = 246.0
         primary, residual = engine._prepare_stop_limit_split(
             _stop_limit_decision(qty=0.6), target_symbol="QCOM"
         )
+        assert primary is not None
         assert primary.qty == 0.6
         assert primary.order_type is OrderType.MARKET
         assert primary.entry_trigger_price is None
-        assert primary.entry_max_price == 257.0
+        # PR #58 R2 P1 #2: cap MUST be cleared on the pure-fractional
+        # fallback for the same reason as the residual leg — Alpaca
+        # rejects capped sub-1-share entries.
+        assert primary.entry_max_price is None
+        assert residual is None
+
+    def test_pure_fractional_qty_with_live_below_trigger_skips_entry(
+        self, tmp_path,
+    ):
+        """PR #58 R2 P1 #2: when the pure-fractional fallback would
+        otherwise submit a MARKET on a failed-breakout state, the
+        downside gate refuses the entry. Returns (None, None) to signal
+        skip to the caller."""
+        engine = _engine(tmp_path)
+        engine.broker.get_latest_quote_midpoint.return_value = 228.0
+        primary, residual = engine._prepare_stop_limit_split(
+            _stop_limit_decision(qty=0.6), target_symbol="QCOM"
+        )
+        assert primary is None
+        assert residual is None
+
+    def test_pure_fractional_qty_with_no_live_quote_skips_entry(self, tmp_path):
+        """No live quote → cannot verify the trigger was crossed → skip."""
+        engine = _engine(tmp_path)
+        engine.broker.get_latest_quote_midpoint.return_value = None
+        primary, residual = engine._prepare_stop_limit_split(
+            _stop_limit_decision(qty=0.6), target_symbol="QCOM"
+        )
+        assert primary is None
         assert residual is None
 
     def test_non_stop_limit_decision_unchanged(self, tmp_path):
@@ -293,9 +326,83 @@ class TestHybridDispatchPlacement:
         )
         engine.broker.place_order.return_value = unknown_result
         result = engine.broker.place_order(primary)
-        if residual is not None and result.status is not OrderStatus.UNKNOWN:
+        if residual is not None and result.status in {
+            OrderStatus.ACCEPTED,
+            OrderStatus.FILLED,
+            OrderStatus.PARTIAL,
+        }:
             engine._submit_stop_limit_residual(residual, primary.strategy_name)
         engine._submit_stop_limit_residual.assert_not_called()
+
+    @pytest.mark.parametrize("rejected_status", [
+        OrderStatus.REJECTED,
+        OrderStatus.CANCELED,
+    ])
+    def test_residual_skipped_when_primary_rejected_or_canceled(
+        self, tmp_path, rejected_status,
+    ):
+        """PR #58 R2 P1 #1: residual MUST NOT fire when the primary
+        STOP_LIMIT was rejected or canceled by the broker — a standalone
+        fractional MARKET entry without the structural protection is
+        exactly what this work is designed to prevent."""
+        engine = _engine(tmp_path)
+        engine.broker.get_latest_quote_midpoint.return_value = 246.0
+        primary, residual = engine._prepare_stop_limit_split(
+            _stop_limit_decision(qty=5.88), target_symbol="QCOM"
+        )
+        engine._submit_stop_limit_residual = MagicMock()
+
+        bad_result = OrderResult(
+            status=rejected_status,
+            order_id=None,
+            symbol="QCOM",
+            requested_qty=primary.qty,
+            filled_qty=0,
+            avg_fill_price=None,
+            raw_status=rejected_status.value,
+            message="primary rejected",
+        )
+        engine.broker.place_order.return_value = bad_result
+        result = engine.broker.place_order(primary)
+        if residual is not None and result.status in {
+            OrderStatus.ACCEPTED,
+            OrderStatus.FILLED,
+            OrderStatus.PARTIAL,
+        }:
+            engine._submit_stop_limit_residual(residual, primary.strategy_name)
+        engine._submit_stop_limit_residual.assert_not_called()
+
+    def test_residual_submission_passes_skip_lifecycle(self, tmp_path):
+        """PR #58 R2 P1 #3: the residual MUST call broker.place_order
+        with skip_lifecycle=True so a second position_uid is not minted
+        for what the broker treats as one symbol-level position."""
+        engine = _engine(tmp_path)
+        residual = RiskDecision(
+            symbol="QCOM",
+            side=Side.BUY,
+            qty=0.88,
+            entry_reference_price=245.0,
+            stop_price=230.0,
+            strategy_name="donchian_breakout",
+            reason="test",
+            order_type=OrderType.MARKET,
+        )
+        engine.broker.place_order.return_value = OrderResult(
+            status=OrderStatus.FILLED,
+            order_id="ord-residual-1",
+            symbol="QCOM",
+            requested_qty=0.88,
+            filled_qty=0.88,
+            avg_fill_price=246.0,
+            raw_status="filled",
+            message="ok",
+        )
+        engine._record_fill = MagicMock()
+        engine._log_entry = MagicMock()
+        engine._submit_stop_limit_residual(residual, "donchian_breakout")
+        engine.broker.place_order.assert_called_once()
+        _, kwargs = engine.broker.place_order.call_args
+        assert kwargs.get("skip_lifecycle") is True
 
 
 class TestCancelStaleStopLimitEntries:

@@ -1662,18 +1662,23 @@ class TradingEngine:
         # PLAN 11.47 hybrid submission split — Donchian-style STOP_LIMIT
         # entries with fractional sizing are submitted as two orders: a
         # whole-share stop-limit (broker-side trigger + chase cap as the
-        # limit) plus a fractional residual MARKET capped via the existing
-        # 11.32 entry_max_price path. The residual is gated on the live
-        # quote being at-or-above the breakout level (refuses to fill the
-        # residual on a failed-breakout gap-down). Helper returns:
-        #   primary: the decision actually submitted (may be the original,
-        #            a whole-share rewrite, or a MARKET-only rewrite when
-        #            the position rounded entirely to a fractional residual)
-        #   residual: the fractional MARKET decision to submit after the
-        #             primary, or None if no residual is needed/gated out
+        # limit) plus a fractional residual MARKET (gated on live >=
+        # trigger). Helper returns:
+        #   primary  is None → skip entry entirely (pure-fractional
+        #                      fallback refused by downside gate, PR #58
+        #                      R2 P1 #2)
+        #   primary  is a decision → submit it; if residual is non-None,
+        #                            also submit the supplemental MARKET
         primary_decision, residual_decision = self._prepare_stop_limit_split(
             decision, target_symbol
         )
+        if primary_decision is None:
+            # Logging is done inside _prepare_stop_limit_split; here we
+            # just need to bail out cleanly so no broker call is made.
+            self._mark_signal_bar_processed(
+                signal_key, signal_bar, strategy_statuses, strategy_reasons, symbol
+            )
+            return None
         decision = primary_decision
 
         # Arrival-price benchmark for execution-quality slippage measurement
@@ -1720,18 +1725,29 @@ class TradingEngine:
             _lc = self._lifecycle_counter_for(strategy.name)
             if _lc is not None:
                 _lc.submitted += 1
-            # PLAN 11.47 fix (PR #58 review P1 #1b): fire the residual
-            # immediately after the primary is confirmed at the broker,
-            # NOT after _record_fill / _log_entry. The primary STOP_LIMIT
-            # rests at Alpaca as a non-terminal order, which the broker
-            # adapter maps to ACCEPTED — the early-return at the ACCEPTED
-            # branch below would otherwise skip the residual entirely on
-            # the normal happy path. Skip residual only when the primary
-            # state itself is ambiguous (UNKNOWN) — a residual on top of
-            # an unconfirmed primary would compound the uncertainty.
+            # PLAN 11.47 fix (PR #58 review P1 #1b + R2 P1 #1): fire the
+            # residual immediately after the primary is confirmed at the
+            # broker, NOT after _record_fill / _log_entry. The primary
+            # STOP_LIMIT rests at Alpaca as a non-terminal order, which
+            # the broker adapter maps to ACCEPTED — the early-return at
+            # the ACCEPTED branch below would otherwise skip the residual
+            # entirely on the normal happy path.
+            #
+            # Gate: residual fires ONLY when the primary was accepted by
+            # the broker (ACCEPTED / FILLED / PARTIAL). If the primary was
+            # REJECTED or CANCELED, the residual must NOT fire — a
+            # standalone fractional market entry without the structural
+            # stop-limit protection is exactly what this work is designed
+            # to prevent. If the primary status is UNKNOWN (poll timed
+            # out / submission state ambiguous), defer rather than
+            # compound the uncertainty.
             if (
                 residual_decision is not None
-                and result.status is not OrderStatus.UNKNOWN
+                and result.status in {
+                    OrderStatus.ACCEPTED,
+                    OrderStatus.FILLED,
+                    OrderStatus.PARTIAL,
+                }
             ):
                 self._submit_stop_limit_residual(residual_decision, strategy.name)
             if result.status is OrderStatus.UNKNOWN:
@@ -2029,29 +2045,28 @@ class TradingEngine:
         self,
         decision: RiskDecision,
         target_symbol: str,
-    ) -> tuple[RiskDecision, RiskDecision | None]:
+    ) -> tuple[RiskDecision | None, RiskDecision | None]:
         """PLAN 11.47 hybrid submission split.
 
         For a STOP_LIMIT decision with fractional qty, split into:
           - whole-share STOP_LIMIT (the structural protection)
-          - fractional MARKET residual (existing 11.32 cap applies)
+          - fractional MARKET residual (gated on live >= trigger)
 
-        The residual is gated on the live quote being at-or-above the
-        trigger so a failed-breakout gap-down does not fill the residual
-        as a 'cheap' entry on an invalid signal.
-
-        Returns (primary_decision, residual_decision_or_None). The primary
-        decision is what gets submitted first; the residual (if non-None)
-        is submitted after.
+        Returns (primary_decision, residual_decision):
+          - primary is None  → caller MUST skip submission entirely
+            (used by the pure-fractional fallback when the failed-
+            breakout gate refuses the entry; PR #58 R2 P1 #2).
+          - primary is the original decision (or a whole-share rewrite,
+            or a MARKET rewrite for the pure-fractional fallback).
+          - residual is None unless the hybrid path applies AND the live
+            quote is at-or-above the breakout trigger.
 
         Edge cases:
           - Non-STOP_LIMIT decision → returns (decision, None) unchanged.
           - Integer qty → returns (decision, None) unchanged.
-          - whole_qty == 0 (entire qty is fractional, e.g. high-priced
-            symbol that sized to less than one whole share) → returns a
-            MARKET-only rewrite (no stop-limit submission possible) and
-            None residual. Logs that the structural stop-limit protection
-            was unavailable for this entry; 11.32 still caps the MARKET.
+          - whole_qty == 0 (entire qty is fractional): returns either
+            (MARKET rewrite, None) when live >= trigger, or (None, None)
+            when the residual gate refuses (failed-breakout state).
         """
         if decision.order_type is not OrderType.STOP_LIMIT:
             return decision, None
@@ -2072,15 +2087,44 @@ class TradingEngine:
 
         if whole_qty == 0:
             # The position rounded entirely to a fractional residual — the
-            # stop-limit path is unavailable for this entry (whole_qty=0
-            # would be rejected by Alpaca). Fall back to a MARKET-only
-            # submission with the existing 11.32 cap.
+            # stop-limit path is unavailable for this entry (Alpaca rejects
+            # whole_qty=0). Fall back to a MARKET submission for the
+            # fractional sliver.
+            #
+            # PR #58 R2 P1 #2 fix: drop entry_max_price (same reason as
+            # the residual leg — Alpaca's capped-fractional broker guard
+            # rejects sub-1-share capped entries) AND apply the same
+            # downside gate as the hybrid residual path. Without these
+            # two changes:
+            #   - the cap caused the broker to reject every pure-
+            #     fractional entry before submission;
+            #   - the entry would have fired on a failed-breakout gap-
+            #     down (no structural trigger to gate it).
+            #
+            # If the live quote is below the trigger at submission, skip
+            # the entry entirely — paper observation can promote this to
+            # a different sizing policy if the sleeve consistently sizes
+            # to sub-one-share fractionals.
+            live = _finite_or_none(
+                self.broker.get_latest_quote_midpoint(target_symbol)
+            )
+            if live is None or live < trigger:
+                logger.warning(
+                    f"[entry-guard] {decision.symbol}: STOP_LIMIT sized to "
+                    f"qty={decision.qty} < 1 whole share AND live "
+                    f"({live if live is not None else 'unavailable'}) is "
+                    f"below trigger ${trigger:.2f}; skipping entry "
+                    f"(failed-breakout gate on pure-fractional fallback)"
+                )
+                # Explicit skip — caller (entry-submit path) sees None
+                # primary and does not attempt any broker submission.
+                return None, None
             logger.warning(
                 f"[entry-guard] {decision.symbol}: STOP_LIMIT sized to "
                 f"qty={decision.qty} < 1 whole share; falling back to "
-                f"MARKET with cap=${decision.entry_max_price:.2f} "
-                f"(structural stop-limit protection unavailable; 11.32 "
-                f"chase cap still applies)"
+                f"MARKET (structural stop-limit protection unavailable; "
+                f"residual gate confirmed live=${live:.2f} >= "
+                f"trigger=${trigger:.2f})"
             )
             return (
                 replace(
@@ -2088,6 +2132,7 @@ class TradingEngine:
                     qty=residual_qty,
                     order_type=OrderType.MARKET,
                     entry_trigger_price=None,
+                    entry_max_price=None,
                 ),
                 None,
             )
@@ -2144,6 +2189,12 @@ class TradingEngine:
         or fire trade_executed alerts — the primary submission already
         did that and the residual just adds to the same position.
 
+        PR #58 R2 P1 #3: passes skip_lifecycle=True so the broker does
+        not mint a second position_uid. The residual's fill aggregates
+        into the same broker-side position the primary STOP_LIMIT
+        created (or will create on trigger); the bot tracks one
+        lifecycle row, not two.
+
         Failures are logged but never re-raise: a residual submission
         failure must not undo or alert on the successful primary entry."""
         try:
@@ -2155,7 +2206,7 @@ class TradingEngine:
                 if arrival_price is not None
                 else residual.entry_reference_price
             )
-            result = self.broker.place_order(residual)
+            result = self.broker.place_order(residual, skip_lifecycle=True)
             logger.info(
                 f"[{strategy_name}] {residual.symbol}: residual MARKET "
                 f"qty={residual.qty} status={result.status.value} "

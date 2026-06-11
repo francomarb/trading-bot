@@ -556,6 +556,36 @@ class TestSubmitOrderKwargs:
         assert req.time_in_force.value == "day"
         assert req.client_order_id.startswith("donchian_breakout-")
 
+    def test_skip_lifecycle_param_suppresses_position_uid_mint(self):
+        """PR #58 R2 P1 #3: when skip_lifecycle=True, place_order MUST
+        NOT call _lifecycle_begin. Used by the hybrid residual MARKET so
+        a second position_uid is not minted for what the broker treats
+        as one symbol-level position."""
+        api = MagicMock()
+        api.submit_order.return_value = _alpaca_order(status="filled")
+        api.get_order_by_id.return_value = _alpaca_order(status="filled")
+        broker = _broker_with_mock(api)
+        broker._lifecycle_begin = MagicMock()
+
+        broker.place_order(
+            _decision(qty=1),
+            poll_timeout=0.1,
+            skip_lifecycle=True,
+        )
+        broker._lifecycle_begin.assert_not_called()
+
+    def test_default_lifecycle_path_still_mints_position_uid(self):
+        """Sanity: skip_lifecycle defaults to False and the existing
+        lifecycle path is unchanged."""
+        api = MagicMock()
+        api.submit_order.return_value = _alpaca_order(status="filled")
+        api.get_order_by_id.return_value = _alpaca_order(status="filled")
+        broker = _broker_with_mock(api)
+        broker._lifecycle_begin = MagicMock(return_value="pos-uid-mock")
+
+        broker.place_order(_decision(qty=1), poll_timeout=0.1)
+        broker._lifecycle_begin.assert_called_once()
+
     def test_stop_limit_missing_trigger_price_raises(self):
         api = MagicMock()
         broker = _broker_with_mock(api)

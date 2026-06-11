@@ -770,6 +770,7 @@ class AlpacaBroker:
         *,
         poll_timeout: float = ORDER_CONFIRM_TIMEOUT_SECONDS,
         poll_interval: float = 1.0,
+        skip_lifecycle: bool = False,
     ) -> OrderResult:
         """
         Submit `decision` to Alpaca.
@@ -784,6 +785,16 @@ class AlpacaBroker:
 
         Refuses any non-`RiskDecision` input. There is no other way to call
         this — that is the Phase 6 / 7 contract.
+
+        Args:
+            skip_lifecycle: PLAN 11.47 (PR #58 R2 P1 #3). When True, the
+                broker does NOT mint a fresh position_uid via
+                _lifecycle_begin. Used by the engine for the supplemental
+                MARKET residual leg of a hybrid Donchian STOP_LIMIT entry:
+                the broker aggregates the residual's fill into the same
+                symbol-level position created by the primary, so the bot
+                must track only one lifecycle row, not two. Default False
+                preserves every existing call-site's behavior unchanged.
         """
         if not isinstance(decision, RiskDecision):
             raise TypeError(
@@ -1046,10 +1057,19 @@ class AlpacaBroker:
         # Operator Controls Phase A — write the pending lifecycle row
         # only after the dry-run guard passes, so a preflight dry run
         # never leaks pending positions to the operator CLI.
-        position_uid = self._lifecycle_begin(
-            decision=decision,
-            client_order_id=client_order_id,
-        )
+        #
+        # PR #58 R2 P1 #3: PLAN 11.47 hybrid path passes skip_lifecycle=True
+        # for the supplemental fractional residual MARKET so the bot does
+        # not record two position_uids for what the broker treats as one
+        # symbol-level position. The primary STOP_LIMIT has already minted
+        # the position_uid; the residual aggregates into the same position.
+        if skip_lifecycle:
+            position_uid = None
+        else:
+            position_uid = self._lifecycle_begin(
+                decision=decision,
+                client_order_id=client_order_id,
+            )
 
         # Register with the stream before submitting to avoid a fill-before-watch race.
         stream_event: threading.Event | None = None
