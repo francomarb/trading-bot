@@ -134,7 +134,7 @@ if first_fill_at is not None or (current_qty or 0.0) > 0.0:
 **Important scope correction (PR #59 review-2):** §8.1 is a **position-level invariant**, not a per-order one. At the broker, an order that is partially filled and then canceled DOES terminate as `canceled` with a preserved `filled_qty`. That's normal Alpaca behavior. The position that the order partially filled remains `open` at the filled quantity. Under §6's per-order table:
 
 - the per-order row transitions `partially_filled → canceled` and stays at `filled_qty` (this is the broker truth)
-- the position-level `current_qty` is the rollup of `SUM(filled_qty)` across the position's orders' realized quantities and stays > 0
+- the position-level `current_qty` is the side-signed rollup `SUM(CASE side WHEN 'buy' THEN filled_qty ELSE -filled_qty END)` across the position's orders and stays > 0 (see §6.6 for the full query)
 - the §8.1 invariant applies to the position-level row's status only — it must remain `open` / `partially_filled`, never `canceled`, if any per-order row has `filled_qty > 0`
 
 The current store-level `mark_canceled` check is still correct *for the position-level row*. The foundation PR adds a parallel per-order state machine where `partially_filled → canceled` is a valid order-level transition.
@@ -436,7 +436,7 @@ rejected →  (terminal)
 **Per-order vs. position-level invariant (PR #59 review-2 fix).** A `partially_filled → canceled` transition IS valid at the per-order level. That is how Alpaca describes a partially-filled order that gets canceled: the order terminates as `canceled` with its `filled_qty` preserved. The §8.1 invariant from the operator proposal is a *position-level* claim — the parent position must remain `open` (or `partially_filled`) at the filled quantity, never reach `canceled`. Under §6's two-table shape:
 
 - **Per-order rows** record broker truth. `partially_filled → canceled` is allowed; `filled_qty` is preserved on the terminal row.
-- **Position-level row** rolls up `current_qty = SUM(filled_qty across non-replaced realized orders)` and `status` accordingly. The store-boundary `mark_canceled` guard at [engine/lifecycle.py:486](../engine/lifecycle.py:486) keeps doing its job: a position whose roll-up `current_qty > 0` cannot transition to `canceled`. Belt-and-suspenders in `apply_order_event` (see §6.4).
+- **Position-level row** rolls up `current_qty` via the side-signed sum specified in §6.6 (`SUM(CASE side WHEN 'buy' THEN filled_qty ELSE -filled_qty END)`) and updates `status` accordingly. The store-boundary `mark_canceled` guard at [engine/lifecycle.py:486](../engine/lifecycle.py:486) keeps doing its job: a position whose roll-up `current_qty > 0` cannot transition to `canceled`. Belt-and-suspenders in `apply_order_event` (see §6.4).
 
 State-machine ordering (used by §6.4 atomicity):
 
@@ -518,35 +518,128 @@ WHERE order_id = :order_id
   );
 ```
 
-SQLite executes a single `UPDATE` atomically. `rowcount == 0` means the event was stale, a duplicate, or targeted a terminal-state row — log and drop. `rowcount == 1` means the event was applied; the caller then runs the position-rollup update inside the same transaction (see §6.6).
+SQLite executes a single `UPDATE` atomically. `rowcount == 0` means the event was stale, a duplicate, or targeted a terminal-state row — log and drop. `rowcount == 1` means the event was applied; the **same transaction** then runs the trades UPSERT, the position rollup, and the position-level status update.
 
-`apply_order_event` is the single chokepoint that enforces:
+#### One transaction wraps all four operations
 
-- **Exactly-once** via the atomic where-clause above (the per-order row mutates at most once per broker-distinct event)
-- **State-machine monotonicity** — terminal states stay terminal; updated_at is a tiebreaker WITHIN a state-machine-valid step, never a bypass
-- **§8.1 position-level invariant** via the rollup step (§6.6)
-- **Fill dedup on `trades`** — but **not** via `(order_id, updated_at)`. See §6.5 below for the correct dedup key.
+PR #59 review-4 (P1, "all accounting writes must be one transaction") makes the transaction scope explicit. The compare-and-set per-order UPDATE cannot succeed in isolation while the dependent rollups fail — that would leave the per-order row at a new state while `trades` and the position-level row reflect the old state. The right model is one transaction per `apply_order_event` covering all four writes:
 
-### 6.5 Fill dedup on `trades` — keyed by `execution_id`, not order-snapshot timestamp
+```python
+with conn:  # sqlite3 context manager: commits on success, rolls back on any exception
+    # Step 1: compare-and-set on the per-order row (§6.4 SQL above).
+    cur = conn.execute(COMPARE_AND_SET_SQL, params)
+    if cur.rowcount == 0:
+        raise StaleOrDuplicateEvent()      # context manager rolls back, transaction abandoned
 
-The order row's idempotency (§6.4) and the fill row's idempotency are **distinct mechanisms** keyed on **distinct identifiers**. Earlier drafts conflated them; the PR #59 review-3 P1 correctly flagged this.
+    # Step 2: aggregate trades UPSERT keyed by order_id (§6.5 SQL).
+    conn.execute(TRADES_UPSERT_SQL, fill_params)
 
-| Concern | Key | Mechanism |
-|---|---|---|
-| **Per-order state transitions** on `position_lifecycle_orders` | `(order_id, last_observed_broker_updated_at)` plus state-machine rank | Atomic `UPDATE ... WHERE` per §6.4. `updated_at` is a per-order snapshot, fine for this. |
-| **Per-fill rows** on `trades` | `execution_id` from the broker trade-update event | Each Alpaca trade-update fill event carries a unique `execution_id`. A single order with N partial fills produces N distinct `execution_id`s, all with the same `order_id`. `order_id + updated_at` cannot distinguish them — both share the order-level snapshot. |
+    # Step 3: recompute position-level current_qty + avg_entry_price
+    # from the per-order rows (§6.6 side-signed sum).
+    conn.execute(POSITION_ROLLUP_SQL, {"position_uid": position_uid})
 
-`trades` gains an `execution_id TEXT` column with a `UNIQUE` partial index:
-
-```sql
-ALTER TABLE trades ADD COLUMN execution_id TEXT;
-CREATE UNIQUE INDEX uniq_trades_execution_id
-    ON trades(execution_id) WHERE execution_id IS NOT NULL;
+    # Step 4: update position-level status based on the new rollup.
+    # closed when current_qty == 0; partially_filled / open otherwise.
+    conn.execute(POSITION_STATUS_SQL, {"position_uid": position_uid})
+# implicit COMMIT here
 ```
 
-Fill writers (`_log_entry`, `_log_close`, `log_stop_fill`, `log_spread_fill`) extract `execution_id` from the broker payload — present on stream `trade_update` events at `update.execution_id` and on REST recovery via the order's `legs[].id` / `event_id` field — and pass it through. Dedup at the SQL layer; the writer becomes idempotent because a duplicate insert violates the unique index.
+If any step raises — UNIQUE conflict on a duplicate `execution_id` audit value, foreign-key violation, disk full, anything — the transaction rolls back entirely. There is no partial application that leaves the three tables out of sync.
 
-Recovery / historical rows whose `execution_id` cannot be honestly reconstructed (recovered-entry-context, external close detection) write `NULL` rather than fabricating an id. The partial unique index permits multiple NULLs.
+The `StaleOrDuplicateEvent` path is the normal "this event was already applied or stale" outcome and is not an error from the caller's perspective; `apply_order_event` catches it and returns a `dropped` outcome to its caller. Other exceptions propagate.
+
+`apply_order_event` is the single chokepoint that enforces, *together within one transaction*:
+
+- **Exactly-once on the per-order row** via the atomic where-clause (the per-order row mutates at most once per broker-distinct event)
+- **State-machine monotonicity** — terminal states stay terminal; updated_at is a tiebreaker WITHIN a state-machine-valid step, never a bypass
+- **Idempotent aggregate state on `trades`** via the order-id-keyed UPSERT (§6.5)
+- **§8.1 position-level invariant** via the rollup + status step (§6.6) — if the rollup produces `current_qty > 0`, the position-level status cannot transition to `canceled`
+
+### 6.5 `trades` stays one row per ORDER — idempotent UPSERT via cumulative state
+
+PR #59 review-4 (P1, "keep one persistence system") rejected an earlier draft that would have introduced per-execution rows on `trades`. That change would have created a parallel execution ledger, broken existing aggregate consumers, and required a backward-incompatible read migration. The correct shape preserves the current per-order semantics:
+
+- `trades` continues to hold **one row per order_id** (or per logical close event for spread legs, etc.).
+- That row carries **cumulative aggregate state**: `filled_qty` is the order's total filled quantity, `avg_fill_price` is the qty-weighted VWAP across all executions for that order.
+- Foundation writers UPSERT keyed on `order_id`. A partial fill that later completes simply updates the same row.
+- `execution_id` is **optional audit metadata**, nothing more.
+
+#### Schema change on `trades`
+
+```sql
+-- Idempotency key for UPSERTs. Existing rows with NULL order_id
+-- (synthetic external close, etc.) remain valid; the partial unique
+-- index permits multiple NULLs.
+CREATE UNIQUE INDEX uniq_trades_order_id
+    ON trades(order_id) WHERE order_id IS NOT NULL;
+
+-- Optional audit-only column; no UNIQUE, no constraints.
+ALTER TABLE trades ADD COLUMN execution_id TEXT;
+```
+
+#### Writer pattern (UPSERT keyed on `order_id`)
+
+```sql
+INSERT INTO trades (
+    order_id, symbol, strategy, side,
+    filled_qty, avg_fill_price,
+    slippage_benchmark_price, slippage_benchmark_kind,
+    slippage_benchmark_timestamp, slippage_measurement_quality,
+    execution_id,
+    ...
+) VALUES (
+    :order_id, :symbol, :strategy, :side,
+    :filled_qty, :avg_fill_price,
+    :slippage_benchmark_price, :slippage_benchmark_kind,
+    :slippage_benchmark_timestamp, :slippage_measurement_quality,
+    :execution_id,
+    ...
+)
+ON CONFLICT(order_id) DO UPDATE SET
+    filled_qty       = excluded.filled_qty,        -- broker's latest cumulative
+    avg_fill_price   = excluded.avg_fill_price,    -- broker's latest cumulative VWAP
+    -- benchmark provenance is set once at first insert and never updated:
+    slippage_benchmark_price       = COALESCE(trades.slippage_benchmark_price,       excluded.slippage_benchmark_price),
+    slippage_benchmark_kind        = COALESCE(trades.slippage_benchmark_kind,        excluded.slippage_benchmark_kind),
+    slippage_benchmark_timestamp   = COALESCE(trades.slippage_benchmark_timestamp,   excluded.slippage_benchmark_timestamp),
+    slippage_measurement_quality   = COALESCE(trades.slippage_measurement_quality,   excluded.slippage_measurement_quality),
+    -- execution_id is optional audit; keep the last-seen value:
+    execution_id = COALESCE(excluded.execution_id, trades.execution_id);
+```
+
+The UPSERT semantics make the writer naturally idempotent across stream / cycle / startup paths: each path produces the same cumulative `filled_qty` and `avg_fill_price` for a given order, so re-application is a no-op (state values match) or an advance (cumulative qty / VWAP have grown).
+
+#### REST recovery uses cumulative deltas, not execution_id
+
+PR #59 review-4 (P1, "REST recovery has no execution_id") correctly notes that Alpaca's REST order-history endpoint exposes **cumulative order state only** — no per-execution detail. `legs[].id` is a child order id (OTO/bracket relationship), not an execution id, and must not be treated as one.
+
+REST recovery path computes the newly-realized quantity from the per-order row's existing cumulative state vs. the broker's current cumulative state:
+
+```python
+# Recovery: poll broker for order, compute delta against stored state
+broker_state    = self.broker.get_order_by_id(order_id)
+stored_filled   = order_row.filled_qty   # cumulative as-of last apply
+delta_filled    = broker_state.filled_qty - stored_filled
+
+if delta_filled > 0:
+    # Real new fill observed via REST. apply_order_event with the
+    # broker's CUMULATIVE values (not the delta) — the trades UPSERT
+    # is idempotent on cumulative state.
+    apply_order_event(
+        order_id           = order_id,
+        status             = broker_state.status,
+        filled_qty         = broker_state.filled_qty,        # cumulative
+        avg_fill_price     = broker_state.filled_avg_price,  # cumulative VWAP
+        broker_updated_at  = broker_state.updated_at,
+        execution_id       = None,  # REST has no execution_id; audit-only field stays NULL
+    )
+elif delta_filled == 0 and broker_state.status != order_row.status:
+    # Status changed without new fills (e.g. accepted → working,
+    # working → canceled with zero fills). Still a valid apply.
+    apply_order_event(...)
+```
+
+Stream path uses `update.execution_id` when present and writes it through as audit-only. REST and startup paths leave `execution_id` NULL. No path ever fabricates one.
 
 ### 6.6 Position rollup — side-signed sum, not raw `SUM(filled_qty)`
 
@@ -651,7 +744,11 @@ The `role` column in `position_lifecycle_orders` is an open enum (§6.2). The fo
 | `entry_residual` | 🟡 Schema-only | PR #58 rebuild. Enum value exists; no writer in foundation. | When PR #58 rebuild wires Donchian hybrid. Until then no current strategy needs this role. |
 | `partial_close` | 🟡 Schema-only | Operator Controls Phase C. Enum value exists; no writer in foundation. | When Phase C ships destructive operator commands. Until then no path creates partial closes. |
 
-**Consequence for live readiness:** the four wired roles cover every production strategy in flight today (SMA, RSI, Donchian classic, single-leg options, spread legs as a `protective_stop`-equivalent). The position-level rollup is authoritative for every position those strategies open. The two schema-only roles unlock without a schema change when their owning PRs land.
+**Consequence for live readiness — and what the rollup does NOT cover.** The four wired roles cover production strategies that operate at the **single-leg level**: SMA Crossover, RSI Reversion, Donchian Breakout (classic market entries), and single-leg SPY options. The position-level rollup is authoritative for every position those strategies open.
+
+**MLEG spreads (credit_spread strategy) remain on their existing path.** Spread entries and exits do not use any of the four wired roles. They continue to use `log_spread_fill` and the existing `trades` aggregation. The foundation PR adds no `position_lifecycle_orders` writes for spread legs, and the per-order rollup at §6.6 is **not authoritative for spread positions** — those positions remain visible through `log_spread_fill`'s rows on `trades` and through the spread-side ownership tracking in `engine.positions`. PR #59 review-4 (P2) correctly pushed back on a prior wording that implied spreads benefited from foundation wiring; they do not. Spread lifecycle wiring is the separate spread-lifecycle PR's responsibility ([3] in the recommended sequence).
+
+The two schema-only roles (`entry_residual`, `partial_close`) unlock without a schema change when their owning PRs (PR #58 rebuild and Operator Phase C respectively) land.
 
 ### 9.1 Moved INTO this foundation (correctness prerequisites)
 
@@ -700,11 +797,17 @@ Explicit so the implementation PR cannot silently expand any one table into anot
 |---|---|---|
 | `position_lifecycle` | One row per logical position. Aggregate state (`status`, `current_qty`, `avg_entry_price`, `net_realized_pnl`). Identity (`position_uid`, `owner_key`, `strategy`, `position_type`). Lifecycle creation / termination timestamps. | Per-order metadata. Order-level state. Computed slippage values. Trade-by-trade fills. |
 | `position_lifecycle_orders` (new) | Durable per-order intent (order_type, order_class, TIF, intended prices, qty). Broker identity (`order_id`, `client_order_id`). Per-order lifecycle state and reconciliation anchor. Pre-fill slippage benchmark provenance. Relationships between orders (parent / replaces). Origin (bot vs. operator command). | Position-level rollups. Computed realized slippage. Trade-row primary keys. |
-| `trades` | Executed fills (one row per terminal fill event). Realized P&L. Computed `slippage_signed_bps` / `slippage_adverse_bps`. Slippage measurement quality of the actual fill. **`execution_id` for fill-event dedup (§6.5).** | Pre-submit order intent. Per-order broker state. Order relationships. |
+| `trades` | **One row per `order_id`** carrying cumulative aggregate state (`filled_qty`, `avg_fill_price` VWAP). Realized P&L. Computed `slippage_signed_bps` / `slippage_adverse_bps`. Slippage measurement quality of the actual fill. Optional `execution_id` as audit metadata only. | Pre-submit order intent. Per-order broker state. Order relationships. Per-execution detail (out of scope; would require a separate execution ledger, deliberately not introduced). |
 
 This boundary is the load-bearing answer to "the per-order table is not a second slippage-reporting store." Foundation PR persists pre-fill benchmark provenance on the order row; the trades row continues to be the source of truth for computed slippage. Phase 2 consumer migration reads computed values from `trades` exactly as it does today.
 
-**Idempotency lives on different keys on each table.** §6.4 / §6.5 spell this out: `position_lifecycle_orders` dedups state transitions by `(order_id, last_observed_broker_updated_at)` plus state-machine rank. `trades` dedups fill rows by `execution_id`. Confusing the two — using `updated_at` as a fill key or `execution_id` as an order key — produces either duplicate fill rows or refused state transitions; the doc explicitly separates them so callers cannot mix them up.
+**Idempotency keys differ between the two tables, but both use cumulative state.** §6.4 / §6.5 spell this out:
+
+- `position_lifecycle_orders` dedups state transitions by `(order_id, last_observed_broker_updated_at)` plus state-machine rank. Each row holds the order's most recent observed state.
+- `trades` dedups fill rows by `order_id` via UPSERT. Each row holds the order's cumulative `filled_qty` and `avg_fill_price` VWAP.
+- `execution_id` is audit metadata on `trades`; it is not the dedup key. REST recovery has no `execution_id` (the Alpaca REST endpoint exposes cumulative order state only) and writes NULL there.
+
+PR #59 review-4 ("keep one persistence system") rejected an earlier draft that would have made `trades` one row per execution. Per-execution history would have been a parallel ledger with breaking consumer impact; the foundation PR explicitly does not go that route.
 
 ---
 
