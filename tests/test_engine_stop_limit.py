@@ -334,6 +334,39 @@ class TestHybridDispatchPlacement:
             engine._submit_stop_limit_residual(residual, primary.strategy_name)
         engine._submit_stop_limit_residual.assert_not_called()
 
+    def test_residual_fires_on_timeout_primary(self, tmp_path):
+        """PR #58 R5 P1 #1: a resting STOP_LIMIT returns TIMEOUT (the
+        poll window expired without a terminal fill event), not
+        ACCEPTED. The residual gate MUST include TIMEOUT or the residual
+        is silently skipped on the normal happy path."""
+        engine = _engine(tmp_path)
+        engine.broker.get_latest_quote_midpoint.return_value = 246.0
+        primary, residual = engine._prepare_stop_limit_split(
+            _stop_limit_decision(qty=5.88), target_symbol="QCOM"
+        )
+        engine._submit_stop_limit_residual = MagicMock()
+
+        timeout_result = OrderResult(
+            status=OrderStatus.TIMEOUT,
+            order_id="ord-stoplimit-resting",
+            symbol="QCOM",
+            requested_qty=primary.qty,
+            filled_qty=0,
+            avg_fill_price=None,
+            raw_status="accepted",
+            message="poll timed out — resting at broker",
+        )
+        engine.broker.place_order.return_value = timeout_result
+        result = engine.broker.place_order(primary)
+        if residual is not None and result.status in {
+            OrderStatus.ACCEPTED,
+            OrderStatus.FILLED,
+            OrderStatus.PARTIAL,
+            OrderStatus.TIMEOUT,
+        }:
+            engine._submit_stop_limit_residual(residual, primary.strategy_name)
+        engine._submit_stop_limit_residual.assert_called_once()
+
     @pytest.mark.parametrize("rejected_status", [
         OrderStatus.REJECTED,
         OrderStatus.CANCELED,
@@ -578,6 +611,35 @@ class TestAmendLifecycleForResidualFill:
         store.get_by_position_uid.assert_not_called()
         store.mark_open.assert_not_called()
 
+    def test_pending_row_caches_residual_for_drain(self, tmp_path):
+        """PR #58 R5 P1 #2: when the primary is still pending at residual
+        fill, the engine caches the residual rather than just deferring.
+        The drain pass on subsequent cycles consumes the cache."""
+        from types import SimpleNamespace as _NS
+        engine = _engine(tmp_path)
+        store = MagicMock()
+        row = _NS(
+            position_uid="pos-uid-pending",
+            status="pending",
+            current_qty=5.0,
+            avg_entry_price=245.0,
+            owner_key="QCOM",
+        )
+        store.get_by_position_uid.return_value = row
+        engine.lifecycle_store = store
+
+        engine._amend_lifecycle_for_residual_fill(
+            primary_position_uid="pos-uid-pending",
+            residual_qty=0.88,
+            residual_avg_price=246.0,
+        )
+        cached = engine._pending_residual_amendments.get("pos-uid-pending")
+        assert cached is not None
+        assert cached["residual_qty"] == 0.88
+        assert cached["residual_avg_price"] == 246.0
+        assert cached["owner_key"] == "QCOM"
+        store.mark_open.assert_not_called()
+
     def test_residual_submission_threads_primary_uid_to_amend(self, tmp_path):
         """End-to-end: the residual-submission helper passes the primary's
         position_uid through to the amend helper after a successful fill."""
@@ -615,6 +677,177 @@ class TestAmendLifecycleForResidualFill:
         assert kwargs["primary_position_uid"] == "pos-uid-primary-real"
         assert kwargs["residual_qty"] == 0.88
         assert kwargs["residual_avg_price"] == 246.0
+
+    def test_residual_log_entry_carries_primary_position_uid(self, tmp_path):
+        """PR #58 R5 P1 #2: residual trade row MUST carry the primary's
+        position_uid so the trade DB rows are linked to the same
+        lifecycle. Without this, the residual row goes in with NULL
+        position_uid because the broker call used skip_lifecycle=True."""
+        engine = _engine(tmp_path)
+        residual = RiskDecision(
+            symbol="QCOM",
+            side=Side.BUY,
+            qty=0.88,
+            entry_reference_price=245.0,
+            stop_price=230.0,
+            strategy_name="donchian_breakout",
+            reason="test",
+            order_type=OrderType.MARKET,
+        )
+        engine.broker.place_order.return_value = OrderResult(
+            status=OrderStatus.FILLED,
+            order_id="ord-residual-link",
+            symbol="QCOM",
+            requested_qty=0.88,
+            filled_qty=0.88,
+            avg_fill_price=246.0,
+            raw_status="filled",
+            message="ok",
+            position_uid=None,  # skip_lifecycle path returns None
+        )
+        engine._record_fill = MagicMock()
+        engine._log_entry = MagicMock()
+        engine._amend_lifecycle_for_residual_fill = MagicMock()
+        engine._submit_stop_limit_residual(
+            residual,
+            "donchian_breakout",
+            primary_position_uid="pos-uid-primary-link",
+        )
+        engine._log_entry.assert_called_once()
+        kwargs = engine._log_entry.call_args.kwargs
+        assert kwargs.get("position_uid_override") == "pos-uid-primary-link"
+
+
+class TestDrainPendingResidualAmendments:
+    """PR #58 R5 P1 #2: the cycle-pass drain transitions pending
+    lifecycle rows to open when the broker reports the aggregated
+    position, and consumes cached residual amendments."""
+
+    def _make_engine_with_store(self, tmp_path, *, rows):
+        from types import SimpleNamespace as _NS
+        engine = _engine(tmp_path)
+        store = MagicMock()
+        store.get_by_position_uid.side_effect = lambda uid: rows.get(uid)
+        engine.lifecycle_store = store
+        return engine, store
+
+    def test_pending_row_with_broker_position_transitions_to_open(self, tmp_path):
+        from types import SimpleNamespace as _NS
+        row = _NS(
+            position_uid="pos-uid-pending",
+            status="pending",
+            current_qty=5.0,
+            avg_entry_price=245.0,
+            owner_key="QCOM",
+        )
+        engine, store = self._make_engine_with_store(
+            tmp_path, rows={"pos-uid-pending": row}
+        )
+        engine._pending_residual_amendments["pos-uid-pending"] = {
+            "owner_key": "QCOM",
+            "residual_qty": 0.88,
+            "residual_avg_price": 246.0,
+            "recorded_at": "2026-06-11T13:30:00+00:00",
+        }
+        # Broker now reports the aggregated 5.88 position.
+        position = Position(
+            symbol="QCOM",
+            qty=5.88,
+            avg_entry_price=245.15,
+            market_value=5.88 * 245.15,
+        )
+        snap = _snapshot(positions={"QCOM": position})
+        engine._drain_pending_residual_amendments(snap)
+        store.mark_open.assert_called_once()
+        kwargs = store.mark_open.call_args.kwargs
+        assert kwargs["position_uid"] == "pos-uid-pending"
+        assert kwargs["current_qty"] == 5.88
+        assert kwargs["avg_entry_price"] == 245.15
+        assert "pos-uid-pending" not in engine._pending_residual_amendments
+
+    def test_canceled_row_drops_cache(self, tmp_path):
+        from types import SimpleNamespace as _NS
+        row = _NS(
+            position_uid="pos-uid-canceled",
+            status="canceled",
+            current_qty=0.0,
+            avg_entry_price=245.0,
+            owner_key="QCOM",
+        )
+        engine, store = self._make_engine_with_store(
+            tmp_path, rows={"pos-uid-canceled": row}
+        )
+        engine._pending_residual_amendments["pos-uid-canceled"] = {
+            "owner_key": "QCOM",
+            "residual_qty": 0.88,
+            "residual_avg_price": 246.0,
+            "recorded_at": "2026-06-11T13:30:00+00:00",
+        }
+        snap = _snapshot()
+        engine._drain_pending_residual_amendments(snap)
+        store.mark_open.assert_not_called()
+        assert "pos-uid-canceled" not in engine._pending_residual_amendments
+
+    def test_open_row_aggregates_cached_residual(self, tmp_path):
+        """If the primary somehow transitioned to open before the drain
+        ran, aggregate the cached residual into the existing row."""
+        from types import SimpleNamespace as _NS
+        row = _NS(
+            position_uid="pos-uid-open",
+            status="open",
+            current_qty=5.0,
+            avg_entry_price=245.0,
+            owner_key="QCOM",
+        )
+        engine, store = self._make_engine_with_store(
+            tmp_path, rows={"pos-uid-open": row}
+        )
+        engine._pending_residual_amendments["pos-uid-open"] = {
+            "owner_key": "QCOM",
+            "residual_qty": 0.88,
+            "residual_avg_price": 246.0,
+            "recorded_at": "2026-06-11T13:30:00+00:00",
+        }
+        snap = _snapshot()
+        engine._drain_pending_residual_amendments(snap)
+        store.mark_open.assert_called_once()
+        kwargs = store.mark_open.call_args.kwargs
+        assert kwargs["current_qty"] == pytest.approx(5.88)
+        expected = (5.0 * 245.0 + 0.88 * 246.0) / 5.88
+        assert kwargs["avg_entry_price"] == pytest.approx(expected)
+        assert "pos-uid-open" not in engine._pending_residual_amendments
+
+    def test_pending_row_no_broker_position_leaves_cache(self, tmp_path):
+        """Primary hasn't filled yet AND broker shows no position → leave
+        the cache entry for the next cycle."""
+        from types import SimpleNamespace as _NS
+        row = _NS(
+            position_uid="pos-uid-still-pending",
+            status="pending",
+            current_qty=5.0,
+            avg_entry_price=245.0,
+            owner_key="QCOM",
+        )
+        engine, store = self._make_engine_with_store(
+            tmp_path, rows={"pos-uid-still-pending": row}
+        )
+        engine._pending_residual_amendments["pos-uid-still-pending"] = {
+            "owner_key": "QCOM",
+            "residual_qty": 0.88,
+            "residual_avg_price": 246.0,
+            "recorded_at": "2026-06-11T13:30:00+00:00",
+        }
+        snap = _snapshot()  # no positions
+        engine._drain_pending_residual_amendments(snap)
+        store.mark_open.assert_not_called()
+        # Cache survives for the next cycle.
+        assert "pos-uid-still-pending" in engine._pending_residual_amendments
+
+    def test_empty_cache_is_noop(self, tmp_path):
+        engine, store = self._make_engine_with_store(tmp_path, rows={})
+        snap = _snapshot()
+        engine._drain_pending_residual_amendments(snap)
+        store.get_by_position_uid.assert_not_called()
 
 
 class TestCancelStaleStopLimitEntries:

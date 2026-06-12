@@ -423,6 +423,17 @@ class TradingEngine:
         self._suspect_orders: dict[str, SuspectOrder] = {}
         self._suspect_exit_orders: dict[str, SuspectExitOrder] = {}
 
+        # PR #58 R5 P1 #2: hybrid residual fills that landed while the
+        # primary STOP_LIMIT was still pending. Each entry maps the
+        # primary's position_uid to {owner_key, residual_qty,
+        # residual_avg_price, recorded_at}. Drained on each market-open
+        # cycle by _drain_pending_residual_amendments which transitions
+        # the pending lifecycle row to 'open' using broker truth once
+        # the broker reports a position for the owner_key, then clears
+        # the entry. Entries also clear when the lifecycle row reaches
+        # a terminal status (canceled / closed).
+        self._pending_residual_amendments: dict[str, dict] = {}
+
         # DAY-stop promotion is retried from every broker snapshot, but a
         # persistent rejection should count as one broker incident rather than
         # tripping the rolling broker-error halt on the same order each cycle.
@@ -866,6 +877,17 @@ class TradingEngine:
             self._drain_spread_fills()
             self._sync_option_trailing_stops(snapshot)
             self._repair_missing_protective_stops(snapshot)
+            # PR #58 R5 P1 #2: drain pending residual amendments — when
+            # the residual fills while the primary STOP_LIMIT is still
+            # resting, the lifecycle row stays pending until broker
+            # reports the aggregated position. This pass transitions
+            # the row using broker truth.
+            try:
+                self._drain_pending_residual_amendments(snapshot)
+            except Exception as exc:
+                logger.warning(
+                    f"drain pending residual amendments failed: {exc}"
+                )
             # Operator command poll moved earlier in the cycle so it
             # runs even when the market is closed — see the F1-fix
             # block before the `if not market_open` branch.
@@ -1747,6 +1769,12 @@ class TradingEngine:
                     OrderStatus.ACCEPTED,
                     OrderStatus.FILLED,
                     OrderStatus.PARTIAL,
+                    # PR #58 R5 P1 #1: a stop-limit that rests at the
+                    # broker without filling within the poll window
+                    # returns TIMEOUT (terminal-but-no-fill), not
+                    # ACCEPTED. Without TIMEOUT in this gate, the
+                    # residual never fires on the normal happy path.
+                    OrderStatus.TIMEOUT,
                 }
             ):
                 # PR #58 R4 P2: pass the primary's position_uid so the
@@ -2184,6 +2212,102 @@ class TradingEngine:
         )
         return whole, residual
 
+    def _drain_pending_residual_amendments(self, snapshot: BrokerSnapshot) -> None:
+        """PR #58 R5 P1 #2: drain cached residual amendments whose primary
+        lifecycle row was still pending when the residual filled.
+
+        For each cached entry:
+          - If the lifecycle row reached a terminal status (canceled or
+            closed): drop the cache entry. The residual is captured in
+            the trade DB regardless; if the primary was canceled and only
+            the residual filled, the EOD orphan sweep handles cleanup.
+          - If the row is still pending AND the broker now shows a
+            position for the row's owner_key: transition pending → open
+            using broker truth. Drop the cache entry.
+          - If the row is now 'open' (someone else transitioned it):
+            amend with the cached residual qty + weighted basis and drop.
+          - Otherwise: leave the cache entry for the next cycle.
+
+        Runs on market-open cycles after sync_with_broker has produced
+        a fresh snapshot. Idempotent — empty cache → no-op."""
+        if not self._pending_residual_amendments:
+            return
+        if self.lifecycle_store is None:
+            return
+        for uid, cached in list(self._pending_residual_amendments.items()):
+            try:
+                row = self.lifecycle_store.get_by_position_uid(uid)
+                if row is None or row.status in {"canceled", "closed"}:
+                    self._pending_residual_amendments.pop(uid, None)
+                    logger.debug(
+                        f"[PLAN 11.47] dropped residual cache for "
+                        f"{uid}: row status="
+                        f"{row.status if row else 'missing'}"
+                    )
+                    continue
+                if row.status == "open":
+                    # Primary transitioned to open through some path; amend
+                    # with the cached residual using weighted average basis.
+                    old_qty = float(row.current_qty)
+                    old_basis = float(row.avg_entry_price)
+                    add_qty = float(cached["residual_qty"])
+                    add_basis = float(cached["residual_avg_price"])
+                    new_qty = old_qty + add_qty
+                    if new_qty <= 0:
+                        self._pending_residual_amendments.pop(uid, None)
+                        continue
+                    new_basis = (
+                        old_qty * old_basis + add_qty * add_basis
+                    ) / new_qty
+                    self.lifecycle_store.mark_open(
+                        position_uid=uid,
+                        avg_entry_price=new_basis,
+                        current_qty=new_qty,
+                    )
+                    self._pending_residual_amendments.pop(uid, None)
+                    logger.info(
+                        f"[PLAN 11.47] drained cached residual into "
+                        f"lifecycle {uid}: qty {old_qty} → {new_qty}, "
+                        f"basis ${old_basis:.4f} → ${new_basis:.4f}"
+                    )
+                    continue
+                # status == 'pending' — check if broker now shows the
+                # aggregated position. Broker truth is the authoritative
+                # post-fill state when it reports a position.
+                owner_key = cached.get("owner_key") or row.owner_key
+                broker_position = None
+                for sym, pos in snapshot.account.open_positions.items():
+                    if owner_key_for(sym) == owner_key:
+                        broker_position = pos
+                        break
+                if broker_position is None:
+                    # Primary hasn't filled yet AND residual either didn't
+                    # land at the broker (rare) or broker snapshot is stale.
+                    # Leave cached for next cycle.
+                    continue
+                broker_qty = float(getattr(broker_position, "qty", 0.0) or 0.0)
+                broker_basis = getattr(broker_position, "avg_entry_price", None)
+                broker_basis = float(broker_basis) if broker_basis else None
+                if broker_qty <= 0 or broker_basis is None or broker_basis <= 0:
+                    continue
+                self.lifecycle_store.mark_open(
+                    position_uid=uid,
+                    avg_entry_price=broker_basis,
+                    current_qty=broker_qty,
+                )
+                self._pending_residual_amendments.pop(uid, None)
+                logger.info(
+                    f"[PLAN 11.47] transitioned pending lifecycle {uid} "
+                    f"→ open using broker truth: qty={broker_qty}, "
+                    f"basis=${broker_basis:.4f} (cached residual "
+                    f"qty={cached['residual_qty']} consumed)"
+                )
+            except Exception as exc:
+                logger.warning(
+                    f"[PLAN 11.47] drain pending residual amendment "
+                    f"failed for {uid}: {exc}"
+                )
+
     def _amend_lifecycle_for_residual_fill(
         self,
         *,
@@ -2226,11 +2350,26 @@ class TradingEngine:
                 )
                 return
             if row.status != "open":
+                # PR #58 R5 P1 #2: cache the residual fill instead of
+                # discarding the deferred case. Each market-open cycle
+                # the drain pass will detect when the broker reports a
+                # position for the primary's owner_key and transition
+                # the pending lifecycle row to 'open' using broker truth
+                # (broker.avg_entry_price already reflects the weighted
+                # aggregation of primary + residual fills at the symbol
+                # level).
+                self._pending_residual_amendments[primary_position_uid] = {
+                    "owner_key": row.owner_key,
+                    "residual_qty": float(residual_qty),
+                    "residual_avg_price": float(residual_avg_price),
+                    "recorded_at": datetime.now(timezone.utc).isoformat(),
+                }
                 logger.info(
-                    f"[PLAN 11.47] residual fill deferred for lifecycle "
+                    f"[PLAN 11.47] residual fill cached for lifecycle "
                     f"row {primary_position_uid}: primary status="
-                    f"{row.status} (will not aggregate until primary "
-                    f"transitions to open)"
+                    f"{row.status}, owner_key={row.owner_key} "
+                    f"(will be reconciled on next cycle once broker "
+                    f"reports the aggregated position)"
                 )
                 return
             old_qty = float(row.current_qty)
@@ -2309,6 +2448,10 @@ class TradingEngine:
                         "arrival_midpoint" if arrival_price is not None
                         else "fallback_reference_price"
                     ),
+                    # PR #58 R5 P1 #2: link the residual trade row to the
+                    # primary's position_uid (residual was submitted with
+                    # skip_lifecycle=True so result.position_uid is None).
+                    position_uid_override=primary_position_uid,
                 )
                 # PR #58 R4 P2: amend the primary's lifecycle row so its
                 # current_qty + avg_entry_price reflect the aggregated
@@ -2607,6 +2750,7 @@ class TradingEngine:
         timestamp_override: datetime | None = None,
         benchmark_kind: str | None = None,
         measurement_quality: str | None = None,
+        position_uid_override: str | None = None,
     ) -> None:
         """Log an entry fill to the trade database.
 
@@ -2640,11 +2784,21 @@ class TradingEngine:
             # to the trade row when the broker attached one. None for
             # legacy/options/spread paths is harmless (column is
             # nullable and indexed for show-position joins).
+            # PR #58 R5 P1 #2: position_uid_override lets the hybrid
+            # residual link its trade row to the primary's position_uid
+            # (the residual itself was submitted with skip_lifecycle=True
+            # so result.position_uid is None — without the override the
+            # residual row would have a NULL position_uid and lose the
+            # link to the primary's lifecycle).
             record = self.trade_logger.build_record(
                 decision,
                 result,
                 modeled_price=modeled_price,
-                position_uid=getattr(result, "position_uid", None),
+                position_uid=(
+                    position_uid_override
+                    if position_uid_override is not None
+                    else getattr(result, "position_uid", None)
+                ),
                 record_slippage=record_slippage,
                 timestamp_override=timestamp_override,
                 benchmark_kind=benchmark_kind,

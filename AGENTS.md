@@ -279,6 +279,12 @@ recorded milestone is **646 unit tests passing** as of 2026-04-25, before the
 2026-04-28 dashboard work and 2026-04-29 Bollinger strategy additions.
 
 **Operational preference:**
+- For pull-request reviews and re-reviews, audit the complete affected workflow
+  end to end before posting feedback, and batch as many confirmed findings as
+  possible into one review round. Do not limit a re-review to checking only the
+  previously reported issue: trace adjacent state transitions, error paths,
+  persistence/restart behavior, and integration boundaries so follow-on defects
+  are found together rather than drip-fed across multiple rounds.
 - Do **not** create Git worktrees for this repo unless the user explicitly asks.
   Gemini / Antigravity can hang or misbehave when linked worktrees exist, so
   normal in-place branch work is preferred.
