@@ -120,9 +120,9 @@ This corrects the prior cut, which conflated single-leg options with the equity 
 5. **Stream-driven partial fill on a resting order.** No hook. Stays pending after each partial.
 6. **Spread lifecycle (entries and exits).** Confirmed by `grep -n lifecycle execution/options_executor.py` returning nothing and by the absence of spread-path `create_pending` call sites. Spreads are explicitly Phase-A-deferred.
 
-### 2.3 The §8.1 invariant — verified
+### 2.3 The §8.1 invariant — verified, and scoped to the position level
 
-The proposal's invariant (any row with `current_qty > 0` cannot transition to `canceled`) IS enforced at the store boundary at [engine/lifecycle.py:486-501](../engine/lifecycle.py:486):
+The proposal's invariant — any row with `current_qty > 0` cannot transition to `canceled` — IS enforced today at the store boundary at [engine/lifecycle.py:486-501](../engine/lifecycle.py:486):
 
 ```python
 if first_fill_at is not None or (current_qty or 0.0) > 0.0:
@@ -131,7 +131,13 @@ if first_fill_at is not None or (current_qty or 0.0) > 0.0:
 
 `_lifecycle_mark_filled` at [execution/broker.py:399-412](../execution/broker.py:399) also defends in depth: a CANCELED/REJECTED outcome with `filled_qty > 0` routes to `mark_partially_filled` rather than `mark_canceled`.
 
-Foundation PR must continue to honor this invariant — both at the store API boundary and per-order, once a per-order table exists.
+**Important scope correction (PR #59 review-2):** §8.1 is a **position-level invariant**, not a per-order one. At the broker, an order that is partially filled and then canceled DOES terminate as `canceled` with a preserved `filled_qty`. That's normal Alpaca behavior. The position that the order partially filled remains `open` at the filled quantity. Under §6's per-order table:
+
+- the per-order row transitions `partially_filled → canceled` and stays at `filled_qty` (this is the broker truth)
+- the position-level `current_qty` is the rollup of `SUM(filled_qty)` across the position's orders' realized quantities and stays > 0
+- the §8.1 invariant applies to the position-level row's status only — it must remain `open` / `partially_filled`, never `canceled`, if any per-order row has `filled_qty > 0`
+
+The current store-level `mark_canceled` check is still correct *for the position-level row*. The foundation PR adds a parallel per-order state machine where `partially_filled → canceled` is a valid order-level transition.
 
 ---
 
@@ -203,11 +209,12 @@ There is **no exactly-once contract.** Today's de-facto idempotency comes from:
 - `_log_entry` writes to `trades` without an order_id uniqueness constraint. Two paths calling it produce duplicate fill rows.
 - `_close_lifecycle_for_owner_key` reads-then-updates; if already closed it's a no-op. This is the strongest of the implicit guards.
 
-The foundation PR must define exactly-once explicitly. Recommended shape, applicable per-order on the table proposed in §6:
+The foundation PR must define exactly-once explicitly. Mechanism specified in §6.4. Two real constraints to honor (PR #59 review-2):
 
-> Every observed broker outcome is keyed by `(position_uid, order_id, event_kind, event_sequence)` and applied at most once. The per-order row carries `last_observed_event_sequence`; an incoming event with `sequence <= last_observed_event_sequence` is logged and dropped. Stream, cycle, and startup all funnel through the same `apply_order_event(...)` API.
+1. **Alpaca does not provide a monotonic per-event sequence.** A speculative `event_sequence INTEGER` column has no wire source. The broker DOES provide `Order.updated_at` (ISO-8601 timestamp, monotonic per order in nearly all cases, with rare backend ties that need a secondary discriminator). It also provides per-event `(status, filled_qty)` which, in the per-order state machine, is itself monotonic in state-machine order.
+2. **Atomicity must come from a single SQL statement, not read-then-update.** A `SELECT ... ; UPDATE ...` pair across two statements races concurrent callers; a single `UPDATE ... WHERE (state-stale predicate)` returns rowcount and applies the event iff the row is actually stale.
 
-The per-order table makes this natural because a position can have multiple distinct orders (each with its own sequence). A position-level row cannot represent "stream-side primary fill has been applied but cycle-side residual fill has not."
+§6.4 specifies the resulting API. The per-order table makes the mechanism natural because a position can have multiple distinct orders, each with its own state and its own `last_observed_broker_updated_at`. A position-level row cannot represent "stream-side primary fill has been applied but cycle-side residual fill has not."
 
 ---
 
@@ -318,66 +325,185 @@ CREATE TABLE position_lifecycle_orders (
     role                          TEXT    NOT NULL,    -- entry_primary | entry_residual
                                                        -- | protective_stop | replacement_stop
                                                        -- | exit | partial_close
-    order_id                      TEXT,                -- broker order id (NULL until submitted)
+
+    -- Broker identity (order_id NULL while pending; populated once submit returns)
+    order_id                      TEXT,
     client_order_id               TEXT    NOT NULL,
+
+    -- Order intent (captured at row insert; never changes)
     order_type                    TEXT    NOT NULL,    -- market | limit | stop | stop_limit
+    order_class                   TEXT    NOT NULL,    -- simple | bracket | oto | oco
+    time_in_force                 TEXT    NOT NULL,    -- day | gtc | ioc | fok | opg | cls
     side                          TEXT    NOT NULL,    -- buy | sell
     intended_qty                  REAL    NOT NULL,
-    intended_stop_price           REAL,                -- for stop / stop_limit / oto stop child
-    intended_trigger_price        REAL,                -- for stop_limit
-    intended_limit_price          REAL,                -- for limit / capped market / stop_limit
-    slippage_benchmark_price      REAL,                -- canonical Phase 1 naming
-    slippage_benchmark_kind       TEXT,                -- arrival_midpoint | fallback_latest_close
-                                                       -- | unavailable
+    intended_stop_price           REAL,                -- stop / stop_limit / OTO stop child
+    intended_trigger_price        REAL,                -- stop_limit stop price
+    intended_limit_price          REAL,                -- limit / capped market / stop_limit
+    intended_take_profit_price    REAL,                -- bracket take-profit child
+
+    -- Order relationships
+    parent_order_id               TEXT,                -- OTO/bracket: order_id of the parent
+    replaces_order_id             TEXT,                -- replacement_stop: order_id being replaced
+
+    -- Origin (schema-compatible hooks for Phase C; bot-originated rows leave NULL)
+    origin_kind                   TEXT    NOT NULL DEFAULT 'bot',  -- bot | operator
+    operator_command_uid          TEXT,                -- cmd_<hex> when origin_kind='operator'
+
+    -- Pre-fill slippage benchmark provenance (canonical Phase 1 naming).
+    -- NOTE: the per-order table carries INTENT only — computed
+    -- slippage_signed_bps / slippage_adverse_bps stay on `trades`.
+    slippage_benchmark_price      REAL,
+    slippage_benchmark_kind       TEXT,                -- arrival_midpoint | fallback_latest_close | unavailable
     slippage_benchmark_timestamp  TEXT,
     slippage_measurement_quality  TEXT,                -- primary | fallback | recovered | unavailable
+
+    -- Lifecycle / observed state
     status                        TEXT    NOT NULL,    -- per-order state machine, see §6.3
     filled_qty                    REAL    NOT NULL DEFAULT 0.0,
     avg_fill_price                REAL,
-    submitted_at                  TEXT    NOT NULL,
-    last_observed_at              TEXT    NOT NULL,
-    last_observed_event_sequence  INTEGER NOT NULL DEFAULT 0,   -- idempotency key
-    terminal_at                   TEXT,
+
+    -- Timestamps with distinct semantics
+    created_at                    TEXT    NOT NULL,    -- row insert (pre-submit allowed)
+    submitted_at                  TEXT,                -- broker submit return (NULL during pending)
+    terminal_at                   TEXT,                -- moved to a terminal status (filled/canceled/rejected)
+
+    -- Idempotency anchor — broker's last-observed updated_at echoed onto the row.
+    -- Combined with the state-machine ordering in §6.4, this enforces
+    -- exactly-once application without depending on a fabricated event_sequence.
+    last_observed_broker_updated_at TEXT,
+    last_observed_at              TEXT    NOT NULL,    -- our wall-clock for the last apply
+
     FOREIGN KEY(position_uid) REFERENCES position_lifecycle(position_uid)
 );
 
+-- Unique constraints (PR #59 review-2 fix: non-unique indexes don't enforce exactly-once).
+-- order_id is NULL during pending; partial unique index permits multiple NULLs
+-- but rejects duplicate non-NULL ids (SQLite supports this natively).
+CREATE UNIQUE INDEX uniq_lifecycle_orders_order_id
+    ON position_lifecycle_orders(order_id) WHERE order_id IS NOT NULL;
+CREATE UNIQUE INDEX uniq_lifecycle_orders_client_order_id
+    ON position_lifecycle_orders(client_order_id);
+
+-- A position has at most one entry_primary and at most one open exit at a time.
+-- Other roles (replacement_stop, partial_close) are intentionally many-per-position.
+CREATE UNIQUE INDEX uniq_one_entry_primary_per_position
+    ON position_lifecycle_orders(position_uid) WHERE role = 'entry_primary';
+
 CREATE INDEX idx_lifecycle_orders_position_uid ON position_lifecycle_orders(position_uid);
-CREATE INDEX idx_lifecycle_orders_order_id     ON position_lifecycle_orders(order_id);
 CREATE INDEX idx_lifecycle_orders_status       ON position_lifecycle_orders(status);
+CREATE INDEX idx_lifecycle_orders_parent       ON position_lifecycle_orders(parent_order_id);
+CREATE INDEX idx_lifecycle_orders_replaces     ON position_lifecycle_orders(replaces_order_id);
 ```
 
-`position_lifecycle` keeps its position-level fields (status, current_qty, avg_entry_price, net_realized_pnl) as a rollup — derived from the child rows. The position-level `entry_order_id` column becomes legacy and is left in place as a non-authoritative mirror of `entry_primary`'s order_id for backward compatibility.
+Notes:
+
+- **`order_class` vs `order_type`** — Alpaca's `OrderClass` (simple / bracket / OTO / OCO) is distinct from `OrderType` (market / limit / stop / stop_limit). Both are needed; the bot uses `OrderClass.OTO` for every equity entry today and `OrderClass.SIMPLE` for option entries.
+- **`time_in_force`** — required to honestly reproduce intent across a downtime gap. Alpaca expires GTC at 90 days and DAY at session end; both are visible to the bot only if persisted.
+- **`parent_order_id` / `replaces_order_id`** — the protective-stop child of an OTO entry has `parent_order_id = entry_primary.order_id`. A GTC-promoted replacement stop ([PR #47](https://github.com/francomarb/trading-bot/pull/47)) has `replaces_order_id = previous_stop.order_id` and `parent_order_id = entry_primary.order_id`. This makes "which stop currently covers this position" a single query against the orders table.
+- **`origin_kind` + `operator_command_uid`** — schema-compatible only. Foundation PR does NOT implement destructive operator commands; the columns exist so Phase C can populate them when it ships. Bot-originated rows leave `origin_kind='bot'` and `operator_command_uid` NULL.
+- **No computed slippage bps on this table.** Per the cross-workstream phase-boundary feedback: the per-order table owns pre-fill *intent* and *benchmark provenance*; computed `slippage_signed_bps` / `slippage_adverse_bps` stay on `trades`. The order table is not a second slippage-reporting store.
+- **`created_at` vs `submitted_at` vs `terminal_at`** — three distinct moments. `created_at` is row insert (before broker submit). `submitted_at` is when submit returned (NULL while the row is `pending`). `terminal_at` is the move to a terminal status.
+
+`position_lifecycle` keeps its position-level fields (`status`, `current_qty`, `avg_entry_price`, `net_realized_pnl`) as a rollup derived from the child rows. The position-level `entry_order_id` column is retained as a non-authoritative mirror of the `entry_primary` row's order_id for backward compatibility.
 
 ### 6.3 Per-order state machine
 
 ```
-pending           — row inserted, broker submit in progress
+pending           — row inserted; broker submit in progress
 working           — broker has accepted; order is alive (live working, resting STOP_LIMIT, etc.)
-partially_filled  — filled_qty > 0 < intended_qty
+partially_filled  — 0 < filled_qty < intended_qty
 filled            — filled_qty == intended_qty (terminal)
-canceled          — terminal with zero fills (§8.1 enforced here, too)
-rejected          — terminal pre-fill broker rejection
+canceled          — broker-side cancel; preserves filled_qty (terminal)
+rejected          — broker rejected pre-fill (terminal, filled_qty == 0)
 unknown           — submitted but no confirmation; awaits reconciliation
 ```
 
-`pending → working → partially_filled → filled` is the happy path. `pending` exists only as a brief moment between row insert and broker submit return; in practice many transitions skip straight to `working` or `unknown`.
+Allowed transitions:
 
-§8.1 invariant applies per-order: a `partially_filled` order cannot transition to `canceled`; the broker-side cancel of a partially-filled order leaves the order `partially_filled` at its filled quantity.
+```
+pending  →  working | unknown | rejected
+working  →  partially_filled | filled | canceled | unknown
+partially_filled
+         →  filled | canceled
+unknown  →  any of the above (resolved by reconciliation)
+filled   →  (terminal)
+canceled →  (terminal)
+rejected →  (terminal)
+```
+
+**Per-order vs. position-level invariant (PR #59 review-2 fix).** A `partially_filled → canceled` transition IS valid at the per-order level. That is how Alpaca describes a partially-filled order that gets canceled: the order terminates as `canceled` with its `filled_qty` preserved. The §8.1 invariant from the operator proposal is a *position-level* claim — the parent position must remain `open` (or `partially_filled`) at the filled quantity, never reach `canceled`. Under §6's two-table shape:
+
+- **Per-order rows** record broker truth. `partially_filled → canceled` is allowed; `filled_qty` is preserved on the terminal row.
+- **Position-level row** rolls up `current_qty = SUM(filled_qty across non-replaced realized orders)` and `status` accordingly. The store-boundary `mark_canceled` guard at [engine/lifecycle.py:486](../engine/lifecycle.py:486) keeps doing its job: a position whose roll-up `current_qty > 0` cannot transition to `canceled`. Belt-and-suspenders in `apply_order_event` (see §6.4).
+
+State-machine ordering (used by §6.4 atomicity):
+
+```
+rank(pending)          = 0
+rank(working)          = 1
+rank(unknown)          = 1
+rank(partially_filled) = 2
+rank(filled)           = 3
+rank(canceled)         = 3
+rank(rejected)         = 3
+```
+
+An incoming event is "newer" than the row's current state iff `(rank(incoming.status), incoming.filled_qty) > (rank(row.status), row.filled_qty)` lexicographically. This is monotonic by construction of the broker's order lifecycle and is the secondary discriminator when `Order.updated_at` ties.
 
 ### 6.4 Reconciliation paths under the new shape
 
-All three paths share the same `apply_order_event(position_uid, order_id, event)` API:
+All three paths funnel through one API: `apply_order_event(order_id, event)`.
 
-- **Stream** delivers events as they arrive. Each event has an `event_sequence` (monotonic per order from the broker).
-- **Cycle** iterates non-terminal per-order rows, calls broker `get_order_by_id(order_id)`, translates the broker view into an `event`, calls `apply_order_event`.
-- **Startup** does the same as cycle, but also walks broker closed-order history for `order_id`s belonging to non-terminal per-order rows that aren't in `open_orders`.
+- **Stream**: delivers events as they arrive from the WebSocket trade_updates feed.
+- **Cycle**: iterates non-terminal per-order rows, calls `broker.get_order_by_id(order_id)`, builds an `event` from the broker view, calls `apply_order_event`.
+- **Startup**: same as cycle, plus walks broker closed-order history for non-terminal per-order rows that aren't in `open_orders` (downtime fill / cancel discovery).
+
+An `event` carries: `(status, filled_qty, avg_fill_price, broker_updated_at)` plus any reconciliation metadata. No fabricated `event_sequence`.
+
+**Atomic enforcement (PR #59 review-2 fix).** `apply_order_event` is one SQL `UPDATE ... WHERE` statement, not a read-then-update pair. The where-clause encodes the staleness check directly so two concurrent callers cannot both pass it:
+
+```sql
+UPDATE position_lifecycle_orders
+SET status                          = :status,
+    filled_qty                      = :filled_qty,
+    avg_fill_price                  = :avg_fill_price,
+    last_observed_broker_updated_at = :broker_updated_at,
+    last_observed_at                = :now,
+    terminal_at                     = CASE
+        WHEN :status IN ('filled', 'canceled', 'rejected') THEN :now
+        ELSE terminal_at
+    END
+WHERE order_id = :order_id
+  AND (
+      -- Incoming event is strictly newer in state-machine + filled_qty order:
+      (
+          CASE status
+              WHEN 'pending'          THEN 0
+              WHEN 'working'          THEN 1
+              WHEN 'unknown'          THEN 1
+              WHEN 'partially_filled' THEN 2
+              ELSE                         3
+          END,
+          filled_qty
+      )
+      <
+      (:status_rank, :filled_qty)
+  )
+  -- OR the broker has bumped updated_at, which is the tiebreaker
+  -- when state-rank/filled_qty are equal (rare backend race):
+  OR (
+      last_observed_broker_updated_at IS NULL
+      OR last_observed_broker_updated_at < :broker_updated_at
+  );
+```
+
+SQLite executes a single `UPDATE` atomically. `rowcount == 0` means the event was stale or duplicate — log and drop. `rowcount == 1` means the event was applied; the caller then runs a SECOND atomic step (in the same transaction) to update the position rollup. The two-statement transaction is fine because the per-order check has already proven the incoming event is the one that advances state.
 
 `apply_order_event` is the single chokepoint that enforces:
 
-- exactly-once via `event_sequence`
-- §8.1 invariant
-- position-level rollup updates (`position_lifecycle.current_qty`, etc.)
-- trade-log row creation (with the same `event_sequence` echoed in a new `trades.order_event_sequence` column to make duplicates detectable post-hoc)
+- **Exactly-once** via the atomic where-clause above (the per-order row mutates at most once per broker-distinct event)
+- **§8.1 position-level invariant** via the rollup step: if the new per-order row would drive position-level `current_qty` to a negative value (impossible per the order state machine) or would close a position with `current_qty > 0` via `partially_filled → canceled`, the rollup leaves the position as `open` / `partially_filled` at the realized quantity
+- **Trade-log row creation** for every observed fill event, keyed by `(position_lifecycle_orders.id, broker_updated_at)` to make duplicates detectable post-hoc
 
 ### 6.5 What this eliminates
 
@@ -420,4 +546,75 @@ If during slippage Phase 1's Defect 2 fix we had paused and asked "should this f
 - **Suspect order** — an order whose terminal state the bot didn't confirm before the synchronous timeout. Held in `_suspect_orders` (entry) or `_suspect_residual_orders` (hybrid residual). Both caches go away with the per-order table.
 - **Synthesized row** — a lifecycle row created retroactively to back a broker-open position the bot didn't originate. Tagged `metadata.synthesized=true`.
 - **Hybrid entry / residual** — PR #58's split-entry: whole shares as a STOP_LIMIT primary, fractional remainder as a MARKET residual. Two orders, one logical position.
-- **`event_sequence`** (proposed §6.4) — monotonic per-order counter sourced from the broker that lets stream / cycle / startup paths apply at most one update per observed event.
+- **`last_observed_broker_updated_at`** (§6.2 column / §6.4 atomicity) — the most recent `Order.updated_at` value the bot has observed for this per-order row. Anchors the staleness check; combined with state-machine rank + filled_qty ordering it enforces exactly-once application without depending on a fabricated event sequence.
+- **`origin_kind` / `operator_command_uid`** (§6.2 columns) — schema-compatible hooks for future Operator Controls Phase C orders. Bot-originated rows leave `origin_kind='bot'` and `operator_command_uid` NULL. Foundation PR does NOT implement destructive operator commands.
+
+---
+
+## 9. Dependency matrix — what this foundation PR owns
+
+Per the cross-workstream phase-boundary feedback on PR #59, the foundation work must classify every touched item so we don't silently absorb whole future phases.
+
+### 9.1 Moved INTO this foundation (correctness prerequisites)
+
+| Item | Why it's here |
+|---|---|
+| `position_lifecycle_orders` table per §6.2 | The per-order durable record is the substrate that eliminates the suspect-order caches. Required for correctness of recovery, idempotency, and §8.1 enforcement. |
+| `apply_order_event` API per §6.4 | Single chokepoint for stream / cycle / startup events. Without it the three reconciliation paths cannot honor exactly-once. |
+| `entry_order_id` actually populated on the position-level row (as a non-authoritative mirror of `entry_primary.order_id`) | Backward compatibility for any consumer currently reading the column. The authoritative copy lives on the per-order row. |
+| Stream-driven entry-fill plumbing for equity entries | Required so a stream-delivered fill on a resting STOP_LIMIT or LIMIT advances the lifecycle. The single-leg options worker pattern is the prototype. |
+| Cycle-level reconciliation of non-terminal per-order rows by `order_id` | The reverse-close pass already exists; the forward-non-terminal pass does not. Required for correctness of every non-synchronous fill path. |
+| Startup downtime fill / cancel discovery against broker closed-order history | Required so a pending order that resolved during downtime can be advanced from the actual `order_id` rather than guessed from open broker state. |
+| Persist pre-fill `slippage_benchmark_*` provenance on the per-order row | Required so a recovered fill propagates honest provenance into `trades` rather than fabricating `unavailable` or worse. |
+| §8.1 invariant enforced at the position-level rollup (per-order rows may legitimately `partially_filled → canceled`) | Correct state machine. The store-boundary guard at [engine/lifecycle.py:486](../engine/lifecycle.py:486) stays in place. |
+
+### 9.2 Schema-compatible only (no behavior added in this PR)
+
+| Item | Schema artifact | Behavior in this PR |
+|---|---|---|
+| Operator-issued order origin | `origin_kind` (default `'bot'`), `operator_command_uid` (NULL) on `position_lifecycle_orders` | No destructive operator commands implemented. Phase C populates these columns when it ships. |
+| Spread (MLEG) order lifecycle | Per-order schema is shape-compatible (`role`, `parent_order_id`, `replaces_order_id` carry MLEG legs naturally) | No spread `create_pending` / `apply_order_event` paths wired. Spread lifecycle remains deferred. |
+| Future order roles beyond §6.1's six | `role TEXT` is open enum | This PR ships only the six roles enumerated in §6.1. |
+| Bracket take-profit | `intended_take_profit_price` column exists | No strategy uses bracket TP today; column is reserved for future strategies. |
+
+### 9.3 Still deferred (out of scope here)
+
+| Item | Where it lives |
+|---|---|
+| Operator Controls Phase B (soft controls, command heartbeat, command alerts, Telegram queue migration) | Operator Controls Phase B PR |
+| Operator Controls Phase C (destructive commands, symbol/owner-key locking, stop cancel/recreate, allocator + P&L reintegration, command execution recovery) | Operator Controls Phase C PR |
+| `Position.position_uid` engine-state integration, dashboard exposure, broad alert adoption | Separate consumer PRs per §17 |
+| Health monitor / sleeve allocator / PnL reporting / backtest reconciliation adoption of `position_uid` | Separate consumer PRs per §17 |
+| Slippage Phase 2 consumer migration (health, risk kill switch, calibration script, dashboard display + denominator fix, legacy dual-write removal) | Slippage Phase 2 PR |
+| Slippage Phase 3 historical cleanup (phantom recovery rows, pre-`8316e64` LIMIT rows) | Slippage Phase 3 PR |
+| Spread lifecycle wiring | Separate spread-lifecycle PR |
+| Implementation-shortfall or trigger-time-quote metrics | Out of taxonomy; not in scope anywhere current |
+
+The PR-#58 capability (Donchian stop-limit + hybrid residual) is rebuilt AFTER this foundation lands, on top of it. Not in this PR.
+
+---
+
+## 10. Ownership boundaries between the three tables
+
+Explicit so the implementation PR cannot silently expand any one table into another's responsibility.
+
+| Table | Owns | Does NOT own |
+|---|---|---|
+| `position_lifecycle` | One row per logical position. Aggregate state (`status`, `current_qty`, `avg_entry_price`, `net_realized_pnl`). Identity (`position_uid`, `owner_key`, `strategy`, `position_type`). Lifecycle creation / termination timestamps. | Per-order metadata. Order-level state. Computed slippage values. Trade-by-trade fills. |
+| `position_lifecycle_orders` (new) | Durable per-order intent (order_type, order_class, TIF, intended prices, qty). Broker identity (`order_id`, `client_order_id`). Per-order lifecycle state and reconciliation anchor. Pre-fill slippage benchmark provenance. Relationships between orders (parent / replaces). Origin (bot vs. operator command). | Position-level rollups. Computed realized slippage. Trade-row primary keys. |
+| `trades` | Executed fills (one row per terminal fill event). Realized P&L. Computed `slippage_signed_bps` / `slippage_adverse_bps`. Slippage measurement quality of the actual fill. | Pre-submit order intent. Per-order broker state. Order relationships. |
+
+This boundary is the load-bearing answer to "the per-order table is not a second slippage-reporting store." Foundation PR persists pre-fill benchmark provenance on the order row; the trades row continues to be the source of truth for computed slippage. Phase 2 consumer migration reads computed values from `trades` exactly as it does today.
+
+---
+
+## 11. Documentation updates required when foundation PR lands
+
+The cross-workstream phase-boundary feedback notes that previously documented phase assumptions become stale once this foundation lands. The implementation PR must update:
+
+- **`PLAN.md`** — Live readiness gate row for slippage / operator controls needs to note that the foundation PR is in flight or merged, and that PR #58 is awaiting rebuild on it.
+- **`docs/operator_controls_proposal.md`** — §17 explicitly notes that `position_uid` adoption is "deferred organic." This is partly stale: single-leg option entry async callbacks already exist in code, and the foundation PR makes the per-order substrate first-class. The proposal should be amended to call out (a) the write-side substrate vs. read-side consumer split (per §7.1 of this doc), and (b) that the per-order table is now the substrate Phase C commands write into.
+- **`docs/slippage_unification_tracker.md`** — Phase 2 consumer migration scope did not previously contemplate reading pre-fill benchmark provenance from a lifecycle row. The tracker should note that the foundation PR persists this provenance, and that recovered-fill rows now have a durable source for the kind / quality tags rather than relying on `_suspect_orders` in memory.
+- **PR #58 description** — should be marked draft with a top comment listing what's blocked vs. cherry-pickable (per the operator's directive). Foundation PR description should link back to PR #58 for the rebuild scope.
+
+These doc updates are a required part of the foundation PR, not a follow-up.
