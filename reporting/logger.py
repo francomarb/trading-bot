@@ -369,6 +369,15 @@ class TradeLogger:
         os.makedirs(os.path.dirname(self._path) or ".", exist_ok=True)
         conn = sqlite3.connect(self._path)
         try:
+            # Order lifecycle foundation (PR #59 §6.2 / R13-G1): SQLite
+            # does NOT enforce FOREIGN KEY constraints by default — they
+            # are declared in the schema but advisory unless this PRAGMA
+            # is executed on every connection that opens the database.
+            # Must run BEFORE any DDL or DML so the FKs declared by the
+            # position_lifecycle_orders schema (and option_trailing_stops
+            # once that migration lands) are enforced from the first
+            # statement onward.
+            conn.execute("PRAGMA foreign_keys = ON;")
             # Register OWNER_KEY() as a SQLite UDF so the backfill SQL can
             # normalize OCC option symbols to their underlying. Keeps the
             # stored position_id consistent with engine.positions.owner_key_for().
@@ -407,6 +416,24 @@ class TradeLogger:
             conn.execute(_CREATE_POSITION_LIFECYCLE_LEGS_SQL)
             for index_sql in _CREATE_POSITION_LIFECYCLE_INDEXES_SQL:
                 conn.execute(index_sql)
+            # Order lifecycle foundation (PR #59): per-order substrate.
+            # Same migration scaffolding pattern as the position_lifecycle
+            # DDL above; the local import keeps engine.lifecycle_orders
+            # standalone-importable without pulling in reporting/logger.
+            from engine.lifecycle_orders import (
+                _CREATE_POSITION_LIFECYCLE_ORDERS_SQL,
+                _CREATE_POSITION_LIFECYCLE_ORDERS_INDEXES_SQL,
+                _UNIQ_ONE_ACTIVE_POSITION_PER_OWNER_KEY_SQL,
+            )
+            conn.execute(_CREATE_POSITION_LIFECYCLE_ORDERS_SQL)
+            for index_sql in _CREATE_POSITION_LIFECYCLE_ORDERS_INDEXES_SQL:
+                conn.execute(index_sql)
+            # Position-level partial unique index added to the existing
+            # position_lifecycle table — durable cross-position
+            # duplicate-entry prevention per PR #59 §6.2 / R6-1 / R8-3.
+            # See engine/lifecycle_orders.py for the discussion of why
+            # 'error' is included in the WHERE clause.
+            conn.execute(_UNIQ_ONE_ACTIVE_POSITION_PER_OWNER_KEY_SQL)
             from engine.option_trailing import (
                 _CREATE_OPTION_TRAILING_STOPS_SQL,
                 _OPTION_TRAILING_STOPS_INDEXES_SQL,
