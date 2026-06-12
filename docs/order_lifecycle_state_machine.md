@@ -242,7 +242,20 @@ The cache is memory-only: a restart drops every entry. Today this is rare for sy
 
 PR #58 added a parallel cache to handle the residual MARKET because the primary cache slot was owned by the STOP_LIMIT. Same shape, same memory-only durability. The R7 review's [P1] "Ambiguous residual recovery is still lost across restart" finding identifies this as fundamentally insufficient.
 
-### 4.3 What the caches' existence reveals
+### 4.3 `_suspect_exit_orders` — exit-side mirror of the entry cache
+
+[engine/trader.py:424](../engine/trader.py:424): `dict[str, SuspectExitOrder]`, keyed by `decision.symbol`. The exit-side parallel to `_suspect_orders`, introduced by [PR #53](https://github.com/francomarb/trading-bot/pull/53) (commits `28352a0`, `e0bedc2`) when a confirmed-by-Alpaca close lost its terminal confirmation locally and the existing recovery path declared the position external-closed before the real fill landed.
+
+Drained by [`_recover_suspect_exit_orders`](../engine/trader.py:1979) each cycle (called from the same operator-halt-coverage path that runs `_recover_suspect_orders`). The recovery logic preserves the same invariants as the entry-side path:
+
+- query broker order history only after the current lifecycle's entry timestamp (bounded window)
+- require recovered cumulative sell quantity to explain the open quantity
+- preserve broker timestamps / VWAP
+- never let external-close detection race ahead of a known submitted close
+
+This cache is the same shape and has the same restart-volatility problem as `_suspect_orders`: the durable handle for an in-flight exit lives only in memory. Foundation PR's `role='exit'` per-order rows make the handle durable and `_suspect_exit_orders` redundant — the same way `role='entry_primary'` rows replace `_suspect_orders`. The recovery invariants above must survive the migration as acceptance tests (see §10).
+
+### 4.4 What the caches' existence reveals
 
 **A position can have multiple distinct orders associated with it through its life: an entry, a residual entry (in hybrid strategies), a protective stop order, and an exit order.** Each has its own `order_id`, its own `intended_qty`, its own benchmark provenance, and its own status timeline. The lifecycle row carries metadata for *one* of them. Every additional order ends up either:
 
@@ -567,35 +580,45 @@ PR #59 review-4 (P1, "keep one persistence system") rejected an earlier draft th
 #### Schema change on `trades`
 
 ```sql
--- Idempotency key for UPSERTs. Existing rows with NULL order_id
--- (synthetic external close, etc.) remain valid; the partial unique
--- index permits multiple NULLs.
-CREATE UNIQUE INDEX uniq_trades_order_id
-    ON trades(order_id) WHERE order_id IS NOT NULL;
+-- Idempotency key for UPSERTs. Scoped to single-leg rows only:
+-- log_spread_fill deliberately writes TWO leg rows per spread fill
+-- that share the same combo `order_id` (one row for the short OCC
+-- leg, one for the long OCC leg). A global UNIQUE(order_id) would
+-- reject the second leg insert and break the existing MLEG path.
+-- PR #59 review-5 correction (verified at reporting/logger.py:1111+).
+-- Existing rows with NULL order_id (synthetic external close, etc.)
+-- remain valid: the partial unique index permits multiple NULLs.
+CREATE UNIQUE INDEX uniq_trades_order_id_single_leg
+    ON trades(order_id)
+    WHERE order_id IS NOT NULL AND position_type = 'single_leg';
 
 -- Optional audit-only column; no UNIQUE, no constraints.
 ALTER TABLE trades ADD COLUMN execution_id TEXT;
 ```
 
-#### Writer pattern (UPSERT keyed on `order_id`)
+#### Writer pattern (UPSERT keyed on `order_id`, single-leg only)
+
+SQLite's `ON CONFLICT` target must match the unique index's predicate exactly when the index is partial. Foundation writers therefore include the same `WHERE order_id IS NOT NULL AND position_type = 'single_leg'` predicate on the conflict clause. The implementation PR must add a database-level test that exercises the migration + UPSERT pair together to verify both predicates stay aligned:
 
 ```sql
+-- Single-leg writers (log_entry, log_close, log_stop_fill, etc.)
 INSERT INTO trades (
-    order_id, symbol, strategy, side,
+    order_id, symbol, strategy, side, position_type,
     filled_qty, avg_fill_price,
     slippage_benchmark_price, slippage_benchmark_kind,
     slippage_benchmark_timestamp, slippage_measurement_quality,
     execution_id,
     ...
 ) VALUES (
-    :order_id, :symbol, :strategy, :side,
+    :order_id, :symbol, :strategy, :side, 'single_leg',
     :filled_qty, :avg_fill_price,
     :slippage_benchmark_price, :slippage_benchmark_kind,
     :slippage_benchmark_timestamp, :slippage_measurement_quality,
     :execution_id,
     ...
 )
-ON CONFLICT(order_id) DO UPDATE SET
+ON CONFLICT(order_id) WHERE order_id IS NOT NULL AND position_type = 'single_leg'
+DO UPDATE SET
     filled_qty       = excluded.filled_qty,        -- broker's latest cumulative
     avg_fill_price   = excluded.avg_fill_price,    -- broker's latest cumulative VWAP
     -- benchmark provenance is set once at first insert and never updated:
@@ -607,7 +630,9 @@ ON CONFLICT(order_id) DO UPDATE SET
     execution_id = COALESCE(excluded.execution_id, trades.execution_id);
 ```
 
-The UPSERT semantics make the writer naturally idempotent across stream / cycle / startup paths: each path produces the same cumulative `filled_qty` and `avg_fill_price` for a given order, so re-application is a no-op (state values match) or an advance (cumulative qty / VWAP have grown).
+`log_spread_fill` continues to use plain `INSERT` for its two leg rows (no UPSERT, no UNIQUE conflict — `position_type='spread'` rows fall outside the partial index). When spread lifecycle wiring lands in the separate spread-lifecycle PR, that PR decides its own dedup key (likely `(order_id, leg_role)` or a synthetic leg id).
+
+The UPSERT semantics make the single-leg writer naturally idempotent across stream / cycle / startup paths: each path produces the same cumulative `filled_qty` and `avg_fill_price` for a given order, so re-application is a no-op (state values match) or an advance (cumulative qty / VWAP have grown).
 
 #### REST recovery uses cumulative deltas, not execution_id
 
@@ -720,7 +745,7 @@ If during slippage Phase 1's Defect 2 fix we had paused and asked "should this f
 - **Hybrid entry / residual** — PR #58's split-entry: whole shares as a STOP_LIMIT primary, fractional remainder as a MARKET residual. Two orders, one logical position.
 - **`last_observed_broker_updated_at`** (§6.2 column / §6.4 atomicity) — the most recent `Order.updated_at` value the bot has observed for this per-order row. Anchors the staleness check; combined with state-machine rank + filled_qty ordering it enforces exactly-once application without depending on a fabricated event sequence.
 - **`origin_kind` / `operator_command_uid`** (§6.2 columns) — schema-compatible hooks for future Operator Controls Phase C orders. Bot-originated rows leave `origin_kind='bot'` and `operator_command_uid` NULL. Foundation PR does NOT implement destructive operator commands.
-- **`execution_id`** (§6.5) — Alpaca's per-fill identifier on a `trade_update` event. A single order with N partial fills produces N distinct `execution_id`s. This is the correct dedup key for `trades` rows; `order_id + updated_at` is wrong because both share the order-level snapshot. The foundation PR adds `execution_id` as a `UNIQUE` partial column on `trades`.
+- **`execution_id`** (§6.5) — Alpaca's per-fill identifier on a stream `trade_update` event. A single order with N partial fills produces N distinct `execution_id`s. Foundation PR persists it as **optional audit-only metadata** on `trades` — no UNIQUE constraint, no consumer reads it. The fill-row dedup key is `order_id`, paired with cumulative `filled_qty` / VWAP UPSERT semantics (§6.5). REST recovery has no `execution_id` available and leaves it NULL. PR #59 review-4 rejected an earlier draft that would have made `trades` one row per execution gated by a UNIQUE on `execution_id`; that would have created a parallel execution ledger with breaking consumer impact.
 - **State-machine rank** (§6.3 / §6.4) — `pending=0`, `working=1`, `unknown=1`, `partially_filled=2`, `filled=3`, `canceled=3`, `rejected=3`. Used lexicographically with `filled_qty` to determine whether an incoming event strictly advances the per-order row.
 - **Side-signed sum** (§6.6) — the position-level `current_qty` rollup is `SUM(filled_qty * sign(side))`, not raw `SUM(filled_qty)`. Entries and exits net out correctly; a canceled-after-partial-fill row contributes its preserved `filled_qty` exactly once.
 - **Wired role vs. schema-only role** (§9.0) — the role column accepts six values. Foundation PR ships code paths for `entry_primary`, `protective_stop`, `replacement_stop`, `exit` (the four roles every current strategy uses). `entry_residual` waits for PR #58 rebuild; `partial_close` waits for Operator Controls Phase C. The position-level rollup is authoritative when every order on the position uses a wired role.
@@ -789,7 +814,113 @@ The PR-#58 capability (Donchian stop-limit + hybrid residual) is rebuilt AFTER t
 
 ---
 
-## 10. Ownership boundaries between the three tables
+## 10. Compensating-patch absorption matrix — implementation migration checklist
+
+ChatGPT's two-week audit (May 29 – June 12, 2026) identified workarounds that exist in production code today because the durable per-order substrate was missing. The foundation PR absorbs these in a single migration rather than handling them as isolated follow-ups. Each subsection below is one category from the audit: the workaround the foundation replaces, what behavior must be preserved, the safety invariants and tests that must survive the migration, and the audit's recommended sequence.
+
+This matrix is the **implementation PR's migration checklist**. Every row should be addressed in the implementation PR, not deferred.
+
+### 10.1 Entry uncertainty, duplicate prevention, pending-row grace
+
+| Aspect | Detail |
+|---|---|
+| **Workarounds today** | `_suspect_orders` (§4.1); `LIFECYCLE_PENDING_GRACE_SECONDS` reverse-pass guard (§3.1); broker-open-order duplicate checks before entry submit; PR #58's `_restore_suspect_orders_from_broker` startup walk; PR #58's residual drains and symbol-keyed ownership shims |
+| **Anchor commits** | `88d1a45` (operator-queue / pending grace), `021fa63`, `4c727ae`, PR #58 R5–R7 patches `8ce0dee..00f9e53` |
+| **Foundation absorption** | One `apply_order_event` path drives stream, cycle, and startup. `pending → working → partially_filled → filled` advances on observed broker state. Symbol-level duplicate guard becomes the `UNIQUE WHERE role='entry_primary'` constraint on `position_lifecycle_orders` per §6.2; broker-side check becomes redundant once durable identity exists |
+| **Preserved invariants** | (a) No duplicate entry while a non-terminal order exists for the same position. (b) Exact `client_order_id` / `order_id` reconciliation — never fuzzy match by symbol. (c) TIMEOUT and UNKNOWN remain recoverable through the next cycle/startup. (d) Slippage benchmark provenance survives restart (see §10.5). (e) A position is not marked `external_closed` while an order can still create or close it |
+| **Tests that survive** | PR #58's R5–R7 acceptance tests for hybrid recovery, the duplicate-entry guard tests from `88d1a45`, the pending-grace integration test |
+| **Pending-grace fallback** | `LIFECYCLE_PENDING_GRACE_SECONDS` may remain as a **bounded compatibility fallback during migration** — not the primary state model. Removed entirely only after `apply_order_event` is verified across stream / cycle / startup paths |
+| **Symbol-keyed `_positions` cache** | Retained as the in-memory operational state — this is engine state, not a recovery substrate. The foundation only eliminates caches that *substitute* for the missing substrate |
+
+### 10.2 Uncertain single-leg exits
+
+| Aspect | Detail |
+|---|---|
+| **Workaround today** | `_suspect_exit_orders` (§4.3) — exit-side parallel of `_suspect_orders`. Memory-only, restart-volatile |
+| **Anchor commits** | PR #53 — `28352a0` ("fix: recover uncertain single-leg exits"), `e0bedc2` ("fix: tighten exit history recovery bounds") |
+| **Foundation absorption** | `role='exit'` per-order rows replace the cache. Every signal exit, stop fill, and discretionary close creates a durable exit row. `apply_order_event` reconciles it across stream / cycle / startup the same way it handles entries |
+| **Preserved invariants** | (a) Broker order-history queries only after the current lifecycle's entry timestamp. (b) Recovered cumulative sell quantity must explain the open quantity (no phantom fills). (c) Broker timestamps and VWAP preserved on the per-order row and propagated into `trades`. (d) External-close detection cannot race ahead of a known submitted close — the durable `role='exit'` row blocks the external-close path |
+| **Tests that survive** | PR #53's R0–R2 acceptance tests for CIEN-style late-fill recovery, the bounded-history-window test from `e0bedc2` |
+| **Cache removal timing** | After `role='exit'` is verified across stream / cycle / startup paths. Not on day-one of foundation merge |
+
+### 10.3 Protective stop promotion, replacement, and repair
+
+| Aspect | Detail |
+|---|---|
+| **Workarounds today** | PR #47's DAY-child → GTC promotion with `_reported_stop_promotion_failures` set used as identity workaround (because there's no durable handle to track which stop replaced which); PR #46's option-stop replacement hardening (`d98c801`, `c936c57`, `39e0b94`); inferring "which stop is current" from broker snapshot symbols rather than durable identity |
+| **Anchor commits** | `3236593`, `1bdf05e` (PR #47 — capped equity stop durability and DAY-to-GTC replacement); `d98c801`, `c936c57`, `39e0b94` (PR #46 option-stop hardening) |
+| **Foundation absorption** | Every attached protective stop becomes a `role='protective_stop'` per-order row with `parent_order_id = entry_primary.order_id`. Every replacement becomes a `role='replacement_stop'` row with both `parent_order_id` (the entry) AND `replaces_order_id` (the stop it replaces). "Which stop currently covers this position?" becomes one query against the orders table; the `_reported_stop_promotion_failures` identity workaround goes away |
+| **Preserved operational behavior** | Broker-native replace semantics (Alpaca's `ReplaceOrderRequest` path), bounded alerting on promotion failure, immediate protection repair when a managed position has no broker-side stop, GTC/DAY semantics including the 90-day GTC expiry constraint |
+| **Atomic replacement requirement** | A replacement creates a NEW per-order row AND advances the replaced row's status (typically to `canceled`) inside the same transaction. The replacement must NEVER overwrite the identity of the stop it replaces — `replaces_order_id` is the linkage, not a mutation of `order_id` |
+| **Tests that survive** | PR #47's GTC-promotion-after-fill acceptance test, the retry-and-bounded-alerting tests, the GTC/DAY-reconciliation-from-broker-snapshot tests |
+
+### 10.4 Option trailing state — split responsibilities
+
+| Aspect | Detail |
+|---|---|
+| **Workaround today** | `option_trailing_stops` table (defined at [engine/option_trailing.py:11](../engine/option_trailing.py:11)) mixes legitimate strategy state with duplicate order-lifecycle state |
+| **Anchor commits** | `d86aa5e`, `5931361`, `d98c801`, `fdabede` (PR #40 / PR #46) |
+| **Strategy state that stays** | `entry_premium`, `hwm_premium`, `trail_activation_pct`, `trail_pct`, `current_stop_price` (the strategy's derived target), `last_observed_premium`. These are strategy decisions, not broker order state. Keep the columns; keep the read/write paths |
+| **Broker-order state that migrates** | `alpaca_stop_order_id`, `stop_order_status`. These ARE order-lifecycle state and become authoritative on `position_lifecycle_orders` (as a `role='protective_stop'` or `role='replacement_stop'` row keyed to the option position's `position_uid`) |
+| **Migration shape** | `option_trailing_stops.alpaca_stop_order_id` becomes a foreign-key reference to `position_lifecycle_orders.order_id` rather than the source of truth. The trailing table reads broker-order status via a join, not from its own duplicated columns. Strict column removal is deferred — the columns can remain as denormalized mirrors during migration, with the per-order row as authoritative |
+| **Preserved operational behavior** | HWM restoration on startup, missing-HWM fail-safe alerts, durable HWM across restarts (PR #46's core durability promise) |
+| **Tests that survive** | PR #46's HWM restoration / fail-safe-alert / atomic-replacement integration tests |
+
+### 10.5 Slippage recovery patches — preserve provenance as a correctness requirement
+
+| Aspect | Detail |
+|---|---|
+| **Workarounds today** | Pre-fill `slippage_benchmark_*` provenance lives in `SuspectOrder` (in memory); recovered fills depend on the cache surviving to write honest provenance to `trades` |
+| **Anchor commits** | `d2d9509` ("Preserve broker timestamps in recovery paths"), `e9cde89`, `4c727ae` (slippage Phase 1 Defect 2 fix: SuspectOrder.modeled_price_kind), `e055d25` (stream stop_price hotfix), slippage Phase 1 PR #43 |
+| **Foundation absorption** | Pre-fill `slippage_benchmark_price`, `_kind`, `_timestamp`, `_measurement_quality` move from `SuspectOrder` onto each `position_lifecycle_orders` row at create time. On recovery, the per-order row IS the source of provenance — the trades UPSERT propagates it via `COALESCE` (§6.5) |
+| **Preserved as correctness requirements** | These are NOT disposable workarounds. The audit explicitly names: broker timestamps preserved, cumulative `filled_qty`/VWAP preserved, stream `stop_price` round-trips through the SimpleNamespace reconstruction (`e055d25`), canonical `slippage_benchmark_*` taxonomy. All must survive the migration |
+| **Boundary preserved** | Computed `slippage_signed_bps` / `slippage_adverse_bps` stay on `trades`. The per-order table owns pre-fill INTENT; it does NOT become a second computed-slippage store. Phase 2 consumer migration is NOT in this PR |
+| **Tests that survive** | Slippage Phase 1's full per-codepath contract tests, the Defect 1–5 fix tests, the stream `stop_price` round-trip test (`e055d25`) |
+
+### 10.6 Position-level partial-close / accounting fixes
+
+| Aspect | Detail |
+|---|---|
+| **Workarounds today** | Various ad-hoc fixes that established correct partial-close and recovery accounting semantics |
+| **Anchor commits** | `7bdd238`, `a20357d` (PR #33 position_uid foundation), `e151830`, `21120a9`, `095fe19` |
+| **Behaviors that survive as acceptance tests** | (a) Partial fills / closes keep the logical lifecycle `open` / `partially_filled` at the realized quantity. (b) Residual quantity is preserved across partial events. (c) Full-close trade counting happens once per `position_uid` (no double-count when stop and signal-exit interleave). (d) Recovered stop / exit fills close the lifecycle correctly via the same `_record_realized_pnl` → `_close_lifecycle_for_owner_key` path |
+| **Foundation responsibility** | The §6.6 side-signed rollup must produce the same observable accounting as today. These tests stay green when the rollup math replaces the event-driven mutations |
+| **What the foundation does NOT touch** | Allocator / health monitor / dashboard consumer migration. The foundation only ensures existing consumers continue to read correct values from `trades` and `position_lifecycle` |
+
+### 10.7 MLEG partial-close pending state — defer behavior, reserve substrate
+
+| Aspect | Detail |
+|---|---|
+| **Workaround today** | `_spreads_pending_close: set[str]` ([engine/trader.py:406](../engine/trader.py:406)) is in-memory only; PR #56's restart-gap risk is real but acknowledged as out-of-scope for that PR |
+| **Anchor commits** | `9ccd7aa`, `1365742`, `b710aea`, `9e0f533`, `ffa0353` (PR #56) |
+| **Foundation does NOT solve this** | The audit is explicit: **do not** solve the spread restart gap with `engine_state.json` or a parallel persistence layer. The spread lifecycle PR is the right home — it should write combo close orders into the same per-order substrate and derive pending-close state from non-terminal order rows. The foundation PR just keeps the schema spread-compatible (§6.2's `role`, `parent_order_id` columns work for MLEG legs naturally) |
+| **Preserved until spread lifecycle PR ships** | PR #56's fail-safe partial logging, residual ownership preservation, duplicate-dispatch block via `_spreads_pending_close` (in-memory cache stays), CRITICAL alert on partial close |
+| **Migration trigger** | Spread lifecycle PR writes spread entry / exit / close as `position_lifecycle_orders` rows keyed under the spread's `position_uid`. Pending-close state becomes "any non-terminal `role='exit'` order on this spread `position_uid`." `_spreads_pending_close` retires at that point |
+
+### 10.8 PR #58 disposition — rebuild, do not cherry-pick
+
+| Aspect | Detail |
+|---|---|
+| **What does NOT come back** | PR #58's lifecycle plumbing: `skip_lifecycle` shim, `_suspect_residual_orders` cache, pending drains keyed on `current_qty`, startup-open-order reconstruction, symbol-keyed TIMEOUT ownership |
+| **What CAN be cherry-picked into the PR #58 rebuild** | Strategy / order-construction business logic only — STOP_LIMIT semantics in the backtest harness, `BaseStrategy.latest_trigger_price` hooks, `OrderType.STOP_LIMIT` enum + `Signal` / `RiskDecision` field additions, hybrid sizing math, pure unit tests that don't depend on the parked caches |
+| **Rebuild target** | STOP_LIMIT primary + fractional residual entries implemented as TWO durable `position_lifecycle_orders` rows under ONE `position_uid` — one `role='entry_primary'` (STOP_LIMIT), one `role='entry_residual'` (MARKET). `entry_residual` becomes a wired role at that point (was schema-only per §9.0) |
+| **Sequence** | PR #58 rebuild happens AFTER the foundation PR merges, smoke-confirms, and the four currently-wired roles are exercised on production. Not before |
+
+### 10.9 Recommended migration sequence
+
+The audit's recommended order, restated:
+
+1. Implement per-order schema (§6.2) + store + atomic `apply_order_event` (§6.4).
+2. Migrate entry, normal exit, protective stop, and replacement-stop writers / recovery; carry the §10.1–§10.5 tests forward.
+3. Remove `_suspect_orders` / `_suspect_exit_orders` and reduce `LIFECYCLE_PENDING_GRACE_SECONDS` only after restart and mixed stream/REST tests pass against the new path.
+4. Rebuild PR #58 on the substrate (per §10.8).
+5. Wire MLEG orders in the separate spread lifecycle PR using the same table / API (per §10.7).
+
+Everything else in the May 29 – June 12 window (risk halt coverage, feed/cache work, watchlists, research filters, EOD summary, MLEG walk pricing itself) is independent of this foundation and remains untouched.
+
+---
+
+## 11. Ownership boundaries between the three tables
 
 Explicit so the implementation PR cannot silently expand any one table into another's responsibility.
 
@@ -811,13 +942,32 @@ PR #59 review-4 ("keep one persistence system") rejected an earlier draft that w
 
 ---
 
-## 11. Documentation updates required when foundation PR lands
+## 12. Documentation updates required when foundation PR lands
 
 The cross-workstream phase-boundary feedback notes that previously documented phase assumptions become stale once this foundation lands. The implementation PR must update:
 
 - **`PLAN.md`** — Live readiness gate row for slippage / operator controls needs to note that the foundation PR is in flight or merged, and that PR #58 is awaiting rebuild on it.
 - **`docs/operator_controls_proposal.md`** — §17 explicitly notes that `position_uid` adoption is "deferred organic." This is partly stale: single-leg option entry async callbacks already exist in code, and the foundation PR makes the per-order substrate first-class. The proposal should be amended to call out (a) the write-side substrate vs. read-side consumer split (per §7.1 of this doc), and (b) that the per-order table is now the substrate Phase C commands write into.
 - **`docs/slippage_unification_tracker.md`** — Phase 2 consumer migration scope did not previously contemplate reading pre-fill benchmark provenance from a lifecycle row. The tracker should note that the foundation PR persists this provenance, and that recovered-fill rows now have a durable source for the kind / quality tags rather than relying on `_suspect_orders` in memory.
-- **PR #58 description** — should be marked draft with a top comment listing what's blocked vs. cherry-pickable (per the operator's directive). Foundation PR description should link back to PR #58 for the rebuild scope.
+- **PR #58 description** — should be marked draft with a top comment listing what's blocked vs. cherry-pickable per §10.8 (lifecycle plumbing rebuilds; strategy / order-construction logic and pure tests can be cherry-picked). Foundation PR description should link back to PR #58 for the rebuild scope.
 
 These doc updates are a required part of the foundation PR, not a follow-up.
+
+### 12.1 Database-level regression tests the implementation PR must include
+
+Several findings during PR #59 review would have shipped as production bugs if not caught at the doc stage. The implementation PR must include database-level regression tests for each — these tests double as guards against re-introduction.
+
+| Test | Guards against | Source |
+|---|---|---|
+| Atomic `apply_order_event` with two unrelated `order_id`s where one has a stale `updated_at` — assert only the matching row updates | SQL precedence regression (review-3 P0) | §6.4 |
+| Terminal-state immutability — apply event with newer `updated_at` to a `filled` row; assert no update | Terminal regression (review-3 P1a) | §6.4 / §6.3 |
+| Side-signed rollup correctness — entry buy 10 + exit sell 10 produces `current_qty = 0`, not `20` | `SUM(filled_qty)` regression (review-3 P1b) | §6.6 |
+| MLEG two-row insert under foundation schema — `log_spread_fill` writes two rows sharing one combo `order_id`, both succeed | UNIQUE-scope regression (review-5 correction 1) | §6.5 |
+| UPSERT + partial-unique-index pair — INSERT...ON CONFLICT(order_id) WHERE order_id IS NOT NULL AND position_type='single_leg' DO UPDATE actually matches the partial index | SQLite UPSERT conflict-target alignment (review-5 correction 2) | §6.5 |
+| All-or-nothing transaction — force the trades UPSERT to fail mid-`apply_order_event`; assert per-order row, trades row, position rollup, and position-level status are all unchanged | One-transaction discipline (review-4 P1b) | §6.4 |
+| `execution_id` NULL on REST recovery path — cumulative-delta REST recovery does not fabricate execution_id | REST has no execution_id (review-4 P1a) | §6.5 |
+| `_suspect_orders` removal does not break TIMEOUT/UNKNOWN recovery — disable the cache and confirm the durable path covers every scenario the cache used to | §10.1 invariants survive migration | §10.1 |
+| `_suspect_exit_orders` removal — same shape, exit-side | §10.2 invariants survive migration | §10.2 |
+| `replacement_stop` atomic-replace — promote DAY → GTC; assert new row created AND replaced row advanced to `canceled` in one transaction | §10.3 atomic replacement requirement | §10.3 / §6.4 |
+
+The first three are explicit regressions where my earlier doc draft had the bug. The next two are the corrections from this review pass (review-5). The rest are correctness conditions the audit identified that the implementation must verify, not assume.
