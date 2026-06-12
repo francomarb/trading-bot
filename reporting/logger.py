@@ -424,10 +424,24 @@ class TradeLogger:
                 _CREATE_POSITION_LIFECYCLE_ORDERS_SQL,
                 _CREATE_POSITION_LIFECYCLE_ORDERS_INDEXES_SQL,
                 _UNIQ_ONE_ACTIVE_POSITION_PER_OWNER_KEY_SQL,
+                run_preflight_or_raise,
             )
             conn.execute(_CREATE_POSITION_LIFECYCLE_ORDERS_SQL)
             for index_sql in _CREATE_POSITION_LIFECYCLE_ORDERS_INDEXES_SQL:
                 conn.execute(index_sql)
+            # Migration preflight (PR #59 §12.2 / R7-P1b / R9-P1c).
+            # Detect pre-existing duplicate rows that would block the
+            # uniq_one_active_position_per_owner_key partial unique index.
+            # If any are found, raise MigrationDuplicatesFound — this
+            # is a fatal startup precondition; the operator must run
+            # scripts/migrate_dedupe_trades.py and retry. The bot does
+            # NOT continue in a partial-migration / legacy mode; that
+            # would let foundation writer code create more duplicates
+            # or produce silently wrong rollups. Preflight runs BEFORE
+            # the CREATE UNIQUE INDEX statement so the error surfaces
+            # with structured detail instead of as a generic SQLite
+            # constraint violation.
+            run_preflight_or_raise(conn)
             # Position-level partial unique index added to the existing
             # position_lifecycle table — durable cross-position
             # duplicate-entry prevention per PR #59 §6.2 / R6-1 / R8-3.

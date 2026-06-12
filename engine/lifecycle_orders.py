@@ -30,6 +30,9 @@ order in ``_ensure_db`` stays clean.
 
 from __future__ import annotations
 
+import sqlite3
+from dataclasses import dataclass, field
+
 
 # ── Schema version ──
 
@@ -248,3 +251,138 @@ CLOSE_SIDE_ROLES = frozenset({"exit", "partial_close"})
 STOP_SIDE_ROLES = frozenset({"protective_stop", "replacement_stop"})
 SELL_SIDE_ROLES = CLOSE_SIDE_ROLES | STOP_SIDE_ROLES
 ENTRY_SIDE_ROLES = frozenset({"entry_primary", "entry_residual"})
+
+
+# ── Migration preflight (discovery doc §12.2) ──
+
+
+# Status set used by the position-level uniq_one_active_position_per_owner_key
+# index. Preflight detection must mirror this set EXACTLY — if the
+# preflight check uses a different status filter than the index's
+# WHERE clause, duplicates that the index would reject can slip
+# through preflight and break CREATE UNIQUE INDEX at runtime
+# (PR #59 review-9 P1c).
+_OWNER_KEY_LOCK_STATUSES: tuple[str, ...] = (
+    "pending",
+    "open",
+    "partially_filled",
+    "error",
+)
+
+
+@dataclass(frozen=True)
+class OwnerKeyDuplicate:
+    """One duplicate owner_key cluster detected by preflight."""
+
+    owner_key: str
+    count: int
+    position_uids: tuple[str, ...] = field(default_factory=tuple)
+
+
+class MigrationDuplicatesFound(RuntimeError):
+    """Raised when preflight detects pre-existing duplicate rows that
+    would block a new UNIQUE INDEX from being created.
+
+    Per discovery doc §12.2 (PR #59 review-7 P1b): partial-migration
+    mode is NOT safe — foundation writer code assumes the unique
+    indexes exist. Continuing without them would either create more
+    duplicates or produce silently wrong rollups. The correct
+    behavior is to abort startup, force operator remediation
+    (`scripts/migrate_dedupe_trades.py` per §12.2), and retry on
+    the next startup once the operator has applied a decisions file.
+
+    The exception carries structured detail so the alert backend
+    and the operator dashboard can surface the affected rows.
+    """
+
+    def __init__(
+        self,
+        *,
+        owner_key_duplicates: tuple[OwnerKeyDuplicate, ...] = (),
+        message: str | None = None,
+    ) -> None:
+        self.owner_key_duplicates = owner_key_duplicates
+        if message is None:
+            parts: list[str] = []
+            if owner_key_duplicates:
+                parts.append(
+                    f"{len(owner_key_duplicates)} position_lifecycle.owner_key "
+                    f"duplicates"
+                )
+                for dup in owner_key_duplicates[:5]:
+                    parts.append(
+                        f"  - owner_key={dup.owner_key!r} "
+                        f"count={dup.count} "
+                        f"uids={dup.position_uids}"
+                    )
+                if len(owner_key_duplicates) > 5:
+                    parts.append(
+                        f"  ... and {len(owner_key_duplicates) - 5} more"
+                    )
+            parts.append(
+                "Pre-existing duplicates block the foundation PR's "
+                "uniq_one_active_position_per_owner_key partial unique "
+                "index. Run scripts/migrate_dedupe_trades.py (detection / "
+                "review / apply modes per discovery doc §12.2) and retry."
+            )
+            message = "\n".join(parts)
+        super().__init__(message)
+
+
+def detect_owner_key_duplicates(
+    conn: sqlite3.Connection,
+) -> tuple[OwnerKeyDuplicate, ...]:
+    """Detect duplicate owner_key clusters that would block the new
+    uniq_one_active_position_per_owner_key partial unique index.
+
+    The status set MUST match the index's WHERE clause exactly
+    (PR #59 review-9 P1c). Mismatched filters let duplicates slip
+    through preflight and surface as the much-less-helpful generic
+    SQLite UNIQUE constraint violation at index creation time.
+
+    Returns an empty tuple when the database is clean. Callers can
+    treat a non-empty result as a fatal precondition and raise
+    ``MigrationDuplicatesFound``.
+    """
+    status_placeholders = ", ".join("?" for _ in _OWNER_KEY_LOCK_STATUSES)
+    rows = conn.execute(
+        f"""
+        SELECT owner_key, COUNT(*) AS n,
+               GROUP_CONCAT(position_uid, ',') AS uids
+        FROM position_lifecycle
+        WHERE status IN ({status_placeholders})
+        GROUP BY owner_key
+        HAVING COUNT(*) > 1
+        ORDER BY owner_key
+        """,
+        _OWNER_KEY_LOCK_STATUSES,
+    ).fetchall()
+    duplicates: list[OwnerKeyDuplicate] = []
+    for owner_key, count, uids_csv in rows:
+        uids_tuple: tuple[str, ...] = (
+            tuple(uids_csv.split(",")) if uids_csv else ()
+        )
+        duplicates.append(
+            OwnerKeyDuplicate(
+                owner_key=owner_key,
+                count=int(count),
+                position_uids=uids_tuple,
+            )
+        )
+    return tuple(duplicates)
+
+
+def run_preflight_or_raise(conn: sqlite3.Connection) -> None:
+    """Run all migration preflight checks before applying foundation
+    PR's new UNIQUE INDEXes. Raises ``MigrationDuplicatesFound`` on
+    any conflict. Safe to call on every startup; runs fast (indexed
+    GROUP BY queries) when the database is clean.
+
+    Scope at commit 2: checks duplicates on the position_lifecycle
+    owner_key dimension. Commit 5 (trades schema migration) will
+    expand this to also check the trades.order_id /
+    position_type='single_leg' dimension.
+    """
+    duplicates = detect_owner_key_duplicates(conn)
+    if duplicates:
+        raise MigrationDuplicatesFound(owner_key_duplicates=duplicates)

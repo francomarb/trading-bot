@@ -25,7 +25,7 @@ Each commit is reviewable in isolation; each ends with green tests.
 |---|---|---|---|---|---|
 | 0 | Implementation tracker + PLAN.md pointer | n/a | ~150 | — | 🔄 In progress |
 | 1 | Schema: `position_lifecycle_orders` table + indexes + position-level UNIQUE + PRAGMA foreign_keys | §6.2 / R13-G1 | ~400 | 17 | 🔄 In progress |
-| 2 | Migration preflight: duplicate detection + abort-startup on conflict | §12.2 | ~150 | 3 | ⬜ |
+| 2 | Migration preflight: duplicate detection + abort-startup on conflict | §12.2 | ~250 | 12 | 🔄 In progress |
 | 3 | `PositionLifecycleOrdersStore` — CRUD operations on per-order rows | §6.2 / §6.3 | ~400 | 8 | ⬜ |
 | 4 | `apply_order_event` — atomic compare-and-set + trades UPSERT + rollup + status | §6.4 / §6.5 / §6.6 / §6.6.1 | ~500 | 10 | ⬜ |
 | 5 | Trades schema: `execution_id` column + UPSERT semantics + partial UNIQUE index | §6.5 / R5 fixes | ~200 | 4 | ⬜ |
