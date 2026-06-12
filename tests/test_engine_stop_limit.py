@@ -405,6 +405,218 @@ class TestHybridDispatchPlacement:
         assert kwargs.get("skip_lifecycle") is True
 
 
+# ── PR #58 R4 P1: hybrid residual not liquidated while primary is pending ──
+
+
+class TestRepairSweepSkipsHybridResidual:
+    """PR #58 R4 P1: while the primary STOP_LIMIT is still resting at
+    the broker, the fractional residual is the small leg of an active
+    hybrid entry, NOT an orphan. The repair sweep's fractional-residual
+    cleanup must defer until the primary triggers or the EOD orphan
+    sweep handles it."""
+
+    def test_has_pending_stop_limit_buy_detects_matching_order(self, tmp_path):
+        engine = _engine(tmp_path)
+        open_order = OpenOrder(
+            order_id="ord-stoplimit-pending",
+            symbol="QCOM",
+            side=Side.BUY,
+            qty=5,
+            order_type=OrderType.STOP_LIMIT,
+            status="accepted",
+            submitted_at=T0,
+            limit_price=257.0,
+            stop_price=245.0,
+            client_order_id="donchian_breakout-pending1",
+            time_in_force="day",
+        )
+        snap = _snapshot(open_orders=[open_order])
+        assert engine._has_pending_stop_limit_buy(
+            symbol="QCOM", strategy="donchian_breakout", snapshot=snap,
+        ) is True
+
+    def test_has_pending_stop_limit_buy_ignores_wrong_strategy_prefix(self, tmp_path):
+        engine = _engine(tmp_path)
+        open_order = OpenOrder(
+            order_id="ord-stoplimit-other",
+            symbol="QCOM",
+            side=Side.BUY,
+            qty=5,
+            order_type=OrderType.STOP_LIMIT,
+            status="accepted",
+            submitted_at=T0,
+            limit_price=257.0,
+            stop_price=245.0,
+            client_order_id="sma_crossover-other",
+            time_in_force="day",
+        )
+        snap = _snapshot(open_orders=[open_order])
+        assert engine._has_pending_stop_limit_buy(
+            symbol="QCOM", strategy="donchian_breakout", snapshot=snap,
+        ) is False
+
+    def test_has_pending_stop_limit_buy_ignores_other_types(self, tmp_path):
+        engine = _engine(tmp_path)
+        open_order = OpenOrder(
+            order_id="ord-mkt-1",
+            symbol="QCOM",
+            side=Side.BUY,
+            qty=5,
+            order_type=OrderType.MARKET,
+            status="accepted",
+            submitted_at=T0,
+            limit_price=None,
+            stop_price=None,
+            client_order_id="donchian_breakout-mkt1",
+            time_in_force="day",
+        )
+        snap = _snapshot(open_orders=[open_order])
+        assert engine._has_pending_stop_limit_buy(
+            symbol="QCOM", strategy="donchian_breakout", snapshot=snap,
+        ) is False
+
+
+# ── PR #58 R4 P2: residual fill amends primary lifecycle row ────────────────
+
+
+class TestAmendLifecycleForResidualFill:
+    """PR #58 R4 P2: when the residual MARKET fills, the primary's
+    lifecycle row must be updated so current_qty + avg_entry_price
+    reflect the aggregated broker-side position."""
+
+    def test_open_row_aggregated_qty_and_weighted_basis(self, tmp_path):
+        from types import SimpleNamespace as _NS
+        engine = _engine(tmp_path)
+        store = MagicMock()
+        row = _NS(
+            position_uid="pos-uid-primary",
+            status="open",
+            current_qty=5.0,
+            avg_entry_price=245.0,
+        )
+        store.get_by_position_uid.return_value = row
+        engine.lifecycle_store = store
+
+        engine._amend_lifecycle_for_residual_fill(
+            primary_position_uid="pos-uid-primary",
+            residual_qty=0.88,
+            residual_avg_price=246.0,
+        )
+        store.mark_open.assert_called_once()
+        kwargs = store.mark_open.call_args.kwargs
+        assert kwargs["position_uid"] == "pos-uid-primary"
+        # qty = 5.0 + 0.88 = 5.88
+        assert kwargs["current_qty"] == pytest.approx(5.88)
+        # basis = (5*245 + 0.88*246) / 5.88 ≈ 245.15
+        expected = (5.0 * 245.0 + 0.88 * 246.0) / 5.88
+        assert kwargs["avg_entry_price"] == pytest.approx(expected)
+
+    def test_pending_row_amendment_deferred(self, tmp_path):
+        """Primary still resting at broker (status=pending) → must NOT
+        call mark_open, because the broker's later fill callback would
+        clobber the aggregation."""
+        from types import SimpleNamespace as _NS
+        engine = _engine(tmp_path)
+        store = MagicMock()
+        row = _NS(
+            position_uid="pos-uid-primary",
+            status="pending",
+            current_qty=5.0,
+            avg_entry_price=245.0,
+        )
+        store.get_by_position_uid.return_value = row
+        engine.lifecycle_store = store
+
+        engine._amend_lifecycle_for_residual_fill(
+            primary_position_uid="pos-uid-primary",
+            residual_qty=0.88,
+            residual_avg_price=246.0,
+        )
+        store.mark_open.assert_not_called()
+
+    def test_no_position_uid_is_noop(self, tmp_path):
+        engine = _engine(tmp_path)
+        store = MagicMock()
+        engine.lifecycle_store = store
+        engine._amend_lifecycle_for_residual_fill(
+            primary_position_uid=None,
+            residual_qty=0.88,
+            residual_avg_price=246.0,
+        )
+        store.get_by_position_uid.assert_not_called()
+        store.mark_open.assert_not_called()
+
+    def test_no_lifecycle_store_is_noop(self, tmp_path):
+        engine = _engine(tmp_path)
+        engine.lifecycle_store = None
+        # Just must not raise.
+        engine._amend_lifecycle_for_residual_fill(
+            primary_position_uid="pos-uid-primary",
+            residual_qty=0.88,
+            residual_avg_price=246.0,
+        )
+
+    def test_invalid_residual_qty_or_price_is_noop(self, tmp_path):
+        engine = _engine(tmp_path)
+        store = MagicMock()
+        engine.lifecycle_store = store
+        engine._amend_lifecycle_for_residual_fill(
+            primary_position_uid="pos-uid-primary",
+            residual_qty=0,
+            residual_avg_price=246.0,
+        )
+        engine._amend_lifecycle_for_residual_fill(
+            primary_position_uid="pos-uid-primary",
+            residual_qty=0.88,
+            residual_avg_price=None,
+        )
+        engine._amend_lifecycle_for_residual_fill(
+            primary_position_uid="pos-uid-primary",
+            residual_qty=0.88,
+            residual_avg_price=0,
+        )
+        store.get_by_position_uid.assert_not_called()
+        store.mark_open.assert_not_called()
+
+    def test_residual_submission_threads_primary_uid_to_amend(self, tmp_path):
+        """End-to-end: the residual-submission helper passes the primary's
+        position_uid through to the amend helper after a successful fill."""
+        engine = _engine(tmp_path)
+        residual = RiskDecision(
+            symbol="QCOM",
+            side=Side.BUY,
+            qty=0.88,
+            entry_reference_price=245.0,
+            stop_price=230.0,
+            strategy_name="donchian_breakout",
+            reason="test",
+            order_type=OrderType.MARKET,
+        )
+        engine.broker.place_order.return_value = OrderResult(
+            status=OrderStatus.FILLED,
+            order_id="ord-residual-2",
+            symbol="QCOM",
+            requested_qty=0.88,
+            filled_qty=0.88,
+            avg_fill_price=246.0,
+            raw_status="filled",
+            message="ok",
+        )
+        engine._record_fill = MagicMock()
+        engine._log_entry = MagicMock()
+        engine._amend_lifecycle_for_residual_fill = MagicMock()
+        engine._submit_stop_limit_residual(
+            residual,
+            "donchian_breakout",
+            primary_position_uid="pos-uid-primary-real",
+        )
+        engine._amend_lifecycle_for_residual_fill.assert_called_once()
+        kwargs = engine._amend_lifecycle_for_residual_fill.call_args.kwargs
+        assert kwargs["primary_position_uid"] == "pos-uid-primary-real"
+        assert kwargs["residual_qty"] == 0.88
+        assert kwargs["residual_avg_price"] == 246.0
+
+
 class TestCancelStaleStopLimitEntries:
     def _open_order(self, *, order_type=OrderType.STOP_LIMIT, side=Side.BUY,
                    order_id="ord-stoplimit-1", symbol="QCOM",

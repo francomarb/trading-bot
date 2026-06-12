@@ -1749,7 +1749,13 @@ class TradingEngine:
                     OrderStatus.PARTIAL,
                 }
             ):
-                self._submit_stop_limit_residual(residual_decision, strategy.name)
+                # PR #58 R4 P2: pass the primary's position_uid so the
+                # residual's fill amends the same lifecycle row.
+                self._submit_stop_limit_residual(
+                    residual_decision,
+                    strategy.name,
+                    primary_position_uid=result.position_uid,
+                )
             if result.status is OrderStatus.UNKNOWN:
                 # Preserve the benchmark provenance so the recovery row
                 # (codepath §9) tags the right kind/quality if this
@@ -2178,10 +2184,85 @@ class TradingEngine:
         )
         return whole, residual
 
+    def _amend_lifecycle_for_residual_fill(
+        self,
+        *,
+        primary_position_uid: str | None,
+        residual_qty: float,
+        residual_avg_price: float | None,
+    ) -> None:
+        """PR #58 R4 P2: when the fractional residual fills, amend the
+        primary's lifecycle row so its current_qty + avg_entry_price
+        reflect the aggregated position. Without this, the operator CLI
+        and dashboard show the primary's intended qty only and miss the
+        residual's contribution to the actual broker-side position.
+
+        Scope: only fires when the primary's lifecycle row is already in
+        'open' status (the primary fill landed first — the common case
+        when live >= trigger at submission, since the broker triggers
+        the stop on the first tick at-or-above the stop_price).
+
+        Deferred case: if the primary is still 'pending' when the
+        residual fills, amending here would be clobbered by the broker's
+        eventual fill callback (mark_open overrides current_qty rather
+        than aggregating). In that interim the residual is captured in
+        the trade DB via _log_entry; the lifecycle row catches up when
+        the primary fills (whole-share qty only — a small gap accepted
+        as the trade-off for the resting-primary path)."""
+        if (
+            primary_position_uid is None
+            or self.lifecycle_store is None
+            or residual_qty <= 0
+            or residual_avg_price is None
+            or residual_avg_price <= 0
+        ):
+            return
+        try:
+            row = self.lifecycle_store.get_by_position_uid(primary_position_uid)
+            if row is None:
+                logger.debug(
+                    f"[PLAN 11.47] residual fill not amended into "
+                    f"lifecycle row {primary_position_uid}: row missing"
+                )
+                return
+            if row.status != "open":
+                logger.info(
+                    f"[PLAN 11.47] residual fill deferred for lifecycle "
+                    f"row {primary_position_uid}: primary status="
+                    f"{row.status} (will not aggregate until primary "
+                    f"transitions to open)"
+                )
+                return
+            old_qty = float(row.current_qty)
+            old_basis = float(row.avg_entry_price)
+            new_qty = old_qty + float(residual_qty)
+            if new_qty <= 0:
+                return
+            new_basis = (
+                old_qty * old_basis + float(residual_qty) * float(residual_avg_price)
+            ) / new_qty
+            self.lifecycle_store.mark_open(
+                position_uid=primary_position_uid,
+                avg_entry_price=new_basis,
+                current_qty=new_qty,
+            )
+            logger.info(
+                f"[PLAN 11.47] amended lifecycle {primary_position_uid}: "
+                f"qty {old_qty} → {new_qty}, "
+                f"basis ${old_basis:.4f} → ${new_basis:.4f} "
+                f"(residual fill qty={residual_qty} @ ${residual_avg_price:.4f})"
+            )
+        except Exception as exc:
+            logger.warning(
+                f"[PLAN 11.47] amend lifecycle failed for "
+                f"{primary_position_uid}: {exc}"
+            )
+
     def _submit_stop_limit_residual(
         self,
         residual: RiskDecision,
         strategy_name: str,
+        primary_position_uid: str | None = None,
     ) -> None:
         """Submit the fractional MARKET residual after the primary
         STOP_LIMIT has been placed. Logged, slippage-recorded via the
@@ -2228,6 +2309,14 @@ class TradingEngine:
                         "arrival_midpoint" if arrival_price is not None
                         else "fallback_reference_price"
                     ),
+                )
+                # PR #58 R4 P2: amend the primary's lifecycle row so its
+                # current_qty + avg_entry_price reflect the aggregated
+                # broker-side position (primary + residual).
+                self._amend_lifecycle_for_residual_fill(
+                    primary_position_uid=primary_position_uid,
+                    residual_qty=float(result.filled_qty or 0.0),
+                    residual_avg_price=result.avg_fill_price,
                 )
         except Exception as e:
             logger.warning(
@@ -3990,6 +4079,45 @@ class TradingEngine:
         )
         return True
 
+    def _has_pending_stop_limit_buy(
+        self,
+        *,
+        symbol: str,
+        strategy: str,
+        snapshot: BrokerSnapshot,
+    ) -> bool:
+        """PR #58 R4 P1: True when the broker has an open STOP_LIMIT BUY
+        for this symbol with a bot-owned client_order_id prefix matching
+        the given strategy. Used by _repair_missing_protective_stops to
+        recognize that a fractional position with no protective stop is
+        the intentional residual leg of an active hybrid Donchian entry
+        — the primary STOP_LIMIT is still resting at the broker awaiting
+        the breakout trigger; the residual is NOT an orphan and must
+        not be liquidated."""
+        prefix = f"{strategy}-"
+        for order in getattr(snapshot, "open_orders", []) or []:
+            order_type = getattr(order, "order_type", None)
+            type_val = (
+                order_type.value
+                if hasattr(order_type, "value")
+                else str(order_type or "")
+            ).lower()
+            if type_val != "stop_limit":
+                continue
+            side = getattr(order, "side", None)
+            side_val = (
+                side.value if hasattr(side, "value") else str(side or "")
+            ).lower()
+            if side_val != "buy":
+                continue
+            if getattr(order, "symbol", None) != symbol:
+                continue
+            client_id = getattr(order, "client_order_id", None)
+            if not isinstance(client_id, str) or not client_id.startswith(prefix):
+                continue
+            return True
+        return False
+
     def _repair_missing_protective_stops(
         self,
         snapshot: BrokerSnapshot,
@@ -4003,6 +4131,15 @@ class TradingEngine:
         some positions unprotected because attached stops were submitted as DAY.
         This reconciliation restores the original fixed stop from the trade log
         whenever a managed position has no broker-side stop order.
+
+        PR #58 R4 P1: residual-cleanup branch skips fractional positions
+        that are the small leg of an active hybrid Donchian entry. While
+        the primary STOP_LIMIT is still resting at the broker, the
+        residual sits as an unprotected fractional position by design
+        (the primary's OTO bracket protects the whole-share leg; the
+        residual is small and exits via engine signals). The orphan
+        sweep at EOD (_close_orphan_stop_limit_residuals) closes it
+        deterministically only when the primary has timed out.
         """
         for symbol, position in snapshot.account.open_positions.items():
             if _OCC_PAT.match(symbol):
@@ -4018,6 +4155,16 @@ class TradingEngine:
                 if str(existing.time_in_force or "").lower() != "day":
                     continue
                 if stop_qty < 1:
+                    if self._has_pending_stop_limit_buy(
+                        symbol=symbol, strategy=owner, snapshot=snapshot,
+                    ):
+                        logger.debug(
+                            f"{symbol}: fractional residual paired with "
+                            f"pending STOP_LIMIT BUY (strategy={owner}); "
+                            f"skipping residual cleanup until primary "
+                            f"triggers or EOD orphan sweep"
+                        )
+                        continue
                     if allow_residual_cleanup:
                         self._close_fractional_residual_position(
                             snapshot=snapshot,
@@ -4082,6 +4229,16 @@ class TradingEngine:
                     continue
 
             if stop_qty < 1:
+                if self._has_pending_stop_limit_buy(
+                    symbol=symbol, strategy=owner, snapshot=snapshot,
+                ):
+                    logger.debug(
+                        f"{symbol}: fractional residual paired with "
+                        f"pending STOP_LIMIT BUY (strategy={owner}); "
+                        f"skipping residual cleanup until primary "
+                        f"triggers or EOD orphan sweep"
+                    )
+                    continue
                 if allow_residual_cleanup:
                     self._close_fractional_residual_position(
                         snapshot=snapshot,
