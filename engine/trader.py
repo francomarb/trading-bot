@@ -231,12 +231,22 @@ class SuspectOrder:
     the live row would have written. Defaults to 'unavailable' so
     legacy SuspectOrder constructions remain safe — recovery then
     writes NULL slippage rather than fabricating a kind.
+
+    PR #58 R7 P1 #3: ``position_uid`` captures the lifecycle row id
+    minted at submission. Recovery passes it through to ``_log_entry``
+    so the recovered trade row stays linked. ``position_uid_override``
+    is set when this suspect order is a hybrid RESIDUAL — it carries
+    the PRIMARY's position_uid so the residual's recovered row links
+    to the primary's lifecycle row (same semantics as the live-path
+    R5 P1 #2 fix).
     """
 
     decision: RiskDecision
     order_id: str
     modeled_price: float
     modeled_price_kind: str = "unavailable"
+    position_uid: str | None = None
+    position_uid_override: str | None = None
 
 
 @dataclass(frozen=True)
@@ -421,6 +431,11 @@ class TradingEngine:
         # after submit). These are the only unknown positions we will ever try
         # to adopt automatically.
         self._suspect_orders: dict[str, SuspectOrder] = {}
+        # PR #58 R7 P1 #2: residual suspect orders live in a separate
+        # dict so they don't collide with the primary STOP_LIMIT's entry
+        # in _suspect_orders (both are keyed by symbol). The recovery
+        # pass iterates both maps.
+        self._suspect_residual_orders: dict[str, SuspectOrder] = {}
         self._suspect_exit_orders: dict[str, SuspectExitOrder] = {}
 
         # PR #58 R5 P1 #2: hybrid residual fills that landed while the
@@ -688,6 +703,18 @@ class TradingEngine:
         except Exception as exc:
             logger.warning(
                 f"failed to reconstruct pending residual amendments: {exc}"
+            )
+
+        # PR #58 R7 P1 #4: reconstruct the primary STOP_LIMIT suspect-
+        # order cache from broker open_orders + the lifecycle store. A
+        # bot restart while a Donchian primary is resting would otherwise
+        # lose the exact-order recovery handle, and the order would fill
+        # later with no trade-DB record or lifecycle transition.
+        try:
+            self._restore_suspect_orders_from_broker(startup_snapshot)
+        except Exception as exc:
+            logger.warning(
+                f"failed to reconstruct suspect orders from broker state: {exc}"
             )
 
         slot_desc = ", ".join(
@@ -1752,7 +1779,17 @@ class TradingEngine:
         else:
             slippage_kind = None  # build_record will default to 'unavailable'
         try:
-            result = self.broker.place_order(decision)
+            # PR #58 R7 P1 #6: STOP_LIMIT orders rest at the broker;
+            # don't block the engine's serial symbol loop for the full
+            # 240s waiting for them to fill. Short poll catches the
+            # immediate-trigger case (live > trigger at submission);
+            # everything else returns TIMEOUT and lets the engine move on.
+            _poll_timeout = (
+                settings.STOP_LIMIT_CONFIRM_TIMEOUT_SECONDS
+                if decision.order_type is OrderType.STOP_LIMIT
+                else settings.ORDER_CONFIRM_TIMEOUT_SECONDS
+            )
+            result = self.broker.place_order(decision, poll_timeout=_poll_timeout)
             # PLAN 11.10f: lifecycle counter — submitted increments
             # once per place_order call (regardless of fill status).
             # ACCEPTED, FILLED, PARTIAL, UNKNOWN all count as submitted
@@ -2206,12 +2243,27 @@ class TradingEngine:
                 # Explicit skip — caller (entry-submit path) sees None
                 # primary and does not attempt any broker submission.
                 return None, None
+            # PR #58 R7 P1 #5: parity with the hybrid residual gate —
+            # pure-fractional fallback must ALSO refuse to chase above
+            # the cap. The hybrid residual checks both gates at submission
+            # (R6 P1 #4); without the same check here, a gap-up beyond
+            # the chase cap would still let the pure-fractional MARKET
+            # fire uncapped.
+            chase_ceiling = decision.entry_max_price
+            if chase_ceiling is not None and live > chase_ceiling:
+                logger.warning(
+                    f"[entry-guard] {decision.symbol}: STOP_LIMIT sized to "
+                    f"qty={decision.qty} < 1 whole share AND live "
+                    f"${live:.2f} > chase ceiling ${chase_ceiling:.2f}; "
+                    f"skipping entry (chase gate on pure-fractional fallback)"
+                )
+                return None, None
             logger.warning(
                 f"[entry-guard] {decision.symbol}: STOP_LIMIT sized to "
                 f"qty={decision.qty} < 1 whole share; falling back to "
                 f"MARKET (structural stop-limit protection unavailable; "
-                f"residual gate confirmed live=${live:.2f} >= "
-                f"trigger=${trigger:.2f})"
+                f"residual gate confirmed trigger=${trigger:.2f} ≤ "
+                f"live=${live:.2f} ≤ ceiling=${chase_ceiling:.2f})"
             )
             return (
                 replace(
@@ -2265,6 +2317,150 @@ class TradingEngine:
         )
         return whole, residual
 
+    def _restore_suspect_orders_from_broker(
+        self, snapshot: BrokerSnapshot
+    ) -> None:
+        """PR #58 R7 P1 #4: rehydrate _suspect_orders from broker state.
+
+        For each open broker order that looks like a bot-submitted entry
+        (client_order_id matches a known strategy prefix) AND whose
+        symbol/strategy combination has no existing _suspect_orders
+        entry, reconstruct a SuspectOrder so _recover_suspect_orders
+        adopts the eventual fill instead of leaving it as an unowned
+        broker position. The fill is then properly recorded to the
+        trade DB and lifecycle row.
+
+        Scoping: only fires for STOP_LIMIT BUY orders — the order shape
+        whose normal happy path is 'rest at broker, fill later.' Other
+        order types complete synchronously inside place_order so their
+        lifecycle is already managed by the broker's mark_filled hook.
+        Limits ambient blast radius if a future change adds an unrelated
+        resting order type."""
+        if self.lifecycle_store is None or self.trade_logger is None:
+            return
+        known_prefixes = tuple(f"{slot.strategy.name}-" for slot in self.slots)
+        if not known_prefixes:
+            return
+        restored = 0
+        for order in getattr(snapshot, "open_orders", []) or []:
+            order_type = getattr(order, "order_type", None)
+            type_val = (
+                order_type.value
+                if hasattr(order_type, "value")
+                else str(order_type or "")
+            ).lower()
+            if type_val != "stop_limit":
+                continue
+            side = getattr(order, "side", None)
+            side_val = (
+                side.value if hasattr(side, "value") else str(side or "")
+            ).lower()
+            if side_val != "buy":
+                continue
+            client_id = getattr(order, "client_order_id", None)
+            if not isinstance(client_id, str) or not client_id.startswith(known_prefixes):
+                continue
+            symbol = getattr(order, "symbol", None)
+            if not symbol:
+                continue
+            if symbol in self._suspect_orders:
+                continue
+            broker_order_id = (
+                getattr(order, "order_id", None) or getattr(order, "id", None)
+            )
+            if not broker_order_id:
+                continue
+            # Identify which strategy this order belongs to.
+            owning_strategy = None
+            for slot in self.slots:
+                if client_id.startswith(f"{slot.strategy.name}-"):
+                    owning_strategy = slot.strategy.name
+                    break
+            if owning_strategy is None:
+                continue
+            # Reconstruct a minimal RiskDecision from broker order data
+            # + strategy defaults. The recovered fill will be tagged
+            # with measurement_quality='recovered'; missing fields
+            # (modeled_price) come back as the broker's reported
+            # stop_price (the closest 'arrival benchmark' we still have).
+            trigger_price = getattr(order, "stop_price", None)
+            limit_price = getattr(order, "limit_price", None)
+            qty_attr = getattr(order, "qty", None)
+            try:
+                trigger_price_f = (
+                    float(trigger_price) if trigger_price is not None else None
+                )
+                limit_price_f = (
+                    float(limit_price) if limit_price is not None else None
+                )
+                qty_f = float(qty_attr) if qty_attr is not None else None
+            except (TypeError, ValueError):
+                continue
+            if (
+                trigger_price_f is None
+                or limit_price_f is None
+                or qty_f is None
+                or qty_f <= 0
+            ):
+                continue
+            # Match to lifecycle row via client_order_id.
+            position_uid: str | None = None
+            try:
+                # Use the owner_key lookup as the link — the lifecycle
+                # row's owner_key is derived from the symbol.
+                row = self.lifecycle_store.get_open_for_owner_key(
+                    owner_key_for(symbol)
+                )
+                if row is not None:
+                    position_uid = row.position_uid
+            except Exception:
+                position_uid = None
+            from risk.manager import RiskDecision as _RD
+            try:
+                decision = _RD(
+                    symbol=symbol,
+                    side=Side.BUY,
+                    qty=qty_f,
+                    entry_reference_price=trigger_price_f,
+                    stop_price=trigger_price_f * 0.94,  # conservative
+                    strategy_name=owning_strategy,
+                    reason="restored from broker open order",
+                    order_type=OrderType.STOP_LIMIT,
+                    entry_trigger_price=trigger_price_f,
+                    entry_max_price=limit_price_f,
+                )
+            except Exception as exc:
+                logger.debug(
+                    f"[PLAN 11.47] could not rebuild RiskDecision for "
+                    f"resting order {broker_order_id}: {exc}"
+                )
+                continue
+            result = OrderResult(
+                status=OrderStatus.TIMEOUT,
+                order_id=str(broker_order_id),
+                symbol=symbol,
+                requested_qty=qty_f,
+                filled_qty=0,
+                avg_fill_price=None,
+                raw_status="restored",
+                message="restored from broker open_orders at startup",
+                position_uid=position_uid,
+            )
+            self._suspect_orders[symbol] = SuspectOrder(
+                decision=decision,
+                order_id=str(broker_order_id),
+                modeled_price=trigger_price_f,
+                modeled_price_kind="fallback_reference_price",
+                position_uid=position_uid,
+                position_uid_override=None,
+            )
+            restored += 1
+        if restored:
+            logger.info(
+                f"[PLAN 11.47] restored {restored} STOP_LIMIT suspect-"
+                f"order recovery handle(s) from broker open_orders"
+            )
+
     def _restore_pending_residual_amendments(self) -> None:
         """PR #58 R6 P1 #3: reconstruct the in-memory pending-residual-
         amendment cache from the trade DB at startup.
@@ -2317,9 +2513,11 @@ class TradingEngine:
                 weighted_sum += q * p
             if total_qty <= 0 or weighted_sum <= 0:
                 continue
+            # PR #58 R7 P1 #1: pending rows have current_qty=0; the
+            # intended whole-share qty lives in entry_qty.
             self._pending_residual_amendments[row.position_uid] = {
                 "owner_key": row.owner_key,
-                "primary_qty": float(row.current_qty),
+                "primary_qty": float(row.entry_qty or 0.0),
                 "residual_qty": total_qty,
                 "residual_avg_price": weighted_sum / total_qty,
                 "recorded_at": "startup_restore",
@@ -2494,9 +2692,15 @@ class TradingEngine:
                 # filled (broker reports 0.88 shares) — that state is
                 # still 'pending primary' and the EOD orphan sweep
                 # handles cleanup if the primary never triggers.
+                # PR #58 R7 P1 #1: primary_qty must come from entry_qty
+                # (intended whole-share qty at submission) NOT current_qty
+                # (which is 0 for pending rows). Without this, the drain
+                # check `broker_qty >= primary_qty` becomes `broker_qty
+                # >= 0` and transitions the row on residual-only state.
+                primary_qty = float(row.entry_qty or 0.0)
                 self._pending_residual_amendments[primary_position_uid] = {
                     "owner_key": row.owner_key,
-                    "primary_qty": float(row.current_qty),
+                    "primary_qty": primary_qty,
                     "residual_qty": float(residual_qty),
                     "residual_avg_price": float(residual_avg_price),
                     "recorded_at": datetime.now(timezone.utc).isoformat(),
@@ -2505,8 +2709,9 @@ class TradingEngine:
                     f"[PLAN 11.47] residual fill cached for lifecycle "
                     f"row {primary_position_uid}: primary status="
                     f"{row.status}, owner_key={row.owner_key}, "
-                    f"primary_qty={row.current_qty} (will reconcile when "
-                    f"broker reports the whole-share leg filled)"
+                    f"primary_qty={primary_qty} (entry_qty; will "
+                    f"reconcile when broker reports the whole-share "
+                    f"leg filled)"
                 )
                 return
             old_qty = float(row.current_qty)
@@ -2631,14 +2836,13 @@ class TradingEngine:
                     residual_avg_price=result.avg_fill_price,
                 )
             elif result.status in {OrderStatus.TIMEOUT, OrderStatus.UNKNOWN}:
-                # PR #58 R6 P1 #5: residual fill confirmation is
-                # ambiguous. Register the order in the suspect-order
-                # recovery cache so _recover_suspect_orders picks it up
-                # on the next cycle, reconciles via REST, and adopts the
-                # fill into the trade DB + lifecycle row if it landed.
-                # Without this, a TIMEOUT/UNKNOWN residual whose fill
-                # landed at the broker would be silently dropped from the
-                # engine's view.
+                # PR #58 R6 P1 #5 + R7 P1 #2/#3: residual fill
+                # confirmation is ambiguous. Route into the SEPARATE
+                # _suspect_residual_orders map so the residual doesn't
+                # collide with any primary suspect-order entry for the
+                # same symbol. Tag with primary_position_uid so the
+                # recovered trade row links to the primary's lifecycle
+                # row (parallels the live R5 P1 #2 fix).
                 self._remember_suspect_order(
                     residual,
                     result,
@@ -2647,6 +2851,8 @@ class TradingEngine:
                         "arrival_midpoint" if arrival_price is not None
                         else "fallback_reference_price"
                     ),
+                    position_uid_override=primary_position_uid,
+                    is_residual=True,
                 )
                 logger.warning(
                     f"[{strategy_name}] {residual.symbol}: residual MARKET "
@@ -2669,6 +2875,8 @@ class TradingEngine:
         *,
         modeled_price: float,
         modeled_price_kind: str = "unavailable",
+        position_uid_override: str | None = None,
+        is_residual: bool = False,
     ) -> None:
         """
         Persist a narrow recovery handle for submit-succeeded/confirm-failed
@@ -2679,6 +2887,14 @@ class TradingEngine:
         'fallback_latest_close') so the recovered row gets the same
         kind/quality tagging the live row would have written. Defect 2
         of the first-pass review fix.
+
+        PR #58 R7 P1 #2 + #3:
+          - ``is_residual=True`` routes the cache entry to the separate
+            ``_suspect_residual_orders`` map so a primary + residual for
+            the same symbol do not overwrite each other.
+          - ``position_uid_override`` carries the primary's position_uid
+            for residual entries so the recovered residual trade row
+            links to the primary's lifecycle row.
         """
         if result.order_id is None:
             msg = (
@@ -2690,15 +2906,22 @@ class TradingEngine:
             self.alerts.broker_error(msg)
             return
 
-        self._suspect_orders[decision.symbol] = SuspectOrder(
+        suspect = SuspectOrder(
             decision=decision,
             order_id=result.order_id,
             modeled_price=modeled_price,
             modeled_price_kind=modeled_price_kind,
+            position_uid=getattr(result, "position_uid", None),
+            position_uid_override=position_uid_override,
         )
+        if is_residual:
+            self._suspect_residual_orders[decision.symbol] = suspect
+        else:
+            self._suspect_orders[decision.symbol] = suspect
         logger.warning(
-            f"{decision.symbol}: staged suspect order recovery for "
-            f"{result.order_id} [{decision.strategy_name}]"
+            f"{decision.symbol}: staged suspect "
+            f"{'residual' if is_residual else 'primary'} order recovery "
+            f"for {result.order_id} [{decision.strategy_name}]"
         )
 
     def _recover_suspect_orders(self, snapshot: BrokerSnapshot) -> None:
@@ -2749,6 +2972,10 @@ class TradingEngine:
                 # the live row would have written. Quality is forced to
                 # 'recovered' so downstream consumers can isolate
                 # reconstructed rows. Defect 2 fix.
+                # PR #58 R7 P1 #3: preserve primary's position_uid on
+                # the recovered trade row. Without this, reconcile_submitted_order
+                # returns an OrderResult with position_uid=None and the
+                # recovered trade row would be unlinked from the lifecycle.
                 self._log_entry(
                     suspect.decision,
                     result,
@@ -2756,7 +2983,24 @@ class TradingEngine:
                     timestamp_override=result.filled_at or result.submitted_at,
                     benchmark_kind=suspect.modeled_price_kind,
                     measurement_quality="recovered",
+                    position_uid_override=suspect.position_uid,
                 )
+                # PR #58 R7 P1 #3: propagate primary fill into the
+                # lifecycle row that was minted at submission. Without
+                # this, the row stays 'pending' forever even after the
+                # broker reports the fill.
+                if suspect.position_uid is not None and self.lifecycle_store is not None:
+                    try:
+                        self.lifecycle_store.mark_open(
+                            position_uid=suspect.position_uid,
+                            avg_entry_price=float(fill_price),
+                            current_qty=float(fill_qty),
+                        )
+                    except Exception as exc:
+                        logger.warning(
+                            f"{symbol}: lifecycle mark_open during recovery "
+                            f"failed for {suspect.position_uid}: {exc}"
+                        )
                 self._register_single_leg(
                     strategy_name=suspect.decision.strategy_name,
                     symbol=symbol,
@@ -2789,6 +3033,71 @@ class TradingEngine:
                 "dropping recovery state without adopting"
             )
             self._suspect_orders.pop(symbol, None)
+
+        # PR #58 R7 P1 #2 + #3: recover residual suspect orders from the
+        # separate cache. Residuals do not register ownership / fire
+        # alerts / place protective stops — the primary handled all that.
+        # The residual recovery is narrower: confirm the fill at the
+        # broker, write the linked trade row, and (if the primary's
+        # lifecycle row exists in 'open' status) amend qty + basis.
+        for symbol, suspect in list(self._suspect_residual_orders.items()):
+            try:
+                result = self.broker.reconcile_submitted_order(
+                    order_id=suspect.order_id,
+                    symbol=symbol,
+                    requested_qty=suspect.decision.qty,
+                )
+            except Exception as e:
+                logger.warning(
+                    f"{symbol}: residual suspect order {suspect.order_id} "
+                    f"reconciliation failed: {e}"
+                )
+                continue
+
+            if result.status in {OrderStatus.PENDING, OrderStatus.ACCEPTED}:
+                continue
+            if result.status in {OrderStatus.CANCELED, OrderStatus.REJECTED, OrderStatus.TIMEOUT}:
+                logger.warning(
+                    f"{symbol}: residual suspect order {suspect.order_id} "
+                    f"resolved as {result.status.value}; dropping recovery state"
+                )
+                self._suspect_residual_orders.pop(symbol, None)
+                continue
+            if result.status in {OrderStatus.FILLED, OrderStatus.PARTIAL}:
+                self._record_fill(
+                    result,
+                    modeled_price=suspect.modeled_price,
+                    order_type=suspect.decision.order_type.value,
+                    side=suspect.decision.side.value,
+                )
+                self._log_entry(
+                    suspect.decision,
+                    result,
+                    suspect.modeled_price,
+                    timestamp_override=result.filled_at or result.submitted_at,
+                    benchmark_kind=suspect.modeled_price_kind,
+                    measurement_quality="recovered",
+                    position_uid_override=suspect.position_uid_override,
+                )
+                self._amend_lifecycle_for_residual_fill(
+                    primary_position_uid=suspect.position_uid_override,
+                    residual_qty=float(result.filled_qty or 0.0),
+                    residual_avg_price=result.avg_fill_price,
+                )
+                logger.warning(
+                    f"{symbol}: recovered filled residual suspect order "
+                    f"{suspect.order_id} (linked to primary "
+                    f"position_uid={suspect.position_uid_override})"
+                )
+                self._suspect_residual_orders.pop(symbol, None)
+                continue
+
+            logger.warning(
+                f"{symbol}: residual suspect order {suspect.order_id} "
+                f"resolved as {result.status.value} but is not terminal/"
+                f"filled — dropping recovery state without adopting"
+            )
+            self._suspect_residual_orders.pop(symbol, None)
 
     def _ensure_recovered_protective_stop(
         self,

@@ -524,6 +524,7 @@ class TestAmendLifecycleForResidualFill:
         row = _NS(
             position_uid="pos-uid-primary",
             status="open",
+            entry_qty=5.0,
             current_qty=5.0,
             avg_entry_price=245.0,
         )
@@ -554,7 +555,8 @@ class TestAmendLifecycleForResidualFill:
         row = _NS(
             position_uid="pos-uid-primary",
             status="pending",
-            current_qty=5.0,
+            entry_qty=5.0,
+            current_qty=0.0,
             avg_entry_price=245.0,
         )
         store.get_by_position_uid.return_value = row
@@ -621,7 +623,8 @@ class TestAmendLifecycleForResidualFill:
         row = _NS(
             position_uid="pos-uid-pending",
             status="pending",
-            current_qty=5.0,
+            entry_qty=5.0,
+            current_qty=0.0,
             avg_entry_price=245.0,
             owner_key="QCOM",
         )
@@ -736,7 +739,8 @@ class TestDrainPendingResidualAmendments:
         row = _NS(
             position_uid="pos-uid-pending",
             status="pending",
-            current_qty=5.0,
+            entry_qty=5.0,
+            current_qty=0.0,
             avg_entry_price=245.0,
             owner_key="QCOM",
         )
@@ -770,6 +774,7 @@ class TestDrainPendingResidualAmendments:
         row = _NS(
             position_uid="pos-uid-canceled",
             status="canceled",
+            entry_qty=5.0,
             current_qty=0.0,
             avg_entry_price=245.0,
             owner_key="QCOM",
@@ -795,6 +800,7 @@ class TestDrainPendingResidualAmendments:
         row = _NS(
             position_uid="pos-uid-open",
             status="open",
+            entry_qty=5.0,
             current_qty=5.0,
             avg_entry_price=245.0,
             owner_key="QCOM",
@@ -824,7 +830,8 @@ class TestDrainPendingResidualAmendments:
         row = _NS(
             position_uid="pos-uid-still-pending",
             status="pending",
-            current_qty=5.0,
+            entry_qty=5.0,
+            current_qty=0.0,
             avg_entry_price=245.0,
             owner_key="QCOM",
         )
@@ -859,7 +866,8 @@ class TestDrainPendingResidualAmendments:
         row = _NS(
             position_uid="pos-uid-only-residual",
             status="pending",
-            current_qty=5.0,
+            entry_qty=5.0,
+            current_qty=0.0,
             avg_entry_price=245.0,
             owner_key="QCOM",
         )
@@ -957,7 +965,8 @@ class TestRestartReconstruction:
         row = _NS(
             position_uid="pos-uid-restored",
             status="pending",
-            current_qty=5.0,
+            entry_qty=5.0,
+            current_qty=0.0,
             avg_entry_price=245.0,
             owner_key="QCOM",
         )
@@ -985,6 +994,7 @@ class TestRestartReconstruction:
         row = _NS(
             position_uid="pos-uid-already-open",
             status="open",
+            entry_qty=5.0,
             current_qty=5.0,
             avg_entry_price=245.0,
             owner_key="QCOM",
@@ -1005,7 +1015,8 @@ class TestRestartReconstruction:
         row = _NS(
             position_uid="pos-uid-just-submitted",
             status="pending",
-            current_qty=5.0,
+            entry_qty=5.0,
+            current_qty=0.0,
             avg_entry_price=245.0,
             owner_key="QCOM",
         )
@@ -1113,6 +1124,34 @@ class TestResidualResubmitGuards:
 
 
 class TestResidualTimeoutUnknownRecovery:
+    def test_pure_fractional_fallback_rejects_chase_above_ceiling(self, tmp_path):
+        """PR #58 R7 P1 #5: pure-fractional fallback (whole_qty=0) must
+        check BOTH gates — live below trigger AND live above ceiling.
+        Without the upper gate, a gap-up beyond the cap would let the
+        pure-fractional MARKET fire uncapped (parity with the hybrid
+        residual gate that checks the ceiling at submission time)."""
+        engine = _engine(tmp_path)
+        engine.broker.get_latest_quote_midpoint.return_value = 280.0  # > ceiling
+        primary, residual = engine._prepare_stop_limit_split(
+            _stop_limit_decision(qty=0.6, trigger=245.0, cap=257.0),
+            target_symbol="QCOM",
+        )
+        assert primary is None
+        assert residual is None
+
+    def test_pure_fractional_fallback_accepts_when_within_band(self, tmp_path):
+        """Sanity: live between trigger and ceiling → fallback fires."""
+        engine = _engine(tmp_path)
+        engine.broker.get_latest_quote_midpoint.return_value = 250.0
+        primary, residual = engine._prepare_stop_limit_split(
+            _stop_limit_decision(qty=0.6, trigger=245.0, cap=257.0),
+            target_symbol="QCOM",
+        )
+        assert primary is not None
+        assert primary.order_type is OrderType.MARKET
+        assert primary.entry_max_price is None
+        assert residual is None
+
     @pytest.mark.parametrize("ambiguous_status", [
         OrderStatus.TIMEOUT,
         OrderStatus.UNKNOWN,
@@ -1147,11 +1186,112 @@ class TestResidualTimeoutUnknownRecovery:
         engine._submit_stop_limit_residual(
             residual,
             "donchian_breakout",
-            primary_position_uid="pos-uid",
+            primary_position_uid="pos-uid-primary-link",
             trigger_price=245.0,
             chase_ceiling=257.0,
         )
         engine._remember_suspect_order.assert_called_once()
+        # PR #58 R7 P1 #2 + #3: residual flag set + position_uid_override
+        # threaded so recovery later writes a trade row linked to the
+        # primary's lifecycle.
+        kwargs = engine._remember_suspect_order.call_args.kwargs
+        assert kwargs.get("is_residual") is True
+        assert kwargs.get("position_uid_override") == "pos-uid-primary-link"
+
+
+# ── PR #58 R7 P1 #2: separate primary + residual suspect caches ────────────
+
+
+class TestSuspectOrderCacheSeparation:
+    def test_primary_and_residual_for_same_symbol_coexist(self, tmp_path):
+        """Without the separate residual cache, the second
+        _remember_suspect_order call for the same symbol would overwrite
+        the first. Both must survive — recovery iterates both maps."""
+        engine = _engine(tmp_path)
+        decision_primary = RiskDecision(
+            symbol="QCOM",
+            side=Side.BUY,
+            qty=5,
+            entry_reference_price=245.0,
+            stop_price=230.0,
+            strategy_name="donchian_breakout",
+            reason="primary",
+            order_type=OrderType.STOP_LIMIT,
+            entry_trigger_price=245.0,
+            entry_max_price=257.0,
+        )
+        decision_residual = RiskDecision(
+            symbol="QCOM",
+            side=Side.BUY,
+            qty=0.88,
+            entry_reference_price=245.0,
+            stop_price=230.0,
+            strategy_name="donchian_breakout",
+            reason="residual",
+            order_type=OrderType.MARKET,
+        )
+        result_primary = OrderResult(
+            status=OrderStatus.TIMEOUT,
+            order_id="ord-primary-resting",
+            symbol="QCOM",
+            requested_qty=5,
+            filled_qty=0,
+            avg_fill_price=None,
+            raw_status="accepted",
+            message="resting",
+            position_uid="pos-uid-primary",
+        )
+        result_residual = OrderResult(
+            status=OrderStatus.TIMEOUT,
+            order_id="ord-residual-pending",
+            symbol="QCOM",
+            requested_qty=0.88,
+            filled_qty=0,
+            avg_fill_price=None,
+            raw_status="accepted",
+            message="pending",
+        )
+        engine._remember_suspect_order(
+            decision_primary, result_primary, modeled_price=245.0,
+        )
+        engine._remember_suspect_order(
+            decision_residual,
+            result_residual,
+            modeled_price=246.0,
+            is_residual=True,
+            position_uid_override="pos-uid-primary",
+        )
+        assert "QCOM" in engine._suspect_orders
+        assert "QCOM" in engine._suspect_residual_orders
+        assert engine._suspect_orders["QCOM"].order_id == "ord-primary-resting"
+        assert (
+            engine._suspect_residual_orders["QCOM"].order_id
+            == "ord-residual-pending"
+        )
+        assert (
+            engine._suspect_residual_orders["QCOM"].position_uid_override
+            == "pos-uid-primary"
+        )
+
+
+# ── PR #58 R7 P1 #6: STOP_LIMIT short poll timeout ─────────────────────────
+
+
+class TestStopLimitPollTimeout:
+    def test_stop_limit_uses_short_poll_timeout(self, tmp_path):
+        """STOP_LIMIT decisions MUST pass STOP_LIMIT_CONFIRM_TIMEOUT_SECONDS
+        (5s) so the engine's serial symbol loop is not blocked for the
+        full 240s ORDER_CONFIRM_TIMEOUT_SECONDS waiting for a resting
+        order. The TIMEOUT branch in _process_symbol pre-registers
+        ownership and arms suspect-order recovery."""
+        import inspect
+        from engine import trader as trader_module
+        src = inspect.getsource(trader_module.TradingEngine._process_symbol)
+        # Sanity: the entry-submit path branches on order_type for the
+        # poll timeout — STOP_LIMIT path uses STOP_LIMIT_CONFIRM_TIMEOUT.
+        assert "STOP_LIMIT_CONFIRM_TIMEOUT_SECONDS" in src
+        # Both timeouts referenced (default vs STOP_LIMIT short path).
+        assert "ORDER_CONFIRM_TIMEOUT_SECONDS" in src
 
 
 class TestCancelStaleStopLimitEntries:

@@ -71,6 +71,19 @@ ORDER_CONFIRM_TIMEOUT_SECONDS: float = float(
     os.getenv("ORDER_CONFIRM_TIMEOUT_SECONDS", "240")
 )
 
+# PR #58 R7 P1 #6: STOP_LIMIT entries rest at the broker until the
+# trigger fires — polling them for the full ORDER_CONFIRM_TIMEOUT_SECONDS
+# (default 240s) blocks the engine's serial symbol loop for minutes per
+# Donchian entry. A short timeout (5s) catches the rare case where the
+# broker triggers and fills immediately (live > trigger at submission)
+# while letting the normal happy path return TIMEOUT quickly so the
+# engine moves on to the next symbol. The TIMEOUT branch in
+# _process_symbol pre-registers ownership and arms suspect-order
+# recovery (PR #58 R6 P1 #1).
+STOP_LIMIT_CONFIRM_TIMEOUT_SECONDS: float = float(
+    os.getenv("STOP_LIMIT_CONFIRM_TIMEOUT_SECONDS", "5")
+)
+
 # Multi-leg options entry watch window
 # Credit spreads often need longer than single-leg options to fill at a fair
 # net price. Give MLEG combo orders more time to work before we cancel them.
