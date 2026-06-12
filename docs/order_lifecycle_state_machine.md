@@ -399,8 +399,11 @@ CREATE UNIQUE INDEX uniq_lifecycle_orders_order_id
 CREATE UNIQUE INDEX uniq_lifecycle_orders_client_order_id
     ON position_lifecycle_orders(client_order_id);
 
--- A position has at most one entry_primary and at most one open exit at a time.
--- Other roles (replacement_stop, partial_close) are intentionally many-per-position.
+-- A position has at most one entry_primary at the per-order level. This
+-- alone does NOT prevent the bot from opening a SECOND position on the
+-- same owner_key (different position_uid → uniqueness on position_uid
+-- passes). PR #59 review-6 finding #1: the actual duplicate-entry
+-- prevention is a position-LEVEL constraint, added separately below.
 CREATE UNIQUE INDEX uniq_one_entry_primary_per_position
     ON position_lifecycle_orders(position_uid) WHERE role = 'entry_primary';
 
@@ -409,6 +412,25 @@ CREATE INDEX idx_lifecycle_orders_status       ON position_lifecycle_orders(stat
 CREATE INDEX idx_lifecycle_orders_parent       ON position_lifecycle_orders(parent_order_id);
 CREATE INDEX idx_lifecycle_orders_replaces     ON position_lifecycle_orders(replaces_order_id);
 ```
+
+#### Position-level uniqueness — added to existing `position_lifecycle`
+
+Foundation PR also adds a partial unique index to the existing `position_lifecycle` table (no schema column change, index only):
+
+```sql
+-- At most one non-terminal lifecycle row per owner_key. Spreads have
+-- per-instance UUID owner_keys (always unique), so multiple spreads
+-- on the same underlying don't collide. Equity / single-leg options
+-- get one position per owner_key (ticker / underlying), which is the
+-- live duplicate-entry-prevention invariant the bot relies on today
+-- (currently enforced softly via _positions[]; foundation PR makes
+-- it durable). PR #59 review-6 finding #1.
+CREATE UNIQUE INDEX uniq_one_active_position_per_owner_key
+    ON position_lifecycle(owner_key)
+    WHERE status IN ('pending', 'open', 'partially_filled');
+```
+
+This is the constraint that prevents the bot from submitting a second entry for AAPL while an AAPL position is still open. The per-order `uniq_one_entry_primary_per_position` is belt-and-suspenders within the position; the position-level index is what actually guards against shared-symbol duplicates across new position_uids.
 
 Notes:
 
@@ -557,7 +579,7 @@ with conn:  # sqlite3 context manager: commits on success, rolls back on any exc
 # implicit COMMIT here
 ```
 
-If any step raises — UNIQUE conflict on a duplicate `execution_id` audit value, foreign-key violation, disk full, anything — the transaction rolls back entirely. There is no partial application that leaves the three tables out of sync.
+If any step raises — UNIQUE conflict on a duplicate `(order_id, position_type='single_leg')` pair from a misuse (§6.5 dedup intends the UPSERT to handle dups, so a raise here means a bug), foreign-key violation, disk full, anything — the transaction rolls back entirely. There is no partial application that leaves the three tables out of sync. (PR #59 review-6 finding #6: removed a stale claim that this scenario could trip a UNIQUE on `execution_id`; that constraint does not exist in the revised model.)
 
 The `StaleOrDuplicateEvent` path is the normal "this event was already applied or stale" outcome and is not an error from the caller's perspective; `apply_order_event` catches it and returns a `dropped` outcome to its caller. Other exceptions propagate.
 
@@ -838,7 +860,7 @@ This matrix is the **implementation PR's migration checklist**. Every row should
 |---|---|
 | **Workaround today** | `_suspect_exit_orders` (§4.3) — exit-side parallel of `_suspect_orders`. Memory-only, restart-volatile |
 | **Anchor commits** | PR #53 — `28352a0` ("fix: recover uncertain single-leg exits"), `e0bedc2` ("fix: tighten exit history recovery bounds") |
-| **Foundation absorption** | `role='exit'` per-order rows replace the cache. Every signal exit, stop fill, and discretionary close creates a durable exit row. `apply_order_event` reconciles it across stream / cycle / startup the same way it handles entries |
+| **Foundation absorption (PR #59 review-6 finding #3 fix)** | `role='exit'` rows replace `_suspect_exit_orders` for **discretionary exits only** — strategy-signaled market closes and (future) operator-issued closes. A **stop fill is NOT a new exit row.** When a protective or replacement stop fires, the existing `role='protective_stop'` or `role='replacement_stop'` row advances to `status='filled'` via `apply_order_event`. The position rollup (§6.6) handles the close correctly because the stop row's `side='sell'` contributes negatively to `current_qty` when it fills. Treating a stop fill as a new exit row would create a duplicate accounting event and break the side-signed sum |
 | **Preserved invariants** | (a) Broker order-history queries only after the current lifecycle's entry timestamp. (b) Recovered cumulative sell quantity must explain the open quantity (no phantom fills). (c) Broker timestamps and VWAP preserved on the per-order row and propagated into `trades`. (d) External-close detection cannot race ahead of a known submitted close — the durable `role='exit'` row blocks the external-close path |
 | **Tests that survive** | PR #53's R0–R2 acceptance tests for CIEN-style late-fill recovery, the bounded-history-window test from `e0bedc2` |
 | **Cache removal timing** | After `role='exit'` is verified across stream / cycle / startup paths. Not on day-one of foundation merge |
@@ -849,7 +871,8 @@ This matrix is the **implementation PR's migration checklist**. Every row should
 |---|---|
 | **Workarounds today** | PR #47's DAY-child → GTC promotion with `_reported_stop_promotion_failures` set used as identity workaround (because there's no durable handle to track which stop replaced which); PR #46's option-stop replacement hardening (`d98c801`, `c936c57`, `39e0b94`); inferring "which stop is current" from broker snapshot symbols rather than durable identity |
 | **Anchor commits** | `3236593`, `1bdf05e` (PR #47 — capped equity stop durability and DAY-to-GTC replacement); `d98c801`, `c936c57`, `39e0b94` (PR #46 option-stop hardening) |
-| **Foundation absorption** | Every attached protective stop becomes a `role='protective_stop'` per-order row with `parent_order_id = entry_primary.order_id`. Every replacement becomes a `role='replacement_stop'` row with both `parent_order_id` (the entry) AND `replaces_order_id` (the stop it replaces). "Which stop currently covers this position?" becomes one query against the orders table; the `_reported_stop_promotion_failures` identity workaround goes away |
+| **Foundation absorption** | Every attached protective stop becomes a `role='protective_stop'` per-order row with `parent_order_id = entry_primary.order_id`. Every replacement becomes a `role='replacement_stop'` row with both `parent_order_id` (the entry) AND `replaces_order_id` (the stop it replaces). "Which stop currently covers this position?" becomes one query against the orders table. The IDENTITY-WORKAROUND part of `_reported_stop_promotion_failures` goes away — the set previously held inferred `(parent_order_id, child_order_id)` tuples to associate "this child's promotion failed with this parent." With durable per-order identity the set re-keys directly on the failed child's `order_id`. |
+| **Alert-deduplication continuity (PR #59 review-6 finding #5 fix)** | The `_reported_stop_promotion_failures` set still has a legitimate **session-local alert-deduplication** purpose — without it, every cycle's failed promotion attempt alerts again. Foundation does NOT delete the set; it re-keys the entries on the durable `order_id` of the failed replacement-stop row and otherwise leaves the alert suppression behavior unchanged. The set remains an in-memory session cache (alert dedup is session-level, not durable). What the foundation removes is only the IDENTITY workaround (inferring which child belongs to which parent), not the alert suppression itself. |
 | **Preserved operational behavior** | Broker-native replace semantics (Alpaca's `ReplaceOrderRequest` path), bounded alerting on promotion failure, immediate protection repair when a managed position has no broker-side stop, GTC/DAY semantics including the 90-day GTC expiry constraint |
 | **Atomic replacement requirement** | A replacement creates a NEW per-order row AND advances the replaced row's status (typically to `canceled`) inside the same transaction. The replacement must NEVER overwrite the identity of the stop it replaces — `replaces_order_id` is the linkage, not a mutation of `order_id` |
 | **Tests that survive** | PR #47's GTC-promotion-after-fill acceptance test, the retry-and-bounded-alerting tests, the GTC/DAY-reconciliation-from-broker-snapshot tests |
@@ -862,7 +885,7 @@ This matrix is the **implementation PR's migration checklist**. Every row should
 | **Anchor commits** | `d86aa5e`, `5931361`, `d98c801`, `fdabede` (PR #40 / PR #46) |
 | **Strategy state that stays** | `entry_premium`, `hwm_premium`, `trail_activation_pct`, `trail_pct`, `current_stop_price` (the strategy's derived target), `last_observed_premium`. These are strategy decisions, not broker order state. Keep the columns; keep the read/write paths |
 | **Broker-order state that migrates** | `alpaca_stop_order_id`, `stop_order_status`. These ARE order-lifecycle state and become authoritative on `position_lifecycle_orders` (as a `role='protective_stop'` or `role='replacement_stop'` row keyed to the option position's `position_uid`) |
-| **Migration shape** | `option_trailing_stops.alpaca_stop_order_id` becomes a foreign-key reference to `position_lifecycle_orders.order_id` rather than the source of truth. The trailing table reads broker-order status via a join, not from its own duplicated columns. Strict column removal is deferred — the columns can remain as denormalized mirrors during migration, with the per-order row as authoritative |
+| **Migration shape (PR #59 review-6 finding #2 fix)** | A SQLite FK cannot target a column with only a *partial* unique index — and `position_lifecycle_orders.order_id` has `UNIQUE WHERE order_id IS NOT NULL`, which SQLite doesn't accept as an FK parent key. The correct FK target is the autoincrement PK: add `lifecycle_order_id INTEGER REFERENCES position_lifecycle_orders(id)` to `option_trailing_stops`. The trailing table reads broker-order identity / status via the FK join. `option_trailing_stops.alpaca_stop_order_id` and `stop_order_status` columns can remain as denormalized mirrors during migration, with the per-order row authoritative; strict column removal is deferred. |
 | **Preserved operational behavior** | HWM restoration on startup, missing-HWM fail-safe alerts, durable HWM across restarts (PR #46's core durability promise) |
 | **Tests that survive** | PR #46's HWM restoration / fail-safe-alert / atomic-replacement integration tests |
 
@@ -971,3 +994,39 @@ Several findings during PR #59 review would have shipped as production bugs if n
 | `replacement_stop` atomic-replace — promote DAY → GTC; assert new row created AND replaced row advanced to `canceled` in one transaction | §10.3 atomic replacement requirement | §10.3 / §6.4 |
 
 The first three are explicit regressions where my earlier doc draft had the bug. The next two are the corrections from this review pass (review-5). The rest are correctness conditions the audit identified that the implementation must verify, not assume.
+
+### 12.2 Migration prerequisites — duplicate-row detection before applying UNIQUE indexes
+
+PR #59 review-6 finding #4: any pre-existing duplicate rows in `data/trades.db` will cause the `CREATE UNIQUE INDEX uniq_trades_order_id_single_leg` step to fail. SQLite refuses to add a unique index when existing rows violate it, and `_ensure_db()` would then raise on every bot start until manually resolved. The same risk applies to `uniq_one_active_position_per_owner_key` if any production `position_lifecycle` row pair shares an `owner_key` while both are non-terminal.
+
+The implementation PR must include a **pre-flight duplicate check** that runs BEFORE `CREATE UNIQUE INDEX`, on every bot startup until the index exists. Shape:
+
+```sql
+-- Detect duplicates that would block the new index on `trades`.
+SELECT order_id, position_type, COUNT(*) AS n
+FROM trades
+WHERE order_id IS NOT NULL AND position_type = 'single_leg'
+GROUP BY order_id, position_type
+HAVING COUNT(*) > 1;
+
+-- Detect duplicates that would block the new index on `position_lifecycle`.
+SELECT owner_key, COUNT(*) AS n
+FROM position_lifecycle
+WHERE status IN ('pending', 'open', 'partially_filled')
+GROUP BY owner_key
+HAVING COUNT(*) > 1;
+```
+
+If either query returns rows, the migration:
+
+1. Logs an `ERROR`-level message listing the affected `order_id` / `owner_key` values.
+2. Refuses to apply the unique index for this startup (continues with a partial migration; bot remains operational on the legacy code path).
+3. Surfaces the issue through the alert backend so the operator sees it.
+4. Documents a remediation script the operator can run to dedupe (keep most-recent row, delete older copies, then retry the migration on next startup).
+
+Real-world duplicates in `trades` could arise from:
+- early bugs that re-logged the same order_id from both stream and REST paths before the slippage Phase 1 dedup work landed
+- recovered-fill rows that wrote with the same `order_id` as the original log
+- any path where `log_external_close` was called twice for the same broker close
+
+The migration must not silently mask these — they're a signal of past inconsistency that the operator needs to see before the new constraint takes effect.
