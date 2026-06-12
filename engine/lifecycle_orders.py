@@ -32,6 +32,8 @@ from __future__ import annotations
 
 import sqlite3
 from dataclasses import dataclass, field
+from datetime import datetime, timezone
+from typing import Iterable, Sequence
 
 
 # ── Schema version ──
@@ -386,3 +388,398 @@ def run_preflight_or_raise(conn: sqlite3.Connection) -> None:
     duplicates = detect_owner_key_duplicates(conn)
     if duplicates:
         raise MigrationDuplicatesFound(owner_key_duplicates=duplicates)
+
+
+# ── Store API (discovery doc §6.2 / §6.3) ──
+
+
+def _utc_now_iso() -> str:
+    """UTC timestamp in ISO 8601, second precision. Same shape as
+    engine.lifecycle._utc_now_iso so the two stores produce
+    comparable timestamps."""
+    return datetime.now(timezone.utc).isoformat()
+
+
+@dataclass(frozen=True)
+class PositionLifecycleOrderRow:
+    """One row of ``position_lifecycle_orders``.
+
+    Frozen so callers can't accidentally mutate a snapshot. Re-query
+    the store to observe updates (same discipline as
+    ``PositionLifecycleRow`` in engine.lifecycle).
+    """
+
+    id: int
+    position_uid: str
+    role: str
+
+    order_id: str | None
+    client_order_id: str
+
+    order_type: str
+    order_class: str
+    time_in_force: str
+    side: str
+    intended_qty: float
+    intended_stop_price: float | None
+    intended_trigger_price: float | None
+    intended_limit_price: float | None
+    intended_take_profit_price: float | None
+
+    parent_order_id: str | None
+    replaces_order_id: str | None
+
+    origin_kind: str
+    operator_command_uid: str | None
+
+    slippage_benchmark_price: float | None
+    slippage_benchmark_kind: str | None
+    slippage_benchmark_timestamp: str | None
+    slippage_measurement_quality: str | None
+
+    status: str
+    filled_qty: float
+    avg_fill_price: float | None
+
+    created_at: str
+    submitted_at: str | None
+    terminal_at: str | None
+
+    last_observed_broker_updated_at: str | None
+    last_observed_at: str
+
+
+_SELECT_LIFECYCLE_ORDER_COLUMNS = (
+    "SELECT id, position_uid, role, order_id, client_order_id, "
+    "order_type, order_class, time_in_force, side, intended_qty, "
+    "intended_stop_price, intended_trigger_price, intended_limit_price, "
+    "intended_take_profit_price, parent_order_id, replaces_order_id, "
+    "origin_kind, operator_command_uid, "
+    "slippage_benchmark_price, slippage_benchmark_kind, "
+    "slippage_benchmark_timestamp, slippage_measurement_quality, "
+    "status, filled_qty, avg_fill_price, "
+    "created_at, submitted_at, terminal_at, "
+    "last_observed_broker_updated_at, last_observed_at "
+    "FROM position_lifecycle_orders"
+)
+
+
+def _row_from_tuple(row: tuple) -> PositionLifecycleOrderRow:
+    return PositionLifecycleOrderRow(
+        id=row[0],
+        position_uid=row[1],
+        role=row[2],
+        order_id=row[3],
+        client_order_id=row[4],
+        order_type=row[5],
+        order_class=row[6],
+        time_in_force=row[7],
+        side=row[8],
+        intended_qty=row[9],
+        intended_stop_price=row[10],
+        intended_trigger_price=row[11],
+        intended_limit_price=row[12],
+        intended_take_profit_price=row[13],
+        parent_order_id=row[14],
+        replaces_order_id=row[15],
+        origin_kind=row[16],
+        operator_command_uid=row[17],
+        slippage_benchmark_price=row[18],
+        slippage_benchmark_kind=row[19],
+        slippage_benchmark_timestamp=row[20],
+        slippage_measurement_quality=row[21],
+        status=row[22],
+        filled_qty=row[23],
+        avg_fill_price=row[24],
+        created_at=row[25],
+        submitted_at=row[26],
+        terminal_at=row[27],
+        last_observed_broker_updated_at=row[28],
+        last_observed_at=row[29],
+    )
+
+
+class PositionLifecycleOrdersStore:
+    """Read/write API for ``position_lifecycle_orders``.
+
+    Discovery doc §6.2 / §6.3 specify the schema and state machine.
+    Two key properties this store enforces at the API boundary:
+
+    - ``insert_pending(...)`` creates a row at ``status='pending'``
+      with order_id NULL and submitted_at NULL. The broker submit
+      hasn't returned yet; only client_order_id is known. ``apply_
+      order_event`` (commit 4) advances the row from pending onward
+      as broker reality arrives via stream / cycle / startup paths.
+
+    - Reads always return ``PositionLifecycleOrderRow`` frozen
+      snapshots, never mutable references. Callers cannot
+      accidentally drift state by holding stale references.
+
+    The store does NOT execute DDL. The schema is created by
+    ``reporting.logger.TradeLogger._ensure_db`` through the same
+    migration path as ``position_lifecycle`` (engine.lifecycle).
+
+    All writes commit immediately so a crash between operations
+    cannot lose a lifecycle event. The caller is responsible for
+    wrapping calls in try/except so a DB I/O failure does not
+    propagate into the trading loop — same discipline as
+    ``PositionLifecycleStore`` and ``strategies.health.lifecycle``.
+    """
+
+    def __init__(self, conn: sqlite3.Connection) -> None:
+        self._conn = conn
+
+    # ── Writes ────────────────────────────────────────────────────────
+
+    def insert_pending(
+        self,
+        *,
+        position_uid: str,
+        role: str,
+        client_order_id: str,
+        order_type: str,
+        order_class: str,
+        time_in_force: str,
+        side: str,
+        intended_qty: float,
+        intended_stop_price: float | None = None,
+        intended_trigger_price: float | None = None,
+        intended_limit_price: float | None = None,
+        intended_take_profit_price: float | None = None,
+        parent_order_id: str | None = None,
+        replaces_order_id: str | None = None,
+        origin_kind: str = "bot",
+        operator_command_uid: str | None = None,
+        slippage_benchmark_price: float | None = None,
+        slippage_benchmark_kind: str | None = None,
+        slippage_benchmark_timestamp: str | None = None,
+        slippage_measurement_quality: str | None = None,
+    ) -> int:
+        """Insert a per-order row at ``status='pending'`` BEFORE the
+        broker submit goes out. Returns the autoincrement id.
+
+        Caller must pass a unique ``client_order_id`` — the broker
+        will use it as the dedup key, and the foundation enforces
+        the same locally via ``uniq_lifecycle_orders_client_order_id``.
+
+        ``order_id`` is NULL on this row. The broker assigns it on
+        submit return; ``apply_order_event`` populates it on the
+        first observed event.
+
+        Raises:
+          - ``ValueError`` on invalid role / status / origin_kind
+          - ``sqlite3.IntegrityError`` on duplicate client_order_id,
+            duplicate non-terminal entry_primary per position_uid,
+            duplicate non-terminal close per position_uid, or
+            FK violation if position_uid doesn't exist in
+            position_lifecycle.
+        """
+        _validate_role(role)
+        _validate_origin_kind(origin_kind)
+        if not client_order_id:
+            raise ValueError("client_order_id must not be empty")
+        if intended_qty <= 0:
+            raise ValueError(
+                f"intended_qty must be positive; got {intended_qty}"
+            )
+
+        now = _utc_now_iso()
+        cursor = self._conn.execute(
+            """
+            INSERT INTO position_lifecycle_orders (
+                position_uid, role,
+                order_id, client_order_id,
+                order_type, order_class, time_in_force, side,
+                intended_qty,
+                intended_stop_price, intended_trigger_price,
+                intended_limit_price, intended_take_profit_price,
+                parent_order_id, replaces_order_id,
+                origin_kind, operator_command_uid,
+                slippage_benchmark_price, slippage_benchmark_kind,
+                slippage_benchmark_timestamp, slippage_measurement_quality,
+                status, filled_qty, avg_fill_price,
+                created_at, submitted_at, terminal_at,
+                last_observed_broker_updated_at, last_observed_at
+            ) VALUES (
+                ?, ?,
+                NULL, ?,
+                ?, ?, ?, ?,
+                ?,
+                ?, ?, ?, ?,
+                ?, ?,
+                ?, ?,
+                ?, ?, ?, ?,
+                'pending', 0.0, NULL,
+                ?, NULL, NULL,
+                NULL, ?
+            )
+            """,
+            (
+                position_uid, role,
+                client_order_id,
+                order_type, order_class, time_in_force, side,
+                float(intended_qty),
+                intended_stop_price, intended_trigger_price,
+                intended_limit_price, intended_take_profit_price,
+                parent_order_id, replaces_order_id,
+                origin_kind, operator_command_uid,
+                slippage_benchmark_price, slippage_benchmark_kind,
+                slippage_benchmark_timestamp, slippage_measurement_quality,
+                now, now,
+            ),
+        )
+        self._conn.commit()
+        return int(cursor.lastrowid)
+
+    def attach_broker_order_id(
+        self,
+        *,
+        client_order_id: str,
+        order_id: str,
+        submitted_at: str | None = None,
+    ) -> None:
+        """Populate the broker-assigned ``order_id`` on the row
+        identified by ``client_order_id``, after the broker submit
+        returns. Also stamps ``submitted_at`` (defaults to now UTC).
+
+        This is the only path that should populate ``order_id``
+        post-pending — once set, ``order_id`` is immutable. The
+        partial unique index on ``order_id`` enforces no other row
+        can claim the same id.
+
+        Raises ``ValueError`` if the row is not at status='pending'
+        or if order_id is already set.
+        """
+        now = submitted_at or _utc_now_iso()
+        existing = self._conn.execute(
+            "SELECT status, order_id FROM position_lifecycle_orders "
+            "WHERE client_order_id = ?",
+            (client_order_id,),
+        ).fetchone()
+        if existing is None:
+            raise ValueError(
+                f"unknown client_order_id: {client_order_id!r}"
+            )
+        current_status, current_order_id = existing
+        if current_status != "pending":
+            raise ValueError(
+                f"row at client_order_id={client_order_id!r} is "
+                f"status={current_status!r}; cannot attach order_id "
+                f"after pending"
+            )
+        if current_order_id is not None:
+            raise ValueError(
+                f"row at client_order_id={client_order_id!r} already "
+                f"has order_id={current_order_id!r}"
+            )
+        self._conn.execute(
+            "UPDATE position_lifecycle_orders "
+            "SET order_id = ?, submitted_at = ?, last_observed_at = ? "
+            "WHERE client_order_id = ?",
+            (order_id, now, now, client_order_id),
+        )
+        self._conn.commit()
+
+    # ── Reads ─────────────────────────────────────────────────────────
+
+    def get_by_id(self, row_id: int) -> PositionLifecycleOrderRow | None:
+        row = self._conn.execute(
+            _SELECT_LIFECYCLE_ORDER_COLUMNS + " WHERE id = ?",
+            (row_id,),
+        ).fetchone()
+        return None if row is None else _row_from_tuple(row)
+
+    def get_by_order_id(
+        self, order_id: str
+    ) -> PositionLifecycleOrderRow | None:
+        """Lookup by broker-assigned order_id. Returns None if the row
+        is still pending (order_id NULL) or doesn't exist."""
+        row = self._conn.execute(
+            _SELECT_LIFECYCLE_ORDER_COLUMNS + " WHERE order_id = ?",
+            (order_id,),
+        ).fetchone()
+        return None if row is None else _row_from_tuple(row)
+
+    def get_by_client_order_id(
+        self, client_order_id: str
+    ) -> PositionLifecycleOrderRow | None:
+        """Lookup by bot-generated client_order_id. Works whether or
+        not the broker has yet returned an order_id."""
+        row = self._conn.execute(
+            _SELECT_LIFECYCLE_ORDER_COLUMNS + " WHERE client_order_id = ?",
+            (client_order_id,),
+        ).fetchone()
+        return None if row is None else _row_from_tuple(row)
+
+    def get_all_for_position(
+        self, position_uid: str
+    ) -> list[PositionLifecycleOrderRow]:
+        """All per-order rows for a position, terminal or not,
+        ordered by row id (insertion order)."""
+        rows = self._conn.execute(
+            _SELECT_LIFECYCLE_ORDER_COLUMNS
+            + " WHERE position_uid = ? ORDER BY id ASC",
+            (position_uid,),
+        ).fetchall()
+        return [_row_from_tuple(r) for r in rows]
+
+    def get_non_terminal_for_position(
+        self, position_uid: str
+    ) -> list[PositionLifecycleOrderRow]:
+        """Per-order rows for a position whose status is in the
+        non-terminal set (pending / working / partially_filled /
+        unknown). Used by reconciliation paths and by the position-
+        status rollup in §6.6.1."""
+        placeholders = ", ".join("?" for _ in NON_TERMINAL_ORDER_STATUSES)
+        rows = self._conn.execute(
+            _SELECT_LIFECYCLE_ORDER_COLUMNS
+            + f" WHERE position_uid = ? AND status IN ({placeholders}) "
+            "ORDER BY id ASC",
+            (position_uid, *sorted(NON_TERMINAL_ORDER_STATUSES)),
+        ).fetchall()
+        return [_row_from_tuple(r) for r in rows]
+
+    def get_non_terminal_by_role(
+        self, position_uid: str, roles: Iterable[str]
+    ) -> list[PositionLifecycleOrderRow]:
+        """Non-terminal per-order rows for a position whose role is
+        in the given set. Used to query "any active sell-side order"
+        for the position-status logic in §6.6.1."""
+        roles_tuple = tuple(roles)
+        if not roles_tuple:
+            return []
+        for role in roles_tuple:
+            _validate_role(role)
+        role_placeholders = ", ".join("?" for _ in roles_tuple)
+        status_placeholders = ", ".join("?" for _ in NON_TERMINAL_ORDER_STATUSES)
+        rows = self._conn.execute(
+            _SELECT_LIFECYCLE_ORDER_COLUMNS
+            + f" WHERE position_uid = ? "
+            f"AND role IN ({role_placeholders}) "
+            f"AND status IN ({status_placeholders}) "
+            "ORDER BY id ASC",
+            (
+                position_uid,
+                *roles_tuple,
+                *sorted(NON_TERMINAL_ORDER_STATUSES),
+            ),
+        ).fetchall()
+        return [_row_from_tuple(r) for r in rows]
+
+
+# ── Validators ──
+
+
+def _validate_role(role: str) -> None:
+    if role not in VALID_ORDER_ROLES:
+        raise ValueError(
+            f"role must be one of {sorted(VALID_ORDER_ROLES)}; "
+            f"got {role!r}"
+        )
+
+
+def _validate_origin_kind(origin_kind: str) -> None:
+    if origin_kind not in ("bot", "operator"):
+        raise ValueError(
+            f"origin_kind must be 'bot' or 'operator'; got {origin_kind!r}"
+        )
