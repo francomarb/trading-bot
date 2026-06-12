@@ -761,89 +761,93 @@ PR #59 review-7 P0: a naive `current_qty == 0 → 'closed'` rule wrongly marks a
 -- Atomic single statement; runs as Step 4 inside apply_order_event's
 -- transaction (§6.4). The CTE computes new_status once so the
 -- closed_at CASE can read it (a bare subquery in SET would read the
--- pre-update value).
+-- pre-update value — review-9 P1a).
+--
+-- PR #59 review-10 P1 restructure: branch ordering is now
+-- quantity-first, with non-terminal-order existence used only to
+-- disambiguate the "no fills ever yet" case from the "all entries
+-- terminal with zero fills" case. Earlier draft had a nested
+-- "non-terminal entry/close exists" branch that incorrectly held the
+-- position at 'open' when a live exit had already flattened or
+-- oversold the position. The clean discriminator is fill history +
+-- quantity, not order-status existence.
 WITH computed AS (
     SELECT CASE
-        -- Have any per-order rows reached anything past 'pending'?
-        -- If not, the position is `pending` regardless of other state.
+        -- (1) Have any per-order rows reached anything past 'pending'?
+        --     If not, the position is 'pending' regardless of other
+        --     state. (Most newly-created lifecycle rows.)
         WHEN NOT EXISTS (
             SELECT 1 FROM position_lifecycle_orders
             WHERE position_uid = :position_uid
               AND status NOT IN ('pending')
         ) THEN 'pending'
 
-        -- Any non-terminal ENTRY or CLOSE order? These are the order
-        -- families that can still change current_qty. A working
-        -- protective_stop or replacement_stop is broker-state cleanup
-        -- on an already-exited position; it does NOT block closure.
-        -- PR #59 review-8 P1 fix.
-        WHEN EXISTS (
-            SELECT 1 FROM position_lifecycle_orders
-            WHERE position_uid = :position_uid
-              AND status IN ('pending', 'working', 'partially_filled', 'unknown')
-              AND role IN ('entry_primary', 'entry_residual', 'exit', 'partial_close')
-        ) THEN
-            CASE
-                WHEN COALESCE((SELECT current_qty FROM position_lifecycle
-                               WHERE position_uid = :position_uid), 0) = 0
-                     AND NOT EXISTS (
-                         SELECT 1 FROM position_lifecycle_orders
-                         WHERE position_uid = :position_uid
-                           AND filled_qty > 0
-                     )
-                THEN 'pending'  -- working entry sitting at 0 fills
-                WHEN COALESCE((SELECT current_qty FROM position_lifecycle
-                               WHERE position_uid = :position_uid), 0) > 0
-                     AND COALESCE((SELECT current_qty FROM position_lifecycle
-                                   WHERE position_uid = :position_uid), 0)
-                         < COALESCE((SELECT entry_qty FROM position_lifecycle
-                                     WHERE position_uid = :position_uid), 0)
-                THEN 'partially_filled'
-                ELSE 'open'
-            END
-
-        -- No non-terminal entry/close orders. Working stops may still
-        -- be attached but they no longer change current_qty.
-        -- PR #59 review-9 P1 fix: a negative current_qty is a data-
-        -- integrity violation (the bot exited more than it bought),
-        -- NOT a successful close. Surface as `error` so the operator
-        -- sees it.
-        WHEN COALESCE((SELECT current_qty FROM position_lifecycle
-                       WHERE position_uid = :position_uid), 0) < 0
-        THEN 'error'
-
-        -- Did the position ever fill?
+        -- (2) Has the position ever had a fill? If not, the position
+        --     is either still waiting (some entry is working) or
+        --     never opened (all entries terminal with zero fills).
         WHEN NOT EXISTS (
             SELECT 1 FROM position_lifecycle_orders
             WHERE position_uid = :position_uid
               AND filled_qty > 0
-        ) THEN 'canceled'  -- entries ended terminal with zero fills
+        ) THEN
+            CASE
+                -- All entries terminal with zero fills → canceled.
+                WHEN NOT EXISTS (
+                    SELECT 1 FROM position_lifecycle_orders
+                    WHERE position_uid = :position_uid
+                      AND role IN ('entry_primary', 'entry_residual')
+                      AND status IN ('pending', 'working',
+                                     'partially_filled', 'unknown')
+                ) THEN 'canceled'
+                -- Some entry still working with no fills → pending.
+                -- R7-P0: a working entry with filled_qty=0 must NOT
+                -- be classified as 'closed' just because the rollup
+                -- happens to be zero.
+                ELSE 'pending'
+            END
 
-        -- Position filled and is now exactly flat → closed. Working
-        -- protective_stop / replacement_stop rows are allowed to
-        -- coexist with a `closed` position; the engine cancels them
-        -- asynchronously as broker-state cleanup.
+        -- (3) Position has had at least one fill. Status is now driven
+        --     purely by the current rollup quantity vs the intended
+        --     entry quantity. Non-terminal entry/close orders do NOT
+        --     override quantity reality — if a live exit has already
+        --     brought current_qty to 0 or below, the position IS
+        --     closed (or error for negative), even if the exit order
+        --     is still working at the broker. The per-order row tracks
+        --     the broker order's own state independently. (R10-P1
+        --     fix.)
+
+        -- (3a) Negative current_qty: data-integrity violation.
+        --      Surface as 'error' for operator review rather than
+        --      silently completing as closed. (R9-P1b.)
+        WHEN COALESCE((SELECT current_qty FROM position_lifecycle
+                       WHERE position_uid = :position_uid), 0) < 0
+        THEN 'error'
+
+        -- (3b) current_qty exactly 0 with prior fills: fully exited.
         WHEN COALESCE((SELECT current_qty FROM position_lifecycle
                        WHERE position_uid = :position_uid), 0) = 0
         THEN 'closed'
 
-        -- Position filled but still holds a residual qty after some
-        -- exits — open / partially_filled per the standard rule.
+        -- (3c) current_qty > 0 but less than the intended entry qty:
+        --      partially filled (covers both partial-entry-still-
+        --      working and post-partial-close-residual cases).
         WHEN COALESCE((SELECT current_qty FROM position_lifecycle
                        WHERE position_uid = :position_uid), 0)
              < COALESCE((SELECT entry_qty FROM position_lifecycle
                          WHERE position_uid = :position_uid), 0)
         THEN 'partially_filled'
 
+        -- (3d) current_qty >= entry_qty: fully entered, not yet
+        --      exited. Standard 'open' state.
         ELSE 'open'
     END AS new_status
 )
 UPDATE position_lifecycle
 SET status = (SELECT new_status FROM computed),
-    -- closed_at is set ONLY when status transitions to `closed` or
-    -- `external_closed`. `canceled`, `error`, and `pending → working`
-    -- transitions leave closed_at as-is. PR #59 review-8 P2 + review-9
-    -- P1 fix (read new_status from CTE, not pre-update row).
+    -- closed_at is set ONLY when status transitions to 'closed' or
+    -- 'external_closed'. 'canceled', 'error', and pre-fill
+    -- 'pending'/'open' transitions leave closed_at as-is. R8-P2 +
+    -- R9-P1a (read new_status from CTE, not pre-update row).
     closed_at = CASE
         WHEN (SELECT new_status FROM computed) IN ('closed', 'external_closed')
         THEN COALESCE(closed_at, :now)
@@ -852,21 +856,23 @@ SET status = (SELECT new_status FROM computed),
 WHERE position_uid = :position_uid;
 ```
 
-Decision tree it implements:
+Decision tree it implements (quantity-first ordering — R10-P1):
 
 1. **All per-order rows still in `pending`** → position is `pending`
-2. **Some non-terminal ENTRY or CLOSE order exists** (entry_primary, entry_residual, exit, partial_close):
-   - Position has had zero fills so far → still `pending` (working entry, no fills yet)
+2. **No fills yet across any per-order row**:
+   - All entries terminal with zero fills → `canceled`
+   - Otherwise (some entry still working) → `pending`
+3. **At least one fill has happened — quantity drives status:**
+   - `current_qty < 0` (oversold; data-integrity violation) → `error`
+   - `current_qty == 0` → `closed` (fully exited, even if a live exit order is still working at the broker — its per-order row tracks broker state independently)
    - `0 < current_qty < entry_qty` → `partially_filled`
-   - `current_qty == entry_qty` → `open`
-3. **No non-terminal entry/close orders, `current_qty < 0`** → `error` (data integrity violation — the bot exited more than it bought; this should never happen but must surface for operator review rather than silently complete)
-4. **No non-terminal entry/close orders** (working stops are OK), zero fills ever → `canceled`
-5. **No non-terminal entry/close orders, current_qty == 0** → `closed`. Working protective_stop / replacement_stop rows can coexist; the engine cancels them asynchronously as broker-state cleanup
-6. **No non-terminal entry/close orders, current_qty < entry_qty (residual)** → `partially_filled`
+   - `current_qty >= entry_qty` → `open`
 
-`closed_at` is set only when status reaches `closed` or `external_closed`. `canceled`, `error`, and pre-fill `pending`/`open` transitions leave `closed_at` NULL.
+Critical property: branch (3) is driven purely by the rollup. **A non-terminal exit / partial_close at the per-order level does NOT override quantity reality.** If an exit has flattened or oversold the position, the position-level status reflects that (closed or error), even while the exit's own per-order row is still `partially_filled` at the broker. The per-order row's status converges separately as more fill events arrive or as the order terminates.
 
-The §8.1 invariant is preserved end-to-end: a position with any per-order row at `filled_qty > 0` cannot reach `canceled` because branch 4's "zero fills ever" check fails. A position with a fully-exited current_qty correctly reaches `closed` even while a protective_stop is still working at the broker. A position with a *negative* current_qty (data-integrity violation) reaches `error` rather than `closed`, surfacing the inconsistency for operator review.
+`closed_at` is set only when status reaches `closed` or `external_closed`. `canceled`, `error`, and pre-fill `pending` / `open` transitions leave `closed_at` NULL.
+
+The §8.1 invariant is preserved end-to-end: a position with any per-order row at `filled_qty > 0` cannot reach `canceled` because that requires branch (2)'s "no fills ever" check to fire. A position fully exited via either signal-exit OR stop fill reaches `closed` correctly. A position with negative `current_qty` reaches `error`, surfacing the data-integrity violation rather than silently completing.
 
 ### 6.7 What this eliminates
 
@@ -992,7 +998,7 @@ This matrix is the **implementation PR's migration checklist**. Every row should
 |---|---|
 | **Workarounds today** | `_suspect_orders` (§4.1); `LIFECYCLE_PENDING_GRACE_SECONDS` reverse-pass guard (§3.1); broker-open-order duplicate checks before entry submit; PR #58's `_restore_suspect_orders_from_broker` startup walk; PR #58's residual drains and symbol-keyed ownership shims |
 | **Anchor commits** | `88d1a45` (operator-queue / pending grace), `021fa63`, `4c727ae`, PR #58 R5–R7 patches `8ce0dee..00f9e53` |
-| **Foundation absorption** | One `apply_order_event` path drives stream, cycle, and startup. `pending → working → partially_filled → filled` advances on observed broker state. Duplicate-entry prevention becomes the **position-level** `uniq_one_active_position_per_owner_key` partial unique index on `position_lifecycle` per §6.2 (PR #59 review-6 finding #1 / review-7 P2 fix). The per-order `uniq_one_entry_primary_per_position` constraint is belt-and-suspenders within a position; the actual duplicate-symbol-across-positions guard is at the position level. Broker-side snapshot check becomes redundant once these durable constraints exist |
+| **Foundation absorption** | One `apply_order_event` path drives stream, cycle, and startup. `pending → working → partially_filled → filled` advances on observed broker state. Duplicate-entry prevention is now **layered**: (a) the position-level `uniq_one_active_position_per_owner_key` partial unique index on `position_lifecycle` per §6.2 catches duplicates at write time; (b) the per-order `uniq_one_entry_primary_per_position` constraint is belt-and-suspenders within a position; (c) the **existing broker-snapshot check before submit stays as defense-in-depth** (PR #59 review-10 P1 fix). The DB constraints catch what the bot's own state already knows; the snapshot check catches scenarios where the DB doesn't yet know about a broker-side open order (restart races, missed stream events, externally-introduced orders). Removing the snapshot check would create a parallel-state risk; keeping it does not — both layers point at the same broker reality and a successful submit requires both to pass. |
 | **Preserved invariants** | (a) No duplicate entry while a non-terminal order exists for the same position. (b) Exact `client_order_id` / `order_id` reconciliation — never fuzzy match by symbol. (c) TIMEOUT and UNKNOWN remain recoverable through the next cycle/startup. (d) Slippage benchmark provenance survives restart (see §10.5). (e) A position is not marked `external_closed` while an order can still create or close it |
 | **Tests that survive** | PR #58's R5–R7 acceptance tests for hybrid recovery, the duplicate-entry guard tests from `88d1a45`, the pending-grace integration test |
 | **Pending-grace fallback** | `LIFECYCLE_PENDING_GRACE_SECONDS` may remain as a **bounded compatibility fallback during migration** — not the primary state model. Removed entirely only after `apply_order_event` is verified across stream / cycle / startup paths |
@@ -1146,8 +1152,10 @@ Several findings during PR #59 review would have shipped as production bugs if n
 | **Reverse-pass `_reconcile_position_lifecycle` skips `'error'` rows** — set up an `'error'` row whose `owner_key` is no longer in broker positions; assert the reverse pass does NOT transition it to `external_closed` | Auto-resolving error rows via broker snapshot (review-8 P4) | §3.1 |
 | **Dedupe script defaults to detection-only with no side effects** — invoke `scripts/migrate_dedupe_trades.py` without args; assert the script lists conflicts, exits non-zero, and does NOT modify any rows | Silent auto-delete based on `filled_qty` (review-8 P2) | §12.2 |
 | **Migration preflight covers `'error'` status** — seed a duplicate `owner_key` pair where one is `'error'` and another is `'open'`; assert preflight detects the conflict before `CREATE UNIQUE INDEX` runs (status set matches the index's WHERE clause exactly) | Preflight-vs-index status mismatch (review-9 P1) | §12.2 |
+| **Live exit that already flattened the position → `closed`** — create an open position; submit a discretionary exit; before the exit's per-order row terminates, apply a partial fill that brings `current_qty` to `0`; assert position status is `closed`, NOT `open` (and `closed_at` is set). Repeat with an over-fill bringing `current_qty < 0`; assert position status is `error` | Quantity-first branch ordering (review-10 P1) | §6.6.1 |
+| **Broker-snapshot entry guard still rejects shared-symbol submit** — disable the position-level DB UNIQUE index, leave the broker-snapshot pre-submit check enabled; assert a duplicate-entry attempt is still blocked (defense-in-depth, not parallel state) | Layered duplicate-entry defense (review-10 P1) | §10.1 |
 
-The first three are explicit regressions where my earlier doc draft had the bug. The next two are the corrections from review-5. Tests 11–16 are correctness conditions added in review-7 and review-8 (zero-fill working entry, working stops + closed, closed_at semantics, error lock retention, reverse-pass error skip, dedupe-script safety). Tests 14, 18, and 19 are this round's review-9 fixes (CTE-based closed_at read, negative-qty error path, preflight/index status alignment). The remaining tests are correctness conditions the audit identified that the implementation must verify rather than assume.
+The first three are explicit regressions where my earlier doc draft had the bug. The next two are the corrections from review-5. Tests 11–16 are correctness conditions added in review-7 and review-8 (zero-fill working entry, working stops + closed, closed_at semantics, error lock retention, reverse-pass error skip, dedupe-script safety). Tests 14, 18, and 19 are review-9 fixes (CTE-based closed_at read, negative-qty error path, preflight/index status alignment). Tests 20 and 21 are this round's review-10 fixes (quantity-first branch ordering, broker-snapshot defense-in-depth). The remaining tests are correctness conditions the audit identified that the implementation must verify rather than assume.
 
 ### 12.2 Migration prerequisites — duplicate-row detection before applying UNIQUE indexes
 
