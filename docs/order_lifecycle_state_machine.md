@@ -160,6 +160,8 @@ What this does NOT handle:
 
 **Reverse (close-reconcile).** For each non-terminal lifecycle row whose `owner_key` is no longer in broker positions, call `mark_closed(external=True)`. Skips spread rows. Skips `pending` rows younger than `LIFECYCLE_PENDING_GRACE_SECONDS` ([settings.py](../config/settings.py)) — added in PR-2 to avoid mass-closing legitimate in-flight entries after a startup race.
 
+**Foundation PR addition (review-8 finding #4):** the reverse pass must also **skip `status='error'` rows**. An errored position is operator-attention required; the bot must not auto-resolve it via broker-snapshot defense even when the symbol vanishes from the broker (the vanish could itself be a consequence of the error scenario). Errored rows are released only by explicit operator action through the resolution flow. This pairs with §6.2's `uniq_one_active_position_per_owner_key` index, which retains the lock for `'error'` status — together they guarantee an unresolved error blocks both new entries on the symbol AND auto-`external_close` by reverse-pass.
+
 What this handles:
 - overnight stop fills that the bot didn't witness
 - manual broker-side closes
@@ -440,9 +442,16 @@ Foundation PR also adds a partial unique index to the existing `position_lifecyc
 -- live duplicate-entry-prevention invariant the bot relies on today
 -- (currently enforced softly via _positions[]; foundation PR makes
 -- it durable). PR #59 review-6 finding #1.
+--
+-- 'error' is included in the lock (PR #59 review-8 finding #3 fix):
+-- an errored position needs operator resolution before the symbol
+-- can host a new lifecycle. Excluding 'error' would let the bot
+-- silently open a fresh position over an unresolved error, masking
+-- it. Operators close 'error' rows explicitly via the recovery /
+-- resolution flow; only then is the owner_key released.
 CREATE UNIQUE INDEX uniq_one_active_position_per_owner_key
     ON position_lifecycle(owner_key)
-    WHERE status IN ('pending', 'open', 'partially_filled');
+    WHERE status IN ('pending', 'open', 'partially_filled', 'error');
 ```
 
 This is the constraint that prevents the bot from submitting a second entry for AAPL while an AAPL position is still open. The per-order `uniq_one_entry_primary_per_position` is belt-and-suspenders within the position; the position-level index is what actually guards against shared-symbol duplicates across new position_uids.
@@ -745,7 +754,7 @@ The §8.1 invariant on the position-level row uses this rollup: if `current_qty 
 
 PR #59 review-7 P0: a naive `current_qty == 0 → 'closed'` rule wrongly marks a brand-new working entry as closed. A position whose only per-order row is an `entry_primary` at `status='working'` with `filled_qty=0` has `current_qty=0` because zero side-signed values sum to zero — but the position has never filled. Marking it `closed` would close the lifecycle before the entry ever runs.
 
-`POSITION_STATUS_SQL` must use the position's fill history together with the current rollup:
+`POSITION_STATUS_SQL` must use the position's fill history together with the current rollup, AND distinguish close-side from stop-side per-order roles:
 
 ```sql
 -- Compute the new position-level status from the per-order rows.
@@ -754,21 +763,24 @@ PR #59 review-7 P0: a naive `current_qty == 0 → 'closed'` rule wrongly marks a
 UPDATE position_lifecycle
 SET status = (
     SELECT CASE
-        -- Have any per-order rows reached `working` yet? If not,
-        -- the position is `pending` regardless of any other state.
+        -- Have any per-order rows reached anything past 'pending'?
+        -- If not, the position is `pending` regardless of other state.
         WHEN NOT EXISTS (
             SELECT 1 FROM position_lifecycle_orders
             WHERE position_uid = :position_uid
               AND status NOT IN ('pending')
         ) THEN 'pending'
 
-        -- Any non-terminal order? Position is open / partially_filled
-        -- (per current_qty vs entry_qty), regardless of current_qty
-        -- value.
+        -- Any non-terminal ENTRY or CLOSE order? These are the order
+        -- families that can still change current_qty. A working
+        -- protective_stop or replacement_stop is broker-state cleanup
+        -- on an already-exited position; it does NOT block closure.
+        -- PR #59 review-8 P1 fix.
         WHEN EXISTS (
             SELECT 1 FROM position_lifecycle_orders
             WHERE position_uid = :position_uid
               AND status IN ('pending', 'working', 'partially_filled', 'unknown')
+              AND role IN ('entry_primary', 'entry_residual', 'exit', 'partial_close')
         ) THEN
             CASE
                 WHEN COALESCE((SELECT current_qty FROM position_lifecycle
@@ -789,14 +801,19 @@ SET status = (
                 ELSE 'open'
             END
 
-        -- All orders are terminal. Did the position ever fill?
+        -- No non-terminal entry/close orders, but the position may
+        -- still have working stops attached. Did the position ever fill?
         WHEN NOT EXISTS (
             SELECT 1 FROM position_lifecycle_orders
             WHERE position_uid = :position_uid
               AND filled_qty > 0
-        ) THEN 'canceled'  -- all orders ended terminal with zero fills
+        ) THEN 'canceled'  -- entries ended terminal with zero fills
 
-        -- Position filled and is now flat → closed.
+        -- Position filled and is now flat → closed. Working
+        -- protective_stop / replacement_stop rows are allowed to
+        -- coexist with a `closed` position; the engine cancels them
+        -- asynchronously as broker-state cleanup. They never advance
+        -- a closed position back to open.
         WHEN COALESCE((SELECT current_qty FROM position_lifecycle
                        WHERE position_uid = :position_uid), 0) <= 0
         THEN 'closed'
@@ -812,16 +829,14 @@ SET status = (
         ELSE 'open'
     END
 ),
+-- closed_at is set ONLY when status transitions to `closed` or
+-- `external_closed`. `canceled` and `error` rows leave closed_at NULL —
+-- those positions either never opened (canceled) or need operator
+-- resolution (error). PR #59 review-8 P2 fix.
 closed_at = CASE
-    WHEN (
-        SELECT NOT EXISTS (
-            SELECT 1 FROM position_lifecycle_orders
-            WHERE position_uid = :position_uid
-              AND status IN ('pending', 'working', 'partially_filled', 'unknown')
-        )
-        AND COALESCE((SELECT current_qty FROM position_lifecycle
-                      WHERE position_uid = :position_uid), 0) <= 0
-    ) THEN COALESCE(closed_at, :now)
+    WHEN (SELECT status FROM position_lifecycle
+          WHERE position_uid = :position_uid) IN ('closed', 'external_closed')
+    THEN COALESCE(closed_at, :now)
     ELSE closed_at
 END
 WHERE position_uid = :position_uid;
@@ -829,18 +844,18 @@ WHERE position_uid = :position_uid;
 
 Decision tree it implements:
 
-1. **All per-order rows still in `pending`** → position is `pending` (waiting for first broker ack)
-2. **Some non-terminal orders exist**:
+1. **All per-order rows still in `pending`** → position is `pending`
+2. **Some non-terminal ENTRY or CLOSE order exists** (entry_primary, entry_residual, exit, partial_close):
    - Position has had zero fills so far → still `pending` (working entry, no fills yet)
-   - `current_qty > 0` and `< entry_qty` → `partially_filled`
-   - `current_qty > 0` and `== entry_qty` → `open`
-3. **All orders terminal, zero fills ever** → `canceled` (the §8.1 invariant is satisfied because `current_qty == 0` and there is no realized state)
-4. **All orders terminal, current_qty <= 0** → `closed` (position fully exited)
-5. **All orders terminal, current_qty > 0 but < entry_qty** → `partially_filled` (broker-side cancel after partial fill, no further exits)
+   - `0 < current_qty < entry_qty` → `partially_filled`
+   - `current_qty == entry_qty` → `open`
+3. **No non-terminal entry/close orders** (working stops are OK), zero fills ever → `canceled`
+4. **No non-terminal entry/close orders, current_qty <= 0** → `closed`. Working protective_stop / replacement_stop rows can coexist; the engine cancels them asynchronously as broker-state cleanup
+5. **No non-terminal entry/close orders, current_qty < entry_qty (residual)** → `partially_filled`
 
-`closed_at` is only set when the position actually reaches `closed`. `pending → canceled` is the only other terminal transition; it doesn't set `closed_at` per the existing convention (the position never opened so there's no "close time" to record — the existing `mark_canceled` path sets `closed_at` for caller convenience but the field can remain NULL for true cancels).
+`closed_at` is set only when status reaches `closed` or `external_closed`. `canceled` rows (zero-fill terminal) and `error` rows (operator-attention required) leave `closed_at` NULL — these are positions that either never opened or need resolution before they're considered "closed."
 
-The §8.1 invariant is preserved end-to-end: a position whose any per-order row has `filled_qty > 0` cannot transition to `canceled` because case (3) requires zero fills across all per-order rows.
+The §8.1 invariant is preserved end-to-end: a position with any per-order row at `filled_qty > 0` cannot reach `canceled` because branch 3's "zero fills ever" check fails. A position with a fully-exited current_qty correctly reaches `closed` even while a protective_stop is still working at the broker (the engine cancels the stop asynchronously without blocking lifecycle closure).
 
 ### 6.7 What this eliminates
 
@@ -1143,12 +1158,15 @@ Concrete behavior:
 1. Log an `ERROR`-level message listing every affected `order_id` / `owner_key` value, plus the full row counts.
 2. Surface through the alert backend so the operator sees it (Telegram + log file).
 3. **Abort startup**: `_ensure_db()` raises and `forward_test.py` / `main.py` exits non-zero. The bot does NOT continue on the legacy code path; that mode does not exist in foundation code.
-4. Document a remediation script (`scripts/migrate_dedupe_trades.py` or equivalent) that the operator runs offline. The script:
-   - Re-runs the same detection queries
-   - For each duplicate `(order_id, position_type='single_leg')` set, keeps the row with the highest cumulative `filled_qty` (the most-recent broker state) and deletes the others — surfaces what was deleted for audit
-   - For duplicate non-terminal `position_lifecycle.owner_key` sets, the operator chooses (these represent a deeper inconsistency: which lifecycle is "real")
-   - Commits and exits 0 only after the post-cleanup detection queries return zero rows
-5. After the script runs, the next `recycle_bot.sh` applies the unique indexes cleanly and bot starts.
+4. Document a remediation script (`scripts/migrate_dedupe_trades.py` or equivalent) that the operator runs offline. PR #59 review-8 finding #2 fix: the script **does not silently auto-delete rows**. Duplicate trade rows can carry conflicting accounting data (different `realized_pnl`, different `slippage_*` values, possibly different `position_uid`s in the legacy path), and "highest `filled_qty`" is not a safe proxy for "the row to keep" when accounting columns disagree. Auto-deletion would silently drop information the operator needs to see. The script's correct shape:
+
+   - **Detection-only mode (default)**: re-runs the queries; emits a per-conflict report listing every column where the duplicate rows disagree (filled_qty, avg_fill_price, realized_pnl, slippage_*, position_uid, position_type, timestamp, reason). Exits non-zero so it can be wired into operator dashboards / cron without surprising deletes
+   - **Operator review**: the operator inspects each conflict and decides whether to KEEP, MERGE (specifying which fields come from which row), or escalate (some conflicts represent a deeper data-integrity issue and aren't safe to "fix" by deleting one side)
+   - **Apply mode (`--apply`)**: takes a JSON or YAML file produced by the review step, applies the operator's decisions one transaction per conflict, prints a summary, and re-runs the detection queries to confirm zero remaining duplicates
+   - Same shape for `position_lifecycle.owner_key` duplicates — operator inspection required; some pairs represent legitimate edge cases (synthesized backfill row + pre-existing pending row) that need ad-hoc resolution
+   - Exits 0 only after a clean detection run on the post-apply state
+
+5. After the script's `--apply` step runs cleanly, the next `recycle_bot.sh` applies the unique indexes and bot starts.
 
 Real-world sources of duplicates that this protects against:
 - early bugs that re-logged the same `order_id` from both stream and REST paths before the slippage Phase 1 dedup work landed
