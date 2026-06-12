@@ -393,6 +393,19 @@ CREATE TABLE position_lifecycle_orders (
     FOREIGN KEY(position_uid) REFERENCES position_lifecycle(position_uid)
 );
 
+-- SQLite FK enforcement gotcha (PR #59 review-13 Gemini fix).
+-- SQLite does NOT enforce FOREIGN KEY constraints by default — they
+-- are declared in the schema but advisory unless `PRAGMA foreign_keys = ON;`
+-- is executed on every connection that opens the database. Without
+-- that PRAGMA, a buggy writer could insert a position_lifecycle_orders
+-- row pointing at a non-existent position_uid and SQLite would happily
+-- accept it. The implementation PR must add
+-- `conn.execute("PRAGMA foreign_keys = ON;")` to TradeLogger._ensure_db
+-- (reporting/logger.py:354) immediately after sqlite3.connect, BEFORE
+-- any DDL or DML runs. Today's _ensure_db only sets PRAGMA table_info
+-- (a read-only introspection PRAGMA, unrelated); the FK enforcement
+-- PRAGMA is missing and must be added.
+
 -- Unique constraints (PR #59 review-2 fix: non-unique indexes don't enforce exactly-once).
 -- order_id is NULL during pending; partial unique index permits multiple NULLs
 -- but rejects duplicate non-NULL ids (SQLite supports this natively).
@@ -465,7 +478,7 @@ Notes:
 - **No computed slippage bps on this table.** Per the cross-workstream phase-boundary feedback: the per-order table owns pre-fill *intent* and *benchmark provenance*; computed `slippage_signed_bps` / `slippage_adverse_bps` stay on `trades`. The order table is not a second slippage-reporting store.
 - **`created_at` vs `submitted_at` vs `terminal_at`** — three distinct moments. `created_at` is row insert (before broker submit). `submitted_at` is when submit returned (NULL while the row is `pending`). `terminal_at` is the move to a terminal status.
 
-`position_lifecycle` keeps its position-level fields (`status`, `current_qty`, `avg_entry_price`, `net_realized_pnl`) as a rollup derived from the child rows. The position-level `entry_order_id` column is retained as a non-authoritative mirror of the `entry_primary` row's order_id for backward compatibility.
+`position_lifecycle` keeps its position-level fields (`status`, `current_qty`, `avg_entry_price`) as a rollup derived from the child rows in `position_lifecycle_orders`, and `net_realized_pnl` as a rollup from the `trades` table — the per-order table does not carry realized P&L (per §11's ownership boundary: `trades` is the source of truth for realized P&L and computed slippage). PR #59 review-13 Gemini fix. The position-level `entry_order_id` column is retained as a non-authoritative mirror of the `entry_primary` row's order_id for backward compatibility.
 
 ### 6.3 Per-order state machine
 
@@ -596,8 +609,13 @@ with conn:  # sqlite3 context manager: commits on success, rolls back on any exc
     # Step 2: aggregate trades UPSERT keyed by order_id (§6.5 SQL).
     conn.execute(TRADES_UPSERT_SQL, fill_params)
 
-    # Step 3: recompute position-level current_qty + avg_entry_price
-    # from the per-order rows (§6.6 side-signed sum).
+    # Step 3: recompute position-level rollup fields:
+    #   - current_qty + avg_entry_price from the per-order rows
+    #     (§6.6 side-signed sum)
+    #   - net_realized_pnl from `trades` (§6.6 — per-order table
+    #     does not carry realized P&L; trades is the source of
+    #     truth per §11's ownership boundary)
+    # All three are written by one atomic UPDATE on position_lifecycle.
     conn.execute(POSITION_ROLLUP_SQL, {"position_uid": position_uid})
 
     # Step 4: update position-level status based on the new rollup.
@@ -747,7 +765,17 @@ WHERE position_uid = :position_uid
   AND filled_qty > 0;
 ```
 
-Canceled rows with `filled_qty = 0` contribute 0 to both rollups, so the partial-then-cancel case (per-order goes `partially_filled → canceled` with preserved `filled_qty > 0`) is captured correctly: the realized partial counts toward the position's current_qty even though the per-order row is terminal at `canceled`.
+`net_realized_pnl` is the sum of realized P&L from `trades`, NOT from the per-order table — the per-order rows carry pre-fill intent and order-state only, and don't have a `realized_pnl` column. The accounting source of truth stays on `trades` per §11's ownership boundary. PR #59 review-13 Gemini fix:
+
+```sql
+SELECT COALESCE(SUM(realized_pnl), 0.0) AS net_realized_pnl
+FROM trades
+WHERE position_uid = :position_uid;
+```
+
+This query runs as part of Step 3 of `apply_order_event`'s transaction (§6.4) alongside the `current_qty` and `avg_entry_price` recomputes — all three feed into the same atomic UPDATE on `position_lifecycle`. The `trades.position_uid` column has been populated since the slippage Phase 1 / Operator Controls Phase A work and is indexed at [reporting/logger.py:262](../reporting/logger.py:262) for fast lookup.
+
+Canceled rows with `filled_qty = 0` contribute 0 to the per-order rollups (`current_qty` and `avg_entry_price`), so the partial-then-cancel case is captured correctly. Realized-P&L rollup is similarly idempotent: a canceled order produces no new trade row, so re-applying the same event leaves `net_realized_pnl` unchanged.
 
 The §8.1 invariant on the position-level row uses this rollup: if `current_qty > 0`, the position-level row's status stays `open` / `partially_filled`. The store-boundary `mark_canceled` guard at [engine/lifecycle.py:486](../engine/lifecycle.py:486) continues to refuse `pending → canceled` when there are fills.
 
@@ -1200,8 +1228,10 @@ Several findings during PR #59 review would have shipped as production bugs if n
 | **Broker-snapshot entry guard still rejects shared-symbol submit** — disable the position-level DB UNIQUE index, leave the broker-snapshot pre-submit check enabled; assert a duplicate-entry attempt is still blocked (defense-in-depth, not parallel state) | Layered duplicate-entry defense (review-10 P1) | §10.1 |
 | **Direct `pending → filled` transition allowed via fast path** — submit an entry that synchronously returns broker-side `filled` (no intermediate `working` event observed); apply the resulting event; assert the per-order row advances directly from `pending` to `filled` AND the position rollup updates correctly | State-machine diagram allowing direct pending → filled (review-11 P1) | §6.3 / §6.4 |
 | **Direct `pending → canceled` transition allowed via recovery** — create a pending per-order row locally; simulate broker recovery (REST poll or startup walk) returning a terminal `canceled` status with `filled_qty=0` for that order; apply the resulting event; assert the per-order row advances directly from `pending` to `canceled` (no intermediate `working` observed) AND the §8.1 invariant holds (zero fills → position-level row can reach `canceled`) | State-machine diagram missing pending → canceled edge (review-12) | §6.3 / §6.4 |
+| **`PRAGMA foreign_keys = ON;` is set and FK violations are rejected** — open a TradeLogger connection; attempt to INSERT a `position_lifecycle_orders` row with `position_uid` referencing a non-existent `position_lifecycle` row; assert the INSERT fails with `sqlite3.IntegrityError`. Repeat for `option_trailing_stops.lifecycle_order_id` referencing a non-existent `position_lifecycle_orders.id`. Without the PRAGMA, both INSERTs would silently succeed, leaving dangling FK references | SQLite FK enforcement is OFF by default (review-13 Gemini) | §6.2 |
+| **`net_realized_pnl` rollup pulls from `trades`, not from `position_lifecycle_orders`** — open a position, fill an entry, fill an exit at a profit; assert `position_lifecycle.net_realized_pnl` equals `SUM(trades.realized_pnl WHERE position_uid = ?)` for that position. Repeat with a partial close (multiple realized-P&L rows on `trades`); assert the rollup correctly aggregates across rows | Per-order table has no realized_pnl column; trades is the source of truth (review-13 Gemini) | §6.6 |
 
-The first three are explicit regressions where my earlier doc draft had the bug. The next two are the corrections from review-5. Tests 11–16 are correctness conditions added in review-7 and review-8 (zero-fill working entry, working stops + closed, closed_at semantics, error lock retention, reverse-pass error skip, dedupe-script safety). Tests 14, 15, and 19 are review-9 fixes (CTE-based closed_at read, negative-qty error path, preflight/index status alignment — typo in earlier draft said "14, 18, and 19"; review-11 typo fix). Tests 20, 21, and 22 are review-10 + review-11 + review-12 fixes (owner-lock retention extended to ALL non-terminal sell-side orders including stops, oversold immediate error, broker-snapshot defense-in-depth). Tests 23 and 24 are the `pending → filled` and `pending → canceled` direct transitions admitted by the strict-newer rule. The remaining tests are correctness conditions the audit identified that the implementation must verify rather than assume.
+The first three are explicit regressions where my earlier doc draft had the bug. The next two are the corrections from review-5. Tests 11–16 are correctness conditions added in review-7 and review-8 (zero-fill working entry, working stops + closed, closed_at semantics, error lock retention, reverse-pass error skip, dedupe-script safety). Tests 14, 15, and 19 are review-9 fixes (CTE-based closed_at read, negative-qty error path, preflight/index status alignment — typo in earlier draft said "14, 18, and 19"; review-11 typo fix). Tests 20, 21, and 22 are review-10 + review-11 + review-12 fixes (owner-lock retention extended to ALL non-terminal sell-side orders including stops, oversold immediate error, broker-snapshot defense-in-depth). Tests 23 and 24 are the `pending → filled` and `pending → canceled` direct transitions admitted by the strict-newer rule. Tests 25 and 26 are Gemini's review-13 fixes (SQLite FK enforcement PRAGMA, `net_realized_pnl` rollup source from `trades`). The remaining tests are correctness conditions the audit identified that the implementation must verify rather than assume.
 
 ### 12.2 Migration prerequisites — duplicate-row detection before applying UNIQUE indexes
 
