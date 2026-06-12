@@ -677,6 +677,19 @@ class TradingEngine:
         self._sync_option_trailing_stops(startup_snapshot)
         self._repair_missing_protective_stops(startup_snapshot)
 
+        # PR #58 R6 P1 #3: reconstruct the pending-residual-amendment
+        # cache from the trade DB. An in-memory entry can be lost across
+        # a restart; the trade DB always holds the residual's row (linked
+        # via position_uid_override). Any residual row whose primary's
+        # lifecycle is still 'pending' represents work the drain pass
+        # must still perform.
+        try:
+            self._restore_pending_residual_amendments()
+        except Exception as exc:
+            logger.warning(
+                f"failed to reconstruct pending residual amendments: {exc}"
+            )
+
         slot_desc = ", ".join(
             f"{s.strategy.name}({len(s.active_symbols())})"
             for s in self.slots
@@ -1777,12 +1790,17 @@ class TradingEngine:
                     OrderStatus.TIMEOUT,
                 }
             ):
-                # PR #58 R4 P2: pass the primary's position_uid so the
-                # residual's fill amends the same lifecycle row.
+                # PR #58 R4 P2 + R6 P1 #4: pass the primary's position_uid
+                # so the residual's fill amends the same lifecycle row,
+                # plus the trigger price + chase ceiling (= the primary's
+                # entry_max_price) so the residual re-checks the live
+                # quote against both gates at submission time.
                 self._submit_stop_limit_residual(
                     residual_decision,
                     strategy.name,
                     primary_position_uid=result.position_uid,
+                    trigger_price=decision.entry_trigger_price,
+                    chase_ceiling=decision.entry_max_price,
                 )
             if result.status is OrderStatus.UNKNOWN:
                 # Preserve the benchmark provenance so the recovery row
@@ -1793,6 +1811,41 @@ class TradingEngine:
                     result,
                     modeled_price=slippage_ref,
                     modeled_price_kind=slippage_kind or "unavailable",
+                )
+                if strategy_statuses is not None:
+                    strategy_statuses[symbol] = "Pending Entry"
+                if strategy_reasons is not None:
+                    strategy_reasons[symbol] = []
+                self._mark_signal_bar_processed(
+                    signal_key, signal_bar, strategy_statuses, strategy_reasons, symbol
+                )
+                return None
+            if (
+                result.status is OrderStatus.TIMEOUT
+                and decision.order_type is OrderType.STOP_LIMIT
+            ):
+                # PR #58 R6 P1 #1: a STOP_LIMIT that times out at the broker
+                # is RESTING — it WILL fill later when price crosses the
+                # trigger. Register ownership pre-emptively (mirrors the
+                # ACCEPTED branch below for options) AND enter the suspect-
+                # order recovery cache so the eventual fill is reconciled
+                # against the trade DB, lifecycle row, and slippage
+                # benchmark by _recover_suspect_orders on a subsequent
+                # cycle. Without this, the engine has no record of having
+                # submitted the order — the position lands at the broker
+                # unowned and the lifecycle row stays pending forever.
+                self._register_single_leg(strategy_name=strategy.name, symbol=target_symbol)
+                self._entry_prices[symbol] = target_price
+                self._remember_suspect_order(
+                    decision,
+                    result,
+                    modeled_price=slippage_ref,
+                    modeled_price_kind=slippage_kind or "unavailable",
+                )
+                logger.info(
+                    f"[{strategy.name}] {symbol}: STOP_LIMIT resting at "
+                    f"broker (TIMEOUT) — ownership pre-registered, "
+                    f"suspect-order recovery armed for next cycle"
                 )
                 if strategy_statuses is not None:
                     strategy_statuses[symbol] = "Pending Entry"
@@ -2212,6 +2265,72 @@ class TradingEngine:
         )
         return whole, residual
 
+    def _restore_pending_residual_amendments(self) -> None:
+        """PR #58 R6 P1 #3: reconstruct the in-memory pending-residual-
+        amendment cache from the trade DB at startup.
+
+        Approach: for each lifecycle row still in 'pending' status,
+        check if the trade DB has a BUY row tagged with the same
+        position_uid. If yes, a residual landed before the previous
+        shutdown and its amendment was lost from in-memory state. Cache
+        it so the next cycle's drain pass reconciles.
+
+        Scope: only iterates pending lifecycle rows (typically a small
+        set). Idempotent — no rows → no-op."""
+        if self.lifecycle_store is None or self.trade_logger is None:
+            return
+        try:
+            open_rows = self.lifecycle_store.get_open()
+        except Exception as exc:
+            logger.warning(
+                f"[PLAN 11.47] could not enumerate lifecycle rows for "
+                f"residual-amendment restore: {exc}"
+            )
+            return
+        restored = 0
+        for row in open_rows:
+            if row.status != "pending":
+                continue
+            try:
+                trade_rows = self.trade_logger.read_entry_rows_for_position_uid(
+                    row.position_uid
+                )
+            except Exception as exc:
+                logger.debug(
+                    f"[PLAN 11.47] entry-row lookup failed for "
+                    f"{row.position_uid}: {exc}"
+                )
+                continue
+            if not trade_rows:
+                continue
+            # Aggregate all BUY rows tied to this position_uid — they
+            # are all residual fills (the primary STOP_LIMIT is still
+            # pending, so its fill row hasn't been written yet).
+            total_qty = 0.0
+            weighted_sum = 0.0
+            for tr in trade_rows:
+                q = float(tr.get("qty") or 0.0)
+                p = float(tr.get("avg_fill_price") or tr.get("price") or 0.0)
+                if q <= 0 or p <= 0:
+                    continue
+                total_qty += q
+                weighted_sum += q * p
+            if total_qty <= 0 or weighted_sum <= 0:
+                continue
+            self._pending_residual_amendments[row.position_uid] = {
+                "owner_key": row.owner_key,
+                "primary_qty": float(row.current_qty),
+                "residual_qty": total_qty,
+                "residual_avg_price": weighted_sum / total_qty,
+                "recorded_at": "startup_restore",
+            }
+            restored += 1
+        if restored:
+            logger.info(
+                f"[PLAN 11.47] restored {restored} pending residual "
+                f"amendment(s) from trade DB"
+            )
+
     def _drain_pending_residual_amendments(self, snapshot: BrokerSnapshot) -> None:
         """PR #58 R5 P1 #2: drain cached residual amendments whose primary
         lifecycle row was still pending when the residual filled.
@@ -2290,6 +2409,20 @@ class TradingEngine:
                 broker_basis = float(broker_basis) if broker_basis else None
                 if broker_qty <= 0 or broker_basis is None or broker_basis <= 0:
                     continue
+                # PR #58 R6 P1 #2: only transition pending → open when
+                # the broker shows the WHOLE-SHARE leg has filled. If
+                # broker_qty is below primary_qty, only the residual has
+                # filled — leave the cache for next cycle. The EOD orphan
+                # sweep handles cleanup if the primary never triggers.
+                primary_qty = float(cached.get("primary_qty") or 0.0)
+                if primary_qty > 0 and broker_qty + 1e-9 < primary_qty:
+                    logger.debug(
+                        f"[PLAN 11.47] residual cache {uid}: broker shows "
+                        f"qty={broker_qty} < primary_qty={primary_qty} — "
+                        f"whole-share leg has not filled yet; leaving "
+                        f"cache for next cycle"
+                    )
+                    continue
                 self.lifecycle_store.mark_open(
                     position_uid=uid,
                     avg_entry_price=broker_basis,
@@ -2350,16 +2483,20 @@ class TradingEngine:
                 )
                 return
             if row.status != "open":
-                # PR #58 R5 P1 #2: cache the residual fill instead of
-                # discarding the deferred case. Each market-open cycle
-                # the drain pass will detect when the broker reports a
-                # position for the primary's owner_key and transition
-                # the pending lifecycle row to 'open' using broker truth
-                # (broker.avg_entry_price already reflects the weighted
-                # aggregation of primary + residual fills at the symbol
-                # level).
+                # PR #58 R5 P1 #2 + R6 P1 #2: cache the residual fill
+                # instead of discarding the deferred case. Each market-
+                # open cycle the drain pass detects when the broker
+                # reports a position whose qty is at-or-above the
+                # primary's intended whole-share qty and only then
+                # transitions the lifecycle row to 'open' using broker
+                # truth. Gating on primary_qty prevents the cache from
+                # being consumed when only the fractional residual has
+                # filled (broker reports 0.88 shares) — that state is
+                # still 'pending primary' and the EOD orphan sweep
+                # handles cleanup if the primary never triggers.
                 self._pending_residual_amendments[primary_position_uid] = {
                     "owner_key": row.owner_key,
+                    "primary_qty": float(row.current_qty),
                     "residual_qty": float(residual_qty),
                     "residual_avg_price": float(residual_avg_price),
                     "recorded_at": datetime.now(timezone.utc).isoformat(),
@@ -2367,9 +2504,9 @@ class TradingEngine:
                 logger.info(
                     f"[PLAN 11.47] residual fill cached for lifecycle "
                     f"row {primary_position_uid}: primary status="
-                    f"{row.status}, owner_key={row.owner_key} "
-                    f"(will be reconciled on next cycle once broker "
-                    f"reports the aggregated position)"
+                    f"{row.status}, owner_key={row.owner_key}, "
+                    f"primary_qty={row.current_qty} (will reconcile when "
+                    f"broker reports the whole-share leg filled)"
                 )
                 return
             old_qty = float(row.current_qty)
@@ -2402,6 +2539,9 @@ class TradingEngine:
         residual: RiskDecision,
         strategy_name: str,
         primary_position_uid: str | None = None,
+        *,
+        trigger_price: float | None = None,
+        chase_ceiling: float | None = None,
     ) -> None:
         """Submit the fractional MARKET residual after the primary
         STOP_LIMIT has been placed. Logged, slippage-recorded via the
@@ -2421,6 +2561,35 @@ class TradingEngine:
             arrival_price = _finite_or_none(
                 self.broker.get_latest_quote_midpoint(residual.symbol)
             )
+            # PR #58 R6 P1 #4: re-check the live quote at SUBMISSION time
+            # against the trigger and the chase ceiling. The decision was
+            # built earlier with a stale snapshot of the quote — between
+            # split-time and now the broker poll could have taken seconds,
+            # during which the market may have dropped below the trigger
+            # (failed-breakout state) or gapped above the cap (chase
+            # risk). Either condition aborts the residual rather than
+            # silently submitting an uncapped MARKET on a stale gate.
+            if trigger_price is not None and (
+                arrival_price is None or arrival_price < trigger_price
+            ):
+                logger.info(
+                    f"[{strategy_name}] {residual.symbol}: residual MARKET "
+                    f"aborted at submission — live="
+                    f"{f'${arrival_price:.2f}' if arrival_price is not None else 'unavailable'}, "
+                    f"trigger=${trigger_price:.2f} (stale-trigger guard, R6 P1 #4)"
+                )
+                return
+            if (
+                chase_ceiling is not None
+                and arrival_price is not None
+                and arrival_price > chase_ceiling
+            ):
+                logger.info(
+                    f"[{strategy_name}] {residual.symbol}: residual MARKET "
+                    f"aborted at submission — live=${arrival_price:.2f}, "
+                    f"ceiling=${chase_ceiling:.2f} (chase-ceiling guard, R6 P1 #4)"
+                )
+                return
             slippage_ref = (
                 arrival_price
                 if arrival_price is not None
@@ -2460,6 +2629,29 @@ class TradingEngine:
                     primary_position_uid=primary_position_uid,
                     residual_qty=float(result.filled_qty or 0.0),
                     residual_avg_price=result.avg_fill_price,
+                )
+            elif result.status in {OrderStatus.TIMEOUT, OrderStatus.UNKNOWN}:
+                # PR #58 R6 P1 #5: residual fill confirmation is
+                # ambiguous. Register the order in the suspect-order
+                # recovery cache so _recover_suspect_orders picks it up
+                # on the next cycle, reconciles via REST, and adopts the
+                # fill into the trade DB + lifecycle row if it landed.
+                # Without this, a TIMEOUT/UNKNOWN residual whose fill
+                # landed at the broker would be silently dropped from the
+                # engine's view.
+                self._remember_suspect_order(
+                    residual,
+                    result,
+                    modeled_price=slippage_ref,
+                    modeled_price_kind=(
+                        "arrival_midpoint" if arrival_price is not None
+                        else "fallback_reference_price"
+                    ),
+                )
+                logger.warning(
+                    f"[{strategy_name}] {residual.symbol}: residual MARKET "
+                    f"returned {result.status.value} — suspect-order "
+                    f"recovery armed for next cycle"
                 )
         except Exception as e:
             logger.warning(

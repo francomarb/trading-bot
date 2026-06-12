@@ -859,6 +859,27 @@ class TradeLogger:
         rows.reverse()  # Return in chronological order
         return rows
 
+    def read_entry_rows_for_position_uid(
+        self, position_uid: str
+    ) -> list[dict]:
+        """PR #58 R6 P1 #3: return all entry (BUY) trade rows tagged
+        with the given position_uid. Used at startup to reconstruct the
+        in-memory pending-residual-amendment cache: a row for a position
+        whose lifecycle is still 'pending' indicates a residual that
+        landed before restart and whose lifecycle amendment was lost
+        from in-memory state."""
+        if not os.path.exists(self._path):
+            return []
+        conn = self._ensure_db()
+        conn.row_factory = sqlite3.Row
+        cursor = conn.execute(
+            f"SELECT {', '.join(TRADE_COLUMNS)} FROM trades "
+            "WHERE position_uid = ? AND side = 'buy' "
+            "ORDER BY id",
+            (position_uid,),
+        )
+        return [dict(row) for row in cursor.fetchall()]
+
     def log_external_close(self, *, symbol: str, strategy: str, reason: str) -> None:
         """
         Write a synthetic sell record when a position disappears externally

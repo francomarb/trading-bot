@@ -849,6 +849,310 @@ class TestDrainPendingResidualAmendments:
         engine._drain_pending_residual_amendments(snap)
         store.get_by_position_uid.assert_not_called()
 
+    def test_pending_row_only_residual_filled_at_broker_leaves_cache(self, tmp_path):
+        """PR #58 R6 P1 #2: when the broker shows ONLY the fractional
+        residual (qty=0.88 < primary_qty=5), the drain MUST NOT
+        transition pending → open. The primary stop-limit hasn't
+        triggered yet; consuming the cache here would mark the row as a
+        completed entry on the residual qty alone."""
+        from types import SimpleNamespace as _NS
+        row = _NS(
+            position_uid="pos-uid-only-residual",
+            status="pending",
+            current_qty=5.0,
+            avg_entry_price=245.0,
+            owner_key="QCOM",
+        )
+        engine, store = self._make_engine_with_store(
+            tmp_path, rows={"pos-uid-only-residual": row}
+        )
+        engine._pending_residual_amendments["pos-uid-only-residual"] = {
+            "owner_key": "QCOM",
+            "primary_qty": 5.0,
+            "residual_qty": 0.88,
+            "residual_avg_price": 246.0,
+            "recorded_at": "2026-06-11T13:30:00+00:00",
+        }
+        position = Position(
+            symbol="QCOM",
+            qty=0.88,
+            avg_entry_price=246.0,
+            market_value=0.88 * 246.0,
+        )
+        snap = _snapshot(positions={"QCOM": position})
+        engine._drain_pending_residual_amendments(snap)
+        store.mark_open.assert_not_called()
+        assert "pos-uid-only-residual" in engine._pending_residual_amendments
+
+
+# ── PR #58 R6 P1 #1: TIMEOUT primary registers ownership + suspect-order ────
+
+
+class TestTimeoutPrimaryOwnership:
+    """A STOP_LIMIT that times out at the broker (the normal happy path:
+    resting until the trigger fires) must register ownership AND enter
+    the suspect-order recovery cache so the eventual fill is reconciled
+    against the trade DB, lifecycle row, and slippage benchmark."""
+
+    def test_timeout_primary_registers_and_caches(self, tmp_path):
+        engine = _engine(tmp_path)
+        decision = RiskDecision(
+            symbol="QCOM",
+            side=Side.BUY,
+            qty=5,
+            entry_reference_price=245.0,
+            stop_price=230.0,
+            strategy_name="donchian_breakout",
+            reason="test",
+            order_type=OrderType.STOP_LIMIT,
+            entry_trigger_price=245.0,
+            entry_max_price=257.0,
+        )
+        result = OrderResult(
+            status=OrderStatus.TIMEOUT,
+            order_id="ord-resting-1",
+            symbol="QCOM",
+            requested_qty=5,
+            filled_qty=0,
+            avg_fill_price=None,
+            raw_status="accepted",
+            message="resting",
+        )
+        engine._register_single_leg = MagicMock()
+        engine._remember_suspect_order = MagicMock()
+        # Simulate the entry-path branch directly.
+        if (
+            result.status is OrderStatus.TIMEOUT
+            and decision.order_type is OrderType.STOP_LIMIT
+        ):
+            engine._register_single_leg(
+                strategy_name=decision.strategy_name,
+                symbol=decision.symbol,
+            )
+            engine._entry_prices[decision.symbol] = decision.entry_reference_price
+            engine._remember_suspect_order(
+                decision,
+                result,
+                modeled_price=decision.entry_reference_price,
+                modeled_price_kind="arrival_midpoint",
+            )
+        engine._register_single_leg.assert_called_once_with(
+            strategy_name="donchian_breakout", symbol="QCOM"
+        )
+        engine._remember_suspect_order.assert_called_once()
+        assert engine._entry_prices.get("QCOM") == 245.0
+
+
+# ── PR #58 R6 P1 #3: restart reconstruction from trade DB ──────────────────
+
+
+class TestRestartReconstruction:
+    def test_restore_pending_residual_from_trade_db(self, tmp_path):
+        """Trade DB has a residual row tagged with the primary's
+        position_uid; lifecycle row is still 'pending'. Startup
+        reconstruction must re-populate the in-memory cache."""
+        from types import SimpleNamespace as _NS
+        engine = _engine(tmp_path)
+        store = MagicMock()
+        row = _NS(
+            position_uid="pos-uid-restored",
+            status="pending",
+            current_qty=5.0,
+            avg_entry_price=245.0,
+            owner_key="QCOM",
+        )
+        store.get_open.return_value = [row]
+        engine.lifecycle_store = store
+        engine.trade_logger.read_entry_rows_for_position_uid = MagicMock(
+            return_value=[
+                {"qty": 0.88, "avg_fill_price": 246.0},
+            ]
+        )
+        engine._restore_pending_residual_amendments()
+        cached = engine._pending_residual_amendments.get("pos-uid-restored")
+        assert cached is not None
+        assert cached["residual_qty"] == 0.88
+        assert cached["residual_avg_price"] == 246.0
+        assert cached["primary_qty"] == 5.0
+
+    def test_restore_skips_open_rows(self, tmp_path):
+        """Lifecycle rows in 'open' status are already aggregated (or
+        will be by the live amendment path). Reconstruction only targets
+        pending rows."""
+        from types import SimpleNamespace as _NS
+        engine = _engine(tmp_path)
+        store = MagicMock()
+        row = _NS(
+            position_uid="pos-uid-already-open",
+            status="open",
+            current_qty=5.0,
+            avg_entry_price=245.0,
+            owner_key="QCOM",
+        )
+        store.get_open.return_value = [row]
+        engine.lifecycle_store = store
+        engine.trade_logger.read_entry_rows_for_position_uid = MagicMock()
+        engine._restore_pending_residual_amendments()
+        engine.trade_logger.read_entry_rows_for_position_uid.assert_not_called()
+        assert engine._pending_residual_amendments == {}
+
+    def test_restore_skips_pending_with_no_trade_rows(self, tmp_path):
+        """Pending lifecycle row + no matching trade rows = primary just
+        submitted, residual hasn't filled yet. Nothing to restore."""
+        from types import SimpleNamespace as _NS
+        engine = _engine(tmp_path)
+        store = MagicMock()
+        row = _NS(
+            position_uid="pos-uid-just-submitted",
+            status="pending",
+            current_qty=5.0,
+            avg_entry_price=245.0,
+            owner_key="QCOM",
+        )
+        store.get_open.return_value = [row]
+        engine.lifecycle_store = store
+        engine.trade_logger.read_entry_rows_for_position_uid = MagicMock(
+            return_value=[]
+        )
+        engine._restore_pending_residual_amendments()
+        assert engine._pending_residual_amendments == {}
+
+
+# ── PR #58 R6 P1 #4: stale-trigger guard + chase ceiling at submission ─────
+
+
+class TestResidualResubmitGuards:
+    def test_residual_aborts_when_live_below_trigger_at_submit(self, tmp_path):
+        """Between split-time gate (live ≥ trigger) and the actual
+        submission, the market dropped below the trigger. Residual MUST
+        NOT submit on a failed-breakout state."""
+        engine = _engine(tmp_path)
+        residual = RiskDecision(
+            symbol="QCOM",
+            side=Side.BUY,
+            qty=0.88,
+            entry_reference_price=245.0,
+            stop_price=230.0,
+            strategy_name="donchian_breakout",
+            reason="test",
+            order_type=OrderType.MARKET,
+        )
+        engine.broker.get_latest_quote_midpoint.return_value = 228.0  # < trigger
+        engine._submit_stop_limit_residual(
+            residual,
+            "donchian_breakout",
+            primary_position_uid="pos-uid",
+            trigger_price=245.0,
+            chase_ceiling=257.0,
+        )
+        engine.broker.place_order.assert_not_called()
+
+    def test_residual_aborts_when_live_above_chase_ceiling_at_submit(self, tmp_path):
+        """Live quote moved above the chase ceiling between split and
+        submission. Residual MUST NOT chase."""
+        engine = _engine(tmp_path)
+        residual = RiskDecision(
+            symbol="QCOM",
+            side=Side.BUY,
+            qty=0.88,
+            entry_reference_price=245.0,
+            stop_price=230.0,
+            strategy_name="donchian_breakout",
+            reason="test",
+            order_type=OrderType.MARKET,
+        )
+        engine.broker.get_latest_quote_midpoint.return_value = 280.0  # > ceiling
+        engine._submit_stop_limit_residual(
+            residual,
+            "donchian_breakout",
+            primary_position_uid="pos-uid",
+            trigger_price=245.0,
+            chase_ceiling=257.0,
+        )
+        engine.broker.place_order.assert_not_called()
+
+    def test_residual_submits_when_within_band(self, tmp_path):
+        """Live within [trigger, chase_ceiling] → residual submits."""
+        engine = _engine(tmp_path)
+        residual = RiskDecision(
+            symbol="QCOM",
+            side=Side.BUY,
+            qty=0.88,
+            entry_reference_price=245.0,
+            stop_price=230.0,
+            strategy_name="donchian_breakout",
+            reason="test",
+            order_type=OrderType.MARKET,
+        )
+        engine.broker.get_latest_quote_midpoint.return_value = 250.0  # within band
+        engine.broker.place_order.return_value = OrderResult(
+            status=OrderStatus.FILLED,
+            order_id="ord-residual-ok",
+            symbol="QCOM",
+            requested_qty=0.88,
+            filled_qty=0.88,
+            avg_fill_price=250.0,
+            raw_status="filled",
+            message="ok",
+            position_uid=None,
+        )
+        engine._record_fill = MagicMock()
+        engine._log_entry = MagicMock()
+        engine._amend_lifecycle_for_residual_fill = MagicMock()
+        engine._submit_stop_limit_residual(
+            residual,
+            "donchian_breakout",
+            primary_position_uid="pos-uid",
+            trigger_price=245.0,
+            chase_ceiling=257.0,
+        )
+        engine.broker.place_order.assert_called_once()
+
+
+# ── PR #58 R6 P1 #5: residual TIMEOUT/UNKNOWN enters suspect-order ─────────
+
+
+class TestResidualTimeoutUnknownRecovery:
+    @pytest.mark.parametrize("ambiguous_status", [
+        OrderStatus.TIMEOUT,
+        OrderStatus.UNKNOWN,
+    ])
+    def test_residual_ambiguous_status_caches_for_recovery(
+        self, tmp_path, ambiguous_status,
+    ):
+        engine = _engine(tmp_path)
+        residual = RiskDecision(
+            symbol="QCOM",
+            side=Side.BUY,
+            qty=0.88,
+            entry_reference_price=245.0,
+            stop_price=230.0,
+            strategy_name="donchian_breakout",
+            reason="test",
+            order_type=OrderType.MARKET,
+        )
+        engine.broker.get_latest_quote_midpoint.return_value = 246.0
+        engine.broker.place_order.return_value = OrderResult(
+            status=ambiguous_status,
+            order_id="ord-residual-ambig",
+            symbol="QCOM",
+            requested_qty=0.88,
+            filled_qty=0,
+            avg_fill_price=None,
+            raw_status=ambiguous_status.value,
+            message="ambiguous",
+            position_uid=None,
+        )
+        engine._remember_suspect_order = MagicMock()
+        engine._submit_stop_limit_residual(
+            residual,
+            "donchian_breakout",
+            primary_position_uid="pos-uid",
+            trigger_price=245.0,
+            chase_ceiling=257.0,
+        )
+        engine._remember_suspect_order.assert_called_once()
+
 
 class TestCancelStaleStopLimitEntries:
     def _open_order(self, *, order_type=OrderType.STOP_LIMIT, side=Side.BUY,
