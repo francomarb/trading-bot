@@ -407,6 +407,21 @@ CREATE UNIQUE INDEX uniq_lifecycle_orders_client_order_id
 CREATE UNIQUE INDEX uniq_one_entry_primary_per_position
     ON position_lifecycle_orders(position_uid) WHERE role = 'entry_primary';
 
+-- A position has at most one non-terminal close-side order at a time:
+-- if a discretionary exit OR an operator-issued partial_close is already
+-- working, the bot must NOT submit a second one. This is the durable
+-- analog of today's `_spreads_pending_close` set and the
+-- `_has_pending_close_order()` snapshot check — both are in-memory and
+-- restart-volatile. PR #59 review-7 finding P1: foundation makes this
+-- a durable constraint enforced by the database. Stop-side roles
+-- (protective_stop, replacement_stop) are NOT included — replacement_stop
+-- is an intentional second-stop pattern (PR #47 GTC promotion) and
+-- protective_stop is OTO-paired with the entry, not a competing close.
+CREATE UNIQUE INDEX uniq_one_active_close_per_position
+    ON position_lifecycle_orders(position_uid)
+    WHERE role IN ('exit', 'partial_close')
+    AND status IN ('pending', 'working', 'partially_filled', 'unknown');
+
 CREATE INDEX idx_lifecycle_orders_position_uid ON position_lifecycle_orders(position_uid);
 CREATE INDEX idx_lifecycle_orders_status       ON position_lifecycle_orders(status);
 CREATE INDEX idx_lifecycle_orders_parent       ON position_lifecycle_orders(parent_order_id);
@@ -574,7 +589,9 @@ with conn:  # sqlite3 context manager: commits on success, rolls back on any exc
     conn.execute(POSITION_ROLLUP_SQL, {"position_uid": position_uid})
 
     # Step 4: update position-level status based on the new rollup.
-    # closed when current_qty == 0; partially_filled / open otherwise.
+    # See §6.6.1 for the exact SQL; the naive `current_qty == 0 →
+    # closed` rule is WRONG because a freshly-submitted entry sitting
+    # at `working` with zero fills also has current_qty == 0.
     conn.execute(POSITION_STATUS_SQL, {"position_uid": position_uid})
 # implicit COMMIT here
 ```
@@ -724,6 +741,107 @@ The §8.1 invariant on the position-level row uses this rollup: if `current_qty 
 
 **Short-position math (out of scope today).** This PR wires only long-equity / long-options strategies. If a future strategy goes short, the rollup needs to know whether the position was *opened* by a sell (short entry) or *closed* by a sell (long exit). The cleanest way to handle that later is a column or convention on the per-order row (e.g. `role` already encodes the intent: `entry_*` rows are inflows regardless of side; `exit` / `partial_close` / `protective_stop` / `replacement_stop` are outflows). For now the foundation PR assumes long-only and uses `side` as a sufficient proxy.
 
+### 6.6.1 Position-status update — must distinguish "never filled" from "fully exited"
+
+PR #59 review-7 P0: a naive `current_qty == 0 → 'closed'` rule wrongly marks a brand-new working entry as closed. A position whose only per-order row is an `entry_primary` at `status='working'` with `filled_qty=0` has `current_qty=0` because zero side-signed values sum to zero — but the position has never filled. Marking it `closed` would close the lifecycle before the entry ever runs.
+
+`POSITION_STATUS_SQL` must use the position's fill history together with the current rollup:
+
+```sql
+-- Compute the new position-level status from the per-order rows.
+-- Atomic single statement; runs as Step 4 inside apply_order_event's
+-- transaction (§6.4).
+UPDATE position_lifecycle
+SET status = (
+    SELECT CASE
+        -- Have any per-order rows reached `working` yet? If not,
+        -- the position is `pending` regardless of any other state.
+        WHEN NOT EXISTS (
+            SELECT 1 FROM position_lifecycle_orders
+            WHERE position_uid = :position_uid
+              AND status NOT IN ('pending')
+        ) THEN 'pending'
+
+        -- Any non-terminal order? Position is open / partially_filled
+        -- (per current_qty vs entry_qty), regardless of current_qty
+        -- value.
+        WHEN EXISTS (
+            SELECT 1 FROM position_lifecycle_orders
+            WHERE position_uid = :position_uid
+              AND status IN ('pending', 'working', 'partially_filled', 'unknown')
+        ) THEN
+            CASE
+                WHEN COALESCE((SELECT current_qty FROM position_lifecycle
+                               WHERE position_uid = :position_uid), 0) <= 0
+                     AND NOT EXISTS (
+                         SELECT 1 FROM position_lifecycle_orders
+                         WHERE position_uid = :position_uid
+                           AND filled_qty > 0
+                     )
+                THEN 'pending'  -- working entry sitting at 0 fills
+                WHEN COALESCE((SELECT current_qty FROM position_lifecycle
+                               WHERE position_uid = :position_uid), 0) > 0
+                     AND COALESCE((SELECT current_qty FROM position_lifecycle
+                                   WHERE position_uid = :position_uid), 0)
+                         < COALESCE((SELECT entry_qty FROM position_lifecycle
+                                     WHERE position_uid = :position_uid), 0)
+                THEN 'partially_filled'
+                ELSE 'open'
+            END
+
+        -- All orders are terminal. Did the position ever fill?
+        WHEN NOT EXISTS (
+            SELECT 1 FROM position_lifecycle_orders
+            WHERE position_uid = :position_uid
+              AND filled_qty > 0
+        ) THEN 'canceled'  -- all orders ended terminal with zero fills
+
+        -- Position filled and is now flat → closed.
+        WHEN COALESCE((SELECT current_qty FROM position_lifecycle
+                       WHERE position_uid = :position_uid), 0) <= 0
+        THEN 'closed'
+
+        -- Position filled but still holds a residual qty after some
+        -- exits — open / partially_filled per the standard rule.
+        WHEN COALESCE((SELECT current_qty FROM position_lifecycle
+                       WHERE position_uid = :position_uid), 0)
+             < COALESCE((SELECT entry_qty FROM position_lifecycle
+                         WHERE position_uid = :position_uid), 0)
+        THEN 'partially_filled'
+
+        ELSE 'open'
+    END
+),
+closed_at = CASE
+    WHEN (
+        SELECT NOT EXISTS (
+            SELECT 1 FROM position_lifecycle_orders
+            WHERE position_uid = :position_uid
+              AND status IN ('pending', 'working', 'partially_filled', 'unknown')
+        )
+        AND COALESCE((SELECT current_qty FROM position_lifecycle
+                      WHERE position_uid = :position_uid), 0) <= 0
+    ) THEN COALESCE(closed_at, :now)
+    ELSE closed_at
+END
+WHERE position_uid = :position_uid;
+```
+
+Decision tree it implements:
+
+1. **All per-order rows still in `pending`** → position is `pending` (waiting for first broker ack)
+2. **Some non-terminal orders exist**:
+   - Position has had zero fills so far → still `pending` (working entry, no fills yet)
+   - `current_qty > 0` and `< entry_qty` → `partially_filled`
+   - `current_qty > 0` and `== entry_qty` → `open`
+3. **All orders terminal, zero fills ever** → `canceled` (the §8.1 invariant is satisfied because `current_qty == 0` and there is no realized state)
+4. **All orders terminal, current_qty <= 0** → `closed` (position fully exited)
+5. **All orders terminal, current_qty > 0 but < entry_qty** → `partially_filled` (broker-side cancel after partial fill, no further exits)
+
+`closed_at` is only set when the position actually reaches `closed`. `pending → canceled` is the only other terminal transition; it doesn't set `closed_at` per the existing convention (the position never opened so there's no "close time" to record — the existing `mark_canceled` path sets `closed_at` for caller convenience but the field can remain NULL for true cancels).
+
+The §8.1 invariant is preserved end-to-end: a position whose any per-order row has `filled_qty > 0` cannot transition to `canceled` because case (3) requires zero fills across all per-order rows.
+
 ### 6.7 What this eliminates
 
 - `_suspect_orders` cache — replaced by per-order rows in `working` / `unknown` status
@@ -848,7 +966,7 @@ This matrix is the **implementation PR's migration checklist**. Every row should
 |---|---|
 | **Workarounds today** | `_suspect_orders` (§4.1); `LIFECYCLE_PENDING_GRACE_SECONDS` reverse-pass guard (§3.1); broker-open-order duplicate checks before entry submit; PR #58's `_restore_suspect_orders_from_broker` startup walk; PR #58's residual drains and symbol-keyed ownership shims |
 | **Anchor commits** | `88d1a45` (operator-queue / pending grace), `021fa63`, `4c727ae`, PR #58 R5–R7 patches `8ce0dee..00f9e53` |
-| **Foundation absorption** | One `apply_order_event` path drives stream, cycle, and startup. `pending → working → partially_filled → filled` advances on observed broker state. Symbol-level duplicate guard becomes the `UNIQUE WHERE role='entry_primary'` constraint on `position_lifecycle_orders` per §6.2; broker-side check becomes redundant once durable identity exists |
+| **Foundation absorption** | One `apply_order_event` path drives stream, cycle, and startup. `pending → working → partially_filled → filled` advances on observed broker state. Duplicate-entry prevention becomes the **position-level** `uniq_one_active_position_per_owner_key` partial unique index on `position_lifecycle` per §6.2 (PR #59 review-6 finding #1 / review-7 P2 fix). The per-order `uniq_one_entry_primary_per_position` constraint is belt-and-suspenders within a position; the actual duplicate-symbol-across-positions guard is at the position level. Broker-side snapshot check becomes redundant once these durable constraints exist |
 | **Preserved invariants** | (a) No duplicate entry while a non-terminal order exists for the same position. (b) Exact `client_order_id` / `order_id` reconciliation — never fuzzy match by symbol. (c) TIMEOUT and UNKNOWN remain recoverable through the next cycle/startup. (d) Slippage benchmark provenance survives restart (see §10.5). (e) A position is not marked `external_closed` while an order can still create or close it |
 | **Tests that survive** | PR #58's R5–R7 acceptance tests for hybrid recovery, the duplicate-entry guard tests from `88d1a45`, the pending-grace integration test |
 | **Pending-grace fallback** | `LIFECYCLE_PENDING_GRACE_SECONDS` may remain as a **bounded compatibility fallback during migration** — not the primary state model. Removed entirely only after `apply_order_event` is verified across stream / cycle / startup paths |
@@ -916,7 +1034,8 @@ This matrix is the **implementation PR's migration checklist**. Every row should
 |---|---|
 | **Workaround today** | `_spreads_pending_close: set[str]` ([engine/trader.py:406](../engine/trader.py:406)) is in-memory only; PR #56's restart-gap risk is real but acknowledged as out-of-scope for that PR |
 | **Anchor commits** | `9ccd7aa`, `1365742`, `b710aea`, `9e0f533`, `ffa0353` (PR #56) |
-| **Foundation does NOT solve this** | The audit is explicit: **do not** solve the spread restart gap with `engine_state.json` or a parallel persistence layer. The spread lifecycle PR is the right home — it should write combo close orders into the same per-order substrate and derive pending-close state from non-terminal order rows. The foundation PR just keeps the schema spread-compatible (§6.2's `role`, `parent_order_id` columns work for MLEG legs naturally) |
+| **Foundation does NOT solve the spread side** | The audit is explicit: **do not** solve the spread restart gap with `engine_state.json` or a parallel persistence layer. The spread lifecycle PR is the right home — it should write combo close orders into the same per-order substrate and derive pending-close state from non-terminal order rows. The foundation PR just keeps the schema spread-compatible (§6.2's `role`, `parent_order_id` columns work for MLEG legs naturally) |
+| **Foundation DOES solve the single-leg side (PR #59 review-7 P1 fix)** | For single-leg equity / single-leg option positions, the new `uniq_one_active_close_per_position` partial unique index in §6.2 IS the durable analog of `_has_pending_close_order()`. At most one non-terminal `role IN ('exit', 'partial_close')` row per `position_uid`. A second close attempt against the same position fails at the DB layer with a constraint violation — no in-memory cache required, restart-safe. The implementation PR's close path queries for any non-terminal close row before submitting; the unique index is belt-and-suspenders against races. The single-leg analog of `_spreads_pending_close` retires immediately on foundation merge; the spread-side cache stays until the spread lifecycle PR writes spread closes into the substrate |
 | **Preserved until spread lifecycle PR ships** | PR #56's fail-safe partial logging, residual ownership preservation, duplicate-dispatch block via `_spreads_pending_close` (in-memory cache stays), CRITICAL alert on partial close |
 | **Migration trigger** | Spread lifecycle PR writes spread entry / exit / close as `position_lifecycle_orders` rows keyed under the spread's `position_uid`. Pending-close state becomes "any non-terminal `role='exit'` order on this spread `position_uid`." `_spreads_pending_close` retires at that point |
 
@@ -1017,16 +1136,24 @@ GROUP BY owner_key
 HAVING COUNT(*) > 1;
 ```
 
-If either query returns rows, the migration:
+If either query returns rows, the migration **must abort startup**. PR #59 review-7 P1 correctly flagged that running in a "partially migrated, mixed legacy/foundation" mode is unsafe: foundation writer code is written assuming the unique indexes exist (the UPSERT predicate matches the partial index; `apply_order_event`'s rollup math assumes single-row-per-order semantics). Continuing without the indexes would either create more duplicates or produce silently wrong rollups. A loud failure forcing operator remediation is the only safe outcome.
 
-1. Logs an `ERROR`-level message listing the affected `order_id` / `owner_key` values.
-2. Refuses to apply the unique index for this startup (continues with a partial migration; bot remains operational on the legacy code path).
-3. Surfaces the issue through the alert backend so the operator sees it.
-4. Documents a remediation script the operator can run to dedupe (keep most-recent row, delete older copies, then retry the migration on next startup).
+Concrete behavior:
 
-Real-world duplicates in `trades` could arise from:
-- early bugs that re-logged the same order_id from both stream and REST paths before the slippage Phase 1 dedup work landed
+1. Log an `ERROR`-level message listing every affected `order_id` / `owner_key` value, plus the full row counts.
+2. Surface through the alert backend so the operator sees it (Telegram + log file).
+3. **Abort startup**: `_ensure_db()` raises and `forward_test.py` / `main.py` exits non-zero. The bot does NOT continue on the legacy code path; that mode does not exist in foundation code.
+4. Document a remediation script (`scripts/migrate_dedupe_trades.py` or equivalent) that the operator runs offline. The script:
+   - Re-runs the same detection queries
+   - For each duplicate `(order_id, position_type='single_leg')` set, keeps the row with the highest cumulative `filled_qty` (the most-recent broker state) and deletes the others — surfaces what was deleted for audit
+   - For duplicate non-terminal `position_lifecycle.owner_key` sets, the operator chooses (these represent a deeper inconsistency: which lifecycle is "real")
+   - Commits and exits 0 only after the post-cleanup detection queries return zero rows
+5. After the script runs, the next `recycle_bot.sh` applies the unique indexes cleanly and bot starts.
+
+Real-world sources of duplicates that this protects against:
+- early bugs that re-logged the same `order_id` from both stream and REST paths before the slippage Phase 1 dedup work landed
 - recovered-fill rows that wrote with the same `order_id` as the original log
 - any path where `log_external_close` was called twice for the same broker close
+- pre-Phase-A code that created multiple non-terminal lifecycle rows for the same `owner_key`
 
-The migration must not silently mask these — they're a signal of past inconsistency that the operator needs to see before the new constraint takes effect.
+The migration must not silently mask these — they're a signal of past inconsistency that the operator must see and remediate before the new constraints take effect. The "abort on first conflict" pattern is the same shape as the Defect 3 fix from slippage Phase 1's `_ensure_db` work: partial migrations leave the system in an unrecoverable mixed state.
