@@ -298,6 +298,24 @@ _BACKFILL_SQL = (
 )
 
 
+# ── Exceptions ──────────────────────────────────────────────────────────────
+
+
+class TradeLoggerIdentityConflict(RuntimeError):
+    """Raised by ``TradeLogger.log`` when an UPSERT would change an
+    identity-class column (currently ``position_uid``) from one
+    non-null value to a different non-null value.
+
+    Foundation §6.4 invariant: a broker ``order_id`` belongs to
+    exactly one position lifecycle row. A log() call that arrives
+    with a different position_uid for an existing row indicates the
+    caller is wrong about which lifecycle owns the order. Refusing
+    the write — rather than silently keeping the old value or
+    silently clobbering it — surfaces the bug at the point where
+    it can be diagnosed.
+    """
+
+
 # ── Trade record ────────────────────────────────────────────────────────────
 
 
@@ -879,30 +897,66 @@ class TradeLogger:
             ),
         )
 
-    # Columns whose semantic is "set once, then preserve" — provenance
-    # captured at submission, audit trail. A later sparse / recovery
-    # record (where the writer didn't observe the original benchmark)
-    # must NOT clobber an already-populated value with NULL.
-    # PR #60 commit 8 fix F (review finding): the previous policy of
-    # `excluded.<col>` on every non-immutable column would erase the
-    # exact provenance §10.5 of the discovery doc requires foundation
-    # to preserve.
+    # UPSERT column policy. Three groups:
+    #
+    #  - Immutable (handled directly in the loop below): order_id,
+    #    position_type. Identity columns; never reassigned.
+    #
+    #  - PRESERVE-FIRST-NON-NULL via COALESCE(trades.<col>,
+    #    excluded.<col>) — provenance / audit / set-once columns.
+    #    A sparse later record (cycle reconciliation, restart
+    #    reconstruction) must NOT erase a populated value with NULL.
+    #
+    #  - Default: excluded.<col> — cumulative state columns where the
+    #    newest observation is authoritative (fill qty / avg price /
+    #    status / realized P&L / r-multiple).
+    #
+    # The PRESERVE group expanded in PR #60 round 2 (review finding 6)
+    # to cover all entry-side risk anchors and the modeled-slippage
+    # benchmark, which the prior reviewer correctly noted could be
+    # silently zeroed by a downstream sparse write.
     _UPSERT_COALESCE_COLUMNS = frozenset({
         # Slippage unification provenance (Phase 1 taxonomy).
         "slippage_benchmark_price",
         "slippage_benchmark_kind",
         "slippage_benchmark_timestamp",
         "slippage_measurement_quality",
+        # Legacy modeled-slippage benchmark. Captured at submit time
+        # from the arrival price; a later cycle-reconciliation log()
+        # call without the original benchmark must not zero it.
+        "modeled_slippage_bps",
+        # Entry-side risk anchors. Set at the entry log() call and
+        # are READ-ONLY for downstream consumers (per-trade R-multiple,
+        # post-mortem). A later exit log() lacking the entry context
+        # would otherwise NULL them out.
+        "initial_stop_loss",
+        "initial_risk_per_share",
+        "initial_risk_dollars",
+        # Entry / exit timestamps anchor the trade-window math in
+        # reporting/metrics.py and post_mortem analysis. Set-once at
+        # the corresponding lifecycle event.
+        "entry_timestamp",
+        "exit_timestamp",
+        # Stop-trigger price recorded by log_stop_fill when the broker
+        # snapshot carries an actual active stop. A later sparse
+        # recovery record must not clobber it.
+        "stop_trigger_price",
         # Per-fill execution audit identifier captured from Alpaca
         # trade_update payloads. apply_order_event populates it on the
         # first fill; a later sparse record (e.g. cycle reconciliation
         # without the stream payload) must not erase it.
         "execution_id",
-        # position_uid moves into COALESCE territory too: §6.4 attaches
-        # it on first observed fill; subsequent updates from sparse
-        # recovery rows MUST NOT NULL it back.
-        "position_uid",
     })
+
+    # Columns where a value-to-different-value transition is an
+    # identity conflict and must surface loudly rather than silently
+    # be kept-or-clobbered. PR #60 round 2 review (finding 6 sub-point):
+    # if a second log() arrives carrying a DIFFERENT non-null
+    # position_uid for the same order_id, that's a foundation
+    # invariant violation — the broker order belongs to exactly one
+    # lifecycle row. The UPSERT below detects this before the write
+    # and raises ``TradeLoggerIdentityConflict``.
+    _UPSERT_IDENTITY_CONFLICT_COLUMNS = frozenset({"position_uid"})
 
     def log(self, record: TradeRecord) -> None:
         """Write one trade record. Single-leg rows UPSERT on order_id
@@ -915,18 +969,25 @@ class TradeLogger:
         foundation event path produce identical end-state on the
         same order_id.
 
-        UPSERT column policy (PR #60 commit 8 fix F):
-          - order_id, position_type — immutable. Identity columns.
-          - cumulative state (filled_qty, avg_fill_price, status,
-            realized_slippage_bps, ...): excluded.<col> — newest
-            observation wins. The fill event is the source of truth.
-          - provenance + audit (modeled_*, execution_id,
-            position_uid): COALESCE(trades.<col>, excluded.<col>) —
-            preserve existing non-null values. A sparse recovery row
-            that lacks the original arrival-midpoint benchmark must
-            not erase it. position_uid may transition NULL→value
-            during restart reconstruction but never value→value or
-            value→NULL.
+        UPSERT column policy (refined in PR #60 round 2 fix F):
+
+          - Immutable identity (order_id, position_type): never
+            reassigned.
+          - PRESERVE-FIRST-NON-NULL (``_UPSERT_COALESCE_COLUMNS``):
+            provenance + audit + entry-side risk anchors + per-fill
+            timestamps. ``COALESCE(trades.<col>, excluded.<col>)`` —
+            a sparse later record cannot zero out a populated value.
+            See the constant for the full list and the rationale.
+          - Identity conflict (``_UPSERT_IDENTITY_CONFLICT_COLUMNS``,
+            currently just ``position_uid``): a value→different-value
+            transition is a foundation invariant violation and
+            raises ``TradeLoggerIdentityConflict`` BEFORE the write.
+            NULL→value transitions are allowed for restart
+            reconstruction.
+          - Default (cumulative state): ``excluded.<col>`` —
+            filled_qty, avg_fill_price, status, realized_pnl,
+            r_multiple, realized_slippage_bps, etc. Newest observation
+            wins.
         """
         conn = self._ensure_db()
         d = record.as_dict()
@@ -939,12 +1000,47 @@ class TradeLogger:
             and getattr(record, "position_type", None) == "single_leg"
         )
         if is_single_leg_with_order_id:
+            # Pre-write identity-conflict check (finding 6 sub-point).
+            # Read whatever's already in the row; if any
+            # IDENTITY_CONFLICT_COLUMN holds a non-null value
+            # different from what we're about to write, refuse.
+            existing = conn.execute(
+                "SELECT "
+                + ", ".join(self._UPSERT_IDENTITY_CONFLICT_COLUMNS)
+                + " FROM trades WHERE order_id = ? "
+                "AND position_type = 'single_leg'",
+                (record.order_id,),
+            ).fetchone()
+            if existing is not None:
+                for col, existing_val in zip(
+                    self._UPSERT_IDENTITY_CONFLICT_COLUMNS, existing,
+                ):
+                    incoming_val = d.get(col)
+                    if (
+                        existing_val is not None
+                        and incoming_val is not None
+                        and existing_val != incoming_val
+                    ):
+                        raise TradeLoggerIdentityConflict(
+                            f"trades row for order_id={record.order_id!r} "
+                            f"has {col}={existing_val!r}; refusing to "
+                            f"overwrite with {incoming_val!r}. A broker "
+                            f"order belongs to exactly one lifecycle row."
+                        )
+
             immutable = {"order_id", "position_type"}
             update_clauses: list[str] = []
             for col in d.keys():
                 if col in immutable:
                     continue
-                if col in self._UPSERT_COALESCE_COLUMNS:
+                if (
+                    col in self._UPSERT_COALESCE_COLUMNS
+                    or col in self._UPSERT_IDENTITY_CONFLICT_COLUMNS
+                ):
+                    # Same SQL shape: keep the existing non-null value
+                    # if present. The Python-side check above is what
+                    # makes the IDENTITY conflict refuse rather than
+                    # silently preserve.
                     update_clauses.append(
                         f"{col} = COALESCE(trades.{col}, excluded.{col})"
                     )

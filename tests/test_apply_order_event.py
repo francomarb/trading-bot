@@ -1225,3 +1225,180 @@ class TestTradesUpsertProvenancePreservation:
         assert row[0] == 10
         assert row[1] == "filled"
         assert row[2] == 101.0
+
+
+# ── PR #60 round 2 review (finding 6) ───────────────────────────────────────
+
+
+class TestExpandedUpsertPreservation:
+    """Round 2 finding: the COALESCE set must include all set-once
+    columns the sparse-recovery path could clobber — risk anchors,
+    timestamps, modeled_slippage_bps, stop_trigger_price."""
+
+    @staticmethod
+    def _entry_record(order_id: str = "ord-A", **overrides):
+        from reporting.logger import TradeRecord
+        defaults = dict(
+            timestamp="2026-06-12T10:00:00+00:00",
+            symbol="AAPL", side="buy", qty=10,
+            avg_fill_price=150.0, order_id=order_id,
+            strategy="sma_crossover", reason="entry",
+            stop_price=145.0, entry_reference_price=150.0,
+            modeled_slippage_bps=33.4,
+            realized_slippage_bps=3.5,
+            order_type="market", status="filled",
+            requested_qty=10, filled_qty=10,
+            initial_stop_loss=145.0,
+            initial_risk_per_share=5.0,
+            initial_risk_dollars=50.0,
+            entry_timestamp="2026-06-12T10:00:00+00:00",
+            position_type="single_leg",
+        )
+        defaults.update(overrides)
+        return TradeRecord(**defaults)
+
+    @staticmethod
+    def _sparse_record(order_id: str = "ord-A", **overrides):
+        from reporting.logger import TradeRecord
+        defaults = dict(
+            timestamp="2026-06-12T10:01:00+00:00",
+            symbol="AAPL", side="buy", qty=10,
+            avg_fill_price=150.5, order_id=order_id,
+            strategy="sma_crossover", reason="recovery",
+            stop_price=145.0, entry_reference_price=150.0,
+            modeled_slippage_bps=None,
+            realized_slippage_bps=3.5,
+            order_type="market", status="filled",
+            requested_qty=10, filled_qty=10,
+            initial_stop_loss=None,
+            initial_risk_per_share=None,
+            initial_risk_dollars=None,
+            entry_timestamp=None,
+            position_type="single_leg",
+        )
+        defaults.update(overrides)
+        return TradeRecord(**defaults)
+
+    def test_modeled_slippage_bps_preserved(self, tmp_path):
+        from reporting.logger import TradeLogger
+        tl = TradeLogger(path=str(tmp_path / "trades.db"))
+        tl.log(self._entry_record())
+        tl.log(self._sparse_record())
+        row = tl._ensure_db().execute(
+            "SELECT modeled_slippage_bps FROM trades WHERE order_id = 'ord-A'"
+        ).fetchone()
+        assert row[0] == 33.4
+
+    def test_initial_risk_columns_preserved(self, tmp_path):
+        from reporting.logger import TradeLogger
+        tl = TradeLogger(path=str(tmp_path / "trades.db"))
+        tl.log(self._entry_record())
+        tl.log(self._sparse_record())
+        row = tl._ensure_db().execute(
+            "SELECT initial_stop_loss, initial_risk_per_share, "
+            "initial_risk_dollars FROM trades WHERE order_id = 'ord-A'"
+        ).fetchone()
+        assert row[0] == 145.0
+        assert row[1] == 5.0
+        assert row[2] == 50.0
+
+    def test_entry_timestamp_preserved(self, tmp_path):
+        from reporting.logger import TradeLogger
+        tl = TradeLogger(path=str(tmp_path / "trades.db"))
+        tl.log(self._entry_record())
+        tl.log(self._sparse_record())
+        row = tl._ensure_db().execute(
+            "SELECT entry_timestamp FROM trades WHERE order_id = 'ord-A'"
+        ).fetchone()
+        assert row[0] == "2026-06-12T10:00:00+00:00"
+
+    def test_cumulative_state_still_advances(self, tmp_path):
+        """Sanity check on the non-COALESCE side: avg_fill_price /
+        realized_slippage_bps DO get the newer value."""
+        from reporting.logger import TradeLogger
+        tl = TradeLogger(path=str(tmp_path / "trades.db"))
+        tl.log(self._entry_record())
+        tl.log(self._sparse_record(
+            avg_fill_price=151.0,
+            realized_slippage_bps=12.0,
+        ))
+        row = tl._ensure_db().execute(
+            "SELECT avg_fill_price, realized_slippage_bps "
+            "FROM trades WHERE order_id = 'ord-A'"
+        ).fetchone()
+        assert row[0] == 151.0
+        assert row[1] == 12.0
+
+
+class TestPositionUidIdentityConflict:
+    """Round 2 finding 6 sub-point: log() must REFUSE a write that
+    would change position_uid from one non-null value to a different
+    non-null value. Foundation §6.4 invariant: a broker order_id
+    belongs to exactly one lifecycle row."""
+
+    @staticmethod
+    def _record(*, order_id: str, position_uid: str | None):
+        from reporting.logger import TradeRecord
+        return TradeRecord(
+            timestamp="2026-06-12T10:00:00+00:00",
+            symbol="AAPL", side="buy", qty=10,
+            avg_fill_price=150.0, order_id=order_id,
+            strategy="sma_crossover", reason="entry",
+            stop_price=145.0, entry_reference_price=150.0,
+            modeled_slippage_bps=0.0, realized_slippage_bps=3.5,
+            order_type="market", status="filled",
+            requested_qty=10, filled_qty=10,
+            position_uid=position_uid,
+            position_type="single_leg",
+        )
+
+    def test_different_non_null_position_uid_raises(self, tmp_path):
+        from reporting.logger import TradeLogger, TradeLoggerIdentityConflict
+        tl = TradeLogger(path=str(tmp_path / "trades.db"))
+        tl.log(self._record(order_id="ord-X", position_uid="pos-A"))
+        with pytest.raises(TradeLoggerIdentityConflict):
+            tl.log(self._record(order_id="ord-X", position_uid="pos-B"))
+        # First write preserved.
+        row = tl._ensure_db().execute(
+            "SELECT position_uid FROM trades WHERE order_id = 'ord-X'"
+        ).fetchone()
+        assert row[0] == "pos-A"
+
+    def test_same_position_uid_repeat_is_fine(self, tmp_path):
+        from reporting.logger import TradeLogger
+        tl = TradeLogger(path=str(tmp_path / "trades.db"))
+        tl.log(self._record(order_id="ord-Y", position_uid="pos-A"))
+        # Repeating the same uid is not a conflict.
+        tl.log(self._record(order_id="ord-Y", position_uid="pos-A"))
+        row = tl._ensure_db().execute(
+            "SELECT position_uid FROM trades WHERE order_id = 'ord-Y'"
+        ).fetchone()
+        assert row[0] == "pos-A"
+
+    def test_null_to_value_position_uid_is_fine(self, tmp_path):
+        """Restart reconstruction depends on this: an earlier write
+        may have had NULL position_uid; a later write that knows
+        the uid must be allowed to fill it in."""
+        from reporting.logger import TradeLogger
+        tl = TradeLogger(path=str(tmp_path / "trades.db"))
+        tl.log(self._record(order_id="ord-Z", position_uid=None))
+        tl.log(self._record(order_id="ord-Z", position_uid="pos-A"))
+        row = tl._ensure_db().execute(
+            "SELECT position_uid FROM trades WHERE order_id = 'ord-Z'"
+        ).fetchone()
+        assert row[0] == "pos-A"
+
+    def test_value_to_null_position_uid_is_preserved_not_raised(
+        self, tmp_path,
+    ):
+        """The inverse: a later write with NULL position_uid keeps
+        the existing value via COALESCE. NOT a conflict (only
+        different-non-null is)."""
+        from reporting.logger import TradeLogger
+        tl = TradeLogger(path=str(tmp_path / "trades.db"))
+        tl.log(self._record(order_id="ord-W", position_uid="pos-A"))
+        tl.log(self._record(order_id="ord-W", position_uid=None))
+        row = tl._ensure_db().execute(
+            "SELECT position_uid FROM trades WHERE order_id = 'ord-W'"
+        ).fetchone()
+        assert row[0] == "pos-A"

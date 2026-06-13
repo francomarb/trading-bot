@@ -31,7 +31,8 @@ Each commit is reviewable in isolation; each ends with green tests.
 | 5 | Trades partial UNIQUE + UPSERT semantics in TradeLogger.log; UPDATE OR IGNORE backfill; test fixture updates for symbol-based order_ids | §6.5 / R5 fixes | ~150 | 1 + 6 fixture updates | ✅ |
 | 6 | Substrate insert at submit time: equity / fractional / options entries write `position_lifecycle_orders` row at status='pending' alongside the position-level row; attach broker order_id on submit return | §6.3 / §10.1 | ~250 | 6 | ✅ |
 | 7 | PR #60 review fix (A + H#18): trades-side migration preflight + `scripts/migrate_dedupe_trades.py` (detect / review / apply) + plain UPDATE backfill | §12.2 / R8-2 | ~600 | 18 | ✅ |
-| 8 | PR #60 review fix (B + F): status-only events skip trades UPSERT; TradeLogger.log COALESCE-preserves provenance | §6.5 / §6.6 | ~150 | 9 | ✅ |
+| 8 | PR #60 review fix (B + F round 1): status-only events skip trades UPSERT; TradeLogger.log COALESCE-preserves provenance | §6.5 / §6.6 | ~150 | 9 | ✅ |
+| 11 | PR #60 round 2 fix (finding 6): expand COALESCE set to risk anchors + entry/exit timestamps + modeled_slippage_bps; add position_uid identity-conflict refusal | §6.5 / §6.6 | ~150 | 8 | ✅ |
 | 9 | PR #60 review fix (C + D + E): options durable identity (on_submitted callback); fail-closed substrate exception policy; persist slippage provenance | §10.5 / §10.3 | ~300 | 12 | ✅ |
 | 10 | PR #60 round 2 fix (findings 1, 5, 7): dedupe review scopes to detected rows only; BACKFILL respects explicit position_type; apply hardening (snapshot fingerprint + rowcount + FKs ON + post-apply rescan) | §12.2 | ~400 | 7 | ✅ |
 | (later) | Wire WebSocket stream → `apply_order_event` (queue events to cycle thread for thread-safety) | §6.4 / §10.1 | ~300 | 4 | ⬜ |
