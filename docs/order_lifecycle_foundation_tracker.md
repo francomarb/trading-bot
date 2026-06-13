@@ -28,7 +28,7 @@ Each commit is reviewable in isolation; each ends with green tests.
 | 2 | Migration preflight: duplicate detection + abort-startup on conflict | §12.2 | ~250 | 12 | 🔄 In progress |
 | 3 | `PositionLifecycleOrdersStore` — CRUD operations on per-order rows | §6.2 / §6.3 | ~450 | 20 | 🔄 In progress |
 | 4 | `apply_order_event` — atomic compare-and-set + trades dedup + rollup + status; `execution_id` column added | §6.4 / §6.5 / §6.6 / §6.6.1 | ~750 | 16 | 🔄 In progress |
-| 5 | Trades partial UNIQUE + UPSERT migration (deferred to after legacy writer migration) | §6.5 / R5 fixes | ~200 | 4 | ⬜ |
+| 5 | Trades partial UNIQUE + UPSERT semantics in TradeLogger.log; UPDATE OR IGNORE backfill; test fixture updates for symbol-based order_ids | §6.5 / R5 fixes | ~150 | 1 + 6 fixture updates | 🔄 In progress |
 | 6 | Wire WebSocket stream → `apply_order_event` | §6.4 / §10.1 | ~300 | 4 | ⬜ |
 | 7 | Wire cycle reconciliation (`_reconcile_position_lifecycle`) → `apply_order_event` | §6.4 / §10.1 / §3.1 | ~300 | 4 | ⬜ |
 | 8 | Wire startup reconciliation: downtime fill/cancel walk against closed-order history | §6.4 / §10.1 | ~250 | 3 | ⬜ |

@@ -914,14 +914,10 @@ WHERE order_id = :order_id
 """
 
 
-# trades write for apply_order_event — single-leg cumulative state.
-# Uses application-level dedup (SELECT to detect existing row, then
-# INSERT or UPDATE) because the partial UNIQUE index is deferred to
-# a later foundation commit (existing legacy writers still emit
-# multiple rows per order_id). Once those writers migrate to the
-# foundation, the partial UNIQUE + ON CONFLICT UPSERT lands and
-# this two-statement pattern can collapse to a single UPSERT.
-_TRADES_INSERT_SQL = """
+# Trades UPSERT per discovery doc §6.5 (R5-C1 + R5-C2 fixes).
+# Partial-unique-index conflict target matches the index WHERE clause
+# exactly so SQLite ON CONFLICT can attach to it.
+_TRADES_UPSERT_SQL = """
 INSERT INTO trades (
     timestamp, symbol, side, qty, avg_fill_price, order_id,
     strategy, reason, stop_price, entry_reference_price,
@@ -949,19 +945,16 @@ INSERT INTO trades (
     NULL, NULL, NULL,
     :execution_id
 )
-"""
-
-_TRADES_UPDATE_SQL = """
-UPDATE trades SET
-    filled_qty                    = :filled_qty,
-    avg_fill_price                = :avg_fill_price,
-    status                        = :order_status,
-    slippage_benchmark_price      = COALESCE(slippage_benchmark_price,      :slippage_benchmark_price),
-    slippage_benchmark_kind       = COALESCE(slippage_benchmark_kind,       :slippage_benchmark_kind),
-    slippage_benchmark_timestamp  = COALESCE(slippage_benchmark_timestamp,  :slippage_benchmark_timestamp),
-    slippage_measurement_quality  = COALESCE(slippage_measurement_quality,  :slippage_measurement_quality),
-    execution_id                  = COALESCE(:execution_id, execution_id)
-WHERE order_id = :order_id AND position_type = 'single_leg'
+ON CONFLICT(order_id) WHERE order_id IS NOT NULL AND position_type = 'single_leg'
+DO UPDATE SET
+    filled_qty                    = excluded.filled_qty,
+    avg_fill_price                = excluded.avg_fill_price,
+    status                        = excluded.status,
+    slippage_benchmark_price      = COALESCE(trades.slippage_benchmark_price,      excluded.slippage_benchmark_price),
+    slippage_benchmark_kind       = COALESCE(trades.slippage_benchmark_kind,       excluded.slippage_benchmark_kind),
+    slippage_benchmark_timestamp  = COALESCE(trades.slippage_benchmark_timestamp,  excluded.slippage_benchmark_timestamp),
+    slippage_measurement_quality  = COALESCE(trades.slippage_measurement_quality,  excluded.slippage_measurement_quality),
+    execution_id                  = COALESCE(excluded.execution_id, trades.execution_id)
 """
 
 
@@ -1157,42 +1150,35 @@ def apply_order_event(
                     raise _AppliedZeroRows("terminal_blocked")
                 raise _AppliedZeroRows("stale_or_duplicate")
 
-            # Step 2: trades write keyed on order_id. Application-level
-            # SELECT-then-INSERT-or-UPDATE because the foundation's
-            # partial UNIQUE index on trades(order_id) is deferred to
-            # a later commit (existing writers still produce multiple
-            # rows per order_id). The transactional context still
-            # makes the pair atomic.
-            trades_params = {
-                "now": now,
-                "symbol": symbol,
-                "side": side,
-                "filled_qty": float(event.filled_qty),
-                "avg_fill_price": event.avg_fill_price,
-                "order_id": event.order_id,
-                "strategy": strategy,
-                "reason": reason or f"{role}:{event.status}",
-                "order_type": order_type,
-                "order_status": event.status,
-                "intended_qty": float(intended_qty),
-                "position_id": owner_key,
-                "position_uid": position_uid,
-                "slippage_benchmark_price": slip_price,
-                "slippage_benchmark_kind": slip_kind,
-                "slippage_benchmark_timestamp": slip_ts,
-                "slippage_measurement_quality": slip_quality,
-                "execution_id": event.execution_id,
-            }
-            existing_trade = conn.execute(
-                "SELECT 1 FROM trades "
-                "WHERE order_id = ? AND position_type = 'single_leg' "
-                "LIMIT 1",
-                (event.order_id,),
-            ).fetchone()
-            if existing_trade is None:
-                conn.execute(_TRADES_INSERT_SQL, trades_params)
-            else:
-                conn.execute(_TRADES_UPDATE_SQL, trades_params)
+            # Step 2: trades UPSERT keyed on order_id (single-leg scope).
+            # ON CONFLICT predicate matches the partial UNIQUE index
+            # WHERE clause exactly (R5-C2). Re-applying the same
+            # cumulative state is a no-op (values match); an advance
+            # updates filled_qty / VWAP. Provenance preserved via
+            # COALESCE.
+            conn.execute(
+                _TRADES_UPSERT_SQL,
+                {
+                    "now": now,
+                    "symbol": symbol,
+                    "side": side,
+                    "filled_qty": float(event.filled_qty),
+                    "avg_fill_price": event.avg_fill_price,
+                    "order_id": event.order_id,
+                    "strategy": strategy,
+                    "reason": reason or f"{role}:{event.status}",
+                    "order_type": order_type,
+                    "order_status": event.status,
+                    "intended_qty": float(intended_qty),
+                    "position_id": owner_key,
+                    "position_uid": position_uid,
+                    "slippage_benchmark_price": slip_price,
+                    "slippage_benchmark_kind": slip_kind,
+                    "slippage_benchmark_timestamp": slip_ts,
+                    "slippage_measurement_quality": slip_quality,
+                    "execution_id": event.execution_id,
+                },
+            )
 
             # Step 3: position rollup (current_qty + avg_entry_price
             # from orders, net_realized_pnl from trades).

@@ -278,8 +278,15 @@ _POSITION_UID_INDEX_SQL = (
 # new positions, keeping the engine lookup key and the DB key consistent.
 # Guarded by `WHERE position_id IS NULL` so explicit writes (future spreads)
 # are never overwritten on subsequent startups.
+#
+# UPDATE OR IGNORE per foundation §6.5: legacy rows that share order_id
+# with another row would collide with the new partial UNIQUE
+# uniq_trades_order_id_single_leg the moment they're moved into
+# single_leg scope. IGNORE skips the second offender rather than
+# raising — these are stale legacy rows that the operator can
+# clean up via scripts/migrate_dedupe_trades.py if needed.
 _BACKFILL_SQL = (
-    "UPDATE trades "
+    "UPDATE OR IGNORE trades "
     "SET position_id = OWNER_KEY(symbol), position_type = 'single_leg' "
     "WHERE position_id IS NULL"
 )
@@ -454,15 +461,12 @@ class TradeLogger:
             # See engine/lifecycle_orders.py for the discussion of why
             # 'error' is included in the WHERE clause.
             conn.execute(_UNIQ_ONE_ACTIVE_POSITION_PER_OWNER_KEY_SQL)
-            # trades dedup key (uniq_trades_order_id_single_leg) is
-            # DEFERRED to a later foundation commit. Existing writers
-            # (log_close, log_stop_fill, etc.) routinely insert
-            # multiple trades rows for the same order_id today; the
-            # foundation moves them to UPSERT cumulative-state
-            # semantics. The partial UNIQUE index lands once those
-            # writers have been migrated through subsequent foundation
-            # commits. apply_order_event uses application-level
-            # dedup (SELECT then INSERT or UPDATE) until then.
+            # trades dedup key per PR #59 §6.5 (R5-C1 + R5-C2).
+            # Scoped to single-leg rows so log_spread_fill's deliberate
+            # two-leg-rows-per-combo-order_id pattern continues to work.
+            # Predicate must match the ON CONFLICT clause inside
+            # apply_order_event exactly (R5-C2 partial-index alignment).
+            conn.execute(_UNIQ_TRADES_ORDER_ID_SINGLE_LEG_SQL)
             from engine.option_trailing import (
                 _CREATE_OPTION_TRAILING_STOPS_SQL,
                 _OPTION_TRAILING_STOPS_INDEXES_SQL,
@@ -858,15 +862,47 @@ class TradeLogger:
         )
 
     def log(self, record: TradeRecord) -> None:
-        """Insert one trade record into the database."""
+        """Write one trade record. Single-leg rows UPSERT on order_id
+        (foundation §6.5 — cumulative state per order). Spread legs
+        (position_type='spread') and rows with NULL order_id fall
+        outside the partial UNIQUE index and append.
+
+        Aligned with apply_order_event's UPSERT semantics so the
+        legacy log_entry / log_close / log_stop_fill paths and the
+        foundation event path produce identical end-state on the
+        same order_id.
+        """
         conn = self._ensure_db()
         d = record.as_dict()
         columns = ", ".join(d.keys())
         placeholders = ", ".join(["?"] * len(d))
-        conn.execute(
-            f"INSERT INTO trades ({columns}) VALUES ({placeholders})",
-            list(d.values()),
+        # Single-leg + non-NULL order_id → UPSERT on the partial UNIQUE
+        # uniq_trades_order_id_single_leg. Otherwise plain INSERT.
+        is_single_leg_with_order_id = (
+            record.order_id is not None
+            and getattr(record, "position_type", None) == "single_leg"
         )
+        if is_single_leg_with_order_id:
+            # Build a non-key column list for the DO UPDATE SET clause.
+            # We update every column except the immutable identity ones
+            # (order_id, position_uid, position_type).
+            immutable = {"order_id", "position_uid", "position_type"}
+            update_columns = [c for c in d.keys() if c not in immutable]
+            update_set = ", ".join(
+                f"{c} = excluded.{c}" for c in update_columns
+            )
+            conn.execute(
+                f"INSERT INTO trades ({columns}) VALUES ({placeholders}) "
+                f"ON CONFLICT(order_id) "
+                f"WHERE order_id IS NOT NULL AND position_type = 'single_leg' "
+                f"DO UPDATE SET {update_set}",
+                list(d.values()),
+            )
+        else:
+            conn.execute(
+                f"INSERT INTO trades ({columns}) VALUES ({placeholders})",
+                list(d.values()),
+            )
         conn.commit()
         logger.info(
             f"trade logged: {record.side} {record.qty} {record.symbol} "
