@@ -874,6 +874,31 @@ class TradeLogger:
             ),
         )
 
+    # Columns whose semantic is "set once, then preserve" — provenance
+    # captured at submission, audit trail. A later sparse / recovery
+    # record (where the writer didn't observe the original benchmark)
+    # must NOT clobber an already-populated value with NULL.
+    # PR #60 commit 8 fix F (review finding): the previous policy of
+    # `excluded.<col>` on every non-immutable column would erase the
+    # exact provenance §10.5 of the discovery doc requires foundation
+    # to preserve.
+    _UPSERT_COALESCE_COLUMNS = frozenset({
+        # Slippage unification provenance (Phase 1 taxonomy).
+        "slippage_benchmark_price",
+        "slippage_benchmark_kind",
+        "slippage_benchmark_timestamp",
+        "slippage_measurement_quality",
+        # Per-fill execution audit identifier captured from Alpaca
+        # trade_update payloads. apply_order_event populates it on the
+        # first fill; a later sparse record (e.g. cycle reconciliation
+        # without the stream payload) must not erase it.
+        "execution_id",
+        # position_uid moves into COALESCE territory too: §6.4 attaches
+        # it on first observed fill; subsequent updates from sparse
+        # recovery rows MUST NOT NULL it back.
+        "position_uid",
+    })
+
     def log(self, record: TradeRecord) -> None:
         """Write one trade record. Single-leg rows UPSERT on order_id
         (foundation §6.5 — cumulative state per order). Spread legs
@@ -884,6 +909,19 @@ class TradeLogger:
         legacy log_entry / log_close / log_stop_fill paths and the
         foundation event path produce identical end-state on the
         same order_id.
+
+        UPSERT column policy (PR #60 commit 8 fix F):
+          - order_id, position_type — immutable. Identity columns.
+          - cumulative state (filled_qty, avg_fill_price, status,
+            realized_slippage_bps, ...): excluded.<col> — newest
+            observation wins. The fill event is the source of truth.
+          - provenance + audit (modeled_*, execution_id,
+            position_uid): COALESCE(trades.<col>, excluded.<col>) —
+            preserve existing non-null values. A sparse recovery row
+            that lacks the original arrival-midpoint benchmark must
+            not erase it. position_uid may transition NULL→value
+            during restart reconstruction but never value→value or
+            value→NULL.
         """
         conn = self._ensure_db()
         d = record.as_dict()
@@ -896,14 +934,18 @@ class TradeLogger:
             and getattr(record, "position_type", None) == "single_leg"
         )
         if is_single_leg_with_order_id:
-            # Build a non-key column list for the DO UPDATE SET clause.
-            # We update every column except the immutable identity ones
-            # (order_id, position_uid, position_type).
-            immutable = {"order_id", "position_uid", "position_type"}
-            update_columns = [c for c in d.keys() if c not in immutable]
-            update_set = ", ".join(
-                f"{c} = excluded.{c}" for c in update_columns
-            )
+            immutable = {"order_id", "position_type"}
+            update_clauses: list[str] = []
+            for col in d.keys():
+                if col in immutable:
+                    continue
+                if col in self._UPSERT_COALESCE_COLUMNS:
+                    update_clauses.append(
+                        f"{col} = COALESCE(trades.{col}, excluded.{col})"
+                    )
+                else:
+                    update_clauses.append(f"{col} = excluded.{col}")
+            update_set = ", ".join(update_clauses)
             conn.execute(
                 f"INSERT INTO trades ({columns}) VALUES ({placeholders}) "
                 f"ON CONFLICT(order_id) "

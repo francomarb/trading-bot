@@ -1301,34 +1301,43 @@ def apply_order_event(
                 raise _AppliedZeroRows("stale_or_duplicate")
 
             # Step 2: trades UPSERT keyed on order_id (single-leg scope).
+            # Gated on event.filled_qty > 0 (PR #60 commit 8 fix B):
+            # §6.5 defines `trades` as cumulative fill state. Status-only
+            # transitions like pending→working with no fill, or a zero-
+            # fill canceled, must NOT manufacture a trades row — that
+            # would inflate downstream slippage / P&L / activity counts
+            # with phantom orders that never actually traded.
+            # §6.6's rollup of net_realized_pnl from trades depends on
+            # this: only rows representing real fills count.
             # ON CONFLICT predicate matches the partial UNIQUE index
             # WHERE clause exactly (R5-C2). Re-applying the same
             # cumulative state is a no-op (values match); an advance
             # updates filled_qty / VWAP. Provenance preserved via
             # COALESCE.
-            conn.execute(
-                _TRADES_UPSERT_SQL,
-                {
-                    "now": now,
-                    "symbol": symbol,
-                    "side": side,
-                    "filled_qty": float(event.filled_qty),
-                    "avg_fill_price": event.avg_fill_price,
-                    "order_id": event.order_id,
-                    "strategy": strategy,
-                    "reason": reason or f"{role}:{event.status}",
-                    "order_type": order_type,
-                    "order_status": event.status,
-                    "intended_qty": float(intended_qty),
-                    "position_id": owner_key,
-                    "position_uid": position_uid,
-                    "slippage_benchmark_price": slip_price,
-                    "slippage_benchmark_kind": slip_kind,
-                    "slippage_benchmark_timestamp": slip_ts,
-                    "slippage_measurement_quality": slip_quality,
-                    "execution_id": event.execution_id,
-                },
-            )
+            if float(event.filled_qty) > 0:
+                conn.execute(
+                    _TRADES_UPSERT_SQL,
+                    {
+                        "now": now,
+                        "symbol": symbol,
+                        "side": side,
+                        "filled_qty": float(event.filled_qty),
+                        "avg_fill_price": event.avg_fill_price,
+                        "order_id": event.order_id,
+                        "strategy": strategy,
+                        "reason": reason or f"{role}:{event.status}",
+                        "order_type": order_type,
+                        "order_status": event.status,
+                        "intended_qty": float(intended_qty),
+                        "position_id": owner_key,
+                        "position_uid": position_uid,
+                        "slippage_benchmark_price": slip_price,
+                        "slippage_benchmark_kind": slip_kind,
+                        "slippage_benchmark_timestamp": slip_ts,
+                        "slippage_measurement_quality": slip_quality,
+                        "execution_id": event.execution_id,
+                    },
+                )
 
             # Step 3: position rollup (current_qty + avg_entry_price
             # from orders, net_realized_pnl from trades).

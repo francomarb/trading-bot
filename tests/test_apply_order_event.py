@@ -763,7 +763,11 @@ class TestAllOrNothingTransaction:
     ):
         """If the trades UPSERT raises, the per-order UPDATE that
         came before must also roll back. No partial state across
-        the three tables."""
+        the three tables.
+
+        Filled_qty>0 here because commit 8 gates the trades UPSERT
+        on `filled_qty > 0`; only fill-bearing events touch the
+        trades row whose failure we're simulating."""
         uid = _seed_position(pos_store)
         _insert_entry(orders_store, uid)
         order_id = _attach_and_get_order_id(orders_store, "cli-entry")
@@ -774,9 +778,9 @@ class TestAllOrNothingTransaction:
                 flaky,  # type: ignore[arg-type]
                 OrderEvent(
                     order_id=order_id,
-                    status="working",
-                    filled_qty=0.0,
-                    avg_fill_price=None,
+                    status="filled",
+                    filled_qty=10.0,
+                    avg_fill_price=100.5,
                     broker_updated_at="2026-06-12T10:01:00+00:00",
                 ),
             )
@@ -879,3 +883,345 @@ class TestStaleEventDropped:
         status, qty, avg, _, _ = _get_order(conn, order_id)
         assert status == "partially_filled"
         assert qty == 5.0
+
+
+# ── PR #60 commit 8 review fixes ────────────────────────────────────────────
+
+
+class TestStatusOnlyEventsSkipTradesUpsert:
+    """Discovery doc §6.5 + §6.6: `trades` records cumulative fill
+    state. apply_order_event must NOT manufacture a trades row for a
+    status-only transition (pending→working, zero-fill canceled, etc.).
+
+    Without this gate, downstream slippage / activity / realized-P&L
+    consumers would count phantom orders that never actually traded.
+    """
+
+    def test_working_with_zero_fill_does_not_insert_trades_row(
+        self, conn, pos_store, orders_store,
+    ):
+        uid = _seed_position(pos_store)
+        _insert_entry(orders_store, uid)
+        order_id = _attach_and_get_order_id(orders_store, "cli-entry")
+        before = conn.execute("SELECT COUNT(*) FROM trades").fetchone()[0]
+        outcome = apply_order_event(
+            conn,
+            OrderEvent(
+                order_id=order_id,
+                status="working",
+                filled_qty=0.0,
+                avg_fill_price=None,
+                broker_updated_at="2026-06-12T10:01:00+00:00",
+            ),
+        )
+        assert outcome.applied is True
+        after = conn.execute("SELECT COUNT(*) FROM trades").fetchone()[0]
+        assert after == before, (
+            "status-only working event must not insert into trades"
+        )
+
+    def test_zero_fill_canceled_does_not_insert_trades_row(
+        self, conn, pos_store, orders_store,
+    ):
+        uid = _seed_position(pos_store)
+        _insert_entry(orders_store, uid)
+        order_id = _attach_and_get_order_id(orders_store, "cli-entry")
+        before = conn.execute("SELECT COUNT(*) FROM trades").fetchone()[0]
+        outcome = apply_order_event(
+            conn,
+            OrderEvent(
+                order_id=order_id,
+                status="canceled",
+                filled_qty=0.0,
+                avg_fill_price=None,
+                broker_updated_at="2026-06-12T10:01:00+00:00",
+            ),
+        )
+        assert outcome.applied is True
+        after = conn.execute("SELECT COUNT(*) FROM trades").fetchone()[0]
+        assert after == before
+
+    def test_filled_event_with_qty_does_insert_trades_row(
+        self, conn, pos_store, orders_store,
+    ):
+        """Positive control: filled events with qty > 0 DO write."""
+        uid = _seed_position(pos_store)
+        _insert_entry(orders_store, uid)
+        order_id = _attach_and_get_order_id(orders_store, "cli-entry")
+        before = conn.execute("SELECT COUNT(*) FROM trades").fetchone()[0]
+        outcome = apply_order_event(
+            conn,
+            OrderEvent(
+                order_id=order_id,
+                status="filled",
+                filled_qty=10.0,
+                avg_fill_price=100.5,
+                broker_updated_at="2026-06-12T10:01:00+00:00",
+            ),
+        )
+        assert outcome.applied is True
+        after = conn.execute("SELECT COUNT(*) FROM trades").fetchone()[0]
+        assert after == before + 1
+
+    def test_partial_fill_then_zero_fill_canceled_leaves_one_trades_row(
+        self, conn, pos_store, orders_store,
+    ):
+        """A partial-fill that later cancels at the same filled_qty
+        should produce exactly ONE trades row (the partial fill). The
+        canceled event has filled_qty equal to the previously-observed
+        amount, which equals event.filled_qty > 0, so it does write —
+        and the UPSERT preserves cumulative state."""
+        uid = _seed_position(pos_store)
+        _insert_entry(orders_store, uid)
+        order_id = _attach_and_get_order_id(orders_store, "cli-entry")
+        apply_order_event(
+            conn,
+            OrderEvent(
+                order_id=order_id, status="partially_filled",
+                filled_qty=5.0, avg_fill_price=100.0,
+                broker_updated_at="2026-06-12T10:01:00+00:00",
+            ),
+        )
+        apply_order_event(
+            conn,
+            OrderEvent(
+                order_id=order_id, status="canceled",
+                filled_qty=5.0, avg_fill_price=100.0,
+                broker_updated_at="2026-06-12T10:02:00+00:00",
+            ),
+        )
+        cnt = conn.execute(
+            "SELECT COUNT(*) FROM trades WHERE order_id = ?",
+            (order_id,),
+        ).fetchone()[0]
+        assert cnt == 1
+
+
+class TestTradesUpsertProvenancePreservation:
+    """Discovery doc §10.5: slippage / audit provenance is captured
+    once at submission and must survive every subsequent UPSERT,
+    including the sparse-recovery case where a later writer
+    doesn't have access to the original benchmark.
+
+    PR #60 commit 8 fix F (review finding): the UPSERT in
+    TradeLogger.log was `excluded.<col>` for every non-immutable
+    column, including provenance. A later log() call with NULL
+    modeled_* fields would clobber the originally-recorded values.
+    """
+
+    def test_log_preserves_slippage_benchmark_across_upsert(
+        self, tmp_path,
+    ):
+        """Two log() calls on the same order_id: first sets
+        slippage_benchmark_*, second is NULL. The end state must
+        keep the first provenance values."""
+        from reporting.logger import TradeLogger, TradeRecord
+
+        tl = TradeLogger(path=str(tmp_path / "trades.db"))
+        first = TradeRecord(
+            timestamp="2026-06-12T10:00:00+00:00",
+            symbol="AAPL", side="buy", qty=10,
+            avg_fill_price=150.0, order_id="ord-1",
+            strategy="sma_crossover", reason="entry",
+            stop_price=145.0, entry_reference_price=150.0,
+            modeled_slippage_bps=0.0, realized_slippage_bps=3.5,
+            order_type="market", status="filled",
+            requested_qty=10, filled_qty=10,
+            slippage_benchmark_price=149.5,
+            slippage_benchmark_kind="arrival_midpoint",
+            slippage_benchmark_timestamp="2026-06-12T10:00:00+00:00",
+            slippage_measurement_quality="primary",
+            position_type="single_leg",
+        )
+        tl.log(first)
+        # Second log: same order_id, NULL provenance fields.
+        second = TradeRecord(
+            timestamp="2026-06-12T10:01:00+00:00",
+            symbol="AAPL", side="buy", qty=10,
+            avg_fill_price=150.5, order_id="ord-1",
+            strategy="sma_crossover", reason="recovery",
+            stop_price=145.0, entry_reference_price=150.0,
+            modeled_slippage_bps=0.0, realized_slippage_bps=3.5,
+            order_type="market", status="filled",
+            requested_qty=10, filled_qty=10,
+            slippage_benchmark_price=None,
+            slippage_benchmark_kind=None,
+            slippage_benchmark_timestamp=None,
+            slippage_measurement_quality=None,
+            position_type="single_leg",
+        )
+        tl.log(second)
+        row = tl._ensure_db().execute(
+            "SELECT slippage_benchmark_price, slippage_benchmark_kind, "
+            "slippage_benchmark_timestamp, slippage_measurement_quality, "
+            "avg_fill_price "
+            "FROM trades WHERE order_id = 'ord-1'"
+        ).fetchone()
+        # provenance preserved
+        assert row[0] == 149.5
+        assert row[1] == "arrival_midpoint"
+        assert row[2] == "2026-06-12T10:00:00+00:00"
+        assert row[3] == "primary"
+        # cumulative state advanced (newest avg_fill_price wins)
+        assert row[4] == 150.5
+
+    def test_log_preserves_position_uid_across_null_upsert(
+        self, tmp_path,
+    ):
+        """position_uid is COALESCE-preserved. A sparse later record
+        with NULL position_uid must not erase a previously-attached
+        uid."""
+        from reporting.logger import TradeLogger, TradeRecord
+
+        tl = TradeLogger(path=str(tmp_path / "trades.db"))
+        first = TradeRecord(
+            timestamp="2026-06-12T10:00:00+00:00",
+            symbol="AAPL", side="buy", qty=10,
+            avg_fill_price=150.0, order_id="ord-2",
+            strategy="sma_crossover", reason="entry",
+            stop_price=145.0, entry_reference_price=150.0,
+            modeled_slippage_bps=0.0, realized_slippage_bps=3.5,
+            order_type="market", status="filled",
+            requested_qty=10, filled_qty=10,
+            position_uid="pos-known",
+            position_type="single_leg",
+        )
+        tl.log(first)
+        second = TradeRecord(
+            timestamp="2026-06-12T10:01:00+00:00",
+            symbol="AAPL", side="buy", qty=10,
+            avg_fill_price=150.5, order_id="ord-2",
+            strategy="sma_crossover", reason="recovery",
+            stop_price=145.0, entry_reference_price=150.0,
+            modeled_slippage_bps=0.0, realized_slippage_bps=3.5,
+            order_type="market", status="filled",
+            requested_qty=10, filled_qty=10,
+            position_uid=None,
+            position_type="single_leg",
+        )
+        tl.log(second)
+        row = tl._ensure_db().execute(
+            "SELECT position_uid FROM trades WHERE order_id = 'ord-2'"
+        ).fetchone()
+        assert row[0] == "pos-known"
+
+    def test_log_can_fill_null_position_uid_from_later_record(
+        self, tmp_path,
+    ):
+        """The inverse: a NULL initial position_uid CAN be filled by
+        a later record carrying a real value. Restart reconstruction
+        depends on this — the original log() may have run before the
+        position_lifecycle row existed."""
+        from reporting.logger import TradeLogger, TradeRecord
+
+        tl = TradeLogger(path=str(tmp_path / "trades.db"))
+        first = TradeRecord(
+            timestamp="2026-06-12T10:00:00+00:00",
+            symbol="AAPL", side="buy", qty=10,
+            avg_fill_price=150.0, order_id="ord-3",
+            strategy="sma_crossover", reason="entry",
+            stop_price=145.0, entry_reference_price=150.0,
+            modeled_slippage_bps=0.0, realized_slippage_bps=3.5,
+            order_type="market", status="filled",
+            requested_qty=10, filled_qty=10,
+            position_uid=None,
+            position_type="single_leg",
+        )
+        tl.log(first)
+        second = TradeRecord(
+            timestamp="2026-06-12T10:01:00+00:00",
+            symbol="AAPL", side="buy", qty=10,
+            avg_fill_price=150.0, order_id="ord-3",
+            strategy="sma_crossover", reason="reconstruction",
+            stop_price=145.0, entry_reference_price=150.0,
+            modeled_slippage_bps=0.0, realized_slippage_bps=3.5,
+            order_type="market", status="filled",
+            requested_qty=10, filled_qty=10,
+            position_uid="pos-resolved",
+            position_type="single_leg",
+        )
+        tl.log(second)
+        row = tl._ensure_db().execute(
+            "SELECT position_uid FROM trades WHERE order_id = 'ord-3'"
+        ).fetchone()
+        assert row[0] == "pos-resolved"
+
+    def test_apply_order_event_preserves_execution_id_across_events(
+        self, conn, pos_store, orders_store,
+    ):
+        """The substrate-side equivalent: a first event with
+        execution_id='X' followed by a second event with
+        execution_id=None (later observation lacks the per-fill id)
+        must keep the original.
+
+        execution_id is set by apply_order_event via the trades UPSERT;
+        TradeRecord doesn't expose it directly, so we exercise the
+        substrate path."""
+        uid = _seed_position(pos_store)
+        _insert_entry(orders_store, uid)
+        order_id = _attach_and_get_order_id(orders_store, "cli-entry")
+        apply_order_event(
+            conn,
+            OrderEvent(
+                order_id=order_id, status="filled",
+                filled_qty=10.0, avg_fill_price=150.0,
+                broker_updated_at="2026-06-12T10:01:00+00:00",
+                execution_id="exec-7",
+            ),
+        )
+        # Same cumulative state at a later observation, no execution_id.
+        apply_order_event(
+            conn,
+            OrderEvent(
+                order_id=order_id, status="filled",
+                filled_qty=10.0, avg_fill_price=150.0,
+                broker_updated_at="2026-06-12T10:02:00+00:00",
+                execution_id=None,
+            ),
+        )
+        row = conn.execute(
+            "SELECT execution_id FROM trades WHERE order_id = ?",
+            (order_id,),
+        ).fetchone()
+        assert row[0] == "exec-7"
+
+    def test_log_advances_cumulative_filled_qty_via_excluded(
+        self, tmp_path,
+    ):
+        """Sanity check: cumulative columns DO use excluded.<col>
+        (newest wins). This is the positive control for the COALESCE
+        policy on provenance fields."""
+        from reporting.logger import TradeLogger, TradeRecord
+
+        tl = TradeLogger(path=str(tmp_path / "trades.db"))
+        first = TradeRecord(
+            timestamp="2026-06-12T10:00:00+00:00",
+            symbol="AAPL", side="buy", qty=5,
+            avg_fill_price=100.0, order_id="ord-5",
+            strategy="sma_crossover", reason="partial",
+            stop_price=95.0, entry_reference_price=100.0,
+            modeled_slippage_bps=0.0, realized_slippage_bps=0.0,
+            order_type="market", status="partially_filled",
+            requested_qty=10, filled_qty=5,
+            position_type="single_leg",
+        )
+        tl.log(first)
+        second = TradeRecord(
+            timestamp="2026-06-12T10:01:00+00:00",
+            symbol="AAPL", side="buy", qty=10,
+            avg_fill_price=101.0, order_id="ord-5",
+            strategy="sma_crossover", reason="filled",
+            stop_price=95.0, entry_reference_price=100.0,
+            modeled_slippage_bps=0.0, realized_slippage_bps=0.0,
+            order_type="market", status="filled",
+            requested_qty=10, filled_qty=10,
+            position_type="single_leg",
+        )
+        tl.log(second)
+        row = tl._ensure_db().execute(
+            "SELECT filled_qty, status, avg_fill_price "
+            "FROM trades WHERE order_id = 'ord-5'"
+        ).fetchone()
+        assert row[0] == 10
+        assert row[1] == "filled"
+        assert row[2] == 101.0
