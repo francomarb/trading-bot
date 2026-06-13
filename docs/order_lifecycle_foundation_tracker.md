@@ -17,35 +17,55 @@ The foundation PR implements the discovery doc's §6 (schema + atomic event API 
 
 ---
 
-## Commit checklist
+## Commit log (time-ordered, as merged on the branch)
 
-Each commit is reviewable in isolation; each ends with green tests.
+Two phases on `feat/order-lifecycle-foundation-impl`:
 
-| # | Commit | Doc section | LOC est. | Tests | Status |
+  - **A. Substrate landed** (commits 0-6): schema, store, atomic
+    `apply_order_event`, trades-row writer alignment, and submit-time
+    insert. No live behavior change; substrate populated but not yet
+    read by consumers.
+  - **B. PR #60 review-fix series** (commits 7-14): three rounds of
+    ChatGPT review against (A), each landed as 2–3 focused fix
+    commits. End-state ahead of the consumer-wiring phase.
+
+| Git # | Phase | Commit | Doc anchor | Tests | Status |
 |---|---|---|---|---|---|
-| 0 | Implementation tracker + PLAN.md pointer | n/a | ~150 | — | ✅ |
-| 1 | Schema: `position_lifecycle_orders` table + indexes + position-level UNIQUE + PRAGMA foreign_keys | §6.2 / R13-G1 | ~400 | 17 | ✅ |
-| 2 | Migration preflight: duplicate detection + abort-startup on conflict | §12.2 | ~250 | 12 | ✅ |
-| 3 | `PositionLifecycleOrdersStore` — CRUD operations on per-order rows | §6.2 / §6.3 | ~450 | 20 | ✅ |
-| 4 | `apply_order_event` — atomic compare-and-set + trades dedup + rollup + status; `execution_id` column added | §6.4 / §6.5 / §6.6 / §6.6.1 | ~750 | 16 | ✅ |
-| 5 | Trades partial UNIQUE + UPSERT semantics in TradeLogger.log; UPDATE OR IGNORE backfill; test fixture updates for symbol-based order_ids | §6.5 / R5 fixes | ~150 | 1 + 6 fixture updates | ✅ |
-| 6 | Substrate insert at submit time: equity / fractional / options entries write `position_lifecycle_orders` row at status='pending' alongside the position-level row; attach broker order_id on submit return | §6.3 / §10.1 | ~250 | 6 | ✅ |
-| 7 | PR #60 review fix (A + H#18): trades-side migration preflight + `scripts/migrate_dedupe_trades.py` (detect / review / apply) + plain UPDATE backfill | §12.2 / R8-2 | ~600 | 18 | ✅ |
-| 8 | PR #60 review fix (B + F round 1): status-only events skip trades UPSERT; TradeLogger.log COALESCE-preserves provenance | §6.5 / §6.6 | ~150 | 9 | ✅ |
-| 11 | PR #60 round 2 fix (finding 6): expand COALESCE set to risk anchors + entry/exit timestamps + modeled_slippage_bps; add position_uid identity-conflict refusal | §6.5 / §6.6 | ~150 | 8 | ✅ |
-| 9 | PR #60 review fix (C + D + E round 1): options durable identity (on_submitted callback); fail-closed substrate exception policy; persist slippage provenance | §10.5 / §10.3 | ~300 | 12 | ✅ |
-| 12 | PR #60 round 2 fix (findings 2, 3, 4): queue on_submitted to engine thread (thread-safety); roll back pending lifecycle row before substrate-failure re-raise; broaden fail-closed to all exceptions when store configured | §6.4 / §10.3 | ~300 | 5 | ✅ |
-| 10 | PR #60 round 2 fix (findings 1, 5, 7): dedupe review scopes to detected rows only; BACKFILL respects explicit position_type; apply hardening (snapshot fingerprint + rowcount + FKs ON + post-apply rescan) | §12.2 | ~400 | 7 | ✅ |
-| (later) | Wire WebSocket stream → `apply_order_event` (queue events to cycle thread for thread-safety) | §6.4 / §10.1 | ~300 | 4 | ⬜ |
-| 11 | Wire cycle reconciliation (`_reconcile_position_lifecycle`) → `apply_order_event` | §6.4 / §10.1 / §3.1 | ~300 | 4 | ⬜ |
-| 12 | Wire startup reconciliation: downtime fill/cancel walk against closed-order history | §6.4 / §10.1 | ~250 | 3 | ⬜ |
-| 13 | Wire `protective_stop` role: broker OTO child gets its own per-order row | §10.3 | ~150 | 2 | ⬜ |
-| 14 | Wire `replacement_stop` role: PR #47 GTC promotion uses durable identity | §10.3 | ~150 | 2 | ⬜ |
-| 15 | Remove `_suspect_orders` cache (post-verification) | §10.1 / §6.7 | ~200 | 2 | ⬜ |
-| 16 | Remove `_suspect_exit_orders` cache (post-verification) | §10.2 / §6.7 | ~150 | 2 | ⬜ |
-| 17 | Doc updates: PLAN.md, operator_controls_proposal.md, slippage_unification_tracker.md | §12 | ~50 | — | ⬜ |
+| 0 | A | Tracker + PLAN.md pointer | n/a | — | ✅ |
+| 1 | A | Schema: `position_lifecycle_orders` + indexes + position-level UNIQUE + `PRAGMA foreign_keys=ON` | §6.2 / R13-G1 | 17 | ✅ |
+| 2 | A | Migration preflight: `position_lifecycle.owner_key` duplicates + abort-startup | §12.2 | 12 | ✅ |
+| 3 | A | `PositionLifecycleOrdersStore` CRUD | §6.2 / §6.3 | 20 | ✅ |
+| 4 | A | `apply_order_event` — atomic CAS + trades UPSERT + rollup + status CTE; `execution_id` column | §6.4 / §6.5 / §6.6 / §6.6.1 | 16 | ✅ |
+| 5 | A | Trades partial UNIQUE + `TradeLogger.log` UPSERT semantics | §6.5 / R5 | 1 + fixture updates | ✅ |
+| 6 | A | Submit-time substrate insert (equity OTO / fractional / options) + attach order_id on submit return | §6.3 / §10.1 | 6 | ✅ |
+| 7 | B-r1 | Trades-side migration preflight + `scripts/migrate_dedupe_trades.py` (detect / review / apply); plain UPDATE backfill (PR #60 review round 1, fix A) | §12.2 / R8-2 | 18 | ✅ |
+| 8 | B-r1 | Status-only events skip trades UPSERT; COALESCE-preserve provenance / audit (PR #60 round 1, fixes B + F) | §6.5 / §6.6 | 9 | ✅ |
+| 9 | B-r1 | Options durable identity (`on_submitted`); fail-closed substrate policy; persist slippage provenance (PR #60 round 1, fixes C + D + E) | §10.5 / §10.3 | 12 | ✅ |
+| 10 | B-r2 | Dedupe review scopes to detected rows; BACKFILL respects explicit `position_type`; apply hardening — snapshot fingerprint + rowcount + FKs ON + post-apply rescan (PR #60 round 2, fixes 1 + 5 + 7) | §12.2 | 7 | ✅ |
+| 11 | B-r2 | Expand COALESCE set to risk anchors + entry/exit timestamps + `modeled_slippage_bps`; `position_uid` identity-conflict refusal (PR #60 round 2, fix 6) | §6.5 / §6.6 | 8 | ✅ |
+| 12 | B-r2 | Queue `on_submitted` to engine thread (thread-safety); roll back pending position lifecycle on substrate-failure re-raise; broaden fail-closed to all exceptions when store configured (PR #60 round 2, fixes 2 + 3 + 4) | §6.4 / §10.3 | 5 | ✅ |
+| 13 | B-r3 | Dedupe partition validation; reject clusters requiring MERGE (accounting conflict); BACKFILL widening to single_leg-with-null-position_id (PR #60 round 3, fixes 1 + 3 + 4) | §12.2 | 7 | ✅ |
+| 14 | B-r3 | `_UPSERT_LATEST_NON_NULL_COLUMNS` bucket for computed accounting (`realized_pnl`, `r_multiple`, slippage_*) (PR #60 round 3, fix 2) | §6.5 / §6.6 | 5 | ✅ |
+| 15 | B-r3 | This tracker restructure + numbering normalization (PR #60 round 3, fix 5) | n/a | — | 🔄 In progress |
 
-Total estimate: ~3000 LOC code + ~1500 LOC tests, ~14 commits.
+Substrate-landed totals: ~5500 LOC code + ~3200 LOC tests across 16 commits.
+
+---
+
+## Planned (next phase — not yet started)
+
+Consumer wiring + cache removal. These were originally listed as commits 7–13 in the very first draft of this tracker; the PR #60 review series consumed those numbers and shifted them out. They will land as a sequence of commits AFTER PR #60 merges, on a follow-up branch.
+
+| Step | Scope | Doc anchor | LOC est. | Tests | Status |
+|---|---|---|---|---|---|
+| P-1 | Wire WebSocket stream → `apply_order_event` (drains via the lifecycle-attach queue introduced in commit 12) | §6.4 / §10.1 | ~300 | 4 | ⬜ |
+| P-2 | Wire cycle reconciliation (`_reconcile_position_lifecycle`) → `apply_order_event` | §6.4 / §10.1 / §3.1 | ~300 | 4 | ⬜ |
+| P-3 | Wire startup reconciliation: downtime fill/cancel walk against closed-order history | §6.4 / §10.1 | ~250 | 3 | ⬜ |
+| P-4 | Wire `protective_stop` role: broker OTO child gets its own per-order row | §10.3 | ~150 | 2 | ⬜ |
+| P-5 | Wire `replacement_stop` role: PR #47 GTC promotion uses durable identity | §10.3 | ~150 | 2 | ⬜ |
+| P-6 | Remove `_suspect_orders` cache (after smoke-test verification) | §10.1 / §6.7 | ~200 | 2 | ⬜ |
+| P-7 | Remove `_suspect_exit_orders` cache (after smoke-test verification) | §10.2 / §6.7 | ~150 | 2 | ⬜ |
+| P-8 | Doc updates: PLAN.md, operator_controls_proposal.md §17, slippage_unification_tracker.md | §12 | ~50 | — | ⬜ |
 
 ---
 
@@ -55,12 +75,12 @@ Each row from the discovery doc's §10 maps to one or more commits above.
 
 | § | Category | Replaces | Commits | Status |
 |---|---|---|---|---|
-| 10.1 | Entry uncertainty / duplicate prevention / pending grace | `_suspect_orders`, broker-open duplicate checks, `LIFECYCLE_PENDING_GRACE_SECONDS` | 6, 7, 8, 11 | ⬜ |
-| 10.2 | Uncertain single-leg exits | `_suspect_exit_orders` | 6, 7, 12 | ⬜ |
-| 10.3 | Protective stop promotion / replacement / repair | `_reported_stop_promotion_failures` identity workaround | 9, 10 | ⬜ |
+| 10.1 | Entry uncertainty / duplicate prevention / pending grace | `_suspect_orders`, broker-open duplicate checks, `LIFECYCLE_PENDING_GRACE_SECONDS` | substrate-side prepared in 6, 9, 12; cache removal P-6 | 🔄 substrate done; consumer pending |
+| 10.2 | Uncertain single-leg exits | `_suspect_exit_orders` | substrate-side prepared in 6; cache removal P-7 | 🔄 substrate done; consumer pending |
+| 10.3 | Protective stop promotion / replacement / repair | `_reported_stop_promotion_failures` identity workaround | P-4, P-5 | ⬜ |
 | 10.4 | Option trailing state split | `option_trailing_stops.alpaca_stop_order_id` denormalization | (separate follow-up) | ⬜ |
-| 10.5 | Slippage recovery — preserve provenance | `SuspectOrder.modeled_price_kind` moves to per-order row | 4, 6, 7 | ⬜ |
-| 10.6 | Position-level partial-close accounting | (acceptance tests; carries forward unchanged) | 4 (rollup) | ⬜ |
+| 10.5 | Slippage recovery — preserve provenance | `SuspectOrder.modeled_price_kind` moves to per-order row | 4 (substrate column) + 9 (plumbed from engine through broker) + 11 (UPSERT preservation) | ✅ |
+| 10.6 | Position-level partial-close accounting | (acceptance tests; carries forward unchanged) | 4 (rollup) | ✅ |
 | 10.7 | MLEG partial-close `_spreads_pending_close` | (single-leg side solved; MLEG side deferred) | (deferred to spread lifecycle PR) | ⬜ |
 | 10.8 | PR #58 disposition | (rebuild, do not cherry-pick) | (deferred until foundation merges) | ⬜ |
 
@@ -68,36 +88,40 @@ Each row from the discovery doc's §10 maps to one or more commits above.
 
 ## §12.1 Regression test matrix progress
 
-All 26 tests from the discovery doc must land in the implementation PR. Each test row identifies the regression it guards against.
+All 26 tests from the discovery doc must land in the implementation PR. Each row maps a regression test to the git commit that landed it (or to the planned consumer-wiring step that will land it).
+
+Statuses below cover the SUBSTRATE-LANDED portion of the PR. Items still in the "planned" phase remain ⬜ until P-1..P-7 ship.
 
 | # | Test (abbreviated) | Doc anchor | Commit | Status |
 |---|---|---|---|---|
-| 1 | Atomic apply_order_event — two unrelated order_ids, only matching updates | §6.4 R3-P0 | 4 | ⬜ |
-| 2 | Terminal-state immutability | §6.4 R3-P1a | 4 | ⬜ |
-| 3 | Side-signed rollup correctness | §6.6 R3-P1b | 4 | ⬜ |
-| 4 | MLEG two-row insert succeeds | §6.5 R5-C1 | 5 | ⬜ |
-| 5 | UPSERT + partial-unique-index pair | §6.5 R5-C2 | 5 | ⬜ |
-| 6 | All-or-nothing transaction on failure | §6.4 R4-P1b | 4 | ⬜ |
-| 7 | execution_id NULL on REST recovery | §6.5 R4-P1a | 8 | ⬜ |
-| 8 | `_suspect_orders` removal preserves TIMEOUT/UNKNOWN recovery | §10.1 | 11 | ⬜ |
-| 9 | `_suspect_exit_orders` removal preserves invariants | §10.2 | 12 | ⬜ |
-| 10 | `replacement_stop` atomic-replace | §10.3 / §6.4 | 10 | ⬜ |
-| 11 | Zero-fill working entry stays `pending` | §6.6.1 R7-P0 | 4 | ⬜ |
-| 12 | Working sell-side order blocks `closed` (R12 supersedes R8-1) | §6.6.1 R12-P1 | 4 | ⬜ |
-| 13 | `closed_at` set only on `closed` / `external_closed` | §6.6.1 R8-P2 | 4 | ⬜ |
-| 14 | `closed_at` reads new status via CTE | §6.6.1 R9-P1a | 4 | ⬜ |
-| 15 | Negative `current_qty` → `error` | §6.6.1 R9-P1b | 4 | ⬜ |
-| 16 | `'error'` retains owner_key lock | §6.2 R8-3 | 1 | ⬜ |
-| 17 | Reverse-pass skips `'error'` rows | §3.1 R8-4 | 7 | ⬜ |
-| 18 | Dedupe script detection-only default | §12.2 R8-2 | 2 | ⬜ |
-| 19 | Migration preflight covers `'error'` status | §12.2 R9-P1c | 2 | ⬜ |
-| 20 | Working sell-side order blocks `closed` AND lock retains | §6.6.1 R12-P1 | 4 | ⬜ |
-| 21 | Oversold position → `error` immediately | §6.6.1 R9-P1b + R11 | 4 | ⬜ |
-| 22 | Broker-snapshot guard defense-in-depth | §10.1 R10-P1b | 6 | ⬜ |
-| 23 | Direct `pending → filled` via fast path | §6.3 / §6.4 R11-P1 | 4 | ⬜ |
-| 24 | Direct `pending → canceled` via recovery | §6.3 / §6.4 R12 | 4 | ⬜ |
-| 25 | `PRAGMA foreign_keys = ON;` enforces FKs | §6.2 R13-G1 | 1 | ⬜ |
-| 26 | `net_realized_pnl` rollup from `trades` (not orders table) | §6.6 R13-G2 | 4 | ⬜ |
+| 1 | Atomic apply_order_event — two unrelated order_ids, only matching updates | §6.4 R3-P0 | 4 | ✅ |
+| 2 | Terminal-state immutability | §6.4 R3-P1a | 4 | ✅ |
+| 3 | Side-signed rollup correctness | §6.6 R3-P1b | 4 | ✅ |
+| 4 | MLEG two-row insert succeeds | §6.5 R5-C1 | 5 | ✅ |
+| 5 | UPSERT + partial-unique-index pair | §6.5 R5-C2 | 5 | ✅ |
+| 6 | All-or-nothing transaction on failure | §6.4 R4-P1b | 4 | ✅ |
+| 7 | execution_id NULL on REST recovery | §6.5 R4-P1a | 8 | ✅ |
+| 8 | `_suspect_orders` removal preserves TIMEOUT/UNKNOWN recovery | §10.1 | P-6 | ⬜ |
+| 9 | `_suspect_exit_orders` removal preserves invariants | §10.2 | P-7 | ⬜ |
+| 10 | `replacement_stop` atomic-replace | §10.3 / §6.4 | P-5 | ⬜ |
+| 11 | Zero-fill working entry stays `pending` | §6.6.1 R7-P0 | 4 | ✅ |
+| 12 | Working sell-side order blocks `closed` (R12 supersedes R8-1) | §6.6.1 R12-P1 | 4 | ✅ |
+| 13 | `closed_at` set only on `closed` / `external_closed` | §6.6.1 R8-P2 | 4 | ✅ |
+| 14 | `closed_at` reads new status via CTE | §6.6.1 R9-P1a | 4 | ✅ |
+| 15 | Negative `current_qty` → `error` | §6.6.1 R9-P1b | 4 | ✅ |
+| 16 | `'error'` retains owner_key lock | §6.2 R8-3 | 1 | ✅ |
+| 17 | Reverse-pass skips `'error'` rows | §3.1 R8-4 | P-2 | ⬜ |
+| 18 | Dedupe script detection-only default | §12.2 R8-2 | 7 | ✅ |
+| 19 | Migration preflight covers `'error'` status | §12.2 R9-P1c | 2 | ✅ |
+| 20 | Working sell-side order blocks `closed` AND lock retains | §6.6.1 R12-P1 | 4 | ✅ |
+| 21 | Oversold position → `error` immediately | §6.6.1 R9-P1b + R11 | 4 | ✅ |
+| 22 | Broker-snapshot guard defense-in-depth | §10.1 R10-P1b | P-1 | ⬜ |
+| 23 | Direct `pending → filled` via fast path | §6.3 / §6.4 R11-P1 | 4 | ✅ |
+| 24 | Direct `pending → canceled` via recovery | §6.3 / §6.4 R12 | 4 | ✅ |
+| 25 | `PRAGMA foreign_keys = ON;` enforces FKs | §6.2 R13-G1 | 1 | ✅ |
+| 26 | `net_realized_pnl` rollup from `trades` (not orders table) | §6.6 R13-G2 | 4 | ✅ |
+
+20/26 landed in the substrate phase. The 6 remaining (#8, #9, #10, #17, #22) all depend on consumer wiring and ship with P-1 / P-2 / P-5 / P-6 / P-7.
 
 ---
 
@@ -112,10 +136,10 @@ Per discovery doc §12.2, the implementation PR must include a duplicate-row pre
 5. Next `recycle_bot.sh` applies the unique indexes cleanly
 
 Implementation PR includes:
-- [ ] Pre-flight detection queries (commit 2)
-- [ ] `_ensure_db()` raises on duplicates (commit 2)
-- [ ] `scripts/migrate_dedupe_trades.py` with three modes (commit 2)
-- [ ] PLAN.md operator-runbook entry for the script (commit 13)
+- [x] Pre-flight detection queries — `position_lifecycle.owner_key` (commit 2) + `trades.order_id` (commit 7)
+- [x] `_ensure_db()` raises on duplicates (commit 2)
+- [x] `scripts/migrate_dedupe_trades.py` with three modes (commit 7) + partition validation + accounting-conflict rejection (commits 10, 13)
+- [ ] PLAN.md operator-runbook entry for the script (planned P-8)
 
 ---
 
