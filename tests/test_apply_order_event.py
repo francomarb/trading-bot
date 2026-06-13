@@ -1,0 +1,881 @@
+"""
+Unit tests for ``apply_order_event`` (foundation commit 4).
+
+This is the load-bearing piece: atomic compare-and-set + trades UPSERT
++ position rollup + position-level status update, all inside one
+transaction. Discovery doc §6.4 / §6.5 / §6.6 / §6.6.1.
+
+§12.1 regression-test matrix coverage:
+
+- Test 1  Atomic — two unrelated order_ids, only matching updates (R3-P0)
+- Test 2  Terminal-state immutability (R3-P1a)
+- Test 3  Side-signed rollup correctness (R3-P1b)
+- Test 6  All-or-nothing transaction on failure (R4-P1b)
+- Test 11 Zero-fill working entry stays 'pending' (R7-P0)
+- Test 12 Working sell-side order blocks 'closed' (R12-P1)
+- Test 13 closed_at set only on closed / external_closed (R8-P2)
+- Test 14 closed_at reads new status via CTE (R9-P1a)
+- Test 15 Negative current_qty maps to 'error' (R9-P1b)
+- Test 20 Working sell-side blocks 'closed' AND lock retains (R12-P1)
+- Test 21 Oversold → 'error' immediately (R9-P1b + R11)
+- Test 23 Direct pending → filled fast path (R11-P1)
+- Test 24 Direct pending → canceled recovery (R12)
+- Test 26 net_realized_pnl rollup from trades (R13-G2)
+"""
+
+from __future__ import annotations
+
+import sqlite3
+from pathlib import Path
+
+import pytest
+
+from engine.lifecycle import PositionLifecycleStore, new_position_uid
+from engine.lifecycle_orders import (
+    OrderEvent,
+    OrderEventOutcome,
+    PositionLifecycleOrdersStore,
+    apply_order_event,
+)
+from reporting.logger import TradeLogger
+
+
+# ── Fixtures ────────────────────────────────────────────────────────────────
+
+
+@pytest.fixture
+def tmp_db_path(tmp_path: Path) -> str:
+    return str(tmp_path / "trades.db")
+
+
+@pytest.fixture
+def conn(tmp_db_path: str) -> sqlite3.Connection:
+    return TradeLogger(path=tmp_db_path)._ensure_db()
+
+
+@pytest.fixture
+def pos_store(conn: sqlite3.Connection) -> PositionLifecycleStore:
+    return PositionLifecycleStore(conn)
+
+
+@pytest.fixture
+def orders_store(conn: sqlite3.Connection) -> PositionLifecycleOrdersStore:
+    return PositionLifecycleOrdersStore(conn)
+
+
+# ── Helpers ────────────────────────────────────────────────────────────────
+
+
+def _seed_position(
+    pos_store: PositionLifecycleStore,
+    *,
+    owner_key: str = "AAPL",
+    entry_qty: float = 10.0,
+) -> str:
+    uid = new_position_uid()
+    pos_store.create_pending(
+        position_uid=uid,
+        symbol=owner_key,
+        owner_key=owner_key,
+        strategy="sma_crossover",
+        position_type="single_leg",
+        entry_qty=entry_qty,
+    )
+    return uid
+
+
+def _insert_entry(
+    orders_store: PositionLifecycleOrdersStore,
+    position_uid: str,
+    *,
+    client_order_id: str = "cli-entry",
+    intended_qty: float = 10.0,
+    side: str = "buy",
+    role: str = "entry_primary",
+    benchmark: bool = True,
+) -> int:
+    return orders_store.insert_pending(
+        position_uid=position_uid,
+        role=role,
+        client_order_id=client_order_id,
+        order_type="market",
+        order_class="oto",
+        time_in_force="gtc",
+        side=side,
+        intended_qty=intended_qty,
+        slippage_benchmark_price=150.0 if benchmark else None,
+        slippage_benchmark_kind="arrival_midpoint" if benchmark else None,
+        slippage_benchmark_timestamp="2026-06-12T10:00:00+00:00" if benchmark else None,
+        slippage_measurement_quality="primary" if benchmark else None,
+    )
+
+
+def _insert_exit(
+    orders_store: PositionLifecycleOrdersStore,
+    position_uid: str,
+    *,
+    client_order_id: str = "cli-exit",
+    intended_qty: float = 10.0,
+) -> int:
+    return orders_store.insert_pending(
+        position_uid=position_uid,
+        role="exit",
+        client_order_id=client_order_id,
+        order_type="market",
+        order_class="simple",
+        time_in_force="gtc",
+        side="sell",
+        intended_qty=intended_qty,
+    )
+
+
+def _insert_protective_stop(
+    orders_store: PositionLifecycleOrdersStore,
+    position_uid: str,
+    *,
+    client_order_id: str = "cli-stop",
+    intended_qty: float = 10.0,
+    stop_price: float = 95.0,
+) -> int:
+    return orders_store.insert_pending(
+        position_uid=position_uid,
+        role="protective_stop",
+        client_order_id=client_order_id,
+        order_type="stop",
+        order_class="oto",
+        time_in_force="gtc",
+        side="sell",
+        intended_qty=intended_qty,
+        intended_stop_price=stop_price,
+    )
+
+
+def _attach_and_get_order_id(
+    orders_store: PositionLifecycleOrdersStore,
+    client_order_id: str,
+    *,
+    order_id: str | None = None,
+) -> str:
+    oid = order_id or f"broker-{client_order_id}"
+    orders_store.attach_broker_order_id(
+        client_order_id=client_order_id,
+        order_id=oid,
+    )
+    return oid
+
+
+def _get_position(
+    conn: sqlite3.Connection, position_uid: str
+) -> tuple:
+    row = conn.execute(
+        "SELECT status, current_qty, avg_entry_price, net_realized_pnl, closed_at "
+        "FROM position_lifecycle WHERE position_uid = ?",
+        (position_uid,),
+    ).fetchone()
+    assert row is not None
+    return row
+
+
+def _get_order(conn: sqlite3.Connection, order_id: str) -> tuple:
+    row = conn.execute(
+        "SELECT status, filled_qty, avg_fill_price, "
+        "last_observed_broker_updated_at, terminal_at "
+        "FROM position_lifecycle_orders WHERE order_id = ?",
+        (order_id,),
+    ).fetchone()
+    assert row is not None
+    return row
+
+
+# ── Core compare-and-set semantics ─────────────────────────────────────────
+
+
+class TestApplyOrderEventBasic:
+    def test_unknown_order_id_returns_outcome(
+        self, conn: sqlite3.Connection
+    ):
+        outcome = apply_order_event(
+            conn,
+            OrderEvent(
+                order_id="never-existed",
+                status="filled",
+                filled_qty=10.0,
+                avg_fill_price=150.0,
+                broker_updated_at="2026-06-12T10:00:00+00:00",
+            ),
+        )
+        assert outcome.applied is False
+        assert outcome.reason == "unknown_order"
+
+    def test_working_event_advances_pending_row(
+        self,
+        conn: sqlite3.Connection,
+        pos_store: PositionLifecycleStore,
+        orders_store: PositionLifecycleOrdersStore,
+    ):
+        uid = _seed_position(pos_store)
+        _insert_entry(orders_store, uid)
+        order_id = _attach_and_get_order_id(orders_store, "cli-entry")
+        outcome = apply_order_event(
+            conn,
+            OrderEvent(
+                order_id=order_id,
+                status="working",
+                filled_qty=0.0,
+                avg_fill_price=None,
+                broker_updated_at="2026-06-12T10:01:00+00:00",
+            ),
+        )
+        assert outcome.applied is True
+        assert outcome.new_status == "pending"  # R7-P0: zero-fill working entry stays pending
+        status, qty, avg, _, terminal_at = _get_order(conn, order_id)
+        assert status == "working"
+        assert qty == 0.0
+        assert avg is None
+        assert terminal_at is None
+
+
+# Test 23 — Direct pending → filled fast-path (R11-P1)
+class TestDirectPendingToFilled:
+    def test_pending_to_filled_synchronous_fast_path(
+        self,
+        conn: sqlite3.Connection,
+        pos_store: PositionLifecycleStore,
+        orders_store: PositionLifecycleOrdersStore,
+    ):
+        """The synchronous fast path produces a 'filled' event with
+        no intermediate 'working' observed. The strict-newer rule
+        admits this directly: (3, qty) > (0, 0)."""
+        uid = _seed_position(pos_store)
+        _insert_entry(orders_store, uid)
+        order_id = _attach_and_get_order_id(orders_store, "cli-entry")
+        outcome = apply_order_event(
+            conn,
+            OrderEvent(
+                order_id=order_id,
+                status="filled",
+                filled_qty=10.0,
+                avg_fill_price=150.50,
+                broker_updated_at="2026-06-12T10:01:00+00:00",
+            ),
+        )
+        assert outcome.applied is True
+        assert outcome.new_status == "open"
+        status, qty, avg, _, terminal_at = _get_order(conn, order_id)
+        assert status == "filled"
+        assert qty == 10.0
+        assert avg == pytest.approx(150.50)
+        assert terminal_at is not None
+        # Position rolled up to open with current_qty == entry_qty.
+        pl_status, current_qty, avg_entry, _, _ = _get_position(conn, uid)
+        assert pl_status == "open"
+        assert current_qty == 10.0
+        assert avg_entry == pytest.approx(150.50)
+
+
+# Test 24 — Direct pending → canceled recovery (R12)
+class TestDirectPendingToCanceled:
+    def test_pending_to_canceled_recovery(
+        self,
+        conn: sqlite3.Connection,
+        pos_store: PositionLifecycleStore,
+        orders_store: PositionLifecycleOrdersStore,
+    ):
+        """Recovery path observes a canceled order with zero fills
+        for a pending row. (3, 0) > (0, 0) admits the transition.
+        Position rolls up to canceled per §8.1."""
+        uid = _seed_position(pos_store)
+        _insert_entry(orders_store, uid)
+        order_id = _attach_and_get_order_id(orders_store, "cli-entry")
+        outcome = apply_order_event(
+            conn,
+            OrderEvent(
+                order_id=order_id,
+                status="canceled",
+                filled_qty=0.0,
+                avg_fill_price=None,
+                broker_updated_at="2026-06-12T10:01:00+00:00",
+            ),
+        )
+        assert outcome.applied is True
+        assert outcome.new_status == "canceled"
+        status, qty, _, _, _ = _get_order(conn, order_id)
+        assert status == "canceled"
+        assert qty == 0.0
+        pl_status, current_qty, _, _, closed_at = _get_position(conn, uid)
+        assert pl_status == "canceled"
+        assert current_qty == 0.0
+        # canceled is NOT closed → closed_at stays NULL (R8-P2).
+        assert closed_at is None
+
+
+# Test 2 — Terminal-state immutability (R3-P1a)
+class TestTerminalImmutability:
+    def test_event_with_newer_updated_at_cannot_revive_filled(
+        self,
+        conn: sqlite3.Connection,
+        pos_store: PositionLifecycleStore,
+        orders_store: PositionLifecycleOrdersStore,
+    ):
+        uid = _seed_position(pos_store)
+        _insert_entry(orders_store, uid)
+        order_id = _attach_and_get_order_id(orders_store, "cli-entry")
+        apply_order_event(
+            conn,
+            OrderEvent(
+                order_id=order_id,
+                status="filled",
+                filled_qty=10.0,
+                avg_fill_price=150.0,
+                broker_updated_at="2026-06-12T10:01:00+00:00",
+            ),
+        )
+        # Now try to "advance" with a newer updated_at — must be blocked.
+        outcome = apply_order_event(
+            conn,
+            OrderEvent(
+                order_id=order_id,
+                status="working",
+                filled_qty=5.0,
+                avg_fill_price=149.0,
+                broker_updated_at="2026-06-12T10:02:00+00:00",
+            ),
+        )
+        assert outcome.applied is False
+        assert outcome.reason == "terminal_blocked"
+        # Row unchanged.
+        status, qty, avg, _, _ = _get_order(conn, order_id)
+        assert status == "filled"
+        assert qty == 10.0
+        assert avg == pytest.approx(150.0)
+
+
+# Test 1 — Atomic: two unrelated order_ids, only matching updates (R3-P0)
+class TestAtomicMatchingRowOnly:
+    def test_event_only_updates_matching_order_id(
+        self,
+        conn: sqlite3.Connection,
+        pos_store: PositionLifecycleStore,
+        orders_store: PositionLifecycleOrdersStore,
+    ):
+        """The R3-P0 SQL precedence bug would have updated all rows
+        with older updated_at on any event. The fix scopes the update
+        to order_id = :order_id only."""
+        uid_a = _seed_position(pos_store, owner_key="AAPL")
+        _insert_entry(orders_store, uid_a, client_order_id="cli-a")
+        order_a = _attach_and_get_order_id(orders_store, "cli-a")
+
+        # Close the first position then seed a second on a different
+        # owner_key with the second order also pending.
+        # Simplest: directly insert entry for AAPL second order is
+        # impossible (owner_key lock). Use a different owner_key.
+        # Actually — for the test, we just need TWO rows in the same
+        # table with different order_ids. Close A first.
+        apply_order_event(
+            conn,
+            OrderEvent(
+                order_id=order_a,
+                status="filled",
+                filled_qty=10.0,
+                avg_fill_price=150.0,
+                broker_updated_at="2026-06-12T10:01:00+00:00",
+            ),
+        )
+        # Exit the first position so the owner_key lock releases.
+        _insert_exit(orders_store, uid_a, client_order_id="cli-a-exit")
+        order_a_exit = _attach_and_get_order_id(orders_store, "cli-a-exit")
+        apply_order_event(
+            conn,
+            OrderEvent(
+                order_id=order_a_exit,
+                status="filled",
+                filled_qty=10.0,
+                avg_fill_price=151.0,
+                broker_updated_at="2026-06-12T10:02:00+00:00",
+            ),
+        )
+        # Now insert a fresh position on the same owner_key.
+        uid_b = _seed_position(pos_store, owner_key="AAPL")
+        _insert_entry(orders_store, uid_b, client_order_id="cli-b")
+        order_b = _attach_and_get_order_id(orders_store, "cli-b")
+
+        # Apply an event that targets order_b only — it must NOT
+        # touch order_a's row, even though order_a's updated_at
+        # could be older.
+        outcome = apply_order_event(
+            conn,
+            OrderEvent(
+                order_id=order_b,
+                status="working",
+                filled_qty=0.0,
+                avg_fill_price=None,
+                broker_updated_at="2026-06-12T11:00:00+00:00",
+            ),
+        )
+        assert outcome.applied is True
+        # order_a stays at filled with its original values.
+        status_a, qty_a, avg_a, _, _ = _get_order(conn, order_a)
+        assert status_a == "filled"
+        assert qty_a == 10.0
+        assert avg_a == pytest.approx(150.0)
+
+
+# Test 3 — Side-signed rollup correctness (R3-P1b)
+class TestSideSignedRollup:
+    def test_buy_then_sell_zeroes_current_qty(
+        self,
+        conn: sqlite3.Connection,
+        pos_store: PositionLifecycleStore,
+        orders_store: PositionLifecycleOrdersStore,
+    ):
+        """Naive SUM(filled_qty) would produce 20 here. Side-signed
+        SUM zeroes correctly."""
+        uid = _seed_position(pos_store)
+        _insert_entry(orders_store, uid)
+        eid = _attach_and_get_order_id(orders_store, "cli-entry")
+        apply_order_event(
+            conn,
+            OrderEvent(
+                order_id=eid,
+                status="filled",
+                filled_qty=10.0,
+                avg_fill_price=150.0,
+                broker_updated_at="2026-06-12T10:01:00+00:00",
+            ),
+        )
+        # Verify current_qty == 10 after entry.
+        _, qty_after_entry, _, _, _ = _get_position(conn, uid)
+        assert qty_after_entry == 10.0
+        # Submit an exit.
+        _insert_exit(orders_store, uid)
+        xid = _attach_and_get_order_id(orders_store, "cli-exit")
+        apply_order_event(
+            conn,
+            OrderEvent(
+                order_id=xid,
+                status="filled",
+                filled_qty=10.0,
+                avg_fill_price=152.0,
+                broker_updated_at="2026-06-12T10:02:00+00:00",
+            ),
+        )
+        # current_qty == 0 after exit (10 - 10), NOT 20.
+        pl_status, current_qty, _, _, closed_at = _get_position(conn, uid)
+        assert current_qty == 0.0
+        assert pl_status == "closed"
+        assert closed_at is not None
+
+
+# Test 11 — Zero-fill working entry stays 'pending' (R7-P0)
+class TestZeroFillWorkingStaysPending:
+    def test_zero_fill_working_entry_stays_pending(
+        self,
+        conn: sqlite3.Connection,
+        pos_store: PositionLifecycleStore,
+        orders_store: PositionLifecycleOrdersStore,
+    ):
+        uid = _seed_position(pos_store)
+        _insert_entry(orders_store, uid)
+        order_id = _attach_and_get_order_id(orders_store, "cli-entry")
+        # Broker says 'working' with no fills — naive rule
+        # current_qty == 0 → closed is wrong; position stays pending.
+        outcome = apply_order_event(
+            conn,
+            OrderEvent(
+                order_id=order_id,
+                status="working",
+                filled_qty=0.0,
+                avg_fill_price=None,
+                broker_updated_at="2026-06-12T10:01:00+00:00",
+            ),
+        )
+        assert outcome.applied is True
+        assert outcome.new_status == "pending"
+
+
+# Test 12 + 20 — Working sell-side blocks 'closed' AND lock retains (R12-P1)
+class TestSellSideBlocksClosed:
+    def test_working_exit_with_current_qty_zero_stays_partially_filled(
+        self,
+        conn: sqlite3.Connection,
+        pos_store: PositionLifecycleStore,
+        orders_store: PositionLifecycleOrdersStore,
+    ):
+        """A live exit with current_qty == 0 (operationally flat)
+        does NOT release the owner_key lock — must stay
+        partially_filled. R11-P1 walk-back of R10-P1."""
+        uid = _seed_position(pos_store)
+        _insert_entry(orders_store, uid)
+        eid = _attach_and_get_order_id(orders_store, "cli-entry")
+        apply_order_event(
+            conn,
+            OrderEvent(
+                order_id=eid,
+                status="filled",
+                filled_qty=10.0,
+                avg_fill_price=150.0,
+                broker_updated_at="2026-06-12T10:01:00+00:00",
+            ),
+        )
+        _insert_exit(orders_store, uid)
+        xid = _attach_and_get_order_id(orders_store, "cli-exit")
+        # Exit observed as partially_filled with full qty filled but
+        # the per-order row not yet at 'filled'.
+        outcome = apply_order_event(
+            conn,
+            OrderEvent(
+                order_id=xid,
+                status="partially_filled",
+                filled_qty=10.0,
+                avg_fill_price=152.0,
+                broker_updated_at="2026-06-12T10:02:00+00:00",
+            ),
+        )
+        assert outcome.applied is True
+        assert outcome.new_status == "partially_filled"
+        # Owner_key lock retained — verify the index still blocks a duplicate.
+        _, current_qty, _, _, closed_at = _get_position(conn, uid)
+        assert current_qty == 0.0
+        assert closed_at is None
+        # Try to create a second position on the same owner_key.
+        with pytest.raises(sqlite3.IntegrityError):
+            pos_store.create_pending(
+                position_uid=new_position_uid(),
+                symbol="AAPL",
+                owner_key="AAPL",
+                strategy="sma_crossover",
+                position_type="single_leg",
+                entry_qty=10.0,
+            )
+
+    def test_working_protective_stop_blocks_closed_too(
+        self,
+        conn: sqlite3.Connection,
+        pos_store: PositionLifecycleStore,
+        orders_store: PositionLifecycleOrdersStore,
+    ):
+        """R12-P1 supersedes R8-1: stop-side roles also block 'closed'.
+        Otherwise a working stop could fire after the lock releases
+        and oversell a fresh entry on the same symbol."""
+        uid = _seed_position(pos_store)
+        _insert_entry(orders_store, uid)
+        eid = _attach_and_get_order_id(orders_store, "cli-entry")
+        apply_order_event(
+            conn,
+            OrderEvent(
+                order_id=eid,
+                status="filled",
+                filled_qty=10.0,
+                avg_fill_price=150.0,
+                broker_updated_at="2026-06-12T10:01:00+00:00",
+            ),
+        )
+        # Attach a protective stop (still working at broker).
+        _insert_protective_stop(orders_store, uid)
+        sid = _attach_and_get_order_id(orders_store, "cli-stop")
+        apply_order_event(
+            conn,
+            OrderEvent(
+                order_id=sid,
+                status="working",
+                filled_qty=0.0,
+                avg_fill_price=None,
+                broker_updated_at="2026-06-12T10:02:00+00:00",
+            ),
+        )
+        # Submit and fill the exit.
+        _insert_exit(orders_store, uid)
+        xid = _attach_and_get_order_id(orders_store, "cli-exit")
+        apply_order_event(
+            conn,
+            OrderEvent(
+                order_id=xid,
+                status="filled",
+                filled_qty=10.0,
+                avg_fill_price=152.0,
+                broker_updated_at="2026-06-12T10:03:00+00:00",
+            ),
+        )
+        # Position is operationally flat but the stop is still working.
+        # Must stay partially_filled, NOT closed.
+        pl_status, current_qty, _, _, closed_at = _get_position(conn, uid)
+        assert current_qty == 0.0
+        assert pl_status == "partially_filled"
+        assert closed_at is None
+        # Now cancel the stop.
+        apply_order_event(
+            conn,
+            OrderEvent(
+                order_id=sid,
+                status="canceled",
+                filled_qty=0.0,
+                avg_fill_price=None,
+                broker_updated_at="2026-06-12T10:04:00+00:00",
+            ),
+        )
+        # NOW position closes.
+        pl_status, current_qty, _, _, closed_at = _get_position(conn, uid)
+        assert pl_status == "closed"
+        assert closed_at is not None
+
+
+# Test 13 + 14 — closed_at only on closed/external_closed via CTE (R8-P2, R9-P1a)
+class TestClosedAtSemantics:
+    def test_closed_at_set_via_cte_on_close_transition(
+        self,
+        conn: sqlite3.Connection,
+        pos_store: PositionLifecycleStore,
+        orders_store: PositionLifecycleOrdersStore,
+    ):
+        """The CTE-based SQL must produce a non-NULL closed_at on the
+        same UPDATE that sets status='closed'. R9-P1a: a bare subquery
+        in SET would read the pre-update status and never set
+        closed_at."""
+        uid = _seed_position(pos_store)
+        _insert_entry(orders_store, uid)
+        eid = _attach_and_get_order_id(orders_store, "cli-entry")
+        apply_order_event(
+            conn,
+            OrderEvent(
+                order_id=eid,
+                status="filled",
+                filled_qty=10.0,
+                avg_fill_price=150.0,
+                broker_updated_at="2026-06-12T10:01:00+00:00",
+            ),
+        )
+        _insert_exit(orders_store, uid)
+        xid = _attach_and_get_order_id(orders_store, "cli-exit")
+        apply_order_event(
+            conn,
+            OrderEvent(
+                order_id=xid,
+                status="filled",
+                filled_qty=10.0,
+                avg_fill_price=152.0,
+                broker_updated_at="2026-06-12T10:02:00+00:00",
+            ),
+        )
+        pl_status, _, _, _, closed_at = _get_position(conn, uid)
+        assert pl_status == "closed"
+        assert closed_at is not None
+
+    def test_closed_at_NULL_on_canceled(
+        self,
+        conn: sqlite3.Connection,
+        pos_store: PositionLifecycleStore,
+        orders_store: PositionLifecycleOrdersStore,
+    ):
+        uid = _seed_position(pos_store)
+        _insert_entry(orders_store, uid)
+        eid = _attach_and_get_order_id(orders_store, "cli-entry")
+        apply_order_event(
+            conn,
+            OrderEvent(
+                order_id=eid,
+                status="canceled",
+                filled_qty=0.0,
+                avg_fill_price=None,
+                broker_updated_at="2026-06-12T10:01:00+00:00",
+            ),
+        )
+        pl_status, _, _, _, closed_at = _get_position(conn, uid)
+        assert pl_status == "canceled"
+        assert closed_at is None  # R8-P2
+
+
+# Test 15 + 21 — Negative current_qty → 'error' (R9-P1b + R11)
+class TestNegativeCurrentQtyIsError:
+    def test_oversold_position_is_error(
+        self,
+        conn: sqlite3.Connection,
+        pos_store: PositionLifecycleStore,
+        orders_store: PositionLifecycleOrdersStore,
+    ):
+        """Oversold (current_qty < 0) must surface as 'error',
+        immediately, regardless of pending sell-side orders."""
+        uid = _seed_position(pos_store, entry_qty=10.0)
+        _insert_entry(orders_store, uid)
+        eid = _attach_and_get_order_id(orders_store, "cli-entry")
+        apply_order_event(
+            conn,
+            OrderEvent(
+                order_id=eid,
+                status="filled",
+                filled_qty=10.0,
+                avg_fill_price=150.0,
+                broker_updated_at="2026-06-12T10:01:00+00:00",
+            ),
+        )
+        _insert_exit(orders_store, uid, intended_qty=12.0)  # intent oversize
+        xid = _attach_and_get_order_id(orders_store, "cli-exit")
+        # Broker oversells: fills 12 against a position of 10 → -2.
+        apply_order_event(
+            conn,
+            OrderEvent(
+                order_id=xid,
+                status="filled",
+                filled_qty=12.0,
+                avg_fill_price=152.0,
+                broker_updated_at="2026-06-12T10:02:00+00:00",
+            ),
+        )
+        pl_status, current_qty, _, _, closed_at = _get_position(conn, uid)
+        assert current_qty == pytest.approx(-2.0)
+        assert pl_status == "error"
+        assert closed_at is None  # error rows leave closed_at NULL
+
+
+# Test 6 — All-or-nothing transaction on failure (R4-P1b)
+class _FlakyConnection:
+    """Proxy that delegates to a real sqlite3.Connection but raises
+    when a configured SQL marker appears. Lets the test simulate a
+    failure inside the apply_order_event transaction without
+    monkey-patching sqlite3.Connection (whose execute is read-only)."""
+
+    def __init__(self, real: sqlite3.Connection, fail_on_marker: str) -> None:
+        self._real = real
+        self._fail_on_marker = fail_on_marker
+        self.failed = False
+
+    def execute(self, sql: str, *args, **kwargs):
+        if self._fail_on_marker in sql:
+            self.failed = True
+            raise sqlite3.OperationalError("simulated UPSERT failure")
+        return self._real.execute(sql, *args, **kwargs)
+
+    def __enter__(self):
+        return self._real.__enter__()
+
+    def __exit__(self, exc_type, exc, tb):
+        return self._real.__exit__(exc_type, exc, tb)
+
+    def __getattr__(self, name):
+        return getattr(self._real, name)
+
+
+class TestAllOrNothingTransaction:
+    def test_failure_inside_transaction_rolls_back_everything(
+        self,
+        conn: sqlite3.Connection,
+        pos_store: PositionLifecycleStore,
+        orders_store: PositionLifecycleOrdersStore,
+    ):
+        """If the trades UPSERT raises, the per-order UPDATE that
+        came before must also roll back. No partial state across
+        the three tables."""
+        uid = _seed_position(pos_store)
+        _insert_entry(orders_store, uid)
+        order_id = _attach_and_get_order_id(orders_store, "cli-entry")
+        before_row = _get_order(conn, order_id)
+        flaky = _FlakyConnection(conn, fail_on_marker="INSERT INTO trades")
+        with pytest.raises(sqlite3.OperationalError):
+            apply_order_event(
+                flaky,  # type: ignore[arg-type]
+                OrderEvent(
+                    order_id=order_id,
+                    status="working",
+                    filled_qty=0.0,
+                    avg_fill_price=None,
+                    broker_updated_at="2026-06-12T10:01:00+00:00",
+                ),
+            )
+        assert flaky.failed
+        # Re-read the per-order row — unchanged because the entire
+        # transaction rolled back.
+        after_row = _get_order(conn, order_id)
+        assert before_row == after_row
+
+
+# Test 26 — net_realized_pnl rollup from trades (R13-G2)
+class TestNetRealizedPnlRollup:
+    def test_position_net_realized_pnl_sums_trades(
+        self,
+        conn: sqlite3.Connection,
+        pos_store: PositionLifecycleStore,
+        orders_store: PositionLifecycleOrdersStore,
+    ):
+        """R13-G2: net_realized_pnl on position_lifecycle is the
+        SUM(realized_pnl) on trades for that position_uid. The
+        per-order table has no realized_pnl column."""
+        uid = _seed_position(pos_store)
+        _insert_entry(orders_store, uid)
+        eid = _attach_and_get_order_id(orders_store, "cli-entry")
+        apply_order_event(
+            conn,
+            OrderEvent(
+                order_id=eid,
+                status="filled",
+                filled_qty=10.0,
+                avg_fill_price=150.0,
+                broker_updated_at="2026-06-12T10:01:00+00:00",
+            ),
+        )
+        # apply_order_event's trades UPSERT doesn't compute realized_pnl;
+        # it's the existing TradeLogger.log_close path that fills it
+        # (or in this test, we set it directly on the trades row).
+        # Simulate that a downstream writer set realized_pnl after a
+        # SELL closed the position.
+        conn.execute(
+            "UPDATE trades SET realized_pnl = ? "
+            "WHERE position_uid = ? AND side = 'buy'",
+            (25.0, uid),
+        )
+        conn.commit()
+        # Re-running apply_order_event for ANY event triggers the
+        # rollup; use a no-op stale event for the entry to drive it.
+        _insert_exit(orders_store, uid)
+        xid = _attach_and_get_order_id(orders_store, "cli-exit")
+        apply_order_event(
+            conn,
+            OrderEvent(
+                order_id=xid,
+                status="working",
+                filled_qty=0.0,
+                avg_fill_price=None,
+                broker_updated_at="2026-06-12T10:02:00+00:00",
+            ),
+        )
+        _, _, _, net_realized_pnl, _ = _get_position(conn, uid)
+        assert net_realized_pnl == pytest.approx(25.0)
+
+
+# Smoke: stale event drops cleanly
+class TestStaleEventDropped:
+    def test_older_status_is_dropped(
+        self,
+        conn: sqlite3.Connection,
+        pos_store: PositionLifecycleStore,
+        orders_store: PositionLifecycleOrdersStore,
+    ):
+        uid = _seed_position(pos_store)
+        _insert_entry(orders_store, uid)
+        order_id = _attach_and_get_order_id(orders_store, "cli-entry")
+        # Advance to partially_filled.
+        apply_order_event(
+            conn,
+            OrderEvent(
+                order_id=order_id,
+                status="partially_filled",
+                filled_qty=5.0,
+                avg_fill_price=150.0,
+                broker_updated_at="2026-06-12T10:01:00+00:00",
+            ),
+        )
+        # A stale 'working' event with zero fills must drop.
+        outcome = apply_order_event(
+            conn,
+            OrderEvent(
+                order_id=order_id,
+                status="working",
+                filled_qty=0.0,
+                avg_fill_price=None,
+                broker_updated_at="2026-06-12T10:02:00+00:00",  # newer ts even
+            ),
+        )
+        assert outcome.applied is False
+        assert outcome.reason == "stale_or_duplicate"
+        # Row unchanged.
+        status, qty, avg, _, _ = _get_order(conn, order_id)
+        assert status == "partially_filled"
+        assert qty == 5.0

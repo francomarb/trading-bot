@@ -183,6 +183,17 @@ _UNIQ_ONE_ACTIVE_POSITION_PER_OWNER_KEY_SQL = (
     "WHERE status IN ('pending', 'open', 'partially_filled', 'error')"
 )
 
+# trades dedup key per discovery doc §6.5 (R5-C1 + R5-C2 fixes):
+# scoped to single-leg rows only because log_spread_fill deliberately
+# writes two leg rows with the same combo order_id. The ON CONFLICT
+# clause inside apply_order_event references this exact predicate
+# (R5-C2 SQLite partial-index alignment).
+_UNIQ_TRADES_ORDER_ID_SINGLE_LEG_SQL = (
+    "CREATE UNIQUE INDEX IF NOT EXISTS uniq_trades_order_id_single_leg "
+    "ON trades(order_id) "
+    "WHERE order_id IS NOT NULL AND position_type = 'single_leg'"
+)
+
 
 # Tuple consumed by reporting.logger.TradeLogger._ensure_db. All
 # statements are idempotent (CREATE TABLE IF NOT EXISTS, CREATE INDEX
@@ -783,3 +794,447 @@ def _validate_origin_kind(origin_kind: str) -> None:
         raise ValueError(
             f"origin_kind must be 'bot' or 'operator'; got {origin_kind!r}"
         )
+
+
+def _validate_status(status: str) -> None:
+    if status not in VALID_ORDER_STATUSES:
+        raise ValueError(
+            f"status must be one of {sorted(VALID_ORDER_STATUSES)}; "
+            f"got {status!r}"
+        )
+
+
+# ── apply_order_event (discovery doc §6.4 / §6.5 / §6.6 / §6.6.1) ──
+
+
+@dataclass(frozen=True)
+class OrderEvent:
+    """One observed broker event for a specific order.
+
+    All fields are required except ``execution_id`` and
+    ``avg_fill_price`` (the latter is NULL on rejections and on
+    canceled-zero-fill orders).
+
+    ``broker_updated_at`` is the order's ``updated_at`` field as
+    returned by Alpaca — the strict-newer rule in §6.4 uses this
+    as the tiebreaker when state-machine rank and filled_qty are
+    exactly equal (rare backend reissues).
+
+    ``execution_id`` is audit-only on ``trades`` per discovery doc
+    §6.5. REST recovery has no execution_id and passes None.
+    """
+
+    order_id: str
+    status: str
+    filled_qty: float
+    avg_fill_price: float | None
+    broker_updated_at: str
+    execution_id: str | None = None
+
+
+@dataclass(frozen=True)
+class OrderEventOutcome:
+    """Outcome of a single apply_order_event call.
+
+    ``applied=True`` means the per-order row advanced AND the
+    transaction (per-order UPDATE + trades UPSERT + position rollup
+    + position status update) committed.
+
+    ``applied=False`` means the event was ignored. ``reason``
+    distinguishes the cases callers care about:
+      - 'stale_or_duplicate': the event is older than the row's
+        current observed state (per the strict-newer rule).
+      - 'terminal_blocked': the row is already at filled / canceled /
+        rejected; terminal states are immutable.
+      - 'unknown_order': order_id has no matching per-order row.
+        Foundation will not synthesize rows; the caller (typically
+        a recovery path) should insert_pending first if appropriate.
+    """
+
+    applied: bool
+    reason: str
+    position_uid: str | None = None
+    new_status: str | None = None
+
+
+# State-machine rank case expression — matches §6.3 / §6.4 exactly.
+# Pulled into one fragment so the compare-and-set SQL and the
+# rollup SQL can reference identical semantics.
+_STATUS_RANK_CASE = (
+    "CASE status "
+    "WHEN 'pending' THEN 0 "
+    "WHEN 'working' THEN 1 "
+    "WHEN 'unknown' THEN 1 "
+    "WHEN 'partially_filled' THEN 2 "
+    "ELSE 3 "
+    "END"
+)
+
+_INCOMING_RANK_PARAM_CASE = (
+    "CASE :status "
+    "WHEN 'pending' THEN 0 "
+    "WHEN 'working' THEN 1 "
+    "WHEN 'unknown' THEN 1 "
+    "WHEN 'partially_filled' THEN 2 "
+    "ELSE 3 "
+    "END"
+)
+
+
+# Compare-and-set SQL per discovery doc §6.4 (R3-P0 + R3-P1a +
+# R10-P1 fixes incorporated). Order_id is the outer guard; terminal
+# states are immutable; updated_at is the tiebreaker WITHIN
+# state-machine-equal events only — never a bypass.
+_COMPARE_AND_SET_SQL = f"""
+UPDATE position_lifecycle_orders
+SET
+    status                          = :status,
+    filled_qty                      = :filled_qty,
+    avg_fill_price                  = :avg_fill_price,
+    last_observed_broker_updated_at = :broker_updated_at,
+    last_observed_at                = :now,
+    terminal_at = CASE
+        WHEN :status IN ('filled', 'canceled', 'rejected') THEN :now
+        ELSE terminal_at
+    END
+WHERE order_id = :order_id
+  AND status NOT IN ('filled', 'canceled', 'rejected')
+  AND (
+      ({_STATUS_RANK_CASE}, filled_qty)
+        < ({_INCOMING_RANK_PARAM_CASE}, :filled_qty)
+      OR (
+          {_STATUS_RANK_CASE} = {_INCOMING_RANK_PARAM_CASE}
+          AND filled_qty = :filled_qty
+          AND (
+              last_observed_broker_updated_at IS NULL
+              OR last_observed_broker_updated_at < :broker_updated_at
+          )
+      )
+  )
+"""
+
+
+# trades write for apply_order_event — single-leg cumulative state.
+# Uses application-level dedup (SELECT to detect existing row, then
+# INSERT or UPDATE) because the partial UNIQUE index is deferred to
+# a later foundation commit (existing legacy writers still emit
+# multiple rows per order_id). Once those writers migrate to the
+# foundation, the partial UNIQUE + ON CONFLICT UPSERT lands and
+# this two-statement pattern can collapse to a single UPSERT.
+_TRADES_INSERT_SQL = """
+INSERT INTO trades (
+    timestamp, symbol, side, qty, avg_fill_price, order_id,
+    strategy, reason, stop_price, entry_reference_price,
+    modeled_slippage_bps, realized_slippage_bps,
+    order_type, status, requested_qty, filled_qty,
+    initial_stop_loss, initial_risk_per_share, initial_risk_dollars,
+    realized_pnl, r_multiple,
+    entry_timestamp, exit_timestamp,
+    position_id, position_type, position_uid,
+    slippage_benchmark_price, slippage_benchmark_kind,
+    slippage_benchmark_timestamp, slippage_measurement_quality,
+    slippage_signed_bps, slippage_adverse_bps, stop_trigger_price,
+    execution_id
+) VALUES (
+    :now, :symbol, :side, :filled_qty, :avg_fill_price, :order_id,
+    :strategy, :reason, 0.0, COALESCE(:slippage_benchmark_price, 0.0),
+    NULL, NULL,
+    :order_type, :order_status, :intended_qty, :filled_qty,
+    NULL, NULL, NULL,
+    NULL, NULL,
+    :now, NULL,
+    :position_id, 'single_leg', :position_uid,
+    :slippage_benchmark_price, :slippage_benchmark_kind,
+    :slippage_benchmark_timestamp, :slippage_measurement_quality,
+    NULL, NULL, NULL,
+    :execution_id
+)
+"""
+
+_TRADES_UPDATE_SQL = """
+UPDATE trades SET
+    filled_qty                    = :filled_qty,
+    avg_fill_price                = :avg_fill_price,
+    status                        = :order_status,
+    slippage_benchmark_price      = COALESCE(slippage_benchmark_price,      :slippage_benchmark_price),
+    slippage_benchmark_kind       = COALESCE(slippage_benchmark_kind,       :slippage_benchmark_kind),
+    slippage_benchmark_timestamp  = COALESCE(slippage_benchmark_timestamp,  :slippage_benchmark_timestamp),
+    slippage_measurement_quality  = COALESCE(slippage_measurement_quality,  :slippage_measurement_quality),
+    execution_id                  = COALESCE(:execution_id, execution_id)
+WHERE order_id = :order_id AND position_type = 'single_leg'
+"""
+
+
+# Position rollup SQL — discovery doc §6.6 (R3-P1b side-signed sum) +
+# R13-G2 (net_realized_pnl from trades).
+_POSITION_ROLLUP_SQL = """
+UPDATE position_lifecycle
+SET
+    current_qty = COALESCE((
+        SELECT SUM(
+            CASE side
+                WHEN 'buy'  THEN  filled_qty
+                WHEN 'sell' THEN -filled_qty
+                ELSE              0
+            END
+        )
+        FROM position_lifecycle_orders
+        WHERE position_uid = :position_uid
+    ), 0.0),
+    avg_entry_price = (
+        SELECT SUM(filled_qty * avg_fill_price) / NULLIF(SUM(filled_qty), 0)
+        FROM position_lifecycle_orders
+        WHERE position_uid = :position_uid
+          AND role IN ('entry_primary', 'entry_residual')
+          AND filled_qty > 0
+    ),
+    net_realized_pnl = COALESCE((
+        SELECT SUM(realized_pnl)
+        FROM trades
+        WHERE position_uid = :position_uid
+          AND realized_pnl IS NOT NULL
+    ), 0.0)
+WHERE position_uid = :position_uid
+"""
+
+
+# Position-status SQL — discovery doc §6.6.1 (R7-P0 + R8-1+R12-P1
+# walk-back + R8-P2 + R9-P1a CTE + R9-P1b error + R10-P1 + R11-P1
+# walk-back + R12-P1 sell-side gate). The CTE computes new_status
+# once so the closed_at CASE can read it (a bare subquery in SET
+# would see the pre-update value).
+_POSITION_STATUS_SQL = """
+WITH computed AS (
+    SELECT CASE
+        WHEN NOT EXISTS (
+            SELECT 1 FROM position_lifecycle_orders
+            WHERE position_uid = :position_uid
+              AND status NOT IN ('pending')
+        ) THEN 'pending'
+
+        WHEN NOT EXISTS (
+            SELECT 1 FROM position_lifecycle_orders
+            WHERE position_uid = :position_uid
+              AND filled_qty > 0
+        ) THEN
+            CASE
+                WHEN NOT EXISTS (
+                    SELECT 1 FROM position_lifecycle_orders
+                    WHERE position_uid = :position_uid
+                      AND role IN ('entry_primary', 'entry_residual')
+                      AND status IN ('pending', 'working',
+                                     'partially_filled', 'unknown')
+                ) THEN 'canceled'
+                ELSE 'pending'
+            END
+
+        WHEN COALESCE((SELECT current_qty FROM position_lifecycle
+                       WHERE position_uid = :position_uid), 0) < 0
+        THEN 'error'
+
+        WHEN COALESCE((SELECT current_qty FROM position_lifecycle
+                       WHERE position_uid = :position_uid), 0) = 0
+             AND NOT EXISTS (
+                 SELECT 1 FROM position_lifecycle_orders
+                 WHERE position_uid = :position_uid
+                   AND role IN ('exit', 'partial_close',
+                                'protective_stop', 'replacement_stop')
+                   AND status IN ('pending', 'working',
+                                  'partially_filled', 'unknown')
+             )
+        THEN 'closed'
+
+        WHEN COALESCE((SELECT current_qty FROM position_lifecycle
+                       WHERE position_uid = :position_uid), 0) = 0
+        THEN 'partially_filled'
+
+        WHEN COALESCE((SELECT current_qty FROM position_lifecycle
+                       WHERE position_uid = :position_uid), 0)
+             < COALESCE((SELECT entry_qty FROM position_lifecycle
+                         WHERE position_uid = :position_uid), 0)
+        THEN 'partially_filled'
+
+        ELSE 'open'
+    END AS new_status
+)
+UPDATE position_lifecycle
+SET status = (SELECT new_status FROM computed),
+    closed_at = CASE
+        WHEN (SELECT new_status FROM computed) IN ('closed', 'external_closed')
+        THEN COALESCE(closed_at, :now)
+        ELSE closed_at
+    END
+WHERE position_uid = :position_uid
+"""
+
+
+def apply_order_event(
+    conn: sqlite3.Connection,
+    event: OrderEvent,
+    *,
+    reason: str = "",
+) -> OrderEventOutcome:
+    """Apply one broker event atomically across four steps:
+
+    1. Compare-and-set on the per-order row (§6.4).
+    2. Trades UPSERT keyed on order_id (§6.5).
+    3. Position-level rollup recompute (§6.6 + R13-G2 net_realized_pnl
+       from trades).
+    4. Position-level status update via CTE (§6.6.1).
+
+    All four execute inside one ``with conn:`` transaction. Any
+    exception rolls back the entire operation; partial application
+    is impossible.
+
+    Returns ``OrderEventOutcome`` describing whether the event was
+    applied and (if not) why. The caller can use ``reason`` to
+    decide whether to retry, alert, or move on.
+
+    Pre-conditions:
+      - The per-order row for ``event.order_id`` must already exist
+        in ``position_lifecycle_orders``. ``insert_pending`` (the
+        broker entry path) and ``attach_broker_order_id`` (post-
+        submit) together establish this. Foundation will not
+        synthesize rows here.
+    """
+    _validate_status(event.status)
+
+    # Look up the per-order row + its parent position metadata in
+    # one SELECT. apply_order_event needs symbol / strategy / side /
+    # slippage benchmark fields for the trades UPSERT.
+    pre_row = conn.execute(
+        """
+        SELECT plo.id, plo.position_uid, plo.role, plo.side,
+               plo.order_type, plo.intended_qty,
+               plo.slippage_benchmark_price, plo.slippage_benchmark_kind,
+               plo.slippage_benchmark_timestamp, plo.slippage_measurement_quality,
+               pl.symbol, pl.strategy, pl.owner_key
+        FROM position_lifecycle_orders plo
+        JOIN position_lifecycle pl
+          ON pl.position_uid = plo.position_uid
+        WHERE plo.order_id = ?
+        """,
+        (event.order_id,),
+    ).fetchone()
+    if pre_row is None:
+        return OrderEventOutcome(
+            applied=False, reason="unknown_order"
+        )
+
+    (
+        row_id, position_uid, role, side,
+        order_type, intended_qty,
+        slip_price, slip_kind, slip_ts, slip_quality,
+        symbol, strategy, owner_key,
+    ) = pre_row
+
+    now = _utc_now_iso()
+
+    try:
+        with conn:
+            # Step 1: compare-and-set on per-order.
+            cur = conn.execute(
+                _COMPARE_AND_SET_SQL,
+                {
+                    "status": event.status,
+                    "filled_qty": float(event.filled_qty),
+                    "avg_fill_price": event.avg_fill_price,
+                    "broker_updated_at": event.broker_updated_at,
+                    "now": now,
+                    "order_id": event.order_id,
+                },
+            )
+            if cur.rowcount == 0:
+                # Either the row is terminal, the event is stale,
+                # or the event is a duplicate. Tell the caller
+                # apart by re-reading status.
+                cur2 = conn.execute(
+                    "SELECT status FROM position_lifecycle_orders "
+                    "WHERE order_id = ?",
+                    (event.order_id,),
+                ).fetchone()
+                if cur2 is not None and cur2[0] in TERMINAL_ORDER_STATUSES:
+                    raise _AppliedZeroRows("terminal_blocked")
+                raise _AppliedZeroRows("stale_or_duplicate")
+
+            # Step 2: trades write keyed on order_id. Application-level
+            # SELECT-then-INSERT-or-UPDATE because the foundation's
+            # partial UNIQUE index on trades(order_id) is deferred to
+            # a later commit (existing writers still produce multiple
+            # rows per order_id). The transactional context still
+            # makes the pair atomic.
+            trades_params = {
+                "now": now,
+                "symbol": symbol,
+                "side": side,
+                "filled_qty": float(event.filled_qty),
+                "avg_fill_price": event.avg_fill_price,
+                "order_id": event.order_id,
+                "strategy": strategy,
+                "reason": reason or f"{role}:{event.status}",
+                "order_type": order_type,
+                "order_status": event.status,
+                "intended_qty": float(intended_qty),
+                "position_id": owner_key,
+                "position_uid": position_uid,
+                "slippage_benchmark_price": slip_price,
+                "slippage_benchmark_kind": slip_kind,
+                "slippage_benchmark_timestamp": slip_ts,
+                "slippage_measurement_quality": slip_quality,
+                "execution_id": event.execution_id,
+            }
+            existing_trade = conn.execute(
+                "SELECT 1 FROM trades "
+                "WHERE order_id = ? AND position_type = 'single_leg' "
+                "LIMIT 1",
+                (event.order_id,),
+            ).fetchone()
+            if existing_trade is None:
+                conn.execute(_TRADES_INSERT_SQL, trades_params)
+            else:
+                conn.execute(_TRADES_UPDATE_SQL, trades_params)
+
+            # Step 3: position rollup (current_qty + avg_entry_price
+            # from orders, net_realized_pnl from trades).
+            conn.execute(
+                _POSITION_ROLLUP_SQL,
+                {"position_uid": position_uid},
+            )
+
+            # Step 4: position-level status via CTE.
+            conn.execute(
+                _POSITION_STATUS_SQL,
+                {"position_uid": position_uid, "now": now},
+            )
+
+            # Read back the new status for the outcome.
+            new_status_row = conn.execute(
+                "SELECT status FROM position_lifecycle "
+                "WHERE position_uid = ?",
+                (position_uid,),
+            ).fetchone()
+            new_status = new_status_row[0] if new_status_row else None
+
+    except _AppliedZeroRows as drop:
+        return OrderEventOutcome(
+            applied=False,
+            reason=drop.reason,
+            position_uid=position_uid,
+        )
+
+    return OrderEventOutcome(
+        applied=True,
+        reason="applied",
+        position_uid=position_uid,
+        new_status=new_status,
+    )
+
+
+class _AppliedZeroRows(Exception):
+    """Internal signal that the compare-and-set didn't advance the
+    row. Caught inside apply_order_event so the transaction rolls
+    back cleanly without surfacing as an error to the caller."""
+
+    def __init__(self, reason: str) -> None:
+        super().__init__(reason)
+        self.reason = reason

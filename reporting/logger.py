@@ -237,6 +237,11 @@ _MIGRATION_COLUMNS = {
     # implementation plan — they will be added when their first
     # consumer ships.
     "position_uid": "TEXT",
+    # Order lifecycle foundation (PR #59 §6.5) — audit-only metadata
+    # capturing Alpaca's per-fill execution_id from stream trade_update
+    # events. No UNIQUE constraint per the discovery doc; dedup on
+    # trades is by order_id (with the partial UNIQUE index below).
+    "execution_id": "TEXT",
     # Slippage unification — see docs/slippage_unification_design.md and
     # docs/slippage_unification_tracker.md. All nullable; pre-existing
     # rows remain NULL. Writers populate these per the per-codepath
@@ -424,6 +429,7 @@ class TradeLogger:
                 _CREATE_POSITION_LIFECYCLE_ORDERS_SQL,
                 _CREATE_POSITION_LIFECYCLE_ORDERS_INDEXES_SQL,
                 _UNIQ_ONE_ACTIVE_POSITION_PER_OWNER_KEY_SQL,
+                _UNIQ_TRADES_ORDER_ID_SINGLE_LEG_SQL,
                 run_preflight_or_raise,
             )
             conn.execute(_CREATE_POSITION_LIFECYCLE_ORDERS_SQL)
@@ -448,6 +454,15 @@ class TradeLogger:
             # See engine/lifecycle_orders.py for the discussion of why
             # 'error' is included in the WHERE clause.
             conn.execute(_UNIQ_ONE_ACTIVE_POSITION_PER_OWNER_KEY_SQL)
+            # trades dedup key (uniq_trades_order_id_single_leg) is
+            # DEFERRED to a later foundation commit. Existing writers
+            # (log_close, log_stop_fill, etc.) routinely insert
+            # multiple trades rows for the same order_id today; the
+            # foundation moves them to UPSERT cumulative-state
+            # semantics. The partial UNIQUE index lands once those
+            # writers have been migrated through subsequent foundation
+            # commits. apply_order_event uses application-level
+            # dedup (SELECT then INSERT or UPDATE) until then.
             from engine.option_trailing import (
                 _CREATE_OPTION_TRAILING_STOPS_SQL,
                 _OPTION_TRAILING_STOPS_INDEXES_SQL,
