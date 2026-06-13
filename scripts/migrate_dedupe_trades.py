@@ -64,6 +64,32 @@ from engine.lifecycle_orders import (  # noqa: E402
 )
 
 
+def _cluster_fingerprint(rows: list[dict[str, Any]]) -> str:
+    """Stable hash of the rows in a cluster, used by --apply to detect
+    mutation between --review and --apply. We include every field the
+    operator might have used to make the keep/delete decision: status,
+    qty, price, timestamp. Order independent (sorted by row id /
+    position_uid) so cosmetic reordering doesn't trip the check."""
+    import hashlib
+
+    keyed: list[tuple] = []
+    for r in rows:
+        # Use whichever identity is present.
+        identity = r.get("id") or r.get("position_uid") or ""
+        keyed.append((
+            str(identity),
+            r.get("status"),
+            r.get("position_type"),
+            r.get("qty"),
+            r.get("avg_fill_price"),
+            r.get("timestamp") or r.get("opened_at"),
+            r.get("position_uid"),
+        ))
+    keyed.sort(key=lambda t: t[0])
+    payload = json.dumps(keyed, default=str, sort_keys=True)
+    return hashlib.sha256(payload.encode("utf-8")).hexdigest()
+
+
 def _scan(conn: sqlite3.Connection) -> dict[str, Any]:
     """Return a structured report of both duplicate dimensions."""
     owner_key_dupes = detect_owner_key_duplicates(conn)
@@ -81,15 +107,21 @@ def _scan(conn: sqlite3.Connection) -> dict[str, Any]:
 
     owner_key_report = []
     for dup in owner_key_dupes:
-        # For each cluster, fetch the rows so the operator can choose
-        # which to keep based on timestamps / strategy / status.
+        # PR #60 round 2 fix (P0): review MUST fetch only the rows
+        # the detector flagged. Fetching all owner_key=X rows lets
+        # historical closed rows show up next to the live duplicates
+        # and the keep-earliest default would then propose deleting
+        # the active positions. Scope to exactly dup.position_uids.
+        if not dup.position_uids:
+            continue
+        placeholders = ", ".join("?" for _ in dup.position_uids)
         rows = conn.execute(
             f"SELECT position_uid, status, strategy, {timestamp_col}, "
             "symbol "
             "FROM position_lifecycle "
-            "WHERE owner_key = ? "
+            f"WHERE position_uid IN ({placeholders}) "
             f"ORDER BY {timestamp_col}",
-            (dup.owner_key,),
+            dup.position_uids,
         ).fetchall()
         owner_key_report.append({
             "owner_key": dup.owner_key,
@@ -108,13 +140,20 @@ def _scan(conn: sqlite3.Connection) -> dict[str, Any]:
 
     trades_report = []
     for dup in trades_dupes:
+        # Same defect on the trades side: a WHERE order_id = ? scope
+        # includes legitimate spread legs (position_type='spread'
+        # rows correctly share order_id). Filter to the exact trade
+        # ids the detector returned.
+        if not dup.trade_ids:
+            continue
+        placeholders = ", ".join("?" for _ in dup.trade_ids)
         rows = conn.execute(
             "SELECT id, timestamp, symbol, side, qty, avg_fill_price, "
             "status, position_type, position_uid "
             "FROM trades "
-            "WHERE order_id = ? "
+            f"WHERE id IN ({placeholders}) "
             "ORDER BY timestamp",
-            (dup.order_id,),
+            dup.trade_ids,
         ).fetchall()
         trades_report.append({
             "order_id": dup.order_id,
@@ -215,8 +254,17 @@ def _review(conn: sqlite3.Connection, out_path: Path) -> int:
             "order_id": cluster["order_id"],
             "keep_trade_id": rows[0]["id"],
             "delete_trade_ids": [r["id"] for r in rows[1:]],
+            # Snapshot fingerprint per cluster — apply mode uses these
+            # to detect rows mutated between --review and --apply, so
+            # an operator who reviewed a stale snapshot cannot
+            # accidentally delete the wrong row.
+            "review_fingerprint": _cluster_fingerprint(rows),
             "rows": rows,
         })
+    for cluster_idx, dec_cluster in enumerate(decisions["owner_key_clusters"]):
+        dec_cluster["review_fingerprint"] = _cluster_fingerprint(
+            dec_cluster["rows"]
+        )
     out_path.write_text(json.dumps(decisions, indent=2, default=str))
     n = (
         len(decisions["owner_key_clusters"])
@@ -230,33 +278,201 @@ def _review(conn: sqlite3.Connection, out_path: Path) -> int:
     return 0
 
 
+class _ApplyAborted(Exception):
+    """Internal signal that the apply transaction must roll back."""
+
+
+def _refetch_owner_cluster(
+    conn: sqlite3.Connection,
+    cluster: dict[str, Any],
+    timestamp_col: str,
+) -> list[dict[str, Any]]:
+    uids = [r["position_uid"] for r in cluster["rows"]]
+    if not uids:
+        return []
+    placeholders = ", ".join("?" for _ in uids)
+    rows = conn.execute(
+        f"SELECT position_uid, status, strategy, {timestamp_col}, "
+        "symbol FROM position_lifecycle "
+        f"WHERE position_uid IN ({placeholders}) "
+        f"ORDER BY {timestamp_col}",
+        uids,
+    ).fetchall()
+    return [
+        {
+            "position_uid": r[0],
+            "status": r[1],
+            "strategy": r[2],
+            "opened_at": r[3],
+            "symbol": r[4],
+        }
+        for r in rows
+    ]
+
+
+def _refetch_trades_cluster(
+    conn: sqlite3.Connection, cluster: dict[str, Any],
+) -> list[dict[str, Any]]:
+    ids = [r["id"] for r in cluster["rows"]]
+    if not ids:
+        return []
+    placeholders = ", ".join("?" for _ in ids)
+    rows = conn.execute(
+        "SELECT id, timestamp, symbol, side, qty, avg_fill_price, "
+        "status, position_type, position_uid "
+        "FROM trades "
+        f"WHERE id IN ({placeholders}) "
+        "ORDER BY timestamp",
+        ids,
+    ).fetchall()
+    return [
+        {
+            "id": r[0],
+            "timestamp": r[1],
+            "symbol": r[2],
+            "side": r[3],
+            "qty": r[4],
+            "avg_fill_price": r[5],
+            "status": r[6],
+            "position_type": r[7],
+            "position_uid": r[8],
+        }
+        for r in rows
+    ]
+
+
 def _apply(conn: sqlite3.Connection, in_path: Path) -> int:
-    """--apply mode: execute deletes from a decisions file. Single
-    transaction; rolls back on any failure."""
+    """--apply mode: execute deletes from a decisions file with the
+    full safety bundle:
+
+    1. PRAGMA foreign_keys = ON so deleting a parent row that the
+       new position_lifecycle_orders schema FK-references can never
+       leave orphaned children behind.
+    2. Snapshot fingerprint per cluster, recomputed in-transaction
+       just before the delete. If the cluster mutated between --review
+       and --apply the operator gets a structured abort and the
+       transaction rolls back (compare-and-set against stale review).
+    3. rowcount verification: every DELETE BY id must affect exactly
+       one row. A delete that affected zero rows means the operator
+       was working from a snapshot where the row had already been
+       removed — abort.
+    4. In-transaction post-condition rescan: after the deletes apply,
+       detect_owner_key_duplicates and detect_trades_order_id_duplicates
+       must both return empty inside the SAME transaction (uncommitted
+       state) before we commit. If they don't, the decisions file
+       didn't cover every cluster — abort.
+
+    Returns 0 on a clean apply, 2 on any abort. The transaction
+    rolls back on any abort path, leaving the DB exactly as it was
+    before --apply ran.
+
+    Operator-facing precondition: the live bot must NOT be running
+    against the same DB. SQLite's default locking will fight the
+    bot's writes and either path will see WAL chaos. The script
+    prints a banner reminding the operator before doing anything.
+    """
     decisions = json.loads(in_path.read_text())
     if decisions.get("version") != 1:
         print(f"ERROR: unsupported decisions file version "
               f"{decisions.get('version')!r}")
         return 2
 
+    print(
+        "WARNING: --apply mutates the DB. The live bot MUST be "
+        "stopped (stop_bot.sh) before running --apply. Mixed-access "
+        "WAL state can produce silent data corruption."
+    )
+
+    # PR #60 round 2 fix (P1.7): enforce FK constraints during the
+    # delete so any rows in dependent tables (position_lifecycle_orders
+    # references position_lifecycle.position_uid) trigger an explicit
+    # FK error instead of being silently orphaned.
+    conn.execute("PRAGMA foreign_keys = ON")
+
     owner_clusters = decisions.get("owner_key_clusters", [])
     trades_clusters = decisions.get("trades_order_id_clusters", [])
+
+    # Detect once before the deletes to compare schema column for
+    # owner-cluster refetch — same logic as _scan.
+    pl_cols = {
+        col[1] for col in conn.execute(
+            "PRAGMA table_info(position_lifecycle)"
+        ).fetchall()
+    }
+    timestamp_col = "opened_at" if "opened_at" in pl_cols else "created_at"
 
     deleted_owner = 0
     deleted_trades = 0
     try:
         for cluster in owner_clusters:
+            expected_fp = cluster.get("review_fingerprint")
+            current_rows = _refetch_owner_cluster(
+                conn, cluster, timestamp_col,
+            )
+            current_fp = _cluster_fingerprint(current_rows)
+            if expected_fp is not None and expected_fp != current_fp:
+                raise _ApplyAborted(
+                    f"owner_key={cluster.get('owner_key')!r} cluster "
+                    f"mutated between --review and --apply (snapshot "
+                    f"fingerprint mismatch). Re-run --review."
+                )
             for uid in cluster.get("delete_position_uids", []):
-                conn.execute(
+                cur = conn.execute(
                     "DELETE FROM position_lifecycle WHERE position_uid = ?",
                     (uid,),
                 )
+                if cur.rowcount != 1:
+                    raise _ApplyAborted(
+                        f"DELETE position_uid={uid!r} affected "
+                        f"{cur.rowcount} rows (expected exactly 1). "
+                        f"The row may have been removed since --review."
+                    )
                 deleted_owner += 1
+
         for cluster in trades_clusters:
+            expected_fp = cluster.get("review_fingerprint")
+            current_rows = _refetch_trades_cluster(conn, cluster)
+            current_fp = _cluster_fingerprint(current_rows)
+            if expected_fp is not None and expected_fp != current_fp:
+                raise _ApplyAborted(
+                    f"order_id={cluster.get('order_id')!r} cluster "
+                    f"mutated between --review and --apply (snapshot "
+                    f"fingerprint mismatch). Re-run --review."
+                )
             for tid in cluster.get("delete_trade_ids", []):
-                conn.execute("DELETE FROM trades WHERE id = ?", (tid,))
+                cur = conn.execute(
+                    "DELETE FROM trades WHERE id = ?", (tid,),
+                )
+                if cur.rowcount != 1:
+                    raise _ApplyAborted(
+                        f"DELETE trades.id={tid} affected "
+                        f"{cur.rowcount} rows (expected exactly 1). "
+                        f"The row may have been removed since --review."
+                    )
                 deleted_trades += 1
+
+        # In-transaction post-condition: every duplicate cluster must
+        # be gone before we commit. If the decisions file didn't cover
+        # every cluster (e.g., a new duplicate appeared between
+        # --review and --apply, or the operator forgot a cluster), the
+        # foundation will fail preflight on the next bot startup.
+        # Catch it here while we can still roll back cleanly.
+        owner_residual = detect_owner_key_duplicates(conn)
+        trades_residual = detect_trades_order_id_duplicates(conn)
+        if owner_residual or trades_residual:
+            raise _ApplyAborted(
+                f"Post-apply rescan still finds duplicates: "
+                f"{len(owner_residual)} owner_key cluster(s), "
+                f"{len(trades_residual)} trades cluster(s). The "
+                f"decisions file did not cover everything. Roll back "
+                f"and regenerate the file."
+            )
+
         conn.commit()
+    except _ApplyAborted as abort:
+        conn.rollback()
+        print(f"ABORT: {abort}")
+        return 2
     except Exception as exc:
         conn.rollback()
         print(f"ERROR: apply failed, rolled back: {exc}")
@@ -264,8 +480,7 @@ def _apply(conn: sqlite3.Connection, in_path: Path) -> int:
 
     print(f"Applied: deleted {deleted_owner} position_lifecycle row(s), "
           f"{deleted_trades} trades row(s).")
-    print("Re-run --detect to confirm the DB is clean before restarting "
-          "the bot.")
+    print("Post-apply rescan: clean. Safe to restart the bot.")
     return 0
 
 

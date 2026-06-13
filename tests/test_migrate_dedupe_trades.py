@@ -247,3 +247,339 @@ class TestApplyMode:
             ["--db", str(db), "--apply", str(out)],
         )
         assert code == 2
+
+
+# ── PR #60 round 2 fixes ────────────────────────────────────────────────────
+
+
+class TestReviewScopesToDetectedRowsOnly:
+    """P0 from round 2: --review must fetch only rows the detector
+    flagged, not every row matching the cluster key. Otherwise
+    historical closed rows (owner_key) and legitimate spread legs
+    (trades.order_id) get presented to the operator and the keep-
+    earliest default proposes deleting valid positions."""
+
+    def test_owner_key_review_excludes_historical_closed_rows(
+        self, tmp_path,
+    ):
+        """A closed row plus two open duplicates: detector flags the
+        two open rows. Review must propose deleting one of the open
+        rows — NOT keeping the closed row and deleting both opens."""
+        db = tmp_path / "trades.db"
+        conn = sqlite3.connect(db)
+        conn.execute(
+            "CREATE TABLE trades ("
+            "id INTEGER PRIMARY KEY AUTOINCREMENT, "
+            "order_id TEXT, position_type TEXT)"
+        )
+        conn.execute(
+            "CREATE TABLE position_lifecycle ("
+            "schema_version INTEGER, position_uid TEXT, "
+            "owner_key TEXT, status TEXT, strategy TEXT, "
+            "symbol TEXT, opened_at TEXT)"
+        )
+        # Old closed row — outside the lock-holding status set.
+        conn.execute(
+            "INSERT INTO position_lifecycle "
+            "(schema_version, position_uid, owner_key, status, strategy, "
+            "opened_at) "
+            "VALUES (1, 'pos-OLD', 'TSLA', 'closed', 'sma', "
+            "'2025-01-01T10:00:00+00:00')"
+        )
+        # Two active duplicates.
+        conn.execute(
+            "INSERT INTO position_lifecycle "
+            "(schema_version, position_uid, owner_key, status, strategy, "
+            "opened_at) "
+            "VALUES (1, 'pos-A', 'TSLA', 'open', 'sma', "
+            "'2026-05-01T10:00:00+00:00')"
+        )
+        conn.execute(
+            "INSERT INTO position_lifecycle "
+            "(schema_version, position_uid, owner_key, status, strategy, "
+            "opened_at) "
+            "VALUES (1, 'pos-B', 'TSLA', 'open', 'sma', "
+            "'2026-05-02T10:00:00+00:00')"
+        )
+        conn.commit()
+        conn.close()
+
+        out = tmp_path / "decisions.json"
+        code = migrate_dedupe_trades.main(
+            ["--db", str(db), "--review", str(out)],
+        )
+        assert code == 0
+        decisions = json.loads(out.read_text())
+        assert len(decisions["owner_key_clusters"]) == 1
+        cluster = decisions["owner_key_clusters"][0]
+        # pos-OLD must NOT appear anywhere in this cluster.
+        all_uids = (
+            [cluster["keep_position_uid"]]
+            + cluster["delete_position_uids"]
+            + [r["position_uid"] for r in cluster["rows"]]
+        )
+        assert "pos-OLD" not in all_uids
+        # The two flagged opens are present.
+        assert set(all_uids) == {"pos-A", "pos-B"}
+        # Keeper is pos-A (earlier opened_at); delete pos-B.
+        assert cluster["keep_position_uid"] == "pos-A"
+        assert cluster["delete_position_uids"] == ["pos-B"]
+
+    def test_trades_review_excludes_spread_legs_sharing_order_id(
+        self, tmp_path,
+    ):
+        """A combo order with two spread legs sharing order_id PLUS
+        two single_leg rows also sharing that order_id: detector
+        flags the single_leg pair. Review must NOT include the spread
+        legs in delete proposals."""
+        db = tmp_path / "trades.db"
+        conn = sqlite3.connect(db)
+        conn.execute(
+            "CREATE TABLE trades ("
+            "id INTEGER PRIMARY KEY AUTOINCREMENT, "
+            "timestamp TEXT, symbol TEXT, side TEXT, qty REAL, "
+            "avg_fill_price REAL, order_id TEXT, position_type TEXT, "
+            "position_uid TEXT, status TEXT)"
+        )
+        conn.execute(
+            "CREATE TABLE position_lifecycle ("
+            "schema_version INTEGER, position_uid TEXT, "
+            "owner_key TEXT, status TEXT, strategy TEXT, "
+            "symbol TEXT, opened_at TEXT)"
+        )
+        # Two spread legs — same order_id, OUTSIDE the single_leg
+        # scope. Detector must skip them.
+        conn.execute(
+            "INSERT INTO trades "
+            "(timestamp, symbol, order_id, position_type) "
+            "VALUES ('2026-06-01T10:00:00+00:00', "
+            "'SPY260618C00500000', 'combo-1', 'spread')"
+        )
+        conn.execute(
+            "INSERT INTO trades "
+            "(timestamp, symbol, order_id, position_type) "
+            "VALUES ('2026-06-01T10:00:00+00:00', "
+            "'SPY260618C00510000', 'combo-1', 'spread')"
+        )
+        # Two single_leg duplicates sharing a DIFFERENT order_id.
+        conn.execute(
+            "INSERT INTO trades "
+            "(timestamp, symbol, order_id, position_type) "
+            "VALUES ('2026-06-01T11:00:00+00:00', 'AAPL', "
+            "'ord-dup', 'single_leg')"
+        )
+        conn.execute(
+            "INSERT INTO trades "
+            "(timestamp, symbol, order_id, position_type) "
+            "VALUES ('2026-06-01T12:00:00+00:00', 'AAPL', "
+            "'ord-dup', 'single_leg')"
+        )
+        conn.commit()
+        conn.close()
+
+        out = tmp_path / "decisions.json"
+        code = migrate_dedupe_trades.main(
+            ["--db", str(db), "--review", str(out)],
+        )
+        assert code == 0
+        decisions = json.loads(out.read_text())
+        # Only the single_leg cluster appears.
+        assert len(decisions["trades_order_id_clusters"]) == 1
+        cluster = decisions["trades_order_id_clusters"][0]
+        assert cluster["order_id"] == "ord-dup"
+        # And the spread leg ids (1, 2) are NOWHERE in the cluster.
+        # The flagged single_leg ids are 3 and 4.
+        all_ids = (
+            [cluster["keep_trade_id"]]
+            + cluster["delete_trade_ids"]
+            + [r["id"] for r in cluster["rows"]]
+        )
+        assert 1 not in all_ids and 2 not in all_ids
+        assert set(all_ids) == {3, 4}
+
+
+class TestApplyHardening:
+    """P1.7 from round 2: --apply must defend against stale decisions
+    files, missing FK enforcement, phantom deletes, and operator
+    incomplete coverage."""
+
+    def test_apply_aborts_on_stale_decisions_after_status_change(
+        self, tmp_path,
+    ):
+        """Between --review and --apply, an active row's status flips
+        (operator's monitoring tool touched it). The snapshot
+        fingerprint check must abort and roll back."""
+        db = tmp_path / "trades.db"
+        _make_dirty_db(db)
+        out = tmp_path / "decisions.json"
+        migrate_dedupe_trades.main(["--db", str(db), "--review", str(out)])
+
+        # Operator's monitor flips pos-A's status before apply runs.
+        conn = sqlite3.connect(db)
+        conn.execute(
+            "UPDATE position_lifecycle SET status = 'partially_filled' "
+            "WHERE position_uid = 'pos-A'"
+        )
+        conn.commit()
+        conn.close()
+
+        code = migrate_dedupe_trades.main(
+            ["--db", str(db), "--apply", str(out)],
+        )
+        assert code == 2  # aborted
+        # Roll back proves it: pos-B still exists.
+        rows = sqlite3.connect(db).execute(
+            "SELECT position_uid FROM position_lifecycle "
+            "ORDER BY position_uid"
+        ).fetchall()
+        assert ("pos-B",) in rows
+
+    def test_apply_aborts_on_phantom_delete(self, tmp_path):
+        """If a row in the delete list no longer exists (already
+        removed manually), the DELETE rowcount is 0 — must abort,
+        not silently miscount."""
+        db = tmp_path / "trades.db"
+        _make_dirty_db(db)
+        out = tmp_path / "decisions.json"
+        migrate_dedupe_trades.main(["--db", str(db), "--review", str(out)])
+
+        # Modify decisions file to point at a nonexistent id.
+        decisions = json.loads(out.read_text())
+        decisions["trades_order_id_clusters"][0]["delete_trade_ids"] = [9999]
+        # Adjust fingerprint to NOT trip the snapshot check, so we
+        # isolate the rowcount-check failure path.
+        from scripts.migrate_dedupe_trades import (
+            _cluster_fingerprint, _refetch_trades_cluster,
+        )
+        conn = sqlite3.connect(db)
+        decisions["trades_order_id_clusters"][0]["review_fingerprint"] = (
+            _cluster_fingerprint(_refetch_trades_cluster(
+                conn,
+                decisions["trades_order_id_clusters"][0],
+            ))
+        )
+        conn.close()
+        out.write_text(json.dumps(decisions))
+
+        code = migrate_dedupe_trades.main(
+            ["--db", str(db), "--apply", str(out)],
+        )
+        assert code == 2
+
+    def test_apply_aborts_on_incomplete_decisions_file(self, tmp_path):
+        """If the operator removes a cluster from the decisions file,
+        the post-apply rescan still finds duplicates → abort, roll
+        back. The bot must never start with leftover duplicates."""
+        db = tmp_path / "trades.db"
+        _make_dirty_db(db)
+        out = tmp_path / "decisions.json"
+        migrate_dedupe_trades.main(["--db", str(db), "--review", str(out)])
+
+        # Operator removes the trades cluster, keeping only owner_key.
+        decisions = json.loads(out.read_text())
+        decisions["trades_order_id_clusters"] = []
+        out.write_text(json.dumps(decisions))
+
+        code = migrate_dedupe_trades.main(
+            ["--db", str(db), "--apply", str(out)],
+        )
+        assert code == 2
+        # Roll back proves it: trades cluster intact.
+        cnt = sqlite3.connect(db).execute(
+            "SELECT COUNT(*) FROM trades WHERE order_id = 'ord-dup'"
+        ).fetchone()[0]
+        assert cnt == 2
+
+    def test_apply_enables_foreign_keys(self, tmp_path):
+        """PRAGMA foreign_keys must be ON for the apply transaction
+        so dependent rows (position_lifecycle_orders FK-references
+        position_lifecycle.position_uid) cause an explicit FK error
+        rather than being silently orphaned.
+
+        Plant a position_lifecycle_orders row referencing pos-B, then
+        try to --apply (which proposes deleting pos-B). With FKs on,
+        the DELETE raises FOREIGN KEY constraint failed → apply
+        aborts and rolls back."""
+        db = tmp_path / "trades.db"
+        _make_dirty_db(db)
+        # Add the FK-enforcing child table and a row referencing pos-B
+        # (whose DELETE the apply will try).
+        conn = sqlite3.connect(db)
+        conn.execute(
+            "CREATE TABLE position_lifecycle_orders ("
+            "id INTEGER PRIMARY KEY, position_uid TEXT NOT NULL, "
+            "FOREIGN KEY (position_uid) REFERENCES "
+            "position_lifecycle(position_uid))"
+        )
+        conn.execute(
+            "INSERT INTO position_lifecycle_orders "
+            "(id, position_uid) VALUES (1, 'pos-B')"
+        )
+        conn.commit()
+        conn.close()
+        out = tmp_path / "decisions.json"
+        migrate_dedupe_trades.main(["--db", str(db), "--review", str(out)])
+
+        code = migrate_dedupe_trades.main(
+            ["--db", str(db), "--apply", str(out)],
+        )
+        # With FKs ON, the DELETE FROM position_lifecycle WHERE
+        # position_uid='pos-B' raises and apply rolls back.
+        assert code == 2
+        # pos-B is still present (rollback).
+        rows = sqlite3.connect(db).execute(
+            "SELECT position_uid FROM position_lifecycle "
+            "WHERE position_uid = 'pos-B'"
+        ).fetchall()
+        assert rows == [("pos-B",)]
+
+
+class TestBackfillRespectsExplicitPositionType:
+    """Finding 5 (round 2): _BACKFILL_SQL must NOT promote rows that
+    already carry an explicit position_type. Predicate is now
+    `position_id IS NULL AND position_type IS NULL`."""
+
+    def test_backfill_skips_explicit_spread_row_with_null_position_id(
+        self, tmp_path,
+    ):
+        """A pre-PR-60 spread row may have position_type='spread' but
+        position_id=NULL. The previous BACKFILL predicate would have
+        clobbered position_type to 'single_leg' and corrupted the
+        row. The tightened predicate leaves it alone."""
+        from reporting.logger import TradeLogger
+        db_path = str(tmp_path / "trades.db")
+        # Seed via raw sqlite3 to plant the legacy shape, then let
+        # TradeLogger._ensure_db run the migration.
+        conn = sqlite3.connect(db_path)
+        conn.execute(
+            "CREATE TABLE trades ("
+            "id INTEGER PRIMARY KEY AUTOINCREMENT, "
+            "timestamp TEXT, symbol TEXT, side TEXT, qty REAL, "
+            "avg_fill_price REAL, order_id TEXT, strategy TEXT, "
+            "reason TEXT, stop_price REAL, "
+            "entry_reference_price REAL, "
+            "modeled_slippage_bps REAL, realized_slippage_bps REAL, "
+            "order_type TEXT, status TEXT, requested_qty REAL, "
+            "filled_qty REAL, position_id TEXT, "
+            "position_type TEXT)"
+        )
+        conn.execute(
+            "INSERT INTO trades "
+            "(timestamp, symbol, order_id, position_id, "
+            "position_type) "
+            "VALUES ('2026-06-01T10:00:00+00:00', "
+            "'SPY260618C00500000', 'combo-X', NULL, 'spread')"
+        )
+        conn.commit()
+        conn.close()
+
+        # Let _ensure_db migrate (which runs preflight + BACKFILL).
+        # The spread row's position_type='spread' must survive.
+        tl = TradeLogger(path=db_path)
+        conn = tl._ensure_db()
+        row = conn.execute(
+            "SELECT position_type, position_id FROM trades "
+            "WHERE order_id = 'combo-X'"
+        ).fetchone()
+        assert row[0] == "spread"
+        assert row[1] is None
