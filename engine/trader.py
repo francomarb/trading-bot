@@ -861,6 +861,7 @@ class TradingEngine:
             self._recover_suspect_exit_orders(snapshot)
             self._process_stream_stop_fills(snapshot)
             self._detect_external_closes(snapshot)
+            self._drain_lifecycle_attaches()
             self._drain_option_fills()
             self._drain_spread_fills()
             self._sync_option_trailing_stops(snapshot)
@@ -4272,6 +4273,39 @@ class TradingEngine:
                         f"{raw_symbol}: option trailing cleanup failed after "
                         f"stream stop fill: {exc}"
                     )
+
+    def _drain_lifecycle_attaches(self) -> None:
+        """Apply per-order substrate attaches enqueued by background
+        worker threads.
+
+        PR #60 round 2 fix (finding 2): the shared sqlite3 connection
+        is opened on the main thread; background workers
+        (OptionsExecutionWorker today, others in commits 11+) cannot
+        call attach_broker_order_id directly. They enqueue
+        (client_order_id, broker_order_id, submitted_at); we drain
+        and apply on this — the connection-owning — thread.
+
+        Best-effort: an individual attach failure is logged at
+        CRITICAL and absorbed so a broken substrate row cannot stall
+        the cycle. Same discipline as
+        ``_lifecycle_orders_attach_order_id`` in the broker."""
+        if self.lifecycle_orders_store is None:
+            return
+        attaches = self.broker.drain_lifecycle_attaches()
+        for client_order_id, order_id, submitted_at in attaches:
+            try:
+                self.lifecycle_orders_store.attach_broker_order_id(
+                    client_order_id=client_order_id,
+                    order_id=order_id,
+                    submitted_at=submitted_at,
+                )
+            except Exception as exc:
+                logger.critical(
+                    f"queued lifecycle_orders.attach FAILED for "
+                    f"{client_order_id} → {order_id}: {exc}. Cycle "
+                    f"reconciliation (commit later) will retry via "
+                    f"client_order_id lookup."
+                )
 
     def _drain_option_fills(self) -> None:
         """

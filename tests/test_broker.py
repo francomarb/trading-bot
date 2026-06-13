@@ -2143,10 +2143,14 @@ class TestLifecycleOrdersSubstrate:
         result = broker.place_order(_decision(stop=95.5), poll_timeout=0.1)
         assert result.status is OrderStatus.FILLED  # behavior preserved
 
-    def test_substrate_insert_failure_does_not_block_order(self):
-        """If the substrate insert raises, the order still goes out and
-        the broker still returns a truthful result. Same discipline as
-        position-level _lifecycle_begin failure handling."""
+    def test_substrate_insert_failure_aborts_order_when_store_wired(self):
+        """PR #60 round 2 fix (finding 4): once the substrate store is
+        configured, ALL persistence failures fail closed pre-submit.
+        Updated from commit-6 behavior (which swallowed transient
+        errors). Detail of the policy change: with the substrate
+        load-bearing on commit-12+, there is no "recoverable next
+        pass" — the cycle reconciliation has nothing to recover
+        against without a row."""
         api = MagicMock()
         api.submit_order.return_value = _alpaca_order(status="filled")
         api.get_order_by_id.return_value = _alpaca_order(status="filled")
@@ -2154,10 +2158,9 @@ class TestLifecycleOrdersSubstrate:
         orders_store.insert_pending.side_effect = RuntimeError("db is hosed")
         broker = self._broker_with_substrate(api, orders_store)
 
-        result = broker.place_order(_decision(stop=95.5), poll_timeout=0.1)
-
-        assert result.status is OrderStatus.FILLED
-        api.submit_order.assert_called_once()
+        with pytest.raises(RuntimeError):
+            broker.place_order(_decision(stop=95.5), poll_timeout=0.1)
+        api.submit_order.assert_not_called()
 
     def test_attach_failure_does_not_block_order(self):
         api = MagicMock()
@@ -2225,10 +2228,12 @@ class TestSubstrateExceptionPolicy:
             broker.place_order(_decision(stop=95.5), poll_timeout=0.1)
         api.submit_order.assert_not_called()
 
-    def test_transient_error_on_insert_pending_lets_order_through(self):
-        """A generic Exception (transient I/O) still logs-and-skips so
-        a flaky disk doesn't ground the bot. Behavior identical to
-        pre-commit-9."""
+    def test_transient_error_on_insert_pending_now_fails_closed(self):
+        """PR #60 round 2 fix (finding 4): broadened fail-closed.
+        Reviewer noted that with the substrate load-bearing in
+        commit 12+, a 'transient' disk error has no recoverable
+        next pass — there's no row for reconciliation to retry
+        against. Order MUST NOT go out."""
         api = MagicMock()
         api.submit_order.return_value = _alpaca_order(status="filled")
         api.get_order_by_id.return_value = _alpaca_order(status="filled")
@@ -2236,10 +2241,9 @@ class TestSubstrateExceptionPolicy:
         orders_store.insert_pending.side_effect = RuntimeError("disk hiccup")
         broker = self._broker(api, orders_store)
 
-        result = broker.place_order(_decision(stop=95.5), poll_timeout=0.1)
-        # Order still went through.
-        assert result.status is OrderStatus.FILLED
-        api.submit_order.assert_called_once()
+        with pytest.raises(RuntimeError):
+            broker.place_order(_decision(stop=95.5), poll_timeout=0.1)
+        api.submit_order.assert_not_called()
 
     def test_attach_failure_does_NOT_abort_post_submit(self):
         """attach_broker_order_id runs AFTER submit_order returns
@@ -2364,14 +2368,16 @@ class TestOptionsDurableIdentity:
         client_id = captured["client_order_id"]
 
         # Simulate the worker firing on_submitted with the real
-        # broker order id.
+        # broker order id (from the daemon worker thread).
         captured["on_submitted"](client_id, "alpaca-options-ord-1")
 
-        # The substrate attach was called with the broker id.
-        orders_store.attach_broker_order_id.assert_called_once()
-        attach_kwargs = orders_store.attach_broker_order_id.call_args.kwargs
-        assert attach_kwargs["client_order_id"] == client_id
-        assert attach_kwargs["order_id"] == "alpaca-options-ord-1"
+        # Round 2 fix (finding 2): on_submitted no longer touches the
+        # store directly — it enqueues for the engine cycle thread to
+        # drain. Verify the queue picked up the attach.
+        queued = broker.drain_lifecycle_attaches()
+        assert queued == [(client_id, "alpaca-options-ord-1", None)]
+        # Store was NOT touched on the worker thread.
+        orders_store.attach_broker_order_id.assert_not_called()
 
     def test_options_on_fill_no_longer_attaches_with_client_order_id_bug(self):
         """The pre-fix bug: worker passed client_order_id to on_fill
@@ -2418,3 +2424,164 @@ class TestOptionsDurableIdentity:
 
         # Attach was NOT called from on_fill — substrate untouched.
         orders_store.attach_broker_order_id.assert_not_called()
+
+
+# ── PR #60 round 2 fixes ────────────────────────────────────────────────────
+
+
+class TestNoPositionLifecycleLeakOnFailClose:
+    """Round 2 finding 3: when _lifecycle_orders_insert_pending
+    re-raises, the position_lifecycle pending row created by
+    _lifecycle_begin BEFORE the substrate insert must be rolled back
+    so the owner-key lock isn't leaked."""
+
+    @staticmethod
+    def _broker(api, orders_store, lifecycle_store):
+        broker = AlpacaBroker(
+            client=api, max_attempts=1, base_delay=0.0,
+            lifecycle_orders_store=orders_store,
+            lifecycle_store=lifecycle_store,
+        )
+        lifecycle_store.create_pending = MagicMock(return_value="pos-uid-99")
+        return broker
+
+    def test_equity_path_rolls_back_pending_lifecycle_on_substrate_failure(
+        self,
+    ):
+        import sqlite3
+        api = MagicMock()
+        orders_store = MagicMock()
+        orders_store.insert_pending.side_effect = sqlite3.IntegrityError(
+            "duplicate client_order_id"
+        )
+        lifecycle_store = MagicMock()
+        broker = self._broker(api, orders_store, lifecycle_store)
+
+        with pytest.raises(sqlite3.IntegrityError):
+            broker.place_order(_decision(stop=95.5), poll_timeout=0.1)
+
+        # mark_canceled was called against the position_uid the
+        # pending row created. _lifecycle_begin generates the uid via
+        # engine.lifecycle.new_position_uid() so we match the prefix
+        # rather than the exact value.
+        lifecycle_store.mark_canceled.assert_called_once()
+        canceled_uid = lifecycle_store.mark_canceled.call_args.kwargs[
+            "position_uid"
+        ]
+        assert canceled_uid.startswith("pos_")
+        api.submit_order.assert_not_called()
+
+    def test_equity_path_rolls_back_on_generic_substrate_exception(self):
+        """Finding 4 + finding 3: even on a generic Exception path,
+        the position lifecycle row must be rolled back before the
+        re-raise so the owner-key lock isn't leaked."""
+        api = MagicMock()
+        orders_store = MagicMock()
+        orders_store.insert_pending.side_effect = RuntimeError("disk")
+        lifecycle_store = MagicMock()
+        broker = self._broker(api, orders_store, lifecycle_store)
+
+        with pytest.raises(RuntimeError):
+            broker.place_order(_decision(stop=95.5), poll_timeout=0.1)
+        lifecycle_store.mark_canceled.assert_called_once()
+        canceled_uid = lifecycle_store.mark_canceled.call_args.kwargs[
+            "position_uid"
+        ]
+        assert canceled_uid.startswith("pos_")
+
+    def test_rollback_failure_does_not_mask_original_exception(self):
+        """If the lifecycle rollback itself raises (cascaded
+        failure), the ORIGINAL substrate exception is what
+        propagates."""
+        import sqlite3
+        api = MagicMock()
+        orders_store = MagicMock()
+        orders_store.insert_pending.side_effect = ValueError(
+            "intended_qty must be positive"
+        )
+        lifecycle_store = MagicMock()
+        lifecycle_store.mark_canceled.side_effect = RuntimeError(
+            "rollback also broken"
+        )
+        broker = self._broker(api, orders_store, lifecycle_store)
+
+        # The ValueError from insert_pending propagates, NOT the
+        # rollback's RuntimeError.
+        with pytest.raises(ValueError):
+            broker.place_order(_decision(stop=95.5), poll_timeout=0.1)
+
+
+class TestLifecycleAttachQueue:
+    """Round 2 finding 2: per-order substrate attaches produced by
+    background worker threads must NOT touch the sqlite3 connection
+    directly (check_same_thread=True). They enqueue; engine drains."""
+
+    def test_drain_returns_and_clears_queue(self):
+        broker = AlpacaBroker(
+            client=MagicMock(), max_attempts=1, base_delay=0.0,
+        )
+        # Simulate two worker callbacks enqueuing.
+        with broker._pending_lifecycle_attaches_lock:
+            broker._pending_lifecycle_attaches.append(("cli-1", "ord-1", None))
+            broker._pending_lifecycle_attaches.append(("cli-2", "ord-2", None))
+
+        first = broker.drain_lifecycle_attaches()
+        assert first == [("cli-1", "ord-1", None), ("cli-2", "ord-2", None)]
+        # Second drain is empty.
+        assert broker.drain_lifecycle_attaches() == []
+
+    def test_attach_enqueue_is_thread_safe(self):
+        """Real-thread regression test (finding 2 sub-point):
+        on_submitted fires from a daemon thread. The enqueue path
+        must not raise sqlite3.ProgrammingError because it never
+        touches the connection — and a real thread fires it."""
+        import threading
+
+        api = MagicMock()
+        orders_store = MagicMock()
+        # If the broker ever calls attach on this store from any
+        # thread, the test fails the assertion below.
+        broker = AlpacaBroker(
+            client=api, max_attempts=1, base_delay=0.0,
+            lifecycle_orders_store=orders_store,
+            lifecycle_store=MagicMock(),
+        )
+        broker._lifecycle_store.create_pending = MagicMock(return_value="p")
+
+        captured = {}
+
+        def _capture_worker(*, on_fill, on_submitted, **kwargs):
+            captured["on_submitted"] = on_submitted
+            captured["cli"] = kwargs["client_order_id"]
+            return MagicMock()
+
+        opt_decision = RiskDecision(
+            symbol="SPY260618C00500000",
+            side=Side.BUY, qty=1,
+            entry_reference_price=2.50, stop_price=1.25,
+            strategy_name="spy_options_reversion",
+            reason="test",
+            order_type=OrderType.LIMIT, limit_price=2.50,
+        )
+        from unittest.mock import patch as _patch
+        with _patch("execution.broker.OptionsExecutionWorker",
+                    side_effect=_capture_worker):
+            broker.place_order(opt_decision, poll_timeout=0.0)
+
+        # Fire on_submitted from a REAL worker thread.
+        errors: list[BaseException] = []
+        def _worker_thread():
+            try:
+                captured["on_submitted"](captured["cli"], "ord-from-thread")
+            except BaseException as e:
+                errors.append(e)
+
+        t = threading.Thread(target=_worker_thread, daemon=True)
+        t.start()
+        t.join(timeout=2.0)
+        assert errors == []
+        # And the substrate store was never touched from any thread.
+        orders_store.attach_broker_order_id.assert_not_called()
+        # The queue picked it up.
+        attaches = broker.drain_lifecycle_attaches()
+        assert attaches == [(captured["cli"], "ord-from-thread", None)]

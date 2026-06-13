@@ -33,7 +33,8 @@ Each commit is reviewable in isolation; each ends with green tests.
 | 7 | PR #60 review fix (A + H#18): trades-side migration preflight + `scripts/migrate_dedupe_trades.py` (detect / review / apply) + plain UPDATE backfill | §12.2 / R8-2 | ~600 | 18 | ✅ |
 | 8 | PR #60 review fix (B + F round 1): status-only events skip trades UPSERT; TradeLogger.log COALESCE-preserves provenance | §6.5 / §6.6 | ~150 | 9 | ✅ |
 | 11 | PR #60 round 2 fix (finding 6): expand COALESCE set to risk anchors + entry/exit timestamps + modeled_slippage_bps; add position_uid identity-conflict refusal | §6.5 / §6.6 | ~150 | 8 | ✅ |
-| 9 | PR #60 review fix (C + D + E): options durable identity (on_submitted callback); fail-closed substrate exception policy; persist slippage provenance | §10.5 / §10.3 | ~300 | 12 | ✅ |
+| 9 | PR #60 review fix (C + D + E round 1): options durable identity (on_submitted callback); fail-closed substrate exception policy; persist slippage provenance | §10.5 / §10.3 | ~300 | 12 | ✅ |
+| 12 | PR #60 round 2 fix (findings 2, 3, 4): queue on_submitted to engine thread (thread-safety); roll back pending lifecycle row before substrate-failure re-raise; broaden fail-closed to all exceptions when store configured | §6.4 / §10.3 | ~300 | 5 | ✅ |
 | 10 | PR #60 round 2 fix (findings 1, 5, 7): dedupe review scopes to detected rows only; BACKFILL respects explicit position_type; apply hardening (snapshot fingerprint + rowcount + FKs ON + post-apply rescan) | §12.2 | ~400 | 7 | ✅ |
 | (later) | Wire WebSocket stream → `apply_order_event` (queue events to cycle thread for thread-safety) | §6.4 / §10.1 | ~300 | 4 | ⬜ |
 | 11 | Wire cycle reconciliation (`_reconcile_position_lifecycle`) → `apply_order_event` | §6.4 / §10.1 / §3.1 | ~300 | 4 | ⬜ |

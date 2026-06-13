@@ -279,6 +279,16 @@ class AlpacaBroker:
         # Drained by TradingEngine each cycle via drain_option_fills().
         self._pending_option_fills: list[tuple] = []
         self._pending_option_lock = threading.Lock()
+        # PR #60 round 2 fix (finding 2): per-order substrate attaches
+        # produced by background worker threads must NOT touch the
+        # shared sqlite3 connection directly (check_same_thread=True).
+        # Workers enqueue (client_order_id, broker_order_id,
+        # submitted_at) tuples here; TradingEngine drains them once
+        # per cycle on the connection-owning main thread via
+        # drain_lifecycle_attaches(). Same pattern as the existing
+        # _pending_option_fills queue.
+        self._pending_lifecycle_attaches: list[tuple[str, str, str | None]] = []
+        self._pending_lifecycle_attaches_lock = threading.Lock()
         # Async MLEG combo fills reported by SpreadExecutionWorker threads.
         # Drained by TradingEngine each cycle via drain_spread_fills().
         self._pending_spread_fills: list[tuple] = []
@@ -478,20 +488,35 @@ class AlpacaBroker:
         No-op when the store isn't wired or `position_uid` is None
         (broker is operating without lifecycle persistence).
 
-        PR #60 commit 9 fix D — exception policy: this runs BEFORE the
-        broker submit. IntegrityError (duplicate client_order_id, FK
-        violation, partial-UNIQUE conflict) signals a caller bug — a
-        substrate row already exists for this client_order_id, or the
-        position_uid doesn't resolve, or the unique invariants the
-        foundation depends on are broken. Re-raise so the call site
-        aborts the order BEFORE Alpaca sees it; the substrate's
-        consistency is a precondition for any subsequent
-        apply_order_event call. ValueError (invalid role / status /
-        bad inputs) is also a caller bug and re-raises.
+        PR #60 round 2 fix (findings 3 + 4) — exception policy:
 
-        Other exceptions (transient I/O, disk full, etc.) keep the
-        existing log-and-swallow policy since they're recoverable on
-        the next pass.
+        This runs BEFORE the broker submit. Once a lifecycle_orders
+        store is configured, ALL persistence failures here fail
+        closed:
+
+          - sqlite3.IntegrityError (duplicate client_order_id, FK
+            miss, partial-UNIQUE conflict): caller-bug invariant
+            violation; investigate before retry.
+          - ValueError (invalid role / qty / origin_kind): caller
+            bug; the substrate refused the input.
+          - Any other Exception (disk full, locked DB, transient
+            I/O): there is no recoverable "next pass" because
+            without a row in position_lifecycle_orders, apply_order
+            _event has nothing to compare-and-set against on the
+            stream / cycle / startup paths. Failing closed surfaces
+            the substrate health issue before any broker action.
+
+        Round 2 finding 3 fix: on ALL fail-closed paths, the caller's
+        already-committed position_lifecycle pending row is rolled
+        back via ``_lifecycle_mark_canceled`` BEFORE re-raising so we
+        don't leak the owner-key lock to the operator CLI. The
+        rollback runs in a try/except that suppresses any error
+        (best-effort cleanup) so the original exception is what
+        propagates.
+
+        The optional-store path (``self._lifecycle_orders_store is
+        None``) preserves the legacy no-op behavior for tests and
+        legacy callers that don't wire the substrate.
         """
         if self._lifecycle_orders_store is None or position_uid is None:
             return
@@ -514,26 +539,39 @@ class AlpacaBroker:
                 slippage_benchmark_timestamp=slippage_benchmark_timestamp,
                 slippage_measurement_quality=slippage_measurement_quality,
             )
-        except sqlite3.IntegrityError as exc:
-            logger.critical(
-                f"lifecycle_orders.insert_pending REFUSED for "
-                f"{decision.symbol} ({client_order_id}): {exc} — "
-                f"this is a foundation-substrate invariant violation; "
-                f"aborting submit. Investigate before retrying."
-            )
-            raise
-        except ValueError as exc:
-            logger.critical(
-                f"lifecycle_orders.insert_pending REJECTED for "
-                f"{decision.symbol} ({client_order_id}): {exc} — "
-                f"caller passed invalid role / qty / origin_kind."
-            )
-            raise
         except Exception as exc:
-            logger.warning(
-                f"lifecycle_orders.insert_pending skipped for "
-                f"{decision.symbol} ({client_order_id}): {exc}"
-            )
+            # Roll back the position-level pending row so the owner-key
+            # lock isn't leaked. _lifecycle_mark_canceled handles the
+            # store-is-None case and is itself wrapped in try/except,
+            # so a cascade failure here cannot mask the original
+            # exception we're about to re-raise.
+            try:
+                self._lifecycle_mark_canceled(position_uid)
+            except Exception:
+                pass
+            if isinstance(exc, sqlite3.IntegrityError):
+                logger.critical(
+                    f"lifecycle_orders.insert_pending REFUSED for "
+                    f"{decision.symbol} ({client_order_id}): {exc} — "
+                    f"foundation-substrate invariant violation; "
+                    f"aborting submit + rolling back position lock."
+                )
+            elif isinstance(exc, ValueError):
+                logger.critical(
+                    f"lifecycle_orders.insert_pending REJECTED for "
+                    f"{decision.symbol} ({client_order_id}): {exc} — "
+                    f"caller passed invalid role / qty / origin_kind; "
+                    f"rolling back position lock."
+                )
+            else:
+                logger.critical(
+                    f"lifecycle_orders.insert_pending FAILED for "
+                    f"{decision.symbol} ({client_order_id}): "
+                    f"{type(exc).__name__}: {exc} — aborting submit "
+                    f"+ rolling back position lock. With substrate "
+                    f"configured there is no recoverable next pass."
+                )
+            raise
 
     def _lifecycle_orders_attach_order_id(
         self,
@@ -1006,11 +1044,17 @@ class AlpacaBroker:
                 rejection. PR #60 commit 9 fix C: attach the broker
                 order_id to the substrate row at the earliest possible
                 moment so a worker crash between submit and first fill
-                doesn't strand the row at order_id=NULL."""
-                self._lifecycle_orders_attach_order_id(
-                    client_order_id=cli_id,
-                    order_id=broker_order_id,
-                )
+                doesn't strand the row at order_id=NULL.
+
+                Round 2 fix (finding 2): fires from the worker daemon
+                thread; cannot touch the shared sqlite3 connection
+                directly (check_same_thread=True). Enqueue for the
+                engine cycle thread to drain via
+                drain_lifecycle_attaches()."""
+                with self._pending_lifecycle_attaches_lock:
+                    self._pending_lifecycle_attaches.append(
+                        (cli_id, broker_order_id, None)
+                    )
 
             def _on_fill(status: str, filled_qty: float, avg_price: "float | None", order_id: str) -> None:
                 # Per fix C: substrate attach now happens in
@@ -1590,6 +1634,24 @@ class AlpacaBroker:
             fills = list(self._pending_option_fills)
             self._pending_option_fills.clear()
         return fills
+
+    def drain_lifecycle_attaches(self) -> list[tuple[str, str, str | None]]:
+        """Return and clear (client_order_id, broker_order_id,
+        submitted_at) tuples enqueued from background worker threads.
+
+        PR #60 round 2 fix (finding 2): the shared sqlite3 connection
+        was opened on the main thread with check_same_thread=True.
+        Worker threads (OptionsExecutionWorker, SpreadExecutionWorker)
+        cannot call lifecycle_orders_store.attach_broker_order_id
+        directly. The on_submitted callback enqueues here; the engine
+        drains and applies on the connection-owning thread.
+
+        Same drain pattern as drain_option_fills / drain_spread_fills.
+        """
+        with self._pending_lifecycle_attaches_lock:
+            attaches = list(self._pending_lifecycle_attaches)
+            self._pending_lifecycle_attaches.clear()
+        return attaches
 
     def place_spread_order(
         self,
