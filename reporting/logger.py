@@ -279,22 +279,26 @@ _POSITION_UID_INDEX_SQL = (
 # Guarded by `WHERE position_id IS NULL` so explicit writes (future spreads)
 # are never overwritten on subsequent startups.
 #
-# PR #60 round 2 fix (finding 5): BACKFILL must NOT touch rows that
-# already carry an explicit position_type. A spread leg written
-# pre-PR-60 (position_id=NULL, position_type='spread') would otherwise
-# be promoted to single_leg here, corrupting its type AND introducing
-# a duplicate that preflight could not have predicted.
+# PR #60 round 3 fix (P2): BACKFILL must populate position_id on rows
+# that are explicit single_leg but missing position_id too. Round 2's
+# predicate skipped them — leaving a partially-migrated row outside
+# the position-identity model. The COALESCE on position_type
+# preserves an explicit 'single_leg' value (no-op) while assigning
+# 'single_leg' to fully-NULL rows. Spread rows (position_type='spread')
+# remain skipped via the AND clause.
 #
-# Predicate now matches what detect_trades_order_id_duplicates models:
-# only rows that are NULL on BOTH columns get promoted. Preflight runs
-# BEFORE BACKFILL (see _ensure_db ordering below); if preflight passes,
-# no row this UPDATE moves into single_leg scope can collide. A failure
-# here therefore signals a bug (preflight missed a case) and should
-# raise loudly rather than be swallowed.
+# Predicate now matches detect_trades_order_id_duplicates' scope:
+# every row in (NULL ∪ single_leg) gets touched. Preflight runs
+# BEFORE BACKFILL (see _ensure_db ordering below); if preflight
+# passes, no row this UPDATE moves into single_leg scope can
+# collide. A failure here therefore signals a bug (preflight
+# missed a case) and should raise loudly rather than be swallowed.
 _BACKFILL_SQL = (
     "UPDATE trades "
-    "SET position_id = OWNER_KEY(symbol), position_type = 'single_leg' "
-    "WHERE position_id IS NULL AND position_type IS NULL"
+    "SET position_id = OWNER_KEY(symbol), "
+    "    position_type = COALESCE(position_type, 'single_leg') "
+    "WHERE position_id IS NULL "
+    "  AND (position_type IS NULL OR position_type = 'single_leg')"
 )
 
 

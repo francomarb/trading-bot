@@ -65,26 +65,37 @@ from engine.lifecycle_orders import (  # noqa: E402
 
 
 def _cluster_fingerprint(rows: list[dict[str, Any]]) -> str:
-    """Stable hash of the rows in a cluster, used by --apply to detect
-    mutation between --review and --apply. We include every field the
-    operator might have used to make the keep/delete decision: status,
-    qty, price, timestamp. Order independent (sorted by row id /
-    position_uid) so cosmetic reordering doesn't trip the check."""
+    """Stable hash of the rows in a cluster, used by --apply to
+    detect mutation between --review and --apply.
+
+    PR #60 round 3 fix (P1 dedupe sub-point): the fingerprint must
+    include every field the operator could have used to decide
+    keep vs delete. Round 2's set covered status / qty / price /
+    timestamp / position_uid; round 3 adds symbol / side / strategy /
+    position_type and the accounting columns (net_realized_pnl,
+    realized_pnl, realized_slippage_bps, slippage_signed_*,
+    reason). A mutation in any of these between --review and --apply
+    invalidates the operator's decision.
+
+    Order independent (sorted by row identity) so cosmetic reordering
+    doesn't trip the check."""
     import hashlib
 
+    fingerprint_columns = (
+        "status", "position_type", "qty", "avg_fill_price",
+        "timestamp", "opened_at", "position_uid",
+        "symbol", "side", "strategy",
+        "net_realized_pnl",
+        "realized_pnl", "realized_slippage_bps",
+        "slippage_signed_bps", "slippage_adverse_bps",
+        "reason",
+    )
     keyed: list[tuple] = []
     for r in rows:
-        # Use whichever identity is present.
         identity = r.get("id") or r.get("position_uid") or ""
-        keyed.append((
-            str(identity),
-            r.get("status"),
-            r.get("position_type"),
-            r.get("qty"),
-            r.get("avg_fill_price"),
-            r.get("timestamp") or r.get("opened_at"),
-            r.get("position_uid"),
-        ))
+        keyed.append(
+            (str(identity),) + tuple(r.get(c) for c in fingerprint_columns)
+        )
     keyed.sort(key=lambda t: t[0])
     payload = json.dumps(keyed, default=str, sort_keys=True)
     return hashlib.sha256(payload.encode("utf-8")).hexdigest()
@@ -105,6 +116,24 @@ def _scan(conn: sqlite3.Connection) -> dict[str, Any]:
     }
     timestamp_col = "opened_at" if "opened_at" in pl_cols else "created_at"
 
+    # PR #60 round 3 fix (P1 dedupe): which optional accounting columns
+    # exist on this particular DB. Older schemas may lack some.
+    pl_optional_cols = [
+        c for c in ("net_realized_pnl", "position_type")
+        if c in pl_cols
+    ]
+    trades_cols = {
+        col[1] for col in conn.execute("PRAGMA table_info(trades)").fetchall()
+    }
+    trades_optional_cols = [
+        c for c in (
+            "realized_pnl", "realized_slippage_bps",
+            "slippage_signed_bps", "slippage_adverse_bps",
+            "reason",
+        )
+        if c in trades_cols
+    ]
+
     owner_key_report = []
     for dup in owner_key_dupes:
         # PR #60 round 2 fix (P0): review MUST fetch only the rows
@@ -115,27 +144,32 @@ def _scan(conn: sqlite3.Connection) -> dict[str, Any]:
         if not dup.position_uids:
             continue
         placeholders = ", ".join("?" for _ in dup.position_uids)
+        select_cols = [
+            "position_uid", "status", "strategy", timestamp_col, "symbol",
+        ] + pl_optional_cols
         rows = conn.execute(
-            f"SELECT position_uid, status, strategy, {timestamp_col}, "
-            "symbol "
+            f"SELECT {', '.join(select_cols)} "
             "FROM position_lifecycle "
             f"WHERE position_uid IN ({placeholders}) "
             f"ORDER BY {timestamp_col}",
             dup.position_uids,
         ).fetchall()
+        out_rows = []
+        for r in rows:
+            row_dict: dict[str, Any] = {
+                "position_uid": r[0],
+                "status": r[1],
+                "strategy": r[2],
+                "opened_at": r[3],
+                "symbol": r[4],
+            }
+            for offset, col in enumerate(pl_optional_cols, start=5):
+                row_dict[col] = r[offset]
+            out_rows.append(row_dict)
         owner_key_report.append({
             "owner_key": dup.owner_key,
             "count": dup.count,
-            "rows": [
-                {
-                    "position_uid": r[0],
-                    "status": r[1],
-                    "strategy": r[2],
-                    "opened_at": r[3],
-                    "symbol": r[4],
-                }
-                for r in rows
-            ],
+            "rows": out_rows,
         })
 
     trades_report = []
@@ -147,31 +181,37 @@ def _scan(conn: sqlite3.Connection) -> dict[str, Any]:
         if not dup.trade_ids:
             continue
         placeholders = ", ".join("?" for _ in dup.trade_ids)
+        select_cols = [
+            "id", "timestamp", "symbol", "side", "qty", "avg_fill_price",
+            "status", "position_type", "position_uid",
+        ] + trades_optional_cols
         rows = conn.execute(
-            "SELECT id, timestamp, symbol, side, qty, avg_fill_price, "
-            "status, position_type, position_uid "
+            f"SELECT {', '.join(select_cols)} "
             "FROM trades "
             f"WHERE id IN ({placeholders}) "
             "ORDER BY timestamp",
             dup.trade_ids,
         ).fetchall()
+        out_rows = []
+        for r in rows:
+            row_dict = {
+                "id": r[0],
+                "timestamp": r[1],
+                "symbol": r[2],
+                "side": r[3],
+                "qty": r[4],
+                "avg_fill_price": r[5],
+                "status": r[6],
+                "position_type": r[7],
+                "position_uid": r[8],
+            }
+            for offset, col in enumerate(trades_optional_cols, start=9):
+                row_dict[col] = r[offset]
+            out_rows.append(row_dict)
         trades_report.append({
             "order_id": dup.order_id,
             "count": dup.count,
-            "rows": [
-                {
-                    "id": r[0],
-                    "timestamp": r[1],
-                    "symbol": r[2],
-                    "side": r[3],
-                    "qty": r[4],
-                    "avg_fill_price": r[5],
-                    "status": r[6],
-                    "position_type": r[7],
-                    "position_uid": r[8],
-                }
-                for r in rows
-            ],
+            "rows": out_rows,
         })
 
     return {
@@ -282,32 +322,135 @@ class _ApplyAborted(Exception):
     """Internal signal that the apply transaction must roll back."""
 
 
+# PR #60 round 3 fix (P1 dedupe): accounting fields that the script
+# refuses to merge implicitly. If the kept row and any delete
+# candidate disagree on a NON-NULL value for any of these columns,
+# the cluster requires an explicit merge that the script does NOT
+# support, and --apply rejects it. Two non-null values that AGREE
+# are fine (idempotent); a non-null vs NULL is fine (delete candidate
+# can be dropped — keep wins by definition); only NON-NULL ≠ NON-NULL
+# triggers the reject.
+_OWNER_KEY_CONFLICT_COLUMNS = (
+    "strategy",
+    "symbol",
+    "position_type",
+    "net_realized_pnl",
+)
+_TRADES_CONFLICT_COLUMNS = (
+    "symbol",
+    "side",
+    "position_type",
+    "position_uid",
+    "realized_pnl",
+    "realized_slippage_bps",
+    "slippage_signed_bps",
+    "slippage_adverse_bps",
+    "reason",
+)
+
+
+def _cells_conflict(a: Any, b: Any) -> bool:
+    """Two cells conflict only if both are non-null and unequal.
+    NULL is "missing observation" not "explicit value", so a NULL
+    on either side is harmonized away."""
+    if a is None or b is None:
+        return False
+    return a != b
+
+
+def _reject_owner_cluster_on_accounting_conflict(
+    cluster: dict[str, Any],
+    current_rows: list[dict[str, Any]],
+    keep_uid: str | None,
+) -> None:
+    by_uid = {r["position_uid"]: r for r in current_rows}
+    keep_row = by_uid.get(keep_uid) if keep_uid is not None else None
+    if keep_row is None:
+        return
+    for uid in cluster.get("delete_position_uids", []):
+        delete_row = by_uid.get(uid)
+        if delete_row is None:
+            continue
+        for col in _OWNER_KEY_CONFLICT_COLUMNS:
+            if _cells_conflict(keep_row.get(col), delete_row.get(col)):
+                raise _ApplyAborted(
+                    f"owner_key={cluster.get('owner_key')!r}: keep "
+                    f"row position_uid={keep_uid!r} and delete row "
+                    f"position_uid={uid!r} disagree on column "
+                    f"{col!r}: {keep_row[col]!r} vs {delete_row[col]!r}. "
+                    f"This would require a MERGE, which the script "
+                    f"does not support. Resolve manually and re-run "
+                    f"--review."
+                )
+
+
+def _reject_trades_cluster_on_accounting_conflict(
+    cluster: dict[str, Any],
+    current_rows: list[dict[str, Any]],
+    keep_id: int | None,
+) -> None:
+    by_id = {r["id"]: r for r in current_rows}
+    keep_row = by_id.get(keep_id) if keep_id is not None else None
+    if keep_row is None:
+        return
+    for tid in cluster.get("delete_trade_ids", []):
+        delete_row = by_id.get(tid)
+        if delete_row is None:
+            continue
+        for col in _TRADES_CONFLICT_COLUMNS:
+            if _cells_conflict(keep_row.get(col), delete_row.get(col)):
+                raise _ApplyAborted(
+                    f"order_id={cluster.get('order_id')!r}: keep "
+                    f"trade id={keep_id} and delete trade id={tid} "
+                    f"disagree on column {col!r}: "
+                    f"{keep_row[col]!r} vs {delete_row[col]!r}. "
+                    f"This would require a MERGE, which the script "
+                    f"does not support. Resolve manually and "
+                    f"re-run --review."
+                )
+
+
 def _refetch_owner_cluster(
     conn: sqlite3.Connection,
     cluster: dict[str, Any],
     timestamp_col: str,
 ) -> list[dict[str, Any]]:
+    """Refetch a cluster's current state, mirroring _scan's column
+    set so the fingerprint computed in --apply uses the same columns
+    as --review's fingerprint."""
     uids = [r["position_uid"] for r in cluster["rows"]]
     if not uids:
         return []
+    pl_cols = {
+        col[1] for col in conn.execute(
+            "PRAGMA table_info(position_lifecycle)"
+        ).fetchall()
+    }
+    optional = [c for c in ("net_realized_pnl", "position_type") if c in pl_cols]
+    select_cols = [
+        "position_uid", "status", "strategy", timestamp_col, "symbol",
+    ] + optional
     placeholders = ", ".join("?" for _ in uids)
     rows = conn.execute(
-        f"SELECT position_uid, status, strategy, {timestamp_col}, "
-        "symbol FROM position_lifecycle "
+        f"SELECT {', '.join(select_cols)} "
+        "FROM position_lifecycle "
         f"WHERE position_uid IN ({placeholders}) "
         f"ORDER BY {timestamp_col}",
         uids,
     ).fetchall()
-    return [
-        {
+    out: list[dict[str, Any]] = []
+    for r in rows:
+        row_dict = {
             "position_uid": r[0],
             "status": r[1],
             "strategy": r[2],
             "opened_at": r[3],
             "symbol": r[4],
         }
-        for r in rows
-    ]
+        for offset, col in enumerate(optional, start=5):
+            row_dict[col] = r[offset]
+        out.append(row_dict)
+    return out
 
 
 def _refetch_trades_cluster(
@@ -316,17 +459,34 @@ def _refetch_trades_cluster(
     ids = [r["id"] for r in cluster["rows"]]
     if not ids:
         return []
+    trades_cols = {
+        col[1] for col in conn.execute(
+            "PRAGMA table_info(trades)"
+        ).fetchall()
+    }
+    optional = [
+        c for c in (
+            "realized_pnl", "realized_slippage_bps",
+            "slippage_signed_bps", "slippage_adverse_bps",
+            "reason",
+        )
+        if c in trades_cols
+    ]
+    select_cols = [
+        "id", "timestamp", "symbol", "side", "qty", "avg_fill_price",
+        "status", "position_type", "position_uid",
+    ] + optional
     placeholders = ", ".join("?" for _ in ids)
     rows = conn.execute(
-        "SELECT id, timestamp, symbol, side, qty, avg_fill_price, "
-        "status, position_type, position_uid "
+        f"SELECT {', '.join(select_cols)} "
         "FROM trades "
         f"WHERE id IN ({placeholders}) "
         "ORDER BY timestamp",
         ids,
     ).fetchall()
-    return [
-        {
+    out: list[dict[str, Any]] = []
+    for r in rows:
+        row_dict = {
             "id": r[0],
             "timestamp": r[1],
             "symbol": r[2],
@@ -337,8 +497,10 @@ def _refetch_trades_cluster(
             "position_type": r[7],
             "position_uid": r[8],
         }
-        for r in rows
-    ]
+        for offset, col in enumerate(optional, start=9):
+            row_dict[col] = r[offset]
+        out.append(row_dict)
+    return out
 
 
 def _apply(conn: sqlite3.Connection, in_path: Path) -> int:
@@ -416,7 +578,43 @@ def _apply(conn: sqlite3.Connection, in_path: Path) -> int:
                     f"mutated between --review and --apply (snapshot "
                     f"fingerprint mismatch). Re-run --review."
                 )
-            for uid in cluster.get("delete_position_uids", []):
+
+            # PR #60 round 3 fix (P0): partition validation. The
+            # union of keep_position_uid + delete_position_uids must
+            # equal the set of position_uids the detector flagged.
+            # Without this an operator could add an unrelated valid
+            # position_uid to delete_position_uids; the rowcount and
+            # post-rescan checks would not catch it.
+            snapshot_uids = {r["position_uid"] for r in cluster["rows"]}
+            keep_uid = cluster.get("keep_position_uid")
+            delete_uids = list(cluster.get("delete_position_uids", []))
+            partition = (
+                ([keep_uid] if keep_uid is not None else []) + delete_uids
+            )
+            if len(partition) != len(set(partition)):
+                raise _ApplyAborted(
+                    f"owner_key={cluster.get('owner_key')!r}: keep + "
+                    f"delete contains duplicate ids; aborting."
+                )
+            if set(partition) != snapshot_uids:
+                raise _ApplyAborted(
+                    f"owner_key={cluster.get('owner_key')!r}: keep + "
+                    f"delete {sorted(partition)} does not exactly "
+                    f"partition the reviewed snapshot "
+                    f"{sorted(snapshot_uids)}. Operator may have "
+                    f"injected an unrelated position_uid. Aborting."
+                )
+
+            # PR #60 round 3 fix (P1 dedupe): accounting-conflict
+            # rejection. If the kept row and any delete candidate
+            # disagree on a populated accounting field, the operator
+            # is asking for an implicit merge that the script does
+            # NOT support. Reject the cluster.
+            _reject_owner_cluster_on_accounting_conflict(
+                cluster, current_rows, keep_uid,
+            )
+
+            for uid in delete_uids:
                 cur = conn.execute(
                     "DELETE FROM position_lifecycle WHERE position_uid = ?",
                     (uid,),
@@ -439,7 +637,34 @@ def _apply(conn: sqlite3.Connection, in_path: Path) -> int:
                     f"mutated between --review and --apply (snapshot "
                     f"fingerprint mismatch). Re-run --review."
                 )
-            for tid in cluster.get("delete_trade_ids", []):
+
+            # Partition validation (P0).
+            snapshot_ids = {r["id"] for r in cluster["rows"]}
+            keep_id = cluster.get("keep_trade_id")
+            delete_ids = list(cluster.get("delete_trade_ids", []))
+            partition = (
+                ([keep_id] if keep_id is not None else []) + delete_ids
+            )
+            if len(partition) != len(set(partition)):
+                raise _ApplyAborted(
+                    f"order_id={cluster.get('order_id')!r}: keep + "
+                    f"delete contains duplicate ids; aborting."
+                )
+            if set(partition) != snapshot_ids:
+                raise _ApplyAborted(
+                    f"order_id={cluster.get('order_id')!r}: keep + "
+                    f"delete {sorted(partition)} does not exactly "
+                    f"partition the reviewed snapshot "
+                    f"{sorted(snapshot_ids)}. Operator may have "
+                    f"injected an unrelated trade id. Aborting."
+                )
+
+            # Accounting-conflict rejection (P1 dedupe).
+            _reject_trades_cluster_on_accounting_conflict(
+                cluster, current_rows, keep_id,
+            )
+
+            for tid in delete_ids:
                 cur = conn.execute(
                     "DELETE FROM trades WHERE id = ?", (tid,),
                 )

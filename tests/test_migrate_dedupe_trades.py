@@ -583,3 +583,238 @@ class TestBackfillRespectsExplicitPositionType:
         ).fetchone()
         assert row[0] == "spread"
         assert row[1] is None
+
+
+# ── PR #60 round 3 fixes ────────────────────────────────────────────────────
+
+
+class TestPartitionValidation:
+    """Round 3 P0 finding: --apply must reject decisions files where
+    keep + delete is not an exact partition of the reviewed snapshot
+    ids. Without this, an operator could add an unrelated valid
+    position_uid / trade id to delete_*; rowcount + rescan checks
+    would both pass and the unrelated row would be silently
+    destroyed."""
+
+    def test_owner_apply_rejects_injected_unrelated_position_uid(
+        self, tmp_path,
+    ):
+        db = tmp_path / "trades.db"
+        _make_dirty_db(db)
+        # Plant an unrelated active position the operator might
+        # maliciously / accidentally inject.
+        conn = sqlite3.connect(db)
+        conn.execute(
+            "INSERT INTO position_lifecycle "
+            "(schema_version, position_uid, owner_key, status, "
+            "strategy, opened_at) VALUES "
+            "(1, 'pos-UNRELATED', 'AAPL', 'open', 'sma', "
+            "'2026-05-15T10:00:00+00:00')"
+        )
+        conn.commit()
+        conn.close()
+        out = tmp_path / "decisions.json"
+        migrate_dedupe_trades.main(["--db", str(db), "--review", str(out)])
+        # Operator injects the unrelated id into delete_position_uids.
+        decisions = json.loads(out.read_text())
+        decisions["owner_key_clusters"][0]["delete_position_uids"].append(
+            "pos-UNRELATED"
+        )
+        out.write_text(json.dumps(decisions))
+
+        code = migrate_dedupe_trades.main(
+            ["--db", str(db), "--apply", str(out)],
+        )
+        assert code == 2
+        # pos-UNRELATED still exists (full rollback).
+        rows = sqlite3.connect(db).execute(
+            "SELECT position_uid FROM position_lifecycle "
+            "WHERE position_uid = 'pos-UNRELATED'"
+        ).fetchall()
+        assert rows == [("pos-UNRELATED",)]
+
+    def test_trades_apply_rejects_injected_unrelated_trade_id(
+        self, tmp_path,
+    ):
+        db = tmp_path / "trades.db"
+        _make_dirty_db(db)
+        # Plant an unrelated trade row.
+        conn = sqlite3.connect(db)
+        conn.execute(
+            "INSERT INTO trades "
+            "(timestamp, symbol, side, qty, order_id, position_type) "
+            "VALUES ('2026-06-02T10:00:00+00:00', 'AAPL', 'buy', 5, "
+            "'ord-UNRELATED', 'single_leg')"
+        )
+        injected_id = conn.execute(
+            "SELECT id FROM trades WHERE order_id = 'ord-UNRELATED'"
+        ).fetchone()[0]
+        conn.commit()
+        conn.close()
+        out = tmp_path / "decisions.json"
+        migrate_dedupe_trades.main(["--db", str(db), "--review", str(out)])
+        decisions = json.loads(out.read_text())
+        decisions["trades_order_id_clusters"][0]["delete_trade_ids"].append(
+            injected_id
+        )
+        out.write_text(json.dumps(decisions))
+
+        code = migrate_dedupe_trades.main(
+            ["--db", str(db), "--apply", str(out)],
+        )
+        assert code == 2
+        rows = sqlite3.connect(db).execute(
+            "SELECT order_id FROM trades WHERE id = ?", (injected_id,),
+        ).fetchall()
+        assert rows == [("ord-UNRELATED",)]
+
+    def test_owner_apply_rejects_keep_id_outside_snapshot(self, tmp_path):
+        """Setting keep_position_uid to a value not in the snapshot
+        also breaks the partition — reject."""
+        db = tmp_path / "trades.db"
+        _make_dirty_db(db)
+        out = tmp_path / "decisions.json"
+        migrate_dedupe_trades.main(["--db", str(db), "--review", str(out)])
+        decisions = json.loads(out.read_text())
+        decisions["owner_key_clusters"][0]["keep_position_uid"] = "pos-FAKE"
+        out.write_text(json.dumps(decisions))
+        code = migrate_dedupe_trades.main(
+            ["--db", str(db), "--apply", str(out)],
+        )
+        assert code == 2
+
+
+class TestAccountingConflictRejection:
+    """Round 3 P1 finding (dedupe): clusters where the kept row and a
+    delete candidate disagree on a populated accounting column would
+    require a merge the script does not implement. --apply must
+    reject them instead of silently dropping data."""
+
+    def test_owner_cluster_with_realized_pnl_mismatch_rejected(
+        self, tmp_path,
+    ):
+        db = tmp_path / "trades.db"
+        # Build a dirty DB and assign different realized P&L to each
+        # row in the cluster.
+        _make_dirty_db(db)
+        conn = sqlite3.connect(db)
+        conn.execute(
+            "UPDATE position_lifecycle SET net_realized_pnl = 12.34 "
+            "WHERE position_uid = 'pos-A'"
+        )
+        conn.execute(
+            "UPDATE position_lifecycle SET net_realized_pnl = 56.78 "
+            "WHERE position_uid = 'pos-B'"
+        )
+        conn.commit()
+        conn.close()
+
+        out = tmp_path / "decisions.json"
+        migrate_dedupe_trades.main(["--db", str(db), "--review", str(out)])
+        code = migrate_dedupe_trades.main(
+            ["--db", str(db), "--apply", str(out)],
+        )
+        assert code == 2  # conflict rejected
+        # Roll back proves it: both rows still present.
+        rows = sqlite3.connect(db).execute(
+            "SELECT position_uid FROM position_lifecycle "
+            "ORDER BY position_uid"
+        ).fetchall()
+        assert ("pos-A",) in rows
+        assert ("pos-B",) in rows
+
+    def test_trades_cluster_with_realized_pnl_mismatch_rejected(
+        self, tmp_path,
+    ):
+        db = tmp_path / "trades.db"
+        _make_dirty_db(db)
+        conn = sqlite3.connect(db)
+        # Add the column if it's not there.
+        try:
+            conn.execute("ALTER TABLE trades ADD COLUMN realized_pnl REAL")
+        except sqlite3.OperationalError:
+            pass
+        conn.execute(
+            "UPDATE trades SET realized_pnl = 10.0 WHERE id = 1"
+        )
+        conn.execute(
+            "UPDATE trades SET realized_pnl = 20.0 WHERE id = 2"
+        )
+        conn.commit()
+        conn.close()
+
+        out = tmp_path / "decisions.json"
+        migrate_dedupe_trades.main(["--db", str(db), "--review", str(out)])
+        code = migrate_dedupe_trades.main(
+            ["--db", str(db), "--apply", str(out)],
+        )
+        assert code == 2
+        rows = sqlite3.connect(db).execute(
+            "SELECT id FROM trades ORDER BY id"
+        ).fetchall()
+        # Both rows still present (rollback).
+        assert (1,) in rows
+        assert (2,) in rows
+
+    def test_clusters_with_matching_accounting_proceed(self, tmp_path):
+        """Positive control: when accounting columns AGREE, apply
+        proceeds normally."""
+        db = tmp_path / "trades.db"
+        _make_dirty_db(db)
+        conn = sqlite3.connect(db)
+        # Both rows have the same realized P&L.
+        conn.execute(
+            "UPDATE position_lifecycle SET net_realized_pnl = 12.34 "
+            "WHERE owner_key = 'TSLA'"
+        )
+        conn.commit()
+        conn.close()
+
+        out = tmp_path / "decisions.json"
+        migrate_dedupe_trades.main(["--db", str(db), "--review", str(out)])
+        code = migrate_dedupe_trades.main(
+            ["--db", str(db), "--apply", str(out)],
+        )
+        assert code == 0
+
+
+class TestBackfillPromotesExplicitSingleLeg:
+    """Round 3 P2 finding: BACKFILL must also populate position_id on
+    rows that are explicit single_leg but missing position_id."""
+
+    def test_explicit_single_leg_with_null_position_id_gets_position_id(
+        self, tmp_path,
+    ):
+        from reporting.logger import TradeLogger
+        db_path = str(tmp_path / "trades.db")
+        conn = sqlite3.connect(db_path)
+        conn.execute(
+            "CREATE TABLE trades ("
+            "id INTEGER PRIMARY KEY AUTOINCREMENT, "
+            "timestamp TEXT, symbol TEXT, side TEXT, qty REAL, "
+            "avg_fill_price REAL, order_id TEXT, strategy TEXT, "
+            "reason TEXT, stop_price REAL, "
+            "entry_reference_price REAL, "
+            "modeled_slippage_bps REAL, realized_slippage_bps REAL, "
+            "order_type TEXT, status TEXT, requested_qty REAL, "
+            "filled_qty REAL, position_id TEXT, position_type TEXT)"
+        )
+        # Partially migrated row: explicit single_leg, NULL position_id.
+        conn.execute(
+            "INSERT INTO trades "
+            "(timestamp, symbol, order_id, position_id, position_type) "
+            "VALUES ('2026-06-01T10:00:00+00:00', "
+            "'AAPL', 'ord-partial', NULL, 'single_leg')"
+        )
+        conn.commit()
+        conn.close()
+
+        # _ensure_db runs BACKFILL with the new predicate.
+        tl = TradeLogger(path=db_path)
+        conn = tl._ensure_db()
+        row = conn.execute(
+            "SELECT position_id, position_type FROM trades "
+            "WHERE order_id = 'ord-partial'"
+        ).fetchone()
+        assert row[0] == "AAPL"  # populated via OWNER_KEY
+        assert row[1] == "single_leg"  # preserved
