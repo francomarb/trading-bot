@@ -334,6 +334,24 @@ class TradingEngine:
         except Exception as exc:
             logger.warning(f"lifecycle store init skipped: {exc}")
             self.lifecycle_store = None
+        # Foundation commit 6 — per-order substrate store. Same DB connection
+        # so the FK from position_lifecycle_orders.position_uid →
+        # position_lifecycle.position_uid resolves locally. Best-effort: if
+        # init fails the broker simply won't insert per-order rows and the
+        # engine falls back to the position-level lifecycle exclusively.
+        try:
+            from engine.lifecycle_orders import PositionLifecycleOrdersStore
+            self.lifecycle_orders_store = PositionLifecycleOrdersStore(
+                self.trade_logger._ensure_db()
+            )
+            if (
+                hasattr(self.broker, "_lifecycle_orders_store")
+                and getattr(self.broker, "_lifecycle_orders_store", None) is None
+            ):
+                self.broker._lifecycle_orders_store = self.lifecycle_orders_store
+        except Exception as exc:
+            logger.warning(f"lifecycle_orders store init skipped: {exc}")
+            self.lifecycle_orders_store = None
         try:
             self.option_trailing_store = OptionTrailingStopStore(
                 self.trade_logger._ensure_db()

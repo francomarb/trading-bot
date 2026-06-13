@@ -50,6 +50,7 @@ from typing import TYPE_CHECKING, Callable
 if TYPE_CHECKING:
     from execution.stream import StreamManager
     from engine.lifecycle import PositionLifecycleStore
+    from engine.lifecycle_orders import PositionLifecycleOrdersStore
     from execution.mleg_close import MlegCloseScheduler, MlegQuote
 
 from execution.options_executor import (
@@ -242,6 +243,7 @@ class AlpacaBroker:
         stream_manager: "StreamManager | None" = None,
         dry_run: bool | None = None,
         lifecycle_store: "PositionLifecycleStore | None" = None,
+        lifecycle_orders_store: "PositionLifecycleOrdersStore | None" = None,
         entry_allowed: Callable[[], bool] | None = None,
     ) -> None:
         self._api = client or TradingClient(
@@ -262,6 +264,13 @@ class AlpacaBroker:
         # writes are silently skipped and behavior is byte-for-byte
         # unchanged from before Phase A.
         self._lifecycle_store = lifecycle_store
+        # Foundation commit 6 — per-order substrate. Optional, same wiring
+        # discipline as `_lifecycle_store`: None means no-op so legacy
+        # tests / callers stay byte-for-byte identical. When wired, every
+        # successful entry submission also stamps a `position_lifecycle_orders`
+        # row at status='pending' alongside the position-level row, and
+        # populates the broker-assigned order_id on submit return.
+        self._lifecycle_orders_store = lifecycle_orders_store
         self._entry_allowed = entry_allowed
         # Dry-run: log orders but never submit. Defaults to settings.DRY_RUN.
         self._dry_run: bool = dry_run if dry_run is not None else DRY_RUN
@@ -430,6 +439,86 @@ class AlpacaBroker:
         except Exception as exc:
             logger.warning(
                 f"lifecycle.mark_canceled skipped for {position_uid}: {exc}"
+            )
+
+    # ── Per-order substrate (foundation commit 6) ───────────────────────
+    #
+    # Same try/except → logger.warning discipline as the position-level
+    # helpers above. When ``self._lifecycle_orders_store is None`` (legacy
+    # callers, tests not exercising the substrate), every call here is a
+    # no-op and behavior is byte-for-byte identical to pre-commit-6.
+
+    def _lifecycle_orders_insert_pending(
+        self,
+        *,
+        position_uid: str | None,
+        role: str,
+        client_order_id: str,
+        decision: "RiskDecision",
+        order_class: str,
+        time_in_force: str,
+        intended_stop_price: float | None = None,
+        intended_limit_price: float | None = None,
+        parent_order_id: str | None = None,
+        replaces_order_id: str | None = None,
+    ) -> None:
+        """Write a `position_lifecycle_orders` row at status='pending'
+        before the broker submission goes out.
+
+        Mirrors `_lifecycle_begin`'s position-level pending stamp but at
+        the per-order grain so `apply_order_event` has a row to advance
+        when the WebSocket / cycle / startup reconciliation paths
+        observe broker reality.
+
+        No-op when the store isn't wired or `position_uid` is None
+        (broker is operating without lifecycle persistence)."""
+        if self._lifecycle_orders_store is None or position_uid is None:
+            return
+        try:
+            self._lifecycle_orders_store.insert_pending(
+                position_uid=position_uid,
+                role=role,
+                client_order_id=client_order_id,
+                order_type=decision.order_type.value,
+                order_class=order_class,
+                time_in_force=time_in_force,
+                side=decision.side.value,
+                intended_qty=float(decision.qty),
+                intended_stop_price=intended_stop_price,
+                intended_limit_price=intended_limit_price,
+                parent_order_id=parent_order_id,
+                replaces_order_id=replaces_order_id,
+            )
+        except Exception as exc:
+            logger.warning(
+                f"lifecycle_orders.insert_pending skipped for "
+                f"{decision.symbol} ({client_order_id}): {exc}"
+            )
+
+    def _lifecycle_orders_attach_order_id(
+        self,
+        *,
+        client_order_id: str,
+        order_id: str,
+        submitted_at: str | None = None,
+    ) -> None:
+        """Populate the broker-assigned `order_id` on the matching
+        pending row. Best-effort: a persistence failure here cannot
+        affect the live order — the WebSocket stop-fill / fill paths
+        will still observe broker truth and the cycle reconciliation
+        will eventually attach the order_id on a retry."""
+        if self._lifecycle_orders_store is None:
+            return
+        try:
+            self._lifecycle_orders_store.attach_broker_order_id(
+                client_order_id=client_order_id,
+                order_id=order_id,
+                submitted_at=submitted_at,
+            )
+        except Exception as exc:
+            logger.warning(
+                f"lifecycle_orders.attach_broker_order_id skipped for "
+                f"{client_order_id} → {order_id}: {exc}"
             )
 
     # ── Retry wrapper ────────────────────────────────────────────────────
@@ -823,10 +912,35 @@ class AlpacaBroker:
                 decision=decision,
                 client_order_id=client_order_id,
             )
+            # Foundation commit 6 — options orders are 'simple' LIMIT
+            # (no broker-attached stop_loss leg; the strategy manages
+            # exits via separate LIMIT orders via the spy options
+            # reversion strategy). TIF=day.
+            self._lifecycle_orders_insert_pending(
+                position_uid=position_uid,
+                role="entry_primary",
+                client_order_id=client_order_id,
+                decision=decision,
+                order_class="simple",
+                time_in_force="day",
+                intended_limit_price=(
+                    float(decision.limit_price)
+                    if decision.limit_price is not None
+                    else None
+                ),
+            )
 
             dec = decision  # capture for closure
 
             def _on_fill(status: str, filled_qty: float, avg_price: "float | None", order_id: str) -> None:
+                # Foundation commit 6 — attach the broker-assigned order_id
+                # to the substrate row before the legacy lifecycle_mark_filled
+                # transition. Wrapped in the standard try/except discipline
+                # (helper handles it) so callback can't crash the worker.
+                self._lifecycle_orders_attach_order_id(
+                    client_order_id=client_order_id,
+                    order_id=order_id,
+                )
                 result = OrderResult(
                     status={
                         "filled": OrderStatus.FILLED,
@@ -1011,6 +1125,25 @@ class AlpacaBroker:
             decision=decision,
             client_order_id=client_order_id,
         )
+        # Foundation commit 6 — same dry-run discipline for the per-order
+        # substrate: only insert AFTER the dry-run guard. order_class on
+        # every equity entry branch above is OTO (stop_loss is always
+        # attached). time_in_force is the resolved Alpaca TIF on the
+        # request just built.
+        self._lifecycle_orders_insert_pending(
+            position_uid=position_uid,
+            role="entry_primary",
+            client_order_id=client_order_id,
+            decision=decision,
+            order_class="oto",
+            time_in_force=str(order_request.time_in_force.value),
+            intended_stop_price=float(decision.stop_price),
+            intended_limit_price=(
+                float(order_request.limit_price)
+                if getattr(order_request, "limit_price", None) is not None
+                else None
+            ),
+        )
 
         # Register with the stream before submitting to avoid a fill-before-watch race.
         stream_event: threading.Event | None = None
@@ -1053,6 +1186,14 @@ class AlpacaBroker:
         capped_stop_leg_id = None
         if decision.entry_max_price is not None:
             capped_stop_leg_id = self._find_stop_leg_id(order)
+
+        # Foundation commit 6 — populate the substrate row's broker-assigned
+        # order_id immediately on submit return so the WebSocket / cycle
+        # reconciliation paths can advance it via apply_order_event.
+        self._lifecycle_orders_attach_order_id(
+            client_order_id=client_order_id,
+            order_id=order_id,
+        )
 
         # Bind the real Alpaca order ID back to the pre-submit watch so either
         # identifier can resolve the same terminal update.
@@ -1179,6 +1320,20 @@ class AlpacaBroker:
             decision=decision,
             client_order_id=client_order_id,
         )
+        # Foundation commit 6 — fractional entries are 'simple' market
+        # orders (no order_class / no attached stop_loss); the GTC stop
+        # is submitted standalone after the fill below. Reflect that
+        # truthfully in the substrate so apply_order_event's role-based
+        # accounting doesn't expect a stop_loss leg here.
+        self._lifecycle_orders_insert_pending(
+            position_uid=position_uid,
+            role="entry_primary",
+            client_order_id=client_order_id,
+            decision=decision,
+            order_class="simple",
+            time_in_force="day",
+            intended_stop_price=float(decision.stop_price),
+        )
 
         order_request = MarketOrderRequest(
             symbol=decision.symbol,
@@ -1226,6 +1381,13 @@ class AlpacaBroker:
             )
 
         order_id = str(order.id)
+        # Foundation commit 6 — attach broker-assigned order_id on the
+        # per-order substrate row before the stream binding so subsequent
+        # apply_order_event calls can resolve by order_id.
+        self._lifecycle_orders_attach_order_id(
+            client_order_id=client_order_id,
+            order_id=order_id,
+        )
         if self._stream_manager is not None:
             self._stream_manager.bind_submitted_order(
                 client_order_id=client_order_id,

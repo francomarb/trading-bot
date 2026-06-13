@@ -23,13 +23,13 @@ Each commit is reviewable in isolation; each ends with green tests.
 
 | # | Commit | Doc section | LOC est. | Tests | Status |
 |---|---|---|---|---|---|
-| 0 | Implementation tracker + PLAN.md pointer | n/a | ~150 | — | 🔄 In progress |
-| 1 | Schema: `position_lifecycle_orders` table + indexes + position-level UNIQUE + PRAGMA foreign_keys | §6.2 / R13-G1 | ~400 | 17 | 🔄 In progress |
-| 2 | Migration preflight: duplicate detection + abort-startup on conflict | §12.2 | ~250 | 12 | 🔄 In progress |
-| 3 | `PositionLifecycleOrdersStore` — CRUD operations on per-order rows | §6.2 / §6.3 | ~450 | 20 | 🔄 In progress |
-| 4 | `apply_order_event` — atomic compare-and-set + trades dedup + rollup + status; `execution_id` column added | §6.4 / §6.5 / §6.6 / §6.6.1 | ~750 | 16 | 🔄 In progress |
-| 5 | Trades partial UNIQUE + UPSERT semantics in TradeLogger.log; UPDATE OR IGNORE backfill; test fixture updates for symbol-based order_ids | §6.5 / R5 fixes | ~150 | 1 + 6 fixture updates | 🔄 In progress |
-| 6 | Wire WebSocket stream → `apply_order_event` | §6.4 / §10.1 | ~300 | 4 | ⬜ |
+| 0 | Implementation tracker + PLAN.md pointer | n/a | ~150 | — | ✅ |
+| 1 | Schema: `position_lifecycle_orders` table + indexes + position-level UNIQUE + PRAGMA foreign_keys | §6.2 / R13-G1 | ~400 | 17 | ✅ |
+| 2 | Migration preflight: duplicate detection + abort-startup on conflict | §12.2 | ~250 | 12 | ✅ |
+| 3 | `PositionLifecycleOrdersStore` — CRUD operations on per-order rows | §6.2 / §6.3 | ~450 | 20 | ✅ |
+| 4 | `apply_order_event` — atomic compare-and-set + trades dedup + rollup + status; `execution_id` column added | §6.4 / §6.5 / §6.6 / §6.6.1 | ~750 | 16 | ✅ |
+| 5 | Trades partial UNIQUE + UPSERT semantics in TradeLogger.log; UPDATE OR IGNORE backfill; test fixture updates for symbol-based order_ids | §6.5 / R5 fixes | ~150 | 1 + 6 fixture updates | ✅ |
+| 6 | Substrate insert at submit time: equity / fractional / options entries write `position_lifecycle_orders` row at status='pending' alongside the position-level row; attach broker order_id on submit return | §6.3 / §10.1 | ~250 | 6 | ✅ |
 | 7 | Wire cycle reconciliation (`_reconcile_position_lifecycle`) → `apply_order_event` | §6.4 / §10.1 / §3.1 | ~300 | 4 | ⬜ |
 | 8 | Wire startup reconciliation: downtime fill/cancel walk against closed-order history | §6.4 / §10.1 | ~250 | 3 | ⬜ |
 | 9 | Wire `protective_stop` role: broker OTO child gets its own per-order row | §10.3 | ~150 | 2 | ⬜ |
