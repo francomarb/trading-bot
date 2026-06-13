@@ -96,16 +96,24 @@ def db_conn(tmp_path: Path):
     logger.close()
 
 
+_SLIPPAGE_OID_COUNTER = [0]
+
+
 def _seed_slippage_trade(conn, *, strategy, timestamp, realized, modeled):
+    # Foundation §6.5 partial UNIQUE on trades.order_id within single_leg
+    # scope means every fixture row needs a distinct order_id, or the
+    # preflight fires on _ensure_db.
+    _SLIPPAGE_OID_COUNTER[0] += 1
+    oid = f"oid-{_SLIPPAGE_OID_COUNTER[0]:04d}"
     conn.execute(
         "INSERT INTO trades ("
         "timestamp, symbol, side, qty, avg_fill_price, order_id, "
         "strategy, reason, stop_price, entry_reference_price, "
         "modeled_slippage_bps, realized_slippage_bps, "
         "order_type, status, requested_qty, filled_qty"
-        ") VALUES (?, 'X', 'sell', 1.0, 100.0, 'oid', ?, 'exit', "
+        ") VALUES (?, 'X', 'sell', 1.0, 100.0, ?, ?, 'exit', "
         "95.0, 100.0, ?, ?, 'market', 'filled', 1.0, 1.0)",
-        (timestamp, strategy, modeled, realized),
+        (timestamp, oid, strategy, modeled, realized),
     )
     conn.commit()
 

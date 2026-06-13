@@ -292,6 +292,24 @@ class OwnerKeyDuplicate:
     position_uids: tuple[str, ...] = field(default_factory=tuple)
 
 
+@dataclass(frozen=True)
+class TradesOrderIdDuplicate:
+    """One duplicate cluster on ``trades.order_id`` for the single-leg
+    partial UNIQUE scope. Each entry collides with the new
+    ``uniq_trades_order_id_single_leg`` index when it is created.
+
+    Added per PR #60 review (commit 7): preflight must also detect
+    trades-side duplicates because the same partial UNIQUE the discovery
+    doc §6.5 requires is created during ``_ensure_db()``. Without this
+    detection an existing duplicate raises a generic IntegrityError
+    rather than the structured remediation flow §12.2 promises.
+    """
+
+    order_id: str
+    count: int
+    trade_ids: tuple[int, ...] = field(default_factory=tuple)
+
+
 class MigrationDuplicatesFound(RuntimeError):
     """Raised when preflight detects pre-existing duplicate rows that
     would block a new UNIQUE INDEX from being created.
@@ -306,15 +324,23 @@ class MigrationDuplicatesFound(RuntimeError):
 
     The exception carries structured detail so the alert backend
     and the operator dashboard can surface the affected rows.
+
+    The exception carries two dimensions of duplicates: position-level
+    ``owner_key_duplicates`` (blocking
+    ``uniq_one_active_position_per_owner_key``) and per-order
+    ``trades_order_id_duplicates`` (blocking
+    ``uniq_trades_order_id_single_leg``).
     """
 
     def __init__(
         self,
         *,
         owner_key_duplicates: tuple[OwnerKeyDuplicate, ...] = (),
+        trades_order_id_duplicates: tuple[TradesOrderIdDuplicate, ...] = (),
         message: str | None = None,
     ) -> None:
         self.owner_key_duplicates = owner_key_duplicates
+        self.trades_order_id_duplicates = trades_order_id_duplicates
         if message is None:
             parts: list[str] = []
             if owner_key_duplicates:
@@ -332,11 +358,26 @@ class MigrationDuplicatesFound(RuntimeError):
                     parts.append(
                         f"  ... and {len(owner_key_duplicates) - 5} more"
                     )
+            if trades_order_id_duplicates:
+                parts.append(
+                    f"{len(trades_order_id_duplicates)} trades.order_id "
+                    f"duplicates (position_type='single_leg' scope)"
+                )
+                for dup in trades_order_id_duplicates[:5]:
+                    parts.append(
+                        f"  - order_id={dup.order_id!r} "
+                        f"count={dup.count} "
+                        f"trade_ids={dup.trade_ids}"
+                    )
+                if len(trades_order_id_duplicates) > 5:
+                    parts.append(
+                        f"  ... and {len(trades_order_id_duplicates) - 5} more"
+                    )
             parts.append(
                 "Pre-existing duplicates block the foundation PR's "
-                "uniq_one_active_position_per_owner_key partial unique "
-                "index. Run scripts/migrate_dedupe_trades.py (detection / "
-                "review / apply modes per discovery doc §12.2) and retry."
+                "uniqueness indexes. Run scripts/migrate_dedupe_trades.py "
+                "(detection / review / apply modes per discovery doc §12.2) "
+                "and retry."
             )
             message = "\n".join(parts)
         super().__init__(message)
@@ -353,10 +394,19 @@ def detect_owner_key_duplicates(
     through preflight and surface as the much-less-helpful generic
     SQLite UNIQUE constraint violation at index creation time.
 
-    Returns an empty tuple when the database is clean. Callers can
-    treat a non-empty result as a fatal precondition and raise
-    ``MigrationDuplicatesFound``.
+    Returns an empty tuple when ``position_lifecycle`` does not exist
+    yet (first-startup DB or a partial-bootstrap test fixture). The
+    table is created earlier in the same ``_ensure_db`` pass in
+    production, so this only triggers in tests that call preflight
+    against a hand-built connection.
     """
+    has_table = conn.execute(
+        "SELECT 1 FROM sqlite_master WHERE type='table' "
+        "AND name='position_lifecycle'"
+    ).fetchone()
+    if has_table is None:
+        return ()
+
     status_placeholders = ", ".join("?" for _ in _OWNER_KEY_LOCK_STATUSES)
     rows = conn.execute(
         f"""
@@ -385,20 +435,120 @@ def detect_owner_key_duplicates(
     return tuple(duplicates)
 
 
+def detect_trades_order_id_duplicates(
+    conn: sqlite3.Connection,
+) -> tuple[TradesOrderIdDuplicate, ...]:
+    """Detect duplicate ``trades.order_id`` clusters that would block
+    the new ``uniq_trades_order_id_single_leg`` partial UNIQUE index.
+
+    Scope: any row with ``order_id IS NOT NULL`` and ``position_type``
+    NULL **or** ``'single_leg'`` — i.e. anything that either already
+    lives inside the partial index predicate or would be migrated
+    into it by ``_BACKFILL_SQL``. Rows with ``position_type='spread'``
+    are deliberately excluded because spread legs legitimately share
+    ``order_id`` (combo order; one DB row per OCC leg) and are not
+    in the unique scope.
+
+    Detecting NULL+NULL and NULL+single_leg collisions matters
+    because the BACKFILL step that runs immediately after preflight
+    sets ``position_type='single_leg'`` on every NULL row — duplicates
+    that look harmless pre-BACKFILL become hard collisions seconds
+    later. The previous implementation relied on ``UPDATE OR IGNORE``
+    in the BACKFILL to paper over these, which silently quarantined
+    duplicate rows at NULL ``position_type`` and made them invisible
+    to the rest of the schema. Preflight now surfaces them up front
+    so the operator's dedupe script can act on the full picture.
+
+    The ``trades`` table may not exist yet on a first-startup DB. In
+    that case the partial UNIQUE can be created cleanly without any
+    duplicates being possible, so we return an empty tuple rather
+    than raising.
+
+    Returns an empty tuple when the database is clean. Callers can
+    treat a non-empty result as a fatal precondition and raise
+    ``MigrationDuplicatesFound``.
+    """
+    has_trades = conn.execute(
+        "SELECT 1 FROM sqlite_master WHERE type='table' AND name='trades'"
+    ).fetchone()
+    if has_trades is None:
+        return ()
+
+    cols = conn.execute("PRAGMA table_info(trades)").fetchall()
+    column_names = {col[1] for col in cols}
+    if "order_id" not in column_names:
+        return ()
+    # Pre-PR-59 trades tables won't have position_type; the column
+    # gets added by the migration step that runs BEFORE preflight in
+    # reporting.logger._ensure_db, so by the time this function runs
+    # the column is always present. The check below is defensive
+    # against being called against an arbitrary connection (tests).
+    if "position_type" not in column_names:
+        type_filter = ""
+        params: tuple = ()
+    else:
+        type_filter = (
+            "AND (position_type IS NULL OR position_type = 'single_leg') "
+        )
+        params = ()
+
+    rows = conn.execute(
+        f"""
+        SELECT order_id, COUNT(*) AS n,
+               GROUP_CONCAT(id, ',') AS ids
+        FROM trades
+        WHERE order_id IS NOT NULL
+          {type_filter}
+        GROUP BY order_id
+        HAVING COUNT(*) > 1
+        ORDER BY order_id
+        """,
+        params,
+    ).fetchall()
+    duplicates: list[TradesOrderIdDuplicate] = []
+    for order_id, count, ids_csv in rows:
+        ids_tuple: tuple[int, ...] = (
+            tuple(int(s) for s in ids_csv.split(",")) if ids_csv else ()
+        )
+        duplicates.append(
+            TradesOrderIdDuplicate(
+                order_id=str(order_id),
+                count=int(count),
+                trade_ids=ids_tuple,
+            )
+        )
+    return tuple(duplicates)
+
+
 def run_preflight_or_raise(conn: sqlite3.Connection) -> None:
     """Run all migration preflight checks before applying foundation
     PR's new UNIQUE INDEXes. Raises ``MigrationDuplicatesFound`` on
-    any conflict. Safe to call on every startup; runs fast (indexed
-    GROUP BY queries) when the database is clean.
+    any conflict (either dimension; the exception carries both). Safe
+    to call on every startup; runs fast (indexed GROUP BY queries)
+    when the database is clean.
 
-    Scope at commit 2: checks duplicates on the position_lifecycle
-    owner_key dimension. Commit 5 (trades schema migration) will
-    expand this to also check the trades.order_id /
-    position_type='single_leg' dimension.
+    Two dimensions are checked:
+
+    - ``position_lifecycle.owner_key`` duplicates (blocking
+      ``uniq_one_active_position_per_owner_key``)
+    - ``trades.order_id`` duplicates within
+      ``position_type='single_leg'`` (blocking
+      ``uniq_trades_order_id_single_leg``)
+
+    Both unique indexes are created by the same ``_ensure_db()`` call
+    on the same startup, so both dimensions must be clean before
+    either index can be created. The exception consolidates them so
+    the operator sees the full remediation surface in one diagnostic
+    message rather than fixing one and tripping the other on the
+    next startup.
     """
-    duplicates = detect_owner_key_duplicates(conn)
-    if duplicates:
-        raise MigrationDuplicatesFound(owner_key_duplicates=duplicates)
+    owner_key_dupes = detect_owner_key_duplicates(conn)
+    trades_dupes = detect_trades_order_id_duplicates(conn)
+    if owner_key_dupes or trades_dupes:
+        raise MigrationDuplicatesFound(
+            owner_key_duplicates=owner_key_dupes,
+            trades_order_id_duplicates=trades_dupes,
+        )
 
 
 # ── Store API (discovery doc §6.2 / §6.3) ──

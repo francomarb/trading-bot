@@ -279,14 +279,15 @@ _POSITION_UID_INDEX_SQL = (
 # Guarded by `WHERE position_id IS NULL` so explicit writes (future spreads)
 # are never overwritten on subsequent startups.
 #
-# UPDATE OR IGNORE per foundation §6.5: legacy rows that share order_id
-# with another row would collide with the new partial UNIQUE
-# uniq_trades_order_id_single_leg the moment they're moved into
-# single_leg scope. IGNORE skips the second offender rather than
-# raising — these are stale legacy rows that the operator can
-# clean up via scripts/migrate_dedupe_trades.py if needed.
+# Plain UPDATE: BACKFILL runs AFTER preflight (see _ensure_db ordering
+# below). If preflight passes, no row this UPDATE moves into single_leg
+# scope can collide with another — duplicate trades.order_id clusters
+# in the NULL / single_leg space were already surfaced by
+# detect_trades_order_id_duplicates and the operator was forced to run
+# the dedupe script. A failure here therefore signals a bug (preflight
+# missed a case) and should raise loudly rather than be swallowed.
 _BACKFILL_SQL = (
-    "UPDATE OR IGNORE trades "
+    "UPDATE trades "
     "SET position_id = OWNER_KEY(symbol), position_type = 'single_leg' "
     "WHERE position_id IS NULL"
 )
@@ -404,16 +405,6 @@ class TradeLogger:
                     conn.execute(
                         f"ALTER TABLE trades ADD COLUMN {column} {col_type}"
                     )
-            # 11.27: backfill position_id/position_type on pre-existing rows, then
-            # ensure the lookup index exists. Both statements are idempotent.
-            conn.execute(_BACKFILL_SQL)
-            conn.execute(_POSITION_ID_INDEX_SQL)
-            conn.execute(_POSITION_UID_INDEX_SQL)
-            # 11.10c: signal-lifecycle counter table for the Strategy Health
-            # Monitor. Local import avoids a circular dependency
-            # (strategies.health.* can import reporting.logger types).
-            from strategies.health.lifecycle import _CREATE_LIFECYCLE_TABLE_SQL
-            conn.execute(_CREATE_LIFECYCLE_TABLE_SQL)
             # Operator Controls Phase A — position_lifecycle and
             # position_lifecycle_legs. Created by the same migration path
             # so all schema lives behind one connection bootstrap. Local
@@ -442,19 +433,41 @@ class TradeLogger:
             conn.execute(_CREATE_POSITION_LIFECYCLE_ORDERS_SQL)
             for index_sql in _CREATE_POSITION_LIFECYCLE_ORDERS_INDEXES_SQL:
                 conn.execute(index_sql)
-            # Migration preflight (PR #59 §12.2 / R7-P1b / R9-P1c).
-            # Detect pre-existing duplicate rows that would block the
-            # uniq_one_active_position_per_owner_key partial unique index.
-            # If any are found, raise MigrationDuplicatesFound — this
-            # is a fatal startup precondition; the operator must run
+            # Migration preflight (PR #59 §12.2 / R7-P1b / R9-P1c,
+            # PR #60 commit 7 review).
+            #
+            # Detect pre-existing duplicate rows that would block the new
+            # partial UNIQUE indexes — two dimensions:
+            #   - uniq_one_active_position_per_owner_key on position_lifecycle
+            #   - uniq_trades_order_id_single_leg on trades
+            # If either fires, raise MigrationDuplicatesFound — fatal
+            # startup precondition; the operator must run
             # scripts/migrate_dedupe_trades.py and retry. The bot does
             # NOT continue in a partial-migration / legacy mode; that
             # would let foundation writer code create more duplicates
-            # or produce silently wrong rollups. Preflight runs BEFORE
-            # the CREATE UNIQUE INDEX statement so the error surfaces
-            # with structured detail instead of as a generic SQLite
-            # constraint violation.
+            # or produce silently wrong rollups.
+            #
+            # Preflight runs BEFORE _BACKFILL_SQL — the BACKFILL changes
+            # position_type from NULL to 'single_leg' on legacy rows,
+            # which would bring duplicate order_ids into the unique
+            # scope. detect_trades_order_id_duplicates anticipates that
+            # transition by scanning (position_type NULL or single_leg)
+            # rows up front so the operator sees the full conflict
+            # surface before any data is mutated.
             run_preflight_or_raise(conn)
+            # 11.27: backfill position_id/position_type on pre-existing
+            # rows, then ensure the lookup index exists. Plain UPDATE
+            # (not UPDATE OR IGNORE) — preflight above guarantees no
+            # conflicts here; any IntegrityError signals a bug in
+            # detect_trades_order_id_duplicates and must raise loudly.
+            conn.execute(_BACKFILL_SQL)
+            conn.execute(_POSITION_ID_INDEX_SQL)
+            conn.execute(_POSITION_UID_INDEX_SQL)
+            # 11.10c: signal-lifecycle counter table for the Strategy Health
+            # Monitor. Local import avoids a circular dependency
+            # (strategies.health.* can import reporting.logger types).
+            from strategies.health.lifecycle import _CREATE_LIFECYCLE_TABLE_SQL
+            conn.execute(_CREATE_LIFECYCLE_TABLE_SQL)
             # Position-level partial unique index added to the existing
             # position_lifecycle table — durable cross-position
             # duplicate-entry prevention per PR #59 §6.2 / R6-1 / R8-3.

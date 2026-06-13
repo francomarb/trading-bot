@@ -30,13 +30,17 @@ Each commit is reviewable in isolation; each ends with green tests.
 | 4 | `apply_order_event` — atomic compare-and-set + trades dedup + rollup + status; `execution_id` column added | §6.4 / §6.5 / §6.6 / §6.6.1 | ~750 | 16 | ✅ |
 | 5 | Trades partial UNIQUE + UPSERT semantics in TradeLogger.log; UPDATE OR IGNORE backfill; test fixture updates for symbol-based order_ids | §6.5 / R5 fixes | ~150 | 1 + 6 fixture updates | ✅ |
 | 6 | Substrate insert at submit time: equity / fractional / options entries write `position_lifecycle_orders` row at status='pending' alongside the position-level row; attach broker order_id on submit return | §6.3 / §10.1 | ~250 | 6 | ✅ |
-| 7 | Wire cycle reconciliation (`_reconcile_position_lifecycle`) → `apply_order_event` | §6.4 / §10.1 / §3.1 | ~300 | 4 | ⬜ |
-| 8 | Wire startup reconciliation: downtime fill/cancel walk against closed-order history | §6.4 / §10.1 | ~250 | 3 | ⬜ |
-| 9 | Wire `protective_stop` role: broker OTO child gets its own per-order row | §10.3 | ~150 | 2 | ⬜ |
-| 10 | Wire `replacement_stop` role: PR #47 GTC promotion uses durable identity | §10.3 | ~150 | 2 | ⬜ |
-| 11 | Remove `_suspect_orders` cache (post-verification) | §10.1 / §6.7 | ~200 | 2 | ⬜ |
-| 12 | Remove `_suspect_exit_orders` cache (post-verification) | §10.2 / §6.7 | ~150 | 2 | ⬜ |
-| 13 | Doc updates: PLAN.md, operator_controls_proposal.md, slippage_unification_tracker.md | §12 | ~50 | — | ⬜ |
+| 7 | PR #60 review fix (A + H#18): trades-side migration preflight + `scripts/migrate_dedupe_trades.py` (detect / review / apply) + plain UPDATE backfill | §12.2 / R8-2 | ~600 | 18 | ✅ |
+| 8 | PR #60 review fix (B + F + H#5 + H#13): status-only events skip trades UPSERT; TradeLogger.log COALESCE-preserves provenance; trades-row writer semantics | §6.5 / §6.6 | ~150 | 14 | ⬜ |
+| 9 | PR #60 review fix (C + D + E + H#20 + H#21 + H#25): options durable identity (on_submitted callback); fail-closed substrate exception policy; persist slippage provenance | §10.5 / §10.3 | ~300 | 22 | ⬜ |
+| 10 | Wire WebSocket stream → `apply_order_event` (queue events to cycle thread for thread-safety) | §6.4 / §10.1 | ~300 | 4 | ⬜ |
+| 11 | Wire cycle reconciliation (`_reconcile_position_lifecycle`) → `apply_order_event` | §6.4 / §10.1 / §3.1 | ~300 | 4 | ⬜ |
+| 12 | Wire startup reconciliation: downtime fill/cancel walk against closed-order history | §6.4 / §10.1 | ~250 | 3 | ⬜ |
+| 13 | Wire `protective_stop` role: broker OTO child gets its own per-order row | §10.3 | ~150 | 2 | ⬜ |
+| 14 | Wire `replacement_stop` role: PR #47 GTC promotion uses durable identity | §10.3 | ~150 | 2 | ⬜ |
+| 15 | Remove `_suspect_orders` cache (post-verification) | §10.1 / §6.7 | ~200 | 2 | ⬜ |
+| 16 | Remove `_suspect_exit_orders` cache (post-verification) | §10.2 / §6.7 | ~150 | 2 | ⬜ |
+| 17 | Doc updates: PLAN.md, operator_controls_proposal.md, slippage_unification_tracker.md | §12 | ~50 | — | ⬜ |
 
 Total estimate: ~3000 LOC code + ~1500 LOC tests, ~14 commits.
 

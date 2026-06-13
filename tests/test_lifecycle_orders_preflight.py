@@ -340,3 +340,192 @@ class TestPreflightHasNoSideEffects:
             "ORDER BY position_uid"
         ).fetchall()
         assert rows_before == rows_after
+
+
+# ── Trades-side duplicate detection (PR #60 commit 7 review) ────────────────
+
+
+def _make_legacy_trades_conn(path: str) -> sqlite3.Connection:
+    """Open a raw sqlite3 connection and bootstrap a minimal trades
+    table mirroring the pre-PR-60 schema (no partial UNIQUE on
+    order_id). Used to simulate a legacy DB shape against which the
+    foundation migration must run preflight before mutating anything.
+    """
+    conn = sqlite3.connect(path)
+    conn.execute(
+        "CREATE TABLE IF NOT EXISTS trades ("
+        "id INTEGER PRIMARY KEY AUTOINCREMENT, "
+        "timestamp TEXT, symbol TEXT, side TEXT, qty REAL, "
+        "avg_fill_price REAL, order_id TEXT, strategy TEXT, "
+        "reason TEXT, stop_price REAL, entry_reference_price REAL, "
+        "modeled_slippage_bps REAL, realized_slippage_bps REAL, "
+        "order_type TEXT, status TEXT, requested_qty REAL, "
+        "filled_qty REAL, position_type TEXT)"
+    )
+    return conn
+
+
+def _seed_trades_row(
+    conn: sqlite3.Connection,
+    *,
+    order_id: str | None,
+    position_type: str | None,
+    timestamp: str = "2026-06-12T00:00:00+00:00",
+    symbol: str = "AAPL",
+) -> int:
+    """Insert a trades row with explicit order_id/position_type,
+    returning the new row id. Used to simulate legacy data shapes."""
+    cur = conn.execute(
+        """
+        INSERT INTO trades (
+            timestamp, symbol, side, qty, avg_fill_price,
+            order_id, strategy, reason, stop_price,
+            entry_reference_price, modeled_slippage_bps,
+            realized_slippage_bps, order_type, status,
+            requested_qty, filled_qty, position_type
+        ) VALUES (
+            ?, ?, 'buy', 10, 100.0,
+            ?, 'sma_crossover', 'test', 95.0,
+            100.0, 0.0,
+            0.0, 'market', 'filled',
+            10, 10, ?
+        )
+        """,
+        (timestamp, symbol, order_id, position_type),
+    )
+    conn.commit()
+    return int(cur.lastrowid)
+
+
+class TestTradesOrderIdDuplicateDetection:
+    """detect_trades_order_id_duplicates and the integrated preflight
+    must catch every duplicate that would conflict with the new
+    uniq_trades_order_id_single_leg partial UNIQUE — at the moment
+    the index is created, AND after _BACKFILL_SQL flips legacy NULL
+    rows to single_leg scope."""
+
+    def test_clean_db_no_trades_duplicates(self, tmp_db_path):
+        from engine.lifecycle_orders import detect_trades_order_id_duplicates
+        tl = TradeLogger(path=tmp_db_path)
+        conn = tl._ensure_db()
+        # Empty trades table → clean.
+        assert detect_trades_order_id_duplicates(conn) == ()
+
+    def test_two_single_leg_rows_same_order_id_detected(self, tmp_db_path):
+        """Two rows already at position_type='single_leg' with the same
+        order_id is the prototypical violation. Uses a legacy-shape
+        trades table (no partial UNIQUE yet) to simulate the state
+        at which preflight is supposed to run."""
+        from engine.lifecycle_orders import detect_trades_order_id_duplicates
+        conn = _make_legacy_trades_conn(tmp_db_path)
+        _seed_trades_row(conn, order_id="ord-X", position_type="single_leg")
+        _seed_trades_row(conn, order_id="ord-X", position_type="single_leg")
+        dupes = detect_trades_order_id_duplicates(conn)
+        assert len(dupes) == 1
+        assert dupes[0].order_id == "ord-X"
+        assert dupes[0].count == 2
+        assert len(dupes[0].trade_ids) == 2
+
+    def test_two_null_position_type_rows_same_order_id_detected(
+        self, tmp_db_path,
+    ):
+        """Pre-BACKFILL legacy rows: position_type=NULL on both.
+        BACKFILL would move both into single_leg scope and collide,
+        so preflight must catch them BEFORE BACKFILL runs."""
+        from engine.lifecycle_orders import detect_trades_order_id_duplicates
+        conn = _make_legacy_trades_conn(tmp_db_path)
+        _seed_trades_row(conn, order_id="ord-Y", position_type=None)
+        _seed_trades_row(conn, order_id="ord-Y", position_type=None)
+        dupes = detect_trades_order_id_duplicates(conn)
+        assert len(dupes) == 1
+        assert dupes[0].order_id == "ord-Y"
+
+    def test_mixed_null_and_single_leg_same_order_id_detected(
+        self, tmp_db_path,
+    ):
+        """Half-migrated DB: one row at single_leg, another at NULL.
+        BACKFILL would promote the NULL to single_leg and collide.
+        Preflight must surface this."""
+        from engine.lifecycle_orders import detect_trades_order_id_duplicates
+        conn = _make_legacy_trades_conn(tmp_db_path)
+        _seed_trades_row(conn, order_id="ord-Z", position_type="single_leg")
+        _seed_trades_row(conn, order_id="ord-Z", position_type=None)
+        dupes = detect_trades_order_id_duplicates(conn)
+        assert len(dupes) == 1
+        assert dupes[0].order_id == "ord-Z"
+
+    def test_spread_rows_sharing_order_id_NOT_flagged(self, tmp_db_path):
+        """Spread legs deliberately share order_id (one combo order,
+        two OCC leg rows) and live OUTSIDE the partial UNIQUE scope.
+        Preflight must not flag them."""
+        from engine.lifecycle_orders import detect_trades_order_id_duplicates
+        conn = _make_legacy_trades_conn(tmp_db_path)
+        _seed_trades_row(
+            conn, order_id="combo-1", position_type="spread",
+            symbol="SPY260618C00500000",
+        )
+        _seed_trades_row(
+            conn, order_id="combo-1", position_type="spread",
+            symbol="SPY260618C00510000",
+        )
+        assert detect_trades_order_id_duplicates(conn) == ()
+
+    def test_null_order_id_rows_NOT_flagged(self, tmp_db_path):
+        """Rows with order_id IS NULL are outside the partial UNIQUE
+        predicate by construction."""
+        from engine.lifecycle_orders import detect_trades_order_id_duplicates
+        conn = _make_legacy_trades_conn(tmp_db_path)
+        _seed_trades_row(conn, order_id=None, position_type="single_leg")
+        _seed_trades_row(conn, order_id=None, position_type="single_leg")
+        assert detect_trades_order_id_duplicates(conn) == ()
+
+    def test_preflight_raises_with_trades_duplicates_in_payload(
+        self, tmp_db_path,
+    ):
+        """run_preflight_or_raise carries the trades duplicates on the
+        exception so the operator alert can render them."""
+        conn = _make_legacy_trades_conn(tmp_db_path)
+        _seed_trades_row(conn, order_id="ord-W", position_type="single_leg")
+        _seed_trades_row(conn, order_id="ord-W", position_type="single_leg")
+        with pytest.raises(MigrationDuplicatesFound) as exc:
+            run_preflight_or_raise(conn)
+        assert len(exc.value.trades_order_id_duplicates) == 1
+        assert exc.value.trades_order_id_duplicates[0].order_id == "ord-W"
+        # And owner_key dimension is empty (no position_lifecycle).
+        assert exc.value.owner_key_duplicates == ()
+
+    def test_preflight_message_lists_both_dimensions(self, tmp_db_path):
+        """The exception's str() form lists both owner_key and trades
+        duplicate clusters so the operator alert renders everything
+        in a single diagnostic blob."""
+        # Build both dimensions on a single legacy-shape conn.
+        conn = _make_legacy_trades_conn(tmp_db_path)
+        _seed_trades_row(conn, order_id="ord-T", position_type="single_leg")
+        _seed_trades_row(conn, order_id="ord-T", position_type="single_leg")
+        conn.execute(
+            "CREATE TABLE position_lifecycle ("
+            "schema_version INTEGER, position_uid TEXT, "
+            "created_at TEXT, closed_at TEXT, symbol TEXT, "
+            "owner_key TEXT, strategy TEXT, position_type TEXT, "
+            "status TEXT, entry_qty REAL, current_qty REAL, "
+            "avg_entry_price REAL, net_realized_pnl REAL, "
+            "entry_order_id TEXT, entry_client_order_id TEXT, "
+            "first_fill_at TEXT, last_fill_at TEXT, metadata_json TEXT)"
+        )
+        conn.execute(
+            "INSERT INTO position_lifecycle "
+            "(schema_version, position_uid, owner_key, status, strategy) "
+            "VALUES (1, 'p1', 'AAPL', 'open', 'sma')"
+        )
+        conn.execute(
+            "INSERT INTO position_lifecycle "
+            "(schema_version, position_uid, owner_key, status, strategy) "
+            "VALUES (1, 'p2', 'AAPL', 'open', 'sma')"
+        )
+        conn.commit()
+        with pytest.raises(MigrationDuplicatesFound) as exc:
+            run_preflight_or_raise(conn)
+        msg = str(exc.value)
+        assert "owner_key" in msg
+        assert "trades.order_id" in msg
+        assert "ord-T" in msg
