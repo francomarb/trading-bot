@@ -56,6 +56,7 @@ QuoteProvider = Callable[[], "MlegQuote | None"]
 
 # Callback signature: (status_str, filled_qty, avg_fill_price, order_id)
 FillCallback = Callable[[str, float, "float | None", str], None]
+SubmittedCallback = Callable[[str, str], None]
 EntryAllowedCallback = Callable[[], bool]
 
 # How long an unfilled limit order is allowed to work before we cancel it.
@@ -207,11 +208,38 @@ class _BaseExecutionWorker(threading.Thread):
         api: TradingClient,
         stream_manager: StreamManager | None,
         on_fill: FillCallback | None,
+        on_submitted: "Callable[[str, str], None] | None" = None,
     ) -> None:
         super().__init__(daemon=True, name=name)
         self.api = api
         self.stream_manager = stream_manager
         self._on_fill = on_fill
+        # PR #60 commit 9 fix C: durable broker identity. Fires once
+        # immediately after a successful ``submit_order`` returns with
+        # the broker-assigned id. Used by the broker to attach the id
+        # to the per-order substrate row at the earliest possible
+        # moment, so a worker crash between submit and first fill
+        # cannot leave the row with order_id=NULL and unrecoverable
+        # by exact id.
+        #
+        # Pre-submit rejection paths MUST NOT invoke this callback —
+        # the substrate row stays at status='pending' with order_id
+        # NULL until the on_fill callback signals 'rejected', at which
+        # point apply_order_event handles the canceled transition via
+        # client_order_id lookup.
+        self._on_submitted = on_submitted
+
+    def _report_submitted(self, client_order_id: str, order_id: str) -> None:
+        """Fire the on_submitted callback if wired. Wrapped in
+        try/except so a misbehaving callback can't crash the worker."""
+        if self._on_submitted is None:
+            return
+        try:
+            self._on_submitted(client_order_id, order_id)
+        except Exception as exc:
+            logger.error(
+                f"[{self.name}] on_submitted callback raised: {exc}"
+            )
 
     def _report_fill(self, status: str, order_id: str, order=None) -> None:
         """Invoke the on_fill callback with normalized fill details.
@@ -333,12 +361,14 @@ class OptionsExecutionWorker(_BaseExecutionWorker):
         on_fill: FillCallback | None = None,
         client_order_id: str | None = None,
         entry_allowed: EntryAllowedCallback | None = None,
+        on_submitted: SubmittedCallback | None = None,
     ) -> None:
         super().__init__(
             name=f"OptionsExecutor-{decision.symbol}",
             api=api,
             stream_manager=stream_manager,
             on_fill=on_fill,
+            on_submitted=on_submitted,
         )
         self.decision = decision
         self.client_order_id = client_order_id
@@ -396,6 +426,14 @@ class OptionsExecutionWorker(_BaseExecutionWorker):
                 order_id=str(order.id),
                 stop_leg_ids=[],
             )
+
+        # PR #60 commit 9 fix C: attach the broker order_id to the
+        # substrate row at the earliest possible moment so any later
+        # crash / restart / reconciliation can resolve this order by
+        # its broker id rather than only by client_order_id. If the
+        # worker dies before _watch_to_terminal yields a fill, the
+        # substrate row is still recoverable.
+        self._report_submitted(client_order_id, str(order.id))
 
         self._watch_to_terminal(
             order_id=str(order.id),

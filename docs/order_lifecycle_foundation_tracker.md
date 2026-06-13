@@ -32,7 +32,7 @@ Each commit is reviewable in isolation; each ends with green tests.
 | 6 | Substrate insert at submit time: equity / fractional / options entries write `position_lifecycle_orders` row at status='pending' alongside the position-level row; attach broker order_id on submit return | §6.3 / §10.1 | ~250 | 6 | ✅ |
 | 7 | PR #60 review fix (A + H#18): trades-side migration preflight + `scripts/migrate_dedupe_trades.py` (detect / review / apply) + plain UPDATE backfill | §12.2 / R8-2 | ~600 | 18 | ✅ |
 | 8 | PR #60 review fix (B + F): status-only events skip trades UPSERT; TradeLogger.log COALESCE-preserves provenance | §6.5 / §6.6 | ~150 | 9 | ✅ |
-| 9 | PR #60 review fix (C + D + E + H#20 + H#21 + H#25): options durable identity (on_submitted callback); fail-closed substrate exception policy; persist slippage provenance | §10.5 / §10.3 | ~300 | 22 | ⬜ |
+| 9 | PR #60 review fix (C + D + E): options durable identity (on_submitted callback); fail-closed substrate exception policy; persist slippage provenance | §10.5 / §10.3 | ~300 | 12 | ✅ |
 | 10 | Wire WebSocket stream → `apply_order_event` (queue events to cycle thread for thread-safety) | §6.4 / §10.1 | ~300 | 4 | ⬜ |
 | 11 | Wire cycle reconciliation (`_reconcile_position_lifecycle`) → `apply_order_event` | §6.4 / §10.1 / §3.1 | ~300 | 4 | ⬜ |
 | 12 | Wire startup reconciliation: downtime fill/cancel walk against closed-order history | §6.4 / §10.1 | ~250 | 3 | ⬜ |

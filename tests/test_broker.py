@@ -2170,3 +2170,251 @@ class TestLifecycleOrdersSubstrate:
         result = broker.place_order(_decision(stop=95.5), poll_timeout=0.1)
 
         assert result.status is OrderStatus.FILLED
+
+
+# ── PR #60 commit 9 review fixes ────────────────────────────────────────────
+
+
+class TestSubstrateExceptionPolicy:
+    """PR #60 commit 9 fix D — substrate failures must follow a
+    differentiated policy: pre-submit invariant violations re-raise
+    so the order never goes out; post-submit failures log CRITICAL
+    but absorb (the order is already live and would otherwise be
+    untracked but un-cancelable).
+    """
+
+    @staticmethod
+    def _broker(api: MagicMock, orders_store: MagicMock) -> AlpacaBroker:
+        broker = AlpacaBroker(
+            client=api, max_attempts=1, base_delay=0.0,
+            lifecycle_orders_store=orders_store,
+            lifecycle_store=MagicMock(),
+        )
+        broker._lifecycle_store.create_pending = MagicMock(return_value="pos-uid")
+        return broker
+
+    def test_integrity_error_on_insert_pending_aborts_order(self):
+        """Duplicate client_order_id / FK violation pre-submit must
+        re-raise — Alpaca must not see the order while the substrate
+        is inconsistent."""
+        import sqlite3
+        api = MagicMock()
+        orders_store = MagicMock()
+        orders_store.insert_pending.side_effect = sqlite3.IntegrityError(
+            "UNIQUE constraint failed"
+        )
+        broker = self._broker(api, orders_store)
+
+        with pytest.raises(sqlite3.IntegrityError):
+            broker.place_order(_decision(stop=95.5), poll_timeout=0.1)
+
+        # Submit never happened.
+        api.submit_order.assert_not_called()
+
+    def test_value_error_on_insert_pending_aborts_order(self):
+        """Caller-bug invariants (invalid role / qty / origin_kind)
+        also re-raise pre-submit."""
+        api = MagicMock()
+        orders_store = MagicMock()
+        orders_store.insert_pending.side_effect = ValueError(
+            "intended_qty must be positive"
+        )
+        broker = self._broker(api, orders_store)
+
+        with pytest.raises(ValueError):
+            broker.place_order(_decision(stop=95.5), poll_timeout=0.1)
+        api.submit_order.assert_not_called()
+
+    def test_transient_error_on_insert_pending_lets_order_through(self):
+        """A generic Exception (transient I/O) still logs-and-skips so
+        a flaky disk doesn't ground the bot. Behavior identical to
+        pre-commit-9."""
+        api = MagicMock()
+        api.submit_order.return_value = _alpaca_order(status="filled")
+        api.get_order_by_id.return_value = _alpaca_order(status="filled")
+        orders_store = MagicMock()
+        orders_store.insert_pending.side_effect = RuntimeError("disk hiccup")
+        broker = self._broker(api, orders_store)
+
+        result = broker.place_order(_decision(stop=95.5), poll_timeout=0.1)
+        # Order still went through.
+        assert result.status is OrderStatus.FILLED
+        api.submit_order.assert_called_once()
+
+    def test_attach_failure_does_NOT_abort_post_submit(self):
+        """attach_broker_order_id runs AFTER submit_order returns
+        success. The order is live at Alpaca; raising would leave it
+        untracked-but-uncancelable. Log CRITICAL and absorb."""
+        api = MagicMock()
+        api.submit_order.return_value = _alpaca_order(status="filled")
+        api.get_order_by_id.return_value = _alpaca_order(status="filled")
+        orders_store = MagicMock()
+        orders_store.attach_broker_order_id.side_effect = RuntimeError(
+            "post-submit failure"
+        )
+        broker = self._broker(api, orders_store)
+
+        # Does NOT raise.
+        result = broker.place_order(_decision(stop=95.5), poll_timeout=0.1)
+        assert result.status is OrderStatus.FILLED
+
+
+class TestSlippageProvenancePlumbing:
+    """PR #60 commit 9 fix E — engine threads the arrival benchmark
+    through place_order; broker stores it on the substrate row."""
+
+    def test_place_order_forwards_slippage_kwargs_to_substrate(self):
+        api = MagicMock()
+        api.submit_order.return_value = _alpaca_order(status="filled")
+        api.get_order_by_id.return_value = _alpaca_order(status="filled")
+        orders_store = MagicMock()
+        broker = AlpacaBroker(
+            client=api, max_attempts=1, base_delay=0.0,
+            lifecycle_orders_store=orders_store,
+            lifecycle_store=MagicMock(),
+        )
+        broker._lifecycle_store.create_pending = MagicMock(return_value="pos-uid")
+
+        broker.place_order(
+            _decision(stop=95.5),
+            poll_timeout=0.1,
+            slippage_benchmark_price=99.875,
+            slippage_benchmark_kind="arrival_midpoint",
+            slippage_benchmark_timestamp="2026-06-13T15:30:00+00:00",
+            slippage_measurement_quality="primary",
+        )
+
+        kwargs = orders_store.insert_pending.call_args.kwargs
+        assert kwargs["slippage_benchmark_price"] == 99.875
+        assert kwargs["slippage_benchmark_kind"] == "arrival_midpoint"
+        assert kwargs["slippage_benchmark_timestamp"] == "2026-06-13T15:30:00+00:00"
+        assert kwargs["slippage_measurement_quality"] == "primary"
+
+    def test_place_order_slippage_kwargs_default_to_none(self):
+        """A caller that doesn't supply provenance still works; the
+        substrate row records NULL (existing legacy behaviour)."""
+        api = MagicMock()
+        api.submit_order.return_value = _alpaca_order(status="filled")
+        api.get_order_by_id.return_value = _alpaca_order(status="filled")
+        orders_store = MagicMock()
+        broker = AlpacaBroker(
+            client=api, max_attempts=1, base_delay=0.0,
+            lifecycle_orders_store=orders_store,
+            lifecycle_store=MagicMock(),
+        )
+        broker._lifecycle_store.create_pending = MagicMock(return_value="pos-uid")
+
+        broker.place_order(_decision(stop=95.5), poll_timeout=0.1)
+
+        kwargs = orders_store.insert_pending.call_args.kwargs
+        assert kwargs["slippage_benchmark_price"] is None
+        assert kwargs["slippage_benchmark_kind"] is None
+
+
+class TestOptionsDurableIdentity:
+    """PR #60 commit 9 fix C — OptionsExecutionWorker now exposes an
+    on_submitted callback that fires synchronously after submit_order
+    succeeds. The broker uses it to attach the broker order_id to the
+    substrate row at the earliest possible moment."""
+
+    def test_options_path_uses_on_submitted_for_attach(self):
+        """The broker wires on_submitted into the worker; the legacy
+        on_fill no longer attaches (avoids the rejected-with-client-
+        order-id-as-order-id bug)."""
+        api = MagicMock()
+        orders_store = MagicMock()
+        broker = AlpacaBroker(
+            client=api, max_attempts=1, base_delay=0.0,
+            lifecycle_orders_store=orders_store,
+            lifecycle_store=MagicMock(),
+        )
+        broker._lifecycle_store.create_pending = MagicMock(return_value="pos-uid")
+
+        captured = {}
+
+        def _capture_worker(*, on_fill, on_submitted, **kwargs):
+            captured["on_fill"] = on_fill
+            captured["on_submitted"] = on_submitted
+            captured["client_order_id"] = kwargs["client_order_id"]
+            mock_worker = MagicMock()
+            mock_worker.start = MagicMock()
+            return mock_worker
+
+        # Build an options-style decision (OCC symbol forces the
+        # options branch).
+        opt_decision = RiskDecision(
+            symbol="SPY260618C00500000",
+            side=Side.BUY,
+            qty=1,
+            entry_reference_price=2.50,
+            stop_price=1.25,
+            strategy_name="spy_options_reversion",
+            reason="test",
+            order_type=OrderType.LIMIT,
+            limit_price=2.50,
+        )
+
+        from unittest.mock import patch as _patch
+        with _patch("execution.broker.OptionsExecutionWorker",
+                    side_effect=_capture_worker):
+            broker.place_order(opt_decision, poll_timeout=0.0)
+
+        # Worker was constructed with on_submitted wired through.
+        assert captured.get("on_submitted") is not None
+        client_id = captured["client_order_id"]
+
+        # Simulate the worker firing on_submitted with the real
+        # broker order id.
+        captured["on_submitted"](client_id, "alpaca-options-ord-1")
+
+        # The substrate attach was called with the broker id.
+        orders_store.attach_broker_order_id.assert_called_once()
+        attach_kwargs = orders_store.attach_broker_order_id.call_args.kwargs
+        assert attach_kwargs["client_order_id"] == client_id
+        assert attach_kwargs["order_id"] == "alpaca-options-ord-1"
+
+    def test_options_on_fill_no_longer_attaches_with_client_order_id_bug(self):
+        """The pre-fix bug: worker passed client_order_id to on_fill
+        for rejected status, and the on_fill handler would attach
+        that as if it were the broker order_id. With C the attach is
+        in on_submitted, so a rejected on_fill triggers ZERO substrate
+        writes — exactly what we want when the order never made it
+        to Alpaca."""
+        api = MagicMock()
+        orders_store = MagicMock()
+        broker = AlpacaBroker(
+            client=api, max_attempts=1, base_delay=0.0,
+            lifecycle_orders_store=orders_store,
+            lifecycle_store=MagicMock(),
+        )
+        broker._lifecycle_store.create_pending = MagicMock(return_value="pos-uid")
+
+        captured = {}
+
+        def _capture_worker(*, on_fill, on_submitted, **kwargs):
+            captured["on_fill"] = on_fill
+            return MagicMock()
+
+        opt_decision = RiskDecision(
+            symbol="SPY260618C00500000",
+            side=Side.BUY,
+            qty=1,
+            entry_reference_price=2.50,
+            stop_price=1.25,
+            strategy_name="spy_options_reversion",
+            reason="test",
+            order_type=OrderType.LIMIT,
+            limit_price=2.50,
+        )
+
+        from unittest.mock import patch as _patch
+        with _patch("execution.broker.OptionsExecutionWorker",
+                    side_effect=_capture_worker):
+            broker.place_order(opt_decision, poll_timeout=0.0)
+
+        # Simulate the legacy worker call: rejected status with
+        # client_order_id passed as "order_id" (the old bug).
+        captured["on_fill"]("rejected", 0.0, None, "bogus-client-id-as-order-id")
+
+        # Attach was NOT called from on_fill — substrate untouched.
+        orders_store.attach_broker_order_id.assert_not_called()

@@ -38,6 +38,7 @@ SDK: alpaca-py (official, replaces deprecated alpaca-trade-api).
 
 from __future__ import annotations
 
+import sqlite3
 import threading
 import time
 import uuid
@@ -461,6 +462,10 @@ class AlpacaBroker:
         intended_limit_price: float | None = None,
         parent_order_id: str | None = None,
         replaces_order_id: str | None = None,
+        slippage_benchmark_price: float | None = None,
+        slippage_benchmark_kind: str | None = None,
+        slippage_benchmark_timestamp: str | None = None,
+        slippage_measurement_quality: str | None = None,
     ) -> None:
         """Write a `position_lifecycle_orders` row at status='pending'
         before the broker submission goes out.
@@ -471,7 +476,23 @@ class AlpacaBroker:
         observe broker reality.
 
         No-op when the store isn't wired or `position_uid` is None
-        (broker is operating without lifecycle persistence)."""
+        (broker is operating without lifecycle persistence).
+
+        PR #60 commit 9 fix D — exception policy: this runs BEFORE the
+        broker submit. IntegrityError (duplicate client_order_id, FK
+        violation, partial-UNIQUE conflict) signals a caller bug — a
+        substrate row already exists for this client_order_id, or the
+        position_uid doesn't resolve, or the unique invariants the
+        foundation depends on are broken. Re-raise so the call site
+        aborts the order BEFORE Alpaca sees it; the substrate's
+        consistency is a precondition for any subsequent
+        apply_order_event call. ValueError (invalid role / status /
+        bad inputs) is also a caller bug and re-raises.
+
+        Other exceptions (transient I/O, disk full, etc.) keep the
+        existing log-and-swallow policy since they're recoverable on
+        the next pass.
+        """
         if self._lifecycle_orders_store is None or position_uid is None:
             return
         try:
@@ -488,7 +509,26 @@ class AlpacaBroker:
                 intended_limit_price=intended_limit_price,
                 parent_order_id=parent_order_id,
                 replaces_order_id=replaces_order_id,
+                slippage_benchmark_price=slippage_benchmark_price,
+                slippage_benchmark_kind=slippage_benchmark_kind,
+                slippage_benchmark_timestamp=slippage_benchmark_timestamp,
+                slippage_measurement_quality=slippage_measurement_quality,
             )
+        except sqlite3.IntegrityError as exc:
+            logger.critical(
+                f"lifecycle_orders.insert_pending REFUSED for "
+                f"{decision.symbol} ({client_order_id}): {exc} — "
+                f"this is a foundation-substrate invariant violation; "
+                f"aborting submit. Investigate before retrying."
+            )
+            raise
+        except ValueError as exc:
+            logger.critical(
+                f"lifecycle_orders.insert_pending REJECTED for "
+                f"{decision.symbol} ({client_order_id}): {exc} — "
+                f"caller passed invalid role / qty / origin_kind."
+            )
+            raise
         except Exception as exc:
             logger.warning(
                 f"lifecycle_orders.insert_pending skipped for "
@@ -503,10 +543,17 @@ class AlpacaBroker:
         submitted_at: str | None = None,
     ) -> None:
         """Populate the broker-assigned `order_id` on the matching
-        pending row. Best-effort: a persistence failure here cannot
-        affect the live order — the WebSocket stop-fill / fill paths
-        will still observe broker truth and the cycle reconciliation
-        will eventually attach the order_id on a retry."""
+        pending row.
+
+        PR #60 commit 9 fix D — exception policy: this runs AFTER the
+        broker submit returns success. The order is already live at
+        Alpaca; raising here would leave it un-tracked but un-cancelable
+        from the bot's side, which is worse than the recovery cost. Any
+        exception is logged at CRITICAL level (so an oncall alert
+        fires) and absorbed — the next cycle reconciliation will
+        attempt to attach the order_id on its own via client_order_id
+        lookup.
+        """
         if self._lifecycle_orders_store is None:
             return
         try:
@@ -516,9 +563,11 @@ class AlpacaBroker:
                 submitted_at=submitted_at,
             )
         except Exception as exc:
-            logger.warning(
-                f"lifecycle_orders.attach_broker_order_id skipped for "
-                f"{client_order_id} → {order_id}: {exc}"
+            logger.critical(
+                f"lifecycle_orders.attach_broker_order_id FAILED for "
+                f"{client_order_id} → {order_id}: {exc}. The broker "
+                f"order is live; cycle reconciliation will retry the "
+                f"attach. Investigate substrate health."
             )
 
     # ── Retry wrapper ────────────────────────────────────────────────────
@@ -858,6 +907,10 @@ class AlpacaBroker:
         *,
         poll_timeout: float = ORDER_CONFIRM_TIMEOUT_SECONDS,
         poll_interval: float = 1.0,
+        slippage_benchmark_price: float | None = None,
+        slippage_benchmark_kind: str | None = None,
+        slippage_benchmark_timestamp: str | None = None,
+        slippage_measurement_quality: str | None = None,
     ) -> OrderResult:
         """
         Submit `decision` to Alpaca.
@@ -872,6 +925,17 @@ class AlpacaBroker:
 
         Refuses any non-`RiskDecision` input. There is no other way to call
         this — that is the Phase 6 / 7 contract.
+
+        PR #60 commit 9 fix E (review finding): the four
+        ``slippage_benchmark_*`` kwargs let the engine pass the arrival
+        midpoint / latest-close / etc. it captured immediately before
+        ``place_order`` so the substrate row records the exact
+        provenance §10.5 of the discovery doc requires foundation to
+        preserve. Without these, recovered fills lose the original
+        benchmark and the new slippage taxonomy reads 'unavailable'.
+        Callers that don't have provenance available leave them None;
+        the substrate row records NULL and apply_order_event will
+        eventually populate them via stream payload if available.
         """
         if not isinstance(decision, RiskDecision):
             raise TypeError(
@@ -928,19 +992,33 @@ class AlpacaBroker:
                     if decision.limit_price is not None
                     else None
                 ),
+                slippage_benchmark_price=slippage_benchmark_price,
+                slippage_benchmark_kind=slippage_benchmark_kind,
+                slippage_benchmark_timestamp=slippage_benchmark_timestamp,
+                slippage_measurement_quality=slippage_measurement_quality,
             )
 
             dec = decision  # capture for closure
 
-            def _on_fill(status: str, filled_qty: float, avg_price: "float | None", order_id: str) -> None:
-                # Foundation commit 6 — attach the broker-assigned order_id
-                # to the substrate row before the legacy lifecycle_mark_filled
-                # transition. Wrapped in the standard try/except discipline
-                # (helper handles it) so callback can't crash the worker.
+            def _on_submitted(cli_id: str, broker_order_id: str) -> None:
+                """Fires once, synchronously, right after the worker's
+                successful submit_order — never on pre-submit
+                rejection. PR #60 commit 9 fix C: attach the broker
+                order_id to the substrate row at the earliest possible
+                moment so a worker crash between submit and first fill
+                doesn't strand the row at order_id=NULL."""
                 self._lifecycle_orders_attach_order_id(
-                    client_order_id=client_order_id,
-                    order_id=order_id,
+                    client_order_id=cli_id,
+                    order_id=broker_order_id,
                 )
+
+            def _on_fill(status: str, filled_qty: float, avg_price: "float | None", order_id: str) -> None:
+                # Per fix C: substrate attach now happens in
+                # _on_submitted above. _on_fill no longer attaches;
+                # for rejected status the worker passed
+                # client_order_id as order_id (legacy contract) — that
+                # value is intentionally NOT used to identify the
+                # substrate row.
                 result = OrderResult(
                     status={
                         "filled": OrderStatus.FILLED,
@@ -968,6 +1046,7 @@ class AlpacaBroker:
                 api=self._api,
                 stream_manager=self._stream_manager,
                 on_fill=_on_fill,
+                on_submitted=_on_submitted,
                 client_order_id=client_order_id,
                 entry_allowed=self._entry_allowed,
             )
@@ -1031,7 +1110,11 @@ class AlpacaBroker:
         # never entered and the OTO path below is byte-for-byte unchanged.
         if math.floor(decision.qty) != decision.qty:
             return self._place_fractional_order(
-                decision, poll_timeout=poll_timeout, poll_interval=poll_interval
+                decision, poll_timeout=poll_timeout, poll_interval=poll_interval,
+                slippage_benchmark_price=slippage_benchmark_price,
+                slippage_benchmark_kind=slippage_benchmark_kind,
+                slippage_benchmark_timestamp=slippage_benchmark_timestamp,
+                slippage_measurement_quality=slippage_measurement_quality,
             )
 
         # Build request object.
@@ -1143,6 +1226,10 @@ class AlpacaBroker:
                 if getattr(order_request, "limit_price", None) is not None
                 else None
             ),
+            slippage_benchmark_price=slippage_benchmark_price,
+            slippage_benchmark_kind=slippage_benchmark_kind,
+            slippage_benchmark_timestamp=slippage_benchmark_timestamp,
+            slippage_measurement_quality=slippage_measurement_quality,
         )
 
         # Register with the stream before submitting to avoid a fill-before-watch race.
@@ -1254,6 +1341,10 @@ class AlpacaBroker:
         *,
         poll_timeout: float,
         poll_interval: float,
+        slippage_benchmark_price: float | None = None,
+        slippage_benchmark_kind: str | None = None,
+        slippage_benchmark_timestamp: str | None = None,
+        slippage_measurement_quality: str | None = None,
     ) -> OrderResult:
         """
         Fractional market entry path — only reached when FRACTIONAL_ENABLED=True
@@ -1333,6 +1424,10 @@ class AlpacaBroker:
             order_class="simple",
             time_in_force="day",
             intended_stop_price=float(decision.stop_price),
+            slippage_benchmark_price=slippage_benchmark_price,
+            slippage_benchmark_kind=slippage_benchmark_kind,
+            slippage_benchmark_timestamp=slippage_benchmark_timestamp,
+            slippage_measurement_quality=slippage_measurement_quality,
         )
 
         order_request = MarketOrderRequest(

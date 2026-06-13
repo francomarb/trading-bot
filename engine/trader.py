@@ -1642,7 +1642,23 @@ class TradingEngine:
         else:
             slippage_kind = None  # build_record will default to 'unavailable'
         try:
-            result = self.broker.place_order(decision)
+            # PR #60 commit 9 fix E: thread the arrival benchmark we
+            # just computed (and its provenance kind) through to the
+            # broker so the per-order substrate row records the exact
+            # observation §10.5 of the discovery doc requires.
+            # Recovery rows that hit apply_order_event later inherit
+            # this via the COALESCE policy in TradeLogger.log.
+            _now_iso = self._clock().isoformat()
+            result = self.broker.place_order(
+                decision,
+                slippage_benchmark_price=slippage_ref,
+                slippage_benchmark_kind=slippage_kind,
+                slippage_benchmark_timestamp=_now_iso,
+                slippage_measurement_quality=(
+                    "primary" if slippage_kind == "arrival_midpoint"
+                    else ("fallback" if slippage_kind else "unavailable")
+                ),
+            )
             # PLAN 11.10f: lifecycle counter — submitted increments
             # once per place_order call (regardless of fill status).
             # ACCEPTED, FILLED, PARTIAL, UNKNOWN all count as submitted
