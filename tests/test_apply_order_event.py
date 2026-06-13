@@ -1402,3 +1402,146 @@ class TestPositionUidIdentityConflict:
             "SELECT position_uid FROM trades WHERE order_id = 'ord-W'"
         ).fetchone()
         assert row[0] == "pos-A"
+
+
+# ── PR #60 round 3 (finding 2 UPSERT computed accounting) ───────────────────
+
+
+class TestLatestNonNullAccountingBucket:
+    """Round 3 finding: realized_pnl, r_multiple, realized_slippage_bps,
+    slippage_signed_bps, slippage_adverse_bps are computed accounting
+    fields that legitimately UPDATE across multiple log() calls (a
+    later observation refines them). An incoming NULL must NOT erase
+    a populated value — that's "I don't have this observation now",
+    not "I'm explicitly clearing it"."""
+
+    @staticmethod
+    def _record(*, order_id: str, **overrides):
+        from reporting.logger import TradeRecord
+        defaults = dict(
+            timestamp="2026-06-12T10:00:00+00:00",
+            symbol="AAPL", side="buy", qty=10,
+            avg_fill_price=150.0, order_id=order_id,
+            strategy="sma_crossover", reason="entry",
+            stop_price=145.0, entry_reference_price=150.0,
+            modeled_slippage_bps=0.0,
+            order_type="market", status="filled",
+            requested_qty=10, filled_qty=10,
+            position_type="single_leg",
+        )
+        defaults.update(overrides)
+        return TradeRecord(**defaults)
+
+    def test_realized_pnl_preserved_on_sparse_null_follow_up(self, tmp_path):
+        from reporting.logger import TradeLogger
+        tl = TradeLogger(path=str(tmp_path / "trades.db"))
+        tl.log(self._record(
+            order_id="ord-pnl",
+            realized_pnl=12.34,
+            realized_slippage_bps=3.5,
+        ))
+        # Sparse follow-up: NULL realized_pnl and NULL slippage.
+        tl.log(self._record(
+            order_id="ord-pnl",
+            realized_pnl=None,
+            realized_slippage_bps=None,
+        ))
+        row = tl._ensure_db().execute(
+            "SELECT realized_pnl, realized_slippage_bps "
+            "FROM trades WHERE order_id = 'ord-pnl'"
+        ).fetchone()
+        assert row[0] == 12.34
+        assert row[1] == 3.5
+
+    def test_r_multiple_preserved_on_sparse_null(self, tmp_path):
+        from reporting.logger import TradeLogger
+        tl = TradeLogger(path=str(tmp_path / "trades.db"))
+        tl.log(self._record(
+            order_id="ord-r", r_multiple=2.5,
+            realized_slippage_bps=3.5,
+        ))
+        tl.log(self._record(
+            order_id="ord-r", r_multiple=None,
+            realized_slippage_bps=None,
+        ))
+        row = tl._ensure_db().execute(
+            "SELECT r_multiple FROM trades WHERE order_id = 'ord-r'"
+        ).fetchone()
+        assert row[0] == 2.5
+
+    def test_slippage_signed_adverse_preserved_on_sparse_null(
+        self, tmp_path,
+    ):
+        from reporting.logger import TradeLogger
+        tl = TradeLogger(path=str(tmp_path / "trades.db"))
+        tl.log(self._record(
+            order_id="ord-slip",
+            slippage_signed_bps=2.1,
+            slippage_adverse_bps=2.1,
+            realized_slippage_bps=3.5,
+        ))
+        tl.log(self._record(
+            order_id="ord-slip",
+            slippage_signed_bps=None,
+            slippage_adverse_bps=None,
+            realized_slippage_bps=None,
+        ))
+        row = tl._ensure_db().execute(
+            "SELECT slippage_signed_bps, slippage_adverse_bps "
+            "FROM trades WHERE order_id = 'ord-slip'"
+        ).fetchone()
+        assert row[0] == 2.1
+        assert row[1] == 2.1
+
+    def test_latest_non_null_advances_when_incoming_is_populated(
+        self, tmp_path,
+    ):
+        """The non-NULL side of LATEST-NON-NULL: a later observation
+        DOES update the column if it carries a value. This is what
+        distinguishes the bucket from PRESERVE-FIRST-NON-NULL."""
+        from reporting.logger import TradeLogger
+        tl = TradeLogger(path=str(tmp_path / "trades.db"))
+        tl.log(self._record(
+            order_id="ord-adv",
+            realized_pnl=10.0,
+            realized_slippage_bps=3.5,
+        ))
+        # Later observation refines realized_pnl upward.
+        tl.log(self._record(
+            order_id="ord-adv",
+            realized_pnl=15.0,
+            realized_slippage_bps=4.0,
+        ))
+        row = tl._ensure_db().execute(
+            "SELECT realized_pnl, realized_slippage_bps "
+            "FROM trades WHERE order_id = 'ord-adv'"
+        ).fetchone()
+        assert row[0] == 15.0
+        assert row[1] == 4.0
+
+    def test_broker_cumulative_state_still_uses_excluded(self, tmp_path):
+        """Positive control on the default bucket: filled_qty /
+        avg_fill_price / status remain newest-wins even when the new
+        value is NULL. The LATEST-NON-NULL bucket is specifically the
+        computed-accounting columns."""
+        from reporting.logger import TradeLogger
+        tl = TradeLogger(path=str(tmp_path / "trades.db"))
+        tl.log(self._record(
+            order_id="ord-bro",
+            avg_fill_price=150.0,
+            filled_qty=10,
+            realized_slippage_bps=3.5,
+        ))
+        tl.log(self._record(
+            order_id="ord-bro",
+            avg_fill_price=151.5,  # newest wins
+            filled_qty=10,
+            status="filled",
+            realized_slippage_bps=4.0,
+        ))
+        row = tl._ensure_db().execute(
+            "SELECT avg_fill_price, status FROM trades "
+            "WHERE order_id = 'ord-bro'"
+        ).fetchone()
+        assert row[0] == 151.5
+        assert row[1] == "filled"

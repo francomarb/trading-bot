@@ -901,24 +901,40 @@ class TradeLogger:
             ),
         )
 
-    # UPSERT column policy. Three groups:
+    # UPSERT column policy. Four groups (refined PR #60 round 3
+    # fix F finding):
     #
     #  - Immutable (handled directly in the loop below): order_id,
     #    position_type. Identity columns; never reassigned.
     #
     #  - PRESERVE-FIRST-NON-NULL via COALESCE(trades.<col>,
-    #    excluded.<col>) — provenance / audit / set-once columns.
-    #    A sparse later record (cycle reconciliation, restart
-    #    reconstruction) must NOT erase a populated value with NULL.
+    #    excluded.<col>) — provenance / audit / set-once columns
+    #    (``_UPSERT_COALESCE_COLUMNS``). A sparse later record
+    #    (cycle reconciliation, restart reconstruction) must NOT
+    #    erase a populated value with NULL. First write wins; later
+    #    NULLs are absorbed.
     #
-    #  - Default: excluded.<col> — cumulative state columns where the
-    #    newest observation is authoritative (fill qty / avg price /
-    #    status / realized P&L / r-multiple).
+    #  - LATEST-NON-NULL via COALESCE(excluded.<col>, trades.<col>)
+    #    — computed accounting that legitimately updates over the
+    #    lifetime of an order (realized_pnl / r_multiple /
+    #    realized_slippage_bps / slippage_signed_bps /
+    #    slippage_adverse_bps). The newest non-null observation
+    #    wins; an incoming NULL is absorbed rather than clobbering
+    #    a populated value. This is the round-3 reviewer's correct
+    #    distinction from the PRESERVE bucket — these columns DO
+    #    advance, but only on real observations.
+    #
+    #  - Default: excluded.<col> — broker-cumulative state where
+    #    the newest observation is always authoritative even if
+    #    it's NULL (filled_qty / avg_fill_price / status).
     #
     # The PRESERVE group expanded in PR #60 round 2 (review finding 6)
     # to cover all entry-side risk anchors and the modeled-slippage
     # benchmark, which the prior reviewer correctly noted could be
-    # silently zeroed by a downstream sparse write.
+    # silently zeroed by a downstream sparse write. Round 3 reviewer
+    # split off the LATEST-NON-NULL bucket for accounting fields
+    # that were still being silently zeroed under the generic
+    # excluded.<col> policy.
     _UPSERT_COALESCE_COLUMNS = frozenset({
         # Slippage unification provenance (Phase 1 taxonomy).
         "slippage_benchmark_price",
@@ -962,6 +978,20 @@ class TradeLogger:
     # and raises ``TradeLoggerIdentityConflict``.
     _UPSERT_IDENTITY_CONFLICT_COLUMNS = frozenset({"position_uid"})
 
+    # Latest-non-null bucket (PR #60 round 3 fix). These are computed
+    # accounting fields that legitimately update across multiple
+    # log() calls (e.g., realized_pnl recomputed as a partial fill
+    # advances) but where an incoming NULL means "I don't have this
+    # observation right now" rather than "I am explicitly nulling
+    # the value". SQL: ``COALESCE(excluded.<col>, trades.<col>)``.
+    _UPSERT_LATEST_NON_NULL_COLUMNS = frozenset({
+        "realized_pnl",
+        "r_multiple",
+        "realized_slippage_bps",
+        "slippage_signed_bps",
+        "slippage_adverse_bps",
+    })
+
     def log(self, record: TradeRecord) -> None:
         """Write one trade record. Single-leg rows UPSERT on order_id
         (foundation §6.5 — cumulative state per order). Spread legs
@@ -973,7 +1003,7 @@ class TradeLogger:
         foundation event path produce identical end-state on the
         same order_id.
 
-        UPSERT column policy (refined in PR #60 round 2 fix F):
+        UPSERT column policy (refined in PR #60 round 3):
 
           - Immutable identity (order_id, position_type): never
             reassigned.
@@ -981,17 +1011,22 @@ class TradeLogger:
             provenance + audit + entry-side risk anchors + per-fill
             timestamps. ``COALESCE(trades.<col>, excluded.<col>)`` —
             a sparse later record cannot zero out a populated value.
-            See the constant for the full list and the rationale.
+          - LATEST-NON-NULL (``_UPSERT_LATEST_NON_NULL_COLUMNS``):
+            computed accounting that legitimately updates over the
+            order's lifetime (realized_pnl, r_multiple, realized
+            slippage / signed / adverse bps). ``COALESCE(excluded.
+            <col>, trades.<col>)`` — incoming value wins if
+            present; incoming NULL is absorbed so a sparse later
+            record can't zero the column.
           - Identity conflict (``_UPSERT_IDENTITY_CONFLICT_COLUMNS``,
             currently just ``position_uid``): a value→different-value
             transition is a foundation invariant violation and
             raises ``TradeLoggerIdentityConflict`` BEFORE the write.
             NULL→value transitions are allowed for restart
             reconstruction.
-          - Default (cumulative state): ``excluded.<col>`` —
-            filled_qty, avg_fill_price, status, realized_pnl,
-            r_multiple, realized_slippage_bps, etc. Newest observation
-            wins.
+          - Default (broker cumulative state): ``excluded.<col>`` —
+            filled_qty, avg_fill_price, status. Newest observation
+            wins even if NULL.
         """
         conn = self._ensure_db()
         d = record.as_dict()
@@ -1041,12 +1076,21 @@ class TradeLogger:
                     col in self._UPSERT_COALESCE_COLUMNS
                     or col in self._UPSERT_IDENTITY_CONFLICT_COLUMNS
                 ):
-                    # Same SQL shape: keep the existing non-null value
-                    # if present. The Python-side check above is what
-                    # makes the IDENTITY conflict refuse rather than
-                    # silently preserve.
+                    # PRESERVE-FIRST-NON-NULL: keep the existing
+                    # non-null value if present. The Python-side
+                    # check above is what makes the IDENTITY conflict
+                    # refuse rather than silently preserve.
                     update_clauses.append(
                         f"{col} = COALESCE(trades.{col}, excluded.{col})"
+                    )
+                elif col in self._UPSERT_LATEST_NON_NULL_COLUMNS:
+                    # LATEST-NON-NULL: a populated incoming value
+                    # advances the column; an incoming NULL is
+                    # absorbed rather than clobbering the existing
+                    # non-null. Computed accounting that updates
+                    # across the order's lifetime.
+                    update_clauses.append(
+                        f"{col} = COALESCE(excluded.{col}, trades.{col})"
                     )
                 else:
                     update_clauses.append(f"{col} = excluded.{col}")
