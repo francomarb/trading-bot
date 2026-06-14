@@ -68,28 +68,36 @@ def _cluster_fingerprint(rows: list[dict[str, Any]]) -> str:
     """Stable hash of the rows in a cluster, used by --apply to
     detect mutation between --review and --apply.
 
-    PR #60 round 3 fix (P1 dedupe sub-point): the fingerprint must
-    include every field the operator could have used to decide
-    keep vs delete. Round 2's set covered status / qty / price /
-    timestamp / position_uid; round 3 adds symbol / side / strategy /
-    position_type and the accounting columns (net_realized_pnl,
-    realized_pnl, realized_slippage_bps, slippage_signed_*,
-    reason). A mutation in any of these between --review and --apply
-    invalidates the operator's decision.
+    PR #60 round 5 fix (P0 + P1 schema-driven): the fingerprint
+    derives its column set from each row's keys MINUS the
+    discardable noise allowlists. Round 4's hand-curated list was
+    incomplete; this approach automatically picks up every column
+    fetched by _scan / _refetch_*.
 
-    Order independent (sorted by row identity) so cosmetic reordering
-    doesn't trip the check."""
+    Order independent (sorted by row identity) so cosmetic
+    reordering doesn't trip the check."""
     import hashlib
 
-    fingerprint_columns = (
-        "status", "position_type", "qty", "avg_fill_price",
-        "timestamp", "opened_at", "position_uid",
-        "symbol", "side", "strategy",
-        "net_realized_pnl",
-        "realized_pnl", "realized_slippage_bps",
-        "slippage_signed_bps", "slippage_adverse_bps",
-        "reason",
+    discardable: set[str] = (
+        _OWNER_KEY_DISCARDABLE_COLUMNS
+        | _TRADES_DISCARDABLE_COLUMNS
     )
+    # Identity columns are excluded from the per-row payload (they
+    # appear in the leading "identity" tuple element); cosmetic
+    # aliases like opened_at are skipped to avoid double-counting
+    # whichever native column already carried the value.
+    identity_or_alias = {"id", "position_uid", "opened_at"}
+
+    # Take every column present on any row; missing columns appear
+    # as None for rows that lack them.
+    all_columns: set[str] = set()
+    for r in rows:
+        all_columns.update(r.keys())
+    fingerprint_columns = sorted(
+        c for c in all_columns
+        if c not in discardable and c not in identity_or_alias
+    )
+
     keyed: list[tuple] = []
     for r in rows:
         identity = r.get("id") or r.get("position_uid") or ""
@@ -117,34 +125,19 @@ def _scan(conn: sqlite3.Connection) -> dict[str, Any]:
     timestamp_col = "opened_at" if "opened_at" in pl_cols else "created_at"
 
     # PR #60 round 3 fix (P1 dedupe): which optional accounting columns
-    # exist on this particular DB. Older schemas may lack some.
-    pl_optional_cols = [
-        c for c in ("net_realized_pnl", "position_type")
-        if c in pl_cols
+    # PR #60 round 5 fix (P0 + P1 schema-driven): fetch the full
+    # column set so the conflict check + fingerprint + detect output
+    # see every field. SELECT * naturally picks up future schema
+    # additions without script changes.
+    pl_all_cols = [
+        col[1] for col in conn.execute(
+            "PRAGMA table_info(position_lifecycle)"
+        ).fetchall()
     ]
-    trades_cols = {
-        col[1] for col in conn.execute("PRAGMA table_info(trades)").fetchall()
-    }
-    # PR #60 round 4 fix (P1 expanded coverage): every column the
-    # conflict check might inspect must be in the report, otherwise
-    # _delete_has_data_keeper_lacks gets None for both sides and
-    # silently passes.
-    trades_optional_cols = [
-        c for c in (
-            "order_type", "requested_qty", "filled_qty",
-            "realized_pnl", "r_multiple",
-            "realized_slippage_bps",
-            "slippage_signed_bps", "slippage_adverse_bps",
-            "modeled_slippage_bps",
-            "slippage_benchmark_price", "slippage_benchmark_kind",
-            "slippage_benchmark_timestamp",
-            "slippage_measurement_quality",
-            "initial_stop_loss", "initial_risk_per_share",
-            "initial_risk_dollars",
-            "entry_timestamp", "exit_timestamp",
-            "stop_trigger_price", "reason",
-        )
-        if c in trades_cols
+    trades_all_cols = [
+        col[1] for col in conn.execute(
+            "PRAGMA table_info(trades)"
+        ).fetchall()
     ]
 
     owner_key_report = []
@@ -157,11 +150,8 @@ def _scan(conn: sqlite3.Connection) -> dict[str, Any]:
         if not dup.position_uids:
             continue
         placeholders = ", ".join("?" for _ in dup.position_uids)
-        select_cols = [
-            "position_uid", "status", "strategy", timestamp_col, "symbol",
-        ] + pl_optional_cols
         rows = conn.execute(
-            f"SELECT {', '.join(select_cols)} "
+            f"SELECT {', '.join(pl_all_cols)} "
             "FROM position_lifecycle "
             f"WHERE position_uid IN ({placeholders}) "
             f"ORDER BY {timestamp_col}",
@@ -170,14 +160,13 @@ def _scan(conn: sqlite3.Connection) -> dict[str, Any]:
         out_rows = []
         for r in rows:
             row_dict: dict[str, Any] = {
-                "position_uid": r[0],
-                "status": r[1],
-                "strategy": r[2],
-                "opened_at": r[3],
-                "symbol": r[4],
+                col: val for col, val in zip(pl_all_cols, r)
             }
-            for offset, col in enumerate(pl_optional_cols, start=5):
-                row_dict[col] = r[offset]
+            # 'opened_at' is the operator-friendly alias for whichever
+            # timestamp column the schema actually uses. Keep both so
+            # report consumers don't have to schema-probe.
+            if "opened_at" not in row_dict and timestamp_col in row_dict:
+                row_dict["opened_at"] = row_dict[timestamp_col]
             out_rows.append(row_dict)
         owner_key_report.append({
             "owner_key": dup.owner_key,
@@ -194,33 +183,17 @@ def _scan(conn: sqlite3.Connection) -> dict[str, Any]:
         if not dup.trade_ids:
             continue
         placeholders = ", ".join("?" for _ in dup.trade_ids)
-        select_cols = [
-            "id", "timestamp", "symbol", "side", "qty", "avg_fill_price",
-            "status", "position_type", "position_uid",
-        ] + trades_optional_cols
         rows = conn.execute(
-            f"SELECT {', '.join(select_cols)} "
+            f"SELECT {', '.join(trades_all_cols)} "
             "FROM trades "
             f"WHERE id IN ({placeholders}) "
             "ORDER BY timestamp",
             dup.trade_ids,
         ).fetchall()
-        out_rows = []
-        for r in rows:
-            row_dict = {
-                "id": r[0],
-                "timestamp": r[1],
-                "symbol": r[2],
-                "side": r[3],
-                "qty": r[4],
-                "avg_fill_price": r[5],
-                "status": r[6],
-                "position_type": r[7],
-                "position_uid": r[8],
-            }
-            for offset, col in enumerate(trades_optional_cols, start=9):
-                row_dict[col] = r[offset]
-            out_rows.append(row_dict)
+        out_rows = [
+            {col: val for col, val in zip(trades_all_cols, r)}
+            for r in rows
+        ]
         trades_report.append({
             "order_id": dup.order_id,
             "count": dup.count,
@@ -370,46 +343,70 @@ class _ApplyAborted(Exception):
     """Internal signal that the apply transaction must roll back."""
 
 
-# PR #60 round 4 fix (P1 dedupe — expanded coverage + asymmetric):
-# Every operator-decision-relevant column. Round 3's set covered
-# accounting headlines; round 4 reviewer noted it missed broker-
-# cumulative state (filled_qty, avg_fill_price), entry/exit
-# timestamps, modeled-slippage provenance, benchmark provenance,
-# risk anchors, and stop-trigger price. A "partial earliest"
-# keeper could therefore silently discard a more complete later
-# delete row.
-_OWNER_KEY_CONFLICT_COLUMNS = (
-    "strategy",
-    "symbol",
-    "position_type",
-    "net_realized_pnl",
-)
-_TRADES_CONFLICT_COLUMNS = (
-    # Identity / intent
-    "symbol", "side", "position_type", "position_uid",
-    "order_type", "requested_qty",
-    # Broker cumulative state — a later observation may legitimately
-    # advance these, but a sparser keeper losing them is data loss
-    # the operator must approve explicitly.
-    "filled_qty", "avg_fill_price", "status",
-    # Computed accounting
-    "realized_pnl", "r_multiple",
-    "realized_slippage_bps",
-    "slippage_signed_bps", "slippage_adverse_bps",
-    # Modeled slippage + benchmark provenance
-    "modeled_slippage_bps",
-    "slippage_benchmark_price", "slippage_benchmark_kind",
-    "slippage_benchmark_timestamp",
-    "slippage_measurement_quality",
-    # Risk anchors set at entry
-    "initial_stop_loss", "initial_risk_per_share",
-    "initial_risk_dollars",
-    # Lifecycle timestamps
-    "entry_timestamp", "exit_timestamp",
-    "stop_trigger_price",
-    # Operator-readable rationale
-    "reason",
-)
+# PR #60 round 5 fix (P0 + P1 dedupe — schema-driven coverage):
+#
+# Round 4 maintained explicit allowlists of "conflict-relevant"
+# columns. Round 5 reviewer demonstrated that ANY column missing
+# from those lists could carry data the operator wanted to keep
+# but the script silently discarded (P0: lifecycle missing
+# current_qty / avg_entry_price / entry_order_id; P1: trades
+# missing qty / stop_price / entry_reference_price / execution_id).
+#
+# The fix: invert the policy. Compare ALL columns by default, with
+# a tight DISCARDABLE allowlist of columns that are intrinsically
+# row-local noise (autoincrement keys, the timestamp the row was
+# WRITTEN). Any new column added to either schema in the future is
+# automatically conflict-checked without requiring a script update.
+#
+# Discardable columns:
+#   position_lifecycle:
+#     schema_version — always equals LIFECYCLE_SCHEMA_VERSION; not
+#       fact about the position, just a schema marker.
+#     position_uid   — the row's primary key (each row in a cluster
+#                       has a DIFFERENT value by definition; that's
+#                       the partition basis, not a conflict).
+#     owner_key      — the cluster key; every row in a given cluster
+#                       has the SAME value (also not a conflict).
+#   trades:
+#     id        — autoincrement PK; we DELETE by this so cross-row
+#                 comparison is meaningless.
+#     order_id  — the cluster key; same on every row in a cluster.
+#     timestamp — wall-clock time the trades row was written, NOT
+#                 fact about the order. Two duplicate writes for
+#                 the same order_id legitimately differ here.
+#
+# Everything else is a property of the position or the order and
+# must therefore be conflict-checked.
+_OWNER_KEY_DISCARDABLE_COLUMNS = frozenset({
+    "schema_version", "position_uid", "owner_key",
+    # When this lifecycle row was inserted. Same character as
+    # trades.timestamp — per-row write metadata, not a property of
+    # the position itself that's lost when the row goes away. The
+    # operator uses these in --review to pick the keeper.
+    # (Fill timestamps `first_fill_at` / `last_fill_at` are NOT in
+    # this set; they ARE facts about the position and must be
+    # conflict-checked per the round-5 reviewer note.)
+    "opened_at", "created_at",
+})
+_TRADES_DISCARDABLE_COLUMNS = frozenset({
+    "id", "order_id", "timestamp",
+})
+
+
+def _conflict_columns_for(
+    conn: sqlite3.Connection,
+    table: str,
+    discardable: frozenset[str],
+) -> tuple[str, ...]:
+    """Return every column on ``table`` minus the discardable noise
+    allowlist. Schema-driven so a new column added to either table
+    is automatically conflict-checked."""
+    cols = [
+        col[1] for col in conn.execute(
+            f"PRAGMA table_info({table})"
+        ).fetchall()
+    ]
+    return tuple(c for c in cols if c not in discardable)
 
 
 def _delete_has_data_keeper_lacks(
@@ -440,6 +437,7 @@ def _reject_owner_cluster_on_accounting_conflict(
     cluster: dict[str, Any],
     current_rows: list[dict[str, Any]],
     keep_uid: str | None,
+    conflict_columns: tuple[str, ...],
 ) -> None:
     by_uid = {r["position_uid"]: r for r in current_rows}
     keep_row = by_uid.get(keep_uid) if keep_uid is not None else None
@@ -449,7 +447,7 @@ def _reject_owner_cluster_on_accounting_conflict(
         delete_row = by_uid.get(uid)
         if delete_row is None:
             continue
-        for col in _OWNER_KEY_CONFLICT_COLUMNS:
+        for col in conflict_columns:
             if _delete_has_data_keeper_lacks(
                 keep_row.get(col), delete_row.get(col),
             ):
@@ -468,6 +466,7 @@ def _reject_trades_cluster_on_accounting_conflict(
     cluster: dict[str, Any],
     current_rows: list[dict[str, Any]],
     keep_id: int | None,
+    conflict_columns: tuple[str, ...],
 ) -> None:
     by_id = {r["id"]: r for r in current_rows}
     keep_row = by_id.get(keep_id) if keep_id is not None else None
@@ -477,7 +476,7 @@ def _reject_trades_cluster_on_accounting_conflict(
         delete_row = by_id.get(tid)
         if delete_row is None:
             continue
-        for col in _TRADES_CONFLICT_COLUMNS:
+        for col in conflict_columns:
             if _delete_has_data_keeper_lacks(
                 keep_row.get(col), delete_row.get(col),
             ):
@@ -496,24 +495,24 @@ def _refetch_owner_cluster(
     cluster: dict[str, Any],
     timestamp_col: str,
 ) -> list[dict[str, Any]]:
-    """Refetch a cluster's current state, mirroring _scan's column
-    set so the fingerprint computed in --apply uses the same columns
-    as --review's fingerprint."""
+    """Refetch a cluster's current state with every column from
+    position_lifecycle so the fingerprint and conflict check in
+    --apply see the same shape as --review.
+
+    Round 5 schema-driven: SELECT * effectively, via PRAGMA. Any
+    future schema column is automatically covered.
+    """
     uids = [r["position_uid"] for r in cluster["rows"]]
     if not uids:
         return []
-    pl_cols = {
+    all_cols = [
         col[1] for col in conn.execute(
             "PRAGMA table_info(position_lifecycle)"
         ).fetchall()
-    }
-    optional = [c for c in ("net_realized_pnl", "position_type") if c in pl_cols]
-    select_cols = [
-        "position_uid", "status", "strategy", timestamp_col, "symbol",
-    ] + optional
+    ]
     placeholders = ", ".join("?" for _ in uids)
     rows = conn.execute(
-        f"SELECT {', '.join(select_cols)} "
+        f"SELECT {', '.join(all_cols)} "
         "FROM position_lifecycle "
         f"WHERE position_uid IN ({placeholders}) "
         f"ORDER BY {timestamp_col}",
@@ -521,15 +520,9 @@ def _refetch_owner_cluster(
     ).fetchall()
     out: list[dict[str, Any]] = []
     for r in rows:
-        row_dict = {
-            "position_uid": r[0],
-            "status": r[1],
-            "strategy": r[2],
-            "opened_at": r[3],
-            "symbol": r[4],
-        }
-        for offset, col in enumerate(optional, start=5):
-            row_dict[col] = r[offset]
+        row_dict = {col: val for col, val in zip(all_cols, r)}
+        if "opened_at" not in row_dict and timestamp_col in row_dict:
+            row_dict["opened_at"] = row_dict[timestamp_col]
         out.append(row_dict)
     return out
 
@@ -537,60 +530,27 @@ def _refetch_owner_cluster(
 def _refetch_trades_cluster(
     conn: sqlite3.Connection, cluster: dict[str, Any],
 ) -> list[dict[str, Any]]:
+    """Round 5 schema-driven: fetch every column from trades."""
     ids = [r["id"] for r in cluster["rows"]]
     if not ids:
         return []
-    trades_cols = {
+    all_cols = [
         col[1] for col in conn.execute(
             "PRAGMA table_info(trades)"
         ).fetchall()
-    }
-    optional = [
-        c for c in (
-            "order_type", "requested_qty", "filled_qty",
-            "realized_pnl", "r_multiple",
-            "realized_slippage_bps",
-            "slippage_signed_bps", "slippage_adverse_bps",
-            "modeled_slippage_bps",
-            "slippage_benchmark_price", "slippage_benchmark_kind",
-            "slippage_benchmark_timestamp",
-            "slippage_measurement_quality",
-            "initial_stop_loss", "initial_risk_per_share",
-            "initial_risk_dollars",
-            "entry_timestamp", "exit_timestamp",
-            "stop_trigger_price", "reason",
-        )
-        if c in trades_cols
     ]
-    select_cols = [
-        "id", "timestamp", "symbol", "side", "qty", "avg_fill_price",
-        "status", "position_type", "position_uid",
-    ] + optional
     placeholders = ", ".join("?" for _ in ids)
     rows = conn.execute(
-        f"SELECT {', '.join(select_cols)} "
+        f"SELECT {', '.join(all_cols)} "
         "FROM trades "
         f"WHERE id IN ({placeholders}) "
         "ORDER BY timestamp",
         ids,
     ).fetchall()
-    out: list[dict[str, Any]] = []
-    for r in rows:
-        row_dict = {
-            "id": r[0],
-            "timestamp": r[1],
-            "symbol": r[2],
-            "side": r[3],
-            "qty": r[4],
-            "avg_fill_price": r[5],
-            "status": r[6],
-            "position_type": r[7],
-            "position_uid": r[8],
-        }
-        for offset, col in enumerate(optional, start=9):
-            row_dict[col] = r[offset]
-        out.append(row_dict)
-    return out
+    return [
+        {col: val for col, val in zip(all_cols, r)}
+        for r in rows
+    ]
 
 
 def _apply(conn: sqlite3.Connection, in_path: Path) -> int:
@@ -652,6 +612,16 @@ def _apply(conn: sqlite3.Connection, in_path: Path) -> int:
         ).fetchall()
     }
     timestamp_col = "opened_at" if "opened_at" in pl_cols else "created_at"
+
+    # PR #60 round 5 fix: schema-driven conflict column lists. ANY
+    # non-noise column on either table must conflict-check; otherwise
+    # a future schema addition silently slips through the check.
+    owner_conflict_cols = _conflict_columns_for(
+        conn, "position_lifecycle", _OWNER_KEY_DISCARDABLE_COLUMNS,
+    )
+    trades_conflict_cols = _conflict_columns_for(
+        conn, "trades", _TRADES_DISCARDABLE_COLUMNS,
+    )
 
     deleted_owner = 0
     deleted_trades = 0
@@ -716,13 +686,13 @@ def _apply(conn: sqlite3.Connection, in_path: Path) -> int:
                     f"injected or omitted ids. Aborting."
                 )
 
-            # PR #60 round 3 fix (P1 dedupe): accounting-conflict
-            # rejection. If the kept row and any delete candidate
-            # disagree on a populated accounting field, the operator
-            # is asking for an implicit merge that the script does
-            # NOT support. Reject the cluster.
+            # PR #60 round 3/5 fix: accounting-conflict rejection.
+            # If the kept row lacks a value the delete row carries,
+            # silently deleting would lose data the operator must
+            # explicitly approve. Compares every non-discardable
+            # column (round 5 schema-driven).
             _reject_owner_cluster_on_accounting_conflict(
-                cluster, current_rows, keep_uid,
+                cluster, current_rows, keep_uid, owner_conflict_cols,
             )
 
             for uid in delete_uids:
@@ -789,9 +759,9 @@ def _apply(conn: sqlite3.Connection, in_path: Path) -> int:
                     f"injected or omitted ids. Aborting."
                 )
 
-            # Accounting-conflict rejection (P1 dedupe).
+            # Accounting-conflict rejection (round 5 schema-driven).
             _reject_trades_cluster_on_accounting_conflict(
-                cluster, current_rows, keep_id,
+                cluster, current_rows, keep_id, trades_conflict_cols,
             )
 
             for tid in delete_ids:

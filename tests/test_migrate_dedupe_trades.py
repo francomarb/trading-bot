@@ -1040,3 +1040,183 @@ class TestDetectOutputShowsAccountingEvidence:
         captured = capsys.readouterr()
         assert "net_realized_pnl" in captured.out
         assert "77.7" in captured.out
+
+
+# ── PR #60 round 5 fixes ────────────────────────────────────────────────────
+
+
+class TestSchemaDrivenLifecycleConflict:
+    """Round 5 P0: the lifecycle conflict check now scans every
+    column except the discardable noise allowlist. Reproduces the
+    exact destructive sequence the reviewer caught: pending keeper
+    with NULL fill state vs delete row carrying real fill data."""
+
+    def test_pending_keeper_with_null_state_vs_filled_delete_rejected(
+        self, tmp_path,
+    ):
+        """The reviewer's reproduction: earliest keeper is pending
+        with current_qty=0 and no order identity; the delete row is
+        open with current_qty=10, $101.25 avg basis, real broker
+        order id. Apply MUST reject — earlier rounds would have
+        silently retained the stale pending row."""
+        db = tmp_path / "trades.db"
+        _make_dirty_db(db)
+        conn = sqlite3.connect(db)
+        # Keeper (pos-A, earlier opened_at) is pending/empty.
+        conn.execute(
+            "UPDATE position_lifecycle SET "
+            "status='pending', current_qty=0, "
+            "avg_entry_price=NULL, entry_order_id=NULL, "
+            "entry_client_order_id=NULL "
+            "WHERE position_uid='pos-A'"
+        )
+        # Delete (pos-B) is the real position with fill state.
+        conn.execute(
+            "UPDATE position_lifecycle SET "
+            "status='open', current_qty=10, entry_qty=10, "
+            "avg_entry_price=101.25, "
+            "entry_order_id='alpaca-real-1', "
+            "entry_client_order_id='cli-real-1' "
+            "WHERE position_uid='pos-B'"
+        )
+        conn.commit()
+        conn.close()
+
+        out = tmp_path / "decisions.json"
+        migrate_dedupe_trades.main(["--db", str(db), "--review", str(out)])
+        code = migrate_dedupe_trades.main(
+            ["--db", str(db), "--apply", str(out)],
+        )
+        assert code == 2  # rejected
+        # Both rows survive (rollback).
+        rows = sqlite3.connect(db).execute(
+            "SELECT position_uid, status, current_qty FROM "
+            "position_lifecycle ORDER BY position_uid"
+        ).fetchall()
+        statuses = {r[0]: (r[1], r[2]) for r in rows}
+        assert statuses["pos-A"] == ("pending", 0)
+        assert statuses["pos-B"] == ("open", 10)
+
+    def test_current_qty_only_on_delete_rejected(self, tmp_path):
+        """Single-column smoke for the previously-uncovered field."""
+        db = tmp_path / "trades.db"
+        _make_dirty_db(db)
+        conn = sqlite3.connect(db)
+        conn.execute(
+            "UPDATE position_lifecycle SET current_qty=NULL "
+            "WHERE position_uid='pos-A'"
+        )
+        conn.execute(
+            "UPDATE position_lifecycle SET current_qty=5 "
+            "WHERE position_uid='pos-B'"
+        )
+        conn.commit()
+        conn.close()
+        out = tmp_path / "decisions.json"
+        migrate_dedupe_trades.main(["--db", str(db), "--review", str(out)])
+        code = migrate_dedupe_trades.main(
+            ["--db", str(db), "--apply", str(out)],
+        )
+        assert code == 2
+
+    def test_entry_order_id_only_on_delete_rejected(self, tmp_path):
+        """The 'broker/client order IDs' from the reviewer's list."""
+        db = tmp_path / "trades.db"
+        _make_dirty_db(db)
+        conn = sqlite3.connect(db)
+        conn.execute(
+            "UPDATE position_lifecycle SET entry_order_id=NULL "
+            "WHERE position_uid='pos-A'"
+        )
+        conn.execute(
+            "UPDATE position_lifecycle SET entry_order_id='alpaca-9' "
+            "WHERE position_uid='pos-B'"
+        )
+        conn.commit()
+        conn.close()
+        out = tmp_path / "decisions.json"
+        migrate_dedupe_trades.main(["--db", str(db), "--review", str(out)])
+        code = migrate_dedupe_trades.main(
+            ["--db", str(db), "--apply", str(out)],
+        )
+        assert code == 2
+
+    def test_first_fill_at_only_on_delete_rejected(self, tmp_path):
+        """fill timestamps from the reviewer's list."""
+        db = tmp_path / "trades.db"
+        _make_dirty_db(db)
+        conn = sqlite3.connect(db)
+        conn.execute(
+            "UPDATE position_lifecycle SET first_fill_at=NULL "
+            "WHERE position_uid='pos-A'"
+        )
+        conn.execute(
+            "UPDATE position_lifecycle SET "
+            "first_fill_at='2026-05-02T11:00:00+00:00' "
+            "WHERE position_uid='pos-B'"
+        )
+        conn.commit()
+        conn.close()
+        out = tmp_path / "decisions.json"
+        migrate_dedupe_trades.main(["--db", str(db), "--review", str(out)])
+        code = migrate_dedupe_trades.main(
+            ["--db", str(db), "--apply", str(out)],
+        )
+        assert code == 2
+
+
+class TestSchemaDrivenTradesConflict:
+    """Round 5 P1: trades conflict now scans every non-discardable
+    column. Picks up columns the round-4 hand-curated list was
+    missing — qty, stop_price, entry_reference_price, execution_id."""
+
+    def test_qty_only_on_delete_rejected(self, tmp_path):
+        db = tmp_path / "trades.db"
+        _make_dirty_db(db)
+        conn = sqlite3.connect(db)
+        conn.execute("UPDATE trades SET qty=NULL WHERE id=1")
+        conn.execute("UPDATE trades SET qty=10 WHERE id=2")
+        conn.commit()
+        conn.close()
+        out = tmp_path / "decisions.json"
+        migrate_dedupe_trades.main(["--db", str(db), "--review", str(out)])
+        code = migrate_dedupe_trades.main(
+            ["--db", str(db), "--apply", str(out)],
+        )
+        assert code == 2
+
+    def test_stop_price_only_on_delete_rejected(self, tmp_path):
+        db = tmp_path / "trades.db"
+        _make_dirty_db(db)
+        conn = sqlite3.connect(db)
+        conn.execute("UPDATE trades SET stop_price=NULL WHERE id=1")
+        conn.execute("UPDATE trades SET stop_price=95.0 WHERE id=2")
+        conn.commit()
+        conn.close()
+        out = tmp_path / "decisions.json"
+        migrate_dedupe_trades.main(["--db", str(db), "--review", str(out)])
+        code = migrate_dedupe_trades.main(
+            ["--db", str(db), "--apply", str(out)],
+        )
+        assert code == 2
+
+    def test_execution_id_only_on_delete_rejected(self, tmp_path):
+        """execution_id wasn't in round 4's list. Round 5 catches it."""
+        db = tmp_path / "trades.db"
+        _make_dirty_db(db)
+        conn = sqlite3.connect(db)
+        # Add the column if it's missing.
+        try:
+            conn.execute("ALTER TABLE trades ADD COLUMN execution_id TEXT")
+        except sqlite3.OperationalError:
+            pass
+        conn.execute("UPDATE trades SET execution_id=NULL WHERE id=1")
+        conn.execute("UPDATE trades SET execution_id='exec-77' WHERE id=2")
+        conn.commit()
+        conn.close()
+        out = tmp_path / "decisions.json"
+        migrate_dedupe_trades.main(["--db", str(db), "--review", str(out)])
+        code = migrate_dedupe_trades.main(
+            ["--db", str(db), "--apply", str(out)],
+        )
+        assert code == 2
