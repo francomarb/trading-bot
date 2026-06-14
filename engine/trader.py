@@ -2060,6 +2060,108 @@ class TradingEngine:
                 f"bound. Next restart will recover from trades DB."
             )
 
+    def _maybe_dispatch_substrate_exit_fill(
+        self,
+        *,
+        event: "Any",
+        snapshot: "BrokerSnapshot | None",
+    ) -> None:
+        """P-7 commit A: fire the engine-side recovery side effects
+        when the substrate observes an exit-role fill that the
+        synchronous close path didn't already handle.
+
+        Mirrors _maybe_dispatch_substrate_entry_fill but for the
+        close path: when an exit row reaches filled, write the
+        trade row via _record_recovered_exit_fill (idempotent via
+        has_recorded_order_id) and clear engine ownership state
+        (_pop_position, _entry_prices, _external_close_suspects).
+
+        De-dup guards (in order):
+          1. event.status == 'filled'
+          2. event.filled_qty > 0
+          3. event.avg_fill_price is not None
+          4. substrate row exists with role='exit'
+          5. position_lifecycle row exists for the position_uid
+
+        Idempotent: _record_recovered_exit_fill checks
+        has_recorded_order_id and returns False if the order_id
+        is already in the trade log. The cleanup pops are
+        idempotent by nature (dict.pop with default). Safe to
+        fire multiple times across stream / cycle / startup
+        observations of the same fill.
+
+        Best-effort: any failure logs CRITICAL and absorbs. The
+        substrate already recorded the fill at the substrate
+        level; the engine-side cleanup not happening means the
+        position stays "owned" in the engine's view until the
+        next restart, when _restore_ownership_from_db picks up
+        the truth from the trade log (which the substrate
+        UPSERT also wrote).
+        """
+        if event.status != "filled":
+            return
+        if float(event.filled_qty or 0.0) <= 0:
+            return
+        if event.avg_fill_price is None:
+            return
+        if self.lifecycle_orders_store is None or self.lifecycle_store is None:
+            return
+        try:
+            order_row = self.lifecycle_orders_store.get_by_order_id(
+                event.order_id,
+            )
+            if order_row is None or order_row.role != "exit":
+                return
+            pos_row = self.lifecycle_store.get_by_position_uid(
+                order_row.position_uid,
+            )
+            if pos_row is None:
+                return
+            symbol = pos_row.symbol
+            owner = pos_row.strategy
+            # Build a synthetic exit_fill object matching the
+            # OrderResult shape _record_recovered_exit_fill expects.
+            exit_fill = OrderResult(
+                status=OrderStatus.FILLED,
+                order_id=event.order_id,
+                symbol=symbol,
+                requested_qty=float(order_row.intended_qty),
+                filled_qty=float(event.filled_qty),
+                avg_fill_price=float(event.avg_fill_price),
+                raw_status="filled",
+                message="substrate exit-fill dispatch",
+            )
+            wrote = self._record_recovered_exit_fill(
+                symbol=symbol,
+                owner=owner,
+                exit_fill=exit_fill,
+                modeled_price=float(
+                    order_row.slippage_benchmark_price or 0.0
+                ),
+                benchmark_kind=(
+                    order_row.slippage_benchmark_kind or "unavailable"
+                ),
+                alert_reason="substrate exit dispatch",
+            )
+            if wrote:
+                self._pop_position(symbol)
+                self._entry_prices.pop(symbol, None)
+                self._external_close_suspects.pop(symbol, None)
+                logger.warning(
+                    f"substrate exit-fill dispatch: cleared "
+                    f"ownership for {symbol} ({owner}) via "
+                    f"order_id={event.order_id}"
+                )
+        except Exception as exc:
+            logger.critical(
+                f"substrate exit-fill dispatch FAILED for "
+                f"order_id={event.order_id}: "
+                f"{type(exc).__name__}: {exc}. Substrate row "
+                f"already recorded the fill; engine state not "
+                f"updated. Next restart will recover from trades "
+                f"DB."
+            )
+
     def _ensure_recovered_protective_stop(
         self,
         *,
@@ -4549,6 +4651,9 @@ class TradingEngine:
                 self._maybe_dispatch_substrate_entry_fill(
                     event=event, snapshot=snapshot,
                 )
+                self._maybe_dispatch_substrate_exit_fill(
+                    event=event, snapshot=snapshot,
+                )
             elif outcome.reason in {"unknown_order", "stale_or_duplicate"}:
                 logger.debug(
                     f"substrate skipped event for order_id="
@@ -4690,6 +4795,9 @@ class TradingEngine:
                     f"(position {outcome.new_status})"
                 )
                 self._maybe_dispatch_substrate_entry_fill(
+                    event=event, snapshot=snapshot,
+                )
+                self._maybe_dispatch_substrate_exit_fill(
                     event=event, snapshot=snapshot,
                 )
             else:

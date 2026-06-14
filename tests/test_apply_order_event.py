@@ -2022,3 +2022,62 @@ class TestSubstrateEntryFillDispatchSemantics:
         # would skip this — verified by query.
         row = orders_store.get_by_order_id(order_id)
         assert row.role == "protective_stop"  # would not dispatch
+
+
+# ── P-7 commit A: substrate exit-fill dispatch ──────────────────────────────
+
+
+class TestSubstrateExitFillDispatchSemantics:
+    """Exit-side counterpart to TestSubstrateEntryFillDispatchSemantics.
+    The dispatch fires _record_recovered_exit_fill (idempotent via
+    has_recorded_order_id) and clears engine ownership state when
+    the substrate observes an exit-role row reaching filled."""
+
+    def test_dispatch_role_filter_exit_only(
+        self, conn, pos_store, orders_store,
+    ):
+        """Only role='exit' rows trigger exit dispatch. entry_primary
+        / protective_stop / replacement_stop fills go through their
+        own dispatches (or no dispatch at all)."""
+        from engine.lifecycle_orders import apply_order_event
+        uid = _seed_position(pos_store)
+        _insert_protective_stop(
+            orders_store, uid, client_order_id="cli-not-exit",
+        )
+        order_id = _attach_and_get_order_id(
+            orders_store, "cli-not-exit", order_id="alpaca-stop-x",
+        )
+        outcome = apply_order_event(
+            conn,
+            OrderEvent(
+                order_id=order_id, status="filled",
+                filled_qty=10.0, avg_fill_price=95.0,
+                broker_updated_at="2026-06-15T10:00:00+00:00",
+            ),
+        )
+        assert outcome.applied is True
+        # Dispatch's role filter would skip — role is protective_stop.
+        row = orders_store.get_by_order_id(order_id)
+        assert row.role == "protective_stop"  # would not trigger exit dispatch
+
+    def test_exit_row_filled_event_recognized(
+        self, conn, pos_store, orders_store,
+    ):
+        """Positive shape check: an exit row transitioning to filled
+        is the substrate trigger the dispatch acts on."""
+        from engine.lifecycle_orders import apply_order_event
+        uid = _seed_position(pos_store)
+        _insert_exit(orders_store, uid)
+        order_id = _attach_and_get_order_id(orders_store, "cli-exit")
+        outcome = apply_order_event(
+            conn,
+            OrderEvent(
+                order_id=order_id, status="filled",
+                filled_qty=10.0, avg_fill_price=99.5,
+                broker_updated_at="2026-06-15T10:00:00+00:00",
+            ),
+        )
+        assert outcome.applied is True
+        row = orders_store.get_by_order_id(order_id)
+        assert row.role == "exit"
+        assert row.status == "filled"
