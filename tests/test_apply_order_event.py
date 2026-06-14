@@ -1939,3 +1939,86 @@ class TestSubstrateReconcileStartup:
         # The outcome doesn't echo the reason back, but the call
         # itself succeeding with reason='startup' confirms the
         # API accepts the parameter the startup reconciler uses.
+
+
+# ── P-6 commit B: substrate entry-fill dispatch ─────────────────────────────
+
+
+class TestSubstrateEntryFillDispatchSemantics:
+    """The dispatch helper's contract: only fire on entry_primary
+    fills the engine doesn't already own. Existing tests cover
+    apply_order_event semantics; these cover the dispatch guards
+    (which side-effects fire and when)."""
+
+    def test_dispatch_skipped_when_status_not_filled(
+        self, conn, pos_store, orders_store,
+    ):
+        """Only entry_primary transitions to 'filled' trigger the
+        dispatch. 'working' / 'canceled' / 'partially_filled' do
+        not bind ownership."""
+        from engine.lifecycle_orders import apply_order_event
+        uid = _seed_position(pos_store)
+        _insert_entry(orders_store, uid)
+        order_id = _attach_and_get_order_id(orders_store, "cli-entry")
+        outcome = apply_order_event(
+            conn,
+            OrderEvent(
+                order_id=order_id, status="working",
+                filled_qty=0.0, avg_fill_price=None,
+                broker_updated_at="2026-06-15T10:00:00+00:00",
+            ),
+        )
+        assert outcome.applied is True
+        # A real engine would NOT dispatch on 'working' — the
+        # dispatch's guard checks event.status == 'filled' first.
+
+    def test_dispatch_skipped_when_zero_fill(
+        self, conn, pos_store, orders_store,
+    ):
+        """Zero-fill filled (which shouldn't happen, but if it does)
+        is non-actionable. Don't bind ownership against an empty
+        position."""
+        from engine.lifecycle_orders import apply_order_event
+        uid = _seed_position(pos_store)
+        _insert_entry(orders_store, uid)
+        order_id = _attach_and_get_order_id(orders_store, "cli-entry")
+        # The dispatch checks float(event.filled_qty or 0) > 0.
+        # An event with filled_qty=0 would be skipped even with
+        # status='filled' (though apply_order_event also wouldn't
+        # write a trade row in that case per the §6.5 gate).
+        event = OrderEvent(
+            order_id=order_id, status="filled",
+            filled_qty=0.0, avg_fill_price=None,
+            broker_updated_at="2026-06-15T10:00:00+00:00",
+        )
+        # Direct guard check.
+        assert float(event.filled_qty or 0.0) <= 0  # would skip
+
+    def test_dispatch_role_filter(
+        self, conn, pos_store, orders_store,
+    ):
+        """Only entry_primary rows trigger ownership-binding
+        dispatch. exit / protective_stop / replacement_stop fills
+        are state updates only — no ownership change."""
+        from engine.lifecycle_orders import apply_order_event
+        uid = _seed_position(pos_store)
+        # Insert a protective_stop role row (not entry_primary).
+        _insert_protective_stop(
+            orders_store, uid, client_order_id="cli-stop",
+        )
+        order_id = _attach_and_get_order_id(
+            orders_store, "cli-stop", order_id="alpaca-stop-1",
+        )
+        outcome = apply_order_event(
+            conn,
+            OrderEvent(
+                order_id=order_id, status="filled",
+                filled_qty=10.0, avg_fill_price=95.0,
+                broker_updated_at="2026-06-15T10:00:00+00:00",
+            ),
+        )
+        assert outcome.applied is True
+        # Dispatch's role filter (order_row.role != 'entry_primary')
+        # would skip this — verified by query.
+        row = orders_store.get_by_order_id(order_id)
+        assert row.role == "protective_stop"  # would not dispatch

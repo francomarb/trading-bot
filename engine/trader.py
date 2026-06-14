@@ -908,7 +908,7 @@ class TradingEngine:
             self._process_stream_stop_fills(snapshot)
             self._detect_external_closes(snapshot)
             self._drain_lifecycle_attaches()
-            self._drain_lifecycle_events()
+            self._drain_lifecycle_events(snapshot)
             self._reconcile_substrate_cycle(snapshot)
             self._drain_option_fills()
             self._drain_spread_fills()
@@ -2079,6 +2079,111 @@ class TradingEngine:
             price=fill_price,
             reason=f"{decision.reason} {reason_suffix}".strip(),
         )
+
+    def _maybe_dispatch_substrate_entry_fill(
+        self,
+        *,
+        event: "Any",
+        snapshot: "BrokerSnapshot | None",
+    ) -> None:
+        """P-6 commit B: fire the engine-side recovery side effects
+        when the substrate observes an entry_primary fill that the
+        synchronous place_order path didn't already handle.
+
+        Called from _drain_lifecycle_events (stream) and
+        _reconcile_substrate_via_rest (cycle / startup) after each
+        successful apply_order_event. De-dup guard: if
+        _has_position(symbol) is already true, the synchronous
+        path bound ownership at submit time and the side effects
+        already fired — skip.
+
+        Concretely this replaces the cache-driven path the legacy
+        _suspect_orders cache provides: on the rare submit-succeeds-
+        but-confirm-fails scenario, the cache used to hold the
+        decision metadata and fire the side effects on the next
+        cycle's broker reconciliation. The substrate now observes
+        the fill via stream / cycle / startup reconcile and this
+        dispatch fires the same side effects from the same
+        helper (_apply_recovered_entry_side_effects).
+
+        Best-effort: any failure is logged at CRITICAL and absorbed
+        so a bad dispatch can't stall the cycle. The substrate has
+        already recorded the fill; the engine just hasn't bound
+        ownership.
+        """
+        if event.status != "filled":
+            return
+        if float(event.filled_qty or 0.0) <= 0:
+            return
+        if event.avg_fill_price is None:
+            return
+        if self.lifecycle_orders_store is None or self.lifecycle_store is None:
+            return
+        try:
+            order_row = self.lifecycle_orders_store.get_by_order_id(
+                event.order_id,
+            )
+            if order_row is None or order_row.role != "entry_primary":
+                return
+            pos_row = self.lifecycle_store.get_by_position_uid(
+                order_row.position_uid,
+            )
+            if pos_row is None:
+                return
+            symbol = pos_row.symbol
+            if self._has_position(symbol):
+                # Synchronous path bound ownership; side effects
+                # already fired. Substrate is the parallel observer.
+                return
+            if snapshot is None:
+                logger.warning(
+                    f"substrate entry-fill dispatch: skipped for "
+                    f"order_id={event.order_id} symbol={symbol} — "
+                    f"no snapshot available (cycle drains may run "
+                    f"without one in some code paths)"
+                )
+                return
+            position = snapshot.account.open_positions.get(symbol)
+            if position is None:
+                logger.warning(
+                    f"substrate entry-fill dispatch: skipped for "
+                    f"order_id={event.order_id} symbol={symbol} — "
+                    f"broker reports no open position; nothing to "
+                    f"bind ownership against"
+                )
+                return
+            from risk.manager import RiskDecision, Side
+            decision = RiskDecision(
+                symbol=symbol,
+                side=Side.BUY,
+                qty=float(order_row.intended_qty),
+                entry_reference_price=float(event.avg_fill_price),
+                stop_price=float(order_row.intended_stop_price or 0.0),
+                strategy_name=pos_row.strategy,
+                reason="substrate dispatch",
+                order_type=OrderType(order_row.order_type),
+            )
+            self._apply_recovered_entry_side_effects(
+                snapshot=snapshot,
+                position=position,
+                decision=decision,
+                fill_price=float(event.avg_fill_price),
+                fill_qty=float(event.filled_qty),
+                reason_suffix="(substrate)",
+            )
+            logger.warning(
+                f"substrate entry-fill dispatch: bound ownership "
+                f"for {symbol} ({pos_row.strategy}) via order_id="
+                f"{event.order_id}"
+            )
+        except Exception as exc:
+            logger.critical(
+                f"substrate entry-fill dispatch FAILED for "
+                f"order_id={event.order_id}: "
+                f"{type(exc).__name__}: {exc}. Substrate row "
+                f"already recorded the fill; engine ownership not "
+                f"bound. Next restart will recover from trades DB."
+            )
 
     def _ensure_recovered_protective_stop(
         self,
@@ -4507,7 +4612,9 @@ class TradingEngine:
                     f"client_order_id lookup."
                 )
 
-    def _drain_lifecycle_events(self) -> None:
+    def _drain_lifecycle_events(
+        self, snapshot: "BrokerSnapshot | None" = None,
+    ) -> None:
         """P-1: apply OrderEvents enqueued by the WS thread.
 
         StreamManager translates each material Alpaca trade_update
@@ -4563,6 +4670,9 @@ class TradingEngine:
                     f"substrate advanced: order_id={event.order_id} "
                     f"→ status={event.status} "
                     f"(position {outcome.new_status})"
+                )
+                self._maybe_dispatch_substrate_entry_fill(
+                    event=event, snapshot=snapshot,
                 )
             elif outcome.reason in {"unknown_order", "stale_or_duplicate"}:
                 logger.debug(
@@ -4703,6 +4813,9 @@ class TradingEngine:
                     f"substrate {reason} reconcile: order_id={oid} "
                     f"advanced to status={event.status} "
                     f"(position {outcome.new_status})"
+                )
+                self._maybe_dispatch_substrate_entry_fill(
+                    event=event, snapshot=snapshot,
                 )
             else:
                 logger.debug(
