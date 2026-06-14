@@ -1977,6 +1977,21 @@ class TradingEngine:
         existing = self._protective_stop_order(symbol, snapshot)
         if existing is not None:
             if str(existing.time_in_force or "").lower() == "day":
+                # P-5: look up position_uid for the replacement_stop
+                # substrate row.
+                _promote_uid: str | None = None
+                if self.lifecycle_store is not None:
+                    try:
+                        _row = self.lifecycle_store.get_open_for_owner_key(
+                            owner_key_for(symbol),
+                        )
+                        if _row is not None:
+                            _promote_uid = _row.position_uid
+                    except Exception as exc:
+                        logger.debug(
+                            f"promote-stop position_uid lookup raised "
+                            f"{type(exc).__name__}: {exc} — proceeding"
+                        )
                 promoted = self.broker.promote_equity_stop_to_gtc(
                     parent_order_id=None,
                     stop_order_id=existing.order_id,
@@ -1985,6 +2000,7 @@ class TradingEngine:
                     client_order_id_prefix=(
                         f"{decision.strategy_name}-recover-stop-gtc"
                     ),
+                    position_uid=_promote_uid,
                 )
                 snapshot.open_orders.remove(existing)
                 snapshot.open_orders.append(promoted)
@@ -3647,6 +3663,21 @@ class TradingEngine:
                         )
                     continue
                 failure_key = (symbol, existing.order_id)
+                # P-5: look up position_uid for the replacement_stop
+                # substrate row.
+                _promote_uid: str | None = None
+                if self.lifecycle_store is not None:
+                    try:
+                        _row = self.lifecycle_store.get_open_for_owner_key(
+                            owner_key_for(symbol),
+                        )
+                        if _row is not None:
+                            _promote_uid = _row.position_uid
+                    except Exception as exc:
+                        logger.debug(
+                            f"repair-promote position_uid lookup raised "
+                            f"{type(exc).__name__}: {exc} — proceeding"
+                        )
                 try:
                     promoted = self.broker.promote_equity_stop_to_gtc(
                         parent_order_id=None,
@@ -3654,6 +3685,7 @@ class TradingEngine:
                         qty=stop_qty,
                         stop_price=float(existing.stop_price),
                         client_order_id_prefix=f"{owner}-repair-stop-gtc",
+                        position_uid=_promote_uid,
                     )
                     self._reported_stop_promotion_failures.discard(failure_key)
                     snapshot.open_orders.remove(existing)

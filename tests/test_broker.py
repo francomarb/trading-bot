@@ -2791,3 +2791,135 @@ class TestProtectiveStopSubstrate:
             position_uid="pos-X",
         )
         assert result is not None
+
+
+# ── P-5 (consumer wiring): replacement_stop substrate insert ───────────────
+
+
+class TestReplacementStopSubstrate:
+    """P-5: promote_equity_stop_to_gtc records a `replacement_stop`
+    substrate row with replaces_order_id pointing at the old OTO
+    child it superseded. apply_order_event uses that lineage to
+    resolve terminal events for either id."""
+
+    @staticmethod
+    def _broker(api: MagicMock, orders_store: MagicMock):
+        broker = AlpacaBroker(
+            client=api, max_attempts=1, base_delay=0.0,
+            lifecycle_orders_store=orders_store,
+            lifecycle_store=MagicMock(),
+        )
+        broker._lifecycle_store.create_pending = MagicMock(return_value="pos-P5")
+        return broker
+
+    @staticmethod
+    def _replacement_order(*, id: str, cli: str):
+        from types import SimpleNamespace
+        return SimpleNamespace(
+            id=id,
+            client_order_id=cli,
+            status="accepted",
+            symbol="AAPL",
+            qty="10",
+            side="sell",
+            type="stop",
+            stop_price="95.0",
+            time_in_force="gtc",
+            submitted_at="2026-06-15T14:30:00Z",
+            filled_at=None,
+            filled_qty="0",
+            filled_avg_price=None,
+            legs=None,
+        )
+
+    def test_promote_with_position_uid_records_replacement_stop(self):
+        api = MagicMock()
+        api.replace_order_by_id.return_value = self._replacement_order(
+            id="alpaca-replace-1", cli="cli-replace-1",
+        )
+        orders_store = MagicMock()
+        broker = self._broker(api, orders_store)
+
+        broker.promote_equity_stop_to_gtc(
+            parent_order_id=None,
+            stop_order_id="alpaca-oto-child-7",
+            qty=10,
+            stop_price=95.0,
+            position_uid="pos-A",
+        )
+
+        # insert_pending called with role='replacement_stop' and the
+        # lineage link populated.
+        stop_call = [
+            c for c in orders_store.insert_pending.call_args_list
+            if c.kwargs.get("role") == "replacement_stop"
+        ][0]
+        kwargs = stop_call.kwargs
+        assert kwargs["position_uid"] == "pos-A"
+        assert kwargs["side"] == "sell"
+        assert kwargs["order_type"] == "stop"
+        assert kwargs["order_class"] == "simple"
+        assert kwargs["intended_stop_price"] == 95.0
+        assert kwargs["intended_qty"] == 10.0
+        assert kwargs["parent_order_id"] is None
+        # The critical field: the new row knows which order it
+        # supersedes.
+        assert kwargs["replaces_order_id"] == "alpaca-oto-child-7"
+
+        # attach_broker_order_id called with the replacement's id.
+        attach_calls = [
+            c for c in orders_store.attach_broker_order_id.call_args_list
+            if c.kwargs.get("client_order_id", "").startswith("equity-stop-gtc-")
+            or c.kwargs.get("client_order_id") == "cli-replace-1"
+        ]
+        # Whichever client_order_id format the broker generated, the
+        # attach should have happened for the replacement.
+        assert any(
+            c.kwargs.get("order_id") == "alpaca-replace-1"
+            for c in attach_calls
+        )
+
+    def test_promote_without_position_uid_skips_substrate_write(self):
+        """Legacy callers without position_uid get the same broker
+        behavior; substrate write is just skipped."""
+        api = MagicMock()
+        api.replace_order_by_id.return_value = self._replacement_order(
+            id="alpaca-replace-2", cli="cli-replace-2",
+        )
+        orders_store = MagicMock()
+        broker = self._broker(api, orders_store)
+
+        broker.promote_equity_stop_to_gtc(
+            parent_order_id=None,
+            stop_order_id="alpaca-oto-child-8",
+            qty=10,
+            stop_price=95.0,
+        )
+
+        roles = [
+            c.kwargs.get("role")
+            for c in orders_store.insert_pending.call_args_list
+        ]
+        assert "replacement_stop" not in roles
+
+    def test_substrate_failure_does_not_abort_promotion(self):
+        """POST-submit semantics: substrate insert raising must not
+        crash the broker promotion path. The replacement is already
+        live at Alpaca."""
+        api = MagicMock()
+        api.replace_order_by_id.return_value = self._replacement_order(
+            id="alpaca-replace-3", cli="cli-replace-3",
+        )
+        orders_store = MagicMock()
+        orders_store.insert_pending.side_effect = RuntimeError("substrate down")
+        broker = self._broker(api, orders_store)
+
+        # Does NOT raise.
+        result = broker.promote_equity_stop_to_gtc(
+            parent_order_id=None,
+            stop_order_id="alpaca-oto-child-9",
+            qty=10,
+            stop_price=95.0,
+            position_uid="pos-X",
+        )
+        assert result is not None

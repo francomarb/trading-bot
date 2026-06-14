@@ -608,6 +608,71 @@ class AlpacaBroker:
                 f"attach. Investigate substrate health."
             )
 
+    def _lifecycle_orders_record_stop(
+        self,
+        *,
+        position_uid: str | None,
+        role: str,
+        client_order_id: str,
+        broker_order_id: str | None,
+        stop_price: float,
+        qty: float,
+        parent_order_id: str | None,
+        order_class: str,
+        replaces_order_id: str | None = None,
+        time_in_force: str = "gtc",
+        order_type: str = "stop",
+    ) -> None:
+        """Insert + attach a stop-side substrate row in one call.
+
+        Used by every stop-creation path that has the broker
+        order_id in hand at write time:
+
+          - role='protective_stop' (P-4): bracket OTO child,
+            fractional standalone GTC, repair flow.
+          - role='replacement_stop' (P-5): GTC promotion of an OTO
+            child via Alpaca's replace_order_by_id. replaces_order_id
+            carries the id of the row this one supersedes.
+
+        POST-submit semantics — the broker stop is already live when
+        this runs. Any IntegrityError / FK / I/O failure here is
+        logged CRITICAL and absorbed: raising would leave the broker
+        stop tracked only in the legacy `option_trailing_stops` /
+        `_stop_legs` paths, which is exactly the state the
+        foundation is trying to eliminate. Cycle reconciliation will
+        pick it up on the next pass.
+
+        No-op when the store isn't wired or position_uid is None
+        (broker is operating without lifecycle persistence)."""
+        if self._lifecycle_orders_store is None or position_uid is None:
+            return
+        try:
+            self._lifecycle_orders_store.insert_pending(
+                position_uid=position_uid,
+                role=role,
+                client_order_id=client_order_id,
+                order_type=order_type,
+                order_class=order_class,
+                time_in_force=time_in_force,
+                side="sell",
+                intended_qty=float(qty),
+                intended_stop_price=float(stop_price),
+                parent_order_id=parent_order_id,
+                replaces_order_id=replaces_order_id,
+            )
+            if broker_order_id is not None:
+                self._lifecycle_orders_store.attach_broker_order_id(
+                    client_order_id=client_order_id,
+                    order_id=broker_order_id,
+                )
+        except Exception as exc:
+            logger.critical(
+                f"lifecycle_orders.{role} FAILED for "
+                f"{client_order_id} → {broker_order_id}: {exc}. The "
+                f"broker stop is live; cycle reconciliation will "
+                f"retry. Investigate substrate health."
+            )
+
     def _lifecycle_orders_record_protective_stop(
         self,
         *,
@@ -621,50 +686,21 @@ class AlpacaBroker:
         time_in_force: str = "gtc",
         order_type: str = "stop",
     ) -> None:
-        """Insert + attach a ``protective_stop`` substrate row in one
-        call. Used by the three protective-stop submission paths
-        (bracket OTO child, fractional standalone GTC, repair flow).
-
-        POST-submit semantics — the broker stop is already live when
-        this runs (we either pulled the id from order.legs after the
-        parent submit returned, or we're inserting a row for a stop
-        whose submit_order has already returned success). Any
-        IntegrityError / FK / I/O failure here is logged CRITICAL and
-        absorbed: raising would leave the broker stop tracked only
-        in the legacy `option_trailing_stops` / `_stop_legs` paths,
-        which is exactly the state the foundation is trying to
-        eliminate. Cycle reconciliation will pick it up on the next
-        pass.
-
-        No-op when the store isn't wired or position_uid is None
-        (broker is operating without lifecycle persistence)."""
-        if self._lifecycle_orders_store is None or position_uid is None:
-            return
-        try:
-            self._lifecycle_orders_store.insert_pending(
-                position_uid=position_uid,
-                role="protective_stop",
-                client_order_id=client_order_id,
-                order_type=order_type,
-                order_class=order_class,
-                time_in_force=time_in_force,
-                side="sell",
-                intended_qty=float(qty),
-                intended_stop_price=float(stop_price),
-                parent_order_id=parent_order_id,
-            )
-            if broker_order_id is not None:
-                self._lifecycle_orders_store.attach_broker_order_id(
-                    client_order_id=client_order_id,
-                    order_id=broker_order_id,
-                )
-        except Exception as exc:
-            logger.critical(
-                f"lifecycle_orders.protective_stop FAILED for "
-                f"{client_order_id} → {broker_order_id}: {exc}. The "
-                f"broker stop is live; cycle reconciliation will "
-                f"retry. Investigate substrate health."
-            )
+        """Thin wrapper around _lifecycle_orders_record_stop for the
+        ``protective_stop`` role (P-4). Keeps the three P-4 call
+        sites readable."""
+        self._lifecycle_orders_record_stop(
+            position_uid=position_uid,
+            role="protective_stop",
+            client_order_id=client_order_id,
+            broker_order_id=broker_order_id,
+            stop_price=stop_price,
+            qty=qty,
+            parent_order_id=parent_order_id,
+            order_class=order_class,
+            time_in_force=time_in_force,
+            order_type=order_type,
+        )
 
     # ── Retry wrapper ────────────────────────────────────────────────────
 
@@ -1438,11 +1474,15 @@ class AlpacaBroker:
             and result.status is OrderStatus.FILLED
         ):
             try:
+                # P-5: pass position_uid through so the substrate
+                # records the replacement_stop row with the lineage
+                # back to the OTO child being promoted.
                 self.promote_equity_stop_to_gtc(
                     parent_order_id=order_id,
                     stop_order_id=capped_stop_leg_id,
                     qty=result.filled_qty,
                     stop_price=decision.stop_price,
+                    position_uid=position_uid,
                 )
             except Exception as exc:
                 # The entry is already filled. Preserve the truthful fill result
@@ -2171,8 +2211,18 @@ class AlpacaBroker:
         qty: float,
         stop_price: float,
         client_order_id_prefix: str = "equity-stop-gtc",
+        position_uid: str | None = None,
     ) -> OpenOrder:
-        """Promote an activated equity OTO child stop to durable GTC."""
+        """Promote an activated equity OTO child stop to durable GTC.
+
+        P-5: when ``position_uid`` is supplied, the replacement is
+        recorded in the substrate as a ``replacement_stop`` row with
+        replaces_order_id = old stop id, so apply_order_event can
+        resolve 'this stop supersedes that one' on subsequent fill
+        / cancel events. Callers without the uid (legacy tests) pass
+        None and the substrate write is skipped — the broker order
+        still goes out.
+        """
         whole_qty = int(qty)
         if whole_qty < 1 or abs(float(qty) - whole_qty) > 1e-9:
             raise BrokerError(
@@ -2219,6 +2269,23 @@ class AlpacaBroker:
         if self._stream_manager is not None:
             self._stream_manager.unregister_stop_leg(resolved_stop_id)
         self._register_standalone_stop_leg(replacement)
+        # P-5: record the replacement_stop substrate row. order_class
+        # ='simple' (the promoted stop is standalone GTC, not an OTO
+        # child anymore); parent_order_id=None for the same reason;
+        # replaces_order_id ties the new row to the OTO child it
+        # superseded so apply_order_event can resolve the lineage
+        # when the old stop's terminal events arrive.
+        self._lifecycle_orders_record_stop(
+            position_uid=position_uid,
+            role="replacement_stop",
+            client_order_id=client_order_id,
+            broker_order_id=str(replacement.id),
+            stop_price=float(stop_price),
+            qty=float(whole_qty),
+            parent_order_id=None,
+            order_class="simple",
+            replaces_order_id=resolved_stop_id,
+        )
         return self._to_open_order(replacement)
 
     def submit_option_gtc_stop(

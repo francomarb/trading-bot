@@ -2010,13 +2010,21 @@ class TestWatchlistStatuses:
 
         engine._repair_missing_protective_stops(snapshot)
 
-        broker.promote_equity_stop_to_gtc.assert_called_once_with(
-            parent_order_id=None,
-            stop_order_id="day-stop",
-            qty=10,
-            stop_price=95.0,
-            client_order_id_prefix="fake_strategy-repair-stop-gtc",
+        # P-5: position_uid kwarg is now part of the contract.
+        # This test fixture doesn't seed a lifecycle row for the
+        # recovered position, so the engine's lookup returns None
+        # — the substrate write is skipped, but the broker call
+        # still goes out with the correct stop semantics.
+        broker.promote_equity_stop_to_gtc.assert_called_once()
+        kwargs = broker.promote_equity_stop_to_gtc.call_args.kwargs
+        assert kwargs["parent_order_id"] is None
+        assert kwargs["stop_order_id"] == "day-stop"
+        assert kwargs["qty"] == 10
+        assert kwargs["stop_price"] == 95.0
+        assert kwargs["client_order_id_prefix"] == (
+            "fake_strategy-repair-stop-gtc"
         )
+        assert "position_uid" in kwargs
         assert snapshot.open_orders == [promoted]
         broker.place_protective_stop.assert_not_called()
 
@@ -2184,13 +2192,19 @@ class TestWatchlistStatuses:
 
         engine.start(max_cycles=2)
 
-        broker.promote_equity_stop_to_gtc.assert_called_once_with(
-            parent_order_id=None,
-            stop_order_id="day-stop",
-            qty=10,
-            stop_price=95.0,
-            client_order_id_prefix="fake_strategy-recover-stop-gtc",
+        # P-5: position_uid kwarg is now part of the contract; this
+        # test's recovery path doesn't seed a lifecycle row, so the
+        # engine's lookup returns None.
+        broker.promote_equity_stop_to_gtc.assert_called_once()
+        kwargs = broker.promote_equity_stop_to_gtc.call_args.kwargs
+        assert kwargs["parent_order_id"] is None
+        assert kwargs["stop_order_id"] == "day-stop"
+        assert kwargs["qty"] == 10
+        assert kwargs["stop_price"] == 95.0
+        assert kwargs["client_order_id_prefix"] == (
+            "fake_strategy-recover-stop-gtc"
         )
+        assert "position_uid" in kwargs
         broker.place_protective_stop.assert_not_called()
 
 
