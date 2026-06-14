@@ -818,3 +818,225 @@ class TestBackfillPromotesExplicitSingleLeg:
         ).fetchone()
         assert row[0] == "AAPL"  # populated via OWNER_KEY
         assert row[1] == "single_leg"  # preserved
+
+
+# ── PR #60 round 4 fixes ────────────────────────────────────────────────────
+
+
+class TestKeeperRequiredPartition:
+    """Round 4 P0: --apply must require exactly one keeper in the
+    snapshot and deletes == snapshot - {keeper}. Round 3's symmetric
+    check passed when keeper=None and delete=all_snapshot_ids."""
+
+    def test_owner_apply_rejects_null_keeper_with_all_in_delete(
+        self, tmp_path,
+    ):
+        """The delete-all-no-keeper bug ChatGPT caught: operator
+        sets keep_position_uid=None and puts every snapshot id in
+        delete_position_uids. Old check passed; new check rejects."""
+        db = tmp_path / "trades.db"
+        _make_dirty_db(db)
+        out = tmp_path / "decisions.json"
+        migrate_dedupe_trades.main(["--db", str(db), "--review", str(out)])
+        decisions = json.loads(out.read_text())
+        cluster = decisions["owner_key_clusters"][0]
+        snapshot_uids = [r["position_uid"] for r in cluster["rows"]]
+        cluster["keep_position_uid"] = None
+        cluster["delete_position_uids"] = snapshot_uids
+        out.write_text(json.dumps(decisions))
+
+        code = migrate_dedupe_trades.main(
+            ["--db", str(db), "--apply", str(out)],
+        )
+        assert code == 2
+        # Both rows survive (rollback).
+        rows = sqlite3.connect(db).execute(
+            "SELECT position_uid FROM position_lifecycle "
+            "ORDER BY position_uid"
+        ).fetchall()
+        assert ("pos-A",) in rows
+        assert ("pos-B",) in rows
+
+    def test_trades_apply_rejects_null_keeper_with_all_in_delete(
+        self, tmp_path,
+    ):
+        db = tmp_path / "trades.db"
+        _make_dirty_db(db)
+        out = tmp_path / "decisions.json"
+        migrate_dedupe_trades.main(["--db", str(db), "--review", str(out)])
+        decisions = json.loads(out.read_text())
+        cluster = decisions["trades_order_id_clusters"][0]
+        snapshot_ids = [r["id"] for r in cluster["rows"]]
+        cluster["keep_trade_id"] = None
+        cluster["delete_trade_ids"] = snapshot_ids
+        out.write_text(json.dumps(decisions))
+
+        code = migrate_dedupe_trades.main(
+            ["--db", str(db), "--apply", str(out)],
+        )
+        assert code == 2
+        rows = sqlite3.connect(db).execute(
+            "SELECT COUNT(*) FROM trades WHERE order_id = 'ord-dup'"
+        ).fetchone()
+        assert rows[0] == 2
+
+    def test_owner_apply_rejects_omitted_delete_in_3_row_cluster(
+        self, tmp_path,
+    ):
+        """3-row cluster: keeper plus only one delete instead of two.
+        Partition is a subset of the snapshot — must reject."""
+        db = tmp_path / "trades.db"
+        _make_dirty_db(db)
+        # Add a third active duplicate so the cluster has 3 rows.
+        conn = sqlite3.connect(db)
+        conn.execute(
+            "INSERT INTO position_lifecycle "
+            "(schema_version, position_uid, owner_key, status, "
+            "strategy, opened_at) "
+            "VALUES (1, 'pos-C', 'TSLA', 'open', 'sma', "
+            "'2026-05-03T10:00:00+00:00')"
+        )
+        conn.commit()
+        conn.close()
+        out = tmp_path / "decisions.json"
+        migrate_dedupe_trades.main(["--db", str(db), "--review", str(out)])
+        decisions = json.loads(out.read_text())
+        cluster = decisions["owner_key_clusters"][0]
+        # Default would be: keep pos-A, delete [pos-B, pos-C].
+        # Operator omits pos-C.
+        cluster["delete_position_uids"] = ["pos-B"]
+        out.write_text(json.dumps(decisions))
+
+        code = migrate_dedupe_trades.main(
+            ["--db", str(db), "--apply", str(out)],
+        )
+        assert code == 2
+        # All three rows survive (rollback).
+        rows = sqlite3.connect(db).execute(
+            "SELECT position_uid FROM position_lifecycle "
+            "WHERE owner_key = 'TSLA' ORDER BY position_uid"
+        ).fetchall()
+        assert len(rows) == 3
+
+    def test_owner_apply_rejects_keeper_in_delete_list(self, tmp_path):
+        """Keeper id also appears in delete list → reject."""
+        db = tmp_path / "trades.db"
+        _make_dirty_db(db)
+        out = tmp_path / "decisions.json"
+        migrate_dedupe_trades.main(["--db", str(db), "--review", str(out)])
+        decisions = json.loads(out.read_text())
+        cluster = decisions["owner_key_clusters"][0]
+        cluster["delete_position_uids"].append(cluster["keep_position_uid"])
+        out.write_text(json.dumps(decisions))
+        code = migrate_dedupe_trades.main(
+            ["--db", str(db), "--apply", str(out)],
+        )
+        assert code == 2
+
+
+class TestAsymmetricConflictRejection:
+    """Round 4 P1 (asymmetric NULL): _delete_has_data_keeper_lacks
+    must reject when the delete row has a non-null value the keeper
+    lacks — silently dropping would lose data."""
+
+    def test_keeper_null_delete_has_realized_pnl_rejected(
+        self, tmp_path,
+    ):
+        db = tmp_path / "trades.db"
+        _make_dirty_db(db)
+        # Keeper (earliest, pos-A) has NULL net_realized_pnl;
+        # delete candidate (pos-B) has populated value. Round 3
+        # would have silently dropped pos-B + the value with it.
+        conn = sqlite3.connect(db)
+        conn.execute(
+            "UPDATE position_lifecycle SET net_realized_pnl = NULL "
+            "WHERE position_uid = 'pos-A'"
+        )
+        conn.execute(
+            "UPDATE position_lifecycle SET net_realized_pnl = 99.99 "
+            "WHERE position_uid = 'pos-B'"
+        )
+        conn.commit()
+        conn.close()
+        out = tmp_path / "decisions.json"
+        migrate_dedupe_trades.main(["--db", str(db), "--review", str(out)])
+        code = migrate_dedupe_trades.main(
+            ["--db", str(db), "--apply", str(out)],
+        )
+        assert code == 2
+        # pos-B still exists with the populated value.
+        row = sqlite3.connect(db).execute(
+            "SELECT net_realized_pnl FROM position_lifecycle "
+            "WHERE position_uid = 'pos-B'"
+        ).fetchone()
+        assert row[0] == 99.99
+
+    def test_trades_keeper_null_delete_has_modeled_slippage_rejected(
+        self, tmp_path,
+    ):
+        """Round 4 expanded column coverage: modeled_slippage_bps
+        is now in the conflict check. A populated value on the
+        delete row that the keeper lacks must reject."""
+        db = tmp_path / "trades.db"
+        _make_dirty_db(db)
+        conn = sqlite3.connect(db)
+        conn.execute(
+            "UPDATE trades SET modeled_slippage_bps = NULL WHERE id = 1"
+        )
+        conn.execute(
+            "UPDATE trades SET modeled_slippage_bps = 22.2 WHERE id = 2"
+        )
+        conn.commit()
+        conn.close()
+        out = tmp_path / "decisions.json"
+        migrate_dedupe_trades.main(["--db", str(db), "--review", str(out)])
+        code = migrate_dedupe_trades.main(
+            ["--db", str(db), "--apply", str(out)],
+        )
+        assert code == 2
+
+    def test_keeper_has_value_delete_null_proceeds(self, tmp_path):
+        """Positive control: keeper has populated value, delete has
+        NULL — no data lost; apply proceeds."""
+        db = tmp_path / "trades.db"
+        _make_dirty_db(db)
+        conn = sqlite3.connect(db)
+        conn.execute(
+            "UPDATE position_lifecycle SET net_realized_pnl = 12.34 "
+            "WHERE position_uid = 'pos-A'"
+        )
+        conn.execute(
+            "UPDATE position_lifecycle SET net_realized_pnl = NULL "
+            "WHERE position_uid = 'pos-B'"
+        )
+        conn.commit()
+        conn.close()
+        out = tmp_path / "decisions.json"
+        migrate_dedupe_trades.main(["--db", str(db), "--review", str(out)])
+        code = migrate_dedupe_trades.main(
+            ["--db", str(db), "--apply", str(out)],
+        )
+        assert code == 0
+
+
+class TestDetectOutputShowsAccountingEvidence:
+    """Round 4 P1 sub-point: --detect output must surface the
+    accounting columns _scan now fetches, so the operator can see
+    differences before deciding the keeper."""
+
+    def test_detect_prints_realized_pnl_when_present(
+        self, tmp_path, capsys,
+    ):
+        db = tmp_path / "trades.db"
+        _make_dirty_db(db)
+        conn = sqlite3.connect(db)
+        conn.execute(
+            "UPDATE position_lifecycle SET net_realized_pnl = 77.7 "
+            "WHERE position_uid = 'pos-A'"
+        )
+        conn.commit()
+        conn.close()
+        migrate_dedupe_trades.main(["--db", str(db), "--detect"])
+        captured = capsys.readouterr()
+        assert "net_realized_pnl" in captured.out
+        assert "77.7" in captured.out

@@ -125,11 +125,24 @@ def _scan(conn: sqlite3.Connection) -> dict[str, Any]:
     trades_cols = {
         col[1] for col in conn.execute("PRAGMA table_info(trades)").fetchall()
     }
+    # PR #60 round 4 fix (P1 expanded coverage): every column the
+    # conflict check might inspect must be in the report, otherwise
+    # _delete_has_data_keeper_lacks gets None for both sides and
+    # silently passes.
     trades_optional_cols = [
         c for c in (
-            "realized_pnl", "realized_slippage_bps",
+            "order_type", "requested_qty", "filled_qty",
+            "realized_pnl", "r_multiple",
+            "realized_slippage_bps",
             "slippage_signed_bps", "slippage_adverse_bps",
-            "reason",
+            "modeled_slippage_bps",
+            "slippage_benchmark_price", "slippage_benchmark_kind",
+            "slippage_benchmark_timestamp",
+            "slippage_measurement_quality",
+            "initial_stop_loss", "initial_risk_per_share",
+            "initial_risk_dollars",
+            "entry_timestamp", "exit_timestamp",
+            "stop_trigger_price", "reason",
         )
         if c in trades_cols
     ]
@@ -231,17 +244,38 @@ def _detect(conn: sqlite3.Connection) -> int:
         return 0
     print(f"DIRTY: {owner_n} owner_key cluster(s), "
           f"{trades_n} trades.order_id cluster(s)")
+    # PR #60 round 4 fix (P1 detect output): print every accounting /
+    # provenance column we fetched so the operator can compare values
+    # across rows before deciding the keeper. _scan now pulls
+    # net_realized_pnl on the owner-key side and the full slippage /
+    # risk-anchor / accounting set on the trades side; surface them
+    # here.
     if owner_n:
         print("\nposition_lifecycle.owner_key duplicates:")
         for cluster in report["owner_key_duplicates"]:
             print(f"  owner_key={cluster['owner_key']!r} "
                   f"({cluster['count']} rows):")
             for r in cluster["rows"]:
-                print(f"    - uid={r['position_uid']} "
-                      f"status={r['status']} "
-                      f"strategy={r['strategy']} "
-                      f"opened_at={r['opened_at']} "
-                      f"symbol={r['symbol']}")
+                # Core identity fields first, then every additional
+                # field that was fetched (skips None for readability).
+                core = (
+                    f"    - uid={r['position_uid']} "
+                    f"status={r['status']} "
+                    f"strategy={r['strategy']} "
+                    f"opened_at={r['opened_at']} "
+                    f"symbol={r['symbol']}"
+                )
+                extras = [
+                    f"{k}={v!r}" for k, v in r.items()
+                    if k not in {
+                        "position_uid", "status", "strategy",
+                        "opened_at", "symbol",
+                    } and v is not None
+                ]
+                if extras:
+                    print(core + " " + " ".join(extras))
+                else:
+                    print(core)
     if trades_n:
         print("\ntrades.order_id duplicates "
               "(NULL or single_leg position_type):")
@@ -249,14 +283,28 @@ def _detect(conn: sqlite3.Connection) -> int:
             print(f"  order_id={cluster['order_id']!r} "
                   f"({cluster['count']} rows):")
             for r in cluster["rows"]:
-                print(f"    - id={r['id']} "
-                      f"timestamp={r['timestamp']} "
-                      f"symbol={r['symbol']} "
-                      f"side={r['side']} "
-                      f"qty={r['qty']} "
-                      f"avg_fill_price={r['avg_fill_price']} "
-                      f"position_type={r['position_type']} "
-                      f"status={r['status']}")
+                core = (
+                    f"    - id={r['id']} "
+                    f"timestamp={r['timestamp']} "
+                    f"symbol={r['symbol']} "
+                    f"side={r['side']} "
+                    f"qty={r['qty']} "
+                    f"avg_fill_price={r['avg_fill_price']} "
+                    f"position_type={r['position_type']} "
+                    f"status={r['status']}"
+                )
+                extras = [
+                    f"{k}={v!r}" for k, v in r.items()
+                    if k not in {
+                        "id", "timestamp", "symbol", "side", "qty",
+                        "avg_fill_price", "position_type", "status",
+                        "position_uid",
+                    } and v is not None
+                ]
+                if extras:
+                    print(core + " " + " ".join(extras))
+                else:
+                    print(core)
     print("\nNext step: re-run with --review FILE to emit a decisions "
           "file, edit it, then --apply FILE.")
     return 1
@@ -322,14 +370,14 @@ class _ApplyAborted(Exception):
     """Internal signal that the apply transaction must roll back."""
 
 
-# PR #60 round 3 fix (P1 dedupe): accounting fields that the script
-# refuses to merge implicitly. If the kept row and any delete
-# candidate disagree on a NON-NULL value for any of these columns,
-# the cluster requires an explicit merge that the script does NOT
-# support, and --apply rejects it. Two non-null values that AGREE
-# are fine (idempotent); a non-null vs NULL is fine (delete candidate
-# can be dropped — keep wins by definition); only NON-NULL ≠ NON-NULL
-# triggers the reject.
+# PR #60 round 4 fix (P1 dedupe — expanded coverage + asymmetric):
+# Every operator-decision-relevant column. Round 3's set covered
+# accounting headlines; round 4 reviewer noted it missed broker-
+# cumulative state (filled_qty, avg_fill_price), entry/exit
+# timestamps, modeled-slippage provenance, benchmark provenance,
+# risk anchors, and stop-trigger price. A "partial earliest"
+# keeper could therefore silently discard a more complete later
+# delete row.
 _OWNER_KEY_CONFLICT_COLUMNS = (
     "strategy",
     "symbol",
@@ -337,25 +385,55 @@ _OWNER_KEY_CONFLICT_COLUMNS = (
     "net_realized_pnl",
 )
 _TRADES_CONFLICT_COLUMNS = (
-    "symbol",
-    "side",
-    "position_type",
-    "position_uid",
-    "realized_pnl",
+    # Identity / intent
+    "symbol", "side", "position_type", "position_uid",
+    "order_type", "requested_qty",
+    # Broker cumulative state — a later observation may legitimately
+    # advance these, but a sparser keeper losing them is data loss
+    # the operator must approve explicitly.
+    "filled_qty", "avg_fill_price", "status",
+    # Computed accounting
+    "realized_pnl", "r_multiple",
     "realized_slippage_bps",
-    "slippage_signed_bps",
-    "slippage_adverse_bps",
+    "slippage_signed_bps", "slippage_adverse_bps",
+    # Modeled slippage + benchmark provenance
+    "modeled_slippage_bps",
+    "slippage_benchmark_price", "slippage_benchmark_kind",
+    "slippage_benchmark_timestamp",
+    "slippage_measurement_quality",
+    # Risk anchors set at entry
+    "initial_stop_loss", "initial_risk_per_share",
+    "initial_risk_dollars",
+    # Lifecycle timestamps
+    "entry_timestamp", "exit_timestamp",
+    "stop_trigger_price",
+    # Operator-readable rationale
     "reason",
 )
 
 
-def _cells_conflict(a: Any, b: Any) -> bool:
-    """Two cells conflict only if both are non-null and unequal.
-    NULL is "missing observation" not "explicit value", so a NULL
-    on either side is harmonized away."""
-    if a is None or b is None:
+def _delete_has_data_keeper_lacks(
+    keep_val: Any, delete_val: Any,
+) -> bool:
+    """PR #60 round 4 fix (P1 asymmetric): the conflict check is
+    one-directional. A delete row that carries a NON-NULL value the
+    keeper LACKS (NULL or different non-null) represents data the
+    keeper cannot replace — silently dropping the delete row would
+    lose information. Symmetric NULLs and equal non-nulls are fine.
+
+    Cases:
+      delete_val is None                       → no conflict (delete
+                                                  adds nothing).
+      delete_val is non-null, keep_val is None → CONFLICT (data loss).
+      delete_val == keep_val                    → no conflict.
+      delete_val != keep_val (both non-null)    → CONFLICT (merge
+                                                  required).
+    """
+    if delete_val is None:
         return False
-    return a != b
+    if keep_val is None:
+        return True
+    return keep_val != delete_val
 
 
 def _reject_owner_cluster_on_accounting_conflict(
@@ -372,15 +450,17 @@ def _reject_owner_cluster_on_accounting_conflict(
         if delete_row is None:
             continue
         for col in _OWNER_KEY_CONFLICT_COLUMNS:
-            if _cells_conflict(keep_row.get(col), delete_row.get(col)):
+            if _delete_has_data_keeper_lacks(
+                keep_row.get(col), delete_row.get(col),
+            ):
                 raise _ApplyAborted(
-                    f"owner_key={cluster.get('owner_key')!r}: keep "
-                    f"row position_uid={keep_uid!r} and delete row "
-                    f"position_uid={uid!r} disagree on column "
-                    f"{col!r}: {keep_row[col]!r} vs {delete_row[col]!r}. "
-                    f"This would require a MERGE, which the script "
-                    f"does not support. Resolve manually and re-run "
-                    f"--review."
+                    f"owner_key={cluster.get('owner_key')!r}: "
+                    f"delete row position_uid={uid!r} has {col!r}="
+                    f"{delete_row[col]!r} but keeper "
+                    f"position_uid={keep_uid!r} has {col!r}="
+                    f"{keep_row.get(col)!r}. Deleting would lose "
+                    f"data. Resolve manually (update the keeper or "
+                    f"choose a different keeper) and re-run --review."
                 )
 
 
@@ -398,15 +478,16 @@ def _reject_trades_cluster_on_accounting_conflict(
         if delete_row is None:
             continue
         for col in _TRADES_CONFLICT_COLUMNS:
-            if _cells_conflict(keep_row.get(col), delete_row.get(col)):
+            if _delete_has_data_keeper_lacks(
+                keep_row.get(col), delete_row.get(col),
+            ):
                 raise _ApplyAborted(
-                    f"order_id={cluster.get('order_id')!r}: keep "
-                    f"trade id={keep_id} and delete trade id={tid} "
-                    f"disagree on column {col!r}: "
-                    f"{keep_row[col]!r} vs {delete_row[col]!r}. "
-                    f"This would require a MERGE, which the script "
-                    f"does not support. Resolve manually and "
-                    f"re-run --review."
+                    f"order_id={cluster.get('order_id')!r}: delete "
+                    f"trade id={tid} has {col!r}={delete_row[col]!r} "
+                    f"but keeper trade id={keep_id} has {col!r}="
+                    f"{keep_row.get(col)!r}. Deleting would lose "
+                    f"data. Resolve manually (update the keeper or "
+                    f"choose a different keeper) and re-run --review."
                 )
 
 
@@ -466,9 +547,18 @@ def _refetch_trades_cluster(
     }
     optional = [
         c for c in (
-            "realized_pnl", "realized_slippage_bps",
+            "order_type", "requested_qty", "filled_qty",
+            "realized_pnl", "r_multiple",
+            "realized_slippage_bps",
             "slippage_signed_bps", "slippage_adverse_bps",
-            "reason",
+            "modeled_slippage_bps",
+            "slippage_benchmark_price", "slippage_benchmark_kind",
+            "slippage_benchmark_timestamp",
+            "slippage_measurement_quality",
+            "initial_stop_loss", "initial_risk_per_share",
+            "initial_risk_dollars",
+            "entry_timestamp", "exit_timestamp",
+            "stop_trigger_price", "reason",
         )
         if c in trades_cols
     ]
@@ -579,30 +669,51 @@ def _apply(conn: sqlite3.Connection, in_path: Path) -> int:
                     f"fingerprint mismatch). Re-run --review."
                 )
 
-            # PR #60 round 3 fix (P0): partition validation. The
-            # union of keep_position_uid + delete_position_uids must
-            # equal the set of position_uids the detector flagged.
-            # Without this an operator could add an unrelated valid
-            # position_uid to delete_position_uids; the rowcount and
-            # post-rescan checks would not catch it.
+            # PR #60 round 4 fix (P0): keeper-required partition.
+            # Round 3's symmetric "keep + delete == snapshot" check
+            # passed when keeper=None and delete=all_snapshot_ids —
+            # apply would then delete every row in the cluster and
+            # the post-scan would report clean. The contract must be
+            # stricter: exactly one keeper, drawn from the snapshot,
+            # and deletes == snapshot - {keeper}.
             snapshot_uids = {r["position_uid"] for r in cluster["rows"]}
             keep_uid = cluster.get("keep_position_uid")
             delete_uids = list(cluster.get("delete_position_uids", []))
-            partition = (
-                ([keep_uid] if keep_uid is not None else []) + delete_uids
-            )
-            if len(partition) != len(set(partition)):
+            if keep_uid is None:
                 raise _ApplyAborted(
-                    f"owner_key={cluster.get('owner_key')!r}: keep + "
-                    f"delete contains duplicate ids; aborting."
+                    f"owner_key={cluster.get('owner_key')!r}: "
+                    f"keep_position_uid is null. Every cluster must "
+                    f"name exactly one surviving row; refusing to "
+                    f"delete the entire cluster."
                 )
-            if set(partition) != snapshot_uids:
+            if keep_uid not in snapshot_uids:
                 raise _ApplyAborted(
-                    f"owner_key={cluster.get('owner_key')!r}: keep + "
-                    f"delete {sorted(partition)} does not exactly "
-                    f"partition the reviewed snapshot "
-                    f"{sorted(snapshot_uids)}. Operator may have "
-                    f"injected an unrelated position_uid. Aborting."
+                    f"owner_key={cluster.get('owner_key')!r}: "
+                    f"keep_position_uid={keep_uid!r} is not in the "
+                    f"reviewed snapshot {sorted(snapshot_uids)}. "
+                    f"Operator may have edited the keeper to an "
+                    f"unrelated id. Aborting."
+                )
+            if len(delete_uids) != len(set(delete_uids)):
+                raise _ApplyAborted(
+                    f"owner_key={cluster.get('owner_key')!r}: "
+                    f"delete_position_uids contains duplicates; "
+                    f"aborting."
+                )
+            if keep_uid in delete_uids:
+                raise _ApplyAborted(
+                    f"owner_key={cluster.get('owner_key')!r}: keeper "
+                    f"{keep_uid!r} also appears in delete list; "
+                    f"aborting."
+                )
+            expected_deletes = snapshot_uids - {keep_uid}
+            if set(delete_uids) != expected_deletes:
+                raise _ApplyAborted(
+                    f"owner_key={cluster.get('owner_key')!r}: "
+                    f"delete_position_uids {sorted(delete_uids)} "
+                    f"!= snapshot - {{keeper}} "
+                    f"{sorted(expected_deletes)}. Operator may have "
+                    f"injected or omitted ids. Aborting."
                 )
 
             # PR #60 round 3 fix (P1 dedupe): accounting-conflict
@@ -638,25 +749,44 @@ def _apply(conn: sqlite3.Connection, in_path: Path) -> int:
                     f"fingerprint mismatch). Re-run --review."
                 )
 
-            # Partition validation (P0).
+            # Partition validation (round 4 keeper-required form).
             snapshot_ids = {r["id"] for r in cluster["rows"]}
             keep_id = cluster.get("keep_trade_id")
             delete_ids = list(cluster.get("delete_trade_ids", []))
-            partition = (
-                ([keep_id] if keep_id is not None else []) + delete_ids
-            )
-            if len(partition) != len(set(partition)):
+            if keep_id is None:
                 raise _ApplyAborted(
-                    f"order_id={cluster.get('order_id')!r}: keep + "
-                    f"delete contains duplicate ids; aborting."
+                    f"order_id={cluster.get('order_id')!r}: "
+                    f"keep_trade_id is null. Every cluster must name "
+                    f"exactly one surviving row; refusing to delete "
+                    f"the entire cluster."
                 )
-            if set(partition) != snapshot_ids:
+            if keep_id not in snapshot_ids:
                 raise _ApplyAborted(
-                    f"order_id={cluster.get('order_id')!r}: keep + "
-                    f"delete {sorted(partition)} does not exactly "
-                    f"partition the reviewed snapshot "
-                    f"{sorted(snapshot_ids)}. Operator may have "
-                    f"injected an unrelated trade id. Aborting."
+                    f"order_id={cluster.get('order_id')!r}: "
+                    f"keep_trade_id={keep_id} is not in the reviewed "
+                    f"snapshot {sorted(snapshot_ids)}. Operator may "
+                    f"have edited the keeper to an unrelated id. "
+                    f"Aborting."
+                )
+            if len(delete_ids) != len(set(delete_ids)):
+                raise _ApplyAborted(
+                    f"order_id={cluster.get('order_id')!r}: "
+                    f"delete_trade_ids contains duplicates; aborting."
+                )
+            if keep_id in delete_ids:
+                raise _ApplyAborted(
+                    f"order_id={cluster.get('order_id')!r}: keeper "
+                    f"{keep_id} also appears in delete list; "
+                    f"aborting."
+                )
+            expected_deletes = snapshot_ids - {keep_id}
+            if set(delete_ids) != expected_deletes:
+                raise _ApplyAborted(
+                    f"order_id={cluster.get('order_id')!r}: "
+                    f"delete_trade_ids {sorted(delete_ids)} != "
+                    f"snapshot - {{keeper}} "
+                    f"{sorted(expected_deletes)}. Operator may have "
+                    f"injected or omitted ids. Aborting."
                 )
 
             # Accounting-conflict rejection (P1 dedupe).
