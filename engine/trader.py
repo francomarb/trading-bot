@@ -250,23 +250,6 @@ class EngineConfig:
 
 
 @dataclass(frozen=True)
-class SuspectOrder:
-    """Bot-submitted order accepted by Alpaca but not yet locally confirmed.
-
-    ``modeled_price_kind`` preserves the slippage benchmark provenance
-    captured at submission so the recovery row gets the same tagging
-    the live row would have written. Defaults to 'unavailable' so
-    legacy SuspectOrder constructions remain safe — recovery then
-    writes NULL slippage rather than fabricating a kind.
-    """
-
-    decision: RiskDecision
-    order_id: str
-    modeled_price: float
-    modeled_price_kind: str = "unavailable"
-
-
-@dataclass(frozen=True)
 class SuspectExitOrder:
     """Exact submitted close whose terminal state was not confirmed locally."""
 
@@ -465,7 +448,12 @@ class TradingEngine:
         # fill state could not be confirmed locally (e.g. stream/REST failure
         # after submit). These are the only unknown positions we will ever try
         # to adopt automatically.
-        self._suspect_orders: dict[str, SuspectOrder] = {}
+        # P-6: _suspect_orders removed. The substrate capture pipeline
+        # (P-1 stream + P-2 cycle reconcile + P-3 startup reconcile)
+        # observes the resolution of UNKNOWN-at-submit orders, and
+        # _maybe_dispatch_substrate_entry_fill fires the engine-side
+        # side effects (ownership bind, entry-price cache, stop
+        # replacement, alert) on each captured fill.
         self._suspect_exit_orders: dict[str, SuspectExitOrder] = {}
 
         # DAY-stop promotion is retried from every broker snapshot, but a
@@ -903,7 +891,10 @@ class TradingEngine:
 
             self._sync_managed_stop_legs(snapshot)
             self._observe_stream_health()
-            self._recover_suspect_orders(snapshot)
+            # P-6: _recover_suspect_orders removed. Substrate
+            # pipeline (P-1/P-2/P-3) observes UNKNOWN-at-submit
+            # resolutions and dispatches ownership / alert / stop
+            # via _maybe_dispatch_substrate_entry_fill.
             self._recover_suspect_exit_orders(snapshot)
             self._process_stream_stop_fills(snapshot)
             self._detect_external_closes(snapshot)
@@ -1716,15 +1707,30 @@ class TradingEngine:
             if _lc is not None:
                 _lc.submitted += 1
             if result.status is OrderStatus.UNKNOWN:
-                # Preserve the benchmark provenance so the recovery row
-                # (codepath §9) tags the right kind/quality if this
-                # submission later resolves filled. Defect 2 fix.
-                self._remember_suspect_order(
-                    decision,
-                    result,
-                    modeled_price=slippage_ref,
-                    modeled_price_kind=slippage_kind or "unavailable",
-                )
+                # P-6: substrate pipeline now owns recovery. The
+                # per-order substrate row was already inserted at
+                # submit time (foundation commit 6) and the broker
+                # order_id was attached on the successful submit
+                # return — when the order's terminal state arrives
+                # via stream / cycle reconcile / startup reconcile,
+                # apply_order_event advances the substrate row and
+                # _maybe_dispatch_substrate_entry_fill fires the
+                # engine-side side effects. No cache state required.
+                #
+                # Defensive log for the genuinely-broken case (no
+                # order_id) the legacy _remember_suspect_order
+                # handled with risk.record_broker_error + alert.
+                if result.order_id is None:
+                    msg = (
+                        f"{decision.symbol}: place_order returned "
+                        f"UNKNOWN with no order_id — broker submit "
+                        f"path failed before id assignment; substrate "
+                        f"row will sit at pending until manual "
+                        f"investigation"
+                    )
+                    logger.error(msg)
+                    self.risk.record_broker_error()
+                    self.alerts.broker_error(msg)
                 if strategy_statuses is not None:
                     strategy_statuses[symbol] = "Pending Entry"
                 if strategy_reasons is not None:
@@ -1884,137 +1890,6 @@ class TradingEngine:
             self._processed_signal_reasons[key] = list(
                 strategy_reasons.get(symbol, [])
             )
-
-    def _remember_suspect_order(
-        self,
-        decision: RiskDecision,
-        result: OrderResult,
-        *,
-        modeled_price: float,
-        modeled_price_kind: str = "unavailable",
-    ) -> None:
-        """
-        Persist a narrow recovery handle for submit-succeeded/confirm-failed
-        entries. Recovery is tied to the exact order_id returned by Alpaca.
-
-        ``modeled_price_kind`` preserves the slippage-benchmark provenance
-        captured at submission ('arrival_midpoint' or
-        'fallback_latest_close') so the recovered row gets the same
-        kind/quality tagging the live row would have written. Defect 2
-        of the first-pass review fix.
-        """
-        if result.order_id is None:
-            msg = (
-                f"{decision.symbol}: confirmation failed but no order_id was "
-                "returned; cannot stage suspect-order recovery"
-            )
-            logger.error(msg)
-            self.risk.record_broker_error()
-            self.alerts.broker_error(msg)
-            return
-
-        self._suspect_orders[decision.symbol] = SuspectOrder(
-            decision=decision,
-            order_id=result.order_id,
-            modeled_price=modeled_price,
-            modeled_price_kind=modeled_price_kind,
-        )
-        logger.warning(
-            f"{decision.symbol}: staged suspect order recovery for "
-            f"{result.order_id} [{decision.strategy_name}]"
-        )
-
-    def _recover_suspect_orders(self, snapshot: BrokerSnapshot) -> None:
-        """Recover only exact bot-submitted orders that lost confirmation."""
-        for symbol, suspect in list(self._suspect_orders.items()):
-            try:
-                result = self.broker.reconcile_submitted_order(
-                    order_id=suspect.order_id,
-                    symbol=symbol,
-                    requested_qty=suspect.decision.qty,
-                )
-            except Exception as e:
-                logger.warning(
-                    f"{symbol}: suspect order {suspect.order_id} reconciliation "
-                    f"failed: {e}"
-                )
-                continue
-
-            if result.status in {OrderStatus.PENDING, OrderStatus.ACCEPTED}:
-                logger.warning(
-                    f"{symbol}: suspect order {suspect.order_id} still "
-                    f"{result.status.value}; waiting for next cycle"
-                )
-                continue
-
-            if result.status in {OrderStatus.CANCELED, OrderStatus.REJECTED, OrderStatus.TIMEOUT}:
-                logger.warning(
-                    f"{symbol}: suspect order {suspect.order_id} resolved as "
-                    f"{result.status.value}; dropping recovery state"
-                )
-                self._suspect_orders.pop(symbol, None)
-                continue
-
-            position = snapshot.account.open_positions.get(symbol)
-            if result.status in {OrderStatus.FILLED, OrderStatus.PARTIAL} and position is not None:
-                # P-6 commit A: side effects 1-2 (trade-log writes)
-                # stay inline because the suspect path's UPSERT
-                # consolidates with the substrate's apply_order_event
-                # UPSERT on the same order_id. Side effects 3-6
-                # (ownership + cache + stop + alert) are extracted
-                # into _apply_recovered_entry_side_effects so the
-                # substrate-driven path (commit B) can call the same
-                # helper without going through the suspect cache.
-                self._record_fill(
-                    result,
-                    modeled_price=suspect.modeled_price,
-                    order_type=suspect.decision.order_type.value,
-                    side=suspect.decision.side.value,
-                )
-                # Slippage unification (Phase 1) codepath §9 — the
-                # suspect-order recovery state preserves the original
-                # benchmark kind (arrival_midpoint vs fallback_latest_close
-                # vs unavailable) so the recovered row tags the same kind
-                # the live row would have written. Quality is forced to
-                # 'recovered' so downstream consumers can isolate
-                # reconstructed rows. Defect 2 fix.
-                self._log_entry(
-                    suspect.decision,
-                    result,
-                    suspect.modeled_price,
-                    timestamp_override=result.filled_at or result.submitted_at,
-                    benchmark_kind=suspect.modeled_price_kind,
-                    measurement_quality="recovered",
-                )
-                self._apply_recovered_entry_side_effects(
-                    snapshot=snapshot,
-                    position=position,
-                    decision=suspect.decision,
-                    fill_price=(
-                        result.avg_fill_price
-                        or suspect.decision.entry_reference_price
-                    ),
-                    fill_qty=float(
-                        result.filled_qty
-                        or position.qty
-                        or suspect.decision.qty
-                    ),
-                    reason_suffix="(recovered)",
-                )
-                logger.warning(
-                    f"{symbol}: recovered filled suspect order "
-                    f"{suspect.order_id}; adopted position for "
-                    f"'{suspect.decision.strategy_name}'"
-                )
-                self._suspect_orders.pop(symbol, None)
-                continue
-
-            logger.warning(
-                f"{symbol}: suspect order {suspect.order_id} resolved as "
-                f"{result.status.value} but no broker position was present; "
-                "dropping recovery state without adopting"
-            )
-            self._suspect_orders.pop(symbol, None)
 
     def _apply_recovered_entry_side_effects(
         self,

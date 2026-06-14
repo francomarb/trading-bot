@@ -2102,110 +2102,15 @@ class TestWatchlistStatuses:
             position=snapshot.account.open_positions["AAPL"],
         )
 
-    def test_suspect_order_recovery_adopts_position_and_restores_stop(
-        self, engine_factory
-    ):
-        startup = _snapshot()
-        cycle1 = _snapshot()
-        cycle2 = _snapshot(
-            positions={"AAPL": Position("AAPL", 10, 100.0, 1010.0)},
-            open_orders=[],
-        )
-        engine, broker = engine_factory(
-            entries=[False] * 59 + [True],
-            snapshot=startup,
-            place_result=_unknown_result("AAPL", 10, order_id="ord-suspect"),
-        )
-        broker.sync_with_broker.side_effect = [startup, cycle1, cycle2]
-        broker.reconcile_submitted_order.return_value = _filled_result(
-            "AAPL",
-            10,
-            100.5,
-            submitted_at=T0,
-            filled_at=T0 + timedelta(minutes=2),
-        )
-        broker.place_protective_stop.return_value = _open_stop_order("AAPL", 95.0)
-
-        engine.start(max_cycles=2)
-
-        reconcile_call = broker.reconcile_submitted_order.call_args.kwargs
-        assert reconcile_call["order_id"] == "ord-suspect"
-        assert reconcile_call["symbol"] == "AAPL"
-        assert reconcile_call["requested_qty"] == pytest.approx(98.52)
-
-        stop_call = broker.place_protective_stop.call_args.kwargs
-        assert stop_call["symbol"] == "AAPL"
-        assert stop_call["qty"] == 10
-        assert round(stop_call["stop_price"], 2) == 96.94
-        assert stop_call["client_order_id_prefix"] == "fake_strategy-recover-stop"
-        assert engine._get_owner("AAPL") == "fake_strategy"
-        assert engine.trade_logger.read_all_open_owners() == {"AAPL": "fake_strategy"}
-        buy_rows = [
-            r for r in engine.trade_logger.read_all()
-            if r["side"] == "buy" and r["symbol"] == "AAPL"
-        ]
-        assert len(buy_rows) == 1
-        assert buy_rows[0]["timestamp"] == (T0 + timedelta(minutes=2)).isoformat()
-        assert buy_rows[0]["entry_timestamp"] == (T0 + timedelta(minutes=2)).isoformat()
-        assert buy_rows[0]["avg_fill_price"] == pytest.approx(100.5)
-
-        engine._entry_prices.clear()
-        engine._restore_entry_prices_from_db(cycle2)
-
-        assert engine._entry_prices["AAPL"] == pytest.approx(100.5)
-
-    def test_suspect_recovery_promotes_existing_day_child_stop(
-        self, engine_factory
-    ):
-        day_stop = replace(
-            _open_stop_order("AAPL", 95.0),
-            order_id="day-stop",
-            qty=10,
-            time_in_force="day",
-        )
-        promoted = replace(
-            day_stop,
-            order_id="gtc-stop",
-            status="accepted",
-            time_in_force="gtc",
-        )
-        startup = _snapshot()
-        cycle1 = _snapshot()
-        cycle2 = _snapshot(
-            positions={"AAPL": Position("AAPL", 10, 100.0, 1010.0)},
-            open_orders=[day_stop],
-        )
-        engine, broker = engine_factory(
-            entries=[False] * 59 + [True],
-            snapshot=startup,
-            place_result=_unknown_result("AAPL", 10, order_id="ord-suspect"),
-        )
-        broker.sync_with_broker.side_effect = [startup, cycle1, cycle2]
-        broker.reconcile_submitted_order.return_value = _filled_result(
-            "AAPL",
-            10,
-            100.5,
-            submitted_at=T0,
-            filled_at=T0 + timedelta(minutes=2),
-        )
-        broker.promote_equity_stop_to_gtc.return_value = promoted
-
-        engine.start(max_cycles=2)
-
-        # P-5: position_uid kwarg is now part of the contract; this
-        # test's recovery path doesn't seed a lifecycle row, so the
-        # engine's lookup returns None.
-        broker.promote_equity_stop_to_gtc.assert_called_once()
-        kwargs = broker.promote_equity_stop_to_gtc.call_args.kwargs
-        assert kwargs["parent_order_id"] is None
-        assert kwargs["stop_order_id"] == "day-stop"
-        assert kwargs["qty"] == 10
-        assert kwargs["stop_price"] == 95.0
-        assert kwargs["client_order_id_prefix"] == (
-            "fake_strategy-recover-stop-gtc"
-        )
-        assert "position_uid" in kwargs
-        broker.place_protective_stop.assert_not_called()
+    # P-6: tests for the legacy _suspect_orders / _recover_suspect_orders
+    # path were removed alongside the cache. The substrate pipeline
+    # (P-1 stream + P-2 cycle reconcile + P-3 startup reconcile +
+    # _maybe_dispatch_substrate_entry_fill) covers the same recovery
+    # behavior. See:
+    #   - tests/test_apply_order_event.py::TestStreamDrainEndToEnd
+    #   - tests/test_apply_order_event.py::TestCycleReconcileStoreQuery
+    #   - tests/test_apply_order_event.py::TestSubstrateEntryFillDispatchSemantics
+    #   - tests/test_stream.py::TestLifecycleEventQueue
 
 
 # ── Scanner cadence ────────────────────────────────────────────────────────
@@ -4966,130 +4871,16 @@ class TestExitPathBenchmarkKind:
         assert engine._record_realized_pnl.call_args.kwargs["external"] is False
 
 
-# ── Slippage unification Defect 2 fix ──────────────────────────────────────
+# ── P-6: TestSuspectOrderBenchmarkProvenance removed ──────────────────────
+#
+# Tested that the legacy _suspect_orders cache preserved the
+# benchmark provenance kind (arrival_midpoint vs fallback_latest_close)
+# through the recovery path. The cache is gone; the substrate's
+# per-order row now carries provenance from submit time onward, and
+# apply_order_event's UPSERT preserves it. Coverage moved to:
+#   - tests/test_apply_order_event.py::TestExpandedUpsertPreservation
+#   - tests/test_apply_order_event.py::TestTradesUpsertProvenancePreservation
+#   - tests/test_broker.py::TestSlippageProvenancePlumbing
 
 
-class TestSuspectOrderBenchmarkProvenance:
-    """
-    Defect 2 (Medium): SuspectOrder previously stored only the resolved
-    modeled_price, not whether the submission used an arrival_midpoint
-    or a latest_close fallback. Recovery hardcoded
-    benchmark_kind='arrival_midpoint', so a row that originally fell
-    into the fallback branch would be mislabeled on recovery.
-
-    Fix preserves modeled_price_kind on SuspectOrder and threads it
-    back through _log_entry at recovery time.
-    """
-
-    def test_recovery_preserves_fallback_kind(self, tmp_path):
-        from execution.broker import BrokerSnapshot, OrderStatus
-        from engine.trader import SuspectOrder
-        from risk.manager import RiskDecision
-
-        # Build a minimal engine via the same fixture as TestExitPathBenchmarkKind.
-        helper = TestExitPathBenchmarkKind()
-        engine, broker = helper._engine_with_real_logger(tmp_path)
-
-        decision = RiskDecision(
-            symbol="AAPL",
-            side=Side.BUY,
-            qty=10,
-            stop_price=145.0,
-            entry_reference_price=150.0,
-            strategy_name="sma_crossover",
-            reason="entry signal",
-            order_type=OrderType.MARKET,
-        )
-        # Simulate a suspect-order originally captured under the
-        # fallback_latest_close branch (no arrival quote available).
-        engine._suspect_orders["AAPL"] = SuspectOrder(
-            decision=decision,
-            order_id="ord-suspect-1",
-            modeled_price=150.0,
-            modeled_price_kind="fallback_latest_close",
-        )
-
-        broker.reconcile_submitted_order.return_value = _filled_result(
-            "AAPL",
-            10,
-            150.05,
-            submitted_at=T0,
-            filled_at=T0 + timedelta(minutes=1),
-        )
-
-        snap = BrokerSnapshot(
-            account=SimpleNamespace(
-                equity=100_000.0,
-                cash=50_000.0,
-                buying_power=50_000.0,
-                open_positions={"AAPL": SimpleNamespace(
-                    qty=10, symbol="AAPL", avg_entry_price=150.05,
-                    market_value=1500.5, unrealized_pl=0.0,
-                    current_price=150.05, cost_basis=1500.5,
-                    asset_id="x", side="long",
-                )},
-            ),
-            open_orders=[],
-        )
-        engine._log_entry = MagicMock()
-        engine._ensure_recovered_protective_stop = MagicMock()
-        engine._recover_suspect_orders(snap)
-
-        kwargs = engine._log_entry.call_args.kwargs
-        assert kwargs["benchmark_kind"] == "fallback_latest_close"
-        assert kwargs["measurement_quality"] == "recovered"
-
-    def test_recovery_preserves_arrival_kind(self, tmp_path):
-        from execution.broker import BrokerSnapshot, OrderStatus
-        from engine.trader import SuspectOrder
-        from risk.manager import RiskDecision
-
-        helper = TestExitPathBenchmarkKind()
-        engine, broker = helper._engine_with_real_logger(tmp_path)
-
-        decision = RiskDecision(
-            symbol="AAPL",
-            side=Side.BUY,
-            qty=10,
-            stop_price=145.0,
-            entry_reference_price=150.0,
-            strategy_name="sma_crossover",
-            reason="entry signal",
-            order_type=OrderType.MARKET,
-        )
-        engine._suspect_orders["AAPL"] = SuspectOrder(
-            decision=decision,
-            order_id="ord-suspect-2",
-            modeled_price=150.0,
-            modeled_price_kind="arrival_midpoint",
-        )
-
-        broker.reconcile_submitted_order.return_value = _filled_result(
-            "AAPL",
-            10,
-            150.05,
-            submitted_at=T0,
-            filled_at=T0 + timedelta(minutes=1),
-        )
-
-        snap = BrokerSnapshot(
-            account=SimpleNamespace(
-                equity=100_000.0,
-                cash=50_000.0,
-                buying_power=50_000.0,
-                open_positions={"AAPL": SimpleNamespace(
-                    qty=10, symbol="AAPL", avg_entry_price=150.05,
-                    market_value=1500.5, unrealized_pl=0.0,
-                    current_price=150.05, cost_basis=1500.5,
-                    asset_id="x", side="long",
-                )},
-            ),
-            open_orders=[],
-        )
-        engine._log_entry = MagicMock()
-        engine._ensure_recovered_protective_stop = MagicMock()
-        engine._recover_suspect_orders(snap)
-
-        kwargs = engine._log_entry.call_args.kwargs
-        assert kwargs["benchmark_kind"] == "arrival_midpoint"
-        assert kwargs["measurement_quality"] == "recovered"
+# (class deleted; coverage moved as documented above)
