@@ -702,6 +702,63 @@ class AlpacaBroker:
             order_type=order_type,
         )
 
+    def _lifecycle_orders_record_exit(
+        self,
+        *,
+        position_uid: str | None,
+        client_order_id: str,
+        broker_order_id: str | None,
+        qty: float,
+        role: str = "exit",
+        order_type: str = "market",
+        order_class: str = "simple",
+        time_in_force: str = "day",
+        intended_limit_price: float | None = None,
+    ) -> None:
+        """Insert + attach an exit-side substrate row in one call.
+
+        Used by every close path that has the broker order_id in
+        hand at write time. Currently:
+
+          - role='exit' (P-6): broker.close_position (full
+            liquidation via Alpaca's close-position API).
+          - role='partial_close' (deferred): reserved for a future
+            strategy that submits a sell smaller than the position.
+            No call sites today.
+
+        POST-submit semantics — same discipline as the stop helper.
+        A substrate failure here is logged CRITICAL and absorbed;
+        the close has already gone to Alpaca and cycle reconciliation
+        will reattempt the attach via client_order_id.
+
+        No-op when the store isn't wired or position_uid is None."""
+        if self._lifecycle_orders_store is None or position_uid is None:
+            return
+        try:
+            self._lifecycle_orders_store.insert_pending(
+                position_uid=position_uid,
+                role=role,
+                client_order_id=client_order_id,
+                order_type=order_type,
+                order_class=order_class,
+                time_in_force=time_in_force,
+                side="sell",
+                intended_qty=float(qty),
+                intended_limit_price=intended_limit_price,
+            )
+            if broker_order_id is not None:
+                self._lifecycle_orders_store.attach_broker_order_id(
+                    client_order_id=client_order_id,
+                    order_id=broker_order_id,
+                )
+        except Exception as exc:
+            logger.critical(
+                f"lifecycle_orders.{role} FAILED for "
+                f"{client_order_id} → {broker_order_id}: {exc}. The "
+                f"broker exit is live; cycle reconciliation will "
+                f"retry. Investigate substrate health."
+            )
+
     # ── Retry wrapper ────────────────────────────────────────────────────
 
     def _with_retry(self, fn, *, op_desc: str = "broker call"):
@@ -2082,6 +2139,7 @@ class AlpacaBroker:
         *,
         poll_timeout: float = ORDER_CONFIRM_TIMEOUT_SECONDS,
         poll_interval: float = 1.0,
+        position_uid: str | None = None,
     ) -> OrderResult:
         """
         Liquidate an open position with a market order. Used for hard-risk
@@ -2093,6 +2151,13 @@ class AlpacaBroker:
         shares against those siblings and rejects the close as
         "insufficient qty available". A hard exit must not fail because of an
         already-attached stop.
+
+        P-6: when ``position_uid`` is supplied, an ``exit`` substrate
+        row is recorded with the broker-assigned identifiers from
+        the close response (Alpaca's close-position API generates
+        the client_order_id internally). Callers without the uid
+        (legacy tests, ad-hoc REPL use) pass None and the substrate
+        write is skipped — the broker close still executes.
         """
         positions = self.get_positions()
         if symbol not in positions:
@@ -2122,14 +2187,25 @@ class AlpacaBroker:
                 message=str(e),
             )
         order_id = str(order.id)
+        # P-6: record the exit substrate row. Alpaca's close-position
+        # API generates the client_order_id internally, so we read it
+        # off the response. POST-submit semantics — the broker close
+        # is already accepted; substrate failure is logged CRITICAL
+        # and absorbed.
+        close_client_id = str(
+            getattr(order, "client_order_id", None) or order_id
+        )
+        self._lifecycle_orders_record_exit(
+            position_uid=position_uid,
+            client_order_id=close_client_id,
+            broker_order_id=order_id,
+            qty=float(qty),
+        )
         stream_event: threading.Event | None = None
         if self._stream_manager is not None:
-            client_order_id = str(
-                getattr(order, "client_order_id", None) or order_id
-            )
-            stream_event = self._stream_manager.watch(client_order_id)
+            stream_event = self._stream_manager.watch(close_client_id)
             self._stream_manager.bind_submitted_order(
-                client_order_id=client_order_id,
+                client_order_id=close_client_id,
                 order_id=order_id,
             )
         try:

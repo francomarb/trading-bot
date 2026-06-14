@@ -518,7 +518,7 @@ class TestProcessSymbol:
         snap = _snapshot(positions=positions)
         engine._session_start_equity = snap.account.equity
         self._process(engine, "AAPL", snap)
-        broker.close_position.assert_called_once_with("AAPL")
+        broker.close_position.assert_called_once_with("AAPL", position_uid=None)
         broker.place_order.assert_not_called()
 
     def test_global_halt_does_not_block_exit(self, engine_factory):
@@ -531,7 +531,7 @@ class TestProcessSymbol:
 
         self._process(engine, "AAPL", snap)
 
-        broker.close_position.assert_called_once_with("AAPL")
+        broker.close_position.assert_called_once_with("AAPL", position_uid=None)
         broker.place_order.assert_not_called()
 
     def test_exit_signal_with_no_position_does_nothing(self, engine_factory):
@@ -585,7 +585,7 @@ class TestProcessSymbol:
 
         assert strategy.inspect_calls == 1
         assert strategy.raw_calls == 0
-        broker.close_position.assert_called_once_with(occ)
+        broker.close_position.assert_called_once_with(occ, position_uid=None)
         broker.place_order.assert_not_called()
         assert not engine._has_position("SPY")
         assert "SPY" not in engine._entry_prices
@@ -611,7 +611,7 @@ class TestProcessSymbol:
 
         self._process(engine, "AAPL", snap)
 
-        broker.close_position.assert_called_once_with("AAPL")
+        broker.close_position.assert_called_once_with("AAPL", position_uid=None)
 
     def test_processed_bar_signal_exit_respects_position_owner(
         self, engine_factory, patch_fetch
@@ -658,7 +658,7 @@ class TestProcessSymbol:
 
         self._process(engine, "AAPL", snap)
 
-        broker.close_position.assert_called_once_with("AAPL")
+        broker.close_position.assert_called_once_with("AAPL", position_uid=None)
         assert engine._has_position("AAPL")
         assert engine._entry_prices["AAPL"] == 100.0
 
@@ -697,7 +697,7 @@ class TestProcessSymbol:
 
         self._process(engine, "AAPL", snap)
 
-        broker.close_position.assert_called_once_with("AAPL")
+        broker.close_position.assert_called_once_with("AAPL", position_uid=None)
 
     def test_option_trade_rejected_logs_warning_and_skips_order(
         self, engine_factory, monkeypatch
@@ -1499,7 +1499,7 @@ class TestPositionOwnership:
 
         slot = engine.slots[0]
         engine._process_symbol("AAPL", snap, snap.account, slot.strategy, slot.timeframe)
-        broker.close_position.assert_called_once_with("AAPL")
+        broker.close_position.assert_called_once_with("AAPL", position_uid=None)
         # Ownership cleared after close.
         assert not engine._has_position("AAPL")
 
@@ -1513,7 +1513,7 @@ class TestPositionOwnership:
         # No ownership recorded — should still allow close.
         slot = engine.slots[0]
         engine._process_symbol("AAPL", snap, snap.account, slot.strategy, slot.timeframe)
-        broker.close_position.assert_called_once_with("AAPL")
+        broker.close_position.assert_called_once_with("AAPL", position_uid=None)
 
     def test_entry_registers_ownership(self, engine_factory):
         """A successful entry fill records the strategy as position owner."""
@@ -3380,7 +3380,7 @@ class TestOptionsEngineFixes:
         engine._repair_missing_protective_stops(snap)
 
         engine.broker.place_protective_stop.assert_not_called()
-        engine.broker.close_position.assert_called_once_with("AAPL")
+        engine.broker.close_position.assert_called_once_with("AAPL", position_uid=None)
         engine.alerts.broker_error.assert_not_called()
         engine.alerts.trade_executed.assert_called_once()
         assert engine._get_owner("AAPL") is None
@@ -4675,7 +4675,7 @@ class TestSharedSymbolConflict:
         snap = _snapshot(positions=positions)
         engine._session_start_equity = snap.account.equity
         self._process(engine, "AAPL", snap)
-        broker.close_position.assert_called_once_with("AAPL")
+        broker.close_position.assert_called_once_with("AAPL", position_uid=None)
 
 
 # ── Sector exposure observability (11.7 Part B) ────────────────────────────

@@ -2923,3 +2923,147 @@ class TestReplacementStopSubstrate:
             position_uid="pos-X",
         )
         assert result is not None
+
+
+# ── P-6 (consumer wiring): exit substrate insert ───────────────────────────
+
+
+class TestExitSubstrate:
+    """P-6: broker.close_position records an `exit` substrate row
+    when the engine supplies position_uid. Alpaca's close-position
+    API generates the client_order_id internally; the broker reads
+    it off the response and uses it as the substrate row key."""
+
+    @staticmethod
+    def _broker(api: MagicMock, orders_store: MagicMock):
+        broker = AlpacaBroker(
+            client=api, max_attempts=1, base_delay=0.0,
+            lifecycle_orders_store=orders_store,
+            lifecycle_store=MagicMock(),
+        )
+        broker._lifecycle_store.create_pending = MagicMock(return_value="pos-P6")
+        return broker
+
+    @staticmethod
+    def _close_response(*, id: str, cli: str):
+        from types import SimpleNamespace
+        return SimpleNamespace(
+            id=id,
+            client_order_id=cli,
+            status="filled",
+            symbol="AAPL",
+            qty="10",
+            side="sell",
+            type="market",
+            stop_price=None,
+            limit_price=None,
+            time_in_force="day",
+            submitted_at="2026-06-15T14:30:00Z",
+            filled_at="2026-06-15T14:30:05Z",
+            filled_qty="10",
+            filled_avg_price="100.5",
+            legs=None,
+        )
+
+    def test_close_position_with_uid_records_exit_row(self):
+        from types import SimpleNamespace
+        api = MagicMock()
+        # close_position uses get_positions + _api.close_position(symbol).
+        api.get_all_positions.return_value = [
+            SimpleNamespace(
+                symbol="AAPL", qty="10", avg_entry_price="100.0",
+                current_price="100.5", side="long",
+                asset_class=SimpleNamespace(value="us_equity"),
+                cost_basis="1000.0", market_value="1005.0",
+            )
+        ]
+        api.get_orders.return_value = []
+        api.close_position.return_value = self._close_response(
+            id="alpaca-close-1", cli="alpaca-cli-close-1",
+        )
+        api.get_order_by_id.return_value = self._close_response(
+            id="alpaca-close-1", cli="alpaca-cli-close-1",
+        )
+        orders_store = MagicMock()
+        broker = self._broker(api, orders_store)
+
+        broker.close_position("AAPL", position_uid="pos-X", poll_timeout=0.1)
+
+        exit_call = [
+            c for c in orders_store.insert_pending.call_args_list
+            if c.kwargs.get("role") == "exit"
+        ][0]
+        kwargs = exit_call.kwargs
+        assert kwargs["position_uid"] == "pos-X"
+        assert kwargs["side"] == "sell"
+        assert kwargs["order_type"] == "market"
+        assert kwargs["order_class"] == "simple"
+        assert kwargs["intended_qty"] == 10.0
+        assert kwargs["client_order_id"] == "alpaca-cli-close-1"
+
+        # attach with the broker close id
+        attach_calls = [
+            c for c in orders_store.attach_broker_order_id.call_args_list
+            if c.kwargs.get("client_order_id") == "alpaca-cli-close-1"
+        ]
+        assert len(attach_calls) == 1
+        assert attach_calls[0].kwargs["order_id"] == "alpaca-close-1"
+
+    def test_close_position_without_uid_skips_substrate_write(self):
+        from types import SimpleNamespace
+        api = MagicMock()
+        api.get_all_positions.return_value = [
+            SimpleNamespace(
+                symbol="AAPL", qty="10", avg_entry_price="100.0",
+                current_price="100.5", side="long",
+                asset_class=SimpleNamespace(value="us_equity"),
+                cost_basis="1000.0", market_value="1005.0",
+            )
+        ]
+        api.get_orders.return_value = []
+        api.close_position.return_value = self._close_response(
+            id="alpaca-close-2", cli="alpaca-cli-close-2",
+        )
+        api.get_order_by_id.return_value = self._close_response(
+            id="alpaca-close-2", cli="alpaca-cli-close-2",
+        )
+        orders_store = MagicMock()
+        broker = self._broker(api, orders_store)
+
+        broker.close_position("AAPL", poll_timeout=0.1)
+
+        roles = [
+            c.kwargs.get("role")
+            for c in orders_store.insert_pending.call_args_list
+        ]
+        assert "exit" not in roles
+
+    def test_substrate_failure_does_not_abort_close(self):
+        """POST-submit semantics: insert raising must not crash the
+        close. The broker close has already been accepted."""
+        from types import SimpleNamespace
+        api = MagicMock()
+        api.get_all_positions.return_value = [
+            SimpleNamespace(
+                symbol="AAPL", qty="10", avg_entry_price="100.0",
+                current_price="100.5", side="long",
+                asset_class=SimpleNamespace(value="us_equity"),
+                cost_basis="1000.0", market_value="1005.0",
+            )
+        ]
+        api.get_orders.return_value = []
+        api.close_position.return_value = self._close_response(
+            id="alpaca-close-3", cli="alpaca-cli-close-3",
+        )
+        api.get_order_by_id.return_value = self._close_response(
+            id="alpaca-close-3", cli="alpaca-cli-close-3",
+        )
+        orders_store = MagicMock()
+        orders_store.insert_pending.side_effect = RuntimeError("substrate down")
+        broker = self._broker(api, orders_store)
+
+        # Does NOT raise.
+        result = broker.close_position(
+            "AAPL", position_uid="pos-X", poll_timeout=0.1,
+        )
+        assert result is not None

@@ -2895,7 +2895,26 @@ class TradingEngine:
             f"{symbol}: auto-closing residual fractional position qty={position.qty} "
             "because it cannot carry a whole-share protective stop"
         )
-        result = self.broker.close_position(position.symbol)
+        # P-6: thread position_uid through so the broker writes an
+        # exit substrate row alongside the close. Lookup is best-
+        # effort; failure logs DEBUG and we proceed without the
+        # substrate write (matches the protective_stop pattern).
+        _exit_uid: str | None = None
+        if self.lifecycle_store is not None:
+            try:
+                _row = self.lifecycle_store.get_open_for_owner_key(
+                    owner_key_for(position.symbol),
+                )
+                if _row is not None:
+                    _exit_uid = _row.position_uid
+            except Exception as exc:
+                logger.debug(
+                    f"residual-close position_uid lookup raised "
+                    f"{type(exc).__name__}: {exc} — proceeding"
+                )
+        result = self.broker.close_position(
+            position.symbol, position_uid=_exit_uid,
+        )
         close_price = float(
             result.avg_fill_price
             or getattr(position, "current_price", 0.0)
@@ -4560,8 +4579,24 @@ class TradingEngine:
             logger.info(f"{symbol}: close requested but a close order is already pending — skipping")
             return False
 
+        # P-6: thread position_uid for the exit substrate row.
+        _exit_uid: str | None = None
+        if self.lifecycle_store is not None:
+            try:
+                _row = self.lifecycle_store.get_open_for_owner_key(
+                    owner_key_for(position.symbol),
+                )
+                if _row is not None:
+                    _exit_uid = _row.position_uid
+            except Exception as exc:
+                logger.debug(
+                    f"{symbol}: exit position_uid lookup raised "
+                    f"{type(exc).__name__}: {exc} — proceeding"
+                )
         try:
-            result = self.broker.close_position(position.symbol)
+            result = self.broker.close_position(
+                position.symbol, position_uid=_exit_uid,
+            )
         except Exception as e:
             logger.error(f"{symbol}: close_position failed: {e}")
             self.risk.record_broker_error()
