@@ -970,13 +970,33 @@ class TradeLogger:
 
     # Columns where a value-to-different-value transition is an
     # identity conflict and must surface loudly rather than silently
-    # be kept-or-clobbered. PR #60 round 2 review (finding 6 sub-point):
-    # if a second log() arrives carrying a DIFFERENT non-null
-    # position_uid for the same order_id, that's a foundation
-    # invariant violation — the broker order belongs to exactly one
-    # lifecycle row. The UPSERT below detects this before the write
-    # and raises ``TradeLoggerIdentityConflict``.
-    _UPSERT_IDENTITY_CONFLICT_COLUMNS = frozenset({"position_uid"})
+    # be kept-or-clobbered. Expanded in PR #60 round 4 review
+    # (P2 finding) to cover every column that names what the order
+    # IS — round 3 reviewer noted a populated position_id='AAPL'
+    # could become NULL after a sparse follow-up. Identity columns
+    # belong here, not in the default excluded.<col> bucket.
+    #
+    # Semantics:
+    #   - value→different-value: TradeLoggerIdentityConflict raised
+    #     BEFORE the write. Surfaces the caller bug instead of
+    #     silently mutating identity.
+    #   - NULL→value: allowed (restart-reconstruction fills NULL).
+    #   - value→NULL: preserved via the same COALESCE shape used by
+    #     _UPSERT_COALESCE_COLUMNS (set-once-and-keep).
+    #
+    # The set includes every identity / intent column on the trades
+    # table. position_uid was already covered (round 2); round 4
+    # adds position_id, symbol, side, strategy, order_type, and
+    # requested_qty.
+    _UPSERT_IDENTITY_CONFLICT_COLUMNS = frozenset({
+        "position_uid",
+        "position_id",
+        "symbol",
+        "side",
+        "strategy",
+        "order_type",
+        "requested_qty",
+    })
 
     # Latest-non-null bucket (PR #60 round 3 fix). These are computed
     # accounting fields that legitimately update across multiple

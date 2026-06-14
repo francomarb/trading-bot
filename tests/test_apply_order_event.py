@@ -1545,3 +1545,121 @@ class TestLatestNonNullAccountingBucket:
         ).fetchone()
         assert row[0] == 151.5
         assert row[1] == "filled"
+
+
+# ── PR #60 round 4 (P2 identity column expansion) ──────────────────────────
+
+
+class TestIdentityColumnExpansion:
+    """Round 4 P2 finding: position_id was in the default
+    excluded.<col> bucket — a sparse follow-up could clobber
+    populated 'AAPL' with NULL. Round 4 moves position_id and the
+    other identity/intent columns into the IDENTITY_CONFLICT set
+    so they raise on value→different-value and are preserved on
+    value→NULL."""
+
+    @staticmethod
+    def _record(*, order_id: str, **overrides):
+        from reporting.logger import TradeRecord
+        defaults = dict(
+            timestamp="2026-06-12T10:00:00+00:00",
+            symbol="AAPL", side="buy", qty=10,
+            avg_fill_price=150.0, order_id=order_id,
+            strategy="sma_crossover", reason="entry",
+            stop_price=145.0, entry_reference_price=150.0,
+            modeled_slippage_bps=0.0, realized_slippage_bps=3.5,
+            order_type="market", status="filled",
+            requested_qty=10, filled_qty=10,
+            position_id="AAPL",
+            position_type="single_leg",
+        )
+        defaults.update(overrides)
+        return TradeRecord(**defaults)
+
+    def test_position_id_preserved_on_sparse_null(self, tmp_path):
+        """The exact regression ChatGPT reproduced: populated
+        position_id='AAPL' must survive a sparse follow-up with
+        position_id=None."""
+        from reporting.logger import TradeLogger
+        tl = TradeLogger(path=str(tmp_path / "trades.db"))
+        tl.log(self._record(order_id="ord-pid", position_id="AAPL"))
+        tl.log(self._record(order_id="ord-pid", position_id=None))
+        row = tl._ensure_db().execute(
+            "SELECT position_id FROM trades WHERE order_id = 'ord-pid'"
+        ).fetchone()
+        assert row[0] == "AAPL"
+
+    def test_position_id_different_value_raises_conflict(self, tmp_path):
+        from reporting.logger import TradeLogger, TradeLoggerIdentityConflict
+        tl = TradeLogger(path=str(tmp_path / "trades.db"))
+        tl.log(self._record(order_id="ord-pid2", position_id="AAPL"))
+        with pytest.raises(TradeLoggerIdentityConflict):
+            tl.log(self._record(order_id="ord-pid2", position_id="TSLA"))
+
+    # NOTE: trades.symbol has a NOT NULL constraint at the schema
+    # level — a sparse-null follow-up is structurally impossible.
+    # The COALESCE preservation behavior is therefore unreachable
+    # for symbol; the different-value conflict path below is the
+    # meaningful coverage.
+
+    def test_symbol_different_value_raises_conflict(self, tmp_path):
+        from reporting.logger import TradeLogger, TradeLoggerIdentityConflict
+        tl = TradeLogger(path=str(tmp_path / "trades.db"))
+        tl.log(self._record(order_id="ord-sym2", symbol="AAPL"))
+        with pytest.raises(TradeLoggerIdentityConflict):
+            tl.log(self._record(order_id="ord-sym2", symbol="TSLA"))
+
+    def test_side_different_value_raises_conflict(self, tmp_path):
+        from reporting.logger import TradeLogger, TradeLoggerIdentityConflict
+        tl = TradeLogger(path=str(tmp_path / "trades.db"))
+        tl.log(self._record(order_id="ord-side", side="buy"))
+        with pytest.raises(TradeLoggerIdentityConflict):
+            tl.log(self._record(order_id="ord-side", side="sell"))
+
+    def test_strategy_different_value_raises_conflict(self, tmp_path):
+        from reporting.logger import TradeLogger, TradeLoggerIdentityConflict
+        tl = TradeLogger(path=str(tmp_path / "trades.db"))
+        tl.log(self._record(order_id="ord-str", strategy="sma_crossover"))
+        with pytest.raises(TradeLoggerIdentityConflict):
+            tl.log(self._record(
+                order_id="ord-str", strategy="rsi_reversion",
+            ))
+
+    def test_order_type_different_value_raises_conflict(self, tmp_path):
+        from reporting.logger import TradeLogger, TradeLoggerIdentityConflict
+        tl = TradeLogger(path=str(tmp_path / "trades.db"))
+        tl.log(self._record(order_id="ord-ot", order_type="market"))
+        with pytest.raises(TradeLoggerIdentityConflict):
+            tl.log(self._record(order_id="ord-ot", order_type="limit"))
+
+    def test_requested_qty_different_value_raises_conflict(self, tmp_path):
+        from reporting.logger import TradeLogger, TradeLoggerIdentityConflict
+        tl = TradeLogger(path=str(tmp_path / "trades.db"))
+        tl.log(self._record(order_id="ord-rq", requested_qty=10))
+        with pytest.raises(TradeLoggerIdentityConflict):
+            tl.log(self._record(order_id="ord-rq", requested_qty=20))
+
+    def test_identity_null_to_value_allowed(self, tmp_path):
+        """The NULL→value direction: restart reconstruction may
+        write position_id where it was previously NULL."""
+        from reporting.logger import TradeLogger, TradeRecord
+        tl = TradeLogger(path=str(tmp_path / "trades.db"))
+        # First write: position_id=NULL.
+        first = TradeRecord(
+            timestamp="2026-06-12T10:00:00+00:00",
+            symbol="AAPL", side="buy", qty=10,
+            avg_fill_price=150.0, order_id="ord-fill",
+            strategy="sma_crossover", reason="entry",
+            stop_price=145.0, entry_reference_price=150.0,
+            modeled_slippage_bps=0.0, realized_slippage_bps=3.5,
+            order_type="market", status="filled",
+            requested_qty=10, filled_qty=10,
+            position_id=None,
+            position_type="single_leg",
+        )
+        tl.log(first)
+        tl.log(self._record(order_id="ord-fill", position_id="AAPL"))
+        row = tl._ensure_db().execute(
+            "SELECT position_id FROM trades WHERE order_id = 'ord-fill'"
+        ).fetchone()
+        assert row[0] == "AAPL"
