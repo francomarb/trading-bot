@@ -60,20 +60,37 @@ Substrate-landed totals: ~7100 LOC code + ~3800 LOC tests across 23 commits.
 
 ---
 
-## Planned (next phase — not yet started)
+## Phase 2 — Consumer wiring + cache removal (`feat/order-lifecycle-consumer-wiring`)
 
-Consumer wiring + cache removal. These were originally listed as commits 7–13 in the very first draft of this tracker; the PR #60 review series consumed those numbers and shifted them out. They will land as a sequence of commits AFTER PR #60 merges, on a follow-up branch.
+After PR #60 merged to main on 2026-06-14, the consumer wiring landed on a follow-up branch. Substrate became load-bearing: every state transition the legacy `_suspect_orders` / `_suspect_exit_orders` caches were catching is now captured by the substrate, and the side effects fire from `_maybe_dispatch_substrate_{entry,exit}_fill` via the same code path the synchronous fast path uses.
 
-| Step | Scope | Doc anchor | LOC est. | Tests | Status |
-|---|---|---|---|---|---|
-| P-1 | Wire WebSocket stream → `apply_order_event` (drains via the lifecycle-attach queue introduced in commit 12) | §6.4 / §10.1 | ~300 | 4 | ⬜ |
-| P-2 | Wire cycle reconciliation (`_reconcile_position_lifecycle`) → `apply_order_event` | §6.4 / §10.1 / §3.1 | ~300 | 4 | ⬜ |
-| P-3 | Wire startup reconciliation: downtime fill/cancel walk against closed-order history | §6.4 / §10.1 | ~250 | 3 | ⬜ |
-| P-4 | Wire `protective_stop` role: broker OTO child gets its own per-order row | §10.3 | ~150 | 2 | ⬜ |
-| P-5 | Wire `replacement_stop` role: PR #47 GTC promotion uses durable identity | §10.3 | ~150 | 2 | ⬜ |
-| P-6 | Remove `_suspect_orders` cache (after smoke-test verification) | §10.1 / §6.7 | ~200 | 2 | ⬜ |
-| P-7 | Remove `_suspect_exit_orders` cache (after smoke-test verification) | §10.2 / §6.7 | ~150 | 2 | ⬜ |
-| P-8 | Doc updates: PLAN.md, operator_controls_proposal.md §17, slippage_unification_tracker.md | §12 | ~50 | — | ⬜ |
+| Step | Scope | Doc anchor | Commit(s) | Status |
+|---|---|---|---|---|
+| P-4 | Wire `protective_stop` role: broker OTO child + fractional GTC + repair flow get their own per-order rows | §10.3 | `6883b87` | ✅ |
+| P-5 | Wire `replacement_stop` role: `promote_equity_stop_to_gtc` records lineage via `replaces_order_id` | §10.3 | `f3feaa7` | ✅ |
+| P-6e | Wire `exit` role: `close_position` records the close substrate row at submit time | §10.3 | `bf3a6e4` | ✅ |
+| P-1 | Wire WebSocket stream → `apply_order_event` via the new `_pending_lifecycle_events` queue + engine cycle drain | §6.4 / §10.1 | `6cd718e` | ✅ |
+| P-2 | Wire cycle reconciliation: per-cycle REST walk of substrate rows whose `order_id` is absent from `snapshot.open_orders`, capped at 20/cycle | §6.4 / §10.1 / §3.1 | `7cb6366` | ✅ |
+| P-3 | Wire startup reconciliation: post-restart walk of all non-terminal substrate rows, unlimited (one-shot) | §6.4 / §10.1 | `92b5157` | ✅ |
+| P-6a | Extract `_apply_recovered_entry_side_effects` helper (ownership bind + entry-price cache + stop replacement + alert) | §10.1 | `1378289` | ✅ |
+| P-6b | Wire `_maybe_dispatch_substrate_entry_fill` from stream + cycle + startup drains; gates on `_has_position` to avoid double-firing | §10.1 / §6.7 | `73793d7` | ✅ |
+| P-6c | Delete `_suspect_orders` cache, `SuspectOrder` dataclass, `_remember_suspect_order`, `_recover_suspect_orders` | §10.1 / §6.7 | `b982870` | ✅ |
+| P-7a | Wire `_maybe_dispatch_substrate_exit_fill` from same drain handlers; uses existing `_record_recovered_exit_fill` (idempotent via `has_recorded_order_id`) | §10.2 / §6.7 | `860ce93` | ✅ |
+| P-7b | Delete `_suspect_exit_orders` cache, `SuspectExitOrder` dataclass, `_recover_suspect_exit_orders`, staging branch in `_close_single_leg_position` | §10.2 / §6.7 | `ecce2da` | ✅ |
+| P-8 | Doc updates: this tracker + PLAN.md + slippage_unification_tracker.md + operator_controls_proposal.md §17 | §12 | (this commit) | 🔄 In progress |
+
+Consumer-wiring totals: ~1,800 LOC code + ~750 LOC tests across 11 commits; ~500 LOC of legacy cache infrastructure deleted.
+
+### Four-tier capture pipeline (substrate becomes load-bearing)
+
+| Tier | Path | Trigger | Cost |
+|---|---|---|---|
+| 1 | Substrate-attach queue (foundation commit 12) | Worker post-submit | Free (queue) |
+| 2 | WS → `apply_order_event` (P-1) | Real-time Alpaca trade_update | Free (already-paid stream) |
+| 3 | Cycle reconcile (P-2) | Every 5 min for missed-terminal rows | ≤20 REST calls/cycle |
+| 4 | Startup reconcile (P-3) | Each bot restart, all non-terminal rows | One-shot REST sweep |
+
+Each tier writes through `apply_order_event`, which advances the per-order state machine, recomputes the position rollup, and updates the position-status CTE. The same dispatch (`_maybe_dispatch_substrate_{entry,exit}_fill`) fires the engine-side side effects regardless of which tier captured the transition — synchronous happy path or async recovery use one code path.
 
 ---
 
@@ -83,14 +100,14 @@ Each row from the discovery doc's §10 maps to one or more commits above.
 
 | § | Category | Replaces | Commits | Status |
 |---|---|---|---|---|
-| 10.1 | Entry uncertainty / duplicate prevention / pending grace | `_suspect_orders`, broker-open duplicate checks, `LIFECYCLE_PENDING_GRACE_SECONDS` | substrate-side prepared in 6, 9, 12; cache removal P-6 | 🔄 substrate done; consumer pending |
-| 10.2 | Uncertain single-leg exits | `_suspect_exit_orders` | substrate-side prepared in 6; cache removal P-7 | 🔄 substrate done; consumer pending |
-| 10.3 | Protective stop promotion / replacement / repair | `_reported_stop_promotion_failures` identity workaround | P-4, P-5 | ⬜ |
+| 10.1 | Entry uncertainty / duplicate prevention / pending grace | `_suspect_orders`, broker-open duplicate checks, `LIFECYCLE_PENDING_GRACE_SECONDS` | substrate: 6, 9, 12; consumer wiring: P-1/P-2/P-3; cache delete: P-6 | ✅ |
+| 10.2 | Uncertain single-leg exits | `_suspect_exit_orders` | substrate: 6 + P-6e; consumer wiring: P-1/P-2/P-3; cache delete: P-7 | ✅ |
+| 10.3 | Protective stop promotion / replacement / repair | `_reported_stop_promotion_failures` identity workaround | P-4, P-5 | ✅ |
 | 10.4 | Option trailing state split | `option_trailing_stops.alpaca_stop_order_id` denormalization | (separate follow-up) | ⬜ |
 | 10.5 | Slippage recovery — preserve provenance | `SuspectOrder.modeled_price_kind` moves to per-order row | 4 (substrate column) + 9 (plumbed from engine through broker) + 11 (UPSERT preservation) | ✅ |
 | 10.6 | Position-level partial-close accounting | (acceptance tests; carries forward unchanged) | 4 (rollup) | ✅ |
 | 10.7 | MLEG partial-close `_spreads_pending_close` | (single-leg side solved; MLEG side deferred) | (deferred to spread lifecycle PR) | ⬜ |
-| 10.8 | PR #58 disposition | (rebuild, do not cherry-pick) | (deferred until foundation merges) | ⬜ |
+| 10.8 | PR #58 disposition | (rebuild, do not cherry-pick) | (PR #60 merged; consumer wiring landed) | rebuild blocked on §10.4 / §10.7 |
 
 ---
 
@@ -109,27 +126,27 @@ Statuses below cover the SUBSTRATE-LANDED portion of the PR. Items still in the 
 | 5 | UPSERT + partial-unique-index pair | §6.5 R5-C2 | 5 | ✅ |
 | 6 | All-or-nothing transaction on failure | §6.4 R4-P1b | 4 | ✅ |
 | 7 | execution_id NULL on REST recovery | §6.5 R4-P1a | 8 | ✅ |
-| 8 | `_suspect_orders` removal preserves TIMEOUT/UNKNOWN recovery | §10.1 | P-6 | ⬜ |
-| 9 | `_suspect_exit_orders` removal preserves invariants | §10.2 | P-7 | ⬜ |
-| 10 | `replacement_stop` atomic-replace | §10.3 / §6.4 | P-5 | ⬜ |
+| 8 | `_suspect_orders` removal preserves TIMEOUT/UNKNOWN recovery | §10.1 | P-6 (TestSubstrateEntryFillDispatchSemantics) | ✅ |
+| 9 | `_suspect_exit_orders` removal preserves invariants | §10.2 | P-7 (TestSubstrateExitFillDispatchSemantics) | ✅ |
+| 10 | `replacement_stop` atomic-replace | §10.3 / §6.4 | P-5 (TestReplacementStopSubstrate) | ✅ |
 | 11 | Zero-fill working entry stays `pending` | §6.6.1 R7-P0 | 4 | ✅ |
 | 12 | Working sell-side order blocks `closed` (R12 supersedes R8-1) | §6.6.1 R12-P1 | 4 | ✅ |
 | 13 | `closed_at` set only on `closed` / `external_closed` | §6.6.1 R8-P2 | 4 | ✅ |
 | 14 | `closed_at` reads new status via CTE | §6.6.1 R9-P1a | 4 | ✅ |
 | 15 | Negative `current_qty` → `error` | §6.6.1 R9-P1b | 4 | ✅ |
 | 16 | `'error'` retains owner_key lock | §6.2 R8-3 | 1 | ✅ |
-| 17 | Reverse-pass skips `'error'` rows | §3.1 R8-4 | P-2 | ⬜ |
+| 17 | Reverse-pass skips `'error'` rows | §3.1 R8-4 | P-2 (TestCycleReconcileStoreQuery::test_error_status_excluded) | ✅ |
 | 18 | Dedupe script detection-only default | §12.2 R8-2 | 7 | ✅ |
 | 19 | Migration preflight covers `'error'` status | §12.2 R9-P1c | 2 | ✅ |
 | 20 | Working sell-side order blocks `closed` AND lock retains | §6.6.1 R12-P1 | 4 | ✅ |
 | 21 | Oversold position → `error` immediately | §6.6.1 R9-P1b + R11 | 4 | ✅ |
-| 22 | Broker-snapshot guard defense-in-depth | §10.1 R10-P1b | P-1 | ⬜ |
+| 22 | Broker-snapshot guard defense-in-depth | §10.1 R10-P1b | P-1 (TestStreamDrainEndToEnd + TestSubstrateEntryFillDispatchSemantics — _has_position guard) | ✅ |
 | 23 | Direct `pending → filled` via fast path | §6.3 / §6.4 R11-P1 | 4 | ✅ |
 | 24 | Direct `pending → canceled` via recovery | §6.3 / §6.4 R12 | 4 | ✅ |
 | 25 | `PRAGMA foreign_keys = ON;` enforces FKs | §6.2 R13-G1 | 1 | ✅ |
 | 26 | `net_realized_pnl` rollup from `trades` (not orders table) | §6.6 R13-G2 | 4 | ✅ |
 
-21/26 landed in the substrate phase. The 5 remaining (#8 → P-6, #9 → P-7, #10 → P-5, #17 → P-2, #22 → P-1) all depend on consumer wiring and ship with the corresponding planned step.
+26/26 ✅ as of consumer-wiring branch. The original 21/26 (substrate phase) plus the 5 deferred items (#8, #9, #10, #17, #22) all landed via the planned consumer-wiring steps. Test anchors are listed in the table above for each item.
 
 ---
 
@@ -164,47 +181,46 @@ The foundation PR must update (per discovery doc §12):
 
 ## Smoke check protocol
 
-Two separate sets — substrate-merge smoke runs on PR #60 alone; the
-full-loop smoke depends on the planned consumer-wiring phase. Round
-4 review correctly noted that the old single list implied things
-that cannot happen until P-1..P-7 land.
+### Substrate-merge smoke (PR #60) — ✅ passed 2026-06-14
 
-### Substrate-merge smoke (after PR #60 merges to main)
+After PR #60 merged, the bot recycled cleanly on the new code:
 
-Validates the substrate plumbing without depending on the consumer
-work that hasn't landed yet:
-
-- [ ] Bot recycles cleanly (migration runs idempotently)
-- [ ] Preflight duplicate check passes on production DB — both
+- [x] Bot recycles cleanly (migration runs idempotently)
+- [x] Preflight duplicate check passes on production DB — both
       `position_lifecycle.owner_key` and `trades.order_id` dimensions
-      (or operator runs `scripts/migrate_dedupe_trades.py` first)
+      (clean on first scan; no remediation needed)
 - [ ] First post-merge entry creates a `position_lifecycle_orders`
-      row at status='pending'; submit return populates `order_id`
-      via the new attach path (or the queued-attach drain for
-      options orders)
-- [ ] Slippage benchmark provenance (the four `slippage_benchmark_*`
-      columns) is populated on the new substrate row for each entry
-- [ ] Parity check: existing `position_lifecycle` rollups
-      (`current_qty`, `avg_entry_price`, `net_realized_pnl`) remain
-      consistent with pre-merge behavior — substrate is additive,
-      no legacy path changed observable values
+      row at status='pending' — pending Monday's market open
+- [ ] Slippage benchmark provenance populated — pending Monday
+- [x] Parity check: existing `position_lifecycle` rollups remain
+      consistent with pre-merge behavior
 
-### Full-loop smoke (after planned phase P-1..P-7 lands)
+### Full-loop smoke (consumer-wiring branch) — pending Monday's first fill
 
-Validates that the substrate is being read by reconciliation and
-that the legacy `_suspect_*` caches are gone. These items cannot
-pass before P-1..P-7 ship on the follow-up branch:
+The consumer-wiring branch (`feat/order-lifecycle-consumer-wiring`)
+recycled cleanly. The full pipeline (entry submit → substrate row →
+WS apply → dispatch → ownership bind → recovery on any tier) needs
+a live fill to validate end-to-end. Items to check after Monday's
+first new entry:
 
-- [ ] First post-merge entry advances `pending` → `working` →
-      `filled` on the substrate via WebSocket → `apply_order_event`
-      (depends on P-1)
-- [ ] First post-merge exit creates a `role='exit'` row; position
-      transitions to `closed` after exit terminates (depends on
-      P-1 / P-2)
-- [ ] First post-merge stop fill advances the `protective_stop`
-      row to `filled` (depends on P-1 / P-4)
-- [ ] `_suspect_orders` and `_suspect_exit_orders` caches are
-      empty / absent throughout (depends on P-6 / P-7)
+- [ ] Substrate `position_lifecycle_orders` row created at submission
+      with `role='entry_primary'`, `status='pending'`, `order_id`
+      attached on submit return
+- [ ] WebSocket fill event observed and applied — substrate row
+      advances `pending` → `working` → `filled`
+- [ ] `position_lifecycle` row transitions `pending` → `open` via
+      the position-status CTE
+- [ ] If the position later closes via a sell signal: `role='exit'`
+      row created at close submit; advances to `filled`; position
+      transitions to `closed`
+- [ ] If the protective stop fires instead: `role='protective_stop'`
+      row advances to `filled`; position transitions to `closed`
+- [ ] No `_suspect_orders` / `_suspect_exit_orders` references in
+      logs (caches deleted)
+- [ ] `_drain_lifecycle_events` per-cycle log lines visible at
+      DEBUG when fills land
+- [ ] Cycle and startup reconcile drains run without CRITICAL
+      log lines
 
 Once full-loop smoke passes, PR #58 rebuild can start.
 
@@ -212,7 +228,19 @@ Once full-loop smoke passes, PR #58 rebuild can start.
 
 ## Rollback plan
 
-`git revert <foundation-merge-sha> && ./recycle_bot.sh`. The new tables remain in `data/trades.db` but no code writes them post-revert. Pre-existing rows are untouched. The `_suspect_orders` / `_suspect_exit_orders` caches are restored by the revert.
+Two phases, two rollback strategies:
+
+### Phase 1 (PR #60 substrate) rollback
+
+`git revert <pr-60-merge-sha> && ./recycle_bot.sh`. Schema tables remain in `data/trades.db` but no code writes them post-revert. Pre-existing rows untouched. Substrate is additive on phase 1, so revert is a clean no-op for observable behavior.
+
+### Phase 2 (consumer wiring) rollback
+
+The consumer-wiring branch DELETES the legacy `_suspect_orders` and `_suspect_exit_orders` caches. Reverting the cache-removal commits (`b982870`, `ecce2da`) is safe — the substrate-driven dispatch (`73793d7`, `860ce93`) and the caches can coexist (dual-write), so a partial rollback of just the deletion commits restores the safety net without breaking the substrate.
+
+Full Phase 2 revert (all 11 commits) reverts to phase-1 substrate-only state. Safe.
+
+A partial rollback (e.g., keeping P-1 stream wiring but reverting P-6/P-7 cache removal) is supported because the substrate dispatches gate on `_has_position` and the cache dispatches gate on `_suspect_orders` membership — both can run simultaneously without double-firing alerts.
 
 Idempotent — safe to apply and revert any number of times during smoke validation.
 
