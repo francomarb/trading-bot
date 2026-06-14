@@ -884,6 +884,36 @@ class PositionLifecycleOrdersStore:
         ).fetchall()
         return [_row_from_tuple(r) for r in rows]
 
+    def get_non_terminal_with_order_id(
+        self, *, limit: int | None = None,
+    ) -> list[PositionLifecycleOrderRow]:
+        """All non-terminal rows that already have a broker order_id
+        attached. Used by cycle-reconciliation (P-2) to walk rows
+        whose state might have advanced at the broker without the
+        WebSocket noticing.
+
+        Rows still at status='pending' without an order_id are
+        excluded — those belong to the lifecycle-attach queue path
+        (foundation commit 12), not the broker-state reconciliation
+        path.
+
+        ``error`` status is also excluded: it's a sticky sentinel
+        for invariant violations (§6.6.1 R9-P1b) and should not be
+        revived by a passing broker fetch."""
+        active_statuses = ("pending", "working", "partially_filled", "unknown")
+        placeholders = ", ".join("?" for _ in active_statuses)
+        sql = (
+            _SELECT_LIFECYCLE_ORDER_COLUMNS
+            + f" WHERE order_id IS NOT NULL AND status IN ({placeholders}) "
+            "ORDER BY id ASC"
+        )
+        params: tuple = active_statuses
+        if limit is not None:
+            sql += " LIMIT ?"
+            params = active_statuses + (int(limit),)
+        rows = self._conn.execute(sql, params).fetchall()
+        return [_row_from_tuple(r) for r in rows]
+
     def get_non_terminal_for_position(
         self, position_uid: str
     ) -> list[PositionLifecycleOrderRow]:

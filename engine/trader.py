@@ -120,6 +120,33 @@ if TYPE_CHECKING:
 _OCC_PAT = re.compile(r"^[A-Z]{1,6}[0-9]{6}[CP][0-9]{8}$")
 
 
+# P-2: cap on substrate cycle-reconciliation REST calls per cycle.
+# A large gap (e.g., after a long stream outage) catches up over
+# several cycles rather than blowing the per-cycle Alpaca API
+# budget in one shot.
+_SUBSTRATE_CYCLE_RECONCILE_LIMIT = 20
+
+
+# P-2: Alpaca REST order.status → substrate status. Same intent as
+# stream's _STREAM_EVENT_TO_SUBSTRATE_STATUS but maps the FINAL
+# status string the REST endpoint returns (not the event-stream
+# verbs). Non-material statuses (pending_*, suspended) are absent
+# from the map so they're skipped — the substrate doesn't advance
+# on them.
+_ALPACA_STATUS_TO_SUBSTRATE_STATUS = {
+    "new": "working",
+    "accepted": "working",
+    "partially_filled": "partially_filled",
+    "filled": "filled",
+    "canceled": "canceled",
+    "expired": "canceled",
+    "replaced": "canceled",
+    "rejected": "rejected",
+    "done_for_day": "canceled",
+    "stopped": "filled",
+}
+
+
 # ── Bar-interval helpers ─────────────────────────────────────────────────────
 
 
@@ -863,6 +890,7 @@ class TradingEngine:
             self._detect_external_closes(snapshot)
             self._drain_lifecycle_attaches()
             self._drain_lifecycle_events()
+            self._reconcile_substrate_cycle(snapshot)
             self._drain_option_fills()
             self._drain_spread_fills()
             self._sync_option_trailing_stops(snapshot)
@@ -4462,6 +4490,162 @@ class TradingEngine:
                     f"{event.order_id} status={event.status}: "
                     f"{outcome.reason}"
                 )
+
+    def _reconcile_substrate_cycle(self, snapshot: "BrokerSnapshot") -> None:
+        """P-2: cycle-time substrate reconciliation against broker state.
+
+        Defense-in-depth for events the WebSocket missed (reconnect
+        gaps, dropped frames, late-binding race conditions). For
+        each non-terminal substrate row whose order_id is NOT in
+        the snapshot's open_orders, fetch the broker's current
+        state via REST and apply an OrderEvent.
+
+        Rows whose order_id IS in snapshot.open_orders are skipped
+        — those are still active at the broker and the stream
+        owns their state transitions. P-1 already wires the stream
+        path; this method covers the gap.
+
+        Cost cap: at most ``_SUBSTRATE_CYCLE_RECONCILE_LIMIT`` REST
+        calls per cycle. A larger backlog catches up over multiple
+        cycles. Tunable so a one-off gap (e.g., long network
+        outage) doesn't blow the per-cycle Alpaca API budget.
+
+        Best-effort: any per-row failure logs at CRITICAL and
+        continues. Stream + substrate-attach queue + cycle
+        reconciliation together form the redundant capture pipeline;
+        a single bad row cannot stall the others.
+        """
+        if (
+            self.lifecycle_orders_store is None
+            or self._stream_manager is None  # safety: don't reconcile without stream context
+        ):
+            return
+        try:
+            rows = self.lifecycle_orders_store.get_non_terminal_with_order_id(
+                limit=_SUBSTRATE_CYCLE_RECONCILE_LIMIT,
+            )
+        except Exception as exc:
+            logger.critical(
+                f"substrate cycle reconcile: get_non_terminal "
+                f"query failed: {type(exc).__name__}: {exc}"
+            )
+            return
+        if not rows:
+            return
+        open_by_id = {
+            o.order_id: o for o in snapshot.open_orders
+            if getattr(o, "order_id", None)
+        }
+        from engine.lifecycle_orders import OrderEvent, apply_order_event
+
+        for row in rows:
+            oid = row.order_id
+            if oid is None:
+                continue
+            if oid in open_by_id:
+                # Still active at the broker; the stream owns it.
+                continue
+            # Order is non-terminal in substrate but absent from
+            # broker open orders → terminal at the broker. Fetch
+            # the truth.
+            try:
+                broker_order = self.broker._with_retry(
+                    lambda oid=oid: self.broker._api.get_order_by_id(oid),
+                    op_desc=f"substrate_reconcile({oid})",
+                )
+            except Exception as exc:
+                logger.critical(
+                    f"substrate cycle reconcile: get_order_by_id "
+                    f"failed for {oid}: {type(exc).__name__}: {exc}. "
+                    f"Will retry next cycle."
+                )
+                continue
+            event = self._build_substrate_event_from_broker_order(
+                broker_order, oid,
+            )
+            if event is None:
+                # Broker reports a state we don't translate (e.g.,
+                # pending_*). Skip; the stream will deliver a
+                # material event eventually.
+                continue
+            try:
+                outcome = apply_order_event(
+                    self.lifecycle_orders_store._conn,
+                    event,
+                    reason="cycle",
+                )
+            except Exception as exc:
+                logger.critical(
+                    f"substrate cycle reconcile: apply_order_event "
+                    f"raised for {oid} status={event.status}: "
+                    f"{type(exc).__name__}: {exc}"
+                )
+                continue
+            if outcome.applied:
+                logger.info(
+                    f"substrate cycle reconcile: order_id={oid} "
+                    f"advanced to status={event.status} "
+                    f"(position {outcome.new_status})"
+                )
+            else:
+                logger.debug(
+                    f"substrate cycle reconcile: order_id={oid} "
+                    f"no-op ({outcome.reason})"
+                )
+
+    @staticmethod
+    def _build_substrate_event_from_broker_order(
+        broker_order, order_id: str,
+    ) -> "Any | None":
+        """Translate an Alpaca order (REST result) to an OrderEvent.
+        Mirrors stream._build_substrate_event but reads from the
+        REST order object's status / filled_qty / filled_avg_price /
+        updated_at, not from a trade_update payload."""
+        from engine.lifecycle_orders import OrderEvent
+
+        raw_status = getattr(broker_order, "status", None)
+        status_val = (
+            raw_status.value if hasattr(raw_status, "value")
+            else str(raw_status) if raw_status is not None else None
+        )
+        if status_val is None:
+            return None
+        substrate_status = _ALPACA_STATUS_TO_SUBSTRATE_STATUS.get(status_val)
+        if substrate_status is None:
+            return None
+
+        raw_filled = getattr(broker_order, "filled_qty", None)
+        try:
+            filled_qty = float(raw_filled) if raw_filled is not None else 0.0
+        except (TypeError, ValueError):
+            filled_qty = 0.0
+
+        raw_avg = getattr(broker_order, "filled_avg_price", None)
+        try:
+            avg_fill_price = (
+                float(raw_avg) if raw_avg is not None else None
+            )
+        except (TypeError, ValueError):
+            avg_fill_price = None
+
+        updated_at_raw = (
+            getattr(broker_order, "updated_at", None)
+            or getattr(broker_order, "filled_at", None)
+            or getattr(broker_order, "submitted_at", None)
+        )
+        if updated_at_raw is None:
+            updated_at = datetime.now(timezone.utc).isoformat()
+        else:
+            updated_at = str(updated_at_raw)
+
+        return OrderEvent(
+            order_id=order_id,
+            status=substrate_status,
+            filled_qty=filled_qty,
+            avg_fill_price=avg_fill_price,
+            broker_updated_at=updated_at,
+            execution_id=None,
+        )
 
     def _drain_option_fills(self) -> None:
         """

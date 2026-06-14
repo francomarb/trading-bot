@@ -1760,3 +1760,134 @@ class TestStreamDrainEndToEnd:
         status, qty, _, _, _ = _get_order(conn, order_id)
         assert status == "filled"
         assert qty == 10.0
+
+
+# ── P-2: cycle reconciliation against broker REST ──────────────────────────
+
+
+class TestCycleReconcileStoreQuery:
+    """P-2: get_non_terminal_with_order_id is the substrate query
+    that drives cycle reconciliation. Exclusions matter — pending
+    rows without order_id and 'error' rows must NOT be returned."""
+
+    def test_returns_rows_with_order_id_in_non_terminal_status(
+        self, pos_store, orders_store,
+    ):
+        uid = _seed_position(pos_store)
+        _insert_entry(orders_store, uid)
+        _attach_and_get_order_id(orders_store, "cli-entry")
+
+        rows = orders_store.get_non_terminal_with_order_id()
+        assert len(rows) == 1
+        assert rows[0].order_id is not None
+        assert rows[0].status == "pending"
+
+    def test_excludes_rows_with_null_order_id(
+        self, pos_store, orders_store,
+    ):
+        """Pending row whose attach hasn't fired yet is owned by
+        the lifecycle-attach queue, not by REST reconciliation."""
+        uid = _seed_position(pos_store)
+        _insert_entry(orders_store, uid)  # order_id=NULL
+        rows = orders_store.get_non_terminal_with_order_id()
+        assert rows == []
+
+    def test_excludes_terminal_rows(
+        self, conn, pos_store, orders_store,
+    ):
+        uid = _seed_position(pos_store)
+        _insert_entry(orders_store, uid)
+        order_id = _attach_and_get_order_id(orders_store, "cli-entry")
+        apply_order_event(
+            conn,
+            OrderEvent(
+                order_id=order_id, status="filled",
+                filled_qty=10.0, avg_fill_price=100.5,
+                broker_updated_at="2026-06-15T10:00:00+00:00",
+            ),
+        )
+        assert orders_store.get_non_terminal_with_order_id() == []
+
+    def test_limit_caps_returned_rows(self, pos_store, orders_store):
+        """The cycle reconciler caps REST calls per cycle by passing
+        limit=N to this query."""
+        for i in range(5):
+            uid = _seed_position(pos_store, owner_key=f"SYM{i}")
+            _insert_entry(
+                orders_store, uid, client_order_id=f"cli-{i}",
+            )
+            _attach_and_get_order_id(orders_store, f"cli-{i}")
+        rows = orders_store.get_non_terminal_with_order_id(limit=2)
+        assert len(rows) == 2
+
+    def test_error_status_excluded(self, conn, pos_store, orders_store):
+        """'error' is a sticky invariant-violation sentinel
+        (§6.6.1 R9-P1b) and must not be reconciled. Manually
+        set status='error' to simulate the state."""
+        uid = _seed_position(pos_store)
+        _insert_entry(orders_store, uid)
+        order_id = _attach_and_get_order_id(orders_store, "cli-entry")
+        conn.execute(
+            "UPDATE position_lifecycle_orders SET status='error' "
+            "WHERE order_id = ?",
+            (order_id,),
+        )
+        conn.commit()
+        assert orders_store.get_non_terminal_with_order_id() == []
+
+
+# ── P-2: REST order → OrderEvent translation ───────────────────────────────
+
+
+class TestBuildSubstrateEventFromBrokerOrder:
+    """The cycle reconciler translates Alpaca REST order objects to
+    OrderEvents the same way the stream translates trade_updates.
+    The status mapping must be identical so cycle + stream produce
+    consistent state advances."""
+
+    @staticmethod
+    def _build(order_id="ord-1", **overrides):
+        from types import SimpleNamespace
+        from engine.trader import TradingEngine
+        order = SimpleNamespace(
+            status=SimpleNamespace(value=overrides.pop("status", "filled")),
+            filled_qty=overrides.pop("filled_qty", "10"),
+            filled_avg_price=overrides.pop("filled_avg_price", "100.5"),
+            updated_at=overrides.pop("updated_at", "2026-06-15T10:00:00Z"),
+            **overrides,
+        )
+        return TradingEngine._build_substrate_event_from_broker_order(
+            order, order_id,
+        )
+
+    def test_filled_status_maps_to_filled(self):
+        ev = self._build(status="filled", filled_qty="10", filled_avg_price="100.5")
+        assert ev.status == "filled"
+        assert ev.filled_qty == 10.0
+        assert ev.avg_fill_price == 100.5
+
+    def test_partially_filled_status_maps(self):
+        ev = self._build(status="partially_filled", filled_qty="5")
+        assert ev.status == "partially_filled"
+        assert ev.filled_qty == 5.0
+
+    def test_canceled_status_maps(self):
+        ev = self._build(status="canceled", filled_qty="0", filled_avg_price=None)
+        assert ev.status == "canceled"
+        assert ev.filled_qty == 0.0
+        assert ev.avg_fill_price is None
+
+    def test_expired_status_maps_to_canceled(self):
+        ev = self._build(status="expired", filled_qty="0", filled_avg_price=None)
+        assert ev.status == "canceled"
+
+    def test_rejected_status_maps(self):
+        ev = self._build(status="rejected", filled_qty="0", filled_avg_price=None)
+        assert ev.status == "rejected"
+
+    def test_non_material_status_returns_none(self):
+        """pending_new / pending_cancel / suspended don't advance
+        the state machine — skip them."""
+        assert self._build(status="pending_new") is None
+        assert self._build(status="pending_cancel") is None
+        assert self._build(status="suspended") is None
