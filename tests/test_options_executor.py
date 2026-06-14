@@ -578,3 +578,113 @@ class TestSpreadExecutionWorkerWalkAndMarket:
         last_call = on_walk_step.call_args_list[-1].kwargs
         assert last_call["is_market"] is True
         assert last_call["terminal_status"] != "skipped"
+
+
+# ── PR #60 commit 9 fix C: on_submitted callback ────────────────────────────
+
+
+class TestOptionsExecutionWorkerOnSubmitted:
+    """The worker fires on_submitted exactly once, synchronously, after
+    a successful submit_order returns. Pre-submit rejections (entry
+    halt, submit_order raising) must NOT fire it."""
+
+    def test_on_submitted_fires_after_successful_submit(self):
+        api = MagicMock()
+        api.submit_order.return_value = _submitted_order("ord-42")
+        api.get_order_by_id.return_value = _filled_order("ord-42")
+        stream = MagicMock()
+        stream_event = MagicMock()
+        stream_event.wait.return_value = True
+        stream.watch.return_value = stream_event
+        on_fill = MagicMock()
+        on_submitted = MagicMock()
+
+        worker = OptionsExecutionWorker(
+            decision=_decision(),
+            api=api,
+            stream_manager=stream,
+            on_fill=on_fill,
+            on_submitted=on_submitted,
+        )
+        worker.run()
+
+        on_submitted.assert_called_once()
+        cli_id, broker_id = on_submitted.call_args.args
+        assert cli_id.startswith("opt-spy_options_reversion-")
+        assert broker_id == "ord-42"
+
+    def test_on_submitted_NOT_fired_when_submit_raises(self):
+        """Pre-submit failure must not fire on_submitted — the
+        substrate row stays at order_id=NULL, which is the
+        truthful state."""
+        api = MagicMock()
+        api.submit_order.side_effect = Exception("rejected at the door")
+        stream = MagicMock()
+        stream_event = MagicMock()
+        stream.watch.return_value = stream_event
+        on_fill = MagicMock()
+        on_submitted = MagicMock()
+
+        worker = OptionsExecutionWorker(
+            decision=_decision(),
+            api=api,
+            stream_manager=stream,
+            on_fill=on_fill,
+            on_submitted=on_submitted,
+        )
+        worker.run()
+
+        on_submitted.assert_not_called()
+        # on_fill DID fire with rejected — note the bug-bait: order_id
+        # arg is client_order_id, NOT a real broker id. Substrate must
+        # NOT use it to attach.
+        on_fill.assert_called_once()
+        status, _, _, order_id_arg = on_fill.call_args.args
+        assert status == "rejected"
+
+    def test_on_submitted_NOT_fired_on_entry_halt(self):
+        """Global risk halt before submit also skips on_submitted."""
+        api = MagicMock()
+        stream = MagicMock()
+        stream.watch.return_value = MagicMock()
+        on_fill = MagicMock()
+        on_submitted = MagicMock()
+
+        worker = OptionsExecutionWorker(
+            decision=_decision(),
+            api=api,
+            stream_manager=stream,
+            on_fill=on_fill,
+            on_submitted=on_submitted,
+            entry_allowed=lambda: False,
+        )
+        worker.run()
+
+        api.submit_order.assert_not_called()
+        on_submitted.assert_not_called()
+
+    def test_on_submitted_callback_exception_does_not_crash_worker(self):
+        """A misbehaving on_submitted must not abort the worker —
+        it still runs _watch_to_terminal."""
+        api = MagicMock()
+        api.submit_order.return_value = _submitted_order("ord-77")
+        api.get_order_by_id.return_value = _filled_order("ord-77")
+        stream = MagicMock()
+        stream_event = MagicMock()
+        stream_event.wait.return_value = True
+        stream.watch.return_value = stream_event
+        on_fill = MagicMock()
+        on_submitted = MagicMock(side_effect=RuntimeError("substrate kaboom"))
+
+        worker = OptionsExecutionWorker(
+            decision=_decision(),
+            api=api,
+            stream_manager=stream,
+            on_fill=on_fill,
+            on_submitted=on_submitted,
+        )
+        worker.run()
+
+        # _watch_to_terminal still completed and fired on_fill.
+        on_fill.assert_called_once()
+        assert on_fill.call_args.args[0] == "filled"

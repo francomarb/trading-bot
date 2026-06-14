@@ -145,12 +145,31 @@ class TestTradeLogger:
         ) == pytest.approx(50.0)
 
     def test_append_multiple_records(self, tmp_csv, sample_decision, sample_result):
+        """Foundation §6.5: trades is one row per order_id (single-leg).
+        Three distinct order_ids produce three rows. Re-logging the
+        same order_id UPSERTs."""
+        from dataclasses import replace
         tl = TradeLogger(path=tmp_csv)
-        for _ in range(3):
-            record = tl.build_record(sample_decision, sample_result)
+        for i in range(3):
+            result = replace(sample_result, order_id=f"abc{i}")
+            record = tl.build_record(sample_decision, result)
             tl.log(record)
         rows = tl.read_all()
         assert len(rows) == 3
+
+    def test_log_with_same_order_id_upserts(
+        self, tmp_csv, sample_decision, sample_result
+    ):
+        """Foundation §6.5: re-logging the same single-leg order_id
+        updates the existing row rather than appending. R5-C1 + R5-C2."""
+        tl = TradeLogger(path=tmp_csv)
+        record = tl.build_record(sample_decision, sample_result)
+        tl.log(record)
+        tl.log(record)
+        tl.log(record)
+        rows = tl.read_all()
+        assert len(rows) == 1
+        assert rows[0]["order_id"] == sample_result.order_id
 
     def test_read_all_empty(self, tmp_csv):
         tl = TradeLogger(path=tmp_csv)
@@ -781,10 +800,14 @@ class TestTradeLogger:
         assert record.realized_slippage_bps == 0.0
 
     def test_read_trades_in_range(self, tmp_csv, sample_decision, sample_result):
+        """Foundation §6.5: distinct order_ids → distinct rows; UPSERT
+        on same order_id."""
+        from dataclasses import replace
         tl = TradeLogger(path=tmp_csv)
-        # Log 3 records — all will have today's timestamp
-        for _ in range(3):
-            record = tl.build_record(sample_decision, sample_result)
+        record = None
+        for i in range(3):
+            result = replace(sample_result, order_id=f"abc{i}")
+            record = tl.build_record(sample_decision, result)
             tl.log(record)
         today = record.timestamp[:10]
         rows = tl.read_trades_in_range(today, today)
@@ -793,9 +816,11 @@ class TestTradeLogger:
         assert tl.read_trades_in_range("1999-01-01", "1999-12-31") == []
 
     def test_read_recent(self, tmp_csv, sample_decision, sample_result):
+        from dataclasses import replace
         tl = TradeLogger(path=tmp_csv)
-        for _ in range(5):
-            record = tl.build_record(sample_decision, sample_result)
+        for i in range(5):
+            result = replace(sample_result, order_id=f"abc{i}")
+            record = tl.build_record(sample_decision, result)
             tl.log(record)
         recent = tl.read_recent(3)
         assert len(recent) == 3
@@ -1701,7 +1726,15 @@ class TestSlippageUnificationSchema:
             assert col in columns, f"missing column on fresh DB: {col}"
 
     def test_migration_adds_columns_to_legacy_db(self, tmp_path):
-        """A pre-existing DB without the new columns gets them via ALTER."""
+        """A pre-existing DB without the new columns gets them via ALTER.
+
+        Foundation §6.5: the legacy seed schema must include the
+        columns the foundation's partial UNIQUE index references
+        (order_id, position_type) so the index creation succeeds.
+        Earlier slippage-Phase-1 tests used a stripped-down schema
+        without these; the foundation widens the migration's
+        cross-column dependency surface.
+        """
         db_path = str(tmp_path / "legacy.db")
         conn = sqlite3.connect(db_path)
         conn.execute(
@@ -1714,7 +1747,9 @@ class TestSlippageUnificationSchema:
                 qty REAL NOT NULL,
                 strategy TEXT NOT NULL,
                 reason TEXT NOT NULL,
-                status TEXT NOT NULL
+                status TEXT NOT NULL,
+                order_id TEXT,
+                position_type TEXT
             )
             """
         )
@@ -2768,10 +2803,12 @@ class TestPnLTracker:
         assert report["mean_bps"] == 0.0
 
     def test_slippage_report_from_db(self, tmp_csv, tmp_daily_dir, sample_decision, sample_result):
-        # Write some trade records to the database first.
+        # Foundation §6.5: distinct order_ids → distinct rows.
+        from dataclasses import replace
         tl = TradeLogger(path=tmp_csv)
-        for _ in range(5):
-            record = tl.build_record(sample_decision, sample_result, modeled_price=150.0)
+        for i in range(5):
+            result = replace(sample_result, order_id=f"ord-{i}")
+            record = tl.build_record(sample_decision, result, modeled_price=150.0)
             tl.log(record)
 
         tracker = PnLTracker(

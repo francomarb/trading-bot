@@ -79,6 +79,9 @@ def _write_trades(path: str, rows: list[dict]) -> None:
         tl.log(record)
 
 
+_FILL_COUNTER = [0]
+
+
 def _make_fill(
     symbol: str = "AAPL",
     side: str = "buy",
@@ -86,15 +89,24 @@ def _make_fill(
     date: str = "2026-04-20",
     strategy: str = "test_strat",
     qty: int = 10,
+    order_id: str | None = None,
 ) -> dict:
-    """Build a minimal row dict for a filled trade."""
+    """Build a minimal row dict for a filled trade.
+
+    Foundation §6.5: trades.order_id is partial-UNIQUE within single-leg
+    scope, so fixtures must emit distinct order_ids per fill or
+    TradeLogger.log will UPSERT them into one row.
+    """
+    if order_id is None:
+        _FILL_COUNTER[0] += 1
+        order_id = f"test-order-{_FILL_COUNTER[0]:04d}"
     return {
         "timestamp": f"{date}T15:30:00+00:00",
         "symbol": symbol,
         "side": side,
         "qty": str(qty),
         "avg_fill_price": str(price),
-        "order_id": "test-order-001",
+        "order_id": order_id,
         "strategy": strategy,
         "reason": "test",
         "stop_price": "145.0",

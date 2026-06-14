@@ -38,6 +38,7 @@ SDK: alpaca-py (official, replaces deprecated alpaca-trade-api).
 
 from __future__ import annotations
 
+import sqlite3
 import threading
 import time
 import uuid
@@ -50,6 +51,7 @@ from typing import TYPE_CHECKING, Callable
 if TYPE_CHECKING:
     from execution.stream import StreamManager
     from engine.lifecycle import PositionLifecycleStore
+    from engine.lifecycle_orders import PositionLifecycleOrdersStore
     from execution.mleg_close import MlegCloseScheduler, MlegQuote
 
 from execution.options_executor import (
@@ -242,6 +244,7 @@ class AlpacaBroker:
         stream_manager: "StreamManager | None" = None,
         dry_run: bool | None = None,
         lifecycle_store: "PositionLifecycleStore | None" = None,
+        lifecycle_orders_store: "PositionLifecycleOrdersStore | None" = None,
         entry_allowed: Callable[[], bool] | None = None,
     ) -> None:
         self._api = client or TradingClient(
@@ -262,6 +265,13 @@ class AlpacaBroker:
         # writes are silently skipped and behavior is byte-for-byte
         # unchanged from before Phase A.
         self._lifecycle_store = lifecycle_store
+        # Foundation commit 6 — per-order substrate. Optional, same wiring
+        # discipline as `_lifecycle_store`: None means no-op so legacy
+        # tests / callers stay byte-for-byte identical. When wired, every
+        # successful entry submission also stamps a `position_lifecycle_orders`
+        # row at status='pending' alongside the position-level row, and
+        # populates the broker-assigned order_id on submit return.
+        self._lifecycle_orders_store = lifecycle_orders_store
         self._entry_allowed = entry_allowed
         # Dry-run: log orders but never submit. Defaults to settings.DRY_RUN.
         self._dry_run: bool = dry_run if dry_run is not None else DRY_RUN
@@ -269,6 +279,16 @@ class AlpacaBroker:
         # Drained by TradingEngine each cycle via drain_option_fills().
         self._pending_option_fills: list[tuple] = []
         self._pending_option_lock = threading.Lock()
+        # PR #60 round 2 fix (finding 2): per-order substrate attaches
+        # produced by background worker threads must NOT touch the
+        # shared sqlite3 connection directly (check_same_thread=True).
+        # Workers enqueue (client_order_id, broker_order_id,
+        # submitted_at) tuples here; TradingEngine drains them once
+        # per cycle on the connection-owning main thread via
+        # drain_lifecycle_attaches(). Same pattern as the existing
+        # _pending_option_fills queue.
+        self._pending_lifecycle_attaches: list[tuple[str, str, str | None]] = []
+        self._pending_lifecycle_attaches_lock = threading.Lock()
         # Async MLEG combo fills reported by SpreadExecutionWorker threads.
         # Drained by TradingEngine each cycle via drain_spread_fills().
         self._pending_spread_fills: list[tuple] = []
@@ -430,6 +450,162 @@ class AlpacaBroker:
         except Exception as exc:
             logger.warning(
                 f"lifecycle.mark_canceled skipped for {position_uid}: {exc}"
+            )
+
+    # ── Per-order substrate (foundation commit 6) ───────────────────────
+    #
+    # Same try/except → logger.warning discipline as the position-level
+    # helpers above. When ``self._lifecycle_orders_store is None`` (legacy
+    # callers, tests not exercising the substrate), every call here is a
+    # no-op and behavior is byte-for-byte identical to pre-commit-6.
+
+    def _lifecycle_orders_insert_pending(
+        self,
+        *,
+        position_uid: str | None,
+        role: str,
+        client_order_id: str,
+        decision: "RiskDecision",
+        order_class: str,
+        time_in_force: str,
+        intended_stop_price: float | None = None,
+        intended_limit_price: float | None = None,
+        parent_order_id: str | None = None,
+        replaces_order_id: str | None = None,
+        slippage_benchmark_price: float | None = None,
+        slippage_benchmark_kind: str | None = None,
+        slippage_benchmark_timestamp: str | None = None,
+        slippage_measurement_quality: str | None = None,
+    ) -> None:
+        """Write a `position_lifecycle_orders` row at status='pending'
+        before the broker submission goes out.
+
+        Mirrors `_lifecycle_begin`'s position-level pending stamp but at
+        the per-order grain so `apply_order_event` has a row to advance
+        when the WebSocket / cycle / startup reconciliation paths
+        observe broker reality.
+
+        No-op when the store isn't wired or `position_uid` is None
+        (broker is operating without lifecycle persistence).
+
+        PR #60 round 2 fix (findings 3 + 4) — exception policy:
+
+        This runs BEFORE the broker submit. Once a lifecycle_orders
+        store is configured, ALL persistence failures here fail
+        closed:
+
+          - sqlite3.IntegrityError (duplicate client_order_id, FK
+            miss, partial-UNIQUE conflict): caller-bug invariant
+            violation; investigate before retry.
+          - ValueError (invalid role / qty / origin_kind): caller
+            bug; the substrate refused the input.
+          - Any other Exception (disk full, locked DB, transient
+            I/O): there is no recoverable "next pass" because
+            without a row in position_lifecycle_orders, apply_order
+            _event has nothing to compare-and-set against on the
+            stream / cycle / startup paths. Failing closed surfaces
+            the substrate health issue before any broker action.
+
+        Round 2 finding 3 fix: on ALL fail-closed paths, the caller's
+        already-committed position_lifecycle pending row is rolled
+        back via ``_lifecycle_mark_canceled`` BEFORE re-raising so we
+        don't leak the owner-key lock to the operator CLI. The
+        rollback runs in a try/except that suppresses any error
+        (best-effort cleanup) so the original exception is what
+        propagates.
+
+        The optional-store path (``self._lifecycle_orders_store is
+        None``) preserves the legacy no-op behavior for tests and
+        legacy callers that don't wire the substrate.
+        """
+        if self._lifecycle_orders_store is None or position_uid is None:
+            return
+        try:
+            self._lifecycle_orders_store.insert_pending(
+                position_uid=position_uid,
+                role=role,
+                client_order_id=client_order_id,
+                order_type=decision.order_type.value,
+                order_class=order_class,
+                time_in_force=time_in_force,
+                side=decision.side.value,
+                intended_qty=float(decision.qty),
+                intended_stop_price=intended_stop_price,
+                intended_limit_price=intended_limit_price,
+                parent_order_id=parent_order_id,
+                replaces_order_id=replaces_order_id,
+                slippage_benchmark_price=slippage_benchmark_price,
+                slippage_benchmark_kind=slippage_benchmark_kind,
+                slippage_benchmark_timestamp=slippage_benchmark_timestamp,
+                slippage_measurement_quality=slippage_measurement_quality,
+            )
+        except Exception as exc:
+            # Roll back the position-level pending row so the owner-key
+            # lock isn't leaked. _lifecycle_mark_canceled handles the
+            # store-is-None case and is itself wrapped in try/except,
+            # so a cascade failure here cannot mask the original
+            # exception we're about to re-raise.
+            try:
+                self._lifecycle_mark_canceled(position_uid)
+            except Exception:
+                pass
+            if isinstance(exc, sqlite3.IntegrityError):
+                logger.critical(
+                    f"lifecycle_orders.insert_pending REFUSED for "
+                    f"{decision.symbol} ({client_order_id}): {exc} — "
+                    f"foundation-substrate invariant violation; "
+                    f"aborting submit + rolling back position lock."
+                )
+            elif isinstance(exc, ValueError):
+                logger.critical(
+                    f"lifecycle_orders.insert_pending REJECTED for "
+                    f"{decision.symbol} ({client_order_id}): {exc} — "
+                    f"caller passed invalid role / qty / origin_kind; "
+                    f"rolling back position lock."
+                )
+            else:
+                logger.critical(
+                    f"lifecycle_orders.insert_pending FAILED for "
+                    f"{decision.symbol} ({client_order_id}): "
+                    f"{type(exc).__name__}: {exc} — aborting submit "
+                    f"+ rolling back position lock. With substrate "
+                    f"configured there is no recoverable next pass."
+                )
+            raise
+
+    def _lifecycle_orders_attach_order_id(
+        self,
+        *,
+        client_order_id: str,
+        order_id: str,
+        submitted_at: str | None = None,
+    ) -> None:
+        """Populate the broker-assigned `order_id` on the matching
+        pending row.
+
+        PR #60 commit 9 fix D — exception policy: this runs AFTER the
+        broker submit returns success. The order is already live at
+        Alpaca; raising here would leave it un-tracked but un-cancelable
+        from the bot's side, which is worse than the recovery cost. Any
+        exception is logged at CRITICAL level (so an oncall alert
+        fires) and absorbed — the next cycle reconciliation will
+        attempt to attach the order_id on its own via client_order_id
+        lookup.
+        """
+        if self._lifecycle_orders_store is None:
+            return
+        try:
+            self._lifecycle_orders_store.attach_broker_order_id(
+                client_order_id=client_order_id,
+                order_id=order_id,
+                submitted_at=submitted_at,
+            )
+        except Exception as exc:
+            logger.critical(
+                f"lifecycle_orders.attach_broker_order_id FAILED for "
+                f"{client_order_id} → {order_id}: {exc}. The broker "
+                f"order is live; cycle reconciliation will retry the "
+                f"attach. Investigate substrate health."
             )
 
     # ── Retry wrapper ────────────────────────────────────────────────────
@@ -769,6 +945,10 @@ class AlpacaBroker:
         *,
         poll_timeout: float = ORDER_CONFIRM_TIMEOUT_SECONDS,
         poll_interval: float = 1.0,
+        slippage_benchmark_price: float | None = None,
+        slippage_benchmark_kind: str | None = None,
+        slippage_benchmark_timestamp: str | None = None,
+        slippage_measurement_quality: str | None = None,
     ) -> OrderResult:
         """
         Submit `decision` to Alpaca.
@@ -783,6 +963,17 @@ class AlpacaBroker:
 
         Refuses any non-`RiskDecision` input. There is no other way to call
         this — that is the Phase 6 / 7 contract.
+
+        PR #60 commit 9 fix E (review finding): the four
+        ``slippage_benchmark_*`` kwargs let the engine pass the arrival
+        midpoint / latest-close / etc. it captured immediately before
+        ``place_order`` so the substrate row records the exact
+        provenance §10.5 of the discovery doc requires foundation to
+        preserve. Without these, recovered fills lose the original
+        benchmark and the new slippage taxonomy reads 'unavailable'.
+        Callers that don't have provenance available leave them None;
+        the substrate row records NULL and apply_order_event will
+        eventually populate them via stream payload if available.
         """
         if not isinstance(decision, RiskDecision):
             raise TypeError(
@@ -823,10 +1014,55 @@ class AlpacaBroker:
                 decision=decision,
                 client_order_id=client_order_id,
             )
+            # Foundation commit 6 — options orders are 'simple' LIMIT
+            # (no broker-attached stop_loss leg; the strategy manages
+            # exits via separate LIMIT orders via the spy options
+            # reversion strategy). TIF=day.
+            self._lifecycle_orders_insert_pending(
+                position_uid=position_uid,
+                role="entry_primary",
+                client_order_id=client_order_id,
+                decision=decision,
+                order_class="simple",
+                time_in_force="day",
+                intended_limit_price=(
+                    float(decision.limit_price)
+                    if decision.limit_price is not None
+                    else None
+                ),
+                slippage_benchmark_price=slippage_benchmark_price,
+                slippage_benchmark_kind=slippage_benchmark_kind,
+                slippage_benchmark_timestamp=slippage_benchmark_timestamp,
+                slippage_measurement_quality=slippage_measurement_quality,
+            )
 
             dec = decision  # capture for closure
 
+            def _on_submitted(cli_id: str, broker_order_id: str) -> None:
+                """Fires once, synchronously, right after the worker's
+                successful submit_order — never on pre-submit
+                rejection. PR #60 commit 9 fix C: attach the broker
+                order_id to the substrate row at the earliest possible
+                moment so a worker crash between submit and first fill
+                doesn't strand the row at order_id=NULL.
+
+                Round 2 fix (finding 2): fires from the worker daemon
+                thread; cannot touch the shared sqlite3 connection
+                directly (check_same_thread=True). Enqueue for the
+                engine cycle thread to drain via
+                drain_lifecycle_attaches()."""
+                with self._pending_lifecycle_attaches_lock:
+                    self._pending_lifecycle_attaches.append(
+                        (cli_id, broker_order_id, None)
+                    )
+
             def _on_fill(status: str, filled_qty: float, avg_price: "float | None", order_id: str) -> None:
+                # Per fix C: substrate attach now happens in
+                # _on_submitted above. _on_fill no longer attaches;
+                # for rejected status the worker passed
+                # client_order_id as order_id (legacy contract) — that
+                # value is intentionally NOT used to identify the
+                # substrate row.
                 result = OrderResult(
                     status={
                         "filled": OrderStatus.FILLED,
@@ -854,6 +1090,7 @@ class AlpacaBroker:
                 api=self._api,
                 stream_manager=self._stream_manager,
                 on_fill=_on_fill,
+                on_submitted=_on_submitted,
                 client_order_id=client_order_id,
                 entry_allowed=self._entry_allowed,
             )
@@ -917,7 +1154,11 @@ class AlpacaBroker:
         # never entered and the OTO path below is byte-for-byte unchanged.
         if math.floor(decision.qty) != decision.qty:
             return self._place_fractional_order(
-                decision, poll_timeout=poll_timeout, poll_interval=poll_interval
+                decision, poll_timeout=poll_timeout, poll_interval=poll_interval,
+                slippage_benchmark_price=slippage_benchmark_price,
+                slippage_benchmark_kind=slippage_benchmark_kind,
+                slippage_benchmark_timestamp=slippage_benchmark_timestamp,
+                slippage_measurement_quality=slippage_measurement_quality,
             )
 
         # Build request object.
@@ -1011,6 +1252,29 @@ class AlpacaBroker:
             decision=decision,
             client_order_id=client_order_id,
         )
+        # Foundation commit 6 — same dry-run discipline for the per-order
+        # substrate: only insert AFTER the dry-run guard. order_class on
+        # every equity entry branch above is OTO (stop_loss is always
+        # attached). time_in_force is the resolved Alpaca TIF on the
+        # request just built.
+        self._lifecycle_orders_insert_pending(
+            position_uid=position_uid,
+            role="entry_primary",
+            client_order_id=client_order_id,
+            decision=decision,
+            order_class="oto",
+            time_in_force=str(order_request.time_in_force.value),
+            intended_stop_price=float(decision.stop_price),
+            intended_limit_price=(
+                float(order_request.limit_price)
+                if getattr(order_request, "limit_price", None) is not None
+                else None
+            ),
+            slippage_benchmark_price=slippage_benchmark_price,
+            slippage_benchmark_kind=slippage_benchmark_kind,
+            slippage_benchmark_timestamp=slippage_benchmark_timestamp,
+            slippage_measurement_quality=slippage_measurement_quality,
+        )
 
         # Register with the stream before submitting to avoid a fill-before-watch race.
         stream_event: threading.Event | None = None
@@ -1053,6 +1317,14 @@ class AlpacaBroker:
         capped_stop_leg_id = None
         if decision.entry_max_price is not None:
             capped_stop_leg_id = self._find_stop_leg_id(order)
+
+        # Foundation commit 6 — populate the substrate row's broker-assigned
+        # order_id immediately on submit return so the WebSocket / cycle
+        # reconciliation paths can advance it via apply_order_event.
+        self._lifecycle_orders_attach_order_id(
+            client_order_id=client_order_id,
+            order_id=order_id,
+        )
 
         # Bind the real Alpaca order ID back to the pre-submit watch so either
         # identifier can resolve the same terminal update.
@@ -1113,6 +1385,10 @@ class AlpacaBroker:
         *,
         poll_timeout: float,
         poll_interval: float,
+        slippage_benchmark_price: float | None = None,
+        slippage_benchmark_kind: str | None = None,
+        slippage_benchmark_timestamp: str | None = None,
+        slippage_measurement_quality: str | None = None,
     ) -> OrderResult:
         """
         Fractional market entry path — only reached when FRACTIONAL_ENABLED=True
@@ -1179,6 +1455,24 @@ class AlpacaBroker:
             decision=decision,
             client_order_id=client_order_id,
         )
+        # Foundation commit 6 — fractional entries are 'simple' market
+        # orders (no order_class / no attached stop_loss); the GTC stop
+        # is submitted standalone after the fill below. Reflect that
+        # truthfully in the substrate so apply_order_event's role-based
+        # accounting doesn't expect a stop_loss leg here.
+        self._lifecycle_orders_insert_pending(
+            position_uid=position_uid,
+            role="entry_primary",
+            client_order_id=client_order_id,
+            decision=decision,
+            order_class="simple",
+            time_in_force="day",
+            intended_stop_price=float(decision.stop_price),
+            slippage_benchmark_price=slippage_benchmark_price,
+            slippage_benchmark_kind=slippage_benchmark_kind,
+            slippage_benchmark_timestamp=slippage_benchmark_timestamp,
+            slippage_measurement_quality=slippage_measurement_quality,
+        )
 
         order_request = MarketOrderRequest(
             symbol=decision.symbol,
@@ -1226,6 +1520,13 @@ class AlpacaBroker:
             )
 
         order_id = str(order.id)
+        # Foundation commit 6 — attach broker-assigned order_id on the
+        # per-order substrate row before the stream binding so subsequent
+        # apply_order_event calls can resolve by order_id.
+        self._lifecycle_orders_attach_order_id(
+            client_order_id=client_order_id,
+            order_id=order_id,
+        )
         if self._stream_manager is not None:
             self._stream_manager.bind_submitted_order(
                 client_order_id=client_order_id,
@@ -1333,6 +1634,24 @@ class AlpacaBroker:
             fills = list(self._pending_option_fills)
             self._pending_option_fills.clear()
         return fills
+
+    def drain_lifecycle_attaches(self) -> list[tuple[str, str, str | None]]:
+        """Return and clear (client_order_id, broker_order_id,
+        submitted_at) tuples enqueued from background worker threads.
+
+        PR #60 round 2 fix (finding 2): the shared sqlite3 connection
+        was opened on the main thread with check_same_thread=True.
+        Worker threads (OptionsExecutionWorker, SpreadExecutionWorker)
+        cannot call lifecycle_orders_store.attach_broker_order_id
+        directly. The on_submitted callback enqueues here; the engine
+        drains and applies on the connection-owning thread.
+
+        Same drain pattern as drain_option_fills / drain_spread_fills.
+        """
+        with self._pending_lifecycle_attaches_lock:
+            attaches = list(self._pending_lifecycle_attaches)
+            self._pending_lifecycle_attaches.clear()
+        return attaches
 
     def place_spread_order(
         self,

@@ -237,6 +237,11 @@ _MIGRATION_COLUMNS = {
     # implementation plan — they will be added when their first
     # consumer ships.
     "position_uid": "TEXT",
+    # Order lifecycle foundation (PR #59 §6.5) — audit-only metadata
+    # capturing Alpaca's per-fill execution_id from stream trade_update
+    # events. No UNIQUE constraint per the discovery doc; dedup on
+    # trades is by order_id (with the partial UNIQUE index below).
+    "execution_id": "TEXT",
     # Slippage unification — see docs/slippage_unification_design.md and
     # docs/slippage_unification_tracker.md. All nullable; pre-existing
     # rows remain NULL. Writers populate these per the per-codepath
@@ -273,11 +278,46 @@ _POSITION_UID_INDEX_SQL = (
 # new positions, keeping the engine lookup key and the DB key consistent.
 # Guarded by `WHERE position_id IS NULL` so explicit writes (future spreads)
 # are never overwritten on subsequent startups.
+#
+# PR #60 round 3 fix (P2): BACKFILL must populate position_id on rows
+# that are explicit single_leg but missing position_id too. Round 2's
+# predicate skipped them — leaving a partially-migrated row outside
+# the position-identity model. The COALESCE on position_type
+# preserves an explicit 'single_leg' value (no-op) while assigning
+# 'single_leg' to fully-NULL rows. Spread rows (position_type='spread')
+# remain skipped via the AND clause.
+#
+# Predicate now matches detect_trades_order_id_duplicates' scope:
+# every row in (NULL ∪ single_leg) gets touched. Preflight runs
+# BEFORE BACKFILL (see _ensure_db ordering below); if preflight
+# passes, no row this UPDATE moves into single_leg scope can
+# collide. A failure here therefore signals a bug (preflight
+# missed a case) and should raise loudly rather than be swallowed.
 _BACKFILL_SQL = (
     "UPDATE trades "
-    "SET position_id = OWNER_KEY(symbol), position_type = 'single_leg' "
-    "WHERE position_id IS NULL"
+    "SET position_id = OWNER_KEY(symbol), "
+    "    position_type = COALESCE(position_type, 'single_leg') "
+    "WHERE position_id IS NULL "
+    "  AND (position_type IS NULL OR position_type = 'single_leg')"
 )
+
+
+# ── Exceptions ──────────────────────────────────────────────────────────────
+
+
+class TradeLoggerIdentityConflict(RuntimeError):
+    """Raised by ``TradeLogger.log`` when an UPSERT would change an
+    identity-class column (currently ``position_uid``) from one
+    non-null value to a different non-null value.
+
+    Foundation §6.4 invariant: a broker ``order_id`` belongs to
+    exactly one position lifecycle row. A log() call that arrives
+    with a different position_uid for an existing row indicates the
+    caller is wrong about which lifecycle owns the order. Refusing
+    the write — rather than silently keeping the old value or
+    silently clobbering it — surfaces the bug at the point where
+    it can be diagnosed.
+    """
 
 
 # ── Trade record ────────────────────────────────────────────────────────────
@@ -369,6 +409,15 @@ class TradeLogger:
         os.makedirs(os.path.dirname(self._path) or ".", exist_ok=True)
         conn = sqlite3.connect(self._path)
         try:
+            # Order lifecycle foundation (PR #59 §6.2 / R13-G1): SQLite
+            # does NOT enforce FOREIGN KEY constraints by default — they
+            # are declared in the schema but advisory unless this PRAGMA
+            # is executed on every connection that opens the database.
+            # Must run BEFORE any DDL or DML so the FKs declared by the
+            # position_lifecycle_orders schema (and option_trailing_stops
+            # once that migration lands) are enforced from the first
+            # statement onward.
+            conn.execute("PRAGMA foreign_keys = ON;")
             # Register OWNER_KEY() as a SQLite UDF so the backfill SQL can
             # normalize OCC option symbols to their underlying. Keeps the
             # stored position_id consistent with engine.positions.owner_key_for().
@@ -383,16 +432,6 @@ class TradeLogger:
                     conn.execute(
                         f"ALTER TABLE trades ADD COLUMN {column} {col_type}"
                     )
-            # 11.27: backfill position_id/position_type on pre-existing rows, then
-            # ensure the lookup index exists. Both statements are idempotent.
-            conn.execute(_BACKFILL_SQL)
-            conn.execute(_POSITION_ID_INDEX_SQL)
-            conn.execute(_POSITION_UID_INDEX_SQL)
-            # 11.10c: signal-lifecycle counter table for the Strategy Health
-            # Monitor. Local import avoids a circular dependency
-            # (strategies.health.* can import reporting.logger types).
-            from strategies.health.lifecycle import _CREATE_LIFECYCLE_TABLE_SQL
-            conn.execute(_CREATE_LIFECYCLE_TABLE_SQL)
             # Operator Controls Phase A — position_lifecycle and
             # position_lifecycle_legs. Created by the same migration path
             # so all schema lives behind one connection bootstrap. Local
@@ -407,6 +446,67 @@ class TradeLogger:
             conn.execute(_CREATE_POSITION_LIFECYCLE_LEGS_SQL)
             for index_sql in _CREATE_POSITION_LIFECYCLE_INDEXES_SQL:
                 conn.execute(index_sql)
+            # Order lifecycle foundation (PR #59): per-order substrate.
+            # Same migration scaffolding pattern as the position_lifecycle
+            # DDL above; the local import keeps engine.lifecycle_orders
+            # standalone-importable without pulling in reporting/logger.
+            from engine.lifecycle_orders import (
+                _CREATE_POSITION_LIFECYCLE_ORDERS_SQL,
+                _CREATE_POSITION_LIFECYCLE_ORDERS_INDEXES_SQL,
+                _UNIQ_ONE_ACTIVE_POSITION_PER_OWNER_KEY_SQL,
+                _UNIQ_TRADES_ORDER_ID_SINGLE_LEG_SQL,
+                run_preflight_or_raise,
+            )
+            conn.execute(_CREATE_POSITION_LIFECYCLE_ORDERS_SQL)
+            for index_sql in _CREATE_POSITION_LIFECYCLE_ORDERS_INDEXES_SQL:
+                conn.execute(index_sql)
+            # Migration preflight (PR #59 §12.2 / R7-P1b / R9-P1c,
+            # PR #60 commit 7 review).
+            #
+            # Detect pre-existing duplicate rows that would block the new
+            # partial UNIQUE indexes — two dimensions:
+            #   - uniq_one_active_position_per_owner_key on position_lifecycle
+            #   - uniq_trades_order_id_single_leg on trades
+            # If either fires, raise MigrationDuplicatesFound — fatal
+            # startup precondition; the operator must run
+            # scripts/migrate_dedupe_trades.py and retry. The bot does
+            # NOT continue in a partial-migration / legacy mode; that
+            # would let foundation writer code create more duplicates
+            # or produce silently wrong rollups.
+            #
+            # Preflight runs BEFORE _BACKFILL_SQL — the BACKFILL changes
+            # position_type from NULL to 'single_leg' on legacy rows,
+            # which would bring duplicate order_ids into the unique
+            # scope. detect_trades_order_id_duplicates anticipates that
+            # transition by scanning (position_type NULL or single_leg)
+            # rows up front so the operator sees the full conflict
+            # surface before any data is mutated.
+            run_preflight_or_raise(conn)
+            # 11.27: backfill position_id/position_type on pre-existing
+            # rows, then ensure the lookup index exists. Plain UPDATE
+            # (not UPDATE OR IGNORE) — preflight above guarantees no
+            # conflicts here; any IntegrityError signals a bug in
+            # detect_trades_order_id_duplicates and must raise loudly.
+            conn.execute(_BACKFILL_SQL)
+            conn.execute(_POSITION_ID_INDEX_SQL)
+            conn.execute(_POSITION_UID_INDEX_SQL)
+            # 11.10c: signal-lifecycle counter table for the Strategy Health
+            # Monitor. Local import avoids a circular dependency
+            # (strategies.health.* can import reporting.logger types).
+            from strategies.health.lifecycle import _CREATE_LIFECYCLE_TABLE_SQL
+            conn.execute(_CREATE_LIFECYCLE_TABLE_SQL)
+            # Position-level partial unique index added to the existing
+            # position_lifecycle table — durable cross-position
+            # duplicate-entry prevention per PR #59 §6.2 / R6-1 / R8-3.
+            # See engine/lifecycle_orders.py for the discussion of why
+            # 'error' is included in the WHERE clause.
+            conn.execute(_UNIQ_ONE_ACTIVE_POSITION_PER_OWNER_KEY_SQL)
+            # trades dedup key per PR #59 §6.5 (R5-C1 + R5-C2).
+            # Scoped to single-leg rows so log_spread_fill's deliberate
+            # two-leg-rows-per-combo-order_id pattern continues to work.
+            # Predicate must match the ON CONFLICT clause inside
+            # apply_order_event exactly (R5-C2 partial-index alignment).
+            conn.execute(_UNIQ_TRADES_ORDER_ID_SINGLE_LEG_SQL)
             from engine.option_trailing import (
                 _CREATE_OPTION_TRAILING_STOPS_SQL,
                 _OPTION_TRAILING_STOPS_INDEXES_SQL,
@@ -801,16 +901,234 @@ class TradeLogger:
             ),
         )
 
+    # UPSERT column policy. Four groups (refined PR #60 round 3
+    # fix F finding):
+    #
+    #  - Immutable (handled directly in the loop below): order_id,
+    #    position_type. Identity columns; never reassigned.
+    #
+    #  - PRESERVE-FIRST-NON-NULL via COALESCE(trades.<col>,
+    #    excluded.<col>) — provenance / audit / set-once columns
+    #    (``_UPSERT_COALESCE_COLUMNS``). A sparse later record
+    #    (cycle reconciliation, restart reconstruction) must NOT
+    #    erase a populated value with NULL. First write wins; later
+    #    NULLs are absorbed.
+    #
+    #  - LATEST-NON-NULL via COALESCE(excluded.<col>, trades.<col>)
+    #    — computed accounting that legitimately updates over the
+    #    lifetime of an order (realized_pnl / r_multiple /
+    #    realized_slippage_bps / slippage_signed_bps /
+    #    slippage_adverse_bps). The newest non-null observation
+    #    wins; an incoming NULL is absorbed rather than clobbering
+    #    a populated value. This is the round-3 reviewer's correct
+    #    distinction from the PRESERVE bucket — these columns DO
+    #    advance, but only on real observations.
+    #
+    #  - Default: excluded.<col> — broker-cumulative state where
+    #    the newest observation is always authoritative even if
+    #    it's NULL (filled_qty / avg_fill_price / status).
+    #
+    # The PRESERVE group expanded in PR #60 round 2 (review finding 6)
+    # to cover all entry-side risk anchors and the modeled-slippage
+    # benchmark, which the prior reviewer correctly noted could be
+    # silently zeroed by a downstream sparse write. Round 3 reviewer
+    # split off the LATEST-NON-NULL bucket for accounting fields
+    # that were still being silently zeroed under the generic
+    # excluded.<col> policy.
+    _UPSERT_COALESCE_COLUMNS = frozenset({
+        # Slippage unification provenance (Phase 1 taxonomy).
+        "slippage_benchmark_price",
+        "slippage_benchmark_kind",
+        "slippage_benchmark_timestamp",
+        "slippage_measurement_quality",
+        # Legacy modeled-slippage benchmark. Captured at submit time
+        # from the arrival price; a later cycle-reconciliation log()
+        # call without the original benchmark must not zero it.
+        "modeled_slippage_bps",
+        # Entry-side risk anchors. Set at the entry log() call and
+        # are READ-ONLY for downstream consumers (per-trade R-multiple,
+        # post-mortem). A later exit log() lacking the entry context
+        # would otherwise NULL them out.
+        "initial_stop_loss",
+        "initial_risk_per_share",
+        "initial_risk_dollars",
+        # Entry / exit timestamps anchor the trade-window math in
+        # reporting/metrics.py and post_mortem analysis. Set-once at
+        # the corresponding lifecycle event.
+        "entry_timestamp",
+        "exit_timestamp",
+        # Stop-trigger price recorded by log_stop_fill when the broker
+        # snapshot carries an actual active stop. A later sparse
+        # recovery record must not clobber it.
+        "stop_trigger_price",
+        # Per-fill execution audit identifier captured from Alpaca
+        # trade_update payloads. apply_order_event populates it on the
+        # first fill; a later sparse record (e.g. cycle reconciliation
+        # without the stream payload) must not erase it.
+        "execution_id",
+    })
+
+    # Columns where a value-to-different-value transition is an
+    # identity conflict and must surface loudly rather than silently
+    # be kept-or-clobbered. Expanded in PR #60 round 4 review
+    # (P2 finding) to cover every column that names what the order
+    # IS — round 3 reviewer noted a populated position_id='AAPL'
+    # could become NULL after a sparse follow-up. Identity columns
+    # belong here, not in the default excluded.<col> bucket.
+    #
+    # Semantics:
+    #   - value→different-value: TradeLoggerIdentityConflict raised
+    #     BEFORE the write. Surfaces the caller bug instead of
+    #     silently mutating identity.
+    #   - NULL→value: allowed (restart-reconstruction fills NULL).
+    #   - value→NULL: preserved via the same COALESCE shape used by
+    #     _UPSERT_COALESCE_COLUMNS (set-once-and-keep).
+    #
+    # The set includes every identity / intent column on the trades
+    # table. position_uid was already covered (round 2); round 4
+    # adds position_id, symbol, side, strategy, order_type, and
+    # requested_qty.
+    _UPSERT_IDENTITY_CONFLICT_COLUMNS = frozenset({
+        "position_uid",
+        "position_id",
+        "symbol",
+        "side",
+        "strategy",
+        "order_type",
+        "requested_qty",
+    })
+
+    # Latest-non-null bucket (PR #60 round 3 fix). These are computed
+    # accounting fields that legitimately update across multiple
+    # log() calls (e.g., realized_pnl recomputed as a partial fill
+    # advances) but where an incoming NULL means "I don't have this
+    # observation right now" rather than "I am explicitly nulling
+    # the value". SQL: ``COALESCE(excluded.<col>, trades.<col>)``.
+    _UPSERT_LATEST_NON_NULL_COLUMNS = frozenset({
+        "realized_pnl",
+        "r_multiple",
+        "realized_slippage_bps",
+        "slippage_signed_bps",
+        "slippage_adverse_bps",
+    })
+
     def log(self, record: TradeRecord) -> None:
-        """Insert one trade record into the database."""
+        """Write one trade record. Single-leg rows UPSERT on order_id
+        (foundation §6.5 — cumulative state per order). Spread legs
+        (position_type='spread') and rows with NULL order_id fall
+        outside the partial UNIQUE index and append.
+
+        Aligned with apply_order_event's UPSERT semantics so the
+        legacy log_entry / log_close / log_stop_fill paths and the
+        foundation event path produce identical end-state on the
+        same order_id.
+
+        UPSERT column policy (refined in PR #60 round 3):
+
+          - Immutable identity (order_id, position_type): never
+            reassigned.
+          - PRESERVE-FIRST-NON-NULL (``_UPSERT_COALESCE_COLUMNS``):
+            provenance + audit + entry-side risk anchors + per-fill
+            timestamps. ``COALESCE(trades.<col>, excluded.<col>)`` —
+            a sparse later record cannot zero out a populated value.
+          - LATEST-NON-NULL (``_UPSERT_LATEST_NON_NULL_COLUMNS``):
+            computed accounting that legitimately updates over the
+            order's lifetime (realized_pnl, r_multiple, realized
+            slippage / signed / adverse bps). ``COALESCE(excluded.
+            <col>, trades.<col>)`` — incoming value wins if
+            present; incoming NULL is absorbed so a sparse later
+            record can't zero the column.
+          - Identity conflict (``_UPSERT_IDENTITY_CONFLICT_COLUMNS``):
+            ``position_uid``, ``position_id``, ``symbol``, ``side``,
+            ``strategy``, ``order_type``, ``requested_qty``.
+            A value→different-value transition is a foundation
+            invariant violation and raises
+            ``TradeLoggerIdentityConflict`` BEFORE the write.
+            NULL→value transitions are allowed for restart
+            reconstruction.
+          - Default (broker cumulative state): ``excluded.<col>`` —
+            filled_qty, avg_fill_price, status. Newest observation
+            wins even if NULL.
+        """
         conn = self._ensure_db()
         d = record.as_dict()
         columns = ", ".join(d.keys())
         placeholders = ", ".join(["?"] * len(d))
-        conn.execute(
-            f"INSERT INTO trades ({columns}) VALUES ({placeholders})",
-            list(d.values()),
+        # Single-leg + non-NULL order_id → UPSERT on the partial UNIQUE
+        # uniq_trades_order_id_single_leg. Otherwise plain INSERT.
+        is_single_leg_with_order_id = (
+            record.order_id is not None
+            and getattr(record, "position_type", None) == "single_leg"
         )
+        if is_single_leg_with_order_id:
+            # Pre-write identity-conflict check (finding 6 sub-point).
+            # Read whatever's already in the row; if any
+            # IDENTITY_CONFLICT_COLUMN holds a non-null value
+            # different from what we're about to write, refuse.
+            existing = conn.execute(
+                "SELECT "
+                + ", ".join(self._UPSERT_IDENTITY_CONFLICT_COLUMNS)
+                + " FROM trades WHERE order_id = ? "
+                "AND position_type = 'single_leg'",
+                (record.order_id,),
+            ).fetchone()
+            if existing is not None:
+                for col, existing_val in zip(
+                    self._UPSERT_IDENTITY_CONFLICT_COLUMNS, existing,
+                ):
+                    incoming_val = d.get(col)
+                    if (
+                        existing_val is not None
+                        and incoming_val is not None
+                        and existing_val != incoming_val
+                    ):
+                        raise TradeLoggerIdentityConflict(
+                            f"trades row for order_id={record.order_id!r} "
+                            f"has {col}={existing_val!r}; refusing to "
+                            f"overwrite with {incoming_val!r}. A broker "
+                            f"order belongs to exactly one lifecycle row."
+                        )
+
+            immutable = {"order_id", "position_type"}
+            update_clauses: list[str] = []
+            for col in d.keys():
+                if col in immutable:
+                    continue
+                if (
+                    col in self._UPSERT_COALESCE_COLUMNS
+                    or col in self._UPSERT_IDENTITY_CONFLICT_COLUMNS
+                ):
+                    # PRESERVE-FIRST-NON-NULL: keep the existing
+                    # non-null value if present. The Python-side
+                    # check above is what makes the IDENTITY conflict
+                    # refuse rather than silently preserve.
+                    update_clauses.append(
+                        f"{col} = COALESCE(trades.{col}, excluded.{col})"
+                    )
+                elif col in self._UPSERT_LATEST_NON_NULL_COLUMNS:
+                    # LATEST-NON-NULL: a populated incoming value
+                    # advances the column; an incoming NULL is
+                    # absorbed rather than clobbering the existing
+                    # non-null. Computed accounting that updates
+                    # across the order's lifetime.
+                    update_clauses.append(
+                        f"{col} = COALESCE(excluded.{col}, trades.{col})"
+                    )
+                else:
+                    update_clauses.append(f"{col} = excluded.{col}")
+            update_set = ", ".join(update_clauses)
+            conn.execute(
+                f"INSERT INTO trades ({columns}) VALUES ({placeholders}) "
+                f"ON CONFLICT(order_id) "
+                f"WHERE order_id IS NOT NULL AND position_type = 'single_leg' "
+                f"DO UPDATE SET {update_set}",
+                list(d.values()),
+            )
+        else:
+            conn.execute(
+                f"INSERT INTO trades ({columns}) VALUES ({placeholders})",
+                list(d.values()),
+            )
         conn.commit()
         logger.info(
             f"trade logged: {record.side} {record.qty} {record.symbol} "

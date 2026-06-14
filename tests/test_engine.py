@@ -137,10 +137,15 @@ def _filled_result(
     *,
     submitted_at: datetime | None = None,
     filled_at: datetime | None = None,
+    order_id: str | None = None,
 ) -> OrderResult:
+    # Foundation §6.5: trades is one row per order_id (single-leg).
+    # Use a symbol-based default so writers that call _filled_result
+    # for distinct symbols get distinct order_ids (the legacy
+    # ord-1 default would have UPSERTed into a single row).
     return OrderResult(
         status=OrderStatus.FILLED,
-        order_id="ord-1",
+        order_id=order_id or f"ord-{symbol}",
         symbol=symbol,
         requested_qty=qty,
         filled_qty=qty,

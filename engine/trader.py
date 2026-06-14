@@ -334,6 +334,24 @@ class TradingEngine:
         except Exception as exc:
             logger.warning(f"lifecycle store init skipped: {exc}")
             self.lifecycle_store = None
+        # Foundation commit 6 — per-order substrate store. Same DB connection
+        # so the FK from position_lifecycle_orders.position_uid →
+        # position_lifecycle.position_uid resolves locally. Best-effort: if
+        # init fails the broker simply won't insert per-order rows and the
+        # engine falls back to the position-level lifecycle exclusively.
+        try:
+            from engine.lifecycle_orders import PositionLifecycleOrdersStore
+            self.lifecycle_orders_store = PositionLifecycleOrdersStore(
+                self.trade_logger._ensure_db()
+            )
+            if (
+                hasattr(self.broker, "_lifecycle_orders_store")
+                and getattr(self.broker, "_lifecycle_orders_store", None) is None
+            ):
+                self.broker._lifecycle_orders_store = self.lifecycle_orders_store
+        except Exception as exc:
+            logger.warning(f"lifecycle_orders store init skipped: {exc}")
+            self.lifecycle_orders_store = None
         try:
             self.option_trailing_store = OptionTrailingStopStore(
                 self.trade_logger._ensure_db()
@@ -843,6 +861,7 @@ class TradingEngine:
             self._recover_suspect_exit_orders(snapshot)
             self._process_stream_stop_fills(snapshot)
             self._detect_external_closes(snapshot)
+            self._drain_lifecycle_attaches()
             self._drain_option_fills()
             self._drain_spread_fills()
             self._sync_option_trailing_stops(snapshot)
@@ -1624,7 +1643,23 @@ class TradingEngine:
         else:
             slippage_kind = None  # build_record will default to 'unavailable'
         try:
-            result = self.broker.place_order(decision)
+            # PR #60 commit 9 fix E: thread the arrival benchmark we
+            # just computed (and its provenance kind) through to the
+            # broker so the per-order substrate row records the exact
+            # observation §10.5 of the discovery doc requires.
+            # Recovery rows that hit apply_order_event later inherit
+            # this via the COALESCE policy in TradeLogger.log.
+            _now_iso = self._clock().isoformat()
+            result = self.broker.place_order(
+                decision,
+                slippage_benchmark_price=slippage_ref,
+                slippage_benchmark_kind=slippage_kind,
+                slippage_benchmark_timestamp=_now_iso,
+                slippage_measurement_quality=(
+                    "primary" if slippage_kind == "arrival_midpoint"
+                    else ("fallback" if slippage_kind else "unavailable")
+                ),
+            )
             # PLAN 11.10f: lifecycle counter — submitted increments
             # once per place_order call (regardless of fill status).
             # ACCEPTED, FILLED, PARTIAL, UNKNOWN all count as submitted
@@ -4238,6 +4273,39 @@ class TradingEngine:
                         f"{raw_symbol}: option trailing cleanup failed after "
                         f"stream stop fill: {exc}"
                     )
+
+    def _drain_lifecycle_attaches(self) -> None:
+        """Apply per-order substrate attaches enqueued by background
+        worker threads.
+
+        PR #60 round 2 fix (finding 2): the shared sqlite3 connection
+        is opened on the main thread; background workers
+        (OptionsExecutionWorker today, others in commits 11+) cannot
+        call attach_broker_order_id directly. They enqueue
+        (client_order_id, broker_order_id, submitted_at); we drain
+        and apply on this — the connection-owning — thread.
+
+        Best-effort: an individual attach failure is logged at
+        CRITICAL and absorbed so a broken substrate row cannot stall
+        the cycle. Same discipline as
+        ``_lifecycle_orders_attach_order_id`` in the broker."""
+        if self.lifecycle_orders_store is None:
+            return
+        attaches = self.broker.drain_lifecycle_attaches()
+        for client_order_id, order_id, submitted_at in attaches:
+            try:
+                self.lifecycle_orders_store.attach_broker_order_id(
+                    client_order_id=client_order_id,
+                    order_id=order_id,
+                    submitted_at=submitted_at,
+                )
+            except Exception as exc:
+                logger.critical(
+                    f"queued lifecycle_orders.attach FAILED for "
+                    f"{client_order_id} → {order_id}: {exc}. Cycle "
+                    f"reconciliation (commit later) will retry via "
+                    f"client_order_id lookup."
+                )
 
     def _drain_option_fills(self) -> None:
         """

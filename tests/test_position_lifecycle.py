@@ -114,7 +114,14 @@ class TestSchemaMigration:
                 "AND name LIKE 'position_lifecycle%'"
             ).fetchall()
         ]
-        assert sorted(names) == ["position_lifecycle", "position_lifecycle_legs"]
+        # position_lifecycle_orders added by the order lifecycle
+        # foundation (PR #59 §6.2). Foundation migration is run by the
+        # same _ensure_db bootstrap, so the table list grew by one.
+        assert sorted(names) == [
+            "position_lifecycle",
+            "position_lifecycle_legs",
+            "position_lifecycle_orders",
+        ]
 
     def test_trades_has_position_uid_column_after_migration(self, tmp_path):
         db_path = tmp_path / "trades.db"
@@ -411,24 +418,40 @@ class TestReads:
         statuses = {r.status for r in open_rows}
         assert statuses == {"open", "pending"}
 
-    def test_get_open_for_owner_key_returns_latest(self, store):
-        """When two non-terminal rows exist for the same owner_key
-        (rare edge case), return the most recently created."""
-        uid_old = new_position_uid()
+    def test_get_open_for_owner_key_rejects_duplicate_via_uniq_index(
+        self, store
+    ):
+        """Order lifecycle foundation (PR #59 §6.2 / R6-1) made the
+        'two non-terminal rows on same owner_key' state durably
+        impossible — the uniq_one_active_position_per_owner_key
+        partial unique index rejects the second INSERT.
+
+        This test was previously `test_get_open_for_owner_key_returns_latest`
+        and exercised the soft 'caller should detect and reconcile'
+        behavior the discovery doc flagged as inadequate. The foundation
+        makes the constraint durable; the test now verifies the
+        IntegrityError fires."""
+        import sqlite3
+        uid_first = new_position_uid()
         store.create_pending(
-            position_uid=uid_old, symbol="NVDA", owner_key="NVDA",
+            position_uid=uid_first, symbol="NVDA", owner_key="NVDA",
             strategy="sma_crossover", position_type="single_leg",
             entry_qty=5.0,
         )
-        uid_new = new_position_uid()
-        store.create_pending(
-            position_uid=uid_new, symbol="NVDA", owner_key="NVDA",
-            strategy="sma_crossover", position_type="single_leg",
-            entry_qty=5.0,
-        )
+        # Second create_pending on the same owner_key while the first
+        # is still non-terminal MUST be rejected by the foundation's
+        # position-level unique index.
+        with pytest.raises(sqlite3.IntegrityError):
+            store.create_pending(
+                position_uid=new_position_uid(),
+                symbol="NVDA", owner_key="NVDA",
+                strategy="sma_crossover", position_type="single_leg",
+                entry_qty=5.0,
+            )
+        # The single non-terminal row is returned by lookup.
         row = store.get_open_for_owner_key("NVDA")
         assert row is not None
-        assert row.position_uid == uid_new
+        assert row.position_uid == uid_first
 
     def test_get_open_for_owner_key_excludes_closed(self, store):
         uid = new_position_uid()
