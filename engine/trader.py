@@ -2065,8 +2065,9 @@ class TradingEngine:
 
         Mirrors _maybe_dispatch_substrate_entry_fill but for the
         close path: when an exit row reaches filled, write the
-        trade row via _record_recovered_exit_fill (idempotent via
-        has_recorded_order_id) and clear engine ownership state
+        trade row via _record_recovered_exit_fill (with
+        skip_trades_dedup_check=True since apply_order_event
+        already UPSERTed) and clear engine ownership state
         (_pop_position, _entry_prices, _external_close_suspects).
 
         De-dup guards (in order):
@@ -2075,12 +2076,12 @@ class TradingEngine:
           3. event.avg_fill_price is not None
           4. substrate row exists with role='exit'
           5. position_lifecycle row exists for the position_uid
+          6. _has_position(symbol) — engine still owns the symbol.
+             This is the PRIMARY idempotency signal (PR #61 round-1
+             fix P1): after the first dispatch fires, _pop_position
+             clears ownership; subsequent observations skip here.
 
-        Idempotent: _record_recovered_exit_fill checks
-        has_recorded_order_id and returns False if the order_id
-        is already in the trade log. The cleanup pops are
-        idempotent by nature (dict.pop with default). Safe to
-        fire multiple times across stream / cycle / startup
+        Safe to fire multiple times across stream / cycle / startup
         observations of the same fill.
 
         Best-effort: any failure logs CRITICAL and absorbs. The
@@ -4566,11 +4567,19 @@ class TradingEngine:
                     submitted_at=submitted_at,
                 )
             except Exception as exc:
+                # PR #61 round-2 fix P2-2 honesty: the cycle and
+                # startup reconcilers query `order_id IS NOT NULL`
+                # only, so they do NOT pick up rows whose attach
+                # failed (order_id still NULL). The lifecycle-
+                # attach queue itself is in-memory and lost on bot
+                # restart. This row is ORPHANED until a NULL-order_id
+                # recovery path lands (tracker: 'Known follow-ups').
+                # The broker order is live; operator must inspect.
                 logger.critical(
                     f"queued lifecycle_orders.attach FAILED for "
-                    f"{client_order_id} → {order_id}: {exc}. Cycle "
-                    f"reconciliation (commit later) will retry via "
-                    f"client_order_id lookup."
+                    f"{client_order_id} → {order_id}: {exc}. "
+                    f"SUBSTRATE ROW ORPHANED — order_id NULL means "
+                    f"REST reconcilers skip it. Inspect manually."
                 )
 
     def _drain_lifecycle_events(

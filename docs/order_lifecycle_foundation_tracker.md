@@ -75,17 +75,20 @@ After PR #60 merged to main on 2026-06-14, the consumer wiring landed on a follo
 | P-6a | Extract `_apply_recovered_entry_side_effects` helper (ownership bind + entry-price cache + stop replacement + alert) | §10.1 | `1378289` | ✅ |
 | P-6b | Wire `_maybe_dispatch_substrate_entry_fill` from stream + cycle + startup drains; gates on `_has_position` to avoid double-firing | §10.1 / §6.7 | `73793d7` | ✅ |
 | P-6c | Delete `_suspect_orders` cache, `SuspectOrder` dataclass, `_remember_suspect_order`, `_recover_suspect_orders` | §10.1 / §6.7 | `b982870` | ✅ |
-| P-7a | Wire `_maybe_dispatch_substrate_exit_fill` from same drain handlers; uses existing `_record_recovered_exit_fill` (idempotent via `has_recorded_order_id`) | §10.2 / §6.7 | `860ce93` | ✅ |
+| P-7a | Wire `_maybe_dispatch_substrate_exit_fill` from same drain handlers; calls `_record_recovered_exit_fill` with `skip_trades_dedup_check=True`; idempotency via `_has_position` ownership gate (post round-1 P1 fix) | §10.2 / §6.7 | `860ce93` + `c247fe4` | ✅ |
 | P-7b | Delete `_suspect_exit_orders` cache, `SuspectExitOrder` dataclass, `_recover_suspect_exit_orders`, staging branch in `_close_single_leg_position` | §10.2 / §6.7 | `ecce2da` | ✅ |
 | P-8 | Doc updates: this tracker + PLAN.md (slippage_unification_tracker.md and operator_controls_proposal.md don't reference the foundation — no edits needed there) | §12 | `8bf9046` | ✅ |
 | PR #61 round-1 fix P1 | Exit dispatch via ownership gate (was suppressed by its own substrate UPSERT); +2 integration tests covering the apply→dispatch sequence | §10.2 | `c247fe4` | ✅ |
-| PR #61 round-1 fix P2 | Cycle REST cap counts actual calls, not rows read; tracker doc drift; NULL-order_id attach retry tracked as follow-up | §10.1 | (this commit) | 🔄 In progress |
+| PR #61 round-1 fix P2 | Cycle REST cap counts actual calls, not rows read; tracker doc drift; NULL-order_id attach retry tracked as follow-up | §10.1 | `d181f1d` | ✅ |
+| PR #61 round-2 fix | Honest CRITICAL log on orphaned-attach (was lying about retry); stale docstrings on exit-dispatch; new known follow-up for recovered-entry accounting completeness | §10.1 / §10.2 | (this commit) | 🔄 In progress |
 
-Consumer-wiring totals: ~2,100 LOC code + ~1,000 LOC tests across 14 commits (12 original + 2 PR #61 round-1 review fixes); ~500 LOC of legacy cache infrastructure deleted.
+Consumer-wiring totals: ~2,150 LOC code + ~1,000 LOC tests across 15 commits (12 original + 3 PR #61 review-fix commits); ~500 LOC of legacy cache infrastructure deleted.
 
 ### Known follow-ups (tracked, not blocking)
 
-- **NULL-order_id attach retry**: cycle and startup reconcilers only walk rows with `order_id IS NOT NULL`. A synchronous attach failure (or a failed lifecycle-attach queue drain) leaves the row at `pending` with `order_id=NULL`, invisible to the REST reconcilers. Recovery requires a separate path that walks NULL-order_id rows and resolves via `get_order_by_client_id`. Requires an uncommon SQLite failure to occur; not blocking on paper. PR #61 round-1 reviewer P2-2.
+- **NULL-order_id attach orphaning**: cycle and startup reconcilers walk rows with `order_id IS NOT NULL` only. A synchronous attach failure OR a bot crash between async submit and the next cycle's drain leaves the row at `pending` with `order_id=NULL`. The lifecycle-attach queue is in-memory and lost on restart — it does NOT re-drain. The substrate row is then ORPHANED until manually resolved. The CRITICAL log in `_drain_lifecycle_attaches` (engine/trader.py:4568) says exactly this so the operator knows to inspect. Recovery requires a separate REST path that walks NULL-order_id rows and resolves via `get_order_by_client_id`. Uncommon trigger; not blocking on paper, but the failure mode is more serious than the earlier "self-heals on restart" framing implied. PR #61 round-2 reviewer.
+
+- **Recovered-entry accounting completeness**: `_apply_recovered_entry_side_effects` (called by `_maybe_dispatch_substrate_entry_fill` on UNKNOWN-at-submit recovery) fires items 3-6 (ownership / entry-price cache / stop replacement / alert) but NOT items 1-2 (`_record_fill` / `_log_entry`). The trade row is written by `apply_order_event`'s UPSERT — so the row exists — but it lacks the slippage taxonomy fields (`modeled_slippage_bps`, `slippage_signed_bps`, `slippage_adverse_bps`) that `_log_entry` calculates from `modeled_price` vs `avg_fill_price`. Affects accounting quality on the uncommon recovery path, not position management. Fix: substrate dispatch should also call `_record_fill` + `_log_entry` after `apply_order_event` writes (the trade-log UPSERT preservation policy ensures fields merge correctly). Add apply-then-dispatch entry integration test mirroring `TestExitDispatchEndToEnd`. PR #61 round-2 reviewer.
 
 ### Four-tier capture pipeline (substrate becomes load-bearing)
 
@@ -244,7 +247,7 @@ Two phases, two rollback strategies:
 
 The consumer-wiring branch DELETES the legacy `_suspect_orders` and `_suspect_exit_orders` caches. Reverting the cache-removal commits (`b982870`, `ecce2da`) is safe — the substrate-driven dispatch (`73793d7`, `860ce93`) and the caches can coexist (dual-write), so a partial rollback of just the deletion commits restores the safety net without breaking the substrate.
 
-Full Phase 2 revert (all 14 commits) reverts to phase-1 substrate-only state. Safe.
+Full Phase 2 revert (all 15 commits) reverts to phase-1 substrate-only state. Safe.
 
 A partial rollback (e.g., keeping P-1 stream wiring but reverting P-6/P-7 cache removal) is supported because the substrate dispatches gate on `_has_position` and the cache dispatches gate on `_suspect_orders` membership — both can run simultaneously without double-firing alerts.
 
