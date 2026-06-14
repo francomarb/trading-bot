@@ -2112,6 +2112,17 @@ class TradingEngine:
                 return
             symbol = pos_row.symbol
             owner = pos_row.strategy
+            # PR #61 round-1 fix P1: dedup via ownership, NOT via
+            # has_recorded_order_id. apply_order_event has already
+            # UPSERTed the trade row by the time we get here, so
+            # the legacy "is this order_id in trades?" check would
+            # always short-circuit. We instead gate on
+            # _has_position: if the engine doesn't own the
+            # symbol, the dispatch either already fired (and
+            # popped ownership) or this is a phantom event for a
+            # position never bound — skip.
+            if not self._has_position(symbol):
+                return
             # Build a synthetic exit_fill object matching the
             # OrderResult shape _record_recovered_exit_fill expects.
             exit_fill = OrderResult(
@@ -2135,6 +2146,10 @@ class TradingEngine:
                     order_row.slippage_benchmark_kind or "unavailable"
                 ),
                 alert_reason="substrate exit dispatch",
+                # Substrate already wrote the trade row via
+                # apply_order_event's UPSERT — bypass the legacy
+                # dedup check so P&L / alert / cleanup actually fire.
+                skip_trades_dedup_check=True,
             )
             if wrote:
                 self._pop_position(symbol)
@@ -2407,10 +2422,33 @@ class TradingEngine:
         alert_reason: str = "broker-history exit recovery",
         is_full_close: bool | None = None,
         external: bool = False,
+        skip_trades_dedup_check: bool = False,
     ) -> bool:
-        """Persist one broker-confirmed non-stop exit exactly once."""
+        """Persist one broker-confirmed non-stop exit exactly once.
+
+        ``skip_trades_dedup_check`` (PR #61 round-1 review fix P1):
+        the substrate-driven exit dispatch calls this AFTER
+        apply_order_event has already UPSERTed the trade row, so
+        has_recorded_order_id returns True and the legacy dedup
+        gate would short-circuit before firing P&L / alert /
+        ownership cleanup. Substrate callers pass True; their
+        idempotency comes from the dispatch's _has_position gate
+        (the engine pops ownership at the end of this helper, so
+        subsequent substrate observations see no position and
+        skip the dispatch).
+
+        Legacy callers (broker-history exit recovery, external-
+        close confirmation) keep the default False — they predate
+        the substrate write and need the has_recorded_order_id
+        check to avoid double-writing.
+        """
         order_id = getattr(exit_fill, "order_id", None)
-        if not order_id or self.trade_logger.has_recorded_order_id(order_id):
+        if not order_id:
+            return False
+        if (
+            not skip_trades_dedup_check
+            and self.trade_logger.has_recorded_order_id(order_id)
+        ):
             return False
         price = getattr(exit_fill, "avg_fill_price", None)
         qty = float(getattr(exit_fill, "filled_qty", 0.0) or 0.0)

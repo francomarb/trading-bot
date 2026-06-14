@@ -2081,3 +2081,241 @@ class TestSubstrateExitFillDispatchSemantics:
         row = orders_store.get_by_order_id(order_id)
         assert row.role == "exit"
         assert row.status == "filled"
+
+
+# ── PR #61 round-1 fix P1: end-to-end exit-dispatch integration ────────────
+
+
+class TestExitDispatchEndToEnd:
+    """ChatGPT round-1 review caught a deterministic bug: the unit
+    tests for the exit dispatch verified the substrate row reached
+    filled but never actually called _maybe_dispatch_substrate_exit_
+    fill. The real-world sequence (apply_order_event UPSERTs trade
+    → dispatch sees has_recorded_order_id=True → skips P&L/alert/
+    cleanup) was untested.
+
+    These integration tests exercise the actual pipeline path:
+    apply_order_event first, then dispatch second, on the same
+    in-engine substrate connection — and assert the side effects
+    actually fire."""
+
+    def test_exit_dispatch_fires_pnl_and_cleanup_after_substrate_write(
+        self, tmp_path,
+    ):
+        """The reviewer's exact reproduction. After apply_order_event
+        writes the exit trade row, the dispatch must STILL fire
+        realized_pnl + ownership cleanup."""
+        from unittest.mock import MagicMock
+        from types import SimpleNamespace
+        from engine.lifecycle_orders import apply_order_event
+        from engine.trader import TradingEngine
+        from engine.positions import Position
+        from execution.broker import BrokerSnapshot
+        from risk.manager import RiskDecision, Side
+        from strategies.base import OrderType
+
+        # Build a minimal engine wired to a real substrate.
+        engine = MagicMock(spec=TradingEngine)
+        engine.lifecycle_orders_store = MagicMock()
+        engine.lifecycle_store = MagicMock()
+        engine.trade_logger = MagicMock()
+        engine.alerts = MagicMock()
+        engine.risk = MagicMock()
+        engine._positions = {"AAPL": Position(
+            position_id="AAPL", position_type="single_leg",
+            strategy_name="sma_crossover",
+        )}
+        engine._entry_prices = {"AAPL": 100.0}
+        engine._external_close_suspects = {}
+        # Mock spec stubs out _has_position / _pop_position; wire
+        # them to real dict semantics so the dispatch's gate and
+        # cleanup are observable.
+        engine._has_position = lambda sym: sym in engine._positions
+        engine._pop_position = lambda sym: engine._positions.pop(sym, None)
+        # Bind the REAL _record_recovered_exit_fill and its
+        # dependencies so the dispatch's call into it actually
+        # writes the close log and fires the alert.
+        engine._record_recovered_exit_fill = (
+            TradingEngine._record_recovered_exit_fill.__get__(engine)
+        )
+        engine._record_fill = lambda *a, **kw: None  # HWM gate noop
+        engine._log_close = lambda *a, **kw: None  # trade_logger already has the row
+        engine._record_realized_pnl = MagicMock()
+
+        # Real substrate connection from a TradeLogger.
+        from reporting.logger import TradeLogger
+        tl = TradeLogger(path=str(tmp_path / "trades.db"))
+        conn = tl._ensure_db()
+        from engine.lifecycle import PositionLifecycleStore, new_position_uid
+        from engine.lifecycle_orders import PositionLifecycleOrdersStore
+        pos_store = PositionLifecycleStore(conn)
+        orders_store = PositionLifecycleOrdersStore(conn)
+        engine.lifecycle_orders_store = orders_store
+        engine.lifecycle_store = pos_store
+        engine.trade_logger = tl
+
+        # Seed: an open position with an exit order pending.
+        uid = new_position_uid()
+        pos_store.create_pending(
+            position_uid=uid, symbol="AAPL", owner_key="AAPL",
+            strategy="sma_crossover", position_type="single_leg",
+            entry_qty=10.0,
+        )
+        pos_store.mark_open(
+            position_uid=uid, avg_entry_price=100.0, current_qty=10.0,
+        )
+        orders_store.insert_pending(
+            position_uid=uid, role="exit", client_order_id="cli-exit-1",
+            order_type="market", order_class="simple",
+            time_in_force="day", side="sell", intended_qty=10.0,
+        )
+        orders_store.attach_broker_order_id(
+            client_order_id="cli-exit-1", order_id="alpaca-exit-1",
+        )
+
+        # Step 1: substrate observes the fill via stream → apply.
+        # This is what was happening BEFORE the dispatch could run.
+        outcome = apply_order_event(
+            conn,
+            OrderEvent(
+                order_id="alpaca-exit-1", status="filled",
+                filled_qty=10.0, avg_fill_price=105.0,
+                broker_updated_at="2026-06-16T10:30:00+00:00",
+            ),
+            reason="stream",
+        )
+        assert outcome.applied is True
+        # Trade row IS in trades now — pre-fix, the next step's
+        # has_recorded_order_id check would short-circuit.
+        assert tl.has_recorded_order_id("alpaca-exit-1") is True
+
+        # Step 2: dispatch runs. With the round-1 fix it must
+        # bypass the trades-dedup check (ownership gate is the
+        # dedup signal instead) and fire side effects.
+        event = OrderEvent(
+            order_id="alpaca-exit-1", status="filled",
+            filled_qty=10.0, avg_fill_price=105.0,
+            broker_updated_at="2026-06-16T10:30:00+00:00",
+        )
+        snapshot = BrokerSnapshot(
+            account=SimpleNamespace(
+                equity=100_000.0, cash=50_000.0, buying_power=50_000.0,
+                open_positions={},  # broker no longer holds AAPL
+            ),
+            open_orders=[],
+        )
+        # We need the REAL engine method (not a mock) for this
+        # integration. Re-bind it directly.
+        TradingEngine._maybe_dispatch_substrate_exit_fill(
+            engine, event=event, snapshot=snapshot,
+        )
+
+        # Side effects should have fired even though the trade row
+        # was already in trades:
+        # 1. Ownership cleared from _positions
+        assert "AAPL" not in engine._positions
+        # 2. Entry-price cache cleared
+        assert "AAPL" not in engine._entry_prices
+        # 3. alerts.trade_executed fired
+        engine.alerts.trade_executed.assert_called_once()
+
+    def test_exit_dispatch_idempotent_via_ownership_gate(self, tmp_path):
+        """Second observation of the same fill (e.g., cycle reconcile
+        re-fires after the stream already did) must be a no-op:
+        first dispatch popped ownership, second sees no position and
+        skips."""
+        from unittest.mock import MagicMock
+        from types import SimpleNamespace
+        from engine.lifecycle_orders import apply_order_event
+        from engine.trader import TradingEngine
+        from engine.positions import Position
+        from execution.broker import BrokerSnapshot
+        from reporting.logger import TradeLogger
+        from engine.lifecycle import PositionLifecycleStore, new_position_uid
+        from engine.lifecycle_orders import PositionLifecycleOrdersStore
+
+        tl = TradeLogger(path=str(tmp_path / "trades.db"))
+        conn = tl._ensure_db()
+        pos_store = PositionLifecycleStore(conn)
+        orders_store = PositionLifecycleOrdersStore(conn)
+
+        engine = MagicMock(spec=TradingEngine)
+        engine.lifecycle_orders_store = orders_store
+        engine.lifecycle_store = pos_store
+        engine.trade_logger = tl
+        engine.alerts = MagicMock()
+        engine.risk = MagicMock()
+        engine._positions = {"AAPL": Position(
+            position_id="AAPL", position_type="single_leg",
+            strategy_name="sma_crossover",
+        )}
+        engine._entry_prices = {"AAPL": 100.0}
+        engine._external_close_suspects = {}
+        # Mock spec stubs out _has_position / _pop_position; wire
+        # them to real dict semantics so the dispatch's gate and
+        # cleanup are observable.
+        engine._has_position = lambda sym: sym in engine._positions
+        engine._pop_position = lambda sym: engine._positions.pop(sym, None)
+        # Bind the REAL _record_recovered_exit_fill and its
+        # dependencies so the dispatch's call into it actually
+        # writes the close log and fires the alert.
+        engine._record_recovered_exit_fill = (
+            TradingEngine._record_recovered_exit_fill.__get__(engine)
+        )
+        engine._record_fill = lambda *a, **kw: None  # HWM gate noop
+        engine._log_close = lambda *a, **kw: None  # trade_logger already has the row
+        engine._record_realized_pnl = MagicMock()
+
+        uid = new_position_uid()
+        pos_store.create_pending(
+            position_uid=uid, symbol="AAPL", owner_key="AAPL",
+            strategy="sma_crossover", position_type="single_leg",
+            entry_qty=10.0,
+        )
+        pos_store.mark_open(
+            position_uid=uid, avg_entry_price=100.0, current_qty=10.0,
+        )
+        orders_store.insert_pending(
+            position_uid=uid, role="exit", client_order_id="cli-exit-2",
+            order_type="market", order_class="simple",
+            time_in_force="day", side="sell", intended_qty=10.0,
+        )
+        orders_store.attach_broker_order_id(
+            client_order_id="cli-exit-2", order_id="alpaca-exit-2",
+        )
+        apply_order_event(
+            conn,
+            OrderEvent(
+                order_id="alpaca-exit-2", status="filled",
+                filled_qty=10.0, avg_fill_price=105.0,
+                broker_updated_at="2026-06-16T10:30:00+00:00",
+            ),
+            reason="stream",
+        )
+
+        event = OrderEvent(
+            order_id="alpaca-exit-2", status="filled",
+            filled_qty=10.0, avg_fill_price=105.0,
+            broker_updated_at="2026-06-16T10:30:00+00:00",
+        )
+        snapshot = BrokerSnapshot(
+            account=SimpleNamespace(
+                equity=100_000.0, cash=50_000.0, buying_power=50_000.0,
+                open_positions={},
+            ),
+            open_orders=[],
+        )
+
+        # First dispatch fires.
+        TradingEngine._maybe_dispatch_substrate_exit_fill(
+            engine, event=event, snapshot=snapshot,
+        )
+        assert "AAPL" not in engine._positions
+        first_alert_count = engine.alerts.trade_executed.call_count
+
+        # Second dispatch (cycle reconcile re-observation) sees no
+        # ownership and skips. Alert count unchanged.
+        TradingEngine._maybe_dispatch_substrate_exit_fill(
+            engine, event=event, snapshot=snapshot,
+        )
+        assert engine.alerts.trade_executed.call_count == first_alert_count
