@@ -1957,8 +1957,14 @@ class TradingEngine:
 
             position = snapshot.account.open_positions.get(symbol)
             if result.status in {OrderStatus.FILLED, OrderStatus.PARTIAL} and position is not None:
-                fill_price = result.avg_fill_price or suspect.decision.entry_reference_price
-                fill_qty = float(result.filled_qty or position.qty or suspect.decision.qty)
+                # P-6 commit A: side effects 1-2 (trade-log writes)
+                # stay inline because the suspect path's UPSERT
+                # consolidates with the substrate's apply_order_event
+                # UPSERT on the same order_id. Side effects 3-6
+                # (ownership + cache + stop + alert) are extracted
+                # into _apply_recovered_entry_side_effects so the
+                # substrate-driven path (commit B) can call the same
+                # helper without going through the suspect cache.
                 self._record_fill(
                     result,
                     modeled_price=suspect.modeled_price,
@@ -1980,23 +1986,20 @@ class TradingEngine:
                     benchmark_kind=suspect.modeled_price_kind,
                     measurement_quality="recovered",
                 )
-                self._register_single_leg(
-                    strategy_name=suspect.decision.strategy_name,
-                    symbol=symbol,
-                )
-                self._entry_prices[symbol] = fill_price
-                self._ensure_recovered_protective_stop(
+                self._apply_recovered_entry_side_effects(
                     snapshot=snapshot,
                     position=position,
                     decision=suspect.decision,
-                )
-                self.alerts.trade_executed(
-                    symbol=symbol,
-                    strategy=suspect.decision.strategy_name,
-                    side="buy",
-                    qty=fill_qty,
-                    price=fill_price,
-                    reason=f"{suspect.decision.reason} (recovered)",
+                    fill_price=(
+                        result.avg_fill_price
+                        or suspect.decision.entry_reference_price
+                    ),
+                    fill_qty=float(
+                        result.filled_qty
+                        or position.qty
+                        or suspect.decision.qty
+                    ),
+                    reason_suffix="(recovered)",
                 )
                 logger.warning(
                     f"{symbol}: recovered filled suspect order "
@@ -2012,6 +2015,70 @@ class TradingEngine:
                 "dropping recovery state without adopting"
             )
             self._suspect_orders.pop(symbol, None)
+
+    def _apply_recovered_entry_side_effects(
+        self,
+        *,
+        snapshot: BrokerSnapshot,
+        position: Position,
+        decision: RiskDecision,
+        fill_price: float,
+        fill_qty: float,
+        reason_suffix: str = "(recovered)",
+    ) -> None:
+        """Fire the engine-side side effects that happen when a
+        bot-submitted entry is adopted on the recovery path.
+
+        Extracted from the body of _recover_suspect_orders so two
+        callers can share it:
+
+          - Legacy suspect-cache path (this commit): when
+            _recover_suspect_orders confirms a UNKNOWN-then-FILLED
+            entry against the broker.
+          - Substrate-driven path (next commit): when the substrate
+            observes a fill on an entry_primary row whose engine
+            ownership hasn't been bound yet (recovery via stream /
+            cycle / startup reconcile rather than via the cache).
+
+        Side effects:
+          1. Register strategy ownership of the symbol so signals
+             can act on it.
+          2. Cache the entry price for the HWM drawdown gate.
+          3. Submit a protective stop if the broker doesn't already
+             have one attached (recovered entries lose their
+             original stop_loss leg when confirmation fails before
+             OTO completion).
+          4. Fire the trade_executed alert.
+
+        Trade-log writes (_record_fill / _log_entry) are NOT in
+        this helper — they're called inline by each caller because
+        the substrate's apply_order_event UPSERT consolidates with
+        TradeLogger.log on the same order_id, and the two paths
+        capture provenance differently. Keeping that distinction
+        explicit at the call site.
+
+        Idempotent on items 1-2-3: register/cache/stop check
+        already-present state and no-op if so. NOT idempotent on
+        item 4 (alert) — callers must de-dup at their own layer
+        (the suspect path pops the cache; the substrate path uses
+        _has_position).
+        """
+        symbol = decision.symbol
+        self._register_single_leg(
+            strategy_name=decision.strategy_name, symbol=symbol,
+        )
+        self._entry_prices[symbol] = fill_price
+        self._ensure_recovered_protective_stop(
+            snapshot=snapshot, position=position, decision=decision,
+        )
+        self.alerts.trade_executed(
+            symbol=symbol,
+            strategy=decision.strategy_name,
+            side="buy",
+            qty=fill_qty,
+            price=fill_price,
+            reason=f"{decision.reason} {reason_suffix}".strip(),
+        )
 
     def _ensure_recovered_protective_stop(
         self,
