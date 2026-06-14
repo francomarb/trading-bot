@@ -1891,3 +1891,51 @@ class TestBuildSubstrateEventFromBrokerOrder:
         assert self._build(status="pending_new") is None
         assert self._build(status="pending_cancel") is None
         assert self._build(status="suspended") is None
+
+
+# ── P-3: startup reconciliation ────────────────────────────────────────────
+
+
+class TestSubstrateReconcileStartup:
+    """P-3: startup walks ALL non-terminal substrate rows (no
+    per-call limit) and apply broker truth. Catches events that
+    happened during downtime."""
+
+    def test_get_non_terminal_returns_all_rows_when_no_limit(
+        self, pos_store, orders_store,
+    ):
+        """P-3 calls the same store query as P-2 but with limit=None.
+        The store returns the full set in that case."""
+        for i in range(50):
+            uid = _seed_position(pos_store, owner_key=f"SYM{i}")
+            _insert_entry(
+                orders_store, uid, client_order_id=f"cli-{i}",
+            )
+            _attach_and_get_order_id(orders_store, f"cli-{i}")
+        rows = orders_store.get_non_terminal_with_order_id(limit=None)
+        # All 50 rows (no cap).
+        assert len(rows) == 50
+
+    def test_startup_reason_threaded_through_apply_order_event(
+        self, conn, pos_store, orders_store,
+    ):
+        """The startup reconciler passes reason='startup' so the
+        substrate audit reflects the source. Cycle uses 'cycle';
+        stream uses 'stream'."""
+        from engine.lifecycle_orders import apply_order_event
+        uid = _seed_position(pos_store)
+        _insert_entry(orders_store, uid)
+        order_id = _attach_and_get_order_id(orders_store, "cli-entry")
+        outcome = apply_order_event(
+            conn,
+            OrderEvent(
+                order_id=order_id, status="filled",
+                filled_qty=10.0, avg_fill_price=100.5,
+                broker_updated_at="2026-06-15T10:00:00+00:00",
+            ),
+            reason="startup",
+        )
+        assert outcome.applied is True
+        # The outcome doesn't echo the reason back, but the call
+        # itself succeeding with reason='startup' confirms the
+        # API accepts the parameter the startup reconciler uses.

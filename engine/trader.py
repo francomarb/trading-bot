@@ -700,6 +700,25 @@ class TradingEngine:
         # closes, etc.). Best-effort: never raises into the cycle path.
         self._reconcile_position_lifecycle(startup_snapshot)
 
+        # P-3: per-order substrate startup reconciliation. Walk every
+        # non-terminal position_lifecycle_orders row whose order_id
+        # is NOT in the broker's current open_orders, fetch its
+        # current state via REST, and apply via apply_order_event.
+        # Catches fill / cancel / expiration events that landed at
+        # the broker while the bot was down (overnight, weekend,
+        # crash window). Runs after _reconcile_position_lifecycle so
+        # the position_uid FKs already resolve. Best-effort: each
+        # row's failure is isolated and logged CRITICAL.
+        try:
+            self._reconcile_substrate_startup(startup_snapshot)
+        except Exception as exc:
+            logger.critical(
+                f"substrate startup reconcile raised: "
+                f"{type(exc).__name__}: {exc}. Cycle path will retry "
+                f"non-terminal rows over time via the cycle "
+                f"reconciler."
+            )
+
         # Operator Controls Phase A PR-2 — restore sticky halt from disk.
         # If a halt was engaged before the previous shutdown, re-engage
         # the kill switch immediately so the first cycle blocks entries.
@@ -4495,38 +4514,73 @@ class TradingEngine:
         """P-2: cycle-time substrate reconciliation against broker state.
 
         Defense-in-depth for events the WebSocket missed (reconnect
-        gaps, dropped frames, late-binding race conditions). For
-        each non-terminal substrate row whose order_id is NOT in
-        the snapshot's open_orders, fetch the broker's current
-        state via REST and apply an OrderEvent.
+        gaps, dropped frames, late-binding race conditions). Each
+        cycle, walk up to ``_SUBSTRATE_CYCLE_RECONCILE_LIMIT``
+        non-terminal substrate rows whose order_id is NOT in the
+        snapshot's open_orders and apply the truth via REST.
 
         Rows whose order_id IS in snapshot.open_orders are skipped
         — those are still active at the broker and the stream
-        owns their state transitions. P-1 already wires the stream
-        path; this method covers the gap.
-
-        Cost cap: at most ``_SUBSTRATE_CYCLE_RECONCILE_LIMIT`` REST
-        calls per cycle. A larger backlog catches up over multiple
-        cycles. Tunable so a one-off gap (e.g., long network
-        outage) doesn't blow the per-cycle Alpaca API budget.
-
-        Best-effort: any per-row failure logs at CRITICAL and
-        continues. Stream + substrate-attach queue + cycle
-        reconciliation together form the redundant capture pipeline;
-        a single bad row cannot stall the others.
+        owns their state transitions.
         """
-        if (
-            self.lifecycle_orders_store is None
-            or self._stream_manager is None  # safety: don't reconcile without stream context
-        ):
+        self._reconcile_substrate_via_rest(
+            snapshot,
+            reason="cycle",
+            limit=_SUBSTRATE_CYCLE_RECONCILE_LIMIT,
+        )
+
+    def _reconcile_substrate_startup(self, snapshot: "BrokerSnapshot") -> None:
+        """P-3: post-startup substrate reconciliation against broker state.
+
+        On restart, walk ALL non-terminal substrate rows whose
+        order_id is NOT in the broker's current open_orders. These
+        are orders that became terminal at the broker while the bot
+        was down — fill events, cancellations, expirations the
+        stream wasn't connected to receive.
+
+        No per-call limit: startup is a one-shot operation and the
+        backlog could be arbitrarily large after a long downtime.
+        Per-row failures log CRITICAL and continue; one bad row
+        cannot stall startup.
+        """
+        self._reconcile_substrate_via_rest(
+            snapshot, reason="startup", limit=None,
+        )
+
+    def _reconcile_substrate_via_rest(
+        self,
+        snapshot: "BrokerSnapshot",
+        *,
+        reason: str,
+        limit: int | None,
+    ) -> None:
+        """Shared implementation for P-2 (cycle) and P-3 (startup)
+        substrate-vs-broker reconciliation.
+
+        Algorithm:
+          1. Query substrate non-terminal rows with order_id NOT
+             NULL.
+          2. Build broker_open_by_id from snapshot.open_orders.
+          3. For each substrate row:
+               - If order_id IS in open_orders → stream owns it;
+                 skip.
+               - Else → fetch get_order_by_id via REST, translate
+                 to OrderEvent, apply.
+          4. Per-row failures log CRITICAL and continue.
+
+        ``reason`` flows through to apply_order_event so the
+        substrate's audit reflects whether each advance came from
+        cycle or startup reconciliation.
+        """
+        if self.lifecycle_orders_store is None:
             return
         try:
             rows = self.lifecycle_orders_store.get_non_terminal_with_order_id(
-                limit=_SUBSTRATE_CYCLE_RECONCILE_LIMIT,
+                limit=limit,
             )
         except Exception as exc:
             logger.critical(
-                f"substrate cycle reconcile: get_non_terminal "
+                f"substrate {reason} reconcile: get_non_terminal "
                 f"query failed: {type(exc).__name__}: {exc}"
             )
             return
@@ -4536,7 +4590,7 @@ class TradingEngine:
             o.order_id: o for o in snapshot.open_orders
             if getattr(o, "order_id", None)
         }
-        from engine.lifecycle_orders import OrderEvent, apply_order_event
+        from engine.lifecycle_orders import apply_order_event
 
         for row in rows:
             oid = row.order_id
@@ -4551,45 +4605,41 @@ class TradingEngine:
             try:
                 broker_order = self.broker._with_retry(
                     lambda oid=oid: self.broker._api.get_order_by_id(oid),
-                    op_desc=f"substrate_reconcile({oid})",
+                    op_desc=f"substrate_reconcile_{reason}({oid})",
                 )
             except Exception as exc:
                 logger.critical(
-                    f"substrate cycle reconcile: get_order_by_id "
-                    f"failed for {oid}: {type(exc).__name__}: {exc}. "
-                    f"Will retry next cycle."
+                    f"substrate {reason} reconcile: get_order_by_id "
+                    f"failed for {oid}: {type(exc).__name__}: {exc}."
                 )
                 continue
             event = self._build_substrate_event_from_broker_order(
                 broker_order, oid,
             )
             if event is None:
-                # Broker reports a state we don't translate (e.g.,
-                # pending_*). Skip; the stream will deliver a
-                # material event eventually.
                 continue
             try:
                 outcome = apply_order_event(
                     self.lifecycle_orders_store._conn,
                     event,
-                    reason="cycle",
+                    reason=reason,
                 )
             except Exception as exc:
                 logger.critical(
-                    f"substrate cycle reconcile: apply_order_event "
+                    f"substrate {reason} reconcile: apply_order_event "
                     f"raised for {oid} status={event.status}: "
                     f"{type(exc).__name__}: {exc}"
                 )
                 continue
             if outcome.applied:
                 logger.info(
-                    f"substrate cycle reconcile: order_id={oid} "
+                    f"substrate {reason} reconcile: order_id={oid} "
                     f"advanced to status={event.status} "
                     f"(position {outcome.new_status})"
                 )
             else:
                 logger.debug(
-                    f"substrate cycle reconcile: order_id={oid} "
+                    f"substrate {reason} reconcile: order_id={oid} "
                     f"no-op ({outcome.reason})"
                 )
 
