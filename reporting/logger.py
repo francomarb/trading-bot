@@ -1038,10 +1038,12 @@ class TradeLogger:
             <col>, trades.<col>)`` — incoming value wins if
             present; incoming NULL is absorbed so a sparse later
             record can't zero the column.
-          - Identity conflict (``_UPSERT_IDENTITY_CONFLICT_COLUMNS``,
-            currently just ``position_uid``): a value→different-value
-            transition is a foundation invariant violation and
-            raises ``TradeLoggerIdentityConflict`` BEFORE the write.
+          - Identity conflict (``_UPSERT_IDENTITY_CONFLICT_COLUMNS``):
+            ``position_uid``, ``position_id``, ``symbol``, ``side``,
+            ``strategy``, ``order_type``, ``requested_qty``.
+            A value→different-value transition is a foundation
+            invariant violation and raises
+            ``TradeLoggerIdentityConflict`` BEFORE the write.
             NULL→value transitions are allowed for restart
             reconstruction.
           - Default (broker cumulative state): ``excluded.<col>`` —

@@ -25,7 +25,7 @@ Two phases on `feat/order-lifecycle-foundation-impl`:
     `apply_order_event`, trades-row writer alignment, and submit-time
     insert. No live behavior change; substrate populated but not yet
     read by consumers.
-  - **B. PR #60 review-fix series** (commits 7-17): four rounds of
+  - **B. PR #60 review-fix series** (commits 7-20): five rounds of
     ChatGPT review against (A), each landed as 2–3 focused fix
     commits. End-state ahead of the consumer-wiring phase.
 
@@ -49,9 +49,11 @@ Two phases on `feat/order-lifecycle-foundation-impl`:
 | 15 | B-r3 | Tracker restructure + numbering normalization (PR #60 round 3, fix 5) | n/a | — | ✅ |
 | 16 | B-r4 | Keeper-required partition (delete-all bug); asymmetric conflict (keeper-NULL + delete-non-NULL); expanded conflict column set; detect output prints accounting evidence (PR #60 round 4, fixes P0 + P1 dedupe) | §12.2 | 8 | ✅ |
 | 17 | B-r4 | Expanded `_UPSERT_IDENTITY_CONFLICT_COLUMNS` to cover `position_id`, `symbol`, `side`, `strategy`, `order_type`, `requested_qty` (PR #60 round 4, fix P2 identity) | §6.5 / §6.6 | 8 | ✅ |
-| 18 | B-r4 | Tracker fixes: correct test-matrix count, scope statement reflects substrate-only, smoke-protocol items gated on planned phase (PR #60 round 4, fix P2 tracker) | n/a | — | 🔄 In progress |
+| 18 | B-r4 | Tracker fixes: correct test-matrix count, scope statement reflects substrate-only, smoke-protocol items gated on planned phase (PR #60 round 4, fix P2 tracker) | n/a | — | ✅ |
+| 19 | B-r5 | Schema-driven dedupe conflict comparison: invert allowlist policy so every non-noise column on both tables is conflict-checked; closes lifecycle corruption (current_qty / entry_order_id / first_fill_at) and trades gaps (qty / stop_price / execution_id) (PR #60 round 5, fixes P0 + P1) | §12.2 | 7 | ✅ |
+| 20 | B-r5 | Documentation drift: tracker review-fix range now reflects current commit, commit 18 marked done, UPSERT docstring lists all 7 identity-conflict columns (PR #60 round 5, fix P2 docs) | n/a | — | 🔄 In progress |
 
-Substrate-landed totals: ~6500 LOC code + ~3500 LOC tests across 19 commits.
+Substrate-landed totals: ~7000 LOC code + ~3700 LOC tests across 21 commits.
 
 ---
 

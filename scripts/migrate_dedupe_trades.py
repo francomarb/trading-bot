@@ -256,6 +256,11 @@ def _detect(conn: sqlite3.Connection) -> int:
             print(f"  order_id={cluster['order_id']!r} "
                   f"({cluster['count']} rows):")
             for r in cluster["rows"]:
+                # PR #60 round 5 fix (P2 docs sub-point): include
+                # position_uid in the core line so it's visible to
+                # the operator. Previously it was in the extras-
+                # exclude set but not in the core line either, so
+                # it was suppressed entirely.
                 core = (
                     f"    - id={r['id']} "
                     f"timestamp={r['timestamp']} "
@@ -264,6 +269,7 @@ def _detect(conn: sqlite3.Connection) -> int:
                     f"qty={r['qty']} "
                     f"avg_fill_price={r['avg_fill_price']} "
                     f"position_type={r['position_type']} "
+                    f"position_uid={r.get('position_uid')!r} "
                     f"status={r['status']}"
                 )
                 extras = [
