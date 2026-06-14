@@ -2585,3 +2585,209 @@ class TestLifecycleAttachQueue:
         # The queue picked it up.
         attaches = broker.drain_lifecycle_attaches()
         assert attaches == [(captured["cli"], "ord-from-thread", None)]
+
+
+# ── P-4 (consumer wiring): protective_stop substrate insert ─────────────────
+
+
+class TestProtectiveStopSubstrate:
+    """P-4: every protective-stop creation path (bracket OTO child,
+    fractional standalone GTC, repair flow) writes a
+    `protective_stop` substrate row alongside the broker stop.
+    POST-submit semantics — substrate failure does NOT abort the
+    stop submission (which has already succeeded)."""
+
+    @staticmethod
+    def _broker(api: MagicMock, orders_store: MagicMock):
+        broker = AlpacaBroker(
+            client=api, max_attempts=1, base_delay=0.0,
+            lifecycle_orders_store=orders_store,
+            lifecycle_store=MagicMock(),
+        )
+        broker._lifecycle_store.create_pending = MagicMock(return_value="pos-uid-pX")
+        return broker
+
+    def test_bracket_oto_entry_writes_protective_stop_row(self):
+        """Equity entry submitted with OTO stop_loss. After submit
+        returns, broker extracts the stop leg's id + client_order_id
+        and writes a protective_stop row with parent_order_id =
+        entry order id."""
+        from types import SimpleNamespace
+        api = MagicMock()
+        # Order returned by submit has a stop leg.
+        order = _alpaca_order(id="alpaca-entry-1", status="filled")
+        order.legs = [SimpleNamespace(
+            id="alpaca-stop-1",
+            client_order_id="alpaca-cli-stop-1",
+            type=SimpleNamespace(value="stop"),
+            side=SimpleNamespace(value="sell"),
+        )]
+        api.submit_order.return_value = order
+        api.get_order_by_id.return_value = _alpaca_order(
+            id="alpaca-entry-1", status="filled",
+        )
+        orders_store = MagicMock()
+        broker = self._broker(api, orders_store)
+
+        broker.place_order(_decision(stop=95.5), poll_timeout=0.1)
+
+        # Two insert_pending calls: one for the entry (role=entry_primary),
+        # one for the protective stop.
+        roles = [
+            c.kwargs["role"]
+            for c in orders_store.insert_pending.call_args_list
+        ]
+        assert "entry_primary" in roles
+        assert "protective_stop" in roles
+
+        stop_call = [
+            c for c in orders_store.insert_pending.call_args_list
+            if c.kwargs["role"] == "protective_stop"
+        ][0]
+        kwargs = stop_call.kwargs
+        assert kwargs["client_order_id"] == "alpaca-cli-stop-1"
+        assert kwargs["side"] == "sell"
+        assert kwargs["order_type"] == "stop"
+        assert kwargs["order_class"] == "oto"
+        assert kwargs["intended_stop_price"] == 95.5
+        assert kwargs["intended_qty"] == 10.0
+        assert kwargs["parent_order_id"] == "alpaca-entry-1"
+
+        # attach_broker_order_id called with the stop's broker id.
+        attach_calls = [
+            c for c in orders_store.attach_broker_order_id.call_args_list
+            if c.kwargs.get("client_order_id") == "alpaca-cli-stop-1"
+        ]
+        assert len(attach_calls) == 1
+        assert attach_calls[0].kwargs["order_id"] == "alpaca-stop-1"
+
+    def test_bracket_oto_without_stop_leg_skips_substrate_write(self):
+        """Defensive: if order.legs is empty (malformed broker
+        response) the protective_stop write is skipped, not crashed."""
+        api = MagicMock()
+        order_no_legs = _alpaca_order(id="alpaca-entry-2", status="filled")
+        order_no_legs.legs = []
+        api.submit_order.return_value = order_no_legs
+        api.get_order_by_id.return_value = _alpaca_order(
+            id="alpaca-entry-2", status="filled",
+        )
+        orders_store = MagicMock()
+        broker = self._broker(api, orders_store)
+
+        broker.place_order(_decision(stop=95.5), poll_timeout=0.1)
+
+        roles = [
+            c.kwargs["role"]
+            for c in orders_store.insert_pending.call_args_list
+        ]
+        assert "protective_stop" not in roles
+
+    def test_repair_path_passes_position_uid_to_substrate(self):
+        """place_protective_stop now records the substrate row when
+        the engine supplies position_uid. order_class='simple',
+        parent_order_id=None (this is a standalone repair, not a
+        bracket child)."""
+        api = MagicMock()
+        from types import SimpleNamespace
+        api.submit_order.return_value = SimpleNamespace(
+            id="alpaca-repair-1",
+            client_order_id="cli-repair-1",
+            status="accepted",
+            symbol="AAPL",
+            qty="10",
+            side="sell",
+            type="stop",
+            stop_price="95.0",
+            time_in_force="gtc",
+            submitted_at="2026-06-15T14:30:00Z",
+            filled_at=None,
+            filled_qty="0",
+            filled_avg_price=None,
+            legs=None,
+        )
+        orders_store = MagicMock()
+        broker = self._broker(api, orders_store)
+
+        broker.place_protective_stop(
+            symbol="AAPL", qty=10, stop_price=95.0,
+            client_order_id_prefix="recover-stop",
+            position_uid="pos-known-A",
+        )
+
+        stop_call = [
+            c for c in orders_store.insert_pending.call_args_list
+            if c.kwargs["role"] == "protective_stop"
+        ][0]
+        kwargs = stop_call.kwargs
+        assert kwargs["position_uid"] == "pos-known-A"
+        assert kwargs["order_class"] == "simple"
+        assert kwargs["parent_order_id"] is None
+        assert kwargs["intended_stop_price"] == 95.0
+        assert kwargs["intended_qty"] == 10.0
+
+    def test_repair_path_without_position_uid_skips_substrate_write(self):
+        """Legacy / test callers that don't supply position_uid get
+        the same broker behavior; substrate write is just skipped."""
+        api = MagicMock()
+        from types import SimpleNamespace
+        api.submit_order.return_value = SimpleNamespace(
+            id="alpaca-repair-2",
+            client_order_id="cli-repair-2",
+            status="accepted",
+            symbol="AAPL",
+            qty="10",
+            side="sell",
+            type="stop",
+            stop_price="95.0",
+            time_in_force="gtc",
+            submitted_at="2026-06-15T14:30:00Z",
+            filled_at=None,
+            filled_qty="0",
+            filled_avg_price=None,
+            legs=None,
+        )
+        orders_store = MagicMock()
+        broker = self._broker(api, orders_store)
+
+        broker.place_protective_stop(
+            symbol="AAPL", qty=10, stop_price=95.0,
+            client_order_id_prefix="recover-stop",
+        )
+
+        roles = [
+            c.kwargs.get("role")
+            for c in orders_store.insert_pending.call_args_list
+        ]
+        assert "protective_stop" not in roles
+
+    def test_substrate_failure_does_not_abort_repair_stop(self):
+        """POST-submit semantics: insert raising must not crash the
+        place_protective_stop return path."""
+        api = MagicMock()
+        from types import SimpleNamespace
+        api.submit_order.return_value = SimpleNamespace(
+            id="alpaca-repair-3",
+            client_order_id="cli-repair-3",
+            status="accepted",
+            symbol="AAPL",
+            qty="10",
+            side="sell",
+            type="stop",
+            stop_price="95.0",
+            time_in_force="gtc",
+            submitted_at="2026-06-15T14:30:00Z",
+            filled_at=None,
+            filled_qty="0",
+            filled_avg_price=None,
+            legs=None,
+        )
+        orders_store = MagicMock()
+        orders_store.insert_pending.side_effect = RuntimeError("substrate down")
+        broker = self._broker(api, orders_store)
+
+        # Does NOT raise; broker stop result still returned.
+        result = broker.place_protective_stop(
+            symbol="AAPL", qty=10, stop_price=95.0,
+            position_uid="pos-X",
+        )
+        assert result is not None

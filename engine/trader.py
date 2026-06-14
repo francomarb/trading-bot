@@ -1999,11 +1999,27 @@ class TradingEngine:
             )
             return
 
+        # P-4: look up position_uid for the substrate write.
+        _recover_uid: str | None = None
+        if self.lifecycle_store is not None:
+            try:
+                _row = self.lifecycle_store.get_open_for_owner_key(
+                    owner_key_for(symbol),
+                )
+                if _row is not None:
+                    _recover_uid = _row.position_uid
+            except Exception as exc:
+                logger.debug(
+                    f"recover-stop position_uid lookup raised "
+                    f"{type(exc).__name__}: {exc} — proceeding without "
+                    f"substrate row"
+                )
         repaired = self.broker.place_protective_stop(
             symbol=symbol,
             qty=stop_qty,
             stop_price=decision.stop_price,
             client_order_id_prefix=f"{decision.strategy_name}-recover-stop",
+            position_uid=_recover_uid,
         )
         snapshot.open_orders.append(repaired)
         logger.warning(
@@ -3696,11 +3712,29 @@ class TradingEngine:
                 continue
 
             try:
+                # P-4: look up position_uid so the broker can record
+                # a protective_stop substrate row alongside the
+                # repair stop.
+                _repair_uid: str | None = None
+                if self.lifecycle_store is not None:
+                    try:
+                        _row = self.lifecycle_store.get_open_for_owner_key(
+                            owner_key_for(symbol),
+                        )
+                        if _row is not None:
+                            _repair_uid = _row.position_uid
+                    except Exception as exc:
+                        logger.debug(
+                            f"repair stop position_uid lookup raised "
+                            f"{type(exc).__name__}: {exc} — proceeding "
+                            f"without substrate row"
+                        )
                 repaired = self.broker.place_protective_stop(
                     symbol=symbol,
                     qty=stop_qty,
                     stop_price=stop_price,
                     client_order_id_prefix=f"{owner}-repair-stop",
+                    position_uid=_repair_uid,
                 )
                 logger.warning(
                     f"{symbol}: restored missing protective stop at "

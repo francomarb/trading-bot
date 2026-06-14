@@ -1941,12 +1941,16 @@ class TestWatchlistStatuses:
 
         engine.start(max_cycles=1)
 
-        broker.place_protective_stop.assert_called_once_with(
-            symbol="AAPL",
-            qty=10,
-            stop_price=95.0,
-            client_order_id_prefix="fake_strategy-repair-stop",
-        )
+        # P-4: lookup happens before the call; the fixture has a
+        # position_lifecycle row for AAPL so position_uid resolves
+        # to whatever new_position_uid() generated.
+        broker.place_protective_stop.assert_called_once()
+        kwargs = broker.place_protective_stop.call_args.kwargs
+        assert kwargs["symbol"] == "AAPL"
+        assert kwargs["qty"] == 10
+        assert kwargs["stop_price"] == 95.0
+        assert kwargs["client_order_id_prefix"] == "fake_strategy-repair-stop"
+        assert kwargs["position_uid"].startswith("pos_")
 
     def test_cycle_repairs_missing_protective_stop_after_gtc_absent(
         self, engine_factory, tmp_path
