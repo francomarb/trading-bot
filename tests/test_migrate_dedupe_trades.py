@@ -1220,3 +1220,107 @@ class TestSchemaDrivenTradesConflict:
             ["--db", str(db), "--apply", str(out)],
         )
         assert code == 2
+
+
+# ── PR #60 round 6 fixes ────────────────────────────────────────────────────
+
+
+class TestFingerprintCoversTimestamps:
+    """Round 6 P1 finding: a mutation to opened_at / created_at /
+    trades.timestamp between --review and --apply was slipping
+    through the staleness check because round 5 reused the conflict
+    discardable set as the fingerprint exclusion. The two sets now
+    diverge — timestamps are conflict-discardable but
+    fingerprint-tracked."""
+
+    def test_apply_aborts_on_keeper_opened_at_mutation(self, tmp_path):
+        """The reviewer's exact reproduction: change keeper's
+        opened_at after --review; --apply must abort on the
+        snapshot fingerprint mismatch."""
+        db = tmp_path / "trades.db"
+        _make_dirty_db(db)
+        out = tmp_path / "decisions.json"
+        migrate_dedupe_trades.main(["--db", str(db), "--review", str(out)])
+
+        # Operator's monitoring tool updates the keeper's opened_at
+        # between review and apply (or a parallel writer touched it).
+        conn = sqlite3.connect(db)
+        conn.execute(
+            "UPDATE position_lifecycle SET "
+            "opened_at='2024-01-01T00:00:00+00:00' "
+            "WHERE position_uid='pos-A'"
+        )
+        conn.commit()
+        conn.close()
+
+        code = migrate_dedupe_trades.main(
+            ["--db", str(db), "--apply", str(out)],
+        )
+        assert code == 2  # fingerprint mismatch → abort
+        # Both rows survive (rollback).
+        rows = sqlite3.connect(db).execute(
+            "SELECT position_uid FROM position_lifecycle "
+            "ORDER BY position_uid"
+        ).fetchall()
+        assert ("pos-A",) in rows
+        assert ("pos-B",) in rows
+
+    def test_apply_aborts_on_trades_timestamp_mutation(self, tmp_path):
+        """The same property on the trades side: a row's timestamp
+        column changing between --review and --apply invalidates
+        the operator's decision context."""
+        db = tmp_path / "trades.db"
+        _make_dirty_db(db)
+        out = tmp_path / "decisions.json"
+        migrate_dedupe_trades.main(["--db", str(db), "--review", str(out)])
+
+        conn = sqlite3.connect(db)
+        conn.execute(
+            "UPDATE trades SET "
+            "timestamp='2024-01-01T00:00:00+00:00' WHERE id=1"
+        )
+        conn.commit()
+        conn.close()
+
+        code = migrate_dedupe_trades.main(
+            ["--db", str(db), "--apply", str(out)],
+        )
+        assert code == 2
+        # Trades cluster intact (rollback).
+        cnt = sqlite3.connect(db).execute(
+            "SELECT COUNT(*) FROM trades WHERE order_id='ord-dup'"
+        ).fetchone()[0]
+        assert cnt == 2
+
+
+class TestSchemaVersionConflict:
+    """Round 6 P2 finding: schema_version is no longer in the
+    conflict discardable set, so a mixed-version cluster surfaces
+    as a conflict instead of being silently glossed over."""
+
+    def test_owner_cluster_with_different_schema_versions_rejected(
+        self, tmp_path,
+    ):
+        db = tmp_path / "trades.db"
+        _make_dirty_db(db)
+        # Simulate a partial migration: keeper at version 1, delete
+        # at version 2.
+        conn = sqlite3.connect(db)
+        conn.execute(
+            "UPDATE position_lifecycle SET schema_version=1 "
+            "WHERE position_uid='pos-A'"
+        )
+        conn.execute(
+            "UPDATE position_lifecycle SET schema_version=2 "
+            "WHERE position_uid='pos-B'"
+        )
+        conn.commit()
+        conn.close()
+        out = tmp_path / "decisions.json"
+        migrate_dedupe_trades.main(["--db", str(db), "--review", str(out)])
+        code = migrate_dedupe_trades.main(
+            ["--db", str(db), "--apply", str(out)],
+        )
+        # Round 5 would have passed (schema_version was discardable).
+        # Round 6 rejects.
+        assert code == 2

@@ -68,25 +68,46 @@ def _cluster_fingerprint(rows: list[dict[str, Any]]) -> str:
     """Stable hash of the rows in a cluster, used by --apply to
     detect mutation between --review and --apply.
 
-    PR #60 round 5 fix (P0 + P1 schema-driven): the fingerprint
-    derives its column set from each row's keys MINUS the
-    discardable noise allowlists. Round 4's hand-curated list was
-    incomplete; this approach automatically picks up every column
-    fetched by _scan / _refetch_*.
+    PR #60 round 6 fix (P1): the fingerprint's exclusion set is
+    SMALLER than the conflict-check's discardable set. The two
+    purposes differ:
+
+      - Conflict discardable: a column whose values legitimately
+        differ between duplicate rows without representing data
+        loss (e.g. opened_at — each row has its own creation time;
+        keeper has its own opened_at; nothing is lost).
+      - Fingerprint discardable: a column whose value, if it
+        changes between --review and --apply, doesn't invalidate
+        the operator's decision (e.g. cosmetic aliases that
+        duplicate another native column).
+
+    Lifecycle timestamps (opened_at, created_at, trades.timestamp)
+    fall in the FIRST set but NOT the second: review sorts by
+    these and the keep-earliest default depends on the values
+    being the values the operator saw. A mutation here between
+    review and apply IS a stale-review event.
+
+    Round 5 conflated the two sets, allowing a mutated keeper
+    opened_at to slip through the staleness check.
 
     Order independent (sorted by row identity) so cosmetic
     reordering doesn't trip the check."""
     import hashlib
 
-    discardable: set[str] = (
-        _OWNER_KEY_DISCARDABLE_COLUMNS
-        | _TRADES_DISCARDABLE_COLUMNS
-    )
-    # Identity columns are excluded from the per-row payload (they
-    # appear in the leading "identity" tuple element); cosmetic
-    # aliases like opened_at are skipped to avoid double-counting
-    # whichever native column already carried the value.
-    identity_or_alias = {"id", "position_uid", "opened_at"}
+    # Fingerprint-discardable: ONLY the row identities. These appear
+    # in the leading position of the per-row tuple already, so adding
+    # them to the payload would be redundant.
+    #
+    # opened_at is INCLUDED in the fingerprint payload, even when it
+    # is a synthesized alias for created_at on older schemas — the
+    # synthesis happens identically at --review and --apply, so the
+    # value is stable and including it twice (once as opened_at, once
+    # as created_at) is just a redundant byte in the hash, not an
+    # instability source. The previous round excluded opened_at
+    # under the assumption it was always synthesized; on schemas
+    # where opened_at is the NATIVE column with its own value, that
+    # exclusion missed real mutations.
+    fingerprint_discardable = {"id", "position_uid"}
 
     # Take every column present on any row; missing columns appear
     # as None for rows that lack them.
@@ -95,7 +116,7 @@ def _cluster_fingerprint(rows: list[dict[str, Any]]) -> str:
         all_columns.update(r.keys())
     fingerprint_columns = sorted(
         c for c in all_columns
-        if c not in discardable and c not in identity_or_alias
+        if c not in fingerprint_discardable
     )
 
     keyed: list[tuple] = []
@@ -384,15 +405,25 @@ class _ApplyAborted(Exception):
 # Everything else is a property of the position or the order and
 # must therefore be conflict-checked.
 _OWNER_KEY_DISCARDABLE_COLUMNS = frozenset({
-    "schema_version", "position_uid", "owner_key",
+    "position_uid", "owner_key",
     # When this lifecycle row was inserted. Same character as
     # trades.timestamp — per-row write metadata, not a property of
     # the position itself that's lost when the row goes away. The
-    # operator uses these in --review to pick the keeper.
+    # operator uses these in --review to pick the keeper. They DO
+    # remain in the fingerprint (review-time mutation-detection)
+    # via _cluster_fingerprint's smaller exclusion set.
     # (Fill timestamps `first_fill_at` / `last_fill_at` are NOT in
     # this set; they ARE facts about the position and must be
     # conflict-checked per the round-5 reviewer note.)
     "opened_at", "created_at",
+    # Note (PR #60 round 6 review, P2 schema_version): schema_version
+    # is INTENTIONALLY NOT in the discardable set. Every current
+    # row uses LIFECYCLE_SCHEMA_VERSION=1, but a future migration
+    # bump would create rows with different interpretations of
+    # other columns. A mixed-version cluster should therefore
+    # surface as a conflict and require explicit operator review,
+    # not be silently glossed over by a stale "always discardable"
+    # rule.
 })
 _TRADES_DISCARDABLE_COLUMNS = frozenset({
     "id", "order_id", "timestamp",
