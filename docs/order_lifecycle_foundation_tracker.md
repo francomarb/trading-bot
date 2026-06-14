@@ -80,7 +80,7 @@ After PR #60 merged to main on 2026-06-14, the consumer wiring landed on a follo
 | P-8 | Doc updates: this tracker + PLAN.md (slippage_unification_tracker.md and operator_controls_proposal.md don't reference the foundation — no edits needed there) | §12 | `8bf9046` | ✅ |
 | PR #61 round-1 fix P1 | Exit dispatch via ownership gate (was suppressed by its own substrate UPSERT); +2 integration tests covering the apply→dispatch sequence | §10.2 | `c247fe4` | ✅ |
 | PR #61 round-1 fix P2 | Cycle REST cap counts actual calls, not rows read; tracker doc drift; NULL-order_id attach retry tracked as follow-up | §10.1 | `d181f1d` | ✅ |
-| PR #61 round-2 fix | Honest CRITICAL log on orphaned-attach (was lying about retry); stale docstrings on exit-dispatch; new known follow-up for recovered-entry accounting completeness | §10.1 / §10.2 | (this commit) | 🔄 In progress |
+| PR #61 round-2 fix | Honest CRITICAL log on orphaned-attach (was lying about retry); stale docstrings on exit-dispatch; new known follow-up for recovered-entry accounting completeness | §10.1 / §10.2 | `a08503b` | ✅ |
 
 Consumer-wiring totals: ~2,150 LOC code + ~1,000 LOC tests across 15 commits (12 original + 3 PR #61 review-fix commits); ~500 LOC of legacy cache infrastructure deleted.
 
