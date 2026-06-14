@@ -249,17 +249,12 @@ class EngineConfig:
             raise ValueError("external_close_confirm_cycles must be >= 1")
 
 
-@dataclass(frozen=True)
-class SuspectExitOrder:
-    """Exact submitted close whose terminal state was not confirmed locally."""
-
-    order_id: str
-    symbol: str
-    owner: str
-    requested_qty: float
-    modeled_price: float
-    benchmark_kind: str
-    alert_reason: str
+# P-7: SuspectExitOrder dataclass removed. Substrate exit rows
+# (created by close_position via _lifecycle_orders_record_exit)
+# now carry the same recovery state — order_id, symbol, owner_key
+# (via JOIN to position_lifecycle), intended_qty, slippage benchmark
+# provenance. _maybe_dispatch_substrate_exit_fill is the recovery
+# trigger.
 
 
 # ── Engine ───────────────────────────────────────────────────────────────────
@@ -444,17 +439,12 @@ class TradingEngine:
         # treat the position as genuinely gone (guards against API blips).
         self._external_close_suspects: dict[str, int] = {}
 
-        # Exact bot-submitted orders that were accepted by Alpaca but whose
-        # fill state could not be confirmed locally (e.g. stream/REST failure
-        # after submit). These are the only unknown positions we will ever try
-        # to adopt automatically.
-        # P-6: _suspect_orders removed. The substrate capture pipeline
-        # (P-1 stream + P-2 cycle reconcile + P-3 startup reconcile)
-        # observes the resolution of UNKNOWN-at-submit orders, and
-        # _maybe_dispatch_substrate_entry_fill fires the engine-side
-        # side effects (ownership bind, entry-price cache, stop
-        # replacement, alert) on each captured fill.
-        self._suspect_exit_orders: dict[str, SuspectExitOrder] = {}
+        # P-6 + P-7: _suspect_orders and _suspect_exit_orders both
+        # removed. The substrate capture pipeline (P-1 stream + P-2
+        # cycle reconcile + P-3 startup reconcile) observes UNKNOWN-
+        # at-submit resolutions and _maybe_dispatch_substrate_
+        # {entry,exit}_fill fires the engine-side side effects on
+        # each captured fill.
 
         # DAY-stop promotion is retried from every broker snapshot, but a
         # persistent rejection should count as one broker incident rather than
@@ -849,7 +839,9 @@ class TradingEngine:
                             )
                     order_strategy = self._attribute_orders(snapshot.open_orders)
                     self._sync_managed_stop_legs(snapshot)
-                    self._recover_suspect_exit_orders(snapshot)
+                    # P-7: _recover_suspect_exit_orders removed.
+                    # Substrate pipeline + _maybe_dispatch_substrate_
+                    # exit_fill cover the close-side recovery.
                     self._repair_missing_protective_stops(
                         snapshot,
                         allow_residual_cleanup=False,
@@ -891,11 +883,12 @@ class TradingEngine:
 
             self._sync_managed_stop_legs(snapshot)
             self._observe_stream_health()
-            # P-6: _recover_suspect_orders removed. Substrate
+            # P-6 + P-7: _recover_suspect_orders and
+            # _recover_suspect_exit_orders both removed. Substrate
             # pipeline (P-1/P-2/P-3) observes UNKNOWN-at-submit
-            # resolutions and dispatches ownership / alert / stop
-            # via _maybe_dispatch_substrate_entry_fill.
-            self._recover_suspect_exit_orders(snapshot)
+            # resolutions on both entry and exit roles; the
+            # _maybe_dispatch_substrate_{entry,exit}_fill helpers
+            # fire the engine-side side effects.
             self._process_stream_stop_fills(snapshot)
             self._detect_external_closes(snapshot)
             self._drain_lifecycle_attaches()
@@ -2240,55 +2233,8 @@ class TradingEngine:
             f"order recovery at ${decision.stop_price:.2f}"
         )
 
-    def _recover_suspect_exit_orders(self, snapshot: BrokerSnapshot) -> None:
-        """Reconcile exact close orders whose post-submit confirmation failed."""
-        for symbol, suspect in list(self._suspect_exit_orders.items()):
-            try:
-                result = self.broker.reconcile_submitted_order(
-                    order_id=suspect.order_id,
-                    symbol=suspect.symbol,
-                    requested_qty=suspect.requested_qty,
-                )
-            except Exception as exc:
-                logger.warning(
-                    f"{symbol}: suspect exit {suspect.order_id} reconciliation "
-                    f"failed: {exc}"
-                )
-                continue
-
-            if result.status in {OrderStatus.PENDING, OrderStatus.ACCEPTED}:
-                logger.warning(
-                    f"{symbol}: suspect exit {suspect.order_id} still "
-                    f"{result.status.value}; waiting for next cycle"
-                )
-                continue
-            if result.status in {
-                OrderStatus.CANCELED,
-                OrderStatus.REJECTED,
-                OrderStatus.TIMEOUT,
-            }:
-                logger.warning(
-                    f"{symbol}: suspect exit {suspect.order_id} resolved as "
-                    f"{result.status.value}; dropping recovery state"
-                )
-                self._suspect_exit_orders.pop(symbol, None)
-                continue
-            if result.status not in {OrderStatus.FILLED, OrderStatus.PARTIAL}:
-                continue
-
-            self._record_recovered_exit_fill(
-                symbol=symbol,
-                owner=suspect.owner,
-                exit_fill=result,
-                modeled_price=suspect.modeled_price,
-                benchmark_kind=suspect.benchmark_kind,
-                alert_reason=f"{suspect.alert_reason} (recovered)",
-            )
-            self._suspect_exit_orders.pop(symbol, None)
-            if result.status is OrderStatus.FILLED:
-                self._pop_position(symbol)
-                self._entry_prices.pop(symbol, None)
-                self._external_close_suspects.pop(symbol, None)
+    # P-7: _recover_suspect_exit_orders removed. Substrate exit row
+    # → _maybe_dispatch_substrate_exit_fill replaces this path.
 
     # ── Post-fill bookkeeping ────────────────────────────────────────────
 
@@ -5103,22 +5049,14 @@ class TradingEngine:
             measurement_quality=close_measurement_quality,
         )
         if result.status not in {OrderStatus.FILLED, OrderStatus.PARTIAL}:
-            if result.status is OrderStatus.UNKNOWN and result.order_id:
-                self._suspect_exit_orders[symbol] = SuspectExitOrder(
-                    order_id=result.order_id,
-                    symbol=position.symbol,
-                    owner=strategy.name,
-                    requested_qty=float(
-                        result.requested_qty or getattr(position, "qty", 0.0) or 0.0
-                    ),
-                    modeled_price=close_modeled,
-                    benchmark_kind=close_benchmark_kind,
-                    alert_reason=alert_reason,
-                )
-                logger.warning(
-                    f"{symbol}: staged suspect exit recovery for "
-                    f"{result.order_id} [{strategy.name}]"
-                )
+            # P-7: _suspect_exit_orders staging removed. The substrate
+            # exit row (P-6e: close_position writes role='exit' at
+            # submit time) is already in place. When the close
+            # eventually resolves at the broker, the substrate capture
+            # pipeline (P-1 stream / P-2 cycle reconcile / P-3 startup
+            # reconcile) advances the row and
+            # _maybe_dispatch_substrate_exit_fill fires
+            # _record_recovered_exit_fill + ownership cleanup.
             logger.warning(
                 f"[{strategy.name}] {symbol}: close did not fill "
                 f"(status={result.status.value}); ownership retained for retry"
