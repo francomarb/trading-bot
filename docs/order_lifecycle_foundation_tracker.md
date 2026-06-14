@@ -13,7 +13,7 @@ The foundation PR implements the discovery doc's §6 (schema + atomic event API 
 
 | Phase | Scope | Branch | PR | Status |
 |---|---|---|---|---|
-| 1 | Schema + `apply_order_event` + reconciliation paths + cache removal + 26-test matrix | `feat/order-lifecycle-foundation-impl` | — | 🔄 In progress |
+| 1 | Substrate only: schema + `PositionLifecycleOrdersStore` + atomic `apply_order_event` + submit-time inserts + trades-writer alignment + migration preflight + dedupe script. Reconciliation wiring (WebSocket / cycle / startup), cache removal, and the remaining `_suspect_*` work are deferred to a follow-up branch (see "Planned" section). | `feat/order-lifecycle-foundation-impl` | [#60](https://github.com/francomarb/trading-bot/pull/60) | 🔄 In progress |
 
 ---
 
@@ -25,7 +25,7 @@ Two phases on `feat/order-lifecycle-foundation-impl`:
     `apply_order_event`, trades-row writer alignment, and submit-time
     insert. No live behavior change; substrate populated but not yet
     read by consumers.
-  - **B. PR #60 review-fix series** (commits 7-14): three rounds of
+  - **B. PR #60 review-fix series** (commits 7-17): four rounds of
     ChatGPT review against (A), each landed as 2–3 focused fix
     commits. End-state ahead of the consumer-wiring phase.
 
@@ -46,9 +46,12 @@ Two phases on `feat/order-lifecycle-foundation-impl`:
 | 12 | B-r2 | Queue `on_submitted` to engine thread (thread-safety); roll back pending position lifecycle on substrate-failure re-raise; broaden fail-closed to all exceptions when store configured (PR #60 round 2, fixes 2 + 3 + 4) | §6.4 / §10.3 | 5 | ✅ |
 | 13 | B-r3 | Dedupe partition validation; reject clusters requiring MERGE (accounting conflict); BACKFILL widening to single_leg-with-null-position_id (PR #60 round 3, fixes 1 + 3 + 4) | §12.2 | 7 | ✅ |
 | 14 | B-r3 | `_UPSERT_LATEST_NON_NULL_COLUMNS` bucket for computed accounting (`realized_pnl`, `r_multiple`, slippage_*) (PR #60 round 3, fix 2) | §6.5 / §6.6 | 5 | ✅ |
-| 15 | B-r3 | This tracker restructure + numbering normalization (PR #60 round 3, fix 5) | n/a | — | 🔄 In progress |
+| 15 | B-r3 | Tracker restructure + numbering normalization (PR #60 round 3, fix 5) | n/a | — | ✅ |
+| 16 | B-r4 | Keeper-required partition (delete-all bug); asymmetric conflict (keeper-NULL + delete-non-NULL); expanded conflict column set; detect output prints accounting evidence (PR #60 round 4, fixes P0 + P1 dedupe) | §12.2 | 8 | ✅ |
+| 17 | B-r4 | Expanded `_UPSERT_IDENTITY_CONFLICT_COLUMNS` to cover `position_id`, `symbol`, `side`, `strategy`, `order_type`, `requested_qty` (PR #60 round 4, fix P2 identity) | §6.5 / §6.6 | 8 | ✅ |
+| 18 | B-r4 | Tracker fixes: correct test-matrix count, scope statement reflects substrate-only, smoke-protocol items gated on planned phase (PR #60 round 4, fix P2 tracker) | n/a | — | 🔄 In progress |
 
-Substrate-landed totals: ~5500 LOC code + ~3200 LOC tests across 16 commits.
+Substrate-landed totals: ~6500 LOC code + ~3500 LOC tests across 19 commits.
 
 ---
 
@@ -121,7 +124,7 @@ Statuses below cover the SUBSTRATE-LANDED portion of the PR. Items still in the 
 | 25 | `PRAGMA foreign_keys = ON;` enforces FKs | §6.2 R13-G1 | 1 | ✅ |
 | 26 | `net_realized_pnl` rollup from `trades` (not orders table) | §6.6 R13-G2 | 4 | ✅ |
 
-20/26 landed in the substrate phase. The 6 remaining (#8, #9, #10, #17, #22) all depend on consumer wiring and ship with P-1 / P-2 / P-5 / P-6 / P-7.
+21/26 landed in the substrate phase. The 5 remaining (#8 → P-6, #9 → P-7, #10 → P-5, #17 → P-2, #22 → P-1) all depend on consumer wiring and ship with the corresponding planned step.
 
 ---
 
@@ -154,19 +157,51 @@ The foundation PR must update (per discovery doc §12):
 
 ---
 
-## Smoke check protocol (post-merge)
+## Smoke check protocol
 
-Foundation PR merges to main. Bot recycles on main with the new code. Smoke check verifies before declaring foundation green:
+Two separate sets — substrate-merge smoke runs on PR #60 alone; the
+full-loop smoke depends on the planned consumer-wiring phase. Round
+4 review correctly noted that the old single list implied things
+that cannot happen until P-1..P-7 land.
+
+### Substrate-merge smoke (after PR #60 merges to main)
+
+Validates the substrate plumbing without depending on the consumer
+work that hasn't landed yet:
 
 - [ ] Bot recycles cleanly (migration runs idempotently)
-- [ ] Pre-flight duplicate check passes on production DB (or operator runs dedupe script first)
-- [ ] First post-merge entry creates a `position_lifecycle_orders` row at `pending` → `working` / `filled`
-- [ ] First post-merge exit creates a `role='exit'` row; position transitions to `closed` after exit terminates
-- [ ] First post-merge stop fill advances the existing `protective_stop` row to `filled`
-- [ ] `_suspect_orders` cache is empty (or absent) throughout
-- [ ] Parity check: per-order rollups (`current_qty`, `avg_entry_price`, `net_realized_pnl`) match the legacy values on `position_lifecycle`
+- [ ] Preflight duplicate check passes on production DB — both
+      `position_lifecycle.owner_key` and `trades.order_id` dimensions
+      (or operator runs `scripts/migrate_dedupe_trades.py` first)
+- [ ] First post-merge entry creates a `position_lifecycle_orders`
+      row at status='pending'; submit return populates `order_id`
+      via the new attach path (or the queued-attach drain for
+      options orders)
+- [ ] Slippage benchmark provenance (the four `slippage_benchmark_*`
+      columns) is populated on the new substrate row for each entry
+- [ ] Parity check: existing `position_lifecycle` rollups
+      (`current_qty`, `avg_entry_price`, `net_realized_pnl`) remain
+      consistent with pre-merge behavior — substrate is additive,
+      no legacy path changed observable values
 
-Once smoke passes, PR #58 rebuild can start.
+### Full-loop smoke (after planned phase P-1..P-7 lands)
+
+Validates that the substrate is being read by reconciliation and
+that the legacy `_suspect_*` caches are gone. These items cannot
+pass before P-1..P-7 ship on the follow-up branch:
+
+- [ ] First post-merge entry advances `pending` → `working` →
+      `filled` on the substrate via WebSocket → `apply_order_event`
+      (depends on P-1)
+- [ ] First post-merge exit creates a `role='exit'` row; position
+      transitions to `closed` after exit terminates (depends on
+      P-1 / P-2)
+- [ ] First post-merge stop fill advances the `protective_stop`
+      row to `filled` (depends on P-1 / P-4)
+- [ ] `_suspect_orders` and `_suspect_exit_orders` caches are
+      empty / absent throughout (depends on P-6 / P-7)
+
+Once full-loop smoke passes, PR #58 rebuild can start.
 
 ---
 
