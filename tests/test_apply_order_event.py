@@ -1663,3 +1663,100 @@ class TestIdentityColumnExpansion:
             "SELECT position_id FROM trades WHERE order_id = 'ord-fill'"
         ).fetchone()
         assert row[0] == "AAPL"
+
+
+# ── P-1 end-to-end: stream event → engine drain → apply_order_event ────────
+
+
+class TestStreamDrainEndToEnd:
+    """P-1: verify the full pipeline from a queued OrderEvent to a
+    persisted substrate state change. Uses the substrate's real
+    sqlite3 connection (the cycle thread context); doesn't exercise
+    the WS thread itself (that's the stream test file's scope)."""
+
+    def test_drained_filled_event_advances_pending_row_to_filled(
+        self, conn, pos_store, orders_store,
+    ):
+        from engine.lifecycle_orders import apply_order_event
+        uid = _seed_position(pos_store)
+        _insert_entry(orders_store, uid)
+        order_id = _attach_and_get_order_id(orders_store, "cli-entry")
+
+        # Simulate what _drain_lifecycle_events does per cycle.
+        outcome = apply_order_event(
+            conn,
+            OrderEvent(
+                order_id=order_id,
+                status="filled",
+                filled_qty=10.0,
+                avg_fill_price=100.5,
+                broker_updated_at="2026-06-15T14:30:00+00:00",
+            ),
+            reason="stream",
+        )
+        assert outcome.applied is True
+        assert outcome.new_status == "open"
+
+        # Row advanced.
+        status, qty, avg, _, terminal_at = _get_order(conn, order_id)
+        assert status == "filled"
+        assert qty == 10.0
+        assert avg == 100.5
+        assert terminal_at is not None
+
+    def test_drained_event_for_unknown_order_returns_skip(
+        self, conn,
+    ):
+        """Legacy orders submitted before P-4..P-6 shipped have no
+        substrate row. The drain handler logs debug and moves on."""
+        from engine.lifecycle_orders import apply_order_event
+        outcome = apply_order_event(
+            conn,
+            OrderEvent(
+                order_id="legacy-ord-without-substrate-row",
+                status="filled",
+                filled_qty=10.0,
+                avg_fill_price=100.5,
+                broker_updated_at="2026-06-15T14:30:00+00:00",
+            ),
+            reason="stream",
+        )
+        assert outcome.applied is False
+        assert outcome.reason == "unknown_order"
+
+    def test_drained_stale_event_returns_skip(
+        self, conn, pos_store, orders_store,
+    ):
+        """Out-of-order event arrival: a 'working' event arriving
+        AFTER a 'filled' event for the same order_id should be
+        skipped, not regress the row."""
+        from engine.lifecycle_orders import apply_order_event
+        uid = _seed_position(pos_store)
+        _insert_entry(orders_store, uid)
+        order_id = _attach_and_get_order_id(orders_store, "cli-entry")
+        # First: filled event arrives.
+        apply_order_event(
+            conn,
+            OrderEvent(
+                order_id=order_id, status="filled",
+                filled_qty=10.0, avg_fill_price=100.5,
+                broker_updated_at="2026-06-15T14:30:05+00:00",
+            ),
+            reason="stream",
+        )
+        # Then: stale 'working' arrives out of order.
+        outcome = apply_order_event(
+            conn,
+            OrderEvent(
+                order_id=order_id, status="working",
+                filled_qty=0.0, avg_fill_price=None,
+                broker_updated_at="2026-06-15T14:30:00+00:00",  # older
+            ),
+            reason="stream",
+        )
+        assert outcome.applied is False
+        assert outcome.reason in {"stale_or_duplicate", "terminal_blocked"}
+        # Row unchanged.
+        status, qty, _, _, _ = _get_order(conn, order_id)
+        assert status == "filled"
+        assert qty == 10.0

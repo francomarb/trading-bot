@@ -612,3 +612,95 @@ class TestMlegPayloadHandling:
         asyncio.run(sm._on_trade_update(update))
         assert event.is_set()
         assert sm.get_update("combo-1") is not None
+
+
+# ── P-1: WebSocket → apply_order_event queue ───────────────────────────────
+
+
+class TestLifecycleEventQueue:
+    """P-1: every material Alpaca trade_update gets translated to an
+    OrderEvent and enqueued for the engine drain. Non-material events
+    (pending_*, suspended) are silently skipped."""
+
+    def test_fill_event_enqueues_filled_order_event(self):
+        from engine.lifecycle_orders import OrderEvent
+        sm = StreamManager(api_key="k", secret_key="s", paper=True)
+        update = _make_update(
+            "ord-fill-1", "AAPL", "fill",
+            qty=10.0, price=100.5,
+        )
+        asyncio.run(sm._on_trade_update(update))
+        events = sm.drain_lifecycle_events()
+        assert len(events) == 1
+        ev = events[0]
+        assert isinstance(ev, OrderEvent)
+        assert ev.order_id == "ord-fill-1"
+        assert ev.status == "filled"
+        assert ev.filled_qty == 10.0
+        assert ev.avg_fill_price == 100.5
+
+    def test_partial_fill_enqueues_partially_filled_status(self):
+        sm = StreamManager(api_key="k", secret_key="s", paper=True)
+        update = _make_update(
+            "ord-pf-1", "AAPL", "partial_fill",
+            qty=5.0, price=100.0,
+        )
+        asyncio.run(sm._on_trade_update(update))
+        events = sm.drain_lifecycle_events()
+        assert len(events) == 1
+        assert events[0].status == "partially_filled"
+        assert events[0].filled_qty == 5.0
+
+    def test_canceled_event_enqueues_canceled_status(self):
+        sm = StreamManager(api_key="k", secret_key="s", paper=True)
+        update = _make_update(
+            "ord-x-1", "AAPL", "canceled", qty=0.0, price=0.0,
+        )
+        asyncio.run(sm._on_trade_update(update))
+        events = sm.drain_lifecycle_events()
+        assert len(events) == 1
+        assert events[0].status == "canceled"
+
+    def test_replaced_event_maps_to_canceled(self):
+        """Alpaca's 'replaced' terminates the OLD order; the
+        replacement has its own order_id and event stream."""
+        sm = StreamManager(api_key="k", secret_key="s", paper=True)
+        update = _make_update(
+            "ord-old", "AAPL", "replaced", qty=0.0, price=0.0,
+        )
+        asyncio.run(sm._on_trade_update(update))
+        events = sm.drain_lifecycle_events()
+        assert len(events) == 1
+        assert events[0].status == "canceled"
+
+    def test_non_material_event_skipped(self):
+        """pending_cancel / suspended / etc. don't advance the
+        substrate state machine — drop them."""
+        sm = StreamManager(api_key="k", secret_key="s", paper=True)
+        update = _make_update(
+            "ord-pc-1", "AAPL", "pending_cancel",
+        )
+        asyncio.run(sm._on_trade_update(update))
+        assert sm.drain_lifecycle_events() == []
+
+    def test_drain_clears_the_queue(self):
+        sm = StreamManager(api_key="k", secret_key="s", paper=True)
+        asyncio.run(sm._on_trade_update(
+            _make_update("ord-1", "AAPL", "fill", qty=10.0, price=100.0)
+        ))
+        first = sm.drain_lifecycle_events()
+        assert len(first) == 1
+        # Second drain is empty.
+        assert sm.drain_lifecycle_events() == []
+
+    def test_multiple_events_preserve_order(self):
+        sm = StreamManager(api_key="k", secret_key="s", paper=True)
+        asyncio.run(sm._on_trade_update(
+            _make_update("ord-a", "AAPL", "fill", qty=10.0, price=100.0)
+        ))
+        asyncio.run(sm._on_trade_update(
+            _make_update("ord-b", "AAPL", "canceled", qty=0.0, price=0.0)
+        ))
+        events = sm.drain_lifecycle_events()
+        assert [e.order_id for e in events] == ["ord-a", "ord-b"]
+        assert [e.status for e in events] == ["filled", "canceled"]

@@ -862,6 +862,7 @@ class TradingEngine:
             self._process_stream_stop_fills(snapshot)
             self._detect_external_closes(snapshot)
             self._drain_lifecycle_attaches()
+            self._drain_lifecycle_events()
             self._drain_option_fills()
             self._drain_spread_fills()
             self._sync_option_trailing_stops(snapshot)
@@ -4390,6 +4391,76 @@ class TradingEngine:
                     f"{client_order_id} → {order_id}: {exc}. Cycle "
                     f"reconciliation (commit later) will retry via "
                     f"client_order_id lookup."
+                )
+
+    def _drain_lifecycle_events(self) -> None:
+        """P-1: apply OrderEvents enqueued by the WS thread.
+
+        StreamManager translates each material Alpaca trade_update
+        into an ``engine.lifecycle_orders.OrderEvent`` on the
+        WebSocket thread and enqueues it on
+        ``_pending_lifecycle_events``. This drain runs on the cycle
+        thread (the connection-owning thread) and applies each via
+        ``apply_order_event`` so the substrate state machine
+        advances pending → working → partially_filled → filled /
+        canceled / rejected.
+
+        Outcomes:
+          - ``applied=True``: substrate advanced; debug-log.
+          - ``applied=False, reason='unknown_order'``: the broker
+            event was for an order with no substrate row (legacy
+            orders submitted before P-4..P-6 shipped, or orders
+            created by a path that doesn't insert substrate rows).
+            Debug-log; the legacy paths still own these.
+          - ``applied=False, reason='stale_or_duplicate'``: the
+            event was older than the row's last_observed_broker
+            _updated_at, or the row was already in a terminal
+            state. Normal — debug-log.
+          - Any exception: CRITICAL log + continue. One bad event
+            cannot stall the cycle.
+
+        The legacy stream-driven trade-logging paths
+        (``_process_stream_stop_fills`` / suspect caches) continue
+        to run during the suspect-cache deprecation window. Dual-
+        write is intentional until P-6/P-7 (cache removal) lands.
+        """
+        if self.lifecycle_orders_store is None or self._stream_manager is None:
+            return
+        from engine.lifecycle_orders import apply_order_event
+
+        events = self._stream_manager.drain_lifecycle_events()
+        for event in events:
+            try:
+                outcome = apply_order_event(
+                    self.lifecycle_orders_store._conn,
+                    event,
+                    reason="stream",
+                )
+            except Exception as exc:
+                logger.critical(
+                    f"apply_order_event raised for order_id="
+                    f"{event.order_id} status={event.status}: "
+                    f"{type(exc).__name__}: {exc}. Cycle continues; "
+                    f"investigate substrate health."
+                )
+                continue
+            if outcome.applied:
+                logger.debug(
+                    f"substrate advanced: order_id={event.order_id} "
+                    f"→ status={event.status} "
+                    f"(position {outcome.new_status})"
+                )
+            elif outcome.reason in {"unknown_order", "stale_or_duplicate"}:
+                logger.debug(
+                    f"substrate skipped event for order_id="
+                    f"{event.order_id} status={event.status}: "
+                    f"{outcome.reason}"
+                )
+            else:
+                logger.info(
+                    f"substrate dropped event for order_id="
+                    f"{event.order_id} status={event.status}: "
+                    f"{outcome.reason}"
                 )
 
     def _drain_option_fills(self) -> None:

@@ -47,6 +47,24 @@ _TERMINAL_EVENTS: frozenset[str] = frozenset({
     "rejected",
 })
 _FILL_EVENTS: frozenset[str] = frozenset({"fill"})
+_PARTIAL_FILL_EVENTS: frozenset[str] = frozenset({"partial_fill"})
+
+# P-1: Alpaca trade_update event → substrate status. Events not in
+# this map (pending_*, suspended, etc.) are non-material state
+# pings and skipped — they don't advance the per-order state
+# machine. "replaced" maps to 'canceled' because the OLD order is
+# terminal; the replacement order has its own client_order_id /
+# broker order_id and produces its own event stream.
+_STREAM_EVENT_TO_SUBSTRATE_STATUS: dict[str, str] = {
+    "new": "working",
+    "accepted": "working",
+    "partial_fill": "partially_filled",
+    "fill": "filled",
+    "canceled": "canceled",
+    "expired": "canceled",
+    "replaced": "canceled",
+    "rejected": "rejected",
+}
 _STATUS_TO_EVENT: dict[str, str] = {
     "filled": "fill",
     "stopped": "fill",
@@ -118,6 +136,12 @@ class StreamManager:
         self._alias_to_canonical: dict[str, str] = {}
         self._stop_legs: set[str] = set()
         self._stop_fills: list[Any] = []
+        # P-1: substrate state-machine events translated from
+        # Alpaca trade_updates. Enqueued on the WS thread, drained
+        # by the engine on the cycle thread (single-threaded sqlite3
+        # connection — see foundation commit 12 / round-2 finding 2).
+        # Each entry is an engine.lifecycle_orders.OrderEvent.
+        self._pending_lifecycle_events: list[Any] = []
         self._health = StreamHealth(
             connected=False,
             healthy=False,
@@ -249,6 +273,21 @@ class StreamManager:
             fills = list(self._stop_fills)
             self._stop_fills.clear()
             return fills
+
+    def drain_lifecycle_events(self) -> list[Any]:
+        """Return and clear substrate state-machine events that the
+        WS thread translated from Alpaca trade_updates.
+
+        P-1: events come out as ``engine.lifecycle_orders.OrderEvent``
+        instances ready for ``apply_order_event``. The drain runs
+        on the cycle thread (single-threaded sqlite3 connection),
+        same pattern as ``drain_stop_fills`` and
+        ``broker.drain_lifecycle_attaches``.
+        """
+        with self._lock:
+            events = list(self._pending_lifecycle_events)
+            self._pending_lifecycle_events.clear()
+            return events
 
     def health_snapshot(self) -> StreamHealth:
         """Return an immutable snapshot of current websocket health."""
@@ -826,3 +865,80 @@ class StreamManager:
                 if tracked is not None:
                     tracked.update = update
                     tracked.event.set()
+
+            # P-1: translate every state-bearing event to a substrate
+            # OrderEvent and enqueue. Drained by the engine each
+            # cycle (single-threaded sqlite3 connection). The legacy
+            # _stop_fills / tracked.update / event.set paths above
+            # continue to run during the suspect-cache deprecation
+            # window — dual-write until P-6/P-7 land.
+            substrate_event = self._build_substrate_event(
+                order_id, event_val, update,
+            )
+            if substrate_event is not None:
+                self._pending_lifecycle_events.append(substrate_event)
+
+    @staticmethod
+    def _build_substrate_event(
+        order_id: str, event_val: str, update: Any,
+    ) -> "Any | None":
+        """Translate one Alpaca trade_update into an
+        ``engine.lifecycle_orders.OrderEvent``.
+
+        Returns None when the Alpaca event is non-material to the
+        substrate state machine (e.g., pending_cancel, suspended)
+        — apply_order_event has nothing to advance on those and
+        we don't want noise in the queue.
+        """
+        substrate_status = _STREAM_EVENT_TO_SUBSTRATE_STATUS.get(event_val)
+        if substrate_status is None:
+            return None
+        # Local import keeps stream.py importable without the engine
+        # substrate (test fixtures that don't exercise the engine).
+        from engine.lifecycle_orders import OrderEvent
+
+        # filled_qty / avg_fill_price come off update.order (the
+        # cumulative state), not update (which carries per-execution
+        # qty for partial fills). The substrate stores cumulative
+        # state per the §6.5 rollup contract.
+        raw_filled = getattr(update.order, "filled_qty", None)
+        try:
+            filled_qty = float(raw_filled) if raw_filled is not None else 0.0
+        except (TypeError, ValueError):
+            filled_qty = 0.0
+        raw_avg = getattr(update.order, "filled_avg_price", None)
+        try:
+            avg_fill_price = (
+                float(raw_avg) if raw_avg is not None else None
+            )
+        except (TypeError, ValueError):
+            avg_fill_price = None
+
+        # broker_updated_at is required by OrderEvent. Alpaca's
+        # trade_update payload uses updated_at on the order object;
+        # fall back to submitted_at, then to a synthesized 'now'
+        # marker so the event is still applyable (apply_order_event
+        # uses it for terminal_at and audit, not state ordering).
+        updated_at_raw = (
+            getattr(update.order, "updated_at", None)
+            or getattr(update.order, "submitted_at", None)
+        )
+        if updated_at_raw is None:
+            from datetime import datetime, timezone
+            updated_at = datetime.now(timezone.utc).isoformat()
+        else:
+            updated_at = str(updated_at_raw)
+
+        execution_id_raw = getattr(update, "execution_id", None)
+        execution_id = (
+            None if execution_id_raw is None else str(execution_id_raw)
+        )
+
+        return OrderEvent(
+            order_id=order_id,
+            status=substrate_status,
+            filled_qty=filled_qty,
+            avg_fill_price=avg_fill_price,
+            broker_updated_at=updated_at,
+            execution_id=execution_id,
+        )
