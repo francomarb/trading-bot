@@ -869,9 +869,13 @@ class StreamManager:
             # P-1: translate every state-bearing event to a substrate
             # OrderEvent and enqueue. Drained by the engine each
             # cycle (single-threaded sqlite3 connection). The legacy
-            # _stop_fills / tracked.update / event.set paths above
-            # continue to run during the suspect-cache deprecation
-            # window — dual-write until P-6/P-7 land.
+            # _stop_fills accumulator + tracked.update / event.set
+            # paths above continue to run: the synchronous broker
+            # code in execution/broker.py uses tracked.event for
+            # _wait_for_fill, and _process_stream_stop_fills owns
+            # the protective-stop fill path. Substrate dispatches
+            # are role-filtered (entry_primary / exit) so they don't
+            # overlap with the stop-fill path.
             substrate_event = self._build_substrate_event(
                 order_id, event_val, update,
             )

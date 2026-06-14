@@ -4601,10 +4601,13 @@ class TradingEngine:
           - Any exception: CRITICAL log + continue. One bad event
             cannot stall the cycle.
 
-        The legacy stream-driven trade-logging paths
-        (``_process_stream_stop_fills`` / suspect caches) continue
-        to run during the suspect-cache deprecation window. Dual-
-        write is intentional until P-6/P-7 (cache removal) lands.
+        After P-6/P-7 the suspect caches are gone. The remaining
+        legacy stream-driven trade-logging paths
+        (``_process_stream_stop_fills`` for protective-stop fills,
+        ``_detect_external_closes`` for unexpected broker closes)
+        continue to run alongside this drain; their writes
+        converge with the substrate UPSERT per the trades-
+        UPSERT preservation policy (foundation commits 8 / 11 / 14).
         """
         if self.lifecycle_orders_store is None or self._stream_manager is None:
             return
@@ -4716,8 +4719,13 @@ class TradingEngine:
         if self.lifecycle_orders_store is None:
             return
         try:
+            # PR #61 round-1 fix P2-1: query unbounded so the limit
+            # caps actual REST calls, not rows read. Round-1 reviewer
+            # noted that the old 'limit at query time' could let 20
+            # long-lived GTC stops fill every batch and permanently
+            # starve newer terminal rows of reconciliation.
             rows = self.lifecycle_orders_store.get_non_terminal_with_order_id(
-                limit=limit,
+                limit=None,
             )
         except Exception as exc:
             logger.critical(
@@ -4733,6 +4741,7 @@ class TradingEngine:
         }
         from engine.lifecycle_orders import apply_order_event
 
+        rest_calls = 0
         for row in rows:
             oid = row.order_id
             if oid is None:
@@ -4740,6 +4749,15 @@ class TradingEngine:
             if oid in open_by_id:
                 # Still active at the broker; the stream owns it.
                 continue
+            # Enforce the REST-call cap on candidates that
+            # actually need a fetch, AFTER the open-orders filter.
+            if limit is not None and rest_calls >= limit:
+                logger.debug(
+                    f"substrate {reason} reconcile: hit REST cap "
+                    f"({limit}); remaining rows catch up next pass"
+                )
+                break
+            rest_calls += 1
             # Order is non-terminal in substrate but absent from
             # broker open orders → terminal at the broker. Fetch
             # the truth.

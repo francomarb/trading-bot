@@ -77,9 +77,15 @@ After PR #60 merged to main on 2026-06-14, the consumer wiring landed on a follo
 | P-6c | Delete `_suspect_orders` cache, `SuspectOrder` dataclass, `_remember_suspect_order`, `_recover_suspect_orders` | §10.1 / §6.7 | `b982870` | ✅ |
 | P-7a | Wire `_maybe_dispatch_substrate_exit_fill` from same drain handlers; uses existing `_record_recovered_exit_fill` (idempotent via `has_recorded_order_id`) | §10.2 / §6.7 | `860ce93` | ✅ |
 | P-7b | Delete `_suspect_exit_orders` cache, `SuspectExitOrder` dataclass, `_recover_suspect_exit_orders`, staging branch in `_close_single_leg_position` | §10.2 / §6.7 | `ecce2da` | ✅ |
-| P-8 | Doc updates: this tracker + PLAN.md + slippage_unification_tracker.md + operator_controls_proposal.md §17 | §12 | (this commit) | 🔄 In progress |
+| P-8 | Doc updates: this tracker + PLAN.md (slippage_unification_tracker.md and operator_controls_proposal.md don't reference the foundation — no edits needed there) | §12 | `8bf9046` | ✅ |
+| PR #61 round-1 fix P1 | Exit dispatch via ownership gate (was suppressed by its own substrate UPSERT); +2 integration tests covering the apply→dispatch sequence | §10.2 | `c247fe4` | ✅ |
+| PR #61 round-1 fix P2 | Cycle REST cap counts actual calls, not rows read; tracker doc drift; NULL-order_id attach retry tracked as follow-up | §10.1 | (this commit) | 🔄 In progress |
 
-Consumer-wiring totals: ~1,800 LOC code + ~750 LOC tests across 11 commits; ~500 LOC of legacy cache infrastructure deleted.
+Consumer-wiring totals: ~2,100 LOC code + ~1,000 LOC tests across 14 commits (12 original + 2 PR #61 round-1 review fixes); ~500 LOC of legacy cache infrastructure deleted.
+
+### Known follow-ups (tracked, not blocking)
+
+- **NULL-order_id attach retry**: cycle and startup reconcilers only walk rows with `order_id IS NOT NULL`. A synchronous attach failure (or a failed lifecycle-attach queue drain) leaves the row at `pending` with `order_id=NULL`, invisible to the REST reconcilers. Recovery requires a separate path that walks NULL-order_id rows and resolves via `get_order_by_client_id`. Requires an uncommon SQLite failure to occur; not blocking on paper. PR #61 round-1 reviewer P2-2.
 
 ### Four-tier capture pipeline (substrate becomes load-bearing)
 
@@ -238,7 +244,7 @@ Two phases, two rollback strategies:
 
 The consumer-wiring branch DELETES the legacy `_suspect_orders` and `_suspect_exit_orders` caches. Reverting the cache-removal commits (`b982870`, `ecce2da`) is safe — the substrate-driven dispatch (`73793d7`, `860ce93`) and the caches can coexist (dual-write), so a partial rollback of just the deletion commits restores the safety net without breaking the substrate.
 
-Full Phase 2 revert (all 11 commits) reverts to phase-1 substrate-only state. Safe.
+Full Phase 2 revert (all 14 commits) reverts to phase-1 substrate-only state. Safe.
 
 A partial rollback (e.g., keeping P-1 stream wiring but reverting P-6/P-7 cache removal) is supported because the substrate dispatches gate on `_has_position` and the cache dispatches gate on `_suspect_orders` membership — both can run simultaneously without double-firing alerts.
 
