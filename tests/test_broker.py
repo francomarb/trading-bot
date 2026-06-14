@@ -2585,3 +2585,485 @@ class TestLifecycleAttachQueue:
         # The queue picked it up.
         attaches = broker.drain_lifecycle_attaches()
         assert attaches == [(captured["cli"], "ord-from-thread", None)]
+
+
+# ── P-4 (consumer wiring): protective_stop substrate insert ─────────────────
+
+
+class TestProtectiveStopSubstrate:
+    """P-4: every protective-stop creation path (bracket OTO child,
+    fractional standalone GTC, repair flow) writes a
+    `protective_stop` substrate row alongside the broker stop.
+    POST-submit semantics — substrate failure does NOT abort the
+    stop submission (which has already succeeded)."""
+
+    @staticmethod
+    def _broker(api: MagicMock, orders_store: MagicMock):
+        broker = AlpacaBroker(
+            client=api, max_attempts=1, base_delay=0.0,
+            lifecycle_orders_store=orders_store,
+            lifecycle_store=MagicMock(),
+        )
+        broker._lifecycle_store.create_pending = MagicMock(return_value="pos-uid-pX")
+        return broker
+
+    def test_bracket_oto_entry_writes_protective_stop_row(self):
+        """Equity entry submitted with OTO stop_loss. After submit
+        returns, broker extracts the stop leg's id + client_order_id
+        and writes a protective_stop row with parent_order_id =
+        entry order id."""
+        from types import SimpleNamespace
+        api = MagicMock()
+        # Order returned by submit has a stop leg.
+        order = _alpaca_order(id="alpaca-entry-1", status="filled")
+        order.legs = [SimpleNamespace(
+            id="alpaca-stop-1",
+            client_order_id="alpaca-cli-stop-1",
+            type=SimpleNamespace(value="stop"),
+            side=SimpleNamespace(value="sell"),
+        )]
+        api.submit_order.return_value = order
+        api.get_order_by_id.return_value = _alpaca_order(
+            id="alpaca-entry-1", status="filled",
+        )
+        orders_store = MagicMock()
+        broker = self._broker(api, orders_store)
+
+        broker.place_order(_decision(stop=95.5), poll_timeout=0.1)
+
+        # Two insert_pending calls: one for the entry (role=entry_primary),
+        # one for the protective stop.
+        roles = [
+            c.kwargs["role"]
+            for c in orders_store.insert_pending.call_args_list
+        ]
+        assert "entry_primary" in roles
+        assert "protective_stop" in roles
+
+        stop_call = [
+            c for c in orders_store.insert_pending.call_args_list
+            if c.kwargs["role"] == "protective_stop"
+        ][0]
+        kwargs = stop_call.kwargs
+        assert kwargs["client_order_id"] == "alpaca-cli-stop-1"
+        assert kwargs["side"] == "sell"
+        assert kwargs["order_type"] == "stop"
+        assert kwargs["order_class"] == "oto"
+        assert kwargs["intended_stop_price"] == 95.5
+        assert kwargs["intended_qty"] == 10.0
+        assert kwargs["parent_order_id"] == "alpaca-entry-1"
+
+        # attach_broker_order_id called with the stop's broker id.
+        attach_calls = [
+            c for c in orders_store.attach_broker_order_id.call_args_list
+            if c.kwargs.get("client_order_id") == "alpaca-cli-stop-1"
+        ]
+        assert len(attach_calls) == 1
+        assert attach_calls[0].kwargs["order_id"] == "alpaca-stop-1"
+
+    def test_bracket_oto_without_stop_leg_skips_substrate_write(self):
+        """Defensive: if order.legs is empty (malformed broker
+        response) the protective_stop write is skipped, not crashed."""
+        api = MagicMock()
+        order_no_legs = _alpaca_order(id="alpaca-entry-2", status="filled")
+        order_no_legs.legs = []
+        api.submit_order.return_value = order_no_legs
+        api.get_order_by_id.return_value = _alpaca_order(
+            id="alpaca-entry-2", status="filled",
+        )
+        orders_store = MagicMock()
+        broker = self._broker(api, orders_store)
+
+        broker.place_order(_decision(stop=95.5), poll_timeout=0.1)
+
+        roles = [
+            c.kwargs["role"]
+            for c in orders_store.insert_pending.call_args_list
+        ]
+        assert "protective_stop" not in roles
+
+    def test_repair_path_passes_position_uid_to_substrate(self):
+        """place_protective_stop now records the substrate row when
+        the engine supplies position_uid. order_class='simple',
+        parent_order_id=None (this is a standalone repair, not a
+        bracket child)."""
+        api = MagicMock()
+        from types import SimpleNamespace
+        api.submit_order.return_value = SimpleNamespace(
+            id="alpaca-repair-1",
+            client_order_id="cli-repair-1",
+            status="accepted",
+            symbol="AAPL",
+            qty="10",
+            side="sell",
+            type="stop",
+            stop_price="95.0",
+            time_in_force="gtc",
+            submitted_at="2026-06-15T14:30:00Z",
+            filled_at=None,
+            filled_qty="0",
+            filled_avg_price=None,
+            legs=None,
+        )
+        orders_store = MagicMock()
+        broker = self._broker(api, orders_store)
+
+        broker.place_protective_stop(
+            symbol="AAPL", qty=10, stop_price=95.0,
+            client_order_id_prefix="recover-stop",
+            position_uid="pos-known-A",
+        )
+
+        stop_call = [
+            c for c in orders_store.insert_pending.call_args_list
+            if c.kwargs["role"] == "protective_stop"
+        ][0]
+        kwargs = stop_call.kwargs
+        assert kwargs["position_uid"] == "pos-known-A"
+        assert kwargs["order_class"] == "simple"
+        assert kwargs["parent_order_id"] is None
+        assert kwargs["intended_stop_price"] == 95.0
+        assert kwargs["intended_qty"] == 10.0
+
+    def test_repair_path_without_position_uid_skips_substrate_write(self):
+        """Legacy / test callers that don't supply position_uid get
+        the same broker behavior; substrate write is just skipped."""
+        api = MagicMock()
+        from types import SimpleNamespace
+        api.submit_order.return_value = SimpleNamespace(
+            id="alpaca-repair-2",
+            client_order_id="cli-repair-2",
+            status="accepted",
+            symbol="AAPL",
+            qty="10",
+            side="sell",
+            type="stop",
+            stop_price="95.0",
+            time_in_force="gtc",
+            submitted_at="2026-06-15T14:30:00Z",
+            filled_at=None,
+            filled_qty="0",
+            filled_avg_price=None,
+            legs=None,
+        )
+        orders_store = MagicMock()
+        broker = self._broker(api, orders_store)
+
+        broker.place_protective_stop(
+            symbol="AAPL", qty=10, stop_price=95.0,
+            client_order_id_prefix="recover-stop",
+        )
+
+        roles = [
+            c.kwargs.get("role")
+            for c in orders_store.insert_pending.call_args_list
+        ]
+        assert "protective_stop" not in roles
+
+    def test_substrate_failure_does_not_abort_repair_stop(self):
+        """POST-submit semantics: insert raising must not crash the
+        place_protective_stop return path."""
+        api = MagicMock()
+        from types import SimpleNamespace
+        api.submit_order.return_value = SimpleNamespace(
+            id="alpaca-repair-3",
+            client_order_id="cli-repair-3",
+            status="accepted",
+            symbol="AAPL",
+            qty="10",
+            side="sell",
+            type="stop",
+            stop_price="95.0",
+            time_in_force="gtc",
+            submitted_at="2026-06-15T14:30:00Z",
+            filled_at=None,
+            filled_qty="0",
+            filled_avg_price=None,
+            legs=None,
+        )
+        orders_store = MagicMock()
+        orders_store.insert_pending.side_effect = RuntimeError("substrate down")
+        broker = self._broker(api, orders_store)
+
+        # Does NOT raise; broker stop result still returned.
+        result = broker.place_protective_stop(
+            symbol="AAPL", qty=10, stop_price=95.0,
+            position_uid="pos-X",
+        )
+        assert result is not None
+
+
+# ── P-5 (consumer wiring): replacement_stop substrate insert ───────────────
+
+
+class TestReplacementStopSubstrate:
+    """P-5: promote_equity_stop_to_gtc records a `replacement_stop`
+    substrate row with replaces_order_id pointing at the old OTO
+    child it superseded. apply_order_event uses that lineage to
+    resolve terminal events for either id."""
+
+    @staticmethod
+    def _broker(api: MagicMock, orders_store: MagicMock):
+        broker = AlpacaBroker(
+            client=api, max_attempts=1, base_delay=0.0,
+            lifecycle_orders_store=orders_store,
+            lifecycle_store=MagicMock(),
+        )
+        broker._lifecycle_store.create_pending = MagicMock(return_value="pos-P5")
+        return broker
+
+    @staticmethod
+    def _replacement_order(*, id: str, cli: str):
+        from types import SimpleNamespace
+        return SimpleNamespace(
+            id=id,
+            client_order_id=cli,
+            status="accepted",
+            symbol="AAPL",
+            qty="10",
+            side="sell",
+            type="stop",
+            stop_price="95.0",
+            time_in_force="gtc",
+            submitted_at="2026-06-15T14:30:00Z",
+            filled_at=None,
+            filled_qty="0",
+            filled_avg_price=None,
+            legs=None,
+        )
+
+    def test_promote_with_position_uid_records_replacement_stop(self):
+        api = MagicMock()
+        api.replace_order_by_id.return_value = self._replacement_order(
+            id="alpaca-replace-1", cli="cli-replace-1",
+        )
+        orders_store = MagicMock()
+        broker = self._broker(api, orders_store)
+
+        broker.promote_equity_stop_to_gtc(
+            parent_order_id=None,
+            stop_order_id="alpaca-oto-child-7",
+            qty=10,
+            stop_price=95.0,
+            position_uid="pos-A",
+        )
+
+        # insert_pending called with role='replacement_stop' and the
+        # lineage link populated.
+        stop_call = [
+            c for c in orders_store.insert_pending.call_args_list
+            if c.kwargs.get("role") == "replacement_stop"
+        ][0]
+        kwargs = stop_call.kwargs
+        assert kwargs["position_uid"] == "pos-A"
+        assert kwargs["side"] == "sell"
+        assert kwargs["order_type"] == "stop"
+        assert kwargs["order_class"] == "simple"
+        assert kwargs["intended_stop_price"] == 95.0
+        assert kwargs["intended_qty"] == 10.0
+        assert kwargs["parent_order_id"] is None
+        # The critical field: the new row knows which order it
+        # supersedes.
+        assert kwargs["replaces_order_id"] == "alpaca-oto-child-7"
+
+        # attach_broker_order_id called with the replacement's id.
+        attach_calls = [
+            c for c in orders_store.attach_broker_order_id.call_args_list
+            if c.kwargs.get("client_order_id", "").startswith("equity-stop-gtc-")
+            or c.kwargs.get("client_order_id") == "cli-replace-1"
+        ]
+        # Whichever client_order_id format the broker generated, the
+        # attach should have happened for the replacement.
+        assert any(
+            c.kwargs.get("order_id") == "alpaca-replace-1"
+            for c in attach_calls
+        )
+
+    def test_promote_without_position_uid_skips_substrate_write(self):
+        """Legacy callers without position_uid get the same broker
+        behavior; substrate write is just skipped."""
+        api = MagicMock()
+        api.replace_order_by_id.return_value = self._replacement_order(
+            id="alpaca-replace-2", cli="cli-replace-2",
+        )
+        orders_store = MagicMock()
+        broker = self._broker(api, orders_store)
+
+        broker.promote_equity_stop_to_gtc(
+            parent_order_id=None,
+            stop_order_id="alpaca-oto-child-8",
+            qty=10,
+            stop_price=95.0,
+        )
+
+        roles = [
+            c.kwargs.get("role")
+            for c in orders_store.insert_pending.call_args_list
+        ]
+        assert "replacement_stop" not in roles
+
+    def test_substrate_failure_does_not_abort_promotion(self):
+        """POST-submit semantics: substrate insert raising must not
+        crash the broker promotion path. The replacement is already
+        live at Alpaca."""
+        api = MagicMock()
+        api.replace_order_by_id.return_value = self._replacement_order(
+            id="alpaca-replace-3", cli="cli-replace-3",
+        )
+        orders_store = MagicMock()
+        orders_store.insert_pending.side_effect = RuntimeError("substrate down")
+        broker = self._broker(api, orders_store)
+
+        # Does NOT raise.
+        result = broker.promote_equity_stop_to_gtc(
+            parent_order_id=None,
+            stop_order_id="alpaca-oto-child-9",
+            qty=10,
+            stop_price=95.0,
+            position_uid="pos-X",
+        )
+        assert result is not None
+
+
+# ── P-6 (consumer wiring): exit substrate insert ───────────────────────────
+
+
+class TestExitSubstrate:
+    """P-6: broker.close_position records an `exit` substrate row
+    when the engine supplies position_uid. Alpaca's close-position
+    API generates the client_order_id internally; the broker reads
+    it off the response and uses it as the substrate row key."""
+
+    @staticmethod
+    def _broker(api: MagicMock, orders_store: MagicMock):
+        broker = AlpacaBroker(
+            client=api, max_attempts=1, base_delay=0.0,
+            lifecycle_orders_store=orders_store,
+            lifecycle_store=MagicMock(),
+        )
+        broker._lifecycle_store.create_pending = MagicMock(return_value="pos-P6")
+        return broker
+
+    @staticmethod
+    def _close_response(*, id: str, cli: str):
+        from types import SimpleNamespace
+        return SimpleNamespace(
+            id=id,
+            client_order_id=cli,
+            status="filled",
+            symbol="AAPL",
+            qty="10",
+            side="sell",
+            type="market",
+            stop_price=None,
+            limit_price=None,
+            time_in_force="day",
+            submitted_at="2026-06-15T14:30:00Z",
+            filled_at="2026-06-15T14:30:05Z",
+            filled_qty="10",
+            filled_avg_price="100.5",
+            legs=None,
+        )
+
+    def test_close_position_with_uid_records_exit_row(self):
+        from types import SimpleNamespace
+        api = MagicMock()
+        # close_position uses get_positions + _api.close_position(symbol).
+        api.get_all_positions.return_value = [
+            SimpleNamespace(
+                symbol="AAPL", qty="10", avg_entry_price="100.0",
+                current_price="100.5", side="long",
+                asset_class=SimpleNamespace(value="us_equity"),
+                cost_basis="1000.0", market_value="1005.0",
+            )
+        ]
+        api.get_orders.return_value = []
+        api.close_position.return_value = self._close_response(
+            id="alpaca-close-1", cli="alpaca-cli-close-1",
+        )
+        api.get_order_by_id.return_value = self._close_response(
+            id="alpaca-close-1", cli="alpaca-cli-close-1",
+        )
+        orders_store = MagicMock()
+        broker = self._broker(api, orders_store)
+
+        broker.close_position("AAPL", position_uid="pos-X", poll_timeout=0.1)
+
+        exit_call = [
+            c for c in orders_store.insert_pending.call_args_list
+            if c.kwargs.get("role") == "exit"
+        ][0]
+        kwargs = exit_call.kwargs
+        assert kwargs["position_uid"] == "pos-X"
+        assert kwargs["side"] == "sell"
+        assert kwargs["order_type"] == "market"
+        assert kwargs["order_class"] == "simple"
+        assert kwargs["intended_qty"] == 10.0
+        assert kwargs["client_order_id"] == "alpaca-cli-close-1"
+
+        # attach with the broker close id
+        attach_calls = [
+            c for c in orders_store.attach_broker_order_id.call_args_list
+            if c.kwargs.get("client_order_id") == "alpaca-cli-close-1"
+        ]
+        assert len(attach_calls) == 1
+        assert attach_calls[0].kwargs["order_id"] == "alpaca-close-1"
+
+    def test_close_position_without_uid_skips_substrate_write(self):
+        from types import SimpleNamespace
+        api = MagicMock()
+        api.get_all_positions.return_value = [
+            SimpleNamespace(
+                symbol="AAPL", qty="10", avg_entry_price="100.0",
+                current_price="100.5", side="long",
+                asset_class=SimpleNamespace(value="us_equity"),
+                cost_basis="1000.0", market_value="1005.0",
+            )
+        ]
+        api.get_orders.return_value = []
+        api.close_position.return_value = self._close_response(
+            id="alpaca-close-2", cli="alpaca-cli-close-2",
+        )
+        api.get_order_by_id.return_value = self._close_response(
+            id="alpaca-close-2", cli="alpaca-cli-close-2",
+        )
+        orders_store = MagicMock()
+        broker = self._broker(api, orders_store)
+
+        broker.close_position("AAPL", poll_timeout=0.1)
+
+        roles = [
+            c.kwargs.get("role")
+            for c in orders_store.insert_pending.call_args_list
+        ]
+        assert "exit" not in roles
+
+    def test_substrate_failure_does_not_abort_close(self):
+        """POST-submit semantics: insert raising must not crash the
+        close. The broker close has already been accepted."""
+        from types import SimpleNamespace
+        api = MagicMock()
+        api.get_all_positions.return_value = [
+            SimpleNamespace(
+                symbol="AAPL", qty="10", avg_entry_price="100.0",
+                current_price="100.5", side="long",
+                asset_class=SimpleNamespace(value="us_equity"),
+                cost_basis="1000.0", market_value="1005.0",
+            )
+        ]
+        api.get_orders.return_value = []
+        api.close_position.return_value = self._close_response(
+            id="alpaca-close-3", cli="alpaca-cli-close-3",
+        )
+        api.get_order_by_id.return_value = self._close_response(
+            id="alpaca-close-3", cli="alpaca-cli-close-3",
+        )
+        orders_store = MagicMock()
+        orders_store.insert_pending.side_effect = RuntimeError("substrate down")
+        broker = self._broker(api, orders_store)
+
+        # Does NOT raise.
+        result = broker.close_position(
+            "AAPL", position_uid="pos-X", poll_timeout=0.1,
+        )
+        assert result is not None

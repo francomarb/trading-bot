@@ -120,6 +120,33 @@ if TYPE_CHECKING:
 _OCC_PAT = re.compile(r"^[A-Z]{1,6}[0-9]{6}[CP][0-9]{8}$")
 
 
+# P-2: cap on substrate cycle-reconciliation REST calls per cycle.
+# A large gap (e.g., after a long stream outage) catches up over
+# several cycles rather than blowing the per-cycle Alpaca API
+# budget in one shot.
+_SUBSTRATE_CYCLE_RECONCILE_LIMIT = 20
+
+
+# P-2: Alpaca REST order.status → substrate status. Same intent as
+# stream's _STREAM_EVENT_TO_SUBSTRATE_STATUS but maps the FINAL
+# status string the REST endpoint returns (not the event-stream
+# verbs). Non-material statuses (pending_*, suspended) are absent
+# from the map so they're skipped — the substrate doesn't advance
+# on them.
+_ALPACA_STATUS_TO_SUBSTRATE_STATUS = {
+    "new": "working",
+    "accepted": "working",
+    "partially_filled": "partially_filled",
+    "filled": "filled",
+    "canceled": "canceled",
+    "expired": "canceled",
+    "replaced": "canceled",
+    "rejected": "rejected",
+    "done_for_day": "canceled",
+    "stopped": "filled",
+}
+
+
 # ── Bar-interval helpers ─────────────────────────────────────────────────────
 
 
@@ -222,34 +249,12 @@ class EngineConfig:
             raise ValueError("external_close_confirm_cycles must be >= 1")
 
 
-@dataclass(frozen=True)
-class SuspectOrder:
-    """Bot-submitted order accepted by Alpaca but not yet locally confirmed.
-
-    ``modeled_price_kind`` preserves the slippage benchmark provenance
-    captured at submission so the recovery row gets the same tagging
-    the live row would have written. Defaults to 'unavailable' so
-    legacy SuspectOrder constructions remain safe — recovery then
-    writes NULL slippage rather than fabricating a kind.
-    """
-
-    decision: RiskDecision
-    order_id: str
-    modeled_price: float
-    modeled_price_kind: str = "unavailable"
-
-
-@dataclass(frozen=True)
-class SuspectExitOrder:
-    """Exact submitted close whose terminal state was not confirmed locally."""
-
-    order_id: str
-    symbol: str
-    owner: str
-    requested_qty: float
-    modeled_price: float
-    benchmark_kind: str
-    alert_reason: str
+# P-7: SuspectExitOrder dataclass removed. Substrate exit rows
+# (created by close_position via _lifecycle_orders_record_exit)
+# now carry the same recovery state — order_id, symbol, owner_key
+# (via JOIN to position_lifecycle), intended_qty, slippage benchmark
+# provenance. _maybe_dispatch_substrate_exit_fill is the recovery
+# trigger.
 
 
 # ── Engine ───────────────────────────────────────────────────────────────────
@@ -434,12 +439,12 @@ class TradingEngine:
         # treat the position as genuinely gone (guards against API blips).
         self._external_close_suspects: dict[str, int] = {}
 
-        # Exact bot-submitted orders that were accepted by Alpaca but whose
-        # fill state could not be confirmed locally (e.g. stream/REST failure
-        # after submit). These are the only unknown positions we will ever try
-        # to adopt automatically.
-        self._suspect_orders: dict[str, SuspectOrder] = {}
-        self._suspect_exit_orders: dict[str, SuspectExitOrder] = {}
+        # P-6 + P-7: _suspect_orders and _suspect_exit_orders both
+        # removed. The substrate capture pipeline (P-1 stream + P-2
+        # cycle reconcile + P-3 startup reconcile) observes UNKNOWN-
+        # at-submit resolutions and _maybe_dispatch_substrate_
+        # {entry,exit}_fill fires the engine-side side effects on
+        # each captured fill.
 
         # DAY-stop promotion is retried from every broker snapshot, but a
         # persistent rejection should count as one broker incident rather than
@@ -673,6 +678,25 @@ class TradingEngine:
         # closes, etc.). Best-effort: never raises into the cycle path.
         self._reconcile_position_lifecycle(startup_snapshot)
 
+        # P-3: per-order substrate startup reconciliation. Walk every
+        # non-terminal position_lifecycle_orders row whose order_id
+        # is NOT in the broker's current open_orders, fetch its
+        # current state via REST, and apply via apply_order_event.
+        # Catches fill / cancel / expiration events that landed at
+        # the broker while the bot was down (overnight, weekend,
+        # crash window). Runs after _reconcile_position_lifecycle so
+        # the position_uid FKs already resolve. Best-effort: each
+        # row's failure is isolated and logged CRITICAL.
+        try:
+            self._reconcile_substrate_startup(startup_snapshot)
+        except Exception as exc:
+            logger.critical(
+                f"substrate startup reconcile raised: "
+                f"{type(exc).__name__}: {exc}. Cycle path will retry "
+                f"non-terminal rows over time via the cycle "
+                f"reconciler."
+            )
+
         # Operator Controls Phase A PR-2 — restore sticky halt from disk.
         # If a halt was engaged before the previous shutdown, re-engage
         # the kill switch immediately so the first cycle blocks entries.
@@ -815,7 +839,9 @@ class TradingEngine:
                             )
                     order_strategy = self._attribute_orders(snapshot.open_orders)
                     self._sync_managed_stop_legs(snapshot)
-                    self._recover_suspect_exit_orders(snapshot)
+                    # P-7: _recover_suspect_exit_orders removed.
+                    # Substrate pipeline + _maybe_dispatch_substrate_
+                    # exit_fill cover the close-side recovery.
                     self._repair_missing_protective_stops(
                         snapshot,
                         allow_residual_cleanup=False,
@@ -857,11 +883,17 @@ class TradingEngine:
 
             self._sync_managed_stop_legs(snapshot)
             self._observe_stream_health()
-            self._recover_suspect_orders(snapshot)
-            self._recover_suspect_exit_orders(snapshot)
+            # P-6 + P-7: _recover_suspect_orders and
+            # _recover_suspect_exit_orders both removed. Substrate
+            # pipeline (P-1/P-2/P-3) observes UNKNOWN-at-submit
+            # resolutions on both entry and exit roles; the
+            # _maybe_dispatch_substrate_{entry,exit}_fill helpers
+            # fire the engine-side side effects.
             self._process_stream_stop_fills(snapshot)
             self._detect_external_closes(snapshot)
             self._drain_lifecycle_attaches()
+            self._drain_lifecycle_events(snapshot)
+            self._reconcile_substrate_cycle(snapshot)
             self._drain_option_fills()
             self._drain_spread_fills()
             self._sync_option_trailing_stops(snapshot)
@@ -1668,15 +1700,30 @@ class TradingEngine:
             if _lc is not None:
                 _lc.submitted += 1
             if result.status is OrderStatus.UNKNOWN:
-                # Preserve the benchmark provenance so the recovery row
-                # (codepath §9) tags the right kind/quality if this
-                # submission later resolves filled. Defect 2 fix.
-                self._remember_suspect_order(
-                    decision,
-                    result,
-                    modeled_price=slippage_ref,
-                    modeled_price_kind=slippage_kind or "unavailable",
-                )
+                # P-6: substrate pipeline now owns recovery. The
+                # per-order substrate row was already inserted at
+                # submit time (foundation commit 6) and the broker
+                # order_id was attached on the successful submit
+                # return — when the order's terminal state arrives
+                # via stream / cycle reconcile / startup reconcile,
+                # apply_order_event advances the substrate row and
+                # _maybe_dispatch_substrate_entry_fill fires the
+                # engine-side side effects. No cache state required.
+                #
+                # Defensive log for the genuinely-broken case (no
+                # order_id) the legacy _remember_suspect_order
+                # handled with risk.record_broker_error + alert.
+                if result.order_id is None:
+                    msg = (
+                        f"{decision.symbol}: place_order returned "
+                        f"UNKNOWN with no order_id — broker submit "
+                        f"path failed before id assignment; substrate "
+                        f"row will sit at pending until manual "
+                        f"investigation"
+                    )
+                    logger.error(msg)
+                    self.risk.record_broker_error()
+                    self.alerts.broker_error(msg)
                 if strategy_statuses is not None:
                     strategy_statuses[symbol] = "Pending Entry"
                 if strategy_reasons is not None:
@@ -1837,133 +1884,292 @@ class TradingEngine:
                 strategy_reasons.get(symbol, [])
             )
 
-    def _remember_suspect_order(
+    def _apply_recovered_entry_side_effects(
         self,
-        decision: RiskDecision,
-        result: OrderResult,
         *,
-        modeled_price: float,
-        modeled_price_kind: str = "unavailable",
+        snapshot: BrokerSnapshot,
+        position: Position,
+        decision: RiskDecision,
+        fill_price: float,
+        fill_qty: float,
+        reason_suffix: str = "(recovered)",
     ) -> None:
-        """
-        Persist a narrow recovery handle for submit-succeeded/confirm-failed
-        entries. Recovery is tied to the exact order_id returned by Alpaca.
+        """Fire the engine-side side effects that happen when a
+        bot-submitted entry is adopted on the recovery path.
 
-        ``modeled_price_kind`` preserves the slippage-benchmark provenance
-        captured at submission ('arrival_midpoint' or
-        'fallback_latest_close') so the recovered row gets the same
-        kind/quality tagging the live row would have written. Defect 2
-        of the first-pass review fix.
+        Extracted from the body of _recover_suspect_orders so two
+        callers can share it:
+
+          - Legacy suspect-cache path (this commit): when
+            _recover_suspect_orders confirms a UNKNOWN-then-FILLED
+            entry against the broker.
+          - Substrate-driven path (next commit): when the substrate
+            observes a fill on an entry_primary row whose engine
+            ownership hasn't been bound yet (recovery via stream /
+            cycle / startup reconcile rather than via the cache).
+
+        Side effects:
+          1. Register strategy ownership of the symbol so signals
+             can act on it.
+          2. Cache the entry price for the HWM drawdown gate.
+          3. Submit a protective stop if the broker doesn't already
+             have one attached (recovered entries lose their
+             original stop_loss leg when confirmation fails before
+             OTO completion).
+          4. Fire the trade_executed alert.
+
+        Trade-log writes (_record_fill / _log_entry) are NOT in
+        this helper — they're called inline by each caller because
+        the substrate's apply_order_event UPSERT consolidates with
+        TradeLogger.log on the same order_id, and the two paths
+        capture provenance differently. Keeping that distinction
+        explicit at the call site.
+
+        Idempotent on items 1-2-3: register/cache/stop check
+        already-present state and no-op if so. NOT idempotent on
+        item 4 (alert) — callers must de-dup at their own layer
+        (the suspect path pops the cache; the substrate path uses
+        _has_position).
         """
-        if result.order_id is None:
-            msg = (
-                f"{decision.symbol}: confirmation failed but no order_id was "
-                "returned; cannot stage suspect-order recovery"
-            )
-            logger.error(msg)
-            self.risk.record_broker_error()
-            self.alerts.broker_error(msg)
+        symbol = decision.symbol
+        self._register_single_leg(
+            strategy_name=decision.strategy_name, symbol=symbol,
+        )
+        self._entry_prices[symbol] = fill_price
+        self._ensure_recovered_protective_stop(
+            snapshot=snapshot, position=position, decision=decision,
+        )
+        self.alerts.trade_executed(
+            symbol=symbol,
+            strategy=decision.strategy_name,
+            side="buy",
+            qty=fill_qty,
+            price=fill_price,
+            reason=f"{decision.reason} {reason_suffix}".strip(),
+        )
+
+    def _maybe_dispatch_substrate_entry_fill(
+        self,
+        *,
+        event: "Any",
+        snapshot: "BrokerSnapshot | None",
+    ) -> None:
+        """P-6 commit B: fire the engine-side recovery side effects
+        when the substrate observes an entry_primary fill that the
+        synchronous place_order path didn't already handle.
+
+        Called from _drain_lifecycle_events (stream) and
+        _reconcile_substrate_via_rest (cycle / startup) after each
+        successful apply_order_event. De-dup guard: if
+        _has_position(symbol) is already true, the synchronous
+        path bound ownership at submit time and the side effects
+        already fired — skip.
+
+        Concretely this replaces the cache-driven path the legacy
+        _suspect_orders cache provides: on the rare submit-succeeds-
+        but-confirm-fails scenario, the cache used to hold the
+        decision metadata and fire the side effects on the next
+        cycle's broker reconciliation. The substrate now observes
+        the fill via stream / cycle / startup reconcile and this
+        dispatch fires the same side effects from the same
+        helper (_apply_recovered_entry_side_effects).
+
+        Best-effort: any failure is logged at CRITICAL and absorbed
+        so a bad dispatch can't stall the cycle. The substrate has
+        already recorded the fill; the engine just hasn't bound
+        ownership.
+        """
+        if event.status != "filled":
             return
-
-        self._suspect_orders[decision.symbol] = SuspectOrder(
-            decision=decision,
-            order_id=result.order_id,
-            modeled_price=modeled_price,
-            modeled_price_kind=modeled_price_kind,
-        )
-        logger.warning(
-            f"{decision.symbol}: staged suspect order recovery for "
-            f"{result.order_id} [{decision.strategy_name}]"
-        )
-
-    def _recover_suspect_orders(self, snapshot: BrokerSnapshot) -> None:
-        """Recover only exact bot-submitted orders that lost confirmation."""
-        for symbol, suspect in list(self._suspect_orders.items()):
-            try:
-                result = self.broker.reconcile_submitted_order(
-                    order_id=suspect.order_id,
-                    symbol=symbol,
-                    requested_qty=suspect.decision.qty,
-                )
-            except Exception as e:
-                logger.warning(
-                    f"{symbol}: suspect order {suspect.order_id} reconciliation "
-                    f"failed: {e}"
-                )
-                continue
-
-            if result.status in {OrderStatus.PENDING, OrderStatus.ACCEPTED}:
-                logger.warning(
-                    f"{symbol}: suspect order {suspect.order_id} still "
-                    f"{result.status.value}; waiting for next cycle"
-                )
-                continue
-
-            if result.status in {OrderStatus.CANCELED, OrderStatus.REJECTED, OrderStatus.TIMEOUT}:
-                logger.warning(
-                    f"{symbol}: suspect order {suspect.order_id} resolved as "
-                    f"{result.status.value}; dropping recovery state"
-                )
-                self._suspect_orders.pop(symbol, None)
-                continue
-
-            position = snapshot.account.open_positions.get(symbol)
-            if result.status in {OrderStatus.FILLED, OrderStatus.PARTIAL} and position is not None:
-                fill_price = result.avg_fill_price or suspect.decision.entry_reference_price
-                fill_qty = float(result.filled_qty or position.qty or suspect.decision.qty)
-                self._record_fill(
-                    result,
-                    modeled_price=suspect.modeled_price,
-                    order_type=suspect.decision.order_type.value,
-                    side=suspect.decision.side.value,
-                )
-                # Slippage unification (Phase 1) codepath §9 — the
-                # suspect-order recovery state preserves the original
-                # benchmark kind (arrival_midpoint vs fallback_latest_close
-                # vs unavailable) so the recovered row tags the same kind
-                # the live row would have written. Quality is forced to
-                # 'recovered' so downstream consumers can isolate
-                # reconstructed rows. Defect 2 fix.
-                self._log_entry(
-                    suspect.decision,
-                    result,
-                    suspect.modeled_price,
-                    timestamp_override=result.filled_at or result.submitted_at,
-                    benchmark_kind=suspect.modeled_price_kind,
-                    measurement_quality="recovered",
-                )
-                self._register_single_leg(
-                    strategy_name=suspect.decision.strategy_name,
-                    symbol=symbol,
-                )
-                self._entry_prices[symbol] = fill_price
-                self._ensure_recovered_protective_stop(
-                    snapshot=snapshot,
-                    position=position,
-                    decision=suspect.decision,
-                )
-                self.alerts.trade_executed(
-                    symbol=symbol,
-                    strategy=suspect.decision.strategy_name,
-                    side="buy",
-                    qty=fill_qty,
-                    price=fill_price,
-                    reason=f"{suspect.decision.reason} (recovered)",
-                )
-                logger.warning(
-                    f"{symbol}: recovered filled suspect order "
-                    f"{suspect.order_id}; adopted position for "
-                    f"'{suspect.decision.strategy_name}'"
-                )
-                self._suspect_orders.pop(symbol, None)
-                continue
-
-            logger.warning(
-                f"{symbol}: suspect order {suspect.order_id} resolved as "
-                f"{result.status.value} but no broker position was present; "
-                "dropping recovery state without adopting"
+        if float(event.filled_qty or 0.0) <= 0:
+            return
+        if event.avg_fill_price is None:
+            return
+        if self.lifecycle_orders_store is None or self.lifecycle_store is None:
+            return
+        try:
+            order_row = self.lifecycle_orders_store.get_by_order_id(
+                event.order_id,
             )
-            self._suspect_orders.pop(symbol, None)
+            if order_row is None or order_row.role != "entry_primary":
+                return
+            pos_row = self.lifecycle_store.get_by_position_uid(
+                order_row.position_uid,
+            )
+            if pos_row is None:
+                return
+            symbol = pos_row.symbol
+            if self._has_position(symbol):
+                # Synchronous path bound ownership; side effects
+                # already fired. Substrate is the parallel observer.
+                return
+            if snapshot is None:
+                logger.warning(
+                    f"substrate entry-fill dispatch: skipped for "
+                    f"order_id={event.order_id} symbol={symbol} — "
+                    f"no snapshot available (cycle drains may run "
+                    f"without one in some code paths)"
+                )
+                return
+            position = snapshot.account.open_positions.get(symbol)
+            if position is None:
+                logger.warning(
+                    f"substrate entry-fill dispatch: skipped for "
+                    f"order_id={event.order_id} symbol={symbol} — "
+                    f"broker reports no open position; nothing to "
+                    f"bind ownership against"
+                )
+                return
+            from risk.manager import RiskDecision, Side
+            decision = RiskDecision(
+                symbol=symbol,
+                side=Side.BUY,
+                qty=float(order_row.intended_qty),
+                entry_reference_price=float(event.avg_fill_price),
+                stop_price=float(order_row.intended_stop_price or 0.0),
+                strategy_name=pos_row.strategy,
+                reason="substrate dispatch",
+                order_type=OrderType(order_row.order_type),
+            )
+            self._apply_recovered_entry_side_effects(
+                snapshot=snapshot,
+                position=position,
+                decision=decision,
+                fill_price=float(event.avg_fill_price),
+                fill_qty=float(event.filled_qty),
+                reason_suffix="(substrate)",
+            )
+            logger.warning(
+                f"substrate entry-fill dispatch: bound ownership "
+                f"for {symbol} ({pos_row.strategy}) via order_id="
+                f"{event.order_id}"
+            )
+        except Exception as exc:
+            logger.critical(
+                f"substrate entry-fill dispatch FAILED for "
+                f"order_id={event.order_id}: "
+                f"{type(exc).__name__}: {exc}. Substrate row "
+                f"already recorded the fill; engine ownership not "
+                f"bound. Next restart will recover from trades DB."
+            )
+
+    def _maybe_dispatch_substrate_exit_fill(
+        self,
+        *,
+        event: "Any",
+        snapshot: "BrokerSnapshot | None",
+    ) -> None:
+        """P-7 commit A: fire the engine-side recovery side effects
+        when the substrate observes an exit-role fill that the
+        synchronous close path didn't already handle.
+
+        Mirrors _maybe_dispatch_substrate_entry_fill but for the
+        close path: when an exit row reaches filled, write the
+        trade row via _record_recovered_exit_fill (with
+        skip_trades_dedup_check=True since apply_order_event
+        already UPSERTed) and clear engine ownership state
+        (_pop_position, _entry_prices, _external_close_suspects).
+
+        De-dup guards (in order):
+          1. event.status == 'filled'
+          2. event.filled_qty > 0
+          3. event.avg_fill_price is not None
+          4. substrate row exists with role='exit'
+          5. position_lifecycle row exists for the position_uid
+          6. _has_position(symbol) — engine still owns the symbol.
+             This is the PRIMARY idempotency signal (PR #61 round-1
+             fix P1): after the first dispatch fires, _pop_position
+             clears ownership; subsequent observations skip here.
+
+        Safe to fire multiple times across stream / cycle / startup
+        observations of the same fill.
+
+        Best-effort: any failure logs CRITICAL and absorbs. The
+        substrate already recorded the fill at the substrate
+        level; the engine-side cleanup not happening means the
+        position stays "owned" in the engine's view until the
+        next restart, when _restore_ownership_from_db picks up
+        the truth from the trade log (which the substrate
+        UPSERT also wrote).
+        """
+        if event.status != "filled":
+            return
+        if float(event.filled_qty or 0.0) <= 0:
+            return
+        if event.avg_fill_price is None:
+            return
+        if self.lifecycle_orders_store is None or self.lifecycle_store is None:
+            return
+        try:
+            order_row = self.lifecycle_orders_store.get_by_order_id(
+                event.order_id,
+            )
+            if order_row is None or order_row.role != "exit":
+                return
+            pos_row = self.lifecycle_store.get_by_position_uid(
+                order_row.position_uid,
+            )
+            if pos_row is None:
+                return
+            symbol = pos_row.symbol
+            owner = pos_row.strategy
+            # PR #61 round-1 fix P1: dedup via ownership, NOT via
+            # has_recorded_order_id. apply_order_event has already
+            # UPSERTed the trade row by the time we get here, so
+            # the legacy "is this order_id in trades?" check would
+            # always short-circuit. We instead gate on
+            # _has_position: if the engine doesn't own the
+            # symbol, the dispatch either already fired (and
+            # popped ownership) or this is a phantom event for a
+            # position never bound — skip.
+            if not self._has_position(symbol):
+                return
+            # Build a synthetic exit_fill object matching the
+            # OrderResult shape _record_recovered_exit_fill expects.
+            exit_fill = OrderResult(
+                status=OrderStatus.FILLED,
+                order_id=event.order_id,
+                symbol=symbol,
+                requested_qty=float(order_row.intended_qty),
+                filled_qty=float(event.filled_qty),
+                avg_fill_price=float(event.avg_fill_price),
+                raw_status="filled",
+                message="substrate exit-fill dispatch",
+            )
+            wrote = self._record_recovered_exit_fill(
+                symbol=symbol,
+                owner=owner,
+                exit_fill=exit_fill,
+                modeled_price=float(
+                    order_row.slippage_benchmark_price or 0.0
+                ),
+                benchmark_kind=(
+                    order_row.slippage_benchmark_kind or "unavailable"
+                ),
+                alert_reason="substrate exit dispatch",
+                # Substrate already wrote the trade row via
+                # apply_order_event's UPSERT — bypass the legacy
+                # dedup check so P&L / alert / cleanup actually fire.
+                skip_trades_dedup_check=True,
+            )
+            if wrote:
+                self._pop_position(symbol)
+                self._entry_prices.pop(symbol, None)
+                self._external_close_suspects.pop(symbol, None)
+                logger.warning(
+                    f"substrate exit-fill dispatch: cleared "
+                    f"ownership for {symbol} ({owner}) via "
+                    f"order_id={event.order_id}"
+                )
+        except Exception as exc:
+            logger.critical(
+                f"substrate exit-fill dispatch FAILED for "
+                f"order_id={event.order_id}: "
+                f"{type(exc).__name__}: {exc}. Substrate row "
+                f"already recorded the fill; engine state not "
+                f"updated. Next restart will recover from trades "
+                f"DB."
+            )
 
     def _ensure_recovered_protective_stop(
         self,
@@ -1977,6 +2183,21 @@ class TradingEngine:
         existing = self._protective_stop_order(symbol, snapshot)
         if existing is not None:
             if str(existing.time_in_force or "").lower() == "day":
+                # P-5: look up position_uid for the replacement_stop
+                # substrate row.
+                _promote_uid: str | None = None
+                if self.lifecycle_store is not None:
+                    try:
+                        _row = self.lifecycle_store.get_open_for_owner_key(
+                            owner_key_for(symbol),
+                        )
+                        if _row is not None:
+                            _promote_uid = _row.position_uid
+                    except Exception as exc:
+                        logger.debug(
+                            f"promote-stop position_uid lookup raised "
+                            f"{type(exc).__name__}: {exc} — proceeding"
+                        )
                 promoted = self.broker.promote_equity_stop_to_gtc(
                     parent_order_id=None,
                     stop_order_id=existing.order_id,
@@ -1985,6 +2206,7 @@ class TradingEngine:
                     client_order_id_prefix=(
                         f"{decision.strategy_name}-recover-stop-gtc"
                     ),
+                    position_uid=_promote_uid,
                 )
                 snapshot.open_orders.remove(existing)
                 snapshot.open_orders.append(promoted)
@@ -1999,11 +2221,27 @@ class TradingEngine:
             )
             return
 
+        # P-4: look up position_uid for the substrate write.
+        _recover_uid: str | None = None
+        if self.lifecycle_store is not None:
+            try:
+                _row = self.lifecycle_store.get_open_for_owner_key(
+                    owner_key_for(symbol),
+                )
+                if _row is not None:
+                    _recover_uid = _row.position_uid
+            except Exception as exc:
+                logger.debug(
+                    f"recover-stop position_uid lookup raised "
+                    f"{type(exc).__name__}: {exc} — proceeding without "
+                    f"substrate row"
+                )
         repaired = self.broker.place_protective_stop(
             symbol=symbol,
             qty=stop_qty,
             stop_price=decision.stop_price,
             client_order_id_prefix=f"{decision.strategy_name}-recover-stop",
+            position_uid=_recover_uid,
         )
         snapshot.open_orders.append(repaired)
         logger.warning(
@@ -2011,55 +2249,8 @@ class TradingEngine:
             f"order recovery at ${decision.stop_price:.2f}"
         )
 
-    def _recover_suspect_exit_orders(self, snapshot: BrokerSnapshot) -> None:
-        """Reconcile exact close orders whose post-submit confirmation failed."""
-        for symbol, suspect in list(self._suspect_exit_orders.items()):
-            try:
-                result = self.broker.reconcile_submitted_order(
-                    order_id=suspect.order_id,
-                    symbol=suspect.symbol,
-                    requested_qty=suspect.requested_qty,
-                )
-            except Exception as exc:
-                logger.warning(
-                    f"{symbol}: suspect exit {suspect.order_id} reconciliation "
-                    f"failed: {exc}"
-                )
-                continue
-
-            if result.status in {OrderStatus.PENDING, OrderStatus.ACCEPTED}:
-                logger.warning(
-                    f"{symbol}: suspect exit {suspect.order_id} still "
-                    f"{result.status.value}; waiting for next cycle"
-                )
-                continue
-            if result.status in {
-                OrderStatus.CANCELED,
-                OrderStatus.REJECTED,
-                OrderStatus.TIMEOUT,
-            }:
-                logger.warning(
-                    f"{symbol}: suspect exit {suspect.order_id} resolved as "
-                    f"{result.status.value}; dropping recovery state"
-                )
-                self._suspect_exit_orders.pop(symbol, None)
-                continue
-            if result.status not in {OrderStatus.FILLED, OrderStatus.PARTIAL}:
-                continue
-
-            self._record_recovered_exit_fill(
-                symbol=symbol,
-                owner=suspect.owner,
-                exit_fill=result,
-                modeled_price=suspect.modeled_price,
-                benchmark_kind=suspect.benchmark_kind,
-                alert_reason=f"{suspect.alert_reason} (recovered)",
-            )
-            self._suspect_exit_orders.pop(symbol, None)
-            if result.status is OrderStatus.FILLED:
-                self._pop_position(symbol)
-                self._entry_prices.pop(symbol, None)
-                self._external_close_suspects.pop(symbol, None)
+    # P-7: _recover_suspect_exit_orders removed. Substrate exit row
+    # → _maybe_dispatch_substrate_exit_fill replaces this path.
 
     # ── Post-fill bookkeeping ────────────────────────────────────────────
 
@@ -2232,10 +2423,33 @@ class TradingEngine:
         alert_reason: str = "broker-history exit recovery",
         is_full_close: bool | None = None,
         external: bool = False,
+        skip_trades_dedup_check: bool = False,
     ) -> bool:
-        """Persist one broker-confirmed non-stop exit exactly once."""
+        """Persist one broker-confirmed non-stop exit exactly once.
+
+        ``skip_trades_dedup_check`` (PR #61 round-1 review fix P1):
+        the substrate-driven exit dispatch calls this AFTER
+        apply_order_event has already UPSERTed the trade row, so
+        has_recorded_order_id returns True and the legacy dedup
+        gate would short-circuit before firing P&L / alert /
+        ownership cleanup. Substrate callers pass True; their
+        idempotency comes from the dispatch's _has_position gate
+        (the engine pops ownership at the end of this helper, so
+        subsequent substrate observations see no position and
+        skip the dispatch).
+
+        Legacy callers (broker-history exit recovery, external-
+        close confirmation) keep the default False — they predate
+        the substrate write and need the has_recorded_order_id
+        check to avoid double-writing.
+        """
         order_id = getattr(exit_fill, "order_id", None)
-        if not order_id or self.trade_logger.has_recorded_order_id(order_id):
+        if not order_id:
+            return False
+        if (
+            not skip_trades_dedup_check
+            and self.trade_logger.has_recorded_order_id(order_id)
+        ):
             return False
         price = getattr(exit_fill, "avg_fill_price", None)
         qty = float(getattr(exit_fill, "filled_qty", 0.0) or 0.0)
@@ -2863,7 +3077,26 @@ class TradingEngine:
             f"{symbol}: auto-closing residual fractional position qty={position.qty} "
             "because it cannot carry a whole-share protective stop"
         )
-        result = self.broker.close_position(position.symbol)
+        # P-6: thread position_uid through so the broker writes an
+        # exit substrate row alongside the close. Lookup is best-
+        # effort; failure logs DEBUG and we proceed without the
+        # substrate write (matches the protective_stop pattern).
+        _exit_uid: str | None = None
+        if self.lifecycle_store is not None:
+            try:
+                _row = self.lifecycle_store.get_open_for_owner_key(
+                    owner_key_for(position.symbol),
+                )
+                if _row is not None:
+                    _exit_uid = _row.position_uid
+            except Exception as exc:
+                logger.debug(
+                    f"residual-close position_uid lookup raised "
+                    f"{type(exc).__name__}: {exc} — proceeding"
+                )
+        result = self.broker.close_position(
+            position.symbol, position_uid=_exit_uid,
+        )
         close_price = float(
             result.avg_fill_price
             or getattr(position, "current_price", 0.0)
@@ -3631,6 +3864,21 @@ class TradingEngine:
                         )
                     continue
                 failure_key = (symbol, existing.order_id)
+                # P-5: look up position_uid for the replacement_stop
+                # substrate row.
+                _promote_uid: str | None = None
+                if self.lifecycle_store is not None:
+                    try:
+                        _row = self.lifecycle_store.get_open_for_owner_key(
+                            owner_key_for(symbol),
+                        )
+                        if _row is not None:
+                            _promote_uid = _row.position_uid
+                    except Exception as exc:
+                        logger.debug(
+                            f"repair-promote position_uid lookup raised "
+                            f"{type(exc).__name__}: {exc} — proceeding"
+                        )
                 try:
                     promoted = self.broker.promote_equity_stop_to_gtc(
                         parent_order_id=None,
@@ -3638,6 +3886,7 @@ class TradingEngine:
                         qty=stop_qty,
                         stop_price=float(existing.stop_price),
                         client_order_id_prefix=f"{owner}-repair-stop-gtc",
+                        position_uid=_promote_uid,
                     )
                     self._reported_stop_promotion_failures.discard(failure_key)
                     snapshot.open_orders.remove(existing)
@@ -3696,11 +3945,29 @@ class TradingEngine:
                 continue
 
             try:
+                # P-4: look up position_uid so the broker can record
+                # a protective_stop substrate row alongside the
+                # repair stop.
+                _repair_uid: str | None = None
+                if self.lifecycle_store is not None:
+                    try:
+                        _row = self.lifecycle_store.get_open_for_owner_key(
+                            owner_key_for(symbol),
+                        )
+                        if _row is not None:
+                            _repair_uid = _row.position_uid
+                    except Exception as exc:
+                        logger.debug(
+                            f"repair stop position_uid lookup raised "
+                            f"{type(exc).__name__}: {exc} — proceeding "
+                            f"without substrate row"
+                        )
                 repaired = self.broker.place_protective_stop(
                     symbol=symbol,
                     qty=stop_qty,
                     stop_price=stop_price,
                     client_order_id_prefix=f"{owner}-repair-stop",
+                    position_uid=_repair_uid,
                 )
                 logger.warning(
                     f"{symbol}: restored missing protective stop at "
@@ -4300,12 +4567,309 @@ class TradingEngine:
                     submitted_at=submitted_at,
                 )
             except Exception as exc:
+                # PR #61 round-2 fix P2-2 honesty: the cycle and
+                # startup reconcilers query `order_id IS NOT NULL`
+                # only, so they do NOT pick up rows whose attach
+                # failed (order_id still NULL). The lifecycle-
+                # attach queue itself is in-memory and lost on bot
+                # restart. This row is ORPHANED until a NULL-order_id
+                # recovery path lands (tracker: 'Known follow-ups').
+                # The broker order is live; operator must inspect.
                 logger.critical(
                     f"queued lifecycle_orders.attach FAILED for "
-                    f"{client_order_id} → {order_id}: {exc}. Cycle "
-                    f"reconciliation (commit later) will retry via "
-                    f"client_order_id lookup."
+                    f"{client_order_id} → {order_id}: {exc}. "
+                    f"SUBSTRATE ROW ORPHANED — order_id NULL means "
+                    f"REST reconcilers skip it. Inspect manually."
                 )
+
+    def _drain_lifecycle_events(
+        self, snapshot: "BrokerSnapshot | None" = None,
+    ) -> None:
+        """P-1: apply OrderEvents enqueued by the WS thread.
+
+        StreamManager translates each material Alpaca trade_update
+        into an ``engine.lifecycle_orders.OrderEvent`` on the
+        WebSocket thread and enqueues it on
+        ``_pending_lifecycle_events``. This drain runs on the cycle
+        thread (the connection-owning thread) and applies each via
+        ``apply_order_event`` so the substrate state machine
+        advances pending → working → partially_filled → filled /
+        canceled / rejected.
+
+        Outcomes:
+          - ``applied=True``: substrate advanced; debug-log.
+          - ``applied=False, reason='unknown_order'``: the broker
+            event was for an order with no substrate row (legacy
+            orders submitted before P-4..P-6 shipped, or orders
+            created by a path that doesn't insert substrate rows).
+            Debug-log; the legacy paths still own these.
+          - ``applied=False, reason='stale_or_duplicate'``: the
+            event was older than the row's last_observed_broker
+            _updated_at, or the row was already in a terminal
+            state. Normal — debug-log.
+          - Any exception: CRITICAL log + continue. One bad event
+            cannot stall the cycle.
+
+        After P-6/P-7 the suspect caches are gone. The remaining
+        legacy stream-driven trade-logging paths
+        (``_process_stream_stop_fills`` for protective-stop fills,
+        ``_detect_external_closes`` for unexpected broker closes)
+        continue to run alongside this drain; their writes
+        converge with the substrate UPSERT per the trades-
+        UPSERT preservation policy (foundation commits 8 / 11 / 14).
+        """
+        if self.lifecycle_orders_store is None or self._stream_manager is None:
+            return
+        from engine.lifecycle_orders import apply_order_event
+
+        events = self._stream_manager.drain_lifecycle_events()
+        for event in events:
+            try:
+                outcome = apply_order_event(
+                    self.lifecycle_orders_store._conn,
+                    event,
+                    reason="stream",
+                )
+            except Exception as exc:
+                logger.critical(
+                    f"apply_order_event raised for order_id="
+                    f"{event.order_id} status={event.status}: "
+                    f"{type(exc).__name__}: {exc}. Cycle continues; "
+                    f"investigate substrate health."
+                )
+                continue
+            if outcome.applied:
+                logger.debug(
+                    f"substrate advanced: order_id={event.order_id} "
+                    f"→ status={event.status} "
+                    f"(position {outcome.new_status})"
+                )
+                self._maybe_dispatch_substrate_entry_fill(
+                    event=event, snapshot=snapshot,
+                )
+                self._maybe_dispatch_substrate_exit_fill(
+                    event=event, snapshot=snapshot,
+                )
+            elif outcome.reason in {"unknown_order", "stale_or_duplicate"}:
+                logger.debug(
+                    f"substrate skipped event for order_id="
+                    f"{event.order_id} status={event.status}: "
+                    f"{outcome.reason}"
+                )
+            else:
+                logger.info(
+                    f"substrate dropped event for order_id="
+                    f"{event.order_id} status={event.status}: "
+                    f"{outcome.reason}"
+                )
+
+    def _reconcile_substrate_cycle(self, snapshot: "BrokerSnapshot") -> None:
+        """P-2: cycle-time substrate reconciliation against broker state.
+
+        Defense-in-depth for events the WebSocket missed (reconnect
+        gaps, dropped frames, late-binding race conditions). Each
+        cycle, walk up to ``_SUBSTRATE_CYCLE_RECONCILE_LIMIT``
+        non-terminal substrate rows whose order_id is NOT in the
+        snapshot's open_orders and apply the truth via REST.
+
+        Rows whose order_id IS in snapshot.open_orders are skipped
+        — those are still active at the broker and the stream
+        owns their state transitions.
+        """
+        self._reconcile_substrate_via_rest(
+            snapshot,
+            reason="cycle",
+            limit=_SUBSTRATE_CYCLE_RECONCILE_LIMIT,
+        )
+
+    def _reconcile_substrate_startup(self, snapshot: "BrokerSnapshot") -> None:
+        """P-3: post-startup substrate reconciliation against broker state.
+
+        On restart, walk ALL non-terminal substrate rows whose
+        order_id is NOT in the broker's current open_orders. These
+        are orders that became terminal at the broker while the bot
+        was down — fill events, cancellations, expirations the
+        stream wasn't connected to receive.
+
+        No per-call limit: startup is a one-shot operation and the
+        backlog could be arbitrarily large after a long downtime.
+        Per-row failures log CRITICAL and continue; one bad row
+        cannot stall startup.
+        """
+        self._reconcile_substrate_via_rest(
+            snapshot, reason="startup", limit=None,
+        )
+
+    def _reconcile_substrate_via_rest(
+        self,
+        snapshot: "BrokerSnapshot",
+        *,
+        reason: str,
+        limit: int | None,
+    ) -> None:
+        """Shared implementation for P-2 (cycle) and P-3 (startup)
+        substrate-vs-broker reconciliation.
+
+        Algorithm:
+          1. Query substrate non-terminal rows with order_id NOT
+             NULL.
+          2. Build broker_open_by_id from snapshot.open_orders.
+          3. For each substrate row:
+               - If order_id IS in open_orders → stream owns it;
+                 skip.
+               - Else → fetch get_order_by_id via REST, translate
+                 to OrderEvent, apply.
+          4. Per-row failures log CRITICAL and continue.
+
+        ``reason`` flows through to apply_order_event so the
+        substrate's audit reflects whether each advance came from
+        cycle or startup reconciliation.
+        """
+        if self.lifecycle_orders_store is None:
+            return
+        try:
+            # PR #61 round-1 fix P2-1: query unbounded so the limit
+            # caps actual REST calls, not rows read. Round-1 reviewer
+            # noted that the old 'limit at query time' could let 20
+            # long-lived GTC stops fill every batch and permanently
+            # starve newer terminal rows of reconciliation.
+            rows = self.lifecycle_orders_store.get_non_terminal_with_order_id(
+                limit=None,
+            )
+        except Exception as exc:
+            logger.critical(
+                f"substrate {reason} reconcile: get_non_terminal "
+                f"query failed: {type(exc).__name__}: {exc}"
+            )
+            return
+        if not rows:
+            return
+        open_by_id = {
+            o.order_id: o for o in snapshot.open_orders
+            if getattr(o, "order_id", None)
+        }
+        from engine.lifecycle_orders import apply_order_event
+
+        rest_calls = 0
+        for row in rows:
+            oid = row.order_id
+            if oid is None:
+                continue
+            if oid in open_by_id:
+                # Still active at the broker; the stream owns it.
+                continue
+            # Enforce the REST-call cap on candidates that
+            # actually need a fetch, AFTER the open-orders filter.
+            if limit is not None and rest_calls >= limit:
+                logger.debug(
+                    f"substrate {reason} reconcile: hit REST cap "
+                    f"({limit}); remaining rows catch up next pass"
+                )
+                break
+            rest_calls += 1
+            # Order is non-terminal in substrate but absent from
+            # broker open orders → terminal at the broker. Fetch
+            # the truth.
+            try:
+                broker_order = self.broker._with_retry(
+                    lambda oid=oid: self.broker._api.get_order_by_id(oid),
+                    op_desc=f"substrate_reconcile_{reason}({oid})",
+                )
+            except Exception as exc:
+                logger.critical(
+                    f"substrate {reason} reconcile: get_order_by_id "
+                    f"failed for {oid}: {type(exc).__name__}: {exc}."
+                )
+                continue
+            event = self._build_substrate_event_from_broker_order(
+                broker_order, oid,
+            )
+            if event is None:
+                continue
+            try:
+                outcome = apply_order_event(
+                    self.lifecycle_orders_store._conn,
+                    event,
+                    reason=reason,
+                )
+            except Exception as exc:
+                logger.critical(
+                    f"substrate {reason} reconcile: apply_order_event "
+                    f"raised for {oid} status={event.status}: "
+                    f"{type(exc).__name__}: {exc}"
+                )
+                continue
+            if outcome.applied:
+                logger.info(
+                    f"substrate {reason} reconcile: order_id={oid} "
+                    f"advanced to status={event.status} "
+                    f"(position {outcome.new_status})"
+                )
+                self._maybe_dispatch_substrate_entry_fill(
+                    event=event, snapshot=snapshot,
+                )
+                self._maybe_dispatch_substrate_exit_fill(
+                    event=event, snapshot=snapshot,
+                )
+            else:
+                logger.debug(
+                    f"substrate {reason} reconcile: order_id={oid} "
+                    f"no-op ({outcome.reason})"
+                )
+
+    @staticmethod
+    def _build_substrate_event_from_broker_order(
+        broker_order, order_id: str,
+    ) -> "Any | None":
+        """Translate an Alpaca order (REST result) to an OrderEvent.
+        Mirrors stream._build_substrate_event but reads from the
+        REST order object's status / filled_qty / filled_avg_price /
+        updated_at, not from a trade_update payload."""
+        from engine.lifecycle_orders import OrderEvent
+
+        raw_status = getattr(broker_order, "status", None)
+        status_val = (
+            raw_status.value if hasattr(raw_status, "value")
+            else str(raw_status) if raw_status is not None else None
+        )
+        if status_val is None:
+            return None
+        substrate_status = _ALPACA_STATUS_TO_SUBSTRATE_STATUS.get(status_val)
+        if substrate_status is None:
+            return None
+
+        raw_filled = getattr(broker_order, "filled_qty", None)
+        try:
+            filled_qty = float(raw_filled) if raw_filled is not None else 0.0
+        except (TypeError, ValueError):
+            filled_qty = 0.0
+
+        raw_avg = getattr(broker_order, "filled_avg_price", None)
+        try:
+            avg_fill_price = (
+                float(raw_avg) if raw_avg is not None else None
+            )
+        except (TypeError, ValueError):
+            avg_fill_price = None
+
+        updated_at_raw = (
+            getattr(broker_order, "updated_at", None)
+            or getattr(broker_order, "filled_at", None)
+            or getattr(broker_order, "submitted_at", None)
+        )
+        if updated_at_raw is None:
+            updated_at = datetime.now(timezone.utc).isoformat()
+        else:
+            updated_at = str(updated_at_raw)
+
+        return OrderEvent(
+            order_id=order_id,
+            status=substrate_status,
+            filled_qty=filled_qty,
+            avg_fill_price=avg_fill_price,
+            broker_updated_at=updated_at,
+            execution_id=None,
+        )
 
     def _drain_option_fills(self) -> None:
         """
@@ -4494,8 +5058,24 @@ class TradingEngine:
             logger.info(f"{symbol}: close requested but a close order is already pending — skipping")
             return False
 
+        # P-6: thread position_uid for the exit substrate row.
+        _exit_uid: str | None = None
+        if self.lifecycle_store is not None:
+            try:
+                _row = self.lifecycle_store.get_open_for_owner_key(
+                    owner_key_for(position.symbol),
+                )
+                if _row is not None:
+                    _exit_uid = _row.position_uid
+            except Exception as exc:
+                logger.debug(
+                    f"{symbol}: exit position_uid lookup raised "
+                    f"{type(exc).__name__}: {exc} — proceeding"
+                )
         try:
-            result = self.broker.close_position(position.symbol)
+            result = self.broker.close_position(
+                position.symbol, position_uid=_exit_uid,
+            )
         except Exception as e:
             logger.error(f"{symbol}: close_position failed: {e}")
             self.risk.record_broker_error()
@@ -4534,22 +5114,14 @@ class TradingEngine:
             measurement_quality=close_measurement_quality,
         )
         if result.status not in {OrderStatus.FILLED, OrderStatus.PARTIAL}:
-            if result.status is OrderStatus.UNKNOWN and result.order_id:
-                self._suspect_exit_orders[symbol] = SuspectExitOrder(
-                    order_id=result.order_id,
-                    symbol=position.symbol,
-                    owner=strategy.name,
-                    requested_qty=float(
-                        result.requested_qty or getattr(position, "qty", 0.0) or 0.0
-                    ),
-                    modeled_price=close_modeled,
-                    benchmark_kind=close_benchmark_kind,
-                    alert_reason=alert_reason,
-                )
-                logger.warning(
-                    f"{symbol}: staged suspect exit recovery for "
-                    f"{result.order_id} [{strategy.name}]"
-                )
+            # P-7: _suspect_exit_orders staging removed. The substrate
+            # exit row (P-6e: close_position writes role='exit' at
+            # submit time) is already in place. When the close
+            # eventually resolves at the broker, the substrate capture
+            # pipeline (P-1 stream / P-2 cycle reconcile / P-3 startup
+            # reconcile) advances the row and
+            # _maybe_dispatch_substrate_exit_fill fires
+            # _record_recovered_exit_fill + ownership cleanup.
             logger.warning(
                 f"[{strategy.name}] {symbol}: close did not fill "
                 f"(status={result.status.value}); ownership retained for retry"

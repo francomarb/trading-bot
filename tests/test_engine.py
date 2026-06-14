@@ -518,7 +518,7 @@ class TestProcessSymbol:
         snap = _snapshot(positions=positions)
         engine._session_start_equity = snap.account.equity
         self._process(engine, "AAPL", snap)
-        broker.close_position.assert_called_once_with("AAPL")
+        broker.close_position.assert_called_once_with("AAPL", position_uid=None)
         broker.place_order.assert_not_called()
 
     def test_global_halt_does_not_block_exit(self, engine_factory):
@@ -531,7 +531,7 @@ class TestProcessSymbol:
 
         self._process(engine, "AAPL", snap)
 
-        broker.close_position.assert_called_once_with("AAPL")
+        broker.close_position.assert_called_once_with("AAPL", position_uid=None)
         broker.place_order.assert_not_called()
 
     def test_exit_signal_with_no_position_does_nothing(self, engine_factory):
@@ -585,7 +585,7 @@ class TestProcessSymbol:
 
         assert strategy.inspect_calls == 1
         assert strategy.raw_calls == 0
-        broker.close_position.assert_called_once_with(occ)
+        broker.close_position.assert_called_once_with(occ, position_uid=None)
         broker.place_order.assert_not_called()
         assert not engine._has_position("SPY")
         assert "SPY" not in engine._entry_prices
@@ -611,7 +611,7 @@ class TestProcessSymbol:
 
         self._process(engine, "AAPL", snap)
 
-        broker.close_position.assert_called_once_with("AAPL")
+        broker.close_position.assert_called_once_with("AAPL", position_uid=None)
 
     def test_processed_bar_signal_exit_respects_position_owner(
         self, engine_factory, patch_fetch
@@ -658,7 +658,7 @@ class TestProcessSymbol:
 
         self._process(engine, "AAPL", snap)
 
-        broker.close_position.assert_called_once_with("AAPL")
+        broker.close_position.assert_called_once_with("AAPL", position_uid=None)
         assert engine._has_position("AAPL")
         assert engine._entry_prices["AAPL"] == 100.0
 
@@ -697,7 +697,7 @@ class TestProcessSymbol:
 
         self._process(engine, "AAPL", snap)
 
-        broker.close_position.assert_called_once_with("AAPL")
+        broker.close_position.assert_called_once_with("AAPL", position_uid=None)
 
     def test_option_trade_rejected_logs_warning_and_skips_order(
         self, engine_factory, monkeypatch
@@ -1499,7 +1499,7 @@ class TestPositionOwnership:
 
         slot = engine.slots[0]
         engine._process_symbol("AAPL", snap, snap.account, slot.strategy, slot.timeframe)
-        broker.close_position.assert_called_once_with("AAPL")
+        broker.close_position.assert_called_once_with("AAPL", position_uid=None)
         # Ownership cleared after close.
         assert not engine._has_position("AAPL")
 
@@ -1513,7 +1513,7 @@ class TestPositionOwnership:
         # No ownership recorded — should still allow close.
         slot = engine.slots[0]
         engine._process_symbol("AAPL", snap, snap.account, slot.strategy, slot.timeframe)
-        broker.close_position.assert_called_once_with("AAPL")
+        broker.close_position.assert_called_once_with("AAPL", position_uid=None)
 
     def test_entry_registers_ownership(self, engine_factory):
         """A successful entry fill records the strategy as position owner."""
@@ -1941,12 +1941,16 @@ class TestWatchlistStatuses:
 
         engine.start(max_cycles=1)
 
-        broker.place_protective_stop.assert_called_once_with(
-            symbol="AAPL",
-            qty=10,
-            stop_price=95.0,
-            client_order_id_prefix="fake_strategy-repair-stop",
-        )
+        # P-4: lookup happens before the call; the fixture has a
+        # position_lifecycle row for AAPL so position_uid resolves
+        # to whatever new_position_uid() generated.
+        broker.place_protective_stop.assert_called_once()
+        kwargs = broker.place_protective_stop.call_args.kwargs
+        assert kwargs["symbol"] == "AAPL"
+        assert kwargs["qty"] == 10
+        assert kwargs["stop_price"] == 95.0
+        assert kwargs["client_order_id_prefix"] == "fake_strategy-repair-stop"
+        assert kwargs["position_uid"].startswith("pos_")
 
     def test_cycle_repairs_missing_protective_stop_after_gtc_absent(
         self, engine_factory, tmp_path
@@ -2006,13 +2010,21 @@ class TestWatchlistStatuses:
 
         engine._repair_missing_protective_stops(snapshot)
 
-        broker.promote_equity_stop_to_gtc.assert_called_once_with(
-            parent_order_id=None,
-            stop_order_id="day-stop",
-            qty=10,
-            stop_price=95.0,
-            client_order_id_prefix="fake_strategy-repair-stop-gtc",
+        # P-5: position_uid kwarg is now part of the contract.
+        # This test fixture doesn't seed a lifecycle row for the
+        # recovered position, so the engine's lookup returns None
+        # — the substrate write is skipped, but the broker call
+        # still goes out with the correct stop semantics.
+        broker.promote_equity_stop_to_gtc.assert_called_once()
+        kwargs = broker.promote_equity_stop_to_gtc.call_args.kwargs
+        assert kwargs["parent_order_id"] is None
+        assert kwargs["stop_order_id"] == "day-stop"
+        assert kwargs["qty"] == 10
+        assert kwargs["stop_price"] == 95.0
+        assert kwargs["client_order_id_prefix"] == (
+            "fake_strategy-repair-stop-gtc"
         )
+        assert "position_uid" in kwargs
         assert snapshot.open_orders == [promoted]
         broker.place_protective_stop.assert_not_called()
 
@@ -2090,104 +2102,15 @@ class TestWatchlistStatuses:
             position=snapshot.account.open_positions["AAPL"],
         )
 
-    def test_suspect_order_recovery_adopts_position_and_restores_stop(
-        self, engine_factory
-    ):
-        startup = _snapshot()
-        cycle1 = _snapshot()
-        cycle2 = _snapshot(
-            positions={"AAPL": Position("AAPL", 10, 100.0, 1010.0)},
-            open_orders=[],
-        )
-        engine, broker = engine_factory(
-            entries=[False] * 59 + [True],
-            snapshot=startup,
-            place_result=_unknown_result("AAPL", 10, order_id="ord-suspect"),
-        )
-        broker.sync_with_broker.side_effect = [startup, cycle1, cycle2]
-        broker.reconcile_submitted_order.return_value = _filled_result(
-            "AAPL",
-            10,
-            100.5,
-            submitted_at=T0,
-            filled_at=T0 + timedelta(minutes=2),
-        )
-        broker.place_protective_stop.return_value = _open_stop_order("AAPL", 95.0)
-
-        engine.start(max_cycles=2)
-
-        reconcile_call = broker.reconcile_submitted_order.call_args.kwargs
-        assert reconcile_call["order_id"] == "ord-suspect"
-        assert reconcile_call["symbol"] == "AAPL"
-        assert reconcile_call["requested_qty"] == pytest.approx(98.52)
-
-        stop_call = broker.place_protective_stop.call_args.kwargs
-        assert stop_call["symbol"] == "AAPL"
-        assert stop_call["qty"] == 10
-        assert round(stop_call["stop_price"], 2) == 96.94
-        assert stop_call["client_order_id_prefix"] == "fake_strategy-recover-stop"
-        assert engine._get_owner("AAPL") == "fake_strategy"
-        assert engine.trade_logger.read_all_open_owners() == {"AAPL": "fake_strategy"}
-        buy_rows = [
-            r for r in engine.trade_logger.read_all()
-            if r["side"] == "buy" and r["symbol"] == "AAPL"
-        ]
-        assert len(buy_rows) == 1
-        assert buy_rows[0]["timestamp"] == (T0 + timedelta(minutes=2)).isoformat()
-        assert buy_rows[0]["entry_timestamp"] == (T0 + timedelta(minutes=2)).isoformat()
-        assert buy_rows[0]["avg_fill_price"] == pytest.approx(100.5)
-
-        engine._entry_prices.clear()
-        engine._restore_entry_prices_from_db(cycle2)
-
-        assert engine._entry_prices["AAPL"] == pytest.approx(100.5)
-
-    def test_suspect_recovery_promotes_existing_day_child_stop(
-        self, engine_factory
-    ):
-        day_stop = replace(
-            _open_stop_order("AAPL", 95.0),
-            order_id="day-stop",
-            qty=10,
-            time_in_force="day",
-        )
-        promoted = replace(
-            day_stop,
-            order_id="gtc-stop",
-            status="accepted",
-            time_in_force="gtc",
-        )
-        startup = _snapshot()
-        cycle1 = _snapshot()
-        cycle2 = _snapshot(
-            positions={"AAPL": Position("AAPL", 10, 100.0, 1010.0)},
-            open_orders=[day_stop],
-        )
-        engine, broker = engine_factory(
-            entries=[False] * 59 + [True],
-            snapshot=startup,
-            place_result=_unknown_result("AAPL", 10, order_id="ord-suspect"),
-        )
-        broker.sync_with_broker.side_effect = [startup, cycle1, cycle2]
-        broker.reconcile_submitted_order.return_value = _filled_result(
-            "AAPL",
-            10,
-            100.5,
-            submitted_at=T0,
-            filled_at=T0 + timedelta(minutes=2),
-        )
-        broker.promote_equity_stop_to_gtc.return_value = promoted
-
-        engine.start(max_cycles=2)
-
-        broker.promote_equity_stop_to_gtc.assert_called_once_with(
-            parent_order_id=None,
-            stop_order_id="day-stop",
-            qty=10,
-            stop_price=95.0,
-            client_order_id_prefix="fake_strategy-recover-stop-gtc",
-        )
-        broker.place_protective_stop.assert_not_called()
+    # P-6: tests for the legacy _suspect_orders / _recover_suspect_orders
+    # path were removed alongside the cache. The substrate pipeline
+    # (P-1 stream + P-2 cycle reconcile + P-3 startup reconcile +
+    # _maybe_dispatch_substrate_entry_fill) covers the same recovery
+    # behavior. See:
+    #   - tests/test_apply_order_event.py::TestStreamDrainEndToEnd
+    #   - tests/test_apply_order_event.py::TestCycleReconcileStoreQuery
+    #   - tests/test_apply_order_event.py::TestSubstrateEntryFillDispatchSemantics
+    #   - tests/test_stream.py::TestLifecycleEventQueue
 
 
 # ── Scanner cadence ────────────────────────────────────────────────────────
@@ -3362,7 +3285,7 @@ class TestOptionsEngineFixes:
         engine._repair_missing_protective_stops(snap)
 
         engine.broker.place_protective_stop.assert_not_called()
-        engine.broker.close_position.assert_called_once_with("AAPL")
+        engine.broker.close_position.assert_called_once_with("AAPL", position_uid=None)
         engine.alerts.broker_error.assert_not_called()
         engine.alerts.trade_executed.assert_called_once()
         assert engine._get_owner("AAPL") is None
@@ -4657,7 +4580,7 @@ class TestSharedSymbolConflict:
         snap = _snapshot(positions=positions)
         engine._session_start_equity = snap.account.equity
         self._process(engine, "AAPL", snap)
-        broker.close_position.assert_called_once_with("AAPL")
+        broker.close_position.assert_called_once_with("AAPL", position_uid=None)
 
 
 # ── Sector exposure observability (11.7 Part B) ────────────────────────────
@@ -4875,203 +4798,24 @@ class TestExitPathBenchmarkKind:
         assert kwargs["benchmark_kind"] == "unavailable"
         assert kwargs["measurement_quality"] == "unavailable"
 
-    def test_unknown_exit_is_staged_and_reconciled_by_exact_order_id(self, tmp_path):
-        engine, broker = self._engine_with_real_logger(tmp_path)
-        _write_buy(engine.trade_logger, "AAPL", "fake_strategy")
-        engine._register_single_leg(strategy_name="fake_strategy", symbol="AAPL")
-        engine._entry_prices["AAPL"] = 100.5
-        position = SimpleNamespace(
-            qty=10,
-            symbol="AAPL",
-            avg_entry_price=100.5,
-            market_value=1000.0,
-            unrealized_pl=0.0,
-            current_price=100.0,
-            cost_basis=1005.0,
-            asset_id="x",
-            side="long",
-        )
-        snapshot = BrokerSnapshot(
-            account=SimpleNamespace(
-                equity=100_000.0,
-                cash=50_000.0,
-                buying_power=50_000.0,
-                open_positions={"AAPL": position},
-            ),
-            open_orders=[],
-        )
-        broker.close_position.return_value = OrderResult(
-            status=OrderStatus.UNKNOWN,
-            order_id="close-aapl-unknown",
-            symbol="AAPL",
-            requested_qty=10.0,
-            filled_qty=0.0,
-            avg_fill_price=None,
-            raw_status=None,
-            message="confirmation timed out",
-        )
-
-        closed = engine._close_single_leg_position(
-            symbol="AAPL",
-            strategy=engine.strategy,
-            position=position,
-            snapshot=snapshot,
-            latest_close=100.0,
-            alert_reason="exit signal",
-        )
-
-        assert closed is False
-        assert engine._suspect_exit_orders["AAPL"].order_id == "close-aapl-unknown"
-
-        broker.reconcile_submitted_order.return_value = OrderResult(
-            status=OrderStatus.FILLED,
-            order_id="close-aapl-unknown",
-            symbol="AAPL",
-            requested_qty=10.0,
-            filled_qty=10.0,
-            avg_fill_price=99.0,
-            raw_status="filled",
-            submitted_at=T0,
-            filled_at=T0 + timedelta(minutes=4),
-        )
-        engine._record_realized_pnl = MagicMock()
-        engine._recover_suspect_exit_orders(_snapshot())
-
-        assert "AAPL" not in engine._suspect_exit_orders
-        assert not engine._has_position("AAPL")
-        sell_rows = [
-            row for row in engine.trade_logger.read_all() if row["side"] == "sell"
-        ]
-        assert len(sell_rows) == 1
-        assert sell_rows[0]["order_id"] == "close-aapl-unknown"
-        assert sell_rows[0]["slippage_measurement_quality"] == "recovered"
-        assert engine._record_realized_pnl.call_args.kwargs["external"] is False
+    # P-7: test_unknown_exit_is_staged_and_reconciled_by_exact_order_id
+    # removed. Exercised the legacy _suspect_exit_orders cache, which
+    # the substrate exit dispatch (P-7 commit A) replaced. Coverage
+    # moved to:
+    #   - tests/test_apply_order_event.py::TestSubstrateExitFillDispatchSemantics
+    #   - tests/test_apply_order_event.py::TestStreamDrainEndToEnd (exit row variant)
 
 
-# ── Slippage unification Defect 2 fix ──────────────────────────────────────
+# ── P-6: TestSuspectOrderBenchmarkProvenance removed ──────────────────────
+#
+# Tested that the legacy _suspect_orders cache preserved the
+# benchmark provenance kind (arrival_midpoint vs fallback_latest_close)
+# through the recovery path. The cache is gone; the substrate's
+# per-order row now carries provenance from submit time onward, and
+# apply_order_event's UPSERT preserves it. Coverage moved to:
+#   - tests/test_apply_order_event.py::TestExpandedUpsertPreservation
+#   - tests/test_apply_order_event.py::TestTradesUpsertProvenancePreservation
+#   - tests/test_broker.py::TestSlippageProvenancePlumbing
 
 
-class TestSuspectOrderBenchmarkProvenance:
-    """
-    Defect 2 (Medium): SuspectOrder previously stored only the resolved
-    modeled_price, not whether the submission used an arrival_midpoint
-    or a latest_close fallback. Recovery hardcoded
-    benchmark_kind='arrival_midpoint', so a row that originally fell
-    into the fallback branch would be mislabeled on recovery.
-
-    Fix preserves modeled_price_kind on SuspectOrder and threads it
-    back through _log_entry at recovery time.
-    """
-
-    def test_recovery_preserves_fallback_kind(self, tmp_path):
-        from execution.broker import BrokerSnapshot, OrderStatus
-        from engine.trader import SuspectOrder
-        from risk.manager import RiskDecision
-
-        # Build a minimal engine via the same fixture as TestExitPathBenchmarkKind.
-        helper = TestExitPathBenchmarkKind()
-        engine, broker = helper._engine_with_real_logger(tmp_path)
-
-        decision = RiskDecision(
-            symbol="AAPL",
-            side=Side.BUY,
-            qty=10,
-            stop_price=145.0,
-            entry_reference_price=150.0,
-            strategy_name="sma_crossover",
-            reason="entry signal",
-            order_type=OrderType.MARKET,
-        )
-        # Simulate a suspect-order originally captured under the
-        # fallback_latest_close branch (no arrival quote available).
-        engine._suspect_orders["AAPL"] = SuspectOrder(
-            decision=decision,
-            order_id="ord-suspect-1",
-            modeled_price=150.0,
-            modeled_price_kind="fallback_latest_close",
-        )
-
-        broker.reconcile_submitted_order.return_value = _filled_result(
-            "AAPL",
-            10,
-            150.05,
-            submitted_at=T0,
-            filled_at=T0 + timedelta(minutes=1),
-        )
-
-        snap = BrokerSnapshot(
-            account=SimpleNamespace(
-                equity=100_000.0,
-                cash=50_000.0,
-                buying_power=50_000.0,
-                open_positions={"AAPL": SimpleNamespace(
-                    qty=10, symbol="AAPL", avg_entry_price=150.05,
-                    market_value=1500.5, unrealized_pl=0.0,
-                    current_price=150.05, cost_basis=1500.5,
-                    asset_id="x", side="long",
-                )},
-            ),
-            open_orders=[],
-        )
-        engine._log_entry = MagicMock()
-        engine._ensure_recovered_protective_stop = MagicMock()
-        engine._recover_suspect_orders(snap)
-
-        kwargs = engine._log_entry.call_args.kwargs
-        assert kwargs["benchmark_kind"] == "fallback_latest_close"
-        assert kwargs["measurement_quality"] == "recovered"
-
-    def test_recovery_preserves_arrival_kind(self, tmp_path):
-        from execution.broker import BrokerSnapshot, OrderStatus
-        from engine.trader import SuspectOrder
-        from risk.manager import RiskDecision
-
-        helper = TestExitPathBenchmarkKind()
-        engine, broker = helper._engine_with_real_logger(tmp_path)
-
-        decision = RiskDecision(
-            symbol="AAPL",
-            side=Side.BUY,
-            qty=10,
-            stop_price=145.0,
-            entry_reference_price=150.0,
-            strategy_name="sma_crossover",
-            reason="entry signal",
-            order_type=OrderType.MARKET,
-        )
-        engine._suspect_orders["AAPL"] = SuspectOrder(
-            decision=decision,
-            order_id="ord-suspect-2",
-            modeled_price=150.0,
-            modeled_price_kind="arrival_midpoint",
-        )
-
-        broker.reconcile_submitted_order.return_value = _filled_result(
-            "AAPL",
-            10,
-            150.05,
-            submitted_at=T0,
-            filled_at=T0 + timedelta(minutes=1),
-        )
-
-        snap = BrokerSnapshot(
-            account=SimpleNamespace(
-                equity=100_000.0,
-                cash=50_000.0,
-                buying_power=50_000.0,
-                open_positions={"AAPL": SimpleNamespace(
-                    qty=10, symbol="AAPL", avg_entry_price=150.05,
-                    market_value=1500.5, unrealized_pl=0.0,
-                    current_price=150.05, cost_basis=1500.5,
-                    asset_id="x", side="long",
-                )},
-            ),
-            open_orders=[],
-        )
-        engine._log_entry = MagicMock()
-        engine._ensure_recovered_protective_stop = MagicMock()
-        engine._recover_suspect_orders(snap)
-
-        kwargs = engine._log_entry.call_args.kwargs
-        assert kwargs["benchmark_kind"] == "arrival_midpoint"
-        assert kwargs["measurement_quality"] == "recovered"
+# (class deleted; coverage moved as documented above)
