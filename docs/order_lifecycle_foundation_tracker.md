@@ -13,7 +13,7 @@ The foundation PR implements the discovery doc's §6 (schema + atomic event API 
 
 | Phase | Scope | Branch | PR | Status |
 |---|---|---|---|---|
-| 1 | Substrate only: schema + `PositionLifecycleOrdersStore` + atomic `apply_order_event` + submit-time inserts + trades-writer alignment + migration preflight + dedupe script. Reconciliation wiring (WebSocket / cycle / startup), cache removal, and the remaining `_suspect_*` work are deferred to a follow-up branch (see "Planned" section). | `feat/order-lifecycle-foundation-impl` | [#60](https://github.com/francomarb/trading-bot/pull/60) | 🔄 In progress |
+| 1 | Substrate only: schema + `PositionLifecycleOrdersStore` + atomic `apply_order_event` + submit-time inserts + trades-writer alignment + migration preflight + dedupe script. Reconciliation wiring (WebSocket / cycle / startup), cache removal, and the remaining `_suspect_*` work are deferred to a follow-up branch (see "Planned" section). | `feat/order-lifecycle-foundation-impl` | [#60](https://github.com/francomarb/trading-bot/pull/60) | ✅ Approved across 6 review rounds; ready to merge |
 
 ---
 
@@ -53,7 +53,8 @@ Two phases on `feat/order-lifecycle-foundation-impl`:
 | 19 | B-r5 | Schema-driven dedupe conflict comparison: invert allowlist policy so every non-noise column on both tables is conflict-checked; closes lifecycle corruption (current_qty / entry_order_id / first_fill_at) and trades gaps (qty / stop_price / execution_id) (PR #60 round 5, fixes P0 + P1) | §12.2 | 7 | ✅ |
 | 20 | B-r5 | Documentation drift: tracker review-fix range now reflects current commit, commit 18 marked done, UPSERT docstring lists all 7 identity-conflict columns (PR #60 round 5, fix P2 docs) | n/a | — | ✅ |
 | 21 | B-r6 | Split fingerprint exclusion from conflict-discardable: lifecycle timestamps (`opened_at` / `created_at` / `trades.timestamp`) and `schema_version` now fingerprint-tracked even though they're conflict-discardable; mixed `schema_version` now flagged as conflict (PR #60 round 6, fixes P1 + P2 schema_version) | §12.2 | 3 | ✅ |
-| 22 | B-r6 | Tracker fix: mark commit 20 done, add rows for 21 + 22 (PR #60 round 6, fix P2 tracker) | n/a | — | 🔄 In progress |
+| 22 | B-r6 | Tracker fix: mark commit 20 done, add rows for 21 + 22 (PR #60 round 6, fix P2 tracker) | n/a | — | ✅ |
+| 23 | B-r7 | Pre-merge tidies: mark Phase 1 complete; remove stale schema_version-discardable comment; soften dedupe WAL warning (PR #60 round 7 follow-ups) | n/a | — | 🔄 In progress |
 
 Substrate-landed totals: ~7100 LOC code + ~3800 LOC tests across 23 commits.
 

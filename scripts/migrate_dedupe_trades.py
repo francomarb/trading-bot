@@ -387,13 +387,13 @@ class _ApplyAborted(Exception):
 #
 # Discardable columns:
 #   position_lifecycle:
-#     schema_version — always equals LIFECYCLE_SCHEMA_VERSION; not
-#       fact about the position, just a schema marker.
 #     position_uid   — the row's primary key (each row in a cluster
 #                       has a DIFFERENT value by definition; that's
 #                       the partition basis, not a conflict).
 #     owner_key      — the cluster key; every row in a given cluster
 #                       has the SAME value (also not a conflict).
+#   (schema_version is NOT discardable — see the explicit note
+#    in _OWNER_KEY_DISCARDABLE_COLUMNS below for the rationale.)
 #   trades:
 #     id        — autoincrement PK; we DELETE by this so cross-row
 #                 comparison is meaningless.
@@ -616,9 +616,14 @@ def _apply(conn: sqlite3.Connection, in_path: Path) -> int:
     before --apply ran.
 
     Operator-facing precondition: the live bot must NOT be running
-    against the same DB. SQLite's default locking will fight the
-    bot's writes and either path will see WAL chaos. The script
-    prints a banner reminding the operator before doing anything.
+    against the same DB. Concurrent access while the bot writes is
+    UNSUPPORTED — the script's fingerprint / rowcount / rescan
+    checks assume a stable database. With a live writer the script
+    is likely to abort with a SQLITE_BUSY locking error or with a
+    stale-review fingerprint mismatch, but the safety contract is
+    'do not run concurrently' rather than any specific failure
+    mode. The script prints a banner reminding the operator before
+    doing anything.
     """
     decisions = json.loads(in_path.read_text())
     if decisions.get("version") != 1:
@@ -628,8 +633,9 @@ def _apply(conn: sqlite3.Connection, in_path: Path) -> int:
 
     print(
         "WARNING: --apply mutates the DB. The live bot MUST be "
-        "stopped (stop_bot.sh) before running --apply. Mixed-access "
-        "WAL state can produce silent data corruption."
+        "stopped (stop_bot.sh) before running --apply. Concurrent "
+        "access is unsupported and is likely to fail with locking "
+        "or stale-review errors."
     )
 
     # PR #60 round 2 fix (P1.7): enforce FK constraints during the
