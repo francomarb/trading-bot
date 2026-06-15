@@ -340,3 +340,144 @@ class TestParameterSensitivity:
                 {"fast": [50], "slow": [20]},   # only invalid combo
                 df,
             )
+
+
+# ── STOP_LIMIT entry model (PLAN 11.47 R1 P1-4) ─────────────────────────────
+
+
+class TestStopLimitEntryModel:
+    """Backtest now models broker-resting STOP_LIMIT semantics for
+    strategies declaring OrderType.STOP_LIMIT (Donchian today). Three
+    next-bar outcomes covered:
+
+      1. open above limit cap → gap-over-limit, no fill.
+      2. high below trigger → trigger not reached, no fill.
+      3. otherwise → fill at max(open, trigger), capped at limit.
+
+    Pre-PLAN-11.47 the runner unconditionally filled at next-open, which
+    materially diverged from production once Donchian moved to STOP_LIMIT.
+    """
+
+    def _df_for(self, *, opens, highs, lows, closes) -> pd.DataFrame:
+        idx = pd.date_range(
+            "2026-01-01", periods=len(closes), freq="D", tz="UTC",
+        )
+        return pd.DataFrame(
+            {
+                "open": opens, "high": highs, "low": lows, "close": closes,
+                "volume": [1_000_000] * len(closes),
+            },
+            index=idx,
+        )
+
+    def _strategy(self):
+        from strategies.donchian_breakout import DonchianBreakout
+        return DonchianBreakout(entry_window=5, exit_window=3)
+
+    def _policy(self):
+        # 500 bps chase — matches the production Donchian policy shape so
+        # cap math here is sane.
+        from execution.entry_guard import EntryPriceCap
+        return EntryPriceCap(max_chase_bps=500)
+
+    def test_gap_over_limit_blocks_entry(self):
+        # entry_window=5: trigger at bar t = max(close[t-5:t-1]).
+        # Flat at 100 for bars 0–5 → no breakout there. Bar 6 closes 110 →
+        # first breakout (close 110 > prior-5 max 100). Trigger[6] = 100,
+        # limit[6] = 100 * 1.05 = 105. Bar 7 opens 130 → gap over limit.
+        # Must NOT fill, and no later bar can re-fire the breakout because
+        # we don't add more bars after bar 7 — the model drops last-bar
+        # entries anyway.
+        closes = [100, 100, 100, 100, 100, 100, 110, 130]
+        opens  = [100, 100, 100, 100, 100, 100, 100, 130]
+        highs  = [c + 0.5 for c in closes]
+        lows   = [c - 0.5 for c in closes]
+        df = self._df_for(opens=opens, highs=highs, lows=lows, closes=closes)
+
+        result = run_backtest(
+            self._strategy(), df,
+            BacktestConfig(slippage_bps=0, commission_per_trade=0),
+            entry_price_cap_policy=self._policy(),
+        )
+        # No trade — bar-6 entry was blocked by gap-over-limit at bar 7.
+        assert result.stats["trade_count"] == 0
+
+    def test_trigger_unreached_blocks_entry(self):
+        # Same flat-then-breakout setup. Bar 7's high stays below the
+        # trigger (= 100). Order rests; DAY TIF expires → no fill.
+        closes = [100, 100, 100, 100, 100, 100, 110, 95]
+        opens  = [100, 100, 100, 100, 100, 100, 100, 95]
+        highs  = [100.5, 100.5, 100.5, 100.5, 100.5, 100.5, 110.5, 99.0]
+        lows   = [c - 0.5 for c in closes]
+        df = self._df_for(opens=opens, highs=highs, lows=lows, closes=closes)
+
+        result = run_backtest(
+            self._strategy(), df,
+            BacktestConfig(slippage_bps=0, commission_per_trade=0),
+            entry_price_cap_policy=self._policy(),
+        )
+        assert result.stats["trade_count"] == 0
+
+    def test_fill_at_trigger_when_open_below_and_high_above(self):
+        # Bar 6 close > 5-bar max → entry shifted to bar 7. Trigger=100.
+        # Bar 7 open=99, high=104 → triggers (price trades through 100)
+        # but the open is below; fill at trigger=100 (max(open, trigger)).
+        closes = [100, 100, 100, 100, 100, 100, 110, 103, 102]
+        opens  = [100, 100, 100, 100, 100, 100, 100,  99, 102]
+        highs  = [100.5, 100.5, 100.5, 100.5, 100.5, 100.5, 110.5, 104.0, 103.0]
+        lows   = [c - 0.5 for c in closes]
+        df = self._df_for(opens=opens, highs=highs, lows=lows, closes=closes)
+
+        result = run_backtest(
+            self._strategy(), df,
+            BacktestConfig(slippage_bps=0, commission_per_trade=0),
+            entry_price_cap_policy=self._policy(),
+        )
+        # At least one trade entered. Inspect vbt's trade records.
+        assert result.stats["trade_count"] >= 1
+        records = result.portfolio.trades.records_readable
+        first_trade = records.iloc[0]
+        # Filled at trigger=100, not at the lower open=99.
+        assert abs(float(first_trade["Avg Entry Price"]) - 100.0) < 0.01
+
+    def test_fill_at_open_when_open_above_trigger_within_limit(self):
+        # Bar 7 opens at 102 (above trigger=100, below limit=105). The
+        # stop trips on open → fill at the open, not at the trigger.
+        closes = [100, 100, 100, 100, 100, 100, 110, 104, 104]
+        opens  = [100, 100, 100, 100, 100, 100, 100, 102, 104]
+        highs  = [100.5, 100.5, 100.5, 100.5, 100.5, 100.5, 110.5, 104.5, 104.5]
+        lows   = [c - 0.5 for c in closes]
+        df = self._df_for(opens=opens, highs=highs, lows=lows, closes=closes)
+
+        result = run_backtest(
+            self._strategy(), df,
+            BacktestConfig(slippage_bps=0, commission_per_trade=0),
+            entry_price_cap_policy=self._policy(),
+        )
+        assert result.stats["trade_count"] >= 1
+        records = result.portfolio.trades.records_readable
+        first_trade = records.iloc[0]
+        # Filled at the open, NOT at the trigger.
+        assert abs(float(first_trade["Avg Entry Price"]) - 102.0) < 0.01
+
+    def test_market_strategy_unchanged_by_stop_limit_model(self):
+        # Negative control: SMA crossover (MARKET) still uses next-open fill.
+        df = _trending_df(300)
+        from strategies.sma_crossover import SMACrossover
+        baseline = run_backtest(SMACrossover(fast=5, slow=20), df)
+        assert baseline.stats["trade_count"] >= 1
+
+    def test_stop_limit_strategy_without_policy_raises(self):
+        # If neither parameter nor ENTRY_PRICE_CAPS configures a policy for
+        # the strategy, the backtest must refuse rather than silently fall
+        # back to the old next-open model.
+        from strategies.donchian_breakout import DonchianBreakout
+
+        class UnknownDonchian(DonchianBreakout):
+            name = "unknown_strategy_no_policy"
+
+        df = _trending_df(50)
+        with pytest.raises(ValueError, match="EntryPriceCap policy"):
+            run_backtest(
+                UnknownDonchian(entry_window=5, exit_window=3), df,
+            )

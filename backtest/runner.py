@@ -39,8 +39,9 @@ import numpy as np
 import pandas as pd
 import vectorbt as vbt
 
+from execution.entry_guard import EntryPriceCap, compute_cap_price
 from reporting.metrics import kelly_fraction
-from strategies.base import BaseStrategy
+from strategies.base import BaseStrategy, OrderType
 
 # ── Config ──────────────────────────────────────────────────────────────────
 
@@ -158,6 +159,90 @@ def _shift_for_next_open(s: pd.Series) -> pd.Series:
     return pd.Series(values, index=s.index, dtype=bool)
 
 
+def _stop_limit_entry_model(
+    *,
+    df: pd.DataFrame,
+    raw_entries: pd.Series,
+    trigger_series: pd.Series,
+    policy: EntryPriceCap,
+    atr_series: pd.Series,
+) -> tuple[pd.Series, pd.Series]:
+    """
+    PLAN 11.47 R1 P1-4: model broker-resting STOP_LIMIT entries.
+
+    For each signal-bar t whose raw_entry[t] is True, the engine submits
+    a DAY stop-limit at trigger[t] with limit cap = trigger[t] + chase.
+    The order rests until execution bar t+1. Three outcomes:
+
+      1. open[t+1] > limit[t]   — gap above the limit cap; no fill.
+      2. high[t+1] < trigger[t] — price never trades through the trigger;
+                                  DAY expiry, no fill.
+      3. otherwise              — fill at max(open[t+1], trigger[t]),
+                                  capped by limit[t].
+
+    Returns (filtered_raw_entries, fill_price_at_signal_bar). The caller
+    shifts both forward by 1 to align with vbt's execution-on-next-open
+    convention.
+
+    `fill_price_at_signal_bar[t]` carries the modeled fill price for an
+    entry on bar t+1, indexed by t. The caller shifts it forward by 1
+    so vbt uses it at the execution bar.
+    """
+    if "high" not in df.columns:
+        raise ValueError(
+            "STOP_LIMIT backtest semantics require a 'high' column"
+        )
+    next_open = df["open"].shift(-1)
+    next_high = df["high"].shift(-1)
+
+    # Per-bar limit cap: anchored to the trigger, not the close. Mirrors
+    # the engine's compute_cap_price call at the STOP_LIMIT signal site.
+    # Use the bps knob exclusively when both are set — the ATR knob would
+    # need a per-bar fill since compute_cap_price takes scalars; bps gives
+    # an exact per-bar series. If only the ATR knob is configured, fall
+    # back to a per-bar scalar loop.
+    if policy.max_chase_bps is not None and policy.max_chase_atr_fraction is None:
+        limit_series = trigger_series * (1.0 + policy.max_chase_bps / 1e4)
+    else:
+        # General case: vectorize compute_cap_price across bars.
+        limit_values = []
+        for trigger, atr in zip(
+            trigger_series.values, atr_series.values, strict=False
+        ):
+            if pd.isna(trigger) or trigger <= 0 or pd.isna(atr) or atr < 0:
+                limit_values.append(float("nan"))
+                continue
+            limit_values.append(
+                compute_cap_price(
+                    reference_price=float(trigger),
+                    atr=float(atr),
+                    side="buy",
+                    policy=policy,
+                )
+            )
+        limit_series = pd.Series(
+            limit_values, index=trigger_series.index, dtype=float,
+        )
+
+    # Block conditions at signal bar t (next bar = execution).
+    valid = trigger_series.notna() & limit_series.notna() & next_open.notna() & next_high.notna()
+    gap_over_limit = valid & (next_open > limit_series)
+    trigger_unreached = valid & (next_high < trigger_series)
+    blocked = gap_over_limit | trigger_unreached
+
+    filtered = raw_entries.astype(bool) & ~blocked
+    # Last bar has no next bar — drop any entry there (no t+1 to execute on).
+    filtered = filtered & valid
+
+    # Fill price for an entry that lands: max(open, trigger) capped at limit.
+    fill_at_open_or_trigger = next_open.where(
+        next_open >= trigger_series, trigger_series
+    )
+    fill_price_at_signal = fill_at_open_or_trigger.clip(upper=limit_series)
+
+    return filtered, fill_price_at_signal
+
+
 def run_backtest(
     strategy: BaseStrategy,
     df: pd.DataFrame,
@@ -167,6 +252,7 @@ def run_backtest(
     atr_stop_mult: float | None = None,
     atr_length: int = 14,
     atr_trail: bool = False,
+    entry_price_cap_policy: EntryPriceCap | None = None,
 ) -> BacktestResult:
     """
     Run `strategy` against `df` (must have 'open' and 'close' columns) under
@@ -199,7 +285,59 @@ def run_backtest(
     # filters that don't need the symbol ignore it (BaseStrategy
     # docstring guarantees backwards compatibility).
     raw = strategy.generate_signals(df, symbol=symbol)
-    entries = _shift_for_next_open(raw.entries)
+
+    # PLAN 11.47 R1 P1-4: STOP_LIMIT strategies (Donchian today) model
+    # broker-resting stop-limit entries — fill only if the next bar
+    # trades through the trigger and the open isn't above the limit
+    # cap. Reuses the strategy's compute_entry_triggers() and the
+    # production EntryPriceCap policy so production / envelopes /
+    # research stay aligned.
+    is_stop_limit = (
+        getattr(strategy, "preferred_order_type", None) is OrderType.STOP_LIMIT
+    )
+    stop_limit_fill_price: pd.Series | None = None
+    if is_stop_limit:
+        if not hasattr(strategy, "compute_entry_triggers"):
+            raise ValueError(
+                f"strategy {strategy.name!r} declares STOP_LIMIT but does not "
+                f"expose compute_entry_triggers(df) — required for the "
+                f"backtest's fill model"
+            )
+        # Pull the cap policy from the explicit parameter or, when not
+        # provided, from the production settings registry so backtests
+        # match live behavior by default.
+        policy = entry_price_cap_policy
+        if policy is None:
+            from config.settings import ENTRY_PRICE_CAPS  # local import: avoid cycle
+            policy = ENTRY_PRICE_CAPS.get(strategy.name)
+        if policy is None:
+            raise ValueError(
+                f"strategy {strategy.name!r} declares STOP_LIMIT but has no "
+                f"EntryPriceCap policy configured in ENTRY_PRICE_CAPS and none "
+                f"was passed via entry_price_cap_policy — required to compute "
+                f"the limit-leg chase cap"
+            )
+        from indicators.technicals import add_atr
+        if "high" not in df.columns or "low" not in df.columns:
+            raise ValueError(
+                "STOP_LIMIT backtest semantics require high/low columns "
+                "(for ATR-based chase cap and next-bar fill model)"
+            )
+        with_atr = add_atr(df, atr_length)
+        atr_series = with_atr[f"atr_{atr_length}"]
+        trigger_series = strategy.compute_entry_triggers(df)
+        filtered_entries, fill_price_at_signal = _stop_limit_entry_model(
+            df=df,
+            raw_entries=raw.entries,
+            trigger_series=trigger_series,
+            policy=policy,
+            atr_series=atr_series,
+        )
+        entries = _shift_for_next_open(filtered_entries)
+        # Shift forward by 1 so vbt sees the modeled fill at the execution bar.
+        stop_limit_fill_price = fill_price_at_signal.shift(1)
+    else:
+        entries = _shift_for_next_open(raw.entries)
     exits = _shift_for_next_open(raw.exits)
 
     sl_stop = None
@@ -220,11 +358,31 @@ def run_backtest(
         # Floor at a tiny positive value to avoid vectorbt rejecting 0.0 stops.
         sl_stop = sl_stop.clip(lower=1e-6)
 
+    # PLAN 11.47 R1 P1-4: when STOP_LIMIT semantics apply, vbt's fill
+    # price at entry bars must reflect the modeled max(open, trigger)
+    # capped at limit. Other bars (exit bars, non-signal bars) keep
+    # df["open"] — vbt only reads price[bar] when a signal fires there
+    # and we never put an entry on a bar that also has an exit, so
+    # exits land at the open as before.
+    if stop_limit_fill_price is not None:
+        # Cast both sides to float explicitly so pandas' future "no silent
+        # downcast" semantics doesn't fire a FutureWarning on the where().
+        price_series = df["open"].astype(float).copy()
+        entry_mask = entries.astype(bool)
+        # Where the entry mask is True, swap in the modeled fill price.
+        # NaN-safe: filtered entries are masked away in the entry model
+        # for bars whose next_open/trigger/limit are NaN.
+        price_series = price_series.where(
+            ~entry_mask, stop_limit_fill_price.astype(float),
+        )
+    else:
+        price_series = df["open"]
+
     pf = vbt.Portfolio.from_signals(
         close=df["close"],
         entries=entries,
         exits=exits,
-        price=df["open"],                       # fill at the bar's open
+        price=price_series,                     # fill model: open for exits, modeled for STOP_LIMIT entries
         init_cash=cfg.initial_cash,
         slippage=cfg.slippage_bps / 10_000.0,   # vbt: fraction
         fixed_fees=cfg.commission_per_trade,    # per-trade $

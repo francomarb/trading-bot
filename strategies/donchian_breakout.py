@@ -115,6 +115,19 @@ class DonchianBreakout(BaseStrategy):
 
         return SignalFrame(entries=entries, exits=exits)
 
+    def compute_entry_triggers(self, df: pd.DataFrame) -> pd.Series:
+        """
+        Return the per-bar stop trigger Series — the prior-N-day high
+        at each bar. Used by the backtest harness to model STOP_LIMIT
+        semantics over the full series; the scalar
+        `compute_entry_trigger` is the latest-bar specialization for
+        the live engine.
+        """
+        if "close" not in df.columns:
+            raise ValueError("DonchianBreakout requires a 'close' column")
+        with_high = add_donchian_high(df, self.entry_window)
+        return with_high[f"donchian_high_{self.entry_window}"]
+
     def compute_entry_trigger(self, df: pd.DataFrame) -> float:
         """
         Return the broker-resting stop trigger for the latest bar.
@@ -124,10 +137,7 @@ class DonchianBreakout(BaseStrategy):
         breakout. Re-computes the same indicator used in `_raw_signals`
         so the trigger is exactly the level that produced the signal.
         """
-        if "close" not in df.columns:
-            raise ValueError("DonchianBreakout requires a 'close' column")
-        with_high = add_donchian_high(df, self.entry_window)
-        trigger = float(with_high[f"donchian_high_{self.entry_window}"].iloc[-1])
+        trigger = float(self.compute_entry_triggers(df).iloc[-1])
         if not (trigger > 0):
             raise ValueError(
                 f"donchian_high_{self.entry_window} is non-positive ({trigger!r}); "
