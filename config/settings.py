@@ -83,6 +83,22 @@ RESTING_ENTRY_CONFIRM_TIMEOUT_SECONDS: float = float(
     os.getenv("RESTING_ENTRY_CONFIRM_TIMEOUT_SECONDS", "5")
 )
 
+# Single-leg option trailing-stop replacement quality gate.
+# Alpaca paper fills are matched against current quotes, while the Positions
+# API's current_price can reflect a non-executable mark or last trade. Keep the
+# existing broker stop whenever the latest two-sided option quote cannot safely
+# support a higher stop. These knobs affect price ratchets only; missing-stop
+# creation and TIF/quantity repairs remain fail-safe.
+OPTION_TRAILING_QUOTE_MAX_AGE_SECONDS: float = float(
+    os.getenv("OPTION_TRAILING_QUOTE_MAX_AGE_SECONDS", "30")
+)
+OPTION_TRAILING_MAX_SPREAD_PCT: float = float(
+    os.getenv("OPTION_TRAILING_MAX_SPREAD_PCT", "0.20")
+)
+OPTION_TRAILING_STOP_BID_BUFFER_PCT: float = float(
+    os.getenv("OPTION_TRAILING_STOP_BID_BUFFER_PCT", "0.05")
+)
+
 # Multi-leg options entry watch window
 # Credit spreads often need longer than single-leg options to fill at a fair
 # net price. Give MLEG combo orders more time to work before we cancel them.

@@ -43,6 +43,7 @@ from execution.broker import (
     BrokerSnapshot,
     ClosedOrderInfo,
     OpenOrder,
+    OptionQuote,
     OrderResult,
     OrderStatus,
 )
@@ -4035,6 +4036,12 @@ class TestGenericSingleLegOptionTrailingStops:
         strategy = self.GenericOptionStrategy(entries=[False], exits=[False])
         broker = MagicMock()
         broker.get_open_orders.return_value = []
+        broker.get_latest_option_quote.return_value = OptionQuote(
+            symbol="SPY260618C00746000",
+            bid_price=21.90,
+            ask_price=22.10,
+            timestamp=T0,
+        )
         broker.submit_option_gtc_stop.return_value = OpenOrder(
             order_id="new-stop",
             symbol="SPY260618C00746000",
@@ -4268,6 +4275,116 @@ class TestGenericSingleLegOptionTrailingStops:
         assert row.hwm_premium == pytest.approx(22.00)
         assert row.current_stop_price == pytest.approx(18.70)
         assert row.alpaca_stop_order_id == "replacement-stop"
+
+    def test_ratchet_is_deferred_when_bid_does_not_support_new_stop(self, tmp_path):
+        engine, broker = self._engine(tmp_path)
+        stale = replace(
+            _open_stop_order("SPY260618C00746000", stop_price=17.14),
+            order_id="old-stop",
+            qty=3,
+            time_in_force="gtc",
+        )
+        broker.get_latest_option_quote.return_value = OptionQuote(
+            symbol="SPY260618C00746000",
+            bid_price=19.00,
+            ask_price=19.20,
+            timestamp=T0,
+        )
+        snapshot = _snapshot(
+            positions={
+                "SPY260618C00746000": Position(
+                    symbol="SPY260618C00746000",
+                    qty=3,
+                    avg_entry_price=12.77,
+                    market_value=6_600.0,
+                    current_price=22.00,
+                )
+            },
+            open_orders=[stale],
+        )
+
+        engine._sync_option_trailing_stops(snapshot)
+
+        broker.replace_option_stop.assert_not_called()
+        row = engine.option_trailing_store.get_by_occ("SPY260618C00746000")
+        assert row.hwm_premium == pytest.approx(22.00)
+        assert row.current_stop_price == pytest.approx(17.14)
+        assert row.alpaca_stop_order_id == "old-stop"
+
+    def test_ratchet_is_deferred_for_stale_or_wide_quote(self, tmp_path):
+        engine, broker = self._engine(tmp_path)
+        stale_stop = replace(
+            _open_stop_order("SPY260618C00746000", stop_price=17.14),
+            order_id="old-stop",
+            qty=3,
+            time_in_force="gtc",
+        )
+        snapshot = _snapshot(
+            positions={
+                "SPY260618C00746000": Position(
+                    symbol="SPY260618C00746000",
+                    qty=3,
+                    avg_entry_price=12.77,
+                    market_value=6_600.0,
+                    current_price=22.00,
+                )
+            },
+            open_orders=[stale_stop],
+        )
+
+        broker.get_latest_option_quote.return_value = OptionQuote(
+            symbol="SPY260618C00746000",
+            bid_price=21.90,
+            ask_price=22.10,
+            timestamp=T0 - timedelta(seconds=31),
+        )
+        engine._sync_option_trailing_stops(snapshot)
+        broker.replace_option_stop.assert_not_called()
+
+        broker.get_latest_option_quote.return_value = OptionQuote(
+            symbol="SPY260618C00746000",
+            bid_price=20.00,
+            ask_price=25.00,
+            timestamp=T0,
+        )
+        engine._sync_option_trailing_stops(snapshot)
+        broker.replace_option_stop.assert_not_called()
+
+    def test_quote_rejection_does_not_block_day_to_gtc_maintenance(self, tmp_path):
+        engine, broker = self._engine(tmp_path)
+        day_stop = replace(
+            _open_stop_order("SPY260618C00746000", stop_price=17.14),
+            order_id="day-stop",
+            qty=3,
+            time_in_force="day",
+        )
+        broker.get_latest_option_quote.return_value = None
+        broker.replace_option_stop.return_value = replace(
+            broker.replace_option_stop.return_value,
+            stop_price=17.14,
+        )
+        snapshot = _snapshot(
+            positions={
+                "SPY260618C00746000": Position(
+                    symbol="SPY260618C00746000",
+                    qty=3,
+                    avg_entry_price=12.77,
+                    market_value=6_600.0,
+                    current_price=22.00,
+                )
+            },
+            open_orders=[day_stop],
+        )
+
+        engine._sync_option_trailing_stops(snapshot)
+
+        broker.replace_option_stop.assert_called_once_with(
+            order_id="day-stop",
+            qty=3.0,
+            stop_price=17.14,
+        )
+        row = engine.option_trailing_store.get_by_occ("SPY260618C00746000")
+        assert row.current_stop_price == pytest.approx(17.14)
 
     def test_replace_failure_keeps_existing_stop_live(self, tmp_path):
         engine, broker = self._engine(tmp_path)

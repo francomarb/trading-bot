@@ -35,6 +35,7 @@ from execution.broker import (
     AlpacaBroker,
     BrokerError,
     ClosedOrderInfo,
+    OptionQuote,
     OrderResult,
     OrderStatus,
 )
@@ -1900,6 +1901,66 @@ class TestOptionsDryRun:
 
 
 class TestOptionGtcStops:
+    def test_latest_option_quote_returns_typed_two_sided_quote(self):
+        api = MagicMock()
+        option_data = MagicMock()
+        timestamp = datetime(2026, 6, 15, 14, 30, tzinfo=timezone.utc)
+        option_data.get_option_latest_quote.return_value = {
+            "SPY260702C00737000": SimpleNamespace(
+                bid_price="19.60",
+                ask_price="19.80",
+                timestamp=timestamp,
+            )
+        }
+        broker = AlpacaBroker(
+            client=api,
+            option_data_client=option_data,
+            max_attempts=1,
+            base_delay=0.0,
+        )
+
+        quote = broker.get_latest_option_quote("SPY260702C00737000")
+
+        assert quote == OptionQuote(
+            symbol="SPY260702C00737000",
+            bid_price=19.60,
+            ask_price=19.80,
+            timestamp=timestamp,
+        )
+        request = option_data.get_option_latest_quote.call_args.args[0]
+        assert request.symbol_or_symbols == "SPY260702C00737000"
+
+    @pytest.mark.parametrize(
+        "quote",
+        [
+            None,
+            SimpleNamespace(
+                bid_price="0",
+                ask_price="19.80",
+                timestamp=datetime(2026, 6, 15, tzinfo=timezone.utc),
+            ),
+            SimpleNamespace(
+                bid_price="19.60",
+                ask_price="0",
+                timestamp=datetime(2026, 6, 15, tzinfo=timezone.utc),
+            ),
+            SimpleNamespace(bid_price="19.60", ask_price="19.80", timestamp=None),
+        ],
+    )
+    def test_latest_option_quote_rejects_incomplete_quote(self, quote):
+        option_data = MagicMock()
+        option_data.get_option_latest_quote.return_value = (
+            {} if quote is None else {"SPY260702C00737000": quote}
+        )
+        broker = AlpacaBroker(
+            client=MagicMock(),
+            option_data_client=option_data,
+            max_attempts=1,
+            base_delay=0.0,
+        )
+
+        assert broker.get_latest_option_quote("SPY260702C00737000") is None
+
     def test_submit_option_gtc_stop_uses_gtc_sell_stop(self):
         api = MagicMock()
         api.submit_order.return_value = _alpaca_order(
