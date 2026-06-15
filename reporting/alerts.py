@@ -71,6 +71,13 @@ class AlertType(Enum):
     MLEG_CLOSE_WALK_STARTED = "mleg_close_walk_started"
     MLEG_CLOSE_MARKET_FALLBACK = "mleg_close_market_fallback"
     ENGINE_HALT = "engine_halt"
+    # PR-65 review F4: soft operator actions (pause-entries /
+    # resume-entries / pause-strategy / resume-strategy) get their own
+    # alert type at INFO severity. Previously routed through engine_halt
+    # which formatted them as "engine halted: ..." at CRITICAL — a
+    # routine resume-entries looked like an emergency to alerting
+    # channels. ENGINE_HALT stays for actual halt + resume-after-halt.
+    OPERATOR_ACTION = "operator_action"
     TRADE_EXECUTED = "trade_executed"
     REGIME_SHIFT = "regime_shift"
     EOD_SUMMARY = "eod_summary"
@@ -563,6 +570,19 @@ class AlertDispatcher:
             alert_type=AlertType.ENGINE_HALT,
             severity=AlertSeverity.CRITICAL,
             message=f"engine halted: {reason}",
+        ))
+
+    def operator_action(self, message: str) -> bool:
+        """PR-65 review F4: routine operator soft-control transitions
+        (pause-entries / resume-entries / pause-strategy /
+        resume-strategy). Routed as INFO not CRITICAL so a routine
+        resume doesn't trip emergency-style alerting channels. Use
+        `engine_halt` only for halt / resume-after-halt where CRITICAL
+        is correct."""
+        return self.fire(Alert(
+            alert_type=AlertType.OPERATOR_ACTION,
+            severity=AlertSeverity.INFO,
+            message=message,
         ))
 
     def trade_executed(

@@ -13,6 +13,8 @@ data/**/*.db.*
 data/engine_state.json
 data/engine_state.json.tmp
 data/engine_state.json.bak.*
+data/operator_control_state.json
+data/operator_control_state.json.tmp
 data/historical/
 logs/
 .env

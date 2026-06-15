@@ -407,16 +407,17 @@ class TradeLogger:
         if self._conn is not None:
             return self._conn
         os.makedirs(os.path.dirname(self._path) or ".", exist_ok=True)
-        # Operator Controls Phase B — the operator-command heartbeat
-        # thread reads/writes operator_commands from a daemon thread
-        # separate from the main cycle thread. SQLite refuses cross-
-        # thread connection use by default (`check_same_thread=True`).
-        # With False, the application is responsible for serialising
-        # access; SQLite's per-statement locking handles the rest.
-        # The heartbeat only does brief atomic operations (UPDATE…WHERE
-        # for claim, single INSERT for terminal state), and the cycle
-        # thread writes to disjoint tables. No deadlock risk.
-        conn = sqlite3.connect(self._path, check_same_thread=False)
+        # PR-65 review F3: revert to check_same_thread=True (the
+        # default). Sharing a single connection across cycle-thread
+        # writes (trades, position_lifecycle) and heartbeat-thread
+        # writes (operator_commands) puts both threads into the same
+        # implicit transaction — commit from either flushes both
+        # threads' changes and could roll back the other on error.
+        # Disjoint TABLES does not make a shared CONNECTION
+        # transaction-safe. The operator queue store now opens its
+        # own dedicated connection (see engine.trader.__init__) so
+        # this connection stays single-threaded.
+        conn = sqlite3.connect(self._path)
         try:
             # Order lifecycle foundation (PR #59 §6.2 / R13-G1): SQLite
             # does NOT enforce FOREIGN KEY constraints by default — they

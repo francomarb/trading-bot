@@ -342,14 +342,36 @@ class AlpacaBroker:
 
     def bind_entry_guard(self, callback: Callable[[], bool]) -> bool:
         """
-        Install an entry-submit guard when none was supplied at construction.
+        Install an entry-submit guard.
 
-        Returns True when the callback was installed. An explicitly configured
-        guard is preserved so an engine cannot weaken a stricter caller policy.
+        Returns True when the new callback was installed in addition to
+        any existing guard. PR-65 review [Q] (Phase B): previous
+        semantics no-op'd when an explicit guard was already configured,
+        which would silently disable the engine's Phase B pause-entries
+        check in any deployment that constructed AlpacaBroker with its
+        own `entry_allowed=...`. Production (`forward_test.py` /
+        `main.py`) never passes one, so the bare-bind path remains
+        correct; this change keeps both guards composed (AND) when an
+        explicit one exists so policy can never weaken — both must
+        allow entry for entry to be allowed.
         """
-        if getattr(self, "_entry_allowed", None) is not None:
-            return False
-        self._entry_allowed = callback
+        existing = getattr(self, "_entry_allowed", None)
+        if existing is None:
+            self._entry_allowed = callback
+            return True
+        # Compose. AND semantics: entries blocked when EITHER guard
+        # returns False. Strictly cannot weaken the existing policy.
+        def _composed(_a=existing, _b=callback) -> bool:
+            try:
+                if not _a():
+                    return False
+            except Exception:
+                return False
+            try:
+                return bool(_b())
+            except Exception:
+                return False
+        self._entry_allowed = _composed
         return True
 
     @staticmethod

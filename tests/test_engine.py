@@ -537,6 +537,79 @@ class TestProcessSymbol:
         broker.close_position.assert_called_once_with("AAPL", position_uid=None)
         broker.place_order.assert_not_called()
 
+    # ── Phase B PR-65 review F5: prove _process_symbol enforces the
+    #    pause-entries / pause-strategy gates BEFORE broker dispatch ──
+
+    def test_pause_entries_blocks_broker_place_order(self, engine_factory):
+        """A fresh entry signal under pause-entries must NOT reach
+        broker.place_order. The existing halt check is the outer gate;
+        Phase B added soft pauses underneath. This proves the new gate
+        is actually in `_process_symbol`, not just on the RiskManager
+        flag accessor."""
+        engine, broker = engine_factory(entries=[False] * 59 + [True])
+        snap = _snapshot()
+        engine._session_start_equity = snap.account.equity
+
+        engine.risk.pause_entries(reason="market event", command_uid="cmd_abc")
+        assert engine.risk.is_entries_paused()
+
+        self._process(engine, "AAPL", snap)
+
+        broker.place_order.assert_not_called()
+        # And the halt mechanism stayed clean — pause should NOT engage
+        # the kill switch.
+        assert not engine.risk.is_halted()
+
+    def test_pause_entries_does_not_block_exits(self, engine_factory):
+        """Soft pause only blocks new entries. An existing position
+        with an exit signal must still close — same invariant
+        `test_global_halt_does_not_block_exit` proves for halt."""
+        engine, broker = engine_factory(exits=[False] * 59 + [True])
+        positions = {"AAPL": Position("AAPL", 10, 100.0, 1010.0)}
+        snap = _snapshot(positions=positions)
+        engine._session_start_equity = snap.account.equity
+
+        engine.risk.pause_entries(reason="t", command_uid="c")
+
+        self._process(engine, "AAPL", snap)
+
+        broker.close_position.assert_called_once_with("AAPL", position_uid=None)
+        broker.place_order.assert_not_called()
+
+    def test_pause_strategy_is_scoped_to_one_strategy(self, engine_factory):
+        """pause-strategy <name> blocks new entries for that strategy
+        only. Other strategies in the same process should be
+        unaffected. We exercise the scope with the engine's first slot
+        (whose strategy is the FakeStrategy named 'fake_strategy').
+        Pausing 'sma_crossover' must NOT block 'fake_strategy'; pausing
+        'fake_strategy' MUST block it."""
+        engine, broker = engine_factory(entries=[False] * 59 + [True])
+        snap = _snapshot()
+        engine._session_start_equity = snap.account.equity
+        slot_strategy_name = engine.slots[0].strategy.name
+
+        # Pausing a DIFFERENT strategy does not affect the slot's
+        # strategy — entry proceeds.
+        engine.risk.pause_strategy(
+            strategy_name="sma_crossover", reason="other slot",
+            command_uid="cmd_x",
+        )
+        self._process(engine, "AAPL", snap)
+        assert broker.place_order.call_count == 1
+        broker.place_order.reset_mock()
+
+        # Pausing the slot's OWN strategy blocks the entry.
+        engine.risk.resume_strategy(strategy_name="sma_crossover")
+        engine.risk.pause_strategy(
+            strategy_name=slot_strategy_name, reason="this slot",
+            command_uid="cmd_y",
+        )
+        # Need a fresh signal bar — clear processed-signal cache so
+        # the entry decision re-fires.
+        engine._processed_signal_bars.clear()
+        self._process(engine, "AAPL", snap)
+        broker.place_order.assert_not_called()
+
     def test_exit_signal_with_no_position_does_nothing(self, engine_factory):
         engine, broker = engine_factory(exits=[False] * 59 + [True])
         snap = _snapshot()

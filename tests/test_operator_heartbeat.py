@@ -21,10 +21,19 @@ from reporting.logger import TradeLogger
 
 
 def _build_engine(tmp_path):
+    import sqlite3 as _sqlite3
     db_path = tmp_path / "trades.db"
     tl = TradeLogger(path=str(db_path))
-    conn = tl._ensure_db()
-    store = OperatorCommandStore(conn)
+    tl._ensure_db()
+    # PR-65 review F3: production opens a separate cross-thread-safe
+    # connection for the operator-queue store so the cycle thread and
+    # heartbeat thread don't share a transaction. Tests must mirror
+    # that, otherwise the heartbeat thread's claim_next_pending raises
+    # "SQLite objects created in a thread can only be used in that
+    # same thread" (TradeLogger's connection is single-thread now).
+    op_conn = _sqlite3.connect(str(db_path), check_same_thread=False)
+    op_conn.execute("PRAGMA foreign_keys = ON")
+    store = OperatorCommandStore(op_conn)
 
     engine = TradingEngine.__new__(TradingEngine)
     engine.operator_command_store = store
@@ -141,6 +150,51 @@ class TestHeartbeatDrains:
             engine._running = False
             engine._operator_heartbeat_stop.set()
             thread.join(timeout=2.0)
+
+    def test_shutdown_stops_heartbeat_without_explicit_stop(
+        self, tmp_path, monkeypatch
+    ):
+        """PR-65 review F2: max_cycles, exceptions, and restart-loop
+        wrappers can exit `start()` through `_shutdown()` without ever
+        calling `stop()`. The daemon heartbeat must still be joined or
+        it keeps draining operator commands after the engine has
+        shut down. `_shutdown` must call `_stop_operator_heartbeat`."""
+        monkeypatch.setattr(
+            "config.settings.OPERATOR_COMMAND_HEARTBEAT_SECONDS", 1
+        )
+        engine, store = _build_engine(tmp_path)
+        # Minimal _shutdown surface (rest of _shutdown does broker /
+        # stream cleanup we don't exercise here).
+        engine._cycle_count = 0
+        engine.config = MagicMock()
+        engine.config.cancel_orders_on_shutdown = False
+        engine._stream_manager = None
+        engine._start_operator_heartbeat()
+        thread = engine._operator_heartbeat_thread
+        assert thread is not None and thread.is_alive()
+
+        # Simulate the start()-finally branch where _shutdown() runs
+        # but stop() was never called.
+        engine._shutdown()
+
+        # Thread must be joined and the handle cleared.
+        assert thread.is_alive() is False
+        assert engine._operator_heartbeat_thread is None
+
+    def test_stop_operator_heartbeat_is_idempotent(
+        self, tmp_path, monkeypatch
+    ):
+        """`_stop_operator_heartbeat` is called from both `stop()` and
+        `_shutdown()`. Double-call must be safe."""
+        monkeypatch.setattr(
+            "config.settings.OPERATOR_COMMAND_HEARTBEAT_SECONDS", 1
+        )
+        engine, store = _build_engine(tmp_path)
+        engine._start_operator_heartbeat()
+        engine._stop_operator_heartbeat()
+        # Second call must not raise.
+        engine._stop_operator_heartbeat()
+        assert engine._operator_heartbeat_thread is None
 
     def test_loop_survives_queue_errors(self, tmp_path, monkeypatch):
         """If the queue store raises, the heartbeat thread logs and

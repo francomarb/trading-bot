@@ -259,8 +259,14 @@ def run() -> int:
         # Make a fresh DB to avoid the test_operator_cli rows above.
         hb_db = os.path.join(tmp, "trades_hb.db")
         tl = TradeLogger(path=hb_db)
-        conn = tl._ensure_db()
-        store = OperatorCommandStore(conn)
+        tl._ensure_db()
+        # PR-65 review F3: mirror production — open a dedicated
+        # cross-thread-safe connection for the operator store so the
+        # heartbeat thread can read/write it.
+        import sqlite3 as _sqlite3
+        op_conn = _sqlite3.connect(hb_db, check_same_thread=False)
+        op_conn.execute("PRAGMA foreign_keys = ON")
+        store = OperatorCommandStore(op_conn)
 
         engine = TradingEngine.__new__(TradingEngine)
         engine.operator_command_store = store

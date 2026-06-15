@@ -448,16 +448,29 @@ class TradingEngine:
                 logger.warning(f"option stop audit store init skipped: {exc}")
                 self.option_stop_audit_store = None
         # Operator Controls Phase A PR-2 — operator command queue store.
-        # Same DB connection as the lifecycle store. Used by per-cycle
-        # `_process_operator_commands()` to drain queued halt /
-        # resume-after-halt commands written by `scripts/operator.py`.
+        # PR-65 review F3 (Phase B): the store gets its OWN sqlite3
+        # connection (separate from TradeLogger's) so cross-thread
+        # access from the heartbeat thread + Telegram listener cannot
+        # share a transaction with cycle-thread trades/lifecycle writes.
+        # Two distinct connections to the same DB file are coordinated
+        # by SQLite's file-level locking; the store's own threading
+        # RLock serialises its multi-thread callers internally.
         try:
+            import sqlite3 as _sqlite3
             from engine.operator_queue import OperatorCommandStore
-            self.operator_command_store = OperatorCommandStore(
-                self.trade_logger._ensure_db()
+            # Ensure schema is materialised before opening the
+            # dedicated connection (TradeLogger._ensure_db runs the
+            # full migration once).
+            self.trade_logger._ensure_db()
+            op_conn = _sqlite3.connect(
+                self.trade_logger._path, check_same_thread=False
             )
+            op_conn.execute("PRAGMA foreign_keys = ON")
+            self._operator_command_conn = op_conn
+            self.operator_command_store = OperatorCommandStore(op_conn)
         except Exception as exc:
             logger.warning(f"operator command store init skipped: {exc}")
+            self._operator_command_conn = None
             self.operator_command_store = None
         self.pnl_tracker = pnl_tracker or PnLTracker()
         self.alerts = alerts or AlertDispatcher()
@@ -852,8 +865,28 @@ class TradingEngine:
         if self._running:
             logger.info("engine stop requested")
         self._running = False
-        # Phase B — wake the heartbeat sleeper so it observes _running=False
-        # immediately rather than waiting up to HEARTBEAT_SECONDS.
+        # Heartbeat shutdown is idempotent and also re-run in
+        # `_shutdown()` (the `finally:` after `start()`). Calling it
+        # here gives operators an immediate stop signal even if the
+        # cycle thread is mid-sleep; the finally clause is the
+        # guarantee that covers max_cycles / exception / restart-loop
+        # paths where `stop()` was never explicitly called.
+        # (PR-65 review F2.)
+        self._stop_operator_heartbeat()
+
+    def _stop_operator_heartbeat(self) -> None:
+        """Idempotent heartbeat shutdown. Wakes the sleeper, joins with
+        a bounded timeout, and clears the thread handle. Safe to call
+        multiple times.
+
+        Called from:
+          - `stop()` for explicit operator/SIGINT shutdown
+          - `_shutdown()` finally block for max_cycles / exception /
+            restart-loop wrapping
+          - Tests that need deterministic cleanup
+        """
+        # Wake the sleeper so it observes the stop flag immediately
+        # rather than waiting up to HEARTBEAT_SECONDS.
         self._operator_heartbeat_stop.set()
         thread = self._operator_heartbeat_thread
         if thread is not None and thread.is_alive():
@@ -863,6 +896,7 @@ class TradingEngine:
                     "operator heartbeat thread did not exit within 2s; "
                     "daemon=True ensures it won't block process exit"
                 )
+        self._operator_heartbeat_thread = None
 
     # ── Per-cycle pipeline ───────────────────────────────────────────────
 
@@ -2162,6 +2196,10 @@ class TradingEngine:
         self._ensure_recovered_protective_stop(
             snapshot=snapshot, position=position, decision=decision,
         )
+        # PR-65 review F1: `result` was not in scope (helper takes
+        # decision/position/fill_price/fill_qty only). Look up the uid
+        # via the lifecycle store using owner_key, which works for both
+        # the substrate-driven recovery path and any future caller.
         self.alerts.trade_executed(
             symbol=symbol,
             strategy=decision.strategy_name,
@@ -2169,7 +2207,9 @@ class TradingEngine:
             qty=fill_qty,
             price=fill_price,
             reason=f"{decision.reason} {reason_suffix}".strip(),
-            position_uid=getattr(result, "position_uid", None),
+            position_uid=self._lookup_position_uid_for_owner(
+                owner_key_for(symbol)
+            ),
         )
 
     def _maybe_dispatch_substrate_entry_fill(
@@ -3535,7 +3575,10 @@ class TradingEngine:
             return
         self._persist_control_state()
         try:
-            self.alerts.engine_halt(
+            # PR-65 review F4: INFO-severity operator_action alert,
+            # not the CRITICAL engine_halt. A routine pause-entries is
+            # not an emergency.
+            self.alerts.operator_action(
                 f"operator pause-entries: {command.reason} "
                 f"(cmd={command.command_uid[:18]}…) — new entries blocked"
             )
@@ -3567,7 +3610,8 @@ class TradingEngine:
             return
         self._persist_control_state()
         try:
-            self.alerts.engine_halt(
+            # PR-65 review F4: INFO-severity operator_action alert.
+            self.alerts.operator_action(
                 f"operator resume-entries: {command.reason} "
                 f"(cmd={command.command_uid[:18]}…) — entries unblocked"
             )
@@ -3616,7 +3660,8 @@ class TradingEngine:
             return
         self._persist_control_state()
         try:
-            self.alerts.engine_halt(
+            # PR-65 review F4: INFO-severity operator_action alert.
+            self.alerts.operator_action(
                 f"operator pause-strategy {strategy_name}: {command.reason} "
                 f"(cmd={command.command_uid[:18]}…) — "
                 f"{strategy_name} entries blocked"
@@ -3660,7 +3705,8 @@ class TradingEngine:
             return
         self._persist_control_state()
         try:
-            self.alerts.engine_halt(
+            # PR-65 review F4: INFO-severity operator_action alert.
+            self.alerts.operator_action(
                 f"operator resume-strategy {strategy_name}: {command.reason} "
                 f"(cmd={command.command_uid[:18]}…) — "
                 f"{strategy_name} entries unblocked"
@@ -8001,6 +8047,12 @@ class TradingEngine:
 
     def _shutdown(self) -> None:
         logger.info(f"engine stopped after {self._cycle_count} cycle(s)")
+        # PR-65 review F2: covers max_cycles / exception / restart-loop
+        # paths that exit the start() while-loop without calling
+        # `stop()`. _stop_operator_heartbeat is idempotent so explicit
+        # stop() callers see no double-stop side effects.
+        self._running = False
+        self._stop_operator_heartbeat()
         if self.config.cancel_orders_on_shutdown:
             try:
                 for o in self.broker.get_open_orders():
@@ -8010,12 +8062,23 @@ class TradingEngine:
                 logger.error(f"shutdown cleanup failed: {e}")
         if self._stream_manager is not None:
             self._stream_manager.stop()
+        # main: option-stop audit cleanup (PRs #63/#64).
         self._drain_option_stop_audit_events()
         if self.option_stop_audit_store is not None:
             try:
                 self.option_stop_audit_store.close()
             except Exception as exc:
                 logger.warning(f"option-stop audit close failed: {exc}")
+        # PR-65 review F3: close the operator-queue's dedicated SQLite
+        # connection. Cycle-thread connections (TradeLogger / lifecycle
+        # store) are closed elsewhere.
+        op_conn = getattr(self, "_operator_command_conn", None)
+        if op_conn is not None:
+            try:
+                op_conn.close()
+            except Exception as exc:
+                logger.debug(f"operator queue connection close failed: {exc}")
+            self._operator_command_conn = None
 
 
 # ── CLI entry point ──────────────────────────────────────────────────────────
