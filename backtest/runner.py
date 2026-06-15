@@ -168,32 +168,37 @@ def _stop_limit_entry_model(
     atr_series: pd.Series,
 ) -> tuple[pd.Series, pd.Series]:
     """
-    PLAN 11.47 R1 P1-4: model broker-resting STOP_LIMIT entries.
+    PLAN 11.47 R1 P1-4 / R2 P2: model broker-resting STOP_LIMIT entries.
 
     For each signal-bar t whose raw_entry[t] is True, the engine submits
     a DAY stop-limit at trigger[t] with limit cap = trigger[t] + chase.
-    The order rests until execution bar t+1. Three outcomes:
+    The order rests until execution bar t+1. Mechanics on bar t+1:
 
-      1. open[t+1] > limit[t]   — gap above the limit cap; no fill.
-      2. high[t+1] < trigger[t] — price never trades through the trigger;
-                                  DAY expiry, no fill.
-      3. otherwise              — fill at max(open[t+1], trigger[t]),
-                                  capped by limit[t].
+      1. The stop arms when price trades through the trigger — modeled
+         as `high[t+1] >= trigger[t]`. If `high < trigger`, the order
+         never activates and the DAY TIF expires.
+      2. Once armed, the order becomes a BUY LIMIT at limit_price.
+         It fills if intraday price drops to or below limit — modeled
+         as `low[t+1] <= limit[t]`. (A gap-and-retrace: open above the
+         limit, then low retraces down to limit, IS a valid fill.)
+
+    Fill price (when triggered AND limit reachable):
+      - open <= trigger: stop arms intraday; conservative fill at trigger.
+      - trigger <= open <= limit: stop arms at open; fill at open.
+      - open > limit: stop arms at open but the limit is unfillable
+        there; price has to retrace to limit → fill at limit.
 
     Returns (filtered_raw_entries, fill_price_at_signal_bar). The caller
     shifts both forward by 1 to align with vbt's execution-on-next-open
     convention.
-
-    `fill_price_at_signal_bar[t]` carries the modeled fill price for an
-    entry on bar t+1, indexed by t. The caller shifts it forward by 1
-    so vbt uses it at the execution bar.
     """
-    if "high" not in df.columns:
+    if "high" not in df.columns or "low" not in df.columns:
         raise ValueError(
-            "STOP_LIMIT backtest semantics require a 'high' column"
+            "STOP_LIMIT backtest semantics require 'high' and 'low' columns"
         )
     next_open = df["open"].shift(-1)
     next_high = df["high"].shift(-1)
+    next_low  = df["low"].shift(-1)
 
     # Per-bar limit cap: anchored to the trigger, not the close. Mirrors
     # the engine's compute_cap_price call at the STOP_LIMIT signal site.
@@ -224,21 +229,42 @@ def _stop_limit_entry_model(
             limit_values, index=trigger_series.index, dtype=float,
         )
 
-    # Block conditions at signal bar t (next bar = execution).
-    valid = trigger_series.notna() & limit_series.notna() & next_open.notna() & next_high.notna()
-    gap_over_limit = valid & (next_open > limit_series)
-    trigger_unreached = valid & (next_high < trigger_series)
-    blocked = gap_over_limit | trigger_unreached
-
-    filtered = raw_entries.astype(bool) & ~blocked
-    # Last bar has no next bar — drop any entry there (no t+1 to execute on).
-    filtered = filtered & valid
-
-    # Fill price for an entry that lands: max(open, trigger) capped at limit.
-    fill_at_open_or_trigger = next_open.where(
-        next_open >= trigger_series, trigger_series
+    valid = (
+        trigger_series.notna()
+        & limit_series.notna()
+        & next_open.notna()
+        & next_high.notna()
+        & next_low.notna()
     )
-    fill_price_at_signal = fill_at_open_or_trigger.clip(upper=limit_series)
+
+    # Fillable when the stop arms (high >= trigger) AND the limit
+    # is reachable (low <= limit). This covers the gap-and-retrace
+    # case: open > limit but low <= limit fills at limit.
+    triggered = next_high >= trigger_series
+    limit_reachable = next_low <= limit_series
+    fillable = valid & triggered & limit_reachable
+
+    filtered = raw_entries.astype(bool) & fillable
+
+    # Fill price (only meaningful where filtered is True):
+    #   open > limit              → fill at limit (gap-and-retrace down)
+    #   trigger <= open <= limit  → fill at open (stop arms at open)
+    #   open < trigger            → fill at trigger (stop arms intraday)
+    fill_price_at_signal = pd.Series(
+        np.where(
+            next_open > limit_series,
+            limit_series,
+            np.where(
+                next_open >= trigger_series,
+                next_open,
+                trigger_series,
+            ),
+        ),
+        index=trigger_series.index,
+        dtype=float,
+    )
+    # Final safety: never above limit (covers floating-point edges).
+    fill_price_at_signal = fill_price_at_signal.clip(upper=limit_series)
 
     return filtered, fill_price_at_signal
 

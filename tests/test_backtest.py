@@ -380,18 +380,17 @@ class TestStopLimitEntryModel:
         from execution.entry_guard import EntryPriceCap
         return EntryPriceCap(max_chase_bps=500)
 
-    def test_gap_over_limit_blocks_entry(self):
+    def test_gap_over_limit_without_retrace_blocks_entry(self):
         # entry_window=5: trigger at bar t = max(close[t-5:t-1]).
         # Flat at 100 for bars 0–5 → no breakout there. Bar 6 closes 110 →
         # first breakout (close 110 > prior-5 max 100). Trigger[6] = 100,
-        # limit[6] = 100 * 1.05 = 105. Bar 7 opens 130 → gap over limit.
-        # Must NOT fill, and no later bar can re-fire the breakout because
-        # we don't add more bars after bar 7 — the model drops last-bar
-        # entries anyway.
+        # limit[6] = 100 * 1.05 = 105. Bar 7 opens 130 and the LOW stays
+        # above 105 (no retrace) → the limit never becomes reachable
+        # intraday, so no fill.
         closes = [100, 100, 100, 100, 100, 100, 110, 130]
         opens  = [100, 100, 100, 100, 100, 100, 100, 130]
-        highs  = [c + 0.5 for c in closes]
-        lows   = [c - 0.5 for c in closes]
+        highs  = [100.5, 100.5, 100.5, 100.5, 100.5, 100.5, 110.5, 132.0]
+        lows   = [99.5, 99.5, 99.5, 99.5, 99.5, 99.5, 99.5, 128.0]
         df = self._df_for(opens=opens, highs=highs, lows=lows, closes=closes)
 
         result = run_backtest(
@@ -399,8 +398,31 @@ class TestStopLimitEntryModel:
             BacktestConfig(slippage_bps=0, commission_per_trade=0),
             entry_price_cap_policy=self._policy(),
         )
-        # No trade — bar-6 entry was blocked by gap-over-limit at bar 7.
+        # No trade — limit unreachable on the only entry-eligible bar.
         assert result.stats["trade_count"] == 0
+
+    def test_gap_over_limit_with_retrace_fills_at_limit(self):
+        # Same flat-then-breakout setup as above, but bar 7 gaps above
+        # limit and then the intraday LOW retraces *down to or below* the
+        # limit. A real broker-resting stop-limit triggers on the gap
+        # (high crosses trigger immediately at the open) and the limit
+        # order fills as price retraces to limit. Modeled fill = limit.
+        closes = [100, 100, 100, 100, 100, 100, 110, 120]
+        opens  = [100, 100, 100, 100, 100, 100, 100, 130]
+        highs  = [100.5, 100.5, 100.5, 100.5, 100.5, 100.5, 110.5, 132.0]
+        lows   = [99.5, 99.5, 99.5, 99.5, 99.5, 99.5, 99.5, 103.0]
+        df = self._df_for(opens=opens, highs=highs, lows=lows, closes=closes)
+
+        result = run_backtest(
+            self._strategy(), df,
+            BacktestConfig(slippage_bps=0, commission_per_trade=0),
+            entry_price_cap_policy=self._policy(),
+        )
+        assert result.stats["trade_count"] >= 1
+        records = result.portfolio.trades.records_readable
+        first_trade = records.iloc[0]
+        # Trigger=100, limit=105. Gap-and-retrace fill at limit=105.
+        assert abs(float(first_trade["Avg Entry Price"]) - 105.0) < 0.01
 
     def test_trigger_unreached_blocks_entry(self):
         # Same flat-then-breakout setup. Bar 7's high stays below the
