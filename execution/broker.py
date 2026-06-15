@@ -82,6 +82,7 @@ with warnings.catch_warnings():
         LimitOrderRequest,
         MarketOrderRequest,
         ReplaceOrderRequest,
+        StopLimitOrderRequest,
         StopOrderRequest,
         StopLossRequest,
     )
@@ -1361,6 +1362,38 @@ class AlpacaBroker:
                 stop_loss=stop_loss,
                 client_order_id=client_order_id,
                 limit_price=round(decision.limit_price, 2),
+            )
+        elif decision.order_type is OrderType.STOP_LIMIT:
+            # PLAN 11.47: Donchian breakout entries rest at the broker as a
+            # DAY stop-limit. The stop arms when price trades through the
+            # prior-N-day high (`entry_trigger_price`); the limit prevents
+            # chase past `limit_price`. DAY TIF (never GTC) so an unfilled
+            # arming order expires at session close instead of ghost-filling
+            # the next session at a stale level. OTO carries the protective
+            # ATR stop, recorded by the substrate via P-4 dispatch as a
+            # `protective_stop` row.
+            if decision.entry_trigger_price is None or decision.limit_price is None:
+                raise ValueError(
+                    "STOP_LIMIT decision missing entry_trigger_price or limit_price"
+                )
+            trigger = round(decision.entry_trigger_price, 2)
+            cap = round(decision.limit_price, 2)
+            logger.info(
+                f"[entry-guard] {decision.symbol}: STOP_LIMIT trigger=${trigger:.2f}, "
+                f"limit=${cap:.2f} (ref ${decision.entry_reference_price:.2f}, "
+                f"stop ${decision.stop_price:.2f}); submitting as DAY STOP_LIMIT + OTO"
+            )
+            order_request = StopLimitOrderRequest(
+                symbol=decision.symbol,
+                qty=decision.qty,
+                side=AlpacaOrderSide.BUY if decision.side is Side.BUY else AlpacaOrderSide.SELL,
+                type=AlpacaOrderType.STOP_LIMIT,
+                time_in_force=TimeInForce.DAY,
+                order_class=AlpacaOrderClass.OTO,
+                stop_loss=stop_loss,
+                client_order_id=client_order_id,
+                stop_price=trigger,
+                limit_price=cap,
             )
         else:
             order_request = MarketOrderRequest(
