@@ -470,6 +470,7 @@ class AlpacaBroker:
         order_class: str,
         time_in_force: str,
         intended_stop_price: float | None = None,
+        intended_trigger_price: float | None = None,
         intended_limit_price: float | None = None,
         parent_order_id: str | None = None,
         replaces_order_id: str | None = None,
@@ -532,6 +533,7 @@ class AlpacaBroker:
                 side=decision.side.value,
                 intended_qty=float(decision.qty),
                 intended_stop_price=intended_stop_price,
+                intended_trigger_price=intended_trigger_price,
                 intended_limit_price=intended_limit_price,
                 parent_order_id=parent_order_id,
                 replaces_order_id=replaces_order_id,
@@ -1449,6 +1451,19 @@ class AlpacaBroker:
             order_class="oto",
             time_in_force=str(order_request.time_in_force.value),
             intended_stop_price=float(decision.stop_price),
+            # PLAN 11.47 R1 P1-1: STOP_LIMIT entries persist the broker stop
+            # arming level (decision.entry_trigger_price). The substrate-
+            # recovery path in the engine reads this back to reconstruct a
+            # valid STOP_LIMIT RiskDecision (which __post_init__ requires
+            # both trigger and limit, else raises). Other order types pass
+            # None — only StopLimit* requests have a distinct stop_price
+            # *and* limit_price; for OTO MARKET/LIMIT the stop_loss leg
+            # carries the protective stop and there is no entry trigger.
+            intended_trigger_price=(
+                float(decision.entry_trigger_price)
+                if decision.entry_trigger_price is not None
+                else None
+            ),
             intended_limit_price=(
                 float(order_request.limit_price)
                 if getattr(order_request, "limit_price", None) is not None

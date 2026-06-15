@@ -2253,6 +2253,40 @@ class TestLifecycleOrdersSubstrate:
         # value is what we stored as intended_limit_price.
         assert kwargs["intended_limit_price"] == 99.12
 
+    def test_stop_limit_entry_records_intended_trigger_and_limit(self):
+        # PLAN 11.47 R1 P1-1: the substrate must persist entry_trigger_price
+        # so the async fill-dispatch path can reconstruct a valid
+        # STOP_LIMIT RiskDecision. Without it __post_init__ raises and
+        # ownership recovery falls into the CRITICAL log branch.
+        api = MagicMock()
+        api.submit_order.return_value = _alpaca_order(
+            status="accepted", type="stop_limit",
+        )
+        api.get_order_by_id.return_value = _alpaca_order(
+            status="accepted", type="stop_limit", filled_qty=0,
+        )
+        orders_store = MagicMock()
+        broker = self._broker_with_substrate(api, orders_store)
+
+        broker.place_order(
+            _decision(
+                qty=10,
+                entry=120.0,
+                stop=110.0,
+                order_type=OrderType.STOP_LIMIT,
+                entry_trigger_price=121.50,
+                limit_price=125.00,
+                strategy="donchian_breakout",
+            ),
+            poll_timeout=0.0,
+            poll_interval=0.0,
+        )
+        kwargs = orders_store.insert_pending.call_args.kwargs
+        assert kwargs["order_type"] == "stop_limit"
+        assert kwargs["intended_trigger_price"] == 121.50
+        assert kwargs["intended_limit_price"] == 125.00
+        assert kwargs["intended_stop_price"] == 110.0
+
     def test_substrate_insert_skipped_before_dry_run(self):
         """A dry run must not leak a pending per-order row (mirrors the
         equivalent guard for position_lifecycle rows)."""

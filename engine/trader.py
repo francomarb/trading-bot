@@ -2076,6 +2076,39 @@ class TradingEngine:
                 )
                 return
             from risk.manager import RiskDecision, Side
+            # PLAN 11.47 R1 P1-1: STOP_LIMIT requires both entry_trigger_price
+            # and limit_price on the RiskDecision; without them __post_init__
+            # raises, gets caught below as CRITICAL, and ownership never
+            # binds. Pull both back from the substrate row.
+            recovered_order_type = OrderType(order_row.order_type)
+            extra_kwargs: dict = {}
+            if recovered_order_type is OrderType.STOP_LIMIT:
+                trigger = order_row.intended_trigger_price
+                limit = order_row.intended_limit_price
+                if trigger is None or limit is None:
+                    # Legacy / pre-PLAN-11.47 substrate rows (or a bug
+                    # upstream) cannot reconstruct a valid STOP_LIMIT
+                    # decision. Fall back to MARKET — the side effects
+                    # _apply_recovered_entry_side_effects fires
+                    # (ownership bind, entry-price cache, stop
+                    # replacement, alert) are order-type agnostic.
+                    logger.warning(
+                        f"substrate entry-fill dispatch: STOP_LIMIT row "
+                        f"missing trigger/limit for {symbol} order_id="
+                        f"{event.order_id}; reconstructing as MARKET "
+                        f"for recovery side effects"
+                    )
+                    recovered_order_type = OrderType.MARKET
+                else:
+                    extra_kwargs["entry_trigger_price"] = float(trigger)
+                    extra_kwargs["limit_price"] = float(limit)
+            elif recovered_order_type is OrderType.LIMIT:
+                # LIMIT also requires a limit_price for shape validation.
+                limit = order_row.intended_limit_price
+                if limit is not None:
+                    extra_kwargs["limit_price"] = float(limit)
+                else:
+                    recovered_order_type = OrderType.MARKET
             decision = RiskDecision(
                 symbol=symbol,
                 side=Side.BUY,
@@ -2084,7 +2117,8 @@ class TradingEngine:
                 stop_price=float(order_row.intended_stop_price or 0.0),
                 strategy_name=pos_row.strategy,
                 reason="substrate dispatch",
-                order_type=OrderType(order_row.order_type),
+                order_type=recovered_order_type,
+                **extra_kwargs,
             )
             self._apply_recovered_entry_side_effects(
                 snapshot=snapshot,
