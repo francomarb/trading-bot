@@ -828,6 +828,63 @@ class TestStopLimitEntry:
         assert result.filled_qty == 0
         assert result.avg_fill_price is None
 
+    def test_stop_limit_default_timeout_is_short(self, monkeypatch):
+        # PLAN 11.47 R1 P1-2: when the caller (the engine) omits poll_timeout,
+        # STOP_LIMIT must resolve to the short RESTING_ENTRY_CONFIRM_TIMEOUT
+        # — not the 240s ORDER_CONFIRM_TIMEOUT meant for synchronous fills.
+        # Resting orders are expected to be unfilled at submit time; the
+        # substrate's WS / cycle / startup drains pick up the eventual fill.
+        api = MagicMock()
+        api.submit_order.return_value = _alpaca_order(
+            status="accepted", type="stop_limit", filled_qty=0,
+        )
+        api.get_order_by_id.return_value = _alpaca_order(
+            status="accepted", type="stop_limit", filled_qty=0,
+        )
+        broker = _broker_with_mock(api)
+
+        captured: dict = {}
+        original = broker._wait_for_fill
+
+        def _capture_wait(*args, **kwargs):
+            captured["timeout"] = kwargs.get("timeout")
+            return original(*args, **kwargs)
+
+        monkeypatch.setattr(broker, "_wait_for_fill", _capture_wait)
+
+        # No explicit poll_timeout — the engine's production call shape.
+        broker.place_order(self._decision_stop_limit())
+
+        from config.settings import (
+            ORDER_CONFIRM_TIMEOUT_SECONDS,
+            RESTING_ENTRY_CONFIRM_TIMEOUT_SECONDS,
+        )
+        assert captured["timeout"] == RESTING_ENTRY_CONFIRM_TIMEOUT_SECONDS
+        # And the sanity check: it's *not* the 4-minute synchronous default.
+        assert captured["timeout"] < ORDER_CONFIRM_TIMEOUT_SECONDS
+
+    def test_market_default_timeout_is_long(self, monkeypatch):
+        # Inverse assertion: non-STOP_LIMIT orders keep the long default
+        # (synchronous fill semantics — the caller wants to wait).
+        api = MagicMock()
+        api.submit_order.return_value = _alpaca_order(status="filled")
+        api.get_order_by_id.return_value = _alpaca_order(status="filled")
+        broker = _broker_with_mock(api)
+
+        captured: dict = {}
+        original = broker._wait_for_fill
+
+        def _capture_wait(*args, **kwargs):
+            captured["timeout"] = kwargs.get("timeout")
+            return original(*args, **kwargs)
+
+        monkeypatch.setattr(broker, "_wait_for_fill", _capture_wait)
+
+        broker.place_order(_decision())
+
+        from config.settings import ORDER_CONFIRM_TIMEOUT_SECONDS
+        assert captured["timeout"] == ORDER_CONFIRM_TIMEOUT_SECONDS
+
     def test_stop_limit_clean_intraday_fill_at_trigger(self):
         # Clean breakout: stop arms at the trigger and the limit allows fill.
         # Alpaca returns FILLED with avg_fill_price between trigger and limit.

@@ -99,6 +99,7 @@ from config.settings import (
     DRY_RUN,
     FRACTIONAL_ENABLED,
     ORDER_CONFIRM_TIMEOUT_SECONDS,
+    RESTING_ENTRY_CONFIRM_TIMEOUT_SECONDS,
 )
 from risk.manager import AccountState, Position, RiskDecision, Side
 from strategies.base import OrderType
@@ -1097,7 +1098,7 @@ class AlpacaBroker:
         self,
         decision: RiskDecision,
         *,
-        poll_timeout: float = ORDER_CONFIRM_TIMEOUT_SECONDS,
+        poll_timeout: float | None = None,
         poll_interval: float = 1.0,
         slippage_benchmark_price: float | None = None,
         slippage_benchmark_kind: str | None = None,
@@ -1133,6 +1134,18 @@ class AlpacaBroker:
             raise TypeError(
                 f"place_order requires a RiskDecision (got {type(decision).__name__}). "
                 "Strategy signals must go through RiskManager.evaluate first."
+            )
+        # PLAN 11.47 R1 P1-2: resolve the order-type-dependent timeout default.
+        # STOP_LIMIT entries rest at the broker (unfilled is the expected state
+        # at submit time), so polling for 240s would stall the serial symbol
+        # loop on every Donchian submission. The substrate's WS / cycle / startup
+        # drains capture the eventual fill regardless. Explicit caller values
+        # (most existing tests) bypass this and use whatever they passed.
+        if poll_timeout is None:
+            poll_timeout = (
+                RESTING_ENTRY_CONFIRM_TIMEOUT_SECONDS
+                if decision.order_type is OrderType.STOP_LIMIT
+                else ORDER_CONFIRM_TIMEOUT_SECONDS
             )
         if not self._entries_allowed():
             logger.warning(

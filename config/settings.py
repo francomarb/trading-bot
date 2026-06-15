@@ -71,6 +71,18 @@ ORDER_CONFIRM_TIMEOUT_SECONDS: float = float(
     os.getenv("ORDER_CONFIRM_TIMEOUT_SECONDS", "240")
 )
 
+# Broker order confirmation window — broker-resting STOP_LIMIT entries (PLAN 11.47).
+# Resting orders are EXPECTED to be unfilled at submit time (the stop arms only
+# when price trades through the trigger). Polling for 240s would stall the
+# serial symbol loop for every Donchian submission; the substrate's
+# WebSocket / cycle reconcile / startup reconcile drains capture the eventual
+# fill regardless. Keep the timeout long enough to capture the rare
+# trigger-already-in-band intraday fill on submit, and short enough to release
+# the cycle loop quickly.
+RESTING_ENTRY_CONFIRM_TIMEOUT_SECONDS: float = float(
+    os.getenv("RESTING_ENTRY_CONFIRM_TIMEOUT_SECONDS", "5")
+)
+
 # Multi-leg options entry watch window
 # Credit spreads often need longer than single-leg options to fill at a fair
 # net price. Give MLEG combo orders more time to work before we cancel them.
