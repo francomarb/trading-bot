@@ -224,6 +224,14 @@ class RiskDecision:
         # trigger arms the stop-limit at the prior-N-day high; the limit caps
         # the chase after the trigger fires.
         if self.order_type is OrderType.STOP_LIMIT:
+            # Alpaca rejects fractional stop-limit. Sizing (`_size_position`)
+            # already floors to int for STOP_LIMIT, but enforce here as a
+            # last-line invariant for manually-constructed decisions.
+            if float(self.qty).is_integer() is False:
+                raise ValueError(
+                    f"STOP_LIMIT order requires whole-share qty (Alpaca "
+                    f"rejects fractional stop-limit), got qty={self.qty}"
+                )
             if self.entry_trigger_price is None or self.entry_trigger_price <= 0:
                 raise ValueError(
                     "STOP_LIMIT order requires a positive entry_trigger_price, "
@@ -619,6 +627,11 @@ class RiskManager:
         # Choose floor function based on fractional mode.
         # LIMIT orders (RSI reversion) always use whole shares — Alpaca GTC
         # limit orders do not support fractional quantities. Options cannot be fractional.
+        # STOP_LIMIT (PLAN 11.47, Donchian) is also whole-share — Alpaca rejects
+        # fractional stop-limit orders, so we floor to int here and let the
+        # POSITION_TOO_SMALL gate below reject sub-share entries explicitly
+        # rather than rounding up to 1 share (which would silently amplify
+        # risk past the configured budget).
         fractional = (
             settings.FRACTIONAL_ENABLED
             and signal.order_type is OrderType.MARKET

@@ -247,6 +247,33 @@ class TestSignalValidationStopLimit:
         assert decision.entry_trigger_price == 100.5
         assert decision.limit_price == 101.0
 
+    def test_stop_limit_decision_qty_is_whole_share(self):
+        # Even with FRACTIONAL_ENABLED=True (the LIVE_TRADING/paper default),
+        # STOP_LIMIT must floor to int because Alpaca rejects fractional
+        # stop-limit. _size_position's fractional branch is gated on MARKET.
+        decision = _mgr().evaluate(
+            self._stop_limit_signal(),
+            _account(equity=100_000.0),
+            now=T0,
+        )
+        assert isinstance(decision, RiskDecision)
+        assert float(decision.qty).is_integer(), (
+            f"STOP_LIMIT qty must be whole-share, got {decision.qty}"
+        )
+
+    def test_stop_limit_sub_share_rejected(self):
+        # 1 share at the entry trigger needs ~$100.5 of risk budget.
+        # max_position_pct=0.02 → risk_dollars = equity * 0.02. With
+        # equity=$100, risk_dollars=$2 — far below a single-share stop
+        # loss of (ref - stop) = $10. Sizing rounds to 0 → POSITION_TOO_SMALL.
+        rej = _mgr().evaluate(
+            self._stop_limit_signal(price=100.0, atr=2.5),  # stop=95
+            _account(equity=100.0, cash=100.0),
+            now=T0,
+        )
+        assert isinstance(rej, RiskRejection)
+        assert rej.code is RejectionCode.POSITION_TOO_SMALL
+
 
 # ── Stop placement & position sizing ────────────────────────────────────────
 
@@ -842,6 +869,18 @@ class TestRiskDecisionStopLimitShape:
     def test_entry_max_price_rejected_on_stop_limit(self):
         with pytest.raises(ValueError, match="STOP_LIMIT"):
             RiskDecision(**self._kwargs(entry_max_price=102.0))
+
+    def test_fractional_qty_rejected_on_stop_limit(self):
+        # Alpaca rejects fractional stop-limit; the RiskDecision invariant
+        # catches manually-constructed decisions before they reach the broker.
+        with pytest.raises(ValueError, match="whole-share"):
+            RiskDecision(**self._kwargs(qty=10.5))
+
+    def test_integer_valued_float_qty_accepted_on_stop_limit(self):
+        # qty=10.0 (float but integer-valued) is fine — it's the round-trip
+        # form _size_position produces after math.floor.
+        decision = RiskDecision(**self._kwargs(qty=10.0))
+        assert decision.qty == 10.0
 
 
 # ── Halt behaviour ──────────────────────────────────────────────────────────
