@@ -100,6 +100,16 @@ class _TrackedOrder:
     aliases: set[str] = field(default_factory=set)
 
 
+@dataclass
+class _OptionStopAuditWatch:
+    """Bounded alias set for one option-stop replacement decision."""
+
+    correlation_id: str
+    strategy: str
+    occ_symbol: str
+    expires_at: datetime
+
+
 def _utcnow() -> datetime:
     return datetime.now(timezone.utc)
 
@@ -142,6 +152,8 @@ class StreamManager:
         # connection — see foundation commit 12 / round-2 finding 2).
         # Each entry is an engine.lifecycle_orders.OrderEvent.
         self._pending_lifecycle_events: list[Any] = []
+        self._option_stop_audit_by_alias: dict[str, _OptionStopAuditWatch] = {}
+        self._option_stop_audit_events: list[Any] = []
         self._health = StreamHealth(
             connected=False,
             healthy=False,
@@ -288,6 +300,75 @@ class StreamManager:
             events = list(self._pending_lifecycle_events)
             self._pending_lifecycle_events.clear()
             return events
+
+    def register_option_stop_audit(
+        self,
+        *,
+        correlation_id: str,
+        strategy: str,
+        occ_symbol: str,
+        aliases: list[str] | tuple[str, ...] | set[str],
+        expires_at: datetime,
+    ) -> None:
+        """Associate order/client ids with one bounded audit incident."""
+        normalized = {str(alias) for alias in aliases if alias}
+        if not correlation_id or not normalized:
+            return
+        if expires_at.tzinfo is None:
+            expires_at = expires_at.replace(tzinfo=timezone.utc)
+        with self._lock:
+            self._prune_option_stop_audits_locked(_utcnow())
+            watch = _OptionStopAuditWatch(
+                correlation_id=correlation_id,
+                strategy=strategy,
+                occ_symbol=occ_symbol,
+                expires_at=expires_at.astimezone(timezone.utc),
+            )
+            for alias in normalized:
+                self._option_stop_audit_by_alias[alias] = watch
+
+    def bind_option_stop_audit_alias(
+        self, correlation_id: str, alias: str
+    ) -> None:
+        """Add the replacement broker order id to an existing audit."""
+        if not alias:
+            return
+        with self._lock:
+            watch = next(
+                (
+                    candidate
+                    for candidate in self._option_stop_audit_by_alias.values()
+                    if candidate.correlation_id == correlation_id
+                ),
+                None,
+            )
+            if watch is None:
+                return
+            self._option_stop_audit_by_alias[str(alias)] = watch
+
+    def drain_option_stop_audit_events(self) -> list[Any]:
+        """Return queued audit events for durable engine-thread persistence."""
+        with self._lock:
+            self._prune_option_stop_audits_locked(_utcnow())
+            events = list(self._option_stop_audit_events)
+            self._option_stop_audit_events.clear()
+            return events
+
+    def _prune_option_stop_audits_locked(self, now: datetime) -> None:
+        expired = {
+            watch.correlation_id
+            for watch in self._option_stop_audit_by_alias.values()
+            if watch.expires_at <= now
+        }
+        if expired:
+            self._remove_option_stop_audits_locked(expired)
+
+    def _remove_option_stop_audits_locked(
+        self, correlation_ids: set[str]
+    ) -> None:
+        for alias, watch in list(self._option_stop_audit_by_alias.items()):
+            if watch.correlation_id in correlation_ids:
+                self._option_stop_audit_by_alias.pop(alias, None)
 
     def health_snapshot(self) -> StreamHealth:
         """Return an immutable snapshot of current websocket health."""
@@ -761,6 +842,7 @@ class StreamManager:
             symbol = leg_symbols[0]
         return SimpleNamespace(
             event=SimpleNamespace(value=event_val),
+            timestamp=getattr(order, "updated_at", None),
             qty=qty,
             price=avg_price,
             is_combo=bool(leg_symbols),
@@ -773,6 +855,8 @@ class StreamManager:
                 filled_avg_price=(
                     None if avg_price is None else str(avg_price)
                 ),
+                status=getattr(order, "status", None),
+                updated_at=getattr(order, "updated_at", None),
                 # Slippage unification Phase 1 hotfix — preserve stop_price
                 # on the gap-resync path so a stop fill discovered after
                 # a stream reconnect still benchmarks against the broker's
@@ -799,6 +883,7 @@ class StreamManager:
             event=SimpleNamespace(
                 value=(event.value if hasattr(event, "value") else str(event))
             ),
+            timestamp=data.get("timestamp"),
             qty=(0.0 if qty is None else float(qty)),
             price=(None if price is None else float(price)),
             is_combo=bool(leg_symbols),
@@ -809,6 +894,8 @@ class StreamManager:
                 symbol=symbol,
                 filled_qty=str(order.get("filled_qty") or 0),
                 filled_avg_price=order.get("filled_avg_price"),
+                status=order.get("status"),
+                updated_at=order.get("updated_at"),
                 # Slippage unification Phase 1 hotfix — stop_price must
                 # round-trip from the Alpaca trade_updates payload so
                 # log_stop_fill can benchmark against the actual broker
@@ -840,6 +927,32 @@ class StreamManager:
         )
 
         with self._lock:
+            now = _utcnow()
+            if self._option_stop_audit_by_alias:
+                self._prune_option_stop_audits_locked(now)
+                audit_watch = self._option_stop_audit_by_alias.get(order_id)
+                if audit_watch is None and client_order_id is not None:
+                    audit_watch = self._option_stop_audit_by_alias.get(
+                        client_order_id
+                    )
+                if audit_watch is not None:
+                    audit_event = self._build_option_stop_audit_record(
+                        audit_watch,
+                        update,
+                        event_val,
+                        received_at=now,
+                    )
+                    self._option_stop_audit_events.append(audit_event)
+                    if event_val in {
+                        "fill",
+                        "canceled",
+                        "rejected",
+                        "expired",
+                    }:
+                        self._remove_option_stop_audits_locked(
+                            {audit_watch.correlation_id}
+                        )
+
             if order_id in self._stop_legs:
                 if event_val in _FILL_EVENTS:
                     self._stop_fills.append(update)
@@ -881,6 +994,36 @@ class StreamManager:
             )
             if substrate_event is not None:
                 self._pending_lifecycle_events.append(substrate_event)
+
+    @staticmethod
+    def _build_option_stop_audit_record(
+        watch: _OptionStopAuditWatch,
+        update: Any,
+        event_val: str,
+        *,
+        received_at: datetime,
+    ) -> dict[str, Any]:
+        order = update.order
+        return {
+            "correlation_id": watch.correlation_id,
+            "recorded_at": received_at,
+            "record_type": f"stream_{event_val}",
+            "strategy": watch.strategy,
+            "occ_symbol": watch.occ_symbol,
+            "order_id": str(getattr(order, "id")),
+            "payload": {
+                "event_timestamp": getattr(update, "timestamp", None),
+                "qty": getattr(update, "qty", None),
+                "price": getattr(update, "price", None),
+                "client_order_id": getattr(order, "client_order_id", None),
+                "symbol": getattr(order, "symbol", None),
+                "status": getattr(order, "status", None),
+                "filled_qty": getattr(order, "filled_qty", None),
+                "filled_avg_price": getattr(order, "filled_avg_price", None),
+                "stop_price": getattr(order, "stop_price", None),
+                "broker_updated_at": getattr(order, "updated_at", None),
+            },
+        }
 
     @staticmethod
     def _build_substrate_event(

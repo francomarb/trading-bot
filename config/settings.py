@@ -98,6 +98,25 @@ OPTION_TRAILING_MAX_SPREAD_PCT: float = float(
 OPTION_TRAILING_STOP_BID_BUFFER_PCT: float = float(
     os.getenv("OPTION_TRAILING_STOP_BID_BUFFER_PCT", "0.05")
 )
+# Temporary, opt-in forensic capture for the SPY options-reversion stop
+# replacement investigation. Disabled means no diagnostic DB, extra broker
+# reads, stream watches, or writes.
+OPTION_STOP_REPLACE_AUDIT_ENABLED: bool = os.getenv(
+    "OPTION_STOP_REPLACE_AUDIT_ENABLED", "false"
+).lower() in ("true", "1", "yes")
+OPTION_STOP_REPLACE_AUDIT_STRATEGY: str = os.getenv(
+    "OPTION_STOP_REPLACE_AUDIT_STRATEGY", "spy_options_reversion"
+)
+OPTION_STOP_REPLACE_AUDIT_DB_PATH: str = os.getenv(
+    "OPTION_STOP_REPLACE_AUDIT_DB_PATH",
+    "data/diagnostics/option_stop_replace_audit.db",
+)
+OPTION_STOP_REPLACE_AUDIT_WINDOW_SECONDS: float = float(
+    os.getenv("OPTION_STOP_REPLACE_AUDIT_WINDOW_SECONDS", "300")
+)
+OPTION_STOP_REPLACE_AUDIT_RETENTION_DAYS: int = int(
+    os.getenv("OPTION_STOP_REPLACE_AUDIT_RETENTION_DAYS", "14")
+)
 
 # Multi-leg options entry watch window
 # Credit spreads often need longer than single-leg options to fill at a fair

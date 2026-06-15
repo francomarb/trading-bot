@@ -1961,6 +1961,43 @@ class TestOptionGtcStops:
 
         assert broker.get_latest_option_quote("SPY260702C00737000") is None
 
+    def test_order_audit_snapshot_preserves_broker_state_and_raw_payload(self):
+        api = MagicMock()
+        order = _alpaca_order(
+            id="stop-1",
+            status="new",
+            symbol="SPY260702C00724000",
+            side="sell",
+            qty=2,
+            type="stop",
+            stop_price="19.55",
+            time_in_force="gtc",
+        )
+        order.updated_at = "2026-06-15T14:30:00Z"
+        order.replaced_at = None
+        order.replaces = "old-stop"
+        api.get_order_by_id.return_value = order
+        broker = AlpacaBroker(client=api, max_attempts=1, base_delay=0.0)
+
+        snapshot = broker.get_order_audit_snapshot("stop-1")
+
+        assert snapshot is not None
+        assert snapshot.order_id == "stop-1"
+        assert snapshot.stop_price == pytest.approx(19.55)
+        assert snapshot.qty == pytest.approx(2)
+        assert snapshot.time_in_force == "gtc"
+        assert snapshot.replaces_order_id == "old-stop"
+        assert '"id": "stop-1"' in snapshot.raw_json
+        assert snapshot.latency_ms >= 0
+
+    def test_order_audit_snapshot_is_best_effort_without_retries(self):
+        api = MagicMock()
+        api.get_order_by_id.side_effect = RuntimeError("temporary failure")
+        broker = AlpacaBroker(client=api, max_attempts=5, base_delay=0.0)
+
+        assert broker.get_order_audit_snapshot("stop-1") is None
+        api.get_order_by_id.assert_called_once_with("stop-1")
+
     def test_submit_option_gtc_stop_uses_gtc_sell_stop(self):
         api = MagicMock()
         api.submit_order.return_value = _alpaca_order(
@@ -2014,6 +2051,7 @@ class TestOptionGtcStops:
             order_id="stop-1",
             qty=3,
             stop_price=18.70,
+            client_order_id="audit-client-1",
         )
 
         order_id, req = api.replace_order_by_id.call_args.args
@@ -2021,6 +2059,7 @@ class TestOptionGtcStops:
         assert req.qty == 3
         assert req.stop_price == 18.70
         assert req.time_in_force.value == "gtc"
+        assert req.client_order_id == "audit-client-1"
         assert result.order_id == "stop-2"
         assert result.time_in_force == "gtc"
         stream.unregister_stop_leg.assert_called_once_with("stop-1")

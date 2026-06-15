@@ -49,7 +49,8 @@ import os
 import re
 import signal
 import time
-from dataclasses import dataclass, field, replace
+import uuid
+from dataclasses import asdict, dataclass, field, replace
 from datetime import datetime, timedelta, timezone
 from typing import TYPE_CHECKING, Callable
 from zoneinfo import ZoneInfo
@@ -74,6 +75,7 @@ from engine.option_trailing import OptionTrailingStopStore
 from execution.entry_guard import CapAction, compute_cap_price, gate_entry
 from execution.broker import (
     AlpacaBroker,
+    BrokerOrderAuditSnapshot,
     BrokerSnapshot,
     OptionQuote,
     OrderResult,
@@ -126,6 +128,16 @@ _OCC_PAT = re.compile(r"^[A-Z]{1,6}[0-9]{6}[CP][0-9]{8}$")
 # several cycles rather than blowing the per-cycle Alpaca API
 # budget in one shot.
 _SUBSTRATE_CYCLE_RECONCILE_LIMIT = 20
+
+
+@dataclass(frozen=True)
+class _OptionStopAuditContext:
+    """One enabled, strategy-scoped replacement audit window."""
+
+    correlation_id: str
+    decision_at: datetime
+    expires_at: datetime
+    broker_before: BrokerOrderAuditSnapshot | None
 
 
 # P-2: Alpaca REST order.status → substrate status. Same intent as
@@ -243,6 +255,21 @@ class EngineConfig:
     option_trailing_stop_bid_buffer_pct: float = (
         settings.OPTION_TRAILING_STOP_BID_BUFFER_PCT
     )
+    option_stop_replace_audit_enabled: bool = (
+        settings.OPTION_STOP_REPLACE_AUDIT_ENABLED
+    )
+    option_stop_replace_audit_strategy: str = (
+        settings.OPTION_STOP_REPLACE_AUDIT_STRATEGY
+    )
+    option_stop_replace_audit_db_path: str = (
+        settings.OPTION_STOP_REPLACE_AUDIT_DB_PATH
+    )
+    option_stop_replace_audit_window_seconds: float = (
+        settings.OPTION_STOP_REPLACE_AUDIT_WINDOW_SECONDS
+    )
+    option_stop_replace_audit_retention_days: int = (
+        settings.OPTION_STOP_REPLACE_AUDIT_RETENTION_DAYS
+    )
 
     def __post_init__(self) -> None:
         if self.cycle_interval_seconds <= 0:
@@ -261,6 +288,16 @@ class EngineConfig:
             raise ValueError("option_trailing_max_spread_pct must be in [0, 1)")
         if not 0 <= self.option_trailing_stop_bid_buffer_pct < 1:
             raise ValueError("option_trailing_stop_bid_buffer_pct must be in [0, 1)")
+        if (
+            self.option_stop_replace_audit_enabled
+            and self.option_stop_replace_audit_window_seconds <= 0
+        ):
+            raise ValueError("option_stop_replace_audit_window_seconds must be > 0")
+        if (
+            self.option_stop_replace_audit_enabled
+            and self.option_stop_replace_audit_retention_days <= 0
+        ):
+            raise ValueError("option_stop_replace_audit_retention_days must be > 0")
 
 
 # P-7: SuspectExitOrder dataclass removed. Substrate exit rows
@@ -378,6 +415,31 @@ class TradingEngine:
         except Exception as exc:
             logger.warning(f"option trailing store init skipped: {exc}")
             self.option_trailing_store = None
+        self.option_stop_audit_store = None
+        self._option_stop_audit_last_pruned_at: datetime | None = None
+        if self.config.option_stop_replace_audit_enabled:
+            try:
+                from engine.option_stop_audit import OptionStopReplaceAuditStore
+                self.option_stop_audit_store = OptionStopReplaceAuditStore(
+                    self.config.option_stop_replace_audit_db_path
+                )
+                cutoff = datetime.now(timezone.utc) - timedelta(
+                    days=self.config.option_stop_replace_audit_retention_days
+                )
+                pruned = self.option_stop_audit_store.prune_before(cutoff)
+                self._option_stop_audit_last_pruned_at = datetime.now(
+                    timezone.utc
+                )
+                logger.info(
+                    "temporary option-stop replacement audit enabled for "
+                    f"strategy={self.config.option_stop_replace_audit_strategy} "
+                    f"db={self.config.option_stop_replace_audit_db_path} "
+                    f"retention={self.config.option_stop_replace_audit_retention_days}d"
+                    + (f" pruned={pruned}" if pruned else "")
+                )
+            except Exception as exc:
+                logger.warning(f"option stop audit store init skipped: {exc}")
+                self.option_stop_audit_store = None
         # Operator Controls Phase A PR-2 — operator command queue store.
         # Same DB connection as the lifecycle store. Used by per-cycle
         # `_process_operator_commands()` to drain queued halt /
@@ -853,6 +915,7 @@ class TradingEngine:
                             )
                     order_strategy = self._attribute_orders(snapshot.open_orders)
                     self._sync_managed_stop_legs(snapshot)
+                    self._drain_option_stop_audit_events()
                     # P-7: _recover_suspect_exit_orders removed.
                     # Substrate pipeline + _maybe_dispatch_substrate_
                     # exit_fill cover the close-side recovery.
@@ -897,6 +960,7 @@ class TradingEngine:
 
             self._sync_managed_stop_legs(snapshot)
             self._observe_stream_health()
+            self._drain_option_stop_audit_events()
             # P-6 + P-7: _recover_suspect_orders and
             # _recover_suspect_exit_orders both removed. Substrate
             # pipeline (P-1/P-2/P-3) observes UNKNOWN-at-submit
@@ -3468,6 +3532,139 @@ class TradingEngine:
             )
         return None
 
+    def _option_stop_audit_active_for(self, owner: str) -> bool:
+        """Return whether temporary replace diagnostics apply to this owner."""
+        return (
+            self.option_stop_audit_store is not None
+            and owner == self.config.option_stop_replace_audit_strategy
+        )
+
+    def _record_option_stop_audit(
+        self,
+        *,
+        correlation_id: str,
+        record_type: str,
+        strategy: str,
+        occ_symbol: str,
+        order_id: str | None,
+        payload: dict[str, object],
+        recorded_at: datetime | None = None,
+    ) -> bool:
+        """Append diagnostic evidence without affecting order behavior."""
+        if self.option_stop_audit_store is None:
+            return False
+        try:
+            self.option_stop_audit_store.append(
+                correlation_id=correlation_id,
+                recorded_at=recorded_at or datetime.now(timezone.utc),
+                record_type=record_type,
+                strategy=strategy,
+                occ_symbol=occ_symbol,
+                order_id=order_id,
+                payload=payload,
+            )
+            return True
+        except Exception as exc:
+            logger.warning(f"option-stop audit write failed: {exc}")
+            return False
+
+    def _begin_option_stop_audit(
+        self, *, owner: str, order_id: str
+    ) -> _OptionStopAuditContext | None:
+        """Open a real-time forensic window for one target-strategy decision."""
+        if not self._option_stop_audit_active_for(owner):
+            return None
+        decision_at = datetime.now(timezone.utc)
+        return _OptionStopAuditContext(
+            correlation_id=f"optstop_{uuid.uuid4().hex}",
+            decision_at=decision_at,
+            expires_at=decision_at + timedelta(
+                seconds=self.config.option_stop_replace_audit_window_seconds
+            ),
+            broker_before=self.broker.get_order_audit_snapshot(order_id),
+        )
+
+    def _record_option_stop_audit_decision(
+        self,
+        *,
+        audit: _OptionStopAuditContext,
+        record_type: str,
+        owner: str,
+        occ: str,
+        lifecycle_row,
+        existing,
+        position,
+        quote: OptionQuote | None,
+        reason: str,
+        entry_premium: float,
+        hwm: float,
+        desired_stop: float,
+        requested_stop: float | None,
+        qty: float,
+        replacement_client_order_id: str | None = None,
+    ) -> bool:
+        """Record the shared decision evidence for deferrals and replacements."""
+        return self._record_option_stop_audit(
+            correlation_id=audit.correlation_id,
+            record_type=record_type,
+            strategy=owner,
+            occ_symbol=occ,
+            order_id=existing.order_id,
+            recorded_at=audit.decision_at,
+            payload={
+                "position_uid": lifecycle_row.position_uid,
+                "reason": reason,
+                "association_expires_at": audit.expires_at,
+                "cached_order": {
+                    "stop_price": existing.stop_price,
+                    "qty": existing.qty,
+                    "time_in_force": existing.time_in_force,
+                    "status": existing.status,
+                },
+                "broker_before": (
+                    asdict(audit.broker_before)
+                    if audit.broker_before is not None
+                    else None
+                ),
+                "quote": asdict(quote) if quote is not None else None,
+                "position_current_price": getattr(
+                    position, "current_price", None
+                ),
+                "position_market_value": getattr(
+                    position, "market_value", None
+                ),
+                "entry_premium": entry_premium,
+                "hwm_premium": hwm,
+                "desired_stop_price": desired_stop,
+                "requested_stop_price": requested_stop,
+                "requested_qty": qty,
+                "replacement_client_order_id": replacement_client_order_id,
+            },
+        )
+
+    def _drain_option_stop_audit_events(self) -> None:
+        """Persist bounded stream evidence on the engine's DB thread."""
+        if self.option_stop_audit_store is None:
+            return
+        try:
+            now = datetime.now(timezone.utc)
+            last_pruned = self._option_stop_audit_last_pruned_at
+            if (
+                last_pruned is None
+                or now - last_pruned >= timedelta(hours=24)
+            ):
+                cutoff = now - timedelta(
+                    days=self.config.option_stop_replace_audit_retention_days
+                )
+                self.option_stop_audit_store.prune_before(cutoff)
+                self._option_stop_audit_last_pruned_at = now
+            if self._stream_manager is None:
+                return
+            for record in self._stream_manager.drain_option_stop_audit_events():
+                self.option_stop_audit_store.append(**record)
+        except Exception as exc:
+            logger.warning(f"option-stop audit event drain failed: {exc}")
+
     def _sync_option_trailing_stops(self, snapshot: BrokerSnapshot) -> None:
         """Create or atomically ratchet durable GTC single-leg option stops."""
         if self.option_trailing_store is None:
@@ -3620,6 +3817,12 @@ class TradingEngine:
                 maintenance_replacement = (
                     not existing_is_known_gtc or not existing_qty_matches
                 )
+                audit = self._begin_option_stop_audit(
+                    owner=owner,
+                    order_id=existing.order_id,
+                )
+                quote: OptionQuote | None = None
+                quote_rejection: str | None = None
                 if price_ratchet:
                     quote = self.broker.get_latest_option_quote(occ)
                     quote_rejection = self._option_ratchet_quote_rejection(
@@ -3656,14 +3859,113 @@ class TradingEngine:
                                 f"deferred — {quote_rejection}; existing broker "
                                 "stop remains active"
                             )
+                            if audit is not None:
+                                self._record_option_stop_audit_decision(
+                                    audit=audit,
+                                    record_type="decision_deferred",
+                                    owner=owner,
+                                    occ=occ,
+                                    lifecycle_row=lifecycle_row,
+                                    existing=existing,
+                                    position=position,
+                                    quote=quote,
+                                    reason=quote_rejection,
+                                    entry_premium=entry_premium,
+                                    hwm=hwm,
+                                    desired_stop=desired_stop,
+                                    requested_stop=None,
+                                    qty=qty,
+                                )
                             continue
-                try:
-                    new_order = self.broker.replace_option_stop(
-                        order_id=existing.order_id,
-                        qty=qty,
-                        stop_price=replacement_stop,
+                replacement_client_order_id = (
+                    f"opt-trail-audit-{uuid.uuid4().hex[:10]}"
+                    if audit is not None else None
+                )
+                audit_created = False
+                if audit is not None:
+                    reason = (
+                        f"{quote_rejection}; proceeding with TIF/qty maintenance"
+                        if quote_rejection is not None
+                        else (
+                            "price ratchet"
+                            if price_ratchet
+                            else "TIF/qty maintenance"
+                        )
                     )
+                    audit_created = self._record_option_stop_audit_decision(
+                        audit=audit,
+                        record_type="decision_replace",
+                        owner=owner,
+                        occ=occ,
+                        lifecycle_row=lifecycle_row,
+                        existing=existing,
+                        position=position,
+                        quote=quote,
+                        reason=reason,
+                        entry_premium=entry_premium,
+                        hwm=hwm,
+                        desired_stop=desired_stop,
+                        requested_stop=replacement_stop,
+                        qty=qty,
+                        replacement_client_order_id=(
+                            replacement_client_order_id
+                        ),
+                    )
+                    if audit_created and self._stream_manager is not None:
+                        self._stream_manager.register_option_stop_audit(
+                            correlation_id=audit.correlation_id,
+                            strategy=owner,
+                            occ_symbol=occ,
+                            aliases={
+                                existing.order_id,
+                                replacement_client_order_id,
+                            },
+                            expires_at=audit.expires_at,
+                        )
+                replace_call_start = (
+                    datetime.now(timezone.utc) if audit_created else None
+                )
+                replace_call_started_mono = (
+                    time.monotonic() if audit_created else None
+                )
+                try:
+                    if replacement_client_order_id is not None:
+                        new_order = self.broker.replace_option_stop(
+                            order_id=existing.order_id,
+                            qty=qty,
+                            stop_price=replacement_stop,
+                            client_order_id=replacement_client_order_id,
+                        )
+                    else:
+                        new_order = self.broker.replace_option_stop(
+                            order_id=existing.order_id,
+                            qty=qty,
+                            stop_price=replacement_stop,
+                        )
                 except Exception as exc:
+                    replace_call_end = (
+                        datetime.now(timezone.utc) if audit_created else None
+                    )
+                    if audit_created and audit is not None:
+                        assert replace_call_start is not None
+                        assert replace_call_started_mono is not None
+                        assert replace_call_end is not None
+                        self._record_option_stop_audit(
+                            correlation_id=audit.correlation_id,
+                            record_type="replace_failed",
+                            strategy=owner,
+                            occ_symbol=occ,
+                            order_id=existing.order_id,
+                            recorded_at=replace_call_end,
+                            payload={
+                                "replace_call_start": replace_call_start,
+                                "replace_call_end": replace_call_end,
+                                "replace_call_latency_ms": (
+                                    time.monotonic() - replace_call_started_mono
+                                ) * 1000.0,
+                                "error": str(exc),
+                            },
+                        )
                     logger.error(
                         f"[{owner}] {occ}: failed to replace option trailing stop "
                         f"{existing.order_id} with GTC @ ${desired_stop:.2f}: {exc}"
@@ -3688,6 +3990,47 @@ class TradingEngine:
                         last_observed_premium=current_premium,
                     )
                     continue
+                replace_call_end = (
+                    datetime.now(timezone.utc) if audit_created else None
+                )
+                if (
+                    audit_created
+                    and audit is not None
+                    and self._stream_manager is not None
+                ):
+                    self._stream_manager.bind_option_stop_audit_alias(
+                        audit.correlation_id,
+                        new_order.order_id,
+                    )
+                broker_after = (
+                    self.broker.get_order_audit_snapshot(new_order.order_id)
+                    if audit_created
+                    else None
+                )
+                if audit_created and audit is not None:
+                    assert replace_call_start is not None
+                    assert replace_call_started_mono is not None
+                    assert replace_call_end is not None
+                    self._record_option_stop_audit(
+                        correlation_id=audit.correlation_id,
+                        record_type="replace_result",
+                        strategy=owner,
+                        occ_symbol=occ,
+                        order_id=new_order.order_id,
+                        recorded_at=replace_call_end,
+                        payload={
+                            "replaces_order_id": existing.order_id,
+                            "replace_call_start": replace_call_start,
+                            "replace_call_end": replace_call_end,
+                            "replace_call_latency_ms": (
+                                time.monotonic() - replace_call_started_mono
+                            ) * 1000.0,
+                            "broker_after": (
+                                asdict(broker_after)
+                                if broker_after is not None else None
+                            ),
+                        },
+                    )
                 self.option_trailing_store.upsert(
                     position_uid=lifecycle_row.position_uid,
                     occ_symbol=occ,
@@ -7187,6 +7530,12 @@ class TradingEngine:
                 logger.error(f"shutdown cleanup failed: {e}")
         if self._stream_manager is not None:
             self._stream_manager.stop()
+        self._drain_option_stop_audit_events()
+        if self.option_stop_audit_store is not None:
+            try:
+                self.option_stop_audit_store.close()
+            except Exception as exc:
+                logger.warning(f"option-stop audit close failed: {exc}")
 
 
 # ── CLI entry point ──────────────────────────────────────────────────────────

@@ -10,12 +10,18 @@ active workstreams settle.
 
 ## 1. Option trailing-stop replacement and fill timing
 
-**Status:** Fix in review. The replacement path now requires a fresh,
+**Status:** Quote-quality hardening merged in PR #63. The replacement path now requires a fresh,
 two-sided Alpaca option quote before increasing a stop price. The executable
 bid must support the proposed stop with a safety buffer and the spread must
 remain within a conservative quality ceiling. A failed quality check leaves
 the existing broker stop active and retries next cycle; missing-stop creation
 and required GTC/quantity maintenance remain fail-safe and are not blocked.
+
+The fill-timing mechanism remains unresolved. A separate, temporary diagnostic
+is being reviewed to capture broker and WebSocket evidence only for
+`spy_options_reversion`. It is disabled by default, writes to a disposable
+standalone DB, and does not close this follow-up by itself. See
+`docs/option_stop_replace_diagnostics.md`.
 
 The `spy_options_reversion` position in `SPY260702C00724000` closed profitably:
 
@@ -40,7 +46,7 @@ Investigation results:
 4. Exact historical quote reconstruction was unavailable, so a transient quote
    and a paper-simulation quirk cannot be distinguished conclusively.
 
-The fix does not classify either profitable fill as defective. It improves the
+PR #63 does not classify either profitable fill as defective. It improves the
 evidence required for future stop-price increases without changing the existing
 broker-side protection or converting the strategy to software-only exits.
 
