@@ -38,6 +38,7 @@ SDK: alpaca-py (official, replaces deprecated alpaca-trade-api).
 
 from __future__ import annotations
 
+import json
 import sqlite3
 import threading
 import time
@@ -232,6 +233,27 @@ class OptionQuote:
     bid_price: float
     ask_price: float
     timestamp: datetime
+
+
+@dataclass(frozen=True)
+class BrokerOrderAuditSnapshot:
+    """Read-only Alpaca order state captured around a replacement decision."""
+
+    order_id: str
+    status: str | None
+    stop_price: float | None
+    qty: float | None
+    time_in_force: str | None
+    submitted_at: datetime | None
+    updated_at: datetime | None
+    replaced_at: datetime | None
+    filled_at: datetime | None
+    filled_avg_price: float | None
+    replaces_order_id: str | None
+    raw_json: str
+    fetch_started_at: datetime
+    fetch_ended_at: datetime
+    latency_ms: float
 
 
 # ── Broker ───────────────────────────────────────────────────────────────────
@@ -875,6 +897,80 @@ class AlpacaBroker:
         except Exception as exc:
             logger.warning(f"{symbol}: latest option quote fetch failed: {exc}")
             return None
+
+    def get_order_audit_snapshot(
+        self, order_id: str
+    ) -> BrokerOrderAuditSnapshot | None:
+        """Fetch one order and preserve its complete SDK response for audit."""
+        if not order_id:
+            return None
+        started_at = datetime.now(timezone.utc)
+        started_monotonic = time.monotonic()
+        try:
+            # Diagnostics must not consume the broker retry budget or delay a
+            # protective-stop ratchet. One best-effort official SDK read is
+            # enough; failure is recorded as missing evidence.
+            order = self._api.get_order_by_id(order_id)
+        except Exception as exc:
+            logger.warning(f"{order_id}: order audit snapshot failed: {exc}")
+            return None
+        ended_at = datetime.now(timezone.utc)
+        latency_ms = (time.monotonic() - started_monotonic) * 1000.0
+
+        raw_data: object
+        if hasattr(order, "model_dump"):
+            raw_data = order.model_dump(mode="json")
+        elif hasattr(order, "dict"):
+            raw_data = order.dict()
+        else:
+            raw_data = getattr(order, "__dict__", {"repr": repr(order)})
+
+        def _enum_value(value):
+            return value.value if hasattr(value, "value") else value
+
+        def _float_or_none(value) -> float | None:
+            if value is None:
+                return None
+            try:
+                return float(value)
+            except (TypeError, ValueError):
+                return None
+
+        return BrokerOrderAuditSnapshot(
+            order_id=str(getattr(order, "id", order_id)),
+            status=(
+                str(_enum_value(getattr(order, "status", None)))
+                if getattr(order, "status", None) is not None
+                else None
+            ),
+            stop_price=_float_or_none(getattr(order, "stop_price", None)),
+            qty=_float_or_none(getattr(order, "qty", None)),
+            time_in_force=(
+                str(_enum_value(getattr(order, "time_in_force", None)))
+                if getattr(order, "time_in_force", None) is not None
+                else None
+            ),
+            submitted_at=self._parse_datetime(
+                getattr(order, "submitted_at", None)
+            ),
+            updated_at=self._parse_datetime(getattr(order, "updated_at", None)),
+            replaced_at=self._parse_datetime(
+                getattr(order, "replaced_at", None)
+            ),
+            filled_at=self._parse_datetime(getattr(order, "filled_at", None)),
+            filled_avg_price=_float_or_none(
+                getattr(order, "filled_avg_price", None)
+            ),
+            replaces_order_id=(
+                str(getattr(order, "replaces"))
+                if getattr(order, "replaces", None)
+                else None
+            ),
+            raw_json=json.dumps(raw_data, sort_keys=True, default=str),
+            fetch_started_at=started_at,
+            fetch_ended_at=ended_at,
+            latency_ms=latency_ms,
+        )
 
     def get_account(self, *, session_start_equity: float | None = None) -> AccountState:
         """
@@ -2531,6 +2627,7 @@ class AlpacaBroker:
         qty: float,
         stop_price: float,
         client_order_id_prefix: str = "opt-trail-stop",
+        client_order_id: str | None = None,
     ) -> OpenOrder:
         """Atomically ratchet an open option stop and enforce GTC duration."""
         if not order_id:
@@ -2546,7 +2643,9 @@ class AlpacaBroker:
             raise BrokerError(
                 f"option replacement stop price must be positive: {stop_price}"
             )
-        client_order_id = f"{client_order_id_prefix}-{uuid.uuid4().hex[:10]}"
+        client_order_id = client_order_id or (
+            f"{client_order_id_prefix}-{uuid.uuid4().hex[:10]}"
+        )
         request = ReplaceOrderRequest(
             qty=whole_qty,
             time_in_force=TimeInForce.GTC,

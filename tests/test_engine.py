@@ -29,6 +29,7 @@ Coverage map (one class per concern):
 from __future__ import annotations
 
 import time
+import sqlite3
 from dataclasses import replace
 from datetime import datetime, timedelta, timezone
 from types import SimpleNamespace
@@ -40,6 +41,7 @@ import pytest
 from engine.trader import EngineConfig, TradingEngine, _lookback_days
 from execution.broker import (
     AlpacaBroker,
+    BrokerOrderAuditSnapshot,
     BrokerSnapshot,
     ClosedOrderInfo,
     OpenOrder,
@@ -4032,7 +4034,14 @@ class TestGenericSingleLegOptionTrailingStops:
                 }
             )
 
-    def _engine(self, tmp_path, *, create_lifecycle: bool = True):
+    def _engine(
+        self,
+        tmp_path,
+        *,
+        create_lifecycle: bool = True,
+        audit_enabled: bool = False,
+        stream_manager=None,
+    ):
         strategy = self.GenericOptionStrategy(entries=[False], exits=[False])
         broker = MagicMock()
         broker.get_open_orders.return_value = []
@@ -4081,8 +4090,16 @@ class TestGenericSingleLegOptionTrailingStops:
             symbols=["SPY"],
             risk=risk,
             broker=broker,
-            config=EngineConfig(market_hours_only=False),
+            config=EngineConfig(
+                market_hours_only=False,
+                option_stop_replace_audit_enabled=audit_enabled,
+                option_stop_replace_audit_strategy=strategy.name,
+                option_stop_replace_audit_db_path=str(
+                    tmp_path / "option-stop-audit.db"
+                ),
+            ),
             trade_logger=TradeLogger(path=str(tmp_path / "trades.db")),
+            stream_manager=stream_manager,
             clock=lambda: T0,
         )
         engine._register_single_leg(
@@ -4269,12 +4286,131 @@ class TestGenericSingleLegOptionTrailingStops:
             qty=3.0,
             stop_price=18.70,
         )
+        broker.get_order_audit_snapshot.assert_not_called()
+        assert not (tmp_path / "option-stop-audit.db").exists()
         broker.cancel_order.assert_not_called()
         broker.submit_option_gtc_stop.assert_not_called()
         row = engine.option_trailing_store.get_by_occ("SPY260618C00746000")
         assert row.hwm_premium == pytest.approx(22.00)
         assert row.current_stop_price == pytest.approx(18.70)
         assert row.alpaca_stop_order_id == "replacement-stop"
+
+    def test_opt_in_audit_is_separate_and_owner_scoped(self, tmp_path):
+        stream = MagicMock()
+        engine, broker = self._engine(
+            tmp_path,
+            audit_enabled=True,
+            stream_manager=stream,
+        )
+        stale = replace(
+            _open_stop_order("SPY260618C00746000", stop_price=17.14),
+            order_id="old-stop",
+            qty=3,
+            time_in_force="gtc",
+        )
+        before = BrokerOrderAuditSnapshot(
+            order_id="old-stop",
+            status="new",
+            stop_price=17.14,
+            qty=3,
+            time_in_force="gtc",
+            submitted_at=T0 - timedelta(minutes=10),
+            updated_at=T0 - timedelta(minutes=10),
+            replaced_at=None,
+            filled_at=None,
+            filled_avg_price=None,
+            replaces_order_id=None,
+            raw_json='{"id":"old-stop"}',
+            fetch_started_at=T0,
+            fetch_ended_at=T0,
+            latency_ms=4.0,
+        )
+        after = replace(
+            before,
+            order_id="replacement-stop",
+            stop_price=18.70,
+            replaces_order_id="old-stop",
+            raw_json='{"id":"replacement-stop"}',
+        )
+        broker.get_order_audit_snapshot.side_effect = [before, after]
+        broker.replace_option_stop.return_value = replace(
+            broker.replace_option_stop.return_value,
+            stop_price=18.70,
+        )
+        snapshot = _snapshot(
+            positions={
+                "SPY260618C00746000": Position(
+                    symbol="SPY260618C00746000",
+                    qty=3,
+                    avg_entry_price=12.77,
+                    market_value=6_600.0,
+                    current_price=22.00,
+                )
+            },
+            open_orders=[stale],
+        )
+
+        engine._sync_option_trailing_stops(snapshot)
+
+        broker.get_order_audit_snapshot.assert_any_call("old-stop")
+        broker.get_order_audit_snapshot.assert_any_call("replacement-stop")
+        replace_kwargs = broker.replace_option_stop.call_args.kwargs
+        assert replace_kwargs["client_order_id"].startswith(
+            "opt-trail-audit-"
+        )
+        records = engine.option_stop_audit_store.read_records(
+            occ_symbol="SPY260618C00746000"
+        )
+        assert [row["record_type"] for row in records] == [
+            "decision_replace",
+            "replace_result",
+        ]
+        assert records[0]["order_id"] == "old-stop"
+        assert records[1]["order_id"] == "replacement-stop"
+        assert records[0]["payload"]["broker_before"]["order_id"] == "old-stop"
+        stream.register_option_stop_audit.assert_called_once()
+        stream.bind_option_stop_audit_alias.assert_called_once()
+
+        with sqlite3.connect(tmp_path / "trades.db") as conn:
+            table = conn.execute(
+                """
+                SELECT name FROM sqlite_master
+                WHERE type = 'table'
+                  AND name = 'option_stop_replace_audit'
+                """
+            ).fetchone()
+        assert table is None
+
+    def test_enabled_audit_ignores_non_target_strategy(self, tmp_path):
+        engine, broker = self._engine(tmp_path, audit_enabled=True)
+        engine.config = replace(
+            engine.config,
+            option_stop_replace_audit_strategy="spy_options_reversion",
+        )
+        stale = replace(
+            _open_stop_order("SPY260618C00746000", stop_price=17.14),
+            order_id="old-stop",
+            qty=3,
+            time_in_force="gtc",
+        )
+        snapshot = _snapshot(
+            positions={
+                "SPY260618C00746000": Position(
+                    symbol="SPY260618C00746000",
+                    qty=3,
+                    avg_entry_price=12.77,
+                    market_value=6_600.0,
+                    current_price=22.00,
+                )
+            },
+            open_orders=[stale],
+        )
+
+        engine._sync_option_trailing_stops(snapshot)
+
+        broker.get_order_audit_snapshot.assert_not_called()
+        assert "client_order_id" not in broker.replace_option_stop.call_args.kwargs
+        assert engine.option_stop_audit_store.read_records() == []
 
     def test_ratchet_is_deferred_when_bid_does_not_support_new_stop(self, tmp_path):
         engine, broker = self._engine(tmp_path)

@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import asyncio
 import threading
+from datetime import timedelta
 from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
@@ -123,10 +124,82 @@ class TestStreamManagerPublicAPI:
             client_order_id="client-1",
         )
         asyncio.run(_dispatch(sm, update))
-
         assert ev.is_set()
         assert sm.get_update("client-1") is update
         assert sm.get_update("ord-1") is update
+
+    def test_option_stop_audit_associates_old_client_and_new_order_ids(self):
+        sm = _stream()
+        expires_at = _utcnow() + timedelta(minutes=5)
+        sm.register_option_stop_audit(
+            correlation_id="corr-1",
+            strategy="spy_options_reversion",
+            occ_symbol="SPY260702C00724000",
+            aliases={"old-stop", "replacement-client"},
+            expires_at=expires_at,
+        )
+
+        asyncio.run(_dispatch(
+            sm,
+            _make_update(
+                "old-stop",
+                "SPY260702C00724000",
+                "replaced",
+            ),
+        ))
+        asyncio.run(_dispatch(
+            sm,
+            _make_update(
+                "new-stop",
+                "SPY260702C00724000",
+                "fill",
+                client_order_id="replacement-client",
+                qty=2,
+                price=23.0,
+            ),
+        ))
+
+        events = sm.drain_option_stop_audit_events()
+        assert [event["record_type"] for event in events] == [
+            "stream_replaced",
+            "stream_fill",
+        ]
+        assert {event["order_id"] for event in events} == {
+            "old-stop",
+            "new-stop",
+        }
+
+        asyncio.run(_dispatch(
+            sm,
+            _make_update(
+                "new-stop",
+                "SPY260702C00724000",
+                "canceled",
+                client_order_id="replacement-client",
+            ),
+        ))
+        assert sm.drain_option_stop_audit_events() == []
+
+    def test_option_stop_audit_ignores_events_after_bounded_window(self):
+        sm = _stream()
+        sm.register_option_stop_audit(
+            correlation_id="corr-expired",
+            strategy="spy_options_reversion",
+            occ_symbol="SPY260702C00724000",
+            aliases={"old-stop"},
+            expires_at=_utcnow() - timedelta(seconds=1),
+        )
+
+        asyncio.run(_dispatch(
+            sm,
+            _make_update(
+                "old-stop",
+                "SPY260702C00724000",
+                "fill",
+            ),
+        ))
+
+        assert sm.drain_option_stop_audit_events() == []
 
     def test_unwatch_clears_aliases_for_client_and_order_id(self):
         sm = _stream()
