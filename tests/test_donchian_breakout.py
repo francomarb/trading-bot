@@ -44,8 +44,10 @@ class TestDonchianBreakoutParams:
         assert s.entry_window == 20
         assert s.exit_window == 10
 
-    def test_default_order_type_is_market(self):
-        assert DonchianBreakout().preferred_order_type == OrderType.MARKET
+    def test_default_order_type_is_stop_limit(self):
+        # PLAN 11.47: Donchian moved off MARKET to broker-resting STOP_LIMIT
+        # to prevent gap-up chases and failed-breakout gap-down fills.
+        assert DonchianBreakout().preferred_order_type == OrderType.STOP_LIMIT
 
     def test_name_attribute(self):
         assert DonchianBreakout.name == "donchian_breakout"
@@ -207,3 +209,37 @@ class TestDonchianBreakoutPurity:
         original_cols = set(df.columns)
         _strategy().generate_signals(df)
         assert set(df.columns) == original_cols
+
+
+# ── STOP_LIMIT entry trigger (PLAN 11.47) ────────────────────────────────────
+
+
+class TestDonchianBreakoutEntryTrigger:
+    """`compute_entry_trigger` returns the prior-N-day high — the same level
+    `_raw_signals` compares against. This is the broker-resting stop trigger."""
+
+    def test_trigger_equals_prior_window_max(self):
+        # entry_window=5: the trigger at the last bar is max(closes[-6:-1]).
+        closes = [10.0, 12.0, 11.0, 13.0, 14.0, 15.0, 16.0]
+        strat = _strategy()
+        df = _df(closes)
+        trigger = strat.compute_entry_trigger(df)
+        # Prior 5 closes before the last bar: [12, 11, 13, 14, 15] → max=15.
+        assert trigger == 15.0
+
+    def test_trigger_excludes_current_bar(self):
+        # Last bar's close is the highest, but the trigger must look back.
+        closes = [10.0, 11.0, 12.0, 13.0, 14.0, 15.0, 99.0]
+        trigger = _strategy().compute_entry_trigger(_df(closes))
+        assert trigger == 15.0
+
+    def test_trigger_requires_close_column(self):
+        df = pd.DataFrame({"open": [1.0, 2.0, 3.0]})
+        with pytest.raises(ValueError, match="close"):
+            _strategy().compute_entry_trigger(df)
+
+    def test_trigger_rejects_insufficient_history(self):
+        # Only 3 bars — the 5-bar rolling max is NaN at the last bar.
+        df = _df([10.0, 11.0, 12.0])
+        with pytest.raises(ValueError, match="non-positive"):
+            _strategy().compute_entry_trigger(df)

@@ -743,6 +743,28 @@ class RiskManager:
                 f"LIMIT signal requires positive limit_price, got {signal.limit_price!r}",
                 signal,
             )
+        if signal.order_type is OrderType.STOP_LIMIT:
+            if signal.entry_trigger_price is None or signal.entry_trigger_price <= 0:
+                return self._reject(
+                    RejectionCode.INVALID_SIGNAL,
+                    f"STOP_LIMIT signal requires positive entry_trigger_price, "
+                    f"got {signal.entry_trigger_price!r}",
+                    signal,
+                )
+            if signal.limit_price is None or signal.limit_price <= 0:
+                return self._reject(
+                    RejectionCode.INVALID_SIGNAL,
+                    f"STOP_LIMIT signal requires positive limit_price, "
+                    f"got {signal.limit_price!r}",
+                    signal,
+                )
+            if signal.side is Side.BUY and signal.limit_price < signal.entry_trigger_price:
+                return self._reject(
+                    RejectionCode.INVALID_SIGNAL,
+                    f"BUY STOP_LIMIT limit_price {signal.limit_price} must be "
+                    f">= entry_trigger_price {signal.entry_trigger_price}",
+                    signal,
+                )
 
         # 2. Kill switches (cheapest, most decisive).
         if self._halted:
@@ -804,6 +826,22 @@ class RiskManager:
                 f"long stop {stop_price} not below entry {signal.reference_price}",
                 signal,
             )
+        # STOP_LIMIT-specific: the protective stop must sit strictly below
+        # the arming trigger so the OTO leg never enters a crossed state at
+        # submit time. Reject as INVALID_STOP rather than letting RiskDecision
+        # raise — keeps the engine's rejection-handling path uniform.
+        if (
+            signal.order_type is OrderType.STOP_LIMIT
+            and signal.side is Side.BUY
+            and signal.entry_trigger_price is not None
+            and stop_price >= signal.entry_trigger_price
+        ):
+            return self._reject(
+                RejectionCode.INVALID_STOP,
+                f"long stop {stop_price} not below STOP_LIMIT trigger "
+                f"{signal.entry_trigger_price}",
+                signal,
+            )
 
         qty = self._size_position(signal, stop_price, account, notional_cap=notional_cap)
 
@@ -861,6 +899,7 @@ class RiskManager:
             order_type=signal.order_type,
             limit_price=signal.limit_price,
             entry_max_price=signal.entry_max_price,
+            entry_trigger_price=signal.entry_trigger_price,
         )
         logger.info(
             f"risk approved {decision.symbol}: {decision.qty} shares @ "

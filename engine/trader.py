@@ -71,7 +71,7 @@ from engine.positions import (
     view_owner_map,
 )
 from engine.option_trailing import OptionTrailingStopStore
-from execution.entry_guard import CapAction, gate_entry
+from execution.entry_guard import CapAction, compute_cap_price, gate_entry
 from execution.broker import (
     AlpacaBroker,
     BrokerSnapshot,
@@ -1608,6 +1608,60 @@ class TradingEngine:
                     f"chase {cap_decision.diagnostics['chase_bps']:.1f}bps)"
                 )
 
+        # PLAN 11.47 STOP_LIMIT branch: equity strategies that declare
+        # STOP_LIMIT (Donchian today) emit a broker-resting stop-limit
+        # entry. The trigger comes from the strategy (the level that
+        # produced the signal — the prior-N-day high for Donchian); the
+        # limit cap reuses the PLAN 11.32 EntryPriceCap policy but
+        # anchored to the trigger, not to the close. The protective stop
+        # leg is the usual ATR stop attached via OTO, which the substrate
+        # P-4 dispatch records automatically.
+        signal_order_type = strategy.preferred_order_type
+        signal_limit_price: float | None = None
+        entry_trigger_price: float | None = None
+        if (
+            not hasattr(strategy, "build_option_execution")
+            and signal_order_type is OrderType.STOP_LIMIT
+        ):
+            policy = settings.ENTRY_PRICE_CAPS.get(strategy.name)
+            if policy is None:
+                logger.error(
+                    f"[entry-guard] {strategy.name} {symbol}: STOP_LIMIT strategy "
+                    f"requires an ENTRY_PRICE_CAPS policy to anchor the limit "
+                    f"leg; skipping entry"
+                )
+                self._mark_signal_bar_processed(
+                    signal_key, signal_bar, strategy_statuses, strategy_reasons, symbol
+                )
+                return None
+            try:
+                trigger = float(strategy.compute_entry_trigger(df))
+            except Exception as e:
+                logger.error(
+                    f"[entry-guard] {strategy.name} {symbol}: "
+                    f"compute_entry_trigger failed: {e}"
+                )
+                self._mark_signal_bar_processed(
+                    signal_key, signal_bar, strategy_statuses, strategy_reasons, symbol
+                )
+                return None
+            entry_trigger_price = trigger
+            signal_limit_price = compute_cap_price(
+                reference_price=trigger,
+                atr=latest_atr,
+                side="buy",
+                policy=policy,
+            )
+            chase_bps = (signal_limit_price / trigger - 1.0) * 1e4
+            logger.info(
+                f"[entry-guard] {strategy.name} {symbol}: STOP_LIMIT "
+                f"trigger=${trigger:.2f}, limit=${signal_limit_price:.2f} "
+                f"(close=${target_price:.2f}, atr={latest_atr:.2f}, "
+                f"chase {chase_bps:.1f}bps)"
+            )
+        elif signal_order_type is OrderType.LIMIT:
+            signal_limit_price = target_price
+
         sig = Signal(
             symbol=target_symbol,
             side=Side.BUY,
@@ -1615,11 +1669,12 @@ class TradingEngine:
             reference_price=target_price,
             atr=latest_atr,
             reason=f"{strategy.name} entry @ {latest_ts.isoformat()}",
-            order_type=strategy.preferred_order_type,
-            limit_price=target_price if strategy.preferred_order_type is OrderType.LIMIT else None,
+            order_type=signal_order_type,
+            limit_price=signal_limit_price,
             take_profit_price=take_profit,
             stop_price_override=stop_price,
             entry_max_price=entry_max_price,
+            entry_trigger_price=entry_trigger_price,
         )
         decision = self.risk.evaluate(sig, account, notional_cap=notional_cap)
         if isinstance(decision, RiskRejection):

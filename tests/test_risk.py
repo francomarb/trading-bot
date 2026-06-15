@@ -76,6 +76,7 @@ def _signal(
     atr: float = 2.0,
     order_type: OrderType = OrderType.MARKET,
     limit_price: float | None = None,
+    entry_trigger_price: float | None = None,
 ) -> Signal:
     return Signal(
         symbol=symbol,
@@ -86,6 +87,7 @@ def _signal(
         reason="test",
         order_type=order_type,
         limit_price=limit_price,
+        entry_trigger_price=entry_trigger_price,
     )
 
 
@@ -181,6 +183,69 @@ class TestSignalValidation:
         )
         assert isinstance(rej, RiskRejection)
         assert rej.code is RejectionCode.UNSUPPORTED_SIDE
+
+
+# ── STOP_LIMIT manager-level validation (PLAN 11.47) ────────────────────────
+
+
+class TestSignalValidationStopLimit:
+    def _stop_limit_signal(self, **overrides) -> Signal:
+        kwargs = dict(
+            order_type=OrderType.STOP_LIMIT,
+            entry_trigger_price=100.5,
+            limit_price=101.0,
+            price=100.0,
+        )
+        kwargs.update(overrides)
+        return _signal(**kwargs)
+
+    def test_stop_limit_missing_trigger_rejected(self):
+        rej = _mgr().evaluate(
+            self._stop_limit_signal(entry_trigger_price=None),
+            _account(), now=T0,
+        )
+        assert isinstance(rej, RiskRejection)
+        assert rej.code is RejectionCode.INVALID_SIGNAL
+        assert "entry_trigger_price" in rej.message
+
+    def test_stop_limit_missing_limit_rejected(self):
+        rej = _mgr().evaluate(
+            self._stop_limit_signal(limit_price=None),
+            _account(), now=T0,
+        )
+        assert isinstance(rej, RiskRejection)
+        assert rej.code is RejectionCode.INVALID_SIGNAL
+        assert "limit_price" in rej.message
+
+    def test_stop_limit_limit_below_trigger_rejected(self):
+        rej = _mgr().evaluate(
+            self._stop_limit_signal(entry_trigger_price=100.5, limit_price=100.0),
+            _account(), now=T0,
+        )
+        assert isinstance(rej, RiskRejection)
+        assert rej.code is RejectionCode.INVALID_SIGNAL
+
+    def test_stop_limit_stop_above_trigger_returns_invalid_stop(self):
+        # Force the ATR stop above the trigger: atr*2.0 stop offset from
+        # reference_price=100 puts stop at 90. Trigger at 89 < stop → INVALID_STOP.
+        rej = _mgr().evaluate(
+            self._stop_limit_signal(
+                price=100.0, atr=5.0, entry_trigger_price=89.0, limit_price=90.0,
+            ),
+            _account(), now=T0,
+        )
+        assert isinstance(rej, RiskRejection)
+        assert rej.code is RejectionCode.INVALID_STOP
+
+    def test_stop_limit_passthrough_to_decision(self):
+        decision = _mgr().evaluate(
+            self._stop_limit_signal(),
+            _account(), now=T0,
+        )
+        assert isinstance(decision, RiskDecision)
+        assert decision.order_type is OrderType.STOP_LIMIT
+        assert decision.entry_trigger_price == 100.5
+        assert decision.limit_price == 101.0
 
 
 # ── Stop placement & position sizing ────────────────────────────────────────
