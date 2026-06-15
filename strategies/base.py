@@ -68,6 +68,7 @@ class MultiLegTradeRejected(ValueError):
 class OrderType(Enum):
     MARKET = "market"
     LIMIT = "limit"
+    STOP_LIMIT = "stop_limit"
 
 
 @dataclass(frozen=True)

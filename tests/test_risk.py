@@ -694,6 +694,91 @@ class TestRiskDecisionInvariant:
             )
 
 
+# ── STOP_LIMIT shape (PLAN 11.47) ───────────────────────────────────────────
+
+
+class TestRiskDecisionStopLimitShape:
+    """STOP_LIMIT entries require trigger + limit and the BUY ordering
+    stop_price < entry_trigger_price <= limit_price."""
+
+    def _kwargs(self, **overrides):
+        base = dict(
+            symbol="NVDA",
+            side=Side.BUY,
+            qty=10,
+            entry_reference_price=100.0,
+            stop_price=95.0,
+            strategy_name="donchian_breakout",
+            reason="r",
+            order_type=OrderType.STOP_LIMIT,
+            entry_trigger_price=100.5,
+            limit_price=101.0,
+        )
+        base.update(overrides)
+        return base
+
+    def test_valid_buy_stop_limit_accepted(self):
+        decision = RiskDecision(**self._kwargs())
+        assert decision.order_type is OrderType.STOP_LIMIT
+        assert decision.entry_trigger_price == 100.5
+        assert decision.limit_price == 101.0
+
+    def test_missing_trigger_rejected(self):
+        with pytest.raises(ValueError, match="entry_trigger_price"):
+            RiskDecision(**self._kwargs(entry_trigger_price=None))
+
+    def test_zero_trigger_rejected(self):
+        with pytest.raises(ValueError, match="entry_trigger_price"):
+            RiskDecision(**self._kwargs(entry_trigger_price=0))
+
+    def test_missing_limit_rejected(self):
+        with pytest.raises(ValueError, match="limit_price"):
+            RiskDecision(**self._kwargs(limit_price=None))
+
+    def test_buy_trigger_at_or_below_stop_rejected(self):
+        # trigger == stop
+        with pytest.raises(ValueError, match="strictly above"):
+            RiskDecision(**self._kwargs(entry_trigger_price=95.0))
+        # trigger < stop
+        with pytest.raises(ValueError, match="strictly above"):
+            RiskDecision(**self._kwargs(entry_trigger_price=94.0))
+
+    def test_buy_limit_below_trigger_rejected(self):
+        with pytest.raises(ValueError, match="limit_price"):
+            RiskDecision(**self._kwargs(entry_trigger_price=100.5, limit_price=100.0))
+
+    def test_buy_limit_equal_to_trigger_accepted(self):
+        # No-chase: limit == trigger is the tightest valid form.
+        decision = RiskDecision(
+            **self._kwargs(entry_trigger_price=100.5, limit_price=100.5)
+        )
+        assert decision.limit_price == decision.entry_trigger_price
+
+    def test_entry_trigger_price_rejected_on_market(self):
+        with pytest.raises(ValueError, match="only valid on STOP_LIMIT"):
+            RiskDecision(
+                **self._kwargs(
+                    order_type=OrderType.MARKET,
+                    limit_price=None,
+                    entry_trigger_price=100.5,
+                )
+            )
+
+    def test_entry_trigger_price_rejected_on_limit(self):
+        with pytest.raises(ValueError, match="only valid on STOP_LIMIT"):
+            RiskDecision(
+                **self._kwargs(
+                    order_type=OrderType.LIMIT,
+                    limit_price=99.0,
+                    entry_trigger_price=100.5,
+                )
+            )
+
+    def test_entry_max_price_rejected_on_stop_limit(self):
+        with pytest.raises(ValueError, match="STOP_LIMIT"):
+            RiskDecision(**self._kwargs(entry_max_price=102.0))
+
+
 # ── Halt behaviour ──────────────────────────────────────────────────────────
 
 

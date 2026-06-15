@@ -118,7 +118,7 @@ class Signal:
     # Strategy declares its preferred entry order type (PLAN 4.8). Hard-risk
     # exits (stop-outs, circuit breakers) are always market regardless.
     order_type: OrderType = OrderType.MARKET
-    # Required only when order_type is LIMIT.
+    # Required when order_type is LIMIT or STOP_LIMIT.
     limit_price: float | None = None
     # For bracket options orders
     take_profit_price: float | None = None
@@ -128,6 +128,9 @@ class Signal:
     # + OTO at exactly this price instead of an unbounded market order.
     # LIMIT signals must not carry this — they already control their fill price.
     entry_max_price: float | None = None
+    # PLAN 11.47 STOP_LIMIT entries: broker-resting stop trigger above the
+    # prior-N-day high. Required only when order_type is STOP_LIMIT.
+    entry_trigger_price: float | None = None
 
 
 class RejectionCode(str, Enum):
@@ -182,6 +185,8 @@ class RiskDecision:
     # gate_entry() decides to convert a MARKET entry to a capped marketable
     # DAY LIMIT. Broker honors this regardless of order_type.
     entry_max_price: float | None = None
+    # PLAN 11.47 STOP_LIMIT entries — see Signal.entry_trigger_price.
+    entry_trigger_price: float | None = None
 
     def __post_init__(self) -> None:
         # Defensive: any caller that constructs this manually still has to pass
@@ -213,6 +218,51 @@ class RiskDecision:
             )
         if self.order_type is OrderType.MARKET and self.limit_price is not None:
             raise ValueError("MARKET order must not carry a limit_price")
+        # PLAN 11.47 STOP_LIMIT shape: trigger and limit are both required and
+        # ordered. For a BUY breakout: stop_price < entry_trigger_price <=
+        # limit_price. The stop is the protective stop (below entry); the
+        # trigger arms the stop-limit at the prior-N-day high; the limit caps
+        # the chase after the trigger fires.
+        if self.order_type is OrderType.STOP_LIMIT:
+            if self.entry_trigger_price is None or self.entry_trigger_price <= 0:
+                raise ValueError(
+                    "STOP_LIMIT order requires a positive entry_trigger_price, "
+                    f"got {self.entry_trigger_price!r}"
+                )
+            if self.limit_price is None or self.limit_price <= 0:
+                raise ValueError(
+                    "STOP_LIMIT order requires a positive limit_price, "
+                    f"got {self.limit_price!r}"
+                )
+            if self.side is Side.BUY:
+                if self.entry_trigger_price <= self.stop_price:
+                    raise ValueError(
+                        f"BUY STOP_LIMIT entry_trigger_price "
+                        f"{self.entry_trigger_price} must be strictly above "
+                        f"stop_price {self.stop_price}"
+                    )
+                if self.limit_price < self.entry_trigger_price:
+                    raise ValueError(
+                        f"BUY STOP_LIMIT limit_price {self.limit_price} must be "
+                        f">= entry_trigger_price {self.entry_trigger_price}"
+                    )
+            else:  # SELL
+                if self.entry_trigger_price >= self.stop_price:
+                    raise ValueError(
+                        f"SELL STOP_LIMIT entry_trigger_price "
+                        f"{self.entry_trigger_price} must be strictly below "
+                        f"stop_price {self.stop_price}"
+                    )
+                if self.limit_price > self.entry_trigger_price:
+                    raise ValueError(
+                        f"SELL STOP_LIMIT limit_price {self.limit_price} must be "
+                        f"<= entry_trigger_price {self.entry_trigger_price}"
+                    )
+        elif self.entry_trigger_price is not None:
+            raise ValueError(
+                "entry_trigger_price is only valid on STOP_LIMIT orders, "
+                f"got order_type={self.order_type.value}"
+            )
         if self.entry_max_price is not None:
             if self.entry_max_price <= 0:
                 raise ValueError(
@@ -222,6 +272,11 @@ class RiskDecision:
                 raise ValueError(
                     "entry_max_price is for capping MARKET entries; "
                     "LIMIT orders set their fill price via limit_price"
+                )
+            if self.order_type is OrderType.STOP_LIMIT:
+                raise ValueError(
+                    "entry_max_price is for capping MARKET entries; "
+                    "STOP_LIMIT orders cap their fill via limit_price"
                 )
             if self.side is Side.BUY and self.entry_max_price < self.stop_price:
                 raise ValueError(
