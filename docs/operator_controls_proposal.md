@@ -729,16 +729,34 @@ The main principle: operator controls should reduce ambiguity and reduce risk. T
 
 ---
 
-## 17. Cross-subsystem opportunities (deferred)
+## 17. Cross-subsystem opportunities
 
-`position_uid` is project-wide lifecycle identity, not an operator-CLI-private field. The operator controls work is the first consumer, but several existing subsystems would benefit when they are next revised. None of the items below are in scope for v1; they are documented here so the field is not treated as private to the operator queue, and so future implementers do not re-derive these conclusions or, worse, miss them.
+**Amended 2026-06-15 after the order-lifecycle foundation (PR #60 + PR #61) landed.** The original §17 collapsed write-side substrate and read-side consumers into a single "deferred organic adoption" bucket. That framing was correct for read-side consumers but wrong for write-side substrate — write-side substrate isn't a subsystem that *benefits* from `position_uid`; it's the substrate every read-side consumer depends on, and treating it the same encouraged write-side wiring to be deferred too. See [`docs/order_lifecycle_state_machine.md`](order_lifecycle_state_machine.md) §7.1 for the process learning that drove this amendment.
+
+`position_uid` is project-wide lifecycle identity, not an operator-CLI-private field. The split now sits explicitly.
+
+### 17.1 Write-side substrate — owned by the order-lifecycle foundation (shipped)
+
+The per-order `position_lifecycle_orders` table (foundation §6.2) is the durable substrate for every order in a position's life — entries, protective stops, replacement stops, exits, and (when their owning PRs land) `entry_residual` and `partial_close`. PR #60 introduced the schema + `apply_order_event` atomic API; PR #61 wired the consumers (WebSocket / cycle reconcile / startup reconcile / submit-time inserts) so every state transition flows through one chokepoint. This is no longer organic-adoption work — it shipped.
+
+For **Operator Controls Phase C** this means:
+
+- **Destructive commands** (`reduce-position` / `close-position` / `cancel-position-orders`) write rows into `position_lifecycle_orders` with `origin_kind='operator'` and `operator_command_uid` set. Both columns exist on the per-order table today (foundation §6.2). **They do NOT need to be added to `trades`** — an earlier Phase A "deferred items" entry that listed these as future `trades` columns is superseded by the foundation.
+- **Symbol-level locks** already exist as durable DB constraints: `uniq_one_active_position_per_owner_key` (no second non-terminal entry per owner_key) and `uniq_one_active_close_per_position` (no second non-terminal close per position) per foundation §6.2. Phase C wraps these with application-layer acquire/release semantics rather than building a new in-memory registry.
+- **Stop cancel/recreate** for operator-driven closes uses the existing `replaces_order_id` mechanism (foundation §10.3, already wired for the GTC-promotion path).
+- The `Position.position_uid` in-memory field originally deferred to Phase C is **likely obsolete** — `apply_order_event` carries `position_uid` through the substrate. Phase C should re-evaluate before adding the field.
+
+### 17.2 Read-side consumers — still organic adoption, value uneven
+
+These subsystems read `position_uid` for clarity but don't drive lifecycle state. Each can adopt independently when next revised; the original "let it spread organically" recommendation still applies here:
 
 - **Strategy Health & Edge Monitor.** Lifecycle ID makes "trade count" unambiguous and removes the partial-exit accounting concern raised in §10. Per-lifecycle realized R becomes a direct query rather than a symbol+time-window heuristic.
 - **Sleeve allocator.** Reserve/release keyed by `(strategy, position_uid)` makes reopened symbols within the same strategy provably distinct from positions that were never closed.
 - **PnL and R-multiple reporting.** Per-lifecycle final R, win/loss attribution, and reopened-symbol distinction all become single-query operations.
 - **Backtest ↔ forward-test reconciliation.** `backtest/reconcile.py` matching becomes a join rather than a fuzzy match if backtest-side lifecycles synthesize equivalent IDs.
-- **Engine state snapshot.** Restart can distinguish "same lifecycle the bot was tracking" from "broker still holds this symbol but the prior lifecycle ended overnight via a stop fill."
-- **Stop-recovery and order-repair paths.** Embedding `position_uid` in `client_order_id` for repaired/recovered stops makes "this stop belongs to this lifecycle" provable rather than inferred from symbol + strategy.
+- **Engine state snapshot.** Restart can distinguish "same lifecycle the bot was tracking" from "broker still holds this symbol but the prior lifecycle ended overnight via a stop fill." Foundation's substrate-driven reconciliation already covers this for new state machines; the snapshot itself remains a separate exposure layer.
 - **Alerts.** Fill/exit alerts can include `position_uid`, making the alert stream actionable — the operator can copy-paste the ID straight into `show-position`.
 
-Recommendation: let each subsystem adopt `position_uid` organically when it is next touched. A standalone "wire it everywhere" PR is not recommended — the value is uneven across subsystems and a horizontal refactor would dilute focus and produce a large diff that is hard to review.
+Stop-recovery and order-repair paths used to be on this list; the foundation absorbed them via `replacement_stop` / `protective_stop` per-order rows and the `replaces_order_id` lineage column. The "embed `position_uid` in `client_order_id`" framing is no longer needed — the per-order row IS the durable handle, queried directly by `order_id`.
+
+Recommendation: let each subsystem in §17.2 adopt `position_uid` organically when it is next touched. A standalone "wire it everywhere" PR for §17.2 items is not recommended — the value is uneven across subsystems and a horizontal refactor would dilute focus. §17.1 write-side substrate is already done.
