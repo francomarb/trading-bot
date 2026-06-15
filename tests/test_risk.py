@@ -261,6 +261,75 @@ class TestSignalValidationStopLimit:
             f"STOP_LIMIT qty must be whole-share, got {decision.qty}"
         )
 
+    def test_stop_limit_sizing_uses_limit_price_not_close(self):
+        # PLAN 11.47 R1 P1-3: sizing must anchor to the worst-permitted
+        # fill (limit_price), not the signal-bar close. A STOP_LIMIT with
+        # close=$100, trigger=$101, limit=$105 has worst-case fill at $105.
+        # Stop at $95 → worst-case stop_distance = $10, NOT $5. Sizing on
+        # close would double the qty if the fill landed at the cap.
+        #
+        # max_position_pct=0.02 on equity=$100k → $2k risk dollars. At a
+        # worst-case stop_distance of $10, that's 200 shares. Sizing on
+        # close ($5 distance) would have given 400 — a 2× over-allocation.
+        # max_position_notional_pct lifted out of the way so the assertion
+        # tests stop-risk sizing in isolation.
+        mgr = _mgr(max_position_pct=0.02, max_position_notional_pct=1.0)
+        decision = mgr.evaluate(
+            self._stop_limit_signal(
+                price=100.0,
+                atr=2.5,            # ATR stop → 100 - 2*2.5 = 95
+                entry_trigger_price=101.0,
+                limit_price=105.0,
+            ),
+            _account(equity=100_000.0, cash=100_000.0),
+            now=T0,
+        )
+        assert isinstance(decision, RiskDecision)
+        assert decision.qty == 200, (
+            f"STOP_LIMIT qty must size off limit_price (worst-case fill), "
+            f"not close. Expected 200 shares (risk=$2k / stop_distance=$10); "
+            f"got {decision.qty} — likely still sizing off close ($5 distance)."
+        )
+
+    def test_stop_limit_notional_cap_uses_limit_price(self):
+        # Per-position notional cap: the cap is on worst-case exposure.
+        # equity=$100k, max_position_notional_pct=0.10 → $10k cap. At
+        # limit_price=$105, the cap allows floor($10k/$105) = 95 shares.
+        # If sizing used close ($100), it would allow 100 shares and
+        # exceed the cap at the worst-case fill.
+        mgr = _mgr(max_position_pct=0.99, max_position_notional_pct=0.10)
+        decision = mgr.evaluate(
+            self._stop_limit_signal(
+                price=100.0,
+                atr=2.5,
+                entry_trigger_price=101.0,
+                limit_price=105.0,
+            ),
+            _account(equity=100_000.0, cash=100_000.0),
+            now=T0,
+        )
+        assert isinstance(decision, RiskDecision)
+        assert decision.qty == 95
+        # And the worst-case notional respects the cap.
+        assert decision.qty * 105.0 <= 100_000.0 * 0.10
+
+    def test_market_sizing_unchanged_by_stop_limit_anchor(self):
+        # Negative control: MARKET sizing still uses reference_price (close).
+        # Same risk budget, same close, same ATR → identical qty to the
+        # pre-PLAN-11.47 behavior.
+        mgr = _mgr(max_position_pct=0.02, max_position_notional_pct=1.0)
+        decision = mgr.evaluate(
+            _signal(
+                order_type=OrderType.MARKET,
+                price=100.0,
+                atr=2.5,        # stop at 95, distance $5
+            ),
+            _account(equity=100_000.0, cash=100_000.0),
+            now=T0,
+        )
+        assert isinstance(decision, RiskDecision)
+        assert decision.qty == 400  # $2k / $5 = 400 (close-anchored, unchanged)
+
     def test_stop_limit_sub_share_rejected(self):
         # 1 share at the entry trigger needs ~$100.5 of risk budget.
         # max_position_pct=0.02 → risk_dollars = equity * 0.02. With

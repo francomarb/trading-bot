@@ -639,40 +639,54 @@ class RiskManager:
         )
         _floor = (lambda x: math.floor(x * 100) / 100) if fractional else math.floor
 
+        # PLAN 11.47 R1 P1-3: STOP_LIMIT sizing must use the worst-permitted
+        # fill price, not the signal-bar close. The order can fill anywhere
+        # from the trigger up to the chase cap (limit_price); sizing on close
+        # would understate stop_distance and over-allocate qty, exceeding
+        # max_position_pct, the per-position notional cap, sleeve, and cash
+        # budgets if the fill lands at the cap. We anchor to limit_price
+        # (worst case) for stop_distance and every notional cap below.
+        # reference_price stays = close for slippage attribution downstream.
+        sizing_price = (
+            signal.limit_price
+            if signal.order_type is OrderType.STOP_LIMIT and signal.limit_price is not None
+            else signal.reference_price
+        )
+
         risk_dollars = account.equity * self.max_position_pct
-        stop_distance = abs(signal.reference_price - stop_price)
+        stop_distance = abs(sizing_price - stop_price)
         if stop_distance <= 0:
             return 0
-            
+
         multiplier = 100.0 if is_option else 1.0
-        
+
         raw_qty = _floor(risk_dollars / (stop_distance * multiplier))
         if raw_qty <= 0:
             return 0
 
         # Cap by per-position notional budget so tight stops do not consume
         # the whole sleeve in a single position.
-        if signal.reference_price > 0:
+        if sizing_price > 0:
             max_position_notional = account.equity * self.max_position_notional_pct
-            notional_qty_cap = _floor(max_position_notional / (signal.reference_price * multiplier))
+            notional_qty_cap = _floor(max_position_notional / (sizing_price * multiplier))
             raw_qty = min(raw_qty, notional_qty_cap)
 
         # Cap by remaining gross-exposure budget.
         max_gross = account.equity * self.max_gross_exposure_pct
         remaining_gross = max(0.0, max_gross - account.gross_exposure())
-        if signal.reference_price > 0:
-            gross_qty_cap = _floor(remaining_gross / (signal.reference_price * multiplier))
+        if sizing_price > 0:
+            gross_qty_cap = _floor(remaining_gross / (sizing_price * multiplier))
             raw_qty = min(raw_qty, gross_qty_cap)
 
         # Cap by cash on hand (a buy must be payable).
-        if signal.side is Side.BUY and signal.reference_price > 0:
-            cash_qty_cap = _floor(max(0.0, account.cash) / (signal.reference_price * multiplier))
+        if signal.side is Side.BUY and sizing_price > 0:
+            cash_qty_cap = _floor(max(0.0, account.cash) / (sizing_price * multiplier))
             raw_qty = min(raw_qty, cash_qty_cap)
 
         # Cap by sleeve budget (supplied by SleeveAllocator when active).
         # This prevents one strategy from consuming another's reserved capital.
-        if notional_cap is not None and signal.reference_price > 0:
-            sleeve_qty_cap = _floor(notional_cap / (signal.reference_price * multiplier))
+        if notional_cap is not None and sizing_price > 0:
+            sleeve_qty_cap = _floor(notional_cap / (sizing_price * multiplier))
             if sleeve_qty_cap < raw_qty:
                 logger.debug(
                     f"[{signal.strategy_name}] {signal.symbol}: "
