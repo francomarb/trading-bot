@@ -76,6 +76,7 @@ def _signal(
     atr: float = 2.0,
     order_type: OrderType = OrderType.MARKET,
     limit_price: float | None = None,
+    entry_trigger_price: float | None = None,
 ) -> Signal:
     return Signal(
         symbol=symbol,
@@ -86,6 +87,7 @@ def _signal(
         reason="test",
         order_type=order_type,
         limit_price=limit_price,
+        entry_trigger_price=entry_trigger_price,
     )
 
 
@@ -181,6 +183,210 @@ class TestSignalValidation:
         )
         assert isinstance(rej, RiskRejection)
         assert rej.code is RejectionCode.UNSUPPORTED_SIDE
+
+
+# ── STOP_LIMIT manager-level validation (PLAN 11.47) ────────────────────────
+
+
+class TestSignalValidationStopLimit:
+    def _stop_limit_signal(self, **overrides) -> Signal:
+        kwargs = dict(
+            order_type=OrderType.STOP_LIMIT,
+            entry_trigger_price=100.5,
+            limit_price=101.0,
+            price=100.0,
+        )
+        kwargs.update(overrides)
+        return _signal(**kwargs)
+
+    def test_stop_limit_missing_trigger_rejected(self):
+        rej = _mgr().evaluate(
+            self._stop_limit_signal(entry_trigger_price=None),
+            _account(), now=T0,
+        )
+        assert isinstance(rej, RiskRejection)
+        assert rej.code is RejectionCode.INVALID_SIGNAL
+        assert "entry_trigger_price" in rej.message
+
+    def test_stop_limit_missing_limit_rejected(self):
+        rej = _mgr().evaluate(
+            self._stop_limit_signal(limit_price=None),
+            _account(), now=T0,
+        )
+        assert isinstance(rej, RiskRejection)
+        assert rej.code is RejectionCode.INVALID_SIGNAL
+        assert "limit_price" in rej.message
+
+    def test_stop_limit_limit_below_trigger_rejected(self):
+        rej = _mgr().evaluate(
+            self._stop_limit_signal(entry_trigger_price=100.5, limit_price=100.0),
+            _account(), now=T0,
+        )
+        assert isinstance(rej, RiskRejection)
+        assert rej.code is RejectionCode.INVALID_SIGNAL
+
+    def test_stop_limit_stop_above_trigger_returns_invalid_stop(self):
+        # Force the ATR stop above the trigger: atr*2.0 stop offset from
+        # reference_price=100 puts stop at 90. Trigger at 89 < stop → INVALID_STOP.
+        rej = _mgr().evaluate(
+            self._stop_limit_signal(
+                price=100.0, atr=5.0, entry_trigger_price=89.0, limit_price=90.0,
+            ),
+            _account(), now=T0,
+        )
+        assert isinstance(rej, RiskRejection)
+        assert rej.code is RejectionCode.INVALID_STOP
+
+    def test_stop_limit_passthrough_to_decision(self):
+        decision = _mgr().evaluate(
+            self._stop_limit_signal(),
+            _account(), now=T0,
+        )
+        assert isinstance(decision, RiskDecision)
+        assert decision.order_type is OrderType.STOP_LIMIT
+        assert decision.entry_trigger_price == 100.5
+        assert decision.limit_price == 101.0
+
+    def test_stop_limit_decision_qty_is_whole_share(self):
+        # Even with FRACTIONAL_ENABLED=True (the LIVE_TRADING/paper default),
+        # STOP_LIMIT must floor to int because Alpaca rejects fractional
+        # stop-limit. _size_position's fractional branch is gated on MARKET.
+        decision = _mgr().evaluate(
+            self._stop_limit_signal(),
+            _account(equity=100_000.0),
+            now=T0,
+        )
+        assert isinstance(decision, RiskDecision)
+        assert float(decision.qty).is_integer(), (
+            f"STOP_LIMIT qty must be whole-share, got {decision.qty}"
+        )
+
+    def test_stop_limit_sizing_uses_limit_price_not_close(self):
+        # PLAN 11.47 R1 P1-3: sizing must anchor to the worst-permitted
+        # fill (limit_price), not the signal-bar close. A STOP_LIMIT with
+        # close=$100, trigger=$101, limit=$105 has worst-case fill at $105.
+        # Stop at $95 → worst-case stop_distance = $10, NOT $5. Sizing on
+        # close would double the qty if the fill landed at the cap.
+        #
+        # max_position_pct=0.02 on equity=$100k → $2k risk dollars. At a
+        # worst-case stop_distance of $10, that's 200 shares. Sizing on
+        # close ($5 distance) would have given 400 — a 2× over-allocation.
+        # max_position_notional_pct lifted out of the way so the assertion
+        # tests stop-risk sizing in isolation.
+        mgr = _mgr(max_position_pct=0.02, max_position_notional_pct=1.0)
+        decision = mgr.evaluate(
+            self._stop_limit_signal(
+                price=100.0,
+                atr=2.5,            # ATR stop → 100 - 2*2.5 = 95
+                entry_trigger_price=101.0,
+                limit_price=105.0,
+            ),
+            _account(equity=100_000.0, cash=100_000.0),
+            now=T0,
+        )
+        assert isinstance(decision, RiskDecision)
+        assert decision.qty == 200, (
+            f"STOP_LIMIT qty must size off limit_price (worst-case fill), "
+            f"not close. Expected 200 shares (risk=$2k / stop_distance=$10); "
+            f"got {decision.qty} — likely still sizing off close ($5 distance)."
+        )
+
+    def test_stop_limit_notional_cap_uses_limit_price(self):
+        # Per-position notional cap: the cap is on worst-case exposure.
+        # equity=$100k, max_position_notional_pct=0.10 → $10k cap. At
+        # limit_price=$105, the cap allows floor($10k/$105) = 95 shares.
+        # If sizing used close ($100), it would allow 100 shares and
+        # exceed the cap at the worst-case fill.
+        mgr = _mgr(max_position_pct=0.99, max_position_notional_pct=0.10)
+        decision = mgr.evaluate(
+            self._stop_limit_signal(
+                price=100.0,
+                atr=2.5,
+                entry_trigger_price=101.0,
+                limit_price=105.0,
+            ),
+            _account(equity=100_000.0, cash=100_000.0),
+            now=T0,
+        )
+        assert isinstance(decision, RiskDecision)
+        assert decision.qty == 95
+        # And the worst-case notional respects the cap.
+        assert decision.qty * 105.0 <= 100_000.0 * 0.10
+
+    def test_market_sizing_unchanged_by_stop_limit_anchor(self):
+        # Negative control: MARKET sizing still uses reference_price (close).
+        # Same risk budget, same close, same ATR → identical qty to the
+        # pre-PLAN-11.47 behavior.
+        mgr = _mgr(max_position_pct=0.02, max_position_notional_pct=1.0)
+        decision = mgr.evaluate(
+            _signal(
+                order_type=OrderType.MARKET,
+                price=100.0,
+                atr=2.5,        # stop at 95, distance $5
+            ),
+            _account(equity=100_000.0, cash=100_000.0),
+            now=T0,
+        )
+        assert isinstance(decision, RiskDecision)
+        assert decision.qty == 400  # $2k / $5 = 400 (close-anchored, unchanged)
+
+    def test_live_multiplier_does_not_revive_zero_share_stop_limit(self, monkeypatch):
+        # PLAN 11.47 R2 P1: a STOP_LIMIT signal whose risk budget can't
+        # afford even one share must stay rejected in live mode. The
+        # previous code applied max(1, math.floor(qty * mult)) AFTER
+        # sizing returned 0, coercing the reject to a one-share order
+        # and violating the never-round-up-beyond-budget invariant.
+        from risk import manager as risk_manager_module
+        monkeypatch.setattr(risk_manager_module.settings, "LIVE_TRADING", True)
+        monkeypatch.setattr(risk_manager_module.settings, "LIVE_SIZE_MULTIPLIER", 0.25)
+
+        # equity=$100, max_position_pct=0.02 → $2 risk dollars. STOP_LIMIT
+        # worst-case fill at $105 with stop=$95 → $10 stop_distance. The
+        # zero-floor rounds qty to 0. Live multiplier 0.25 used to push
+        # max(1, math.floor(0 * 0.25)) = 1.
+        rej = _mgr(max_position_pct=0.02).evaluate(
+            self._stop_limit_signal(price=100.0, atr=2.5),
+            _account(equity=100.0, cash=100.0),
+            now=T0,
+        )
+        assert isinstance(rej, RiskRejection), (
+            f"live multiplier revived a zero-share STOP_LIMIT: got {rej!r}"
+        )
+        assert rej.code is RejectionCode.POSITION_TOO_SMALL
+
+    def test_live_multiplier_invariant_covers_fractional_path(self, monkeypatch):
+        # Same invariant for the fractional MARKET branch. Bypass the
+        # rounding accident (fractional shares are too granular to easily
+        # round to 0 from realistic inputs) by patching _size_position
+        # directly — the test asserts the multiplier doesn't fabricate a
+        # 0.01-share order when sizing rejected the trade.
+        from risk import manager as risk_manager_module
+        monkeypatch.setattr(risk_manager_module.settings, "LIVE_TRADING", True)
+        monkeypatch.setattr(risk_manager_module.settings, "LIVE_SIZE_MULTIPLIER", 0.25)
+        monkeypatch.setattr(risk_manager_module.settings, "FRACTIONAL_ENABLED", True)
+
+        mgr = _mgr(max_position_pct=0.02)
+        monkeypatch.setattr(mgr, "_size_position", lambda *a, **k: 0)
+        rej = mgr.evaluate(
+            _signal(order_type=OrderType.MARKET, price=100.0, atr=2.5),
+            _account(equity=100_000.0, cash=100_000.0),
+            now=T0,
+        )
+        assert isinstance(rej, RiskRejection)
+        assert rej.code is RejectionCode.POSITION_TOO_SMALL
+
+    def test_stop_limit_sub_share_rejected(self):
+        # 1 share at the entry trigger needs ~$100.5 of risk budget.
+        # max_position_pct=0.02 → risk_dollars = equity * 0.02. With
+        # equity=$100, risk_dollars=$2 — far below a single-share stop
+        # loss of (ref - stop) = $10. Sizing rounds to 0 → POSITION_TOO_SMALL.
+        rej = _mgr().evaluate(
+            self._stop_limit_signal(price=100.0, atr=2.5),  # stop=95
+            _account(equity=100.0, cash=100.0),
+            now=T0,
+        )
+        assert isinstance(rej, RiskRejection)
+        assert rej.code is RejectionCode.POSITION_TOO_SMALL
 
 
 # ── Stop placement & position sizing ────────────────────────────────────────
@@ -692,6 +898,103 @@ class TestRiskDecisionInvariant:
                 strategy_name="x",
                 reason="r",
             )
+
+
+# ── STOP_LIMIT shape (PLAN 11.47) ───────────────────────────────────────────
+
+
+class TestRiskDecisionStopLimitShape:
+    """STOP_LIMIT entries require trigger + limit and the BUY ordering
+    stop_price < entry_trigger_price <= limit_price."""
+
+    def _kwargs(self, **overrides):
+        base = dict(
+            symbol="NVDA",
+            side=Side.BUY,
+            qty=10,
+            entry_reference_price=100.0,
+            stop_price=95.0,
+            strategy_name="donchian_breakout",
+            reason="r",
+            order_type=OrderType.STOP_LIMIT,
+            entry_trigger_price=100.5,
+            limit_price=101.0,
+        )
+        base.update(overrides)
+        return base
+
+    def test_valid_buy_stop_limit_accepted(self):
+        decision = RiskDecision(**self._kwargs())
+        assert decision.order_type is OrderType.STOP_LIMIT
+        assert decision.entry_trigger_price == 100.5
+        assert decision.limit_price == 101.0
+
+    def test_missing_trigger_rejected(self):
+        with pytest.raises(ValueError, match="entry_trigger_price"):
+            RiskDecision(**self._kwargs(entry_trigger_price=None))
+
+    def test_zero_trigger_rejected(self):
+        with pytest.raises(ValueError, match="entry_trigger_price"):
+            RiskDecision(**self._kwargs(entry_trigger_price=0))
+
+    def test_missing_limit_rejected(self):
+        with pytest.raises(ValueError, match="limit_price"):
+            RiskDecision(**self._kwargs(limit_price=None))
+
+    def test_buy_trigger_at_or_below_stop_rejected(self):
+        # trigger == stop
+        with pytest.raises(ValueError, match="strictly above"):
+            RiskDecision(**self._kwargs(entry_trigger_price=95.0))
+        # trigger < stop
+        with pytest.raises(ValueError, match="strictly above"):
+            RiskDecision(**self._kwargs(entry_trigger_price=94.0))
+
+    def test_buy_limit_below_trigger_rejected(self):
+        with pytest.raises(ValueError, match="limit_price"):
+            RiskDecision(**self._kwargs(entry_trigger_price=100.5, limit_price=100.0))
+
+    def test_buy_limit_equal_to_trigger_accepted(self):
+        # No-chase: limit == trigger is the tightest valid form.
+        decision = RiskDecision(
+            **self._kwargs(entry_trigger_price=100.5, limit_price=100.5)
+        )
+        assert decision.limit_price == decision.entry_trigger_price
+
+    def test_entry_trigger_price_rejected_on_market(self):
+        with pytest.raises(ValueError, match="only valid on STOP_LIMIT"):
+            RiskDecision(
+                **self._kwargs(
+                    order_type=OrderType.MARKET,
+                    limit_price=None,
+                    entry_trigger_price=100.5,
+                )
+            )
+
+    def test_entry_trigger_price_rejected_on_limit(self):
+        with pytest.raises(ValueError, match="only valid on STOP_LIMIT"):
+            RiskDecision(
+                **self._kwargs(
+                    order_type=OrderType.LIMIT,
+                    limit_price=99.0,
+                    entry_trigger_price=100.5,
+                )
+            )
+
+    def test_entry_max_price_rejected_on_stop_limit(self):
+        with pytest.raises(ValueError, match="STOP_LIMIT"):
+            RiskDecision(**self._kwargs(entry_max_price=102.0))
+
+    def test_fractional_qty_rejected_on_stop_limit(self):
+        # Alpaca rejects fractional stop-limit; the RiskDecision invariant
+        # catches manually-constructed decisions before they reach the broker.
+        with pytest.raises(ValueError, match="whole-share"):
+            RiskDecision(**self._kwargs(qty=10.5))
+
+    def test_integer_valued_float_qty_accepted_on_stop_limit(self):
+        # qty=10.0 (float but integer-valued) is fine — it's the round-trip
+        # form _size_position produces after math.floor.
+        decision = RiskDecision(**self._kwargs(qty=10.0))
+        assert decision.qty == 10.0
 
 
 # ── Halt behaviour ──────────────────────────────────────────────────────────

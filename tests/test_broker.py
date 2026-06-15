@@ -79,6 +79,7 @@ def _decision(
     limit_price: float | None = None,
     strategy: str = "sma_crossover",
     entry_max_price: float | None = None,
+    entry_trigger_price: float | None = None,
 ) -> RiskDecision:
     return RiskDecision(
         symbol=symbol,
@@ -91,6 +92,7 @@ def _decision(
         order_type=order_type,
         limit_price=limit_price,
         entry_max_price=entry_max_price,
+        entry_trigger_price=entry_trigger_price,
     )
 
 
@@ -715,6 +717,198 @@ class TestSubmitOrderKwargs:
             order_id="entry-1",
         )
         stream.unwatch.assert_called_once_with("entry-1")
+
+
+# ── place_order: PLAN 11.47 STOP_LIMIT entries ──────────────────────────────
+
+
+class TestStopLimitEntry:
+    """
+    PLAN 11.47 — Donchian breakouts use broker-resting STOP_LIMIT instead
+    of MARKET. The broker submits a `StopLimitOrderRequest` with the stop
+    armed at the prior-N-day high (entry_trigger_price) and the limit at
+    the chase cap (limit_price). DAY TIF + OTO stop_loss; the protective
+    ATR stop is recorded by the substrate via P-4 dispatch automatically.
+
+    Behavior these tests cover:
+      - Request type / fields match the spec.
+      - Stop and limit are rounded to 2dp.
+      - OTO stop_loss leg carries the protective ATR stop.
+      - DAY TIF (never GTC) so an unfilled arming order expires at session
+        close instead of ghost-filling the next session.
+      - Gap-up "no fill" (broker accepted but not filled) propagates
+        through as ACCEPTED — Alpaca enforces the price ceiling at match
+        time; the broker test verifies our submission shape, not Alpaca's
+        matcher.
+    """
+
+    def _decision_stop_limit(self, **overrides) -> RiskDecision:
+        kwargs = dict(
+            symbol="NVDA",
+            qty=10,
+            entry=120.0,        # signal-bar close
+            stop=110.0,         # protective ATR stop
+            order_type=OrderType.STOP_LIMIT,
+            entry_trigger_price=121.50,  # prior-N-day high
+            limit_price=125.00,          # chase cap
+            strategy="donchian_breakout",
+        )
+        kwargs.update(overrides)
+        return _decision(**kwargs)
+
+    def test_stop_limit_request_shape(self):
+        api = MagicMock()
+        api.submit_order.return_value = _alpaca_order(
+            status="accepted", type="stop_limit", filled_qty=0,
+        )
+        api.get_order_by_id.return_value = _alpaca_order(
+            status="accepted", type="stop_limit", filled_qty=0,
+        )
+        broker = _broker_with_mock(api)
+
+        broker.place_order(
+            self._decision_stop_limit(), poll_timeout=0.0, poll_interval=0.0,
+        )
+        req = api.submit_order.call_args.args[0]
+        assert req.symbol == "NVDA"
+        assert req.qty == 10
+        assert req.side.value == "buy"
+        assert req.type.value == "stop_limit"
+        assert req.order_class.value == "oto"
+        assert req.stop_price == 121.50    # entry_trigger_price
+        assert req.limit_price == 125.00   # chase cap
+        assert req.stop_loss.stop_price == 110.0  # OTO protective stop
+        assert req.time_in_force.value == "day"   # never GTC
+        assert req.client_order_id.startswith("donchian_breakout-")
+
+    def test_stop_limit_rounds_prices_to_2dp(self):
+        # Anchored chase math yields long decimals: e.g. trigger 121.5366,
+        # limit 121.5366 * (1 + 0.05) = 127.6134. Alpaca rejects > 2dp.
+        api = MagicMock()
+        api.submit_order.return_value = _alpaca_order(
+            status="accepted", type="stop_limit", filled_qty=0,
+        )
+        api.get_order_by_id.return_value = _alpaca_order(
+            status="accepted", type="stop_limit", filled_qty=0,
+        )
+        broker = _broker_with_mock(api)
+
+        broker.place_order(
+            self._decision_stop_limit(
+                stop=110.5137,
+                entry_trigger_price=121.5366,
+                limit_price=127.6134,
+            ),
+            poll_timeout=0.0,
+            poll_interval=0.0,
+        )
+        req = api.submit_order.call_args.args[0]
+        assert req.stop_price == 121.54
+        assert req.limit_price == 127.61
+        assert req.stop_loss.stop_price == 110.51
+
+    def test_stop_limit_gap_up_does_not_report_phantom_fill(self):
+        # Gap-up scenario: open is above limit_price so Alpaca accepts the
+        # stop-limit but never matches it. The broker's poll observes
+        # "accepted, 0 filled" and must never claim a fill that didn't
+        # happen — the key invariant is filled_qty == 0 and no avg price.
+        api = MagicMock()
+        api.submit_order.return_value = _alpaca_order(
+            status="accepted", type="stop_limit", filled_qty=0, filled_avg_price=None,
+        )
+        api.get_order_by_id.return_value = _alpaca_order(
+            status="accepted", type="stop_limit", filled_qty=0, filled_avg_price=None,
+        )
+        broker = _broker_with_mock(api)
+
+        result = broker.place_order(
+            self._decision_stop_limit(), poll_timeout=0.02, poll_interval=0.01,
+        )
+        assert result.status is not OrderStatus.FILLED
+        assert result.filled_qty == 0
+        assert result.avg_fill_price is None
+
+    def test_stop_limit_default_timeout_is_short(self, monkeypatch):
+        # PLAN 11.47 R1 P1-2: when the caller (the engine) omits poll_timeout,
+        # STOP_LIMIT must resolve to the short RESTING_ENTRY_CONFIRM_TIMEOUT
+        # — not the 240s ORDER_CONFIRM_TIMEOUT meant for synchronous fills.
+        # Resting orders are expected to be unfilled at submit time; the
+        # substrate's WS / cycle / startup drains pick up the eventual fill.
+        api = MagicMock()
+        api.submit_order.return_value = _alpaca_order(
+            status="accepted", type="stop_limit", filled_qty=0,
+        )
+        api.get_order_by_id.return_value = _alpaca_order(
+            status="accepted", type="stop_limit", filled_qty=0,
+        )
+        broker = _broker_with_mock(api)
+
+        captured: dict = {}
+        original = broker._wait_for_fill
+
+        def _capture_wait(*args, **kwargs):
+            captured["timeout"] = kwargs.get("timeout")
+            return original(*args, **kwargs)
+
+        monkeypatch.setattr(broker, "_wait_for_fill", _capture_wait)
+
+        # No explicit poll_timeout — the engine's production call shape.
+        broker.place_order(self._decision_stop_limit())
+
+        from config.settings import (
+            ORDER_CONFIRM_TIMEOUT_SECONDS,
+            RESTING_ENTRY_CONFIRM_TIMEOUT_SECONDS,
+        )
+        assert captured["timeout"] == RESTING_ENTRY_CONFIRM_TIMEOUT_SECONDS
+        # And the sanity check: it's *not* the 4-minute synchronous default.
+        assert captured["timeout"] < ORDER_CONFIRM_TIMEOUT_SECONDS
+
+    def test_market_default_timeout_is_long(self, monkeypatch):
+        # Inverse assertion: non-STOP_LIMIT orders keep the long default
+        # (synchronous fill semantics — the caller wants to wait).
+        api = MagicMock()
+        api.submit_order.return_value = _alpaca_order(status="filled")
+        api.get_order_by_id.return_value = _alpaca_order(status="filled")
+        broker = _broker_with_mock(api)
+
+        captured: dict = {}
+        original = broker._wait_for_fill
+
+        def _capture_wait(*args, **kwargs):
+            captured["timeout"] = kwargs.get("timeout")
+            return original(*args, **kwargs)
+
+        monkeypatch.setattr(broker, "_wait_for_fill", _capture_wait)
+
+        broker.place_order(_decision())
+
+        from config.settings import ORDER_CONFIRM_TIMEOUT_SECONDS
+        assert captured["timeout"] == ORDER_CONFIRM_TIMEOUT_SECONDS
+
+    def test_stop_limit_clean_intraday_fill_at_trigger(self):
+        # Clean breakout: stop arms at the trigger and the limit allows fill.
+        # Alpaca returns FILLED with avg_fill_price between trigger and limit.
+        api = MagicMock()
+        api.submit_order.return_value = _alpaca_order(
+            status="filled",
+            type="stop_limit",
+            filled_qty=10,
+            filled_avg_price=122.0,
+        )
+        api.get_order_by_id.return_value = _alpaca_order(
+            status="filled",
+            type="stop_limit",
+            filled_qty=10,
+            filled_avg_price=122.0,
+        )
+        broker = _broker_with_mock(api)
+
+        result = broker.place_order(
+            self._decision_stop_limit(), poll_timeout=0.1,
+        )
+        assert result.status is OrderStatus.FILLED
+        assert result.filled_qty == 10
+        assert result.avg_fill_price == 122.0
 
 
 # ── place_order: PLAN 11.32 entry price cap ─────────────────────────────────
@@ -2115,6 +2309,40 @@ class TestLifecycleOrdersSubstrate:
         # Broker rounds the price to 2dp before submission; that rounded
         # value is what we stored as intended_limit_price.
         assert kwargs["intended_limit_price"] == 99.12
+
+    def test_stop_limit_entry_records_intended_trigger_and_limit(self):
+        # PLAN 11.47 R1 P1-1: the substrate must persist entry_trigger_price
+        # so the async fill-dispatch path can reconstruct a valid
+        # STOP_LIMIT RiskDecision. Without it __post_init__ raises and
+        # ownership recovery falls into the CRITICAL log branch.
+        api = MagicMock()
+        api.submit_order.return_value = _alpaca_order(
+            status="accepted", type="stop_limit",
+        )
+        api.get_order_by_id.return_value = _alpaca_order(
+            status="accepted", type="stop_limit", filled_qty=0,
+        )
+        orders_store = MagicMock()
+        broker = self._broker_with_substrate(api, orders_store)
+
+        broker.place_order(
+            _decision(
+                qty=10,
+                entry=120.0,
+                stop=110.0,
+                order_type=OrderType.STOP_LIMIT,
+                entry_trigger_price=121.50,
+                limit_price=125.00,
+                strategy="donchian_breakout",
+            ),
+            poll_timeout=0.0,
+            poll_interval=0.0,
+        )
+        kwargs = orders_store.insert_pending.call_args.kwargs
+        assert kwargs["order_type"] == "stop_limit"
+        assert kwargs["intended_trigger_price"] == 121.50
+        assert kwargs["intended_limit_price"] == 125.00
+        assert kwargs["intended_stop_price"] == 110.0
 
     def test_substrate_insert_skipped_before_dry_run(self):
         """A dry run must not leak a pending per-order row (mirrors the

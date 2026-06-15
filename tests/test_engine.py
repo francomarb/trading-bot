@@ -4819,3 +4819,123 @@ class TestExitPathBenchmarkKind:
 
 
 # (class deleted; coverage moved as documented above)
+
+
+# ── PLAN 11.47 R1 P1-1: STOP_LIMIT substrate reconstruction ─────────────────
+
+
+class TestSubstrateStopLimitReconstruction:
+    """The async substrate-recovery path reconstructs a RiskDecision
+    from the per-order row when the synchronous place_order path
+    didn't bind ownership. STOP_LIMIT requires both
+    entry_trigger_price and limit_price on the RiskDecision —
+    without them __post_init__ raises and the dispatch is caught
+    as CRITICAL with ownership unbound.
+
+    Before R1 P1-1, the reconstruction at engine/trader.py:~2079
+    only passed order_type=STOP_LIMIT but no trigger/limit, which
+    raised ValueError every time a Donchian fill arrived via
+    stream / cycle / startup reconcile.
+    """
+
+    def _engine_with_mocked_stores(self, patch_fetch, tmp_path):
+        engine, _broker, _tl = _engine_with_db(patch_fetch, tmp_path)
+        engine.lifecycle_orders_store = MagicMock()
+        engine.lifecycle_store = MagicMock()
+        return engine
+
+    def _stop_limit_order_row(self):
+        return SimpleNamespace(
+            position_uid="pos_test_1",
+            role="entry_primary",
+            order_type="stop_limit",
+            intended_qty=10.0,
+            intended_stop_price=110.0,
+            intended_trigger_price=121.50,
+            intended_limit_price=125.00,
+        )
+
+    def _pos_row(self):
+        return SimpleNamespace(
+            position_uid="pos_test_1",
+            strategy="donchian_breakout",
+            symbol="NVDA",
+        )
+
+    def _filled_event(self):
+        return SimpleNamespace(
+            order_id="alpaca-ord-1",
+            status="filled",
+            filled_qty=10.0,
+            avg_fill_price=122.0,
+        )
+
+    def test_stop_limit_reconstruction_passes_trigger_and_limit(
+        self, patch_fetch, tmp_path
+    ):
+        engine = self._engine_with_mocked_stores(patch_fetch, tmp_path)
+        engine.lifecycle_orders_store.get_by_order_id.return_value = (
+            self._stop_limit_order_row()
+        )
+        engine.lifecycle_store.get_by_position_uid.return_value = self._pos_row()
+
+        # Snapshot with an open NVDA position so dispatch reaches reconstruction.
+        position = Position("NVDA", 10, 122.0, 1220.0)
+        snapshot = _snapshot(positions={"NVDA": position})
+
+        # Capture the RiskDecision the side-effects helper receives.
+        captured: dict = {}
+
+        def _capture(*, snapshot, position, decision, fill_price, fill_qty, reason_suffix):
+            captured["decision"] = decision
+
+        engine._apply_recovered_entry_side_effects = _capture
+
+        # Must not raise — would raise pre-R1-P1-1 because STOP_LIMIT
+        # RiskDecision validation rejects missing trigger/limit.
+        engine._maybe_dispatch_substrate_entry_fill(
+            event=self._filled_event(),
+            snapshot=snapshot,
+        )
+
+        decision = captured["decision"]
+        assert decision is not None
+        assert decision.order_type is OrderType.STOP_LIMIT
+        assert decision.entry_trigger_price == 121.50
+        assert decision.limit_price == 125.00
+        assert decision.stop_price == 110.0
+        assert decision.qty == 10.0
+
+    def test_stop_limit_reconstruction_falls_back_when_trigger_missing(
+        self, patch_fetch, tmp_path
+    ):
+        # Legacy substrate rows (written before P1-1 shipped) lack
+        # intended_trigger_price. Dispatch should warn and fall back to
+        # MARKET rather than blowing up — the side effects fire
+        # regardless of order type.
+        engine = self._engine_with_mocked_stores(patch_fetch, tmp_path)
+        legacy_row = self._stop_limit_order_row()
+        legacy_row.intended_trigger_price = None  # legacy gap
+        legacy_row.intended_limit_price = None
+        engine.lifecycle_orders_store.get_by_order_id.return_value = legacy_row
+        engine.lifecycle_store.get_by_position_uid.return_value = self._pos_row()
+
+        position = Position("NVDA", 10, 122.0, 1220.0)
+        snapshot = _snapshot(positions={"NVDA": position})
+
+        captured: dict = {}
+
+        def _capture(*, snapshot, position, decision, fill_price, fill_qty, reason_suffix):
+            captured["decision"] = decision
+
+        engine._apply_recovered_entry_side_effects = _capture
+
+        engine._maybe_dispatch_substrate_entry_fill(
+            event=self._filled_event(),
+            snapshot=snapshot,
+        )
+
+        # Fell back to MARKET; side effects still fired.
+        assert captured["decision"].order_type is OrderType.MARKET
+        assert captured["decision"].entry_trigger_price is None
+        assert captured["decision"].limit_price is None

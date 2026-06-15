@@ -116,7 +116,7 @@ Each row from the discovery doc's §10 maps to one or more commits above.
 | 10.5 | Slippage recovery — preserve provenance | `SuspectOrder.modeled_price_kind` moves to per-order row | 4 (substrate column) + 9 (plumbed from engine through broker) + 11 (UPSERT preservation) | ✅ |
 | 10.6 | Position-level partial-close accounting | (acceptance tests; carries forward unchanged) | 4 (rollup) | ✅ |
 | 10.7 | MLEG partial-close `_spreads_pending_close` | (single-leg side solved; MLEG side deferred) | (deferred to spread lifecycle PR) | ⬜ |
-| 10.8 | PR #58 disposition | (rebuild, do not cherry-pick) | (PR #60 merged; consumer wiring landed) | rebuild blocked on §10.4 / §10.7 |
+| 10.8 | PR #58 disposition | (rebuild, do not cherry-pick) | PR #62 — minimal-scope rewrite on the substrate (`feat/donchian-stop-limit-v2`); PR #58 closed | ✅ |
 
 ---
 
@@ -181,7 +181,7 @@ Implementation PR includes:
 
 The foundation PR must update (per discovery doc §12):
 
-- [ ] `PLAN.md` — Live readiness gate row for slippage / operator controls; foundation PR in flight or merged; PR #58 awaiting rebuild
+- [x] `PLAN.md` — Live readiness gate row for slippage / operator controls; foundation PR merged (#60, #61); PR #58 closed and rebuilt as PR #62
 - [ ] `docs/operator_controls_proposal.md` §17 amended for write-side / read-side substrate split + per-order table substrate Phase C writes into
 - [ ] `docs/slippage_unification_tracker.md` — Phase 2 scope references foundation-provided pre-fill provenance
 - [ ] PR #58 description — (already done — converted to draft with blocked/cherry-pickable list)
@@ -231,7 +231,7 @@ first new entry:
 - [ ] Cycle and startup reconcile drains run without CRITICAL
       log lines
 
-Once full-loop smoke passes, PR #58 rebuild can start.
+Once full-loop smoke passes, the PR #58 rebuild can ship. (Update 2026-06-14: the rebuild has shipped as PR #62 — `feat/donchian-stop-limit-v2`. Full-loop smoke for the rebuild itself is still waiting on the first Donchian fill against the new STOP_LIMIT path.)
 
 ---
 

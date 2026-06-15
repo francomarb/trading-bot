@@ -25,8 +25,18 @@ maximum, not the maximum that includes today.
 
 Order type
 ----------
-MARKET — breakouts are price-sensitive. Missing the fill is worse than
-paying a few bps slippage. Same as SMACrossover.
+STOP_LIMIT (PLAN 11.47) — the broker arms a stop at the prior-N-day high,
+the same level that produced the signal. The stop only triggers if price
+trades through that level the next session, which prevents the
+failed-breakout case (gap-down opens that filled hundreds of dollars
+below signal on QCOM/ARM/MRVL/ASML 6/01–6/05). The attached limit caps
+chase past the trigger, which prevents the gap-up case (QCOM 5/11 filled
++1205 bps above signal close on a MARKET). The limit cap reuses
+PLAN 11.32's `ENTRY_PRICE_CAPS` policy but is anchored to the trigger,
+not to the close.
+
+Original SMACrossover-style MARKET is preserved for other strategies;
+STOP_LIMIT is opted into by overriding `preferred_order_type`.
 
 Why this strategy fits trending mega-caps
 -----------------------------------------
@@ -55,7 +65,7 @@ from strategies.base import BaseStrategy, EdgeFilter, OrderType, SignalFrame
 
 class DonchianBreakout(BaseStrategy):
     name = "donchian_breakout"
-    preferred_order_type = OrderType.MARKET
+    preferred_order_type = OrderType.STOP_LIMIT
 
     def __init__(
         self,
@@ -104,6 +114,36 @@ class DonchianBreakout(BaseStrategy):
         exits = (close < donchian_low).fillna(False).astype(bool)
 
         return SignalFrame(entries=entries, exits=exits)
+
+    def compute_entry_triggers(self, df: pd.DataFrame) -> pd.Series:
+        """
+        Return the per-bar stop trigger Series — the prior-N-day high
+        at each bar. Used by the backtest harness to model STOP_LIMIT
+        semantics over the full series; the scalar
+        `compute_entry_trigger` is the latest-bar specialization for
+        the live engine.
+        """
+        if "close" not in df.columns:
+            raise ValueError("DonchianBreakout requires a 'close' column")
+        with_high = add_donchian_high(df, self.entry_window)
+        return with_high[f"donchian_high_{self.entry_window}"]
+
+    def compute_entry_trigger(self, df: pd.DataFrame) -> float:
+        """
+        Return the broker-resting stop trigger for the latest bar.
+
+        For a Donchian breakout this is the prior-N-day high — the level
+        the next session's price must trade through to confirm the
+        breakout. Re-computes the same indicator used in `_raw_signals`
+        so the trigger is exactly the level that produced the signal.
+        """
+        trigger = float(self.compute_entry_triggers(df).iloc[-1])
+        if not (trigger > 0):
+            raise ValueError(
+                f"donchian_high_{self.entry_window} is non-positive ({trigger!r}); "
+                f"insufficient history for trigger computation"
+            )
+        return trigger
 
     def __repr__(self) -> str:
         return (

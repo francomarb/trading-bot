@@ -82,6 +82,7 @@ with warnings.catch_warnings():
         LimitOrderRequest,
         MarketOrderRequest,
         ReplaceOrderRequest,
+        StopLimitOrderRequest,
         StopOrderRequest,
         StopLossRequest,
     )
@@ -98,6 +99,7 @@ from config.settings import (
     DRY_RUN,
     FRACTIONAL_ENABLED,
     ORDER_CONFIRM_TIMEOUT_SECONDS,
+    RESTING_ENTRY_CONFIRM_TIMEOUT_SECONDS,
 )
 from risk.manager import AccountState, Position, RiskDecision, Side
 from strategies.base import OrderType
@@ -469,6 +471,7 @@ class AlpacaBroker:
         order_class: str,
         time_in_force: str,
         intended_stop_price: float | None = None,
+        intended_trigger_price: float | None = None,
         intended_limit_price: float | None = None,
         parent_order_id: str | None = None,
         replaces_order_id: str | None = None,
@@ -531,6 +534,7 @@ class AlpacaBroker:
                 side=decision.side.value,
                 intended_qty=float(decision.qty),
                 intended_stop_price=intended_stop_price,
+                intended_trigger_price=intended_trigger_price,
                 intended_limit_price=intended_limit_price,
                 parent_order_id=parent_order_id,
                 replaces_order_id=replaces_order_id,
@@ -1094,7 +1098,7 @@ class AlpacaBroker:
         self,
         decision: RiskDecision,
         *,
-        poll_timeout: float = ORDER_CONFIRM_TIMEOUT_SECONDS,
+        poll_timeout: float | None = None,
         poll_interval: float = 1.0,
         slippage_benchmark_price: float | None = None,
         slippage_benchmark_kind: str | None = None,
@@ -1130,6 +1134,18 @@ class AlpacaBroker:
             raise TypeError(
                 f"place_order requires a RiskDecision (got {type(decision).__name__}). "
                 "Strategy signals must go through RiskManager.evaluate first."
+            )
+        # PLAN 11.47 R1 P1-2: resolve the order-type-dependent timeout default.
+        # STOP_LIMIT entries rest at the broker (unfilled is the expected state
+        # at submit time), so polling for 240s would stall the serial symbol
+        # loop on every Donchian submission. The substrate's WS / cycle / startup
+        # drains capture the eventual fill regardless. Explicit caller values
+        # (most existing tests) bypass this and use whatever they passed.
+        if poll_timeout is None:
+            poll_timeout = (
+                RESTING_ENTRY_CONFIRM_TIMEOUT_SECONDS
+                if decision.order_type is OrderType.STOP_LIMIT
+                else ORDER_CONFIRM_TIMEOUT_SECONDS
             )
         if not self._entries_allowed():
             logger.warning(
@@ -1362,6 +1378,38 @@ class AlpacaBroker:
                 client_order_id=client_order_id,
                 limit_price=round(decision.limit_price, 2),
             )
+        elif decision.order_type is OrderType.STOP_LIMIT:
+            # PLAN 11.47: Donchian breakout entries rest at the broker as a
+            # DAY stop-limit. The stop arms when price trades through the
+            # prior-N-day high (`entry_trigger_price`); the limit prevents
+            # chase past `limit_price`. DAY TIF (never GTC) so an unfilled
+            # arming order expires at session close instead of ghost-filling
+            # the next session at a stale level. OTO carries the protective
+            # ATR stop, recorded by the substrate via P-4 dispatch as a
+            # `protective_stop` row.
+            if decision.entry_trigger_price is None or decision.limit_price is None:
+                raise ValueError(
+                    "STOP_LIMIT decision missing entry_trigger_price or limit_price"
+                )
+            trigger = round(decision.entry_trigger_price, 2)
+            cap = round(decision.limit_price, 2)
+            logger.info(
+                f"[entry-guard] {decision.symbol}: STOP_LIMIT trigger=${trigger:.2f}, "
+                f"limit=${cap:.2f} (ref ${decision.entry_reference_price:.2f}, "
+                f"stop ${decision.stop_price:.2f}); submitting as DAY STOP_LIMIT + OTO"
+            )
+            order_request = StopLimitOrderRequest(
+                symbol=decision.symbol,
+                qty=decision.qty,
+                side=AlpacaOrderSide.BUY if decision.side is Side.BUY else AlpacaOrderSide.SELL,
+                type=AlpacaOrderType.STOP_LIMIT,
+                time_in_force=TimeInForce.DAY,
+                order_class=AlpacaOrderClass.OTO,
+                stop_loss=stop_loss,
+                client_order_id=client_order_id,
+                stop_price=trigger,
+                limit_price=cap,
+            )
         else:
             order_request = MarketOrderRequest(
                 symbol=decision.symbol,
@@ -1416,6 +1464,19 @@ class AlpacaBroker:
             order_class="oto",
             time_in_force=str(order_request.time_in_force.value),
             intended_stop_price=float(decision.stop_price),
+            # PLAN 11.47 R1 P1-1: STOP_LIMIT entries persist the broker stop
+            # arming level (decision.entry_trigger_price). The substrate-
+            # recovery path in the engine reads this back to reconstruct a
+            # valid STOP_LIMIT RiskDecision (which __post_init__ requires
+            # both trigger and limit, else raises). Other order types pass
+            # None — only StopLimit* requests have a distinct stop_price
+            # *and* limit_price; for OTO MARKET/LIMIT the stop_loss leg
+            # carries the protective stop and there is no entry trigger.
+            intended_trigger_price=(
+                float(decision.entry_trigger_price)
+                if decision.entry_trigger_price is not None
+                else None
+            ),
             intended_limit_price=(
                 float(order_request.limit_price)
                 if getattr(order_request, "limit_price", None) is not None

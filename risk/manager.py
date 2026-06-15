@@ -118,7 +118,7 @@ class Signal:
     # Strategy declares its preferred entry order type (PLAN 4.8). Hard-risk
     # exits (stop-outs, circuit breakers) are always market regardless.
     order_type: OrderType = OrderType.MARKET
-    # Required only when order_type is LIMIT.
+    # Required when order_type is LIMIT or STOP_LIMIT.
     limit_price: float | None = None
     # For bracket options orders
     take_profit_price: float | None = None
@@ -128,6 +128,9 @@ class Signal:
     # + OTO at exactly this price instead of an unbounded market order.
     # LIMIT signals must not carry this — they already control their fill price.
     entry_max_price: float | None = None
+    # PLAN 11.47 STOP_LIMIT entries: broker-resting stop trigger above the
+    # prior-N-day high. Required only when order_type is STOP_LIMIT.
+    entry_trigger_price: float | None = None
 
 
 class RejectionCode(str, Enum):
@@ -182,6 +185,8 @@ class RiskDecision:
     # gate_entry() decides to convert a MARKET entry to a capped marketable
     # DAY LIMIT. Broker honors this regardless of order_type.
     entry_max_price: float | None = None
+    # PLAN 11.47 STOP_LIMIT entries — see Signal.entry_trigger_price.
+    entry_trigger_price: float | None = None
 
     def __post_init__(self) -> None:
         # Defensive: any caller that constructs this manually still has to pass
@@ -213,6 +218,59 @@ class RiskDecision:
             )
         if self.order_type is OrderType.MARKET and self.limit_price is not None:
             raise ValueError("MARKET order must not carry a limit_price")
+        # PLAN 11.47 STOP_LIMIT shape: trigger and limit are both required and
+        # ordered. For a BUY breakout: stop_price < entry_trigger_price <=
+        # limit_price. The stop is the protective stop (below entry); the
+        # trigger arms the stop-limit at the prior-N-day high; the limit caps
+        # the chase after the trigger fires.
+        if self.order_type is OrderType.STOP_LIMIT:
+            # Alpaca rejects fractional stop-limit. Sizing (`_size_position`)
+            # already floors to int for STOP_LIMIT, but enforce here as a
+            # last-line invariant for manually-constructed decisions.
+            if float(self.qty).is_integer() is False:
+                raise ValueError(
+                    f"STOP_LIMIT order requires whole-share qty (Alpaca "
+                    f"rejects fractional stop-limit), got qty={self.qty}"
+                )
+            if self.entry_trigger_price is None or self.entry_trigger_price <= 0:
+                raise ValueError(
+                    "STOP_LIMIT order requires a positive entry_trigger_price, "
+                    f"got {self.entry_trigger_price!r}"
+                )
+            if self.limit_price is None or self.limit_price <= 0:
+                raise ValueError(
+                    "STOP_LIMIT order requires a positive limit_price, "
+                    f"got {self.limit_price!r}"
+                )
+            if self.side is Side.BUY:
+                if self.entry_trigger_price <= self.stop_price:
+                    raise ValueError(
+                        f"BUY STOP_LIMIT entry_trigger_price "
+                        f"{self.entry_trigger_price} must be strictly above "
+                        f"stop_price {self.stop_price}"
+                    )
+                if self.limit_price < self.entry_trigger_price:
+                    raise ValueError(
+                        f"BUY STOP_LIMIT limit_price {self.limit_price} must be "
+                        f">= entry_trigger_price {self.entry_trigger_price}"
+                    )
+            else:  # SELL
+                if self.entry_trigger_price >= self.stop_price:
+                    raise ValueError(
+                        f"SELL STOP_LIMIT entry_trigger_price "
+                        f"{self.entry_trigger_price} must be strictly below "
+                        f"stop_price {self.stop_price}"
+                    )
+                if self.limit_price > self.entry_trigger_price:
+                    raise ValueError(
+                        f"SELL STOP_LIMIT limit_price {self.limit_price} must be "
+                        f"<= entry_trigger_price {self.entry_trigger_price}"
+                    )
+        elif self.entry_trigger_price is not None:
+            raise ValueError(
+                "entry_trigger_price is only valid on STOP_LIMIT orders, "
+                f"got order_type={self.order_type.value}"
+            )
         if self.entry_max_price is not None:
             if self.entry_max_price <= 0:
                 raise ValueError(
@@ -222,6 +280,11 @@ class RiskDecision:
                 raise ValueError(
                     "entry_max_price is for capping MARKET entries; "
                     "LIMIT orders set their fill price via limit_price"
+                )
+            if self.order_type is OrderType.STOP_LIMIT:
+                raise ValueError(
+                    "entry_max_price is for capping MARKET entries; "
+                    "STOP_LIMIT orders cap their fill via limit_price"
                 )
             if self.side is Side.BUY and self.entry_max_price < self.stop_price:
                 raise ValueError(
@@ -564,6 +627,11 @@ class RiskManager:
         # Choose floor function based on fractional mode.
         # LIMIT orders (RSI reversion) always use whole shares — Alpaca GTC
         # limit orders do not support fractional quantities. Options cannot be fractional.
+        # STOP_LIMIT (PLAN 11.47, Donchian) is also whole-share — Alpaca rejects
+        # fractional stop-limit orders, so we floor to int here and let the
+        # POSITION_TOO_SMALL gate below reject sub-share entries explicitly
+        # rather than rounding up to 1 share (which would silently amplify
+        # risk past the configured budget).
         fractional = (
             settings.FRACTIONAL_ENABLED
             and signal.order_type is OrderType.MARKET
@@ -571,40 +639,54 @@ class RiskManager:
         )
         _floor = (lambda x: math.floor(x * 100) / 100) if fractional else math.floor
 
+        # PLAN 11.47 R1 P1-3: STOP_LIMIT sizing must use the worst-permitted
+        # fill price, not the signal-bar close. The order can fill anywhere
+        # from the trigger up to the chase cap (limit_price); sizing on close
+        # would understate stop_distance and over-allocate qty, exceeding
+        # max_position_pct, the per-position notional cap, sleeve, and cash
+        # budgets if the fill lands at the cap. We anchor to limit_price
+        # (worst case) for stop_distance and every notional cap below.
+        # reference_price stays = close for slippage attribution downstream.
+        sizing_price = (
+            signal.limit_price
+            if signal.order_type is OrderType.STOP_LIMIT and signal.limit_price is not None
+            else signal.reference_price
+        )
+
         risk_dollars = account.equity * self.max_position_pct
-        stop_distance = abs(signal.reference_price - stop_price)
+        stop_distance = abs(sizing_price - stop_price)
         if stop_distance <= 0:
             return 0
-            
+
         multiplier = 100.0 if is_option else 1.0
-        
+
         raw_qty = _floor(risk_dollars / (stop_distance * multiplier))
         if raw_qty <= 0:
             return 0
 
         # Cap by per-position notional budget so tight stops do not consume
         # the whole sleeve in a single position.
-        if signal.reference_price > 0:
+        if sizing_price > 0:
             max_position_notional = account.equity * self.max_position_notional_pct
-            notional_qty_cap = _floor(max_position_notional / (signal.reference_price * multiplier))
+            notional_qty_cap = _floor(max_position_notional / (sizing_price * multiplier))
             raw_qty = min(raw_qty, notional_qty_cap)
 
         # Cap by remaining gross-exposure budget.
         max_gross = account.equity * self.max_gross_exposure_pct
         remaining_gross = max(0.0, max_gross - account.gross_exposure())
-        if signal.reference_price > 0:
-            gross_qty_cap = _floor(remaining_gross / (signal.reference_price * multiplier))
+        if sizing_price > 0:
+            gross_qty_cap = _floor(remaining_gross / (sizing_price * multiplier))
             raw_qty = min(raw_qty, gross_qty_cap)
 
         # Cap by cash on hand (a buy must be payable).
-        if signal.side is Side.BUY and signal.reference_price > 0:
-            cash_qty_cap = _floor(max(0.0, account.cash) / (signal.reference_price * multiplier))
+        if signal.side is Side.BUY and sizing_price > 0:
+            cash_qty_cap = _floor(max(0.0, account.cash) / (sizing_price * multiplier))
             raw_qty = min(raw_qty, cash_qty_cap)
 
         # Cap by sleeve budget (supplied by SleeveAllocator when active).
         # This prevents one strategy from consuming another's reserved capital.
-        if notional_cap is not None and signal.reference_price > 0:
-            sleeve_qty_cap = _floor(notional_cap / (signal.reference_price * multiplier))
+        if notional_cap is not None and sizing_price > 0:
+            sleeve_qty_cap = _floor(notional_cap / (sizing_price * multiplier))
             if sleeve_qty_cap < raw_qty:
                 logger.debug(
                     f"[{signal.strategy_name}] {signal.symbol}: "
@@ -688,6 +770,28 @@ class RiskManager:
                 f"LIMIT signal requires positive limit_price, got {signal.limit_price!r}",
                 signal,
             )
+        if signal.order_type is OrderType.STOP_LIMIT:
+            if signal.entry_trigger_price is None or signal.entry_trigger_price <= 0:
+                return self._reject(
+                    RejectionCode.INVALID_SIGNAL,
+                    f"STOP_LIMIT signal requires positive entry_trigger_price, "
+                    f"got {signal.entry_trigger_price!r}",
+                    signal,
+                )
+            if signal.limit_price is None or signal.limit_price <= 0:
+                return self._reject(
+                    RejectionCode.INVALID_SIGNAL,
+                    f"STOP_LIMIT signal requires positive limit_price, "
+                    f"got {signal.limit_price!r}",
+                    signal,
+                )
+            if signal.side is Side.BUY and signal.limit_price < signal.entry_trigger_price:
+                return self._reject(
+                    RejectionCode.INVALID_SIGNAL,
+                    f"BUY STOP_LIMIT limit_price {signal.limit_price} must be "
+                    f">= entry_trigger_price {signal.entry_trigger_price}",
+                    signal,
+                )
 
         # 2. Kill switches (cheapest, most decisive).
         if self._halted:
@@ -749,11 +853,36 @@ class RiskManager:
                 f"long stop {stop_price} not below entry {signal.reference_price}",
                 signal,
             )
+        # STOP_LIMIT-specific: the protective stop must sit strictly below
+        # the arming trigger so the OTO leg never enters a crossed state at
+        # submit time. Reject as INVALID_STOP rather than letting RiskDecision
+        # raise — keeps the engine's rejection-handling path uniform.
+        if (
+            signal.order_type is OrderType.STOP_LIMIT
+            and signal.side is Side.BUY
+            and signal.entry_trigger_price is not None
+            and stop_price >= signal.entry_trigger_price
+        ):
+            return self._reject(
+                RejectionCode.INVALID_STOP,
+                f"long stop {stop_price} not below STOP_LIMIT trigger "
+                f"{signal.entry_trigger_price}",
+                signal,
+            )
 
         qty = self._size_position(signal, stop_price, account, notional_cap=notional_cap)
 
         # Live-trading size multiplier (10.G1): scale down on first live exposure.
-        if settings.LIVE_TRADING and settings.LIVE_SIZE_MULTIPLIER != 1.0:
+        # PLAN 11.47 R2 P1: only apply when sizing produced a positive qty.
+        # max(1, ...) and max(0.01, ...) below were reviving a zero-share
+        # sizing rejection back into a 1-share / 0.01-share order, which on
+        # STOP_LIMIT violates the never-round-up-beyond-budget invariant.
+        # Letting qty stay 0 falls into the POSITION_TOO_SMALL branch below.
+        if (
+            qty > 0
+            and settings.LIVE_TRADING
+            and settings.LIVE_SIZE_MULTIPLIER != 1.0
+        ):
             _is_fractional = (
                 settings.FRACTIONAL_ENABLED
                 and signal.order_type is OrderType.MARKET
@@ -806,6 +935,7 @@ class RiskManager:
             order_type=signal.order_type,
             limit_price=signal.limit_price,
             entry_max_price=signal.entry_max_price,
+            entry_trigger_price=signal.entry_trigger_price,
         )
         logger.info(
             f"risk approved {decision.symbol}: {decision.qty} shares @ "

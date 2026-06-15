@@ -71,7 +71,7 @@ from engine.positions import (
     view_owner_map,
 )
 from engine.option_trailing import OptionTrailingStopStore
-from execution.entry_guard import CapAction, gate_entry
+from execution.entry_guard import CapAction, compute_cap_price, gate_entry
 from execution.broker import (
     AlpacaBroker,
     BrokerSnapshot,
@@ -1608,6 +1608,60 @@ class TradingEngine:
                     f"chase {cap_decision.diagnostics['chase_bps']:.1f}bps)"
                 )
 
+        # PLAN 11.47 STOP_LIMIT branch: equity strategies that declare
+        # STOP_LIMIT (Donchian today) emit a broker-resting stop-limit
+        # entry. The trigger comes from the strategy (the level that
+        # produced the signal — the prior-N-day high for Donchian); the
+        # limit cap reuses the PLAN 11.32 EntryPriceCap policy but
+        # anchored to the trigger, not to the close. The protective stop
+        # leg is the usual ATR stop attached via OTO, which the substrate
+        # P-4 dispatch records automatically.
+        signal_order_type = strategy.preferred_order_type
+        signal_limit_price: float | None = None
+        entry_trigger_price: float | None = None
+        if (
+            not hasattr(strategy, "build_option_execution")
+            and signal_order_type is OrderType.STOP_LIMIT
+        ):
+            policy = settings.ENTRY_PRICE_CAPS.get(strategy.name)
+            if policy is None:
+                logger.error(
+                    f"[entry-guard] {strategy.name} {symbol}: STOP_LIMIT strategy "
+                    f"requires an ENTRY_PRICE_CAPS policy to anchor the limit "
+                    f"leg; skipping entry"
+                )
+                self._mark_signal_bar_processed(
+                    signal_key, signal_bar, strategy_statuses, strategy_reasons, symbol
+                )
+                return None
+            try:
+                trigger = float(strategy.compute_entry_trigger(df))
+            except Exception as e:
+                logger.error(
+                    f"[entry-guard] {strategy.name} {symbol}: "
+                    f"compute_entry_trigger failed: {e}"
+                )
+                self._mark_signal_bar_processed(
+                    signal_key, signal_bar, strategy_statuses, strategy_reasons, symbol
+                )
+                return None
+            entry_trigger_price = trigger
+            signal_limit_price = compute_cap_price(
+                reference_price=trigger,
+                atr=latest_atr,
+                side="buy",
+                policy=policy,
+            )
+            chase_bps = (signal_limit_price / trigger - 1.0) * 1e4
+            logger.info(
+                f"[entry-guard] {strategy.name} {symbol}: STOP_LIMIT "
+                f"trigger=${trigger:.2f}, limit=${signal_limit_price:.2f} "
+                f"(close=${target_price:.2f}, atr={latest_atr:.2f}, "
+                f"chase {chase_bps:.1f}bps)"
+            )
+        elif signal_order_type is OrderType.LIMIT:
+            signal_limit_price = target_price
+
         sig = Signal(
             symbol=target_symbol,
             side=Side.BUY,
@@ -1615,11 +1669,12 @@ class TradingEngine:
             reference_price=target_price,
             atr=latest_atr,
             reason=f"{strategy.name} entry @ {latest_ts.isoformat()}",
-            order_type=strategy.preferred_order_type,
-            limit_price=target_price if strategy.preferred_order_type is OrderType.LIMIT else None,
+            order_type=signal_order_type,
+            limit_price=signal_limit_price,
             take_profit_price=take_profit,
             stop_price_override=stop_price,
             entry_max_price=entry_max_price,
+            entry_trigger_price=entry_trigger_price,
         )
         decision = self.risk.evaluate(sig, account, notional_cap=notional_cap)
         if isinstance(decision, RiskRejection):
@@ -2021,6 +2076,39 @@ class TradingEngine:
                 )
                 return
             from risk.manager import RiskDecision, Side
+            # PLAN 11.47 R1 P1-1: STOP_LIMIT requires both entry_trigger_price
+            # and limit_price on the RiskDecision; without them __post_init__
+            # raises, gets caught below as CRITICAL, and ownership never
+            # binds. Pull both back from the substrate row.
+            recovered_order_type = OrderType(order_row.order_type)
+            extra_kwargs: dict = {}
+            if recovered_order_type is OrderType.STOP_LIMIT:
+                trigger = order_row.intended_trigger_price
+                limit = order_row.intended_limit_price
+                if trigger is None or limit is None:
+                    # Legacy / pre-PLAN-11.47 substrate rows (or a bug
+                    # upstream) cannot reconstruct a valid STOP_LIMIT
+                    # decision. Fall back to MARKET — the side effects
+                    # _apply_recovered_entry_side_effects fires
+                    # (ownership bind, entry-price cache, stop
+                    # replacement, alert) are order-type agnostic.
+                    logger.warning(
+                        f"substrate entry-fill dispatch: STOP_LIMIT row "
+                        f"missing trigger/limit for {symbol} order_id="
+                        f"{event.order_id}; reconstructing as MARKET "
+                        f"for recovery side effects"
+                    )
+                    recovered_order_type = OrderType.MARKET
+                else:
+                    extra_kwargs["entry_trigger_price"] = float(trigger)
+                    extra_kwargs["limit_price"] = float(limit)
+            elif recovered_order_type is OrderType.LIMIT:
+                # LIMIT also requires a limit_price for shape validation.
+                limit = order_row.intended_limit_price
+                if limit is not None:
+                    extra_kwargs["limit_price"] = float(limit)
+                else:
+                    recovered_order_type = OrderType.MARKET
             decision = RiskDecision(
                 symbol=symbol,
                 side=Side.BUY,
@@ -2029,7 +2117,8 @@ class TradingEngine:
                 stop_price=float(order_row.intended_stop_price or 0.0),
                 strategy_name=pos_row.strategy,
                 reason="substrate dispatch",
-                order_type=OrderType(order_row.order_type),
+                order_type=recovered_order_type,
+                **extra_kwargs,
             )
             self._apply_recovered_entry_side_effects(
                 snapshot=snapshot,
