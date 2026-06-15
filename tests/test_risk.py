@@ -330,6 +330,51 @@ class TestSignalValidationStopLimit:
         assert isinstance(decision, RiskDecision)
         assert decision.qty == 400  # $2k / $5 = 400 (close-anchored, unchanged)
 
+    def test_live_multiplier_does_not_revive_zero_share_stop_limit(self, monkeypatch):
+        # PLAN 11.47 R2 P1: a STOP_LIMIT signal whose risk budget can't
+        # afford even one share must stay rejected in live mode. The
+        # previous code applied max(1, math.floor(qty * mult)) AFTER
+        # sizing returned 0, coercing the reject to a one-share order
+        # and violating the never-round-up-beyond-budget invariant.
+        from risk import manager as risk_manager_module
+        monkeypatch.setattr(risk_manager_module.settings, "LIVE_TRADING", True)
+        monkeypatch.setattr(risk_manager_module.settings, "LIVE_SIZE_MULTIPLIER", 0.25)
+
+        # equity=$100, max_position_pct=0.02 → $2 risk dollars. STOP_LIMIT
+        # worst-case fill at $105 with stop=$95 → $10 stop_distance. The
+        # zero-floor rounds qty to 0. Live multiplier 0.25 used to push
+        # max(1, math.floor(0 * 0.25)) = 1.
+        rej = _mgr(max_position_pct=0.02).evaluate(
+            self._stop_limit_signal(price=100.0, atr=2.5),
+            _account(equity=100.0, cash=100.0),
+            now=T0,
+        )
+        assert isinstance(rej, RiskRejection), (
+            f"live multiplier revived a zero-share STOP_LIMIT: got {rej!r}"
+        )
+        assert rej.code is RejectionCode.POSITION_TOO_SMALL
+
+    def test_live_multiplier_invariant_covers_fractional_path(self, monkeypatch):
+        # Same invariant for the fractional MARKET branch. Bypass the
+        # rounding accident (fractional shares are too granular to easily
+        # round to 0 from realistic inputs) by patching _size_position
+        # directly — the test asserts the multiplier doesn't fabricate a
+        # 0.01-share order when sizing rejected the trade.
+        from risk import manager as risk_manager_module
+        monkeypatch.setattr(risk_manager_module.settings, "LIVE_TRADING", True)
+        monkeypatch.setattr(risk_manager_module.settings, "LIVE_SIZE_MULTIPLIER", 0.25)
+        monkeypatch.setattr(risk_manager_module.settings, "FRACTIONAL_ENABLED", True)
+
+        mgr = _mgr(max_position_pct=0.02)
+        monkeypatch.setattr(mgr, "_size_position", lambda *a, **k: 0)
+        rej = mgr.evaluate(
+            _signal(order_type=OrderType.MARKET, price=100.0, atr=2.5),
+            _account(equity=100_000.0, cash=100_000.0),
+            now=T0,
+        )
+        assert isinstance(rej, RiskRejection)
+        assert rej.code is RejectionCode.POSITION_TOO_SMALL
+
     def test_stop_limit_sub_share_rejected(self):
         # 1 share at the entry trigger needs ~$100.5 of risk budget.
         # max_position_pct=0.02 → risk_dollars = equity * 0.02. With
