@@ -115,9 +115,19 @@ VALID_STATUSES = frozenset({
 
 # Actions the CLI may submit. Validated at insert time — the CLI cannot
 # write an unknown action.
+#
+# Phase B adds four soft-control actions: pause-entries / resume-entries
+# block all new entries while existing position management continues;
+# pause-strategy / resume-strategy scope the block to a single strategy
+# (the strategy name is passed in target_strategy, validated at the
+# engine handler).
 VALID_ACTIONS = frozenset({
     "halt",
     "resume-after-halt",
+    "pause-entries",
+    "resume-entries",
+    "pause-strategy",
+    "resume-strategy",
 })
 
 

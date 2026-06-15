@@ -248,10 +248,15 @@ def run() -> int:
 
         # ── 8. Public constants ──────────────────────────────────
         _section("8. Public constants")
-        if VALID_ACTIONS == {"halt", "resume-after-halt"}:
-            _ok("VALID_ACTIONS locked to Phase A actions")
+        # Phase B extended VALID_ACTIONS with 4 soft-control actions.
+        # Phase A's contract is that halt + resume-after-halt are present;
+        # superset is allowed.
+        phase_a_required = {"halt", "resume-after-halt"}
+        if phase_a_required.issubset(VALID_ACTIONS):
+            _ok("VALID_ACTIONS contains Phase A actions (superset allowed)")
         else:
-            _fail(f"VALID_ACTIONS = {VALID_ACTIONS} (expected halt + resume-after-halt)")
+            missing = phase_a_required - VALID_ACTIONS
+            _fail(f"VALID_ACTIONS missing Phase A actions: {missing}")
             failures += 1
         if "rejected_unsupported_phase_a" in VALID_STATUSES:
             _ok("rejected_unsupported_phase_a recognised by store")

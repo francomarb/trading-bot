@@ -407,7 +407,16 @@ class TradeLogger:
         if self._conn is not None:
             return self._conn
         os.makedirs(os.path.dirname(self._path) or ".", exist_ok=True)
-        conn = sqlite3.connect(self._path)
+        # Operator Controls Phase B — the operator-command heartbeat
+        # thread reads/writes operator_commands from a daemon thread
+        # separate from the main cycle thread. SQLite refuses cross-
+        # thread connection use by default (`check_same_thread=True`).
+        # With False, the application is responsible for serialising
+        # access; SQLite's per-statement locking handles the rest.
+        # The heartbeat only does brief atomic operations (UPDATE…WHERE
+        # for claim, single INSERT for terminal state), and the cycle
+        # thread writes to disjoint tables. No deadlock risk.
+        conn = sqlite3.connect(self._path, check_same_thread=False)
         try:
             # Order lifecycle foundation (PR #59 §6.2 / R13-G1): SQLite
             # does NOT enforce FOREIGN KEY constraints by default — they

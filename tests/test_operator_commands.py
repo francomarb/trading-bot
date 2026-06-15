@@ -334,8 +334,20 @@ class TestReads:
 
 
 class TestStatusEnum:
-    def test_valid_actions_is_phase_a_only(self):
-        assert VALID_ACTIONS == {"halt", "resume-after-halt"}
+    def test_valid_actions_covers_phase_a_and_b(self):
+        """Phase A: halt / resume-after-halt. Phase B: 4 soft pauses.
+        Destructive Phase C actions stay out of the enum until they
+        ship — `claim_next_pending` only returns rows whose action
+        is in VALID_ACTIONS, so an early-write of a Phase C action
+        would still get rejected at insert time."""
+        assert VALID_ACTIONS == {
+            "halt",
+            "resume-after-halt",
+            "pause-entries",
+            "resume-entries",
+            "pause-strategy",
+            "resume-strategy",
+        }
 
     def test_valid_statuses_documented(self):
         expected = {

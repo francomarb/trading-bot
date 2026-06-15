@@ -48,6 +48,7 @@ import math
 import os
 import re
 import signal
+import threading
 import time
 import uuid
 from dataclasses import asdict, dataclass, field, replace
@@ -369,7 +370,13 @@ class TradingEngine:
         # Every engine-owned AlpacaBroker gets the same last-mile entry guard.
         # bind_entry_guard preserves any stricter callback supplied by the
         # caller, while making the safety net independent of entrypoint wiring.
-        self.broker.bind_entry_guard(lambda: not self.risk.is_halted())
+        # Phase B extends the guard to also reject when pause-entries is
+        # active. Per-strategy pause stays engine-only (the broker doesn't
+        # see strategy context at submit time); pause-entries IS visible
+        # at this boundary and adds a second defense-in-depth check.
+        self.broker.bind_entry_guard(
+            lambda: not self.risk.is_halted() and not self.risk.is_entries_paused()
+        )
         self.trade_logger = trade_logger or TradeLogger()
         # Operator Controls Phase A — wire the lifecycle store to the
         # broker so equity entry paths persist `position_uid` pending →
@@ -464,6 +471,14 @@ class TradingEngine:
         self._session_start_equity: float | None = None
         self._cycle_count: int = 0
         self._last_cycle_end: float = 0.0  # monotonic timestamp
+        # Operator Controls Phase B — fast operator-command heartbeat.
+        # Daemon thread polls the operator_commands queue every
+        # OPERATOR_COMMAND_HEARTBEAT_SECONDS. Started in `start()`,
+        # stopped by setting `_running=False` (the thread checks the flag
+        # in a sleep loop). Daemon=True so a stuck join during shutdown
+        # cannot prevent process exit.
+        self._operator_heartbeat_thread: threading.Thread | None = None
+        self._operator_heartbeat_stop = threading.Event()
         self._last_regime: str | None = None
         self._regime_fail_count: int = 0
         self._last_cycle_equity: float | None = None
@@ -778,7 +793,17 @@ class TradingEngine:
         # the kill switch immediately so the first cycle blocks entries.
         # Persisted state lives outside the SQLite DB so corruption in
         # one file does not lock out the other.
-        self._restore_sticky_halt_state()
+        # Phase B extends this to also restore pause-entries and
+        # pause-strategy flags from the same file.
+        self._restore_control_state()
+
+        # Operator Controls Phase B — start the fast heartbeat that
+        # drains the operator queue every OPERATOR_COMMAND_HEARTBEAT_SECONDS.
+        # Independent of the trading cycle so commands drain regardless
+        # of market state and at sub-second latency. Best-effort: if
+        # initialisation fails the trading loop still runs (commands
+        # would fall back to expiry).
+        self._start_operator_heartbeat()
 
         self._sync_managed_stop_legs(startup_snapshot)
         self._sync_option_trailing_stops(startup_snapshot)
@@ -827,6 +852,17 @@ class TradingEngine:
         if self._running:
             logger.info("engine stop requested")
         self._running = False
+        # Phase B — wake the heartbeat sleeper so it observes _running=False
+        # immediately rather than waiting up to HEARTBEAT_SECONDS.
+        self._operator_heartbeat_stop.set()
+        thread = self._operator_heartbeat_thread
+        if thread is not None and thread.is_alive():
+            thread.join(timeout=2.0)
+            if thread.is_alive():
+                logger.warning(
+                    "operator heartbeat thread did not exit within 2s; "
+                    "daemon=True ensures it won't block process exit"
+                )
 
     # ── Per-cycle pipeline ───────────────────────────────────────────────
 
@@ -880,15 +916,13 @@ class TradingEngine:
                 f"slots={len(self.slots)}"
             )
 
-            # Operator Controls Phase A PR-2 — F1 fix.
-            # Drain queued operator commands BEFORE the market-closed
-            # early return so a halt or resume-after-halt issued
-            # outside RTH gets picked up on the very next cycle (not
-            # only when the market reopens). Best-effort: queue I/O
-            # failure logs and never aborts the cycle. Phase B will
-            # add a fast heartbeat thread so the operator does not
-            # have to wait up to one full cycle interval.
-            self._process_operator_commands()
+            # Operator Controls Phase B — queue polling moved to the
+            # `_operator_heartbeat_thread` daemon (started in `start()`),
+            # which drains commands every OPERATOR_COMMAND_HEARTBEAT_SECONDS
+            # independent of the trading cycle. The earlier per-cycle
+            # poll (Phase A PR-2 F1 fix) is no longer required because
+            # the heartbeat runs regardless of market state and at
+            # sub-second drain latency.
 
             if not market_open:
                 cycle_status = "market_closed"
@@ -1496,6 +1530,62 @@ class TradingEngine:
             )
             return None
 
+        # Operator Controls Phase B — soft entry pauses.
+        # Layered under the halt gate above. The order matters:
+        # halt → pause-entries (global) → pause-strategy (scoped).
+        # Each branch logs its own reason, fires an order_rejection
+        # alert with HALTED code (the rejection taxonomy doesn't yet
+        # distinguish soft pause; the alert reason text carries the
+        # discriminator), and increments the risk_blocked counter
+        # so the health monitor sees the block.
+        if self.risk.is_entries_paused():
+            reason = (
+                self.risk.entries_paused_reason()
+                or "entries paused by operator"
+            )
+            soft_reason = f"pause-entries: {reason}"
+            logger.info(
+                f"[{strategy.name}] {symbol}: entry blocked — {soft_reason}"
+            )
+            self.alerts.order_rejection(
+                symbol, strategy.name, soft_reason, RejectionCode.HALTED.value
+            )
+            if strategy_statuses is not None:
+                strategy_statuses[symbol] = "Paused"
+            if strategy_reasons is not None:
+                strategy_reasons[symbol] = [soft_reason]
+            _lc = self._lifecycle_counter_for(strategy.name)
+            if _lc is not None:
+                _lc.risk_blocked += 1
+            self._mark_signal_bar_processed(
+                signal_key, signal_bar, strategy_statuses, strategy_reasons, symbol
+            )
+            return None
+
+        if self.risk.is_strategy_paused(strategy.name):
+            paused = self.risk.paused_strategies_snapshot().get(strategy.name, {})
+            soft_reason = (
+                f"pause-strategy {strategy.name}: "
+                f"{paused.get('reason') or 'paused by operator'}"
+            )
+            logger.info(
+                f"[{strategy.name}] {symbol}: entry blocked — {soft_reason}"
+            )
+            self.alerts.order_rejection(
+                symbol, strategy.name, soft_reason, RejectionCode.HALTED.value
+            )
+            if strategy_statuses is not None:
+                strategy_statuses[symbol] = "Paused"
+            if strategy_reasons is not None:
+                strategy_reasons[symbol] = [soft_reason]
+            _lc = self._lifecycle_counter_for(strategy.name)
+            if _lc is not None:
+                _lc.risk_blocked += 1
+            self._mark_signal_bar_processed(
+                signal_key, signal_bar, strategy_statuses, strategy_reasons, symbol
+            )
+            return None
+
         # Shared-symbol conflict (11.7 Part A, refined by PLAN 11.44).
         #
         # Asymmetry by ownership-model keying:
@@ -2079,6 +2169,7 @@ class TradingEngine:
             qty=fill_qty,
             price=fill_price,
             reason=f"{decision.reason} {reason_suffix}".strip(),
+            position_uid=getattr(result, "position_uid", None),
         )
 
     def _maybe_dispatch_substrate_entry_fill(
@@ -2901,24 +2992,29 @@ class TradingEngine:
     # daily-loss / hard-dollar / broker-error / slippage-drift gates
     # and must NOT be cleared by an operator resume.
 
-    def _restore_sticky_halt_state(self) -> None:
-        """Re-engage the kill switch if a halt was active before the
-        previous shutdown.
+    def _restore_control_state(self) -> None:
+        """Re-engage halt / soft pauses from disk on startup.
 
         Reads ``settings.OPERATOR_CONTROL_STATE_PATH``. The file is
-        written by `_persist_sticky_halt` whenever the operator queue
-        engages or clears a halt. Absent file → no halt (normal startup).
+        written by `_persist_control_state` whenever the operator queue
+        changes any flag (halt, pause-entries, pause-strategy). Absent
+        file → no flags set (normal startup).
 
         Best-effort: file-format errors log a warning and continue with
-        no halt. This prevents a malformed JSON from locking the bot
-        out of startup. The operator can manually re-issue halt via
+        no flags. This prevents a malformed JSON from locking the bot
+        out of startup. The operator can manually re-issue commands via
         the CLI if needed.
 
         **Intentionally independent of the operator command store.**
-        The sticky-halt JSON lives outside the SQLite DB precisely so
-        DB corruption cannot defeat halt recovery. The only
-        prerequisite is the risk manager — read the file, engage the
-        kill switch, done. (PR-2 reviewer finding F3.)
+        The control-state JSON lives outside the SQLite DB precisely so
+        DB corruption cannot defeat recovery. The only prerequisite is
+        the risk manager — read the file, set the flags, done. (PR-2
+        reviewer finding F3.)
+
+        Phase B compatibility: a pre-Phase-B JSON (`{halted: true,
+        reason: ..., command_uid: ...}`) is still valid input — the
+        absent `entries_paused` and `paused_strategies` keys default
+        to "not paused".
         """
         path = settings.OPERATOR_CONTROL_STATE_PATH
         try:
@@ -2926,38 +3022,102 @@ class TradingEngine:
                 return
             with open(path, "r") as fh:
                 state = json.load(fh)
-            if not isinstance(state, dict) or not state.get("halted"):
+            if not isinstance(state, dict):
                 return
-            reason = str(state.get("reason") or "sticky halt from prior session")
-            command_uid = state.get("command_uid")
-            note = f"operator_halt_sticky: {reason}"
-            if command_uid:
-                note = f"{note} (cmd={command_uid[:18]}…)"
-            # Engage the existing kill switch. The risk manager owns
-            # the halt state machine — we add no new state machine here.
+        except Exception as exc:
+            logger.warning(
+                f"control state restore skipped (path={path}): {exc}"
+            )
+            return
+
+        # Halt restore (existing behavior, preserved).
+        if state.get("halted"):
             try:
+                reason = str(state.get("reason") or "sticky halt from prior session")
+                command_uid = state.get("command_uid")
+                note = f"operator_halt_sticky: {reason}"
+                if command_uid:
+                    note = f"{note} (cmd={command_uid[:18]}…)"
                 self.risk._engage_kill_switch(note)
+                logger.warning(f"sticky halt restored from {path}: {reason}")
             except Exception as exc:
                 logger.warning(
                     f"sticky halt restore: kill switch engage failed: {exc}"
                 )
-                return
-            logger.warning(
-                f"sticky halt restored from {path}: {reason}"
-            )
-        except Exception as exc:
-            logger.warning(
-                f"sticky halt restore skipped (path={path}): {exc}"
-            )
 
-    def _persist_sticky_halt(
+        # Phase B — pause-entries restore.
+        if state.get("entries_paused"):
+            try:
+                reason = str(state.get("entries_paused_reason") or "restored from prior session")
+                command_uid = state.get("entries_paused_command_uid")
+                self.risk.pause_entries(reason=reason, command_uid=command_uid)
+                logger.warning(
+                    f"pause-entries restored from {path}: {reason}"
+                )
+            except Exception as exc:
+                logger.warning(
+                    f"pause-entries restore: pause failed: {exc}"
+                )
+
+        # Phase B — pause-strategy restore.
+        paused_strategies = state.get("paused_strategies") or {}
+        if isinstance(paused_strategies, dict):
+            for strategy_name, meta in paused_strategies.items():
+                if not isinstance(meta, dict):
+                    continue
+                try:
+                    reason = str(meta.get("reason") or "restored from prior session")
+                    command_uid = meta.get("command_uid")
+                    self.risk.pause_strategy(
+                        strategy_name=strategy_name,
+                        reason=reason,
+                        command_uid=command_uid,
+                    )
+                    logger.warning(
+                        f"pause-strategy '{strategy_name}' restored "
+                        f"from {path}: {reason}"
+                    )
+                except Exception as exc:
+                    logger.warning(
+                        f"pause-strategy restore failed for "
+                        f"{strategy_name!r}: {exc}"
+                    )
+
+    # Backward-compat alias retained so tests written against the
+    # PR-2 method name keep working. Same behavior; the rename to
+    # `_restore_control_state` reflects the broader scope (halt +
+    # pauses, not just halt).
+    _restore_sticky_halt_state = _restore_control_state
+
+    def _persist_control_state(
         self,
         *,
-        halted: bool,
-        reason: str | None,
-        command_uid: str | None,
+        halt_command_uid: str | None = None,
+        halt_reason_override: str | None = None,
     ) -> None:
-        """Write the sticky halt state to disk via atomic rename."""
+        """Atomically snapshot RiskManager halt + pause state to disk.
+
+        Called by every operator-halt / pause handler after it mutates
+        RiskManager state. If no flag is set, the file is removed
+        (absence = clean state). Otherwise the payload includes only
+        the active flags plus their metadata.
+
+        ``halt_command_uid`` is threaded through only because the
+        RiskManager doesn't track which command engaged the halt
+        (the kill switch was originally engaged for non-operator reasons
+        too — daily-loss, hard-dollar, etc.). The operator-halt handler
+        passes its own uid here so the persisted record carries audit
+        identity. Pause uids come from RiskManager state directly
+        because pauses are operator-only.
+
+        ``halt_reason_override`` preserves the historical contract that
+        the persisted JSON carries the BARE command reason (e.g.
+        "market event") — not the prefixed form RiskManager stores
+        ("operator_halt: market event"). The prefix is re-applied on
+        restore. When None, the persister reads RiskManager directly
+        (e.g. a Phase B pause persist that doesn't know the halt
+        reason context).
+        """
         path = settings.OPERATOR_CONTROL_STATE_PATH
         parent = os.path.dirname(path)
         if parent:
@@ -2965,32 +3125,129 @@ class TradingEngine:
                 os.makedirs(parent, exist_ok=True)
             except Exception as exc:
                 logger.warning(
-                    f"sticky halt persist: makedirs failed: {exc}"
+                    f"control state persist: makedirs failed: {exc}"
                 )
                 return
+
+        # Compose the payload from current RiskManager state.
+        payload: dict = {}
+        if self.risk.is_halted():
+            payload["halted"] = True
+            payload["reason"] = (
+                halt_reason_override
+                if halt_reason_override is not None
+                else (self.risk.halt_reason() or "")
+            )
+            payload["command_uid"] = halt_command_uid
+        if self.risk.is_entries_paused():
+            payload["entries_paused"] = True
+            payload["entries_paused_reason"] = (
+                self.risk.entries_paused_reason() or ""
+            )
+            payload["entries_paused_command_uid"] = getattr(
+                self.risk, "_entries_paused_command_uid", None
+            )
+        paused = self.risk.paused_strategies_snapshot()
+        if paused:
+            payload["paused_strategies"] = paused
+        if payload:
+            payload["set_at"] = datetime.now(timezone.utc).isoformat()
+
         try:
-            if halted:
-                payload = {
-                    "halted": True,
-                    "reason": reason or "",
-                    "command_uid": command_uid,
-                    "set_at": datetime.now(timezone.utc).isoformat(),
-                }
+            if payload:
                 tmp = path + ".tmp"
                 with open(tmp, "w") as fh:
                     json.dump(payload, fh, indent=2)
                 os.replace(tmp, path)
             else:
-                # Clear: remove the file.
                 if os.path.exists(path):
                     os.remove(path)
         except Exception as exc:
-            logger.warning(f"sticky halt persist failed: {exc}")
+            logger.warning(f"control state persist failed: {exc}")
+
+    # Backward-compat alias for the old `_persist_sticky_halt(halted,
+    # reason, command_uid)` signature. The new `_persist_control_state`
+    # reads from RiskManager directly, so this shim ensures RiskManager
+    # is consistent with the requested halt state before snapshotting.
+    # New code should call `_persist_control_state` directly.
+    def _persist_sticky_halt(
+        self,
+        *,
+        halted: bool,
+        reason: str | None,
+        command_uid: str | None,
+    ) -> None:
+        # The handlers already set RiskManager state before calling
+        # this — but the old contract took explicit args. Honour both:
+        # if the requested halt state differs from the manager's
+        # current state, the handler hasn't mutated risk yet, so we
+        # do nothing here (the payload is built from RiskManager).
+        # `halt_command_uid` is the only piece RiskManager doesn't
+        # carry; thread it through.
+        self._persist_control_state(
+            halt_command_uid=command_uid if halted else None,
+        )
+
+    def _start_operator_heartbeat(self) -> None:
+        """Spawn the daemon thread that drains operator commands.
+
+        Phase B: replaces the per-cycle queue poll. Calls
+        ``_process_operator_commands`` once every
+        ``OPERATOR_COMMAND_HEARTBEAT_SECONDS`` seconds. Idempotent —
+        safe to call once per engine start.
+        """
+        if self.operator_command_store is None:
+            # No queue → nothing to poll. Skip silently; the engine
+            # otherwise functions correctly.
+            return
+        if (
+            self._operator_heartbeat_thread is not None
+            and self._operator_heartbeat_thread.is_alive()
+        ):
+            return  # already running; defensive against double-start
+        self._operator_heartbeat_stop.clear()
+        thread = threading.Thread(
+            target=self._operator_heartbeat_loop,
+            name="operator-heartbeat",
+            daemon=True,
+        )
+        self._operator_heartbeat_thread = thread
+        thread.start()
+        logger.info(
+            f"operator heartbeat started "
+            f"(interval={settings.OPERATOR_COMMAND_HEARTBEAT_SECONDS}s)"
+        )
+
+    def _operator_heartbeat_loop(self) -> None:
+        """Thread body: drain commands until `_running=False`.
+
+        Wrapped so any exception inside `_process_operator_commands`
+        logs and continues — the heartbeat must survive transient
+        queue errors. Sleeping via `_operator_heartbeat_stop.wait()`
+        lets `stop()` interrupt the sleep immediately for clean
+        shutdown.
+        """
+        interval = max(1, int(settings.OPERATOR_COMMAND_HEARTBEAT_SECONDS))
+        while self._running:
+            try:
+                self._process_operator_commands()
+            except Exception as exc:
+                logger.warning(
+                    f"operator heartbeat: drain raised "
+                    f"{type(exc).__name__}: {exc} (continuing)"
+                )
+            # Wait returns True when set; we exit immediately. False
+            # means timeout — continue draining.
+            if self._operator_heartbeat_stop.wait(timeout=interval):
+                break
+        logger.debug("operator heartbeat thread exiting")
 
     def _process_operator_commands(self) -> None:
-        """Drain one queued operator command per cycle.
+        """Drain one queued operator command per call.
 
-        Phase A routes only ``halt`` and ``resume-after-halt``. Every
+        Called by the heartbeat thread (Phase B). Phase A routes
+        ``halt`` and ``resume-after-halt``; Phase B adds the four
+        soft-pause actions. Every
         other action is terminated with
         ``status='rejected_unsupported_phase_a'`` so the operator sees
         an audited refusal rather than a silent no-op.
@@ -3022,21 +3279,29 @@ class TradingEngine:
                 self._apply_operator_halt(claimed)
             elif claimed.action == "resume-after-halt":
                 self._apply_operator_resume_after_halt(claimed)
+            elif claimed.action == "pause-entries":
+                self._apply_operator_pause_entries(claimed)
+            elif claimed.action == "resume-entries":
+                self._apply_operator_resume_entries(claimed)
+            elif claimed.action == "pause-strategy":
+                self._apply_operator_pause_strategy(claimed)
+            elif claimed.action == "resume-strategy":
+                self._apply_operator_resume_strategy(claimed)
             else:
                 # Defensive — claim_next_pending only returns rows
                 # written via insert(), which validates against
-                # VALID_ACTIONS. But Phase B/C may extend the table;
+                # VALID_ACTIONS. But Phase C may extend the table;
                 # be explicit until those handlers exist.
                 self.operator_command_store.mark_rejected(
                     command_uid=claimed.command_uid,
                     status="rejected_unsupported_phase_a",
                     result={
-                        "note": f"action {claimed.action!r} not implemented in Phase A",
+                        "note": f"action {claimed.action!r} not implemented yet",
                     },
                 )
                 logger.warning(
                     f"operator command {claimed.command_uid[:18]}…: "
-                    f"action {claimed.action!r} not supported in Phase A"
+                    f"action {claimed.action!r} not supported in current phase"
                 )
         except Exception as exc:
             logger.error(
@@ -3073,10 +3338,9 @@ class TradingEngine:
                 result={"error": f"kill switch engage failed: {exc}"},
             )
             return
-        self._persist_sticky_halt(
-            halted=True,
-            reason=command.reason,
-            command_uid=command.command_uid,
+        self._persist_control_state(
+            halt_command_uid=command.command_uid,
+            halt_reason_override=command.reason,  # bare reason, prefix added on restore
         )
         try:
             self.alerts.engine_halt(
@@ -3216,6 +3480,205 @@ class TradingEngine:
         )
         logger.info(f"engine resumed by operator: {command.reason}")
 
+    def _lookup_position_uid_for_owner(self, owner_key: str) -> str | None:
+        """Phase B §17.2 — uid lookup for exit alerts.
+
+        Looks up the currently-open lifecycle row for an owner_key and
+        returns its position_uid. Returns None when the lifecycle store
+        is unavailable (legacy build) or no open row exists (pre-PR-1
+        position not yet backfilled). The alert helper accepts uid=None
+        gracefully — the message simply omits the `[pos_...]` suffix.
+        """
+        if self.lifecycle_store is None or not owner_key:
+            return None
+        try:
+            row = self.lifecycle_store.get_open_for_owner_key(owner_key)
+            return row.position_uid if row is not None else None
+        except Exception as exc:  # noqa: BLE001
+            logger.debug(f"position_uid lookup failed for {owner_key!r}: {exc}")
+            return None
+
+    # ── Operator soft pauses (Phase B) ────────────────────────────────
+    #
+    # Soft pauses are flag flips on the RiskManager — they do NOT engage
+    # the kill switch. The engine-side handlers:
+    #   1. Mutate RiskManager state (pause_entries / pause_strategy / ...)
+    #   2. Call `_persist_control_state()` so the next restart re-applies
+    #   3. Fire an info alert (non-CRITICAL — soft pauses are operational
+    #      gestures, not emergencies)
+    #   4. Transition the queue row to `succeeded`
+    #
+    # All four handlers are idempotent at the RiskManager layer: if the
+    # operator re-issues `pause-entries` when already paused, RiskManager
+    # returns False from pause_entries() and the result-json carries
+    # `already_paused: true`. The command still records as `succeeded`
+    # because the desired end-state is met.
+
+    def _apply_operator_pause_entries(self, command) -> None:
+        """Handle ``pause-entries``: globally block new entries.
+
+        Does NOT engage the kill switch — soft pause and halt are
+        independent gates (halt is the stricter outer gate; pause-entries
+        layers under it). Exits, stops, reconciliation, allocator
+        updates, and lifecycle reconciles continue.
+        """
+        try:
+            state_changed = self.risk.pause_entries(
+                reason=command.reason,
+                command_uid=command.command_uid,
+            )
+        except Exception as exc:
+            self.operator_command_store.mark_failed(
+                command_uid=command.command_uid,
+                result={"error": f"pause_entries failed: {exc}"},
+            )
+            return
+        self._persist_control_state()
+        try:
+            self.alerts.engine_halt(
+                f"operator pause-entries: {command.reason} "
+                f"(cmd={command.command_uid[:18]}…) — new entries blocked"
+            )
+        except Exception as exc:
+            logger.warning(f"pause-entries alert failed: {exc}")
+        self.operator_command_store.mark_succeeded(
+            command_uid=command.command_uid,
+            result={
+                "entries_paused": True,
+                "already_paused": not state_changed,
+            },
+        )
+        logger.warning(f"entries paused by operator: {command.reason}")
+
+    def _apply_operator_resume_entries(self, command) -> None:
+        """Handle ``resume-entries``: clear the global pause flag.
+
+        Unlike `resume-after-halt`, no reconciliation is required —
+        soft pause is a flag flip. The next entry attempt stops being
+        gated by the pause check.
+        """
+        try:
+            state_changed = self.risk.resume_entries()
+        except Exception as exc:
+            self.operator_command_store.mark_failed(
+                command_uid=command.command_uid,
+                result={"error": f"resume_entries failed: {exc}"},
+            )
+            return
+        self._persist_control_state()
+        try:
+            self.alerts.engine_halt(
+                f"operator resume-entries: {command.reason} "
+                f"(cmd={command.command_uid[:18]}…) — entries unblocked"
+            )
+        except Exception as exc:
+            logger.warning(f"resume-entries alert failed: {exc}")
+        self.operator_command_store.mark_succeeded(
+            command_uid=command.command_uid,
+            result={
+                "entries_paused": False,
+                "already_resumed": not state_changed,
+            },
+        )
+        logger.info(f"entries resumed by operator: {command.reason}")
+
+    def _apply_operator_pause_strategy(self, command) -> None:
+        """Handle ``pause-strategy``: block new entries for one strategy.
+
+        The strategy name is carried in ``command.target_strategy``.
+        Other strategies and existing position management for the
+        paused strategy continue unaffected.
+        """
+        strategy_name = (command.target_strategy or "").strip()
+        if not strategy_name:
+            self.operator_command_store.mark_rejected(
+                command_uid=command.command_uid,
+                status="rejected_validation",
+                result={"note": "target_strategy is required for pause-strategy"},
+            )
+            logger.warning(
+                f"pause-strategy {command.command_uid[:18]}…: "
+                "no target_strategy supplied"
+            )
+            return
+
+        try:
+            state_changed = self.risk.pause_strategy(
+                strategy_name=strategy_name,
+                reason=command.reason,
+                command_uid=command.command_uid,
+            )
+        except Exception as exc:
+            self.operator_command_store.mark_failed(
+                command_uid=command.command_uid,
+                result={"error": f"pause_strategy failed: {exc}"},
+            )
+            return
+        self._persist_control_state()
+        try:
+            self.alerts.engine_halt(
+                f"operator pause-strategy {strategy_name}: {command.reason} "
+                f"(cmd={command.command_uid[:18]}…) — "
+                f"{strategy_name} entries blocked"
+            )
+        except Exception as exc:
+            logger.warning(f"pause-strategy alert failed: {exc}")
+        self.operator_command_store.mark_succeeded(
+            command_uid=command.command_uid,
+            result={
+                "strategy": strategy_name,
+                "paused": True,
+                "already_paused": not state_changed,
+            },
+        )
+        logger.warning(
+            f"strategy '{strategy_name}' paused by operator: {command.reason}"
+        )
+
+    def _apply_operator_resume_strategy(self, command) -> None:
+        """Handle ``resume-strategy``: clear the per-strategy pause."""
+        strategy_name = (command.target_strategy or "").strip()
+        if not strategy_name:
+            self.operator_command_store.mark_rejected(
+                command_uid=command.command_uid,
+                status="rejected_validation",
+                result={"note": "target_strategy is required for resume-strategy"},
+            )
+            logger.warning(
+                f"resume-strategy {command.command_uid[:18]}…: "
+                "no target_strategy supplied"
+            )
+            return
+
+        try:
+            state_changed = self.risk.resume_strategy(strategy_name=strategy_name)
+        except Exception as exc:
+            self.operator_command_store.mark_failed(
+                command_uid=command.command_uid,
+                result={"error": f"resume_strategy failed: {exc}"},
+            )
+            return
+        self._persist_control_state()
+        try:
+            self.alerts.engine_halt(
+                f"operator resume-strategy {strategy_name}: {command.reason} "
+                f"(cmd={command.command_uid[:18]}…) — "
+                f"{strategy_name} entries unblocked"
+            )
+        except Exception as exc:
+            logger.warning(f"resume-strategy alert failed: {exc}")
+        self.operator_command_store.mark_succeeded(
+            command_uid=command.command_uid,
+            result={
+                "strategy": strategy_name,
+                "paused": False,
+                "already_resumed": not state_changed,
+            },
+        )
+        logger.info(
+            f"strategy '{strategy_name}' resumed by operator: {command.reason}"
+        )
+
     def _close_fractional_residual_position(
         self,
         *,
@@ -3293,6 +3756,8 @@ class TradingEngine:
                 qty=close_qty,
                 price=close_price,
                 reason="fractional residual cleanup",
+                position_uid=getattr(result, "position_uid", None)
+                    or self._lookup_position_uid_for_owner(owner),
             )
             self._record_realized_pnl(symbol, owner, close_price, close_qty)
             self._pop_position(symbol)
@@ -5671,6 +6136,8 @@ class TradingEngine:
             qty=close_qty,
             price=close_price,
             reason=alert_reason,
+            position_uid=getattr(result, "position_uid", None)
+                or self._lookup_position_uid_for_owner(symbol),
         )
         pnl_mult = 100 if _OCC_PAT.match(position.symbol) else 1
         # Operator Controls Phase A — only close the lifecycle row when
@@ -7217,6 +7684,9 @@ class TradingEngine:
         out: dict = {
             "is_halted": False,
             "halt_reason": None,
+            "entries_paused": False,
+            "entries_paused_reason": None,
+            "paused_strategies": {},
             "cooldown_state": {},
             "sleeve_dd_state": {},
         }
@@ -7225,6 +7695,16 @@ class TradingEngine:
             out["halt_reason"] = self.risk.halt_reason()
         except Exception as exc:  # noqa: BLE001
             logger.debug(f"risk halt accessor failed: {exc}")
+        # Phase B — soft entry pauses, fail-safe defaults if RiskManager
+        # is a custom subclass that doesn't yet expose these accessors.
+        try:
+            if hasattr(self.risk, "is_entries_paused"):
+                out["entries_paused"] = bool(self.risk.is_entries_paused())
+                out["entries_paused_reason"] = self.risk.entries_paused_reason()
+            if hasattr(self.risk, "paused_strategies_snapshot"):
+                out["paused_strategies"] = self.risk.paused_strategies_snapshot()
+        except Exception as exc:  # noqa: BLE001
+            logger.debug(f"soft pause accessor failed: {exc}")
         try:
             if hasattr(self.risk, "cooldown_snapshot"):
                 out["cooldown_state"] = self.risk.cooldown_snapshot()
