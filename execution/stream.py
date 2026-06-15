@@ -943,7 +943,12 @@ class StreamManager:
                         received_at=now,
                     )
                     self._option_stop_audit_events.append(audit_event)
-                    if event_val == "fill":
+                    if event_val in {
+                        "fill",
+                        "canceled",
+                        "rejected",
+                        "expired",
+                    }:
                         self._remove_option_stop_audits_locked(
                             {audit_watch.correlation_id}
                         )

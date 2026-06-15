@@ -29,7 +29,8 @@ OPTION_STOP_REPLACE_AUDIT_RETENTION_DAYS=14
 Each ratchet decision records cached and freshly fetched order state, quote
 state, position mark/value, HWM and requested stop, replace request timing,
 the replacement REST response, and matching WebSocket trade updates. Stream
-association ends on fill or after five minutes.
+association ends on fill, cancel, rejection, expiry, or after five minutes.
+Retention pruning runs at startup and at most once per 24 hours while enabled.
 
 Inspect evidence with:
 

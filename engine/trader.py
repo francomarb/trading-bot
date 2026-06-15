@@ -75,6 +75,7 @@ from engine.option_trailing import OptionTrailingStopStore
 from execution.entry_guard import CapAction, compute_cap_price, gate_entry
 from execution.broker import (
     AlpacaBroker,
+    BrokerOrderAuditSnapshot,
     BrokerSnapshot,
     OptionQuote,
     OrderResult,
@@ -127,6 +128,16 @@ _OCC_PAT = re.compile(r"^[A-Z]{1,6}[0-9]{6}[CP][0-9]{8}$")
 # several cycles rather than blowing the per-cycle Alpaca API
 # budget in one shot.
 _SUBSTRATE_CYCLE_RECONCILE_LIMIT = 20
+
+
+@dataclass(frozen=True)
+class _OptionStopAuditContext:
+    """One enabled, strategy-scoped replacement audit window."""
+
+    correlation_id: str
+    decision_at: datetime
+    expires_at: datetime
+    broker_before: BrokerOrderAuditSnapshot | None
 
 
 # P-2: Alpaca REST order.status → substrate status. Same intent as
@@ -405,6 +416,7 @@ class TradingEngine:
             logger.warning(f"option trailing store init skipped: {exc}")
             self.option_trailing_store = None
         self.option_stop_audit_store = None
+        self._option_stop_audit_last_pruned_at: datetime | None = None
         if self.config.option_stop_replace_audit_enabled:
             try:
                 from engine.option_stop_audit import OptionStopReplaceAuditStore
@@ -415,6 +427,9 @@ class TradingEngine:
                     days=self.config.option_stop_replace_audit_retention_days
                 )
                 pruned = self.option_stop_audit_store.prune_before(cutoff)
+                self._option_stop_audit_last_pruned_at = datetime.now(
+                    timezone.utc
+                )
                 logger.info(
                     "temporary option-stop replacement audit enabled for "
                     f"strategy={self.config.option_stop_replace_audit_strategy} "
@@ -3553,14 +3568,98 @@ class TradingEngine:
             logger.warning(f"option-stop audit write failed: {exc}")
             return False
 
+    def _begin_option_stop_audit(
+        self, *, owner: str, order_id: str
+    ) -> _OptionStopAuditContext | None:
+        """Open a real-time forensic window for one target-strategy decision."""
+        if not self._option_stop_audit_active_for(owner):
+            return None
+        decision_at = datetime.now(timezone.utc)
+        return _OptionStopAuditContext(
+            correlation_id=f"optstop_{uuid.uuid4().hex}",
+            decision_at=decision_at,
+            expires_at=decision_at + timedelta(
+                seconds=self.config.option_stop_replace_audit_window_seconds
+            ),
+            broker_before=self.broker.get_order_audit_snapshot(order_id),
+        )
+
+    def _record_option_stop_audit_decision(
+        self,
+        *,
+        audit: _OptionStopAuditContext,
+        record_type: str,
+        owner: str,
+        occ: str,
+        lifecycle_row,
+        existing,
+        position,
+        quote: OptionQuote | None,
+        reason: str,
+        entry_premium: float,
+        hwm: float,
+        desired_stop: float,
+        requested_stop: float | None,
+        qty: float,
+        replacement_client_order_id: str | None = None,
+    ) -> bool:
+        """Record the shared decision evidence for deferrals and replacements."""
+        return self._record_option_stop_audit(
+            correlation_id=audit.correlation_id,
+            record_type=record_type,
+            strategy=owner,
+            occ_symbol=occ,
+            order_id=existing.order_id,
+            recorded_at=audit.decision_at,
+            payload={
+                "position_uid": lifecycle_row.position_uid,
+                "reason": reason,
+                "association_expires_at": audit.expires_at,
+                "cached_order": {
+                    "stop_price": existing.stop_price,
+                    "qty": existing.qty,
+                    "time_in_force": existing.time_in_force,
+                    "status": existing.status,
+                },
+                "broker_before": (
+                    asdict(audit.broker_before)
+                    if audit.broker_before is not None
+                    else None
+                ),
+                "quote": asdict(quote) if quote is not None else None,
+                "position_current_price": getattr(
+                    position, "current_price", None
+                ),
+                "position_market_value": getattr(
+                    position, "market_value", None
+                ),
+                "entry_premium": entry_premium,
+                "hwm_premium": hwm,
+                "desired_stop_price": desired_stop,
+                "requested_stop_price": requested_stop,
+                "requested_qty": qty,
+                "replacement_client_order_id": replacement_client_order_id,
+            },
+        )
+
     def _drain_option_stop_audit_events(self) -> None:
         """Persist bounded stream evidence on the engine's DB thread."""
-        if (
-            self.option_stop_audit_store is None
-            or self._stream_manager is None
-        ):
+        if self.option_stop_audit_store is None:
             return
         try:
+            now = datetime.now(timezone.utc)
+            last_pruned = self._option_stop_audit_last_pruned_at
+            if (
+                last_pruned is None
+                or now - last_pruned >= timedelta(hours=24)
+            ):
+                cutoff = now - timedelta(
+                    days=self.config.option_stop_replace_audit_retention_days
+                )
+                self.option_stop_audit_store.prune_before(cutoff)
+                self._option_stop_audit_last_pruned_at = now
+            if self._stream_manager is None:
+                return
             for record in self._stream_manager.drain_option_stop_audit_events():
                 self.option_stop_audit_store.append(**record)
         except Exception as exc:
@@ -3718,30 +3817,9 @@ class TradingEngine:
                 maintenance_replacement = (
                     not existing_is_known_gtc or not existing_qty_matches
                 )
-                audit_active = self._option_stop_audit_active_for(owner)
-                audit_correlation_id = (
-                    f"optstop_{uuid.uuid4().hex}" if audit_active else None
-                )
-                audit_decision_at: datetime | None = None
-                audit_expires_at: datetime | None = None
-                if audit_active:
-                    audit_decision_at = self._clock()
-                    if audit_decision_at.tzinfo is None:
-                        audit_decision_at = audit_decision_at.replace(
-                            tzinfo=timezone.utc
-                        )
-                    audit_decision_at = audit_decision_at.astimezone(
-                        timezone.utc
-                    )
-                    audit_expires_at = audit_decision_at + timedelta(
-                        seconds=(
-                            self.config.option_stop_replace_audit_window_seconds
-                        )
-                    )
-                broker_before = (
-                    self.broker.get_order_audit_snapshot(existing.order_id)
-                    if audit_active
-                    else None
+                audit = self._begin_option_stop_audit(
+                    owner=owner,
+                    order_id=existing.order_id,
                 )
                 quote: OptionQuote | None = None
                 quote_rejection: str | None = None
@@ -3781,55 +3859,30 @@ class TradingEngine:
                                 f"deferred — {quote_rejection}; existing broker "
                                 "stop remains active"
                             )
-                            if (
-                                audit_correlation_id is not None
-                                and audit_decision_at is not None
-                            ):
-                                self._record_option_stop_audit(
-                                    correlation_id=audit_correlation_id,
+                            if audit is not None:
+                                self._record_option_stop_audit_decision(
+                                    audit=audit,
                                     record_type="decision_deferred",
-                                    strategy=owner,
-                                    occ_symbol=occ,
-                                    order_id=existing.order_id,
-                                    recorded_at=audit_decision_at,
-                                    payload={
-                                        "position_uid": lifecycle_row.position_uid,
-                                        "reason": quote_rejection,
-                                        "association_expires_at": audit_expires_at,
-                                        "cached_order": {
-                                            "stop_price": existing.stop_price,
-                                            "qty": existing.qty,
-                                            "time_in_force": existing.time_in_force,
-                                            "status": existing.status,
-                                        },
-                                        "broker_before": (
-                                            asdict(broker_before)
-                                            if broker_before is not None
-                                            else None
-                                        ),
-                                        "quote": (
-                                            asdict(quote)
-                                            if quote is not None else None
-                                        ),
-                                        "position_current_price": getattr(
-                                            position, "current_price", None
-                                        ),
-                                        "position_market_value": getattr(
-                                            position, "market_value", None
-                                        ),
-                                        "entry_premium": entry_premium,
-                                        "hwm_premium": hwm,
-                                        "desired_stop_price": desired_stop,
-                                        "requested_qty": qty,
-                                    },
+                                    owner=owner,
+                                    occ=occ,
+                                    lifecycle_row=lifecycle_row,
+                                    existing=existing,
+                                    position=position,
+                                    quote=quote,
+                                    reason=quote_rejection,
+                                    entry_premium=entry_premium,
+                                    hwm=hwm,
+                                    desired_stop=desired_stop,
+                                    requested_stop=None,
+                                    qty=qty,
                                 )
                             continue
                 replacement_client_order_id = (
                     f"opt-trail-audit-{uuid.uuid4().hex[:10]}"
-                    if audit_correlation_id is not None else None
+                    if audit is not None else None
                 )
                 audit_created = False
-                if audit_correlation_id is not None:
+                if audit is not None:
                     reason = (
                         f"{quote_rejection}; proceeding with TIF/qty maintenance"
                         if quote_rejection is not None
@@ -3839,58 +3892,35 @@ class TradingEngine:
                             else "TIF/qty maintenance"
                         )
                     )
-                    assert audit_decision_at is not None
-                    assert audit_expires_at is not None
-                    audit_created = self._record_option_stop_audit(
-                        correlation_id=audit_correlation_id,
+                    audit_created = self._record_option_stop_audit_decision(
+                        audit=audit,
                         record_type="decision_replace",
-                        strategy=owner,
-                        occ_symbol=occ,
-                        order_id=existing.order_id,
-                        recorded_at=audit_decision_at,
-                        payload={
-                            "position_uid": lifecycle_row.position_uid,
-                            "reason": reason,
-                            "association_expires_at": audit_expires_at,
-                            "cached_order": {
-                                "stop_price": existing.stop_price,
-                                "qty": existing.qty,
-                                "time_in_force": existing.time_in_force,
-                                "status": existing.status,
-                            },
-                            "broker_before": (
-                                asdict(broker_before)
-                                if broker_before is not None else None
-                            ),
-                            "quote": (
-                                asdict(quote) if quote is not None else None
-                            ),
-                            "position_current_price": getattr(
-                                position, "current_price", None
-                            ),
-                            "position_market_value": getattr(
-                                position, "market_value", None
-                            ),
-                            "entry_premium": entry_premium,
-                            "hwm_premium": hwm,
-                            "desired_stop_price": desired_stop,
-                            "requested_stop_price": replacement_stop,
-                            "requested_qty": qty,
-                            "replacement_client_order_id": (
-                                replacement_client_order_id
-                            ),
-                        },
+                        owner=owner,
+                        occ=occ,
+                        lifecycle_row=lifecycle_row,
+                        existing=existing,
+                        position=position,
+                        quote=quote,
+                        reason=reason,
+                        entry_premium=entry_premium,
+                        hwm=hwm,
+                        desired_stop=desired_stop,
+                        requested_stop=replacement_stop,
+                        qty=qty,
+                        replacement_client_order_id=(
+                            replacement_client_order_id
+                        ),
                     )
                     if audit_created and self._stream_manager is not None:
                         self._stream_manager.register_option_stop_audit(
-                            correlation_id=audit_correlation_id,
+                            correlation_id=audit.correlation_id,
                             strategy=owner,
                             occ_symbol=occ,
                             aliases={
                                 existing.order_id,
                                 replacement_client_order_id,
                             },
-                            expires_at=audit_expires_at,
+                            expires_at=audit.expires_at,
                         )
                 replace_call_start = (
                     datetime.now(timezone.utc) if audit_created else None
@@ -3916,12 +3946,12 @@ class TradingEngine:
                     replace_call_end = (
                         datetime.now(timezone.utc) if audit_created else None
                     )
-                    if audit_created and audit_correlation_id is not None:
+                    if audit_created and audit is not None:
                         assert replace_call_start is not None
                         assert replace_call_started_mono is not None
                         assert replace_call_end is not None
                         self._record_option_stop_audit(
-                            correlation_id=audit_correlation_id,
+                            correlation_id=audit.correlation_id,
                             record_type="replace_failed",
                             strategy=owner,
                             occ_symbol=occ,
@@ -3965,11 +3995,11 @@ class TradingEngine:
                 )
                 if (
                     audit_created
-                    and audit_correlation_id is not None
+                    and audit is not None
                     and self._stream_manager is not None
                 ):
                     self._stream_manager.bind_option_stop_audit_alias(
-                        audit_correlation_id,
+                        audit.correlation_id,
                         new_order.order_id,
                     )
                 broker_after = (
@@ -3977,12 +4007,12 @@ class TradingEngine:
                     if audit_created
                     else None
                 )
-                if audit_created and audit_correlation_id is not None:
+                if audit_created and audit is not None:
                     assert replace_call_start is not None
                     assert replace_call_started_mono is not None
                     assert replace_call_end is not None
                     self._record_option_stop_audit(
-                        correlation_id=audit_correlation_id,
+                        correlation_id=audit.correlation_id,
                         record_type="replace_result",
                         strategy=owner,
                         occ_symbol=occ,

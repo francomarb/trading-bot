@@ -4368,6 +4368,7 @@ class TestGenericSingleLegOptionTrailingStops:
         assert records[0]["order_id"] == "old-stop"
         assert records[1]["order_id"] == "replacement-stop"
         assert records[0]["payload"]["broker_before"]["order_id"] == "old-stop"
+        assert datetime.fromisoformat(records[0]["recorded_at"]) > T0
         stream.register_option_stop_audit.assert_called_once()
         stream.bind_option_stop_audit_alias.assert_called_once()
 
@@ -4411,6 +4412,23 @@ class TestGenericSingleLegOptionTrailingStops:
         broker.get_order_audit_snapshot.assert_not_called()
         assert "client_order_id" not in broker.replace_option_stop.call_args.kwargs
         assert engine.option_stop_audit_store.read_records() == []
+
+    def test_enabled_audit_prunes_daily_during_long_session(self, tmp_path):
+        stream = MagicMock()
+        stream.drain_option_stop_audit_events.return_value = []
+        engine, _broker = self._engine(
+            tmp_path,
+            audit_enabled=True,
+            stream_manager=stream,
+        )
+        engine.option_stop_audit_store.prune_before = MagicMock(return_value=0)
+        engine._option_stop_audit_last_pruned_at = (
+            datetime.now(timezone.utc) - timedelta(hours=25)
+        )
+
+        engine._drain_option_stop_audit_events()
+
+        engine.option_stop_audit_store.prune_before.assert_called_once()
 
     def test_ratchet_is_deferred_when_bid_does_not_support_new_stop(self, tmp_path):
         engine, broker = self._engine(tmp_path)

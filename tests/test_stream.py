@@ -201,6 +201,42 @@ class TestStreamManagerPublicAPI:
 
         assert sm.drain_option_stop_audit_events() == []
 
+    @pytest.mark.parametrize("terminal_event", ["canceled", "rejected", "expired"])
+    def test_option_stop_audit_releases_watch_on_terminal_failure(
+        self, terminal_event
+    ):
+        sm = _stream()
+        sm.register_option_stop_audit(
+            correlation_id="corr-terminal",
+            strategy="spy_options_reversion",
+            occ_symbol="SPY260702C00724000",
+            aliases={"replacement-client"},
+            expires_at=_utcnow() + timedelta(minutes=5),
+        )
+
+        asyncio.run(_dispatch(
+            sm,
+            _make_update(
+                "new-stop",
+                "SPY260702C00724000",
+                terminal_event,
+                client_order_id="replacement-client",
+            ),
+        ))
+        first = sm.drain_option_stop_audit_events()
+        assert first[0]["record_type"] == f"stream_{terminal_event}"
+
+        asyncio.run(_dispatch(
+            sm,
+            _make_update(
+                "new-stop",
+                "SPY260702C00724000",
+                "fill",
+                client_order_id="replacement-client",
+            ),
+        ))
+        assert sm.drain_option_stop_audit_events() == []
+
     def test_unwatch_clears_aliases_for_client_and_order_id(self):
         sm = _stream()
         sm.watch("client-1")
