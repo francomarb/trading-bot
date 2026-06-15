@@ -1,7 +1,7 @@
 # Deferred trade follow-ups — 2026-06-12
 
-**Status:** Recorded for later review. Do not investigate or implement while
-the current parallel bot work is still in flight.
+**Status:** Item 1 is active on a dedicated fix branch. Item 2 remains deferred
+while its related order-lifecycle work is in flight.
 
 **Context:** Two operational observations were found while reviewing the
 June 12, 2026 paper-trading activity. Neither observation invalidates the
@@ -9,6 +9,13 @@ day's realized SPY option profit, but both deserve a focused review after the
 active workstreams settle.
 
 ## 1. Option trailing-stop replacement and fill timing
+
+**Status:** Fix in review. The replacement path now requires a fresh,
+two-sided Alpaca option quote before increasing a stop price. The executable
+bid must support the proposed stop with a safety buffer and the spread must
+remain within a conservative quality ceiling. A failed quality check leaves
+the existing broker stop active and retries next cycle; missing-stop creation
+and required GTC/quantity maintenance remain fail-safe and are not blocked.
 
 The `spy_options_reversion` position in `SPY260702C00724000` closed profitably:
 
@@ -23,19 +30,19 @@ and receiving a fill update at $23.00 almost simultaneously. The trade logger
 therefore records a stop trigger benchmark of $19.55 and an unusually favorable
 $23.00 fill.
 
-Questions for later review:
+Investigation results:
 
-1. Did the fill belong to the old stop while its replacement was in flight, the
-   replacement order, or another broker-side event?
-2. Is the persisted stop order identity correctly associated with the fill
-   during Alpaca replace events?
-3. Is the reported stop slippage meaningful when a replace and fill race in
-   this way?
-4. Do tests cover replacement/fill ordering from both REST snapshots and
-   WebSocket trade updates?
+1. Broker history confirmed the replacement order itself filled, not the old
+   stop.
+2. The persisted order identity followed Alpaca's replacement id correctly.
+3. Alpaca paper fills against current quotes, but the ratchet decision used the
+   Positions API current price without validating the executable option book.
+4. Exact historical quote reconstruction was unavailable, so a transient quote
+   and a paper-simulation quirk cannot be distinguished conclusively.
 
-Do not infer a defect solely from the favorable fill. Reconstruct the broker
-event sequence and Alpaca replacement semantics before proposing a change.
+The fix does not classify either profitable fill as defective. It improves the
+evidence required for future stop-price increases without changing the existing
+broker-side protection or converting the strategy to software-only exits.
 
 ## 2. ALAB attached stop cannot be promoted to GTC
 
@@ -71,12 +78,11 @@ live-facing order lifecycle.
 
 ## Revisit criteria
 
-Return to these items only when the operator explicitly resumes them and the
-current order-lifecycle and other parallel bot work has settled. At that point:
+For any remaining work:
 
-1. Start from the exact June 12 logs and trade rows.
-2. Check the current branch and deployed order-lifecycle phase before assuming
+1. Start from the exact incident logs and trade rows.
+2. Check the deployed order-lifecycle phase before assuming
    which component owns order identity or replacement state.
-3. Investigate each concern separately; do not bundle them into one fix.
+3. Keep each concern in a separate fix branch and PR.
 4. Add focused unit tests and a targeted Alpaca paper verification for any
    broker-facing change.

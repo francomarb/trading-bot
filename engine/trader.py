@@ -75,6 +75,7 @@ from execution.entry_guard import CapAction, compute_cap_price, gate_entry
 from execution.broker import (
     AlpacaBroker,
     BrokerSnapshot,
+    OptionQuote,
     OrderResult,
     OrderStatus,
 )
@@ -235,6 +236,13 @@ class EngineConfig:
     cancel_orders_on_shutdown: bool = settings.ENGINE_CANCEL_ORDERS_ON_SHUTDOWN
     atr_length: int = settings.ATR_LENGTH
     external_close_confirm_cycles: int = settings.ENGINE_EXTERNAL_CLOSE_CONFIRM_CYCLES
+    option_trailing_quote_max_age_seconds: float = (
+        settings.OPTION_TRAILING_QUOTE_MAX_AGE_SECONDS
+    )
+    option_trailing_max_spread_pct: float = settings.OPTION_TRAILING_MAX_SPREAD_PCT
+    option_trailing_stop_bid_buffer_pct: float = (
+        settings.OPTION_TRAILING_STOP_BID_BUFFER_PCT
+    )
 
     def __post_init__(self) -> None:
         if self.cycle_interval_seconds <= 0:
@@ -247,6 +255,12 @@ class EngineConfig:
             raise ValueError("history_lookback_days must be >= 1")
         if self.external_close_confirm_cycles < 1:
             raise ValueError("external_close_confirm_cycles must be >= 1")
+        if self.option_trailing_quote_max_age_seconds <= 0:
+            raise ValueError("option_trailing_quote_max_age_seconds must be > 0")
+        if not 0 <= self.option_trailing_max_spread_pct < 1:
+            raise ValueError("option_trailing_max_spread_pct must be in [0, 1)")
+        if not 0 <= self.option_trailing_stop_bid_buffer_pct < 1:
+            raise ValueError("option_trailing_stop_bid_buffer_pct must be in [0, 1)")
 
 
 # P-7: SuspectExitOrder dataclass removed. Substrate exit rows
@@ -3406,6 +3420,54 @@ class TradingEngine:
         retry_grace = max(120.0, float(self.config.cycle_interval_seconds) * 2.0)
         return 0.0 <= age.total_seconds() <= retry_grace
 
+    def _option_ratchet_quote_rejection(
+        self,
+        *,
+        quote: OptionQuote | None,
+        desired_stop: float,
+    ) -> str | None:
+        """Return why a quote cannot safely support a higher option stop."""
+        if quote is None:
+            return "latest two-sided option quote unavailable"
+        bid = float(quote.bid_price)
+        ask = float(quote.ask_price)
+        if not math.isfinite(bid) or not math.isfinite(ask) or bid <= 0 or ask <= 0:
+            return f"invalid option quote bid=${bid:.2f} ask=${ask:.2f}"
+        if ask < bid:
+            return f"crossed option quote bid=${bid:.2f} ask=${ask:.2f}"
+
+        now = self._clock()
+        if now.tzinfo is None:
+            now = now.replace(tzinfo=timezone.utc)
+        age_seconds = (
+            now.astimezone(timezone.utc) - quote.timestamp.astimezone(timezone.utc)
+        ).total_seconds()
+        if (
+            age_seconds < -5.0
+            or age_seconds > self.config.option_trailing_quote_max_age_seconds
+        ):
+            return (
+                f"stale option quote age={age_seconds:.1f}s "
+                f"(max={self.config.option_trailing_quote_max_age_seconds:.1f}s)"
+            )
+
+        midpoint = (bid + ask) / 2.0
+        spread_pct = (ask - bid) / midpoint if midpoint > 0 else math.inf
+        if spread_pct > self.config.option_trailing_max_spread_pct:
+            return (
+                f"wide option quote bid=${bid:.2f} ask=${ask:.2f} "
+                f"spread={spread_pct:.1%} "
+                f"(max={self.config.option_trailing_max_spread_pct:.1%})"
+            )
+
+        max_safe_stop = bid * (1.0 - self.config.option_trailing_stop_bid_buffer_pct)
+        if desired_stop > max_safe_stop + 1e-9:
+            return (
+                f"bid=${bid:.2f} does not support stop=${desired_stop:.2f} "
+                f"with {self.config.option_trailing_stop_bid_buffer_pct:.1%} buffer"
+            )
+        return None
+
     def _sync_option_trailing_stops(self, snapshot: BrokerSnapshot) -> None:
         """Create or atomically ratchet durable GTC single-leg option stops."""
         if self.option_trailing_store is None:
@@ -3552,14 +3614,54 @@ class TradingEngine:
             # Alpaca's replace endpoint keeps protection at the broker boundary:
             # a rejected replacement leaves the existing stop in place.
             if existing is not None:
+                existing_stop = float(existing.stop_price or desired_stop)
+                replacement_stop = max(desired_stop, existing_stop)
+                price_ratchet = desired_stop > existing_stop + 0.005
+                maintenance_replacement = (
+                    not existing_is_known_gtc or not existing_qty_matches
+                )
+                if price_ratchet:
+                    quote = self.broker.get_latest_option_quote(occ)
+                    quote_rejection = self._option_ratchet_quote_rejection(
+                        quote=quote,
+                        desired_stop=desired_stop,
+                    )
+                    if quote_rejection is not None:
+                        if maintenance_replacement:
+                            replacement_stop = existing_stop
+                            logger.info(
+                                f"[{owner}] {occ}: option stop price ratchet "
+                                f"deferred ({quote_rejection}); applying required "
+                                f"TIF/qty maintenance at existing ${existing_stop:.2f}"
+                            )
+                        else:
+                            self.option_trailing_store.upsert(
+                                position_uid=lifecycle_row.position_uid,
+                                occ_symbol=occ,
+                                strategy=owner,
+                                owner_key=owner_key,
+                                qty=qty,
+                                entry_premium=entry_premium,
+                                hwm_premium=hwm,
+                                trail_activation_pct=trail_activation_pct,
+                                trail_pct=trail_pct,
+                                current_stop_price=existing_stop,
+                                alpaca_stop_order_id=existing.order_id,
+                                stop_order_status=existing.status,
+                                last_observed_premium=current_premium,
+                            )
+                            logger.info(
+                                f"[{owner}] {occ}: option stop ratchet "
+                                f"${existing_stop:.2f} -> ${desired_stop:.2f} "
+                                f"deferred — {quote_rejection}; existing broker "
+                                "stop remains active"
+                            )
+                            continue
                 try:
                     new_order = self.broker.replace_option_stop(
                         order_id=existing.order_id,
                         qty=qty,
-                        stop_price=max(
-                            desired_stop,
-                            float(existing.stop_price or desired_stop),
-                        ),
+                        stop_price=replacement_stop,
                     )
                 except Exception as exc:
                     logger.error(

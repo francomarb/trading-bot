@@ -224,6 +224,16 @@ class ClosedOrderInfo:
     filled_at: datetime | None
 
 
+@dataclass(frozen=True)
+class OptionQuote:
+    """Latest two-sided option quote used to validate stop ratchets."""
+
+    symbol: str
+    bid_price: float
+    ask_price: float
+    timestamp: datetime
+
+
 # ── Broker ───────────────────────────────────────────────────────────────────
 
 
@@ -248,6 +258,7 @@ class AlpacaBroker:
         lifecycle_store: "PositionLifecycleStore | None" = None,
         lifecycle_orders_store: "PositionLifecycleOrdersStore | None" = None,
         entry_allowed: Callable[[], bool] | None = None,
+        option_data_client: object | None = None,
     ) -> None:
         self._api = client or TradingClient(
             api_key=ALPACA_API_KEY,
@@ -275,6 +286,7 @@ class AlpacaBroker:
         # populates the broker-assigned order_id on submit return.
         self._lifecycle_orders_store = lifecycle_orders_store
         self._entry_allowed = entry_allowed
+        self._option_data_api = option_data_client
         # Dry-run: log orders but never submit. Defaults to settings.DRY_RUN.
         self._dry_run: bool = dry_run if dry_run is not None else DRY_RUN
         # Async option fills reported by OptionsExecutionWorker threads.
@@ -817,6 +829,52 @@ class AlpacaBroker:
         """
         from data.fetcher import fetch_latest_quote_midpoint
         return fetch_latest_quote_midpoint(symbol)
+
+    def get_latest_option_quote(self, symbol: str) -> OptionQuote | None:
+        """Return Alpaca's latest two-sided quote for one OCC option symbol.
+
+        The official latest-option-quote endpoint is the execution-quality
+        source for stop ratchets. A missing, malformed, or one-sided quote is
+        returned as ``None`` so callers can retain the existing broker stop.
+        """
+        if not symbol:
+            return None
+        try:
+            if self._option_data_api is None:
+                from alpaca.data.historical.option import OptionHistoricalDataClient
+
+                self._option_data_api = OptionHistoricalDataClient(
+                    ALPACA_API_KEY,
+                    ALPACA_SECRET_KEY,
+                )
+                session = getattr(self._option_data_api, "_session", None)
+                if session is not None:
+                    _install_timeout(session)
+
+            from alpaca.data.requests import OptionLatestQuoteRequest
+
+            quotes = self._option_data_api.get_option_latest_quote(
+                OptionLatestQuoteRequest(symbol_or_symbols=symbol)
+            )
+            quote = quotes.get(symbol)
+            if quote is None:
+                return None
+            bid = float(getattr(quote, "bid_price", 0.0) or 0.0)
+            ask = float(getattr(quote, "ask_price", 0.0) or 0.0)
+            timestamp = getattr(quote, "timestamp", None)
+            if bid <= 0 or ask <= 0 or not isinstance(timestamp, datetime):
+                return None
+            if timestamp.tzinfo is None:
+                timestamp = timestamp.replace(tzinfo=timezone.utc)
+            return OptionQuote(
+                symbol=symbol,
+                bid_price=bid,
+                ask_price=ask,
+                timestamp=timestamp.astimezone(timezone.utc),
+            )
+        except Exception as exc:
+            logger.warning(f"{symbol}: latest option quote fetch failed: {exc}")
+            return None
 
     def get_account(self, *, session_start_equity: float | None = None) -> AccountState:
         """
