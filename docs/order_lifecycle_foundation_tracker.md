@@ -182,9 +182,9 @@ Implementation PR includes:
 The foundation PR must update (per discovery doc §12):
 
 - [x] `PLAN.md` — Live readiness gate row for slippage / operator controls; foundation PR merged (#60, #61); PR #58 closed and rebuilt as PR #62
-- [ ] `docs/operator_controls_proposal.md` §17 amended for write-side / read-side substrate split + per-order table substrate Phase C writes into
+- [x] `docs/operator_controls_proposal.md` §17 amended for write-side / read-side substrate split + per-order table substrate Phase C writes into (amended 2026-06-15; Phase C subsequently shipped via PR #66 on 2026-06-16)
 - [ ] `docs/slippage_unification_tracker.md` — Phase 2 scope references foundation-provided pre-fill provenance
-- [ ] PR #58 description — (already done — converted to draft with blocked/cherry-pickable list)
+- [x] PR #58 description — converted to draft with blocked/cherry-pickable list
 
 ---
 

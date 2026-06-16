@@ -1,6 +1,6 @@
 # Operator Controls & Unique Position Identity — v1 Proposal
 
-**Status:** Draft proposal for review  
+**Status:** Shipped — Phase A (PR #33 + #41), Phase B (PR #65), Phase C (PR #66, merged 2026-06-16). Doc retained as the design reference; §13 implementation sketch is historical. Operator controls is feature-complete for v1; remaining work is paper-bake evidence before live. The §17 amendment dissolved the original Phase A "deferred items" table in full.  
 **Author intent:** Written for Codex, Claude, Gemini, and the human operator to audit before implementation.  
 **Primary goal:** Give the operator safe, precise, auditable control over live bot risk without turning the bot into a manual trading terminal.
 

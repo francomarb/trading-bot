@@ -991,7 +991,7 @@ If during slippage Phase 1's Defect 2 fix we had paused and asked "should this f
 - **`execution_id`** (§6.5) — Alpaca's per-fill identifier on a stream `trade_update` event. A single order with N partial fills produces N distinct `execution_id`s. Foundation PR persists it as **optional audit-only metadata** on `trades` — no UNIQUE constraint, no consumer reads it. The fill-row dedup key is `order_id`, paired with cumulative `filled_qty` / VWAP UPSERT semantics (§6.5). REST recovery has no `execution_id` available and leaves it NULL. PR #59 review-4 rejected an earlier draft that would have made `trades` one row per execution gated by a UNIQUE on `execution_id`; that would have created a parallel execution ledger with breaking consumer impact.
 - **State-machine rank** (§6.3 / §6.4) — `pending=0`, `working=1`, `unknown=1`, `partially_filled=2`, `filled=3`, `canceled=3`, `rejected=3`. Used lexicographically with `filled_qty` to determine whether an incoming event strictly advances the per-order row.
 - **Side-signed sum** (§6.6) — the position-level `current_qty` rollup is `SUM(filled_qty * sign(side))`, not raw `SUM(filled_qty)`. Entries and exits net out correctly; a canceled-after-partial-fill row contributes its preserved `filled_qty` exactly once.
-- **Wired role vs. schema-only role** (§9.0) — the role column accepts six values. Foundation PR ships code paths for `entry_primary`, `protective_stop`, `replacement_stop`, `exit` (the four roles every current strategy uses). `entry_residual` waits for PR #58 rebuild; `partial_close` waits for Operator Controls Phase C. The position-level rollup is authoritative when every order on the position uses a wired role.
+- **Wired role vs. schema-only role** (§9.0) — the role column accepts six values. Foundation PR ships code paths for `entry_primary`, `protective_stop`, `replacement_stop`, `exit` (the four roles every current strategy uses). `partial_close` was wired by Operator Controls Phase C (PR #66, merged 2026-06-16). `entry_residual` remains schema-only pending PR #58 rebuild. The position-level rollup is authoritative when every order on the position uses a wired role.
 
 ---
 
@@ -1010,13 +1010,13 @@ The `role` column in `position_lifecycle_orders` is an open enum (§6.2). The fo
 | `replacement_stop` | ✅ Wired | Foundation PR. PR #47's GTC-promotion path ([broker.py:1289 region](../execution/broker.py:1289)) already replaces a DAY child with a GTC; foundation writes the replacement as a new per-order row with `replaces_order_id = previous_stop.order_id`. | Immediately on merge. |
 | `exit` | ✅ Wired | Foundation PR. Every `_log_close` / `_close_lifecycle_for_owner_key` path produces an `exit` per-order row. | Immediately on merge. |
 | `entry_residual` | 🟡 Schema-only | PR #58 rebuild. Enum value exists; no writer in foundation. | When PR #58 rebuild wires Donchian hybrid. Until then no current strategy needs this role. |
-| `partial_close` | 🟡 Schema-only | Operator Controls Phase C. Enum value exists; no writer in foundation. | When Phase C ships destructive operator commands. Until then no path creates partial closes. |
+| `partial_close` | ✅ Wired | Operator Controls Phase C (PR #66, merged 2026-06-16). `reduce-position` writes a `partial_close` per-order row tagged `origin_kind='operator'` + `operator_command_uid` via `broker.close_position(partial_qty=...)`. | Immediately on PR #66 merge. No bot-originated path creates partial closes; only the operator queue does. |
 
 **Consequence for live readiness — and what the rollup does NOT cover.** The four wired roles cover production strategies that operate at the **single-leg level**: SMA Crossover, RSI Reversion, Donchian Breakout (classic market entries), and single-leg SPY options. The position-level rollup is authoritative for every position those strategies open.
 
 **MLEG spreads (credit_spread strategy) remain on their existing path.** Spread entries and exits do not use any of the four wired roles. They continue to use `log_spread_fill` and the existing `trades` aggregation. The foundation PR adds no `position_lifecycle_orders` writes for spread legs, and the per-order rollup at §6.6 is **not authoritative for spread positions** — those positions remain visible through `log_spread_fill`'s rows on `trades` and through the spread-side ownership tracking in `engine.positions`. PR #59 review-4 (P2) correctly pushed back on a prior wording that implied spreads benefited from foundation wiring; they do not. Spread lifecycle wiring is the separate spread-lifecycle PR's responsibility ([3] in the recommended sequence).
 
-The two schema-only roles (`entry_residual`, `partial_close`) unlock without a schema change when their owning PRs (PR #58 rebuild and Operator Phase C respectively) land.
+`partial_close` was unlocked by Operator Controls Phase C (PR #66, merged 2026-06-16). `entry_residual` remains schema-only until PR #58 rebuild wires Donchian hybrid. Both unlock without a schema change.
 
 ### 9.1 Moved INTO this foundation (correctness prerequisites)
 
@@ -1044,8 +1044,8 @@ The two schema-only roles (`entry_residual`, `partial_close`) unlock without a s
 
 | Item | Where it lives |
 |---|---|
-| Operator Controls Phase B (soft controls, command heartbeat, command alerts, Telegram queue migration) | Operator Controls Phase B PR |
-| Operator Controls Phase C (destructive commands, symbol/owner-key locking, stop cancel/recreate, allocator + P&L reintegration, command execution recovery) | Operator Controls Phase C PR |
+| ~~Operator Controls Phase B~~ ✅ SHIPPED (PR #65) | ~~Operator Controls Phase B PR~~ |
+| ~~Operator Controls Phase C~~ ✅ SHIPPED (PR #66, merged 2026-06-16) | ~~Operator Controls Phase C PR~~ |
 | `Position.position_uid` engine-state integration, dashboard exposure, broad alert adoption | Separate consumer PRs per §17 |
 | Health monitor / sleeve allocator / PnL reporting / backtest reconciliation adoption of `position_uid` | Separate consumer PRs per §17 |
 | Slippage Phase 2 consumer migration (health, risk kill switch, calibration script, dashboard display + denominator fix, legacy dual-write removal) | Slippage Phase 2 PR |
