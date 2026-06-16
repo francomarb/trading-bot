@@ -3830,6 +3830,29 @@ class TradingEngine:
             )
             return None, None, None
 
+        # PR-66 review F3: v1 destructive controls are equity / single-
+        # leg-options only (matches the broker.close_position scope).
+        # An operator targeting a spread position_uid would otherwise
+        # close one OCC leg via close_position(symbol), breaking the
+        # spread atomicity. Spread destructive is a separate PR
+        # alongside the spread-lifecycle PR.
+        if lifecycle_row.position_type != "single_leg":
+            self.operator_command_store.mark_rejected(
+                command_uid=command.command_uid,
+                status="rejected_validation",
+                result={
+                    "note": (
+                        f"destructive controls v1 support single_leg "
+                        f"only; got position_type="
+                        f"{lifecycle_row.position_type!r}. Spread/MLEG "
+                        "destructive controls are deferred to the "
+                        "spread-lifecycle PR."
+                    ),
+                    "position_type": lifecycle_row.position_type,
+                },
+            )
+            return None, None, None
+
         # Terminal-state guard — proposal §9 / §14 invariants.
         if lifecycle_row.status in {
             "closed", "external_closed", "canceled", "error",
@@ -3971,28 +3994,95 @@ class TradingEngine:
                         "error": str(exc),
                     })
 
-            self.operator_command_store.mark_succeeded(
-                command_uid=command.command_uid,
-                result={
-                    "position_uid": lifecycle_row.position_uid,
-                    "owner_key": lifecycle_row.owner_key,
-                    "cancelled": cancelled,
-                    "errors": errors,
-                },
-            )
+            # PR-66 review F6: differentiate full-success from partial-
+            # or full-failure so the operator knows whether the stale
+            # orders are actually gone.
+            #   - all cancels broker_ok=True and no errors → succeeded
+            #   - any cancel returned False or raised, but at least one
+            #     succeeded → succeeded with degraded=True flag
+            #   - zero successful cancels (all failed/errored) → failed
+            successful_cancels = [c for c in cancelled if c["broker_ok"]]
+            broker_rejected_cancels = [c for c in cancelled if not c["broker_ok"]]
+            has_any_failure = bool(errors) or bool(broker_rejected_cancels)
+
+            if not non_terminal:
+                # No cancellable rows to begin with — that's a successful
+                # no-op (operator's expectation was already satisfied).
+                self.operator_command_store.mark_succeeded(
+                    command_uid=command.command_uid,
+                    result={
+                        "position_uid": lifecycle_row.position_uid,
+                        "owner_key": lifecycle_row.owner_key,
+                        "cancelled": [],
+                        "errors": [],
+                        "note": "no non-terminal sell-side orders found",
+                    },
+                )
+            elif not successful_cancels and has_any_failure:
+                # All requested cancels failed — operator's stop/exit
+                # is still live at the broker.
+                self.operator_command_store.mark_failed(
+                    command_uid=command.command_uid,
+                    result={
+                        "position_uid": lifecycle_row.position_uid,
+                        "owner_key": lifecycle_row.owner_key,
+                        "cancelled": cancelled,
+                        "errors": errors,
+                        "note": (
+                            "every requested cancel failed; stale orders "
+                            "remain live at the broker — investigate "
+                            "before retrying"
+                        ),
+                    },
+                )
+            elif has_any_failure:
+                # Partial failure — some cancels succeeded, others
+                # didn't. The operator needs to know which ones.
+                self.operator_command_store.mark_succeeded(
+                    command_uid=command.command_uid,
+                    result={
+                        "position_uid": lifecycle_row.position_uid,
+                        "owner_key": lifecycle_row.owner_key,
+                        "cancelled": cancelled,
+                        "errors": errors,
+                        "degraded": True,
+                        "note": (
+                            "some cancels succeeded, others failed or "
+                            "returned False from the broker; review the "
+                            "errors / broker_ok fields"
+                        ),
+                    },
+                )
+            else:
+                self.operator_command_store.mark_succeeded(
+                    command_uid=command.command_uid,
+                    result={
+                        "position_uid": lifecycle_row.position_uid,
+                        "owner_key": lifecycle_row.owner_key,
+                        "cancelled": cancelled,
+                        "errors": [],
+                    },
+                )
             try:
+                degraded_tag = ""
+                if has_any_failure and successful_cancels:
+                    degraded_tag = " DEGRADED"
+                elif has_any_failure:
+                    degraded_tag = " FAILED"
                 self.alerts.operator_action(
-                    f"operator cancel-position-orders: "
+                    f"operator cancel-position-orders{degraded_tag}: "
                     f"{lifecycle_row.symbol} "
                     f"({lifecycle_row.position_uid[:18]}…) "
-                    f"— {len(cancelled)} cancelled, {len(errors)} errors"
+                    f"— {len(successful_cancels)} cancelled, "
+                    f"{len(broker_rejected_cancels) + len(errors)} failed"
                 )
             except Exception as exc:
                 logger.warning(f"cancel-position-orders alert failed: {exc}")
             logger.warning(
                 f"cancel-position-orders by operator: "
-                f"{lifecycle_row.symbol} cancelled={len(cancelled)} "
-                f"errors={len(errors)} reason={command.reason!r}"
+                f"{lifecycle_row.symbol} ok={len(successful_cancels)} "
+                f"failed={len(broker_rejected_cancels) + len(errors)} "
+                f"reason={command.reason!r}"
             )
         except Exception as exc:
             self.operator_command_store.mark_failed(
@@ -4077,6 +4167,13 @@ class TradingEngine:
             try:
                 result = self.broker.close_position(
                     lifecycle_row.symbol,
+                    # PR-66 review F2: position_uid is required for the
+                    # broker's exit substrate write — without it,
+                    # _lifecycle_orders_record_exit no-ops and the
+                    # promised origin_kind='operator' /
+                    # operator_command_uid tagging never reaches the
+                    # per-order table.
+                    position_uid=lifecycle_row.position_uid,
                     operator_command_uid=command.command_uid,
                 )
             except Exception as exc:
@@ -4086,8 +4183,48 @@ class TradingEngine:
                 )
                 return
 
+            # PR-66 review F1: gate accounting on result.status.
+            # Mirror _close_single_leg_position — a REJECTED, TIMEOUT,
+            # UNKNOWN, or zero-fill result must NOT advance lifecycle
+            # state, must NOT call _record_realized_pnl, and must NOT
+            # mark the command succeeded. Otherwise a failed close at
+            # the broker would still locally close the lifecycle at
+            # $0.00 PnL and tell the operator "succeeded".
+            if result.status not in {OrderStatus.FILLED, OrderStatus.PARTIAL}:
+                self.operator_command_store.mark_failed(
+                    command_uid=command.command_uid,
+                    result={
+                        "position_uid": lifecycle_row.position_uid,
+                        "owner_key": lifecycle_row.owner_key,
+                        "broker_status": getattr(result.status, "value", str(result.status)),
+                        "broker_order_id": result.order_id,
+                        "raw_status": result.raw_status,
+                        "message": result.message,
+                        "note": (
+                            "broker close did not produce a fill; "
+                            "lifecycle and PnL accounting were NOT "
+                            "advanced. The operator may retry once the "
+                            "broker state stabilises."
+                        ),
+                    },
+                )
+                logger.error(
+                    f"close-position by operator: {lifecycle_row.symbol} "
+                    f"broker returned status={result.status} "
+                    f"(filled_qty={result.filled_qty}); "
+                    f"lifecycle and accounting NOT advanced"
+                )
+                return
+
             close_price = result.avg_fill_price or 0.0
-            close_qty = float(result.filled_qty or broker_pos.qty or 0.0)
+            close_qty = float(result.filled_qty or 0.0)
+            # PARTIAL on a full close: residual remains at the broker.
+            # Treat this as a REDUCE (is_full_close=False) so the
+            # lifecycle row's current_qty drops by the partial fill
+            # but does NOT transition to closed. The operator should
+            # re-issue close-position to finish the job, OR rely on
+            # the normal exit path on the next cycle.
+            is_full_close = result.status is OrderStatus.FILLED
 
             # Accounting reintegration (proposal §13 Phase C invariant):
             # operator-driven exits flow through the same accounting
@@ -4100,12 +4237,13 @@ class TradingEngine:
                 qty=close_qty,
                 multiplier=100 if _OCC_PAT.match(lifecycle_row.symbol) else 1,
                 external=False,
-                is_full_close=True,
+                is_full_close=is_full_close,
             )
 
             # Mark queue row succeeded. The lifecycle row's pending→closed
             # transition runs inside _record_realized_pnl via
-            # _close_lifecycle_for_owner_key; here we only audit.
+            # _close_lifecycle_for_owner_key (when is_full_close=True);
+            # on PARTIAL the row stays open at the residual qty.
             self.operator_command_store.mark_succeeded(
                 command_uid=command.command_uid,
                 result={
@@ -4114,13 +4252,16 @@ class TradingEngine:
                     "symbol": lifecycle_row.symbol,
                     "close_price": close_price,
                     "close_qty": close_qty,
+                    "is_full_close": is_full_close,
                     "broker_status": getattr(result.status, "value", str(result.status)),
                     "broker_order_id": result.order_id,
                 },
             )
             try:
                 self.alerts.operator_action(
-                    f"operator close-position: {lifecycle_row.symbol} "
+                    f"operator close-position "
+                    f"({'FULL' if is_full_close else 'PARTIAL'}): "
+                    f"{lifecycle_row.symbol} "
                     f"({lifecycle_row.position_uid[:18]}…) "
                     f"@ ${close_price:.2f} × {close_qty} "
                     f"— {command.reason}"
@@ -4128,9 +4269,10 @@ class TradingEngine:
             except Exception as exc:
                 logger.warning(f"close-position alert failed: {exc}")
             logger.warning(
-                f"close-position by operator: {lifecycle_row.symbol} "
-                f"close_qty={close_qty} close_price={close_price} "
-                f"reason={command.reason!r}"
+                f"close-position by operator "
+                f"({'FULL' if is_full_close else 'PARTIAL'}): "
+                f"{lifecycle_row.symbol} close_qty={close_qty} "
+                f"close_price={close_price} reason={command.reason!r}"
             )
         except Exception as exc:
             self.operator_command_store.mark_failed(
@@ -4262,6 +4404,8 @@ class TradingEngine:
             try:
                 result = self.broker.close_position(
                     lifecycle_row.symbol,
+                    # PR-66 review F2: same fix as close-position.
+                    position_uid=lifecycle_row.position_uid,
                     partial_qty=reduce_qty,
                     operator_command_uid=command.command_uid,
                 )
@@ -4272,8 +4416,49 @@ class TradingEngine:
                 )
                 return
 
+            # PR-66 review F1: same status gate as close-position.
+            # A REJECTED/TIMEOUT/UNKNOWN/zero-fill reduce must NOT
+            # advance lifecycle current_qty or PnL — otherwise the
+            # row would silently report a phantom reduction.
+            if result.status not in {OrderStatus.FILLED, OrderStatus.PARTIAL}:
+                self.operator_command_store.mark_failed(
+                    command_uid=command.command_uid,
+                    result={
+                        "position_uid": lifecycle_row.position_uid,
+                        "symbol": lifecycle_row.symbol,
+                        "broker_status": getattr(result.status, "value", str(result.status)),
+                        "broker_order_id": result.order_id,
+                        "raw_status": result.raw_status,
+                        "message": result.message,
+                        "note": (
+                            "broker reduce did not produce a fill; "
+                            "lifecycle and PnL accounting were NOT "
+                            "advanced."
+                        ),
+                    },
+                )
+                logger.error(
+                    f"reduce-position by operator: {lifecycle_row.symbol} "
+                    f"broker returned status={result.status} "
+                    f"(filled_qty={result.filled_qty}); "
+                    f"lifecycle and accounting NOT advanced"
+                )
+                return
+
             close_price = result.avg_fill_price or 0.0
-            filled_qty = float(result.filled_qty or reduce_qty)
+            filled_qty = float(result.filled_qty or 0.0)
+            if filled_qty <= 0:
+                # Defensive: status is FILLED/PARTIAL but filled_qty is
+                # zero — shouldn't happen but if it does, do not write
+                # phantom accounting.
+                self.operator_command_store.mark_failed(
+                    command_uid=command.command_uid,
+                    result={
+                        "note": "result.filled_qty<=0 despite FILLED/PARTIAL status",
+                        "broker_status": getattr(result.status, "value", str(result.status)),
+                    },
+                )
+                return
 
             # PnL + lifecycle current_qty drop. is_full_close=False so
             # _record_realized_pnl calls _reduce_lifecycle_for_owner_key
@@ -4288,6 +4473,19 @@ class TradingEngine:
                 is_full_close=False,
             )
 
+            # PR-66 review F5: cancel-sibling-first inside
+            # broker.close_position cleared any protective stop along
+            # with the reduce. Mark the row 'succeeded' but flag the
+            # `protection_status` so the operator knows the residual is
+            # temporarily unprotected until the next cycle's
+            # `_repair_missing_protective_stops` runs. Per-cycle repair
+            # is bounded by ENGINE_CYCLE_INTERVAL_SECONDS (default 300s);
+            # for shorter exposure the operator can fire a fresh halt or
+            # full close. Recreating the stop inline here would require
+            # waiting on the partial fill confirmation, looking up the
+            # strategy's risk parameters, and ordering it sequentially —
+            # significant extra complexity for v1. v1 contract: report
+            # the degraded state, let cycle repair handle it.
             self.operator_command_store.mark_succeeded(
                 command_uid=command.command_uid,
                 result={
@@ -4298,7 +4496,16 @@ class TradingEngine:
                     "filled_qty": filled_qty,
                     "close_price": close_price,
                     "residual_qty": max(0.0, current_qty - filled_qty),
+                    "broker_status": getattr(result.status, "value", str(result.status)),
                     "broker_order_id": result.order_id,
+                    "degraded": True,
+                    "protection_status": "pending_repair_cycle",
+                    "protection_note": (
+                        "broker.close_position cancelled the protective "
+                        "stop before the reduce; residual is unprotected "
+                        "until the engine's per-cycle stop repair pass "
+                        "restores it"
+                    ),
                 },
             )
             try:
@@ -4307,13 +4514,15 @@ class TradingEngine:
                     f"({lifecycle_row.position_uid[:18]}…) "
                     f"−{filled_qty} @ ${close_price:.2f} "
                     f"({pct:.0f}% of {current_qty}) "
-                    f"— {command.reason}"
+                    f"— DEGRADED: residual unprotected until next "
+                    f"cycle's stop repair — {command.reason}"
                 )
             except Exception as exc:
                 logger.warning(f"reduce-position alert failed: {exc}")
             logger.warning(
                 f"reduce-position by operator: {lifecycle_row.symbol} "
                 f"reduced={filled_qty}/{current_qty} (pct={pct}) "
+                f"DEGRADED protection until repair-cycle "
                 f"reason={command.reason!r}"
             )
         except Exception as exc:
@@ -6704,30 +6913,89 @@ class TradingEngine:
             logger.info(f"{symbol}: close requested but a close order is already pending — skipping")
             return False
 
-        # P-6: thread position_uid for the exit substrate row.
-        _exit_uid: str | None = None
-        if self.lifecycle_store is not None:
-            try:
-                _row = self.lifecycle_store.get_open_for_owner_key(
-                    owner_key_for(position.symbol),
-                )
-                if _row is not None:
-                    _exit_uid = _row.position_uid
-            except Exception as exc:
-                logger.debug(
-                    f"{symbol}: exit position_uid lookup raised "
-                    f"{type(exc).__name__}: {exc} — proceeding"
-                )
-        try:
-            result = self.broker.close_position(
-                position.symbol, position_uid=_exit_uid,
+        # PR-66 review F4: honor the Phase C symbol lock so a strategy
+        # exit cannot race an operator close-position / reduce-position
+        # on the same owner_key. The heartbeat thread (which runs the
+        # operator handlers) is concurrent with the cycle thread (which
+        # runs strategy exits); without the lock both could submit
+        # SELL orders to Alpaca for the same shares and the second
+        # would oversell. Acquire under kind='strategy_exit'; if the
+        # operator already holds the lock, skip this strategy exit —
+        # the operator command is in flight and will close the
+        # position itself. The next cycle's signal will fire again if
+        # the operator command was a partial reduce, or it'll see the
+        # position gone if the operator command was a full close.
+        owner_key_str = owner_key_for(position.symbol)
+        lock_holder = None
+        registry = getattr(self, "symbol_locks", None)
+        if registry is not None:
+            lock_holder = registry.acquire(
+                owner_key=owner_key_str,
+                kind="strategy_exit",
+                identifier=strategy.name,
             )
-        except Exception as e:
-            logger.error(f"{symbol}: close_position failed: {e}")
-            self.risk.record_broker_error()
-            self.alerts.broker_error(f"{symbol} close_position: {e}")
-            return False
+            if lock_holder is None:
+                existing = registry.is_locked(owner_key_str)
+                logger.warning(
+                    f"{symbol}: strategy exit deferred — owner_key locked "
+                    f"by {existing!s}; operator command in flight will "
+                    "handle the close"
+                )
+                return False
 
+        try:
+            # P-6: thread position_uid for the exit substrate row.
+            _exit_uid: str | None = None
+            if self.lifecycle_store is not None:
+                try:
+                    _row = self.lifecycle_store.get_open_for_owner_key(
+                        owner_key_str,
+                    )
+                    if _row is not None:
+                        _exit_uid = _row.position_uid
+                except Exception as exc:
+                    logger.debug(
+                        f"{symbol}: exit position_uid lookup raised "
+                        f"{type(exc).__name__}: {exc} — proceeding"
+                    )
+            try:
+                result = self.broker.close_position(
+                    position.symbol, position_uid=_exit_uid,
+                )
+            except Exception as e:
+                logger.error(f"{symbol}: close_position failed: {e}")
+                self.risk.record_broker_error()
+                self.alerts.broker_error(f"{symbol} close_position: {e}")
+                return False
+
+            return self._finish_close_single_leg(
+                symbol=symbol,
+                strategy=strategy,
+                position=position,
+                latest_close=latest_close,
+                alert_reason=alert_reason,
+                result=result,
+            )
+        finally:
+            if lock_holder is not None and registry is not None:
+                registry.release(owner_key=owner_key_str, holder=lock_holder)
+
+    def _finish_close_single_leg(
+        self,
+        *,
+        symbol: str,
+        strategy: BaseStrategy,
+        position,
+        latest_close: float,
+        alert_reason: str,
+        result,
+    ) -> bool:
+        """Post-broker-call bookkeeping for `_close_single_leg_position`.
+
+        Extracted (PR-66 review F4 fix) so the symbol-lock acquire/release
+        can wrap the broker submit in a clean try/finally without nesting
+        the entire 80-line accounting body inside the try.
+        """
         if not _OCC_PAT.match(position.symbol):
             # Close path is a SELL for long equity positions — side
             # matters for the kill switch's signed slippage so adverse

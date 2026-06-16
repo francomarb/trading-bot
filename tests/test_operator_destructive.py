@@ -418,6 +418,11 @@ class TestCancelPositionOrders:
         assert any(c["order_id"] == "alpaca-stop" for c in row.result["cancelled"])
 
     def test_handles_null_order_id_gracefully(self, tmp_path):
+        """A row with order_id=NULL counts as an error (we can't issue
+        a broker cancel without an id). Per F6 semantics: when every
+        cancellable row results in error and zero broker cancels
+        succeed, the command is FAILED — the operator must know the
+        stale orders are still live."""
         engine, queue = _build_engine(tmp_path)
         pos_uid = _seed_open_lifecycle(engine)
         # Row with order_id=NULL — the foundation's NULL-order_id
@@ -439,11 +444,291 @@ class TestCancelPositionOrders:
         engine._process_operator_commands()
 
         row = queue.get_by_command_uid(uid)
-        assert row.status == "succeeded"
+        # F6 contract: zero successful cancels + at least one error
+        # → command is FAILED, not succeeded. The substrate row is
+        # still live at the broker side; the operator must investigate.
+        assert row.status == "failed"
         assert any(
             "order_id not yet attached" in e.get("error", "")
             for e in row.result["errors"]
         )
+        engine.broker.cancel_order.assert_not_called()
+
+
+class TestReviewFindings:
+    """Round-2 review fixes — F1 (status gate), F2 (position_uid
+    threading), F3 (spread rejection), F5 (protection degraded), F6
+    (cancel failure semantics)."""
+
+    # ── F1: handler must NOT book accounting on non-fill results ──
+
+    def test_close_rejected_does_not_record_pnl_or_close_lifecycle(
+        self, tmp_path,
+    ):
+        engine, queue = _build_engine(tmp_path, broker_qty=10.0)
+        pos_uid = _seed_open_lifecycle(engine)
+        engine.broker.close_position.return_value = OrderResult(
+            status=OrderStatus.REJECTED,
+            order_id=None,
+            symbol="AAPL",
+            requested_qty=10.0, filled_qty=0.0, avg_fill_price=None,
+            raw_status="rejected", message="broker rejected",
+        )
+        recorded = []
+        engine._record_realized_pnl = lambda **kw: recorded.append(kw)
+
+        uid = new_command_uid()
+        queue.insert(
+            command_uid=uid, action="close-position", reason="t",
+            target_position_uid=pos_uid,
+        )
+        engine._process_operator_commands()
+
+        # Command marked FAILED, not succeeded.
+        row = queue.get_by_command_uid(uid)
+        assert row.status == "failed"
+        assert "did not produce a fill" in (row.result.get("note") or "")
+        # NO accounting writes.
+        assert recorded == []
+
+    def test_close_partial_result_treated_as_reduce(self, tmp_path):
+        """PARTIAL on a full-close request leaves the residual at the
+        broker — handler must call _record_realized_pnl with
+        is_full_close=False so the lifecycle stays open at the
+        residual qty, not marked closed."""
+        engine, queue = _build_engine(tmp_path, broker_qty=10.0)
+        pos_uid = _seed_open_lifecycle(engine)
+        engine.broker.close_position.return_value = OrderResult(
+            status=OrderStatus.PARTIAL,
+            order_id="alpaca-1",
+            symbol="AAPL",
+            requested_qty=10.0, filled_qty=4.0, avg_fill_price=108.0,
+            raw_status="partially_filled",
+        )
+        recorded = []
+        engine._record_realized_pnl = lambda **kw: recorded.append(kw)
+
+        uid = new_command_uid()
+        queue.insert(
+            command_uid=uid, action="close-position", reason="t",
+            target_position_uid=pos_uid,
+        )
+        engine._process_operator_commands()
+
+        row = queue.get_by_command_uid(uid)
+        assert row.status == "succeeded"
+        assert row.result["is_full_close"] is False
+        # _record_realized_pnl invoked with the PARTIAL qty AND
+        # is_full_close=False so the lifecycle stays open.
+        assert len(recorded) == 1
+        assert recorded[0]["is_full_close"] is False
+        assert recorded[0]["qty"] == 4.0
+
+    def test_reduce_rejected_does_not_record_pnl(self, tmp_path):
+        engine, queue = _build_engine(tmp_path, broker_qty=10.0)
+        pos_uid = _seed_open_lifecycle(engine)
+        engine.broker.close_position.return_value = OrderResult(
+            status=OrderStatus.REJECTED,
+            order_id=None, symbol="AAPL",
+            requested_qty=3.0, filled_qty=0.0, avg_fill_price=None,
+            raw_status="rejected",
+        )
+        recorded = []
+        engine._record_realized_pnl = lambda **kw: recorded.append(kw)
+
+        uid = new_command_uid()
+        queue.insert(
+            command_uid=uid, action="reduce-position", reason="t",
+            target_position_uid=pos_uid, params={"pct": 30},
+        )
+        engine._process_operator_commands()
+
+        row = queue.get_by_command_uid(uid)
+        assert row.status == "failed"
+        assert recorded == []
+
+    # ── F2: position_uid must be threaded to broker ──
+
+    def test_close_passes_position_uid_to_broker(self, tmp_path):
+        engine, queue = _build_engine(tmp_path, broker_qty=10.0)
+        pos_uid = _seed_open_lifecycle(engine)
+        engine.broker.close_position.return_value = OrderResult(
+            status=OrderStatus.FILLED, order_id="a",
+            symbol="AAPL", requested_qty=10.0, filled_qty=10.0,
+            avg_fill_price=110.0, raw_status="filled",
+        )
+        uid = new_command_uid()
+        queue.insert(
+            command_uid=uid, action="close-position", reason="t",
+            target_position_uid=pos_uid,
+        )
+        engine._process_operator_commands()
+
+        kwargs = engine.broker.close_position.call_args.kwargs
+        assert kwargs.get("position_uid") == pos_uid, (
+            "position_uid must be threaded so the broker's exit "
+            "substrate row gets origin_kind='operator' tagging"
+        )
+        assert kwargs.get("operator_command_uid") == uid
+
+    def test_reduce_passes_position_uid_to_broker(self, tmp_path):
+        engine, queue = _build_engine(tmp_path, broker_qty=10.0)
+        pos_uid = _seed_open_lifecycle(engine)
+        engine.broker.close_position.return_value = OrderResult(
+            status=OrderStatus.FILLED, order_id="a",
+            symbol="AAPL", requested_qty=3.0, filled_qty=3.0,
+            avg_fill_price=108.0, raw_status="filled",
+        )
+        uid = new_command_uid()
+        queue.insert(
+            command_uid=uid, action="reduce-position", reason="t",
+            target_position_uid=pos_uid, params={"pct": 30},
+        )
+        engine._process_operator_commands()
+
+        kwargs = engine.broker.close_position.call_args.kwargs
+        assert kwargs.get("position_uid") == pos_uid
+        assert kwargs.get("operator_command_uid") == uid
+        assert kwargs.get("partial_qty") == 3
+
+    # ── F3: spread rejection ──
+
+    def test_destructive_setup_rejects_spread_lifecycles(self, tmp_path):
+        engine, queue = _build_engine(tmp_path)
+        # Seed a spread lifecycle.
+        spread_uid = new_position_uid()
+        engine.lifecycle_store.create_pending(
+            position_uid=spread_uid,
+            symbol="QQQ260710P00713000",
+            owner_key="QQQ-spread-uuid",
+            strategy="credit_spread",
+            position_type="spread",
+            entry_qty=1.0,
+        )
+        engine.lifecycle_store.mark_open(
+            position_uid=spread_uid,
+            avg_entry_price=2.50, current_qty=1.0,
+        )
+
+        uid = new_command_uid()
+        queue.insert(
+            command_uid=uid, action="close-position", reason="t",
+            target_position_uid=spread_uid,
+        )
+        engine._process_operator_commands()
+
+        row = queue.get_by_command_uid(uid)
+        assert row.status == "rejected_validation"
+        assert "single_leg only" in (row.result.get("note") or "")
+        engine.broker.close_position.assert_not_called()
+
+    # ── F5: reduce-position protection_status flag ──
+
+    def test_reduce_succeeded_carries_degraded_protection_flag(self, tmp_path):
+        engine, queue = _build_engine(tmp_path, broker_qty=10.0)
+        pos_uid = _seed_open_lifecycle(engine)
+        engine.broker.close_position.return_value = OrderResult(
+            status=OrderStatus.FILLED, order_id="a",
+            symbol="AAPL", requested_qty=3.0, filled_qty=3.0,
+            avg_fill_price=108.0, raw_status="filled",
+        )
+
+        uid = new_command_uid()
+        queue.insert(
+            command_uid=uid, action="reduce-position", reason="t",
+            target_position_uid=pos_uid, params={"pct": 30},
+        )
+        engine._process_operator_commands()
+
+        row = queue.get_by_command_uid(uid)
+        assert row.status == "succeeded"
+        # Reviewer F5: succeeded result MUST carry the degraded flag
+        # so the operator knows the residual is temporarily unprotected.
+        assert row.result.get("degraded") is True
+        assert row.result.get("protection_status") == "pending_repair_cycle"
+        assert "unprotected" in (row.result.get("protection_note") or "")
+
+    # ── F6: cancel-position-orders failure semantics ──
+
+    def test_cancel_all_broker_false_marks_failed(self, tmp_path):
+        engine, queue = _build_engine(tmp_path)
+        pos_uid = _seed_open_lifecycle(engine)
+        # Seed a stop row.
+        engine.lifecycle_orders_store.insert_pending(
+            position_uid=pos_uid, role="protective_stop",
+            client_order_id="cli-stop",
+            order_type="stop", order_class="simple",
+            time_in_force="gtc", side="sell", intended_qty=10.0,
+            intended_stop_price=90.0,
+        )
+        engine.lifecycle_orders_store.attach_broker_order_id(
+            client_order_id="cli-stop", order_id="alpaca-stop",
+        )
+
+        # Broker reports failure.
+        engine.broker.cancel_order.return_value = False
+
+        uid = new_command_uid()
+        queue.insert(
+            command_uid=uid, action="cancel-position-orders", reason="t",
+            target_position_uid=pos_uid,
+        )
+        engine._process_operator_commands()
+
+        row = queue.get_by_command_uid(uid)
+        assert row.status == "failed", (
+            "When every requested cancel returns False, the command "
+            "must mark FAILED — the stop is still live at the broker."
+        )
+
+    def test_cancel_partial_failure_marks_succeeded_degraded(self, tmp_path):
+        engine, queue = _build_engine(tmp_path)
+        pos_uid = _seed_open_lifecycle(engine)
+        # Two stops; broker cancels one and fails the other.
+        for i, oid in enumerate(("alpaca-stop1", "alpaca-stop2")):
+            engine.lifecycle_orders_store.insert_pending(
+                position_uid=pos_uid, role="protective_stop",
+                client_order_id=f"cli-{i}",
+                order_type="stop", order_class="simple",
+                time_in_force="gtc", side="sell", intended_qty=10.0,
+                intended_stop_price=90.0,
+            )
+            engine.lifecycle_orders_store.attach_broker_order_id(
+                client_order_id=f"cli-{i}", order_id=oid,
+            )
+
+        results = iter([True, False])
+        engine.broker.cancel_order.side_effect = lambda *a, **kw: next(results)
+
+        uid = new_command_uid()
+        queue.insert(
+            command_uid=uid, action="cancel-position-orders", reason="t",
+            target_position_uid=pos_uid,
+        )
+        engine._process_operator_commands()
+
+        row = queue.get_by_command_uid(uid)
+        assert row.status == "succeeded"
+        assert row.result.get("degraded") is True
+
+    def test_cancel_no_orders_to_cancel_is_clean_success(self, tmp_path):
+        """No non-terminal sell-side rows → command succeeded without
+        the degraded flag (operator's expectation already satisfied)."""
+        engine, queue = _build_engine(tmp_path)
+        pos_uid = _seed_open_lifecycle(engine)
+        # No substrate rows seeded — clean lifecycle.
+
+        uid = new_command_uid()
+        queue.insert(
+            command_uid=uid, action="cancel-position-orders", reason="t",
+            target_position_uid=pos_uid,
+        )
+        engine._process_operator_commands()
+
+        row = queue.get_by_command_uid(uid)
+        assert row.status == "succeeded"
+        assert row.result.get("degraded") is not True
+        assert row.result.get("cancelled") == []
         engine.broker.cancel_order.assert_not_called()
 
 
