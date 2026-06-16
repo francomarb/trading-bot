@@ -648,6 +648,93 @@ class TestReviewFindings:
         assert row.result.get("protection_status") == "pending_repair_cycle"
         assert "unprotected" in (row.result.get("protection_note") or "")
 
+    # ── P2#1: close-position PARTIAL carries same degraded flag ──
+
+    def test_close_partial_carries_degraded_protection_flag(self, tmp_path):
+        """A PARTIAL close-position fill leaves residual at the broker
+        with the protective stop cancelled — mirror the reduce-position
+        contract and report `degraded=True` with `protection_status`
+        so the operator sees the gap immediately."""
+        engine, queue = _build_engine(tmp_path, broker_qty=10.0)
+        pos_uid = _seed_open_lifecycle(engine)
+        engine.broker.close_position.return_value = OrderResult(
+            status=OrderStatus.PARTIAL,
+            order_id="alpaca-1",
+            symbol="AAPL",
+            requested_qty=10.0, filled_qty=4.0, avg_fill_price=108.0,
+            raw_status="partially_filled",
+        )
+        engine._record_realized_pnl = lambda **kw: None
+
+        uid = new_command_uid()
+        queue.insert(
+            command_uid=uid, action="close-position", reason="t",
+            target_position_uid=pos_uid,
+        )
+        engine._process_operator_commands()
+
+        row = queue.get_by_command_uid(uid)
+        assert row.status == "succeeded"
+        assert row.result["is_full_close"] is False
+        assert row.result.get("degraded") is True
+        assert row.result.get("protection_status") == "pending_repair_cycle"
+        assert "unprotected" in (row.result.get("protection_note") or "")
+
+    def test_close_full_does_not_carry_degraded_flag(self, tmp_path):
+        """A clean FULL close has no residual and no protection gap —
+        the degraded flag must NOT be set, otherwise the operator
+        would see false alarms on every full close."""
+        engine, queue = _build_engine(tmp_path, broker_qty=10.0)
+        pos_uid = _seed_open_lifecycle(engine)
+        engine.broker.close_position.return_value = OrderResult(
+            status=OrderStatus.FILLED, order_id="a",
+            symbol="AAPL", requested_qty=10.0, filled_qty=10.0,
+            avg_fill_price=110.0, raw_status="filled",
+        )
+        engine._record_realized_pnl = lambda **kw: None
+
+        uid = new_command_uid()
+        queue.insert(
+            command_uid=uid, action="close-position", reason="t",
+            target_position_uid=pos_uid,
+        )
+        engine._process_operator_commands()
+
+        row = queue.get_by_command_uid(uid)
+        assert row.status == "succeeded"
+        assert row.result["is_full_close"] is True
+        assert "degraded" not in row.result
+        assert "protection_status" not in row.result
+
+    # ── N: close-position zero-fill defensive guard ──
+
+    def test_close_filled_with_zero_qty_does_not_record_pnl(self, tmp_path):
+        """A FILLED/PARTIAL status with filled_qty==0 is near-impossible
+        at the broker, but the handler must NOT call
+        _record_realized_pnl with qty=0 — that would log a phantom
+        zero-PnL close. Mirror the reduce-position defensive guard."""
+        engine, queue = _build_engine(tmp_path, broker_qty=10.0)
+        pos_uid = _seed_open_lifecycle(engine)
+        engine.broker.close_position.return_value = OrderResult(
+            status=OrderStatus.FILLED, order_id="a",
+            symbol="AAPL", requested_qty=10.0, filled_qty=0.0,
+            avg_fill_price=110.0, raw_status="filled",
+        )
+        recorded = []
+        engine._record_realized_pnl = lambda **kw: recorded.append(kw)
+
+        uid = new_command_uid()
+        queue.insert(
+            command_uid=uid, action="close-position", reason="t",
+            target_position_uid=pos_uid,
+        )
+        engine._process_operator_commands()
+
+        row = queue.get_by_command_uid(uid)
+        assert row.status == "failed"
+        assert "filled_qty<=0" in (row.result.get("note") or "")
+        assert recorded == []
+
     # ── F6: cancel-position-orders failure semantics ──
 
     def test_cancel_all_broker_false_marks_failed(self, tmp_path):

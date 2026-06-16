@@ -4218,6 +4218,29 @@ class TradingEngine:
 
             close_price = result.avg_fill_price or 0.0
             close_qty = float(result.filled_qty or 0.0)
+            # PR-66 review N: same defensive zero-fill guard as
+            # reduce-position. A FILLED / PARTIAL status with zero
+            # filled_qty is near-impossible at the broker, but if it
+            # somehow surfaces here we must NOT advance accounting —
+            # _record_realized_pnl with qty=0 would log a phantom
+            # zero-PnL close.
+            if close_qty <= 0:
+                self.operator_command_store.mark_failed(
+                    command_uid=command.command_uid,
+                    result={
+                        "position_uid": lifecycle_row.position_uid,
+                        "symbol": lifecycle_row.symbol,
+                        "note": "result.filled_qty<=0 despite FILLED/PARTIAL status",
+                        "broker_status": getattr(result.status, "value", str(result.status)),
+                        "broker_order_id": result.order_id,
+                    },
+                )
+                logger.error(
+                    f"close-position by operator: {lifecycle_row.symbol} "
+                    f"status={result.status} but filled_qty<=0; "
+                    f"lifecycle and accounting NOT advanced"
+                )
+                return
             # PARTIAL on a full close: residual remains at the broker.
             # Treat this as a REDUCE (is_full_close=False) so the
             # lifecycle row's current_qty drops by the partial fill
@@ -4240,39 +4263,70 @@ class TradingEngine:
                 is_full_close=is_full_close,
             )
 
+            # PR-66 review P2#1: a PARTIAL close-position fill leaves
+            # residual at the broker with the same protection gap as a
+            # reduce-position partial — broker.close_position cancelled
+            # the sibling protective stop before submitting, so the
+            # residual sits unprotected until the next cycle's
+            # _repair_missing_protective_stops pass. Mirror the
+            # reduce-position contract: report 'degraded' +
+            # protection_status so the operator sees the gap
+            # immediately. A clean FULL close has no residual, so no
+            # degraded flag.
+            result_payload = {
+                "position_uid": lifecycle_row.position_uid,
+                "owner_key": lifecycle_row.owner_key,
+                "symbol": lifecycle_row.symbol,
+                "close_price": close_price,
+                "close_qty": close_qty,
+                "is_full_close": is_full_close,
+                "broker_status": getattr(result.status, "value", str(result.status)),
+                "broker_order_id": result.order_id,
+            }
+            if not is_full_close:
+                result_payload["degraded"] = True
+                result_payload["protection_status"] = "pending_repair_cycle"
+                result_payload["protection_note"] = (
+                    "broker.close_position cancelled the protective "
+                    "stop before the partial close; residual is "
+                    "unprotected until the engine's per-cycle stop "
+                    "repair pass restores it, OR until the operator "
+                    "re-issues close-position to finish the job"
+                )
             # Mark queue row succeeded. The lifecycle row's pending→closed
             # transition runs inside _record_realized_pnl via
             # _close_lifecycle_for_owner_key (when is_full_close=True);
             # on PARTIAL the row stays open at the residual qty.
             self.operator_command_store.mark_succeeded(
                 command_uid=command.command_uid,
-                result={
-                    "position_uid": lifecycle_row.position_uid,
-                    "owner_key": lifecycle_row.owner_key,
-                    "symbol": lifecycle_row.symbol,
-                    "close_price": close_price,
-                    "close_qty": close_qty,
-                    "is_full_close": is_full_close,
-                    "broker_status": getattr(result.status, "value", str(result.status)),
-                    "broker_order_id": result.order_id,
-                },
+                result=result_payload,
             )
             try:
+                degraded_tag = (
+                    "" if is_full_close
+                    else " — DEGRADED: residual unprotected until "
+                         "next cycle's stop repair"
+                )
                 self.alerts.operator_action(
                     f"operator close-position "
                     f"({'FULL' if is_full_close else 'PARTIAL'}): "
                     f"{lifecycle_row.symbol} "
                     f"({lifecycle_row.position_uid[:18]}…) "
-                    f"@ ${close_price:.2f} × {close_qty} "
-                    f"— {command.reason}"
+                    f"@ ${close_price:.2f} × {close_qty}"
+                    f"{degraded_tag} — {command.reason}"
                 )
             except Exception as exc:
                 logger.warning(f"close-position alert failed: {exc}")
+            degraded_log = (
+                "" if is_full_close
+                else " DEGRADED protection until repair-cycle"
+            )
             logger.warning(
                 f"close-position by operator "
                 f"({'FULL' if is_full_close else 'PARTIAL'}): "
                 f"{lifecycle_row.symbol} close_qty={close_qty} "
-                f"close_price={close_price} reason={command.reason!r}"
+                f"close_price={close_price}{degraded_log} "
+                f"reason={command.reason!r}"
             )
         except Exception as exc:
             self.operator_command_store.mark_failed(
