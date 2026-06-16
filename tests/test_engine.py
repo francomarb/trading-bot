@@ -576,6 +576,52 @@ class TestProcessSymbol:
         broker.close_position.assert_called_once_with("AAPL", position_uid=None)
         broker.place_order.assert_not_called()
 
+    # ── Phase C PR-66 review F4: strategy exits must honor the
+    #    symbol-lock so a cycle-thread strategy exit cannot race a
+    #    heartbeat-thread operator close on the same owner_key. ──
+
+    def test_strategy_exit_acquires_and_releases_symbol_lock(
+        self, engine_factory,
+    ):
+        engine, broker = engine_factory(exits=[False] * 59 + [True])
+        positions = {"AAPL": Position("AAPL", 10, 100.0, 1010.0)}
+        snap = _snapshot(positions=positions)
+        engine._session_start_equity = snap.account.equity
+
+        self._process(engine, "AAPL", snap)
+
+        broker.close_position.assert_called_once_with(
+            "AAPL", position_uid=None,
+        )
+        # Lock released after the close path completes.
+        assert engine.symbol_locks.is_locked("AAPL") is None
+
+    def test_strategy_exit_skipped_when_owner_key_locked_by_operator(
+        self, engine_factory,
+    ):
+        """If the operator already holds the symbol lock (close-position
+        / reduce-position in flight), the strategy exit must skip and
+        let the operator command finish. Otherwise both threads can
+        SELL the same shares and oversell."""
+        engine, broker = engine_factory(exits=[False] * 59 + [True])
+        positions = {"AAPL": Position("AAPL", 10, 100.0, 1010.0)}
+        snap = _snapshot(positions=positions)
+        engine._session_start_equity = snap.account.equity
+
+        # Pre-acquire the lock as if an operator command is mid-flight.
+        engine.symbol_locks.acquire(
+            owner_key="AAPL", kind="operator_command", identifier="cmd_xyz",
+        )
+
+        self._process(engine, "AAPL", snap)
+
+        # Strategy exit must NOT have submitted a SELL.
+        broker.close_position.assert_not_called()
+        # And the operator's lock is still held.
+        h = engine.symbol_locks.is_locked("AAPL")
+        assert h is not None
+        assert h.kind == "operator_command"
+
     def test_pause_strategy_is_scoped_to_one_strategy(self, engine_factory):
         """pause-strategy <name> blocks new entries for that strategy
         only. Other strategies in the same process should be

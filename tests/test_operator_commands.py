@@ -123,7 +123,9 @@ class TestInsert:
         with pytest.raises(ValueError, match="action must be one of"):
             store.insert(
                 command_uid=new_command_uid(),
-                action="reduce-position",  # Phase C only
+                # Use a deliberately-fake action so this test stays
+                # accurate across Phase A/B/C extensions of the enum.
+                action="not-a-real-action",
                 reason="test",
             )
 
@@ -334,12 +336,9 @@ class TestReads:
 
 
 class TestStatusEnum:
-    def test_valid_actions_covers_phase_a_and_b(self):
+    def test_valid_actions_covers_all_shipped_phases(self):
         """Phase A: halt / resume-after-halt. Phase B: 4 soft pauses.
-        Destructive Phase C actions stay out of the enum until they
-        ship — `claim_next_pending` only returns rows whose action
-        is in VALID_ACTIONS, so an early-write of a Phase C action
-        would still get rejected at insert time."""
+        Phase C: 3 destructive position controls."""
         assert VALID_ACTIONS == {
             "halt",
             "resume-after-halt",
@@ -347,6 +346,9 @@ class TestStatusEnum:
             "resume-entries",
             "pause-strategy",
             "resume-strategy",
+            "close-position",
+            "reduce-position",
+            "cancel-position-orders",
         }
 
     def test_valid_statuses_documented(self):

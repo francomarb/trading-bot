@@ -742,9 +742,16 @@ The per-order `position_lifecycle_orders` table (foundation §6.2) is the durabl
 For **Operator Controls Phase C** this means:
 
 - **Destructive commands** (`reduce-position` / `close-position` / `cancel-position-orders`) write rows into `position_lifecycle_orders` with `origin_kind='operator'` and `operator_command_uid` set. Both columns exist on the per-order table today (foundation §6.2). **They do NOT need to be added to `trades`** — an earlier Phase A "deferred items" entry that listed these as future `trades` columns is superseded by the foundation.
-- **Symbol-level locks** already exist as durable DB constraints: `uniq_one_active_position_per_owner_key` (no second non-terminal entry per owner_key) and `uniq_one_active_close_per_position` (no second non-terminal close per position) per foundation §6.2. Phase C wraps these with application-layer acquire/release semantics rather than building a new in-memory registry.
+- **Symbol-level locks** already exist as durable DB constraints: `uniq_one_active_position_per_owner_key` (no second non-terminal entry per owner_key) and `uniq_one_active_close_per_position` (no second non-terminal close per position) per foundation §6.2. Phase C wraps these with a thin in-memory `SymbolLockRegistry` (`engine/symbol_locks.py`) that fails fast with audit context before the broker submit; the DB constraints remain authoritative.
 - **Stop cancel/recreate** for operator-driven closes uses the existing `replaces_order_id` mechanism (foundation §10.3, already wired for the GTC-promotion path).
-- The `Position.position_uid` in-memory field originally deferred to Phase C is **likely obsolete** — `apply_order_event` carries `position_uid` through the substrate. Phase C should re-evaluate before adding the field.
+- The `Position.position_uid` in-memory field originally deferred to Phase C is **confirmed obsolete** — `apply_order_event` carries `position_uid` through the substrate; Phase C handlers query the lifecycle store directly and never need it on `Position`.
+
+**Phase C confirmed shipped — what landed:**
+- `close-position` / `reduce-position` / `cancel-position-orders` actions, each routed through the operator queue with the `--confirm <position_uid_short>` typo-guard
+- `SymbolLockRegistry` engine-side wrapper around the foundation's DB-level uniqueness
+- Substrate row tagging: every operator-driven exit/partial-close carries `origin_kind='operator'` + `operator_command_uid` on `position_lifecycle_orders`
+- Allocator + PnL reintegration through the existing `_record_realized_pnl` path — operator-driven exits look identical to automatic exits downstream
+- The Phase A "deferred items" table (`Position.position_uid`, in-memory startup re-attach, `operator_command_uid`/`client_order_id` columns on `trades`, `position_uid` in `engine_state.json`) is **retired in full**: every item is either now obsolete (foundation absorbed it) or migrated to its appropriate Phase C handler. No outstanding Phase A deferrals remain.
 
 ### 17.2 Read-side consumers — still organic adoption, value uneven
 

@@ -774,6 +774,8 @@ class AlpacaBroker:
         order_class: str = "simple",
         time_in_force: str = "day",
         intended_limit_price: float | None = None,
+        origin_kind: str = "bot",
+        operator_command_uid: str | None = None,
     ) -> None:
         """Insert + attach an exit-side substrate row in one call.
 
@@ -805,6 +807,11 @@ class AlpacaBroker:
                 side="sell",
                 intended_qty=float(qty),
                 intended_limit_price=intended_limit_price,
+                # Phase C: when the close was issued by an operator
+                # command, tag the substrate row so audit + downstream
+                # consumers can distinguish operator vs strategy exits.
+                origin_kind=origin_kind,
+                operator_command_uid=operator_command_uid,
             )
             if broker_order_id is not None:
                 self._lifecycle_orders_store.attach_broker_order_id(
@@ -2377,6 +2384,8 @@ class AlpacaBroker:
         poll_timeout: float = ORDER_CONFIRM_TIMEOUT_SECONDS,
         poll_interval: float = 1.0,
         position_uid: str | None = None,
+        operator_command_uid: str | None = None,
+        partial_qty: float | None = None,
     ) -> OrderResult:
         """
         Liquidate an open position with a market order. Used for hard-risk
@@ -2395,11 +2404,38 @@ class AlpacaBroker:
         the client_order_id internally). Callers without the uid
         (legacy tests, ad-hoc REPL use) pass None and the substrate
         write is skipped — the broker close still executes.
+
+        Phase C: ``operator_command_uid`` and ``partial_qty`` are
+        operator-driven extensions. When ``operator_command_uid`` is
+        supplied, the substrate row is tagged ``origin_kind='operator'``
+        with the command uid. When ``partial_qty`` is supplied (and
+        smaller than the current position qty), the broker submits a
+        market reduce instead of a full liquidation; the substrate row
+        is recorded with ``role='partial_close'``. The two kwargs are
+        independent — strategy-driven partial closes (a future
+        enhancement) would pass ``partial_qty`` without
+        ``operator_command_uid``.
         """
         positions = self.get_positions()
         if symbol not in positions:
             raise BrokerError(f"no open position for {symbol}")
-        qty = abs(positions[symbol].qty)
+        total_qty = abs(positions[symbol].qty)
+        # Phase C: validate + clamp partial_qty.
+        if partial_qty is not None:
+            if partial_qty <= 0:
+                raise BrokerError(
+                    f"close_position(partial_qty={partial_qty}) must be > 0"
+                )
+            if partial_qty > total_qty:
+                raise BrokerError(
+                    f"close_position(partial_qty={partial_qty}) exceeds "
+                    f"current qty {total_qty} for {symbol}"
+                )
+            qty = float(partial_qty)
+            is_partial = True
+        else:
+            qty = total_qty
+            is_partial = False
 
         # Cancel sibling orders so their shares are freed for the close.
         for o in self.get_open_orders():
@@ -2407,10 +2443,21 @@ class AlpacaBroker:
                 self.cancel_order(o.order_id)
 
         try:
-            order = self._with_retry(
-                lambda: self._api.close_position(symbol),
-                op_desc=f"close_position({symbol})",
-            )
+            if is_partial:
+                # ClosePositionRequest supports qty + percentage; we
+                # pass qty as a string per the alpaca-py contract.
+                from alpaca.trading.requests import ClosePositionRequest as _CPR
+                order = self._with_retry(
+                    lambda: self._api.close_position(
+                        symbol, close_options=_CPR(qty=str(qty)),
+                    ),
+                    op_desc=f"close_position({symbol}, partial={qty})",
+                )
+            else:
+                order = self._with_retry(
+                    lambda: self._api.close_position(symbol),
+                    op_desc=f"close_position({symbol})",
+                )
         except APIError as e:
             logger.error(f"close_position({symbol}) failed: {e}")
             return OrderResult(
@@ -2437,6 +2484,9 @@ class AlpacaBroker:
             client_order_id=close_client_id,
             broker_order_id=order_id,
             qty=float(qty),
+            role="partial_close" if is_partial else "exit",
+            origin_kind="operator" if operator_command_uid else "bot",
+            operator_command_uid=operator_command_uid,
         )
         stream_event: threading.Event | None = None
         if self._stream_manager is not None:

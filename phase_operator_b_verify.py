@@ -77,6 +77,18 @@ def run() -> int:
         db_path = os.path.join(tmp, "trades.db")
         state_path = os.path.join(tmp, "engine_state.json")
 
+        # PR-66 review follow-up: patch OPERATOR_CONTROL_STATE_PATH up
+        # front so every section that drives a real RiskManager
+        # through pause/halt handlers writes to the tmp file instead
+        # of the production `data/operator_control_state.json`.
+        # Section 7 (heartbeat draining a real pause-entries command)
+        # previously fell outside the narrower section-3 try/finally
+        # and contaminated production state.
+        ctrl_path_global = os.path.join(tmp, "operator_control_state.json")
+        from config import settings as _settings_global
+        _orig_ctrl_path_global = _settings_global.OPERATOR_CONTROL_STATE_PATH
+        _settings_global.OPERATOR_CONTROL_STATE_PATH = ctrl_path_global
+
         # ── 1. VALID_ACTIONS enum ─────────────────────────────────
         _section("1. VALID_ACTIONS includes Phase B")
         phase_b = {
@@ -312,6 +324,10 @@ def run() -> int:
             engine._running = False
             engine._operator_heartbeat_stop.set()
             thread.join(timeout=2.0)
+
+        # Restore the production OPERATOR_CONTROL_STATE_PATH before
+        # leaving the TemporaryDirectory context.
+        _settings_global.OPERATOR_CONTROL_STATE_PATH = _orig_ctrl_path_global
 
     print()
     print("=" * 60)

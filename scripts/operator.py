@@ -483,6 +483,87 @@ def cmd_resume_strategy(args: argparse.Namespace) -> int:
     return _enqueue_simple_action(args, action="resume-strategy", expected_confirm="resume")
 
 
+# ── Subcommand: destructive position controls (Phase C) ─────────
+
+
+def _enqueue_destructive_action(
+    args, *, action: str, params: dict | None = None,
+) -> int:
+    """Shared helper for the 3 Phase C destructive subcommands.
+
+    Per proposal §6, destructive commands require the operator to type
+    the FIRST 10 HEX CHARS of the position_uid as the --confirm token.
+    A generic "yes" / "close" string would be too easy to fire by
+    accident on the wrong position; matching the uid's short form
+    forces the operator to actually look at the target before
+    confirming.
+    """
+    uid = args.position_uid or ""
+    if not uid.startswith("pos_"):
+        sys.stderr.write(
+            f"error: {action} requires position_uid in the 'pos_<hex>' form\n"
+        )
+        return 2
+    if not (args.reason and args.reason.strip()):
+        sys.stderr.write(f"error: {action} requires --reason \"<text>\"\n")
+        return 2
+    expected_token = uid.removeprefix("pos_")[:10]
+    if args.confirm != expected_token:
+        sys.stderr.write(
+            f"error: {action} requires --confirm {expected_token}\n"
+            "  type the first 10 hex chars of the position_uid to confirm.\n"
+            "  this prevents firing against the wrong position by accident.\n"
+        )
+        return 2
+
+    conn = _open_db(args.db)
+    queue = _operator_command_store(conn)
+    cmd_uid = new_command_uid()
+    queue.insert(
+        command_uid=cmd_uid,
+        action=action,
+        reason=args.reason,
+        requested_by=_requested_by(),
+        target_position_uid=uid,
+        params=params,
+    )
+    print(f"queued {action}: {cmd_uid}")
+    print(f"target:      {uid}")
+    print(f"reason:      {args.reason}")
+    if params:
+        print(f"params:      {params}")
+    print(
+        f"engine heartbeat drains the queue every "
+        f"~{settings.OPERATOR_COMMAND_HEARTBEAT_SECONDS}s; use "
+        f"`operator.py commands` to see the result."
+    )
+    return 0
+
+
+def cmd_close_position(args: argparse.Namespace) -> int:
+    return _enqueue_destructive_action(args, action="close-position")
+
+
+def cmd_reduce_position(args: argparse.Namespace) -> int:
+    try:
+        pct = float(args.pct)
+    except (TypeError, ValueError):
+        sys.stderr.write(f"error: --pct must be numeric; got {args.pct!r}\n")
+        return 2
+    if not (0 < pct < 100):
+        sys.stderr.write(
+            f"error: --pct must be in (0, 100); got {pct}\n"
+        )
+        return 2
+    return _enqueue_destructive_action(
+        args, action="reduce-position", params={"pct": pct},
+    )
+
+
+def cmd_cancel_position_orders(args: argparse.Namespace) -> int:
+    return _enqueue_destructive_action(args, action="cancel-position-orders")
+
+
 # ── argparse wiring ────────────────────────────────────────────────
 
 
@@ -576,6 +657,46 @@ def _build_parser() -> argparse.ArgumentParser:
         help="must be literally `resume` to confirm",
     )
 
+    # Phase C — destructive position controls. All three accept a
+    # position_uid argument and require --confirm <first-10-hex> of
+    # that uid, so a typo can't fire against the wrong position.
+    sp_cp = sub.add_parser(
+        "close-position",
+        help="fully close one lifecycle by position_uid",
+    )
+    sp_cp.add_argument("position_uid", help="full pos_<hex> identifier")
+    sp_cp.add_argument("--reason", required=True, help="why are you closing?")
+    sp_cp.add_argument(
+        "--confirm", default="",
+        help="must equal the first 10 hex chars of position_uid",
+    )
+
+    sp_rp = sub.add_parser(
+        "reduce-position",
+        help="partially close one lifecycle (--pct)",
+    )
+    sp_rp.add_argument("position_uid", help="full pos_<hex> identifier")
+    sp_rp.add_argument(
+        "--pct", required=True, type=float,
+        help="percentage of current position qty to reduce (0 < pct < 100)",
+    )
+    sp_rp.add_argument("--reason", required=True, help="why are you reducing?")
+    sp_rp.add_argument(
+        "--confirm", default="",
+        help="must equal the first 10 hex chars of position_uid",
+    )
+
+    sp_co = sub.add_parser(
+        "cancel-position-orders",
+        help="cancel non-terminal stop/exit orders for one position",
+    )
+    sp_co.add_argument("position_uid", help="full pos_<hex> identifier")
+    sp_co.add_argument("--reason", required=True, help="why are you canceling?")
+    sp_co.add_argument(
+        "--confirm", default="",
+        help="must equal the first 10 hex chars of position_uid",
+    )
+
     return parser
 
 
@@ -590,6 +711,9 @@ _DISPATCH = {
     "resume-entries": cmd_resume_entries,
     "pause-strategy": cmd_pause_strategy,
     "resume-strategy": cmd_resume_strategy,
+    "close-position": cmd_close_position,
+    "reduce-position": cmd_reduce_position,
+    "cancel-position-orders": cmd_cancel_position_orders,
 }
 
 

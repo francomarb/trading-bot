@@ -435,6 +435,106 @@ class TestStatusSurfacesPauseState:
         assert "donchian_breakout" in out
 
 
+class TestPhaseCDestructiveControls:
+    """Phase C — 3 destructive subcommands. Confirm requires the
+    first 10 hex chars of the position_uid (not a generic token), so
+    a typo can't fire against the wrong position."""
+
+    _UID = "pos_abcdef0123456789abcdef0123456789"
+    _CONFIRM = "abcdef0123"  # first 10 hex chars
+
+    def test_close_position_refuses_without_confirm(self, db_paths):
+        db_path, state_path = db_paths
+        rc, _, err = _run([
+            "--db", db_path, "--state-path", state_path,
+            "close-position", self._UID, "--reason", "t",
+        ])
+        assert rc != 0
+        assert self._CONFIRM in err
+
+    def test_close_position_refuses_wrong_confirm(self, db_paths):
+        db_path, state_path = db_paths
+        rc, _, err = _run([
+            "--db", db_path, "--state-path", state_path,
+            "close-position", self._UID, "--reason", "t",
+            "--confirm", "wrongtoken",
+        ])
+        assert rc != 0
+        assert self._CONFIRM in err
+
+    def test_close_position_refuses_bad_uid_format(self, db_paths):
+        db_path, state_path = db_paths
+        rc, _, err = _run([
+            "--db", db_path, "--state-path", state_path,
+            "close-position", "AAPL", "--reason", "t",
+            "--confirm", "x",
+        ])
+        assert rc != 0
+        assert "pos_<hex>" in err
+
+    def test_close_position_writes_queue_row(self, db_paths):
+        db_path, state_path = db_paths
+        rc, out, _ = _run([
+            "--db", db_path, "--state-path", state_path,
+            "close-position", self._UID, "--reason", "take profit",
+            "--confirm", self._CONFIRM,
+        ])
+        assert rc == 0
+        assert "queued close-position" in out
+
+        import sqlite3
+        conn = sqlite3.connect(db_path)
+        store = OperatorCommandStore(conn)
+        recent = store.recent(limit=5)
+        match = [r for r in recent if r.action == "close-position"]
+        assert len(match) == 1
+        assert match[0].target_position_uid == self._UID
+        assert match[0].status == "pending"
+
+    def test_reduce_position_writes_pct_in_params(self, db_paths):
+        db_path, state_path = db_paths
+        rc, out, _ = _run([
+            "--db", db_path, "--state-path", state_path,
+            "reduce-position", self._UID,
+            "--pct", "33",
+            "--reason", "take some off",
+            "--confirm", self._CONFIRM,
+        ])
+        assert rc == 0
+        assert "queued reduce-position" in out
+
+        import sqlite3
+        conn = sqlite3.connect(db_path)
+        store = OperatorCommandStore(conn)
+        recent = store.recent(limit=5)
+        match = [r for r in recent if r.action == "reduce-position"]
+        assert len(match) == 1
+        assert match[0].params.get("pct") == 33.0
+
+    def test_reduce_position_rejects_pct_out_of_range(self, db_paths):
+        db_path, state_path = db_paths
+        for bad in (0, 100, -5, 150):
+            rc, _, err = _run([
+                "--db", db_path, "--state-path", state_path,
+                "reduce-position", self._UID,
+                "--pct", str(bad),
+                "--reason", "t",
+                "--confirm", self._CONFIRM,
+            ])
+            assert rc != 0, f"pct={bad} should refuse"
+
+    def test_cancel_position_orders_writes_queue_row(self, db_paths):
+        db_path, state_path = db_paths
+        rc, out, _ = _run([
+            "--db", db_path, "--state-path", state_path,
+            "cancel-position-orders", self._UID,
+            "--reason", "stale stop",
+            "--confirm", self._CONFIRM,
+        ])
+        assert rc == 0
+        assert "queued cancel-position-orders" in out
+
+
 class TestMissingDB:
     def test_missing_db_returns_2(self, tmp_path):
         # Point at a non-existent DB.
