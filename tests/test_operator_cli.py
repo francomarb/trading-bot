@@ -313,6 +313,128 @@ class TestReadOnlyCommands:
         assert out.index("test 2") < out.index("test 1")
 
 
+class TestPhaseBSoftControls:
+    """Phase B — the 4 soft-control subcommands. Same `--confirm` +
+    `--reason` pattern as `halt`."""
+
+    def test_pause_entries_refuses_without_confirm(self, db_paths):
+        db_path, state_path = db_paths
+        rc, _, err = _run([
+            "--db", db_path, "--state-path", state_path,
+            "pause-entries", "--reason", "test",
+        ])
+        assert rc != 0
+        assert "--confirm pause" in err
+
+    def test_pause_entries_writes_queue_row_when_confirmed(self, db_paths):
+        db_path, state_path = db_paths
+        rc, out, _ = _run([
+            "--db", db_path, "--state-path", state_path,
+            "pause-entries", "--reason", "market event", "--confirm", "pause",
+        ])
+        assert rc == 0
+        assert "queued pause-entries" in out
+
+        import sqlite3
+        conn = sqlite3.connect(db_path)
+        store = OperatorCommandStore(conn)
+        rows = store.recent(limit=5)
+        ent = [r for r in rows if r.action == "pause-entries"]
+        assert len(ent) == 1
+        assert ent[0].status == "pending"
+        assert ent[0].reason == "market event"
+
+    def test_resume_entries_refuses_without_confirm(self, db_paths):
+        db_path, state_path = db_paths
+        rc, _, err = _run([
+            "--db", db_path, "--state-path", state_path,
+            "resume-entries", "--reason", "ok",
+        ])
+        assert rc != 0
+        assert "--confirm resume" in err
+
+    def test_pause_strategy_requires_strategy(self, db_paths):
+        db_path, state_path = db_paths
+        # argparse should reject before our handler runs.
+        rc, _, err = _run([
+            "--db", db_path, "--state-path", state_path,
+            "pause-strategy", "--reason", "test", "--confirm", "pause",
+        ])
+        assert rc != 0
+        assert "strategy" in (err or "").lower()
+
+    def test_pause_strategy_writes_target_strategy(self, db_paths):
+        db_path, state_path = db_paths
+        rc, out, _ = _run([
+            "--db", db_path, "--state-path", state_path,
+            "pause-strategy",
+            "--strategy", "donchian_breakout",
+            "--reason", "regime", "--confirm", "pause",
+        ])
+        assert rc == 0
+        assert "queued pause-strategy" in out
+
+        import sqlite3
+        conn = sqlite3.connect(db_path)
+        store = OperatorCommandStore(conn)
+        rows = store.recent(limit=5)
+        ps = [r for r in rows if r.action == "pause-strategy"]
+        assert len(ps) == 1
+        assert ps[0].target_strategy == "donchian_breakout"
+
+    def test_resume_strategy_writes_target_strategy(self, db_paths):
+        db_path, state_path = db_paths
+        rc, _, _ = _run([
+            "--db", db_path, "--state-path", state_path,
+            "resume-strategy",
+            "--strategy", "sma_crossover",
+            "--reason", "reviewed", "--confirm", "resume",
+        ])
+        assert rc == 0
+
+
+class TestStatusSurfacesPauseState:
+    """The `status` subcommand should display halt + pause state from
+    the engine_state.json snapshot. Earlier versions only showed halt;
+    Phase B adds pause-entries + paused_strategies."""
+
+    def test_status_shows_no_pauses_when_clean(self, db_paths):
+        import json as _json
+        db_path, state_path = db_paths
+        with open(state_path, "w") as fh:
+            _json.dump({"risk_controls": {"is_halted": False}}, fh)
+        rc, out, _ = _run([
+            "--db", db_path, "--state-path", state_path,
+            "status",
+        ])
+        assert rc == 0
+        assert "entries paused:     no" in out
+        assert "paused strategies:  (none)" in out
+
+    def test_status_shows_pause_state(self, db_paths):
+        import json as _json
+        db_path, state_path = db_paths
+        with open(state_path, "w") as fh:
+            _json.dump({
+                "risk_controls": {
+                    "is_halted": False,
+                    "entries_paused": True,
+                    "entries_paused_reason": "market event",
+                    "paused_strategies": {
+                        "donchian_breakout": {"reason": "regime"},
+                    },
+                },
+            }, fh)
+        rc, out, _ = _run([
+            "--db", db_path, "--state-path", state_path,
+            "status",
+        ])
+        assert rc == 0
+        assert "entries paused:     YES" in out
+        assert "market event" in out
+        assert "donchian_breakout" in out
+
+
 class TestMissingDB:
     def test_missing_db_returns_2(self, tmp_path):
         # Point at a non-existent DB.

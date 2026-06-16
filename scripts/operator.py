@@ -185,6 +185,19 @@ def cmd_status(args: argparse.Namespace) -> int:
     halted = risk.get("is_halted", False)
     print(f"halt status:        {'HALTED' if halted else 'normal'}"
           + (f"  reason={risk.get('halt_reason')!r}" if halted else ""))
+    # Phase B — soft pauses surfaced alongside halt. Fields may be
+    # absent on pre-Phase-B snapshots; tolerate either shape.
+    entries_paused = risk.get("entries_paused", False)
+    print(f"entries paused:     {'YES' if entries_paused else 'no'}"
+          + (f"  reason={risk.get('entries_paused_reason')!r}" if entries_paused else ""))
+    paused_strats = risk.get("paused_strategies") or {}
+    if paused_strats:
+        print(f"paused strategies:  {len(paused_strats)}")
+        for name in sorted(paused_strats):
+            meta = paused_strats[name] or {}
+            print(f"  - {name}: reason={meta.get('reason')!r}")
+    else:
+        print(f"paused strategies:  (none)")
     stream = state.get("stream_health") or {}
     if stream:
         print(f"stream healthy:     {stream.get('healthy')} (generation={stream.get('generation')})")
@@ -366,7 +379,8 @@ def cmd_halt(args: argparse.Namespace) -> int:
     print(f"queued halt: {uid}")
     print(f"reason:      {args.reason}")
     print(
-        "engine drains the queue once per cycle (~5 min in Phase A); "
+        f"engine heartbeat drains the queue every "
+        f"~{settings.OPERATOR_COMMAND_HEARTBEAT_SECONDS}s; "
         f"expiry after {settings.OPERATOR_COMMAND_EXPIRY_SECONDS}s if "
         "the bot is stalled."
     )
@@ -404,6 +418,69 @@ def cmd_resume_after_halt(args: argparse.Namespace) -> int:
         "rejected — use `operator.py commands` to confirm."
     )
     return 0
+
+
+# ── Subcommand: pause-entries / resume-entries (Phase B) ─────────
+
+
+def _enqueue_simple_action(args, *, action: str, expected_confirm: str) -> int:
+    """Shared helper for the four soft-control subcommands.
+
+    Each requires `--reason "<text>"` and `--confirm <expected>` —
+    mirroring the halt pattern so a typo can't fire a state change.
+    """
+    if args.confirm != expected_confirm:
+        sys.stderr.write(
+            f"error: {action} requires --confirm {expected_confirm}\n"
+            "  this prevents an accidental keystroke from changing state.\n"
+        )
+        return 2
+    if not (args.reason and args.reason.strip()):
+        sys.stderr.write(f"error: {action} requires --reason \"<text>\"\n")
+        return 2
+
+    conn = _open_db(args.db)
+    queue = _operator_command_store(conn)
+    uid = new_command_uid()
+    queue.insert(
+        command_uid=uid,
+        action=action,
+        reason=args.reason,
+        requested_by=_requested_by(),
+        target_strategy=getattr(args, "strategy", None),
+    )
+    print(f"queued {action}: {uid}")
+    print(f"reason:      {args.reason}")
+    target_strategy = getattr(args, "strategy", None)
+    if target_strategy:
+        print(f"strategy:    {target_strategy}")
+    print(
+        f"engine heartbeat drains the queue every "
+        f"~{settings.OPERATOR_COMMAND_HEARTBEAT_SECONDS}s."
+    )
+    return 0
+
+
+def cmd_pause_entries(args: argparse.Namespace) -> int:
+    return _enqueue_simple_action(args, action="pause-entries", expected_confirm="pause")
+
+
+def cmd_resume_entries(args: argparse.Namespace) -> int:
+    return _enqueue_simple_action(args, action="resume-entries", expected_confirm="resume")
+
+
+def cmd_pause_strategy(args: argparse.Namespace) -> int:
+    if not (args.strategy and args.strategy.strip()):
+        sys.stderr.write("error: pause-strategy requires --strategy <name>\n")
+        return 2
+    return _enqueue_simple_action(args, action="pause-strategy", expected_confirm="pause")
+
+
+def cmd_resume_strategy(args: argparse.Namespace) -> int:
+    if not (args.strategy and args.strategy.strip()):
+        sys.stderr.write("error: resume-strategy requires --strategy <name>\n")
+        return 2
+    return _enqueue_simple_action(args, action="resume-strategy", expected_confirm="resume")
 
 
 # ── argparse wiring ────────────────────────────────────────────────
@@ -456,6 +533,49 @@ def _build_parser() -> argparse.ArgumentParser:
         help="must be literally `resume` to confirm — prevents an accidental resume",
     )
 
+    # Phase B — soft entry pauses.
+    sp_pe = sub.add_parser(
+        "pause-entries",
+        help="block new entries (exits/stops continue)",
+    )
+    sp_pe.add_argument("--reason", required=True, help="why are you pausing entries?")
+    sp_pe.add_argument(
+        "--confirm", default="",
+        help="must be literally `pause` to confirm",
+    )
+
+    sp_re = sub.add_parser(
+        "resume-entries",
+        help="unblock new entries (no reconciliation required)",
+    )
+    sp_re.add_argument("--reason", required=True, help="why are you resuming entries?")
+    sp_re.add_argument(
+        "--confirm", default="",
+        help="must be literally `resume` to confirm",
+    )
+
+    sp_ps = sub.add_parser(
+        "pause-strategy",
+        help="block new entries for one strategy only",
+    )
+    sp_ps.add_argument("--strategy", required=True, help="strategy name (e.g. sma_crossover)")
+    sp_ps.add_argument("--reason", required=True, help="why are you pausing the strategy?")
+    sp_ps.add_argument(
+        "--confirm", default="",
+        help="must be literally `pause` to confirm",
+    )
+
+    sp_rs = sub.add_parser(
+        "resume-strategy",
+        help="unblock new entries for one strategy",
+    )
+    sp_rs.add_argument("--strategy", required=True, help="strategy name (e.g. sma_crossover)")
+    sp_rs.add_argument("--reason", required=True, help="why are you resuming the strategy?")
+    sp_rs.add_argument(
+        "--confirm", default="",
+        help="must be literally `resume` to confirm",
+    )
+
     return parser
 
 
@@ -466,6 +586,10 @@ _DISPATCH = {
     "commands": cmd_commands,
     "halt": cmd_halt,
     "resume-after-halt": cmd_resume_after_halt,
+    "pause-entries": cmd_pause_entries,
+    "resume-entries": cmd_resume_entries,
+    "pause-strategy": cmd_pause_strategy,
+    "resume-strategy": cmd_resume_strategy,
 }
 
 

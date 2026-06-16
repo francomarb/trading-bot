@@ -377,6 +377,21 @@ class RiskManager:
         self._slippage_samples: Deque[tuple[float, float]] = deque(maxlen=200)
         self._halted: bool = False
         self._halt_reason: str | None = None
+        # Operator Controls Phase B — soft entry pauses. Independent of
+        # the kill switch: pauses block NEW entries only; exits, stops,
+        # reconciliation, allocator updates, and lifecycle reconciles
+        # continue to run. Halt and pauses can coexist; halt is the
+        # stricter gate. Resume-after-halt only clears the kill switch
+        # (after the F2 operator-prefix reconcile check); resume-entries
+        # / resume-strategy clear their own pause flags without any
+        # reconciliation. All three pause/halt states persist across
+        # restart via `OPERATOR_CONTROL_STATE_PATH` JSON owned by the
+        # engine; this class is the in-memory authority while the engine
+        # is running.
+        self._entries_paused: bool = False
+        self._entries_paused_reason: str | None = None
+        self._entries_paused_command_uid: str | None = None
+        self._paused_strategies: dict[str, dict] = {}
 
     # ── Kill-switch state ────────────────────────────────────────────────
 
@@ -400,6 +415,122 @@ class RiskManager:
             )
         self._halted = False
         self._halt_reason = None
+
+    # ── Soft entry pauses (Operator Controls Phase B) ──────────────────
+    #
+    # All four accessors are pure flag checks — no I/O, no side effects.
+    # The engine layer is responsible for persisting state to disk
+    # (via `_persist_control_state`) so a restart can rehydrate the
+    # in-memory flags here. That separation lets us unit-test pause
+    # behavior without touching the filesystem.
+
+    def is_entries_paused(self) -> bool:
+        """True when the operator has issued `pause-entries` and not
+        yet issued `resume-entries`. Independent of `is_halted()`."""
+        return self._entries_paused
+
+    def entries_paused_reason(self) -> str | None:
+        return self._entries_paused_reason
+
+    def is_strategy_paused(self, strategy_name: str) -> bool:
+        """True when the operator has issued `pause-strategy <name>`
+        and not yet issued `resume-strategy <name>`. Independent of
+        `is_entries_paused()`: a strategy can be paused individually
+        while global pause-entries is off."""
+        if not strategy_name:
+            return False
+        return strategy_name in self._paused_strategies
+
+    def paused_strategies_snapshot(self) -> dict[str, dict]:
+        """Read-only snapshot of paused-strategy metadata. Returns a
+        deep copy so callers (CLI / dashboard / engine_state.json)
+        can iterate without holding a reference into RiskManager state."""
+        return {name: dict(meta) for name, meta in self._paused_strategies.items()}
+
+    def pause_entries(
+        self,
+        *,
+        reason: str,
+        command_uid: str | None = None,
+    ) -> bool:
+        """Set the global entries-paused flag.
+
+        Returns True if state changed, False if entries were already
+        paused (so the engine handler can write an idempotent succeeded
+        result without alerting twice).
+        """
+        if self._entries_paused:
+            return False
+        self._entries_paused = True
+        self._entries_paused_reason = reason
+        self._entries_paused_command_uid = command_uid
+        logger.warning(
+            f"RiskManager entries paused: {reason} "
+            f"(cmd={(command_uid or '-')[:18]}…)"
+        )
+        return True
+
+    def resume_entries(self) -> bool:
+        """Clear the global entries-paused flag.
+
+        Returns True if state changed, False if entries were not paused.
+        Resume does NOT require any reconciliation — soft pause is
+        a flag flip, distinct from sticky halt's `resume-after-halt`.
+        """
+        if not self._entries_paused:
+            return False
+        prior = self._entries_paused_reason
+        self._entries_paused = False
+        self._entries_paused_reason = None
+        self._entries_paused_command_uid = None
+        logger.info(f"RiskManager entries resumed (prior reason: {prior!r})")
+        return True
+
+    def pause_strategy(
+        self,
+        *,
+        strategy_name: str,
+        reason: str,
+        command_uid: str | None = None,
+    ) -> bool:
+        """Pause entries for one strategy only.
+
+        Returns True if state changed, False if the strategy was
+        already paused.
+        """
+        if not strategy_name:
+            raise ValueError("strategy_name must not be empty")
+        if strategy_name in self._paused_strategies:
+            return False
+        from datetime import datetime, timezone
+
+        self._paused_strategies[strategy_name] = {
+            "reason": reason,
+            "command_uid": command_uid,
+            "paused_at": datetime.now(timezone.utc).isoformat(),
+        }
+        logger.warning(
+            f"RiskManager strategy '{strategy_name}' paused: {reason} "
+            f"(cmd={(command_uid or '-')[:18]}…)"
+        )
+        return True
+
+    def resume_strategy(self, *, strategy_name: str) -> bool:
+        """Clear the per-strategy pause flag for one strategy.
+
+        Returns True if state changed, False if the strategy was not
+        paused.
+        """
+        if not strategy_name:
+            raise ValueError("strategy_name must not be empty")
+        meta = self._paused_strategies.pop(strategy_name, None)
+        if meta is None:
+            return False
+        logger.info(
+            f"RiskManager strategy '{strategy_name}' resumed "
+            f"(prior reason: {meta.get('reason')!r})"
+        )
+        return True
 
     def _account_limit_breach(
         self, account: AccountState

@@ -50,6 +50,7 @@ from __future__ import annotations
 
 import json
 import sqlite3
+import threading
 import uuid
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
@@ -115,9 +116,19 @@ VALID_STATUSES = frozenset({
 
 # Actions the CLI may submit. Validated at insert time — the CLI cannot
 # write an unknown action.
+#
+# Phase B adds four soft-control actions: pause-entries / resume-entries
+# block all new entries while existing position management continues;
+# pause-strategy / resume-strategy scope the block to a single strategy
+# (the strategy name is passed in target_strategy, validated at the
+# engine handler).
 VALID_ACTIONS = frozenset({
     "halt",
     "resume-after-halt",
+    "pause-entries",
+    "resume-entries",
+    "pause-strategy",
+    "resume-strategy",
 })
 
 
@@ -178,6 +189,13 @@ class OperatorCommandStore:
 
     def __init__(self, conn: sqlite3.Connection) -> None:
         self._conn = conn
+        # PR-65 review F3: serialise all DB ops on this connection so
+        # the heartbeat thread (calling claim_next_pending / mark_*)
+        # and the Telegram listener thread (calling insert) cannot
+        # interleave on the same shared connection. Cycle-thread
+        # writes go through a SEPARATE connection (TradeLogger's) so
+        # the lock here is only for the queue's own threads.
+        self._lock = threading.RLock()
 
     # ── Writes (CLI side) ────────────────────────────────────────────
 
@@ -213,33 +231,34 @@ class OperatorCommandStore:
             raise ValueError("reason must be a non-empty string")
 
         now = _utc_now_iso()
-        self._conn.execute(
-            """
-            INSERT INTO operator_commands (
-                schema_version, command_uid, created_at, accepted_at,
-                completed_at, requested_by, action, target_position_uid,
-                target_strategy, params_json, reason, status,
-                client_order_id, result_json
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-            """,
-            (
-                OPERATOR_QUEUE_SCHEMA_VERSION,
-                command_uid,
-                now,
-                None,
-                None,
-                requested_by,
-                action,
-                target_position_uid,
-                target_strategy,
-                json.dumps(params or {}),
-                reason.strip(),
-                "pending",
-                None,
-                None,
-            ),
-        )
-        self._conn.commit()
+        with self._lock:
+            self._conn.execute(
+                """
+                INSERT INTO operator_commands (
+                    schema_version, command_uid, created_at, accepted_at,
+                    completed_at, requested_by, action, target_position_uid,
+                    target_strategy, params_json, reason, status,
+                    client_order_id, result_json
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    OPERATOR_QUEUE_SCHEMA_VERSION,
+                    command_uid,
+                    now,
+                    None,
+                    None,
+                    requested_by,
+                    action,
+                    target_position_uid,
+                    target_strategy,
+                    json.dumps(params or {}),
+                    reason.strip(),
+                    "pending",
+                    None,
+                    None,
+                ),
+            )
+            self._conn.commit()
 
     # ── Writes (engine side) ─────────────────────────────────────────
 
@@ -267,43 +286,44 @@ class OperatorCommandStore:
         now = now_iso or _utc_now_iso()
         cutoff = _iso_minus_seconds(now, expiry_seconds)
 
-        # Expire stale rows first. Idempotent — operates only on `pending`.
-        self._conn.execute(
-            "UPDATE operator_commands "
-            "SET status = 'rejected_expired', completed_at = ? "
-            "WHERE status = 'pending' AND created_at < ?",
-            (now, cutoff),
-        )
+        with self._lock:
+            # Expire stale rows first. Idempotent — operates only on `pending`.
+            self._conn.execute(
+                "UPDATE operator_commands "
+                "SET status = 'rejected_expired', completed_at = ? "
+                "WHERE status = 'pending' AND created_at < ?",
+                (now, cutoff),
+            )
 
-        # Pick the oldest remaining pending row.
-        row = self._conn.execute(
-            "SELECT id, " + _SELECT_COLUMNS_CSV + " "
-            "FROM operator_commands "
-            "WHERE status = 'pending' "
-            "ORDER BY created_at ASC LIMIT 1"
-        ).fetchone()
-        if row is None:
+            # Pick the oldest remaining pending row.
+            row = self._conn.execute(
+                "SELECT id, " + _SELECT_COLUMNS_CSV + " "
+                "FROM operator_commands "
+                "WHERE status = 'pending' "
+                "ORDER BY created_at ASC LIMIT 1"
+            ).fetchone()
+            if row is None:
+                self._conn.commit()
+                return None
+
+            row_id = row[0]
+            # Transition to accepted atomically. The id is unique so the
+            # WHERE clause guarantees a single update; combined with the
+            # same transaction the next call will not see this row in the
+            # SELECT above.
+            self._conn.execute(
+                "UPDATE operator_commands "
+                "SET status = 'accepted', accepted_at = ? WHERE id = ?",
+                (now, row_id),
+            )
             self._conn.commit()
-            return None
 
-        row_id = row[0]
-        # Transition to accepted atomically. The id is unique so the
-        # WHERE clause guarantees a single update; combined with the
-        # same transaction the next call will not see this row in the
-        # SELECT above.
-        self._conn.execute(
-            "UPDATE operator_commands "
-            "SET status = 'accepted', accepted_at = ? WHERE id = ?",
-            (now, row_id),
-        )
-        self._conn.commit()
-
-        # Re-read the row to return the post-update state.
-        return self._row_to_obj(self._conn.execute(
-            "SELECT " + _SELECT_COLUMNS_CSV + " "
-            "FROM operator_commands WHERE id = ?",
-            (row_id,),
-        ).fetchone())
+            # Re-read the row to return the post-update state.
+            return self._row_to_obj(self._conn.execute(
+                "SELECT " + _SELECT_COLUMNS_CSV + " "
+                "FROM operator_commands WHERE id = ?",
+                (row_id,),
+            ).fetchone())
 
     def mark_succeeded(
         self,
@@ -376,27 +396,29 @@ class OperatorCommandStore:
                 f"status must be one of {sorted(VALID_STATUSES)}; "
                 f"got {status!r}"
             )
-        self._conn.execute(
-            "UPDATE operator_commands "
-            "SET status = ?, completed_at = ?, result_json = ? "
-            "WHERE command_uid = ?",
-            (
-                status,
-                _utc_now_iso(),
-                json.dumps(result) if result else None,
-                command_uid,
-            ),
-        )
-        self._conn.commit()
+        with self._lock:
+            self._conn.execute(
+                "UPDATE operator_commands "
+                "SET status = ?, completed_at = ?, result_json = ? "
+                "WHERE command_uid = ?",
+                (
+                    status,
+                    _utc_now_iso(),
+                    json.dumps(result) if result else None,
+                    command_uid,
+                ),
+            )
+            self._conn.commit()
 
     # ── Reads ─────────────────────────────────────────────────────────
 
     def get_by_command_uid(self, command_uid: str) -> OperatorCommandRow | None:
-        row = self._conn.execute(
-            "SELECT " + _SELECT_COLUMNS_CSV + " "
-            "FROM operator_commands WHERE command_uid = ?",
-            (command_uid,),
-        ).fetchone()
+        with self._lock:
+            row = self._conn.execute(
+                "SELECT " + _SELECT_COLUMNS_CSV + " "
+                "FROM operator_commands WHERE command_uid = ?",
+                (command_uid,),
+            ).fetchone()
         if row is None:
             return None
         return self._row_to_obj(row)
@@ -406,18 +428,20 @@ class OperatorCommandStore:
         this for the audit view."""
         if limit <= 0:
             return []
-        rows = self._conn.execute(
-            "SELECT " + _SELECT_COLUMNS_CSV + " "
-            "FROM operator_commands "
-            "ORDER BY created_at DESC LIMIT ?",
-            (int(limit),),
-        ).fetchall()
+        with self._lock:
+            rows = self._conn.execute(
+                "SELECT " + _SELECT_COLUMNS_CSV + " "
+                "FROM operator_commands "
+                "ORDER BY created_at DESC LIMIT ?",
+                (int(limit),),
+            ).fetchall()
         return [self._row_to_obj(r) for r in rows]
 
     def count_pending(self) -> int:
-        return self._conn.execute(
-            "SELECT COUNT(*) FROM operator_commands WHERE status = 'pending'"
-        ).fetchone()[0]
+        with self._lock:
+            return self._conn.execute(
+                "SELECT COUNT(*) FROM operator_commands WHERE status = 'pending'"
+            ).fetchone()[0]
 
     # ── Internal ──────────────────────────────────────────────────────
 

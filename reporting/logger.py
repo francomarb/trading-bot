@@ -407,6 +407,16 @@ class TradeLogger:
         if self._conn is not None:
             return self._conn
         os.makedirs(os.path.dirname(self._path) or ".", exist_ok=True)
+        # PR-65 review F3: revert to check_same_thread=True (the
+        # default). Sharing a single connection across cycle-thread
+        # writes (trades, position_lifecycle) and heartbeat-thread
+        # writes (operator_commands) puts both threads into the same
+        # implicit transaction — commit from either flushes both
+        # threads' changes and could roll back the other on error.
+        # Disjoint TABLES does not make a shared CONNECTION
+        # transaction-safe. The operator queue store now opens its
+        # own dedicated connection (see engine.trader.__init__) so
+        # this connection stays single-threaded.
         conn = sqlite3.connect(self._path)
         try:
             # Order lifecycle foundation (PR #59 §6.2 / R13-G1): SQLite

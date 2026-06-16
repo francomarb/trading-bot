@@ -71,6 +71,13 @@ class AlertType(Enum):
     MLEG_CLOSE_WALK_STARTED = "mleg_close_walk_started"
     MLEG_CLOSE_MARKET_FALLBACK = "mleg_close_market_fallback"
     ENGINE_HALT = "engine_halt"
+    # PR-65 review F4: soft operator actions (pause-entries /
+    # resume-entries / pause-strategy / resume-strategy) get their own
+    # alert type at INFO severity. Previously routed through engine_halt
+    # which formatted them as "engine halted: ..." at CRITICAL — a
+    # routine resume-entries looked like an emergency to alerting
+    # channels. ENGINE_HALT stays for actual halt + resume-after-halt.
+    OPERATOR_ACTION = "operator_action"
     TRADE_EXECUTED = "trade_executed"
     REGIME_SHIFT = "regime_shift"
     EOD_SUMMARY = "eod_summary"
@@ -322,6 +329,44 @@ class TelegramCommandListener:
         self._backend.send_text("\n".join(lines))
 
     def _handle_halt(self) -> None:
+        """Telegram /halt — Phase B migration.
+
+        Was: called `engine.stop()` directly, which shut the bot down
+        rather than engaging the kill switch. That left no audit trail
+        and bypassed the standard halt/resume mechanism. Phase B writes
+        a `halt` row to the operator queue so the engine heartbeat
+        engages the kill switch (sticky), captures the audit trail, and
+        the operator can resume via the queue without restarting.
+
+        Falls back to the legacy `engine.stop()` path if the operator
+        queue store is not wired (older builds, unit tests with bare
+        backends).
+        """
+        store = getattr(self._engine, "operator_command_store", None) if self._engine else None
+        if store is not None:
+            try:
+                from engine.operator_queue import new_command_uid
+                uid = new_command_uid()
+                store.insert(
+                    command_uid=uid,
+                    action="halt",
+                    reason="telegram /halt",
+                    requested_by=f"telegram:{self._backend._chat_id}",
+                )
+                self._backend.send_text(
+                    f"🛑 halt queued ({uid[:18]}…) — engine will engage "
+                    "kill switch on its next heartbeat tick."
+                )
+                logger.warning(
+                    f"TelegramCommandListener: queued halt {uid[:18]}…"
+                )
+                return
+            except Exception as exc:
+                logger.warning(
+                    f"TelegramCommandListener: queue write failed, "
+                    f"falling back to engine.stop(): {exc}"
+                )
+        # Legacy fallback — pre-Phase-A builds or queue write failure.
         if self._engine is not None and hasattr(self._engine, "stop"):
             self._engine.stop()  # type: ignore[union-attr]
             self._backend.send_text("🛑 Engine halt requested — bot will stop after the current cycle.")
@@ -527,6 +572,19 @@ class AlertDispatcher:
             message=f"engine halted: {reason}",
         ))
 
+    def operator_action(self, message: str) -> bool:
+        """PR-65 review F4: routine operator soft-control transitions
+        (pause-entries / resume-entries / pause-strategy /
+        resume-strategy). Routed as INFO not CRITICAL so a routine
+        resume doesn't trip emergency-style alerting channels. Use
+        `engine_halt` only for halt / resume-after-halt where CRITICAL
+        is correct."""
+        return self.fire(Alert(
+            alert_type=AlertType.OPERATOR_ACTION,
+            severity=AlertSeverity.INFO,
+            message=message,
+        ))
+
     def trade_executed(
         self,
         symbol: str,
@@ -535,14 +593,25 @@ class AlertDispatcher:
         qty: float,
         price: float,
         reason: str,
+        *,
+        position_uid: str | None = None,
     ) -> bool:
+        # Phase B §17.2 — include position_uid so the operator can
+        # paste it into `operator.py show-position`. Optional kwarg
+        # keeps existing callers source-compatible; the uid is appended
+        # to the message body only when present.
+        message = f"{side.upper()} {qty} {symbol} @ ${price:.2f} — {reason}"
+        details: dict = {"side": side, "qty": qty, "price": price, "reason": reason}
+        if position_uid:
+            message = f"{message} [{position_uid[:18]}…]"
+            details["position_uid"] = position_uid
         return self.fire(Alert(
             alert_type=AlertType.TRADE_EXECUTED,
             severity=AlertSeverity.INFO,
-            message=f"{side.upper()} {qty} {symbol} @ ${price:.2f} — {reason}",
+            message=message,
             symbol=symbol,
             strategy=strategy,
-            details={"side": side, "qty": qty, "price": price, "reason": reason},
+            details=details,
         ))
 
     def regime_shift(self, old_regime: str, new_regime: str) -> bool:

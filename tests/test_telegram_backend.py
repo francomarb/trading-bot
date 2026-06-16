@@ -214,9 +214,35 @@ class TestTelegramCommandListener:
         mock_send.assert_called_once()
         assert "offline" in mock_send.call_args[0][0].lower() or "not found" in mock_send.call_args[0][0].lower()
 
-    def test_halt_command_calls_engine_stop(self):
+    def test_halt_command_queues_via_operator_store(self):
+        """Phase B migration: Telegram /halt writes to the operator
+        command queue (single channel). The engine heartbeat picks it
+        up on the next tick; we no longer call engine.stop() directly,
+        which left no audit trail."""
         listener, backend = self._make_listener()
         engine = MagicMock()
+        # Engine has the operator_command_store wired (Phase A PR-2).
+        listener._engine = engine
+
+        with patch.object(backend, "send_text"):
+            listener._handle_halt()
+
+        # Queue write happened with the expected action.
+        engine.operator_command_store.insert.assert_called_once()
+        kwargs = engine.operator_command_store.insert.call_args.kwargs
+        assert kwargs["action"] == "halt"
+        assert kwargs["reason"] == "telegram /halt"
+        assert kwargs["requested_by"].startswith("telegram:")
+        # engine.stop() is NOT called — sticky halt via kill switch
+        # is the new mechanism.
+        engine.stop.assert_not_called()
+
+    def test_halt_command_falls_back_to_stop_when_queue_unavailable(self):
+        """Pre-Phase-A builds (no operator_command_store) or queue
+        write failures fall back to the legacy engine.stop() path so
+        the operator still has an emergency stop."""
+        listener, backend = self._make_listener()
+        engine = MagicMock(spec=["stop"])  # no operator_command_store attribute
         listener._engine = engine
 
         with patch.object(backend, "send_text"):
@@ -226,13 +252,16 @@ class TestTelegramCommandListener:
 
     def test_halt_command_replies_with_confirmation(self):
         listener, backend = self._make_listener()
+        # MagicMock auto-creates operator_command_store; the reply
+        # in the Phase B path mentions "queued" / "kill switch".
         listener._engine = MagicMock()
 
         with patch.object(backend, "send_text") as mock_send:
             listener._handle_halt()
 
         assert mock_send.called
-        assert "halt" in mock_send.call_args[0][0].lower()
+        msg = mock_send.call_args[0][0].lower()
+        assert "halt" in msg or "kill switch" in msg
 
     def test_poll_ignores_unauthorized_chat_id(self):
         listener, backend = self._make_listener(chat_id="42")

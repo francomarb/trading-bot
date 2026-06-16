@@ -956,7 +956,7 @@ DASHBOARD_PORT: int = int(os.getenv("DASHBOARD_PORT", "8501"))
 #   `_lifecycle_mark_filled`. Older pending rows are still closed (almost
 #   certainly orphaned from a crashed submit). 5 min is longer than the
 #   longest fill-confirm window (BROKER_ORDER_CONFIRM_WINDOW_SECONDS).
-OPERATOR_COMMAND_EXPIRY_SECONDS: int = 1800  # 30 minutes (PR-2 F1 fix)
+OPERATOR_COMMAND_EXPIRY_SECONDS: int = 180  # 3 minutes; Phase B heartbeat polls every 5s so commands drain well within this window
 OPERATOR_COMMAND_HEARTBEAT_SECONDS: int = 5
 OPERATOR_CONTROL_STATE_PATH: str = "data/operator_control_state.json"
 LIFECYCLE_PENDING_GRACE_SECONDS: int = 300

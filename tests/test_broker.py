@@ -189,7 +189,13 @@ class TestPlaceOrderContract:
         assert result.raw_status == "risk_halted"
         api.submit_order.assert_not_called()
 
-    def test_bind_entry_guard_preserves_explicit_policy(self):
+    def test_bind_entry_guard_composes_with_explicit_policy(self):
+        """PR-65 review [Q] (Phase B): the old contract no-op'd when
+        an explicit guard was already configured. That would silently
+        disable any later engine bind (e.g. pause-entries) in a
+        deployment that constructs AlpacaBroker with its own guard.
+        New contract: compose (AND) so policy can never weaken — both
+        guards must allow entry for entry to be allowed."""
         def explicit_guard() -> bool:
             return False
 
@@ -200,8 +206,23 @@ class TestPlaceOrderContract:
 
         installed = broker.bind_entry_guard(lambda: True)
 
-        assert installed is False
-        assert broker._entry_allowed is explicit_guard
+        # Returns True now because the new guard IS installed (composed).
+        assert installed is True
+        # Composed guard rejects when EITHER underlying guard does.
+        # Here the explicit guard returns False, so entries stay blocked
+        # regardless of the new guard's True. Stricter, never weaker.
+        assert broker._entries_allowed() is False
+
+    def test_bind_entry_guard_compose_allows_only_when_both_allow(self):
+        broker = AlpacaBroker(
+            client=MagicMock(),
+            entry_allowed=lambda: True,
+        )
+        broker.bind_entry_guard(lambda: True)
+        assert broker._entries_allowed() is True
+
+        broker.bind_entry_guard(lambda: False)
+        assert broker._entries_allowed() is False
 
     def test_rejects_none(self):
         api = MagicMock()

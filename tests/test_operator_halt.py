@@ -45,12 +45,40 @@ def _build_engine(tmp_path, *, halted=False, halt_reason=None):
     engine.trade_logger = tl
 
     # Mock the risk manager with the minimum surface area used by the
-    # operator-halt handlers.
+    # operator-halt handlers. Phase B: `_persist_control_state` reads
+    # halt/pause flags back from RiskManager AFTER the handler mutates
+    # them, so the mock has to behave statefully — `_engage_kill_switch`
+    # flips the `is_halted` return value to True; `reset_kill_switches`
+    # flips it back. This mirrors how the real RiskManager behaves and
+    # keeps the unit test honest about the call ordering inside the
+    # handlers.
     engine.risk = MagicMock()
-    engine.risk.is_halted = MagicMock(return_value=halted)
-    engine.risk.halt_reason = MagicMock(return_value=halt_reason)
-    engine.risk._engage_kill_switch = MagicMock()
-    engine.risk.reset_kill_switches = MagicMock()
+    _halt_state = {"halted": halted, "reason": halt_reason}
+
+    def _is_halted():
+        return _halt_state["halted"]
+
+    def _halt_reason():
+        return _halt_state["reason"]
+
+    def _engage(reason: str):
+        _halt_state["halted"] = True
+        _halt_state["reason"] = reason
+
+    def _reset():
+        _halt_state["halted"] = False
+        _halt_state["reason"] = None
+
+    engine.risk.is_halted = MagicMock(side_effect=_is_halted)
+    engine.risk.halt_reason = MagicMock(side_effect=_halt_reason)
+    engine.risk._engage_kill_switch = MagicMock(side_effect=_engage)
+    engine.risk.reset_kill_switches = MagicMock(side_effect=_reset)
+    # Phase B — fast accessors that _persist_control_state reads.
+    # Default to "no pauses" so the existing halt tests behave as
+    # before. Per-test overrides for pause tests live in test_operator_pause.py.
+    engine.risk.is_entries_paused = MagicMock(return_value=False)
+    engine.risk.entries_paused_reason = MagicMock(return_value=None)
+    engine.risk.paused_strategies_snapshot = MagicMock(return_value={})
 
     # Alerts dispatcher — record calls but don't actually send anywhere.
     engine.alerts = MagicMock()
@@ -422,31 +450,41 @@ class TestF1CommandsProcessedWhenMarketClosed:
     to broker/snapshot machinery to drive end-to-end in a unit test).
     """
 
-    def test_command_poll_runs_before_market_open_check(self):
+    def test_heartbeat_thread_drives_command_drain(self):
+        """Phase B replaced the per-cycle poll with a dedicated
+        heartbeat thread. The engine has a `_start_operator_heartbeat`
+        method called from `start()`, and the loop calls
+        `_process_operator_commands` every
+        OPERATOR_COMMAND_HEARTBEAT_SECONDS. No per-cycle poll in
+        `_run_one_cycle`."""
         import inspect
         from engine.trader import TradingEngine
-        src = inspect.getsource(TradingEngine._run_one_cycle)
-        # The hook must appear before the `if not market_open:` branch.
-        poll_idx = src.find("self._process_operator_commands()")
-        market_idx = src.find("if not market_open:")
-        assert poll_idx != -1, "operator command poll missing from cycle"
-        assert market_idx != -1, "market_open branch missing from cycle"
-        assert poll_idx < market_idx, (
-            "operator command poll must precede the market-closed early "
-            "return so after-hours halts get picked up immediately"
+        cycle_src = inspect.getsource(TradingEngine._run_one_cycle)
+        # Cycle path no longer calls _process_operator_commands directly.
+        assert "self._process_operator_commands()" not in cycle_src, (
+            "Phase B: the per-cycle poll was replaced by a heartbeat "
+            "thread; remove the cycle-level call"
         )
+        # Heartbeat methods exist and reference the drain.
+        assert hasattr(TradingEngine, "_start_operator_heartbeat")
+        assert hasattr(TradingEngine, "_operator_heartbeat_loop")
+        loop_src = inspect.getsource(TradingEngine._operator_heartbeat_loop)
+        assert "_process_operator_commands" in loop_src
 
-    def test_expiry_safely_exceeds_cycle_interval(self):
-        """Expiry must be > cycle interval + jitter so a command
+    def test_expiry_safely_exceeds_heartbeat_interval(self):
+        """Phase B: expiry must be >> heartbeat interval so a command
         queued just after a poll is not rejected_expired before the
-        next poll."""
+        next poll. Heartbeat is seconds-scale; expiry is the safety
+        net against a stalled bot."""
         from config import settings
         expiry = settings.OPERATOR_COMMAND_EXPIRY_SECONDS
-        cycle = settings.ENGINE_CYCLE_INTERVAL_SECONDS
-        # At minimum 2x cycle interval, providing one missed-cycle buffer.
-        assert expiry >= cycle * 2, (
-            f"OPERATOR_COMMAND_EXPIRY_SECONDS={expiry} must be >= "
-            f"2 * cycle interval ({cycle}s) to survive one missed cycle"
+        heartbeat = settings.OPERATOR_COMMAND_HEARTBEAT_SECONDS
+        # Expiry must give the operator a meaningful window even if the
+        # heartbeat misses a tick. ≥ 20x heartbeat is comfortable.
+        assert expiry >= heartbeat * 20, (
+            f"OPERATOR_COMMAND_EXPIRY_SECONDS={expiry} must be "
+            f">= 20 * heartbeat ({heartbeat}s) so transient drain "
+            f"delays cannot expire valid commands"
         )
 
 
@@ -484,7 +522,8 @@ class TestUnsupportedActions:
 
         row = store.get_by_command_uid(uid)
         assert row.status == "rejected_unsupported_phase_a"
-        assert "not implemented in Phase A" in (
-            row.result.get("note") or ""
-        )
+        # Phase B updated the rejection wording from "not implemented
+        # in Phase A" to "not implemented yet" so it stays accurate
+        # whenever a future phase extends VALID_ACTIONS.
+        assert "not implemented yet" in (row.result.get("note") or "")
         engine.risk._engage_kill_switch.assert_not_called()
