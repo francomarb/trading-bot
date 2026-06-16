@@ -174,11 +174,15 @@ class TestHeartbeatDrains:
         )
         engine, store = _build_engine(tmp_path)
         # Minimal _shutdown surface (rest of _shutdown does broker /
-        # stream cleanup we don't exercise here).
+        # stream cleanup we don't exercise here). PRs #63/#64 added
+        # the option-stop audit cleanup path; stub it inert so this
+        # test stays focused on heartbeat-shutdown semantics.
         engine._cycle_count = 0
         engine.config = MagicMock()
         engine.config.cancel_orders_on_shutdown = False
         engine._stream_manager = None
+        engine.option_stop_audit_store = None
+        engine._drain_option_stop_audit_events = lambda: None
         engine._start_operator_heartbeat()
         thread = engine._operator_heartbeat_thread
         assert thread is not None and thread.is_alive()
