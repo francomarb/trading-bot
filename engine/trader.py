@@ -466,6 +466,14 @@ class TradingEngine:
                 self.trade_logger._path, check_same_thread=False
             )
             op_conn.execute("PRAGMA foreign_keys = ON")
+            # PR-65 R2 (Q): busy_timeout asks SQLite to retry briefly
+            # on `SQLITE_BUSY` if the trade-logger connection holds
+            # the database lock when the heartbeat tries to claim a
+            # row. 5s is well above any real lock duration (cycle
+            # writes are sub-millisecond) and well under the heartbeat
+            # interval, so contention surfaces as a transparent retry
+            # rather than as a logged "queue claim failed" warning.
+            op_conn.execute("PRAGMA busy_timeout = 5000")
             self._operator_command_conn = op_conn
             self.operator_command_store = OperatorCommandStore(op_conn)
         except Exception as exc:
@@ -8079,6 +8087,11 @@ class TradingEngine:
             except Exception as exc:
                 logger.debug(f"operator queue connection close failed: {exc}")
             self._operator_command_conn = None
+        # PR-65 R2 (N): drop the store reference too so a leaked
+        # post-shutdown caller (e.g. a TelegramCommandListener that
+        # races shutdown) sees the same None as a never-initialised
+        # store, instead of operating on a closed connection.
+        self.operator_command_store = None
 
 
 # ── CLI entry point ──────────────────────────────────────────────────────────

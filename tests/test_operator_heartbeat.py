@@ -133,18 +133,28 @@ class TestHeartbeatDrains:
             store.insert(
                 command_uid=uid, action="halt", reason="heartbeat test",
             )
-            # Wait up to 1s for drain.
-            deadline = time.monotonic() + 1.0
+            # Wait up to 2s for the row to reach a terminal status.
+            # PR-65 R2 (F1): the queue transitions pending → accepted →
+            # succeeded; an earlier version of this test broke on
+            # `status != "pending"` and could observe the durable
+            # intermediate `accepted` state, then assert succeeded and
+            # flake. Wait specifically for a terminal state.
+            terminal = {
+                "succeeded", "failed",
+                "rejected_expired", "rejected_unsupported_phase_a",
+                "rejected_validation",
+            }
+            deadline = time.monotonic() + 2.0
             row = None
             while time.monotonic() < deadline:
                 row = store.get_by_command_uid(uid)
-                if row.status != "pending":
+                if row is not None and row.status in terminal:
                     break
                 time.sleep(0.05)
             assert row is not None
             assert row.status == "succeeded", (
-                f"heartbeat should have drained the halt within ~200ms; "
-                f"got status={row.status}"
+                f"heartbeat should have drained the halt to a terminal "
+                f"`succeeded` within ~2s; got status={row.status}"
             )
         finally:
             engine._running = False
