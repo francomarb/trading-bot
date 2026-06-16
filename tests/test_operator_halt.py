@@ -512,7 +512,9 @@ class TestUnsupportedActions:
             (
                 uid,
                 datetime.now(timezone.utc).isoformat(),
-                "reduce-position",  # Phase C
+                # Use a deliberately-fake action so this test stays
+                # accurate across Phase A/B/C extensions of the enum.
+                "not-a-real-action",
                 "future action",
             ),
         )

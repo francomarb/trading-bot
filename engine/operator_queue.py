@@ -122,6 +122,21 @@ VALID_STATUSES = frozenset({
 # pause-strategy / resume-strategy scope the block to a single strategy
 # (the strategy name is passed in target_strategy, validated at the
 # engine handler).
+#
+# Phase C adds three destructive position-control actions:
+# - close-position: full close of one lifecycle, identified by
+#   target_position_uid. Cancels any protective stop on that position,
+#   submits a closing order via the engine (origin_kind='operator' on
+#   the substrate row), waits for fill confirmation, then releases the
+#   symbol lock.
+# - reduce-position: partial close. Same flow but the engine computes
+#   the reduce qty from the operator's --pct (carried in params_json)
+#   and updates the lifecycle's current_qty to the residual via the
+#   existing _reduce_lifecycle_for_owner_key helper.
+# - cancel-position-orders: cancel every non-terminal protective stop
+#   / exit / partial_close row for the position. Does NOT submit any
+#   new orders. Useful before a manual close or when a stale broker
+#   stop needs operator intervention.
 VALID_ACTIONS = frozenset({
     "halt",
     "resume-after-halt",
@@ -129,6 +144,9 @@ VALID_ACTIONS = frozenset({
     "resume-entries",
     "pause-strategy",
     "resume-strategy",
+    "close-position",
+    "reduce-position",
+    "cancel-position-orders",
 })
 
 
