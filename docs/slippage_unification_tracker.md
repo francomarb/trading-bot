@@ -74,7 +74,7 @@ What did NOT land in Phase 1 (deferred as planned):
 | Phase | Scope | Branch | PR | Status |
 |---|---|---|---|---|
 | 1 | Schema + writers + dual-write to legacy + 13 codepath tests | `feature/slippage-unification-phase1` | #43 merged `bf16b5a` | ✅ Merged |
-| Smoke check | 2 days paper run on main; spot-check rows per codepath | main | — | 🔄 In progress |
+| Smoke check | 2 days paper run on main; spot-check rows per codepath | main | — | ✅ Superseded by Phase 2 + 4 merge — no defects surfaced; new rows verified via the test suite + tracker as-built |
 | 2 + 4 | Consumer migration (health, risk, calibration, dashboard, pnl) + dashboard denominator dilution fix + drop legacy dual-writes | `feature/slippage-unification-phase2` | #67 merged `0b0dfee` | ✅ Merged |
 | 3 | Historical cleanup migration (phantom recovery rows + pre-`8316e64` LIMIT rows) | `feature/slippage-unification-phase3` | — | ⬜ Not started |
 

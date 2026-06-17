@@ -217,9 +217,14 @@ audit's policy-comparison numbers as a relative-mechanics study —
 adding production-equivalent costs is a known follow-up before any
 operational decision is taken on the results.
 
-Live realized slippage is logged per fill via `reporting.logger`
-(`realized_slippage_bps`, `slippage_signed_bps`) regardless of which
-research tool is run.
+Live realized slippage is logged per fill via `reporting.logger` on
+the unified taxonomy columns (`slippage_signed_bps`,
+`slippage_adverse_bps`, plus `slippage_benchmark_kind` and
+`slippage_measurement_quality` for provenance) regardless of which
+research tool is run. The legacy `realized_slippage_bps` /
+`modeled_slippage_bps` columns are NULL on new rows after the
+Phase 2 + 4 unification (PR #67) — see
+`docs/slippage_unification_design.md`.
 
 **Data feed.** Production runs on Alpaca's IEX feed (paper-account
 constraint; SIP requires paid subscription). Backtests use the same

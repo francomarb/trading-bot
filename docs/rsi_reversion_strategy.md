@@ -222,8 +222,15 @@ shifts to bar `t+1`'s open via the backtester's `_shift_for_next_open`.
 **Limit-order fill modeling.** Backtest assumes the limit order fills at
 the bar's open if `open ≤ entry_reference_price`. Production sits a
 genuine GTC limit at the price; partial fills and stale orders are
-handled by `sync_with_broker`. Live realized slippage is logged
-(`realized_slippage_bps`).
+handled by `sync_with_broker`. RSI entries are LIMIT orders, so under
+the unified slippage taxonomy (Phase 2 + 4, PR #67) they record
+`slippage_benchmark_kind='limit_price'` and
+`slippage_measurement_quality='unavailable'` with NULL on
+`slippage_signed_bps` / `slippage_adverse_bps` — arrival-price
+slippage isn't a meaningful execution-quality metric for a passive
+fill. Limit-fill execution quality versus the limit price is a
+separate (out-of-scope) metric. Stop-out fills do record adverse
+slippage against the active stop price.
 
 **Trade cadence.** The filter stack is intentionally tight and produces
 multi-month zero-trade stretches. The min-trades-for-verdict floor (8)

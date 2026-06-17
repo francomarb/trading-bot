@@ -218,8 +218,11 @@ def check_trade_log_threading(tmp_dir: str) -> int:
         reason="entry",
         stop_price=850.0,
         entry_reference_price=884.20,
-        modeled_slippage_bps=0.0,
-        realized_slippage_bps=0.0,
+        # Phase 2 + 4 (PR #67): production writers never populate
+        # the legacy columns; set None to mirror the shape every
+        # other path writes.
+        modeled_slippage_bps=None,
+        realized_slippage_bps=None,
         order_type="market",
         status="filled",
         requested_qty=10.0,

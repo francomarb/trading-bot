@@ -169,10 +169,14 @@ def test_trade_csv(tmp_dir: str, broker: AlpacaBroker) -> None:
     if rows:
         check("first row is BUY", rows[0]["side"] == "buy")
         check("second row is SELL", rows[1]["side"] == "sell")
+        # Phase 2 + 4 slippage unification (PR #67): legacy
+        # `realized_slippage_bps` is NULL on new rows. Read the
+        # unified `slippage_signed_bps` column.
+        signed = rows[0]["slippage_signed_bps"]
         check(
             "slippage populated",
-            float(rows[0]["realized_slippage_bps"]) > 0,
-            f"{rows[0]['realized_slippage_bps']} bps",
+            signed is not None and float(signed) > 0,
+            f"{signed} bps",
         )
     return csv_path
 

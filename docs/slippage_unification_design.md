@@ -1,7 +1,8 @@
 # Slippage Unification Design
 
-Status: Review draft, not implemented
-Updated: 2026-06-04
+Status: Phase 1 and Phase 2 + 4 merged; Phase 3 pending. See
+`docs/slippage_unification_tracker.md` for as-built commit history.
+Updated: 2026-06-17
 
 ## Goal
 
@@ -62,6 +63,13 @@ These changes improved correctness materially, but they did not fully unify the
 metric model or the persistence contract.
 
 ## Current-State Audit
+
+> **Reader note:** the audit subsections below describe the state of
+> the bot *before* the unification shipped (pre-2026-06-05). They
+> motivated the design and are retained for context. For "what the
+> bot does today" read the §Codepath Coverage Matrix below and
+> `docs/slippage_unification_tracker.md`.
+
 
 ### 1. Single-leg market entries
 
@@ -321,27 +329,45 @@ Column semantics:
 
 ### Legacy column treatment
 
-Keep these existing columns for compatibility:
+Three existing columns are kept on the schema for historical-row
+readability:
 
 - `entry_reference_price`
 - `modeled_slippage_bps`
 - `realized_slippage_bps`
 
-But redefine their role during migration:
+Their role as of Phase 2 + 4 (PR #67, merged 2026-06-17):
 
 - `entry_reference_price`
   - remains the strategy/entry context price for P&L and context
   - no longer treated as the slippage benchmark unless the row explicitly says
     `slippage_benchmark_kind='decision_price'`
 - `modeled_slippage_bps`
-  - legacy compatibility mirror of the current modeled/control value
+  - **historical only.** New rows write `NULL`. No reader consults
+    this column anywhere in the codebase. Phase 3 will null out
+    populated historical rows where the original benchmark was
+    bad provenance (pre-`32e21c2` recovered-context rows and
+    pre-`8316e64` LIMIT rows).
 - `realized_slippage_bps`
-  - legacy compatibility mirror of `slippage_signed_bps`
+  - **historical only.** Same status as `modeled_slippage_bps`.
+    Phase 1 (`bf16b5a`) wrote it in parallel with
+    `slippage_signed_bps`; Phase 2 + 4 (`0b0dfee`) removed the
+    dual-write so every new row is `NULL`.
 
-This gives us a clean path forward without breaking current consumers all at
-once.
+The Phase 1 strategy of "keep both columns populated while consumers
+migrate" was deliberately compressed into a single follow-up PR
+(Phase 2 + 4) so the column families never live in a "some consumers
+on old, some on new" state.
 
 ## Codepath Coverage Matrix
+
+> **Status:** the per-codepath contracts below are implemented as
+> specified. Each codepath is pinned by a test in `tests/test_reporting.py`
+> and `tests/test_engine.py`; the writer-side implementation lives
+> in `reporting/logger.py` and the call-site tagging in
+> `engine/trader.py`. See `docs/slippage_unification_tracker.md`
+> for the per-codepath status table.
+
 
 This is the key operational requirement: every codepath that can create a fill
 row must set slippage fields deliberately rather than inheriting whatever
@@ -715,28 +741,64 @@ briefly show both labels during the consumer-migration release.
 
 ## Migration Plan
 
-### Phase 1 — Additive schema and dual-write
+Implementation status as of 2026-06-17: Phase 1 and Phase 2 + 4 are
+merged. See `docs/slippage_unification_tracker.md` for as-built
+details and commit shas.
 
-- add the new slippage columns to `trades`
-- keep writing legacy slippage columns for backward compatibility
-- start dual-writing:
-  - `realized_slippage_bps` mirrors `slippage_signed_bps`
-  - `modeled_slippage_bps` continues mirroring the current modeled/control value
-- passive MLEG legs will write `NULL` instead of `0.0`; consumers using
-  `SUM(...)` / `AVG(...)` over legacy slippage columns should be audited.
-  `AVG` over `NULL` is naturally safe, but `SUM` semantics shift and any
-  weighted average that divides by `COUNT(*)` will move.
+### Phase 1 — Additive schema and dual-write ✅ MERGED (PR #43, `bf16b5a`, 2026-06-05)
 
-### Phase 2 — Consumer migration
+- added the new slippage columns to `trades`
+- kept writing legacy slippage columns for backward compatibility
+- dual-wrote:
+  - `realized_slippage_bps` mirrored `slippage_signed_bps`
+  - `modeled_slippage_bps` mirrored the modeled/control value
+- passive MLEG legs wrote `NULL` on the new columns; legacy long-leg
+  rows retained their `0.0` structural value to avoid breaking
+  consumers using `SUM(...)` / `AVG(...)` over the legacy columns
+  until those consumers migrated.
 
-- move health assessor to `slippage_adverse_bps`
-- move calibration script to `slippage_adverse_bps`
-- move dashboard recent-trades display to the new benchmark fields
-- move strategy-level average slippage to an explicit chosen field
-- fix dashboard weighted-average dilution so rows with `NULL` slippage do not
-  contribute quantity to the denominator
+### Phase 2 + 4 — Consumer migration and legacy dual-write removal ✅ MERGED (PR #67, `0b0dfee`, 2026-06-17)
 
-### Phase 3 — Historical cleanup
+Folded the original Phase 4 (legacy deprecation) into Phase 2 so the
+column families never live in a "consumers split between old and new"
+state.
+
+- health assessor (`strategies/health/assessor.py:_slippage_p95_bps`)
+  reads `slippage_adverse_bps` with a positive
+  `slippage_measurement_quality IN ('primary','fallback')` whitelist
+- calibration script (`scripts/calibrate_health_thresholds.py`)
+  mirrors the assessor query
+- risk kill switch (`risk/manager.py::record_fill_slippage`) parameter
+  renamed `realized_bps` → `adverse_bps`; engine was already clamping
+  to adverse before calling
+- dashboard Recent Trades surfaces `slippage_benchmark_kind` +
+  `slippage_measurement_quality` alongside the bps value
+- dashboard strategy stats (`compute_strategy_stats`) reads
+  `slippage_adverse_bps` with the same whitelist; numerator +
+  denominator gated on the same `.notna()` mask for both single-leg
+  and MLEG branches (denominator dilution fix); MLEG long-leg
+  `avg_fill_price > 0` workaround removed since the unified column's
+  NULL value is the structural-zero signal; column renamed
+  `Avg Adverse Slippage Bps`
+- `reporting/pnl.py` weekly / daily / `slippage_report` use the new
+  `_adverse_bps()` helper that returns `Optional[float]` and applies
+  the quality whitelist
+- forward-test reconciliation (`backtest/reconcile.py`) slippage
+  go/no-go gate migrated to the new column + whitelist (review
+  follow-up — pre-fix it read the retired legacy column and silently
+  fell back to zero on every post-Phase-2 row)
+- legacy `modeled_slippage_bps` / `realized_slippage_bps` writes
+  removed across `build_record`, `build_close_record`,
+  `log_stop_fill`, `log_spread_fill`. New rows write NULL on both
+  legacy columns
+- Phase 1 market-entry-without-`modeled_price` divergence reconciled:
+  legacy column no longer falls back to
+  `decision.entry_reference_price`
+- hot-path log line (`reporting/logger.py`) switched from
+  `slip=Nonebps` (always NULL post-Phase-4) to
+  `slip_signed=... kind=... quality=...` from the new taxonomy
+
+### Phase 3 — Historical cleanup ⬜ pending
 
 - null or annotate known-bad legacy recovery rows using a deterministic
   migration predicate:
@@ -753,11 +815,14 @@ briefly show both labels during the consumer-migration release.
 - backfill new slippage columns only where the benchmark is provably reconstructable
 - do not force speculative backfills
 
-### Phase 4 — Legacy deprecation
+### Phase 4 — Legacy deprecation ✅ FOLDED INTO PHASE 2
 
-- mark legacy `modeled_slippage_bps` / `realized_slippage_bps` columns as
-  compatibility-only
-- eventually stop using them as the source of truth
+Originally planned as "mark legacy columns compatibility-only, then
+eventually stop using them." Implemented in PR #67 as a clean drop:
+every Phase 2 consumer landed reading the new columns directly, and
+the legacy dual-writes were removed in the same PR rather than living
+on as a deprecated read path. The legacy columns remain on the schema
+to keep historical rows readable; Phase 3 cleans those up.
 
 ## Specific Current Issues This Design Resolves
 
