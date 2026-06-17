@@ -2818,6 +2818,57 @@ class TestPnLTracker:
         assert report["count"] == 5
         assert report["mean_bps"] > 0
 
+    def test_slippage_report_skips_null_rows_in_count_and_mean(
+        self, tmp_csv, tmp_daily_dir, sample_decision, sample_result,
+    ):
+        """Phase 2 slippage unification — rows with NULL
+        slippage_adverse_bps must NOT default to 0. The pre-Phase-2
+        code did `t.get("realized_slippage_bps", 0)` and silently
+        diluted the mean toward zero when a window mixed measured
+        rows with LIMIT/external-close paths that have no benchmark.
+
+        Setup: one measured market entry (>0 bps adverse against
+        the modeled 150.0 benchmark) + one LIMIT order which
+        deliberately writes NULL on the new slippage columns.
+        Report's `count` reflects only the measured row; `mean_bps`
+        equals that measured row's value, not half of it.
+        """
+        from dataclasses import replace
+        from risk.manager import RiskDecision
+        from execution.broker import OrderType, Side
+        tl = TradeLogger(path=tmp_csv)
+        # Measured market entry.
+        market_result = replace(sample_result, order_id="m-1")
+        tl.log(tl.build_record(
+            sample_decision, market_result, modeled_price=150.0,
+        ))
+        # LIMIT entry — NULL slippage on the new columns.
+        limit_decision = RiskDecision(
+            symbol="AAPL",
+            side=Side.BUY,
+            qty=10,
+            stop_price=145.0,
+            entry_reference_price=150.0,
+            strategy_name="rsi_reversion",
+            reason="rsi limit",
+            order_type=OrderType.LIMIT,
+            limit_price=149.50,
+        )
+        limit_result = replace(sample_result, order_id="l-1")
+        tl.log(tl.build_record(
+            limit_decision, limit_result, modeled_price=150.0,
+        ))
+
+        tracker = PnLTracker(
+            trade_csv_path=tmp_csv, daily_pnl_dir=tmp_daily_dir,
+        )
+        report = tracker.slippage_report(last_n=10)
+        # Count is the number of measured rows, not the row count.
+        assert report["count"] == 1
+        # Mean equals the single measured row — undiluted by the
+        # LIMIT row's NULL slippage.
+        assert report["mean_bps"] > 0
+
     def test_weekly_report_no_dailies(self, tmp_csv, tmp_daily_dir, tmp_weekly_dir):
         tracker = PnLTracker(
             trade_csv_path=tmp_csv,
