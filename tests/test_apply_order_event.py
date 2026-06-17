@@ -2319,3 +2319,254 @@ class TestExitDispatchEndToEnd:
             engine, event=event, snapshot=snapshot,
         )
         assert engine.alerts.trade_executed.call_count == first_alert_count
+
+
+class TestEntryDispatchSlippageCompleteness:
+    """Slippage Phase 2 follow-up: when the substrate observes an
+    entry_primary fill that the synchronous place_order path didn't
+    handle (UNKNOWN-at-submit then later FILLED), the dispatch must
+    fire the trade-log completeness call so the trades row carries
+    computed `slippage_signed_bps` / `slippage_adverse_bps`.
+
+    Pre-fix: `apply_order_event`'s UPSERT wrote the row with the
+    substrate's submit-time benchmark provenance (kind / quality /
+    benchmark_price) but left the computed columns NULL because
+    that math lives in `build_record` not in the substrate's
+    transactional SQL. The dispatch fired ownership / entry-price
+    cache / stop replacement / alert, but never replayed
+    `_log_entry`. The row was correct for position management and
+    wrong for accounting.
+
+    Post-fix: after `_apply_recovered_entry_side_effects` succeeds,
+    the dispatch builds an OrderResult + logging decision from the
+    substrate row and calls `_log_entry`. `tl.log`'s UPSERT policy
+    preserves the substrate's provenance fields (PRESERVE-FIRST-
+    NON-NULL) and fills in the computed signed/adverse columns
+    (LATEST-NON-NULL).
+    """
+
+    def _wire_engine(self, tmp_path, symbol: str):
+        """Build a MagicMock engine with the minimum real wiring the
+        dispatch needs: real substrate stores, real TradeLogger,
+        real dict-backed ownership, real bound `_log_entry` so the
+        substrate row's trade-log UPSERT actually executes."""
+        from unittest.mock import MagicMock
+        from engine.trader import TradingEngine
+        from reporting.logger import TradeLogger
+        from engine.lifecycle import PositionLifecycleStore
+        from engine.lifecycle_orders import PositionLifecycleOrdersStore
+
+        tl = TradeLogger(path=str(tmp_path / "trades.db"))
+        conn = tl._ensure_db()
+        pos_store = PositionLifecycleStore(conn)
+        orders_store = PositionLifecycleOrdersStore(conn)
+
+        engine = MagicMock(spec=TradingEngine)
+        engine.lifecycle_orders_store = orders_store
+        engine.lifecycle_store = pos_store
+        engine.trade_logger = tl
+        engine.alerts = MagicMock()
+        engine.risk = MagicMock()
+        # Real engine state — the dispatch reads / writes these.
+        engine._positions = {}
+        engine._entry_prices = {}
+        engine._has_position = lambda sym: sym in engine._positions
+        engine._register_single_leg = MagicMock(
+            side_effect=lambda strategy_name, symbol: engine._positions.update(
+                {symbol: object()}
+            )
+        )
+        engine._ensure_recovered_protective_stop = MagicMock()
+        engine._lookup_position_uid_for_owner = lambda key: None
+        # Bind the real side-effects helper + log_entry so the
+        # dispatch's recovered-entry path executes end-to-end.
+        engine._apply_recovered_entry_side_effects = (
+            TradingEngine._apply_recovered_entry_side_effects.__get__(engine)
+        )
+        engine._log_entry = TradingEngine._log_entry.__get__(engine)
+        return engine, tl, pos_store, orders_store
+
+    def test_entry_dispatch_fills_computed_slippage_after_substrate_write(
+        self, tmp_path,
+    ):
+        """The reviewer's exact repro. Substrate writes the row with
+        provenance + NULL computed slippage; dispatch fires and the
+        row ends with provenance preserved + computed signed/adverse
+        populated."""
+        from types import SimpleNamespace
+        from engine.lifecycle_orders import apply_order_event
+        from engine.trader import TradingEngine
+        from engine.lifecycle import new_position_uid
+        from execution.broker import BrokerSnapshot
+
+        symbol = "AAPL"
+        engine, tl, pos_store, orders_store = self._wire_engine(
+            tmp_path, symbol,
+        )
+
+        # Seed: open position with an UNKNOWN-at-submit entry order
+        # whose substrate row captured the arrival-midpoint benchmark.
+        uid = new_position_uid()
+        pos_store.create_pending(
+            position_uid=uid, symbol=symbol, owner_key=symbol,
+            strategy="sma_crossover", position_type="single_leg",
+            entry_qty=10.0,
+        )
+        orders_store.insert_pending(
+            position_uid=uid, role="entry_primary",
+            client_order_id="cli-entry-1",
+            order_type="market", order_class="simple",
+            time_in_force="day", side="buy", intended_qty=10.0,
+            intended_stop_price=95.0,
+            slippage_benchmark_price=100.0,          # arrival midpoint
+            slippage_benchmark_kind="arrival_midpoint",
+            slippage_benchmark_timestamp="2026-06-17T15:00:00+00:00",
+            slippage_measurement_quality="primary",  # substrate's tag
+        )
+        orders_store.attach_broker_order_id(
+            client_order_id="cli-entry-1", order_id="alpaca-entry-1",
+        )
+
+        # Step 1: substrate sees the fill — apply_order_event UPSERTs
+        # the trade row.
+        outcome = apply_order_event(
+            tl._ensure_db(),
+            OrderEvent(
+                order_id="alpaca-entry-1", status="filled",
+                filled_qty=10.0, avg_fill_price=100.50,  # adverse fill
+                broker_updated_at="2026-06-17T15:00:01+00:00",
+            ),
+            reason="stream",
+        )
+        assert outcome.applied is True
+        # Sanity check the pre-dispatch row state matches the reviewer's
+        # finding: provenance populated, computed slippage NULL.
+        row = tl._ensure_db().execute(
+            "SELECT slippage_benchmark_price, slippage_benchmark_kind, "
+            "slippage_measurement_quality, slippage_signed_bps, "
+            "slippage_adverse_bps FROM trades "
+            "WHERE order_id='alpaca-entry-1'"
+        ).fetchone()
+        assert row[0] == 100.0
+        assert row[1] == "arrival_midpoint"
+        assert row[2] == "primary"
+        assert row[3] is None  # signed — the gap
+        assert row[4] is None  # adverse — the gap
+
+        # Step 2: dispatch fires.
+        event = OrderEvent(
+            order_id="alpaca-entry-1", status="filled",
+            filled_qty=10.0, avg_fill_price=100.50,
+            broker_updated_at="2026-06-17T15:00:01+00:00",
+        )
+        snapshot = BrokerSnapshot(
+            account=SimpleNamespace(
+                equity=100_000.0, cash=50_000.0, buying_power=50_000.0,
+                open_positions={symbol: SimpleNamespace(
+                    qty=10.0, avg_entry_price=100.50, side="long",
+                )},
+            ),
+            open_orders=[],
+        )
+        TradingEngine._maybe_dispatch_substrate_entry_fill(
+            engine, event=event, snapshot=snapshot,
+        )
+
+        # Side effects — sanity check ownership bound, alert fired.
+        assert symbol in engine._positions
+        engine.alerts.trade_executed.assert_called_once()
+
+        # The completeness call ran. Provenance preserved by UPSERT
+        # COALESCE; computed signed/adverse filled in.
+        row = tl._ensure_db().execute(
+            "SELECT slippage_benchmark_price, slippage_benchmark_kind, "
+            "slippage_measurement_quality, slippage_signed_bps, "
+            "slippage_adverse_bps FROM trades "
+            "WHERE order_id='alpaca-entry-1'"
+        ).fetchone()
+        assert row[0] == 100.0                 # substrate price preserved
+        assert row[1] == "arrival_midpoint"    # substrate kind preserved
+        assert row[2] == "primary"             # substrate quality preserved
+        # Fill 100.50 vs benchmark 100.0 on a BUY → adverse 50 bps.
+        assert row[3] is not None
+        assert row[4] is not None
+        assert row[3] == pytest.approx(50.0, abs=0.1)
+        assert row[4] == pytest.approx(50.0, abs=0.1)
+
+    def test_entry_dispatch_with_missing_substrate_benchmark_records_null(
+        self, tmp_path,
+    ):
+        """If the substrate row's `slippage_benchmark_price` is NULL
+        (older row, or an upstream path that didn't capture one),
+        the completeness call writes NULL computed slippage —
+        recovery never fabricates a benchmark."""
+        from types import SimpleNamespace
+        from engine.lifecycle_orders import apply_order_event
+        from engine.trader import TradingEngine
+        from engine.lifecycle import new_position_uid
+        from execution.broker import BrokerSnapshot
+
+        symbol = "MSFT"
+        engine, tl, pos_store, orders_store = self._wire_engine(
+            tmp_path, symbol,
+        )
+
+        uid = new_position_uid()
+        pos_store.create_pending(
+            position_uid=uid, symbol=symbol, owner_key=symbol,
+            strategy="sma_crossover", position_type="single_leg",
+            entry_qty=5.0,
+        )
+        orders_store.insert_pending(
+            position_uid=uid, role="entry_primary",
+            client_order_id="cli-entry-no-bench",
+            order_type="market", order_class="simple",
+            time_in_force="day", side="buy", intended_qty=5.0,
+            intended_stop_price=190.0,
+            # No benchmark captured at submit — exercises the
+            # honest-NULL recovery path.
+            slippage_benchmark_price=None,
+            slippage_benchmark_kind=None,
+            slippage_measurement_quality="unavailable",
+        )
+        orders_store.attach_broker_order_id(
+            client_order_id="cli-entry-no-bench",
+            order_id="alpaca-entry-no-bench",
+        )
+        apply_order_event(
+            tl._ensure_db(),
+            OrderEvent(
+                order_id="alpaca-entry-no-bench", status="filled",
+                filled_qty=5.0, avg_fill_price=200.0,
+                broker_updated_at="2026-06-17T15:00:01+00:00",
+            ),
+            reason="stream",
+        )
+
+        event = OrderEvent(
+            order_id="alpaca-entry-no-bench", status="filled",
+            filled_qty=5.0, avg_fill_price=200.0,
+            broker_updated_at="2026-06-17T15:00:01+00:00",
+        )
+        snapshot = BrokerSnapshot(
+            account=SimpleNamespace(
+                equity=100_000.0, cash=50_000.0, buying_power=50_000.0,
+                open_positions={symbol: SimpleNamespace(
+                    qty=5.0, avg_entry_price=200.0, side="long",
+                )},
+            ),
+            open_orders=[],
+        )
+        TradingEngine._maybe_dispatch_substrate_entry_fill(
+            engine, event=event, snapshot=snapshot,
+        )
+
+        # Honest NULL on both sides — no fabricated benchmark.
+        row = tl._ensure_db().execute(
+            "SELECT slippage_benchmark_price, slippage_signed_bps, "
+            "slippage_adverse_bps FROM trades "
+            "WHERE order_id='alpaca-entry-no-bench'"
+        ).fetchone()
+        assert row[0] is None
+        assert row[1] is None
+        assert row[2] is None
