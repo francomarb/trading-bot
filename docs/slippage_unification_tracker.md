@@ -75,7 +75,7 @@ What did NOT land in Phase 1 (deferred as planned):
 |---|---|---|---|---|
 | 1 | Schema + writers + dual-write to legacy + 13 codepath tests | `feature/slippage-unification-phase1` | #43 merged `bf16b5a` | ✅ Merged |
 | Smoke check | 2 days paper run on main; spot-check rows per codepath | main | — | 🔄 In progress |
-| 2 + 4 | Consumer migration (health, risk, calibration, dashboard, pnl) + dashboard denominator dilution fix + drop legacy dual-writes | `feature/slippage-unification-phase2` | — | ✅ Merged |
+| 2 + 4 | Consumer migration (health, risk, calibration, dashboard, pnl) + dashboard denominator dilution fix + drop legacy dual-writes | `feature/slippage-unification-phase2` | #67 merged `0b0dfee` | ✅ Merged |
 | 3 | Historical cleanup migration (phantom recovery rows + pre-`8316e64` LIMIT rows) | `feature/slippage-unification-phase3` | — | ⬜ Not started |
 
 Calendar estimate: ~2 weeks total, 3 PRs.
@@ -198,9 +198,10 @@ smoke-period rows keep their new columns populated but no consumer reads them.
 
 ## Phase 2 + 4 — As-built summary
 
-Phase 2 + 4 landed on `feature/slippage-unification-phase2` as 9
-commits (commit 0 tracker kickoff + 8 logical commits). Full suite
-2712 passed.
+Phase 2 + 4 merged via PR #67 (`0b0dfee`, 2026-06-17) on
+`feature/slippage-unification-phase2` as 9 commits plus two
+review-response commits (reconcile.py gate fix + dashboard/pnl
+quality whitelist + log-line fix). Full suite 2717 passed.
 
 What landed:
 
