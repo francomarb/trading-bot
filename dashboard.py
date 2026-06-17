@@ -651,17 +651,26 @@ def compute_rolling_sharpe(
 def compute_strategy_stats(trades_df: pd.DataFrame) -> pd.DataFrame:
     """
     Compute per-strategy summary: trades, wins, win_rate, total_pnl,
-    avg_realized_slippage_bps.
+    avg_adverse_slippage_bps.
 
     Single-leg trades are fully closed positions aggregated across exit rows
     that share strategy / symbol / entry_timestamp. Multi-leg trades are
     realized-P&L close events keyed by position_id, so spreads do not need to
     mimic single-leg buy/sell shape to show up in the dashboard.
+
+    Phase 2 slippage unification: reads `slippage_adverse_bps`. The
+    weighted average uses the same `.notna()` mask for numerator and
+    denominator so rows without a slippage measurement (LIMIT entries,
+    `unavailable` external closes, MLEG long-leg structural NULLs)
+    contribute neither value nor weight. Pre-Phase 2 the denominator
+    summed all `filled_qty_num` for the exit group and silently
+    diluted the average by counting rows whose slippage was NULL /
+    zero-by-default.
     """
     if trades_df.empty or "strategy" not in trades_df.columns:
         return pd.DataFrame(columns=[
             "strategy", "trades", "wins", "win_rate",
-            "total_pnl", "avg_slippage_bps",
+            "total_pnl", "avg_adverse_slippage_bps",
         ])
 
     results = []
@@ -692,8 +701,14 @@ def compute_strategy_stats(trades_df: pd.DataFrame) -> pd.DataFrame:
                 entries["filled_qty"], errors="coerce"
             ).fillna(0.0)
             exits["realized_pnl"] = pd.to_numeric(exits["realized_pnl"], errors="coerce")
-            exits["realized_slippage_bps"] = pd.to_numeric(
-                exits["realized_slippage_bps"], errors="coerce"
+            # No fillna here — preserving NaN is what drives the
+            # denominator-dilution fix below. Rows whose slippage
+            # column is NULL (LIMIT entries, external closes, etc.)
+            # must contribute neither value nor weight to the
+            # weighted average.
+            exits["slippage_adverse_bps"] = pd.to_numeric(
+                exits.get("slippage_adverse_bps", pd.Series(index=exits.index)),
+                errors="coerce",
             )
             exits["filled_qty_num"] = pd.to_numeric(
                 exits["filled_qty"], errors="coerce"
@@ -707,11 +722,26 @@ def compute_strategy_stats(trades_df: pd.DataFrame) -> pd.DataFrame:
             ).agg(
                 realized_pnl=("realized_pnl", "sum"),
                 exit_qty=("filled_qty_num", "sum"),
+                # Numerator + denominator gated on the same notna()
+                # mask: a row with NULL slippage contributes 0 to
+                # both, so the weighted average is over the measured
+                # rows only and not diluted by the missing ones.
                 slippage_numer=(
-                    "realized_slippage_bps",
-                    lambda s: float((s.fillna(0.0) * exits.loc[s.index, "filled_qty_num"]).sum()),
+                    "slippage_adverse_bps",
+                    lambda s: float(
+                        (s * exits.loc[s.index, "filled_qty_num"])
+                        .where(s.notna())
+                        .sum()
+                    ),
                 ),
-                slippage_denom=("filled_qty_num", "sum"),
+                slippage_denom=(
+                    "slippage_adverse_bps",
+                    lambda s: float(
+                        exits.loc[s.index, "filled_qty_num"]
+                        .where(s.notna())
+                        .sum()
+                    ),
+                ),
             )
             grouped = grouped.join(entry_groups, how="inner")
             grouped = grouped[
@@ -732,9 +762,6 @@ def compute_strategy_stats(trades_df: pd.DataFrame) -> pd.DataFrame:
             mleg_exits["realized_pnl"] = pd.to_numeric(
                 mleg_exits["realized_pnl"], errors="coerce"
             )
-            mleg_exits["realized_slippage_bps"] = pd.to_numeric(
-                mleg_exits["realized_slippage_bps"], errors="coerce"
-            ).fillna(0.0)
             mleg_exits["filled_qty_num"] = pd.to_numeric(
                 mleg_exits["filled_qty"], errors="coerce"
             ).fillna(0.0)
@@ -746,35 +773,42 @@ def compute_strategy_stats(trades_df: pd.DataFrame) -> pd.DataFrame:
             mleg_grouped = mleg_grouped[mleg_grouped["realized_pnl"].notna()]
             pnls.extend(mleg_grouped["realized_pnl"].fillna(0.0).tolist())
 
-            # For completed MLEG positions, include the economic short-leg
-            # rows from both entry and close. The long-leg rows carry
-            # avg_fill_price=0.0 because the combo net economics live on the
-            # short-leg row.
+            # For completed MLEG positions, include both entry and
+            # close rows. The long-leg row writes NULL on
+            # slippage_adverse_bps under Phase 1 codepath §11; the
+            # short leg carries the economic combo_limit measurement.
+            # The same .notna() mask used below excludes the long-leg
+            # rows naturally — no need for the pre-Phase 2 avg_fill_
+            # price>0 workaround that special-cased the structural-zero
+            # row.
             completed_ids = set(mleg_grouped.index)
             position_ids = group.get("position_id", pd.Series(index=group.index))
             mleg_slippage_rows = group[
                 is_mleg & position_ids.isin(completed_ids)
             ].copy()
             if not mleg_slippage_rows.empty:
-                mleg_slippage_rows["avg_fill_price_num"] = pd.to_numeric(
-                    mleg_slippage_rows["avg_fill_price"], errors="coerce"
-                ).fillna(0.0)
-                mleg_slippage_rows["realized_slippage_bps"] = pd.to_numeric(
-                    mleg_slippage_rows["realized_slippage_bps"], errors="coerce"
-                ).fillna(0.0)
+                mleg_slippage_rows["slippage_adverse_bps"] = pd.to_numeric(
+                    mleg_slippage_rows.get(
+                        "slippage_adverse_bps",
+                        pd.Series(index=mleg_slippage_rows.index),
+                    ),
+                    errors="coerce",
+                )
                 mleg_slippage_rows["filled_qty_num"] = pd.to_numeric(
                     mleg_slippage_rows["filled_qty"], errors="coerce"
                 ).fillna(0.0)
-                mleg_slippage_rows = mleg_slippage_rows[
-                    mleg_slippage_rows["avg_fill_price_num"] > 0
-                ]
+                mask = mleg_slippage_rows["slippage_adverse_bps"].notna()
                 slippage_numer += float(
                     (
-                        mleg_slippage_rows["realized_slippage_bps"]
+                        mleg_slippage_rows["slippage_adverse_bps"]
                         * mleg_slippage_rows["filled_qty_num"]
-                    ).sum()
+                    )
+                    .where(mask)
+                    .sum()
                 )
-                slippage_denom += float(mleg_slippage_rows["filled_qty_num"].sum())
+                slippage_denom += float(
+                    mleg_slippage_rows["filled_qty_num"].where(mask).sum()
+                )
 
         wins = sum(1 for p in pnls if p > 0)
         trade_count = len(pnls)
@@ -788,7 +822,7 @@ def compute_strategy_stats(trades_df: pd.DataFrame) -> pd.DataFrame:
             "wins": wins,
             "win_rate": win_rate,
             "total_pnl": total_pnl,
-            "avg_slippage_bps": avg_slip,
+            "avg_adverse_slippage_bps": avg_slip,
         })
 
     return pd.DataFrame(results)
@@ -1495,7 +1529,7 @@ def render_dashboard() -> None:
             "wins": "Wins",
             "win_rate": "Win Rate",
             "total_pnl": "Total P&L",
-            "avg_slippage_bps": "Avg Slippage Bps",
+            "avg_adverse_slippage_bps": "Avg Adverse Slippage Bps",
         })
         display["Win Rate"] = display["Win Rate"] * 100.0
         st.dataframe(
@@ -1507,7 +1541,9 @@ def render_dashboard() -> None:
                 "Wins": st.column_config.NumberColumn(format="%d"),
                 "Win Rate": st.column_config.NumberColumn(format="%.1f%%"),
                 "Total P&L": st.column_config.NumberColumn(format="$%.2f"),
-                "Avg Slippage Bps": st.column_config.NumberColumn(format="%.1f bps"),
+                "Avg Adverse Slippage Bps": st.column_config.NumberColumn(
+                    format="%.1f bps",
+                ),
             },
         )
 
