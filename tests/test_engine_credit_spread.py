@@ -313,7 +313,13 @@ class TestDrainSpreadFills:
             if r["symbol"] == "SPY260618P00568000"
         ][0]
         assert short_row["entry_reference_price"] == pytest.approx(1.45)
-        assert short_row["realized_slippage_bps"] == pytest.approx(-344.83)
+        # Phase 2: slippage measurement lives in the new taxonomy
+        # column; legacy realized_slippage_bps is no longer written.
+        assert short_row["realized_slippage_bps"] is None
+        assert short_row["slippage_signed_bps"] == pytest.approx(-344.83)
+        # Opening credit 1.50 above limit 1.45 → price improvement,
+        # adverse-only column clamps to 0.
+        assert short_row["slippage_adverse_bps"] == pytest.approx(0.0)
 
     def test_open_canceled_rolls_back(self, tmp_path):
         strategy = _strategy()
@@ -389,7 +395,11 @@ class TestDrainSpreadFills:
         ]
         assert len(close_rows) == 1
         assert close_rows[0]["entry_reference_price"] == pytest.approx(0.60)
-        assert close_rows[0]["realized_slippage_bps"] == pytest.approx(500.0)
+        # Phase 2: slippage measurement on the new taxonomy column.
+        assert close_rows[0]["realized_slippage_bps"] is None
+        assert close_rows[0]["slippage_signed_bps"] == pytest.approx(500.0)
+        # Close debit 0.63 above submitted limit 0.60 → adverse.
+        assert close_rows[0]["slippage_adverse_bps"] == pytest.approx(500.0)
 
     def test_close_filled_with_no_allocator_still_logs_pnl(self, tmp_path):
         strategy = _strategy()

@@ -223,7 +223,7 @@ Branch: `feature/slippage-unification-phase2`
 | 4 | Dashboard Recent Trades surfaces `slippage_benchmark_kind` + `slippage_measurement_quality` | + `load_trades` empty-frame columns | ✅ |
 | 5 | Dashboard `compute_strategy_stats` → `slippage_adverse_bps`; numerator + denominator from same `.notna()` mask | rename column to `Avg Adverse Slippage Bps`; MLEG branch parallel | ✅ |
 | 6 | `reporting/pnl.py` weekly/daily/slippage reports → `slippage_adverse_bps`; skip NULL rows | no silent zero-defaults | ✅ |
-| 7 | Drop legacy dual-writes across writers; reconcile Phase 1 divergence; swap parity tests for no-legacy tests | + MLEG long-leg legacy-NULL test | ⬜ |
+| 7 | Drop legacy dual-writes across writers; reconcile Phase 1 divergence; swap parity tests for no-legacy tests | + MLEG long-leg legacy-NULL test | ✅ |
 | 8 | Tracker + PLAN.md sync | mark Phase 2+4 ✅; P1 row updated | ⬜ |
 
 ---
