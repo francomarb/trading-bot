@@ -99,7 +99,16 @@ def db_conn(tmp_path: Path):
 _SLIPPAGE_OID_COUNTER = [0]
 
 
-def _seed_slippage_trade(conn, *, strategy, timestamp, realized, modeled):
+def _seed_slippage_trade(
+    conn, *, strategy, timestamp, adverse_bps, measurement_quality="primary",
+):
+    """Seed a row matching the Phase 2 collector query.
+
+    `adverse_bps=None` seeds NULL (the IS NOT NULL filter excludes it).
+    `measurement_quality` defaults to 'primary' so calibration includes
+    the row; pass 'recovered' / 'unavailable' / anything else to verify
+    the whitelist filter excludes it.
+    """
     # Foundation §6.5 partial UNIQUE on trades.order_id within single_leg
     # scope means every fixture row needs a distinct order_id, or the
     # preflight fires on _ensure_db.
@@ -109,11 +118,14 @@ def _seed_slippage_trade(conn, *, strategy, timestamp, realized, modeled):
         "INSERT INTO trades ("
         "timestamp, symbol, side, qty, avg_fill_price, order_id, "
         "strategy, reason, stop_price, entry_reference_price, "
-        "modeled_slippage_bps, realized_slippage_bps, "
+        "slippage_signed_bps, slippage_adverse_bps, slippage_measurement_quality, "
         "order_type, status, requested_qty, filled_qty"
         ") VALUES (?, 'X', 'sell', 1.0, 100.0, ?, ?, 'exit', "
-        "95.0, 100.0, ?, ?, 'market', 'filled', 1.0, 1.0)",
-        (timestamp, oid, strategy, modeled, realized),
+        "95.0, 100.0, ?, ?, ?, 'market', 'filled', 1.0, 1.0)",
+        (
+            timestamp, oid, strategy,
+            adverse_bps, adverse_bps, measurement_quality,
+        ),
     )
     conn.commit()
 
@@ -126,39 +138,32 @@ class TestSlippageCollector:
         )
         assert out == []
 
-    def test_returns_adverse_delta_only(self, db_conn):
-        """Adverse-only semantics: only positive `realized - modeled`
-        contributes to the calibration sample. Price improvement
-        (negative `realized - modeled`) clamps to 0. Mirrors the live
-        L2 check's `max(0, realized - modeled)` so calibration learns
-        from the same distribution the assessor sees."""
-        for ts, realized, modeled in [
-            ("2026-04-15T10:00:00", 5.0, 5.0),     # zero drift → 0
-            ("2026-04-16T10:00:00", 35.0, 5.0),    # adverse +30 → 30
-            ("2026-04-17T10:00:00", -95.0, 5.0),   # price-improvement → 0
-            ("2026-04-18T10:00:00", 105.0, 5.0),   # adverse +100 → 100
+    def test_returns_adverse_values(self, db_conn):
+        """Phase 2: the column is already adverse-clamped by the
+        writer, so the collector just emits the column value."""
+        for ts, adverse in [
+            ("2026-04-15T10:00:00", 0.0),
+            ("2026-04-16T10:00:00", 30.0),
+            ("2026-04-17T10:00:00", 0.0),
+            ("2026-04-18T10:00:00", 100.0),
         ]:
             _seed_slippage_trade(
-                db_conn, strategy="x", timestamp=ts,
-                realized=realized, modeled=modeled,
+                db_conn, strategy="x", timestamp=ts, adverse_bps=adverse,
             )
         out = _collect_slippage_observations(
             db_conn, "x",
             start=date(2026, 4, 1), end=date(2026, 5, 1),
         )
-        # Adverse-only: two zeros + two adverse drifts; the -95 row
-        # (which the old abs() formula would have counted as 100)
-        # contributes 0 under the new semantics.
         assert sorted(out) == [0.0, 0.0, 30.0, 100.0]
 
     def test_excludes_other_strategies(self, db_conn):
         _seed_slippage_trade(
             db_conn, strategy="A", timestamp="2026-04-15T10:00:00",
-            realized=35.0, modeled=5.0,
+            adverse_bps=30.0,
         )
         _seed_slippage_trade(
             db_conn, strategy="B", timestamp="2026-04-15T10:00:00",
-            realized=200.0, modeled=5.0,
+            adverse_bps=195.0,
         )
         out = _collect_slippage_observations(
             db_conn, "A",
@@ -166,40 +171,59 @@ class TestSlippageCollector:
         )
         assert out == [30.0]
 
-    def test_excludes_recovered_context_rows(self, db_conn):
-        """Reviewer P2 #1: calibration must apply the same defensive
-        filter as the live L2 check. Legacy recovered-entry-context
-        rows carry phantom slippage (1200+ bps) that would skew the
-        proposed WATCH/DEGRADED/BROKEN thresholds upward — even though
-        the live assessor learned to skip them in PR #37."""
+    def test_excludes_recovered_quality_rows(self, db_conn):
+        """Phase 2: calibration applies the same quality whitelist
+        as `strategies/health/assessor.py:_slippage_p95_bps`. Rows
+        tagged `recovered` (codepaths §5/§8/§9 — benchmark
+        reconstructed from broker history) carry honest but
+        synthetic measurements and shouldn't skew threshold
+        proposals."""
         _seed_slippage_trade(
             db_conn, strategy="x", timestamp="2026-04-15T10:00:00",
-            realized=10.0, modeled=5.0,  # clean fill, delta=5
+            adverse_bps=5.0,
         )
-        # Mimic the legacy recovered-context shape: same columns, but
-        # `reason` carries the marker the engine's recovery path used to
-        # write. Use the raw INSERT so we can override the `reason`
-        # column (the helper hardcodes 'exit').
-        db_conn.execute(
-            "INSERT INTO trades ("
-            "timestamp, symbol, side, qty, avg_fill_price, order_id, "
-            "strategy, reason, stop_price, entry_reference_price, "
-            "modeled_slippage_bps, realized_slippage_bps, "
-            "order_type, status, requested_qty, filled_qty"
-            ") VALUES ('2026-04-16T10:00:00', 'X', 'buy', 1.0, 100.0, "
-            "'oid', 'x', 'x recovered entry context', 95.0, 100.0, "
-            "0.0, 1205.3, 'market', 'filled', 1.0, 1.0)"
+        _seed_slippage_trade(
+            db_conn, strategy="x", timestamp="2026-04-16T10:00:00",
+            adverse_bps=1205.3, measurement_quality="recovered",
         )
-        db_conn.commit()
         out = _collect_slippage_observations(
             db_conn, "x",
             start=date(2026, 4, 1), end=date(2026, 5, 1),
         )
-        # Only the clean fill survives — the phantom 1205.3 bps row is
-        # excluded by the defensive `reason NOT LIKE` filter. Without
-        # the filter, calibration would learn p90/p95/p99 from a sample
-        # of [5.0, 1205.3] and propose massively inflated thresholds.
+        # Only the primary-quality fill survives.
         assert out == [5.0]
+
+    def test_excludes_unknown_quality_rows(self, db_conn):
+        """Quality whitelist fails closed — any future enum (or a
+        typo) is excluded until explicitly opted in."""
+        _seed_slippage_trade(
+            db_conn, strategy="x", timestamp="2026-04-15T10:00:00",
+            adverse_bps=5.0,
+        )
+        _seed_slippage_trade(
+            db_conn, strategy="x", timestamp="2026-04-16T10:00:00",
+            adverse_bps=900.0, measurement_quality="some_future_tier",
+        )
+        out = _collect_slippage_observations(
+            db_conn, "x",
+            start=date(2026, 4, 1), end=date(2026, 5, 1),
+        )
+        assert out == [5.0]
+
+    def test_fallback_quality_rows_are_included(self, db_conn):
+        """`fallback` is whitelisted alongside `primary` — SMA /
+        Donchian market entries that benchmark against the latest
+        close are honest execution measurements and must contribute
+        to calibration."""
+        _seed_slippage_trade(
+            db_conn, strategy="x", timestamp="2026-04-15T10:00:00",
+            adverse_bps=80.0, measurement_quality="fallback",
+        )
+        out = _collect_slippage_observations(
+            db_conn, "x",
+            start=date(2026, 4, 1), end=date(2026, 5, 1),
+        )
+        assert out == [80.0]
 
 
 class TestDriftCollector:
@@ -270,8 +294,7 @@ class TestCalibrate:
             _seed_slippage_trade(
                 db_conn, strategy="x",
                 timestamp=f"2026-04-{day:02d}T10:00:00",
-                realized=5.0 + i * 2.0,
-                modeled=5.0,
+                adverse_bps=float(i * 2),
             )
         out = calibrate(
             db_conn, strategy_name="x", weeks=4,
@@ -358,8 +381,7 @@ class TestMainExitCode:
                 _seed_slippage_trade(
                     conn, strategy="x",
                     timestamp=f"2026-04-{day:02d}T10:00:00",
-                    realized=5.0 + i,
-                    modeled=5.0,
+                    adverse_bps=float(i),
                 )
         finally:
             tl.close()
