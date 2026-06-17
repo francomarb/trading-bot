@@ -364,6 +364,17 @@ class TestRefreshMultiLegPositions:
 
 class TestComputeEquityCurve:
     def _make_df(self, rows: list[dict]) -> pd.DataFrame:
+        # Phase 2 default: rows that carry a measured slippage_adverse_bps
+        # but no explicit quality tag default to 'primary' (calibration-
+        # grade), matching what production writers emit. Tests that
+        # need to exercise the quality whitelist set quality explicitly
+        # (`recovered`, `unavailable`, or some other tier).
+        for row in rows:
+            if (
+                "slippage_adverse_bps" in row
+                and "slippage_measurement_quality" not in row
+            ):
+                row["slippage_measurement_quality"] = "primary"
         df = pd.DataFrame(rows)
         if "timestamp" in df.columns:
             df["timestamp"] = pd.to_datetime(df["timestamp"], utc=True)
@@ -562,6 +573,17 @@ class TestComputeRollingSharpe:
 
 class TestComputeStrategyStats:
     def _make_df(self, rows: list[dict]) -> pd.DataFrame:
+        # Phase 2 default: rows that carry a measured slippage_adverse_bps
+        # but no explicit quality tag default to 'primary' (calibration-
+        # grade), matching what production writers emit. Tests that
+        # need to exercise the quality whitelist set quality explicitly
+        # (`recovered`, `unavailable`, or some other tier).
+        for row in rows:
+            if (
+                "slippage_adverse_bps" in row
+                and "slippage_measurement_quality" not in row
+            ):
+                row["slippage_measurement_quality"] = "primary"
         df = pd.DataFrame(rows)
         if "timestamp" in df.columns:
             df["timestamp"] = pd.to_datetime(df["timestamp"], utc=True)
@@ -796,6 +818,116 @@ class TestComputeStrategyStats:
         # (40*2 + 60*2) / (2 + 2) = 50.0. Long-leg NULLs excluded
         # naturally by the .notna() mask — not by the legacy
         # avg_fill_price > 0 workaround.
+        assert row["avg_adverse_slippage_bps"] == pytest.approx(50.0)
+
+    def test_recovered_quality_rows_excluded_from_strategy_average(self):
+        """Phase 2 quality whitelist regression guard. Pre-fix the
+        dashboard gated on `slippage_adverse_bps.notna()` alone, so a
+        recovered-quality row (e.g. broker-history reconstructed stop
+        fill) with a huge adverse value would pollute the operator-
+        facing Avg Adverse Slippage Bps even though health /
+        calibration / reconcile / pnl all exclude it.
+
+        Setup: trade A with measured 50 bps adverse (primary) + trade
+        B with recovered 999 bps adverse. Pre-fix avg would be
+        ~525 bps. Post-fix only trade A contributes — avg = 50 bps."""
+        df = self._make_df([
+            # Trade A — measured.
+            {"symbol": "AAPL", "side": "buy", "strategy": "sma_crossover",
+             "avg_fill_price": "100.0", "filled_qty": "10", "qty": "10",
+             "slippage_adverse_bps": None, "timestamp": _ts(0),
+             "entry_timestamp": _ts(0)},
+            {"symbol": "AAPL", "side": "sell", "strategy": "sma_crossover",
+             "avg_fill_price": "110.0", "filled_qty": "10", "qty": "10",
+             "slippage_adverse_bps": "50.0",
+             "slippage_measurement_quality": "primary",
+             "timestamp": _ts(1),
+             "entry_timestamp": _ts(0), "realized_pnl": "100.0"},
+            # Trade B — recovered (reconstructed from broker history).
+            {"symbol": "MSFT", "side": "buy", "strategy": "sma_crossover",
+             "avg_fill_price": "200.0", "filled_qty": "10", "qty": "10",
+             "slippage_adverse_bps": None, "timestamp": _ts(2),
+             "entry_timestamp": _ts(2)},
+            {"symbol": "MSFT", "side": "sell", "strategy": "sma_crossover",
+             "avg_fill_price": "210.0", "filled_qty": "10", "qty": "10",
+             "slippage_adverse_bps": "999.0",
+             "slippage_measurement_quality": "recovered",
+             "timestamp": _ts(3),
+             "entry_timestamp": _ts(2), "realized_pnl": "100.0"},
+        ])
+        stats = compute_strategy_stats(df)
+        row = stats.iloc[0]
+        assert row["trades"] == 2
+        # Only the primary-quality row contributes. Avg = 50 bps. The
+        # recovered 999 bps row is excluded from BOTH numerator and
+        # denominator — without this it would have pulled the average
+        # to ~525 bps.
+        assert row["avg_adverse_slippage_bps"] == pytest.approx(50.0)
+
+    def test_mleg_recovered_quality_short_leg_excluded(self):
+        """Same regression guard on the MLEG branch — a recovered
+        short-leg row with a huge value must not pollute the
+        weighted average."""
+        df = self._make_df([
+            # spread-1: measured short-leg pair.
+            {"symbol": "SPY260618P00714000", "side": "sell", "strategy": "credit_spread",
+             "avg_fill_price": "1.50", "filled_qty": "2", "qty": "2",
+             "slippage_adverse_bps": "40.0",
+             "slippage_measurement_quality": "primary",
+             "timestamp": _ts(0),
+             "position_id": "spread-1", "position_type": "spread",
+             "reason": "spread entry"},
+            {"symbol": "SPY260618P00704000", "side": "buy", "strategy": "credit_spread",
+             "avg_fill_price": "0", "filled_qty": "2", "qty": "2",
+             "slippage_adverse_bps": None, "timestamp": _ts(0),
+             "position_id": "spread-1", "position_type": "spread",
+             "reason": "spread entry"},
+            {"symbol": "SPY260618P00714000", "side": "buy", "strategy": "credit_spread",
+             "avg_fill_price": "0.63", "filled_qty": "2", "qty": "2",
+             "slippage_adverse_bps": "60.0",
+             "slippage_measurement_quality": "primary",
+             "timestamp": _ts(1),
+             "position_id": "spread-1", "position_type": "spread",
+             "reason": "spread exit", "realized_pnl": "174.0"},
+            {"symbol": "SPY260618P00704000", "side": "sell", "strategy": "credit_spread",
+             "avg_fill_price": "0", "filled_qty": "2", "qty": "2",
+             "slippage_adverse_bps": None, "timestamp": _ts(1),
+             "position_id": "spread-1", "position_type": "spread",
+             "reason": "spread exit"},
+            # spread-2: recovered short-leg pair (reconstructed
+            # spread close) carrying a huge 999 bps adverse value.
+            {"symbol": "SPY260620P00714000", "side": "sell", "strategy": "credit_spread",
+             "avg_fill_price": "1.50", "filled_qty": "2", "qty": "2",
+             "slippage_adverse_bps": "999.0",
+             "slippage_measurement_quality": "recovered",
+             "timestamp": _ts(2),
+             "position_id": "spread-2", "position_type": "spread",
+             "reason": "spread entry"},
+            {"symbol": "SPY260620P00704000", "side": "buy", "strategy": "credit_spread",
+             "avg_fill_price": "0", "filled_qty": "2", "qty": "2",
+             "slippage_adverse_bps": None, "timestamp": _ts(2),
+             "position_id": "spread-2", "position_type": "spread",
+             "reason": "spread entry"},
+            {"symbol": "SPY260620P00714000", "side": "buy", "strategy": "credit_spread",
+             "avg_fill_price": "0.63", "filled_qty": "2", "qty": "2",
+             "slippage_adverse_bps": "999.0",
+             "slippage_measurement_quality": "recovered",
+             "timestamp": _ts(3),
+             "position_id": "spread-2", "position_type": "spread",
+             "reason": "spread exit", "realized_pnl": "174.0"},
+            {"symbol": "SPY260620P00704000", "side": "sell", "strategy": "credit_spread",
+             "avg_fill_price": "0", "filled_qty": "2", "qty": "2",
+             "slippage_adverse_bps": None, "timestamp": _ts(3),
+             "position_id": "spread-2", "position_type": "spread",
+             "reason": "spread exit"},
+        ])
+        stats = compute_strategy_stats(df)
+        row = stats[stats["strategy"] == "credit_spread"].iloc[0]
+        assert row["trades"] == 2
+        # Only spread-1's primary short-leg rows contribute. Avg =
+        # (40*2 + 60*2) / (2 + 2) = 50.0. Without the whitelist the
+        # recovered 999 bps rows on spread-2 would push the average
+        # toward 524.5.
         assert row["avg_adverse_slippage_bps"] == pytest.approx(50.0)
 
     def test_single_leg_avg_adverse_slippage_excludes_null_rows(self):

@@ -648,6 +648,9 @@ def compute_rolling_sharpe(
     return sharpe
 
 
+_CALIBRATION_GRADE_QUALITIES = ("primary", "fallback")
+
+
 def compute_strategy_stats(trades_df: pd.DataFrame) -> pd.DataFrame:
     """
     Compute per-strategy summary: trades, wins, win_rate, total_pnl,
@@ -658,14 +661,21 @@ def compute_strategy_stats(trades_df: pd.DataFrame) -> pd.DataFrame:
     realized-P&L close events keyed by position_id, so spreads do not need to
     mimic single-leg buy/sell shape to show up in the dashboard.
 
-    Phase 2 slippage unification: reads `slippage_adverse_bps`. The
-    weighted average uses the same `.notna()` mask for numerator and
-    denominator so rows without a slippage measurement (LIMIT entries,
-    `unavailable` external closes, MLEG long-leg structural NULLs)
-    contribute neither value nor weight. Pre-Phase 2 the denominator
-    summed all `filled_qty_num` for the exit group and silently
-    diluted the average by counting rows whose slippage was NULL /
-    zero-by-default.
+    Phase 2 slippage unification: reads `slippage_adverse_bps` and
+    applies the same positive quality whitelist used by health /
+    calibration / reconcile / pnl (`slippage_measurement_quality IN
+    ('primary', 'fallback')`). Rows whose quality is not in the
+    whitelist (`recovered`, `unavailable`, future enums) are masked
+    to NaN before aggregation so reconstructed or synthetic
+    measurements don't pollute the operator-facing strategy-level
+    average.
+
+    The weighted average uses the same `.notna()` mask (post-whitelist)
+    for numerator and denominator so rows without a calibration-grade
+    measurement contribute neither value nor weight. Pre-Phase 2 the
+    denominator summed all `filled_qty_num` for the exit group and
+    silently diluted the average by counting rows whose slippage was
+    NULL / zero-by-default.
     """
     if trades_df.empty or "strategy" not in trades_df.columns:
         return pd.DataFrame(columns=[
@@ -706,9 +716,22 @@ def compute_strategy_stats(trades_df: pd.DataFrame) -> pd.DataFrame:
             # column is NULL (LIMIT entries, external closes, etc.)
             # must contribute neither value nor weight to the
             # weighted average.
-            exits["slippage_adverse_bps"] = pd.to_numeric(
+            #
+            # Phase 2 quality whitelist: also mask to NaN any row
+            # whose measurement_quality isn't 'primary' or 'fallback'
+            # so recovered/unavailable rows (reconstructed or
+            # synthetic measurements) don't pollute the strategy
+            # average, matching health / calibration / reconcile / pnl.
+            adverse_series = pd.to_numeric(
                 exits.get("slippage_adverse_bps", pd.Series(index=exits.index)),
                 errors="coerce",
+            )
+            exit_quality = exits.get(
+                "slippage_measurement_quality",
+                pd.Series(index=exits.index, dtype=object),
+            )
+            exits["slippage_adverse_bps"] = adverse_series.where(
+                exit_quality.isin(_CALIBRATION_GRADE_QUALITIES)
             )
             exits["filled_qty_num"] = pd.to_numeric(
                 exits["filled_qty"], errors="coerce"
@@ -787,12 +810,22 @@ def compute_strategy_stats(trades_df: pd.DataFrame) -> pd.DataFrame:
                 is_mleg & position_ids.isin(completed_ids)
             ].copy()
             if not mleg_slippage_rows.empty:
-                mleg_slippage_rows["slippage_adverse_bps"] = pd.to_numeric(
+                mleg_adverse = pd.to_numeric(
                     mleg_slippage_rows.get(
                         "slippage_adverse_bps",
                         pd.Series(index=mleg_slippage_rows.index),
                     ),
                     errors="coerce",
+                )
+                mleg_quality = mleg_slippage_rows.get(
+                    "slippage_measurement_quality",
+                    pd.Series(index=mleg_slippage_rows.index, dtype=object),
+                )
+                # Phase 2 quality whitelist — same shape as the
+                # single-leg branch above. Recovered / unavailable
+                # MLEG rows are masked out of the strategy average.
+                mleg_slippage_rows["slippage_adverse_bps"] = mleg_adverse.where(
+                    mleg_quality.isin(_CALIBRATION_GRADE_QUALITIES)
                 )
                 mleg_slippage_rows["filled_qty_num"] = pd.to_numeric(
                     mleg_slippage_rows["filled_qty"], errors="coerce"

@@ -1083,10 +1083,21 @@ class TradeLogger:
                 list(d.values()),
             )
         conn.commit()
+        # Phase 2 slippage unification: log the signed bps from the new
+        # taxonomy column (writer-clamped adverse value is available too,
+        # but signed carries the price-improvement / adverse distinction
+        # operators care about during paper review) plus the benchmark
+        # kind + measurement quality so operators can audit the row
+        # without cross-referencing the design doc. Legacy
+        # realized_slippage_bps is NULL on every new row and would
+        # always log as `slip=Nonebps`.
+        signed = record.slippage_signed_bps
+        kind = record.slippage_benchmark_kind or "unknown"
+        quality = record.slippage_measurement_quality or "unknown"
         logger.info(
             f"trade logged: {record.side} {record.qty} {record.symbol} "
             f"@ ${record.avg_fill_price} [{record.strategy}] "
-            f"slip={record.realized_slippage_bps}bps"
+            f"slip_signed={signed}bps kind={kind} quality={quality}"
         )
 
     def read_all(self) -> list[dict]:

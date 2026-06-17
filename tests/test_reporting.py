@@ -2956,6 +2956,67 @@ class TestPnLTracker:
         assert report["count"] == 5
         assert report["mean_bps"] > 0
 
+    def test_slippage_report_excludes_recovered_quality_rows(
+        self, tmp_csv, tmp_daily_dir, sample_decision, sample_result,
+    ):
+        """Phase 2 quality-whitelist regression guard.
+
+        `_adverse_bps()` must gate on `slippage_measurement_quality
+        IN ('primary','fallback')`, mirroring health / calibration /
+        reconcile / dashboard. Pre-fix the helper only skipped
+        NULL/non-numeric values, so a `recovered` row (e.g.
+        reconstructed stop fill from broker history) with a huge
+        adverse value would still flow into operator-facing weekly
+        / daily / `slippage_report` outputs.
+
+        Setup: one primary market entry (small adverse) + one
+        manually-seeded recovered row with adverse 999 bps. Expected:
+        the recovered row contributes nothing; count == 1, mean ==
+        the primary row's adverse value.
+        """
+        from dataclasses import replace
+        from reporting.logger import TradeRecord
+
+        tl = TradeLogger(path=tmp_csv)
+        # Measured market entry — flows through normal build_record so
+        # it carries primary quality + a small computed adverse value.
+        market_result = replace(sample_result, order_id="m-primary")
+        primary_record = tl.build_record(
+            sample_decision, market_result, modeled_price=150.0,
+        )
+        tl.log(primary_record)
+
+        # Recovered row — bypass build_record to plant a row with
+        # quality='recovered' and a huge adverse value. Pre-fix
+        # `_adverse_bps` would have accepted it.
+        recovered = TradeRecord(
+            timestamp="2026-04-15T10:00:00+00:00",
+            symbol="MSFT", side="buy", qty=10, avg_fill_price=200.0,
+            order_id="m-recovered",
+            strategy="sma_crossover", reason="recovered entry context",
+            stop_price=195.0, entry_reference_price=200.0,
+            modeled_slippage_bps=None, realized_slippage_bps=None,
+            order_type="market", status="filled",
+            requested_qty=10, filled_qty=10,
+            slippage_signed_bps=999.0,
+            slippage_adverse_bps=999.0,
+            slippage_measurement_quality="recovered",
+            slippage_benchmark_kind="arrival_midpoint",
+        )
+        tl.log(recovered)
+
+        tracker = PnLTracker(
+            trade_csv_path=tmp_csv, daily_pnl_dir=tmp_daily_dir,
+        )
+        report = tracker.slippage_report(last_n=10)
+        # Only the primary row participates. Without the quality
+        # whitelist the recovered 999 bps row would push mean toward
+        # ~500.
+        assert report["count"] == 1
+        primary_signed = primary_record.slippage_adverse_bps
+        assert report["mean_bps"] == pytest.approx(primary_signed, abs=0.01)
+        assert report["max_bps"] == pytest.approx(primary_signed, abs=0.01)
+
     def test_slippage_report_skips_null_rows_in_count_and_mean(
         self, tmp_csv, tmp_daily_dir, sample_decision, sample_result,
     ):

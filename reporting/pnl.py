@@ -37,17 +37,31 @@ from config import settings
 
 
 _SLIPPAGE_COLUMN = "slippage_adverse_bps"
+_QUALITY_COLUMN = "slippage_measurement_quality"
+_CALIBRATION_GRADE_QUALITIES = frozenset({"primary", "fallback"})
 
 
 def _adverse_bps(trade: dict) -> float | None:
-    """Return adverse slippage for a trade row, or None when unmeasured.
+    """Return adverse slippage for a trade row, or None when the row
+    isn't calibration-grade.
 
     Phase 2 slippage unification: reads `slippage_adverse_bps` from
-    the trade row. A NULL / missing / non-numeric value means the row
-    has no honest measurement and must be skipped — defaulting to 0
-    silently dilutes operator-facing means (the bug the tracker
-    flagged when this migration was scoped).
+    the trade row and gates on the same positive quality whitelist
+    used by health / calibration / reconcile / dashboard
+    (`slippage_measurement_quality IN ('primary', 'fallback')`).
+
+    Returns None for:
+      - NULL / missing / non-numeric slippage values, OR
+      - rows whose quality is not in the whitelist (`recovered`,
+        `unavailable`, future enums, or a typo).
+
+    Both conditions mean the row has no honest measurement and must
+    be skipped — defaulting to 0 silently dilutes operator-facing
+    means; including reconstructed (`recovered`) measurements
+    pollutes reports with non-live-execution evidence.
     """
+    if trade.get(_QUALITY_COLUMN) not in _CALIBRATION_GRADE_QUALITIES:
+        return None
     raw = trade.get(_SLIPPAGE_COLUMN)
     if raw is None:
         return None
