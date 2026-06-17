@@ -56,20 +56,29 @@ def _seed_filled_trade(
     strategy: str,
     timestamp: str,
     status: str = "filled",
-    realized_slippage_bps: float = 5.0,
-    modeled_slippage_bps: float = 5.0,
+    adverse_bps: float | None = 0.0,
+    measurement_quality: str = "primary",
 ) -> None:
-    """Seed a row matching the L2 check queries."""
+    """Seed a row matching the L2 check queries.
+
+    Phase 2 (slippage unification): assessor reads `slippage_adverse_bps`
+    + `slippage_measurement_quality`. `adverse_bps=None` seeds a NULL
+    metric (the row is excluded by the assessor's IS NOT NULL filter).
+    `measurement_quality` controls the whitelist filter — pass
+    `'recovered'` / `'unavailable'` to simulate the rows the assessor
+    must skip.
+    """
     conn.execute(
         "INSERT INTO trades ("
         "timestamp, symbol, side, qty, avg_fill_price, order_id, "
         "strategy, reason, stop_price, entry_reference_price, "
-        "modeled_slippage_bps, realized_slippage_bps, "
+        "slippage_signed_bps, slippage_adverse_bps, slippage_measurement_quality, "
         "order_type, status, requested_qty, filled_qty"
         ") VALUES (?, 'X', 'sell', 1.0, 100.0, 'oid', ?, 'exit', "
-        "95.0, 100.0, ?, ?, 'market', ?, 1.0, 1.0)",
+        "95.0, 100.0, ?, ?, ?, 'market', ?, 1.0, 1.0)",
         (
-            timestamp, strategy, modeled_slippage_bps, realized_slippage_bps,
+            timestamp, strategy,
+            adverse_bps, adverse_bps, measurement_quality,
             status,
         ),
     )
@@ -259,13 +268,12 @@ class TestL1Stubs:
 
 class TestL2Checks:
     def test_l2_slippage_classifies_correctly(self, db_conn):
-        # Seed trades with realized_slippage 30 bps above modeled.
+        # Seed trades with adverse drift of 30 bps.
         for i in range(10):
             _seed_filled_trade(
                 db_conn, strategy="x",
                 timestamp=f"2026-05-{18 + i % 7:02d}T{i:02d}:00:00",
-                realized_slippage_bps=35.0,
-                modeled_slippage_bps=5.0,
+                adverse_bps=30.0,
             )
         # 30 bps delta is between watch (20) and degraded (50) → WATCH.
         report = HealthAssessor().assess(_standard_inputs(db_conn))
@@ -431,8 +439,7 @@ class TestLayerAggregation:
             _seed_filled_trade(
                 db_conn, strategy="x",
                 timestamp=f"2026-05-{18 + i % 7:02d}T{i:02d}:00:00",
-                realized_slippage_bps=35.0,
-                modeled_slippage_bps=5.0,
+                adverse_bps=30.0,
             )
         report = HealthAssessor().assess(_standard_inputs(db_conn))
         # L2 has the slippage WATCH; L1 mostly stubs (HEALTHY); L3 healthy.
@@ -584,12 +591,12 @@ class TestP95SlippageRegression:
         _seed_filled_trade(
             db_conn, strategy="x",
             timestamp="2026-05-19T09:00:00",
-            realized_slippage_bps=5.0, modeled_slippage_bps=5.0,  # delta=0
+            adverse_bps=0.0,
         )
         _seed_filled_trade(
             db_conn, strategy="x",
             timestamp="2026-05-20T09:00:00",
-            realized_slippage_bps=105.0, modeled_slippage_bps=5.0,  # delta=100
+            adverse_bps=100.0,
         )
         report = HealthAssessor().assess(_standard_inputs(db_conn))
         slip = next(
@@ -612,8 +619,7 @@ class TestP95SlippageRegression:
             _seed_filled_trade(
                 db_conn, strategy="x",
                 timestamp=f"2026-05-{day:02d}T09:00:00",
-                realized_slippage_bps=delta + 5.0,
-                modeled_slippage_bps=5.0,
+                adverse_bps=float(delta),
             )
         report = HealthAssessor().assess(_standard_inputs(db_conn))
         slip = next(
@@ -626,202 +632,214 @@ class TestP95SlippageRegression:
         assert slip.status == HealthStatus.BROKEN
 
 
-def _seed_recovered_context_trade(
-    conn: sqlite3.Connection,
-    *,
-    strategy: str,
-    timestamp: str,
-    realized_slippage_bps: float,
-    modeled_slippage_bps: float,
-) -> None:
-    """Legacy recovered-entry-context row: reason carries the marker, both
-    slippage columns are populated with nonsense values (the pre-fix
-    failure mode that produced QCOM's 1205 bps phantom slippage)."""
-    conn.execute(
-        "INSERT INTO trades ("
-        "timestamp, symbol, side, qty, avg_fill_price, order_id, "
-        "strategy, reason, stop_price, entry_reference_price, "
-        "modeled_slippage_bps, realized_slippage_bps, "
-        "order_type, status, requested_qty, filled_qty"
-        ") VALUES (?, 'X', 'buy', 1.0, 100.0, 'oid', ?, ?, "
-        "95.0, 100.0, ?, ?, 'market', 'filled', 1.0, 1.0)",
-        (
-            timestamp, strategy,
-            f"{strategy} recovered entry context",
-            modeled_slippage_bps, realized_slippage_bps,
-        ),
-    )
-    conn.commit()
+class TestMeasurementQualityFilter:
+    """Phase 2 (slippage unification): the assessor reads from the new
+    `slippage_adverse_bps` column and gates on
+    `slippage_measurement_quality IN ('primary','fallback')`.
 
+    The whitelist is a positive opt-in: rows tagged `recovered`
+    (codepaths §5, §8, §9 — benchmark reconstructed from broker
+    history) or `unavailable` (codepaths §7, §10, §12, §13 — no
+    honest benchmark exists) are excluded from the live drift alarm
+    so reconstructed/synthetic measurements don't dominate the p95.
 
-class TestRecoveredContextSlippageFilter:
-    """Issue A defensive filter: rows whose `reason` carries the
-    `recovered entry context` marker have no honest pre-trade
-    benchmark (their original arrival quote happened in a previous
-    process). Pre-PR these rows wrote large phantom realized_bps
-    against modeled_bps=0 and dominated the L2 p95. Post-PR the
-    engine writes NULL on both columns and the IS NOT NULL clause
-    filters them naturally; this defensive `reason NOT LIKE` clause
-    handles the legacy rows already on disk in a running operator's
-    trades.db.
+    Fails-closed shape: any future quality enum is excluded by
+    default until explicitly added to the whitelist.
     """
 
     def test_recovered_rows_excluded_from_p95(self, db_conn):
-        # One clean fill (5 bps delta) + one legacy recovered row
-        # carrying a 1200 bps phantom delta. Without the filter,
+        # One clean fill (5 bps adverse) + one recovered-quality row
+        # carrying a 1200 bps reconstructed value. Without the filter,
         # p95 ≈ 1140; with the filter, p95 = 5.
         _seed_filled_trade(
             db_conn, strategy="x",
             timestamp="2026-05-19T09:00:00",
-            realized_slippage_bps=10.0, modeled_slippage_bps=5.0,
+            adverse_bps=5.0,
         )
-        _seed_recovered_context_trade(
+        _seed_filled_trade(
             db_conn, strategy="x",
             timestamp="2026-05-20T09:00:00",
-            realized_slippage_bps=1205.3, modeled_slippage_bps=0.0,
+            adverse_bps=1205.3,
+            measurement_quality="recovered",
         )
         report = HealthAssessor().assess(_standard_inputs(db_conn))
         slip = next(
             c for c in report.checks
             if c.name == "slippage_realized_vs_modeled_bps_p95"
         )
-        # Single remaining sample (delta=5) → p95 = 5; the legacy
-        # phantom row was excluded by the reason filter.
+        # Single remaining sample (adverse=5) → p95 = 5.
         assert slip.numeric_value == pytest.approx(5.0)
         assert slip.status == HealthStatus.HEALTHY
 
-    def test_recovered_rows_excluded_even_when_only_rows(self, db_conn):
-        """If all rows in the window are recovered-context, the check
-        reports NO DATA rather than degrading on phantom slippage —
-        operator can tell the difference between "no fills" and
-        "all fills had bad benchmarks."""
-        _seed_recovered_context_trade(
+    def test_unavailable_quality_rows_excluded(self, db_conn):
+        """`unavailable` is the other excluded tier — codepaths that
+        have no honest benchmark (external close, options LIMIT,
+        fractional residual cleanup). They shouldn't appear in the
+        adverse_bps column anyway, but if a row carries both an
+        `unavailable` quality tag and a non-null adverse value,
+        the whitelist still excludes it."""
+        _seed_filled_trade(
             db_conn, strategy="x",
             timestamp="2026-05-19T09:00:00",
-            realized_slippage_bps=1205.3, modeled_slippage_bps=0.0,
+            adverse_bps=5.0,
         )
-        _seed_recovered_context_trade(
+        _seed_filled_trade(
             db_conn, strategy="x",
             timestamp="2026-05-20T09:00:00",
-            realized_slippage_bps=600.0, modeled_slippage_bps=0.0,
+            adverse_bps=600.0,
+            measurement_quality="unavailable",
         )
         report = HealthAssessor().assess(_standard_inputs(db_conn))
         slip = next(
             c for c in report.checks
             if c.name == "slippage_realized_vs_modeled_bps_p95"
         )
-        # NO_DATA result — no numeric_value, status reflects insufficient sample.
+        assert slip.numeric_value == pytest.approx(5.0)
+        assert slip.status == HealthStatus.HEALTHY
+
+    def test_all_recovered_window_reports_no_data(self, db_conn):
+        """If every row in the window has a non-whitelisted quality,
+        the check reports NO DATA — operator can tell apart "no
+        fills" from "all fills had reconstructed benchmarks"."""
+        _seed_filled_trade(
+            db_conn, strategy="x",
+            timestamp="2026-05-19T09:00:00",
+            adverse_bps=1205.3,
+            measurement_quality="recovered",
+        )
+        _seed_filled_trade(
+            db_conn, strategy="x",
+            timestamp="2026-05-20T09:00:00",
+            adverse_bps=600.0,
+            measurement_quality="recovered",
+        )
+        report = HealthAssessor().assess(_standard_inputs(db_conn))
+        slip = next(
+            c for c in report.checks
+            if c.name == "slippage_realized_vs_modeled_bps_p95"
+        )
         assert slip.numeric_value is None
 
-    def test_non_recovered_rows_pass_through_normally(self, db_conn):
-        """Sanity: the filter only catches the marker; ordinary
-        `reason` values still flow into the check."""
+    def test_fallback_quality_rows_are_included(self, db_conn):
+        """`fallback` is a whitelisted quality — SMA / Donchian market
+        entries that benchmark against the latest close when no
+        arrival midpoint is available still contribute honest
+        execution-drift evidence and must NOT be excluded."""
+        _seed_filled_trade(
+            db_conn, strategy="x",
+            timestamp="2026-05-19T09:00:00",
+            adverse_bps=120.0,
+            measurement_quality="fallback",
+        )
+        report = HealthAssessor().assess(_standard_inputs(db_conn))
+        slip = next(
+            c for c in report.checks
+            if c.name == "slippage_realized_vs_modeled_bps_p95"
+        )
+        assert slip.numeric_value == pytest.approx(120.0)
+
+    def test_unknown_quality_fails_closed(self, db_conn):
+        """If a row carries some other quality value (e.g. a future
+        enum we haven't yet opted in to, or a typo), it must be
+        excluded. The whitelist is positive — anything not in
+        `('primary','fallback')` is out."""
+        _seed_filled_trade(
+            db_conn, strategy="x",
+            timestamp="2026-05-19T09:00:00",
+            adverse_bps=1000.0,
+            measurement_quality="some_future_tier",
+        )
+        report = HealthAssessor().assess(_standard_inputs(db_conn))
+        slip = next(
+            c for c in report.checks
+            if c.name == "slippage_realized_vs_modeled_bps_p95"
+        )
+        assert slip.numeric_value is None
+
+    def test_primary_rows_flow_through(self, db_conn):
+        """Sanity: ordinary `primary` rows still participate."""
         for delta, day in [(5.0, 18), (50.0, 19), (200.0, 20)]:
             _seed_filled_trade(
                 db_conn, strategy="x",
                 timestamp=f"2026-05-{day:02d}T09:00:00",
-                realized_slippage_bps=5.0 + delta,
-                modeled_slippage_bps=5.0,
+                adverse_bps=delta,
             )
         report = HealthAssessor().assess(_standard_inputs(db_conn))
         slip = next(
             c for c in report.checks
             if c.name == "slippage_realized_vs_modeled_bps_p95"
         )
-        # All three rows participate; p95 of [5, 50, 200] is ≈ 185 by
-        # linear interpolation — matches TestP95SlippageRegression.
+        # p95 of [5, 50, 200] ≈ 185 by linear interpolation.
         assert slip.numeric_value > 100.0
 
 
 class TestAdverseOnlySlippageSemantics:
-    """The L2 check measures **adverse** drift, not absolute drift.
-    `realized_slippage_bps` is signed by the slippage helpers (positive =
-    paid more / got less; negative = price improvement). Pre-fix the
-    check used `abs(realized - modeled)` which conflated improvement
-    with adverse — credit_spread's two price-improvement MLEG fills
-    (-134 and -77 bps) were dominating the p95 and flagging the sleeve
-    as DEGRADED even though it was getting better fills than asked.
+    """The L2 check measures **adverse** drift only. After Phase 2 the
+    column `slippage_adverse_bps` is already clamped to `max(0, signed)`
+    at writer time (see `single_leg_realized_slippage_bps` callers in
+    `reporting/logger.py`), so the assessor just reads the column —
+    price improvement contributes 0, not |improvement|.
+
+    Historical context: pre-PR #38 the check computed `abs(realized -
+    modeled)` and was inflated by credit_spread's two price-improvement
+    MLEG fills (-134 / -77 bps), flagging the sleeve as DEGRADED even
+    though execution was better than modeled. The clamp now lives in
+    the writer; the assessor's job is to trust it.
     """
 
-    def test_price_improvement_does_not_inflate_p95(self, db_conn):
-        # Two zero-drift fills + one price-improvement fill at -150 bps.
-        # Pre-fix p95 would be ~142 (abs of -150); post-fix p95 = 0.
-        _seed_filled_trade(
-            db_conn, strategy="x",
-            timestamp="2026-05-19T09:00:00",
-            realized_slippage_bps=5.0, modeled_slippage_bps=5.0,
-        )
-        _seed_filled_trade(
-            db_conn, strategy="x",
-            timestamp="2026-05-20T09:00:00",
-            realized_slippage_bps=5.0, modeled_slippage_bps=5.0,
-        )
-        _seed_filled_trade(
-            db_conn, strategy="x",
-            timestamp="2026-05-21T09:00:00",
-            realized_slippage_bps=-145.0, modeled_slippage_bps=5.0,
-        )
+    def test_zero_adverse_rows_keep_p95_at_zero(self, db_conn):
+        """Three rows with adverse_bps=0 (clean / improved fills) →
+        p95 = 0, no alarm. Regression guard against any future change
+        that re-introduces an unclamped read path."""
+        for day in (19, 20, 21):
+            _seed_filled_trade(
+                db_conn, strategy="x",
+                timestamp=f"2026-05-{day}T09:00:00",
+                adverse_bps=0.0,
+            )
         report = HealthAssessor().assess(_standard_inputs(db_conn))
         slip = next(
             c for c in report.checks
             if c.name == "slippage_realized_vs_modeled_bps_p95"
         )
-        # All three contributions clamp to 0 — clean execution, no alarm.
         assert slip.numeric_value == pytest.approx(0.0)
         assert slip.status == HealthStatus.HEALTHY
 
-    def test_adverse_drift_still_inflates_p95(self, db_conn):
-        # Symmetry guard: regular adverse drift continues to flag.
-        # If the new semantics over-clamped (e.g. returned 0 for all
-        # rows), this would falsely pass — the regression catch.
+    def test_adverse_drift_inflates_p95(self, db_conn):
+        """Symmetry guard: a real adverse-only sample continues to
+        flag. If the new query over-filtered (e.g. excluded the wrong
+        quality tier), this would falsely return None or zero."""
         _seed_filled_trade(
             db_conn, strategy="x",
             timestamp="2026-05-19T09:00:00",
-            realized_slippage_bps=5.0, modeled_slippage_bps=5.0,
+            adverse_bps=0.0,
         )
         _seed_filled_trade(
             db_conn, strategy="x",
             timestamp="2026-05-20T09:00:00",
-            realized_slippage_bps=125.0, modeled_slippage_bps=5.0,
+            adverse_bps=120.0,
         )
         report = HealthAssessor().assess(_standard_inputs(db_conn))
         slip = next(
             c for c in report.checks
             if c.name == "slippage_realized_vs_modeled_bps_p95"
         )
-        # Adverse 120 bps drift is captured; p95 between 0 and 120.
         assert slip.numeric_value > 100.0
         assert slip.status in (HealthStatus.DEGRADED, HealthStatus.BROKEN)
 
-    def test_credit_spread_price_improvement_pattern_passes(self, db_conn):
-        """Reproduction of the credit_spread false-positive: 8 zero-
-        slippage MLEG rows + 2 price-improvement rows at -76.6 and
-        -134.5 bps (modeled=0 on mleg). Pre-fix p95 was 87.4 bps →
-        DEGRADED. Post-fix p95 = 0 → HEALTHY (or WATCH with broader
-        thresholds, but never DEGRADED on price improvement alone)."""
-        for i in range(8):
+    def test_credit_spread_clean_run_stays_healthy(self, db_conn):
+        """Inverse of the W22 false positive: 8 zero-drift MLEG rows
+        + 2 clean (post-clamp adverse=0) rows → p95 = 0, HEALTHY."""
+        for i in range(10):
             _seed_filled_trade(
                 db_conn, strategy="x",
                 timestamp=f"2026-05-{19 + i:02d}T09:00:00",
-                realized_slippage_bps=0.0, modeled_slippage_bps=0.0,
+                adverse_bps=0.0,
             )
-        _seed_filled_trade(
-            db_conn, strategy="x",
-            timestamp="2026-05-27T09:00:00",
-            realized_slippage_bps=-76.6, modeled_slippage_bps=0.0,
-        )
-        _seed_filled_trade(
-            db_conn, strategy="x",
-            timestamp="2026-05-28T09:00:00",
-            realized_slippage_bps=-134.5, modeled_slippage_bps=0.0,
-        )
         report = HealthAssessor().assess(_standard_inputs(db_conn))
         slip = next(
             c for c in report.checks
             if c.name == "slippage_realized_vs_modeled_bps_p95"
         )
-        # All ten samples are non-adverse → p95 = 0; sleeve is HEALTHY.
-        # This is exactly the inverse of the W22 87.4 bps DEGRADED
-        # finding pre-fix.
         assert slip.numeric_value == pytest.approx(0.0)
         assert slip.status == HealthStatus.HEALTHY

@@ -10,9 +10,10 @@ P&L tracking and reporting (Phase 9).
      rolling Sharpe broken out per `strategy_name`. Even with one strategy
      today the schema supports N strategies (Phase 11 readiness).
 
-  3. **Continuous slippage monitoring** — rolling comparison of realized vs.
-     modeled slippage. The stats feed the Phase 6.11 drift kill switch; the
-     report surfaces them for operator review.
+  3. **Continuous slippage monitoring** — rolling adverse-only slippage
+     stats from `slippage_adverse_bps` (Phase 2 slippage unification).
+     The Phase 6.11 drift kill switch consumes adverse slippage live; the
+     reports here surface the rolling distribution for operator review.
 
   4. **Weekly summary report** — aggregates daily summaries into a markdown
      weekly digest.
@@ -35,6 +36,41 @@ from loguru import logger
 from config import settings
 
 
+_SLIPPAGE_COLUMN = "slippage_adverse_bps"
+_QUALITY_COLUMN = "slippage_measurement_quality"
+_CALIBRATION_GRADE_QUALITIES = frozenset({"primary", "fallback"})
+
+
+def _adverse_bps(trade: dict) -> float | None:
+    """Return adverse slippage for a trade row, or None when the row
+    isn't calibration-grade.
+
+    Phase 2 slippage unification: reads `slippage_adverse_bps` from
+    the trade row and gates on the same positive quality whitelist
+    used by health / calibration / reconcile / dashboard
+    (`slippage_measurement_quality IN ('primary', 'fallback')`).
+
+    Returns None for:
+      - NULL / missing / non-numeric slippage values, OR
+      - rows whose quality is not in the whitelist (`recovered`,
+        `unavailable`, future enums, or a typo).
+
+    Both conditions mean the row has no honest measurement and must
+    be skipped — defaulting to 0 silently dilutes operator-facing
+    means; including reconstructed (`recovered`) measurements
+    pollutes reports with non-live-execution evidence.
+    """
+    if trade.get(_QUALITY_COLUMN) not in _CALIBRATION_GRADE_QUALITIES:
+        return None
+    raw = trade.get(_SLIPPAGE_COLUMN)
+    if raw is None:
+        return None
+    try:
+        return float(raw)
+    except (TypeError, ValueError):
+        return None
+
+
 # ── Data structures ─────────────────────────────────────────────────────────
 
 
@@ -49,6 +85,12 @@ class StrategyStats:
     losses: int = 0
     largest_win: float = 0.0
     largest_loss: float = 0.0
+    # Mean adverse slippage (bps). Sourced from
+    # `slippage_adverse_bps` on `trades` (Phase 2 slippage
+    # unification); rows with NULL slippage are skipped — not
+    # treated as zero — so the average isn't diluted by paths
+    # without a benchmark (LIMIT entries, external closes, MLEG
+    # long-leg structural NULLs).
     mean_slippage_bps: float = 0.0
     trade_pnls: list[float] = field(default_factory=list)
 
@@ -270,8 +312,8 @@ class PnLTracker:
             f"| Total trades | {summary.total_trades} |",
             f"| Largest win | ${summary.largest_win:,.2f} |",
             f"| Largest loss | ${summary.largest_loss:,.2f} |",
-            f"| Mean slippage | {summary.slippage_mean_bps} bps |",
-            f"| Max slippage | {summary.slippage_max_bps} bps |",
+            f"| Mean adverse slippage | {summary.slippage_mean_bps} bps |",
+            f"| Max adverse slippage | {summary.slippage_max_bps} bps |",
         ]
 
         if summary.strategies:
@@ -293,7 +335,7 @@ class PnLTracker:
                     f"| Profit factor | {s.profit_factor:.2f} |",
                     f"| Largest win | ${s.largest_win:,.2f} |",
                     f"| Largest loss | ${s.largest_loss:,.2f} |",
-                    f"| Mean slippage | {s.mean_slippage_bps:.1f} bps |",
+                    f"| Mean adverse slippage | {s.mean_slippage_bps:.1f} bps |",
                     "",
                 ]
 
@@ -338,13 +380,16 @@ class PnLTracker:
         strat_pnls: dict[str, list[float]] = {}
 
         # We don't have per-trade P&L in the CSV (we have fills, not
-        # round-trips). Weekly report summarizes trade activity + slippage.
-        slip_values = []
+        # round-trips). Weekly report summarizes trade activity +
+        # adverse-only slippage from measured rows. Rows with NULL
+        # slippage are skipped — not treated as zero — so paths that
+        # legitimately have no benchmark (LIMIT entries, external
+        # closes) don't drag the mean toward zero.
+        slip_values: list[float] = []
         for t in trades:
-            try:
-                slip_values.append(float(t.get("realized_slippage_bps", 0)))
-            except (ValueError, TypeError):
-                pass
+            v = _adverse_bps(t)
+            if v is not None:
+                slip_values.append(v)
 
         os.makedirs(self._weekly_dir, exist_ok=True)
         path = os.path.join(
@@ -360,12 +405,12 @@ class PnLTracker:
             f"|---|---|",
             f"| Trading days with reports | {len(daily_files)} |",
             f"| Total fills | {total_trades} |",
-            f"| Mean slippage | {sum(slip_values)/len(slip_values):.1f} bps |"
+            f"| Mean adverse slippage | {sum(slip_values)/len(slip_values):.1f} bps |"
             if slip_values
-            else f"| Mean slippage | — |",
-            f"| Max slippage | {max(slip_values):.1f} bps |"
+            else f"| Mean adverse slippage | — |",
+            f"| Max adverse slippage | {max(slip_values):.1f} bps |"
             if slip_values
-            else f"| Max slippage | — |",
+            else f"| Max adverse slippage | — |",
             "",
             "## Daily Reports",
             "",
@@ -383,22 +428,29 @@ class PnLTracker:
 
     def slippage_report(self, last_n: int = 50) -> dict:
         """
-        Rolling slippage stats from the trade database. Returns a dict with
-        mean/max/count for the last N fills.
+        Rolling adverse-only slippage stats from the trade database.
+        Returns a dict with mean / max / count for the last N fills
+        that have a measured `slippage_adverse_bps` (rows with NULL
+        slippage are skipped — see `_adverse_bps`).
+
+        `count` reflects the number of measured rows in the window,
+        not the raw count of recent rows. A window of 50 recent
+        fills with only 20 measured will report `count=20`. The
+        denominator matches the numerator so the mean isn't
+        diluted by paths that legitimately have no benchmark.
         """
         recent = self._trade_logger.read_recent(last_n)
         if not recent:
             return {"count": 0, "mean_bps": 0.0, "max_bps": 0.0}
 
-        slips = []
+        slips: list[float] = []
         for t in recent:
-            try:
-                slips.append(float(t.get("realized_slippage_bps", 0)))
-            except (ValueError, TypeError):
-                pass
+            v = _adverse_bps(t)
+            if v is not None:
+                slips.append(v)
 
         if not slips:
-            return {"count": len(recent), "mean_bps": 0.0, "max_bps": 0.0}
+            return {"count": 0, "mean_bps": 0.0, "max_bps": 0.0}
 
         return {
             "count": len(slips),
@@ -413,30 +465,32 @@ class PnLTracker:
         return self._trade_logger.read_trades_in_range(start, end)
 
     def _slippage_stats_for_day(self, day: str) -> tuple[float, float]:
-        """Mean and max realized slippage for a given day."""
+        """Mean and max adverse slippage for a given day. Rows whose
+        `slippage_adverse_bps` is NULL/missing are skipped — paths
+        without a benchmark must not dilute the mean toward zero."""
         trades = self._trades_in_range(day, day)
-        slips = []
+        slips: list[float] = []
         for t in trades:
-            try:
-                slips.append(float(t.get("realized_slippage_bps", 0)))
-            except (ValueError, TypeError):
-                pass
+            v = _adverse_bps(t)
+            if v is not None:
+                slips.append(v)
         if not slips:
             return 0.0, 0.0
         return sum(slips) / len(slips), max(slips)
 
     def _slippage_by_strategy(self, day: str) -> dict[str, float]:
-        """Mean realized slippage per strategy for a given day."""
+        """Mean adverse slippage per strategy for a given day. Rows
+        whose `slippage_adverse_bps` is NULL/missing are skipped;
+        strategies with no measured rows are omitted from the
+        result entirely (rather than reporting a misleading 0)."""
         trades = self._trades_in_range(day, day)
         by_strat: dict[str, list[float]] = {}
         for t in trades:
+            v = _adverse_bps(t)
+            if v is None:
+                continue
             strat = t.get("strategy", "unknown")
-            try:
-                by_strat.setdefault(strat, []).append(
-                    float(t.get("realized_slippage_bps", 0))
-                )
-            except (ValueError, TypeError):
-                pass
+            by_strat.setdefault(strat, []).append(v)
         return {
             name: sum(vs) / len(vs)
             for name, vs in by_strat.items()

@@ -40,6 +40,8 @@ _TRADE_COLUMNS = [
     "requested_qty", "filled_qty", "initial_stop_loss",
     "initial_risk_per_share", "initial_risk_dollars",
     "realized_pnl", "r_multiple", "entry_timestamp", "exit_timestamp",
+    "slippage_benchmark_kind", "slippage_measurement_quality",
+    "slippage_signed_bps", "slippage_adverse_bps",
 ]
 
 
@@ -71,6 +73,21 @@ class TestLoadTrades:
         df = load_trades(str(tmp_path / "nonexistent.db"))
         assert isinstance(df, pd.DataFrame)
         assert df.empty
+
+    def test_empty_frame_advertises_unified_slippage_columns(self, tmp_path):
+        """Phase 2 slippage unification — empty-frame placeholder must
+        include the new taxonomy columns so dashboard sections that
+        check `col in trades_df.columns` (Recent Trades surfacing
+        benchmark_kind + measurement_quality) gate on the same column
+        set regardless of whether the DB exists."""
+        df = load_trades(str(tmp_path / "nonexistent.db"))
+        for col in (
+            "slippage_benchmark_kind",
+            "slippage_measurement_quality",
+            "slippage_signed_bps",
+            "slippage_adverse_bps",
+        ):
+            assert col in df.columns
 
     def test_empty_table_returns_empty_dataframe(self, tmp_path):
         db = tmp_path / "trades.db"
@@ -347,6 +364,17 @@ class TestRefreshMultiLegPositions:
 
 class TestComputeEquityCurve:
     def _make_df(self, rows: list[dict]) -> pd.DataFrame:
+        # Phase 2 default: rows that carry a measured slippage_adverse_bps
+        # but no explicit quality tag default to 'primary' (calibration-
+        # grade), matching what production writers emit. Tests that
+        # need to exercise the quality whitelist set quality explicitly
+        # (`recovered`, `unavailable`, or some other tier).
+        for row in rows:
+            if (
+                "slippage_adverse_bps" in row
+                and "slippage_measurement_quality" not in row
+            ):
+                row["slippage_measurement_quality"] = "primary"
         df = pd.DataFrame(rows)
         if "timestamp" in df.columns:
             df["timestamp"] = pd.to_datetime(df["timestamp"], utc=True)
@@ -545,6 +573,17 @@ class TestComputeRollingSharpe:
 
 class TestComputeStrategyStats:
     def _make_df(self, rows: list[dict]) -> pd.DataFrame:
+        # Phase 2 default: rows that carry a measured slippage_adverse_bps
+        # but no explicit quality tag default to 'primary' (calibration-
+        # grade), matching what production writers emit. Tests that
+        # need to exercise the quality whitelist set quality explicitly
+        # (`recovered`, `unavailable`, or some other tier).
+        for row in rows:
+            if (
+                "slippage_adverse_bps" in row
+                and "slippage_measurement_quality" not in row
+            ):
+                row["slippage_measurement_quality"] = "primary"
         df = pd.DataFrame(rows)
         if "timestamp" in df.columns:
             df["timestamp"] = pd.to_datetime(df["timestamp"], utc=True)
@@ -559,11 +598,11 @@ class TestComputeStrategyStats:
         df = self._make_df([
             {"symbol": "AAPL", "side": "buy", "strategy": "sma_crossover",
              "avg_fill_price": "100.0", "filled_qty": "10", "qty": "10",
-             "realized_slippage_bps": "3.0", "timestamp": _ts(0),
+             "slippage_adverse_bps": "3.0", "timestamp": _ts(0),
              "entry_timestamp": _ts(0)},
             {"symbol": "AAPL", "side": "sell", "strategy": "sma_crossover",
              "avg_fill_price": "120.0", "filled_qty": "10", "qty": "10",
-             "realized_slippage_bps": "4.0", "timestamp": _ts(1),
+             "slippage_adverse_bps": "4.0", "timestamp": _ts(1),
              "entry_timestamp": _ts(0), "realized_pnl": "200.0"},
         ])
         stats = compute_strategy_stats(df)
@@ -580,19 +619,19 @@ class TestComputeStrategyStats:
             # Two trades: one win, one loss
             {"symbol": "AAPL", "side": "buy", "strategy": "sma_crossover",
              "avg_fill_price": "100.0", "filled_qty": "10", "qty": "10",
-             "realized_slippage_bps": "0", "timestamp": _ts(0),
+             "slippage_adverse_bps": "0", "timestamp": _ts(0),
              "entry_timestamp": _ts(0)},
             {"symbol": "AAPL", "side": "sell", "strategy": "sma_crossover",
              "avg_fill_price": "110.0", "filled_qty": "10", "qty": "10",
-             "realized_slippage_bps": "0", "timestamp": _ts(1),
+             "slippage_adverse_bps": "0", "timestamp": _ts(1),
              "entry_timestamp": _ts(0), "realized_pnl": "100.0"},
             {"symbol": "GOOG", "side": "buy", "strategy": "sma_crossover",
              "avg_fill_price": "200.0", "filled_qty": "5", "qty": "5",
-             "realized_slippage_bps": "0", "timestamp": _ts(2),
+             "slippage_adverse_bps": "0", "timestamp": _ts(2),
              "entry_timestamp": _ts(2)},
             {"symbol": "GOOG", "side": "sell", "strategy": "sma_crossover",
              "avg_fill_price": "190.0", "filled_qty": "5", "qty": "5",
-             "realized_slippage_bps": "0", "timestamp": _ts(3),
+             "slippage_adverse_bps": "0", "timestamp": _ts(3),
              "entry_timestamp": _ts(2), "realized_pnl": "-50.0"},
         ])
         stats = compute_strategy_stats(df)
@@ -605,19 +644,19 @@ class TestComputeStrategyStats:
         df = self._make_df([
             {"symbol": "AAPL", "side": "buy", "strategy": "sma_crossover",
              "avg_fill_price": "100.0", "filled_qty": "10", "qty": "10",
-             "realized_slippage_bps": "2.0", "timestamp": _ts(0),
+             "slippage_adverse_bps": "2.0", "timestamp": _ts(0),
              "entry_timestamp": _ts(0)},
             {"symbol": "AAPL", "side": "sell", "strategy": "sma_crossover",
              "avg_fill_price": "110.0", "filled_qty": "10", "qty": "10",
-             "realized_slippage_bps": "3.0", "timestamp": _ts(1),
+             "slippage_adverse_bps": "3.0", "timestamp": _ts(1),
              "entry_timestamp": _ts(0), "realized_pnl": "100.0"},
             {"symbol": "ALLY", "side": "buy", "strategy": "rsi_reversion",
              "avg_fill_price": "50.0", "filled_qty": "20", "qty": "20",
-             "realized_slippage_bps": "5.0", "timestamp": _ts(2),
+             "slippage_adverse_bps": "5.0", "timestamp": _ts(2),
              "entry_timestamp": _ts(2)},
             {"symbol": "ALLY", "side": "sell", "strategy": "rsi_reversion",
              "avg_fill_price": "48.0", "filled_qty": "20", "qty": "20",
-             "realized_slippage_bps": "4.0", "timestamp": _ts(3),
+             "slippage_adverse_bps": "4.0", "timestamp": _ts(3),
              "entry_timestamp": _ts(2), "realized_pnl": "-40.0"},
         ])
         stats = compute_strategy_stats(df)
@@ -630,15 +669,15 @@ class TestComputeStrategyStats:
         df = self._make_df([
             {"symbol": "AAPL", "side": "buy", "strategy": "sma_crossover",
              "avg_fill_price": "100.0", "filled_qty": "10", "qty": "10",
-             "realized_slippage_bps": "0", "timestamp": _ts(0),
+             "slippage_adverse_bps": "0", "timestamp": _ts(0),
              "entry_timestamp": _ts(0)},
             {"symbol": "AAPL", "side": "sell", "strategy": "sma_crossover",
              "avg_fill_price": "110.0", "filled_qty": "5", "qty": "5",
-             "realized_slippage_bps": "0", "timestamp": _ts(1),
+             "slippage_adverse_bps": "0", "timestamp": _ts(1),
              "entry_timestamp": _ts(0), "realized_pnl": "50.0"},
             {"symbol": "AAPL", "side": "sell", "strategy": "sma_crossover",
              "avg_fill_price": "120.0", "filled_qty": "5", "qty": "5",
-             "realized_slippage_bps": "0", "timestamp": _ts(2),
+             "slippage_adverse_bps": "0", "timestamp": _ts(2),
              "entry_timestamp": _ts(0), "realized_pnl": "100.0"},
         ])
         stats = compute_strategy_stats(df)
@@ -652,15 +691,15 @@ class TestComputeStrategyStats:
         df = self._make_df([
             {"symbol": "DK", "side": "buy", "strategy": "sma_crossover",
              "avg_fill_price": "44.50", "filled_qty": "236.4", "qty": "236.4",
-             "realized_slippage_bps": "353.35", "timestamp": _ts(0),
+             "slippage_adverse_bps": "353.35", "timestamp": _ts(0),
              "entry_timestamp": _ts(0)},
             {"symbol": "DK", "side": "sell", "strategy": "sma_crossover",
              "avg_fill_price": "41.92", "filled_qty": "236.0", "qty": "236.0",
-             "realized_slippage_bps": "0", "timestamp": _ts(1),
+             "slippage_adverse_bps": "0", "timestamp": _ts(1),
              "entry_timestamp": _ts(0), "realized_pnl": str((41.92 - 44.50) * 236)},
             {"symbol": "DK", "side": "sell", "strategy": "sma_crossover",
              "avg_fill_price": "41.872", "filled_qty": "0.4", "qty": "0.4",
-             "realized_slippage_bps": "0", "timestamp": _ts(2),
+             "slippage_adverse_bps": "0", "timestamp": _ts(2),
              "entry_timestamp": _ts(0), "realized_pnl": str((41.872 - 44.50) * 0.4)},
         ])
         stats = compute_strategy_stats(df)
@@ -675,11 +714,11 @@ class TestComputeStrategyStats:
         df = self._make_df([
             {"symbol": "TSLA", "side": "buy", "strategy": "donchian_breakout",
              "avg_fill_price": "420.73", "filled_qty": "5.39", "qty": "5.39",
-             "realized_slippage_bps": "10.0", "timestamp": _ts(0),
+             "slippage_adverse_bps": "10.0", "timestamp": _ts(0),
              "entry_timestamp": _ts(0)},
             {"symbol": "TSLA", "side": "sell", "strategy": "donchian_breakout",
              "avg_fill_price": "418.728", "filled_qty": "0.39", "qty": "0.39",
-             "realized_slippage_bps": "0", "timestamp": _ts(1),
+             "slippage_adverse_bps": "0", "timestamp": _ts(1),
              "entry_timestamp": _ts(0), "realized_pnl": "-3.73698"},
         ])
         stats = compute_strategy_stats(df)
@@ -692,27 +731,27 @@ class TestComputeStrategyStats:
         df = self._make_df([
             {"symbol": "SPY260618P00714000", "side": "sell", "strategy": "credit_spread",
              "avg_fill_price": "1.49", "filled_qty": "1", "qty": "1",
-             "realized_slippage_bps": "0", "timestamp": _ts(0),
+             "slippage_adverse_bps": "0", "timestamp": _ts(0),
              "position_id": "spread-1", "position_type": "spread",
              "reason": "spread entry"},
             {"symbol": "SPY260618P00704000", "side": "buy", "strategy": "credit_spread",
              "avg_fill_price": "0", "filled_qty": "1", "qty": "1",
-             "realized_slippage_bps": "0", "timestamp": _ts(0),
+             "slippage_adverse_bps": "0", "timestamp": _ts(0),
              "position_id": "spread-1", "position_type": "spread",
              "reason": "spread entry"},
             {"symbol": "SPY260618P00714000", "side": "buy", "strategy": "credit_spread",
              "avg_fill_price": "0.74", "filled_qty": "1", "qty": "1",
-             "realized_slippage_bps": "0", "timestamp": _ts(1),
+             "slippage_adverse_bps": "0", "timestamp": _ts(1),
              "position_id": "spread-1", "position_type": "spread",
              "reason": "spread exit", "realized_pnl": "75.0"},
             {"symbol": "SPY260618P00704000", "side": "sell", "strategy": "credit_spread",
              "avg_fill_price": "0", "filled_qty": "1", "qty": "1",
-             "realized_slippage_bps": "0", "timestamp": _ts(1),
+             "slippage_adverse_bps": "0", "timestamp": _ts(1),
              "position_id": "spread-1", "position_type": "spread",
              "reason": "spread exit"},
             {"symbol": "SPY260626P00704000", "side": "buy", "strategy": "credit_spread",
              "avg_fill_price": "0.61", "filled_qty": "1", "qty": "1",
-             "realized_slippage_bps": "0", "timestamp": _ts(2),
+             "slippage_adverse_bps": "0", "timestamp": _ts(2),
              "position_id": "spread-2", "position_type": "spread",
              "reason": "spread exit", "realized_pnl": "66.0"},
         ])
@@ -725,32 +764,48 @@ class TestComputeStrategyStats:
         assert row["win_rate"] == pytest.approx(1.0)
         assert row["total_pnl"] == pytest.approx(141.0)
 
-    def test_mleg_spread_avg_slippage_uses_completed_entry_and_close_rows(self):
+    def test_mleg_spread_avg_adverse_slippage_excludes_long_leg_nulls(self):
+        """Phase 2 slippage unification — MLEG long-leg rows write
+        NULL on `slippage_adverse_bps` (codepath §11). The dashboard
+        weighted average gates numerator + denominator on the same
+        `.notna()` mask so the long-leg structural NULL contributes
+        neither value nor weight.
+
+        Pre-Phase 2 the long-leg row carried
+        `realized_slippage_bps = 0.0` and the dashboard filtered it
+        out via an `avg_fill_price > 0` workaround. With the
+        unified taxonomy that workaround is unnecessary: the NULL
+        slippage value is the signal.
+        """
         df = self._make_df([
+            # Short-leg entry: adverse 40 bps × qty 2.
             {"symbol": "SPY260618P00714000", "side": "sell", "strategy": "credit_spread",
              "avg_fill_price": "1.50", "filled_qty": "2", "qty": "2",
-             "realized_slippage_bps": "-100.0", "timestamp": _ts(0),
+             "slippage_adverse_bps": "40.0", "timestamp": _ts(0),
              "position_id": "spread-1", "position_type": "spread",
              "reason": "spread entry"},
+            # Long-leg entry: NULL adverse (structural — no honest benchmark).
             {"symbol": "SPY260618P00704000", "side": "buy", "strategy": "credit_spread",
              "avg_fill_price": "0", "filled_qty": "2", "qty": "2",
-             "realized_slippage_bps": "0", "timestamp": _ts(0),
+             "slippage_adverse_bps": None, "timestamp": _ts(0),
              "position_id": "spread-1", "position_type": "spread",
              "reason": "spread entry"},
+            # Short-leg exit: adverse 60 bps × qty 2.
             {"symbol": "SPY260618P00714000", "side": "buy", "strategy": "credit_spread",
              "avg_fill_price": "0.63", "filled_qty": "2", "qty": "2",
-             "realized_slippage_bps": "50.0", "timestamp": _ts(1),
+             "slippage_adverse_bps": "60.0", "timestamp": _ts(1),
              "position_id": "spread-1", "position_type": "spread",
              "reason": "spread exit", "realized_pnl": "174.0"},
+            # Long-leg exit: NULL adverse.
             {"symbol": "SPY260618P00704000", "side": "sell", "strategy": "credit_spread",
              "avg_fill_price": "0", "filled_qty": "2", "qty": "2",
-             "realized_slippage_bps": "0", "timestamp": _ts(1),
+             "slippage_adverse_bps": None, "timestamp": _ts(1),
              "position_id": "spread-1", "position_type": "spread",
              "reason": "spread exit"},
-            # Still-open spread should not affect completed-trade slippage.
+            # Still-open spread short-leg: must not affect completed-trade avg.
             {"symbol": "QQQ260618P00674000", "side": "sell", "strategy": "credit_spread",
              "avg_fill_price": "2.00", "filled_qty": "1", "qty": "1",
-             "realized_slippage_bps": "999.0", "timestamp": _ts(2),
+             "slippage_adverse_bps": "999.0", "timestamp": _ts(2),
              "position_id": "spread-open", "position_type": "spread",
              "reason": "spread entry"},
         ])
@@ -759,7 +814,163 @@ class TestComputeStrategyStats:
 
         assert row["trades"] == 1
         assert row["total_pnl"] == pytest.approx(174.0)
-        assert row["avg_slippage_bps"] == pytest.approx(-25.0)
+        # Weighted average over the two short-leg rows only:
+        # (40*2 + 60*2) / (2 + 2) = 50.0. Long-leg NULLs excluded
+        # naturally by the .notna() mask — not by the legacy
+        # avg_fill_price > 0 workaround.
+        assert row["avg_adverse_slippage_bps"] == pytest.approx(50.0)
+
+    def test_recovered_quality_rows_excluded_from_strategy_average(self):
+        """Phase 2 quality whitelist regression guard. Pre-fix the
+        dashboard gated on `slippage_adverse_bps.notna()` alone, so a
+        recovered-quality row (e.g. broker-history reconstructed stop
+        fill) with a huge adverse value would pollute the operator-
+        facing Avg Adverse Slippage Bps even though health /
+        calibration / reconcile / pnl all exclude it.
+
+        Setup: trade A with measured 50 bps adverse (primary) + trade
+        B with recovered 999 bps adverse. Pre-fix avg would be
+        ~525 bps. Post-fix only trade A contributes — avg = 50 bps."""
+        df = self._make_df([
+            # Trade A — measured.
+            {"symbol": "AAPL", "side": "buy", "strategy": "sma_crossover",
+             "avg_fill_price": "100.0", "filled_qty": "10", "qty": "10",
+             "slippage_adverse_bps": None, "timestamp": _ts(0),
+             "entry_timestamp": _ts(0)},
+            {"symbol": "AAPL", "side": "sell", "strategy": "sma_crossover",
+             "avg_fill_price": "110.0", "filled_qty": "10", "qty": "10",
+             "slippage_adverse_bps": "50.0",
+             "slippage_measurement_quality": "primary",
+             "timestamp": _ts(1),
+             "entry_timestamp": _ts(0), "realized_pnl": "100.0"},
+            # Trade B — recovered (reconstructed from broker history).
+            {"symbol": "MSFT", "side": "buy", "strategy": "sma_crossover",
+             "avg_fill_price": "200.0", "filled_qty": "10", "qty": "10",
+             "slippage_adverse_bps": None, "timestamp": _ts(2),
+             "entry_timestamp": _ts(2)},
+            {"symbol": "MSFT", "side": "sell", "strategy": "sma_crossover",
+             "avg_fill_price": "210.0", "filled_qty": "10", "qty": "10",
+             "slippage_adverse_bps": "999.0",
+             "slippage_measurement_quality": "recovered",
+             "timestamp": _ts(3),
+             "entry_timestamp": _ts(2), "realized_pnl": "100.0"},
+        ])
+        stats = compute_strategy_stats(df)
+        row = stats.iloc[0]
+        assert row["trades"] == 2
+        # Only the primary-quality row contributes. Avg = 50 bps. The
+        # recovered 999 bps row is excluded from BOTH numerator and
+        # denominator — without this it would have pulled the average
+        # to ~525 bps.
+        assert row["avg_adverse_slippage_bps"] == pytest.approx(50.0)
+
+    def test_mleg_recovered_quality_short_leg_excluded(self):
+        """Same regression guard on the MLEG branch — a recovered
+        short-leg row with a huge value must not pollute the
+        weighted average."""
+        df = self._make_df([
+            # spread-1: measured short-leg pair.
+            {"symbol": "SPY260618P00714000", "side": "sell", "strategy": "credit_spread",
+             "avg_fill_price": "1.50", "filled_qty": "2", "qty": "2",
+             "slippage_adverse_bps": "40.0",
+             "slippage_measurement_quality": "primary",
+             "timestamp": _ts(0),
+             "position_id": "spread-1", "position_type": "spread",
+             "reason": "spread entry"},
+            {"symbol": "SPY260618P00704000", "side": "buy", "strategy": "credit_spread",
+             "avg_fill_price": "0", "filled_qty": "2", "qty": "2",
+             "slippage_adverse_bps": None, "timestamp": _ts(0),
+             "position_id": "spread-1", "position_type": "spread",
+             "reason": "spread entry"},
+            {"symbol": "SPY260618P00714000", "side": "buy", "strategy": "credit_spread",
+             "avg_fill_price": "0.63", "filled_qty": "2", "qty": "2",
+             "slippage_adverse_bps": "60.0",
+             "slippage_measurement_quality": "primary",
+             "timestamp": _ts(1),
+             "position_id": "spread-1", "position_type": "spread",
+             "reason": "spread exit", "realized_pnl": "174.0"},
+            {"symbol": "SPY260618P00704000", "side": "sell", "strategy": "credit_spread",
+             "avg_fill_price": "0", "filled_qty": "2", "qty": "2",
+             "slippage_adverse_bps": None, "timestamp": _ts(1),
+             "position_id": "spread-1", "position_type": "spread",
+             "reason": "spread exit"},
+            # spread-2: recovered short-leg pair (reconstructed
+            # spread close) carrying a huge 999 bps adverse value.
+            {"symbol": "SPY260620P00714000", "side": "sell", "strategy": "credit_spread",
+             "avg_fill_price": "1.50", "filled_qty": "2", "qty": "2",
+             "slippage_adverse_bps": "999.0",
+             "slippage_measurement_quality": "recovered",
+             "timestamp": _ts(2),
+             "position_id": "spread-2", "position_type": "spread",
+             "reason": "spread entry"},
+            {"symbol": "SPY260620P00704000", "side": "buy", "strategy": "credit_spread",
+             "avg_fill_price": "0", "filled_qty": "2", "qty": "2",
+             "slippage_adverse_bps": None, "timestamp": _ts(2),
+             "position_id": "spread-2", "position_type": "spread",
+             "reason": "spread entry"},
+            {"symbol": "SPY260620P00714000", "side": "buy", "strategy": "credit_spread",
+             "avg_fill_price": "0.63", "filled_qty": "2", "qty": "2",
+             "slippage_adverse_bps": "999.0",
+             "slippage_measurement_quality": "recovered",
+             "timestamp": _ts(3),
+             "position_id": "spread-2", "position_type": "spread",
+             "reason": "spread exit", "realized_pnl": "174.0"},
+            {"symbol": "SPY260620P00704000", "side": "sell", "strategy": "credit_spread",
+             "avg_fill_price": "0", "filled_qty": "2", "qty": "2",
+             "slippage_adverse_bps": None, "timestamp": _ts(3),
+             "position_id": "spread-2", "position_type": "spread",
+             "reason": "spread exit"},
+        ])
+        stats = compute_strategy_stats(df)
+        row = stats[stats["strategy"] == "credit_spread"].iloc[0]
+        assert row["trades"] == 2
+        # Only spread-1's primary short-leg rows contribute. Avg =
+        # (40*2 + 60*2) / (2 + 2) = 50.0. Without the whitelist the
+        # recovered 999 bps rows on spread-2 would push the average
+        # toward 524.5.
+        assert row["avg_adverse_slippage_bps"] == pytest.approx(50.0)
+
+    def test_single_leg_avg_adverse_slippage_excludes_null_rows(self):
+        """Phase 2 denominator-dilution fix — single-leg exit rows
+        whose `slippage_adverse_bps` is NULL (e.g. options LIMIT
+        exits, external closes) must contribute neither value nor
+        weight to the weighted average. Pre-fix the denominator
+        summed all `filled_qty_num` for the exit group and silently
+        diluted the average toward zero.
+
+        Setup: two completed trades. Trade A has a measured 200 bps
+        adverse slippage on qty 10. Trade B closed via a path that
+        writes NULL slippage (qty 10). Pre-fix avg = (200*10 +
+        0*10)/(10+10) = 100. Post-fix avg = (200*10)/10 = 200 —
+        the measured trade reports its true average.
+        """
+        df = self._make_df([
+            # Trade A entry + measured exit (200 bps adverse).
+            {"symbol": "AAPL", "side": "buy", "strategy": "sma_crossover",
+             "avg_fill_price": "100.0", "filled_qty": "10", "qty": "10",
+             "slippage_adverse_bps": None, "timestamp": _ts(0),
+             "entry_timestamp": _ts(0)},
+            {"symbol": "AAPL", "side": "sell", "strategy": "sma_crossover",
+             "avg_fill_price": "110.0", "filled_qty": "10", "qty": "10",
+             "slippage_adverse_bps": "200.0", "timestamp": _ts(1),
+             "entry_timestamp": _ts(0), "realized_pnl": "100.0"},
+            # Trade B entry + NULL-slippage exit (e.g. external close).
+            {"symbol": "MSFT", "side": "buy", "strategy": "sma_crossover",
+             "avg_fill_price": "200.0", "filled_qty": "10", "qty": "10",
+             "slippage_adverse_bps": None, "timestamp": _ts(2),
+             "entry_timestamp": _ts(2)},
+            {"symbol": "MSFT", "side": "sell", "strategy": "sma_crossover",
+             "avg_fill_price": "210.0", "filled_qty": "10", "qty": "10",
+             "slippage_adverse_bps": None, "timestamp": _ts(3),
+             "entry_timestamp": _ts(2), "realized_pnl": "100.0"},
+        ])
+        stats = compute_strategy_stats(df)
+        row = stats.iloc[0]
+        assert row["trades"] == 2
+        # Only Trade A contributes. Avg = 200 bps. Pre-fix this
+        # was 100 because Trade B's qty=10 silently inflated the
+        # denominator without contributing to the numerator.
+        assert row["avg_adverse_slippage_bps"] == pytest.approx(200.0)
 
 
 class TestComputeSleeveUsage:

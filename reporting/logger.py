@@ -593,41 +593,15 @@ class TradeLogger:
         timestamp instead of stamping "time of reconstruction", which would
         make recovered rows look like after-the-fact fills.
         """
-        # Arrival-price slippage is only a meaningful execution-quality
-        # signal for MARKET orders. A resting LIMIT fill at $95 against a
-        # $100 limit is excellent execution — the operator got the price
-        # they asked for or better. The signed `realized_slippage_bps`
-        # would store −500 bps (price improvement); the L2 alarm now
-        # uses adverse-only semantics (max(0, realized − modeled)) so
-        # price improvement no longer trips it directly, but writing a
-        # large negative value into the row still pollutes downstream
-        # consumers and the operator-facing column. RSI mean-reversion
-        # entries are all LIMIT (strategies/rsi_reversion.py), so the
-        # cleanest answer for LIMIT is to write NULL on both slippage
-        # columns: the IS NOT NULL filter on the L2 query naturally
-        # excludes them; LIMIT execution quality lives in a separate
-        # (out-of-PR-scope) limit-fill-vs-limit-price metric.
+        # ── Slippage unification (Phase 2) ──
+        # Legacy `modeled_slippage_bps` / `realized_slippage_bps` are
+        # no longer written. Phase 1 wrote them in parallel to the new
+        # taxonomy as a migration safety net; with Phase 2 consumers
+        # (health / risk / calibration / dashboard / pnl) reading the
+        # new columns directly, the dual-write is removed and new
+        # rows write NULL on the legacy columns. Historical row
+        # cleanup is Phase 3.
         is_market_order = decision.order_type.value == "market"
-        if record_slippage and is_market_order:
-            modeled_bps: float | None = 0.0
-            realized_bps: float | None = 0.0
-            ref_price = modeled_price or decision.entry_reference_price
-            if modeled_price is not None:
-                modeled_bps = settings.SLIPPAGE_MODEL_MARKET_BPS
-            if (
-                result.avg_fill_price is not None
-                and ref_price > 0
-            ):
-                realized_bps = single_leg_realized_slippage_bps(
-                    side=decision.side.value,
-                    reference_price=ref_price,
-                    actual_fill_price=result.avg_fill_price,
-                )
-        else:
-            modeled_bps = None
-            realized_bps = None
-
-        # ── Slippage unification (Phase 1) ──
         # Default benchmark_kind / quality inference preserves current
         # behavior when callers don't pass explicit values. Engine call
         # sites tag rows with the precise kind (arrival_midpoint vs
@@ -704,10 +678,8 @@ class TradeLogger:
             reason=decision.reason,
             stop_price=decision.stop_price,
             entry_reference_price=decision.entry_reference_price,
-            modeled_slippage_bps=modeled_bps,
-            realized_slippage_bps=(
-                round(realized_bps, 2) if realized_bps is not None else None
-            ),
+            modeled_slippage_bps=None,
+            realized_slippage_bps=None,
             order_type=decision.order_type.value,
             status=result.status.value,
             requested_qty=result.requested_qty,
@@ -765,43 +737,16 @@ class TradeLogger:
             ``unavailable`` / ``unavailable`` because the close_price
             fallback chain is not a slippage benchmark.
 
-        Pass ``unavailable`` explicitly for any path where
-        ``modeled_price`` is not a proper benchmark — Defect 5 fix
-        ensures legacy columns also write NULL in that case rather
-        than computing against the non-benchmark value.
+        Phase 2: legacy `modeled_slippage_bps` / `realized_slippage_bps`
+        are no longer written. The new taxonomy columns
+        (`slippage_*`) are the sole source of truth.
         """
-        # Defect 5 fix — when the caller explicitly declares
-        # benchmark_kind='unavailable', the legacy columns should not
-        # compute a slippage value either. Without this, codepath §7
-        # (fractional residual cleanup) would write a structural ~0
-        # legacy slippage value (fill vs fill) while the new columns
-        # honestly say 'unavailable'. Align legacy with new for the
-        # explicit-unavailable case so consumers see consistent
-        # 'no measurement' across both column families.
-        legacy_metric_suppressed = benchmark_kind == "unavailable"
-        realized_bps: float | None = 0.0
-        modeled_bps: float | None = (
-            settings.SLIPPAGE_MODEL_MARKET_BPS if modeled_price > 0 else 0.0
-        )
-        if legacy_metric_suppressed:
-            realized_bps = None
-            modeled_bps = None
         context = self._read_latest_open_entry_context(
             symbol=result.symbol,
             strategy=strategy_name,
         )
         timestamp_dt = timestamp_override or datetime.now(timezone.utc)
         now_iso = timestamp_dt.astimezone(timezone.utc).isoformat()
-        if (
-            not legacy_metric_suppressed
-            and result.avg_fill_price is not None
-            and modeled_price > 0
-        ):
-            realized_bps = single_leg_realized_slippage_bps(
-                side="sell",
-                reference_price=modeled_price,
-                actual_fill_price=result.avg_fill_price,
-            )
         realized_pnl = None
         r_multiple = None
         initial_stop_loss = None
@@ -877,10 +822,8 @@ class TradeLogger:
             reason=reason,
             stop_price=0.0,
             entry_reference_price=modeled_price,
-            modeled_slippage_bps=modeled_bps,
-            realized_slippage_bps=(
-                round(realized_bps, 2) if realized_bps is not None else None
-            ),
+            modeled_slippage_bps=None,
+            realized_slippage_bps=None,
             order_type="market",
             status=result.status.value,
             requested_qty=result.requested_qty,
@@ -1140,10 +1083,21 @@ class TradeLogger:
                 list(d.values()),
             )
         conn.commit()
+        # Phase 2 slippage unification: log the signed bps from the new
+        # taxonomy column (writer-clamped adverse value is available too,
+        # but signed carries the price-improvement / adverse distinction
+        # operators care about during paper review) plus the benchmark
+        # kind + measurement quality so operators can audit the row
+        # without cross-referencing the design doc. Legacy
+        # realized_slippage_bps is NULL on every new row and would
+        # always log as `slip=Nonebps`.
+        signed = record.slippage_signed_bps
+        kind = record.slippage_benchmark_kind or "unknown"
+        quality = record.slippage_measurement_quality or "unknown"
         logger.info(
             f"trade logged: {record.side} {record.qty} {record.symbol} "
             f"@ ${record.avg_fill_price} [{record.strategy}] "
-            f"slip={record.realized_slippage_bps}bps"
+            f"slip_signed={signed}bps kind={kind} quality={quality}"
         )
 
     def read_all(self) -> list[dict]:
@@ -1349,13 +1303,13 @@ class TradeLogger:
             if math.isfinite(pnl_f):
                 r_multiple = pnl_f / basis
 
-        # ── Slippage unification (Phase 1) codepath §11 ──
+        # ── Slippage unification (Phase 2) codepath §11 ──
         # The short leg carries the economic measurement against the
         # submitted combo limit; the long leg is structural and writes
-        # NULL slippage on the new columns. Legacy columns dual-write
-        # zeros on the long leg for Phase 1 consumer compat (the
-        # passive-leg NULL transition for SUM/AVG consumers is a Phase 2
-        # follow-up — see tracker migration plan).
+        # NULL slippage on the new columns. Legacy `modeled_slippage_bps`
+        # / `realized_slippage_bps` are no longer written (Phase 1
+        # dual-write removed) — both legs get NULL on the legacy
+        # columns. SUM/AVG consumers have migrated to the new columns.
         short_new_kind: SlippageBenchmarkKind
         short_new_quality: SlippageMeasurementQuality
         short_new_benchmark_price: float | None
@@ -1381,7 +1335,6 @@ class TradeLogger:
             pnl: float | None,
             *,
             entry_reference_price: float,
-            slippage_bps: float,
             risk_dollars: float | None,
             r_mult: float | None,
             new_benchmark_kind: SlippageBenchmarkKind,
@@ -1401,8 +1354,8 @@ class TradeLogger:
                 reason=reason or default_reason,
                 stop_price=0.0,
                 entry_reference_price=entry_reference_price,
-                modeled_slippage_bps=0.0,
-                realized_slippage_bps=slippage_bps,
+                modeled_slippage_bps=None,
+                realized_slippage_bps=None,
                 order_type="mleg",
                 status=row_status,
                 requested_qty=qty,
@@ -1442,7 +1395,6 @@ class TradeLogger:
             net_price,
             realized_pnl,
             entry_reference_price=short_ref_price,
-            slippage_bps=short_slippage_bps,
             risk_dollars=basis,
             r_mult=r_multiple,
             new_benchmark_kind=short_new_kind,
@@ -1451,16 +1403,14 @@ class TradeLogger:
             new_signed_bps=short_new_signed_bps,
             new_adverse_bps=short_new_adverse_bps,
         ))
-        # Long leg is structural — new columns write NULL/'unavailable'
-        # so SUM/AVG consumers can distinguish structural zeros from
-        # real measurements once they migrate. Legacy 0.0 retained.
+        # Long leg is structural — new columns write NULL/'unavailable'.
+        # Legacy columns also NULL (Phase 1 dual-write removed).
         self.log(_leg_record(
             long_occ,
             long_side,
             0.0,
             None,
             entry_reference_price=0.0,
-            slippage_bps=0.0,
             risk_dollars=None,
             r_mult=None,
             new_benchmark_kind="unavailable",
@@ -1538,10 +1488,11 @@ class TradeLogger:
         authoritative slippage benchmark for stop fills — see
         docs/slippage_unification_design.md §Stop Lifecycle. When None or
         non-positive, the new slippage columns are written as
-        ``unavailable`` and signed/adverse values stay NULL; legacy
-        ``realized_slippage_bps`` / ``modeled_slippage_bps`` retain their
-        old behavior (fall back to ``initial_stop_loss``) for Phase 1
-        consumer compatibility.
+        ``unavailable`` and signed/adverse values stay NULL.
+
+        Phase 2: legacy `modeled_slippage_bps` / `realized_slippage_bps`
+        are no longer written; the new taxonomy columns are the sole
+        source of truth.
 
         `measurement_quality` lets the recovery path tag rows as
         ``recovered`` rather than ``primary``. Forced to ``unavailable``
@@ -1624,25 +1575,8 @@ class TradeLogger:
             new_slippage_adverse_bps = max(0.0, signed)
             new_stop_trigger_price = benchmark
 
-        # ── Legacy dual-write (Phase 1 compat) ──
-        # Prefer broker stop_price when available so legacy consumers
-        # immediately benefit from the more accurate benchmark; otherwise
-        # fall back to initial_stop_loss exactly as before this change.
-        legacy_reference = (
-            coerced_stop
-            if broker_stop_available
-            else float(initial_stop_loss or 0.0)
-        )
-        realized_slippage_bps = 0.0
-        modeled_slippage_bps = 0.0
-        if legacy_reference > 0:
-            modeled_slippage_bps = settings.SLIPPAGE_MODEL_MARKET_BPS
-            realized_slippage_bps = single_leg_realized_slippage_bps(
-                side="sell",
-                reference_price=legacy_reference,
-                actual_fill_price=avg_fill_price,
-            )
-
+        # Phase 2: legacy dual-write removed. The new taxonomy
+        # columns are the sole source of truth.
         record = TradeRecord(
             timestamp=now_iso,
             symbol=symbol,
@@ -1654,8 +1588,8 @@ class TradeLogger:
             reason="stop_triggered",
             stop_price=avg_fill_price,
             entry_reference_price=entry_reference_price,
-            modeled_slippage_bps=modeled_slippage_bps,
-            realized_slippage_bps=round(realized_slippage_bps, 2),
+            modeled_slippage_bps=None,
+            realized_slippage_bps=None,
             order_type="stop",
             status="filled",
             requested_qty=qty,

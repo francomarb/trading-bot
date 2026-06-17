@@ -75,7 +75,7 @@ What did NOT land in Phase 1 (deferred as planned):
 |---|---|---|---|---|
 | 1 | Schema + writers + dual-write to legacy + 13 codepath tests | `feature/slippage-unification-phase1` | #43 merged `bf16b5a` | ✅ Merged |
 | Smoke check | 2 days paper run on main; spot-check rows per codepath | main | — | 🔄 In progress |
-| 2 + 4 | Consumer migration (health, risk, calibration, dashboard) + dashboard denominator dilution fix + drop legacy dual-writes | `feature/slippage-unification-phase2` | — | ⬜ Not started |
+| 2 + 4 | Consumer migration (health, risk, calibration, dashboard, pnl) + dashboard denominator dilution fix + drop legacy dual-writes | `feature/slippage-unification-phase2` | — | ✅ Merged |
 | 3 | Historical cleanup migration (phantom recovery rows + pre-`8316e64` LIMIT rows) | `feature/slippage-unification-phase3` | — | ⬜ Not started |
 
 Calendar estimate: ~2 weeks total, 3 PRs.
@@ -196,18 +196,114 @@ smoke-period rows keep their new columns populated but no consumer reads them.
 
 ---
 
+## Phase 2 + 4 — As-built summary
+
+Phase 2 + 4 landed on `feature/slippage-unification-phase2` as 9
+commits (commit 0 tracker kickoff + 8 logical commits). Full suite
+2712 passed.
+
+What landed:
+
+- **Health assessor** (`strategies/health/assessor.py:_slippage_p95_bps`)
+  reads `slippage_adverse_bps` directly; quality whitelist
+  `slippage_measurement_quality IN ('primary','fallback')` replaces
+  the legacy `reason NOT LIKE` defensive filter. Fails closed for
+  any future enum.
+- **Calibration script** (`scripts/calibrate_health_thresholds.py`)
+  mirrors the assessor query — same column, same whitelist.
+- **RiskManager** (`risk/manager.py`) `record_fill_slippage`
+  parameter renamed `realized_bps` → `adverse_bps`. The engine
+  was already clamping to adverse before calling; the rename
+  aligns naming with the persisted column and the docstring +
+  log lines now refer to "adverse" rather than the ambiguous
+  "realized" (no behavior change).
+- **Dashboard Recent Trades** surfaces `slippage_benchmark_kind`
+  + `slippage_measurement_quality` columns alongside the bps
+  value so the operator can audit every slippage number's
+  measurement context (`arrival_midpoint`/`active_stop_price`/
+  `limit_price`/`unavailable`; `primary`/`fallback`/`recovered`).
+- **Dashboard `compute_strategy_stats`** migrated to
+  `slippage_adverse_bps`. **Denominator dilution fix**: numerator
+  and denominator gated on the same `.notna()` mask for both
+  single-leg and MLEG branches; the pre-Phase-2 MLEG long-leg
+  `avg_fill_price > 0` workaround is removed (the unified
+  column's NULL value is the structural-zero signal). Column
+  header renamed `Avg Slippage Bps` → `Avg Adverse Slippage Bps`.
+- **`reporting/pnl.py`** weekly summary, daily slippage stats,
+  `slippage_report`, and per-strategy attribution all read
+  `slippage_adverse_bps` via the `_adverse_bps()` helper that
+  returns `Optional[float]`. Rows with NULL slippage are skipped,
+  not defaulted to 0 — operator-facing means are no longer
+  silently diluted toward zero by paths without a benchmark.
+  Labels updated to "Mean adverse slippage" / "Max adverse
+  slippage".
+- **Legacy dual-write removed** (Phase 4 fold-in) across
+  `build_record`, `build_close_record`, `log_stop_fill`, and
+  `log_spread_fill`. New rows write NULL on
+  `modeled_slippage_bps` / `realized_slippage_bps`; the new
+  taxonomy columns are the sole source of truth. The Phase 1
+  market-entry-without-benchmark divergence is reconciled — no
+  more silent `decision.entry_reference_price` fallback.
+- **Test sweep**: `TestSlippageDualWriteParity` (5 tests)
+  replaced with `TestNoLegacyWritesOnNewRows` (5 tests + the
+  MLEG long-leg structural-zero regression guard). The
+  Phase 1 pinned test
+  `test_market_entry_without_benchmark_legacy_still_uses_decision_price`
+  is replaced with the reconciled-divergence pin.
+
+What did NOT land in Phase 2 (deferred as planned):
+
+- Historical row cleanup migration — Phase 3.
+
+---
+
+## Phase 2 + 4 — Commit checklist
+
+Branch: `feature/slippage-unification-phase2`
+
+| # | Commit | Notes | Status |
+|---|---|---|---|
+| 0 | Tracker kickoff + commit checklist | `3cbb238` | ✅ |
+| 1 | `strategies/health/assessor.py` → `slippage_adverse_bps` + quality whitelist | `3ceaf04` | ✅ |
+| 2 | `scripts/calibrate_health_thresholds.py` → same | `f06ad55` | ✅ |
+| 3 | `RiskManager.record_fill_slippage` adverse_bps rename | `94dce7a` | ✅ |
+| 4 | Dashboard Recent Trades surfaces benchmark_kind + quality | `58f2249` | ✅ |
+| 5 | Dashboard `compute_strategy_stats` + dilution fix + column rename | `741d57a` | ✅ |
+| 6 | `reporting/pnl.py` migration; skip NULL rows | `02e34b8` | ✅ |
+| 7 | Drop legacy dual-writes; reconcile divergence; swap parity tests | `95e4178` | ✅ |
+| 8 | Tracker + PLAN.md sync | this commit | ✅ |
+
+---
+
 ## Phase 2 + 4 — Consumer migration scope
 
 Branch: `feature/slippage-unification-phase2`
 
-- [ ] `strategies/health/assessor.py` reads `slippage_adverse_bps` (and filters by `measurement_quality`)
-- [ ] `risk/manager.py` kill switch reads `slippage_adverse_bps`
-- [ ] `scripts/calibrate_health_thresholds.py` reads `slippage_adverse_bps`
-- [ ] `dashboard.py` Recent Trades displays `slippage_benchmark_kind` + `measurement_quality` alongside slippage bps
-- [ ] `dashboard.py:710` denominator dilution fix — `IS NOT NULL` mask on slippage_denom
-- [ ] Stop dual-writing `realized_slippage_bps` / `modeled_slippage_bps` on new rows (Phase 4 fold-in)
-- [ ] Update tests that read legacy columns
-- [ ] **Reconcile Phase 1 divergence**: market-entry path without `modeled_price` — align legacy `realized_slippage_bps` with new (NULL instead of decision-price fallback). See `test_market_entry_without_benchmark_legacy_still_uses_decision_price` for the pinned current behavior.
+- [x] `strategies/health/assessor.py` reads `slippage_adverse_bps` (and filters by `measurement_quality`)
+- [x] `risk/manager.py` kill switch reads `slippage_adverse_bps` (param rename — engine clamps to adverse before calling)
+- [x] `scripts/calibrate_health_thresholds.py` reads `slippage_adverse_bps`
+- [x] `dashboard.py` Recent Trades displays `slippage_benchmark_kind` + `measurement_quality` alongside slippage bps
+- [x] `dashboard.py:710` denominator dilution fix — `.notna()` mask on numerator + denominator
+- [x] `reporting/pnl.py` weekly/daily/slippage reports read `slippage_adverse_bps`; skip NULL rows
+- [x] Stop dual-writing `realized_slippage_bps` / `modeled_slippage_bps` on new rows (Phase 4 fold-in)
+- [x] Update tests that read legacy columns
+- [x] **Reconcile Phase 1 divergence**: market-entry path without `modeled_price` — both legacy AND new columns now NULL (dual-write removed).
+
+### Commit checklist
+
+Branch: `feature/slippage-unification-phase2`
+
+| # | Commit | Notes | Status |
+|---|---|---|---|
+| 0 | Tracker kickoff + commit checklist | this commit | ✅ |
+| 1 | `strategies/health/assessor.py` → `slippage_adverse_bps`; quality whitelist `IN ('primary','fallback')` | drops legacy `reason NOT LIKE` defensive filter (superseded by quality column) | ✅ |
+| 2 | `scripts/calibrate_health_thresholds.py` → same | mirrors assessor query shape | ✅ |
+| 3 | `RiskManager.record_fill_slippage` param rename `realized_bps` → `adverse_bps` | engine already clamps to adverse before calling; pure naming + docs | ✅ |
+| 4 | Dashboard Recent Trades surfaces `slippage_benchmark_kind` + `slippage_measurement_quality` | + `load_trades` empty-frame columns | ✅ |
+| 5 | Dashboard `compute_strategy_stats` → `slippage_adverse_bps`; numerator + denominator from same `.notna()` mask | rename column to `Avg Adverse Slippage Bps`; MLEG branch parallel | ✅ |
+| 6 | `reporting/pnl.py` weekly/daily/slippage reports → `slippage_adverse_bps`; skip NULL rows | no silent zero-defaults | ✅ |
+| 7 | Drop legacy dual-writes across writers; reconcile Phase 1 divergence; swap parity tests for no-legacy tests | + MLEG long-leg legacy-NULL test | ✅ |
+| 8 | Tracker + PLAN.md sync | mark Phase 2+4 ✅; P1 row updated | ⬜ |
 
 ---
 

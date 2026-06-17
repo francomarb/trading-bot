@@ -2579,22 +2579,24 @@ class TradingEngine:
         side: str = "buy",
     ) -> None:
         """
-        Feed the realized vs. modeled slippage into the Phase 6 drift kill
-        switch. Modeled fill = the arrival price at submission (NBBO mid);
-        realized fill = what Alpaca actually gave us.
+        Feed the adverse-clamped fill slippage into the Phase 6 drift
+        kill switch. Modeled fill = the arrival price at submission
+        (NBBO mid); realized fill = what Alpaca actually gave us.
 
         MARKET orders only. LIMIT orders are skipped because arrival
         price is not a meaningful execution-quality benchmark for them —
         a resting limit at $100 filled at $95 looks like -500 bps against
         arrival but is a clean fill against the limit.
 
-        The kill switch consumes **adverse-only** magnitude. We compute
-        signed slippage via single_leg_realized_slippage_bps (positive =
-        adverse fill / negative = price improvement) and clamp negatives
-        to 0 before recording. A run of unusually good fills must not
-        trip the drift halt — that's the conceptual bug shared with the
-        L2 Health check's previous abs() semantics (PR follow-up after
-        the credit_spread DEGRADED false positive on a sample of
+        The kill switch consumes **adverse-only** magnitude — the same
+        quantity persisted as `slippage_adverse_bps` on `trades` (Phase 2
+        slippage unification). We compute signed slippage via
+        `single_leg_realized_slippage_bps` (positive = adverse fill /
+        negative = price improvement) and clamp `max(0, signed)` before
+        recording. A run of unusually good fills must not trip the
+        drift halt — that's the conceptual bug shared with the L2 Health
+        check's previous abs() semantics (PR follow-up after the
+        credit_spread DEGRADED false positive on a sample of
         zero-slippage + price-improvement fills).
         """
         if result.status not in {OrderStatus.FILLED, OrderStatus.PARTIAL}:
@@ -2609,9 +2611,9 @@ class TradingEngine:
             reference_price=modeled_price,
             actual_fill_price=result.avg_fill_price,
         )
-        realized_bps = max(0.0, signed_bps)
+        adverse_bps = max(0.0, signed_bps)
         self.risk.record_fill_slippage(
-            modeled_bps=modeled_bps, realized_bps=realized_bps
+            modeled_bps=modeled_bps, adverse_bps=adverse_bps
         )
 
     def _log_entry(

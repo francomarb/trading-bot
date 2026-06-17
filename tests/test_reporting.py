@@ -129,8 +129,13 @@ class TestTradeLogger:
         tl = TradeLogger(path="/dev/null")
         record = tl.build_record(sample_decision, sample_result, modeled_price=150.0)
         # Buy entry: paying above the modeled price is adverse.
-        assert record.modeled_slippage_bps == pytest.approx(5.0)
-        assert record.realized_slippage_bps == pytest.approx(3.33)
+        # Phase 2: legacy `modeled_slippage_bps` / `realized_slippage_bps`
+        # are no longer written; the unified `slippage_*` columns are
+        # the sole source of truth.
+        assert record.modeled_slippage_bps is None
+        assert record.realized_slippage_bps is None
+        assert record.slippage_signed_bps == pytest.approx(3.33)
+        assert record.slippage_adverse_bps == pytest.approx(3.33)
 
     def test_single_leg_slippage_is_signed_by_side(self):
         assert single_leg_realized_slippage_bps(
@@ -177,17 +182,26 @@ class TestTradeLogger:
 
     def test_build_close_record(self, sample_result):
         tl = TradeLogger(path="/dev/null")
+        # Phase 2: build_close_record requires an explicit benchmark_kind
+        # to compute the new taxonomy columns. Use 'arrival_midpoint' to
+        # match the close-time arrival price the engine passes from the
+        # quote midpoint at submit.
         record = tl.build_close_record(
-            sample_result, strategy_name="sma_crossover", modeled_price=150.0
+            sample_result, strategy_name="sma_crossover", modeled_price=150.0,
+            benchmark_kind="arrival_midpoint",
         )
         assert record.side == "sell"
         assert record.strategy == "sma_crossover"
         assert record.reason == "exit signal"
         assert record.stop_price == 0.0
         assert record.exit_timestamp is not None
-        assert record.modeled_slippage_bps == pytest.approx(5.0)
+        # Phase 2: legacy columns NULL on new rows.
+        assert record.modeled_slippage_bps is None
+        assert record.realized_slippage_bps is None
         # Sell exit: filling above the modeled price is price improvement.
-        assert record.realized_slippage_bps == pytest.approx(-3.33)
+        assert record.slippage_signed_bps == pytest.approx(-3.33)
+        # Adverse-only column clamps to 0 for price improvement.
+        assert record.slippage_adverse_bps == pytest.approx(0.0)
 
     def test_build_close_record_computes_realized_pnl_and_r(self, tmp_csv, sample_decision, sample_result):
         tl = TradeLogger(path=tmp_csv)
@@ -736,12 +750,22 @@ class TestTradeLogger:
             strategy="sma_crossover",
             qty=10,
             avg_fill_price=94.50,
+            # Phase 2 stop benchmarking: broker stop_price is the
+            # authoritative reference; caller (WS or recovery path)
+            # passes it directly. Without it the row records
+            # unavailable / unavailable.
+            stop_price=95.0,
             order_id="stop-1",
         )
 
         stop_record = tl.read_recent(1)[0]
-        assert stop_record["modeled_slippage_bps"] == pytest.approx(5.0)
-        assert stop_record["realized_slippage_bps"] == pytest.approx(52.63)
+        # Phase 2: legacy columns NULL on new rows.
+        assert stop_record["modeled_slippage_bps"] is None
+        assert stop_record["realized_slippage_bps"] is None
+        # Fill 94.50 below stop 95.0 on a sell → adverse fill.
+        assert stop_record["slippage_signed_bps"] == pytest.approx(52.63, abs=0.01)
+        assert stop_record["slippage_adverse_bps"] == pytest.approx(52.63, abs=0.01)
+        assert stop_record["slippage_benchmark_kind"] == "active_stop_price"
 
     def test_stop_fill_records_negative_slippage_for_price_improvement(self, tmp_csv):
         tl = TradeLogger(path=tmp_csv)
@@ -772,12 +796,18 @@ class TestTradeLogger:
             strategy="sma_crossover",
             qty=10,
             avg_fill_price=95.50,
+            stop_price=95.0,
             order_id="stop-1",
         )
 
         stop_record = tl.read_recent(1)[0]
-        assert stop_record["modeled_slippage_bps"] == pytest.approx(5.0)
-        assert stop_record["realized_slippage_bps"] == pytest.approx(-52.63)
+        # Phase 2: legacy columns NULL on new rows.
+        assert stop_record["modeled_slippage_bps"] is None
+        assert stop_record["realized_slippage_bps"] is None
+        # Fill 95.50 above stop 95.0 on a sell → price improvement.
+        assert stop_record["slippage_signed_bps"] == pytest.approx(-52.63, abs=0.01)
+        # Adverse-only column clamps to 0 for price improvement.
+        assert stop_record["slippage_adverse_bps"] == pytest.approx(0.0)
 
     def test_as_dict_has_all_columns(self, sample_decision, sample_result):
         tl = TradeLogger(path="/dev/null")
@@ -785,7 +815,7 @@ class TestTradeLogger:
         d = record.as_dict()
         assert set(d.keys()) == set(TRADE_CSV_COLUMNS)
 
-    def test_no_fill_price_zero_slippage(self, sample_decision):
+    def test_no_fill_price_records_null_slippage(self, sample_decision):
         result = OrderResult(
             status=OrderStatus.FILLED,
             order_id="x",
@@ -797,7 +827,13 @@ class TestTradeLogger:
         )
         tl = TradeLogger(path="/dev/null")
         record = tl.build_record(sample_decision, result, modeled_price=150.0)
-        assert record.realized_slippage_bps == 0.0
+        # Phase 2: no fill price → no honest measurement.
+        # Legacy columns NULL (dual-write removed); new columns
+        # also NULL (no computed value).
+        assert record.realized_slippage_bps is None
+        assert record.modeled_slippage_bps is None
+        assert record.slippage_signed_bps is None
+        assert record.slippage_adverse_bps is None
 
     def test_read_trades_in_range(self, tmp_csv, sample_decision, sample_result):
         """Foundation §6.5: distinct order_ids → distinct rows; UPSERT
@@ -1282,9 +1318,20 @@ class TestSpreadLogging:
         rows = tl.read_all()
         by_symbol = {r["symbol"]: r for r in rows}
 
+        # Phase 2: legacy `realized_slippage_bps` is NULL on new rows
+        # (dual-write removed). Slippage now lives in
+        # `slippage_signed_bps` (and adverse-clamped in
+        # `slippage_adverse_bps`).
         assert by_symbol[self._SHORT]["entry_reference_price"] == pytest.approx(1.45)
-        assert by_symbol[self._SHORT]["realized_slippage_bps"] == pytest.approx(-344.83)
-        assert by_symbol[self._LONG]["realized_slippage_bps"] == pytest.approx(0.0)
+        assert by_symbol[self._SHORT]["realized_slippage_bps"] is None
+        assert by_symbol[self._SHORT]["slippage_signed_bps"] == pytest.approx(-344.83)
+        # Opening credit 1.50 above limit 1.45 → price improvement, adverse = 0.
+        assert by_symbol[self._SHORT]["slippage_adverse_bps"] == pytest.approx(0.0)
+        # Long leg: structural NULL on both legacy and new columns.
+        assert by_symbol[self._LONG]["realized_slippage_bps"] is None
+        assert by_symbol[self._LONG]["modeled_slippage_bps"] is None
+        assert by_symbol[self._LONG]["slippage_signed_bps"] is None
+        assert by_symbol[self._LONG]["slippage_adverse_bps"] is None
 
     def test_close_debit_slippage_is_logged_on_short_leg(self, tmp_csv):
         tl = TradeLogger(path=tmp_csv)
@@ -1298,8 +1345,13 @@ class TestSpreadLogging:
         by_symbol = {r["symbol"]: r for r in rows}
 
         assert by_symbol[self._SHORT]["entry_reference_price"] == pytest.approx(0.60)
-        assert by_symbol[self._SHORT]["realized_slippage_bps"] == pytest.approx(500.0)
-        assert by_symbol[self._LONG]["realized_slippage_bps"] == pytest.approx(0.0)
+        # Phase 2: legacy NULL; new taxonomy carries the measurement.
+        assert by_symbol[self._SHORT]["realized_slippage_bps"] is None
+        assert by_symbol[self._SHORT]["slippage_signed_bps"] == pytest.approx(500.0)
+        assert by_symbol[self._SHORT]["slippage_adverse_bps"] == pytest.approx(500.0)
+        # Long leg: structural NULL across both column families.
+        assert by_symbol[self._LONG]["realized_slippage_bps"] is None
+        assert by_symbol[self._LONG]["slippage_signed_bps"] is None
 
     def test_realized_pnl_summary_rolls_in_credit_spread_pnl(self, tmp_csv):
         tl = TradeLogger(path=tmp_csv)
@@ -1513,9 +1565,12 @@ class TestBuildRecordSlippageSemantics:
         assert row[0] is None  # modeled_slippage_bps
         assert row[1] is None  # realized_slippage_bps
 
-    def test_record_slippage_default_true_preserves_old_behavior(
+    def test_record_slippage_default_true_writes_new_columns_legacy_null(
         self, tmp_csv, sample_decision, sample_result,
     ):
+        """Phase 2: default `record_slippage=True` on a MARKET entry
+        populates the new taxonomy columns; legacy columns stay NULL
+        (dual-write removed)."""
         tl = TradeLogger(path=tmp_csv)
         record = tl.build_record(
             sample_decision, sample_result, modeled_price=150.0,
@@ -1523,21 +1578,23 @@ class TestBuildRecordSlippageSemantics:
         tl.log(record)
         conn = sqlite3.connect(tmp_csv)
         row = conn.execute(
-            "SELECT modeled_slippage_bps, realized_slippage_bps "
+            "SELECT modeled_slippage_bps, realized_slippage_bps, "
+            "slippage_signed_bps, slippage_adverse_bps "
             "FROM trades WHERE symbol = ?",
             (sample_decision.symbol,),
         ).fetchone()
-        # MARKET order with modeled_price set → modeled stub is the configured
-        # baseline; realized is computed against modeled_price.
-        assert row[0] is not None
-        assert row[1] is not None
+        assert row[0] is None  # modeled_slippage_bps (legacy)
+        assert row[1] is None  # realized_slippage_bps (legacy)
+        assert row[2] is not None  # slippage_signed_bps
+        assert row[3] is not None  # slippage_adverse_bps
 
-    def test_realized_bps_computed_against_arrival_price_not_signal_close(
+    def test_signed_bps_computed_against_arrival_price_not_signal_close(
         self, tmp_csv,
     ):
-        """The Issue B fix: realized_slippage_bps measures fill-vs-arrival,
-        not fill-vs-signal-close. Same fill price, different `modeled_price`
-        → different realized bps."""
+        """The Issue B fix (now living in the new taxonomy column):
+        `slippage_signed_bps` measures fill-vs-arrival, not
+        fill-vs-signal-close. Same fill price, different
+        `modeled_price` → different signed bps."""
         from execution.broker import OrderResult, OrderStatus
         from risk.manager import RiskDecision, Side
         from strategies.base import OrderType
@@ -1559,19 +1616,23 @@ class TestBuildRecordSlippageSemantics:
             raw_status="filled", message="ok",
         )
         tl = TradeLogger(path=tmp_csv)
-        # Case 1: arrival price IS the signal close → realized bps
+        # Case 1: arrival price IS the signal close → signed bps
         # reflects pure execution slippage from $100 to $101 = 100 bps.
         rec_old = tl.build_record(decision, result, modeled_price=100.0)
         # Case 2: arrival price is $100.95 (price drifted toward the
-        # fill before submission) → realized bps shrinks because the
+        # fill before submission) → signed bps shrinks because the
         # arrival benchmark already absorbed most of the drift; only
         # ($101.00 - $100.95) / $100.95 × 10000 ≈ 5 bps left as
         # execution slippage.
         rec_new = tl.build_record(decision, result, modeled_price=100.95)
-        assert rec_old.realized_slippage_bps == pytest.approx(100.0, rel=1e-3)
-        assert rec_new.realized_slippage_bps == pytest.approx(
+        assert rec_old.slippage_signed_bps == pytest.approx(100.0, rel=1e-3)
+        assert rec_new.slippage_signed_bps == pytest.approx(
             (1.00 - 0.95) / 100.95 * 10_000, rel=1e-2,
         )
+        # Legacy columns are NULL across the board (Phase 2 dual-write
+        # removed).
+        assert rec_old.realized_slippage_bps is None
+        assert rec_new.realized_slippage_bps is None
 
     def test_limit_order_writes_null_on_both_slippage_columns(self, tmp_csv):
         """Reviewer P2 #2: LIMIT orders must not record execution-slippage
@@ -1612,7 +1673,8 @@ class TestBuildRecordSlippageSemantics:
     def test_market_order_with_arrival_price_still_records(self, tmp_csv):
         """Sanity: MARKET orders with arrival-price modeled_price continue
         to record real slippage (regression guard against over-broadly
-        gating the LIMIT carve-out)."""
+        gating the LIMIT carve-out). Phase 2: measurement now lives in
+        the new taxonomy columns; legacy stays NULL."""
         from execution.broker import OrderResult, OrderStatus
         from risk.manager import RiskDecision, Side
         from strategies.base import OrderType
@@ -1630,11 +1692,15 @@ class TestBuildRecordSlippageSemantics:
         )
         tl = TradeLogger(path=tmp_csv)
         record = tl.build_record(decision, result, modeled_price=100.05)
-        assert record.modeled_slippage_bps is not None
-        assert record.realized_slippage_bps is not None
-        # Realized measured against arrival ($100.05), not decision ($100).
+        # Legacy columns NULL (Phase 2 dual-write removed).
+        assert record.modeled_slippage_bps is None
+        assert record.realized_slippage_bps is None
+        # New taxonomy carries the measurement.
+        assert record.slippage_signed_bps is not None
+        assert record.slippage_adverse_bps is not None
+        # Measured against arrival ($100.05), not decision ($100).
         expected = (100.10 - 100.05) / 100.05 * 10_000
-        assert record.realized_slippage_bps == pytest.approx(expected, rel=1e-2)
+        assert record.slippage_signed_bps == pytest.approx(expected, rel=1e-2)
 
     def test_record_slippage_false_still_populates_risk_basis(
         self, tmp_csv, sample_decision, sample_result,
@@ -1896,31 +1962,32 @@ class TestBuildRecordSlippageContract:
         assert record.slippage_signed_bps is None
         assert record.slippage_adverse_bps is None
 
-    def test_market_entry_without_benchmark_legacy_still_uses_decision_price(
+    def test_market_entry_without_benchmark_legacy_and_new_both_null(
         self, sample_decision, sample_result
     ):
-        """Defect 5 — documented Phase 1 divergence. When modeled_price
-        is None on a market entry, the legacy realized_slippage_bps
-        column falls back to ``decision.entry_reference_price`` as the
-        benchmark, while the new column honestly says 'unavailable'.
-        Aligning legacy with new here would change consumer-visible
-        numbers for live SMA / Donchian / Bollinger fills today and
-        therefore belongs in Phase 2 consumer migration. This test
-        pins the current intentional divergence so any future change
-        is deliberate."""
+        """Phase 2 reconciles the Phase 1 divergence. Pre-Phase 2 the
+        legacy `realized_slippage_bps` column fell back to
+        `decision.entry_reference_price` as a fabricated benchmark
+        when `modeled_price` was None, while the new
+        `slippage_signed_bps` honestly reported 'unavailable'.
+
+        With Phase 1 dual-write removed, both column families now
+        agree: when there's no honest benchmark, both legacy AND new
+        columns are NULL. No more silent decision-price fallback."""
         tl = TradeLogger(path="/dev/null")
         record = tl.build_record(
             sample_decision,
             sample_result,
             modeled_price=None,
         )
-        # New cols: honestly unavailable.
+        # Legacy cols: NULL (dual-write removed, divergence reconciled).
+        assert record.realized_slippage_bps is None
+        assert record.modeled_slippage_bps is None
+        # New cols: also NULL — honestly unavailable.
         assert record.slippage_signed_bps is None
-        # Legacy cols: still populated against decision price (the
-        # pre-unification fallback). Divergence is documented and
-        # deliberate for Phase 1; Phase 2 may reconcile.
-        assert record.realized_slippage_bps is not None
-        assert record.modeled_slippage_bps is not None
+        assert record.slippage_adverse_bps is None
+        assert record.slippage_benchmark_kind == "unavailable"
+        assert record.slippage_measurement_quality == "unavailable"
 
     def test_limit_entry_writes_limit_price_unavailable(self, sample_result):
         from risk.manager import RiskDecision
@@ -1972,9 +2039,12 @@ class TestBuildRecordSlippageContract:
         assert record.slippage_benchmark_kind == "arrival_midpoint"
         assert record.slippage_measurement_quality == "recovered"
 
-    def test_legacy_dual_write_matches_new_signed_on_market(
+    def test_legacy_columns_null_on_new_market_rows(
         self, sample_decision, sample_result
     ):
+        """Phase 2 replacement for the Phase 1 parity invariant. New
+        rows write NULL on the legacy columns regardless of whether
+        the new taxonomy columns are populated."""
         tl = TradeLogger(path="/dev/null")
         record = tl.build_record(
             sample_decision,
@@ -1982,8 +2052,12 @@ class TestBuildRecordSlippageContract:
             modeled_price=150.0,
             benchmark_kind="arrival_midpoint",
         )
-        # Both compute against the same modeled_price → must match.
-        assert record.realized_slippage_bps == pytest.approx(record.slippage_signed_bps)
+        # New columns populated against modeled_price.
+        assert record.slippage_signed_bps is not None
+        assert record.slippage_adverse_bps is not None
+        # Legacy columns NULL — dual-write removed.
+        assert record.realized_slippage_bps is None
+        assert record.modeled_slippage_bps is None
 
 
 # ── TestBuildCloseRecordSlippageContract ───────────────────────────────────
@@ -2105,29 +2179,30 @@ class TestBuildCloseRecordSlippageContract:
         assert record.modeled_slippage_bps is None
 
 
-# ── TestSlippageDualWriteParity ────────────────────────────────────────────
+# ── TestNoLegacyWritesOnNewRows ────────────────────────────────────────────
 
 
-class TestSlippageDualWriteParity:
+class TestNoLegacyWritesOnNewRows:
     """
-    Phase 1 commit 8 of slippage unification — cross-cutting safety net.
+    Phase 2 replacement for Phase 1's TestSlippageDualWriteParity.
 
-    Where both legacy (realized_slippage_bps) and new (slippage_signed_bps)
-    columns carry a value, they MUST agree. This guards against any
-    future writer change drifting the two paths apart while Phase 1
-    dual-write is in force. Phase 2 consumer migration relies on the
-    new columns being a strict superset of legacy behavior.
+    Phase 1 dual-wrote the new taxonomy columns alongside the legacy
+    `realized_slippage_bps` / `modeled_slippage_bps` and pinned that
+    both columns agreed where both were populated. Phase 2 retires the
+    legacy writes entirely — consumers (health / risk / calibration /
+    dashboard / pnl) now read the new columns directly. The invariant
+    to pin is the new one: every writer codepath writes NULL on the
+    legacy columns regardless of whether the new columns are populated.
 
-    Codepaths where parity is expected (both non-NULL):
-      - Codepath §1 market entry with benchmark
+    Codepaths covered (same set the dual-write parity tests covered):
+      - Codepath §1 market entry
       - Codepath §3 discretionary market exit
-      - Codepath §4/§5 stop fills with broker stop_price
+      - Codepath §4/§5 stop fills (with broker stop_price)
       - Codepath §11 short leg of spread fills
-
-    Codepaths where the legacy and new column legitimately diverge
-    (legacy NULL, new 'unavailable'; or legacy retains 0.0/value
-    while new goes NULL) are NOT covered here — they are pinned by
-    their respective codepath tests above.
+      - Codepath §11 long leg of spread fills (structural-NULL guard:
+        the long-leg row legacy column must not silently revert to
+        the old 0.0 structural zero that the dashboard worked
+        around with its avg_fill_price > 0 filter)
     """
 
     def _open_db(self, path: str):
@@ -2135,7 +2210,7 @@ class TestSlippageDualWriteParity:
         conn.row_factory = sqlite3.Row
         return conn
 
-    def test_market_entry_legacy_matches_new(
+    def test_market_entry_legacy_columns_null(
         self, tmp_csv, sample_decision, sample_result
     ):
         tl = TradeLogger(path=tmp_csv)
@@ -2149,28 +2224,30 @@ class TestSlippageDualWriteParity:
         conn = self._open_db(tmp_csv)
         try:
             row = dict(conn.execute(
-                "SELECT realized_slippage_bps, slippage_signed_bps FROM trades "
+                "SELECT realized_slippage_bps, modeled_slippage_bps, "
+                "slippage_signed_bps, slippage_adverse_bps FROM trades "
                 "WHERE reason = ? ORDER BY id DESC LIMIT 1",
                 (sample_decision.reason,),
             ).fetchone())
         finally:
             conn.close()
-        assert row["realized_slippage_bps"] == pytest.approx(row["slippage_signed_bps"])
+        # Legacy NULL; new populated.
+        assert row["realized_slippage_bps"] is None
+        assert row["modeled_slippage_bps"] is None
+        assert row["slippage_signed_bps"] is not None
+        assert row["slippage_adverse_bps"] is not None
 
-    def test_market_exit_legacy_matches_new(self, tmp_csv):
+    def test_market_exit_legacy_columns_null(self, tmp_csv):
         tl = TradeLogger(path=tmp_csv)
         result = OrderResult(
             status=OrderStatus.FILLED,
-            order_id="exit-parity-1",
+            order_id="exit-no-legacy-1",
             symbol="AAPL",
             requested_qty=10,
             filled_qty=10,
             avg_fill_price=152.0,
             raw_status="filled",
         )
-        # Defect 1 fix — caller must declare an honest kind for new
-        # cols to populate. Parity then holds: legacy and new
-        # benchmark against the same modeled_price.
         record = tl.build_close_record(
             result,
             strategy_name="sma_crossover",
@@ -2181,14 +2258,18 @@ class TestSlippageDualWriteParity:
         conn = self._open_db(tmp_csv)
         try:
             row = dict(conn.execute(
-                "SELECT realized_slippage_bps, slippage_signed_bps FROM trades "
-                "WHERE order_id = 'exit-parity-1'"
+                "SELECT realized_slippage_bps, modeled_slippage_bps, "
+                "slippage_signed_bps, slippage_adverse_bps FROM trades "
+                "WHERE order_id = 'exit-no-legacy-1'"
             ).fetchone())
         finally:
             conn.close()
-        assert row["realized_slippage_bps"] == pytest.approx(row["slippage_signed_bps"])
+        assert row["realized_slippage_bps"] is None
+        assert row["modeled_slippage_bps"] is None
+        assert row["slippage_signed_bps"] is not None
+        assert row["slippage_adverse_bps"] is not None
 
-    def test_stop_fill_with_broker_stop_legacy_matches_new(self, tmp_csv):
+    def test_stop_fill_legacy_columns_null(self, tmp_csv):
         tl = TradeLogger(path=tmp_csv)
         tl.log_stop_fill(
             symbol="AAPL",
@@ -2196,22 +2277,26 @@ class TestSlippageDualWriteParity:
             qty=10.0,
             avg_fill_price=144.50,
             stop_price=145.00,
-            order_id="stop-parity-1",
+            order_id="stop-no-legacy-1",
         )
         conn = self._open_db(tmp_csv)
         try:
             row = dict(conn.execute(
-                "SELECT realized_slippage_bps, slippage_signed_bps FROM trades "
-                "WHERE order_id = 'stop-parity-1'"
+                "SELECT realized_slippage_bps, modeled_slippage_bps, "
+                "slippage_signed_bps, slippage_adverse_bps FROM trades "
+                "WHERE order_id = 'stop-no-legacy-1'"
             ).fetchone())
         finally:
             conn.close()
-        assert row["realized_slippage_bps"] == pytest.approx(row["slippage_signed_bps"])
+        assert row["realized_slippage_bps"] is None
+        assert row["modeled_slippage_bps"] is None
+        assert row["slippage_signed_bps"] is not None
+        assert row["slippage_adverse_bps"] is not None
 
-    def test_spread_short_leg_legacy_matches_new(self, tmp_csv):
+    def test_spread_short_leg_legacy_columns_null(self, tmp_csv):
         tl = TradeLogger(path=tmp_csv)
         tl.log_spread_fill(
-            position_id="spread-parity-1",
+            position_id="spread-no-legacy-1",
             strategy="credit_spread",
             short_occ="SPY260620P00510000",
             long_occ="SPY260620P00505000",
@@ -2224,12 +2309,56 @@ class TestSlippageDualWriteParity:
         conn = self._open_db(tmp_csv)
         try:
             row = dict(conn.execute(
-                "SELECT realized_slippage_bps, slippage_signed_bps FROM trades "
-                "WHERE side='sell' AND position_id='spread-parity-1'"
+                "SELECT realized_slippage_bps, modeled_slippage_bps, "
+                "slippage_signed_bps, slippage_adverse_bps FROM trades "
+                "WHERE side='sell' AND position_id='spread-no-legacy-1'"
             ).fetchone())
         finally:
             conn.close()
-        assert row["realized_slippage_bps"] == pytest.approx(row["slippage_signed_bps"])
+        assert row["realized_slippage_bps"] is None
+        assert row["modeled_slippage_bps"] is None
+        assert row["slippage_signed_bps"] is not None
+        assert row["slippage_adverse_bps"] is not None
+
+    def test_spread_long_leg_legacy_columns_null_no_structural_zero(
+        self, tmp_csv,
+    ):
+        """Regression guard: pre-Phase 2 the long-leg row carried
+        `realized_slippage_bps = 0.0` (a structural zero from the
+        long leg being the non-economic side of the combo). The
+        dashboard worked around this by filtering on
+        `avg_fill_price > 0`. With Phase 2 the long-leg row must be
+        NULL across both column families — both legacy AND new —
+        so the structural-zero dilution can't creep back via the
+        legacy column."""
+        tl = TradeLogger(path=tmp_csv)
+        tl.log_spread_fill(
+            position_id="spread-long-leg-null-1",
+            strategy="credit_spread",
+            short_occ="SPY260620P00510000",
+            long_occ="SPY260620P00505000",
+            qty=1.0,
+            net_price=0.55,
+            submitted_limit_price=0.60,
+            opening=True,
+            initial_risk_dollars=445.0,
+        )
+        conn = self._open_db(tmp_csv)
+        try:
+            row = dict(conn.execute(
+                "SELECT realized_slippage_bps, modeled_slippage_bps, "
+                "slippage_signed_bps, slippage_adverse_bps FROM trades "
+                "WHERE side='buy' AND position_id='spread-long-leg-null-1'"
+            ).fetchone())
+        finally:
+            conn.close()
+        # Both column families NULL — no structural zero on the legacy
+        # column that downstream consumers could mistake for a real
+        # measurement.
+        assert row["realized_slippage_bps"] is None
+        assert row["modeled_slippage_bps"] is None
+        assert row["slippage_signed_bps"] is None
+        assert row["slippage_adverse_bps"] is None
 
     def test_adverse_is_signed_clamped_to_zero(self, tmp_csv):
         """Adverse_bps is max(0, signed_bps) on every row where signed is
@@ -2421,14 +2550,16 @@ class TestOptionAndSpreadSlippageContract:
         # is adverse: (0.60 - 0.55) / 0.60 * 10_000 ≈ 833.33 bps.
         assert short_row["slippage_signed_bps"] == pytest.approx(833.33, abs=0.1)
         assert short_row["slippage_adverse_bps"] == pytest.approx(833.33, abs=0.1)
-        # Long leg: structural — NULL on new columns
+        # Long leg: structural — NULL across both column families.
+        # Phase 2 drops the legacy 0.0 structural zero; downstream
+        # SUM/AVG consumers read slippage_adverse_bps and gate on
+        # `.notna()`.
         assert long_row["slippage_benchmark_kind"] == "unavailable"
         assert long_row["slippage_measurement_quality"] == "unavailable"
         assert long_row["slippage_signed_bps"] is None
         assert long_row["slippage_adverse_bps"] is None
-        # Legacy column on long leg keeps the 0.0 structural value
-        # for Phase 1 SUM/AVG consumer compat.
-        assert long_row["realized_slippage_bps"] == 0.0
+        assert long_row["realized_slippage_bps"] is None
+        assert long_row["modeled_slippage_bps"] is None
 
     def test_spread_without_submitted_limit_writes_unavailable(self, tmp_csv):
         """When no submitted_limit_price is provided, both legs write
@@ -2535,7 +2666,12 @@ class TestLogStopFillSlippageContract:
         assert row["slippage_benchmark_kind"] == "active_stop_price"
         assert row["slippage_measurement_quality"] == "recovered"
 
-    def test_dual_writes_legacy_columns_to_match_signed_when_broker_provides(self, tmp_csv):
+    def test_legacy_columns_null_on_new_stop_fill_rows(self, tmp_csv):
+        """Phase 2 replacement for the Phase 1 dual-write parity pin.
+        Legacy `realized_slippage_bps` / `modeled_slippage_bps` are
+        no longer written on new rows regardless of whether the
+        broker provided a stop_price; the new taxonomy is the sole
+        source of truth."""
         tl = TradeLogger(path=tmp_csv)
         tl.log_stop_fill(
             symbol="AAPL",
@@ -2543,13 +2679,13 @@ class TestLogStopFillSlippageContract:
             qty=10.0,
             avg_fill_price=144.50,
             stop_price=145.00,
-            order_id="stop-parity-1",
+            order_id="stop-no-legacy-2",
         )
         row = self._read_one_stop_row(tmp_csv)
-        # Legacy column must mirror the new signed bps when the broker
-        # stop is available — both benchmark against the same value.
-        assert row["realized_slippage_bps"] == pytest.approx(row["slippage_signed_bps"])
-        assert row["modeled_slippage_bps"] > 0  # SLIPPAGE_MODEL_MARKET_BPS
+        assert row["realized_slippage_bps"] is None
+        assert row["modeled_slippage_bps"] is None
+        assert row["slippage_signed_bps"] is not None
+        assert row["slippage_adverse_bps"] is not None
 
     def test_malformed_broker_stop_writes_unavailable(self, tmp_csv):
         """Defect 4 fix — every form of malformed stop_price must be
@@ -2575,15 +2711,16 @@ class TestLogStopFillSlippageContract:
             )
             assert row["slippage_signed_bps"] is None
 
-    def test_legacy_columns_keep_initial_stop_loss_fallback_when_broker_missing(self, tmp_csv):
-        """
-        Phase 1 compat: when broker stop is None, new cols go `unavailable`
-        but the legacy columns still fall back to initial_stop_loss so
-        unmigrated consumers see the same numbers they always did.
-        """
+    def test_missing_broker_stop_writes_null_across_both_column_families(
+        self, tmp_csv,
+    ):
+        """Phase 2: when the broker stop_price is missing, both new
+        AND legacy columns report 'unavailable' / NULL. Pre-Phase 2
+        the legacy column still fell back to `initial_stop_loss` so
+        unmigrated consumers saw a benchmark; with Phase 1 dual-write
+        removed there is no longer a legacy fallback path."""
         tl = TradeLogger(path=tmp_csv)
         # Seed an open entry context so initial_stop_loss is populated.
-        # Build a minimal opening row using build_record's machinery.
         conn = tl._ensure_db()
         conn.execute(
             """
@@ -2610,15 +2747,16 @@ class TestLogStopFillSlippageContract:
             qty=10.0,
             avg_fill_price=144.50,
             stop_price=None,
-            order_id="stop-legacy-fallback",
+            order_id="stop-no-legacy-fallback",
         )
         row = self._read_one_stop_row(tmp_csv)
-        # New cols: unavailable
+        # New cols: unavailable.
         assert row["slippage_benchmark_kind"] == "unavailable"
         assert row["slippage_signed_bps"] is None
-        # Legacy: still benchmarked against the open context's
-        # initial_stop_loss of 145.0 → 34.48 bps adverse for a sell @ 144.50.
-        assert row["realized_slippage_bps"] == pytest.approx(34.48, abs=0.05)
+        # Legacy cols: also NULL — no silent initial_stop_loss fallback
+        # (Phase 1 dual-write removed in Phase 2).
+        assert row["realized_slippage_bps"] is None
+        assert row["modeled_slippage_bps"] is None
 
 
 # ── TestPnLTracker ──────────────────────────────────────────────────────────
@@ -2816,6 +2954,118 @@ class TestPnLTracker:
         )
         report = tracker.slippage_report(last_n=5)
         assert report["count"] == 5
+        assert report["mean_bps"] > 0
+
+    def test_slippage_report_excludes_recovered_quality_rows(
+        self, tmp_csv, tmp_daily_dir, sample_decision, sample_result,
+    ):
+        """Phase 2 quality-whitelist regression guard.
+
+        `_adverse_bps()` must gate on `slippage_measurement_quality
+        IN ('primary','fallback')`, mirroring health / calibration /
+        reconcile / dashboard. Pre-fix the helper only skipped
+        NULL/non-numeric values, so a `recovered` row (e.g.
+        reconstructed stop fill from broker history) with a huge
+        adverse value would still flow into operator-facing weekly
+        / daily / `slippage_report` outputs.
+
+        Setup: one primary market entry (small adverse) + one
+        manually-seeded recovered row with adverse 999 bps. Expected:
+        the recovered row contributes nothing; count == 1, mean ==
+        the primary row's adverse value.
+        """
+        from dataclasses import replace
+        from reporting.logger import TradeRecord
+
+        tl = TradeLogger(path=tmp_csv)
+        # Measured market entry — flows through normal build_record so
+        # it carries primary quality + a small computed adverse value.
+        market_result = replace(sample_result, order_id="m-primary")
+        primary_record = tl.build_record(
+            sample_decision, market_result, modeled_price=150.0,
+        )
+        tl.log(primary_record)
+
+        # Recovered row — bypass build_record to plant a row with
+        # quality='recovered' and a huge adverse value. Pre-fix
+        # `_adverse_bps` would have accepted it.
+        recovered = TradeRecord(
+            timestamp="2026-04-15T10:00:00+00:00",
+            symbol="MSFT", side="buy", qty=10, avg_fill_price=200.0,
+            order_id="m-recovered",
+            strategy="sma_crossover", reason="recovered entry context",
+            stop_price=195.0, entry_reference_price=200.0,
+            modeled_slippage_bps=None, realized_slippage_bps=None,
+            order_type="market", status="filled",
+            requested_qty=10, filled_qty=10,
+            slippage_signed_bps=999.0,
+            slippage_adverse_bps=999.0,
+            slippage_measurement_quality="recovered",
+            slippage_benchmark_kind="arrival_midpoint",
+        )
+        tl.log(recovered)
+
+        tracker = PnLTracker(
+            trade_csv_path=tmp_csv, daily_pnl_dir=tmp_daily_dir,
+        )
+        report = tracker.slippage_report(last_n=10)
+        # Only the primary row participates. Without the quality
+        # whitelist the recovered 999 bps row would push mean toward
+        # ~500.
+        assert report["count"] == 1
+        primary_signed = primary_record.slippage_adverse_bps
+        assert report["mean_bps"] == pytest.approx(primary_signed, abs=0.01)
+        assert report["max_bps"] == pytest.approx(primary_signed, abs=0.01)
+
+    def test_slippage_report_skips_null_rows_in_count_and_mean(
+        self, tmp_csv, tmp_daily_dir, sample_decision, sample_result,
+    ):
+        """Phase 2 slippage unification — rows with NULL
+        slippage_adverse_bps must NOT default to 0. The pre-Phase-2
+        code did `t.get("realized_slippage_bps", 0)` and silently
+        diluted the mean toward zero when a window mixed measured
+        rows with LIMIT/external-close paths that have no benchmark.
+
+        Setup: one measured market entry (>0 bps adverse against
+        the modeled 150.0 benchmark) + one LIMIT order which
+        deliberately writes NULL on the new slippage columns.
+        Report's `count` reflects only the measured row; `mean_bps`
+        equals that measured row's value, not half of it.
+        """
+        from dataclasses import replace
+        from risk.manager import RiskDecision
+        from execution.broker import OrderType, Side
+        tl = TradeLogger(path=tmp_csv)
+        # Measured market entry.
+        market_result = replace(sample_result, order_id="m-1")
+        tl.log(tl.build_record(
+            sample_decision, market_result, modeled_price=150.0,
+        ))
+        # LIMIT entry — NULL slippage on the new columns.
+        limit_decision = RiskDecision(
+            symbol="AAPL",
+            side=Side.BUY,
+            qty=10,
+            stop_price=145.0,
+            entry_reference_price=150.0,
+            strategy_name="rsi_reversion",
+            reason="rsi limit",
+            order_type=OrderType.LIMIT,
+            limit_price=149.50,
+        )
+        limit_result = replace(sample_result, order_id="l-1")
+        tl.log(tl.build_record(
+            limit_decision, limit_result, modeled_price=150.0,
+        ))
+
+        tracker = PnLTracker(
+            trade_csv_path=tmp_csv, daily_pnl_dir=tmp_daily_dir,
+        )
+        report = tracker.slippage_report(last_n=10)
+        # Count is the number of measured rows, not the row count.
+        assert report["count"] == 1
+        # Mean equals the single measured row — undiluted by the
+        # LIMIT row's NULL slippage.
         assert report["mean_bps"] > 0
 
     def test_weekly_report_no_dailies(self, tmp_csv, tmp_daily_dir, tmp_weekly_dir):

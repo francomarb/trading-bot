@@ -373,7 +373,11 @@ class RiskManager:
         self._loss_streak: dict[str, int] = defaultdict(int)
         self._disabled_until: dict[str, datetime] = {}
         self._broker_errors: Deque[datetime] = deque()
-        # rolling slippage samples: (modeled_bps, realized_bps)
+        # rolling slippage samples: (modeled_bps, adverse_bps).
+        # `adverse_bps` matches the `slippage_adverse_bps` taxonomy on
+        # `trades`: signed slippage clamped to `max(0, signed)` so
+        # price improvement contributes 0 to the drift mean rather than
+        # offsetting later adverse fills (Phase 2 slippage unification).
         self._slippage_samples: Deque[tuple[float, float]] = deque(maxlen=200)
         self._halted: bool = False
         self._halt_reason: str | None = None
@@ -653,31 +657,38 @@ class RiskManager:
             )
 
     def record_fill_slippage(
-        self, modeled_bps: float, realized_bps: float
+        self, modeled_bps: float, adverse_bps: float
     ) -> None:
         """
         Append a fill-slippage sample. Once we have at least
         `slippage_min_samples`, logs drift metrics and — if
-        `slippage_drift_enabled` — engages the kill switch when mean realized
-        exceeds `slippage_drift_multiplier × mean modeled`.
+        `slippage_drift_enabled` — engages the kill switch when
+        mean adverse exceeds `slippage_drift_multiplier × mean modeled`.
 
-        Both inputs must be non-negative bps (absolute slippage cost).
+        Both inputs must be non-negative bps. `adverse_bps` is the
+        magnitude of execution drift in the unfavorable direction —
+        the same quantity persisted as `slippage_adverse_bps` on
+        `trades` (Phase 2 slippage unification): the engine computes
+        signed slippage in `_record_fill` and clamps `max(0, signed)`
+        before calling. Price improvement contributes 0, never a
+        negative value, so a run of good fills can't shift the mean
+        downward and mask later drift.
 
         The kill switch is disabled by default (SLIPPAGE_DRIFT_ENABLED=False)
         during paper trading. Enable only after calibrating the modeled baseline
         against real fills. Must be enabled before going live (Phase 10).
         """
-        if modeled_bps < 0 or realized_bps < 0:
+        if modeled_bps < 0 or adverse_bps < 0:
             raise ValueError("slippage bps must be non-negative")
-        self._slippage_samples.append((modeled_bps, realized_bps))
+        self._slippage_samples.append((modeled_bps, adverse_bps))
         n = len(self._slippage_samples)
         if n < self.slippage_min_samples:
             return
         modeled_mean = sum(m for m, _ in self._slippage_samples) / n
-        realized_mean = sum(r for _, r in self._slippage_samples) / n
+        adverse_mean = sum(a for _, a in self._slippage_samples) / n
 
         logger.debug(
-            f"slippage monitor: realized={realized_mean:.2f}bps "
+            f"slippage monitor: adverse={adverse_mean:.2f}bps "
             f"modeled={modeled_mean:.2f}bps n={n} "
             f"threshold={self.slippage_drift_multiplier}× "
             f"enabled={self.slippage_drift_enabled}"
@@ -685,11 +696,11 @@ class RiskManager:
 
         # Guard: if modeled baseline is zero we have nothing to compare against.
         # Skip the ratio check rather than using an epsilon that would fire on
-        # any positive realized slippage.
+        # any positive adverse slippage.
         if modeled_mean == 0.0:
             logger.warning(
                 f"slippage monitor: modeled mean is 0 — skipping drift check "
-                f"(realized={realized_mean:.2f}bps, n={n}). "
+                f"(adverse={adverse_mean:.2f}bps, n={n}). "
                 "Set SLIPPAGE_MODEL_MARKET_BPS to a non-zero value to enable."
             )
             return
@@ -697,9 +708,9 @@ class RiskManager:
         if not self.slippage_drift_enabled:
             return
 
-        if realized_mean > self.slippage_drift_multiplier * modeled_mean:
+        if adverse_mean > self.slippage_drift_multiplier * modeled_mean:
             self._engage_kill_switch(
-                f"slippage drift: realized mean {realized_mean:.2f}bps > "
+                f"slippage drift: adverse mean {adverse_mean:.2f}bps > "
                 f"{self.slippage_drift_multiplier}× modeled mean {modeled_mean:.2f}bps "
                 f"(n={n})"
             )

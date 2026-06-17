@@ -55,9 +55,28 @@ def tmp_forward_dir(tmp_path: Path) -> str:
 
 
 def _write_trades(path: str, rows: list[dict]) -> None:
-    """Write trade records to a SQLite database via TradeLogger."""
+    """Write trade records to a SQLite database via TradeLogger.
+
+    Phase 2 slippage unification: rows can pass `slippage_adverse_bps`
+    + `slippage_measurement_quality` to drive the reconcile slippage
+    gate. Legacy `realized_slippage_bps` is NULL on new rows after
+    Phase 4 — fixtures that supplied it still work but no longer affect
+    the gate, exactly mirroring production behavior.
+    """
     tl = TradeLogger(path=path)
     for row in rows:
+        adverse_raw = row.get("slippage_adverse_bps")
+        adverse: float | None
+        if adverse_raw is None:
+            adverse = None
+        else:
+            adverse = float(adverse_raw)
+        signed_raw = row.get("slippage_signed_bps", adverse_raw)
+        signed: float | None
+        if signed_raw is None:
+            signed = None
+        else:
+            signed = float(signed_raw)
         record = TradeRecord(
             timestamp=row["timestamp"],
             symbol=row["symbol"],
@@ -69,12 +88,17 @@ def _write_trades(path: str, rows: list[dict]) -> None:
             reason=row.get("reason", ""),
             stop_price=float(row.get("stop_price", 0)),
             entry_reference_price=float(row.get("entry_reference_price", 0)),
-            modeled_slippage_bps=float(row.get("modeled_slippage_bps", 0)),
-            realized_slippage_bps=float(row.get("realized_slippage_bps", 0)),
+            modeled_slippage_bps=None,
+            realized_slippage_bps=None,
             order_type=row.get("order_type", "market"),
             status=row.get("status", "filled"),
             requested_qty=int(float(row.get("requested_qty", row["qty"]))),
             filled_qty=int(float(row.get("filled_qty", row["qty"]))),
+            slippage_signed_bps=signed,
+            slippage_adverse_bps=adverse,
+            slippage_measurement_quality=row.get(
+                "slippage_measurement_quality", "primary",
+            ),
         )
         tl.log(record)
 
@@ -111,8 +135,11 @@ def _make_fill(
         "reason": "test",
         "stop_price": "145.0",
         "entry_reference_price": str(price),
-        "modeled_slippage_bps": "0.0",
-        "realized_slippage_bps": "3.5",
+        # Phase 2 slippage unification — fixtures drive the reconcile
+        # slippage gate via the new taxonomy columns.
+        "slippage_adverse_bps": 3.5,
+        "slippage_signed_bps": 3.5,
+        "slippage_measurement_quality": "primary",
         "order_type": "market",
         "status": "filled",
         "requested_qty": str(qty),
@@ -287,11 +314,12 @@ class TestReconciler:
     def test_no_go_on_high_slippage(
         self, mock_bt, mock_fetch, tmp_csv, tmp_forward_dir
     ):
-        # Paper fills with high slippage.
+        # Paper fill with high adverse slippage on the new taxonomy column.
         rows = [
             {
                 **_make_fill(side="buy", price=150.0),
-                "realized_slippage_bps": "30.0",  # above threshold
+                "slippage_adverse_bps": 30.0,  # above threshold
+                "slippage_signed_bps": 30.0,
             },
         ]
         _write_trades(tmp_csv, rows)
@@ -314,17 +342,23 @@ class TestReconciler:
 
     @patch("backtest.reconcile.fetch_symbol")
     @patch("backtest.reconcile.run_backtest")
-    def test_slippage_gate_uses_adverse_component_only(
+    def test_slippage_gate_uses_adverse_only_column(
         self, mock_bt, mock_fetch, tmp_csv, tmp_forward_dir
     ):
+        """Phase 2: writer-side clamp on `slippage_adverse_bps` is what
+        makes the gate adverse-only. A favorable fill contributes 0
+        (not its abs() magnitude) because the writer clamped at log
+        time, not because the reader does arithmetic."""
         rows = [
             {
                 **_make_fill(side="buy", price=150.0),
-                "realized_slippage_bps": "-40.0",
+                "slippage_signed_bps": -40.0,    # price improvement
+                "slippage_adverse_bps": 0.0,     # writer-clamped to 0
             },
             {
                 **_make_fill(side="sell", price=151.0),
-                "realized_slippage_bps": "30.0",
+                "slippage_signed_bps": 30.0,
+                "slippage_adverse_bps": 30.0,
             },
         ]
         _write_trades(tmp_csv, rows)
@@ -345,6 +379,100 @@ class TestReconciler:
         assert result.mean_slippage_bps == pytest.approx(15.0)
         assert result.max_slippage_bps == pytest.approx(30.0)
         assert result.go is True
+
+    @patch("backtest.reconcile.fetch_symbol")
+    @patch("backtest.reconcile.run_backtest")
+    def test_legacy_realized_column_null_does_not_silently_disable_gate(
+        self, mock_bt, mock_fetch, tmp_csv, tmp_forward_dir
+    ):
+        """Phase 2 regression guard. Pre-fix the gate read the retired
+        `realized_slippage_bps` column. On any post-Phase-2 paper row
+        that column is NULL, so the gate was silently falling back to
+        0.0 and would have rubber-stamped any drift. With the migration
+        to `slippage_adverse_bps`, an adverse 30 bps fill against a
+        20 bps threshold must still flip the gate to NO-GO even when
+        the legacy column is NULL (matching every production row)."""
+        rows = [
+            {
+                **_make_fill(side="buy", price=150.0),
+                # Production shape after Phase 4: legacy NULL, new
+                # column carries the measurement.
+                "slippage_adverse_bps": 30.0,
+                "slippage_signed_bps": 30.0,
+                "slippage_measurement_quality": "primary",
+            },
+        ]
+        _write_trades(tmp_csv, rows)
+        mock_fetch.return_value = (pd.DataFrame(), {})
+
+        recon = Reconciler(
+            _DummyStrategy(),
+            ["AAPL"],
+            "2026-04-01",
+            "2026-04-30",
+            trade_csv_path=tmp_csv,
+            forward_test_dir=tmp_forward_dir,
+            return_divergence_threshold=0.50,
+            max_slippage_threshold=20.0,
+        )
+        result = recon.run()
+
+        # Sanity: the legacy column truly is NULL on the persisted row,
+        # mirroring production after Phase 4.
+        import sqlite3
+        conn = sqlite3.connect(tmp_csv)
+        try:
+            legacy = conn.execute(
+                "SELECT realized_slippage_bps FROM trades LIMIT 1"
+            ).fetchone()[0]
+        finally:
+            conn.close()
+        assert legacy is None
+
+        # Pre-fix this assertion was the bug: mean_slip fell back to
+        # 0.0 because every row's legacy column was None, and `go`
+        # silently came back True.
+        assert result.mean_slippage_bps == pytest.approx(30.0)
+        assert result.go is False
+        assert any("slippage" in r for r in result.reasons)
+
+    @patch("backtest.reconcile.fetch_symbol")
+    @patch("backtest.reconcile.run_backtest")
+    def test_recovered_quality_rows_excluded_from_gate(
+        self, mock_bt, mock_fetch, tmp_csv, tmp_forward_dir
+    ):
+        """Recovered / unavailable rows carry reconstructed or synthetic
+        measurements and must not influence the live drift gate. With
+        the positive quality whitelist they're silently skipped — and
+        a `recovered` row with adverse 999 bps doesn't trip the gate."""
+        rows = [
+            {
+                **_make_fill(side="buy", price=150.0),
+                "slippage_adverse_bps": 999.0,
+                "slippage_signed_bps": 999.0,
+                "slippage_measurement_quality": "recovered",
+            },
+        ]
+        _write_trades(tmp_csv, rows)
+        mock_fetch.return_value = (pd.DataFrame(), {})
+
+        recon = Reconciler(
+            _DummyStrategy(),
+            ["AAPL"],
+            "2026-04-01",
+            "2026-04-30",
+            trade_csv_path=tmp_csv,
+            forward_test_dir=tmp_forward_dir,
+            return_divergence_threshold=0.50,
+            max_slippage_threshold=20.0,
+        )
+        result = recon.run()
+        # No measured rows → mean_slip = 0, gate passes on slippage
+        # (still hits the no-paper-fills reason because the matcher
+        # never gets a measured paper fill — but explicitly NOT the
+        # slippage reason).
+        assert result.mean_slippage_bps == pytest.approx(0.0)
+        assert not any("slippage" in r for r in result.reasons)
 
     def test_no_go_on_no_fills(self, tmp_csv, tmp_forward_dir):
         _write_trades(tmp_csv, [])

@@ -318,51 +318,39 @@ def _slippage_p95_bps(
     period_start: date,
     period_end: date,
 ) -> float | None:
-    """p95 of adverse slippage (max(0, realized - modeled)) over the
-    window. None if no fills with slippage data.
+    """p95 of `slippage_adverse_bps` over the window. None if no fills
+    with calibration-grade slippage data.
 
-    Adverse-only semantics: `realized_slippage_bps` is signed by the
-    slippage helpers (positive = adverse fill / paid more / got less;
-    negative = price improvement / broker filled at a better price than
-    submitted). The L2 alarm asks "how bad is execution drift?" — price
-    improvement contributes 0, not its absolute magnitude. See PR #38
-    for the credit_spread W22 false-positive that motivated the change.
+    Phase 2 consumer migration (slippage unification): reads the new
+    `slippage_adverse_bps` taxonomy column directly. The writer side
+    already clamps signed slippage to `max(0, signed)` at log time —
+    "how bad is execution drift?" — so this query is now a straight
+    column read rather than an in-Python recomputation against the
+    legacy `realized - modeled` pair.
+
+    Quality filter is a positive whitelist (`primary`, `fallback`),
+    not a NOT-IN exclusion. Failing closed keeps any future quality
+    enum (e.g. a richer `recovered_from_audit` tier we might add later)
+    out of the calibration distribution until we explicitly opt it in,
+    and isolates the recovered/unavailable rows whose benchmarks were
+    reconstructed (codepaths §5, §8, §9) and shouldn't influence the
+    live drift alarm.
     """
-    # Defensive filter for the Issue A failure mode: rows written by the
-    # recovered-entry-context path before slippage_pr landed could not
-    # honestly compute slippage (no arrival-price benchmark was captured
-    # at the original submission, which happened in a prior process).
-    # New recovered rows from the post-PR code write NULL on both
-    # slippage columns and are excluded by the IS NOT NULL filter; this
-    # `reason NOT LIKE` clause excludes the legacy rows already on disk
-    # whose modeled_bps=0 / realized_bps=large would otherwise dominate
-    # the p95.
     cursor = conn.execute(
-        "SELECT realized_slippage_bps, modeled_slippage_bps "
+        "SELECT slippage_adverse_bps "
         "FROM trades "
         "WHERE strategy = ? "
         "AND status IN ('filled', 'partial') "
-        "AND realized_slippage_bps IS NOT NULL "
-        "AND modeled_slippage_bps IS NOT NULL "
-        "AND (reason IS NULL OR reason NOT LIKE '%recovered entry context%') "
+        "AND slippage_measurement_quality IN ('primary', 'fallback') "
+        "AND slippage_adverse_bps IS NOT NULL "
         "AND timestamp >= ? "
         "AND timestamp < ?",
         (strategy_name, period_start.isoformat(), period_end.isoformat()),
     )
     deltas = []
-    for realized, modeled in cursor.fetchall():
+    for (adverse,) in cursor.fetchall():
         try:
-            # Adverse-only semantics. `realized_slippage_bps` is signed
-            # by `single_leg_realized_slippage_bps` / `mleg_realized_
-            # slippage_bps`: positive = adverse fill (paid more / got
-            # less), negative = price improvement (broker filled at a
-            # better price than submitted). The L2 check is asking
-            # "how bad is execution drift?" — price improvement should
-            # contribute 0, not be flipped into an inflated p95 by an
-            # abs() wrapper. This was the false-positive that flagged
-            # credit_spread as DEGRADED on a sample of 6 zero-slippage
-            # fills + 2 price-improvement fills.
-            deltas.append(max(0.0, float(realized) - float(modeled)))
+            deltas.append(float(adverse))
         except (TypeError, ValueError):
             continue
     if not deltas:

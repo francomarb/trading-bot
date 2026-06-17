@@ -118,43 +118,35 @@ def _collect_slippage_observations(
     start: date,
     end: date,
 ) -> list[float]:
-    """Per-trade adverse slippage deltas (max(0, realized - modeled)) for L2.
+    """Per-trade adverse slippage values for L2 calibration.
 
-    Adverse-only semantics matches `strategies.health.assessor.
-    _slippage_p95_bps`: positive `realized - modeled` (paid more / got
-    less) contributes its magnitude; negative `realized - modeled`
-    (price improvement) clamps to 0. Calibration learns from the same
-    distribution the live L2 check sees, so threshold suggestions
-    aren't inflated by good fills.
+    Phase 2 (slippage unification): reads the unified
+    `slippage_adverse_bps` taxonomy column. The writer already
+    clamps signed slippage to `max(0, signed)` so calibration sees
+    the same distribution as `_slippage_p95_bps` in
+    `strategies/health/assessor.py`.
 
-    Defensive filter (also mirrors the assessor): rows whose `reason`
-    carries the `recovered entry context` marker have no honest pre-
-    trade benchmark — they were written by the engine's crash-recovery
-    path before the slippage PR landed, with realized_bps reflecting
-    price drift since entry rather than execution quality. Including
-    them in the calibration window would learn from phantom slippage
-    and propose inflated WATCH/DEGRADED/BROKEN thresholds.
+    Quality filter is a positive whitelist (`primary`, `fallback`),
+    matching the assessor. Recovered rows (codepaths §5, §8, §9 —
+    benchmark reconstructed from broker history) and unavailable
+    rows (no honest benchmark) are excluded so calibration doesn't
+    learn from reconstructed or synthetic measurements. Fails closed
+    for future quality enums.
     """
     cursor = conn.execute(
-        "SELECT realized_slippage_bps, modeled_slippage_bps "
+        "SELECT slippage_adverse_bps "
         "FROM trades "
         "WHERE strategy = ? "
         "AND status IN ('filled', 'partial') "
-        "AND realized_slippage_bps IS NOT NULL "
-        "AND modeled_slippage_bps IS NOT NULL "
-        "AND (reason IS NULL OR reason NOT LIKE '%recovered entry context%') "
+        "AND slippage_measurement_quality IN ('primary', 'fallback') "
+        "AND slippage_adverse_bps IS NOT NULL "
         "AND timestamp >= ? AND timestamp < ?",
         (strategy_name, start.isoformat(), end.isoformat()),
     )
     out: list[float] = []
-    for realized, modeled in cursor.fetchall():
+    for (adverse,) in cursor.fetchall():
         try:
-            # Adverse-only semantics — mirrors strategies/health/
-            # assessor.py:_slippage_p95_bps. Calibrating against the
-            # abs() of price improvement would propose elevated
-            # thresholds based on good fills, even though the live L2
-            # check is asking about adverse drift only.
-            out.append(max(0.0, float(realized) - float(modeled)))
+            out.append(float(adverse))
         except (TypeError, ValueError):
             continue
     return out

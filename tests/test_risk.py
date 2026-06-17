@@ -787,36 +787,36 @@ class TestSlippageDrift:
         mgr = _mgr(slippage_min_samples=5, slippage_drift_multiplier=3.0)
         # 4 samples way over threshold — but min not met.
         for _ in range(4):
-            mgr.record_fill_slippage(modeled_bps=5.0, realized_bps=100.0)
+            mgr.record_fill_slippage(modeled_bps=5.0, adverse_bps=100.0)
         assert not mgr.is_halted()
 
     def test_drift_engages_kill_switch(self):
         mgr = _mgr(slippage_min_samples=5, slippage_drift_multiplier=3.0)
         for _ in range(5):
-            mgr.record_fill_slippage(modeled_bps=5.0, realized_bps=20.0)
-        # mean realized 20 > 3 * mean modeled 5 (=15) → halt
+            mgr.record_fill_slippage(modeled_bps=5.0, adverse_bps=20.0)
+        # mean adverse 20 > 3 * mean modeled 5 (=15) → halt
         assert mgr.is_halted()
         assert "slippage drift" in mgr.halt_reason()
 
     def test_within_drift_no_halt(self):
         mgr = _mgr(slippage_min_samples=5, slippage_drift_multiplier=3.0)
         for _ in range(5):
-            mgr.record_fill_slippage(modeled_bps=5.0, realized_bps=10.0)
-        # mean realized 10 ≤ 15 → no halt
+            mgr.record_fill_slippage(modeled_bps=5.0, adverse_bps=10.0)
+        # mean adverse 10 ≤ 15 → no halt
         assert not mgr.is_halted()
 
     def test_negative_slippage_rejected(self):
         mgr = _mgr()
         with pytest.raises(ValueError):
-            mgr.record_fill_slippage(modeled_bps=-1.0, realized_bps=5.0)
+            mgr.record_fill_slippage(modeled_bps=-1.0, adverse_bps=5.0)
 
     def test_zero_modeled_skips_ratio_check_no_halt(self):
         """modeled_bps=0 must not trigger the kill switch via epsilon trick.
         Previously the code used max(modeled_mean, 1e-9) which caused any
-        positive realized slippage to exceed the threshold."""
+        positive adverse slippage to exceed the threshold."""
         mgr = _mgr(slippage_min_samples=5, slippage_drift_multiplier=3.0)
         for _ in range(5):
-            mgr.record_fill_slippage(modeled_bps=0.0, realized_bps=50.0)
+            mgr.record_fill_slippage(modeled_bps=0.0, adverse_bps=50.0)
         assert not mgr.is_halted()
 
     def test_flag_disabled_prevents_halt(self):
@@ -828,7 +828,7 @@ class TestSlippageDrift:
             slippage_drift_enabled=False,
         )
         for _ in range(5):
-            mgr.record_fill_slippage(modeled_bps=5.0, realized_bps=100.0)
+            mgr.record_fill_slippage(modeled_bps=5.0, adverse_bps=100.0)
         assert not mgr.is_halted()
 
     def test_flag_enabled_still_halts_on_drift(self):
@@ -840,7 +840,7 @@ class TestSlippageDrift:
             slippage_drift_enabled=True,
         )
         for _ in range(5):
-            mgr.record_fill_slippage(modeled_bps=5.0, realized_bps=20.0)
+            mgr.record_fill_slippage(modeled_bps=5.0, adverse_bps=20.0)
         assert mgr.is_halted()
         assert "slippage drift" in mgr.halt_reason()
 

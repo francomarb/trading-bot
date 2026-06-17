@@ -161,15 +161,28 @@ class Reconciler:
         # 4. Per-trade divergence.
         divergences = self._match_trades(paper_fills, bt_results)
 
-        # 5. Slippage stats from paper fills. Trade rows store signed
-        # slippage (positive=adverse, negative=improvement); the gate only
-        # penalizes adverse execution so improvements do not mask bad fills.
-        slips = []
+        # 5. Slippage stats from paper fills. Phase 2 slippage
+        # unification: read `slippage_adverse_bps` (already clamped at
+        # writer time) and apply the same `measurement_quality IN
+        # ('primary','fallback')` whitelist used by health and
+        # calibration. Rows tagged 'recovered' / 'unavailable' (or any
+        # future tier) and rows with no measurement (NULL) are skipped
+        # so reconstructed / synthetic measurements never satisfy the
+        # gate by silently contributing zero — pre-fix this read the
+        # retired `realized_slippage_bps` column, which is NULL on every
+        # post-Phase-2 row and would have silently disabled the gate.
+        slips: list[float] = []
         for t in paper_fills:
+            quality = t.get("slippage_measurement_quality")
+            if quality not in ("primary", "fallback"):
+                continue
+            raw = t.get("slippage_adverse_bps")
+            if raw is None:
+                continue
             try:
-                slips.append(max(0.0, float(t.get("realized_slippage_bps", 0))))
-            except (ValueError, TypeError):
-                pass
+                slips.append(float(raw))
+            except (TypeError, ValueError):
+                continue
         mean_slip = sum(slips) / len(slips) if slips else 0.0
         max_slip = max(slips) if slips else 0.0
 
