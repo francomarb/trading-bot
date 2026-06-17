@@ -216,8 +216,8 @@ Branch: `feature/slippage-unification-phase2`
 
 | # | Commit | Notes | Status |
 |---|---|---|---|
-| 0 | Tracker kickoff + commit checklist | this commit | ⬜ |
-| 1 | `strategies/health/assessor.py` → `slippage_adverse_bps`; quality whitelist `IN ('primary','fallback')` | drops legacy `reason NOT LIKE` defensive filter (superseded by quality column) | ⬜ |
+| 0 | Tracker kickoff + commit checklist | this commit | ✅ |
+| 1 | `strategies/health/assessor.py` → `slippage_adverse_bps`; quality whitelist `IN ('primary','fallback')` | drops legacy `reason NOT LIKE` defensive filter (superseded by quality column) | ✅ |
 | 2 | `scripts/calibrate_health_thresholds.py` → same | mirrors assessor query shape | ⬜ |
 | 3 | `RiskManager.record_fill_slippage` param rename `realized_bps` → `adverse_bps` | engine already clamps to adverse before calling; pure naming + docs | ⬜ |
 | 4 | Dashboard Recent Trades surfaces `slippage_benchmark_kind` + `slippage_measurement_quality` | + `load_trades` empty-frame columns | ⬜ |
