@@ -155,6 +155,8 @@ def load_trades(db_path: str) -> pd.DataFrame:
             "initial_risk_per_share", "initial_risk_dollars",
             "realized_pnl", "r_multiple", "entry_timestamp",
             "exit_timestamp",
+            "slippage_benchmark_kind", "slippage_measurement_quality",
+            "slippage_signed_bps", "slippage_adverse_bps",
         ])
         if error is not None:
             df.attrs["load_error"] = error
@@ -1965,9 +1967,17 @@ def render_dashboard() -> None:
     if trades_df.empty:
         st.info("No trades in the database yet.")
     else:
+        # Phase 2 slippage unification: surface the benchmark + quality
+        # tags alongside the bps value so the operator can audit which
+        # measurement context each slippage number came from
+        # (arrival_midpoint vs active_stop_price vs limit_price vs
+        # unavailable; primary vs fallback vs recovered).
         display_cols = [
             "timestamp", "symbol", "side", "qty", "avg_fill_price",
-            "strategy", "reason", "realized_slippage_bps",
+            "strategy", "reason",
+            "slippage_signed_bps",
+            "slippage_benchmark_kind",
+            "slippage_measurement_quality",
         ]
         available = [c for c in display_cols if c in trades_df.columns]
         recent = trades_df[available].tail(20).copy()
@@ -1977,6 +1987,15 @@ def render_dashboard() -> None:
             recent["avg_fill_price"] = recent["avg_fill_price"].map(
                 lambda x: f"${x:,.2f}" if pd.notna(x) else "—"
             )
+        if "slippage_signed_bps" in recent.columns:
+            recent["slippage_signed_bps"] = recent["slippage_signed_bps"].map(
+                lambda x: f"{x:,.1f}" if pd.notna(x) else "—"
+            )
+        for col in ("slippage_benchmark_kind", "slippage_measurement_quality"):
+            if col in recent.columns:
+                recent[col] = recent[col].map(
+                    lambda x: x if (x is not None and pd.notna(x)) else "—"
+                )
         recent = recent.rename(columns={
             "timestamp": "Timestamp",
             "symbol": "Symbol",
@@ -1985,7 +2004,9 @@ def render_dashboard() -> None:
             "avg_fill_price": "Avg Fill Price",
             "strategy": "Strategy",
             "reason": "Reason",
-            "realized_slippage_bps": "Realized Slippage Bps",
+            "slippage_signed_bps": "Slippage Bps",
+            "slippage_benchmark_kind": "Benchmark Kind",
+            "slippage_measurement_quality": "Quality",
         })
         if "Symbol" in recent.columns:
             recent["Symbol"] = recent["Symbol"].map(symbol_url)

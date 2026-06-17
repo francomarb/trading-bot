@@ -40,6 +40,8 @@ _TRADE_COLUMNS = [
     "requested_qty", "filled_qty", "initial_stop_loss",
     "initial_risk_per_share", "initial_risk_dollars",
     "realized_pnl", "r_multiple", "entry_timestamp", "exit_timestamp",
+    "slippage_benchmark_kind", "slippage_measurement_quality",
+    "slippage_signed_bps", "slippage_adverse_bps",
 ]
 
 
@@ -71,6 +73,21 @@ class TestLoadTrades:
         df = load_trades(str(tmp_path / "nonexistent.db"))
         assert isinstance(df, pd.DataFrame)
         assert df.empty
+
+    def test_empty_frame_advertises_unified_slippage_columns(self, tmp_path):
+        """Phase 2 slippage unification — empty-frame placeholder must
+        include the new taxonomy columns so dashboard sections that
+        check `col in trades_df.columns` (Recent Trades surfacing
+        benchmark_kind + measurement_quality) gate on the same column
+        set regardless of whether the DB exists."""
+        df = load_trades(str(tmp_path / "nonexistent.db"))
+        for col in (
+            "slippage_benchmark_kind",
+            "slippage_measurement_quality",
+            "slippage_signed_bps",
+            "slippage_adverse_bps",
+        ):
+            assert col in df.columns
 
     def test_empty_table_returns_empty_dataframe(self, tmp_path):
         db = tmp_path / "trades.db"
