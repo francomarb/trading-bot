@@ -133,7 +133,7 @@ Each row from the discovery doc's §10 maps to one or more commits above.
 | 10.1 | Entry uncertainty / duplicate prevention / pending grace | `_suspect_orders`, broker-open duplicate checks, `LIFECYCLE_PENDING_GRACE_SECONDS` | substrate: 6, 9, 12; consumer wiring: P-1/P-2/P-3; cache delete: P-6 | ✅ |
 | 10.2 | Uncertain single-leg exits | `_suspect_exit_orders` | substrate: 6 + P-6e; consumer wiring: P-1/P-2/P-3; cache delete: P-7 | ✅ |
 | 10.3 | Protective stop promotion / replacement / repair | `_reported_stop_promotion_failures` identity workaround | P-4, P-5 | ✅ |
-| 10.4 | Option trailing state split | `option_trailing_stops.alpaca_stop_order_id` denormalization | (separate follow-up) | ⬜ |
+| 10.4 | Option trailing state split | `option_trailing_stops.alpaca_stop_order_id` denormalization | (separate follow-up) — PR #69 added recovered-close mirror cleanup (`_cleanup_option_trailing_state` at all three broker-history recovery paths) so the deferred split does not need to handle a stale-mirror-on-recovery edge case at migration time | ⬜ |
 | 10.5 | Slippage recovery — preserve provenance | `SuspectOrder.modeled_price_kind` moves to per-order row | 4 (substrate column) + 9 (plumbed from engine through broker) + 11 (UPSERT preservation) | ✅ |
 | 10.6 | Position-level partial-close accounting | (acceptance tests; carries forward unchanged) | 4 (rollup) | ✅ |
 | 10.7 | MLEG partial-close `_spreads_pending_close` | (single-leg side solved; MLEG side deferred) | (deferred to spread lifecycle PR) | ⬜ |
