@@ -78,6 +78,8 @@ What did NOT land in Phase 1 (deferred as planned):
 | 2 + 4 | Consumer migration (health, risk, calibration, dashboard, pnl) + dashboard denominator dilution fix + drop legacy dual-writes | `feature/slippage-unification-phase2` | #67 merged `0b0dfee` | ✅ Merged |
 | 3 | Historical cleanup migration (phantom recovery rows + pre-`8316e64` LIMIT rows) | `feature/slippage-unification-phase3` | — | ⬜ Not started |
 
+Adjacent follow-up shipped: PR #68 (`8977f22`, 2026-06-17) closed the recovered-entry accounting completeness gap discovered during PR #61 round-2 review — the substrate-driven UNKNOWN-at-submit recovery path now writes computed `slippage_signed_bps` / `slippage_adverse_bps` via a focused UPDATE that preserves audit fields. Also fixed the engine submit path to forward order-type-aware tags (LIMIT and STOP_LIMIT correctly get `kind='limit_price'`/`quality='unavailable'` instead of `'arrival_midpoint'`/`'primary'`). See `docs/order_lifecycle_foundation_tracker.md` for the as-built summary.
+
 Calendar estimate: ~2 weeks total, 3 PRs.
 
 ---
