@@ -1373,6 +1373,108 @@ class TestArrivalQuoteCapture:
         assert len(engine.risk._slippage_samples) == 1
 
 
+class TestOrderTypeAwareSubmitSlippageTagging:
+    """PR #68 round-1 review P1. The engine's submit path passes
+    `slippage_benchmark_kind` / `_measurement_quality` / `_price` /
+    `_timestamp` into `broker.place_order` so the substrate's per-
+    order row captures provenance at submit time. The trades-row
+    UPSERT policy (PRESERVE-FIRST-NON-NULL via COALESCE) means
+    whatever the substrate writes first survives every later UPSERT
+    on the same `order_id`, including the recovery completeness
+    call in `_maybe_dispatch_substrate_entry_fill`.
+
+    Pre-fix the engine used `'arrival_midpoint'` / `'primary'` for
+    every entry regardless of `decision.order_type`, so LIMIT
+    entries (RSI reversion) and STOP_LIMIT entries (Donchian
+    breakout) locked in a wrong provenance tag that no later
+    writer could correct — the dashboard / health / calibration
+    consumers saw `quality='primary'` paired with NULL
+    `slippage_signed_bps`, the exact smell PR #67 set out to
+    eliminate.
+
+    Fix: when `decision.order_type` is LIMIT or STOP_LIMIT, the
+    submit path forces `kind='limit_price'`, `quality='unavailable'`,
+    `benchmark_price=None`, `benchmark_timestamp=None`. This
+    mirrors codepath §2 in
+    `docs/slippage_unification_design.md` and matches what
+    `build_record` produces for non-market orders on the
+    synchronous-fill `_log_entry` path.
+    """
+
+    def _patch_order_type(self, engine, order_type):
+        engine.slots[0].strategy.preferred_order_type = order_type
+
+    def test_market_entry_passes_arrival_midpoint_primary(
+        self, engine_factory,
+    ):
+        engine, broker = engine_factory(entries=[False] * 59 + [True])
+        broker.get_latest_quote_midpoint.return_value = 100.25
+        self._patch_order_type(engine, OrderType.MARKET)
+        snap = _snapshot()
+        engine._session_start_equity = snap.account.equity
+        slot = engine.slots[0]
+        engine._process_symbol(
+            "AAPL", snap, snap.account, slot.strategy, slot.timeframe,
+        )
+        kwargs = broker.place_order.call_args.kwargs
+        assert kwargs["slippage_benchmark_kind"] == "arrival_midpoint"
+        assert kwargs["slippage_measurement_quality"] == "primary"
+        assert kwargs["slippage_benchmark_price"] == pytest.approx(100.25)
+        assert kwargs["slippage_benchmark_timestamp"] is not None
+
+    def test_market_entry_falls_back_to_latest_close_fallback_quality(
+        self, engine_factory,
+    ):
+        """No arrival quote available → fallback_latest_close /
+        fallback quality, benchmark_price = latest_close. This was
+        already the pre-fix behaviour for MARKET; pinning here so
+        the post-fix branching doesn't regress it."""
+        engine, broker = engine_factory(entries=[False] * 59 + [True])
+        broker.get_latest_quote_midpoint.return_value = None
+        self._patch_order_type(engine, OrderType.MARKET)
+        snap = _snapshot()
+        engine._session_start_equity = snap.account.equity
+        slot = engine.slots[0]
+        engine._process_symbol(
+            "AAPL", snap, snap.account, slot.strategy, slot.timeframe,
+        )
+        kwargs = broker.place_order.call_args.kwargs
+        assert kwargs["slippage_benchmark_kind"] == "fallback_latest_close"
+        assert kwargs["slippage_measurement_quality"] == "fallback"
+        assert kwargs["slippage_benchmark_price"] is not None
+
+    def test_limit_entry_forces_limit_price_unavailable(
+        self, engine_factory,
+    ):
+        """Even with an arrival quote available, a LIMIT decision
+        gets `limit_price` / `unavailable` and a NULL benchmark_price.
+        This is the canonical fix: the substrate must mirror the
+        synchronous `build_record` contract so the trades-row UPSERT
+        COALESCE doesn't lock in the wrong tag and survive the
+        recovery completeness call."""
+        engine, broker = engine_factory(entries=[False] * 59 + [True])
+        broker.get_latest_quote_midpoint.return_value = 100.25
+        self._patch_order_type(engine, OrderType.LIMIT)
+        snap = _snapshot()
+        engine._session_start_equity = snap.account.equity
+        slot = engine.slots[0]
+        engine._process_symbol(
+            "AAPL", snap, snap.account, slot.strategy, slot.timeframe,
+        )
+        kwargs = broker.place_order.call_args.kwargs
+        assert kwargs["slippage_benchmark_kind"] == "limit_price"
+        assert kwargs["slippage_measurement_quality"] == "unavailable"
+        assert kwargs["slippage_benchmark_price"] is None
+        assert kwargs["slippage_benchmark_timestamp"] is None
+
+    # STOP_LIMIT entries (Donchian breakout) take the same
+    # `is_market_order is False` branch as LIMIT in
+    # `_process_symbol`'s slippage-tagging logic; covered above.
+    # An end-to-end STOP_LIMIT test would require wiring an
+    # ENTRY_PRICE_CAPS policy onto the fixture strategy, which
+    # adds setup unrelated to the tagging branch being exercised.
+
+
 class TestOptionsPathSlippageContract:
     """Verify the LIMIT + arrival-quote fix covers the options strategies
     (spy_options_reversion + credit_spread). The options paths share the
