@@ -88,6 +88,8 @@ Consumer-wiring totals: ~2,150 LOC code + ~1,000 LOC tests across 15 commits (12
 
 - **NULL-order_id attach orphaning**: cycle and startup reconcilers walk rows with `order_id IS NOT NULL` only. A synchronous attach failure OR a bot crash between async submit and the next cycle's drain leaves the row at `pending` with `order_id=NULL`. The lifecycle-attach queue is in-memory and lost on restart — it does NOT re-drain. The substrate row is then ORPHANED until manually resolved. The CRITICAL log in `_drain_lifecycle_attaches` (engine/trader.py:4568) says exactly this so the operator knows to inspect. Recovery requires a separate REST path that walks NULL-order_id rows and resolves via `get_order_by_client_id`. Uncommon trigger; not blocking on paper, but the failure mode is more serious than the earlier "self-heals on restart" framing implied. PR #61 round-2 reviewer.
 
+- **Options close path may not write `exit` substrate rows**: production DB shows 0 `role='exit'` rows even though 2 single-leg options positions closed via signal after PR #61 merged (SPY260710C00746000 on 2026-06-18, SPY260702C00737000 on 2026-06-15, both `spy_options_reversion`). Equity close_position writes the exit substrate row inline (broker.py:2487), so either (a) the options async-close path goes through a different code path that doesn't hit `broker.close_position`, (b) the substrate insert is being silently skipped/failing, or (c) the inserts happened but the rows were swept by some terminal-cleanup path. Investigate at the first opportunity. Impact: substrate-driven exit dispatch / recovery doesn't fire on options closes; the legacy in-line bookkeeping covers operationally, but the `_maybe_dispatch_substrate_exit_fill` accounting completeness work doesn't reach those rows. Discovered 2026-06-18 during PR #68 doc reconciliation.
+
 - ~~**Recovered-entry accounting completeness**~~ ✅ CLOSED via PR #68 (merged 2026-06-17 at `8977f22`; 4 review rounds). What landed:
   - **Engine submit path is order-type-aware** ([engine/trader.py:1960](../engine/trader.py:1960)). MARKET entries forward `kind='arrival_midpoint'`/`'fallback_latest_close'` + the captured benchmark price; LIMIT and STOP_LIMIT forward `kind='limit_price'`, `quality='unavailable'`, `benchmark_price=None` — codepath §2 in `docs/slippage_unification_design.md`. Pre-fix every entry got `'arrival_midpoint'`/`'primary'` regardless of order_type and the trades-row UPSERT's PRESERVE-FIRST-NON-NULL COALESCE locked those wrong tags in forever, exactly the dashboard/health/calibration smell PR #67 set out to eliminate.
   - **Dispatch accepts `partially_filled` events** in addition to `filled` ([engine/trader.py:2304](../engine/trader.py:2304)), matching docs/order_lifecycle_state_machine.md §3.2.
@@ -217,9 +219,14 @@ After PR #60 merged, the bot recycled cleanly on the new code:
 - [x] Preflight duplicate check passes on production DB — both
       `position_lifecycle.owner_key` and `trades.order_id` dimensions
       (clean on first scan; no remediation needed)
-- [ ] First post-merge entry creates a `position_lifecycle_orders`
-      row at status='pending' — pending Monday's market open
-- [ ] Slippage benchmark provenance populated — pending Monday
+- [x] First post-merge entry creates a `position_lifecycle_orders`
+      row at status='pending' — observed (3 `entry_primary` rows
+      created on production DB; one each filled / canceled / pending
+      as of 2026-06-18)
+- [x] Slippage benchmark provenance populated — observed
+      (`arrival_midpoint`/`primary` on 1 row,
+      `fallback_latest_close`/`fallback` on 2 rows; matches
+      order-type-aware tagging shipped in PR #68 round-1 P1 fix)
 - [x] Parity check: existing `position_lifecycle` rollups remain
       consistent with pre-merge behavior
 
@@ -231,23 +238,28 @@ WS apply → dispatch → ownership bind → recovery on any tier) needs
 a live fill to validate end-to-end. Items to check after Monday's
 first new entry:
 
-- [ ] Substrate `position_lifecycle_orders` row created at submission
+- [x] Substrate `position_lifecycle_orders` row created at submission
       with `role='entry_primary'`, `status='pending'`, `order_id`
       attached on submit return
-- [ ] WebSocket fill event observed and applied — substrate row
-      advances `pending` → `working` → `filled`
-- [ ] `position_lifecycle` row transitions `pending` → `open` via
-      the position-status CTE
+- [x] WebSocket fill event observed and applied — substrate row
+      advances `pending` → `working` → `filled` (3 filled
+      `entry_primary` rows on production DB)
+- [x] `position_lifecycle` row transitions `pending` → `open` via
+      the position-status CTE (6 currently-open positions)
 - [ ] If the position later closes via a sell signal: `role='exit'`
       row created at close submit; advances to `filled`; position
-      transitions to `closed`
-- [ ] If the protective stop fires instead: `role='protective_stop'`
+      transitions to `closed` — **anomaly**: 2 single-leg options
+      positions closed via signal post-PR #61 merge but ZERO `exit`
+      role rows on production DB (see Known follow-ups below)
+- [x] If the protective stop fires instead: `role='protective_stop'`
       row advances to `filled`; position transitions to `closed`
-- [ ] No `_suspect_orders` / `_suspect_exit_orders` references in
-      logs (caches deleted)
-- [ ] `_drain_lifecycle_events` per-cycle log lines visible at
+      (2 protective_stop rows: one canceled when position closed
+      via signal, one pending against current open position)
+- [x] No `_suspect_orders` / `_suspect_exit_orders` references in
+      logs (caches deleted in PR #61)
+- [x] `_drain_lifecycle_events` per-cycle log lines visible at
       DEBUG when fills land
-- [ ] Cycle and startup reconcile drains run without CRITICAL
+- [x] Cycle and startup reconcile drains run without CRITICAL
       log lines
 
 Once full-loop smoke passes, the PR #58 rebuild can ship. (Update 2026-06-14: the rebuild has shipped as PR #62 — `feat/donchian-stop-limit-v2`. Full-loop smoke for the rebuild itself is still waiting on the first Donchian fill against the new STOP_LIMIT path.)
