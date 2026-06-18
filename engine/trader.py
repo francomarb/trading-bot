@@ -2321,62 +2321,47 @@ class TradingEngine:
             if pos_row is None:
                 return
             symbol = pos_row.symbol
-            if self._has_position(symbol):
-                # Synchronous path bound ownership; side effects
-                # already fired. Substrate is the parallel observer.
-                return
-            if snapshot is None:
-                logger.warning(
-                    f"substrate entry-fill dispatch: skipped for "
-                    f"order_id={event.order_id} symbol={symbol} — "
-                    f"no snapshot available (cycle drains may run "
-                    f"without one in some code paths)"
-                )
-                return
-            position = snapshot.account.open_positions.get(symbol)
-            if position is None:
-                logger.warning(
-                    f"substrate entry-fill dispatch: skipped for "
-                    f"order_id={event.order_id} symbol={symbol} — "
-                    f"broker reports no open position; nothing to "
-                    f"bind ownership against"
-                )
-                return
             from risk.manager import RiskDecision, Side
-            # PLAN 11.47 R1 P1-1: STOP_LIMIT requires both entry_trigger_price
-            # and limit_price on the RiskDecision; without them __post_init__
-            # raises, gets caught below as CRITICAL, and ownership never
-            # binds. Pull both back from the substrate row.
-            recovered_order_type = OrderType(order_row.order_type)
-            extra_kwargs: dict = {}
-            if recovered_order_type is OrderType.STOP_LIMIT:
-                trigger = order_row.intended_trigger_price
-                limit = order_row.intended_limit_price
-                if trigger is None or limit is None:
-                    # Legacy / pre-PLAN-11.47 substrate rows (or a bug
-                    # upstream) cannot reconstruct a valid STOP_LIMIT
-                    # decision. Fall back to MARKET — the side effects
-                    # _apply_recovered_entry_side_effects fires
-                    # (ownership bind, entry-price cache, stop
-                    # replacement, alert) are order-type agnostic.
-                    logger.warning(
-                        f"substrate entry-fill dispatch: STOP_LIMIT row "
-                        f"missing trigger/limit for {symbol} order_id="
-                        f"{event.order_id}; reconstructing as MARKET "
-                        f"for recovery side effects"
+            # PR #68 round-2 review P2: split the gate. The side-effects
+            # block (ownership bind / stop replacement / alert) must
+            # run exactly once via _has_position, but the accounting
+            # completeness block must run on EVERY filled /
+            # partially_filled event so the row's signed/adverse
+            # refresh to the cumulative avg_fill_price. Without
+            # this, a partial-then-final-fill recovery would persist
+            # the first-partial slippage (e.g. row.avg_fill_price=
+            # 150.50 alongside slippage computed against 150.40).
+            ownership_already_bound = self._has_position(symbol)
+
+            # ── Build a "logging decision" from the substrate row's
+            # original order_type so build_record's is_market_order
+            # gate is faithful to what was actually submitted. This is
+            # also reused below to construct the side-effects decision,
+            # which falls back to MARKET only when STOP_LIMIT/LIMIT
+            # reconstruction fields are missing. See PLAN 11.47 R1 P1-1.
+            logging_order_type = OrderType(order_row.order_type)
+            logging_extra_kwargs: dict = {}
+            if logging_order_type is OrderType.STOP_LIMIT:
+                if (
+                    order_row.intended_trigger_price is not None
+                    and order_row.intended_limit_price is not None
+                ):
+                    logging_extra_kwargs["entry_trigger_price"] = (
+                        float(order_row.intended_trigger_price)
                     )
-                    recovered_order_type = OrderType.MARKET
+                    logging_extra_kwargs["limit_price"] = float(
+                        order_row.intended_limit_price
+                    )
                 else:
-                    extra_kwargs["entry_trigger_price"] = float(trigger)
-                    extra_kwargs["limit_price"] = float(limit)
-            elif recovered_order_type is OrderType.LIMIT:
-                # LIMIT also requires a limit_price for shape validation.
-                limit = order_row.intended_limit_price
-                if limit is not None:
-                    extra_kwargs["limit_price"] = float(limit)
+                    logging_order_type = OrderType.MARKET
+            elif logging_order_type is OrderType.LIMIT:
+                if order_row.intended_limit_price is not None:
+                    logging_extra_kwargs["limit_price"] = float(
+                        order_row.intended_limit_price
+                    )
                 else:
-                    recovered_order_type = OrderType.MARKET
-            decision = RiskDecision(
+                    logging_order_type = OrderType.MARKET
+            logging_decision = RiskDecision(
                 symbol=symbol,
                 side=Side.BUY,
                 qty=float(order_row.intended_qty),
@@ -2384,87 +2369,76 @@ class TradingEngine:
                 stop_price=float(order_row.intended_stop_price or 0.0),
                 strategy_name=pos_row.strategy,
                 reason="substrate dispatch",
-                order_type=recovered_order_type,
-                **extra_kwargs,
+                order_type=logging_order_type,
+                **logging_extra_kwargs,
             )
-            self._apply_recovered_entry_side_effects(
-                snapshot=snapshot,
-                position=position,
-                decision=decision,
-                fill_price=float(event.avg_fill_price),
-                fill_qty=float(event.filled_qty),
-                reason_suffix="(substrate)",
-            )
-            # Recovered-entry accounting completeness (slippage Phase 2
-            # follow-up). The substrate's apply_order_event UPSERT
-            # writes the trade row with provenance fields
-            # (slippage_benchmark_price / kind / timestamp / quality)
-            # threaded through from the substrate's submit-time
-            # capture, but it leaves slippage_signed_bps /
-            # slippage_adverse_bps as NULL because computing them
-            # needs modeled_price vs avg_fill_price math that's
-            # _log_entry's job (via build_record).
+
+            # ── Side effects (single-shot via ownership gate) ──
+            if not ownership_already_bound:
+                if snapshot is None:
+                    logger.warning(
+                        f"substrate entry-fill dispatch: skipped "
+                        f"side-effects for order_id={event.order_id} "
+                        f"symbol={symbol} — no snapshot available "
+                        f"(cycle drains may run without one in some "
+                        f"code paths)"
+                    )
+                else:
+                    position = snapshot.account.open_positions.get(symbol)
+                    if position is None:
+                        logger.warning(
+                            f"substrate entry-fill dispatch: skipped "
+                            f"side-effects for order_id={event.order_id} "
+                            f"symbol={symbol} — broker reports no open "
+                            f"position; nothing to bind ownership against"
+                        )
+                    else:
+                        # For the side-effects helper we reuse the
+                        # logging_decision when its order_type is safe
+                        # for RiskDecision construction (LIMIT with
+                        # limit_price, STOP_LIMIT with trigger+limit,
+                        # or MARKET).
+                        self._apply_recovered_entry_side_effects(
+                            snapshot=snapshot,
+                            position=position,
+                            decision=logging_decision,
+                            fill_price=float(event.avg_fill_price),
+                            fill_qty=float(event.filled_qty),
+                            reason_suffix="(substrate)",
+                        )
+                        logger.warning(
+                            f"substrate entry-fill dispatch: bound "
+                            f"ownership for {symbol} ({pos_row.strategy}) "
+                            f"via order_id={event.order_id}"
+                        )
+
+            # ── Accounting completeness (runs on every event) ──
+            # The substrate's apply_order_event UPSERT writes the
+            # trade row with provenance fields (slippage_benchmark_
+            # price / kind / timestamp / quality) threaded through
+            # from the substrate's submit-time capture, but it
+            # leaves slippage_signed_bps / slippage_adverse_bps as
+            # NULL because computing them needs modeled_price vs
+            # avg_fill_price math that's build_record's job.
             #
-            # We pull the submit-time benchmark price off the
-            # substrate row and replay _log_entry on the recovery
-            # path. tl.log's UPSERT policy:
+            # tl.log's UPSERT policy:
             #   - PRESERVE-FIRST-NON-NULL on benchmark provenance
             #     (kind / timestamp / quality / benchmark_price) —
             #     keeps the substrate's submit-time tags exactly as
             #     written, so calibration consumers see the same
             #     quality classification a synchronous live fill
             #     would have produced.
-            #   - LATEST-NON-NULL on signed / adverse — fills in the
-            #     computed values that the substrate UPSERT left as
-            #     NULL.
-            # Net effect: row goes from "substrate-only, no computed
-            # slippage" to "substrate provenance + computed slippage"
-            # with one extra UPSERT.
+            #   - LATEST-NON-NULL on signed / adverse — fills in /
+            #     refreshes the computed values. On a partial-then-
+            #     final-fill recovery the second dispatch's event
+            #     carries the cumulative avg_fill_price, so this
+            #     UPSERT replaces the first-partial slippage with
+            #     the final-fill slippage.
             #
             # Best-effort: failures here don't unbind ownership or
             # invalidate the substrate-written row; they just mean
-            # the row retains NULL computed slippage on this rare
-            # recovery path.
+            # the row retains NULL computed slippage.
             try:
-                logging_order_type = OrderType(order_row.order_type)
-                logging_extra_kwargs: dict = {}
-                if logging_order_type is OrderType.STOP_LIMIT:
-                    if (
-                        order_row.intended_trigger_price is not None
-                        and order_row.intended_limit_price is not None
-                    ):
-                        logging_extra_kwargs["entry_trigger_price"] = (
-                            float(order_row.intended_trigger_price)
-                        )
-                        logging_extra_kwargs["limit_price"] = float(
-                            order_row.intended_limit_price
-                        )
-                    else:
-                        # Same fallback as the side-effects path —
-                        # if the substrate row is too sparse to
-                        # reconstruct STOP_LIMIT, fall through to
-                        # MARKET-shape logging so build_record
-                        # doesn't __post_init__-raise on the
-                        # RiskDecision.
-                        logging_order_type = OrderType.MARKET
-                elif logging_order_type is OrderType.LIMIT:
-                    if order_row.intended_limit_price is not None:
-                        logging_extra_kwargs["limit_price"] = float(
-                            order_row.intended_limit_price
-                        )
-                    else:
-                        logging_order_type = OrderType.MARKET
-                logging_decision = RiskDecision(
-                    symbol=symbol,
-                    side=Side.BUY,
-                    qty=float(order_row.intended_qty),
-                    entry_reference_price=float(event.avg_fill_price),
-                    stop_price=float(order_row.intended_stop_price or 0.0),
-                    strategy_name=pos_row.strategy,
-                    reason="substrate dispatch",
-                    order_type=logging_order_type,
-                    **logging_extra_kwargs,
-                )
                 # PR #68 round-1 review P3: mirror event status into
                 # the OrderResult so build_record produces the
                 # correct trades.status string and tl.log's default
@@ -2526,11 +2500,6 @@ class TradingEngine:
                     f"row remains the source of truth; computed "
                     f"slippage fields stay NULL on this row."
                 )
-            logger.warning(
-                f"substrate entry-fill dispatch: bound ownership "
-                f"for {symbol} ({pos_row.strategy}) via order_id="
-                f"{event.order_id}"
-            )
         except Exception as exc:
             logger.critical(
                 f"substrate entry-fill dispatch FAILED for "

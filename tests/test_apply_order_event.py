@@ -2758,14 +2758,25 @@ class TestEntryDispatchSlippageCompleteness:
         assert row[2] == pytest.approx(6.0, abs=0.1)
         assert row[3] == pytest.approx(6.0, abs=0.1)
 
-    def test_partial_then_filled_is_single_shot_via_ownership_gate(
+    def test_partial_then_filled_refreshes_slippage_with_final_avg_fill(
         self, tmp_path,
     ):
-        """Idempotency follow-up: after a PARTIAL dispatches and binds
-        ownership, a subsequent FILLED observation (final-state stream
-        event or cycle reconcile) must short-circuit on
-        `_has_position` so the alert fires once and the trade row
-        keeps its first computed slippage."""
+        """PR #68 round-2 review P2. Pre-fix this test documented stale
+        first-partial slippage on the final row: row.avg_fill_price=
+        150.50 alongside slippage computed against 150.40, which the
+        reviewer flagged as the canonical "Final fill leaves stale
+        slippage" bug. The fix splits the dispatch's gate — side
+        effects (ownership / alert) are still single-shot via
+        `_has_position`, but the accounting-completeness block runs
+        on every filled / partially_filled event so the LATEST-NON-
+        NULL UPSERT refreshes signed/adverse with the cumulative
+        avg_fill_price.
+
+        Final row should carry final-fill slippage (33.33 bps
+        against the 150.0 arrival midpoint), not first-partial
+        slippage (26.67 bps against the same 150.0 from
+        avg_fill_price=150.40).
+        """
         from types import SimpleNamespace
         from engine.lifecycle_orders import apply_order_event
         from engine.trader import TradingEngine
@@ -2865,40 +2876,57 @@ class TestEntryDispatchSlippageCompleteness:
         # No second alert — ownership-gate idempotency held.
         assert engine.alerts.trade_executed.call_count == first_alert_count
         # Trade row's status / filled_qty / avg_fill_price reflect the
-        # substrate's apply_order_event UPSERT (latest broker truth);
-        # slippage_signed_bps stays at the first PARTIAL's computed
-        # value because the second dispatch never re-ran the
-        # completeness call.
+        # substrate's apply_order_event UPSERT (latest broker truth).
+        # signed/adverse refreshed by the second dispatch's
+        # accounting-completeness call: now computed against the
+        # cumulative avg_fill_price of 150.50 vs the 150.0 arrival
+        # midpoint = 33.33 bps adverse, not the stale first-partial
+        # 26.67 bps from avg_fill_price=150.40.
         row = tl._ensure_db().execute(
             "SELECT status, filled_qty, avg_fill_price, "
-            "slippage_signed_bps FROM trades "
+            "slippage_signed_bps, slippage_adverse_bps FROM trades "
             "WHERE order_id='alpaca-entry-pf-1'"
         ).fetchone()
         assert row[0] == "filled"
         assert row[1] == 10.0
         assert row[2] == pytest.approx(150.50)
-        # First-observation slippage preserved (LATEST-NON-NULL kept
-        # the first-write value when the second UPSERT had nothing
-        # new to contribute).
-        assert row[3] is not None
+        # Final-fill slippage: (150.50 − 150.0) / 150.0 × 10_000 ≈
+        # 33.33 bps adverse on a BUY. Without the round-2 fix this
+        # would have been 26.67 bps (the stale first-partial value
+        # against avg_fill_price=150.40).
+        expected_signed = (150.50 - 150.0) / 150.0 * 10_000
+        assert row[3] == pytest.approx(expected_signed, abs=0.1)
+        assert row[4] == pytest.approx(expected_signed, abs=0.1)
+        # Sanity: ensure the assertion would actually catch the
+        # stale first-partial value (26.67) — guards against a
+        # future refactor that silently re-introduces the bug.
+        stale_first_partial = (150.40 - 150.0) / 150.0 * 10_000
+        assert abs(row[3] - stale_first_partial) > 1.0
 
     def test_completeness_call_failure_logs_critical(
-        self, tmp_path, caplog,
+        self, tmp_path,
     ):
-        """PR #68 round-1 review P2. The completeness block is wrapped
-        in a try/except that logs at CRITICAL on failure. Pre-fix the
-        block called `_log_entry`, which catches all exceptions
-        internally and logs at ERROR (engine/trader.py:2779) — the
-        CRITICAL operators rely on never fired.
+        """PR #68 round-1 review P2 + round-2 review P3. The
+        completeness block is wrapped in a try/except that logs at
+        CRITICAL on failure. Pre-fix the block called `_log_entry`,
+        which catches all exceptions internally and logs at ERROR
+        (engine/trader.py:2779), swallowing the operator-visible
+        CRITICAL.
 
-        Post-fix the block calls `build_record` + `trade_logger.log`
-        directly so identity conflicts (the canonical risk per the
-        UPSERT identity-conflict columns: position_uid, position_id,
-        symbol, side, strategy, order_type, requested_qty) reach the
-        outer CRITICAL handler.
+        Round-2: this test now actually ASSERTS the CRITICAL log
+        fires. The engine emits via loguru; caplog (stdlib) doesn't
+        receive loguru records by default. We add a temporary
+        loguru sink (matches the
+        `tests/test_spy_options_reversion.py:_capture_logs` pattern)
+        so the assertion is mandatory.
+
+        Failure mode under test: TradeLoggerIdentityConflict from
+        `reporting/logger.py:1038` — the canonical risk per the
+        UPSERT identity-conflict columns (position_uid, position_id,
+        symbol, side, strategy, order_type, requested_qty).
         """
-        import logging
         from types import SimpleNamespace
+        from loguru import logger as loguru_logger
         from engine.lifecycle_orders import apply_order_event
         from engine.trader import TradingEngine
         from engine.lifecycle import new_position_uid
@@ -2942,10 +2970,10 @@ class TestEntryDispatchSlippageCompleteness:
             reason="stream",
         )
 
-        # Inject the failure on tl.log so build_record runs (proving
-        # the dispatch reached it) but the persistence step throws.
-        # This mirrors the real-world identity-conflict path the
-        # reviewer flagged.
+        # Inject failure on tl.log so build_record runs (proving the
+        # dispatch reached it) but the persistence step throws.
+        # Mirrors the real-world identity-conflict path the reviewer
+        # flagged.
         original_log = tl.log
         def _raise_conflict(_record):
             raise TradeLoggerIdentityConflict(
@@ -2954,37 +2982,54 @@ class TestEntryDispatchSlippageCompleteness:
         tl.log = MagicMock(side_effect=_raise_conflict)
         engine.trade_logger = tl
 
-        event = OrderEvent(
-            order_id="alpaca-entry-conflict-1", status="filled",
-            filled_qty=2.0, avg_fill_price=150.40,
-            broker_updated_at="2026-06-17T15:00:01+00:00",
+        # Capture loguru CRITICAL output. Sink takes a Message
+        # whose .record dict carries 'level' / 'message' / etc.
+        critical_messages: list[str] = []
+        handler_id = loguru_logger.add(
+            lambda msg: critical_messages.append(str(msg)),
+            level="CRITICAL",
         )
-        snapshot = BrokerSnapshot(
-            account=SimpleNamespace(
-                equity=100_000.0, cash=50_000.0, buying_power=50_000.0,
-                open_positions={symbol: SimpleNamespace(
-                    qty=2.0, avg_entry_price=150.40, side="long",
-                )},
-            ),
-            open_orders=[],
-        )
-        with caplog.at_level(logging.CRITICAL):
+        try:
+            event = OrderEvent(
+                order_id="alpaca-entry-conflict-1", status="filled",
+                filled_qty=2.0, avg_fill_price=150.40,
+                broker_updated_at="2026-06-17T15:00:01+00:00",
+            )
+            snapshot = BrokerSnapshot(
+                account=SimpleNamespace(
+                    equity=100_000.0, cash=50_000.0, buying_power=50_000.0,
+                    open_positions={symbol: SimpleNamespace(
+                        qty=2.0, avg_entry_price=150.40, side="long",
+                    )},
+                ),
+                open_orders=[],
+            )
             TradingEngine._maybe_dispatch_substrate_entry_fill(
                 engine, event=event, snapshot=snapshot,
             )
+        finally:
+            loguru_logger.remove(handler_id)
+            tl.log = original_log
 
-        # Failure absorbed: ownership still bound (substrate write +
-        # side effects fired BEFORE the completeness call).
+        # Failure absorbed: ownership still bound (side-effects ran
+        # BEFORE the completeness call). This part already held in
+        # round 1.
         assert symbol in engine._positions
-        # CRITICAL emitted by the completeness block's except handler.
-        # Loguru routes through stderr by default; check the captured
-        # log records' messages for the granular sentinel.
-        completeness_critical_messages = [
-            r for r in caplog.records
-            if "trade-log completeness call FAILED" in r.message
+
+        # Round-2 mandatory assertion: the granular CRITICAL log line
+        # actually fired. Pre-fix (when the block called _log_entry)
+        # this would have been an ERROR via _log_entry's internal
+        # except, never reaching the CRITICAL sink — and this
+        # assertion would fail.
+        matching = [
+            m for m in critical_messages
+            if "trade-log completeness call FAILED" in m
+            and "TradeLoggerIdentityConflict" in m
+            and "alpaca-entry-conflict-1" in m
         ]
-        # Loguru may not always flow into caplog; tolerate either path
-        # as long as the dispatch DIDN'T raise out of the outer try.
-        # The functional contract (ownership bound, exception
-        # absorbed) is the load-bearing assertion. Restore.
-        tl.log = original_log
+        assert len(matching) == 1, (
+            f"expected exactly one CRITICAL log with the granular "
+            f"completeness-failure sentinel; got {len(matching)} "
+            f"matches in {len(critical_messages)} total CRITICAL "
+            f"records: {critical_messages!r}"
+        )
