@@ -2296,11 +2296,13 @@ class TradingEngine:
         # FILLED / PARTIAL + broker position present as the recovery
         # trigger. The substrate's canonical string for partial fills
         # is 'partially_filled' (engine/lifecycle_orders.py
-        # VALID_ORDER_STATUSES). The first partially_filled
-        # observation binds ownership; subsequent observations
-        # (further partials, final filled) short-circuit on the
-        # _has_position(symbol) gate below so side effects are
-        # still single-shot.
+        # VALID_ORDER_STATUSES).
+        #
+        # Single-shot via _has_position applies to the side-effects
+        # block ONLY (ownership bind / stop replacement / alert). The
+        # accounting-completeness block runs on every event so the
+        # row's signed/adverse refresh against the cumulative
+        # avg_fill_price. See round-2 review P2.
         if event.status not in {"filled", "partially_filled"}:
             return
         if float(event.filled_qty or 0.0) <= 0:
@@ -2419,87 +2421,78 @@ class TradingEngine:
             # from the substrate's submit-time capture, but it
             # leaves slippage_signed_bps / slippage_adverse_bps as
             # NULL because computing them needs modeled_price vs
-            # avg_fill_price math that's build_record's job.
+            # avg_fill_price math.
             #
-            # tl.log's UPSERT policy:
-            #   - PRESERVE-FIRST-NON-NULL on benchmark provenance
-            #     (kind / timestamp / quality / benchmark_price) —
-            #     keeps the substrate's submit-time tags exactly as
-            #     written, so calibration consumers see the same
-            #     quality classification a synchronous live fill
-            #     would have produced.
-            #   - LATEST-NON-NULL on signed / adverse — fills in /
-            #     refreshes the computed values. On a partial-then-
-            #     final-fill recovery the second dispatch's event
-            #     carries the cumulative avg_fill_price, so this
-            #     UPSERT replaces the first-partial slippage with
-            #     the final-fill slippage.
+            # PR #68 round-2 review P2: do a focused UPDATE of just
+            # the two computed columns rather than going through
+            # build_record + tl.log. Pre-round-2 the dispatch's
+            # tl.log UPSERT carried a full TradeRecord that included
+            # reason='substrate dispatch' and entry_reference_price=
+            # avg_fill_price, both of which got clobbered onto the
+            # synchronous _log_entry path's correct values via
+            # tl.log's default `excluded.<col>` LATEST-WINS semantics
+            # for those columns (e.g. row.reason='golden cross entry'
+            # → 'substrate dispatch' after a normal sync fill's
+            # substrate event applied). The focused UPDATE touches
+            # exclusively slippage_signed_bps and slippage_adverse_
+            # bps, preserving every other audit field already on the
+            # row.
+            #
+            # Idempotency: for synchronous-fill paths the values
+            # we'd write equal the values _log_entry already wrote
+            # (same modeled_price, same broker avg_fill_price). For
+            # recovered partial-then-final-fill, this UPDATE refreshes
+            # to the cumulative avg_fill_price.
+            #
+            # Gate on a populated, positive benchmark_price + a
+            # MARKET-style benchmark_kind. LIMIT / STOP_LIMIT entries
+            # (PR #68 round-1 P1 fix) carry kind='limit_price' /
+            # benchmark_price=None, so we skip them — codepath §2
+            # in docs/slippage_unification_design.md persists NULL
+            # slippage by design.
             #
             # Best-effort: failures here don't unbind ownership or
             # invalidate the substrate-written row; they just mean
-            # the row retains NULL computed slippage.
-            try:
-                # PR #68 round-1 review P3: mirror event status into
-                # the OrderResult so build_record produces the
-                # correct trades.status string and tl.log's default
-                # `excluded.<col>` UPSERT for status doesn't clobber
-                # the substrate's 'partially_filled' tag with
-                # 'filled'.
-                logging_status = (
-                    OrderStatus.PARTIAL
-                    if event.status == "partially_filled"
-                    else OrderStatus.FILLED
-                )
-                logging_result = OrderResult(
-                    status=logging_status,
-                    order_id=event.order_id,
-                    symbol=symbol,
-                    requested_qty=float(order_row.intended_qty),
-                    filled_qty=float(event.filled_qty),
-                    avg_fill_price=float(event.avg_fill_price),
-                    raw_status=event.status,
-                    position_uid=order_row.position_uid,
-                )
-                modeled_price = order_row.slippage_benchmark_price
-                if modeled_price is not None and modeled_price <= 0:
-                    modeled_price = None
-                # PR #68 round-1 review P2: build_record + trade_logger.log
-                # are called inline here rather than via _log_entry
-                # because _log_entry catches all exceptions internally
-                # and logs at ERROR (engine/trader.py:2779 in the
-                # current commit), which would swallow the CRITICAL
-                # log line operators rely on to see this gap stayed
-                # open. Most likely failure mode is
-                # TradeLoggerIdentityConflict if the substrate's
-                # submit-time identity columns don't match what
-                # build_record produces — exactly the kind of bug
-                # we want operators paged on.
-                #
-                # measurement_quality='recovered' is informational —
-                # the trades-row COALESCE keeps the substrate's
-                # submit-time tag. The arg is here for the trade-
-                # log record's in-memory dataclass so consumers
-                # reading the TradeRecord object (not via SQL UPSERT)
-                # see honest provenance.
-                completeness_record = self.trade_logger.build_record(
-                    logging_decision,
-                    logging_result,
-                    modeled_price=modeled_price,
-                    position_uid=order_row.position_uid,
-                    record_slippage=modeled_price is not None,
-                    benchmark_kind=order_row.slippage_benchmark_kind,
-                    measurement_quality="recovered",
-                )
-                self.trade_logger.log(completeness_record)
-            except Exception as log_exc:
-                logger.critical(
-                    f"substrate entry-fill dispatch: trade-log "
-                    f"completeness call FAILED for order_id="
-                    f"{event.order_id}: "
-                    f"{type(log_exc).__name__}: {log_exc}. Substrate "
-                    f"row remains the source of truth; computed "
-                    f"slippage fields stay NULL on this row."
-                )
+            # the row retains whatever computed slippage was already
+            # there (NULL on recovery, sync-computed on synchronous).
+            modeled_price = order_row.slippage_benchmark_price
+            benchmark_kind = order_row.slippage_benchmark_kind
+            can_compute_slippage = (
+                modeled_price is not None
+                and modeled_price > 0
+                and benchmark_kind in ("arrival_midpoint", "fallback_latest_close")
+            )
+            if can_compute_slippage:
+                try:
+                    signed_bps = single_leg_realized_slippage_bps(
+                        side="buy",
+                        reference_price=float(modeled_price),
+                        actual_fill_price=float(event.avg_fill_price),
+                    )
+                    adverse_bps = max(0.0, signed_bps)
+                    conn = self.trade_logger._ensure_db()
+                    conn.execute(
+                        "UPDATE trades "
+                        "SET slippage_signed_bps = ?, "
+                        "    slippage_adverse_bps = ? "
+                        "WHERE order_id = ? "
+                        "  AND position_type = 'single_leg'",
+                        (
+                            round(signed_bps, 2),
+                            round(adverse_bps, 2),
+                            event.order_id,
+                        ),
+                    )
+                    conn.commit()
+                except Exception as log_exc:
+                    logger.critical(
+                        f"substrate entry-fill dispatch: trade-log "
+                        f"completeness call FAILED for order_id="
+                        f"{event.order_id}: "
+                        f"{type(log_exc).__name__}: {log_exc}. Substrate "
+                        f"row remains the source of truth; computed "
+                        f"slippage fields stay NULL on this row."
+                    )
         except Exception as exc:
             logger.critical(
                 f"substrate entry-fill dispatch FAILED for "

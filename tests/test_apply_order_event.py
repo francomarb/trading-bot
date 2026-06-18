@@ -2744,14 +2744,17 @@ class TestEntryDispatchSlippageCompleteness:
         # PARTIAL dispatched: ownership bound + alert fired.
         assert symbol in engine._positions
         engine.alerts.trade_executed.assert_called_once()
-        # Trade row's status reflects 'partial' (not auto-promoted to
-        # 'filled' by the dispatch's OrderResult shape).
+        # Trade row's status reflects the substrate's canonical
+        # 'partially_filled' string. The round-2 P2 focused-UPDATE
+        # refactor stopped going through build_record/tl.log so the
+        # status column is no longer rewritten by the dispatch —
+        # the substrate's apply_order_event write wins.
         row = tl._ensure_db().execute(
             "SELECT status, filled_qty, slippage_signed_bps, "
             "slippage_adverse_bps FROM trades "
             "WHERE order_id='alpaca-entry-partial-1'"
         ).fetchone()
-        assert row[0] == "partial"
+        assert row[0] == "partially_filled"
         assert row[1] == 6.0
         # Completeness math still ran for the partial-fill price.
         # 500.30 vs 500.0 → 6 bps adverse on a BUY.
@@ -2931,8 +2934,6 @@ class TestEntryDispatchSlippageCompleteness:
         from engine.trader import TradingEngine
         from engine.lifecycle import new_position_uid
         from execution.broker import BrokerSnapshot
-        from reporting.logger import TradeLoggerIdentityConflict
-        from unittest.mock import MagicMock
 
         symbol = "QCOM"
         engine, tl, pos_store, orders_store = self._wire_engine(
@@ -2970,17 +2971,18 @@ class TestEntryDispatchSlippageCompleteness:
             reason="stream",
         )
 
-        # Inject failure on tl.log so build_record runs (proving the
-        # dispatch reached it) but the persistence step throws.
-        # Mirrors the real-world identity-conflict path the reviewer
-        # flagged.
-        original_log = tl.log
-        def _raise_conflict(_record):
-            raise TradeLoggerIdentityConflict(
-                "synthetic conflict for test"
-            )
-        tl.log = MagicMock(side_effect=_raise_conflict)
-        engine.trade_logger = tl
+        # Inject failure on the slippage-computation helper so the
+        # focused UPDATE never runs and the granular CRITICAL
+        # handler must fire. Round-3 P2 refactor switched the
+        # accounting block from build_record + tl.log to a focused
+        # UPDATE that only touches signed/adverse — there's no
+        # TradeRecord write to fail anymore, so we inject earlier
+        # in the call chain.
+        import engine.trader as trader_mod
+        original_calc = trader_mod.single_leg_realized_slippage_bps
+        def _raise(side, reference_price, actual_fill_price):
+            raise RuntimeError("synthetic slippage-calc failure")
+        trader_mod.single_leg_realized_slippage_bps = _raise
 
         # Capture loguru CRITICAL output. Sink takes a Message
         # whose .record dict carries 'level' / 'message' / etc.
@@ -3009,22 +3011,17 @@ class TestEntryDispatchSlippageCompleteness:
             )
         finally:
             loguru_logger.remove(handler_id)
-            tl.log = original_log
+            trader_mod.single_leg_realized_slippage_bps = original_calc
 
         # Failure absorbed: ownership still bound (side-effects ran
-        # BEFORE the completeness call). This part already held in
-        # round 1.
+        # BEFORE the completeness call).
         assert symbol in engine._positions
 
-        # Round-2 mandatory assertion: the granular CRITICAL log line
-        # actually fired. Pre-fix (when the block called _log_entry)
-        # this would have been an ERROR via _log_entry's internal
-        # except, never reaching the CRITICAL sink — and this
-        # assertion would fail.
+        # Mandatory assertion: the granular CRITICAL log line fired.
         matching = [
             m for m in critical_messages
             if "trade-log completeness call FAILED" in m
-            and "TradeLoggerIdentityConflict" in m
+            and "RuntimeError" in m
             and "alpaca-entry-conflict-1" in m
         ]
         assert len(matching) == 1, (
@@ -3033,3 +3030,126 @@ class TestEntryDispatchSlippageCompleteness:
             f"matches in {len(critical_messages)} total CRITICAL "
             f"records: {critical_messages!r}"
         )
+
+    def test_dispatch_on_synchronous_bound_row_preserves_audit_fields(
+        self, tmp_path,
+    ):
+        """PR #68 round-2 review P2 — the reviewer's exact repro.
+
+        Pre-fix the round-2 refactor ran the accounting replay
+        unconditionally, going through `build_record` + `tl.log`
+        with `reason='substrate dispatch'` and
+        `entry_reference_price=event.avg_fill_price`. tl.log's
+        default `excluded.<col>` UPSERT semantics for those columns
+        clobbered the synchronous _log_entry path's correct values:
+
+            before:  ('golden cross entry', 50.0, ...)
+            after:   ('substrate dispatch', 50.0, ...)
+
+        Post-fix the accounting block does a focused UPDATE that
+        only touches `slippage_signed_bps` and
+        `slippage_adverse_bps`. Reason, entry_reference_price,
+        and all other audit fields stay intact regardless of how
+        many times the dispatch runs against an already-populated
+        row.
+        """
+        from types import SimpleNamespace
+        from engine.lifecycle_orders import apply_order_event
+        from engine.trader import TradingEngine
+        from engine.lifecycle import new_position_uid
+        from execution.broker import BrokerSnapshot
+        from reporting.logger import TradeRecord
+
+        symbol = "PYPL"
+        engine, tl, pos_store, orders_store = self._wire_engine(
+            tmp_path, symbol,
+        )
+
+        uid = new_position_uid()
+        pos_store.create_pending(
+            position_uid=uid, symbol=symbol, owner_key=symbol,
+            strategy="sma_crossover", position_type="single_leg",
+            entry_qty=8.0,
+        )
+        orders_store.insert_pending(
+            position_uid=uid, role="entry_primary",
+            client_order_id="cli-entry-sync-1",
+            order_type="market", order_class="simple",
+            time_in_force="day", side="buy", intended_qty=8.0,
+            intended_stop_price=70.0,
+            slippage_benchmark_price=75.0,
+            slippage_benchmark_kind="arrival_midpoint",
+            slippage_benchmark_timestamp="2026-06-17T15:00:00+00:00",
+            slippage_measurement_quality="primary",
+        )
+        orders_store.attach_broker_order_id(
+            client_order_id="cli-entry-sync-1",
+            order_id="alpaca-entry-sync-1",
+        )
+
+        # Simulate the synchronous-fill path having already written
+        # the row via _log_entry with the strategy's audit fields.
+        # apply_order_event UPSERTed first with the substrate's bare
+        # row, then _log_entry overwrote the audit columns. We log a
+        # final TradeRecord that represents the end state.
+        apply_order_event(
+            tl._ensure_db(),
+            OrderEvent(
+                order_id="alpaca-entry-sync-1", status="filled",
+                filled_qty=8.0, avg_fill_price=75.10,
+                broker_updated_at="2026-06-17T15:00:01+00:00",
+            ),
+            reason="stream",
+        )
+        # Synchronous _log_entry would have set reason='golden cross
+        # entry' (the strategy's actual reason) and
+        # entry_reference_price=75.0 (the decision-time bar close).
+        # Plant those values directly so the assertion has a
+        # canonical starting state.
+        conn = tl._ensure_db()
+        conn.execute(
+            "UPDATE trades SET reason = ?, entry_reference_price = ? "
+            "WHERE order_id = 'alpaca-entry-sync-1'",
+            ("golden cross entry", 75.0),
+        )
+        conn.commit()
+        # Engine already owns the position via the synchronous path —
+        # set ownership directly so the dispatch's _has_position gate
+        # treats this as a synchronous-bound row.
+        engine._positions[symbol] = object()
+
+        event = OrderEvent(
+            order_id="alpaca-entry-sync-1", status="filled",
+            filled_qty=8.0, avg_fill_price=75.10,
+            broker_updated_at="2026-06-17T15:00:01+00:00",
+        )
+        snapshot = BrokerSnapshot(
+            account=SimpleNamespace(
+                equity=100_000.0, cash=50_000.0, buying_power=50_000.0,
+                open_positions={symbol: SimpleNamespace(
+                    qty=8.0, avg_entry_price=75.10, side="long",
+                )},
+            ),
+            open_orders=[],
+        )
+        TradingEngine._maybe_dispatch_substrate_entry_fill(
+            engine, event=event, snapshot=snapshot,
+        )
+
+        # Audit columns preserved through the dispatch's accounting
+        # refresh: reason still the strategy's, entry_reference_price
+        # still the decision-time close.
+        row = conn.execute(
+            "SELECT reason, entry_reference_price, "
+            "slippage_signed_bps, slippage_adverse_bps FROM trades "
+            "WHERE order_id='alpaca-entry-sync-1'"
+        ).fetchone()
+        assert row[0] == "golden cross entry"
+        assert row[1] == pytest.approx(75.0)
+        # Slippage refreshed via the focused UPDATE. Computation is
+        # idempotent against the synchronous path's _log_entry write
+        # because both used the same modeled_price (75.0) and the
+        # same broker avg_fill_price (75.10).
+        expected_signed = (75.10 - 75.0) / 75.0 * 10_000
+        assert row[2] == pytest.approx(expected_signed, abs=0.1)
+        assert row[3] == pytest.approx(expected_signed, abs=0.1)
