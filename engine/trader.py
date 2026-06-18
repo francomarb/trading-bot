@@ -2968,6 +2968,11 @@ class TradingEngine:
             f"{symbol}: recovered missed exit fill from broker truth — "
             f"qty={qty} price={price} order_id={order_id}"
         )
+        if is_full_close:
+            self._cleanup_option_trailing_state(
+                result.symbol,
+                reason="broker-history exit recovery",
+            )
         return True
 
     def _record_realized_pnl(
@@ -3184,6 +3189,25 @@ class TradingEngine:
         except Exception as exc:
             logger.warning(
                 f"lifecycle close failed for {owner_key}: {exc}"
+            )
+
+    def _cleanup_option_trailing_state(
+        self,
+        raw_symbol: str,
+        *,
+        reason: str,
+    ) -> None:
+        """Delete durable option trailing metadata after a full OCC close."""
+        if not is_occ_option(raw_symbol):
+            return
+        if self.option_trailing_store is None:
+            return
+        try:
+            self.option_trailing_store.delete_by_occ(raw_symbol)
+        except Exception as exc:
+            logger.warning(
+                f"{raw_symbol}: option trailing cleanup failed after "
+                f"{reason}: {exc}"
             )
 
     # ── Operator Controls Phase A PR-2 — command queue + sticky halt ──
@@ -5822,6 +5846,10 @@ class TradingEngine:
                 owner_key=owner_key_for(raw_symbol),
                 external=True,
             )
+            self._cleanup_option_trailing_state(
+                raw_symbol,
+                reason="broker-history stop fallback",
+            )
             return False
 
         # Slippage unification (Phase 1) — pass the recovered broker
@@ -5871,6 +5899,10 @@ class TradingEngine:
         logger.warning(
             f"{raw_symbol}: recovered missed protective stop fill from broker history "
             f"— qty={qty} price={price} order_id={stop_fill.order_id}"
+        )
+        self._cleanup_option_trailing_state(
+            raw_symbol,
+            reason="broker-history stop recovery",
         )
         return True
 
@@ -6416,16 +6448,12 @@ class TradingEngine:
                                 owner_key=owner_key_for(symbol),
                                 external=True,
                             )
-                    if self.option_trailing_store is not None:
-                        leg = tracked_position.primary_leg
-                        if leg is not None and is_occ_option(leg.symbol):
-                            try:
-                                self.option_trailing_store.delete_by_occ(leg.symbol)
-                            except Exception as exc:
-                                logger.warning(
-                                    f"{leg.symbol}: option trailing cleanup failed "
-                                    f"after external close: {exc}"
-                                )
+                    leg = tracked_position.primary_leg
+                    if leg is not None:
+                        self._cleanup_option_trailing_state(
+                            leg.symbol,
+                            reason="external close",
+                        )
                     self._entry_prices.pop(symbol, None)
             except Exception as e:
                 logger.error(f"{symbol}: failed to log external close: {e}")
@@ -6584,14 +6612,10 @@ class TradingEngine:
 
             self._pop_position(symbol)
             self._entry_prices.pop(symbol, None)
-            if _occ_m and self.option_trailing_store is not None:
-                try:
-                    self.option_trailing_store.delete_by_occ(raw_symbol)
-                except Exception as exc:
-                    logger.warning(
-                        f"{raw_symbol}: option trailing cleanup failed after "
-                        f"stream stop fill: {exc}"
-                    )
+            self._cleanup_option_trailing_state(
+                raw_symbol,
+                reason="stream stop fill",
+            )
 
     def _drain_lifecycle_attaches(self) -> None:
         """Apply per-order substrate attaches enqueued by background
@@ -7269,14 +7293,10 @@ class TradingEngine:
         if result.status is OrderStatus.FILLED:
             self._pop_position(symbol)
             self._entry_prices.pop(symbol, None)
-            if _OCC_PAT.match(position.symbol) and self.option_trailing_store is not None:
-                try:
-                    self.option_trailing_store.delete_by_occ(position.symbol)
-                except Exception as exc:
-                    logger.warning(
-                        f"[{strategy.name}] {position.symbol}: option trailing "
-                        f"cleanup failed after close: {exc}"
-                    )
+            self._cleanup_option_trailing_state(
+                position.symbol,
+                reason="close",
+            )
         return True
 
     def _strategy_by_name(self, name: str) -> BaseStrategy | None:
