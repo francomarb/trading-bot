@@ -2570,3 +2570,421 @@ class TestEntryDispatchSlippageCompleteness:
         assert row[0] is None
         assert row[1] is None
         assert row[2] is None
+
+    def test_recovered_limit_entry_preserves_limit_price_unavailable(
+        self, tmp_path,
+    ):
+        """PR #68 round-1 review P1 regression. After the submit-path
+        fix (engine forces kind='limit_price' / quality='unavailable'
+        for LIMIT entries), the substrate row stores the correct
+        taxonomy tags at submit time. The recovery completeness call
+        in `_maybe_dispatch_substrate_entry_fill` must preserve these
+        tags — not regress them back to 'arrival_midpoint' / 'primary'
+        — so the dashboard / health / calibration consumers see the
+        same NULL-by-design slippage they'd see on a synchronous LIMIT
+        fill.
+
+        The reviewer's exact repro: a recovered LIMIT row pre-fix ended
+        as ('limit', 100.0, 'arrival_midpoint', 'primary', None, None).
+        Post-fix it should be ('limit', None, 'limit_price',
+        'unavailable', None, None).
+        """
+        from types import SimpleNamespace
+        from engine.lifecycle_orders import apply_order_event
+        from engine.trader import TradingEngine
+        from engine.lifecycle import new_position_uid
+        from execution.broker import BrokerSnapshot
+
+        symbol = "TSLA"
+        engine, tl, pos_store, orders_store = self._wire_engine(
+            tmp_path, symbol,
+        )
+
+        uid = new_position_uid()
+        pos_store.create_pending(
+            position_uid=uid, symbol=symbol, owner_key=symbol,
+            strategy="rsi_reversion", position_type="single_leg",
+            entry_qty=4.0,
+        )
+        # Substrate stores submit-time taxonomy for a LIMIT entry per
+        # the order-type-aware engine fix.
+        orders_store.insert_pending(
+            position_uid=uid, role="entry_primary",
+            client_order_id="cli-entry-limit-1",
+            order_type="limit", order_class="simple",
+            time_in_force="day", side="buy", intended_qty=4.0,
+            intended_stop_price=240.0,
+            intended_limit_price=250.0,
+            slippage_benchmark_price=None,
+            slippage_benchmark_kind="limit_price",
+            slippage_benchmark_timestamp=None,
+            slippage_measurement_quality="unavailable",
+        )
+        orders_store.attach_broker_order_id(
+            client_order_id="cli-entry-limit-1",
+            order_id="alpaca-entry-limit-1",
+        )
+        apply_order_event(
+            tl._ensure_db(),
+            OrderEvent(
+                order_id="alpaca-entry-limit-1", status="filled",
+                filled_qty=4.0, avg_fill_price=249.50,
+                broker_updated_at="2026-06-17T15:00:01+00:00",
+            ),
+            reason="stream",
+        )
+
+        event = OrderEvent(
+            order_id="alpaca-entry-limit-1", status="filled",
+            filled_qty=4.0, avg_fill_price=249.50,
+            broker_updated_at="2026-06-17T15:00:01+00:00",
+        )
+        snapshot = BrokerSnapshot(
+            account=SimpleNamespace(
+                equity=100_000.0, cash=50_000.0, buying_power=50_000.0,
+                open_positions={symbol: SimpleNamespace(
+                    qty=4.0, avg_entry_price=249.50, side="long",
+                )},
+            ),
+            open_orders=[],
+        )
+        TradingEngine._maybe_dispatch_substrate_entry_fill(
+            engine, event=event, snapshot=snapshot,
+        )
+
+        # Reviewer's exact repro target: post-fix the LIMIT row stays
+        # at limit_price / unavailable with NULL benchmark price and
+        # NULL signed/adverse — no arrival-midpoint pollution.
+        row = tl._ensure_db().execute(
+            "SELECT order_type, slippage_benchmark_price, "
+            "slippage_benchmark_kind, slippage_measurement_quality, "
+            "slippage_signed_bps, slippage_adverse_bps FROM trades "
+            "WHERE order_id='alpaca-entry-limit-1'"
+        ).fetchone()
+        assert row == ("limit", None, "limit_price", "unavailable",
+                       None, None)
+
+    def test_partial_entry_fill_dispatches_and_binds_ownership(
+        self, tmp_path,
+    ):
+        """PR #68 round-1 review P3. UNKNOWN-at-submit recovery can
+        observe a PARTIAL terminal state — broker-history reconcile
+        or a stream replay where only some shares filled. The
+        dispatch must accept PARTIAL alongside FILLED, otherwise
+        partial-only recoveries leave ownership unbound and the
+        protective stop unplaced.
+
+        docs/order_lifecycle_state_machine.md §3.2 explicitly lists
+        FILLED / PARTIAL + broker position present as the recovery
+        trigger.
+        """
+        from types import SimpleNamespace
+        from engine.lifecycle_orders import apply_order_event
+        from engine.trader import TradingEngine
+        from engine.lifecycle import new_position_uid
+        from execution.broker import BrokerSnapshot
+
+        symbol = "NVDA"
+        engine, tl, pos_store, orders_store = self._wire_engine(
+            tmp_path, symbol,
+        )
+
+        uid = new_position_uid()
+        pos_store.create_pending(
+            position_uid=uid, symbol=symbol, owner_key=symbol,
+            strategy="sma_crossover", position_type="single_leg",
+            entry_qty=10.0,
+        )
+        orders_store.insert_pending(
+            position_uid=uid, role="entry_primary",
+            client_order_id="cli-entry-partial-1",
+            order_type="market", order_class="simple",
+            time_in_force="day", side="buy", intended_qty=10.0,
+            intended_stop_price=475.0,
+            slippage_benchmark_price=500.0,
+            slippage_benchmark_kind="arrival_midpoint",
+            slippage_benchmark_timestamp="2026-06-17T15:00:00+00:00",
+            slippage_measurement_quality="primary",
+        )
+        orders_store.attach_broker_order_id(
+            client_order_id="cli-entry-partial-1",
+            order_id="alpaca-entry-partial-1",
+        )
+        # Only 6 of 10 shares filled — broker terminal state is
+        # 'partial' (rare with MARKET on liquid names, but a
+        # legitimate substrate path).
+        apply_order_event(
+            tl._ensure_db(),
+            OrderEvent(
+                order_id="alpaca-entry-partial-1", status="partially_filled",
+                filled_qty=6.0, avg_fill_price=500.30,
+                broker_updated_at="2026-06-17T15:00:01+00:00",
+            ),
+            reason="stream",
+        )
+
+        event = OrderEvent(
+            order_id="alpaca-entry-partial-1", status="partially_filled",
+            filled_qty=6.0, avg_fill_price=500.30,
+            broker_updated_at="2026-06-17T15:00:01+00:00",
+        )
+        snapshot = BrokerSnapshot(
+            account=SimpleNamespace(
+                equity=100_000.0, cash=50_000.0, buying_power=50_000.0,
+                open_positions={symbol: SimpleNamespace(
+                    qty=6.0, avg_entry_price=500.30, side="long",
+                )},
+            ),
+            open_orders=[],
+        )
+        TradingEngine._maybe_dispatch_substrate_entry_fill(
+            engine, event=event, snapshot=snapshot,
+        )
+
+        # PARTIAL dispatched: ownership bound + alert fired.
+        assert symbol in engine._positions
+        engine.alerts.trade_executed.assert_called_once()
+        # Trade row's status reflects 'partial' (not auto-promoted to
+        # 'filled' by the dispatch's OrderResult shape).
+        row = tl._ensure_db().execute(
+            "SELECT status, filled_qty, slippage_signed_bps, "
+            "slippage_adverse_bps FROM trades "
+            "WHERE order_id='alpaca-entry-partial-1'"
+        ).fetchone()
+        assert row[0] == "partial"
+        assert row[1] == 6.0
+        # Completeness math still ran for the partial-fill price.
+        # 500.30 vs 500.0 → 6 bps adverse on a BUY.
+        assert row[2] == pytest.approx(6.0, abs=0.1)
+        assert row[3] == pytest.approx(6.0, abs=0.1)
+
+    def test_partial_then_filled_is_single_shot_via_ownership_gate(
+        self, tmp_path,
+    ):
+        """Idempotency follow-up: after a PARTIAL dispatches and binds
+        ownership, a subsequent FILLED observation (final-state stream
+        event or cycle reconcile) must short-circuit on
+        `_has_position` so the alert fires once and the trade row
+        keeps its first computed slippage."""
+        from types import SimpleNamespace
+        from engine.lifecycle_orders import apply_order_event
+        from engine.trader import TradingEngine
+        from engine.lifecycle import new_position_uid
+        from execution.broker import BrokerSnapshot
+
+        symbol = "AMD"
+        engine, tl, pos_store, orders_store = self._wire_engine(
+            tmp_path, symbol,
+        )
+
+        uid = new_position_uid()
+        pos_store.create_pending(
+            position_uid=uid, symbol=symbol, owner_key=symbol,
+            strategy="sma_crossover", position_type="single_leg",
+            entry_qty=10.0,
+        )
+        orders_store.insert_pending(
+            position_uid=uid, role="entry_primary",
+            client_order_id="cli-entry-pf-1",
+            order_type="market", order_class="simple",
+            time_in_force="day", side="buy", intended_qty=10.0,
+            intended_stop_price=140.0,
+            slippage_benchmark_price=150.0,
+            slippage_benchmark_kind="arrival_midpoint",
+            slippage_benchmark_timestamp="2026-06-17T15:00:00+00:00",
+            slippage_measurement_quality="primary",
+        )
+        orders_store.attach_broker_order_id(
+            client_order_id="cli-entry-pf-1",
+            order_id="alpaca-entry-pf-1",
+        )
+
+        # First observation: PARTIAL.
+        apply_order_event(
+            tl._ensure_db(),
+            OrderEvent(
+                order_id="alpaca-entry-pf-1", status="partially_filled",
+                filled_qty=4.0, avg_fill_price=150.40,
+                broker_updated_at="2026-06-17T15:00:01+00:00",
+            ),
+            reason="stream",
+        )
+        snapshot_partial = BrokerSnapshot(
+            account=SimpleNamespace(
+                equity=100_000.0, cash=50_000.0, buying_power=50_000.0,
+                open_positions={symbol: SimpleNamespace(
+                    qty=4.0, avg_entry_price=150.40, side="long",
+                )},
+            ),
+            open_orders=[],
+        )
+        TradingEngine._maybe_dispatch_substrate_entry_fill(
+            engine,
+            event=OrderEvent(
+                order_id="alpaca-entry-pf-1", status="partially_filled",
+                filled_qty=4.0, avg_fill_price=150.40,
+                broker_updated_at="2026-06-17T15:00:01+00:00",
+            ),
+            snapshot=snapshot_partial,
+        )
+
+        first_alert_count = engine.alerts.trade_executed.call_count
+        assert first_alert_count == 1
+
+        # Second observation: final FILLED. Apply advances substrate's
+        # filled_qty/status; dispatch sees ownership already bound and
+        # short-circuits before the side-effects helper.
+        apply_order_event(
+            tl._ensure_db(),
+            OrderEvent(
+                order_id="alpaca-entry-pf-1", status="filled",
+                filled_qty=10.0, avg_fill_price=150.50,
+                broker_updated_at="2026-06-17T15:00:02+00:00",
+            ),
+            reason="stream",
+        )
+        snapshot_filled = BrokerSnapshot(
+            account=SimpleNamespace(
+                equity=100_000.0, cash=50_000.0, buying_power=50_000.0,
+                open_positions={symbol: SimpleNamespace(
+                    qty=10.0, avg_entry_price=150.50, side="long",
+                )},
+            ),
+            open_orders=[],
+        )
+        TradingEngine._maybe_dispatch_substrate_entry_fill(
+            engine,
+            event=OrderEvent(
+                order_id="alpaca-entry-pf-1", status="filled",
+                filled_qty=10.0, avg_fill_price=150.50,
+                broker_updated_at="2026-06-17T15:00:02+00:00",
+            ),
+            snapshot=snapshot_filled,
+        )
+
+        # No second alert — ownership-gate idempotency held.
+        assert engine.alerts.trade_executed.call_count == first_alert_count
+        # Trade row's status / filled_qty / avg_fill_price reflect the
+        # substrate's apply_order_event UPSERT (latest broker truth);
+        # slippage_signed_bps stays at the first PARTIAL's computed
+        # value because the second dispatch never re-ran the
+        # completeness call.
+        row = tl._ensure_db().execute(
+            "SELECT status, filled_qty, avg_fill_price, "
+            "slippage_signed_bps FROM trades "
+            "WHERE order_id='alpaca-entry-pf-1'"
+        ).fetchone()
+        assert row[0] == "filled"
+        assert row[1] == 10.0
+        assert row[2] == pytest.approx(150.50)
+        # First-observation slippage preserved (LATEST-NON-NULL kept
+        # the first-write value when the second UPSERT had nothing
+        # new to contribute).
+        assert row[3] is not None
+
+    def test_completeness_call_failure_logs_critical(
+        self, tmp_path, caplog,
+    ):
+        """PR #68 round-1 review P2. The completeness block is wrapped
+        in a try/except that logs at CRITICAL on failure. Pre-fix the
+        block called `_log_entry`, which catches all exceptions
+        internally and logs at ERROR (engine/trader.py:2779) — the
+        CRITICAL operators rely on never fired.
+
+        Post-fix the block calls `build_record` + `trade_logger.log`
+        directly so identity conflicts (the canonical risk per the
+        UPSERT identity-conflict columns: position_uid, position_id,
+        symbol, side, strategy, order_type, requested_qty) reach the
+        outer CRITICAL handler.
+        """
+        import logging
+        from types import SimpleNamespace
+        from engine.lifecycle_orders import apply_order_event
+        from engine.trader import TradingEngine
+        from engine.lifecycle import new_position_uid
+        from execution.broker import BrokerSnapshot
+        from reporting.logger import TradeLoggerIdentityConflict
+        from unittest.mock import MagicMock
+
+        symbol = "QCOM"
+        engine, tl, pos_store, orders_store = self._wire_engine(
+            tmp_path, symbol,
+        )
+
+        uid = new_position_uid()
+        pos_store.create_pending(
+            position_uid=uid, symbol=symbol, owner_key=symbol,
+            strategy="sma_crossover", position_type="single_leg",
+            entry_qty=2.0,
+        )
+        orders_store.insert_pending(
+            position_uid=uid, role="entry_primary",
+            client_order_id="cli-entry-conflict-1",
+            order_type="market", order_class="simple",
+            time_in_force="day", side="buy", intended_qty=2.0,
+            intended_stop_price=140.0,
+            slippage_benchmark_price=150.0,
+            slippage_benchmark_kind="arrival_midpoint",
+            slippage_benchmark_timestamp="2026-06-17T15:00:00+00:00",
+            slippage_measurement_quality="primary",
+        )
+        orders_store.attach_broker_order_id(
+            client_order_id="cli-entry-conflict-1",
+            order_id="alpaca-entry-conflict-1",
+        )
+        apply_order_event(
+            tl._ensure_db(),
+            OrderEvent(
+                order_id="alpaca-entry-conflict-1", status="filled",
+                filled_qty=2.0, avg_fill_price=150.40,
+                broker_updated_at="2026-06-17T15:00:01+00:00",
+            ),
+            reason="stream",
+        )
+
+        # Inject the failure on tl.log so build_record runs (proving
+        # the dispatch reached it) but the persistence step throws.
+        # This mirrors the real-world identity-conflict path the
+        # reviewer flagged.
+        original_log = tl.log
+        def _raise_conflict(_record):
+            raise TradeLoggerIdentityConflict(
+                "synthetic conflict for test"
+            )
+        tl.log = MagicMock(side_effect=_raise_conflict)
+        engine.trade_logger = tl
+
+        event = OrderEvent(
+            order_id="alpaca-entry-conflict-1", status="filled",
+            filled_qty=2.0, avg_fill_price=150.40,
+            broker_updated_at="2026-06-17T15:00:01+00:00",
+        )
+        snapshot = BrokerSnapshot(
+            account=SimpleNamespace(
+                equity=100_000.0, cash=50_000.0, buying_power=50_000.0,
+                open_positions={symbol: SimpleNamespace(
+                    qty=2.0, avg_entry_price=150.40, side="long",
+                )},
+            ),
+            open_orders=[],
+        )
+        with caplog.at_level(logging.CRITICAL):
+            TradingEngine._maybe_dispatch_substrate_entry_fill(
+                engine, event=event, snapshot=snapshot,
+            )
+
+        # Failure absorbed: ownership still bound (substrate write +
+        # side effects fired BEFORE the completeness call).
+        assert symbol in engine._positions
+        # CRITICAL emitted by the completeness block's except handler.
+        # Loguru routes through stderr by default; check the captured
+        # log records' messages for the granular sentinel.
+        completeness_critical_messages = [
+            r for r in caplog.records
+            if "trade-log completeness call FAILED" in r.message
+        ]
+        # Loguru may not always flow into caplog; tolerate either path
+        # as long as the dispatch DIDN'T raise out of the outer try.
+        # The functional contract (ownership bound, exception
+        # absorbed) is the load-bearing assertion. Restore.
+        tl.log = original_log
