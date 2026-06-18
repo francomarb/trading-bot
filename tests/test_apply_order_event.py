@@ -3031,6 +3031,131 @@ class TestEntryDispatchSlippageCompleteness:
             f"records: {critical_messages!r}"
         )
 
+    def test_already_bound_option_limit_entry_does_not_emit_critical(
+        self, tmp_path,
+    ):
+        """PR #68 round-3 review P2 — the reviewer's option-sleeve
+        repro.
+
+        Option LIMIT entries (spy_options_reversion) intentionally
+        create substrate rows with intended_stop_price=None because
+        option exits are strategy-managed (HWM trail, theta limits,
+        underlying stop), not stop-managed at the broker. Pre-round-3
+        the dispatch built a RiskDecision BEFORE the ownership gate,
+        passing `stop_price=float(order_row.intended_stop_price
+        or 0.0)` = 0.0, which RiskDecision.__post_init__ rejects
+        with `ValueError: stop_price must be positive, got 0.0`.
+
+        For an already-bound option fill (synchronous path already
+        registered ownership; substrate stream event arrives next),
+        the ValueError got caught by the outer CRITICAL handler and
+        emitted a false-alarm CRITICAL on a healthy active sleeve.
+
+        Post-fix the RiskDecision is built INSIDE the
+        `if not ownership_already_bound:` block. The focused-UPDATE
+        accounting block doesn't need it. Already-bound option
+        fills exit cleanly with no log noise; option LIMIT entries
+        also skip the accounting UPDATE (benchmark_kind='limit_price',
+        codepath §2 NULL slippage by design).
+        """
+        from types import SimpleNamespace
+        from loguru import logger as loguru_logger
+        from engine.lifecycle_orders import apply_order_event
+        from engine.trader import TradingEngine
+        from engine.lifecycle import new_position_uid
+        from execution.broker import BrokerSnapshot
+
+        # OCC-formatted option symbol (SPY 540 call).
+        symbol = "SPY260618C00540000"
+        owner_key = "SPY"
+        engine, tl, pos_store, orders_store = self._wire_engine(
+            tmp_path, owner_key,
+        )
+
+        uid = new_position_uid()
+        pos_store.create_pending(
+            position_uid=uid, symbol=symbol, owner_key=owner_key,
+            strategy="spy_options_reversion",
+            position_type="single_leg", entry_qty=3.0,
+        )
+        # Option LIMIT entry — intended_stop_price=None per
+        # execution/broker.py's option submission path. LIMIT-typed
+        # so the substrate carries limit_price provenance not
+        # arrival.
+        orders_store.insert_pending(
+            position_uid=uid, role="entry_primary",
+            client_order_id="cli-entry-opt-1",
+            order_type="limit", order_class="simple",
+            time_in_force="day", side="buy", intended_qty=3.0,
+            intended_stop_price=None,
+            intended_limit_price=10.00,
+            slippage_benchmark_price=None,
+            slippage_benchmark_kind="limit_price",
+            slippage_benchmark_timestamp=None,
+            slippage_measurement_quality="unavailable",
+        )
+        orders_store.attach_broker_order_id(
+            client_order_id="cli-entry-opt-1",
+            order_id="alpaca-entry-opt-1",
+        )
+        apply_order_event(
+            tl._ensure_db(),
+            OrderEvent(
+                order_id="alpaca-entry-opt-1", status="filled",
+                filled_qty=3.0, avg_fill_price=10.05,
+                broker_updated_at="2026-06-17T15:00:01+00:00",
+            ),
+            reason="stream",
+        )
+        # Pre-bind ownership — the synchronous async-options path
+        # already registered this position before the substrate
+        # stream event arrived.
+        engine._positions[owner_key] = object()
+
+        # Capture loguru CRITICAL output. Pre-fix this test would
+        # see one false-alarm CRITICAL ('ValueError: stop_price
+        # must be positive'); post-fix zero.
+        critical_messages: list[str] = []
+        handler_id = loguru_logger.add(
+            lambda msg: critical_messages.append(str(msg)),
+            level="CRITICAL",
+        )
+        try:
+            event = OrderEvent(
+                order_id="alpaca-entry-opt-1", status="filled",
+                filled_qty=3.0, avg_fill_price=10.05,
+                broker_updated_at="2026-06-17T15:00:01+00:00",
+            )
+            snapshot = BrokerSnapshot(
+                account=SimpleNamespace(
+                    equity=100_000.0, cash=50_000.0, buying_power=50_000.0,
+                    open_positions={owner_key: SimpleNamespace(
+                        qty=3.0, avg_entry_price=10.05, side="long",
+                    )},
+                ),
+                open_orders=[],
+            )
+            TradingEngine._maybe_dispatch_substrate_entry_fill(
+                engine, event=event, snapshot=snapshot,
+            )
+        finally:
+            loguru_logger.remove(handler_id)
+
+        # No false-alarm CRITICAL on the live options sleeve.
+        assert critical_messages == [], (
+            f"unexpected CRITICAL output on already-bound option "
+            f"LIMIT dispatch: {critical_messages!r}"
+        )
+        # Slippage stays NULL — LIMIT codepath §2 by design.
+        row = tl._ensure_db().execute(
+            "SELECT slippage_signed_bps, slippage_adverse_bps, "
+            "slippage_benchmark_kind FROM trades "
+            "WHERE order_id='alpaca-entry-opt-1'"
+        ).fetchone()
+        assert row[0] is None
+        assert row[1] is None
+        assert row[2] == "limit_price"
+
     def test_dispatch_on_synchronous_bound_row_preserves_audit_fields(
         self, tmp_path,
     ):

@@ -2335,47 +2335,21 @@ class TradingEngine:
             # 150.50 alongside slippage computed against 150.40).
             ownership_already_bound = self._has_position(symbol)
 
-            # ── Build a "logging decision" from the substrate row's
-            # original order_type so build_record's is_market_order
-            # gate is faithful to what was actually submitted. This is
-            # also reused below to construct the side-effects decision,
-            # which falls back to MARKET only when STOP_LIMIT/LIMIT
-            # reconstruction fields are missing. See PLAN 11.47 R1 P1-1.
-            logging_order_type = OrderType(order_row.order_type)
-            logging_extra_kwargs: dict = {}
-            if logging_order_type is OrderType.STOP_LIMIT:
-                if (
-                    order_row.intended_trigger_price is not None
-                    and order_row.intended_limit_price is not None
-                ):
-                    logging_extra_kwargs["entry_trigger_price"] = (
-                        float(order_row.intended_trigger_price)
-                    )
-                    logging_extra_kwargs["limit_price"] = float(
-                        order_row.intended_limit_price
-                    )
-                else:
-                    logging_order_type = OrderType.MARKET
-            elif logging_order_type is OrderType.LIMIT:
-                if order_row.intended_limit_price is not None:
-                    logging_extra_kwargs["limit_price"] = float(
-                        order_row.intended_limit_price
-                    )
-                else:
-                    logging_order_type = OrderType.MARKET
-            logging_decision = RiskDecision(
-                symbol=symbol,
-                side=Side.BUY,
-                qty=float(order_row.intended_qty),
-                entry_reference_price=float(event.avg_fill_price),
-                stop_price=float(order_row.intended_stop_price or 0.0),
-                strategy_name=pos_row.strategy,
-                reason="substrate dispatch",
-                order_type=logging_order_type,
-                **logging_extra_kwargs,
-            )
-
             # ── Side effects (single-shot via ownership gate) ──
+            #
+            # PR #68 round-3 review P2: the RiskDecision construction
+            # used by the side-effects helper lives INSIDE this branch
+            # because option LIMIT entry substrate rows are
+            # intentionally created with intended_stop_price=None (per
+            # execution/broker.py — option exits are strategy-managed,
+            # not stop-managed) and RiskDecision.__post_init__ rejects
+            # stop_price <= 0. Pre-fix the round-2 hoist outside the
+            # gate raised on every async option fill that arrived
+            # after the synchronous path had already bound ownership,
+            # emitting a false CRITICAL on the live options sleeve.
+            # The focused-UPDATE accounting block below doesn't need a
+            # RiskDecision; it reads everything off `order_row` and
+            # `event`.
             if not ownership_already_bound:
                 if snapshot is None:
                     logger.warning(
@@ -2395,15 +2369,49 @@ class TradingEngine:
                             f"position; nothing to bind ownership against"
                         )
                     else:
-                        # For the side-effects helper we reuse the
-                        # logging_decision when its order_type is safe
-                        # for RiskDecision construction (LIMIT with
-                        # limit_price, STOP_LIMIT with trigger+limit,
-                        # or MARKET).
+                        # Build the recovery decision from the substrate
+                        # row's original order_type. PLAN 11.47 R1 P1-1:
+                        # STOP_LIMIT requires both entry_trigger_price
+                        # and limit_price; without them
+                        # RiskDecision.__post_init__ raises and gets
+                        # caught by the outer CRITICAL handler.
+                        recovered_order_type = OrderType(order_row.order_type)
+                        recovered_extra_kwargs: dict = {}
+                        if recovered_order_type is OrderType.STOP_LIMIT:
+                            if (
+                                order_row.intended_trigger_price is not None
+                                and order_row.intended_limit_price is not None
+                            ):
+                                recovered_extra_kwargs["entry_trigger_price"] = (
+                                    float(order_row.intended_trigger_price)
+                                )
+                                recovered_extra_kwargs["limit_price"] = float(
+                                    order_row.intended_limit_price
+                                )
+                            else:
+                                recovered_order_type = OrderType.MARKET
+                        elif recovered_order_type is OrderType.LIMIT:
+                            if order_row.intended_limit_price is not None:
+                                recovered_extra_kwargs["limit_price"] = float(
+                                    order_row.intended_limit_price
+                                )
+                            else:
+                                recovered_order_type = OrderType.MARKET
+                        recovered_decision = RiskDecision(
+                            symbol=symbol,
+                            side=Side.BUY,
+                            qty=float(order_row.intended_qty),
+                            entry_reference_price=float(event.avg_fill_price),
+                            stop_price=float(order_row.intended_stop_price or 0.0),
+                            strategy_name=pos_row.strategy,
+                            reason="substrate dispatch",
+                            order_type=recovered_order_type,
+                            **recovered_extra_kwargs,
+                        )
                         self._apply_recovered_entry_side_effects(
                             snapshot=snapshot,
                             position=position,
-                            decision=logging_decision,
+                            decision=recovered_decision,
                             fill_price=float(event.avg_fill_price),
                             fill_qty=float(event.filled_qty),
                             reason_suffix="(substrate)",
