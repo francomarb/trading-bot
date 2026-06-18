@@ -4991,6 +4991,182 @@ class TestGenericSingleLegOptionTrailingStops:
 
         assert engine.option_trailing_store.get_by_occ("SPY260618C00746000") is None
 
+    def test_recovered_stop_fill_cleans_option_trailing_state(self, tmp_path):
+        engine, _broker = self._engine(tmp_path)
+        engine.option_trailing_store.upsert(
+            position_uid="pos_abc123",
+            occ_symbol="SPY260618C00746000",
+            strategy="generic_single_leg_options",
+            owner_key="SPY",
+            qty=3,
+            entry_premium=12.77,
+            hwm_premium=20.16,
+            trail_activation_pct=0.10,
+            trail_pct=0.15,
+            current_stop_price=17.14,
+            alpaca_stop_order_id="stop-1",
+            stop_order_status="new",
+            last_observed_premium=20.16,
+        )
+
+        stop_fill = ClosedOrderInfo(
+            order_id="stop-1",
+            client_order_id=None,
+            symbol="SPY260618C00746000",
+            side=Side.SELL,
+            order_type="stop",
+            status=OrderStatus.FILLED,
+            raw_status="filled",
+            qty=3.0,
+            filled_qty=3.0,
+            avg_fill_price=17.14,
+            stop_price=17.14,
+            submitted_at=T0,
+            filled_at=T0 + timedelta(minutes=1),
+        )
+
+        result = engine._record_recovered_stop_fill(
+            symbol="SPY",
+            owner="generic_single_leg_options",
+            stop_fill=stop_fill,
+        )
+
+        assert result is True
+        assert engine.option_trailing_store.get_by_occ("SPY260618C00746000") is None
+
+    def test_recovered_stop_fill_fallback_cleans_option_trailing_state(self, tmp_path):
+        engine, _broker = self._engine(tmp_path)
+        engine.option_trailing_store.upsert(
+            position_uid="pos_abc123",
+            occ_symbol="SPY260618C00746000",
+            strategy="generic_single_leg_options",
+            owner_key="SPY",
+            qty=3,
+            entry_premium=12.77,
+            hwm_premium=20.16,
+            trail_activation_pct=0.10,
+            trail_pct=0.15,
+            current_stop_price=17.14,
+            alpaca_stop_order_id="stop-1",
+            stop_order_status="new",
+            last_observed_premium=20.16,
+        )
+
+        stop_fill = ClosedOrderInfo(
+            order_id="stop-1",
+            client_order_id=None,
+            symbol="SPY260618C00746000",
+            side=Side.SELL,
+            order_type="stop",
+            status=OrderStatus.FILLED,
+            raw_status="filled",
+            qty=3.0,
+            filled_qty=0.0,
+            avg_fill_price=None,
+            stop_price=17.14,
+            submitted_at=T0,
+            filled_at=T0 + timedelta(minutes=1),
+        )
+
+        result = engine._record_recovered_stop_fill(
+            symbol="SPY",
+            owner="generic_single_leg_options",
+            stop_fill=stop_fill,
+        )
+
+        assert result is False
+        assert engine.option_trailing_store.get_by_occ("SPY260618C00746000") is None
+
+    def test_recovered_exit_fill_cleans_option_trailing_state_on_full_close(
+        self, tmp_path
+    ):
+        engine, _broker = self._engine(tmp_path)
+        engine.option_trailing_store.upsert(
+            position_uid="pos_abc123",
+            occ_symbol="SPY260618C00746000",
+            strategy="generic_single_leg_options",
+            owner_key="SPY",
+            qty=3,
+            entry_premium=12.77,
+            hwm_premium=20.16,
+            trail_activation_pct=0.10,
+            trail_pct=0.15,
+            current_stop_price=17.14,
+            alpaca_stop_order_id="stop-1",
+            stop_order_status="new",
+            last_observed_premium=20.16,
+        )
+        exit_fill = ClosedOrderInfo(
+            order_id="exit-1",
+            client_order_id=None,
+            symbol="SPY260618C00746000",
+            side=Side.SELL,
+            order_type="market",
+            status=OrderStatus.FILLED,
+            raw_status="filled",
+            qty=3.0,
+            filled_qty=3.0,
+            avg_fill_price=17.14,
+            stop_price=None,
+            submitted_at=T0,
+            filled_at=T0 + timedelta(minutes=1),
+        )
+
+        result = engine._record_recovered_exit_fill(
+            symbol="SPY",
+            owner="generic_single_leg_options",
+            exit_fill=exit_fill,
+            is_full_close=True,
+        )
+
+        assert result is True
+        assert engine.option_trailing_store.get_by_occ("SPY260618C00746000") is None
+
+    def test_recovered_exit_fill_keeps_option_trailing_state_on_partial_close(
+        self, tmp_path
+    ):
+        engine, _broker = self._engine(tmp_path)
+        engine.option_trailing_store.upsert(
+            position_uid="pos_abc123",
+            occ_symbol="SPY260618C00746000",
+            strategy="generic_single_leg_options",
+            owner_key="SPY",
+            qty=3,
+            entry_premium=12.77,
+            hwm_premium=20.16,
+            trail_activation_pct=0.10,
+            trail_pct=0.15,
+            current_stop_price=17.14,
+            alpaca_stop_order_id="stop-1",
+            stop_order_status="new",
+            last_observed_premium=20.16,
+        )
+        exit_fill = ClosedOrderInfo(
+            order_id="exit-1",
+            client_order_id=None,
+            symbol="SPY260618C00746000",
+            side=Side.SELL,
+            order_type="market",
+            status=OrderStatus.PARTIAL,
+            raw_status="partially_filled",
+            qty=3.0,
+            filled_qty=1.0,
+            avg_fill_price=17.14,
+            stop_price=None,
+            submitted_at=T0,
+            filled_at=T0 + timedelta(minutes=1),
+        )
+
+        result = engine._record_recovered_exit_fill(
+            symbol="SPY",
+            owner="generic_single_leg_options",
+            exit_fill=exit_fill,
+            is_full_close=False,
+        )
+
+        assert result is True
+        assert engine.option_trailing_store.get_by_occ("SPY260618C00746000") is not None
+
 
 # ── Shared-symbol conflict rejection (11.7 Part A) ─────────────────────────
 
