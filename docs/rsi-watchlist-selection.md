@@ -60,7 +60,7 @@ Implemented strategy:
 - default entry: RSI crosses below 30
 - default exit: RSI crosses above 70
 - order type: LIMIT
-- status: implemented, not yet active
+- status: active in paper trading
 
 The watchlist rules below are independent of those signal parameters.
 
@@ -123,20 +123,22 @@ RSI Reversion can tolerate weaker fundamentals than SMA because the setup is a
 temporary oversold bounce. It still cannot buy names where the sell-off may be
 the market pricing bankruptcy or permanent impairment.
 
-### 4. Market Regime Gate
+### 4. Runtime Market Gate
 
 Required before allowing new RSI entries:
 
-- SPY close > SPY SMA200
-- SPY close > SPY SMA50
+- engine-level regime must be `TRENDING` or `RANGING`
+- `RSIEdgeFilter` requires SPY close >= 99% of its 50-day SMA
 
 Rationale:
 
 Long-only mean reversion degrades in broad market downtrends. In those regimes,
 oversold can become more oversold.
 
-This is an edge-filter rule, not a watchlist-membership rule. The scanner should
-report it, but the engine should gate entries at runtime.
+The structural SPY 200-day BEAR veto is owned by `RegimeDetector`, not duplicated
+inside `RSIEdgeFilter`. The SPY 50 SMA band is an edge-filter rule, not a
+watchlist-membership rule. The scanner may report it, but the engine gates
+entries at runtime.
 
 ### 5. Symbol Structure
 

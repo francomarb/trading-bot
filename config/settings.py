@@ -330,6 +330,11 @@ RSI_WATCHLIST = [
     "CAT", "CIEN", "MCO", "AMZN", "EQIX", "RTX", "META", "HD",
     "SOFI", "ARM", "MSTR",
 ]
+# RSI macro gate tolerance. RSI still requires SPY to be near its 50-day
+# trend, but a 1% band avoids starving mean-reversion entries on tiny SPY
+# dips below the moving average. The structural SPY > 200 / BEAR veto is
+# enforced by RegimeDetector at the strategy-slot level.
+RSI_SPY50_TOLERANCE_PCT = 0.01
 # Bollinger Squeeze (TTM-style volatility breakout) — IMPLEMENTED BUT NOT
 # ACTIVE. Cross-universe research (docs/bollinger_squeeze_universe_research.md)
 # concluded sector ETFs are the optimal universe (Sharpe +0.22, MeanDD -7.7%

@@ -327,7 +327,7 @@ v1 uses a simple per-strategy config:
 STRATEGY_MIN_TRADES_FOR_VERDICT = {
     "sma_crossover": 30,
     "rsi_reversion": 25,         # lowered from initial 50 — RSI's tight filters
-                                 # (SPY trend, earnings blackout, no-new-low) gate
+                                 # (SPY trend, earnings blackout, active-breakdown) gate
                                  # very heavily in some regimes; observed 2-month
                                  # zero-trade stretches in paper. 25 is reachable.
                                  # The "RSI isn't firing" case is handled by L3

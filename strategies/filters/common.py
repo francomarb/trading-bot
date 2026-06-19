@@ -55,6 +55,7 @@ class SPYTrendFilter:
         sma_windows: SMA periods to check (e.g. [200] for SMA, [200, 50] for RSI).
         lookback_days: Calendar days of SPY history to fetch (default 320).
         cache_ttl_seconds: How long to reuse a cached SPY fetch (default 600 s).
+        sma_tolerance_pct: Allow SPY up to this fraction below each SMA.
     """
 
     def __init__(
@@ -63,12 +64,16 @@ class SPYTrendFilter:
         sma_windows: list[int],
         lookback_days: int = 320,
         cache_ttl_seconds: float = 600.0,
+        sma_tolerance_pct: float = 0.0,
     ) -> None:
         if not sma_windows:
             raise ValueError("sma_windows must not be empty")
+        if sma_tolerance_pct < 0:
+            raise ValueError("sma_tolerance_pct must be >= 0")
         self._windows = sorted(sma_windows)
         self._lookback_days = lookback_days
         self._cache_ttl = cache_ttl_seconds
+        self._sma_tolerance_pct = float(sma_tolerance_pct)
         self._spy_cache: pd.DataFrame | None = None
         self._cache_time: float = 0.0
         self._last_reason: str = ""
@@ -138,12 +143,23 @@ class SPYTrendFilter:
                     f"{len(close)} bars available, {window} required"
                 )
                 return False, reason
-            if last_close <= sma_val:
-                reason = (
-                    f"SPY {last_close:.2f} ≤ SMA{window} {sma_val:.2f}"
-                )
+            threshold = sma_val * (1.0 - self._sma_tolerance_pct)
+            if last_close <= threshold:
+                if self._sma_tolerance_pct > 0:
+                    reason = (
+                        f"SPY {last_close:.2f} ≤ SMA{window} tolerance floor {threshold:.2f} "
+                        f"(SMA {sma_val:.2f}, tolerance {self._sma_tolerance_pct:.1%})"
+                    )
+                else:
+                    reason = f"SPY {last_close:.2f} ≤ SMA{window} {sma_val:.2f}"
                 return False, reason
 
+        if self._sma_tolerance_pct > 0:
+            return (
+                True,
+                f"SPY {last_close:.2f} within {self._sma_tolerance_pct:.1%} "
+                f"of all SMAs {self._windows}",
+            )
         return True, f"SPY {last_close:.2f} above all SMAs {self._windows}"
 
     def __call__(self, df: pd.DataFrame) -> pd.Series:

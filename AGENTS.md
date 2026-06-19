@@ -259,7 +259,7 @@ Phase 10 completed to date:
 - **10.F1** Per-strategy capital sleeve allocator (`STRATEGY_ALLOCATIONS`, 50/50 sleeves)
 - **10.F2/F3** Regime detector + engine-level `allowed_regimes` gating
 - **10.F3a** SMA edge filter (`SPY > 200 SMA`, stock `> 200 SMA`, `10d vol > 30d vol`)
-- **10.F3b** RSI edge filter (`SPY > 200/50 SMA`, earnings blackout, liquidity floor, no new 20-day low)
+- **10.F3b** RSI edge filter (`SPY 50 SMA with 1% band`, earnings blackout, liquidity floor, active-breakdown gate: new 20-day low below stock 200 SMA; structural SPY 200/BEAR veto owned by regime)
 - **10.F4** RSI paper activation in `forward_test.py`
 - **10.G1** `LIVE_SIZE_MULTIPLIER=0.25` applied in risk manager when live
 - **10.G4** `DRY_RUN` flag — broker logs orders without submitting

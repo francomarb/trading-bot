@@ -95,7 +95,7 @@ trading-bot/
 │   ├── filters/
 │   │   ├── common.py          # SPYTrendFilter + CompositeEdgeFilter
 │   │   ├── sma_crossover.py   # SMAEdgeFilter: stock > 200 SMA, volume expansion
-│   │   ├── rsi_reversion.py   # RSIEdgeFilter: SPY dual macro, earnings, liquidity, no-new-low
+│   │   ├── rsi_reversion.py   # RSIEdgeFilter: SPY50 band, earnings, liquidity, active-breakdown
 │   │   ├── donchian_breakout.py      # DonchianEdgeFilter: stock > 200 SMA, liquidity, earnings
 │   │   ├── spy_options_reversion.py  # SPYOptionsEdgeFilter: SPY > 100 SMA
 │   │   ├── credit_spread.py   # CreditSpreadEdgeFilter: trend + IV proxy + earnings

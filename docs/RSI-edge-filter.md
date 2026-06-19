@@ -38,17 +38,18 @@ The filter lives at `strategies/filters/rsi_reversion.py`. Shared building block
 
 All four gates must be `True` on a given bar for an entry to be allowed on that bar. Exits are never evaluated against the filter.
 
-### Gate 1 — SPY Macro Trend (mandatory)
+### Gate 1 — SPY Intermediate Trend (mandatory)
 
-**Rule:** `SPY close > SPY 200-day SMA` AND `SPY close > SPY 50-day SMA`
+**Rule:** `SPY close >= SPY 50-day SMA * 0.99`
 
-**Implemented by:** `SPYTrendFilter(sma_windows=[200, 50])` from `strategies/filters/common.py`
+**Implemented by:** `SPYTrendFilter(sma_windows=[50], sma_tolerance_pct=settings.RSI_SPY50_TOLERANCE_PCT)` from `strategies/filters/common.py`
 
-**Why both SMAs:**
-- 200 SMA: structural bear market gate — RSI reversion into a broad bear is catching a falling knife, not a mean-reversion setup
-- 50 SMA: intermediate downtrend gate — even in a long-term bull, a SPY below its 50 SMA signals deteriorating momentum where individual oversold setups are more likely to extend than revert
+**Why this SMA:**
+- 50 SMA with a 1% band: intermediate downtrend gate — even outside a structural bear market, a SPY materially below its 50 SMA signals deteriorating momentum where individual oversold setups are more likely to extend than revert
+- The 1% tolerance avoids starving RSI when SPY is only fractionally below its 50 SMA, where SIP backtests showed the hard cutoff rejected high-value mean-reversion entries
+- 200 SMA: intentionally delegated to the engine-level `RegimeDetector`, which blocks RSI entries in `BEAR` regimes
 
-**SPY data:** fetched once per engine cycle with a 600-second TTL cache. All symbols in one cycle share the same SPY fetch — no repeated API calls. The default 320-calendar-day lookback provides a holiday-aware buffer beyond the 200 trading sessions required by SMA200.
+**SPY data:** fetched once per engine cycle with a 600-second TTL cache. All symbols in one cycle share the same SPY fetch — no repeated API calls. The default 320-calendar-day lookback is retained as a conservative buffer.
 
 **Failure behaviour:**
 
@@ -60,7 +61,7 @@ All four gates must be `True` on a given bar for an entry to be allowed on that 
 
 The TTL is 600 seconds. After a failed fetch `cache_time` is still advanced, so the API is retried no more than once per TTL interval rather than every cycle.
 
-**Note:** This gate provides a second BEAR block on top of the `RegimeDetector`'s BEAR classification. The redundancy is intentional — the regime detector has a TTL-cached SPY fetch with a longer staleness window. The filter's SPY check is more current and is also the correct home for the RSI-specific 50 SMA gate (which the regime detector does not apply to SMA entries).
+**Note:** This gate does not duplicate the structural `SPY > 200 SMA` check. That BEAR-market veto is owned by `RegimeDetector` at the strategy-slot level. The RSI filter only keeps the RSI-specific 50 SMA confirmation band, which the regime detector does not apply to other equity strategies.
 
 ---
 
@@ -83,7 +84,7 @@ Post-earnings (2 days after): options unwinding, analyst price-target updates, a
 
 ### Gate 3 — Minimum Liquidity
 
-**Rule:** 20-day rolling average volume ≥ 500,000 shares
+**Rule:** 20-day rolling average dollar volume ≥ $10,000,000
 
 **Why:**
 RSI reversion enters via LIMIT orders. Thinly traded stocks fill partially at the limit price (or not at all), leaving the bot with a partial position at an unfavorable price while the stop is sized for a full position. The edge on paper disappears in practice because fill quality degrades below this liquidity floor.
@@ -96,16 +97,22 @@ This is a hard structural floor, not a directional signal. It is evaluated again
 
 ### Gate 4 — No Active Breakdown
 
-**Rule:** Current `close > min(close)` of the prior 20 bars (not including the current bar)
+**Rule:** Block only when both are true:
+- Current `close <= min(close)` of the prior 20 bars, not including the current bar
+- Current `close < 200-day SMA`
 
 **Why:**
-A stock making new 20-day lows is in active breakdown. Each lower low looks like an RSI oversold setup — it generates a raw entry signal — but each one is a knife-catch. The price action is dominated by forced selling, structural deterioration, or bad news that the SPY macro gates cannot see (the broad market may be fine while this individual stock collapses).
+A stock making new 20-day lows below its 200-day trend is in active breakdown. Each lower low looks like an RSI oversold setup — it generates a raw entry signal — but each one is a knife-catch. The price action is dominated by forced selling, structural deterioration, or bad news that the SPY macro gates cannot see.
 
-This gate blocks those entries without penalising normal pullbacks, which is what the strategy is designed to capture. The SPY > 50 SMA gate guards the macro environment; this gate guards individual stock breakdown.
+This gate blocks those entries without penalising normal pullbacks above the stock's long-term trend, which is what the strategy is designed to capture. The SPY 50 SMA band guards the macro environment; this gate guards individual stock breakdown.
 
-**Why not the 50-day SMA:** RSI oversold stocks are typically below their 50-day SMA — that is exactly the population the strategy targets. Filtering on `close < 50 SMA` would remove most valid setups. The new-low gate addresses the same concern more precisely: it distinguishes "temporarily below 50 SMA" (normal pullback, reversion candidate) from "making new 20-day lows" (active breakdown, knife-catch).
+**Why not the 50-day SMA:** RSI oversold stocks are typically below their 50-day SMA — that is exactly the population the strategy targets. Filtering on `close < 50 SMA` would remove most valid setups. The active-breakdown gate addresses the same concern more precisely: it distinguishes "temporarily below 50 SMA" (normal pullback, reversion candidate) from "making new 20-day lows below the 200-day trend" (active breakdown, knife-catch).
 
-**Fail-open:** if there are fewer than 21 bars of history (20 for rolling minimum + 1 for shift), the gate returns `True`.
+**Fail-open with warning:** if there is not enough history to compute either the
+prior-low window or the 200-day SMA on the latest bar, the gate returns `True`
+and logs `RSI_FILTER_WARN ... active-breakdown gate failed open`. This preserves
+eligibility for recent IPOs or temporary data gaps while making the weakened
+protection visible to the operator.
 
 ---
 
@@ -113,20 +120,21 @@ This gate blocks those entries without penalising normal pullbacks, which is wha
 
 | Parameter | Default | Description |
 |---|---|---|
-| `spy_lookback_days` | 320 | Calendar days of SPY history to fetch (buffered beyond 200 trading days) |
+| `spy_lookback_days` | 320 | Calendar days of SPY history to fetch; retained as a conservative cache window |
 | `spy_cache_ttl` | 600.0 s | SPY cache TTL — reused across all symbols in one cycle |
+| `settings.RSI_SPY50_TOLERANCE_PCT` | 0.01 | SPY may be up to 1% below its 50 SMA |
 | `days_before` | 3 | Earnings blackout: calendar days before announcement |
 | `days_after` | 2 | Earnings blackout: calendar days after announcement |
 | `vol_min_window` | 20 | Rolling window for average volume calculation (bars) |
-| `vol_min_avg` | 500,000 | Minimum average daily share volume |
-| `new_low_window` | 20 | Look-back window for breakdown detection (bars) |
+| `notional_min_avg` | 10,000,000 | Minimum 20-day average daily dollar volume |
+| `new_low_window` | 20 | Short-term low window for breakdown detection (bars) |
 
 All parameters can be overridden at construction time:
 
 ```python
 edge = RSIEdgeFilter(
     days_before=5,
-    vol_min_avg=1_000_000,
+    notional_min_avg=20_000_000,
 )
 ```
 
@@ -138,15 +146,15 @@ Every filter decision on the most recent bar is logged. No silent passes or bloc
 
 **Entry allowed:**
 ```
-INFO | RSI_FILTER_ALLOWED ALLY — SPY=True earnings=True liquid=True no_new_low=True
+INFO | RSI_FILTER_ALLOWED ALLY — SPY=True earnings=True liquid=True no_active_breakdown=True
 ```
 
 **Entry blocked** (one or more gates failed, all failing gates listed):
 ```
-INFO | RSI_FILTER_BLOCKED CDNS — SPY trend gate failed: SPY 650.00 ≤ SMA50 655.00
+INFO | RSI_FILTER_BLOCKED CDNS — SPY trend gate failed: SPY 640.00 ≤ SMA50 tolerance floor 648.45 (SMA 655.00, tolerance 1.0%)
 INFO | RSI_FILTER_BLOCKED CCK — earnings blackout
-INFO | RSI_FILTER_BLOCKED SN — volume illiquid (avg20=312,450 < 500,000)
-INFO | RSI_FILTER_BLOCKED TFC — new 20-day low (active breakdown)
+INFO | RSI_FILTER_BLOCKED SN — liquidity too low (avg_dollar_vol20=$8,500,000 < $10,000,000)
+INFO | RSI_FILTER_BLOCKED TFC — new 20-day low below 200 SMA (active breakdown)
 ```
 
 Multiple reasons are comma-separated in a single log line if more than one gate fails simultaneously.
@@ -159,7 +167,7 @@ Multiple reasons are comma-separated in a single log line if more than one gate 
 
 **Why it was considered:** a stock below its 50 SMA has weakening momentum.
 
-**Why it was removed:** RSI oversold stocks are almost always below their 50 SMA. This was the population the strategy is designed to trade. Including this gate was observed to filter out the majority of valid setups. The new-low gate (Gate 4) addresses the legitimate concern — active breakdown — without penalising normal mean-reversion candidates.
+**Why it was removed:** RSI oversold stocks are almost always below their 50 SMA. This was the population the strategy is designed to trade. Including this gate was observed to filter out the majority of valid setups. The active-breakdown gate (Gate 4) addresses the legitimate concern — active breakdown — without penalising normal mean-reversion candidates.
 
 ### Earnings blackout on SMA Crossover — intentionally absent
 
@@ -169,9 +177,9 @@ Earnings blackout belongs on RSI, not SMA. Trend-following strategies benefit fr
 
 High volatility environments are handled at the engine level by the `RegimeDetector` VOLATILE regime gate, which blocks new entries for all strategies. A redundant ATR% check in this filter would be duplication. If the regime detector is ever removed, revisit.
 
-### Cliff-edge SPY 50 SMA gate — noted for Phase 11
+### SPY 50 SMA band — paper-watch after loosening
 
-The current gate is a hard binary: SPY crosses the 50 SMA on one bar → all RSI entries blocked on the next cycle. A brief SPY dip below the 50 SMA on a single day can trigger a lockout during a valid paper run. A smoother N-bar confirmation window (require SPY below 50 SMA for ≥ 3 consecutive bars) would reduce false lockouts. Deferred: hard gates are operationally auditable; the smooth version requires forward-test data to validate the threshold.
+The prior hard gate blocked all RSI entries as soon as SPY crossed below the 50 SMA. SIP backtests showed that a 1% tolerance band materially improved RSI participation and return, at the cost of higher drawdown. This looser gate should be paper-watched before considering any further SPY50 smoothing or removal.
 
 ---
 
@@ -202,5 +210,5 @@ The `allowed_regimes` on the `StrategySlot` provides the engine-level BEAR and V
 
 | Item | Description |
 |---|---|
-| 11.23 | SPY 50 SMA cliff-edge smoothing — N-bar confirmation before engaging the block |
+| 11.23 | SPY 50 SMA band paper-watch — evaluate the looser 1% threshold before considering any further smoothing or removal |
 | 11.25 | VIX integration — high VIX is actually favourable for RSI reversion (sharp oversold snaps); could relax VOLATILE block selectively for RSI when VIX is elevated |

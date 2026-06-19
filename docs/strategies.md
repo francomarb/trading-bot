@@ -140,13 +140,12 @@ All gates must pass for an entry to be allowed. Exits are never blocked.
 
 | Gate | Rule | Rationale |
 |---|---|---|
-| SPY > 200 SMA | SPY close > 200-day SMA | Blocks entries in broad bear markets |
-| SPY > 50 SMA | SPY close > 50-day SMA | Blocks entries during intermediate downtrends |
+| SPY 50 SMA band | SPY close >= 99% of 50-day SMA | Blocks entries during material intermediate downtrends without starving tiny SPY undercuts |
 | Earnings blackout | No entry within 3 bars before / 2 bars after earnings | Avoids binary-event risk on a mean-reversion strategy |
-| Liquidity floor | 20-day avg volume ≥ 500,000 shares | Thin stocks fill partially and exit wide, destroying the edge |
-| No new 20-day low | `close > rolling(20).min()` of prior bars | Blocks entries in active individual breakdowns |
+| Liquidity floor | 20-day avg dollar volume ≥ $10M | Thin stocks fill partially and exit wide, destroying the edge |
+| Active breakdown | New 20-day low **and** below 200 SMA | Blocks entries in active individual breakdowns without rejecting healthy long-term pullbacks |
 
-Note: the SPY macro gates provide a second BEAR block on top of the regime detector, ensuring RSI does not enter mean-reversion trades in a broad downtrend even if the regime detector's TTL cache is stale.
+Note: the structural SPY 200 SMA / BEAR-market veto is owned by the engine-level regime detector. `RSIEdgeFilter` keeps only the RSI-specific SPY 50 SMA confirmation band.
 
 **Sector momentum filter (`strategies/filters/sector_momentum.py` — `SectorMomentumFilter`):**
 
