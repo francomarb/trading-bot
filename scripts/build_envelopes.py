@@ -77,14 +77,15 @@ from strategies.sma_crossover import SMACrossover  # noqa: E402
 #     it actually rejects depends on whether the offline earnings
 #     cache has data for the symbol over the backtest window.
 #
-#   - **SPY trend gate (SPYTrendFilter / SMA200 / SMA50)** is a
+#   - **SPY trend gate (SPYTrendFilter / RSI 50-SMA band)** is a
 #     live-cycle filter: it fetches CURRENT SPY state at filter
 #     construction. During the historical backtest, that same
 #     build-time SPY snapshot is applied to every bar, instead of
-#     replaying per-bar historical SPY state. This means an envelope
-#     built on a day when SPY > 200 SMA produces a different envelope
-#     than one built on a day when SPY < 200 SMA. **Real fix would
-#     require a historical-SPY-injection mode on SPYTrendFilter** —
+#     replaying per-bar historical SPY state. For RSI, the edge filter
+#     currently uses a 1% tolerance around SPY's 50-day SMA; the
+#     structural SPY 200 / BEAR veto is owned by RegimeDetector outside
+#     this filter. **Real fix would require a historical-SPY-injection
+#     mode on SPYTrendFilter** —
 #     out of v1 scope; logged as follow-up §F-future (post-11.10h).
 #
 #   - **SectorMomentumFilter** is intentionally omitted entirely
@@ -102,7 +103,8 @@ FILTER_FIDELITY_NOTE = (
     "and now receives the symbol context (PR #17 fix to "
     "backtest/runner.py), but its replay quality depends on whether the "
     "offline earnings cache has data for the backtest window. SPY trend "
-    "gates (SMA200/SMA50) use the build-time SPY snapshot and apply "
+    "gates (for RSI: 50-SMA band; structural SPY200 is regime-owned) use "
+    "the build-time SPY snapshot and apply "
     "that same decision to every historical bar — not per-bar historical "
     "SPY state. SectorMomentumFilter is omitted entirely (offline-"
     "unfriendly). Net: envelope OVER-counts production-allowed signals; "

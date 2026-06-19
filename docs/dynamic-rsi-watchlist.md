@@ -182,12 +182,16 @@ The dynamic watchlist should select symbols that are:
 
 Before scoring, remove symbols that fail basic quality standards.
 
-### Required baseline filters
+### Example baseline filters
+
+These are scanner examples, not the live `RSIEdgeFilter` contract. The current
+production edge filter uses the regime gate, SPY 50 SMA band, earnings,
+liquidity, sector, and active-breakdown checks at runtime.
 
 - minimum price threshold
 - minimum average daily dollar volume
-- price above 50-day SMA
-- optional: price above 200-day SMA
+- optional scanner preference for price above 50-day SMA
+- optional scanner preference for price above 200-day SMA
 - volatility within acceptable range
 
 ### Example filter goals
@@ -463,7 +467,7 @@ For each refresh:
 
 ```text
 RSI scanner started: base_universe=15
-RSI scanner filtered out 3 symbols below 50 SMA
+RSI scanner filtered out 3 symbols by scanner trend preference
 RSI scanner filtered out 2 symbols on low dollar volume
 RSI scanner selected 10 symbols: AAPL, MSFT, NVDA, META, AMZN, AVGO, AMD, MU, QQQ, SMH
 ```

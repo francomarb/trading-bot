@@ -241,10 +241,10 @@ def main() -> None:
             # RSI reversion works in both trending and ranging markets;
             # blocked in BEAR (stocks can keep falling past oversold) and
             # VOLATILE (fear-driven overshoots are unpredictable and the
-            # snap-back timing is unreliable). The RSI edge filter adds a
-            # second layer: SPY > 200 SMA AND SPY > 50 SMA, so BEAR is
-            # double-blocked. Missing SMA history fails closed. Sector
-            # momentum: COLD sectors BLOCK entries
+            # snap-back timing is unreliable). The RSI edge filter adds the
+            # RSI-specific SPY 50 SMA confirmation with a 1% tolerance band;
+            # the structural SPY > 200 / BEAR veto is owned by the regime gate above.
+            # Missing SMA history fails closed. Sector momentum: COLD sectors BLOCK entries
             # (mean-reversion in a cold sector = cluster risk).
             allowed_regimes=frozenset({MarketRegime.TRENDING, MarketRegime.RANGING}),
         ),

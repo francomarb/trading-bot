@@ -5,7 +5,7 @@ Paired with SMA Crossover for regime diversification: trend-followers
 profit in directional markets, mean-reverters profit in ranging /
 post-extreme markets.
 
-**Last updated:** 2026-06-06
+**Last updated:** 2026-06-19
 
 ---
 
@@ -127,10 +127,12 @@ Applied in order. Any failure blocks the entry.
    (stocks can keep falling past oversold for weeks) and `VOLATILE`
    (fear-driven overshoots are unpredictable; snap-back timing is unreliable).
 2. **`RSIEdgeFilter`** (`strategies/filters/rsi_reversion.py`):
-   - **SPY dual macro gate**: SPY > 200 SMA *and* SPY > 50 SMA. Both
-     must pass — stricter than the single-200 gate other strategies use.
-     The 50 SMA leg adds a short-term momentum confirmation: we will not
-     fade oversold in a market that is itself in short-term decline.
+   - **SPY intermediate trend gate**: SPY within 1% of its 50 SMA. The structural
+     SPY > 200 SMA / BEAR-market veto is owned by the engine-level regime
+     detector, so the RSI filter keeps only the RSI-specific 50 SMA
+     confirmation: we will not fade oversold in a market that is itself in
+     material short-term decline, while allowing tiny SPY undercuts that
+     backtested as high-value reversion windows.
    - **Earnings blackout**: 3 days before / 2 days after. Stricter than
      SMA's blackout because RSI fades volatility, and earnings is the
      event most likely to make today's "overshoot" tomorrow's "new
@@ -138,10 +140,10 @@ Applied in order. Any failure blocks the entry.
    - **Liquidity floor**: 20-day average dollar volume ≥ $10M. Tighter
      than the broader watchlist liquidity requirement; mean-reversion
      is exit-quality-sensitive and we need fillable size.
-   - **No-new-low gate**: current close > min(close over prior 20 bars).
-     Blocks entries when the stock is making 20-day lows (active
-     breakdown). RSI < 30 in an active breakdown is a falling-knife
-     signal, not a reversion signal.
+   - **Active-breakdown gate**: blocks only when the stock is making a new
+     20-day low and is below its 200-day SMA. RSI < 30 below long-term
+     trend support can be a falling-knife signal; a short-term low above the
+     200-day trend remains eligible as a normal pullback.
 3. **`SectorMomentumFilter`** (`sector/gauge.py`) — sector policy is
    `block` (not `warn` as SMA uses). Mean-reversion in a COLD sector is
    cluster risk: multiple names in the same falling sector all flash
@@ -187,7 +189,7 @@ evaluation."
 
 The tight filter stack significantly thins the effective watchlist on
 any given day: most names are blocked by SPY trend, earnings blackout,
-or no-new-low at any moment. This is why the breadth was deliberately
+or active-breakdown at any moment. This is why the breadth was deliberately
 increased.
 
 ---
@@ -250,9 +252,11 @@ in the backtest.
 
 ## Optimization opportunities
 
-A dedicated `rsi_reversion_optimizations.md` has not been created
-because no audit of RSI's actual paper performance has been run. Likely
-candidates, by analogy with the SMA audit:
+A dedicated `rsi_reversion_optimizations.md` has not been created yet. The
+June 2026 filter audit relaxed three over-protective gates: structural SPY200
+was delegated fully to regime, SPY50 became a 1% band, and the 20-day-low block
+became an active-breakdown rule that only blocks below the stock's 200 SMA.
+Remaining likely candidates, by analogy with the SMA audit:
 
 - **Giveback / capture-ratio audit** — replicate `sma_giveback_audit.py`
   for the overbought-cross exit on RSI winners. Mean-reversion winners
@@ -261,10 +265,10 @@ candidates, by analogy with the SMA audit:
 - **Per-symbol profit concentration** — does the same 80/20 pattern hold
   (a few names produce most of the alpha)? If yes, the same cull-the-
   chronic-losers approach applies.
-- **Filter contribution analysis** — of the four `RSIEdgeFilter` gates,
-  which actually catch falling-knife trades and which fire on already-
-  good entries (false positives)? The strict gate stack is the right
-  default but may be over-tuned.
+- **Filter contribution analysis** — of the remaining `RSIEdgeFilter` gates,
+  which actually catch falling-knife trades and which fire on already-good
+  entries (false positives)? After the June 2026 relaxations, this should be
+  paper-watched before further loosening.
 - **Watchlist breadth review** — the 2026-04-30 expansion deliberately
   widened the list; six months of paper data is now available to assess
   whether the expansion produced viable trades or just more blocked
@@ -278,8 +282,8 @@ and create `docs/rsi_reversion_optimizations.md`.
 ## Implementation files
 
 - `strategies/rsi_reversion.py` — strategy class.
-- `strategies/filters/rsi_reversion.py` — `RSIEdgeFilter` (SPY dual gate,
-  earnings, liquidity, no-new-low).
+- `strategies/filters/rsi_reversion.py` — `RSIEdgeFilter` (SPY50 band,
+  earnings, liquidity, active-breakdown).
 - `strategies/filters/common.py` — `SPYTrendFilter`, `EarningsBlackout`.
 - `sector/gauge.py` — `SectorMomentumFilter`.
 - `regime/detector.py` — regime classifier.
