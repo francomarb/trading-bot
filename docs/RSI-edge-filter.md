@@ -108,7 +108,11 @@ This gate blocks those entries without penalising normal pullbacks above the sto
 
 **Why not the 50-day SMA:** RSI oversold stocks are typically below their 50-day SMA — that is exactly the population the strategy targets. Filtering on `close < 50 SMA` would remove most valid setups. The active-breakdown gate addresses the same concern more precisely: it distinguishes "temporarily below 50 SMA" (normal pullback, reversion candidate) from "making new 20-day lows below the 200-day trend" (active breakdown, knife-catch).
 
-**Fail-open:** if there is not enough history to compute either the prior-low window or the 200-day SMA, the gate returns `True`.
+**Fail-open with warning:** if there is not enough history to compute either the
+prior-low window or the 200-day SMA on the latest bar, the gate returns `True`
+and logs `RSI_FILTER_WARN ... active-breakdown gate failed open`. This preserves
+eligibility for recent IPOs or temporary data gaps while making the weakened
+protection visible to the operator.
 
 ---
 

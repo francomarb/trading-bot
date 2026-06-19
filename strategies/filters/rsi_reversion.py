@@ -147,6 +147,13 @@ class RSIEdgeFilter:
         below_200 = close < sma200
         active_breakdown = new_low & below_200
         has_history = prior_min.notna() & sma200.notna()
+        if not df.empty and not bool(has_history.iloc[-1]):
+            logger.warning(
+                f"RSI_FILTER_WARN {self._symbol} — active-breakdown gate "
+                "failed open on latest bar: insufficient history for "
+                f"prior {self._new_low_window}-bar low or SMA200 "
+                f"(bars={len(close)})"
+            )
         return (~active_breakdown).where(has_history, other=True).astype(bool)
 
     def __call__(self, df: pd.DataFrame) -> EdgeFilterDecision:

@@ -11,7 +11,7 @@ the live filters on each signal bar:
 - RSI-specific SPY 50 SMA gate mode (hard, removed, tolerance band, or grace)
 - earnings blackout, fail-open when earnings data is unavailable
 - 20-day average dollar-volume liquidity floor
-- sector momentum block at score <= -3
+- sector momentum block at production COLD threshold
 - configurable stock breakdown gate
 """
 
@@ -45,6 +45,7 @@ from scripts.rsi_portfolio_backtest import (
     PortfolioBacktestResult,
     _compute_portfolio_stats,
 )
+from sector.gauge import _COLD_THRESHOLD
 from strategies.base import EdgeFilterDecision, SignalFrame
 from strategies.rsi_reversion import RSIReversion
 
@@ -76,7 +77,7 @@ class HistoricalRSIFilter:
         earnings_by_symbol: dict[str, list[pd.Timestamp]],
         breakdown_mode: str,
         notional_min_avg: float = 10_000_000.0,
-        sector_score_threshold: float = -3.0,
+        sector_score_threshold: float = float(_COLD_THRESHOLD),
         days_before: int = 3,
         days_after: int = 2,
     ) -> None:
@@ -262,7 +263,7 @@ def _compute_spy_gate(spy: pd.DataFrame, mode: str) -> pd.Series:
     elif mode == "none":
         gate = pd.Series(True, index=work.index, dtype=bool)
     elif mode == "band_1pct":
-        gate = close >= sma50 * 0.99
+        gate = close > sma50 * (1.0 - settings.RSI_SPY50_TOLERANCE_PCT)
     elif mode == "grace_3d":
         gate = (close > sma50).rolling(3, min_periods=1).max().fillna(0).astype(bool)
     else:
@@ -582,7 +583,7 @@ def _render(results: list[PortfolioBacktestResult], *, feed: str, start: datetim
         f"- Feed: `{feed}`",
         f"- Window: {start.date()} to {end.date()}",
         "- Shared-capital portfolio, next-session RSI limit-touch entries, ATR protective stops, 5 bps slippage on market exits/stops, $0 commission.",
-        "- Filters modeled per historical bar: regime, selected SPY50 policy, earnings fail-open, liquidity, sector score <= -3 block, and selected breakdown gate.",
+        f"- Filters modeled per historical bar: regime, selected SPY50 policy, earnings fail-open, liquidity, sector score <= {_COLD_THRESHOLD} block, and selected breakdown gate.",
         "",
         "| Variant | Symbols | Trades | Return | CAGR | Sharpe | Sortino | MaxDD | Win % | PF | Avg Util | Avg Open Pos | Final Equity |",
         "|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|",

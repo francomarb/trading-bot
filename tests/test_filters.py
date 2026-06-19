@@ -767,9 +767,12 @@ class TestRSIEdgeFilter:
         self._spy_allows(f)
         self._clear_earnings(f)
         df = _liquid_df(5)   # only 5 bars, need 21 for prior_min to be non-NaN
-        decision = f(df)
+        with patch("strategies.filters.rsi_reversion.logger.warning") as warn:
+            decision = f(df)
         assert decision.allowed.iloc[-1]   # fail open
         assert decision.latest_reasons == []
+        warn.assert_called_once()
+        assert "active-breakdown gate failed open" in warn.call_args.args[0]
 
     # ── Structural / combined ─────────────────────────────────────────────────
 
