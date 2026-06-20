@@ -7,6 +7,28 @@ from dataclasses import dataclass
 from datetime import datetime, timezone
 
 
+# Order lifecycle state-machine split (PR #59 §10.4).
+#
+# The legacy schema mixed two categories of state on one row:
+#   - Strategy state (kept): entry_premium, hwm_premium, trail_*, etc.
+#   - Broker-order state (migrated): alpaca_stop_order_id, stop_order_status.
+#
+# The broker-order columns are a denormalized mirror of state the order
+# lifecycle foundation owns on ``position_lifecycle_orders`` as a
+# ``role='protective_stop'`` / ``role='replacement_stop'`` row. The
+# ``lifecycle_order_id`` FK below makes that relationship explicit and
+# load-bearing so readers can join through to substrate-authoritative
+# identity / status.
+#
+# Why ``REFERENCES position_lifecycle_orders(id)`` and not ``(order_id)``:
+# ``position_lifecycle_orders.order_id`` has a *partial* unique index
+# (``WHERE order_id IS NOT NULL``) and SQLite refuses to treat a
+# partial-unique column as an FK parent key. The autoincrement PK is the
+# only valid FK target.
+#
+# ``alpaca_stop_order_id`` / ``stop_order_status`` columns remain as
+# denormalized mirrors during migration. Strict column removal is a
+# follow-up cleanup PR once every reader has migrated to the FK join.
 _CREATE_OPTION_TRAILING_STOPS_SQL = """
 CREATE TABLE IF NOT EXISTS option_trailing_stops (
     position_uid            TEXT PRIMARY KEY,
@@ -22,9 +44,39 @@ CREATE TABLE IF NOT EXISTS option_trailing_stops (
     alpaca_stop_order_id    TEXT,
     stop_order_status       TEXT,
     last_observed_premium   REAL,
-    last_updated_at         TEXT NOT NULL
+    last_updated_at         TEXT NOT NULL,
+    lifecycle_order_id      INTEGER
+        REFERENCES position_lifecycle_orders(id)
 );
 """
+
+# Idempotent migration for pre-existing databases — ALTER ADD COLUMN
+# only when the column is missing. SQLite cannot add a column with a
+# FOREIGN KEY clause via ALTER TABLE, so the FK constraint is only
+# enforced on fresh tables created by ``_CREATE_OPTION_TRAILING_STOPS_SQL``
+# above. On pre-existing tables the column exists as a plain INTEGER and
+# is validated by application code + the join-based read instead. New
+# installations (and any future rebuild) get the FK enforcement for
+# free.
+_MIGRATION_COLUMNS = {
+    "lifecycle_order_id": "INTEGER",
+}
+
+
+def _ensure_lifecycle_order_id_column(conn: sqlite3.Connection) -> None:
+    """Add ``lifecycle_order_id`` to ``option_trailing_stops`` when missing."""
+    existing = {
+        row[1]
+        for row in conn.execute(
+            "PRAGMA table_info(option_trailing_stops)"
+        ).fetchall()
+    }
+    for column, col_type in _MIGRATION_COLUMNS.items():
+        if column not in existing:
+            conn.execute(
+                f"ALTER TABLE option_trailing_stops ADD COLUMN {column} {col_type}"
+            )
+
 
 _OPTION_TRAILING_STOPS_INDEXES_SQL = (
     "CREATE INDEX IF NOT EXISTS idx_option_trailing_stops_strategy "
@@ -33,6 +85,8 @@ _OPTION_TRAILING_STOPS_INDEXES_SQL = (
     "ON option_trailing_stops(owner_key)",
     "CREATE INDEX IF NOT EXISTS idx_option_trailing_stops_occ "
     "ON option_trailing_stops(occ_symbol)",
+    "CREATE INDEX IF NOT EXISTS idx_option_trailing_stops_lifecycle_order_id "
+    "ON option_trailing_stops(lifecycle_order_id)",
 )
 
 
@@ -165,4 +219,5 @@ __all__ = [
     "OptionTrailingStopStore",
     "_CREATE_OPTION_TRAILING_STOPS_SQL",
     "_OPTION_TRAILING_STOPS_INDEXES_SQL",
+    "_ensure_lifecycle_order_id_column",
 ]
