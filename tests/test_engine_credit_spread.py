@@ -796,7 +796,7 @@ class TestProcessCreditSpreadExits:
         for regime in (MarketRegime.TRENDING, MarketRegime.RANGING,
                        MarketRegime.VOLATILE, None):
             broker.dispatch_spread_order.reset_mock()
-            
+
             engine._process_credit_spread_exits(
                 strategy=strategy, underlying="SPY", underlying_close=745.0,
                 current_regime=regime,
