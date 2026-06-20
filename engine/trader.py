@@ -3197,7 +3197,21 @@ class TradingEngine:
         *,
         reason: str,
     ) -> None:
-        """Delete durable option trailing metadata after a full OCC close."""
+        """Delete durable option trailing metadata after a full OCC close.
+
+        Scope post-§10.4: this helper deletes the *strategy state* row
+        (entry_premium, hwm_premium, trail_*) on a full close. The
+        per-order broker state for the underlying stop is now owned by
+        the order-lifecycle substrate (``position_lifecycle_orders``),
+        which reaches its own terminal status through ``apply_order_event``
+        independently — this helper does not touch substrate rows.
+
+        Pre-§10.4 this helper also cleaned the broker-state mirror
+        (``alpaca_stop_order_id`` / ``stop_order_status``) embedded on
+        the trailing row; the mirror is gone alongside the trailing row
+        on delete, so behavior at the call sites is unchanged. The PR
+        #69 recovery cleanup tests stay green.
+        """
         if not is_occ_option(raw_symbol):
             return
         if self.option_trailing_store is None:
