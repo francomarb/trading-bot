@@ -1013,6 +1013,52 @@ class PositionLifecycleOrdersStore:
         ).fetchall()
         return [_row_from_tuple(r) for r in rows]
 
+    def get_non_terminal_spread_close_rows(
+        self,
+    ) -> list[PositionLifecycleOrderRow]:
+        """All non-terminal close-side rows (role IN ('exit',
+        'partial_close')) whose parent position is a spread.
+
+        Used by the spread close reconciler (cycle + startup) to walk
+        rows whose state may have advanced at the broker without the
+        WebSocket noticing. ``apply_order_event`` is single-leg-scoped;
+        spreads use ``mark_terminal_after_dispatch`` instead, so they
+        need a dedicated walk that doesn't intermix with the
+        single-leg reconciler.
+
+        Returns rows in id-ascending order (insertion order).
+        Includes rows with order_id IS NULL (e.g. the partial_close
+        residual placeholder); callers must guard their broker fetch
+        on order_id not being None.
+        """
+        roles = ("exit", "partial_close")
+        status_placeholders = ", ".join("?" for _ in NON_TERMINAL_ORDER_STATUSES)
+        rows = self._conn.execute(
+            f"""
+            SELECT plo.id, plo.position_uid, plo.role, plo.order_id,
+                   plo.client_order_id, plo.order_type, plo.order_class,
+                   plo.time_in_force, plo.side, plo.intended_qty,
+                   plo.intended_stop_price, plo.intended_trigger_price,
+                   plo.intended_limit_price, plo.intended_take_profit_price,
+                   plo.parent_order_id, plo.replaces_order_id,
+                   plo.origin_kind, plo.operator_command_uid,
+                   plo.slippage_benchmark_price, plo.slippage_benchmark_kind,
+                   plo.slippage_benchmark_timestamp,
+                   plo.slippage_measurement_quality,
+                   plo.status, plo.filled_qty, plo.avg_fill_price,
+                   plo.created_at, plo.submitted_at, plo.terminal_at,
+                   plo.last_observed_broker_updated_at, plo.last_observed_at
+            FROM position_lifecycle_orders plo
+            JOIN position_lifecycle pl ON pl.position_uid = plo.position_uid
+            WHERE pl.position_type = 'spread'
+              AND plo.role IN (?, ?)
+              AND plo.status IN ({status_placeholders})
+            ORDER BY plo.id ASC
+            """,
+            (roles[0], roles[1], *sorted(NON_TERMINAL_ORDER_STATUSES)),
+        ).fetchall()
+        return [_row_from_tuple(r) for r in rows]
+
     def get_non_terminal_by_role(
         self, position_uid: str, roles: Iterable[str]
     ) -> list[PositionLifecycleOrderRow]:

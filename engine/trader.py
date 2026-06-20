@@ -820,6 +820,18 @@ class TradingEngine:
                 f"non-terminal rows over time via the cycle "
                 f"reconciler."
             )
+        # §10.7 spread close reconciler — closes the restart-gap.
+        try:
+            self._reconcile_substrate_spread_closes(
+                startup_snapshot, reason="startup",
+            )
+        except Exception as exc:
+            logger.critical(
+                f"spread close startup reconcile raised: "
+                f"{type(exc).__name__}: {exc}. Cycle path will retry "
+                f"non-terminal rows over time via the cycle "
+                f"reconciler."
+            )
 
         # Operator Controls Phase A PR-2 — restore sticky halt from disk.
         # If a halt was engaged before the previous shutdown, re-engage
@@ -1060,6 +1072,13 @@ class TradingEngine:
             self._drain_lifecycle_attaches()
             self._drain_lifecycle_events(snapshot)
             self._reconcile_substrate_cycle(snapshot)
+            # §10.7: spread close reconciler — runs every cycle so
+            # rows whose broker order became terminal while the
+            # stream was disconnected get resolved without waiting
+            # for next startup.
+            self._reconcile_substrate_spread_closes(
+                snapshot, reason="cycle",
+            )
             self._drain_option_fills()
             self._drain_spread_fills()
             self._sync_option_trailing_stops(snapshot)
@@ -7294,6 +7313,95 @@ class TradingEngine:
             broker_updated_at=updated_at,
             execution_id=None,
         )
+
+    def _reconcile_substrate_spread_closes(
+        self, snapshot: "BrokerSnapshot", *, reason: str,
+    ) -> None:
+        """§10.7: walk non-terminal spread close substrate rows and
+        resolve any whose broker order is now terminal.
+
+        Separate from `_reconcile_substrate_via_rest` because spreads
+        cannot go through `apply_order_event` (single-leg-scoped
+        trades UPSERT, position-rollup CTE doesn't apply to spread
+        sides). Uses `mark_terminal_after_dispatch` to advance per-
+        order rows individually.
+
+        ``reason`` is 'cycle' or 'startup' — flows through to logs so
+        the operator can grep advance events by source. Cycle should
+        run every cycle; startup once at boot. The query is bounded
+        by the number of open spreads × 2 close roles, so unlike
+        single-leg there's no need for a REST-call cap.
+
+        Skips rows with order_id IS NULL — the partial_close
+        residual placeholder has no broker order to query and is
+        cleared either by the next dispatch cycle (which advances
+        the same row) or by an operator action.
+        """
+        if (
+            self.lifecycle_orders_store is None
+            or self.lifecycle_store is None
+        ):
+            return
+        try:
+            rows = (
+                self.lifecycle_orders_store
+                .get_non_terminal_spread_close_rows()
+            )
+        except Exception as exc:
+            logger.critical(
+                f"spread close {reason} reconcile: query failed: "
+                f"{type(exc).__name__}: {exc}"
+            )
+            return
+        if not rows:
+            return
+        open_by_id = {
+            o.order_id: o for o in snapshot.open_orders
+            if getattr(o, "order_id", None)
+        }
+        for row in rows:
+            oid = row.order_id
+            if oid is None:
+                continue  # placeholder row; nothing to fetch
+            if oid in open_by_id:
+                continue  # still working at the broker
+            try:
+                broker_order = self.broker._with_retry(
+                    lambda oid=oid: self.broker._api.get_order_by_id(oid),
+                    op_desc=f"spread_close_reconcile_{reason}({oid})",
+                )
+            except Exception as exc:
+                logger.critical(
+                    f"spread close {reason} reconcile: get_order_by_id "
+                    f"failed for {oid}: {type(exc).__name__}: {exc}"
+                )
+                continue
+            event = self._build_substrate_event_from_broker_order(
+                broker_order, oid,
+            )
+            if event is None:
+                continue
+            try:
+                self.lifecycle_orders_store.mark_terminal_after_dispatch(
+                    client_order_id=row.client_order_id,
+                    broker_order_id=oid,
+                    status=event.status,
+                    filled_qty=event.filled_qty,
+                    avg_fill_price=event.avg_fill_price,
+                    broker_updated_at=event.broker_updated_at,
+                )
+                logger.info(
+                    f"spread close {reason} reconcile: order_id={oid} "
+                    f"role={row.role} advanced to status={event.status} "
+                    f"qty={event.filled_qty}"
+                )
+            except Exception as exc:
+                logger.critical(
+                    f"spread close {reason} reconcile: "
+                    f"mark_terminal_after_dispatch raised for "
+                    f"client_order_id={row.client_order_id}: "
+                    f"{type(exc).__name__}: {exc}"
+                )
 
     def _drain_option_fills(self) -> None:
         """
