@@ -1135,6 +1135,10 @@ This matrix is the **implementation PR's migration checklist**. Every row should
 
 ### 10.7 MLEG partial-close pending state — defer behavior, reserve substrate
 
+✅ **Shipped on `feat/mleg-partial-close-residual` (PR #72, merged 2026-06-20).** Tracker row: [`docs/order_lifecycle_foundation_tracker.md` §10 row 10.7](order_lifecycle_foundation_tracker.md#10-compensating-patch-absorption-matrix).
+
+The text below preserves the *original deferral framing* this discovery doc captured (the "what must NOT happen" guard rails). All five aspect rows are now historical; what actually shipped is summarized at the end.
+
 | Aspect | Detail |
 |---|---|
 | **Workaround today** | `_spreads_pending_close: set[str]` ([engine/trader.py:406](../engine/trader.py:406)) is in-memory only; PR #56's restart-gap risk is real but acknowledged as out-of-scope for that PR |
@@ -1143,6 +1147,8 @@ This matrix is the **implementation PR's migration checklist**. Every row should
 | **Foundation DOES solve the single-leg side (PR #59 review-7 P1 fix)** | For single-leg equity / single-leg option positions, the new `uniq_one_active_close_per_position` partial unique index in §6.2 IS the durable analog of `_has_pending_close_order()`. At most one non-terminal `role IN ('exit', 'partial_close')` row per `position_uid`. A second close attempt against the same position fails at the DB layer with a constraint violation — no in-memory cache required, restart-safe. The implementation PR's close path queries for any non-terminal close row before submitting; the unique index is belt-and-suspenders against races. The single-leg analog of `_spreads_pending_close` retires immediately on foundation merge; the spread-side cache stays until the spread lifecycle PR writes spread closes into the substrate |
 | **Preserved until spread lifecycle PR ships** | PR #56's fail-safe partial logging, residual ownership preservation, duplicate-dispatch block via `_spreads_pending_close` (in-memory cache stays), CRITICAL alert on partial close |
 | **Migration trigger** | Spread lifecycle PR writes spread entry / exit / close as `position_lifecycle_orders` rows keyed under the spread's `position_uid`. Pending-close state becomes "any non-terminal `role='exit'` order on this spread `position_uid`." `_spreads_pending_close` retires at that point |
+
+**What actually shipped (PR #72, 7 commits + whitespace fix):** spread closes write into `position_lifecycle_orders` (C1–C2); cycle + startup reconciler walks non-terminal close rows (C3); `_spreads_pending_close` fully retired (C4); docs (C5). Review-fix R1 (commit `a5f8352`) added per-submit eager attach via worker `on_submitted` callback queued through `AlpacaBroker._pending_lifecycle_close_attaches`, plus `sqlite_errorname` discriminator and cumulative-fill double-release guard. Review-fix R2 (commit `991d5dc`) added crash-durable substrate write from the worker thread via its own sqlite3 connection (the in-memory queue alone left a one-cycle-interval crash window; the durable write closes it). Worker partial-fill behavior kept as WAIT (evidence: zero historical spread partial-fill events on paper). Acceptance test `test_durable_attach_persists_order_id_before_engine_drain` opens a fresh sqlite connection (simulating restart) and confirms the substrate row has `order_id` set without any engine drain having run.
 
 ### 10.8 PR #58 disposition — rebuild, do not cherry-pick
 

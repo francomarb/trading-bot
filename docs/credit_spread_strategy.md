@@ -232,6 +232,58 @@ residual close is explicitly out of scope until an actual partial
 fires and the right cancel-vs-retry policy is informed by real
 broker behavior.
 
+**Durability of the substrate close-row attach (PR #72 R1+R2):**
+
+`SpreadExecutionWorker` writes the broker `order_id` to the
+`position_lifecycle_orders` row TWICE on every successful submit:
+once durably via its own sqlite3 connection (so a crash within
+milliseconds of submit still leaves a recoverable row on disk),
+and once via the broker's `_pending_lifecycle_close_attaches`
+queue (drained at the next cycle by
+`_drain_lifecycle_close_attaches` → `attach_or_update_order_id_for_walk_step`).
+For walk-and-market closes, every step's broker `order_id` overwrites
+the previous one — only one broker order is alive at any moment, so
+the substrate row tracks the current in-flight id. If the durable
+write fails (DB locked beyond 5s busy_timeout, etc.) the worker
+logs CRITICAL `[SpreadExecutor-...] durable substrate write FAILED`;
+that is the operator-visible signal that the queue is the only
+remaining attach path and a crash before the next cycle drain
+re-opens the restart gap.
+
+**Operator runbook — clearing a stuck `partial_close` placeholder:**
+
+Until [PLAN P2 row "PR #72 follow-up: operator command to clear
+stuck `partial_close` placeholder"](../PLAN.md) ships, the manual
+recipe is:
+
+1. Confirm the broker side: query Alpaca for any open order on the
+   spread's short OCC (e.g. via the trading dashboard or Alpaca
+   web UI) and EITHER let it fill / cancel naturally OR cancel it
+   manually.
+2. Find the placeholder substrate row:
+
+   ```sql
+   SELECT id, position_uid, client_order_id, intended_qty, created_at
+   FROM position_lifecycle_orders
+   WHERE role = 'partial_close'
+     AND status IN ('pending', 'working', 'partially_filled', 'unknown');
+   ```
+
+3. Mark it terminal:
+
+   ```sql
+   UPDATE position_lifecycle_orders
+   SET status = 'canceled',
+       terminal_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now'),
+       last_observed_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now')
+   WHERE client_order_id = ?
+     AND role = 'partial_close'
+     AND status NOT IN ('filled', 'canceled', 'rejected');
+   ```
+
+The next cycle's `_spread_has_pending_close` will then return False
+and the exit logic resumes normally.
+
 ---
 
 ## Related docs
