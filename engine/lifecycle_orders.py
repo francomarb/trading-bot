@@ -841,6 +841,89 @@ class PositionLifecycleOrdersStore:
         )
         self._conn.commit()
 
+    def mark_terminal_after_dispatch(
+        self,
+        *,
+        client_order_id: str,
+        broker_order_id: str | None,
+        status: str,
+        filled_qty: float,
+        avg_fill_price: float | None,
+        broker_updated_at: str | None = None,
+    ) -> None:
+        """Advance a per-order row from ``pending`` to a terminal status
+        in one call, attaching the broker order_id along the way.
+
+        Designed for the spread close path (§10.7): the substrate row is
+        inserted ``pending`` before ``dispatch_spread_order(closing=True)``
+        and the broker order_id is only observed via the drain. This
+        method does the attach + status update without invoking the
+        single-leg-scoped ``apply_order_event`` pipeline (no trades
+        UPSERT, no position rollup, no position-status CTE — none of
+        those apply to spreads).
+
+        ``status`` must be one of ``filled / canceled / rejected /
+        partially_filled / working / unknown``. Terminal states stamp
+        ``terminal_at``; non-terminal advances leave it NULL.
+
+        ``broker_order_id`` may be None — for spreads whose worker
+        rolled back before any broker order was assigned (e.g. dry run
+        canceled, build_mleg_request raised), we still want to mark
+        the row terminal so the position is unlocked.
+
+        Raises ``ValueError`` if the row does not exist.
+        """
+        _validate_status(status)
+        now = _utc_now_iso()
+        broker_updated_at = broker_updated_at or now
+        existing = self._conn.execute(
+            "SELECT status, order_id FROM position_lifecycle_orders "
+            "WHERE client_order_id = ?",
+            (client_order_id,),
+        ).fetchone()
+        if existing is None:
+            raise ValueError(
+                f"unknown client_order_id: {client_order_id!r}"
+            )
+        current_status, current_order_id = existing
+        # Idempotent: re-applying the same terminal status is a no-op
+        # (the row already reflects it). Refuse to walk terminal → other.
+        if current_status in TERMINAL_ORDER_STATUSES:
+            return
+        # If broker_order_id is provided and the row already has one,
+        # keep the existing (immutable). Otherwise attach.
+        order_id_to_set = current_order_id or broker_order_id
+        is_terminal = status in TERMINAL_ORDER_STATUSES
+        self._conn.execute(
+            """
+            UPDATE position_lifecycle_orders
+            SET status                          = ?,
+                filled_qty                      = ?,
+                avg_fill_price                  = ?,
+                order_id                        = ?,
+                submitted_at                    = COALESCE(submitted_at, ?),
+                last_observed_broker_updated_at = ?,
+                last_observed_at                = ?,
+                terminal_at                     = CASE
+                    WHEN ? = 1 THEN ?
+                    ELSE terminal_at
+                END
+            WHERE client_order_id = ?
+            """,
+            (
+                status,
+                float(filled_qty),
+                avg_fill_price,
+                order_id_to_set,
+                now,
+                broker_updated_at,
+                now,
+                1 if is_terminal else 0, now,
+                client_order_id,
+            ),
+        )
+        self._conn.commit()
+
     # ── Reads ─────────────────────────────────────────────────────────
 
     def get_by_id(self, row_id: int) -> PositionLifecycleOrderRow | None:
