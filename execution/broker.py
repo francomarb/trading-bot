@@ -2280,6 +2280,12 @@ class AlpacaBroker:
         # order_id=NULL until the close drains, defeating the
         # restart-gap closure on a crash between submit and drain.
         close_substrate_cloid: str | None = None,
+        # §10.7 fix-up R3 — trade DB path passed to the worker so it
+        # can synchronously persist the broker order_id to the
+        # substrate row from its own thread. Closes the durability
+        # gap the in-memory queue alone left open. None disables
+        # the durable path (legacy callers / tests).
+        close_substrate_db_path: str | None = None,
     ) -> OrderResult:
         """
         Dispatch an asynchronous MLEG combo via ``SpreadExecutionWorker``
@@ -2383,6 +2389,7 @@ class AlpacaBroker:
                 _on_submitted if close_substrate_cloid is not None else None
             ),
             substrate_cloid=close_substrate_cloid,
+            substrate_db_path=close_substrate_db_path,
         )
         worker.start()
         return OrderResult(

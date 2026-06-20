@@ -2314,6 +2314,209 @@ class TestSpreadCloseReconciler:
         )
         assert updated is False
 
+    def test_durable_attach_persists_order_id_before_engine_drain(
+        self, tmp_path,
+    ):
+        """C10 acceptance — the actual crash-durability claim.
+
+        Construct a SpreadExecutionWorker pointing at the real trade
+        DB and the engine's pre-inserted substrate cloid. Call the
+        worker's durable-attach helper directly (simulating what
+        runs synchronously from the worker thread right after a
+        successful broker submit). The substrate row must show
+        order_id NOT NULL BEFORE the engine's queue drain runs.
+
+        This is what the prior in-memory-queue-only fix could not
+        prove: a 'crash' (here: simply 'don't drain the queue') still
+        leaves a recoverable substrate row.
+        """
+        from engine.positions import (
+            make_spread, PositionLeg, spread_substrate_uid,
+        )
+        from execution.options_executor import (
+            SpreadExecutionWorker, SpreadLeg,
+        )
+        from execution.broker import Side
+        strategy = _strategy()
+        engine, _ = _engine(tmp_path, strategy)
+        # Open spread + parent lifecycle row + pre-inserted pending
+        # close substrate row (the moment between insert and submit).
+        engine._positions["p_durable"] = make_spread(
+            strategy_name="credit_spread", position_id="p_durable",
+            legs=[PositionLeg("SPY260618P00568000", -1, side="SELL"),
+                  PositionLeg("SPY260618P00558000", 1, side="BUY")],
+        )
+        engine._spread_owner_strategy["p_durable"] = strategy
+        engine._lifecycle_begin_spread(
+            position_id="p_durable", strategy_name="credit_spread",
+            symbol="SPY260618P00568000", qty=1,
+        )
+        engine._lifecycle_mark_spread_open(
+            position_id="p_durable", avg_entry_price=1.45, current_qty=1.0,
+        )
+        engine.lifecycle_orders_store.insert_pending(
+            position_uid=spread_substrate_uid("p_durable"),
+            role="exit", client_order_id="durable-cloid",
+            order_type="limit", order_class="mleg", time_in_force="day",
+            side="buy", intended_qty=1.0,
+        )
+        # Build a worker pointed at the SAME trade DB and substrate
+        # cloid. The api is stubbed because we're only exercising
+        # the durable-attach helper, not the full submit flow.
+        worker = SpreadExecutionWorker(
+            legs=[
+                SpreadLeg(occ_symbol="SPY260618P00568000",
+                          side=Side.SELL, opening=False),
+                SpreadLeg(occ_symbol="SPY260618P00558000",
+                          side=Side.BUY, opening=False),
+            ],
+            qty=1, limit_price=0.60, strategy_name="credit_spread",
+            api=MagicMock(),
+            substrate_cloid="durable-cloid",
+            substrate_db_path=engine.trade_logger.path,
+        )
+        # Simulate "broker submit returned id=broker-id-99; about to
+        # crash before any engine drain runs."
+        worker._fire_on_submitted("broker-id-99")
+        # The substrate row is durably updated. Open a FRESH store
+        # connection (mimicking a restarted process) to verify the
+        # write hit disk, not just the engine's in-memory connection
+        # cache.
+        import sqlite3 as _sqlite3
+        conn = _sqlite3.connect(engine.trade_logger.path)
+        try:
+            row = conn.execute(
+                "SELECT order_id, status FROM position_lifecycle_orders "
+                "WHERE client_order_id = ?",
+                ("durable-cloid",),
+            ).fetchone()
+        finally:
+            conn.close()
+        assert row is not None
+        assert row[0] == "broker-id-99"  # order_id durably attached
+        assert row[1] == "pending"  # status untouched
+
+    def test_durable_attach_walk_step_overwrites_previous_order_id(
+        self, tmp_path,
+    ):
+        """Walk steps overwrite the substrate's order_id (only one
+        broker order alive at a time; substrate must track the
+        current in-flight id). Confirms the UPDATE in the durable
+        path matches the in-memory queue's
+        ``attach_or_update_order_id_for_walk_step`` semantics."""
+        from engine.positions import (
+            make_spread, PositionLeg, spread_substrate_uid,
+        )
+        from execution.options_executor import (
+            SpreadExecutionWorker, SpreadLeg,
+        )
+        from execution.broker import Side
+        strategy = _strategy()
+        engine, _ = _engine(tmp_path, strategy)
+        engine._positions["p_walk"] = make_spread(
+            strategy_name="credit_spread", position_id="p_walk",
+            legs=[PositionLeg("SPY260618P00568000", -1, side="SELL"),
+                  PositionLeg("SPY260618P00558000", 1, side="BUY")],
+        )
+        engine._spread_owner_strategy["p_walk"] = strategy
+        engine._lifecycle_begin_spread(
+            position_id="p_walk", strategy_name="credit_spread",
+            symbol="SPY260618P00568000", qty=1,
+        )
+        engine._lifecycle_mark_spread_open(
+            position_id="p_walk", avg_entry_price=1.45, current_qty=1.0,
+        )
+        engine.lifecycle_orders_store.insert_pending(
+            position_uid=spread_substrate_uid("p_walk"),
+            role="exit", client_order_id="walk-cloid",
+            order_type="limit", order_class="mleg", time_in_force="day",
+            side="buy", intended_qty=1.0,
+        )
+        worker = SpreadExecutionWorker(
+            legs=[
+                SpreadLeg(occ_symbol="SPY260618P00568000",
+                          side=Side.SELL, opening=False),
+                SpreadLeg(occ_symbol="SPY260618P00558000",
+                          side=Side.BUY, opening=False),
+            ],
+            qty=1, limit_price=0.60, strategy_name="credit_spread",
+            api=MagicMock(),
+            substrate_cloid="walk-cloid",
+            substrate_db_path=engine.trade_logger.path,
+        )
+        # Two consecutive walk steps.
+        worker._fire_on_submitted("broker-step-1")
+        worker._fire_on_submitted("broker-step-2")
+        import sqlite3 as _sqlite3
+        conn = _sqlite3.connect(engine.trade_logger.path)
+        try:
+            row = conn.execute(
+                "SELECT order_id FROM position_lifecycle_orders "
+                "WHERE client_order_id = ?",
+                ("walk-cloid",),
+            ).fetchone()
+        finally:
+            conn.close()
+        assert row[0] == "broker-step-2"  # overwrote
+
+    def test_durable_attach_no_op_on_terminal_row(self, tmp_path):
+        """If the close already terminated, a late durable attach
+        from a stale worker callback must not revive the row."""
+        from engine.positions import (
+            make_spread, PositionLeg, spread_substrate_uid,
+        )
+        from execution.options_executor import (
+            SpreadExecutionWorker, SpreadLeg,
+        )
+        from execution.broker import Side
+        strategy = _strategy()
+        engine, _ = _engine(tmp_path, strategy)
+        engine._positions["p_term"] = make_spread(
+            strategy_name="credit_spread", position_id="p_term",
+            legs=[PositionLeg("SPY260618P00568000", -1, side="SELL"),
+                  PositionLeg("SPY260618P00558000", 1, side="BUY")],
+        )
+        engine._lifecycle_begin_spread(
+            position_id="p_term", strategy_name="credit_spread",
+            symbol="SPY260618P00568000", qty=1,
+        )
+        engine.lifecycle_orders_store.insert_pending(
+            position_uid=spread_substrate_uid("p_term"),
+            role="exit", client_order_id="term-cloid",
+            order_type="limit", order_class="mleg", time_in_force="day",
+            side="buy", intended_qty=1.0,
+        )
+        engine.lifecycle_orders_store.mark_terminal_after_dispatch(
+            client_order_id="term-cloid", broker_order_id="b-1",
+            status="filled", filled_qty=1.0, avg_fill_price=0.60,
+        )
+        worker = SpreadExecutionWorker(
+            legs=[
+                SpreadLeg(occ_symbol="SPY260618P00568000",
+                          side=Side.SELL, opening=False),
+                SpreadLeg(occ_symbol="SPY260618P00558000",
+                          side=Side.BUY, opening=False),
+            ],
+            qty=1, limit_price=0.60, strategy_name="credit_spread",
+            api=MagicMock(),
+            substrate_cloid="term-cloid",
+            substrate_db_path=engine.trade_logger.path,
+        )
+        worker._fire_on_submitted("b-late-99")
+        # Row unchanged (filled, order_id=b-1).
+        import sqlite3 as _sqlite3
+        conn = _sqlite3.connect(engine.trade_logger.path)
+        try:
+            row = conn.execute(
+                "SELECT order_id, status FROM position_lifecycle_orders "
+                "WHERE client_order_id = ?",
+                ("term-cloid",),
+            ).fetchone()
+        finally:
+            conn.close()
+        assert row[0] == "b-1"
+        assert row[1] == "filled"
+
     def test_restart_gap_closure_partial_then_crash_then_restart(
         self, tmp_path,
     ):

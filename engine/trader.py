@@ -9209,6 +9209,15 @@ class TradingEngine:
                     # drain, defeating restart-gap closure on a crash
                     # between worker submit and engine drain.
                     close_substrate_cloid=close_cloid,
+                    # §10.7 fix-up R3 — trade DB path for the worker's
+                    # synchronous, crash-durable substrate write. The
+                    # in-memory queue alone left a narrow but real
+                    # window (submit → next cycle drain) where a
+                    # crash could leave the substrate at order_id=NULL.
+                    close_substrate_db_path=(
+                        self.trade_logger.path
+                        if self.trade_logger is not None else None
+                    ),
                 )
             except Exception as e:
                 logger.error(
