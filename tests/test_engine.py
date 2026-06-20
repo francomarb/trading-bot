@@ -5174,6 +5174,205 @@ class TestGenericSingleLegOptionTrailingStops:
         assert engine.option_trailing_store.get_by_occ("SPY260618C00746000") is not None
 
 
+# ── Option trailing FK propagation end-to-end (PR #59 §10.4) ──────────────
+
+
+class TestOptionTrailingLifecycleOrderIdFK:
+    """End-to-end: real broker substrate writes populate trailing FK.
+
+    The existing TestGenericSingleLegOptionTrailingStops suite uses a
+    fully-mocked broker that does not call the substrate helpers, so
+    the trailing FK in those tests ends up None (which is correct
+    behavior for the mocked path). This suite wraps the broker mock so
+    submit_option_gtc_stop / replace_option_stop write substrate rows
+    the way the production AlpacaBroker now does, then asserts that
+    the engine populates trailing.lifecycle_order_id from the
+    substrate row's id.
+    """
+
+    GenericOptionStrategy = (
+        TestGenericSingleLegOptionTrailingStops.GenericOptionStrategy
+    )
+
+    def _engine_with_substrate_broker(self, tmp_path):
+        engine, broker = TestGenericSingleLegOptionTrailingStops()._engine(
+            tmp_path,
+        )
+        # The mocked broker doesn't share execution/broker.py's
+        # _lifecycle_orders_record_* helpers. Wire its submit/replace
+        # side_effects to write the same substrate rows.
+        orders_store = engine.lifecycle_orders_store
+        assert orders_store is not None
+
+        submit_return = broker.submit_option_gtc_stop.return_value
+
+        def _submit_side_effect(*, symbol, qty, stop_price, position_uid=None,
+                                client_order_id_prefix="opt-trail-stop"):
+            client_order_id = f"{client_order_id_prefix}-{position_uid or 'na'}"
+            orders_store.insert_pending(
+                position_uid=position_uid,
+                role="protective_stop",
+                client_order_id=client_order_id,
+                order_type="stop",
+                order_class="simple",
+                time_in_force="gtc",
+                side="sell",
+                intended_qty=float(qty),
+                intended_stop_price=float(stop_price),
+            )
+            orders_store.attach_broker_order_id(
+                client_order_id=client_order_id,
+                order_id=submit_return.order_id,
+            )
+            return submit_return
+
+        broker.submit_option_gtc_stop.side_effect = _submit_side_effect
+
+        replace_return = broker.replace_option_stop.return_value
+
+        def _replace_side_effect(*, order_id, qty, stop_price,
+                                 client_order_id_prefix="opt-trail-stop",
+                                 client_order_id=None,
+                                 position_uid=None):
+            cid = client_order_id or (
+                f"{client_order_id_prefix}-replace-{position_uid or 'na'}"
+            )
+            orders_store.insert_pending(
+                position_uid=position_uid,
+                role="replacement_stop",
+                client_order_id=cid,
+                order_type="stop",
+                order_class="simple",
+                time_in_force="gtc",
+                side="sell",
+                intended_qty=float(qty),
+                intended_stop_price=float(stop_price),
+                replaces_order_id=order_id,
+            )
+            orders_store.attach_broker_order_id(
+                client_order_id=cid,
+                order_id=replace_return.order_id,
+            )
+            return replace_return
+
+        broker.replace_option_stop.side_effect = _replace_side_effect
+
+        return engine, broker, orders_store
+
+    def test_fresh_submit_populates_trailing_fk(self, tmp_path):
+        engine, broker, orders_store = self._engine_with_substrate_broker(
+            tmp_path
+        )
+        # Pre-seed trailing state so _sync chooses the submit branch.
+        engine.option_trailing_store.upsert(
+            position_uid="pos_abc123",
+            occ_symbol="SPY260618C00746000",
+            strategy="generic_single_leg_options",
+            owner_key="SPY",
+            qty=3,
+            entry_premium=12.77,
+            hwm_premium=20.16,
+            trail_activation_pct=0.10,
+            trail_pct=0.15,
+            current_stop_price=17.14,
+            stop_order_status="expired",
+            last_observed_premium=15.50,
+        )
+        snapshot = _snapshot(
+            positions={
+                "SPY260618C00746000": Position(
+                    symbol="SPY260618C00746000",
+                    qty=3,
+                    avg_entry_price=12.77,
+                    market_value=4_650.0,
+                    current_price=15.50,
+                )
+            },
+            open_orders=[],
+        )
+
+        engine._sync_option_trailing_stops(snapshot)
+
+        broker.submit_option_gtc_stop.assert_called_once()
+        substrate = orders_store.get_by_order_id("new-stop")
+        assert substrate is not None
+        assert substrate.role == "protective_stop"
+        row = engine.option_trailing_store.get_by_occ("SPY260618C00746000")
+        assert row.lifecycle_order_id == substrate.id
+        assert row.alpaca_stop_order_id == "new-stop"
+
+    def test_replacement_advances_trailing_fk_to_new_substrate_row(
+        self, tmp_path
+    ):
+        engine, broker, orders_store = self._engine_with_substrate_broker(
+            tmp_path
+        )
+        # Seed: the existing protective_stop row + matching trailing row
+        # with FK pointing at it.
+        old_substrate_id = orders_store.insert_pending(
+            position_uid="pos_abc123",
+            role="protective_stop",
+            client_order_id="opt-trail-stop-seed",
+            order_type="stop",
+            order_class="simple",
+            time_in_force="gtc",
+            side="sell",
+            intended_qty=3.0,
+            intended_stop_price=17.14,
+        )
+        orders_store.attach_broker_order_id(
+            client_order_id="opt-trail-stop-seed",
+            order_id="old-stop",
+        )
+        engine.option_trailing_store.upsert(
+            position_uid="pos_abc123",
+            occ_symbol="SPY260618C00746000",
+            strategy="generic_single_leg_options",
+            owner_key="SPY",
+            qty=3,
+            entry_premium=12.77,
+            hwm_premium=20.16,
+            trail_activation_pct=0.10,
+            trail_pct=0.15,
+            current_stop_price=17.14,
+            alpaca_stop_order_id="old-stop",
+            stop_order_status="accepted",
+            last_observed_premium=15.50,
+            lifecycle_order_id=old_substrate_id,
+        )
+        stale = replace(
+            _open_stop_order("SPY260618C00746000", stop_price=17.14),
+            order_id="old-stop",
+            qty=3,
+            time_in_force="gtc",
+        )
+        snapshot = _snapshot(
+            positions={
+                "SPY260618C00746000": Position(
+                    symbol="SPY260618C00746000",
+                    qty=3,
+                    avg_entry_price=12.77,
+                    market_value=6_600.0,
+                    current_price=22.00,
+                )
+            },
+            open_orders=[stale],
+        )
+
+        engine._sync_option_trailing_stops(snapshot)
+
+        broker.replace_option_stop.assert_called_once()
+        new_substrate = orders_store.get_by_order_id("replacement-stop")
+        assert new_substrate is not None
+        assert new_substrate.role == "replacement_stop"
+        assert new_substrate.replaces_order_id == "old-stop"
+        row = engine.option_trailing_store.get_by_occ("SPY260618C00746000")
+        # FK advanced to the new substrate row, not the old one.
+        assert row.lifecycle_order_id == new_substrate.id
+        assert row.lifecycle_order_id != old_substrate_id
+        assert row.alpaca_stop_order_id == "replacement-stop"
+
+
 # ── Shared-symbol conflict rejection (11.7 Part A) ─────────────────────────
 
 
