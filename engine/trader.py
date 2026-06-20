@@ -5010,6 +5010,29 @@ class TradingEngine:
             hard_floor = max(hard_floor, hwm_premium * (1.0 - trail_pct))
         return round(max(hard_floor, 0.01), 2)
 
+    def _lifecycle_order_id_for(self, order_id: str | None) -> int | None:
+        """Resolve a broker order_id to its position_lifecycle_orders.id.
+
+        Used to populate option_trailing_stops.lifecycle_order_id at
+        every trailing-row upsert (PR #59 §10.4). Returns None when
+        the substrate store is unavailable, the order_id is None /
+        empty, or the substrate row hasn't been written yet — the
+        trailing row is still safe to upsert; cycle reconciliation
+        will populate the FK on the next pass once the substrate row
+        exists.
+        """
+        if self.lifecycle_orders_store is None or not order_id:
+            return None
+        try:
+            row = self.lifecycle_orders_store.get_by_order_id(order_id)
+        except Exception as exc:
+            logger.debug(
+                f"lifecycle_order_id lookup raised "
+                f"{type(exc).__name__}: {exc} for order_id={order_id}"
+            )
+            return None
+        return None if row is None else row.id
+
     def _recent_option_stop_submit_pending(self, row) -> bool:
         """True when a just-submitted option stop may not show in snapshots yet."""
         if row is None or not row.alpaca_stop_order_id:
@@ -5288,6 +5311,8 @@ class TradingEngine:
             qty = abs(float(getattr(position, "qty", 0.0) or 0.0))
             existing = open_stop_by_occ.get(occ)
             if existing is None and self._recent_option_stop_submit_pending(row):
+                # Submit-pending retry: preserve the substrate FK already
+                # written by the prior cycle's submit_option_gtc_stop.
                 self.option_trailing_store.upsert(
                     position_uid=lifecycle_row.position_uid,
                     occ_symbol=occ,
@@ -5302,6 +5327,7 @@ class TradingEngine:
                     alpaca_stop_order_id=row.alpaca_stop_order_id,
                     stop_order_status=row.stop_order_status,
                     last_observed_premium=current_premium,
+                    lifecycle_order_id=row.lifecycle_order_id,
                 )
                 logger.debug(
                     f"[{owner}] {occ}: recently submitted option stop "
@@ -5333,6 +5359,12 @@ class TradingEngine:
                 and existing_is_known_gtc
                 and existing_qty_matches
             ):
+                # Adequate-stop preserve: resolve the substrate row for
+                # the still-live broker stop so the trailing FK reflects
+                # whichever substrate row currently owns identity. None
+                # is acceptable — the substrate row may not exist for
+                # this stop yet (e.g. broker-side stop pre-dating the
+                # split; cycle reconciliation will fill it later).
                 self.option_trailing_store.upsert(
                     position_uid=lifecycle_row.position_uid,
                     occ_symbol=occ,
@@ -5347,6 +5379,9 @@ class TradingEngine:
                     alpaca_stop_order_id=existing.order_id,
                     stop_order_status=existing.status,
                     last_observed_premium=current_premium,
+                    lifecycle_order_id=self._lifecycle_order_id_for(
+                        existing.order_id
+                    ),
                 )
                 continue
 
@@ -5380,6 +5415,9 @@ class TradingEngine:
                                 f"TIF/qty maintenance at existing ${existing_stop:.2f}"
                             )
                         else:
+                            # Deferred-ratchet preserve: existing stop
+                            # stays live unchanged; FK points at its
+                            # substrate row if one exists.
                             self.option_trailing_store.upsert(
                                 position_uid=lifecycle_row.position_uid,
                                 occ_symbol=occ,
@@ -5394,6 +5432,11 @@ class TradingEngine:
                                 alpaca_stop_order_id=existing.order_id,
                                 stop_order_status=existing.status,
                                 last_observed_premium=current_premium,
+                                lifecycle_order_id=(
+                                    self._lifecycle_order_id_for(
+                                        existing.order_id
+                                    )
+                                ),
                             )
                             logger.info(
                                 f"[{owner}] {occ}: option stop ratchet "
@@ -5518,6 +5561,10 @@ class TradingEngine:
                     self.alerts.broker_error(
                         f"{occ} option trailing stop replacement: {exc}"
                     )
+                    # Replacement failed at the broker — the old stop
+                    # is still live, so the FK still points at the
+                    # original substrate row (no new replacement_stop
+                    # row was written because the broker call raised).
                     self.option_trailing_store.upsert(
                         position_uid=lifecycle_row.position_uid,
                         occ_symbol=occ,
@@ -5532,6 +5579,9 @@ class TradingEngine:
                         alpaca_stop_order_id=existing.order_id,
                         stop_order_status="replace_failed",
                         last_observed_premium=current_premium,
+                        lifecycle_order_id=self._lifecycle_order_id_for(
+                            existing.order_id
+                        ),
                     )
                     continue
                 replace_call_end = (
@@ -5575,6 +5625,11 @@ class TradingEngine:
                             ),
                         },
                     )
+                # Replacement succeeded: FK updates to the brand-new
+                # replacement_stop substrate row just written by
+                # broker.replace_option_stop. The old protective_stop
+                # row terminates asynchronously when apply_order_event
+                # observes the canceled event for the superseded order.
                 self.option_trailing_store.upsert(
                     position_uid=lifecycle_row.position_uid,
                     occ_symbol=occ,
@@ -5589,6 +5644,9 @@ class TradingEngine:
                     alpaca_stop_order_id=new_order.order_id,
                     stop_order_status=new_order.status,
                     last_observed_premium=current_premium,
+                    lifecycle_order_id=self._lifecycle_order_id_for(
+                        new_order.order_id
+                    ),
                 )
                 logger.info(
                     f"[{owner}] {occ}: option GTC trailing stop replaced — "
@@ -5610,6 +5668,8 @@ class TradingEngine:
                 )
                 self.risk.record_broker_error()
                 self.alerts.broker_error(f"{occ} option trailing stop: {exc}")
+                # Fresh submit failed at the broker — no substrate row
+                # was written. FK is None until the next cycle re-attempts.
                 self.option_trailing_store.upsert(
                     position_uid=lifecycle_row.position_uid,
                     occ_symbol=occ,
@@ -5624,8 +5684,12 @@ class TradingEngine:
                     alpaca_stop_order_id=None,
                     stop_order_status="submit_failed",
                     last_observed_premium=current_premium,
+                    lifecycle_order_id=None,
                 )
                 continue
+            # Fresh submit succeeded: FK points at the brand-new
+            # protective_stop substrate row just written by
+            # broker.submit_option_gtc_stop.
             self.option_trailing_store.upsert(
                 position_uid=lifecycle_row.position_uid,
                 occ_symbol=occ,
@@ -5640,6 +5704,9 @@ class TradingEngine:
                 alpaca_stop_order_id=new_order.order_id,
                 stop_order_status=new_order.status,
                 last_observed_premium=current_premium,
+                lifecycle_order_id=self._lifecycle_order_id_for(
+                    new_order.order_id
+                ),
             )
             logger.info(
                 f"[{owner}] {occ}: option GTC trailing stop synced — "
