@@ -116,6 +116,75 @@ _SIGNAL_KEY = ("credit_spread", "SPY", "1Day")
 _SIGNAL_BAR = "2026-05-14"
 
 
+# ── §10.7 C4 test helpers: substrate-backed pending close manipulation ──
+
+
+def _mark_close_pending_in_substrate(engine, position_id: str, qty: float = 1) -> None:
+    """Insert a non-terminal exit row for the spread in the substrate.
+
+    Migration shim for the test fixtures previously poking at
+    ``engine._spreads_pending_close`` directly — that set is retired
+    in C4 and the substrate is now the source of truth.
+
+    Idempotent (safe to call when the row already exists)."""
+    from engine.positions import spread_substrate_uid
+    # Ensure parent position_lifecycle row exists (FK target).
+    if engine.lifecycle_store is not None:
+        uid = spread_substrate_uid(position_id)
+        if engine.lifecycle_store.get_by_position_uid(uid) is None:
+            engine._lifecycle_begin_spread(
+                position_id=position_id,
+                strategy_name="credit_spread",
+                symbol="SPY260618P00568000",
+                qty=qty,
+            )
+            engine._lifecycle_mark_spread_open(
+                position_id=position_id,
+                avg_entry_price=1.45, current_qty=float(qty),
+            )
+    if engine.lifecycle_orders_store is None:
+        return
+    try:
+        engine.lifecycle_orders_store.insert_pending(
+            position_uid=spread_substrate_uid(position_id),
+            role="exit",
+            client_order_id=f"test-pending-close-{position_id}",
+            order_type="limit", order_class="mleg", time_in_force="day",
+            side="buy", intended_qty=float(qty),
+        )
+    except Exception:
+        pass  # already present or substrate misconfigured
+
+
+def _clear_close_pending_in_substrate(engine, position_id: str) -> None:
+    """Finalize any non-terminal close rows for the position so the
+    substrate-backed pending-close check returns False. Migration
+    shim replacing the legacy ``set.discard`` / ``set.clear``."""
+    from engine.positions import spread_substrate_uid
+    if engine.lifecycle_orders_store is None:
+        return
+    rows = engine.lifecycle_orders_store.get_non_terminal_by_role(
+        spread_substrate_uid(position_id), ("exit", "partial_close"),
+    )
+    for row in rows:
+        try:
+            engine.lifecycle_orders_store.mark_terminal_after_dispatch(
+                client_order_id=row.client_order_id,
+                broker_order_id=row.order_id,
+                status="canceled",
+                filled_qty=row.filled_qty,
+                avg_fill_price=row.avg_fill_price,
+            )
+        except Exception:
+            pass
+
+
+def _has_pending_close_substrate(engine, position_id: str) -> bool:
+    """Substrate-backed equivalent of ``position_id in
+    engine._spreads_pending_close``."""
+    return engine._spread_has_pending_close(position_id)
+
+
 # ── Entry path ──────────────────────────────────────────────────────────────
 
 
@@ -337,14 +406,14 @@ class TestDrainSpreadFills:
         strategy = _strategy()
         engine, broker = _engine(tmp_path, strategy)
         self._pre_register(engine, strategy, "p1")
-        engine._spreads_pending_close.add("p1")
+        _mark_close_pending_in_substrate(engine, "p1")
         broker.drain_spread_fills.return_value = [
             ("p1", "credit_spread", True, "filled", 1.0, 0.60, "combo-close-1", 0.60),
         ]
         engine._drain_spread_fills()
         assert "p1" not in engine._positions
         assert "p1" not in engine._spread_owner_strategy
-        assert "p1" not in engine._spreads_pending_close
+        assert not _has_pending_close_substrate(engine, "p1")
         assert strategy.open_spreads == []
         # The close writes one row per leg, both position_type='spread'.
         rows = engine.trade_logger.read_all()
@@ -360,7 +429,7 @@ class TestDrainSpreadFills:
         # _open_spread default net_credit = 1.45.
         self._pre_register(engine, strategy, "p1")
         engine._allocator = MagicMock()
-        engine._spreads_pending_close.add("p1")
+        _mark_close_pending_in_substrate(engine, "p1")
         # Closed at a $0.60 debit → realized = (1.45 − 0.60) × 1 × 100 = 85.0.
         broker.drain_spread_fills.return_value = [
             ("p1", "credit_spread", True, "filled", 1.0, 0.60, "combo-close-1", 0.60),
@@ -383,7 +452,7 @@ class TestDrainSpreadFills:
         strategy = _strategy()
         engine, broker = _engine(tmp_path, strategy)
         self._pre_register(engine, strategy, "p1")
-        engine._spreads_pending_close.add("p1")
+        _mark_close_pending_in_substrate(engine, "p1")
         broker.drain_spread_fills.return_value = [
             ("p1", "credit_spread", True, "filled", 1.0, 0.63, "combo-close-1", 0.60),
         ]
@@ -406,7 +475,7 @@ class TestDrainSpreadFills:
         engine, broker = _engine(tmp_path, strategy)
         self._pre_register(engine, strategy, "p1")
         engine._allocator = None  # no allocator wired
-        engine._spreads_pending_close.add("p1")
+        _mark_close_pending_in_substrate(engine, "p1")
         broker.drain_spread_fills.return_value = [
             ("p1", "credit_spread", True, "filled", 1.0, 0.60, "combo-close-1", 0.60),
         ]
@@ -426,7 +495,7 @@ class TestDrainSpreadFills:
         engine, broker = _engine(tmp_path, strategy)
         self._pre_register(engine, strategy, "p1")
         engine._allocator = MagicMock()
-        engine._spreads_pending_close.add("p1")
+        _mark_close_pending_in_substrate(engine, "p1")
         broker.drain_spread_fills.return_value = [
             ("p1", "credit_spread", True, "filled", 1.0, None, "combo-close-1", 0.60),
         ]
@@ -435,7 +504,7 @@ class TestDrainSpreadFills:
         # Position released — the spread genuinely closed.
         assert "p1" not in engine._positions
         assert strategy.open_spreads == []
-        assert "p1" not in engine._spreads_pending_close
+        assert not _has_pending_close_substrate(engine, "p1")
         # But NO bogus P&L recorded.
         engine._allocator.record_realized_pnl.assert_not_called()
         close_rows = [
@@ -469,7 +538,7 @@ class TestDrainSpreadFills:
             long_strike=558.0, expiration_date=_EXP,
             net_credit=1.45, width=10.0, qty=2,
         ))
-        engine._spreads_pending_close.add("p1")
+        _mark_close_pending_in_substrate(engine, "p1")
         engine.alerts = MagicMock()
         engine._allocator = MagicMock()
         # Drain a CLOSE event reporting only 1 of 2 contracts filled.
@@ -491,7 +560,7 @@ class TestDrainSpreadFills:
         # partial-fill order may still be working at the broker (the worker
         # exits on partially_filled per options_executor.py:275); a fresh
         # close dispatch would risk over-closing.
-        assert "p1" in engine._spreads_pending_close, (
+        assert _has_pending_close_substrate(engine, "p1"), (
             "partial close must keep the position pending to prevent a "
             "duplicate close dispatch on the next cycle"
         )
@@ -542,7 +611,7 @@ class TestDrainSpreadFills:
             net_credit=1.45, width=10.0, qty=2,
         ))
         # Critical: pending-close re-armed by R6.
-        engine._spreads_pending_close.add("p1")
+        _mark_close_pending_in_substrate(engine, "p1")
         # The broker dispatch must NOT be called this cycle.
         broker.dispatch_spread_order.reset_mock()
 
@@ -559,20 +628,20 @@ class TestDrainSpreadFills:
         # No new dispatch — the position is still pending the residual.
         broker.dispatch_spread_order.assert_not_called()
         # And it's still pending.
-        assert "p1" in engine._spreads_pending_close
+        assert _has_pending_close_substrate(engine, "p1")
 
     def test_close_canceled_keeps_position_for_retry(self, tmp_path):
         strategy = _strategy()
         engine, broker = _engine(tmp_path, strategy)
         self._pre_register(engine, strategy, "p1")
-        engine._spreads_pending_close.add("p1")
+        _mark_close_pending_in_substrate(engine, "p1")
         broker.drain_spread_fills.return_value = [
             ("p1", "credit_spread", True, "canceled", 0.0, None, "combo-close-1", 0.60),
         ]
         engine._drain_spread_fills()
         # Position stays open; pending-close flag cleared so the exit path retries.
         assert "p1" in engine._positions
-        assert "p1" not in engine._spreads_pending_close
+        assert not _has_pending_close_substrate(engine, "p1")
         assert len(strategy.open_spreads) == 1
 
 
@@ -589,6 +658,17 @@ class TestProcessCreditSpreadExits:
         )
         engine._spread_owner_strategy[position_id] = strategy
         strategy.register_spread(_open_spread(position_id, net_credit=2.00))
+        # §10.7 C4: register the substrate parent row so the close-
+        # path FK resolves and the substrate-backed pending-close
+        # check works against real rows (previously the in-memory
+        # `_spreads_pending_close` worked without a parent row).
+        engine._lifecycle_begin_spread(
+            position_id=position_id, strategy_name="credit_spread",
+            symbol="SPY260618P00568000", qty=1,
+        )
+        engine._lifecycle_mark_spread_open(
+            position_id=position_id, avg_entry_price=2.00, current_qty=1.0,
+        )
 
     def test_exit_trigger_dispatches_closing_combo(self, tmp_path):
         # spread mid 1.00 = 50% of the 2.00 credit → profit target.
@@ -612,7 +692,7 @@ class TestProcessCreditSpreadExits:
         assert kw["closing"] is True
         assert kw["position_id"] == "p1"
         assert kw["limit_price"] > 0  # positive net debit to close
-        assert "p1" in engine._spreads_pending_close
+        assert _has_pending_close_substrate(engine, "p1")
 
     def test_no_trigger_does_not_dispatch(self, tmp_path):
         # spread mid 1.80 — no exit trigger fires.
@@ -627,7 +707,7 @@ class TestProcessCreditSpreadExits:
             strategy=strategy, underlying="SPY", underlying_close=745.0,
         )
         broker.dispatch_spread_order.assert_not_called()
-        assert engine._spreads_pending_close == set()
+        assert not _has_pending_close_substrate(engine, "p1")
 
     def test_pending_close_position_is_skipped(self, tmp_path):
         quote_lookup = lambda occs: {
@@ -637,7 +717,7 @@ class TestProcessCreditSpreadExits:
         strategy = _strategy(_config(profit_target_pct=0.50), quote_lookup=quote_lookup)
         engine, broker = _engine(tmp_path, strategy)
         self._wire_open_spread(engine, strategy, "p1")
-        engine._spreads_pending_close.add("p1")  # close already in flight
+        _mark_close_pending_in_substrate(engine, "p1")  # close already in flight
         engine._process_credit_spread_exits(
             strategy=strategy, underlying="SPY", underlying_close=745.0,
         )
@@ -668,7 +748,7 @@ class TestProcessCreditSpreadExits:
         assert kw["position_id"] == "p1"
         # No quote → falls back to spread width as a marketable debit.
         assert kw["limit_price"] == 10.0
-        assert "p1" in engine._spreads_pending_close
+        assert _has_pending_close_substrate(engine, "p1")
 
     def test_bear_regime_skips_already_pending_close(self, tmp_path):
         # BEAR override must still respect _spreads_pending_close so the
@@ -676,7 +756,7 @@ class TestProcessCreditSpreadExits:
         strategy = _strategy(quote_lookup=lambda occs: {o: None for o in occs})
         engine, broker = _engine(tmp_path, strategy)
         self._wire_open_spread(engine, strategy, "p1")
-        engine._spreads_pending_close.add("p1")
+        _mark_close_pending_in_substrate(engine, "p1")
         engine._process_credit_spread_exits(
             strategy=strategy, underlying="SPY", underlying_close=745.0,
             current_regime=MarketRegime.BEAR,
@@ -701,7 +781,7 @@ class TestProcessCreditSpreadExits:
             current_regime=MarketRegime.BEAR,
         )
         broker.dispatch_spread_order.assert_called_once()
-        assert "p1" in engine._spreads_pending_close
+        assert _has_pending_close_substrate(engine, "p1")
 
     def test_non_bear_regime_falls_through_to_normal_exit_logic(self, tmp_path):
         # Spread mid 1.80 — no normal trigger fires. Confirms the regime
@@ -716,7 +796,7 @@ class TestProcessCreditSpreadExits:
         for regime in (MarketRegime.TRENDING, MarketRegime.RANGING,
                        MarketRegime.VOLATILE, None):
             broker.dispatch_spread_order.reset_mock()
-            engine._spreads_pending_close.clear()
+            
             engine._process_credit_spread_exits(
                 strategy=strategy, underlying="SPY", underlying_close=745.0,
                 current_regime=regime,
@@ -788,7 +868,7 @@ class TestProcessCreditSpreadExits:
         broker.dispatch_spread_order.assert_called_once()
         assert broker.dispatch_spread_order.call_args.kwargs["closing"] is True
         assert broker.dispatch_spread_order.call_args.kwargs["position_id"] == "p1"
-        assert "p1" in engine._spreads_pending_close
+        assert _has_pending_close_substrate(engine, "p1")
 
 
 # ── BEAR cycle-level sweep ──────────────────────────────────────────────────
@@ -808,6 +888,14 @@ class TestSweepBearSpreadExits:
         )
         engine._spread_owner_strategy[position_id] = strategy
         strategy.register_spread(_open_spread(position_id, net_credit=2.00))
+        # §10.7 C4: substrate parent row for the close-row FK.
+        engine._lifecycle_begin_spread(
+            position_id=position_id, strategy_name="credit_spread",
+            symbol="SPY260618P00568000", qty=1,
+        )
+        engine._lifecycle_mark_spread_open(
+            position_id=position_id, avg_entry_price=2.00, current_qty=1.0,
+        )
 
     def test_sweep_dispatches_close_for_open_spread(self, tmp_path):
         # Quote lookup raises — the sweep must still close because BEAR
@@ -831,7 +919,7 @@ class TestSweepBearSpreadExits:
         assert kw["position_id"] == "p1"
         # Width fallback — quote outage cannot suppress the defensive close.
         assert kw["limit_price"] == 10.0
-        assert "p1" in engine._spreads_pending_close
+        assert _has_pending_close_substrate(engine, "p1")
 
     def test_sweep_skips_strategies_without_open_spreads(self, tmp_path):
         strategy = _strategy()  # no open spreads registered
@@ -860,7 +948,7 @@ class TestSweepBearSpreadExits:
         strategy = _strategy()
         engine, broker = _engine(tmp_path, strategy)
         self._wire_open_spread(engine, strategy, "p1")
-        engine._spreads_pending_close.add("p1")
+        _mark_close_pending_in_substrate(engine, "p1")
         engine._sweep_bear_spread_exits()
         broker.dispatch_spread_order.assert_not_called()
 
@@ -1043,7 +1131,7 @@ class TestCreditSpreadsSnapshot:
         engine, _ = _engine(tmp_path, strategy)
         engine._spread_owner_strategy["p1"] = strategy
         strategy.register_spread(_open_spread("p1"))
-        engine._spreads_pending_close.add("p1")
+        _mark_close_pending_in_substrate(engine, "p1")
         assert engine._credit_spreads_snapshot()[0]["pending_close"] is True
 
     def test_empty_when_no_spreads(self, tmp_path):

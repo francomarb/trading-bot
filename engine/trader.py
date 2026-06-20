@@ -548,9 +548,10 @@ class TradingEngine:
         # position_id → SpreadExecutionPlan for spreads pending their async
         # combo fill — lets _drain_spread_fills finalize or roll back.
         self._pending_spread_plans: dict[str, object] = {}
-        # position_ids with a closing combo in flight — skipped by the exit
-        # path so a stale "should exit" signal cannot double-submit a close.
-        self._spreads_pending_close: set[str] = set()
+        # (§10.7 C4) `_spreads_pending_close` retired — the substrate's
+        # uniq_one_active_close_per_position partial unique index on
+        # `position_lifecycle_orders` is the durable, restart-safe
+        # analog. Read via `_spread_has_pending_close(position_id)`.
 
         # Entry fill prices: symbol → avg fill price at entry ($/share).
         # Used to compute realized P&L when a position closes, which is fed
@@ -1146,7 +1147,7 @@ class TradingEngine:
             # never gated by per-symbol bar fetch failures, stale-data
             # rejections, or empty decision frames. The slot loop below
             # may still try the BEAR override per-symbol, but those calls
-            # become no-ops via _spreads_pending_close after the sweep
+            # become no-ops via the substrate pending-close check after
             # already dispatched the close.
             if current_regime is MarketRegime.BEAR:
                 self._sweep_bear_spread_exits()
@@ -7828,7 +7829,7 @@ class TradingEngine:
                 "expiration": str(spread.expiration_date),
                 "net_credit": spread.net_credit,
                 "qty": spread.qty,
-                "pending_close": position_id in self._spreads_pending_close,
+                "pending_close": self._spread_has_pending_close(position_id),
             })
         return out
 
@@ -7866,7 +7867,7 @@ class TradingEngine:
                 qty=spread.qty,
                 broker_positions=broker_positions,
                 underlying_price=self._last_underlying_prices.get(underlying),
-                pending_close=position_id in self._spreads_pending_close,
+                pending_close=self._spread_has_pending_close(position_id),
                 today=today,
                 stop_loss_multiple=float(
                     getattr(config, "stop_loss_multiple", 2.0)
@@ -8000,6 +8001,37 @@ class TradingEngine:
                 f"spread lifecycle.mark_canceled skipped for "
                 f"position_id={position_id[:8]}: {exc}"
             )
+
+    # ── Substrate-backed pending-close query (§10.7 C4) ──
+    #
+    # The single source of truth for "does this spread have a close in
+    # flight?" — replaces `_spreads_pending_close` (in-memory only).
+    # Restart-safe via the substrate's on-disk rows.
+
+    def _spread_has_pending_close(self, position_id: str) -> bool:
+        """True iff a non-terminal exit / partial_close row exists for
+        the spread's position_uid in the substrate.
+
+        Failure-mode handling: if the substrate isn't wired or the
+        query raises, returns False so the legacy dispatch path
+        proceeds. Defensive logging at WARNING — a sustained read
+        failure surfaces in logs but doesn't lock out closing.
+        """
+        if self.lifecycle_orders_store is None:
+            return False
+        try:
+            rows = self.lifecycle_orders_store.get_non_terminal_by_role(
+                spread_substrate_uid(position_id),
+                ("exit", "partial_close"),
+            )
+            return bool(rows)
+        except Exception as exc:
+            logger.warning(
+                f"spread substrate pending-close query failed for "
+                f"position_id={position_id[:8]}: {exc} — proceeding "
+                f"without lock"
+            )
+            return False
 
     # ── Spread close substrate (§10.7 — close-row writes per §6.2) ──
     #
@@ -8417,7 +8449,12 @@ class TradingEngine:
                 continue
 
             # ── Spread CLOSE ─────────────────────────────────────────────
-            self._spreads_pending_close.discard(position_id)
+            # §10.7 C4: in-memory `_spreads_pending_close` retired —
+            # the substrate is the source of truth. The pending-close
+            # state is finalized via `_lifecycle_orders_finalize_spread_
+            # close` below (full close → row terminal; partial close →
+            # original terminal + new partial_close placeholder; cancel
+            # → row terminal at observed status).
             # §10.7: find the substrate close row this drain event
             # corresponds to. The pre-dispatch insert puts exactly one
             # non-terminal close row per position_uid (guaranteed by
@@ -8466,28 +8503,13 @@ class TradingEngine:
                     # (when the rest fills) will land here again with
                     # full_close_combo=True and proceed normally.
                     #
-                    # PR #56 R6: re-add to _spreads_pending_close so the
-                    # next cycle's _process_credit_spread_exits skips this
-                    # position and does NOT dispatch a duplicate close
-                    # order at the original full qty. The position remains
-                    # "pending close" until the broker reconciles the
-                    # residual fill (or the operator intervenes).
-                    # Line 4924's unconditional `discard` cleared the
-                    # pending state at the top of the close branch; this
-                    # re-arms it.
-                    #
-                    # KNOWN RESIDUAL RISK (PLAN.md P2 follow-up):
-                    # _spreads_pending_close is in-memory only. A bot
-                    # restart between this partial detection and the
-                    # residual fill loses the marker — restart restores
-                    # the spread as open with residual qty (R5), this set
-                    # starts empty, and the next cycle may dispatch a
-                    # duplicate close. The CRITICAL alert below is the
-                    # current mitigation: operator reconciliation closes
-                    # the gap within minutes (the typical restart window).
-                    # See PLAN.md "MLEG partial-close residual
-                    # reconciliation" for the design space.
-                    self._spreads_pending_close.add(position_id)
+                    # §10.7 C4: the substrate-backed R6 (below) makes
+                    # the duplicate-dispatch block restart-safe — the
+                    # partial_close placeholder row is on disk, so the
+                    # next cycle's _process_credit_spread_exits will
+                    # see the lock via _spread_has_pending_close even
+                    # after a restart. The original in-memory
+                    # `_spreads_pending_close.add` re-arm is retired.
                     # §10.7: substrate-backed R6 — finalize the
                     # original exit row at broker truth ('filled' with
                     # the partial qty), then insert a NEW pending
@@ -8694,16 +8716,16 @@ class TradingEngine:
                     reason=f"{strategy_name} {exit_reason}",
                 )
             else:
-                # Close did not fill — the position stays open. Clearing the
-                # pending-close flag (above) lets the exit path retry next cycle.
+                # Close did not fill — the position stays open. Releasing
+                # the substrate close row (below) lets the exit path
+                # retry next cycle.
                 logger.warning(
                     f"[{strategy_name}] credit spread close {status} — "
                     f"position_id={position_id[:8]} still open, will retry"
                 )
                 # §10.7: release the substrate close row so the
                 # uniq_one_active_close_per_position guard doesn't
-                # block the next-cycle retry. Mirrors the in-memory
-                # _spreads_pending_close.discard above.
+                # block the next-cycle retry.
                 if substrate_close_row is not None:
                     self._lifecycle_orders_finalize_spread_close(
                         client_order_id=substrate_close_row.client_order_id,
@@ -8724,9 +8746,11 @@ class TradingEngine:
         ``evaluate_spread_exit`` — ``underlying_close`` is therefore unused
         on this path and a sentinel ``0.0`` is passed.
 
-        Idempotent: positions already in ``_spreads_pending_close`` (from a
-        prior cycle or another caller in the same cycle) are skipped, so any
-        subsequent per-symbol invocation in the slot loop is a no-op.
+        Idempotent: positions whose substrate close row is non-terminal
+        (from a prior cycle or another caller in the same cycle) are
+        skipped via the duplicate-block in
+        ``_lifecycle_orders_insert_spread_close``, so any subsequent
+        per-symbol invocation in the slot loop is a no-op.
         """
         for slot in self.slots:
             strategy = slot.strategy
@@ -8798,8 +8822,8 @@ class TradingEngine:
         """
         Evaluate exit triggers for every open spread this strategy holds and
         dispatch a closing MLEG combo for any that fire. A position with a
-        close already in flight (``_spreads_pending_close``) is skipped so a
-        stale signal cannot double-submit.
+        close already in flight (substrate non-terminal exit/partial_close
+        row) is skipped so a stale signal cannot double-submit.
 
         When ``current_regime`` is ``BEAR`` the engine short-circuits to a
         defensive close for every open spread (docs/credit_spread_strategy.md
@@ -8816,7 +8840,10 @@ class TradingEngine:
         today = self._clock().date()
         for open_spread in list(open_spreads):
             position_id = open_spread.position_id
-            if position_id in self._spreads_pending_close:
+            # §10.7 C4: substrate-backed pending-close check.
+            # Restart-safe. Replaces `position_id in
+            # self._spreads_pending_close`.
+            if self._spread_has_pending_close(position_id):
                 continue
             # Build the typed close decision. BEAR override produces a
             # synthetic decision; otherwise the strategy decides.
@@ -9060,11 +9087,7 @@ class TradingEngine:
             if not substrate_inserted:
                 # Either the duplicate-dispatch guard fired (already a
                 # non-terminal close pending) or the substrate insert
-                # failed critically. Either way, don't dispatch. Also
-                # add to the legacy in-memory set so any reads still on
-                # it during the C5 migration window see consistent
-                # state.
-                self._spreads_pending_close.add(position_id)
+                # failed critically. Either way, don't dispatch.
                 continue
             try:
                 result = self.broker.dispatch_spread_order(
@@ -9095,7 +9118,11 @@ class TradingEngine:
                 )
                 continue
             if result.status is OrderStatus.ACCEPTED:
-                self._spreads_pending_close.add(position_id)
+                # §10.7 C4: the substrate's pending close row inserted
+                # above is what blocks duplicate dispatch (via
+                # uniq_one_active_close_per_position). No in-memory
+                # marker needed.
+                pass
             else:
                 logger.warning(
                     f"[{strategy.name}] {underlying}: spread close dispatch returned "
