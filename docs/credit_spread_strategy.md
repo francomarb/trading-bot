@@ -208,31 +208,29 @@ structurally possible (a 2-contract close fill of 1 contract).
 - If `close_qty < open_qty`: position state is **preserved** (no
   release, no pop), partial fill row is logged with
   `status='partial'`, allocator receives `is_full_close=False`,
-  CRITICAL log + `broker_error` alert fires, and
-  `_spreads_pending_close` is re-armed to block a duplicate close
-  dispatch on the next cycle.
+  CRITICAL log + `broker_error` alert fires, and a new pending
+  `position_lifecycle_orders` row at `role='partial_close'` is
+  inserted to mark the residual qty. The substrate's
+  `uniq_one_active_close_per_position` partial unique index then
+  blocks a duplicate close dispatch on the next cycle — durable
+  across restarts (§10.7 spread lifecycle PR).
 - On restart, `read_open_spread_positions` honors the same semantics:
   spreads with only partial close rows are restored with residual
   qty; only `status='filled'` close rows mark the position closed.
+  The substrate `partial_close` placeholder row is also reloaded,
+  so the duplicate-block remains in effect immediately on boot.
 
-**Known residual risk:**
+**Residual handling (operator-resolved):**
 
-`_spreads_pending_close` is in-memory only. A bot restart between the
-partial detection and the residual fill loses the pending marker —
-the next cycle could dispatch a duplicate close at residual qty
-while the original partial order may still be working at the broker.
-
-**Today's mitigation:** the CRITICAL log + `broker_error` alert tells
-the operator that manual reconciliation is needed. The recycle window
-is typically minutes, not hours — the broker usually resolves the
-residual within that span.
-
-**Status:** **tracked as a separate follow-up PR**, not blocking PR #56
-or any other work. See PLAN.md P2 "MLEG partial-close residual
-reconciliation" for the design space (engine_state.json persistence,
-lifecycle-derived inference, or snapshot-based residual tracking) and
-the worker-side decision (whether `options_executor.py:275` should
-cancel-and-retry on `partially_filled` or wait).
+Per the §10.7 worker-behavior decision (WAIT, evidence: zero
+historical spread partial-fill events on paper), the partial_close
+placeholder is **not** auto-progressed by the engine. The CRITICAL
+alert is the operator-visible signal; the operator inspects, either
+confirms the broker filled the residual or cancels the original
+order, and clears the placeholder by hand. Auto-retry of the
+residual close is explicitly out of scope until an actual partial
+fires and the right cancel-vs-retry policy is informed by real
+broker behavior.
 
 ---
 

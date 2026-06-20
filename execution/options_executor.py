@@ -480,6 +480,23 @@ class SpreadExecutionWorker(_BaseExecutionWorker):
         # limit_price, duration_seconds, terminal_status)`` where
         # ``terminal_status`` is "filled", "canceled", or "skipped".
         on_walk_step: Callable[..., None] | None = None,
+        # §10.7 fix-up — per-submit attach callback. Fires synchronously
+        # after every successful broker submit (single-shot AND each
+        # walk step) with (engine_substrate_cloid, broker_order_id).
+        # The engine uses this to attach the broker order_id to the
+        # substrate row at the earliest possible moment so a worker
+        # crash between submit and drain doesn't leave the substrate
+        # at order_id=NULL (the original blocking defect found by
+        # review on the spread close path).
+        on_submitted: Callable[[str, str], None] | None = None,
+        # §10.7 fix-up — caller-provided substrate cloid that the
+        # worker emits via on_submitted. Distinct from the broker
+        # cloids the worker generates per submit (Alpaca requires
+        # unique cloids per order, walk has multiple submits). The
+        # engine's substrate row carries this value as its
+        # client_order_id; on_submitted echoes it so the engine can
+        # update the substrate row's order_id on every step.
+        substrate_cloid: str | None = None,
     ) -> None:
         # The short leg is the defining symbol for logging/identification.
         short_leg = next(
@@ -500,11 +517,30 @@ class SpreadExecutionWorker(_BaseExecutionWorker):
         self._close_scheduler = close_scheduler
         self._quote_provider = quote_provider
         self._on_walk_step = on_walk_step
+        self._on_submitted = on_submitted
+        self._substrate_cloid = substrate_cloid
         if (close_scheduler is None) != (quote_provider is None):
             raise ValueError(
                 "SpreadExecutionWorker: close_scheduler and quote_provider "
                 "must both be set or both be None (walk-and-market needs "
                 "fresh quotes for each step)"
+            )
+
+    def _fire_on_submitted(self, broker_order_id: str) -> None:
+        """Emit the per-submit attach event if the engine wired it.
+
+        Tagged with ``self._substrate_cloid`` (the engine's substrate
+        row client_order_id), NOT the worker-generated broker cloid —
+        the substrate row was inserted before dispatch with the
+        engine's cloid as its key.
+        """
+        if self._on_submitted is None or self._substrate_cloid is None:
+            return
+        try:
+            self._on_submitted(self._substrate_cloid, broker_order_id)
+        except Exception as exc:
+            logger.error(
+                f"[{self.name}] on_submitted callback raised: {exc}"
             )
 
     @property
@@ -556,6 +592,10 @@ class SpreadExecutionWorker(_BaseExecutionWorker):
                 self.stream_manager.unwatch(client_order_id)
             self._report_fill("rejected", client_order_id)
             return
+
+        # §10.7 fix-up — eager attach the broker order_id to the
+        # substrate row (single-shot path).
+        self._fire_on_submitted(str(order.id))
 
         if self.stream_manager is not None:
             self.stream_manager.bind_submitted_order(
@@ -635,6 +675,13 @@ class SpreadExecutionWorker(_BaseExecutionWorker):
                 f"(expr={step.price_expr!r}, hold={step.duration_seconds}s) "
                 f"order={order.id}"
             )
+
+        # §10.7 fix-up — eager attach the broker order_id to the
+        # substrate row. At any moment during walk-and-market, exactly
+        # one broker order is in flight; this keeps substrate.order_id
+        # current so the cycle / startup reconciler can resolve it
+        # via REST after a crash.
+        self._fire_on_submitted(str(order.id))
 
         if self.stream_manager is not None:
             self.stream_manager.bind_submitted_order(

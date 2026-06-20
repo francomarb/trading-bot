@@ -1071,6 +1071,11 @@ class TradingEngine:
             self._process_stream_stop_fills(snapshot)
             self._detect_external_closes(snapshot)
             self._drain_lifecycle_attaches()
+            # §10.7 fix-up — drain spread close per-submit attaches so
+            # substrate.order_id stays current with the broker's
+            # latest walk-step order. This is what closes the restart-
+            # gap on a crash between submit and the close drain.
+            self._drain_lifecycle_close_attaches()
             self._drain_lifecycle_events(snapshot)
             self._reconcile_substrate_cycle(snapshot)
             # §10.7: spread close reconciler — runs every cycle so
@@ -7026,6 +7031,59 @@ class TradingEngine:
                     f"REST reconcilers skip it. Inspect manually."
                 )
 
+    def _drain_lifecycle_close_attaches(self) -> None:
+        """§10.7 fix-up — apply spread close per-submit attaches.
+
+        Spread close workers queue (engine_substrate_cloid,
+        broker_order_id, None) on every successful broker submit
+        (single-shot AND each walk step). The drain calls the
+        walk-step variant which permits overwriting order_id while
+        the row is non-terminal — each subsequent step's broker
+        order_id replaces the previous one as the in-flight order.
+
+        This is what closes the restart-gap: a crash after submit
+        leaves the substrate row carrying the broker order_id, so
+        the cycle / startup reconciler can resolve it via REST. Best-
+        effort per-row failure handling matches `_drain_lifecycle_
+        attaches` for the single-leg path.
+        """
+        if self.lifecycle_orders_store is None:
+            return
+        try:
+            attaches = self.broker.drain_lifecycle_close_attaches()
+        except AttributeError:
+            # Broker fixture older than the spread-attach queue
+            # (test mocks); no work to do.
+            return
+        for client_order_id, order_id, submitted_at in attaches:
+            try:
+                updated = (
+                    self.lifecycle_orders_store
+                    .attach_or_update_order_id_for_walk_step(
+                        client_order_id=client_order_id,
+                        order_id=order_id,
+                        submitted_at=submitted_at,
+                    )
+                )
+                if not updated:
+                    # Row doesn't exist or is terminal. Both are
+                    # benign for the walk-step path: a terminal row
+                    # means the drain saw the close before this
+                    # attach drained (race; harmless).
+                    logger.debug(
+                        f"spread close attach no-op for "
+                        f"{client_order_id} → {order_id} "
+                        f"(missing or terminal)"
+                    )
+            except Exception as exc:
+                logger.critical(
+                    f"spread close attach FAILED for "
+                    f"{client_order_id} → {order_id}: {exc}. The "
+                    f"broker order is live; cycle reconciliation "
+                    f"may not resolve it on restart if order_id "
+                    f"stays NULL."
+                )
+
     def _drain_lifecycle_events(
         self, snapshot: "BrokerSnapshot | None" = None,
     ) -> None:
@@ -8115,8 +8173,18 @@ class TradingEngine:
             #      this one close than to regress the engine's
             #      ability to close spreads when the parent row is
             #      unexpectedly missing.
-            msg = str(exc).lower()
-            if "foreign key" in msg:
+            #
+            # Discriminate via ``sqlite_errorname`` (Python 3.11+) —
+            # locale-independent symbolic code from the SQLite C API.
+            # Fall back to a substring check if the attribute is
+            # missing (older Python) so the dispatch path stays safe.
+            errname = getattr(exc, "sqlite_errorname", None)
+            is_fk = (
+                errname == "SQLITE_CONSTRAINT_FOREIGNKEY"
+                if errname is not None
+                else "foreign key" in str(exc).lower()
+            )
+            if is_fk:
                 logger.critical(
                     f"spread close substrate FK failure for "
                     f"position_id={position_id[:8]} role={role}: {exc} — "
@@ -8464,6 +8532,41 @@ class TradingEngine:
             substrate_close_row = None
             if self.lifecycle_orders_store is not None:
                 try:
+                    # §10.7 fix-up — DEFENSIVE: drop duplicate drain
+                    # events for an order_id we've already processed
+                    # to terminal for this position. The current
+                    # close paths never emit duplicates (the worker
+                    # exits on the first terminal event), but a
+                    # future worker / stream path that emits
+                    # cumulative-fill updates would otherwise
+                    # double-release the position and double-log
+                    # the close trade. R6 + the partial_close
+                    # placeholder design is operator-resolved by
+                    # contract; auto-progression on a late
+                    # cumulative update is explicitly out of scope.
+                    if order_id is not None:
+                        all_rows = (
+                            self.lifecycle_orders_store
+                            .get_all_for_position(
+                                spread_substrate_uid(position_id)
+                            )
+                        )
+                        already_terminal = any(
+                            r.order_id == order_id
+                            and r.status in {"filled", "canceled", "rejected"}
+                            and r.role in {"exit", "partial_close"}
+                            for r in all_rows
+                        )
+                        if already_terminal:
+                            logger.debug(
+                                f"spread close drain SKIPPED for "
+                                f"position_id={position_id[:8]} "
+                                f"order_id={order_id} — already "
+                                f"processed to terminal in this "
+                                f"position's substrate; duplicate "
+                                f"drain event."
+                            )
+                            continue
                     rows = self.lifecycle_orders_store.get_non_terminal_by_role(
                         spread_substrate_uid(position_id),
                         ("exit", "partial_close"),
@@ -9100,6 +9203,12 @@ class TradingEngine:
                     close_scheduler=scheduler,
                     quote_provider=quote_provider,
                     on_walk_step=_on_walk_step,
+                    # §10.7 fix-up — substrate row cloid so the worker
+                    # can emit per-submit attach events. Without this,
+                    # the substrate row stays at order_id=NULL until
+                    # drain, defeating restart-gap closure on a crash
+                    # between worker submit and engine drain.
+                    close_substrate_cloid=close_cloid,
                 )
             except Exception as e:
                 logger.error(

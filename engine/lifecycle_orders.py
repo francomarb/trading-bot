@@ -841,6 +841,59 @@ class PositionLifecycleOrdersStore:
         )
         self._conn.commit()
 
+    def attach_or_update_order_id_for_walk_step(
+        self,
+        *,
+        client_order_id: str,
+        order_id: str,
+        submitted_at: str | None = None,
+    ) -> bool:
+        """Attach the broker ``order_id`` on a non-terminal close row,
+        overwriting any previously-attached id.
+
+        Differs from ``attach_broker_order_id`` in two ways:
+
+          1. Accepts overwrites when the row is still non-terminal —
+             supports walk-and-market progression where each step's
+             broker order_id replaces the previous one (only one step
+             is alive at the broker at any moment; the substrate row
+             must track the *current* in-flight order so the cycle
+             reconciler can poll the right id after a crash).
+
+          2. Returns ``True`` when the row was updated, ``False`` if
+             the row doesn't exist or is already terminal — callers
+             can log and move on without raising. The single-leg
+             ``attach_broker_order_id`` raises in these cases because
+             single-leg attaches are exactly-once.
+
+        Used by the spread close path (§10.7). The eager-attach
+        (submit-time, via worker on_submitted callback queued to the
+        engine drain) is what closes the restart-gap: a crash between
+        broker submit and the next drain still leaves the substrate
+        row carrying the live broker order_id, so the cycle / startup
+        reconciler can resolve it via REST.
+        """
+        now = submitted_at or _utc_now_iso()
+        existing = self._conn.execute(
+            "SELECT status FROM position_lifecycle_orders "
+            "WHERE client_order_id = ?",
+            (client_order_id,),
+        ).fetchone()
+        if existing is None:
+            return False
+        if existing[0] in TERMINAL_ORDER_STATUSES:
+            return False
+        self._conn.execute(
+            "UPDATE position_lifecycle_orders "
+            "SET order_id = ?, "
+            "    submitted_at = COALESCE(submitted_at, ?), "
+            "    last_observed_at = ? "
+            "WHERE client_order_id = ?",
+            (order_id, now, now, client_order_id),
+        )
+        self._conn.commit()
+        return True
+
     def mark_terminal_after_dispatch(
         self,
         *,

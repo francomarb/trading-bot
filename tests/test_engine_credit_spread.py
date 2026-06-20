@@ -1926,6 +1926,93 @@ class TestSpreadCloseSubstrate:
         # Position is preserved (R6 fail-safe).
         assert "p2" in engine._positions
 
+    def test_duplicate_close_drain_event_for_same_order_id_is_skipped(
+        self, tmp_path,
+    ):
+        """C8 audit: if a second drain event arrives for an order_id
+        we already finalized to terminal, the engine MUST skip it.
+        Otherwise the placeholder partial_close row would be
+        advanced with the original close's order_id, double-logging
+        the trade and re-releasing the position. With WAIT
+        semantics, the placeholder is operator-resolved only."""
+        from engine.positions import (
+            make_spread, PositionLeg, spread_substrate_uid,
+        )
+        strategy = _strategy()
+        engine, broker = _engine(tmp_path, strategy)
+        # Open a 2-contract spread + run a partial close to leave a
+        # placeholder behind.
+        engine._positions["p9"] = make_spread(
+            strategy_name="credit_spread", position_id="p9",
+            legs=[PositionLeg("SPY260618P00568000", -2, side="SELL"),
+                  PositionLeg("SPY260618P00558000", 2, side="BUY")],
+        )
+        engine._spread_owner_strategy["p9"] = strategy
+        engine._pending_spread_plans["p9"] = _pick()
+        spread_2 = OpenSpread(
+            position_id="p9",
+            short_occ="SPY260618P00568000",
+            long_occ="SPY260618P00558000",
+            short_strike=568.0, long_strike=558.0,
+            expiration_date=_EXP, net_credit=1.45, width=10.0, qty=2,
+        )
+        strategy.register_spread(spread_2)
+        engine._lifecycle_begin_spread(
+            position_id="p9", strategy_name="credit_spread",
+            symbol="SPY260618P00568000", qty=2,
+        )
+        engine._lifecycle_mark_spread_open(
+            position_id="p9", avg_entry_price=1.45, current_qty=2.0,
+        )
+        engine.lifecycle_orders_store.insert_pending(
+            position_uid=spread_substrate_uid("p9"),
+            role="exit", client_order_id="close-cloid-9",
+            order_type="limit", order_class="mleg", time_in_force="day",
+            side="buy", intended_qty=2.0,
+        )
+        # Partial fill — leaves placeholder.
+        broker.drain_spread_fills.return_value = [
+            ("p9", "credit_spread", True, "filled", 1.0, 0.60,
+             "broker-id-9", 0.60),
+        ]
+        engine._drain_spread_fills()
+        # Capture state after the partial: position preserved, one
+        # placeholder pending, one exit terminal.
+        assert "p9" in engine._positions
+        rows_after_partial = (
+            engine.lifecycle_orders_store.get_all_for_position(
+                spread_substrate_uid("p9")
+            )
+        )
+        n_exit_terminal = sum(
+            1 for r in rows_after_partial
+            if r.role == "exit" and r.status == "filled"
+        )
+        assert n_exit_terminal == 1
+        # Now simulate a SECOND drain for the same broker order_id
+        # (e.g. defensive replay, stream re-emission). The engine
+        # must skip it — no double-release, no double-log.
+        broker.drain_spread_fills.return_value = [
+            ("p9", "credit_spread", True, "filled", 2.0, 0.60,
+             "broker-id-9", 0.60),  # cumulative qty=2
+        ]
+        before_log_count = len(engine.trade_logger.read_all())
+        engine._drain_spread_fills()
+        # Position still preserved (no double-release).
+        assert "p9" in engine._positions
+        # No new trade-log rows written.
+        after_log_count = len(engine.trade_logger.read_all())
+        assert after_log_count == before_log_count
+        # Placeholder still pending (not advanced by the duplicate).
+        non_terminal = (
+            engine.lifecycle_orders_store.get_non_terminal_by_role(
+                spread_substrate_uid("p9"), ("exit", "partial_close"),
+            )
+        )
+        assert len(non_terminal) == 1
+        assert non_terminal[0].role == "partial_close"
+        assert non_terminal[0].status == "pending"
+
     def test_close_drain_canceled_finalizes_substrate_row_as_canceled(
         self, tmp_path
     ):
@@ -2101,6 +2188,131 @@ class TestSpreadCloseReconciler:
             "placeholder-cloid",
         )
         assert row.status == "pending"
+
+    def test_eager_attach_via_worker_on_submitted_callback(self, tmp_path):
+        """C6 fix-up acceptance: the broker order_id reaches the
+        substrate row via the worker's on_submitted callback before
+        any close-drain event. A crash here would still leave a
+        recoverable substrate row (order_id NOT NULL)."""
+        from engine.positions import (
+            make_spread, PositionLeg, spread_substrate_uid,
+        )
+        strategy = _strategy()
+        # Real broker fixture (not the engine fixture's MagicMock)
+        # would be ideal, but we can stand in by exercising the
+        # broker drain queue directly: simulate the worker's
+        # on_submitted callback pushing to
+        # _pending_lifecycle_close_attaches and assert the engine
+        # drain attaches the order_id to the existing pending row.
+        engine, broker = _engine(tmp_path, strategy)
+        # Real broker queue (the MagicMock doesn't have one).
+        broker._pending_lifecycle_close_attaches = []
+        broker.drain_lifecycle_close_attaches = (
+            lambda: broker._pending_lifecycle_close_attaches[:]
+            and (broker._pending_lifecycle_close_attaches.clear()
+                 or [(_cli, _oid, None) for _cli, _oid, _ in [
+                     ("engine-close-cloid", "broker-step-1", None)]])
+            if broker._pending_lifecycle_close_attaches else []
+        )
+        # Simpler: just stub the drain to return one event.
+        broker.drain_lifecycle_close_attaches = MagicMock(
+            return_value=[("engine-close-cloid", "broker-step-1", None)]
+        )
+        # Pre-populate state: open spread + pending exit row (no
+        # order_id yet, simulating the moment between substrate
+        # insert and worker's first submit).
+        engine._positions["p3"] = make_spread(
+            strategy_name="credit_spread", position_id="p3",
+            legs=[PositionLeg("SPY260618P00568000", -1, side="SELL"),
+                  PositionLeg("SPY260618P00558000", 1, side="BUY")],
+        )
+        engine._spread_owner_strategy["p3"] = strategy
+        engine._lifecycle_begin_spread(
+            position_id="p3", strategy_name="credit_spread",
+            symbol="SPY260618P00568000", qty=1,
+        )
+        engine._lifecycle_mark_spread_open(
+            position_id="p3", avg_entry_price=1.45, current_qty=1.0,
+        )
+        engine.lifecycle_orders_store.insert_pending(
+            position_uid=spread_substrate_uid("p3"),
+            role="exit", client_order_id="engine-close-cloid",
+            order_type="limit", order_class="mleg", time_in_force="day",
+            side="buy", intended_qty=1.0,
+        )
+        # Engine drains the queue — substrate row gets order_id
+        # attached without waiting for the close to complete.
+        engine._drain_lifecycle_close_attaches()
+        row = engine.lifecycle_orders_store.get_by_client_order_id(
+            "engine-close-cloid"
+        )
+        assert row.status == "pending"
+        assert row.order_id == "broker-step-1"
+        # Subsequent walk step OVERWRITES the order_id (walk-step
+        # semantics: only one broker order is alive at a time, and
+        # the substrate row must track the current in-flight id so
+        # the reconciler can poll the right id).
+        broker.drain_lifecycle_close_attaches.return_value = [
+            ("engine-close-cloid", "broker-step-2", None),
+        ]
+        engine._drain_lifecycle_close_attaches()
+        row2 = engine.lifecycle_orders_store.get_by_client_order_id(
+            "engine-close-cloid"
+        )
+        assert row2.order_id == "broker-step-2"  # overwrote
+
+    def test_attach_or_update_order_id_for_walk_step_no_op_on_terminal(
+        self, tmp_path,
+    ):
+        """The walk-step attach method must NOT revive a terminal
+        row — protects against race where the close terminates
+        before a late attach event drains."""
+        from engine.positions import spread_substrate_uid
+        strategy = _strategy()
+        engine, _ = _engine(tmp_path, strategy)
+        # Setup parent + pending close row, then immediately mark
+        # the row terminal.
+        engine._positions["p4"] = MagicMock(is_spread=True, is_single_leg=False,
+                                            strategy_name="credit_spread")
+        engine._lifecycle_begin_spread(
+            position_id="p4", strategy_name="credit_spread",
+            symbol="SPY260618P00568000", qty=1,
+        )
+        engine.lifecycle_orders_store.insert_pending(
+            position_uid=spread_substrate_uid("p4"),
+            role="exit", client_order_id="cloid-p4",
+            order_type="limit", order_class="mleg", time_in_force="day",
+            side="buy", intended_qty=1.0,
+        )
+        engine.lifecycle_orders_store.mark_terminal_after_dispatch(
+            client_order_id="cloid-p4", broker_order_id="b-1",
+            status="filled", filled_qty=1.0, avg_fill_price=0.60,
+        )
+        # Late attach attempt — must be a no-op (return False).
+        updated = (
+            engine.lifecycle_orders_store
+            .attach_or_update_order_id_for_walk_step(
+                client_order_id="cloid-p4",
+                order_id="b-2-late",
+            )
+        )
+        assert updated is False
+        # Row unchanged.
+        row = engine.lifecycle_orders_store.get_by_client_order_id("cloid-p4")
+        assert row.order_id == "b-1"
+        assert row.status == "filled"
+
+    def test_attach_or_update_returns_false_on_missing_row(self, tmp_path):
+        strategy = _strategy()
+        engine, _ = _engine(tmp_path, strategy)
+        updated = (
+            engine.lifecycle_orders_store
+            .attach_or_update_order_id_for_walk_step(
+                client_order_id="unknown-cloid",
+                order_id="b-1",
+            )
+        )
+        assert updated is False
 
     def test_restart_gap_closure_partial_then_crash_then_restart(
         self, tmp_path,

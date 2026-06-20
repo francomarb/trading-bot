@@ -325,6 +325,18 @@ class AlpacaBroker:
         # _pending_option_fills queue.
         self._pending_lifecycle_attaches: list[tuple[str, str, str | None]] = []
         self._pending_lifecycle_attaches_lock = threading.Lock()
+        # §10.7 fix-up — separate queue for spread close per-submit
+        # attaches. The single-leg queue's drain calls
+        # `attach_broker_order_id` (strict: order_id immutable);
+        # spread closes use the walk-step variant
+        # (`attach_or_update_order_id_for_walk_step`) which permits
+        # overwrites while the row is non-terminal so each step's
+        # broker order_id replaces the previous one. Sharing the
+        # queue would require a kind discriminator on every tuple;
+        # a separate queue is cleaner.
+        self._pending_lifecycle_close_attaches: list[
+            tuple[str, str, str | None]
+        ] = []
         # Async MLEG combo fills reported by SpreadExecutionWorker threads.
         # Drained by TradingEngine each cycle via drain_spread_fills().
         self._pending_spread_fills: list[tuple] = []
@@ -2087,6 +2099,19 @@ class AlpacaBroker:
             self._pending_lifecycle_attaches.clear()
         return attaches
 
+    def drain_lifecycle_close_attaches(
+        self,
+    ) -> list[tuple[str, str, str | None]]:
+        """§10.7 fix-up — drain per-submit attach events from spread
+        close workers. Same shape as drain_lifecycle_attaches but
+        applied via `attach_or_update_order_id_for_walk_step` rather
+        than the strict `attach_broker_order_id`, so walk-step
+        overwrites are permitted while the row is non-terminal."""
+        with self._pending_lifecycle_attaches_lock:
+            attaches = list(self._pending_lifecycle_close_attaches)
+            self._pending_lifecycle_close_attaches.clear()
+        return attaches
+
     def place_spread_order(
         self,
         *,
@@ -2246,6 +2271,15 @@ class AlpacaBroker:
         close_scheduler: "MlegCloseScheduler | None" = None,
         quote_provider: "Callable[[], MlegQuote | None] | None" = None,
         on_walk_step: "Callable[..., None] | None" = None,
+        # §10.7 fix-up — engine-side substrate row cloid for spread
+        # closes. When supplied, the worker emits a per-submit
+        # attach event (cloid, broker_order_id) which gets queued to
+        # `_pending_lifecycle_attaches_close` for the engine drain
+        # to apply via `attach_or_update_order_id_for_walk_step`.
+        # Without this thread, the substrate row stays at
+        # order_id=NULL until the close drains, defeating the
+        # restart-gap closure on a crash between submit and drain.
+        close_substrate_cloid: str | None = None,
     ) -> OrderResult:
         """
         Dispatch an asynchronous MLEG combo via ``SpreadExecutionWorker``
@@ -2323,6 +2357,16 @@ class AlpacaBroker:
                     filled_qty, avg_price, order_id, round(limit_price, 2),
                 ))
 
+        # §10.7 fix-up — per-submit substrate attach. Fires from the
+        # worker daemon thread, so we enqueue (cannot touch the
+        # shared sqlite3 connection: check_same_thread=True). Engine
+        # drains every cycle via `_drain_lifecycle_close_attaches`.
+        def _on_submitted(cli_id: str, broker_order_id: str) -> None:
+            with self._pending_lifecycle_attaches_lock:
+                self._pending_lifecycle_close_attaches.append(
+                    (cli_id, broker_order_id, None)
+                )
+
         worker = SpreadExecutionWorker(
             legs=legs,
             qty=qty,
@@ -2335,6 +2379,10 @@ class AlpacaBroker:
             close_scheduler=close_scheduler,
             quote_provider=quote_provider,
             on_walk_step=on_walk_step,
+            on_submitted=(
+                _on_submitted if close_substrate_cloid is not None else None
+            ),
+            substrate_cloid=close_substrate_cloid,
         )
         worker.start()
         return OrderResult(
