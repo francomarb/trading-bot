@@ -2658,8 +2658,18 @@ class AlpacaBroker:
         qty: float,
         stop_price: float,
         client_order_id_prefix: str = "opt-trail-stop",
+        position_uid: str | None = None,
     ) -> OpenOrder:
-        """Submit a durable GTC SELL stop for a single-leg option position."""
+        """Submit a durable GTC SELL stop for a single-leg option position.
+
+        Options-side P-4: when ``position_uid`` is supplied, the new
+        broker order is recorded in the per-order substrate as a
+        ``role='protective_stop'`` row keyed under ``position_uid``.
+        Callers without the uid (legacy tests) pass None and the
+        substrate write is skipped — the broker order still goes out.
+        The substrate row's autoincrement id is the FK target for
+        ``option_trailing_stops.lifecycle_order_id``.
+        """
         if qty <= 0:
             raise BrokerError(f"option stop qty must be positive for {symbol}: {qty}")
         whole_qty = int(qty)
@@ -2690,6 +2700,19 @@ class AlpacaBroker:
             op_desc=f"submit_option_gtc_stop({symbol})",
         )
         self._register_standalone_stop_leg(order)
+        # Options-side P-4: substrate row is the foundation-owned
+        # protective_stop record. POST-submit semantics — the broker
+        # stop is already live; substrate failure logs CRITICAL and
+        # is absorbed so the broker order isn't orphaned.
+        self._lifecycle_orders_record_protective_stop(
+            position_uid=position_uid,
+            client_order_id=client_order_id,
+            broker_order_id=str(order.id),
+            stop_price=float(stop_price),
+            qty=float(whole_qty),
+            parent_order_id=None,
+            order_class="simple",
+        )
         return self._to_open_order(order)
 
     def replace_option_stop(
@@ -2700,8 +2723,19 @@ class AlpacaBroker:
         stop_price: float,
         client_order_id_prefix: str = "opt-trail-stop",
         client_order_id: str | None = None,
+        position_uid: str | None = None,
     ) -> OpenOrder:
-        """Atomically ratchet an open option stop and enforce GTC duration."""
+        """Atomically ratchet an open option stop and enforce GTC duration.
+
+        Options-side P-5: when ``position_uid`` is supplied, the
+        replacement is recorded in the substrate as a
+        ``role='replacement_stop'`` row with
+        ``replaces_order_id=order_id``. The old protective_stop row
+        terminates async when the broker emits the canceled event for
+        the superseded order (handled by ``apply_order_event``).
+        Callers without the uid pass None and the substrate write is
+        skipped — the broker order still goes out.
+        """
         if not order_id:
             raise BrokerError("option stop replacement requires an order id")
         if qty <= 0:
@@ -2736,6 +2770,20 @@ class AlpacaBroker:
         if self._stream_manager is not None:
             self._stream_manager.unregister_stop_leg(order_id)
         self._register_standalone_stop_leg(order)
+        # Options-side P-5: replacement_stop substrate row with
+        # replaces_order_id tying the new row to the order it
+        # superseded so apply_order_event can resolve the lineage.
+        self._lifecycle_orders_record_stop(
+            position_uid=position_uid,
+            role="replacement_stop",
+            client_order_id=client_order_id,
+            broker_order_id=str(order.id),
+            stop_price=float(stop_price),
+            qty=float(whole_qty),
+            parent_order_id=None,
+            order_class="simple",
+            replaces_order_id=order_id,
+        )
         return self._to_open_order(order)
 
     # ── Internals ────────────────────────────────────────────────────────

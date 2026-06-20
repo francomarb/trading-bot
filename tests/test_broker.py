@@ -2086,6 +2086,110 @@ class TestOptionGtcStops:
         stream.unregister_stop_leg.assert_called_once_with("stop-1")
         stream.register_stop_leg.assert_called_once_with("stop-2")
 
+    def test_submit_option_gtc_stop_writes_protective_stop_substrate_row(self):
+        """Options-side P-4: substrate insert + attach on broker accept."""
+        api = MagicMock()
+        api.submit_order.return_value = _alpaca_order(
+            id="broker-stop-id",
+            status="accepted",
+            symbol="SPY260618C00746000",
+            side="sell",
+            qty=3,
+            type="stop",
+            stop_price="17.13",
+        )
+        orders_store = MagicMock()
+
+        AlpacaBroker(
+            client=api,
+            max_attempts=1,
+            base_delay=0.0,
+            lifecycle_orders_store=orders_store,
+        ).submit_option_gtc_stop(
+            symbol="SPY260618C00746000",
+            qty=3,
+            stop_price=17.13,
+            position_uid="pos_abc123",
+        )
+
+        orders_store.insert_pending.assert_called_once()
+        kwargs = orders_store.insert_pending.call_args.kwargs
+        assert kwargs["position_uid"] == "pos_abc123"
+        assert kwargs["role"] == "protective_stop"
+        assert kwargs["intended_qty"] == 3.0
+        assert kwargs["intended_stop_price"] == 17.13
+        orders_store.attach_broker_order_id.assert_called_once()
+        attach_kwargs = orders_store.attach_broker_order_id.call_args.kwargs
+        assert attach_kwargs["order_id"] == "broker-stop-id"
+        assert attach_kwargs["client_order_id"] == kwargs["client_order_id"]
+
+    def test_submit_option_gtc_stop_skips_substrate_without_position_uid(self):
+        """Legacy callers (broker smoke paths) pass no uid → no substrate write."""
+        api = MagicMock()
+        api.submit_order.return_value = _alpaca_order(
+            id="broker-stop-id",
+            status="accepted",
+            symbol="SPY260618C00746000",
+            side="sell",
+            qty=3,
+            type="stop",
+            stop_price="17.13",
+        )
+        orders_store = MagicMock()
+
+        AlpacaBroker(
+            client=api,
+            max_attempts=1,
+            base_delay=0.0,
+            lifecycle_orders_store=orders_store,
+        ).submit_option_gtc_stop(
+            symbol="SPY260618C00746000",
+            qty=3,
+            stop_price=17.13,
+        )
+
+        orders_store.insert_pending.assert_not_called()
+        orders_store.attach_broker_order_id.assert_not_called()
+
+    def test_replace_option_stop_writes_replacement_stop_substrate_row(self):
+        """Options-side P-5: replacement_stop with replaces_order_id lineage."""
+        api = MagicMock()
+        stream = MagicMock()
+        api.replace_order_by_id.return_value = _alpaca_order(
+            id="stop-new",
+            status="accepted",
+            symbol="SPY260618C00746000",
+            side="sell",
+            qty=3,
+            type="stop",
+            stop_price="19.00",
+            time_in_force="gtc",
+        )
+        orders_store = MagicMock()
+
+        AlpacaBroker(
+            client=api,
+            max_attempts=1,
+            base_delay=0.0,
+            stream_manager=stream,
+            lifecycle_orders_store=orders_store,
+        ).replace_option_stop(
+            order_id="stop-old",
+            qty=3,
+            stop_price=19.00,
+            position_uid="pos_abc123",
+        )
+
+        orders_store.insert_pending.assert_called_once()
+        kwargs = orders_store.insert_pending.call_args.kwargs
+        assert kwargs["position_uid"] == "pos_abc123"
+        assert kwargs["role"] == "replacement_stop"
+        assert kwargs["replaces_order_id"] == "stop-old"
+        assert kwargs["intended_stop_price"] == 19.00
+        orders_store.attach_broker_order_id.assert_called_once()
+        attach_kwargs = orders_store.attach_broker_order_id.call_args.kwargs
+        assert attach_kwargs["order_id"] == "stop-new"
+
 
 # ── place_spread_order / close_spread_order — MLEG (11.28) ───────────────────
 

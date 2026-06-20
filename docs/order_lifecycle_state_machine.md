@@ -1100,6 +1100,8 @@ This matrix is the **implementation PR's migration checklist**. Every row should
 
 ### 10.4 Option trailing state — split responsibilities
 
+> **Status (2026-06-20):** ✅ shipped via PR #71 on `feat/option-trailing-state-split` (7 feature commits + 3 review-fix commits). The migration matches the shape recommended below: `lifecycle_order_id INTEGER REFERENCES position_lifecycle_orders(id)` is the FK; `alpaca_stop_order_id` / `stop_order_status` columns stay as denormalized mirrors during migration; strict column removal + Phase 2 consumer migration (dashboard / health monitor) deferred to follow-up cleanup PRs. Tracker entry: [`order_lifecycle_foundation_tracker.md`](order_lifecycle_foundation_tracker.md) §10 absorption matrix row 10.4. The text below is preserved as the design-of-record.
+
 | Aspect | Detail |
 |---|---|
 | **Workaround today** | `option_trailing_stops` table (defined at [engine/option_trailing.py:11](../engine/option_trailing.py:11)) mixes legitimate strategy state with duplicate order-lifecycle state |

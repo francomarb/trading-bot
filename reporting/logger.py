@@ -520,8 +520,14 @@ class TradeLogger:
             from engine.option_trailing import (
                 _CREATE_OPTION_TRAILING_STOPS_SQL,
                 _OPTION_TRAILING_STOPS_INDEXES_SQL,
+                _ensure_lifecycle_order_id_column,
             )
             conn.execute(_CREATE_OPTION_TRAILING_STOPS_SQL)
+            # PR #59 §10.4: idempotent ALTER ADD for legacy tables
+            # created before lifecycle_order_id existed. Must run BEFORE
+            # the index creation below so the new partial index can be
+            # built against the new column on pre-existing DBs.
+            _ensure_lifecycle_order_id_column(conn)
             for index_sql in _OPTION_TRAILING_STOPS_INDEXES_SQL:
                 conn.execute(index_sql)
             # Operator Controls Phase A PR-2 — operator_commands queue.

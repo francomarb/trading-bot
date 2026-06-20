@@ -3197,7 +3197,21 @@ class TradingEngine:
         *,
         reason: str,
     ) -> None:
-        """Delete durable option trailing metadata after a full OCC close."""
+        """Delete durable option trailing metadata after a full OCC close.
+
+        Scope post-§10.4: this helper deletes the *strategy state* row
+        (entry_premium, hwm_premium, trail_*) on a full close. The
+        per-order broker state for the underlying stop is now owned by
+        the order-lifecycle substrate (``position_lifecycle_orders``),
+        which reaches its own terminal status through ``apply_order_event``
+        independently — this helper does not touch substrate rows.
+
+        Pre-§10.4 this helper also cleaned the broker-state mirror
+        (``alpaca_stop_order_id`` / ``stop_order_status``) embedded on
+        the trailing row; the mirror is gone alongside the trailing row
+        on delete, so behavior at the call sites is unchanged. The PR
+        #69 recovery cleanup tests stay green.
+        """
         if not is_occ_option(raw_symbol):
             return
         if self.option_trailing_store is None:
@@ -5010,11 +5024,158 @@ class TradingEngine:
             hard_floor = max(hard_floor, hwm_premium * (1.0 - trail_pct))
         return round(max(hard_floor, 0.01), 2)
 
+    # Sentinel returned by _lifecycle_order_id_for when the substrate
+    # lookup raised — distinct from None (genuinely-not-found) so the
+    # caller can preserve an existing FK across transient store
+    # errors instead of silently demoting to mirror-authoritative
+    # identity (PR #71 review P1 #2).
+    _LIFECYCLE_LOOKUP_FAILED: object = object()
+
+    def _lifecycle_order_id_for(
+        self,
+        order_id: str | None,
+        *,
+        client_order_id: str | None = None,
+        previous_fk: int | None = None,
+    ):
+        """Resolve a broker order_id to its position_lifecycle_orders.id.
+
+        Used to populate ``option_trailing_stops.lifecycle_order_id``
+        at every trailing-row upsert (PR #59 §10.4).
+
+        Return values:
+          - ``int``: substrate row id (happy path).
+          - ``None``: substrate not configured, no order_id supplied,
+            or the substrate row genuinely does not exist yet.
+          - ``self._LIFECYCLE_LOOKUP_FAILED`` sentinel: the lookup
+            raised. The caller MUST preserve any pre-existing FK
+            rather than overwriting with None — a transient store
+            error must not demote substrate-authoritative identity
+            to mirror-only.
+
+        When the order_id-keyed lookup returns no row AND a
+        ``client_order_id`` is supplied, falls back to looking up by
+        ``client_order_id``. This recovers the orphan case where
+        ``_lifecycle_orders_record_stop`` successfully wrote the
+        pending row but the subsequent ``attach_broker_order_id``
+        failed (PR #71 review P1 #1, partial mitigation). On a hit
+        the helper opportunistically re-attaches the broker order_id
+        so future lookups by order_id succeed.
+
+        ``previous_fk`` is informational only — used by callers that
+        want to log a state transition.
+        """
+        if self.lifecycle_orders_store is None or not order_id:
+            return None
+        try:
+            row = self.lifecycle_orders_store.get_by_order_id(order_id)
+            if row is None and client_order_id:
+                fallback = self.lifecycle_orders_store.get_by_client_order_id(
+                    client_order_id
+                )
+                if fallback is not None and fallback.order_id is None:
+                    # Pending substrate row that never got its order_id
+                    # attached. Re-attach now using the broker id we
+                    # have. Wrapped so a second failure here still
+                    # surfaces the row id we already know.
+                    try:
+                        self.lifecycle_orders_store.attach_broker_order_id(
+                            client_order_id=client_order_id,
+                            order_id=order_id,
+                        )
+                    except Exception as exc:
+                        logger.warning(
+                            f"lifecycle_orders attach retry failed for "
+                            f"client_order_id={client_order_id} → "
+                            f"order_id={order_id}: "
+                            f"{type(exc).__name__}: {exc} — substrate "
+                            f"row id={fallback.id} reused without "
+                            f"attached order_id"
+                        )
+                row = fallback if fallback is not None else row
+        except Exception as exc:
+            logger.warning(
+                f"lifecycle_order_id lookup raised "
+                f"{type(exc).__name__}: {exc} for order_id={order_id} "
+                f"(client_order_id={client_order_id}); preserving "
+                f"previous FK={previous_fk}"
+            )
+            return self._LIFECYCLE_LOOKUP_FAILED
+        return None if row is None else row.id
+
+    def _resolve_trailing_fk_or_preserve(
+        self,
+        *,
+        broker_order_id: str | None,
+        client_order_id: str | None,
+        previous_fk: int | None,
+        previous_mirror_order_id: str | None,
+        owner: str,
+        occ: str,
+        load_bearing: bool,
+    ) -> int | None:
+        """Resolve the FK target for a trailing-row upsert.
+
+        Encapsulates the §10.4 preservation contract (PR #71 review
+        P1 #2). Behavior:
+
+          1. If ``broker_order_id`` is unchanged from
+             ``previous_mirror_order_id`` AND ``previous_fk`` is
+             populated, the FK already points at the right substrate
+             row — no need to re-query; return ``previous_fk``.
+          2. Otherwise call ``_lifecycle_order_id_for`` and act on
+             its return:
+             - ``int`` → use it.
+             - ``None`` (genuine not-found) → return ``None``; if
+               ``load_bearing`` is True (post-broker-accept on a
+               fresh submit / replacement), emit CRITICAL so the
+               orphan condition is visible to the operator.
+             - lookup-failed sentinel → preserve ``previous_fk``
+               (which may itself be None on legacy rows; in that
+               case the caller stays mirror-authoritative for this
+               cycle and the next cycle retries).
+        """
+        if (
+            broker_order_id
+            and previous_fk is not None
+            and broker_order_id == previous_mirror_order_id
+        ):
+            return previous_fk
+        resolved = self._lifecycle_order_id_for(
+            broker_order_id,
+            client_order_id=client_order_id,
+            previous_fk=previous_fk,
+        )
+        if resolved is self._LIFECYCLE_LOOKUP_FAILED:
+            return previous_fk
+        if resolved is None and load_bearing and broker_order_id:
+            logger.critical(
+                f"[{owner}] {occ}: option trailing FK could not be "
+                f"resolved for broker order_id={broker_order_id} "
+                f"(client_order_id={client_order_id}). The substrate "
+                f"row for this stop is orphaned — likely "
+                f"insert_pending or attach_broker_order_id failure "
+                f"during stop create/replace. Trailing row will fall "
+                f"back to mirror-authoritative identity for this "
+                f"position. Investigate substrate health."
+            )
+        return resolved
+
     def _recent_option_stop_submit_pending(self, row) -> bool:
-        """True when a just-submitted option stop may not show in snapshots yet."""
-        if row is None or not row.alpaca_stop_order_id:
+        """True when a just-submitted option stop may not show in snapshots yet.
+
+        Reads broker identity / status through the lifecycle_order_id FK
+        when populated (substrate-authoritative per PR #59 §10.4); falls
+        back to the denormalized mirror columns otherwise. Both paths
+        preserve the original predicate: a known order_id with a still-
+        accepting status that was last updated within the retry grace.
+        """
+        if row is None:
             return False
-        if row.stop_order_status not in {"accepted", "new", "pending_new", "open"}:
+        order_id, status = self._option_trailing_authoritative_identity(row)
+        if not order_id:
+            return False
+        if status not in {"accepted", "new", "pending_new", "open"}:
             return False
         try:
             updated_at = datetime.fromisoformat(row.last_updated_at)
@@ -5025,6 +5186,87 @@ class TradingEngine:
         age = datetime.now(timezone.utc) - updated_at.astimezone(timezone.utc)
         retry_grace = max(120.0, float(self.config.cycle_interval_seconds) * 2.0)
         return 0.0 <= age.total_seconds() <= retry_grace
+
+    # Roles a trailing row's FK is allowed to point at — the broker
+    # stop is either the original protective_stop or its post-ratchet
+    # replacement_stop. Anything else (entry_primary, exit, etc.) is a
+    # cross-wiring bug or recovery race; we MUST NOT consult it for
+    # duplicate-submit suppression (PR #71 review P2).
+    _ALLOWED_TRAILING_FK_ROLES: frozenset[str] = frozenset(
+        {"protective_stop", "replacement_stop"}
+    )
+
+    def _option_trailing_authoritative_identity(
+        self, row
+    ) -> tuple[str | None, str | None]:
+        """Return (order_id, status) preferring substrate over the mirror.
+
+        Substrate identity / status (joined via lifecycle_order_id) is
+        the canonical post-§10.4 source. The denormalized mirror columns
+        on ``option_trailing_stops`` remain as a fallback for legacy
+        rows whose FK is still NULL (e.g. trailing state for a broker
+        stop that predates the foundation, before cycle reconciliation
+        has had a chance to backfill the substrate row).
+
+        Defensive validation (PR #71 review P2): the FK only proves the
+        substrate row exists. On a fresh DB the SQLite FK enforces the
+        relationship; on legacy DBs the FK constraint is absent and a
+        bad write or recovery race could leave the FK pointing at an
+        unrelated row. Before trusting the substrate fields we verify
+        that ``position_uid`` matches and ``role`` is a stop role; on
+        mismatch we log CRITICAL and fall back to the mirror columns
+        so a wrong substrate row never influences duplicate-submit
+        suppression.
+        """
+        mirror_order_id = getattr(row, "alpaca_stop_order_id", None)
+        mirror_status = getattr(row, "stop_order_status", None)
+        lifecycle_order_id = getattr(row, "lifecycle_order_id", None)
+        if self.lifecycle_orders_store is None or not lifecycle_order_id:
+            return mirror_order_id, mirror_status
+        try:
+            substrate = self.lifecycle_orders_store.get_by_id(
+                int(lifecycle_order_id)
+            )
+        except Exception as exc:
+            logger.debug(
+                f"option trailing substrate lookup raised "
+                f"{type(exc).__name__}: {exc} for "
+                f"lifecycle_order_id={lifecycle_order_id}"
+            )
+            return mirror_order_id, mirror_status
+        if substrate is None:
+            return mirror_order_id, mirror_status
+        # Defensive validation — see docstring.
+        row_position_uid = getattr(row, "position_uid", None)
+        if (
+            row_position_uid is not None
+            and substrate.position_uid != row_position_uid
+        ):
+            logger.critical(
+                f"option trailing FK position_uid mismatch: trailing row "
+                f"{getattr(row, 'occ_symbol', '?')} "
+                f"position_uid={row_position_uid} but "
+                f"position_lifecycle_orders.id={lifecycle_order_id} has "
+                f"position_uid={substrate.position_uid} (role="
+                f"{substrate.role}). Falling back to mirror columns for "
+                f"this read; investigate cross-wiring or recovery race."
+            )
+            return mirror_order_id, mirror_status
+        if substrate.role not in self._ALLOWED_TRAILING_FK_ROLES:
+            logger.critical(
+                f"option trailing FK role mismatch: trailing row "
+                f"{getattr(row, 'occ_symbol', '?')} → "
+                f"position_lifecycle_orders.id={lifecycle_order_id} has "
+                f"role={substrate.role!r} (expected one of "
+                f"{sorted(self._ALLOWED_TRAILING_FK_ROLES)}). Falling "
+                f"back to mirror columns for this read; investigate "
+                f"cross-wiring or recovery race."
+            )
+            return mirror_order_id, mirror_status
+        return (
+            substrate.order_id or mirror_order_id,
+            substrate.status or mirror_status,
+        )
 
     def _option_ratchet_quote_rejection(
         self,
@@ -5288,6 +5530,8 @@ class TradingEngine:
             qty = abs(float(getattr(position, "qty", 0.0) or 0.0))
             existing = open_stop_by_occ.get(occ)
             if existing is None and self._recent_option_stop_submit_pending(row):
+                # Submit-pending retry: preserve the substrate FK already
+                # written by the prior cycle's submit_option_gtc_stop.
                 self.option_trailing_store.upsert(
                     position_uid=lifecycle_row.position_uid,
                     occ_symbol=occ,
@@ -5302,6 +5546,7 @@ class TradingEngine:
                     alpaca_stop_order_id=row.alpaca_stop_order_id,
                     stop_order_status=row.stop_order_status,
                     last_observed_premium=current_premium,
+                    lifecycle_order_id=row.lifecycle_order_id,
                 )
                 logger.debug(
                     f"[{owner}] {occ}: recently submitted option stop "
@@ -5333,6 +5578,11 @@ class TradingEngine:
                 and existing_is_known_gtc
                 and existing_qty_matches
             ):
+                # Adequate-stop preserve: the broker stop is unchanged,
+                # so if the prior trailing row already had a FK pointing
+                # at it, keep that FK (skip the substrate query). A
+                # lookup-failed sentinel on a re-resolve must also
+                # preserve the existing FK rather than demote.
                 self.option_trailing_store.upsert(
                     position_uid=lifecycle_row.position_uid,
                     occ_symbol=occ,
@@ -5347,6 +5597,19 @@ class TradingEngine:
                     alpaca_stop_order_id=existing.order_id,
                     stop_order_status=existing.status,
                     last_observed_premium=current_premium,
+                    lifecycle_order_id=self._resolve_trailing_fk_or_preserve(
+                        broker_order_id=existing.order_id,
+                        client_order_id=existing.client_order_id,
+                        previous_fk=(
+                            row.lifecycle_order_id if row is not None else None
+                        ),
+                        previous_mirror_order_id=(
+                            row.alpaca_stop_order_id if row is not None else None
+                        ),
+                        owner=owner,
+                        occ=occ,
+                        load_bearing=False,
+                    ),
                 )
                 continue
 
@@ -5380,6 +5643,9 @@ class TradingEngine:
                                 f"TIF/qty maintenance at existing ${existing_stop:.2f}"
                             )
                         else:
+                            # Deferred-ratchet preserve: existing stop
+                            # stays live unchanged; preserve prior FK
+                            # when the broker order id is unchanged.
                             self.option_trailing_store.upsert(
                                 position_uid=lifecycle_row.position_uid,
                                 occ_symbol=occ,
@@ -5394,6 +5660,25 @@ class TradingEngine:
                                 alpaca_stop_order_id=existing.order_id,
                                 stop_order_status=existing.status,
                                 last_observed_premium=current_premium,
+                                lifecycle_order_id=(
+                                    self._resolve_trailing_fk_or_preserve(
+                                        broker_order_id=existing.order_id,
+                                        client_order_id=(
+                                            existing.client_order_id
+                                        ),
+                                        previous_fk=(
+                                            row.lifecycle_order_id
+                                            if row is not None else None
+                                        ),
+                                        previous_mirror_order_id=(
+                                            row.alpaca_stop_order_id
+                                            if row is not None else None
+                                        ),
+                                        owner=owner,
+                                        occ=occ,
+                                        load_bearing=False,
+                                    )
+                                ),
                             )
                             logger.info(
                                 f"[{owner}] {occ}: option stop ratchet "
@@ -5477,12 +5762,14 @@ class TradingEngine:
                             qty=qty,
                             stop_price=replacement_stop,
                             client_order_id=replacement_client_order_id,
+                            position_uid=lifecycle_row.position_uid,
                         )
                     else:
                         new_order = self.broker.replace_option_stop(
                             order_id=existing.order_id,
                             qty=qty,
                             stop_price=replacement_stop,
+                            position_uid=lifecycle_row.position_uid,
                         )
                 except Exception as exc:
                     replace_call_end = (
@@ -5516,6 +5803,10 @@ class TradingEngine:
                     self.alerts.broker_error(
                         f"{occ} option trailing stop replacement: {exc}"
                     )
+                    # Replacement failed at the broker — the old stop
+                    # is still live, so preserve the FK at the original
+                    # substrate row (no new replacement_stop row was
+                    # written because the broker call raised).
                     self.option_trailing_store.upsert(
                         position_uid=lifecycle_row.position_uid,
                         occ_symbol=occ,
@@ -5530,6 +5821,23 @@ class TradingEngine:
                         alpaca_stop_order_id=existing.order_id,
                         stop_order_status="replace_failed",
                         last_observed_premium=current_premium,
+                        lifecycle_order_id=(
+                            self._resolve_trailing_fk_or_preserve(
+                                broker_order_id=existing.order_id,
+                                client_order_id=existing.client_order_id,
+                                previous_fk=(
+                                    row.lifecycle_order_id
+                                    if row is not None else None
+                                ),
+                                previous_mirror_order_id=(
+                                    row.alpaca_stop_order_id
+                                    if row is not None else None
+                                ),
+                                owner=owner,
+                                occ=occ,
+                                load_bearing=False,
+                            )
+                        ),
                     )
                     continue
                 replace_call_end = (
@@ -5573,6 +5881,13 @@ class TradingEngine:
                             ),
                         },
                     )
+                # Replacement succeeded: FK advances to the brand-new
+                # replacement_stop substrate row just written by
+                # broker.replace_option_stop. The old protective_stop
+                # row terminates asynchronously when apply_order_event
+                # observes the canceled event for the superseded order.
+                # load_bearing=True so a missed lookup after broker
+                # accept raises CRITICAL (orphan condition).
                 self.option_trailing_store.upsert(
                     position_uid=lifecycle_row.position_uid,
                     occ_symbol=occ,
@@ -5587,6 +5902,17 @@ class TradingEngine:
                     alpaca_stop_order_id=new_order.order_id,
                     stop_order_status=new_order.status,
                     last_observed_premium=current_premium,
+                    lifecycle_order_id=self._resolve_trailing_fk_or_preserve(
+                        broker_order_id=new_order.order_id,
+                        client_order_id=new_order.client_order_id,
+                        previous_fk=(
+                            row.lifecycle_order_id if row is not None else None
+                        ),
+                        previous_mirror_order_id=None,
+                        owner=owner,
+                        occ=occ,
+                        load_bearing=True,
+                    ),
                 )
                 logger.info(
                     f"[{owner}] {occ}: option GTC trailing stop replaced — "
@@ -5599,6 +5925,7 @@ class TradingEngine:
                     symbol=occ,
                     qty=qty,
                     stop_price=desired_stop,
+                    position_uid=lifecycle_row.position_uid,
                 )
             except Exception as exc:
                 logger.error(
@@ -5607,6 +5934,8 @@ class TradingEngine:
                 )
                 self.risk.record_broker_error()
                 self.alerts.broker_error(f"{occ} option trailing stop: {exc}")
+                # Fresh submit failed at the broker — no substrate row
+                # was written. FK is None until the next cycle re-attempts.
                 self.option_trailing_store.upsert(
                     position_uid=lifecycle_row.position_uid,
                     occ_symbol=occ,
@@ -5621,8 +5950,14 @@ class TradingEngine:
                     alpaca_stop_order_id=None,
                     stop_order_status="submit_failed",
                     last_observed_premium=current_premium,
+                    lifecycle_order_id=None,
                 )
                 continue
+            # Fresh submit succeeded: FK points at the brand-new
+            # protective_stop substrate row just written by
+            # broker.submit_option_gtc_stop. load_bearing=True so a
+            # missed lookup after broker accept raises CRITICAL
+            # (orphan condition).
             self.option_trailing_store.upsert(
                 position_uid=lifecycle_row.position_uid,
                 occ_symbol=occ,
@@ -5637,6 +5972,17 @@ class TradingEngine:
                 alpaca_stop_order_id=new_order.order_id,
                 stop_order_status=new_order.status,
                 last_observed_premium=current_premium,
+                lifecycle_order_id=self._resolve_trailing_fk_or_preserve(
+                    broker_order_id=new_order.order_id,
+                    client_order_id=new_order.client_order_id,
+                    previous_fk=(
+                        row.lifecycle_order_id if row is not None else None
+                    ),
+                    previous_mirror_order_id=None,
+                    owner=owner,
+                    occ=occ,
+                    load_bearing=True,
+                ),
             )
             logger.info(
                 f"[{owner}] {occ}: option GTC trailing stop synced — "
