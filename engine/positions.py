@@ -228,6 +228,29 @@ def new_spread_id() -> str:
     return uuid.uuid4().hex
 
 
+def spread_substrate_uid(position_id: str) -> str:
+    """Map a spread ``position_id`` to the ``pos_<hex>`` form required
+    by the per-order substrate.
+
+    Single-leg positions originate their substrate ``position_uid`` via
+    ``engine.lifecycle.new_position_uid()`` (always ``pos_<32-hex>``).
+    Spreads historically use a raw 32-hex UUID for ``position_id`` so
+    that ID is preserved on the legacy ``trades.position_id`` column
+    and in alert / log strings. The substrate's ``_validate_position_uid``
+    requires a ``pos_`` prefix, so the spread lifecycle PR (§10.7)
+    derives the substrate uid deterministically from the raw position_id
+    rather than maintaining a side mapping table.
+
+    Idempotent: passing an already-prefixed value returns it unchanged
+    so callers can pass either form without branching.
+    """
+    if not position_id:
+        raise ValueError("position_id must not be empty")
+    if position_id.startswith("pos_"):
+        return position_id
+    return f"pos_{position_id}"
+
+
 def make_spread(
     *,
     strategy_name: str,

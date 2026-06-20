@@ -70,6 +70,7 @@ from engine.positions import (
     make_spread,
     new_spread_id,
     owner_key_for,
+    spread_substrate_uid,
     view_owner_map,
 )
 from engine.option_trailing import OptionTrailingStopStore
@@ -7799,6 +7800,98 @@ class TradingEngine:
                 out.append(pos)
         return out
 
+    # ── Spread lifecycle substrate (§10.7 MLEG spread lifecycle PR) ──
+    #
+    # Mirror of the single-leg ``_lifecycle_begin`` / ``_lifecycle_mark_*``
+    # helpers that live on ``execution.broker.AlpacaBroker``. Spreads
+    # dispatch via the engine's ``_enter_multi_leg`` / ``_drain_spread_fills``
+    # paths rather than ``broker.place_order``, so the lifecycle helpers
+    # need an engine-side home.
+    #
+    # All three follow the same try/except → logger.warning discipline:
+    # a DB I/O failure must never abort the spread submit or finalize
+    # path. ``self.lifecycle_store is None`` is a legal state for the
+    # legacy / test wiring and the helpers are no-ops in that case.
+
+    def _lifecycle_begin_spread(
+        self,
+        *,
+        position_id: str,
+        strategy_name: str,
+        symbol: str,
+        qty: int,
+        entry_client_order_id: str | None = None,
+    ) -> str | None:
+        """Write a ``pending`` position_lifecycle row for a spread before
+        the broker submission goes out. Returns the substrate
+        ``position_uid`` (or None if no store is configured / persistence
+        failed).
+
+        The substrate uid is derived deterministically from the spread's
+        raw ``position_id`` via ``spread_substrate_uid`` so the engine's
+        in-memory ``_positions[position_id]`` and substrate rollups can
+        be joined without a side mapping table.
+        """
+        if self.lifecycle_store is None:
+            return None
+        try:
+            uid = spread_substrate_uid(position_id)
+            self.lifecycle_store.create_pending(
+                position_uid=uid,
+                symbol=symbol,
+                owner_key=position_id,
+                strategy=strategy_name,
+                position_type="spread",
+                entry_qty=float(qty),
+                entry_client_order_id=entry_client_order_id,
+            )
+            return uid
+        except Exception as exc:
+            logger.warning(
+                f"spread lifecycle.create_pending failed for "
+                f"position_id={position_id[:8]} ({strategy_name}): {exc}"
+            )
+            return None
+
+    def _lifecycle_mark_spread_open(
+        self,
+        *,
+        position_id: str,
+        avg_entry_price: float,
+        current_qty: float,
+    ) -> None:
+        """Transition the spread's substrate row to ``open`` after the
+        combo fill confirms. Best-effort; logs and absorbs failures so
+        the drain path cannot crash on a substrate I/O error."""
+        if self.lifecycle_store is None:
+            return
+        try:
+            self.lifecycle_store.mark_open(
+                position_uid=spread_substrate_uid(position_id),
+                avg_entry_price=float(avg_entry_price),
+                current_qty=float(current_qty),
+            )
+        except Exception as exc:
+            logger.warning(
+                f"spread lifecycle.mark_open failed for "
+                f"position_id={position_id[:8]}: {exc}"
+            )
+
+    def _lifecycle_mark_spread_canceled(self, position_id: str) -> None:
+        """Cancel the spread's substrate pending row when the open dispatch
+        rolls back (canceled / rejected with zero fill)."""
+        if self.lifecycle_store is None:
+            return
+        try:
+            self.lifecycle_store.mark_canceled(
+                position_uid=spread_substrate_uid(position_id),
+            )
+        except Exception as exc:
+            logger.warning(
+                f"spread lifecycle.mark_canceled skipped for "
+                f"position_id={position_id[:8]}: {exc}"
+            )
+
     def _enter_multi_leg(
         self,
         *,
@@ -7946,6 +8039,18 @@ class TradingEngine:
         self._spread_owner_strategy[position_id] = strategy
         self._pending_spread_plans[position_id] = plan
         strategy.register_spread(plan.to_open_spread(position_id=position_id))
+        # §10.7 spread lifecycle PR: write the substrate pending row
+        # AFTER pre-registration so the drain path's mark_open finds a
+        # row to advance. Best-effort — failure here logs and leaves the
+        # spread tracked at the engine level so the close path still
+        # works; cycle reconciliation will not see a substrate row but
+        # the legacy in-memory ownership is preserved.
+        self._lifecycle_begin_spread(
+            position_id=position_id,
+            strategy_name=strategy.name,
+            symbol=plan.short_occ,
+            qty=plan.qty,
+        )
         logger.info(
             f"[{strategy.name}] {symbol}: credit spread dispatched "
             f"{plan.short_occ}/{plan.long_occ} width=${plan.width:.0f} "
@@ -7999,6 +8104,21 @@ class TradingEngine:
                     )
                     if plan is not None:
                         open_qty = float(filled_qty or plan.qty)
+                        # §10.7 spread lifecycle PR: transition the
+                        # substrate row to 'open' once the combo fill
+                        # lands. The pending row was created in
+                        # _enter_multi_leg; if it never made it (store
+                        # I/O failure), this mark_open is a no-op via
+                        # the helper's swallowed exception path.
+                        self._lifecycle_mark_spread_open(
+                            position_id=position_id,
+                            avg_entry_price=(
+                                abs(avg_fill_price)
+                                if avg_fill_price is not None
+                                else (plan.net_credit if plan is not None else 0.0)
+                            ),
+                            current_qty=open_qty,
+                        )
                         # plan.max_loss is $/contract; multiplier of 100 is
                         # already folded in by SpreadExecutionPlan. The
                         # short-leg row stores this so the close path can
@@ -8037,6 +8157,11 @@ class TradingEngine:
                     self._spread_owner_strategy.pop(position_id, None)
                     if strategy is not None:
                         strategy.release_spread(position_id)
+                    # §10.7 spread lifecycle PR: roll the substrate
+                    # pending row back to 'canceled' so the owner-key
+                    # lock is released. Mirrors broker's _lifecycle_
+                    # mark_canceled on single-leg open rejections.
+                    self._lifecycle_mark_spread_canceled(position_id)
                 continue
 
             # ── Spread CLOSE ─────────────────────────────────────────────
@@ -8820,6 +8945,32 @@ class TradingEngine:
                 qty=qty,
             ))
             spread_leg_occs.update(leg_symbols)
+            # §10.7 spread lifecycle PR: backfill the substrate row for
+            # spreads that pre-date this PR. Idempotent — if a row
+            # already exists under owner_key=position_id, the helper
+            # returns the existing uid and does nothing. Synthesized
+            # rows carry metadata.synthesized=true so dashboards /
+            # operator CLI can distinguish backfills from bot-originated
+            # rows.
+            if self.lifecycle_store is not None:
+                try:
+                    self.lifecycle_store.synthesize_for_existing(
+                        symbol=short_occ,
+                        owner_key=position_id,
+                        strategy=strategy_name,
+                        position_type="spread",
+                        current_qty=float(qty),
+                        avg_entry_price=net_credit,
+                        position_uid=spread_substrate_uid(position_id),
+                        backfill_note=(
+                            "synthesized at startup from reconstructed spread"
+                        ),
+                    )
+                except Exception as exc:
+                    logger.warning(
+                        f"spread lifecycle backfill failed for "
+                        f"position_id={position_id[:8]}: {exc}"
+                    )
             logger.info(
                 f"restart: reconstructed spread {position_id[:8]} ({underlying}) "
                 f"{short_occ}/{long_occ} width=${width:.0f} "

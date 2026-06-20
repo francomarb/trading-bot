@@ -1347,3 +1347,280 @@ class TestEntryBlockedByExistingPosition:
         assert TradingEngine._entry_blocked_by_existing_position(
             strategy, None
         ) is False
+
+
+# ── §10.7 spread lifecycle substrate (C1) ──────────────────────────────────
+
+
+class TestSpreadLifecycleBegin:
+    """Direct unit tests for the spread substrate write helpers."""
+
+    def _engine(self, tmp_path):
+        strategy = _strategy()
+        engine, _ = _engine(tmp_path, strategy)
+        return engine
+
+    def test_lifecycle_begin_spread_creates_pending_row(self, tmp_path):
+        from engine.positions import spread_substrate_uid
+        engine = self._engine(tmp_path)
+        uid = engine._lifecycle_begin_spread(
+            position_id="abc123",
+            strategy_name="credit_spread",
+            symbol="SPY260618P00568000",
+            qty=2,
+        )
+        assert uid == spread_substrate_uid("abc123") == "pos_abc123"
+        row = engine.lifecycle_store.get_by_position_uid(uid)
+        assert row is not None
+        assert row.status == "pending"
+        assert row.position_type == "spread"
+        assert row.owner_key == "abc123"
+        assert row.strategy == "credit_spread"
+        assert row.symbol == "SPY260618P00568000"
+        assert row.entry_qty == 2.0
+        assert row.current_qty == 0.0
+
+    def test_lifecycle_begin_spread_noop_when_store_missing(self, tmp_path):
+        engine = self._engine(tmp_path)
+        engine.lifecycle_store = None
+        # Must not raise and must return None.
+        assert engine._lifecycle_begin_spread(
+            position_id="abc123",
+            strategy_name="credit_spread",
+            symbol="SPY260618P00568000",
+            qty=1,
+        ) is None
+
+    def test_lifecycle_mark_spread_open_promotes_pending(self, tmp_path):
+        from engine.positions import spread_substrate_uid
+        engine = self._engine(tmp_path)
+        engine._lifecycle_begin_spread(
+            position_id="abc123", strategy_name="credit_spread",
+            symbol="SPY260618P00568000", qty=1,
+        )
+        engine._lifecycle_mark_spread_open(
+            position_id="abc123",
+            avg_entry_price=1.45,
+            current_qty=1.0,
+        )
+        row = engine.lifecycle_store.get_by_position_uid(
+            spread_substrate_uid("abc123")
+        )
+        assert row.status == "open"
+        assert row.avg_entry_price == pytest.approx(1.45)
+        assert row.current_qty == 1.0
+
+    def test_lifecycle_mark_spread_canceled_rolls_back(self, tmp_path):
+        from engine.positions import spread_substrate_uid
+        engine = self._engine(tmp_path)
+        engine._lifecycle_begin_spread(
+            position_id="abc123", strategy_name="credit_spread",
+            symbol="SPY260618P00568000", qty=1,
+        )
+        engine._lifecycle_mark_spread_canceled("abc123")
+        row = engine.lifecycle_store.get_by_position_uid(
+            spread_substrate_uid("abc123")
+        )
+        assert row.status == "canceled"
+
+    def test_lifecycle_helpers_absorb_store_errors(self, tmp_path):
+        """A DB failure must NEVER abort the spread submit / drain."""
+        engine = self._engine(tmp_path)
+        # Replace the store with one whose every write raises.
+        broken = MagicMock()
+        broken.create_pending.side_effect = RuntimeError("disk full")
+        broken.mark_open.side_effect = RuntimeError("disk full")
+        broken.mark_canceled.side_effect = RuntimeError("disk full")
+        engine.lifecycle_store = broken
+        # All three must swallow the exception and return cleanly.
+        assert engine._lifecycle_begin_spread(
+            position_id="abc123", strategy_name="credit_spread",
+            symbol="SPY260618P00568000", qty=1,
+        ) is None
+        engine._lifecycle_mark_spread_open(
+            position_id="abc123", avg_entry_price=1.0, current_qty=1.0,
+        )
+        engine._lifecycle_mark_spread_canceled("abc123")
+
+
+class TestSpreadLifecycleWiredInEnter:
+    """_enter_multi_leg writes the substrate pending row after dispatch."""
+
+    def test_pending_row_written_after_accept(self, tmp_path):
+        from engine.positions import spread_substrate_uid
+        strategy = _strategy()
+        engine, broker = _engine(tmp_path, strategy)
+        broker.dispatch_spread_order.return_value = OrderResult(
+            status=OrderStatus.ACCEPTED, order_id="combo-1",
+            symbol="SPY260618P00568000", requested_qty=1,
+            filled_qty=0.0, avg_fill_price=0.0,
+            raw_status="accepted", message="",
+        )
+        pick = _pick()
+        with patch.object(strategy, "build_spread_execution",
+                          return_value=SimpleNamespace(
+                              short_occ=pick.short_occ, long_occ=pick.long_occ,
+                              qty=1, net_credit=pick.net_credit,
+                              width=pick.width, max_loss=pick.max_loss,
+                              limit_price=-pick.net_credit,
+                              legs=[
+                                  SimpleNamespace(occ_symbol=pick.short_occ,
+                                                  side="SELL", opening=True,
+                                                  ratio_qty=1),
+                                  SimpleNamespace(occ_symbol=pick.long_occ,
+                                                  side="BUY", opening=True,
+                                                  ratio_qty=1),
+                              ],
+                              to_open_spread=lambda position_id: _open_spread(
+                                  position_id=position_id),
+                          )):
+            engine._enter_multi_leg(
+                strategy=strategy, symbol="SPY", underlying_close=570.0,
+                notional_cap=1000.0, signal_key=_SIGNAL_KEY,
+                signal_bar=_SIGNAL_BAR, strategy_statuses={},
+                strategy_reasons={},
+            )
+        assert broker.dispatch_spread_order.called
+        # The newly-registered spread must have a pending substrate row.
+        position_id = next(iter(engine._spread_owner_strategy.keys()))
+        row = engine.lifecycle_store.get_by_position_uid(
+            spread_substrate_uid(position_id)
+        )
+        assert row is not None
+        assert row.status == "pending"
+        assert row.position_type == "spread"
+
+
+class TestSpreadLifecycleWiredInDrain:
+    """_drain_spread_fills advances the substrate row on terminal events."""
+
+    def _pre_register_with_pending(self, engine, strategy, position_id):
+        from engine.positions import make_spread, PositionLeg
+        engine._positions[position_id] = make_spread(
+            strategy_name="credit_spread", position_id=position_id,
+            legs=[PositionLeg("SPY260618P00568000", -1, side="SELL"),
+                  PositionLeg("SPY260618P00558000", 1, side="BUY")],
+        )
+        engine._spread_owner_strategy[position_id] = strategy
+        engine._pending_spread_plans[position_id] = _pick()
+        strategy.register_spread(_open_spread(position_id))
+        engine._lifecycle_begin_spread(
+            position_id=position_id,
+            strategy_name="credit_spread",
+            symbol="SPY260618P00568000",
+            qty=1,
+        )
+
+    def test_open_filled_marks_substrate_open(self, tmp_path):
+        from engine.positions import spread_substrate_uid
+        strategy = _strategy()
+        engine, broker = _engine(tmp_path, strategy)
+        self._pre_register_with_pending(engine, strategy, "p1")
+        broker.drain_spread_fills.return_value = [
+            ("p1", "credit_spread", False, "filled", 1.0, -1.50, "combo-1", -1.45),
+        ]
+        engine._drain_spread_fills()
+        row = engine.lifecycle_store.get_by_position_uid(
+            spread_substrate_uid("p1")
+        )
+        assert row.status == "open"
+        assert row.current_qty == 1.0
+        assert row.avg_entry_price == pytest.approx(1.50)
+
+    def test_open_canceled_marks_substrate_canceled(self, tmp_path):
+        from engine.positions import spread_substrate_uid
+        strategy = _strategy()
+        engine, broker = _engine(tmp_path, strategy)
+        self._pre_register_with_pending(engine, strategy, "p1")
+        broker.drain_spread_fills.return_value = [
+            ("p1", "credit_spread", False, "canceled", 0.0, None, "combo-1", -1.45),
+        ]
+        engine._drain_spread_fills()
+        row = engine.lifecycle_store.get_by_position_uid(
+            spread_substrate_uid("p1")
+        )
+        assert row.status == "canceled"
+
+
+class TestSpreadLifecycleBackfill:
+    """_restore_spread_positions synthesizes a substrate row for spreads
+    that pre-date the spread-lifecycle PR."""
+
+    def test_backfill_creates_open_row_with_synthesized_metadata(self, tmp_path):
+        from engine.positions import spread_substrate_uid
+        strategy = _strategy()
+        engine, broker = _engine(tmp_path, strategy)
+        # Seed the trade log with an open spread (entries, no exits).
+        engine.trade_logger.log_spread_fill(
+            position_id="legacy_spread_a",
+            strategy="credit_spread",
+            short_occ="SPY260618P00568000",
+            long_occ="SPY260618P00558000",
+            qty=1, net_price=1.45, order_id="combo-legacy",
+            opening=True,
+        )
+        # Broker must show both legs to allow reconstruction.
+        snapshot = SimpleNamespace(
+            account=SimpleNamespace(
+                open_positions={
+                    "SPY260618P00568000": SimpleNamespace(qty=-1, avg_entry_price=1.55),
+                    "SPY260618P00558000": SimpleNamespace(qty=1, avg_entry_price=0.10),
+                },
+                equity=100_000.0,
+            ),
+            open_orders=[],
+        )
+        conflicts: set[str] = set()
+        engine._restore_spread_positions(snapshot, conflicts)
+        # Backfill row exists, open, with synthesized metadata.
+        uid = spread_substrate_uid("legacy_spread_a")
+        row = engine.lifecycle_store.get_by_position_uid(uid)
+        assert row is not None
+        assert row.status == "open"
+        assert row.position_type == "spread"
+        assert row.owner_key == "legacy_spread_a"
+        assert row.metadata.get("synthesized") is True
+
+    def test_backfill_is_idempotent(self, tmp_path):
+        from engine.positions import spread_substrate_uid
+        strategy = _strategy()
+        engine, broker = _engine(tmp_path, strategy)
+        engine.trade_logger.log_spread_fill(
+            position_id="legacy_spread_a",
+            strategy="credit_spread",
+            short_occ="SPY260618P00568000",
+            long_occ="SPY260618P00558000",
+            qty=1, net_price=1.45, order_id="combo-legacy",
+            opening=True,
+        )
+        snapshot = SimpleNamespace(
+            account=SimpleNamespace(
+                open_positions={
+                    "SPY260618P00568000": SimpleNamespace(qty=-1, avg_entry_price=1.55),
+                    "SPY260618P00558000": SimpleNamespace(qty=1, avg_entry_price=0.10),
+                },
+                equity=100_000.0,
+            ),
+            open_orders=[],
+        )
+        engine._restore_spread_positions(snapshot, set())
+        engine._restore_spread_positions(snapshot, set())
+        # Still exactly one row.
+        uid = spread_substrate_uid("legacy_spread_a")
+        row = engine.lifecycle_store.get_by_position_uid(uid)
+        assert row is not None
+
+
+class TestSpreadSubstrateUidHelper:
+    def test_prefixes_raw_hex(self):
+        from engine.positions import spread_substrate_uid
+        assert spread_substrate_uid("a26634") == "pos_a26634"
+
+    def test_idempotent_when_already_prefixed(self):
+        from engine.positions import spread_substrate_uid
+        assert spread_substrate_uid("pos_a26634") == "pos_a26634"
+
+    def test_empty_raises(self):
+        from engine.positions import spread_substrate_uid
+        with pytest.raises(ValueError):
+            spread_substrate_uid("")
