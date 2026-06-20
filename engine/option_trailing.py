@@ -96,7 +96,16 @@ def _utc_now_iso() -> str:
 
 @dataclass(frozen=True)
 class OptionTrailingStopRow:
-    """One durable trailing-stop row for a single-leg option position."""
+    """One durable trailing-stop row for a single-leg option position.
+
+    ``lifecycle_order_id`` is the FK into ``position_lifecycle_orders``
+    (the autoincrement PK ``id``) and points at the substrate row that
+    represents the currently-live broker stop — either the original
+    ``protective_stop`` row or, after a ratchet, the latest
+    ``replacement_stop`` row. ``None`` on legacy rows written before
+    the split; populated for every new submit / replace after PR #59
+    §10.4.
+    """
 
     position_uid: str
     occ_symbol: str
@@ -112,6 +121,7 @@ class OptionTrailingStopRow:
     stop_order_status: str | None
     last_observed_premium: float | None
     last_updated_at: str
+    lifecycle_order_id: int | None = None
 
 
 class OptionTrailingStopStore:
@@ -136,7 +146,18 @@ class OptionTrailingStopStore:
         alpaca_stop_order_id: str | None = None,
         stop_order_status: str | None = None,
         last_observed_premium: float | None = None,
+        lifecycle_order_id: int | None = None,
     ) -> None:
+        """Insert or update the trailing-state row for a single-leg position.
+
+        ``lifecycle_order_id`` should be the autoincrement ``id`` of
+        the ``position_lifecycle_orders`` row representing the
+        currently-live broker stop. When supplied alongside the legacy
+        ``alpaca_stop_order_id`` / ``stop_order_status`` mirror, the
+        substrate row is treated as authoritative for identity / status
+        by the join-based read; the mirror columns remain populated
+        during migration until the follow-up cleanup PR removes them.
+        """
         if not position_uid:
             raise ValueError("position_uid must not be empty")
         if not occ_symbol:
@@ -154,8 +175,8 @@ class OptionTrailingStopStore:
                 position_uid, occ_symbol, strategy, owner_key, qty,
                 entry_premium, hwm_premium, trail_activation_pct, trail_pct,
                 current_stop_price, alpaca_stop_order_id, stop_order_status,
-                last_observed_premium, last_updated_at
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                last_observed_premium, last_updated_at, lifecycle_order_id
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             ON CONFLICT(position_uid) DO UPDATE SET
                 occ_symbol = excluded.occ_symbol,
                 strategy = excluded.strategy,
@@ -169,7 +190,8 @@ class OptionTrailingStopStore:
                 alpaca_stop_order_id = excluded.alpaca_stop_order_id,
                 stop_order_status = excluded.stop_order_status,
                 last_observed_premium = excluded.last_observed_premium,
-                last_updated_at = excluded.last_updated_at
+                last_updated_at = excluded.last_updated_at,
+                lifecycle_order_id = excluded.lifecycle_order_id
             """,
             (
                 position_uid,
@@ -186,6 +208,7 @@ class OptionTrailingStopStore:
                 stop_order_status,
                 last_observed_premium,
                 now,
+                lifecycle_order_id,
             ),
         )
         self._conn.commit()
@@ -196,7 +219,7 @@ class OptionTrailingStopStore:
             SELECT position_uid, occ_symbol, strategy, owner_key, qty,
                    entry_premium, hwm_premium, trail_activation_pct, trail_pct,
                    current_stop_price, alpaca_stop_order_id, stop_order_status,
-                   last_observed_premium, last_updated_at
+                   last_observed_premium, last_updated_at, lifecycle_order_id
             FROM option_trailing_stops
             WHERE occ_symbol = ?
             """,
