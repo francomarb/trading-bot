@@ -4379,6 +4379,7 @@ class TestGenericSingleLegOptionTrailingStops:
             symbol="SPY260618C00746000",
             qty=3.0,
             stop_price=17.14,
+            position_uid="pos_abc123",
         )
         row = engine.option_trailing_store.get_by_occ("SPY260618C00746000")
         assert row.position_uid == "pos_abc123"
@@ -4420,6 +4421,7 @@ class TestGenericSingleLegOptionTrailingStops:
             symbol="SPY260618C00746000",
             qty=3.0,
             stop_price=13.17,
+            position_uid=lifecycle_row.position_uid,
         )
         trailing_row = engine.option_trailing_store.get_by_occ("SPY260618C00746000")
         assert trailing_row.position_uid == lifecycle_row.position_uid
@@ -4506,6 +4508,7 @@ class TestGenericSingleLegOptionTrailingStops:
             order_id="old-stop",
             qty=3.0,
             stop_price=18.70,
+            position_uid="pos_abc123",
         )
         broker.get_order_audit_snapshot.assert_not_called()
         assert not (tmp_path / "option-stop-audit.db").exists()
@@ -4757,6 +4760,7 @@ class TestGenericSingleLegOptionTrailingStops:
             order_id="day-stop",
             qty=3.0,
             stop_price=17.14,
+            position_uid="pos_abc123",
         )
         row = engine.option_trailing_store.get_by_occ("SPY260618C00746000")
         assert row.current_stop_price == pytest.approx(17.14)
@@ -4838,6 +4842,7 @@ class TestGenericSingleLegOptionTrailingStops:
             order_id="day-stop",
             qty=3.0,
             stop_price=17.14,
+            position_uid="pos_abc123",
         )
 
     def test_qty_mismatch_is_corrected_with_atomic_replace(self, tmp_path):
@@ -4886,6 +4891,7 @@ class TestGenericSingleLegOptionTrailingStops:
             order_id="undersized-stop",
             qty=3.0,
             stop_price=17.14,
+            position_uid="pos_abc123",
         )
 
     def test_missing_tif_uses_matching_durable_gtc_identity(self, tmp_path):

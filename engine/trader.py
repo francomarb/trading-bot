@@ -5477,12 +5477,14 @@ class TradingEngine:
                             qty=qty,
                             stop_price=replacement_stop,
                             client_order_id=replacement_client_order_id,
+                            position_uid=lifecycle_row.position_uid,
                         )
                     else:
                         new_order = self.broker.replace_option_stop(
                             order_id=existing.order_id,
                             qty=qty,
                             stop_price=replacement_stop,
+                            position_uid=lifecycle_row.position_uid,
                         )
                 except Exception as exc:
                     replace_call_end = (
@@ -5599,6 +5601,7 @@ class TradingEngine:
                     symbol=occ,
                     qty=qty,
                     stop_price=desired_stop,
+                    position_uid=lifecycle_row.position_uid,
                 )
             except Exception as exc:
                 logger.error(
