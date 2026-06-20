@@ -841,6 +841,142 @@ class PositionLifecycleOrdersStore:
         )
         self._conn.commit()
 
+    def attach_or_update_order_id_for_walk_step(
+        self,
+        *,
+        client_order_id: str,
+        order_id: str,
+        submitted_at: str | None = None,
+    ) -> bool:
+        """Attach the broker ``order_id`` on a non-terminal close row,
+        overwriting any previously-attached id.
+
+        Differs from ``attach_broker_order_id`` in two ways:
+
+          1. Accepts overwrites when the row is still non-terminal —
+             supports walk-and-market progression where each step's
+             broker order_id replaces the previous one (only one step
+             is alive at the broker at any moment; the substrate row
+             must track the *current* in-flight order so the cycle
+             reconciler can poll the right id after a crash).
+
+          2. Returns ``True`` when the row was updated, ``False`` if
+             the row doesn't exist or is already terminal — callers
+             can log and move on without raising. The single-leg
+             ``attach_broker_order_id`` raises in these cases because
+             single-leg attaches are exactly-once.
+
+        Used by the spread close path (§10.7). The eager-attach
+        (submit-time, via worker on_submitted callback queued to the
+        engine drain) is what closes the restart-gap: a crash between
+        broker submit and the next drain still leaves the substrate
+        row carrying the live broker order_id, so the cycle / startup
+        reconciler can resolve it via REST.
+        """
+        now = submitted_at or _utc_now_iso()
+        existing = self._conn.execute(
+            "SELECT status FROM position_lifecycle_orders "
+            "WHERE client_order_id = ?",
+            (client_order_id,),
+        ).fetchone()
+        if existing is None:
+            return False
+        if existing[0] in TERMINAL_ORDER_STATUSES:
+            return False
+        self._conn.execute(
+            "UPDATE position_lifecycle_orders "
+            "SET order_id = ?, "
+            "    submitted_at = COALESCE(submitted_at, ?), "
+            "    last_observed_at = ? "
+            "WHERE client_order_id = ?",
+            (order_id, now, now, client_order_id),
+        )
+        self._conn.commit()
+        return True
+
+    def mark_terminal_after_dispatch(
+        self,
+        *,
+        client_order_id: str,
+        broker_order_id: str | None,
+        status: str,
+        filled_qty: float,
+        avg_fill_price: float | None,
+        broker_updated_at: str | None = None,
+    ) -> None:
+        """Advance a per-order row from ``pending`` to a terminal status
+        in one call, attaching the broker order_id along the way.
+
+        Designed for the spread close path (§10.7): the substrate row is
+        inserted ``pending`` before ``dispatch_spread_order(closing=True)``
+        and the broker order_id is only observed via the drain. This
+        method does the attach + status update without invoking the
+        single-leg-scoped ``apply_order_event`` pipeline (no trades
+        UPSERT, no position rollup, no position-status CTE — none of
+        those apply to spreads).
+
+        ``status`` must be one of ``filled / canceled / rejected /
+        partially_filled / working / unknown``. Terminal states stamp
+        ``terminal_at``; non-terminal advances leave it NULL.
+
+        ``broker_order_id`` may be None — for spreads whose worker
+        rolled back before any broker order was assigned (e.g. dry run
+        canceled, build_mleg_request raised), we still want to mark
+        the row terminal so the position is unlocked.
+
+        Raises ``ValueError`` if the row does not exist.
+        """
+        _validate_status(status)
+        now = _utc_now_iso()
+        broker_updated_at = broker_updated_at or now
+        existing = self._conn.execute(
+            "SELECT status, order_id FROM position_lifecycle_orders "
+            "WHERE client_order_id = ?",
+            (client_order_id,),
+        ).fetchone()
+        if existing is None:
+            raise ValueError(
+                f"unknown client_order_id: {client_order_id!r}"
+            )
+        current_status, current_order_id = existing
+        # Idempotent: re-applying the same terminal status is a no-op
+        # (the row already reflects it). Refuse to walk terminal → other.
+        if current_status in TERMINAL_ORDER_STATUSES:
+            return
+        # If broker_order_id is provided and the row already has one,
+        # keep the existing (immutable). Otherwise attach.
+        order_id_to_set = current_order_id or broker_order_id
+        is_terminal = status in TERMINAL_ORDER_STATUSES
+        self._conn.execute(
+            """
+            UPDATE position_lifecycle_orders
+            SET status                          = ?,
+                filled_qty                      = ?,
+                avg_fill_price                  = ?,
+                order_id                        = ?,
+                submitted_at                    = COALESCE(submitted_at, ?),
+                last_observed_broker_updated_at = ?,
+                last_observed_at                = ?,
+                terminal_at                     = CASE
+                    WHEN ? = 1 THEN ?
+                    ELSE terminal_at
+                END
+            WHERE client_order_id = ?
+            """,
+            (
+                status,
+                float(filled_qty),
+                avg_fill_price,
+                order_id_to_set,
+                now,
+                broker_updated_at,
+                now,
+                1 if is_terminal else 0, now,
+                client_order_id,
+            ),
+        )
+        self._conn.commit()
+
     # ── Reads ─────────────────────────────────────────────────────────
 
     def get_by_id(self, row_id: int) -> PositionLifecycleOrderRow | None:
@@ -927,6 +1063,52 @@ class PositionLifecycleOrdersStore:
             + f" WHERE position_uid = ? AND status IN ({placeholders}) "
             "ORDER BY id ASC",
             (position_uid, *sorted(NON_TERMINAL_ORDER_STATUSES)),
+        ).fetchall()
+        return [_row_from_tuple(r) for r in rows]
+
+    def get_non_terminal_spread_close_rows(
+        self,
+    ) -> list[PositionLifecycleOrderRow]:
+        """All non-terminal close-side rows (role IN ('exit',
+        'partial_close')) whose parent position is a spread.
+
+        Used by the spread close reconciler (cycle + startup) to walk
+        rows whose state may have advanced at the broker without the
+        WebSocket noticing. ``apply_order_event`` is single-leg-scoped;
+        spreads use ``mark_terminal_after_dispatch`` instead, so they
+        need a dedicated walk that doesn't intermix with the
+        single-leg reconciler.
+
+        Returns rows in id-ascending order (insertion order).
+        Includes rows with order_id IS NULL (e.g. the partial_close
+        residual placeholder); callers must guard their broker fetch
+        on order_id not being None.
+        """
+        roles = ("exit", "partial_close")
+        status_placeholders = ", ".join("?" for _ in NON_TERMINAL_ORDER_STATUSES)
+        rows = self._conn.execute(
+            f"""
+            SELECT plo.id, plo.position_uid, plo.role, plo.order_id,
+                   plo.client_order_id, plo.order_type, plo.order_class,
+                   plo.time_in_force, plo.side, plo.intended_qty,
+                   plo.intended_stop_price, plo.intended_trigger_price,
+                   plo.intended_limit_price, plo.intended_take_profit_price,
+                   plo.parent_order_id, plo.replaces_order_id,
+                   plo.origin_kind, plo.operator_command_uid,
+                   plo.slippage_benchmark_price, plo.slippage_benchmark_kind,
+                   plo.slippage_benchmark_timestamp,
+                   plo.slippage_measurement_quality,
+                   plo.status, plo.filled_qty, plo.avg_fill_price,
+                   plo.created_at, plo.submitted_at, plo.terminal_at,
+                   plo.last_observed_broker_updated_at, plo.last_observed_at
+            FROM position_lifecycle_orders plo
+            JOIN position_lifecycle pl ON pl.position_uid = plo.position_uid
+            WHERE pl.position_type = 'spread'
+              AND plo.role IN (?, ?)
+              AND plo.status IN ({status_placeholders})
+            ORDER BY plo.id ASC
+            """,
+            (roles[0], roles[1], *sorted(NON_TERMINAL_ORDER_STATUSES)),
         ).fetchall()
         return [_row_from_tuple(r) for r in rows]
 

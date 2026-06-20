@@ -391,6 +391,16 @@ class TradeLogger:
         self._path = path or settings.TRADE_LOG_DB
         self._conn: sqlite3.Connection | None = None
 
+    @property
+    def path(self) -> str:
+        """Public accessor for the trade DB path. Used by the spread
+        close path (§10.7 fix-up R3) to pass to ``SpreadExecutionWorker``
+        for synchronous, durable substrate writes from the worker
+        thread (closing the crash-between-submit-and-drain gap that
+        the in-memory queue could not).
+        """
+        return self._path
+
     def _ensure_db(self) -> sqlite3.Connection:
         """Create the database and table if they don't exist yet.
 

@@ -48,6 +48,7 @@ import math
 import os
 import re
 import signal
+import sqlite3
 import threading
 import time
 import uuid
@@ -70,6 +71,7 @@ from engine.positions import (
     make_spread,
     new_spread_id,
     owner_key_for,
+    spread_substrate_uid,
     view_owner_map,
 )
 from engine.option_trailing import OptionTrailingStopStore
@@ -546,9 +548,10 @@ class TradingEngine:
         # position_id → SpreadExecutionPlan for spreads pending their async
         # combo fill — lets _drain_spread_fills finalize or roll back.
         self._pending_spread_plans: dict[str, object] = {}
-        # position_ids with a closing combo in flight — skipped by the exit
-        # path so a stale "should exit" signal cannot double-submit a close.
-        self._spreads_pending_close: set[str] = set()
+        # (§10.7 C4) `_spreads_pending_close` retired — the substrate's
+        # uniq_one_active_close_per_position partial unique index on
+        # `position_lifecycle_orders` is the durable, restart-safe
+        # analog. Read via `_spread_has_pending_close(position_id)`.
 
         # Entry fill prices: symbol → avg fill price at entry ($/share).
         # Used to compute realized P&L when a position closes, which is fed
@@ -818,6 +821,18 @@ class TradingEngine:
                 f"non-terminal rows over time via the cycle "
                 f"reconciler."
             )
+        # §10.7 spread close reconciler — closes the restart-gap.
+        try:
+            self._reconcile_substrate_spread_closes(
+                startup_snapshot, reason="startup",
+            )
+        except Exception as exc:
+            logger.critical(
+                f"spread close startup reconcile raised: "
+                f"{type(exc).__name__}: {exc}. Cycle path will retry "
+                f"non-terminal rows over time via the cycle "
+                f"reconciler."
+            )
 
         # Operator Controls Phase A PR-2 — restore sticky halt from disk.
         # If a halt was engaged before the previous shutdown, re-engage
@@ -1056,8 +1071,20 @@ class TradingEngine:
             self._process_stream_stop_fills(snapshot)
             self._detect_external_closes(snapshot)
             self._drain_lifecycle_attaches()
+            # §10.7 fix-up — drain spread close per-submit attaches so
+            # substrate.order_id stays current with the broker's
+            # latest walk-step order. This is what closes the restart-
+            # gap on a crash between submit and the close drain.
+            self._drain_lifecycle_close_attaches()
             self._drain_lifecycle_events(snapshot)
             self._reconcile_substrate_cycle(snapshot)
+            # §10.7: spread close reconciler — runs every cycle so
+            # rows whose broker order became terminal while the
+            # stream was disconnected get resolved without waiting
+            # for next startup.
+            self._reconcile_substrate_spread_closes(
+                snapshot, reason="cycle",
+            )
             self._drain_option_fills()
             self._drain_spread_fills()
             self._sync_option_trailing_stops(snapshot)
@@ -1125,7 +1152,7 @@ class TradingEngine:
             # never gated by per-symbol bar fetch failures, stale-data
             # rejections, or empty decision frames. The slot loop below
             # may still try the BEAR override per-symbol, but those calls
-            # become no-ops via _spreads_pending_close after the sweep
+            # become no-ops via the substrate pending-close check after
             # already dispatched the close.
             if current_regime is MarketRegime.BEAR:
                 self._sweep_bear_spread_exits()
@@ -7004,6 +7031,59 @@ class TradingEngine:
                     f"REST reconcilers skip it. Inspect manually."
                 )
 
+    def _drain_lifecycle_close_attaches(self) -> None:
+        """§10.7 fix-up — apply spread close per-submit attaches.
+
+        Spread close workers queue (engine_substrate_cloid,
+        broker_order_id, None) on every successful broker submit
+        (single-shot AND each walk step). The drain calls the
+        walk-step variant which permits overwriting order_id while
+        the row is non-terminal — each subsequent step's broker
+        order_id replaces the previous one as the in-flight order.
+
+        This is what closes the restart-gap: a crash after submit
+        leaves the substrate row carrying the broker order_id, so
+        the cycle / startup reconciler can resolve it via REST. Best-
+        effort per-row failure handling matches `_drain_lifecycle_
+        attaches` for the single-leg path.
+        """
+        if self.lifecycle_orders_store is None:
+            return
+        try:
+            attaches = self.broker.drain_lifecycle_close_attaches()
+        except AttributeError:
+            # Broker fixture older than the spread-attach queue
+            # (test mocks); no work to do.
+            return
+        for client_order_id, order_id, submitted_at in attaches:
+            try:
+                updated = (
+                    self.lifecycle_orders_store
+                    .attach_or_update_order_id_for_walk_step(
+                        client_order_id=client_order_id,
+                        order_id=order_id,
+                        submitted_at=submitted_at,
+                    )
+                )
+                if not updated:
+                    # Row doesn't exist or is terminal. Both are
+                    # benign for the walk-step path: a terminal row
+                    # means the drain saw the close before this
+                    # attach drained (race; harmless).
+                    logger.debug(
+                        f"spread close attach no-op for "
+                        f"{client_order_id} → {order_id} "
+                        f"(missing or terminal)"
+                    )
+            except Exception as exc:
+                logger.critical(
+                    f"spread close attach FAILED for "
+                    f"{client_order_id} → {order_id}: {exc}. The "
+                    f"broker order is live; cycle reconciliation "
+                    f"may not resolve it on restart if order_id "
+                    f"stays NULL."
+                )
+
     def _drain_lifecycle_events(
         self, snapshot: "BrokerSnapshot | None" = None,
     ) -> None:
@@ -7292,6 +7372,95 @@ class TradingEngine:
             broker_updated_at=updated_at,
             execution_id=None,
         )
+
+    def _reconcile_substrate_spread_closes(
+        self, snapshot: "BrokerSnapshot", *, reason: str,
+    ) -> None:
+        """§10.7: walk non-terminal spread close substrate rows and
+        resolve any whose broker order is now terminal.
+
+        Separate from `_reconcile_substrate_via_rest` because spreads
+        cannot go through `apply_order_event` (single-leg-scoped
+        trades UPSERT, position-rollup CTE doesn't apply to spread
+        sides). Uses `mark_terminal_after_dispatch` to advance per-
+        order rows individually.
+
+        ``reason`` is 'cycle' or 'startup' — flows through to logs so
+        the operator can grep advance events by source. Cycle should
+        run every cycle; startup once at boot. The query is bounded
+        by the number of open spreads × 2 close roles, so unlike
+        single-leg there's no need for a REST-call cap.
+
+        Skips rows with order_id IS NULL — the partial_close
+        residual placeholder has no broker order to query and is
+        cleared either by the next dispatch cycle (which advances
+        the same row) or by an operator action.
+        """
+        if (
+            self.lifecycle_orders_store is None
+            or self.lifecycle_store is None
+        ):
+            return
+        try:
+            rows = (
+                self.lifecycle_orders_store
+                .get_non_terminal_spread_close_rows()
+            )
+        except Exception as exc:
+            logger.critical(
+                f"spread close {reason} reconcile: query failed: "
+                f"{type(exc).__name__}: {exc}"
+            )
+            return
+        if not rows:
+            return
+        open_by_id = {
+            o.order_id: o for o in snapshot.open_orders
+            if getattr(o, "order_id", None)
+        }
+        for row in rows:
+            oid = row.order_id
+            if oid is None:
+                continue  # placeholder row; nothing to fetch
+            if oid in open_by_id:
+                continue  # still working at the broker
+            try:
+                broker_order = self.broker._with_retry(
+                    lambda oid=oid: self.broker._api.get_order_by_id(oid),
+                    op_desc=f"spread_close_reconcile_{reason}({oid})",
+                )
+            except Exception as exc:
+                logger.critical(
+                    f"spread close {reason} reconcile: get_order_by_id "
+                    f"failed for {oid}: {type(exc).__name__}: {exc}"
+                )
+                continue
+            event = self._build_substrate_event_from_broker_order(
+                broker_order, oid,
+            )
+            if event is None:
+                continue
+            try:
+                self.lifecycle_orders_store.mark_terminal_after_dispatch(
+                    client_order_id=row.client_order_id,
+                    broker_order_id=oid,
+                    status=event.status,
+                    filled_qty=event.filled_qty,
+                    avg_fill_price=event.avg_fill_price,
+                    broker_updated_at=event.broker_updated_at,
+                )
+                logger.info(
+                    f"spread close {reason} reconcile: order_id={oid} "
+                    f"role={row.role} advanced to status={event.status} "
+                    f"qty={event.filled_qty}"
+                )
+            except Exception as exc:
+                logger.critical(
+                    f"spread close {reason} reconcile: "
+                    f"mark_terminal_after_dispatch raised for "
+                    f"client_order_id={row.client_order_id}: "
+                    f"{type(exc).__name__}: {exc}"
+                )
 
     def _drain_option_fills(self) -> None:
         """
@@ -7718,7 +7887,7 @@ class TradingEngine:
                 "expiration": str(spread.expiration_date),
                 "net_credit": spread.net_credit,
                 "qty": spread.qty,
-                "pending_close": position_id in self._spreads_pending_close,
+                "pending_close": self._spread_has_pending_close(position_id),
             })
         return out
 
@@ -7756,7 +7925,7 @@ class TradingEngine:
                 qty=spread.qty,
                 broker_positions=broker_positions,
                 underlying_price=self._last_underlying_prices.get(underlying),
-                pending_close=position_id in self._spreads_pending_close,
+                pending_close=self._spread_has_pending_close(position_id),
                 today=today,
                 stop_loss_multiple=float(
                     getattr(config, "stop_loss_multiple", 2.0)
@@ -7798,6 +7967,282 @@ class TradingEngine:
             if primary is not None and owner_key_for(primary.symbol) == underlying:
                 out.append(pos)
         return out
+
+    # ── Spread lifecycle substrate (§10.7 MLEG spread lifecycle PR) ──
+    #
+    # Mirror of the single-leg ``_lifecycle_begin`` / ``_lifecycle_mark_*``
+    # helpers that live on ``execution.broker.AlpacaBroker``. Spreads
+    # dispatch via the engine's ``_enter_multi_leg`` / ``_drain_spread_fills``
+    # paths rather than ``broker.place_order``, so the lifecycle helpers
+    # need an engine-side home.
+    #
+    # All three follow the same try/except → logger.warning discipline:
+    # a DB I/O failure must never abort the spread submit or finalize
+    # path. ``self.lifecycle_store is None`` is a legal state for the
+    # legacy / test wiring and the helpers are no-ops in that case.
+
+    def _lifecycle_begin_spread(
+        self,
+        *,
+        position_id: str,
+        strategy_name: str,
+        symbol: str,
+        qty: int,
+        entry_client_order_id: str | None = None,
+    ) -> str | None:
+        """Write a ``pending`` position_lifecycle row for a spread before
+        the broker submission goes out. Returns the substrate
+        ``position_uid`` (or None if no store is configured / persistence
+        failed).
+
+        The substrate uid is derived deterministically from the spread's
+        raw ``position_id`` via ``spread_substrate_uid`` so the engine's
+        in-memory ``_positions[position_id]`` and substrate rollups can
+        be joined without a side mapping table.
+        """
+        if self.lifecycle_store is None:
+            return None
+        try:
+            uid = spread_substrate_uid(position_id)
+            self.lifecycle_store.create_pending(
+                position_uid=uid,
+                symbol=symbol,
+                owner_key=position_id,
+                strategy=strategy_name,
+                position_type="spread",
+                entry_qty=float(qty),
+                entry_client_order_id=entry_client_order_id,
+            )
+            return uid
+        except Exception as exc:
+            logger.warning(
+                f"spread lifecycle.create_pending failed for "
+                f"position_id={position_id[:8]} ({strategy_name}): {exc}"
+            )
+            return None
+
+    def _lifecycle_mark_spread_open(
+        self,
+        *,
+        position_id: str,
+        avg_entry_price: float,
+        current_qty: float,
+    ) -> None:
+        """Transition the spread's substrate row to ``open`` after the
+        combo fill confirms. Best-effort; logs and absorbs failures so
+        the drain path cannot crash on a substrate I/O error."""
+        if self.lifecycle_store is None:
+            return
+        try:
+            self.lifecycle_store.mark_open(
+                position_uid=spread_substrate_uid(position_id),
+                avg_entry_price=float(avg_entry_price),
+                current_qty=float(current_qty),
+            )
+        except Exception as exc:
+            logger.warning(
+                f"spread lifecycle.mark_open failed for "
+                f"position_id={position_id[:8]}: {exc}"
+            )
+
+    def _lifecycle_mark_spread_canceled(self, position_id: str) -> None:
+        """Cancel the spread's substrate pending row when the open dispatch
+        rolls back (canceled / rejected with zero fill)."""
+        if self.lifecycle_store is None:
+            return
+        try:
+            self.lifecycle_store.mark_canceled(
+                position_uid=spread_substrate_uid(position_id),
+            )
+        except Exception as exc:
+            logger.warning(
+                f"spread lifecycle.mark_canceled skipped for "
+                f"position_id={position_id[:8]}: {exc}"
+            )
+
+    # ── Substrate-backed pending-close query (§10.7 C4) ──
+    #
+    # The single source of truth for "does this spread have a close in
+    # flight?" — replaces `_spreads_pending_close` (in-memory only).
+    # Restart-safe via the substrate's on-disk rows.
+
+    def _spread_has_pending_close(self, position_id: str) -> bool:
+        """True iff a non-terminal exit / partial_close row exists for
+        the spread's position_uid in the substrate.
+
+        Failure-mode handling: if the substrate isn't wired or the
+        query raises, returns False so the legacy dispatch path
+        proceeds. Defensive logging at WARNING — a sustained read
+        failure surfaces in logs but doesn't lock out closing.
+        """
+        if self.lifecycle_orders_store is None:
+            return False
+        try:
+            rows = self.lifecycle_orders_store.get_non_terminal_by_role(
+                spread_substrate_uid(position_id),
+                ("exit", "partial_close"),
+            )
+            return bool(rows)
+        except Exception as exc:
+            logger.warning(
+                f"spread substrate pending-close query failed for "
+                f"position_id={position_id[:8]}: {exc} — proceeding "
+                f"without lock"
+            )
+            return False
+
+    # ── Spread close substrate (§10.7 — close-row writes per §6.2) ──
+    #
+    # The per-order substrate ``position_lifecycle_orders`` carries one
+    # row per spread close attempt. The pre-submit insert is what gives
+    # us restart-safe duplicate-dispatch prevention: the
+    # ``uniq_one_active_close_per_position`` partial unique index blocks
+    # any concurrent insert of a second non-terminal close row on the
+    # same ``position_uid``.
+    #
+    # Client_order_id is engine-generated (deterministic from
+    # position_id + a timestamp + uuid suffix) and threaded to the
+    # broker via dispatch_spread_order so the drain can join back.
+
+    def _new_spread_close_client_order_id(
+        self, *, position_id: str, role: str
+    ) -> str:
+        """Engine-side client_order_id for a spread close substrate row.
+        Format: ``spr-{role}-{position_id_prefix}-{rand}``."""
+        import uuid as _uuid
+        suffix = _uuid.uuid4().hex[:8]
+        return f"spr-{role}-{position_id[:8]}-{suffix}"
+
+    def _lifecycle_orders_insert_spread_close(
+        self,
+        *,
+        position_id: str,
+        role: str,
+        client_order_id: str,
+        qty: float,
+        intended_limit_price: float | None = None,
+    ) -> bool:
+        """Insert a pending close-side per-order row before dispatch.
+
+        Returns True iff the row was written (or the store is no-op).
+        Returns False when ``uniq_one_active_close_per_position`` blocks
+        the insert — that is the substrate-backed duplicate-dispatch
+        guard firing and the caller must NOT submit the close.
+
+        Other exceptions (FK miss, ValueError, transient I/O) log
+        CRITICAL and return False so the dispatch is skipped — the
+        substrate is load-bearing for restart safety and silently
+        skipping it would re-open the gap.
+        """
+        if (
+            self.lifecycle_orders_store is None
+            or self.lifecycle_store is None
+        ):
+            return True  # legacy / test path — broker still dispatches
+        try:
+            self.lifecycle_orders_store.insert_pending(
+                position_uid=spread_substrate_uid(position_id),
+                role=role,
+                client_order_id=client_order_id,
+                order_type="limit",  # MLEG close uses a net-debit limit
+                order_class="mleg",
+                time_in_force="day",  # Alpaca mleg is DAY-TIF only
+                side="buy",  # net-debit close = buy back the spread
+                intended_qty=float(qty),
+                intended_limit_price=intended_limit_price,
+            )
+            return True
+        except sqlite3.IntegrityError as exc:
+            # Two distinct SQLite IntegrityError shapes land here and
+            # they have OPPOSITE meanings:
+            #
+            #   1. UNIQUE constraint failed on
+            #      uniq_one_active_close_per_position → there's
+            #      already a non-terminal close row on this
+            #      position_uid. This IS the substrate-backed
+            #      duplicate-dispatch block (R6 analog) — return
+            #      False so the caller skips dispatch.
+            #
+            #   2. FOREIGN KEY constraint failed → the parent
+            #      position_lifecycle row for this position_uid is
+            #      missing. This is a setup gap (e.g. a test fixture
+            #      that pre-registers spread state without calling
+            #      _lifecycle_begin_spread, or a pre-C1 backfill
+            #      window). Log CRITICAL but DON'T block the
+            #      dispatch — better to lose substrate tracking on
+            #      this one close than to regress the engine's
+            #      ability to close spreads when the parent row is
+            #      unexpectedly missing.
+            #
+            # Discriminate via ``sqlite_errorname`` (Python 3.11+) —
+            # locale-independent symbolic code from the SQLite C API.
+            # Fall back to a substring check if the attribute is
+            # missing (older Python) so the dispatch path stays safe.
+            errname = getattr(exc, "sqlite_errorname", None)
+            is_fk = (
+                errname == "SQLITE_CONSTRAINT_FOREIGNKEY"
+                if errname is not None
+                else "foreign key" in str(exc).lower()
+            )
+            if is_fk:
+                logger.critical(
+                    f"spread close substrate FK failure for "
+                    f"position_id={position_id[:8]} role={role}: {exc} — "
+                    f"parent position_lifecycle row missing; dispatching "
+                    f"close without substrate tracking. Investigate "
+                    f"why _lifecycle_begin_spread was not called for "
+                    f"this position."
+                )
+                return True
+            logger.info(
+                f"spread close substrate REFUSED for "
+                f"position_id={position_id[:8]} role={role}: {exc} — "
+                f"another close is already pending; not dispatching."
+            )
+            return False
+        except Exception as exc:
+            logger.critical(
+                f"spread close substrate insert FAILED for "
+                f"position_id={position_id[:8]} role={role}: "
+                f"{type(exc).__name__}: {exc} — aborting dispatch to "
+                f"avoid restart-gap regression."
+            )
+            return False
+
+    def _lifecycle_orders_finalize_spread_close(
+        self,
+        *,
+        client_order_id: str,
+        broker_order_id: str | None,
+        status: str,
+        filled_qty: float,
+        avg_fill_price: float | None,
+    ) -> None:
+        """Advance the per-order close row to its terminal status when
+        the worker drain reports back.
+
+        Post-submit absorption: failures here log CRITICAL but don't
+        re-raise — the broker order is already terminal and crashing
+        the drain would prevent the engine from releasing in-memory
+        spread state. Cycle reconciliation retries the attach.
+        """
+        if self.lifecycle_orders_store is None:
+            return
+        try:
+            self.lifecycle_orders_store.mark_terminal_after_dispatch(
+                client_order_id=client_order_id,
+                broker_order_id=broker_order_id,
+                status=status,
+                filled_qty=float(filled_qty),
+                avg_fill_price=avg_fill_price,
+            )
+        except Exception as exc:
+            logger.critical(
+                f"spread close substrate finalize FAILED for "
+                f"client_order_id={client_order_id}: "
+                f"{type(exc).__name__}: {exc}. Cycle reconciliation "
+                f"will retry."
+            )
 
     def _enter_multi_leg(
         self,
@@ -7946,6 +8391,18 @@ class TradingEngine:
         self._spread_owner_strategy[position_id] = strategy
         self._pending_spread_plans[position_id] = plan
         strategy.register_spread(plan.to_open_spread(position_id=position_id))
+        # §10.7 spread lifecycle PR: write the substrate pending row
+        # AFTER pre-registration so the drain path's mark_open finds a
+        # row to advance. Best-effort — failure here logs and leaves the
+        # spread tracked at the engine level so the close path still
+        # works; cycle reconciliation will not see a substrate row but
+        # the legacy in-memory ownership is preserved.
+        self._lifecycle_begin_spread(
+            position_id=position_id,
+            strategy_name=strategy.name,
+            symbol=plan.short_occ,
+            qty=plan.qty,
+        )
         logger.info(
             f"[{strategy.name}] {symbol}: credit spread dispatched "
             f"{plan.short_occ}/{plan.long_occ} width=${plan.width:.0f} "
@@ -7999,6 +8456,21 @@ class TradingEngine:
                     )
                     if plan is not None:
                         open_qty = float(filled_qty or plan.qty)
+                        # §10.7 spread lifecycle PR: transition the
+                        # substrate row to 'open' once the combo fill
+                        # lands. The pending row was created in
+                        # _enter_multi_leg; if it never made it (store
+                        # I/O failure), this mark_open is a no-op via
+                        # the helper's swallowed exception path.
+                        self._lifecycle_mark_spread_open(
+                            position_id=position_id,
+                            avg_entry_price=(
+                                abs(avg_fill_price)
+                                if avg_fill_price is not None
+                                else (plan.net_credit if plan is not None else 0.0)
+                            ),
+                            current_qty=open_qty,
+                        )
                         # plan.max_loss is $/contract; multiplier of 100 is
                         # already folded in by SpreadExecutionPlan. The
                         # short-leg row stores this so the close path can
@@ -8037,10 +8509,75 @@ class TradingEngine:
                     self._spread_owner_strategy.pop(position_id, None)
                     if strategy is not None:
                         strategy.release_spread(position_id)
+                    # §10.7 spread lifecycle PR: roll the substrate
+                    # pending row back to 'canceled' so the owner-key
+                    # lock is released. Mirrors broker's _lifecycle_
+                    # mark_canceled on single-leg open rejections.
+                    self._lifecycle_mark_spread_canceled(position_id)
                 continue
 
             # ── Spread CLOSE ─────────────────────────────────────────────
-            self._spreads_pending_close.discard(position_id)
+            # §10.7 C4: in-memory `_spreads_pending_close` retired —
+            # the substrate is the source of truth. The pending-close
+            # state is finalized via `_lifecycle_orders_finalize_spread_
+            # close` below (full close → row terminal; partial close →
+            # original terminal + new partial_close placeholder; cancel
+            # → row terminal at observed status).
+            # §10.7: find the substrate close row this drain event
+            # corresponds to. The pre-dispatch insert puts exactly one
+            # non-terminal close row per position_uid (guaranteed by
+            # uniq_one_active_close_per_position). On legacy / test
+            # paths where the substrate isn't wired, this is None and
+            # the substrate-finalize calls below become no-ops.
+            substrate_close_row = None
+            if self.lifecycle_orders_store is not None:
+                try:
+                    # §10.7 fix-up — DEFENSIVE: drop duplicate drain
+                    # events for an order_id we've already processed
+                    # to terminal for this position. The current
+                    # close paths never emit duplicates (the worker
+                    # exits on the first terminal event), but a
+                    # future worker / stream path that emits
+                    # cumulative-fill updates would otherwise
+                    # double-release the position and double-log
+                    # the close trade. R6 + the partial_close
+                    # placeholder design is operator-resolved by
+                    # contract; auto-progression on a late
+                    # cumulative update is explicitly out of scope.
+                    if order_id is not None:
+                        all_rows = (
+                            self.lifecycle_orders_store
+                            .get_all_for_position(
+                                spread_substrate_uid(position_id)
+                            )
+                        )
+                        already_terminal = any(
+                            r.order_id == order_id
+                            and r.status in {"filled", "canceled", "rejected"}
+                            and r.role in {"exit", "partial_close"}
+                            for r in all_rows
+                        )
+                        if already_terminal:
+                            logger.debug(
+                                f"spread close drain SKIPPED for "
+                                f"position_id={position_id[:8]} "
+                                f"order_id={order_id} — already "
+                                f"processed to terminal in this "
+                                f"position's substrate; duplicate "
+                                f"drain event."
+                            )
+                            continue
+                    rows = self.lifecycle_orders_store.get_non_terminal_by_role(
+                        spread_substrate_uid(position_id),
+                        ("exit", "partial_close"),
+                    )
+                    if rows:
+                        substrate_close_row = rows[0]
+                except Exception as exc:
+                    logger.warning(
+                        f"spread close substrate lookup failed for "
+                        f"position_id={position_id[:8]}: {exc}"
+                    )
             if filled:
                 # PR #56 R5: peek at the open spread BEFORE releasing so
                 # we can detect a partial close (close_qty < released.qty)
@@ -8069,28 +8606,44 @@ class TradingEngine:
                     # (when the rest fills) will land here again with
                     # full_close_combo=True and proceed normally.
                     #
-                    # PR #56 R6: re-add to _spreads_pending_close so the
-                    # next cycle's _process_credit_spread_exits skips this
-                    # position and does NOT dispatch a duplicate close
-                    # order at the original full qty. The position remains
-                    # "pending close" until the broker reconciles the
-                    # residual fill (or the operator intervenes).
-                    # Line 4924's unconditional `discard` cleared the
-                    # pending state at the top of the close branch; this
-                    # re-arms it.
-                    #
-                    # KNOWN RESIDUAL RISK (PLAN.md P2 follow-up):
-                    # _spreads_pending_close is in-memory only. A bot
-                    # restart between this partial detection and the
-                    # residual fill loses the marker — restart restores
-                    # the spread as open with residual qty (R5), this set
-                    # starts empty, and the next cycle may dispatch a
-                    # duplicate close. The CRITICAL alert below is the
-                    # current mitigation: operator reconciliation closes
-                    # the gap within minutes (the typical restart window).
-                    # See PLAN.md "MLEG partial-close residual
-                    # reconciliation" for the design space.
-                    self._spreads_pending_close.add(position_id)
+                    # §10.7 C4: the substrate-backed R6 (below) makes
+                    # the duplicate-dispatch block restart-safe — the
+                    # partial_close placeholder row is on disk, so the
+                    # next cycle's _process_credit_spread_exits will
+                    # see the lock via _spread_has_pending_close even
+                    # after a restart. The original in-memory
+                    # `_spreads_pending_close.add` re-arm is retired.
+                    # §10.7: substrate-backed R6 — finalize the
+                    # original exit row at broker truth ('filled' with
+                    # the partial qty), then insert a NEW pending
+                    # partial_close row so the position remains
+                    # locked against duplicate dispatch across
+                    # restarts. The unique index would block this
+                    # insert if the original row hadn't been
+                    # transitioned to terminal first.
+                    if substrate_close_row is not None:
+                        self._lifecycle_orders_finalize_spread_close(
+                            client_order_id=substrate_close_row.client_order_id,
+                            broker_order_id=order_id,
+                            status="filled",
+                            filled_qty=close_qty,
+                            avg_fill_price=avg_fill_price,
+                        )
+                        residual_cloid = (
+                            self._new_spread_close_client_order_id(
+                                position_id=position_id,
+                                role="partial_close",
+                            )
+                        )
+                        # Residual qty = open_qty - close_qty.
+                        residual_qty = float(peeked.qty - close_qty)
+                        self._lifecycle_orders_insert_spread_close(
+                            position_id=position_id,
+                            role="partial_close",
+                            client_order_id=residual_cloid,
+                            qty=residual_qty,
+                            intended_limit_price=None,
+                        )
                     logger.critical(
                         f"[{strategy_name}] credit spread PARTIAL close detected — "
                         f"position_id={position_id[:8]} close_qty={close_qty} < "
@@ -8148,6 +8701,28 @@ class TradingEngine:
                 )
                 self._pop_position(position_id)
                 self._spread_owner_strategy.pop(position_id, None)
+                # §10.7: full close — finalize the substrate row at
+                # 'filled' so the position is unlocked.
+                if substrate_close_row is not None:
+                    self._lifecycle_orders_finalize_spread_close(
+                        client_order_id=substrate_close_row.client_order_id,
+                        broker_order_id=order_id,
+                        status="filled",
+                        filled_qty=close_qty,
+                        avg_fill_price=avg_fill_price,
+                    )
+                # §10.7: also transition the position_lifecycle row
+                # to closed so the parent shows the right rollup.
+                if self.lifecycle_store is not None:
+                    try:
+                        self.lifecycle_store.mark_closed(
+                            position_uid=spread_substrate_uid(position_id),
+                        )
+                    except Exception as exc:
+                        logger.warning(
+                            f"spread lifecycle.mark_closed skipped for "
+                            f"position_id={position_id[:8]}: {exc}"
+                        )
                 short_occ = released.short_occ if released is not None else position_id
                 long_occ = released.long_occ if released is not None else ""
 
@@ -8244,12 +8819,24 @@ class TradingEngine:
                     reason=f"{strategy_name} {exit_reason}",
                 )
             else:
-                # Close did not fill — the position stays open. Clearing the
-                # pending-close flag (above) lets the exit path retry next cycle.
+                # Close did not fill — the position stays open. Releasing
+                # the substrate close row (below) lets the exit path
+                # retry next cycle.
                 logger.warning(
                     f"[{strategy_name}] credit spread close {status} — "
                     f"position_id={position_id[:8]} still open, will retry"
                 )
+                # §10.7: release the substrate close row so the
+                # uniq_one_active_close_per_position guard doesn't
+                # block the next-cycle retry.
+                if substrate_close_row is not None:
+                    self._lifecycle_orders_finalize_spread_close(
+                        client_order_id=substrate_close_row.client_order_id,
+                        broker_order_id=order_id,
+                        status="canceled" if status == "canceled" else "rejected",
+                        filled_qty=float(filled_qty or 0.0),
+                        avg_fill_price=avg_fill_price,
+                    )
 
     def _sweep_bear_spread_exits(self) -> None:
         """Cycle-level defensive close of every open spread when the regime
@@ -8262,9 +8849,11 @@ class TradingEngine:
         ``evaluate_spread_exit`` — ``underlying_close`` is therefore unused
         on this path and a sentinel ``0.0`` is passed.
 
-        Idempotent: positions already in ``_spreads_pending_close`` (from a
-        prior cycle or another caller in the same cycle) are skipped, so any
-        subsequent per-symbol invocation in the slot loop is a no-op.
+        Idempotent: positions whose substrate close row is non-terminal
+        (from a prior cycle or another caller in the same cycle) are
+        skipped via the duplicate-block in
+        ``_lifecycle_orders_insert_spread_close``, so any subsequent
+        per-symbol invocation in the slot loop is a no-op.
         """
         for slot in self.slots:
             strategy = slot.strategy
@@ -8336,8 +8925,8 @@ class TradingEngine:
         """
         Evaluate exit triggers for every open spread this strategy holds and
         dispatch a closing MLEG combo for any that fire. A position with a
-        close already in flight (``_spreads_pending_close``) is skipped so a
-        stale signal cannot double-submit.
+        close already in flight (substrate non-terminal exit/partial_close
+        row) is skipped so a stale signal cannot double-submit.
 
         When ``current_regime`` is ``BEAR`` the engine short-circuits to a
         defensive close for every open spread (docs/credit_spread_strategy.md
@@ -8354,7 +8943,10 @@ class TradingEngine:
         today = self._clock().date()
         for open_spread in list(open_spreads):
             position_id = open_spread.position_id
-            if position_id in self._spreads_pending_close:
+            # §10.7 C4: substrate-backed pending-close check.
+            # Restart-safe. Replaces `position_id in
+            # self._spreads_pending_close`.
+            if self._spread_has_pending_close(position_id):
                 continue
             # Build the typed close decision. BEAR override produces a
             # synthetic decision; otherwise the strategy decides.
@@ -8578,6 +9170,28 @@ class TradingEngine:
                     except Exception:
                         pass
 
+            # §10.7: substrate-backed duplicate-dispatch block. Insert
+            # the pending close row BEFORE dispatch — the
+            # `uniq_one_active_close_per_position` partial unique index
+            # is the durable analog of `_spreads_pending_close`. If it
+            # refuses (already a non-terminal close on this position),
+            # skip dispatch entirely. Survives restart because the row
+            # is committed to the DB.
+            close_cloid = self._new_spread_close_client_order_id(
+                position_id=position_id, role="exit",
+            )
+            substrate_inserted = self._lifecycle_orders_insert_spread_close(
+                position_id=position_id,
+                role="exit",
+                client_order_id=close_cloid,
+                qty=float(open_spread.qty),
+                intended_limit_price=float(debit),
+            )
+            if not substrate_inserted:
+                # Either the duplicate-dispatch guard fired (already a
+                # non-terminal close pending) or the substrate insert
+                # failed critically. Either way, don't dispatch.
+                continue
             try:
                 result = self.broker.dispatch_spread_order(
                     legs=legs,
@@ -8589,6 +9203,21 @@ class TradingEngine:
                     close_scheduler=scheduler,
                     quote_provider=quote_provider,
                     on_walk_step=_on_walk_step,
+                    # §10.7 fix-up — substrate row cloid so the worker
+                    # can emit per-submit attach events. Without this,
+                    # the substrate row stays at order_id=NULL until
+                    # drain, defeating restart-gap closure on a crash
+                    # between worker submit and engine drain.
+                    close_substrate_cloid=close_cloid,
+                    # §10.7 fix-up R3 — trade DB path for the worker's
+                    # synchronous, crash-durable substrate write. The
+                    # in-memory queue alone left a narrow but real
+                    # window (submit → next cycle drain) where a
+                    # crash could leave the substrate at order_id=NULL.
+                    close_substrate_db_path=(
+                        self.trade_logger.path
+                        if self.trade_logger is not None else None
+                    ),
                 )
             except Exception as e:
                 logger.error(
@@ -8596,13 +9225,34 @@ class TradingEngine:
                 )
                 self.risk.record_broker_error()
                 self.alerts.broker_error(f"{underlying} spread close: {e}")
+                # Roll the substrate row back so the position isn't
+                # locked out of a future close attempt.
+                self._lifecycle_orders_finalize_spread_close(
+                    client_order_id=close_cloid,
+                    broker_order_id=None,
+                    status="canceled",
+                    filled_qty=0.0,
+                    avg_fill_price=None,
+                )
                 continue
             if result.status is OrderStatus.ACCEPTED:
-                self._spreads_pending_close.add(position_id)
+                # §10.7 C4: the substrate's pending close row inserted
+                # above is what blocks duplicate dispatch (via
+                # uniq_one_active_close_per_position). No in-memory
+                # marker needed.
+                pass
             else:
                 logger.warning(
                     f"[{strategy.name}] {underlying}: spread close dispatch returned "
                     f"{result.status.value} for {position_id[:8]}"
+                )
+                # Non-ACCEPTED dispatch — release the substrate row.
+                self._lifecycle_orders_finalize_spread_close(
+                    client_order_id=close_cloid,
+                    broker_order_id=None,
+                    status="rejected",
+                    filled_qty=0.0,
+                    avg_fill_price=None,
                 )
 
     def _restore_ownership_from_db(self, snapshot: BrokerSnapshot) -> set[str]:
@@ -8820,6 +9470,32 @@ class TradingEngine:
                 qty=qty,
             ))
             spread_leg_occs.update(leg_symbols)
+            # §10.7 spread lifecycle PR: backfill the substrate row for
+            # spreads that pre-date this PR. Idempotent — if a row
+            # already exists under owner_key=position_id, the helper
+            # returns the existing uid and does nothing. Synthesized
+            # rows carry metadata.synthesized=true so dashboards /
+            # operator CLI can distinguish backfills from bot-originated
+            # rows.
+            if self.lifecycle_store is not None:
+                try:
+                    self.lifecycle_store.synthesize_for_existing(
+                        symbol=short_occ,
+                        owner_key=position_id,
+                        strategy=strategy_name,
+                        position_type="spread",
+                        current_qty=float(qty),
+                        avg_entry_price=net_credit,
+                        position_uid=spread_substrate_uid(position_id),
+                        backfill_note=(
+                            "synthesized at startup from reconstructed spread"
+                        ),
+                    )
+                except Exception as exc:
+                    logger.warning(
+                        f"spread lifecycle backfill failed for "
+                        f"position_id={position_id[:8]}: {exc}"
+                    )
             logger.info(
                 f"restart: reconstructed spread {position_id[:8]} ({underlying}) "
                 f"{short_occ}/{long_occ} width=${width:.0f} "

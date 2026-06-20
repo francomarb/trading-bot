@@ -116,6 +116,75 @@ _SIGNAL_KEY = ("credit_spread", "SPY", "1Day")
 _SIGNAL_BAR = "2026-05-14"
 
 
+# ── §10.7 C4 test helpers: substrate-backed pending close manipulation ──
+
+
+def _mark_close_pending_in_substrate(engine, position_id: str, qty: float = 1) -> None:
+    """Insert a non-terminal exit row for the spread in the substrate.
+
+    Migration shim for the test fixtures previously poking at
+    ``engine._spreads_pending_close`` directly — that set is retired
+    in C4 and the substrate is now the source of truth.
+
+    Idempotent (safe to call when the row already exists)."""
+    from engine.positions import spread_substrate_uid
+    # Ensure parent position_lifecycle row exists (FK target).
+    if engine.lifecycle_store is not None:
+        uid = spread_substrate_uid(position_id)
+        if engine.lifecycle_store.get_by_position_uid(uid) is None:
+            engine._lifecycle_begin_spread(
+                position_id=position_id,
+                strategy_name="credit_spread",
+                symbol="SPY260618P00568000",
+                qty=qty,
+            )
+            engine._lifecycle_mark_spread_open(
+                position_id=position_id,
+                avg_entry_price=1.45, current_qty=float(qty),
+            )
+    if engine.lifecycle_orders_store is None:
+        return
+    try:
+        engine.lifecycle_orders_store.insert_pending(
+            position_uid=spread_substrate_uid(position_id),
+            role="exit",
+            client_order_id=f"test-pending-close-{position_id}",
+            order_type="limit", order_class="mleg", time_in_force="day",
+            side="buy", intended_qty=float(qty),
+        )
+    except Exception:
+        pass  # already present or substrate misconfigured
+
+
+def _clear_close_pending_in_substrate(engine, position_id: str) -> None:
+    """Finalize any non-terminal close rows for the position so the
+    substrate-backed pending-close check returns False. Migration
+    shim replacing the legacy ``set.discard`` / ``set.clear``."""
+    from engine.positions import spread_substrate_uid
+    if engine.lifecycle_orders_store is None:
+        return
+    rows = engine.lifecycle_orders_store.get_non_terminal_by_role(
+        spread_substrate_uid(position_id), ("exit", "partial_close"),
+    )
+    for row in rows:
+        try:
+            engine.lifecycle_orders_store.mark_terminal_after_dispatch(
+                client_order_id=row.client_order_id,
+                broker_order_id=row.order_id,
+                status="canceled",
+                filled_qty=row.filled_qty,
+                avg_fill_price=row.avg_fill_price,
+            )
+        except Exception:
+            pass
+
+
+def _has_pending_close_substrate(engine, position_id: str) -> bool:
+    """Substrate-backed equivalent of ``position_id in
+    engine._spreads_pending_close``."""
+    return engine._spread_has_pending_close(position_id)
+
+
 # ── Entry path ──────────────────────────────────────────────────────────────
 
 
@@ -337,14 +406,14 @@ class TestDrainSpreadFills:
         strategy = _strategy()
         engine, broker = _engine(tmp_path, strategy)
         self._pre_register(engine, strategy, "p1")
-        engine._spreads_pending_close.add("p1")
+        _mark_close_pending_in_substrate(engine, "p1")
         broker.drain_spread_fills.return_value = [
             ("p1", "credit_spread", True, "filled", 1.0, 0.60, "combo-close-1", 0.60),
         ]
         engine._drain_spread_fills()
         assert "p1" not in engine._positions
         assert "p1" not in engine._spread_owner_strategy
-        assert "p1" not in engine._spreads_pending_close
+        assert not _has_pending_close_substrate(engine, "p1")
         assert strategy.open_spreads == []
         # The close writes one row per leg, both position_type='spread'.
         rows = engine.trade_logger.read_all()
@@ -360,7 +429,7 @@ class TestDrainSpreadFills:
         # _open_spread default net_credit = 1.45.
         self._pre_register(engine, strategy, "p1")
         engine._allocator = MagicMock()
-        engine._spreads_pending_close.add("p1")
+        _mark_close_pending_in_substrate(engine, "p1")
         # Closed at a $0.60 debit → realized = (1.45 − 0.60) × 1 × 100 = 85.0.
         broker.drain_spread_fills.return_value = [
             ("p1", "credit_spread", True, "filled", 1.0, 0.60, "combo-close-1", 0.60),
@@ -383,7 +452,7 @@ class TestDrainSpreadFills:
         strategy = _strategy()
         engine, broker = _engine(tmp_path, strategy)
         self._pre_register(engine, strategy, "p1")
-        engine._spreads_pending_close.add("p1")
+        _mark_close_pending_in_substrate(engine, "p1")
         broker.drain_spread_fills.return_value = [
             ("p1", "credit_spread", True, "filled", 1.0, 0.63, "combo-close-1", 0.60),
         ]
@@ -406,7 +475,7 @@ class TestDrainSpreadFills:
         engine, broker = _engine(tmp_path, strategy)
         self._pre_register(engine, strategy, "p1")
         engine._allocator = None  # no allocator wired
-        engine._spreads_pending_close.add("p1")
+        _mark_close_pending_in_substrate(engine, "p1")
         broker.drain_spread_fills.return_value = [
             ("p1", "credit_spread", True, "filled", 1.0, 0.60, "combo-close-1", 0.60),
         ]
@@ -426,7 +495,7 @@ class TestDrainSpreadFills:
         engine, broker = _engine(tmp_path, strategy)
         self._pre_register(engine, strategy, "p1")
         engine._allocator = MagicMock()
-        engine._spreads_pending_close.add("p1")
+        _mark_close_pending_in_substrate(engine, "p1")
         broker.drain_spread_fills.return_value = [
             ("p1", "credit_spread", True, "filled", 1.0, None, "combo-close-1", 0.60),
         ]
@@ -435,7 +504,7 @@ class TestDrainSpreadFills:
         # Position released — the spread genuinely closed.
         assert "p1" not in engine._positions
         assert strategy.open_spreads == []
-        assert "p1" not in engine._spreads_pending_close
+        assert not _has_pending_close_substrate(engine, "p1")
         # But NO bogus P&L recorded.
         engine._allocator.record_realized_pnl.assert_not_called()
         close_rows = [
@@ -469,7 +538,7 @@ class TestDrainSpreadFills:
             long_strike=558.0, expiration_date=_EXP,
             net_credit=1.45, width=10.0, qty=2,
         ))
-        engine._spreads_pending_close.add("p1")
+        _mark_close_pending_in_substrate(engine, "p1")
         engine.alerts = MagicMock()
         engine._allocator = MagicMock()
         # Drain a CLOSE event reporting only 1 of 2 contracts filled.
@@ -491,7 +560,7 @@ class TestDrainSpreadFills:
         # partial-fill order may still be working at the broker (the worker
         # exits on partially_filled per options_executor.py:275); a fresh
         # close dispatch would risk over-closing.
-        assert "p1" in engine._spreads_pending_close, (
+        assert _has_pending_close_substrate(engine, "p1"), (
             "partial close must keep the position pending to prevent a "
             "duplicate close dispatch on the next cycle"
         )
@@ -542,7 +611,7 @@ class TestDrainSpreadFills:
             net_credit=1.45, width=10.0, qty=2,
         ))
         # Critical: pending-close re-armed by R6.
-        engine._spreads_pending_close.add("p1")
+        _mark_close_pending_in_substrate(engine, "p1")
         # The broker dispatch must NOT be called this cycle.
         broker.dispatch_spread_order.reset_mock()
 
@@ -559,20 +628,20 @@ class TestDrainSpreadFills:
         # No new dispatch — the position is still pending the residual.
         broker.dispatch_spread_order.assert_not_called()
         # And it's still pending.
-        assert "p1" in engine._spreads_pending_close
+        assert _has_pending_close_substrate(engine, "p1")
 
     def test_close_canceled_keeps_position_for_retry(self, tmp_path):
         strategy = _strategy()
         engine, broker = _engine(tmp_path, strategy)
         self._pre_register(engine, strategy, "p1")
-        engine._spreads_pending_close.add("p1")
+        _mark_close_pending_in_substrate(engine, "p1")
         broker.drain_spread_fills.return_value = [
             ("p1", "credit_spread", True, "canceled", 0.0, None, "combo-close-1", 0.60),
         ]
         engine._drain_spread_fills()
         # Position stays open; pending-close flag cleared so the exit path retries.
         assert "p1" in engine._positions
-        assert "p1" not in engine._spreads_pending_close
+        assert not _has_pending_close_substrate(engine, "p1")
         assert len(strategy.open_spreads) == 1
 
 
@@ -589,6 +658,17 @@ class TestProcessCreditSpreadExits:
         )
         engine._spread_owner_strategy[position_id] = strategy
         strategy.register_spread(_open_spread(position_id, net_credit=2.00))
+        # §10.7 C4: register the substrate parent row so the close-
+        # path FK resolves and the substrate-backed pending-close
+        # check works against real rows (previously the in-memory
+        # `_spreads_pending_close` worked without a parent row).
+        engine._lifecycle_begin_spread(
+            position_id=position_id, strategy_name="credit_spread",
+            symbol="SPY260618P00568000", qty=1,
+        )
+        engine._lifecycle_mark_spread_open(
+            position_id=position_id, avg_entry_price=2.00, current_qty=1.0,
+        )
 
     def test_exit_trigger_dispatches_closing_combo(self, tmp_path):
         # spread mid 1.00 = 50% of the 2.00 credit → profit target.
@@ -612,7 +692,7 @@ class TestProcessCreditSpreadExits:
         assert kw["closing"] is True
         assert kw["position_id"] == "p1"
         assert kw["limit_price"] > 0  # positive net debit to close
-        assert "p1" in engine._spreads_pending_close
+        assert _has_pending_close_substrate(engine, "p1")
 
     def test_no_trigger_does_not_dispatch(self, tmp_path):
         # spread mid 1.80 — no exit trigger fires.
@@ -627,7 +707,7 @@ class TestProcessCreditSpreadExits:
             strategy=strategy, underlying="SPY", underlying_close=745.0,
         )
         broker.dispatch_spread_order.assert_not_called()
-        assert engine._spreads_pending_close == set()
+        assert not _has_pending_close_substrate(engine, "p1")
 
     def test_pending_close_position_is_skipped(self, tmp_path):
         quote_lookup = lambda occs: {
@@ -637,7 +717,7 @@ class TestProcessCreditSpreadExits:
         strategy = _strategy(_config(profit_target_pct=0.50), quote_lookup=quote_lookup)
         engine, broker = _engine(tmp_path, strategy)
         self._wire_open_spread(engine, strategy, "p1")
-        engine._spreads_pending_close.add("p1")  # close already in flight
+        _mark_close_pending_in_substrate(engine, "p1")  # close already in flight
         engine._process_credit_spread_exits(
             strategy=strategy, underlying="SPY", underlying_close=745.0,
         )
@@ -668,7 +748,7 @@ class TestProcessCreditSpreadExits:
         assert kw["position_id"] == "p1"
         # No quote → falls back to spread width as a marketable debit.
         assert kw["limit_price"] == 10.0
-        assert "p1" in engine._spreads_pending_close
+        assert _has_pending_close_substrate(engine, "p1")
 
     def test_bear_regime_skips_already_pending_close(self, tmp_path):
         # BEAR override must still respect _spreads_pending_close so the
@@ -676,7 +756,7 @@ class TestProcessCreditSpreadExits:
         strategy = _strategy(quote_lookup=lambda occs: {o: None for o in occs})
         engine, broker = _engine(tmp_path, strategy)
         self._wire_open_spread(engine, strategy, "p1")
-        engine._spreads_pending_close.add("p1")
+        _mark_close_pending_in_substrate(engine, "p1")
         engine._process_credit_spread_exits(
             strategy=strategy, underlying="SPY", underlying_close=745.0,
             current_regime=MarketRegime.BEAR,
@@ -701,7 +781,7 @@ class TestProcessCreditSpreadExits:
             current_regime=MarketRegime.BEAR,
         )
         broker.dispatch_spread_order.assert_called_once()
-        assert "p1" in engine._spreads_pending_close
+        assert _has_pending_close_substrate(engine, "p1")
 
     def test_non_bear_regime_falls_through_to_normal_exit_logic(self, tmp_path):
         # Spread mid 1.80 — no normal trigger fires. Confirms the regime
@@ -716,7 +796,7 @@ class TestProcessCreditSpreadExits:
         for regime in (MarketRegime.TRENDING, MarketRegime.RANGING,
                        MarketRegime.VOLATILE, None):
             broker.dispatch_spread_order.reset_mock()
-            engine._spreads_pending_close.clear()
+
             engine._process_credit_spread_exits(
                 strategy=strategy, underlying="SPY", underlying_close=745.0,
                 current_regime=regime,
@@ -788,7 +868,7 @@ class TestProcessCreditSpreadExits:
         broker.dispatch_spread_order.assert_called_once()
         assert broker.dispatch_spread_order.call_args.kwargs["closing"] is True
         assert broker.dispatch_spread_order.call_args.kwargs["position_id"] == "p1"
-        assert "p1" in engine._spreads_pending_close
+        assert _has_pending_close_substrate(engine, "p1")
 
 
 # ── BEAR cycle-level sweep ──────────────────────────────────────────────────
@@ -808,6 +888,14 @@ class TestSweepBearSpreadExits:
         )
         engine._spread_owner_strategy[position_id] = strategy
         strategy.register_spread(_open_spread(position_id, net_credit=2.00))
+        # §10.7 C4: substrate parent row for the close-row FK.
+        engine._lifecycle_begin_spread(
+            position_id=position_id, strategy_name="credit_spread",
+            symbol="SPY260618P00568000", qty=1,
+        )
+        engine._lifecycle_mark_spread_open(
+            position_id=position_id, avg_entry_price=2.00, current_qty=1.0,
+        )
 
     def test_sweep_dispatches_close_for_open_spread(self, tmp_path):
         # Quote lookup raises — the sweep must still close because BEAR
@@ -831,7 +919,7 @@ class TestSweepBearSpreadExits:
         assert kw["position_id"] == "p1"
         # Width fallback — quote outage cannot suppress the defensive close.
         assert kw["limit_price"] == 10.0
-        assert "p1" in engine._spreads_pending_close
+        assert _has_pending_close_substrate(engine, "p1")
 
     def test_sweep_skips_strategies_without_open_spreads(self, tmp_path):
         strategy = _strategy()  # no open spreads registered
@@ -860,7 +948,7 @@ class TestSweepBearSpreadExits:
         strategy = _strategy()
         engine, broker = _engine(tmp_path, strategy)
         self._wire_open_spread(engine, strategy, "p1")
-        engine._spreads_pending_close.add("p1")
+        _mark_close_pending_in_substrate(engine, "p1")
         engine._sweep_bear_spread_exits()
         broker.dispatch_spread_order.assert_not_called()
 
@@ -1043,7 +1131,7 @@ class TestCreditSpreadsSnapshot:
         engine, _ = _engine(tmp_path, strategy)
         engine._spread_owner_strategy["p1"] = strategy
         strategy.register_spread(_open_spread("p1"))
-        engine._spreads_pending_close.add("p1")
+        _mark_close_pending_in_substrate(engine, "p1")
         assert engine._credit_spreads_snapshot()[0]["pending_close"] is True
 
     def test_empty_when_no_spreads(self, tmp_path):
@@ -1346,4 +1434,1185 @@ class TestEntryBlockedByExistingPosition:
         ) is False
         assert TradingEngine._entry_blocked_by_existing_position(
             strategy, None
+        ) is False
+
+
+# ── §10.7 spread lifecycle substrate (C1) ──────────────────────────────────
+
+
+class TestSpreadLifecycleBegin:
+    """Direct unit tests for the spread substrate write helpers."""
+
+    def _engine(self, tmp_path):
+        strategy = _strategy()
+        engine, _ = _engine(tmp_path, strategy)
+        return engine
+
+    def test_lifecycle_begin_spread_creates_pending_row(self, tmp_path):
+        from engine.positions import spread_substrate_uid
+        engine = self._engine(tmp_path)
+        uid = engine._lifecycle_begin_spread(
+            position_id="abc123",
+            strategy_name="credit_spread",
+            symbol="SPY260618P00568000",
+            qty=2,
+        )
+        assert uid == spread_substrate_uid("abc123") == "pos_abc123"
+        row = engine.lifecycle_store.get_by_position_uid(uid)
+        assert row is not None
+        assert row.status == "pending"
+        assert row.position_type == "spread"
+        assert row.owner_key == "abc123"
+        assert row.strategy == "credit_spread"
+        assert row.symbol == "SPY260618P00568000"
+        assert row.entry_qty == 2.0
+        assert row.current_qty == 0.0
+
+    def test_lifecycle_begin_spread_noop_when_store_missing(self, tmp_path):
+        engine = self._engine(tmp_path)
+        engine.lifecycle_store = None
+        # Must not raise and must return None.
+        assert engine._lifecycle_begin_spread(
+            position_id="abc123",
+            strategy_name="credit_spread",
+            symbol="SPY260618P00568000",
+            qty=1,
+        ) is None
+
+    def test_lifecycle_mark_spread_open_promotes_pending(self, tmp_path):
+        from engine.positions import spread_substrate_uid
+        engine = self._engine(tmp_path)
+        engine._lifecycle_begin_spread(
+            position_id="abc123", strategy_name="credit_spread",
+            symbol="SPY260618P00568000", qty=1,
+        )
+        engine._lifecycle_mark_spread_open(
+            position_id="abc123",
+            avg_entry_price=1.45,
+            current_qty=1.0,
+        )
+        row = engine.lifecycle_store.get_by_position_uid(
+            spread_substrate_uid("abc123")
+        )
+        assert row.status == "open"
+        assert row.avg_entry_price == pytest.approx(1.45)
+        assert row.current_qty == 1.0
+
+    def test_lifecycle_mark_spread_canceled_rolls_back(self, tmp_path):
+        from engine.positions import spread_substrate_uid
+        engine = self._engine(tmp_path)
+        engine._lifecycle_begin_spread(
+            position_id="abc123", strategy_name="credit_spread",
+            symbol="SPY260618P00568000", qty=1,
+        )
+        engine._lifecycle_mark_spread_canceled("abc123")
+        row = engine.lifecycle_store.get_by_position_uid(
+            spread_substrate_uid("abc123")
+        )
+        assert row.status == "canceled"
+
+    def test_lifecycle_helpers_absorb_store_errors(self, tmp_path):
+        """A DB failure must NEVER abort the spread submit / drain."""
+        engine = self._engine(tmp_path)
+        # Replace the store with one whose every write raises.
+        broken = MagicMock()
+        broken.create_pending.side_effect = RuntimeError("disk full")
+        broken.mark_open.side_effect = RuntimeError("disk full")
+        broken.mark_canceled.side_effect = RuntimeError("disk full")
+        engine.lifecycle_store = broken
+        # All three must swallow the exception and return cleanly.
+        assert engine._lifecycle_begin_spread(
+            position_id="abc123", strategy_name="credit_spread",
+            symbol="SPY260618P00568000", qty=1,
+        ) is None
+        engine._lifecycle_mark_spread_open(
+            position_id="abc123", avg_entry_price=1.0, current_qty=1.0,
+        )
+        engine._lifecycle_mark_spread_canceled("abc123")
+
+
+class TestSpreadLifecycleWiredInEnter:
+    """_enter_multi_leg writes the substrate pending row after dispatch."""
+
+    def test_pending_row_written_after_accept(self, tmp_path):
+        from engine.positions import spread_substrate_uid
+        strategy = _strategy()
+        engine, broker = _engine(tmp_path, strategy)
+        broker.dispatch_spread_order.return_value = OrderResult(
+            status=OrderStatus.ACCEPTED, order_id="combo-1",
+            symbol="SPY260618P00568000", requested_qty=1,
+            filled_qty=0.0, avg_fill_price=0.0,
+            raw_status="accepted", message="",
+        )
+        pick = _pick()
+        with patch.object(strategy, "build_spread_execution",
+                          return_value=SimpleNamespace(
+                              short_occ=pick.short_occ, long_occ=pick.long_occ,
+                              qty=1, net_credit=pick.net_credit,
+                              width=pick.width, max_loss=pick.max_loss,
+                              limit_price=-pick.net_credit,
+                              legs=[
+                                  SimpleNamespace(occ_symbol=pick.short_occ,
+                                                  side="SELL", opening=True,
+                                                  ratio_qty=1),
+                                  SimpleNamespace(occ_symbol=pick.long_occ,
+                                                  side="BUY", opening=True,
+                                                  ratio_qty=1),
+                              ],
+                              to_open_spread=lambda position_id: _open_spread(
+                                  position_id=position_id),
+                          )):
+            engine._enter_multi_leg(
+                strategy=strategy, symbol="SPY", underlying_close=570.0,
+                notional_cap=1000.0, signal_key=_SIGNAL_KEY,
+                signal_bar=_SIGNAL_BAR, strategy_statuses={},
+                strategy_reasons={},
+            )
+        assert broker.dispatch_spread_order.called
+        # The newly-registered spread must have a pending substrate row.
+        position_id = next(iter(engine._spread_owner_strategy.keys()))
+        row = engine.lifecycle_store.get_by_position_uid(
+            spread_substrate_uid(position_id)
+        )
+        assert row is not None
+        assert row.status == "pending"
+        assert row.position_type == "spread"
+
+
+class TestSpreadLifecycleWiredInDrain:
+    """_drain_spread_fills advances the substrate row on terminal events."""
+
+    def _pre_register_with_pending(self, engine, strategy, position_id):
+        from engine.positions import make_spread, PositionLeg
+        engine._positions[position_id] = make_spread(
+            strategy_name="credit_spread", position_id=position_id,
+            legs=[PositionLeg("SPY260618P00568000", -1, side="SELL"),
+                  PositionLeg("SPY260618P00558000", 1, side="BUY")],
+        )
+        engine._spread_owner_strategy[position_id] = strategy
+        engine._pending_spread_plans[position_id] = _pick()
+        strategy.register_spread(_open_spread(position_id))
+        engine._lifecycle_begin_spread(
+            position_id=position_id,
+            strategy_name="credit_spread",
+            symbol="SPY260618P00568000",
+            qty=1,
+        )
+
+    def test_open_filled_marks_substrate_open(self, tmp_path):
+        from engine.positions import spread_substrate_uid
+        strategy = _strategy()
+        engine, broker = _engine(tmp_path, strategy)
+        self._pre_register_with_pending(engine, strategy, "p1")
+        broker.drain_spread_fills.return_value = [
+            ("p1", "credit_spread", False, "filled", 1.0, -1.50, "combo-1", -1.45),
+        ]
+        engine._drain_spread_fills()
+        row = engine.lifecycle_store.get_by_position_uid(
+            spread_substrate_uid("p1")
+        )
+        assert row.status == "open"
+        assert row.current_qty == 1.0
+        assert row.avg_entry_price == pytest.approx(1.50)
+
+    def test_open_canceled_marks_substrate_canceled(self, tmp_path):
+        from engine.positions import spread_substrate_uid
+        strategy = _strategy()
+        engine, broker = _engine(tmp_path, strategy)
+        self._pre_register_with_pending(engine, strategy, "p1")
+        broker.drain_spread_fills.return_value = [
+            ("p1", "credit_spread", False, "canceled", 0.0, None, "combo-1", -1.45),
+        ]
+        engine._drain_spread_fills()
+        row = engine.lifecycle_store.get_by_position_uid(
+            spread_substrate_uid("p1")
+        )
+        assert row.status == "canceled"
+
+
+class TestSpreadLifecycleBackfill:
+    """_restore_spread_positions synthesizes a substrate row for spreads
+    that pre-date the spread-lifecycle PR."""
+
+    def test_backfill_creates_open_row_with_synthesized_metadata(self, tmp_path):
+        from engine.positions import spread_substrate_uid
+        strategy = _strategy()
+        engine, broker = _engine(tmp_path, strategy)
+        # Seed the trade log with an open spread (entries, no exits).
+        engine.trade_logger.log_spread_fill(
+            position_id="legacy_spread_a",
+            strategy="credit_spread",
+            short_occ="SPY260618P00568000",
+            long_occ="SPY260618P00558000",
+            qty=1, net_price=1.45, order_id="combo-legacy",
+            opening=True,
+        )
+        # Broker must show both legs to allow reconstruction.
+        snapshot = SimpleNamespace(
+            account=SimpleNamespace(
+                open_positions={
+                    "SPY260618P00568000": SimpleNamespace(qty=-1, avg_entry_price=1.55),
+                    "SPY260618P00558000": SimpleNamespace(qty=1, avg_entry_price=0.10),
+                },
+                equity=100_000.0,
+            ),
+            open_orders=[],
+        )
+        conflicts: set[str] = set()
+        engine._restore_spread_positions(snapshot, conflicts)
+        # Backfill row exists, open, with synthesized metadata.
+        uid = spread_substrate_uid("legacy_spread_a")
+        row = engine.lifecycle_store.get_by_position_uid(uid)
+        assert row is not None
+        assert row.status == "open"
+        assert row.position_type == "spread"
+        assert row.owner_key == "legacy_spread_a"
+        assert row.metadata.get("synthesized") is True
+
+    def test_backfill_is_idempotent(self, tmp_path):
+        from engine.positions import spread_substrate_uid
+        strategy = _strategy()
+        engine, broker = _engine(tmp_path, strategy)
+        engine.trade_logger.log_spread_fill(
+            position_id="legacy_spread_a",
+            strategy="credit_spread",
+            short_occ="SPY260618P00568000",
+            long_occ="SPY260618P00558000",
+            qty=1, net_price=1.45, order_id="combo-legacy",
+            opening=True,
+        )
+        snapshot = SimpleNamespace(
+            account=SimpleNamespace(
+                open_positions={
+                    "SPY260618P00568000": SimpleNamespace(qty=-1, avg_entry_price=1.55),
+                    "SPY260618P00558000": SimpleNamespace(qty=1, avg_entry_price=0.10),
+                },
+                equity=100_000.0,
+            ),
+            open_orders=[],
+        )
+        engine._restore_spread_positions(snapshot, set())
+        engine._restore_spread_positions(snapshot, set())
+        # Still exactly one row.
+        uid = spread_substrate_uid("legacy_spread_a")
+        row = engine.lifecycle_store.get_by_position_uid(uid)
+        assert row is not None
+
+
+class TestSpreadSubstrateUidHelper:
+    def test_prefixes_raw_hex(self):
+        from engine.positions import spread_substrate_uid
+        assert spread_substrate_uid("a26634") == "pos_a26634"
+
+    def test_idempotent_when_already_prefixed(self):
+        from engine.positions import spread_substrate_uid
+        assert spread_substrate_uid("pos_a26634") == "pos_a26634"
+
+    def test_empty_raises(self):
+        from engine.positions import spread_substrate_uid
+        with pytest.raises(ValueError):
+            spread_substrate_uid("")
+
+
+# ── §10.7 spread close substrate (C2) ──────────────────────────────────────
+
+
+class TestSpreadCloseSubstrate:
+    """C2: dispatch_spread_order(closing=True) writes a pending exit row;
+    drain advances it; partial fills insert a partial_close residual row;
+    uniq_one_active_close_per_position blocks duplicates."""
+
+    def _setup_open_spread(self, engine, strategy, position_id="p1"):
+        """Pre-register an open spread AND write its substrate parent row
+        so the per-order FK succeeds."""
+        from engine.positions import make_spread, PositionLeg
+        engine._positions[position_id] = make_spread(
+            strategy_name="credit_spread", position_id=position_id,
+            legs=[PositionLeg("SPY260618P00568000", -1, side="SELL"),
+                  PositionLeg("SPY260618P00558000", 1, side="BUY")],
+        )
+        engine._spread_owner_strategy[position_id] = strategy
+        engine._pending_spread_plans[position_id] = _pick()
+        strategy.register_spread(_open_spread(position_id))
+        engine._lifecycle_begin_spread(
+            position_id=position_id,
+            strategy_name="credit_spread",
+            symbol="SPY260618P00568000",
+            qty=1,
+        )
+        engine._lifecycle_mark_spread_open(
+            position_id=position_id, avg_entry_price=1.45, current_qty=1.0,
+        )
+
+    def test_close_dispatch_inserts_pending_exit_substrate_row(self, tmp_path):
+        from engine.positions import spread_substrate_uid
+        strategy = _strategy()
+        engine, broker = _engine(tmp_path, strategy)
+        self._setup_open_spread(engine, strategy, "p1")
+        broker.dispatch_spread_order.return_value = OrderResult(
+            status=OrderStatus.ACCEPTED, order_id="combo-close-1",
+            symbol="SPY", requested_qty=1, filled_qty=0.0,
+            avg_fill_price=0.0, raw_status="accepted", message="",
+        )
+        # Mock evaluate_close to force a close trigger.
+        from execution.mleg_close import MlegCloseDecision
+        with patch.object(strategy, "evaluate_close",
+                          return_value=MlegCloseDecision(
+                              should_close=True, reason="profit_target",
+                              detail="test", position_id="p1",
+                              initial_mid=1.0, initial_bid=0.95, initial_ask=1.05,
+                          )):
+            engine._process_credit_spread_exits(
+                strategy=strategy, underlying="SPY",
+                underlying_close=570.0, current_regime=None,
+            )
+        rows = engine.lifecycle_orders_store.get_non_terminal_by_role(
+            spread_substrate_uid("p1"), ("exit", "partial_close"),
+        )
+        assert len(rows) == 1
+        assert rows[0].role == "exit"
+        assert rows[0].status == "pending"
+        assert rows[0].intended_qty == 1.0
+        assert rows[0].order_type == "limit"
+        assert rows[0].order_class == "mleg"
+        assert rows[0].side == "buy"
+
+    def test_close_substrate_duplicate_dispatch_blocks_via_unique_index(
+        self, tmp_path
+    ):
+        from engine.positions import spread_substrate_uid
+        strategy = _strategy()
+        engine, broker = _engine(tmp_path, strategy)
+        self._setup_open_spread(engine, strategy, "p1")
+        broker.dispatch_spread_order.return_value = OrderResult(
+            status=OrderStatus.ACCEPTED, order_id="combo-close-1",
+            symbol="SPY", requested_qty=1, filled_qty=0.0,
+            avg_fill_price=0.0, raw_status="accepted", message="",
+        )
+        # Manually insert a non-terminal exit row to simulate an
+        # already-in-flight close on this position.
+        engine.lifecycle_orders_store.insert_pending(
+            position_uid=spread_substrate_uid("p1"),
+            role="exit", client_order_id="existing-close-cloid",
+            order_type="limit", order_class="mleg", time_in_force="day",
+            side="buy", intended_qty=1.0,
+        )
+        # Second dispatch attempt must be blocked by the unique index.
+        result = engine._lifecycle_orders_insert_spread_close(
+            position_id="p1", role="exit",
+            client_order_id="second-close-cloid", qty=1.0,
+        )
+        assert result is False
+        # Substrate still has exactly one non-terminal close row.
+        rows = engine.lifecycle_orders_store.get_non_terminal_by_role(
+            spread_substrate_uid("p1"), ("exit", "partial_close"),
+        )
+        assert len(rows) == 1
+        assert rows[0].client_order_id == "existing-close-cloid"
+
+    def test_close_substrate_fk_failure_does_not_block_dispatch(self, tmp_path):
+        """When the parent position_lifecycle row is missing (legacy
+        / test setup bug), the substrate insert must NOT block dispatch
+        — better to lose tracking on one close than regress closing
+        ability."""
+        strategy = _strategy()
+        engine, broker = _engine(tmp_path, strategy)
+        # No _lifecycle_begin_spread call → no parent row → FK violation.
+        result = engine._lifecycle_orders_insert_spread_close(
+            position_id="orphan_position", role="exit",
+            client_order_id="cloid-x", qty=1.0,
+        )
+        assert result is True  # dispatch proceeds
+
+    def test_close_drain_full_fill_finalizes_substrate_row(self, tmp_path):
+        from engine.positions import spread_substrate_uid
+        strategy = _strategy()
+        engine, broker = _engine(tmp_path, strategy)
+        self._setup_open_spread(engine, strategy, "p1")
+        # Pre-insert a pending exit row as if dispatch ran.
+        engine.lifecycle_orders_store.insert_pending(
+            position_uid=spread_substrate_uid("p1"),
+            role="exit", client_order_id="close-cloid",
+            order_type="limit", order_class="mleg", time_in_force="day",
+            side="buy", intended_qty=1.0,
+        )
+        # Full close drain event.
+        broker.drain_spread_fills.return_value = [
+            ("p1", "credit_spread", True, "filled", 1.0, 0.60, "broker-id-1", 0.60),
+        ]
+        engine._drain_spread_fills()
+        # The exit row is now terminal at 'filled' with the observed qty.
+        rows = engine.lifecycle_orders_store.get_all_for_position(
+            spread_substrate_uid("p1")
+        )
+        exit_rows = [r for r in rows if r.role == "exit"]
+        assert len(exit_rows) == 1
+        assert exit_rows[0].status == "filled"
+        assert exit_rows[0].filled_qty == 1.0
+        assert exit_rows[0].order_id == "broker-id-1"
+        # No new partial_close row was inserted (this was a full close).
+        partials = [r for r in rows if r.role == "partial_close"]
+        assert len(partials) == 0
+        # Parent position_lifecycle is now closed.
+        parent = engine.lifecycle_store.get_by_position_uid(
+            spread_substrate_uid("p1")
+        )
+        assert parent.status == "closed"
+
+    def test_partial_close_drain_inserts_residual_partial_close_row(
+        self, tmp_path
+    ):
+        """R6 substrate analog: partial close finalizes the original
+        exit row at filled with partial qty AND inserts a new
+        partial_close pending row marking the residual."""
+        from engine.positions import spread_substrate_uid
+        strategy = _strategy()
+        engine, broker = _engine(tmp_path, strategy)
+        # Open a 2-contract spread.
+        from engine.positions import make_spread, PositionLeg
+        engine._positions["p2"] = make_spread(
+            strategy_name="credit_spread", position_id="p2",
+            legs=[PositionLeg("SPY260618P00568000", -2, side="SELL"),
+                  PositionLeg("SPY260618P00558000", 2, side="BUY")],
+        )
+        engine._spread_owner_strategy["p2"] = strategy
+        engine._pending_spread_plans["p2"] = _pick()
+        spread_2 = OpenSpread(
+            position_id="p2",
+            short_occ="SPY260618P00568000",
+            long_occ="SPY260618P00558000",
+            short_strike=568.0, long_strike=558.0,
+            expiration_date=_EXP, net_credit=1.45, width=10.0, qty=2,
+        )
+        strategy.register_spread(spread_2)
+        engine._lifecycle_begin_spread(
+            position_id="p2", strategy_name="credit_spread",
+            symbol="SPY260618P00568000", qty=2,
+        )
+        engine._lifecycle_mark_spread_open(
+            position_id="p2", avg_entry_price=1.45, current_qty=2.0,
+        )
+        engine.lifecycle_orders_store.insert_pending(
+            position_uid=spread_substrate_uid("p2"),
+            role="exit", client_order_id="close-cloid-2",
+            order_type="limit", order_class="mleg", time_in_force="day",
+            side="buy", intended_qty=2.0,
+        )
+        # Drain a partial fill: 1 of 2 contracts closed.
+        broker.drain_spread_fills.return_value = [
+            ("p2", "credit_spread", True, "filled", 1.0, 0.60, "broker-id-2", 0.60),
+        ]
+        engine._drain_spread_fills()
+        rows = engine.lifecycle_orders_store.get_all_for_position(
+            spread_substrate_uid("p2")
+        )
+        exit_rows = [r for r in rows if r.role == "exit"]
+        partial_rows = [r for r in rows if r.role == "partial_close"]
+        # Original exit row finalized at broker truth ('filled', qty=1).
+        assert len(exit_rows) == 1
+        assert exit_rows[0].status == "filled"
+        assert exit_rows[0].filled_qty == 1.0
+        # NEW partial_close row inserted marking the residual qty.
+        assert len(partial_rows) == 1
+        assert partial_rows[0].status == "pending"
+        assert partial_rows[0].intended_qty == 1.0  # residual
+        # Substrate-backed duplicate-block still active: only one
+        # non-terminal close row.
+        non_terminal = engine.lifecycle_orders_store.get_non_terminal_by_role(
+            spread_substrate_uid("p2"), ("exit", "partial_close"),
+        )
+        assert len(non_terminal) == 1
+        assert non_terminal[0].role == "partial_close"
+        # Position is preserved (R6 fail-safe).
+        assert "p2" in engine._positions
+
+    def test_duplicate_close_drain_event_for_same_order_id_is_skipped(
+        self, tmp_path,
+    ):
+        """C8 audit: if a second drain event arrives for an order_id
+        we already finalized to terminal, the engine MUST skip it.
+        Otherwise the placeholder partial_close row would be
+        advanced with the original close's order_id, double-logging
+        the trade and re-releasing the position. With WAIT
+        semantics, the placeholder is operator-resolved only."""
+        from engine.positions import (
+            make_spread, PositionLeg, spread_substrate_uid,
+        )
+        strategy = _strategy()
+        engine, broker = _engine(tmp_path, strategy)
+        # Open a 2-contract spread + run a partial close to leave a
+        # placeholder behind.
+        engine._positions["p9"] = make_spread(
+            strategy_name="credit_spread", position_id="p9",
+            legs=[PositionLeg("SPY260618P00568000", -2, side="SELL"),
+                  PositionLeg("SPY260618P00558000", 2, side="BUY")],
+        )
+        engine._spread_owner_strategy["p9"] = strategy
+        engine._pending_spread_plans["p9"] = _pick()
+        spread_2 = OpenSpread(
+            position_id="p9",
+            short_occ="SPY260618P00568000",
+            long_occ="SPY260618P00558000",
+            short_strike=568.0, long_strike=558.0,
+            expiration_date=_EXP, net_credit=1.45, width=10.0, qty=2,
+        )
+        strategy.register_spread(spread_2)
+        engine._lifecycle_begin_spread(
+            position_id="p9", strategy_name="credit_spread",
+            symbol="SPY260618P00568000", qty=2,
+        )
+        engine._lifecycle_mark_spread_open(
+            position_id="p9", avg_entry_price=1.45, current_qty=2.0,
+        )
+        engine.lifecycle_orders_store.insert_pending(
+            position_uid=spread_substrate_uid("p9"),
+            role="exit", client_order_id="close-cloid-9",
+            order_type="limit", order_class="mleg", time_in_force="day",
+            side="buy", intended_qty=2.0,
+        )
+        # Partial fill — leaves placeholder.
+        broker.drain_spread_fills.return_value = [
+            ("p9", "credit_spread", True, "filled", 1.0, 0.60,
+             "broker-id-9", 0.60),
+        ]
+        engine._drain_spread_fills()
+        # Capture state after the partial: position preserved, one
+        # placeholder pending, one exit terminal.
+        assert "p9" in engine._positions
+        rows_after_partial = (
+            engine.lifecycle_orders_store.get_all_for_position(
+                spread_substrate_uid("p9")
+            )
+        )
+        n_exit_terminal = sum(
+            1 for r in rows_after_partial
+            if r.role == "exit" and r.status == "filled"
+        )
+        assert n_exit_terminal == 1
+        # Now simulate a SECOND drain for the same broker order_id
+        # (e.g. defensive replay, stream re-emission). The engine
+        # must skip it — no double-release, no double-log.
+        broker.drain_spread_fills.return_value = [
+            ("p9", "credit_spread", True, "filled", 2.0, 0.60,
+             "broker-id-9", 0.60),  # cumulative qty=2
+        ]
+        before_log_count = len(engine.trade_logger.read_all())
+        engine._drain_spread_fills()
+        # Position still preserved (no double-release).
+        assert "p9" in engine._positions
+        # No new trade-log rows written.
+        after_log_count = len(engine.trade_logger.read_all())
+        assert after_log_count == before_log_count
+        # Placeholder still pending (not advanced by the duplicate).
+        non_terminal = (
+            engine.lifecycle_orders_store.get_non_terminal_by_role(
+                spread_substrate_uid("p9"), ("exit", "partial_close"),
+            )
+        )
+        assert len(non_terminal) == 1
+        assert non_terminal[0].role == "partial_close"
+        assert non_terminal[0].status == "pending"
+
+    def test_close_drain_canceled_finalizes_substrate_row_as_canceled(
+        self, tmp_path
+    ):
+        from engine.positions import spread_substrate_uid
+        strategy = _strategy()
+        engine, broker = _engine(tmp_path, strategy)
+        self._setup_open_spread(engine, strategy, "p1")
+        engine.lifecycle_orders_store.insert_pending(
+            position_uid=spread_substrate_uid("p1"),
+            role="exit", client_order_id="close-cloid",
+            order_type="limit", order_class="mleg", time_in_force="day",
+            side="buy", intended_qty=1.0,
+        )
+        broker.drain_spread_fills.return_value = [
+            ("p1", "credit_spread", True, "canceled", 0.0, None, "broker-id-3", 0.60),
+        ]
+        engine._drain_spread_fills()
+        rows = engine.lifecycle_orders_store.get_all_for_position(
+            spread_substrate_uid("p1")
+        )
+        exit_rows = [r for r in rows if r.role == "exit"]
+        assert exit_rows[0].status == "canceled"
+        # Position stays open for retry.
+        assert "p1" in engine._positions
+
+    def test_mark_terminal_after_dispatch_no_op_on_terminal_row(self, tmp_path):
+        """Idempotency: re-applying terminal status to an already-terminal
+        row is a no-op (does not error)."""
+        from engine.positions import spread_substrate_uid
+        strategy = _strategy()
+        engine, _ = _engine(tmp_path, strategy)
+        self._setup_open_spread(engine, strategy, "p1")
+        engine.lifecycle_orders_store.insert_pending(
+            position_uid=spread_substrate_uid("p1"),
+            role="exit", client_order_id="cloid-1",
+            order_type="limit", order_class="mleg", time_in_force="day",
+            side="buy", intended_qty=1.0,
+        )
+        engine.lifecycle_orders_store.mark_terminal_after_dispatch(
+            client_order_id="cloid-1", broker_order_id="broker-x",
+            status="filled", filled_qty=1.0, avg_fill_price=0.60,
+        )
+        # Re-apply — must not raise.
+        engine.lifecycle_orders_store.mark_terminal_after_dispatch(
+            client_order_id="cloid-1", broker_order_id="broker-x",
+            status="filled", filled_qty=1.0, avg_fill_price=0.60,
+        )
+        row = engine.lifecycle_orders_store.get_by_client_order_id("cloid-1")
+        assert row.status == "filled"
+
+
+# ── §10.7 spread close reconciler (C3) — cycle + startup ───────────────────
+
+
+class TestSpreadCloseReconciler:
+    """C3: walks non-terminal substrate close rows whose broker order
+    became terminal while the stream was disconnected. Closes the
+    actual restart-gap the PR is designed to fix."""
+
+    def _setup_with_pending_close_row(
+        self, tmp_path, position_id="p1", broker_order_id="b-1",
+    ):
+        from engine.positions import (
+            make_spread, PositionLeg, spread_substrate_uid,
+        )
+        strategy = _strategy()
+        engine, broker = _engine(tmp_path, strategy)
+        engine._positions[position_id] = make_spread(
+            strategy_name="credit_spread", position_id=position_id,
+            legs=[PositionLeg("SPY260618P00568000", -1, side="SELL"),
+                  PositionLeg("SPY260618P00558000", 1, side="BUY")],
+        )
+        engine._spread_owner_strategy[position_id] = strategy
+        strategy.register_spread(_open_spread(position_id))
+        engine._lifecycle_begin_spread(
+            position_id=position_id,
+            strategy_name="credit_spread",
+            symbol="SPY260618P00568000",
+            qty=1,
+        )
+        engine._lifecycle_mark_spread_open(
+            position_id=position_id,
+            avg_entry_price=1.45, current_qty=1.0,
+        )
+        # Insert pending close row with a broker order_id attached
+        # (simulating bot died between dispatch and drain).
+        engine.lifecycle_orders_store.insert_pending(
+            position_uid=spread_substrate_uid(position_id),
+            role="exit", client_order_id="close-cloid",
+            order_type="limit", order_class="mleg", time_in_force="day",
+            side="buy", intended_qty=1.0,
+        )
+        engine.lifecycle_orders_store.attach_broker_order_id(
+            client_order_id="close-cloid",
+            order_id=broker_order_id,
+        )
+        return engine, broker, strategy
+
+    def test_cycle_reconciler_advances_terminal_close_row(self, tmp_path):
+        """Broker shows the close order is filled; substrate row gets
+        advanced from pending → filled."""
+        from engine.positions import spread_substrate_uid
+        engine, broker, _ = self._setup_with_pending_close_row(tmp_path)
+        # Broker open_orders does NOT contain our order (it's terminal).
+        snapshot = SimpleNamespace(open_orders=[])
+        # The broker's REST get_order_by_id returns a filled order.
+        broker._api = MagicMock()
+        broker._api.get_order_by_id.return_value = SimpleNamespace(
+            status="filled", filled_qty="1", filled_avg_price="0.60",
+            updated_at="2026-06-20T15:00:00Z",
+        )
+        broker._with_retry = lambda fn, op_desc=None: fn()
+        engine._reconcile_substrate_spread_closes(snapshot, reason="cycle")
+        # Row is now terminal at the broker-observed status.
+        row = engine.lifecycle_orders_store.get_by_client_order_id(
+            "close-cloid"
+        )
+        assert row.status == "filled"
+        assert row.filled_qty == 1.0
+        assert row.avg_fill_price == pytest.approx(0.60)
+
+    def test_cycle_reconciler_skips_open_order(self, tmp_path):
+        """Row whose order_id is still in broker.open_orders is left
+        alone (the stream owns it)."""
+        engine, broker, _ = self._setup_with_pending_close_row(tmp_path)
+        snapshot = SimpleNamespace(
+            open_orders=[SimpleNamespace(order_id="b-1")],
+        )
+        broker._api = MagicMock()
+        broker._with_retry = MagicMock()
+        engine._reconcile_substrate_spread_closes(snapshot, reason="cycle")
+        # No REST call should have been made.
+        broker._with_retry.assert_not_called()
+        # Row is unchanged (still pending).
+        row = engine.lifecycle_orders_store.get_by_client_order_id(
+            "close-cloid"
+        )
+        assert row.status == "pending"
+
+    def test_cycle_reconciler_skips_row_without_order_id(self, tmp_path):
+        """Partial_close placeholder rows (order_id=NULL) are skipped
+        — there's no broker order to query."""
+        from engine.positions import (
+            make_spread, PositionLeg, spread_substrate_uid,
+        )
+        strategy = _strategy()
+        engine, broker = _engine(tmp_path, strategy)
+        engine._positions["p1"] = make_spread(
+            strategy_name="credit_spread", position_id="p1",
+            legs=[PositionLeg("SPY260618P00568000", -2, side="SELL"),
+                  PositionLeg("SPY260618P00558000", 2, side="BUY")],
+        )
+        engine._spread_owner_strategy["p1"] = strategy
+        engine._lifecycle_begin_spread(
+            position_id="p1", strategy_name="credit_spread",
+            symbol="SPY260618P00568000", qty=2,
+        )
+        # Placeholder partial_close row (no broker order_id attached).
+        engine.lifecycle_orders_store.insert_pending(
+            position_uid=spread_substrate_uid("p1"),
+            role="partial_close", client_order_id="placeholder-cloid",
+            order_type="limit", order_class="mleg", time_in_force="day",
+            side="buy", intended_qty=1.0,
+        )
+        snapshot = SimpleNamespace(open_orders=[])
+        broker._api = MagicMock()
+        broker._with_retry = MagicMock()
+        engine._reconcile_substrate_spread_closes(snapshot, reason="cycle")
+        # No REST call was attempted for the placeholder.
+        broker._with_retry.assert_not_called()
+        # Row is unchanged.
+        row = engine.lifecycle_orders_store.get_by_client_order_id(
+            "placeholder-cloid",
+        )
+        assert row.status == "pending"
+
+    def test_eager_attach_via_worker_on_submitted_callback(self, tmp_path):
+        """C6 fix-up acceptance: the broker order_id reaches the
+        substrate row via the worker's on_submitted callback before
+        any close-drain event. A crash here would still leave a
+        recoverable substrate row (order_id NOT NULL)."""
+        from engine.positions import (
+            make_spread, PositionLeg, spread_substrate_uid,
+        )
+        strategy = _strategy()
+        # Real broker fixture (not the engine fixture's MagicMock)
+        # would be ideal, but we can stand in by exercising the
+        # broker drain queue directly: simulate the worker's
+        # on_submitted callback pushing to
+        # _pending_lifecycle_close_attaches and assert the engine
+        # drain attaches the order_id to the existing pending row.
+        engine, broker = _engine(tmp_path, strategy)
+        # Real broker queue (the MagicMock doesn't have one).
+        broker._pending_lifecycle_close_attaches = []
+        broker.drain_lifecycle_close_attaches = (
+            lambda: broker._pending_lifecycle_close_attaches[:]
+            and (broker._pending_lifecycle_close_attaches.clear()
+                 or [(_cli, _oid, None) for _cli, _oid, _ in [
+                     ("engine-close-cloid", "broker-step-1", None)]])
+            if broker._pending_lifecycle_close_attaches else []
+        )
+        # Simpler: just stub the drain to return one event.
+        broker.drain_lifecycle_close_attaches = MagicMock(
+            return_value=[("engine-close-cloid", "broker-step-1", None)]
+        )
+        # Pre-populate state: open spread + pending exit row (no
+        # order_id yet, simulating the moment between substrate
+        # insert and worker's first submit).
+        engine._positions["p3"] = make_spread(
+            strategy_name="credit_spread", position_id="p3",
+            legs=[PositionLeg("SPY260618P00568000", -1, side="SELL"),
+                  PositionLeg("SPY260618P00558000", 1, side="BUY")],
+        )
+        engine._spread_owner_strategy["p3"] = strategy
+        engine._lifecycle_begin_spread(
+            position_id="p3", strategy_name="credit_spread",
+            symbol="SPY260618P00568000", qty=1,
+        )
+        engine._lifecycle_mark_spread_open(
+            position_id="p3", avg_entry_price=1.45, current_qty=1.0,
+        )
+        engine.lifecycle_orders_store.insert_pending(
+            position_uid=spread_substrate_uid("p3"),
+            role="exit", client_order_id="engine-close-cloid",
+            order_type="limit", order_class="mleg", time_in_force="day",
+            side="buy", intended_qty=1.0,
+        )
+        # Engine drains the queue — substrate row gets order_id
+        # attached without waiting for the close to complete.
+        engine._drain_lifecycle_close_attaches()
+        row = engine.lifecycle_orders_store.get_by_client_order_id(
+            "engine-close-cloid"
+        )
+        assert row.status == "pending"
+        assert row.order_id == "broker-step-1"
+        # Subsequent walk step OVERWRITES the order_id (walk-step
+        # semantics: only one broker order is alive at a time, and
+        # the substrate row must track the current in-flight id so
+        # the reconciler can poll the right id).
+        broker.drain_lifecycle_close_attaches.return_value = [
+            ("engine-close-cloid", "broker-step-2", None),
+        ]
+        engine._drain_lifecycle_close_attaches()
+        row2 = engine.lifecycle_orders_store.get_by_client_order_id(
+            "engine-close-cloid"
+        )
+        assert row2.order_id == "broker-step-2"  # overwrote
+
+    def test_attach_or_update_order_id_for_walk_step_no_op_on_terminal(
+        self, tmp_path,
+    ):
+        """The walk-step attach method must NOT revive a terminal
+        row — protects against race where the close terminates
+        before a late attach event drains."""
+        from engine.positions import spread_substrate_uid
+        strategy = _strategy()
+        engine, _ = _engine(tmp_path, strategy)
+        # Setup parent + pending close row, then immediately mark
+        # the row terminal.
+        engine._positions["p4"] = MagicMock(is_spread=True, is_single_leg=False,
+                                            strategy_name="credit_spread")
+        engine._lifecycle_begin_spread(
+            position_id="p4", strategy_name="credit_spread",
+            symbol="SPY260618P00568000", qty=1,
+        )
+        engine.lifecycle_orders_store.insert_pending(
+            position_uid=spread_substrate_uid("p4"),
+            role="exit", client_order_id="cloid-p4",
+            order_type="limit", order_class="mleg", time_in_force="day",
+            side="buy", intended_qty=1.0,
+        )
+        engine.lifecycle_orders_store.mark_terminal_after_dispatch(
+            client_order_id="cloid-p4", broker_order_id="b-1",
+            status="filled", filled_qty=1.0, avg_fill_price=0.60,
+        )
+        # Late attach attempt — must be a no-op (return False).
+        updated = (
+            engine.lifecycle_orders_store
+            .attach_or_update_order_id_for_walk_step(
+                client_order_id="cloid-p4",
+                order_id="b-2-late",
+            )
+        )
+        assert updated is False
+        # Row unchanged.
+        row = engine.lifecycle_orders_store.get_by_client_order_id("cloid-p4")
+        assert row.order_id == "b-1"
+        assert row.status == "filled"
+
+    def test_attach_or_update_returns_false_on_missing_row(self, tmp_path):
+        strategy = _strategy()
+        engine, _ = _engine(tmp_path, strategy)
+        updated = (
+            engine.lifecycle_orders_store
+            .attach_or_update_order_id_for_walk_step(
+                client_order_id="unknown-cloid",
+                order_id="b-1",
+            )
+        )
+        assert updated is False
+
+    def test_durable_attach_persists_order_id_before_engine_drain(
+        self, tmp_path,
+    ):
+        """C10 acceptance — the actual crash-durability claim.
+
+        Construct a SpreadExecutionWorker pointing at the real trade
+        DB and the engine's pre-inserted substrate cloid. Call the
+        worker's durable-attach helper directly (simulating what
+        runs synchronously from the worker thread right after a
+        successful broker submit). The substrate row must show
+        order_id NOT NULL BEFORE the engine's queue drain runs.
+
+        This is what the prior in-memory-queue-only fix could not
+        prove: a 'crash' (here: simply 'don't drain the queue') still
+        leaves a recoverable substrate row.
+        """
+        from engine.positions import (
+            make_spread, PositionLeg, spread_substrate_uid,
+        )
+        from execution.options_executor import (
+            SpreadExecutionWorker, SpreadLeg,
+        )
+        from execution.broker import Side
+        strategy = _strategy()
+        engine, _ = _engine(tmp_path, strategy)
+        # Open spread + parent lifecycle row + pre-inserted pending
+        # close substrate row (the moment between insert and submit).
+        engine._positions["p_durable"] = make_spread(
+            strategy_name="credit_spread", position_id="p_durable",
+            legs=[PositionLeg("SPY260618P00568000", -1, side="SELL"),
+                  PositionLeg("SPY260618P00558000", 1, side="BUY")],
+        )
+        engine._spread_owner_strategy["p_durable"] = strategy
+        engine._lifecycle_begin_spread(
+            position_id="p_durable", strategy_name="credit_spread",
+            symbol="SPY260618P00568000", qty=1,
+        )
+        engine._lifecycle_mark_spread_open(
+            position_id="p_durable", avg_entry_price=1.45, current_qty=1.0,
+        )
+        engine.lifecycle_orders_store.insert_pending(
+            position_uid=spread_substrate_uid("p_durable"),
+            role="exit", client_order_id="durable-cloid",
+            order_type="limit", order_class="mleg", time_in_force="day",
+            side="buy", intended_qty=1.0,
+        )
+        # Build a worker pointed at the SAME trade DB and substrate
+        # cloid. The api is stubbed because we're only exercising
+        # the durable-attach helper, not the full submit flow.
+        worker = SpreadExecutionWorker(
+            legs=[
+                SpreadLeg(occ_symbol="SPY260618P00568000",
+                          side=Side.SELL, opening=False),
+                SpreadLeg(occ_symbol="SPY260618P00558000",
+                          side=Side.BUY, opening=False),
+            ],
+            qty=1, limit_price=0.60, strategy_name="credit_spread",
+            api=MagicMock(),
+            substrate_cloid="durable-cloid",
+            substrate_db_path=engine.trade_logger.path,
+        )
+        # Simulate "broker submit returned id=broker-id-99; about to
+        # crash before any engine drain runs."
+        worker._fire_on_submitted("broker-id-99")
+        # The substrate row is durably updated. Open a FRESH store
+        # connection (mimicking a restarted process) to verify the
+        # write hit disk, not just the engine's in-memory connection
+        # cache.
+        import sqlite3 as _sqlite3
+        conn = _sqlite3.connect(engine.trade_logger.path)
+        try:
+            row = conn.execute(
+                "SELECT order_id, status FROM position_lifecycle_orders "
+                "WHERE client_order_id = ?",
+                ("durable-cloid",),
+            ).fetchone()
+        finally:
+            conn.close()
+        assert row is not None
+        assert row[0] == "broker-id-99"  # order_id durably attached
+        assert row[1] == "pending"  # status untouched
+
+    def test_durable_attach_walk_step_overwrites_previous_order_id(
+        self, tmp_path,
+    ):
+        """Walk steps overwrite the substrate's order_id (only one
+        broker order alive at a time; substrate must track the
+        current in-flight id). Confirms the UPDATE in the durable
+        path matches the in-memory queue's
+        ``attach_or_update_order_id_for_walk_step`` semantics."""
+        from engine.positions import (
+            make_spread, PositionLeg, spread_substrate_uid,
+        )
+        from execution.options_executor import (
+            SpreadExecutionWorker, SpreadLeg,
+        )
+        from execution.broker import Side
+        strategy = _strategy()
+        engine, _ = _engine(tmp_path, strategy)
+        engine._positions["p_walk"] = make_spread(
+            strategy_name="credit_spread", position_id="p_walk",
+            legs=[PositionLeg("SPY260618P00568000", -1, side="SELL"),
+                  PositionLeg("SPY260618P00558000", 1, side="BUY")],
+        )
+        engine._spread_owner_strategy["p_walk"] = strategy
+        engine._lifecycle_begin_spread(
+            position_id="p_walk", strategy_name="credit_spread",
+            symbol="SPY260618P00568000", qty=1,
+        )
+        engine._lifecycle_mark_spread_open(
+            position_id="p_walk", avg_entry_price=1.45, current_qty=1.0,
+        )
+        engine.lifecycle_orders_store.insert_pending(
+            position_uid=spread_substrate_uid("p_walk"),
+            role="exit", client_order_id="walk-cloid",
+            order_type="limit", order_class="mleg", time_in_force="day",
+            side="buy", intended_qty=1.0,
+        )
+        worker = SpreadExecutionWorker(
+            legs=[
+                SpreadLeg(occ_symbol="SPY260618P00568000",
+                          side=Side.SELL, opening=False),
+                SpreadLeg(occ_symbol="SPY260618P00558000",
+                          side=Side.BUY, opening=False),
+            ],
+            qty=1, limit_price=0.60, strategy_name="credit_spread",
+            api=MagicMock(),
+            substrate_cloid="walk-cloid",
+            substrate_db_path=engine.trade_logger.path,
+        )
+        # Two consecutive walk steps.
+        worker._fire_on_submitted("broker-step-1")
+        worker._fire_on_submitted("broker-step-2")
+        import sqlite3 as _sqlite3
+        conn = _sqlite3.connect(engine.trade_logger.path)
+        try:
+            row = conn.execute(
+                "SELECT order_id FROM position_lifecycle_orders "
+                "WHERE client_order_id = ?",
+                ("walk-cloid",),
+            ).fetchone()
+        finally:
+            conn.close()
+        assert row[0] == "broker-step-2"  # overwrote
+
+    def test_durable_attach_no_op_on_terminal_row(self, tmp_path):
+        """If the close already terminated, a late durable attach
+        from a stale worker callback must not revive the row."""
+        from engine.positions import (
+            make_spread, PositionLeg, spread_substrate_uid,
+        )
+        from execution.options_executor import (
+            SpreadExecutionWorker, SpreadLeg,
+        )
+        from execution.broker import Side
+        strategy = _strategy()
+        engine, _ = _engine(tmp_path, strategy)
+        engine._positions["p_term"] = make_spread(
+            strategy_name="credit_spread", position_id="p_term",
+            legs=[PositionLeg("SPY260618P00568000", -1, side="SELL"),
+                  PositionLeg("SPY260618P00558000", 1, side="BUY")],
+        )
+        engine._lifecycle_begin_spread(
+            position_id="p_term", strategy_name="credit_spread",
+            symbol="SPY260618P00568000", qty=1,
+        )
+        engine.lifecycle_orders_store.insert_pending(
+            position_uid=spread_substrate_uid("p_term"),
+            role="exit", client_order_id="term-cloid",
+            order_type="limit", order_class="mleg", time_in_force="day",
+            side="buy", intended_qty=1.0,
+        )
+        engine.lifecycle_orders_store.mark_terminal_after_dispatch(
+            client_order_id="term-cloid", broker_order_id="b-1",
+            status="filled", filled_qty=1.0, avg_fill_price=0.60,
+        )
+        worker = SpreadExecutionWorker(
+            legs=[
+                SpreadLeg(occ_symbol="SPY260618P00568000",
+                          side=Side.SELL, opening=False),
+                SpreadLeg(occ_symbol="SPY260618P00558000",
+                          side=Side.BUY, opening=False),
+            ],
+            qty=1, limit_price=0.60, strategy_name="credit_spread",
+            api=MagicMock(),
+            substrate_cloid="term-cloid",
+            substrate_db_path=engine.trade_logger.path,
+        )
+        worker._fire_on_submitted("b-late-99")
+        # Row unchanged (filled, order_id=b-1).
+        import sqlite3 as _sqlite3
+        conn = _sqlite3.connect(engine.trade_logger.path)
+        try:
+            row = conn.execute(
+                "SELECT order_id, status FROM position_lifecycle_orders "
+                "WHERE client_order_id = ?",
+                ("term-cloid",),
+            ).fetchone()
+        finally:
+            conn.close()
+        assert row[0] == "b-1"
+        assert row[1] == "filled"
+
+    def test_restart_gap_closure_partial_then_crash_then_restart(
+        self, tmp_path,
+    ):
+        """The acceptance test: bot crashes between partial detection
+        and residual fill. On restart, the partial_close placeholder is
+        still on disk, so the next dispatch attempt is blocked by the
+        unique index — no duplicate dispatch."""
+        from engine.positions import (
+            make_spread, PositionLeg, spread_substrate_uid,
+        )
+        # Phase 1: open a 2-contract spread, dispatch a close, observe
+        # a partial fill. This leaves a substrate state that survives
+        # restart.
+        strategy = _strategy()
+        engine, broker = _engine(tmp_path, strategy)
+        engine._positions["p2"] = make_spread(
+            strategy_name="credit_spread", position_id="p2",
+            legs=[PositionLeg("SPY260618P00568000", -2, side="SELL"),
+                  PositionLeg("SPY260618P00558000", 2, side="BUY")],
+        )
+        engine._spread_owner_strategy["p2"] = strategy
+        engine._pending_spread_plans["p2"] = _pick()
+        spread_2 = OpenSpread(
+            position_id="p2",
+            short_occ="SPY260618P00568000",
+            long_occ="SPY260618P00558000",
+            short_strike=568.0, long_strike=558.0,
+            expiration_date=_EXP, net_credit=1.45, width=10.0, qty=2,
+        )
+        strategy.register_spread(spread_2)
+        engine._lifecycle_begin_spread(
+            position_id="p2", strategy_name="credit_spread",
+            symbol="SPY260618P00568000", qty=2,
+        )
+        engine._lifecycle_mark_spread_open(
+            position_id="p2", avg_entry_price=1.45, current_qty=2.0,
+        )
+        engine.lifecycle_orders_store.insert_pending(
+            position_uid=spread_substrate_uid("p2"),
+            role="exit", client_order_id="close-cloid-2",
+            order_type="limit", order_class="mleg", time_in_force="day",
+            side="buy", intended_qty=2.0,
+        )
+        engine.lifecycle_orders_store.attach_broker_order_id(
+            client_order_id="close-cloid-2", order_id="broker-id-2",
+        )
+        # Drain a partial fill — leaves a partial_close placeholder.
+        broker.drain_spread_fills.return_value = [
+            ("p2", "credit_spread", True, "filled", 1.0, 0.60,
+             "broker-id-2", 0.60),
+        ]
+        engine._drain_spread_fills()
+        # Phase 2: simulate restart by creating a brand-new engine on
+        # the same DB. The in-memory `_spreads_pending_close` is empty.
+        # The substrate's partial_close placeholder must still be
+        # present and the position must still be locked.
+        strategy_new = _strategy()
+        broker_new = MagicMock()
+        broker_new.sync_with_broker.return_value = SimpleNamespace(
+            account=SimpleNamespace(
+                open_positions={
+                    "SPY260618P00568000": SimpleNamespace(qty=-1, avg_entry_price=1.55),
+                    "SPY260618P00558000": SimpleNamespace(qty=1, avg_entry_price=0.10),
+                },
+                equity=100_000.0,
+            ),
+            open_orders=[],
+        )
+        risk = RiskManager(
+            max_position_pct=0.02, max_open_positions=5,
+            max_gross_exposure_pct=0.50, atr_stop_multiplier=2.0,
+            max_daily_loss_pct=0.05, hard_dollar_loss_cap=1_000_000.0,
+            loss_streak_threshold=10, broker_error_threshold=10,
+        )
+        engine_restart = TradingEngine(
+            strategy=strategy_new, symbols=["SPY"], risk=risk,
+            broker=broker_new,
+            # Re-open the SAME trade DB on disk.
+            trade_logger=TradeLogger(path=str(tmp_path / "trades.db")),
+            config=EngineConfig(
+                history_lookback_days=120, cycle_interval_seconds=0.01,
+                max_bar_age_multiplier=10.0, market_hours_only=False,
+            ),
+        )
+        # Substrate is loaded from disk. The partial_close placeholder
+        # must still be present and non-terminal.
+        rows = (
+            engine_restart.lifecycle_orders_store
+            .get_non_terminal_spread_close_rows()
+        )
+        assert len(rows) == 1
+        assert rows[0].role == "partial_close"
+        assert rows[0].intended_qty == 1.0  # residual qty
+        # The duplicate-dispatch block fires: attempting to insert a
+        # NEW exit row for this position is refused.
+        assert engine_restart._lifecycle_orders_insert_spread_close(
+            position_id="p2", role="exit",
+            client_order_id="restart-attempt-cloid", qty=1.0,
         ) is False

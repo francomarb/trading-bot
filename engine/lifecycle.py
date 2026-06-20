@@ -550,6 +550,7 @@ class PositionLifecycleStore:
         first_fill_at: str | None = None,
         legs: Iterable[PositionLifecycleLeg] = (),
         backfill_note: str = "synthesized at startup from broker state",
+        position_uid: str | None = None,
     ) -> str:
         """Idempotent backfill helper: ensure an open lifecycle row
         exists for a broker-open position the bot didn't originate.
@@ -563,12 +564,20 @@ class PositionLifecycleStore:
         Used by `engine.trader._backfill_position_lifecycle()` on
         startup so the operator CLI can see and act on positions that
         existed before this code shipped.
+
+        Spread backfill (PR §10.7) passes ``position_uid`` so the
+        substrate uid stays deterministically derived from the raw
+        ``position_id`` (``spread_substrate_uid``). Single-leg backfill
+        leaves it None and the helper generates a fresh uid.
         """
         existing = self.get_open_for_owner_key(owner_key)
         if existing is not None:
             return existing.position_uid
 
-        position_uid = new_position_uid()
+        if position_uid is None:
+            position_uid = new_position_uid()
+        else:
+            _validate_position_uid(position_uid)
         now = _utc_now_iso()
         first = first_fill_at or now
         meta = {

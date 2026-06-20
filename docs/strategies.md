@@ -450,7 +450,7 @@ Entry:
 
 Exit:
 1. `_process_credit_spread_exits` runs before any entry gating (exits are never blocked by halt / regime / sleeve). Iterates `strategy.open_spreads`; for each runs `evaluate_spread_exit`.
-2. On a trigger: `broker.dispatch_spread_order(closing=True, position_id=<existing>)` — the broker reverses the legs into the `*_TO_CLOSE` trade and the same worker handles it. The close order's positive debit limit is the current modeled spread mid (`short mid − long mid`), rounded to cents. The `position_id` is added to `_spreads_pending_close` so the exit path doesn't double-submit.
+2. On a trigger: `broker.dispatch_spread_order(closing=True, position_id=<existing>)` — the broker reverses the legs into the `*_TO_CLOSE` trade and the same worker handles it. The close order's positive debit limit is the current modeled spread mid (`short mid − long mid`), rounded to cents. A pending close row is inserted into `position_lifecycle_orders` (role=`exit`) before dispatch; the substrate's `uniq_one_active_close_per_position` partial unique index is what blocks double-submission of a close. Restart-safe (§10.7 spread lifecycle PR).
 3. On the close fill: `_drain_spread_fills` close path drops the `Position`, releases it on the strategy, records realized P&L `= (net_credit − net_debit) × qty × 100` into the **allocator's HWM / sleeve-drawdown gate**, and writes the close row to the trade DB. **If the fill price is unavailable** (stream "filled" + REST follow-up failure) the position still closes but realized P&L is left unset, never fabricated to zero.
 
 Current paper behavior on an unfilled close timeout is **cancel + retry later**,
