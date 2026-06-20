@@ -5373,6 +5373,249 @@ class TestOptionTrailingLifecycleOrderIdFK:
         assert row.alpaca_stop_order_id == "replacement-stop"
 
 
+class TestOptionTrailingFKPreservationOnTransientError:
+    """PR #71 review P1 #2 + P2: FK survives lookup failures, defends roles."""
+
+    GenericOptionStrategy = (
+        TestGenericSingleLegOptionTrailingStops.GenericOptionStrategy
+    )
+
+    def _engine(self, tmp_path):
+        engine, broker = TestGenericSingleLegOptionTrailingStops()._engine(
+            tmp_path
+        )
+        return engine, broker
+
+    def _seed_fk(self, engine, *, fk: int) -> None:
+        engine.option_trailing_store.upsert(
+            position_uid="pos_abc123",
+            occ_symbol="SPY260618C00746000",
+            strategy="generic_single_leg_options",
+            owner_key="SPY",
+            qty=3,
+            entry_premium=12.77,
+            hwm_premium=20.16,
+            trail_activation_pct=0.10,
+            trail_pct=0.15,
+            current_stop_price=17.14,
+            alpaca_stop_order_id="old-stop",
+            stop_order_status="accepted",
+            last_observed_premium=15.50,
+            lifecycle_order_id=fk,
+        )
+
+    def test_lookup_failed_sentinel_preserves_prior_fk(self, tmp_path):
+        """Transient store exception must not demote FK to NULL."""
+        engine, _broker = self._engine(tmp_path)
+        # Seed substrate so the FK is valid up front, then break the
+        # store at read time.
+        old_id = engine.lifecycle_orders_store.insert_pending(
+            position_uid="pos_abc123",
+            role="protective_stop",
+            client_order_id="seed-cid",
+            order_type="stop",
+            order_class="simple",
+            time_in_force="gtc",
+            side="sell",
+            intended_qty=3.0,
+            intended_stop_price=17.14,
+        )
+        engine.lifecycle_orders_store.attach_broker_order_id(
+            client_order_id="seed-cid", order_id="old-stop",
+        )
+        self._seed_fk(engine, fk=old_id)
+
+        engine.lifecycle_orders_store.get_by_order_id = MagicMock(
+            side_effect=RuntimeError("transient store error")
+        )
+        engine.lifecycle_orders_store.get_by_client_order_id = MagicMock(
+            side_effect=RuntimeError("transient store error")
+        )
+
+        resolved = engine._resolve_trailing_fk_or_preserve(
+            broker_order_id="some-new-id",
+            client_order_id="some-cid",
+            previous_fk=old_id,
+            previous_mirror_order_id="totally-different",
+            owner="generic_single_leg_options",
+            occ="SPY260618C00746000",
+            load_bearing=False,
+        )
+
+        assert resolved == old_id  # preserved across the exception
+
+    def test_preserve_skips_lookup_when_broker_order_id_unchanged(
+        self, tmp_path
+    ):
+        """Adequate-stop / replace-failed paths must not query each cycle."""
+        engine, _broker = self._engine(tmp_path)
+        engine.lifecycle_orders_store.get_by_order_id = MagicMock()
+
+        resolved = engine._resolve_trailing_fk_or_preserve(
+            broker_order_id="old-stop",
+            client_order_id="seed-cid",
+            previous_fk=77,
+            previous_mirror_order_id="old-stop",
+            owner="generic_single_leg_options",
+            occ="SPY260618C00746000",
+            load_bearing=False,
+        )
+
+        assert resolved == 77
+        engine.lifecycle_orders_store.get_by_order_id.assert_not_called()
+
+    def test_orphan_recovery_via_client_order_id(self, tmp_path):
+        """attach_broker_order_id failure leaves order_id=NULL — recover."""
+        engine, _broker = self._engine(tmp_path)
+        # Simulate the orphan: substrate row inserted, attach failed,
+        # so order_id is NULL but client_order_id is set.
+        orphan_id = engine.lifecycle_orders_store.insert_pending(
+            position_uid="pos_abc123",
+            role="protective_stop",
+            client_order_id="orphan-cid",
+            order_type="stop",
+            order_class="simple",
+            time_in_force="gtc",
+            side="sell",
+            intended_qty=3.0,
+            intended_stop_price=17.14,
+        )
+
+        # Engine resolves with the broker order_id + the client_order_id
+        # we have post-submit.
+        resolved = engine._lifecycle_order_id_for(
+            "broker-real-id",
+            client_order_id="orphan-cid",
+        )
+
+        assert resolved == orphan_id
+        # Opportunistic re-attach happened in the lookup.
+        substrate = engine.lifecycle_orders_store.get_by_id(orphan_id)
+        assert substrate.order_id == "broker-real-id"
+
+    def test_load_bearing_miss_emits_critical(self, tmp_path):
+        """Submit/replace success path must surface orphan condition."""
+        from loguru import logger as _logger
+        engine, _broker = self._engine(tmp_path)
+
+        captured: list[str] = []
+        sink_id = _logger.add(
+            lambda msg: captured.append(str(msg)),
+            level="CRITICAL",
+            format="{message}",
+        )
+        try:
+            resolved = engine._resolve_trailing_fk_or_preserve(
+                broker_order_id="ghost-stop",
+                client_order_id="ghost-cid",
+                previous_fk=None,
+                previous_mirror_order_id=None,
+                owner="generic_single_leg_options",
+                occ="SPY260618C00746000",
+                load_bearing=True,
+            )
+        finally:
+            _logger.remove(sink_id)
+
+        assert resolved is None
+        assert any("FK could not be resolved" in line for line in captured)
+
+    def test_non_load_bearing_miss_silent(self, tmp_path):
+        """Preserve paths must not log CRITICAL on a genuine not-found."""
+        from loguru import logger as _logger
+        engine, _broker = self._engine(tmp_path)
+
+        captured: list[str] = []
+        sink_id = _logger.add(
+            lambda msg: captured.append(str(msg)),
+            level="CRITICAL",
+            format="{message}",
+        )
+        try:
+            resolved = engine._resolve_trailing_fk_or_preserve(
+                broker_order_id="ghost-stop",
+                client_order_id="ghost-cid",
+                previous_fk=None,
+                previous_mirror_order_id=None,
+                owner="generic_single_leg_options",
+                occ="SPY260618C00746000",
+                load_bearing=False,
+            )
+        finally:
+            _logger.remove(sink_id)
+
+        assert resolved is None
+        assert not any("FK could not be resolved" in line for line in captured)
+
+    def test_authoritative_identity_rejects_role_mismatch(self, tmp_path):
+        """FK pointing at an entry_primary row → fall back to mirror."""
+        engine, _broker = self._engine(tmp_path)
+        cross_id = engine.lifecycle_orders_store.insert_pending(
+            position_uid="pos_abc123",
+            role="entry_primary",
+            client_order_id="entry-cid",
+            order_type="market",
+            order_class="simple",
+            time_in_force="day",
+            side="buy",
+            intended_qty=3.0,
+        )
+        engine.lifecycle_orders_store.attach_broker_order_id(
+            client_order_id="entry-cid", order_id="entry-broker-id",
+        )
+        self._seed_fk(engine, fk=cross_id)
+        row = engine.option_trailing_store.get_by_occ("SPY260618C00746000")
+
+        order_id, status = engine._option_trailing_authoritative_identity(row)
+
+        # Mirror, not substrate, because the substrate role is wrong.
+        assert order_id == "old-stop"
+        assert status == "accepted"
+
+    def test_authoritative_identity_rejects_position_uid_mismatch(
+        self, tmp_path
+    ):
+        """FK pointing at another position's stop → fall back to mirror."""
+        engine, _broker = self._engine(tmp_path)
+        # Create a second position + its protective_stop row. Different
+        # owner_key so the active-position uniqueness index doesn't fire.
+        engine.lifecycle_store.create_pending(
+            position_uid="pos_OTHER",
+            symbol="QQQ260618C00450000",
+            owner_key="QQQ",
+            strategy="generic_single_leg_options",
+            position_type="single_leg",
+            entry_qty=1,
+        )
+        engine.lifecycle_store.mark_open(
+            position_uid="pos_OTHER",
+            avg_entry_price=10.0,
+            current_qty=1,
+        )
+        other_id = engine.lifecycle_orders_store.insert_pending(
+            position_uid="pos_OTHER",
+            role="protective_stop",
+            client_order_id="other-cid",
+            order_type="stop",
+            order_class="simple",
+            time_in_force="gtc",
+            side="sell",
+            intended_qty=1.0,
+            intended_stop_price=8.0,
+        )
+        engine.lifecycle_orders_store.attach_broker_order_id(
+            client_order_id="other-cid", order_id="other-broker-id",
+        )
+        self._seed_fk(engine, fk=other_id)
+        row = engine.option_trailing_store.get_by_occ("SPY260618C00746000")
+
+        order_id, status = engine._option_trailing_authoritative_identity(row)
+
+        # Mirror, not substrate.
+        assert order_id == "old-stop"
+        assert status == "accepted"
+
+
 # ── Shared-symbol conflict rejection (11.7 Part A) ─────────────────────────
 
 
