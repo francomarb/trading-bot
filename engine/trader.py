@@ -5187,6 +5187,15 @@ class TradingEngine:
         retry_grace = max(120.0, float(self.config.cycle_interval_seconds) * 2.0)
         return 0.0 <= age.total_seconds() <= retry_grace
 
+    # Roles a trailing row's FK is allowed to point at — the broker
+    # stop is either the original protective_stop or its post-ratchet
+    # replacement_stop. Anything else (entry_primary, exit, etc.) is a
+    # cross-wiring bug or recovery race; we MUST NOT consult it for
+    # duplicate-submit suppression (PR #71 review P2).
+    _ALLOWED_TRAILING_FK_ROLES: frozenset[str] = frozenset(
+        {"protective_stop", "replacement_stop"}
+    )
+
     def _option_trailing_authoritative_identity(
         self, row
     ) -> tuple[str | None, str | None]:
@@ -5198,6 +5207,16 @@ class TradingEngine:
         rows whose FK is still NULL (e.g. trailing state for a broker
         stop that predates the foundation, before cycle reconciliation
         has had a chance to backfill the substrate row).
+
+        Defensive validation (PR #71 review P2): the FK only proves the
+        substrate row exists. On a fresh DB the SQLite FK enforces the
+        relationship; on legacy DBs the FK constraint is absent and a
+        bad write or recovery race could leave the FK pointing at an
+        unrelated row. Before trusting the substrate fields we verify
+        that ``position_uid`` matches and ``role`` is a stop role; on
+        mismatch we log CRITICAL and fall back to the mirror columns
+        so a wrong substrate row never influences duplicate-submit
+        suppression.
         """
         mirror_order_id = getattr(row, "alpaca_stop_order_id", None)
         mirror_status = getattr(row, "stop_order_status", None)
@@ -5216,6 +5235,33 @@ class TradingEngine:
             )
             return mirror_order_id, mirror_status
         if substrate is None:
+            return mirror_order_id, mirror_status
+        # Defensive validation — see docstring.
+        row_position_uid = getattr(row, "position_uid", None)
+        if (
+            row_position_uid is not None
+            and substrate.position_uid != row_position_uid
+        ):
+            logger.critical(
+                f"option trailing FK position_uid mismatch: trailing row "
+                f"{getattr(row, 'occ_symbol', '?')} "
+                f"position_uid={row_position_uid} but "
+                f"position_lifecycle_orders.id={lifecycle_order_id} has "
+                f"position_uid={substrate.position_uid} (role="
+                f"{substrate.role}). Falling back to mirror columns for "
+                f"this read; investigate cross-wiring or recovery race."
+            )
+            return mirror_order_id, mirror_status
+        if substrate.role not in self._ALLOWED_TRAILING_FK_ROLES:
+            logger.critical(
+                f"option trailing FK role mismatch: trailing row "
+                f"{getattr(row, 'occ_symbol', '?')} → "
+                f"position_lifecycle_orders.id={lifecycle_order_id} has "
+                f"role={substrate.role!r} (expected one of "
+                f"{sorted(self._ALLOWED_TRAILING_FK_ROLES)}). Falling "
+                f"back to mirror columns for this read; investigate "
+                f"cross-wiring or recovery race."
+            )
             return mirror_order_id, mirror_status
         return (
             substrate.order_id or mirror_order_id,
