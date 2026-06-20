@@ -208,8 +208,13 @@ All credential and DB routing derives from `LIVE_TRADING`. Do not set
 - Branching: default to `main` for routine work, docs, and small hotfixes.
   Use a feature branch + PR for substantive features or anything that wants
   review before landing.
-- Bot lifecycle: use `start_bot.sh` / `stop_bot.sh` / `recycle_bot.sh` — never
-  send raw tmux keys to the bot session.
+- Bot lifecycle: always use the scripts (`start_bot.sh` / `stop_bot.sh` /
+  `recycle_bot.sh`) — never send raw tmux keys to the bot session. Before
+  running any of them yourself, **ask the operator first** and proceed only
+  after explicit confirmation. The scripts are reversible enough to be
+  fine when authorized, but a stop/start during market hours can drop
+  an in-flight close attempt or interrupt a fill being observed, so the
+  operator decides timing.
 
 ---
 
