@@ -95,6 +95,32 @@ def _utc_now_iso() -> str:
 
 
 @dataclass(frozen=True)
+class JoinedOptionTrailingRow:
+    """Trailing row paired with substrate-authoritative identity / status.
+
+    Returned by ``OptionTrailingStopStore.get_by_occ_joined``. The
+    substrate fields are ``None`` when the FK is unpopulated (legacy
+    row, or new row whose substrate insert hasn't caught up yet) — the
+    caller must fall back to ``trailing.alpaca_stop_order_id`` /
+    ``trailing.stop_order_status`` in that case.
+    """
+
+    trailing: "OptionTrailingStopRow"
+    substrate_order_id: str | None
+    substrate_status: str | None
+
+    @property
+    def authoritative_order_id(self) -> str | None:
+        """Substrate order_id when present, else the mirror column."""
+        return self.substrate_order_id or self.trailing.alpaca_stop_order_id
+
+    @property
+    def authoritative_status(self) -> str | None:
+        """Substrate status when present, else the mirror column."""
+        return self.substrate_status or self.trailing.stop_order_status
+
+
+@dataclass(frozen=True)
 class OptionTrailingStopRow:
     """One durable trailing-stop row for a single-leg option position.
 
@@ -229,6 +255,50 @@ class OptionTrailingStopStore:
             return None
         return OptionTrailingStopRow(*row)
 
+    def get_by_occ_joined(
+        self, occ_symbol: str
+    ) -> "JoinedOptionTrailingRow | None":
+        """Read the trailing row plus substrate-authoritative identity / status.
+
+        Joins through ``option_trailing_stops.lifecycle_order_id`` →
+        ``position_lifecycle_orders.id``. The substrate columns are the
+        canonical source of broker identity / status post-§10.4; the
+        denormalized mirror columns on ``option_trailing_stops`` are
+        kept in sync by the writer but should not drive decisions when
+        the FK is populated.
+
+        Returns ``None`` when the trailing row is absent. When the FK
+        is NULL (legacy rows pre-migration, or rows written before the
+        substrate caught up) the substrate fields are ``None`` and the
+        caller must fall back to the mirror columns.
+        """
+        row = self._conn.execute(
+            """
+            SELECT
+                ots.position_uid, ots.occ_symbol, ots.strategy,
+                ots.owner_key, ots.qty,
+                ots.entry_premium, ots.hwm_premium,
+                ots.trail_activation_pct, ots.trail_pct,
+                ots.current_stop_price,
+                ots.alpaca_stop_order_id, ots.stop_order_status,
+                ots.last_observed_premium, ots.last_updated_at,
+                ots.lifecycle_order_id,
+                plo.order_id, plo.status
+            FROM option_trailing_stops AS ots
+            LEFT JOIN position_lifecycle_orders AS plo
+                ON ots.lifecycle_order_id = plo.id
+            WHERE ots.occ_symbol = ?
+            """,
+            (occ_symbol,),
+        ).fetchone()
+        if row is None:
+            return None
+        return JoinedOptionTrailingRow(
+            trailing=OptionTrailingStopRow(*row[:15]),
+            substrate_order_id=row[15],
+            substrate_status=row[16],
+        )
+
     def delete_by_occ(self, occ_symbol: str) -> None:
         self._conn.execute(
             "DELETE FROM option_trailing_stops WHERE occ_symbol = ?",
@@ -238,6 +308,7 @@ class OptionTrailingStopStore:
 
 
 __all__ = [
+    "JoinedOptionTrailingRow",
     "OptionTrailingStopRow",
     "OptionTrailingStopStore",
     "_CREATE_OPTION_TRAILING_STOPS_SQL",

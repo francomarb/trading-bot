@@ -5034,10 +5034,20 @@ class TradingEngine:
         return None if row is None else row.id
 
     def _recent_option_stop_submit_pending(self, row) -> bool:
-        """True when a just-submitted option stop may not show in snapshots yet."""
-        if row is None or not row.alpaca_stop_order_id:
+        """True when a just-submitted option stop may not show in snapshots yet.
+
+        Reads broker identity / status through the lifecycle_order_id FK
+        when populated (substrate-authoritative per PR #59 §10.4); falls
+        back to the denormalized mirror columns otherwise. Both paths
+        preserve the original predicate: a known order_id with a still-
+        accepting status that was last updated within the retry grace.
+        """
+        if row is None:
             return False
-        if row.stop_order_status not in {"accepted", "new", "pending_new", "open"}:
+        order_id, status = self._option_trailing_authoritative_identity(row)
+        if not order_id:
+            return False
+        if status not in {"accepted", "new", "pending_new", "open"}:
             return False
         try:
             updated_at = datetime.fromisoformat(row.last_updated_at)
@@ -5048,6 +5058,41 @@ class TradingEngine:
         age = datetime.now(timezone.utc) - updated_at.astimezone(timezone.utc)
         retry_grace = max(120.0, float(self.config.cycle_interval_seconds) * 2.0)
         return 0.0 <= age.total_seconds() <= retry_grace
+
+    def _option_trailing_authoritative_identity(
+        self, row
+    ) -> tuple[str | None, str | None]:
+        """Return (order_id, status) preferring substrate over the mirror.
+
+        Substrate identity / status (joined via lifecycle_order_id) is
+        the canonical post-§10.4 source. The denormalized mirror columns
+        on ``option_trailing_stops`` remain as a fallback for legacy
+        rows whose FK is still NULL (e.g. trailing state for a broker
+        stop that predates the foundation, before cycle reconciliation
+        has had a chance to backfill the substrate row).
+        """
+        mirror_order_id = getattr(row, "alpaca_stop_order_id", None)
+        mirror_status = getattr(row, "stop_order_status", None)
+        lifecycle_order_id = getattr(row, "lifecycle_order_id", None)
+        if self.lifecycle_orders_store is None or not lifecycle_order_id:
+            return mirror_order_id, mirror_status
+        try:
+            substrate = self.lifecycle_orders_store.get_by_id(
+                int(lifecycle_order_id)
+            )
+        except Exception as exc:
+            logger.debug(
+                f"option trailing substrate lookup raised "
+                f"{type(exc).__name__}: {exc} for "
+                f"lifecycle_order_id={lifecycle_order_id}"
+            )
+            return mirror_order_id, mirror_status
+        if substrate is None:
+            return mirror_order_id, mirror_status
+        return (
+            substrate.order_id or mirror_order_id,
+            substrate.status or mirror_status,
+        )
 
     def _option_ratchet_quote_rejection(
         self,
