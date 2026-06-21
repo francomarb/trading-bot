@@ -1121,6 +1121,25 @@ class TradingEngine:
             # gap on a crash between submit and the close drain.
             self._drain_lifecycle_close_attaches()
             self._drain_lifecycle_events(snapshot)
+            # NULL-order_id cycle sweep — bounded by
+            # _SUBSTRATE_NULL_ATTACH_SWEEP_LIMIT REST calls per
+            # cycle. Common-case payload is empty (no orphans)
+            # so this is zero-cost on healthy cycles. Runs BEFORE
+            # _reconcile_substrate_cycle so newly-attached order_ids
+            # are reachable to the P-2 walker in the same cycle.
+            # Best-effort: any uncaught exception is logged CRITICAL
+            # and absorbed so the cycle proceeds.
+            try:
+                self._sweep_null_order_id_attaches(
+                    snapshot,
+                    reason="cycle",
+                    budget=_SUBSTRATE_NULL_ATTACH_SWEEP_LIMIT,
+                )
+            except Exception as exc:
+                logger.critical(
+                    f"substrate cycle null-attach sweep raised: "
+                    f"{type(exc).__name__}: {exc}. Cycle continues."
+                )
             self._reconcile_substrate_cycle(snapshot)
             # §10.7: spread close reconciler — runs every cycle so
             # rows whose broker order became terminal while the
