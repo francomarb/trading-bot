@@ -825,6 +825,28 @@ class TradingEngine:
         # closes, etc.). Best-effort: never raises into the cycle path.
         self._reconcile_position_lifecycle(startup_snapshot)
 
+        # NULL-order_id startup sweep — recover single-leg substrate
+        # rows orphaned by a crash between async submit and the
+        # attach-queue drain. The lifecycle-attach queue is in-
+        # memory; a crash before drain leaves the row at status=
+        # 'pending' with order_id=NULL, which the P-3 reconciler
+        # below cannot see (it filters order_id IS NOT NULL). The
+        # sweep walks by client_order_id, attaches what the broker
+        # accepted, and marks unknown cloids rejected. Runs BEFORE
+        # the P-3 reconciler so newly-attached order_ids are
+        # immediately reachable. Tracker row 89, 'Known follow-ups'.
+        try:
+            self._sweep_null_order_id_attaches(
+                startup_snapshot, reason="startup", budget=None,
+            )
+        except Exception as exc:
+            logger.critical(
+                f"substrate startup null-attach sweep raised: "
+                f"{type(exc).__name__}: {exc}. The CRITICAL log in "
+                f"_drain_lifecycle_attaches is unaffected and "
+                f"remains the real-time orphan signal."
+            )
+
         # P-3: per-order substrate startup reconciliation. Walk every
         # non-terminal position_lifecycle_orders row whose order_id
         # is NOT in the broker's current open_orders, fetch its
