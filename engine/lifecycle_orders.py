@@ -32,7 +32,7 @@ from __future__ import annotations
 
 import sqlite3
 from dataclasses import dataclass, field
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from typing import Iterable, Sequence
 
 
@@ -1110,6 +1110,98 @@ class PositionLifecycleOrdersStore:
             """,
             (roles[0], roles[1], *sorted(NON_TERMINAL_ORDER_STATUSES)),
         ).fetchall()
+        return [_row_from_tuple(r) for r in rows]
+
+    def get_orphaned_pending_single_leg_orders(
+        self,
+        *,
+        min_age_seconds: int,
+        limit: int | None = None,
+    ) -> list[PositionLifecycleOrderRow]:
+        """Single-leg pending rows where the broker order_id was never
+        attached (orphan candidates for the NULL-order_id REST sweep).
+
+        Returns rows matching ALL of:
+
+          - ``position_lifecycle.position_type = 'single_leg'`` — spreads
+            have their own crash-durable close path (PR #72 §10.7) and
+            must not be touched by this sweep.
+          - ``status = 'pending'`` — once a row reaches
+            working/partially_filled/filled the broker order_id is
+            already known by definition; this query targets rows the
+            attach queue never got to.
+          - ``order_id IS NULL`` — by construction the attach failed
+            or the bot crashed between submit return and the next
+            cycle's drain.
+          - ``client_order_id IS NOT NULL`` — invariant of the
+            schema (NOT NULL column), restated here so the SQL
+            documents the sweep's recovery key.
+          - ``role != 'partial_close'`` — defense-in-depth even though
+            the single-leg filter already excludes spread-only roles.
+            Per PR #72 §10.7 the partial_close placeholder is
+            intentionally order_id=NULL and the operator clears it.
+          - ``created_at <= now - min_age_seconds`` — gives the
+            synchronous attach queue time to drain naturally. The
+            sweep is a safety net, not a replacement for the
+            normal-path attach. 60s is the recommended floor; below
+            ~30s the sweep starts competing with healthy attach
+            flow and produces operator-visible INFO recovery noise
+            for rows that would have self-healed.
+
+        Returns oldest-first (id ASC ≈ created_at ASC since both
+        increase monotonically per insert). LIMIT applied at SQL.
+        Cycle callers should pass a small ``limit`` so the per-row
+        REST cap is enforced before the sweep even reads rows;
+        startup callers pass ``None`` for the full backlog.
+
+        Operator note: the CRITICAL log in `_drain_lifecycle_attaches`
+        is the real-time orphan signal and stays in place after this
+        sweep ships. A successful sweep recovery produces a
+        complementary INFO log so the failure→recovery pair is
+        diagnostic evidence the substrate path is healthy.
+        """
+        if min_age_seconds < 0:
+            raise ValueError(
+                f"min_age_seconds must be >= 0; got {min_age_seconds}"
+            )
+        # Compute the cutoff in Python rather than SQL so the time
+        # source is consistent with _utc_now_iso elsewhere in the
+        # store and so the query stays trivially testable by
+        # patching the cutoff.
+        cutoff = (
+            datetime.now(timezone.utc)
+            - timedelta(seconds=int(min_age_seconds))
+        ).isoformat()
+        sql = (
+            "SELECT plo.id, plo.position_uid, plo.role, plo.order_id, "
+            "plo.client_order_id, plo.order_type, plo.order_class, "
+            "plo.time_in_force, plo.side, plo.intended_qty, "
+            "plo.intended_stop_price, plo.intended_trigger_price, "
+            "plo.intended_limit_price, plo.intended_take_profit_price, "
+            "plo.parent_order_id, plo.replaces_order_id, "
+            "plo.origin_kind, plo.operator_command_uid, "
+            "plo.slippage_benchmark_price, plo.slippage_benchmark_kind, "
+            "plo.slippage_benchmark_timestamp, "
+            "plo.slippage_measurement_quality, "
+            "plo.status, plo.filled_qty, plo.avg_fill_price, "
+            "plo.created_at, plo.submitted_at, plo.terminal_at, "
+            "plo.last_observed_broker_updated_at, plo.last_observed_at "
+            "FROM position_lifecycle_orders plo "
+            "JOIN position_lifecycle pl "
+            "  ON pl.position_uid = plo.position_uid "
+            "WHERE pl.position_type = 'single_leg' "
+            "  AND plo.status = 'pending' "
+            "  AND plo.order_id IS NULL "
+            "  AND plo.client_order_id IS NOT NULL "
+            "  AND plo.role != 'partial_close' "
+            "  AND plo.created_at <= ? "
+            "ORDER BY plo.id ASC"
+        )
+        params: tuple = (cutoff,)
+        if limit is not None:
+            sql += " LIMIT ?"
+            params = (cutoff, int(limit))
+        rows = self._conn.execute(sql, params).fetchall()
         return [_row_from_tuple(r) for r in rows]
 
     def get_non_terminal_by_role(
