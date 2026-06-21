@@ -597,6 +597,145 @@ class TestSweepPr71RaceNoDoubleAttach:
         assert row.status == "working"
 
 
+# ── (R2) Starvation: failing rows must not block newer orphans ────────────
+
+
+class TestSweepStarvationBackoff:
+    """PR #73 review R2: if the oldest orphans repeatedly raise
+    transient broker errors, the sweep must not let them eat the
+    whole REST budget cycle after cycle while younger orphaned
+    live orders sit unreachable.
+
+    Mechanism: drop the SQL LIMIT (query unbounded) + in-loop
+    REST budget + in-memory backoff for non-404 errors so failing
+    rows are skipped on subsequent passes."""
+
+    def test_first_orphan_failing_does_not_starve_newer_within_budget(
+        self,
+        engine: TradingEngine,
+        pos_store: PositionLifecycleStore,
+        orders_store: PositionLifecycleOrdersStore,
+    ):
+        # Seed 4 orphans. The oldest (id ASC) hits a transient
+        # error; the next three must still be reached within the
+        # budget on the SAME pass after the failing row is skipped
+        # against the budget.
+        for i in range(4):
+            _seed_orphan(
+                pos_store=pos_store, orders_store=orders_store,
+                owner_key=f"STARV{i}", cli=f"cli-starv-{i}",
+            )
+
+        def lookup(cli):
+            if cli == "cli-starv-0":
+                raise RuntimeError("transient broker 5xx")
+            return _make_broker_order(order_id=f"alpaca-{cli}")
+
+        engine.broker.get_order_by_client_id_for_sweep = MagicMock(
+            side_effect=lookup,
+        )
+
+        engine._sweep_null_order_id_attaches(
+            _make_snapshot(), reason="cycle", budget=3,
+        )
+
+        # Failing row is armed for backoff; succeeding rows
+        # attached.
+        assert (
+            "cli-starv-0" in engine._null_attach_sweep_backoff
+        )
+        for cli in ("cli-starv-1", "cli-starv-2"):
+            row = orders_store.get_by_client_order_id(cli)
+            assert row.order_id == f"alpaca-{cli}"
+        # 4th orphan was past the budget on this pass; deferred
+        # to next sweep.
+        row3 = orders_store.get_by_client_order_id("cli-starv-3")
+        assert row3.order_id is None
+        # Exactly budget=3 broker calls happened — the failing
+        # one counted because it actually hit the broker.
+        assert (
+            engine.broker.get_order_by_client_id_for_sweep.call_count
+            == 3
+        )
+
+    def test_backed_off_row_skipped_on_next_sweep(
+        self,
+        engine: TradingEngine,
+        pos_store: PositionLifecycleStore,
+        orders_store: PositionLifecycleOrdersStore,
+    ):
+        # Three orphans; the oldest is in backoff from a prior
+        # transient failure. The current sweep must skip it WITHOUT
+        # consuming budget so younger orphans get their turn.
+        for i in range(3):
+            _seed_orphan(
+                pos_store=pos_store, orders_store=orders_store,
+                owner_key=f"BKOFF{i}", cli=f"cli-bkoff-{i}",
+            )
+        engine._null_attach_sweep_backoff["cli-bkoff-0"] = (
+            datetime.now(timezone.utc) + timedelta(minutes=10)
+        )
+        engine.broker.get_order_by_client_id_for_sweep = MagicMock(
+            side_effect=lambda cli: _make_broker_order(
+                order_id=f"alpaca-{cli}",
+            )
+        )
+
+        engine._sweep_null_order_id_attaches(
+            _make_snapshot(), reason="cycle", budget=2,
+        )
+
+        # Backed-off row is untouched; broker never called for it.
+        broker_call_clis = [
+            call.args[0] for call in
+            engine.broker.get_order_by_client_id_for_sweep.call_args_list
+        ]
+        assert "cli-bkoff-0" not in broker_call_clis
+        assert "cli-bkoff-1" in broker_call_clis
+        assert "cli-bkoff-2" in broker_call_clis
+        assert orders_store.get_by_client_order_id(
+            "cli-bkoff-0"
+        ).order_id is None
+        assert orders_store.get_by_client_order_id(
+            "cli-bkoff-1"
+        ).order_id == "alpaca-cli-bkoff-1"
+        assert orders_store.get_by_client_order_id(
+            "cli-bkoff-2"
+        ).order_id == "alpaca-cli-bkoff-2"
+
+    def test_successful_call_clears_prior_backoff(
+        self,
+        engine: TradingEngine,
+        pos_store: PositionLifecycleStore,
+        orders_store: PositionLifecycleOrdersStore,
+    ):
+        # A previously-failing row whose backoff has expired must
+        # have its backoff entry cleared on the next successful
+        # broker call so it can be retried immediately if a future
+        # transient error fires again.
+        _seed_orphan(
+            pos_store=pos_store, orders_store=orders_store,
+            owner_key="CLEAR", cli="cli-clear",
+        )
+        engine._null_attach_sweep_backoff["cli-clear"] = (
+            datetime.now(timezone.utc) - timedelta(minutes=1)
+        )
+        engine.broker.get_order_by_client_id_for_sweep = MagicMock(
+            return_value=_make_broker_order(order_id="alpaca-clear")
+        )
+
+        engine._sweep_null_order_id_attaches(
+            _make_snapshot(), reason="cycle", budget=5,
+        )
+
+        # Backoff entry cleared (expired AND broker call succeeded).
+        assert "cli-clear" not in engine._null_attach_sweep_backoff
+        assert (
+            orders_store.get_by_client_order_id("cli-clear").order_id
+            == "alpaca-clear"
+        )
+
+
 # ── (9) Stale orphan → CRITICAL ────────────────────────────────────────────
 
 

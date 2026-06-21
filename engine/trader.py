@@ -154,6 +154,15 @@ _SUBSTRATE_NULL_ATTACH_SWEEP_MIN_AGE_SECONDS = 60
 # log so the operator knows there is a real anomaly.
 _SUBSTRATE_NULL_ATTACH_SWEEP_STALE_SECONDS = 3600
 
+# In-memory backoff window applied after a broker lookup raises a
+# non-404 error during the NULL-order_id sweep (PR #73 review R2).
+# Without backoff the next cycle would re-query the same orphan
+# first (id ASC) and burn the entire 5-call budget on rows that
+# are persistently failing, starving newer orphans. The window is
+# longer than one cycle so a failing row is skipped for at least
+# one full sweep pass.
+_SUBSTRATE_NULL_ATTACH_SWEEP_BACKOFF_SECONDS = 300
+
 
 @dataclass(frozen=True)
 class _OptionStopAuditContext:
@@ -439,6 +448,12 @@ class TradingEngine:
         except Exception as exc:
             logger.warning(f"lifecycle_orders store init skipped: {exc}")
             self.lifecycle_orders_store = None
+        # In-memory backoff for the NULL-order_id sweep: cloid →
+        # earliest-retry datetime. Populated when a broker lookup
+        # raises a non-404 error so a persistently-failing row
+        # doesn't starve newer orphans across cycles (PR #73 review
+        # R2). Cleared on a successful broker call.
+        self._null_attach_sweep_backoff: dict[str, datetime] = {}
         try:
             self.option_trailing_store = OptionTrailingStopStore(
                 self.trade_logger._ensure_db()
@@ -7326,13 +7341,18 @@ class TradingEngine:
         if self.lifecycle_orders_store is None:
             return
         try:
+            # PR #73 review R2: query unbounded so the per-cycle
+            # budget caps actual REST calls, not rows read. Mirrors
+            # _reconcile_substrate_via_rest's pattern. With LIMIT
+            # at SQL, a persistently-failing oldest row would
+            # repeatedly fill the budget and starve newer orphans.
             orphans = (
                 self.lifecycle_orders_store
                 .get_orphaned_pending_single_leg_orders(
                     min_age_seconds=(
                         _SUBSTRATE_NULL_ATTACH_SWEEP_MIN_AGE_SECONDS
                     ),
-                    limit=budget,
+                    limit=None,
                 )
             )
         except Exception as exc:
@@ -7347,6 +7367,7 @@ class TradingEngine:
         from engine.lifecycle_orders import apply_order_event
 
         rest_calls = 0
+        skipped_for_backoff = 0
         now_utc = datetime.now(timezone.utc)
         stale_cutoff = (
             now_utc
@@ -7355,16 +7376,31 @@ class TradingEngine:
             )
         )
         for row in orphans:
+            cli = row.client_order_id
+            # PR #73 review R2: in-memory backoff skips rows that
+            # raised a non-404 broker error recently. Skipped rows
+            # do NOT count against the REST budget so newer orphans
+            # get their chance within the same cycle.
+            backoff_until = self._null_attach_sweep_backoff.get(cli)
+            if backoff_until is not None and backoff_until > now_utc:
+                skipped_for_backoff += 1
+                continue
+            # Stale rows whose backoff has expired should NOT
+            # silently re-fire forever; the per-row CRITICAL below
+            # provides the operator-visible signal.
             if budget is not None and rest_calls >= budget:
+                remaining = (
+                    len(orphans) - rest_calls - skipped_for_backoff
+                )
                 logger.info(
                     f"substrate {reason} null-attach sweep: budget "
                     f"({budget}) exhausted; "
-                    f"{len(orphans) - rest_calls} remaining orphans "
-                    f"deferred to next sweep"
+                    f"{remaining} remaining orphans "
+                    f"deferred to next sweep "
+                    f"(skipped_for_backoff={skipped_for_backoff})"
                 )
                 break
             rest_calls += 1
-            cli = row.client_order_id
             # CRITICAL on stale orphans BEFORE the broker call so
             # the operator sees the alert even if the broker is
             # also failing.
@@ -7393,13 +7429,29 @@ class TradingEngine:
                     self.broker.get_order_by_client_id_for_sweep(cli)
                 )
             except Exception as exc:
+                # PR #73 review R2: arm backoff so the next sweep
+                # pass skips this row and spends budget on other
+                # orphans. The window is longer than one cycle so
+                # transient errors don't starve newer orphans.
+                self._null_attach_sweep_backoff[cli] = (
+                    now_utc
+                    + timedelta(
+                        seconds=(
+                            _SUBSTRATE_NULL_ATTACH_SWEEP_BACKOFF_SECONDS
+                        ),
+                    )
+                )
                 logger.warning(
                     f"substrate {reason} null-attach sweep: "
                     f"get_order_by_client_id raised for {cli}: "
-                    f"{type(exc).__name__}: {exc} — deferring to "
-                    f"next sweep"
+                    f"{type(exc).__name__}: {exc} — backed off for "
+                    f"{_SUBSTRATE_NULL_ATTACH_SWEEP_BACKOFF_SECONDS}s"
                 )
                 continue
+            # Successful broker call (200 or 404) clears any prior
+            # backoff so a row that fails once then recovers gets
+            # processed immediately on the next pass.
+            self._null_attach_sweep_backoff.pop(cli, None)
             if broker_order is None:
                 # Outcome (c): broker doesn't know the cloid → mark
                 # the row rejected so the parent position can advance.
