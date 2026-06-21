@@ -132,6 +132,28 @@ _OCC_PAT = re.compile(r"^[A-Z]{1,6}[0-9]{6}[CP][0-9]{8}$")
 # budget in one shot.
 _SUBSTRATE_CYCLE_RECONCILE_LIMIT = 20
 
+# NULL-order_id REST sweep (tracker row 89, 'Known follow-ups'):
+# bounded per-cycle budget for `get_order_by_client_id` calls on
+# orphaned pending rows. Additive to _SUBSTRATE_CYCLE_RECONCILE_LIMIT
+# above (different REST endpoint, different recovery target).
+# Common-case payload is empty (no orphans) → zero REST cost; the
+# budget caps the catastrophic-backlog case where many orphans
+# accumulated during an outage.
+_SUBSTRATE_NULL_ATTACH_SWEEP_LIMIT = 5
+
+# Minimum age for an orphan candidate before the sweep will touch
+# it. Gives the synchronous attach queue plenty of time to drain on
+# a healthy cycle. Below ~30s the sweep starts competing with normal
+# attach flow and produces operator-visible recovery noise for rows
+# that would have self-healed.
+_SUBSTRATE_NULL_ATTACH_SWEEP_MIN_AGE_SECONDS = 60
+
+# Stale-orphan alert threshold: if a sweep still finds a row this
+# old, the failure is no longer transient (broker doesn't know the
+# cloid, or attach is failing for a structural reason). CRITICAL
+# log so the operator knows there is a real anomaly.
+_SUBSTRATE_NULL_ATTACH_SWEEP_STALE_SECONDS = 3600
+
 
 @dataclass(frozen=True)
 class _OptionStopAuditContext:
@@ -7201,6 +7223,285 @@ class TradingEngine:
         self._reconcile_substrate_via_rest(
             snapshot, reason="startup", limit=None,
         )
+
+    def _sweep_null_order_id_attaches(
+        self,
+        snapshot: "BrokerSnapshot",
+        *,
+        reason: str,
+        budget: int | None,
+    ) -> None:
+        """Recover single-leg substrate rows orphaned by a failed
+        ``attach_broker_order_id`` or by a bot crash between broker
+        submit return and the next cycle's attach-queue drain.
+
+        Tracker row 89, 'Known follow-ups'. The cycle / startup
+        reconcilers (``_reconcile_substrate_via_rest``) only walk
+        rows with ``order_id IS NOT NULL`` — orphaned NULL-order_id
+        rows are invisible to them. This sweep walks the orphans by
+        ``client_order_id``, asks the broker via
+        ``get_order_by_client_id_for_sweep``, and takes one of three
+        outcomes:
+
+          (a) Broker returns an alive order → ``attach_broker_
+              order_id`` so the regular reconciler picks the row up
+              on its next pass. INFO log the recovery.
+          (b) Broker returns a terminal order → attach + immediately
+              translate via ``_build_substrate_event_from_broker_
+              order`` + ``apply_order_event`` + dispatch entry/exit
+              side effects. One pass, same code path as
+              ``_reconcile_substrate_via_rest``.
+          (c) Broker returns 404 (unknown cloid) → ``mark_pending_
+              unknown_to_broker`` so the position-status CTE
+              advances the parent out of pending.
+
+        Scope (excluded by ``get_orphaned_pending_single_leg_orders``):
+          - Spreads (PR #72 §10.7 has its own crash-durable path)
+          - ``role='partial_close'`` (PR #72 intentional NULL)
+          - Rows newer than ``_SUBSTRATE_NULL_ATTACH_SWEEP_MIN_AGE_
+            SECONDS`` (let the normal attach queue drain naturally)
+
+        REST budget: ``budget`` caps the number of broker calls;
+        cycle callers pass ``_SUBSTRATE_NULL_ATTACH_SWEEP_LIMIT``,
+        startup callers pass ``None`` for the full backlog. The
+        budget is additive to the regular reconciler's cap (different
+        endpoint, different recovery target).
+
+        Composition with PR #71 (option trailing client_order_id
+        fallback): both paths call ``attach_broker_order_id``. If
+        PR #71 races ahead, the row already has ``order_id`` set;
+        the sweep's attach raises and we treat it as benign — re-
+        check via ``get_by_client_order_id`` and proceed to outcome
+        (b)/(c) if appropriate, otherwise skip.
+
+        Stale-orphan signal: rows older than
+        ``_SUBSTRATE_NULL_ATTACH_SWEEP_STALE_SECONDS`` produce a
+        CRITICAL log so the operator knows the failure is no longer
+        transient.
+
+        Per-row exceptions are CRITICAL-logged and absorbed: one
+        bad orphan cannot stall the cycle or startup.
+        """
+        if self.lifecycle_orders_store is None:
+            return
+        try:
+            orphans = (
+                self.lifecycle_orders_store
+                .get_orphaned_pending_single_leg_orders(
+                    min_age_seconds=(
+                        _SUBSTRATE_NULL_ATTACH_SWEEP_MIN_AGE_SECONDS
+                    ),
+                    limit=budget,
+                )
+            )
+        except Exception as exc:
+            logger.critical(
+                f"substrate {reason} null-attach sweep: orphan query "
+                f"failed: {type(exc).__name__}: {exc}"
+            )
+            return
+        if not orphans:
+            return
+
+        from engine.lifecycle_orders import apply_order_event
+
+        rest_calls = 0
+        now_utc = datetime.now(timezone.utc)
+        stale_cutoff = (
+            now_utc
+            - timedelta(
+                seconds=_SUBSTRATE_NULL_ATTACH_SWEEP_STALE_SECONDS,
+            )
+        )
+        for row in orphans:
+            if budget is not None and rest_calls >= budget:
+                logger.info(
+                    f"substrate {reason} null-attach sweep: budget "
+                    f"({budget}) exhausted; "
+                    f"{len(orphans) - rest_calls} remaining orphans "
+                    f"deferred to next sweep"
+                )
+                break
+            rest_calls += 1
+            cli = row.client_order_id
+            # CRITICAL on stale orphans BEFORE the broker call so
+            # the operator sees the alert even if the broker is
+            # also failing.
+            try:
+                created_at_dt = datetime.fromisoformat(row.created_at)
+                if created_at_dt.tzinfo is None:
+                    created_at_dt = created_at_dt.replace(
+                        tzinfo=timezone.utc,
+                    )
+                is_stale = created_at_dt <= stale_cutoff
+            except (ValueError, TypeError):
+                is_stale = False
+            if is_stale:
+                logger.critical(
+                    f"substrate {reason} null-attach sweep: orphan "
+                    f"client_order_id={cli} role={row.role} "
+                    f"position_uid={row.position_uid[:8]} has been "
+                    f"orphaned > "
+                    f"{_SUBSTRATE_NULL_ATTACH_SWEEP_STALE_SECONDS}s "
+                    f"(created_at={row.created_at}). The substrate "
+                    f"attach path is not self-healing for this row "
+                    f"— investigate."
+                )
+            try:
+                broker_order = (
+                    self.broker.get_order_by_client_id_for_sweep(cli)
+                )
+            except Exception as exc:
+                logger.warning(
+                    f"substrate {reason} null-attach sweep: "
+                    f"get_order_by_client_id raised for {cli}: "
+                    f"{type(exc).__name__}: {exc} — deferring to "
+                    f"next sweep"
+                )
+                continue
+            if broker_order is None:
+                # Outcome (c): broker doesn't know the cloid → mark
+                # the row rejected so the parent position can advance.
+                try:
+                    updated = (
+                        self.lifecycle_orders_store
+                        .mark_pending_unknown_to_broker(
+                            client_order_id=cli,
+                            reason=(
+                                f"null_order_id_sweep_unknown_to_broker"
+                                f"_{reason}"
+                            ),
+                        )
+                    )
+                except Exception as exc:
+                    logger.critical(
+                        f"substrate {reason} null-attach sweep: "
+                        f"mark_pending_unknown_to_broker FAILED for "
+                        f"{cli}: {type(exc).__name__}: {exc}"
+                    )
+                    continue
+                if updated:
+                    logger.info(
+                        f"NULL-order_id sweep ({reason}) marked "
+                        f"client_order_id={cli} role={row.role} "
+                        f"REJECTED — broker does not know the cloid "
+                        f"(never accepted submission)"
+                    )
+                else:
+                    logger.debug(
+                        f"substrate {reason} null-attach sweep: "
+                        f"client_order_id={cli} already resolved "
+                        f"out of band; skipping"
+                    )
+                continue
+
+            broker_order_id = str(getattr(broker_order, "id", ""))
+            if not broker_order_id:
+                logger.warning(
+                    f"substrate {reason} null-attach sweep: "
+                    f"broker returned order without id for {cli}; "
+                    f"skipping"
+                )
+                continue
+
+            # Outcomes (a) and (b): attach the broker order_id.
+            # PR #71's trailing fallback may have raced ahead and
+            # attached already — handle the resulting ValueError
+            # as benign by re-checking the row.
+            attached = False
+            try:
+                self.lifecycle_orders_store.attach_broker_order_id(
+                    client_order_id=cli,
+                    order_id=broker_order_id,
+                )
+                attached = True
+            except ValueError as exc:
+                refreshed = (
+                    self.lifecycle_orders_store
+                    .get_by_client_order_id(cli)
+                )
+                if (
+                    refreshed is not None
+                    and refreshed.order_id == broker_order_id
+                ):
+                    # PR #71 fallback (or any racer) won the attach;
+                    # not a real failure.
+                    logger.debug(
+                        f"substrate {reason} null-attach sweep: "
+                        f"attach raced for {cli} → {broker_order_id} "
+                        f"(already attached out of band): {exc}"
+                    )
+                    attached = True
+                elif (
+                    refreshed is not None
+                    and refreshed.status in {"canceled", "rejected", "filled"}
+                ):
+                    logger.debug(
+                        f"substrate {reason} null-attach sweep: "
+                        f"{cli} reached terminal {refreshed.status} "
+                        f"during sweep; skipping"
+                    )
+                    continue
+                else:
+                    logger.critical(
+                        f"substrate {reason} null-attach sweep: "
+                        f"attach_broker_order_id FAILED for {cli} → "
+                        f"{broker_order_id}: {type(exc).__name__}: "
+                        f"{exc}"
+                    )
+                    continue
+            except Exception as exc:
+                logger.critical(
+                    f"substrate {reason} null-attach sweep: "
+                    f"attach_broker_order_id raised for {cli} → "
+                    f"{broker_order_id}: {type(exc).__name__}: {exc}"
+                )
+                continue
+
+            if attached:
+                logger.info(
+                    f"NULL-order_id sweep ({reason}) recovered "
+                    f"client_order_id={cli} → order_id="
+                    f"{broker_order_id} role={row.role}"
+                )
+
+            # Build the broker-state event and apply it. For an alive
+            # order this is a no-op (apply_order_event detects no
+            # state advance and reports stale_or_duplicate); for a
+            # terminal order it advances the row and dispatches the
+            # entry/exit side effects in one pass.
+            event = self._build_substrate_event_from_broker_order(
+                broker_order, broker_order_id,
+            )
+            if event is None:
+                continue
+            try:
+                outcome = apply_order_event(
+                    self.lifecycle_orders_store._conn,
+                    event,
+                    reason=f"null_attach_sweep_{reason}",
+                )
+            except Exception as exc:
+                logger.critical(
+                    f"substrate {reason} null-attach sweep: "
+                    f"apply_order_event raised for {broker_order_id} "
+                    f"status={event.status}: {type(exc).__name__}: "
+                    f"{exc}"
+                )
+                continue
+            if outcome.applied:
+                logger.info(
+                    f"substrate {reason} null-attach sweep: "
+                    f"order_id={broker_order_id} advanced to "
+                    f"status={event.status} "
+                    f"(position {outcome.new_status})"
+                )
+                self._maybe_dispatch_substrate_entry_fill(
+                    event=event, snapshot=snapshot,
+                )
+                self._maybe_dispatch_substrate_exit_fill(
+                    event=event, snapshot=snapshot,
+                )
 
     def _reconcile_substrate_via_rest(
         self,
