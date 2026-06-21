@@ -7558,11 +7558,18 @@ class TradingEngine:
                     f"{broker_order_id} role={row.role}"
                 )
 
-            # Build the broker-state event and apply it. For an alive
-            # order this is a no-op (apply_order_event detects no
-            # state advance and reports stale_or_duplicate); for a
-            # terminal order it advances the row and dispatches the
-            # entry/exit side effects in one pass.
+            # Build the broker-state event and apply it. Alpaca
+            # status 'new' / 'accepted' maps to substrate 'working'
+            # (see _ALPACA_STATUS_TO_SUBSTRATE_STATUS above), so an
+            # alive order still advances the row pending → working
+            # through apply_order_event's compare-and-set — it is
+            # NOT a no-op. The dispatch helpers below internally
+            # gate on filled / partially_filled with qty + price
+            # (entry) and filled (exit), so a 'working' advance
+            # does not fire side effects. A terminal broker order
+            # advances all the way to filled / canceled / rejected
+            # and dispatches the entry/exit side effects in one
+            # pass.
             event = self._build_substrate_event_from_broker_order(
                 broker_order, broker_order_id,
             )
