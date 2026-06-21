@@ -7312,16 +7312,33 @@ class TradingEngine:
               advances the parent out of pending.
 
         Scope (excluded by ``get_orphaned_pending_single_leg_orders``):
-          - Spreads (PR #72 §10.7 has its own crash-durable path)
-          - ``role='partial_close'`` (PR #72 intentional NULL)
+          - Spreads (PR #72 §10.7 has its own crash-durable path) —
+            the ``position_type='single_leg'`` JOIN filters BOTH
+            the spread ``exit`` row AND the intentional
+            ``partial_close`` residual placeholder, which is the
+            only load-bearing exclusion.
           - Rows newer than ``_SUBSTRATE_NULL_ATTACH_SWEEP_MIN_AGE_
-            SECONDS`` (let the normal attach queue drain naturally)
+            SECONDS`` (let the normal attach queue drain naturally).
 
-        REST budget: ``budget`` caps the number of broker calls;
-        cycle callers pass ``_SUBSTRATE_NULL_ATTACH_SWEEP_LIMIT``,
-        startup callers pass ``None`` for the full backlog. The
-        budget is additive to the regular reconciler's cap (different
-        endpoint, different recovery target).
+        Single-leg ``role='partial_close'`` rows ARE swept (PR #73
+        review R1): operator ``reduce-position`` uses the same
+        ``_lifecycle_orders_record_exit`` insert + attach pair as
+        single-leg ``exit`` (execution/broker.py:777, :2537) and
+        orphans the same way if attach fails or the bot crashes
+        mid-call.
+
+        REST budget: ``budget`` caps the number of in-loop broker
+        calls; cycle callers pass
+        ``_SUBSTRATE_NULL_ATTACH_SWEEP_LIMIT``, startup callers
+        pass ``None`` for the full backlog. The query is unbounded
+        (PR #73 review R2) so backed-off rows can be skipped over
+        without starving the rest of the orphan set. The budget is
+        additive to the regular reconciler's cap (different
+        endpoint, different recovery target). Rows whose broker
+        lookup raises a non-404 error are armed with an in-memory
+        backoff in ``self._null_attach_sweep_backoff`` for
+        ``_SUBSTRATE_NULL_ATTACH_SWEEP_BACKOFF_SECONDS`` so they
+        do not eat the budget cycle after cycle.
 
         Composition with PR #71 (option trailing client_order_id
         fallback): both paths call ``attach_broker_order_id``. If

@@ -1231,10 +1231,14 @@ class PositionLifecycleOrdersStore:
             for rows that would have self-healed.
 
         Returns oldest-first (id ASC ≈ created_at ASC since both
-        increase monotonically per insert). LIMIT applied at SQL.
-        Cycle callers should pass a small ``limit`` so the per-row
-        REST cap is enforced before the sweep even reads rows;
-        startup callers pass ``None`` for the full backlog.
+        increase monotonically per insert). ``limit`` is an optional
+        safety cap on the result-set size (applied at SQL). Both
+        engine callers — cycle AND startup — pass ``None`` (PR #73
+        review R2): the REST budget is enforced in-loop by the
+        engine and a SQL LIMIT here would starve newer orphans when
+        the oldest rows are persistently failing. The ``limit``
+        parameter is preserved for tests and future callers that
+        legitimately want bounded reads.
 
         Operator note: the CRITICAL log in `_drain_lifecycle_attaches`
         is the real-time orphan signal and stays in place after this
