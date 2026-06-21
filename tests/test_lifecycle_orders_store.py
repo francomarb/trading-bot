@@ -21,6 +21,7 @@ Tests verify:
 from __future__ import annotations
 
 import sqlite3
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 import pytest
@@ -620,6 +621,397 @@ class TestReads:
         row = orders_store.get_by_order_id("alpaca-lookup")
         assert row is not None
         assert row.client_order_id == "cli-lookup"
+
+
+# ── Orphan sweep query (NULL-order_id REST sweep) ──────────────────────────
+
+
+class TestGetOrphanedPendingSingleLegOrders:
+    """``get_orphaned_pending_single_leg_orders`` selects rows the
+    NULL-order_id REST sweep needs to recover.
+
+    Required exclusions (the sweep must NOT touch these):
+      - rows whose parent position is a spread (PR #72 §10.7 path)
+      - rows where order_id is already attached (normal reconciler
+        owns them)
+      - rows whose status has advanced past pending
+      - rows newer than ``min_age_seconds`` (let the normal attach
+        queue drain naturally)
+      - role='partial_close' (intentional NULL by design)
+    """
+
+    def _insert_pending_orphan(
+        self,
+        *,
+        pos_store: PositionLifecycleStore,
+        orders_store: PositionLifecycleOrdersStore,
+        conn: sqlite3.Connection,
+        owner_key: str,
+        cli: str,
+        created_at: str | None = None,
+        role: str = "entry_primary",
+    ) -> int:
+        """Create a pending row with order_id NULL. Optionally back-
+        date created_at so the age window is hit."""
+        uid = _seed_position(pos_store, owner_key=owner_key)
+        row_id = orders_store.insert_pending(
+            position_uid=uid,
+            role=role,
+            client_order_id=cli,
+            order_type="market",
+            order_class="oto" if role == "entry_primary" else "simple",
+            time_in_force="gtc",
+            side="buy" if role == "entry_primary" else "sell",
+            intended_qty=10.0,
+        )
+        if created_at is not None:
+            conn.execute(
+                "UPDATE position_lifecycle_orders SET created_at = ? "
+                "WHERE id = ?",
+                (created_at, row_id),
+            )
+            conn.commit()
+        return row_id
+
+    def test_returns_orphaned_pending_row(
+        self,
+        conn: sqlite3.Connection,
+        pos_store: PositionLifecycleStore,
+        orders_store: PositionLifecycleOrdersStore,
+    ):
+        old = (
+            datetime.now(timezone.utc) - timedelta(minutes=5)
+        ).isoformat()
+        self._insert_pending_orphan(
+            pos_store=pos_store, orders_store=orders_store, conn=conn,
+            owner_key="AAPL", cli="cli-orphan", created_at=old,
+        )
+        rows = orders_store.get_orphaned_pending_single_leg_orders(
+            min_age_seconds=60,
+        )
+        assert [r.client_order_id for r in rows] == ["cli-orphan"]
+
+    def test_excludes_rows_younger_than_min_age(
+        self,
+        conn: sqlite3.Connection,
+        pos_store: PositionLifecycleStore,
+        orders_store: PositionLifecycleOrdersStore,
+    ):
+        # No backdate — created_at is "now"; min_age=60 must skip it.
+        self._insert_pending_orphan(
+            pos_store=pos_store, orders_store=orders_store, conn=conn,
+            owner_key="MSFT", cli="cli-fresh",
+        )
+        assert orders_store.get_orphaned_pending_single_leg_orders(
+            min_age_seconds=60,
+        ) == []
+
+    def test_excludes_rows_with_order_id_already_attached(
+        self,
+        conn: sqlite3.Connection,
+        pos_store: PositionLifecycleStore,
+        orders_store: PositionLifecycleOrdersStore,
+    ):
+        old = (
+            datetime.now(timezone.utc) - timedelta(minutes=5)
+        ).isoformat()
+        self._insert_pending_orphan(
+            pos_store=pos_store, orders_store=orders_store, conn=conn,
+            owner_key="NVDA", cli="cli-attached", created_at=old,
+        )
+        orders_store.attach_broker_order_id(
+            client_order_id="cli-attached", order_id="alpaca-attached",
+        )
+        assert orders_store.get_orphaned_pending_single_leg_orders(
+            min_age_seconds=60,
+        ) == []
+
+    def test_excludes_rows_advanced_past_pending(
+        self,
+        conn: sqlite3.Connection,
+        pos_store: PositionLifecycleStore,
+        orders_store: PositionLifecycleOrdersStore,
+    ):
+        old = (
+            datetime.now(timezone.utc) - timedelta(minutes=5)
+        ).isoformat()
+        row_id = self._insert_pending_orphan(
+            pos_store=pos_store, orders_store=orders_store, conn=conn,
+            owner_key="GOOG", cli="cli-working", created_at=old,
+        )
+        # Move to 'working' without attaching order_id (synthetic
+        # state for the test — real flow would attach first).
+        conn.execute(
+            "UPDATE position_lifecycle_orders SET status = 'working' "
+            "WHERE id = ?",
+            (row_id,),
+        )
+        conn.commit()
+        assert orders_store.get_orphaned_pending_single_leg_orders(
+            min_age_seconds=60,
+        ) == []
+
+    @pytest.mark.parametrize("role", ["exit", "partial_close"])
+    def test_excludes_spread_close_rows(
+        self,
+        conn: sqlite3.Connection,
+        pos_store: PositionLifecycleStore,
+        orders_store: PositionLifecycleOrdersStore,
+        role: str,
+    ):
+        """PR #72 §10.7: spread closes have their own crash-durable
+        path; the single-leg sweep must not touch them. Covers BOTH
+        spread close shapes — ``exit`` (worker durable attach) and
+        ``partial_close`` (intentional NULL residual placeholder).
+        This is the only load-bearing exclusion; the JOIN to
+        ``position_type='single_leg'`` is what enforces it."""
+        # Build a spread position directly so position_type='spread'.
+        uid = new_position_uid()
+        pos_store.create_pending(
+            position_uid=uid,
+            symbol="SPY",
+            owner_key=uid,  # spread owner_keys are UUIDs
+            strategy="credit_spread",
+            position_type="spread",
+            entry_qty=1.0,
+        )
+        old = (
+            datetime.now(timezone.utc) - timedelta(minutes=5)
+        ).isoformat()
+        row_id = orders_store.insert_pending(
+            position_uid=uid,
+            role=role,
+            client_order_id=f"cli-spread-{role}",
+            order_type="limit",
+            order_class="mleg",
+            time_in_force="gtc",
+            side="sell",
+            intended_qty=1.0,
+        )
+        conn.execute(
+            "UPDATE position_lifecycle_orders SET created_at = ? "
+            "WHERE id = ?",
+            (old, row_id),
+        )
+        conn.commit()
+        assert orders_store.get_orphaned_pending_single_leg_orders(
+            min_age_seconds=60,
+        ) == []
+
+    def test_includes_single_leg_partial_close_orphan(
+        self,
+        conn: sqlite3.Connection,
+        pos_store: PositionLifecycleStore,
+        orders_store: PositionLifecycleOrdersStore,
+    ):
+        """Operator ``reduce-position`` writes ``role='partial_close'``
+        on single-leg positions via
+        ``execution/broker.py:_lifecycle_orders_record_exit``
+        (see ``broker.close_position(partial_qty=...)`` at
+        execution/broker.py:2537). If that insert succeeds but the
+        attach fails or the bot crashes mid-call, the row is a
+        single-leg partial_close orphan and the sweep MUST recover
+        it — the regular reconciler can't see NULL-order_id rows
+        and the operator queue can't cancel by id either."""
+        uid = _seed_position(pos_store, owner_key="TSLA")
+        old = (
+            datetime.now(timezone.utc) - timedelta(minutes=5)
+        ).isoformat()
+        conn.execute(
+            "INSERT INTO position_lifecycle_orders ("
+            "position_uid, role, order_id, client_order_id, "
+            "order_type, order_class, time_in_force, side, "
+            "intended_qty, status, filled_qty, created_at, "
+            "last_observed_at"
+            ") VALUES (?, 'partial_close', NULL, ?, 'market', "
+            "'simple', 'gtc', 'sell', 1.0, 'pending', 0.0, ?, ?)",
+            (uid, "cli-sl-pc-orphan", old, old),
+        )
+        conn.commit()
+        rows = orders_store.get_orphaned_pending_single_leg_orders(
+            min_age_seconds=60,
+        )
+        assert [r.client_order_id for r in rows] == ["cli-sl-pc-orphan"]
+
+    def test_respects_limit(
+        self,
+        conn: sqlite3.Connection,
+        pos_store: PositionLifecycleStore,
+        orders_store: PositionLifecycleOrdersStore,
+    ):
+        old = (
+            datetime.now(timezone.utc) - timedelta(minutes=5)
+        ).isoformat()
+        for owner in ("A", "B", "C", "D"):
+            self._insert_pending_orphan(
+                pos_store=pos_store, orders_store=orders_store,
+                conn=conn, owner_key=owner, cli=f"cli-{owner}",
+                created_at=old,
+            )
+        rows = orders_store.get_orphaned_pending_single_leg_orders(
+            min_age_seconds=60, limit=2,
+        )
+        assert len(rows) == 2
+        # Oldest-first → insertion order (id ASC).
+        assert [r.client_order_id for r in rows] == ["cli-A", "cli-B"]
+
+    def test_returns_oldest_first_for_startup_unbounded(
+        self,
+        conn: sqlite3.Connection,
+        pos_store: PositionLifecycleStore,
+        orders_store: PositionLifecycleOrdersStore,
+    ):
+        """Startup callers pass limit=None and need oldest-first so
+        the longest-orphaned rows recover first."""
+        old = (
+            datetime.now(timezone.utc) - timedelta(minutes=5)
+        ).isoformat()
+        for owner in ("Z", "Y", "X"):
+            self._insert_pending_orphan(
+                pos_store=pos_store, orders_store=orders_store,
+                conn=conn, owner_key=owner, cli=f"cli-{owner}",
+                created_at=old,
+            )
+        rows = orders_store.get_orphaned_pending_single_leg_orders(
+            min_age_seconds=60, limit=None,
+        )
+        assert [r.client_order_id for r in rows] == [
+            "cli-Z", "cli-Y", "cli-X",
+        ]
+
+    def test_rejects_negative_min_age(
+        self,
+        orders_store: PositionLifecycleOrdersStore,
+    ):
+        with pytest.raises(ValueError, match="min_age_seconds"):
+            orders_store.get_orphaned_pending_single_leg_orders(
+                min_age_seconds=-1,
+            )
+
+
+# ── mark_pending_unknown_to_broker (orphan outcome c) ──────────────────────
+
+
+class TestMarkPendingUnknownToBroker:
+    """Outcome (c) of the NULL-order_id REST sweep: the broker
+    doesn't know the client_order_id, so the order never reached the
+    broker. The substrate row should advance from pending → rejected
+    and the position-status CTE should re-evaluate the parent."""
+
+    def test_marks_pending_orphan_rejected_and_advances_position(
+        self,
+        conn: sqlite3.Connection,
+        pos_store: PositionLifecycleStore,
+        orders_store: PositionLifecycleOrdersStore,
+    ):
+        uid = _seed_position(pos_store, owner_key="AAPL")
+        orders_store.insert_pending(
+            position_uid=uid,
+            role="entry_primary",
+            client_order_id="cli-unknown",
+            order_type="market",
+            order_class="oto",
+            time_in_force="gtc",
+            side="buy",
+            intended_qty=10.0,
+        )
+        updated = orders_store.mark_pending_unknown_to_broker(
+            client_order_id="cli-unknown",
+            reason="null_order_id_sweep_unknown_to_broker",
+        )
+        assert updated is True
+        row = orders_store.get_by_client_order_id("cli-unknown")
+        assert row is not None
+        assert row.status == "rejected"
+        assert row.terminal_at is not None
+        assert row.order_id is None
+        # Position should have walked pending → canceled (no fill ever
+        # landed and the only entry_primary is now terminal).
+        pos = conn.execute(
+            "SELECT status FROM position_lifecycle "
+            "WHERE position_uid = ?",
+            (uid,),
+        ).fetchone()
+        assert pos[0] == "canceled"
+
+    def test_noop_when_order_id_already_attached(
+        self,
+        pos_store: PositionLifecycleStore,
+        orders_store: PositionLifecycleOrdersStore,
+    ):
+        uid = _seed_position(pos_store, owner_key="MSFT")
+        orders_store.insert_pending(
+            position_uid=uid,
+            role="entry_primary",
+            client_order_id="cli-attached",
+            order_type="market",
+            order_class="oto",
+            time_in_force="gtc",
+            side="buy",
+            intended_qty=10.0,
+        )
+        # Racing attach beat the sweep — PR #71 fallback or a
+        # delayed normal attach drained first.
+        orders_store.attach_broker_order_id(
+            client_order_id="cli-attached", order_id="alpaca-attached",
+        )
+        assert orders_store.mark_pending_unknown_to_broker(
+            client_order_id="cli-attached",
+            reason="sweep",
+        ) is False
+        row = orders_store.get_by_client_order_id("cli-attached")
+        assert row.status == "pending"
+        assert row.order_id == "alpaca-attached"
+
+    def test_noop_when_status_already_terminal(
+        self,
+        conn: sqlite3.Connection,
+        pos_store: PositionLifecycleStore,
+        orders_store: PositionLifecycleOrdersStore,
+    ):
+        uid = _seed_position(pos_store, owner_key="NVDA")
+        orders_store.insert_pending(
+            position_uid=uid,
+            role="entry_primary",
+            client_order_id="cli-already-canceled",
+            order_type="market",
+            order_class="oto",
+            time_in_force="gtc",
+            side="buy",
+            intended_qty=10.0,
+        )
+        # Operator manually resolved out of band.
+        conn.execute(
+            "UPDATE position_lifecycle_orders "
+            "SET status = 'canceled', terminal_at = ? "
+            "WHERE client_order_id = ?",
+            (datetime.now(timezone.utc).isoformat(),
+             "cli-already-canceled"),
+        )
+        conn.commit()
+        assert orders_store.mark_pending_unknown_to_broker(
+            client_order_id="cli-already-canceled",
+            reason="sweep",
+        ) is False
+
+    def test_noop_when_row_missing(
+        self,
+        orders_store: PositionLifecycleOrdersStore,
+    ):
+        assert orders_store.mark_pending_unknown_to_broker(
+            client_order_id="cli-nonexistent",
+            reason="sweep",
+        ) is False
+
+    def test_rejects_empty_reason(
+        self,
+        orders_store: PositionLifecycleOrdersStore,
+    ):
+        with pytest.raises(ValueError, match="reason"):
+            orders_store.mark_pending_unknown_to_broker(
+                client_order_id="cli-x",
+                reason="",
+            )
 
 
 # ── Frozen-row property ────────────────────────────────────────────────────

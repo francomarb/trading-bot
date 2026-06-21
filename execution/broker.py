@@ -3105,6 +3105,26 @@ class AlpacaBroker:
             op_desc=f"stream_get_order_by_client_id({client_order_id})",
         )
 
+    def get_order_by_client_id_for_sweep(
+        self, client_order_id: str,
+    ) -> object | None:
+        """Bounded direct lookup used by the NULL-order_id REST sweep.
+
+        Returns the broker order object on success, ``None`` when
+        Alpaca responds 404 (the cloid is unknown to the broker —
+        outcome (c) of the sweep). Any other broker error is
+        re-raised so the sweep can defer that row to the next cycle
+        without consuming protective-order retry budget — mirrors
+        the PR #64 audit pattern of using a bounded direct call
+        rather than ``_with_retry``.
+        """
+        try:
+            return self._api.get_order_by_client_id(client_order_id)
+        except APIError as exc:
+            if getattr(exc, "status_code", None) == 404:
+                return None
+            raise
+
     def close_connections(self) -> None:
         """Close idle broker HTTP connections between cycles."""
         self._api._session.close()

@@ -32,7 +32,7 @@ from __future__ import annotations
 
 import sqlite3
 from dataclasses import dataclass, field
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from typing import Iterable, Sequence
 
 
@@ -977,6 +977,82 @@ class PositionLifecycleOrdersStore:
         )
         self._conn.commit()
 
+    def mark_pending_unknown_to_broker(
+        self,
+        *,
+        client_order_id: str,
+        reason: str,
+    ) -> bool:
+        """Resolve a NULL-order_id orphan that the broker has never
+        heard of by marking the substrate row 'rejected'.
+
+        Outcome (c) of the NULL-order_id REST sweep (tracker row 89,
+        'Known follow-ups'). When ``get_order_by_client_id`` raises
+        NotFound, the broker never accepted the submission — there is
+        no live order to lose track of, so the substrate row should
+        be transitioned out of pending so the position rollup can
+        progress.
+
+        Behavior:
+          - status='pending' AND order_id IS NULL → UPDATE to
+            'rejected', set terminal_at, last_observed_at; run the
+            position-status CTE so the parent position transitions
+            (typically pending → canceled if no fill ever landed).
+          - status already terminal OR order_id already attached →
+            no-op; return False. The orphan was already resolved out
+            of band (operator intervention, PR #71 trailing fallback,
+            or a racing attach).
+          - Row missing entirely → return False. Caller treats this
+            as benign.
+
+        Trades table is NOT touched: no fill happened, no trade row.
+        Position ``current_qty`` is NOT touched: a row that never had
+        order_id never had filled_qty either, so the rollup stays at
+        zero. We only need the position-status CTE to advance the
+        parent position out of 'pending'.
+
+        Returns True if the row was rejected, False if no-op.
+        """
+        if not reason:
+            raise ValueError("reason must not be empty")
+        now = _utc_now_iso()
+        # All-or-nothing transaction: row UPDATE + position-status
+        # recompute land together or not at all.
+        with self._conn:
+            existing = self._conn.execute(
+                "SELECT status, order_id, position_uid "
+                "FROM position_lifecycle_orders "
+                "WHERE client_order_id = ?",
+                (client_order_id,),
+            ).fetchone()
+            if existing is None:
+                return False
+            current_status, current_order_id, position_uid = existing
+            if (
+                current_status in TERMINAL_ORDER_STATUSES
+                or current_order_id is not None
+                or current_status != "pending"
+            ):
+                # Already resolved out of band; sweep treats as no-op.
+                return False
+            self._conn.execute(
+                "UPDATE position_lifecycle_orders "
+                "SET status = 'rejected', "
+                "    terminal_at = ?, "
+                "    last_observed_at = ? "
+                "WHERE client_order_id = ?",
+                (now, now, client_order_id),
+            )
+            # Position-status CTE recompute — typically transitions
+            # the parent from pending → canceled when this was the
+            # only pending entry. Imported here to avoid a
+            # forward-ref against the module-level SQL constant.
+            self._conn.execute(
+                _POSITION_STATUS_SQL,
+                {"position_uid": position_uid, "now": now},
+            )
+        return True
+
     # ── Reads ─────────────────────────────────────────────────────────
 
     def get_by_id(self, row_id: int) -> PositionLifecycleOrderRow | None:
@@ -1110,6 +1186,107 @@ class PositionLifecycleOrdersStore:
             """,
             (roles[0], roles[1], *sorted(NON_TERMINAL_ORDER_STATUSES)),
         ).fetchall()
+        return [_row_from_tuple(r) for r in rows]
+
+    def get_orphaned_pending_single_leg_orders(
+        self,
+        *,
+        min_age_seconds: int,
+        limit: int | None = None,
+    ) -> list[PositionLifecycleOrderRow]:
+        """Single-leg pending rows where the broker order_id was never
+        attached (orphan candidates for the NULL-order_id REST sweep).
+
+        Returns rows matching ALL of:
+
+          - ``position_lifecycle.position_type = 'single_leg'`` — spreads
+            have their own crash-durable close path (PR #72 §10.7) and
+            must not be touched by this sweep.
+          - ``status = 'pending'`` — once a row reaches
+            working/partially_filled/filled the broker order_id is
+            already known by definition; this query targets rows the
+            attach queue never got to.
+          - ``order_id IS NULL`` — by construction the attach failed
+            or the bot crashed between submit return and the next
+            cycle's drain.
+          - ``client_order_id IS NOT NULL`` — invariant of the
+            schema (NOT NULL column), restated here so the SQL
+            documents the sweep's recovery key.
+          - The only intentional ``order_id IS NULL`` shape is the
+            spread ``partial_close`` residual placeholder from PR #72
+            §10.7. That row sits on a ``position_type='spread'``
+            parent and is excluded by the JOIN above. Single-leg
+            ``partial_close`` rows (operator ``reduce-position``,
+            execution/broker.py:_lifecycle_orders_record_exit with
+            ``partial_qty``) ARE valid sweep targets — they go
+            through the same insert + attach pattern as ``exit``
+            rows and orphan the same way if attach fails or the bot
+            crashes mid-call.
+          - ``created_at <= now - min_age_seconds`` — gives the
+            synchronous attach queue time to drain naturally. The
+            sweep is a safety net, not a replacement for the
+            normal-path attach. 60s is the recommended floor; below
+            ~30s the sweep starts competing with healthy attach
+            flow and produces operator-visible INFO recovery noise
+            for rows that would have self-healed.
+
+        Returns oldest-first (id ASC ≈ created_at ASC since both
+        increase monotonically per insert). ``limit`` is an optional
+        safety cap on the result-set size (applied at SQL). Both
+        engine callers — cycle AND startup — pass ``None`` (PR #73
+        review R2): the REST budget is enforced in-loop by the
+        engine and a SQL LIMIT here would starve newer orphans when
+        the oldest rows are persistently failing. The ``limit``
+        parameter is preserved for tests and future callers that
+        legitimately want bounded reads.
+
+        Operator note: the CRITICAL log in `_drain_lifecycle_attaches`
+        is the real-time orphan signal and stays in place after this
+        sweep ships. A successful sweep recovery produces a
+        complementary INFO log so the failure→recovery pair is
+        diagnostic evidence the substrate path is healthy.
+        """
+        if min_age_seconds < 0:
+            raise ValueError(
+                f"min_age_seconds must be >= 0; got {min_age_seconds}"
+            )
+        # Compute the cutoff in Python rather than SQL so the time
+        # source is consistent with _utc_now_iso elsewhere in the
+        # store and so the query stays trivially testable by
+        # patching the cutoff.
+        cutoff = (
+            datetime.now(timezone.utc)
+            - timedelta(seconds=int(min_age_seconds))
+        ).isoformat()
+        sql = (
+            "SELECT plo.id, plo.position_uid, plo.role, plo.order_id, "
+            "plo.client_order_id, plo.order_type, plo.order_class, "
+            "plo.time_in_force, plo.side, plo.intended_qty, "
+            "plo.intended_stop_price, plo.intended_trigger_price, "
+            "plo.intended_limit_price, plo.intended_take_profit_price, "
+            "plo.parent_order_id, plo.replaces_order_id, "
+            "plo.origin_kind, plo.operator_command_uid, "
+            "plo.slippage_benchmark_price, plo.slippage_benchmark_kind, "
+            "plo.slippage_benchmark_timestamp, "
+            "plo.slippage_measurement_quality, "
+            "plo.status, plo.filled_qty, plo.avg_fill_price, "
+            "plo.created_at, plo.submitted_at, plo.terminal_at, "
+            "plo.last_observed_broker_updated_at, plo.last_observed_at "
+            "FROM position_lifecycle_orders plo "
+            "JOIN position_lifecycle pl "
+            "  ON pl.position_uid = plo.position_uid "
+            "WHERE pl.position_type = 'single_leg' "
+            "  AND plo.status = 'pending' "
+            "  AND plo.order_id IS NULL "
+            "  AND plo.client_order_id IS NOT NULL "
+            "  AND plo.created_at <= ? "
+            "ORDER BY plo.id ASC"
+        )
+        params: tuple = (cutoff,)
+        if limit is not None:
+            sql += " LIMIT ?"
+            params = (cutoff, int(limit))
+        rows = self._conn.execute(sql, params).fetchall()
         return [_row_from_tuple(r) for r in rows]
 
     def get_non_terminal_by_role(
