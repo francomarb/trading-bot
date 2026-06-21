@@ -751,14 +751,20 @@ class TestGetOrphanedPendingSingleLegOrders:
             min_age_seconds=60,
         ) == []
 
+    @pytest.mark.parametrize("role", ["exit", "partial_close"])
     def test_excludes_spread_close_rows(
         self,
         conn: sqlite3.Connection,
         pos_store: PositionLifecycleStore,
         orders_store: PositionLifecycleOrdersStore,
+        role: str,
     ):
         """PR #72 §10.7: spread closes have their own crash-durable
-        path; the single-leg sweep must not touch them."""
+        path; the single-leg sweep must not touch them. Covers BOTH
+        spread close shapes — ``exit`` (worker durable attach) and
+        ``partial_close`` (intentional NULL residual placeholder).
+        This is the only load-bearing exclusion; the JOIN to
+        ``position_type='single_leg'`` is what enforces it."""
         # Build a spread position directly so position_type='spread'.
         uid = new_position_uid()
         pos_store.create_pending(
@@ -774,8 +780,8 @@ class TestGetOrphanedPendingSingleLegOrders:
         ).isoformat()
         row_id = orders_store.insert_pending(
             position_uid=uid,
-            role="exit",
-            client_order_id="cli-spread-close",
+            role=role,
+            client_order_id=f"cli-spread-{role}",
             order_type="limit",
             order_class="mleg",
             time_in_force="gtc",
@@ -792,18 +798,22 @@ class TestGetOrphanedPendingSingleLegOrders:
             min_age_seconds=60,
         ) == []
 
-    def test_excludes_partial_close_role(
+    def test_includes_single_leg_partial_close_orphan(
         self,
         conn: sqlite3.Connection,
         pos_store: PositionLifecycleStore,
         orders_store: PositionLifecycleOrdersStore,
     ):
-        """Defense-in-depth: partial_close only appears on spreads
-        today, but if a future writer ever inserts one on a
-        single-leg row the sweep must still skip it."""
+        """Operator ``reduce-position`` writes ``role='partial_close'``
+        on single-leg positions via
+        ``execution/broker.py:_lifecycle_orders_record_exit``
+        (see ``broker.close_position(partial_qty=...)`` at
+        execution/broker.py:2537). If that insert succeeds but the
+        attach fails or the bot crashes mid-call, the row is a
+        single-leg partial_close orphan and the sweep MUST recover
+        it — the regular reconciler can't see NULL-order_id rows
+        and the operator queue can't cancel by id either."""
         uid = _seed_position(pos_store, owner_key="TSLA")
-        # Direct insert bypassing role-validation to exercise the
-        # WHERE-clause defense-in-depth even on the single-leg path.
         old = (
             datetime.now(timezone.utc) - timedelta(minutes=5)
         ).isoformat()
@@ -815,12 +825,13 @@ class TestGetOrphanedPendingSingleLegOrders:
             "last_observed_at"
             ") VALUES (?, 'partial_close', NULL, ?, 'market', "
             "'simple', 'gtc', 'sell', 1.0, 'pending', 0.0, ?, ?)",
-            (uid, "cli-pc-orphan-defense", old, old),
+            (uid, "cli-sl-pc-orphan", old, old),
         )
         conn.commit()
-        assert orders_store.get_orphaned_pending_single_leg_orders(
+        rows = orders_store.get_orphaned_pending_single_leg_orders(
             min_age_seconds=60,
-        ) == []
+        )
+        assert [r.client_order_id for r in rows] == ["cli-sl-pc-orphan"]
 
     def test_respects_limit(
         self,

@@ -1212,10 +1212,16 @@ class PositionLifecycleOrdersStore:
           - ``client_order_id IS NOT NULL`` — invariant of the
             schema (NOT NULL column), restated here so the SQL
             documents the sweep's recovery key.
-          - ``role != 'partial_close'`` — defense-in-depth even though
-            the single-leg filter already excludes spread-only roles.
-            Per PR #72 §10.7 the partial_close placeholder is
-            intentionally order_id=NULL and the operator clears it.
+          - The only intentional ``order_id IS NULL`` shape is the
+            spread ``partial_close`` residual placeholder from PR #72
+            §10.7. That row sits on a ``position_type='spread'``
+            parent and is excluded by the JOIN above. Single-leg
+            ``partial_close`` rows (operator ``reduce-position``,
+            execution/broker.py:_lifecycle_orders_record_exit with
+            ``partial_qty``) ARE valid sweep targets — they go
+            through the same insert + attach pattern as ``exit``
+            rows and orphan the same way if attach fails or the bot
+            crashes mid-call.
           - ``created_at <= now - min_age_seconds`` — gives the
             synchronous attach queue time to drain naturally. The
             sweep is a safety net, not a replacement for the
@@ -1269,7 +1275,6 @@ class PositionLifecycleOrdersStore:
             "  AND plo.status = 'pending' "
             "  AND plo.order_id IS NULL "
             "  AND plo.client_order_id IS NOT NULL "
-            "  AND plo.role != 'partial_close' "
             "  AND plo.created_at <= ? "
             "ORDER BY plo.id ASC"
         )

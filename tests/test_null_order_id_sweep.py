@@ -394,20 +394,28 @@ class TestSweepRestBudget:
         assert _SUBSTRATE_NULL_ATTACH_SWEEP_LIMIT == 5
 
 
-# ── (6) role='partial_close' excluded ──────────────────────────────────────
+# ── (6) Single-leg operator partial_close IS recovered ────────────────────
 
 
-class TestSweepExcludesPartialClose:
-    def test_partial_close_row_never_touched(
+class TestSweepRecoversSingleLegPartialClose:
+    def test_single_leg_operator_reduce_partial_close_orphan_recovered(
         self,
         engine: TradingEngine,
         pos_store: PositionLifecycleStore,
         orders_store: PositionLifecycleOrdersStore,
     ):
-        # Build a single-leg parent then directly insert a
-        # partial_close row (the role normally only appears on
-        # spreads — defense-in-depth WHERE clause must skip it
-        # even if a future writer hits the single-leg path).
+        """Operator ``reduce-position`` submits via
+        ``broker.close_position(partial_qty=...)`` which writes a
+        ``role='partial_close'`` row through
+        ``_lifecycle_orders_record_exit`` (execution/broker.py:2537,
+        execution/broker.py:777). If the insert succeeds and the
+        attach fails (or the bot crashes between submit and attach),
+        the row is a single-leg partial_close orphan and the sweep
+        MUST recover it — otherwise (a) the regular reconciler can't
+        see NULL-order_id rows, (b) cancel-position-orders has no
+        order_id to cancel, and (c) the close-side guard at
+        engine/trader.py:4707-4713 blocks every future operator
+        reduction attempt on this position."""
         uid = new_position_uid()
         pos_store.create_pending(
             position_uid=uid, symbol="SPY", owner_key="SPY",
@@ -424,39 +432,51 @@ class TestSweepExcludesPartialClose:
             "intended_qty, status, filled_qty, created_at, "
             "last_observed_at"
             ") VALUES (?, 'partial_close', NULL, ?, 'market', "
-            "'simple', 'gtc', 'sell', 1.0, 'pending', 0.0, ?, ?)",
-            (uid, "cli-pc-defense", old_ts, old_ts),
+            "'simple', 'gtc', 'sell', 4.0, 'pending', 0.0, ?, ?)",
+            (uid, "cli-sl-operator-pc", old_ts, old_ts),
         )
         orders_store._conn.commit()
-        engine.broker.get_order_by_client_id_for_sweep = MagicMock()
+        engine.broker.get_order_by_client_id_for_sweep = MagicMock(
+            return_value=_make_broker_order(
+                order_id="alpaca-operator-pc", status="new",
+            )
+        )
 
         engine._sweep_null_order_id_attaches(
             _make_snapshot(), reason="cycle", budget=5,
         )
 
         engine.broker.get_order_by_client_id_for_sweep \
-            .assert_not_called()
-        row = orders_store.get_by_client_order_id("cli-pc-defense")
-        assert row.status == "pending"
-        assert row.order_id is None
+            .assert_called_once_with("cli-sl-operator-pc")
+        row = orders_store.get_by_client_order_id("cli-sl-operator-pc")
+        assert row.order_id == "alpaca-operator-pc"
+        # State advanced via apply_order_event (alpaca 'new' →
+        # substrate 'working'); now reachable by the regular
+        # reconciler.
+        assert row.status == "working"
 
 
 # ── (7) Spread close rows excluded ─────────────────────────────────────────
 
 
 class TestSweepExcludesSpreadClose:
+    @pytest.mark.parametrize("role", ["exit", "partial_close"])
     def test_spread_close_row_never_touched(
         self,
         engine: TradingEngine,
         pos_store: PositionLifecycleStore,
         orders_store: PositionLifecycleOrdersStore,
+        role: str,
     ):
-        # Build a spread position (UUID owner_key) with a pending
-        # exit row → must be skipped by the single-leg sweep.
+        """PR #72 §10.7 owns spread close substrate state — both
+        the ``exit`` row (worker durable attach) and the
+        ``partial_close`` residual placeholder (intentional NULL).
+        The single-leg JOIN is the only load-bearing exclusion;
+        both spread shapes must be filtered."""
         _seed_orphan(
             pos_store=pos_store, orders_store=orders_store,
-            owner_key="SPY", cli="cli-spread-exit",
-            role="exit", side="sell",
+            owner_key="SPY", cli=f"cli-spread-{role}",
+            role=role, side="sell",
             position_type="spread",
         )
         engine.broker.get_order_by_client_id_for_sweep = MagicMock()
@@ -467,7 +487,9 @@ class TestSweepExcludesSpreadClose:
 
         engine.broker.get_order_by_client_id_for_sweep \
             .assert_not_called()
-        row = orders_store.get_by_client_order_id("cli-spread-exit")
+        row = orders_store.get_by_client_order_id(
+            f"cli-spread-{role}"
+        )
         assert row.status == "pending"
         assert row.order_id is None
 
