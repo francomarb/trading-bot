@@ -878,6 +878,131 @@ class TestGetOrphanedPendingSingleLegOrders:
             )
 
 
+# ── mark_pending_unknown_to_broker (orphan outcome c) ──────────────────────
+
+
+class TestMarkPendingUnknownToBroker:
+    """Outcome (c) of the NULL-order_id REST sweep: the broker
+    doesn't know the client_order_id, so the order never reached the
+    broker. The substrate row should advance from pending → rejected
+    and the position-status CTE should re-evaluate the parent."""
+
+    def test_marks_pending_orphan_rejected_and_advances_position(
+        self,
+        conn: sqlite3.Connection,
+        pos_store: PositionLifecycleStore,
+        orders_store: PositionLifecycleOrdersStore,
+    ):
+        uid = _seed_position(pos_store, owner_key="AAPL")
+        orders_store.insert_pending(
+            position_uid=uid,
+            role="entry_primary",
+            client_order_id="cli-unknown",
+            order_type="market",
+            order_class="oto",
+            time_in_force="gtc",
+            side="buy",
+            intended_qty=10.0,
+        )
+        updated = orders_store.mark_pending_unknown_to_broker(
+            client_order_id="cli-unknown",
+            reason="null_order_id_sweep_unknown_to_broker",
+        )
+        assert updated is True
+        row = orders_store.get_by_client_order_id("cli-unknown")
+        assert row is not None
+        assert row.status == "rejected"
+        assert row.terminal_at is not None
+        assert row.order_id is None
+        # Position should have walked pending → canceled (no fill ever
+        # landed and the only entry_primary is now terminal).
+        pos = conn.execute(
+            "SELECT status FROM position_lifecycle "
+            "WHERE position_uid = ?",
+            (uid,),
+        ).fetchone()
+        assert pos[0] == "canceled"
+
+    def test_noop_when_order_id_already_attached(
+        self,
+        pos_store: PositionLifecycleStore,
+        orders_store: PositionLifecycleOrdersStore,
+    ):
+        uid = _seed_position(pos_store, owner_key="MSFT")
+        orders_store.insert_pending(
+            position_uid=uid,
+            role="entry_primary",
+            client_order_id="cli-attached",
+            order_type="market",
+            order_class="oto",
+            time_in_force="gtc",
+            side="buy",
+            intended_qty=10.0,
+        )
+        # Racing attach beat the sweep — PR #71 fallback or a
+        # delayed normal attach drained first.
+        orders_store.attach_broker_order_id(
+            client_order_id="cli-attached", order_id="alpaca-attached",
+        )
+        assert orders_store.mark_pending_unknown_to_broker(
+            client_order_id="cli-attached",
+            reason="sweep",
+        ) is False
+        row = orders_store.get_by_client_order_id("cli-attached")
+        assert row.status == "pending"
+        assert row.order_id == "alpaca-attached"
+
+    def test_noop_when_status_already_terminal(
+        self,
+        conn: sqlite3.Connection,
+        pos_store: PositionLifecycleStore,
+        orders_store: PositionLifecycleOrdersStore,
+    ):
+        uid = _seed_position(pos_store, owner_key="NVDA")
+        orders_store.insert_pending(
+            position_uid=uid,
+            role="entry_primary",
+            client_order_id="cli-already-canceled",
+            order_type="market",
+            order_class="oto",
+            time_in_force="gtc",
+            side="buy",
+            intended_qty=10.0,
+        )
+        # Operator manually resolved out of band.
+        conn.execute(
+            "UPDATE position_lifecycle_orders "
+            "SET status = 'canceled', terminal_at = ? "
+            "WHERE client_order_id = ?",
+            (datetime.now(timezone.utc).isoformat(),
+             "cli-already-canceled"),
+        )
+        conn.commit()
+        assert orders_store.mark_pending_unknown_to_broker(
+            client_order_id="cli-already-canceled",
+            reason="sweep",
+        ) is False
+
+    def test_noop_when_row_missing(
+        self,
+        orders_store: PositionLifecycleOrdersStore,
+    ):
+        assert orders_store.mark_pending_unknown_to_broker(
+            client_order_id="cli-nonexistent",
+            reason="sweep",
+        ) is False
+
+    def test_rejects_empty_reason(
+        self,
+        orders_store: PositionLifecycleOrdersStore,
+    ):
+        with pytest.raises(ValueError, match="reason"):
+            orders_store.mark_pending_unknown_to_broker(
+                client_order_id="cli-x",
+                reason="",
+            )
+
+
 # ── Frozen-row property ────────────────────────────────────────────────────
 
 

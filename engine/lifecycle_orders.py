@@ -977,6 +977,82 @@ class PositionLifecycleOrdersStore:
         )
         self._conn.commit()
 
+    def mark_pending_unknown_to_broker(
+        self,
+        *,
+        client_order_id: str,
+        reason: str,
+    ) -> bool:
+        """Resolve a NULL-order_id orphan that the broker has never
+        heard of by marking the substrate row 'rejected'.
+
+        Outcome (c) of the NULL-order_id REST sweep (tracker row 89,
+        'Known follow-ups'). When ``get_order_by_client_id`` raises
+        NotFound, the broker never accepted the submission — there is
+        no live order to lose track of, so the substrate row should
+        be transitioned out of pending so the position rollup can
+        progress.
+
+        Behavior:
+          - status='pending' AND order_id IS NULL → UPDATE to
+            'rejected', set terminal_at, last_observed_at; run the
+            position-status CTE so the parent position transitions
+            (typically pending → canceled if no fill ever landed).
+          - status already terminal OR order_id already attached →
+            no-op; return False. The orphan was already resolved out
+            of band (operator intervention, PR #71 trailing fallback,
+            or a racing attach).
+          - Row missing entirely → return False. Caller treats this
+            as benign.
+
+        Trades table is NOT touched: no fill happened, no trade row.
+        Position ``current_qty`` is NOT touched: a row that never had
+        order_id never had filled_qty either, so the rollup stays at
+        zero. We only need the position-status CTE to advance the
+        parent position out of 'pending'.
+
+        Returns True if the row was rejected, False if no-op.
+        """
+        if not reason:
+            raise ValueError("reason must not be empty")
+        now = _utc_now_iso()
+        # All-or-nothing transaction: row UPDATE + position-status
+        # recompute land together or not at all.
+        with self._conn:
+            existing = self._conn.execute(
+                "SELECT status, order_id, position_uid "
+                "FROM position_lifecycle_orders "
+                "WHERE client_order_id = ?",
+                (client_order_id,),
+            ).fetchone()
+            if existing is None:
+                return False
+            current_status, current_order_id, position_uid = existing
+            if (
+                current_status in TERMINAL_ORDER_STATUSES
+                or current_order_id is not None
+                or current_status != "pending"
+            ):
+                # Already resolved out of band; sweep treats as no-op.
+                return False
+            self._conn.execute(
+                "UPDATE position_lifecycle_orders "
+                "SET status = 'rejected', "
+                "    terminal_at = ?, "
+                "    last_observed_at = ? "
+                "WHERE client_order_id = ?",
+                (now, now, client_order_id),
+            )
+            # Position-status CTE recompute — typically transitions
+            # the parent from pending → canceled when this was the
+            # only pending entry. Imported here to avoid a
+            # forward-ref against the module-level SQL constant.
+            self._conn.execute(
+                _POSITION_STATUS_SQL,
+                {"position_uid": position_uid, "now": now},
+            )
+        return True
+
     # ── Reads ─────────────────────────────────────────────────────────
 
     def get_by_id(self, row_id: int) -> PositionLifecycleOrderRow | None:
