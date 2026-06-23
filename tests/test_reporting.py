@@ -485,7 +485,7 @@ class TestTradeLogger:
         been fully closed must NOT count as a completed round trip
         during restart restoration. The reviewer's bug scenario:
 
-          - Strategy at N=floor-1 (catastrophic tier).
+          - Strategy at N=floor-1 (drawdown gate observational).
           - Position opens, partially closes → row with status='partial',
             position_uid='X', realized_pnl=partial-P&L.
           - Bot restarts. Restart reads the partial row.

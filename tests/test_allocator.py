@@ -9,6 +9,7 @@ from unittest.mock import MagicMock, patch
 import pandas as pd
 import pytest
 
+from config import settings as app_settings
 from execution.broker import BrokerSnapshot, OpenOrder, OrderResult, OrderStatus
 from risk.allocator import (
     SleeveAllocator,
@@ -379,10 +380,23 @@ class TestSleeveDrawdownGate:
         # threshold value in message = 15% * 36000 = $5,400
         assert "threshold=5400" in result.message
 
-    def test_check_rejection_message_reports_catastrophic_tier_below_floor(self):
-        """PR #56 R2: below-floor rejections show the catastrophic
-        threshold, not the normal one. The operator log was previously
-        misleading at exactly the moment context matters most."""
+    def test_check_allows_drawdown_below_floor_in_paper(self, monkeypatch):
+        """In paper mode, below-floor strategy drawdown is observed but
+        cannot block entries."""
+        monkeypatch.setattr(app_settings, "LIVE_TRADING", False)
+        allocator = _allocator(dd_threshold=0.05)
+        # spy_options_reversion: floor=15. Stay at N=1 (below floor).
+        allocator.record_realized_pnl(
+            "spy_options_reversion", -10_000.0,
+            position_uid="pos-low-sample", is_full_close=True,
+        )
+        result = allocator.check("spy_options_reversion", _account(), [], {}, {})
+        assert isinstance(result, SleeveCapacity)
+
+    def test_check_rejection_message_reports_catastrophic_tier_below_floor_in_live(self, monkeypatch):
+        """In live mode, below-floor rejections use the catastrophic
+        threshold and make that tier visible to the operator."""
+        monkeypatch.setattr(app_settings, "LIVE_TRADING", True)
         allocator = _allocator(dd_threshold=0.05)
         # spy_options_reversion: floor=15. Stay at N=1 (below floor).
         # target_budget = 100k * 0.80 * 0.05 = $4,000.
@@ -394,9 +408,7 @@ class TestSleeveDrawdownGate:
         result = allocator.check("spy_options_reversion", _account(), [], {}, {})
         assert isinstance(result, SleeveRejection)
         assert "tier=catastrophic" in result.message
-        # threshold value in message = 35% * 4000 = $1,400 (NOT $200 from 5%)
         assert "threshold=1400" in result.message
-        # n=1/15 should also be in the message for context
         assert "n=1/15" in result.message
 
     def test_restore_pnl_summary_rehydrates_cumulative_and_hwm(self):
@@ -431,54 +443,44 @@ class TestSleeveDrawdownGate:
 
 
 class TestSleeveDrawdownMinTradesGuard:
-    """The min-trades guard prevents the drawdown gate from firing
-    when a strategy has too few trades to make HWM-vs-running meaningful.
+    """The min-trades guard prevents the drawdown gate from blocking
+    entries when a strategy has too few trades to make HWM-vs-running
+    meaningful.
 
     Motivating case (2026-06-10): spy_options_reversion had exactly ONE
     closed trade — a −$1,269 exit fired against still-buggy trailing-stop
     code that has since been fixed (PR #46 hardening). That single
     data point tripped the gate indefinitely. The guard removes that
-    failure mode: below the floor, the gate fails open and the
-    daily-loss / hard-dollar kill switches remain the active defense.
+    paper-watch failure mode: below the floor, paper fails open while
+    daily-loss / hard-dollar kill switches remain active; live retains
+    the catastrophic below-floor backstop.
     """
 
-    def test_gate_uses_catastrophic_threshold_below_floor(self):
-        # Sample size MUST NOT disable protection entirely (PR #56 R1).
-        # Below the floor, the catastrophic threshold (35% of
-        # target_budget by default) applies — NOT the normal 5%/15%.
-        #
-        # spy_options_reversion: floor=15, target_pct=0.10 in the
-        # test allocator, total_gross_pct=0.80, equity=100_000.
-        # target_budget = 100_000 * 0.80 * 0.10 = $8_000.
-        # Normal threshold: 5% of $8_000 = $400 — would trip on small loss.
-        # Catastrophic threshold: 35% of $8_000 = $2_800 — does NOT trip
-        # on small loss, DOES trip on a major one.
+    def test_gate_fails_open_below_floor_in_paper(self, monkeypatch):
+        # spy_options_reversion: floor=15. With only one completed
+        # trade, even a large realized-P&L drawdown is not enough sample
+        # to let this strategy-performance gate block paper-watch entries.
+        monkeypatch.setattr(app_settings, "LIVE_TRADING", False)
         allocator = _allocator(dd_threshold=0.05)
 
-        # Small loss (well above 5% normal, below 35% catastrophic).
-        # Drawdown of $1,000 is 12.5% of target — would trip the
-        # normal threshold, but the catastrophic threshold protects
-        # against this misfire at low sample size.
-        allocator.record_realized_pnl("spy_options_reversion", -1_000.0)
+        allocator.record_realized_pnl("spy_options_reversion", -10_000.0)
         assert allocator.is_strategy_in_drawdown(
             "spy_options_reversion", 100_000.0,
         ) is False, (
-            "small loss at N=1 must not trip the catastrophic gate"
+            "below-floor strategy drawdown must fail open"
         )
 
-    def test_catastrophic_loss_below_floor_DOES_trip_gate(self):
-        # The other half of R1: a truly catastrophic loss MUST still
-        # trip the gate even below the min-trades floor. Sample size
-        # is not an excuse to disable protection entirely.
+    def test_catastrophic_loss_below_floor_trips_gate_in_live(self, monkeypatch):
+        # Live keeps the PR #56 R1 backstop: a true below-floor
+        # catastrophe still blocks new entries.
+        monkeypatch.setattr(app_settings, "LIVE_TRADING", True)
         allocator = _allocator(dd_threshold=0.05)
-        # target_budget = $8_000; catastrophic threshold 35% = $2_800.
-        # A −$5_000 loss is 62.5% drawdown — well above catastrophic.
+        # spy_options_reversion target_budget = $4,000 in this fixture;
+        # catastrophic threshold 35% = $1,400.
         allocator.record_realized_pnl("spy_options_reversion", -5_000.0)
         assert allocator.is_strategy_in_drawdown(
             "spy_options_reversion", 100_000.0,
-        ) is True, (
-            "catastrophic loss at N=1 MUST trip the gate"
-        )
+        ) is True
 
     def test_gate_arms_at_floor(self):
         allocator = _allocator(dd_threshold=0.05)
@@ -511,6 +513,7 @@ class TestSleeveDrawdownMinTradesGuard:
         # When a strategy is in the allocator but NOT in the
         # min-trades-for-drawdown-gate map, the default floor applies.
         from config import settings as _s
+        monkeypatch.setattr(_s, "LIVE_TRADING", False)
         monkeypatch.setattr(_s, "STRATEGY_MIN_TRADES_FOR_DRAWDOWN_GATE", {})
         monkeypatch.setattr(_s, "STRATEGY_DEFAULT_MIN_TRADES_FOR_DRAWDOWN_GATE", 5)
         allocator = _allocator(dd_threshold=0.05)
@@ -526,11 +529,11 @@ class TestSleeveDrawdownMinTradesGuard:
             "sma_crossover", 100_000.0,
         ) is True
 
-    def test_drawdown_snapshot_exposes_guard_state(self):
+    def test_drawdown_snapshot_exposes_paper_below_floor_state(self, monkeypatch):
         # The snapshot used for observability/health must surface the
         # trade count, the floor, the active threshold, and whether the
-        # gate is in the "normal-armed" tier or the "catastrophic-only"
-        # tier.
+        # gate is armed.
+        monkeypatch.setattr(app_settings, "LIVE_TRADING", False)
         allocator = _allocator(dd_threshold=0.05)
         allocator.record_realized_pnl(
             "spy_options_reversion", -1_269.0, position_uid="pos-spy-1",
@@ -539,16 +542,28 @@ class TestSleeveDrawdownMinTradesGuard:
         entry = snap["spy_options_reversion"]
         assert entry["trade_count"] == 1
         assert entry["min_trades_for_gate"] == 15  # settings value
-        # gate_armed=False means the normal threshold does NOT apply;
-        # the catastrophic threshold is active instead. Protection is
-        # NEVER fully disabled.
+        # gate_armed=False means this strategy-performance gate is
+        # observational only until sample size reaches the configured floor.
         assert entry["gate_armed"] is False
-        # The catastrophic threshold (35% default) governs this tier.
-        assert entry["effective_threshold_pct"] == pytest.approx(0.35)
-        # −$1,269 at $8k target = 15.9% drawdown → below catastrophic.
+        assert entry["effective_threshold_pct"] == pytest.approx(0.0)
         assert entry["in_drawdown"] is False
         assert entry["drawdown_dollars"] == pytest.approx(1_269.0)
         assert entry["running_pnl"] == pytest.approx(-1_269.0)
+
+    def test_drawdown_snapshot_exposes_live_below_floor_backstop(self, monkeypatch):
+        monkeypatch.setattr(app_settings, "LIVE_TRADING", True)
+        allocator = _allocator(dd_threshold=0.05)
+        allocator.record_realized_pnl(
+            "spy_options_reversion", -1_269.0, position_uid="pos-spy-1",
+        )
+        snap = allocator.drawdown_snapshot(100_000.0)
+        entry = snap["spy_options_reversion"]
+        assert entry["trade_count"] == 1
+        assert entry["min_trades_for_gate"] == 15
+        assert entry["gate_armed"] is False
+        assert entry["effective_threshold_pct"] == pytest.approx(0.35)
+        assert entry["in_drawdown"] is False
+        assert entry["drawdown_dollars"] == pytest.approx(1_269.0)
 
     def test_record_realized_pnl_increments_trade_count(self):
         allocator = _allocator()
@@ -559,27 +574,26 @@ class TestSleeveDrawdownMinTradesGuard:
         summary = allocator.pnl_summary()
         assert summary["sma_crossover"]["trade_count"] == pytest.approx(5.0)
 
-    def test_restore_pnl_summary_handles_missing_fields(self):
+    def test_restore_pnl_summary_handles_missing_fields(self, monkeypatch):
         # Backward-compat: legacy summaries lacking trade_count /
-        # seen_position_uids restore N=0 and empty set. Combined with
-        # the catastrophic-tier guard, this is safe: an isolated bad
-        # loss still won't fire the normal gate but a sleeve-scale
-        # disaster will fire the catastrophic one.
+        # seen_position_uids restore N=0 and empty set. The
+        # strategy-performance drawdown gate remains observational until
+        # enough completed round trips accumulate.
+        monkeypatch.setattr(app_settings, "LIVE_TRADING", False)
         allocator = _allocator(dd_threshold=0.05)
         allocator.restore_pnl_summary(
             {
-                # Small loss, no trade_count/seen_uids.
-                "sma_crossover": {"realized_pnl": -200.0, "hwm": 0.0},
+                # Large loss, no trade_count/seen_uids.
+                "sma_crossover": {"realized_pnl": -10_000.0, "hwm": 0.0},
             }
         )
-        # Below catastrophic (sma target=$20k, 35% = $7k) → False.
         assert allocator.is_strategy_in_drawdown(
             "sma_crossover", 100_000.0,
         ) is False
         snap = allocator.drawdown_snapshot(100_000.0)
         assert snap["sma_crossover"]["trade_count"] == 0
         assert snap["sma_crossover"]["gate_armed"] is False
-        assert snap["sma_crossover"]["effective_threshold_pct"] == pytest.approx(0.35)
+        assert snap["sma_crossover"]["effective_threshold_pct"] == pytest.approx(0.0)
 
 
 class TestSleeveDrawdownPartialCloseAccounting:
@@ -690,10 +704,10 @@ class TestSleeveDrawdownPartialCloseAccounting:
         assert summary["sma_crossover"]["realized_pnl"] == pytest.approx(-75.0)
         assert summary["sma_crossover"]["trade_count"] == pytest.approx(1.0)
 
-    def test_partial_close_does_not_prematurely_arm_normal_tier(self):
+    def test_partial_close_does_not_prematurely_arm_normal_tier(self, monkeypatch):
         """Reviewer's concrete R2 scenario: a partial close at N=floor-1
-        must NOT push N past the floor and switch from catastrophic to
-        normal threshold mid-trade.
+        must NOT push N past the floor and arm the strategy drawdown
+        gate mid-trade.
 
         Setup: sma_crossover, floor=25. Seed 24 completed round trips
         (all 0 P&L), then a 25th position opens and partially closes.
@@ -701,13 +715,14 @@ class TestSleeveDrawdownPartialCloseAccounting:
         the normal threshold. After R2: trade_count stays at 24 until
         the 25th position fully closes.
         """
+        monkeypatch.setattr(app_settings, "LIVE_TRADING", False)
         allocator = _allocator(dd_threshold=0.05)
         for i in range(24):
             allocator.record_realized_pnl(
                 "sma_crossover", 0.0,
                 position_uid=f"pos-{i}", is_full_close=True,
             )
-        # N=24, floor=25 → catastrophic tier still active.
+        # N=24, floor=25 → drawdown gate still observational.
         snap = allocator.drawdown_snapshot(100_000.0)
         assert snap["sma_crossover"]["trade_count"] == 24
         assert snap["sma_crossover"]["gate_armed"] is False
@@ -721,7 +736,7 @@ class TestSleeveDrawdownPartialCloseAccounting:
         assert snap["sma_crossover"]["trade_count"] == 24
         assert snap["sma_crossover"]["gate_armed"] is False
         assert snap["sma_crossover"]["effective_threshold_pct"] == pytest.approx(
-            0.35  # catastrophic
+            0.0
         )
         # Now the full close for the same UID fires — NOW trade_count
         # increments. Gate transitions to normal tier from this point.
@@ -736,20 +751,33 @@ class TestSleeveDrawdownPartialCloseAccounting:
             0.05  # normal dd_threshold
         )
 
-    def test_catastrophic_gate_uses_distinct_position_count(self):
-        """The catastrophic-threshold tier (R1) depends on the same
-        trade-count definition — fragmented closes of a single
-        catastrophic position must not be mistaken for many small ones."""
+    def test_below_floor_gate_uses_distinct_position_count_in_paper(self, monkeypatch):
+        """Fragmented closes of a single position must not be mistaken
+        for enough completed round trips to arm the drawdown gate."""
+        monkeypatch.setattr(app_settings, "LIVE_TRADING", False)
         allocator = _allocator(dd_threshold=0.05)
-        # spy_options_reversion: floor=15, target_budget=$8k,
-        # catastrophic=35% of $8k = $2,800.
         # One position closes in 3 chunks for −$5k total.
         for chunk in (-2000.0, -2000.0, -1000.0):
             allocator.record_realized_pnl(
                 "spy_options_reversion", chunk, position_uid="pos-big-loss",
             )
-        # trade_count = 1 (one position), but dollar math still −$5k —
-        # well above the $2,800 catastrophic floor.
+        # trade_count = 1 (one position), so the gate remains below-floor
+        # and observational despite the large realized loss.
+        assert allocator.pnl_summary()["spy_options_reversion"]["trade_count"] == pytest.approx(1.0)
+        assert allocator.is_strategy_in_drawdown(
+            "spy_options_reversion", 100_000.0,
+        ) is False
+
+    def test_below_floor_live_backstop_uses_distinct_position_count(self, monkeypatch):
+        """Live below-floor backstop uses the same completed-position
+        count, so fragmented closes stay below floor while dollar loss
+        can still trip the catastrophic threshold."""
+        monkeypatch.setattr(app_settings, "LIVE_TRADING", True)
+        allocator = _allocator(dd_threshold=0.05)
+        for chunk in (-2000.0, -2000.0, -1000.0):
+            allocator.record_realized_pnl(
+                "spy_options_reversion", chunk, position_uid="pos-big-loss",
+            )
         assert allocator.pnl_summary()["spy_options_reversion"]["trade_count"] == pytest.approx(1.0)
         assert allocator.is_strategy_in_drawdown(
             "spy_options_reversion", 100_000.0,

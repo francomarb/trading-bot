@@ -349,7 +349,8 @@ class SleeveAllocator:
 
         Backward-compatible:
           - Summaries without ``trade_count`` restore N=0 (the gate then
-            fails open via the min-trades guard until live trades fire).
+            follows the below-floor policy until new completed trades
+            establish a sample size).
           - Summaries without ``seen_position_uids`` restore an empty
             set — meaning a partial close of a pre-restart position will
             (incorrectly) count as a new trade. Restart paths that
@@ -393,11 +394,7 @@ class SleeveAllocator:
         return equity * self._total_gross_pct * float(entry["target_pct"])
 
     def _min_trades_for_drawdown_gate(self, strategy_name: str) -> int:
-        """Per-strategy minimum trade count before the *normal* drawdown
-        threshold applies. See ``is_strategy_in_drawdown`` for the
-        two-tier semantics (catastrophic threshold below floor, normal
-        threshold at/after floor).
-        """
+        """Per-strategy minimum trade count before drawdown can block entries."""
         from config import settings as _s
         override = _s.STRATEGY_MIN_TRADES_FOR_DRAWDOWN_GATE.get(strategy_name)
         if override is not None:
@@ -405,11 +402,7 @@ class SleeveAllocator:
         return int(_s.STRATEGY_DEFAULT_MIN_TRADES_FOR_DRAWDOWN_GATE)
 
     def _catastrophic_drawdown_threshold(self) -> float:
-        """The drawdown threshold applied when trade_count is below the
-        min-trades floor. Generous enough not to fire on ordinary
-        single-trade variance, but tight enough to catch a true sleeve
-        catastrophe (default: 35% of target budget).
-        """
+        """Live-only below-floor drawdown threshold."""
         from config import settings as _s
         return float(_s.STRATEGY_CATASTROPHIC_DRAWDOWN_THRESHOLD)
 
@@ -417,47 +410,43 @@ class SleeveAllocator:
         """Return the threshold (fraction of target_budget) that the
         gate would currently apply for ``strategy_name``.
 
-        Picks the catastrophic tier when ``trade_count < min_floor``,
-        the normal ``dd_threshold`` otherwise. Used by both
-        ``is_strategy_in_drawdown`` and ``check()`` (rejection message)
-        so the operator-visible threshold value is always the one that
-        actually fired.
+        Below the configured min-trades floor, the strategy-level
+        sleeve-drawdown gate is observational only in paper mode. In
+        live mode, the catastrophic backstop remains active below the
+        floor. Once the floor is reached, the configured normal
+        threshold applies in both modes.
         """
+        from config import settings as _s
         if self._strategy_trade_count[strategy_name] < self._min_trades_for_drawdown_gate(strategy_name):
-            return self._catastrophic_drawdown_threshold()
+            return self._catastrophic_drawdown_threshold() if _s.LIVE_TRADING else 0.0
         return self._dd_threshold
 
     def is_strategy_in_drawdown(self, strategy_name: str, equity: float) -> bool:
         """True iff the strategy's sleeve-drawdown gate should halt new entries.
 
-        **Two-tier threshold semantics** (PR #56 R1 fix):
-
-          - ``trade_count <  floor`` → catastrophic threshold applies
-            (default 35% of target budget). Sample size MUST NOT disable
-            protection entirely — a true sleeve catastrophe still trips
-            the gate even at low N.
-
-          - ``trade_count >= floor`` → normal threshold applies
-            (``dd_threshold``, typically 5–15% of target budget).
-
         The min-trades guard exists because with too few trades the
         HWM-vs-running ratio is dominated by noise — a single bad trade
         (buggy code, atypical market, ordinary variance) produces an
         indefinite lockout that doesn't reflect the strategy's true
-        behaviour. The catastrophic tier ensures we still halt on a
-        loss large enough to be unambiguous regardless of sample size.
+        behaviour. In paper mode, below the configured floor this
+        allocator-level strategy-performance gate fails open so
+        paper-watch can accumulate evidence. In live mode, the
+        catastrophic backstop still protects against severe early
+        sleeve drain. Daily/account loss controls, hard sizing,
+        broker-side stops, max positions, and exits remain active.
 
-        See ``settings.STRATEGY_MIN_TRADES_FOR_DRAWDOWN_GATE`` and
-        ``settings.STRATEGY_CATASTROPHIC_DRAWDOWN_THRESHOLD`` for the
+        See ``settings.STRATEGY_MIN_TRADES_FOR_DRAWDOWN_GATE`` for the
         rationale and motivating case.
         """
         if self._dd_threshold == 0.0 or strategy_name not in self._entries:
             return False
+        threshold = self._effective_drawdown_threshold(strategy_name)
+        if threshold == 0.0:
+            return False
         target_budget = self.target_budget(strategy_name, equity)
         running = self._strategy_realized_pnl[strategy_name]
         hwm = self._strategy_pnl_hwm[strategy_name]
-        effective_threshold = self._effective_drawdown_threshold(strategy_name)
-        return (hwm - running) > (effective_threshold * target_budget)
+        return (hwm - running) > (threshold * target_budget)
 
     def drawdown_snapshot(self, equity: float) -> dict[str, dict]:
         """Read-only per-strategy HWM-drawdown state.
@@ -473,15 +462,11 @@ class SleeveAllocator:
         "gate_armed": bool}}` for every registered strategy.
 
         ``gate_armed`` reflects whether the strategy has accumulated
-        enough trades for the *normal* sleeve-drawdown threshold to
-        apply. When True, the gate uses ``dd_threshold`` (typically
-        5–15% of target_budget). When False (sample below the min-trades
-        floor), the gate uses the **catastrophic** threshold instead —
-        default 35% of target_budget per
-        ``settings.STRATEGY_CATASTROPHIC_DRAWDOWN_THRESHOLD``. The gate
-        is NEVER fully disabled: a true sleeve catastrophe still trips
-        the gate even at low N. The ``effective_threshold_pct`` field
-        below surfaces whichever threshold is currently active.
+        enough trades for the sleeve-drawdown threshold to block new
+        entries with the normal HWM threshold. When False (sample below
+        the min-trades floor), the gate is observational only in paper
+        mode (``effective_threshold_pct`` is 0.0) and uses the
+        catastrophic backstop in live mode.
         """
         out: dict[str, dict] = {}
         for strategy_name in self._entries:
@@ -500,9 +485,10 @@ class SleeveAllocator:
                 "drawdown_dollars": max(hwm - running, 0.0),
                 "trade_count": trade_count,
                 "min_trades_for_gate": min_trades,
-                # gate_armed=True means the *normal* threshold applies;
-                # gate_armed=False means the catastrophic threshold
-                # applies (it is NEVER disabled entirely).
+                # gate_armed=False means sample size is below the
+                # configured floor. In paper mode, strategy-level
+                # drawdown is observed but cannot block entries yet; in
+                # live mode the catastrophic threshold still applies.
                 "gate_armed": not below_floor,
                 "effective_threshold_pct": effective_threshold,
             }
@@ -550,14 +536,12 @@ class SleeveAllocator:
         if self.is_strategy_in_drawdown(strategy_name, account.equity):
             running = self._strategy_realized_pnl[strategy_name]
             hwm = self._strategy_pnl_hwm[strategy_name]
-            # Use the EFFECTIVE threshold (catastrophic if below floor,
-            # normal otherwise) in the operator-visible message so the
-            # rejection reason shows the value that actually fired.
             effective_pct = self._effective_drawdown_threshold(strategy_name)
             trigger = effective_pct * snapshot.target_budget
             tier_label = (
-                "catastrophic" if effective_pct == self._catastrophic_drawdown_threshold()
-                and self._strategy_trade_count[strategy_name] < self._min_trades_for_drawdown_gate(strategy_name)
+                "catastrophic"
+                if self._strategy_trade_count[strategy_name]
+                < self._min_trades_for_drawdown_gate(strategy_name)
                 else "normal"
             )
             return SleeveRejection(
