@@ -1,7 +1,8 @@
 # Deferred trade follow-ups — 2026-06-12
 
 **Status:** Item 1 is active on a dedicated fix branch. Item 2 remains deferred
-while its related order-lifecycle work is in flight.
+while its related order-lifecycle work is in flight. Item 3 is being addressed
+by a dedicated allocator-policy PR.
 
 **Context:** Two operational observations were found while reviewing the
 June 12, 2026 paper-trading activity. Neither observation invalidates the
@@ -81,6 +82,44 @@ Questions for later review:
 Treat this as an execution-safety follow-up. Consult Alpaca's current official
 SDK documentation and paper-test the chosen recovery path before changing the
 live-facing order lifecycle.
+
+## 3. SPY options reversion blocked before enough paper trades
+
+On June 22, 2026, `spy_options_reversion` produced valid entry signals but was
+blocked by the allocator sleeve-drawdown gate:
+
+- Closed round trips on record: 5 of the configured 15-trade floor
+- Cumulative realized P&L: +$160
+- Prior realized-P&L high-water mark: +$2,252
+- Drawdown from HWM: $2,092
+- Active pre-fix threshold: "catastrophic" below-floor tier, about $1.6k that day
+
+The DB rows feeding the allocator looked internally consistent; this was not an
+accounting-hole finding. The concern is policy: with only five closed trades,
+the bot is making a hard entry-blocking decision from a very small sample. The
+pre-fix implementation applied a generous catastrophic threshold below the
+min-trades floor instead of fully failing open. That protected against a true
+early sleeve disaster, but for sparse paper-watch strategies it also created
+the same chicken-and-egg lockout the min-trades floor was meant to avoid.
+
+Policy decision for the fix PR: in paper mode, the configured minimum
+completed-trade floor means the strategy-level sleeve drawdown gate is
+observational only until the floor is reached. Below the floor, it must not
+block entries. In live mode, the catastrophic below-floor backstop is retained
+so sample size cannot disable protection entirely. The bot still keeps the
+real hard-risk layers active in both modes: daily/account loss controls, hard
+sizing, broker-side stops, max positions, sleeve-budget checks, entry quality
+guards, and exits.
+
+Acceptance:
+
+1. In paper mode, `trade_count < STRATEGY_MIN_TRADES_FOR_DRAWDOWN_GATE[strategy]`
+   makes `SleeveAllocator.is_strategy_in_drawdown(...)` return false.
+2. `drawdown_snapshot(...)` still reports running P&L, HWM, drawdown dollars,
+   trade count, floor, and the mode-appropriate effective threshold for
+   observability.
+3. Once `trade_count >= floor`, the normal HWM drawdown threshold resumes.
+4. In live mode, the catastrophic below-floor threshold remains active.
 
 ## Revisit criteria
 

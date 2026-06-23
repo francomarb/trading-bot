@@ -607,9 +607,11 @@ STRATEGY_MIN_TRADES_FOR_VERDICT: dict[str, int] = {
 #
 # Floors mirror STRATEGY_MIN_TRADES_FOR_VERDICT (above) because the
 # conceptual question is identical: "how many trades do we need before we
-# trust this strategy's realized P&L as a verdict?" Below the floor, the
-# gate fails open (does not halt) and the daily-loss / hard-dollar cap
-# kill switches remain the active line of defense.
+# trust this strategy's realized P&L as a verdict?" In paper mode below the
+# floor, the gate fails open (does not halt) so validation can gather enough
+# evidence. In live mode below the floor, the catastrophic backstop below
+# remains active. Daily-loss / hard-dollar cap kill switches remain active in
+# both modes.
 #
 # The default for strategies not in the map is high (10) to ensure new
 # strategies aren't gated out on their first bad day. Adjust per-strategy
@@ -623,21 +625,12 @@ STRATEGY_MIN_TRADES_FOR_DRAWDOWN_GATE: dict[str, int] = {
 }
 STRATEGY_DEFAULT_MIN_TRADES_FOR_DRAWDOWN_GATE: int = 10
 
-# Catastrophic drawdown threshold (PR #56 R1) — even below the min-trades
-# floor, sample size MUST NOT disable protection entirely. A second-tier
-# threshold gates against catastrophic loss while the strategy is still
-# in its "we don't have enough sample to evaluate normally" window.
-#
-# Two-tier semantics in SleeveAllocator.is_strategy_in_drawdown:
-#   - trade_count <  floor: gate fires at  STRATEGY_CATASTROPHIC_DRAWDOWN_THRESHOLD
-#                           × target_budget (default: 35%)
-#   - trade_count >= floor: gate fires at  dd_threshold × target_budget
-#                           (the configured normal threshold, e.g. 15%)
-#
-# The catastrophic level is intentionally generous — it should NOT fire on
-# ordinary single-trade variance, but it MUST fire on a 35%+ sleeve loss
-# (which on the spy_options_reversion case would have been ~-$3,500+ on a
-# ~$10k target budget — clearly beyond "noise from one bad trade").
+# Live-only catastrophic drawdown threshold (PR #74 review) — in paper mode,
+# the min-trades floor is a true fail-open so sparse strategies can collect
+# enough evidence for tuning. In live mode, sample size must not disable
+# protection entirely: below the floor, this backstop blocks entries after a
+# severe HWM drawdown. Once the floor is reached, the normal
+# STRATEGY_SLEEVE_DD_THRESHOLD applies in both paper and live.
 STRATEGY_CATASTROPHIC_DRAWDOWN_THRESHOLD: float = 0.35
 
 # Strategy Health monitor (PLAN 11.10f) — feature flag for the
