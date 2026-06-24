@@ -117,7 +117,7 @@ These are the items that must be green before any live flip.
 | Indicators | Hand-rolled SMA, EMA, ATR, RSI, ADX |
 | Strategy framework | `BaseStrategy`, `SignalFrame`, `StrategySlot`, `WatchlistSource`, structured edge-filter decisions |
 | Backtesting | vectorbt runner, slippage/commission modeling, look-ahead-safe next-open execution, reconciliation tooling |
-| Risk manager | Position sizing, ATR stops, prior-close daily/hard-dollar halts that re-engage after recycle, universal entry-only submit guards, loss streak cooldown, broker-error and slippage kill switches |
+| Risk manager | Position sizing, ATR stops, prior-close daily/hard-dollar halts that re-engage after same-day recycle and recompute after broker baseline rollover, universal entry-only submit guards, loss streak cooldown, broker-error and slippage kill switches |
 | Broker execution | Alpaca wrapper, market/limit/OTO/fractional paths, option worker, MLEG worker, stream-first fills |
 | Engine | Restart-safe cycle, startup reconciliation, external-close detection, state snapshot, per-strategy slots |
 | Reporting | SQLite trade log, PnL summaries, alerts, dashboard (now with monthly health report tabs), Strategy Health & Edge reports |

@@ -688,6 +688,76 @@ class TestHardDollarCap:
         assert code is RejectionCode.HARD_DOLLAR_CAP
         assert mgr.is_halted()
         assert "previous close" in (mgr.halt_reason() or "")
+        assert mgr._halt_code is RejectionCode.HARD_DOLLAR_CAP
+
+    def test_account_halt_stays_sticky_for_same_broker_baseline(self):
+        mgr = _mgr(hard_dollar_loss_cap=2_000.0, max_daily_loss_pct=0.99)
+        code = mgr.evaluate_account(
+            _account(
+                equity=98_000.0,
+                session_start=98_000.0,
+                previous_close=100_000.0,
+            )
+        )
+        assert code is RejectionCode.HARD_DOLLAR_CAP
+
+        # Intraday recovery does not auto-clear the kill switch while the
+        # broker prior-close baseline is unchanged.
+        code = mgr.evaluate_account(
+            _account(
+                equity=99_500.0,
+                session_start=98_000.0,
+                previous_close=100_000.0,
+            )
+        )
+        assert code is RejectionCode.HALTED
+        assert mgr.is_halted()
+
+    def test_account_halt_clears_when_new_broker_baseline_is_healthy(self):
+        mgr = _mgr(hard_dollar_loss_cap=2_000.0, max_daily_loss_pct=0.99)
+        code = mgr.evaluate_account(
+            _account(
+                equity=98_000.0,
+                session_start=98_000.0,
+                previous_close=100_000.0,
+            )
+        )
+        assert code is RejectionCode.HARD_DOLLAR_CAP
+
+        code = mgr.evaluate_account(
+            _account(
+                equity=99_000.0,
+                session_start=98_000.0,
+                previous_close=100_500.0,
+            )
+        )
+        assert code is None
+        assert not mgr.is_halted()
+        assert mgr.halt_reason() is None
+
+    def test_account_halt_refreshes_when_new_broker_baseline_still_breaches(self):
+        mgr = _mgr(hard_dollar_loss_cap=2_000.0, max_daily_loss_pct=0.99)
+        code = mgr.evaluate_account(
+            _account(
+                equity=98_000.0,
+                session_start=98_000.0,
+                previous_close=100_000.0,
+            )
+        )
+        assert code is RejectionCode.HARD_DOLLAR_CAP
+        old_reason = mgr.halt_reason()
+
+        code = mgr.evaluate_account(
+            _account(
+                equity=101_000.0,
+                session_start=98_000.0,
+                previous_close=104_000.0,
+            )
+        )
+        assert code is RejectionCode.HARD_DOLLAR_CAP
+        assert mgr.is_halted()
+        assert mgr._halt_code is RejectionCode.HARD_DOLLAR_CAP
+        assert mgr.halt_reason() != old_reason
 
     def test_account_check_falls_back_to_process_session_start(self):
         mgr = _mgr(hard_dollar_loss_cap=2_000.0, max_daily_loss_pct=0.99)
