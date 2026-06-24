@@ -432,7 +432,9 @@ The isolated options pool uses the same `SleeveAllocator` and HWM drawdown gate 
 **Responsibilities:**
 - Validate signals against current portfolio state
 - Enforce ATR-based position sizing (risk no more than 2% of equity per trade)
-- Enforce daily loss limits (halt bot if breached)
+- Enforce daily / hard-dollar loss limits against Alpaca prior-close equity when
+  available; account-loss halts stay sticky for that broker baseline and
+  recompute after baseline rollover.
 - Apply stop-loss levels to every order (ATR-based for equities; bracket legs for options)
 - Track current exposure per symbol and overall
 - Loss-streak cooldown per strategy

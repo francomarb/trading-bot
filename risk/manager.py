@@ -23,8 +23,9 @@ Design principles
 
 3. **Multiple independent kill switches.** Daily-loss %, hard-dollar cap,
    broker-error streak, and slippage drift each halt trading independently.
-   Once tripped, the manager stays halted until `reset_kill_switches()` is
-   explicitly called by an operator.
+   Account-loss halts stay sticky for the broker baseline they tripped on;
+   non-account halts stay halted until `reset_kill_switches()` is explicitly
+   called by an operator.
 
 4. **Per-strategy loss-streak cooldown.** A strategy that posts N consecutive
    losses gets disabled for K hours; other strategies keep running.
@@ -381,6 +382,7 @@ class RiskManager:
         self._slippage_samples: Deque[tuple[float, float]] = deque(maxlen=200)
         self._halted: bool = False
         self._halt_reason: str | None = None
+        self._account_halt_baseline: float | None = None
         # Operator Controls Phase B — soft entry pauses. Independent of
         # the kill switch: pauses block NEW entries only; exits, stops,
         # reconciliation, allocator updates, and lifecycle reconciles
@@ -409,6 +411,7 @@ class RiskManager:
         if not self._halted:
             self._halted = True
             self._halt_reason = reason
+            self._account_halt_baseline = None
             logger.critical(f"RiskManager kill switch engaged: {reason}")
 
     def reset_kill_switches(self) -> None:
@@ -419,6 +422,7 @@ class RiskManager:
             )
         self._halted = False
         self._halt_reason = None
+        self._account_halt_baseline = None
 
     # ── Soft entry pauses (Operator Controls Phase B) ──────────────────
     #
@@ -538,13 +542,9 @@ class RiskManager:
 
     def _account_limit_breach(
         self, account: AccountState
-    ) -> tuple[RejectionCode, str] | None:
+    ) -> tuple[RejectionCode, str, float] | None:
         """Return the first account-level loss-limit breach, if any."""
-        baseline = getattr(account, "previous_close_equity", None)
-        baseline_name = "previous close"
-        if baseline is None or baseline <= 0:
-            baseline = getattr(account, "session_start_equity", 0.0)
-            baseline_name = "session start"
+        baseline, baseline_name = self._account_loss_baseline(account)
         if baseline <= 0:
             return None
 
@@ -554,6 +554,7 @@ class RiskManager:
                 RejectionCode.DAILY_LOSS_LIMIT,
                 f"daily loss {drawdown_pct * 100:.2f}% >= "
                 f"{self.max_daily_loss_pct * 100:.2f}% from {baseline_name}",
+                baseline,
             )
 
         dollar_loss = baseline - account.equity
@@ -562,8 +563,23 @@ class RiskManager:
                 RejectionCode.HARD_DOLLAR_CAP,
                 f"dollar loss ${dollar_loss:.2f} >= "
                 f"cap ${self.hard_dollar_loss_cap:.2f} from {baseline_name}",
+                baseline,
             )
         return None
+
+    def _account_loss_baseline(self, account: AccountState) -> tuple[float, str]:
+        baseline = getattr(account, "previous_close_equity", None)
+        baseline_name = "previous close"
+        if baseline is None or baseline <= 0:
+            baseline = getattr(account, "session_start_equity", 0.0)
+            baseline_name = "session start"
+        return float(baseline or 0.0), baseline_name
+
+    def _halt_is_account_loss(self) -> bool:
+        reason = self._halt_reason or ""
+        return reason.startswith("daily loss ") or reason.startswith(
+            "dollar loss "
+        )
 
     def evaluate_account(self, account: AccountState) -> RejectionCode | None:
         """
@@ -575,12 +591,50 @@ class RiskManager:
         recycle during the same trading day.
         """
         if self._halted:
-            return RejectionCode.HALTED
+            if not self._halt_is_account_loss():
+                return RejectionCode.HALTED
+
+            baseline, baseline_name = self._account_loss_baseline(account)
+            baseline_changed = (
+                self._account_halt_baseline is None
+                or not math.isclose(
+                    baseline,
+                    self._account_halt_baseline,
+                    rel_tol=0.0,
+                    abs_tol=0.01,
+                )
+            )
+            if not baseline_changed:
+                return RejectionCode.HALTED
+
+            breach = self._account_limit_breach(account)
+            if breach is None:
+                logger.warning(
+                    "RiskManager account-loss halt cleared after broker "
+                    f"baseline rollover to {baseline_name} "
+                    f"${baseline:,.2f} (was: {self._halt_reason})"
+                )
+                self._halted = False
+                self._halt_reason = None
+                self._account_halt_baseline = None
+                return None
+
+            code, message, breach_baseline = breach
+            if message != self._halt_reason:
+                logger.critical(
+                    "RiskManager account-loss halt refreshed after broker "
+                    f"baseline rollover: {message} "
+                    f"(was: {self._halt_reason})"
+                )
+                self._halt_reason = message
+            self._account_halt_baseline = breach_baseline
+            return code
         breach = self._account_limit_breach(account)
         if breach is None:
             return None
-        code, message = breach
+        code, message, baseline = breach
         self._engage_kill_switch(message)
+        self._account_halt_baseline = baseline
         return code
 
     def cooldown_snapshot(
@@ -945,8 +999,9 @@ class RiskManager:
 
         breach = self._account_limit_breach(account)
         if breach is not None:
-            code, message = breach
+            code, message, baseline = breach
             self._engage_kill_switch(message)
+            self._account_halt_baseline = baseline
             return self._reject(
                 code,
                 message,
