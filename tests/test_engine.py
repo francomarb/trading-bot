@@ -928,6 +928,35 @@ class TestRunOneCycle:
         assert "previous close" in (engine.risk.halt_reason() or "")
         broker.place_order.assert_not_called()
 
+    def test_broker_snapshot_clears_stale_account_halt_before_signal_gate(
+        self, engine_factory
+    ):
+        snap = _snapshot(equity=99_000.0, previous_close_equity=100_500.0)
+        engine, broker = engine_factory(
+            entries=[False] * 59 + [True],
+            snapshot=snap,
+            market_open=True,
+        )
+        engine.risk.hard_dollar_loss_cap = 2_000.0
+        engine.risk.max_daily_loss_pct = 0.99
+        engine.risk.evaluate_account(
+            AccountState(
+                equity=98_000.0,
+                cash=98_000.0,
+                session_start_equity=98_000.0,
+                previous_close_equity=100_000.0,
+                open_positions={},
+            )
+        )
+        assert engine.risk.is_halted()
+        engine._session_start_equity = 98_000.0
+        engine._cycle_count = 1
+
+        engine._run_one_cycle()
+
+        assert not engine.risk.is_halted()
+        broker.place_order.assert_called_once()
+
     def test_market_closed_skips_cycle(self, engine_factory):
         engine, broker = engine_factory(
             entries=[False] * 59 + [True],

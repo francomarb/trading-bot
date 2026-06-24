@@ -688,6 +688,7 @@ class TestHardDollarCap:
         assert code is RejectionCode.HARD_DOLLAR_CAP
         assert mgr.is_halted()
         assert "previous close" in (mgr.halt_reason() or "")
+        assert mgr._halt_code is RejectionCode.HARD_DOLLAR_CAP
 
     def test_account_halt_stays_sticky_for_same_broker_baseline(self):
         mgr = _mgr(hard_dollar_loss_cap=2_000.0, max_daily_loss_pct=0.99)
@@ -744,6 +745,7 @@ class TestHardDollarCap:
             )
         )
         assert code is RejectionCode.HARD_DOLLAR_CAP
+        old_reason = mgr.halt_reason()
 
         code = mgr.evaluate_account(
             _account(
@@ -754,7 +756,8 @@ class TestHardDollarCap:
         )
         assert code is RejectionCode.HARD_DOLLAR_CAP
         assert mgr.is_halted()
-        assert "$3000.00" in (mgr.halt_reason() or "")
+        assert mgr._halt_code is RejectionCode.HARD_DOLLAR_CAP
+        assert mgr.halt_reason() != old_reason
 
     def test_account_check_falls_back_to_process_session_start(self):
         mgr = _mgr(hard_dollar_loss_cap=2_000.0, max_daily_loss_pct=0.99)

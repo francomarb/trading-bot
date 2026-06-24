@@ -382,6 +382,7 @@ class RiskManager:
         self._slippage_samples: Deque[tuple[float, float]] = deque(maxlen=200)
         self._halted: bool = False
         self._halt_reason: str | None = None
+        self._halt_code: RejectionCode | None = None
         self._account_halt_baseline: float | None = None
         # Operator Controls Phase B — soft entry pauses. Independent of
         # the kill switch: pauses block NEW entries only; exits, stops,
@@ -407,11 +408,18 @@ class RiskManager:
     def halt_reason(self) -> str | None:
         return self._halt_reason
 
-    def _engage_kill_switch(self, reason: str) -> None:
+    def _engage_kill_switch(
+        self,
+        reason: str,
+        *,
+        code: RejectionCode | None = None,
+        account_baseline: float | None = None,
+    ) -> None:
         if not self._halted:
             self._halted = True
             self._halt_reason = reason
-            self._account_halt_baseline = None
+            self._halt_code = code
+            self._account_halt_baseline = account_baseline
             logger.critical(f"RiskManager kill switch engaged: {reason}")
 
     def reset_kill_switches(self) -> None:
@@ -422,6 +430,7 @@ class RiskManager:
             )
         self._halted = False
         self._halt_reason = None
+        self._halt_code = None
         self._account_halt_baseline = None
 
     # ── Soft entry pauses (Operator Controls Phase B) ──────────────────
@@ -576,10 +585,10 @@ class RiskManager:
         return float(baseline or 0.0), baseline_name
 
     def _halt_is_account_loss(self) -> bool:
-        reason = self._halt_reason or ""
-        return reason.startswith("daily loss ") or reason.startswith(
-            "dollar loss "
-        )
+        return self._halt_code in {
+            RejectionCode.DAILY_LOSS_LIMIT,
+            RejectionCode.HARD_DOLLAR_CAP,
+        }
 
     def evaluate_account(self, account: AccountState) -> RejectionCode | None:
         """
@@ -588,7 +597,9 @@ class RiskManager:
         This is run from each fresh broker snapshot so defined-risk strategies
         that do not use signal sizing cannot bypass global loss limits. Using
         Alpaca's prior-close equity also makes the halt re-engage after a bot
-        recycle during the same trading day.
+        recycle during the same trading day. Account-loss halts are recomputed
+        when the broker baseline rolls over; non-account halts remain sticky
+        until an operator reset.
         """
         if self._halted:
             if not self._halt_is_account_loss():
@@ -616,6 +627,7 @@ class RiskManager:
                 )
                 self._halted = False
                 self._halt_reason = None
+                self._halt_code = None
                 self._account_halt_baseline = None
                 return None
 
@@ -627,14 +639,18 @@ class RiskManager:
                     f"(was: {self._halt_reason})"
                 )
                 self._halt_reason = message
+            self._halt_code = code
             self._account_halt_baseline = breach_baseline
             return code
         breach = self._account_limit_breach(account)
         if breach is None:
             return None
         code, message, baseline = breach
-        self._engage_kill_switch(message)
-        self._account_halt_baseline = baseline
+        self._engage_kill_switch(
+            message,
+            code=code,
+            account_baseline=baseline,
+        )
         return code
 
     def cooldown_snapshot(
@@ -990,6 +1006,9 @@ class RiskManager:
                 )
 
         # 2. Kill switches (cheapest, most decisive).
+        # The engine runs evaluate_account() before per-signal evaluation each
+        # cycle so account-loss halts can clear or refresh on broker-baseline
+        # rollover before this sticky halted branch blocks new entries.
         if self._halted:
             return self._reject(
                 RejectionCode.HALTED,
@@ -1000,8 +1019,11 @@ class RiskManager:
         breach = self._account_limit_breach(account)
         if breach is not None:
             code, message, baseline = breach
-            self._engage_kill_switch(message)
-            self._account_halt_baseline = baseline
+            self._engage_kill_switch(
+                message,
+                code=code,
+                account_baseline=baseline,
+            )
             return self._reject(
                 code,
                 message,
