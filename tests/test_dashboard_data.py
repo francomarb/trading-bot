@@ -28,6 +28,7 @@ from dashboard import (
     realized_trade_events,
     refresh_multi_leg_positions,
     resolve_account_metrics,
+    watchlist_symbol_state,
 )
 
 # ── Helpers ──────────────────────────────────────────────────────────────────
@@ -138,6 +139,26 @@ class TestLoadEngineState:
     def test_missing_file_returns_empty_dict(self, tmp_path):
         result = load_engine_state(str(tmp_path / "nonexistent.json"))
         assert result == {}
+
+
+class TestWatchlistSymbolState:
+    def test_prefers_symbol_qualified_strategy_key(self):
+        state = {
+            "credit_spread": {"SPY": "No Signal"},
+            "credit_spread:SPY": {"SPY": "Filter Blocked"},
+            "credit_spread:QQQ": {"QQQ": "Long"},
+        }
+
+        assert (
+            watchlist_symbol_state(state, "credit_spread", "SPY")
+            == "Filter Blocked"
+        )
+        assert watchlist_symbol_state(state, "credit_spread", "QQQ") == "Long"
+
+    def test_reads_legacy_strategy_key(self):
+        state = {"credit_spread": {"SPY": "No Signal"}}
+
+        assert watchlist_symbol_state(state, "credit_spread", "SPY") == "No Signal"
 
 
 class TestFormatLocalTimestamp:

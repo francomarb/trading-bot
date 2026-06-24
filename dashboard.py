@@ -332,6 +332,27 @@ def load_engine_state(path: str) -> dict:
         return {}
 
 
+def watchlist_symbol_state(
+    watchlist_map: dict[str, dict[str, Any]],
+    strategy_name: str,
+    symbol: str,
+) -> Any:
+    """Read per-symbol watchlist state from legacy or slot-qualified keys."""
+    qualified_key = f"{strategy_name}:{symbol}"
+    if qualified_key in watchlist_map and symbol in watchlist_map[qualified_key]:
+        return watchlist_map[qualified_key][symbol]
+
+    legacy_state = watchlist_map.get(strategy_name, {})
+    if symbol in legacy_state:
+        return legacy_state[symbol]
+
+    for key, symbol_map in watchlist_map.items():
+        if key.startswith(f"{strategy_name}:") and symbol in symbol_map:
+            return symbol_map[symbol]
+
+    return None
+
+
 @st.cache_data(ttl=60, show_spinner=False)
 def load_broker_account_curve(live_trading: bool, period: str = "1M") -> pd.DataFrame:
     """
@@ -1994,24 +2015,25 @@ def render_dashboard() -> None:
                         }
 
                 rows = []
-                strategy_status_map = watchlist_statuses.get(strat_name, {})
-                strategy_reason_map = watchlist_reasons.get(strat_name, {})
                 for sym in symbols:
-                    status = strategy_status_map.get(sym)
+                    status = watchlist_symbol_state(watchlist_statuses, strat_name, sym)
                     if status is None:
                         is_open = sym in open_positions and open_positions[sym] == strat_name
                         status = "Long" if is_open else "No Signal"
-                    reasons = strategy_reason_map.get(sym) or []
+                    reasons = watchlist_symbol_state(watchlist_reasons, strat_name, sym) or []
                     lt = last_trade.get(sym, {})
                     price = lt.get("price")
-                    rows.append({
+                    row = {
                         "Symbol": symbol_url(sym),
                         "Status": status,
                         "Reason": "; ".join(reasons) if reasons else "—",
                         "Last Trade": lt.get("date", "—"),
                         "Last Side": lt.get("side", "—").upper() if lt.get("side") else "—",
                         "Last Price": f"${float(price):,.2f}" if price else "—",
-                    })
+                    }
+                    if strat_name == "credit_spread":
+                        row = {"Instance": f"{strat_name}:{sym}", **row}
+                    rows.append(row)
 
                 st.dataframe(
                     pd.DataFrame(rows),
