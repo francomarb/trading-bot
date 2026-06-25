@@ -1501,31 +1501,22 @@ DO UPDATE SET
 # Position rollup SQL — discovery doc §6.6 (R3-P1b side-signed sum) +
 # R13-G2 (net_realized_pnl from trades).
 _POSITION_ROLLUP_SQL = """
+WITH signed_qty AS (
+    SELECT COALESCE(SUM(
+        CASE side
+            WHEN 'buy'  THEN  filled_qty
+            WHEN 'sell' THEN -filled_qty
+            ELSE              0
+        END
+    ), 0.0) AS net_qty
+    FROM position_lifecycle_orders
+    WHERE position_uid = :position_uid
+)
 UPDATE position_lifecycle
 SET
     current_qty = CASE
-        WHEN ABS(COALESCE((
-            SELECT SUM(
-                CASE side
-                    WHEN 'buy'  THEN  filled_qty
-                    WHEN 'sell' THEN -filled_qty
-                    ELSE              0
-                END
-            )
-            FROM position_lifecycle_orders
-            WHERE position_uid = :position_uid
-        ), 0.0)) <= 1e-9 THEN 0.0
-        ELSE COALESCE((
-            SELECT SUM(
-                CASE side
-                    WHEN 'buy'  THEN  filled_qty
-                    WHEN 'sell' THEN -filled_qty
-                    ELSE              0
-                END
-            )
-            FROM position_lifecycle_orders
-            WHERE position_uid = :position_uid
-        ), 0.0)
+        WHEN ABS((SELECT net_qty FROM signed_qty)) <= 1e-9 THEN 0.0
+        ELSE (SELECT net_qty FROM signed_qty)
     END,
     avg_entry_price = (
         SELECT SUM(filled_qty * avg_fill_price) / NULLIF(SUM(filled_qty), 0)
