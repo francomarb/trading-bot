@@ -2878,6 +2878,63 @@ class TestOptionsDurableIdentity:
         # Attach was NOT called from on_fill — substrate untouched.
         orders_store.attach_broker_order_id.assert_not_called()
 
+    def test_options_on_fill_queues_without_touching_lifecycle_store(self):
+        """Options worker callbacks must not write lifecycle SQLite state.
+
+        The engine cycle thread drains the queued fill and performs the
+        lifecycle transition there. This keeps all normal SQLite writes on
+        the owning connection/thread.
+        """
+        api = MagicMock()
+        orders_store = MagicMock()
+        lifecycle_store = MagicMock()
+        broker = AlpacaBroker(
+            client=api, max_attempts=1, base_delay=0.0,
+            lifecycle_orders_store=orders_store,
+            lifecycle_store=lifecycle_store,
+        )
+        broker._lifecycle_store.create_pending = MagicMock(return_value="pos-uid")
+
+        captured = {}
+
+        def _capture_worker(*, on_fill, on_submitted, **kwargs):
+            captured["on_fill"] = on_fill
+            return MagicMock()
+
+        opt_decision = RiskDecision(
+            symbol="SPY260618C00500000",
+            side=Side.BUY,
+            qty=1,
+            entry_reference_price=2.50,
+            stop_price=1.25,
+            strategy_name="spy_options_reversion",
+            reason="test",
+            order_type=OrderType.LIMIT,
+            limit_price=2.50,
+        )
+
+        with patch(
+            "execution.broker.OptionsExecutionWorker",
+            side_effect=_capture_worker,
+        ):
+            broker.place_order(opt_decision, poll_timeout=0.0)
+
+        captured["on_fill"]("filled", 1.0, 2.75, "alpaca-options-ord-2")
+
+        lifecycle_store.mark_open.assert_not_called()
+        lifecycle_store.mark_partially_filled.assert_not_called()
+        lifecycle_store.mark_closed.assert_not_called()
+        lifecycle_store.mark_canceled.assert_not_called()
+        queued = broker.drain_option_fills()
+        assert queued[0][:5] == (
+            opt_decision,
+            "filled",
+            1.0,
+            2.75,
+            "alpaca-options-ord-2",
+        )
+        assert queued[0][5].startswith("pos_")
+
 
 # ── PR #60 round 2 fixes ────────────────────────────────────────────────────
 

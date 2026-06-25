@@ -3713,9 +3713,19 @@ class TestOptionsEngineFixes:
 	                "pos_filled",
 	            )
 	        ])
+        engine.broker._lifecycle_mark_filled = MagicMock()
 
         engine._drain_option_fills()
 
+        lifecycle_result = engine.broker._lifecycle_mark_filled.call_args.kwargs[
+            "result"
+        ]
+        assert engine.broker._lifecycle_mark_filled.call_args.kwargs[
+            "position_uid"
+        ] == "pos_filled"
+        assert lifecycle_result.symbol == occ
+        assert lifecycle_result.status is OrderStatus.FILLED
+        assert lifecycle_result.position_uid == "pos_filled"
         strat_mock.register_fill.assert_called_once_with(occ, 12.40)
         # Entry price tracking continues to use the fill price as before.
         assert engine._entry_prices.get("SPY") == 12.40
@@ -4258,6 +4268,41 @@ class TestOptionsEngineFixes:
         engine.trade_logger.log_stop_fill.assert_not_called()
         engine.trade_logger.log_external_close.assert_not_called()
         engine.alerts.broker_error.assert_not_called()
+        engine._allocator.record_realized_pnl.assert_not_called()
+        assert engine._has_position("AAPL")
+
+    def test_stream_stop_fill_skips_substrate_owned_stop_order(self, tmp_path):
+        """Substrate-owned stop fills are handled by lifecycle event dispatch,
+        leaving the legacy stream fallback idle."""
+        from unittest.mock import MagicMock
+        from types import SimpleNamespace
+        from execution.stream import StreamManager
+
+        engine = self._engine(tmp_path)
+        engine._register_single_leg(strategy_name="fake_strategy", symbol="AAPL")
+        engine._entry_prices["AAPL"] = 100.0
+        engine.lifecycle_orders_store = MagicMock()
+        engine.lifecycle_orders_store.get_by_order_id.return_value = (
+            SimpleNamespace(role="protective_stop")
+        )
+
+        fill_update = SimpleNamespace(
+            order=SimpleNamespace(symbol="AAPL", id="substrate-stop-1"),
+            price="95.0",
+            qty="10",
+        )
+        stream = MagicMock(spec=StreamManager)
+        stream.drain_stop_fills.return_value = [fill_update]
+        engine._stream_manager = stream
+
+        engine.trade_logger.log_stop_fill = MagicMock()
+        engine.trade_logger.log_external_close = MagicMock()
+        engine._allocator = MagicMock()
+
+        engine._process_stream_stop_fills(_snapshot())
+
+        engine.trade_logger.log_stop_fill.assert_not_called()
+        engine.trade_logger.log_external_close.assert_not_called()
         engine._allocator.record_realized_pnl.assert_not_called()
         assert engine._has_position("AAPL")
 

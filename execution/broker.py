@@ -1438,10 +1438,6 @@ class AlpacaBroker:
                     raw_status=status,
                     message=f"options async fill: {status}",
                 )
-                self._lifecycle_mark_filled(
-                    position_uid=position_uid,
-                    result=result,
-                )
                 with self._pending_option_lock:
                     self._pending_option_fills.append(
                         (dec, status, filled_qty, avg_price, order_id, position_uid)

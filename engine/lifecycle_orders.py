@@ -1489,6 +1489,7 @@ DO UPDATE SET
     filled_qty                    = excluded.filled_qty,
     avg_fill_price                = excluded.avg_fill_price,
     status                        = excluded.status,
+    position_uid                  = COALESCE(trades.position_uid, excluded.position_uid),
     slippage_benchmark_price      = COALESCE(trades.slippage_benchmark_price,      excluded.slippage_benchmark_price),
     slippage_benchmark_kind       = COALESCE(trades.slippage_benchmark_kind,       excluded.slippage_benchmark_kind),
     slippage_benchmark_timestamp  = COALESCE(trades.slippage_benchmark_timestamp,  excluded.slippage_benchmark_timestamp),
@@ -1502,17 +1503,30 @@ DO UPDATE SET
 _POSITION_ROLLUP_SQL = """
 UPDATE position_lifecycle
 SET
-    current_qty = COALESCE((
-        SELECT SUM(
-            CASE side
-                WHEN 'buy'  THEN  filled_qty
-                WHEN 'sell' THEN -filled_qty
-                ELSE              0
-            END
-        )
-        FROM position_lifecycle_orders
-        WHERE position_uid = :position_uid
-    ), 0.0),
+    current_qty = CASE
+        WHEN ABS(COALESCE((
+            SELECT SUM(
+                CASE side
+                    WHEN 'buy'  THEN  filled_qty
+                    WHEN 'sell' THEN -filled_qty
+                    ELSE              0
+                END
+            )
+            FROM position_lifecycle_orders
+            WHERE position_uid = :position_uid
+        ), 0.0)) <= 1e-9 THEN 0.0
+        ELSE COALESCE((
+            SELECT SUM(
+                CASE side
+                    WHEN 'buy'  THEN  filled_qty
+                    WHEN 'sell' THEN -filled_qty
+                    ELSE              0
+                END
+            )
+            FROM position_lifecycle_orders
+            WHERE position_uid = :position_uid
+        ), 0.0)
+    END,
     avg_entry_price = (
         SELECT SUM(filled_qty * avg_fill_price) / NULLIF(SUM(filled_qty), 0)
         FROM position_lifecycle_orders

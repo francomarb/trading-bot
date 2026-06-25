@@ -2023,17 +2023,14 @@ def render_dashboard() -> None:
                     reasons = watchlist_symbol_state(watchlist_reasons, strat_name, sym) or []
                     lt = last_trade.get(sym, {})
                     price = lt.get("price")
-                    row = {
+                    rows.append({
                         "Symbol": symbol_url(sym),
                         "Status": status,
                         "Reason": "; ".join(reasons) if reasons else "—",
                         "Last Trade": lt.get("date", "—"),
                         "Last Side": lt.get("side", "—").upper() if lt.get("side") else "—",
                         "Last Price": f"${float(price):,.2f}" if price else "—",
-                    }
-                    if strat_name == "credit_spread":
-                        row = {"Instance": f"{strat_name}:{sym}", **row}
-                    rows.append(row)
+                    })
 
                 st.dataframe(
                     pd.DataFrame(rows),
