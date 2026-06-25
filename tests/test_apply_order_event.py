@@ -71,13 +71,14 @@ def _seed_position(
     *,
     owner_key: str = "AAPL",
     entry_qty: float = 10.0,
+    strategy: str = "sma_crossover",
 ) -> str:
     uid = new_position_uid()
     pos_store.create_pending(
         position_uid=uid,
         symbol=owner_key,
         owner_key=owner_key,
-        strategy="sma_crossover",
+        strategy=strategy,
         position_type="single_leg",
         entry_qty=entry_qty,
     )
@@ -842,6 +843,94 @@ class TestNetRealizedPnlRollup:
         )
         _, _, _, net_realized_pnl, _ = _get_position(conn, uid)
         assert net_realized_pnl == pytest.approx(25.0)
+
+    def test_trade_upsert_fills_missing_position_uid_for_existing_order(
+        self,
+        conn: sqlite3.Connection,
+        pos_store: PositionLifecycleStore,
+        orders_store: PositionLifecycleOrdersStore,
+    ):
+        """A pre-existing trade row with NULL position_uid can be
+        repaired when the substrate later observes the same order fill."""
+        uid = _seed_position(pos_store)
+        _insert_protective_stop(orders_store, uid)
+        order_id = _attach_and_get_order_id(orders_store, "cli-stop")
+        conn.execute(
+            """
+            INSERT INTO trades (
+                timestamp, symbol, side, qty, avg_fill_price, order_id,
+                strategy, reason, stop_price, entry_reference_price,
+                modeled_slippage_bps, realized_slippage_bps, order_type,
+                status, requested_qty, filled_qty, position_id,
+                position_type, position_uid
+            )
+            VALUES (
+                '2026-06-12T10:02:00+00:00', 'AAPL', 'sell', 10.0,
+                95.0, ?, 'sma_crossover', 'stop_triggered', 95.0,
+                100.0, 0.0, 0.0, 'stop', 'filled', 10.0, 10.0,
+                'AAPL', 'single_leg', NULL
+            )
+            """,
+            (order_id,),
+        )
+        conn.commit()
+
+        apply_order_event(
+            conn,
+            OrderEvent(
+                order_id=order_id,
+                status="filled",
+                filled_qty=10.0,
+                avg_fill_price=95.0,
+                broker_updated_at="2026-06-12T10:02:00+00:00",
+            ),
+        )
+
+        row = conn.execute(
+            "SELECT position_uid FROM trades WHERE order_id = ?",
+            (order_id,),
+        ).fetchone()
+        assert row[0] == uid
+
+    def test_tiny_rollup_residual_snaps_to_closed_zero(
+        self,
+        conn: sqlite3.Connection,
+        pos_store: PositionLifecycleStore,
+        orders_store: PositionLifecycleOrdersStore,
+    ):
+        """Floating-point dust under epsilon must not leave a phantom
+        open lifecycle position."""
+        uid = _seed_position(pos_store, entry_qty=1.0)
+        _insert_entry(orders_store, uid, intended_qty=1.0)
+        entry_order_id = _attach_and_get_order_id(orders_store, "cli-entry")
+        apply_order_event(
+            conn,
+            OrderEvent(
+                order_id=entry_order_id,
+                status="filled",
+                filled_qty=1.0,
+                avg_fill_price=100.0,
+                broker_updated_at="2026-06-12T10:01:00+00:00",
+            ),
+        )
+        _insert_exit(orders_store, uid, intended_qty=0.9999999995)
+        exit_order_id = _attach_and_get_order_id(orders_store, "cli-exit")
+
+        apply_order_event(
+            conn,
+            OrderEvent(
+                order_id=exit_order_id,
+                status="filled",
+                filled_qty=0.9999999995,
+                avg_fill_price=105.0,
+                broker_updated_at="2026-06-12T10:02:00+00:00",
+            ),
+        )
+
+        status, current_qty, _, _, closed_at = _get_position(conn, uid)
+        assert status == "closed"
+        assert current_qty == 0.0
+        assert closed_at is not None
 
 
 # Smoke: stale event drops cleanly
@@ -1999,7 +2088,7 @@ class TestSubstrateEntryFillDispatchSemantics:
     ):
         """Only entry_primary rows trigger ownership-binding
         dispatch. exit / protective_stop / replacement_stop fills
-        are state updates only — no ownership change."""
+        are handled by their own dispatch paths."""
         from engine.lifecycle_orders import apply_order_event
         uid = _seed_position(pos_store)
         # Insert a protective_stop role row (not entry_primary).
@@ -2018,10 +2107,10 @@ class TestSubstrateEntryFillDispatchSemantics:
             ),
         )
         assert outcome.applied is True
-        # Dispatch's role filter (order_row.role != 'entry_primary')
-        # would skip this — verified by query.
+        # Entry dispatch's role filter (order_row.role != 'entry_primary')
+        # would skip this — stop dispatch owns this role.
         row = orders_store.get_by_order_id(order_id)
-        assert row.role == "protective_stop"  # would not dispatch
+        assert row.role == "protective_stop"  # would not entry-dispatch
 
 
 # ── P-7 commit A: substrate exit-fill dispatch ──────────────────────────────
@@ -2038,7 +2127,7 @@ class TestSubstrateExitFillDispatchSemantics:
     ):
         """Only role='exit' rows trigger exit dispatch. entry_primary
         / protective_stop / replacement_stop fills go through their
-        own dispatches (or no dispatch at all)."""
+        own dispatches."""
         from engine.lifecycle_orders import apply_order_event
         uid = _seed_position(pos_store)
         _insert_protective_stop(
@@ -2056,7 +2145,8 @@ class TestSubstrateExitFillDispatchSemantics:
             ),
         )
         assert outcome.applied is True
-        # Dispatch's role filter would skip — role is protective_stop.
+        # Exit dispatch's role filter would skip — stop dispatch owns
+        # this role.
         row = orders_store.get_by_order_id(order_id)
         assert row.role == "protective_stop"  # would not trigger exit dispatch
 
@@ -2218,6 +2308,17 @@ class TestExitDispatchEndToEnd:
         assert "AAPL" not in engine._entry_prices
         # 3. alerts.trade_executed fired
         engine.alerts.trade_executed.assert_called_once()
+        engine._record_realized_pnl.assert_called_once_with(
+            "AAPL",
+            "sma_crossover",
+            105.0,
+            10.0,
+            multiplier=1,
+            external=False,
+            is_full_close=True,
+            update_lifecycle=False,
+            position_uid_override=uid,
+        )
 
     def test_exit_dispatch_idempotent_via_ownership_gate(self, tmp_path):
         """Second observation of the same fill (e.g., cycle reconcile
@@ -2319,6 +2420,193 @@ class TestExitDispatchEndToEnd:
             engine, event=event, snapshot=snapshot,
         )
         assert engine.alerts.trade_executed.call_count == first_alert_count
+
+
+class TestSubstrateStopFillDispatchSemantics:
+    """Protective-stop rows use substrate truth first; the legacy stream
+    stop-fill queue is only a temporary compatibility fallback."""
+
+    def test_full_stop_fill_logs_stop_and_clears_ownership_with_uid(
+        self,
+        pos_store: PositionLifecycleStore,
+        orders_store: PositionLifecycleOrdersStore,
+    ):
+        from types import SimpleNamespace
+        from unittest.mock import MagicMock
+        from engine.positions import Position
+        from engine.trader import TradingEngine
+        from execution.broker import BrokerSnapshot
+
+        uid = _seed_position(
+            pos_store,
+            owner_key="FRO",
+            entry_qty=49.0,
+        )
+        _insert_protective_stop(
+            orders_store,
+            uid,
+            client_order_id="cli-fro-stop",
+            intended_qty=49.0,
+            stop_price=17.25,
+        )
+        order_id = _attach_and_get_order_id(
+            orders_store,
+            "cli-fro-stop",
+            order_id="alpaca-fro-stop",
+        )
+        engine = MagicMock(spec=TradingEngine)
+        engine.lifecycle_orders_store = orders_store
+        engine.lifecycle_store = pos_store
+        engine.trade_logger = MagicMock()
+        engine.alerts = MagicMock()
+        engine._positions = {
+            "FRO": Position(
+                position_id="FRO",
+                position_type="single_leg",
+                strategy_name="sma_crossover",
+            )
+        }
+        engine._entry_prices = {"FRO": 18.0}
+        engine._external_close_suspects = {"FRO": object()}
+        engine._has_position = lambda key: key in engine._positions
+        engine._pop_position = lambda key: engine._positions.pop(key, None)
+        engine._get_position_for = TradingEngine._get_position_for
+        engine._record_realized_pnl = MagicMock()
+        engine._cleanup_option_trailing_state = MagicMock()
+        event = OrderEvent(
+            order_id=order_id,
+            status="filled",
+            filled_qty=49.0,
+            avg_fill_price=17.25,
+            broker_updated_at="2026-06-18T14:30:00+00:00",
+        )
+        snapshot = BrokerSnapshot(
+            account=SimpleNamespace(
+                equity=100_000.0,
+                cash=50_000.0,
+                buying_power=50_000.0,
+                open_positions={},
+            ),
+            open_orders=[],
+        )
+
+        TradingEngine._maybe_dispatch_substrate_stop_fill(
+            engine,
+            event=event,
+            snapshot=snapshot,
+        )
+
+        engine.trade_logger.log_stop_fill.assert_called_once_with(
+            symbol="FRO",
+            strategy="sma_crossover",
+            qty=49.0,
+            avg_fill_price=17.25,
+            stop_price=17.25,
+            order_id=order_id,
+            position_uid=uid,
+        )
+        engine._record_realized_pnl.assert_called_once_with(
+            "FRO",
+            "sma_crossover",
+            17.25,
+            49.0,
+            multiplier=1,
+            is_full_close=True,
+            update_lifecycle=False,
+            position_uid_override=uid,
+        )
+        assert "FRO" not in engine._positions
+        assert "FRO" not in engine._entry_prices
+        assert "FRO" not in engine._external_close_suspects
+
+    def test_fractional_residual_stop_fill_preserves_ownership(
+        self,
+        pos_store: PositionLifecycleStore,
+        orders_store: PositionLifecycleOrdersStore,
+    ):
+        from types import SimpleNamespace
+        from unittest.mock import MagicMock
+        from engine.positions import Position
+        from engine.trader import TradingEngine
+        from execution.broker import BrokerSnapshot
+        from risk.manager import Position as BrokerPosition
+
+        uid = _seed_position(
+            pos_store,
+            owner_key="GOOG",
+            entry_qty=7.78,
+            strategy="donchian_breakout",
+        )
+        _insert_protective_stop(
+            orders_store,
+            uid,
+            client_order_id="cli-goog-stop",
+            intended_qty=7.0,
+            stop_price=378.85,
+        )
+        order_id = _attach_and_get_order_id(
+            orders_store,
+            "cli-goog-stop",
+            order_id="alpaca-goog-stop",
+        )
+        engine = MagicMock(spec=TradingEngine)
+        engine.lifecycle_orders_store = orders_store
+        engine.lifecycle_store = pos_store
+        engine.trade_logger = MagicMock()
+        engine.alerts = MagicMock()
+        engine._positions = {
+            "GOOG": Position(
+                position_id="GOOG",
+                position_type="single_leg",
+                strategy_name="donchian_breakout",
+            )
+        }
+        engine._entry_prices = {"GOOG": 391.0}
+        engine._external_close_suspects = {"GOOG": object()}
+        engine._has_position = lambda key: key in engine._positions
+        engine._pop_position = lambda key: engine._positions.pop(key, None)
+        engine._get_position_for = TradingEngine._get_position_for
+        engine._record_realized_pnl = MagicMock()
+        engine._cleanup_option_trailing_state = MagicMock()
+        event = OrderEvent(
+            order_id=order_id,
+            status="filled",
+            filled_qty=7.0,
+            avg_fill_price=378.85,
+            broker_updated_at="2026-06-18T14:30:00+00:00",
+        )
+        snapshot = BrokerSnapshot(
+            account=SimpleNamespace(
+                equity=100_000.0,
+                cash=50_000.0,
+                buying_power=50_000.0,
+                open_positions={
+                    "GOOG": BrokerPosition("GOOG", 0.78, 391.2, 305.14),
+                },
+            ),
+            open_orders=[],
+        )
+
+        TradingEngine._maybe_dispatch_substrate_stop_fill(
+            engine,
+            event=event,
+            snapshot=snapshot,
+        )
+
+        engine._record_realized_pnl.assert_called_once_with(
+            "GOOG",
+            "donchian_breakout",
+            378.85,
+            7.0,
+            multiplier=1,
+            is_full_close=False,
+            update_lifecycle=False,
+            position_uid_override=uid,
+        )
+        assert "GOOG" in engine._positions
+        assert engine._entry_prices["GOOG"] == pytest.approx(391.0)
+        assert "GOOG" not in engine._external_close_suspects
+        engine._cleanup_option_trailing_state.assert_not_called()
 
 
 class TestEntryDispatchSlippageCompleteness:

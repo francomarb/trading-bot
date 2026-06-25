@@ -1498,10 +1498,12 @@ class TradeLogger:
         Distinct from log_external_close, which is the fallback for positions
         that disappear without a confirmed fill event.
 
-        `stop_price` is the broker order's actual stop trigger at fill time
-        (from ``update.order.stop_price`` on the WebSocket path, or
-        ``ClosedOrderInfo.stop_price`` on the recovery path). It is the
-        authoritative slippage benchmark for stop fills — see
+        `stop_price` is the stop trigger known for the filled order:
+        ``update.order.stop_price`` on the legacy WebSocket path,
+        ``ClosedOrderInfo.stop_price`` on the recovery path, or the
+        substrate order row's intended stop price when the lifecycle
+        substrate dispatches a protective_stop / replacement_stop fill.
+        It is the authoritative slippage benchmark for stop fills — see
         docs/slippage_unification_design.md §Stop Lifecycle. When None or
         non-positive, the new slippage columns are written as
         ``unavailable`` and signed/adverse values stay NULL.

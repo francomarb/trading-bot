@@ -1127,8 +1127,6 @@ class TradingEngine:
             # resolutions on both entry and exit roles; the
             # _maybe_dispatch_substrate_{entry,exit}_fill helpers
             # fire the engine-side side effects.
-            self._process_stream_stop_fills(snapshot)
-            self._detect_external_closes(snapshot)
             self._drain_lifecycle_attaches()
             # §10.7 fix-up — drain spread close per-submit attaches so
             # substrate.order_id stays current with the broker's
@@ -1136,6 +1134,8 @@ class TradingEngine:
             # gap on a crash between submit and the close drain.
             self._drain_lifecycle_close_attaches()
             self._drain_lifecycle_events(snapshot)
+            self._process_stream_stop_fills(snapshot)
+            self._detect_external_closes(snapshot)
             # NULL-order_id cycle sweep — bounded by
             # _SUBSTRATE_NULL_ATTACH_SWEEP_LIMIT REST calls per
             # cycle. Common-case payload is empty (no orphans)
@@ -2697,6 +2697,7 @@ class TradingEngine:
                 avg_fill_price=float(event.avg_fill_price),
                 raw_status="filled",
                 message="substrate exit-fill dispatch",
+                position_uid=order_row.position_uid,
             )
             wrote = self._record_recovered_exit_fill(
                 symbol=symbol,
@@ -2713,6 +2714,7 @@ class TradingEngine:
                 # apply_order_event's UPSERT — bypass the legacy
                 # dedup check so P&L / alert / cleanup actually fire.
                 skip_trades_dedup_check=True,
+                update_lifecycle=False,
             )
             if wrote:
                 self._pop_position(symbol)
@@ -2731,6 +2733,105 @@ class TradingEngine:
                 f"already recorded the fill; engine state not "
                 f"updated. Next restart will recover from trades "
                 f"DB."
+            )
+
+    def _maybe_dispatch_substrate_stop_fill(
+        self,
+        *,
+        event: "Any",
+        snapshot: "BrokerSnapshot | None",
+    ) -> None:
+        """Fire engine side effects for substrate-owned protective stops."""
+        if event.status != "filled":
+            return
+        qty = float(event.filled_qty or 0.0)
+        if qty <= 0 or event.avg_fill_price is None:
+            return
+        if self.lifecycle_orders_store is None or self.lifecycle_store is None:
+            return
+        try:
+            order_row = self.lifecycle_orders_store.get_by_order_id(
+                event.order_id,
+            )
+            if order_row is None or order_row.role not in {
+                "protective_stop",
+                "replacement_stop",
+            }:
+                return
+            pos_row = self.lifecycle_store.get_by_position_uid(
+                order_row.position_uid,
+            )
+            if pos_row is None:
+                return
+
+            raw_symbol = pos_row.symbol
+            owner_key = owner_key_for(raw_symbol)
+            if not self._has_position(owner_key):
+                return
+
+            owner = pos_row.strategy
+            price = float(event.avg_fill_price)
+            _occ_m = _OCC_PAT.match(raw_symbol)
+            residual_position = (
+                self._get_position_for(owner_key, snapshot)
+                if snapshot is not None and not _occ_m
+                else None
+            )
+            residual_qty = (
+                float(residual_position.qty)
+                if residual_position is not None
+                else 0.0
+            )
+            has_residual = residual_qty > 1e-9 and not _occ_m
+
+            self.trade_logger.log_stop_fill(
+                symbol=raw_symbol,
+                strategy=owner,
+                qty=qty,
+                avg_fill_price=price,
+                stop_price=_finite_or_none(order_row.intended_stop_price),
+                order_id=event.order_id,
+                position_uid=order_row.position_uid,
+            )
+            self._record_realized_pnl(
+                owner_key,
+                owner,
+                price,
+                qty,
+                multiplier=100 if _occ_m else 1,
+                is_full_close=not has_residual,
+                update_lifecycle=False,
+                position_uid_override=order_row.position_uid,
+            )
+            msg = (
+                f"{raw_symbol}: protective stop filled via substrate — "
+                f"qty={qty} price={price} strategy={owner} "
+                f"position_uid={order_row.position_uid[:18]}…"
+            )
+            logger.warning(msg)
+            self.alerts.broker_error(msg)
+            self._external_close_suspects.pop(owner_key, None)
+
+            if has_residual:
+                logger.info(
+                    f"{raw_symbol}: substrate stop fill left residual "
+                    f"qty={residual_qty} — preserving ownership for "
+                    "residual cleanup"
+                )
+                return
+
+            self._pop_position(owner_key)
+            self._entry_prices.pop(owner_key, None)
+            self._cleanup_option_trailing_state(
+                raw_symbol,
+                reason="substrate stop fill",
+            )
+        except Exception as exc:
+            logger.critical(
+                f"substrate stop-fill dispatch FAILED for "
+                f"order_id={event.order_id}: {type(exc).__name__}: "
+                f"{exc}. Substrate row already recorded the fill; "
+                f"legacy fallback may still handle stream stop fills."
             )
 
     def _ensure_recovered_protective_stop(
@@ -2988,6 +3089,7 @@ class TradingEngine:
         is_full_close: bool | None = None,
         external: bool = False,
         skip_trades_dedup_check: bool = False,
+        update_lifecycle: bool = True,
     ) -> bool:
         """Persist one broker-confirmed non-stop exit exactly once.
 
@@ -3060,6 +3162,8 @@ class TradingEngine:
             multiplier=100 if _OCC_PAT.match(result.symbol) else 1,
             external=external,
             is_full_close=is_full_close,
+            update_lifecycle=update_lifecycle,
+            position_uid_override=getattr(result, "position_uid", None),
         )
         self.alerts.trade_executed(
             symbol=symbol,
@@ -3090,6 +3194,8 @@ class TradingEngine:
         *,
         external: bool = False,
         is_full_close: bool = True,
+        update_lifecycle: bool = True,
+        position_uid_override: str | None = None,
     ) -> None:
         """
         Compute and report realized P&L for a closed position to the
@@ -3136,40 +3242,41 @@ class TradingEngine:
         # the row may be flipped to closed below and become harder to
         # find. The allocator uses this for trade-count deduplication
         # (partial closes of the same position must not double-count).
-        position_uid: str | None = None
-        try:
-            row = self.lifecycle_store.get_open_for_owner_key(
-                owner_key_for(symbol),
-            )
-            if row is not None:
-                position_uid = row.position_uid
-        except Exception as exc:
-            logger.debug(
-                f"[{strategy_name}] {symbol}: position_uid lookup raised "
-                f"{type(exc).__name__}: {exc} — proceeding without"
-            )
+        position_uid: str | None = position_uid_override
+        if position_uid is None:
+            try:
+                row = self.lifecycle_store.get_open_for_owner_key(
+                    owner_key_for(symbol),
+                )
+                if row is not None:
+                    position_uid = row.position_uid
+            except Exception as exc:
+                logger.debug(
+                    f"[{strategy_name}] {symbol}: position_uid lookup raised "
+                    f"{type(exc).__name__}: {exc} — proceeding without"
+                )
 
-        # Operator Controls Phase A — update the matching lifecycle
-        # row. Done first so it happens regardless of whether the
-        # allocator update below proceeds. Best-effort: wrapped in
-        # try/except so store failures never propagate into the close
-        # path.
-        if is_full_close:
-            self._close_lifecycle_for_owner_key(
-                owner_key=owner_key_for(symbol),
-                external=external,
-            )
-        else:
-            # Partial close — drop current_qty by the close qty so the
-            # operator CLI shows the residual rather than the stale
-            # entry quantity. If the reduction takes the row to zero
-            # (shouldn't happen on a PARTIAL result, but defensive
-            # against fill-event rounding) the helper falls back to a
-            # full close so the row reaches a terminal status.
-            self._reduce_lifecycle_for_owner_key(
-                owner_key=owner_key_for(symbol),
-                reduced_by=float(qty),
-            )
+        if update_lifecycle:
+            # Operator Controls Phase A — update the matching lifecycle
+            # row. Substrate-dispatched fills pass update_lifecycle=False
+            # because apply_order_event already recomputed the lifecycle
+            # rollup from durable per-order truth.
+            if is_full_close:
+                self._close_lifecycle_for_owner_key(
+                    owner_key=owner_key_for(symbol),
+                    external=external,
+                )
+            else:
+                # Partial close — drop current_qty by the close qty so the
+                # operator CLI shows the residual rather than the stale
+                # entry quantity. If the reduction takes the row to zero
+                # (shouldn't happen on a PARTIAL result, but defensive
+                # against fill-event rounding) the helper falls back to a
+                # full close so the row reaches a terminal status.
+                self._reduce_lifecycle_for_owner_key(
+                    owner_key=owner_key_for(symbol),
+                    reduced_by=float(qty),
+                )
 
         if self._allocator is None:
             return
@@ -6959,6 +7066,35 @@ class TradingEngine:
                 )
                 continue
             order_id = getattr(update.order, "id", None)
+            if order_id and self.lifecycle_orders_store is not None:
+                try:
+                    substrate_row = self.lifecycle_orders_store.get_by_order_id(
+                        str(order_id),
+                    )
+                except Exception as exc:
+                    logger.debug(
+                        f"{raw_symbol}: substrate lookup for stop fill "
+                        f"{order_id} raised {type(exc).__name__}: {exc}; "
+                        "legacy fallback will handle"
+                    )
+                    substrate_row = None
+                if (
+                    substrate_row is not None
+                    and substrate_row.role in {
+                        "protective_stop",
+                        "replacement_stop",
+                    }
+                ):
+                    logger.debug(
+                        f"{raw_symbol}: legacy stop-fill fallback skipped "
+                        f"for substrate-owned order {order_id}"
+                    )
+                    continue
+                logger.warning(
+                    f"{raw_symbol}: legacy stop-fill fallback handling "
+                    f"order {order_id} with no substrate stop row; "
+                    "temporary compatibility path"
+                )
             if self.trade_logger.has_recorded_order_id(order_id):
                 logger.debug(
                     f"{raw_symbol}: duplicate protective stop fill "
@@ -7228,6 +7364,9 @@ class TradingEngine:
                     event=event, snapshot=snapshot,
                 )
                 self._maybe_dispatch_substrate_exit_fill(
+                    event=event, snapshot=snapshot,
+                )
+                self._maybe_dispatch_substrate_stop_fill(
                     event=event, snapshot=snapshot,
                 )
             elif outcome.reason in {"unknown_order", "stale_or_duplicate"}:
@@ -7619,6 +7758,9 @@ class TradingEngine:
                 self._maybe_dispatch_substrate_exit_fill(
                     event=event, snapshot=snapshot,
                 )
+                self._maybe_dispatch_substrate_stop_fill(
+                    event=event, snapshot=snapshot,
+                )
 
     def _reconcile_substrate_via_rest(
         self,
@@ -7729,6 +7871,9 @@ class TradingEngine:
                     event=event, snapshot=snapshot,
                 )
                 self._maybe_dispatch_substrate_exit_fill(
+                    event=event, snapshot=snapshot,
+                )
+                self._maybe_dispatch_substrate_stop_fill(
                     event=event, snapshot=snapshot,
                 )
             else:
@@ -7907,6 +8052,11 @@ class TradingEngine:
                 message=f"options async fill: {status_str}",
                 position_uid=position_uid,
             )
+            if result.status in {OrderStatus.FILLED, OrderStatus.PARTIAL}:
+                self.broker._lifecycle_mark_filled(
+                    position_uid=position_uid,
+                    result=result,
+                )
             self._record_fill(
                 result,
                 modeled_price=decision.entry_reference_price,

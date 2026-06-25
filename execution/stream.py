@@ -985,10 +985,12 @@ class StreamManager:
             # _stop_fills accumulator + tracked.update / event.set
             # paths above continue to run: the synchronous broker
             # code in execution/broker.py uses tracked.event for
-            # _wait_for_fill, and _process_stream_stop_fills owns
-            # the protective-stop fill path. Substrate dispatches
-            # are role-filtered (entry_primary / exit) so they don't
-            # overlap with the stop-fill path.
+            # _wait_for_fill, while substrate dispatch owns normal
+            # entry_primary, exit, protective_stop, and
+            # replacement_stop fill side effects. The legacy
+            # _process_stream_stop_fills path is now only a
+            # compatibility fallback for stop fills that have no
+            # substrate row.
             substrate_event = self._build_substrate_event(
                 order_id, event_val, update,
             )

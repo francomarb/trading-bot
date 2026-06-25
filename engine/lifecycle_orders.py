@@ -1489,6 +1489,7 @@ DO UPDATE SET
     filled_qty                    = excluded.filled_qty,
     avg_fill_price                = excluded.avg_fill_price,
     status                        = excluded.status,
+    position_uid                  = COALESCE(trades.position_uid, excluded.position_uid),
     slippage_benchmark_price      = COALESCE(trades.slippage_benchmark_price,      excluded.slippage_benchmark_price),
     slippage_benchmark_kind       = COALESCE(trades.slippage_benchmark_kind,       excluded.slippage_benchmark_kind),
     slippage_benchmark_timestamp  = COALESCE(trades.slippage_benchmark_timestamp,  excluded.slippage_benchmark_timestamp),
@@ -1500,19 +1501,23 @@ DO UPDATE SET
 # Position rollup SQL — discovery doc §6.6 (R3-P1b side-signed sum) +
 # R13-G2 (net_realized_pnl from trades).
 _POSITION_ROLLUP_SQL = """
+WITH signed_qty AS (
+    SELECT COALESCE(SUM(
+        CASE side
+            WHEN 'buy'  THEN  filled_qty
+            WHEN 'sell' THEN -filled_qty
+            ELSE              0
+        END
+    ), 0.0) AS net_qty
+    FROM position_lifecycle_orders
+    WHERE position_uid = :position_uid
+)
 UPDATE position_lifecycle
 SET
-    current_qty = COALESCE((
-        SELECT SUM(
-            CASE side
-                WHEN 'buy'  THEN  filled_qty
-                WHEN 'sell' THEN -filled_qty
-                ELSE              0
-            END
-        )
-        FROM position_lifecycle_orders
-        WHERE position_uid = :position_uid
-    ), 0.0),
+    current_qty = CASE
+        WHEN ABS((SELECT net_qty FROM signed_qty)) <= 1e-9 THEN 0.0
+        ELSE (SELECT net_qty FROM signed_qty)
+    END,
     avg_entry_price = (
         SELECT SUM(filled_qty * avg_fill_price) / NULLIF(SUM(filled_qty), 0)
         FROM position_lifecycle_orders
