@@ -85,6 +85,26 @@ def _seed_position(
     return uid
 
 
+def _seed_spread_position(
+    pos_store: PositionLifecycleStore,
+    *,
+    position_uid: str = "pos_spread_ghost_regression",
+    owner_key: str = "spread-1",
+    symbol: str = "QQQ260724P00712000",
+    entry_qty: float = 1.0,
+    strategy: str = "credit_spread",
+) -> str:
+    pos_store.create_pending(
+        position_uid=position_uid,
+        symbol=symbol,
+        owner_key=owner_key,
+        strategy=strategy,
+        position_type="spread",
+        entry_qty=entry_qty,
+    )
+    return position_uid
+
+
 def _insert_entry(
     orders_store: PositionLifecycleOrdersStore,
     position_uid: str,
@@ -1051,6 +1071,63 @@ class TestStatusOnlyEventsSkipTradesUpsert:
         assert outcome.applied is True
         after = conn.execute("SELECT COUNT(*) FROM trades").fetchone()[0]
         assert after == before + 1
+
+    def test_spread_mleg_fill_advances_lifecycle_without_single_leg_trade(
+        self, conn, tmp_db_path, pos_store, orders_store,
+    ):
+        """MLEG spread substrate rows are lifecycle state, not
+        user-facing single-leg trades.
+
+        The spread close path writes the real dashboard/accounting rows
+        through TradeLogger.log_spread_fill(position_type='spread').
+        apply_order_event must not also create a raw
+        position_type='single_leg' row for the same MLEG order, because
+        that poisons read_all_open_owners() with a fake open OCC leg.
+        """
+        uid = _seed_spread_position(
+            pos_store,
+            position_uid="pos_a2663428e1444f2491e49e484de68391",
+            owner_key="a2663428e1444f2491e49e484de68391",
+        )
+        orders_store.insert_pending(
+            position_uid=uid,
+            role="exit",
+            client_order_id="spr-exit-a2663428-test",
+            order_type="limit",
+            order_class="mleg",
+            time_in_force="day",
+            side="buy",
+            intended_qty=1.0,
+            intended_limit_price=6.11,
+        )
+        order_id = _attach_and_get_order_id(
+            orders_store,
+            "spr-exit-a2663428-test",
+            order_id="mleg-close-order",
+        )
+        before = conn.execute("SELECT COUNT(*) FROM trades").fetchone()[0]
+
+        outcome = apply_order_event(
+            conn,
+            OrderEvent(
+                order_id=order_id,
+                status="filled",
+                filled_qty=1.0,
+                avg_fill_price=6.2,
+                broker_updated_at="2026-06-24T17:59:18+00:00",
+            ),
+            reason="stream",
+        )
+
+        assert outcome.applied is True
+        status, qty, avg, _, terminal_at = _get_order(conn, order_id)
+        assert status == "filled"
+        assert qty == 1.0
+        assert avg == 6.2
+        assert terminal_at is not None
+        after = conn.execute("SELECT COUNT(*) FROM trades").fetchone()[0]
+        assert after == before
+        assert TradeLogger(tmp_db_path).read_all_open_owners() == {}
 
     def test_partial_fill_then_zero_fill_canceled_leaves_one_trades_row(
         self, conn, pos_store, orders_store,
