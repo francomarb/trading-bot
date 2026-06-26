@@ -1645,7 +1645,7 @@ def apply_order_event(
                plo.order_type, plo.intended_qty,
                plo.slippage_benchmark_price, plo.slippage_benchmark_kind,
                plo.slippage_benchmark_timestamp, plo.slippage_measurement_quality,
-               pl.symbol, pl.strategy, pl.owner_key
+               pl.symbol, pl.strategy, pl.owner_key, pl.position_type
         FROM position_lifecycle_orders plo
         JOIN position_lifecycle pl
           ON pl.position_uid = plo.position_uid
@@ -1662,7 +1662,7 @@ def apply_order_event(
         row_id, position_uid, role, side,
         order_type, intended_qty,
         slip_price, slip_kind, slip_ts, slip_quality,
-        symbol, strategy, owner_key,
+        symbol, strategy, owner_key, position_type,
     ) = pre_row
 
     now = _utc_now_iso()
@@ -1708,7 +1708,14 @@ def apply_order_event(
             # cumulative state is a no-op (values match); an advance
             # updates filled_qty / VWAP. Provenance preserved via
             # COALESCE.
-            if float(event.filled_qty) > 0:
+            #
+            # Important spread boundary: MLEG/spread lifecycle rows use
+            # this same state machine for durable close tracking, but
+            # their user-facing trade rows are written by
+            # TradeLogger.log_spread_fill() as position_type='spread'
+            # with one row per leg. Auto-UPserting them here would create
+            # a fake single-leg row and poison read_all_open_owners().
+            if float(event.filled_qty) > 0 and position_type == "single_leg":
                 conn.execute(
                     _TRADES_UPSERT_SQL,
                     {
