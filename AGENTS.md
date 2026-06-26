@@ -139,6 +139,11 @@ sensitive values.
 - Config values (symbols, timeframes, thresholds) live in `config/settings.py`, never hardcoded.
 - Exceptions are caught and logged; the bot never silently swallows errors.
 - All monetary values are handled as `float`; quantities as `int` where Alpaca requires whole shares, or `float` for fractional.
+- Prefer clean source-level fixes over layered workarounds. When a bug has a clear
+  root cause, fix the boundary or invariant that produced it rather than adding
+  dashboard filters, reader-side exceptions, or stacked compatibility patches.
+  Keep code simple, efficient, and easy to reason about; avoid "just patch over
+  it" changes that make the codebase feel like a chain of special cases.
 - If a code change completes, advances, or materially reframes a planned item already tracked in `PLAN.md`, update the relevant `PLAN.md` entry in the same workstream and include that plan sync in the same commit. Do not leave code and plan status out of sync for tracked roadmap items.
 
 ---
