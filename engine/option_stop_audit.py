@@ -1,4 +1,4 @@
-"""Disposable storage for temporary option-stop replacement diagnostics."""
+"""Disposable storage for temporary option-stop diagnostics."""
 
 from __future__ import annotations
 
@@ -34,7 +34,7 @@ def _iso(value: datetime) -> str:
 
 
 class OptionStopReplaceAuditStore:
-    """Append-only standalone SQLite evidence store."""
+    """Append-only standalone SQLite evidence store for option-stop forensics."""
 
     def __init__(self, db_path: str | Path) -> None:
         path = Path(db_path)

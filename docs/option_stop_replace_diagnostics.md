@@ -1,8 +1,10 @@
-# Temporary option-stop replacement diagnostics
+# Temporary option-stop diagnostics
 
-This diagnostic is narrowly scoped to the unresolved immediate-fill timing
-seen while `spy_options_reversion` ratcheted broker-side option stops. It is
-instrumentation, not a trading-behavior change and not a general order audit.
+This diagnostic is narrowly scoped to unresolved `spy_options_reversion`
+option-stop execution questions: immediate-fill timing while ratcheting
+broker-side stops, and adverse slippage on ordinary protective-stop fills. It
+is instrumentation, not a trading-behavior change and not a general order
+audit.
 
 ## Isolation
 
@@ -26,11 +28,18 @@ OPTION_STOP_REPLACE_AUDIT_WINDOW_SECONDS=300
 OPTION_STOP_REPLACE_AUDIT_RETENTION_DAYS=14
 ```
 
-Each ratchet decision records cached and freshly fetched order state, quote
-state, position mark/value, HWM and requested stop, replace request timing,
-the replacement REST response, and matching WebSocket trade updates. Stream
-association ends on fill, cancel, rejection, expiry, or after five minutes.
-Retention pruning runs at startup and at most once per 24 hours while enabled.
+Each initial stop submit records quote state, position mark/value, HWM,
+requested stop, submit request timing, the broker REST response, and matching
+WebSocket trade updates. Each ratchet decision records cached and freshly
+fetched order state, quote state, position mark/value, HWM and requested stop,
+replace request timing, the replacement REST response, and matching WebSocket
+trade updates. When an audited option stop fills, the engine records a
+separate fill-context row with stop price, fill price, adverse slippage bps,
+execution id, broker timestamp, and the latest option bid/ask if available.
+
+Stream association ends on fill, cancel, rejection, expiry, or after five
+minutes. Retention pruning runs at startup and at most once per 24 hours while
+enabled.
 
 Inspect evidence with:
 

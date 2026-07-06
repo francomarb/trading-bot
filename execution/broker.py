@@ -2709,6 +2709,7 @@ class AlpacaBroker:
         qty: float,
         stop_price: float,
         client_order_id_prefix: str = "opt-trail-stop",
+        client_order_id: str | None = None,
         position_uid: str | None = None,
     ) -> OpenOrder:
         """Submit a durable GTC SELL stop for a single-leg option position.
@@ -2732,7 +2733,9 @@ class AlpacaBroker:
             raise BrokerError(
                 f"option stop price must be positive for {symbol}: {stop_price}"
             )
-        client_order_id = f"{client_order_id_prefix}-{uuid.uuid4().hex[:10]}"
+        client_order_id = client_order_id or (
+            f"{client_order_id_prefix}-{uuid.uuid4().hex[:10]}"
+        )
         order_request = StopOrderRequest(
             symbol=symbol,
             qty=whole_qty,
