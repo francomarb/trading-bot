@@ -299,14 +299,6 @@ recorded milestone is **646 unit tests passing** as of 2026-04-25, before the
   fails on auth, ask the operator or fall back to the macOS Keychain via
   the credential helper / `gh auth login`. Never paper over auth by
   embedding a token.
-- If Codex's inherited environment has a stale `GH_TOKEN` but the operator's
-  interactive zsh shell has a valid one, use it only ephemerally through `gh`:
-  run Git commands as `/bin/zsh -ic 'git -c credential.helper="!gh auth git-credential" push ...'`
-  and GitHub CLI commands as `/bin/zsh -ic 'gh pr ...'`. This uses the
-  authenticated `gh` client without writing tokens to `.git/config` or the
-  remote URL. For PR descriptions containing Markdown backticks, write a
-  temporary body file and pass `--body-file` rather than inline `--body`, so
-  the shell cannot interpret code spans as command substitutions.
 - **Always use `./recycle_bot.sh`** when restarting or recycling the bot, rather
   than manually killing the tmux session and calling `./start_bot.sh`.
 
