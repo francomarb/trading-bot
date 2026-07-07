@@ -39,6 +39,7 @@ import pandas as pd
 import pytest
 
 from engine.trader import EngineConfig, TradingEngine, _lookback_days
+from engine.lifecycle_orders import OrderEvent
 from execution.broker import (
     AlpacaBroker,
     BrokerOrderAuditSnapshot,
@@ -4453,6 +4454,7 @@ class TestGenericSingleLegOptionTrailingStops:
             symbol="SPY260618C00746000",
             qty=3.0,
             stop_price=17.14,
+            client_order_id=None,
             position_uid="pos_abc123",
         )
         row = engine.option_trailing_store.get_by_occ("SPY260618C00746000")
@@ -4464,6 +4466,134 @@ class TestGenericSingleLegOptionTrailingStops:
             "entry_premium": 12.77,
             "hwm_premium": 20.16,
         }
+
+    def test_enabled_audit_records_initial_stop_submit(self, tmp_path):
+        stream = MagicMock()
+        engine, broker = self._engine(
+            tmp_path,
+            audit_enabled=True,
+            stream_manager=stream,
+        )
+        before = BrokerOrderAuditSnapshot(
+            order_id="new-stop",
+            status="accepted",
+            stop_price=17.14,
+            qty=3.0,
+            time_in_force="gtc",
+            submitted_at=T0,
+            updated_at=T0,
+            replaced_at=None,
+            filled_at=None,
+            filled_avg_price=None,
+            replaces_order_id=None,
+            raw_json='{"id":"new-stop"}',
+            fetch_started_at=T0,
+            fetch_ended_at=T0,
+            latency_ms=4.0,
+        )
+        broker.get_order_audit_snapshot.return_value = before
+        engine.option_trailing_store.upsert(
+            position_uid="pos_abc123",
+            occ_symbol="SPY260618C00746000",
+            strategy="generic_single_leg_options",
+            owner_key="SPY",
+            qty=3,
+            entry_premium=12.77,
+            hwm_premium=20.16,
+            trail_activation_pct=0.10,
+            trail_pct=0.15,
+            current_stop_price=17.14,
+            stop_order_status="expired",
+            last_observed_premium=15.50,
+        )
+        snapshot = _snapshot(
+            positions={
+                "SPY260618C00746000": Position(
+                    symbol="SPY260618C00746000",
+                    qty=3,
+                    avg_entry_price=12.77,
+                    market_value=4_650.0,
+                    current_price=15.50,
+                )
+            },
+            open_orders=[],
+        )
+
+        engine._sync_option_trailing_stops(snapshot)
+
+        submit_kwargs = broker.submit_option_gtc_stop.call_args.kwargs
+        assert submit_kwargs["client_order_id"].startswith(
+            "opt-trail-audit-"
+        )
+        records = engine.option_stop_audit_store.read_records(
+            occ_symbol="SPY260618C00746000"
+        )
+        assert [row["record_type"] for row in records] == [
+            "initial_submit_decision",
+            "initial_submit_result",
+        ]
+        assert records[0]["payload"]["quote"]["bid_price"] == pytest.approx(21.90)
+        assert records[0]["payload"]["requested_stop_price"] == pytest.approx(17.14)
+        assert records[1]["order_id"] == "new-stop"
+        assert records[1]["payload"]["broker_after"]["order_id"] == "new-stop"
+        stream.register_option_stop_audit.assert_called_once()
+        stream.bind_option_stop_audit_alias.assert_called_once_with(
+            records[0]["correlation_id"],
+            "new-stop",
+        )
+
+    def test_enabled_audit_records_option_stop_fill_context(self, tmp_path):
+        engine, broker = self._engine(tmp_path, audit_enabled=True)
+        engine.lifecycle_orders_store.insert_pending(
+            position_uid="pos_abc123",
+            role="protective_stop",
+            client_order_id="stop-client-1",
+            order_type="stop",
+            order_class="simple",
+            time_in_force="gtc",
+            side="sell",
+            intended_qty=3,
+            intended_stop_price=17.14,
+        )
+        engine.lifecycle_orders_store.attach_broker_order_id(
+            client_order_id="stop-client-1",
+            order_id="stop-order-1",
+            submitted_at=T0.isoformat(),
+        )
+        broker.get_latest_option_quote.return_value = OptionQuote(
+            symbol="SPY260618C00746000",
+            bid_price=16.85,
+            ask_price=17.05,
+            timestamp=T0 + timedelta(minutes=1),
+        )
+        event = OrderEvent(
+            order_id="stop-order-1",
+            status="filled",
+            filled_qty=3.0,
+            avg_fill_price=16.90,
+            broker_updated_at=(T0 + timedelta(minutes=1)).isoformat(),
+            execution_id="exec-1",
+        )
+
+        engine._maybe_dispatch_substrate_stop_fill(
+            event=event,
+            snapshot=_snapshot(positions={}, open_orders=[]),
+        )
+
+        records = engine.option_stop_audit_store.read_records(
+            occ_symbol="SPY260618C00746000"
+        )
+        assert [row["record_type"] for row in records] == ["stop_fill_context"]
+        payload = records[0]["payload"]
+        assert records[0]["order_id"] == "stop-order-1"
+        assert payload["client_order_id"] == "stop-client-1"
+        assert payload["avg_fill_price"] == pytest.approx(16.90)
+        assert payload["stop_price"] == pytest.approx(17.14)
+        assert payload["adverse_slippage_bps"] == pytest.approx(
+            140.02
+        )
+        assert payload["quote_at_dispatch"]["bid_price"] == pytest.approx(16.85)
+        assert payload["execution_id"] == "exec-1"
 
     def test_startup_backfills_legacy_occ_lifecycle_then_recreates_stop(self, tmp_path):
         engine, broker = self._engine(tmp_path, create_lifecycle=False)
@@ -4495,6 +4625,7 @@ class TestGenericSingleLegOptionTrailingStops:
             symbol="SPY260618C00746000",
             qty=3.0,
             stop_price=13.17,
+            client_order_id=None,
             position_uid=lifecycle_row.position_uid,
         )
         trailing_row = engine.option_trailing_store.get_by_occ("SPY260618C00746000")
@@ -5281,8 +5412,11 @@ class TestOptionTrailingLifecycleOrderIdFK:
         submit_return = broker.submit_option_gtc_stop.return_value
 
         def _submit_side_effect(*, symbol, qty, stop_price, position_uid=None,
-                                client_order_id_prefix="opt-trail-stop"):
-            client_order_id = f"{client_order_id_prefix}-{position_uid or 'na'}"
+                                client_order_id_prefix="opt-trail-stop",
+                                client_order_id=None):
+            client_order_id = client_order_id or (
+                f"{client_order_id_prefix}-{position_uid or 'na'}"
+            )
             orders_store.insert_pending(
                 position_uid=position_uid,
                 role="protective_stop",

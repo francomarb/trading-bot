@@ -2048,6 +2048,30 @@ class TestOptionGtcStops:
         assert result.order_id == "stop-1"
         assert result.stop_price == pytest.approx(17.13)
 
+    def test_submit_option_gtc_stop_accepts_audit_client_order_id(self):
+        api = MagicMock()
+        api.submit_order.return_value = _alpaca_order(
+            id="stop-1",
+            status="accepted",
+            symbol="SPY260618C00746000",
+            side="sell",
+            qty=3,
+            type="stop",
+            stop_price="17.13",
+        )
+
+        AlpacaBroker(
+            client=api, max_attempts=1, base_delay=0.0
+        ).submit_option_gtc_stop(
+            symbol="SPY260618C00746000",
+            qty=3,
+            stop_price=17.13,
+            client_order_id="opt-trail-audit-fixed",
+        )
+
+        req = api.submit_order.call_args.args[0]
+        assert req.client_order_id == "opt-trail-audit-fixed"
+
     def test_replace_option_stop_ratchets_atomically_and_enforces_gtc(self):
         api = MagicMock()
         stream = MagicMock()

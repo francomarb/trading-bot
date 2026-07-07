@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Render temporary option-stop replacement diagnostics chronologically."""
+"""Render temporary option-stop diagnostics chronologically."""
 
 from __future__ import annotations
 
@@ -16,7 +16,7 @@ from engine.option_stop_audit import OptionStopReplaceAuditStore
 
 def _parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
-        description="Dump SPY options-reversion stop replacement evidence."
+        description="Dump SPY options-reversion stop diagnostic evidence."
     )
     parser.add_argument(
         "--db",
@@ -67,12 +67,18 @@ def main() -> int:
                     "reason",
                     "desired_stop_price",
                     "requested_stop_price",
+                    "client_order_id",
                     "position_current_price",
                     "hwm_premium",
                     "qty",
+                    "filled_qty",
                     "price",
+                    "avg_fill_price",
+                    "stop_price",
+                    "adverse_slippage_bps",
                     "status",
                     "replace_call_latency_ms",
+                    "submit_call_latency_ms",
                     "error",
                 )
                 if payload.get(key) is not None
@@ -80,7 +86,7 @@ def main() -> int:
             print(f"  {json.dumps(summary, sort_keys=True, default=str)}")
 
     if not records:
-        print("No matching option-stop replacement audits.")
+        print("No matching option-stop diagnostics.")
     return 0
 
 

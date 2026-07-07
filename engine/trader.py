@@ -166,7 +166,7 @@ _SUBSTRATE_NULL_ATTACH_SWEEP_BACKOFF_SECONDS = 300
 
 @dataclass(frozen=True)
 class _OptionStopAuditContext:
-    """One enabled, strategy-scoped replacement audit window."""
+    """One enabled, strategy-scoped option-stop audit window."""
 
     correlation_id: str
     decision_at: datetime
@@ -477,7 +477,7 @@ class TradingEngine:
                     timezone.utc
                 )
                 logger.info(
-                    "temporary option-stop replacement audit enabled for "
+                    "temporary option-stop diagnostics enabled for "
                     f"strategy={self.config.option_stop_replace_audit_strategy} "
                     f"db={self.config.option_stop_replace_audit_db_path} "
                     f"retention={self.config.option_stop_replace_audit_retention_days}d"
@@ -2792,6 +2792,14 @@ class TradingEngine:
                 stop_price=_finite_or_none(order_row.intended_stop_price),
                 order_id=event.order_id,
                 position_uid=order_row.position_uid,
+            )
+            self._record_option_stop_fill_context(
+                owner=owner,
+                raw_symbol=raw_symbol,
+                order_row=order_row,
+                event=event,
+                price=price,
+                qty=qty,
             )
             self._record_realized_pnl(
                 owner_key,
@@ -5529,7 +5537,7 @@ class TradingEngine:
         return None
 
     def _option_stop_audit_active_for(self, owner: str) -> bool:
-        """Return whether temporary replace diagnostics apply to this owner."""
+        """Return whether temporary stop diagnostics apply to this owner."""
         return (
             self.option_stop_audit_store is not None
             and owner == self.config.option_stop_replace_audit_strategy
@@ -5565,7 +5573,7 @@ class TradingEngine:
             return False
 
     def _begin_option_stop_audit(
-        self, *, owner: str, order_id: str
+        self, *, owner: str, order_id: str | None = None
     ) -> _OptionStopAuditContext | None:
         """Open a real-time forensic window for one target-strategy decision."""
         if not self._option_stop_audit_active_for(owner):
@@ -5577,7 +5585,10 @@ class TradingEngine:
             expires_at=decision_at + timedelta(
                 seconds=self.config.option_stop_replace_audit_window_seconds
             ),
-            broker_before=self.broker.get_order_audit_snapshot(order_id),
+            broker_before=(
+                self.broker.get_order_audit_snapshot(order_id)
+                if order_id is not None else None
+            ),
         )
 
     def _record_option_stop_audit_decision(
@@ -5635,6 +5646,96 @@ class TradingEngine:
                 "requested_stop_price": requested_stop,
                 "requested_qty": qty,
                 "replacement_client_order_id": replacement_client_order_id,
+            },
+        )
+
+    def _record_option_stop_submit_decision(
+        self,
+        *,
+        audit: _OptionStopAuditContext,
+        owner: str,
+        occ: str,
+        lifecycle_row,
+        position,
+        quote: OptionQuote | None,
+        entry_premium: float,
+        hwm: float,
+        desired_stop: float,
+        qty: float,
+        client_order_id: str,
+    ) -> bool:
+        """Record evidence for a fresh protective-stop submit."""
+        return self._record_option_stop_audit(
+            correlation_id=audit.correlation_id,
+            record_type="initial_submit_decision",
+            strategy=owner,
+            occ_symbol=occ,
+            order_id=None,
+            recorded_at=audit.decision_at,
+            payload={
+                "position_uid": lifecycle_row.position_uid,
+                "reason": "initial protective stop submit",
+                "association_expires_at": audit.expires_at,
+                "quote": asdict(quote) if quote is not None else None,
+                "position_current_price": getattr(
+                    position, "current_price", None
+                ),
+                "position_market_value": getattr(
+                    position, "market_value", None
+                ),
+                "entry_premium": entry_premium,
+                "hwm_premium": hwm,
+                "desired_stop_price": desired_stop,
+                "requested_stop_price": desired_stop,
+                "requested_qty": qty,
+                "client_order_id": client_order_id,
+            },
+        )
+
+    def _record_option_stop_fill_context(
+        self,
+        *,
+        owner: str,
+        raw_symbol: str,
+        order_row,
+        event,
+        price: float,
+        qty: float,
+    ) -> None:
+        """Capture forensic quote/order context for an option stop fill."""
+        if not self._option_stop_audit_active_for(owner):
+            return
+        if not _OCC_PAT.match(raw_symbol):
+            return
+        quote = self.broker.get_latest_option_quote(raw_symbol)
+        stop_price = _finite_or_none(order_row.intended_stop_price)
+        adverse_bps = None
+        if stop_price is not None and stop_price > 0:
+            adverse_bps = max(
+                0.0,
+                single_leg_realized_slippage_bps(
+                    side="sell",
+                    reference_price=stop_price,
+                    actual_fill_price=price,
+                ),
+            )
+        self._record_option_stop_audit(
+            correlation_id=f"stopfill_{event.order_id}",
+            record_type="stop_fill_context",
+            strategy=owner,
+            occ_symbol=raw_symbol,
+            order_id=event.order_id,
+            payload={
+                "position_uid": order_row.position_uid,
+                "client_order_id": order_row.client_order_id,
+                "role": order_row.role,
+                "filled_qty": qty,
+                "avg_fill_price": price,
+                "stop_price": stop_price,
+                "adverse_slippage_bps": adverse_bps,
+                "broker_updated_at": event.broker_updated_at,
+                "execution_id": event.execution_id,
+                "quote_at_dispatch": asdict(quote) if quote is not None else None,
             },
         )
 
@@ -6132,14 +6233,71 @@ class TradingEngine:
                 )
                 continue
 
+            submit_audit = self._begin_option_stop_audit(owner=owner)
+            submit_client_order_id = (
+                f"opt-trail-audit-{uuid.uuid4().hex[:10]}"
+                if submit_audit is not None else None
+            )
+            submit_audit_created = False
+            if submit_audit is not None and submit_client_order_id is not None:
+                submit_quote = self.broker.get_latest_option_quote(occ)
+                submit_audit_created = self._record_option_stop_submit_decision(
+                    audit=submit_audit,
+                    owner=owner,
+                    occ=occ,
+                    lifecycle_row=lifecycle_row,
+                    position=position,
+                    quote=submit_quote,
+                    entry_premium=entry_premium,
+                    hwm=hwm,
+                    desired_stop=desired_stop,
+                    qty=qty,
+                    client_order_id=submit_client_order_id,
+                )
+                if submit_audit_created and self._stream_manager is not None:
+                    try:
+                        self._stream_manager.register_option_stop_audit(
+                            correlation_id=submit_audit.correlation_id,
+                            strategy=owner,
+                            occ_symbol=occ,
+                            aliases={submit_client_order_id},
+                            expires_at=submit_audit.expires_at,
+                        )
+                    except Exception as exc:
+                        logger.warning(
+                            f"{occ}: option-stop audit stream registration "
+                            f"failed: {exc}"
+                        )
+            submit_call_start = datetime.now(timezone.utc)
+            submit_call_started_mono = time.monotonic()
             try:
                 new_order = self.broker.submit_option_gtc_stop(
                     symbol=occ,
                     qty=qty,
                     stop_price=desired_stop,
+                    client_order_id=submit_client_order_id,
                     position_uid=lifecycle_row.position_uid,
                 )
             except Exception as exc:
+                submit_call_end = datetime.now(timezone.utc)
+                if submit_audit_created and submit_audit is not None:
+                    self._record_option_stop_audit(
+                        correlation_id=submit_audit.correlation_id,
+                        record_type="initial_submit_failed",
+                        strategy=owner,
+                        occ_symbol=occ,
+                        order_id=None,
+                        recorded_at=submit_call_end,
+                        payload={
+                            "client_order_id": submit_client_order_id,
+                            "submit_call_start": submit_call_start,
+                            "submit_call_end": submit_call_end,
+                            "submit_call_latency_ms": (
+                                time.monotonic() - submit_call_started_mono
+                            ) * 1000.0,
+                            "error": str(exc),
+                        },
+                    )
                 logger.error(
                     f"[{owner}] {occ}: failed to submit option GTC trailing stop "
                     f"@ ${desired_stop:.2f}: {exc}"
@@ -6165,6 +6323,48 @@ class TradingEngine:
                     lifecycle_order_id=None,
                 )
                 continue
+            submit_call_end = datetime.now(timezone.utc)
+            if (
+                submit_audit_created
+                and submit_audit is not None
+                and self._stream_manager is not None
+            ):
+                try:
+                    self._stream_manager.bind_option_stop_audit_alias(
+                        submit_audit.correlation_id,
+                        new_order.order_id,
+                    )
+                except Exception as exc:
+                    logger.warning(
+                        f"{occ}: option-stop audit stream alias bind "
+                        f"failed for {new_order.order_id}: {exc}"
+                    )
+            submit_broker_after = (
+                self.broker.get_order_audit_snapshot(new_order.order_id)
+                if submit_audit_created
+                else None
+            )
+            if submit_audit_created and submit_audit is not None:
+                self._record_option_stop_audit(
+                    correlation_id=submit_audit.correlation_id,
+                    record_type="initial_submit_result",
+                    strategy=owner,
+                    occ_symbol=occ,
+                    order_id=new_order.order_id,
+                    recorded_at=submit_call_end,
+                    payload={
+                        "client_order_id": submit_client_order_id,
+                        "submit_call_start": submit_call_start,
+                        "submit_call_end": submit_call_end,
+                        "submit_call_latency_ms": (
+                            time.monotonic() - submit_call_started_mono
+                        ) * 1000.0,
+                        "broker_after": (
+                            asdict(submit_broker_after)
+                            if submit_broker_after is not None else None
+                        ),
+                    },
+                )
             # Fresh submit succeeded: FK points at the brand-new
             # protective_stop substrate row just written by
             # broker.submit_option_gtc_stop. load_bearing=True so a
