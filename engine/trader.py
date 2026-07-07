@@ -5711,7 +5711,14 @@ class TradingEngine:
         stop_price = _finite_or_none(order_row.intended_stop_price)
         adverse_bps = None
         if stop_price is not None and stop_price > 0:
-            adverse_bps = max((stop_price - price) / stop_price * 10_000.0, 0.0)
+            adverse_bps = max(
+                0.0,
+                single_leg_realized_slippage_bps(
+                    side="sell",
+                    reference_price=stop_price,
+                    actual_fill_price=price,
+                ),
+            )
         self._record_option_stop_audit(
             correlation_id=f"stopfill_{event.order_id}",
             record_type="stop_fill_context",
@@ -6248,43 +6255,32 @@ class TradingEngine:
                     client_order_id=submit_client_order_id,
                 )
                 if submit_audit_created and self._stream_manager is not None:
-                    self._stream_manager.register_option_stop_audit(
-                        correlation_id=submit_audit.correlation_id,
-                        strategy=owner,
-                        occ_symbol=occ,
-                        aliases={submit_client_order_id},
-                        expires_at=submit_audit.expires_at,
-                    )
-            submit_call_start = (
-                datetime.now(timezone.utc) if submit_audit_created else None
-            )
-            submit_call_started_mono = (
-                time.monotonic() if submit_audit_created else None
-            )
+                    try:
+                        self._stream_manager.register_option_stop_audit(
+                            correlation_id=submit_audit.correlation_id,
+                            strategy=owner,
+                            occ_symbol=occ,
+                            aliases={submit_client_order_id},
+                            expires_at=submit_audit.expires_at,
+                        )
+                    except Exception as exc:
+                        logger.warning(
+                            f"{occ}: option-stop audit stream registration "
+                            f"failed: {exc}"
+                        )
+            submit_call_start = datetime.now(timezone.utc)
+            submit_call_started_mono = time.monotonic()
             try:
-                if submit_client_order_id is not None:
-                    new_order = self.broker.submit_option_gtc_stop(
-                        symbol=occ,
-                        qty=qty,
-                        stop_price=desired_stop,
-                        client_order_id=submit_client_order_id,
-                        position_uid=lifecycle_row.position_uid,
-                    )
-                else:
-                    new_order = self.broker.submit_option_gtc_stop(
-                        symbol=occ,
-                        qty=qty,
-                        stop_price=desired_stop,
-                        position_uid=lifecycle_row.position_uid,
-                    )
-            except Exception as exc:
-                submit_call_end = (
-                    datetime.now(timezone.utc) if submit_audit_created else None
+                new_order = self.broker.submit_option_gtc_stop(
+                    symbol=occ,
+                    qty=qty,
+                    stop_price=desired_stop,
+                    client_order_id=submit_client_order_id,
+                    position_uid=lifecycle_row.position_uid,
                 )
+            except Exception as exc:
+                submit_call_end = datetime.now(timezone.utc)
                 if submit_audit_created and submit_audit is not None:
-                    assert submit_call_start is not None
-                    assert submit_call_started_mono is not None
-                    assert submit_call_end is not None
                     self._record_option_stop_audit(
                         correlation_id=submit_audit.correlation_id,
                         record_type="initial_submit_failed",
@@ -6327,27 +6323,28 @@ class TradingEngine:
                     lifecycle_order_id=None,
                 )
                 continue
-            submit_call_end = (
-                datetime.now(timezone.utc) if submit_audit_created else None
-            )
+            submit_call_end = datetime.now(timezone.utc)
             if (
                 submit_audit_created
                 and submit_audit is not None
                 and self._stream_manager is not None
             ):
-                self._stream_manager.bind_option_stop_audit_alias(
-                    submit_audit.correlation_id,
-                    new_order.order_id,
-                )
+                try:
+                    self._stream_manager.bind_option_stop_audit_alias(
+                        submit_audit.correlation_id,
+                        new_order.order_id,
+                    )
+                except Exception as exc:
+                    logger.warning(
+                        f"{occ}: option-stop audit stream alias bind "
+                        f"failed for {new_order.order_id}: {exc}"
+                    )
             submit_broker_after = (
                 self.broker.get_order_audit_snapshot(new_order.order_id)
                 if submit_audit_created
                 else None
             )
             if submit_audit_created and submit_audit is not None:
-                assert submit_call_start is not None
-                assert submit_call_started_mono is not None
-                assert submit_call_end is not None
                 self._record_option_stop_audit(
                     correlation_id=submit_audit.correlation_id,
                     record_type="initial_submit_result",

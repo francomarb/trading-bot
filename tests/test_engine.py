@@ -4454,6 +4454,7 @@ class TestGenericSingleLegOptionTrailingStops:
             symbol="SPY260618C00746000",
             qty=3.0,
             stop_price=17.14,
+            client_order_id=None,
             position_uid="pos_abc123",
         )
         row = engine.option_trailing_store.get_by_occ("SPY260618C00746000")
@@ -4589,7 +4590,7 @@ class TestGenericSingleLegOptionTrailingStops:
         assert payload["avg_fill_price"] == pytest.approx(16.90)
         assert payload["stop_price"] == pytest.approx(17.14)
         assert payload["adverse_slippage_bps"] == pytest.approx(
-            (17.14 - 16.90) / 17.14 * 10_000.0
+            140.02
         )
         assert payload["quote_at_dispatch"]["bid_price"] == pytest.approx(16.85)
         assert payload["execution_id"] == "exec-1"
@@ -4624,6 +4625,7 @@ class TestGenericSingleLegOptionTrailingStops:
             symbol="SPY260618C00746000",
             qty=3.0,
             stop_price=13.17,
+            client_order_id=None,
             position_uid=lifecycle_row.position_uid,
         )
         trailing_row = engine.option_trailing_store.get_by_occ("SPY260618C00746000")
@@ -5410,8 +5412,11 @@ class TestOptionTrailingLifecycleOrderIdFK:
         submit_return = broker.submit_option_gtc_stop.return_value
 
         def _submit_side_effect(*, symbol, qty, stop_price, position_uid=None,
-                                client_order_id_prefix="opt-trail-stop"):
-            client_order_id = f"{client_order_id_prefix}-{position_uid or 'na'}"
+                                client_order_id_prefix="opt-trail-stop",
+                                client_order_id=None):
+            client_order_id = client_order_id or (
+                f"{client_order_id_prefix}-{position_uid or 'na'}"
+            )
             orders_store.insert_pending(
                 position_uid=position_uid,
                 role="protective_stop",
