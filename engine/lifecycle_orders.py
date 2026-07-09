@@ -142,8 +142,9 @@ _UNIQ_ONE_ENTRY_PRIMARY_PER_POSITION_SQL = (
 # analog of `_spreads_pending_close` and `_has_pending_close_order()`
 # (PR #59 review-7 P1). Stop-side roles (protective_stop,
 # replacement_stop) are intentionally excluded — replacement_stop is
-# an intentional second-stop pattern (PR #47 GTC promotion) and
-# protective_stop is OTO-paired with the entry, not a competing close.
+# an intentional broker-supported stop replacement pattern (for example
+# option trailing ratchets) and protective_stop is OTO-paired with the
+# entry or a standalone rebuilt stop, not a competing close.
 _UNIQ_ONE_ACTIVE_CLOSE_PER_POSITION_SQL = (
     "CREATE UNIQUE INDEX IF NOT EXISTS uniq_one_active_close_per_position "
     "ON position_lifecycle_orders(position_uid) "

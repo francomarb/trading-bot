@@ -51,37 +51,34 @@ PR #63 does not classify either profitable fill as defective. It improves the
 evidence required for future stop-price increases without changing the existing
 broker-side protection or converting the strategy to software-only exits.
 
-## 2. ALAB attached stop cannot be promoted to GTC
+## 2. ALAB / ANET attached DAY stop durability
 
-The `donchian_breakout` strategy opened 27 ALAB shares at an average price of
-$378.49 with an attached protective stop near $308.53. The entry used the
-capped DAY limit plus OTO path.
+The `donchian_breakout` strategy opened capped DAY + OTO equity entries whose
+attached stop children were DAY orders. ALAB first exposed the issue; ANET
+reproduced it on 2026-07-09 after a capped STOP_LIMIT + OTO entry.
 
 The attached stop became active, but attempts to promote it from DAY to GTC
 were repeatedly rejected by Alpaca with:
 
 `time_in_force cannot be changed for advanced orders`
 
-The position had intraday protection at the time of review, but the repeated
-promotion failure raises an overnight-protection concern because a DAY child
-order expires at the end of the session.
+Resolution note, 2026-07-09:
 
-Questions for later review:
+- Checked Alpaca's current Orders docs and local `alpaca-py` SDK request model.
+- Alpaca supports `day` / `gtc` for advanced orders at submission time, but OTO
+  child replacement is not a supported path for changing TIF. The SDK can build
+  a `ReplaceOrderRequest(time_in_force=...)`, but Alpaca rejects that mutation
+  for advanced-order children.
+- The correct local behavior is: record the attached OTO child with its actual
+  DAY TIF, then rebuild durable protection as cancel-child + standalone simple
+  GTC stop after confirmed fill / broker-snapshot reconciliation.
+- The PR for this fix must not treat this as a generic `PATCH` promotion. It
+  should keep the existing DAY child if cancel fails, and it should alert if the
+  cancel/rebuild path cannot establish standalone GTC protection.
 
-1. Does Alpaca permit replacing only the time-in-force of an attached OTO child
-   order, or must the child/order group be canceled and rebuilt?
-2. What broker-native order shape should provide a capped equity entry plus a
-   durable GTC protective stop?
-3. If cancel/rebuild is required, how should the engine avoid an uncovered
-   window or duplicate SELL exposure?
-4. Why does the repair loop retry every cycle after receiving a deterministic
-   unsupported-operation response?
-5. Does startup reconciliation recreate valid protection after the DAY child
-   expires?
-
-Treat this as an execution-safety follow-up. Consult Alpaca's current official
-SDK documentation and paper-test the chosen recovery path before changing the
-live-facing order lifecycle.
+Status: fix branch in review. Paper verification still required on the next
+capped fill: DAY child cancel event, one standalone GTC protective stop, no
+duplicate SELL exposure, substrate row TIF matches broker truth.
 
 ## 3. SPY options reversion blocked before enough paper trades
 

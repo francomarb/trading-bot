@@ -2239,7 +2239,7 @@ class TestWatchlistStatuses:
 
         broker.place_protective_stop.assert_called_once()
 
-    def test_reconciliation_promotes_existing_day_stop_to_gtc(
+    def test_reconciliation_rebuilds_existing_day_stop_as_gtc(
         self, engine_factory
     ):
         day_stop = replace(
@@ -2248,7 +2248,7 @@ class TestWatchlistStatuses:
             qty=10,
             time_in_force="day",
         )
-        promoted = replace(
+        rebuilt = replace(
             day_stop,
             order_id="gtc-stop",
             status="accepted",
@@ -2260,18 +2260,20 @@ class TestWatchlistStatuses:
         )
         engine, broker = engine_factory(snapshot=snapshot)
         engine._register_single_leg(strategy_name="fake_strategy", symbol="AAPL")
-        broker.promote_equity_stop_to_gtc.return_value = promoted
+        broker.replace_day_stop_with_standalone_gtc.return_value = rebuilt
 
         engine._repair_missing_protective_stops(snapshot)
 
-        # P-5: position_uid kwarg is now part of the contract.
+        # Alpaca-verified 2026-07-09: attached OTO child stops cannot
+        # be promoted in place by changing time_in_force. Reconciliation
+        # cancels/rebuilds a standalone GTC stop instead.
         # This test fixture doesn't seed a lifecycle row for the
         # recovered position, so the engine's lookup returns None
         # — the substrate write is skipped, but the broker call
         # still goes out with the correct stop semantics.
-        broker.promote_equity_stop_to_gtc.assert_called_once()
-        kwargs = broker.promote_equity_stop_to_gtc.call_args.kwargs
-        assert kwargs["parent_order_id"] is None
+        broker.replace_day_stop_with_standalone_gtc.assert_called_once()
+        kwargs = broker.replace_day_stop_with_standalone_gtc.call_args.kwargs
+        assert kwargs["symbol"] == "AAPL"
         assert kwargs["stop_order_id"] == "day-stop"
         assert kwargs["qty"] == 10
         assert kwargs["stop_price"] == 95.0
@@ -2279,7 +2281,7 @@ class TestWatchlistStatuses:
             "fake_strategy-repair-stop-gtc"
         )
         assert "position_uid" in kwargs
-        assert snapshot.open_orders == [promoted]
+        assert snapshot.open_orders == [rebuilt]
         broker.place_protective_stop.assert_not_called()
 
     def test_reconciliation_leaves_gtc_stop_unchanged(self, engine_factory):
@@ -2298,10 +2300,10 @@ class TestWatchlistStatuses:
 
         engine._repair_missing_protective_stops(snapshot)
 
-        broker.promote_equity_stop_to_gtc.assert_not_called()
+        broker.replace_day_stop_with_standalone_gtc.assert_not_called()
         broker.place_protective_stop.assert_not_called()
 
-    def test_reconciliation_reports_repeated_day_stop_promotion_failure_once(
+    def test_reconciliation_reports_repeated_day_stop_rebuild_failure_once(
         self, engine_factory
     ):
         day_stop = replace(
@@ -2316,8 +2318,8 @@ class TestWatchlistStatuses:
         )
         engine, broker = engine_factory(snapshot=snapshot)
         engine._register_single_leg(strategy_name="fake_strategy", symbol="AAPL")
-        broker.promote_equity_stop_to_gtc.side_effect = RuntimeError(
-            "order is temporarily not replaceable"
+        broker.replace_day_stop_with_standalone_gtc.side_effect = RuntimeError(
+            "order is temporarily not rebuildable"
         )
         engine.risk.record_broker_error = MagicMock()
         engine.alerts.broker_error = MagicMock()
@@ -2325,7 +2327,7 @@ class TestWatchlistStatuses:
         engine._repair_missing_protective_stops(snapshot)
         engine._repair_missing_protective_stops(snapshot)
 
-        assert broker.promote_equity_stop_to_gtc.call_count == 2
+        assert broker.replace_day_stop_with_standalone_gtc.call_count == 2
         engine.risk.record_broker_error.assert_called_once()
         engine.alerts.broker_error.assert_called_once()
 
@@ -2348,7 +2350,7 @@ class TestWatchlistStatuses:
 
         engine._repair_missing_protective_stops(snapshot)
 
-        broker.promote_equity_stop_to_gtc.assert_not_called()
+        broker.replace_day_stop_with_standalone_gtc.assert_not_called()
         engine._close_fractional_residual_position.assert_called_once_with(
             snapshot=snapshot,
             symbol="AAPL",

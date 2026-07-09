@@ -743,7 +743,7 @@ For **Operator Controls Phase C** this means:
 
 - **Destructive commands** (`reduce-position` / `close-position` / `cancel-position-orders`) write rows into `position_lifecycle_orders` with `origin_kind='operator'` and `operator_command_uid` set. Both columns exist on the per-order table today (foundation §6.2). **They do NOT need to be added to `trades`** — an earlier Phase A "deferred items" entry that listed these as future `trades` columns is superseded by the foundation.
 - **Symbol-level locks** already exist as durable DB constraints: `uniq_one_active_position_per_owner_key` (no second non-terminal entry per owner_key) and `uniq_one_active_close_per_position` (no second non-terminal close per position) per foundation §6.2. Phase C wraps these with a thin in-memory `SymbolLockRegistry` (`engine/symbol_locks.py`) that fails fast with audit context before the broker submit; the DB constraints remain authoritative.
-- **Stop cancel/recreate** for operator-driven closes uses the existing `replaces_order_id` mechanism (foundation §10.3, already wired for the GTC-promotion path).
+- **Stop cancel/recreate** for operator-driven closes uses the existing protective-stop substrate rows; broker-supported replacements use `replaces_order_id` per foundation §10.3. Alpaca-verified 2026-07-09: capped equity OTO DAY children are canceled/rebuilt as standalone GTC stops, not TIF-promoted in place.
 - The `Position.position_uid` in-memory field originally deferred to Phase C is **confirmed obsolete** — `apply_order_event` carries `position_uid` through the substrate; Phase C handlers query the lifecycle store directly and never need it on `Position`.
 
 **Phase C confirmed shipped — what landed:**

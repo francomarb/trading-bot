@@ -350,10 +350,10 @@ class TestInsertPending:
         pos_store: PositionLifecycleStore,
         orders_store: PositionLifecycleOrdersStore,
     ):
-        """PR #47's GTC promotion creates a replacement_stop row.
-        Both the original and the replacement can be non-terminal
-        for a brief window — PR #59 R8-1's note about replacement
-        being an intentional second-stop pattern."""
+        """Broker-supported replacements can create replacement_stop rows.
+        Both the original and the replacement can be non-terminal for a brief
+        window. Alpaca-verified 2026-07-09: capped equity OTO DAY children
+        are cancel/rebuilt as standalone protective_stop rows instead."""
         uid = _seed_position(pos_store)
         orders_store.insert_pending(
             position_uid=uid,

@@ -702,9 +702,11 @@ class AlpacaBroker:
 
           - role='protective_stop' (P-4): bracket OTO child,
             fractional standalone GTC, repair flow.
-          - role='replacement_stop' (P-5): GTC promotion of an OTO
-            child via Alpaca's replace_order_by_id. replaces_order_id
-            carries the id of the row this one supersedes.
+          - role='replacement_stop' (P-5): broker-supported stop
+            replacements such as option trailing-stop ratchets.
+            Alpaca-verified 2026-07-09: equity OTO children are not
+            promoted by changing time_in_force; those are canceled
+            and rebuilt as standalone GTC protective_stop rows.
 
         POST-submit semantics — the broker stop is already live when
         this runs. Any IntegrityError / FK / I/O failure here is
@@ -1739,6 +1741,11 @@ class AlpacaBroker:
         stop_leg_details = self._find_stop_leg_details(order)
         if stop_leg_details is not None:
             stop_oid, stop_cli = stop_leg_details
+            entry_tif = (
+                order_request.time_in_force.value
+                if hasattr(order_request.time_in_force, "value")
+                else str(order_request.time_in_force)
+            )
             self._lifecycle_orders_record_protective_stop(
                 position_uid=position_uid,
                 client_order_id=stop_cli,
@@ -1747,6 +1754,7 @@ class AlpacaBroker:
                 qty=float(decision.qty),
                 parent_order_id=order_id,
                 order_class="oto",
+                time_in_force=entry_tif,
             )
 
         # Bind the real Alpaca order ID back to the pre-submit watch so either
@@ -1783,22 +1791,33 @@ class AlpacaBroker:
             and result.status is OrderStatus.FILLED
         ):
             try:
-                # P-5: pass position_uid through so the substrate
-                # records the replacement_stop row with the lineage
-                # back to the OTO child being promoted.
-                self.promote_equity_stop_to_gtc(
-                    parent_order_id=order_id,
+                if capped_stop_leg_id is None:
+                    parent = self._with_retry(
+                        lambda: self._api.get_order_by_id(
+                            order_id,
+                            GetOrderByIdRequest(nested=True),
+                        ),
+                        op_desc=f"get_nested_order({order_id})",
+                    )
+                    capped_stop_leg_id = self._find_stop_leg_id(parent)
+                # Alpaca-verified 2026-07-09: OTO child stops cannot be
+                # promoted in-place by changing time_in_force. Rebuild the
+                # durable protection as a standalone GTC stop after the DAY
+                # child is live and the entry fill is confirmed.
+                self.replace_day_stop_with_standalone_gtc(
+                    symbol=decision.symbol,
                     stop_order_id=capped_stop_leg_id,
                     qty=result.filled_qty,
                     stop_price=decision.stop_price,
+                    client_order_id_prefix="equity-stop-gtc",
                     position_uid=position_uid,
                 )
             except Exception as exc:
                 # The entry is already filled. Preserve the truthful fill result
-                # and let engine reconciliation retry promotion immediately.
+                # and let engine reconciliation retry durable-stop rebuild.
                 logger.error(
                     f"{decision.symbol}: capped entry filled but attached stop "
-                    f"GTC promotion failed: {exc}"
+                    f"GTC rebuild failed: {exc}"
                 )
         # Lifecycle: best-effort fill transition. Returns the result
         # with position_uid attached so the engine can pass it to
@@ -2617,90 +2636,53 @@ class AlpacaBroker:
         )
         return self._to_open_order(order)
 
-    def promote_equity_stop_to_gtc(
+    def replace_day_stop_with_standalone_gtc(
         self,
         *,
-        parent_order_id: str | None,
-        stop_order_id: str | None,
+        symbol: str,
+        stop_order_id: str,
         qty: float,
         stop_price: float,
         client_order_id_prefix: str = "equity-stop-gtc",
         position_uid: str | None = None,
     ) -> OpenOrder:
-        """Promote an activated equity OTO child stop to durable GTC.
+        """Replace an attached DAY stop with a standalone GTC stop.
 
-        P-5: when ``position_uid`` is supplied, the replacement is
-        recorded in the substrate as a ``replacement_stop`` row with
-        replaces_order_id = old stop id, so apply_order_event can
-        resolve 'this stop supersedes that one' on subsequent fill
-        / cancel events. Callers without the uid (legacy tests) pass
-        None and the substrate write is skipped — the broker order
-        still goes out.
+        Verified against Alpaca docs/SDK on 2026-07-09: advanced OTO child
+        orders cannot be promoted by changing ``time_in_force`` via replace.
+        Alpaca documents OTO replacement as unsupported, and paper rejected
+        this exact PATCH with "time_in_force cannot be changed for advanced
+        orders". Rebuild the protection as cancel-child + simple GTC stop.
         """
         whole_qty = int(qty)
         if whole_qty < 1 or abs(float(qty) - whole_qty) > 1e-9:
             raise BrokerError(
-                f"equity stop promotion requires positive whole-share qty: {qty}"
+                f"equity stop rebuild requires positive whole-share qty: {qty}"
             )
         if stop_price <= 0:
             raise BrokerError(
-                f"equity stop promotion requires positive stop price: {stop_price}"
+                f"equity stop rebuild requires positive stop price: {stop_price}"
             )
-        resolved_stop_id = stop_order_id
-        if resolved_stop_id is None:
-            if not parent_order_id:
-                raise BrokerError(
-                    "equity stop promotion requires parent or child order id"
-                )
-            parent = self._with_retry(
-                lambda: self._api.get_order_by_id(
-                    parent_order_id,
-                    GetOrderByIdRequest(nested=True),
-                ),
-                op_desc=f"get_nested_order({parent_order_id})",
-            )
-            resolved_stop_id = self._find_stop_leg_id(parent)
-        if resolved_stop_id is None:
-            raise BrokerError(
-                f"no attached stop leg found for parent order {parent_order_id}"
-            )
+        if not stop_order_id:
+            raise BrokerError("equity stop rebuild requires existing stop order id")
 
-        client_order_id = f"{client_order_id_prefix}-{uuid.uuid4().hex[:10]}"
-        request = ReplaceOrderRequest(
-            qty=whole_qty,
-            time_in_force=TimeInForce.GTC,
-            stop_price=round(stop_price, 2),
-            client_order_id=client_order_id,
-        )
         logger.warning(
-            f"promoting equity stop {resolved_stop_id} to GTC: "
-            f"sell {whole_qty} @ ${stop_price:.2f}"
+            f"rebuilding DAY protective stop {stop_order_id} as standalone GTC: "
+            f"sell {whole_qty} {symbol} @ ${stop_price:.2f}"
         )
-        replacement = self._with_retry(
-            lambda: self._api.replace_order_by_id(resolved_stop_id, request),
-            op_desc=f"promote_equity_stop_to_gtc({resolved_stop_id})",
-        )
+        if not self.cancel_order(stop_order_id):
+            raise BrokerError(
+                f"could not cancel DAY protective stop {stop_order_id}"
+            )
         if self._stream_manager is not None:
-            self._stream_manager.unregister_stop_leg(resolved_stop_id)
-        self._register_standalone_stop_leg(replacement)
-        # P-5: record the replacement_stop substrate row. order_class
-        # ='simple' (the promoted stop is standalone GTC, not an OTO
-        # child anymore); parent_order_id=None for the same reason;
-        # replaces_order_id ties the new row to the OTO child it
-        # superseded so apply_order_event can resolve the lineage
-        # when the old stop's terminal events arrive.
-        self._lifecycle_orders_record_stop(
+            self._stream_manager.unregister_stop_leg(stop_order_id)
+        return self.place_protective_stop(
+            symbol=symbol,
+            qty=whole_qty,
+            stop_price=stop_price,
+            client_order_id_prefix=client_order_id_prefix,
             position_uid=position_uid,
-            role="replacement_stop",
-            client_order_id=client_order_id,
-            broker_order_id=str(replacement.id),
-            stop_price=float(stop_price),
-            qty=float(whole_qty),
-            parent_order_id=None,
-            order_class="simple",
-            replaces_order_id=resolved_stop_id,
         )
-        return self._to_open_order(replacement)
 
     def submit_option_gtc_stop(
         self,
@@ -3052,8 +3034,10 @@ class AlpacaBroker:
                 leg_side.value if hasattr(leg_side, "value") else str(leg_side)
                 if leg_side is not None else None
             )
-            if leg_id is not None and leg_type_val in {"stop", "stop_limit"} and (
-                leg_side_val in {None, "sell"}
+            if (
+                leg_id is not None
+                and leg_type_val in {"stop", "stop_limit"}
+                and leg_side_val in {None, "sell"}
             ):
                 return str(leg_id)
         return None

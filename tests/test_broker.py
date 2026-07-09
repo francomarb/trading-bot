@@ -973,25 +973,19 @@ class TestEntryMaxPriceCap:
         assert req.order_class.value == "oto"
         assert req.stop_loss.stop_price == 210.0
 
-    def test_filled_capped_entry_promotes_attached_stop_to_gtc(self):
+    def test_filled_capped_entry_rebuilds_attached_stop_as_gtc(self):
         api = MagicMock()
         stop_leg = SimpleNamespace(
             id="day-stop-1",
             type="stop",
             side="sell",
         )
-        api.submit_order.return_value = _alpaca_order(
+        entry_order = _alpaca_order(
             id="entry-1",
             status="accepted",
             legs=[stop_leg],
         )
-        api.get_order_by_id.return_value = _alpaca_order(
-            id="entry-1",
-            status="filled",
-            filled_qty=10,
-            filled_avg_price=100.5,
-        )
-        api.replace_order_by_id.return_value = _alpaca_order(
+        gtc_stop = _alpaca_order(
             id="gtc-stop-1",
             status="accepted",
             side="sell",
@@ -999,6 +993,13 @@ class TestEntryMaxPriceCap:
             type="stop",
             stop_price="95.0",
             time_in_force="gtc",
+        )
+        api.submit_order.side_effect = [entry_order, gtc_stop]
+        api.get_order_by_id.return_value = _alpaca_order(
+            id="entry-1",
+            status="filled",
+            filled_qty=10,
+            filled_avg_price=100.5,
         )
         broker = _broker_with_mock(api)
 
@@ -1009,19 +1010,33 @@ class TestEntryMaxPriceCap:
         )
 
         assert result.status is OrderStatus.FILLED
-        stop_id, req = api.replace_order_by_id.call_args.args
-        assert stop_id == "day-stop-1"
-        assert req.qty == 10
-        assert req.time_in_force.value == "gtc"
-        assert req.stop_price == 95.0
+        api.replace_order_by_id.assert_not_called()
+        api.cancel_order_by_id.assert_called_once_with("day-stop-1")
+        stop_req = api.submit_order.call_args_list[1].args[0]
+        assert stop_req.symbol == "AAPL"
+        assert stop_req.qty == 10
+        assert stop_req.side.value == "sell"
+        assert stop_req.type.value == "stop"
+        assert stop_req.time_in_force.value == "gtc"
+        assert stop_req.stop_price == 95.0
 
-    def test_promotion_resolves_child_from_nested_parent_when_submit_omits_legs(self):
+    def test_rebuild_resolves_child_from_nested_parent_when_submit_omits_legs(self):
         api = MagicMock()
-        api.submit_order.return_value = _alpaca_order(
+        entry_order = _alpaca_order(
             id="entry-1",
             status="accepted",
             legs=None,
         )
+        gtc_stop = _alpaca_order(
+            id="gtc-stop-1",
+            status="accepted",
+            side="sell",
+            qty=10,
+            type="stop",
+            stop_price="95.0",
+            time_in_force="gtc",
+        )
+        api.submit_order.side_effect = [entry_order, gtc_stop]
         filled = _alpaca_order(
             id="entry-1",
             status="filled",
@@ -1034,15 +1049,6 @@ class TestEntryMaxPriceCap:
             legs=[SimpleNamespace(id="day-stop-1", type="stop", side="sell")],
         )
         api.get_order_by_id.side_effect = [filled, nested]
-        api.replace_order_by_id.return_value = _alpaca_order(
-            id="gtc-stop-1",
-            status="accepted",
-            side="sell",
-            qty=10,
-            type="stop",
-            stop_price="95.0",
-            time_in_force="gtc",
-        )
         broker = _broker_with_mock(api)
 
         result = broker.place_order(
@@ -1055,9 +1061,10 @@ class TestEntryMaxPriceCap:
         nested_call = api.get_order_by_id.call_args_list[1]
         assert nested_call.args[0] == "entry-1"
         assert nested_call.args[1].nested is True
-        assert api.replace_order_by_id.call_args.args[0] == "day-stop-1"
+        api.replace_order_by_id.assert_not_called()
+        api.cancel_order_by_id.assert_called_once_with("day-stop-1")
 
-    def test_promotion_failure_preserves_truthful_filled_result(self):
+    def test_rebuild_failure_preserves_truthful_filled_result(self):
         api = MagicMock()
         api.submit_order.return_value = _alpaca_order(
             id="entry-1",
@@ -1070,7 +1077,7 @@ class TestEntryMaxPriceCap:
             filled_qty=10,
             filled_avg_price=100.5,
         )
-        api.replace_order_by_id.side_effect = RuntimeError("replace unavailable")
+        api.cancel_order_by_id.side_effect = RuntimeError("cancel unavailable")
         broker = _broker_with_mock(api)
 
         result = broker.place_order(
@@ -1082,24 +1089,18 @@ class TestEntryMaxPriceCap:
         assert result.status is OrderStatus.FILLED
         assert result.filled_qty == 10
 
-    def test_stream_confirmed_capped_fill_also_promotes_stop(self):
+    def test_stream_confirmed_capped_fill_also_rebuilds_stop(self):
         api = MagicMock()
         stream = MagicMock()
         stream_event = MagicMock()
         stream_event.wait.return_value = True
         stream.watch.return_value = stream_event
-        api.submit_order.return_value = _alpaca_order(
+        entry_order = _alpaca_order(
             id="entry-1",
             status="accepted",
             legs=[SimpleNamespace(id="day-stop-1", type="stop", side="sell")],
         )
-        stream.get_update.return_value = _stream_update(
-            order_id="entry-1",
-            event="fill",
-            filled_qty=10,
-            filled_avg_price=100.5,
-        )
-        api.replace_order_by_id.return_value = _alpaca_order(
+        gtc_stop = _alpaca_order(
             id="gtc-stop-1",
             status="accepted",
             side="sell",
@@ -1107,6 +1108,13 @@ class TestEntryMaxPriceCap:
             type="stop",
             stop_price="95.0",
             time_in_force="gtc",
+        )
+        api.submit_order.side_effect = [entry_order, gtc_stop]
+        stream.get_update.return_value = _stream_update(
+            order_id="entry-1",
+            event="fill",
+            filled_qty=10,
+            filled_avg_price=100.5,
         )
         broker = AlpacaBroker(
             client=api,
@@ -1122,11 +1130,12 @@ class TestEntryMaxPriceCap:
         )
 
         assert result.status is OrderStatus.FILLED
-        assert api.replace_order_by_id.call_args.args[0] == "day-stop-1"
+        api.replace_order_by_id.assert_not_called()
+        api.cancel_order_by_id.assert_called_once_with("day-stop-1")
         stream.unregister_stop_leg.assert_called_once_with("day-stop-1")
         stream.register_stop_leg.assert_called_once_with("gtc-stop-1")
 
-    def test_partial_capped_fill_defers_promotion_to_reconciliation(self):
+    def test_partial_capped_fill_defers_rebuild_to_reconciliation(self):
         api = MagicMock()
         api.submit_order.return_value = _alpaca_order(
             id="entry-1",
@@ -1149,8 +1158,9 @@ class TestEntryMaxPriceCap:
 
         assert result.status is OrderStatus.PARTIAL
         api.replace_order_by_id.assert_not_called()
+        api.cancel_order_by_id.assert_not_called()
 
-    def test_non_capped_entry_does_not_promote_gtc_oto_stop(self):
+    def test_non_capped_entry_does_not_rebuild_gtc_oto_stop(self):
         api = MagicMock()
         api.submit_order.return_value = _alpaca_order(
             id="entry-1",
@@ -1172,6 +1182,7 @@ class TestEntryMaxPriceCap:
         )
 
         api.replace_order_by_id.assert_not_called()
+        api.cancel_order_by_id.assert_not_called()
 
     def test_fractional_market_with_cap_is_floored_then_capped(self):
         """
@@ -3183,6 +3194,7 @@ class TestProtectiveStopSubstrate:
         assert kwargs["side"] == "sell"
         assert kwargs["order_type"] == "stop"
         assert kwargs["order_class"] == "oto"
+        assert kwargs["time_in_force"] == "gtc"
         assert kwargs["intended_stop_price"] == 95.5
         assert kwargs["intended_qty"] == 10.0
         assert kwargs["parent_order_id"] == "alpaca-entry-1"
@@ -3194,6 +3206,51 @@ class TestProtectiveStopSubstrate:
         ]
         assert len(attach_calls) == 1
         assert attach_calls[0].kwargs["order_id"] == "alpaca-stop-1"
+
+    def test_capped_day_oto_entry_writes_day_protective_stop_row(self):
+        """Capped entries submit DAY + OTO; the substrate must record
+        the broker child's actual TIF instead of assuming durable GTC."""
+        from types import SimpleNamespace
+        api = MagicMock()
+        entry = _alpaca_order(id="alpaca-entry-day", status="accepted")
+        entry.legs = [SimpleNamespace(
+            id="alpaca-stop-day",
+            client_order_id="alpaca-cli-stop-day",
+            type=SimpleNamespace(value="stop"),
+            side=SimpleNamespace(value="sell"),
+        )]
+        gtc_stop = _alpaca_order(
+            id="alpaca-stop-gtc",
+            status="accepted",
+            side="sell",
+            type="stop",
+            stop_price="95.5",
+            qty=10,
+            time_in_force="gtc",
+        )
+        api.submit_order.side_effect = [entry, gtc_stop]
+        api.get_order_by_id.return_value = _alpaca_order(
+            id="alpaca-entry-day",
+            status="filled",
+            filled_qty=10,
+            filled_avg_price=100.5,
+        )
+        orders_store = MagicMock()
+        broker = self._broker(api, orders_store)
+
+        broker.place_order(
+            _decision(stop=95.5, entry_max_price=105.0),
+            poll_timeout=0.0,
+            poll_interval=0.0,
+        )
+
+        stop_call = [
+            c for c in orders_store.insert_pending.call_args_list
+            if c.kwargs["role"] == "protective_stop"
+            and c.kwargs["client_order_id"] == "alpaca-cli-stop-day"
+        ][0]
+        assert stop_call.kwargs["order_class"] == "oto"
+        assert stop_call.kwargs["time_in_force"] == "day"
 
     def test_bracket_oto_without_stop_leg_skips_substrate_write(self):
         """Defensive: if order.legs is empty (malformed broker
@@ -3327,14 +3384,13 @@ class TestProtectiveStopSubstrate:
         assert result is not None
 
 
-# ── P-5 (consumer wiring): replacement_stop substrate insert ───────────────
+# ── Alpaca-safe DAY child rebuild: cancel + standalone GTC stop ────────────
 
 
-class TestReplacementStopSubstrate:
-    """P-5: promote_equity_stop_to_gtc records a `replacement_stop`
-    substrate row with replaces_order_id pointing at the old OTO
-    child it superseded. apply_order_event uses that lineage to
-    resolve terminal events for either id."""
+class TestDayStopRebuildSubstrate:
+    """Alpaca-verified 2026-07-09: attached OTO child stops cannot be
+    promoted to GTC by PATCHing time_in_force. The safe durability path
+    is cancel the DAY child and submit a standalone simple GTC stop."""
 
     @staticmethod
     def _broker(api: MagicMock, orders_store: MagicMock):
@@ -3347,7 +3403,7 @@ class TestReplacementStopSubstrate:
         return broker
 
     @staticmethod
-    def _replacement_order(*, id: str, cli: str):
+    def _gtc_stop(*, id: str, cli: str):
         from types import SimpleNamespace
         return SimpleNamespace(
             id=id,
@@ -3366,65 +3422,60 @@ class TestReplacementStopSubstrate:
             legs=None,
         )
 
-    def test_promote_with_position_uid_records_replacement_stop(self):
+    def test_rebuild_with_position_uid_records_simple_gtc_protective_stop(self):
         api = MagicMock()
-        api.replace_order_by_id.return_value = self._replacement_order(
-            id="alpaca-replace-1", cli="cli-replace-1",
+        api.submit_order.return_value = self._gtc_stop(
+            id="alpaca-gtc-1", cli="cli-gtc-1",
         )
         orders_store = MagicMock()
         broker = self._broker(api, orders_store)
 
-        broker.promote_equity_stop_to_gtc(
-            parent_order_id=None,
+        broker.replace_day_stop_with_standalone_gtc(
+            symbol="AAPL",
             stop_order_id="alpaca-oto-child-7",
             qty=10,
             stop_price=95.0,
             position_uid="pos-A",
         )
 
-        # insert_pending called with role='replacement_stop' and the
-        # lineage link populated.
+        api.cancel_order_by_id.assert_called_once_with("alpaca-oto-child-7")
+        api.replace_order_by_id.assert_not_called()
         stop_call = [
             c for c in orders_store.insert_pending.call_args_list
-            if c.kwargs.get("role") == "replacement_stop"
+            if c.kwargs.get("role") == "protective_stop"
         ][0]
         kwargs = stop_call.kwargs
         assert kwargs["position_uid"] == "pos-A"
         assert kwargs["side"] == "sell"
         assert kwargs["order_type"] == "stop"
         assert kwargs["order_class"] == "simple"
+        assert kwargs["time_in_force"] == "gtc"
         assert kwargs["intended_stop_price"] == 95.0
         assert kwargs["intended_qty"] == 10.0
         assert kwargs["parent_order_id"] is None
-        # The critical field: the new row knows which order it
-        # supersedes.
-        assert kwargs["replaces_order_id"] == "alpaca-oto-child-7"
+        assert kwargs["replaces_order_id"] is None
 
-        # attach_broker_order_id called with the replacement's id.
         attach_calls = [
             c for c in orders_store.attach_broker_order_id.call_args_list
             if c.kwargs.get("client_order_id", "").startswith("equity-stop-gtc-")
-            or c.kwargs.get("client_order_id") == "cli-replace-1"
         ]
-        # Whichever client_order_id format the broker generated, the
-        # attach should have happened for the replacement.
         assert any(
-            c.kwargs.get("order_id") == "alpaca-replace-1"
+            c.kwargs.get("order_id") == "alpaca-gtc-1"
             for c in attach_calls
         )
 
-    def test_promote_without_position_uid_skips_substrate_write(self):
+    def test_rebuild_without_position_uid_skips_substrate_write(self):
         """Legacy callers without position_uid get the same broker
         behavior; substrate write is just skipped."""
         api = MagicMock()
-        api.replace_order_by_id.return_value = self._replacement_order(
-            id="alpaca-replace-2", cli="cli-replace-2",
+        api.submit_order.return_value = self._gtc_stop(
+            id="alpaca-gtc-2", cli="cli-gtc-2",
         )
         orders_store = MagicMock()
         broker = self._broker(api, orders_store)
 
-        broker.promote_equity_stop_to_gtc(
-            parent_order_id=None,
+        broker.replace_day_stop_with_standalone_gtc(
+            symbol="AAPL",
             stop_order_id="alpaca-oto-child-8",
             qty=10,
             stop_price=95.0,
@@ -3434,23 +3485,23 @@ class TestReplacementStopSubstrate:
             c.kwargs.get("role")
             for c in orders_store.insert_pending.call_args_list
         ]
-        assert "replacement_stop" not in roles
+        assert "protective_stop" not in roles
 
-    def test_substrate_failure_does_not_abort_promotion(self):
+    def test_substrate_failure_does_not_abort_rebuild(self):
         """POST-submit semantics: substrate insert raising must not
-        crash the broker promotion path. The replacement is already
+        crash the broker rebuild path. The standalone stop is already
         live at Alpaca."""
         api = MagicMock()
-        api.replace_order_by_id.return_value = self._replacement_order(
-            id="alpaca-replace-3", cli="cli-replace-3",
+        api.submit_order.return_value = self._gtc_stop(
+            id="alpaca-gtc-3", cli="cli-gtc-3",
         )
         orders_store = MagicMock()
         orders_store.insert_pending.side_effect = RuntimeError("substrate down")
         broker = self._broker(api, orders_store)
 
         # Does NOT raise.
-        result = broker.promote_equity_stop_to_gtc(
-            parent_order_id=None,
+        result = broker.replace_day_stop_with_standalone_gtc(
+            symbol="AAPL",
             stop_order_id="alpaca-oto-child-9",
             qty=10,
             stop_price=95.0,
