@@ -608,10 +608,10 @@ class TradingEngine:
         # {entry,exit}_fill fires the engine-side side effects on
         # each captured fill.
 
-        # DAY-stop promotion is retried from every broker snapshot, but a
+        # DAY-stop rebuild is retried from every broker snapshot, but a
         # persistent rejection should count as one broker incident rather than
         # tripping the rolling broker-error halt on the same order each cycle.
-        self._reported_stop_promotion_failures: set[tuple[str, str]] = set()
+        self._reported_stop_rebuild_failures: set[tuple[str, str]] = set()
 
         # Startup mode set by _reconcile_startup. NORMAL → full trading.
         # RESTRICTED → exits only (one cycle, then auto-clears to NORMAL).
@@ -2854,30 +2854,31 @@ class TradingEngine:
         existing = self._protective_stop_order(symbol, snapshot)
         if existing is not None:
             if str(existing.time_in_force or "").lower() == "day":
-                # P-5: look up position_uid for the replacement_stop
-                # substrate row.
-                _promote_uid: str | None = None
+                # Alpaca-verified 2026-07-09: attached OTO child stops
+                # cannot be promoted in place by changing time_in_force.
+                # Rebuild durable protection as a standalone GTC stop.
+                _rebuild_uid: str | None = None
                 if self.lifecycle_store is not None:
                     try:
                         _row = self.lifecycle_store.get_open_for_owner_key(
                             owner_key_for(symbol),
                         )
                         if _row is not None:
-                            _promote_uid = _row.position_uid
+                            _rebuild_uid = _row.position_uid
                     except Exception as exc:
                         logger.debug(
-                            f"promote-stop position_uid lookup raised "
+                            f"rebuild-stop position_uid lookup raised "
                             f"{type(exc).__name__}: {exc} — proceeding"
                         )
-                promoted = self.broker.promote_equity_stop_to_gtc(
-                    parent_order_id=None,
+                promoted = self.broker.replace_day_stop_with_standalone_gtc(
+                    symbol=symbol,
                     stop_order_id=existing.order_id,
                     qty=abs(int(position.qty)),
                     stop_price=float(existing.stop_price),
                     client_order_id_prefix=(
                         f"{decision.strategy_name}-recover-stop-gtc"
                     ),
-                    position_uid=_promote_uid,
+                    position_uid=_rebuild_uid,
                 )
                 snapshot.open_orders.remove(existing)
                 snapshot.open_orders.append(promoted)
@@ -6702,48 +6703,49 @@ class TradingEngine:
                     else:
                         logger.debug(
                             f"{symbol}: deferring fractional residual cleanup "
-                            "and DAY-stop promotion until a market-open cycle"
+                            "and DAY-stop rebuild until a market-open cycle"
                         )
                     continue
                 failure_key = (symbol, existing.order_id)
-                # P-5: look up position_uid for the replacement_stop
-                # substrate row.
-                _promote_uid: str | None = None
+                # Alpaca-verified 2026-07-09: OTO child TIF cannot be
+                # replaced in place, so look up position_uid for the
+                # standalone GTC stop row created by the rebuild.
+                _rebuild_uid: str | None = None
                 if self.lifecycle_store is not None:
                     try:
                         _row = self.lifecycle_store.get_open_for_owner_key(
                             owner_key_for(symbol),
                         )
                         if _row is not None:
-                            _promote_uid = _row.position_uid
+                            _rebuild_uid = _row.position_uid
                     except Exception as exc:
                         logger.debug(
-                            f"repair-promote position_uid lookup raised "
+                            f"repair-rebuild position_uid lookup raised "
                             f"{type(exc).__name__}: {exc} — proceeding"
                         )
                 try:
-                    promoted = self.broker.promote_equity_stop_to_gtc(
-                        parent_order_id=None,
+                    promoted = self.broker.replace_day_stop_with_standalone_gtc(
+                        symbol=symbol,
                         stop_order_id=existing.order_id,
                         qty=stop_qty,
                         stop_price=float(existing.stop_price),
                         client_order_id_prefix=f"{owner}-repair-stop-gtc",
-                        position_uid=_promote_uid,
+                        position_uid=_rebuild_uid,
                     )
-                    self._reported_stop_promotion_failures.discard(failure_key)
+                    self._reported_stop_rebuild_failures.discard(failure_key)
                     snapshot.open_orders.remove(existing)
                     snapshot.open_orders.append(promoted)
                     logger.warning(
-                        f"{symbol}: promoted DAY protective stop "
-                        f"{existing.order_id} to GTC as {promoted.order_id}"
+                        f"{symbol}: rebuilt DAY protective stop "
+                        f"{existing.order_id} as standalone GTC {promoted.order_id}"
                     )
                 except Exception as e:
                     msg = (
-                        f"{symbol}: failed to promote DAY protective stop "
-                        f"{existing.order_id} to GTC: {e}"
+                        f"{symbol}: failed to rebuild DAY protective stop "
+                        f"{existing.order_id} as standalone GTC: {e}"
                     )
-                    if failure_key not in self._reported_stop_promotion_failures:
-                        self._reported_stop_promotion_failures.add(failure_key)
+                    if failure_key not in self._reported_stop_rebuild_failures:
+                        self._reported_stop_rebuild_failures.add(failure_key)
                         logger.error(msg)
                         self.risk.record_broker_error()
                         self.alerts.broker_error(msg)

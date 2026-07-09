@@ -327,7 +327,7 @@ A position has at most one identity (`position_uid`), one position-level status 
 | `entry_primary` | always |
 | `entry_residual` | PR #58 hybrid |
 | `protective_stop` | always for equities (attached OTO) |
-| `replacement_stop` | after GTC promotion (PR #47) or trail-driven replacement (option trailing) |
+| `replacement_stop` | broker-supported stop replacement, such as trail-driven option replacement |
 | `exit` | every signal exit or operator-issued close |
 | `partial_close` | every reduce-position operation |
 
@@ -429,9 +429,10 @@ CREATE UNIQUE INDEX uniq_one_entry_primary_per_position
 -- `_has_pending_close_order()` snapshot check — both are in-memory and
 -- restart-volatile. PR #59 review-7 finding P1: foundation makes this
 -- a durable constraint enforced by the database. Stop-side roles
--- (protective_stop, replacement_stop) are NOT included — replacement_stop
--- is an intentional second-stop pattern (PR #47 GTC promotion) and
--- protective_stop is OTO-paired with the entry, not a competing close.
+-- (protective_stop, replacement_stop) are NOT included —
+-- replacement_stop is an intentional broker-supported stop-replacement
+-- pattern and protective_stop is OTO-paired with the entry or a
+-- standalone rebuilt stop, not a competing close.
 CREATE UNIQUE INDEX uniq_one_active_close_per_position
     ON position_lifecycle_orders(position_uid)
     WHERE role IN ('exit', 'partial_close')
@@ -1007,7 +1008,7 @@ The `role` column in `position_lifecycle_orders` is an open enum (§6.2). The fo
 |---|---|---|---|
 | `entry_primary` | ✅ Wired | Foundation PR. `_lifecycle_begin` already creates the pending row; foundation adds `apply_order_event` for all status transitions. | Immediately on merge. |
 | `protective_stop` | ✅ Wired | Foundation PR. The OTO child stop attached at submit becomes its own per-order row with `parent_order_id = entry_primary.order_id`. | Immediately on merge. |
-| `replacement_stop` | ✅ Wired | Foundation PR. PR #47's GTC-promotion path ([broker.py:1289 region](../execution/broker.py:1289)) already replaces a DAY child with a GTC; foundation writes the replacement as a new per-order row with `replaces_order_id = previous_stop.order_id`. | Immediately on merge. |
+| `replacement_stop` | ✅ Wired | Foundation PR. Broker-supported replacement paths such as option trailing-stop ratchets write the replacement as a new per-order row with `replaces_order_id = previous_stop.order_id`. Alpaca-verified 2026-07-09: capped equity OTO DAY children are not TIF-promoted through this role; they are canceled and rebuilt as standalone `protective_stop` rows. | Immediately on merge. |
 | `exit` | ✅ Wired | Foundation PR. Every `_log_close` / `_close_lifecycle_for_owner_key` path produces an `exit` per-order row. | Immediately on merge. |
 | `entry_residual` | 🟡 Schema-only | PR #58 rebuild. Enum value exists; no writer in foundation. | When PR #58 rebuild wires Donchian hybrid. Until then no current strategy needs this role. |
 | `partial_close` | ✅ Wired | Operator Controls Phase C (PR #66, merged 2026-06-16). `reduce-position` writes a `partial_close` per-order row tagged `origin_kind='operator'` + `operator_command_uid` via `broker.close_position(partial_qty=...)`. | Immediately on PR #66 merge. No bot-originated path creates partial closes; only the operator queue does. |
@@ -1086,17 +1087,18 @@ This matrix is the **implementation PR's migration checklist**. Every row should
 | **Tests that survive** | PR #53's R0–R2 acceptance tests for CIEN-style late-fill recovery, the bounded-history-window test from `e0bedc2` |
 | **Cache removal timing** | After `role='exit'` is verified across stream / cycle / startup paths. Not on day-one of foundation merge |
 
-### 10.3 Protective stop promotion, replacement, and repair
+### 10.3 Protective stop rebuild, replacement, and repair
 
 | Aspect | Detail |
 |---|---|
-| **Workarounds today** | PR #47's DAY-child → GTC promotion with `_reported_stop_promotion_failures` set used as identity workaround (because there's no durable handle to track which stop replaced which); PR #46's option-stop replacement hardening (`d98c801`, `c936c57`, `39e0b94`); inferring "which stop is current" from broker snapshot symbols rather than durable identity |
+| **Alpaca contract check (2026-07-09)** | Alpaca paper rejected `ReplaceOrderRequest(time_in_force=GTC)` on an attached OTO child with `time_in_force cannot be changed for advanced orders`. Current Alpaca docs say OTO replacement is not supported, while bracket/OCO replacement is documented only for price fields. Capped equity entries therefore rebuild durability as cancel attached DAY child → submit standalone simple GTC stop, not in-place TIF promotion. |
+| **Workarounds today** | PR #47's original DAY-child → GTC promotion assumption is retired. The session-local `_reported_stop_rebuild_failures` set now only dedupes repeated cancel/rebuild failures for the same broker child. PR #46's option-stop replacement hardening (`d98c801`, `c936c57`, `39e0b94`) remains separate because option trailing stops are standalone broker-supported replacements. |
 | **Anchor commits** | `3236593`, `1bdf05e` (PR #47 — capped equity stop durability and DAY-to-GTC replacement); `d98c801`, `c936c57`, `39e0b94` (PR #46 option-stop hardening) |
-| **Foundation absorption** | Every attached protective stop becomes a `role='protective_stop'` per-order row with `parent_order_id = entry_primary.order_id`. Every replacement becomes a `role='replacement_stop'` row with both `parent_order_id` (the entry) AND `replaces_order_id` (the stop it replaces). "Which stop currently covers this position?" becomes one query against the orders table. The IDENTITY-WORKAROUND part of `_reported_stop_promotion_failures` goes away — the set previously held inferred `(parent_order_id, child_order_id)` tuples to associate "this child's promotion failed with this parent." With durable per-order identity the set re-keys directly on the failed child's `order_id`. |
-| **Alert-deduplication continuity (PR #59 review-6 finding #5 fix)** | The `_reported_stop_promotion_failures` set still has a legitimate **session-local alert-deduplication** purpose — without it, every cycle's failed promotion attempt alerts again. Foundation does NOT delete the set; it re-keys the entries on the durable `order_id` of the failed replacement-stop row and otherwise leaves the alert suppression behavior unchanged. The set remains an in-memory session cache (alert dedup is session-level, not durable). What the foundation removes is only the IDENTITY workaround (inferring which child belongs to which parent), not the alert suppression itself. |
-| **Preserved operational behavior** | Broker-native replace semantics (Alpaca's `ReplaceOrderRequest` path), bounded alerting on promotion failure, immediate protection repair when a managed position has no broker-side stop, GTC/DAY semantics including the 90-day GTC expiry constraint |
+| **Foundation absorption** | Every attached protective stop becomes a `role='protective_stop'` per-order row with `parent_order_id = entry_primary.order_id` and the child's actual broker TIF. Standalone GTC rebuilds are new simple `protective_stop` rows. Broker-supported replacements such as option trailing ratchets remain `role='replacement_stop'` rows with `replaces_order_id`. |
+| **Alert-deduplication continuity (PR #59 review-6 finding #5 fix)** | The `_reported_stop_rebuild_failures` set has a legitimate **session-local alert-deduplication** purpose — without it, every cycle's failed rebuild attempt alerts again. The set remains an in-memory session cache (alert dedup is session-level, not durable). |
+| **Preserved operational behavior** | Bounded alerting on DAY-stop rebuild failure, immediate protection repair when a managed position has no broker-side stop, truthful GTC/DAY substrate semantics including the 90-day GTC expiry constraint |
 | **Atomic replacement requirement** | A replacement creates a NEW per-order row AND advances the replaced row's status (typically to `canceled`) inside the same transaction. The replacement must NEVER overwrite the identity of the stop it replaces — `replaces_order_id` is the linkage, not a mutation of `order_id` |
-| **Tests that survive** | PR #47's GTC-promotion-after-fill acceptance test, the retry-and-bounded-alerting tests, the GTC/DAY-reconciliation-from-broker-snapshot tests |
+| **Tests that survive** | Capped fill rebuild acceptance tests, retry-and-bounded-alerting tests, truthful DAY/GTC substrate TIF tests, GTC/DAY-reconciliation-from-broker-snapshot tests |
 
 ### 10.4 Option trailing state — split responsibilities
 

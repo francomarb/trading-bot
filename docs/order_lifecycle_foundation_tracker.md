@@ -67,7 +67,7 @@ After PR #60 merged to main on 2026-06-14, the consumer wiring landed on a follo
 | Step | Scope | Doc anchor | Commit(s) | Status |
 |---|---|---|---|---|
 | P-4 | Wire `protective_stop` role: broker OTO child + fractional GTC + repair flow get their own per-order rows | §10.3 | `6883b87` | ✅ |
-| P-5 | Wire `replacement_stop` role: `promote_equity_stop_to_gtc` records lineage via `replaces_order_id` | §10.3 | `f3feaa7` | ✅ |
+| P-5 | Wire `replacement_stop` role for broker-supported replacements with lineage via `replaces_order_id` | §10.3 | `f3feaa7` | ✅ |
 | P-6e | Wire `exit` role: `close_position` records the close substrate row at submit time | §10.3 | `bf3a6e4` | ✅ |
 | P-1 | Wire WebSocket stream → `apply_order_event` via the new `_pending_lifecycle_events` queue + engine cycle drain | §6.4 / §10.1 | `6cd718e` | ✅ |
 | P-2 | Wire cycle reconciliation: per-cycle REST walk of substrate rows whose `order_id` is absent from `snapshot.open_orders`, capped at 20/cycle | §6.4 / §10.1 / §3.1 | `7cb6366` | ✅ |
@@ -132,7 +132,7 @@ Each row from the discovery doc's §10 maps to one or more commits above.
 |---|---|---|---|---|
 | 10.1 | Entry uncertainty / duplicate prevention / pending grace | `_suspect_orders`, broker-open duplicate checks, `LIFECYCLE_PENDING_GRACE_SECONDS` | substrate: 6, 9, 12; consumer wiring: P-1/P-2/P-3; cache delete: P-6 | ✅ |
 | 10.2 | Uncertain single-leg exits | `_suspect_exit_orders` | substrate: 6 + P-6e; consumer wiring: P-1/P-2/P-3; cache delete: P-7 | ✅ |
-| 10.3 | Protective stop promotion / replacement / repair | `_reported_stop_promotion_failures` identity workaround | P-4, P-5 | ✅ |
+| 10.3 | Protective stop rebuild / replacement / repair | `_reported_stop_rebuild_failures` alert-dedupe cache; old promotion identity workaround retired after Alpaca contract check on 2026-07-09 | P-4, P-5 | ✅ |
 | 10.4 | Option trailing state split | `option_trailing_stops.alpaca_stop_order_id` denormalization | shipped on `feat/option-trailing-state-split` (PR #71; 7 feature commits + 3 review-fix commits). Feature: schema FK column (1), options-side P-4/P-5 substrate writes in `submit_option_gtc_stop` / `replace_option_stop` (2), store API + `JoinedOptionTrailingRow` (3 + 5), engine writers populate FK at every `_sync_option_trailing_stops` upsert (4), read-path migration through FK join for `_recent_option_stop_submit_pending` (5), docstring scope shift on `_cleanup_option_trailing_state` (6), store + engine + broker tests + tracker + PLAN (7). Review fixes: `_LIFECYCLE_LOOKUP_FAILED` sentinel + `_resolve_trailing_fk_or_preserve` preservation contract (R1, P1 #2), orphan recovery via `client_order_id` fallback + opportunistic re-attach + load-bearing-miss CRITICAL (R1, P1 #1 partial mitigation), `position_uid` + role guards in `_option_trailing_authoritative_identity` (R2, P2). Strict removal of `alpaca_stop_order_id` / `stop_order_status` columns and Phase 2 consumer migration (dashboard / health monitor) deferred to follow-up cleanup PRs | ✅ |
 | 10.5 | Slippage recovery — preserve provenance | `SuspectOrder.modeled_price_kind` moves to per-order row | 4 (substrate column) + 9 (plumbed from engine through broker) + 11 (UPSERT preservation) | ✅ |
 | 10.6 | Position-level partial-close accounting | (acceptance tests; carries forward unchanged) | 4 (rollup) | ✅ |
