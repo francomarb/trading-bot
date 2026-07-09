@@ -32,6 +32,7 @@ _RAW_SPY = {
     "iv_proxy_source": "vix", "min_iv_proxy": 14, "min_credit_pct_of_width": 0.13,
     "max_concurrent_positions": 3, "max_per_expiration": 1,
     "min_dte_gap_between_opens": 7, "profit_target_pct": 0.50,
+    "trend_sma_buffer_pct": 0.0,
     "stop_loss_multiple": 2.0, "time_stop_dte": 21,
     "exit_on_short_strike_breach": True, "limit_timeout_seconds": 30,
     "earnings_blackout_days": 0,

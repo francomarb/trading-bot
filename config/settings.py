@@ -682,6 +682,7 @@ CREDIT_SPREAD_INSTRUMENTS: dict[str, dict] = {
         "spread_width": 10,
         "dte_min": 30,
         "dte_max": 45,
+        "trend_sma_buffer_pct": 0.00,
         "iv_proxy_source": "vix",
         "min_iv_proxy": 14,                 # VIX index points
         "min_credit_pct_of_width": 0.13,
@@ -699,10 +700,11 @@ CREDIT_SPREAD_INSTRUMENTS: dict[str, dict] = {
         "earnings_blackout_days": 0,
     },
     "QQQ": {
-        "short_leg_delta": 0.17,
+        "short_leg_delta": 0.12,
         "spread_width": 15,                 # higher price → wider strikes
         "dte_min": 30,
         "dte_max": 45,
+        "trend_sma_buffer_pct": 0.01,
         "iv_proxy_source": "vix",           # QQQ tracks SPX closely
         "min_iv_proxy": 14,
         "min_credit_pct_of_width": 0.13,
@@ -720,7 +722,7 @@ CREDIT_SPREAD_INSTRUMENTS: dict[str, dict] = {
 
 # Every CREDIT_SPREAD_INSTRUMENTS block must define exactly these keys.
 _REQUIRED_CREDIT_SPREAD_KEYS: frozenset[str] = frozenset({
-    "short_leg_delta", "spread_width", "dte_min", "dte_max",
+    "short_leg_delta", "spread_width", "dte_min", "dte_max", "trend_sma_buffer_pct",
     "iv_proxy_source", "min_iv_proxy", "min_credit_pct_of_width",
     "max_concurrent_positions", "max_per_expiration", "min_dte_gap_between_opens",
     "profit_target_pct", "stop_loss_multiple", "time_stop_dte",

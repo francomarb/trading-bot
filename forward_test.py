@@ -306,6 +306,7 @@ def main() -> None:
                 edge_filter=CreditSpreadEdgeFilter(
                     iv_proxy_source=_cs_config.iv_proxy_source,
                     min_iv_proxy=_cs_config.min_iv_proxy,
+                    trend_sma_buffer_pct=_cs_config.trend_sma_buffer_pct,
                     earnings_blackout_days=_cs_config.earnings_blackout_days,
                     iv_resolver=_iv_resolver,
                 ),

@@ -79,6 +79,36 @@ class TestTrendGate:
         decision = f(_frame([400.0, 401.0, 402.0]))
         assert decision.latest_allowed is True
 
+    def test_trend_buffer_requires_extra_cushion_above_sma(self):
+        closes = [100.0] * 49 + [100.5]
+        f = CreditSpreadEdgeFilter(
+            iv_proxy_source="vix", min_iv_proxy=14,
+            trend_sma_buffer_pct=0.01,
+            iv_resolver=_stub_resolver(20.0),
+        )
+        f.set_symbol("QQQ")
+        decision = f(_frame(closes))
+        assert decision.latest_allowed is False
+        assert any("1.0% buffer" in r for r in decision.latest_reasons)
+
+    def test_trend_buffer_allows_close_above_required_cushion(self):
+        closes = [100.0] * 49 + [103.0]
+        f = CreditSpreadEdgeFilter(
+            iv_proxy_source="vix", min_iv_proxy=14,
+            trend_sma_buffer_pct=0.01,
+            iv_resolver=_stub_resolver(20.0),
+        )
+        f.set_symbol("QQQ")
+        decision = f(_frame(closes))
+        assert decision.latest_allowed is True
+
+    def test_trend_buffer_must_be_non_negative(self):
+        with pytest.raises(ValueError, match="trend_sma_buffer_pct"):
+            CreditSpreadEdgeFilter(
+                iv_proxy_source="vix", min_iv_proxy=14,
+                trend_sma_buffer_pct=-0.01,
+            )
+
 
 class TestIvGate:
     def test_iv_below_floor_blocks(self):

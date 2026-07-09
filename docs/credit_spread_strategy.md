@@ -52,10 +52,11 @@ compensate for the higher underlying price).
 
 | Parameter | SPY | QQQ | Notes |
 |---|---|---|---|
-| `short_leg_delta` | 0.17 | 0.17 | Sell strike at ~17Δ — well OTM bull put |
+| `short_leg_delta` | 0.17 | 0.12 | QQQ moved farther OTM after paper losses showed 17Δ entries were not high-quality enough |
 | `spread_width` | 10 | 15 | Long strike = short strike − width |
 | `dte_min` | 30 | 30 | Earliest entry expiry |
 | `dte_max` | 45 | 45 | Latest entry expiry |
+| `trend_sma_buffer_pct` | 0.00 | 0.01 | QQQ requires close > 50 SMA by 1%; SPY keeps the original close > 50 SMA gate |
 | `iv_proxy_source` | `vix` | `vix` | QQQ tracks SPX vol closely enough |
 | `min_iv_proxy` | 14 | 14 | VIX must be ≥ 14 for entry (premium floor) |
 | `min_credit_pct_of_width` | 0.13 | 0.13 | Credit ≥ 13% of spread width |
@@ -89,6 +90,7 @@ for _cs_symbol in settings.STRATEGY_WATCHLISTS["credit_spread"]:
             edge_filter=CreditSpreadEdgeFilter(
                 iv_proxy_source=_cs_config.iv_proxy_source,
                 min_iv_proxy=_cs_config.min_iv_proxy,
+                trend_sma_buffer_pct=_cs_config.trend_sma_buffer_pct,
                 earnings_blackout_days=_cs_config.earnings_blackout_days,
                 iv_resolver=_iv_resolver,
             ),
@@ -533,6 +535,7 @@ CREDIT_SPREAD_INSTRUMENTS = {
         "spread_width": 10,
         "dte_min": 30,
         "dte_max": 45,
+        "trend_sma_buffer_pct": 0.00,
         "iv_proxy_source": "vix",
         "min_iv_proxy": 14,
         "min_credit_pct_of_width": 0.25,
@@ -553,10 +556,11 @@ CREDIT_SPREAD_INSTRUMENTS = {
         "earnings_blackout_days": 0,  # ETF, no earnings
     },
     "QQQ": {
-        "short_leg_delta": 0.17,
+        "short_leg_delta": 0.12,
         "spread_width": 15,           # higher price → wider strikes
         "dte_min": 30,
         "dte_max": 45,
+        "trend_sma_buffer_pct": 0.01,
         "iv_proxy_source": "vix",     # QQQ tracks SPX closely
         "min_iv_proxy": 14,
         "min_credit_pct_of_width": 0.25,
@@ -609,6 +613,7 @@ CREDIT_SPREAD_RANKER_WEIGHTS = {
 | Knob | Higher value → effect |
 |---|---|
 | `short_leg_delta` | More credit per trade, lower win rate, larger losers |
+| `trend_sma_buffer_pct` | Trade less; require more cushion above the 50 SMA before selling puts |
 | `spread_width` | Bigger absolute credit & max loss, same risk:reward ratio |
 | `dte_min` / `dte_max` | More theta-positive but slower turnover; lower → less theta, more gamma |
 | `min_iv_proxy` | Trade less, only when premium is rich |

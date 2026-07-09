@@ -218,6 +218,7 @@ class TestEnterMultiLegContractGuard:
         raw = {
             "short_leg_delta": 0.17, "spread_width": 10, "dte_min": 30,
             "dte_max": 45, "iv_proxy_source": "vix", "min_iv_proxy": 14,
+            "trend_sma_buffer_pct": 0.0,
             "min_credit_pct_of_width": 0.13, "max_concurrent_positions": 3,
             "max_per_expiration": 1, "min_dte_gap_between_opens": 7,
             "profit_target_pct": 0.50, "stop_loss_multiple": 2.0,
