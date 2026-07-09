@@ -443,7 +443,7 @@ Pure logic, no I/O. Same module so future spread strategies (iron condors = 2 sp
 ### Hard filters (drop before scoring)
 
 - **Affordability** — max loss ≤ `max_loss_per_position` (from sleeve allocator)
-- **Min credit** — net credit ≥ `min_credit_pct_of_width` × spread width (default 25%); reject thin credits below this floor
+- **Min credit** — net credit ≥ `min_credit_pct_of_width` × spread width (default 25%); reject thin credits below this floor. **Expected consequence:** SPY sits idle in normal-vol regimes while QQQ trades — this is the floor rejecting thin SPY premium (17Δ $10-wide SPY spreads cluster at ~8–14% of width vs QQQ's richer ~14–21%), not a fault. SPY reactivates on its own when VIX firms up; see docs/strategies.md for the full note.
 - **Valid quotes** — both legs bid > 0, ask > 0, ask ≥ bid
 - **Short leg delta window** — within `[short_leg_delta − 0.05, short_leg_delta + 0.05]`
 

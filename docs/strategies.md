@@ -412,6 +412,8 @@ A bull put credit spread sells the short (higher-strike) put and buys the long (
 | `exit_on_short_strike_breach` | True | True | Thesis broken when underlying ≤ short strike |
 | `earnings_blackout_days` | 0 | 0 | ETFs have no earnings; meaningful only for single names |
 
+> **Expected: SPY sits idle in normal-vol regimes — this is the credit floor rejecting thin premium, not a fault.** `min_credit_pct_of_width` is a ratio (credit ÷ width), so it is instrument-agnostic on paper, but the credit itself is vol-driven and QQQ (Nasdaq-100) carries structurally richer IV than SPY (S&P 500). Observed paper fills bear this out: QQQ resolved spreads collect ~14–21% of width and clear the 0.13 floor easily, whereas SPY 17Δ $10-wide spreads cluster at ~8–14% and mostly land just below it — the picker then logs `No tradeable put spread for SPY … thin credit … < 13% × $10.00 width` and skips the cycle. So the sleeve trades whichever index is paying enough (currently QQQ), and SPY only participates when VIX firms up enough to push its credit over 13%. That is the quality gate working, not the SPY channel being broken; a vol spike reactivates SPY with no config change. The thing to watch is the opposite failure — the *whole sleeve* going idle (e.g. if a lower QQQ short-leg delta shrinks QQQ's cushion toward the same floor), which raises the different question of whether index put spreads have a sellable edge in this regime at all.
+
 **Entry gates (all must pass):**
 
 1. **Regime** — `{TRENDING, RANGING}` only (slot's `allowed_regimes`). Never sell puts in BEAR / VOLATILE — a vol spike is exactly when defined-risk shorts hit max loss.
