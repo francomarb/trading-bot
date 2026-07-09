@@ -150,6 +150,132 @@ class TestSPYOptionsEdgeFilterDecision:
         ]
 
 
+def _iv_resolver_pct(values) -> IVProxyResolver:
+    """Stub resolver whose trailing series yields a controllable VIX percentile.
+
+    ``resolve_rank('vix').percentile`` == fraction of ``values`` ≤ the last
+    value; ``sufficient`` == (len(values) >= 240).
+    """
+    vals = list(values)
+    idx = pd.date_range("2025-01-01", periods=len(vals), freq="D")
+    return IVProxyResolver(fetch_fn=lambda ticker: pd.Series(vals, index=idx))
+
+
+# Trailing series presets keyed to the 240-day sufficiency floor.
+_VIX_HIGH = [15.0] * 249 + [30.0]   # percentile 1.00, sufficient
+_VIX_LOW = [15.0] * 249 + [10.0]    # percentile 0.004, sufficient
+_VIX_INSUFFICIENT = [15.0] * 100 + [30.0]  # percentile high but < 240 days
+
+
+def _edge_with(regime, vix_values, *, spy_ok=True):
+    """Build an edge filter with a mocked SPY gate and a stub VIX resolver."""
+    edge = SPYOptionsEdgeFilter(iv_resolver=_iv_resolver_pct(vix_values))
+    edge._spy_filter = MagicMock(
+        side_effect=lambda df: pd.Series(bool(spy_ok), index=df.index, dtype=bool)
+    )
+    edge._spy_filter.last_reason = "SPY above all SMAs [100]" if spy_ok else "SPY 480 ≤ SMA100 500"
+    if regime is not None:
+        edge.set_regime(regime)
+    return edge
+
+
+class TestSPYOptionsVixPercentileGate:
+    """Gate 2: VIX percentile is enforced only in TRENDING (PLAN 11.46b)."""
+
+    def test_ranging_ignores_low_vix(self):
+        # RANGING trades on the SPY gate alone — low VIX does not block.
+        decision = _edge_with("ranging", _VIX_LOW)(_make_df(30))
+        assert bool(decision.latest_allowed) is True
+        assert decision.latest_reasons == []
+
+    def test_trending_allows_high_vix(self):
+        decision = _edge_with("trending", _VIX_HIGH)(_make_df(30))
+        assert bool(decision.latest_allowed) is True
+        assert decision.latest_reasons == []
+
+    def test_trending_blocks_low_vix(self):
+        decision = _edge_with("trending", _VIX_LOW)(_make_df(30))
+        assert bool(decision.latest_allowed) is False
+        assert len(decision.latest_reasons) == 1
+        assert "VIX percentile" in decision.latest_reasons[0]
+
+    def test_trending_blocks_insufficient_history_fail_closed(self):
+        decision = _edge_with("trending", _VIX_INSUFFICIENT)(_make_df(30))
+        assert bool(decision.latest_allowed) is False
+        assert "VIX percentile unavailable" in decision.latest_reasons[0]
+
+    def test_no_regime_does_not_enforce_vix(self):
+        # Back-compat / offline callers: regime never injected → gate 2 off.
+        decision = _edge_with(None, _VIX_LOW)(_make_df(30))
+        assert bool(decision.latest_allowed) is True
+        assert decision.latest_reasons == []
+
+    def test_spy_gate_failure_blocks_regardless_of_vix(self):
+        decision = _edge_with("trending", _VIX_HIGH, spy_ok=False)(_make_df(30))
+        assert bool(decision.latest_allowed) is False
+        assert any("SPY trend gate failed" in r for r in decision.latest_reasons)
+
+    def test_both_gates_fail_reports_both_reasons(self):
+        decision = _edge_with("trending", _VIX_LOW, spy_ok=False)(_make_df(30))
+        assert bool(decision.latest_allowed) is False
+        reasons = decision.latest_reasons
+        assert any("SPY trend gate failed" in r for r in reasons)
+        assert any("VIX percentile" in r for r in reasons)
+
+    def test_accepts_marketregime_enum(self):
+        from regime.detector import MarketRegime
+
+        decision = _edge_with(MarketRegime.TRENDING, _VIX_LOW)(_make_df(30))
+        assert bool(decision.latest_allowed) is False
+        assert "VIX percentile" in decision.latest_reasons[0]
+
+    def test_default_threshold_matches_settings_single_source(self):
+        from config import settings
+
+        edge = SPYOptionsEdgeFilter(iv_resolver=_iv_resolver_pct(_VIX_HIGH))
+        assert edge._min_vix_percentile == settings.SPY_OPTIONS_MIN_VIX_PERCENTILE
+
+
+class TestInspectSignalsRegimeInjection:
+    """BaseStrategy.inspect_signals forwards current_regime to set_regime filters."""
+
+    def test_current_regime_injected_into_edge_filter(self):
+        recorded = {}
+
+        class _RecordingFilter:
+            last_reason = ""
+
+            def set_regime(self, regime):
+                recorded["regime"] = regime
+
+            def __call__(self, df):
+                return pd.Series(True, index=df.index, dtype=bool)
+
+        strat = SPYOptionsReversionStrategy(
+            rsi_length=14, rsi_threshold=30, edge_filter=_RecordingFilter()
+        )
+        strat.inspect_signals(_make_df(30), symbol="SPY", current_regime="trending")
+        assert recorded.get("regime") == "trending"
+
+    def test_no_regime_leaves_filter_uninjected(self):
+        recorded = {}
+
+        class _RecordingFilter:
+            last_reason = ""
+
+            def set_regime(self, regime):
+                recorded["regime"] = regime
+
+            def __call__(self, df):
+                return pd.Series(True, index=df.index, dtype=bool)
+
+        strat = SPYOptionsReversionStrategy(
+            rsi_length=14, rsi_threshold=30, edge_filter=_RecordingFilter()
+        )
+        strat.inspect_signals(_make_df(30), symbol="SPY")  # no current_regime
+        assert "regime" not in recorded
+
+
 class TestSPYOptionsStrategyEdgeFilterIntegration:
     def test_raw_rsi_entry_can_be_vetoed_with_structured_reasons(self):
         closes = [520.0] * 20 + [480.0] * 5 + [521.0]

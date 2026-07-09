@@ -276,7 +276,10 @@ def main() -> None:
             strategy=SPYOptionsReversionStrategy(
                 rsi_length=14,
                 rsi_threshold=45,
-                edge_filter=SPYOptionsEdgeFilter(),
+                # Share the one IV resolver with the edge filter so the VIX
+                # percentile gate and the strategy's BS-sigma / observation
+                # logging all read the same daily-cached trailing-1y series.
+                edge_filter=SPYOptionsEdgeFilter(iv_resolver=_iv_resolver),
                 iv_resolver=_iv_resolver,
             ),
             watchlist_source=StaticWatchlistSource(

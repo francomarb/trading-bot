@@ -324,7 +324,7 @@ class BaseStrategy(ABC):
         """Compute entries/exits before edge-filter gating."""
 
     def _aligned_edge_gate(
-        self, df: pd.DataFrame, *, symbol: str = ""
+        self, df: pd.DataFrame, *, symbol: str = "", current_regime=None
     ) -> EdgeFilterDecision | None:
         """Return the normalized edge-filter decision for ``df``, if configured."""
         if self._edge_filter is None:
@@ -332,6 +332,12 @@ class BaseStrategy(ABC):
         # Inject symbol into filters that declare set_symbol().
         if symbol and hasattr(self._edge_filter, "set_symbol"):
             self._edge_filter.set_symbol(symbol)
+        # Inject the current market regime into filters that declare
+        # set_regime(). Regime is detected only at the engine; the filter merely
+        # receives the label (e.g. SPYOptionsEdgeFilter gates on it). None →
+        # not injected (offline/back-compat callers keep prior behavior).
+        if current_regime is not None and hasattr(self._edge_filter, "set_regime"):
+            self._edge_filter.set_regime(current_regime)
 
         result = self._edge_filter(df)
         getter = getattr(self._edge_filter, "get_last_block_reasons", None)
@@ -343,7 +349,7 @@ class BaseStrategy(ABC):
         )
 
     def inspect_signals(
-        self, df: pd.DataFrame, *, symbol: str = ""
+        self, df: pd.DataFrame, *, symbol: str = "", current_regime=None
     ) -> tuple[SignalFrame, SignalFrame, bool | None, list[str]]:
         """
         Return raw signals, filtered signals, and the current edge-filter state.
@@ -351,9 +357,15 @@ class BaseStrategy(ABC):
         The final value is:
           - `True` / `False` when an edge filter exists
           - `None` when the strategy has no edge filter configured
+
+        `current_regime` (a ``MarketRegime`` or ``None``) is forwarded to
+        regime-aware edge filters via ``set_regime``; regime detection itself
+        stays at the engine.
         """
         raw = self._raw_signals(df)
-        edge_decision = self._aligned_edge_gate(df, symbol=symbol)
+        edge_decision = self._aligned_edge_gate(
+            df, symbol=symbol, current_regime=current_regime
+        )
         if edge_decision is None:
             return raw, raw, None, []
         filtered = SignalFrame(
@@ -367,7 +379,9 @@ class BaseStrategy(ABC):
             edge_decision.latest_reasons,
         )
 
-    def generate_signals(self, df: pd.DataFrame, *, symbol: str = "") -> SignalFrame:
+    def generate_signals(
+        self, df: pd.DataFrame, *, symbol: str = "", current_regime=None
+    ) -> SignalFrame:
         """
         Public entry point. Computes raw signals, then AND-gates entries
         (but not exits — we always want to be able to exit) with the
@@ -376,8 +390,11 @@ class BaseStrategy(ABC):
         `symbol` is passed through to symbol-aware filters (those that
         implement a `set_symbol` method, e.g. EarningsBlackout). Filters
         that don't need the symbol ignore it — backwards compatible.
+        `current_regime` is likewise forwarded to regime-aware filters.
         """
-        _raw, filtered, _edge_allowed, _reasons = self.inspect_signals(df, symbol=symbol)
+        _raw, filtered, _edge_allowed, _reasons = self.inspect_signals(
+            df, symbol=symbol, current_regime=current_regime
+        )
         return filtered
 
 

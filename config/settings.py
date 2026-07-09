@@ -98,6 +98,26 @@ OPTION_TRAILING_MAX_SPREAD_PCT: float = float(
 OPTION_TRAILING_STOP_BID_BUFFER_PCT: float = float(
     os.getenv("OPTION_TRAILING_STOP_BID_BUFFER_PCT", "0.05")
 )
+# SPY Options Reversion — VIX-percentile entry gate (PLAN 11.46b graduation).
+# The oversold-bounce edge only materializes in a TRENDING regime when implied
+# vol is already elevated; a dip in a calm uptrend is noise/continuation that
+# grinds the long call out on theta. Require today's VIX to sit at or above this
+# percentile of its trailing ~1-year range (IVProxyResolver.resolve_rank(...).
+# percentile — fraction of trailing closes ≤ today) before allowing a TRENDING
+# entry. RANGING is a mean-reversion regime and trades on the SPY>100SMA gate
+# alone; the gate is not enforced there.
+#
+# Threshold 0.60 chosen from the 2018–2025 production-mirrored backtest
+# (backtest/spy_options_backtest.py) and confirmed 6/6 on the live paper sample
+# (all six entries were TRENDING; the three winners had VIX percentile
+# 0.64/0.75/0.85, the three losers 0.25/0.28/0.29). NOTE: this is the ≤-percentile,
+# NOT the min-max rank — the winners' min-max rank was only 0.25–0.43, so a
+# rank-based gate at 0.60 would have blocked them. SPYOptionsEdgeFilter reads
+# this value; tests/test_spy_options_reversion.py asserts the parity.
+SPY_OPTIONS_MIN_VIX_PERCENTILE: float = float(
+    os.getenv("SPY_OPTIONS_MIN_VIX_PERCENTILE", "0.60")
+)
+
 # Temporary, opt-in forensic capture for the SPY options-reversion stop
 # replacement investigation. Disabled means no diagnostic DB, extra broker
 # reads, stream watches, or writes.
