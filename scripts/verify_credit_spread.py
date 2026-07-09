@@ -103,6 +103,7 @@ def _verify_underlying(
         edge_filter=CreditSpreadEdgeFilter(
             iv_proxy_source=config.iv_proxy_source,
             min_iv_proxy=config.min_iv_proxy,
+            trend_sma_buffer_pct=config.trend_sma_buffer_pct,
             earnings_blackout_days=config.earnings_blackout_days,
             iv_resolver=iv_resolver,
         ),

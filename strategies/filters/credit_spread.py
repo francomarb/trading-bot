@@ -6,8 +6,9 @@ docs/credit_spread_strategy.md §3 that are not position-state or
 chain-availability concerns:
 
   Gate 2 — Underlying trend:
-    underlying close > its own 50-day SMA. Don't sell puts into a
-    downtrend on this specific instrument. Per-bar.
+    underlying close > its own 50-day SMA plus any configured buffer.
+    Don't sell puts into a downtrend or thin trend cushion on this specific
+    instrument. Per-bar.
 
   Gate 3 — Volatility floor:
     the instrument's IV proxy ≥ ``min_iv_proxy`` (index points). Only
@@ -53,6 +54,8 @@ class CreditSpreadEdgeFilter:
         iv_proxy_source:       IV proxy source name ("vix" / "rvx").
         min_iv_proxy:          Minimum IV proxy in index points to allow entry.
         sma_window:            Trend-gate SMA window (default 50).
+        trend_sma_buffer_pct:  Required fractional cushion above the trend SMA
+                               (0.01 means close must be > SMA × 1.01).
         earnings_blackout_days: Calendar days around earnings to block. 0 for
                                ETFs disables the earnings gate entirely.
         iv_resolver:           Injected IVProxyResolver (tests pass a stub;
@@ -65,6 +68,7 @@ class CreditSpreadEdgeFilter:
         iv_proxy_source: str,
         min_iv_proxy: float,
         sma_window: int = _DEFAULT_SMA_WINDOW,
+        trend_sma_buffer_pct: float = 0.0,
         earnings_blackout_days: int = 0,
         iv_resolver: IVProxyResolver | None = None,
     ) -> None:
@@ -76,6 +80,9 @@ class CreditSpreadEdgeFilter:
         self._iv_source = iv_proxy_source
         self._min_iv_proxy = float(min_iv_proxy)
         self._sma_window = int(sma_window)
+        self._trend_sma_buffer_pct = float(trend_sma_buffer_pct)
+        if self._trend_sma_buffer_pct < 0:
+            raise ValueError("trend_sma_buffer_pct must be non-negative")
         self._iv_resolver = iv_resolver or IVProxyResolver()
         self._symbol: str = ""
         # Earnings gate only matters for single names; ETFs pass 0 and the
@@ -102,7 +109,8 @@ class CreditSpreadEdgeFilter:
         chain/availability checks still gate those edge cases."""
         close = df["close"].astype(float)
         sma = close.rolling(self._sma_window).mean()
-        gate = close > sma
+        required_close = sma * (1.0 + self._trend_sma_buffer_pct)
+        gate = close > required_close
         return gate.where(sma.notna(), other=True).astype(bool)
 
     def __call__(self, df: pd.DataFrame) -> EdgeFilterDecision:
@@ -129,7 +137,13 @@ class CreditSpreadEdgeFilter:
         ):
             row: list[str] = []
             if not trend_ok:
-                row.append(f"underlying below {self._sma_window} SMA (downtrend)")
+                if self._trend_sma_buffer_pct > 0:
+                    row.append(
+                        f"underlying below {self._sma_window} SMA + "
+                        f"{self._trend_sma_buffer_pct:.1%} buffer"
+                    )
+                else:
+                    row.append(f"underlying below {self._sma_window} SMA (downtrend)")
             if not iv_ok:
                 row.append(
                     f"IV proxy {iv_value:.1f} < min {self._min_iv_proxy:.1f} "
@@ -149,6 +163,7 @@ class CreditSpreadEdgeFilter:
             logger.info(
                 f"CREDIT_SPREAD_FILTER_ALLOWED {self._symbol} — "
                 f"trend={bool(trend_gate.iloc[-1])} "
+                f"sma_buffer={self._trend_sma_buffer_pct:.1%} "
                 f"iv={iv_value:.1f}≥{self._min_iv_proxy:.1f} "
                 f"earnings={bool(earnings_gate.iloc[-1])}"
             )

@@ -396,9 +396,10 @@ A bull put credit spread sells the short (higher-strike) put and buys the long (
 
 | Parameter | SPY | QQQ | Notes |
 |---|---:|---:|---|
-| `short_leg_delta` | 0.17 | 0.17 | Target |Δ| of the short put |
+| `short_leg_delta` | 0.17 | 0.12 | Target |Δ| of the short put; QQQ moved farther OTM after paper losses at 17Δ |
 | `spread_width` | $10 | $15 | Long leg this many dollars below short |
 | `dte_min` / `dte_max` | 30 / 45 | 30 / 45 | DTE window for the picker |
+| `trend_sma_buffer_pct` | 0.00 | 0.01 | QQQ requires close > 50 SMA by 1%; SPY keeps the original trend gate |
 | `iv_proxy_source` | `vix` | `vix` | QQQ tracks SPX closely; VIX is the proxy |
 | `min_iv_proxy` | 14 | 14 | VIX index points — entry blocked when premium is thin |
 | `min_credit_pct_of_width` | 0.13 | 0.13 | Floor on net credit / width. **Note:** the design doc default is 0.25, but the 11.28 merge gate showed real ~17Δ $10-wide SPY spreads collect only ~13–15% of width — 0.25 would reject nearly every spread. SPY may still sit idle in normal-vol conditions while QQQ trades comfortably; PLAN.md 11.30 will revisit. |

@@ -705,6 +705,7 @@ class TestCreditSpreadCounters:
         return CreditSpreadConfig.from_dict("SPY", {
             "short_leg_delta": 0.17, "spread_width": 10,
             "dte_min": 30, "dte_max": 45,
+            "trend_sma_buffer_pct": 0.0,
             "iv_proxy_source": "vix", "min_iv_proxy": 14,
             "min_credit_pct_of_width": 0.13,
             "max_concurrent_positions": 3, "max_per_expiration": 1,

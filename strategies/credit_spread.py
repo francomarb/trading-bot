@@ -76,6 +76,7 @@ class CreditSpreadConfig:
     spread_width: float
     dte_min: int
     dte_max: int
+    trend_sma_buffer_pct: float
     iv_proxy_source: str
     min_iv_proxy: float
     min_credit_pct_of_width: float
@@ -92,6 +93,7 @@ class CreditSpreadConfig:
 
     _REQUIRED_KEYS = frozenset({
         "short_leg_delta", "spread_width", "dte_min", "dte_max",
+        "trend_sma_buffer_pct",
         "iv_proxy_source", "min_iv_proxy", "min_credit_pct_of_width",
         "max_concurrent_positions", "max_per_expiration",
         "min_dte_gap_between_opens", "profit_target_pct", "stop_loss_multiple",
@@ -114,6 +116,7 @@ class CreditSpreadConfig:
             spread_width=float(raw["spread_width"]),
             dte_min=int(raw["dte_min"]),
             dte_max=int(raw["dte_max"]),
+            trend_sma_buffer_pct=float(raw["trend_sma_buffer_pct"]),
             iv_proxy_source=str(raw["iv_proxy_source"]),
             min_iv_proxy=float(raw["min_iv_proxy"]),
             min_credit_pct_of_width=float(raw["min_credit_pct_of_width"]),

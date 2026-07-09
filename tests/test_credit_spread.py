@@ -35,6 +35,7 @@ _RAW_SPY = {
     "spread_width": 10,
     "dte_min": 30,
     "dte_max": 45,
+    "trend_sma_buffer_pct": 0.0,
     "iv_proxy_source": "vix",
     "min_iv_proxy": 14,
     "min_credit_pct_of_width": 0.13,
@@ -137,6 +138,7 @@ class TestCreditSpreadConfig:
         assert cfg.symbol == "SPY"
         assert cfg.short_leg_delta == pytest.approx(0.17)
         assert cfg.spread_width == pytest.approx(10.0)
+        assert cfg.trend_sma_buffer_pct == pytest.approx(0.0)
         assert cfg.dte_min == 30 and cfg.dte_max == 45
         assert cfg.exit_on_short_strike_breach is True
 
@@ -152,10 +154,12 @@ class TestCreditSpreadConfig:
             assert cfg.symbol == symbol
 
     def test_two_instances_carry_different_params(self):
-        spy = _config("SPY", spread_width=10)
-        qqq = _config("QQQ", spread_width=15)
+        spy = _config("SPY", spread_width=10, trend_sma_buffer_pct=0.0)
+        qqq = _config("QQQ", spread_width=15, trend_sma_buffer_pct=0.01)
         assert spy.spread_width == 10.0
         assert qqq.spread_width == 15.0
+        assert spy.trend_sma_buffer_pct == pytest.approx(0.0)
+        assert qqq.trend_sma_buffer_pct == pytest.approx(0.01)
         assert spy.symbol == "SPY" and qqq.symbol == "QQQ"
 
 
