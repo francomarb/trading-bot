@@ -1480,6 +1480,7 @@ class TradingEngine:
         raw_signals, signals, edge_allowed, edge_reasons = strategy.inspect_signals(
             df,
             symbol=symbol,
+            current_regime=current_regime,
         )
         raw_entry = bool(raw_signals.entries.iloc[-1])
         last_entry = bool(signals.entries.iloc[-1])

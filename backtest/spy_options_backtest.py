@@ -1,76 +1,152 @@
 """
-SPY Options Reversion — Parameter Grid Backtest
+SPY Options Reversion — production-mirrored backtest + VIX-percentile gate audit.
 
-Methodology
------------
-- Daily SPY bars from yfinance, 2019-01-01 to 2025-12-31.
-- RSI(14) Wilder's RMA, same implementation as the live strategy.
-- Entry signal: RSI crosses above threshold (prev < threshold, curr >= threshold)
-  AND SPY close > 200-day SMA (edge filter).
-- One position at a time — new signals skipped while a position is open.
-- Contract: Black-Scholes call, strike = close × (1 - itm_offset), first Friday
-  expiry inside [min_dte, max_dte] calendar days.
-- Option priced at entry using VIX close as implied vol; tracked daily thereafter.
-- Exit: TP hit, SL hit, or Wednesday time stop (close of Wednesday in expiry week).
-- r = 0.05 (risk-free rate), multiplier = 100 (standard contract).
+This backtest is deliberately wired to mirror the LIVE decision path so its
+numbers answer a production question (see the "backtests must mirror production"
+project standard). Prior to 2026-07 this file gated on SPY>200SMA with no regime
+gate — that overstated the edge ~2.5× and did not reflect what the bot trades.
 
-Output
-------
-Ranked table of parameter combinations by total P&L.
+What it mirrors
+---------------
+- RSI(14) Wilder's RMA, entry on cross up through threshold 45 (forward_test.py).
+- Edge gate 1: SPY close > 100-day SMA (SPYOptionsEdgeFilter).
+- Regime gate: entries only in {TRENDING, RANGING}. BEAR (SPY<200SMA) and
+  VOLATILE (ATR% ≥ 80th pct of trailing 126 AND ATR% ≥ 1.2%) block — mirrors
+  regime/detector.py.
+- Edge gate 2 (the enhancement under test): in TRENDING regime, require today's
+  VIX at or above SPY_OPTIONS_MIN_VIX_PERCENTILE of its trailing-252 range
+  (≤-percentile, mirroring IVProxyResolver.resolve_rank). RANGING is exempt.
+- Exit stack: trailing (act 10% / trail 15%), hard SL 25%, delta floor 0.30,
+  Wednesday-of-expiry-week time stop, 300% take-profit cap. Contract: BS call,
+  strike = close × 0.995, first Friday inside [14, 28] DTE.
+
+Caveats (read before trusting absolute %s)
+-----------------------------------------
+Daily Black-Scholes pricing with NO bid/ask spread, NO commission, and NO
+intraday premium noise. The daily model cannot see the intraday 25% swings that
+trip the hard stop live, so it UNDER-states stop churn. Treat absolute totals as
+an optimistic ceiling; the RELATIVE comparisons (baseline vs gate, IV buckets,
+regime cross-tab) are the trustworthy signal.
+
+Data: yfinance SPY + ^VIX daily, auto-adjusted. VIX is required and only
+yfinance provides it here.
+
+Run:  venv/bin/python backtest/spy_options_backtest.py
 """
+
+from __future__ import annotations
 
 import sys
 from datetime import date, timedelta
-from itertools import product
+from pathlib import Path
 
 import numpy as np
 import pandas as pd
+from scipy.stats import norm
 
-# ── Data download ────────────────────────────────────────────────────────────
+ROOT = Path(__file__).resolve().parents[1]
+if str(ROOT) not in sys.path:
+    sys.path.insert(0, str(ROOT))
 
-def _download() -> tuple[pd.DataFrame, pd.Series]:
+from config import settings
+
+# ── Production-mirrored parameters ────────────────────────────────────────────
+RSI_THRESHOLD = 45
+MIN_DTE, MAX_DTE = 14, 28
+ITM_OFFSET = 0.005          # target_strike_pct 0.995
+R = 0.05
+DELTA_FLOOR = 0.30
+TP_MULT = 3.00
+TRAIL_ACT, TRAIL_PCT = 0.10, 0.15
+MIN_VIX_PCTILE = settings.SPY_OPTIONS_MIN_VIX_PERCENTILE  # single source of truth
+START, END = "2018-01-01", "2025-12-31"
+
+
+# ── Data ──────────────────────────────────────────────────────────────────────
+
+def _download() -> pd.DataFrame:
     import yfinance as yf
-    spy = yf.download("SPY", start="2019-01-01", end="2025-12-31",
-                      auto_adjust=True, progress=False)
-    vix = yf.download("^VIX", start="2019-01-01", end="2025-12-31",
-                      auto_adjust=True, progress=False)
-
-    spy.columns = spy.columns.get_level_values(0) if isinstance(spy.columns, pd.MultiIndex) else spy.columns
-    vix.columns = vix.columns.get_level_values(0) if isinstance(vix.columns, pd.MultiIndex) else vix.columns
-
+    spy = yf.download("SPY", start=START, end=END, auto_adjust=True, progress=False)
+    vix = yf.download("^VIX", start=START, end=END, auto_adjust=True, progress=False)
+    for d in (spy, vix):
+        if isinstance(d.columns, pd.MultiIndex):
+            d.columns = d.columns.get_level_values(0)
     spy.index = pd.to_datetime(spy.index).tz_localize(None)
     vix.index = pd.to_datetime(vix.index).tz_localize(None)
-
-    vix_close = vix["Close"].rename("vix")
     df = spy[["Open", "High", "Low", "Close", "Volume"]].copy()
     df.columns = ["open", "high", "low", "close", "volume"]
-    df = df.join(vix_close, how="left")
-    df["vix"] = df["vix"].ffill().fillna(20.0)  # fallback VIX=20 if missing
-    return df, df["close"]
+    df = df.join(vix["Close"].rename("vix"), how="left")
+    df["vix"] = df["vix"].ffill().fillna(20.0)
+    return df
 
 
-# ── RSI (Wilder's RMA) ───────────────────────────────────────────────────────
+# ── Indicators (mirror indicators/technicals.py + regime/detector.py) ─────────
+
+def _wilder(s: pd.Series, length: int) -> pd.Series:
+    return s.ewm(alpha=1.0 / length, adjust=False).mean()
+
 
 def _wilder_rsi(close: pd.Series, length: int = 14) -> pd.Series:
     delta = close.diff()
     gain = delta.where(delta > 0, 0.0)
     loss = -delta.where(delta < 0, 0.0)
-
-    # First value: simple mean of first `length` bars
-    avg_gain = gain.ewm(alpha=1.0 / length, adjust=False).mean()
-    avg_loss = loss.ewm(alpha=1.0 / length, adjust=False).mean()
-
-    rs = avg_gain / avg_loss.replace(0, np.nan)
-    rsi = 100 - (100 / (1 + rs))
-    rsi = rsi.fillna(100.0)
-    return rsi
+    rs = _wilder(gain, length) / _wilder(loss, length).replace(0, np.nan)
+    return (100 - 100 / (1 + rs)).fillna(100.0)
 
 
-# ── Option pricing ───────────────────────────────────────────────────────────
+def _adx_atr(df: pd.DataFrame, length: int = 14) -> tuple[pd.Series, pd.Series]:
+    high, low, close = df["high"], df["low"], df["close"]
+    up, down = high.diff(), -low.diff()
+    plus_dm = pd.Series(np.where((up > down) & (up > 0), up, 0.0), index=df.index)
+    minus_dm = pd.Series(np.where((down > up) & (down > 0), down, 0.0), index=df.index)
+    tr = pd.concat([high - low, (high - close.shift()).abs(),
+                    (low - close.shift()).abs()], axis=1).max(axis=1)
+    atr = _wilder(tr, length)
+    plus_di = 100 * _wilder(plus_dm, length) / atr
+    minus_di = 100 * _wilder(minus_dm, length) / atr
+    dx = 100 * (plus_di - minus_di).abs() / (plus_di + minus_di).replace(0, np.nan)
+    return _wilder(dx.fillna(0.0), length), atr
 
-def _bs_call(S: float, K: float, T: float, r: float, sigma: float) -> float:
-    """Black-Scholes call price. Returns 0 on degenerate inputs."""
-    from scipy.stats import norm
+
+def _prep(df: pd.DataFrame) -> pd.DataFrame:
+    df = df.copy()
+    df["rsi"] = _wilder_rsi(df["close"])
+    df["sma100"] = df["close"].rolling(100).mean()
+    df["sma200"] = df["close"].rolling(200).mean()
+    df["sma50"] = df["close"].rolling(50).mean()
+    df["sma50_slope"] = df["sma50"] - df["sma50"].shift(5)
+    adx, atr = _adx_atr(df)
+    df["adx"] = adx
+    df["atr_pct"] = atr / df["close"]
+    df["atr_pctile"] = df["atr_pct"].rolling(126, min_periods=10).apply(
+        lambda w: (w[:-1] < w[-1]).mean(), raw=True)
+    # Trailing-252 VIX ≤-percentile, mirroring IVProxyResolver.resolve_rank.
+    df["vix_pctile"] = df["vix"].rolling(252, min_periods=240).apply(
+        lambda w: (w <= w[-1]).mean(), raw=True)
+    return df
+
+
+def _regime(row) -> str:
+    if pd.isna(row["sma200"]):
+        return "RANGING"
+    if row["close"] < row["sma200"]:
+        return "BEAR"
+    if (not pd.isna(row["atr_pctile"]) and row["atr_pctile"] >= 0.80
+            and row["atr_pct"] >= 0.012):
+        return "VOLATILE"
+    adx = row["adx"]
+    if pd.isna(adx):
+        return "RANGING"
+    if adx >= 25:
+        return "TRENDING"
+    if adx <= 20:
+        return "RANGING"
+    return "TRENDING" if row["sma50_slope"] > 0 else "RANGING"
+
+
+# ── Option pricing ────────────────────────────────────────────────────────────
+
+def _bs_call(S, K, T, r, sigma) -> float:
     if T <= 0 or sigma <= 0:
         return max(S - K, 0.0)
     d1 = (np.log(S / K) + (r + 0.5 * sigma ** 2) * T) / (sigma * np.sqrt(T))
@@ -78,402 +154,173 @@ def _bs_call(S: float, K: float, T: float, r: float, sigma: float) -> float:
     return float(S * norm.cdf(d1) - K * np.exp(-r * T) * norm.cdf(d2))
 
 
+def _bs_delta(S, K, T, r, sigma) -> float:
+    if T <= 0 or sigma <= 0:
+        return 1.0 if S > K else 0.0
+    d1 = (np.log(S / K) + (r + 0.5 * sigma ** 2) * T) / (sigma * np.sqrt(T))
+    return float(norm.cdf(d1))
+
+
 def _next_friday(from_date: date, min_dte: int, max_dte: int) -> date | None:
-    """Return first Friday expiry between min_dte and max_dte calendar days out."""
-    min_d = from_date + timedelta(days=min_dte)
-    max_d = from_date + timedelta(days=max_dte)
-    d = min_d
-    while d <= max_d:
-        if d.weekday() == 4:  # Friday
+    d, end = from_date + timedelta(days=min_dte), from_date + timedelta(days=max_dte)
+    while d <= end:
+        if d.weekday() == 4:
             return d
         d += timedelta(days=1)
     return None
 
 
-# ── Single backtest run ──────────────────────────────────────────────────────
+# ── Backtest core ─────────────────────────────────────────────────────────────
 
-def _run(
-    df: pd.DataFrame,
-    *,
-    rsi_threshold: float,
-    min_dte: int,
-    max_dte: int,
-    tp_pct: float,
-    sl_pct: float,
-    sma_filter: bool = True,
-    max_positions: int = 1,
-    r: float = 0.05,
-    itm_offset: float = 0.005,
-    # Trailing stop — if both are set, tp_pct is ignored
-    trail_activation_pct: float | None = None,
-    trail_pct: float | None = None,
-) -> list[dict]:
-    close = df["close"]
-    vix = df["vix"]
-    rsi = _wilder_rsi(close, length=14)
-    sma200 = close.rolling(200).mean()
-
+def run(df: pd.DataFrame, *, sl_pct: float = 0.25, regime_gate: bool = True,
+        vix_gate: bool = False, min_vix_pctile: float = MIN_VIX_PCTILE,
+        sma_window: int = 100) -> list[dict]:
+    """Run one production-mirrored backtest. Records full entry context per trade."""
+    df = df.copy()
+    df["regime"] = df.apply(_regime, axis=1)
+    smacol = f"sma{sma_window}"
+    idx = df.index
     trades: list[dict] = []
-    # Each open position: dict with entry_price, entry_premium, expiry, entry_date, strike
-    open_positions: list[dict] = []
+    open_pos: list[dict] = []
 
-    dates = df.index.tolist()
-    closes = close.values
-    vixxs = vix.values
-    rsis = rsi.values
-    smas = sma200.values
+    for i in range(201, len(df)):
+        row = df.iloc[i]
+        today = idx[i].date()
+        S, sigma = float(row["close"]), float(row["vix"]) / 100.0
 
-    for i in range(201, len(dates)):
-        today = dates[i].date() if hasattr(dates[i], "date") else dates[i]
-        S = float(closes[i])
-        sigma = float(vixxs[i]) / 100.0
-        curr_rsi = float(rsis[i])
-        prev_rsi = float(rsis[i - 1])
-        sma_val = float(smas[i])
-
-        # ── Check exits for all open positions ──────────────────────────────
-        use_trailing = trail_activation_pct is not None and trail_pct is not None
-        still_open = []
-        for pos in open_positions:
-            T = max((pos["expiry"] - today).days / 365.0, 0.001)
-            opt_val = _bs_call(S, pos["strike"], T, r, sigma)
-            pnl_pct = (opt_val - pos["entry_premium"]) / pos["entry_premium"]
-
-            expiry_wednesday = pos["expiry"] - timedelta(days=2)
-            exit_reason = None
-            if today >= expiry_wednesday:
-                exit_reason = "time_stop"
-            elif pnl_pct <= -sl_pct:
-                exit_reason = "sl"
-            elif use_trailing:
-                # Update HWM and check trailing stop
-                if "hwm" not in pos:
-                    pos["hwm"] = opt_val
-                else:
-                    pos["hwm"] = max(pos["hwm"], opt_val)
-                base = pos["entry_premium"]
-                hwm = pos["hwm"]
-                if hwm >= base * (1.0 + trail_activation_pct):
-                    trail_floor = hwm * (1.0 - trail_pct)
-                    if opt_val < trail_floor:
-                        exit_reason = "trail"
-            elif pnl_pct >= tp_pct:
-                exit_reason = "tp"
-
-            if exit_reason:
-                trades.append({
-                    "entry_date":    pos["entry_date"],
-                    "exit_date":     today,
-                    "entry_spy":     pos["entry_price"],
-                    "strike":        pos["strike"],
-                    "expiry":        pos["expiry"],
-                    "entry_premium": pos["entry_premium"],
-                    "exit_premium":  opt_val,
-                    "pnl_pct":       pnl_pct,
-                    "exit_reason":   exit_reason,
-                })
+        still = []
+        for p in open_pos:
+            T = max((p["expiry"] - today).days / 365.0, 0.001)
+            val = _bs_call(S, p["strike"], T, R, sigma)
+            delta = _bs_delta(S, p["strike"], T, R, sigma)
+            pnl = (val - p["entry_premium"]) / p["entry_premium"]
+            reason = None
+            if today >= p["expiry"] - timedelta(days=2):
+                reason = "time_stop"
+            elif delta < DELTA_FLOOR:
+                reason = "delta_floor"
+            elif pnl <= -sl_pct:
+                reason = "sl"
             else:
-                still_open.append(pos)
-        open_positions = still_open
+                p["hwm"] = max(p.get("hwm", val), val)
+                if p["hwm"] >= p["entry_premium"] * (1 + TRAIL_ACT) and \
+                        val < p["hwm"] * (1 - TRAIL_PCT):
+                    reason = "trail"
+                elif pnl >= TP_MULT - 1:
+                    reason = "tp"
+            if reason:
+                p.update(exit_date=today, exit_premium=val, pnl_pct=pnl, exit_reason=reason)
+                trades.append(p)
+            else:
+                still.append(p)
+        open_pos = still
 
-        # ── Check entry signal ───────────────────────────────────────────────
-        if len(open_positions) < max_positions:
-            entry_signal = (prev_rsi < rsi_threshold) and (curr_rsi >= rsi_threshold)
-            if sma_filter and (pd.isna(sma_val) or S <= sma_val):
-                entry_signal = False
-
-            if entry_signal:
-                exp = _next_friday(today, min_dte, max_dte)
-                if exp is not None:
-                    K = S * (1.0 - itm_offset)
-                    T = max((exp - today).days / 365.0, 0.001)
-                    premium = _bs_call(S, K, T, r, sigma)
-                    if premium > 0:
-                        open_positions.append({
-                            "entry_price":   S,
-                            "entry_premium": premium,
-                            "expiry":        exp,
-                            "entry_date":    today,
-                            "strike":        K,
-                        })
-
-    # Force-close any remaining open positions at last bar
-    i = len(dates) - 1
-    today = dates[i].date() if hasattr(dates[i], "date") else dates[i]
-    S = float(closes[i])
-    sigma = float(vixxs[i]) / 100.0
-    for pos in open_positions:
-        T = max((pos["expiry"] - today).days / 365.0, 0.001)
-        opt_val = _bs_call(S, pos["strike"], T, r, sigma)
-        pnl_pct = (opt_val - pos["entry_premium"]) / pos["entry_premium"]
-        trades.append({
-            "entry_date":    pos["entry_date"],
-            "exit_date":     today,
-            "entry_spy":     pos["entry_price"],
-            "strike":        pos["strike"],
-            "expiry":        pos["expiry"],
-            "entry_premium": pos["entry_premium"],
-            "exit_premium":  opt_val,
-            "pnl_pct":       pnl_pct,
-            "exit_reason":   "end_of_data",
-        })
-
+        if open_pos:
+            continue
+        prev_rsi = float(df.iloc[i - 1]["rsi"])
+        if not ((prev_rsi < RSI_THRESHOLD) and (float(row["rsi"]) >= RSI_THRESHOLD)):
+            continue
+        sma_val = row[smacol]
+        if pd.isna(sma_val) or S <= float(sma_val):
+            continue
+        if regime_gate and row["regime"] not in ("TRENDING", "RANGING"):
+            continue
+        # Gate 2: VIX percentile — enforced only in TRENDING (mirrors filter).
+        if vix_gate and row["regime"] == "TRENDING":
+            if pd.isna(row["vix_pctile"]) or row["vix_pctile"] < min_vix_pctile:
+                continue
+        exp = _next_friday(today, MIN_DTE, MAX_DTE)
+        if exp is None:
+            continue
+        K = S * (1 - ITM_OFFSET)
+        T = max((exp - today).days / 365.0, 0.001)
+        prem = _bs_call(S, K, T, R, sigma)
+        if prem <= 0:
+            continue
+        open_pos.append(dict(
+            entry_date=today, entry_price=S, entry_premium=prem, strike=K, expiry=exp,
+            entry_rsi=float(row["rsi"]), entry_vix=float(row["vix"]),
+            entry_vix_pctile=float(row["vix_pctile"]) if not pd.isna(row["vix_pctile"]) else np.nan,
+            entry_adx=float(row["adx"]) if not pd.isna(row["adx"]) else np.nan,
+            entry_regime=row["regime"],
+            sma_dist=(S / float(sma_val) - 1),
+        ))
     return trades
 
 
-# ── Aggregate metrics ────────────────────────────────────────────────────────
-
-def _metrics(trades: list[dict]) -> dict:
+def metrics(trades: list[dict]) -> dict:
     if not trades:
-        return {
-            "n_trades": 0,
-            "win_rate": float("nan"),
-            "avg_pnl": float("nan"),
-            "total_pnl": float("nan"),
-            "profit_factor": float("nan"),
-            "avg_hold_days": float("nan"),
-        }
+        return dict(n=0, win=np.nan, avg=np.nan, total=np.nan, pf=np.nan, hold=np.nan)
     pnls = [t["pnl_pct"] for t in trades]
     wins = [p for p in pnls if p > 0]
-    losses = [p for p in pnls if p <= 0]
-    gross_profit = sum(wins) if wins else 0.0
-    gross_loss = abs(sum(losses)) if losses else 0.0
-    hold_days = [
-        (t["exit_date"] - t["entry_date"]).days
-        for t in trades
-        if isinstance(t["entry_date"], date) and isinstance(t["exit_date"], date)
-    ]
-    return {
-        "n_trades": len(trades),
-        "win_rate": len(wins) / len(pnls),
-        "avg_pnl": float(np.mean(pnls)),
-        "total_pnl": float(np.sum(pnls)),
-        "profit_factor": gross_profit / gross_loss if gross_loss > 0 else float("inf"),
-        "avg_hold_days": float(np.mean(hold_days)) if hold_days else float("nan"),
-    }
+    gp, gl = sum(wins), abs(sum(p for p in pnls if p <= 0))
+    hold = [(t["exit_date"] - t["entry_date"]).days for t in trades]
+    return dict(n=len(trades), win=len(wins) / len(pnls), avg=np.mean(pnls),
+                total=np.sum(pnls), pf=(gp / gl if gl else np.inf), hold=np.mean(hold))
 
 
-def _period_pnl(trades: list[dict], label: str, year_from: int, year_to: int) -> float:
-    subset = [
-        t for t in trades
-        if isinstance(t["entry_date"], date)
-        and year_from <= t["entry_date"].year <= year_to
-    ]
-    return float(np.sum([t["pnl_pct"] for t in subset])) if subset else 0.0
+def _exits(trades: list[dict]) -> dict:
+    from collections import Counter
+    return dict(Counter(t["exit_reason"] for t in trades))
 
 
-# ── Grid search ─────────────────────────────────────────────────────────────
-
-def run_grid(df: pd.DataFrame) -> pd.DataFrame:
-    rsi_thresholds = [40, 45, 50]
-    tp_pcts        = [0.15, 0.20, 0.25, 0.30]
-    sl_pcts        = [0.20, 0.25, 0.30]
-    dte_windows    = [(10, 21), (14, 28)]
-    max_pos_list   = [1, 2]
-
-    rows = []
-    combos = list(product(rsi_thresholds, tp_pcts, sl_pcts, dte_windows, max_pos_list))
-    print(f"Running {len(combos)} parameter combinations...\n")
-
-    for rsi_thr, tp, sl, (min_dte, max_dte), max_pos in combos:
-        trades = _run(
-            df,
-            rsi_threshold=rsi_thr,
-            min_dte=min_dte,
-            max_dte=max_dte,
-            tp_pct=tp,
-            sl_pct=sl,
-            sma_filter=True,
-            max_positions=max_pos,
-        )
-        m = _metrics(trades)
-        rows.append({
-            "rsi_thr":     rsi_thr,
-            "tp_%":        int(tp * 100),
-            "sl_%":        int(sl * 100),
-            "dte":         f"{min_dte}-{max_dte}",
-            "max_pos":     max_pos,
-            "trades":      m["n_trades"],
-            "win_%":       round(m["win_rate"] * 100, 1) if not np.isnan(m["win_rate"]) else "—",
-            "avg_pnl_%":   round(m["avg_pnl"] * 100, 1) if not np.isnan(m["avg_pnl"]) else "—",
-            "total_pnl_%": round(m["total_pnl"] * 100, 1) if not np.isnan(m["total_pnl"]) else "—",
-            "pf":          round(m["profit_factor"], 2) if not np.isinf(m["profit_factor"]) else "∞",
-            "hold_d":      round(m["avg_hold_days"], 1) if not np.isnan(m["avg_hold_days"]) else "—",
-            "covid_%":     round(_period_pnl(trades, "covid", 2020, 2020) * 100, 1),
-            "2022_%":      round(_period_pnl(trades, "2022", 2022, 2022) * 100, 1),
-            "2023+_%":     round(_period_pnl(trades, "2023+", 2023, 2025) * 100, 1),
-        })
-
-    result = pd.DataFrame(rows)
-    if not result.empty:
-        result = result.sort_values("total_pnl_%", ascending=False)
-    return result
+def _line(label: str, t: list[dict]) -> str:
+    m = metrics(t)
+    return (f"{label:28s} | n={m['n']:3d} win={m['win']*100:4.0f}% "
+            f"avg={m['avg']*100:+6.1f}% total={m['total']*100:+7.0f}% pf={m['pf']:.2f}")
 
 
-# ── Entry point ──────────────────────────────────────────────────────────────
+def main() -> None:
+    print(f"Downloading SPY + VIX (yfinance, {START[:4]}–{END[:4]})…")
+    df = _prep(_download())
+    print(f"{len(df)} bars  {df.index[0].date()} → {df.index[-1].date()}\n")
+
+    base = run(df, regime_gate=True, vix_gate=False)
+    gated = run(df, regime_gate=True, vix_gate=True)
+
+    print("=" * 92)
+    print(f"PRODUCTION-MIRRORED — VIX-percentile gate (TRENDING requires "
+          f"VIX pctile ≥ {MIN_VIX_PCTILE:.2f})")
+    print("=" * 92)
+    print(_line("baseline (regime only)", base) + f"  exits={_exits(base)}")
+    print(_line("+ VIX-pctile gate", gated) + f"  exits={_exits(gated)}")
+
+    print("\n" + "=" * 92)
+    print("REGIME × IVR CROSS-TAB (baseline)  —  total P&L% | n")
+    print("=" * 92)
+    print(f"  {'':10s} {'VIXpct<gate':>16s} {'VIXpct>=gate':>16s}")
+    for reg in ("TRENDING", "RANGING"):
+        cells = []
+        for lo, hi in [(0.0, MIN_VIX_PCTILE), (MIN_VIX_PCTILE, 1.01)]:
+            sub = [t for t in base if t["entry_regime"] == reg
+                   and not np.isnan(t["entry_vix_pctile"]) and lo <= t["entry_vix_pctile"] < hi]
+            m = metrics(sub)
+            cells.append(f"{m['total']*100:+6.0f}%|n={m['n']}" if m["n"] else "—")
+        print(f"  {reg:10s} {cells[0]:>16s} {cells[1]:>16s}")
+
+    print("\n" + "=" * 92)
+    print("STOP-LOSS SWEEP (gated config)")
+    print("=" * 92)
+    for sl in [0.20, 0.25, 0.30, 0.35, 0.40, 0.50]:
+        print(_line(f"SL={sl*100:.0f}%", run(df, regime_gate=True, vix_gate=True, sl_pct=sl)))
+
+    print("\n" + "=" * 92)
+    print("WINNER vs LOSER ANATOMY (baseline)")
+    print("=" * 92)
+
+    def anat(g):
+        if not g:
+            return "n=0"
+        f = lambda k: np.nanmean([t[k] for t in g])
+        hold = np.mean([(t["exit_date"] - t["entry_date"]).days for t in g])
+        return (f"n={len(g):3d}  VIX={f('entry_vix'):5.1f}  VIXpct={f('entry_vix_pctile'):.2f}  "
+                f"RSI={f('entry_rsi'):4.1f}  ADX={f('entry_adx'):4.1f}  hold={hold:.1f}d")
+    print(f"  WINNERS  {anat([t for t in base if t['pnl_pct'] > 0])}")
+    print(f"  LOSERS   {anat([t for t in base if t['pnl_pct'] <= 0])}")
+    print()
+    print("Caveat: daily BS pricing, no spread/commission/intraday noise — absolute")
+    print("totals are an optimistic ceiling; trust the relative comparisons above.")
+
 
 if __name__ == "__main__":
-    print("Downloading SPY + VIX data (2019–2025)...")
-    df, _ = _download()
-    print(f"Downloaded {len(df)} daily bars ({df.index[0].date()} → {df.index[-1].date()})\n")
-
-    result = run_grid(df)
-
-    pd.set_option("display.max_rows", 300)
-    pd.set_option("display.width", 140)
-
-    # ── Top 20 by total P&L (≥8 trades for statistical relevance) ──
-    valid = result[result["trades"] >= 8].copy()
-    print("=" * 130)
-    print("SPY OPTIONS REVERSION — TOP 20 by Total P&L  (≥8 trades)  sorted ↓")
-    print("=" * 130)
-    if valid.empty:
-        print("No combinations with ≥8 trades. Showing top 20 overall:")
-        top = result.head(20)
-    else:
-        top = valid.head(20)
-    print(top.to_string(index=False))
-
-    # ── Full table ──
-    print()
-    print("=" * 130)
-    print("FULL GRID — all combinations, sorted by total P&L")
-    print("=" * 130)
-    print(result.to_string(index=False))
-
-    print()
-    print("Columns: rsi_thr=RSI threshold  tp_%=take-profit  sl_%=stop-loss")
-    print("         dte=DTE window  200sma=Y/N whether SPY>200SMA filter was on")
-    print("         total_pnl_%=cumulative sum of per-trade P&L %  pf=profit factor")
-    print("         covid_%=2020 trades total  2022_%=2022 total  2023+_%=2023-2025 total")
-
-    def _show_trades(label: str, trades: list[dict]) -> None:
-        print(f"\n── {label} ──")
-        rows = []
-        for t in trades:
-            rows.append({
-                "entry":     str(t.get("entry_date", "?")),
-                "exit":      str(t.get("exit_date", "?")),
-                "spy@entry": round(float(t.get("entry_spy", 0)), 2),
-                "strike":    round(float(t.get("strike", 0)), 2),
-                "expiry":    str(t.get("expiry", "?")),
-                "entry_$":   round(float(t.get("entry_premium", 0)), 2),
-                "exit_$":    round(float(t.get("exit_premium", 0)), 2),
-                "pnl_%":     round(float(t.get("pnl_pct", 0)) * 100, 1),
-                "reason":    t.get("exit_reason", "?"),
-            })
-        if rows:
-            print(pd.DataFrame(rows).to_string(index=False))
-
-    # ── Per-trade detail: best combo with max_pos=1 and max_pos=2 ──
-    for mp in [1, 2]:
-        subset = valid[valid["max_pos"] == mp] if not valid.empty else result[result["max_pos"] == mp]
-        if subset.empty:
-            subset = result[result["max_pos"] == mp]
-        if subset.empty:
-            continue
-        br = subset.iloc[0]
-        rsi_b = int(br["rsi_thr"]); tp_b = float(br["tp_%"]) / 100
-        sl_b  = float(br["sl_%"]) / 100
-        dte_b = br["dte"].split("-"); min_b, max_b = int(dte_b[0]), int(dte_b[1])
-        bt = _run(df, rsi_threshold=rsi_b, min_dte=min_b, max_dte=max_b,
-                  tp_pct=tp_b, sl_pct=sl_b, sma_filter=True, max_positions=mp)
-        _show_trades(
-            f"Per-trade: rsi={rsi_b} tp={int(tp_b*100)}% sl={int(sl_b*100)}% "
-            f"DTE {min_b}-{max_b} max_pos={mp}  "
-            f"({len(bt)} trades  win={round(sum(1 for t in bt if t['pnl_pct']>0)/len(bt)*100,1) if bt else 0}%)",
-            bt,
-        )
-
-    # ═══════════════════════════════════════════════════════════════════════════
-    # TRAILING STOP COMPARISON
-    # Baseline: RSI 45, TP 20%, SL 25%, DTE 14-28 (calibrated params)
-    # Variants: same RSI/SL/DTE, trailing stop with different activation/trail combos
-    # ═══════════════════════════════════════════════════════════════════════════
-    print()
-    print("=" * 110)
-    print("TRAILING STOP COMPARISON  (RSI 45, SL 25%, DTE 14-28, max_pos=1, SMA-100 filter)")
-    print("Baseline = fixed TP 20% | Trailing = HWM trail replaces TP, SL stays at 25%")
-    print("=" * 110)
-
-    _BASE_RSI, _BASE_SL, _BASE_MIN_DTE, _BASE_MAX_DTE = 45, 0.25, 14, 28
-
-    baseline_trades = _run(
-        df, rsi_threshold=_BASE_RSI, min_dte=_BASE_MIN_DTE, max_dte=_BASE_MAX_DTE,
-        tp_pct=0.20, sl_pct=_BASE_SL, sma_filter=True, max_positions=1,
-    )
-
-    trail_variants = [
-        ("trail act=10% trail=15% (live default)", 0.10, 0.15),
-        ("trail act=10% trail=10%",                0.10, 0.10),
-        ("trail act=10% trail=20%",                0.10, 0.20),
-        ("trail act=15% trail=15%",                0.15, 0.15),
-        ("trail act=15% trail=10%",                0.15, 0.10),
-        ("trail act=20% trail=15%",                0.20, 0.15),
-    ]
-
-    comp_rows = []
-    all_variant_trades: dict[str, list[dict]] = {}
-
-    def _win_pct(t: list[dict]) -> float:
-        return round(sum(1 for x in t if x["pnl_pct"] > 0) / len(t) * 100, 1) if t else 0.0
-
-    bm = _metrics(baseline_trades)
-    comp_rows.append({
-        "variant":       "baseline TP=20%",
-        "trades":        bm["n_trades"],
-        "win_%":         round(bm["win_rate"] * 100, 1),
-        "avg_pnl_%":     round(bm["avg_pnl"] * 100, 2),
-        "total_pnl_%":   round(bm["total_pnl"] * 100, 1),
-        "pf":            round(bm["profit_factor"], 2) if not np.isinf(bm["profit_factor"]) else "∞",
-        "avg_hold_d":    round(bm["avg_hold_days"], 1),
-        "covid_%":       round(_period_pnl(baseline_trades, "covid", 2020, 2020) * 100, 1),
-        "2022_%":        round(_period_pnl(baseline_trades, "2022", 2022, 2022) * 100, 1),
-        "2023+_%":       round(_period_pnl(baseline_trades, "2023+", 2023, 2025) * 100, 1),
-        "sl_exits":      sum(1 for t in baseline_trades if t["exit_reason"] == "sl"),
-        "tp_exits":      sum(1 for t in baseline_trades if t["exit_reason"] == "tp"),
-        "time_exits":    sum(1 for t in baseline_trades if t["exit_reason"] == "time_stop"),
-        "trail_exits":   0,
-    })
-
-    for label, act, trail in trail_variants:
-        vt = _run(
-            df, rsi_threshold=_BASE_RSI, min_dte=_BASE_MIN_DTE, max_dte=_BASE_MAX_DTE,
-            tp_pct=0.20, sl_pct=_BASE_SL, sma_filter=True, max_positions=1,
-            trail_activation_pct=act, trail_pct=trail,
-        )
-        all_variant_trades[label] = vt
-        vm = _metrics(vt)
-        comp_rows.append({
-            "variant":       label,
-            "trades":        vm["n_trades"],
-            "win_%":         round(vm["win_rate"] * 100, 1),
-            "avg_pnl_%":     round(vm["avg_pnl"] * 100, 2),
-            "total_pnl_%":   round(vm["total_pnl"] * 100, 1),
-            "pf":            round(vm["profit_factor"], 2) if not np.isinf(vm["profit_factor"]) else "∞",
-            "avg_hold_d":    round(vm["avg_hold_days"], 1),
-            "covid_%":       round(_period_pnl(vt, "covid", 2020, 2020) * 100, 1),
-            "2022_%":        round(_period_pnl(vt, "2022", 2022, 2022) * 100, 1),
-            "2023+_%":       round(_period_pnl(vt, "2023+", 2023, 2025) * 100, 1),
-            "sl_exits":      sum(1 for t in vt if t["exit_reason"] == "sl"),
-            "tp_exits":      sum(1 for t in vt if t["exit_reason"] == "tp"),
-            "time_exits":    sum(1 for t in vt if t["exit_reason"] == "time_stop"),
-            "trail_exits":   sum(1 for t in vt if t["exit_reason"] == "trail"),
-        })
-
-    comp_df = pd.DataFrame(comp_rows)
-    print(comp_df.to_string(index=False))
-
-    # ── Per-trade detail for baseline vs live-default trailing stop ──
-    _show_trades(
-        f"Baseline (fixed TP=20%, SL=25%)  [{len(baseline_trades)} trades  "
-        f"win={_win_pct(baseline_trades)}%]",
-        baseline_trades,
-    )
-    live_label = "trail act=10% trail=15% (live default)"
-    live_trades = all_variant_trades[live_label]
-    _show_trades(
-        f"Live default (trailing act=10% trail=15%, SL=25%)  [{len(live_trades)} trades  "
-        f"win={_win_pct(live_trades)}%]",
-        live_trades,
-    )
+    sys.exit(main())

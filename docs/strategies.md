@@ -322,9 +322,12 @@ Guards run in order: if Guard 1 fires, Guards 2 and 3 are skipped. VIX is fetche
 
 | Gate | Rule | Rationale |
 |---|---|---|
-| SPY > 100-day SMA | SPY close > 100-day SMA | In a structural downtrend every oversold bounce is a dead-cat setup; call value decays against a declining underlying |
+| SPY > 100-day SMA | SPY close > 100-day SMA (always) | In a structural downtrend every oversold bounce is a dead-cat setup; call value decays against a declining underlying |
+| VIX percentile (TRENDING only) | Today's VIX ≥ `SPY_OPTIONS_MIN_VIX_PERCENTILE` (0.60) of its trailing-1y ≤-percentile — enforced **only in TRENDING** | A dip in a *calm* uptrend is noise/continuation that theta grinds the long call out on (toxic quadrant: backtest −104%/8 trades, all 3 live losers). In TRENDING trade only when fear is already elevated; RANGING is a mean-reversion regime and trades on the SMA gate alone. See PLAN.md 11.46b. |
 
-Fails **closed** on API failure (no SPY data → no entry). No earnings, liquidity, or breakdown gates — SPY is an ETF; none of those risks apply.
+The VIX gate keys on the **≤-percentile** (fraction of the trailing year ≤ today), *not* the min-max rank — the live winners had percentile 0.64–0.85 but rank only 0.25–0.43, so a rank-based gate would have blocked them. Regime is detected only at the engine (`RegimeDetector`) and passed to the filter via `set_regime` (mirroring `set_symbol`); the filter never detects regime itself.
+
+Fails **closed** on API failure (no SPY data → no entry); the VIX gate likewise fails **closed** in TRENDING when the percentile is unavailable/insufficient. No earnings, liquidity, or breakdown gates — SPY is an ETF; none of those risks apply.
 
 **Regime gating:**
 
