@@ -334,9 +334,13 @@ class BaseStrategy(ABC):
             self._edge_filter.set_symbol(symbol)
         # Inject the current market regime into filters that declare
         # set_regime(). Regime is detected only at the engine; the filter merely
-        # receives the label (e.g. SPYOptionsEdgeFilter gates on it). None →
-        # not injected (offline/back-compat callers keep prior behavior).
-        if current_regime is not None and hasattr(self._edge_filter, "set_regime"):
+        # receives the label (e.g. SPYOptionsEdgeFilter gates on it). We forward
+        # on EVERY evaluation — including ``None`` — so injection is authoritative
+        # per call: a reused filter instance that saw TRENDING once must not keep
+        # a stale regime (and keep enforcing the TRENDING VIX gate) on a later
+        # no-regime/offline call. set_regime(None) resets to the not-enforced
+        # state, matching the documented "no regime injected → gate off" contract.
+        if hasattr(self._edge_filter, "set_regime"):
             self._edge_filter.set_regime(current_regime)
 
         result = self._edge_filter(df)

@@ -257,14 +257,16 @@ class TestInspectSignalsRegimeInjection:
         strat.inspect_signals(_make_df(30), symbol="SPY", current_regime="trending")
         assert recorded.get("regime") == "trending"
 
-    def test_no_regime_leaves_filter_uninjected(self):
-        recorded = {}
+    def test_no_regime_injects_none_authoritatively(self):
+        # Injection is authoritative every call: a no-regime evaluation forwards
+        # None (clearing any stale regime), rather than skipping set_regime.
+        recorded = []
 
         class _RecordingFilter:
             last_reason = ""
 
             def set_regime(self, regime):
-                recorded["regime"] = regime
+                recorded.append(regime)
 
             def __call__(self, df):
                 return pd.Series(True, index=df.index, dtype=bool)
@@ -273,7 +275,31 @@ class TestInspectSignalsRegimeInjection:
             rsi_length=14, rsi_threshold=30, edge_filter=_RecordingFilter()
         )
         strat.inspect_signals(_make_df(30), symbol="SPY")  # no current_regime
-        assert "regime" not in recorded
+        assert recorded == [None]
+
+    def test_reused_filter_does_not_retain_stale_regime(self):
+        # Regression: a filter that enforced the TRENDING VIX gate on one call
+        # must NOT keep enforcing it on a later no-regime call (base.py must
+        # re-inject None, resetting the filter). _VIX_LOW would block in TRENDING.
+        edge = SPYOptionsEdgeFilter(iv_resolver=_iv_resolver_pct(_VIX_LOW))
+        edge._spy_filter = MagicMock(
+            side_effect=lambda df: pd.Series(True, index=df.index, dtype=bool)
+        )
+        edge._spy_filter.last_reason = "SPY above all SMAs [100]"
+        strat = SPYOptionsReversionStrategy(
+            rsi_length=14, rsi_threshold=30, edge_filter=edge
+        )
+        df = _make_df(30)
+
+        # TRENDING + low VIX → gate enforced → blocked.
+        _, _, allowed_trending, _ = strat.inspect_signals(
+            df, symbol="SPY", current_regime="trending"
+        )
+        assert allowed_trending is False
+
+        # Later call with no regime → stale "trending" cleared → gate off → allowed.
+        _, _, allowed_none, _ = strat.inspect_signals(df, symbol="SPY")
+        assert allowed_none is True
 
 
 class TestSPYOptionsStrategyEdgeFilterIntegration:

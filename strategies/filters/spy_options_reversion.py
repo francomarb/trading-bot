@@ -100,6 +100,9 @@ class SPYOptionsEdgeFilter:
         Regime detection stays entirely at the engine (``RegimeDetector``); the
         filter only consumes the label to decide whether to enforce the VIX gate.
         Accepts a ``MarketRegime`` enum (uses ``.value``) or a plain string.
+        ``None`` (or any non-string) clears the regime so the VIX gate is NOT
+        enforced — the engine injects this on every evaluation, so a stale
+        regime cannot leak across calls on a reused filter instance.
         """
         value = getattr(regime, "value", regime)
         self._regime = value.lower() if isinstance(value, str) else None
