@@ -85,7 +85,7 @@ trading-bot/
 │   │   ├── rsi_reversion.py   # RSIEdgeFilter: SPY dual macro, earnings blackout, liquidity, no-new-low
 │   │   ├── bollinger_squeeze.py # BollingerSqueezeEdgeFilter: IEX-scaled liquidity, earnings blackout, exhaustion gate
 │   │   ├── donchian_breakout.py # DonchianEdgeFilter: stock > 200 SMA, IEX-scaled liquidity, short earnings blackout
-│   │   └── spy_options_reversion.py # SPYOptionsEdgeFilter: SPY > 100 SMA
+│   │   └── spy_options_reversion.py # SPYOptionsEdgeFilter: SPY > 100 SMA + TRENDING-only VIX-percentile gate
 │   └── health/                # Strategy Health & Edge Monitor v1 (PLAN 11.10 — advisory only)
 │       ├── stats.py           # Bootstrap CI, one-sided t-test, EMA50/100 cross detector
 │       ├── thresholds.py      # Per-strategy Health-check thresholds (calibration TODOs)
@@ -108,7 +108,7 @@ trading-bot/
 ├── backtest/
 │   ├── runner.py              # vectorbt backtesting harness
 │   ├── reconcile.py           # Forward-test reconciliation (paper vs backtest)
-│   └── spy_options_backtest.py # SPY options RSI reversion backtest
+│   └── spy_options_backtest.py # SPY options reversion backtest (production-mirrored: 100SMA + regime + VIX-percentile gate)
 ├── execution/
 │   ├── broker.py              # AlpacaBroker — TradingClient wrapper + fractional path
 │   ├── stream.py              # StreamManager — TradingStream WebSocket wrapper

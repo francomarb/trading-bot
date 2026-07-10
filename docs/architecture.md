@@ -97,7 +97,7 @@ trading-bot/
 │   │   ├── sma_crossover.py   # SMAEdgeFilter: stock > 200 SMA, volume expansion
 │   │   ├── rsi_reversion.py   # RSIEdgeFilter: SPY50 band, earnings, liquidity, active-breakdown
 │   │   ├── donchian_breakout.py      # DonchianEdgeFilter: stock > 200 SMA, liquidity, earnings
-│   │   ├── spy_options_reversion.py  # SPYOptionsEdgeFilter: SPY > 100 SMA
+│   │   ├── spy_options_reversion.py  # SPYOptionsEdgeFilter: SPY > 100 SMA + TRENDING-only VIX-percentile gate
 │   │   ├── credit_spread.py   # CreditSpreadEdgeFilter: trend + IV proxy + earnings
 │   │   └── sector_momentum.py # SectorMomentumFilter: HOT/NEUTRAL/COLD gate adapter
 │   └── health/                # Strategy Health & Edge Monitor v1 (PLAN.md 11.10 — advisory only)

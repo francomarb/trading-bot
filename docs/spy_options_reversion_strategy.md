@@ -1,8 +1,8 @@
 # SPY Options RSI Reversion — Strategy Research & Deployment Guide
 
-**Status:** ✅ **ACTIVE** — wired in `forward_test.py` on `gemini/options-wip-save` branch.
+**Status:** ✅ **ACTIVE** — wired in `forward_test.py`.
 
-**Last updated:** 2026-05-06 (trailing stop added)
+**Last updated:** 2026-07-09 (TRENDING-only VIX-percentile entry gate — PLAN 11.46b)
 
 ---
 
@@ -45,8 +45,8 @@ human discretion lacks (greed, holding winners past the target).
 | Stop loss | **−25%** of entry premium (hard floor, always active) |
 | Time stop | Wednesday of expiry week at 3:30 PM ET |
 | Delta floor | Exit if Black-Scholes Delta < 0.30 (uses VIX as implied vol, cached daily) |
-| Edge filter | `SPYOptionsEdgeFilter`: SPY close > **100-day SMA** |
-| Regime gate | `TRENDING` or `RANGING` — blocked in BEAR and VOLATILE |
+| Edge filter | `SPYOptionsEdgeFilter`: (1) SPY close > **100-day SMA** (always); (2) **VIX ≤-percentile ≥ 0.60** of its trailing-1y range — enforced **only in TRENDING** (`SPY_OPTIONS_MIN_VIX_PERCENTILE`) |
+| Regime gate | `TRENDING` or `RANGING` — blocked in BEAR and VOLATILE. In TRENDING the VIX gate above additionally requires elevated IV; RANGING trades on the SMA gate alone |
 | Sleeve weight | 0.05 of gross capital |
 | Max positions | 1 concurrent |
 
@@ -85,6 +85,48 @@ The 100 SMA is superior to the 200 SMA: it is faster to reflect regime change, b
 all 2022 entries entirely (0 trades vs. 3 borderline trades with 200 SMA), and delivers
 a higher profit factor (3.08 vs. 2.59) with fewer but cleaner trades.  The 50 SMA and
 no-filter variants bleed badly in 2022 — the filter is load-bearing, not cosmetic.
+
+---
+
+## VIX-percentile entry gate — TRENDING only (PLAN 11.46b, shipped 2026-07-09)
+
+The 2022-whipsaw "future improvement" noted below (a volatility gate) was implemented
+after the 11.46b VIX observation logs, a **production-mirrored** backtest
+(`backtest/spy_options_backtest.py`, 100 SMA + regime gate, 2018–2025), and the first
+live paper trades all converged on the same finding: the oversold-bounce edge splits by
+**regime × implied vol**, and one quadrant is toxic.
+
+Regime × IVR cross-tab (production-mirrored baseline, total P&L% | n):
+
+| | VIX pctile < 0.60 | VIX pctile ≥ 0.60 |
+|---|---|---|
+| **TRENDING** | **−104% \| n=8** (toxic) | +151% \| n=12 |
+| **RANGING** | +183% \| n=9 | +171% \| n=2 |
+
+The levers are independent and complementary: RANGING pays regardless of vol (it is a
+mean-reversion regime), while a TRENDING dip only pays when fear is already elevated — a
+dip in a *calm* uptrend is noise/continuation that theta grinds the long call out on.
+
+**The gate:** in TRENDING regime require today's VIX at or above
+`SPY_OPTIONS_MIN_VIX_PERCENTILE` (0.60) of its trailing-1-year **≤-percentile**
+(`IVProxyResolver.resolve_rank(...).percentile`). RANGING is exempt.
+
+- **Percentile, not min-max rank.** This matters: the three live winners had VIX
+  percentile 0.64 / 0.75 / 0.85 but min-max `rank` only 0.25 / 0.33 / 0.43 — a
+  `rank ≥ 0.60` gate would have blocked all three winners.
+- **Regime stays at the engine.** `RegimeDetector` detects regime; the filter receives
+  it via `set_regime` (mirroring the `set_symbol` injection) and never detects regime
+  itself. Fail-closed in TRENDING when the percentile is unavailable/insufficient.
+
+**Effect (production-mirrored backtest):** baseline +400% / pf 1.69 → gated
++504% / pf 2.33, 23 trades. **Live paper confirmation:** all six post-hardening entries
+were TRENDING; the gate keeps the three winners (+$4,169) and blocks the three losers
+(−$3,094) — a clean 6/6 separation.
+
+**Caveat:** the daily Black-Scholes backtest has no bid/ask spread, commission, or
+intraday premium noise, so absolute %s are an optimistic ceiling; the *relative*
+comparisons (baseline vs gate, the cross-tab) are the trustworthy signal. Advisory until
+confirmed on live paper — in particular the RANGING path is untested live.
 
 ---
 
@@ -171,6 +213,11 @@ hard.  This is a structural whipsaw risk.  A volatility gate or SMA re-tuning co
 this but is deferred — the overall improvement across 6 years is unambiguous.  The 100 SMA
 filter already blocks the most dangerous 2022 entries (no trades after mid-Jan 2022).
 
+> **Update (2026-07-09):** the volatility gate is no longer deferred — the TRENDING-only
+> VIX-percentile gate shipped (see the *VIX-percentile entry gate* section above). It
+> targets exactly this failure mode (a bounce in a lower-vol trend that reverses), by
+> requiring elevated IV before taking a TRENDING dip.
+
 **Per-trade log — trailing stop (live configuration):**
 
 | Entry | Exit | SPY @ Entry | Strike | Expiry | Entry $ | Exit $ | P&L % | Reason |
@@ -215,8 +262,9 @@ filter already blocks the most dangerous 2022 entries (no trades after mid-Jan 2
 | 2025-11-24 | 2025-12-09 | 664.94 | 661.62 | 2025-12-12 | 14.68 | 18.00 | +22.6% | trail |
 | 2025-12-18 | 2025-12-29 | 672.64 | 669.28 | 2026-01-02 | 11.71 | 17.25 | +47.4% | trail |
 
-**Future improvement noted:** 2022 whipsaw risk (Jan/Feb trades) could be addressed with a
-volatility gate (e.g. VIX > threshold) or SMA re-tuning.  Deferred pending paper run data.
+**Future improvement noted (RESOLVED 2026-07-09):** 2022 whipsaw risk (Jan/Feb trades)
+was addressed with the TRENDING-only VIX-percentile gate (PLAN 11.46b) — see the
+*VIX-percentile entry gate* section above.
 
 ---
 
@@ -252,8 +300,9 @@ cumulative — the filter is the single most important risk control in this stra
 | File | Purpose |
 |---|---|
 | `strategies/spy_options_reversion.py` | Strategy class — RSI signal, time stop, Delta floor |
-| `strategies/filters/spy_options_reversion.py` | `SPYOptionsEdgeFilter` — 100 SMA gate |
+| `strategies/filters/spy_options_reversion.py` | `SPYOptionsEdgeFilter` — 100 SMA gate + TRENDING-only VIX-percentile gate |
+| `utils/iv_proxy.py` | `IVProxyResolver` — trailing-1y VIX series, `resolve_rank(...).percentile` for the gate |
 | `utils/options_lookup.py` | OCC contract resolver (`find_best_call`) |
 | `execution/options_executor.py` | Background bracket-order worker |
-| `backtest/spy_options_backtest.py` | Parameter grid backtest script |
-| `tests/test_spy_options_reversion.py` | 14 unit tests |
+| `backtest/spy_options_backtest.py` | Production-mirrored backtest (100 SMA + regime + VIX gate; baseline vs gated, regime×IVR cross-tab, SL sweep) |
+| `tests/test_spy_options_reversion.py` | Unit tests (RSI signal, exit guards, edge filter incl. VIX-gate behavior + regime injection) |

@@ -185,7 +185,7 @@ flipping based on whether the strategy is short or long premium.
 | Consumer | Direction | How IVR gets used |
 |---|---|---|
 | Credit spread (current) | Short premium | Gate — enter only when IVR ≥ floor (premium is rich) |
-| `spy_options_reversion` (current) | Long premium | Gate — skip or switch to debit spread (Tier 2 #C) when IVR is high |
+| `spy_options_reversion` (current) | Long premium | **Gate SHIPPED (PLAN 11.46b) — but the direction inverted from the hypothesis below:** in TRENDING regime, enter *only* when VIX ≤-percentile ≥ 0.60 (elevated IV), not skip-when-high. RANGING is exempt. Evidence (backtest + live 6/6): the directional bounce payoff dominates any IV-crush cost, so the toxic case is TRENDING + *complacent* vol, not high vol. |
 | Bear call spread (G, future) | Short premium | Mirror credit spread |
 | SPY long puts (H, future) | Long premium | Mirror long calls |
 | Bear put debit spread (I, future) | Long premium, capped | Same as H |
@@ -242,16 +242,21 @@ flipping based on whether the strategy is short or long premium.
 11.30 (which is credit-spread-specific). Three possible IVR applications
 to it, in increasing order of behavior change:
 
-1. **Observation-only logging** — compute and record IVR at every signal
-   entry/exit. Zero gate, zero behavior change. Ships safely with the
-   utility and builds an evidence base for future threshold decisions.
-   This is the recommended first step.
-2. **Simple "skip when IVR too high" gate** — capital-neutral but the
-   threshold is a guess without evidence. Defer until application #1
-   has produced data.
+1. **Observation-only logging** — ✅ **SHIPPED** (11.46b `SPY_OPTIONS_IVR`
+   log lines). Built the evidence base that motivated the gate below.
+2. **IVR entry gate** — ✅ **SHIPPED (PLAN 11.46b, 2026-07-09).** But the
+   direction is the **opposite** of the "skip when IVR too high" guess:
+   the evidence (a production-mirrored backtest + live 6/6) showed a
+   TRENDING dip only pays when IV is *already elevated*, so the gate
+   **requires** VIX ≤-percentile ≥ 0.60 in TRENDING and exempts RANGING.
+   Threshold is the ≤-percentile, not the min-max rank (the live winners'
+   rank was only 0.25–0.43). See `docs/spy_options_reversion_strategy.md`.
 3. **Structure switch to bull call debit spread when IVR is rich** —
-   this is Tier 2 #C. Bigger code lift; needs its own paper-watch on
-   long-call behavior across IV regimes (not 11.30).
+   this is Tier 2 #C, still open. Bigger code lift; needs its own
+   paper-watch on long-call behavior across IV regimes (not 11.30). Note
+   the 11.46b finding complicates the naive "debit spread when IV is
+   rich" thesis — for the *directional* bounce, high IV was where the
+   naked long calls did best, not worst.
 
 Recommended sequencing: ship the utility + observation-only logging in
 parallel with the 11.30 wait. Both are free during the observation
@@ -760,7 +765,8 @@ verdict during 11.30:
   Build it now.
 - **`spy_options_reversion` IVR observation logging** (Tier 1 #A, step 1
   application). Zero behavior change; builds evidence base in the
-  background.
+  background. ✅ Shipped — and the evidence graduated it to a live
+  TRENDING-only VIX-percentile gate (PLAN 11.46b, 2026-07-09).
 - **SGOV defensive cash sweep** (PLAN 11.44). Independent of options
   entirely; clearer edge thesis than bear-side options once
   prolonged-BEAR confirmation fires (T-bill yield rather than strategy
