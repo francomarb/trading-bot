@@ -152,10 +152,7 @@ def _replay_event_time(row: Any) -> datetime:
     return datetime.min.replace(tzinfo=timezone.utc)
 
 
-def replay_single_leg_rows(
-    rows: Any,
-    on_sell: Any = None,
-) -> dict[str, dict[str, Any]]:
+def replay_single_leg_rows(rows: Any) -> dict[str, dict[str, Any]]:
     """Replay single-leg trade rows into per-symbol open state.
 
     ``rows`` are sqlite3.Row-like mappings with at least: id, timestamp,
@@ -166,13 +163,6 @@ def replay_single_leg_rows(
     reconciliation backfills exit rows with higher ids and earlier
     execution timestamps, and an id-ordered replay would blend adjacent
     positions of the same symbol into one weighted basis.
-
-    ``on_sell``, when provided, is invoked as ``on_sell(row, state)``
-    for every sell row BEFORE its quantity is applied, with ``state``
-    a snapshot of the symbol's open state at that moment. This is the
-    hook `scripts/repair_stop_fill_pnl.py` uses to recompute what each
-    exit row should have booked — sharing this walk keeps the repair
-    tool and the production replay from drifting apart.
 
     Each symbol's state carries ``entry_fill_price_source`` — one of
     the ENTRY_BASIS_* constants, or None while flat — recording whether
@@ -256,8 +246,6 @@ def replay_single_leg_rows(
             continue
 
         if side == "sell":
-            if on_sell is not None:
-                on_sell(row, dict(current))
             if qty <= 0:
                 current["open_qty"] = 0.0
             else:
@@ -2202,8 +2190,8 @@ class TradeLogger:
                 f"(source={replay_source}) and no lifecycle "
                 f"avg_entry_price is available — leaving realized_pnl "
                 f"NULL instead of booking against a reference price. "
-                f"Repair via scripts/repair_stop_fill_pnl.py once the "
-                f"entry fill is backfilled."
+                f"The row needs a manual UPDATE once the broker entry "
+                f"fill is known (see PR #82 for the repair pattern)."
             )
         return None
 
