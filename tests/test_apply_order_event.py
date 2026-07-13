@@ -26,7 +26,10 @@ transaction. Discovery doc §6.4 / §6.5 / §6.6 / §6.6.1.
 from __future__ import annotations
 
 import sqlite3
+from datetime import datetime, timezone
 from pathlib import Path
+from types import SimpleNamespace
+from unittest.mock import MagicMock
 
 import pytest
 
@@ -37,7 +40,9 @@ from engine.lifecycle_orders import (
     PositionLifecycleOrdersStore,
     apply_order_event,
 )
+from execution.broker import BrokerSnapshot, OpenOrder
 from reporting.logger import TradeLogger
+from risk.manager import Side
 
 
 # ── Fixtures ────────────────────────────────────────────────────────────────
@@ -2105,6 +2110,92 @@ class TestSubstrateReconcileStartup:
         # The outcome doesn't echo the reason back, but the call
         # itself succeeding with reason='startup' confirms the
         # API accepts the parameter the startup reconciler uses.
+
+    def test_open_snapshot_advances_pending_order_to_working(
+        self, conn, pos_store, orders_store,
+    ):
+        """A broker-open order can miss the stream's status-only
+        accepted/new event. Cycle/startup reconciliation should still
+        advance the substrate row from pending to working without
+        creating a trade row or performing a REST fetch."""
+        from engine.trader import TradingEngine
+
+        uid = _seed_position(
+            pos_store,
+            owner_key="WYFI",
+            entry_qty=4.0,
+            strategy="donchian_breakout",
+        )
+        pos_store.mark_open(
+            position_uid=uid,
+            avg_entry_price=33.85,
+            current_qty=4.0,
+        )
+        _insert_protective_stop(
+            orders_store,
+            uid,
+            client_order_id="donchian_breakout-recover-stop-f25547f2fe",
+            intended_qty=4.0,
+            stop_price=29.09,
+        )
+        order_id = _attach_and_get_order_id(
+            orders_store,
+            "donchian_breakout-recover-stop-f25547f2fe",
+            order_id="3f602dd0-3e87-45b6-99bc-ab18b26b1fc8",
+        )
+        engine = SimpleNamespace(
+            lifecycle_orders_store=orders_store,
+            broker=SimpleNamespace(
+                _with_retry=MagicMock(
+                    side_effect=AssertionError("REST fetch not expected")
+                ),
+                _api=SimpleNamespace(get_order_by_id=MagicMock()),
+            ),
+            _maybe_dispatch_substrate_entry_fill=MagicMock(),
+            _maybe_dispatch_substrate_exit_fill=MagicMock(),
+            _maybe_dispatch_substrate_stop_fill=MagicMock(),
+        )
+        snapshot = BrokerSnapshot(
+            account=SimpleNamespace(),
+            open_orders=[
+                OpenOrder(
+                    order_id=order_id,
+                    symbol="WYFI",
+                    side=Side.SELL,
+                    qty=4.0,
+                    order_type="stop",
+                    status="new",
+                    submitted_at=datetime(
+                        2026, 6, 18, 13, 34, 21,
+                        tzinfo=timezone.utc,
+                    ),
+                    limit_price=None,
+                    stop_price=29.09,
+                    client_order_id="donchian_breakout-recover-stop-f25547f2fe",
+                    time_in_force="gtc",
+                )
+            ],
+        )
+
+        TradingEngine._reconcile_substrate_via_rest(
+            engine,
+            snapshot,
+            reason="cycle",
+            limit=20,
+        )
+
+        row = orders_store.get_by_order_id(order_id)
+        assert row is not None
+        assert row.status == "working"
+        assert row.filled_qty == 0.0
+        assert conn.execute(
+            "SELECT COUNT(*) FROM trades WHERE order_id = ?",
+            (order_id,),
+        ).fetchone()[0] == 0
+        engine.broker._with_retry.assert_not_called()
+        engine._maybe_dispatch_substrate_entry_fill.assert_not_called()
+        engine._maybe_dispatch_substrate_exit_fill.assert_not_called()
+        engine._maybe_dispatch_substrate_stop_fill.assert_not_called()
 
 
 # ── P-6 commit B: substrate entry-fill dispatch ─────────────────────────────

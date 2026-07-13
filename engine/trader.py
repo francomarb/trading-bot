@@ -8013,7 +8013,7 @@ class TradingEngine:
             o.order_id: o for o in snapshot.open_orders
             if getattr(o, "order_id", None)
         }
-        from engine.lifecycle_orders import apply_order_event
+        from engine.lifecycle_orders import OrderEvent, apply_order_event
 
         rest_calls = 0
         for row in rows:
@@ -8021,7 +8021,56 @@ class TradingEngine:
             if oid is None:
                 continue
             if oid in open_by_id:
-                # Still active at the broker; the stream owns it.
+                # Still active at the broker. If the stream missed the
+                # initial status-only accepted/new event, snapshot truth can
+                # safely advance pending → working without inventing fills.
+                if row.status == "pending":
+                    open_order = open_by_id[oid]
+                    raw_status = getattr(open_order, "status", None)
+                    status_val = (
+                        raw_status.value if hasattr(raw_status, "value")
+                        else str(raw_status) if raw_status is not None
+                        else None
+                    )
+                    substrate_status = (
+                        _ALPACA_STATUS_TO_SUBSTRATE_STATUS.get(status_val)
+                        if status_val is not None
+                        else None
+                    )
+                    if substrate_status == "working":
+                        submitted_at = getattr(open_order, "submitted_at", None)
+                        broker_updated_at = (
+                            submitted_at.isoformat()
+                            if hasattr(submitted_at, "isoformat")
+                            else datetime.now(timezone.utc).isoformat()
+                        )
+                        try:
+                            outcome = apply_order_event(
+                                self.lifecycle_orders_store._conn,
+                                OrderEvent(
+                                    order_id=oid,
+                                    status="working",
+                                    filled_qty=0.0,
+                                    avg_fill_price=None,
+                                    broker_updated_at=broker_updated_at,
+                                    execution_id=None,
+                                ),
+                                reason=f"{reason}_open_snapshot",
+                            )
+                        except Exception as exc:
+                            logger.critical(
+                                f"substrate {reason} reconcile: "
+                                f"open-order status advance raised for "
+                                f"{oid}: {type(exc).__name__}: {exc}"
+                            )
+                            continue
+                        if outcome.applied:
+                            logger.info(
+                                f"substrate {reason} reconcile: "
+                                f"open order_id={oid} advanced to "
+                                f"status=working (position "
+                                f"{outcome.new_status})"
+                            )
                 continue
             # Enforce the REST-call cap on candidates that
             # actually need a fetch, AFTER the open-orders filter.
