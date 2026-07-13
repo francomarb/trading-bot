@@ -819,13 +819,17 @@ class TestRiskManagerNotionalCap:
         assert decision.qty == 80
 
     def test_first_position_does_not_automatically_take_concentration_maximum(self):
+        # Production defaults include the 11.48 per-strategy risk targets:
+        # sma_crossover risks 0.60% of $100k = $600. Stop distance
+        # 2×ATR = $40/share → 15 shares = $1,500 notional, well below the
+        # $16,560 concentration cap — risk sizes the trade, not the cap.
         decision = self._risk().evaluate(
             self._signal(price=100.0, atr=20.0),
             _account(equity=100_000.0),
             notional_cap=16_560.0,
         )
-        assert decision.qty == 50
-        assert decision.qty * decision.entry_reference_price == pytest.approx(5_000.0)
+        assert decision.qty == 15
+        assert decision.qty * decision.entry_reference_price == pytest.approx(1_500.0)
 
 
 class TestEngineAllocatorIntegration:

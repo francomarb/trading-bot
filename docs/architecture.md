@@ -425,13 +425,19 @@ At $100k equity, 80% deployable gross, 85/15 pool split, and a 40% concentration
 
 RiskManager still sizes from stop-risk first; the allocator only caps strategy capital. Equity sleeves may borrow idle equity-pool capital up to 115% of target while total deployable utilization remains below 80%. Rejection codes remain `SLEEVE_FULL` (capital exhausted), `SLEEVE_MAX_POSITIONS` (hard safety ceiling), and `SLEEVE_DRAWDOWN`.
 
+**11.48 (2026-07-13) — "stop-risk first" is now enforced, not aspirational.** The 2026-07 sizing audit showed the old global 2% risk parameter was arithmetically unreachable beneath the notional caps (2% risk at 2×ATR stops needs 25–50% of equity in one calm name), so the caps had silently become the sizer: per-trade dollar risk ranged $55–$1,900 and scaled with each symbol's ATR%. Per-strategy risk targets (`STRATEGY_RISK_PER_TRADE_PCT`: donchian 0.40%, sma 0.60%, rsi 0.25% of account equity) are now derived from measured watchlist ATR coverage so the risk rule sizes normal entries and the caps clip only the calmest names — every clip is logged with the binding cap by name. Derivation, history, and re-derivation triggers: [`allocator_risk_target_reconciliation.md`](allocator_risk_target_reconciliation.md).
+
 The isolated options pool uses the same `SleeveAllocator` and HWM drawdown gate as equity strategies. Single-leg option P&L is recorded with a 100× contract multiplier so the drawdown gate operates on real dollar amounts, not premium points. Credit-spread sleeve usage is based on defined max loss (`width − credit`) × contracts × 100, and realized spread P&L is fed back into the same allocator HWM gate on close.
 
 #### Risk Manager (`risk/manager.py`)
 
 **Responsibilities:**
 - Validate signals against current portfolio state
-- Enforce ATR-based position sizing (risk no more than 2% of equity per trade)
+- Enforce ATR-based position sizing: per-strategy risk-to-stop targets
+  (`STRATEGY_RISK_PER_TRADE_PCT` — donchian 0.40%, sma 0.60%, rsi 0.25% of
+  equity, 11.48) beneath the `MAX_POSITION_PCT` 2% global ceiling, which also
+  serves as the fallback for strategies without a target. (Pre-11.48: a single
+  2% rule that the notional caps overruled on essentially every entry.)
 - Enforce daily / hard-dollar loss limits against Alpaca prior-close equity when
   available; account-loss halts stay sticky for that broker baseline and
   recompute after baseline rollover.

@@ -189,6 +189,22 @@ This better matches the intent of the allocator:
 - the design transitions more cleanly into a later Kelly-based allocator where
   strategy capital, concentration, and count limits remain distinct controls
 
+Update 2026-07-13 (11.48 — risk-target reconciliation):
+
+The 2026-07 sizing audit found that "the risk manager still sizes from
+stop-risk first" had quietly stopped being true: the global 2% risk
+parameter was arithmetically unreachable beneath the concentration caps
+(2% risk at a `2 x ATR` stop needs `1% / ATR%` of equity in notional —
+25–50% for calm names), so the caps sized essentially every entry and
+per-trade dollar risk became proportional to each symbol's ATR% — the
+exact "oversizing volatile symbols" outcome this section exists to avoid.
+The fix keeps this section's architecture unchanged and re-derives the one
+stale parameter: per-strategy `risk_per_trade_pct` targets
+(donchian 0.40%, sma 0.60%, rsi 0.25% of equity), each set to the largest
+value the per-position caps can honor across the strategy's measured
+watchlist ATR distribution. Derivation, worked examples, and re-derivation
+triggers: `docs/allocator_risk_target_reconciliation.md`.
+
 ### 3.5 Regime-Aware Capital Tilting
 
 An optional enhancement is to tilt capital between broad strategy buckets based
