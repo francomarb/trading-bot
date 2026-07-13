@@ -2523,12 +2523,17 @@ def _write_buy(tl: TradeLogger, symbol: str, strategy: str) -> None:
 
 
 def _write_sell(tl: TradeLogger, symbol: str, strategy: str) -> None:
-    """Insert a filled sell row into a TradeLogger's DB."""
+    """Insert a filled sell row into a TradeLogger's DB.
+
+    The row is stamped with the current time so it replays AFTER the
+    ``_write_buy`` row it closes — the open-state replay is ordered by
+    event timestamp, not insertion order.
+    """
     from reporting.logger import TradeRecord
 
     tl.log(
         TradeRecord(
-            timestamp="2026-04-23T10:00:00+00:00",
+            timestamp=datetime.now(timezone.utc).isoformat(),
             symbol=symbol,
             side="sell",
             qty=10,
@@ -2641,6 +2646,102 @@ class TestDurableOwnershipFromDB:
     def test_read_owner_for_symbol_no_db(self, tmp_path):
         tl = TradeLogger(path=str(tmp_path / "no_trades.db"))
         assert tl.read_owner_for_symbol("AAPL") is None
+
+
+class TestRestoreEntryPrices:
+    """_restore_entry_prices_from_db must never seed _entry_prices with
+    a reference-tainted basis — it feeds _record_realized_pnl and the
+    allocator's HWM drawdown gate (2026-07 realized-P&L audit)."""
+
+    def _write_fill_less_buy(self, tl: TradeLogger, symbol: str, strategy: str) -> None:
+        """A buy row whose broker fill was never recorded — the replay
+        basis falls back to entry_reference_price and is tagged."""
+        from reporting.logger import TradeRecord
+
+        tl.log(
+            TradeRecord(
+                timestamp=datetime.now(timezone.utc).isoformat(),
+                symbol=symbol,
+                side="buy",
+                qty=10,
+                avg_fill_price=None,
+                order_id="ord-buy-no-fill",
+                strategy=strategy,
+                reason="test entry",
+                stop_price=95.0,
+                entry_reference_price=100.0,
+                modeled_slippage_bps=None,
+                realized_slippage_bps=None,
+                order_type="market",
+                status="filled",
+                requested_qty=10,
+                filled_qty=10,
+                initial_stop_loss=95.0,
+                initial_risk_per_share=5.0,
+                initial_risk_dollars=50.0,
+                entry_timestamp=datetime.now(timezone.utc).isoformat(),
+                position_type="single_leg",
+            )
+        )
+
+    def _restore(self, engine, positions):
+        snap = _snapshot(positions=positions)
+        engine._restore_ownership_from_db(snap)
+        engine._restore_entry_prices_from_db(snap)
+
+    def test_broker_fill_basis_restores(self, patch_fetch, tmp_path):
+        positions = {"AAPL": Position("AAPL", 10, 100.0, 1000.0)}
+        engine, _, tl = _engine_with_db(patch_fetch, tmp_path, positions=positions)
+        _write_buy(tl, "AAPL", "fake_strategy")
+        self._restore(engine, positions)
+        assert engine._entry_prices["AAPL"] == pytest.approx(100.5)
+
+    def test_reference_tainted_basis_is_not_restored(self, patch_fetch, tmp_path):
+        positions = {"AAPL": Position("AAPL", 10, 100.0, 1000.0)}
+        engine, _, tl = _engine_with_db(patch_fetch, tmp_path, positions=positions)
+        self._write_fill_less_buy(tl, "AAPL", "fake_strategy")
+        self._restore(engine, positions)
+        assert "AAPL" not in engine._entry_prices
+
+    def test_missing_source_key_is_refused_not_assumed(self, patch_fetch, tmp_path):
+        """A context without entry_fill_price_source has UNKNOWN
+        provenance — it must fall through to the lifecycle rescue (and
+        be skipped when no lifecycle row exists), never be treated as a
+        broker fill. Failing open here would invert the rule this
+        function exists to enforce."""
+        positions = {"AAPL": Position("AAPL", 10, 100.0, 1000.0)}
+        engine, _, tl = _engine_with_db(patch_fetch, tmp_path, positions=positions)
+        _write_buy(tl, "AAPL", "fake_strategy")
+        engine.trade_logger.read_latest_open_entry_context = MagicMock(
+            return_value={
+                "entry_fill_price": 123.0,
+                "entry_timestamp": datetime.now(timezone.utc).isoformat(),
+                "open_qty": 10.0,
+            }
+        )
+        self._restore(engine, positions)
+        assert "AAPL" not in engine._entry_prices
+
+    def test_lifecycle_basis_rescues_tainted_replay(self, patch_fetch, tmp_path):
+        positions = {"AAPL": Position("AAPL", 10, 100.0, 1000.0)}
+        engine, _, tl = _engine_with_db(patch_fetch, tmp_path, positions=positions)
+        self._write_fill_less_buy(tl, "AAPL", "fake_strategy")
+        uid = "pos_" + "b" * 32
+        engine.lifecycle_store.create_pending(
+            position_uid=uid,
+            symbol="AAPL",
+            owner_key="AAPL",
+            strategy="fake_strategy",
+            position_type="single_leg",
+            entry_qty=10.0,
+        )
+        engine.lifecycle_store.mark_open(
+            position_uid=uid,
+            avg_entry_price=100.5,
+            current_qty=10.0,
+        )
+        self._restore(engine, positions)
+        assert engine._entry_prices["AAPL"] == pytest.approx(100.5)
 
 
 # ── Startup reconciliation modes (10.C2) ──────────────────────────────────
@@ -2805,6 +2906,11 @@ class TestStartupReconciliation:
         broker.sync_with_broker.side_effect = [startup, startup]
         _write_buy(tl, "AAPL", "fake_strategy")
         broker.find_recent_filled_stop_order.return_value = None
+        # The recovered sell must carry an execution time AFTER the buy
+        # row just written (which is stamped now) — the open-state
+        # replay orders rows by event timestamp, and a sell that
+        # predates its buy is an impossible history.
+        recovered_at = datetime.now(timezone.utc)
         broker.find_recent_filled_sell_orders.return_value = [
             ClosedOrderInfo(
                 order_id="startup-exit-1",
@@ -2818,8 +2924,8 @@ class TestStartupReconciliation:
                 filled_qty=10.0,
                 avg_fill_price=99.0,
                 stop_price=None,
-                submitted_at=T0 + timedelta(minutes=1),
-                filled_at=T0 + timedelta(minutes=2),
+                submitted_at=recovered_at + timedelta(minutes=1),
+                filled_at=recovered_at + timedelta(minutes=2),
             )
         ]
         engine._record_realized_pnl = MagicMock()
@@ -3013,6 +3119,9 @@ class TestExternalCloseDetection:
         engine._register_single_leg(strategy_name="fake_strategy", symbol="AAPL")
         engine._entry_prices["AAPL"] = 100.5
         engine.broker.find_recent_filled_stop_order = MagicMock(return_value=None)
+        # Recovered sells must postdate the now-stamped buy row — the
+        # open-state replay orders rows by event timestamp.
+        recovered_at = datetime.now(timezone.utc)
         engine.broker.find_recent_filled_sell_orders = MagicMock(
             return_value=[
                 ClosedOrderInfo(
@@ -3027,8 +3136,8 @@ class TestExternalCloseDetection:
                     filled_qty=qty,
                     avg_fill_price=price,
                     stop_price=None,
-                    submitted_at=T0 + timedelta(minutes=index),
-                    filled_at=T0 + timedelta(minutes=index),
+                    submitted_at=recovered_at + timedelta(minutes=index),
+                    filled_at=recovered_at + timedelta(minutes=index),
                 )
                 for index, qty, price in [(1, 4.0, 101.0), (2, 6.0, 99.0)]
             ]
