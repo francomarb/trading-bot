@@ -31,6 +31,9 @@ from reporting.alerts import (
     LogFileBackend,
 )
 from reporting.logger import (
+    ENTRY_BASIS_BROKER_FILL,
+    ENTRY_BASIS_MIXED,
+    ENTRY_BASIS_REFERENCE_FALLBACK,
     TRADE_CSV_COLUMNS,
     TradeLogger,
     TradeRecord,
@@ -2757,6 +2760,309 @@ class TestLogStopFillSlippageContract:
         # (Phase 1 dual-write removed in Phase 2).
         assert row["realized_slippage_bps"] is None
         assert row["modeled_slippage_bps"] is None
+
+
+# ── Open-state replay chronology + entry-basis provenance ──────────────────
+
+
+def _single_leg_row(
+    *,
+    symbol: str,
+    side: str,
+    qty: float,
+    fill: float | None,
+    reference: float,
+    timestamp: str,
+    order_id: str,
+    strategy: str = "fake_strategy",
+    reason: str = "test",
+    order_type: str = "market",
+    entry_timestamp: str | None = None,
+    initial_stop_loss: float | None = None,
+    initial_risk_per_share: float | None = None,
+    initial_risk_dollars: float | None = None,
+    realized_pnl: float | None = None,
+    r_multiple: float | None = None,
+    exit_timestamp: str | None = None,
+) -> TradeRecord:
+    """Build a minimal filled single-leg trades row with explicit
+    timestamps, so tests can write out-of-order (backfilled) histories."""
+    return TradeRecord(
+        timestamp=timestamp,
+        symbol=symbol,
+        side=side,
+        qty=qty,
+        avg_fill_price=fill,
+        order_id=order_id,
+        strategy=strategy,
+        reason=reason,
+        stop_price=0.0,
+        entry_reference_price=reference,
+        modeled_slippage_bps=None,
+        realized_slippage_bps=None,
+        order_type=order_type,
+        status="filled",
+        requested_qty=qty,
+        filled_qty=qty,
+        initial_stop_loss=initial_stop_loss,
+        initial_risk_per_share=initial_risk_per_share,
+        initial_risk_dollars=initial_risk_dollars,
+        realized_pnl=realized_pnl,
+        r_multiple=r_multiple,
+        entry_timestamp=entry_timestamp or timestamp,
+        exit_timestamp=exit_timestamp,
+        position_id=symbol,
+        position_type="single_leg",
+    )
+
+
+class TestReplayChronologyAndBasisSource:
+    """The open-state replay must be chronological (event timestamp,
+    then id), and it must record the provenance of the weighted entry
+    basis. Regression tests for the trade-320 blend and the trade-285/
+    288/290/301 reference-basis P&L corruption (2026-07 audit)."""
+
+    T1 = "2026-05-01T10:00:00+00:00"
+    T2 = "2026-05-10T10:00:00+00:00"
+    T3 = "2026-06-01T10:00:00+00:00"
+    T4 = "2026-06-09T10:00:00+00:00"
+
+    def test_backfilled_exit_does_not_blend_adjacent_positions(self, tmp_csv):
+        """A reconciliation-backfilled exit (higher id, earlier
+        timestamp) must close position 1 BEFORE position 2's entry is
+        replayed — id-ordered replay blended both into one basis."""
+        tl = TradeLogger(path=tmp_csv)
+        tl.log(_single_leg_row(
+            symbol="QCOM", side="buy", qty=14.0, fill=245.0,
+            reference=245.0, timestamp=self.T1, order_id="b1",
+        ))
+        tl.log(_single_leg_row(
+            symbol="QCOM", side="buy", qty=16.0, fill=228.0,
+            reference=251.0, timestamp=self.T3, order_id="b2",
+        ))
+        # Backfilled exit of position 1: written last, executed between
+        # the two entries.
+        tl.log(_single_leg_row(
+            symbol="QCOM", side="sell", qty=14.0, fill=195.5,
+            reference=245.0, timestamp=self.T2, order_id="s1",
+            exit_timestamp=self.T2,
+        ))
+
+        state = tl._read_single_leg_open_state()["QCOM"]
+        assert state["open_qty"] == pytest.approx(16.0)
+        assert state["entry_fill_price"] == pytest.approx(228.0)
+        assert state["entry_timestamp"] == self.T3
+        assert state["entry_fill_price_source"] == ENTRY_BASIS_BROKER_FILL
+
+    def test_stop_fill_books_against_correct_position_basis(self, tmp_csv):
+        """End-to-end trade-320 regression: the stop fill after a
+        backfilled exit books P&L against position 2's broker fill."""
+        tl = TradeLogger(path=tmp_csv)
+        tl.log(_single_leg_row(
+            symbol="QCOM", side="buy", qty=14.0, fill=245.0,
+            reference=245.0, timestamp=self.T1, order_id="b1",
+        ))
+        tl.log(_single_leg_row(
+            symbol="QCOM", side="buy", qty=16.0, fill=228.0,
+            reference=251.0, timestamp=self.T3, order_id="b2",
+        ))
+        tl.log(_single_leg_row(
+            symbol="QCOM", side="sell", qty=14.0, fill=195.5,
+            reference=245.0, timestamp=self.T2, order_id="s1",
+            exit_timestamp=self.T2,
+        ))
+
+        tl.log_stop_fill(
+            symbol="QCOM",
+            strategy="fake_strategy",
+            qty=16.0,
+            avg_fill_price=195.0,
+            stop_price=195.5,
+            order_id="s2",
+            timestamp_override=datetime.fromisoformat(self.T4),
+        )
+        row = next(r for r in tl.read_all() if r["order_id"] == "s2")
+        assert row["realized_pnl"] == pytest.approx((195.0 - 228.0) * 16.0)
+        assert row["entry_timestamp"] == self.T3
+
+    def test_basis_source_broker_fill(self, tmp_csv):
+        tl = TradeLogger(path=tmp_csv)
+        tl.log(_single_leg_row(
+            symbol="AAPL", side="buy", qty=10.0, fill=100.5,
+            reference=100.0, timestamp=self.T1, order_id="b1",
+        ))
+        context = tl.read_latest_open_entry_context(
+            symbol="AAPL", strategy="fake_strategy",
+        )
+        assert context["entry_fill_price"] == pytest.approx(100.5)
+        assert context["entry_fill_price_source"] == ENTRY_BASIS_BROKER_FILL
+
+    def test_basis_source_reference_fallback(self, tmp_csv):
+        """A buy row with no broker fill falls back to the reference
+        price for qty/ownership reconstruction — tagged, not silent."""
+        tl = TradeLogger(path=tmp_csv)
+        tl.log(_single_leg_row(
+            symbol="AAPL", side="buy", qty=10.0, fill=None,
+            reference=100.0, timestamp=self.T1, order_id="b1",
+        ))
+        context = tl.read_latest_open_entry_context(
+            symbol="AAPL", strategy="fake_strategy",
+        )
+        assert context["entry_fill_price"] == pytest.approx(100.0)
+        assert (
+            context["entry_fill_price_source"] == ENTRY_BASIS_REFERENCE_FALLBACK
+        )
+
+    def test_basis_source_mixed_on_scale_in(self, tmp_csv):
+        tl = TradeLogger(path=tmp_csv)
+        tl.log(_single_leg_row(
+            symbol="AAPL", side="buy", qty=10.0, fill=100.0,
+            reference=100.0, timestamp=self.T1, order_id="b1",
+        ))
+        tl.log(_single_leg_row(
+            symbol="AAPL", side="buy", qty=10.0, fill=None,
+            reference=110.0, timestamp=self.T2, order_id="b2",
+        ))
+        state = tl._read_single_leg_open_state()["AAPL"]
+        assert state["entry_fill_price"] == pytest.approx(105.0)
+        assert state["entry_fill_price_source"] == ENTRY_BASIS_MIXED
+
+    def test_basis_source_resets_after_full_close(self, tmp_csv):
+        tl = TradeLogger(path=tmp_csv)
+        tl.log(_single_leg_row(
+            symbol="AAPL", side="buy", qty=10.0, fill=None,
+            reference=100.0, timestamp=self.T1, order_id="b1",
+        ))
+        tl.log(_single_leg_row(
+            symbol="AAPL", side="sell", qty=10.0, fill=99.0,
+            reference=99.0, timestamp=self.T2, order_id="s1",
+            exit_timestamp=self.T2,
+        ))
+        tl.log(_single_leg_row(
+            symbol="AAPL", side="buy", qty=5.0, fill=101.0,
+            reference=101.5, timestamp=self.T3, order_id="b2",
+        ))
+        state = tl._read_single_leg_open_state()["AAPL"]
+        assert state["entry_fill_price"] == pytest.approx(101.0)
+        assert state["entry_fill_price_source"] == ENTRY_BASIS_BROKER_FILL
+
+
+class TestExitBasisRefusalAndLifecycleRescue:
+    """Exit writers must never book realized P&L against a
+    reference-tainted basis (PLAN 'Durable Design Decisions'). When the
+    replay basis is unusable, the lifecycle substrate's
+    ``avg_entry_price`` is the fallback; failing that, realized_pnl
+    stays honestly NULL."""
+
+    T1 = "2026-05-01T10:00:00+00:00"
+    UID = "pos_" + "a" * 32
+
+    def _entry_without_fill(self, tmp_csv) -> TradeLogger:
+        tl = TradeLogger(path=tmp_csv)
+        tl.log(_single_leg_row(
+            symbol="AAPL", side="buy", qty=10.0, fill=None,
+            reference=100.0, timestamp=self.T1, order_id="b1",
+            initial_risk_per_share=5.0,
+        ))
+        return tl
+
+    def _mark_lifecycle_open(self, tl: TradeLogger, avg_entry_price: float) -> None:
+        from engine.lifecycle import PositionLifecycleStore
+
+        store = PositionLifecycleStore(tl._ensure_db())
+        store.create_pending(
+            position_uid=self.UID,
+            symbol="AAPL",
+            owner_key="AAPL",
+            strategy="fake_strategy",
+            position_type="single_leg",
+            entry_qty=10.0,
+        )
+        store.mark_open(
+            position_uid=self.UID,
+            avg_entry_price=avg_entry_price,
+            current_qty=10.0,
+        )
+
+    def test_stop_fill_refuses_reference_basis(self, tmp_csv):
+        tl = self._entry_without_fill(tmp_csv)
+        tl.log_stop_fill(
+            symbol="AAPL",
+            strategy="fake_strategy",
+            qty=10.0,
+            avg_fill_price=95.0,
+            stop_price=95.0,
+            order_id="s1",
+        )
+        row = next(r for r in tl.read_all() if r["order_id"] == "s1")
+        assert row["realized_pnl"] is None
+        assert row["r_multiple"] is None
+
+    def test_stop_fill_uses_lifecycle_basis_when_replay_unusable(self, tmp_csv):
+        tl = self._entry_without_fill(tmp_csv)
+        self._mark_lifecycle_open(tl, avg_entry_price=101.5)
+        tl.log_stop_fill(
+            symbol="AAPL",
+            strategy="fake_strategy",
+            qty=10.0,
+            avg_fill_price=95.0,
+            stop_price=95.0,
+            order_id="s1",
+            position_uid=self.UID,
+        )
+        row = next(r for r in tl.read_all() if r["order_id"] == "s1")
+        assert row["realized_pnl"] == pytest.approx((95.0 - 101.5) * 10.0)
+        # r_multiple stays consistent with the booked P&L.
+        assert row["r_multiple"] == pytest.approx(-65.0 / 50.0)
+
+    def test_stop_fill_books_normally_against_broker_fill(self, tmp_csv):
+        tl = TradeLogger(path=tmp_csv)
+        tl.log(_single_leg_row(
+            symbol="AAPL", side="buy", qty=10.0, fill=100.5,
+            reference=100.0, timestamp=self.T1, order_id="b1",
+        ))
+        tl.log_stop_fill(
+            symbol="AAPL",
+            strategy="fake_strategy",
+            qty=10.0,
+            avg_fill_price=95.0,
+            stop_price=95.0,
+            order_id="s1",
+        )
+        row = next(r for r in tl.read_all() if r["order_id"] == "s1")
+        assert row["realized_pnl"] == pytest.approx((95.0 - 100.5) * 10.0)
+
+    def test_build_close_record_refuses_reference_basis(self, tmp_csv, sample_result):
+        tl = self._entry_without_fill(tmp_csv)
+        record = tl.build_close_record(
+            sample_result,
+            strategy_name="fake_strategy",
+            modeled_price=96.0,
+            benchmark_kind="arrival_midpoint",
+        )
+        assert record.realized_pnl is None
+        assert record.r_multiple is None
+
+    def test_build_close_record_uses_lifecycle_basis(self, tmp_csv, sample_result):
+        tl = self._entry_without_fill(tmp_csv)
+        self._mark_lifecycle_open(tl, avg_entry_price=101.5)
+        record = tl.build_close_record(
+            sample_result,
+            strategy_name="fake_strategy",
+            modeled_price=96.0,
+            benchmark_kind="arrival_midpoint",
+            position_uid=self.UID,
+        )
+        assert record.realized_pnl == pytest.approx(
+            (sample_result.avg_fill_price - 101.5) * 10.0
+        )
+
+    def test_read_lifecycle_entry_basis_contract(self, tmp_csv):
+        tl = self._entry_without_fill(tmp_csv)
+        assert tl.read_lifecycle_entry_basis(None) is None
+        assert tl.read_lifecycle_entry_basis("pos_" + "f" * 32) is None
+        self._mark_lifecycle_open(tl, avg_entry_price=101.5)
+        assert tl.read_lifecycle_entry_basis(self.UID) == pytest.approx(101.5)
 
 
 # ── TestPnLTracker ──────────────────────────────────────────────────────────

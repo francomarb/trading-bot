@@ -117,6 +117,163 @@ def mleg_realized_slippage_bps(
     return round(bps, 2)
 
 
+# ── Single-leg open-state replay ────────────────────────────────────────────
+
+# Provenance of the weighted entry-fill basis reconstructed by
+# `replay_single_leg_rows`. Realized P&L may only be booked against a
+# BROKER_FILL basis (PLAN "Durable Design Decisions": broker fill cost
+# basis, never the strategy's decision/reference price). A
+# REFERENCE_FALLBACK or MIXED basis is still useful for ownership /
+# quantity reconstruction, but writers must not silently turn it into
+# realized P&L.
+ENTRY_BASIS_BROKER_FILL = "broker_fill"
+ENTRY_BASIS_REFERENCE_FALLBACK = "reference_fallback"
+ENTRY_BASIS_MIXED = "mixed"
+
+
+def _replay_event_time(row: Any) -> datetime:
+    """Best-effort UTC event time for a trades row, for replay ordering.
+
+    Unparseable or missing timestamps sort first (they predate the
+    ISO-normalized writers), with the row id as the tiebreaker.
+    """
+    raw = row["timestamp"]
+    if raw:
+        try:
+            parsed = datetime.fromisoformat(str(raw).replace("Z", "+00:00"))
+            if parsed.tzinfo is None:
+                parsed = parsed.replace(tzinfo=timezone.utc)
+            return parsed.astimezone(timezone.utc)
+        except ValueError:
+            logger.warning(
+                f"trade log replay: unparseable timestamp {raw!r} on row "
+                f"id={row['id']} — sorting it before all timestamped rows"
+            )
+    return datetime.min.replace(tzinfo=timezone.utc)
+
+
+def replay_single_leg_rows(
+    rows: Any,
+    on_sell: Any = None,
+) -> dict[str, dict[str, Any]]:
+    """Replay single-leg trade rows into per-symbol open state.
+
+    ``rows`` are sqlite3.Row-like mappings with at least: id, timestamp,
+    symbol, strategy, side, qty, filled_qty, stop_price, avg_fill_price,
+    entry_reference_price, initial_stop_loss, initial_risk_per_share,
+    entry_timestamp. They may arrive in any order — the replay sorts by
+    (event timestamp, id). Insertion order (id) is NOT chronological:
+    reconciliation backfills exit rows with higher ids and earlier
+    execution timestamps, and an id-ordered replay would blend adjacent
+    positions of the same symbol into one weighted basis.
+
+    ``on_sell``, when provided, is invoked as ``on_sell(row, state)``
+    for every sell row BEFORE its quantity is applied, with ``state``
+    a snapshot of the symbol's open state at that moment. This is the
+    hook `scripts/repair_stop_fill_pnl.py` uses to recompute what each
+    exit row should have booked — sharing this walk keeps the repair
+    tool and the production replay from drifting apart.
+
+    Each symbol's state carries ``entry_fill_price_source`` — one of
+    the ENTRY_BASIS_* constants, or None while flat — recording whether
+    the weighted basis traces purely to broker fills or (partly) to the
+    legacy entry_reference_price fallback for buy rows that lack
+    ``avg_fill_price``.
+    """
+    ordered = sorted(
+        rows, key=lambda row: (_replay_event_time(row), int(row["id"]))
+    )
+    state: dict[str, dict[str, Any]] = {}
+    for row in ordered:
+        symbol = row["symbol"]
+        side = str(row["side"] or "").lower()
+        qty_raw = row["filled_qty"] if row["filled_qty"] is not None else row["qty"]
+        qty = float(qty_raw or 0.0)
+        current = state.get(symbol)
+        if current is None:
+            current = {
+                "strategy": None,
+                "open_qty": 0.0,
+                "stop_price": None,
+                "entry_reference_price": None,
+                "entry_fill_price": None,
+                "entry_fill_price_source": None,
+                "initial_stop_loss": None,
+                "initial_risk_per_share": None,
+                "entry_timestamp": None,
+            }
+            state[symbol] = current
+
+        if side == "buy":
+            if current["open_qty"] <= 0:
+                current["strategy"] = row["strategy"]
+                current["stop_price"] = (
+                    float(row["stop_price"]) if row["stop_price"] is not None else None
+                )
+                current["entry_reference_price"] = (
+                    float(row["entry_reference_price"])
+                    if row["entry_reference_price"] is not None else None
+                )
+                current["initial_stop_loss"] = (
+                    float(row["initial_stop_loss"])
+                    if row["initial_stop_loss"] is not None else None
+                )
+                current["initial_risk_per_share"] = (
+                    float(row["initial_risk_per_share"])
+                    if row["initial_risk_per_share"] is not None else None
+                )
+                current["entry_timestamp"] = row["entry_timestamp"]
+            # Legacy rows may lack a broker fill; the reference-price
+            # fallback keeps qty/ownership reconstruction working for
+            # them, but the resulting basis is tagged so no writer can
+            # silently book realized P&L against a reference price.
+            chunk_source = (
+                ENTRY_BASIS_BROKER_FILL
+                if row["avg_fill_price"] is not None
+                else ENTRY_BASIS_REFERENCE_FALLBACK
+            )
+            fill_price_raw = (
+                row["avg_fill_price"]
+                if row["avg_fill_price"] is not None
+                else row["entry_reference_price"]
+            )
+            fill_price = (
+                float(fill_price_raw) if fill_price_raw is not None else None
+            )
+            if fill_price is not None and fill_price > 0 and qty > 0:
+                existing_qty = max(0.0, float(current["open_qty"]))
+                existing_price = current["entry_fill_price"]
+                if existing_qty <= 0 or existing_price is None:
+                    current["entry_fill_price"] = fill_price
+                    current["entry_fill_price_source"] = chunk_source
+                else:
+                    current["entry_fill_price"] = (
+                        float(existing_price) * existing_qty + fill_price * qty
+                    ) / (existing_qty + qty)
+                    if current["entry_fill_price_source"] != chunk_source:
+                        current["entry_fill_price_source"] = ENTRY_BASIS_MIXED
+            current["open_qty"] += qty
+            continue
+
+        if side == "sell":
+            if on_sell is not None:
+                on_sell(row, dict(current))
+            if qty <= 0:
+                current["open_qty"] = 0.0
+            else:
+                current["open_qty"] = max(0.0, current["open_qty"] - qty)
+            if current["open_qty"] <= 1e-9:
+                current["strategy"] = None
+                current["stop_price"] = None
+                current["entry_reference_price"] = None
+                current["entry_fill_price"] = None
+                current["entry_fill_price_source"] = None
+                current["initial_stop_loss"] = None
+                current["initial_risk_per_share"] = None
+                current["entry_timestamp"] = None
+    return state
+
+
 # ── Structured JSON sink ────────────────────────────────────────────────────
 
 
@@ -780,17 +937,21 @@ class TradeLogger:
                     * float(result.filled_qty or 0)
                     * multiplier
                 )
-            if (
-                result.avg_fill_price is not None
-                and context["entry_fill_price"] is not None
-            ):
-                realized_pnl = (
-                    (float(result.avg_fill_price) - float(context["entry_fill_price"]))
-                    * float(result.filled_qty or 0)
-                    * multiplier
-                )
-                if initial_risk_dollars and initial_risk_dollars > 0:
-                    r_multiple = realized_pnl / initial_risk_dollars
+        entry_basis = self._resolve_entry_fill_basis(
+            symbol=result.symbol,
+            strategy=strategy_name,
+            context=context,
+            position_uid=position_uid,
+            caller="build_close_record",
+        )
+        if result.avg_fill_price is not None and entry_basis is not None:
+            realized_pnl = (
+                (float(result.avg_fill_price) - entry_basis)
+                * float(result.filled_qty or 0)
+                * multiplier
+            )
+            if initial_risk_dollars and initial_risk_dollars > 0:
+                r_multiple = realized_pnl / initial_risk_dollars
 
         # ── Slippage unification (Phase 1) ──
         # Default kind = 'unavailable' is the safe behavior — no caller
@@ -1534,20 +1695,25 @@ class TradeLogger:
         r_multiple = None
         entry_timestamp = None
         entry_reference_price = 0.0
-        entry_fill_price = 0.0
         multiplier = _contract_multiplier(symbol)
         if context is not None:
             initial_stop_loss = context["initial_stop_loss"]
             initial_risk_per_share = context["initial_risk_per_share"]
             entry_timestamp = context["entry_timestamp"]
             entry_reference_price = float(context["entry_reference_price"] or 0.0)
-            entry_fill_price = float(context["entry_fill_price"] or 0.0)
             if initial_risk_per_share is not None:
                 initial_risk_dollars = float(initial_risk_per_share) * qty * multiplier
-            if entry_fill_price > 0:
-                realized_pnl = (avg_fill_price - entry_fill_price) * qty * multiplier
-                if initial_risk_dollars and initial_risk_dollars > 0:
-                    r_multiple = realized_pnl / initial_risk_dollars
+        entry_basis = self._resolve_entry_fill_basis(
+            symbol=symbol,
+            strategy=strategy,
+            context=context,
+            position_uid=position_uid,
+            caller="log_stop_fill",
+        )
+        if entry_basis is not None:
+            realized_pnl = (avg_fill_price - entry_basis) * qty * multiplier
+            if initial_risk_dollars and initial_risk_dollars > 0:
+                r_multiple = realized_pnl / initial_risk_dollars
 
         # ── Slippage unification (Phase 1) ──
         # Broker stop_price is the authoritative benchmark. When absent,
@@ -1959,11 +2125,87 @@ class TradeLogger:
         return {
             "entry_reference_price": state.get("entry_reference_price"),
             "entry_fill_price": state.get("entry_fill_price"),
+            "entry_fill_price_source": state.get("entry_fill_price_source"),
             "initial_stop_loss": state.get("initial_stop_loss"),
             "initial_risk_per_share": state.get("initial_risk_per_share"),
             "entry_timestamp": state.get("entry_timestamp"),
             "open_qty": state.get("open_qty"),
         }
+
+    def read_lifecycle_entry_basis(self, position_uid: str | None) -> float | None:
+        """Return ``position_lifecycle.avg_entry_price`` for ``position_uid``.
+
+        The lifecycle substrate records the broker entry fill basis at
+        ``mark_open`` and keeps it after the row reaches a terminal
+        status, so it stays valid even when the trade-log replay basis
+        is unavailable or traces to a reference price. Returns None when
+        the uid is absent, the row has no positive finite basis, or the
+        table can't be read.
+        """
+        if not position_uid or not os.path.exists(self._path):
+            return None
+        try:
+            conn = self._ensure_db()
+            row = conn.execute(
+                "SELECT avg_entry_price FROM position_lifecycle "
+                "WHERE position_uid = ?",
+                (position_uid,),
+            ).fetchone()
+        except sqlite3.Error:
+            return None
+        if row is None or row[0] is None:
+            return None
+        basis = float(row[0])
+        if not math.isfinite(basis) or basis <= 0:
+            return None
+        return basis
+
+    def _resolve_entry_fill_basis(
+        self,
+        *,
+        symbol: str,
+        strategy: str,
+        context: dict | None,
+        position_uid: str | None,
+        caller: str,
+    ) -> float | None:
+        """Resolve the broker-fill entry basis for a close/stop writer.
+
+        Priority:
+          1. Replay basis whose provenance is purely broker fills.
+          2. ``position_lifecycle.avg_entry_price`` via ``position_uid``.
+          3. None — and if a reference-tainted replay basis exists, a
+             CRITICAL log explains why it was refused rather than
+             silently booked (PLAN "Durable Design Decisions": realized
+             P&L uses broker fill cost basis, never reference prices).
+        """
+        replay_basis = 0.0
+        replay_source = None
+        if context is not None:
+            replay_basis = float(context.get("entry_fill_price") or 0.0)
+            replay_source = context.get("entry_fill_price_source")
+        if replay_basis > 0 and replay_source == ENTRY_BASIS_BROKER_FILL:
+            return replay_basis
+        lifecycle_basis = self.read_lifecycle_entry_basis(position_uid)
+        if lifecycle_basis is not None:
+            logger.info(
+                f"{symbol} [{strategy}] {caller}: trade-log replay basis "
+                f"unavailable (source={replay_source}) — using lifecycle "
+                f"avg_entry_price ${lifecycle_basis:.2f} for "
+                f"{position_uid}"
+            )
+            return lifecycle_basis
+        if replay_basis > 0:
+            logger.critical(
+                f"{symbol} [{strategy}] {caller}: entry basis "
+                f"${replay_basis:.2f} traces to entry_reference_price "
+                f"(source={replay_source}) and no lifecycle "
+                f"avg_entry_price is available — leaving realized_pnl "
+                f"NULL instead of booking against a reference price. "
+                f"Repair via scripts/repair_stop_fill_pnl.py once the "
+                f"entry fill is backfilled."
+            )
+        return None
 
     def has_recorded_order_id(self, order_id: str | None) -> bool:
         """True if the trade log already contains ``order_id``."""
@@ -1980,7 +2222,15 @@ class TradeLogger:
         return cursor.fetchone() is not None
 
     def _read_single_leg_open_state(self) -> dict[str, dict[str, Any]]:
-        """Return open state keyed by symbol, including weighted fill basis."""
+        """Return open state keyed by symbol, including weighted fill basis.
+
+        The replay is chronological (event timestamp, then id) — NOT
+        insertion order. Reconciliation backfills missed exit rows with
+        higher ids but earlier execution timestamps; an id-ordered
+        replay applied such an exit after a subsequent re-entry and
+        blended two adjacent positions of the same symbol into one
+        weighted basis (the QCOM trade-320 corruption).
+        """
         if not os.path.exists(self._path):
             return {}
         try:
@@ -1989,90 +2239,14 @@ class TradeLogger:
             return {}
         conn.row_factory = sqlite3.Row
         cursor = conn.execute(
-            "SELECT symbol, strategy, side, qty, filled_qty, stop_price, "
-            "avg_fill_price, entry_reference_price, initial_stop_loss, "
-            "initial_risk_per_share, entry_timestamp "
+            "SELECT id, timestamp, symbol, strategy, side, qty, filled_qty, "
+            "stop_price, avg_fill_price, entry_reference_price, "
+            "initial_stop_loss, initial_risk_per_share, entry_timestamp "
             "FROM trades "
             "WHERE status IN ('filled', 'partial') "
-            "AND (position_type IS NULL OR position_type != 'spread') "
-            "ORDER BY id"
+            "AND (position_type IS NULL OR position_type != 'spread')"
         )
-
-        state: dict[str, dict[str, Any]] = {}
-        for row in cursor.fetchall():
-            symbol = row["symbol"]
-            side = str(row["side"] or "").lower()
-            qty_raw = row["filled_qty"] if row["filled_qty"] is not None else row["qty"]
-            qty = float(qty_raw or 0.0)
-            current = state.get(symbol)
-            if current is None:
-                current = {
-                    "strategy": None,
-                    "open_qty": 0.0,
-                    "stop_price": None,
-                    "entry_reference_price": None,
-                    "entry_fill_price": None,
-                    "initial_stop_loss": None,
-                    "initial_risk_per_share": None,
-                    "entry_timestamp": None,
-                }
-                state[symbol] = current
-
-            if side == "buy":
-                if current["open_qty"] <= 0:
-                    current["strategy"] = row["strategy"]
-                    current["stop_price"] = (
-                        float(row["stop_price"]) if row["stop_price"] is not None else None
-                    )
-                    current["entry_reference_price"] = (
-                        float(row["entry_reference_price"])
-                        if row["entry_reference_price"] is not None else None
-                    )
-                    current["initial_stop_loss"] = (
-                        float(row["initial_stop_loss"])
-                        if row["initial_stop_loss"] is not None else None
-                    )
-                    current["initial_risk_per_share"] = (
-                        float(row["initial_risk_per_share"])
-                        if row["initial_risk_per_share"] is not None else None
-                    )
-                    current["entry_timestamp"] = row["entry_timestamp"]
-                # Legacy rows may lack a broker fill, so preserve the old
-                # reference-price fallback without using it for newer rows.
-                fill_price_raw = (
-                    row["avg_fill_price"]
-                    if row["avg_fill_price"] is not None
-                    else row["entry_reference_price"]
-                )
-                fill_price = (
-                    float(fill_price_raw) if fill_price_raw is not None else None
-                )
-                if fill_price is not None and fill_price > 0 and qty > 0:
-                    existing_qty = max(0.0, float(current["open_qty"]))
-                    existing_price = current["entry_fill_price"]
-                    if existing_qty <= 0 or existing_price is None:
-                        current["entry_fill_price"] = fill_price
-                    else:
-                        current["entry_fill_price"] = (
-                            float(existing_price) * existing_qty + fill_price * qty
-                        ) / (existing_qty + qty)
-                current["open_qty"] += qty
-                continue
-
-            if side == "sell":
-                if qty <= 0:
-                    current["open_qty"] = 0.0
-                else:
-                    current["open_qty"] = max(0.0, current["open_qty"] - qty)
-                if current["open_qty"] <= 1e-9:
-                    current["strategy"] = None
-                    current["stop_price"] = None
-                    current["entry_reference_price"] = None
-                    current["entry_fill_price"] = None
-                    current["initial_stop_loss"] = None
-                    current["initial_risk_per_share"] = None
-                    current["entry_timestamp"] = None
-        return state
+        return replay_single_leg_rows(cursor.fetchall())
 
     def read_latest_open_entry_context(
         self, *, symbol: str, strategy: str

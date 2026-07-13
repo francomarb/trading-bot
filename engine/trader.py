@@ -102,7 +102,11 @@ from risk.manager import (
     Signal,
 )
 from reporting.alerts import AlertDispatcher
-from reporting.logger import TradeLogger, single_leg_realized_slippage_bps
+from reporting.logger import (
+    ENTRY_BASIS_BROKER_FILL,
+    TradeLogger,
+    single_leg_realized_slippage_bps,
+)
 from reporting.pnl import PnLTracker
 from strategies.base import (
     BaseStrategy,
@@ -10308,13 +10312,58 @@ class TradingEngine:
             if context is None:
                 continue
             entry_price = float(context.get("entry_fill_price") or 0.0)
-            if entry_price <= 0.0:
-                continue
+            # Contexts built before the basis-provenance fix (or mocked
+            # in tests) lack the source key; treat those as broker fills
+            # to preserve their behavior.
+            basis_source = (
+                context.get("entry_fill_price_source")
+                or ENTRY_BASIS_BROKER_FILL
+            )
+            if entry_price <= 0.0 or basis_source != ENTRY_BASIS_BROKER_FILL:
+                # Replay basis is missing or traces (partly) to
+                # entry_reference_price. _entry_prices feeds
+                # _record_realized_pnl → the allocator's HWM drawdown
+                # gate, so a reference basis must not be seeded here.
+                # The lifecycle substrate keeps the broker fill basis.
+                lifecycle_price = self._lifecycle_avg_entry_price(owner_key)
+                if lifecycle_price is None:
+                    if entry_price > 0.0:
+                        logger.warning(
+                            f"restart: NOT restoring entry price for {sym} "
+                            f"(owner_key='{owner_key}') — replay basis "
+                            f"${entry_price:.2f} has source="
+                            f"'{basis_source}' and no lifecycle "
+                            f"avg_entry_price exists; realized P&L for "
+                            f"this position will be conservatively "
+                            f"skipped at close"
+                        )
+                    continue
+                entry_price = lifecycle_price
+                logger.info(
+                    f"restart: replay basis unavailable for {sym} "
+                    f"(source='{basis_source}') — using lifecycle "
+                    f"avg_entry_price ${entry_price:.2f}"
+                )
             self._entry_prices[owner_key] = entry_price
             logger.info(
                 f"restart: restored entry price for {sym} "
                 f"(owner_key='{owner_key}') at ${entry_price:.2f}"
             )
+
+    def _lifecycle_avg_entry_price(self, owner_key: str) -> float | None:
+        """Broker entry fill basis from the open lifecycle row, if any."""
+        try:
+            row = self.lifecycle_store.get_open_for_owner_key(owner_key)
+        except Exception as exc:
+            logger.debug(
+                f"lifecycle avg_entry_price lookup for '{owner_key}' raised "
+                f"{type(exc).__name__}: {exc}"
+            )
+            return None
+        if row is None or row.avg_entry_price is None:
+            return None
+        price = float(row.avg_entry_price)
+        return price if price > 0.0 else None
 
     def _reconcile_startup(
         self, snapshot: BrokerSnapshot, conflict_symbols: set[str]
