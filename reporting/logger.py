@@ -169,6 +169,17 @@ def replay_single_leg_rows(rows: Any) -> dict[str, dict[str, Any]]:
     the weighted basis traces purely to broker fills or (partly) to the
     legacy entry_reference_price fallback for buy rows that lack
     ``avg_fill_price``.
+
+    This state has a live-money consumer beyond P&L bookkeeping:
+    ``read_latest_open_stop_price`` feeds the engine's
+    ``_repair_missing_protective_stops``, so ``stop_price`` here
+    decides where a replacement broker stop is placed. Under the old
+    id-ordered replay, a trade-320-shaped history (buy → backfilled
+    partial sell → buy) left ``stop_price`` stale from the PREVIOUS
+    position — in production the June 2026 QCOM stop was repaired at
+    the May position's 195.57 level instead of the intended 218.64,
+    riding ~$370 of avoidable loss to 195.51 after price traded
+    through 218.64 with no exit.
     """
     ordered = sorted(
         rows, key=lambda row: (_replay_event_time(row), int(row["id"]))
@@ -2192,6 +2203,19 @@ class TradeLogger:
                 f"NULL instead of booking against a reference price. "
                 f"The row needs a manual UPDATE once the broker entry "
                 f"fill is known (see PR #82 for the repair pattern)."
+            )
+        else:
+            # No replay basis at all (no open entry state) and no
+            # lifecycle row — the exit row will carry a NULL
+            # realized_pnl that the allocator gate never counts, so the
+            # cause must be traceable from the log.
+            logger.warning(
+                f"{symbol} [{strategy}] {caller}: no entry basis "
+                f"available — the trade-log replay has no open entry "
+                f"fill for this position and no position_lifecycle row "
+                f"matches position_uid={position_uid or '(none)'}; "
+                f"realized_pnl will be NULL for this exit row and the "
+                f"allocator drawdown gate will not count it."
             )
         return None
 

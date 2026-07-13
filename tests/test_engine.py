@@ -2703,6 +2703,25 @@ class TestRestoreEntryPrices:
         self._restore(engine, positions)
         assert "AAPL" not in engine._entry_prices
 
+    def test_missing_source_key_is_refused_not_assumed(self, patch_fetch, tmp_path):
+        """A context without entry_fill_price_source has UNKNOWN
+        provenance — it must fall through to the lifecycle rescue (and
+        be skipped when no lifecycle row exists), never be treated as a
+        broker fill. Failing open here would invert the rule this
+        function exists to enforce."""
+        positions = {"AAPL": Position("AAPL", 10, 100.0, 1000.0)}
+        engine, _, tl = _engine_with_db(patch_fetch, tmp_path, positions=positions)
+        _write_buy(tl, "AAPL", "fake_strategy")
+        engine.trade_logger.read_latest_open_entry_context = MagicMock(
+            return_value={
+                "entry_fill_price": 123.0,
+                "entry_timestamp": datetime.now(timezone.utc).isoformat(),
+                "open_qty": 10.0,
+            }
+        )
+        self._restore(engine, positions)
+        assert "AAPL" not in engine._entry_prices
+
     def test_lifecycle_basis_rescues_tainted_replay(self, patch_fetch, tmp_path):
         positions = {"AAPL": Position("AAPL", 10, 100.0, 1000.0)}
         engine, _, tl = _engine_with_db(patch_fetch, tmp_path, positions=positions)

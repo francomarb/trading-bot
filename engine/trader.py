@@ -10312,13 +10312,12 @@ class TradingEngine:
             if context is None:
                 continue
             entry_price = float(context.get("entry_fill_price") or 0.0)
-            # Contexts built before the basis-provenance fix (or mocked
-            # in tests) lack the source key; treat those as broker fills
-            # to preserve their behavior.
-            basis_source = (
-                context.get("entry_fill_price_source")
-                or ENTRY_BASIS_BROKER_FILL
-            )
+            # Unknown provenance is refused, not assumed: a context
+            # without the source key falls through to the lifecycle
+            # rescue below rather than being treated as a broker fill —
+            # this is the function the basis-provenance fix hardens,
+            # so it must not fail open on the missing key.
+            basis_source = context.get("entry_fill_price_source")
             if entry_price <= 0.0 or basis_source != ENTRY_BASIS_BROKER_FILL:
                 # Replay basis is missing or traces (partly) to
                 # entry_reference_price. _entry_prices feeds
@@ -10354,15 +10353,15 @@ class TradingEngine:
         """Broker entry fill basis from the open lifecycle row, if any."""
         try:
             row = self.lifecycle_store.get_open_for_owner_key(owner_key)
+            if row is None or row.avg_entry_price is None:
+                return None
+            price = float(row.avg_entry_price)
         except Exception as exc:
             logger.debug(
                 f"lifecycle avg_entry_price lookup for '{owner_key}' raised "
                 f"{type(exc).__name__}: {exc}"
             )
             return None
-        if row is None or row.avg_entry_price is None:
-            return None
-        price = float(row.avg_entry_price)
         return price if price > 0.0 else None
 
     def _reconcile_startup(

@@ -2778,6 +2778,7 @@ def _single_leg_row(
     reason: str = "test",
     order_type: str = "market",
     entry_timestamp: str | None = None,
+    stop_price: float = 0.0,
     initial_stop_loss: float | None = None,
     initial_risk_per_share: float | None = None,
     initial_risk_dollars: float | None = None,
@@ -2796,7 +2797,7 @@ def _single_leg_row(
         order_id=order_id,
         strategy=strategy,
         reason=reason,
-        stop_price=0.0,
+        stop_price=stop_price,
         entry_reference_price=reference,
         modeled_slippage_bps=None,
         realized_slippage_bps=None,
@@ -2884,6 +2885,40 @@ class TestReplayChronologyAndBasisSource:
         row = next(r for r in tl.read_all() if r["order_id"] == "s2")
         assert row["realized_pnl"] == pytest.approx((195.0 - 228.0) * 16.0)
         assert row["entry_timestamp"] == self.T3
+
+    def test_stop_repair_reads_current_position_stop_level(self, tmp_csv):
+        """read_latest_open_stop_price feeds the engine's
+        _repair_missing_protective_stops — a LIVE-MONEY consumer of the
+        replayed state. Under the old id-ordered replay, this
+        trade-320-shaped history left stop_price stale from position 1:
+        the June 2026 QCOM broker stop was repaired at the May
+        position's 195.57 instead of the intended 218.64 and rode ~$370
+        of avoidable loss. The chronological replay must return the
+        CURRENT position's stop."""
+        tl = TradeLogger(path=tmp_csv)
+        tl.log(_single_leg_row(
+            symbol="QCOM", side="buy", qty=14.0, fill=245.0,
+            reference=245.0, timestamp=self.T1, order_id="b1",
+            stop_price=195.57,
+        ))
+        tl.log(_single_leg_row(
+            symbol="QCOM", side="buy", qty=16.0, fill=228.0,
+            reference=251.0, timestamp=self.T3, order_id="b2",
+            stop_price=218.64,
+        ))
+        # Backfilled partial exit of position 1 (higher id, earlier
+        # execution) — under id-order it replayed AFTER buy 2, leaving
+        # open_qty > 0 at buy 2's turn so position 1's stop survived.
+        tl.log(_single_leg_row(
+            symbol="QCOM", side="sell", qty=14.0, fill=195.5,
+            reference=245.0, timestamp=self.T2, order_id="s1",
+            exit_timestamp=self.T2,
+        ))
+
+        stop = tl.read_latest_open_stop_price(
+            symbol="QCOM", strategy="fake_strategy",
+        )
+        assert stop == pytest.approx(218.64)
 
     def test_basis_source_broker_fill(self, tmp_csv):
         tl = TradeLogger(path=tmp_csv)
@@ -3063,6 +3098,34 @@ class TestExitBasisRefusalAndLifecycleRescue:
         assert tl.read_lifecycle_entry_basis("pos_" + "f" * 32) is None
         self._mark_lifecycle_open(tl, avg_entry_price=101.5)
         assert tl.read_lifecycle_entry_basis(self.UID) == pytest.approx(101.5)
+
+    def test_missing_context_and_lifecycle_warns_loudly(self, tmp_csv):
+        """The honest-NULL worst case (no replay state, no lifecycle
+        row) must be traceable from the log — the allocator gate will
+        never count this exit."""
+        from loguru import logger as loguru_logger
+
+        messages: list[str] = []
+        sink_id = loguru_logger.add(messages.append, level="WARNING")
+        try:
+            tl = TradeLogger(path=tmp_csv)
+            tl.log_stop_fill(
+                symbol="AAPL",
+                strategy="fake_strategy",
+                qty=10.0,
+                avg_fill_price=95.0,
+                stop_price=95.0,
+                order_id="s1",
+                position_uid="pos_" + "c" * 32,
+            )
+        finally:
+            loguru_logger.remove(sink_id)
+        row = next(r for r in tl.read_all() if r["order_id"] == "s1")
+        assert row["realized_pnl"] is None
+        logged = "".join(messages)
+        assert "no entry basis available" in logged
+        assert "log_stop_fill" in logged
+        assert "pos_" + "c" * 32 in logged
 
 
 # ── TestPnLTracker ──────────────────────────────────────────────────────────
