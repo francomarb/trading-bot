@@ -153,6 +153,14 @@ Notes:
 - Reproduce the ATR distributions: `fetch_symbol(sym, ..., feed="sip")` per
   watchlist + `add_atr(df, 14)`, last bar `atr_14/close`. Re-run before
   changing any T — the coverage points move with market volatility.
+- **The targets are coupled to the watchlists' calm end.** Re-run the ATR
+  measurement whenever a watchlist changes. Drift fails soft in both
+  directions: wilder watchlist → T merely becomes conservative; calmer
+  additions → only those names get cap-clipped below target (risk moves
+  DOWN, never disperses up), and the §7 cap-clip logging surfaces it
+  organically. Routine clip logs on multiple names = the floor moved →
+  re-derive. If dynamic watchlists (PLAN 11.1) ever ship, fold this
+  measurement into the watchlist refresh itself.
 - Related but explicitly out of scope: same-day correlated-cohort entry
   staggering (needs the 2016–2024 SIP backtest with production gates and an
   explicit signal-ranking rule; see the Donchian trade-profile findings).
