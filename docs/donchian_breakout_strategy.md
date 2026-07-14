@@ -334,8 +334,8 @@ Eight independent layers are active when Donchian runs in production:
 | Regime gate | `allowed_regimes={TRENDING}` — blocks entries in BEAR, VOLATILE, RANGING | No new entries |
 | HWM drawdown gate | Pause entries if cumulative realized P&L > 15% below sleeve peak | No new entries per strategy |
 | ATR stop | 2× ATR below entry for every position | Per-trade loss cap |
-| Per-position risk cap | `MAX_POSITION_PCT=2%` — max 2% equity at risk per trade | Per-trade sizing |
-| Sleeve max positions | 5 concurrent Donchian positions maximum | Concentration cap |
+| Per-position risk target | `risk_per_trade_pct=0.40%` of equity at risk per trade (11.48), beneath the `MAX_POSITION_PCT=2%` global ceiling | Per-trade sizing |
+| Sleeve max positions | 8 concurrent Donchian positions maximum (`hard_max_positions`) | Concentration cap |
 | Gross exposure cap | `MAX_GROSS_EXPOSURE_PCT=0.80` | Portfolio-level |
 | Daily session loss cap | `MAX_DAILY_LOSS_PCT=5%` — engine halts against Alpaca prior-close when available | Portfolio-level |
 | Hard dollar loss cap | `HARD_DOLLAR_LOSS_CAP=$2,000` from Alpaca prior-close when available | Emergency halt |

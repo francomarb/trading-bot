@@ -107,7 +107,10 @@ The stop does **not** trail. Its purpose is to cap loss when the
 oversold cross was the *start* of a sustained breakdown rather than an
 overshoot to fade (the "falling knife" failure mode). The ATR stop also
 serves as the denominator for fixed-fractional position sizing
-(`risk_dollars = equity × max_position_pct; qty = risk_dollars / |entry − stop|`).
+(`risk_dollars = equity × risk_per_trade_pct["rsi_reversion"]` — 0.25% of
+equity per 11.48; `qty = risk_dollars / |entry − stop|`. `MAX_POSITION_PCT`
+= 2% remains only the global ceiling; pre-11.48 it was the formula input
+but the notional caps overruled it on essentially every entry).
 
 **Note on the 90-day GTC ceiling.** Alpaca auto-cancels GTC orders
 after 90 days. RSI's limit-order entries occasionally sit open for

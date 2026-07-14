@@ -63,7 +63,7 @@ All gates must pass for an entry to be allowed. Exits are never blocked.
 |---|---|---|
 | Stock trend | `close > 200-day SMA` | Avoids crossovers in structurally broken names |
 | Volume expansion | 10-day avg volume > 30-day avg volume | Confirms institutional participation |
-| Pre-earnings blackout | No new entry within 2 days before earnings (`days_after=0`) | OTO stop cannot protect against an overnight gap; a 20% earnings miss bypasses `MAX_POSITION_PCT` entirely. Post-earnings entries allowed immediately to capture trend acceleration. |
+| Pre-earnings blackout | No new entry within 2 days before earnings (`days_after=0`) | OTO stop cannot protect against an overnight gap; a 20% earnings miss bypasses the per-trade risk budget (`risk_per_trade_pct`, 11.48) entirely. Post-earnings entries allowed immediately to capture trend acceleration. |
 
 **Sector momentum filter (`strategies/filters/sector_momentum.py` — `SectorMomentumFilter`):**
 
@@ -528,16 +528,19 @@ STRATEGY_ALLOCATIONS = {
         "target_pct": 0.40, "type": "equity", "priority": 3,
         "can_stretch": True, "hard_max_positions": 8,
         "max_position_pct_of_sleeve": 0.40,
+        "risk_per_trade_pct": 0.006,   # 11.48: 0.60% of equity risk-to-stop
     },
     "rsi_reversion": {
         "target_pct": 0.20, "type": "equity", "priority": 1,
         "can_stretch": True, "hard_max_positions": 8,
         "max_position_pct_of_sleeve": 0.40,
+        "risk_per_trade_pct": 0.0025,  # 11.48: 0.25% of equity risk-to-stop
     },
     "donchian_breakout": {
         "target_pct": 0.25, "type": "equity", "priority": 2,
         "can_stretch": True, "hard_max_positions": 8,
         "max_position_pct_of_sleeve": 0.40,
+        "risk_per_trade_pct": 0.004,   # 11.48: 0.40% of equity risk-to-stop
     },
     "spy_options_reversion": {
         "target_pct": 0.05, "type": "isolated", "priority": 0,
