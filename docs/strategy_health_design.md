@@ -51,7 +51,7 @@ These four bullets are the user's stated priorities. **Every design decision mus
 **What the bot is NOT allowed to do in v1:**
 - Modify `STRATEGY_ALLOCATIONS` or any sleeve weight
 - Halt a strategy, set it to cooldown, or skip its signals
-- Reduce position sizing or change `MAX_POSITION_PCT`
+- Reduce position sizing (lower the strategy's `risk_per_trade_pct`, 11.48)
 - Cancel pending orders based on health verdicts
 - Trigger any change to `RiskManager`, `SleeveAllocator`, or `TradingEngine` *behavior* based on its own assessments
 - Track whether the operator followed a recommendation (this is not a feedback-loop system in v1)

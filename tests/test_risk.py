@@ -31,6 +31,7 @@ from datetime import datetime, timedelta, timezone
 
 import pytest
 
+from config import settings
 from risk.manager import (
     AccountState,
     OrderType,
@@ -99,6 +100,10 @@ def _mgr(**overrides) -> RiskManager:
     """
     defaults = dict(
         max_position_pct=0.02,
+        # Empty: legacy tests exercise the global max_position_pct
+        # semantics. Per-strategy 11.48 targets are covered explicitly
+        # in TestPerStrategyRiskTargets.
+        risk_per_trade_pct_by_strategy={},
         max_open_positions=3,
         max_gross_exposure_pct=0.50,
         atr_stop_multiplier=2.0,
@@ -552,6 +557,133 @@ class TestStopAndSizing:
 
 
 # ── Duplicate position + max positions ──────────────────────────────────────
+
+
+class TestPerStrategyRiskTargets:
+    """11.48 — per-strategy risk-to-stop targets beneath the global ceiling.
+
+    Contract (docs/allocator_risk_target_reconciliation.md): the risk rule
+    sizes normal entries; the notional caps clip only the calmest names,
+    and every clip is logged with the binding cap.
+    """
+
+    def _target_mgr(self, **overrides) -> RiskManager:
+        defaults = dict(
+            risk_per_trade_pct_by_strategy={
+                "donchian_breakout": 0.004,
+                "sma_crossover": 0.006,
+                "rsi_reversion": 0.0025,
+            },
+        )
+        defaults.update(overrides)
+        return _mgr(**defaults)
+
+    def test_strategy_target_sizes_wild_name_exactly(self):
+        # Donchian 0.40% on $100k = $400 target. 4%-ATR name: stop
+        # distance $8/share → ~50 shares, ~$5k notional, no cap binds.
+        mgr = self._target_mgr()
+        result = mgr.evaluate(
+            _signal(strategy="donchian_breakout", price=100.0, atr=4.0),
+            _account(equity=100_000.0),
+            now=T0,
+        )
+        assert isinstance(result, RiskDecision)
+        loss_at_stop = result.qty * (result.entry_reference_price - result.stop_price)
+        assert loss_at_stop == pytest.approx(400.0, rel=0.01)
+
+    def test_equal_dollar_risk_across_volatility(self):
+        """The point of 11.48: calm and wild names lose the same dollars
+        at their stops (within cap coverage), instead of risk ∝ ATR%."""
+        mgr = self._target_mgr(max_position_notional_pct=1.0)
+        losses = []
+        for atr in (3.0, 6.0, 9.0):
+            result = mgr.evaluate(
+                _signal(strategy="donchian_breakout", price=100.0, atr=atr),
+                _account(equity=100_000.0),
+                now=T0,
+            )
+            assert isinstance(result, RiskDecision)
+            losses.append(
+                result.qty * (result.entry_reference_price - result.stop_price)
+            )
+        assert max(losses) - min(losses) < 0.02 * 400.0
+
+    def test_calm_name_clipped_by_cap_and_logged(self):
+        # 1%-ATR name: $400 target needs $20k notional; global 10% cap
+        # ($10k) clips to ~$200 implied risk — visibly.
+        from loguru import logger as loguru_logger
+
+        messages: list[str] = []
+        sink_id = loguru_logger.add(messages.append, level="INFO")
+        try:
+            mgr = self._target_mgr(max_position_notional_pct=0.10)
+            result = mgr.evaluate(
+                _signal(strategy="donchian_breakout", price=100.0, atr=1.0),
+                _account(equity=100_000.0),
+                now=T0,
+            )
+        finally:
+            loguru_logger.remove(sink_id)
+        assert isinstance(result, RiskDecision)
+        loss_at_stop = result.qty * (result.entry_reference_price - result.stop_price)
+        assert loss_at_stop == pytest.approx(200.0, rel=0.01)
+        logged = "".join(messages)
+        assert "clipped by" in logged
+        assert "global notional cap" in logged
+
+    def test_sleeve_cap_clip_is_logged_with_cap_name(self):
+        from loguru import logger as loguru_logger
+
+        messages: list[str] = []
+        sink_id = loguru_logger.add(messages.append, level="INFO")
+        try:
+            mgr = self._target_mgr(max_position_notional_pct=1.0)
+            result = mgr.evaluate(
+                _signal(strategy="donchian_breakout", price=100.0, atr=1.0),
+                _account(equity=100_000.0),
+                now=T0,
+                notional_cap=8_000.0,
+            )
+        finally:
+            loguru_logger.remove(sink_id)
+        assert isinstance(result, RiskDecision)
+        assert result.qty * 100.0 <= 8_000.0
+        assert "sleeve notional_cap" in "".join(messages)
+
+    def test_fallback_to_global_ceiling_for_unlisted_strategy(self):
+        # Strategies without a target (options/credit-spread paths) keep
+        # the pre-11.48 behavior: max_position_pct sizes the trade.
+        mgr = self._target_mgr(max_position_notional_pct=1.0)
+        result = mgr.evaluate(
+            _signal(strategy="some_new_strategy", price=100.0, atr=4.0),
+            _account(equity=100_000.0),
+            now=T0,
+        )
+        assert isinstance(result, RiskDecision)
+        loss_at_stop = result.qty * (result.entry_reference_price - result.stop_price)
+        assert loss_at_stop == pytest.approx(100_000.0 * 0.02, rel=0.01)
+
+    def test_constructor_rejects_target_at_or_above_ceiling(self):
+        with pytest.raises(ValueError, match="risk_per_trade_pct_by_strategy"):
+            _mgr(risk_per_trade_pct_by_strategy={"donchian_breakout": 0.02})
+        with pytest.raises(ValueError, match="risk_per_trade_pct_by_strategy"):
+            _mgr(risk_per_trade_pct_by_strategy={"donchian_breakout": 0.0})
+
+    def test_none_defaults_to_production_settings(self):
+        mgr = _mgr(risk_per_trade_pct_by_strategy=None)
+        assert mgr.risk_per_trade_pct_by_strategy == settings.STRATEGY_RISK_PER_TRADE_PCT
+
+    def test_production_targets_match_accepted_values(self):
+        """Parity guard: the accepted 11.48 §6 targets. Changing them
+        requires re-running the ATR derivation (doc §9) — update both
+        the config and this test in the same commit."""
+        assert settings.STRATEGY_RISK_PER_TRADE_PCT == {
+            "sma_crossover": 0.006,
+            "rsi_reversion": 0.0025,
+            "donchian_breakout": 0.004,
+        }
+        for pct in settings.STRATEGY_RISK_PER_TRADE_PCT.values():
+            assert 0 < pct < settings.MAX_POSITION_PCT
 
 
 class TestDuplicateAndMaxPositions:

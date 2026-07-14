@@ -15,11 +15,17 @@ Design principles
 
 2. **Stop is defined before entry.** Position size is derived from the
    distance between entry reference price and the ATR-based stop, so the
-   *dollar* loss on a stop-out is bounded to `MAX_POSITION_PCT * equity`
-   regardless of the symbol's volatility.
+   *dollar* loss on a stop-out equals the strategy's risk target
+   (`STRATEGY_RISK_PER_TRADE_PCT`, 11.48) regardless of the symbol's
+   volatility. `MAX_POSITION_PCT` is the global hard ceiling above the
+   per-strategy targets, and the sizing fallback for strategies without
+   a target (options / credit-spread paths own their sizing).
 
    Sizing is also capped by per-position notional exposure. A tight stop must
-   not let one trade consume the whole gross-exposure sleeve.
+   not let one trade consume the whole gross-exposure sleeve. The 11.48
+   targets are derived (docs/allocator_risk_target_reconciliation.md §3)
+   so these caps bind exceptionally, not routinely — a cap that overrules
+   the risk-sized qty logs the clip and the binding cap by name.
 
 3. **Multiple independent kill switches.** Daily-loss %, hard-dollar cap,
    broker-error streak, and slippage drift each halt trading independently.
@@ -312,6 +318,7 @@ class RiskManager:
         self,
         *,
         max_position_pct: float = settings.MAX_POSITION_PCT,
+        risk_per_trade_pct_by_strategy: dict[str, float] | None = None,
         max_position_notional_pct: float = settings.MAX_POSITION_NOTIONAL_PCT,
         max_open_positions: int = settings.MAX_OPEN_POSITIONS,
         max_gross_exposure_pct: float = settings.MAX_GROSS_EXPOSURE_PCT,
@@ -330,6 +337,22 @@ class RiskManager:
         # silently disable a rule mid-session.
         if not (0 < max_position_pct < 1):
             raise ValueError("max_position_pct must be in (0, 1)")
+        # 11.48: per-strategy risk-to-stop targets beneath the global
+        # ceiling. None → production defaults from settings. A target at
+        # or above max_position_pct would defeat the ceiling, and the
+        # derivation contract (docs/allocator_risk_target_reconciliation.md
+        # §3) requires targets small enough that the notional caps do not
+        # do the sizing.
+        if risk_per_trade_pct_by_strategy is None:
+            risk_per_trade_pct_by_strategy = dict(
+                settings.STRATEGY_RISK_PER_TRADE_PCT
+            )
+        for _strat, _pct in risk_per_trade_pct_by_strategy.items():
+            if not (0 < _pct < max_position_pct):
+                raise ValueError(
+                    f"risk_per_trade_pct_by_strategy['{_strat}'] = {_pct} "
+                    f"must be in (0, max_position_pct={max_position_pct})"
+                )
         if not (0 < max_position_notional_pct <= 1):
             raise ValueError("max_position_notional_pct must be in (0, 1]")
         if max_open_positions < 1:
@@ -357,6 +380,7 @@ class RiskManager:
 
         self.slippage_drift_enabled = slippage_drift_enabled
         self.max_position_pct = max_position_pct
+        self.risk_per_trade_pct_by_strategy = risk_per_trade_pct_by_strategy
         self.max_position_notional_pct = max_position_notional_pct
         self.max_open_positions = max_open_positions
         self.max_gross_exposure_pct = max_gross_exposure_pct
@@ -818,11 +842,15 @@ class RiskManager:
     ) -> float:
         """
         Fixed-fractional sizing on stop distance:
-            risk_dollars = equity * max_position_pct
+            risk_dollars = equity * risk_per_trade_pct[strategy]
+                           (fallback: equity * max_position_pct)
             qty          = _floor(risk_dollars / |entry - stop|)
         Then capped by per-position notional exposure, remaining
         gross-exposure budget, available cash, and — when provided —
-        the sleeve notional_cap from the SleeveAllocator.
+        the sleeve notional_cap from the SleeveAllocator. Per the 11.48
+        derivation the per-strategy targets are small enough that these
+        caps clip exceptionally (calmest watchlist names only); any clip
+        below the risk-sized qty is logged with the binding cap.
 
         When settings.FRACTIONAL_ENABLED=True and signal.order_type is MARKET:
           _floor rounds down to 2 decimal places (fractional shares).
@@ -865,7 +893,13 @@ class RiskManager:
             else signal.reference_price
         )
 
-        risk_dollars = account.equity * self.max_position_pct
+        # 11.48: per-strategy risk-to-stop target; strategies without one
+        # (options, credit spread — own sizing semantics) fall back to the
+        # global ceiling. See docs/allocator_risk_target_reconciliation.md.
+        risk_pct = self.risk_per_trade_pct_by_strategy.get(
+            signal.strategy_name, self.max_position_pct
+        )
+        risk_dollars = account.equity * risk_pct
         stop_distance = abs(sizing_price - stop_price)
         if stop_distance <= 0:
             return 0
@@ -876,38 +910,57 @@ class RiskManager:
         if raw_qty <= 0:
             return 0
 
+        # The caps below are brakes, not the sizer. Track which one (if
+        # any) overrules the risk-sized qty so the clip is visible in the
+        # log — the 11.48 derivation keeps clips exceptional, and routine
+        # clip logs are the operator's signal that watchlist volatility
+        # drifted below the risk target's coverage point.
+        risk_qty = raw_qty
+        binding_cap: str | None = None
+
         # Cap by per-position notional budget so tight stops do not consume
         # the whole sleeve in a single position.
         if sizing_price > 0:
             max_position_notional = account.equity * self.max_position_notional_pct
             notional_qty_cap = _floor(max_position_notional / (sizing_price * multiplier))
-            raw_qty = min(raw_qty, notional_qty_cap)
+            if notional_qty_cap < raw_qty:
+                raw_qty = notional_qty_cap
+                binding_cap = f"global notional cap ${max_position_notional:,.0f}"
 
         # Cap by remaining gross-exposure budget.
         max_gross = account.equity * self.max_gross_exposure_pct
         remaining_gross = max(0.0, max_gross - account.gross_exposure())
         if sizing_price > 0:
             gross_qty_cap = _floor(remaining_gross / (sizing_price * multiplier))
-            raw_qty = min(raw_qty, gross_qty_cap)
+            if gross_qty_cap < raw_qty:
+                raw_qty = gross_qty_cap
+                binding_cap = f"remaining gross exposure ${remaining_gross:,.0f}"
 
         # Cap by cash on hand (a buy must be payable).
         if signal.side is Side.BUY and sizing_price > 0:
             cash_qty_cap = _floor(max(0.0, account.cash) / (sizing_price * multiplier))
-            raw_qty = min(raw_qty, cash_qty_cap)
+            if cash_qty_cap < raw_qty:
+                raw_qty = cash_qty_cap
+                binding_cap = f"cash on hand ${max(0.0, account.cash):,.0f}"
 
         # Cap by sleeve budget (supplied by SleeveAllocator when active).
         # This prevents one strategy from consuming another's reserved capital.
         if notional_cap is not None and sizing_price > 0:
             sleeve_qty_cap = _floor(notional_cap / (sizing_price * multiplier))
             if sleeve_qty_cap < raw_qty:
-                logger.debug(
-                    f"[{signal.strategy_name}] {signal.symbol}: "
-                    f"qty {raw_qty}→{sleeve_qty_cap} "
-                    f"(sleeve notional_cap=${notional_cap:,.0f})"
-                )
                 raw_qty = sleeve_qty_cap
+                binding_cap = f"sleeve notional_cap=${notional_cap:,.0f}"
 
-        return max(raw_qty, 0)
+        raw_qty = max(raw_qty, 0)
+        if binding_cap is not None and raw_qty < risk_qty:
+            implied_risk = raw_qty * stop_distance * multiplier
+            logger.info(
+                f"[{signal.strategy_name}] {signal.symbol}: risk-sized qty "
+                f"{risk_qty}→{raw_qty} clipped by {binding_cap} — implied "
+                f"risk ${implied_risk:,.0f} vs target ${risk_dollars:,.0f} "
+                f"({risk_pct:.2%} of equity)"
+            )
+        return raw_qty
 
     @staticmethod
     def _reject(

@@ -1,7 +1,13 @@
-# Allocator Risk-Target Reconciliation — Proposal
+# Allocator Risk-Target Reconciliation
 
-**Status:** PROPOSED — awaiting operator sign-off on the per-strategy risk
-targets in §6. No code changes until approved.
+**Status:** ACCEPTED 2026-07-13 (operator sign-off on the §6 targets as
+proposed: donchian 0.40% / sma 0.60% / rsi 0.25%). Implemented per §7 on
+`feat/allocator-risk-targets`: `STRATEGY_ALLOCATIONS[*].risk_per_trade_pct`
++ derived `STRATEGY_RISK_PER_TRADE_PCT` with import-time validation,
+per-strategy sizing + binding-cap clip logging in
+`RiskManager._size_position`, tests in
+`tests/test_risk.py::TestPerStrategyRiskTargets`. Paper acceptance per §8
+pending.
 **Date:** 2026-07-13
 **Origin:** Donchian trade-profile audit (2026-07-12) and the RiskManager
 sizing audit that followed it (see PR #82 for the P&L-integrity fixes that

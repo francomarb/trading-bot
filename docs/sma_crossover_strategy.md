@@ -98,7 +98,10 @@ stop_price = entry_price − 2.0 × ATR(14)
 The stop does **not** ratchet up as price moves favorably. Its purpose is
 asymmetric: cap the loss on a *bad entry* (head-fake crossover), and
 serve as the denominator for the fixed-fractional position sizer
-(`risk_dollars = equity × max_position_pct; qty = risk_dollars / |entry − stop|`).
+(`risk_dollars = equity × risk_per_trade_pct["sma_crossover"]` — 0.60% of
+equity per 11.48; `qty = risk_dollars / |entry − stop|`. `MAX_POSITION_PCT`
+= 2% remains only the global ceiling; pre-11.48 it was the formula input
+but the notional caps overruled it on essentially every entry).
 Once price moves meaningfully above entry, the static stop is well below
 entry and is essentially dormant until the death cross fires.
 

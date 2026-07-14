@@ -520,6 +520,14 @@ CAPITAL_POOLS: dict[str, float] = {
 }
 
 STRATEGY_ALLOCATIONS: dict[str, dict] = {
+    # `risk_per_trade_pct` (11.48, accepted 2026-07-13): per-strategy
+    # risk-to-stop target as a fraction of account equity. Derived so the
+    # risk rule — not the notional caps — decides normal position size:
+    #   T ≤ per_position_cap% × 2 × ATR%₁₀ (calm end of the watchlist).
+    # Values from measured SIP ATR14 distributions on 2026-07-13; re-derive
+    # on watchlist changes or major vol-regime shifts per
+    # docs/allocator_risk_target_reconciliation.md §9. MAX_POSITION_PCT
+    # remains the global hard ceiling above these.
     "sma_crossover": {
         "target_pct": 0.40,
         "type": "equity",
@@ -527,6 +535,7 @@ STRATEGY_ALLOCATIONS: dict[str, dict] = {
         "can_stretch": True,
         "hard_max_positions": 8,
         "max_position_pct_of_sleeve": 0.40,
+        "risk_per_trade_pct": 0.006,   # 0.60% — covers watchlist ATR% ≥ 3.0 (all but GSAT)
     },
     "rsi_reversion": {
         "target_pct": 0.20,
@@ -535,6 +544,7 @@ STRATEGY_ALLOCATIONS: dict[str, dict] = {
         "can_stretch": True,
         "hard_max_positions": 8,
         "max_position_pct_of_sleeve": 0.40,
+        "risk_per_trade_pct": 0.0025,  # 0.25% — covers watchlist ATR% ≥ 2.0 (all but KBE)
     },
     "donchian_breakout": {
         "target_pct": 0.25,
@@ -543,6 +553,7 @@ STRATEGY_ALLOCATIONS: dict[str, dict] = {
         "can_stretch": True,
         "hard_max_positions": 8,
         "max_position_pct_of_sleeve": 0.40,
+        "risk_per_trade_pct": 0.004,   # 0.40% — covers watchlist ATR% ≥ 2.5 (full list; AAPL 2.6 is the floor)
     },
     "spy_options_reversion": {
         "target_pct": 0.05,
@@ -574,6 +585,19 @@ STRATEGY_ALLOCATIONS: dict[str, dict] = {
 ALLOCATOR_STRETCH_UTILIZATION_THRESHOLD = 0.80
 ALLOCATOR_DEFAULT_STRETCH_PCT = 0.15
 MIN_TRADE_NOTIONAL = 100.0      # Reject entries if sleeve available < this
+
+# Derived: strategy → risk_per_trade_pct for RiskManager sizing (11.48).
+# Strategies without the key (options, credit spread — own sizing paths)
+# fall back to MAX_POSITION_PCT inside RiskManager.
+STRATEGY_RISK_PER_TRADE_PCT: dict[str, float] = {
+    name: cfg["risk_per_trade_pct"]
+    for name, cfg in STRATEGY_ALLOCATIONS.items()
+    if "risk_per_trade_pct" in cfg
+}
+# Fail loudly at import if a target is outside (0, MAX_POSITION_PCT) —
+# a target above the global ceiling would silently re-invert the
+# risk-vs-caps binding order that 11.48 exists to fix. (MAX_POSITION_PCT
+# is defined in the risk-settings block below; validation runs there.)
 
 # Strategy Health monitor (PLAN 11.10) — per-strategy minimum trade
 # count before the EdgeAssessor can emit a CONCLUSIVE verdict. Below
@@ -792,8 +816,25 @@ CREDIT_SPREAD_RANKER_WEIGHTS: dict[str, float] = {
 
 # ── Risk settings (Phase 6) ──────────────────────────────────────────────────
 # Position sizing
-MAX_POSITION_PCT = 0.02         # Risk no more than 2% of equity per trade (loss-to-stop)
+MAX_POSITION_PCT = 0.02         # Global hard ceiling on risk-to-stop per trade.
+                                # Per-strategy targets in STRATEGY_RISK_PER_TRADE_PCT
+                                # (11.48) do the normal sizing beneath this ceiling.
 MAX_POSITION_NOTIONAL_PCT = 0.10 # Global per-position cap; allocator adds strategy-level caps
+
+# 11.48 validation — deferred from the STRATEGY_ALLOCATIONS block because
+# MAX_POSITION_PCT is defined here. A per-strategy target at or above the
+# global ceiling would silently hand sizing back to the notional caps.
+_bad_risk_targets = {
+    name: pct
+    for name, pct in STRATEGY_RISK_PER_TRADE_PCT.items()
+    if not (0 < pct < MAX_POSITION_PCT)
+}
+if _bad_risk_targets:
+    raise ValueError(
+        f"risk_per_trade_pct must be in (0, MAX_POSITION_PCT={MAX_POSITION_PCT}); "
+        f"violations: {_bad_risk_targets}"
+    )
+del _bad_risk_targets
 MAX_OPEN_POSITIONS = 30         # Global cap; per-strategy limit enforced by sleeve
 MAX_GROSS_EXPOSURE_PCT = 0.80   # 80% of equity tradeable across all strategies
 

@@ -67,7 +67,7 @@ A crossover on contracting volume is a weak signal. If institutions are not part
 **Rule:** No new entry within 2 calendar days **before** an earnings announcement. Entries are allowed immediately **after** earnings (`days_after=0`).
 
 **Why:**
-An SMA crossover the day before earnings creates an asymmetric gap risk that the OTO stop-loss cannot protect against. A GTC stop order becomes a market order that executes at the next available price after the open — if a stock gaps down 20% on an earnings miss, the stop fills at the gap-down open price, not at the stop price. The 2% `MAX_POSITION_PCT` risk limit is completely bypassed.
+An SMA crossover the day before earnings creates an asymmetric gap risk that the OTO stop-loss cannot protect against. A GTC stop order becomes a market order that executes at the next available price after the open — if a stock gaps down 20% on an earnings miss, the stop fills at the gap-down open price, not at the stop price. The per-trade risk budget (`risk_per_trade_pct`, 11.48) is completely bypassed.
 
 **Why `days_after=0`** (different from RSI's `days_after=2`):
 Trend-following specifically captures earnings acceleration. A stock that beats earnings and gaps up is exactly the kind of momentum an SMA crossover is designed to ride. Blocking post-earnings entries would miss the best setups. RSI reversion holds a longer post-earnings window (2 days) because options-unwinding and analyst follow-through noise makes oversold readings unreliable after the event — that concern does not apply to trend-following.
@@ -140,7 +140,7 @@ The re-enable path is prepared in the code: the `SPYTrendFilter` import is retai
 
 The SMA filter blocks new entries up to 2 days **before** earnings but allows entries immediately **after** (`days_after=0`). This is a narrower window than RSI's 3/2 split and it is asymmetric by design.
 
-**The pre-earnings block** guards against gap risk on a new position. An OTO GTC stop-loss becomes a market order at the open after an overnight gap — a 20% earnings miss would bypass `MAX_POSITION_PCT` entirely. This is not a theoretical concern; it is a guaranteed bad trade on any significant miss when the position is entered the session before.
+**The pre-earnings block** guards against gap risk on a new position. An OTO GTC stop-loss becomes a market order at the open after an overnight gap — a 20% earnings miss would bypass the per-trade risk budget (`risk_per_trade_pct`, 11.48) entirely. This is not a theoretical concern; it is a guaranteed bad trade on any significant miss when the position is entered the session before.
 
 **The post-earnings open** preserves the core SMA edge. Earnings beats that accelerate trends are exactly the entries this strategy is designed to capture. A blackout after earnings would systematically miss the highest-momentum setups.
 
