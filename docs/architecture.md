@@ -445,7 +445,31 @@ The isolated options pool uses the same `SleeveAllocator` and HWM drawdown gate 
 - Track current exposure per symbol and overall
 - Loss-streak cooldown per strategy
 - Broker-error-streak kill switch
-- Slippage-drift kill switch
+- Slippage-drift kill switch (currently disabled — see "Slippage metric families")
+
+#### Slippage metric families
+
+`trades.slippage_adverse_bps` is one column holding three incommensurable
+measurements, told apart only by `slippage_benchmark_kind`. The families are
+declared in `reporting/logger.py` beside the `SlippageBenchmarkKind` Literal:
+
+| Family | Benchmark kinds | Answers |
+|---|---|---|
+| Execution quality | `arrival_midpoint`, `combo_limit` | Was the fill good relative to the market when we submitted? |
+| Implementation shortfall | `decision_price`, `fallback_latest_close` | How far did price move between deciding and filling? |
+| Stop-gap erosion | `active_stop_price` | How far past the stop trigger did we actually exit? |
+| Unmeasured | `limit_price`, `unavailable` | No honest benchmark exists. |
+
+Only the execution-quality family may feed the drift kill switch or the
+execution-quality reports. Consumers must call the shared
+`is_execution_quality_measurement` / `execution_quality_sql` rather than
+re-deriving the rule — the defect this replaced (PR #84) came from six
+consumers each filtering on `measurement_quality` alone, which admits
+`fallback_latest_close` and so reported market drift as execution cost.
+`test_every_benchmark_kind_is_classified` fails if a new kind is added
+without a family.
+
+Stop-gap erosion currently has no consumer — see PLAN `11.49`.
 
 For single-leg options, fractional sizing is disabled (`and not is_option` guard in `_size_position()`). The 100× contract multiplier is applied only in P&L accounting — the risk manager sizes by contract count. MLEG spreads do not call `_size_position`; their quantity is chosen inside `build_spread_execution` from sleeve notional, width, credit, and max-loss caps.
 
@@ -499,7 +523,7 @@ Options orders are detected by matching the OCC symbol format (`^[A-Z]{1,6}[0-9]
 | Path | OCC-specific behaviour |
 |---|---|
 | `_repair_missing_protective_stops` | Skips OCC symbols — bracket stop legs are managed by Alpaca, not the engine |
-| `_record_fill` (slippage monitor) | Skipped for OCC exits — underlying bar price vs option premium produces meaningless bps |
+| `_record_fill` (slippage monitor) | Skipped for OCC exits — underlying bar price vs option premium produces meaningless bps. The pre-close arrival-quote fetch is also OCC-gated (OPRA, not the stock quote endpoint). Independently of OCC, `_record_fill` now drops any fill whose `benchmark_kind` is outside the execution-quality family — see "Slippage metric families" below |
 | `_log_close` | Uses `result.avg_fill_price` (option premium) as `modeled_price` instead of the underlying bar close |
 | `_record_realized_pnl` | Accepts `multiplier=100` for options; default 1 for equities |
 | `_process_stream_stop_fills` | Normalizes OCC → underlying via `owner_key_for()` before `_positions` lookup; logs with `log_stop_fill` |
@@ -629,7 +653,7 @@ Before committing live capital, ALL of the following must be satisfied:
 4. Bot has run for at least **72 hours continuously** without crashes or errors
 5. Risk manager daily halt has never been triggered without being intentional
 6. `scripts/preflight.py` exits 0 against the live endpoint
-7. `SLIPPAGE_DRIFT_ENABLED=True` — kill switch calibrated from real fills
+7. `SLIPPAGE_DRIFT_ENABLED=True` — kill switch calibrated from real fills. Calibrate against the **execution-quality family only** (PR #84); a pool that includes `fallback_latest_close` rows reads ~200 bps and would set a threshold that can never fire on genuine degradation. Leave headroom: the arrival midpoint is IEX BBO, not full SIP NBBO, on a paper account.
 
 Run the checker: `python scripts/gonogo.py` (exit code 0 = GO, 1 = NO-GO).
 

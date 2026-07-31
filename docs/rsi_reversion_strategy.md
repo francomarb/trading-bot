@@ -235,7 +235,17 @@ the unified slippage taxonomy (Phase 2 + 4, PR #67) they record
 slippage isn't a meaningful execution-quality metric for a passive
 fill. Limit-fill execution quality versus the limit price is a
 separate (out-of-scope) metric. Stop-out fills do record adverse
-slippage against the active stop price.
+slippage against the active stop price — but note that
+`active_stop_price` is the **stop-gap erosion** family, not execution
+quality, so since PR #84 those rows are excluded from the drift kill
+switch and the L2 execution-quality check. They are written and
+queryable; nothing currently reports them. See PLAN `11.49`.
+
+Signal-driven RSI exits are market orders and do get an
+execution-quality measurement: the close path captures an NBBO midpoint
+immediately before submitting, tagged `arrival_midpoint` / `primary`,
+falling back to `fallback_latest_close` / `fallback` when the quote is
+unavailable.
 
 **Trade cadence.** The filter stack is intentionally tight and produces
 multi-month zero-trade stretches. The min-trades-for-verdict floor (8)

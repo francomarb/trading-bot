@@ -229,6 +229,17 @@ research tool is run. The legacy `realized_slippage_bps` /
 Phase 2 + 4 unification (PR #67) — see
 `docs/slippage_unification_design.md`.
 
+SMA entries and signal-driven exits are both market orders, so both
+carry an execution-quality measurement: an NBBO midpoint is captured
+immediately before submission (`arrival_midpoint` / `primary`),
+falling back to the prior bar close (`fallback_latest_close` /
+`fallback`) when the quote is unavailable. Only the former counts as
+execution quality — the fallback measures market drift between that
+close and the fill, and PR #84 excludes it from the drift kill switch
+and the L2 execution check. Stop-out fills record against the active
+stop price, which is the stop-gap erosion family and likewise excluded
+(PLAN `11.49`).
+
 **Data feed.** Production runs on Alpaca's IEX feed (paper-account
 constraint; SIP requires paid subscription). Backtests use the same
 IEX cache via `data.fetcher`. IEX is a subset of national tape — volume

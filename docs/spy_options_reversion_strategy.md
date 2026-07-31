@@ -295,6 +295,46 @@ cumulative — the filter is the single most important risk control in this stra
 
 ---
 
+## Execution measurement — current gap (PLAN 11.49)
+
+**This sleeve currently has no execution measurement of any kind.** That is a
+consequence of its order shapes, not a bug in the taxonomy, but it means the
+operator is flying blind on execution here and it should be closed.
+
+Every fill this strategy produces lands outside the execution-quality metric
+family defined in `reporting/logger.py`:
+
+| Fill type | Benchmark kind | Quality | Why it isn't execution quality |
+|---|---|---|---|
+| Entry | `limit_price` | `unavailable` | Passive fill. A resting limit filled at its own limit price yields a structural zero — arrival-price slippage is not meaningful for it (design doc §2). |
+| Stop exit | `active_stop_price` | `primary` / `recovered` | Measures how far past the stop trigger the fill landed — **stop-gap erosion**, a distinct family. |
+| Signal exit | `unavailable` | `unavailable` | OCC symbols are skipped by the pre-close quote fetch: they belong to OPRA, not the stock quote endpoint, so there is no arrival midpoint to compare against. |
+
+Before PR #84 (2026-07-31) the four `active_stop_price` rows were being read by
+the health assessor as though they were execution quality, so the L2 slippage
+check reported a number and the gap was invisible. The family filter is correct
+— those rows never measured execution — but it took the L2 sample count for this
+strategy from 4 to **0**, and nothing else consumes stop-gap erosion.
+
+**Why this matters more here than elsewhere.** This is a 25%-hard-stop strategy
+on a leveraged instrument. "How far past my stop did I actually get out" is the
+single most consequential execution number it has, and the audit that surfaced
+this found real evidence of erosion: a 2026-07-01 stop fill at 18.72 against a
+19.20 stop (250 bps) and a 2026-06-17 fill at 10.19 against 10.40 (202 bps).
+Those are not disasters, but they are exactly the quantity that should be
+trended rather than discovered by hand.
+
+It also feeds two open items: `11.26` (options picker audit — fill quality on
+the 10% fatal-spread threshold) and the unresolved June 12/15 immediate-fill
+mechanism tracked under "SPY option trailing durability" in PLAN.md.
+
+The fix is consumer-side only — `STOP_GAP_KINDS` already exists and the rows are
+already tagged correctly. It must be a **separate** reported figure; merging it
+back into the execution-quality number is what produced the original defect.
+See PLAN `11.49` for scope and acceptance.
+
+---
+
 ## Implementation files
 
 | File | Purpose |
