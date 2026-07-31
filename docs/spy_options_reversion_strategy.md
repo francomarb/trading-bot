@@ -297,9 +297,12 @@ cumulative — the filter is the single most important risk control in this stra
 
 ## Execution measurement — current gap (PLAN 11.49)
 
-**This sleeve currently has no execution measurement of any kind.** That is a
-consequence of its order shapes, not a bug in the taxonomy, but it means the
-operator is flying blind on execution here and it should be closed.
+**This sleeve produces slippage numbers, but none of them measure execution
+quality.** It has six measured fills to date and every one of them measures
+*stop-gap erosion* — how far past the stop trigger the fill landed — not how
+good the fill was against the market at submission. Those are different
+questions, and until PR #84 the health report answered the second one using
+data that only answered the first.
 
 Every fill this strategy produces lands outside the execution-quality metric
 family defined in `reporting/logger.py`:
@@ -310,11 +313,35 @@ family defined in `reporting/logger.py`:
 | Stop exit | `active_stop_price` | `primary` / `recovered` | Measures how far past the stop trigger the fill landed — **stop-gap erosion**, a distinct family. |
 | Signal exit | `unavailable` | `unavailable` | OCC symbols are skipped by the pre-close quote fetch: they belong to OPRA, not the stock quote endpoint, so there is no arrival midpoint to compare against. |
 
-Before PR #84 (2026-07-31) the four `active_stop_price` rows were being read by
-the health assessor as though they were execution quality, so the L2 slippage
-check reported a number and the gap was invisible. The family filter is correct
-— those rows never measured execution — but it took the L2 sample count for this
-strategy from 4 to **0**, and nothing else consumes stop-gap erosion.
+### Why L2 used to report a number
+
+All six measured fills carry `benchmark_kind='active_stop_price'`. The old L2
+filter gated on `measurement_quality IN ('primary','fallback')` only, so it
+picked up the four `primary` ones and averaged them:
+
+| Date | Fill | Stop benchmark | Adverse bps |
+|---|---|---|---|
+| 2026-06-12 | 23.00 | 19.55 | 0.0 |
+| 2026-06-15 | 19.73 | 16.77 | 0.0 |
+| 2026-07-01 | 18.72 | 19.20 | 250.0 |
+| 2026-07-02 | 9.62 | 9.72 | 102.9 |
+
+Mean 88.2 bps — reported under a heading that reads as execution quality. It
+was never that. It was the average distance past the stop trigger, which is a
+real and important number, just not the one the label claimed.
+
+The family filter is correct and took the L2 count from 4 to **0**. Nothing
+else consumes stop-gap erosion, so the measurement now exists in the database
+and is reported nowhere.
+
+Two of those four rows are also independently suspect: a sell stop cannot
+normally fill *above* its trigger, yet 2026-06-12 and 2026-06-15 show fills
+17% above the recorded benchmark, clamping to 0.0 adverse and dragging the
+mean down. Those are the same June 12/15 dates as the unresolved immediate-fill
+mechanism tracked under "SPY option trailing durability" in PLAN.md — most
+likely a stale benchmark on the trailing-stop replacement path. Worth
+confirming when 11.49 is built, since a stop-gap metric computed against a
+stale stop level would inherit the same defect.
 
 **Why this matters more here than elsewhere.** This is a 25%-hard-stop strategy
 on a leveraged instrument. "How far past my stop did I actually get out" is the
