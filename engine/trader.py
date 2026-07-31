@@ -3120,11 +3120,21 @@ class TradingEngine:
     ) -> None:
         """Log an exit fill to the trade database.
 
-        ``benchmark_kind`` defaults to None which makes ``build_close_record``
-        assume 'arrival_midpoint' (correct for normal discretionary
-        exits). The fractional residual cleanup call site passes
-        'unavailable' so the row honestly reports no benchmark — see
-        codepath §7 in docs/slippage_unification_design.md.
+        ``benchmark_kind`` defaults to None, which ``build_close_record``
+        resolves to 'unavailable' — a row that honestly reports no
+        benchmark rather than fabricating a claim. Every real call site
+        declares its benchmark explicitly:
+
+          - ``_finish_close_single_leg`` (codepath §3): equity exits pass
+            'arrival_midpoint' / 'primary' when the pre-submit quote
+            resolves, else 'fallback_latest_close' / 'fallback'; option
+            exits pass 'unavailable' / 'unavailable'.
+          - ``_close_fractional_residual_position`` (codepath §7):
+            'unavailable' / 'unavailable'.
+
+        See docs/slippage_unification_design.md. Only the
+        execution-quality family reaches the drift kill switch, so the
+        tags are load-bearing, not just provenance.
 
         PR #56 R1: look up the open lifecycle row's position_uid so it
         gets persisted on the close row. Without this, restart

@@ -985,12 +985,15 @@ class TradeLogger:
         — never fabricates a benchmark claim) after the Defect 1 fix.
         Real callers declare honestly:
 
-          - ``_close_single_leg_position`` (codepath §3): equity exits
-            pass ``fallback_latest_close`` / ``fallback`` because the
-            exit path uses the latest bar close as a proxy benchmark;
-            option exits pass ``unavailable`` / ``unavailable`` because
-            ``modeled_price`` is the fill price itself, which yields a
-            structural zero-slippage measurement.
+          - ``_finish_close_single_leg`` (codepath §3): equity exits pass
+            ``arrival_midpoint`` / ``primary`` when the NBBO midpoint
+            captured immediately before submit resolves, and
+            ``fallback_latest_close`` / ``fallback`` when it doesn't
+            (one-sided book, API failure) — in that case ``modeled_price``
+            is the latest bar close, which measures market drift rather
+            than fill quality. Option exits pass ``unavailable`` /
+            ``unavailable`` because ``modeled_price`` is the fill price
+            itself, which yields a structural zero-slippage measurement.
           - ``_close_fractional_residual_position`` (codepath §7):
             ``unavailable`` / ``unavailable`` because the close_price
             fallback chain is not a slippage benchmark.
