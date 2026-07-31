@@ -105,6 +105,7 @@ from reporting.alerts import AlertDispatcher
 from reporting.logger import (
     ENTRY_BASIS_BROKER_FILL,
     TradeLogger,
+    is_execution_quality_measurement,
     single_leg_realized_slippage_bps,
 )
 from reporting.pnl import PnLTracker
@@ -805,6 +806,8 @@ class TradingEngine:
         self._install_signal_handlers()
         self._running = True
         self._cycle_count = 0
+
+        self._seed_slippage_monitor()
 
         # Start WebSocket stream before the first broker snapshot so that
         # fills from positions placed immediately after startup are not missed.
@@ -2172,6 +2175,8 @@ class TradingEngine:
             self._record_fill(
                 result,
                 modeled_price=slippage_ref,
+                benchmark_kind=slippage_kind,
+                measurement_quality=slippage_quality,
                 order_type=decision.order_type.value,
                 side=decision.side.value,
             )
@@ -2931,11 +2936,56 @@ class TradingEngine:
 
     # ── Post-fill bookkeeping ────────────────────────────────────────────
 
+    def _seed_slippage_monitor(self) -> None:
+        """Rehydrate the drift kill switch's sample pool from the trade log.
+
+        `RiskManager._slippage_samples` is process memory. Without this,
+        every restart resets it to empty and the kill switch has to
+        re-accumulate `SLIPPAGE_DRIFT_MIN_SAMPLES` qualifying fills
+        before it can judge anything — which, at this bot's fill rate
+        and restart frequency, it may never do. Seeding closes that gap
+        and matches the RiskManager's stated design principle 5.
+
+        Never fatal: a failure here leaves the pool empty, which is
+        exactly the pre-existing behaviour. Startup must not be blocked
+        by an advisory monitor.
+        """
+        if self.trade_logger is None:
+            return
+        try:
+            samples = self.trade_logger.read_recent_execution_quality_slippage(
+                self.risk._slippage_samples.maxlen or 200
+            )
+        except Exception as exc:
+            logger.warning(
+                f"slippage monitor: seed read failed "
+                f"({type(exc).__name__}: {exc}) — starting with an empty "
+                "pool, the kill switch will re-accumulate from live fills"
+            )
+            return
+        if not samples:
+            logger.info(
+                "slippage monitor: no historical execution-quality fills to "
+                "seed from — pool starts empty"
+            )
+            return
+        try:
+            self.risk.seed_slippage_samples(
+                [(SLIPPAGE_MODEL_MARKET_BPS, value) for value in samples]
+            )
+        except Exception as exc:
+            logger.warning(
+                f"slippage monitor: seeding rejected "
+                f"({type(exc).__name__}: {exc}) — pool left empty"
+            )
+
     def _record_fill(
         self,
         result: OrderResult,
         *,
         modeled_price: float,
+        benchmark_kind: str | None,
+        measurement_quality: str | None,
         order_type: str = "market",
         side: str = "buy",
     ) -> None:
@@ -2943,6 +2993,19 @@ class TradingEngine:
         Feed the adverse-clamped fill slippage into the Phase 6 drift
         kill switch. Modeled fill = the arrival price at submission
         (NBBO mid); realized fill = what Alpaca actually gave us.
+
+        `benchmark_kind` and `measurement_quality` are **required** — no
+        defaults. They describe what `modeled_price` actually is, and the
+        kill switch is only allowed to see the execution-quality family
+        (`docs/slippage_unification_design.md`: "Do not use ...
+        implementation shortfall, stop-gap erosion"). Before this was
+        enforced, the discretionary-exit path fed a prior-bar close in
+        here while tagging the matching DB row `fallback_latest_close` —
+        the same number, labelled honestly in one place and anonymously
+        in the other. A market exit after a 9% overnight gap booked 918
+        bps of "execution slippage" that was pure market movement.
+        Requiring both arguments means a new call site cannot inherit a
+        silent default; it has to say what it is measuring.
 
         MARKET orders only. LIMIT orders are skipped because arrival
         price is not a meaningful execution-quality benchmark for them —
@@ -2963,6 +3026,16 @@ class TradingEngine:
         if result.status not in {OrderStatus.FILLED, OrderStatus.PARTIAL}:
             return
         if order_type != "market":
+            return
+        if not is_execution_quality_measurement(
+            benchmark_kind, measurement_quality
+        ):
+            logger.debug(
+                f"slippage monitor: skipping {result.symbol} fill — "
+                f"benchmark_kind={benchmark_kind!r} "
+                f"quality={measurement_quality!r} is not an "
+                "execution-quality measurement"
+            )
             return
         if result.avg_fill_price is None or modeled_price <= 0:
             return
@@ -3151,9 +3224,15 @@ class TradingEngine:
             )
         )
         quality = "recovered" if benchmark_kind != "unavailable" else "unavailable"
+        # Recovered rows never reach the kill switch — their benchmark was
+        # reconstructed after the fact rather than observed at submit — but
+        # the tags are passed explicitly so the filter, not this call site,
+        # makes that decision.
         self._record_fill(
             result,
             modeled_price=modeled_price,
+            benchmark_kind=benchmark_kind,
+            measurement_quality=quality,
             order_type="market",
             side="sell",
         )
@@ -8313,9 +8392,14 @@ class TradingEngine:
                     position_uid=position_uid,
                     result=result,
                 )
+            # Codepath §10 — async single-leg option LIMIT entry. The
+            # order_type guard below already skips LIMIT fills; the tags
+            # mirror what `build_record` persists so the two agree.
             self._record_fill(
                 result,
                 modeled_price=decision.entry_reference_price,
+                benchmark_kind="limit_price",
+                measurement_quality="unavailable",
                 order_type="limit",
                 side=decision.side.value,
             )
@@ -8518,6 +8602,27 @@ class TradingEngine:
                         f"{symbol}: exit position_uid lookup raised "
                         f"{type(exc).__name__}: {exc} — proceeding"
                     )
+            # Arrival-price benchmark for the exit, mirroring the entry
+            # path (§codepath 1). The design doc's fill-type contract
+            # §3 "Discretionary market exit" specifies "arrival midpoint
+            # at close submission"; Phase 1 was writers-only and Phase 2
+            # was consumers-only, so this fell between them and exits
+            # have been measured against a prior bar close ever since —
+            # which is implementation shortfall, not execution quality.
+            #
+            # Captured immediately before submit so the fill is compared
+            # against live market state. OCC symbols are skipped: they
+            # belong to OPRA, not the stock quote endpoint, and a single
+            # option leg has no honest arrival benchmark here anyway.
+            # `_finite_or_none` rejects NaN/inf, and the fetch itself
+            # never raises into the trading loop — on any failure we
+            # fall back to exactly the previous behaviour.
+            exit_arrival_price: float | None = None
+            if not _OCC_PAT.match(position.symbol):
+                exit_arrival_price = _finite_or_none(
+                    self.broker.get_latest_quote_midpoint(position.symbol)
+                )
+
             try:
                 result = self.broker.close_position(
                     position.symbol, position_uid=_exit_uid,
@@ -8535,6 +8640,7 @@ class TradingEngine:
                 latest_close=latest_close,
                 alert_reason=alert_reason,
                 result=result,
+                arrival_price=exit_arrival_price,
             )
         finally:
             if lock_holder is not None and registry is not None:
@@ -8549,37 +8655,62 @@ class TradingEngine:
         latest_close: float,
         alert_reason: str,
         result,
+        arrival_price: float | None = None,
     ) -> bool:
         """Post-broker-call bookkeeping for `_close_single_leg_position`.
 
         Extracted (PR-66 review F4 fix) so the symbol-lock acquire/release
         can wrap the broker submit in a clean try/finally without nesting
         the entire 80-line accounting body inside the try.
+
+        `arrival_price` is the NBBO midpoint captured immediately before
+        the close was submitted, or None when it was unavailable (option
+        leg, one-sided book, API failure). It decides the benchmark this
+        exit is measured against — see the classification below.
         """
+        # Classify the benchmark BEFORE anything consumes it, so the
+        # kill-switch feed and the persisted row are driven by one
+        # decision. Previously these were computed ten lines apart and
+        # the kill switch was fed the untagged value.
+        #
+        # Equities: prefer the arrival midpoint (execution quality). Fall
+        # back to the latest bar close, which measures market drift
+        # between that close and the fill — honest as a label, but
+        # implementation shortfall, so the shared predicate keeps it out
+        # of the drift alarm.
+        #
+        # Options: nothing better than the fill price itself, which
+        # yields a structural zero and must be reported as 'unavailable'
+        # (Phase 1 Defect 1 fix — tagging these 'arrival_midpoint' was a
+        # false claim).
+        if _OCC_PAT.match(position.symbol):
+            close_modeled = result.avg_fill_price or 0.0
+            close_benchmark_kind: str = "unavailable"
+            close_measurement_quality: str = "unavailable"
+        elif arrival_price is not None:
+            close_modeled = arrival_price
+            close_benchmark_kind = "arrival_midpoint"
+            close_measurement_quality = "primary"
+        else:
+            close_modeled = latest_close
+            close_benchmark_kind = "fallback_latest_close"
+            close_measurement_quality = "fallback"
         if not _OCC_PAT.match(position.symbol):
             # Close path is a SELL for long equity positions — side
             # matters for the kill switch's signed slippage so adverse
             # close fills (sold below modeled) are captured and price-
             # improvement close fills (sold above modeled) clamp to 0.
+            # The same benchmark tuple drives this and the row written
+            # below; `_record_fill` drops anything that isn't an
+            # execution-quality measurement.
             self._record_fill(
-                result, modeled_price=latest_close,
-                order_type="market", side="sell",
+                result,
+                modeled_price=close_modeled,
+                benchmark_kind=close_benchmark_kind,
+                measurement_quality=close_measurement_quality,
+                order_type="market",
+                side="sell",
             )
-        # Slippage unification (Phase 1) Defect 1 fix — the exit path
-        # never fetches an arrival midpoint, so tagging the row as
-        # 'arrival_midpoint' was a false claim. For equities we still
-        # have the latest bar close as a measurement reference, which
-        # is honestly a fallback; for options we have nothing better
-        # than the fill price itself, which yields a structural zero
-        # and must be reported as 'unavailable' instead.
-        if _OCC_PAT.match(position.symbol):
-            close_modeled = result.avg_fill_price or 0.0
-            close_benchmark_kind: str = "unavailable"
-            close_measurement_quality: str = "unavailable"
-        else:
-            close_modeled = latest_close
-            close_benchmark_kind = "fallback_latest_close"
-            close_measurement_quality = "fallback"
         self._log_close(
             result,
             close_modeled,

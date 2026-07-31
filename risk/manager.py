@@ -403,6 +403,15 @@ class RiskManager:
         # `trades`: signed slippage clamped to `max(0, signed)` so
         # price improvement contributes 0 to the drift mean rather than
         # offsetting later adverse fills (Phase 2 slippage unification).
+        #
+        # Seeded at engine startup via `seed_slippage_samples` — see
+        # design principle 5 above ("persist it via the trade log so the
+        # engine survives restarts; the RiskManager API stays the same").
+        # Without seeding this deque starts empty on every process
+        # restart, and the bot restarts often enough (halts, recycles,
+        # host sleep) that it could rarely accumulate
+        # `slippage_min_samples` qualifying fills in one lifetime — the
+        # drift alarm would be permanently below its own quorum.
         self._slippage_samples: Deque[tuple[float, float]] = deque(maxlen=200)
         self._halted: bool = False
         self._halt_reason: str | None = None
@@ -749,6 +758,45 @@ class RiskManager:
                 f"broker errors: {len(self._broker_errors)} within "
                 f"{self.broker_error_window.total_seconds():.0f}s window"
             )
+
+    def seed_slippage_samples(
+        self, samples: list[tuple[float, float]]
+    ) -> int:
+        """Pre-load historical `(modeled_bps, adverse_bps)` pairs at startup.
+
+        The engine reads these from the trade log and hands them over, so
+        `RiskManager` keeps no database knowledge — the same shape as the
+        per-fill `record_fill_slippage` push. Returns the number of
+        samples accepted.
+
+        Seeding replaces rather than appends, so a second call (e.g. a
+        re-sync) is idempotent instead of double-counting. Samples are
+        appended oldest-first and bounded by the deque's `maxlen`, so an
+        over-long history keeps only the most recent window.
+
+        Deliberately does NOT evaluate the drift threshold: startup is
+        not a fill event, and halting the bot before it has placed an
+        order would be a confusing, hard-to-diagnose failure. The next
+        real fill triggers the check with the full pool behind it.
+
+        Negative values are rejected per the same contract as
+        `record_fill_slippage`.
+        """
+        cleaned: list[tuple[float, float]] = []
+        for modeled_bps, adverse_bps in samples:
+            if modeled_bps < 0 or adverse_bps < 0:
+                raise ValueError("slippage bps must be non-negative")
+            cleaned.append((float(modeled_bps), float(adverse_bps)))
+        self._slippage_samples.clear()
+        self._slippage_samples.extend(cleaned)
+        n = len(self._slippage_samples)
+        if n:
+            logger.info(
+                f"slippage monitor: seeded {n} historical execution-quality "
+                f"sample(s) from the trade log "
+                f"(min_samples={self.slippage_min_samples})"
+            )
+        return n
 
     def record_fill_slippage(
         self, modeled_bps: float, adverse_bps: float
