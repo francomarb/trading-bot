@@ -889,7 +889,29 @@ def compute_strategy_stats(trades_df: pd.DataFrame) -> pd.DataFrame:
         trade_count = len(pnls)
         total_pnl = sum(pnls)
         win_rate = wins / trade_count if trade_count > 0 else 0.0
-        avg_slip = slippage_numer / slippage_denom if slippage_denom > 0 else 0.0
+        # NaN, not 0.0, when nothing qualified. A zero denominator means
+        # "no execution-quality measurement exists for this strategy",
+        # which is a different statement from "execution was perfect" —
+        # and 0.0 bps reads as the latter, i.e. a positive signal, which
+        # is the worst possible way to render an absence.
+        #
+        # This is the same no-silent-zero-defaults rule already enforced
+        # on the numerator by the `.notna()` mask below, and in
+        # `reporting/pnl.py::_adverse_bps` ("rows with NULL slippage are
+        # skipped — not treated as zero"). The zero-denominator branch
+        # was the one place it hadn't been applied.
+        #
+        # It became load-bearing when the execution-quality family filter
+        # landed: strategies whose fills are all LIMIT entries and stop
+        # exits (spy_options_reversion) or whose exits are all stop-gap /
+        # prior-close benchmarks (donchian_breakout, sma_crossover) now
+        # legitimately have zero qualifying rows. Before the filter they
+        # had non-zero — if wrong — numbers, so the absence never showed.
+        avg_slip = (
+            slippage_numer / slippage_denom
+            if slippage_denom > 0
+            else float("nan")
+        )
 
         results.append({
             "strategy": strategy,
@@ -1616,8 +1638,20 @@ def render_dashboard() -> None:
                 "Wins": st.column_config.NumberColumn(format="%d"),
                 "Win Rate": st.column_config.NumberColumn(format="%.1f%%"),
                 "Total P&L": st.column_config.NumberColumn(format="$%.2f"),
+                # NaN renders as an empty cell rather than "0.0 bps" —
+                # a strategy with no execution-quality measurement must
+                # not look like it has flawless execution. See
+                # `compute_strategy_stats`.
                 "Avg Adverse Slippage Bps": st.column_config.NumberColumn(
                     format="%.1f bps",
+                    help=(
+                        "Mean adverse slippage over execution-quality "
+                        "benchmarks only (arrival midpoint, combo limit). "
+                        "Blank means no such measurement exists for this "
+                        "strategy — not zero slippage. Stop-gap erosion "
+                        "and prior-close benchmarks are excluded by "
+                        "design; see PLAN 11.49."
+                    ),
                 ),
             },
         )
