@@ -1019,12 +1019,29 @@ class TradeLogger:
             initial_stop_loss = context["initial_stop_loss"]
             initial_risk_per_share = context["initial_risk_per_share"]
             entry_timestamp = context["entry_timestamp"]
-            if initial_risk_per_share is not None:
-                initial_risk_dollars = (
-                    float(initial_risk_per_share)
-                    * float(result.filled_qty or 0)
-                    * multiplier
+        if initial_risk_per_share is None:
+            # Same ordering-independent fallback as `log_stop_fill`. The
+            # normal signal-exit path writes this row before the stream
+            # event lands, so `context` is populated — but the recovery
+            # paths dispatch from the substrate *after* apply_order_event
+            # has persisted the row, and there the open-state replay nets
+            # to zero. See `read_entry_risk_context`.
+            risk_context = self.read_entry_risk_context(position_uid)
+            if risk_context is not None:
+                initial_stop_loss = risk_context["initial_stop_loss"]
+                initial_risk_per_share = risk_context["initial_risk_per_share"]
+                entry_timestamp = risk_context["entry_timestamp"]
+                logger.info(
+                    f"{result.symbol} [{strategy_name}] build_close_record: "
+                    f"risk basis recovered by position_uid={position_uid} "
+                    f"(open-state replay saw the position as flat)"
                 )
+        if initial_risk_per_share is not None:
+            initial_risk_dollars = (
+                float(initial_risk_per_share)
+                * float(result.filled_qty or 0)
+                * multiplier
+            )
         entry_basis = self._resolve_entry_fill_basis(
             symbol=result.symbol,
             strategy=strategy_name,
@@ -1845,8 +1862,28 @@ class TradeLogger:
             initial_risk_per_share = context["initial_risk_per_share"]
             entry_timestamp = context["entry_timestamp"]
             entry_reference_price = float(context["entry_reference_price"] or 0.0)
-            if initial_risk_per_share is not None:
-                initial_risk_dollars = float(initial_risk_per_share) * qty * multiplier
+        if initial_risk_per_share is None:
+            # Ordering-independent fallback. The substrate persists this
+            # stop's sell row before dispatching here, so the open-state
+            # replay above nets to zero and reports the position flat
+            # even though its entry row is present. Resolve the entry by
+            # position_uid instead — see `read_entry_risk_context`.
+            risk_context = self.read_entry_risk_context(position_uid)
+            if risk_context is not None:
+                initial_stop_loss = risk_context["initial_stop_loss"]
+                initial_risk_per_share = risk_context["initial_risk_per_share"]
+                entry_timestamp = risk_context["entry_timestamp"]
+                if not entry_reference_price:
+                    entry_reference_price = float(
+                        risk_context["entry_reference_price"] or 0.0
+                    )
+                logger.info(
+                    f"{symbol} [{strategy}] log_stop_fill: risk basis "
+                    f"recovered by position_uid={position_uid} "
+                    f"(open-state replay saw the position as flat)"
+                )
+        if initial_risk_per_share is not None:
+            initial_risk_dollars = float(initial_risk_per_share) * qty * multiplier
         entry_basis = self._resolve_entry_fill_basis(
             symbol=symbol,
             strategy=strategy,
@@ -2274,6 +2311,75 @@ class TradeLogger:
             "initial_risk_per_share": state.get("initial_risk_per_share"),
             "entry_timestamp": state.get("entry_timestamp"),
             "open_qty": state.get("open_qty"),
+        }
+
+    def read_entry_risk_context(self, position_uid: str | None) -> dict | None:
+        """Return the entry row's risk basis for a position, keyed by uid.
+
+        `_read_latest_open_entry_context` answers "what is open right
+        now?" by netting buys against sells across the whole trade log.
+        That question has a read-after-write hazard on any writer that
+        runs *after* its own closing row has been persisted: the replay
+        nets to zero, reports the position flat, and returns None — so
+        the risk fields silently stay NULL even though the entry row is
+        sitting right there.
+
+        That is exactly what the order-lifecycle substrate does for stop
+        fills. `apply_order_event` UPSERTs the sell row, and only then
+        does `_maybe_dispatch_substrate_stop_fill` call `log_stop_fill`.
+        Since PR #76 made the substrate the primary stop-fill handler
+        this is the normal path, not an edge case — ANET (2026-07-17)
+        and AAPL (2026-07-31) both booked real losses with a NULL
+        `r_multiple` and an `entry_timestamp` stamped at exit time.
+
+        This lookup asks the ordering-independent question instead:
+        "what was the entry for *this* position?" It resolves a specific
+        record by key rather than counting anything, so it cannot be
+        perturbed by whether the closing row exists yet. Same shape as
+        `read_lifecycle_entry_basis`, which already solved this for the
+        P&L basis.
+
+        Returns None when the uid is absent, no row for it carries a
+        risk basis (entries predating risk-field recording legitimately
+        have none), or the table can't be read. Callers must treat None
+        as "leave the fields NULL", never as zero.
+        """
+        if not position_uid or not os.path.exists(self._path):
+            return None
+        try:
+            conn = self._ensure_db()
+            conn.row_factory = sqlite3.Row
+            row = conn.execute(
+                "SELECT initial_stop_loss, initial_risk_per_share, "
+                "entry_timestamp, entry_reference_price "
+                "FROM trades "
+                "WHERE position_uid = ? AND initial_risk_per_share IS NOT NULL "
+                "ORDER BY id LIMIT 1",
+                (position_uid,),
+            ).fetchone()
+        except sqlite3.Error:
+            return None
+        if row is None:
+            return None
+        # Lowest id for the uid that carries a risk basis is the entry.
+        # Exit rows copy these fields forward when their own context
+        # lookup succeeds, so ordering by id keeps the original rather
+        # than a later copy. Side is deliberately not filtered on — the
+        # entry side is a strategy concern, not this lookup's.
+        risk_per_share = row["initial_risk_per_share"]
+        if risk_per_share is None:
+            return None
+        try:
+            risk_per_share = float(risk_per_share)
+        except (TypeError, ValueError):
+            return None
+        if not math.isfinite(risk_per_share) or risk_per_share <= 0:
+            return None
+        return {
+            "initial_stop_loss": row["initial_stop_loss"],
+            "initial_risk_per_share": risk_per_share,
+            "entry_timestamp": row["entry_timestamp"],
+            "entry_reference_price": row["entry_reference_price"],
         }
 
     def read_lifecycle_entry_basis(self, position_uid: str | None) -> float | None:

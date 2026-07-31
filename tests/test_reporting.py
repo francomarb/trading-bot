@@ -3925,3 +3925,189 @@ class TestExecutionQualitySlippageSeedRead:
     def test_missing_db_returns_empty(self, tmp_path):
         tl = TradeLogger(path=str(tmp_path / "nope.db"))
         assert tl.read_recent_execution_quality_slippage(50) == []
+
+
+class TestStopFillRiskContextByPositionUid:
+    """Regression guard for the read-after-write hazard in the
+    substrate stop-fill path.
+
+    `_read_latest_open_entry_context` answers "what is open right now?"
+    by netting buys against sells across the trade log. The substrate
+    persists a stop's sell row via `apply_order_event` and only then
+    dispatches `log_stop_fill`, so that replay nets to zero and reports
+    the position flat — leaving the risk fields NULL even though the
+    entry row is present. PR #76 made the substrate the primary stop
+    handler, so this is the normal path.
+
+    Production evidence: ANET 2026-07-17 (-$854.11, should be -1.10R)
+    and AAPL 2026-07-31 (-$448.81, should be -2.13R) both booked a NULL
+    r_multiple and an entry_timestamp stamped at exit time.
+    """
+
+    UID = "pos_testuid0000000000000000000000"
+
+    def _log_entry_row(self, tl, *, qty=13.0, fill=339.543846,
+                       rps=16.1921886113901, stop=320.73781138861,
+                       uid=None, symbol="AAPL"):
+        tl.log(
+            TradeRecord(
+                timestamp="2026-07-28T17:07:35+00:00",
+                symbol=symbol,
+                side="buy",
+                qty=qty,
+                avg_fill_price=fill,
+                order_id=f"entry-{symbol}",
+                strategy="donchian_breakout",
+                reason="donchian_breakout entry @ 2026-07-27T04:00:00+00:00",
+                stop_price=stop,
+                entry_reference_price=336.93,
+                modeled_slippage_bps=None,
+                realized_slippage_bps=None,
+                order_type="stop_limit",
+                status="filled",
+                requested_qty=qty,
+                filled_qty=qty,
+                initial_stop_loss=stop,
+                initial_risk_per_share=rps,
+                entry_timestamp="2026-07-28T17:07:35+00:00",
+                position_uid=uid if uid is not None else self.UID,
+            )
+        )
+
+    def _log_substrate_sell_row(self, tl, *, qty=13.0, price=305.02,
+                                uid=None, symbol="AAPL"):
+        """Mimic apply_order_event persisting the sell row FIRST."""
+        tl.log(
+            TradeRecord(
+                timestamp="2026-07-31T13:32:27+00:00",
+                symbol=symbol,
+                side="sell",
+                qty=qty,
+                avg_fill_price=price,
+                order_id=f"substrate-sell-{symbol}",
+                strategy="donchian_breakout",
+                reason="stop_triggered",
+                stop_price=price,
+                entry_reference_price=0.0,
+                modeled_slippage_bps=None,
+                realized_slippage_bps=None,
+                order_type="stop",
+                status="filled",
+                requested_qty=qty,
+                filled_qty=qty,
+                position_uid=uid if uid is not None else self.UID,
+            )
+        )
+
+    def test_risk_context_resolves_when_replay_sees_position_flat(self, tmp_path):
+        tl = TradeLogger(path=str(tmp_path / "trades.db"))
+        self._log_entry_row(tl)
+        self._log_substrate_sell_row(tl)
+        # Precondition: the open-state replay now nets to zero, which is
+        # exactly why the old code lost the risk basis.
+        assert tl._read_latest_open_entry_context(
+            symbol="AAPL", strategy="donchian_breakout"
+        ) is None
+        ctx = tl.read_entry_risk_context(self.UID)
+        assert ctx is not None
+        assert ctx["initial_risk_per_share"] == pytest.approx(16.1921886113901)
+        assert ctx["initial_stop_loss"] == pytest.approx(320.73781138861)
+        assert ctx["entry_timestamp"] == "2026-07-28T17:07:35+00:00"
+
+    def _seed_lifecycle_row(self, tl, *, uid=None, symbol="AAPL",
+                            avg_entry_price=339.543846):
+        """The substrate parent row. Production has this, and it is what
+        supplies the P&L basis once the open-state replay reports flat —
+        the pre-existing fallback this fix mirrors for the risk fields."""
+        conn = tl._ensure_db()
+        conn.execute(
+            "INSERT OR REPLACE INTO position_lifecycle "
+            "(position_uid, schema_version, created_at, symbol, owner_key, "
+            " strategy, position_type, status, entry_qty, current_qty, "
+            " avg_entry_price) "
+            "VALUES (?, 1, ?, ?, ?, 'donchian_breakout', 'single_leg', "
+            "'closed', 13.0, 0.0, ?)",
+            (uid if uid is not None else self.UID, "2026-07-28T17:07:35+00:00",
+             symbol, symbol, avg_entry_price),
+        )
+        conn.commit()
+
+    def test_stop_fill_books_r_multiple_despite_write_ordering(self, tmp_path):
+        """End-to-end: the AAPL scenario must book -2.13R, not NULL."""
+        tl = TradeLogger(path=str(tmp_path / "trades.db"))
+        self._log_entry_row(tl)
+        self._seed_lifecycle_row(tl)
+        self._log_substrate_sell_row(tl)  # substrate wrote it first
+        tl.log_stop_fill(
+            symbol="AAPL",
+            strategy="donchian_breakout",
+            qty=13.0,
+            avg_fill_price=305.02,
+            stop_price=320.73781138861,
+            order_id="substrate-sell-AAPL",
+            position_uid=self.UID,
+        )
+        row = [r for r in tl.read_all() if r["side"] == "sell"][-1]
+        expected_risk = 16.1921886113901 * 13.0
+        assert row["initial_risk_per_share"] == pytest.approx(16.1921886113901)
+        assert row["initial_risk_dollars"] == pytest.approx(expected_risk)
+        assert row["initial_stop_loss"] == pytest.approx(320.73781138861)
+        # -448.81 / 210.50 = -2.13R
+        assert row["r_multiple"] == pytest.approx(
+            (305.02 - 339.543846) * 13.0 / expected_risk, rel=1e-6
+        )
+        assert row["r_multiple"] == pytest.approx(-2.13, abs=0.01)
+
+    def test_entry_timestamp_is_the_entry_not_the_exit(self, tmp_path):
+        """The third symptom: with no context, entry_timestamp fell
+        through to 'now', corrupting hold-time analysis and breaking the
+        entry/exit join."""
+        tl = TradeLogger(path=str(tmp_path / "trades.db"))
+        self._log_entry_row(tl)
+        self._seed_lifecycle_row(tl)
+        self._log_substrate_sell_row(tl)
+        tl.log_stop_fill(
+            symbol="AAPL", strategy="donchian_breakout", qty=13.0,
+            avg_fill_price=305.02, stop_price=320.73781138861,
+            order_id="substrate-sell-AAPL", position_uid=self.UID,
+        )
+        row = [r for r in tl.read_all() if r["side"] == "sell"][-1]
+        assert row["entry_timestamp"] == "2026-07-28T17:07:35+00:00"
+
+    def test_no_uid_leaves_fields_null_rather_than_zero(self, tmp_path):
+        tl = TradeLogger(path=str(tmp_path / "trades.db"))
+        assert tl.read_entry_risk_context(None) is None
+        assert tl.read_entry_risk_context("") is None
+
+    def test_entry_without_risk_basis_stays_null(self, tmp_path):
+        """Entries predating risk-field recording legitimately have no
+        basis — the fallback must not invent one."""
+        tl = TradeLogger(path=str(tmp_path / "trades.db"))
+        self._log_entry_row(tl, rps=None, stop=None)
+        assert tl.read_entry_risk_context(self.UID) is None
+
+    def test_unknown_uid_returns_none(self, tmp_path):
+        tl = TradeLogger(path=str(tmp_path / "trades.db"))
+        self._log_entry_row(tl)
+        assert tl.read_entry_risk_context("pos_doesnotexist") is None
+
+    def test_does_not_cross_positions(self, tmp_path):
+        """A prior closed position in the same symbol must not supply
+        the basis for a later one."""
+        tl = TradeLogger(path=str(tmp_path / "trades.db"))
+        self._log_entry_row(tl, rps=99.0, stop=100.0, uid="pos_old")
+        self._log_entry_row(tl, rps=16.19, stop=320.74, uid="pos_new")
+        ctx = tl.read_entry_risk_context("pos_new")
+        assert ctx["initial_risk_per_share"] == pytest.approx(16.19)
+
+    def test_context_path_still_wins_when_available(self, tmp_path):
+        """When the replay does find the open position (the normal
+        synchronous exit path), nothing changes — the fallback is only
+        consulted if the risk basis is still missing."""
+        tl = TradeLogger(path=str(tmp_path / "trades.db"))
+        self._log_entry_row(tl)
+        ctx = tl._read_latest_open_entry_context(
+            symbol="AAPL", strategy="donchian_breakout"
+        )
+        assert ctx is not None
+        assert ctx["initial_risk_per_share"] == pytest.approx(16.1921886113901)
