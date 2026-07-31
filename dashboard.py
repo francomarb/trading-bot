@@ -32,6 +32,10 @@ import plotly.graph_objects as go
 import streamlit as st
 
 from config import settings
+from reporting.logger import (
+    CALIBRATION_GRADE_QUALITIES,
+    EXECUTION_QUALITY_KINDS,
+)
 from engine.positions import build_credit_spread_snapshot, owner_key_for
 
 
@@ -669,7 +673,27 @@ def compute_rolling_sharpe(
     return sharpe
 
 
-_CALIBRATION_GRADE_QUALITIES = ("primary", "fallback")
+def _execution_quality_mask(
+    frame: pd.DataFrame, index: pd.Index
+) -> "pd.Series[bool]":
+    """Vectorized form of `is_execution_quality_measurement`.
+
+    Both dimensions must hold: the benchmark kind must belong to the
+    execution-quality family, and the quality tier must be live rather
+    than reconstructed. Kept as a thin wrapper over the shared frozensets
+    in `reporting.logger` so the dashboard cannot drift away from the
+    definition used by health / calibration / reconcile / pnl / the drift
+    kill switch.
+    """
+    kind = frame.get(
+        "slippage_benchmark_kind", pd.Series(index=index, dtype=object)
+    )
+    quality = frame.get(
+        "slippage_measurement_quality", pd.Series(index=index, dtype=object)
+    )
+    return kind.isin(EXECUTION_QUALITY_KINDS) & quality.isin(
+        CALIBRATION_GRADE_QUALITIES
+    )
 
 
 def compute_strategy_stats(trades_df: pd.DataFrame) -> pd.DataFrame:
@@ -747,12 +771,8 @@ def compute_strategy_stats(trades_df: pd.DataFrame) -> pd.DataFrame:
                 exits.get("slippage_adverse_bps", pd.Series(index=exits.index)),
                 errors="coerce",
             )
-            exit_quality = exits.get(
-                "slippage_measurement_quality",
-                pd.Series(index=exits.index, dtype=object),
-            )
             exits["slippage_adverse_bps"] = adverse_series.where(
-                exit_quality.isin(_CALIBRATION_GRADE_QUALITIES)
+                _execution_quality_mask(exits, exits.index)
             )
             exits["filled_qty_num"] = pd.to_numeric(
                 exits["filled_qty"], errors="coerce"
@@ -838,15 +858,16 @@ def compute_strategy_stats(trades_df: pd.DataFrame) -> pd.DataFrame:
                     ),
                     errors="coerce",
                 )
-                mleg_quality = mleg_slippage_rows.get(
-                    "slippage_measurement_quality",
-                    pd.Series(index=mleg_slippage_rows.index, dtype=object),
-                )
-                # Phase 2 quality whitelist — same shape as the
-                # single-leg branch above. Recovered / unavailable
-                # MLEG rows are masked out of the strategy average.
+                # Execution-quality filter — same shape as the
+                # single-leg branch above. Recovered / unavailable MLEG
+                # rows and any non-execution benchmark family are masked
+                # out of the strategy average. Spread short legs carry
+                # `combo_limit`, which is execution quality, so completed
+                # MLEG positions still contribute.
                 mleg_slippage_rows["slippage_adverse_bps"] = mleg_adverse.where(
-                    mleg_quality.isin(_CALIBRATION_GRADE_QUALITIES)
+                    _execution_quality_mask(
+                        mleg_slippage_rows, mleg_slippage_rows.index
+                    )
                 )
                 mleg_slippage_rows["filled_qty_num"] = pd.to_numeric(
                     mleg_slippage_rows["filled_qty"], errors="coerce"

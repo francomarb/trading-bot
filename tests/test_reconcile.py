@@ -57,11 +57,14 @@ def tmp_forward_dir(tmp_path: Path) -> str:
 def _write_trades(path: str, rows: list[dict]) -> None:
     """Write trade records to a SQLite database via TradeLogger.
 
-    Phase 2 slippage unification: rows can pass `slippage_adverse_bps`
-    + `slippage_measurement_quality` to drive the reconcile slippage
-    gate. Legacy `realized_slippage_bps` is NULL on new rows after
-    Phase 4 — fixtures that supplied it still work but no longer affect
-    the gate, exactly mirroring production behavior.
+    Rows can pass `slippage_adverse_bps`, `slippage_measurement_quality`
+    and `slippage_benchmark_kind` to drive the reconcile slippage gate.
+    The benchmark kind defaults to an execution-quality benchmark so a
+    fixture that only sets a bps value still reaches the gate; pass
+    `'fallback_latest_close'` to exercise the metric-family exclusion.
+    Legacy `realized_slippage_bps` is NULL on new rows after Phase 4 —
+    fixtures that supplied it still work but no longer affect the gate,
+    exactly mirroring production behavior.
     """
     tl = TradeLogger(path=path)
     for row in rows:
@@ -98,6 +101,9 @@ def _write_trades(path: str, rows: list[dict]) -> None:
             slippage_adverse_bps=adverse,
             slippage_measurement_quality=row.get(
                 "slippage_measurement_quality", "primary",
+            ),
+            slippage_benchmark_kind=row.get(
+                "slippage_benchmark_kind", "arrival_midpoint",
             ),
         )
         tl.log(record)

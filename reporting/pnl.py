@@ -34,33 +34,38 @@ import pandas as pd
 from loguru import logger
 
 from config import settings
+from reporting.logger import is_execution_quality_measurement
 
 
 _SLIPPAGE_COLUMN = "slippage_adverse_bps"
 _QUALITY_COLUMN = "slippage_measurement_quality"
-_CALIBRATION_GRADE_QUALITIES = frozenset({"primary", "fallback"})
+_BENCHMARK_KIND_COLUMN = "slippage_benchmark_kind"
 
 
 def _adverse_bps(trade: dict) -> float | None:
     """Return adverse slippage for a trade row, or None when the row
-    isn't calibration-grade.
+    doesn't carry an execution-quality measurement.
 
-    Phase 2 slippage unification: reads `slippage_adverse_bps` from
-    the trade row and gates on the same positive quality whitelist
-    used by health / calibration / reconcile / dashboard
-    (`slippage_measurement_quality IN ('primary', 'fallback')`).
+    Delegates the decision to `is_execution_quality_measurement`, the
+    single definition shared with health / calibration / reconcile /
+    dashboard / the drift kill switch.
 
     Returns None for:
       - NULL / missing / non-numeric slippage values, OR
-      - rows whose quality is not in the whitelist (`recovered`,
-        `unavailable`, future enums, or a typo).
+      - rows whose benchmark isn't in the execution-quality family
+        (`fallback_latest_close` measures market drift between the
+        last bar close and the fill, not fill quality), OR
+      - rows whose quality is reconstructed rather than live
+        (`recovered`, `unavailable`, future enums, or a typo).
 
-    Both conditions mean the row has no honest measurement and must
-    be skipped — defaulting to 0 silently dilutes operator-facing
-    means; including reconstructed (`recovered`) measurements
-    pollutes reports with non-live-execution evidence.
+    All three mean the row has no honest execution measurement and
+    must be skipped — defaulting to 0 silently dilutes operator-facing
+    means, and mixing in the other metric families reports market
+    movement as though it were execution cost.
     """
-    if trade.get(_QUALITY_COLUMN) not in _CALIBRATION_GRADE_QUALITIES:
+    if not is_execution_quality_measurement(
+        trade.get(_BENCHMARK_KIND_COLUMN), trade.get(_QUALITY_COLUMN)
+    ):
         return None
     raw = trade.get(_SLIPPAGE_COLUMN)
     if raw is None:

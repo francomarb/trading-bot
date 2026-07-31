@@ -58,27 +58,30 @@ def _seed_filled_trade(
     status: str = "filled",
     adverse_bps: float | None = 0.0,
     measurement_quality: str = "primary",
+    benchmark_kind: str = "arrival_midpoint",
 ) -> None:
     """Seed a row matching the L2 check queries.
 
-    Phase 2 (slippage unification): assessor reads `slippage_adverse_bps`
-    + `slippage_measurement_quality`. `adverse_bps=None` seeds a NULL
-    metric (the row is excluded by the assessor's IS NOT NULL filter).
-    `measurement_quality` controls the whitelist filter — pass
-    `'recovered'` / `'unavailable'` to simulate the rows the assessor
-    must skip.
+    The assessor reads `slippage_adverse_bps` gated on the shared
+    execution-quality predicate. `adverse_bps=None` seeds a NULL metric
+    (excluded by the IS NOT NULL filter). `measurement_quality` controls
+    the trust dimension — pass `'recovered'` / `'unavailable'` for rows
+    the assessor must skip. `benchmark_kind` controls the family
+    dimension — pass `'fallback_latest_close'` to simulate an
+    implementation-shortfall row, which the assessor must also skip.
     """
     conn.execute(
         "INSERT INTO trades ("
         "timestamp, symbol, side, qty, avg_fill_price, order_id, "
         "strategy, reason, stop_price, entry_reference_price, "
         "slippage_signed_bps, slippage_adverse_bps, slippage_measurement_quality, "
+        "slippage_benchmark_kind, "
         "order_type, status, requested_qty, filled_qty"
         ") VALUES (?, 'X', 'sell', 1.0, 100.0, 'oid', ?, 'exit', "
-        "95.0, 100.0, ?, ?, ?, 'market', ?, 1.0, 1.0)",
+        "95.0, 100.0, ?, ?, ?, ?, 'market', ?, 1.0, 1.0)",
         (
             timestamp, strategy,
-            adverse_bps, adverse_bps, measurement_quality,
+            adverse_bps, adverse_bps, measurement_quality, benchmark_kind,
             status,
         ),
     )
