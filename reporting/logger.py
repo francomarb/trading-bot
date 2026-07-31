@@ -1045,10 +1045,12 @@ class TradeLogger:
         # Default kind = 'unavailable' is the safe behavior — no caller
         # gets a fabricated 'arrival_midpoint' tag if it forgot to
         # declare what kind of price it passed. The real exit caller
-        # (`_close_single_leg_position`) declares 'fallback_latest_close'
-        # for equities and 'unavailable' for options; the fractional
-        # residual cleanup declares 'unavailable'. See codepaths §3, §7
-        # in docs/slippage_unification_design.md.
+        # (`_finish_close_single_leg`) declares 'arrival_midpoint' for
+        # equities when the pre-submit NBBO fetch resolves and
+        # 'fallback_latest_close' when it doesn't, and 'unavailable' for
+        # options; the fractional residual cleanup declares
+        # 'unavailable'. See codepaths §3, §7 in
+        # docs/slippage_unification_design.md.
         new_benchmark_price: float | None = None
         new_benchmark_kind: SlippageBenchmarkKind = benchmark_kind or "unavailable"
         new_benchmark_timestamp: str | None = None
