@@ -839,6 +839,67 @@ class TestComputeStrategyStats:
         # avg_fill_price > 0 workaround.
         assert row["avg_adverse_slippage_bps"] == pytest.approx(50.0)
 
+    def test_no_qualifying_rows_reports_nan_not_zero(self):
+        """A strategy with no execution-quality measurement must report
+        NaN, not 0.0.
+
+        0.0 bps reads as *flawless execution* — a positive signal — when
+        it actually means "no measurement exists". That is the worst
+        possible way to render an absence, and it is the same
+        no-silent-zero-defaults rule already enforced on the numerator
+        and in `reporting/pnl.py::_adverse_bps`.
+
+        It became reachable when the execution-quality family filter
+        landed: a strategy whose exits are all stop-gap
+        (`active_stop_price`) or prior-close (`fallback_latest_close`)
+        benchmarks now has zero qualifying rows. Before the filter it had
+        a non-zero — if wrong — number, so the absence never showed.
+        Production hit this on three of four strategies at once.
+        """
+        df = self._make_df([
+            {"symbol": "AAPL", "side": "buy", "strategy": "donchian_breakout",
+             "avg_fill_price": "100.0", "filled_qty": "10", "qty": "10",
+             "timestamp": _ts(0), "entry_timestamp": _ts(0),
+             "position_type": "single_leg"},
+            # Stop-gap exit: real measurement, wrong family — excluded.
+            {"symbol": "AAPL", "side": "sell", "strategy": "donchian_breakout",
+             "avg_fill_price": "90.0", "filled_qty": "10", "qty": "10",
+             "realized_pnl": "-100.0", "timestamp": _ts(1),
+             "entry_timestamp": _ts(0), "position_type": "single_leg",
+             "slippage_adverse_bps": "490.1",
+             "slippage_benchmark_kind": "active_stop_price",
+             "slippage_measurement_quality": "primary"},
+        ])
+        stats = compute_strategy_stats(df)
+        row = stats[stats["strategy"] == "donchian_breakout"].iloc[0]
+        # The trade itself still counts — only the slippage is absent.
+        assert row["trades"] == 1
+        assert row["total_pnl"] == pytest.approx(-100.0)
+        assert pd.isna(row["avg_adverse_slippage_bps"]), (
+            "no execution-quality rows must render as blank, never 0.0 — "
+            "0.0 bps reads as perfect execution"
+        )
+
+    def test_genuine_zero_slippage_is_still_zero_not_nan(self):
+        """The counterpart: a real 0.0 bps measurement (a fill exactly at
+        the arrival midpoint) must stay 0.0 and NOT be confused with
+        'no data'. Both render as a number the operator can trust."""
+        df = self._make_df([
+            {"symbol": "AAPL", "side": "buy", "strategy": "sma_crossover",
+             "avg_fill_price": "100.0", "filled_qty": "10", "qty": "10",
+             "timestamp": _ts(0), "entry_timestamp": _ts(0),
+             "position_type": "single_leg"},
+            {"symbol": "AAPL", "side": "sell", "strategy": "sma_crossover",
+             "avg_fill_price": "110.0", "filled_qty": "10", "qty": "10",
+             "realized_pnl": "100.0", "timestamp": _ts(1),
+             "entry_timestamp": _ts(0), "position_type": "single_leg",
+             "slippage_adverse_bps": "0.0"},
+        ])
+        stats = compute_strategy_stats(df)
+        row = stats[stats["strategy"] == "sma_crossover"].iloc[0]
+        assert not pd.isna(row["avg_adverse_slippage_bps"])
+        assert row["avg_adverse_slippage_bps"] == pytest.approx(0.0)
+
     def test_recovered_quality_rows_excluded_from_strategy_average(self):
         """Phase 2 quality whitelist regression guard. Pre-fix the
         dashboard gated on `slippage_adverse_bps.notna()` alone, so a
