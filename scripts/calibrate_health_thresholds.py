@@ -48,7 +48,7 @@ if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
 from config import settings  # noqa: E402
-from reporting.logger import TradeLogger  # noqa: E402
+from reporting.logger import TradeLogger, execution_quality_sql  # noqa: E402
 from strategies.health.lifecycle import (  # noqa: E402
     LifecycleCounters,
     read_counters_for_period,
@@ -126,22 +126,25 @@ def _collect_slippage_observations(
     the same distribution as `_slippage_p95_bps` in
     `strategies/health/assessor.py`.
 
-    Quality filter is a positive whitelist (`primary`, `fallback`),
-    matching the assessor. Recovered rows (codepaths §5, §8, §9 —
-    benchmark reconstructed from broker history) and unavailable
-    rows (no honest benchmark) are excluded so calibration doesn't
-    learn from reconstructed or synthetic measurements. Fails closed
-    for future quality enums.
+    Row selection uses the shared `execution_quality_sql()` predicate,
+    identical to the assessor. It excludes two classes of row:
+    benchmarks outside the execution-quality family (a
+    `fallback_latest_close` row measures market drift between the last
+    bar close and the fill, not fill quality), and reconstructed
+    quality tiers (codepaths §5, §8, §9 rebuild the benchmark from
+    broker history). Calibrating on either would tune the drift
+    thresholds against something other than execution.
     """
+    predicate, predicate_params = execution_quality_sql()
     cursor = conn.execute(
         "SELECT slippage_adverse_bps "
         "FROM trades "
         "WHERE strategy = ? "
         "AND status IN ('filled', 'partial') "
-        "AND slippage_measurement_quality IN ('primary', 'fallback') "
+        f"AND {predicate} "
         "AND slippage_adverse_bps IS NOT NULL "
         "AND timestamp >= ? AND timestamp < ?",
-        (strategy_name, start.isoformat(), end.isoformat()),
+        (strategy_name, *predicate_params, start.isoformat(), end.isoformat()),
     )
     out: list[float] = []
     for (adverse,) in cursor.fetchall():

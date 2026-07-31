@@ -358,6 +358,14 @@ means price improvement. The economic value is stored on the short-leg row
 alongside the combo net price so dashboard strategy stats can surface average
 execution quality for completed spreads.
 
+`combo_limit` is classified as an **execution-quality** benchmark (fill versus
+the price we actually submitted), so PR #84's metric-family filter leaves this
+sleeve's measurement untouched — 17 of 17 rows still count. Note the bps are
+computed on option premium, so they are not comparable in magnitude to equity
+bps: an 8¢ miss on a $0.66 leg reads as 1212 bps. Per-strategy reporting keeps
+these separated; the cross-instrument pooling that still exists in
+`reporting/pnl.py` aggregates is tracked as PLAN `11.50`.
+
 ### Concrete example — SPY at $737
 
 | Leg | Action | Strike | DTE | Premium |

@@ -32,6 +32,7 @@ from backtest.runner import BacktestConfig, BacktestResult, run_backtest
 from config import settings
 from data.fetcher import fetch_symbol
 from indicators.technicals import add_atr
+from reporting.logger import is_execution_quality_measurement
 from strategies.base import BaseStrategy
 
 
@@ -161,20 +162,23 @@ class Reconciler:
         # 4. Per-trade divergence.
         divergences = self._match_trades(paper_fills, bt_results)
 
-        # 5. Slippage stats from paper fills. Phase 2 slippage
-        # unification: read `slippage_adverse_bps` (already clamped at
-        # writer time) and apply the same `measurement_quality IN
-        # ('primary','fallback')` whitelist used by health and
-        # calibration. Rows tagged 'recovered' / 'unavailable' (or any
-        # future tier) and rows with no measurement (NULL) are skipped
-        # so reconstructed / synthetic measurements never satisfy the
-        # gate by silently contributing zero — pre-fix this read the
-        # retired `realized_slippage_bps` column, which is NULL on every
-        # post-Phase-2 row and would have silently disabled the gate.
+        # 5. Slippage stats from paper fills. Reads
+        # `slippage_adverse_bps` (already clamped at writer time) and
+        # applies the shared `is_execution_quality_measurement`
+        # predicate used by health, calibration, pnl, the dashboard and
+        # the drift kill switch. Two classes of row are skipped:
+        # benchmarks outside the execution-quality family (a
+        # `fallback_latest_close` row measures market drift, not fill
+        # quality) and reconstructed / absent measurements. Neither may
+        # satisfy the gate by silently contributing zero — pre-Phase-2
+        # this read the retired `realized_slippage_bps` column, which is
+        # NULL on every current row and would have disabled the gate.
         slips: list[float] = []
         for t in paper_fills:
-            quality = t.get("slippage_measurement_quality")
-            if quality not in ("primary", "fallback"):
+            if not is_execution_quality_measurement(
+                t.get("slippage_benchmark_kind"),
+                t.get("slippage_measurement_quality"),
+            ):
                 continue
             raw = t.get("slippage_adverse_bps")
             if raw is None:

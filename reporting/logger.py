@@ -48,6 +48,92 @@ SlippageMeasurementQuality = Literal[
     "unavailable",
 ]
 
+
+# ── Slippage metric families ─────────────────────────────────────────────────
+#
+# `slippage_adverse_bps` is one physical column holding three conceptually
+# incommensurable measurements, told apart only by `slippage_benchmark_kind`.
+# `docs/slippage_unification_design.md` names the families and states, for the
+# drift kill switch: "Do not use ... implementation shortfall, stop-gap
+# erosion."
+#
+# That constraint was unenforceable while consumers filtered on
+# `slippage_measurement_quality` alone: quality answers "how much do we trust
+# this measurement", not "what does it measure". `fallback` quality pairs 1:1
+# with the `fallback_latest_close` benchmark, which is implementation
+# shortfall — so the whitelist admitted exactly the rows the design forbids.
+#
+# Classifying here, next to the enum that defines the vocabulary, makes the
+# family a property of the data instead of something each consumer has to
+# remember. `TestSlippageFamilies::test_every_benchmark_kind_is_classified`
+# fails if a new kind is added to the Literal without being placed in a family.
+
+EXECUTION_QUALITY_KINDS: frozenset[str] = frozenset({
+    "arrival_midpoint",   # market fill vs NBBO midpoint captured at submit
+    "combo_limit",        # spread fill vs the combo limit we submitted
+})
+
+IMPLEMENTATION_SHORTFALL_KINDS: frozenset[str] = frozenset({
+    "decision_price",         # fill vs the price the strategy decided on
+    "fallback_latest_close",  # fill vs a prior bar close — market drift
+})
+
+STOP_GAP_KINDS: frozenset[str] = frozenset({
+    "active_stop_price",  # fill vs the stop level that released the order
+})
+
+# Kinds that carry no honest measurement at all. LIMIT fills live here: a
+# resting limit filled at its own limit price yields a structural zero, not
+# an execution-quality reading (design doc §2).
+UNMEASURED_KINDS: frozenset[str] = frozenset({
+    "limit_price",
+    "unavailable",
+})
+
+# Quality tiers whose benchmark was observed live rather than reconstructed
+# after the fact. Retained from the Phase 2 migration: `recovered` benchmarks
+# are rebuilt from broker history and `unavailable` has none, so neither
+# belongs in a distribution used to judge live execution.
+CALIBRATION_GRADE_QUALITIES: frozenset[str] = frozenset({"primary", "fallback"})
+
+
+def is_execution_quality_measurement(
+    benchmark_kind: str | None,
+    measurement_quality: str | None,
+) -> bool:
+    """True when a row's slippage value actually measures execution quality.
+
+    Both dimensions must hold: the benchmark has to belong to the
+    execution-quality family (what is being measured) and the quality tier
+    has to be live rather than reconstructed (how much we trust it).
+
+    This is the single definition consumed by the drift kill switch, the
+    health assessor, the calibration script, the PnL reports, the dashboard
+    and the reconcile gate. Callers must not re-implement it.
+    """
+    return (
+        benchmark_kind in EXECUTION_QUALITY_KINDS
+        and measurement_quality in CALIBRATION_GRADE_QUALITIES
+    )
+
+
+def execution_quality_sql() -> tuple[str, tuple[str, ...]]:
+    """SQL fragment + bind params selecting execution-quality rows.
+
+    Returns a ``WHERE``-clause fragment (no leading ``AND``) and the
+    parameters to bind, so SQL consumers share one definition with the
+    in-Python `is_execution_quality_measurement` predicate. Values are
+    sorted so the generated SQL is stable across runs.
+    """
+    kinds = tuple(sorted(EXECUTION_QUALITY_KINDS))
+    qualities = tuple(sorted(CALIBRATION_GRADE_QUALITIES))
+    fragment = (
+        f"slippage_benchmark_kind IN ({', '.join('?' * len(kinds))}) "
+        f"AND slippage_measurement_quality IN ({', '.join('?' * len(qualities))})"
+    )
+    return fragment, kinds + qualities
+
+
 from loguru import logger
 
 from config import settings
@@ -899,12 +985,15 @@ class TradeLogger:
         — never fabricates a benchmark claim) after the Defect 1 fix.
         Real callers declare honestly:
 
-          - ``_close_single_leg_position`` (codepath §3): equity exits
-            pass ``fallback_latest_close`` / ``fallback`` because the
-            exit path uses the latest bar close as a proxy benchmark;
-            option exits pass ``unavailable`` / ``unavailable`` because
-            ``modeled_price`` is the fill price itself, which yields a
-            structural zero-slippage measurement.
+          - ``_finish_close_single_leg`` (codepath §3): equity exits pass
+            ``arrival_midpoint`` / ``primary`` when the NBBO midpoint
+            captured immediately before submit resolves, and
+            ``fallback_latest_close`` / ``fallback`` when it doesn't
+            (one-sided book, API failure) — in that case ``modeled_price``
+            is the latest bar close, which measures market drift rather
+            than fill quality. Option exits pass ``unavailable`` /
+            ``unavailable`` because ``modeled_price`` is the fill price
+            itself, which yields a structural zero-slippage measurement.
           - ``_close_fractional_residual_position`` (codepath §7):
             ``unavailable`` / ``unavailable`` because the close_price
             fallback chain is not a slippage benchmark.
@@ -956,10 +1045,12 @@ class TradeLogger:
         # Default kind = 'unavailable' is the safe behavior — no caller
         # gets a fabricated 'arrival_midpoint' tag if it forgot to
         # declare what kind of price it passed. The real exit caller
-        # (`_close_single_leg_position`) declares 'fallback_latest_close'
-        # for equities and 'unavailable' for options; the fractional
-        # residual cleanup declares 'unavailable'. See codepaths §3, §7
-        # in docs/slippage_unification_design.md.
+        # (`_finish_close_single_leg`) declares 'arrival_midpoint' for
+        # equities when the pre-submit NBBO fetch resolves and
+        # 'fallback_latest_close' when it doesn't, and 'unavailable' for
+        # options; the fractional residual cleanup declares
+        # 'unavailable'. See codepaths §3, §7 in
+        # docs/slippage_unification_design.md.
         new_benchmark_price: float | None = None
         new_benchmark_kind: SlippageBenchmarkKind = benchmark_kind or "unavailable"
         new_benchmark_timestamp: str | None = None
@@ -1302,6 +1393,60 @@ class TradeLogger:
             (start_date, end_date),
         )
         return [dict(row) for row in cursor.fetchall()]
+
+    def read_recent_execution_quality_slippage(
+        self, last_n: int
+    ) -> list[float]:
+        """Adverse bps for the last N execution-quality MARKET fills.
+
+        Feeds `RiskManager.seed_slippage_samples` at engine startup so
+        the drift kill switch survives restarts. Returns oldest-first so
+        the caller can append in chronological order.
+
+        Selection mirrors `_record_fill` exactly, and both derive from
+        `execution_quality_sql()`:
+
+          - MARKET orders only. Arrival price is not a meaningful
+            benchmark for a resting LIMIT fill.
+          - execution-quality benchmark family only. A
+            `fallback_latest_close` row measures market drift between
+            the last bar close and the fill, not fill quality.
+          - live quality tiers only, never reconstructed ones.
+
+        If these two selections ever diverge, the kill switch would
+        judge live fills against a differently-shaped history;
+        `TestSeedMatchesRecordFill` pins them together.
+        """
+        if not os.path.exists(self._path):
+            return []
+        predicate, predicate_params = execution_quality_sql()
+        conn = self._ensure_db()
+        cursor = conn.execute(
+            "SELECT slippage_adverse_bps FROM trades "
+            "WHERE order_type = 'market' "
+            "AND status IN ('filled', 'partial') "
+            f"AND {predicate} "
+            "AND slippage_adverse_bps IS NOT NULL "
+            "ORDER BY id DESC LIMIT ?",
+            (*predicate_params, last_n),
+        )
+        out: list[float] = []
+        for (adverse,) in cursor.fetchall():
+            try:
+                value = float(adverse)
+            except (TypeError, ValueError):
+                continue
+            if value < 0:
+                # Writer clamps to max(0, signed); a negative here means
+                # a corrupt or hand-edited row. Skip rather than raise
+                # into startup.
+                logger.warning(
+                    f"slippage seed: skipping negative adverse value {value}"
+                )
+                continue
+            out.append(value)
+        out.reverse()  # chronological
+        return out
 
     def read_recent(self, last_n: int) -> list[dict]:
         """Read the last N trade records."""

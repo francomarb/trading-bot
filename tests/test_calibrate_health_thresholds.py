@@ -101,13 +101,16 @@ _SLIPPAGE_OID_COUNTER = [0]
 
 def _seed_slippage_trade(
     conn, *, strategy, timestamp, adverse_bps, measurement_quality="primary",
+    benchmark_kind="arrival_midpoint",
 ):
-    """Seed a row matching the Phase 2 collector query.
+    """Seed a row matching the collector query.
 
     `adverse_bps=None` seeds NULL (the IS NOT NULL filter excludes it).
     `measurement_quality` defaults to 'primary' so calibration includes
     the row; pass 'recovered' / 'unavailable' / anything else to verify
-    the whitelist filter excludes it.
+    the trust filter excludes it. `benchmark_kind` defaults to an
+    execution-quality benchmark; pass 'fallback_latest_close' to verify
+    the metric-family filter excludes implementation-shortfall rows.
     """
     # Foundation §6.5 partial UNIQUE on trades.order_id within single_leg
     # scope means every fixture row needs a distinct order_id, or the
@@ -119,12 +122,13 @@ def _seed_slippage_trade(
         "timestamp, symbol, side, qty, avg_fill_price, order_id, "
         "strategy, reason, stop_price, entry_reference_price, "
         "slippage_signed_bps, slippage_adverse_bps, slippage_measurement_quality, "
+        "slippage_benchmark_kind, "
         "order_type, status, requested_qty, filled_qty"
         ") VALUES (?, 'X', 'sell', 1.0, 100.0, ?, ?, 'exit', "
-        "95.0, 100.0, ?, ?, ?, 'market', 'filled', 1.0, 1.0)",
+        "95.0, 100.0, ?, ?, ?, ?, 'market', 'filled', 1.0, 1.0)",
         (
             timestamp, oid, strategy,
-            adverse_bps, adverse_bps, measurement_quality,
+            adverse_bps, adverse_bps, measurement_quality, benchmark_kind,
         ),
     )
     conn.commit()

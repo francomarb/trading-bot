@@ -1212,3 +1212,62 @@ class TestKillSwitchHalt:
         rej = mgr.evaluate(_signal(), _account(), now=T0)
         assert isinstance(rej, RiskRejection)
         assert rej.code is RejectionCode.HALTED
+
+
+class TestSlippageSampleSeeding:
+    """Restart durability for the drift kill switch.
+
+    `_slippage_samples` is process memory. Without seeding, every
+    restart empties it and the alarm has to re-accumulate
+    `slippage_min_samples` qualifying fills before it can judge
+    anything — at this bot's fill rate and restart frequency it could
+    sit permanently below its own quorum, enabled but mute.
+    """
+
+    def test_seed_populates_pool(self):
+        mgr = _mgr(slippage_min_samples=5)
+        n = mgr.seed_slippage_samples([(5.0, 1.0), (5.0, 2.0)])
+        assert n == 2
+        assert len(mgr._slippage_samples) == 2
+
+    def test_seed_does_not_evaluate_threshold(self):
+        """Startup is not a fill event. Halting before the bot has
+        placed an order would be a confusing, hard-to-diagnose stop."""
+        mgr = _mgr(slippage_min_samples=2, slippage_drift_multiplier=3.0,
+                   slippage_drift_enabled=True)
+        mgr.seed_slippage_samples([(5.0, 500.0)] * 10)
+        assert not mgr.is_halted()
+
+    def test_seeded_history_counts_toward_quorum(self):
+        """The point of seeding: one live fill after a restart can now
+        trip the alarm because the history behind it survived."""
+        mgr = _mgr(slippage_min_samples=5, slippage_drift_multiplier=3.0,
+                   slippage_drift_enabled=True)
+        mgr.seed_slippage_samples([(5.0, 20.0)] * 4)
+        assert not mgr.is_halted()
+        mgr.record_fill_slippage(modeled_bps=5.0, adverse_bps=20.0)
+        assert mgr.is_halted()
+
+    def test_seed_replaces_rather_than_appends(self):
+        """Idempotent under a re-sync — a second call must not
+        double-count the same history."""
+        mgr = _mgr(slippage_min_samples=5)
+        mgr.seed_slippage_samples([(5.0, 1.0)] * 3)
+        mgr.seed_slippage_samples([(5.0, 1.0)] * 3)
+        assert len(mgr._slippage_samples) == 3
+
+    def test_seed_rejects_negative_values(self):
+        mgr = _mgr(slippage_min_samples=5)
+        with pytest.raises(ValueError):
+            mgr.seed_slippage_samples([(5.0, -1.0)])
+
+    def test_seed_empty_list_is_noop(self):
+        mgr = _mgr(slippage_min_samples=5)
+        assert mgr.seed_slippage_samples([]) == 0
+        assert len(mgr._slippage_samples) == 0
+
+    def test_seed_bounded_by_deque_maxlen(self):
+        mgr = _mgr(slippage_min_samples=5)
+        maxlen = mgr._slippage_samples.maxlen
+        mgr.seed_slippage_samples([(5.0, 1.0)] * (maxlen + 50))
+        assert len(mgr._slippage_samples) == maxlen

@@ -385,17 +385,16 @@ class TestRefreshMultiLegPositions:
 
 class TestComputeEquityCurve:
     def _make_df(self, rows: list[dict]) -> pd.DataFrame:
-        # Phase 2 default: rows that carry a measured slippage_adverse_bps
-        # but no explicit quality tag default to 'primary' (calibration-
-        # grade), matching what production writers emit. Tests that
-        # need to exercise the quality whitelist set quality explicitly
-        # (`recovered`, `unavailable`, or some other tier).
+        # Rows that carry a measured slippage_adverse_bps but no explicit
+        # tags default to a calibration-grade execution-quality pair
+        # ('primary' + 'arrival_midpoint'), matching what production
+        # writers emit. Tests that need to exercise either filter
+        # dimension set the tag explicitly — quality (`recovered`,
+        # `unavailable`) or benchmark kind (`fallback_latest_close`).
         for row in rows:
-            if (
-                "slippage_adverse_bps" in row
-                and "slippage_measurement_quality" not in row
-            ):
-                row["slippage_measurement_quality"] = "primary"
+            if "slippage_adverse_bps" in row:
+                row.setdefault("slippage_measurement_quality", "primary")
+                row.setdefault("slippage_benchmark_kind", "arrival_midpoint")
         df = pd.DataFrame(rows)
         if "timestamp" in df.columns:
             df["timestamp"] = pd.to_datetime(df["timestamp"], utc=True)
@@ -594,17 +593,16 @@ class TestComputeRollingSharpe:
 
 class TestComputeStrategyStats:
     def _make_df(self, rows: list[dict]) -> pd.DataFrame:
-        # Phase 2 default: rows that carry a measured slippage_adverse_bps
-        # but no explicit quality tag default to 'primary' (calibration-
-        # grade), matching what production writers emit. Tests that
-        # need to exercise the quality whitelist set quality explicitly
-        # (`recovered`, `unavailable`, or some other tier).
+        # Rows that carry a measured slippage_adverse_bps but no explicit
+        # tags default to a calibration-grade execution-quality pair
+        # ('primary' + 'arrival_midpoint'), matching what production
+        # writers emit. Tests that need to exercise either filter
+        # dimension set the tag explicitly — quality (`recovered`,
+        # `unavailable`) or benchmark kind (`fallback_latest_close`).
         for row in rows:
-            if (
-                "slippage_adverse_bps" in row
-                and "slippage_measurement_quality" not in row
-            ):
-                row["slippage_measurement_quality"] = "primary"
+            if "slippage_adverse_bps" in row:
+                row.setdefault("slippage_measurement_quality", "primary")
+                row.setdefault("slippage_benchmark_kind", "arrival_midpoint")
         df = pd.DataFrame(rows)
         if "timestamp" in df.columns:
             df["timestamp"] = pd.to_datetime(df["timestamp"], utc=True)

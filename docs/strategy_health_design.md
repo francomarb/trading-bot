@@ -129,7 +129,7 @@ The primacy inversion is the most important rule in this design:
 | Layer | Question | Examples |
 |---|---|---|
 | **L1 Operational** | Is the strategy *running* and *seeing the world correctly*? | Stream connected; regime gate firing; watchlist non-empty; sector resolver hits; cycle latency; reconciliation mismatches; missing stop repairs |
-| **L2 Execution** | When it does trade, is execution honest? | Realized vs modeled slippage; fill rate; order rejection rate; timeout/cancel rate; spread for options; signal-to-fill conversion |
+| **L2 Execution** | When it does trade, is execution honest? | Realized vs modeled slippage (execution-quality benchmark family only — see §L2 Execution checks); fill rate; order rejection rate; timeout/cancel rate; spread for options; signal-to-fill conversion |
 | **L3 Drift** | Is the live signal distribution diverging from backtest? *(Leading indicator of future edge loss.)* | Trade frequency vs envelope; hold-time distribution; edge-filter block rate; concurrent-position clustering |
 
 L3 is explicitly **leading-indicator** in nature — it warns of edge erosion before it shows up in PnL, but does not itself constitute an edge verdict. The realized statistical underperformance question moves entirely into EdgeReport.
@@ -252,6 +252,8 @@ Three signals combine to produce the verdict, **all computed on R-expectancy (no
 ### L2 Execution checks
 
 - **Realized slippage in bps vs modeled** (existing slippage drift tracker at 6.11 — health monitor reads it, doesn't duplicate)
+  - **Scoped to the execution-quality benchmark family since PR #84 (2026-07-31).** `slippage_adverse_bps` holds three incommensurable measurements distinguished only by `slippage_benchmark_kind`; `_slippage_p95_bps` now gates on `reporting.logger.execution_quality_sql()` so implementation-shortfall rows (`fallback_latest_close`) and stop-gap rows (`active_stop_price`) no longer inflate it. Previously the check filtered on `measurement_quality` alone, which admits both.
+  - Consequence: strategies whose fills are all LIMIT entries and stop exits report **no** L2 slippage figure at all. `spy_options_reversion` went from 4 samples to 0 for exactly this reason. That is honest, not a regression — but it means stop-gap erosion is currently surfaced nowhere. Tracked as PLAN `11.49`; it must be reported as its **own** L2 line, never merged back into the execution-quality figure.
 - Order rejection rate (orders submitted vs rejected by broker)
 - Timeout / cancel rate (`ORDER_CONFIRM_TIMEOUT_SECONDS` exceedances)
 - Fill rate (orders submitted vs orders filled within session)

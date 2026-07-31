@@ -43,6 +43,7 @@ from typing import Any
 
 import numpy as np
 
+from reporting.logger import execution_quality_sql
 from strategies.health.envelope import StrategyEnvelope
 from strategies.health.lifecycle import (
     LifecycleCounters,
@@ -328,24 +329,34 @@ def _slippage_p95_bps(
     column read rather than an in-Python recomputation against the
     legacy `realized - modeled` pair.
 
-    Quality filter is a positive whitelist (`primary`, `fallback`),
-    not a NOT-IN exclusion. Failing closed keeps any future quality
-    enum (e.g. a richer `recovered_from_audit` tier we might add later)
-    out of the calibration distribution until we explicitly opt it in,
-    and isolates the recovered/unavailable rows whose benchmarks were
-    reconstructed (codepaths §5, §8, §9) and shouldn't influence the
-    live drift alarm.
+    Row selection uses the shared `execution_quality_sql()` predicate so
+    this query, the drift kill switch, the calibration script, the PnL
+    reports, the dashboard and the reconcile gate cannot drift apart.
+    It gates on two dimensions:
+
+      - benchmark kind must be in the execution-quality family. A
+        `fallback_latest_close` row measures how far price moved
+        between the last bar close and the fill — implementation
+        shortfall, not execution quality — and the design doc forbids
+        feeding that to drift controls.
+      - quality must be live (`primary`/`fallback`), not reconstructed.
+        Failing closed keeps any future quality enum out of the
+        distribution until it is explicitly opted in, and isolates the
+        recovered/unavailable rows whose benchmarks were rebuilt after
+        the fact (codepaths §5, §8, §9).
     """
+    predicate, predicate_params = execution_quality_sql()
     cursor = conn.execute(
         "SELECT slippage_adverse_bps "
         "FROM trades "
         "WHERE strategy = ? "
         "AND status IN ('filled', 'partial') "
-        "AND slippage_measurement_quality IN ('primary', 'fallback') "
+        f"AND {predicate} "
         "AND slippage_adverse_bps IS NOT NULL "
         "AND timestamp >= ? "
         "AND timestamp < ?",
-        (strategy_name, period_start.isoformat(), period_end.isoformat()),
+        (strategy_name, *predicate_params,
+         period_start.isoformat(), period_end.isoformat()),
     )
     deltas = []
     for (adverse,) in cursor.fetchall():

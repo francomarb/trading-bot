@@ -1237,6 +1237,12 @@ class TestSlippageRecording:
             entries=[False] * 59 + [True],
             place_result=_filled_result("AAPL", 1, modeled_close + 0.20),
         )
+        # An arrival quote is required for the fill to reach the kill
+        # switch at all — the factory's default None yields a
+        # `fallback_latest_close` benchmark, which is implementation
+        # shortfall and is filtered out. Anchoring the quote at
+        # `modeled_close` keeps the bps arithmetic below unchanged.
+        broker.get_latest_quote_midpoint.return_value = modeled_close
         snap = _snapshot()
         engine._session_start_equity = snap.account.equity
         slot = engine.slots[0]
@@ -1376,23 +1382,28 @@ class TestArrivalQuoteCapture:
     def test_falls_back_to_decision_close_when_quote_unavailable(
         self, engine_factory,
     ):
-        """Arrival quote of None (one-sided book, API failure) → fall
-        back to the legacy behaviour rather than refusing to log
-        slippage. Defensive: a broken quote feed must not blind the
-        slippage tracker entirely."""
+        """Arrival quote of None (one-sided book, API failure) → the row
+        is still written, tagged as the fallback it is, but it must NOT
+        reach the drift kill switch.
+
+        Fill-vs-prior-close is implementation shortfall, not execution
+        quality, and the design doc forbids feeding that family to the
+        drift alarm. A broken quote feed blinds the *alarm* rather than
+        poisoning it with market movement.
+        """
         engine, broker = engine_factory(entries=[False] * 59 + [True])
         broker.get_latest_quote_midpoint.return_value = None
         snap = _snapshot()
         engine._session_start_equity = snap.account.equity
         slot = engine.slots[0]
         engine._process_symbol("AAPL", snap, snap.account, slot.strategy, slot.timeframe)
-        # A slippage sample is recorded (didn't refuse) and modeled_bps is
-        # the configured baseline — confirms the fall-back path ran.
-        assert len(engine.risk._slippage_samples) == 1
+        assert len(engine.risk._slippage_samples) == 0
 
     def test_rejects_non_finite_quote_from_broker(self, engine_factory):
         """Defensive: broker returns NaN / negative / zero (Mock-style
-        misbehavior) → engine treats as no quote and falls back."""
+        misbehavior) → engine treats as no quote, falls back to the
+        prior close for the row, and withholds it from the kill switch
+        for the same reason as the None case."""
         engine, broker = engine_factory(entries=[False] * 59 + [True])
         broker.get_latest_quote_midpoint.return_value = float("nan")
         snap = _snapshot()
@@ -1400,7 +1411,7 @@ class TestArrivalQuoteCapture:
         slot = engine.slots[0]
         # Must not raise into the trading loop.
         engine._process_symbol("AAPL", snap, snap.account, slot.strategy, slot.timeframe)
-        assert len(engine.risk._slippage_samples) == 1
+        assert len(engine.risk._slippage_samples) == 0
 
 
 class TestOrderTypeAwareSubmitSlippageTagging:
@@ -3886,7 +3897,13 @@ class TestOptionsEngineFixes:
             raw_status="filled",
             message="",
         )
-        engine._record_fill(result, modeled_price=100.0, order_type="market")
+        engine._record_fill(
+            result,
+            modeled_price=100.0,
+            benchmark_kind="arrival_midpoint",
+            measurement_quality="primary",
+            order_type="market",
+        )
         engine.risk.record_fill_slippage.assert_called_once()
 
     # Fix 4: 100x multiplier for options P&L ─────────────────────────────────
@@ -6116,17 +6133,21 @@ class TestSectorExposure:
 
 class TestExitPathBenchmarkKind:
     """
-    Codepath §3 — discretionary market exits. The exit path never
-    fetches an arrival midpoint; it passes latest_close (equities) or
-    the fill price itself (options) as ``modeled_price``. Phase 1
-    Defect 1 fix changes the tagging so:
+    Codepath §3 — discretionary market exits.
 
-      - equity exits → benchmark_kind='fallback_latest_close', quality='fallback'
-      - option exits → benchmark_kind='unavailable', quality='unavailable'
+    The exit path now fetches an NBBO midpoint immediately before
+    submitting the close, mirroring the entry path and satisfying the
+    design doc's fill-type contract §3 ("arrival midpoint at close
+    submission"). Tagging:
 
-    Previously both were tagged 'arrival_midpoint' / 'primary', which
-    was a false claim for equities and a fabricated zero-slippage
-    measurement for options.
+      - equity exit, quote available   → 'arrival_midpoint' / 'primary'
+      - equity exit, quote unavailable → 'fallback_latest_close' / 'fallback'
+      - option exit                    → 'unavailable' / 'unavailable'
+
+    The Phase 1 Defect 1 invariant still holds: nothing may be tagged
+    'arrival_midpoint' unless an arrival midpoint was actually observed.
+    Options are never tagged that way — OCC symbols are skipped entirely
+    because they belong to OPRA, not the stock quote endpoint.
     """
 
     def _engine_with_real_logger(self, tmp_path):
@@ -6167,8 +6188,8 @@ class TestExitPathBenchmarkKind:
             ),
         ), broker
 
-    def test_equity_exit_tags_fallback_latest_close(self, tmp_path):
-        engine, broker = self._engine_with_real_logger(tmp_path)
+    @staticmethod
+    def _equity_position_and_snapshot():
         from execution.broker import BrokerSnapshot
         position = SimpleNamespace(
             qty=10, symbol="AAPL", avg_entry_price=148.0,
@@ -6185,6 +6206,14 @@ class TestExitPathBenchmarkKind:
             ),
             open_orders=[],
         )
+        return position, snap
+
+    def test_equity_exit_tags_fallback_latest_close_without_quote(self, tmp_path):
+        """No arrival quote → the row falls back to the prior bar close
+        and says so, exactly as before this path learned to fetch."""
+        engine, broker = self._engine_with_real_logger(tmp_path)
+        broker.get_latest_quote_midpoint.return_value = None
+        position, snap = self._equity_position_and_snapshot()
         engine._log_close = MagicMock()
         engine._close_single_leg_position(
             symbol="AAPL",
@@ -6197,6 +6226,60 @@ class TestExitPathBenchmarkKind:
         kwargs = engine._log_close.call_args.kwargs
         assert kwargs["benchmark_kind"] == "fallback_latest_close"
         assert kwargs["measurement_quality"] == "fallback"
+        # Implementation shortfall must never reach the drift alarm.
+        assert len(engine.risk._slippage_samples) == 0
+
+    def test_equity_exit_tags_arrival_midpoint_when_quote_available(self, tmp_path):
+        """Quote available → the exit is measured against live market
+        state, tagged as a primary execution-quality measurement, and
+        feeds the drift kill switch."""
+        engine, broker = self._engine_with_real_logger(tmp_path)
+        broker.get_latest_quote_midpoint.return_value = 149.60
+        position, snap = self._equity_position_and_snapshot()
+        engine._log_close = MagicMock()
+        engine._close_single_leg_position(
+            symbol="AAPL",
+            strategy=engine.strategy,
+            position=position,
+            snapshot=snap,
+            latest_close=149.00,
+            alert_reason="exit signal",
+        )
+        kwargs = engine._log_close.call_args.kwargs
+        assert kwargs["benchmark_kind"] == "arrival_midpoint"
+        assert kwargs["measurement_quality"] == "primary"
+        # Benchmark is the arrival midpoint, not the bar close.
+        assert engine._log_close.call_args.args[1] == pytest.approx(149.60)
+        # Sold at 149.50 against a 149.60 arrival → adverse.
+        assert len(engine.risk._slippage_samples) == 1
+        _, adverse_bps = engine.risk._slippage_samples[0]
+        assert adverse_bps == pytest.approx(
+            (149.60 - 149.50) / 149.60 * 10_000, rel=1e-3
+        )
+
+    def test_equity_exit_quote_fetched_before_close_submitted(self, tmp_path):
+        """The midpoint must be captured before the close is submitted —
+        a quote read afterwards is contaminated by our own order."""
+        engine, broker = self._engine_with_real_logger(tmp_path)
+        call_order: list[str] = []
+        broker.get_latest_quote_midpoint.side_effect = (
+            lambda *_a, **_k: call_order.append("quote") or 149.60
+        )
+        broker.close_position.side_effect = (
+            lambda *_a, **_k: call_order.append("close")
+            or _filled_result("AAPL", 10, 149.50)
+        )
+        position, snap = self._equity_position_and_snapshot()
+        engine._log_close = MagicMock()
+        engine._close_single_leg_position(
+            symbol="AAPL",
+            strategy=engine.strategy,
+            position=position,
+            snapshot=snap,
+            latest_close=149.00,
+            alert_reason="exit signal",
+        )
+        assert call_order == ["quote", "close"]
 
     def test_option_exit_tags_unavailable(self, tmp_path):
         engine, broker = self._engine_with_real_logger(tmp_path)
@@ -6374,3 +6457,93 @@ class TestSubstrateStopLimitReconstruction:
         assert captured["decision"].order_type is OrderType.MARKET
         assert captured["decision"].entry_trigger_price is None
         assert captured["decision"].limit_price is None
+
+
+class TestSlippageMonitorSeeding:
+    """Engine-side wiring of the kill switch's restart rehydration.
+
+    The engine owns the database read and hands plain samples to
+    `RiskManager`, keeping risk free of trade-log knowledge — the same
+    shape as the per-fill push. Seeding must never be able to block
+    startup: an advisory monitor is not worth failing a boot over.
+    """
+
+    def _engine(self, tmp_path, trade_logger=None):
+        strategy = FakeStrategy(entries=[False], exits=[False])
+        broker = MagicMock()
+        broker.sync_with_broker.return_value = _snapshot()
+        broker.get_open_orders.return_value = []
+        broker._with_retry.side_effect = lambda fn, **_: fn()
+        broker._api.get_clock.return_value = SimpleNamespace(is_open=True)
+        risk = RiskManager(
+            max_position_pct=0.02,
+            max_open_positions=5,
+            max_gross_exposure_pct=0.50,
+            atr_stop_multiplier=2.0,
+            max_daily_loss_pct=0.05,
+            hard_dollar_loss_cap=1_000_000.0,
+            loss_streak_threshold=10,
+            broker_error_threshold=10,
+        )
+        return TradingEngine(
+            strategy=strategy,
+            symbols=["AAPL"],
+            risk=risk,
+            broker=broker,
+            trade_logger=trade_logger or TradeLogger(
+                path=str(tmp_path / "trades.db")
+            ),
+            config=EngineConfig(
+                history_lookback_days=120,
+                cycle_interval_seconds=0.01,
+                max_bar_age_multiplier=10.0,
+                market_hours_only=False,
+            ),
+        )
+
+    def test_seeds_pool_from_trade_log(self, tmp_path):
+        from config.settings import SLIPPAGE_MODEL_MARKET_BPS
+
+        tl = MagicMock()
+        tl.read_recent_execution_quality_slippage.return_value = [1.0, 2.0, 3.0]
+        engine = self._engine(tmp_path, trade_logger=tl)
+        engine._seed_slippage_monitor()
+        assert len(engine.risk._slippage_samples) == 3
+        modeled, adverse = engine.risk._slippage_samples[0]
+        assert modeled == pytest.approx(SLIPPAGE_MODEL_MARKET_BPS)
+        assert adverse == pytest.approx(1.0)
+
+    def test_seed_read_failure_is_not_fatal(self, tmp_path):
+        tl = MagicMock()
+        tl.read_recent_execution_quality_slippage.side_effect = RuntimeError("boom")
+        engine = self._engine(tmp_path, trade_logger=tl)
+        engine._seed_slippage_monitor()  # must not raise
+        assert len(engine.risk._slippage_samples) == 0
+
+    def test_seed_rejection_is_not_fatal(self, tmp_path):
+        """A corrupt row that trips RiskManager's validation leaves the
+        pool empty rather than killing startup."""
+        tl = MagicMock()
+        tl.read_recent_execution_quality_slippage.return_value = [1.0]
+        engine = self._engine(tmp_path, trade_logger=tl)
+        engine.risk.seed_slippage_samples = MagicMock(
+            side_effect=ValueError("negative")
+        )
+        engine._seed_slippage_monitor()  # must not raise
+        assert len(engine.risk._slippage_samples) == 0
+
+    def test_empty_history_leaves_pool_empty(self, tmp_path):
+        tl = MagicMock()
+        tl.read_recent_execution_quality_slippage.return_value = []
+        engine = self._engine(tmp_path, trade_logger=tl)
+        engine._seed_slippage_monitor()
+        assert len(engine.risk._slippage_samples) == 0
+
+    def test_seed_requests_full_deque_window(self, tmp_path):
+        tl = MagicMock()
+        tl.read_recent_execution_quality_slippage.return_value = []
+        engine = self._engine(tmp_path, trade_logger=tl)
+        engine._seed_slippage_monitor()
+        tl.read_recent_execution_quality_slippage.assert_called_once_with(
+            engine.risk._slippage_samples.maxlen
+        )

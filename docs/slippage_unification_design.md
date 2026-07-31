@@ -614,6 +614,22 @@ Persist:
 - optional `implementation_shortfall`
   - benchmark: strategy exit decision price if we want that family
 
+**Implemented 2026-07-31.** This contract was specified here but not
+built: Phase 1 was writers-only and Phase 2 was consumers-only, so the
+quote fetch fell between the two phases and exits were measured against
+the prior bar close for four months. `_close_single_leg_position` now
+captures `broker.get_latest_quote_midpoint(...)` immediately before
+submitting the close, mirroring codepath §1. Tagging:
+
+- quote available → `arrival_midpoint` / `primary`
+- quote unavailable → `fallback_latest_close` / `fallback` (unchanged
+  fallback behaviour; excluded from drift controls by family)
+- OCC symbols → skipped entirely (OPRA, not the stock quote endpoint);
+  still `unavailable` / `unavailable`
+
+The Phase 1 Defect 1 invariant is preserved: nothing is tagged
+`arrival_midpoint` unless an arrival midpoint was actually observed.
+
 ### 4. Stop-triggered exit
 
 Persist two separate metrics:
@@ -694,13 +710,34 @@ It should not be phase 1 of this fix.
 
 Use:
 
-- `slippage_adverse_bps`
+- `slippage_adverse_bps`, **filtered to the execution-quality benchmark
+  family** via `reporting.logger.is_execution_quality_measurement`.
 
 Do not use:
 
 - signed slippage directly,
 - implementation shortfall,
 - stop-gap erosion.
+
+**Implementation note (2026-07-31).** This section originally stated the
+"do not use" rule without saying how to enforce it, and the rule was
+unenforceable as written: Phase 1 collapsed all three metric families
+into the single `slippage_adverse_bps` column, distinguished only by
+`slippage_benchmark_kind`, and no consumer filtered on that tag. Every
+consumer instead filtered on `slippage_measurement_quality IN
+('primary','fallback')` — but `fallback` quality pairs 1:1 with the
+`fallback_latest_close` benchmark, which *is* implementation shortfall.
+The kill switch was therefore consuming exactly the family this section
+forbids; a market exit after a 9% overnight gap booked 918 bps of
+"execution slippage" that was pure market movement, and the pooled mean
+sat at 200.8 bps against a 15 bps halt threshold.
+
+The families are now declared in `reporting/logger.py` next to the
+`SlippageBenchmarkKind` Literal, with an exhaustiveness test that fails
+if a new kind is added without being classified, and a parity test
+pinning the SQL predicate to the in-Python one. Consumers must call the
+shared `is_execution_quality_measurement` / `execution_quality_sql`
+rather than re-deriving the rule.
 
 ### Health reports and calibration
 

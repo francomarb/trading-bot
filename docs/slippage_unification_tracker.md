@@ -114,7 +114,7 @@ test.
 |---|---|---|---|---|---|
 | 1 | Single-leg market entry | `engine/trader.py:1591` `_log_entry` | `arrival_midpoint` / `fallback_latest_close` | `primary` / `fallback` | ✅ |
 | 2 | Single-leg limit entry | `reporting/logger.py:425` `build_record` | `limit_price` | `unavailable` | ✅ |
-| 3 | Discretionary market exit | `reporting/logger.py:504` `build_close_record` via `_close_single_leg_position` | equity `fallback_latest_close` / option `unavailable` (Defect 1 fix) | `fallback` / `unavailable` | ✅ |
+| 3 | Discretionary market exit | `reporting/logger.py:504` `build_close_record` via `_close_single_leg_position` | equity `arrival_midpoint` when the pre-submit quote resolves, else `fallback_latest_close`; option `unavailable` | `primary` / `fallback` / `unavailable` | ✅ (arrival fetch added 2026-07-31) |
 | 4 | WebSocket stop fill | `engine/trader.py:3530` | `active_stop_price` | `primary` | ✅ |
 | 5 | Broker-history recovered stop fill | `engine/trader.py:2974` | `active_stop_price` | `recovered` | ✅ |
 | 6 | Standalone repair-stop fill | (falls through 4/5) | `active_stop_price` | `primary`/`recovered` | ✅ (via 4/5) |
@@ -167,7 +167,14 @@ Checklist:
 - [ ] If any spread fills: confirm long-leg row has NULL slippage, not `0.0`
 - [ ] Dashboard still renders without errors (consumers still read legacy columns)
 - [ ] Health report still runs (`scripts/strategy_health_review.py`)
-- [ ] Risk kill switch does not trip on bogus values
+- [x] Risk kill switch does not trip on bogus values — **this check was
+      never run, and it was the one that would have caught the
+      benchmark-family defect.** Closed 2026-07-31: the kill switch now
+      filters to the execution-quality family and its pooled mean over
+      the paper history drops from 200.8 bps (13× the 15 bps halt
+      threshold, driven entirely by `fallback_latest_close` rows) to
+      1.6 bps. Pinned by `TestSlippageFamilies` +
+      `TestExecutionQualitySlippageSeedRead` in `tests/test_reporting.py`.
 
 Spot-check queries (run against `data/trades.db`):
 
