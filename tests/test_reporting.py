@@ -4017,7 +4017,7 @@ class TestStopFillRiskContextByPositionUid:
         assert tl._read_latest_open_entry_context(
             symbol="AAPL", strategy="donchian_breakout"
         ) is None
-        ctx = tl.read_entry_risk_context(self.UID)
+        ctx = tl.read_entry_context_by_uid(self.UID)
         assert ctx is not None
         assert ctx["initial_risk_per_share"] == pytest.approx(16.1921886113901)
         assert ctx["initial_stop_loss"] == pytest.approx(320.73781138861)
@@ -4119,20 +4119,62 @@ class TestStopFillRiskContextByPositionUid:
 
     def test_no_uid_leaves_fields_null_rather_than_zero(self, tmp_path):
         tl = TradeLogger(path=str(tmp_path / "trades.db"))
-        assert tl.read_entry_risk_context(None) is None
-        assert tl.read_entry_risk_context("") is None
+        assert tl.read_entry_context_by_uid(None) is None
+        assert tl.read_entry_context_by_uid("") is None
 
-    def test_entry_without_risk_basis_stays_null(self, tmp_path):
-        """Entries predating risk-field recording legitimately have no
-        basis — the fallback must not invent one."""
+    def test_entry_without_risk_basis_still_yields_entry_timestamp(self, tmp_path):
+        """Risk basis and entry timestamp are recovered independently.
+
+        Entries predating risk-field recording legitimately have no
+        basis, and the fallback must not invent one — but there is no
+        reason for that to cost them their entry timestamp too. An
+        earlier version gated the whole lookup on the risk basis and
+        lost both.
+        """
         tl = TradeLogger(path=str(tmp_path / "trades.db"))
         self._log_entry_row(tl, rps=None, stop=None)
-        assert tl.read_entry_risk_context(self.UID) is None
+        ctx = tl.read_entry_context_by_uid(self.UID)
+        assert ctx is not None
+        assert ctx["initial_risk_per_share"] is None
+        assert ctx["initial_stop_loss"] is None
+        assert ctx["entry_timestamp"] == "2026-07-28T17:07:35+00:00"
+
+    def test_no_risk_basis_leaves_r_null_but_dates_the_entry(self, tmp_path):
+        """End-to-end of the decoupling: a WYFI-shaped position (entry
+        with no risk basis) books a correct entry_timestamp and a NULL
+        r_multiple, rather than losing both."""
+        tl = TradeLogger(path=str(tmp_path / "trades.db"))
+        self._log_entry_row(tl, rps=None, stop=None)
+        self._seed_lifecycle_row(tl)
+        self._log_substrate_sell_row(tl, entry_timestamp=None)
+        tl.log_stop_fill(
+            symbol="AAPL", strategy="donchian_breakout", qty=13.0,
+            avg_fill_price=305.02, stop_price=320.73781138861,
+            order_id="substrate-sell-AAPL", position_uid=self.UID,
+        )
+        row = [r for r in tl.read_all() if r["side"] == "sell"][-1]
+        assert row["entry_timestamp"] == "2026-07-28T17:07:35+00:00"
+        assert row["r_multiple"] is None
+        assert row["initial_risk_dollars"] is None
+        # P&L still resolves via the lifecycle basis.
+        assert row["realized_pnl"] == pytest.approx(
+            (305.02 - 339.543846) * 13.0
+        )
+
+    def test_own_closing_row_is_not_mistaken_for_the_entry(self, tmp_path):
+        """If the entry was never logged to `trades`, the lookup must
+        not read the closing row it is about to write and recover its
+        exit time as the entry time."""
+        tl = TradeLogger(path=str(tmp_path / "trades.db"))
+        self._log_substrate_sell_row(tl, entry_timestamp=self.EXIT_TS)
+        assert tl.read_entry_context_by_uid(
+            self.UID, exclude_order_id="substrate-sell-AAPL"
+        ) is None
 
     def test_unknown_uid_returns_none(self, tmp_path):
         tl = TradeLogger(path=str(tmp_path / "trades.db"))
         self._log_entry_row(tl)
-        assert tl.read_entry_risk_context("pos_doesnotexist") is None
+        assert tl.read_entry_context_by_uid("pos_doesnotexist") is None
 
     def test_does_not_cross_positions(self, tmp_path):
         """A prior closed position in the same symbol must not supply
@@ -4140,7 +4182,7 @@ class TestStopFillRiskContextByPositionUid:
         tl = TradeLogger(path=str(tmp_path / "trades.db"))
         self._log_entry_row(tl, rps=99.0, stop=100.0, uid="pos_old")
         self._log_entry_row(tl, rps=16.19, stop=320.74, uid="pos_new")
-        ctx = tl.read_entry_risk_context("pos_new")
+        ctx = tl.read_entry_context_by_uid("pos_new")
         assert ctx["initial_risk_per_share"] == pytest.approx(16.19)
 
     def test_context_path_still_wins_when_available(self, tmp_path):
