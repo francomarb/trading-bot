@@ -670,6 +670,42 @@ ALTER TABLE trades ADD COLUMN execution_id TEXT;
 
 SQLite's `ON CONFLICT` target must match the unique index's predicate exactly when the index is partial. Foundation writers therefore include the same `WHERE order_id IS NOT NULL AND position_type = 'single_leg'` predicate on the conflict clause. The implementation PR must add a database-level test that exercises the migration + UPSERT pair together to verify both predicates stay aligned:
 
+> **⚠️ Silent duplicate-row hazard — the predicate binds the INCOMING row too.**
+>
+> A partial index only covers rows satisfying its predicate. If the row
+> being inserted has `position_type` NULL, it falls outside the index,
+> **no conflict is detected, and the INSERT succeeds as a second row for
+> an `order_id` that already exists.** No error, no constraint violation,
+> no log line — just a duplicate.
+>
+> This bites specifically when the substrate has already written the row:
+> `apply_order_event` always sets `position_type='single_leg'`, so a later
+> `TradeLogger.log()` for the same `order_id` that omits `position_type`
+> does not update it — it duplicates it. Both rows then flow into the
+> replay, P&L attribution, and slippage aggregates.
+>
+> Found 2026-07-31 while building `TestSubstrateStopFillSeamEndToEnd`
+> (`tests/test_engine.py`), where a fixture `TradeRecord` without
+> `position_type` produced two `broker-entry` rows. The
+> `_TRADES_MIGRATION_SQL` backfill (`position_type = COALESCE(position_type,
+> 'single_leg')`) heals *historical* NULLs at migration time; it does not
+> protect a live writer that omits the field.
+>
+> **Audited 2026-07-31 — production is currently clean, and the hazard is
+> latent rather than live:**
+>
+> - Every production builder sets the field internally — `build_record`,
+>   `build_close_record`, `log_stop_fill`, `log_spread_fill`.
+> - `SELECT COUNT(*) FROM trades WHERE position_type IS NULL` → **0**.
+> - No duplicate `order_id` among `position_type='single_leg'` rows. The
+>   21 duplicated `order_id`s in the table are all `spread` rows, which
+>   is by design (short and long OCC legs share the combo `order_id`).
+>
+> The exposure is a *future* writer that constructs a `TradeRecord`
+> directly and calls `TradeLogger.log()` without the field — which is
+> exactly what the test fixture did. Because the failure is silent, this
+> wants a guard rather than a convention. See PLAN `11.51`.
+
 ```sql
 -- Single-leg writers (log_entry, log_close, log_stop_fill, etc.)
 INSERT INTO trades (

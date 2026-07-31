@@ -3734,3 +3734,87 @@ class TestEntryDispatchSlippageCompleteness:
         expected_signed = (75.10 - 75.0) / 75.0 * 10_000
         assert row[2] == pytest.approx(expected_signed, abs=0.1)
         assert row[3] == pytest.approx(expected_signed, abs=0.1)
+
+
+class TestEntryTimestampOnlyOnEntryRows:
+    """`entry_timestamp` is the time the POSITION was entered, not the
+    time this row's order filled. Only an `entry_primary` fill is both.
+
+    Stamping `:now` on a closing row is wrong data, and it is worse than
+    merely cosmetic: `entry_timestamp` is PRESERVE-FIRST-NON-NULL in
+    `TradeLogger`'s upsert, so the wrong value written here wins
+    permanently over the correct one that `log_stop_fill` /
+    `build_close_record` supply moments later. In production that left
+    ANET (2026-07-17) and AAPL (2026-07-31) with their entry timestamps
+    stamped at exit time, corrupting hold-time analysis and breaking the
+    entry/exit join that pairs the two rows.
+    """
+
+    def _fill(self, conn, order_id, qty=10.0, price=100.5):
+        return apply_order_event(
+            conn,
+            OrderEvent(
+                order_id=order_id,
+                status="filled",
+                filled_qty=qty,
+                avg_fill_price=price,
+                broker_updated_at="2026-07-31T13:32:27+00:00",
+            ),
+        )
+
+    def _entry_ts(self, conn, order_id):
+        return conn.execute(
+            "SELECT entry_timestamp FROM trades WHERE order_id = ?",
+            (order_id,),
+        ).fetchone()[0]
+
+    def test_entry_primary_fill_sets_entry_timestamp(self, conn, pos_store, orders_store):
+        uid = _seed_position(pos_store)
+        _insert_entry(orders_store, uid)
+        oid = _attach_and_get_order_id(orders_store, "cli-entry")
+        assert self._fill(conn, oid).applied is True
+        assert self._entry_ts(conn, oid) is not None
+
+    def test_protective_stop_fill_leaves_entry_timestamp_null(
+        self, conn, pos_store, orders_store,
+    ):
+        """The production case: a stop fill must not stamp its own fill
+        time into the entry column."""
+        uid = _seed_position(pos_store)
+        _insert_entry(orders_store, uid)
+        entry_oid = _attach_and_get_order_id(orders_store, "cli-entry")
+        self._fill(conn, entry_oid)
+        _insert_entry(
+            orders_store, uid, client_order_id="cli-stop",
+            side="sell", role="protective_stop",
+        )
+        stop_oid = _attach_and_get_order_id(orders_store, "cli-stop")
+        self._fill(conn, stop_oid)
+        assert self._entry_ts(conn, stop_oid) is None
+
+    def test_exit_fill_leaves_entry_timestamp_null(
+        self, conn, pos_store, orders_store,
+    ):
+        uid = _seed_position(pos_store)
+        _insert_entry(orders_store, uid)
+        entry_oid = _attach_and_get_order_id(orders_store, "cli-entry")
+        self._fill(conn, entry_oid)
+        _insert_exit(orders_store, uid)
+        exit_oid = _attach_and_get_order_id(orders_store, "cli-exit")
+        self._fill(conn, exit_oid)
+        assert self._entry_ts(conn, exit_oid) is None
+
+    def test_replacement_stop_fill_leaves_entry_timestamp_null(
+        self, conn, pos_store, orders_store,
+    ):
+        uid = _seed_position(pos_store)
+        _insert_entry(orders_store, uid)
+        entry_oid = _attach_and_get_order_id(orders_store, "cli-entry")
+        self._fill(conn, entry_oid)
+        _insert_entry(
+            orders_store, uid, client_order_id="cli-repl",
+            side="sell", role="replacement_stop",
+        )
+        repl_oid = _attach_and_get_order_id(orders_store, "cli-repl")
+        self._fill(conn, repl_oid)
+        assert self._entry_ts(conn, repl_oid) is None

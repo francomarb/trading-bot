@@ -6547,3 +6547,204 @@ class TestSlippageMonitorSeeding:
         tl.read_recent_execution_quality_slippage.assert_called_once_with(
             engine.risk._slippage_samples.maxlen
         )
+
+
+class TestSubstrateStopFillSeamEndToEnd:
+    """The seam that broke twice: `apply_order_event` INSERTing the sell
+    row, then the engine dispatching to `log_stop_fill`.
+
+    Both previous fixes were verified only on each half in isolation.
+    The first missed that the risk basis was lost because the open-state
+    replay nets to zero once the sell row exists. The second missed that
+    `entry_timestamp` stayed wrong because the substrate stamped `:now`
+    into it and TradeLogger's upsert is PRESERVE-FIRST-NON-NULL — the
+    unit test used `TradeLogger.log()` for the pre-existing row, which
+    left the column NULL and quietly modelled a state production never
+    reaches.
+
+    This drives the real writers in the real order against one database.
+    """
+
+    ENTRY_TS = "2026-07-28T17:07:35.812362+00:00"
+    RPS = 16.1921886113901
+    STOP = 320.73781138861
+    ENTRY_FILL = 339.543846
+    STOP_FILL = 305.02
+    QTY = 13.0
+
+    def _setup(self, tmp_path):
+        from engine.lifecycle import PositionLifecycleStore, new_position_uid
+        from engine.lifecycle_orders import (
+            OrderEvent,
+            PositionLifecycleOrdersStore,
+            apply_order_event,
+        )
+        from reporting.logger import TradeRecord
+
+        tl = TradeLogger(path=str(tmp_path / "trades.db"))
+        conn = tl._ensure_db()
+        pos_store = PositionLifecycleStore(conn)
+        orders_store = PositionLifecycleOrdersStore(conn)
+
+        uid = new_position_uid()
+        pos_store.create_pending(
+            position_uid=uid, symbol="AAPL", owner_key="AAPL",
+            strategy="donchian_breakout", position_type="single_leg",
+            entry_qty=self.QTY,
+        )
+
+        # Full entry through the substrate: the order row must exist or
+        # the position-status rollup nets to a negative qty on the later
+        # sell and flips the position to 'error'.
+        orders_store.insert_pending(
+            position_uid=uid, role="entry_primary",
+            client_order_id="cli-entry", order_type="stop_limit",
+            order_class="oto", time_in_force="day", side="buy",
+            intended_qty=self.QTY, intended_stop_price=self.STOP,
+        )
+        orders_store.attach_broker_order_id(
+            client_order_id="cli-entry", order_id="broker-entry",
+        )
+        apply_order_event(
+            conn,
+            OrderEvent(
+                order_id="broker-entry", status="filled",
+                filled_qty=self.QTY, avg_fill_price=self.ENTRY_FILL,
+                broker_updated_at=self.ENTRY_TS,
+            ),
+        )
+        # `_log_entry` then upserts the risk basis onto that same row.
+        tl.log(
+            TradeRecord(
+                timestamp=self.ENTRY_TS, symbol="AAPL", side="buy",
+                qty=self.QTY, avg_fill_price=self.ENTRY_FILL,
+                order_id="broker-entry", strategy="donchian_breakout",
+                reason="donchian_breakout entry @ 2026-07-27T04:00:00+00:00",
+                stop_price=self.STOP, entry_reference_price=336.93,
+                modeled_slippage_bps=None, realized_slippage_bps=None,
+                order_type="stop_limit", status="filled",
+                requested_qty=self.QTY, filled_qty=self.QTY,
+                initial_stop_loss=self.STOP, initial_risk_per_share=self.RPS,
+                entry_timestamp=self.ENTRY_TS, position_uid=uid,
+                # Required: the trades upsert conflict target is a
+                # PARTIAL unique index predicated on
+                # `position_type = 'single_leg'`. Omitting it makes the
+                # incoming row fail the predicate, so no conflict is
+                # detected and `_log_entry` inserts a DUPLICATE row for
+                # an order the substrate already wrote.
+                position_type="single_leg",
+            )
+        )
+
+        orders_store.insert_pending(
+            position_uid=uid, role="protective_stop",
+            client_order_id="cli-stop", order_type="stop",
+            order_class="simple", time_in_force="gtc", side="sell",
+            intended_qty=self.QTY, intended_stop_price=self.STOP,
+        )
+        orders_store.attach_broker_order_id(
+            client_order_id="cli-stop", order_id="broker-stop",
+        )
+        return tl, conn, pos_store, orders_store, uid, OrderEvent, apply_order_event
+
+    def _engine(self, tl, pos_store, orders_store):
+        strategy = FakeStrategy(entries=[False], exits=[False])
+        broker = MagicMock()
+        broker.sync_with_broker.return_value = _snapshot()
+        broker.get_open_orders.return_value = []
+        broker._with_retry.side_effect = lambda fn, **_: fn()
+        broker._api.get_clock.return_value = SimpleNamespace(is_open=True)
+        risk = RiskManager(
+            max_position_pct=0.02, max_open_positions=5,
+            max_gross_exposure_pct=0.50, atr_stop_multiplier=2.0,
+            max_daily_loss_pct=0.05, hard_dollar_loss_cap=1_000_000.0,
+            loss_streak_threshold=10, broker_error_threshold=10,
+        )
+        engine = TradingEngine(
+            strategy=strategy, symbols=["AAPL"], risk=risk, broker=broker,
+            trade_logger=tl,
+            config=EngineConfig(
+                history_lookback_days=120, cycle_interval_seconds=0.01,
+                max_bar_age_multiplier=10.0, market_hours_only=False,
+            ),
+        )
+        engine.lifecycle_store = pos_store
+        engine.lifecycle_orders_store = orders_store
+        return engine
+
+    def test_stop_fill_records_full_accounting_through_the_real_seam(
+        self, tmp_path,
+    ):
+        tl, conn, pos_store, orders_store, uid, OrderEvent, apply_order_event = (
+            self._setup(tmp_path)
+        )
+        engine = self._engine(tl, pos_store, orders_store)
+        engine._positions["AAPL"] = SimpleNamespace(
+            symbol="AAPL", strategy_name="donchian_breakout", qty=self.QTY,
+        )
+        engine._entry_prices["AAPL"] = self.ENTRY_FILL
+
+        event = OrderEvent(
+            order_id="broker-stop", status="filled", filled_qty=self.QTY,
+            avg_fill_price=self.STOP_FILL,
+            broker_updated_at="2026-07-31T13:32:27+00:00",
+        )
+        # 1. Substrate persists the sell row FIRST — the real ordering.
+        assert apply_order_event(conn, event).applied is True
+        # 2. Engine then dispatches the accounting.
+        engine._maybe_dispatch_substrate_stop_fill(
+            event=event, snapshot=_snapshot(positions={}, open_orders=[]),
+        )
+
+        all_rows = tl.read_all()
+        rows = [r for r in all_rows
+                if r["side"] == "sell" and r["order_id"] == "broker-stop"]
+        assert len(rows) == 1, "the seam must produce exactly one sell row"
+        row = rows[0]
+        entry_row = [r for r in all_rows if r["order_id"] == "broker-entry"][0]
+
+        # Entry timestamp is the ENTRY's, not this fill's. Compared
+        # against the entry row rather than a constant, because the
+        # dashboard joins the two on exact equality — that is the
+        # property worth pinning.
+        assert row["entry_timestamp"] == entry_row["entry_timestamp"]
+        assert row["entry_timestamp"] != row["timestamp"]
+        # Risk basis recovered by position_uid despite the write ordering.
+        assert row["initial_risk_per_share"] == pytest.approx(self.RPS)
+        assert row["initial_stop_loss"] == pytest.approx(self.STOP)
+        expected_risk = self.RPS * self.QTY
+        assert row["initial_risk_dollars"] == pytest.approx(expected_risk)
+        # P&L and R against the broker entry basis.
+        expected_pnl = (self.STOP_FILL - self.ENTRY_FILL) * self.QTY
+        assert row["realized_pnl"] == pytest.approx(expected_pnl)
+        assert row["r_multiple"] == pytest.approx(
+            expected_pnl / expected_risk, rel=1e-6
+        )
+        assert row["r_multiple"] == pytest.approx(-2.13, abs=0.01)
+        # Stop-gap erosion is tagged as such, and stays out of the
+        # execution-quality family (PR #84).
+        assert row["slippage_benchmark_kind"] == "active_stop_price"
+
+    def test_entry_and_exit_rows_join_on_entry_timestamp(self, tmp_path):
+        """The downstream property that actually matters: the dashboard
+        pairs entries to exits on exact equality of `entry_timestamp`."""
+        tl, conn, pos_store, orders_store, uid, OrderEvent, apply_order_event = (
+            self._setup(tmp_path)
+        )
+        engine = self._engine(tl, pos_store, orders_store)
+        engine._positions["AAPL"] = SimpleNamespace(
+            symbol="AAPL", strategy_name="donchian_breakout", qty=self.QTY,
+        )
+        event = OrderEvent(
+            order_id="broker-stop", status="filled", filled_qty=self.QTY,
+            avg_fill_price=self.STOP_FILL,
+            broker_updated_at="2026-07-31T13:32:27+00:00",
+        )
+        apply_order_event(conn, event)
+        engine._maybe_dispatch_substrate_stop_fill(
+            event=event, snapshot=_snapshot(positions={}, open_orders=[]),
+        )
+        rows = tl.read_all()
+        entry = [r for r in rows if r["side"] == "buy"][0]
+        exit_row = [r for r in rows if r["side"] == "sell"][0]
+        assert entry["entry_timestamp"] == exit_row["entry_timestamp"]
