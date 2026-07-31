@@ -41,6 +41,16 @@ from reporting.logger import (
     mleg_realized_slippage_bps,
     single_leg_realized_slippage_bps,
 )
+from reporting.logger import (
+    CALIBRATION_GRADE_QUALITIES,
+    EXECUTION_QUALITY_KINDS,
+    IMPLEMENTATION_SHORTFALL_KINDS,
+    STOP_GAP_KINDS,
+    UNMEASURED_KINDS,
+    SlippageBenchmarkKind,
+    execution_quality_sql,
+    is_execution_quality_measurement,
+)
 from reporting.pnl import DailySummary, PnLTracker, StrategyStats
 from risk.manager import RiskDecision, Side
 from strategies.base import OrderType
@@ -3735,3 +3745,183 @@ class TestEngineReportingWiring:
         )
         engine._log_entry(sample_decision, rejected_result, 150.0)
         assert tl.read_all() == []
+
+
+# ── Slippage metric families ────────────────────────────────────────────────
+
+
+class TestSlippageFamilies:
+    """The classification that keeps three incommensurable measurements
+    from being averaged together.
+
+    `slippage_adverse_bps` is one column holding execution quality,
+    implementation shortfall and stop-gap erosion, told apart only by
+    `slippage_benchmark_kind`. The design doc forbids feeding the latter
+    two to the drift kill switch; before this classification existed
+    that rule lived only in prose and nothing enforced it.
+    """
+
+    def test_every_benchmark_kind_is_classified(self):
+        """The guard that stops this from rotting.
+
+        Adding a benchmark kind to the Literal without placing it in a
+        family fails here, rather than silently defaulting it into (or
+        out of) the drift alarm months later.
+        """
+        declared = set(SlippageBenchmarkKind.__args__)
+        classified = (
+            EXECUTION_QUALITY_KINDS
+            | IMPLEMENTATION_SHORTFALL_KINDS
+            | STOP_GAP_KINDS
+            | UNMEASURED_KINDS
+        )
+        assert classified == declared, (
+            "every SlippageBenchmarkKind must belong to exactly one family; "
+            f"unclassified={declared - classified} "
+            f"unknown={classified - declared}"
+        )
+
+    def test_families_are_disjoint(self):
+        families = [
+            EXECUTION_QUALITY_KINDS,
+            IMPLEMENTATION_SHORTFALL_KINDS,
+            STOP_GAP_KINDS,
+            UNMEASURED_KINDS,
+        ]
+        for i, left in enumerate(families):
+            for right in families[i + 1:]:
+                assert not (left & right), f"overlapping families: {left & right}"
+
+    def test_fallback_latest_close_is_not_execution_quality(self):
+        """The specific bug: a fill measured against a prior bar close
+        reports overnight market movement, not execution cost. On
+        2026-07-29 a market exit after a 9% gap booked 918 bps this way.
+        """
+        assert "fallback_latest_close" in IMPLEMENTATION_SHORTFALL_KINDS
+        assert not is_execution_quality_measurement(
+            "fallback_latest_close", "fallback"
+        )
+
+    def test_arrival_midpoint_is_execution_quality(self):
+        assert is_execution_quality_measurement("arrival_midpoint", "primary")
+
+    def test_stop_gap_is_not_execution_quality(self):
+        assert not is_execution_quality_measurement("active_stop_price", "primary")
+
+    @pytest.mark.parametrize("quality", ["recovered", "unavailable", "typo", None])
+    def test_reconstructed_qualities_rejected_even_for_good_kind(self, quality):
+        """Both dimensions must hold. A reconstructed benchmark is not a
+        live observation even when its kind is right."""
+        assert not is_execution_quality_measurement("arrival_midpoint", quality)
+
+    @pytest.mark.parametrize("kind", [None, "", "not_a_kind"])
+    def test_unknown_kinds_fail_closed(self, kind):
+        assert not is_execution_quality_measurement(kind, "primary")
+
+    def test_sql_predicate_matches_python_predicate(self, tmp_path):
+        """The SQL consumers and the in-process kill switch must agree.
+
+        Divergence here is invisible in production: the alarm would
+        judge live fills against a differently-shaped history.
+        """
+        db = tmp_path / "t.db"
+        conn = sqlite3.connect(db)
+        conn.execute(
+            "CREATE TABLE trades (kind TEXT, quality TEXT)"
+        )
+        combos = [
+            (k, q)
+            for k in list(SlippageBenchmarkKind.__args__) + ["not_a_kind"]
+            for q in ["primary", "fallback", "recovered", "unavailable", "typo"]
+        ]
+        conn.executemany("INSERT INTO trades VALUES (?, ?)", combos)
+        conn.commit()
+
+        fragment, params = execution_quality_sql()
+        fragment = fragment.replace(
+            "slippage_benchmark_kind", "kind"
+        ).replace("slippage_measurement_quality", "quality")
+        sql_rows = set(
+            conn.execute(
+                f"SELECT kind, quality FROM trades WHERE {fragment}", params
+            ).fetchall()
+        )
+        conn.close()
+
+        python_rows = {
+            (k, q) for k, q in combos if is_execution_quality_measurement(k, q)
+        }
+        assert sql_rows == python_rows
+
+    def test_calibration_grade_qualities_exclude_reconstructed(self):
+        assert "recovered" not in CALIBRATION_GRADE_QUALITIES
+        assert "unavailable" not in CALIBRATION_GRADE_QUALITIES
+
+
+class TestExecutionQualitySlippageSeedRead:
+    """`read_recent_execution_quality_slippage` feeds the kill switch's
+    startup rehydration. Its selection must match `_record_fill`'s."""
+
+    def _seed(self, tl, *, kind, quality, adverse, order_type="market", oid):
+        tl.log(
+            TradeRecord(
+                timestamp="2026-07-01T10:00:00+00:00",
+                symbol="AAPL",
+                side="sell",
+                qty=1,
+                avg_fill_price=100.0,
+                order_id=oid,
+                strategy="sma_crossover",
+                reason="exit signal",
+                stop_price=0.0,
+                entry_reference_price=100.0,
+                modeled_slippage_bps=None,
+                realized_slippage_bps=None,
+                order_type=order_type,
+                status="filled",
+                requested_qty=1,
+                filled_qty=1,
+                slippage_signed_bps=adverse,
+                slippage_adverse_bps=adverse,
+                slippage_benchmark_kind=kind,
+                slippage_measurement_quality=quality,
+            )
+        )
+
+    def test_excludes_implementation_shortfall_rows(self, tmp_path):
+        tl = TradeLogger(path=str(tmp_path / "trades.db"))
+        self._seed(tl, kind="arrival_midpoint", quality="primary",
+                   adverse=2.0, oid="a")
+        self._seed(tl, kind="fallback_latest_close", quality="fallback",
+                   adverse=918.3, oid="b")
+        assert tl.read_recent_execution_quality_slippage(50) == [2.0]
+
+    def test_excludes_non_market_orders(self, tmp_path):
+        tl = TradeLogger(path=str(tmp_path / "trades.db"))
+        self._seed(tl, kind="arrival_midpoint", quality="primary",
+                   adverse=3.0, order_type="limit", oid="a")
+        assert tl.read_recent_execution_quality_slippage(50) == []
+
+    def test_excludes_recovered_quality(self, tmp_path):
+        tl = TradeLogger(path=str(tmp_path / "trades.db"))
+        self._seed(tl, kind="arrival_midpoint", quality="recovered",
+                   adverse=4.0, oid="a")
+        assert tl.read_recent_execution_quality_slippage(50) == []
+
+    def test_returns_chronological_order(self, tmp_path):
+        tl = TradeLogger(path=str(tmp_path / "trades.db"))
+        for i, value in enumerate([1.0, 2.0, 3.0]):
+            self._seed(tl, kind="arrival_midpoint", quality="primary",
+                       adverse=value, oid=f"o{i}")
+        assert tl.read_recent_execution_quality_slippage(50) == [1.0, 2.0, 3.0]
+
+    def test_limit_keeps_most_recent(self, tmp_path):
+        tl = TradeLogger(path=str(tmp_path / "trades.db"))
+        for i, value in enumerate([1.0, 2.0, 3.0]):
+            self._seed(tl, kind="arrival_midpoint", quality="primary",
+                       adverse=value, oid=f"o{i}")
+        assert tl.read_recent_execution_quality_slippage(2) == [2.0, 3.0]
+
+    def test_missing_db_returns_empty(self, tmp_path):
+        tl = TradeLogger(path=str(tmp_path / "nope.db"))
+        assert tl.read_recent_execution_quality_slippage(50) == []
