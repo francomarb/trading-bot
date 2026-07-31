@@ -1644,17 +1644,30 @@ def render_dashboard() -> None:
                 # `compute_strategy_stats`.
                 "Avg Adverse Slippage Bps": st.column_config.NumberColumn(
                     format="%.1f bps",
-                    help=(
-                        "Mean adverse slippage over execution-quality "
-                        "benchmarks only (arrival midpoint, combo limit). "
-                        "Blank means no such measurement exists for this "
-                        "strategy — not zero slippage. Stop-gap erosion "
-                        "and prior-close benchmarks are excluded by "
-                        "design; see PLAN 11.49."
-                    ),
                 ),
             },
         )
+        # The `help=` tooltip on the column above does NOT render: Streamlit
+        # draws stDataFrame to a canvas, and the help text never reaches the
+        # DOM (verified on a fresh process — absent from innerHTML, from
+        # every element attribute, and after hovering the header). A blank
+        # cell on its own is ambiguous — it reads as easily as "the
+        # dashboard is broken" as it does "no measurement exists" — so the
+        # explanation has to go somewhere that always renders.
+        if display["Avg Adverse Slippage Bps"].isna().any():
+            blank = display.loc[
+                display["Avg Adverse Slippage Bps"].isna(), "Strategy"
+            ].tolist()
+            st.caption(
+                "Blank slippage — no execution-quality measurement exists "
+                f"for: {', '.join(blank)}. This is **not** zero slippage. "
+                "The column averages arrival-midpoint and combo-limit "
+                "benchmarks only; stop-gap erosion (`active_stop_price`) "
+                "and prior-close (`fallback_latest_close`) rows measure "
+                "something else and are excluded by design. Per-fill "
+                "values with their benchmark and quality tags are in "
+                "Recent Trades below. See PLAN 11.49."
+            )
 
     st.divider()
 
