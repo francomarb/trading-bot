@@ -3974,30 +3974,39 @@ class TestStopFillRiskContextByPositionUid:
             )
         )
 
+    EXIT_TS = "2026-07-31T13:32:27+00:00"
+
     def _log_substrate_sell_row(self, tl, *, qty=13.0, price=305.02,
-                                uid=None, symbol="AAPL"):
-        """Mimic apply_order_event persisting the sell row FIRST."""
-        tl.log(
-            TradeRecord(
-                timestamp="2026-07-31T13:32:27+00:00",
-                symbol=symbol,
-                side="sell",
-                qty=qty,
-                avg_fill_price=price,
-                order_id=f"substrate-sell-{symbol}",
-                strategy="donchian_breakout",
-                reason="stop_triggered",
-                stop_price=price,
-                entry_reference_price=0.0,
-                modeled_slippage_bps=None,
-                realized_slippage_bps=None,
-                order_type="stop",
-                status="filled",
-                requested_qty=qty,
-                filled_qty=qty,
-                position_uid=uid if uid is not None else self.UID,
-            )
+                                uid=None, symbol="AAPL",
+                                entry_timestamp="__exit__"):
+        """Mimic `apply_order_event` persisting the sell row FIRST.
+
+        Faithfulness matters here. An earlier version of this fixture
+        went through `TradeLogger.log()` without an `entry_timestamp`,
+        which left the column NULL — so the PRESERVE-FIRST-NON-NULL
+        upsert happily took the correct value later and the test passed
+        while production stayed broken. `_TRADES_UPSERT_SQL` is the real
+        writer, so this goes through it directly. Pass
+        `entry_timestamp=None` to model the fixed behaviour, or a
+        timestamp to model the pre-fix behaviour that stamped exit time
+        into the entry column.
+        """
+        if entry_timestamp == "__exit__":
+            entry_timestamp = self.EXIT_TS
+        conn = tl._ensure_db()
+        conn.execute(
+            "INSERT INTO trades (timestamp, symbol, side, qty, avg_fill_price, "
+            " order_id, strategy, reason, stop_price, entry_reference_price, "
+            " order_type, status, requested_qty, filled_qty, entry_timestamp, "
+            " position_type, position_uid) "
+            "VALUES (?, ?, 'sell', ?, ?, ?, 'donchian_breakout', "
+            "'stop_triggered', 0.0, 0.0, 'stop', 'filled', ?, ?, ?, "
+            "'single_leg', ?)",
+            (self.EXIT_TS, symbol, qty, price, f"substrate-sell-{symbol}",
+             qty, qty, entry_timestamp,
+             uid if uid is not None else self.UID),
         )
+        conn.commit()
 
     def test_risk_context_resolves_when_replay_sees_position_flat(self, tmp_path):
         tl = TradeLogger(path=str(tmp_path / "trades.db"))
@@ -4059,13 +4068,18 @@ class TestStopFillRiskContextByPositionUid:
         assert row["r_multiple"] == pytest.approx(-2.13, abs=0.01)
 
     def test_entry_timestamp_is_the_entry_not_the_exit(self, tmp_path):
-        """The third symptom: with no context, entry_timestamp fell
-        through to 'now', corrupting hold-time analysis and breaking the
-        entry/exit join."""
+        """Third symptom: entry_timestamp was being stamped at exit time,
+        corrupting hold-time analysis and breaking the entry/exit join.
+
+        Models the substrate writing NULL for a closing row's
+        entry_timestamp (see `_TRADES_UPSERT_SQL`), which is what lets
+        the accounting writer's correct value survive the
+        PRESERVE-FIRST-NON-NULL upsert.
+        """
         tl = TradeLogger(path=str(tmp_path / "trades.db"))
         self._log_entry_row(tl)
         self._seed_lifecycle_row(tl)
-        self._log_substrate_sell_row(tl)
+        self._log_substrate_sell_row(tl, entry_timestamp=None)
         tl.log_stop_fill(
             symbol="AAPL", strategy="donchian_breakout", qty=13.0,
             avg_fill_price=305.02, stop_price=320.73781138861,
@@ -4073,6 +4087,35 @@ class TestStopFillRiskContextByPositionUid:
         )
         row = [r for r in tl.read_all() if r["side"] == "sell"][-1]
         assert row["entry_timestamp"] == "2026-07-28T17:07:35+00:00"
+
+    def test_preexisting_wrong_entry_timestamp_is_preserved_not_corrected(
+        self, tmp_path,
+    ):
+        """Pins WHY the historical rows needed a database repair.
+
+        `entry_timestamp` is PRESERVE-FIRST-NON-NULL in the upsert, so a
+        wrong value already on the row wins permanently over the correct
+        one supplied moments later. Fixing the writer stops NEW rows
+        being poisoned; it cannot heal rows already written. This test
+        documents that boundary — if upsert policy ever changes so the
+        later value wins, this test fails and the repair rationale needs
+        revisiting.
+        """
+        tl = TradeLogger(path=str(tmp_path / "trades.db"))
+        self._log_entry_row(tl)
+        self._seed_lifecycle_row(tl)
+        # Pre-fix substrate behaviour: exit time stamped into the entry column.
+        self._log_substrate_sell_row(tl, entry_timestamp=self.EXIT_TS)
+        tl.log_stop_fill(
+            symbol="AAPL", strategy="donchian_breakout", qty=13.0,
+            avg_fill_price=305.02, stop_price=320.73781138861,
+            order_id="substrate-sell-AAPL", position_uid=self.UID,
+        )
+        row = [r for r in tl.read_all() if r["side"] == "sell"][-1]
+        assert row["entry_timestamp"] == self.EXIT_TS
+        # The risk fields still recover — they are inserted NULL by the
+        # substrate, so preserve-first takes the correct later value.
+        assert row["r_multiple"] == pytest.approx(-2.13, abs=0.01)
 
     def test_no_uid_leaves_fields_null_rather_than_zero(self, tmp_path):
         tl = TradeLogger(path=str(tmp_path / "trades.db"))

@@ -1478,7 +1478,17 @@ INSERT INTO trades (
     :order_type, :order_status, :intended_qty, :filled_qty,
     NULL, NULL, NULL,
     NULL, NULL,
-    :now, NULL,
+    -- entry_timestamp is the time the POSITION was entered, not the time
+    -- this row's order filled. Only an entry_primary fill is both. For a
+    -- closing row (exit / protective_stop / replacement_stop) `:now` is
+    -- the exit time, and stamping it here is simply wrong data — worse,
+    -- `entry_timestamp` is PRESERVE-FIRST-NON-NULL in TradeLogger's
+    -- upsert, so the wrong value wins permanently over the correct one
+    -- that log_stop_fill / build_close_record supply moments later.
+    -- Writing NULL lets the accounting writer fill in the real entry
+    -- time; an honest absence is also better than a wrong value for the
+    -- consumers that pair entries to exits on this column.
+    CASE WHEN :role = 'entry_primary' THEN :now ELSE NULL END, NULL,
     :position_id, 'single_leg', :position_uid,
     :slippage_benchmark_price, :slippage_benchmark_kind,
     :slippage_benchmark_timestamp, :slippage_measurement_quality,
@@ -1723,6 +1733,7 @@ def apply_order_event(
                         "now": now,
                         "symbol": symbol,
                         "side": side,
+                        "role": role,
                         "filled_qty": float(event.filled_qty),
                         "avg_fill_price": event.avg_fill_price,
                         "order_id": event.order_id,
