@@ -1804,11 +1804,14 @@ class AlpacaBroker:
                 # promoted in-place by changing time_in_force. Rebuild the
                 # durable protection as a standalone GTC stop after the DAY
                 # child is live and the entry fill is confirmed.
+                # PLAN 11.53: this rebuild already happens after the fill
+                # is confirmed, so re-anchor to the real entry while we
+                # are replacing the order anyway.
                 self.replace_day_stop_with_standalone_gtc(
                     symbol=decision.symbol,
                     stop_order_id=capped_stop_leg_id,
                     qty=result.filled_qty,
-                    stop_price=decision.stop_price,
+                    stop_price=decision.stop_for_fill(result.avg_fill_price),
                     client_order_id_prefix="equity-stop-gtc",
                     position_uid=position_uid,
                 )
@@ -2004,13 +2007,26 @@ class AlpacaBroker:
         if result.status is OrderStatus.FILLED:
             stop_qty = math.floor(decision.qty)
             if stop_qty >= 1:
+                # PLAN 11.53: anchor the stop to the price we actually
+                # filled at, not to the signal-bar close it was derived
+                # from. This path already submits the stop *after* the
+                # fill, so the correct anchor is simply available — no
+                # cancel/replace and no drift threshold needed.
+                anchored_stop = decision.stop_for_fill(result.avg_fill_price)
+                if abs(anchored_stop - decision.stop_price) > 0.005:
+                    logger.info(
+                        f"{decision.symbol}: stop re-anchored to fill — "
+                        f"${decision.stop_price:.2f} → ${anchored_stop:.2f} "
+                        f"(ref ${decision.entry_reference_price:.2f}, "
+                        f"fill ${result.avg_fill_price:.2f})"
+                    )
                 stop_client_id = f"frac-stop-{uuid.uuid4().hex[:10]}"
                 stop_request = StopOrderRequest(
                     symbol=decision.symbol,
                     qty=stop_qty,
                     side=AlpacaOrderSide.SELL,
                     time_in_force=TimeInForce.GTC,
-                    stop_price=round(decision.stop_price, 2),
+                    stop_price=round(anchored_stop, 2),
                     client_order_id=stop_client_id,
                 )
                 try:
@@ -2029,14 +2045,14 @@ class AlpacaBroker:
                         position_uid=position_uid,
                         client_order_id=stop_client_id,
                         broker_order_id=str(stop_order.id),
-                        stop_price=float(decision.stop_price),
+                        stop_price=float(anchored_stop),
                         qty=float(stop_qty),
                         parent_order_id=order_id,
                         order_class="simple",
                     )
                     logger.info(
                         f"[fractional] GTC stop: sell {stop_qty} "
-                        f"{decision.symbol} @ ${decision.stop_price:.2f}"
+                        f"{decision.symbol} @ ${anchored_stop:.2f}"
                     )
                 except APIError as e:
                     logger.error(

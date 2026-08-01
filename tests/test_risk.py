@@ -1271,3 +1271,67 @@ class TestSlippageSampleSeeding:
         maxlen = mgr._slippage_samples.maxlen
         mgr.seed_slippage_samples([(5.0, 1.0)] * (maxlen + 50))
         assert len(mgr._slippage_samples) == maxlen
+
+
+class TestStopForFill:
+    """PLAN 11.53 — the protective stop must measure its k*ATR offset from
+    the price we actually filled at, not from the signal-bar close that
+    offset was derived from.
+
+    Audit evidence: across 16 equity entries, live breathing room ranged
+    from 30.8% to 118% of what was designed, and 69% fell outside 11.48's
+    +/-10% risk band.
+    """
+
+    def _decision(self, *, ref=100.0, stop=96.0, side=Side.BUY, qty=10.0):
+        return RiskDecision(
+            symbol="AAPL", side=side, qty=qty,
+            entry_reference_price=ref, stop_price=stop,
+            strategy_name="sma_crossover", reason="test",
+        )
+
+    def test_fill_below_reference_moves_stop_down(self):
+        """The FRO case: filled 5% below the signal close. Anchoring to the
+        reference left 2.6% of room instead of 7.6%."""
+        d = self._decision(ref=42.86, stop=39.60)
+        assert d.stop_for_fill(40.66) == pytest.approx(37.40, abs=0.01)
+
+    def test_fill_above_reference_moves_stop_up(self):
+        """The dangerous direction — an unmoved stop would leave the
+        position carrying MORE dollar risk than sizing budgeted for."""
+        d = self._decision(ref=100.0, stop=96.0)
+        assert d.stop_for_fill(108.0) == pytest.approx(104.0)
+
+    def test_offset_is_preserved_exactly(self):
+        """The invariant that makes re-sizing unnecessary: qty was chosen as
+        budget / k*ATR, so holding the offset constant makes realized risk
+        equal the budget."""
+        d = self._decision(ref=100.0, stop=96.0)
+        for fill in (80.0, 96.5, 100.0, 100.01, 250.0):
+            assert fill - d.stop_for_fill(fill) == pytest.approx(4.0)
+
+    def test_fill_equal_to_reference_is_a_noop(self):
+        d = self._decision(ref=100.0, stop=96.0)
+        assert d.stop_for_fill(100.0) == pytest.approx(96.0)
+
+    @pytest.mark.parametrize("bad", [None, 0.0, -5.0, float("nan"), float("inf")])
+    def test_unusable_fill_falls_back_to_original_stop(self, bad):
+        """A stop that can't be placed is worse than one placed slightly off."""
+        d = self._decision(ref=100.0, stop=96.0)
+        assert d.stop_for_fill(bad) == 96.0
+
+    def test_fill_below_offset_would_be_non_positive_so_falls_back(self):
+        """Offset larger than the fill would put the stop at or below zero."""
+        d = self._decision(ref=100.0, stop=1.0)   # 99.0 offset
+        assert d.stop_for_fill(50.0) == 1.0
+
+    def test_short_side_anchors_above_the_fill(self):
+        d = self._decision(ref=100.0, stop=104.0, side=Side.SELL)
+        assert d.stop_for_fill(97.0) == pytest.approx(101.0)
+
+    def test_zero_offset_is_unconstructable(self):
+        """The `offset <= 0` branch in stop_for_fill is belt-and-braces:
+        RiskDecision already refuses a stop at or above the entry, so a
+        zero offset cannot reach it through the normal constructor."""
+        with pytest.raises(ValueError, match="strictly below entry"):
+            self._decision(ref=100.0, stop=100.0)

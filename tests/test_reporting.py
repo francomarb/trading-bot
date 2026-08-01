@@ -132,7 +132,14 @@ class TestTradeLogger:
         assert record.entry_reference_price == 150.0
         assert record.order_type == "market"
         assert record.status == "filled"
-        assert record.initial_stop_loss == 145.0
+        # PLAN 11.53: `stop_price` keeps the reference-derived level that
+        # sizing used (asserted above), while `initial_stop_loss` records
+        # the stop actually placed — re-anchored to the fill. Reference
+        # 150.0 / stop 145.0 is a 5.00 offset; the fill was 150.05, so the
+        # real stop sits at 145.05 and the position keeps its full 5.00.
+        assert record.initial_stop_loss == pytest.approx(145.05)
+        # The offset is what sizing divided by, so it must NOT move.
+        assert record.initial_risk_per_share == pytest.approx(5.0)
         assert record.initial_risk_per_share == 5.0
         assert record.initial_risk_dollars == 50.0
         assert record.entry_timestamp is not None

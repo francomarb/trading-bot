@@ -909,7 +909,27 @@ class TradeLogger:
                 )
                 new_signed_bps = signed
                 new_adverse_bps = max(0.0, signed)
-        initial_stop_loss = float(decision.stop_price)
+        # PLAN 11.53: record the stop that was actually placed. The broker
+        # re-anchors it to the fill on the paths that submit the stop after
+        # the entry confirms, so deriving it the same way here keeps the
+        # trade row describing the order that really exists.
+        #
+        # `initial_risk_per_share` is deliberately still the reference-to-stop
+        # offset (k×ATR) — that is unchanged by re-anchoring, and it is what
+        # sizing used. Once the stop sits k×ATR from the fill, this stops
+        # being the *intended* risk and becomes the *realized* one, which is
+        # what makes r_multiple honest.
+        #
+        # `decision` is duck-typed at this boundary — this module
+        # deliberately does not import `risk.manager`. Production always
+        # passes a real RiskDecision; the fallback covers callers that
+        # pass a bare object, for which the unmodified stop is correct.
+        _stop_for_fill = getattr(decision, "stop_for_fill", None)
+        initial_stop_loss = float(
+            _stop_for_fill(result.avg_fill_price)
+            if callable(_stop_for_fill)
+            else decision.stop_price
+        )
         initial_risk_per_share = max(
             0.0,
             float(decision.entry_reference_price) - float(decision.stop_price),
