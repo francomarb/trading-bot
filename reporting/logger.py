@@ -914,12 +914,6 @@ class TradeLogger:
         # the entry confirms, so deriving it the same way here keeps the
         # trade row describing the order that really exists.
         #
-        # `initial_risk_per_share` is deliberately still the reference-to-stop
-        # offset (k×ATR) — that is unchanged by re-anchoring, and it is what
-        # sizing used. Once the stop sits k×ATR from the fill, this stops
-        # being the *intended* risk and becomes the *realized* one, which is
-        # what makes r_multiple honest.
-        #
         # `decision` is duck-typed at this boundary — this module
         # deliberately does not import `risk.manager`. Production always
         # passes a real RiskDecision; the fallback covers callers that
@@ -930,10 +924,28 @@ class TradeLogger:
             if callable(_stop_for_fill)
             else decision.stop_price
         )
-        initial_risk_per_share = max(
-            0.0,
-            float(decision.entry_reference_price) - float(decision.stop_price),
-        )
+        # Risk per share is the distance from where we actually got in to
+        # where the stop actually sits. Derived from the two values above
+        # rather than from `reference − stop`, which describes neither on
+        # a STOP_LIMIT entry: sizing there divides by `limit − stop` (the
+        # worst permitted fill) while the real room is `fill − stop`. AAPL
+        # 2026-07-28 had all three differ — 29.20 sized, 18.81 actual,
+        # 16.19 recorded — so its r_multiple was computed against a number
+        # that described nothing.
+        #
+        # For MARKET entries this is unchanged: the stop is re-anchored to
+        # `fill − k×ATR`, so `fill − stop` is exactly the k×ATR offset the
+        # old expression produced.
+        _fill_for_risk = result.avg_fill_price
+        if _fill_for_risk is not None and float(_fill_for_risk) > 0:
+            initial_risk_per_share = abs(
+                float(_fill_for_risk) - initial_stop_loss
+            )
+        else:
+            initial_risk_per_share = max(
+                0.0,
+                float(decision.entry_reference_price) - float(decision.stop_price),
+            )
         multiplier = _contract_multiplier(decision.symbol)
         initial_risk_dollars = (
             initial_risk_per_share

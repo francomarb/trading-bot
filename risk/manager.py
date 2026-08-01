@@ -214,11 +214,24 @@ class RiskDecision:
         matches the backtest, which hands vectorbt a stop *fraction*
         applied to the actual fill rather than an absolute level.
 
+        **STOP_LIMIT decisions are returned unchanged**, for two
+        independent reasons. Their protective stop is a bracket child
+        submitted *with* the entry, so it is already live at the broker
+        before any fill exists to anchor to. And the offset used here
+        would be the wrong one: `_size_position` divides STOP_LIMIT risk
+        by `limit_price − stop_price` (the worst permitted fill), not by
+        `reference − stop`, so re-anchoring on the smaller reference
+        offset would *shrink* an already-conservative position's risk
+        rather than correct it — AAPL 2026-07-28 would go from 64% of
+        its budgeted risk down to 55%.
+
         Falls back to the unmodified `stop_price` when there is no
         usable fill, or when the re-anchored stop would be non-positive
         or land on the wrong side of the entry — a stop that cannot be
         placed is worse than one placed slightly off.
         """
+        if self.order_type is OrderType.STOP_LIMIT:
+            return self.stop_price
         if fill_price is None:
             return self.stop_price
         try:

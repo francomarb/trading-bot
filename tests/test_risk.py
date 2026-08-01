@@ -1329,6 +1329,39 @@ class TestStopForFill:
         d = self._decision(ref=100.0, stop=104.0, side=Side.SELL)
         assert d.stop_for_fill(97.0) == pytest.approx(101.0)
 
+    def test_stop_limit_decision_is_returned_unchanged(self):
+        """STOP_LIMIT (Donchian) stops are bracket children submitted WITH
+        the entry, so there is no post-fill moment to re-anchor at — and
+        the offset here would be the wrong one anyway.
+
+        `_size_position` divides STOP_LIMIT risk by `limit - stop` (the
+        worst permitted fill), not `reference - stop`. Re-anchoring on the
+        smaller reference offset would shrink an already-conservative
+        position's risk instead of correcting it.
+        """
+        d = RiskDecision(
+            symbol="AAPL", side=Side.BUY, qty=13.0,
+            entry_reference_price=336.93, stop_price=320.74,
+            strategy_name="donchian_breakout", reason="test",
+            order_type=OrderType.STOP_LIMIT, limit_price=349.94,
+            entry_trigger_price=333.75,
+        )
+        assert d.stop_for_fill(339.54) == 320.74
+
+    def test_stop_limit_reanchor_would_have_reduced_risk_not_fixed_it(self):
+        """Pins the reasoning above with the production numbers, so the
+        guard is not mistaken for a mere ordering convenience."""
+        ref, stop, limit, fill = 336.93, 320.74, 349.94, 339.54
+        sized_on = limit - stop            # 29.20 - what qty was derived from
+        actual_room = fill - stop          # 18.81 - real distance to the stop
+        naive_reanchor = fill - (ref - stop)   # 323.35 -> 16.19 of room
+        assert actual_room / sized_on == pytest.approx(0.644, abs=0.005)
+        assert (fill - naive_reanchor) / sized_on == pytest.approx(0.554, abs=0.005)
+        assert (fill - naive_reanchor) < actual_room, (
+            "naive re-anchoring makes a conservative STOP_LIMIT position "
+            "MORE under-risked, not less"
+        )
+
     def test_zero_offset_is_unconstructable(self):
         """The `offset <= 0` branch in stop_for_fill is belt-and-braces:
         RiskDecision already refuses a stop at or above the entry, so a

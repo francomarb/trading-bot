@@ -4203,3 +4203,71 @@ class TestStopFillRiskContextByPositionUid:
         )
         assert ctx is not None
         assert ctx["initial_risk_per_share"] == pytest.approx(16.1921886113901)
+
+
+class TestRecordedRiskBasisMatchesTheRealStop:
+    """`initial_risk_per_share` must describe the distance from the fill to
+    the stop that actually exists — on BOTH order types.
+
+    It previously recorded `reference − stop`, which on a STOP_LIMIT entry
+    describes neither: sizing divides by `limit − stop` (worst permitted
+    fill) while the real room is `fill − stop`. AAPL 2026-07-28 had all
+    three differ — 29.20 sized, 18.81 actual, 16.19 recorded — so its
+    r_multiple was computed against a number that described nothing.
+    """
+
+    def _result(self, fill, qty=13.0):
+        return OrderResult(
+            status=OrderStatus.FILLED, order_id="oid", symbol="AAPL",
+            requested_qty=qty, filled_qty=qty, avg_fill_price=fill,
+            raw_status="filled",
+        )
+
+    def test_market_entry_risk_is_the_atr_offset(self, tmp_csv):
+        """Unchanged behaviour: the stop is re-anchored to the fill, so the
+        distance is exactly the k×ATR offset sizing used."""
+        from risk.manager import RiskDecision, Side
+        tl = TradeLogger(path=tmp_csv)
+        d = RiskDecision(
+            symbol="AAPL", side=Side.BUY, qty=13.0,
+            entry_reference_price=336.93, stop_price=320.74,
+            strategy_name="sma_crossover", reason="entry",
+        )
+        rec = tl.build_record(d, self._result(339.54), modeled_price=336.93)
+        assert rec.initial_stop_loss == pytest.approx(339.54 - 16.19, abs=0.01)
+        assert rec.initial_risk_per_share == pytest.approx(16.19, abs=0.01)
+
+    def test_stop_limit_risk_is_fill_to_the_bracket_stop(self, tmp_csv):
+        """The correction: the bracket stop stays where it was submitted, so
+        the recorded risk must be `fill − stop`, not `reference − stop`."""
+        from risk.manager import OrderType, RiskDecision, Side
+        tl = TradeLogger(path=tmp_csv)
+        d = RiskDecision(
+            symbol="AAPL", side=Side.BUY, qty=13.0,
+            entry_reference_price=336.93, stop_price=320.74,
+            strategy_name="donchian_breakout", reason="entry",
+            order_type=OrderType.STOP_LIMIT, limit_price=349.94,
+            entry_trigger_price=333.75,
+        )
+        rec = tl.build_record(d, self._result(339.54), modeled_price=336.93)
+        # Stop is the bracket child — unchanged by the fill.
+        assert rec.initial_stop_loss == pytest.approx(320.74)
+        # Real room, not the 16.19 the old expression produced.
+        assert rec.initial_risk_per_share == pytest.approx(18.81, abs=0.01)
+        assert rec.initial_risk_dollars == pytest.approx(18.81 * 13, abs=0.2)
+
+    def test_no_fill_price_falls_back_to_the_reference_offset(self, tmp_csv):
+        from risk.manager import RiskDecision, Side
+        tl = TradeLogger(path=tmp_csv)
+        d = RiskDecision(
+            symbol="AAPL", side=Side.BUY, qty=13.0,
+            entry_reference_price=336.93, stop_price=320.74,
+            strategy_name="sma_crossover", reason="entry",
+        )
+        res = OrderResult(
+            status=OrderStatus.PARTIAL, order_id="oid", symbol="AAPL",
+            requested_qty=13.0, filled_qty=13.0, avg_fill_price=None,
+            raw_status="partially_filled",
+        )
+        rec = tl.build_record(d, res, modeled_price=336.93)
+        assert rec.initial_risk_per_share == pytest.approx(16.19, abs=0.01)
