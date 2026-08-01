@@ -132,16 +132,17 @@ class TestTradeLogger:
         assert record.entry_reference_price == 150.0
         assert record.order_type == "market"
         assert record.status == "filled"
-        # PLAN 11.53: `stop_price` keeps the reference-derived level that
-        # sizing used (asserted above), while `initial_stop_loss` records
-        # the stop actually placed — re-anchored to the fill. Reference
-        # 150.0 / stop 145.0 is a 5.00 offset; the fill was 150.05, so the
-        # real stop sits at 145.05 and the position keeps its full 5.00.
-        assert record.initial_stop_loss == pytest.approx(145.05)
-        # The offset is what sizing divided by, so it must NOT move.
-        assert record.initial_risk_per_share == pytest.approx(5.0)
-        assert record.initial_risk_per_share == 5.0
-        assert record.initial_risk_dollars == 50.0
+        # PLAN 11.53: `initial_stop_loss` records the stop the BROKER
+        # placed, reported on the OrderResult. This fixture builds a bare
+        # OrderResult with no `placed_stop_price`, which is the honest
+        # signal for "this path did not report a stop" — so it falls back
+        # to the decision's level rather than inferring a re-anchor that
+        # may not have happened. Whether the stop was re-anchored depends
+        # on the execution path, not the decision.
+        assert record.initial_stop_loss == pytest.approx(145.0)
+        # Risk per share is fill-to-stop: 150.05 − 145.00.
+        assert record.initial_risk_per_share == pytest.approx(5.05)
+        assert record.initial_risk_dollars == pytest.approx(50.5)
         assert record.entry_timestamp is not None
         assert record.exit_timestamp is None
 
@@ -242,8 +243,11 @@ class TestTradeLogger:
             modeled_price=160.0,
         )
         assert record.realized_pnl == pytest.approx(99.5)
-        assert record.initial_risk_dollars == pytest.approx(50.0)
-        assert record.r_multiple == pytest.approx(1.99)
+        # PLAN 11.53: risk basis is fill-to-stop (150.05 − 145.00 = 5.05),
+        # inherited from the entry row, so R measures the loss against the
+        # risk actually on the table rather than the planned one.
+        assert record.initial_risk_dollars == pytest.approx(50.5)
+        assert record.r_multiple == pytest.approx(99.5 / 50.5, abs=0.001)
 
     def test_read_latest_open_entry_context_public_wrapper(self, tmp_csv, sample_decision, sample_result):
         tl = TradeLogger(path=tmp_csv)
@@ -257,7 +261,8 @@ class TestTradeLogger:
         assert context is not None
         assert context["entry_reference_price"] == pytest.approx(150.0)
         assert context["entry_fill_price"] == pytest.approx(150.05)
-        assert context["initial_risk_per_share"] == pytest.approx(5.0)
+        # PLAN 11.53: fill-to-stop (150.05 − 145.00), not reference-to-stop.
+        assert context["initial_risk_per_share"] == pytest.approx(5.05)
 
     def test_open_entry_context_tracks_weighted_fill_basis_after_partial_sell(
         self, tmp_csv
@@ -657,8 +662,12 @@ class TestTradeLogger:
             message="filled 2 @ 3.55",
         )
         record = tl.build_record(decision, result, modeled_price=3.50)
-        assert record.initial_risk_per_share == pytest.approx(1.0)
-        assert record.initial_risk_dollars == pytest.approx(200.0)
+        # PLAN 11.53: risk per share is fill-to-stop, not reference-to-stop.
+        # Filled at 3.55 against a 2.50 stop = 1.05 of premium at risk; the
+        # old reference-based 1.00 understated it. The multiplier assertion
+        # below is what this test is actually about and is unaffected.
+        assert record.initial_risk_per_share == pytest.approx(1.05)
+        assert record.initial_risk_dollars == pytest.approx(1.05 * 2 * 100)
 
     def test_option_close_uses_contract_multiplier_for_realized_pnl(self, tmp_csv):
         tl = TradeLogger(path=tmp_csv)
@@ -699,9 +708,11 @@ class TestTradeLogger:
             strategy_name="spy_options_reversion",
             modeled_price=4.50,
         )
-        assert record.initial_risk_dollars == pytest.approx(200.0)
+        # PLAN 11.53: 1.05 of premium at risk (fill 3.55 → stop 2.50)
+        # × 2 contracts × 100. The multiplier is what this test pins.
+        assert record.initial_risk_dollars == pytest.approx(210.0)
         assert record.realized_pnl == pytest.approx(190.0)
-        assert record.r_multiple == pytest.approx(0.95)
+        assert record.r_multiple == pytest.approx(190.0 / 210.0, abs=0.001)
 
     def test_option_stop_fill_uses_contract_multiplier(self, tmp_csv):
         tl = TradeLogger(path=tmp_csv)
@@ -737,9 +748,13 @@ class TestTradeLogger:
         )
 
         stop_record = tl.read_recent(1)[0]
-        assert stop_record["initial_risk_dollars"] == pytest.approx(200.0)
+        # PLAN 11.53: 1.05 of premium at risk (fill 3.55 → stop 2.50)
+        # × 2 × 100. The stop filled below its trigger, so the loss is
+        # slightly more than 1R — which is exactly what a stop-gap looks
+        # like, and was previously hidden by the understated basis.
+        assert stop_record["initial_risk_dollars"] == pytest.approx(210.0)
         assert stop_record["realized_pnl"] == pytest.approx(-210.0)
-        assert stop_record["r_multiple"] == pytest.approx(-1.05)
+        assert stop_record["r_multiple"] == pytest.approx(-1.0)
 
     def test_stop_fill_records_slippage_against_intended_stop(self, tmp_csv):
         tl = TradeLogger(path=tmp_csv)
@@ -4216,40 +4231,72 @@ class TestRecordedRiskBasisMatchesTheRealStop:
     r_multiple was computed against a number that described nothing.
     """
 
-    def _result(self, fill, qty=13.0):
+    def _result(self, fill, qty=13.0, placed_stop=None):
         return OrderResult(
             status=OrderStatus.FILLED, order_id="oid", symbol="AAPL",
             requested_qty=qty, filled_qty=qty, avg_fill_price=fill,
-            raw_status="filled",
+            raw_status="filled", placed_stop_price=placed_stop,
         )
 
-    def test_market_entry_risk_is_the_atr_offset(self, tmp_csv):
-        """Unchanged behaviour: the stop is re-anchored to the fill, so the
-        distance is exactly the k×ATR offset sizing used."""
+    def _decision(self, **kw):
         from risk.manager import RiskDecision, Side
-        tl = TradeLogger(path=tmp_csv)
-        d = RiskDecision(
+        base = dict(
             symbol="AAPL", side=Side.BUY, qty=13.0,
             entry_reference_price=336.93, stop_price=320.74,
             strategy_name="sma_crossover", reason="entry",
         )
-        rec = tl.build_record(d, self._result(339.54), modeled_price=336.93)
-        assert rec.initial_stop_loss == pytest.approx(339.54 - 16.19, abs=0.01)
+        base.update(kw)
+        return RiskDecision(**base)
+
+    def test_fractional_path_reports_its_reanchored_stop(self, tmp_csv):
+        """The fractional path submits the stop after the fill and reports
+        the re-anchored level, so the row records exactly that."""
+        tl = TradeLogger(path=tmp_csv)
+        anchored = 339.54 - 16.19
+        rec = tl.build_record(
+            self._decision(),
+            self._result(339.54, placed_stop=anchored),
+            modeled_price=336.93,
+        )
+        assert rec.initial_stop_loss == pytest.approx(anchored, abs=0.01)
         assert rec.initial_risk_per_share == pytest.approx(16.19, abs=0.01)
 
-    def test_stop_limit_risk_is_fill_to_the_bracket_stop(self, tmp_csv):
-        """The correction: the bracket stop stays where it was submitted, so
-        the recorded risk must be `fill − stop`, not `reference − stop`."""
-        from risk.manager import OrderType, RiskDecision, Side
+    def test_whole_share_oto_records_the_bracket_child_not_a_reanchor(self, tmp_csv):
+        """Review finding: routing is by `math.floor(qty) != qty`, so a
+        whole-share MARKET entry takes the OTO path and its stop is
+        attached BEFORE the fill. Inferring a re-anchor here recorded a
+        stop that did not exist at the broker."""
         tl = TradeLogger(path=tmp_csv)
-        d = RiskDecision(
-            symbol="AAPL", side=Side.BUY, qty=13.0,
-            entry_reference_price=336.93, stop_price=320.74,
-            strategy_name="donchian_breakout", reason="entry",
+        rec = tl.build_record(
+            self._decision(qty=13.0),
+            self._result(339.54, placed_stop=320.74),   # OTO child level
+            modeled_price=336.93,
+        )
+        assert rec.initial_stop_loss == pytest.approx(320.74)
+        assert rec.initial_risk_per_share == pytest.approx(18.81, abs=0.01)
+
+    def test_unreported_stop_falls_back_to_the_decision(self, tmp_csv):
+        """No `placed_stop_price` means the path did not report one — fall
+        back rather than guessing that a re-anchor happened."""
+        tl = TradeLogger(path=tmp_csv)
+        rec = tl.build_record(
+            self._decision(), self._result(339.54), modeled_price=336.93,
+        )
+        assert rec.initial_stop_loss == pytest.approx(320.74)
+
+    def test_stop_limit_risk_is_fill_to_the_bracket_stop(self, tmp_csv):
+        """The bracket stop stays where it was submitted, so the recorded
+        risk must be `fill − stop`, not `reference − stop`."""
+        from risk.manager import OrderType
+        tl = TradeLogger(path=tmp_csv)
+        d = self._decision(
+            strategy_name="donchian_breakout",
             order_type=OrderType.STOP_LIMIT, limit_price=349.94,
             entry_trigger_price=333.75,
         )
-        rec = tl.build_record(d, self._result(339.54), modeled_price=336.93)
+        rec = tl.build_record(
+            d, self._result(339.54, placed_stop=320.74), modeled_price=336.93,
+        )
         # Stop is the bracket child — unchanged by the fill.
         assert rec.initial_stop_loss == pytest.approx(320.74)
         # Real room, not the 16.19 the old expression produced.

@@ -914,15 +914,18 @@ class TradeLogger:
         # the entry confirms, so deriving it the same way here keeps the
         # trade row describing the order that really exists.
         #
-        # `decision` is duck-typed at this boundary — this module
-        # deliberately does not import `risk.manager`. Production always
-        # passes a real RiskDecision; the fallback covers callers that
-        # pass a bare object, for which the unmodified stop is correct.
-        _stop_for_fill = getattr(decision, "stop_for_fill", None)
+        # Record the stop the broker actually placed. Do NOT re-derive it
+        # from the decision: whether the stop was re-anchored to the fill
+        # depends on the execution path, not on the decision. OTO brackets
+        # attach the child BEFORE the fill at the reference-derived level;
+        # only the fractional and capped-rebuild paths submit it after and
+        # re-anchor. Routing is by `math.floor(qty) != qty`, so a MARKET
+        # entry that happens to size to whole shares takes the OTO path —
+        # inferring here logged 145.05 against a broker child at 145.00,
+        # on 9 of the production entries to date.
+        placed = getattr(result, "placed_stop_price", None)
         initial_stop_loss = float(
-            _stop_for_fill(result.avg_fill_price)
-            if callable(_stop_for_fill)
-            else decision.stop_price
+            placed if placed is not None and placed > 0 else decision.stop_price
         )
         # Risk per share is the distance from where we actually got in to
         # where the stop actually sits. Derived from the two values above
