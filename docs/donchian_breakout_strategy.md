@@ -333,12 +333,47 @@ Eight independent layers are active when Donchian runs in production:
 |---|---|---|
 | Regime gate | `allowed_regimes={TRENDING}` — blocks entries in BEAR, VOLATILE, RANGING | No new entries |
 | HWM drawdown gate | Pause entries if cumulative realized P&L > 15% below sleeve peak | No new entries per strategy |
-| ATR stop | 2× ATR below entry for every position | Per-trade loss cap |
+| ATR stop | 2× ATR below the **signal-bar close** — see caveat below | Per-trade loss cap |
 | Per-position risk target | `risk_per_trade_pct=0.40%` of equity at risk per trade (11.48), beneath the `MAX_POSITION_PCT=2%` global ceiling | Per-trade sizing |
 | Sleeve max positions | 8 concurrent Donchian positions maximum (`hard_max_positions`) | Concentration cap |
 | Gross exposure cap | `MAX_GROSS_EXPOSURE_PCT=0.80` | Portfolio-level |
 | Daily session loss cap | `MAX_DAILY_LOSS_PCT=5%` — engine halts against Alpaca prior-close when available | Portfolio-level |
 | Hard dollar loss cap | `HARD_DOLLAR_LOSS_CAP=$2,000` from Alpaca prior-close when available | Emergency halt |
+
+### Caveat: the ATR stop is not 2× ATR from the entry (PLAN 11.54)
+
+The row above says "2× ATR below entry" because that is the design intent.
+It is not what the broker order does.
+
+The protective stop is an OTO bracket child attached when the entry is
+*submitted*, priced at `signal_close − 2×ATR`. But a STOP_LIMIT entry is a
+resting order that fills anywhere between its trigger and the chase cap — and
+the trigger sits *below* the signal close on every observed entry (ANET 175.39
+vs 181.18, AAPL 333.75 vs 336.93, WYFI 32.25 vs 37.29). So the actual distance
+from entry to stop is unknown at submit time and varies per trade:
+
+| Entry | Room vs the intended 2× ATR | Deployed risk vs budget |
+|---|---|---|
+| ANET 2026-07-09 | 108.2% | 94.1% |
+| AAPL 2026-07-28 | 116.1% | 64.4% |
+| WYFI 2026-06-18 | **58.1%** | 99.8% |
+
+**Capital safety is not affected.** `_size_position` divides STOP_LIMIT risk by
+`limit_price − stop` — the worst permitted fill (PR #62 R1 P1-3) — so the dollar
+loss is bounded at or below budget regardless of where the fill lands. No
+observed entry exceeded its budget.
+
+**Strategy performance is affected, in both directions.** A fill below the
+signal close leaves the stop much closer than 2× ATR, so ordinary noise can end
+the trade before it works — WYFI kept 58% of its intended room and was stopped
+out. A fill well below the chase cap leaves the position smaller than the risk
+target calls for — AAPL deployed 64% of budget.
+
+Do **not** apply the `11.53` re-anchor here: it works from `reference − stop`,
+which on AAPL would have cut deployed risk from 64.4% to 55%. `stop_for_fill`
+returns STOP_LIMIT decisions unchanged for exactly this reason. Sample is three
+entries (STOP_LIMIT only landed 2026-07-09); gather evidence before choosing a
+fix. See PLAN `11.54`.
 
 ---
 
