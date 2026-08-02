@@ -173,9 +173,26 @@ class OrderResult:
     # The trade log must record the order that exists rather than
     # re-deriving one from the decision — inferring it logged a stop of
     # 145.05 for a whole-share MARKET entry whose broker child sat at
-    # 145.00. None means "no stop reported by this path"; consumers fall
-    # back to `decision.stop_price` rather than guessing.
+    # 145.00.
+    #
+    # `placed_stop_price` alone cannot carry the answer, because None has
+    # two very different meanings. `stop_placement_reported` separates
+    # them:
+    #
+    #   reported=False  — this path said nothing about a stop (legacy
+    #                     callers, recovery rows, tests). Consumers fall
+    #                     back to `decision.stop_price`.
+    #   reported=True   — this path is authoritative. A price means that
+    #                     stop exists; None means **no stop was placed**,
+    #                     which happens on a fractional entry under one
+    #                     whole share (Alpaca stops require whole shares)
+    #                     or when the stop submission was rejected.
+    #
+    # Collapsing the two let an unprotected fractional fill record a stop
+    # that had never been submitted — the same class of lie this field
+    # was added to remove.
     placed_stop_price: float | None = None
+    stop_placement_reported: bool = False
 
     @property
     def is_terminal(self) -> bool:
@@ -1848,6 +1865,7 @@ class AlpacaBroker:
         self._lifecycle_mark_filled(position_uid=position_uid, result=result)
         return replace(
             result, position_uid=position_uid, placed_stop_price=placed_stop,
+            stop_placement_reported=True,
         )
 
     def _place_fractional_order(
@@ -2101,6 +2119,7 @@ class AlpacaBroker:
         self._lifecycle_mark_filled(position_uid=position_uid, result=result)
         return replace(
             result, position_uid=position_uid, placed_stop_price=placed_stop,
+            stop_placement_reported=True,
         )
 
     def reconcile_submitted_order(

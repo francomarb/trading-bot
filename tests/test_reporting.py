@@ -4231,11 +4231,16 @@ class TestRecordedRiskBasisMatchesTheRealStop:
     r_multiple was computed against a number that described nothing.
     """
 
-    def _result(self, fill, qty=13.0, placed_stop=None):
+    def _result(self, fill, qty=13.0, placed_stop=None, reported=True):
+        """`reported=True` models a broker path that knows the answer —
+        including reporting `placed_stop=None` for "no stop was placed".
+        `reported=False` models a legacy/recovery caller that says nothing.
+        """
         return OrderResult(
             status=OrderStatus.FILLED, order_id="oid", symbol="AAPL",
             requested_qty=qty, filled_qty=qty, avg_fill_price=fill,
             raw_status="filled", placed_stop_price=placed_stop,
+            stop_placement_reported=reported,
         )
 
     def _decision(self, **kw):
@@ -4275,14 +4280,62 @@ class TestRecordedRiskBasisMatchesTheRealStop:
         assert rec.initial_stop_loss == pytest.approx(320.74)
         assert rec.initial_risk_per_share == pytest.approx(18.81, abs=0.01)
 
-    def test_unreported_stop_falls_back_to_the_decision(self, tmp_csv):
-        """No `placed_stop_price` means the path did not report one — fall
-        back rather than guessing that a re-anchor happened."""
+    def test_unreported_path_falls_back_to_the_decision(self, tmp_csv):
+        """A path that says nothing about the stop (legacy caller, recovery
+        row) falls back rather than guessing a re-anchor happened."""
         tl = TradeLogger(path=tmp_csv)
         rec = tl.build_record(
-            self._decision(), self._result(339.54), modeled_price=336.93,
+            self._decision(),
+            self._result(339.54, reported=False),
+            modeled_price=336.93,
         )
         assert rec.initial_stop_loss == pytest.approx(320.74)
+        assert rec.initial_risk_per_share == pytest.approx(18.81, abs=0.01)
+
+    def test_fractional_under_one_share_records_no_stop(self, tmp_csv):
+        """Review finding: Alpaca stops require whole shares, so a
+        fractional entry below one share gets NO stop at all. Falling back
+        to the decision's level would state that protection exists when it
+        does not — the same lie `placed_stop_price` was added to remove.
+        """
+        tl = TradeLogger(path=tmp_csv)
+        rec = tl.build_record(
+            self._decision(qty=0.5),
+            self._result(100.5, qty=0.5, placed_stop=None, reported=True),
+            modeled_price=100.0,
+        )
+        assert rec.initial_stop_loss is None
+        # No stop means no bounded risk — so no risk basis, and no R.
+        assert rec.initial_risk_per_share is None
+        assert rec.initial_risk_dollars is None
+
+    def test_rejected_stop_submission_records_no_stop(self, tmp_csv):
+        """Same contract when the broker rejects the stop: the position is
+        unprotected until `_repair_missing_protective_stops` catches it,
+        and the row must not claim otherwise."""
+        tl = TradeLogger(path=tmp_csv)
+        rec = tl.build_record(
+            self._decision(qty=8.5),
+            self._result(100.5, qty=8.5, placed_stop=None, reported=True),
+            modeled_price=100.0,
+        )
+        assert rec.initial_stop_loss is None
+        assert rec.initial_risk_per_share is None
+
+    def test_reported_none_and_unreported_none_differ(self, tmp_csv):
+        """The distinction the flag exists for: identical
+        `placed_stop_price=None`, opposite meanings."""
+        tl = TradeLogger(path=tmp_csv)
+        no_stop = tl.build_record(
+            self._decision(), self._result(339.54, reported=True),
+            modeled_price=336.93,
+        )
+        unknown = tl.build_record(
+            self._decision(), self._result(339.54, reported=False),
+            modeled_price=336.93,
+        )
+        assert no_stop.initial_stop_loss is None
+        assert unknown.initial_stop_loss == pytest.approx(320.74)
 
     def test_stop_limit_risk_is_fill_to_the_bracket_stop(self, tmp_csv):
         """The bracket stop stays where it was submitted, so the recorded
