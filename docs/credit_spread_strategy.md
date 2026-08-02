@@ -360,7 +360,18 @@ execution quality for completed spreads.
 
 `combo_limit` is classified as an **execution-quality** benchmark (fill versus
 the price we actually submitted), so PR #84's metric-family filter leaves this
-sleeve's measurement untouched — 17 of 17 rows still count. Note the bps are
+sleeve's measurement untouched — 17 of 17 rows still count.
+
+This sleeve is also **structurally exempt from PLAN `11.49`** (stop-gap
+erosion having no consumer). A spread is defined-risk — max loss is width minus
+credit, capped by the structure — so no protective stop is ever placed and no
+`active_stop_price` row is ever written. Verified in code: `dispatch_spread_order`,
+`_enter_multi_leg`, `mleg_close.py` and `SpreadExecutionWorker` contain zero
+stop-submission references, and none of the four `protective_stop` call sites in
+`execution/broker.py` is on a spread path. Credit spread is consequently the one
+sleeve whose slippage measurement is currently **complete** — worth knowing when
+comparing sleeves, since a blank or partial figure elsewhere is a missing metric
+rather than better execution. Note the bps are
 computed on option premium, so they are not comparable in magnitude to equity
 bps: an 8¢ miss on a $0.66 leg reads as 1212 bps. Per-strategy reporting keeps
 these separated; the cross-instrument pooling that still exists in

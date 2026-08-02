@@ -297,6 +297,15 @@ cumulative — the filter is the single most important risk control in this stra
 
 ## Execution measurement — current gap (PLAN 11.49)
 
+> **Scope note.** `11.49` is not an options-only item — it covers single-leg
+> equities too, and `donchian_breakout` is its largest contributor (max 490.1
+> bps vs this sleeve's 250.0). What *is* specific to this sleeve is the
+> severity: LIMIT entries plus stop exits mean stop-gap is the only execution
+> measurement it has, so losing it leaves this strategy entirely blind while
+> the equity sleeves merely lose one dimension. MLEG/credit spreads are
+> structurally exempt — verified in code: spreads are defined-risk and place
+> no stop orders, so they never generate a stop-gap row at all.
+
 **This sleeve produces slippage numbers, but none of them measure execution
 quality.** It has six measured fills to date and every one of them measures
 *stop-gap erosion* — how far past the stop trigger the fill landed — not how
