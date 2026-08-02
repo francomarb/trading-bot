@@ -11,7 +11,7 @@ the right data.
 from __future__ import annotations
 
 import json
-from datetime import date
+from datetime import date, datetime, timezone
 from pathlib import Path
 from unittest.mock import MagicMock, patch
 
@@ -20,6 +20,7 @@ import pytest
 from dashboard import (
     _find_latest_report,
     _format_generated_at,
+    _local_timezone,
     _load_health_state,
     _parse_report_metadata,
 )
@@ -208,20 +209,58 @@ class TestParseReportMetadata:
 
 
 class TestFormatGeneratedAt:
+    """`_format_generated_at` renders in the HOST's local zone, so these
+    assertions must be derived from the host rather than hardcoded.
+
+    They previously pinned "2026-06-02 07:30 CDT" — correct only on a
+    machine set to America/Chicago. They failed on every other host, and
+    stayed red for the whole of 2026-07 once this machine moved to +03,
+    which trained everyone to skim past four failing tests.
+
+    The property worth pinning is the *conversion*, not one zone's
+    rendering: all three inputs denote the same instant, so all three must
+    produce the same string, and that string must be that instant expressed
+    locally.
+    """
+
+    # 2026-06-02T12:30:00Z, written three ways.
+    UTC_INSTANT = datetime(2026, 6, 2, 12, 30, tzinfo=timezone.utc)
+
+    def _expected(self) -> str:
+        local = self.UTC_INSTANT.astimezone(_local_timezone())
+        return f"{local:%Y-%m-%d %H:%M} {local:%Z}"
+
     def test_renders_iso_as_compact_local_time(self):
         # The reviewer writes ISO with +00:00 — display in the host's local zone.
-        out = _format_generated_at("2026-06-02T12:30:00+00:00")
-        assert out == "2026-06-02 07:30 CDT"
+        assert _format_generated_at("2026-06-02T12:30:00+00:00") == self._expected()
 
     def test_converts_offset_to_local_time(self):
         # Non-UTC offsets should still normalize to the host's local zone.
-        out = _format_generated_at("2026-06-02T08:30:00-04:00")
-        assert out == "2026-06-02 07:30 CDT"
+        assert _format_generated_at("2026-06-02T08:30:00-04:00") == self._expected()
 
     def test_renders_naive_as_utc_then_converts_local(self):
         # Some legacy reports may omit the offset; assume UTC, then convert local.
-        out = _format_generated_at("2026-06-02T12:30:00")
-        assert out == "2026-06-02 07:30 CDT"
+        assert _format_generated_at("2026-06-02T12:30:00") == self._expected()
+
+    def test_all_three_spellings_agree(self):
+        """The real invariant: same instant in, same string out — this is
+        what the three tests above are collectively asserting, and it holds
+        on any host."""
+        outs = {
+            _format_generated_at("2026-06-02T12:30:00+00:00"),
+            _format_generated_at("2026-06-02T08:30:00-04:00"),
+            _format_generated_at("2026-06-02T12:30:00"),
+        }
+        assert len(outs) == 1
+
+    def test_conversion_is_not_a_passthrough_of_the_wall_clock(self):
+        """Guard against the assertions above passing vacuously if the
+        function ever stopped converting: on a non-UTC host the rendered
+        hour must differ from the input's UTC hour."""
+        out = _format_generated_at("2026-06-02T12:30:00+00:00")
+        offset = _local_timezone().utcoffset(self.UTC_INSTANT.replace(tzinfo=None))
+        if offset and offset.total_seconds() != 0:
+            assert "12:30" not in out
 
     def test_falls_back_on_unparseable(self):
         # Malformed timestamp — surface the raw value rather than raise.

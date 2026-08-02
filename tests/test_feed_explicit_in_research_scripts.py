@@ -59,7 +59,21 @@ _EXEMPT_FILES: dict[str, str] = {
 
 # Directories whose .py files are skipped entirely. Tests monkeypatch the
 # fetcher so explicit feed= is not meaningful there.
-_SKIP_DIRS: tuple[str, ...] = ("tests", "venv", ".venv", "__pycache__")
+#
+# `.claude` holds agent tooling state, including checked-out worktrees. Those
+# are *copies* of repo files at some other commit, so their paths never match
+# the `_EXEMPT_FILES` keys (which are repo-root-relative) and every exempt file
+# gets re-reported once per worktree. That is what kept this guard red through
+# 2026-07 — it was flagging `.claude/worktrees/<id>/scripts/verify_credit_spread.py`
+# while the real `scripts/verify_credit_spread.py` was correctly exempt. A guard
+# that cries wolf is a guard nobody reads, and this one protects the IEX/SIP
+# feed discipline that a July cache corruption already traced back to.
+#
+# Note the repo forbids worktrees outright (see CLAUDE.md) — skipping them here
+# is defence in depth, not permission.
+_SKIP_DIRS: tuple[str, ...] = (
+    "tests", "venv", ".venv", "__pycache__", ".claude", ".git",
+)
 
 # Function names whose calls require an explicit feed kwarg.
 _REQUIRES_FEED = frozenset({"fetch_symbol", "fetch_symbols"})
