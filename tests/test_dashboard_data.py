@@ -1212,3 +1212,69 @@ class TestResolveAccountMetrics:
         assert metrics["daily_pnl"] == pytest.approx(80.0)
         assert warning is not None
         assert "TimeoutError" in warning
+
+
+class TestStopGapDollarsColumn:
+    """PLAN 11.49 — stop-gap erosion surfaced in dollars, as its own
+    column, never merged into the slippage figure."""
+
+    _make_df = TestComputeStrategyStats._make_df
+
+    def _rows(self, **over):
+        base = dict(
+            symbol="AAPL", side="sell", strategy="donchian_breakout",
+            avg_fill_price="305.02", filled_qty="13", qty="13",
+            stop_trigger_price="320.74", timestamp=_ts(1),
+            entry_timestamp=_ts(0), position_type="single_leg",
+            slippage_benchmark_kind="active_stop_price",
+            slippage_measurement_quality="primary",
+            slippage_adverse_bps="490.1", realized_pnl="-448.81",
+        )
+        base.update(over)
+        entry = dict(
+            symbol=base["symbol"], side="buy", strategy=base["strategy"],
+            avg_fill_price="339.54", filled_qty=base["filled_qty"],
+            qty=base["qty"], timestamp=_ts(0), entry_timestamp=_ts(0),
+            position_type="single_leg",
+        )
+        return [entry, base]
+
+    def test_dollars_are_trigger_minus_fill_times_qty(self):
+        """AAPL 2026-07-31: stop at 320.74, filled 305.02 on 13 shares."""
+        stats = compute_strategy_stats(self._make_df(self._rows()))
+        row = stats[stats["strategy"] == "donchian_breakout"].iloc[0]
+        assert row["stop_gap_dollars"] == pytest.approx(204.36, abs=0.01)
+
+    def test_options_carry_the_contract_multiplier(self):
+        stats = compute_strategy_stats(self._make_df(self._rows(
+            symbol="SPY260717C00730000", strategy="spy_options_reversion",
+            stop_trigger_price="19.20", avg_fill_price="18.72",
+            filled_qty="2", qty="2",
+        )))
+        row = stats[stats["strategy"] == "spy_options_reversion"].iloc[0]
+        assert row["stop_gap_dollars"] == pytest.approx(96.0, abs=0.01)
+
+    def test_no_stop_fills_renders_blank_not_zero(self):
+        """credit_spread is defined-risk and places no stops. A 0 here
+        would read as 'stops cost nothing' rather than 'no stops exist'."""
+        stats = compute_strategy_stats(self._make_df(self._rows(
+            strategy="credit_spread",
+            slippage_benchmark_kind="combo_limit",
+        )))
+        row = stats[stats["strategy"] == "credit_spread"].iloc[0]
+        assert pd.isna(row["stop_gap_dollars"])
+
+    def test_fill_better_than_trigger_contributes_zero(self):
+        stats = compute_strategy_stats(self._make_df(self._rows(
+            stop_trigger_price="19.55", avg_fill_price="23.00",
+        )))
+        row = stats[stats["strategy"] == "donchian_breakout"].iloc[0]
+        assert row["stop_gap_dollars"] == pytest.approx(0.0)
+
+    def test_stop_gap_does_not_leak_into_the_slippage_column(self):
+        """The two families stay independent. The stop row is stop-gap,
+        so the execution-quality figure must stay blank."""
+        stats = compute_strategy_stats(self._make_df(self._rows()))
+        row = stats[stats["strategy"] == "donchian_breakout"].iloc[0]
+        assert row["stop_gap_dollars"] == pytest.approx(204.36, abs=0.01)
+        assert pd.isna(row["avg_adverse_slippage_bps"])

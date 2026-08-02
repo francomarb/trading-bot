@@ -35,6 +35,7 @@ from config import settings
 from reporting.logger import (
     CALIBRATION_GRADE_QUALITIES,
     EXECUTION_QUALITY_KINDS,
+    STOP_GAP_KINDS,
 )
 from engine.positions import build_credit_spread_snapshot, owner_key_for
 
@@ -673,6 +674,47 @@ def compute_rolling_sharpe(
     return sharpe
 
 
+# OCC option symbols carry a 100x contract multiplier. Same shape as
+# `reporting.logger._OCC_OPTION_SYMBOL`; kept local so the dashboard does
+# not import a private name.
+_OCC_SYMBOL_RE = re.compile(r"^[A-Z]{1,6}[0-9]{6}[CP][0-9]{8}$")
+
+
+def _stop_gap_dollars(frame: pd.DataFrame) -> float:
+    """Total dollars lost past the stop trigger for one strategy's rows.
+
+    PLAN 11.49. Stop-gap erosion is the loss taken *beyond* the planned
+    risk when a protective stop fills below the level it was set at —
+    AAPL 2026-07-31 held a stop at 320.74, the stock opened at 304.81,
+    and $204 of a $448.81 loss landed past the point the bot believed it
+    had exited.
+
+    Adverse-only, matching `slippage_adverse_bps`: a fill better than the
+    trigger contributes 0 rather than netting away a real gap elsewhere.
+    Options carry a 100× contract multiplier.
+
+    Returns NaN when the strategy has no stop fills at all, so the column
+    renders blank. A zero would read as "stops cost nothing" when the
+    truth is "this strategy has no stops" — credit_spread is defined-risk
+    and never places one.
+    """
+    kind = frame.get(
+        "slippage_benchmark_kind", pd.Series(index=frame.index, dtype=object)
+    )
+    rows = frame[kind.isin(STOP_GAP_KINDS)]
+    if rows.empty:
+        return float("nan")
+    trigger = pd.to_numeric(rows.get("stop_trigger_price"), errors="coerce")
+    fill = pd.to_numeric(rows.get("avg_fill_price"), errors="coerce")
+    qty = pd.to_numeric(rows.get("filled_qty"), errors="coerce")
+    mult = rows.get(
+        "symbol", pd.Series(index=rows.index, dtype=object)
+    ).map(lambda s: 100 if _OCC_SYMBOL_RE.match(str(s or "")) else 1)
+    excess = ((trigger - fill) * qty * mult).clip(lower=0.0)
+    total = float(excess.sum(skipna=True))
+    return total if excess.notna().any() else float("nan")
+
+
 def _execution_quality_mask(
     frame: pd.DataFrame, index: pd.Index
 ) -> "pd.Series[bool]":
@@ -913,6 +955,21 @@ def compute_strategy_stats(trades_df: pd.DataFrame) -> pd.DataFrame:
             else float("nan")
         )
 
+        # PLAN 11.49 — stop-gap erosion, in dollars. How far past its
+        # trigger a protective stop actually filled, i.e. loss taken
+        # beyond the planned risk. Deliberately a SEPARATE column from
+        # the slippage figure above: different metric family, and a large
+        # value here means the market gapped through the level, not that
+        # execution was poor. Merging the two is the defect PR #84
+        # removed; showing them adjacent without conflating them is the
+        # point.
+        #
+        # NaN (not 0.0) when the strategy has no stop fills, for the same
+        # reason as the slippage column: credit_spread is structurally
+        # exempt (defined-risk, places no stops), and a zero there would
+        # read as "stops cost nothing" rather than "there are no stops".
+        stop_gap_dollars = _stop_gap_dollars(group)
+
         results.append({
             "strategy": strategy,
             "trades": trade_count,
@@ -920,6 +977,7 @@ def compute_strategy_stats(trades_df: pd.DataFrame) -> pd.DataFrame:
             "win_rate": win_rate,
             "total_pnl": total_pnl,
             "avg_adverse_slippage_bps": avg_slip,
+            "stop_gap_dollars": stop_gap_dollars,
         })
 
     return pd.DataFrame(results)
@@ -1627,6 +1685,7 @@ def render_dashboard() -> None:
             "win_rate": "Win Rate",
             "total_pnl": "Total P&L",
             "avg_adverse_slippage_bps": "Avg Adverse Slippage Bps",
+            "stop_gap_dollars": "Stop-Gap $",
         })
         display["Win Rate"] = display["Win Rate"] * 100.0
         st.dataframe(
@@ -1645,6 +1704,7 @@ def render_dashboard() -> None:
                 "Avg Adverse Slippage Bps": st.column_config.NumberColumn(
                     format="%.1f bps",
                 ),
+                "Stop-Gap $": st.column_config.NumberColumn(format="$%.0f"),
             },
         )
         # The `help=` tooltip on the column above does NOT render: Streamlit
@@ -1666,8 +1726,18 @@ def render_dashboard() -> None:
                 "and prior-close (`fallback_latest_close`) rows measure "
                 "something else and are excluded by design. Per-fill "
                 "values with their benchmark and quality tags are in "
-                "Recent Trades below. See PLAN 11.49."
+                "Recent Trades below."
             )
+        st.caption(
+            "**Stop-Gap $** — how far past its trigger a protective stop "
+            "actually filled, in dollars: loss taken *beyond* the planned "
+            "risk. A large value means the market gapped through the "
+            "level, **not** that execution was poor, so it is reported "
+            "and never alarmed. Blank means the strategy places no stops "
+            "at all — credit spreads are defined-risk. Deliberately "
+            "separate from the slippage column: different question, "
+            "different family. See PLAN 11.49."
+        )
 
     st.divider()
 

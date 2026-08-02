@@ -43,7 +43,11 @@ from typing import Any
 
 import numpy as np
 
-from reporting.logger import execution_quality_sql
+from reporting.logger import (
+    STOP_GAP_KINDS,
+    _contract_multiplier,
+    execution_quality_sql,
+)
 from strategies.health.envelope import StrategyEnvelope
 from strategies.health.lifecycle import (
     LifecycleCounters,
@@ -285,6 +289,43 @@ def _l2_checks(
                 "slippage_realized_vs_modeled_bps_p95", Layer.L2,
             ))
 
+    # ── Stop-gap erosion (PLAN 11.49) ───────────────────────────
+    # Reported, never alarmed. A large stop-gap means the market gapped
+    # through the level, not that anything is broken — classifying it
+    # against thresholds would state a fact about the market as a system
+    # fault and generate alerts nobody can act on (design §1 operator
+    # fatigue). Status is always HEALTHY so this line cannot move a
+    # strategy's Health verdict; the content lives in `findings`.
+    #
+    # Deliberately separate from the execution-quality check above:
+    # different metric family, different scale (10–490 bps here vs a
+    # 20/50/100 threshold set there). Merging them is the defect PR #84
+    # removed.
+    gap = _stop_gap_stats(conn, strategy_name, period_start, period_end)
+    if gap is None:
+        out.append(_no_data("stop_gap_erosion", Layer.L2))
+    else:
+        bits: list[str] = []
+        if gap["median_dollars"] is not None:
+            bits.append(
+                f"${gap['total_dollars']:,.0f} total beyond trigger "
+                f"across {gap['n']} stop fill(s) "
+                f"(median ${gap['median_dollars']:,.0f}, "
+                f"max ${gap['max_dollars']:,.0f})"
+            )
+        if gap["median_bps"] is not None:
+            bits.append(
+                f"median {gap['median_bps']:.1f} bps, "
+                f"max {gap['max_bps']:.1f} bps"
+            )
+        out.append(CheckResult(
+            name="stop_gap_erosion",
+            layer=Layer.L2,
+            status=HealthStatus.HEALTHY,   # informational — never alarms
+            numeric_value=gap["max_dollars"],
+            findings=bits or ["stop fills recorded but no usable measurement"],
+        ))
+
     # ── Partial fill rate ───────────────────────────────────────
     partial_rate = _partial_fill_rate(
         conn, strategy_name, period_start, period_end,
@@ -311,6 +352,77 @@ def _l2_checks(
     out.append(_not_yet_wired("timeout_cancel_rate", Layer.L2))
 
     return out
+
+
+def _stop_gap_stats(
+    conn: sqlite3.Connection,
+    strategy_name: str,
+    period_start: date,
+    period_end: date,
+) -> dict | None:
+    """Stop-gap erosion over the window, or None if no stop fills.
+
+    Stop-gap is how far past its trigger a protective stop actually
+    filled — the loss taken *beyond* the planned risk. It is a distinct
+    metric family from execution quality (PLAN 11.49): a large value
+    means the market gapped through the level, not that the fill was
+    poorly executed. AAPL 2026-07-31 held a stop at 320.74 while the
+    stock closed 333.43 and opened 304.81 — the level never traded, and
+    $204 of a $448.81 loss landed past the point the bot believed it had
+    exited.
+
+    Returns median + max in both basis points and dollars:
+
+      - **dollars** is the headline. "Stops cost $204 beyond their
+        trigger" is actionable; a basis-point percentile is not.
+      - **median and max, not p95.** At the sample sizes involved (4
+        Donchian readings: 10.3 / 11.3 / 18.9 / 490.1) a p95 *is* the
+        max, so it would read as a crisis until the gap event left the
+        window and then collapse. Median answers "are stops filling near
+        their trigger normally"; max answers "did we get gapped".
+
+    Clamped to adverse-only, matching `slippage_adverse_bps` semantics:
+    a fill better than the trigger contributes 0, never a negative that
+    would net away a real gap elsewhere in the window.
+    """
+    kinds = tuple(sorted(STOP_GAP_KINDS))
+    cursor = conn.execute(
+        "SELECT symbol, stop_trigger_price, avg_fill_price, filled_qty, "
+        "slippage_adverse_bps "
+        "FROM trades "
+        "WHERE strategy = ? "
+        "AND status IN ('filled', 'partial') "
+        f"AND slippage_benchmark_kind IN ({', '.join('?' * len(kinds))}) "
+        "AND timestamp >= ? AND timestamp < ?",
+        (strategy_name, *kinds, period_start.isoformat(), period_end.isoformat()),
+    )
+    bps: list[float] = []
+    dollars: list[float] = []
+    for symbol, trigger, fill, qty, adverse in cursor.fetchall():
+        if adverse is not None:
+            try:
+                bps.append(max(0.0, float(adverse)))
+            except (TypeError, ValueError):
+                pass
+        if trigger is None or fill is None or qty is None:
+            continue
+        try:
+            excess = (float(trigger) - float(fill)) * float(qty)
+        except (TypeError, ValueError):
+            continue
+        if not math.isfinite(excess):
+            continue
+        dollars.append(max(0.0, excess) * _contract_multiplier(symbol or ""))
+    if not bps and not dollars:
+        return None
+    return {
+        "n": max(len(bps), len(dollars)),
+        "median_bps": float(np.median(bps)) if bps else None,
+        "max_bps": max(bps) if bps else None,
+        "median_dollars": float(np.median(dollars)) if dollars else None,
+        "max_dollars": max(dollars) if dollars else None,
+        "total_dollars": sum(dollars) if dollars else None,
+    }
 
 
 def _slippage_p95_bps(
