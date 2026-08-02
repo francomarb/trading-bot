@@ -195,6 +195,63 @@ class RiskDecision:
     # PLAN 11.47 STOP_LIMIT entries — see Signal.entry_trigger_price.
     entry_trigger_price: float | None = None
 
+    def stop_for_fill(self, fill_price: float | None) -> float:
+        """Protective stop re-anchored to the price we actually filled at.
+
+        `stop_price` is computed from `entry_reference_price`, which is
+        the latest completed bar's close — an *estimate* of where we'd
+        execute (see `Signal.reference_price`). When the fill lands
+        somewhere else, an absolute stop derived from that estimate no
+        longer sits the intended distance from the real entry: the 2026
+        07-31 audit found live breathing room ranging from 30.8% to
+        118% of what was designed, on 69% of entries (PLAN 11.53).
+
+        Re-anchoring keeps the *offset* — `|reference − stop|`, i.e.
+        k×ATR — and measures it from the fill instead. That is what
+        makes the recorded risk true: `_size_position` picks qty as
+        `budget ÷ k×ATR`, so holding the offset constant means realized
+        risk equals the budget exactly, with no re-sizing. It also
+        matches the backtest, which hands vectorbt a stop *fraction*
+        applied to the actual fill rather than an absolute level.
+
+        **STOP_LIMIT decisions are returned unchanged**, for two
+        independent reasons. Their protective stop is a bracket child
+        submitted *with* the entry, so it is already live at the broker
+        before any fill exists to anchor to. And the offset used here
+        would be the wrong one: `_size_position` divides STOP_LIMIT risk
+        by `limit_price − stop_price` (the worst permitted fill), not by
+        `reference − stop`, so re-anchoring on the smaller reference
+        offset would *shrink* an already-conservative position's risk
+        rather than correct it — AAPL 2026-07-28 would go from 64% of
+        its budgeted risk down to 55%.
+
+        Falls back to the unmodified `stop_price` when there is no
+        usable fill, or when the re-anchored stop would be non-positive
+        or land on the wrong side of the entry — a stop that cannot be
+        placed is worse than one placed slightly off.
+        """
+        if self.order_type is OrderType.STOP_LIMIT:
+            return self.stop_price
+        if fill_price is None:
+            return self.stop_price
+        try:
+            fill = float(fill_price)
+        except (TypeError, ValueError):
+            return self.stop_price
+        if not math.isfinite(fill) or fill <= 0:
+            return self.stop_price
+        offset = abs(float(self.entry_reference_price) - float(self.stop_price))
+        if offset <= 0:
+            return self.stop_price
+        anchored = fill - offset if self.side is Side.BUY else fill + offset
+        if not math.isfinite(anchored) or anchored <= 0:
+            return self.stop_price
+        if self.side is Side.BUY and anchored >= fill:
+            return self.stop_price
+        if self.side is Side.SELL and anchored <= fill:
+            return self.stop_price
+        return anchored
+
     def __post_init__(self) -> None:
         # Defensive: any caller that constructs this manually still has to pass
         # a sane shape. The contract enforcement (caller is RiskManager) is

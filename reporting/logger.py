@@ -909,14 +909,73 @@ class TradeLogger:
                 )
                 new_signed_bps = signed
                 new_adverse_bps = max(0.0, signed)
-        initial_stop_loss = float(decision.stop_price)
-        initial_risk_per_share = max(
-            0.0,
-            float(decision.entry_reference_price) - float(decision.stop_price),
-        )
+        # PLAN 11.53: record the stop that was actually placed. The broker
+        # re-anchors it to the fill on the paths that submit the stop after
+        # the entry confirms, so deriving it the same way here keeps the
+        # trade row describing the order that really exists.
+        #
+        # Record the stop the broker actually placed. Do NOT re-derive it
+        # from the decision: whether the stop was re-anchored to the fill
+        # depends on the execution path, not on the decision. OTO brackets
+        # attach the child BEFORE the fill at the reference-derived level;
+        # only the fractional and capped-rebuild paths submit it after and
+        # re-anchor. Routing is by `math.floor(qty) != qty`, so a MARKET
+        # entry that happens to size to whole shares takes the OTO path —
+        # inferring here logged 145.05 against a broker child at 145.00,
+        # on 9 of the production entries to date.
+        #
+        # A path that reports is authoritative, and that includes reporting
+        # that NO stop exists: a fractional entry under one whole share
+        # cannot have one (Alpaca stops require whole shares), and a
+        # rejected stop submission leaves the position unprotected until
+        # `_repair_missing_protective_stops` catches it. Recording the
+        # decision's intended level for those rows would state that
+        # protection exists when it does not — so they get NULL, and the
+        # risk basis below falls away with it. Only an unreporting path
+        # (legacy callers, recovery rows) uses the decision fallback.
+        initial_stop_loss: float | None
+        if getattr(result, "stop_placement_reported", False):
+            placed = result.placed_stop_price
+            initial_stop_loss = (
+                float(placed) if placed is not None and placed > 0 else None
+            )
+        else:
+            initial_stop_loss = float(decision.stop_price)
+        # Risk per share is the distance from where we actually got in to
+        # where the stop actually sits. Derived from the two values above
+        # rather than from `reference − stop`, which describes neither on
+        # a STOP_LIMIT entry: sizing there divides by `limit − stop` (the
+        # worst permitted fill) while the real room is `fill − stop`. AAPL
+        # 2026-07-28 had all three differ — 29.20 sized, 18.81 actual,
+        # 16.19 recorded — so its r_multiple was computed against a number
+        # that described nothing.
+        #
+        # For MARKET entries this is unchanged: the stop is re-anchored to
+        # `fill − k×ATR`, so `fill − stop` is exactly the k×ATR offset the
+        # old expression produced.
+        #
+        # No stop means no defined risk-to-stop, so these stay NULL rather
+        # than being filled from the decision's intent. r_multiple is then
+        # NULL too, which is correct: you cannot express a loss in units of
+        # a risk that was never bounded.
+        _fill_for_risk = result.avg_fill_price
+        initial_risk_per_share: float | None
+        if initial_stop_loss is None:
+            initial_risk_per_share = None
+        elif _fill_for_risk is not None and float(_fill_for_risk) > 0:
+            initial_risk_per_share = abs(
+                float(_fill_for_risk) - initial_stop_loss
+            )
+        else:
+            initial_risk_per_share = max(
+                0.0,
+                float(decision.entry_reference_price) - float(decision.stop_price),
+            )
         multiplier = _contract_multiplier(decision.symbol)
         initial_risk_dollars = (
-            initial_risk_per_share
+            None
+            if initial_risk_per_share is None
+            else initial_risk_per_share
             * float(result.filled_qty or result.requested_qty or 0)
             * multiplier
         )

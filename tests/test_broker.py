@@ -1018,7 +1018,10 @@ class TestEntryMaxPriceCap:
         assert stop_req.side.value == "sell"
         assert stop_req.type.value == "stop"
         assert stop_req.time_in_force.value == "gtc"
-        assert stop_req.stop_price == 95.0
+        # PLAN 11.53: the rebuild already runs after the fill confirms, so
+        # it re-anchors while replacing the order anyway. Reference 100.0,
+        # stop 95.0 => 5.00 offset; fill 100.5 => 95.5.
+        assert stop_req.stop_price == 95.5
 
     def test_rebuild_resolves_child_from_nested_parent_when_submit_omits_legs(self):
         api = MagicMock()
@@ -1783,8 +1786,37 @@ class TestFractionalOrders:
         assert stop_req.qty == 8               # floor(8.5)
         assert stop_req.time_in_force.value == "gtc"
         assert stop_req.type.value == "stop"
-        assert stop_req.stop_price == 96.0
+        # PLAN 11.53: anchored to the FILL, not the reference close.
+        # _decision() uses reference 100.0 with stop 96.0, i.e. a 4.00
+        # offset; the fill landed at 100.5, so the stop follows to
+        # 100.5 - 4.00 = 96.5 and the position keeps the 4.00 of room
+        # it was sized for. Anchoring to the reference would have left
+        # only 4.50 - and in the other direction, only 3.50.
+        assert stop_req.stop_price == 96.5
         assert stop_req.side.value == "sell"
+
+    def test_fractional_stop_keeps_intended_risk_when_fill_drifts(self):
+        """The point of re-anchoring: distance from entry to stop stays
+        constant at k*ATR regardless of where the fill lands, so realized
+        risk equals the budget that sizing used."""
+        for fill, expected_stop in ((100.5, 96.5), (94.0, 90.0), (108.25, 104.25)):
+            api = MagicMock()
+            entry_order = _alpaca_order(id="e", status="accepted", qty=8.5)
+            filled_order = _alpaca_order(
+                id="e", status="filled", qty=8.5,
+                filled_qty=8.5, filled_avg_price=fill,
+            )
+            api.submit_order.side_effect = [
+                entry_order, _alpaca_order(id="s", status="accepted", qty=8),
+            ]
+            api.get_order_by_id.return_value = filled_order
+            broker = _broker_with_mock(api)
+            broker.place_order(_decision(qty=8.5, stop=96.0), poll_timeout=0.1)
+            stop_req = api.submit_order.call_args_list[1].args[0]
+            assert stop_req.stop_price == pytest.approx(expected_stop), (
+                f"fill {fill} should give stop {expected_stop}"
+            )
+            assert fill - stop_req.stop_price == pytest.approx(4.0)
 
     def test_fractional_registers_standalone_stop_leg_with_stream(self):
         """Whole-share stop for a fractional entry must be registered for stop-fill logging."""
@@ -1826,6 +1858,51 @@ class TestFractionalOrders:
         assert result.status is OrderStatus.FILLED
         # Only the entry was submitted — no stop (floor(0.5) == 0).
         assert api.submit_order.call_count == 1
+        # PLAN 11.53: and the result must SAY no stop exists, not merely
+        # omit the field. `reported=True` with a None price is what stops
+        # the trade log falling back to the decision's intended level and
+        # recording protection this position does not have.
+        assert result.stop_placement_reported is True
+        assert result.placed_stop_price is None
+
+    def test_fractional_rejected_stop_reports_no_stop(self):
+        """Broker rejects the stop: the entry is filled and unprotected, and
+        the result must report that rather than staying silent."""
+        api = MagicMock()
+        entry_order = _alpaca_order(id="entry-4", status="accepted", qty=8.5)
+        filled_order = _alpaca_order(
+            id="entry-4", status="filled", qty=8.5,
+            filled_qty=8.5, filled_avg_price=100.5,
+        )
+        api.submit_order.side_effect = [entry_order, APIError("stop rejected")]
+        api.get_order_by_id.return_value = filled_order
+
+        broker = _broker_with_mock(api)
+        result = broker.place_order(_decision(qty=8.5, stop=96.0), poll_timeout=0.1)
+
+        assert result.status is OrderStatus.FILLED
+        assert result.stop_placement_reported is True
+        assert result.placed_stop_price is None
+
+    def test_fractional_accepted_stop_reports_the_anchored_price(self):
+        """Positive control for the two above — an accepted stop reports its
+        actual price, so the three outcomes are distinguishable."""
+        api = MagicMock()
+        entry_order = _alpaca_order(id="entry-5", status="accepted", qty=8.5)
+        filled_order = _alpaca_order(
+            id="entry-5", status="filled", qty=8.5,
+            filled_qty=8.5, filled_avg_price=100.5,
+        )
+        api.submit_order.side_effect = [
+            entry_order, _alpaca_order(id="stop-5", status="accepted", qty=8),
+        ]
+        api.get_order_by_id.return_value = filled_order
+
+        broker = _broker_with_mock(api)
+        result = broker.place_order(_decision(qty=8.5, stop=96.0), poll_timeout=0.1)
+
+        assert result.stop_placement_reported is True
+        assert result.placed_stop_price == pytest.approx(96.5)
 
     def test_whole_share_uses_oto_path_unchanged(self):
         """Whole-share qty (floor(qty) == qty) always takes the OTO GTC path."""

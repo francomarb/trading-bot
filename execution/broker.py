@@ -165,6 +165,34 @@ class OrderResult:
     # passed a lifecycle store through (e.g. close paths in Phase A,
     # tests that construct OrderResult directly).
     position_uid: str | None = None
+    # PLAN 11.53 — the protective stop price this order actually left at
+    # the broker. Set by every entry path that submits one, because the
+    # price differs by path: OTO brackets attach the stop BEFORE the fill
+    # at the reference-derived level, while the fractional and
+    # capped-rebuild paths submit it AFTER and re-anchor it to the fill.
+    # The trade log must record the order that exists rather than
+    # re-deriving one from the decision — inferring it logged a stop of
+    # 145.05 for a whole-share MARKET entry whose broker child sat at
+    # 145.00.
+    #
+    # `placed_stop_price` alone cannot carry the answer, because None has
+    # two very different meanings. `stop_placement_reported` separates
+    # them:
+    #
+    #   reported=False  — this path said nothing about a stop (legacy
+    #                     callers, recovery rows, tests). Consumers fall
+    #                     back to `decision.stop_price`.
+    #   reported=True   — this path is authoritative. A price means that
+    #                     stop exists; None means **no stop was placed**,
+    #                     which happens on a fractional entry under one
+    #                     whole share (Alpaca stops require whole shares)
+    #                     or when the stop submission was rejected.
+    #
+    # Collapsing the two let an unprotected fractional fill record a stop
+    # that had never been submitted — the same class of lie this field
+    # was added to remove.
+    placed_stop_price: float | None = None
+    stop_placement_reported: bool = False
 
     @property
     def is_terminal(self) -> bool:
@@ -1530,6 +1558,11 @@ class AlpacaBroker:
         # positions to the operator CLI).
         position_uid: str | None = None
         stop_loss = StopLossRequest(stop_price=round(decision.stop_price, 2))
+        # PLAN 11.53: the OTO child is attached BEFORE the fill, so it can
+        # only carry the reference-derived level. Record that as what was
+        # actually placed; the capped-entry branch below overwrites it if
+        # (and only if) it successfully rebuilds the stop post-fill.
+        placed_stop: float | None = float(stop_loss.stop_price)
 
         tif = TimeInForce.DAY if self._time_in_force == "day" else TimeInForce.GTC
 
@@ -1804,14 +1837,21 @@ class AlpacaBroker:
                 # promoted in-place by changing time_in_force. Rebuild the
                 # durable protection as a standalone GTC stop after the DAY
                 # child is live and the entry fill is confirmed.
+                # PLAN 11.53: this rebuild already happens after the fill
+                # is confirmed, so re-anchor to the real entry while we
+                # are replacing the order anyway.
+                rebuilt_stop = decision.stop_for_fill(result.avg_fill_price)
                 self.replace_day_stop_with_standalone_gtc(
                     symbol=decision.symbol,
                     stop_order_id=capped_stop_leg_id,
                     qty=result.filled_qty,
-                    stop_price=decision.stop_price,
+                    stop_price=rebuilt_stop,
                     client_order_id_prefix="equity-stop-gtc",
                     position_uid=position_uid,
                 )
+                # Only on success — a failed rebuild leaves the original
+                # OTO child in place, and the log must say so.
+                placed_stop = float(rebuilt_stop)
             except Exception as exc:
                 # The entry is already filled. Preserve the truthful fill result
                 # and let engine reconciliation retry durable-stop rebuild.
@@ -1823,7 +1863,10 @@ class AlpacaBroker:
         # with position_uid attached so the engine can pass it to
         # TradeLogger.log().
         self._lifecycle_mark_filled(position_uid=position_uid, result=result)
-        return replace(result, position_uid=position_uid)
+        return replace(
+            result, position_uid=position_uid, placed_stop_price=placed_stop,
+            stop_placement_reported=True,
+        )
 
     def _place_fractional_order(
         self,
@@ -2001,16 +2044,34 @@ class AlpacaBroker:
         # Submit standalone GTC stop for the whole-share portion after fill.
         # Alpaca stop orders require whole shares; fractional remainder exits
         # via engine exit signals when the strategy fires.
+        #
+        # PLAN 11.53: stays None unless a stop is actually accepted — an
+        # unprotected fractional entry must not report a stop the trade
+        # log would then record as existing.
+        placed_stop: float | None = None
         if result.status is OrderStatus.FILLED:
             stop_qty = math.floor(decision.qty)
             if stop_qty >= 1:
+                # PLAN 11.53: anchor the stop to the price we actually
+                # filled at, not to the signal-bar close it was derived
+                # from. This path already submits the stop *after* the
+                # fill, so the correct anchor is simply available — no
+                # cancel/replace and no drift threshold needed.
+                anchored_stop = decision.stop_for_fill(result.avg_fill_price)
+                if abs(anchored_stop - decision.stop_price) > 0.005:
+                    logger.info(
+                        f"{decision.symbol}: stop re-anchored to fill — "
+                        f"${decision.stop_price:.2f} → ${anchored_stop:.2f} "
+                        f"(ref ${decision.entry_reference_price:.2f}, "
+                        f"fill ${result.avg_fill_price:.2f})"
+                    )
                 stop_client_id = f"frac-stop-{uuid.uuid4().hex[:10]}"
                 stop_request = StopOrderRequest(
                     symbol=decision.symbol,
                     qty=stop_qty,
                     side=AlpacaOrderSide.SELL,
                     time_in_force=TimeInForce.GTC,
-                    stop_price=round(decision.stop_price, 2),
+                    stop_price=round(anchored_stop, 2),
                     client_order_id=stop_client_id,
                 )
                 try:
@@ -2019,6 +2080,8 @@ class AlpacaBroker:
                         op_desc=f"submit_frac_stop({decision.symbol})",
                     )
                     self._register_standalone_stop_leg(stop_order)
+                    # Broker accepted it — this is the stop that exists.
+                    placed_stop = float(anchored_stop)
                     # P-4: protective_stop substrate row for the
                     # standalone GTC stop. order_class='simple' (no
                     # broker-attached parent — this stop is a
@@ -2029,14 +2092,14 @@ class AlpacaBroker:
                         position_uid=position_uid,
                         client_order_id=stop_client_id,
                         broker_order_id=str(stop_order.id),
-                        stop_price=float(decision.stop_price),
+                        stop_price=float(anchored_stop),
                         qty=float(stop_qty),
                         parent_order_id=order_id,
                         order_class="simple",
                     )
                     logger.info(
                         f"[fractional] GTC stop: sell {stop_qty} "
-                        f"{decision.symbol} @ ${decision.stop_price:.2f}"
+                        f"{decision.symbol} @ ${anchored_stop:.2f}"
                     )
                 except APIError as e:
                     logger.error(
@@ -2054,7 +2117,10 @@ class AlpacaBroker:
         # Operator Controls Phase A — lifecycle transition on the
         # success path. Best-effort.
         self._lifecycle_mark_filled(position_uid=position_uid, result=result)
-        return replace(result, position_uid=position_uid)
+        return replace(
+            result, position_uid=position_uid, placed_stop_price=placed_stop,
+            stop_placement_reported=True,
+        )
 
     def reconcile_submitted_order(
         self,
