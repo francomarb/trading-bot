@@ -13,6 +13,7 @@ Covers:
 from __future__ import annotations
 
 import os
+import re
 import sqlite3
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
@@ -4459,3 +4460,56 @@ class TestSlippageNeverPoolsAcrossInstruments:
     ])
     def test_instrument_classification(self, symbol, expected):
         assert _instrument_class(symbol) == expected
+
+
+class TestWeeklyReportDailyLinks:
+    """Review finding: the weekly report's daily links were all broken.
+
+    Markdown links resolve relative to the file containing them. The
+    weekly report lives in `logs/weekly_reports/` while the dailies live
+    in `logs/daily_pnl/`, so `[2026-07-31](2026-07-31.md)` pointed at
+    `logs/weekly_reports/2026-07-31.md` — a path that never exists.
+
+    Harmless while nothing generated this report; every link in the
+    first live one (PR #91) was dead.
+    """
+
+    def _setup(self, tmp_path):
+        daily = tmp_path / "daily"
+        weekly = tmp_path / "weekly"
+        daily.mkdir()
+        for day in ("2026-07-31", "2026-08-01"):
+            (daily / f"{day}.md").write_text(f"# Daily — {day}\n")
+        return PnLTracker(
+            trade_csv_path=str(tmp_path / "t.db"),
+            daily_pnl_dir=str(daily),
+            weekly_report_dir=str(weekly),
+        ), daily, weekly
+
+    def test_links_resolve_from_the_weekly_report_directory(self, tmp_path):
+        tracker, daily, weekly = self._setup(tmp_path)
+        path = tracker.generate_weekly_report(week_end="2026-08-01")
+        assert path is not None
+        body = Path(path).read_text()
+        targets = re.findall(r"\]\(([^)]+\.md)\)", body)
+        assert targets, "expected daily links in the report"
+        for target in targets:
+            resolved = (Path(path).parent / target).resolve()
+            assert resolved.exists(), f"dead link: {target} -> {resolved}"
+
+    def test_links_are_not_bare_filenames(self, tmp_path):
+        """The specific regression: a bare `{day}.md` resolves inside the
+        weekly directory, where nothing lives."""
+        tracker, _, _ = self._setup(tmp_path)
+        path = tracker.generate_weekly_report(week_end="2026-08-01")
+        body = Path(path).read_text()
+        assert "](2026-07-31.md)" not in body
+
+    def test_links_follow_custom_directories(self, tmp_path):
+        """Computed with `relpath`, not a hardcoded `../daily_pnl/`, so
+        overriding either directory keeps the links correct."""
+        tracker, daily, weekly = self._setup(tmp_path)
+        path = tracker.generate_weekly_report(week_end="2026-08-01")
+        body = Path(path).read_text()
+        for target in re.findall(r"\]\(([^)]+\.md)\)", body):
+            assert (Path(path).parent / target).resolve().parent == daily.resolve()

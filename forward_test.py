@@ -405,6 +405,11 @@ def main() -> None:
     health_scheduler = HealthReviewScheduler(
         conn_factory=lambda: trade_logger._ensure_db(),
         dispatcher=alerts,
+        # The same Monday trigger writes the weekly P&L digest. Before
+        # this, `generate_weekly_report` was reachable only from tests
+        # and phase9_verify, so no weekly report was ever produced in
+        # live operation.
+        pnl_tracker=pnl_tracker,
     )
 
     try:

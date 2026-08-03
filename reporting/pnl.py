@@ -503,8 +503,18 @@ class PnLTracker:
             "## Daily Reports",
             "",
         ]
-        for day_str, _ in daily_files:
-            lines.append(f"- [{day_str}]({day_str}.md)")
+        # Links are resolved by the reader relative to the WEEKLY report's
+        # own directory, not the daily one. `{day}.md` therefore pointed at
+        # `logs/weekly_reports/{day}.md`, which never exists — the dailies
+        # live in `logs/daily_pnl/`. Harmless while nothing generated this
+        # report; every link in the first live one was broken.
+        #
+        # `os.path.relpath` rather than a hardcoded `../daily_pnl/` so the
+        # link stays correct when either directory is overridden via
+        # settings or the constructor (tests pass tmp dirs for both).
+        for day_str, day_path in daily_files:
+            rel = os.path.relpath(day_path, start=self._weekly_dir)
+            lines.append(f"- [{day_str}]({rel})")
 
         lines.append("")
         with open(path, "w") as f:
