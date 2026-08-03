@@ -989,3 +989,75 @@ class TestStrategyHealthBrokenAlwaysWarning:
         assert len(captured) == 2
         assert captured[0].severity == AlertSeverity.INFO  # positive Edge
         assert captured[1].severity == AlertSeverity.WARNING  # non-positive
+
+
+class TestInformationalChecksReachTheReport:
+    """PLAN 11.49 — the gap that unit tests on the assessor could not catch.
+
+    Informational checks are deliberately always HEALTHY so they can never
+    move a verdict. The Health Report section renders only non-HEALTHY
+    checks to stay short — so without an explicit carve-out, an
+    informational check is produced correctly, asserted correctly by the
+    assessor's own tests, and then never appears anywhere a human looks.
+
+    That is exactly what happened: `stop_gap_erosion` was built, tested,
+    merged, and rendered nothing. Caught only by running the CLI.
+    """
+
+    def _bundle(self, checks):
+        health = HealthReport(
+            strategy="donchian_breakout",
+            period_start=date(2026, 7, 27),
+            period_end=date(2026, 8, 3),
+            checks=tuple(checks),
+            l1_status=HealthStatus.HEALTHY,
+            l2_status=HealthStatus.HEALTHY,
+            l3_status=HealthStatus.HEALTHY,
+        )
+        return AssessmentBundle(
+            strategy="donchian_breakout", edge=_edge(), health=health,
+            recommendation=Recommendation.CONTINUE_AND_MONITOR,
+        )
+
+    def _render(self, checks) -> str:
+        from strategies.health.reviewer import _strategy_detail_section
+        return "\n".join(_strategy_detail_section(self._bundle(checks)))
+
+    def test_informational_check_is_rendered_despite_being_healthy(self):
+        out = self._render([CheckResult(
+            name="stop_gap_erosion", layer=Layer.L2,
+            status=HealthStatus.HEALTHY, informational=True,
+            findings=["$204 total beyond trigger across 1 stop fill(s)"],
+        )])
+        assert "Context (not scored)" in out
+        assert "stop_gap_erosion" in out
+        assert "$204 total beyond trigger" in out
+
+    def test_informational_check_stays_out_of_the_scored_table(self):
+        """It must not appear as a pass/fail row — it is context, not a
+        check that passed."""
+        out = self._render([CheckResult(
+            name="stop_gap_erosion", layer=Layer.L2,
+            status=HealthStatus.HEALTHY, informational=True,
+            findings=["$204 beyond trigger"],
+        )])
+        assert "| stop_gap_erosion |" not in out
+        # With no scored failures, the summary line must still be honest.
+        assert "All L1/L2/L3 checks passing." in out
+
+    def test_no_observations_does_not_grow_an_empty_block(self):
+        out = self._render([CheckResult(
+            name="stop_gap_erosion", layer=Layer.L2,
+            status=HealthStatus.HEALTHY, informational=True,
+            findings=["no observations in window"],
+        )])
+        assert "Context (not scored)" not in out
+
+    def test_ordinary_healthy_checks_remain_hidden(self):
+        """The existing terseness contract is unchanged for real checks."""
+        out = self._render([CheckResult(
+            name="partial_fill_rate", layer=Layer.L2,
+            status=HealthStatus.HEALTHY, findings=["0.0%"],
+        )])
+        assert "partial_fill_rate" not in out
+        assert "Context (not scored)" not in out
