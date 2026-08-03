@@ -282,8 +282,10 @@ def test_slippage_monitoring(csv_path: str) -> None:
     )
     check(
         "mean slippage >= 0",
-        report["mean_bps"] >= 0,
-        f"mean={report['mean_bps']} bps",
+        all(v["mean_bps"] >= 0 for v in report["by_instrument"].values()),
+        # PLAN 11.50: reported per instrument class — equity and option
+        # basis points are not comparable and are never pooled.
+        f"by_instrument={report['by_instrument']}",
     )
 
 

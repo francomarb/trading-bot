@@ -27,6 +27,7 @@ Design principles:
 from __future__ import annotations
 
 import os
+import re
 from dataclasses import dataclass, field
 from datetime import date, datetime, timedelta, timezone
 
@@ -35,6 +36,56 @@ from loguru import logger
 
 from config import settings
 from reporting.logger import is_execution_quality_measurement
+
+
+_OCC_SYMBOL_RE = re.compile(r"^[A-Z]{1,6}[0-9]{6}[CP][0-9]{8}$")
+
+# PLAN 11.50. Basis points are a *percentage*, so they are only
+# comparable between instruments of similar price. They are not
+# comparable across equities and options, and pooling them produces a
+# number that describes neither:
+#
+#   an 8¢ execution miss on a $400 stock   ->     2 bps
+#   the same 8¢ miss on a $0.66 contract   -> 1,212 bps
+#
+# On the live trade log that made equity execution of 1.6 bps read as
+# 75.6 bps, because 17 cheap option rows outweighed 3 expensive equity
+# ones. An operator would reasonably conclude execution had degraded 15x.
+#
+# Every aggregate in this module is therefore reported per instrument
+# class. The health assessor and dashboard were never affected because
+# both group by strategy, and strategies are single-instrument — which
+# is also why grouping is the right fix rather than a special case.
+INSTRUMENT_CLASSES: tuple[str, ...] = ("equity", "option")
+
+
+def _instrument_class(symbol: str | None) -> str:
+    """"equity" or "option" for a trade-log symbol (OCC = option)."""
+    return "option" if _OCC_SYMBOL_RE.match(str(symbol or "")) else "equity"
+
+
+def _slippage_by_instrument(trades: list[dict]) -> dict[str, dict]:
+    """Adverse-slippage stats split by instrument class.
+
+    Returns only classes that actually have measured rows — a class with
+    nothing to report is omitted rather than shown as 0.0, for the same
+    reason the dashboard renders a blank instead of a zero: absence of a
+    measurement must not read as perfect execution.
+    """
+    buckets: dict[str, list[float]] = {}
+    for t in trades:
+        value = _adverse_bps(t)
+        if value is None:
+            continue
+        buckets.setdefault(_instrument_class(t.get("symbol")), []).append(value)
+    return {
+        cls: {
+            "count": len(vals),
+            "mean_bps": round(sum(vals) / len(vals), 2),
+            "max_bps": round(max(vals), 2),
+        }
+        for cls, vals in buckets.items()
+    }
 
 
 _SLIPPAGE_COLUMN = "slippage_adverse_bps"
@@ -132,8 +183,13 @@ class DailySummary:
     session_start_equity: float = 0.0
     session_end_equity: float = 0.0
     strategies: dict[str, StrategyStats] = field(default_factory=dict)
-    slippage_mean_bps: float = 0.0
-    slippage_max_bps: float = 0.0
+    # PLAN 11.50 — per instrument class, e.g.
+    # {"equity": {"count": 3, "mean_bps": 1.6, "max_bps": 4.9}}.
+    # Replaces the pooled `slippage_mean_bps` / `slippage_max_bps` pair:
+    # basis points are a percentage of price, so equities and options
+    # cannot share a mean. Classes with no measured rows are absent
+    # rather than present-and-zero.
+    slippage_by_instrument: dict[str, dict] = field(default_factory=dict)
 
 
 # ── PnL Tracker ─────────────────────────────────────────────────────────────
@@ -268,8 +324,9 @@ class PnLTracker:
         largest_win = max(all_pnls) if all_pnls else 0.0
         largest_loss = min(all_pnls) if all_pnls else 0.0
 
-        # Slippage from database (today's rows).
-        slip_mean, slip_max = self._slippage_stats_for_day(day)
+        # Slippage from database (today's rows), split by instrument
+        # class — PLAN 11.50.
+        slip_by_instrument = self._slippage_stats_for_day(day)
 
         # Enrich strategy stats with slippage.
         csv_strat_slip = self._slippage_by_strategy(day)
@@ -288,8 +345,7 @@ class PnLTracker:
             session_start_equity=round(session_start_equity, 2),
             session_end_equity=round(session_end_equity, 2),
             strategies=strats,
-            slippage_mean_bps=round(slip_mean, 2),
-            slippage_max_bps=round(slip_max, 2),
+            slippage_by_instrument=slip_by_instrument,
         )
 
     def write_daily_report(self, summary: DailySummary) -> str:
@@ -317,9 +373,20 @@ class PnLTracker:
             f"| Total trades | {summary.total_trades} |",
             f"| Largest win | ${summary.largest_win:,.2f} |",
             f"| Largest loss | ${summary.largest_loss:,.2f} |",
-            f"| Mean adverse slippage | {summary.slippage_mean_bps} bps |",
-            f"| Max adverse slippage | {summary.slippage_max_bps} bps |",
         ]
+        for cls in INSTRUMENT_CLASSES:
+            stats = summary.slippage_by_instrument.get(cls)
+            if stats is None:
+                continue
+            lines.append(
+                f"| Mean adverse slippage ({cls}) | "
+                f"{stats['mean_bps']:.1f} bps (n={stats['count']}) |"
+            )
+            lines.append(
+                f"| Max adverse slippage ({cls}) | {stats['max_bps']:.1f} bps |"
+            )
+        if not summary.slippage_by_instrument:
+            lines.append("| Adverse slippage | — (no measured fills) |")
 
         if summary.strategies:
             lines += [
@@ -390,11 +457,10 @@ class PnLTracker:
         # slippage are skipped — not treated as zero — so paths that
         # legitimately have no benchmark (LIMIT entries, external
         # closes) don't drag the mean toward zero.
-        slip_values: list[float] = []
-        for t in trades:
-            v = _adverse_bps(t)
-            if v is not None:
-                slip_values.append(v)
+        # PLAN 11.50: split by instrument class. A single pooled mean
+        # across equities and options is not a number — see the module
+        # header for why.
+        slip_by_instrument = _slippage_by_instrument(trades)
 
         os.makedirs(self._weekly_dir, exist_ok=True)
         path = os.path.join(
@@ -410,12 +476,29 @@ class PnLTracker:
             f"|---|---|",
             f"| Trading days with reports | {len(daily_files)} |",
             f"| Total fills | {total_trades} |",
-            f"| Mean adverse slippage | {sum(slip_values)/len(slip_values):.1f} bps |"
-            if slip_values
-            else f"| Mean adverse slippage | — |",
-            f"| Max adverse slippage | {max(slip_values):.1f} bps |"
-            if slip_values
-            else f"| Max adverse slippage | — |",
+        ]
+        # One row per instrument class that actually has measurements.
+        # Basis points are not comparable across price scales, so there
+        # is deliberately no combined figure to fall back on.
+        for cls in INSTRUMENT_CLASSES:
+            stats = slip_by_instrument.get(cls)
+            if stats is None:
+                continue
+            lines.append(
+                f"| Mean adverse slippage ({cls}) | "
+                f"{stats['mean_bps']:.1f} bps (n={stats['count']}) |"
+            )
+            lines.append(
+                f"| Max adverse slippage ({cls}) | {stats['max_bps']:.1f} bps |"
+            )
+        if not slip_by_instrument:
+            lines.append("| Adverse slippage | — (no measured fills) |")
+        lines += [
+            "",
+            "> Slippage is reported per instrument class. Basis points are a "
+            "percentage of price, so equity and option figures are not "
+            "comparable and are never combined — an 8¢ miss is 2 bps on a "
+            "$400 stock and 1,212 bps on a $0.66 contract (PLAN 11.50).",
             "",
             "## Daily Reports",
             "",
@@ -445,22 +528,17 @@ class PnLTracker:
         diluted by paths that legitimately have no benchmark.
         """
         recent = self._trade_logger.read_recent(last_n)
-        if not recent:
-            return {"count": 0, "mean_bps": 0.0, "max_bps": 0.0}
-
-        slips: list[float] = []
-        for t in recent:
-            v = _adverse_bps(t)
-            if v is not None:
-                slips.append(v)
-
-        if not slips:
-            return {"count": 0, "mean_bps": 0.0, "max_bps": 0.0}
-
+        by_instrument = _slippage_by_instrument(recent) if recent else {}
+        total = sum(s["count"] for s in by_instrument.values())
         return {
-            "count": len(slips),
-            "mean_bps": round(sum(slips) / len(slips), 2),
-            "max_bps": round(max(slips), 2),
+            "count": total,
+            # PLAN 11.50: per instrument class. There is deliberately no
+            # combined `mean_bps` — pooling equity and option basis
+            # points produces a number that describes neither, and
+            # keeping one "for compatibility" would preserve exactly the
+            # misleading figure this change removes. Callers must name
+            # the class they mean.
+            "by_instrument": by_instrument,
         }
 
     # ── Database helpers ────────────────────────────────────────────────
@@ -469,19 +547,16 @@ class PnLTracker:
         """Read trades whose timestamp falls within [start, end]."""
         return self._trade_logger.read_trades_in_range(start, end)
 
-    def _slippage_stats_for_day(self, day: str) -> tuple[float, float]:
-        """Mean and max adverse slippage for a given day. Rows whose
-        `slippage_adverse_bps` is NULL/missing are skipped — paths
-        without a benchmark must not dilute the mean toward zero."""
-        trades = self._trades_in_range(day, day)
-        slips: list[float] = []
-        for t in trades:
-            v = _adverse_bps(t)
-            if v is not None:
-                slips.append(v)
-        if not slips:
-            return 0.0, 0.0
-        return sum(slips) / len(slips), max(slips)
+    def _slippage_stats_for_day(self, day: str) -> dict[str, dict]:
+        """Adverse slippage for a day, split by instrument class.
+
+        PLAN 11.50: previously returned a single pooled `(mean, max)`
+        pair across every fill. Basis points are a percentage of price,
+        so equities and options cannot share a mean — on the live log
+        that reported equity execution of 1.6 bps as 75.6 bps. Classes
+        with no measured rows are omitted rather than reported as 0.0.
+        """
+        return _slippage_by_instrument(self._trades_in_range(day, day))
 
     def _slippage_by_strategy(self, day: str) -> dict[str, float]:
         """Mean adverse slippage per strategy for a given day. Rows

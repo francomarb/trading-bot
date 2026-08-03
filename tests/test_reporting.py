@@ -51,7 +51,13 @@ from reporting.logger import (
     execution_quality_sql,
     is_execution_quality_measurement,
 )
-from reporting.pnl import DailySummary, PnLTracker, StrategyStats
+from reporting.pnl import (
+    DailySummary,
+    PnLTracker,
+    StrategyStats,
+    _instrument_class,
+    _slippage_by_instrument,
+)
 from risk.manager import RiskDecision, Side
 from strategies.base import OrderType
 
@@ -3339,7 +3345,9 @@ class TestPnLTracker:
         )
         report = tracker.slippage_report()
         assert report["count"] == 0
-        assert report["mean_bps"] == 0.0
+        # PLAN 11.50: no pooled `mean_bps` — equity and option basis
+        # points are not comparable, so there is nothing to combine.
+        assert report["by_instrument"] == {}
 
     def test_slippage_report_from_db(self, tmp_csv, tmp_daily_dir, sample_decision, sample_result):
         # Foundation §6.5: distinct order_ids → distinct rows.
@@ -3355,7 +3363,8 @@ class TestPnLTracker:
         )
         report = tracker.slippage_report(last_n=5)
         assert report["count"] == 5
-        assert report["mean_bps"] > 0
+        assert report["by_instrument"]["equity"]["count"] == 5
+        assert report["by_instrument"]["equity"]["mean_bps"] > 0
 
     def test_slippage_report_excludes_recovered_quality_rows(
         self, tmp_csv, tmp_daily_dir, sample_decision, sample_result,
@@ -3415,8 +3424,9 @@ class TestPnLTracker:
         # ~500.
         assert report["count"] == 1
         primary_signed = primary_record.slippage_adverse_bps
-        assert report["mean_bps"] == pytest.approx(primary_signed, abs=0.01)
-        assert report["max_bps"] == pytest.approx(primary_signed, abs=0.01)
+        eq = report["by_instrument"]["equity"]
+        assert eq["mean_bps"] == pytest.approx(primary_signed, abs=0.01)
+        assert eq["max_bps"] == pytest.approx(primary_signed, abs=0.01)
 
     def test_slippage_report_skips_null_rows_in_count_and_mean(
         self, tmp_csv, tmp_daily_dir, sample_decision, sample_result,
@@ -3467,7 +3477,7 @@ class TestPnLTracker:
         assert report["count"] == 1
         # Mean equals the single measured row — undiluted by the
         # LIMIT row's NULL slippage.
-        assert report["mean_bps"] > 0
+        assert report["by_instrument"]["equity"]["mean_bps"] > 0
 
     def test_weekly_report_no_dailies(self, tmp_csv, tmp_daily_dir, tmp_weekly_dir):
         tracker = PnLTracker(
@@ -4371,3 +4381,81 @@ class TestRecordedRiskBasisMatchesTheRealStop:
         )
         rec = tl.build_record(d, res, modeled_price=336.93)
         assert rec.initial_risk_per_share == pytest.approx(16.19, abs=0.01)
+
+
+class TestSlippageNeverPoolsAcrossInstruments:
+    """PLAN 11.50 — basis points are a percentage of price, so equity and
+    option figures cannot share a mean.
+
+    An 8¢ execution miss is 2 bps on a $400 stock and 1,212 bps on a
+    $0.66 contract. Pooling them made equity execution of 1.6 bps read as
+    75.6 bps on the live trade log — a 15x apparent degradation that was
+    purely an artefact of option contracts being cheap.
+    """
+
+    def _row(self, symbol, bps, oid):
+        return {
+            "symbol": symbol,
+            "slippage_adverse_bps": bps,
+            "slippage_benchmark_kind": "arrival_midpoint",
+            "slippage_measurement_quality": "primary",
+            "order_id": oid,
+        }
+
+    def test_equity_and_option_are_reported_separately(self):
+        rows = [
+            self._row("AAPL", 2.0, "a"),
+            self._row("MSFT", 1.2, "b"),
+            self._row("SPY260821C00738000", 1212.0, "c"),
+        ]
+        out = _slippage_by_instrument(rows)
+        assert out["equity"]["count"] == 2
+        assert out["equity"]["mean_bps"] == pytest.approx(1.6)
+        assert out["option"]["count"] == 1
+        assert out["option"]["mean_bps"] == pytest.approx(1212.0)
+        # The pooled mean would have been ~405 — a number describing
+        # neither instrument. It must not be derivable from the result.
+        assert "mean_bps" not in out
+
+    def test_option_volume_cannot_swamp_the_equity_figure(self):
+        """The live shape: many cheap option rows, few expensive equity
+        ones. Equity execution must stay legible."""
+        rows = [self._row(f"EQ{i}", 1.6, f"e{i}") for i in range(3)]
+        # Strikes vary so the symbols stay valid OCC (6-digit date, then
+        # C/P, then an 8-digit strike) — an invalid symbol would silently
+        # classify as equity and hide the very effect under test.
+        rows += [
+            self._row(f"SPY260821C{700 + i:05d}000", 88.6, f"o{i}")
+            for i in range(17)
+        ]
+        out = _slippage_by_instrument(rows)
+        assert out["equity"]["mean_bps"] == pytest.approx(1.6)
+        assert out["option"]["mean_bps"] == pytest.approx(88.6)
+
+    def test_class_with_no_measurements_is_absent_not_zero(self):
+        """Same rule as the dashboard's blank cell: an absent measurement
+        must not read as perfect execution."""
+        out = _slippage_by_instrument([self._row("AAPL", 2.0, "a")])
+        assert "option" not in out
+
+    def test_unmeasured_rows_are_excluded_entirely(self):
+        rows = [
+            self._row("AAPL", 2.0, "a"),
+            # LIMIT entry — no honest execution benchmark.
+            {"symbol": "MSFT", "slippage_adverse_bps": None,
+             "slippage_benchmark_kind": "limit_price",
+             "slippage_measurement_quality": "unavailable", "order_id": "b"},
+        ]
+        out = _slippage_by_instrument(rows)
+        assert out["equity"]["count"] == 1
+
+    @pytest.mark.parametrize("symbol,expected", [
+        ("AAPL", "equity"),
+        ("SPY", "equity"),
+        ("SPY260821C00738000", "option"),
+        ("QQQ260814P00687000", "option"),
+        (None, "equity"),
+        ("", "equity"),
+    ])
+    def test_instrument_classification(self, symbol, expected):
+        assert _instrument_class(symbol) == expected
