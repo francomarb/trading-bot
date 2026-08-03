@@ -1368,3 +1368,63 @@ class TestStopForFill:
         zero offset cannot reach it through the normal constructor."""
         with pytest.raises(ValueError, match="strictly below entry"):
             self._decision(ref=100.0, stop=100.0)
+
+
+class TestRiskBudgetIsRecorded:
+    """PLAN 11.54 — persist what the strategy INTENDED to risk.
+
+    Without it, "deployed risk as % of budget" is unanswerable after the
+    fact: equity moves between entries, and `risk_per_trade_pct` for
+    donchian_breakout itself changed on 2026-07-14 when 11.48 landed, so
+    reconstructing from current config misattributes every earlier entry.
+    """
+
+    def test_budget_is_equity_times_the_strategy_target(self):
+        mgr = _mgr(risk_per_trade_pct_by_strategy={"donchian_breakout": 0.004})
+        acct = _account(equity=99_500.0)
+        assert mgr.risk_budget_dollars(acct, "donchian_breakout") == pytest.approx(398.0)
+
+    def test_strategies_without_a_target_fall_back_to_the_global_ceiling(self):
+        mgr = _mgr(max_position_pct=0.02, risk_per_trade_pct_by_strategy={})
+        acct = _account(equity=100_000.0)
+        assert mgr.risk_budget_dollars(acct, "credit_spread") == pytest.approx(2_000.0)
+
+    def test_decision_carries_the_same_budget_sizing_used(self):
+        """One implementation, two consumers — the value divided by the
+        stop distance to pick qty must be the value persisted."""
+        mgr = _mgr(risk_per_trade_pct_by_strategy={"sma_crossover": 0.006})
+        acct = _account(equity=100_000.0)
+        d = mgr.evaluate(_signal(price=100.0, atr=2.0), acct, now=T0)
+        assert isinstance(d, RiskDecision)
+        assert d.risk_budget_dollars == pytest.approx(600.0)
+        assert d.risk_budget_dollars == pytest.approx(
+            mgr.risk_budget_dollars(acct, "sma_crossover")
+        )
+
+    def test_budget_tracks_equity_not_a_constant(self):
+        """The first reason it cannot be reconstructed later."""
+        mgr = _mgr(risk_per_trade_pct_by_strategy={"sma_crossover": 0.006})
+        rich = mgr.evaluate(_signal(), _account(equity=200_000.0), now=T0)
+        poor = mgr.evaluate(_signal(), _account(equity=50_000.0), now=T0)
+        assert rich.risk_budget_dollars == pytest.approx(1_200.0)
+        assert poor.risk_budget_dollars == pytest.approx(300.0)
+
+    def test_qty_times_stop_distance_is_not_the_budget(self):
+        """The tempting reconstruction, pinned as WRONG.
+
+        Whole-share flooring and the notional caps both break the
+        identity. On production data it gave ANET $895 against a ~$398
+        budget — 2.2x over, which is impossible if the budget had bound
+        the size. Anyone tempted to drop the stored column and re-derive
+        should fail here first.
+        """
+        mgr = _mgr(
+            risk_per_trade_pct_by_strategy={"sma_crossover": 0.006},
+            max_position_notional_pct=0.001,   # force a cap to bind
+        )
+        acct = _account(equity=100_000.0)
+        d = mgr.evaluate(_signal(price=100.0, atr=2.0), acct, now=T0)
+        assert isinstance(d, RiskDecision)
+        reconstructed = d.qty * abs(d.entry_reference_price - d.stop_price)
+        assert d.risk_budget_dollars == pytest.approx(600.0)
+        assert reconstructed != pytest.approx(d.risk_budget_dollars, rel=0.05)

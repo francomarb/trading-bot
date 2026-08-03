@@ -194,6 +194,15 @@ class RiskDecision:
     entry_max_price: float | None = None
     # PLAN 11.47 STOP_LIMIT entries — see Signal.entry_trigger_price.
     entry_trigger_price: float | None = None
+    # PLAN 11.54 — dollars this strategy intended to risk on this trade
+    # (`equity x risk_per_trade_pct` at sizing time). Recorded because it
+    # is NOT reconstructable later: equity moves between entries, and the
+    # pct for donchian_breakout changed on 2026-07-14 when 11.48 landed,
+    # so reconstructing from current config misattributes every earlier
+    # entry. The tempting `qty x stop_distance` shortcut does not work
+    # either — caps and whole-share flooring break the identity, giving
+    # ANET $895 against a ~$398 budget.
+    risk_budget_dollars: float | None = None
 
     def stop_for_fill(self, fill_price: float | None) -> float:
         """Protective stop re-anchored to the price we actually filled at.
@@ -938,6 +947,27 @@ class RiskManager:
             return signal.reference_price - offset
         return signal.reference_price + offset
 
+    def risk_budget_dollars(
+        self, account: AccountState, strategy_name: str
+    ) -> float:
+        """Dollars this strategy intends to risk on one trade.
+
+        `equity × risk_per_trade_pct`, falling back to the global
+        `max_position_pct` for strategies without an 11.48 target
+        (options and credit spread own their sizing).
+
+        Extracted so `_size_position` and `evaluate` cannot disagree:
+        the value is divided by the stop distance to pick quantity, and
+        also persisted on the trade row, and those two must be the same
+        number. See PLAN 11.54 — the budget was previously computed
+        inline and discarded, which left every "deployed risk as % of
+        budget" question unanswerable after the fact.
+        """
+        risk_pct = self.risk_per_trade_pct_by_strategy.get(
+            strategy_name, self.max_position_pct
+        )
+        return account.equity * risk_pct
+
     def _size_position(
         self,
         signal: Signal,
@@ -1001,10 +1031,9 @@ class RiskManager:
         # 11.48: per-strategy risk-to-stop target; strategies without one
         # (options, credit spread — own sizing semantics) fall back to the
         # global ceiling. See docs/allocator_risk_target_reconciliation.md.
-        risk_pct = self.risk_per_trade_pct_by_strategy.get(
-            signal.strategy_name, self.max_position_pct
-        )
-        risk_dollars = account.equity * risk_pct
+        # Shared with `evaluate`, which persists the same value on the
+        # trade row — these must not drift (PLAN 11.54).
+        risk_dollars = self.risk_budget_dollars(account, signal.strategy_name)
         stop_distance = abs(sizing_price - stop_price)
         if stop_distance <= 0:
             return 0
@@ -1063,7 +1092,7 @@ class RiskManager:
                 f"[{signal.strategy_name}] {signal.symbol}: risk-sized qty "
                 f"{risk_qty}→{raw_qty} clipped by {binding_cap} — implied "
                 f"risk ${implied_risk:,.0f} vs target ${risk_dollars:,.0f} "
-                f"({risk_pct:.2%} of equity)"
+                f"({risk_dollars / account.equity:.2%} of equity)"
             )
         return raw_qty
 
@@ -1313,6 +1342,14 @@ class RiskManager:
             limit_price=signal.limit_price,
             entry_max_price=signal.entry_max_price,
             entry_trigger_price=signal.entry_trigger_price,
+            # PLAN 11.54: persist what we INTENDED to risk. Without it,
+            # "deployed risk as % of budget" is unanswerable after the
+            # fact — equity moves between entries and the risk pct
+            # itself changed on 2026-07-14 (11.48), so the budget cannot
+            # be reconstructed from current config.
+            risk_budget_dollars=self.risk_budget_dollars(
+                account, signal.strategy_name,
+            ),
         )
         logger.info(
             f"risk approved {decision.symbol}: {decision.qty} shares @ "

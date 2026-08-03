@@ -398,6 +398,7 @@ TRADE_COLUMNS = [
     "status",
     "requested_qty",
     "filled_qty",
+    "risk_budget_dollars",
     "initial_stop_loss",
     "initial_risk_per_share",
     "initial_risk_dollars",
@@ -461,6 +462,14 @@ CREATE TABLE IF NOT EXISTS trades (
 """
 
 _MIGRATION_COLUMNS = {
+    # PLAN 11.54 — dollars the strategy INTENDED to risk on this trade
+    # (`equity x risk_per_trade_pct` at sizing time). Nullable; rows
+    # predating 2026-08-03 are NULL and must stay that way. Do NOT
+    # backfill from current config: the pct for donchian_breakout changed
+    # on 2026-07-14 (11.48), so a backfill would fabricate a denominator
+    # that was never used and make "deployed risk vs budget" look
+    # answerable for entries where it is not.
+    "risk_budget_dollars": "REAL",
     "initial_stop_loss": "REAL",
     "initial_risk_per_share": "REAL",
     "initial_risk_dollars": "REAL",
@@ -588,6 +597,8 @@ class TradeRecord:
     initial_stop_loss: float | None = None
     initial_risk_per_share: float | None = None
     initial_risk_dollars: float | None = None
+    # PLAN 11.54 — intended risk budget at sizing time.
+    risk_budget_dollars: float | None = None
     realized_pnl: float | None = None
     r_multiple: float | None = None
     entry_timestamp: str | None = None
@@ -1004,6 +1015,11 @@ class TradeLogger:
             initial_stop_loss=initial_stop_loss,
             initial_risk_per_share=initial_risk_per_share,
             initial_risk_dollars=initial_risk_dollars,
+            # PLAN 11.54 — the intended risk budget, recorded so
+            # "deployed risk as % of budget" stays answerable later.
+            # Duck-typed boundary (no risk.manager import here); legacy
+            # callers without the field record NULL, which is honest.
+            risk_budget_dollars=getattr(decision, "risk_budget_dollars", None),
             realized_pnl=None,
             r_multiple=None,
             entry_timestamp=now_iso,
@@ -1259,6 +1275,9 @@ class TradeLogger:
         "initial_stop_loss",
         "initial_risk_per_share",
         "initial_risk_dollars",
+        # PLAN 11.54 — set once at entry from the sizing decision; a
+        # later exit log() has no decision and would NULL it out.
+        "risk_budget_dollars",
         # Entry / exit timestamps anchor the trade-window math in
         # reporting/metrics.py and post_mortem analysis. Set-once at
         # the corresponding lifecycle event.
