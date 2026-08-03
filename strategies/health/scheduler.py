@@ -50,13 +50,16 @@ from __future__ import annotations
 
 import sqlite3
 from dataclasses import dataclass
-from datetime import date, datetime, timezone
-from typing import Callable
+from datetime import date, datetime, timedelta, timezone
+from typing import Callable, TYPE_CHECKING
 
 from loguru import logger
 
 from reporting.alerts import AlertDispatcher
 from strategies.health.reviewer import run_review, window_from_args
+
+if TYPE_CHECKING:  # pragma: no cover - import cycle guard
+    from reporting.pnl import PnLTracker
 
 
 # Monday in Python's weekday() is 0 (Monday=0, ..., Sunday=6). Firing
@@ -88,6 +91,17 @@ class HealthReviewScheduler:
     conn_factory: Callable[[], sqlite3.Connection]
     dispatcher: AlertDispatcher
     clock: Callable[[], datetime] = lambda: datetime.now(timezone.utc)
+    # Optional PnLTracker. When supplied, the Monday trigger also writes
+    # the weekly P&L digest, reusing this scheduler's proven once-per-day
+    # idempotency rather than standing up a second timer.
+    #
+    # `generate_weekly_report` existed since Phase 9 and was called from
+    # nothing but tests and phase9_verify — so in ~4 months of operation
+    # no weekly P&L report was ever written, and `logs/weekly_reports/`
+    # did not exist. Discovered 2026-08-03 when the operator went looking
+    # for it. Left optional so existing constructions (and tests) keep
+    # working without a tracker.
+    pnl_tracker: "PnLTracker | None" = None
     last_weekly_fired_date: date | None = None
     last_monthly_fired_date: date | None = None
 
@@ -127,7 +141,44 @@ class HealthReviewScheduler:
         )
         window = window_from_args("weekly", end_date=today)
         self._run(window)
+        self._maybe_write_weekly_pnl(today)
         self.last_weekly_fired_date = today
+
+    def _maybe_write_weekly_pnl(self, today: date) -> None:
+        """Write the weekly P&L digest alongside the health review.
+
+        `week_end` is **Sunday**, not today. The health review's window is
+        previous-Monday → this-Monday, but this hook fires *during*
+        Monday's session, so today's daily file is either absent or a
+        stub with zero trades. Ending on Sunday covers the fully
+        completed Mon→Sun week and never averages in a partial day.
+
+        Isolated in its own try/except: a P&L failure must not prevent
+        the health review from being recorded, and the reverse is
+        already guaranteed by `__call__`'s wrapper. Neither can reach
+        the trading loop.
+        """
+        if self.pnl_tracker is None:
+            return
+        week_end = today - timedelta(days=1)
+        try:
+            path = self.pnl_tracker.generate_weekly_report(
+                week_end=week_end.isoformat(),
+            )
+        except Exception as exc:  # noqa: BLE001
+            logger.warning(
+                f"weekly P&L report failed for week ending "
+                f"{week_end.isoformat()} (trading and health review "
+                f"unaffected): {exc}"
+            )
+            return
+        if path is None:
+            logger.info(
+                f"weekly P&L report: no daily summaries in the week "
+                f"ending {week_end.isoformat()} — nothing to aggregate"
+            )
+        else:
+            logger.info(f"weekly P&L report written: {path}")
 
     def _maybe_fire_monthly(self, today: date) -> None:
         # First of month only.

@@ -19,7 +19,7 @@ Covers:
 from __future__ import annotations
 
 import sqlite3
-from datetime import date, datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from unittest.mock import MagicMock
 
@@ -254,3 +254,93 @@ class TestFailureTolerance:
         )
         # Must NOT raise even though conn_factory fails.
         scheduler()
+
+
+class TestWeeklyPnLReport:
+    """The Monday trigger also writes the weekly P&L digest.
+
+    `PnLTracker.generate_weekly_report` had existed since Phase 9 and was
+    reachable only from tests and phase9_verify — so across ~4 months of
+    live operation no weekly P&L report was ever written and
+    `logs/weekly_reports/` did not exist. Found 2026-08-03 when the
+    operator went looking for a report that had never been produced.
+    """
+
+    def _tracker(self):
+        t = MagicMock()
+        t.generate_weekly_report.return_value = "logs/weekly_reports/w.md"
+        return t
+
+    def test_monday_writes_the_weekly_pnl_report(self, db_conn, mock_run_review):
+        tracker = self._tracker()
+        sched = HealthReviewScheduler(
+            conn_factory=lambda: db_conn, dispatcher=AlertDispatcher(),
+            clock=lambda: _MONDAY, pnl_tracker=tracker,
+        )
+        sched()
+        tracker.generate_weekly_report.assert_called_once()
+
+    def test_week_ends_sunday_not_the_firing_monday(self, db_conn, mock_run_review):
+        """The hook fires *during* Monday's session, so Monday's daily
+        file is absent or a zero-trade stub. Ending on Sunday covers the
+        fully completed Mon→Sun week and never averages in a partial day.
+        """
+        tracker = self._tracker()
+        sched = HealthReviewScheduler(
+            conn_factory=lambda: db_conn, dispatcher=AlertDispatcher(),
+            clock=lambda: _MONDAY, pnl_tracker=tracker,
+        )
+        sched()
+        sunday = (_MONDAY.date() - timedelta(days=1)).isoformat()
+        tracker.generate_weekly_report.assert_called_once_with(week_end=sunday)
+
+    def test_non_monday_writes_nothing(self, db_conn, mock_run_review):
+        tracker = self._tracker()
+        sched = HealthReviewScheduler(
+            conn_factory=lambda: db_conn, dispatcher=AlertDispatcher(),
+            clock=lambda: _MONDAY + timedelta(days=2), pnl_tracker=tracker,
+        )
+        sched()
+        tracker.generate_weekly_report.assert_not_called()
+
+    def test_fires_once_per_monday(self, db_conn, mock_run_review):
+        tracker = self._tracker()
+        sched = HealthReviewScheduler(
+            conn_factory=lambda: db_conn, dispatcher=AlertDispatcher(),
+            clock=lambda: _MONDAY, pnl_tracker=tracker,
+        )
+        sched(); sched(); sched()
+        assert tracker.generate_weekly_report.call_count == 1
+
+    def test_pnl_failure_does_not_block_the_health_review(
+        self, db_conn, mock_run_review,
+    ):
+        """Isolated failure domains — a broken P&L digest must not cost
+        you the health review, which is the higher-value artefact."""
+        tracker = self._tracker()
+        tracker.generate_weekly_report.side_effect = RuntimeError("disk full")
+        sched = HealthReviewScheduler(
+            conn_factory=lambda: db_conn, dispatcher=AlertDispatcher(),
+            clock=lambda: _MONDAY, pnl_tracker=tracker,
+        )
+        sched()   # must not raise
+        mock_run_review.assert_called_once()
+        assert sched.last_weekly_fired_date == _MONDAY.date()
+
+    def test_no_tracker_is_a_noop(self, db_conn, mock_run_review):
+        """Existing constructions without a tracker keep working."""
+        sched = _make_scheduler(db_conn, clock_value=_MONDAY)
+        sched()   # must not raise
+        mock_run_review.assert_called_once()
+
+    def test_no_daily_files_is_reported_not_raised(self, db_conn, mock_run_review):
+        """generate_weekly_report returns None when there is nothing to
+        aggregate; that is a log line, not a failure."""
+        tracker = self._tracker()
+        tracker.generate_weekly_report.return_value = None
+        sched = HealthReviewScheduler(
+            conn_factory=lambda: db_conn, dispatcher=AlertDispatcher(),
+            clock=lambda: _MONDAY, pnl_tracker=tracker,
+        )
+        sched()
+        assert sched.last_weekly_fired_date == _MONDAY.date()
