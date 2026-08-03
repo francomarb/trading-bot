@@ -30,6 +30,8 @@ from strategies.health.assessor import (
     HealthAssessor,
     HealthInputs,
     _classify,
+    _l2_checks,
+    _stop_gap_stats,
     _worst,
     load_engine_state,
 )
@@ -846,3 +848,107 @@ class TestAdverseOnlySlippageSemantics:
         )
         assert slip.numeric_value == pytest.approx(0.0)
         assert slip.status == HealthStatus.HEALTHY
+
+
+def _seed_stop_fill(
+    conn: sqlite3.Connection,
+    *,
+    strategy: str,
+    timestamp: str,
+    symbol: str = "AAPL",
+    trigger: float = 320.74,
+    fill: float = 305.02,
+    qty: float = 13.0,
+    adverse_bps: float | None = 490.1,
+) -> None:
+    """Seed a stop fill as `log_stop_fill` writes one (PLAN 11.49)."""
+    conn.execute(
+        "INSERT INTO trades ("
+        "timestamp, symbol, side, qty, avg_fill_price, order_id, "
+        "strategy, reason, stop_price, entry_reference_price, "
+        "stop_trigger_price, slippage_adverse_bps, "
+        "slippage_benchmark_kind, slippage_measurement_quality, "
+        "order_type, status, requested_qty, filled_qty"
+        ") VALUES (?, ?, 'sell', ?, ?, ?, ?, 'stop_triggered', "
+        "0.0, 0.0, ?, ?, 'active_stop_price', 'primary', 'stop', "
+        "'filled', ?, ?)",
+        (timestamp, symbol, qty, fill, f"stop-{timestamp}-{symbol}",
+         strategy, trigger, adverse_bps, qty, qty),
+    )
+    conn.commit()
+
+
+class TestStopGapErosion:
+    """PLAN 11.49 — stop-gap is measured on every stop fill and was
+    reported nowhere. It is reported, never alarmed: a large value means
+    the market gapped through the level, not that anything is broken.
+    """
+
+    WINDOW = (date(2026, 1, 1), date(2026, 12, 31))
+
+    def test_none_when_no_stop_fills(self, db_conn):
+        assert _stop_gap_stats(db_conn, "donchian_breakout", *self.WINDOW) is None
+
+    def test_dollars_are_trigger_minus_fill_times_qty(self, db_conn):
+        """The AAPL 2026-07-31 case: stop at 320.74, opened at 304.81,
+        filled 305.02 on 13 shares."""
+        _seed_stop_fill(db_conn, strategy="donchian_breakout",
+                        timestamp="2026-07-31T13:32:27+00:00")
+        g = _stop_gap_stats(db_conn, "donchian_breakout", *self.WINDOW)
+        assert g["max_dollars"] == pytest.approx((320.74 - 305.02) * 13, abs=0.01)
+        assert g["total_dollars"] == pytest.approx(204.36, abs=0.01)
+
+    def test_options_get_the_contract_multiplier(self, db_conn):
+        _seed_stop_fill(db_conn, strategy="spy_options_reversion",
+                        timestamp="2026-07-01T14:00:00+00:00",
+                        symbol="SPY260717C00730000",
+                        trigger=19.20, fill=18.72, qty=2.0, adverse_bps=250.0)
+        g = _stop_gap_stats(db_conn, "spy_options_reversion", *self.WINDOW)
+        # 0.48 x 2 contracts x 100
+        assert g["total_dollars"] == pytest.approx(96.0, abs=0.01)
+
+    def test_median_and_max_not_p95(self, db_conn):
+        """Donchian's real shape: three small fills and one gap event. A
+        p95 at n=4 IS the max, which would read as a crisis until the gap
+        rolled out of the window. Median must stay near the typical fill.
+        """
+        for i, bps in enumerate([10.3, 11.3, 18.9, 490.1]):
+            _seed_stop_fill(db_conn, strategy="donchian_breakout",
+                            timestamp=f"2026-06-0{i+1}T14:00:00+00:00",
+                            symbol=f"SYM{i}", adverse_bps=bps)
+        g = _stop_gap_stats(db_conn, "donchian_breakout", *self.WINDOW)
+        assert g["median_bps"] == pytest.approx(15.1, abs=0.1)
+        assert g["max_bps"] == pytest.approx(490.1)
+        assert g["median_bps"] < g["max_bps"] / 10
+
+    def test_fill_better_than_trigger_contributes_zero(self, db_conn):
+        """Adverse-only, matching slippage_adverse_bps. A favourable fill
+        must not net away a real gap elsewhere in the window."""
+        _seed_stop_fill(db_conn, strategy="donchian_breakout",
+                        timestamp="2026-06-12T14:00:00+00:00",
+                        symbol="GOOD", trigger=19.55, fill=23.00,
+                        qty=2.0, adverse_bps=0.0)
+        g = _stop_gap_stats(db_conn, "donchian_breakout", *self.WINDOW)
+        assert g["total_dollars"] == pytest.approx(0.0)
+
+    def test_l2_line_is_informational_and_never_alarms(self, db_conn):
+        """The design decision: this line must not be able to move a
+        strategy's Health verdict, however large the gap."""
+        _seed_stop_fill(db_conn, strategy="donchian_breakout",
+                        timestamp="2026-07-31T13:32:27+00:00",
+                        adverse_bps=99_999.0)
+        checks = _l2_checks("donchian_breakout", db_conn, *self.WINDOW)
+        line = [c for c in checks if c.name == "stop_gap_erosion"]
+        assert len(line) == 1
+        assert line[0].status is HealthStatus.HEALTHY
+        assert "204" in " ".join(line[0].findings)
+
+    def test_does_not_contaminate_the_execution_quality_check(self, db_conn):
+        """The two families stay independent — merging them is the defect
+        PR #84 removed."""
+        _seed_stop_fill(db_conn, strategy="donchian_breakout",
+                        timestamp="2026-07-31T13:32:27+00:00")
+        checks = _l2_checks("donchian_breakout", db_conn, *self.WINDOW)
+        exec_q = [c for c in checks
+                  if c.name == "slippage_realized_vs_modeled_bps_p95"][0]
+        assert exec_q.numeric_value is None
