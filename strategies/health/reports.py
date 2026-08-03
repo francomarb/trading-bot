@@ -140,6 +140,15 @@ class CheckResult:
     numeric_value: float | None = None
     threshold_breached: str = ""
     findings: tuple[str, ...] = field(default_factory=tuple)
+    # PLAN 11.49 — a measurement reported for context, never classified
+    # against thresholds. Stop-gap erosion is the first: a large value
+    # means the market gapped through the stop level, not that anything
+    # is broken, so alarming on it would state a fact about the market as
+    # a system fault. Such checks carry status HEALTHY so they can never
+    # move a verdict — which means the renderer's "only show non-HEALTHY"
+    # filter would otherwise hide them entirely. This flag is what makes
+    # them visible without making them alarms.
+    informational: bool = False
 
     def __post_init__(self) -> None:
         if self.layer is Layer.L3 and self.status is HealthStatus.BROKEN:

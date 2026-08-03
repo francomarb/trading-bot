@@ -321,7 +321,8 @@ def _l2_checks(
         out.append(CheckResult(
             name="stop_gap_erosion",
             layer=Layer.L2,
-            status=HealthStatus.HEALTHY,   # informational — never alarms
+            status=HealthStatus.HEALTHY,   # never alarms
+            informational=True,            # ...and so must be rendered anyway
             numeric_value=gap["max_dollars"],
             findings=bits or ["stop fills recorded but no usable measurement"],
         ))

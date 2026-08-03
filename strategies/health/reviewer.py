@@ -627,8 +627,14 @@ def _strategy_detail_section(bundle: AssessmentBundle) -> list[str]:
     # Only surface checks that aren't HEALTHY — keeps the section
     # short. A HealthReport with all HEALTHY checks shows only the
     # overall line, no table.
+    #
+    # Informational checks (PLAN 11.49) are excluded here and rendered in
+    # their own block below. They are deliberately always HEALTHY so they
+    # cannot move a verdict, which means this filter would otherwise hide
+    # them completely — the exact failure this split exists to prevent.
     non_healthy_checks = [
-        c for c in health.checks if c.status != HealthStatus.HEALTHY
+        c for c in health.checks
+        if c.status != HealthStatus.HEALTHY and not c.informational
     ]
     if non_healthy_checks:
         lines += [
@@ -646,6 +652,23 @@ def _strategy_detail_section(bundle: AssessmentBundle) -> list[str]:
         lines.append("")
     else:
         lines += ["All L1/L2/L3 checks passing.", ""]
+
+    # Informational measurements — reported for context, never alarmed.
+    # Rendered regardless of status, and only when they have something to
+    # say, so a strategy with no stop fills doesn't grow an empty block.
+    informational = [
+        c for c in health.checks
+        if c.informational and c.findings
+        and c.findings != ("no observations in window",)
+    ]
+    if informational:
+        lines += [
+            "**Context (not scored):**",
+            "",
+        ]
+        for c in informational:
+            lines.append(f"- {c.name}: {'; '.join(c.findings)}")
+        lines.append("")
 
     return lines
 
