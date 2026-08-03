@@ -140,9 +140,30 @@ class HealthReviewScheduler:
             f"completed week ending {today.isoformat()}"
         )
         window = window_from_args("weekly", end_date=today)
-        self._run(window)
+        # Both Monday artefacts are attempted independently. `_run` does
+        # not catch its own failures, so without this the health review
+        # raising (a bad conn, a reviewer bug) would propagate to
+        # `__call__` and silently skip the P&L digest entirely — the
+        # isolation was one-directional and the weaker direction was the
+        # one that mattered, since the P&L write is the newer path.
+        health_ok = True
+        try:
+            self._run(window)
+        except Exception as exc:  # noqa: BLE001
+            health_ok = False
+            logger.warning(
+                f"weekly health review failed for week ending "
+                f"{today.isoformat()} (trading unaffected; weekly P&L "
+                f"digest still attempted): {exc}"
+            )
         self._maybe_write_weekly_pnl(today)
+        # Mark fired regardless: retrying on the next cycle would re-run
+        # whichever half succeeded, and both writers are already
+        # idempotent-by-overwrite. A failure is logged, not retried in a
+        # loop that fires every cycle for the rest of the day.
         self.last_weekly_fired_date = today
+        if not health_ok:
+            return
 
     def _maybe_write_weekly_pnl(self, today: date) -> None:
         """Write the weekly P&L digest alongside the health review.

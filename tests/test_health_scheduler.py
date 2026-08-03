@@ -344,3 +344,61 @@ class TestWeeklyPnLReport:
         )
         sched()
         assert sched.last_weekly_fired_date == _MONDAY.date()
+
+
+class TestWeeklyFailureIsolationIsTwoWay:
+    """Review finding: the isolation was one-directional.
+
+    `_run` does not catch its own failures, so a health-review error
+    propagated to `__call__` and the weekly P&L digest was silently
+    skipped — the weaker direction was the one that mattered, since the
+    P&L write is the newer and less-exercised path.
+    """
+
+    def _sched(self, db_conn, tracker, *, conn_factory=None):
+        return HealthReviewScheduler(
+            conn_factory=conn_factory or (lambda: db_conn),
+            dispatcher=AlertDispatcher(),
+            clock=lambda: _MONDAY,
+            pnl_tracker=tracker,
+        )
+
+    def test_health_failure_still_writes_the_pnl_digest(self, db_conn):
+        def _boom():
+            raise RuntimeError("db down")
+        tracker = MagicMock()
+        sched = self._sched(db_conn, tracker, conn_factory=_boom)
+        sched()   # must not raise
+        tracker.generate_weekly_report.assert_called_once()
+
+    def test_health_failure_still_marks_the_day_fired(self, db_conn):
+        """Otherwise the hook retries on every cycle for the rest of the
+        day, re-running whichever half succeeded."""
+        def _boom():
+            raise RuntimeError("db down")
+        tracker = MagicMock()
+        sched = self._sched(db_conn, tracker, conn_factory=_boom)
+        sched()
+        assert sched.last_weekly_fired_date == _MONDAY.date()
+        sched()
+        assert tracker.generate_weekly_report.call_count == 1
+
+    def test_pnl_failure_still_runs_the_health_review(
+        self, db_conn, mock_run_review,
+    ):
+        """The direction that already worked — pinned so a refactor
+        cannot quietly reintroduce the asymmetry."""
+        tracker = MagicMock()
+        tracker.generate_weekly_report.side_effect = RuntimeError("disk full")
+        sched = self._sched(db_conn, tracker)
+        sched()
+        mock_run_review.assert_called_once()
+
+    def test_both_failing_is_survivable(self, db_conn):
+        def _boom():
+            raise RuntimeError("db down")
+        tracker = MagicMock()
+        tracker.generate_weekly_report.side_effect = RuntimeError("disk full")
+        sched = self._sched(db_conn, tracker, conn_factory=_boom)
+        sched()   # must not raise into the trading loop
+        assert sched.last_weekly_fired_date == _MONDAY.date()
