@@ -3,7 +3,7 @@
 **Status:** Living document. Audit findings, completed experiments, and
 ranked optimization opportunities for the SMA crossover sleeve.
 
-**Last updated:** 2026-06-06
+**Last updated:** 2026-08-04
 
 For the strategy specification (signal logic, deployment configuration,
 filter stack, methodology), see
@@ -180,6 +180,69 @@ $32 of baseline, but that was comparing winner-only sums. On the full
 that briefly popped above +150% never had a chance to roll into the
 catastrophic ones.
 
+### 4. Partial scale-out (sell a fraction, ride the rest)
+
+**Added 2026-08-04.** Distinct from §3: a fixed-% take-profit exits the
+*whole* position at the target; a scale-out sells `fraction` and lets the
+remainder run to the unchanged death-cross / disaster-stop exit. The
+residual keeps the original stop level. Policy: `scale_out` in
+`scripts/sma_giveback_audit.py`.
+
+> **Feed note.** This section was produced on **SIP**
+> (`settings.BACKTEST_DATA_FEED`, flipped from `iex` after §1–§3 were
+> written). The baseline shifts accordingly — 736 entries / $8,654 on the
+> pinned universe, versus the 571 / $8,277 in §1–§3 above. Compare Δ-vs-
+> baseline columns across sections, never absolute dollars.
+
+Pinned 40-name universe (736 entries, baseline **$8,654**):
+
+| Policy | Net P&L | Δ vs baseline | Win rate |
+|---|---|---|---|
+| scale-out 33% @ +150% | $7,874 | **−$779 (−9%)** | 36.0% |
+| scale-out 33% @ +125% | $7,787 | −$867 (−10%) | 36.1% |
+| scale-out 33% @ +100% | $7,666 | −$988 (−11%) | 36.3% |
+| scale-out 50% @ +125% | $7,340 | −$1,313 (−15%) | 36.1% |
+| scale-out 50% @ +100% | $7,157 | −$1,496 (−17%) | 36.3% |
+| *(reference)* take-profit +100% | $5,661 | −$2,992 (−35%) | 36.3% |
+
+Current 50-name watchlist (944 entries, baseline **$9,786**) reproduces
+it: 33%@+150% −$800 (−8%), 33%@+125% −$907 (−9%), 50%@+125% −$1,374
+(−14%), take-profit +100% −$3,245 (−33%).
+
+**Verdict: still loses, but it is the cheapest tail-capping rule tested.**
+Best case −8%. Two findings worth keeping:
+
+1. **It never touches losers.** Win rate moves 36.1% → 36.1–36.4% across
+   every variant, because a +100%-plus trigger only fires on trades that
+   have already more than doubled. That is the structural difference from
+   §1–§2, where trails cut losers early and *raise* win rate while
+   destroying the runners.
+2. **Partial is ~4× cheaper than full at the same threshold.** −9% for a
+   33% scale-out vs −33% for a full take-profit at +100%. The
+   "caps only part of the tail" mechanism is real — it reduces the damage
+   rather than removing it, roughly in proportion to the fraction sold.
+
+This refines the §3 note that a take-profit is *"defensible only as a
+behavioral 'sleep well' rule at +150%"*: a **partial** version of that
+rule costs ~8% rather than the ~28% measured for a full exit. Cheaper
+than previously priced — still a cost, not a gain.
+
+**What this run does NOT settle.** It measures net P&L, win rate and
+average trade, not return *per unit of risk*. A scale-out mechanically
+lowers per-trade dispersion (half the position stops compounding at the
+trigger), so a risk-adjusted framing could rank it differently. That is
+the only open door here, and it needs a harness that reports volatility.
+
+**Origin and a process warning.** This was proposed as PLAN `11.55` off a
+separate 740-trade sweep that showed the opposite result — +125% sell-half
+appearing to *beat* baseline on risk-adjusted terms. That sweep had **no
+protective stop**: its baseline was death-cross-only, so losers ran
+unbounded, the baseline looked worse than production actually is, and
+capping the tail appeared to win. Modelling the 2×ATR stop reversed the
+conclusion and `11.55` was retracted. **Any exit-policy claim about this
+strategy must model the disaster stop** — it is what makes the baseline
+strong.
+
 ### Behavioral observation worth flagging
 
 Look at the **win rate** column. Tight take-profits push win rate from
@@ -195,6 +258,10 @@ sliced.
 - ❌ **Adding a fixed-% take-profit** (defensible only as a behavioral
   "sleep well" rule at +150%, where the cost is near-zero but so is the
   benefit).
+- ❌ **Partial scale-out at a high trigger** (§4, added 2026-08-04) — the
+  cheapest tail-capping rule tested at −8%, and ~4× cheaper than a full
+  take-profit, but still negative. Re-open **only** with a risk-adjusted
+  harness; net-P&L evidence is settled.
 - ❌ **Faster MA exits** (e.g., close below 20 EMA) — same failure mode
   as the trails.
 - ❌ **Adding more entry signals on top of crossover** — dilutes the
@@ -317,6 +384,9 @@ be unsupportable on methodology, and reverted before merge.
 | 2026-06-06 | Restructured audit script to a **unified policy comparison** | Earlier version simulated alternative exits only on death-cross winners — selection-biased. New version replays every entry under each *complete* policy; aggregate net P&L is the comparison metric. Headline numbers in this doc updated accordingly. |
 | 2026-06-06 | Pinned audit universe (`AUDIT_UNIVERSE` constant in script) | Earlier version read `settings.SMA_WATCHLIST` and would silently drift. Now the documented numbers reproduce exactly via `--universe audit` (default). |
 | 2026-06-06 | Entry-bar stop/take-profit honored | Reviewer identified that simulation skipped the entry bar entirely. Production's OTO stop attaches as soon as the parent fills at the open, so the stop can trigger same-day. Loops now check stops + take-profits starting at `entry_idx`; the death-cross check still starts at `entry_idx + 1` (a same-bar cross would only be observed by production on the next engine cycle). Per-symbol numbers shifted: **INTC turned out to be net-positive (+$46) under the corrected policy**, validating the reviewer's broader point that the original cull was not supported by the data. Negative-net names reduced from 6 to 5. |
+| 2026-08-04 | Added **§4 partial scale-out** and a `scale_out` policy to the audit script | PLAN `11.55` proposed a +125% sell-half rule off a separate sweep that had **no protective stop** — its baseline was death-cross-only, so losers ran unbounded and tail-capping appeared to win. Re-run inside this harness with the 2×ATR stop modelled: every scale-out variant loses (best −8%). `11.55` retracted. Findings kept: the rule never touches losers, and partial is ~4× cheaper than a full take-profit. |
+| 2026-08-04 | Fixed `--universe current`, which had **never worked** | A redundant local `from config import settings` inside `main()` shadowed the module-level import, so the `current` branch raised `UnboundLocalError` on every invocation. This doc had been telling readers to use that flag. |
+| 2026-08-04 | Feed is now **SIP**, not IEX | `settings.BACKTEST_DATA_FEED` was flipped after §1–§3 were written. Baseline moves 571 entries / $8,277 → 736 / $8,654 on the pinned universe. Qualitative conclusions unchanged; compare Δ-vs-baseline across sections, never absolute dollars. The run header prints the feed — record it with any quoted result. |
 | 2026-06-06 | Per-symbol output added to `scripts/sma_giveback_audit.py` | Profit-concentration section in this doc is now reproducible by running the audit — addresses reviewer's "script emits no per-symbol P&L table" finding. |
 
 ---
@@ -324,15 +394,25 @@ be unsupportable on methodology, and reverted before merge.
 ## Reproducing the audit
 
 ```bash
-# Full audit (giveback distribution + chandelier + gated trail + take-profit overlays)
-venv/bin/python -m scripts.sma_giveback_audit
+# Full audit — giveback distribution + chandelier + gated trail
+# + take-profit + partial scale-out overlays, on the pinned universe
+# that §1–§4 numbers come from.
+venv/bin/python -m scripts.sma_giveback_audit --universe audit
 
-# Per-symbol P&L breakdown (used for chronic-loser identification)
-# — embedded in the script's symbol loop; see `simulate_symbol()` returns.
+# Same policies against the live production watchlist. Numbers will NOT
+# match this doc — the watchlist drifts. Use it to check a conclusion
+# still holds, not to reproduce a figure.
+venv/bin/python -m scripts.sma_giveback_audit --universe current
 ```
 
-Both run offline once the IEX daily cache is warm (~1 minute end-to-end).
-No live API calls beyond cache top-up.
+`--universe audit` is the default and is what every number in this doc
+reproduces. Runs offline once the daily cache is warm (~1 minute
+end-to-end); no live API calls beyond cache top-up.
+
+**Read the run header before quoting any result.** It prints the feed,
+window and universe. §1–§3 are IEX-era; §4 is SIP. The baseline moved
+between them, so a raw dollar figure from one section is not comparable
+to another — the Δ-vs-baseline column is.
 
 ## Related docs
 
