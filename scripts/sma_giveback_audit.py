@@ -1,7 +1,13 @@
 """
 SMA Crossover audit — replays every 20/50 SMA round trip on daily Alpaca
-IEX bars and compares full exit policies (baseline death-cross+ATR stop vs
+bars and compares full exit policies (baseline death-cross+ATR stop vs
 alternative exits) on an apples-to-apples basis.
+
+**Feed:** read from `settings.BACKTEST_DATA_FEED` (currently `sip`). The
+2026-06-06 numbers in `docs/sma_crossover_optimizations.md` were produced
+when that default was `iex`; re-running today on SIP will not reproduce
+them exactly. Feed is printed in the run header — record it with any
+result you quote.
 
 Methodology notes (reviewed against ChatGPT P1 feedback 2026-06-06)
 ------------------------------------------------------------------
@@ -66,6 +72,12 @@ ATR_LEN = 14
 ATR_STOP_MULT = 2.0
 TRAIL_KS = (2.5, 3.0, 3.5)
 PROFIT_TARGETS_PCT = (0.10, 0.20, 0.30, 0.50, 0.75, 1.00, 1.50)
+
+# PLAN 11.55 — partial scale-out grid. Triggers overlap PROFIT_TARGETS_PCT
+# on purpose so take-profit (full exit) and scale-out (partial) can be read
+# side by side at the same threshold.
+SCALE_OUT_TRIGGERS_PCT: tuple[float, ...] = (0.75, 1.00, 1.25, 1.50)
+SCALE_OUT_FRACTIONS: tuple[float, ...] = (0.33, 0.50)
 
 # Profit-gated trail grid: activation threshold (in ATR units of unrealized
 # profit) × trail distance (in ATR units below HWM).
@@ -398,6 +410,78 @@ def _policy_take_profit(
     return (n - 1, bars.closes[n - 1], "eod", hwm_close, hwm_idx)
 
 
+def _policy_scale_out(
+    bars: _BarsView, entry_idx: int, trigger_pct: float, fraction: float
+) -> tuple[int, float, str, float, int]:
+    """
+    Death-cross + 2.0×ATR disaster + PARTIAL scale-out at
+    entry × (1 + trigger_pct); the remainder rides to the unchanged
+    death-cross/disaster exit.
+
+    This is deliberately NOT `_policy_take_profit`. That policy exits the
+    whole position at the target and was ruled out at every threshold
+    (docs/sma_crossover_optimizations.md, "Completed experiments"). This
+    one sells `fraction` and keeps the rest, so it caps only part of the
+    tail. The comparison against take_profit at the same threshold is the
+    point of the policy — if it lands on top of take_profit, the partial
+    structure buys nothing and PLAN 11.55 should be retracted.
+
+    Returned `exit_price` is the BLENDED per-share proceeds
+    (`fraction × scale_price + (1 − fraction) × final_price`), so
+    `Trade.pnl` stays per-share-comparable with every other policy.
+    `exit_idx` is the FINAL exit — the position is not flat until the
+    remainder closes, so overlap suppression stays correct.
+
+    Conventions match the sibling policies exactly: disaster stop checked
+    first (pessimistic intrabar ordering — if the stop and the trigger
+    could both hit on one bar, the stop wins); the scale-out may fire on
+    the entry bar; the residual keeps the ORIGINAL stop level, matching
+    the production design where the replacement stop is placed at the
+    original price.
+
+    Daily-bar intrabar fill at the trigger is the same assumption
+    `_policy_take_profit` makes. A separate 5-min cycle-fill parity study
+    (PLAN 11.55) found this roughly neutral in aggregate: live fills ran
+    ~94 bps BETTER than an at-trigger fill because a 300s poll waits for a
+    bar to close above the level, offset by ~11% of touches never being
+    observed at all (wick-only). Do not read this policy's fills as exact.
+    """
+    entry_price = bars.opens[entry_idx]
+    entry_atr = bars.atr[entry_idx - 1]
+    disaster_stop = entry_price - ATR_STOP_MULT * entry_atr
+    target_price = entry_price * (1.0 + trigger_pct)
+    hwm_close = bars.closes[entry_idx]
+    hwm_idx = entry_idx
+    n = len(bars.closes)
+
+    scaled_at: float | None = None
+
+    def _blend(final_price: float) -> float:
+        if scaled_at is None:
+            return final_price
+        return fraction * scaled_at + (1.0 - fraction) * final_price
+
+    def _reason(base: str) -> str:
+        return f"scaled+{base}" if scaled_at is not None else base
+
+    for i in range(entry_idx, n):
+        if bars.lows[i] <= disaster_stop:
+            fill = _fill_through_stop(bars.lows[i], disaster_stop)
+            return (i, _blend(fill), _reason("atr_stop"), hwm_close, hwm_idx)
+        if scaled_at is None and bars.highs[i] >= target_price:
+            scaled_at = target_price
+        if bars.closes[i] > hwm_close:
+            hwm_close = bars.closes[i]
+            hwm_idx = i
+        if i > entry_idx and (
+            bars.fast[i] < bars.slow[i] and bars.fast[i - 1] >= bars.slow[i - 1]
+        ) and i + 1 < n:
+            return (i + 1, _blend(bars.opens[i + 1]),
+                    _reason("death_cross"), hwm_close, hwm_idx)
+
+    return (n - 1, _blend(bars.closes[n - 1]), _reason("eod"), hwm_close, hwm_idx)
+
+
 # ── Per-symbol simulator ────────────────────────────────────────────────────
 
 
@@ -408,7 +492,8 @@ def simulate_symbol(
     """
     Walk every 20/50 round trip in df under the named exit policy.
 
-    policy_name in {"baseline", "chandelier", "gated", "take_profit"}.
+    policy_name in {"baseline", "chandelier", "gated", "take_profit",
+    "scale_out"}.
     policy_args is positional args for the policy beyond (bars, entry_idx).
     """
     bars = _prepare_bars(df)
@@ -420,6 +505,7 @@ def simulate_symbol(
         "chandelier":   _policy_chandelier,
         "gated":        _policy_gated_trail,
         "take_profit":  _policy_take_profit,
+        "scale_out":    _policy_scale_out,
     }[policy_name]
 
     trades: list[Trade] = []
@@ -520,7 +606,11 @@ def main(argv: list[str] | None = None) -> int:
           f"window={start.date()} → {end.date()}", file=sys.stderr)
 
     # Fetch all symbols once; rerun every policy on the same cached bars.
-    from config import settings
+    # NOTE: `settings` is imported at module scope. A redundant local
+    # `from config import settings` used to live here, which made
+    # `settings` a local name for the whole function and turned the
+    # `--universe current` branch above into an UnboundLocalError —
+    # that option had never worked.
     backtest_feed = settings.BACKTEST_DATA_FEED
     bar_cache: dict[str, pd.DataFrame] = {}
     for sym in symbols:
@@ -549,6 +639,17 @@ def main(argv: list[str] | None = None) -> int:
         )
     for tgt in PROFIT_TARGETS_PCT:
         policies.append((f"take-profit +{int(tgt*100)}%", "take_profit", (tgt,)))
+    # PLAN 11.55 — PARTIAL scale-out. Paired deliberately with the
+    # take-profit rows above at the SAME thresholds: take-profit exits the
+    # whole position, scale-out sells `frac` and rides the rest to the
+    # unchanged death cross. If the two columns land together, the partial
+    # structure buys nothing and 11.55 should be retracted.
+    for tgt in SCALE_OUT_TRIGGERS_PCT:
+        for frac in SCALE_OUT_FRACTIONS:
+            policies.append((
+                f"scale-out {int(frac*100)}% @ +{int(tgt*100)}%",
+                "scale_out", (tgt, frac),
+            ))
 
     results: list[PolicyResult] = []
     for label, name, pargs in policies:
