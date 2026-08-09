@@ -57,8 +57,8 @@ compensate for the higher underlying price).
 | `dte_min` | 30 | 30 | Earliest entry expiry |
 | `dte_max` | 45 | 45 | Latest entry expiry |
 | `trend_sma_buffer_pct` | 0.00 | 0.01 | QQQ requires close > 50 SMA by 1%; SPY keeps the original close > 50 SMA gate |
-| `iv_proxy_source` | `vix` | `vix` | ⚠️ "QQQ tracks SPX vol closely enough" is the assumption under audit in PLAN 11.57 — measured QQQ spread vol runs above VIX. Note `iv` feeds **only** the Black-Scholes delta estimate; the credit itself is quote-derived |
-| `min_iv_proxy` | 14 | 14 | VIX must be ≥ 14 for entry (premium floor) |
+| `iv_proxy_source` | `vix` | **`vxn`** | QQQ moved to the Nasdaq-100 vol index 2026-08-09 (PLAN 11.57). "QQQ tracks SPX vol closely enough" was disproved by the live trades — see below |
+| `min_iv_proxy` | 14 | **17** | Premium floor, in the units of each instrument's own index. Rescaled with the source: VXN averaged 1.24× VIX over 2016-2026, so 14→17 preserves the gate rather than loosening it |
 | `min_credit_pct_of_width` | 0.13 | 0.13 | Credit ≥ 13% of spread width |
 | `max_concurrent_positions` | **1** | **1** | Per-instance cap. Throttled from 3 on 2026-08-09 (PLAN 11.57); the global cap of 1 binds first |
 | `max_per_expiration` | 1 | 1 | One spread per expiry, per underlying |
@@ -142,6 +142,44 @@ QQQ averaged 17.8% of width against SPY's 14.7% while targeting a
 *lower* nominal delta on a *wider* spread — where credit/width should
 fall, not rise. The signal was in the watch list from day one and was
 never read comparatively.
+
+### Why QQQ prices risk off VXN, not VIX (PLAN 11.57)
+
+Measured on the **ten live QQQ credit spreads**, not simulated:
+
+| | strikes sold | own realized vol | **cushion** | wins | P&L |
+|---|---|---|---|---|---|
+| SPY | 4.44% OTM | 10.6% | **1.09 σ** | 2/3 | −$2 |
+| QQQ | 4.61% OTM | 23.0% | **0.55 σ** | 2/10 | −$1,932 |
+
+Both sold at essentially the same *percentage* distance. QQQ's own
+volatility was more than double, so that distance bought **half the
+protection**. Sorted by cushion the outcome is near-monotonic: **every
+QQQ trade below 0.6σ lost — six for six**, and both winners were the two
+widest cushions (0.79σ, 0.66σ).
+
+**Why nobody could see it.** Across those same trades QQQ's realized vol
+ran **16% → 30%** while **VIX fell 18.4 → 15.0**. The bot measured QQQ's
+risk with SPX's volatility, so while QQQ was becoming twice as dangerous
+its own risk numbers said conditions were calming. Every delta it
+computed — and therefore every strike it chose — drifted toward more risk
+while reporting less.
+
+**This is also why PR #80 could not work.** Its diagnosis ("QQQ entries
+are not high-quality enough") was right, and its lever moved the strikes
+out as intended — 4.53% → 4.96% OTM. But the cushion still *fell*,
+0.58σ → 0.44σ, because QQQ's vol was rising faster than the strikes were
+moving. It turned the right dial, in the right direction, in a currency
+that was lying to it.
+
+`min_iv_proxy` was rescaled 14 → 17 alongside the source, since 14 was a
+VIX level and VXN runs ~1.24× VIX; leaving it would have loosened the
+premium gate rather than preserving it.
+
+**What to watch:** with a correct vol input the picker should select
+strikes near ~1σ of cushion rather than ~0.55σ. That is directly visible
+in the `credit_spread_pick` events below — `est_short_delta_at_live_spot`
+should now track `target_short_delta`.
 
 ### Pick-time instrumentation (`credit_spread_pick`, PLAN 11.57)
 

@@ -844,3 +844,67 @@ class TestSelectionSpot:
         # est_short_delta_at_live_spot is computed at the live spot too,
         # so with selection now on that spot the two agree by construction.
         assert event["spot_used"] == pytest.approx(event["spot_live"])
+
+
+class TestQqqVolProxy:
+    """PLAN 11.57 — QQQ risk must be measured against QQQ's volatility.
+
+    Measured across the ten live QQQ credit spreads: QQQ sold 4.61% OTM
+    against SPY's 4.44% — nearly the same distance — but carried only
+    0.55 sigma of cushion against SPY's 1.09, because QQQ's realized vol
+    was 23.0% against SPY's 10.6%. Over the same trades VIX fell
+    18.4 -> 15.0 while QQQ vol ran 16% -> 30%.
+    """
+
+    def test_qqq_prices_risk_off_the_nasdaq_vol_index(self):
+        from config.settings import CREDIT_SPREAD_INSTRUMENTS
+
+        assert CREDIT_SPREAD_INSTRUMENTS["QQQ"]["iv_proxy_source"] == "vxn"
+
+    def test_spy_still_uses_vix(self):
+        """VIX is the correct index for SPY; only QQQ was mismatched."""
+        from config.settings import CREDIT_SPREAD_INSTRUMENTS
+
+        assert CREDIT_SPREAD_INSTRUMENTS["SPY"]["iv_proxy_source"] == "vix"
+
+    def test_min_iv_proxy_was_rescaled_with_the_source(self):
+        """14 was a VIX level. VXN averaged ~1.24x VIX over 2016-2026, so
+        leaving 14 in place would have quietly loosened the premium gate
+        rather than preserving it."""
+        from config.settings import CREDIT_SPREAD_INSTRUMENTS
+
+        spy = CREDIT_SPREAD_INSTRUMENTS["SPY"]
+        qqq = CREDIT_SPREAD_INSTRUMENTS["QQQ"]
+        assert spy["min_iv_proxy"] == 14
+        assert qqq["min_iv_proxy"] == 17
+        assert qqq["min_iv_proxy"] / spy["min_iv_proxy"] == pytest.approx(1.21, abs=0.05)
+
+    def test_every_configured_source_is_resolvable(self):
+        """A source name that the resolver does not know would raise at the
+        first trade, not at import."""
+        from config.settings import CREDIT_SPREAD_INSTRUMENTS
+        from utils.iv_proxy import is_valid_source
+
+        for sym, cfg in CREDIT_SPREAD_INSTRUMENTS.items():
+            assert is_valid_source(cfg["iv_proxy_source"]), sym
+
+    def test_the_strategy_asks_its_resolver_for_the_configured_source(self):
+        """Wiring check: the config value must actually reach resolve()."""
+        asked: list[str] = []
+
+        class _Spy(IVProxyResolver):
+            def resolve(self, source):           # type: ignore[override]
+                asked.append(source)
+                return 22.0
+
+        strat = CreditSpread(
+            _config("QQQ", iv_proxy_source="vxn", spread_width=15),
+            iv_resolver=_Spy(fetch_fn=lambda t: None),
+            quote_lookup=_stub_quotes,
+        )
+        with patch(
+            "strategies.credit_spread.find_best_put_spread",
+            return_value=_pick(expiration=date.today() + timedelta(days=37)),
+        ), patch("data.fetcher.fetch_latest_quote_midpoint", return_value=740.0):
+            strat.build_spread_execution(745.0, notional_cap=2_000.0)
+        assert asked == ["vxn"]

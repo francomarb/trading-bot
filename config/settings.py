@@ -761,8 +761,18 @@ CREDIT_SPREAD_INSTRUMENTS: dict[str, dict] = {
         "dte_min": 30,
         "dte_max": 45,
         "trend_sma_buffer_pct": 0.01,
-        "iv_proxy_source": "vix",           # QQQ tracks SPX closely
-        "min_iv_proxy": 14,
+        # 11.57: was "vix" on the assumption that QQQ tracks SPX closely
+        # enough. The ten live QQQ spreads disproved it — QQQ realized vol
+        # ran 16%→30% across them while VIX FELL 18.4→15.0, so the picker's
+        # risk numbers moved opposite to the risk. Measured on those trades,
+        # QQQ sold 4.61% OTM against SPY's 4.44% — nearly the same distance
+        # — but only 0.55 sigma of cushion against SPY's 1.09, because QQQ's
+        # own vol was 23.0% against SPY's 10.6%.
+        "iv_proxy_source": "vxn",
+        # Rescaled with the source. 14 was a VIX level; VXN averaged 1.24x
+        # VIX over 2016-2026, so 17 preserves the original intent (only sell
+        # premium when there is enough of it) rather than loosening the gate.
+        "min_iv_proxy": 17,
         "min_credit_pct_of_width": 0.13,
         "max_concurrent_positions": 1,      # 11.57 throttle (was 3)
         "max_per_expiration": 1,
