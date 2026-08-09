@@ -241,6 +241,43 @@ class RiskDecision:
         """
         if self.order_type is OrderType.STOP_LIMIT:
             return self.stop_price
+        return self._stop_anchored_to(fill_price)
+
+    def stop_for_confirmed_fill(self, fill_price: float | None) -> float:
+        """Protective stop re-anchored to a fill that has already happened.
+
+        Same arithmetic as `stop_for_fill`, **without** the STOP_LIMIT
+        early return — because the reason for that guard is timing, not
+        policy. `stop_for_fill` runs at submit time, where a resting
+        STOP_LIMIT entry has no fill to anchor to and its bracket child
+        is going out with the entry. This method is for the opposite
+        moment: the fill is confirmed and its price is known.
+
+        Used by the post-fill DAY→GTC stop rebuild (PLAN 11.54). That
+        rebuild already cancels the bracket child and places a standalone
+        GTC stop — Alpaca cannot modify OTO children in place — so
+        re-deriving the price there costs nothing extra and is what makes
+        live room match the 2×ATR the strategy was backtested on. Before
+        this, the rebuild reused the bracket child's reference-anchored
+        price and live room ranged 68%–116% of intended.
+
+        The sizing caveat in `stop_for_fill` still stands and is
+        deliberately not addressed here: `_size_position` divides
+        STOP_LIMIT risk by `limit_price − stop_price`, so holding the
+        offset constant means realized risk lands below budget on fills
+        above the reference. That is PLAN 11.54's cost (b), tracked
+        separately — room and deployment are two costs pointing in
+        opposite directions and a single fix that nets them out would
+        read as healthy while both stayed wrong.
+        """
+        return self._stop_anchored_to(fill_price)
+
+    def _stop_anchored_to(self, fill_price: float | None) -> float:
+        """Shared re-anchoring arithmetic for both public entry points.
+
+        One implementation so the two callers cannot drift — the offset
+        rule and every fallback branch are defined exactly once.
+        """
         if fill_price is None:
             return self.stop_price
         try:

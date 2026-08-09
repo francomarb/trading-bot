@@ -2358,6 +2358,7 @@ class TradingEngine:
         self._entry_prices[symbol] = fill_price
         self._ensure_recovered_protective_stop(
             snapshot=snapshot, position=position, decision=decision,
+            fill_price=fill_price,
         )
         # PR-65 review F1: `result` was not in scope (helper takes
         # decision/position/fill_price/fill_qty only). Look up the uid
@@ -2858,8 +2859,16 @@ class TradingEngine:
         snapshot: BrokerSnapshot,
         position: Position,
         decision: RiskDecision,
+        fill_price: float | None = None,
     ) -> None:
-        """Place the intended stop immediately for a recovered entry if missing."""
+        """Place the intended stop immediately for a recovered entry if missing.
+
+        ``fill_price`` re-anchors the rebuilt stop to the price we actually
+        filled at (PLAN 11.54). It only affects the DAY→GTC rebuild branch
+        below, which runs **once per position, at fill confirmation** —
+        after that the stop is GTC and the branch is skipped, so an already
+        open position can never have its live stop moved by this path.
+        """
         symbol = decision.symbol
         existing = self._protective_stop_order(symbol, snapshot)
         if existing is not None:
@@ -2880,11 +2889,28 @@ class TradingEngine:
                             f"rebuild-stop position_uid lookup raised "
                             f"{type(exc).__name__}: {exc} — proceeding"
                         )
+                # Re-anchor to the actual fill (PLAN 11.54). The bracket
+                # child was priced off the prior session's close at submit
+                # time, so its distance from the real entry varied 68%-116%
+                # of the intended k×ATR. This rebuild already cancels and
+                # re-places the order, so re-deriving the price is free.
+                # Falls back to the child's own price on any bad input.
+                _rebuild_stop = float(existing.stop_price)
+                if fill_price is not None:
+                    _anchored = decision.stop_for_confirmed_fill(fill_price)
+                    if _anchored != _rebuild_stop:
+                        logger.info(
+                            f"[{decision.strategy_name}] {symbol}: re-anchoring "
+                            f"rebuilt stop {_rebuild_stop:.2f} → {_anchored:.2f} "
+                            f"on fill {float(fill_price):.2f} (offset "
+                            f"{abs(decision.entry_reference_price - decision.stop_price):.2f})"
+                        )
+                        _rebuild_stop = _anchored
                 promoted = self.broker.replace_day_stop_with_standalone_gtc(
                     symbol=symbol,
                     stop_order_id=existing.order_id,
                     qty=abs(int(position.qty)),
-                    stop_price=float(existing.stop_price),
+                    stop_price=_rebuild_stop,
                     client_order_id_prefix=(
                         f"{decision.strategy_name}-recover-stop-gtc"
                     ),

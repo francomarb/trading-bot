@@ -1428,3 +1428,86 @@ class TestRiskBudgetIsRecorded:
         reconstructed = d.qty * abs(d.entry_reference_price - d.stop_price)
         assert d.risk_budget_dollars == pytest.approx(600.0)
         assert reconstructed != pytest.approx(d.risk_budget_dollars, rel=0.05)
+
+
+class TestStopForConfirmedFill:
+    """PLAN 11.54 — the post-fill re-anchor for STOP_LIMIT entries.
+
+    `stop_for_fill` returns STOP_LIMIT decisions unchanged because it runs
+    at SUBMIT time, where a resting entry has no fill to anchor to. Once
+    the fill is confirmed the constraint is gone, and the DAY->GTC stop
+    rebuild (which already cancels and re-places the order) can price it
+    off the real entry. Live evidence before this: room ranged 68.4%-116.1%
+    of the intended 2xATR across seven Donchian entries.
+    """
+
+    def _decision(self, *, ref=100.0, stop=96.0, side=Side.BUY,
+                  order_type=OrderType.STOP_LIMIT, trigger=None, limit=None):
+        """STOP_LIMIT decisions must satisfy the 11.47 shape invariant:
+        for a BUY, stop < trigger <= limit. Defaults derive a valid
+        trigger/limit from the stop so each test only states what it cares
+        about."""
+        kwargs = dict(
+            symbol="ANET", side=side, qty=10.0,
+            entry_reference_price=ref, stop_price=stop,
+            strategy_name="donchian_breakout", reason="test",
+            order_type=order_type,
+        )
+        if order_type is OrderType.STOP_LIMIT:
+            if side is Side.BUY:
+                kwargs["entry_trigger_price"] = trigger or max(stop, ref) + 0.01
+                kwargs["limit_price"] = limit or (kwargs["entry_trigger_price"] * 1.05)
+            else:
+                kwargs["entry_trigger_price"] = trigger or min(stop, ref) - 0.01
+                kwargs["limit_price"] = limit or (kwargs["entry_trigger_price"] * 0.95)
+        return RiskDecision(**kwargs)
+
+    def test_stop_limit_is_re_anchored_where_stop_for_fill_refuses(self):
+        """The whole point: same decision, two answers, by design."""
+        d = self._decision(ref=100.0, stop=96.0)
+        assert d.stop_for_fill(108.0) == 96.0            # submit time: unchanged
+        assert d.stop_for_confirmed_fill(108.0) == pytest.approx(104.0)
+
+    def test_offset_is_preserved_exactly_for_stop_limit(self):
+        """Room becomes exactly the intended k*ATR regardless of where the
+        resting entry filled between its trigger and its chase cap."""
+        d = self._decision(ref=100.0, stop=96.0)
+        for fill in (92.0, 96.5, 100.0, 108.0, 130.0):
+            assert fill - d.stop_for_confirmed_fill(fill) == pytest.approx(4.0)
+
+    def test_reproduces_the_live_avgo_case(self):
+        """AVGO 2026-08-07: ref 420.68, 2xATR 33.73, filled 426.09. The
+        rebuild placed the GTC stop at 386.95 (116.0% of intended room);
+        re-anchored it is 392.36 and room is exactly 100%."""
+        d = self._decision(ref=420.68, stop=386.95)
+        anchored = d.stop_for_confirmed_fill(426.09)
+        assert anchored == pytest.approx(392.36, abs=0.01)
+        assert (426.09 - anchored) / 33.73 == pytest.approx(1.0, abs=0.001)
+
+    def test_reproduces_the_live_amzn_case(self):
+        """AMZN 2026-08-04 filled BELOW its reference, the direction that
+        leaves the stop too close: 68.3% of intended room at 264.45."""
+        d = self._decision(ref=284.12, stop=264.45)
+        anchored = d.stop_for_confirmed_fill(277.90)
+        assert anchored == pytest.approx(258.22, abs=0.01)
+        assert (277.90 - anchored) / 19.67 == pytest.approx(1.0, abs=0.001)
+
+    @pytest.mark.parametrize("bad", [None, 0.0, -5.0, float("nan"), float("inf")])
+    def test_unusable_fill_falls_back_to_the_original_stop(self, bad):
+        d = self._decision(ref=100.0, stop=96.0)
+        assert d.stop_for_confirmed_fill(bad) == 96.0
+
+    def test_non_positive_result_falls_back(self):
+        d = self._decision(ref=100.0, stop=1.0)   # 99.0 offset
+        assert d.stop_for_confirmed_fill(50.0) == 1.0
+
+    def test_short_side_anchors_above_the_fill(self):
+        d = self._decision(ref=100.0, stop=104.0, side=Side.SELL)
+        assert d.stop_for_confirmed_fill(97.0) == pytest.approx(101.0)
+
+    def test_market_orders_get_the_same_answer_from_both_methods(self):
+        """For non-STOP_LIMIT the two entry points must agree — otherwise
+        the rebuild would silently disagree with the submit-time anchor."""
+        d = self._decision(ref=100.0, stop=96.0, order_type=OrderType.MARKET)
+        for fill in (88.0, 100.0, 112.0):
+            assert d.stop_for_fill(fill) == d.stop_for_confirmed_fill(fill)

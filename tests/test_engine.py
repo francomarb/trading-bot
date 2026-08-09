@@ -54,6 +54,7 @@ from reporting.logger import TradeLogger
 from risk.manager import (
     AccountState,
     Position,
+    RiskDecision,
     RiskManager,
     Side,
 )
@@ -6748,3 +6749,133 @@ class TestSubstrateStopFillSeamEndToEnd:
         entry = [r for r in rows if r["side"] == "buy"][0]
         exit_row = [r for r in rows if r["side"] == "sell"][0]
         assert entry["entry_timestamp"] == exit_row["entry_timestamp"]
+
+
+class TestPostFillStopReAnchor:
+    """PLAN 11.54 — the DAY->GTC rebuild must price the replacement stop
+    off the actual fill, not off the bracket child's reference-anchored
+    price.
+
+    Donchian's protective stop is an OTO bracket child priced at
+    `reference_close - 2xATR` when the entry is SUBMITTED, but the entry is
+    a resting STOP_LIMIT that fills later at its own price. Across seven
+    live entries the resulting room ranged 68.4%-116.1% of the intended
+    2xATR. The rebuild already cancels and re-places the order (Alpaca
+    cannot modify OTO children), so re-deriving the price costs nothing.
+    """
+
+    def _stop_limit_decision(self, *, ref, stop, trigger, limit):
+        return RiskDecision(
+            symbol="AAPL", side=Side.BUY, qty=10.0,
+            entry_reference_price=ref, stop_price=stop,
+            strategy_name="donchian_breakout", reason="test",
+            order_type=OrderType.STOP_LIMIT,
+            entry_trigger_price=trigger, limit_price=limit,
+        )
+
+    def _day_stop_setup(self, engine_factory, stop_price):
+        day_stop = replace(
+            _open_stop_order("AAPL", stop_price),
+            order_id="day-stop", qty=10, time_in_force="day",
+        )
+        rebuilt = replace(
+            day_stop, order_id="gtc-stop", status="accepted", time_in_force="gtc",
+        )
+        snapshot = _snapshot(
+            positions={"AAPL": Position("AAPL", 10, 100.0, 1010.0)},
+            open_orders=[day_stop],
+        )
+        engine, broker = engine_factory(snapshot=snapshot)
+        engine._register_single_leg(strategy_name="donchian_breakout", symbol="AAPL")
+        broker.replace_day_stop_with_standalone_gtc.return_value = rebuilt
+        return engine, broker, snapshot
+
+    def test_rebuild_uses_the_fill_anchored_price(self, engine_factory):
+        """AVGO 2026-08-07 shape: ref 420.68, stop 386.95 (2xATR 33.73),
+        filled 426.09. The old behaviour re-placed at 386.95 (116% room);
+        re-anchored it is 392.36 and room is exactly 100%."""
+        engine, broker, snapshot = self._day_stop_setup(engine_factory, 386.95)
+        decision = self._stop_limit_decision(
+            ref=420.68, stop=386.95, trigger=418.49, limit=439.41,
+        )
+        engine._ensure_recovered_protective_stop(
+            snapshot=snapshot,
+            position=snapshot.account.open_positions["AAPL"],
+            decision=decision,
+            fill_price=426.09,
+        )
+        kwargs = broker.replace_day_stop_with_standalone_gtc.call_args.kwargs
+        assert kwargs["stop_price"] == pytest.approx(392.36, abs=0.01)
+
+    def test_fill_below_reference_moves_the_stop_down(self, engine_factory):
+        """AMZN 2026-08-04 shape — the direction that leaves the stop too
+        close: 68.3% of intended room before re-anchoring."""
+        engine, broker, snapshot = self._day_stop_setup(engine_factory, 264.45)
+        decision = self._stop_limit_decision(
+            ref=284.12, stop=264.45, trigger=271.46, limit=285.04,
+        )
+        engine._ensure_recovered_protective_stop(
+            snapshot=snapshot,
+            position=snapshot.account.open_positions["AAPL"],
+            decision=decision,
+            fill_price=277.90,
+        )
+        kwargs = broker.replace_day_stop_with_standalone_gtc.call_args.kwargs
+        assert kwargs["stop_price"] == pytest.approx(258.22, abs=0.01)
+
+    def test_missing_fill_price_keeps_the_original_stop(self, engine_factory):
+        """A stop that cannot be placed is worse than one placed slightly
+        off — the rebuild must still happen, at the child's own price."""
+        engine, broker, snapshot = self._day_stop_setup(engine_factory, 386.95)
+        decision = self._stop_limit_decision(
+            ref=420.68, stop=386.95, trigger=418.49, limit=439.41,
+        )
+        engine._ensure_recovered_protective_stop(
+            snapshot=snapshot,
+            position=snapshot.account.open_positions["AAPL"],
+            decision=decision,
+            fill_price=None,
+        )
+        kwargs = broker.replace_day_stop_with_standalone_gtc.call_args.kwargs
+        assert kwargs["stop_price"] == pytest.approx(386.95)
+
+    def test_an_existing_gtc_stop_is_never_rebuilt(self, engine_factory):
+        """THE GUARANTEE THAT PROTECTS ALREADY-OPEN POSITIONS.
+
+        The rebuild branch fires only when the live stop is DAY. Once a
+        position has its standalone GTC stop it can never be re-priced by
+        this path, so shipping the re-anchor cannot move the stop on a
+        position that is already open — it applies to new fills only.
+        """
+        gtc_stop = replace(
+            _open_stop_order("AAPL", 386.95),
+            order_id="gtc-stop", qty=10, time_in_force="gtc",
+        )
+        snapshot = _snapshot(
+            positions={"AAPL": Position("AAPL", 10, 100.0, 1010.0)},
+            open_orders=[gtc_stop],
+        )
+        engine, broker = engine_factory(snapshot=snapshot)
+        engine._register_single_leg(strategy_name="donchian_breakout", symbol="AAPL")
+        decision = self._stop_limit_decision(
+            ref=420.68, stop=386.95, trigger=418.49, limit=439.41,
+        )
+        engine._ensure_recovered_protective_stop(
+            snapshot=snapshot,
+            position=snapshot.account.open_positions["AAPL"],
+            decision=decision,
+            fill_price=426.09,
+        )
+        broker.replace_day_stop_with_standalone_gtc.assert_not_called()
+        broker.place_protective_stop.assert_not_called()
+        assert snapshot.open_orders == [gtc_stop]
+
+    def test_repair_path_does_not_re_anchor(self, engine_factory):
+        """`_repair_missing_protective_stops` runs every cycle over ALREADY
+        OPEN positions. It must keep using the recorded stop price — if it
+        re-anchored, shipping this change would silently move live stops on
+        open positions, which is exactly what was ruled out."""
+        engine, broker, snapshot = self._day_stop_setup(engine_factory, 95.0)
+        engine._repair_missing_protective_stops(snapshot)
+        kwargs = broker.replace_day_stop_with_standalone_gtc.call_args.kwargs
+        assert kwargs["stop_price"] == 95.0
