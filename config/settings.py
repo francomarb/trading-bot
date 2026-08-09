@@ -577,7 +577,7 @@ STRATEGY_ALLOCATIONS: dict[str, dict] = {
         # credit_spread takes the next free slot.
         "priority": 4,
         "can_stretch": False,
-        "hard_max_positions": 8,
+        "hard_max_positions": 1,            # 11.57 throttle (was 8)
         "max_position_pct_of_sleeve": 0.40,
     },
 }
@@ -719,6 +719,18 @@ STRATEGY_SLEEVE_DD_THRESHOLD = 0.15
 # 11.28 merge gate showed real ~17Δ $10-wide SPY put spreads collect only
 # ~13–15% of width. 0.25 would reject nearly every spread. Revisit during
 # the paper-watch follow-up.
+#
+# THROTTLED TO ONE CONCURRENT SPREAD (2026-08-09, PLAN 11.57). The picker
+# labels strikes with a Black-Scholes delta computed from (a) the prior
+# session's close, while pricing the same strikes against live quotes, and
+# (b) sigma = VIX/100 for both underlyings. On SPY the two errors cancel
+# (net ~+0.01Δ); on QQQ they compound (~+0.10Δ), so QQQ has been selling
+# roughly double its 0.12 target delta. Both instruments stay eligible —
+# the whole point of the throttle is to keep collecting logged evidence,
+# especially on QQQ where the bias lives — but only one spread may be open
+# at a time while that evidence accumulates.
+# Restore to 3 / 3 / 8 once the pick-time instrumentation confirms the
+# realised short delta tracks the configured target.
 CREDIT_SPREAD_INSTRUMENTS: dict[str, dict] = {
     "SPY": {
         # Entry
@@ -731,7 +743,7 @@ CREDIT_SPREAD_INSTRUMENTS: dict[str, dict] = {
         "min_iv_proxy": 14,                 # VIX index points
         "min_credit_pct_of_width": 0.13,
         # Position management
-        "max_concurrent_positions": 3,
+        "max_concurrent_positions": 1,      # 11.57 throttle (was 3)
         "max_per_expiration": 1,
         "min_dte_gap_between_opens": 7,
         # Exits
@@ -752,7 +764,7 @@ CREDIT_SPREAD_INSTRUMENTS: dict[str, dict] = {
         "iv_proxy_source": "vix",           # QQQ tracks SPX closely
         "min_iv_proxy": 14,
         "min_credit_pct_of_width": 0.13,
-        "max_concurrent_positions": 3,
+        "max_concurrent_positions": 1,      # 11.57 throttle (was 3)
         "max_per_expiration": 1,
         "min_dte_gap_between_opens": 7,
         "profit_target_pct": 0.50,
@@ -802,7 +814,26 @@ if set(STRATEGY_WATCHLISTS["credit_spread"]) != set(CREDIT_SPREAD_INSTRUMENTS):
 CREDIT_SPREAD_SLEEVE_BUDGET_PCT = 0.10
 # Global cap across ALL credit-spread instances combined — the safety net
 # for a correlated drawdown where every instrument's own cap is full.
-MAX_TOTAL_CONCURRENT_CREDIT_SPREADS = 8
+# Held at 1 by the 11.57 throttle (was 8); this is the binding constraint
+# that guarantees a single open spread regardless of the per-instance caps.
+# Must stay equal to STRATEGY_ALLOCATIONS["credit_spread"]["hard_max_positions"]
+# — asserted below.
+MAX_TOTAL_CONCURRENT_CREDIT_SPREADS = 1
+
+# The allocator's hard cap and the strategy's global cap are two independent
+# reads of the same intent; a silent divergence would let the allocator fund
+# spreads the strategy refuses to open (or the reverse). Documentation that
+# "these match" rots, so assert it at import.
+if (
+    STRATEGY_ALLOCATIONS["credit_spread"]["hard_max_positions"]
+    != MAX_TOTAL_CONCURRENT_CREDIT_SPREADS
+):
+    raise ValueError(
+        "credit_spread concurrency caps disagree: "
+        f"STRATEGY_ALLOCATIONS hard_max_positions="
+        f"{STRATEGY_ALLOCATIONS['credit_spread']['hard_max_positions']} vs "
+        f"MAX_TOTAL_CONCURRENT_CREDIT_SPREADS={MAX_TOTAL_CONCURRENT_CREDIT_SPREADS}"
+    )
 
 # Composite weights for utils.options_ranker.rank_put_spread_candidates.
 # Mirrors the ranker module's defaults; here so the values are reviewable

@@ -354,9 +354,26 @@ from entry to stop is unknown at submit time and varies per trade:
 
 | Entry | Room vs the intended 2× ATR | Deployed risk vs budget |
 |---|---|---|
-| ANET 2026-07-09 | 108.2% | 94.1% |
-| AAPL 2026-07-28 | 116.1% | 64.4% |
-| WYFI 2026-06-18 | **58.1%** | 99.8% |
+| ANET 2026-07-09 | 108.2% | 94.1% ⚠️ |
+| AAPL 2026-07-28 | 116.1% | 64.4% ⚠️ |
+| WYFI 2026-06-18 | **58.1%** | 99.8% ⚠️ |
+
+⚠️ **The deployed-risk column above is superseded.** Those three ratios were
+computed from a *reconstructed* budget; PLAN `11.54` records why every
+reconstruction attempted so far misattributes the denominator, and
+`risk_budget_dollars` was only persisted from 2026-08-03. With the real
+denominator the picture is systematic rather than sporadic:
+
+| Entry | Deployed risk vs **persisted** budget |
+|---|---|
+| GOOG 2026-08-04 | 70.5% |
+| AMZN 2026-08-04 | 64.8% |
+| MSFT 2026-08-07 | 66.3% |
+| AVGO 2026-08-07 | 71.4% |
+
+Consistent ~2/3 deployment in a 65–71% band. All four are still open, so the
+*room-vs-2×ATR* column and the stop-vs-signal exit split are still unanswered
+for this cohort — the two costs stay on separate lines.
 
 **Capital safety is not affected.** `_size_position` divides STOP_LIMIT risk by
 `limit_price − stop` — the worst permitted fill (PR #62 R1 P1-3) — so the dollar
@@ -371,9 +388,44 @@ target calls for — AAPL deployed 64% of budget.
 
 Do **not** apply the `11.53` re-anchor here: it works from `reference − stop`,
 which on AAPL would have cut deployed risk from 64.4% to 55%. `stop_for_fill`
-returns STOP_LIMIT decisions unchanged for exactly this reason. Sample is three
-entries (STOP_LIMIT only landed 2026-07-09); gather evidence before choosing a
-fix. See PLAN `11.54`.
+returns STOP_LIMIT decisions unchanged for exactly this reason. Gather evidence
+before choosing a fix. See PLAN `11.54`.
+
+**Date correction (2026-08-09):** this section previously read "STOP_LIMIT only
+landed 2026-07-09". That is wrong — PR #62 merged **2026-06-14** (`16bcbfb`),
+and 2026-07-09 is the date of the ANET *entry*, not the ship date. The old
+claim contradicted the WYFI 2026-06-18 STOP_LIMIT row in the table above it.
+The correct evidence window for STOP_LIMIT behaviour opens 2026-06-14.
+
+### Reading realized Donchian P&L: mind the configuration eras
+
+Realized P&L for this strategy is dominated by superseded configurations, and
+reading it without that inverts the conclusion. **No Donchian trade has closed
+under the current configuration.**
+
+| Entry era | Entries | Order type | Risk range | Closed P&L |
+|---|---|---|---|---|
+| 05-01 → 06-12 | 16 | market | $36 – $1,600 (44×) | −$1,214 |
+| 06-18 → 07-09 (STOP_LIMIT, pre-fix) | 2 | stop_limit | $778 | −$873 |
+| 07-28 (post-11.48 sizing) | 1 | stop_limit | $211 | −$449 (overnight gap) |
+| 08-04 → 08-07 (post fill-anchored stop) | 4 | stop_limit | $269 – $295 (1.1×) | none closed |
+
+Per-strategy risk targets landed 2026-07-13 (11.48), the fill-anchored stop
+2026-08-01 (`efe0d74`), budget persistence 2026-08-03 (`b5ca503`). The entry
+risk range is the clearest evidence 11.48 worked: **44× dispersion before,
+1.1× after**.
+
+Split by exit reason across all 19 closed trades, the strategy's own exit is
+profitable and the protective stop carries the loss:
+
+| Exit | n | P&L | Avg R |
+|---|---|---|---|
+| `exit signal` (Donchian trend exit) | 5 | **+$1,882** | **+1.17** |
+| `stop_triggered` | 13 | **−$3,872** | −0.96 |
+
+That is directional support for `11.54`'s premise, but **10 of those 13
+stop-outs are pre-2026-06-14 MARKET entries** and say nothing about STOP_LIMIT
+anchoring. Only WYFI, ANET and AAPL are STOP_LIMIT-era.
 
 ---
 

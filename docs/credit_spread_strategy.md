@@ -28,7 +28,7 @@ update; allocated 10% of equity in the isolated-options pool.
 |---|---|---|
 | Pool type | Isolated options (defined-risk, never stretches) | `settings.STRATEGY_ALLOCATIONS["credit_spread"]` |
 | Sleeve weight | 0.10 of equity (target) | same |
-| Shared max concurrent positions | 8 across all underlyings | `settings.MAX_TOTAL_CONCURRENT_CREDIT_SPREADS` |
+| Shared max concurrent positions | **1** across all underlyings (throttled 2026-08-09, PLAN 11.57; was 8) | `settings.MAX_TOTAL_CONCURRENT_CREDIT_SPREADS` |
 | Regime gate | `TRENDING`, `RANGING` only | `settings.STRATEGY_ALLOWED_REGIMES["credit_spread"]` |
 | Sleeve budget pct | 0.10 | `settings.CREDIT_SPREAD_SLEEVE_BUDGET_PCT` |
 | Min trades for health verdict | 25 | `settings.STRATEGY_MIN_TRADES_FOR_VERDICT` |
@@ -57,10 +57,10 @@ compensate for the higher underlying price).
 | `dte_min` | 30 | 30 | Earliest entry expiry |
 | `dte_max` | 45 | 45 | Latest entry expiry |
 | `trend_sma_buffer_pct` | 0.00 | 0.01 | QQQ requires close > 50 SMA by 1%; SPY keeps the original close > 50 SMA gate |
-| `iv_proxy_source` | `vix` | `vix` | QQQ tracks SPX vol closely enough |
+| `iv_proxy_source` | `vix` | `vix` | ⚠️ "QQQ tracks SPX vol closely enough" is the assumption under audit in PLAN 11.57 — measured QQQ spread vol runs above VIX. Note `iv` feeds **only** the Black-Scholes delta estimate; the credit itself is quote-derived |
 | `min_iv_proxy` | 14 | 14 | VIX must be ≥ 14 for entry (premium floor) |
 | `min_credit_pct_of_width` | 0.13 | 0.13 | Credit ≥ 13% of spread width |
-| `max_concurrent_positions` | 3 | 3 | Per-instance cap |
+| `max_concurrent_positions` | **1** | **1** | Per-instance cap. Throttled from 3 on 2026-08-09 (PLAN 11.57); the global cap of 1 binds first |
 | `max_per_expiration` | 1 | 1 | One spread per expiry, per underlying |
 | `min_dte_gap_between_opens` | 7 | 7 | Stagger entries across calendar |
 | `profit_target_pct` | 0.50 | 0.50 | Close at 50% of max profit |
@@ -125,12 +125,46 @@ lookup. The allocator routes them through a single shared sleeve.
 - Paper-trading on SPY + QQQ since PLAN 11.29 landed.
 - Allocated 10% of equity in the isolated-options pool (shared sleeve).
 - Health monitor floor: 25 trades for `CONCLUSIVE` verdict; the sleeve
-  takes a while to accumulate that many trades because each instance is
-  capped at 3 concurrent and per-expiration entries are throttled.
+  takes a while to accumulate that many trades — and **slower still under
+  the 11.57 throttle**, which allows one open spread across both
+  underlyings (was 3 per instance / 8 global).
 - Watch items: (1) per-side fill quality on the two-leg combo, (2)
   realized credit-to-width ratio vs. the 0.13 floor, (3) frequency of
   short-strike-breach exits in volatile sessions, (4) walk-and-market
-  close-fill distribution (see *Close-walk tuning review* below).
+  close-fill distribution (see *Close-walk tuning review* below),
+  (5) **realised short delta vs the configured target** — the
+  `credit_spread_pick` event (11.57), see below.
+
+**Watch item (2) is comparative, not absolute.** Credit-to-width was
+being read per-instrument against the 0.13 floor, which both underlyings
+clear. Read *across* instruments it was the tell that surfaced 11.57:
+QQQ averaged 17.8% of width against SPY's 14.7% while targeting a
+*lower* nominal delta on a *wider* spread — where credit/width should
+fall, not rise. The signal was in the watch list from day one and was
+never read comparatively.
+
+### Pick-time instrumentation (`credit_spread_pick`, PLAN 11.57)
+
+Every successful pick emits a structured `credit_spread_pick` event
+recording the inputs strike selection depended on. Extract with:
+
+```bash
+jq -c 'select(.record.extra.event == "credit_spread_pick") | .record.extra' logs/bot.jsonl
+```
+
+| Field | Meaning |
+|---|---|
+| `spot_at_decision` | The spot the Black-Scholes delta was computed from — on a 1Day slot this is the **prior** completed session's close (`_decision_frame` drops the in-progress bar) |
+| `spot_live` | Live quote midpoint at pick time. Observation only, never an input |
+| `spot_drift_pct` | Signed drift of `spot_live` from `spot_at_decision` |
+| `iv_proxy_source` / `iv_proxy_points` | The sigma fed to the delta estimate |
+| `target_short_delta` | The configured `short_leg_delta` |
+| `est_short_delta` | What the picker estimated |
+| `est_short_delta_at_live_spot` | Same model, live spot — isolates the staleness error from the vol error |
+| `net_credit` / `credit_pct_of_width` | Quote-derived; carries no volatility assumption |
+
+The instrumentation is wrapped so any failure (including an unavailable
+live quote) degrades to `None` and never blocks a trade.
 
 ### Close path — walk-and-market
 
