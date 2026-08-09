@@ -471,6 +471,11 @@ class CreditSpread(BaseStrategy):
             f"max_loss=${pick.max_loss:,.0f} limit={limit_price:.2f} "
             f"shortΔ={pick.short_leg_delta:.3f} score={pick.score:.2f}"
         )
+        self._log_pick_inputs(
+            pick=pick,
+            underlying_price=underlying_price,
+            iv_points=iv_points,
+        )
         return SpreadExecutionPlan(
             legs=legs,
             qty=1,
@@ -484,6 +489,106 @@ class CreditSpread(BaseStrategy):
             max_loss=pick.max_loss,
             width=pick.width,
         )
+
+    @staticmethod
+    def _fmt_optional(value: float | None, places: int = 2) -> str:
+        """Render an optional float for the human-readable log line."""
+        return "n/a" if value is None else f"{value:.{places}f}"
+
+    def _log_pick_inputs(
+        self,
+        *,
+        pick: SpreadPick,
+        underlying_price: float,
+        iv_points: float,
+    ) -> None:
+        """
+        Emit a ``credit_spread_pick`` event recording every input the strike
+        selection depended on. Observational only — nothing here feeds a
+        decision, and any failure is swallowed so instrumentation can never
+        block a trade.
+
+        Why this exists (PLAN 11.57): the picker prices strikes against LIVE
+        OPRA quotes but labels them with a Black-Scholes delta computed from
+        ``underlying_price``, which on a 1Day slot is the *prior* completed
+        session's close (``_decision_frame`` drops the in-progress bar). The
+        sigma fed to that estimate is the IV proxy — VIX for both SPY and
+        QQQ. Neither input was recorded anywhere, so the realised-vs-target
+        delta question could only be answered by reconstruction against a
+        proxy for the pick-time spot. It is now answerable from logs.
+
+        ``spot_live`` is fetched purely to measure the staleness gap. It runs
+        only on a successful pick (at most a few calls a day, not per cycle).
+        """
+        try:
+            from data.fetcher import fetch_latest_quote_midpoint
+            from utils.options_lookup import estimate_put_delta
+
+            _fmt = self._fmt_optional
+            spot_live: float | None = None
+            try:
+                spot_live = fetch_latest_quote_midpoint(self.symbol)
+            except Exception as e:  # pragma: no cover - network path
+                logger.debug(f"[{self.name}] {self.symbol}: live spot unavailable: {e}")
+
+            dte = (pick.expiration_date - date.today()).days
+            sigma = iv_points / 100.0
+
+            # Same delta model, evaluated at the live spot instead of the
+            # stale one. The difference isolates the spot-staleness error
+            # from the volatility-input error; without this the two are not
+            # separable after the fact.
+            delta_at_live_spot: float | None = None
+            spot_drift_pct: float | None = None
+            if spot_live and spot_live > 0 and dte > 0:
+                delta_at_live_spot = estimate_put_delta(
+                    underlying_price=spot_live,
+                    strike=pick.short_strike,
+                    dte_days=dte,
+                    iv=sigma,
+                )
+                spot_drift_pct = 100.0 * (spot_live - underlying_price) / underlying_price
+
+            logger.bind(
+                event="credit_spread_pick",
+                strategy=self.name,
+                underlying=self.symbol,
+                short_occ=pick.short_occ,
+                long_occ=pick.long_occ,
+                short_strike=pick.short_strike,
+                long_strike=pick.long_strike,
+                width=pick.width,
+                dte=dte,
+                # Inputs the delta estimate actually used.
+                spot_at_decision=underlying_price,
+                iv_proxy_source=self.config.iv_proxy_source,
+                iv_proxy_points=iv_points,
+                # Observation only — never an input.
+                spot_live=spot_live,
+                spot_drift_pct=spot_drift_pct,
+                # Target vs model estimate vs same model at the live spot.
+                target_short_delta=self.config.short_leg_delta,
+                est_short_delta=pick.short_leg_delta,
+                est_short_delta_at_live_spot=delta_at_live_spot,
+                # Quote-derived; carries no volatility assumption.
+                net_credit=pick.net_credit,
+                credit_pct_of_width=(
+                    pick.net_credit / pick.width if pick.width else None
+                ),
+            ).info(
+                f"[{self.name}] {self.symbol} pick inputs: "
+                f"spot_decision={underlying_price:.2f} "
+                f"spot_live={_fmt(spot_live)} "
+                f"iv={iv_points:.1f} targetΔ={self.config.short_leg_delta:.2f} "
+                f"estΔ={pick.short_leg_delta:.3f} "
+                f"estΔ@live={_fmt(delta_at_live_spot, 3)} "
+                f"credit/width={_fmt(pick.net_credit / pick.width if pick.width else None, 3)}"
+            )
+        except Exception as e:  # pragma: no cover - instrumentation must not block
+            logger.warning(
+                f"[{self.name}] {self.symbol}: pick instrumentation failed "
+                f"(trade unaffected): {e}"
+            )
 
     # ── Exit triggers ────────────────────────────────────────────────────
 

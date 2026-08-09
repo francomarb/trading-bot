@@ -585,3 +585,162 @@ class TestEvaluateClose:
         # NaN sentinel — caller distinguishes from a real 0.0 mid.
         import math
         assert math.isnan(decision.initial_mid)
+
+
+# ── Pick-time instrumentation (PLAN 11.57) ──────────────────────────────────
+
+
+class TestPickInputInstrumentation:
+    """
+    The picker prices strikes against live quotes but labels them with a
+    Black-Scholes delta computed from the prior session's close. Neither
+    input was recorded, so realised-vs-target delta was only answerable by
+    reconstruction. These tests pin the event that makes it answerable from
+    logs -- and pin that instrumentation can never break a trade.
+    """
+
+    _EXP = date.today() + timedelta(days=37)
+
+    def _capture(
+        self,
+        strat,
+        spot_live,
+        *,
+        spot_at_decision=745.0,
+        short_strike=568.0,
+    ):
+        """Run a successful pick, returning the credit_spread_pick payload."""
+        events: list[dict] = []
+
+        def sink(message):
+            extra = message.record["extra"]
+            if extra.get("event") == "credit_spread_pick":
+                events.append(dict(extra))
+
+        from loguru import logger
+
+        sink_id = logger.add(sink, level="DEBUG")
+        try:
+            with patch(
+                "strategies.credit_spread.find_best_put_spread",
+                return_value=_pick(
+                    expiration=self._EXP,
+                    short_strike=short_strike,
+                    long_strike=short_strike - 10,
+                    short_delta=0.17,
+                ),
+            ), patch(
+                "data.fetcher.fetch_latest_quote_midpoint",
+                return_value=spot_live,
+            ):
+                strat.build_spread_execution(spot_at_decision, notional_cap=2_000.0)
+        finally:
+            logger.remove(sink_id)
+        return events
+
+    def test_records_both_spots_and_the_vol_input(self):
+        events = self._capture(_strategy(iv_points=18.0), spot_live=740.0)
+        assert len(events) == 1
+        e = events[0]
+        # The stale spot the delta estimate actually used...
+        assert e["spot_at_decision"] == pytest.approx(745.0)
+        # ...and the live spot the quotes were struck against.
+        assert e["spot_live"] == pytest.approx(740.0)
+        assert e["iv_proxy_source"] == "vix"
+        assert e["iv_proxy_points"] == pytest.approx(18.0)
+        assert e["target_short_delta"] == pytest.approx(0.17)
+        assert e["est_short_delta"] == pytest.approx(0.17)
+
+    def test_spot_drift_is_signed_relative_to_the_decision_spot(self):
+        events = self._capture(_strategy(), spot_live=738.55, spot_at_decision=745.0)
+        # (738.55 - 745) / 745 = -0.866%
+        assert events[0]["spot_drift_pct"] == pytest.approx(-0.8658, abs=1e-3)
+
+    def test_delta_at_live_spot_rises_when_the_underlying_fell(self):
+        """
+        The whole point of the event: a put's delta grows as spot falls
+        toward the strike, so a stale high decision spot understates the
+        delta actually sold.
+
+        Compared across two runs of the SAME model rather than against
+        ``est_short_delta`` -- that field is whatever the picker returned
+        (a fixture constant here), so comparing to it would test the stub.
+        """
+        strike = 715.0
+        unchanged = self._capture(
+            _strategy(), spot_live=745.0, spot_at_decision=745.0, short_strike=strike
+        )[0]
+        fell = self._capture(
+            _strategy(), spot_live=700.0, spot_at_decision=745.0, short_strike=strike
+        )[0]
+
+        # Same strike, same vol, same DTE — only the live spot differs.
+        assert fell["est_short_delta_at_live_spot"] > unchanged["est_short_delta_at_live_spot"]
+        # Spot below the strike puts the short leg ITM: |delta| past 0.5.
+        assert fell["est_short_delta_at_live_spot"] > 0.5
+        # And the decision-spot record is untouched by the live reading.
+        assert fell["spot_at_decision"] == pytest.approx(745.0)
+
+    def test_credit_pct_of_width_is_recorded(self):
+        events = self._capture(_strategy(), spot_live=745.0)
+        # _pick defaults: net_credit 1.45 on a 10-wide spread.
+        assert events[0]["credit_pct_of_width"] == pytest.approx(0.145)
+
+    def test_live_spot_unavailable_degrades_to_none_not_an_exception(self):
+        events = self._capture(_strategy(), spot_live=None)
+        e = events[0]
+        assert e["spot_live"] is None
+        assert e["spot_drift_pct"] is None
+        assert e["est_short_delta_at_live_spot"] is None
+        # The stale-spot inputs are still recorded.
+        assert e["spot_at_decision"] == pytest.approx(745.0)
+
+    def test_instrumentation_failure_never_blocks_the_trade(self):
+        """Observational code must not be able to cost a fill."""
+        strat = _strategy()
+        with patch(
+            "strategies.credit_spread.find_best_put_spread",
+            return_value=_pick(expiration=self._EXP),
+        ), patch(
+            "data.fetcher.fetch_latest_quote_midpoint",
+            side_effect=RuntimeError("broker down"),
+        ):
+            plan = strat.build_spread_execution(745.0, notional_cap=2_000.0)
+        assert isinstance(plan, SpreadExecutionPlan)
+        assert plan.limit_price == pytest.approx(-1.45)
+
+
+class TestConcurrencyCapParity:
+    """
+    The allocator's hard cap and the strategy's global cap are two reads of
+    one intent. Documentation that "these match" rots (see
+    feedback_single_source_of_truth_params), so settings asserts it at
+    import -- this pins that the assertion exists and that the throttle is
+    actually in force.
+    """
+
+    def test_global_cap_matches_allocator_hard_max(self):
+        from config import settings
+
+        assert (
+            settings.STRATEGY_ALLOCATIONS["credit_spread"]["hard_max_positions"]
+            == settings.MAX_TOTAL_CONCURRENT_CREDIT_SPREADS
+        )
+
+    def test_throttle_allows_a_single_concurrent_spread(self):
+        from config import settings
+
+        assert settings.MAX_TOTAL_CONCURRENT_CREDIT_SPREADS == 1
+        for sym, cfg in settings.CREDIT_SPREAD_INSTRUMENTS.items():
+            assert cfg["max_concurrent_positions"] == 1, sym
+
+    def test_both_instruments_remain_eligible_under_the_throttle(self):
+        """
+        The throttle caps exposure; it must not silently disable QQQ, which
+        is where the delta bias under investigation lives.
+        """
+        from config import settings
+
+        assert set(settings.CREDIT_SPREAD_INSTRUMENTS) == {"SPY", "QQQ"}
+        for cfg in settings.CREDIT_SPREAD_INSTRUMENTS.values():
+            assert cfg["max_concurrent_positions"] >= 1
