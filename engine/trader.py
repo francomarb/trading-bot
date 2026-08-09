@@ -2323,9 +2323,15 @@ class TradingEngine:
         fill_price: float,
         fill_qty: float,
         reason_suffix: str = "(recovered)",
+        entry_order_id: str | None = None,
     ) -> None:
         """Fire the engine-side side effects that happen when a
         bot-submitted entry is adopted on the recovery path.
+
+        ``entry_order_id`` is the broker id of the entry order. It lets
+        the protective-stop rebuild point the trade row at the stop it
+        actually placed (PLAN 11.54); omitted, the stop is still placed
+        correctly and only the recorded risk basis stays stale.
 
         Extracted from the body of _recover_suspect_orders so two
         callers can share it:
@@ -2368,7 +2374,7 @@ class TradingEngine:
         self._entry_prices[symbol] = fill_price
         self._ensure_recovered_protective_stop(
             snapshot=snapshot, position=position, decision=decision,
-            fill_price=fill_price,
+            fill_price=fill_price, entry_order_id=entry_order_id,
         )
         # PR-65 review F1: `result` was not in scope (helper takes
         # decision/position/fill_price/fill_qty only). Look up the uid
@@ -2541,6 +2547,7 @@ class TradingEngine:
                             fill_price=float(event.avg_fill_price),
                             fill_qty=float(event.filled_qty),
                             reason_suffix="(substrate)",
+                            entry_order_id=event.order_id,
                         )
                         logger.warning(
                             f"substrate entry-fill dispatch: bound "
@@ -2922,6 +2929,7 @@ class TradingEngine:
         position: Position,
         decision: RiskDecision,
         fill_price: float | None = None,
+        entry_order_id: str | None = None,
     ) -> None:
         """Place the intended stop immediately for a recovered entry if missing.
 
@@ -2984,6 +2992,32 @@ class TradingEngine:
                 )
                 snapshot.open_orders.remove(existing)
                 snapshot.open_orders.append(promoted)
+                # Point the trade row at the stop that now exists. Without
+                # this the row keeps describing the cancelled bracket
+                # child, which (a) makes r_multiple measure against a stop
+                # that is gone and (b) lets _repair_missing_protective_stops
+                # restore the OLD level from the trade log if the GTC stop
+                # ever disappears, silently undoing the re-anchor.
+                # Only when the price actually moved — a no-op rebuild has
+                # nothing to correct.
+                if (
+                    entry_order_id
+                    and abs(_rebuild_stop - float(existing.stop_price)) >= 0.005
+                ):
+                    try:
+                        self.trade_logger.rebase_entry_stop(
+                            order_id=entry_order_id,
+                            new_stop_price=_rebuild_stop,
+                        )
+                    except Exception as exc:
+                        # Reporting accuracy must never cost protection:
+                        # the broker stop is already correctly placed.
+                        logger.warning(
+                            f"[{decision.strategy_name}] {symbol}: could not "
+                            f"rebase the recorded stop basis to "
+                            f"{_rebuild_stop:.2f} ({type(exc).__name__}: {exc}) "
+                            "— broker stop is correct, trade log is stale"
+                        )
             return
 
         stop_qty = abs(int(position.qty))

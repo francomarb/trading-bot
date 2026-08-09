@@ -2385,6 +2385,75 @@ class TradeLogger:
             s["seen_position_uids"] = sorted(s["seen_position_uids"])
         return summary
 
+    def rebase_entry_stop(
+        self,
+        *,
+        order_id: str,
+        new_stop_price: float,
+    ) -> bool:
+        """Point an entry row's recorded risk basis at a re-placed stop.
+
+        The Donchian post-fill rebuild moves the protective stop to
+        ``fill − k×ATR`` (PLAN 11.54). Without this, the trade row keeps
+        describing the bracket child that was cancelled, and two things
+        go wrong:
+
+        1. ``initial_risk_per_share`` — and therefore every ``r_multiple``
+           derived from it — is measured against a stop that no longer
+           exists, understating R by however far the stop moved.
+        2. ``_repair_missing_protective_stops`` restores from
+           ``read_latest_open_stop_price``, so if the GTC stop ever
+           disappears (90-day expiry, manual cancel, rejected submission)
+           the repair silently re-places at the *old* level and undoes
+           the re-anchor.
+
+        Keyed on ``order_id`` — the entry order — because that is unique
+        per single-leg row (``uniq_trades_order_id_single_leg``) and is
+        the only identifier available at the rebuild site that cannot
+        collide with a later round trip on the same symbol.
+
+        Risk-per-share is recomputed as ``|fill − new_stop|`` from the
+        row's own ``avg_fill_price``, matching how ``build_record``
+        derives it, so the two cannot disagree. Rows with no usable fill
+        price are left alone rather than guessed at.
+
+        Returns True when a row was updated. False means no matching
+        entry row — expected on paths that never wrote one — and is not
+        an error.
+        """
+        if not order_id or new_stop_price <= 0:
+            return False
+        conn = self._ensure_db()
+        conn.row_factory = sqlite3.Row
+        row = conn.execute(
+            "SELECT symbol, avg_fill_price, filled_qty, requested_qty "
+            "FROM trades WHERE order_id = ? AND position_type = 'single_leg'",
+            (order_id,),
+        ).fetchone()
+        if row is None:
+            return False
+        fill = row["avg_fill_price"]
+        if fill is None or float(fill) <= 0:
+            logger.debug(
+                f"rebase_entry_stop: order {order_id} has no usable fill "
+                "price — leaving the recorded risk basis alone"
+            )
+            return False
+        risk_per_share = abs(float(fill) - float(new_stop_price))
+        qty = float(row["filled_qty"] or row["requested_qty"] or 0.0)
+        risk_dollars = risk_per_share * qty * _contract_multiplier(row["symbol"])
+        conn.execute(
+            "UPDATE trades SET stop_price = ?, initial_stop_loss = ?, "
+            "initial_risk_per_share = ?, initial_risk_dollars = ? "
+            "WHERE order_id = ? AND position_type = 'single_leg'",
+            (
+                float(new_stop_price), float(new_stop_price),
+                risk_per_share, risk_dollars, order_id,
+            ),
+        )
+        conn.commit()
+        return True
+
     def read_latest_open_stop_price(
         self, *, symbol: str, strategy: str
     ) -> float | None:
