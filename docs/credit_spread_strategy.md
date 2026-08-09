@@ -52,7 +52,7 @@ compensate for the higher underlying price).
 
 | Parameter | SPY | QQQ | Notes |
 |---|---|---|---|
-| `short_leg_delta` | 0.17 | 0.12 | QQQ moved farther OTM after paper losses showed 17Δ entries were not high-quality enough |
+| `short_leg_delta` | 0.17 | **0.17** | QQQ: 0.17 → 0.12 (PR #80) → 0.17 (11.57). **Not a revert** — the label points to a different strike once the vol proxy is correct: 0.17-with-VIX gave ~0.6–0.8σ of real cushion, 0.17-with-VXN gives ~0.95σ. 0.12 against the fixed proxy targets ~1.17σ, below the credit floor and therefore idle |
 | `spread_width` | 10 | 15 | Long strike = short strike − width |
 | `dte_min` | 30 | 30 | Earliest entry expiry |
 | `dte_max` | 45 | 45 | Latest entry expiry |

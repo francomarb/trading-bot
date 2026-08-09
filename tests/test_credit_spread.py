@@ -856,6 +856,34 @@ class TestQqqVolProxy:
     18.4 -> 15.0 while QQQ vol ran 16% -> 30%.
     """
 
+    def test_qqq_target_delta_returns_to_017_against_the_fixed_proxy(self):
+        """Not a revert of PR #80. The number labels "whatever strike my
+        model calls a 17% chance", so it points somewhere different once
+        the model is fixed: 0.17-with-VIX gave ~0.6-0.8 sigma of real
+        cushion (what lost); 0.17-with-VXN gives ~0.95, near SPY's 1.09.
+
+        0.12 against the corrected proxy targets ~1.17 sigma, which the
+        ten real fills extrapolate to ~10.7% of width -- under the 13%
+        floor, i.e. permanently idle.
+        """
+        from config.settings import CREDIT_SPREAD_INSTRUMENTS
+
+        assert CREDIT_SPREAD_INSTRUMENTS["QQQ"]["short_leg_delta"] == pytest.approx(0.17)
+
+    def test_target_delta_and_credit_floor_are_mutually_satisfiable(self):
+        """The pair that broke QQQ: a delta target so far out that the
+        credit floor can never be met is not a conservative setting, it is
+        an idle one. Pins that the two are not silently re-set into
+        contradiction."""
+        from config.settings import CREDIT_SPREAD_INSTRUMENTS
+
+        for sym, cfg in CREDIT_SPREAD_INSTRUMENTS.items():
+            assert cfg["short_leg_delta"] >= 0.15, (
+                f"{sym}: delta {cfg['short_leg_delta']} is far enough OTM that "
+                f"the {cfg['min_credit_pct_of_width']:.0%} credit floor is "
+                "unlikely to be reachable — see PLAN 11.57"
+            )
+
     def test_qqq_prices_risk_off_the_nasdaq_vol_index(self):
         from config.settings import CREDIT_SPREAD_INSTRUMENTS
 

@@ -756,7 +756,20 @@ CREDIT_SPREAD_INSTRUMENTS: dict[str, dict] = {
         "earnings_blackout_days": 0,
     },
     "QQQ": {
-        "short_leg_delta": 0.12,
+        # 0.17 → 0.12 (PR #80, 2026-07-09) → 0.17 (11.57, 2026-08-09).
+        # Returning to 0.17 is NOT a revert of PR #80. The number is a
+        # label for "whatever strike my model calls a 17% chance", so it
+        # points somewhere different once the model is fixed:
+        #   0.17 measured with VIX  → ~0.6–0.8σ of real cushion (what lost)
+        #   0.17 measured with VXN  → ~0.95σ  (comparable to SPY's 1.09σ)
+        # And 0.12 against the corrected proxy targets ~1.17σ, which the
+        # ten real fills extrapolate to ~10.7% of width — below the 13%
+        # min_credit_pct_of_width floor, i.e. permanently idle. Safe and
+        # silent teaches nothing.
+        # HYPOTHESIS, not a settled value: the extrapolation runs past the
+        # observed 0.38–0.79σ range. Prediction to check against the first
+        # few `credit_spread_pick` events — cushion ~0.95σ, credit ~13%.
+        "short_leg_delta": 0.17,
         "spread_width": 15,                 # higher price → wider strikes
         "dte_min": 30,
         "dte_max": 45,
