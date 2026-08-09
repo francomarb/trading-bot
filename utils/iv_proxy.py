@@ -5,7 +5,13 @@ Resolves per-instrument implied-volatility proxies for options strategies.
 Alpaca paper does not stream live Greeks, so each instrument points at a
 published volatility index instead:
 
-  * SPY, QQQ  → VIX  (``^VIX``)  — SPX-family, tracks both closely
+  * SPY       → VIX  (``^VIX``)  — SPX-family
+  * QQQ       → VXN  (``^VXN``)  — the Nasdaq-100 volatility index.
+    Was VIX until 2026-08-09 on the assumption that "QQQ tracks SPX
+    closely enough". It does not: across the ten live QQQ credit
+    spreads, QQQ realized vol ran 16%→30% while VIX FELL 18.4→15.0,
+    so every risk number the picker computed moved the wrong way.
+    See PLAN 11.57.
   * IWM       → RVX  (``^RVX``)  — the Russell 2000 volatility index
 
 Two public methods:
@@ -40,12 +46,25 @@ from loguru import logger
 _SOURCE_TICKERS: dict[str, str] = {
     "vix": "^VIX",
     "rvx": "^RVX",
+    "vxn": "^VXN",
 }
 
 # Used when a live fetch fails and there is no cached value yet. ~VIX 15 is a
 # neutral long-run level; a stale proxy should neither force nor block trades
 # on its own — the gate is one of several.
 _DEFAULT_FALLBACK_POINTS = 15.0
+
+# Per-source neutral levels. A single VIX-scaled fallback understates any
+# index that habitually trades above VIX, and understating the vol input is
+# exactly the failure this module was mis-serving: a low sigma produces a
+# low Black-Scholes delta, which makes the picker sell a fatter strike than
+# it believes. VXN averaged 1.24x VIX over 2016-2026, RVX similar.
+# Measured, not assumed — see PLAN 11.57.
+_FALLBACK_POINTS_BY_SOURCE: dict[str, float] = {
+    "vix": 15.0,
+    "vxn": 19.0,   # ~1.24 x the VIX neutral level
+    "rvx": 19.0,
+}
 
 # Trading-day floor for IVR sufficiency. yfinance ``period="1y"`` returns
 # ~250-252 closes depending on the year's holiday schedule; 240 (~48 weeks)
@@ -113,11 +132,16 @@ class IVProxyResolver:
         self,
         *,
         fetch_fn: FetchFn | None = None,
-        fallback_points: float = _DEFAULT_FALLBACK_POINTS,
+        fallback_points: float | None = None,
         lookback_floor: int = _DEFAULT_LOOKBACK_FLOOR,
     ) -> None:
         self._fetch_fn: FetchFn = fetch_fn or _yfinance_fetch
-        self._fallback = fallback_points
+        # None means "use the per-source level"; an explicit value overrides
+        # it for every source, which is what existing callers/tests expect.
+        self._fallback_explicit = fallback_points is not None
+        self._fallback = (
+            _DEFAULT_FALLBACK_POINTS if fallback_points is None else fallback_points
+        )
         self._lookback_floor = int(lookback_floor)
         # source → (date, trailing-1y close series)
         self._cache: dict[str, tuple[date, pd.Series]] = {}
@@ -216,16 +240,31 @@ class IVProxyResolver:
         scalar contract that the live credit-spread filter depends on.
 
         On a fetch failure with no prior cache, returns the fallback
-        (``_DEFAULT_FALLBACK_POINTS=15.0``) and logs a warning.
+        for that source (``_FALLBACK_POINTS_BY_SOURCE``) and logs a
+        warning. Per-source because a VIX-scaled default understates
+        any index that trades above VIX.
         """
         key, series = self._resolve_series(source)
         if series is None or len(series) == 0:
+            fallback = self._fallback_for(key)
             logger.warning(
                 f"iv_proxy: {key} fetch failed and no cache — "
-                f"using fallback {self._fallback:.2f}"
+                f"using fallback {fallback:.2f}"
             )
-            return self._fallback
+            return fallback
         return float(series.iloc[-1])
+
+    def _fallback_for(self, key: str) -> float:
+        """Neutral level for one source.
+
+        An explicit ``fallback_points`` passed to the constructor always
+        wins — callers that set it mean it. Otherwise the per-source level
+        applies, so a VXN outage does not silently substitute a VIX-scaled
+        number and understate the vol input.
+        """
+        if self._fallback_explicit:
+            return self._fallback
+        return _FALLBACK_POINTS_BY_SOURCE.get(key, self._fallback)
 
     # ── Public IV Rank API (new in 11.46) ────────────────────────────────────
 

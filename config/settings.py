@@ -577,7 +577,7 @@ STRATEGY_ALLOCATIONS: dict[str, dict] = {
         # credit_spread takes the next free slot.
         "priority": 4,
         "can_stretch": False,
-        "hard_max_positions": 1,            # 11.57 throttle (was 8)
+        "hard_max_positions": 2,            # 11.57 throttle: 1 per instrument (was 8)
         "max_position_pct_of_sleeve": 0.40,
     },
 }
@@ -743,7 +743,7 @@ CREDIT_SPREAD_INSTRUMENTS: dict[str, dict] = {
         "min_iv_proxy": 14,                 # VIX index points
         "min_credit_pct_of_width": 0.13,
         # Position management
-        "max_concurrent_positions": 1,      # 11.57 throttle (was 3)
+        "max_concurrent_positions": 1,      # 11.57 throttle (was 3); global cap allows 1 each
         "max_per_expiration": 1,
         "min_dte_gap_between_opens": 7,
         # Exits
@@ -756,15 +756,38 @@ CREDIT_SPREAD_INSTRUMENTS: dict[str, dict] = {
         "earnings_blackout_days": 0,
     },
     "QQQ": {
-        "short_leg_delta": 0.12,
+        # 0.17 → 0.12 (PR #80, 2026-07-09) → 0.17 (11.57, 2026-08-09).
+        # Returning to 0.17 is NOT a revert of PR #80. The number is a
+        # label for "whatever strike my model calls a 17% chance", so it
+        # points somewhere different once the model is fixed:
+        #   0.17 measured with VIX  → ~0.6–0.8σ of real cushion (what lost)
+        #   0.17 measured with VXN  → ~0.95σ  (comparable to SPY's 1.09σ)
+        # And 0.12 against the corrected proxy targets ~1.17σ, which the
+        # ten real fills extrapolate to ~10.7% of width — below the 13%
+        # min_credit_pct_of_width floor, i.e. permanently idle. Safe and
+        # silent teaches nothing.
+        # HYPOTHESIS, not a settled value: the extrapolation runs past the
+        # observed 0.38–0.79σ range. Prediction to check against the first
+        # few `credit_spread_pick` events — cushion ~0.95σ, credit ~13%.
+        "short_leg_delta": 0.17,
         "spread_width": 15,                 # higher price → wider strikes
         "dte_min": 30,
         "dte_max": 45,
         "trend_sma_buffer_pct": 0.01,
-        "iv_proxy_source": "vix",           # QQQ tracks SPX closely
-        "min_iv_proxy": 14,
+        # 11.57: was "vix" on the assumption that QQQ tracks SPX closely
+        # enough. The ten live QQQ spreads disproved it — QQQ realized vol
+        # ran 16%→30% across them while VIX FELL 18.4→15.0, so the picker's
+        # risk numbers moved opposite to the risk. Measured on those trades,
+        # QQQ sold 4.61% OTM against SPY's 4.44% — nearly the same distance
+        # — but only 0.55 sigma of cushion against SPY's 1.09, because QQQ's
+        # own vol was 23.0% against SPY's 10.6%.
+        "iv_proxy_source": "vxn",
+        # Rescaled with the source. 14 was a VIX level; VXN averaged 1.24x
+        # VIX over 2016-2026, so 17 preserves the original intent (only sell
+        # premium when there is enough of it) rather than loosening the gate.
+        "min_iv_proxy": 17,
         "min_credit_pct_of_width": 0.13,
-        "max_concurrent_positions": 1,      # 11.57 throttle (was 3)
+        "max_concurrent_positions": 1,      # 11.57 throttle (was 3); global cap allows 1 each
         "max_per_expiration": 1,
         "min_dte_gap_between_opens": 7,
         "profit_target_pct": 0.50,
@@ -814,11 +837,19 @@ if set(STRATEGY_WATCHLISTS["credit_spread"]) != set(CREDIT_SPREAD_INSTRUMENTS):
 CREDIT_SPREAD_SLEEVE_BUDGET_PCT = 0.10
 # Global cap across ALL credit-spread instances combined — the safety net
 # for a correlated drawdown where every instrument's own cap is full.
-# Held at 1 by the 11.57 throttle (was 8); this is the binding constraint
-# that guarantees a single open spread regardless of the per-instance caps.
+# Held at 2 by the 11.57 throttle (was 8; briefly 1). With per-instance
+# caps of 1 this is exactly ONE OPEN SPREAD PER INSTRUMENT.
+#
+# It was 1 while the delta bias was being diagnosed. That made SPY and QQQ
+# compete for a single slot, and whichever fired first blocked the other —
+# which defeats the purpose now that each instrument is testing a different
+# question. SPY is the one that works and still has only 3 closed trades;
+# QQQ is running the 0.17Δ-against-VXN hypothesis. Sharing one slot would
+# starve both. Raised to 2 so they accumulate evidence independently.
+#
 # Must stay equal to STRATEGY_ALLOCATIONS["credit_spread"]["hard_max_positions"]
 # — asserted below.
-MAX_TOTAL_CONCURRENT_CREDIT_SPREADS = 1
+MAX_TOTAL_CONCURRENT_CREDIT_SPREADS = 2
 
 # The allocator's hard cap and the strategy's global cap are two independent
 # reads of the same intent; a silent divergence would let the allocator fund

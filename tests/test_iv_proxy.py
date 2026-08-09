@@ -387,3 +387,77 @@ class TestAsOfDerivation:
         resolver._fetch_fn = lambda ticker: None
         snap = resolver.resolve_rank("vix")
         assert snap.as_of == stale_end
+
+
+# ── VXN + per-source fallbacks (PLAN 11.57) ─────────────────────────────────
+
+
+class TestVxnSource:
+    """QQQ moved from VIX to VXN on 2026-08-09.
+
+    Evidence, from the ten live QQQ credit spreads: QQQ realized vol ran
+    16%→30% across them while VIX FELL 18.4→15.0. The picker priced QQQ
+    risk off VIX, so every delta it computed drifted toward more risk
+    while reporting less.
+    """
+
+    def test_vxn_is_a_known_source(self) -> None:
+        assert is_valid_source("vxn") is True
+        assert is_valid_source("VXN") is True
+
+    def test_vxn_resolves_to_the_nasdaq_vol_index(self) -> None:
+        seen: list[str] = []
+
+        def fetch(ticker: str):
+            seen.append(ticker)
+            return pd.Series([21.0, 22.5], index=pd.to_datetime(["2026-08-06", "2026-08-07"]))
+
+        assert IVProxyResolver(fetch_fn=fetch).resolve("vxn") == pytest.approx(22.5)
+        assert seen == ["^VXN"]
+
+    def test_vix_and_vxn_are_cached_independently(self) -> None:
+        """One resolver serves both instruments; a QQQ lookup must not
+        return the SPY series or vice versa."""
+        def fetch(ticker: str):
+            level = {"^VIX": 15.0, "^VXN": 23.0}[ticker]
+            return pd.Series([level], index=pd.to_datetime(["2026-08-07"]))
+
+        r = IVProxyResolver(fetch_fn=fetch)
+        assert r.resolve("vix") == pytest.approx(15.0)
+        assert r.resolve("vxn") == pytest.approx(23.0)
+        assert r.resolve("vix") == pytest.approx(15.0)   # cached, not clobbered
+
+
+class TestPerSourceFallback:
+    """A single VIX-scaled fallback understates any index that habitually
+    trades above VIX — and understating sigma is precisely what makes the
+    picker sell a fatter strike than it believes."""
+
+    def test_vxn_falls_back_higher_than_vix(self) -> None:
+        r = IVProxyResolver(fetch_fn=lambda ticker: None)
+        assert r.resolve("vix") == pytest.approx(15.0)
+        assert r.resolve("vxn") == pytest.approx(19.0)
+        assert r.resolve("vxn") > r.resolve("vix")
+
+    def test_explicit_fallback_overrides_every_source(self) -> None:
+        """Callers that pass fallback_points mean it — existing tests and
+        callers rely on that behaviour."""
+        r = IVProxyResolver(fetch_fn=lambda ticker: None, fallback_points=12.0)
+        assert r.resolve("vix") == pytest.approx(12.0)
+        assert r.resolve("vxn") == pytest.approx(12.0)
+
+    def test_fallback_only_applies_with_no_cache(self) -> None:
+        calls = {"n": 0}
+
+        def fetch(ticker: str):
+            calls["n"] += 1
+            return (
+                pd.Series([26.0], index=pd.to_datetime(["2026-08-07"]))
+                if calls["n"] == 1 else None
+            )
+
+        r = IVProxyResolver(fetch_fn=fetch)
+        assert r.resolve("vxn") == pytest.approx(26.0)
+        r._cache["vxn"] = (date(2020, 1, 1), r._cache["vxn"][1])   # force stale
+        # Stale real data beats a synthetic neutral level.
+        assert r.resolve("vxn") == pytest.approx(26.0)

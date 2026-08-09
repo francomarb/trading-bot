@@ -727,12 +727,82 @@ class TestConcurrencyCapParity:
             == settings.MAX_TOTAL_CONCURRENT_CREDIT_SPREADS
         )
 
-    def test_throttle_allows_a_single_concurrent_spread(self):
+    def test_throttle_allows_one_spread_per_instrument(self):
+        """Global 2 against per-instance 1 = exactly one open spread each.
+
+        It was 1 while the delta bias was being diagnosed, which made SPY
+        and QQQ compete for a single slot. They are testing different
+        questions now — SPY has 3 closed trades, QQQ is running the
+        0.17Δ-against-VXN hypothesis — so sharing one slot would starve
+        both. The global cap must stay at the instrument count so neither
+        can crowd the other out.
+        """
         from config import settings
 
-        assert settings.MAX_TOTAL_CONCURRENT_CREDIT_SPREADS == 1
+        n_instruments = len(settings.CREDIT_SPREAD_INSTRUMENTS)
+        assert settings.MAX_TOTAL_CONCURRENT_CREDIT_SPREADS == n_instruments == 2
         for sym, cfg in settings.CREDIT_SPREAD_INSTRUMENTS.items():
             assert cfg["max_concurrent_positions"] == 1, sym
+
+    def test_one_instrument_cannot_take_both_global_slots(self):
+        """QQQ holding a spread must not be able to claim SPY's slot.
+
+        The global cap alone would allow it — 2 slots, and nothing in that
+        number says who may use them. What prevents it is the per-instance
+        cap of 1: each instance counts only its OWN open spreads
+        (`self._open_spreads`), so QQQ is refused a second entry while SPY
+        is still free to take the remaining slot.
+        """
+        exp = date.today() + timedelta(days=37)
+        # Explicit: the _RAW_SPY helper defaults to 3, production is 1.
+        qqq = _strategy(_config("QQQ", spread_width=15, max_concurrent_positions=1))
+        qqq.register_spread(_open_spread(position_id="q1", expiration=exp))
+
+        # QQQ tries for a second while one global slot is still open.
+        with patch(
+            "strategies.credit_spread.find_best_put_spread",
+            return_value=_pick(expiration=exp + timedelta(days=14)),
+        ), patch("data.fetcher.fetch_latest_quote_midpoint", return_value=740.0):
+            with pytest.raises(CreditSpreadRejected, match="per-instance cap"):
+                qqq.build_spread_execution(
+                    745.0, notional_cap=2_000.0, total_open_spreads=1,
+                )
+
+        # SPY, a separate instance, still gets the free slot.
+        spy = _strategy(_config("SPY", max_concurrent_positions=1))
+        with patch(
+            "strategies.credit_spread.find_best_put_spread",
+            return_value=_pick(expiration=exp),
+        ), patch("data.fetcher.fetch_latest_quote_midpoint", return_value=745.0):
+            plan = spy.build_spread_execution(
+                745.0, notional_cap=2_000.0, total_open_spreads=1,
+            )
+        assert isinstance(plan, SpreadExecutionPlan)
+
+    def test_the_second_slot_closes_once_both_instruments_hold_one(self):
+        """With both slots used the global cap binds, and the message says
+        so — not the per-instance one."""
+        exp = date.today() + timedelta(days=37)
+        spy = _strategy(_config("SPY", max_concurrent_positions=1))
+        with patch(
+            "strategies.credit_spread.find_best_put_spread",
+            return_value=_pick(expiration=exp),
+        ), patch("data.fetcher.fetch_latest_quote_midpoint", return_value=745.0):
+            with pytest.raises(CreditSpreadRejected, match="global cap"):
+                spy.build_spread_execution(
+                    745.0, notional_cap=2_000.0, total_open_spreads=2,
+                )
+
+    def test_global_cap_cannot_starve_an_instrument(self):
+        """Per-instance caps summing above the global cap means the slower
+        instrument gets crowded out — the failure this raise fixed."""
+        from config import settings
+
+        per_instance_total = sum(
+            c["max_concurrent_positions"]
+            for c in settings.CREDIT_SPREAD_INSTRUMENTS.values()
+        )
+        assert settings.MAX_TOTAL_CONCURRENT_CREDIT_SPREADS >= per_instance_total
 
     def test_both_instruments_remain_eligible_under_the_throttle(self):
         """
@@ -744,3 +814,195 @@ class TestConcurrencyCapParity:
         assert set(settings.CREDIT_SPREAD_INSTRUMENTS) == {"SPY", "QQQ"}
         for cfg in settings.CREDIT_SPREAD_INSTRUMENTS.values():
             assert cfg["max_concurrent_positions"] >= 1
+
+
+class TestSelectionSpot:
+    """PLAN 11.57 step 3 — contract selection must run against the LIVE
+    spot, not the prior session's close.
+
+    `underlying_price` is the bar close `_decision_frame` hands a 1Day
+    slot. That is correct for the *signal* (the trend gate lives in the
+    edge filter and still uses it), but the picker bounds its strike scan
+    and computes its Black-Scholes delta from the same number while
+    ranking LIVE quotes — so a stale spot describes a market that has
+    moved on.
+
+    These assert the value the picker actually receives. The pre-existing
+    entry tests stub `find_best_put_spread` and pass either way, which is
+    precisely why they cannot cover this.
+    """
+
+    _EXP = date.today() + timedelta(days=37)
+    _BAR_CLOSE = 745.0
+
+    def _run(self, *, live_spot, bar_close=None):
+        """Returns (positional_spot_passed_to_picker, pick_event)."""
+        events: list[dict] = []
+
+        def sink(message):
+            extra = message.record["extra"]
+            if extra.get("event") == "credit_spread_pick":
+                events.append(dict(extra))
+
+        from loguru import logger
+
+        sink_id = logger.add(sink, level="DEBUG")
+        try:
+            with patch(
+                "strategies.credit_spread.find_best_put_spread",
+                return_value=_pick(expiration=self._EXP),
+            ) as picker, patch(
+                "data.fetcher.fetch_latest_quote_midpoint",
+                **({"side_effect": live_spot}
+                   if isinstance(live_spot, Exception)
+                   else {"return_value": live_spot}),
+            ):
+                _strategy().build_spread_execution(
+                    self._BAR_CLOSE if bar_close is None else bar_close,
+                    notional_cap=2_000.0,
+                )
+        finally:
+            logger.remove(sink_id)
+        return picker.call_args.args[1], (events[0] if events else None)
+
+    def test_picker_receives_the_live_spot_not_the_bar_close(self):
+        spot, event = self._run(live_spot=738.20)
+        assert spot == pytest.approx(738.20)
+        assert spot != pytest.approx(self._BAR_CLOSE)
+        assert event["spot_used"] == pytest.approx(738.20)
+        assert event["spot_source"] == "live_quote"
+        # The bar close is still recorded, for the drift measurement.
+        assert event["spot_at_decision"] == pytest.approx(self._BAR_CLOSE)
+
+    def test_falls_back_to_the_bar_close_when_no_live_quote(self):
+        """A slightly stale spot beats no spread at all."""
+        spot, event = self._run(live_spot=None)
+        assert spot == pytest.approx(self._BAR_CLOSE)
+        assert event["spot_used"] == pytest.approx(self._BAR_CLOSE)
+        assert event["spot_source"] == "bar_close_fallback"
+        assert event["spot_live"] is None
+
+    def test_quote_lookup_raising_does_not_break_the_entry(self):
+        spot, event = self._run(live_spot=RuntimeError("broker down"))
+        assert spot == pytest.approx(self._BAR_CLOSE)
+        assert event["spot_source"] == "bar_close_fallback"
+
+    @pytest.mark.parametrize("bad", [0.0, -5.0, float("nan")])
+    def test_unusable_quote_values_fall_back(self, bad):
+        spot, event = self._run(live_spot=bad)
+        assert spot == pytest.approx(self._BAR_CLOSE)
+        assert event["spot_source"] == "bar_close_fallback"
+
+    def test_only_one_quote_fetch_per_pick(self):
+        """Selection and the audit event share one lookup — the earlier
+        version fetched a second time purely to log it."""
+        with patch(
+            "strategies.credit_spread.find_best_put_spread",
+            return_value=_pick(expiration=self._EXP),
+        ), patch(
+            "data.fetcher.fetch_latest_quote_midpoint", return_value=740.0
+        ) as quote:
+            _strategy().build_spread_execution(745.0, notional_cap=2_000.0)
+        assert quote.call_count == 1
+
+    def test_delta_and_strike_bounds_see_the_same_spot(self):
+        """The whole point of the fix: one spot drives both halves of
+        selection, so the delta label describes the strike that was
+        actually scanned."""
+        spot, event = self._run(live_spot=700.0)
+        assert spot == pytest.approx(700.0)
+        # est_short_delta_at_live_spot is computed at the live spot too,
+        # so with selection now on that spot the two agree by construction.
+        assert event["spot_used"] == pytest.approx(event["spot_live"])
+
+
+class TestQqqVolProxy:
+    """PLAN 11.57 — QQQ risk must be measured against QQQ's volatility.
+
+    Measured across the ten live QQQ credit spreads: QQQ sold 4.61% OTM
+    against SPY's 4.44% — nearly the same distance — but carried only
+    0.55 sigma of cushion against SPY's 1.09, because QQQ's realized vol
+    was 23.0% against SPY's 10.6%. Over the same trades VIX fell
+    18.4 -> 15.0 while QQQ vol ran 16% -> 30%.
+    """
+
+    def test_qqq_target_delta_returns_to_017_against_the_fixed_proxy(self):
+        """Not a revert of PR #80. The number labels "whatever strike my
+        model calls a 17% chance", so it points somewhere different once
+        the model is fixed: 0.17-with-VIX gave ~0.6-0.8 sigma of real
+        cushion (what lost); 0.17-with-VXN gives ~0.95, near SPY's 1.09.
+
+        0.12 against the corrected proxy targets ~1.17 sigma, which the
+        ten real fills extrapolate to ~10.7% of width -- under the 13%
+        floor, i.e. permanently idle.
+        """
+        from config.settings import CREDIT_SPREAD_INSTRUMENTS
+
+        assert CREDIT_SPREAD_INSTRUMENTS["QQQ"]["short_leg_delta"] == pytest.approx(0.17)
+
+    def test_target_delta_and_credit_floor_are_mutually_satisfiable(self):
+        """The pair that broke QQQ: a delta target so far out that the
+        credit floor can never be met is not a conservative setting, it is
+        an idle one. Pins that the two are not silently re-set into
+        contradiction."""
+        from config.settings import CREDIT_SPREAD_INSTRUMENTS
+
+        for sym, cfg in CREDIT_SPREAD_INSTRUMENTS.items():
+            assert cfg["short_leg_delta"] >= 0.15, (
+                f"{sym}: delta {cfg['short_leg_delta']} is far enough OTM that "
+                f"the {cfg['min_credit_pct_of_width']:.0%} credit floor is "
+                "unlikely to be reachable — see PLAN 11.57"
+            )
+
+    def test_qqq_prices_risk_off_the_nasdaq_vol_index(self):
+        from config.settings import CREDIT_SPREAD_INSTRUMENTS
+
+        assert CREDIT_SPREAD_INSTRUMENTS["QQQ"]["iv_proxy_source"] == "vxn"
+
+    def test_spy_still_uses_vix(self):
+        """VIX is the correct index for SPY; only QQQ was mismatched."""
+        from config.settings import CREDIT_SPREAD_INSTRUMENTS
+
+        assert CREDIT_SPREAD_INSTRUMENTS["SPY"]["iv_proxy_source"] == "vix"
+
+    def test_min_iv_proxy_was_rescaled_with_the_source(self):
+        """14 was a VIX level. VXN averaged ~1.24x VIX over 2016-2026, so
+        leaving 14 in place would have quietly loosened the premium gate
+        rather than preserving it."""
+        from config.settings import CREDIT_SPREAD_INSTRUMENTS
+
+        spy = CREDIT_SPREAD_INSTRUMENTS["SPY"]
+        qqq = CREDIT_SPREAD_INSTRUMENTS["QQQ"]
+        assert spy["min_iv_proxy"] == 14
+        assert qqq["min_iv_proxy"] == 17
+        assert qqq["min_iv_proxy"] / spy["min_iv_proxy"] == pytest.approx(1.21, abs=0.05)
+
+    def test_every_configured_source_is_resolvable(self):
+        """A source name that the resolver does not know would raise at the
+        first trade, not at import."""
+        from config.settings import CREDIT_SPREAD_INSTRUMENTS
+        from utils.iv_proxy import is_valid_source
+
+        for sym, cfg in CREDIT_SPREAD_INSTRUMENTS.items():
+            assert is_valid_source(cfg["iv_proxy_source"]), sym
+
+    def test_the_strategy_asks_its_resolver_for_the_configured_source(self):
+        """Wiring check: the config value must actually reach resolve()."""
+        asked: list[str] = []
+
+        class _Spy(IVProxyResolver):
+            def resolve(self, source):           # type: ignore[override]
+                asked.append(source)
+                return 22.0
+
+        strat = CreditSpread(
+            _config("QQQ", iv_proxy_source="vxn", spread_width=15),
+            iv_resolver=_Spy(fetch_fn=lambda t: None),
+            quote_lookup=_stub_quotes,
+        )
+        with patch(
+            "strategies.credit_spread.find_best_put_spread",
+            return_value=_pick(expiration=date.today() + timedelta(days=37)),
+        ), patch("data.fetcher.fetch_latest_quote_midpoint", return_value=740.0):
+            strat.build_spread_execution(745.0, notional_cap=2_000.0)
+        assert asked == ["vxn"]

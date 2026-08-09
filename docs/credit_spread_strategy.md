@@ -28,7 +28,7 @@ update; allocated 10% of equity in the isolated-options pool.
 |---|---|---|
 | Pool type | Isolated options (defined-risk, never stretches) | `settings.STRATEGY_ALLOCATIONS["credit_spread"]` |
 | Sleeve weight | 0.10 of equity (target) | same |
-| Shared max concurrent positions | **1** across all underlyings (throttled 2026-08-09, PLAN 11.57; was 8) | `settings.MAX_TOTAL_CONCURRENT_CREDIT_SPREADS` |
+| Shared max concurrent positions | **2** across all underlyings — one per instrument (throttled 2026-08-09, PLAN 11.57; was 8, briefly 1) | `settings.MAX_TOTAL_CONCURRENT_CREDIT_SPREADS` |
 | Regime gate | `TRENDING`, `RANGING` only | `settings.STRATEGY_ALLOWED_REGIMES["credit_spread"]` |
 | Sleeve budget pct | 0.10 | `settings.CREDIT_SPREAD_SLEEVE_BUDGET_PCT` |
 | Min trades for health verdict | 25 | `settings.STRATEGY_MIN_TRADES_FOR_VERDICT` |
@@ -52,15 +52,15 @@ compensate for the higher underlying price).
 
 | Parameter | SPY | QQQ | Notes |
 |---|---|---|---|
-| `short_leg_delta` | 0.17 | 0.12 | QQQ moved farther OTM after paper losses showed 17Δ entries were not high-quality enough |
+| `short_leg_delta` | 0.17 | **0.17** | QQQ: 0.17 → 0.12 (PR #80) → 0.17 (11.57). **Not a revert** — the label points to a different strike once the vol proxy is correct: 0.17-with-VIX gave ~0.6–0.8σ of real cushion, 0.17-with-VXN gives ~0.95σ. 0.12 against the fixed proxy targets ~1.17σ, below the credit floor and therefore idle |
 | `spread_width` | 10 | 15 | Long strike = short strike − width |
 | `dte_min` | 30 | 30 | Earliest entry expiry |
 | `dte_max` | 45 | 45 | Latest entry expiry |
 | `trend_sma_buffer_pct` | 0.00 | 0.01 | QQQ requires close > 50 SMA by 1%; SPY keeps the original close > 50 SMA gate |
-| `iv_proxy_source` | `vix` | `vix` | ⚠️ "QQQ tracks SPX vol closely enough" is the assumption under audit in PLAN 11.57 — measured QQQ spread vol runs above VIX. Note `iv` feeds **only** the Black-Scholes delta estimate; the credit itself is quote-derived |
-| `min_iv_proxy` | 14 | 14 | VIX must be ≥ 14 for entry (premium floor) |
+| `iv_proxy_source` | `vix` | **`vxn`** | QQQ moved to the Nasdaq-100 vol index 2026-08-09 (PLAN 11.57). "QQQ tracks SPX vol closely enough" was disproved by the live trades — see below |
+| `min_iv_proxy` | 14 | **17** | Premium floor, in the units of each instrument's own index. Rescaled with the source: VXN averaged 1.24× VIX over 2016-2026, so 14→17 preserves the gate rather than loosening it |
 | `min_credit_pct_of_width` | 0.13 | 0.13 | Credit ≥ 13% of spread width |
-| `max_concurrent_positions` | **1** | **1** | Per-instance cap. Throttled from 3 on 2026-08-09 (PLAN 11.57); the global cap of 1 binds first |
+| `max_concurrent_positions` | **1** | **1** | Per-instance cap. Throttled from 3 on 2026-08-09 (PLAN 11.57); the global cap of 2 means exactly one open spread each, so neither instrument can crowd the other out |
 | `max_per_expiration` | 1 | 1 | One spread per expiry, per underlying |
 | `min_dte_gap_between_opens` | 7 | 7 | Stagger entries across calendar |
 | `profit_target_pct` | 0.50 | 0.50 | Close at 50% of max profit |
@@ -126,8 +126,8 @@ lookup. The allocator routes them through a single shared sleeve.
 - Allocated 10% of equity in the isolated-options pool (shared sleeve).
 - Health monitor floor: 25 trades for `CONCLUSIVE` verdict; the sleeve
   takes a while to accumulate that many trades — and **slower still under
-  the 11.57 throttle**, which allows one open spread across both
-  underlyings (was 3 per instance / 8 global).
+  the 11.57 throttle**, which allows one open spread per instrument
+  (was 3 per instance / 8 global).
 - Watch items: (1) per-side fill quality on the two-leg combo, (2)
   realized credit-to-width ratio vs. the 0.13 floor, (3) frequency of
   short-strike-breach exits in volatile sessions, (4) walk-and-market
@@ -142,6 +142,44 @@ QQQ averaged 17.8% of width against SPY's 14.7% while targeting a
 *lower* nominal delta on a *wider* spread — where credit/width should
 fall, not rise. The signal was in the watch list from day one and was
 never read comparatively.
+
+### Why QQQ prices risk off VXN, not VIX (PLAN 11.57)
+
+Measured on the **ten live QQQ credit spreads**, not simulated:
+
+| | strikes sold | own realized vol | **cushion** | wins | P&L |
+|---|---|---|---|---|---|
+| SPY | 4.44% OTM | 10.6% | **1.09 σ** | 2/3 | −$2 |
+| QQQ | 4.61% OTM | 23.0% | **0.55 σ** | 2/10 | −$1,932 |
+
+Both sold at essentially the same *percentage* distance. QQQ's own
+volatility was more than double, so that distance bought **half the
+protection**. Sorted by cushion the outcome is near-monotonic: **every
+QQQ trade below 0.6σ lost — six for six**, and both winners were the two
+widest cushions (0.79σ, 0.66σ).
+
+**Why nobody could see it.** Across those same trades QQQ's realized vol
+ran **16% → 30%** while **VIX fell 18.4 → 15.0**. The bot measured QQQ's
+risk with SPX's volatility, so while QQQ was becoming twice as dangerous
+its own risk numbers said conditions were calming. Every delta it
+computed — and therefore every strike it chose — drifted toward more risk
+while reporting less.
+
+**This is also why PR #80 could not work.** Its diagnosis ("QQQ entries
+are not high-quality enough") was right, and its lever moved the strikes
+out as intended — 4.53% → 4.96% OTM. But the cushion still *fell*,
+0.58σ → 0.44σ, because QQQ's vol was rising faster than the strikes were
+moving. It turned the right dial, in the right direction, in a currency
+that was lying to it.
+
+`min_iv_proxy` was rescaled 14 → 17 alongside the source, since 14 was a
+VIX level and VXN runs ~1.24× VIX; leaving it would have loosened the
+premium gate rather than preserving it.
+
+**What to watch:** with a correct vol input the picker should select
+strikes near ~1σ of cushion rather than ~0.55σ. That is directly visible
+in the `credit_spread_pick` events below — `est_short_delta_at_live_spot`
+should now track `target_short_delta`.
 
 ### Pick-time instrumentation (`credit_spread_pick`, PLAN 11.57)
 
@@ -685,7 +723,7 @@ Honest expectations based on documented research, **not promises**. Numbers belo
 
 | Metric | Expected range |
 |---|---|
-| Win rate (per trade) | 72–80% |
+| Win rate (per trade) | 72–80% projected · **72.3% simulated on SPY** (2016–2026, live exit ladder) — see the note below |
 | Average winner | ~50% of credit received |
 | Average loser | 1.5–2.5× credit received |
 | Expectancy per trade | Positive but small (~+25% of max profit on average) |
@@ -694,6 +732,41 @@ Honest expectations based on documented research, **not promises**. Numbers belo
 | Annual sleeve return | 30–60% in normal conditions |
 | Annual portfolio contribution | 3–6% on $108k account |
 | Worst quarter | −10% to −25% of sleeve, plausibly more if positioned wrong into a crash |
+
+### Win-rate projection — re-derived 2026-08-09 (PLAN 11.57 step 4)
+
+The 72–80% above was P(short put expires OTM) for a 17Δ put. **The
+strategy never holds to expiration** — `stop_loss_multiple = 2.0` closes
+on a doubling of the mid, a far shallower move than a strike breach — so
+the projection described a structure the bot does not trade. It was
+re-derived against the live exit ladder.
+
+At +0.5C / −1.0C the breakeven is 66.7% of trades won.
+
+| | simulated | breakeven | expectancy |
+|---|---|---|---|
+| **SPY** @ true 0.17Δ | **72.3%** (n=173) | 67.4% | **+$0.134/share** |
+| **QQQ** @ true 0.12Δ | *no entries clear the credit floor* | — | — |
+
+**The projection holds for SPY.** The 2×-credit stop does bite — 26.6% of
+entries stop out — but not enough to break the structure.
+
+**QQQ is a config contradiction.** At its configured *true* 0.12Δ a
+15-wide QQQ spread collects a mean **5.7% of width** and clears the 13%
+`min_credit_pct_of_width` floor **zero times in 374 samples**. Production
+traded 10 QQQ spreads at 15–21% of width only because the delta estimate
+was biased (11.57 steps 1–3) and the strikes were never really 0.12Δ. By
+true delta: 0.12→5.7%, 0.17→8.5%, 0.22→11.5%. Either the floor or the
+target has to give — and that choice needs live `credit_spread_pick`
+data, not the model, which is the biased instrument.
+
+**Read as an upper bound.** No bid/ask, no skew, no early assignment; all
+three make reality worse. Pricing is Black-Scholes at VIX — the same
+model and the same bias the picker uses — so the SPY/QQQ *asymmetry* is
+the robust signal, not QQQ's absolute figures. Entries overlap, so 173 is
+worth fewer independent observations than it looks.
+
+Reproduce: `venv/bin/python -m scripts.credit_spread_winrate_sim`
 
 ### Critical caveat — negative skew
 
