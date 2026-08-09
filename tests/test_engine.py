@@ -6879,3 +6879,45 @@ class TestPostFillStopReAnchor:
         engine._repair_missing_protective_stops(snapshot)
         kwargs = broker.replace_day_stop_with_standalone_gtc.call_args.kwargs
         assert kwargs["stop_price"] == 95.0
+
+    def test_substrate_reconstructed_decision_cannot_re_anchor(self, engine_factory):
+        """BLOCKER, pinned deliberately (PLAN 11.54).
+
+        The only live caller of `_ensure_recovered_protective_stop` is the
+        substrate entry-fill path, and it rebuilds the RiskDecision with
+        `entry_reference_price=float(event.avg_fill_price)`
+        (engine/trader.py:2519) because the original signal-bar close is
+        not persisted anywhere.
+
+        The re-anchor offset is `|entry_reference_price - stop_price|`. When
+        the reference IS the fill, that offset is `fill - stop` -- the
+        already-wrong distance -- and re-anchoring to `fill - offset`
+        returns the original stop exactly. The fix is therefore INERT on
+        the real path until the intended k*ATR offset (or the reference
+        close) is persisted at submit time on the lifecycle order row.
+
+        This mirrors `risk_budget_dollars`: the denominator has to be
+        recorded when it is used, not reconstructed afterwards.
+
+        When that prerequisite lands, this test should start failing and be
+        replaced by an assertion that the stop DID move.
+        """
+        engine, broker, snapshot = self._day_stop_setup(engine_factory, 386.95)
+        # Exactly how engine/trader.py:2519 builds it.
+        reconstructed = RiskDecision(
+            symbol="AAPL", side=Side.BUY, qty=10.0,
+            entry_reference_price=426.09,      # == the fill
+            stop_price=386.95,
+            strategy_name="donchian_breakout", reason="substrate dispatch",
+            order_type=OrderType.STOP_LIMIT,
+            entry_trigger_price=418.49, limit_price=439.41,
+        )
+        engine._ensure_recovered_protective_stop(
+            snapshot=snapshot,
+            position=snapshot.account.open_positions["AAPL"],
+            decision=reconstructed,
+            fill_price=426.09,
+        )
+        kwargs = broker.replace_day_stop_with_standalone_gtc.call_args.kwargs
+        # Unchanged: the offset collapsed to `fill - stop`.
+        assert kwargs["stop_price"] == pytest.approx(386.95)

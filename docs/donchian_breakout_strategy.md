@@ -342,7 +342,15 @@ Eight independent layers are active when Donchian runs in production:
 
 ### Caveat: the ATR stop is not 2× ATR from the entry (PLAN 11.54)
 
-> **✅ FIXED for new entries, 2026-08-09.** The post-fill DAY→GTC stop
+> **⚠️ MECHANISM BUILT BUT INERT — NOT YET FIXED (2026-08-09).** The re-anchor
+> below is implemented and correct in isolation, but the substrate entry-fill
+> path rebuilds the `RiskDecision` with `entry_reference_price = fill`, so the
+> offset collapses to `fill − stop` and re-anchoring is a **no-op** in
+> production. Blocked on persisting the intended k×ATR offset at submit time —
+> see PLAN `11.54`. **Live behaviour is unchanged; the room figures in this
+> section still describe production.**
+>
+> Once unblocked: the post-fill DAY→GTC stop
 > rebuild now prices the replacement stop at `fill − 2×ATR` instead of
 > reusing the bracket child's reference-anchored price, so room is exactly
 > 100% of intended on every new entry. **Existing open positions were
