@@ -727,12 +727,82 @@ class TestConcurrencyCapParity:
             == settings.MAX_TOTAL_CONCURRENT_CREDIT_SPREADS
         )
 
-    def test_throttle_allows_a_single_concurrent_spread(self):
+    def test_throttle_allows_one_spread_per_instrument(self):
+        """Global 2 against per-instance 1 = exactly one open spread each.
+
+        It was 1 while the delta bias was being diagnosed, which made SPY
+        and QQQ compete for a single slot. They are testing different
+        questions now — SPY has 3 closed trades, QQQ is running the
+        0.17Δ-against-VXN hypothesis — so sharing one slot would starve
+        both. The global cap must stay at the instrument count so neither
+        can crowd the other out.
+        """
         from config import settings
 
-        assert settings.MAX_TOTAL_CONCURRENT_CREDIT_SPREADS == 1
+        n_instruments = len(settings.CREDIT_SPREAD_INSTRUMENTS)
+        assert settings.MAX_TOTAL_CONCURRENT_CREDIT_SPREADS == n_instruments == 2
         for sym, cfg in settings.CREDIT_SPREAD_INSTRUMENTS.items():
             assert cfg["max_concurrent_positions"] == 1, sym
+
+    def test_one_instrument_cannot_take_both_global_slots(self):
+        """QQQ holding a spread must not be able to claim SPY's slot.
+
+        The global cap alone would allow it — 2 slots, and nothing in that
+        number says who may use them. What prevents it is the per-instance
+        cap of 1: each instance counts only its OWN open spreads
+        (`self._open_spreads`), so QQQ is refused a second entry while SPY
+        is still free to take the remaining slot.
+        """
+        exp = date.today() + timedelta(days=37)
+        # Explicit: the _RAW_SPY helper defaults to 3, production is 1.
+        qqq = _strategy(_config("QQQ", spread_width=15, max_concurrent_positions=1))
+        qqq.register_spread(_open_spread(position_id="q1", expiration=exp))
+
+        # QQQ tries for a second while one global slot is still open.
+        with patch(
+            "strategies.credit_spread.find_best_put_spread",
+            return_value=_pick(expiration=exp + timedelta(days=14)),
+        ), patch("data.fetcher.fetch_latest_quote_midpoint", return_value=740.0):
+            with pytest.raises(CreditSpreadRejected, match="per-instance cap"):
+                qqq.build_spread_execution(
+                    745.0, notional_cap=2_000.0, total_open_spreads=1,
+                )
+
+        # SPY, a separate instance, still gets the free slot.
+        spy = _strategy(_config("SPY", max_concurrent_positions=1))
+        with patch(
+            "strategies.credit_spread.find_best_put_spread",
+            return_value=_pick(expiration=exp),
+        ), patch("data.fetcher.fetch_latest_quote_midpoint", return_value=745.0):
+            plan = spy.build_spread_execution(
+                745.0, notional_cap=2_000.0, total_open_spreads=1,
+            )
+        assert isinstance(plan, SpreadExecutionPlan)
+
+    def test_the_second_slot_closes_once_both_instruments_hold_one(self):
+        """With both slots used the global cap binds, and the message says
+        so — not the per-instance one."""
+        exp = date.today() + timedelta(days=37)
+        spy = _strategy(_config("SPY", max_concurrent_positions=1))
+        with patch(
+            "strategies.credit_spread.find_best_put_spread",
+            return_value=_pick(expiration=exp),
+        ), patch("data.fetcher.fetch_latest_quote_midpoint", return_value=745.0):
+            with pytest.raises(CreditSpreadRejected, match="global cap"):
+                spy.build_spread_execution(
+                    745.0, notional_cap=2_000.0, total_open_spreads=2,
+                )
+
+    def test_global_cap_cannot_starve_an_instrument(self):
+        """Per-instance caps summing above the global cap means the slower
+        instrument gets crowded out — the failure this raise fixed."""
+        from config import settings
+
+        per_instance_total = sum(
+            c["max_concurrent_positions"]
+            for c in settings.CREDIT_SPREAD_INSTRUMENTS.values()
+        )
+        assert settings.MAX_TOTAL_CONCURRENT_CREDIT_SPREADS >= per_instance_total
 
     def test_both_instruments_remain_eligible_under_the_throttle(self):
         """

@@ -577,7 +577,7 @@ STRATEGY_ALLOCATIONS: dict[str, dict] = {
         # credit_spread takes the next free slot.
         "priority": 4,
         "can_stretch": False,
-        "hard_max_positions": 1,            # 11.57 throttle (was 8)
+        "hard_max_positions": 2,            # 11.57 throttle: 1 per instrument (was 8)
         "max_position_pct_of_sleeve": 0.40,
     },
 }
@@ -743,7 +743,7 @@ CREDIT_SPREAD_INSTRUMENTS: dict[str, dict] = {
         "min_iv_proxy": 14,                 # VIX index points
         "min_credit_pct_of_width": 0.13,
         # Position management
-        "max_concurrent_positions": 1,      # 11.57 throttle (was 3)
+        "max_concurrent_positions": 1,      # 11.57 throttle (was 3); global cap allows 1 each
         "max_per_expiration": 1,
         "min_dte_gap_between_opens": 7,
         # Exits
@@ -787,7 +787,7 @@ CREDIT_SPREAD_INSTRUMENTS: dict[str, dict] = {
         # premium when there is enough of it) rather than loosening the gate.
         "min_iv_proxy": 17,
         "min_credit_pct_of_width": 0.13,
-        "max_concurrent_positions": 1,      # 11.57 throttle (was 3)
+        "max_concurrent_positions": 1,      # 11.57 throttle (was 3); global cap allows 1 each
         "max_per_expiration": 1,
         "min_dte_gap_between_opens": 7,
         "profit_target_pct": 0.50,
@@ -837,11 +837,19 @@ if set(STRATEGY_WATCHLISTS["credit_spread"]) != set(CREDIT_SPREAD_INSTRUMENTS):
 CREDIT_SPREAD_SLEEVE_BUDGET_PCT = 0.10
 # Global cap across ALL credit-spread instances combined — the safety net
 # for a correlated drawdown where every instrument's own cap is full.
-# Held at 1 by the 11.57 throttle (was 8); this is the binding constraint
-# that guarantees a single open spread regardless of the per-instance caps.
+# Held at 2 by the 11.57 throttle (was 8; briefly 1). With per-instance
+# caps of 1 this is exactly ONE OPEN SPREAD PER INSTRUMENT.
+#
+# It was 1 while the delta bias was being diagnosed. That made SPY and QQQ
+# compete for a single slot, and whichever fired first blocked the other —
+# which defeats the purpose now that each instrument is testing a different
+# question. SPY is the one that works and still has only 3 closed trades;
+# QQQ is running the 0.17Δ-against-VXN hypothesis. Sharing one slot would
+# starve both. Raised to 2 so they accumulate evidence independently.
+#
 # Must stay equal to STRATEGY_ALLOCATIONS["credit_spread"]["hard_max_positions"]
 # — asserted below.
-MAX_TOTAL_CONCURRENT_CREDIT_SPREADS = 1
+MAX_TOTAL_CONCURRENT_CREDIT_SPREADS = 2
 
 # The allocator's hard cap and the strategy's global cap are two independent
 # reads of the same intent; a silent divergence would let the allocator fund

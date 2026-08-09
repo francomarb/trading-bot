@@ -28,7 +28,7 @@ update; allocated 10% of equity in the isolated-options pool.
 |---|---|---|
 | Pool type | Isolated options (defined-risk, never stretches) | `settings.STRATEGY_ALLOCATIONS["credit_spread"]` |
 | Sleeve weight | 0.10 of equity (target) | same |
-| Shared max concurrent positions | **1** across all underlyings (throttled 2026-08-09, PLAN 11.57; was 8) | `settings.MAX_TOTAL_CONCURRENT_CREDIT_SPREADS` |
+| Shared max concurrent positions | **2** across all underlyings — one per instrument (throttled 2026-08-09, PLAN 11.57; was 8, briefly 1) | `settings.MAX_TOTAL_CONCURRENT_CREDIT_SPREADS` |
 | Regime gate | `TRENDING`, `RANGING` only | `settings.STRATEGY_ALLOWED_REGIMES["credit_spread"]` |
 | Sleeve budget pct | 0.10 | `settings.CREDIT_SPREAD_SLEEVE_BUDGET_PCT` |
 | Min trades for health verdict | 25 | `settings.STRATEGY_MIN_TRADES_FOR_VERDICT` |
@@ -60,7 +60,7 @@ compensate for the higher underlying price).
 | `iv_proxy_source` | `vix` | **`vxn`** | QQQ moved to the Nasdaq-100 vol index 2026-08-09 (PLAN 11.57). "QQQ tracks SPX vol closely enough" was disproved by the live trades — see below |
 | `min_iv_proxy` | 14 | **17** | Premium floor, in the units of each instrument's own index. Rescaled with the source: VXN averaged 1.24× VIX over 2016-2026, so 14→17 preserves the gate rather than loosening it |
 | `min_credit_pct_of_width` | 0.13 | 0.13 | Credit ≥ 13% of spread width |
-| `max_concurrent_positions` | **1** | **1** | Per-instance cap. Throttled from 3 on 2026-08-09 (PLAN 11.57); the global cap of 1 binds first |
+| `max_concurrent_positions` | **1** | **1** | Per-instance cap. Throttled from 3 on 2026-08-09 (PLAN 11.57); the global cap of 2 means exactly one open spread each, so neither instrument can crowd the other out |
 | `max_per_expiration` | 1 | 1 | One spread per expiry, per underlying |
 | `min_dte_gap_between_opens` | 7 | 7 | Stagger entries across calendar |
 | `profit_target_pct` | 0.50 | 0.50 | Close at 50% of max profit |
@@ -126,8 +126,8 @@ lookup. The allocator routes them through a single shared sleeve.
 - Allocated 10% of equity in the isolated-options pool (shared sleeve).
 - Health monitor floor: 25 trades for `CONCLUSIVE` verdict; the sleeve
   takes a while to accumulate that many trades — and **slower still under
-  the 11.57 throttle**, which allows one open spread across both
-  underlyings (was 3 per instance / 8 global).
+  the 11.57 throttle**, which allows one open spread per instrument
+  (was 3 per instance / 8 global).
 - Watch items: (1) per-side fill quality on the two-leg combo, (2)
   realized credit-to-width ratio vs. the 0.13 floor, (3) frequency of
   short-strike-breach exits in volatile sessions, (4) walk-and-market
