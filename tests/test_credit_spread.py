@@ -744,3 +744,103 @@ class TestConcurrencyCapParity:
         assert set(settings.CREDIT_SPREAD_INSTRUMENTS) == {"SPY", "QQQ"}
         for cfg in settings.CREDIT_SPREAD_INSTRUMENTS.values():
             assert cfg["max_concurrent_positions"] >= 1
+
+
+class TestSelectionSpot:
+    """PLAN 11.57 step 3 — contract selection must run against the LIVE
+    spot, not the prior session's close.
+
+    `underlying_price` is the bar close `_decision_frame` hands a 1Day
+    slot. That is correct for the *signal* (the trend gate lives in the
+    edge filter and still uses it), but the picker bounds its strike scan
+    and computes its Black-Scholes delta from the same number while
+    ranking LIVE quotes — so a stale spot describes a market that has
+    moved on.
+
+    These assert the value the picker actually receives. The pre-existing
+    entry tests stub `find_best_put_spread` and pass either way, which is
+    precisely why they cannot cover this.
+    """
+
+    _EXP = date.today() + timedelta(days=37)
+    _BAR_CLOSE = 745.0
+
+    def _run(self, *, live_spot, bar_close=None):
+        """Returns (positional_spot_passed_to_picker, pick_event)."""
+        events: list[dict] = []
+
+        def sink(message):
+            extra = message.record["extra"]
+            if extra.get("event") == "credit_spread_pick":
+                events.append(dict(extra))
+
+        from loguru import logger
+
+        sink_id = logger.add(sink, level="DEBUG")
+        try:
+            with patch(
+                "strategies.credit_spread.find_best_put_spread",
+                return_value=_pick(expiration=self._EXP),
+            ) as picker, patch(
+                "data.fetcher.fetch_latest_quote_midpoint",
+                **({"side_effect": live_spot}
+                   if isinstance(live_spot, Exception)
+                   else {"return_value": live_spot}),
+            ):
+                _strategy().build_spread_execution(
+                    self._BAR_CLOSE if bar_close is None else bar_close,
+                    notional_cap=2_000.0,
+                )
+        finally:
+            logger.remove(sink_id)
+        return picker.call_args.args[1], (events[0] if events else None)
+
+    def test_picker_receives_the_live_spot_not_the_bar_close(self):
+        spot, event = self._run(live_spot=738.20)
+        assert spot == pytest.approx(738.20)
+        assert spot != pytest.approx(self._BAR_CLOSE)
+        assert event["spot_used"] == pytest.approx(738.20)
+        assert event["spot_source"] == "live_quote"
+        # The bar close is still recorded, for the drift measurement.
+        assert event["spot_at_decision"] == pytest.approx(self._BAR_CLOSE)
+
+    def test_falls_back_to_the_bar_close_when_no_live_quote(self):
+        """A slightly stale spot beats no spread at all."""
+        spot, event = self._run(live_spot=None)
+        assert spot == pytest.approx(self._BAR_CLOSE)
+        assert event["spot_used"] == pytest.approx(self._BAR_CLOSE)
+        assert event["spot_source"] == "bar_close_fallback"
+        assert event["spot_live"] is None
+
+    def test_quote_lookup_raising_does_not_break_the_entry(self):
+        spot, event = self._run(live_spot=RuntimeError("broker down"))
+        assert spot == pytest.approx(self._BAR_CLOSE)
+        assert event["spot_source"] == "bar_close_fallback"
+
+    @pytest.mark.parametrize("bad", [0.0, -5.0, float("nan")])
+    def test_unusable_quote_values_fall_back(self, bad):
+        spot, event = self._run(live_spot=bad)
+        assert spot == pytest.approx(self._BAR_CLOSE)
+        assert event["spot_source"] == "bar_close_fallback"
+
+    def test_only_one_quote_fetch_per_pick(self):
+        """Selection and the audit event share one lookup — the earlier
+        version fetched a second time purely to log it."""
+        with patch(
+            "strategies.credit_spread.find_best_put_spread",
+            return_value=_pick(expiration=self._EXP),
+        ), patch(
+            "data.fetcher.fetch_latest_quote_midpoint", return_value=740.0
+        ) as quote:
+            _strategy().build_spread_execution(745.0, notional_cap=2_000.0)
+        assert quote.call_count == 1
+
+    def test_delta_and_strike_bounds_see_the_same_spot(self):
+        """The whole point of the fix: one spot drives both halves of
+        selection, so the delta label describes the strike that was
+        actually scanned."""
+        spot, event = self._run(live_spot=700.0)
+        assert spot == pytest.approx(700.0)
+        # est_short_delta_at_live_spot is computed at the live spot too,
+        # so with selection now on that spot the two agree by construction.
+        assert event["spot_used"] == pytest.approx(event["spot_live"])

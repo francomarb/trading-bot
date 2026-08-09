@@ -685,7 +685,7 @@ Honest expectations based on documented research, **not promises**. Numbers belo
 
 | Metric | Expected range |
 |---|---|
-| Win rate (per trade) | 72–80% |
+| Win rate (per trade) | 72–80% projected · **72.3% simulated on SPY** (2016–2026, live exit ladder) — see the note below |
 | Average winner | ~50% of credit received |
 | Average loser | 1.5–2.5× credit received |
 | Expectancy per trade | Positive but small (~+25% of max profit on average) |
@@ -694,6 +694,41 @@ Honest expectations based on documented research, **not promises**. Numbers belo
 | Annual sleeve return | 30–60% in normal conditions |
 | Annual portfolio contribution | 3–6% on $108k account |
 | Worst quarter | −10% to −25% of sleeve, plausibly more if positioned wrong into a crash |
+
+### Win-rate projection — re-derived 2026-08-09 (PLAN 11.57 step 4)
+
+The 72–80% above was P(short put expires OTM) for a 17Δ put. **The
+strategy never holds to expiration** — `stop_loss_multiple = 2.0` closes
+on a doubling of the mid, a far shallower move than a strike breach — so
+the projection described a structure the bot does not trade. It was
+re-derived against the live exit ladder.
+
+At +0.5C / −1.0C the breakeven is 66.7% of trades won.
+
+| | simulated | breakeven | expectancy |
+|---|---|---|---|
+| **SPY** @ true 0.17Δ | **72.3%** (n=173) | 67.4% | **+$0.134/share** |
+| **QQQ** @ true 0.12Δ | *no entries clear the credit floor* | — | — |
+
+**The projection holds for SPY.** The 2×-credit stop does bite — 26.6% of
+entries stop out — but not enough to break the structure.
+
+**QQQ is a config contradiction.** At its configured *true* 0.12Δ a
+15-wide QQQ spread collects a mean **5.7% of width** and clears the 13%
+`min_credit_pct_of_width` floor **zero times in 374 samples**. Production
+traded 10 QQQ spreads at 15–21% of width only because the delta estimate
+was biased (11.57 steps 1–3) and the strikes were never really 0.12Δ. By
+true delta: 0.12→5.7%, 0.17→8.5%, 0.22→11.5%. Either the floor or the
+target has to give — and that choice needs live `credit_spread_pick`
+data, not the model, which is the biased instrument.
+
+**Read as an upper bound.** No bid/ask, no skew, no early assignment; all
+three make reality worse. Pricing is Black-Scholes at VIX — the same
+model and the same bias the picker uses — so the SPY/QQQ *asymmetry* is
+the robust signal, not QQQ's absolute figures. Entries overlap, so 173 is
+worth fewer independent observations than it looks.
+
+Reproduce: `venv/bin/python -m scripts.credit_spread_winrate_sim`
 
 ### Critical caveat — negative skew
 

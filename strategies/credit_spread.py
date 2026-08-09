@@ -426,9 +426,19 @@ class CreditSpread(BaseStrategy):
             raise CreditSpreadRejected(f"{self.symbol}: {early_reject}")
 
         iv_points = self._iv_resolver.resolve(self.config.iv_proxy_source)
+        # PLAN 11.57 step 3. ``underlying_price`` is the prior completed
+        # session's close (``_decision_frame`` drops the in-progress bar on
+        # a 1Day slot). That is the right input for the *signal* — the
+        # trend gate lives in the edge filter and still uses it — but
+        # contract selection is an execution concern: the picker ranks and
+        # prices strikes against LIVE quotes, so bounding the strike scan
+        # and estimating delta off a stale spot describes a market that has
+        # moved on. Falls back to the bar close when no live quote is
+        # available, and records which was used either way.
+        selection_spot, spot_live = self._resolve_selection_spot(underlying_price)
         pick: SpreadPick | None = find_best_put_spread(
             self.symbol,
-            underlying_price,
+            selection_spot,
             min_dte=self.config.dte_min,
             max_dte=self.config.dte_max,
             spread_width=self.config.spread_width,
@@ -474,6 +484,8 @@ class CreditSpread(BaseStrategy):
         self._log_pick_inputs(
             pick=pick,
             underlying_price=underlying_price,
+            selection_spot=selection_spot,
+            spot_live=spot_live,
             iv_points=iv_points,
         )
         return SpreadExecutionPlan(
@@ -495,11 +507,43 @@ class CreditSpread(BaseStrategy):
         """Render an optional float for the human-readable log line."""
         return "n/a" if value is None else f"{value:.{places}f}"
 
+    def _resolve_selection_spot(
+        self, bar_close: float
+    ) -> tuple[float, float | None]:
+        """Pick the spot that contract selection should run against.
+
+        Returns ``(spot_used, live_spot_or_None)``. The live NBBO midpoint
+        wins when available, because the picker's strike bounds and its
+        Black-Scholes delta must describe the same market the quotes it
+        ranks are coming from. Any failure — no quote, crossed book,
+        malformed value, network error — falls back to ``bar_close``,
+        which is the pre-11.57 behaviour: a slightly stale spot is far
+        better than no spread at all.
+        """
+        try:
+            from data.fetcher import fetch_latest_quote_midpoint
+
+            live = fetch_latest_quote_midpoint(self.symbol)
+        except Exception as exc:  # pragma: no cover - network path
+            logger.debug(
+                f"[{self.name}] {self.symbol}: live spot lookup raised "
+                f"{type(exc).__name__}: {exc} — selecting on the bar close"
+            )
+            return bar_close, None
+        if live is None or not isinstance(live, (int, float)):
+            return bar_close, None
+        live = float(live)
+        if live <= 0 or live != live:  # non-positive or NaN
+            return bar_close, None
+        return live, live
+
     def _log_pick_inputs(
         self,
         *,
         pick: SpreadPick,
         underlying_price: float,
+        selection_spot: float,
+        spot_live: float | None,
         iv_points: float,
     ) -> None:
         """
@@ -521,16 +565,9 @@ class CreditSpread(BaseStrategy):
         only on a successful pick (at most a few calls a day, not per cycle).
         """
         try:
-            from data.fetcher import fetch_latest_quote_midpoint
             from utils.options_lookup import estimate_put_delta
 
             _fmt = self._fmt_optional
-            spot_live: float | None = None
-            try:
-                spot_live = fetch_latest_quote_midpoint(self.symbol)
-            except Exception as e:  # pragma: no cover - network path
-                logger.debug(f"[{self.name}] {self.symbol}: live spot unavailable: {e}")
-
             dte = (pick.expiration_date - date.today()).days
             sigma = iv_points / 100.0
 
@@ -538,6 +575,10 @@ class CreditSpread(BaseStrategy):
             # stale one. The difference isolates the spot-staleness error
             # from the volatility-input error; without this the two are not
             # separable after the fact.
+            # Delta at the live spot, kept as the audit's ground truth even
+            # now that selection uses it — when the live quote is missing,
+            # selection falls back to the bar close and this goes None,
+            # which is exactly the case worth being able to count.
             delta_at_live_spot: float | None = None
             spot_drift_pct: float | None = None
             if spot_live and spot_live > 0 and dte > 0:
@@ -559,8 +600,16 @@ class CreditSpread(BaseStrategy):
                 long_strike=pick.long_strike,
                 width=pick.width,
                 dte=dte,
-                # Inputs the delta estimate actually used.
+                # The bar close the signal ran on. Since 11.57 step 3 this
+                # is NO LONGER what the delta estimate uses unless the live
+                # quote was unavailable — compare against spot_used.
                 spot_at_decision=underlying_price,
+                # The spot selection actually ran against, and where it
+                # came from. `bar_close_fallback` means no live quote.
+                spot_used=selection_spot,
+                spot_source=(
+                    "live_quote" if spot_live is not None else "bar_close_fallback"
+                ),
                 iv_proxy_source=self.config.iv_proxy_source,
                 iv_proxy_points=iv_points,
                 # Observation only — never an input.
