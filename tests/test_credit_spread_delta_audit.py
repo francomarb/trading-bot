@@ -12,8 +12,10 @@ from __future__ import annotations
 import sqlite3
 from datetime import date
 
+import pandas as pd
 import pytest
 
+from scripts import credit_spread_delta_audit as audit
 from scripts.credit_spread_delta_audit import (
     OccContract,
     SpreadEntry,
@@ -245,6 +247,138 @@ class TestLoadEntriesFromDb:
         entries = load_entries_from_db(db)
         assert len(entries) == 2
         assert [e.entry_date for e in entries] == [date(2026, 7, 10), date(2026, 7, 13)]
+
+
+class TestBuildReportFetchesOnlyWhatIsMissing:
+    """
+    The log source is documented as authoritative and reconstruction-free.
+    That contract is only real if a fully-populated log run touches no
+    network at all — otherwise an unrelated Yahoo or Alpaca outage fails
+    an audit that needed neither.
+    """
+
+    def _logged(self, **overrides):
+        base = dict(
+            underlying="QQQ", entry_date=date(2026, 8, 11),
+            short_strike=690.0, long_strike=675.0, expiry=date(2026, 9, 18),
+            net_credit=3.05, source="logs",
+            spot_at_decision=725.60, spot_live=722.10,
+            iv_points=15.8, est_short_delta=0.124,
+        )
+        base.update(overrides)
+        return SpreadEntry(**base)
+
+    @pytest.fixture
+    def no_network(self, monkeypatch):
+        """Make both network boundaries fatal, the way a DNS failure is."""
+        def boom(*a, **k):
+            raise AssertionError("network was touched")
+
+        monkeypatch.setattr(audit, "_fetch_vix_series", boom)
+        monkeypatch.setattr(audit, "_fetch_close_series", boom)
+
+    def test_complete_log_entries_build_offline(self, no_network):
+        df = audit.build_report([self._logged()])
+        assert len(df) == 1
+        row = df.iloc[0]
+        # The logged values are used verbatim, not re-derived.
+        assert row["spot_dec"] == pytest.approx(725.60)
+        assert row["spot_live"] == pytest.approx(722.10)
+        assert row["vix"] == pytest.approx(15.8)
+        assert row["d_logged"] == pytest.approx(0.124)
+
+    def test_many_complete_entries_still_build_offline(self, no_network):
+        entries = [
+            self._logged(underlying="QQQ"),
+            self._logged(underlying="SPY", short_strike=714.0, long_strike=704.0),
+        ]
+        assert len(audit.build_report(entries)) == 2
+
+    def test_empty_input_does_not_fetch(self, no_network):
+        assert audit.build_report([]).empty
+
+    def test_missing_iv_fetches_vix_but_not_bars(self, monkeypatch):
+        """Only the genuinely absent input is fetched."""
+        calls: list[str] = []
+
+        def fake_vix(start, end):
+            calls.append("vix")
+            idx = pd.to_datetime(["2026-08-08", "2026-08-10"])
+            return pd.Series([16.2, 15.9], index=idx)
+
+        def bars_boom(*a, **k):
+            raise AssertionError("bars were fetched but spots were logged")
+
+        monkeypatch.setattr(audit, "_fetch_vix_series", fake_vix)
+        monkeypatch.setattr(audit, "_fetch_close_series", bars_boom)
+
+        df = audit.build_report([self._logged(iv_points=None)])
+        assert calls == ["vix"]
+        # Prior close strictly before 2026-08-11.
+        assert df.iloc[0]["vix"] == pytest.approx(15.9)
+
+    def test_missing_live_spot_fetches_bars_but_not_vix(self, monkeypatch):
+        """
+        `spot_live` is legitimately None when the pick-time quote was
+        unavailable, so the fallback decision is per entry, not per source.
+        """
+        calls: list[str] = []
+
+        def fake_bars(symbol, start, end):
+            calls.append(symbol)
+            idx = pd.to_datetime(["2026-08-10", "2026-08-11"])
+            return pd.Series([724.0, 719.5], index=idx)
+
+        def vix_boom(*a, **k):
+            raise AssertionError("VIX was fetched but iv_points was logged")
+
+        monkeypatch.setattr(audit, "_fetch_close_series", fake_bars)
+        monkeypatch.setattr(audit, "_fetch_vix_series", vix_boom)
+
+        df = audit.build_report([self._logged(spot_live=None)])
+        assert calls == ["QQQ"]
+        assert df.iloc[0]["spot_dec"] == pytest.approx(725.60)   # still logged
+        assert df.iloc[0]["spot_live"] == pytest.approx(719.5)   # session close
+
+    def test_bars_are_fetched_once_per_symbol(self, monkeypatch):
+        calls: list[str] = []
+
+        def fake_bars(symbol, start, end):
+            calls.append(symbol)
+            idx = pd.to_datetime(["2026-08-10", "2026-08-11"])
+            return pd.Series([724.0, 719.5], index=idx)
+
+        monkeypatch.setattr(audit, "_fetch_close_series", fake_bars)
+        monkeypatch.setattr(audit, "_fetch_vix_series", lambda *a, **k: pd.Series(dtype=float))
+
+        audit.build_report([
+            self._logged(spot_at_decision=None),
+            self._logged(spot_at_decision=None, entry_date=date(2026, 8, 11)),
+        ])
+        assert calls == ["QQQ"], "memoisation failed — one fetch per symbol"
+
+    def test_zero_spot_is_reported_and_skipped_not_silently_backfilled(
+        self, no_network
+    ):
+        """
+        Truthiness would swap a logged 0.0 for a fetched close and hide
+        corrupt data. `is None` keeps it, and the validator then skips the
+        row loudly — Black-Scholes would otherwise assert deep in the
+        library with a message naming neither the entry nor the field.
+        """
+        df = audit.build_report([self._logged(spot_live=0.0)])
+        assert df.empty  # skipped, and no network was touched to "fix" it
+
+    def test_one_bad_row_does_not_kill_the_batch(self, no_network):
+        df = audit.build_report([
+            self._logged(spot_live=0.0),                      # corrupt
+            self._logged(underlying="SPY", short_strike=714.0, long_strike=704.0),
+        ])
+        assert len(df) == 1
+        assert df.iloc[0]["und"] == "SPY"
+
+    def test_nan_iv_is_skipped_too(self, no_network):
+        assert audit.build_report([self._logged(iv_points=float("nan"))]).empty
 
 
 class TestSpreadEntry:

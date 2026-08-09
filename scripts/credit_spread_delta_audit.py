@@ -35,6 +35,13 @@ Data sources, in order of preference
    so no reconstruction is involved. Only available for picks made after
    the instrumentation shipped (2026-08-09).
 
+   A run whose events are fully populated performs **no network I/O at
+   all** — bars and ^VIX are fetched lazily and only for entries actually
+   missing an input. That is load-bearing, not incidental: an audit that
+   needs neither Yahoo nor Alpaca must not be able to fail because one of
+   them is down. `TestBuildReportFetchesOnlyWhatIsMissing` pins it by
+   making both network boundaries raise.
+
 2. ``--source db`` (default) — reconstructs from ``trades`` rows. Needed
    for the historical sample that predates the instrumentation.
    **Carries a known and irreducible error**: the spot at the pick moment
@@ -69,6 +76,7 @@ from pathlib import Path
 
 import pandas as pd
 from blackscholes import BlackScholesPut
+from loguru import logger
 
 _REPO_ROOT = Path(__file__).resolve().parent.parent
 if str(_REPO_ROOT) not in sys.path:
@@ -350,12 +358,43 @@ def _session_close(series: pd.Series, on: date) -> float:
     return float(s.iloc[-1]) if len(s) else float("nan")
 
 
-def build_report(entries: list[SpreadEntry]) -> pd.DataFrame:
-    """Assemble the per-entry decomposition table."""
+def _fetch_vix_series(start: datetime, end: datetime) -> pd.Series:
+    """Daily ^VIX closes. Network boundary — kept separate so the lazy
+    caller can avoid it entirely and tests can prove that it did."""
     import yfinance as yf
 
+    s = yf.Ticker("^VIX").history(start=start, end=end)["Close"]
+    s.index = pd.to_datetime(s.index).tz_localize(None).normalize()
+    return s
+
+
+def _fetch_close_series(symbol: str, start: datetime, end: datetime) -> pd.Series:
+    """Daily closes on the replay feed. Network boundary — see above."""
     from data.fetcher import fetch_symbol
 
+    df, _ = fetch_symbol(
+        symbol, start=start, end=end, timeframe="1Day", feed=REPLAY_FEED
+    )
+    df.index = pd.to_datetime(df.index).tz_localize(None).normalize()
+    return df["close"]
+
+
+def build_report(entries: list[SpreadEntry]) -> pd.DataFrame:
+    """
+    Assemble the per-entry decomposition table.
+
+    **Fetches only what the entries do not already carry.** A
+    ``--source logs`` run whose events are fully populated
+    (``spot_at_decision``, ``spot_live``, ``iv_proxy_points`` all present)
+    touches the network zero times — that is the point of the log source
+    being authoritative, and an unrelated Yahoo or Alpaca outage must not
+    be able to fail it. Bars and ^VIX are pulled lazily, once, and only
+    when some entry actually needs a fallback.
+
+    ``spot_live`` is legitimately ``None`` in a logged event when the live
+    quote was unavailable at pick time, so the fallback decision is made
+    per entry rather than per source.
+    """
     if not entries:
         return pd.DataFrame()
 
@@ -364,24 +403,59 @@ def build_report(entries: list[SpreadEntry]) -> pd.DataFrame:
     pad_start = datetime(lo.year, lo.month, 1, tzinfo=timezone.utc)
     pad_end = datetime(hi.year, hi.month, hi.day, tzinfo=timezone.utc) + pd.Timedelta(days=5)
 
-    vix = yf.Ticker("^VIX").history(start=pad_start, end=pad_end)["Close"]
-    vix.index = pd.to_datetime(vix.index).tz_localize(None).normalize()
+    # Memoised lazy loaders: the fetch happens on first genuine need.
+    _vix: list[pd.Series] = []
+    _bars: dict[str, pd.Series] = {}
 
-    bars: dict[str, pd.Series] = {}
-    for sym in sorted({e.underlying for e in entries}):
-        df, _ = fetch_symbol(
-            sym, start=pad_start, end=pad_end, timeframe="1Day", feed=REPLAY_FEED
-        )
-        df.index = pd.to_datetime(df.index).tz_localize(None).normalize()
-        bars[sym] = df["close"]
+    def vix_series() -> pd.Series:
+        if not _vix:
+            _vix.append(_fetch_vix_series(pad_start, pad_end))
+        return _vix[0]
+
+    def close_series(symbol: str) -> pd.Series:
+        if symbol not in _bars:
+            _bars[symbol] = _fetch_close_series(symbol, pad_start, pad_end)
+        return _bars[symbol]
 
     rows = []
     for e in entries:
-        close = bars[e.underlying]
-        # Logged values win; DB reconstruction falls back to bar/index data.
-        spot_dec = e.spot_at_decision or _prior_close(close, e.entry_date)
-        spot_live = e.spot_live or _session_close(close, e.entry_date)
-        iv = e.iv_points if e.iv_points is not None else _prior_close(vix, e.entry_date)
+        # Logged values win. Use `is None`, not truthiness — a logged 0.0
+        # is corrupt data, and silently swapping in a fetched close would
+        # hide that instead of surfacing it.
+        if e.spot_at_decision is not None:
+            spot_dec = e.spot_at_decision
+        else:
+            spot_dec = _prior_close(close_series(e.underlying), e.entry_date)
+
+        if e.spot_live is not None:
+            spot_live = e.spot_live
+        else:
+            spot_live = _session_close(close_series(e.underlying), e.entry_date)
+
+        if e.iv_points is not None:
+            iv = e.iv_points
+        else:
+            iv = _prior_close(vix_series(), e.entry_date)
+
+        # Black-Scholes asserts S > 0 and sigma > 0 deep inside the
+        # library, which would kill the whole batch with a message that
+        # names neither the entry nor the field. Check here so one bad
+        # row is reported and skipped rather than ending the run.
+        bad = [
+            name for name, val in (
+                ("spot_at_decision", spot_dec),
+                ("spot_live", spot_live),
+                ("iv_points", iv),
+            )
+            if val is None or not (val > 0) or pd.isna(val)
+        ]
+        if bad:
+            logger.warning(
+                f"skipping {e.underlying} {e.entry_date} ({e.source}): "
+                f"non-positive or missing {', '.join(bad)} "
+                f"(spot_dec={spot_dec}, spot_live={spot_live}, iv={iv})"
+            )
+            continue
 
         d = decompose_delta_error(
             spot_at_decision=spot_dec,
