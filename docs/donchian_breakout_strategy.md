@@ -352,17 +352,61 @@ the trigger sits *below* the signal close on every observed entry (ANET 175.39
 vs 181.18, AAPL 333.75 vs 336.93, WYFI 32.25 vs 37.29). So the actual distance
 from entry to stop is unknown at submit time and varies per trade:
 
-| Entry | Room vs the intended 2× ATR | Deployed risk vs budget |
-|---|---|---|
-| ANET 2026-07-09 | 108.2% | 94.1% ⚠️ |
-| AAPL 2026-07-28 | 116.1% | 64.4% ⚠️ |
-| WYFI 2026-06-18 | **58.1%** | 99.8% ⚠️ |
+#### Stop room — seven entries, all reconciled (2026-08-09)
 
-⚠️ **The deployed-risk column above is superseded.** Those three ratios were
-computed from a *reconstructed* budget; PLAN `11.54` records why every
-reconstruction attempted so far misattributes the denominator, and
-`risk_budget_dollars` was only persisted from 2026-08-03. With the real
-denominator the picture is systematic rather than sporadic:
+**Room does not require the trade to close.** It is entry price, stop price
+and ATR, all of which exist the moment the entry fills. An earlier version of
+this section implied the open cohort could not contribute; that was wrong, and
+four of the seven rows below cost nothing to gather.
+
+| Entry | submitted | ref close | fill | fill vs ref | 2× ATR | room | **room %** | outcome |
+|---|---|---|---|---|---|---|---|---|
+| AMZN | 2026-08-04 | 284.12 | 277.90 | **−2.19%** | 19.68 | 13.45 | **68.4%** | open |
+| WYFI | 2026-06-17 | 35.61 | 33.85 | **−4.94%** | 6.52 | 4.76 | **73.0%** | stopped out |
+| ANET | 2026-07-09 | 181.18 | 182.82 | +0.91% | 19.96 | 21.60 | 108.2% | stopped out |
+| MSFT | 2026-08-07 | 500.04 | 504.20 | +0.83% | 32.65 | 36.82 | 112.8% | open |
+| AVGO | 2026-08-07 | 420.68 | 426.09 | +1.29% | 33.73 | 39.14 | 116.0% | open |
+| AAPL | 2026-07-28 | 336.93 | 339.54 | +0.77% | 16.19 | 18.80 | 116.1% | stopped out (gap) |
+| GOOG | 2026-08-04 | 372.50 | 376.55 | +1.09% | 25.21 | 29.26 | 116.1% | open |
+
+**Shape: five long, two short.** Five entries cluster tightly at 108–116% —
+*more* room than intended — and two fall short. Only the short ones carry
+premature-stop risk; the long ones carry the under-deployment cost instead.
+
+**There is no mystery in the distribution — it is an identity.** Because the
+stop is `reference − 2×ATR` and room is `fill − stop`:
+
+```
+room % = 100% + (fill − reference) / (2 × ATR)
+```
+
+So room is fully determined at fill time by how far the fill landed from the
+reference close, **measured in ATR units** — not in percent. That distinction
+matters: WYFI's fill was 4.94% below its reference against AMZN's 2.19%, yet
+WYFI kept *more* room, because WYFI's ATR was 9.2% of its price and AMZN's was
+3.5%. Ranking entries by raw percentage gap gets the ordering wrong.
+
+**Correction — WYFI is 73.0%, not the 58.1% previously recorded here.** The
+old figure does not reconcile. The method used above does: for all seven
+entries, `reference − 2×ATR` reproduces the stop price the broker actually
+holds **to the cent** (verified against `position_lifecycle_orders`), which is
+what licenses the recomputation over the recorded value.
+
+⚠️ **Methodology — use the SUBMIT date, not the fill date.** The stop is an OTO
+bracket child attached when the entry is *submitted*, so the reference bar is
+the prior completed session as of submission. WYFI submitted 2026-06-17 and
+filled 2026-06-18; anchoring on the fill date gives 70.3% and fails to
+reconcile by $2.39. Every other entry here submitted and filled the same day,
+which is exactly why the error stayed invisible until WYFI. **This is the
+fourth reference/denominator error on this workstream** — after
+`reference − stop` in the original 11.53 audit, `qty × (limit − stop)`, and the
+reconstructed risk budget. Check reconciliation before trusting any new
+number here.
+
+**Deployed risk — the other cost, on its own line.** The three ratios formerly
+in this table (94.1% / 64.4% / 99.8%) came from a *reconstructed* budget that
+PLAN `11.54` documents as unreliable; `risk_budget_dollars` was only persisted
+from 2026-08-03. With the real denominator:
 
 | Entry | Deployed risk vs **persisted** budget |
 |---|---|
@@ -371,9 +415,21 @@ denominator the picture is systematic rather than sporadic:
 | MSFT 2026-08-07 | 66.3% |
 | AVGO 2026-08-07 | 71.4% |
 
-Consistent ~2/3 deployment in a 65–71% band. All four are still open, so the
-*room-vs-2×ATR* column and the stop-vs-signal exit split are still unanswered
-for this cohort — the two costs stay on separate lines.
+Consistent ~2/3 deployment in a 65–71% band — systematic, not sporadic.
+
+**What still needs the positions to close.** Room is the *condition*; the cost
+is the *consequence*, and only outcomes supply it. AMZN sitting at 68.4% says
+it is more exposed to being stopped by noise. It does not say it will be, nor
+that a full-room stop would have changed anything — that needs the price path
+after the stop. The fix choice depends on **how often short room converts into
+a lost trade that would otherwise have worked**, and that conversion rate is
+what the closes are for.
+
+**Reproduce:** entry fill and stop from `trades` / `position_lifecycle_orders`
+(`role='entry_primary'`, use `created_at` for the submit date); ATR via
+`indicators.technicals.add_atr` at `settings.ATR_LENGTH` on IEX daily bars
+strictly before the submit date. A standing version belongs in the `11.49`
+health-assessor surface per `11.54`'s own instruction — not a new consumer.
 
 **Capital safety is not affected.** `_size_position` divides STOP_LIMIT risk by
 `limit_price − stop` — the worst permitted fill (PR #62 R1 P1-3) — so the dollar
@@ -381,10 +437,14 @@ loss is bounded at or below budget regardless of where the fill lands. No
 observed entry exceeded its budget.
 
 **Strategy performance is affected, in both directions.** A fill below the
-signal close leaves the stop much closer than 2× ATR, so ordinary noise can end
-the trade before it works — WYFI kept 58% of its intended room and was stopped
-out. A fill well below the chase cap leaves the position smaller than the risk
-target calls for — AAPL deployed 64% of budget.
+reference close leaves the stop closer than 2× ATR, so ordinary noise can end
+the trade before it works — WYFI kept 73% of its intended room and was stopped
+out, and AMZN is currently open on 68%. A fill well below the chase cap leaves
+the position smaller than the risk target calls for — the four measured entries
+deployed 65–71% of budget. On the evidence so far the two costs are **not**
+equally frequent: five of seven entries landed long (108–116%) and two short,
+so under-deployment is the common case and premature stopping the occasional
+one. That ratio is from seven entries and should not be treated as settled.
 
 Do **not** apply the `11.53` re-anchor here: it works from `reference − stop`,
 which on AAPL would have cut deployed risk from 64.4% to 55%. `stop_for_fill`
