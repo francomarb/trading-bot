@@ -118,7 +118,11 @@ def strike_at_delta(
 
 @dataclass(frozen=True)
 class ExitRules:
-    """The live exit triggers, in the order `evaluate_close` applies them."""
+    """The live exit triggers.
+
+    Field order here is declarative only — the precedence that matters is
+    encoded in `simulate_one` and mirrors `CreditSpread._classify_exit`.
+    """
 
     profit_target_pct: float = 0.50
     stop_loss_multiple: float = 2.0
@@ -149,11 +153,13 @@ def simulate_one(
     ``spot_path`` / ``vol_path`` start at the bar AFTER entry (index 0 is
     day 1 of the hold). ``vol_path`` is in decimal sigma, not index points.
 
-    Trigger precedence matters and mirrors the strategy: profit target,
-    then stop, then breach, then time stop. A spread can satisfy two on
-    the same bar — a gap through the short strike also doubles the mid —
-    and which one is recorded changes the outcome mix, so the order here
-    is load-bearing, not cosmetic.
+    Trigger precedence mirrors `CreditSpread._classify_exit`: profit
+    target, stop loss, time stop, then short-strike breach. A spread can
+    satisfy two on the same bar — a gap through the short strike also
+    doubles the mid — and which one is recorded changes the outcome mix,
+    so the order is load-bearing and must not drift from production.
+    Outcome labels match production's too (`defensive_breach`), so the two
+    can be compared without a translation table.
 
     Returns None when the paths run out before any trigger fires, which
     the caller should drop rather than score.
@@ -168,10 +174,10 @@ def simulate_one(
             return SimResult("profit_target", mid, i, credit - mid)
         if mid >= rules.stop_loss_multiple * credit:
             return SimResult("stop_loss", mid, i, credit - mid)
-        if rules.exit_on_short_strike_breach and S <= short_strike:
-            return SimResult("breach", mid, i, credit - mid)
         if dte_left <= rules.time_stop_dte:
             return SimResult("time_stop", mid, i, credit - mid)
+        if rules.exit_on_short_strike_breach and S <= short_strike:
+            return SimResult("defensive_breach", mid, i, credit - mid)
     return None
 
 

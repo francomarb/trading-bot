@@ -91,7 +91,7 @@ class TestExitLadder:
     def test_stop_fires_when_the_mid_doubles(self):
         res = simulate_one(**self._BASE, **self._flat(706.0))
         assert res is not None
-        assert res.outcome in ("stop_loss", "breach")
+        assert res.outcome in ("stop_loss", "defensive_breach")
         assert res.pnl < 0
 
     def test_profit_target_takes_precedence_over_the_time_stop(self):
@@ -114,13 +114,46 @@ class TestExitLadder:
         assert res.outcome == "stop_loss"
 
     def test_breach_can_fire_without_the_stop(self):
-        """Disable the stop and the same path exits on the breach rule."""
+        """Disable the stop and the same path exits on the breach rule.
+
+        DTE is still 32 here, well clear of the 21 time stop, so breach is
+        genuinely the trigger rather than a mislabelled time stop.
+        """
         res = simulate_one(
             **self._BASE,
             spot_path=[698.0] * 5, vol_path=[0.18] * 5,
             rules=ExitRules(stop_loss_multiple=99.0),
         )
-        assert res.outcome == "breach"
+        assert res.outcome == "defensive_breach"
+
+    def test_time_stop_outranks_breach_exactly_as_production_does(self):
+        """`CreditSpread._classify_exit` checks time_stop BEFORE breach.
+        An earlier version of this simulator had them swapped, which could
+        mislabel the outcome mix in evidence runs even where P&L matched.
+        """
+        # Construct a genuine collision: stay ABOVE the strike until the
+        # time stop is reachable, then breach on the very bar DTE hits 21.
+        # (Sitting under the strike from bar 1 breaches long before the
+        # time stop and never tests the precedence at all.)
+        above, below = 730.0, 690.0
+        spot = [above] * 15 + [below] * 25          # bar 16 -> dte_left == 21
+        res = simulate_one(
+            **self._BASE,
+            spot_path=spot, vol_path=[0.18] * len(spot),
+            rules=ExitRules(profit_target_pct=0.01, stop_loss_multiple=99.0),
+        )
+        assert res.held_days == 16                  # both triggers true here
+        assert res.outcome == "time_stop"
+
+        # Same bar, breach disabled -> still the time stop, confirming the
+        # collision was real rather than the breach simply never firing.
+        res2 = simulate_one(
+            **self._BASE,
+            spot_path=spot, vol_path=[0.18] * len(spot),
+            rules=ExitRules(profit_target_pct=0.01, stop_loss_multiple=99.0,
+                            exit_on_short_strike_breach=False),
+        )
+        assert res2.held_days == 16 and res2.outcome == "time_stop"
 
     def test_time_stop_fires_when_nothing_else_does(self):
         res = simulate_one(
