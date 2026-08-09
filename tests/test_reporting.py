@@ -4513,3 +4513,113 @@ class TestWeeklyReportDailyLinks:
         body = Path(path).read_text()
         for target in re.findall(r"\]\(([^)]+\.md)\)", body):
             assert (Path(path).parent / target).resolve().parent == daily.resolve()
+
+
+class TestRebaseEntryStop:
+    """PLAN 11.54 — after the post-fill rebuild moves the protective stop to
+    `fill - k*ATR`, the trade row must describe the stop that now exists.
+
+    Two things break otherwise: r_multiple is measured against a cancelled
+    bracket child, and `_repair_missing_protective_stops` restores the OLD
+    level from `read_latest_open_stop_price` if the GTC stop ever
+    disappears -- silently undoing the re-anchor.
+    """
+
+    def _seed(self, tl, *, order_id="entry-1", fill=426.09, qty=7.0,
+              stop=386.95, symbol="AVGO"):
+        """Write an entry row the way the AVGO 2026-08-07 fill did."""
+        from risk.manager import RiskDecision, Side
+        decision = RiskDecision(
+            symbol=symbol, side=Side.BUY, qty=qty,
+            entry_reference_price=420.68, stop_price=stop,
+            strategy_name="donchian_breakout", reason="entry",
+        )
+        result = OrderResult(
+            status=OrderStatus.FILLED, order_id=order_id, symbol=symbol,
+            requested_qty=qty, filled_qty=qty, avg_fill_price=fill,
+            raw_status="filled", placed_stop_price=stop,
+            stop_placement_reported=True,
+        )
+        tl.log(tl.build_record(decision, result, modeled_price=420.68))
+        return decision, result
+
+    def _row(self, tl, order_id="entry-1"):
+        return next(r for r in tl.read_all() if r["order_id"] == order_id)
+
+    def test_rebases_stop_and_recomputes_the_risk_basis(self, tmp_csv):
+        tl = TradeLogger(path=tmp_csv)
+        self._seed(tl)
+        assert self._row(tl)["initial_stop_loss"] == pytest.approx(386.95)
+
+        assert tl.rebase_entry_stop(order_id="entry-1", new_stop_price=392.36)
+
+        row = self._row(tl)
+        assert row["stop_price"] == pytest.approx(392.36)
+        assert row["initial_stop_loss"] == pytest.approx(392.36)
+        # |426.09 - 392.36| = 33.73, i.e. exactly the 2xATR offset.
+        assert row["initial_risk_per_share"] == pytest.approx(33.73, abs=0.01)
+        assert row["initial_risk_dollars"] == pytest.approx(33.73 * 7, abs=0.1)
+
+    def test_repair_lookup_returns_the_new_stop_afterwards(self, tmp_csv):
+        """The consequence that matters most: if the GTC stop vanishes, the
+        repair path must restore the re-anchored level, not the old one."""
+        tl = TradeLogger(path=tmp_csv)
+        self._seed(tl)
+        before = tl.read_latest_open_stop_price(
+            symbol="AVGO", strategy="donchian_breakout",
+        )
+        assert before == pytest.approx(386.95)
+
+        tl.rebase_entry_stop(order_id="entry-1", new_stop_price=392.36)
+
+        after = tl.read_latest_open_stop_price(
+            symbol="AVGO", strategy="donchian_breakout",
+        )
+        assert after == pytest.approx(392.36)
+
+    def test_risk_basis_matches_what_build_record_would_have_written(self, tmp_csv):
+        """The rebased row must be indistinguishable from one written with
+        the re-anchored stop in the first place -- otherwise the two paths
+        disagree about the same position."""
+        tl = TradeLogger(path=tmp_csv)
+        self._seed(tl)
+        tl.rebase_entry_stop(order_id="entry-1", new_stop_price=392.36)
+        rebased = self._row(tl)
+
+        fresh = TradeLogger(path=tmp_csv + ".2")
+        self._seed(fresh, order_id="entry-2", stop=392.36)
+        direct = self._row(fresh, "entry-2")
+
+        for col in ("stop_price", "initial_stop_loss",
+                    "initial_risk_per_share", "initial_risk_dollars"):
+            assert rebased[col] == pytest.approx(direct[col]), col
+
+    def test_unknown_order_id_is_a_no_op(self, tmp_csv):
+        tl = TradeLogger(path=tmp_csv)
+        self._seed(tl)
+        assert tl.rebase_entry_stop(order_id="nope", new_stop_price=392.36) is False
+        assert self._row(tl)["initial_stop_loss"] == pytest.approx(386.95)
+
+    @pytest.mark.parametrize("bad", [0.0, -1.0])
+    def test_non_positive_stop_is_refused(self, tmp_csv, bad):
+        tl = TradeLogger(path=tmp_csv)
+        self._seed(tl)
+        assert tl.rebase_entry_stop(order_id="entry-1", new_stop_price=bad) is False
+        assert self._row(tl)["initial_stop_loss"] == pytest.approx(386.95)
+
+    def test_empty_order_id_is_refused(self, tmp_csv):
+        tl = TradeLogger(path=tmp_csv)
+        self._seed(tl)
+        assert tl.rebase_entry_stop(order_id="", new_stop_price=392.36) is False
+
+    def test_only_the_targeted_row_moves(self, tmp_csv):
+        """Keyed on order_id so a later round trip on the same symbol is
+        never touched."""
+        tl = TradeLogger(path=tmp_csv)
+        self._seed(tl, order_id="entry-1")
+        self._seed(tl, order_id="entry-2", fill=430.00, stop=390.00)
+
+        tl.rebase_entry_stop(order_id="entry-1", new_stop_price=392.36)
+
+        assert self._row(tl, "entry-1")["initial_stop_loss"] == pytest.approx(392.36)
+        assert self._row(tl, "entry-2")["initial_stop_loss"] == pytest.approx(390.00)

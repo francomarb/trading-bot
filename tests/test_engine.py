@@ -6405,8 +6405,13 @@ class TestSubstrateStopLimitReconstruction:
         # Capture the RiskDecision the side-effects helper receives.
         captured: dict = {}
 
-        def _capture(*, snapshot, position, decision, fill_price, fill_qty, reason_suffix):
+        def _capture(*, snapshot, position, decision, fill_price, fill_qty,
+                     reason_suffix, **kwargs):
+            # **kwargs so adding an optional argument to the real helper
+            # does not break this stub with a confusing TypeError that
+            # only surfaces as a swallowed CRITICAL in the dispatch path.
             captured["decision"] = decision
+            captured.update(kwargs)
 
         engine._apply_recovered_entry_side_effects = _capture
 
@@ -6444,8 +6449,13 @@ class TestSubstrateStopLimitReconstruction:
 
         captured: dict = {}
 
-        def _capture(*, snapshot, position, decision, fill_price, fill_qty, reason_suffix):
+        def _capture(*, snapshot, position, decision, fill_price, fill_qty,
+                     reason_suffix, **kwargs):
+            # **kwargs so adding an optional argument to the real helper
+            # does not break this stub with a confusing TypeError that
+            # only surfaces as a swallowed CRITICAL in the dispatch path.
             captured["decision"] = decision
+            captured.update(kwargs)
 
         engine._apply_recovered_entry_side_effects = _capture
 
@@ -6926,6 +6936,68 @@ class TestPostFillStopReAnchor:
         )
         kwargs = broker.replace_day_stop_with_standalone_gtc.call_args.kwargs
         assert kwargs["stop_price"] == pytest.approx(386.95)
+
+    def test_trade_log_is_rebased_to_the_stop_actually_placed(self, engine_factory):
+        """Seam test. The broker stop and the recorded risk basis must not
+        disagree — r_multiple reads the log, and so does the stop-repair
+        path, which would otherwise restore the pre-anchor level."""
+        engine, broker, snapshot = self._day_stop_setup(engine_factory, 386.95)
+        engine._last_atr["AAPL"] = 16.865
+        engine.trade_logger.rebase_entry_stop = MagicMock(return_value=True)
+        decision = self._stop_limit_decision(
+            ref=420.68, stop=386.95, trigger=418.49, limit=439.41,
+        )
+        engine._ensure_recovered_protective_stop(
+            snapshot=snapshot,
+            position=snapshot.account.open_positions["AAPL"],
+            decision=decision,
+            fill_price=426.09,
+            entry_order_id="entry-oid",
+        )
+        placed = broker.replace_day_stop_with_standalone_gtc.call_args.kwargs["stop_price"]
+        engine.trade_logger.rebase_entry_stop.assert_called_once()
+        logged = engine.trade_logger.rebase_entry_stop.call_args.kwargs
+        assert logged["order_id"] == "entry-oid"
+        assert logged["new_stop_price"] == pytest.approx(placed)
+
+    def test_no_rebase_when_the_stop_did_not_move(self, engine_factory):
+        """A rebuild that re-places at the same level has nothing to
+        correct — don't write to the trade log for it."""
+        engine, broker, snapshot = self._day_stop_setup(engine_factory, 392.36)
+        engine._last_atr["AAPL"] = 16.865        # fill 426.09 - 33.73 = 392.36
+        engine.trade_logger.rebase_entry_stop = MagicMock(return_value=True)
+        decision = self._stop_limit_decision(
+            ref=420.68, stop=392.36, trigger=418.49, limit=439.41,
+        )
+        engine._ensure_recovered_protective_stop(
+            snapshot=snapshot,
+            position=snapshot.account.open_positions["AAPL"],
+            decision=decision,
+            fill_price=426.09,
+            entry_order_id="entry-oid",
+        )
+        engine.trade_logger.rebase_entry_stop.assert_not_called()
+
+    def test_a_failed_rebase_never_costs_protection(self, engine_factory):
+        """Reporting accuracy is subordinate to the stop being placed. If
+        the log write raises, the broker stop still stands."""
+        engine, broker, snapshot = self._day_stop_setup(engine_factory, 386.95)
+        engine._last_atr["AAPL"] = 16.865
+        engine.trade_logger.rebase_entry_stop = MagicMock(
+            side_effect=RuntimeError("db locked")
+        )
+        decision = self._stop_limit_decision(
+            ref=420.68, stop=386.95, trigger=418.49, limit=439.41,
+        )
+        engine._ensure_recovered_protective_stop(
+            snapshot=snapshot,
+            position=snapshot.account.open_positions["AAPL"],
+            decision=decision,
+            fill_price=426.09,
+            entry_order_id="entry-oid",
+        )
+        kwargs = broker.replace_day_stop_with_standalone_gtc.call_args.kwargs
+        assert kwargs["stop_price"] == pytest.approx(392.36, abs=0.01)
 
     def test_atr_is_cached_where_the_close_already_was(self, engine_factory):
         """The value was computed every cycle and thrown away; the fix is

@@ -355,9 +355,8 @@ Eight independent layers are active when Donchian runs in production:
 > holds a GTC stop. The four open on 2026-08-09 keep the room shown below.
 >
 > Closes cost **(a)**. Cost **(b)**, under-deployment, is unchanged and
-> slightly widened. **Known follow-up:** the trade log still records the
-> pre-anchor stop, so `r_multiple` mildly understates R and a stop repair
-> would restore the old price — see PLAN `11.54`.
+> slightly widened. The trade row is rebased to the stop actually placed,
+> so `r_multiple` and the stop-repair path both read the real level.
 >
 > **Removes a live-vs-backtest divergence.** `backtest/runner.py` models the
 > stop as `entry_price − atr_stop_mult × ATR` — anchored to the actual fill,
