@@ -629,6 +629,15 @@ class TradingEngine:
         self._watchlist_reasons: dict[str, dict[str, list[str]]] = {}
         self._sector_heat: dict | None = None
         self._last_underlying_prices: dict[str, float] = {}
+        # Latest ATR per symbol, stashed alongside the close above. Used to
+        # re-anchor a protective stop to the price we actually filled at
+        # (PLAN 11.54): a STOP_LIMIT entry's bracket child is priced off the
+        # prior close at submit time, so its distance from the real entry
+        # varied 68%-116% of the intended k×ATR across seven live entries.
+        # The engine already computes this value every cycle to price that
+        # stop and then discards it; keeping it costs nothing and avoids
+        # both a schema change and a re-fetch inside a fill handler.
+        self._last_atr: dict[str, float] = {}
 
         # Sector exposure observability (11.7 Part B). Maps normalized sector
         # key → count of open equity positions in that sector. OCC option
@@ -1425,6 +1434,7 @@ class TradingEngine:
         latest_close = float(df["close"].iloc[-1])
         latest_ts = df.index[-1]
         self._last_underlying_prices[symbol] = latest_close
+        self._last_atr[symbol] = latest_atr
 
         if signal_bar_already_processed:
             processed_owner_conflict = False
@@ -2358,6 +2368,7 @@ class TradingEngine:
         self._entry_prices[symbol] = fill_price
         self._ensure_recovered_protective_stop(
             snapshot=snapshot, position=position, decision=decision,
+            fill_price=fill_price,
         )
         # PR-65 review F1: `result` was not in scope (helper takes
         # decision/position/fill_price/fill_qty only). Look up the uid
@@ -2852,14 +2863,74 @@ class TradingEngine:
                 f"legacy fallback may still handle stream stop fills."
             )
 
+    def _fill_anchored_stop_price(
+        self,
+        *,
+        symbol: str,
+        fill_price: float | None,
+        fallback: float,
+        strategy_name: str,
+    ) -> float:
+        """Protective stop placed k×ATR below the price we actually filled at.
+
+        Returns ``fallback`` — the stop already sitting at the broker —
+        whenever the inputs can't support a better answer. A stop that
+        cannot be placed is worse than one placed slightly off, so every
+        failure here is a no-op rather than a gap in protection.
+
+        Uses ``self._last_atr``, refreshed each cycle. When an entry rests
+        overnight the ATR will have moved on by a day; that is accepted.
+        The drift is ~4% on the one observed cross-day entry (WYFI,
+        submitted 06-17, filled 06-18) against the 68%–116% spread this
+        replaces.
+        """
+        if fill_price is None:
+            return fallback
+        atr = self._last_atr.get(symbol)
+        if atr is None:
+            logger.warning(
+                f"[{strategy_name}] {symbol}: no cached ATR — leaving the "
+                f"protective stop at {fallback:.2f} (not re-anchored)"
+            )
+            return fallback
+        try:
+            fill = float(fill_price)
+            offset = float(self.risk.atr_stop_multiplier) * float(atr)
+        except (TypeError, ValueError):
+            return fallback
+        if not math.isfinite(fill) or fill <= 0:
+            return fallback
+        if not math.isfinite(offset) or offset <= 0:
+            return fallback
+        anchored = fill - offset
+        if not math.isfinite(anchored) or anchored <= 0 or anchored >= fill:
+            return fallback
+        if abs(anchored - fallback) >= 0.005:
+            logger.info(
+                f"[{strategy_name}] {symbol}: re-anchoring protective stop "
+                f"{fallback:.2f} → {anchored:.2f} on fill {fill:.2f} "
+                f"(offset {offset:.2f} = {self.risk.atr_stop_multiplier}×ATR "
+                f"{atr:.2f}; room was "
+                f"{100 * (fill - fallback) / offset:.1f}% of intended)"
+            )
+        return anchored
+
     def _ensure_recovered_protective_stop(
         self,
         *,
         snapshot: BrokerSnapshot,
         position: Position,
         decision: RiskDecision,
+        fill_price: float | None = None,
     ) -> None:
-        """Place the intended stop immediately for a recovered entry if missing."""
+        """Place the intended stop immediately for a recovered entry if missing.
+
+        ``fill_price`` re-anchors the rebuilt stop to the price we actually
+        filled at (PLAN 11.54). It only affects the DAY→GTC rebuild branch
+        below, which runs **once per position, at fill confirmation** —
+        after that the stop is GTC and the branch is skipped, so an already
+        open position can never have its live stop moved by this path.
+        """
         symbol = decision.symbol
         existing = self._protective_stop_order(symbol, snapshot)
         if existing is not None:
@@ -2880,11 +2951,32 @@ class TradingEngine:
                             f"rebuild-stop position_uid lookup raised "
                             f"{type(exc).__name__}: {exc} — proceeding"
                         )
+                # Re-anchor to the actual fill (PLAN 11.54). The bracket
+                # child was priced off the prior session's close at submit
+                # time, so its distance from the real entry varied 68%-116%
+                # of the intended k×ATR. This rebuild already cancels and
+                # re-places the order, so re-deriving the price is free.
+                #
+                # The offset comes from the stashed ATR, NOT from the
+                # decision's own `reference − stop` distance. On this path
+                # the substrate reconstructs the decision with
+                # `entry_reference_price = avg_fill_price`, so that
+                # distance collapses to `fill − stop` and re-anchoring
+                # against it is a no-op — see the warning on
+                # `RiskDecision.stop_for_fill`. k×ATR is the actual design
+                # intent and the only thing that reproduces the backtest,
+                # which models the stop as `entry_price − k×ATR`.
+                _rebuild_stop = self._fill_anchored_stop_price(
+                    symbol=symbol,
+                    fill_price=fill_price,
+                    fallback=float(existing.stop_price),
+                    strategy_name=decision.strategy_name,
+                )
                 promoted = self.broker.replace_day_stop_with_standalone_gtc(
                     symbol=symbol,
                     stop_order_id=existing.order_id,
                     qty=abs(int(position.qty)),
-                    stop_price=float(existing.stop_price),
+                    stop_price=_rebuild_stop,
                     client_order_id_prefix=(
                         f"{decision.strategy_name}-recover-stop-gtc"
                     ),

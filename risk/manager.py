@@ -238,6 +238,20 @@ class RiskDecision:
         usable fill, or when the re-anchored stop would be non-positive
         or land on the wrong side of the entry — a stop that cannot be
         placed is worse than one placed slightly off.
+
+        **Do not reach for this from the post-fill stop rebuild** (PLAN
+        11.54). It looks like the right tool and is not: that path runs
+        on a decision the substrate reconstructs with
+        `entry_reference_price = avg_fill_price`
+        (engine/trader.py, substrate entry-fill dispatch), because the
+        signal-bar close is not persisted. The offset below is
+        `|entry_reference_price − stop_price|`, so on that path it
+        collapses to `fill − stop` and re-anchoring returns the original
+        stop unchanged. A variant of this method without the STOP_LIMIT
+        guard was written for exactly that purpose, passed its unit tests
+        against a hand-built decision, and was a no-op in production; it
+        was deleted rather than left as a trap. The engine derives the
+        offset from `k × TradingEngine._last_atr[symbol]` instead.
         """
         if self.order_type is OrderType.STOP_LIMIT:
             return self.stop_price

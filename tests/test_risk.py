@@ -1428,3 +1428,4 @@ class TestRiskBudgetIsRecorded:
         reconstructed = d.qty * abs(d.entry_reference_price - d.stop_price)
         assert d.risk_budget_dollars == pytest.approx(600.0)
         assert reconstructed != pytest.approx(d.risk_budget_dollars, rel=0.05)
+

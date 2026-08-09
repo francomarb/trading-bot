@@ -342,6 +342,30 @@ Eight independent layers are active when Donchian runs in production:
 
 ### Caveat: the ATR stop is not 2× ATR from the entry (PLAN 11.54)
 
+> **✅ FIXED for new entries, 2026-08-09.** The post-fill DAY→GTC stop
+> rebuild now prices the replacement at `fill − k×ATR`, using the ATR the
+> engine already computes every cycle (`_last_atr`) rather than the
+> decision's offset — on the production path the decision is rebuilt with
+> `entry_reference_price = fill`, which makes that offset collapse to
+> `fill − stop` and re-anchoring a no-op. Fails safe: any missing input
+> leaves the broker's existing stop untouched.
+>
+> **Existing open positions were deliberately not touched** — the rebuild
+> branch fires only while the live stop is DAY, and an open position already
+> holds a GTC stop. The four open on 2026-08-09 keep the room shown below.
+>
+> Closes cost **(a)**. Cost **(b)**, under-deployment, is unchanged and
+> slightly widened. **Known follow-up:** the trade log still records the
+> pre-anchor stop, so `r_multiple` mildly understates R and a stop repair
+> would restore the old price — see PLAN `11.54`.
+>
+> **Removes a live-vs-backtest divergence.** `backtest/runner.py` models the
+> stop as `entry_price − atr_stop_mult × ATR` — anchored to the actual fill,
+> always. Live was the outlier.
+
+The rest of this section describes the behaviour **before** that fix, and
+still describes the seven entries measured below.
+
 The row above says "2× ATR below entry" because that is the design intent.
 It is not what the broker order does.
 
