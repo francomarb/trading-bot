@@ -6795,6 +6795,7 @@ class TestPostFillStopReAnchor:
         filled 426.09. The old behaviour re-placed at 386.95 (116% room);
         re-anchored it is 392.36 and room is exactly 100%."""
         engine, broker, snapshot = self._day_stop_setup(engine_factory, 386.95)
+        engine._last_atr["AAPL"] = 16.865            # 2x = 33.73, AVGO's real ATR
         decision = self._stop_limit_decision(
             ref=420.68, stop=386.95, trigger=418.49, limit=439.41,
         )
@@ -6811,6 +6812,7 @@ class TestPostFillStopReAnchor:
         """AMZN 2026-08-04 shape — the direction that leaves the stop too
         close: 68.3% of intended room before re-anchoring."""
         engine, broker, snapshot = self._day_stop_setup(engine_factory, 264.45)
+        engine._last_atr["AAPL"] = 9.84              # 2x = 19.68, AMZN's real ATR
         decision = self._stop_limit_decision(
             ref=284.12, stop=264.45, trigger=271.46, limit=285.04,
         )
@@ -6880,33 +6882,21 @@ class TestPostFillStopReAnchor:
         kwargs = broker.replace_day_stop_with_standalone_gtc.call_args.kwargs
         assert kwargs["stop_price"] == 95.0
 
-    def test_substrate_reconstructed_decision_cannot_re_anchor(self, engine_factory):
-        """BLOCKER, pinned deliberately (PLAN 11.54).
+    def test_substrate_reconstructed_decision_still_re_anchors(self, engine_factory):
+        """The production shape, which an earlier attempt could not handle.
 
-        The only live caller of `_ensure_recovered_protective_stop` is the
-        substrate entry-fill path, and it rebuilds the RiskDecision with
-        `entry_reference_price=float(event.avg_fill_price)`
-        (engine/trader.py:2519) because the original signal-bar close is
-        not persisted anywhere.
-
-        The re-anchor offset is `|entry_reference_price - stop_price|`. When
-        the reference IS the fill, that offset is `fill - stop` -- the
-        already-wrong distance -- and re-anchoring to `fill - offset`
-        returns the original stop exactly. The fix is therefore INERT on
-        the real path until the intended k*ATR offset (or the reference
-        close) is persisted at submit time on the lifecycle order row.
-
-        This mirrors `risk_budget_dollars`: the denominator has to be
-        recorded when it is used, not reconstructed afterwards.
-
-        When that prerequisite lands, this test should start failing and be
-        replaced by an assertion that the stop DID move.
+        The substrate rebuilds the RiskDecision with
+        `entry_reference_price = avg_fill_price` (engine/trader.py:2519)
+        because the signal-bar close is not persisted. Deriving the offset
+        from the decision therefore collapses to `fill - stop` and
+        re-anchoring becomes a no-op. Taking the offset from the cached ATR
+        instead sidesteps that entirely -- no schema change, no re-fetch.
         """
         engine, broker, snapshot = self._day_stop_setup(engine_factory, 386.95)
-        # Exactly how engine/trader.py:2519 builds it.
+        engine._last_atr["AAPL"] = 16.865            # AVGO's real ATR; 2x = 33.73
         reconstructed = RiskDecision(
             symbol="AAPL", side=Side.BUY, qty=10.0,
-            entry_reference_price=426.09,      # == the fill
+            entry_reference_price=426.09,            # == the fill, as production builds it
             stop_price=386.95,
             strategy_name="donchian_breakout", reason="substrate dispatch",
             order_type=OrderType.STOP_LIMIT,
@@ -6919,5 +6909,27 @@ class TestPostFillStopReAnchor:
             fill_price=426.09,
         )
         kwargs = broker.replace_day_stop_with_standalone_gtc.call_args.kwargs
-        # Unchanged: the offset collapsed to `fill - stop`.
+        assert kwargs["stop_price"] == pytest.approx(392.36, abs=0.01)
+
+    def test_no_cached_atr_leaves_the_stop_untouched(self, engine_factory):
+        """A stop that cannot be re-derived stays where it is. Never a gap."""
+        engine, broker, snapshot = self._day_stop_setup(engine_factory, 386.95)
+        engine._last_atr.pop("AAPL", None)
+        decision = self._stop_limit_decision(
+            ref=420.68, stop=386.95, trigger=418.49, limit=439.41,
+        )
+        engine._ensure_recovered_protective_stop(
+            snapshot=snapshot,
+            position=snapshot.account.open_positions["AAPL"],
+            decision=decision,
+            fill_price=426.09,
+        )
+        kwargs = broker.replace_day_stop_with_standalone_gtc.call_args.kwargs
         assert kwargs["stop_price"] == pytest.approx(386.95)
+
+    def test_atr_is_cached_where_the_close_already_was(self, engine_factory):
+        """The value was computed every cycle and thrown away; the fix is
+        to keep it. Guard against it being dropped again."""
+        engine, _ = engine_factory()
+        assert hasattr(engine, "_last_atr")
+        assert isinstance(engine._last_atr, dict)

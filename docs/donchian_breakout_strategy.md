@@ -342,15 +342,27 @@ Eight independent layers are active when Donchian runs in production:
 
 ### Caveat: the ATR stop is not 2× ATR from the entry (PLAN 11.54)
 
-> **⚠️ MECHANISM BUILT BUT INERT — NOT YET FIXED (2026-08-09).** The re-anchor
-> below is implemented and correct in isolation, but the substrate entry-fill
-> path rebuilds the `RiskDecision` with `entry_reference_price = fill`, so the
-> offset collapses to `fill − stop` and re-anchoring is a **no-op** in
-> production. Blocked on persisting the intended k×ATR offset at submit time —
-> see PLAN `11.54`. **Live behaviour is unchanged; the room figures in this
-> section still describe production.**
+> **✅ FIXED for new entries, 2026-08-09.** The post-fill DAY→GTC stop
+> rebuild now prices the replacement at `fill − k×ATR`, using the ATR the
+> engine already computes every cycle (`_last_atr`) rather than the
+> decision's offset — on the production path the decision is rebuilt with
+> `entry_reference_price = fill`, which makes that offset collapse to
+> `fill − stop` and re-anchoring a no-op. Fails safe: any missing input
+> leaves the broker's existing stop untouched.
 >
-> Once unblocked: the post-fill DAY→GTC stop
+> **Existing open positions were deliberately not touched** — the rebuild
+> branch fires only while the live stop is DAY, and an open position already
+> holds a GTC stop. The four open on 2026-08-09 keep the room shown below.
+>
+> Closes cost **(a)**. Cost **(b)**, under-deployment, is unchanged and
+> slightly widened. **Known follow-up:** the trade log still records the
+> pre-anchor stop, so `r_multiple` mildly understates R and a stop repair
+> would restore the old price — see PLAN `11.54`.
+>
+> **Removes a live-vs-backtest divergence.** `backtest/runner.py` models the
+> stop as `entry_price − atr_stop_mult × ATR` — anchored to the actual fill,
+> always. Live was the outlier.
+
 > rebuild now prices the replacement stop at `fill − 2×ATR` instead of
 > reusing the bracket child's reference-anchored price, so room is exactly
 > 100% of intended on every new entry. **Existing open positions were
