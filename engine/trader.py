@@ -2957,14 +2957,15 @@ class TradingEngine:
                 # of the intended k×ATR. This rebuild already cancels and
                 # re-places the order, so re-deriving the price is free.
                 #
-                # The offset comes from the stashed ATR, NOT from
-                # `decision.stop_for_confirmed_fill`. On this path the
-                # decision is reconstructed with
-                # `entry_reference_price = avg_fill_price`, so its own
-                # offset collapses to `fill − stop` and re-anchoring
-                # against it is a no-op. k×ATR is the actual design intent
-                # and is the only thing that reproduces the backtest, which
-                # models the stop as `entry_price − k×ATR`.
+                # The offset comes from the stashed ATR, NOT from the
+                # decision's own `reference − stop` distance. On this path
+                # the substrate reconstructs the decision with
+                # `entry_reference_price = avg_fill_price`, so that
+                # distance collapses to `fill − stop` and re-anchoring
+                # against it is a no-op — see the warning on
+                # `RiskDecision.stop_for_fill`. k×ATR is the actual design
+                # intent and the only thing that reproduces the backtest,
+                # which models the stop as `entry_price − k×ATR`.
                 _rebuild_stop = self._fill_anchored_stop_price(
                     symbol=symbol,
                     fill_price=fill_price,

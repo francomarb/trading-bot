@@ -363,24 +363,6 @@ Eight independent layers are active when Donchian runs in production:
 > stop as `entry_price − atr_stop_mult × ATR` — anchored to the actual fill,
 > always. Live was the outlier.
 
-> rebuild now prices the replacement stop at `fill − 2×ATR` instead of
-> reusing the bracket child's reference-anchored price, so room is exactly
-> 100% of intended on every new entry. **Existing open positions were
-> deliberately not touched** — the rebuild branch fires only while the live
-> stop is DAY, and an open position already holds a GTC stop, so this
-> cannot re-price one. The four positions open on 2026-08-09 keep the room
-> shown in the table below.
->
-> This closes cost **(a)**, premature stop-outs. Cost **(b)**,
-> under-deployment, is unchanged and slightly widened — see the deployment
-> note below. The two costs point in opposite directions and are tracked
-> separately on purpose.
->
-> **It also removes a live-vs-backtest divergence.** `backtest/runner.py`
-> models the stop as `entry_price − atr_stop_mult × ATR` — anchored to the
-> actual fill, always. Live was the outlier, so the strategy was trading a
-> stop rule its own validation (Sharpe +0.85, 457 trades) never tested.
-
 The rest of this section describes the behaviour **before** that fix, and
 still describes the seven entries measured below.
 

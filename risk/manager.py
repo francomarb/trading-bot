@@ -238,46 +238,23 @@ class RiskDecision:
         usable fill, or when the re-anchored stop would be non-positive
         or land on the wrong side of the entry — a stop that cannot be
         placed is worse than one placed slightly off.
+
+        **Do not reach for this from the post-fill stop rebuild** (PLAN
+        11.54). It looks like the right tool and is not: that path runs
+        on a decision the substrate reconstructs with
+        `entry_reference_price = avg_fill_price`
+        (engine/trader.py, substrate entry-fill dispatch), because the
+        signal-bar close is not persisted. The offset below is
+        `|entry_reference_price − stop_price|`, so on that path it
+        collapses to `fill − stop` and re-anchoring returns the original
+        stop unchanged. A variant of this method without the STOP_LIMIT
+        guard was written for exactly that purpose, passed its unit tests
+        against a hand-built decision, and was a no-op in production; it
+        was deleted rather than left as a trap. The engine derives the
+        offset from `k × TradingEngine._last_atr[symbol]` instead.
         """
         if self.order_type is OrderType.STOP_LIMIT:
             return self.stop_price
-        return self._stop_anchored_to(fill_price)
-
-    def stop_for_confirmed_fill(self, fill_price: float | None) -> float:
-        """Protective stop re-anchored to a fill that has already happened.
-
-        Same arithmetic as `stop_for_fill`, **without** the STOP_LIMIT
-        early return — because the reason for that guard is timing, not
-        policy. `stop_for_fill` runs at submit time, where a resting
-        STOP_LIMIT entry has no fill to anchor to and its bracket child
-        is going out with the entry. This method is for the opposite
-        moment: the fill is confirmed and its price is known.
-
-        Used by the post-fill DAY→GTC stop rebuild (PLAN 11.54). That
-        rebuild already cancels the bracket child and places a standalone
-        GTC stop — Alpaca cannot modify OTO children in place — so
-        re-deriving the price there costs nothing extra and is what makes
-        live room match the 2×ATR the strategy was backtested on. Before
-        this, the rebuild reused the bracket child's reference-anchored
-        price and live room ranged 68%–116% of intended.
-
-        The sizing caveat in `stop_for_fill` still stands and is
-        deliberately not addressed here: `_size_position` divides
-        STOP_LIMIT risk by `limit_price − stop_price`, so holding the
-        offset constant means realized risk lands below budget on fills
-        above the reference. That is PLAN 11.54's cost (b), tracked
-        separately — room and deployment are two costs pointing in
-        opposite directions and a single fix that nets them out would
-        read as healthy while both stayed wrong.
-        """
-        return self._stop_anchored_to(fill_price)
-
-    def _stop_anchored_to(self, fill_price: float | None) -> float:
-        """Shared re-anchoring arithmetic for both public entry points.
-
-        One implementation so the two callers cannot drift — the offset
-        rule and every fallback branch are defined exactly once.
-        """
         if fill_price is None:
             return self.stop_price
         try:
