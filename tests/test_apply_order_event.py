@@ -3342,25 +3342,26 @@ class TestEntryDispatchSlippageCompleteness:
         # midpoint = 33.33 bps adverse, not the stale first-partial
         # 26.67 bps from avg_fill_price=150.40.
         row = tl._ensure_db().execute(
-            "SELECT status, filled_qty, avg_fill_price, "
+            "SELECT status, qty, filled_qty, avg_fill_price, "
             "slippage_signed_bps, slippage_adverse_bps FROM trades "
             "WHERE order_id='alpaca-entry-pf-1'"
         ).fetchone()
         assert row[0] == "filled"
         assert row[1] == 10.0
-        assert row[2] == pytest.approx(150.50)
+        assert row[2] == 10.0
+        assert row[3] == pytest.approx(150.50)
         # Final-fill slippage: (150.50 − 150.0) / 150.0 × 10_000 ≈
         # 33.33 bps adverse on a BUY. Without the round-2 fix this
         # would have been 26.67 bps (the stale first-partial value
         # against avg_fill_price=150.40).
         expected_signed = (150.50 - 150.0) / 150.0 * 10_000
-        assert row[3] == pytest.approx(expected_signed, abs=0.1)
         assert row[4] == pytest.approx(expected_signed, abs=0.1)
+        assert row[5] == pytest.approx(expected_signed, abs=0.1)
         # Sanity: ensure the assertion would actually catch the
         # stale first-partial value (26.67) — guards against a
         # future refactor that silently re-introduces the bug.
         stale_first_partial = (150.40 - 150.0) / 150.0 * 10_000
-        assert abs(row[3] - stale_first_partial) > 1.0
+        assert abs(row[4] - stale_first_partial) > 1.0
 
     def test_completeness_call_failure_logs_critical(
         self, tmp_path,

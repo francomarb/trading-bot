@@ -1497,6 +1497,7 @@ INSERT INTO trades (
 )
 ON CONFLICT(order_id) WHERE order_id IS NOT NULL AND position_type = 'single_leg'
 DO UPDATE SET
+    qty                           = excluded.filled_qty,
     filled_qty                    = excluded.filled_qty,
     avg_fill_price                = excluded.avg_fill_price,
     status                        = excluded.status,
