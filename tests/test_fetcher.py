@@ -832,3 +832,134 @@ class TestUseCacheFalseIsNonDestructive:
             timeframe="1Day", feed="iex", use_cache=False,
         )
         assert not (tmp_cache_dir / "iex" / "NVDA_1Day_all.parquet").exists()
+
+
+class TestJuly2026ShutdownRegression:
+    """The specific incident 11.52 documents, end to end.
+
+    2026-07-13 → 07-20 the laptop was off. On resume the bot issued one
+    large catch-up fetch; the meta recorded the REQUEST, so whatever subset
+    came back was accepted silently and the missing sessions sat inside
+    [covered_start, covered_end] forever. 92 of 106 SIP symbols lost that
+    trading week, undetectable from the metadata, and it later produced a
+    wrong analytical result (the ANET counterfactual in 11.54).
+
+    Two things these tests do that the rest of the file does not:
+
+    1. **Start from a POPULATED cache.** July began with history and a
+       shutdown gap, which takes a different branch — cov_start/cov_end are
+       set, `_missing_ranges` computes a tail range, and the response
+       merges into existing bars. Empty-cache tests never exercise it.
+    2. **Use an API fake that respects the requested window.** A fake that
+       returns the missing bars regardless of what was asked lets the buggy
+       code "heal" the hole for the wrong reason — it passed against the
+       original fetcher until this was fixed.
+    """
+
+    def _bars(self, days):
+        idx = pd.DatetimeIndex([pd.Timestamp(d, tz="UTC") for d in days])
+        return pd.DataFrame(
+            {"open": 1.0, "high": 2.0, "low": 0.5, "close": 1.5, "volume": 100},
+            index=idx,
+        )
+
+    def _api(self, available, log=None):
+        """A fake that behaves like Alpaca: only ever returns bars INSIDE
+        the requested range. Anything looser makes these tests vacuous."""
+        def fake(symbol, timeframe, s, e, adjustment, feed):
+            if log is not None:
+                log.append((s.date(), e.date()))
+            inside = [
+                d for d in available
+                if s.date() <= date.fromisoformat(d) <= e.date()
+            ]
+            return self._bars(inside) if inside else pd.DataFrame()
+        return fake
+
+    def _cached_days(self, tmp_cache_dir, symbol="AAPL", feed="iex"):
+        f = tmp_cache_dir / feed / f"{symbol}_1Day_all.parquet"
+        return {str(t.date()) for t in pd.read_parquet(f).index}
+
+    BEFORE = ["2026-07-06", "2026-07-07", "2026-07-08", "2026-07-09", "2026-07-10"]
+    RETURNED_FIRST = ["2026-07-13", "2026-07-14"]      # short catch-up response
+    MISSING = ["2026-07-15", "2026-07-16", "2026-07-17", "2026-07-20"]
+
+    def _resume(self, monkeypatch, available, log=None, end_day=21):
+        monkeypatch.setattr(fetcher, "_fetch_bars_api", self._api(available, log))
+        fetcher.fetch_symbol(
+            "AAPL",
+            start=datetime(2026, 7, 1, tzinfo=timezone.utc),
+            end=datetime(2026, 7, end_day, tzinfo=timezone.utc),
+            timeframe="1Day", feed="iex",
+        )
+
+    def _seed_and_hole(self, monkeypatch):
+        """Cache with pre-shutdown history, then a resume that comes back
+        short — the exact July state."""
+        monkeypatch.setattr(fetcher, "_fetch_bars_api", self._api(self.BEFORE))
+        fetcher.fetch_symbol(
+            "AAPL",
+            start=datetime(2026, 7, 1, tzinfo=timezone.utc),
+            end=datetime(2026, 7, 10, tzinfo=timezone.utc),
+            timeframe="1Day", feed="iex",
+        )
+        self._resume(monkeypatch, self.BEFORE + self.RETURNED_FIRST)
+
+    def test_the_july_hole_is_filled_on_the_next_cycle(
+        self, tmp_cache_dir, monkeypatch
+    ):
+        """The whole point: the hole must not be permanent.
+
+        Without the fix the resume stamps covered_end at the requested
+        07-21, so the next cycle only asks from 07-20 — and a realistic API
+        returns nothing before that, leaving 07-15..07-17 gone for good.
+        """
+        self._seed_and_hole(monkeypatch)
+        holed = self._cached_days(tmp_cache_dir)
+        assert not (set(self.MISSING) & holed), "fixture wrong: no hole created"
+
+        # Next cycle — the API now has the full week available.
+        self._resume(monkeypatch, self.BEFORE + self.RETURNED_FIRST + self.MISSING)
+
+        final = self._cached_days(tmp_cache_dir)
+        assert set(self.MISSING) <= final, (
+            f"the July hole survived — still missing "
+            f"{sorted(set(self.MISSING) - final)}"
+        )
+        assert set(self.BEFORE) <= final, "pre-shutdown history was lost"
+
+    def test_the_refetch_reaches_back_into_the_holed_week(
+        self, tmp_cache_dir, monkeypatch
+    ):
+        """The mechanism, asserted on what the API is actually asked for."""
+        self._seed_and_hole(monkeypatch)
+        asked = []
+        self._resume(
+            monkeypatch, self.BEFORE + self.RETURNED_FIRST + self.MISSING, log=asked
+        )
+        assert asked, "no refetch at all — the week was written off"
+        assert min(s for s, _ in asked) <= date(2026, 7, 15), (
+            f"refetch started at {min(s for s, _ in asked)}, after the hole at "
+            "2026-07-15 — this is exactly the July failure"
+        )
+
+    def test_repeated_cycles_converge_and_stop_fetching(
+        self, tmp_cache_dir, monkeypatch
+    ):
+        """Once whole, the cache must settle: no endless re-request loop.
+
+        A fix that healed holes by refetching forever would trade a silent
+        bug for a permanent API cost.
+        """
+        self._seed_and_hole(monkeypatch)
+        whole = self.BEFORE + self.RETURNED_FIRST + self.MISSING
+        for _ in range(3):
+            self._resume(monkeypatch, whole)
+        assert set(self.MISSING) <= self._cached_days(tmp_cache_dir)
+
+        calls = []
+        self._resume(monkeypatch, whole, log=calls, end_day=20)
+        # At most the single trailing-bar refresh `effective_cov_end` forces.
+        assert len(calls) <= 1, (
+            f"settled cache still made {len(calls)} API calls — re-request loop"
+        )
