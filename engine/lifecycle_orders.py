@@ -1609,7 +1609,8 @@ WITH computed AS (
 UPDATE position_lifecycle
 SET status = (SELECT new_status FROM computed),
     closed_at = CASE
-        WHEN (SELECT new_status FROM computed) IN ('closed', 'external_closed')
+        WHEN (SELECT new_status FROM computed)
+             IN ('closed', 'external_closed', 'canceled')
         THEN COALESCE(closed_at, :now)
         ELSE closed_at
     END

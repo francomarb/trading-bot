@@ -13,7 +13,7 @@ transaction. Discovery doc §6.4 / §6.5 / §6.6 / §6.6.1.
 - Test 6  All-or-nothing transaction on failure (R4-P1b)
 - Test 11 Zero-fill working entry stays 'pending' (R7-P0)
 - Test 12 Working sell-side order blocks 'closed' (R12-P1)
-- Test 13 closed_at set only on closed / external_closed (R8-P2)
+- Test 13 closed_at set on terminal closed / external_closed / canceled rows (R8-P2)
 - Test 14 closed_at reads new status via CTE (R9-P1a)
 - Test 15 Negative current_qty maps to 'error' (R9-P1b)
 - Test 20 Working sell-side blocks 'closed' AND lock retains (R12-P1)
@@ -331,8 +331,7 @@ class TestDirectPendingToCanceled:
         pl_status, current_qty, _, _, closed_at = _get_position(conn, uid)
         assert pl_status == "canceled"
         assert current_qty == 0.0
-        # canceled is NOT closed → closed_at stays NULL (R8-P2).
-        assert closed_at is None
+        assert closed_at is not None
 
 
 # Test 2 — Terminal-state immutability (R3-P1a)
@@ -645,7 +644,7 @@ class TestSellSideBlocksClosed:
         assert closed_at is not None
 
 
-# Test 13 + 14 — closed_at only on closed/external_closed via CTE (R8-P2, R9-P1a)
+# Test 13 + 14 — closed_at set by the status CTE (R8-P2, R9-P1a)
 class TestClosedAtSemantics:
     def test_closed_at_set_via_cte_on_close_transition(
         self,
@@ -686,7 +685,7 @@ class TestClosedAtSemantics:
         assert pl_status == "closed"
         assert closed_at is not None
 
-    def test_closed_at_NULL_on_canceled(
+    def test_closed_at_set_on_canceled(
         self,
         conn: sqlite3.Connection,
         pos_store: PositionLifecycleStore,
@@ -707,7 +706,7 @@ class TestClosedAtSemantics:
         )
         pl_status, _, _, _, closed_at = _get_position(conn, uid)
         assert pl_status == "canceled"
-        assert closed_at is None  # R8-P2
+        assert closed_at is not None
 
 
 # Test 15 + 21 — Negative current_qty → 'error' (R9-P1b + R11)

@@ -928,11 +928,12 @@ class TestMarkPendingUnknownToBroker:
         # Position should have walked pending → canceled (no fill ever
         # landed and the only entry_primary is now terminal).
         pos = conn.execute(
-            "SELECT status FROM position_lifecycle "
+            "SELECT status, closed_at FROM position_lifecycle "
             "WHERE position_uid = ?",
             (uid,),
         ).fetchone()
         assert pos[0] == "canceled"
+        assert pos[1] is not None
 
     def test_noop_when_order_id_already_attached(
         self,
