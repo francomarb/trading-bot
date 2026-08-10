@@ -17,6 +17,7 @@ Covers:
 from __future__ import annotations
 
 import json
+from pathlib import Path
 from datetime import date, datetime, timedelta, timezone
 from unittest.mock import MagicMock
 
@@ -963,3 +964,152 @@ class TestJuly2026ShutdownRegression:
         assert len(calls) <= 1, (
             f"settled cache still made {len(calls)} API calls — re-request loop"
         )
+
+
+class TestSessionGapDetection:
+    """PLAN 11.52 — interval coverage cannot see a gap in the MIDDLE.
+
+    `_missing_ranges` only ever asks for bars before covered_start or after
+    covered_end, so clamping covered_end to the last bar received heals a
+    TAIL truncation and nothing else. Measured before this was added, of
+    the four plausible catch-up response shapes only two healed:
+
+        tail truncation  (07-13, 07-14)  -> healed
+        interior drop    (07-13, 07-20)  -> STILL HOLED
+        start truncation (07-20 only)    -> STILL HOLED
+        empty response                   -> healed
+
+    Diffing what we hold against a real session calendar closes all four.
+    """
+
+    BEFORE = ["2026-07-06", "2026-07-07", "2026-07-08", "2026-07-09", "2026-07-10"]
+    WEEK = ["2026-07-13", "2026-07-14", "2026-07-15", "2026-07-16",
+            "2026-07-17", "2026-07-20"]
+
+    @pytest.fixture(autouse=True)
+    def _calendar(self, monkeypatch):
+        """Deterministic calendar — never the network, never a cached symbol."""
+        from data import market_calendar
+        every = self.BEFORE + self.WEEK
+        monkeypatch.setattr(
+            market_calendar, "trading_sessions",
+            lambda s, e: {
+                date.fromisoformat(d) for d in every
+                if s <= date.fromisoformat(d) <= e
+            },
+        )
+        market_calendar._reset_for_tests()
+
+    def _bars(self, days):
+        if not days:
+            return pd.DataFrame()
+        return pd.DataFrame(
+            {"open": 1.0, "high": 2.0, "low": 0.5, "close": 1.5, "volume": 100},
+            index=pd.DatetimeIndex([pd.Timestamp(d, tz="UTC") for d in days]),
+        )
+
+    def _api(self, available, log=None):
+        def fake(symbol, timeframe, s, e, adjustment, feed):
+            if log is not None:
+                log.append((s.date(), e.date()))
+            inside = [d for d in available
+                      if s.date() <= date.fromisoformat(d) <= e.date()]
+            return self._bars(inside) if inside else pd.DataFrame()
+        return fake
+
+    def _cycle(self, monkeypatch, available, log=None, end_day=21):
+        monkeypatch.setattr(fetcher, "_fetch_bars_api", self._api(available, log))
+        fetcher.fetch_symbol(
+            "AAPL", start=datetime(2026, 7, 1, tzinfo=timezone.utc),
+            end=datetime(2026, 7, end_day, tzinfo=timezone.utc),
+            timeframe="1Day", feed="iex",
+        )
+
+    def _days(self, tmp_cache_dir):
+        f = tmp_cache_dir / "iex" / "AAPL_1Day_all.parquet"
+        return {str(t.date()) for t in pd.read_parquet(f).index}
+
+    @pytest.mark.parametrize("shape,resume", [
+        ("tail_truncation", ["2026-07-13", "2026-07-14"]),
+        ("interior_drop", ["2026-07-13", "2026-07-20"]),
+        ("start_truncation", ["2026-07-20"]),
+        ("empty_response", []),
+    ])
+    def test_every_catch_up_response_shape_heals(
+        self, tmp_cache_dir, monkeypatch, shape, resume
+    ):
+        """The acceptance matrix. Two of these fail on tail-clamping alone."""
+        self._cycle(monkeypatch, self.BEFORE, end_day=10)
+        self._cycle(monkeypatch, self.BEFORE + resume)          # short catch-up
+        for _ in range(2):
+            self._cycle(monkeypatch, self.BEFORE + self.WEEK)   # data now available
+
+        missing = set(self.WEEK) - self._days(tmp_cache_dir)
+        assert not missing, f"{shape}: sessions never recovered — {sorted(missing)}"
+
+    def test_genuinely_absent_sessions_stop_being_requested(
+        self, tmp_cache_dir, monkeypatch
+    ):
+        """`iex/SPY` has a real 634-day feed-depth gap. Chasing it every
+        call for the life of the cache would trade a silent bug for a
+        permanent API cost, so a session missed twice is retired."""
+        never = {"2026-07-08", "2026-07-09"}
+        available = [d for d in self.BEFORE + self.WEEK if d not in never]
+
+        for _ in range(3):
+            self._cycle(monkeypatch, available, end_day=20)
+
+        meta = json.loads(
+            (tmp_cache_dir / "iex" / "AAPL_1Day_all.meta.json").read_text()
+        )
+        assert set(meta.get("absent_sessions", [])) >= never
+
+        calls: list = []
+        self._cycle(monkeypatch, available, log=calls, end_day=20)
+        assert len(calls) <= 1, (
+            f"settled cache made {len(calls)} calls — absent sessions are "
+            "still being chased"
+        )
+
+    def test_first_miss_is_retried_before_being_written_off(
+        self, tmp_cache_dir, monkeypatch
+    ):
+        """One strike is not enough. Retiring on the first miss is what
+        would have hidden the July incident — a truncated response looks
+        identical to absent data until you ask again."""
+        self._cycle(monkeypatch, self.BEFORE, end_day=10)
+        self._cycle(monkeypatch, self.BEFORE + ["2026-07-13"])
+
+        meta = json.loads(
+            (tmp_cache_dir / "iex" / "AAPL_1Day_all.meta.json").read_text()
+        )
+        absent = set(meta.get("absent_sessions", []))
+        assert "2026-07-14" not in absent, (
+            "a single miss retired the session — a truncated response would "
+            "never be retried"
+        )
+
+    def test_calendar_unavailable_falls_back_to_previous_behaviour(
+        self, tmp_cache_dir, monkeypatch
+    ):
+        """A market-data outage must never block a fetch. Cost of failing
+        closed is worse than the hole it would prevent."""
+        from data import market_calendar
+        monkeypatch.setattr(market_calendar, "trading_sessions",
+                            lambda s, e: None)
+        self._cycle(monkeypatch, self.BEFORE, end_day=10)
+        df, _ = fetcher.fetch_symbol(
+            "AAPL", start=datetime(2026, 7, 1, tzinfo=timezone.utc),
+            end=datetime(2026, 7, 10, tzinfo=timezone.utc),
+            timeframe="1Day", feed="iex",
+        )
+        assert len(df) == len(self.BEFORE)
+
+    def test_gap_detection_never_consults_a_cached_symbol(self):
+        """11.52: a sweep using SPY as the session reference reported
+        'clean' while 92 of 106 symbols were holed, because SPY is cached
+        by the same code and shared the gap. The calendar module must not
+        read the bar cache at all."""
+        src = (Path(fetcher.__file__).parent / "market_calendar.py").read_text()
+        assert "_read_cache" not in src
+        assert "read_parquet" not in src
