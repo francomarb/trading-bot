@@ -1394,15 +1394,32 @@ class TradeLogger:
             filled_qty, avg_fill_price, status. Newest observation
             wins even if NULL.
         """
-        # Defence in depth: the dataclass stops a writer OMITTING the
-        # field, this stops one passing None explicitly. Either way the
-        # row would miss the partial unique index and duplicate silently.
-        if record.position_type is None:
+        # Defence in depth. The dataclass stops a writer OMITTING the
+        # field; this stops every other way of getting it wrong.
+        #
+        # Rejecting only None is not enough (review finding on PR #99).
+        # The UPSERT applies when `position_type = 'single_leg'`, so ANY
+        # value that is not exactly that — 'single-leg', 'single_leg ',
+        # 'SINGLE_LEG', 'junk' — falls outside
+        # uniq_trades_order_id_single_leg and appends a duplicate row for
+        # an order_id that already exists. Reproduced: all four of those
+        # produced 2 rows where 'single_leg' produced 1. Same silent
+        # corruption as NULL, different bad value.
+        #
+        # Deliberately NOT normalised (no strip/lower). Coercing a typo
+        # would hide the writer's bug; the point is to surface it.
+        # VALID_POSITION_TYPES is imported rather than redefined so this
+        # cannot drift from `Position`, which already validates the same
+        # vocabulary — [`feedback_single_source_of_truth_params`].
+        from engine.positions import VALID_POSITION_TYPES
+
+        if record.position_type not in VALID_POSITION_TYPES:
             raise ValueError(
-                f"TradeRecord for order_id={record.order_id!r} has a NULL "
-                "position_type — it would miss uniq_trades_order_id_single_leg "
-                "and duplicate silently instead of upserting (PLAN 11.51). "
-                "Set 'single_leg' or 'spread'."
+                f"TradeRecord for order_id={record.order_id!r} has "
+                f"position_type={record.position_type!r}, which is not one of "
+                f"{sorted(VALID_POSITION_TYPES)}. Anything else misses "
+                "uniq_trades_order_id_single_leg and duplicates silently "
+                "instead of upserting (PLAN 11.51)."
             )
         conn = self._ensure_db()
         d = record.as_dict()

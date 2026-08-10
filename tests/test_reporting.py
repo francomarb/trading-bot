@@ -4682,8 +4682,54 @@ class TestPositionTypeIsRequired:
         deliberate None. Dataclasses do not enforce types at runtime."""
         rec = TradeRecord(**self._kwargs(), position_type=None)
         tl = TradeLogger(path=":memory:")
-        with pytest.raises(ValueError, match="NULL position_type"):
+        with pytest.raises(ValueError, match="position_type"):
             tl.log(rec)
+
+    @pytest.mark.parametrize("bad", [
+        "single-leg",    # hyphen instead of underscore
+        "single_leg ",   # trailing whitespace
+        "SINGLE_LEG",    # wrong case
+        "singleleg",
+        "junk",
+        "",
+    ])
+    def test_invalid_values_are_refused_not_just_none(self, bad):
+        """Review finding on PR #99. Rejecting only None left the same
+        hole open with a different bad value: the UPSERT applies when
+        `position_type = 'single_leg'` exactly, so ANY other string falls
+        outside the partial index and appends a duplicate row.
+
+        Measured before this guard: each of these produced 2 rows for one
+        order_id where 'single_leg' produced 1.
+        """
+        rec = TradeRecord(**self._kwargs(), position_type=bad)
+        tl = TradeLogger(path=":memory:")
+        with pytest.raises(ValueError, match="position_type"):
+            tl.log(rec)
+
+    def test_invalid_value_would_otherwise_have_duplicated(self, tmp_path):
+        """Pins WHY the value matters, not just that it is checked — a
+        future refactor that relaxes this must fail here."""
+        tl = TradeLogger(path=str(tmp_path / "t.db"))
+        tl.log(TradeRecord(**self._kwargs(), position_type="single_leg"))
+        tl.log(TradeRecord(**self._kwargs(), position_type="single_leg"))
+        assert len([r for r in tl.read_all() if r["order_id"] == "oid-1"]) == 1
+
+    def test_spread_legs_still_append_by_design(self, tmp_path):
+        """Not a bug and must not be "fixed": two OCC legs of one combo
+        share a broker order_id, so spread rows fall outside the partial
+        index deliberately. The live DB's 21 duplicate order_ids are all
+        spreads."""
+        tl = TradeLogger(path=str(tmp_path / "t.db"))
+        tl.log(TradeRecord(**self._kwargs(), position_type="spread"))
+        tl.log(TradeRecord(**self._kwargs(), position_type="spread"))
+        assert len([r for r in tl.read_all() if r["order_id"] == "oid-1"]) == 2
+
+    def test_vocabulary_is_shared_with_the_position_model(self):
+        """Imported, not redefined — `Position` already validates the same
+        vocabulary and the two must not drift apart."""
+        from engine.positions import VALID_POSITION_TYPES
+        assert VALID_POSITION_TYPES == {"single_leg", "spread"}
 
     def test_single_leg_and_spread_both_construct(self):
         for pt in ("single_leg", "spread"):
