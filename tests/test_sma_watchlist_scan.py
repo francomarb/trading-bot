@@ -245,6 +245,7 @@ def _log_trade(
     """
     tl.log(
         TradeRecord(
+            position_type="single_leg",
             timestamp=datetime.now(timezone.utc).isoformat(),
             symbol=symbol,
             side=side,

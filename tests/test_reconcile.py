@@ -81,6 +81,7 @@ def _write_trades(path: str, rows: list[dict]) -> None:
         else:
             signed = float(signed_raw)
         record = TradeRecord(
+            position_type="single_leg",
             timestamp=row["timestamp"],
             symbol=row["symbol"],
             side=row["side"],

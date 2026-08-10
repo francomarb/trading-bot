@@ -224,6 +224,7 @@ class TestRunGoNoGo:
             day_offset = i  # one trade per day
             ts = (base + timedelta(days=day_offset)).isoformat()
             buy = TradeRecord(
+                position_type="single_leg",
                 timestamp=ts, symbol="AAPL", side="buy", qty=10,
                 avg_fill_price=100.0, order_id=f"b-{i}",
                 strategy="sma_crossover", reason="entry",
@@ -236,6 +237,7 @@ class TestRunGoNoGo:
 
             sell_ts = (base + timedelta(days=day_offset, hours=2)).isoformat()
             sell = TradeRecord(
+                position_type="single_leg",
                 timestamp=sell_ts, symbol="AAPL", side="sell", qty=10,
                 avg_fill_price=110.0, order_id=f"s-{i}",
                 strategy="sma_crossover", reason="exit signal",

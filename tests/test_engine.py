@@ -2545,6 +2545,7 @@ def _write_sell(tl: TradeLogger, symbol: str, strategy: str) -> None:
 
     tl.log(
         TradeRecord(
+            position_type="single_leg",
             timestamp=datetime.now(timezone.utc).isoformat(),
             symbol=symbol,
             side="sell",

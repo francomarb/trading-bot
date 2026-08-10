@@ -470,6 +470,7 @@ class TestTradeLogger:
         tl = TradeLogger(path=tmp_csv)
         rows = [
             TradeRecord(
+                position_type="single_leg",
                 timestamp="2026-04-22T10:00:00+00:00",
                 symbol=f"SYM{i}",
                 side="sell",
@@ -535,6 +536,7 @@ class TestTradeLogger:
 
         def _close_row(*, status: str, uid: str | None, pnl: float, i: int) -> TradeRecord:
             return TradeRecord(
+                position_type="single_leg",
                 timestamp=f"2026-04-22T10:0{i}:00+00:00",
                 symbol=f"SYM{i}",
                 side="sell",
@@ -580,6 +582,7 @@ class TestTradeLogger:
         P&L but does not increment trade_count."""
         tl = TradeLogger(path=tmp_csv)
         tl.log(TradeRecord(
+            position_type="single_leg",
             timestamp="2026-04-22T10:00:00+00:00",
             symbol="X", side="sell", qty=1, avg_fill_price=100.0,
             order_id="c-0", strategy="sma_crossover",
@@ -615,6 +618,7 @@ class TestTradeLogger:
         ]
         for i, (uid, pnl) in enumerate(rows):
             tl.log(TradeRecord(
+                position_type="single_leg",
                 timestamp=f"2026-04-22T10:0{i}:00+00:00",
                 symbol=f"SYM{i}",
                 side="sell",
@@ -1928,6 +1932,7 @@ class TestSlippageUnificationSchema:
         fields None. This guards against any future caller that builds a
         TradeRecord directly bypassing the writer-side default inference."""
         record = TradeRecord(
+            position_type="single_leg",
             timestamp="2026-06-05T00:00:00+00:00",
             symbol="AAPL",
             side="buy",
@@ -3401,6 +3406,7 @@ class TestPnLTracker:
         # quality='recovered' and a huge adverse value. Pre-fix
         # `_adverse_bps` would have accepted it.
         recovered = TradeRecord(
+            position_type="single_leg",
             timestamp="2026-04-15T10:00:00+00:00",
             symbol="MSFT", side="buy", qty=10, avg_fill_price=200.0,
             order_id="m-recovered",
@@ -3898,6 +3904,7 @@ class TestExecutionQualitySlippageSeedRead:
     def _seed(self, tl, *, kind, quality, adverse, order_type="market", oid):
         tl.log(
             TradeRecord(
+                position_type="single_leg",
                 timestamp="2026-07-01T10:00:00+00:00",
                 symbol="AAPL",
                 side="sell",
@@ -3981,15 +3988,19 @@ class TestStopFillRiskContextByPositionUid:
 
     def _log_entry_row(self, tl, *, qty=13.0, fill=339.543846,
                        rps=16.1921886113901, stop=320.73781138861,
-                       uid=None, symbol="AAPL"):
+                       uid=None, symbol="AAPL", order_id=None):
+        """`order_id` is settable because a broker order belongs to exactly
+        ONE lifecycle. Two distinct positions must not share one — see
+        `test_does_not_cross_positions`."""
         tl.log(
             TradeRecord(
+                position_type="single_leg",
                 timestamp="2026-07-28T17:07:35+00:00",
                 symbol=symbol,
                 side="buy",
                 qty=qty,
                 avg_fill_price=fill,
-                order_id=f"entry-{symbol}",
+                order_id=order_id or f"entry-{symbol}",
                 strategy="donchian_breakout",
                 reason="donchian_breakout entry @ 2026-07-27T04:00:00+00:00",
                 stop_price=stop,
@@ -4213,8 +4224,16 @@ class TestStopFillRiskContextByPositionUid:
         """A prior closed position in the same symbol must not supply
         the basis for a later one."""
         tl = TradeLogger(path=str(tmp_path / "trades.db"))
-        self._log_entry_row(tl, rps=99.0, stop=100.0, uid="pos_old")
-        self._log_entry_row(tl, rps=16.19, stop=320.74, uid="pos_new")
+        # Distinct order_ids: these are two separate round trips. Reusing
+        # one id previously "worked" only because the second row carried a
+        # NULL position_type, missed the partial unique index, and inserted
+        # a duplicate instead of upserting — the exact 11.51 hazard. With
+        # the field required the UPSERT fires and the identity check
+        # correctly refuses to move an order between lifecycles.
+        self._log_entry_row(tl, rps=99.0, stop=100.0, uid="pos_old",
+                            order_id="entry-AAPL-old")
+        self._log_entry_row(tl, rps=16.19, stop=320.74, uid="pos_new",
+                            order_id="entry-AAPL-new")
         ctx = tl.read_entry_context_by_uid("pos_new")
         assert ctx["initial_risk_per_share"] == pytest.approx(16.19)
 
@@ -4623,3 +4642,80 @@ class TestRebaseEntryStop:
 
         assert self._row(tl, "entry-1")["initial_stop_loss"] == pytest.approx(392.36)
         assert self._row(tl, "entry-2")["initial_stop_loss"] == pytest.approx(390.00)
+
+
+class TestPositionTypeIsRequired:
+    """PLAN 11.51 — the trades UPSERT targets a PARTIAL unique index
+    predicated on `position_type = 'single_leg'`.
+
+    A partial index does not cover rows failing its predicate, so a row
+    written with NULL there misses the conflict entirely: no error, no
+    constraint violation, no log line — the INSERT succeeds as a SECOND
+    row for an order_id that already exists, and both flow into replay,
+    P&L attribution and slippage aggregates.
+
+    Production was never hit (all five writers set it, zero NULL rows),
+    so the exposure was always a FUTURE writer forgetting — which an
+    optional field gave no feedback about.
+    """
+
+    def _kwargs(self, **over):
+        base = dict(
+            timestamp="2026-08-10T12:00:00+00:00", symbol="AAPL", side="buy",
+            qty=10.0, avg_fill_price=100.0, order_id="oid-1",
+            strategy="donchian_breakout", reason="entry", stop_price=95.0,
+            entry_reference_price=100.0, modeled_slippage_bps=None,
+            realized_slippage_bps=None, order_type="market", status="filled",
+            requested_qty=10.0, filled_qty=10.0,
+        )
+        base.update(over)
+        return base
+
+    def test_omitting_position_type_is_a_construction_error(self):
+        """The failure mode is forgetting, so it must fail at the earliest
+        possible point rather than silently duplicating a row later."""
+        with pytest.raises(TypeError, match="position_type"):
+            TradeRecord(**self._kwargs())
+
+    def test_explicit_none_is_refused_at_the_write(self):
+        """Defence in depth: the dataclass stops omission, this stops a
+        deliberate None. Dataclasses do not enforce types at runtime."""
+        rec = TradeRecord(**self._kwargs(), position_type=None)
+        tl = TradeLogger(path=":memory:")
+        with pytest.raises(ValueError, match="NULL position_type"):
+            tl.log(rec)
+
+    def test_single_leg_and_spread_both_construct(self):
+        for pt in ("single_leg", "spread"):
+            assert TradeRecord(**self._kwargs(), position_type=pt).position_type == pt
+
+    def test_a_second_row_for_one_order_id_upserts_instead_of_duplicating(
+        self, tmp_path
+    ):
+        """The behaviour the required field guarantees. Before it, a
+        NULL-typed second write appended — demonstrated 2026-07-31, when a
+        fixture without the field produced two `broker-entry` rows."""
+        tl = TradeLogger(path=str(tmp_path / "t.db"))
+        tl.log(TradeRecord(**self._kwargs(), position_type="single_leg"))
+        tl.log(TradeRecord(**self._kwargs(filled_qty=10.0, status="filled"),
+                           position_type="single_leg"))
+        rows = [r for r in tl.read_all() if r["order_id"] == "oid-1"]
+        assert len(rows) == 1, f"order_id duplicated into {len(rows)} rows"
+
+    def test_every_production_writer_sets_it(self):
+        """Parity guard. Five writers build a TradeRecord internally; a new
+        one that forgets is now a construction error, but this also fails
+        loudly if someone reintroduces a default."""
+        import inspect
+        from reporting import logger as lg
+
+        src = inspect.getsource(lg)
+        for writer in ("def build_record", "def build_close_record",
+                       "def log_stop_fill", "def log_spread_fill",
+                       "def log_external_close"):
+            assert writer in src, f"{writer} vanished — update this guard"
+        fields = TradeRecord.__dataclass_fields__["position_type"]
+        import dataclasses
+        assert fields.default is dataclasses.MISSING, (
+            "position_type regained a default — the 11.51 hazard is back"
+        )
