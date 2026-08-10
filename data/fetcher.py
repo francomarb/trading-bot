@@ -591,15 +591,24 @@ def fetch_symbol(
         if merged.index.has_duplicates:
             merged = merged[~merged.index.duplicated(keep="last")]
         merged = _validate(merged, symbol)
-        _write_cache(
-            merged, symbol, timeframe, adjustment, new_cov_start, new_cov_end, feed
-        )
+        # Record what came back, not what we asked for (PLAN 11.52).
+        new_cov_end = _coverage_end_from_bars(merged, new_cov_end)
+        if use_cache:
+            _write_cache(
+                merged, symbol, timeframe, adjustment, new_cov_start, new_cov_end, feed
+            )
     else:
         merged = cached
         # Even with no new data, if the user requested a widened window
         # that returned zero rows, persist the expanded coverage so we
         # don't refetch next time.
-        if cached is not None and not cached.empty and (
+        # Not clamped here: a request that returned ZERO rows cannot tell a
+        # truncated response apart from genuinely-absent data (a weekend, or
+        # a window past this symbol's feed depth). Persisting the widened
+        # coverage is the right call for the latter and is the pre-existing
+        # behaviour; clamping would re-request an empty range forever. The
+        # 11.52 failure mode is a PARTIAL response, which lands above.
+        if use_cache and cached is not None and not cached.empty and (
             cov_start != new_cov_start or cov_end != new_cov_end
         ):
             _write_cache(
@@ -667,6 +676,38 @@ def _to_utc(dt: datetime) -> datetime:
     if dt.tzinfo is None:
         return dt.replace(tzinfo=timezone.utc)
     return dt.astimezone(timezone.utc)
+
+
+def _coverage_end_from_bars(
+    bars: pd.DataFrame, requested_end: datetime
+) -> datetime:
+    """
+    Clamp the coverage end to the last bar that actually arrived.
+
+    The sidecar meta used to record what we *asked the API for*. When a
+    response came back short, the missing tail was still stamped as
+    covered — and `_missing_ranges` only ever asks for bars before
+    `covered_start` or after `covered_end`, so those sessions were never
+    requested again no matter how long the bot ran (PLAN 11.52).
+
+    The confirmed case: after the laptop was off 2026-07-13 → 07-20, the
+    resume issued one large catch-up fetch, stamped `covered_end = 07-20`
+    from the request, and silently accepted whatever subset came back.
+    92 of 106 SIP symbols lost that entire trading week, undetectable
+    from the metadata.
+
+    Only the END is clamped. The start side is where per-symbol feed-depth
+    boundaries live — SIP begins 2016-01-04, so a request reaching further
+    back legitimately returns nothing before it, and clamping there would
+    re-request the missing years on every call forever. Recording the
+    requested start is correct for that; only the end was lying.
+    """
+    if bars is None or bars.empty:
+        return requested_end
+    last = pd.Timestamp(bars.index.max()).to_pydatetime()
+    if last.tzinfo is None:
+        last = last.replace(tzinfo=timezone.utc)
+    return min(requested_end, last)
 
 
 def _missing_ranges(

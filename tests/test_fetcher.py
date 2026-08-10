@@ -17,7 +17,7 @@ Covers:
 from __future__ import annotations
 
 import json
-from datetime import datetime, timedelta, timezone
+from datetime import date, datetime, timedelta, timezone
 from unittest.mock import MagicMock
 
 import pandas as pd
@@ -644,3 +644,191 @@ class TestFetchLatestQuoteMidpoint:
         quote = MagicMock(bid_price="not a number", ask_price=100.20)
         mock_client.get_stock_latest_quote.return_value = {"AAPL": quote}
         assert fetcher.fetch_latest_quote_midpoint("AAPL") is None
+
+
+class TestCoverageRecordsTheResponse:
+    """PLAN 11.52 — the sidecar meta must record what came BACK, not what
+    was asked for.
+
+    It used to store the requested end. When a catch-up fetch came back
+    short, the missing tail was still stamped covered, and `_missing_ranges`
+    only ever asks for bars before covered_start or after covered_end — so
+    those sessions were never requested again. Confirmed 2026-07-31: after
+    the laptop was off 2026-07-13 -> 07-20, 92 of 106 SIP symbols lost that
+    entire trading week, undetectable from the metadata.
+    """
+
+    def _bars(self, days: list[str]) -> pd.DataFrame:
+        idx = pd.DatetimeIndex([pd.Timestamp(d, tz="UTC") for d in days])
+        return pd.DataFrame(
+            {"open": 1.0, "high": 2.0, "low": 0.5, "close": 1.5, "volume": 100},
+            index=idx,
+        )
+
+    def _meta(self, tmp_cache_dir, symbol="AAPL", feed="iex"):
+        import json
+        p = tmp_cache_dir / feed / f"{symbol}_1Day_all.meta.json"
+        return json.loads(p.read_text())
+
+    def test_short_response_does_not_claim_the_missing_tail(
+        self, tmp_cache_dir, monkeypatch
+    ):
+        """The exact 11.52 mechanism: ask for a week, get back two days."""
+        start = datetime(2026, 7, 13, tzinfo=timezone.utc)
+        end = datetime(2026, 7, 20, tzinfo=timezone.utc)
+
+        monkeypatch.setattr(
+            fetcher, "_fetch_bars_api",
+            lambda *a, **k: self._bars(["2026-07-13", "2026-07-14"]),
+        )
+        fetcher.fetch_symbol("AAPL", start=start, end=end,
+                             timeframe="1Day", feed="iex")
+
+        covered_end = datetime.fromisoformat(self._meta(tmp_cache_dir)["covered_end"])
+        # Must be the last bar we actually got, NOT the 07-20 we requested.
+        assert covered_end.date() == date(2026, 7, 14)
+        assert covered_end.date() != end.date()
+
+    def test_the_missing_tail_is_re_requested_next_time(
+        self, tmp_cache_dir, monkeypatch
+    ):
+        """The consequence that matters. Without the fix the second call
+        sees the range as covered and never asks again — which is how the
+        holes became permanent."""
+        start = datetime(2026, 7, 13, tzinfo=timezone.utc)
+        end = datetime(2026, 7, 20, tzinfo=timezone.utc)
+
+        monkeypatch.setattr(
+            fetcher, "_fetch_bars_api",
+            lambda *a, **k: self._bars(["2026-07-13", "2026-07-14"]),
+        )
+        fetcher.fetch_symbol("AAPL", start=start, end=end,
+                             timeframe="1Day", feed="iex")
+
+        asked: list[tuple] = []
+
+        def record(symbol, timeframe, s, e, adjustment, feed):
+            asked.append((s.date(), e.date()))
+            return self._bars(["2026-07-15", "2026-07-16", "2026-07-17"])
+
+        monkeypatch.setattr(fetcher, "_fetch_bars_api", record)
+        fetcher.fetch_symbol("AAPL", start=start, end=end,
+                             timeframe="1Day", feed="iex")
+
+        assert asked, "second call made no API request — the tail was lost"
+        # The END is NOT the discriminator: `effective_cov_end` already
+        # subtracts one bar interval to force a re-fetch of the latest bar,
+        # so a request reaching 07-20 happens either way. What matters is
+        # that the refetch reaches BACK far enough to cover 07-15..07-17 —
+        # the sessions the short response never delivered. Without the fix
+        # coverage claims 07-20, so the request starts at 07-19 and the
+        # hole is skipped permanently.
+        earliest_asked = min(s for s, _ in asked)
+        assert earliest_asked <= date(2026, 7, 15), (
+            f"refetch started at {earliest_asked} — it skipped the hole at "
+            "2026-07-15..07-17 rather than filling it"
+        )
+
+    def test_complete_response_still_records_full_coverage(
+        self, tmp_cache_dir, monkeypatch
+    ):
+        """No behaviour change on the happy path — a response that reaches
+        the requested end still claims it, so normal fetches don't start
+        re-requesting ranges they already have."""
+        start = datetime(2026, 7, 13, tzinfo=timezone.utc)
+        end = datetime(2026, 7, 17, tzinfo=timezone.utc)
+        monkeypatch.setattr(
+            fetcher, "_fetch_bars_api",
+            lambda *a, **k: self._bars(
+                ["2026-07-13", "2026-07-14", "2026-07-15",
+                 "2026-07-16", "2026-07-17"]
+            ),
+        )
+        fetcher.fetch_symbol("AAPL", start=start, end=end,
+                             timeframe="1Day", feed="iex")
+        covered_end = datetime.fromisoformat(self._meta(tmp_cache_dir)["covered_end"])
+        assert covered_end.date() == date(2026, 7, 17)
+
+    def test_start_side_is_deliberately_not_clamped(
+        self, tmp_cache_dir, monkeypatch
+    ):
+        """Feed-depth boundaries live on the start side: SIP begins
+        2016-01-04, so asking earlier legitimately returns nothing before
+        it. Clamping there would re-request the missing years forever, so
+        the requested start is recorded on purpose."""
+        start = datetime(2026, 7, 1, tzinfo=timezone.utc)
+        end = datetime(2026, 7, 17, tzinfo=timezone.utc)
+        monkeypatch.setattr(
+            fetcher, "_fetch_bars_api",
+            lambda *a, **k: self._bars(["2026-07-15", "2026-07-16", "2026-07-17"]),
+        )
+        fetcher.fetch_symbol("AAPL", start=start, end=end,
+                             timeframe="1Day", feed="iex")
+        covered_start = datetime.fromisoformat(
+            self._meta(tmp_cache_dir)["covered_start"]
+        )
+        assert covered_start.date() == date(2026, 7, 1)
+
+
+class TestUseCacheFalseIsNonDestructive:
+    """PLAN 11.52(b) — `use_cache=False` means bypass, not discard.
+
+    It blanked `cached` and then let `_write_cache` overwrite the file with
+    only the fetched window, so an ad-hoc diagnostic fetch silently
+    truncated a symbol's whole history. On 2026-07-31 this took MU from
+    2659 rows to 125, and AAPL to 22.
+    """
+
+    def _bars(self, days):
+        idx = pd.DatetimeIndex([pd.Timestamp(d, tz="UTC") for d in days])
+        return pd.DataFrame(
+            {"open": 1.0, "high": 2.0, "low": 0.5, "close": 1.5, "volume": 100},
+            index=idx,
+        )
+
+    def test_diagnostic_fetch_leaves_the_cache_file_untouched(
+        self, tmp_cache_dir, monkeypatch
+    ):
+        # Seed a cache with a wide history.
+        wide = [f"2026-06-{d:02d}" for d in range(1, 26)]
+        monkeypatch.setattr(fetcher, "_fetch_bars_api",
+                            lambda *a, **k: self._bars(wide))
+        fetcher.fetch_symbol(
+            "MU", start=datetime(2026, 6, 1, tzinfo=timezone.utc),
+            end=datetime(2026, 6, 25, tzinfo=timezone.utc),
+            timeframe="1Day", feed="iex",
+        )
+        cache_file = tmp_cache_dir / "iex" / "MU_1Day_all.parquet"
+        before = cache_file.read_bytes()
+        assert len(pd.read_parquet(cache_file)) == len(wide)
+
+        # A narrow diagnostic read with use_cache=False.
+        monkeypatch.setattr(
+            fetcher, "_fetch_bars_api",
+            lambda *a, **k: self._bars(["2026-06-24", "2026-06-25"]),
+        )
+        df, _ = fetcher.fetch_symbol(
+            "MU", start=datetime(2026, 6, 24, tzinfo=timezone.utc),
+            end=datetime(2026, 6, 25, tzinfo=timezone.utc),
+            timeframe="1Day", feed="iex", use_cache=False,
+        )
+
+        assert len(df) == 2, "the caller still gets exactly what it asked for"
+        assert cache_file.read_bytes() == before, (
+            "use_cache=False truncated the cache file"
+        )
+        assert len(pd.read_parquet(cache_file)) == len(wide)
+
+    def test_use_cache_false_does_not_create_a_cache_file(
+        self, tmp_cache_dir, monkeypatch
+    ):
+        monkeypatch.setattr(
+            fetcher, "_fetch_bars_api",
+            lambda *a, **k: self._bars(["2026-06-24", "2026-06-25"]),
+        )
+        fetcher.fetch_symbol(
+            "NVDA", start=datetime(2026, 6, 24, tzinfo=timezone.utc),
+            end=datetime(2026, 6, 25, tzinfo=timezone.utc),
+            timeframe="1Day", feed="iex", use_cache=False,
+        )
+        assert not (tmp_cache_dir / "iex" / "NVDA_1Day_all.parquet").exists()
