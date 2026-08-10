@@ -1113,3 +1113,48 @@ class TestSessionGapDetection:
         src = (Path(fetcher.__file__).parent / "market_calendar.py").read_text()
         assert "_read_cache" not in src
         assert "read_parquet" not in src
+
+
+class TestCalendarIsolation:
+    """The calendar must never reach the network or the real cache file
+    from a unit test.
+
+    `market_calendar` writes to a fixed `data/historical/.market_calendar.json`
+    and falls back to a live Alpaca call. `tmp_cache_dir` only redirects
+    `fetcher.CACHE_DIR`, so before the `isolate_market_calendar` autouse
+    fixture existed, any test on the daily fetch path did both — a run on
+    2026-08-10 left a real file holding 290 genuine trading sessions.
+    """
+
+    def test_cache_path_is_redirected_out_of_the_repo(self):
+        from data import market_calendar
+        assert "data/historical" not in str(market_calendar._CACHE_PATH)
+
+    def test_no_real_calendar_file_is_written(self, tmp_cache_dir, monkeypatch):
+        from data import market_calendar
+        real = Path(fetcher.__file__).parent / "historical" / ".market_calendar.json"
+        existed = real.exists()
+
+        monkeypatch.setattr(
+            fetcher, "_fetch_bars_api",
+            lambda *a, **k: pd.DataFrame(
+                {"open": 1.0, "high": 2.0, "low": 0.5, "close": 1.5, "volume": 100},
+                index=pd.DatetimeIndex([pd.Timestamp("2026-07-06", tz="UTC")]),
+            ),
+        )
+        fetcher.fetch_symbol(
+            "AAPL", start=datetime(2026, 7, 1, tzinfo=timezone.utc),
+            end=datetime(2026, 7, 10, tzinfo=timezone.utc),
+            timeframe="1Day", feed="iex",
+        )
+        market_calendar.trading_sessions(date(2026, 7, 1), date(2026, 7, 10))
+        assert real.exists() == existed, "a unit test wrote the real calendar cache"
+
+    def test_the_live_fetch_path_is_stubbed_out(self):
+        """The fixture replaces `_fetch`, so an unstubbed `trading_sessions`
+        degrades to the fail-open None rather than calling Alpaca."""
+        from data import market_calendar
+        assert market_calendar._fetch(date(2026, 1, 1), date(2026, 1, 2)) is None
+        assert market_calendar.trading_sessions(
+            date(2026, 1, 1), date(2026, 1, 2)
+        ) is None
