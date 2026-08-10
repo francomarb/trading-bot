@@ -26,7 +26,7 @@ import math
 import os
 import re
 import sqlite3
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from typing import Any, Literal
 
@@ -604,7 +604,25 @@ class TradeRecord:
     entry_timestamp: str | None = None
     exit_timestamp: str | None = None
     position_id: str | None = None
-    position_type: str | None = None
+    # REQUIRED (PLAN 11.51). Keyword-only so it can carry no default
+    # without being reordered ahead of the fields above.
+    #
+    # The trades UPSERT targets a PARTIAL unique index predicated on
+    # `position_type = 'single_leg'`. A partial index does not cover rows
+    # failing its predicate, so a row written with NULL here misses the
+    # conflict entirely: no error, no constraint violation, no log line —
+    # the INSERT simply succeeds as a SECOND row for an order_id that
+    # already exists, and both flow into replay, P&L attribution and
+    # slippage aggregates.
+    #
+    # It bites when the substrate wrote first (`apply_order_event` always
+    # sets it) and a later `TradeLogger.log()` omits it. Demonstrated
+    # 2026-07-31: a fixture without this field produced two `broker-entry`
+    # rows. Production has never been hit — all five writers set it — so
+    # the exposure was always a FUTURE writer forgetting, which an
+    # optional field gave no feedback about. Removing the default makes
+    # forgetting impossible; `log()` additionally rejects an explicit None.
+    position_type: str = field(kw_only=True)
     # Operator Controls Phase A — immutable per-lifecycle ID. Optional
     # because exit/close records built without an entry-side lifecycle
     # reference can still log; the broker entry path passes it through
@@ -1376,6 +1394,33 @@ class TradeLogger:
             filled_qty, avg_fill_price, status. Newest observation
             wins even if NULL.
         """
+        # Defence in depth. The dataclass stops a writer OMITTING the
+        # field; this stops every other way of getting it wrong.
+        #
+        # Rejecting only None is not enough (review finding on PR #99).
+        # The UPSERT applies when `position_type = 'single_leg'`, so ANY
+        # value that is not exactly that — 'single-leg', 'single_leg ',
+        # 'SINGLE_LEG', 'junk' — falls outside
+        # uniq_trades_order_id_single_leg and appends a duplicate row for
+        # an order_id that already exists. Reproduced: all four of those
+        # produced 2 rows where 'single_leg' produced 1. Same silent
+        # corruption as NULL, different bad value.
+        #
+        # Deliberately NOT normalised (no strip/lower). Coercing a typo
+        # would hide the writer's bug; the point is to surface it.
+        # VALID_POSITION_TYPES is imported rather than redefined so this
+        # cannot drift from `Position`, which already validates the same
+        # vocabulary — [`feedback_single_source_of_truth_params`].
+        from engine.positions import VALID_POSITION_TYPES
+
+        if record.position_type not in VALID_POSITION_TYPES:
+            raise ValueError(
+                f"TradeRecord for order_id={record.order_id!r} has "
+                f"position_type={record.position_type!r}, which is not one of "
+                f"{sorted(VALID_POSITION_TYPES)}. Anything else misses "
+                "uniq_trades_order_id_single_leg and duplicates silently "
+                "instead of upserting (PLAN 11.51)."
+            )
         conn = self._ensure_db()
         d = record.as_dict()
         columns = ", ".join(d.keys())

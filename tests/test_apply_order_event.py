@@ -1424,6 +1424,7 @@ class TestExpandedUpsertPreservation:
             entry_timestamp="2026-06-12T10:00:00+00:00",
             position_type="single_leg",
         )
+        defaults.setdefault("position_type", "single_leg")
         defaults.update(overrides)
         return TradeRecord(**defaults)
 
@@ -1446,6 +1447,7 @@ class TestExpandedUpsertPreservation:
             entry_timestamp=None,
             position_type="single_leg",
         )
+        defaults.setdefault("position_type", "single_leg")
         defaults.update(overrides)
         return TradeRecord(**defaults)
 
@@ -1599,6 +1601,7 @@ class TestLatestNonNullAccountingBucket:
             requested_qty=10, filled_qty=10,
             position_type="single_leg",
         )
+        defaults.setdefault("position_type", "single_leg")
         defaults.update(overrides)
         return TradeRecord(**defaults)
 
@@ -1743,6 +1746,7 @@ class TestIdentityColumnExpansion:
             position_id="AAPL",
             position_type="single_leg",
         )
+        defaults.setdefault("position_type", "single_leg")
         defaults.update(overrides)
         return TradeRecord(**defaults)
 
