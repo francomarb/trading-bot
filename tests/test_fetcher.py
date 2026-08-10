@@ -17,7 +17,8 @@ Covers:
 from __future__ import annotations
 
 import json
-from datetime import datetime, timedelta, timezone
+from pathlib import Path
+from datetime import date, datetime, timedelta, timezone
 from unittest.mock import MagicMock
 
 import pandas as pd
@@ -644,3 +645,516 @@ class TestFetchLatestQuoteMidpoint:
         quote = MagicMock(bid_price="not a number", ask_price=100.20)
         mock_client.get_stock_latest_quote.return_value = {"AAPL": quote}
         assert fetcher.fetch_latest_quote_midpoint("AAPL") is None
+
+
+class TestCoverageRecordsTheResponse:
+    """PLAN 11.52 — the sidecar meta must record what came BACK, not what
+    was asked for.
+
+    It used to store the requested end. When a catch-up fetch came back
+    short, the missing tail was still stamped covered, and `_missing_ranges`
+    only ever asks for bars before covered_start or after covered_end — so
+    those sessions were never requested again. Confirmed 2026-07-31: after
+    the laptop was off 2026-07-13 -> 07-20, 92 of 106 SIP symbols lost that
+    entire trading week, undetectable from the metadata.
+    """
+
+    def _bars(self, days: list[str]) -> pd.DataFrame:
+        idx = pd.DatetimeIndex([pd.Timestamp(d, tz="UTC") for d in days])
+        return pd.DataFrame(
+            {"open": 1.0, "high": 2.0, "low": 0.5, "close": 1.5, "volume": 100},
+            index=idx,
+        )
+
+    def _meta(self, tmp_cache_dir, symbol="AAPL", feed="iex"):
+        import json
+        p = tmp_cache_dir / feed / f"{symbol}_1Day_all.meta.json"
+        return json.loads(p.read_text())
+
+    def test_short_response_does_not_claim_the_missing_tail(
+        self, tmp_cache_dir, monkeypatch
+    ):
+        """The exact 11.52 mechanism: ask for a week, get back two days."""
+        start = datetime(2026, 7, 13, tzinfo=timezone.utc)
+        end = datetime(2026, 7, 20, tzinfo=timezone.utc)
+
+        monkeypatch.setattr(
+            fetcher, "_fetch_bars_api",
+            lambda *a, **k: self._bars(["2026-07-13", "2026-07-14"]),
+        )
+        fetcher.fetch_symbol("AAPL", start=start, end=end,
+                             timeframe="1Day", feed="iex")
+
+        covered_end = datetime.fromisoformat(self._meta(tmp_cache_dir)["covered_end"])
+        # Must be the last bar we actually got, NOT the 07-20 we requested.
+        assert covered_end.date() == date(2026, 7, 14)
+        assert covered_end.date() != end.date()
+
+    def test_the_missing_tail_is_re_requested_next_time(
+        self, tmp_cache_dir, monkeypatch
+    ):
+        """The consequence that matters. Without the fix the second call
+        sees the range as covered and never asks again — which is how the
+        holes became permanent."""
+        start = datetime(2026, 7, 13, tzinfo=timezone.utc)
+        end = datetime(2026, 7, 20, tzinfo=timezone.utc)
+
+        monkeypatch.setattr(
+            fetcher, "_fetch_bars_api",
+            lambda *a, **k: self._bars(["2026-07-13", "2026-07-14"]),
+        )
+        fetcher.fetch_symbol("AAPL", start=start, end=end,
+                             timeframe="1Day", feed="iex")
+
+        asked: list[tuple] = []
+
+        def record(symbol, timeframe, s, e, adjustment, feed):
+            asked.append((s.date(), e.date()))
+            return self._bars(["2026-07-15", "2026-07-16", "2026-07-17"])
+
+        monkeypatch.setattr(fetcher, "_fetch_bars_api", record)
+        fetcher.fetch_symbol("AAPL", start=start, end=end,
+                             timeframe="1Day", feed="iex")
+
+        assert asked, "second call made no API request — the tail was lost"
+        # The END is NOT the discriminator: `effective_cov_end` already
+        # subtracts one bar interval to force a re-fetch of the latest bar,
+        # so a request reaching 07-20 happens either way. What matters is
+        # that the refetch reaches BACK far enough to cover 07-15..07-17 —
+        # the sessions the short response never delivered. Without the fix
+        # coverage claims 07-20, so the request starts at 07-19 and the
+        # hole is skipped permanently.
+        earliest_asked = min(s for s, _ in asked)
+        assert earliest_asked <= date(2026, 7, 15), (
+            f"refetch started at {earliest_asked} — it skipped the hole at "
+            "2026-07-15..07-17 rather than filling it"
+        )
+
+    def test_complete_response_still_records_full_coverage(
+        self, tmp_cache_dir, monkeypatch
+    ):
+        """No behaviour change on the happy path — a response that reaches
+        the requested end still claims it, so normal fetches don't start
+        re-requesting ranges they already have."""
+        start = datetime(2026, 7, 13, tzinfo=timezone.utc)
+        end = datetime(2026, 7, 17, tzinfo=timezone.utc)
+        monkeypatch.setattr(
+            fetcher, "_fetch_bars_api",
+            lambda *a, **k: self._bars(
+                ["2026-07-13", "2026-07-14", "2026-07-15",
+                 "2026-07-16", "2026-07-17"]
+            ),
+        )
+        fetcher.fetch_symbol("AAPL", start=start, end=end,
+                             timeframe="1Day", feed="iex")
+        covered_end = datetime.fromisoformat(self._meta(tmp_cache_dir)["covered_end"])
+        assert covered_end.date() == date(2026, 7, 17)
+
+    def test_start_side_is_deliberately_not_clamped(
+        self, tmp_cache_dir, monkeypatch
+    ):
+        """Feed-depth boundaries live on the start side: SIP begins
+        2016-01-04, so asking earlier legitimately returns nothing before
+        it. Clamping there would re-request the missing years forever, so
+        the requested start is recorded on purpose."""
+        start = datetime(2026, 7, 1, tzinfo=timezone.utc)
+        end = datetime(2026, 7, 17, tzinfo=timezone.utc)
+        monkeypatch.setattr(
+            fetcher, "_fetch_bars_api",
+            lambda *a, **k: self._bars(["2026-07-15", "2026-07-16", "2026-07-17"]),
+        )
+        fetcher.fetch_symbol("AAPL", start=start, end=end,
+                             timeframe="1Day", feed="iex")
+        covered_start = datetime.fromisoformat(
+            self._meta(tmp_cache_dir)["covered_start"]
+        )
+        assert covered_start.date() == date(2026, 7, 1)
+
+
+class TestUseCacheFalseIsNonDestructive:
+    """PLAN 11.52(b) — `use_cache=False` means bypass, not discard.
+
+    It blanked `cached` and then let `_write_cache` overwrite the file with
+    only the fetched window, so an ad-hoc diagnostic fetch silently
+    truncated a symbol's whole history. On 2026-07-31 this took MU from
+    2659 rows to 125, and AAPL to 22.
+    """
+
+    def _bars(self, days):
+        idx = pd.DatetimeIndex([pd.Timestamp(d, tz="UTC") for d in days])
+        return pd.DataFrame(
+            {"open": 1.0, "high": 2.0, "low": 0.5, "close": 1.5, "volume": 100},
+            index=idx,
+        )
+
+    def test_diagnostic_fetch_leaves_the_cache_file_untouched(
+        self, tmp_cache_dir, monkeypatch
+    ):
+        # Seed a cache with a wide history.
+        wide = [f"2026-06-{d:02d}" for d in range(1, 26)]
+        monkeypatch.setattr(fetcher, "_fetch_bars_api",
+                            lambda *a, **k: self._bars(wide))
+        fetcher.fetch_symbol(
+            "MU", start=datetime(2026, 6, 1, tzinfo=timezone.utc),
+            end=datetime(2026, 6, 25, tzinfo=timezone.utc),
+            timeframe="1Day", feed="iex",
+        )
+        cache_file = tmp_cache_dir / "iex" / "MU_1Day_all.parquet"
+        before = cache_file.read_bytes()
+        assert len(pd.read_parquet(cache_file)) == len(wide)
+
+        # A narrow diagnostic read with use_cache=False.
+        monkeypatch.setattr(
+            fetcher, "_fetch_bars_api",
+            lambda *a, **k: self._bars(["2026-06-24", "2026-06-25"]),
+        )
+        df, _ = fetcher.fetch_symbol(
+            "MU", start=datetime(2026, 6, 24, tzinfo=timezone.utc),
+            end=datetime(2026, 6, 25, tzinfo=timezone.utc),
+            timeframe="1Day", feed="iex", use_cache=False,
+        )
+
+        assert len(df) == 2, "the caller still gets exactly what it asked for"
+        assert cache_file.read_bytes() == before, (
+            "use_cache=False truncated the cache file"
+        )
+        assert len(pd.read_parquet(cache_file)) == len(wide)
+
+    def test_use_cache_false_does_not_create_a_cache_file(
+        self, tmp_cache_dir, monkeypatch
+    ):
+        monkeypatch.setattr(
+            fetcher, "_fetch_bars_api",
+            lambda *a, **k: self._bars(["2026-06-24", "2026-06-25"]),
+        )
+        fetcher.fetch_symbol(
+            "NVDA", start=datetime(2026, 6, 24, tzinfo=timezone.utc),
+            end=datetime(2026, 6, 25, tzinfo=timezone.utc),
+            timeframe="1Day", feed="iex", use_cache=False,
+        )
+        assert not (tmp_cache_dir / "iex" / "NVDA_1Day_all.parquet").exists()
+
+
+class TestJuly2026ShutdownRegression:
+    """The specific incident 11.52 documents, end to end.
+
+    2026-07-13 → 07-20 the laptop was off. On resume the bot issued one
+    large catch-up fetch; the meta recorded the REQUEST, so whatever subset
+    came back was accepted silently and the missing sessions sat inside
+    [covered_start, covered_end] forever. 92 of 106 SIP symbols lost that
+    trading week, undetectable from the metadata, and it later produced a
+    wrong analytical result (the ANET counterfactual in 11.54).
+
+    Two things these tests do that the rest of the file does not:
+
+    1. **Start from a POPULATED cache.** July began with history and a
+       shutdown gap, which takes a different branch — cov_start/cov_end are
+       set, `_missing_ranges` computes a tail range, and the response
+       merges into existing bars. Empty-cache tests never exercise it.
+    2. **Use an API fake that respects the requested window.** A fake that
+       returns the missing bars regardless of what was asked lets the buggy
+       code "heal" the hole for the wrong reason — it passed against the
+       original fetcher until this was fixed.
+    """
+
+    def _bars(self, days):
+        idx = pd.DatetimeIndex([pd.Timestamp(d, tz="UTC") for d in days])
+        return pd.DataFrame(
+            {"open": 1.0, "high": 2.0, "low": 0.5, "close": 1.5, "volume": 100},
+            index=idx,
+        )
+
+    def _api(self, available, log=None):
+        """A fake that behaves like Alpaca: only ever returns bars INSIDE
+        the requested range. Anything looser makes these tests vacuous."""
+        def fake(symbol, timeframe, s, e, adjustment, feed):
+            if log is not None:
+                log.append((s.date(), e.date()))
+            inside = [
+                d for d in available
+                if s.date() <= date.fromisoformat(d) <= e.date()
+            ]
+            return self._bars(inside) if inside else pd.DataFrame()
+        return fake
+
+    def _cached_days(self, tmp_cache_dir, symbol="AAPL", feed="iex"):
+        f = tmp_cache_dir / feed / f"{symbol}_1Day_all.parquet"
+        return {str(t.date()) for t in pd.read_parquet(f).index}
+
+    BEFORE = ["2026-07-06", "2026-07-07", "2026-07-08", "2026-07-09", "2026-07-10"]
+    RETURNED_FIRST = ["2026-07-13", "2026-07-14"]      # short catch-up response
+    MISSING = ["2026-07-15", "2026-07-16", "2026-07-17", "2026-07-20"]
+
+    def _resume(self, monkeypatch, available, log=None, end_day=21):
+        monkeypatch.setattr(fetcher, "_fetch_bars_api", self._api(available, log))
+        fetcher.fetch_symbol(
+            "AAPL",
+            start=datetime(2026, 7, 1, tzinfo=timezone.utc),
+            end=datetime(2026, 7, end_day, tzinfo=timezone.utc),
+            timeframe="1Day", feed="iex",
+        )
+
+    def _seed_and_hole(self, monkeypatch):
+        """Cache with pre-shutdown history, then a resume that comes back
+        short — the exact July state."""
+        monkeypatch.setattr(fetcher, "_fetch_bars_api", self._api(self.BEFORE))
+        fetcher.fetch_symbol(
+            "AAPL",
+            start=datetime(2026, 7, 1, tzinfo=timezone.utc),
+            end=datetime(2026, 7, 10, tzinfo=timezone.utc),
+            timeframe="1Day", feed="iex",
+        )
+        self._resume(monkeypatch, self.BEFORE + self.RETURNED_FIRST)
+
+    def test_the_july_hole_is_filled_on_the_next_cycle(
+        self, tmp_cache_dir, monkeypatch
+    ):
+        """The whole point: the hole must not be permanent.
+
+        Without the fix the resume stamps covered_end at the requested
+        07-21, so the next cycle only asks from 07-20 — and a realistic API
+        returns nothing before that, leaving 07-15..07-17 gone for good.
+        """
+        self._seed_and_hole(monkeypatch)
+        holed = self._cached_days(tmp_cache_dir)
+        assert not (set(self.MISSING) & holed), "fixture wrong: no hole created"
+
+        # Next cycle — the API now has the full week available.
+        self._resume(monkeypatch, self.BEFORE + self.RETURNED_FIRST + self.MISSING)
+
+        final = self._cached_days(tmp_cache_dir)
+        assert set(self.MISSING) <= final, (
+            f"the July hole survived — still missing "
+            f"{sorted(set(self.MISSING) - final)}"
+        )
+        assert set(self.BEFORE) <= final, "pre-shutdown history was lost"
+
+    def test_the_refetch_reaches_back_into_the_holed_week(
+        self, tmp_cache_dir, monkeypatch
+    ):
+        """The mechanism, asserted on what the API is actually asked for."""
+        self._seed_and_hole(monkeypatch)
+        asked = []
+        self._resume(
+            monkeypatch, self.BEFORE + self.RETURNED_FIRST + self.MISSING, log=asked
+        )
+        assert asked, "no refetch at all — the week was written off"
+        assert min(s for s, _ in asked) <= date(2026, 7, 15), (
+            f"refetch started at {min(s for s, _ in asked)}, after the hole at "
+            "2026-07-15 — this is exactly the July failure"
+        )
+
+    def test_repeated_cycles_converge_and_stop_fetching(
+        self, tmp_cache_dir, monkeypatch
+    ):
+        """Once whole, the cache must settle: no endless re-request loop.
+
+        A fix that healed holes by refetching forever would trade a silent
+        bug for a permanent API cost.
+        """
+        self._seed_and_hole(monkeypatch)
+        whole = self.BEFORE + self.RETURNED_FIRST + self.MISSING
+        for _ in range(3):
+            self._resume(monkeypatch, whole)
+        assert set(self.MISSING) <= self._cached_days(tmp_cache_dir)
+
+        calls = []
+        self._resume(monkeypatch, whole, log=calls, end_day=20)
+        # At most the single trailing-bar refresh `effective_cov_end` forces.
+        assert len(calls) <= 1, (
+            f"settled cache still made {len(calls)} API calls — re-request loop"
+        )
+
+
+class TestSessionGapDetection:
+    """PLAN 11.52 — interval coverage cannot see a gap in the MIDDLE.
+
+    `_missing_ranges` only ever asks for bars before covered_start or after
+    covered_end, so clamping covered_end to the last bar received heals a
+    TAIL truncation and nothing else. Measured before this was added, of
+    the four plausible catch-up response shapes only two healed:
+
+        tail truncation  (07-13, 07-14)  -> healed
+        interior drop    (07-13, 07-20)  -> STILL HOLED
+        start truncation (07-20 only)    -> STILL HOLED
+        empty response                   -> healed
+
+    Diffing what we hold against a real session calendar closes all four.
+    """
+
+    BEFORE = ["2026-07-06", "2026-07-07", "2026-07-08", "2026-07-09", "2026-07-10"]
+    WEEK = ["2026-07-13", "2026-07-14", "2026-07-15", "2026-07-16",
+            "2026-07-17", "2026-07-20"]
+
+    @pytest.fixture(autouse=True)
+    def _calendar(self, monkeypatch):
+        """Deterministic calendar — never the network, never a cached symbol."""
+        from data import market_calendar
+        every = self.BEFORE + self.WEEK
+        monkeypatch.setattr(
+            market_calendar, "trading_sessions",
+            lambda s, e: {
+                date.fromisoformat(d) for d in every
+                if s <= date.fromisoformat(d) <= e
+            },
+        )
+        market_calendar._reset_for_tests()
+
+    def _bars(self, days):
+        if not days:
+            return pd.DataFrame()
+        return pd.DataFrame(
+            {"open": 1.0, "high": 2.0, "low": 0.5, "close": 1.5, "volume": 100},
+            index=pd.DatetimeIndex([pd.Timestamp(d, tz="UTC") for d in days]),
+        )
+
+    def _api(self, available, log=None):
+        def fake(symbol, timeframe, s, e, adjustment, feed):
+            if log is not None:
+                log.append((s.date(), e.date()))
+            inside = [d for d in available
+                      if s.date() <= date.fromisoformat(d) <= e.date()]
+            return self._bars(inside) if inside else pd.DataFrame()
+        return fake
+
+    def _cycle(self, monkeypatch, available, log=None, end_day=21):
+        monkeypatch.setattr(fetcher, "_fetch_bars_api", self._api(available, log))
+        fetcher.fetch_symbol(
+            "AAPL", start=datetime(2026, 7, 1, tzinfo=timezone.utc),
+            end=datetime(2026, 7, end_day, tzinfo=timezone.utc),
+            timeframe="1Day", feed="iex",
+        )
+
+    def _days(self, tmp_cache_dir):
+        f = tmp_cache_dir / "iex" / "AAPL_1Day_all.parquet"
+        return {str(t.date()) for t in pd.read_parquet(f).index}
+
+    @pytest.mark.parametrize("shape,resume", [
+        ("tail_truncation", ["2026-07-13", "2026-07-14"]),
+        ("interior_drop", ["2026-07-13", "2026-07-20"]),
+        ("start_truncation", ["2026-07-20"]),
+        ("empty_response", []),
+    ])
+    def test_every_catch_up_response_shape_heals(
+        self, tmp_cache_dir, monkeypatch, shape, resume
+    ):
+        """The acceptance matrix. Two of these fail on tail-clamping alone."""
+        self._cycle(monkeypatch, self.BEFORE, end_day=10)
+        self._cycle(monkeypatch, self.BEFORE + resume)          # short catch-up
+        for _ in range(2):
+            self._cycle(monkeypatch, self.BEFORE + self.WEEK)   # data now available
+
+        missing = set(self.WEEK) - self._days(tmp_cache_dir)
+        assert not missing, f"{shape}: sessions never recovered — {sorted(missing)}"
+
+    def test_genuinely_absent_sessions_stop_being_requested(
+        self, tmp_cache_dir, monkeypatch
+    ):
+        """`iex/SPY` has a real 634-day feed-depth gap. Chasing it every
+        call for the life of the cache would trade a silent bug for a
+        permanent API cost, so a session missed twice is retired."""
+        never = {"2026-07-08", "2026-07-09"}
+        available = [d for d in self.BEFORE + self.WEEK if d not in never]
+
+        for _ in range(3):
+            self._cycle(monkeypatch, available, end_day=20)
+
+        meta = json.loads(
+            (tmp_cache_dir / "iex" / "AAPL_1Day_all.meta.json").read_text()
+        )
+        assert set(meta.get("absent_sessions", [])) >= never
+
+        calls: list = []
+        self._cycle(monkeypatch, available, log=calls, end_day=20)
+        assert len(calls) <= 1, (
+            f"settled cache made {len(calls)} calls — absent sessions are "
+            "still being chased"
+        )
+
+    def test_first_miss_is_retried_before_being_written_off(
+        self, tmp_cache_dir, monkeypatch
+    ):
+        """One strike is not enough. Retiring on the first miss is what
+        would have hidden the July incident — a truncated response looks
+        identical to absent data until you ask again."""
+        self._cycle(monkeypatch, self.BEFORE, end_day=10)
+        self._cycle(monkeypatch, self.BEFORE + ["2026-07-13"])
+
+        meta = json.loads(
+            (tmp_cache_dir / "iex" / "AAPL_1Day_all.meta.json").read_text()
+        )
+        absent = set(meta.get("absent_sessions", []))
+        assert "2026-07-14" not in absent, (
+            "a single miss retired the session — a truncated response would "
+            "never be retried"
+        )
+
+    def test_calendar_unavailable_falls_back_to_previous_behaviour(
+        self, tmp_cache_dir, monkeypatch
+    ):
+        """A market-data outage must never block a fetch. Cost of failing
+        closed is worse than the hole it would prevent."""
+        from data import market_calendar
+        monkeypatch.setattr(market_calendar, "trading_sessions",
+                            lambda s, e: None)
+        self._cycle(monkeypatch, self.BEFORE, end_day=10)
+        df, _ = fetcher.fetch_symbol(
+            "AAPL", start=datetime(2026, 7, 1, tzinfo=timezone.utc),
+            end=datetime(2026, 7, 10, tzinfo=timezone.utc),
+            timeframe="1Day", feed="iex",
+        )
+        assert len(df) == len(self.BEFORE)
+
+    def test_gap_detection_never_consults_a_cached_symbol(self):
+        """11.52: a sweep using SPY as the session reference reported
+        'clean' while 92 of 106 symbols were holed, because SPY is cached
+        by the same code and shared the gap. The calendar module must not
+        read the bar cache at all."""
+        src = (Path(fetcher.__file__).parent / "market_calendar.py").read_text()
+        assert "_read_cache" not in src
+        assert "read_parquet" not in src
+
+
+class TestCalendarIsolation:
+    """The calendar must never reach the network or the real cache file
+    from a unit test.
+
+    `market_calendar` writes to a fixed `data/historical/.market_calendar.json`
+    and falls back to a live Alpaca call. `tmp_cache_dir` only redirects
+    `fetcher.CACHE_DIR`, so before the `isolate_market_calendar` autouse
+    fixture existed, any test on the daily fetch path did both — a run on
+    2026-08-10 left a real file holding 290 genuine trading sessions.
+    """
+
+    def test_cache_path_is_redirected_out_of_the_repo(self):
+        from data import market_calendar
+        assert "data/historical" not in str(market_calendar._CACHE_PATH)
+
+    def test_no_real_calendar_file_is_written(self, tmp_cache_dir, monkeypatch):
+        from data import market_calendar
+        real = Path(fetcher.__file__).parent / "historical" / ".market_calendar.json"
+        existed = real.exists()
+
+        monkeypatch.setattr(
+            fetcher, "_fetch_bars_api",
+            lambda *a, **k: pd.DataFrame(
+                {"open": 1.0, "high": 2.0, "low": 0.5, "close": 1.5, "volume": 100},
+                index=pd.DatetimeIndex([pd.Timestamp("2026-07-06", tz="UTC")]),
+            ),
+        )
+        fetcher.fetch_symbol(
+            "AAPL", start=datetime(2026, 7, 1, tzinfo=timezone.utc),
+            end=datetime(2026, 7, 10, tzinfo=timezone.utc),
+            timeframe="1Day", feed="iex",
+        )
+        market_calendar.trading_sessions(date(2026, 7, 1), date(2026, 7, 10))
+        assert real.exists() == existed, "a unit test wrote the real calendar cache"
+
+    def test_the_live_fetch_path_is_stubbed_out(self):
+        """The fixture replaces `_fetch`, so an unstubbed `trading_sessions`
+        degrades to the fail-open None rather than calling Alpaca."""
+        from data import market_calendar
+        assert market_calendar._fetch(date(2026, 1, 1), date(2026, 1, 2)) is None
+        assert market_calendar.trading_sessions(
+            date(2026, 1, 1), date(2026, 1, 2)
+        ) is None

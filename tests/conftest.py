@@ -84,3 +84,29 @@ def isolate_runtime_artifacts(tmp_path: Path, monkeypatch) -> None:
     monkeypatch.setattr(settings, "STATE_SNAPSHOT_PATH", str(tmp_path / "engine_state.json"))
     monkeypatch.setattr(settings, "JSON_LOG_FILE", str(tmp_path / "bot.jsonl"))
     monkeypatch.setattr(settings, "ALERT_LOG_FILE", str(tmp_path / "alerts.log"))
+
+
+@pytest.fixture(autouse=True)
+def isolate_market_calendar(tmp_path: Path, monkeypatch) -> None:
+    """
+    Keep the trading calendar (PLAN 11.52) offline and out of real files.
+
+    `market_calendar` caches to a fixed `data/historical/.market_calendar.json`
+    and falls back to a live Alpaca call when that file cannot answer. The
+    `tmp_cache_dir` fixture only redirects `fetcher.CACHE_DIR`, so without
+    this any test touching the daily fetch path reached the network and wrote
+    the real cache — confirmed on 2026-08-10, when a run left a file holding
+    290 genuine sessions.
+
+    Default is the fail-open answer (`None` = "cannot check"), which is what
+    the fetcher saw before 11.52. Tests that exercise gap detection stub
+    `trading_sessions` themselves with a deterministic calendar; this only
+    guarantees no test can silently reach Alpaca or the real cache file.
+    """
+    from data import market_calendar
+
+    monkeypatch.setattr(
+        market_calendar, "_CACHE_PATH", tmp_path / ".market_calendar.json"
+    )
+    monkeypatch.setattr(market_calendar, "_fetch", lambda lo, hi: None)
+    market_calendar._reset_for_tests()

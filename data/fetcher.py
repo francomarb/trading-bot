@@ -25,7 +25,7 @@ from __future__ import annotations
 import json
 import time
 from dataclasses import dataclass
-from datetime import datetime, timedelta, timezone
+from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
 from typing import Iterable
 
@@ -350,6 +350,31 @@ def _read_meta(
         return None, None
 
 
+def _read_gap_state(
+    symbol: str, timeframe: str, adjustment: str, feed: str
+) -> tuple[set[date], set[date]]:
+    """Return (absent_sessions, seen_once) from the sidecar.
+
+    ``absent`` are sessions requested twice and delivered neither time —
+    treated as genuinely unavailable upstream (a feed-depth boundary, a
+    delisted stretch) and excluded from gap detection so the fetcher does
+    not chase them forever. ``seen_once`` is the first strike.
+
+    Both default to empty for pre-11.52 sidecars, so old meta files keep
+    working untouched.
+    """
+    path = _meta_path(symbol, timeframe, adjustment, feed)
+    if not path.exists():
+        return set(), set()
+    try:
+        data = json.loads(path.read_text())
+        absent = {date.fromisoformat(d) for d in data.get("absent_sessions", [])}
+        seen = {date.fromisoformat(d) for d in data.get("gap_seen_once", [])}
+        return absent, seen
+    except (json.JSONDecodeError, ValueError):
+        return set(), set()
+
+
 def _write_cache(
     df: pd.DataFrame,
     symbol: str,
@@ -358,20 +383,23 @@ def _write_cache(
     covered_start: datetime,
     covered_end: datetime,
     feed: str,
+    absent_sessions: set[date] | None = None,
+    gap_seen_once: set[date] | None = None,
 ) -> None:
     if df.empty:
         return
     cache_path = _cache_path(symbol, timeframe, adjustment, feed)
     cache_path.parent.mkdir(parents=True, exist_ok=True)
     df.to_parquet(cache_path)
-    _meta_path(symbol, timeframe, adjustment, feed).write_text(
-        json.dumps(
-            {
-                "covered_start": covered_start.isoformat(),
-                "covered_end": covered_end.isoformat(),
-            }
-        )
-    )
+    meta: dict = {
+        "covered_start": covered_start.isoformat(),
+        "covered_end": covered_end.isoformat(),
+    }
+    if absent_sessions:
+        meta["absent_sessions"] = sorted(d.isoformat() for d in absent_sessions)
+    if gap_seen_once:
+        meta["gap_seen_once"] = sorted(d.isoformat() for d in gap_seen_once)
+    _meta_path(symbol, timeframe, adjustment, feed).write_text(json.dumps(meta))
 
 
 # ── Retry wrapper ────────────────────────────────────────────────────────────
@@ -567,6 +595,19 @@ def fetch_symbol(
     effective_cov_end = cov_end - bar_interval if cov_end is not None else None
     missing_ranges = _missing_ranges(cov_start, effective_cov_end, start, end)
 
+    # Interval coverage is blind to gaps in the MIDDLE of a covered range
+    # (PLAN 11.52). Diff what we hold against a real session calendar and
+    # add whatever is genuinely missing. Fail-open: no calendar, no extra
+    # ranges, pre-11.52 behaviour.
+    absent_sessions, gap_seen_once = (
+        _read_gap_state(symbol, timeframe, adjustment, feed)
+        if use_cache else (set(), set())
+    )
+    if use_cache and timeframe == "1Day":
+        missing_ranges = missing_ranges + _session_gap_ranges(
+            cached, start, end, absent_sessions, symbol
+        )
+
     for rng_start, rng_end in missing_ranges:
         logger.info(
             f"{symbol} [{timeframe}]: fetching {rng_start.date()} → {rng_end.date()} from API"
@@ -591,19 +632,36 @@ def fetch_symbol(
         if merged.index.has_duplicates:
             merged = merged[~merged.index.duplicated(keep="last")]
         merged = _validate(merged, symbol)
-        _write_cache(
-            merged, symbol, timeframe, adjustment, new_cov_start, new_cov_end, feed
-        )
+        # Record what came back, not what we asked for (PLAN 11.52).
+        new_cov_end = _coverage_end_from_bars(merged, new_cov_end)
+        if use_cache:
+            absent_sessions, gap_seen_once = _update_gap_strikes(
+                merged, missing_ranges, absent_sessions, gap_seen_once, symbol
+            )
+            _write_cache(
+                merged, symbol, timeframe, adjustment, new_cov_start, new_cov_end,
+                feed, absent_sessions, gap_seen_once,
+            )
     else:
         merged = cached
         # Even with no new data, if the user requested a widened window
         # that returned zero rows, persist the expanded coverage so we
         # don't refetch next time.
-        if cached is not None and not cached.empty and (
+        # Not clamped here: a request that returned ZERO rows cannot tell a
+        # truncated response apart from genuinely-absent data (a weekend, or
+        # a window past this symbol's feed depth). Persisting the widened
+        # coverage is the right call for the latter and is the pre-existing
+        # behaviour; clamping would re-request an empty range forever. The
+        # 11.52 failure mode is a PARTIAL response, which lands above.
+        if use_cache and cached is not None and not cached.empty and (
             cov_start != new_cov_start or cov_end != new_cov_end
         ):
+            absent_sessions, gap_seen_once = _update_gap_strikes(
+                merged, missing_ranges, absent_sessions, gap_seen_once, symbol
+            )
             _write_cache(
-                merged, symbol, timeframe, adjustment, new_cov_start, new_cov_end, feed
+                merged, symbol, timeframe, adjustment, new_cov_start, new_cov_end,
+                feed, absent_sessions, gap_seen_once,
             )
 
     rows_from_api = sum(len(f) for f in fetched_frames)
@@ -667,6 +725,147 @@ def _to_utc(dt: datetime) -> datetime:
     if dt.tzinfo is None:
         return dt.replace(tzinfo=timezone.utc)
     return dt.astimezone(timezone.utc)
+
+
+def _coverage_end_from_bars(
+    bars: pd.DataFrame, requested_end: datetime
+) -> datetime:
+    """
+    Clamp the coverage end to the last bar that actually arrived.
+
+    The sidecar meta used to record what we *asked the API for*. When a
+    response came back short, the missing tail was still stamped as
+    covered — and `_missing_ranges` only ever asks for bars before
+    `covered_start` or after `covered_end`, so those sessions were never
+    requested again no matter how long the bot ran (PLAN 11.52).
+
+    The confirmed case: after the laptop was off 2026-07-13 → 07-20, the
+    resume issued one large catch-up fetch, stamped `covered_end = 07-20`
+    from the request, and silently accepted whatever subset came back.
+    92 of 106 SIP symbols lost that entire trading week, undetectable
+    from the metadata.
+
+    Only the END is clamped. The start side is where per-symbol feed-depth
+    boundaries live — SIP begins 2016-01-04, so a request reaching further
+    back legitimately returns nothing before it, and clamping there would
+    re-request the missing years on every call forever. Recording the
+    requested start is correct for that; only the end was lying.
+    """
+    if bars is None or bars.empty:
+        return requested_end
+    last = pd.Timestamp(bars.index.max()).to_pydatetime()
+    if last.tzinfo is None:
+        last = last.replace(tzinfo=timezone.utc)
+    return min(requested_end, last)
+
+
+
+
+def _update_gap_strikes(
+    merged: pd.DataFrame,
+    requested: list[tuple[datetime, datetime]],
+    absent: set[date],
+    seen_once: set[date],
+    symbol: str,
+) -> tuple[set[date], set[date]]:
+    """
+    Two-strike rule for sessions we asked for and did not get.
+
+    A single miss is ambiguous — it could be a truncated response (retry
+    and it heals) or data that genuinely does not exist upstream (retry
+    forever and it never will). Marking absent on the first miss would have
+    hidden the July incident; never marking absent would chase `iex/SPY`'s
+    634-day feed-depth gap on every call for the life of the cache.
+
+    So: first miss records a strike and leaves the session eligible for
+    re-request. Second miss retires it to ``absent``.
+    """
+    if not requested:
+        return absent, seen_once
+    from data import market_calendar
+
+    have = (
+        {pd.Timestamp(ts).tz_convert("UTC").date() for ts in merged.index}
+        if merged is not None and not merged.empty else set()
+    )
+    lo = min(r[0] for r in requested).date()
+    hi = max(r[1] for r in requested).date()
+    still_missing = market_calendar.missing_sessions(lo, hi, have, ignore=absent)
+    if still_missing is None:
+        return absent, seen_once
+
+    newly_absent = still_missing & seen_once
+    if newly_absent:
+        logger.info(
+            f"{symbol}: {len(newly_absent)} session(s) unavailable after a "
+            "second request — recording as genuinely absent upstream"
+        )
+    return absent | newly_absent, (seen_once | still_missing) - newly_absent
+
+
+def _session_gap_ranges(
+    cached: pd.DataFrame,
+    start: datetime,
+    end: datetime,
+    absent: set[date],
+    symbol: str,
+) -> list[tuple[datetime, datetime]]:
+    """
+    Fetch ranges for sessions that SHOULD exist in [start, end] but are
+    absent from the cache (PLAN 11.52).
+
+    `_missing_ranges` works on the covered interval, so it can only ever
+    ask for bars before `covered_start` or after `covered_end`. That is
+    blind to a gap in the middle — which is exactly how a short catch-up
+    response after the 2026-07-13→07-20 shutdown cost 92 of 106 symbols an
+    entire trading week, permanently.
+
+    This is the complement: diff what we hold against a real session
+    calendar and re-request whatever is genuinely missing, wherever it
+    sits. Layered on top of the interval logic rather than replacing it —
+    the interval path stays the cheap common case.
+
+    Returns [] when the calendar is unavailable (fail-open), when nothing
+    is missing, or when the cache is empty (the interval path already asks
+    for everything).
+    """
+    if cached is None or cached.empty:
+        return []
+    from data import market_calendar
+
+    have = {pd.Timestamp(ts).tz_convert("UTC").date() for ts in cached.index}
+    missing = market_calendar.missing_sessions(
+        start.date(), end.date(), have, ignore=absent
+    )
+    if not missing:
+        return []
+
+    logger.warning(
+        f"{symbol}: {len(missing)} session(s) missing from cache inside a "
+        f"covered range — re-requesting "
+        f"({', '.join(str(d) for d in sorted(missing)[:5])}"
+        f"{'…' if len(missing) > 5 else ''})"
+    )
+    ranges: list[tuple[datetime, datetime]] = []
+    run_start = run_end = None
+    for d in sorted(missing):
+        if run_start is None:
+            run_start = run_end = d
+        elif (d - run_end).days <= 4:      # bridge weekends/holidays
+            run_end = d
+        else:
+            ranges.append((run_start, run_end))
+            run_start = run_end = d
+    if run_start is not None:
+        ranges.append((run_start, run_end))
+
+    return [
+        (
+            datetime.combine(a, datetime.min.time(), tzinfo=timezone.utc),
+            datetime.combine(b, datetime.max.time(), tzinfo=timezone.utc),
+        )
+        for a, b in ranges
+    ]
 
 
 def _missing_ranges(
