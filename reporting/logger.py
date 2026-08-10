@@ -2485,7 +2485,29 @@ class TradeLogger:
             )
             return False
         risk_per_share = abs(float(fill) - float(new_stop_price))
-        qty = float(row["filled_qty"] or row["requested_qty"] or 0.0)
+        # Quantity basis: prefer requested when the fill is still in flight.
+        #
+        # This runs from the post-fill stop rebuild, which fires on fill
+        # CONFIRMATION — not on fill COMPLETION. NOW 2026-08-10 placed its
+        # GTC stop at 13:50:54.030 while the entry order only reached
+        # filled_qty=33 at 13:50:54.058, 28ms later. Reading filled_qty
+        # there gave 24, so risk_dollars was frozen at 24 x rps while qty
+        # went on to 33. `initial_risk_dollars` is preserve-first-non-null
+        # and `qty` is newest-wins, so the row can never reconcile itself.
+        #
+        # requested_qty is the size the risk budget was computed against,
+        # so it is the right basis for "how much was I risking here". A
+        # partially-filled-then-cancelled order would overstate — the safe
+        # direction, visible from qty in the same row, and rare.
+        filled = float(row["filled_qty"] or 0.0)
+        requested = float(row["requested_qty"] or 0.0)
+        qty = requested if requested > filled else filled
+        if qty != filled and filled > 0:
+            logger.info(
+                f"rebase_entry_stop: order {order_id} still filling "
+                f"({filled:g} of {requested:g}) — sizing the recorded risk on "
+                "the requested quantity so it cannot freeze mid-fill"
+            )
         risk_dollars = risk_per_share * qty * _contract_multiplier(row["symbol"])
         conn.execute(
             "UPDATE trades SET stop_price = ?, initial_stop_loss = ?, "
