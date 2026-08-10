@@ -147,3 +147,43 @@ class TestFilterSweep:
             ("atr_pct", "ATR%", "<", 5.0), ("atr_pct", "ATR%", ">", 5.0),
         ])
         assert out.iloc[0].delta >= out.iloc[1].delta
+
+
+class TestSampleSeparation:
+    """The sweep runs on P&L-valid trades; the correlations run on R-valid
+    ones. Those sets differ — PWR 05-01 and WYFI 06-18 have null initial
+    risk fields, so they carry realised P&L but no R.
+
+    Reusing the R-valid set for a P&L sweep silently drops them and makes
+    the printed baseline disagree with the stated trade count (review
+    finding on PR #100: prose said 19, the sweep ran on 17).
+    """
+
+    DF = pd.DataFrame({
+        "sym": ["AAPL", "PWR", "AMD", "WYFI"],
+        "atr_pct": [2.0, 3.1, 4.5, 10.1],
+        "pnl": [473.0, -239.0, 1315.0, -19.0],
+        "R": [2.52, float("nan"), 3.79, float("nan")],
+    })
+
+    def test_pnl_sample_is_larger_than_the_r_sample(self):
+        assert len(self.DF[self.DF.pnl.notna()]) == 4
+        assert len(self.DF[self.DF.R.notna()]) == 2
+
+    def test_sweep_baseline_uses_every_pnl_bearing_trade(self):
+        """The two risk-less trades are both losers, so dropping them would
+        flatter the baseline and shrink every delta."""
+        pnl_all = self.DF[self.DF.pnl.notna()]
+        r_only = self.DF[self.DF.R.notna()]
+        assert pnl_all.pnl.sum() == pytest.approx(1530.0)
+        assert r_only.pnl.sum() == pytest.approx(1788.0)
+        assert pnl_all.pnl.sum() != r_only.pnl.sum()
+
+    def test_sweep_tolerates_rows_without_R(self):
+        """filter_sweep must never touch R — it is a P&L-only calculation."""
+        out = filter_sweep(
+            self.DF[self.DF.pnl.notna()], [("atr_pct", "ATR%", ">", 5.0)]
+        )
+        row = out.iloc[0]
+        assert row.kept == 3 and row.skipped == 1
+        assert row.pnl_kept == pytest.approx(1549.0)   # WYFI's -19 removed
