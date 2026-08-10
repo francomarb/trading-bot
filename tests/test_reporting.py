@@ -4613,6 +4613,55 @@ class TestRebaseEntryStop:
                     "initial_risk_per_share", "initial_risk_dollars"):
             assert rebased[col] == pytest.approx(direct[col]), col
 
+    def test_partial_fill_sizes_risk_on_the_requested_quantity(self, tmp_csv):
+        """NOW 2026-08-10: the rebase fires on fill CONFIRMATION, not fill
+        COMPLETION. Its GTC stop went out 28ms before the entry order
+        reached filled_qty=33, so reading filled_qty gave 24 and froze
+        risk_dollars at 24 x rps while qty went on to 33.
+
+        `initial_risk_dollars` is preserve-first-non-null while `qty` is
+        newest-wins, so the row can never reconcile itself afterwards.
+        """
+        tl = TradeLogger(path=tmp_csv)
+        self._seed(tl, order_id="entry-1", fill=124.0309, qty=33.0,
+                   stop=111.58, symbol="NOW")
+        # The in-flight state the rebase actually observed.
+        conn = tl._ensure_db()
+        conn.execute("UPDATE trades SET filled_qty=24.0 WHERE order_id='entry-1'")
+        conn.commit()
+
+        assert tl.rebase_entry_stop(order_id="entry-1", new_stop_price=110.7645)
+
+        row = self._row(tl)
+        rps = row["initial_risk_per_share"]
+        assert row["initial_risk_dollars"] == pytest.approx(rps * 33.0, abs=0.01)
+        assert row["initial_risk_dollars"] != pytest.approx(rps * 24.0, abs=0.01)
+
+    def test_complete_fill_still_uses_the_filled_quantity(self, tmp_csv):
+        """No behaviour change once the fill is done — requested and filled
+        agree, so nothing is inferred."""
+        tl = TradeLogger(path=tmp_csv)
+        self._seed(tl)
+        tl.rebase_entry_stop(order_id="entry-1", new_stop_price=392.36)
+        row = self._row(tl)
+        assert row["initial_risk_dollars"] == pytest.approx(
+            row["qty"] * row["initial_risk_per_share"], abs=0.01)
+
+    def test_recorded_risk_always_equals_qty_times_risk_per_share(self, tmp_csv):
+        """The invariant this bug violates: risk_dollars is a pure function
+        of the other two columns, so a stored value that can disagree with
+        them is the defect."""
+        tl = TradeLogger(path=tmp_csv)
+        self._seed(tl, order_id="entry-1", fill=124.0309, qty=33.0,
+                   stop=111.58, symbol="NOW")
+        conn = tl._ensure_db()
+        conn.execute("UPDATE trades SET filled_qty=24.0 WHERE order_id='entry-1'")
+        conn.commit()
+        tl.rebase_entry_stop(order_id="entry-1", new_stop_price=110.7645)
+        row = self._row(tl)
+        assert row["initial_risk_dollars"] == pytest.approx(
+            row["qty"] * row["initial_risk_per_share"], abs=0.01)
+
     def test_unknown_order_id_is_a_no_op(self, tmp_csv):
         tl = TradeLogger(path=tmp_csv)
         self._seed(tl)
