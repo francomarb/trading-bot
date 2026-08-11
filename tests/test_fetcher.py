@@ -1112,13 +1112,14 @@ class TestSessionGapDetection:
         """An overnight endpoint cannot contain the current session's bar.
 
         Daily fixtures use Alpaca's 04:00 UTC timestamp and the fake API uses
-        timestamp, not date, comparisons. Before the readiness boundary this
-        scenario struck and then retired Aug 10 after two fetch cycles.
+        timestamp, not date, comparisons. Before the market-open readiness
+        boundary this 08:10 ET scenario struck and retired Aug 10 after two
+        fetch cycles.
         """
         from data import market_calendar
 
         requested_start = datetime(2026, 8, 3, tzinfo=timezone.utc)
-        requested_end = datetime(2026, 8, 10, 2, 55, tzinfo=timezone.utc)
+        requested_end = datetime(2026, 8, 10, 12, 10, tzinfo=timezone.utc)
         monkeypatch.setattr(
             market_calendar,
             "trading_sessions",

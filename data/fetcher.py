@@ -48,11 +48,11 @@ CACHE_DIR.mkdir(parents=True, exist_ok=True)
 
 OHLCV_COLS = ["open", "high", "low", "close", "volume"]
 
-# Alpaca daily bars are timestamped at midnight US Eastern: 04:00 UTC during
-# daylight time and 05:00 UTC during standard time.  Cache repair must not
-# classify today's bar as missing before a request window can contain it.
-# Keep one hour of slack rather than coupling the boundary to DST conversion.
-_DAILY_BAR_READY_UTC_OFFSET = timedelta(hours=6)
+# Alpaca publishes a session's daily bar only after the regular market opens:
+# 13:30 UTC during daylight time and 14:30 UTC during standard time. Cache
+# repair must not classify today's bar as missing before then. Keep 30 minutes
+# of slack rather than coupling this US-equities boundary to DST conversion.
+_DAILY_BAR_READY_UTC_OFFSET = timedelta(hours=15)
 
 # Timeframe string → alpaca-py TimeFrame + pandas offset for gap math.
 _TIMEFRAME_MAP: dict[str, tuple[TimeFrame, pd.Timedelta]] = {
@@ -847,9 +847,10 @@ def _session_gap_ranges(
         return []
     from data import market_calendar
 
-    # A daily bar is timestamped at the US-Eastern day boundary (04:00/05:00
-    # UTC). A request ending before the conservative readiness cutoff cannot
-    # contain that day's bar, so it is not a repair candidate or gap strike.
+    # Alpaca publishes a daily bar after the US-equities market opens
+    # (13:30/14:30 UTC). A request ending before the conservative readiness
+    # cutoff cannot contain that day's bar, so it is not a repair candidate or
+    # gap strike.
     last_session = end.date()
     session_start = datetime.combine(
         last_session, datetime.min.time(), tzinfo=timezone.utc
