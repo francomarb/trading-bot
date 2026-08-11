@@ -2455,10 +2455,16 @@ class AlpacaBroker:
             effective_limit = (
                 worker.effective_limit_price if worker is not None else limit_price
             )
+            # None when the order that filled had no limit (market
+            # fallback). Preserved as None so log_spread_fill records
+            # `unavailable` instead of inventing a benchmark.
+            benchmark = (
+                None if effective_limit is None else round(effective_limit, 2)
+            )
             with self._pending_spread_lock:
                 self._pending_spread_fills.append((
                     position_id, strategy_name, closing, status,
-                    filled_qty, avg_price, order_id, round(effective_limit, 2),
+                    filled_qty, avg_price, order_id, benchmark,
                 ))
 
         # §10.7 fix-up — per-submit substrate attach. Fires from the

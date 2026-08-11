@@ -1109,6 +1109,43 @@ class TestSpreadLogging:
         assert by_symbol[self._SHORT]["side"] == "buy"   # bought back to close
         assert by_symbol[self._LONG]["side"] == "sell"   # long leg sold
 
+    def test_a_market_fallback_close_records_no_execution_quality_reading(
+        self, tmp_csv
+    ):
+        """Review follow-up (PR #103): a market-fallback close fill has no
+        submitted limit, so it must not be filed under `combo_limit`.
+
+        `combo_limit` is defined as "spread fill vs the combo limit we
+        submitted" and lives in EXECUTION_QUALITY_KINDS, which feeds the
+        calibration set. Carrying the last walk rung forward would put a
+        market fill's slippage into that family against a price nobody
+        submitted.
+        """
+        tl = TradeLogger(path=tmp_csv)
+        tl.log_spread_fill(
+            position_id="uuid-mkt", strategy="credit_spread",
+            short_occ=self._SHORT, long_occ=self._LONG,
+            qty=1, net_price=6.10, order_id="combo-mkt", opening=False,
+            submitted_limit_price=None,
+        )
+        short = next(r for r in tl.read_all() if r["symbol"] == self._SHORT)
+        assert short["slippage_benchmark_kind"] == "unavailable"
+        assert short["slippage_measurement_quality"] == "unavailable"
+        assert short["slippage_benchmark_price"] in (None, "")
+
+    def test_a_limit_close_still_records_combo_limit(self, tmp_csv):
+        """The contrast case — without this, the test above would pass on a
+        logger that had simply stopped measuring spreads entirely."""
+        tl = TradeLogger(path=tmp_csv)
+        tl.log_spread_fill(
+            position_id="uuid-lim", strategy="credit_spread",
+            short_occ=self._SHORT, long_occ=self._LONG,
+            qty=1, net_price=6.10, order_id="combo-lim", opening=False,
+            submitted_limit_price=6.00,
+        )
+        short = next(r for r in tl.read_all() if r["symbol"] == self._SHORT)
+        assert short["slippage_benchmark_kind"] == "combo_limit"
+
     def test_open_writes_status_filled(self, tmp_csv):
         """Spread opens are atomic — always written as status='filled'.
 

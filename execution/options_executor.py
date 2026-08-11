@@ -529,12 +529,14 @@ class SpreadExecutionWorker(_BaseExecutionWorker):
         self.legs = legs
         self.qty = qty
         self.limit_price = limit_price
-        # The net limit of the order most recently accepted by the broker.
-        # Starts at the plan limit and is updated on every walk submit, so
-        # a walked fill is benchmarked against the rung that actually
-        # filled rather than the price of the first rung. Read by the
-        # broker's terminal on_fill; see dispatch_spread_order.
-        self.effective_limit_price = limit_price
+        # The net limit of the order most recently accepted by the broker,
+        # or None when the resting order has no limit at all (the market
+        # fallback step of a walk-and-market close). Starts at the plan
+        # limit and is updated on every walk submit, so a walked fill is
+        # benchmarked against the order that actually filled rather than
+        # the first rung. Read by the broker's terminal on_fill; see
+        # dispatch_spread_order.
+        self.effective_limit_price: float | None = limit_price
         self.strategy_name = strategy_name
         self._entry_allowed = entry_allowed
         # Walk-and-market mode is opt-in: setting both turns it on.
@@ -804,11 +806,23 @@ class SpreadExecutionWorker(_BaseExecutionWorker):
                 f"order={order.id}"
             )
 
-        # This rung is now the live order, so it becomes the benchmark a
-        # fill is measured against. Market steps keep the previous limit:
-        # there is no limit price to record for them.
-        if not step.is_market:
-            self.effective_limit_price = step.limit_price
+        # This step is now the live order, so it becomes the benchmark a
+        # fill is measured against.
+        #
+        # A market step has no limit, so it clears the benchmark rather
+        # than inheriting the previous rung's. `combo_limit` is defined in
+        # reporting/logger.py as "spread fill vs the combo limit we
+        # submitted" — for a market order we submitted none, so carrying
+        # the last limit forward would file a market fill under an
+        # execution-quality family it does not belong to, and
+        # EXECUTION_QUALITY_KINDS feeds the calibration set. None flows
+        # through to log_spread_fill's existing `unavailable` branch,
+        # which is the honest label for "no benchmark was observed".
+        #
+        # The richer answer — an `arrival_midpoint` reading against the
+        # NBBO captured at market submit — needs quote capture this path
+        # does not do today. That is a real follow-up, not this fix.
+        self.effective_limit_price = None if step.is_market else step.limit_price
 
         # §10.7 fix-up — eager attach the broker order_id to the
         # substrate row. At any moment during walk-and-market, exactly

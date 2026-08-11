@@ -2611,6 +2611,38 @@ class TestDispatchSpreadOrder:
             f"instead of the -1.95 rung that actually filled"
         )
 
+    def test_a_market_fallback_fill_carries_no_benchmark(self):
+        """Review follow-up (PR #103). When the resting order had no limit,
+        the broker must pass None through rather than substituting the
+        plan limit — log_spread_fill's `unavailable` branch depends on it,
+        and a substituted value would file a market fill under
+        `combo_limit`, an EXECUTION_QUALITY family it does not belong to.
+        """
+        api = MagicMock()
+        broker = AlpacaBroker(client=api, max_attempts=1, base_delay=0.0, dry_run=False)
+        captured = {}
+
+        def _capture_worker(*, on_fill, limit_price, **kwargs):
+            captured["on_fill"] = on_fill
+            worker = MagicMock()
+            worker.effective_limit_price = limit_price
+            captured["worker"] = worker
+            return worker
+
+        with patch("execution.broker.SpreadExecutionWorker", side_effect=_capture_worker):
+            broker.dispatch_spread_order(
+                legs=_open_spread_legs(), qty=1, limit_price=4.60,
+                strategy_name="credit_spread", position_id="pos-mkt",
+                closing=True,
+            )
+        # The walk escalated to its market step, which clears the benchmark.
+        captured["worker"].effective_limit_price = None
+        captured["on_fill"]("filled", 1.0, 6.10, "alpaca-combo-mkt")
+
+        assert broker.drain_spread_fills()[0][-1] is None, (
+            "broker substituted a limit for a fill that had none"
+        )
+
     def test_an_unwalked_fill_still_uses_the_plan_limit(self):
         """The single-shot path is unchanged: its only submit IS the plan
         limit, so the benchmark must not move."""

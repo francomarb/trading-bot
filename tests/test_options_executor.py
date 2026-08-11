@@ -1133,3 +1133,48 @@ class TestSpreadExecutionWorkerEntryWalk:
         assert len(submitted) == 2
         assert w.effective_limit_price == pytest.approx(submitted[1])
         assert w.effective_limit_price != pytest.approx(submitted[0])
+
+    def test_a_market_fallback_step_clears_the_benchmark(self):
+        """Review follow-up (PR #103): market steps have no limit, so the
+        worker must not leave the previous rung's limit standing as the
+        benchmark a market fill gets measured against."""
+        from execution.mleg_close import MlegCloseScheduler, MlegQuote
+        api = self._api()
+        api.get_order_by_id.side_effect = [
+            _mleg_submitted("combo-1", status="accepted"),
+            _mleg_filled("combo-2"),
+            _mleg_filled("combo-2"),
+        ]
+        sched = MlegCloseScheduler(
+            [("mid", 30), ("market", 0)], reason="stop_loss", position_id="p1",
+        )
+        w = SpreadExecutionWorker(
+            legs=_open_legs(), qty=1, limit_price=4.60,
+            strategy_name="credit_spread", api=api,
+            stream_manager=self._stream([False, True]),
+            close_scheduler=sched,
+            quote_provider=lambda: MlegQuote(mid=4.60, bid=4.12, ask=5.08),
+        )
+        w.run()
+        assert w.effective_limit_price is None, (
+            f"market fill would be benchmarked against "
+            f"{w.effective_limit_price}, a limit nobody submitted"
+        )
+
+    def test_the_limit_rung_before_a_market_step_did_set_a_benchmark(self):
+        """Guards the test above from passing vacuously — the walk really
+        did submit a limit first, and it really was recorded."""
+        from execution.mleg_close import MlegCloseScheduler, MlegQuote
+        api = self._api()
+        sched = MlegCloseScheduler(
+            [("mid", 30)], reason="stop_loss", position_id="p1",
+        )
+        w = SpreadExecutionWorker(
+            legs=_open_legs(), qty=1, limit_price=4.60,
+            strategy_name="credit_spread", api=api,
+            stream_manager=self._stream([False]),
+            close_scheduler=sched,
+            quote_provider=lambda: MlegQuote(mid=4.60, bid=4.12, ask=5.08),
+        )
+        w.run()
+        assert w.effective_limit_price == pytest.approx(4.60)
