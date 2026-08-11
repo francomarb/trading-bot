@@ -54,6 +54,7 @@ if TYPE_CHECKING:
     from engine.lifecycle import PositionLifecycleStore
     from engine.lifecycle_orders import PositionLifecycleOrdersStore
     from execution.mleg_close import MlegCloseScheduler, MlegQuote
+    from execution.mleg_entry import MlegEntryWalk
 
 from execution.options_executor import (
     OptionsExecutionWorker,
@@ -2352,6 +2353,9 @@ class AlpacaBroker:
         close_scheduler: "MlegCloseScheduler | None" = None,
         quote_provider: "Callable[[], MlegQuote | None] | None" = None,
         on_walk_step: "Callable[..., None] | None" = None,
+        # Bounded entry walk (opening side). Mutually exclusive with
+        # close_scheduler; needs quote_provider. See execution/mleg_entry.py.
+        entry_walk: "MlegEntryWalk | None" = None,
         # §10.7 fix-up — engine-side substrate row cloid for spread
         # closes. When supplied, the worker emits a per-submit
         # attach event (cloid, broker_order_id) which gets queued to
@@ -2466,6 +2470,7 @@ class AlpacaBroker:
             close_scheduler=close_scheduler,
             quote_provider=quote_provider,
             on_walk_step=on_walk_step,
+            entry_walk=entry_walk,
             on_submitted=(
                 _on_submitted if close_substrate_cloid is not None else None
             ),
