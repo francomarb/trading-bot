@@ -1128,6 +1128,85 @@ class TestSessionGapDetection:
             cached, requested_start, requested_end, set(), "AAPL"
         ) == []
 
+    def test_midnight_endpoint_is_not_warned_or_retired_as_absent(self, monkeypatch):
+        """A real Friday hole must not pull the exclusive Monday endpoint in.
+
+        Bridging weekends turns Friday and Monday into one range.  The Monday
+        endpoint is outside this request, so it must neither produce a noisy
+        repair warning nor accumulate an absent-session strike.
+        """
+        from data import market_calendar
+
+        friday = date(2026, 8, 7)
+        monday = date(2026, 8, 10)
+        requested_start = datetime(2026, 8, 3, tzinfo=timezone.utc)
+        requested_end = datetime(2026, 8, 10, tzinfo=timezone.utc)
+        monkeypatch.setattr(
+            market_calendar,
+            "trading_sessions",
+            lambda start, end: {d for d in {friday, monday} if start <= d <= end},
+        )
+        warning = MagicMock()
+        monkeypatch.setattr(fetcher.logger, "warning", warning)
+        cached = self._bars(["2026-08-03", "2026-08-04", "2026-08-05", "2026-08-06"])
+
+        ranges = fetcher._session_gap_ranges(
+            cached, requested_start, requested_end, set(), "AAPL"
+        )
+
+        assert ranges == [
+            (
+                datetime(2026, 8, 7, tzinfo=timezone.utc),
+                datetime(2026, 8, 7, 23, 59, 59, 999999, tzinfo=timezone.utc),
+            )
+        ]
+        warning.assert_called_once()
+        assert "2026-08-10" not in warning.call_args.args[0]
+
+        absent, seen_once = fetcher._update_gap_strikes(
+            cached, ranges, set(), set(), "AAPL"
+        )
+        absent, seen_once = fetcher._update_gap_strikes(
+            cached, ranges, absent, seen_once, "AAPL"
+        )
+        assert friday in absent
+        assert monday not in absent
+        assert monday not in seen_once
+
+    def test_gap_repair_keeps_the_full_leading_session(self, monkeypatch):
+        """A rolling start must not exclude that day's early daily bar."""
+        from data import market_calendar
+
+        requested_start = datetime(2026, 8, 10, 14, 32, tzinfo=timezone.utc)
+        requested_end = datetime(2026, 8, 10, 16, 35, tzinfo=timezone.utc)
+        monkeypatch.setattr(
+            market_calendar, "trading_sessions", lambda start, end: {date(2026, 8, 10)}
+        )
+
+        ranges = fetcher._session_gap_ranges(
+            self._bars(["2026-08-07"]), requested_start, requested_end, set(), "AAPL"
+        )
+
+        assert ranges == [
+            (
+                datetime(2026, 8, 10, tzinfo=timezone.utc),
+                requested_end,
+            )
+        ]
+
+    def test_all_generated_ranges_have_a_hard_end_boundary(self):
+        end = datetime(2026, 8, 10, tzinfo=timezone.utc)
+        assert fetcher._bound_ranges_to_end(
+            [
+                (
+                    datetime(2026, 8, 9, tzinfo=timezone.utc),
+                    datetime(2026, 8, 11, tzinfo=timezone.utc),
+                ),
+                (end, datetime(2026, 8, 11, tzinfo=timezone.utc)),
+            ],
+            end,
+        ) == [(datetime(2026, 8, 9, tzinfo=timezone.utc), end)]
+
     def test_gap_detection_never_consults_a_cached_symbol(self):
         """11.52: a sweep using SPY as the session reference reported
         'clean' while 92 of 106 symbols were holed, because SPY is cached

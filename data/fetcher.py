@@ -603,10 +603,18 @@ def fetch_symbol(
         _read_gap_state(symbol, timeframe, adjustment, feed)
         if use_cache else (set(), set())
     )
+    gap_ranges: list[tuple[datetime, datetime]] = []
     if use_cache and timeframe == "1Day":
-        missing_ranges = missing_ranges + _session_gap_ranges(
+        gap_ranges = _session_gap_ranges(
             cached, start, end, absent_sessions, symbol
         )
+        missing_ranges = missing_ranges + gap_ranges
+
+    # Every range producer must honor the public request end.  The session
+    # calendar deals in whole days, while delayed SIP requests may end partway
+    # through a day; this final boundary is the invariant before any API call.
+    missing_ranges = _bound_ranges_to_end(missing_ranges, end)
+    gap_ranges = _bound_ranges_to_end(gap_ranges, end)
 
     for rng_start, rng_end in missing_ranges:
         logger.info(
@@ -636,7 +644,7 @@ def fetch_symbol(
         new_cov_end = _coverage_end_from_bars(merged, new_cov_end)
         if use_cache:
             absent_sessions, gap_seen_once = _update_gap_strikes(
-                merged, missing_ranges, absent_sessions, gap_seen_once, symbol
+                merged, gap_ranges, absent_sessions, gap_seen_once, symbol
             )
             _write_cache(
                 merged, symbol, timeframe, adjustment, new_cov_start, new_cov_end,
@@ -657,7 +665,7 @@ def fetch_symbol(
             cov_start != new_cov_start or cov_end != new_cov_end
         ):
             absent_sessions, gap_seen_once = _update_gap_strikes(
-                merged, missing_ranges, absent_sessions, gap_seen_once, symbol
+                merged, gap_ranges, absent_sessions, gap_seen_once, symbol
             )
             _write_cache(
                 merged, symbol, timeframe, adjustment, new_cov_start, new_cov_end,
@@ -833,19 +841,21 @@ def _session_gap_ranges(
         return []
     from data import market_calendar
 
+    # A midnight end is an exclusive daily-bar boundary.  Do not turn that
+    # not-yet-requested calendar day into a repair candidate or a gap strike.
+    last_session = end.date()
+    if end.timetz().replace(tzinfo=None) == datetime.min.time():
+        last_session -= timedelta(days=1)
+    if last_session < start.date():
+        return []
+
     have = {pd.Timestamp(ts).tz_convert("UTC").date() for ts in cached.index}
     missing = market_calendar.missing_sessions(
-        start.date(), end.date(), have, ignore=absent
+        start.date(), last_session, have, ignore=absent
     )
     if not missing:
         return []
 
-    logger.warning(
-        f"{symbol}: {len(missing)} session(s) missing from cache inside a "
-        f"covered range — re-requesting "
-        f"({', '.join(str(d) for d in sorted(missing)[:5])}"
-        f"{'…' if len(missing) > 5 else ''})"
-    )
     ranges: list[tuple[datetime, datetime]] = []
     run_start = run_end = None
     for d in sorted(missing):
@@ -859,15 +869,12 @@ def _session_gap_ranges(
     if run_start is not None:
         ranges.append((run_start, run_end))
 
-    # A calendar day is wider than a caller's request window. In particular,
-    # delayed-SIP callers may have already clamped ``end`` below the end of
-    # today. Keep repair requests inside that boundary rather than widening
-    # them back into unavailable recent data.
+    # Preserve the full start day: a daily bar can be timestamped before a
+    # rolling request's wall-clock start.  Only the end is a hard API limit.
     bounded: list[tuple[datetime, datetime]] = []
     for first_day, last_day in ranges:
-        range_start = max(
-            datetime.combine(first_day, datetime.min.time(), tzinfo=timezone.utc),
-            start,
+        range_start = datetime.combine(
+            first_day, datetime.min.time(), tzinfo=timezone.utc
         )
         range_end = min(
             datetime.combine(last_day, datetime.max.time(), tzinfo=timezone.utc),
@@ -875,7 +882,26 @@ def _session_gap_ranges(
         )
         if range_start < range_end:
             bounded.append((range_start, range_end))
+
+    if bounded:
+        logger.warning(
+            f"{symbol}: {len(missing)} session(s) missing from cache inside a "
+            f"covered range — re-requesting "
+            f"({', '.join(str(d) for d in sorted(missing)[:5])}"
+            f"{'…' if len(missing) > 5 else ''})"
+        )
     return bounded
+
+
+def _bound_ranges_to_end(
+    ranges: list[tuple[datetime, datetime]], end: datetime
+) -> list[tuple[datetime, datetime]]:
+    """Keep generated fetch ranges within the caller's end boundary."""
+    return [
+        (range_start, bounded_end)
+        for range_start, range_end in ranges
+        if range_start < (bounded_end := min(range_end, end))
+    ]
 
 
 def _missing_ranges(
