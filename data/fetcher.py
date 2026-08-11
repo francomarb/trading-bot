@@ -48,6 +48,12 @@ CACHE_DIR.mkdir(parents=True, exist_ok=True)
 
 OHLCV_COLS = ["open", "high", "low", "close", "volume"]
 
+# Alpaca daily bars are timestamped at midnight US Eastern: 04:00 UTC during
+# daylight time and 05:00 UTC during standard time.  Cache repair must not
+# classify today's bar as missing before a request window can contain it.
+# Keep one hour of slack rather than coupling the boundary to DST conversion.
+_DAILY_BAR_READY_UTC_OFFSET = timedelta(hours=6)
+
 # Timeframe string → alpaca-py TimeFrame + pandas offset for gap math.
 _TIMEFRAME_MAP: dict[str, tuple[TimeFrame, pd.Timedelta]] = {
     "1Day": (TimeFrame.Day, pd.Timedelta(days=1)),
@@ -841,10 +847,14 @@ def _session_gap_ranges(
         return []
     from data import market_calendar
 
-    # A midnight end is an exclusive daily-bar boundary.  Do not turn that
-    # not-yet-requested calendar day into a repair candidate or a gap strike.
+    # A daily bar is timestamped at the US-Eastern day boundary (04:00/05:00
+    # UTC). A request ending before the conservative readiness cutoff cannot
+    # contain that day's bar, so it is not a repair candidate or gap strike.
     last_session = end.date()
-    if end.timetz().replace(tzinfo=None) == datetime.min.time():
+    session_start = datetime.combine(
+        last_session, datetime.min.time(), tzinfo=timezone.utc
+    )
+    if end < session_start + _DAILY_BAR_READY_UTC_OFFSET:
         last_session -= timedelta(days=1)
     if last_session < start.date():
         return []
@@ -897,11 +907,12 @@ def _bound_ranges_to_end(
     ranges: list[tuple[datetime, datetime]], end: datetime
 ) -> list[tuple[datetime, datetime]]:
     """Keep generated fetch ranges within the caller's end boundary."""
-    return [
-        (range_start, bounded_end)
-        for range_start, range_end in ranges
-        if range_start < (bounded_end := min(range_end, end))
-    ]
+    bounded: list[tuple[datetime, datetime]] = []
+    for range_start, range_end in ranges:
+        bounded_end = min(range_end, end)
+        if range_start < bounded_end:
+            bounded.append((range_start, bounded_end))
+    return bounded
 
 
 def _missing_ranges(

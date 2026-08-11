@@ -1005,23 +1005,24 @@ class TestSessionGapDetection:
             return pd.DataFrame()
         return pd.DataFrame(
             {"open": 1.0, "high": 2.0, "low": 0.5, "close": 1.5, "volume": 100},
-            index=pd.DatetimeIndex([pd.Timestamp(d, tz="UTC") for d in days]),
+            index=pd.DatetimeIndex(
+                [pd.Timestamp(d, tz="UTC") + pd.Timedelta(hours=4) for d in days]
+            ),
         )
 
     def _api(self, available, log=None):
         def fake(symbol, timeframe, s, e, adjustment, feed):
             if log is not None:
-                log.append((s.date(), e.date()))
-            inside = [d for d in available
-                      if s.date() <= date.fromisoformat(d) <= e.date()]
-            return self._bars(inside) if inside else pd.DataFrame()
+                log.append((s, e))
+            bars = self._bars(available)
+            return bars.loc[(bars.index >= s) & (bars.index <= e)]
         return fake
 
     def _cycle(self, monkeypatch, available, log=None, end_day=21):
         monkeypatch.setattr(fetcher, "_fetch_bars_api", self._api(available, log))
         fetcher.fetch_symbol(
             "AAPL", start=datetime(2026, 7, 1, tzinfo=timezone.utc),
-            end=datetime(2026, 7, end_day, tzinfo=timezone.utc),
+            end=datetime(2026, 7, end_day, 23, 59, tzinfo=timezone.utc),
             timeframe="1Day", feed="iex",
         )
 
@@ -1100,33 +1101,104 @@ class TestSessionGapDetection:
         self._cycle(monkeypatch, self.BEFORE, end_day=10)
         df, _ = fetcher.fetch_symbol(
             "AAPL", start=datetime(2026, 7, 1, tzinfo=timezone.utc),
-            end=datetime(2026, 7, 10, tzinfo=timezone.utc),
+            end=datetime(2026, 7, 10, 23, 59, tzinfo=timezone.utc),
             timeframe="1Day", feed="iex",
         )
         assert len(df) == len(self.BEFORE)
 
-    def test_gap_repair_respects_the_requested_end_boundary(self, monkeypatch):
-        """A gap at an exclusive midnight endpoint must not widen the fetch.
+    def test_overnight_request_never_retires_unavailable_current_session(
+        self, tmp_cache_dir, monkeypatch
+    ):
+        """An overnight endpoint cannot contain the current session's bar.
 
-        Health benchmarks use delayed SIP and request completed windows ending
-        at midnight. The calendar may list that endpoint as a trading session,
-        but a repair request must stay within the already-clamped window rather
-        than expanding through the end of that calendar day.
+        Daily fixtures use Alpaca's 04:00 UTC timestamp and the fake API uses
+        timestamp, not date, comparisons. Before the readiness boundary this
+        scenario struck and then retired Aug 10 after two fetch cycles.
         """
         from data import market_calendar
 
         requested_start = datetime(2026, 8, 3, tzinfo=timezone.utc)
-        requested_end = datetime(2026, 8, 10, tzinfo=timezone.utc)
+        requested_end = datetime(2026, 8, 10, 2, 55, tzinfo=timezone.utc)
         monkeypatch.setattr(
             market_calendar,
             "trading_sessions",
-            lambda start, end: {date(2026, 8, 10)},
+            lambda start, end: {
+                d for d in {date(2026, 8, 10)} if start <= d <= end
+            },
         )
         cached = self._bars(["2026-08-07"])
+        _write_cache(
+            cached,
+            "AAPL",
+            "1Day",
+            "all",
+            requested_start,
+            requested_end,
+            "iex",
+        )
+        returned = self._bars(["2026-08-09"])
 
-        assert fetcher._session_gap_ranges(
-            cached, requested_start, requested_end, set(), "AAPL"
-        ) == []
+        def fake(symbol, timeframe, start, end, adjustment, feed):
+            return returned.loc[(returned.index >= start) & (returned.index <= end)]
+
+        monkeypatch.setattr(fetcher, "_fetch_bars_api", fake)
+        for _ in range(2):
+            fetcher.fetch_symbol(
+                "AAPL",
+                start=requested_start,
+                end=requested_end,
+                timeframe="1Day",
+                feed="iex",
+            )
+
+        meta = json.loads(
+            (tmp_cache_dir / "iex" / "AAPL_1Day_all.meta.json").read_text()
+        )
+        assert "2026-08-10" not in meta.get("gap_seen_once", [])
+        assert "2026-08-10" not in meta.get("absent_sessions", [])
+
+    def test_fetch_symbol_keeps_every_generated_range_within_request_end(
+        self, tmp_cache_dir, monkeypatch
+    ):
+        """The final fetch-loop boundary protects current and future producers."""
+        request_end = datetime(2026, 8, 10, 2, 55, tzinfo=timezone.utc)
+        cached = self._bars(["2026-08-07"])
+        _write_cache(
+            cached,
+            "AAPL",
+            "1Day",
+            "all",
+            datetime(2026, 8, 3, tzinfo=timezone.utc),
+            request_end,
+            "iex",
+        )
+        monkeypatch.setattr(
+            fetcher,
+            "_session_gap_ranges",
+            lambda *args: [
+                (
+                    datetime(2026, 8, 10, tzinfo=timezone.utc),
+                    datetime(2026, 8, 10, 23, 59, tzinfo=timezone.utc),
+                )
+            ],
+        )
+        calls: list[tuple[datetime, datetime]] = []
+
+        def capture(symbol, timeframe, start, end, adjustment, feed):
+            calls.append((start, end))
+            return pd.DataFrame()
+
+        monkeypatch.setattr(fetcher, "_fetch_bars_api", capture)
+        fetcher.fetch_symbol(
+            "AAPL",
+            start=datetime(2026, 8, 3, tzinfo=timezone.utc),
+            end=request_end,
+            timeframe="1Day",
+            feed="iex",
+        )
+
+        assert calls
+        assert all(end <= request_end for _, end in calls)
 
     def test_midnight_endpoint_is_not_warned_or_retired_as_absent(self, monkeypatch):
         """A real Friday hole must not pull the exclusive Monday endpoint in.
@@ -1193,19 +1265,6 @@ class TestSessionGapDetection:
                 requested_end,
             )
         ]
-
-    def test_all_generated_ranges_have_a_hard_end_boundary(self):
-        end = datetime(2026, 8, 10, tzinfo=timezone.utc)
-        assert fetcher._bound_ranges_to_end(
-            [
-                (
-                    datetime(2026, 8, 9, tzinfo=timezone.utc),
-                    datetime(2026, 8, 11, tzinfo=timezone.utc),
-                ),
-                (end, datetime(2026, 8, 11, tzinfo=timezone.utc)),
-            ],
-            end,
-        ) == [(datetime(2026, 8, 9, tzinfo=timezone.utc), end)]
 
     def test_gap_detection_never_consults_a_cached_symbol(self):
         """11.52: a sweep using SPY as the session reference reported
