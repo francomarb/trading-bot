@@ -54,6 +54,7 @@ if TYPE_CHECKING:
     from engine.lifecycle import PositionLifecycleStore
     from engine.lifecycle_orders import PositionLifecycleOrdersStore
     from execution.mleg_close import MlegCloseScheduler, MlegQuote
+    from execution.mleg_entry import MlegEntryWalk
 
 from execution.options_executor import (
     OptionsExecutionWorker,
@@ -2352,6 +2353,9 @@ class AlpacaBroker:
         close_scheduler: "MlegCloseScheduler | None" = None,
         quote_provider: "Callable[[], MlegQuote | None] | None" = None,
         on_walk_step: "Callable[..., None] | None" = None,
+        # Bounded entry walk (opening side). Mutually exclusive with
+        # close_scheduler; needs quote_provider. See execution/mleg_entry.py.
+        entry_walk: "MlegEntryWalk | None" = None,
         # §10.7 fix-up — engine-side substrate row cloid for spread
         # closes. When supplied, the worker emits a per-submit
         # attach event (cloid, broker_order_id) which gets queued to
@@ -2432,16 +2436,35 @@ class AlpacaBroker:
                 message=f"dry run — synthetic spread {action} fill queued",
             )
 
+        # Late-bound so the terminal fill can be benchmarked against the
+        # limit that was ACTUALLY resting when it filled. A walk (entry or
+        # close) submits several prices; benchmarking a rung-3 fill against
+        # the rung-1 limit puts a fictitious number into `combo_limit`
+        # slippage and `entry_reference_price`. Populated immediately
+        # after the worker is constructed and before `.start()`, so the
+        # worker thread cannot observe it empty.
+        _worker_cell: "dict[str, SpreadExecutionWorker]" = {}
+
         def _on_fill(
             status: str,
             filled_qty: float,
             avg_price: "float | None",
             order_id: str,
         ) -> None:
+            worker = _worker_cell.get("worker")
+            effective_limit = (
+                worker.effective_limit_price if worker is not None else limit_price
+            )
+            # None when the order that filled had no limit (market
+            # fallback). Preserved as None so log_spread_fill records
+            # `unavailable` instead of inventing a benchmark.
+            benchmark = (
+                None if effective_limit is None else round(effective_limit, 2)
+            )
             with self._pending_spread_lock:
                 self._pending_spread_fills.append((
                     position_id, strategy_name, closing, status,
-                    filled_qty, avg_price, order_id, round(limit_price, 2),
+                    filled_qty, avg_price, order_id, benchmark,
                 ))
 
         # §10.7 fix-up — per-submit substrate attach. Fires from the
@@ -2466,12 +2489,16 @@ class AlpacaBroker:
             close_scheduler=close_scheduler,
             quote_provider=quote_provider,
             on_walk_step=on_walk_step,
+            entry_walk=entry_walk,
             on_submitted=(
                 _on_submitted if close_substrate_cloid is not None else None
             ),
             substrate_cloid=close_substrate_cloid,
             substrate_db_path=close_substrate_db_path,
         )
+        # Must precede start(): _on_fill only ever runs on the worker
+        # thread, which does not exist until start() is called.
+        _worker_cell["worker"] = worker
         worker.start()
         return OrderResult(
             status=OrderStatus.ACCEPTED,

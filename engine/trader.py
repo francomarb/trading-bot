@@ -9335,6 +9335,76 @@ class TradingEngine:
                 f"will retry."
             )
 
+    def _build_entry_walk(
+        self,
+        *,
+        strategy: BaseStrategy,
+        symbol: str,
+        plan,
+        position_id: str,
+        notional_cap: float | None,
+    ):
+        """Build the bounded entry walk for an MLEG entry, or (None, None).
+
+        Returns ``(entry_walk, quote_provider)``. Both are None whenever
+        the walk cannot be built — the flag is off, the strategy has no
+        quote provider, or the bounds are unusable. In that case
+        ``dispatch_spread_order`` falls back to the single-shot submit at
+        ``plan.limit_price``, which is exactly today's behaviour.
+
+        **Fails closed to the old path, never to an unbounded one.** Any
+        exception here means we could not establish the limits, and an
+        entry we cannot bound is one we simply do not walk.
+        """
+        if not getattr(settings, "MLEG_ENTRY_WALK_ENABLED", False):
+            return None, None
+        if not hasattr(strategy, "build_entry_quote_provider"):
+            return None, None
+        try:
+            from execution.mleg_entry import (
+                EntryWalkBounds,
+                MlegEntryWalk,
+                resolve_mleg_entry_profile,
+            )
+
+            floor_pct = getattr(
+                getattr(strategy, "config", None), "min_credit_pct_of_width", None
+            )
+            if floor_pct is None:
+                logger.warning(
+                    f"[{strategy.name}] {symbol}: no min_credit_pct_of_width — "
+                    f"entry walk needs a credit floor, using single-shot submit"
+                )
+                return None, None
+
+            provider = strategy.build_entry_quote_provider(plan)
+            if provider is None:
+                return None, None
+
+            bounds = EntryWalkBounds(
+                width=float(plan.width),
+                qty=int(plan.qty),
+                min_credit_pct_of_width=float(floor_pct),
+                # The sleeve's approved per-position cap. Conceding credit
+                # raises max loss, so this is what stops the walk from
+                # quietly enlarging the position the sleeve signed off on.
+                max_loss_budget=(
+                    float(notional_cap) if notional_cap is not None else None
+                ),
+            )
+            walk = MlegEntryWalk(
+                resolve_mleg_entry_profile(strategy_name=strategy.name),
+                bounds=bounds,
+                position_id=position_id,
+            )
+        except Exception as e:
+            logger.warning(
+                f"[{strategy.name}] {symbol}: could not build entry walk "
+                f"({e}) — falling back to single-shot submit"
+            )
+            return None, None
+        return walk, provider
+
     def _enter_multi_leg(
         self,
         *,
@@ -9433,6 +9503,13 @@ class TradingEngine:
             return
 
         position_id = new_spread_id()
+        entry_walk, entry_quote_provider = self._build_entry_walk(
+            strategy=strategy,
+            symbol=symbol,
+            plan=plan,
+            position_id=position_id,
+            notional_cap=notional_cap,
+        )
         try:
             result = self.broker.dispatch_spread_order(
                 legs=plan.legs,
@@ -9440,6 +9517,8 @@ class TradingEngine:
                 limit_price=plan.limit_price,
                 strategy_name=strategy.name,
                 position_id=position_id,
+                entry_walk=entry_walk,
+                quote_provider=entry_quote_provider,
             )
         except Exception as e:
             logger.error(f"[{strategy.name}] {symbol}: dispatch_spread_order raised: {e}")

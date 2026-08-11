@@ -308,6 +308,90 @@ for _strat, _overrides in MLEG_CLOSE_PROFILE_OVERRIDES_BY_STRATEGY.items():
             context=f"MLEG_CLOSE_PROFILE_OVERRIDES_BY_STRATEGY['{_strat}']",
         )
 
+# ── MLEG entry walk (bounded) ───────────────────────────────────────────────
+#
+# The entry counterpart to MLEG_CLOSE_PROFILES. Same (expr, duration) shape,
+# same expression grammar, driven by the same executor pattern — but walking
+# DOWN from the mid toward the bid, because an entry receives credit where a
+# close pays a debit.
+#
+# Why it exists: measured across every entry attempt 2026-05-01 → 2026-08-11,
+# the single-shot mid-only entry filled 13 times in 49 attempts (27%). The
+# offered credit did not predict the fill (27.8% under 14% of width vs 25.8%
+# at 14%+), so the problem is not which spreads we pick — it is that we make
+# exactly one offer and never concede.
+#
+# Three hard differences from the close profiles, all enforced in code, not
+# convention (see execution/mleg_entry.py):
+#   * NO "market" step is legal here. An unfilled entry costs nothing; an
+#     unfilled close leaves risk on. Buying a fill at any price is exactly
+#     the failure mode this design excludes.
+#   * The walk never concedes below `min_credit_pct_of_width` — the rule that
+#     says the spread is worth owning at all.
+#   * The walk never concedes past the sleeve's approved max-loss budget.
+#     Conceding credit RAISES max loss ((width − credit) × 100 × qty), so the
+#     budget checked at decision time goes stale as the walk moves.
+#
+# Total duration is held at 180s — the same exposure window the single-shot
+# path already used — so this changes the number of prices offered, not how
+# long an entry attempt stays live.
+MLEG_ENTRY_WALK_ENABLED: bool = (
+    os.getenv("MLEG_ENTRY_WALK_ENABLED", "true").lower() == "true"
+)
+
+MLEG_ENTRY_WALK_PROFILE: list[tuple[str, int]] = [
+    ("mid",                   60),
+    ("mid - 0.34*(mid-bid)",  60),
+    ("mid - 0.67*(mid-bid)",  60),
+]
+
+# Per-strategy overrides; empty by default. Same shape as the global profile.
+MLEG_ENTRY_WALK_PROFILE_OVERRIDES_BY_STRATEGY: dict[str, list[tuple[str, int]]] = {}
+
+
+def _validate_mleg_entry_profile(
+    steps: list[tuple[str, int]],
+    *,
+    context: str,
+) -> None:
+    """Validate an entry-walk profile at config-load time.
+
+    Reuses the close validator for shape/expression checks, then applies
+    the two entry-only rules: no market sentinel at any position, and a
+    total duration that does not exceed the entry watch timeout (so the
+    walk cannot quietly extend how long an entry sits live).
+    """
+    _validate_mleg_close_profile("entry", steps, context=context)
+    for i, (expr, duration) in enumerate(steps):
+        if expr == "market":
+            raise ValueError(
+                f"{context}[{i}]: 'market' is not a legal entry step — an "
+                "unfilled entry is a non-event, so the entry walk is "
+                "limit-only by construction"
+            )
+        if duration <= 0:
+            raise ValueError(
+                f"{context}[{i}]: entry steps need a positive duration "
+                f"(a 0s rung offers a price nobody can hit), got {duration}"
+            )
+    total = sum(d for _, d in steps)
+    if total > MLEG_ENTRY_WATCH_TIMEOUT_SECONDS:
+        raise ValueError(
+            f"{context}: total walk duration {total}s exceeds "
+            f"MLEG_ENTRY_WATCH_TIMEOUT_SECONDS={MLEG_ENTRY_WATCH_TIMEOUT_SECONDS:.0f}s "
+            "— the walk must not extend how long an entry stays live"
+        )
+
+
+_validate_mleg_entry_profile(
+    MLEG_ENTRY_WALK_PROFILE, context="MLEG_ENTRY_WALK_PROFILE"
+)
+for _strat, _steps in MLEG_ENTRY_WALK_PROFILE_OVERRIDES_BY_STRATEGY.items():
+    _validate_mleg_entry_profile(
+        _steps,
+        context=f"MLEG_ENTRY_WALK_PROFILE_OVERRIDES_BY_STRATEGY['{_strat}']",
+    )
+
 # Strategy-specific watchlists
 # SMA Crossover — trend-following; static list promoted from:
 #   /Users/franco/trading-bot/scripts/sma_watchlist_scan.py --top 30 --feed sip

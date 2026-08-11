@@ -785,10 +785,28 @@ class CreditSpread(BaseStrategy):
         any future MLEG strategy implements ``build_close_quote_provider``
         with the same signature so the engine wiring stays strategy-agnostic.
         """
+        return self._build_net_quote_provider(spread.short_occ, spread.long_occ)
+
+    def build_entry_quote_provider(
+        self, plan: SpreadExecutionPlan,
+    ) -> "Callable[[], MlegQuote | None]":
+        """Fresh net quotes for the bounded entry walk.
+
+        Same net-price arithmetic as the close provider — deliberately the
+        same function, so the two can never drift. The *interpretation*
+        differs and lives in the walk, not here: an entry receives credit
+        and walks ``mid`` down toward ``bid``, a close pays a debit and
+        walks ``mid`` up toward ``ask``.
+        """
+        return self._build_net_quote_provider(plan.short_occ, plan.long_occ)
+
+    def _build_net_quote_provider(
+        self, short_occ: str, long_occ: str,
+    ) -> "Callable[[], MlegQuote | None]":
+        """Net (bid, mid, ask) of the two-leg spread, or None if unusable."""
         from execution.mleg_close import MlegQuote
 
         quote_lookup = self._quote_lookup
-        short_occ, long_occ = spread.short_occ, spread.long_occ
         name = self.name
         symbol = self.symbol
 

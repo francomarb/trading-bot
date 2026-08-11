@@ -47,6 +47,7 @@ with warnings.catch_warnings():
 from risk.manager import RiskDecision, Side
 from execution.stream import StreamManager
 from execution.mleg_close import MlegCloseScheduler, MlegQuote
+from execution.mleg_entry import MlegEntryWalk
 from config.settings import MLEG_ENTRY_WATCH_TIMEOUT_SECONDS
 
 # Type alias: returns a fresh quote of the spread (net mid/bid/ask) each call.
@@ -507,6 +508,13 @@ class SpreadExecutionWorker(_BaseExecutionWorker):
         # is required. Restart reconciliation can then find the row
         # by order_id even on a crash within milliseconds of submit.
         substrate_db_path: str | None = None,
+        # Bounded entry walk (optional, opt-in per-call). Mutually
+        # exclusive with close_scheduler — a worker either opens or
+        # closes, never both. Like the close walk it needs
+        # ``quote_provider`` for fresh per-step quotes, but unlike the
+        # close walk it can never reach a market order: see
+        # ``execution/mleg_entry.py``.
+        entry_walk: "MlegEntryWalk | None" = None,
     ) -> None:
         # The short leg is the defining symbol for logging/identification.
         short_leg = next(
@@ -521,6 +529,14 @@ class SpreadExecutionWorker(_BaseExecutionWorker):
         self.legs = legs
         self.qty = qty
         self.limit_price = limit_price
+        # The net limit of the order most recently accepted by the broker,
+        # or None when the resting order has no limit at all (the market
+        # fallback step of a walk-and-market close). Starts at the plan
+        # limit and is updated on every walk submit, so a walked fill is
+        # benchmarked against the order that actually filled rather than
+        # the first rung. Read by the broker's terminal on_fill; see
+        # dispatch_spread_order.
+        self.effective_limit_price: float | None = limit_price
         self.strategy_name = strategy_name
         self._entry_allowed = entry_allowed
         # Walk-and-market mode is opt-in: setting both turns it on.
@@ -530,7 +546,19 @@ class SpreadExecutionWorker(_BaseExecutionWorker):
         self._on_submitted = on_submitted
         self._substrate_cloid = substrate_cloid
         self._substrate_db_path = substrate_db_path
-        if (close_scheduler is None) != (quote_provider is None):
+        self._entry_walk = entry_walk
+        if close_scheduler is not None and entry_walk is not None:
+            raise ValueError(
+                "SpreadExecutionWorker: close_scheduler and entry_walk are "
+                "mutually exclusive — a worker either opens or closes"
+            )
+        if entry_walk is not None and quote_provider is None:
+            raise ValueError(
+                "SpreadExecutionWorker: entry_walk needs a quote_provider "
+                "(each rung is priced against fresh quotes, not a mid "
+                "captured at decision time)"
+            )
+        if entry_walk is None and (close_scheduler is None) != (quote_provider is None):
             raise ValueError(
                 "SpreadExecutionWorker: close_scheduler and quote_provider "
                 "must both be set or both be None (walk-and-market needs "
@@ -642,9 +670,17 @@ class SpreadExecutionWorker(_BaseExecutionWorker):
         """True when the worker will drive the walk-and-market scheduler."""
         return self._close_scheduler is not None
 
+    @property
+    def entry_walk_mode(self) -> bool:
+        """True when the worker will drive the bounded entry walk."""
+        return self._entry_walk is not None
+
     def run(self) -> None:
         if self.walk_and_market_mode:
             self._run_walk_and_market()
+            return
+        if self.entry_walk_mode:
+            self._run_entry_walk()
             return
         logger.info(
             f"[{self.name}] Started combo execution: {self.qty}× "
@@ -769,6 +805,24 @@ class SpreadExecutionWorker(_BaseExecutionWorker):
                 f"(expr={step.price_expr!r}, hold={step.duration_seconds}s) "
                 f"order={order.id}"
             )
+
+        # This step is now the live order, so it becomes the benchmark a
+        # fill is measured against.
+        #
+        # A market step has no limit, so it clears the benchmark rather
+        # than inheriting the previous rung's. `combo_limit` is defined in
+        # reporting/logger.py as "spread fill vs the combo limit we
+        # submitted" — for a market order we submitted none, so carrying
+        # the last limit forward would file a market fill under an
+        # execution-quality family it does not belong to, and
+        # EXECUTION_QUALITY_KINDS feeds the calibration set. None flows
+        # through to log_spread_fill's existing `unavailable` branch,
+        # which is the honest label for "no benchmark was observed".
+        #
+        # The richer answer — an `arrival_midpoint` reading against the
+        # NBBO captured at market submit — needs quote capture this path
+        # does not do today. That is a real follow-up, not this fix.
+        self.effective_limit_price = None if step.is_market else step.limit_price
 
         # §10.7 fix-up — eager attach the broker order_id to the
         # substrate row. At any moment during walk-and-market, exactly
@@ -896,4 +950,135 @@ class SpreadExecutionWorker(_BaseExecutionWorker):
             # Restore the outer on_fill and report the terminal outcome.
             self._on_fill = outer_on_fill
             client_order_id = f"spr-{self.strategy_name}-walk-terminal"
+            self._report_fill(terminal_status, client_order_id, terminal_order)
+
+    # ── Bounded entry walk ─────────────────────────────────────────────────
+    #
+    # Same shape as the close walk, three deliberate differences:
+    #   * no market fallback — running out of rungs is a normal outcome and
+    #     the correct response is to give up on this cycle;
+    #   * a quote outage ABORTS rather than skipping ahead, because with no
+    #     quote there is no way to know a price still clears the bounds;
+    #   * every rung logs the full bid/mid/ask it was priced against, which
+    #     is the measurement nobody had when this was a single-shot submit.
+
+    def _run_entry_walk(self) -> None:
+        """Walk the entry limit down from the mid, within hard bounds."""
+        walk = self._entry_walk
+        assert walk is not None  # type narrowing; checked in run()
+        quote_provider = self._quote_provider
+        assert quote_provider is not None
+
+        bounds = walk.bounds
+        logger.info(
+            f"[{self.name}] entry walk started: position={walk.position_id}, "
+            f"qty={self.qty}× [{', '.join(leg.occ_symbol for leg in self.legs)}], "
+            f"steps={walk.total_steps}, width=${bounds.width:.2f}, "
+            f"credit_floor=${bounds.credit_floor:.2f} "
+            f"(selection=${bounds.selection_floor:.2f}, "
+            f"budget=${bounds.budget_floor:.2f}), no market fallback"
+        )
+
+        # Intermediate cancels are normal; defer on_fill to the terminal
+        # outcome exactly as the close walk does.
+        outer_on_fill = self._on_fill
+        self._on_fill = None
+
+        terminal_status = "canceled"
+        terminal_order = None
+        try:
+            while not walk.exhausted:
+                # Re-checked before EVERY rung, not once before the first.
+                # The single-shot path could get away with a single
+                # pre-submit check because it made one decision; a walk
+                # spans the whole attempt window, so a halt raised at
+                # second 20 must stop rungs 2 and 3. Submitting into a
+                # halted account because the walk started before the halt
+                # is exactly the kind of exposure this design excludes.
+                if self._entry_allowed is not None and not self._entry_allowed():
+                    logger.warning(
+                        f"[{self.name}] entry walk halted at step "
+                        f"{walk.current_step_number}/{walk.total_steps}: "
+                        f"global risk halt active — no further rungs"
+                    )
+                    terminal_status = "rejected"
+                    break
+
+                quote = quote_provider()
+                if quote is None:
+                    # Unlike the close walk there is nothing to guarantee
+                    # here. Without a quote we cannot show the bounds still
+                    # hold, and an unfilled entry costs nothing — so stop
+                    # rather than submit a price we cannot justify.
+                    logger.warning(
+                        f"[{self.name}] entry walk step "
+                        f"{walk.current_step_number}: no quote available — "
+                        f"abandoning this entry attempt (an unfilled entry "
+                        f"is a non-event; a price we cannot bound is not)"
+                    )
+                    break
+
+                step = walk.next_step(quote)
+                if step is None:
+                    logger.info(
+                        f"[{self.name}] entry walk stopped at step "
+                        f"{walk.current_step_number}/{walk.total_steps}: no "
+                        f"price left that clears the bounds "
+                        f"(bid=${quote.bid:.2f} mid=${quote.mid:.2f} "
+                        f"ask=${quote.ask:.2f}, floor=${bounds.credit_floor:.2f}). "
+                        f"Not filling is the correct outcome here."
+                    )
+                    break
+
+                # The instrumentation this whole exercise started from: what
+                # the book looked like, what we offered, and how much room
+                # the bounds actually left us.
+                room = step.credit - bounds.credit_floor
+                logger.info(
+                    f"[{self.name}] entry walk step {step.step_number}/"
+                    f"{step.total_steps}: quote bid=${quote.bid:.2f} "
+                    f"mid=${quote.mid:.2f} ask=${quote.ask:.2f} | "
+                    f"offering credit=${step.credit:.2f} "
+                    f"(expr={step.price_expr!r}, clamp={step.clamp}, "
+                    f"room_to_floor=${room:.2f}, "
+                    f"max_loss=${bounds.max_loss_at(step.credit):,.0f}, "
+                    f"hold={step.duration_seconds}s"
+                    + (f", rungs_merged={step.rungs_merged}"
+                       if step.rungs_merged > 1 else "")
+                    + ")"
+                )
+
+                status, latest_order = self._submit_walk_step(step=step)
+
+                if self._on_walk_step is not None:
+                    try:
+                        self._on_walk_step(
+                            step_number=step.step_number,
+                            total_steps=step.total_steps,
+                            price_expr=step.price_expr,
+                            is_market=False,
+                            limit_price=step.limit_price,
+                            duration_seconds=step.duration_seconds,
+                            terminal_status=status,
+                        )
+                    except Exception as exc:
+                        logger.error(f"[{self.name}] on_walk_step raised: {exc}")
+
+                if status == "filled":
+                    terminal_status = "filled"
+                    terminal_order = latest_order
+                    break
+                if status == "rejected":
+                    terminal_status = "rejected"
+                    break
+                walk.advance()
+
+            logger.info(
+                f"[{self.name}] entry walk finished: terminal={terminal_status}, "
+                f"steps_used={min(walk.current_step_number - 1, walk.total_steps)}/"
+                f"{walk.total_steps}"
+            )
+        finally:
+            self._on_fill = outer_on_fill
+            client_order_id = f"spr-{self.strategy_name}-entrywalk-terminal"
             self._report_fill(terminal_status, client_order_id, terminal_order)
