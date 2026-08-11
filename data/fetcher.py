@@ -859,13 +859,23 @@ def _session_gap_ranges(
     if run_start is not None:
         ranges.append((run_start, run_end))
 
-    return [
-        (
-            datetime.combine(a, datetime.min.time(), tzinfo=timezone.utc),
-            datetime.combine(b, datetime.max.time(), tzinfo=timezone.utc),
+    # A calendar day is wider than a caller's request window. In particular,
+    # delayed-SIP callers may have already clamped ``end`` below the end of
+    # today. Keep repair requests inside that boundary rather than widening
+    # them back into unavailable recent data.
+    bounded: list[tuple[datetime, datetime]] = []
+    for first_day, last_day in ranges:
+        range_start = max(
+            datetime.combine(first_day, datetime.min.time(), tzinfo=timezone.utc),
+            start,
         )
-        for a, b in ranges
-    ]
+        range_end = min(
+            datetime.combine(last_day, datetime.max.time(), tzinfo=timezone.utc),
+            end,
+        )
+        if range_start < range_end:
+            bounded.append((range_start, range_end))
+    return bounded
 
 
 def _missing_ranges(

@@ -1105,6 +1105,29 @@ class TestSessionGapDetection:
         )
         assert len(df) == len(self.BEFORE)
 
+    def test_gap_repair_respects_the_requested_end_boundary(self, monkeypatch):
+        """A gap at an exclusive midnight endpoint must not widen the fetch.
+
+        Health benchmarks use delayed SIP and request completed windows ending
+        at midnight. The calendar may list that endpoint as a trading session,
+        but a repair request must stay within the already-clamped window rather
+        than expanding through the end of that calendar day.
+        """
+        from data import market_calendar
+
+        requested_start = datetime(2026, 8, 3, tzinfo=timezone.utc)
+        requested_end = datetime(2026, 8, 10, tzinfo=timezone.utc)
+        monkeypatch.setattr(
+            market_calendar,
+            "trading_sessions",
+            lambda start, end: {date(2026, 8, 10)},
+        )
+        cached = self._bars(["2026-08-07"])
+
+        assert fetcher._session_gap_ranges(
+            cached, requested_start, requested_end, set(), "AAPL"
+        ) == []
+
     def test_gap_detection_never_consults_a_cached_symbol(self):
         """11.52: a sweep using SPY as the session reference reported
         'clean' while 92 of 106 symbols were holed, because SPY is cached
