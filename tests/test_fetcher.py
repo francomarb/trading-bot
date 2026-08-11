@@ -1134,7 +1134,7 @@ class TestSessionGapDetection:
             "1Day",
             "all",
             requested_start,
-            requested_end,
+            datetime(2026, 8, 7, 4, tzinfo=timezone.utc),
             "iex",
         )
         returned = self._bars(["2026-08-09"])
