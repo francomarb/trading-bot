@@ -529,6 +529,12 @@ class SpreadExecutionWorker(_BaseExecutionWorker):
         self.legs = legs
         self.qty = qty
         self.limit_price = limit_price
+        # The net limit of the order most recently accepted by the broker.
+        # Starts at the plan limit and is updated on every walk submit, so
+        # a walked fill is benchmarked against the rung that actually
+        # filled rather than the price of the first rung. Read by the
+        # broker's terminal on_fill; see dispatch_spread_order.
+        self.effective_limit_price = limit_price
         self.strategy_name = strategy_name
         self._entry_allowed = entry_allowed
         # Walk-and-market mode is opt-in: setting both turns it on.
@@ -798,6 +804,12 @@ class SpreadExecutionWorker(_BaseExecutionWorker):
                 f"order={order.id}"
             )
 
+        # This rung is now the live order, so it becomes the benchmark a
+        # fill is measured against. Market steps keep the previous limit:
+        # there is no limit price to record for them.
+        if not step.is_market:
+            self.effective_limit_price = step.limit_price
+
         # §10.7 fix-up — eager attach the broker order_id to the
         # substrate row. At any moment during walk-and-market, exactly
         # one broker order is in flight; this keeps substrate.order_id
@@ -960,7 +972,6 @@ class SpreadExecutionWorker(_BaseExecutionWorker):
 
         terminal_status = "canceled"
         terminal_order = None
-        last_credit: float | None = None
         try:
             while not walk.exhausted:
                 # Re-checked before EVERY rung, not once before the first.
@@ -1017,23 +1028,13 @@ class SpreadExecutionWorker(_BaseExecutionWorker):
                     f"(expr={step.price_expr!r}, clamp={step.clamp}, "
                     f"room_to_floor=${room:.2f}, "
                     f"max_loss=${bounds.max_loss_at(step.credit):,.0f}, "
-                    f"hold={step.duration_seconds}s)"
+                    f"hold={step.duration_seconds}s"
+                    + (f", rungs_merged={step.rungs_merged}"
+                       if step.rungs_merged > 1 else "")
+                    + ")"
                 )
 
-                if last_credit is not None and step.credit == last_credit:
-                    # The bounds collapsed two rungs onto the same price.
-                    # Resubmitting it buys nothing but order traffic and a
-                    # fresh queue position at the back of the book.
-                    logger.info(
-                        f"[{self.name}] entry walk step {step.step_number}: "
-                        f"price unchanged at ${step.credit:.2f} (bounded) — "
-                        f"holding, not resubmitting"
-                    )
-                    walk.advance()
-                    continue
-
                 status, latest_order = self._submit_walk_step(step=step)
-                last_credit = step.credit
 
                 if self._on_walk_step is not None:
                     try:

@@ -2549,9 +2549,15 @@ class TestDispatchSpreadOrder:
         broker = AlpacaBroker(client=api, max_attempts=1, base_delay=0.0, dry_run=False)
         captured = {}
 
-        def _capture_worker(*, on_fill, **kwargs):
+        def _capture_worker(*, on_fill, limit_price, **kwargs):
             captured["on_fill"] = on_fill
-            return MagicMock()
+            worker = MagicMock()
+            # A real SpreadExecutionWorker initialises this to the plan
+            # limit and updates it on every walk submit. The double has to
+            # do the same or it is not standing in for the real thing.
+            worker.effective_limit_price = limit_price
+            captured["worker"] = worker
+            return worker
 
         with patch("execution.broker.SpreadExecutionWorker", side_effect=_capture_worker):
             broker.dispatch_spread_order(
@@ -2567,6 +2573,65 @@ class TestDispatchSpreadOrder:
                 1.50, "alpaca-combo-1", -1.45,
             )
         ]
+
+    def test_a_walked_fill_is_benchmarked_against_the_rung_that_filled(self):
+        """Review finding (PR #103). A walk submits several prices; the
+        terminal fill must be measured against the limit that was actually
+        resting, not the first rung.
+
+        `submitted_limit` flows through `_drain_spread_fills` into
+        `log_spread_fill`, where it becomes `entry_reference_price` and the
+        `combo_limit` slippage benchmark — so a stale value here does not
+        just mislabel a log line, it writes a fictitious execution-quality
+        number into the trade DB.
+        """
+        api = MagicMock()
+        broker = AlpacaBroker(client=api, max_attempts=1, base_delay=0.0, dry_run=False)
+        captured = {}
+
+        def _capture_worker(*, on_fill, limit_price, **kwargs):
+            captured["on_fill"] = on_fill
+            worker = MagicMock()
+            worker.effective_limit_price = limit_price
+            captured["worker"] = worker
+            return worker
+
+        with patch("execution.broker.SpreadExecutionWorker", side_effect=_capture_worker):
+            broker.dispatch_spread_order(
+                legs=_open_spread_legs(), qty=1, limit_price=-2.01,
+                strategy_name="credit_spread", position_id="pos-walk",
+            )
+        # The walk conceded to rung 2 at -1.95, and THAT is what filled.
+        captured["worker"].effective_limit_price = -1.95
+        captured["on_fill"]("filled", 1.0, 1.95, "alpaca-combo-2")
+
+        submitted_limit = broker.drain_spread_fills()[0][-1]
+        assert submitted_limit == pytest.approx(-1.95), (
+            f"fill benchmarked against {submitted_limit}, the plan limit, "
+            f"instead of the -1.95 rung that actually filled"
+        )
+
+    def test_an_unwalked_fill_still_uses_the_plan_limit(self):
+        """The single-shot path is unchanged: its only submit IS the plan
+        limit, so the benchmark must not move."""
+        api = MagicMock()
+        broker = AlpacaBroker(client=api, max_attempts=1, base_delay=0.0, dry_run=False)
+        captured = {}
+
+        def _capture_worker(*, on_fill, limit_price, **kwargs):
+            captured["on_fill"] = on_fill
+            worker = MagicMock()
+            worker.effective_limit_price = limit_price
+            return worker
+
+        with patch("execution.broker.SpreadExecutionWorker", side_effect=_capture_worker):
+            broker.dispatch_spread_order(
+                legs=_open_spread_legs(), qty=1, limit_price=-1.45,
+                strategy_name="credit_spread", position_id="pos-single",
+            )
+        captured["on_fill"]("filled", 1.0, 1.45, "alpaca-combo-1")
+        assert broker.drain_spread_fills()[0][-1] == pytest.approx(-1.45)
+
 
 
 # ── Foundation commit 6: per-order substrate insert/attach ──────────────────

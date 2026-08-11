@@ -106,6 +106,10 @@ class EntryWalkStep:
         clamp: Why ``credit`` differs from the raw expression value —
             ``"bid"``, ``"floor"``, or None. Purely diagnostic, but it is
             the field that tells you whether the walk had any room.
+        rungs_merged: How many profile rungs this single submit covers.
+            > 1 when the bounds collapsed consecutive rungs onto the same
+            price; ``duration_seconds`` is then their combined hold. See
+            ``MlegEntryWalk.next_step``.
     """
 
     step_number: int
@@ -115,6 +119,7 @@ class EntryWalkStep:
     limit_price: float
     duration_seconds: int
     clamp: str | None = None
+    rungs_merged: int = 1
 
     @property
     def is_market(self) -> bool:
@@ -249,6 +254,10 @@ class MlegEntryWalk:
         self._bounds = bounds
         self._position_id = position_id
         self._current_step = 0
+        # How many rungs the last resolved step covered. advance() consumes
+        # all of them, so a merged submit does not leave its absorbed rungs
+        # to be walked again.
+        self._pending_advance = 1
 
     @property
     def bounds(self) -> EntryWalkBounds:
@@ -271,7 +280,27 @@ class MlegEntryWalk:
         return self._current_step >= len(self._compiled)
 
     def advance(self) -> None:
-        self._current_step += 1
+        """Consume the last resolved step, including any rungs it merged."""
+        self._current_step += max(1, self._pending_advance)
+        self._pending_advance = 1
+
+    def _resolve(self, index: int, quote: MlegQuote) -> "tuple[float, str | None]":
+        """Bounded credit for profile rung ``index`` against ``quote``."""
+        floor = _ceil_to_cents(self._bounds.credit_floor)
+        _expr, _duration, fn = self._compiled[index]
+        credit = float(fn(quote.as_bindings()))
+        clamp: str | None = None
+        # Never offer below the standing bid: someone is already willing
+        # to pay that, so conceding past it buys nothing.
+        if credit < quote.bid:
+            credit, clamp = quote.bid, "bid"
+        credit = round(credit, 2)
+        # Never concede past the floor. Clamping (rather than bailing)
+        # means the floor price itself is always offered as the last
+        # useful rung of the ladder.
+        if credit < floor:
+            credit, clamp = floor, "floor"
+        return credit, clamp
 
     def next_step(self, quote: MlegQuote) -> EntryWalkStep | None:
         """Resolve the current step against ``quote``.
@@ -296,29 +325,45 @@ class MlegEntryWalk:
         if quote.ask < floor:
             return None
 
-        expr, duration, fn = self._compiled[self._current_step]
-        raw = float(fn(quote.as_bindings()))
+        i = self._current_step
+        expr, duration, _fn = self._compiled[i]
+        credit, clamp = self._resolve(i, quote)
 
-        credit = raw
-        clamp: str | None = None
-        # Never offer below the standing bid: someone is already willing
-        # to pay that, so conceding past it buys nothing.
-        if credit < quote.bid:
-            credit, clamp = quote.bid, "bid"
-
-        credit = round(credit, 2)
-        # Never concede past the floor. Clamping (rather than bailing)
-        # means the floor price itself is always offered as the last
-        # useful rung of the ladder.
-        if credit < floor:
-            credit, clamp = floor, "floor"
+        # Merge any consecutive rungs that resolve to the SAME bounded
+        # price into this one submit, summing their holds.
+        #
+        # Without this, a collapsed ladder silently shortens the attempt:
+        # the executor waits out rung 1, cancels, then skips rungs 2-3
+        # instantly because the price is unchanged — so a 180s profile
+        # rests a live order for only 60s. That is *worse* than the
+        # single-shot path it replaces, and it bites hardest in exactly
+        # the thin-credit regime where rungs collapse onto the floor.
+        # Resubmitting the same price instead would keep the duration but
+        # surrender queue position on every cancel/replace, which is the
+        # thing a resting order is for.
+        #
+        # The lookahead prices later rungs against the CURRENT quote. If
+        # the market moves during the merged hold those rungs might have
+        # resolved differently — but the alternative was cancelling and
+        # re-pricing against a quote fetched moments later, which is no
+        # more current than this one. A resting order through the move is
+        # the better trade.
+        merged = 1
+        while i + merged < len(self._compiled):
+            nxt_credit, _ = self._resolve(i + merged, quote)
+            if nxt_credit != credit:
+                break
+            duration += self._compiled[i + merged][1]
+            merged += 1
+        self._pending_advance = merged
 
         return EntryWalkStep(
-            step_number=self._current_step + 1,
+            step_number=i + 1,
             total_steps=len(self._compiled),
             price_expr=expr,
             credit=credit,
             limit_price=-credit,
             duration_seconds=duration,
             clamp=clamp,
+            rungs_merged=merged,
         )

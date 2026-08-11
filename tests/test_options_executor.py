@@ -1000,3 +1000,136 @@ class TestSpreadExecutionWorkerEntryWalk:
         )
         w.run()
         assert on_fill.call_args.args[0] == "rejected"
+
+    def test_live_order_time_is_not_shortened_when_rungs_collapse(self):
+        """Review finding (PR #103), at the level that matters: the seconds
+        an order is actually resting on the book.
+
+        `_submit_walk_step` waits then cancels, so a rung that is skipped
+        rather than merged contributes ZERO live time. Asserted on the
+        timeout passed to the stream wait, i.e. what the worker really
+        held for — not on the planner's arithmetic.
+        """
+        api = self._api()
+        stream = MagicMock()
+        waits = []
+
+        def make_event():
+            ev = MagicMock()
+            ev.wait.side_effect = lambda timeout=None: waits.append(timeout) or False
+            return ev
+
+        stream.watch.side_effect = [make_event() for _ in range(8)]
+        w = SpreadExecutionWorker(
+            legs=_open_legs(), qty=1, limit_price=-2.01,
+            strategy_name="credit_spread", api=api, stream_manager=stream,
+            # bid 1.80 sits under the 1.95 floor, so rungs 2-3 both clamp
+            entry_walk=self._walk(
+                [("mid", 60), ("mid - 0.34*(mid-bid)", 60), ("mid - 0.67*(mid-bid)", 60)]
+            ),
+            quote_provider=lambda: self._quote(),
+        )
+        w.run()
+        limits = [-r.limit_price for r in self._submitted_limits(api)]
+        assert len(set(limits)) < 3, "fixture must collapse rungs or it proves nothing"
+        assert sum(waits) == 180, (
+            f"walk rested a live order for {sum(waits)}s, not the 180s the "
+            f"profile promises — collapsed rungs are being dropped, not merged"
+        )
+
+    def test_live_order_time_matches_the_profile_when_nothing_collapses(self):
+        api = self._api()
+        stream = MagicMock()
+        waits = []
+
+        def make_event():
+            ev = MagicMock()
+            ev.wait.side_effect = lambda timeout=None: waits.append(timeout) or False
+            return ev
+
+        stream.watch.side_effect = [make_event() for _ in range(8)]
+        w = SpreadExecutionWorker(
+            legs=_open_legs(), qty=1, limit_price=-3.42,
+            strategy_name="credit_spread", api=api, stream_manager=stream,
+            entry_walk=self._walk(
+                [("mid", 60), ("mid - 0.34*(mid-bid)", 60), ("mid - 0.67*(mid-bid)", 60)]
+            ),
+            quote_provider=lambda: self._quote(mid=3.42, bid=3.05, ask=3.79),
+        )
+        w.run()
+        assert len(waits) == 3
+        assert sum(waits) == 180
+
+    def test_the_close_walk_gets_the_same_benchmark_fix(self):
+        """`_submit_walk_step` is shared, so closes had the identical stale
+        benchmark: an escalating walk that fills on step 3 was recorded
+        against step 1's limit. Locking that in here so a future change to
+        the entry path cannot quietly regress the close path."""
+        from execution.mleg_close import MlegCloseScheduler, MlegQuote
+        api = self._api()
+        api.get_order_by_id.side_effect = [
+            _mleg_submitted("combo-1", status="accepted"),
+            _mleg_filled("combo-2"),
+            _mleg_filled("combo-2"),
+        ]
+        sched = MlegCloseScheduler(
+            [("mid", 30), ("mid + 0.5*(ask-mid)", 30)],
+            reason="stop_loss", position_id="p1",
+        )
+        w = SpreadExecutionWorker(
+            legs=_open_legs(), qty=1, limit_price=4.60,
+            strategy_name="credit_spread", api=api,
+            stream_manager=self._stream([False, True]),
+            close_scheduler=sched,
+            quote_provider=lambda: MlegQuote(mid=4.60, bid=4.12, ask=5.08),
+        )
+        w.run()
+        submitted = [r.limit_price for r in self._submitted_limits(api)]
+        assert len(submitted) == 2
+        assert w.effective_limit_price == pytest.approx(submitted[1])
+
+    def test_effective_limit_tracks_the_resting_rung(self):
+        """The worker-side half of the benchmark fix: after each submit,
+        `effective_limit_price` must be the price now on the book."""
+        api = self._api()
+        stream = self._stream([False, False, False])
+        w = SpreadExecutionWorker(
+            legs=_open_legs(), qty=1, limit_price=-2.01,
+            strategy_name="credit_spread", api=api, stream_manager=stream,
+            entry_walk=self._walk(), quote_provider=lambda: self._quote(),
+        )
+        assert w.effective_limit_price == -2.01, "starts at the plan limit"
+        w.run()
+        submitted = [r.limit_price for r in self._submitted_limits(api)]
+        assert w.effective_limit_price == pytest.approx(submitted[-1]), (
+            f"effective limit {w.effective_limit_price} is not the last "
+            f"rung submitted {submitted[-1]}"
+        )
+        assert w.effective_limit_price != -2.01, "fixture must concede"
+
+    def test_a_fill_on_a_later_rung_reports_that_rungs_limit(self):
+        api = self._api()
+        # Rung 1: stream miss AND a non-terminal REST re-check, so it is
+        # genuinely cancelled. Rung 2: stream fill, REST returns filled.
+        # A single `resolves_filled=True` would terminate rung 1 on the
+        # REST re-check and the walk would never reach rung 2 — the test
+        # would then assert nothing about later rungs.
+        api.get_order_by_id.side_effect = [
+            _mleg_submitted("combo-1", status="accepted"),
+            _mleg_filled("combo-2"),
+            _mleg_filled("combo-2"),
+        ]
+        stream = self._stream([False, True])   # rung 1 misses, rung 2 fills
+        w = SpreadExecutionWorker(
+            legs=_open_legs(), qty=1, limit_price=-3.42,
+            strategy_name="credit_spread", api=api, stream_manager=stream,
+            entry_walk=self._walk(
+                [("mid", 60), ("mid - 0.34*(mid-bid)", 60), ("mid - 0.67*(mid-bid)", 60)]
+            ),
+            quote_provider=lambda: self._quote(mid=3.42, bid=3.05, ask=3.79),
+        )
+        w.run()
+        submitted = [r.limit_price for r in self._submitted_limits(api)]
+        assert len(submitted) == 2
+        assert w.effective_limit_price == pytest.approx(submitted[1])
+        assert w.effective_limit_price != pytest.approx(submitted[0])

@@ -384,3 +384,67 @@ class TestEngineWiring:
         assert walk is not None
         assert walk.bounds.max_loss_budget is None
         assert walk.bounds.credit_floor == pytest.approx(walk.bounds.selection_floor)
+
+
+class TestAttemptWindowIsPreserved:
+    """Review finding (PR #103): collapsed rungs must not shorten the attempt.
+
+    The executor waits out a rung and THEN cancels, so skipping a
+    duplicate-priced rung leaves no live order resting during its slot. A
+    180s profile whose rungs 2-3 collapse onto the floor would rest an
+    order for only 60s — worse than the single-shot path it replaces, and
+    worst in exactly the thin-credit regime that causes the collapse.
+    """
+
+    def test_total_hold_equals_the_profile_total_when_rungs_collapse(self):
+        """The August case: bid 1.80 under a 1.95 floor, so rungs 2 and 3
+        both clamp to 1.95 and merge into rung 2's submit."""
+        profile = [("mid", 60), ("mid - 0.34*(mid-bid)", 60), ("mid - 0.67*(mid-bid)", 60)]
+        w = MlegEntryWalk(profile, bounds=bounds(), position_id="p")
+        steps = walk_all(w, QQQ_QUOTE)
+        credits = [s.credit for s in steps]
+        assert len(set(credits)) < len(profile), (
+            "fixture must actually collapse rungs or it proves nothing"
+        )
+        assert sum(s.duration_seconds for s in steps) == sum(d for _, d in profile)
+
+    def test_total_hold_is_preserved_when_nothing_collapses(self):
+        profile = [("mid", 60), ("mid - 0.34*(mid-bid)", 60), ("mid - 0.67*(mid-bid)", 60)]
+        wide = MlegQuote(mid=3.42, bid=3.05, ask=3.79)
+        w = MlegEntryWalk(profile, bounds=bounds(), position_id="p")
+        steps = walk_all(w, wide)
+        assert len(set(s.credit for s in steps)) == 3, "fixture must NOT collapse"
+        assert sum(s.duration_seconds for s in steps) == 180
+
+    def test_merged_step_carries_the_combined_hold(self):
+        w = MlegEntryWalk(
+            [("mid", 60), ("bid", 30), ("bid", 45)], bounds=bounds(), position_id="p"
+        )
+        first = w.next_step(QQQ_QUOTE)
+        assert first.duration_seconds == 60 and first.rungs_merged == 1
+        w.advance()
+        merged = w.next_step(QQQ_QUOTE)
+        assert merged.rungs_merged == 2
+        assert merged.duration_seconds == 75, "combined hold of the two clamped rungs"
+
+    def test_advance_consumes_every_merged_rung(self):
+        """If advance() only stepped by one, the absorbed rungs would be
+        walked again and the same price submitted twice."""
+        w = MlegEntryWalk(
+            [("bid", 30), ("bid", 30), ("bid", 30)], bounds=bounds(), position_id="p"
+        )
+        step = w.next_step(QQQ_QUOTE)
+        assert step.rungs_merged == 3
+        w.advance()
+        assert w.exhausted
+
+    def test_every_profile_rung_is_accounted_for_exactly_once(self):
+        """Sum of rungs_merged across the walk == number of profile rungs.
+        Neither dropped (short window) nor double-counted (long window)."""
+        for quote in (QQQ_QUOTE, MlegQuote(mid=3.42, bid=3.05, ask=3.79)):
+            profile = settings.MLEG_ENTRY_WALK_PROFILE
+            w = MlegEntryWalk(profile, bounds=bounds(), position_id="p")
+            steps = walk_all(w, quote)
+            assert sum(s.rungs_merged for s in steps) == len(profile), (
+                f"rung accounting broken for quote {quote}"
+            )
