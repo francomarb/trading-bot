@@ -7,12 +7,14 @@ disagrees with its header does not fail loudly — it renders content in
 the wrong column, or drops it off the visible table entirely, which is
 worse than a missing file because it looks fine.
 
-Two ways it broke on 2026-08-10, both while editing unrelated rows:
+Three ways it broke on 2026-08-10/11, all while editing unrelated rows:
 
 * An insert appended a trailing ``|`` to text that already followed a
   delimiter, splitting a 3-column row into 4 — silently, four times.
 * ``|r|`` (absolute value) and ``` `|fill − new_stop|` ``` were written
   unescaped inside cells, each adding two phantom delimiters.
+* A data row was inserted between a table header and its delimiter, causing
+  GitHub to render the whole block as prose despite matching cell counts.
 
 And two rows had been malformed for longer: ``11.49`` was split across
 lines by a blank line inside a cell, and the MLEG row was missing a
@@ -33,6 +35,7 @@ PLAN = Path(__file__).resolve().parent.parent / "PLAN.md"
 
 # A pipe escaped as \| is cell content, not a delimiter.
 _PIPE = re.compile(r"(?<!\\)\|")
+_DELIMITER_CELL = re.compile(r":?-{3,}:?$")
 
 
 def cell_count(row: str) -> int:
@@ -79,6 +82,26 @@ class TestPlanTables:
             "malformed PLAN.md table row(s) — content will render in the "
             "wrong column:\n" + "\n".join(problems)
         )
+
+    def test_header_is_immediately_followed_by_delimiter(self):
+        """Markdown only recognizes a table when its delimiter follows the header.
+
+        A valid-looking data row placed between them turns the entire block into
+        prose on GitHub, despite every row having the correct cell count.
+        """
+        problems = []
+        for block in tables():
+            if len(block) < 2:
+                problems.append(f"PLAN.md:{block[0][0]} table has no delimiter row")
+                continue
+            lineno, delimiter = block[1]
+            cells = [cell.strip() for cell in _PIPE.split(delimiter)[1:-1]]
+            if not cells or not all(_DELIMITER_CELL.fullmatch(cell) for cell in cells):
+                problems.append(
+                    f"PLAN.md:{lineno} must be the delimiter immediately after "
+                    f"the header at line {block[0][0]}"
+                )
+        assert not problems, "malformed PLAN.md table header(s):\n" + "\n".join(problems)
 
     def test_no_blank_line_splits_a_table(self):
         """A blank line inside a cell ends the table and orphans the rest.
