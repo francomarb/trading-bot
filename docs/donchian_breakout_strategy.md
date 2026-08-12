@@ -3,7 +3,7 @@
 **Status:** ✅ **ACTIVE** — wired in `forward_test.py` since 2026-05-01.
 Built as the successor analysis to [bollinger_squeeze_universe_research.md](bollinger_squeeze_universe_research.md).
 
-**Last updated:** 2026-05-01
+**Last updated:** 2026-08-12
 
 ---
 
@@ -509,6 +509,22 @@ profitable and the protective stop carries the loss:
 That is directional support for `11.54`'s premise, but **10 of those 13
 stop-outs are pre-2026-06-14 MARKET entries** and say nothing about STOP_LIMIT
 anchoring. Only WYFI, ANET and AAPL are STOP_LIMIT-era.
+
+### 30/10 versus 30/15 paper evidence collection (started 2026-08-12)
+
+The deployed exit remains **30/15**. To make a future exit-window review
+grounded in paper evidence rather than reconstructed cache data, the engine now
+emits one log-only `DONCHIAN_EXIT_OBSERVATION` record for every evaluated open
+Donchian position. Each record preserves the completed-bar timestamp, close,
+prior 10-day low, prior 15-day low, and the corresponding `exit_10` / `exit_15`
+booleans, together with the symbol and position ID.
+
+This instrumentation does not alter entries, exits, sizing, or broker orders;
+the trade database remains the source of truth for actual fills. When enough
+positions have encountered a 10-day-only exit (`exit_10=True`,
+`exit_15=False`), review those records alongside the eventual actual exit/stop
+and label any hypothetical 30/10 execution price as a proxy. Do not turn the
+logged signal comparison into claimed realized P&L without that qualification.
 
 ---
 

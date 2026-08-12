@@ -20,8 +20,9 @@ Usage:
         --output logs/backtests/donchian_sweep_ai.md
     python scripts/backtest_donchian_breakout.py --symbols NVDA AVGO MSFT --no-filter
 
-The IEX-vs-SIP feed scaling on the liquidity floor is honoured automatically
-because DonchianEdgeFilter reads ALPACA_DATA_FEED at construction time.
+Research bars and liquidity gating use ``settings.BACKTEST_DATA_FEED`` (SIP by
+default). This script is intentionally a compact signal/execution comparison;
+it does not attempt to reimplement the live portfolio engine.
 """
 
 from __future__ import annotations
@@ -49,7 +50,9 @@ from scripts.backtest_bollinger_squeeze import (
     fetch_bars,
 )
 from strategies.donchian_breakout import DonchianBreakout
+from strategies.base import EdgeFilterDecision
 from strategies.filters.donchian_breakout import DonchianEdgeFilter
+from scripts.donchian_trail_compare import classify_spy_regime
 
 
 # ── Sweep grid ────────────────────────────────────────────────────────────────
@@ -67,6 +70,49 @@ SWEEP_GRID: list[tuple[str, dict]] = [
     ("Hybrid (55/10)",           {"entry_window": 55, "exit_window": 10}),
     ("System 2 (55/20)",         {"entry_window": 55, "exit_window": 20}),
 ]
+
+
+class ProductionMirrorDonchianFilter:
+    """Replay the live Donchian entry gates from historical SIP bars.
+
+    The live engine owns the TRENDING-only regime gate, so the ordinary
+    ``DonchianEdgeFilter`` cannot reproduce it on its own.  This wrapper adds
+    the per-bar historical SPY regime mask while delegating stock strength,
+    liquidity, and earnings handling to the production filter.  The sector
+    filter is intentionally absent because Donchian's production policy is
+    ``warn`` rather than block.
+    """
+
+    def __init__(self, spy_regime: pd.Series) -> None:
+        self._spy_regime = spy_regime
+        self._stock_filter = DonchianEdgeFilter(
+            feed_label=settings.BACKTEST_DATA_FEED
+        )
+
+    def set_symbol(self, symbol: str) -> None:
+        self._stock_filter.set_symbol(symbol)
+
+    def __call__(self, df: pd.DataFrame) -> EdgeFilterDecision:
+        stock_decision = self._stock_filter(df)
+        trending = (
+            self._spy_regime.reindex(df.index).eq("TRENDING").fillna(False)
+        )
+        allowed = stock_decision.allowed & trending.astype(bool)
+        reasons: list[list[str]] = []
+        for stock_allowed, stock_reasons, is_trending in zip(
+            stock_decision.allowed.tolist(),
+            stock_decision.reasons.tolist(),
+            trending.tolist(),
+            strict=False,
+        ):
+            row_reasons = list(stock_reasons) if not stock_allowed else []
+            if not is_trending:
+                row_reasons.append("SPY regime is not TRENDING")
+            reasons.append(row_reasons)
+        return EdgeFilterDecision(
+            allowed=allowed.astype(bool),
+            reasons=pd.Series(reasons, index=df.index, dtype=object),
+        )
 
 
 # ── Per-symbol report ────────────────────────────────────────────────────────
@@ -95,8 +141,11 @@ def run_one(
     strategy_params: dict | None = None,
     atr_stop_mult: float | None = None,
     atr_trail: bool = False,
+    edge_filter=None,
 ) -> SymbolReport:
-    edge = DonchianEdgeFilter(feed_label=settings.BACKTEST_DATA_FEED) if use_filter else None
+    edge = edge_filter if use_filter else None
+    if edge is None and use_filter:
+        edge = DonchianEdgeFilter(feed_label=settings.BACKTEST_DATA_FEED)
     params = strategy_params or {}
     strategy = DonchianBreakout(edge_filter=edge, **params)
     result = run_backtest(
@@ -183,6 +232,25 @@ def render_sweep_summary(rows: list[tuple[str, dict[str, float]]]) -> str:
     return "\n".join(lines)
 
 
+def render_production_mirror_scope() -> str:
+    """State precisely what the compact production-mirror run does and omits."""
+    return """### Production-mirror scope and limitations
+
+This is a **per-symbol signal/execution comparison**, not a simulated live
+portfolio return. It uses SIP daily bars and mirrors the 30/15 Donchian signal,
+next-session STOP_LIMIT entry model and entry cap, 5 bps modeled slippage,
+fixed 2× ATR protective stop, stock 200-SMA/liquidity/earnings gates, and the
+historical SPY `TRENDING` regime gate.
+
+It deliberately does **not** reproduce shared sleeve cash allocation,
+cross-symbol concurrency, the hard position cap, HWM/daily-loss risk halts,
+or paper IEX order/fill lifecycle. Earnings data also follows the production
+filter's fail-open behavior when history is unavailable. Treat paper-trading
+records as the execution ground truth; use this report only for a like-for-like
+30/15 versus 30/10 research comparison.
+"""
+
+
 # ── Main ─────────────────────────────────────────────────────────────────────
 
 
@@ -191,6 +259,21 @@ def main() -> int:
     parser.add_argument(
         "--years", type=float, default=4.0,
         help="Years of trailing daily history to backtest (default 4)",
+    )
+    parser.add_argument(
+        "--entry-window", type=int, default=30,
+        help="Entry lookback for a non-sweep run (default: production 30).",
+    )
+    parser.add_argument(
+        "--exit-window", type=int, default=15,
+        help="Exit lookback for a non-sweep run (default: production 15).",
+    )
+    parser.add_argument(
+        "--production-mirror", action="store_true",
+        help="Replay the live TRENDING-only SPY regime gate as well as the "
+             "Donchian stock-level filter. Requires SIP SPY bars. This is a "
+             "per-symbol signal/execution comparison, not a sleeve allocator "
+             "or shared-capital portfolio simulation.",
     )
     parser.add_argument(
         "--end-date", type=str, default=None,
@@ -261,6 +344,16 @@ def main() -> int:
 
     cfg = BacktestConfig()
 
+    mirror_filter: ProductionMirrorDonchianFilter | None = None
+    if args.production_mirror:
+        # Fetch enough SPY history for the 200-SMA and 126-bar ATR-percentile
+        # regime calculation before the earliest symbol bar.
+        spy_bars = fetch_bars(["SPY"], args.years + 1.0, end_date=end_date).get("SPY")
+        if spy_bars is None or spy_bars.empty:
+            logger.error("production mirror requires SIP SPY bars — aborting")
+            return 1
+        mirror_filter = ProductionMirrorDonchianFilter(classify_spy_regime(spy_bars))
+
     bar_start = min(df.index[0] for df in bars_by_sym.values())
     bar_end   = max(df.index[-1] for df in bars_by_sym.values())
 
@@ -275,8 +368,11 @@ def main() -> int:
         f"- Data feed: {settings.BACKTEST_DATA_FEED} (from `settings.BACKTEST_DATA_FEED`)\n"
         f"- Slippage: {cfg.slippage_bps} bps, init_cash: ${cfg.initial_cash:,.0f}\n"
         f"- Edge filter: {'ON' if not args.no_filter else 'OFF'}\n"
+        f"- Production regime mirror: {'ON (SPY TRENDING-only)' if args.production_mirror else 'OFF'}\n"
         f"- ATR stops: {f'{args.atr_stop_mult}× ATR' + (' (TRAILING)' if args.atr_trail else ' (fixed)') if args.atr_stop_mult else 'OFF (signal exit only)'}\n"
     )
+    if args.production_mirror:
+        sections.append(render_production_mirror_scope())
 
     if args.sweep:
         sections.append(
@@ -297,6 +393,7 @@ def main() -> int:
                         strategy_params=params,
                         atr_stop_mult=args.atr_stop_mult,
                         atr_trail=args.atr_trail,
+                        edge_filter=mirror_filter,
                     )
                 except Exception as exc:  # noqa: BLE001
                     logger.warning(f"{symbol} ({label}): {exc}")
@@ -335,8 +432,13 @@ def main() -> int:
                     symbol, df,
                     use_filter=use_filter,
                     config=cfg,
+                    strategy_params={
+                        "entry_window": args.entry_window,
+                        "exit_window": args.exit_window,
+                    },
                     atr_stop_mult=args.atr_stop_mult,
                     atr_trail=args.atr_trail,
+                    edge_filter=mirror_filter,
                 )
             except Exception as exc:  # noqa: BLE001
                 logger.warning(f"{symbol}: {exc}")

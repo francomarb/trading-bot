@@ -267,6 +267,31 @@ def _finite_or_none(value) -> float | None:
     return f
 
 
+def _donchian_exit_observation(df: pd.DataFrame) -> dict[str, float | bool | None]:
+    """Return the 10/15-day prior-low comparison for one completed bar.
+
+    This is observability-only. It uses the same close-based, prior-window
+    definition as ``DonchianBreakout`` so later audits do not need to infer
+    exit levels from a mutable historical cache.
+    """
+    close = df["close"].astype(float)
+    latest_close = float(close.iloc[-1])
+
+    def _level(window: int) -> float | None:
+        value = close.shift(1).rolling(window).min().iloc[-1]
+        return float(value) if pd.notna(value) else None
+
+    low_10 = _level(10)
+    low_15 = _level(15)
+    return {
+        "close": latest_close,
+        "low_10": low_10,
+        "low_15": low_15,
+        "exit_10": low_10 is not None and latest_close < low_10,
+        "exit_15": low_15 is not None and latest_close < low_15,
+    }
+
+
 # ── Config ───────────────────────────────────────────────────────────────────
 
 
@@ -1530,6 +1555,28 @@ class TradingEngine:
                 # counters increment downstream when applicable.
 
         position = self._get_position_for(symbol, snapshot)
+        if strategy.name == "donchian_breakout" and position is not None:
+            try:
+                observation = _donchian_exit_observation(df)
+                low_10 = observation["low_10"]
+                low_15 = observation["low_15"]
+                low_10_str = f"{low_10:.4f}" if low_10 is not None else "None"
+                low_15_str = f"{low_15:.4f}" if low_15 is not None else "None"
+                logger.info(
+                    "DONCHIAN_EXIT_OBSERVATION "
+                    f"symbol={symbol} position_id={position.position_id} "
+                    f"signal_bar={latest_ts.isoformat()} "
+                    f"close={observation['close']:.4f} "
+                    f"low_10={low_10_str} "
+                    f"low_15={low_15_str} "
+                    f"exit_10={observation['exit_10']} "
+                    f"exit_15={observation['exit_15']}"
+                )
+            except Exception as exc:  # noqa: BLE001
+                logger.warning(
+                    f"[{strategy.name}] {symbol}: DONCHIAN_EXIT_OBSERVATION "
+                    f"unavailable — {type(exc).__name__}: {exc}"
+                )
         logger.info(
             f"[{strategy.name}] {symbol}: bar={latest_ts.isoformat()} "
             f"close=${latest_close:.2f} atr=${latest_atr:.2f} "

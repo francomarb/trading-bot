@@ -38,7 +38,12 @@ from unittest.mock import MagicMock
 import pandas as pd
 import pytest
 
-from engine.trader import EngineConfig, TradingEngine, _lookback_days
+from engine.trader import (
+    EngineConfig,
+    TradingEngine,
+    _donchian_exit_observation,
+    _lookback_days,
+)
 from engine.lifecycle_orders import OrderEvent
 from execution.broker import (
     AlpacaBroker,
@@ -103,6 +108,7 @@ def _bars(n: int = 60, end: datetime = T0, base: float = 100.0) -> pd.DataFrame:
     idx = pd.DatetimeIndex(
         [end - timedelta(days=n - 1 - i) for i in range(n)], tz="UTC"
     )
+
     closes = [base + (i % 7) * 0.5 for i in range(n)]
     return pd.DataFrame(
         {
@@ -114,6 +120,31 @@ def _bars(n: int = 60, end: datetime = T0, base: float = 100.0) -> pd.DataFrame:
         },
         index=idx,
     )
+
+
+class TestDonchianExitObservation:
+    """Paper evidence must preserve the exact 10/15-day comparison."""
+
+    def test_uses_prior_close_windows_and_records_both_exit_flags(self):
+        df = _bars(n=16)
+        df.loc[df.index[-1], "close"] = 99.0
+
+        observation = _donchian_exit_observation(df)
+
+        prior_close = df["close"].iloc[:-1]
+        assert observation["close"] == pytest.approx(99.0)
+        assert observation["low_10"] == pytest.approx(prior_close.iloc[-10:].min())
+        assert observation["low_15"] == pytest.approx(prior_close.iloc[-15:].min())
+        assert observation["exit_10"] is True
+        assert observation["exit_15"] is True
+
+    def test_keeps_insufficient_history_explicit(self):
+        observation = _donchian_exit_observation(_bars(n=10))
+
+        assert observation["low_10"] is None
+        assert observation["low_15"] is None
+        assert observation["exit_10"] is False
+        assert observation["exit_15"] is False
 
 
 def _snapshot(
