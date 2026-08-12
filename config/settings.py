@@ -410,7 +410,7 @@ SMA_WATCHLIST = [
     "SNDK", "WDC", "STX", "GSAT", "POWL", "VIAV", "VSAT", "CIEN", "ASML", "MSTR",
     "MU", "FORM", "ALB", "CSTM", "DOCN", "TTMI", "FRO", "MTZ",
     "DK", "ASX", "CAT", "HUT", "GLW", "AMD", "STRL", "INTC",
-    "BE", "ECG", "MRVL", "NVT", "SQM", "TSEM", "PL", "UBER",
+    "BE", "ECG", "MRVL", "NVT", "SQM", "TSEM", "PL", "UBER", "DASH",
     "NVDA", "ADBE", "ANET", "META", "PLTR", "DUOL",
     # Scanned additions passing fundamentals check (2026-06-08)
     # MANUAL OVERRIDE: Added mid-paper-run to capitalize on the active AI/Semiconductor uptrend,
@@ -482,6 +482,8 @@ DONCHIAN_WATCHLIST = [
     "MSFT", "AAPL", "GOOG", "META", "AMZN", "ORCL", "TSLA",
     # AI software (secondary)
     "PLTR", "CRWD", "NOW", "ALAB", "CRWV", "NBIS",
+    # Platforms
+    "DASH", "UBER",
     # AI compute / quantum (post-IPO names with full 4y history)
     "IREN", "IONQ",
     # AI-adjacent: semiconductor equipment, networking, data-centre power,
