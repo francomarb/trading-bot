@@ -146,6 +146,34 @@ class TestDonchianExitObservation:
         assert observation["exit_10"] is False
         assert observation["exit_15"] is False
 
+    def test_open_broker_position_emits_observation_without_identity_warning(
+        self, engine_factory, monkeypatch
+    ):
+        """Broker positions carry market state, not the engine position id."""
+        engine, _broker = engine_factory(entries=[False] * 60)
+        strategy = engine.slots[0].strategy
+        strategy.name = "donchian_breakout"
+        snapshot = _snapshot(
+            positions={"AAPL": Position("AAPL", 10, 100.0, 1_000.0)}
+        )
+        info = MagicMock()
+        warning = MagicMock()
+        monkeypatch.setattr("engine.trader.logger.info", info)
+        monkeypatch.setattr("engine.trader.logger.warning", warning)
+
+        engine._process_symbol(
+            "AAPL", snapshot, snapshot.account, strategy, engine.slots[0].timeframe
+        )
+
+        assert any(
+            "DONCHIAN_EXIT_OBSERVATION symbol=AAPL position_id=AAPL" in call.args[0]
+            for call in info.call_args_list
+        )
+        assert not any(
+            "DONCHIAN_EXIT_OBSERVATION unavailable" in call.args[0]
+            for call in warning.call_args_list
+        )
+
 
 def _snapshot(
     *,

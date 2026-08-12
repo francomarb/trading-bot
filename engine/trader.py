@@ -1564,7 +1564,7 @@ class TradingEngine:
                 low_15_str = f"{low_15:.4f}" if low_15 is not None else "None"
                 logger.info(
                     "DONCHIAN_EXIT_OBSERVATION "
-                    f"symbol={symbol} position_id={position.position_id} "
+                    f"symbol={symbol} position_id={owner_key_for(symbol)} "
                     f"signal_bar={latest_ts.isoformat()} "
                     f"close={observation['close']:.4f} "
                     f"low_10={low_10_str} "
