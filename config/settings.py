@@ -411,7 +411,7 @@ SMA_WATCHLIST = [
     "MU", "FORM", "ALB", "CSTM", "DOCN", "TTMI", "FRO", "MTZ",
     "DK", "ASX", "CAT", "HUT", "GLW", "AMD", "STRL", "INTC",
     "BE", "ECG", "MRVL", "NVT", "SQM", "TSEM", "PL", "UBER", "DASH",
-    "NVDA", "ADBE", "ANET", "META", "NFLX", "PLTR", "DUOL",
+    "NVDA", "ADBE", "ANET", "META", "PLTR", "DUOL",
     # Scanned additions passing fundamentals check (2026-06-08)
     # MANUAL OVERRIDE: Added mid-paper-run to capitalize on the active AI/Semiconductor uptrend,
     # temporarily bypassing the 3-per-sector cap and mid-run freeze per operator direction.
