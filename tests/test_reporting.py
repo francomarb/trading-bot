@@ -2909,6 +2909,45 @@ class TestReplayChronologyAndBasisSource:
     T3 = "2026-06-01T10:00:00+00:00"
     T4 = "2026-06-09T10:00:00+00:00"
 
+    def test_fractional_full_close_normalizes_before_reentry(self, tmp_csv):
+        """A complete fractional close must not leave float dust that
+        suppresses ownership and entry context for the next position.
+
+        AVGO regression: 7.19 shares closed as 7 + 0.19, then a new
+        7-share Donchian entry arrived after restart.
+        """
+        tl = TradeLogger(path=tmp_csv)
+        tl.log(_single_leg_row(
+            symbol="AVGO", side="buy", qty=7.19, fill=427.08,
+            reference=427.08, timestamp=self.T1, order_id="old-entry",
+            stop_price=400.69,
+        ))
+        tl.log(_single_leg_row(
+            symbol="AVGO", side="sell", qty=7.0, fill=400.79,
+            reference=427.08, timestamp=self.T2, order_id="old-stop",
+            exit_timestamp=self.T2,
+        ))
+        tl.log(_single_leg_row(
+            symbol="AVGO", side="sell", qty=0.19, fill=402.19,
+            reference=427.08, timestamp=self.T3, order_id="old-residual",
+            exit_timestamp=self.T3,
+        ))
+        tl.log(_single_leg_row(
+            symbol="AVGO", side="buy", qty=7.0, fill=426.09,
+            reference=420.68, timestamp=self.T4, order_id="new-entry",
+            stop_price=386.95,
+        ))
+
+        state = tl._read_single_leg_open_state()["AVGO"]
+        assert state["open_qty"] == 7.0
+        assert state["strategy"] == "fake_strategy"
+        assert state["entry_timestamp"] == self.T4
+        assert state["entry_fill_price"] == pytest.approx(426.09)
+        assert tl.read_all_open_owners() == {"AVGO": "fake_strategy"}
+        assert tl.read_latest_open_stop_price(
+            symbol="AVGO", strategy="fake_strategy",
+        ) == pytest.approx(386.95)
+
     def test_backfilled_exit_does_not_blend_adjacent_positions(self, tmp_csv):
         """A reconciliation-backfilled exit (higher id, earlier
         timestamp) must close position 1 BEFORE position 2's entry is

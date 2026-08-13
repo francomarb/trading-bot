@@ -216,6 +216,11 @@ ENTRY_BASIS_BROKER_FILL = "broker_fill"
 ENTRY_BASIS_REFERENCE_FALLBACK = "reference_fallback"
 ENTRY_BASIS_MIXED = "mixed"
 
+# Trade-log rows store fractional quantities as floats. Treat values at or
+# below this threshold as flat everywhere in replay so a fully closed prior
+# position cannot contaminate a later re-entry through binary roundoff.
+_REPLAY_QTY_EPSILON = 1e-9
+
 
 def _replay_event_time(row: Any) -> datetime:
     """Best-effort UTC event time for a trades row, for replay ordering.
@@ -292,7 +297,8 @@ def replay_single_leg_rows(rows: Any) -> dict[str, dict[str, Any]]:
             state[symbol] = current
 
         if side == "buy":
-            if current["open_qty"] <= 0:
+            if current["open_qty"] <= _REPLAY_QTY_EPSILON:
+                current["open_qty"] = 0.0
                 current["strategy"] = row["strategy"]
                 current["stop_price"] = (
                     float(row["stop_price"]) if row["stop_price"] is not None else None
@@ -347,7 +353,8 @@ def replay_single_leg_rows(rows: Any) -> dict[str, dict[str, Any]]:
                 current["open_qty"] = 0.0
             else:
                 current["open_qty"] = max(0.0, current["open_qty"] - qty)
-            if current["open_qty"] <= 1e-9:
+            if current["open_qty"] <= _REPLAY_QTY_EPSILON:
+                current["open_qty"] = 0.0
                 current["strategy"] = None
                 current["stop_price"] = None
                 current["entry_reference_price"] = None
