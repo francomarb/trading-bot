@@ -3915,3 +3915,170 @@ class TestInitialRiskDollarsFollowsSubstrateFills:
             assert ird == pytest.approx(qty * rps, abs=0.01), (
                 f"invariant broken after {step}: qty={qty} ird={ird}"
             )
+
+
+class TestRiskCarrySurvivesTheDispatchSeam:
+    """PR #105 round 3 — the seam I reasoned about instead of running.
+
+    In production, `apply_order_event` UPSERTs the trade row and THEN
+    `_maybe_dispatch_substrate_entry_fill` issues a focused UPDATE on the
+    same row. Reading that function shows it touches only
+    `slippage_signed_bps` / `slippage_adverse_bps` (PR #68 round-2
+    deliberately narrowed it so it could not clobber other audit fields) —
+    but "I read it" is what the previous two rounds of this PR died on.
+    This executes the real sequence and re-checks the invariant after it.
+    """
+
+    def _seed(self, tmp_path, symbol="SMCI"):
+        from unittest.mock import MagicMock
+        from engine.trader import TradingEngine
+        from reporting.logger import TradeLogger
+        from engine.lifecycle import PositionLifecycleStore
+        from engine.lifecycle_orders import PositionLifecycleOrdersStore
+        from engine.lifecycle import new_position_uid
+
+        tl = TradeLogger(path=str(tmp_path / "trades.db"))
+        conn = tl._ensure_db()
+        pos_store = PositionLifecycleStore(conn)
+        orders_store = PositionLifecycleOrdersStore(conn)
+
+        engine = MagicMock(spec=TradingEngine)
+        engine.lifecycle_orders_store = orders_store
+        engine.lifecycle_store = pos_store
+        engine.trade_logger = tl
+        engine.alerts = MagicMock()
+        engine.risk = MagicMock()
+        engine._positions = {}
+        engine._entry_prices = {}
+        engine._has_position = lambda s: s in engine._positions
+        engine._register_single_leg = MagicMock(
+            side_effect=lambda strategy_name, symbol: engine._positions.update(
+                {symbol: object()}))
+        engine._ensure_recovered_protective_stop = MagicMock()
+        engine._lookup_position_uid_for_owner = lambda key: None
+        engine._apply_recovered_entry_side_effects = (
+            TradingEngine._apply_recovered_entry_side_effects.__get__(engine))
+        engine._log_entry = TradingEngine._log_entry.__get__(engine)
+        # THE function under test must be the real one. On a
+        # MagicMock(spec=TradingEngine) it is otherwise a stub, and calling
+        # it does nothing at all — the first version of this test called
+        # that stub and asserted on the untouched row.
+        engine._maybe_dispatch_substrate_entry_fill = (
+            TradingEngine._maybe_dispatch_substrate_entry_fill.__get__(engine))
+
+        uid = new_position_uid()
+        pos_store.create_pending(
+            position_uid=uid, symbol=symbol, owner_key=symbol,
+            strategy="donchian_breakout", position_type="single_leg",
+            entry_qty=73.0)
+        orders_store.insert_pending(
+            position_uid=uid, role="entry_primary", client_order_id="cli-1",
+            order_type="stop_limit", order_class="simple", time_in_force="day",
+            side="buy", intended_qty=73.0, intended_stop_price=33.83,
+            intended_trigger_price=39.17, intended_limit_price=40.0)
+        orders_store.attach_broker_order_id(
+            client_order_id="cli-1", order_id="alpaca-1")
+        return engine, tl, conn, symbol
+
+    def _entry_logged_at_partial(self, tl, symbol):
+        """The single accounting write, made while 54 of 73 had filled."""
+        import contextlib, io
+        from execution.broker import OrderResult, OrderStatus
+        from risk.manager import RiskDecision, Side, OrderType
+        dec = RiskDecision(
+            symbol=symbol, side=Side.BUY, qty=73, entry_reference_price=39.17,
+            stop_price=33.83, strategy_name="donchian_breakout", reason="entry",
+            order_type=OrderType.STOP_LIMIT, limit_price=40.0,
+            entry_trigger_price=39.17)
+        with contextlib.redirect_stderr(io.StringIO()):
+            tl.log(tl.build_record(dec, OrderResult(
+                status=OrderStatus.PARTIAL, order_id="alpaca-1", symbol=symbol,
+                requested_qty=73, filled_qty=54, avg_fill_price=39.46,
+                raw_status="x", message=""), modeled_price=39.46))
+
+    def _snapshot_holding(self, symbol, qty, price=39.46):
+        """A snapshot that HOLDS the position.
+
+        The dispatch returns early when the broker snapshot shows no such
+        position — with a flat snapshot it never reaches the accounting
+        UPDATE, and this whole test asserts nothing. That is how the first
+        version of it passed.
+        """
+        from execution.broker import BrokerSnapshot, AccountState, Position
+        return BrokerSnapshot(
+            account=AccountState(
+                equity=100_000.0, cash=100_000.0,
+                session_start_equity=100_000.0, previous_close_equity=None,
+                open_positions={symbol: Position(symbol, qty, price, qty * price)},
+            ),
+            open_orders=[],
+        )
+
+    def _row(self, conn):
+        return conn.execute(
+            "SELECT qty, initial_risk_per_share, initial_risk_dollars "
+            "FROM trades WHERE side='buy'").fetchone()
+
+    def _run_full_sequence(self, tmp_path, final_status, final_qty):
+        import contextlib, io
+        from types import SimpleNamespace
+        engine, tl, conn, symbol = self._seed(tmp_path)
+        self._entry_logged_at_partial(tl, symbol)
+
+        with contextlib.redirect_stderr(io.StringIO()):
+            # Step 1 — the substrate applies the later fill.
+            outcome = apply_order_event(
+                conn,
+                OrderEvent(order_id="alpaca-1", status=final_status,
+                           filled_qty=final_qty, avg_fill_price=39.46,
+                           broker_updated_at="2026-08-14T19:55:48+00:00"),
+                reason="stream")
+            assert outcome.applied is True
+
+            qty, rps, ird = self._row(conn)
+            assert ird == pytest.approx(qty * rps, abs=0.01), (
+                "invariant already broken before the dispatch ran")
+
+            # Step 2 — the dispatch's focused accounting UPDATE, same row.
+            try:
+                engine._maybe_dispatch_substrate_entry_fill(
+                    event=SimpleNamespace(
+                        order_id="alpaca-1", status=final_status,
+                        filled_qty=final_qty, avg_fill_price=39.46),
+                    snapshot=self._snapshot_holding(symbol, final_qty))
+            except Exception as exc:      # pragma: no cover - diagnostic
+                pytest.fail(f"dispatch raised: {type(exc).__name__}: {exc}")
+
+        dispatch_ran = engine._register_single_leg.call_count > 0
+        return self._row(conn), dispatch_ran
+
+    def test_invariant_survives_the_dispatch_after_a_completing_fill(
+        self, tmp_path
+    ):
+        (qty, rps, ird), dispatch_ran = self._run_full_sequence(
+            tmp_path, "filled", 73.0)
+        assert dispatch_ran, (
+            "the dispatch returned early, so this asserts nothing about the "
+            "seam — check the snapshot holds the position and that the REAL "
+            "method is bound, not the MagicMock stub"
+        )
+        assert qty == 73
+        assert ird == pytest.approx(rps * 73, abs=0.01), (
+            f"the focused accounting UPDATE disturbed the risk carry: "
+            f"qty={qty} ird={ird} expected={rps * 73:.2f}")
+
+    def test_a_cancelled_remainder_never_reaches_the_dispatch(self, tmp_path):
+        """A cancellation is not an entry fill, so the dispatch's first gate
+        (`status not in {filled, partially_filled}`) correctly rejects it.
+
+        The risk carry therefore has to be right coming out of
+        `apply_order_event` alone — there is no later writer to fix it.
+        """
+        (qty, rps, ird), dispatch_ran = self._run_full_sequence(
+            tmp_path, "canceled", 54.0)
+        assert not dispatch_ran, (
+            "a canceled event reached the entry-fill dispatch; that gate is "
+            "what stops a cancellation being booked as an entry"
+        )
+        assert qty == 54
+        assert ird == pytest.approx(rps * 54, abs=0.01)
