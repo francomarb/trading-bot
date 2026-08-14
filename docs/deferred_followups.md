@@ -1,8 +1,32 @@
-# Deferred trade follow-ups — 2026-06-12
+# Deferred trade follow-ups — incident forensics
 
-**Status:** Item 1 is active on a dedicated fix branch. Item 2 remains deferred
-while its related order-lifecycle work is in flight. Item 3 is being addressed
-by a dedicated allocator-policy PR.
+> **What this file is.** A forensics and debugging record: what was observed
+> on a given day, what was measured, what was ruled out, and why. It exists so
+> a future reader can reconstruct an incident without re-deriving it from raw
+> logs and trade rows.
+>
+> **What this file is NOT.** It is not a work queue, and it does not track
+> whether anything is done. **`PLAN.md` is the single source of truth for
+> status** — what is shipped, what is pending, what is blocked, and what the
+> acceptance is. Nothing here should be read as "current state of the work".
+>
+> This split exists because it already failed the other way: on 2026-08-14 an
+> audit found item 2 below still reading "fix branch in review" while the
+> cancel-child + standalone-GTC path had long since shipped
+> (`execution/broker.py:1839`, `:2045`). Two documents carrying the same status
+> will diverge; only one of them can be right, and it is PLAN.
+>
+> **Rules for editing.** Add narrative, evidence, measurements and ruled-out
+> hypotheses freely. Do not add status lines, branch states, or "still
+> required" checklists — those belong in the PLAN row this section links to.
+> Statements of historical fact ("merged in PR #63") are fine; statements of
+> present state ("in review") are not.
+
+| section | tracked in PLAN as |
+|---|---|
+| 1. Option trailing-stop replacement and fill timing | Live Readiness Gate — *SPY option trailing durability* |
+| 2. ALAB / ANET attached DAY stop durability | Live Readiness Gate — *Capped equity entry stop durability* |
+| 3. SPY options reversion blocked before enough paper trades | resolved 2026-08-14 by PR #104 (paper drawdown observability) |
 
 **Context:** Two operational observations were found while reviewing the
 June 12, 2026 paper-trading activity. Neither observation invalidates the
@@ -11,7 +35,9 @@ active workstreams settle.
 
 ## 1. Option trailing-stop replacement and fill timing
 
-**Status:** Quote-quality hardening merged in PR #63. The replacement path now requires a fresh,
+*Status: see the PLAN gate "SPY option trailing durability".*
+
+Quote-quality hardening merged in PR #63. The replacement path now requires a fresh,
 two-sided Alpaca option quote before increasing a stop price. The executable
 bid must support the proposed stop with a safety buffer and the spread must
 remain within a conservative quality ceiling. A failed quality check leaves
@@ -76,9 +102,14 @@ Resolution note, 2026-07-09:
   should keep the existing DAY child if cancel fails, and it should alert if the
   cancel/rebuild path cannot establish standalone GTC protection.
 
-Status: fix branch in review. Paper verification still required on the next
-capped fill: DAY child cancel event, one standalone GTC protective stop, no
-duplicate SELL exposure, substrate row TIF matches broker truth.
+*Status: see the PLAN gate "Capped equity entry stop durability". As of
+2026-08-14 the cancel-child + standalone-GTC path is shipped
+(`execution/broker.py:1839`, `:2045`); the outstanding paper confirmation is
+tracked in that PLAN row, not here.*
+
+What a paper confirmation of this fix looks like: a DAY child cancel event, one
+standalone GTC protective stop, no duplicate SELL exposure, and a substrate row
+whose TIF matches broker truth.
 
 ## 3. SPY options reversion blocked before enough paper trades
 
@@ -99,7 +130,9 @@ min-trades floor instead of fully failing open. That protected against a true
 early sleeve disaster, but for sparse paper-watch strategies it also created
 the same chicken-and-egg lockout the min-trades floor was meant to avoid.
 
-Policy update (2026-08-14): paper development defaults to observation-only at
+Policy update, shipped 2026-08-14 in PR #104 (verified in code:
+`settings.PAPER_STRATEGY_DRAWDOWN_GATE_ENABLED`,
+`SleeveAllocator.drawdown_snapshot`'s `observed_in_drawdown`). Paper development defaults to observation-only at
 every sample size, so the sleeve drawdown remains visible but never blocks new
 entries while strategies are being tuned. A mature paper strategy can opt into
 the normal post-floor gate with `PAPER_STRATEGY_DRAWDOWN_GATE_ENABLED=true`.
@@ -108,7 +141,8 @@ gate. The bot still keeps the real hard-risk layers active in both modes:
 daily/account loss controls, hard sizing, broker-side stops, max positions,
 sleeve-budget checks, entry quality guards, and exits.
 
-Acceptance:
+Acceptance that was applied when this shipped (recorded for reconstruction,
+not as outstanding work):
 
 1. In default paper mode, `SleeveAllocator.is_strategy_in_drawdown(...)`
    returns false at every trade count while retaining full observability.
@@ -124,7 +158,8 @@ Acceptance:
 
 ## Revisit criteria
 
-For any remaining work:
+Guidance for whoever picks up one of these threads. What is actually
+outstanding is defined by the linked PLAN row, not by this list:
 
 1. Start from the exact incident logs and trade rows.
 2. Check the deployed order-lifecycle phase before assuming
