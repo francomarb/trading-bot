@@ -5024,4 +5024,3 @@ class TestRiskBasisQty:
         assert "risk_basis_qty(" in entry_src
         assert "risk_basis_qty(" in rebase_src
         assert "filled_qty or result.requested_qty" not in entry_src
-
