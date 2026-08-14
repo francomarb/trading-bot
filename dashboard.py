@@ -1055,17 +1055,21 @@ def compute_sleeve_usage(
 
 
 def compute_sleeve_drawdown_state(state: dict) -> pd.DataFrame:
-    """Return observed sleeve drawdown state from the engine snapshot."""
+    """Return observable or entry-blocking sleeve drawdowns from the snapshot."""
     drawdown_state = (state.get("risk_controls") or {}).get("sleeve_dd_state") or {}
     rows = []
     for strategy_name, detail in drawdown_state.items():
-        if not isinstance(detail, dict) or not detail.get("observed_in_drawdown"):
+        if not isinstance(detail, dict) or not (
+            detail.get("observed_in_drawdown") or detail.get("in_drawdown")
+        ):
             continue
         rows.append({
             "Strategy": strategy_name,
             "Status": "Blocking" if detail.get("in_drawdown") else "Observed",
             "Drawdown": float(detail.get("drawdown_dollars", 0.0) or 0.0),
-            "Threshold": float(detail.get("observed_threshold_pct", 0.0) or 0.0),
+            "Threshold": 100.0 * float(
+                detail.get("observed_threshold_pct", 0.0) or 0.0
+            ),
             "Trades": int(detail.get("trade_count", 0) or 0),
             "Gate Armed": bool(detail.get("gate_armed")),
         })
