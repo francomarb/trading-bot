@@ -4638,6 +4638,27 @@ class TestRebaseEntryStop:
         tl.log(tl.build_record(decision, result, modeled_price=420.68))
         return decision, result
 
+    def _log_fill(self, tl, *, filled, stop, requested=33.0, fill=124.0309):
+        """Log NOW's entry at a given cumulative filled quantity.
+
+        `requested_qty` is constant — one broker order — while `filled_qty`
+        advances. Tying them together (as `_seed` does) trips the 11.51
+        identity guard, which is correct: it would look like two orders.
+        """
+        from risk.manager import RiskDecision, Side
+        decision = RiskDecision(
+            symbol="NOW", side=Side.BUY, qty=requested,
+            entry_reference_price=124.03, stop_price=stop,
+            strategy_name="donchian_breakout", reason="entry",
+        )
+        result = OrderResult(
+            status=OrderStatus.FILLED if filled >= requested else OrderStatus.PARTIAL,
+            order_id="entry-1", symbol="NOW", requested_qty=requested,
+            filled_qty=filled, avg_fill_price=fill, raw_status="x",
+            placed_stop_price=stop, stop_placement_reported=True,
+        )
+        tl.log(tl.build_record(decision, result, modeled_price=124.03))
+
     def _row(self, tl, order_id="entry-1"):
         return next(r for r in tl.read_all() if r["order_id"] == order_id)
 
@@ -4689,30 +4710,37 @@ class TestRebaseEntryStop:
                     "initial_risk_per_share", "initial_risk_dollars"):
             assert rebased[col] == pytest.approx(direct[col]), col
 
-    def test_partial_fill_sizes_risk_on_the_requested_quantity(self, tmp_csv):
-        """NOW 2026-08-10: the rebase fires on fill CONFIRMATION, not fill
-        COMPLETION. Its GTC stop went out 28ms before the entry order
-        reached filled_qty=33, so reading filled_qty gave 24 and froze
-        risk_dollars at 24 x rps while qty went on to 33.
+    def test_rebase_mid_fill_records_what_is_filled_then_the_fill_corrects_it(
+        self, tmp_csv
+    ):
+        """NOW 2026-08-10: the rebase fires on fill CONFIRMATION, not
+        COMPLETION, so it can legitimately see a partial.
 
-        `initial_risk_dollars` is preserve-first-non-null while `qty` is
-        newest-wins, so the row can never reconcile itself afterwards.
+        The first fix for this preferred `requested_qty` to jump ahead to
+        the eventual size. PR #105 review rejected that: if the remainder is
+        cancelled, the row then claims risk that was never carried. The
+        value follows the fills instead — `initial_risk_dollars` is
+        LATEST-NON-NULL, so the completing fill rewrites it.
         """
         tl = TradeLogger(path=tmp_csv)
-        self._seed(tl, order_id="entry-1", fill=124.0309, qty=33.0,
-                   stop=111.58, symbol="NOW")
-        # The in-flight state the rebase actually observed.
-        conn = tl._ensure_db()
-        conn.execute("UPDATE trades SET filled_qty=24.0 WHERE order_id='entry-1'")
-        conn.commit()
-
+        # requested stays 33 throughout — the ORDER was always for 33.
+        # Only filled moves, 24 -> 33. (`_seed` ties the two together, which
+        # trips the 11.51 identity guard, so build the results here.)
+        self._log_fill(tl, filled=24.0, stop=111.58)
         assert tl.rebase_entry_stop(order_id="entry-1", new_stop_price=110.7645)
-
         row = self._row(tl)
         rps = row["initial_risk_per_share"]
-        assert row["initial_risk_dollars"] == pytest.approx(rps * 33.0, abs=0.01)
-        assert row["initial_risk_dollars"] != pytest.approx(rps * 24.0, abs=0.01)
+        assert row["initial_risk_dollars"] == pytest.approx(rps * 24.0, abs=0.01), (
+            "mid-fill, the honest record is the 24 shares actually held"
+        )
 
+        # The completing fill arrives; the value must follow it up to 33.
+        self._log_fill(tl, filled=33.0, stop=110.7645)
+        row = self._row(tl)
+        assert row["qty"] == pytest.approx(33.0)
+        assert row["initial_risk_dollars"] == pytest.approx(
+            row["initial_risk_per_share"] * 33.0, abs=0.01
+        ), "the completing fill did not correct the recorded risk"
     def test_complete_fill_still_uses_the_filled_quantity(self, tmp_csv):
         """No behaviour change once the fill is done — requested and filled
         agree, so nothing is inferred."""
@@ -4724,20 +4752,24 @@ class TestRebaseEntryStop:
             row["qty"] * row["initial_risk_per_share"], abs=0.01)
 
     def test_recorded_risk_always_equals_qty_times_risk_per_share(self, tmp_csv):
-        """The invariant this bug violates: risk_dollars is a pure function
-        of the other two columns, so a stored value that can disagree with
-        them is the defect."""
+        """The invariant: risk_dollars is a pure function of the other two
+        columns, so a stored value that disagrees with them is the defect.
+
+        Checked after a rebase AND after a subsequent fill, because the
+        value now moves — a snapshot at one instant would not prove the
+        invariant holds across the transition.
+        """
         tl = TradeLogger(path=tmp_csv)
-        self._seed(tl, order_id="entry-1", fill=124.0309, qty=33.0,
-                   stop=111.58, symbol="NOW")
-        conn = tl._ensure_db()
-        conn.execute("UPDATE trades SET filled_qty=24.0 WHERE order_id='entry-1'")
-        conn.commit()
+        self._log_fill(tl, filled=24.0, stop=111.58)
         tl.rebase_entry_stop(order_id="entry-1", new_stop_price=110.7645)
         row = self._row(tl)
         assert row["initial_risk_dollars"] == pytest.approx(
             row["qty"] * row["initial_risk_per_share"], abs=0.01)
 
+        self._log_fill(tl, filled=33.0, stop=110.7645)
+        row = self._row(tl)
+        assert row["initial_risk_dollars"] == pytest.approx(
+            row["qty"] * row["initial_risk_per_share"], abs=0.01)
     def test_unknown_order_id_is_a_no_op(self, tmp_csv):
         tl = TradeLogger(path=tmp_csv)
         self._seed(tl)
@@ -4890,3 +4922,105 @@ class TestPositionTypeIsRequired:
         assert fields.default is dataclasses.MISSING, (
             "position_type regained a default — the 11.51 hazard is back"
         )
+
+
+class TestRiskBasisQty:
+    """PLAN 11.58(a) round 2 — the partial-fill freeze, and the
+    over-recording regression the first fix introduced.
+
+    `initial_risk_dollars` records risk that was actually CARRIED. The
+    intended size has its own column (`risk_budget_dollars`), so basing
+    this one on `requested_qty` would make 11.48's "deployed vs budget"
+    compare a number against itself.
+    """
+
+    def _decision(self):
+        from risk.manager import RiskDecision, Side, OrderType
+        return RiskDecision(
+            symbol="SMCI", side=Side.BUY, qty=73, entry_reference_price=39.17,
+            stop_price=33.83, strategy_name="donchian_breakout", reason="entry",
+            order_type=OrderType.STOP_LIMIT, limit_price=40.0,
+            entry_trigger_price=39.17,
+        )
+
+    def _result(self, status, filled):
+        from execution.broker import OrderResult
+        return OrderResult(status=status, order_id="ord-1", symbol="SMCI",
+                           requested_qty=73, filled_qty=filled,
+                           avg_fill_price=39.46, raw_status="x", message="")
+
+    def _row(self, tmp_csv, sequence):
+        import sqlite3
+        from reporting.logger import TradeLogger
+        tl = TradeLogger(path=tmp_csv)
+        for status, filled in sequence:
+            tl.log(tl.build_record(self._decision(), self._result(status, filled),
+                                   modeled_price=39.46))
+        con = sqlite3.connect(tmp_csv); con.row_factory = sqlite3.Row
+        return con.execute(
+            "SELECT qty, initial_risk_per_share rps, initial_risk_dollars ird "
+            "FROM trades"
+        ).fetchone()
+
+    def test_helper_returns_the_filled_quantity(self):
+        from reporting.logger import risk_basis_qty
+        assert risk_basis_qty(54) == 54.0
+        assert risk_basis_qty(73) == 73.0
+        assert risk_basis_qty(None) == 0.0
+
+    def test_a_partial_that_completes_records_the_full_risk(self, tmp_csv):
+        """SMCI 2026-08-14: filled 54 + 18 + 1 = 73, logged first at 54.
+        The value must follow the fills to 73."""
+        from execution.broker import OrderStatus
+        r = self._row(tmp_csv, [(OrderStatus.PARTIAL, 54), (OrderStatus.FILLED, 73)])
+        assert r["qty"] == 73
+        assert r["ird"] == pytest.approx(r["rps"] * 73)
+
+    def test_a_partial_that_is_cancelled_records_only_what_was_held(self, tmp_csv):
+        """PR #105 review, P1. The first fix preferred `requested_qty`, so a
+        54-of-73 fill whose remainder is cancelled claimed risk for 73 —
+        overstating by 35% and understating that trade's R-multiple by the
+        same amount. This is the case that exposes it."""
+        from execution.broker import OrderStatus
+        r = self._row(tmp_csv, [(OrderStatus.PARTIAL, 54), (OrderStatus.CANCELED, 54)])
+        assert r["qty"] == 54
+        assert r["ird"] == pytest.approx(r["rps"] * 54), (
+            f"recorded {r['ird']} for 54 shares actually held — that is "
+            f"{r['ird'] / r['rps']:.0f} shares of risk"
+        )
+
+    def test_multi_slice_fill_lands_on_the_final_quantity(self, tmp_csv):
+        from execution.broker import OrderStatus
+        r = self._row(tmp_csv, [(OrderStatus.PARTIAL, 54), (OrderStatus.PARTIAL, 72),
+                                (OrderStatus.FILLED, 73)])
+        assert r["ird"] == pytest.approx(r["rps"] * 73)
+
+    def test_a_clean_full_fill_is_unaffected(self, tmp_csv):
+        from execution.broker import OrderStatus
+        r = self._row(tmp_csv, [(OrderStatus.FILLED, 73)])
+        assert r["ird"] == pytest.approx(r["rps"] * 73)
+
+    def test_nothing_filled_records_null_not_zero(self, tmp_csv):
+        """A stored 0.0 survives IS NOT NULL guards and reads as a real
+        measurement — the failure mode PLAN 11.58(b) tracks."""
+        from execution.broker import OrderStatus
+        r = self._row(tmp_csv, [(OrderStatus.ACCEPTED, 0)])
+        assert r["ird"] is None
+
+    def test_the_value_must_follow_fills_not_be_pinned(self):
+        """The freeze is fixed by the upsert policy, not by guessing the
+        eventual size. If this column were preserve-first-non-null again,
+        the first partial would stick forever."""
+        from reporting.logger import TradeLogger as T
+        assert "initial_risk_dollars" in T._UPSERT_LATEST_NON_NULL_COLUMNS
+        assert "initial_risk_dollars" not in T._UPSERT_COALESCE_COLUMNS
+
+    def test_both_writers_use_the_same_basis(self):
+        """The original defect was two call sites with contradictory rules."""
+        import inspect
+        from reporting import logger as L
+        entry_src = inspect.getsource(L.TradeLogger.build_record)
+        rebase_src = inspect.getsource(L.TradeLogger.rebase_entry_stop)
+        assert "risk_basis_qty(" in entry_src
+        assert "risk_basis_qty(" in rebase_src
+        assert "filled_qty or result.requested_qty" not in entry_src
