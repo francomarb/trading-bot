@@ -4890,3 +4890,101 @@ class TestPositionTypeIsRequired:
         assert fields.default is dataclasses.MISSING, (
             "position_type regained a default — the 11.51 hazard is back"
         )
+
+
+class TestRiskBasisQty:
+    """PLAN 11.58(a) round 2 — the partial-fill freeze.
+
+    An entry is logged on fill CONFIRMATION, not COMPLETION, so
+    `filled_qty` at that moment can be a partial. Recording risk against it
+    understates the risk actually carried, and the row cannot heal itself:
+    `initial_risk_dollars` is preserve-first-non-null while `qty` is
+    newest-wins.
+    """
+
+    def test_prefers_requested_while_the_fill_is_in_flight(self):
+        """SMCI 2026-08-14: filled 54 + 18 + 1 = 73. Logged at 54."""
+        from reporting.logger import risk_basis_qty
+        assert risk_basis_qty(54, 73) == 73.0
+
+    def test_uses_filled_once_the_fill_is_complete(self):
+        from reporting.logger import risk_basis_qty
+        assert risk_basis_qty(73, 73) == 73.0
+
+    def test_an_overfill_is_not_capped_to_requested(self):
+        """Recording less risk than was actually taken is the unsafe
+        direction, so the larger value wins."""
+        from reporting.logger import risk_basis_qty
+        assert risk_basis_qty(74, 73) == 74.0
+
+    def test_missing_requested_falls_back_to_filled(self):
+        from reporting.logger import risk_basis_qty
+        assert risk_basis_qty(54, None) == 54.0
+
+    def test_nothing_usable_is_zero_not_an_error(self):
+        from reporting.logger import risk_basis_qty
+        assert risk_basis_qty(None, None) == 0.0
+
+    def test_both_writers_agree_on_every_combination(self):
+        """The defect was two call sites with contradictory rules —
+        build_entry_record preferred `filled`, rebase_entry_stop preferred
+        `requested`. A single helper is only a fix if both actually use it,
+        so this pins the property rather than the implementation."""
+        import inspect
+        from reporting import logger as L
+        entry_src = inspect.getsource(L.TradeLogger.build_record)
+        rebase_src = inspect.getsource(L.TradeLogger.rebase_entry_stop)
+        assert "risk_basis_qty(" in entry_src, (
+            "build_record no longer routes through risk_basis_qty — "
+            "the two writers can drift again"
+        )
+        assert "risk_basis_qty(" in rebase_src, (
+            "rebase_entry_stop no longer routes through risk_basis_qty"
+        )
+        assert "filled_qty or result.requested_qty" not in entry_src, (
+            "the old filled-first expression is back"
+        )
+
+    def test_a_partial_fill_records_the_full_requested_risk(
+        self, tmp_csv, sample_decision
+    ):
+        """End-to-end reproduction of the SMCI 2026-08-14 row.
+
+        The entry is logged while the order is still filling. Recording risk
+        on the partial understates what the position actually carries, and
+        the row can never correct itself afterwards.
+        """
+        from reporting.logger import TradeLogger
+        from execution.broker import OrderResult, OrderStatus
+
+        partial = OrderResult(
+            status=OrderStatus.PARTIAL,
+            order_id="smci-1",
+            symbol="AAPL",
+            requested_qty=73,
+            filled_qty=54,          # only the first slice has landed
+            avg_fill_price=39.46,
+            raw_status="partially_filled",
+            message="partial 54 of 73",
+        )
+        tl = TradeLogger(path=tmp_csv)
+        rec = tl.build_record(sample_decision, partial, modeled_price=39.46)
+
+        rps = rec.initial_risk_per_share
+        assert rps is not None and rps > 0
+        assert rec.initial_risk_dollars == pytest.approx(rps * 73), (
+            f"risk recorded as {rec.initial_risk_dollars} — that is "
+            f"{rec.initial_risk_dollars / rps:.0f} shares, the partial fill, "
+            f"not the 73 the risk budget was sized against"
+        )
+
+    def test_a_complete_fill_is_unaffected(self, tmp_csv, sample_decision, sample_result):
+        """Guards the test above from passing on a logger that had simply
+        started using requested_qty everywhere."""
+        from reporting.logger import TradeLogger
+        tl = TradeLogger(path=tmp_csv)
+        rec = tl.build_record(sample_decision, sample_result, modeled_price=150.0)
+        if rec.initial_risk_per_share:
+            assert rec.initial_risk_dollars == pytest.approx(
+                rec.initial_risk_per_share * 10
+            )

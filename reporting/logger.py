@@ -142,6 +142,42 @@ from utils.option_symbols import owner_key_for
 _OCC_OPTION_SYMBOL = re.compile(r"^[A-Z]{1,6}[0-9]{6}[CP][0-9]{8}$")
 
 
+def risk_basis_qty(
+    filled_qty: "float | int | None",
+    requested_qty: "float | int | None",
+) -> float:
+    """Quantity the recorded entry risk should be sized on.
+
+    **One definition, two call sites.** `build_entry_record` writes
+    `initial_risk_dollars` when the entry is first logged;
+    `TradeLogger.rebase_entry_stop` rewrites it when the protective stop is
+    re-anchored. Before 2026-08-14 those disagreed — the first preferred
+    `filled_qty`, the second preferred `requested_qty` — and the row that
+    exposed it (SMCI, 2026-08-14) never passed through the rebase path at
+    all, so the freeze survived.
+
+    The rule is: **prefer `requested_qty` while the fill is still in
+    flight.** An entry is logged on fill CONFIRMATION, not COMPLETION, so
+    `filled_qty` at that instant can be a partial. SMCI filled 54 + 18 + 1
+    = 73 shares; the entry logged at 54 and froze risk at `54 x rps`
+    ($304.02) while `qty` went on to 73 ($410.99 of real risk) — a 26%
+    understatement of the risk actually carried. The row cannot heal
+    itself: `initial_risk_dollars` is preserve-first-non-null while `qty`
+    is newest-wins.
+
+    `requested_qty` is the size the risk budget was computed against, so it
+    is the honest basis for "how much was I risking here". A
+    partially-filled-then-cancelled order overstates — the safe direction,
+    visible from `qty` in the same row, and rare.
+
+    Returns 0.0 when neither is usable; callers treat that as "no risk
+    recordable".
+    """
+    filled = float(filled_qty or 0.0)
+    requested = float(requested_qty or 0.0)
+    return requested if requested > filled else filled
+
+
 def _contract_multiplier(symbol: str) -> int:
     """Return the contract multiplier for equities vs OCC option symbols."""
     return 100 if _OCC_OPTION_SYMBOL.match(symbol or "") else 1
@@ -1012,7 +1048,9 @@ class TradeLogger:
             None
             if initial_risk_per_share is None
             else initial_risk_per_share
-            * float(result.filled_qty or result.requested_qty or 0)
+            # NOT `filled_qty or requested_qty` — on a partial fill that
+            # freezes the recorded risk at the partial. See risk_basis_qty.
+            * risk_basis_qty(result.filled_qty, result.requested_qty)
             * multiplier
         )
         timestamp_dt = timestamp_override or datetime.now(timezone.utc)
@@ -2508,7 +2546,7 @@ class TradeLogger:
         # direction, visible from qty in the same row, and rare.
         filled = float(row["filled_qty"] or 0.0)
         requested = float(row["requested_qty"] or 0.0)
-        qty = requested if requested > filled else filled
+        qty = risk_basis_qty(filled, requested)
         if qty != filled and filled > 0:
             logger.info(
                 f"rebase_entry_stop: order {order_id} still filling "
