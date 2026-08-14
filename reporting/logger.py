@@ -142,40 +142,35 @@ from utils.option_symbols import owner_key_for
 _OCC_OPTION_SYMBOL = re.compile(r"^[A-Z]{1,6}[0-9]{6}[CP][0-9]{8}$")
 
 
-def risk_basis_qty(
-    filled_qty: "float | int | None",
-    requested_qty: "float | int | None",
-) -> float:
-    """Quantity the recorded entry risk should be sized on.
+def risk_basis_qty(filled_qty: "float | int | None") -> float:
+    """Quantity actually **held** — the cumulative filled amount.
 
-    **One definition, two call sites.** `build_entry_record` writes
-    `initial_risk_dollars` when the entry is first logged;
-    `TradeLogger.rebase_entry_stop` rewrites it when the protective stop is
-    re-anchored. Before 2026-08-14 those disagreed — the first preferred
-    `filled_qty`, the second preferred `requested_qty` — and the row that
-    exposed it (SMCI, 2026-08-14) never passed through the rebase path at
-    all, so the freeze survived.
+    `initial_risk_dollars` records risk that was really carried, so its
+    quantity basis is what filled, never what was requested. The intended
+    size already has its own column, `risk_budget_dollars`; conflating the
+    two makes "deployed risk vs budget" (PLAN 11.48) compare a number
+    against itself.
 
-    The rule is: **prefer `requested_qty` while the fill is still in
-    flight.** An entry is logged on fill CONFIRMATION, not COMPLETION, so
-    `filled_qty` at that instant can be a partial. SMCI filled 54 + 18 + 1
-    = 73 shares; the entry logged at 54 and froze risk at `54 x rps`
-    ($304.02) while `qty` went on to 73 ($410.99 of real risk) — a 26%
-    understatement of the risk actually carried. The row cannot heal
-    itself: `initial_risk_dollars` is preserve-first-non-null while `qty`
-    is newest-wins.
+    **Why not `requested_qty`.** The first version of this fix preferred
+    requested whenever the fill was in flight, to stop the SMCI 2026-08-14
+    freeze (logged at a 54-share partial, `qty` went on to 73). That traded
+    under-recording for over-recording: if 54 of 73 fill and the remainder
+    is cancelled, only 54 were ever held, but the row would permanently
+    claim risk for 73 — overstating risk by 35% and understating every
+    R-multiple on that trade by the same amount. Reviewed and rejected on
+    PR #105.
 
-    `requested_qty` is the size the risk budget was computed against, so it
-    is the honest basis for "how much was I risking here". A
-    partially-filled-then-cancelled order overstates — the safe direction,
-    visible from `qty` in the same row, and rare.
+    The freeze is fixed instead by letting the value **follow the fills**:
+    `initial_risk_dollars` is LATEST-NON-NULL in the upsert, so each
+    successive fill event rewrites it, and the last write — whether that is
+    the completing fill or a cancellation — is the one that stands. Correct
+    at every point, without predicting the outcome.
 
-    Returns 0.0 when neither is usable; callers treat that as "no risk
-    recordable".
+    Returns 0.0 when nothing has filled; callers record NULL rather than a
+    zero, since a zero risk is indistinguishable from a missing measurement
+    once stored (the failure mode PLAN 11.58(b) tracks).
     """
-    filled = float(filled_qty or 0.0)
-    requested = float(requested_qty or 0.0)
-    return requested if requested > filled else filled
+    return float(filled_qty or 0.0)
 
 
 def _contract_multiplier(symbol: str) -> int:
@@ -1048,11 +1043,14 @@ class TradeLogger:
             None
             if initial_risk_per_share is None
             else initial_risk_per_share
-            # NOT `filled_qty or requested_qty` — on a partial fill that
-            # freezes the recorded risk at the partial. See risk_basis_qty.
-            * risk_basis_qty(result.filled_qty, result.requested_qty)
+            * risk_basis_qty(result.filled_qty)
             * multiplier
         )
+        # A zero basis means nothing filled, so no risk was carried. Record
+        # NULL, not 0.0 — a zero stored in a REAL column survives IS NOT NULL
+        # guards and reads as a real measurement (PLAN 11.58(b)).
+        if initial_risk_dollars is not None and initial_risk_dollars <= 0:
+            initial_risk_dollars = None
         timestamp_dt = timestamp_override or datetime.now(timezone.utc)
         now_iso = timestamp_dt.astimezone(timezone.utc).isoformat()
         if new_benchmark_price is not None:
@@ -1321,6 +1319,8 @@ class TradeLogger:
     # split off the LATEST-NON-NULL bucket for accounting fields
     # that were still being silently zeroed under the generic
     # excluded.<col> policy.
+    # NOTE: `initial_risk_dollars` is deliberately NOT here — see
+    # _UPSERT_LATEST_NON_NULL_COLUMNS. It must follow the fills.
     _UPSERT_COALESCE_COLUMNS = frozenset({
         # Slippage unification provenance (Phase 1 taxonomy).
         "slippage_benchmark_price",
@@ -1337,7 +1337,6 @@ class TradeLogger:
         # would otherwise NULL them out.
         "initial_stop_loss",
         "initial_risk_per_share",
-        "initial_risk_dollars",
         # PLAN 11.54 — set once at entry from the sizing decision; a
         # later exit log() has no decision and would NULL it out.
         "risk_budget_dollars",
@@ -1399,7 +1398,11 @@ class TradeLogger:
         "realized_slippage_bps",
         "slippage_signed_bps",
         "slippage_adverse_bps",
-    })
+            # Must follow the fills: a partial-fill entry is rewritten by
+        # each later fill event, and the final write (completing fill OR
+        # cancellation) is the one that stands. PR #105 review.
+        "initial_risk_dollars",
+})
 
     def log(self, record: TradeRecord) -> None:
         """Write one trade record. Single-leg rows UPSERT on order_id
@@ -2530,29 +2533,14 @@ class TradeLogger:
             )
             return False
         risk_per_share = abs(float(fill) - float(new_stop_price))
-        # Quantity basis: prefer requested when the fill is still in flight.
-        #
-        # This runs from the post-fill stop rebuild, which fires on fill
-        # CONFIRMATION — not on fill COMPLETION. NOW 2026-08-10 placed its
-        # GTC stop at 13:50:54.030 while the entry order only reached
-        # filled_qty=33 at 13:50:54.058, 28ms later. Reading filled_qty
-        # there gave 24, so risk_dollars was frozen at 24 x rps while qty
-        # went on to 33. `initial_risk_dollars` is preserve-first-non-null
-        # and `qty` is newest-wins, so the row can never reconcile itself.
-        #
-        # requested_qty is the size the risk budget was computed against,
-        # so it is the right basis for "how much was I risking here". A
-        # partially-filled-then-cancelled order would overstate — the safe
-        # direction, visible from qty in the same row, and rare.
-        filled = float(row["filled_qty"] or 0.0)
-        requested = float(row["requested_qty"] or 0.0)
-        qty = risk_basis_qty(filled, requested)
-        if qty != filled and filled > 0:
-            logger.info(
-                f"rebase_entry_stop: order {order_id} still filling "
-                f"({filled:g} of {requested:g}) — sizing the recorded risk on "
-                "the requested quantity so it cannot freeze mid-fill"
-            )
+        # Quantity basis is the ACTUAL filled amount. This runs on fill
+        # CONFIRMATION, not COMPLETION, so it can see a partial — that is
+        # fine and deliberate: `initial_risk_dollars` is LATEST-NON-NULL in
+        # the upsert, so the next fill event rewrites it and the final write
+        # stands. Guessing the eventual size from `requested_qty` instead
+        # would overstate risk whenever the remainder is cancelled (PR #105
+        # review).
+        qty = risk_basis_qty(row["filled_qty"])
         risk_dollars = risk_per_share * qty * _contract_multiplier(row["symbol"])
         conn.execute(
             "UPDATE trades SET stop_price = ?, initial_stop_loss = ?, "
