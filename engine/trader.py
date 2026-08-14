@@ -615,6 +615,12 @@ class TradingEngine:
         # position_id → SpreadExecutionPlan for spreads pending their async
         # combo fill — lets _drain_spread_fills finalize or roll back.
         self._pending_spread_plans: dict[str, object] = {}
+        # Typed MLEG close reason (one of settings.MLEG_CLOSE_REASONS),
+        # kept from close dispatch until the fill drains. Without it every
+        # spread exit logs the generic "spread exit", which is why PLAN
+        # 11.34's acceptance ("exit reasons reviewed") could not be met on
+        # 13 completed cycles — there was nothing to review.
+        self._pending_spread_close_reasons: dict[str, str] = {}
         # (§10.7 C4) `_spreads_pending_close` retired — the substrate's
         # uniq_one_active_close_per_position partial unique index on
         # `position_lifecycle_orders` is the durable, restart-safe
@@ -9903,7 +9909,12 @@ class TradingEngine:
                                 order_id=order_id,
                                 opening=False,
                                 realized_pnl=partial_pnl,
-                                reason="spread exit (partial)",
+                                reason=(
+                                    f"{self._pending_spread_close_reasons.get(position_id)} "
+                                    "(partial)"
+                                    if self._pending_spread_close_reasons.get(position_id)
+                                    else "spread exit (partial)"
+                                ),
                                 is_full_close=False,
                             )
                         except Exception as exc:
@@ -9950,7 +9961,13 @@ class TradingEngine:
                 # winner and inflate the allocator's HWM / drawdown gate. In
                 # that case leave realized P&L unset (not zero) and warn.
                 realized_pnl: float | None = None
-                exit_reason = "spread exit"
+                # Pop, don't peek: the position is terminal here either way,
+                # so leaving the entry behind would leak and could mislabel a
+                # later close on a recycled position_id.
+                typed_reason = self._pending_spread_close_reasons.pop(
+                    position_id, None
+                )
+                exit_reason = typed_reason or "spread exit"
                 # PR #56 R1+R2+R4: determine full/partial close status ONCE,
                 # outside both the price-availability branches AND the
                 # allocator/log paths, so a single value drives the trade-log
@@ -9964,7 +9981,10 @@ class TradingEngine:
                 )
                 if avg_fill_price is None:
                     net_debit = 0.0
-                    exit_reason = "spread exit (fill price unavailable)"
+                    exit_reason = (
+                        f"{typed_reason} (fill price unavailable)"
+                        if typed_reason else "spread exit (fill price unavailable)"
+                    )
                     logger.warning(
                         f"[{strategy_name}] credit spread CLOSED but the combo "
                         f"fill price was unavailable — position_id="
@@ -10345,6 +10365,10 @@ class TradingEngine:
             _close_underlying = underlying
             _close_position_id = position_id
             _close_reason = decision_reason
+            # Carry the typed reason to the drain, which is where the trade
+            # row is written. Keyed by position_id and popped there.
+            if decision_reason:
+                self._pending_spread_close_reasons[position_id] = decision_reason
             _alerts = self.alerts
             def _on_walk_step(
                 *,

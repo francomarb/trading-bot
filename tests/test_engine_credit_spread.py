@@ -14,6 +14,7 @@ from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
 import pandas as pd
+import pathlib
 import pytest
 
 from engine.trader import EngineConfig, TradingEngine
@@ -2617,3 +2618,66 @@ class TestSpreadCloseReconciler:
             position_id="p2", role="exit",
             client_order_id="restart-attempt-cloid", qty=1.0,
         ) is False
+
+
+class TestSpreadExitReasonGranularity:
+    """PLAN 11.34 — its acceptance is "exit reasons ... reviewed", but all
+    13 completed credit-spread cycles carried the single reason
+    `spread exit`. There was nothing to review: the typed close reason
+    (`stop_loss` / `profit_target` / `time_stop` / `defensive_breach`) was
+    computed at dispatch and dropped before the trade row was written.
+
+    These assert the WIRING between the two sites. Exercising the dict
+    itself would be tautological — it was a dict before the fix too.
+    """
+
+    def test_the_drain_reads_the_typed_reason(self):
+        import inspect
+        from engine.trader import TradingEngine
+        src = inspect.getsource(TradingEngine._drain_spread_fills)
+        assert "_pending_spread_close_reasons.pop(" in src, (
+            "the drain no longer reads the typed reason — every spread exit "
+            "will log the generic string again"
+        )
+        assert 'exit_reason = "spread exit"' not in src, (
+            "the drain still hardcodes the generic reason unconditionally"
+        )
+
+    def test_something_records_the_reason_at_close_dispatch(self):
+        """A reader with no writer silently degrades to the fallback."""
+        src = pathlib.Path("engine/trader.py").read_text()
+        assert "_pending_spread_close_reasons[position_id] = decision_reason" in src, (
+            "no code path records the typed reason at close dispatch"
+        )
+
+    def test_the_reason_is_popped_so_it_cannot_leak(self):
+        """Peeking would leave the entry behind and could mislabel a later
+        close on a recycled position_id."""
+        import inspect
+        from engine.trader import TradingEngine
+        src = inspect.getsource(TradingEngine._drain_spread_fills)
+        assert "_pending_spread_close_reasons.pop(" in src
+        assert "_pending_spread_close_reasons.get(position_id)" in src, (
+            "the partial-close branch should PEEK (position not terminal) "
+            "while the full-close branch POPs"
+        )
+
+    def test_the_fallback_survives_an_unrecorded_close(self):
+        """A close dispatched before this shipped, or by a path that does
+        not record, must still write a usable reason rather than None."""
+        import inspect
+        from engine.trader import TradingEngine
+        src = inspect.getsource(TradingEngine._drain_spread_fills)
+        assert 'or "spread exit"' in src, (
+            "no fallback — an unrecorded close would write None"
+        )
+
+    def test_every_configured_close_reason_is_a_legal_value(self):
+        """The reasons written here must be the same vocabulary the close
+        profiles are keyed on, or the paper-watch cannot group by them."""
+        from config import settings
+        assert settings.MLEG_CLOSE_REASONS == {
+            "profit_target", "stop_loss", "time_stop", "defensive_breach",
+        }
+
+
