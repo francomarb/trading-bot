@@ -1054,6 +1054,28 @@ def compute_sleeve_usage(
     return pd.DataFrame(rows)
 
 
+def compute_sleeve_drawdown_state(state: dict) -> pd.DataFrame:
+    """Return observable or entry-blocking sleeve drawdowns from the snapshot."""
+    drawdown_state = (state.get("risk_controls") or {}).get("sleeve_dd_state") or {}
+    rows = []
+    for strategy_name, detail in drawdown_state.items():
+        if not isinstance(detail, dict) or not (
+            detail.get("observed_in_drawdown") or detail.get("in_drawdown")
+        ):
+            continue
+        rows.append({
+            "Strategy": strategy_name,
+            "Status": "Blocking" if detail.get("in_drawdown") else "Observed",
+            "Drawdown": float(detail.get("drawdown_dollars", 0.0) or 0.0),
+            "Threshold": 100.0 * float(
+                detail.get("observed_threshold_pct", 0.0) or 0.0
+            ),
+            "Trades": int(detail.get("trade_count", 0) or 0),
+            "Gate Armed": bool(detail.get("gate_armed")),
+        })
+    return pd.DataFrame(rows)
+
+
 # ── Dashboard layout ─────────────────────────────────────────────────────────
 
 
@@ -1856,6 +1878,23 @@ def render_dashboard() -> None:
             st.caption(
                 "Uses allocator snapshot data when available, including stretched "
                 "budget and pending-order-aware usage."
+            )
+
+        drawdown_df = compute_sleeve_drawdown_state(state)
+        if not drawdown_df.empty:
+            render_section_header(
+                "Observed Sleeve Drawdown",
+                "Normal HWM-threshold breaches are shown even when paper mode does not block entries.",
+                kicker="Paper Watch",
+            )
+            st.dataframe(
+                drawdown_df,
+                width="stretch",
+                hide_index=True,
+                column_config={
+                    "Drawdown": st.column_config.NumberColumn(format="$%.2f"),
+                    "Threshold": st.column_config.NumberColumn(format="%.1f%%"),
+                },
             )
 
         pool_df = pd.DataFrame.from_dict(

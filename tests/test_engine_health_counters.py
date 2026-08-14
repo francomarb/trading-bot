@@ -558,6 +558,8 @@ class TestAllocatorDrawdownSnapshot:
         snap = alloc.drawdown_snapshot(equity=100_000.0)
         assert "x" in snap
         assert "in_drawdown" in snap["x"]
+        assert "observed_in_drawdown" in snap["x"]
+        assert "observed_threshold_pct" in snap["x"]
         assert snap["x"]["running_pnl"] == 0.0
         assert snap["x"]["hwm_pnl"] == 0.0
         assert snap["x"]["drawdown_dollars"] == 0.0
@@ -572,6 +574,8 @@ class TestAllocatorDrawdownSnapshot:
         assert snap["x"]["running_pnl"] == 2_000.0
         assert snap["x"]["hwm_pnl"] == 5_000.0
         assert snap["x"]["drawdown_dollars"] == 3_000.0
+        assert snap["x"]["observed_threshold_pct"] == 0.20
+        assert snap["x"]["observed_in_drawdown"] is False
 
 
 # ── Counter dict reset at cycle boundary ──────────────────────────────

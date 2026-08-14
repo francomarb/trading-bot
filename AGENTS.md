@@ -145,6 +145,12 @@ sensitive values.
   Keep code simple, efficient, and easy to reason about; avoid "just patch over
   it" changes that make the codebase feel like a chain of special cases.
 - If a code change completes, advances, or materially reframes a planned item already tracked in `PLAN.md`, update the relevant `PLAN.md` entry in the same workstream and include that plan sync in the same commit. Do not leave code and plan status out of sync for tracked roadmap items.
+- Before committing code changes or submitting a PR, scan `docs/` for documents
+  pertinent to the changed behavior, contract, configuration, operational
+  policy, or user-facing reporting. Update every affected document in the
+  same workstream, and explicitly verify that no relevant documentation was
+  left stale. This is required even for small fixes; documentation review is
+  part of change completion, not a follow-up.
 
 ---
 

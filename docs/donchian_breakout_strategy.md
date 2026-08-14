@@ -41,7 +41,7 @@ low exit only triggers when the trend genuinely fails.
 | Sleeve weight | 0.25 of gross capital |
 | Max positions | 5 concurrent |
 | ATR stop | 2× ATR (engine's `ATR_STOP_MULTIPLIER`) |
-| HWM drawdown gate | Entries pause if cumulative realized P&L drops >15% of sleeve budget below peak |
+| HWM drawdown gate | Live (and opt-in mature paper): entries pause if cumulative realized P&L drops >15% of sleeve budget below peak; default paper reports the breach without pausing |
 | Universe | `DONCHIAN_WATCHLIST` — 32 names (see below) |
 
 **Capital math at $100k equity:**
@@ -158,8 +158,9 @@ Thematically adjacent to AI capex — high correlation with the core AI names.
 | QBTS | D-Wave Quantum | Quantum annealing; same early-stage bet as RGTI |
 
 > ⚠️ **Note on Category 6:** These names are highly correlated with the AI core
-> (Category 1) and tend to move together during sector-wide sell-offs. The HWM
-> drawdown gate and max-positions cap are the primary mitigations.
+> (Category 1) and tend to move together during sector-wide sell-offs. In live
+> operation, the HWM drawdown gate and max-positions cap are the primary
+> mitigations; default paper mode reports HWM drawdown without pausing entries.
 > RGTI and QBTS have <4y bar history (SPAC mergers in late 2021/2022) — the
 > backtest runs on available bars.
 
@@ -319,8 +320,9 @@ Donchian is the highest-Sharpe strategy in the codebase by a 2.6× margin over S
 the per-symbol averaged MeanDD overstates portfolio-level drawdown:
 - In production the engine runs one $100k pool, gross exposure capped at 80%
 - With 0.25 sleeve, the maximum Donchian contribution to portfolio DD ≈ 0.25 × 35% = −8.7%
-- The HWM drawdown gate adds a further backstop: if cumulative realized P&L drops
-  >15% of the $20k sleeve budget ($3k) below its peak, new entries pause automatically
+- In live mode, the HWM drawdown gate adds a further backstop: if cumulative realized
+  P&L drops >15% of the $20k sleeve budget ($3k) below its peak, new entries pause
+  automatically. Default paper mode reports this condition without pausing entries.
 - The TRENDING-only regime gate prevents new entries entirely during market downturns
 
 ---
@@ -332,7 +334,7 @@ Eight independent layers are active when Donchian runs in production:
 | Layer | Mechanism | Scope |
 |---|---|---|
 | Regime gate | `allowed_regimes={TRENDING}` — blocks entries in BEAR, VOLATILE, RANGING | No new entries |
-| HWM drawdown gate | Pause entries if cumulative realized P&L > 15% below sleeve peak | No new entries per strategy |
+| HWM drawdown gate | Live / opt-in mature paper: pause entries if cumulative realized P&L >15% below sleeve peak; default paper observes only | No new entries when armed |
 | ATR stop | 2× ATR below the **signal-bar close** — see caveat below | Per-trade loss cap |
 | Per-position risk target | `risk_per_trade_pct=0.40%` of equity at risk per trade (11.48), beneath the `MAX_POSITION_PCT=2%` global ceiling | Per-trade sizing |
 | Sleeve max positions | 8 concurrent Donchian positions maximum (`hard_max_positions`) | Concentration cap |

@@ -17,6 +17,7 @@ from dashboard import (
     filter_realized_curve_window,
     load_broker_account_curve,
     compute_rolling_sharpe,
+    compute_sleeve_drawdown_state,
     compute_sleeve_usage,
     compute_strategy_stats,
     format_local_timestamp,
@@ -1136,6 +1137,53 @@ class TestComputeSleeveUsage:
         assert pytest.approx(sma["Utilization"]) == 1250.0 / 40_000.0
         assert sma["Open Positions"] == 1
         assert pytest.approx(rsi["Used Notional"]) == 900.0
+
+
+class TestComputeSleeveDrawdownState:
+    def test_returns_observed_and_blocking_threshold_breaches(self):
+        state = {
+            "risk_controls": {
+                "sleeve_dd_state": {
+                    "donchian_breakout": {
+                        "observed_in_drawdown": True,
+                        "in_drawdown": False,
+                        "drawdown_dollars": 3_250.0,
+                        "observed_threshold_pct": 0.15,
+                        "trade_count": 6,
+                        "gate_armed": False,
+                    },
+                    "sma_crossover": {
+                        "observed_in_drawdown": False,
+                        "in_drawdown": True,
+                        "drawdown_dollars": 1_600.0,
+                        "observed_threshold_pct": 0.50,
+                        "trade_count": 1,
+                        "gate_armed": True,
+                    },
+                },
+            },
+        }
+
+        result = compute_sleeve_drawdown_state(state)
+
+        assert result.to_dict("records") == [
+            {
+                "Strategy": "donchian_breakout",
+                "Status": "Observed",
+                "Drawdown": 3_250.0,
+                "Threshold": 15.0,
+                "Trades": 6,
+                "Gate Armed": False,
+            },
+            {
+                "Strategy": "sma_crossover",
+                "Status": "Blocking",
+                "Drawdown": 1_600.0,
+                "Threshold": 50.0,
+                "Trades": 1,
+                "Gate Armed": True,
+            },
+        ]
 
 
 class TestFormatDeltaCurrency:

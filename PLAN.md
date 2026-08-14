@@ -140,7 +140,7 @@ These are the items that must be green before any live flip.
 | Broker execution | Alpaca wrapper, market/limit/OTO/fractional paths, option worker, MLEG worker, stream-first fills |
 | Engine | Restart-safe cycle, startup reconciliation, external-close detection, state snapshot, per-strategy slots |
 | Reporting | SQLite trade log, PnL summaries, alerts, dashboard (now with monthly health report tabs), Strategy Health & Edge reports |
-| Allocator | 85/15 pool model, per-strategy sleeves, stretch borrowing for equity only, HWM drawdown gate |
+| Allocator | 85/15 pool model, per-strategy sleeves, stretch borrowing for equity only, HWM drawdown gate (paper observation-only by default; live protected) |
 | Regime and sector context | BEAR/VOLATILE/TRENDING/RANGING detector with ATR% floor; sector resolver/gauge and strategy-specific policies |
 | Active strategy set | SMA, RSI, Donchian, SPY Options, Credit Spread SPY/QQQ |
 | Position abstraction | Single-leg and spread `Position` model with UUID spread ownership and exact-OCC conflict guard |
