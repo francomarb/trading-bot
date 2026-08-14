@@ -115,6 +115,8 @@ Acceptance:
 2. `drawdown_snapshot(...)` still reports running P&L, HWM, drawdown dollars,
    trade count, floor, and both states: `in_drawdown` for entry blocking and
    `observed_in_drawdown` against the normal threshold for paper-watch evidence.
+   Observed breaches are surfaced in the dashboard and `scripts/operator.py
+   status`, not only in the raw engine snapshot.
 3. Explicitly enabling the paper gate resumes the normal HWM threshold at the
    configured floor.
 4. In live mode, the catastrophic below-floor threshold and normal post-floor

@@ -410,6 +410,7 @@ class TestStatusSurfacesPauseState:
         assert rc == 0
         assert "entries paused:     no" in out
         assert "paused strategies:  (none)" in out
+        assert "sleeve drawdowns:   (none observed)" in out
 
     def test_status_shows_pause_state(self, db_paths):
         import json as _json
@@ -433,6 +434,33 @@ class TestStatusSurfacesPauseState:
         assert "entries paused:     YES" in out
         assert "market event" in out
         assert "donchian_breakout" in out
+
+    def test_status_shows_observed_sleeve_drawdown(self, db_paths):
+        import json as _json
+        db_path, state_path = db_paths
+        with open(state_path, "w") as fh:
+            _json.dump({
+                "risk_controls": {
+                    "is_halted": False,
+                    "sleeve_dd_state": {
+                        "donchian_breakout": {
+                            "observed_in_drawdown": True,
+                            "in_drawdown": False,
+                            "drawdown_dollars": 3_250.0,
+                            "observed_threshold_pct": 0.15,
+                        },
+                    },
+                },
+            }, fh)
+        rc, out, _ = _run([
+            "--db", db_path, "--state-path", state_path,
+            "status",
+        ])
+        assert rc == 0
+        assert "sleeve drawdowns:   1 observed" in out
+        assert "donchian_breakout: observational" in out
+        assert "drawdown=$3,250.00" in out
+        assert "threshold=15.0%" in out
 
 
 class TestPhaseCDestructiveControls:

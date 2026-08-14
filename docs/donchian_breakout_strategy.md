@@ -158,8 +158,9 @@ Thematically adjacent to AI capex — high correlation with the core AI names.
 | QBTS | D-Wave Quantum | Quantum annealing; same early-stage bet as RGTI |
 
 > ⚠️ **Note on Category 6:** These names are highly correlated with the AI core
-> (Category 1) and tend to move together during sector-wide sell-offs. The HWM
-> drawdown gate and max-positions cap are the primary mitigations.
+> (Category 1) and tend to move together during sector-wide sell-offs. In live
+> operation, the HWM drawdown gate and max-positions cap are the primary
+> mitigations; default paper mode reports HWM drawdown without pausing entries.
 > RGTI and QBTS have <4y bar history (SPAC mergers in late 2021/2022) — the
 > backtest runs on available bars.
 

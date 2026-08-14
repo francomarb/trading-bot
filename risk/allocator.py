@@ -417,6 +417,8 @@ class SleeveAllocator:
         applies at or above it.
         """
         from config import settings as _s
+        if self._dd_threshold == 0.0 or strategy_name not in self._entries:
+            return 0.0
         if not _s.LIVE_TRADING and not _s.PAPER_STRATEGY_DRAWDOWN_GATE_ENABLED:
             return 0.0
         if (

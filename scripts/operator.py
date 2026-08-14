@@ -198,6 +198,24 @@ def cmd_status(args: argparse.Namespace) -> int:
             print(f"  - {name}: reason={meta.get('reason')!r}")
     else:
         print(f"paused strategies:  (none)")
+    sleeve_drawdowns = risk.get("sleeve_dd_state") or {}
+    observed_drawdowns = {
+        name: detail
+        for name, detail in sleeve_drawdowns.items()
+        if isinstance(detail, dict) and detail.get("observed_in_drawdown")
+    }
+    if observed_drawdowns:
+        print(f"sleeve drawdowns:   {len(observed_drawdowns)} observed")
+        for name in sorted(observed_drawdowns):
+            detail = observed_drawdowns[name]
+            mode = "BLOCKING" if detail.get("in_drawdown") else "observational"
+            print(
+                f"  - {name}: {mode} "
+                f"drawdown=${float(detail.get('drawdown_dollars', 0.0)):,.2f} "
+                f"threshold={float(detail.get('observed_threshold_pct', 0.0)):.1%}"
+            )
+    else:
+        print("sleeve drawdowns:   (none observed)")
     stream = state.get("stream_health") or {}
     if stream:
         print(f"stream healthy:     {stream.get('healthy')} (generation={stream.get('generation')})")

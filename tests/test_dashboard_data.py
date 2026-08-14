@@ -17,6 +17,7 @@ from dashboard import (
     filter_realized_curve_window,
     load_broker_account_curve,
     compute_rolling_sharpe,
+    compute_sleeve_drawdown_state,
     compute_sleeve_usage,
     compute_strategy_stats,
     format_local_timestamp,
@@ -1136,6 +1137,38 @@ class TestComputeSleeveUsage:
         assert pytest.approx(sma["Utilization"]) == 1250.0 / 40_000.0
         assert sma["Open Positions"] == 1
         assert pytest.approx(rsi["Used Notional"]) == 900.0
+
+
+class TestComputeSleeveDrawdownState:
+    def test_returns_only_observed_threshold_breaches(self):
+        state = {
+            "risk_controls": {
+                "sleeve_dd_state": {
+                    "donchian_breakout": {
+                        "observed_in_drawdown": True,
+                        "in_drawdown": False,
+                        "drawdown_dollars": 3_250.0,
+                        "observed_threshold_pct": 0.15,
+                        "trade_count": 6,
+                        "gate_armed": False,
+                    },
+                    "sma_crossover": {
+                        "observed_in_drawdown": False,
+                    },
+                },
+            },
+        }
+
+        result = compute_sleeve_drawdown_state(state)
+
+        assert result.to_dict("records") == [{
+            "Strategy": "donchian_breakout",
+            "Status": "Observed",
+            "Drawdown": 3_250.0,
+            "Threshold": 0.15,
+            "Trades": 6,
+            "Gate Armed": False,
+        }]
 
 
 class TestFormatDeltaCurrency:

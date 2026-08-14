@@ -499,19 +499,28 @@ class TestSleeveDrawdownMinTradesGuard:
             "rsi_reversion", 100_000.0,
         ) is True
 
-    def test_unknown_strategy_returns_false(self):
+    def test_unknown_strategy_returns_false_in_live_mode(self, monkeypatch):
         # Pre-existing invariant — unaffected by the guard.
+        monkeypatch.setattr(app_settings, "LIVE_TRADING", True)
         allocator = _allocator(dd_threshold=0.05)
         assert allocator.is_strategy_in_drawdown("nonexistent", 100_000.0) is False
 
-    def test_dd_threshold_zero_disables_gate_regardless(self):
-        # Pre-existing invariant — disabling the gate is unconditional.
+    def test_dd_threshold_zero_disables_live_below_floor_backstop(self, monkeypatch):
+        # Disabling the normal threshold also disables the live catastrophic
+        # tier, including before the strategy reaches its trade-count floor.
+        monkeypatch.setattr(app_settings, "LIVE_TRADING", True)
         allocator = _allocator(dd_threshold=0.0)
-        for _ in range(100):
-            allocator.record_realized_pnl("sma_crossover", -1_000.0)
+        allocator.record_realized_pnl(
+            "spy_options_reversion", -5_000.0, position_uid="pos-spy-1",
+        )
         assert allocator.is_strategy_in_drawdown(
-            "sma_crossover", 100_000.0,
+            "spy_options_reversion", 100_000.0,
         ) is False
+        snapshot = allocator.drawdown_snapshot(100_000.0)["spy_options_reversion"]
+        assert snapshot["effective_threshold_pct"] == pytest.approx(0.0)
+        assert snapshot["observed_threshold_pct"] == pytest.approx(0.0)
+        assert snapshot["in_drawdown"] is False
+        assert snapshot["observed_in_drawdown"] is False
 
     def test_floor_default_used_for_unmapped_strategy(self, monkeypatch):
         # When a strategy is in the allocator but NOT in the

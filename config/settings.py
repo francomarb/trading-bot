@@ -791,9 +791,12 @@ STRATEGY_CATASTROPHIC_DRAWDOWN_THRESHOLD: float = 0.35
 HEALTH_COUNTERS_ENABLED = True
 
 # Strategy-level high-water-mark drawdown gate (SleeveAllocator).
-# If a strategy's cumulative realized P&L drops more than this fraction
-# below its peak (HWM), new entries for that strategy are paused until
-# P&L recovers. Set to 0.0 to disable. Exits are never blocked.
+# In live mode, if a strategy's cumulative realized P&L drops more than this
+# fraction below its peak (HWM), new entries for that strategy are paused until
+# P&L recovers. Default paper mode reports the same breach without pausing
+# entries; set PAPER_STRATEGY_DRAWDOWN_GATE_ENABLED=true to enable the normal
+# post-floor paper gate. Set this threshold to 0.0 to disable the sleeve gate
+# in every mode. Exits are never blocked.
 #   Example at $100k equity, Donchian weight 0.25:
 #   sleeve budget = $100k × 0.80 × 0.25 = $20k
 #   gate fires when realized PnL < HWM − 0.15 × $20k = HWM − $3k
