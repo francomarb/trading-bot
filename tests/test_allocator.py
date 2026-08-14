@@ -454,9 +454,9 @@ class TestSleeveDrawdownMinTradesGuard:
     closed trade — a −$1,269 exit fired against still-buggy trailing-stop
     code that has since been fixed (PR #46 hardening). That single
     data point tripped the gate indefinitely. The guard removes that
-    paper-watch failure mode: below the floor, paper fails open while
-    daily-loss / hard-dollar kill switches remain active; live retains
-    the catastrophic below-floor backstop.
+    paper-watch failure mode: paper fails open while retaining an observed
+    normal-threshold drawdown signal; daily-loss / hard-dollar kill switches
+    remain active and live retains the catastrophic below-floor backstop.
     """
 
     def test_gate_fails_open_below_floor_in_paper(self, monkeypatch):
@@ -547,10 +547,12 @@ class TestSleeveDrawdownMinTradesGuard:
         assert entry["trade_count"] == 1
         assert entry["min_trades_for_gate"] == 15  # settings value
         # gate_armed=False means this strategy-performance gate is
-        # observational only until sample size reaches the configured floor.
+        # observational in default paper mode at every sample size.
         assert entry["gate_armed"] is False
         assert entry["effective_threshold_pct"] == pytest.approx(0.0)
         assert entry["in_drawdown"] is False
+        assert entry["observed_threshold_pct"] == pytest.approx(0.05)
+        assert entry["observed_in_drawdown"] is True
         assert entry["drawdown_dollars"] == pytest.approx(1_269.0)
         assert entry["running_pnl"] == pytest.approx(-1_269.0)
 
@@ -568,6 +570,8 @@ class TestSleeveDrawdownMinTradesGuard:
         assert allocator.is_strategy_in_drawdown("rsi_reversion", 100_000.0) is False
         assert snapshot["gate_armed"] is False
         assert snapshot["effective_threshold_pct"] == pytest.approx(0.0)
+        assert snapshot["observed_threshold_pct"] == pytest.approx(0.05)
+        assert snapshot["observed_in_drawdown"] is True
 
     def test_paper_drawdown_gate_can_be_enabled_after_floor(self, monkeypatch):
         monkeypatch.setattr(app_settings, "LIVE_TRADING", False)
@@ -594,6 +598,8 @@ class TestSleeveDrawdownMinTradesGuard:
         assert entry["gate_armed"] is True
         assert entry["effective_threshold_pct"] == pytest.approx(0.35)
         assert entry["in_drawdown"] is False
+        assert entry["observed_threshold_pct"] == pytest.approx(0.05)
+        assert entry["observed_in_drawdown"] is True
         assert entry["drawdown_dollars"] == pytest.approx(1_269.0)
 
     def test_record_realized_pnl_increments_trade_count(self):

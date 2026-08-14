@@ -756,9 +756,10 @@ STRATEGY_MIN_TRADES_FOR_DRAWDOWN_GATE: dict[str, int] = {
 }
 STRATEGY_DEFAULT_MIN_TRADES_FOR_DRAWDOWN_GATE: int = 10
 
-# Paper-development policy: report sleeve drawdown but do not block new
-# entries. This is intentionally configurable so mature paper strategies can
-# opt into the normal post-floor gate without weakening any live safeguard.
+# Paper-development policy: report the normal-threshold drawdown condition in
+# state snapshots but do not block new entries. This is intentionally
+# configurable so mature paper strategies can opt into the normal post-floor
+# gate without weakening any live safeguard.
 PAPER_STRATEGY_DRAWDOWN_GATE_ENABLED: bool = (
     os.getenv("PAPER_STRATEGY_DRAWDOWN_GATE_ENABLED", "false").lower()
     in ("true", "1", "yes")

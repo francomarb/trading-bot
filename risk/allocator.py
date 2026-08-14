@@ -443,10 +443,17 @@ class SleeveAllocator:
         See ``settings.STRATEGY_MIN_TRADES_FOR_DRAWDOWN_GATE`` for the
         rationale and motivating case.
         """
-        if self._dd_threshold == 0.0 or strategy_name not in self._entries:
-            return False
         threshold = self._effective_drawdown_threshold(strategy_name)
-        if threshold == 0.0:
+        return self._is_drawdown_at_threshold(strategy_name, equity, threshold)
+
+    def _is_drawdown_at_threshold(
+        self,
+        strategy_name: str,
+        equity: float,
+        threshold: float,
+    ) -> bool:
+        """Return whether a sleeve exceeds a supplied HWM-drawdown threshold."""
+        if threshold == 0.0 or strategy_name not in self._entries:
             return False
         target_budget = self.target_budget(strategy_name, equity)
         running = self._strategy_realized_pnl[strategy_name]
@@ -456,13 +463,14 @@ class SleeveAllocator:
     def drawdown_snapshot(self, equity: float) -> dict[str, dict]:
         """Read-only per-strategy HWM-drawdown state.
 
-        Surfaces the sleeve drawdown gate state for the engine state
-        snapshot. Consumed by HealthAssessor L1 checks (PLAN 11.10d/f)
-        to surface "strategy in sleeve drawdown" as a WATCH finding.
-        Pure read; no mutation.
+        ``in_drawdown`` is the entry-blocking state, while
+        ``observed_in_drawdown`` always evaluates the configured normal
+        threshold. This keeps paper development observation-only without
+        hiding the performance condition that would otherwise block entries.
 
-        Returns: `{strategy_name: {"in_drawdown": bool, "running_pnl":
-        float, "hwm_pnl": float, "drawdown_dollars": float,
+        Returns: `{strategy_name: {"in_drawdown": bool,
+        "observed_in_drawdown": bool, "observed_threshold_pct": float,
+        "running_pnl": float, "hwm_pnl": float, "drawdown_dollars": float,
         "trade_count": int, "min_trades_for_gate": int,
         "gate_armed": bool}}` for every registered strategy.
 
@@ -480,9 +488,13 @@ class SleeveAllocator:
             min_trades = self._min_trades_for_drawdown_gate(strategy_name)
             effective_threshold = self._effective_drawdown_threshold(strategy_name)
             out[strategy_name] = {
-                "in_drawdown": self.is_strategy_in_drawdown(
-                    strategy_name, equity,
+                "in_drawdown": self._is_drawdown_at_threshold(
+                    strategy_name, equity, effective_threshold,
                 ),
+                "observed_in_drawdown": self._is_drawdown_at_threshold(
+                    strategy_name, equity, self._dd_threshold,
+                ),
+                "observed_threshold_pct": self._dd_threshold,
                 "running_pnl": running,
                 "hwm_pnl": hwm,
                 "drawdown_dollars": max(hwm - running, 0.0),

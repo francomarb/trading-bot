@@ -509,7 +509,7 @@ All five strategies provide complementary coverage across market regimes:
 
 The first four are long-premium / long-direction; the credit spread is short-premium / theta-positive — they earn opposite sides of the volatility risk premium, so the credit-spread sleeve diversifies the portfolio's volatility exposure (it earns when realized vol < implied vol, the others depend on directional moves).
 
-All five strategies share a single `RiskManager` and a portfolio allocator. The allocator splits deployable capital into a shared `equity` pool and an isolated options vault, then enforces per-strategy target budgets, concentration caps, and hard count ceilings. Risk sizing still lives in `RiskManager` — except for credit spreads, which bypass `RiskManager.evaluate` because their max loss is defined by the spread width and capped by the sleeve notional; the allocator HWM / sleeve-drawdown gate still applies via `record_realized_pnl` on every close.
+All five strategies share a single `RiskManager` and a portfolio allocator. The allocator splits deployable capital into a shared `equity` pool and an isolated options vault, then enforces per-strategy target budgets, concentration caps, and hard count ceilings. Risk sizing still lives in `RiskManager` — except for credit spreads, which bypass `RiskManager.evaluate` because their max loss is defined by the spread width and capped by the sleeve notional; the allocator HWM / sleeve-drawdown state is updated via `record_realized_pnl` on every close. The HWM gate blocks entries in live mode (and optionally for mature paper strategies); default paper mode records the condition without blocking entries.
 
 ---
 
