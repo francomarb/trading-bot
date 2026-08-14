@@ -410,14 +410,19 @@ class SleeveAllocator:
         """Return the threshold (fraction of target_budget) that the
         gate would currently apply for ``strategy_name``.
 
-        Below the configured min-trades floor, the strategy-level
-        sleeve-drawdown gate is observational only in paper mode. In
-        live mode, the catastrophic backstop remains active below the
-        floor. Once the floor is reached, the configured normal
-        threshold applies in both modes.
+        Paper development is observational by default at every sample
+        size. An operator can explicitly enable the post-floor normal
+        gate for mature paper strategies. In live mode, the catastrophic
+        backstop remains active below the floor and the normal threshold
+        applies at or above it.
         """
         from config import settings as _s
-        if self._strategy_trade_count[strategy_name] < self._min_trades_for_drawdown_gate(strategy_name):
+        if not _s.LIVE_TRADING and not _s.PAPER_STRATEGY_DRAWDOWN_GATE_ENABLED:
+            return 0.0
+        if (
+            self._strategy_trade_count[strategy_name]
+            < self._min_trades_for_drawdown_gate(strategy_name)
+        ):
             return self._catastrophic_drawdown_threshold() if _s.LIVE_TRADING else 0.0
         return self._dd_threshold
 
@@ -428,12 +433,12 @@ class SleeveAllocator:
         HWM-vs-running ratio is dominated by noise — a single bad trade
         (buggy code, atypical market, ordinary variance) produces an
         indefinite lockout that doesn't reflect the strategy's true
-        behaviour. In paper mode, below the configured floor this
-        allocator-level strategy-performance gate fails open so
-        paper-watch can accumulate evidence. In live mode, the
-        catastrophic backstop still protects against severe early
-        sleeve drain. Daily/account loss controls, hard sizing,
-        broker-side stops, max positions, and exits remain active.
+        behaviour. Paper development defaults to observation-only so
+        paper-watch can accumulate evidence at any sample size; an
+        operator can explicitly enable the normal post-floor paper gate.
+        In live mode, the catastrophic backstop still protects against
+        severe early sleeve drain. Daily/account loss controls, hard
+        sizing, broker-side stops, max positions, and exits remain active.
 
         See ``settings.STRATEGY_MIN_TRADES_FOR_DRAWDOWN_GATE`` for the
         rationale and motivating case.
@@ -461,12 +466,11 @@ class SleeveAllocator:
         "trade_count": int, "min_trades_for_gate": int,
         "gate_armed": bool}}` for every registered strategy.
 
-        ``gate_armed`` reflects whether the strategy has accumulated
-        enough trades for the sleeve-drawdown threshold to block new
-        entries with the normal HWM threshold. When False (sample below
-        the min-trades floor), the gate is observational only in paper
-        mode (``effective_threshold_pct`` is 0.0) and uses the
-        catastrophic backstop in live mode.
+        ``gate_armed`` reflects whether the current mode permits sleeve
+        drawdown to block entries. Paper development defaults to
+        observation-only (``effective_threshold_pct`` is 0.0); live
+        mode uses the catastrophic backstop below the min-trades floor
+        and the normal threshold at or above it.
         """
         out: dict[str, dict] = {}
         for strategy_name in self._entries:
@@ -474,7 +478,6 @@ class SleeveAllocator:
             hwm = self._strategy_pnl_hwm.get(strategy_name, 0.0)
             trade_count = self._strategy_trade_count.get(strategy_name, 0)
             min_trades = self._min_trades_for_drawdown_gate(strategy_name)
-            below_floor = trade_count < min_trades
             effective_threshold = self._effective_drawdown_threshold(strategy_name)
             out[strategy_name] = {
                 "in_drawdown": self.is_strategy_in_drawdown(
@@ -485,11 +488,7 @@ class SleeveAllocator:
                 "drawdown_dollars": max(hwm - running, 0.0),
                 "trade_count": trade_count,
                 "min_trades_for_gate": min_trades,
-                # gate_armed=False means sample size is below the
-                # configured floor. In paper mode, strategy-level
-                # drawdown is observed but cannot block entries yet; in
-                # live mode the catastrophic threshold still applies.
-                "gate_armed": not below_floor,
+                "gate_armed": effective_threshold > 0.0,
                 "effective_threshold_pct": effective_threshold,
             }
         return out

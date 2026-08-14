@@ -99,24 +99,25 @@ min-trades floor instead of fully failing open. That protected against a true
 early sleeve disaster, but for sparse paper-watch strategies it also created
 the same chicken-and-egg lockout the min-trades floor was meant to avoid.
 
-Policy decision for the fix PR: in paper mode, the configured minimum
-completed-trade floor means the strategy-level sleeve drawdown gate is
-observational only until the floor is reached. Below the floor, it must not
-block entries. In live mode, the catastrophic below-floor backstop is retained
-so sample size cannot disable protection entirely. The bot still keeps the
-real hard-risk layers active in both modes: daily/account loss controls, hard
-sizing, broker-side stops, max positions, sleeve-budget checks, entry quality
-guards, and exits.
+Policy update (2026-08-14): paper development defaults to observation-only at
+every sample size, so the sleeve drawdown remains visible but never blocks new
+entries while strategies are being tuned. A mature paper strategy can opt into
+the normal post-floor gate with `PAPER_STRATEGY_DRAWDOWN_GATE_ENABLED=true`.
+Live mode retains the catastrophic below-floor backstop and normal post-floor
+gate. The bot still keeps the real hard-risk layers active in both modes:
+daily/account loss controls, hard sizing, broker-side stops, max positions,
+sleeve-budget checks, entry quality guards, and exits.
 
 Acceptance:
 
-1. In paper mode, `trade_count < STRATEGY_MIN_TRADES_FOR_DRAWDOWN_GATE[strategy]`
-   makes `SleeveAllocator.is_strategy_in_drawdown(...)` return false.
+1. In default paper mode, `SleeveAllocator.is_strategy_in_drawdown(...)`
+   returns false at every trade count while retaining full observability.
 2. `drawdown_snapshot(...)` still reports running P&L, HWM, drawdown dollars,
-   trade count, floor, and the mode-appropriate effective threshold for
-   observability.
-3. Once `trade_count >= floor`, the normal HWM drawdown threshold resumes.
-4. In live mode, the catastrophic below-floor threshold remains active.
+   trade count, floor, and the effective threshold for observability.
+3. Explicitly enabling the paper gate resumes the normal HWM threshold at the
+   configured floor.
+4. In live mode, the catastrophic below-floor threshold and normal post-floor
+   gate remain active.
 
 ## Revisit criteria
 

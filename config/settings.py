@@ -737,11 +737,12 @@ STRATEGY_MIN_TRADES_FOR_VERDICT: dict[str, int] = {
 #
 # Floors mirror STRATEGY_MIN_TRADES_FOR_VERDICT (above) because the
 # conceptual question is identical: "how many trades do we need before we
-# trust this strategy's realized P&L as a verdict?" In paper mode below the
-# floor, the gate fails open (does not halt) so validation can gather enough
-# evidence. In live mode below the floor, the catastrophic backstop below
-# remains active. Daily-loss / hard-dollar cap kill switches remain active in
-# both modes.
+# trust this strategy's realized P&L as a verdict?" Paper development defaults
+# to observation-only at every sample size so strategies can accumulate tuning
+# evidence. Set PAPER_STRATEGY_DRAWDOWN_GATE_ENABLED=true only when a mature
+# paper strategy should use the normal gate after its floor. Live keeps its
+# normal gate at the floor and catastrophic below-floor backstop. Daily-loss /
+# hard-dollar cap kill switches remain active in both modes.
 #
 # The default for strategies not in the map is high (10) to ensure new
 # strategies aren't gated out on their first bad day. Adjust per-strategy
@@ -755,12 +756,19 @@ STRATEGY_MIN_TRADES_FOR_DRAWDOWN_GATE: dict[str, int] = {
 }
 STRATEGY_DEFAULT_MIN_TRADES_FOR_DRAWDOWN_GATE: int = 10
 
-# Live-only catastrophic drawdown threshold (PR #74 review) — in paper mode,
-# the min-trades floor is a true fail-open so sparse strategies can collect
-# enough evidence for tuning. In live mode, sample size must not disable
-# protection entirely: below the floor, this backstop blocks entries after a
-# severe HWM drawdown. Once the floor is reached, the normal
-# STRATEGY_SLEEVE_DD_THRESHOLD applies in both paper and live.
+# Paper-development policy: report sleeve drawdown but do not block new
+# entries. This is intentionally configurable so mature paper strategies can
+# opt into the normal post-floor gate without weakening any live safeguard.
+PAPER_STRATEGY_DRAWDOWN_GATE_ENABLED: bool = (
+    os.getenv("PAPER_STRATEGY_DRAWDOWN_GATE_ENABLED", "false").lower()
+    in ("true", "1", "yes")
+)
+
+# Live-only catastrophic drawdown threshold (PR #74 review). In paper mode,
+# the sleeve drawdown remains observational by default. In live mode, sample
+# size must not disable protection entirely: below the floor, this backstop
+# blocks entries after a severe HWM drawdown. Once the floor is reached, the
+# normal STRATEGY_SLEEVE_DD_THRESHOLD applies.
 STRATEGY_CATASTROPHIC_DRAWDOWN_THRESHOLD: float = 0.35
 
 # Strategy Health monitor (PLAN 11.10f) — feature flag for the

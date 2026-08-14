@@ -351,7 +351,8 @@ class TestSleeveDrawdownGate:
         for _ in range(count):
             allocator.record_realized_pnl(strategy, 0.0)
 
-    def test_drawdown_uses_target_budget_not_stretched_budget(self):
+    def test_drawdown_uses_target_budget_not_stretched_budget(self, monkeypatch):
+        monkeypatch.setattr(app_settings, "LIVE_TRADING", True)
         allocator = _allocator(dd_threshold=0.15)
         self._seed_above_floor(allocator, "sma_crossover")
         allocator.record_realized_pnl("sma_crossover", -5_400.0)
@@ -359,7 +360,8 @@ class TestSleeveDrawdownGate:
         allocator.record_realized_pnl("sma_crossover", -1.0)
         assert allocator.is_strategy_in_drawdown("sma_crossover", 100_000.0) is True
 
-    def test_check_returns_drawdown_rejection(self):
+    def test_check_returns_drawdown_rejection(self, monkeypatch):
+        monkeypatch.setattr(app_settings, "LIVE_TRADING", True)
         allocator = _allocator(dd_threshold=0.15)
         self._seed_above_floor(allocator, "sma_crossover")
         allocator.record_realized_pnl("sma_crossover", -5_401.0)
@@ -367,8 +369,9 @@ class TestSleeveDrawdownGate:
         assert isinstance(result, SleeveRejection)
         assert result.code is SleeveRejectionCode.SLEEVE_DRAWDOWN
 
-    def test_check_rejection_message_reports_normal_tier_above_floor(self):
+    def test_check_rejection_message_reports_normal_tier_above_floor(self, monkeypatch):
         """PR #56 R2: above-floor rejections show the normal threshold."""
+        monkeypatch.setattr(app_settings, "LIVE_TRADING", True)
         allocator = _allocator(dd_threshold=0.15)
         self._seed_above_floor(allocator, "sma_crossover")
         # target_budget = 100k * 0.80 * 0.45 = $36,000. Normal threshold
@@ -482,7 +485,8 @@ class TestSleeveDrawdownMinTradesGuard:
             "spy_options_reversion", 100_000.0,
         ) is True
 
-    def test_gate_arms_at_floor(self):
+    def test_live_gate_arms_at_floor(self, monkeypatch):
+        monkeypatch.setattr(app_settings, "LIVE_TRADING", True)
         allocator = _allocator(dd_threshold=0.05)
         # rsi_reversion floor = 8 (settings) — quickest to set up.
         for _ in range(7):
@@ -513,7 +517,7 @@ class TestSleeveDrawdownMinTradesGuard:
         # When a strategy is in the allocator but NOT in the
         # min-trades-for-drawdown-gate map, the default floor applies.
         from config import settings as _s
-        monkeypatch.setattr(_s, "LIVE_TRADING", False)
+        monkeypatch.setattr(_s, "LIVE_TRADING", True)
         monkeypatch.setattr(_s, "STRATEGY_MIN_TRADES_FOR_DRAWDOWN_GATE", {})
         monkeypatch.setattr(_s, "STRATEGY_DEFAULT_MIN_TRADES_FOR_DRAWDOWN_GATE", 5)
         allocator = _allocator(dd_threshold=0.05)
@@ -550,6 +554,33 @@ class TestSleeveDrawdownMinTradesGuard:
         assert entry["drawdown_dollars"] == pytest.approx(1_269.0)
         assert entry["running_pnl"] == pytest.approx(-1_269.0)
 
+    def test_paper_drawdown_remains_observational_above_floor(self, monkeypatch):
+        monkeypatch.setattr(app_settings, "LIVE_TRADING", False)
+        monkeypatch.setattr(
+            app_settings, "PAPER_STRATEGY_DRAWDOWN_GATE_ENABLED", False,
+        )
+        allocator = _allocator(dd_threshold=0.05)
+        for _ in range(8):
+            allocator.record_realized_pnl("rsi_reversion", 0.0)
+        allocator.record_realized_pnl("rsi_reversion", -10_000.0)
+
+        snapshot = allocator.drawdown_snapshot(100_000.0)["rsi_reversion"]
+        assert allocator.is_strategy_in_drawdown("rsi_reversion", 100_000.0) is False
+        assert snapshot["gate_armed"] is False
+        assert snapshot["effective_threshold_pct"] == pytest.approx(0.0)
+
+    def test_paper_drawdown_gate_can_be_enabled_after_floor(self, monkeypatch):
+        monkeypatch.setattr(app_settings, "LIVE_TRADING", False)
+        monkeypatch.setattr(
+            app_settings, "PAPER_STRATEGY_DRAWDOWN_GATE_ENABLED", True,
+        )
+        allocator = _allocator(dd_threshold=0.05)
+        for _ in range(8):
+            allocator.record_realized_pnl("rsi_reversion", 0.0)
+        allocator.record_realized_pnl("rsi_reversion", -10_000.0)
+
+        assert allocator.is_strategy_in_drawdown("rsi_reversion", 100_000.0) is True
+
     def test_drawdown_snapshot_exposes_live_below_floor_backstop(self, monkeypatch):
         monkeypatch.setattr(app_settings, "LIVE_TRADING", True)
         allocator = _allocator(dd_threshold=0.05)
@@ -560,7 +591,7 @@ class TestSleeveDrawdownMinTradesGuard:
         entry = snap["spy_options_reversion"]
         assert entry["trade_count"] == 1
         assert entry["min_trades_for_gate"] == 15
-        assert entry["gate_armed"] is False
+        assert entry["gate_armed"] is True
         assert entry["effective_threshold_pct"] == pytest.approx(0.35)
         assert entry["in_drawdown"] is False
         assert entry["drawdown_dollars"] == pytest.approx(1_269.0)
@@ -716,6 +747,9 @@ class TestSleeveDrawdownPartialCloseAccounting:
         the 25th position fully closes.
         """
         monkeypatch.setattr(app_settings, "LIVE_TRADING", False)
+        monkeypatch.setattr(
+            app_settings, "PAPER_STRATEGY_DRAWDOWN_GATE_ENABLED", True,
+        )
         allocator = _allocator(dd_threshold=0.05)
         for i in range(24):
             allocator.record_realized_pnl(
