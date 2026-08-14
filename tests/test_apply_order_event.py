@@ -3822,3 +3822,96 @@ class TestEntryTimestampOnlyOnEntryRows:
         repl_oid = _attach_and_get_order_id(orders_store, "cli-repl")
         self._fill(conn, repl_oid)
         assert self._entry_ts(conn, repl_oid) is None
+
+
+class TestInitialRiskDollarsFollowsSubstrateFills:
+    """PR #105 review, round 2 — the production path.
+
+    The accounting writer logs an entry ONCE, on fill confirmation. Every
+    later slice arrives as a broker event through `apply_order_event`,
+    whose trades UPSERT advances `qty`/`filled_qty`/VWAP. If
+    `initial_risk_dollars` does not advance with them, the row finishes
+    with qty=73 and risk recorded for 54 — the SMCI 2026-08-14 defect,
+    unreachable by any number of `TradeLogger.log()` calls.
+    """
+
+    def _setup(self, tmp_path):
+        import contextlib, io
+        from reporting.logger import TradeLogger
+        from execution.broker import OrderResult, OrderStatus
+        from risk.manager import RiskDecision, Side, OrderType
+        from engine.lifecycle import PositionLifecycleStore
+        from engine.lifecycle_orders import PositionLifecycleOrdersStore
+
+        db = str(tmp_path / "t.db")
+        tl = TradeLogger(path=db)
+        dec = RiskDecision(
+            symbol="SMCI", side=Side.BUY, qty=73, entry_reference_price=39.17,
+            stop_price=33.83, strategy_name="donchian_breakout", reason="entry",
+            order_type=OrderType.STOP_LIMIT, limit_price=40.0,
+            entry_trigger_price=39.17,
+        )
+        with contextlib.redirect_stderr(io.StringIO()):
+            # Entry logged mid-fill at 54 — this is the only accounting write.
+            tl.log(tl.build_record(dec, OrderResult(
+                status=OrderStatus.PARTIAL, order_id="ord-1", symbol="SMCI",
+                requested_qty=73, filled_qty=54, avg_fill_price=39.46,
+                raw_status="x", message=""), modeled_price=39.46))
+            conn = tl._ensure_db()
+            PositionLifecycleStore(conn).create_pending(
+                position_uid="pos_1", symbol="SMCI", owner_key="SMCI",
+                strategy="donchian_breakout", position_type="single_leg",
+                entry_qty=73.0, entry_client_order_id="cli-1")
+            orders = PositionLifecycleOrdersStore(conn)
+            orders.insert_pending(
+                position_uid="pos_1", role="entry_primary", client_order_id="cli-1",
+                order_type="stop_limit", order_class="simple", time_in_force="day",
+                side="buy", intended_qty=73.0)
+            orders.attach_broker_order_id(client_order_id="cli-1", order_id="ord-1")
+        return conn
+
+    def _apply(self, conn, events):
+        import contextlib, io
+        from engine.lifecycle_orders import apply_order_event, OrderEvent
+        with contextlib.redirect_stderr(io.StringIO()):
+            for i, (status, filled) in enumerate(events):
+                apply_order_event(conn, OrderEvent(
+                    order_id="ord-1", status=status, filled_qty=filled,
+                    avg_fill_price=39.46,
+                    broker_updated_at=f"2026-08-14T19:5{i}:00Z"), reason="stream")
+        return conn.execute(
+            "SELECT qty, initial_risk_per_share, initial_risk_dollars FROM trades"
+        ).fetchone()
+
+    def test_completing_fill_advances_the_recorded_risk(self, tmp_path):
+        qty, rps, ird = self._apply(self._setup(tmp_path), [("filled", 73.0)])
+        assert qty == 73
+        assert ird == pytest.approx(rps * 73, abs=0.01), (
+            f"qty advanced to 73 but risk stayed at {ird / rps:.0f} shares — "
+            "the substrate UPSERT is not carrying initial_risk_dollars"
+        )
+
+    def test_multi_slice_fill_advances_all_the_way(self, tmp_path):
+        qty, rps, ird = self._apply(
+            self._setup(tmp_path), [("partially_filled", 72.0), ("filled", 73.0)])
+        assert qty == 73
+        assert ird == pytest.approx(rps * 73, abs=0.01)
+
+    def test_cancelled_remainder_records_only_what_filled(self, tmp_path):
+        """The other half of the review: never claim risk that was not held."""
+        qty, rps, ird = self._apply(self._setup(tmp_path), [("canceled", 54.0)])
+        assert qty == 54
+        assert ird == pytest.approx(rps * 54, abs=0.01), (
+            f"recorded risk for {ird / rps:.0f} shares when only 54 filled"
+        )
+
+    def test_the_invariant_holds_after_every_event(self, tmp_path):
+        """risk_dollars is a pure function of qty and risk-per-share, so it
+        must hold at each step, not merely at the end."""
+        conn = self._setup(tmp_path)
+        for step in (("partially_filled", 60.0), ("partially_filled", 72.0),
+                     ("filled", 73.0)):
+            qty, rps, ird = self._apply(conn, [step])
+            assert ird == pytest.approx(qty * rps, abs=0.01), (
+                f"invariant broken after {step}: qty={qty} ird={ird}"
+            )

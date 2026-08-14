@@ -1506,7 +1506,28 @@ DO UPDATE SET
     slippage_benchmark_kind       = COALESCE(trades.slippage_benchmark_kind,       excluded.slippage_benchmark_kind),
     slippage_benchmark_timestamp  = COALESCE(trades.slippage_benchmark_timestamp,  excluded.slippage_benchmark_timestamp),
     slippage_measurement_quality  = COALESCE(trades.slippage_measurement_quality,  excluded.slippage_measurement_quality),
-    execution_id                  = COALESCE(excluded.execution_id, trades.execution_id)
+    execution_id                  = COALESCE(excluded.execution_id, trades.execution_id),
+    -- initial_risk_dollars must FOLLOW the fills, not freeze at the first
+    -- partial. This is the production path for later fills: the accounting
+    -- writer logs the entry once, on fill CONFIRMATION, and every
+    -- subsequent slice arrives here as a stream/REST event. Advancing qty
+    -- while leaving the recorded risk behind is exactly the SMCI
+    -- 2026-08-14 defect (logged at 54, filled 73, risk stuck at 54 x rps).
+    --
+    -- Scaled by the fill ratio rather than recomputed from
+    -- initial_risk_per_share, so no contract multiplier is needed here:
+    -- whatever multiplier produced the stored value still applies. Guarded
+    -- on the OLD filled_qty being usable, since that is the denominator;
+    -- when it is NULL or zero there is nothing to scale from and the value
+    -- is left for the accounting writer to set.
+    initial_risk_dollars          = CASE
+        WHEN trades.initial_risk_dollars IS NOT NULL
+         AND trades.filled_qty IS NOT NULL
+         AND trades.filled_qty > 0
+         AND excluded.filled_qty IS NOT NULL
+        THEN trades.initial_risk_dollars * (excluded.filled_qty / trades.filled_qty)
+        ELSE trades.initial_risk_dollars
+    END
 """
 
 
