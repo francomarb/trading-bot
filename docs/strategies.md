@@ -347,7 +347,7 @@ Options orders do not go through the standard equity broker path. The flow is:
 3. On fill: broker submits take-profit and stop-loss legs as a bracket
 4. Fill is reported back to the engine via `drain_option_fills()` (polled each cycle)
 5. Mid-trade exits are triggered by `inspect_open_positions` → `broker.close_position(occ)`
-6. Bracket stop-leg fills are delivered by the WebSocket stream → `_process_stream_stop_fills`
+6. Bracket stop-leg fills are delivered by the WebSocket stream → `apply_order_event` → `_maybe_dispatch_substrate_stop_fill` (the legacy `_process_stream_stop_fills` path was removed 2026-08-14)
 
 The engine's ownership map (`_positions`) keys single-leg option positions by the underlying ticker (`"SPY"`) via `owner_key_for()`, and reserves UUID `position_id`s for multi-leg positions (see PLAN.md 11.27 and `engine/positions.py`). The credit-spread strategy below uses that UUID path; a same-underlying single-leg + spread combination cannot collide on the ownership map.
 

@@ -562,11 +562,15 @@ class TestPartialCloseLeavesLifecycleOpen:
 
 
 class TestStopFillFallbackClosesLifecycle:
-    """Reviewer F7: when a WebSocket stop-fill event arrives without a
-    usable price/qty, _process_stream_stop_fills falls back to
-    log_external_close. The lifecycle row must also be closed
-    (external=True) so the operator CLI is not left showing the
-    position as open until restart."""
+    """Reviewer F7: when a stop-fill event arrives without a usable
+    price/qty, the handler falls back to log_external_close. The
+    lifecycle row must also be closed (external=True) so the operator
+    CLI is not left showing the position as open until restart.
+
+    Originally written against `_process_stream_stop_fills` (removed
+    2026-08-14). The behaviour under test is
+    `_close_lifecycle_for_owner_key`, which this drives directly and
+    which is unchanged by that removal."""
 
     def test_fallback_branch_closes_lifecycle_external(self, tmp_path):
         from engine.trader import TradingEngine

@@ -1175,7 +1175,6 @@ class TradingEngine:
             # gap on a crash between submit and the close drain.
             self._drain_lifecycle_close_attaches()
             self._drain_lifecycle_events(snapshot)
-            self._process_stream_stop_fills(snapshot)
             self._detect_external_closes(snapshot)
             # NULL-order_id cycle sweep — bounded by
             # _SUBSTRATE_NULL_ATTACH_SWEEP_LIMIT REST calls per
@@ -2913,8 +2912,10 @@ class TradingEngine:
             logger.critical(
                 f"substrate stop-fill dispatch FAILED for "
                 f"order_id={event.order_id}: {type(exc).__name__}: "
-                f"{exc}. Substrate row already recorded the fill; "
-                f"legacy fallback may still handle stream stop fills."
+                f"{exc}. The substrate row already recorded the fill, "
+                f"but the engine side effects did NOT run: ownership is "
+                f"still held and no trade row was written. There is no "
+                f"legacy fallback since 2026-08-14 — this needs attention."
             )
 
     def _fill_anchored_stop_price(
@@ -3480,7 +3481,7 @@ class TradingEngine:
 
         Called from all three close paths:
           - Signal-based exit (_process_symbol exit branch) — external=False
-          - WebSocket stop-leg fill (_process_stream_stop_fills) — external=False
+          - WebSocket stop-leg fill via substrate dispatch — external=False
           - External close detection (_detect_external_closes) — external=True
 
         Pass multiplier=100 for options contracts (each contract = 100 shares).
@@ -7485,194 +7486,6 @@ class TradingEngine:
             except Exception as e:
                 logger.error(f"{symbol}: failed to log external close: {e}")
 
-    def _process_stream_stop_fills(self, snapshot: BrokerSnapshot) -> None:
-        """
-        Drain WebSocket stop-leg fill events from the stream manager.
-
-        When a protective stop triggers, Alpaca sends a fill event for the
-        stop-leg order. StreamManager accumulates these in drain_stop_fills().
-        We process them here each cycle — before _detect_external_closes —
-        so the ownership map is already cleared when the cycle-count fallback
-        runs (which then finds no owned symbols absent, and does nothing).
-
-        This gives immediate detection of stop-outs rather than waiting for
-        external_close_confirm_cycles cycles.
-        """
-        if self._stream_manager is None:
-            return
-
-        for update in self._stream_manager.drain_stop_fills():
-            raw_symbol = update.order.symbol
-            # OCC bracket stop legs carry the full OCC string (e.g. SPY260516C00520000).
-            # _positions is keyed by the underlying ("SPY") for OCC option fills,
-            # so normalise before lookup; keep raw_symbol for logging and
-            # trade-DB calls.
-            _occ_m = _OCC_PAT.match(raw_symbol)
-            symbol = owner_key_for(raw_symbol)
-
-            if not self._has_position(symbol):
-                logger.debug(
-                    f"stream stop fill for unowned {raw_symbol} — already handled"
-                )
-                continue
-
-            raw_cum_qty = getattr(update.order, "filled_qty", None)
-            cum_qty = float(raw_cum_qty or 0) if raw_cum_qty is not None else 0.0
-            raw_cum_avg = getattr(update.order, "filled_avg_price", None)
-            cum_avg = float(raw_cum_avg) if raw_cum_avg is not None else None
-            # Stream trade updates carry per-execution chunk fields on
-            # update.qty/update.price, but stop-fill accounting must use the
-            # cumulative order fill quantity / VWAP to avoid under-recording
-            # multi-execution stop orders.
-            qty = cum_qty if cum_qty > 0 else float(update.qty or 0)
-            price = cum_avg if cum_avg is not None else (
-                float(update.price) if update.price is not None else None
-            )
-            owner = self._get_owner(symbol)
-            if owner is None:
-                logger.debug(
-                    f"stream stop fill for unowned {raw_symbol} — already handled"
-                )
-                continue
-            order_id = getattr(update.order, "id", None)
-            if order_id and self.lifecycle_orders_store is not None:
-                try:
-                    substrate_row = self.lifecycle_orders_store.get_by_order_id(
-                        str(order_id),
-                    )
-                except Exception as exc:
-                    logger.debug(
-                        f"{raw_symbol}: substrate lookup for stop fill "
-                        f"{order_id} raised {type(exc).__name__}: {exc}; "
-                        "legacy fallback will handle"
-                    )
-                    substrate_row = None
-                if (
-                    substrate_row is not None
-                    and substrate_row.role in {
-                        "protective_stop",
-                        "replacement_stop",
-                    }
-                ):
-                    logger.debug(
-                        f"{raw_symbol}: legacy stop-fill fallback skipped "
-                        f"for substrate-owned order {order_id}"
-                    )
-                    continue
-                logger.warning(
-                    f"{raw_symbol}: legacy stop-fill fallback handling "
-                    f"order {order_id} with no substrate stop row; "
-                    "temporary compatibility path"
-                )
-            if self.trade_logger.has_recorded_order_id(order_id):
-                logger.debug(
-                    f"{raw_symbol}: duplicate protective stop fill "
-                    f"{order_id} ignored — already recorded"
-                )
-                continue
-            msg = (
-                f"{raw_symbol}: protective stop triggered (WebSocket) — "
-                f"qty={qty} price={price} strategy={owner}"
-            )
-            residual_position = self._get_position_for(symbol, snapshot)
-            residual_qty = (
-                float(residual_position.qty)
-                if residual_position is not None and not _occ_m
-                else 0.0
-            )
-            logger.warning(msg)
-            self.alerts.broker_error(msg)
-            # Feed realized P&L into the HWM drawdown gate.
-            # Options: multiply by 100 (each contract = 100 shares).
-            if price is not None and qty > 0:
-                _pnl_mult = 100 if _occ_m else 1
-                self._record_realized_pnl(symbol, owner, price, qty, multiplier=_pnl_mult)
-            try:
-                if price is not None and qty > 0:
-                    # Slippage unification (Phase 1) — extract the broker
-                    # order's actual stop trigger price so log_stop_fill can
-                    # benchmark against the active stop that fired, not the
-                    # original initial_stop_loss. See codepath §4 in
-                    # docs/slippage_unification_design.md. Defect 4 fix:
-                    # use _finite_or_none so NaN/+inf/-inf can't poison
-                    # the benchmark even if a misbehaving stream payload
-                    # delivers a malformed stop_price.
-                    broker_stop_price = _finite_or_none(
-                        getattr(update.order, "stop_price", None)
-                    )
-                    # PR #56 R1: source position_uid for the stop-fill
-                    # record so restart reconstruction of the
-                    # allocator's trade-count dedup matches live behavior.
-                    _stop_position_uid: str | None = None
-                    try:
-                        _row = self.lifecycle_store.get_open_for_owner_key(
-                            owner_key_for(raw_symbol),
-                        )
-                        if _row is not None:
-                            _stop_position_uid = _row.position_uid
-                    except Exception as exc:
-                        logger.debug(
-                            f"log_stop_fill: position_uid lookup raised "
-                            f"{type(exc).__name__}: {exc} — proceeding without"
-                        )
-                    stop_log_kwargs = {
-                        "symbol": raw_symbol,
-                        "strategy": owner,
-                        "qty": qty,
-                        "avg_fill_price": price,
-                        "stop_price": broker_stop_price,
-                        "order_id": order_id,
-                        "position_uid": _stop_position_uid,
-                    }
-                    stop_timestamp = (
-                        getattr(update.order, "filled_at", None)
-                        or getattr(update.order, "submitted_at", None)
-                    )
-                    if isinstance(stop_timestamp, str):
-                        try:
-                            stop_timestamp = datetime.fromisoformat(
-                                stop_timestamp.replace("Z", "+00:00")
-                            )
-                        except ValueError:
-                            stop_timestamp = None
-                    if stop_timestamp is not None:
-                        stop_log_kwargs["timestamp_override"] = stop_timestamp
-                    self.trade_logger.log_stop_fill(
-                        **stop_log_kwargs,
-                    )
-                else:
-                    # Price or qty unavailable — fall back to the synthetic record.
-                    self.trade_logger.log_external_close(
-                        symbol=raw_symbol,
-                        strategy=owner,
-                        reason="stop_triggered",
-                    )
-                    # Operator Controls Phase A — _record_realized_pnl
-                    # was skipped on this branch (no price/qty), so we
-                    # close the lifecycle row directly. Matches the
-                    # trade-log call above which records as external.
-                    self._close_lifecycle_for_owner_key(
-                        owner_key=owner_key_for(raw_symbol),
-                        external=True,
-                    )
-            except Exception as e:
-                logger.error(f"{raw_symbol}: failed to log stop fill: {e}")
-
-            self._external_close_suspects.pop(symbol, None)
-            if residual_qty > 1e-9 and not _occ_m:
-                logger.info(
-                    f"{raw_symbol}: protective stop left residual qty={residual_qty} "
-                    "— preserving ownership for residual cleanup"
-                )
-                continue
-
-            self._pop_position(symbol)
-            self._entry_prices.pop(symbol, None)
-            self._cleanup_option_trailing_state(
-                raw_symbol,
-                reason="stream stop fill",
-            )
-
     def _drain_lifecycle_attaches(self) -> None:
         """Apply per-order substrate attaches enqueued by background
         worker threads.
@@ -7797,8 +7610,7 @@ class TradingEngine:
 
         After P-6/P-7 the suspect caches are gone. The remaining
         legacy stream-driven trade-logging paths
-        (``_process_stream_stop_fills`` for protective-stop fills,
-        ``_detect_external_closes`` for unexpected broker closes)
+        (``_detect_external_closes`` for unexpected broker closes)
         continue to run alongside this drain; their writes
         converge with the substrate UPSERT per the trades-
         UPSERT preservation policy (foundation commits 8 / 11 / 14).

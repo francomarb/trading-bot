@@ -428,7 +428,7 @@ Must write:
 
 Path:
 
-- `_process_stream_stop_fills(...)` → `trade_logger.log_stop_fill(...)`
+- `_maybe_dispatch_substrate_stop_fill(...)` → `trade_logger.log_stop_fill(...)` (was `_process_stream_stop_fills`, removed 2026-08-14)
 
 Must write:
 

@@ -11,7 +11,6 @@ It provides three integration seams:
        update = stream.get_update(order_id)
 
   2. **Stop-out detection** (used by TradingEngine each cycle):
-       fills = stream.drain_stop_fills()
 
   3. **Connection observability** (used by TradingEngine each cycle):
        health = stream.health_snapshot()
@@ -145,7 +144,6 @@ class StreamManager:
         self._watched: dict[str, _TrackedOrder] = {}
         self._alias_to_canonical: dict[str, str] = {}
         self._stop_legs: set[str] = set()
-        self._stop_fills: list[Any] = []
         # P-1: substrate state-machine events translated from
         # Alpaca trade_updates. Enqueued on the WS thread, drained
         # by the engine on the cycle thread (single-threaded sqlite3
@@ -279,13 +277,6 @@ class StreamManager:
             for alias in tracked.aliases:
                 self._alias_to_canonical.pop(alias, None)
 
-    def drain_stop_fills(self) -> list[Any]:
-        """Return and clear accumulated stop-leg fill events."""
-        with self._lock:
-            fills = list(self._stop_fills)
-            self._stop_fills.clear()
-            return fills
-
     def drain_lifecycle_events(self) -> list[Any]:
         """Return and clear substrate state-machine events that the
         WS thread translated from Alpaca trade_updates.
@@ -293,7 +284,7 @@ class StreamManager:
         P-1: events come out as ``engine.lifecycle_orders.OrderEvent``
         instances ready for ``apply_order_event``. The drain runs
         on the cycle thread (single-threaded sqlite3 connection),
-        same pattern as ``drain_stop_fills`` and
+        same pattern as
         ``broker.drain_lifecycle_attaches``.
         """
         with self._lock:
@@ -955,7 +946,10 @@ class StreamManager:
 
             if order_id in self._stop_legs:
                 if event_val in _FILL_EVENTS:
-                    self._stop_fills.append(update)
+                    # Observability only. The fill is handled by substrate
+                    # dispatch via _build_substrate_event below; the legacy
+                    # _stop_fills accumulator that used to feed
+                    # _process_stream_stop_fills was removed 2026-08-14.
                     logger.info(
                         f"stream: stop fill — {update.order.symbol} "
                         f"qty={update.qty} price={update.price}"
@@ -981,16 +975,14 @@ class StreamManager:
 
             # P-1: translate every state-bearing event to a substrate
             # OrderEvent and enqueue. Drained by the engine each
-            # cycle (single-threaded sqlite3 connection). The legacy
-            # _stop_fills accumulator + tracked.update / event.set
-            # paths above continue to run: the synchronous broker
-            # code in execution/broker.py uses tracked.event for
-            # _wait_for_fill, while substrate dispatch owns normal
-            # entry_primary, exit, protective_stop, and
-            # replacement_stop fill side effects. The legacy
-            # _process_stream_stop_fills path is now only a
-            # compatibility fallback for stop fills that have no
-            # substrate row.
+            # cycle (single-threaded sqlite3 connection). Substrate
+            # dispatch is the ONLY path for entry_primary, exit,
+            # protective_stop and replacement_stop fill side effects
+            # since the legacy _stop_fills accumulator and
+            # _process_stream_stop_fills were removed on 2026-08-14.
+            # The tracked.update / event.set path above still runs and
+            # is separate: the synchronous broker code in
+            # execution/broker.py uses tracked.event for _wait_for_fill.
             substrate_event = self._build_substrate_event(
                 order_id, event_val, update,
             )
