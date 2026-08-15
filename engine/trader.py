@@ -7601,12 +7601,18 @@ class TradingEngine:
             orders submitted before P-4..P-6 shipped, or orders
             created by a path that doesn't insert substrate rows).
             Debug-log. **Nothing owns these since the legacy
-            stop-fill fallback was removed on 2026-08-14**: an orphaned
-            stop fill is picked up ~3 cycles later by
-            `_detect_external_closes` instead, with degraded fill price
-            and no stop-gap measurement. Trigger is a post-submit
-            substrate write absorbed by broker._insert_and_attach_stop_row;
-            never observed in 85 stop writes. See the PLAN row.
+            stop-fill fallback was removed on 2026-08-14**, so no
+            immediate side effects run. For equities the fill is still
+            recovered ~3 cycles later: `_detect_external_closes` →
+            `_record_recovered_stop_fill` replays it from broker history,
+            preserving the actual fill price AND the fired stop's
+            `stop_price`, so stop-gap stays computable. What is lost is
+            the latency (~15 min) and the measurement grade: those rows
+            are tagged `measurement_quality='recovered'`, which is
+            excluded from CALIBRATION_GRADE_QUALITIES. Trigger is a
+            post-submit substrate write absorbed by
+            `broker._lifecycle_orders_record_stop`; never observed in 85
+            stop writes. See the PLAN row.
           - ``applied=False, reason='stale_or_duplicate'``: the
             event was older than the row's last_observed_broker
             _updated_at, or the row was already in a terminal
