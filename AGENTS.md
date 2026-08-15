@@ -160,6 +160,15 @@ Testing is **non-negotiable** for this project — this code is meant to place o
 real money. Current changes must ship with focused unit tests. Broker-facing or
 operational changes may also require a targeted manual paper check.
 
+## Code Review Standard
+
+- Prioritize practical, verified findings: regressions demonstrable through an active
+  code path, failing test, production/paper evidence, or a concrete reachable input
+  in the change under review.
+- Do not present merely theoretical or remotely possible failure modes as blocking
+  review findings. They may be noted separately as non-blocking observations when
+  useful, clearly labeled as such.
+
 ### Test layers
 
 | Layer | Location | Runs | Purpose |
