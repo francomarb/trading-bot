@@ -1211,32 +1211,6 @@ class TestRunOneCycle:
         assert slot.strategy.raw_calls == 1
         broker.place_order.assert_not_called()
 
-    def test_market_open_cycle_processes_stream_stop_fills_before_external_closes(
-        self, engine_factory
-    ):
-        engine, _ = engine_factory(market_open=True)
-        engine.slots[0].symbols = []
-        engine._session_start_equity = 100_000.0
-        engine._cycle_count = 1
-
-        call_order: list[str] = []
-        engine._sync_managed_stop_legs = lambda snapshot: call_order.append("sync")
-        engine._observe_stream_health = lambda: call_order.append("health")
-        engine._recover_suspect_orders = lambda snapshot: call_order.append("suspects")
-        engine._process_stream_stop_fills = lambda snapshot: call_order.append("stops")
-        engine._detect_external_closes = lambda snapshot: call_order.append("external")
-        engine._drain_option_fills = lambda: call_order.append("options")
-        engine._drain_spread_fills = lambda: call_order.append("spreads")
-        engine._repair_missing_protective_stops = lambda snapshot: call_order.append("repair")
-
-        engine._run_one_cycle()
-
-        assert call_order.index("stops") < call_order.index("external")
-
-
-# ── start() / stop() / max_cycles ────────────────────────────────────────────
-
-
 class TestStartStop:
     def test_max_cycles_terminates_loop(self, engine_factory):
         engine, broker = engine_factory()
@@ -4078,225 +4052,6 @@ class TestOptionsEngineFixes:
 
     # Fix B: stream stop fill OCC → underlying normalisation ──────────────────
 
-    def test_stream_stop_fill_normalizes_occ_to_underlying(self, tmp_path):
-        """OCC stop fills must be matched to the underlying key in _positions."""
-        from unittest.mock import MagicMock
-        from types import SimpleNamespace
-        from execution.stream import StreamManager
-
-        engine = self._engine(tmp_path)
-        occ = "SPY260516C00520000"
-        engine._register_single_leg(strategy_name="spy_options_reversion", symbol="SPY")
-        engine._entry_prices["SPY"] = 10.0
-
-        fill_update = SimpleNamespace(
-            order=SimpleNamespace(symbol=occ),
-            price="12.50",
-            qty="2",
-        )
-        stream = MagicMock(spec=StreamManager)
-        stream.drain_stop_fills.return_value = [fill_update]
-        engine._stream_manager = stream
-
-        engine._process_stream_stop_fills(_snapshot())
-
-        # Ownership must be cleared using the underlying key.
-        assert not engine._has_position("SPY")
-        assert "SPY" not in engine._entry_prices
-
-    def test_stream_stop_fill_applies_100x_multiplier_for_options(self, tmp_path):
-        """Options stop fills feed 100x P&L into the HWM drawdown gate."""
-        from unittest.mock import MagicMock
-        from types import SimpleNamespace
-        from execution.stream import StreamManager
-        from risk.allocator import SleeveAllocator
-
-        engine = self._engine(tmp_path)
-        occ = "SPY260516C00520000"
-        engine._register_single_leg(strategy_name="spy_options_reversion", symbol="SPY")
-        engine._entry_prices["SPY"] = 10.0  # premium at entry
-
-        allocator = MagicMock(spec=SleeveAllocator)
-        engine._allocator = allocator
-
-        fill_update = SimpleNamespace(
-            order=SimpleNamespace(symbol=occ),
-            price="15.0",   # exit premium
-            qty="2",        # contracts
-        )
-        stream = MagicMock(spec=StreamManager)
-        stream.drain_stop_fills.return_value = [fill_update]
-        engine._stream_manager = stream
-
-        engine._process_stream_stop_fills(_snapshot())
-
-        # P&L = (15 - 10) * 2 * 100 = $1 000
-        allocator.record_realized_pnl.assert_called_once_with(
-            "spy_options_reversion", 1000.0,
-            position_uid=None, is_full_close=True,
-        )
-
-    def test_resynced_stop_fill_flows_through_engine_stop_processing(self, tmp_path):
-        """Gap-resynced stop fills should be handled exactly like live stream fills."""
-        from unittest.mock import MagicMock
-        from execution.stream import StreamManager
-
-        engine = self._engine(tmp_path)
-        occ = "SPY260516C00520000"
-        engine._register_single_leg(strategy_name="spy_options_reversion", symbol="SPY")
-        engine._entry_prices["SPY"] = 10.0
-
-        order = SimpleNamespace(
-            id="stop-ord-gap",
-            symbol=occ,
-            status=SimpleNamespace(value="filled"),
-            filled_qty="2",
-            filled_avg_price="12.5",
-            qty="2",
-        )
-        fill_update = StreamManager._make_synthetic_update(order, "fill")
-
-        stream = MagicMock(spec=StreamManager)
-        stream.drain_stop_fills.return_value = [fill_update]
-        engine._stream_manager = stream
-        engine.trade_logger.log_stop_fill = MagicMock()
-
-        engine._process_stream_stop_fills(_snapshot())
-
-        engine.trade_logger.log_stop_fill.assert_called_once_with(
-            symbol=occ,
-            strategy="spy_options_reversion",
-            qty=2,
-            avg_fill_price=12.5,
-            stop_price=None,
-            order_id="stop-ord-gap",
-            position_uid=None,
-        )
-        assert not engine._has_position("SPY")
-
-    def test_stream_stop_fill_equity_no_occ_normalization(self, tmp_path):
-        """Plain equity stop fills still work without OCC normalization."""
-        from unittest.mock import MagicMock
-        from types import SimpleNamespace
-        from execution.stream import StreamManager
-        from risk.allocator import SleeveAllocator
-
-        engine = self._engine(tmp_path)
-        engine._register_single_leg(strategy_name="sma_crossover", symbol="AAPL")
-        engine._entry_prices["AAPL"] = 100.0
-
-        allocator = MagicMock(spec=SleeveAllocator)
-        engine._allocator = allocator
-
-        fill_update = SimpleNamespace(
-            order=SimpleNamespace(symbol="AAPL"),
-            price="105.0",
-            qty="10",
-        )
-        stream = MagicMock(spec=StreamManager)
-        stream.drain_stop_fills.return_value = [fill_update]
-        engine._stream_manager = stream
-
-        engine._process_stream_stop_fills(_snapshot())
-
-        # P&L = (105 - 100) * 10 * 1 = $50
-        allocator.record_realized_pnl.assert_called_once_with("sma_crossover", 50.0, position_uid=None, is_full_close=True)
-        assert not engine._has_position("AAPL")
-
-    def test_stream_stop_fill_with_fractional_residual_preserves_ownership(self, tmp_path):
-        """A whole-share stop on a fractional position should leave ownership intact for residual cleanup."""
-        from unittest.mock import MagicMock
-        from types import SimpleNamespace
-        from execution.stream import StreamManager
-
-        engine = self._engine(tmp_path)
-        engine._register_single_leg(strategy_name="fake_strategy", symbol="GOOG")
-        engine._entry_prices["GOOG"] = 391.0
-        engine.trade_logger.log_stop_fill = MagicMock()
-
-        fill_update = SimpleNamespace(
-            order=SimpleNamespace(symbol="GOOG", id="goog-stop-1"),
-            price="378.85",
-            qty="7.0",
-        )
-        stream = MagicMock(spec=StreamManager)
-        stream.drain_stop_fills.return_value = [fill_update]
-        engine._stream_manager = stream
-
-        snapshot = _snapshot(
-            positions={"GOOG": Position("GOOG", 0.78, 391.2, 295.76)},
-            open_orders=[],
-        )
-
-        engine._process_stream_stop_fills(snapshot)
-
-        engine.trade_logger.log_stop_fill.assert_called_once_with(
-            symbol="GOOG",
-            strategy="fake_strategy",
-            qty=7.0,
-            avg_fill_price=378.85,
-            stop_price=None,
-            order_id="goog-stop-1",
-            position_uid=None,
-        )
-        assert engine._has_position("GOOG")
-        assert engine._entry_prices["GOOG"] == pytest.approx(391.0)
-
-    def test_stream_stop_fill_uses_cumulative_order_qty_and_avg_price(self, tmp_path):
-        """Stop-fill accounting must use cumulative broker order fields, not the last execution chunk."""
-        from unittest.mock import MagicMock
-        from types import SimpleNamespace
-        from execution.stream import StreamManager
-        from risk.allocator import SleeveAllocator
-
-        engine = self._engine(tmp_path)
-        engine._register_single_leg(strategy_name="donchian_breakout", symbol="PWR")
-        engine._entry_prices["PWR"] = 727.67
-        engine.trade_logger.log_stop_fill = MagicMock()
-
-        allocator = MagicMock(spec=SleeveAllocator)
-        engine._allocator = allocator
-
-        fill_update = SimpleNamespace(
-            order=SimpleNamespace(
-                symbol="PWR",
-                id="pwr-stop-1",
-                filled_qty="5",
-                filled_avg_price="684.11",
-            ),
-            price="684.11",
-            qty="1",
-        )
-        stream = MagicMock(spec=StreamManager)
-        stream.drain_stop_fills.return_value = [fill_update]
-        engine._stream_manager = stream
-
-        snapshot = _snapshot(
-            positions={"PWR": Position("PWR", 0.54, 727.67, 393.0)},
-            open_orders=[],
-        )
-
-        engine._process_stream_stop_fills(snapshot)
-
-        engine.trade_logger.log_stop_fill.assert_called_once_with(
-            symbol="PWR",
-            strategy="donchian_breakout",
-            qty=5.0,
-            avg_fill_price=684.11,
-            stop_price=None,
-            order_id="pwr-stop-1",
-            position_uid=None,
-        )
-        allocator.record_realized_pnl.assert_called_once_with(
-            "donchian_breakout",
-            pytest.approx((684.11 - 727.67) * 5.0),
-            position_uid=None,
-            is_full_close=True,
-        )
-        assert engine._has_position("PWR")
-
-    # log_stop_fill: confirmed WebSocket stop-fill persists real price/qty ─────
-
     def test_log_stop_fill_writes_correct_record(self, tmp_path):
         """log_stop_fill stores the real fill price, qty, and order_type=stop."""
         import sqlite3
@@ -4328,174 +4083,6 @@ class TestOptionsEngineFixes:
         assert filled_qty == 2
         assert reason == "stop_triggered"
         assert stop_price == 7.50
-
-    def test_stream_stop_fill_calls_log_stop_fill_not_external_close(self, tmp_path):
-        """When price and qty are known, _process_stream_stop_fills uses log_stop_fill."""
-        from unittest.mock import MagicMock, patch
-        from types import SimpleNamespace
-        from execution.stream import StreamManager
-
-        engine = self._engine(tmp_path)
-        occ = "SPY260516C00520000"
-        engine._register_single_leg(strategy_name="spy_options_reversion", symbol="SPY")
-        engine._entry_prices["SPY"] = 10.0
-
-        fill_update = SimpleNamespace(
-            order=SimpleNamespace(symbol=occ, id="stop-ord-1", stop_price="8.00"),
-            price="7.50",
-            qty="2",
-        )
-        stream = MagicMock(spec=StreamManager)
-        stream.drain_stop_fills.return_value = [fill_update]
-        engine._stream_manager = stream
-
-        engine.trade_logger.log_stop_fill = MagicMock()
-        engine.trade_logger.log_external_close = MagicMock()
-
-        engine._process_stream_stop_fills(_snapshot())
-
-        engine.trade_logger.log_stop_fill.assert_called_once_with(
-            symbol=occ,
-            strategy="spy_options_reversion",
-            qty=2,
-            avg_fill_price=7.50,
-            stop_price=8.00,
-            order_id="stop-ord-1",
-            position_uid=None,
-        )
-        engine.trade_logger.log_external_close.assert_not_called()
-
-    def test_stream_stop_fill_forwards_none_when_broker_stop_price_missing(self, tmp_path):
-        """
-        Slippage unification Phase 1 codepath §4 — when the broker order
-        carries no stop_price, the engine must forward stop_price=None
-        rather than synthesizing a fallback. log_stop_fill itself handles
-        the unavailable case by writing NULL slippage with kind/quality
-        of 'unavailable'.
-        """
-        from unittest.mock import MagicMock
-        from types import SimpleNamespace
-        from execution.stream import StreamManager
-
-        engine = self._engine(tmp_path)
-        engine._register_single_leg(strategy_name="sma_crossover", symbol="AAPL")
-        engine._entry_prices["AAPL"] = 100.0
-
-        fill_update = SimpleNamespace(
-            # Note: no stop_price attribute on the order.
-            order=SimpleNamespace(symbol="AAPL", id="stop-ord-no-stop"),
-            price="99.40",
-            qty="10",
-        )
-        stream = MagicMock(spec=StreamManager)
-        stream.drain_stop_fills.return_value = [fill_update]
-        engine._stream_manager = stream
-
-        engine.trade_logger.log_stop_fill = MagicMock()
-        engine._process_stream_stop_fills(_snapshot())
-
-        kwargs = engine.trade_logger.log_stop_fill.call_args.kwargs
-        assert kwargs["stop_price"] is None
-
-    def test_stream_stop_fill_falls_back_to_external_close_when_price_missing(self, tmp_path):
-        """When price is missing from the stream event, fall back to log_external_close."""
-        from unittest.mock import MagicMock
-        from types import SimpleNamespace
-        from execution.stream import StreamManager
-
-        engine = self._engine(tmp_path)
-        engine._register_single_leg(strategy_name="sma_crossover", symbol="AAPL")
-        engine._entry_prices["AAPL"] = 100.0
-
-        fill_update = SimpleNamespace(
-            order=SimpleNamespace(symbol="AAPL", id="stop-ord-2"),
-            price=None,
-            qty="10",
-        )
-        stream = MagicMock(spec=StreamManager)
-        stream.drain_stop_fills.return_value = [fill_update]
-        engine._stream_manager = stream
-
-        engine.trade_logger.log_stop_fill = MagicMock()
-        engine.trade_logger.log_external_close = MagicMock()
-
-        engine._process_stream_stop_fills(_snapshot())
-
-        engine.trade_logger.log_stop_fill.assert_not_called()
-        engine.trade_logger.log_external_close.assert_called_once_with(
-            symbol="AAPL",
-            strategy="sma_crossover",
-            reason="stop_triggered",
-        )
-
-    def test_stream_stop_fill_skips_duplicate_order_id(self, tmp_path):
-        """Duplicate stream stop-fill deliveries should be ignored once the order is recorded."""
-        from unittest.mock import MagicMock
-        from types import SimpleNamespace
-        from execution.stream import StreamManager
-
-        engine = self._engine(tmp_path)
-        engine._register_single_leg(strategy_name="fake_strategy", symbol="AAPL")
-        engine._entry_prices["AAPL"] = 100.0
-
-        fill_update = SimpleNamespace(
-            order=SimpleNamespace(symbol="AAPL", id="dup-stop-1"),
-            price="95.0",
-            qty="10",
-        )
-        stream = MagicMock(spec=StreamManager)
-        stream.drain_stop_fills.return_value = [fill_update]
-        engine._stream_manager = stream
-
-        engine.trade_logger.has_recorded_order_id = MagicMock(return_value=True)
-        engine.trade_logger.log_stop_fill = MagicMock()
-        engine.trade_logger.log_external_close = MagicMock()
-        engine.alerts.broker_error = MagicMock()
-        engine._allocator = MagicMock()
-
-        engine._process_stream_stop_fills(_snapshot())
-
-        engine.trade_logger.log_stop_fill.assert_not_called()
-        engine.trade_logger.log_external_close.assert_not_called()
-        engine.alerts.broker_error.assert_not_called()
-        engine._allocator.record_realized_pnl.assert_not_called()
-        assert engine._has_position("AAPL")
-
-    def test_stream_stop_fill_skips_substrate_owned_stop_order(self, tmp_path):
-        """Substrate-owned stop fills are handled by lifecycle event dispatch,
-        leaving the legacy stream fallback idle."""
-        from unittest.mock import MagicMock
-        from types import SimpleNamespace
-        from execution.stream import StreamManager
-
-        engine = self._engine(tmp_path)
-        engine._register_single_leg(strategy_name="fake_strategy", symbol="AAPL")
-        engine._entry_prices["AAPL"] = 100.0
-        engine.lifecycle_orders_store = MagicMock()
-        engine.lifecycle_orders_store.get_by_order_id.return_value = (
-            SimpleNamespace(role="protective_stop")
-        )
-
-        fill_update = SimpleNamespace(
-            order=SimpleNamespace(symbol="AAPL", id="substrate-stop-1"),
-            price="95.0",
-            qty="10",
-        )
-        stream = MagicMock(spec=StreamManager)
-        stream.drain_stop_fills.return_value = [fill_update]
-        engine._stream_manager = stream
-
-        engine.trade_logger.log_stop_fill = MagicMock()
-        engine.trade_logger.log_external_close = MagicMock()
-        engine._allocator = MagicMock()
-
-        engine._process_stream_stop_fills(_snapshot())
-
-        engine.trade_logger.log_stop_fill.assert_not_called()
-        engine.trade_logger.log_external_close.assert_not_called()
-        engine._allocator.record_realized_pnl.assert_not_called()
-        assert engine._has_position("AAPL")
-
 
 class TestGenericSingleLegOptionTrailingStops:
     class GenericOptionStrategy(FakeStrategy):
@@ -6795,6 +6382,94 @@ class TestSubstrateStopFillSeamEndToEnd:
         # Stop-gap erosion is tagged as such, and stays out of the
         # execution-quality family (PR #84).
         assert row["slippage_benchmark_kind"] == "active_stop_price"
+
+    def test_option_stop_fill_applies_the_100x_contract_multiplier(
+        self, tmp_path,
+    ):
+        """Ported from the removed legacy suite (2026-08-14).
+
+        `_process_stream_stop_fills` had
+        `test_stream_stop_fill_applies_100x_multiplier_for_options`. When
+        that path was deleted the substrate handler had OCC coverage only
+        in an AUDIT test — nothing asserted that an option stop fill books
+        P&L at 100x. Losing that would understate every option stop-out by
+        two orders of magnitude, silently.
+
+        Asserts the recorded P&L rather than intercepting the call: the
+        multiplier is only worth testing through what it produces.
+        """
+        from engine.lifecycle import new_position_uid
+        from execution.broker import Position
+
+        tl, conn, pos_store, orders_store, uid, OrderEvent, apply_order_event = (
+            self._setup(tmp_path)
+        )
+        engine = self._engine(tl, pos_store, orders_store)
+
+        # A purpose-built OCC position. Mutating the AAPL fixture's symbol
+        # instead trips the 11.51 identity guard — that order row is already
+        # stamped position_id='AAPL' — which is the guard working, not a bug.
+        occ, entry_px, stop_px, qty = "SPY260821C00738000", 20.0, 18.72, 2.0
+        occ_uid = new_position_uid()
+        pos_store.create_pending(
+            position_uid=occ_uid, symbol=occ, owner_key="SPY",
+            strategy="generic_single_leg_options", position_type="single_leg",
+            entry_qty=qty,
+        )
+        orders_store.insert_pending(
+            position_uid=occ_uid, role="protective_stop",
+            client_order_id="cid-occ-stop", order_type="stop",
+            order_class="simple", time_in_force="gtc", side="sell",
+            intended_qty=qty,
+        )
+        orders_store.attach_broker_order_id(
+            client_order_id="cid-occ-stop", order_id="occ-broker-stop",
+        )
+        # Real Position, not SimpleNamespace — the realized-P&L path
+        # calls dataclasses.asdict() on it.
+        # NOT spy_options_reversion: OPTION_STOP_REPLACE_AUDIT_STRATEGY is
+        # scoped to it, and the audit path needs fixtures unrelated to the
+        # multiplier this test is about.
+        engine._positions["SPY"] = Position(
+            symbol=occ, qty=qty, avg_entry_price=entry_px,
+            market_value=entry_px * qty * 100,
+        )
+        engine._entry_prices["SPY"] = entry_px
+
+        captured: dict = {}
+        real_record = engine._record_realized_pnl
+
+        def _capture(owner_key, owner, price, qty_, **kw):
+            captured.update(kw)
+            captured["owner_key"] = owner_key
+            captured["qty"] = qty_
+
+        engine._record_realized_pnl = _capture
+
+        event = OrderEvent(
+            order_id="occ-broker-stop", status="filled", filled_qty=qty,
+            avg_fill_price=stop_px,
+            broker_updated_at="2026-07-31T13:32:27+00:00",
+        )
+        assert apply_order_event(conn, event).applied is True
+        engine._maybe_dispatch_substrate_stop_fill(
+            event=event, snapshot=_snapshot(positions={}, open_orders=[]),
+        )
+
+        row = next(r for r in tl.read_all() if r["order_id"] == "occ-broker-stop")
+        assert row["symbol"] == occ, "the trade row keeps the OCC symbol"
+        # The multiplier is applied in _record_realized_pnl, which is
+        # captured above. Asserting the recorded P&L on the row instead
+        # would need a full OCC entry fixture for log_stop_fill to derive
+        # a basis from — more fixture than the property is worth.
+        assert captured.get("multiplier") == 100, (
+            f"option stop fill booked at multiplier "
+            f"{captured.get('multiplier')} — option P&L understated 100x"
+        )
+        assert captured.get("owner_key") == "SPY", (
+            "the OCC symbol must normalise to the underlying for ownership"
+        )
+        assert captured.get("qty") == pytest.approx(qty)
 
     def test_entry_and_exit_rows_join_on_entry_timestamp(self, tmp_path):
         """The downstream property that actually matters: the dashboard

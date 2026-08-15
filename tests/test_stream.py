@@ -295,11 +295,15 @@ class TestStopLegRouting:
 
         asyncio.run(_dispatch(sm, update))
 
-        fills = sm.drain_stop_fills()
-        assert len(fills) == 1
-        assert fills[0] is update
+        # The `_stop_fills` accumulator was removed 2026-08-14 along with
+        # `_process_stream_stop_fills`; the fill now reaches the engine as
+        # a substrate OrderEvent. What this test still pins is the stop-leg
+        # registration cleanup, which is unchanged and still live.
         with sm._lock:
             assert "leg-1" not in sm._stop_legs
+            assert any(
+                e.order_id == "leg-1" for e in sm._pending_lifecycle_events
+            ), "the fill must still be emitted as a substrate event"
 
     def test_non_fill_stop_leg_terminal_event_cleans_up_without_accumulating(self):
         sm = _stream()
@@ -308,7 +312,6 @@ class TestStopLegRouting:
 
         asyncio.run(_dispatch(sm, update))
 
-        assert sm.drain_stop_fills() == []
         with sm._lock:
             assert "leg-1" not in sm._stop_legs
 
@@ -351,10 +354,16 @@ class TestGapResync:
 
         asyncio.run(sm._resync_tracked_state())
 
-        fills = sm.drain_stop_fills()
-        assert len(fills) == 1
-        assert fills[0].order.id == "stop-1"
-        assert fills[0].price == 95.0
+        # Recovery still happens — resync routes through _on_trade_update,
+        # the same handler live events use, which emits a substrate
+        # OrderEvent. The `_stop_fills` accumulator it also used to feed was
+        # removed 2026-08-14; this asserts the surviving path.
+        with sm._lock:
+            events = [e for e in sm._pending_lifecycle_events
+                      if e.order_id == "stop-1"]
+        assert len(events) == 1, "gap resync must still recover the stop fill"
+        assert events[0].avg_fill_price == 95.0
+        assert events[0].filled_qty == 10
 
 
 class TestReconnectLoop:
@@ -511,7 +520,9 @@ class TestRecvLoopDefensiveBehavior:
 
         asyncio.run(sm._dispatch_message({"stream": "trade_updates"}))
 
-        assert sm.drain_stop_fills() == []
+        # A malformed message must produce no substrate event at all.
+        with sm._lock:
+            assert sm._pending_lifecycle_events == []
 
 
 class TestStreamManagerLifecycle:

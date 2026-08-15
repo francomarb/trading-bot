@@ -1036,7 +1036,7 @@ _positions: dict[str, Position]   # position_id → Position
 
 Touch points (~10 sites in `engine/trader.py`):
 - `_restore_ownership_from_db`, `_reconcile_startup`
-- `_detect_external_closes`, `_process_stream_stop_fills`
+- `_detect_external_closes` (`_process_stream_stop_fills` removed 2026-08-14; substrate dispatch owns stop fills)
 - `_drain_option_fills`, `_attribute_orders`
 - State snapshot for dashboard
 - `_record_realized_pnl`
