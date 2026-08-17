@@ -4082,3 +4082,195 @@ class TestRiskCarrySurvivesTheDispatchSeam:
         )
         assert qty == 54
         assert ird == pytest.approx(rps * 54, abs=0.01)
+
+
+class TestStatusCteRequiresEntryRows:
+    """A position with no entry rows cannot have its status DERIVED.
+
+    The CTE reads "no entry order is live" as "the entry was cancelled".
+    For a position whose entry was never recorded — every spread, since
+    PR #72 deferred `entry_primary` rows — that inverts the meaning.
+
+    Both failures below were reproduced against the pre-guard CTE during
+    the 2026-08-17 audit. Production was never wrong, because the spread
+    path stamps status directly via mark_open/mark_closed and those land
+    afterwards; the guard closes the window rather than relying on the
+    stamp always winning.
+    """
+
+    def _spread(self, tmp_path, *, qty=1.0):
+        from reporting.logger import TradeLogger
+        from engine.lifecycle import PositionLifecycleStore, new_position_uid
+        from engine.lifecycle_orders import PositionLifecycleOrdersStore
+        tl = TradeLogger(path=str(tmp_path / "t.db"))
+        conn = tl._ensure_db()
+        pos = PositionLifecycleStore(conn)
+        orders = PositionLifecycleOrdersStore(conn)
+        uid = new_position_uid()
+        pos.create_pending(position_uid=uid, symbol="QQQ", owner_key="QQQ",
+                           strategy="credit_spread", position_type="spread",
+                           entry_qty=qty)
+        pos.mark_open(position_uid=uid, current_qty=qty, avg_entry_price=2.01)
+        return conn, pos, orders, uid
+
+    def _exit_order(self, orders, uid, *, qty=1.0):
+        orders.insert_pending(position_uid=uid, role="exit",
+                              client_order_id="cid-x", order_type="limit",
+                              order_class="mleg", time_in_force="day",
+                              side="buy", intended_qty=qty)
+        orders.attach_broker_order_id(client_order_id="cid-x",
+                                      order_id="combo-1")
+
+    def test_a_working_exit_does_not_cancel_a_live_spread(self, tmp_path):
+        """Pre-guard this computed 'canceled' for a position that is OPEN
+        with an unfilled close resting at the broker."""
+        conn, pos, orders, uid = self._spread(tmp_path)
+        self._exit_order(orders, uid)
+        apply_order_event(conn, OrderEvent(
+            order_id="combo-1", status="working", filled_qty=0.0,
+            avg_fill_price=None,
+            broker_updated_at="2026-08-17T14:00:00+00:00"), reason="stream")
+        row = pos.get_by_position_uid(uid)
+        assert row.status == "open", (
+            f"live spread with a working exit was marked {row.status!r}"
+        )
+        assert row.current_qty == pytest.approx(1.0)
+
+    def test_a_filled_exit_does_not_reopen_a_closed_spread(self, tmp_path):
+        """Pre-guard this computed 'open' with qty 1.0 AFTER the close
+        filled — the substrate believing a closed position was still on."""
+        conn, pos, orders, uid = self._spread(tmp_path)
+        self._exit_order(orders, uid)
+        apply_order_event(conn, OrderEvent(
+            order_id="combo-1", status="filled", filled_qty=1.0,
+            avg_fill_price=1.80,
+            broker_updated_at="2026-08-17T14:02:00+00:00"), reason="stream")
+        row = pos.get_by_position_uid(uid)
+        assert row.status == "open", (
+            "with no entry row the status must be left to the caller's "
+            f"stamp, not derived; got {row.status!r}"
+        )
+
+    def test_the_guard_preserves_whatever_the_caller_stamped(self, tmp_path):
+        """It returns the stored status — it does not invent a new one."""
+        conn, pos, orders, uid = self._spread(tmp_path)
+        pos.mark_closed(position_uid=uid)
+        stored = pos.get_by_position_uid(uid).status
+        self._exit_order(orders, uid)
+        apply_order_event(conn, OrderEvent(
+            order_id="combo-1", status="filled", filled_qty=1.0,
+            avg_fill_price=1.80,
+            broker_updated_at="2026-08-17T14:02:00+00:00"), reason="stream")
+        assert pos.get_by_position_uid(uid).status == stored
+
+    def test_a_position_WITH_entry_rows_still_derives_normally(self, tmp_path):
+        """The guard must not disable derivation for single-leg positions —
+        that is the whole state machine. This is the contrast case."""
+        from reporting.logger import TradeLogger
+        from engine.lifecycle import PositionLifecycleStore, new_position_uid
+        from engine.lifecycle_orders import PositionLifecycleOrdersStore
+        tl = TradeLogger(path=str(tmp_path / "t.db"))
+        conn = tl._ensure_db()
+        pos = PositionLifecycleStore(conn)
+        orders = PositionLifecycleOrdersStore(conn)
+        uid = new_position_uid()
+        pos.create_pending(position_uid=uid, symbol="AAPL", owner_key="AAPL",
+                           strategy="donchian_breakout",
+                           position_type="single_leg", entry_qty=10.0)
+        orders.insert_pending(position_uid=uid, role="entry_primary",
+                              client_order_id="cid-e", order_type="market",
+                              order_class="simple", time_in_force="day",
+                              side="buy", intended_qty=10.0)
+        orders.attach_broker_order_id(client_order_id="cid-e",
+                                      order_id="entry-1")
+        apply_order_event(conn, OrderEvent(
+            order_id="entry-1", status="filled", filled_qty=10.0,
+            avg_fill_price=100.0,
+            broker_updated_at="2026-08-17T14:00:00+00:00"), reason="stream")
+        row = pos.get_by_position_uid(uid)
+        assert row.status == "open", (
+            f"derivation broke for a normal single-leg entry: {row.status!r}"
+        )
+        assert row.current_qty == pytest.approx(10.0)
+
+    def test_entry_cancelled_before_any_fill_still_derives_canceled(
+        self, tmp_path
+    ):
+        """The branch the guard is most likely to have broken: a genuine
+        cancellation must still be derived, because the entry row EXISTS."""
+        from reporting.logger import TradeLogger
+        from engine.lifecycle import PositionLifecycleStore, new_position_uid
+        from engine.lifecycle_orders import PositionLifecycleOrdersStore
+        tl = TradeLogger(path=str(tmp_path / "t.db"))
+        conn = tl._ensure_db()
+        pos = PositionLifecycleStore(conn)
+        orders = PositionLifecycleOrdersStore(conn)
+        uid = new_position_uid()
+        pos.create_pending(position_uid=uid, symbol="AAPL", owner_key="AAPL",
+                           strategy="donchian_breakout",
+                           position_type="single_leg", entry_qty=10.0)
+        orders.insert_pending(position_uid=uid, role="entry_primary",
+                              client_order_id="cid-e", order_type="limit",
+                              order_class="simple", time_in_force="day",
+                              side="buy", intended_qty=10.0)
+        orders.attach_broker_order_id(client_order_id="cid-e",
+                                      order_id="entry-1")
+        apply_order_event(conn, OrderEvent(
+            order_id="entry-1", status="canceled", filled_qty=0.0,
+            avg_fill_price=None,
+            broker_updated_at="2026-08-17T14:00:00+00:00"), reason="stream")
+        assert pos.get_by_position_uid(uid).status == "canceled"
+
+    def test_a_filled_exit_does_not_roll_a_closed_spread_back_to_positive_qty(
+        self, tmp_path
+    ):
+        """The sign bug, pinned separately from status.
+
+        A credit spread's entry is a SELL to open and its close a BUY to
+        close. With no entry row the rollup sums only the buy-to-close, so
+        a FULLY CLOSED spread rolled up to current_qty = +1.0 — the
+        substrate reporting a flat position as open, with quantity.
+        """
+        conn, pos, orders, uid = self._spread(tmp_path)
+        self._exit_order(orders, uid)
+        apply_order_event(conn, OrderEvent(
+            order_id="combo-1", status="filled", filled_qty=1.0,
+            avg_fill_price=1.80,
+            broker_updated_at="2026-08-17T14:02:00+00:00"), reason="stream")
+        assert pos.get_by_position_uid(uid).current_qty == pytest.approx(1.0), (
+            "qty must be left at the caller's stamp, not re-derived from a "
+            "close-only order set"
+        )
+
+    def test_the_guard_does_not_touch_net_realized_pnl(self, tmp_path):
+        """The guard covers current_qty and avg_entry_price only.
+
+        `net_realized_pnl` reads the `trades` table rather than order rows,
+        so guarding it would be wrong in principle — but note it does NOT
+        follow that spread P&L reaches the parent row. It does not: spread
+        trade rows carry `position_uid` WITHOUT the `pos_` prefix that
+        `spread_substrate_uid()` adds, so the rollup's join never matches
+        and all five closed spread parents sit at 0.0 against -$1,934 of
+        real losses. That predates this guard and is tracked separately in
+        PLAN; asserting "spread P&L still rolls up" here would be asserting
+        something production does not do.
+
+        So this pins the narrow, true property: a row the rollup CAN match
+        is still summed after the guard.
+        """
+        conn, pos, orders, uid = self._spread(tmp_path)
+        conn.execute(
+            "INSERT INTO trades (timestamp, symbol, side, qty, strategy, "
+            "reason, status, position_uid, realized_pnl, position_type) "
+            "VALUES ('2026-08-17T14:02:00+00:00','QQQ260918P00679000','buy',"
+            "1,'credit_spread','spread exit','filled',?,-310.0,'spread')",
+            (uid,))
+        conn.commit()
+        self._exit_order(orders, uid)
+        apply_order_event(conn, OrderEvent(
+            order_id="combo-1", status="filled", filled_qty=1.0,
+            avg_fill_price=1.80,
+            broker_updated_at="2026-08-17T14:02:00+00:00"), reason="stream")
+        assert pos.get_by_position_uid(uid).net_realized_pnl == pytest.approx(-310.0), (
+            "the guard must not suppress the trades-derived P&L rollup"
+        )
