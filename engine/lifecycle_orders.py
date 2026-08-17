@@ -1547,17 +1547,37 @@ WITH signed_qty AS (
 )
 UPDATE position_lifecycle
 SET
+    -- Guard (2026-08-17), same reasoning as _POSITION_STATUS_SQL: with no
+    -- entry rows there is nothing to roll up FROM, so keep what the caller
+    -- stamped. The sign is what makes this wrong rather than merely empty:
+    -- a credit spread's entry is a SELL to open and its close a BUY to
+    -- close, so without the entry row the buy-to-close sums as an OPENING
+    -- buy and a fully closed spread rolls up to current_qty = +1.
+    -- net_realized_pnl below is deliberately NOT guarded — it reads the
+    -- `trades` table, not order rows, so it stays correct for spreads.
     current_qty = CASE
+        WHEN NOT EXISTS (
+            SELECT 1 FROM position_lifecycle_orders
+            WHERE position_uid = :position_uid
+              AND role IN ('entry_primary', 'entry_residual')
+        ) THEN current_qty
         WHEN ABS((SELECT net_qty FROM signed_qty)) <= 1e-9 THEN 0.0
         ELSE (SELECT net_qty FROM signed_qty)
     END,
-    avg_entry_price = (
-        SELECT SUM(filled_qty * avg_fill_price) / NULLIF(SUM(filled_qty), 0)
-        FROM position_lifecycle_orders
-        WHERE position_uid = :position_uid
-          AND role IN ('entry_primary', 'entry_residual')
-          AND filled_qty > 0
-    ),
+    avg_entry_price = CASE
+        WHEN NOT EXISTS (
+            SELECT 1 FROM position_lifecycle_orders
+            WHERE position_uid = :position_uid
+              AND role IN ('entry_primary', 'entry_residual')
+        ) THEN avg_entry_price
+        ELSE (
+            SELECT SUM(filled_qty * avg_fill_price) / NULLIF(SUM(filled_qty), 0)
+            FROM position_lifecycle_orders
+            WHERE position_uid = :position_uid
+              AND role IN ('entry_primary', 'entry_residual')
+              AND filled_qty > 0
+        )
+    END,
     net_realized_pnl = COALESCE((
         SELECT SUM(realized_pnl)
         FROM trades
@@ -1576,6 +1596,31 @@ WHERE position_uid = :position_uid
 _POSITION_STATUS_SQL = """
 WITH computed AS (
     SELECT CASE
+        -- Guard (2026-08-17): a position with NO entry rows cannot have
+        -- its status derived from order rows — there is nothing to derive
+        -- from. Keep whatever the caller stamped instead of guessing.
+        --
+        -- Without this, the clauses below read "no entry order is live"
+        -- as "the entry was cancelled", when the truth is "the entry was
+        -- never recorded here". Spreads hit this on every close: they
+        -- write no entry_primary row (PR #72 deferred it), so an exit
+        -- order going `working` computed 'canceled' for a LIVE position,
+        -- and an exit that FILLED computed 'open' for a closed one.
+        -- Both reproduced in tests/test_apply_order_event.py.
+        --
+        -- Production was never wrong because the spread path stamps
+        -- status directly via mark_open / mark_closed and those writes
+        -- land after. This closes the window between the two rather than
+        -- relying on the stamp always winning.
+        WHEN NOT EXISTS (
+            SELECT 1 FROM position_lifecycle_orders
+            WHERE position_uid = :position_uid
+              AND role IN ('entry_primary', 'entry_residual')
+        ) THEN (
+            SELECT status FROM position_lifecycle
+            WHERE position_uid = :position_uid
+        )
+
         WHEN NOT EXISTS (
             SELECT 1 FROM position_lifecycle_orders
             WHERE position_uid = :position_uid

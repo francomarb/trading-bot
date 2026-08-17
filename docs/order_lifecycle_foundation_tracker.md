@@ -164,6 +164,7 @@ Statuses below cover the SUBSTRATE-LANDED portion of the PR. Items still in the 
 | 13 | `closed_at` set only on `closed` / `external_closed` | §6.6.1 R8-P2 | 4 | ✅ |
 | 14 | `closed_at` reads new status via CTE | §6.6.1 R9-P1a | 4 | ✅ |
 | 15 | Negative `current_qty` → `error` | §6.6.1 R9-P1b | 4 | ✅ |
+| 16 | No entry rows → status and qty are NOT derived; the caller's stamp stands | §6.6.1 (2026-08-17) | 7 | ✅ |
 | 16 | `'error'` retains owner_key lock | §6.2 R8-3 | 1 | ✅ |
 | 17 | Reverse-pass skips `'error'` rows | §3.1 R8-4 | P-2 (TestCycleReconcileStoreQuery::test_error_status_excluded) | ✅ |
 | 18 | Dedupe script detection-only default | §12.2 R8-2 | 7 | ✅ |
