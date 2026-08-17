@@ -4242,9 +4242,22 @@ class TestStatusCteRequiresEntryRows:
             "close-only order set"
         )
 
-    def test_realized_pnl_still_rolls_up_for_a_spread(self, tmp_path):
-        """net_realized_pnl reads `trades`, not order rows, so it must NOT
-        be caught by the guard — spreads still need their P&L."""
+    def test_the_guard_does_not_touch_net_realized_pnl(self, tmp_path):
+        """The guard covers current_qty and avg_entry_price only.
+
+        `net_realized_pnl` reads the `trades` table rather than order rows,
+        so guarding it would be wrong in principle — but note it does NOT
+        follow that spread P&L reaches the parent row. It does not: spread
+        trade rows carry `position_uid` WITHOUT the `pos_` prefix that
+        `spread_substrate_uid()` adds, so the rollup's join never matches
+        and all five closed spread parents sit at 0.0 against -$1,934 of
+        real losses. That predates this guard and is tracked separately in
+        PLAN; asserting "spread P&L still rolls up" here would be asserting
+        something production does not do.
+
+        So this pins the narrow, true property: a row the rollup CAN match
+        is still summed after the guard.
+        """
         conn, pos, orders, uid = self._spread(tmp_path)
         conn.execute(
             "INSERT INTO trades (timestamp, symbol, side, qty, strategy, "
@@ -4258,4 +4271,6 @@ class TestStatusCteRequiresEntryRows:
             order_id="combo-1", status="filled", filled_qty=1.0,
             avg_fill_price=1.80,
             broker_updated_at="2026-08-17T14:02:00+00:00"), reason="stream")
-        assert pos.get_by_position_uid(uid).net_realized_pnl == pytest.approx(-310.0)
+        assert pos.get_by_position_uid(uid).net_realized_pnl == pytest.approx(-310.0), (
+            "the guard must not suppress the trades-derived P&L rollup"
+        )

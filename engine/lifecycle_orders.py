@@ -1554,7 +1554,12 @@ SET
     -- close, so without the entry row the buy-to-close sums as an OPENING
     -- buy and a fully closed spread rolls up to current_qty = +1.
     -- net_realized_pnl below is deliberately NOT guarded — it reads the
-    -- `trades` table, not order rows, so it stays correct for spreads.
+    -- `trades` table, not order rows, so the guard's premise does not
+    -- apply to it. That is NOT a claim that spread P&L reaches this
+    -- row: spread trade rows carry position_uid without the `pos_`
+    -- prefix spread_substrate_uid() adds, so this join never matches
+    -- for them and the parent stays 0.0. Separate defect, predates
+    -- this guard, tracked in PLAN.
     current_qty = CASE
         WHEN NOT EXISTS (
             SELECT 1 FROM position_lifecycle_orders
