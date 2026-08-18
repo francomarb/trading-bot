@@ -35,19 +35,40 @@ low exit only triggers when the trend genuinely fails.
 | `entry_window` | 30 days |
 | `exit_window` | 15 days |
 | Variant name | Mid-range (30/15) |
-| Order type | MARKET |
-| Regime gate | `TRENDING` only — blocked in BEAR, VOLATILE, RANGING |
+| Order type | **STOP_LIMIT** (`preferred_order_type`, shipped PR #62) — *was MARKET; the doc said MARKET until 2026-08-18* |
+| Regime gate | `TRENDING` only — blocked in BEAR, VOLATILE, RANGING. **The "RANGING gets faded / VOLATILE whipsaws" rationale was measured and refuted 2026-08-18** — see `11.59` and [`donchian_regime_gate_investigation.md`](donchian_regime_gate_investigation.md). Unchanged pending that decision. |
 | Edge filter | `DonchianEdgeFilter`: stock > 200 SMA, earnings blackout (1 day before / 0 after), IEX-scaled liquidity floor |
 | Sleeve weight | 0.25 of gross capital |
-| Max positions | 5 concurrent |
+| Max positions | **8** (`STRATEGY_ALLOCATIONS["donchian_breakout"]["hard_max_positions"]`) — *doc said 5 until 2026-08-18* |
 | ATR stop | 2× ATR (engine's `ATR_STOP_MULTIPLIER`) |
 | HWM drawdown gate | Live (and opt-in mature paper): entries pause if cumulative realized P&L drops >15% of sleeve budget below peak; default paper reports the breach without pausing |
 | Universe | `DONCHIAN_WATCHLIST` — 32 names (see below) |
 
-**Capital math at $100k equity:**
-- Sleeve budget = $100k × 0.80 × 0.25 = **$20,000**
-- Per-position notional cap = $20,000 ÷ 5 = **$4,000**
-- Max simultaneous loss (all 5 stops fire) = 5 × 2% × $100k = **$10,000** — capped by the 5% daily-loss kill switch before it compounds
+**Capital math at $100k equity** *(recomputed from `config/settings.py`
+2026-08-18 — the previous version derived every line from a stale
+`max positions = 5` and a `2%` per-trade risk that the allocator does not
+use, and was wrong on all three figures):*
+
+- **Target sleeve budget** = $100k × `MAX_GROSS_EXPOSURE_PCT` 0.80 × `target_pct` 0.25 = **$20,000**
+- **Per-position notional cap — baseline** = $20,000 × `max_position_pct_of_sleeve` 0.40 = **$8,000** *(not $20,000 ÷ 8 — the cap is a percentage, not an even split)*
+- **Per-position notional cap — stretch maximum** = **$9,200**. Donchian sets
+  `can_stretch: True`, so when total deployable utilization is below
+  `ALLOCATOR_STRETCH_UTILIZATION_THRESHOLD` (0.80) **and** the equity pool has
+  slack, the allocator raises the effective sleeve to
+  `target × (1 + stretch_pct 0.15)` = **$23,000**. The concentration cap is
+  computed against that **effective** budget, not the target
+  ([`risk/allocator.py`](../risk/allocator.py) — `max_position_notional =
+  min(available, effective_budget × max_position_pct_of_sleeve)`), so it rises
+  with it: $23,000 × 0.40 = $9,200. Borrowed capacity is returned as the pool
+  fills, so $8,000 is the number to plan with and $9,200 is the ceiling a
+  single position can actually reach.
+- **Risk per trade** = `risk_per_trade_pct` 0.004 × $100k = **$400** *(target; sizing is risk-first in `RiskManager`, and `11.48` tracks the gap between this target and recorded risk)*
+- **Planned max simultaneous risk** (all 8 stops fire at target size) = 8 × $400 = **$3,200** — well inside the 5% daily-loss kill switch
+
+> **Do not re-derive these by hand.** `11.48` (allocator risk-target
+> reconciliation) exists because recorded per-trade risk has ranged $55–$1,601
+> against these targets. `settings.py` is the source of truth; this table is a
+> readable copy that has already drifted once.
 
 ---
 

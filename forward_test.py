@@ -263,13 +263,21 @@ def main() -> None:
                 list(settings.DONCHIAN_WATCHLIST), name="donchian"
             ),
             # Donchian breakout is a pure trend-continuation strategy.
-            # Literature is unanimous: restrict to TRENDING only.
-            # RANGING → every N-day high is a false breakout that reverses;
-            # BEAR    → blocked by regime detector (no long entries in downtrend);
-            # VOLATILE → erratic price action produces whipsaws with wide ATR stops.
-            # Backtest validation: Mid-range (30/15), Sharpe +0.85, 32-name
-            # AI/Bigtech universe, 4y window ending 2026-04-28 (2× ATR stops).
-            # Sleeve: 0.25 weight, max 5 concurrent positions.
+            # TRENDING-only. The per-regime rationale that used to sit here
+            # ("RANGING → every N-day high is a false breakout"; "VOLATILE →
+            # whipsaws") was MEASURED AND REFUTED on 2026-08-18: on SIP
+            # 2016-11→2026-08, ai_bigtech, RANGING entries return mean R 0.71
+            # against TRENDING's 0.71, and VOLATILE 0.72 is the best bucket of
+            # the four. The gate's measured value is BEAR protection only.
+            # Kept at TRENDING pending the `11.59` decision (PR #111 proposes a
+            # BEAR-only alternative; it is NOT applied). Canonical rationale:
+            # config/settings.py STRATEGY_ALLOWED_REGIMES and
+            # docs/donchian_regime_gate_investigation.md — do not restate it
+            # here, and do not restore the refuted version.
+            # Historical note: the "Sharpe +0.85" figure previously cited here
+            # came from a 4y IEX per-symbol sweep ending 2026-04-28 and is NOT
+            # comparable to the SIP portfolio-style numbers in the
+            # investigation; quote the feed, window and method with either.
             allowed_regimes=frozenset({MarketRegime.TRENDING}),
         ),
         StrategySlot(

@@ -572,8 +572,18 @@ STRATEGY_ALLOWED_REGIMES: dict[str, set[str]] = {
     "rsi_reversion":     {"TRENDING", "RANGING"},
     # Squeeze fires best after compression breaks (TRENDING) or during it (RANGING).
     "bollinger_squeeze": {"TRENDING", "RANGING"},
-    # Donchian whipsaws hard in RANGING regimes (every 20-day high gets faded).
-    # Restrict to TRENDING only — academic literature is unanimous on this.
+    # TRENDING-only. The original rationale here — "Donchian whipsaws hard in
+    # RANGING regimes (every 20-day high gets faded), academic literature is
+    # unanimous" — was MEASURED AND REFUTED on 2026-08-18 for this universe.
+    # Raw-signal trades bucketed by SPY regime at entry, SIP 2016-11→2026-08,
+    # ai_bigtech: TRENDING mean R 0.71, RANGING mean R 0.71 (higher win rate),
+    # VOLATILE 0.72, BEAR 0.63. RANGING is not faded here.
+    # The gate's real, measured value is BEAR protection (2022: -47.8R ungated
+    # → -9.1R gated); it made 2018 worse (-13.7R → -19.5R).
+    # Kept at TRENDING pending the decision on `11.59` — a pre-registered
+    # BEAR-only alternative passed its criteria and is proposed in PR #111,
+    # NOT applied. Do not "restore" the old rationale.
+    # See docs/donchian_regime_gate_investigation.md.
     "donchian_breakout": {"TRENDING"},
     "spy_options_reversion": {"TRENDING", "RANGING"},
     # Credit spreads sell premium — never in BEAR or VOLATILE (a vol spike
