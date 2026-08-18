@@ -199,11 +199,12 @@ RSI mean reversion profits when prices snap back from extremes. It performs well
 | Status | **Paper Trading** |
 | Sleeve weight | 25% of gross capital |
 | Max positions | **8** (`hard_max_positions`) |
-| Per-position budget | **~$8,000** at $100k paper equity (`max_position_pct_of_sleeve` 0.40 × $20k sleeve) |
+| Per-position budget | **$8,000** baseline at $100k paper equity (`max_position_pct_of_sleeve` 0.40 × $20k target sleeve); **up to $9,200** when the allocator stretch applies — `can_stretch: True` raises the effective sleeve to $23,000 while utilization < 80% and the equity pool has slack, and the cap is computed against the *effective* budget |
 | Activated | 2026-05-01 |
 
 > **Corrected 2026-08-18.** This table previously said MARKET / 5 positions /
-> ~$4,000, all three stale. `config/settings.py` is the source of truth; see
+> ~$4,000, all three stale, and quoted the baseline cap without the stretch
+> ceiling. `config/settings.py` is the source of truth; see
 > [`donchian_breakout_strategy.md`](donchian_breakout_strategy.md) for the full
 > capital math and `11.59` for the open regime-gate question.
 
@@ -255,7 +256,19 @@ All gates must pass for an entry to be allowed. Exits are never blocked.
 | VOLATILE | ❌ No |
 | BEAR | ❌ No |
 
-RANGING is explicitly blocked — in a sideways market every N-day high is a false breakout that reverses. Donchian needs a confirmed trend to produce positive expectancy.
+RANGING, VOLATILE and BEAR are blocked — **unchanged, but the original
+rationale for blocking RANGING and VOLATILE was measured and refuted on
+2026-08-18.** This paragraph used to assert that in a sideways market every
+N-day high is a false breakout and that Donchian needs a confirmed trend for
+positive expectancy. On SIP 2016-11→2026-08 over the `ai_bigtech` universe,
+raw-signal trades bucketed by SPY regime at entry give **RANGING mean R 0.71
+against TRENDING's 0.71** (RANGING with a *higher* win rate), and VOLATILE
+0.72 — the best of the four buckets. The gate's measured value is BEAR
+protection, not RANGING avoidance.
+
+The gate is **still `TRENDING`-only** pending the decision on `11.59`; a
+pre-registered BEAR-only alternative passed its criteria and is proposed, not
+applied. See [`donchian_regime_gate_investigation.md`](donchian_regime_gate_investigation.md).
 
 **Exit mechanics:**
 
@@ -268,7 +281,19 @@ RANGING is explicitly blocked — in a sideways market every N-day high is a fal
 32-name ai_bigtech universe: 23 AI core names (NVDA, MSFT, GOOGL, META, AMZN, etc.) + 9 AI-adjacent names (semiconductor equipment, data-centre power, quantum). See [`docs/donchian_breakout_strategy.md`](donchian_breakout_strategy.md) for the full universe methodology.
 
 **Why this strategy:**
-Donchian breakout is a pure trend-continuation system (Turtle Trading, System 1). It profits when a stock breaks to new highs with momentum and rides the trend until it reverses. It generates no signals in sideways or declining markets, making it naturally complementary to RSI Reversion. Restricted to the TRENDING regime only to eliminate false breakouts in range-bound conditions.
+Donchian breakout is a pure trend-continuation system (Turtle Trading, System 1). It profits when a stock breaks to new highs with momentum and rides the trend until it reverses. Restricted to the TRENDING regime only.
+
+> **Two claims removed here on 2026-08-18, both measured false.** (1) *"It
+> generates no signals in sideways or declining markets"* — the raw signal
+> fires plentifully in both: 443 RANGING and 160 BEAR entries against
+> TRENDING's 520 over SIP 2016-11→2026-08. Those entries are **blocked by the
+> regime gate**, which is not the same as not existing, and the difference
+> matters when reasoning about how much the gate costs. (2) *"Restricted to
+> TRENDING only to eliminate false breakouts in range-bound conditions"* —
+> RANGING entries return mean R 0.71 against TRENDING's 0.71, so there is no
+> false-breakout penalty to eliminate. The gate's measured value is BEAR
+> protection. See `11.59` and
+> [`donchian_regime_gate_investigation.md`](donchian_regime_gate_investigation.md).
 
 ---
 
