@@ -1,6 +1,15 @@
 # Donchian entry-gate investigation — does the gate stack earn its cost?
 
-> **Status: OPEN — evidence gathered, no change proposed or authorised.**
+> **Status: OPEN — pre-registered BEAR-only test PASSED 2026-08-18 (§10).**
+> A pass authorises *proposing* the change via PR for paper observation; it is
+> not a live-behaviour change and not self-approving. Arm E (allow
+> TRENDING/RANGING/VOLATILE, block BEAR) returns **+41.0% / Sharpe 0.52 /
+> maxDD −15.9%** against production's **+27.4% / 0.39 / −15.0%**, and beats
+> production in **9 of 11 years**. The accepted cost: 2022 worsens from −9.1R
+> to −16.1R, and entry count rises 714 → 997, which interacts with the
+> unmodelled `11.48` correlated-entry clustering.
+>
+> **Original finding, unchanged:**
 > The SPY-TRENDING regime gate's stated premise does not survive contact with
 > ten years of SIP data on the `ai_bigtech` universe: RANGING entries have
 > **identical** expectancy to TRENDING entries (both `mean R = 0.71`). The gate
@@ -337,9 +346,85 @@ an edge looks like.
 (4) or [[feedback_trade_log_outranks_the_model]]. A pass authorises a proposal
 under paper observation; the live trade log remains the arbiter.
 
-### 10.4 Result
+### 10.4 Result — run 2026-08-18, criteria unchanged from commit `d799ac0`
 
-*(Filled in below after running. Nothing above this line may be edited.)*
+**Verdict: PASS on all three.** Nothing in §10.1–10.3 was edited after running.
+
+| criterion | threshold | arm E | production | |
+|---|---|---:|---:|---|
+| **C1 primary** — 2022 sum R | ≥ −20.0R | **−16.1R** | −9.1R | **PASS** |
+| **C2 secondary** — full-run return | ≥ D + 5.0pp | **+41.0%** | +27.4% | **PASS** |
+| **C3 guardrail** — mean maxDD | ≥ −18.0% | **−15.9%** | −15.0% | **PASS** |
+
+Arm E in full: **997 trades, 41.5% win, mean R 0.66, mean return +41.0%,
+Sharpe 0.52, maxDD −15.9%.**
+
+| arm | trades | mean R | mean ret% | Sharpe | maxDD% |
+|---|---:|---:|---:|---:|---:|
+| A raw (no gates) | 1209 | 0.70 | +51.7 | 0.58 | −17.5 |
+| D production | 714 | 0.62 | +27.4 | 0.39 | −15.0 |
+| **E BEAR-only** | **997** | **0.66** | **+41.0** | **0.52** | **−15.9** |
+
+#### Read C1 carefully — it passed, but it is the weakest of the three
+
+2022 lands at **−16.1R against production's −9.1R**. The BEAR exclusion is
+**worse than the current gate in the year the current gate exists for**, by 7R.
+It cleared the pre-registered bar of −20.0R with 3.9R of margin, which is not
+comfortable. Stated plainly because the bar was set in advance and cleared, not
+because the result is unambiguous.
+
+What makes it defensible: against the **ungated** −47.8R, arm E removes 66% of
+the 2022 damage while retaining 25 of 103 entries. So the BEAR exclusion does
+provide real bear protection — it is simply less absolute than blocking
+everything that is not TRENDING.
+
+#### The genuinely new evidence is the per-year shape
+
+Sum R by entry year (A raw / D production / E BEAR-only):
+
+| year | A raw | D production | **E BEAR-only** |
+|---:|---:|---:|---:|
+| 2016 | +22.8 | +21.8 | +21.8 |
+| 2017 | +45.2 | +39.5 | **+44.4** |
+| **2018** | −13.7 | −19.5 | **−9.8** ← best arm |
+| 2019 | +103.7 | +32.4 | **+54.9** |
+| 2020 | +92.4 | +36.9 | **+77.9** |
+| 2021 | +36.3 | +8.3 | **+27.0** |
+| **2022** | −47.8 | **−9.1** | −16.1 |
+| 2023 | +168.9 | +62.4 | **+126.4** |
+| 2024 | +246.7 | +110.5 | **+154.4** |
+| 2025 | +141.7 | +95.8 | **+123.8** |
+| 2026 | +48.3 | **+60.3** | +51.3 |
+
+**Arm E beats production in 9 of 11 years**, losing only 2022 and 2026. More
+tellingly, **it beats the ungated arm in both bad years** (2018: −9.8 vs −13.7;
+2022: −16.1 vs −47.8) — which is the evidence that the BEAR exclusion is doing
+real protective work rather than just trading more. In 2018 it is the best of
+all three arms, where the current TRENDING-only gate is the worst.
+
+C2 behaved exactly as the registration predicted it would: +41.0% sits between
+arm C (+43.1%) and arm D (+27.4%). **Per §10.2 it is not reported as evidence.**
+
+#### What this authorises, and what it does not
+
+Per §10.3, a pass **authorises proposing the change via PR for paper
+observation**. It is not a live-behaviour change, it is not self-approving, and
+it does not override `11.56` re-open condition (4) or
+[[feedback_trade_log_outranks_the_model]].
+
+Carried forward into any such proposal, unchanged from §7:
+
+- **These are not portfolio returns.** Arm E opens **997 trades against
+  production's 714** — a 40% increase in entries and therefore in concurrent
+  positions. Nothing here models the allocator sleeve budget, sector caps, or
+  the correlated-entry clustering recorded against `11.48`, and that clustering
+  is the mechanism that turned the live June cohort into a single correlated
+  loss. **This is the largest unmodelled risk in the change** and it argues for
+  pairing any gate loosening with the correlated-entry heat cap rather than
+  shipping it alone.
+- 2022 gets worse (−9.1R → −16.1R). That is a real, accepted cost, not noise.
+- Earnings blackout unmodelled; fills are next-bar-open against production's
+  STOP_LIMIT with chase cap.
 
 ---
 
