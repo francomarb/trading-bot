@@ -2890,8 +2890,16 @@ class TradingEngine:
                 f"qty={qty} price={price} strategy={owner} "
                 f"position_uid={order_row.position_uid[:18]}…"
             )
-            logger.warning(msg)
-            self.alerts.broker_error(msg)
+            logger.info(msg)
+            self.alerts.trade_executed(
+                symbol=raw_symbol,
+                strategy=owner,
+                side="sell",
+                qty=qty,
+                price=price,
+                reason="protective stop filled",
+                position_uid=order_row.position_uid,
+            )
             self._external_close_suspects.pop(owner_key, None)
 
             if has_residual:
