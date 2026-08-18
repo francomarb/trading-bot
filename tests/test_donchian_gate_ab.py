@@ -229,6 +229,95 @@ class TestRegimeAtEntry:
         assert regime_at_entry([], regime) == {}
 
 
+class TestPreRegisteredCriteria:
+    """
+    Guards the arm-E pre-registration in
+    docs/donchian_regime_gate_investigation.md §10. The thresholds are the
+    commitment; a silent retune to fit a result is the failure mode these
+    tests exist to make loud.
+    """
+
+    def test_thresholds_match_the_registered_values(self):
+        from scripts import donchian_gate_ab as mod
+
+        assert mod.PREREG_2022_MIN_SUM_R == -20.0
+        assert mod.PREREG_MIN_RETURN_GAIN_PP == 5.0
+        assert mod.PREREG_MAX_DD_WORSENING_PP == 3.0
+
+    @staticmethod
+    def _arm(name: str, *, ret: float, dd: float, r2022: float) -> ArmResult:
+        from backtest.donchian_trail_sim import PortfolioAggregate, TradeRecord
+
+        ts = pd.Timestamp("2022-06-01", tz="UTC")
+        trade = TradeRecord(
+            symbol="AAA", entry_date=ts, entry_price=100.0, exit_date=ts,
+            exit_price=100.0, exit_reason="signal", bars_held=1, shares=1,
+            initial_stop=90.0, risk_per_share=10.0, pnl_dollars=0.0,
+            pnl_pct=0.0, r_multiple=r2022,
+        )
+        agg = PortfolioAggregate(
+            policy_name=name, n_symbols=1, mean_total_return=ret, mean_cagr=0.0,
+            mean_sharpe=0.0, mean_max_drawdown=dd, mean_buy_hold=0.0,
+            total_trades=1, win_rate=0.0, avg_r=r2022, expectancy_pct=0.0,
+            pct_stop_gap=0.0, pct_stop_intrabar=0.0, pct_signal_exit=1.0, pct_eod=0.0,
+        )
+        return ArmResult(name=name, agg=agg, trades=[trade])
+
+    def test_passes_when_all_three_criteria_are_met(self):
+        from scripts.donchian_gate_ab import render_prereg_verdict
+
+        prod = self._arm("D", ret=0.274, dd=-0.150, r2022=-9.1)
+        good = self._arm("E", ret=0.400, dd=-0.160, r2022=-12.0)
+        out = render_prereg_verdict(good, prod)
+        assert "VERDICT: PASS" in out
+        assert out.count("[PASS]") == 3
+
+    def test_c1_failure_rejects_even_with_a_great_aggregate(self):
+        """The decisive criterion: lose the 2022 protection and it is rejected."""
+        from scripts.donchian_gate_ab import render_prereg_verdict
+
+        prod = self._arm("D", ret=0.274, dd=-0.150, r2022=-9.1)
+        bad = self._arm("E", ret=0.900, dd=-0.150, r2022=-45.0)
+        out = render_prereg_verdict(bad, prod)
+        assert "VERDICT: REJECTED" in out
+        assert "C1" in out.split("REJECTED")[1]
+
+    def test_c3_failure_rejects_on_drawdown(self):
+        from scripts.donchian_gate_ab import render_prereg_verdict
+
+        prod = self._arm("D", ret=0.274, dd=-0.150, r2022=-9.1)
+        bad = self._arm("E", ret=0.500, dd=-0.190, r2022=-10.0)
+        out = render_prereg_verdict(bad, prod)
+        assert "VERDICT: REJECTED" in out and "C3" in out.split("REJECTED")[1]
+
+    def test_boundaries_are_inclusive_as_written(self):
+        from scripts.donchian_gate_ab import render_prereg_verdict
+
+        prod = self._arm("D", ret=0.274, dd=-0.150, r2022=-9.1)
+        edge = self._arm("E", ret=0.324, dd=-0.180, r2022=-20.0)
+        assert "VERDICT: PASS" in render_prereg_verdict(edge, prod)
+
+
+class TestBearOnlyMask:
+    def test_blocks_only_bear(self, bars, regime):
+        _, filter_masks = build_masks(bars, regime)
+        aligned = regime.reindex(bars["AAA"].index).ffill().fillna("RANGING")
+        mask = ((aligned != "BEAR") & filter_masks["AAA"]).astype(bool)
+
+        assert not mask[aligned == "BEAR"].any(), "BEAR bars must be blocked"
+        allowed = mask[(aligned != "BEAR") & filter_masks["AAA"]]
+        assert allowed.all(), "non-BEAR bars passing the filter must be allowed"
+
+    def test_is_strictly_looser_than_the_trending_only_gate(self, bars, regime):
+        regime_masks, filter_masks = build_masks(bars, regime)
+        aligned = regime.reindex(bars["AAA"].index).ffill().fillna("RANGING")
+        bear_only = ((aligned != "BEAR") & filter_masks["AAA"]).astype(bool)
+        production = (regime_masks["AAA"] & filter_masks["AAA"]).astype(bool)
+
+        assert (production <= bear_only).all(), "must admit a superset of production"
+        assert bear_only.sum() > production.sum(), "fixture must exercise the difference"
+
+
 class TestArmResult:
     def test_is_frozen(self, bars, regime):
         arm = run_arm("raw", bars, None, bars["AAA"].index[50])

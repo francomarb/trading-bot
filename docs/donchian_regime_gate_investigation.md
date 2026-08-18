@@ -256,6 +256,93 @@ actually points at — the gate's measured value is bear protection, and its
 measured cost is everything it blocks outside bear markets. It is written here
 as a *candidate to be pre-registered*, not as a proposal to implement.
 
+---
+
+## 10. PRE-REGISTRATION — BEAR-only exclusion
+
+> **Registered 2026-08-18, before the arm was run.** Criteria, thresholds and
+> the decision rule below were committed in the same commit that added the
+> code, and before any arm-E number existed. If a later revision of this
+> document changes a threshold, that revision is the finding — not the number
+> it produced.
+
+### 10.1 The change under test
+
+**Arm E** — replace the binary TRENDING-only regime gate with a **BEAR-only
+exclusion**:
+
+```
+entry_mask = (SPY regime != "BEAR") AND DonchianEdgeFilter(rules 1+3)
+```
+
+i.e. allow TRENDING, RANGING and VOLATILE; block only BEAR. The edge filter is
+unchanged, so this isolates the regime gate. Every other knob stays at the
+values in §2 and remains asserted by the test suite.
+
+**Run parameters, fixed now:** `ai_bigtech` (32 symbols), SIP feed,
+`trade_start = 2016-11-01`, `end = 2026-08-18`, `StaticATRStop(k=2.0)`,
+`SIM_CONSTANTS` as in §2. No other universe, window or stop policy may be
+substituted after seeing results.
+
+### 10.2 Criteria — all three must pass
+
+**Primary — does BEAR-only retain the protection that is the gate's only
+demonstrated value?**
+
+> **C1. 2022 sum R under arm E ≥ −20.0R.**
+
+Reference points: raw/ungated **−47.8R**, current production **−9.1R**. This is
+the decisive criterion because §5 showed 2022 is the *single year the current
+gate earns its keep*. A BEAR-only rule is worth having only if it keeps most of
+that. The outcome is genuinely unpredictable from anything published above:
+2022's damage may well have arrived on RANGING or VOLATILE bars inside the bear
+year, which this rule would let straight through. **If C1 fails, the
+formulation is rejected regardless of how good the aggregate looks.**
+
+**Secondary — aggregate performance.**
+
+> **C2. Full-run mean total return (E) ≥ mean total return (D) + 5.0 pp**
+> (i.e. ≥ +32.4%, against production's +27.4%).
+
+**Declared weakness, stated before running:** §4 already shows BEAR is 160 of
+1209 raw trades at a below-average 0.63R, so removing only BEAR is very likely
+to land between arm C (+43.1%) and arm D (+27.4%). C2 is therefore close to
+*implied* by results already published, and is recorded for completeness — **it
+is not independent evidence and must not be reported as the headline.**
+
+**Guardrail — the cost side.**
+
+> **C3. Mean maxDD (E) no worse than mean maxDD (D) by more than 3.0 pp**
+> (D = −15.0%, so E must be ≥ −18.0%).
+
+Loosening a regime gate should be expected to cost drawdown; this bounds how
+much is acceptable. Reference: raw/ungated is −17.5%.
+
+### 10.3 Decision rule
+
+| outcome | consequence |
+|---|---|
+| **C1 ∧ C2 ∧ C3 all pass** | Authorises **proposing** the config change via PR for paper observation. Not a live-behaviour change and not self-approving. |
+| **any criterion fails** | **This formulation is rejected and not implemented.** |
+
+**No substitutions.** If arm E fails, I will not re-cut the window, swap the
+metric, tune the BEAR definition, or test "BEAR-and-VOLATILE excluded" as a
+salvage and report it as this test. Any different formulation is a **new**
+pre-registration, written before it is run, and must say that it followed a
+failure. This clause exists because the `11.56` sweep returned 10 of 10 rules
+"improving" against a negative baseline — which is what a sweep does, not what
+an edge looks like.
+
+**Precedence unchanged.** Passing does not override `11.56` re-open condition
+(4) or [[feedback_trade_log_outranks_the_model]]. A pass authorises a proposal
+under paper observation; the live trade log remains the arbiter.
+
+### 10.4 Result
+
+*(Filled in below after running. Nothing above this line may be edited.)*
+
+---
+
 **Related:** [`docs/donchian_trail_investigation.md`](donchian_trail_investigation.md)
 (closed; stop policy), `11.48` (risk-target reconciliation — the 28.8×
 sizing dispersion that amplifies the clustered losses), `11.56` (entry-quality

@@ -96,6 +96,15 @@ ARM_RAW = "A raw signal (no gates)"
 ARM_REGIME = "B regime gate only"
 ARM_FILTER = "C edge filter only"
 ARM_BOTH = "D both (production)"
+ARM_BEAR_ONLY = "E BEAR-only excl + filter"
+
+# ── Pre-registered acceptance criteria for arm E ────────────────────────────
+# Registered 2026-08-18 in docs/donchian_regime_gate_investigation.md §10,
+# in the same commit that added this code and BEFORE arm E was ever run.
+# Changing a threshold here is itself the finding — do not retune to fit.
+PREREG_2022_MIN_SUM_R = -20.0  # C1 (primary): raw -47.8R, production -9.1R
+PREREG_MIN_RETURN_GAIN_PP = 5.0  # C2 (secondary, largely implied by §4)
+PREREG_MAX_DD_WORSENING_PP = 3.0  # C3 (guardrail)
 
 
 @dataclass(frozen=True)
@@ -268,6 +277,66 @@ def render_per_year(arms: list[ArmResult], regime: pd.Series) -> str:
     return "\n".join(lines)
 
 
+def sum_r_for_year(arm: ArmResult, year: int) -> float:
+    """Sum of R-multiples for trades entered in `year`."""
+    return sum(t.r_multiple for t in arm.trades if t.entry_date.year == year)
+
+
+def render_prereg_verdict(bear_only: ArmResult, production: ArmResult) -> str:
+    """
+    Evaluate arm E against the criteria pre-registered in
+    docs/donchian_regime_gate_investigation.md §10. All three must pass.
+
+    C1 (primary) is the decisive one: BEAR-only exclusion is worth having only
+    if it retains the 2022 bear protection that is the current gate's only
+    demonstrated value. C2 is declared weak — §4 largely implies it.
+    """
+    e_2022 = sum_r_for_year(bear_only, 2022)
+    d_2022 = sum_r_for_year(production, 2022)
+    e_ret = 100 * bear_only.agg.mean_total_return
+    d_ret = 100 * production.agg.mean_total_return
+    e_dd = 100 * bear_only.agg.mean_max_drawdown
+    d_dd = 100 * production.agg.mean_max_drawdown
+
+    # Thresholds are stated to one decimal place; binary-float noise at ~1e-15
+    # must not decide a boundary case. `100 * 0.180 - 100 * 0.150` is
+    # 3.0000000000000018, which would fail a bare `<= 3.0`.
+    eps = 1e-9
+    c1 = e_2022 >= PREREG_2022_MIN_SUM_R - eps
+    c2 = (e_ret - d_ret) >= PREREG_MIN_RETURN_GAIN_PP - eps
+    c3 = (d_dd - e_dd) <= PREREG_MAX_DD_WORSENING_PP + eps
+
+    mark = lambda ok: "PASS" if ok else "FAIL"  # noqa: E731
+    lines = [
+        "",
+        "=" * 96,
+        "PRE-REGISTERED VERDICT — arm E (BEAR-only exclusion)",
+        "  criteria fixed in docs/donchian_regime_gate_investigation.md §10 before this ran",
+        "=" * 96,
+        f"  C1 PRIMARY  2022 sum R >= {PREREG_2022_MIN_SUM_R:+.1f}R"
+        f"        E={e_2022:+7.1f}R  (production {d_2022:+.1f}R)   [{mark(c1)}]",
+        f"  C2 second   return >= D + {PREREG_MIN_RETURN_GAIN_PP:.1f}pp"
+        f"          E={e_ret:+7.1f}%  (production {d_ret:+.1f}%)   [{mark(c2)}]",
+        f"  C3 guard    maxDD no worse than {PREREG_MAX_DD_WORSENING_PP:.1f}pp"
+        f"    E={e_dd:+7.1f}%  (production {d_dd:+.1f}%)   [{mark(c3)}]",
+        "-" * 96,
+    ]
+    if c1 and c2 and c3:
+        lines += [
+            "  VERDICT: PASS — authorises PROPOSING the change via PR for paper",
+            "  observation. Not a live-behaviour change and not self-approving.",
+        ]
+    else:
+        failed = [n for n, ok in (("C1", c1), ("C2", c2), ("C3", c3)) if not ok]
+        lines += [
+            f"  VERDICT: REJECTED — {', '.join(failed)} failed.",
+            "  Per §10.3 this formulation is not implemented. Do NOT re-cut the",
+            "  window, swap the metric, or salvage with a variant and report it",
+            "  as this test — that requires a new pre-registration.",
+        ]
+    return "\n".join(lines)
+
+
 def render_live_validation(prod: ArmResult, live_start: pd.Timestamp, db_path: str) -> str:
     """
     Compare the production arm against the live trade log over the window the
@@ -347,17 +416,28 @@ def main() -> int:
 
     regime_masks, filter_masks = build_masks(bars, regime)
     both_masks = {s: (regime_masks[s] & filter_masks[s]) for s in bars}
+    # Arm E: allow TRENDING / RANGING / VOLATILE, block only BEAR.
+    not_bear_masks = {
+        s: (
+            (regime.reindex(bars[s].index).ffill().fillna("RANGING") != "BEAR")
+            & filter_masks[s]
+        ).astype(bool)
+        for s in bars
+    }
 
     arms = [
         run_arm(ARM_RAW, bars, None, trade_start),
         run_arm(ARM_REGIME, bars, regime_masks, trade_start),
         run_arm(ARM_FILTER, bars, filter_masks, trade_start),
         run_arm(ARM_BOTH, bars, both_masks, trade_start),
+        run_arm(ARM_BEAR_ONLY, bars, not_bear_masks, trade_start),
     ]
+    production, bear_only = arms[3], arms[4]
 
     print(render_arms(arms))
     print(render_premise_test(arms[0], regime))
-    print(render_per_year([arms[0], arms[3]], regime))
+    print(render_per_year([arms[0], production, bear_only], regime))
+    print(render_prereg_verdict(bear_only, production))
     if args.validate:
         print(
             render_live_validation(
