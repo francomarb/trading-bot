@@ -318,6 +318,104 @@ class TestBearOnlyMask:
         assert bear_only.sum() > production.sum(), "fixture must exercise the difference"
 
 
+class TestLiveValidationWindow:
+    """
+    Regression guard for the P2 found in review of PR #111: `--live-start`
+    filtered the simulated side only, while the SQL loaded every closed
+    Donchian row. The block then reported a MODEL vs LIVE comparison over two
+    different windows while claiming to validate an overlap.
+
+    The default happened to be valid when it shipped (all 24 live rows begin
+    on the default start), which is exactly why it needed a test rather than
+    an eyeball.
+    """
+
+    @staticmethod
+    def _db(tmp_path, rows: list[tuple[str | None, float, float]]) -> str:
+        import sqlite3
+
+        path = tmp_path / "trades.db"
+        con = sqlite3.connect(path)
+        con.execute(
+            "CREATE TABLE trades (strategy TEXT, entry_timestamp TEXT, "
+            "r_multiple REAL, realized_pnl REAL)"
+        )
+        con.executemany(
+            "INSERT INTO trades (strategy, entry_timestamp, r_multiple, realized_pnl) "
+            "VALUES ('donchian_breakout', ?, ?, ?)",
+            rows,
+        )
+        con.commit()
+        con.close()
+        return str(path)
+
+    @staticmethod
+    def _arm() -> ArmResult:
+        from backtest.donchian_trail_sim import PortfolioAggregate
+
+        agg = PortfolioAggregate(
+            policy_name="D", n_symbols=1, mean_total_return=0.0, mean_cagr=0.0,
+            mean_sharpe=0.0, mean_max_drawdown=0.0, mean_buy_hold=0.0,
+            total_trades=0, win_rate=0.0, avg_r=0.0, expectancy_pct=0.0,
+            pct_stop_gap=0.0, pct_stop_intrabar=0.0, pct_signal_exit=0.0, pct_eod=0.0,
+        )
+        return ArmResult(name="D", agg=agg, trades=[])
+
+    def test_live_rows_before_live_start_are_excluded(self, tmp_path):
+        from scripts.donchian_gate_ab import render_live_validation
+
+        db = self._db(tmp_path, [
+            ("2026-03-10T14:00:00+00:00", +5.0, 500.0),   # pre-window, big winner
+            ("2026-04-20T14:00:00+00:00", +5.0, 500.0),   # pre-window, big winner
+            ("2026-06-02T14:00:00+00:00", -1.0, -100.0),  # in-window
+            ("2026-07-15T14:00:00+00:00", -1.0, -100.0),  # in-window
+        ])
+        out = render_live_validation(
+            self._arm(), pd.Timestamp("2026-05-01", tz="UTC"), db
+        )
+        # Only the two in-window losers may count: n=2, 0% wins, mean R -1.00.
+        assert "n=  2" in out, out
+        assert "win%=  0.0" in out, out
+        assert "mean R=-1.00" in out, out
+
+    def test_moving_live_start_moves_the_live_side_too(self, tmp_path):
+        """The exact failure: the model side moved, the live side did not."""
+        from scripts.donchian_gate_ab import render_live_validation
+
+        db = self._db(tmp_path, [
+            ("2026-05-02T14:00:00+00:00", -1.0, -100.0),
+            ("2026-07-15T14:00:00+00:00", +3.0, 300.0),
+        ])
+        arm = self._arm()
+        may = render_live_validation(arm, pd.Timestamp("2026-05-01", tz="UTC"), db)
+        july = render_live_validation(arm, pd.Timestamp("2026-07-01", tz="UTC"), db)
+
+        assert "n=  2" in may and "mean R=+1.00" in may, may
+        assert "n=  1" in july and "mean R=+3.00" in july, july
+
+    def test_boundary_row_on_live_start_is_included(self, tmp_path):
+        from scripts.donchian_gate_ab import render_live_validation
+
+        db = self._db(tmp_path, [("2026-05-01T09:30:00+00:00", -1.0, -100.0)])
+        out = render_live_validation(
+            self._arm(), pd.Timestamp("2026-05-01", tz="UTC"), db
+        )
+        assert "n=  1" in out, out
+
+    def test_rows_without_entry_timestamp_are_reported_not_dropped(self, tmp_path):
+        from scripts.donchian_gate_ab import render_live_validation
+
+        db = self._db(tmp_path, [
+            ("2026-06-02T14:00:00+00:00", -1.0, -100.0),
+            (None, -2.0, -200.0),
+        ])
+        out = render_live_validation(
+            self._arm(), pd.Timestamp("2026-05-01", tz="UTC"), db
+        )
+        assert "n=  1" in out, out
+        assert "1 closed row(s) have no entry_timestamp" in out, out
+
+
 class TestArmResult:
     def test_is_frozen(self, bars, regime):
         arm = run_arm("raw", bars, None, bars["AAA"].index[50])

@@ -356,17 +356,36 @@ def render_live_validation(prod: ArmResult, live_start: pd.Timestamp, db_path: s
             f"  MODEL: n={len(sim):3}  win%={100 * sim_wins / len(sim):5.1f}"
             f"  mean R={sum(sim) / len(sim):+.2f}"
         )
+    # The live side MUST be filtered by the same `live_start` as the model
+    # side above, or this block compares mismatched windows while claiming to
+    # validate an overlap. `date()` is used rather than a lexical string
+    # comparison so the filter survives any variation in how the ISO-8601
+    # offset is stored. Rows with a NULL entry_timestamp cannot be placed in a
+    # window at all; they are excluded and counted, never silently dropped.
     try:
         con = sqlite3.connect(db_path)
+        base = (
+            "FROM trades WHERE strategy='donchian_breakout' "
+            "AND r_multiple IS NOT NULL AND realized_pnl IS NOT NULL"
+        )
         rows = con.execute(
-            "SELECT r_multiple, realized_pnl FROM trades "
-            "WHERE strategy='donchian_breakout' AND r_multiple IS NOT NULL "
-            "AND realized_pnl IS NOT NULL"
+            f"SELECT r_multiple, realized_pnl {base} "
+            "AND entry_timestamp IS NOT NULL "
+            "AND date(entry_timestamp) >= date(:live_start)",
+            {"live_start": live_start.isoformat()},
         ).fetchall()
+        undated = con.execute(
+            f"SELECT COUNT(*) {base} AND entry_timestamp IS NULL"
+        ).fetchone()[0]
         con.close()
     except sqlite3.Error as exc:
         lines.append(f"  LIVE : unavailable ({exc})")
         return "\n".join(lines)
+    if undated:
+        lines.append(
+            f"  NOTE : {undated} closed row(s) have no entry_timestamp and are "
+            "excluded — they cannot be placed in the comparison window"
+        )
     if rows:
         lr = [r[0] for r in rows]
         lw = sum(1 for r in rows if r[1] > 0)
