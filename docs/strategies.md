@@ -195,12 +195,17 @@ RSI mean reversion profits when prices snap back from extremes. It performs well
 | File | `strategies/donchian_breakout.py` |
 | Class | `DonchianBreakout` |
 | Type | Trend-continuation (Turtle System 1) |
-| Order type | MARKET |
+| Order type | **STOP_LIMIT** (shipped PR #62) |
 | Status | **Paper Trading** |
 | Sleeve weight | 25% of gross capital |
-| Max positions | 5 |
-| Per-position budget | ~$4,000 at $100k paper equity |
+| Max positions | **8** (`hard_max_positions`) |
+| Per-position budget | **~$8,000** at $100k paper equity (`max_position_pct_of_sleeve` 0.40 × $20k sleeve) |
 | Activated | 2026-05-01 |
+
+> **Corrected 2026-08-18.** This table previously said MARKET / 5 positions /
+> ~$4,000, all three stale. `config/settings.py` is the source of truth; see
+> [`donchian_breakout_strategy.md`](donchian_breakout_strategy.md) for the full
+> capital math and `11.59` for the open regime-gate question.
 
 **Signal logic:**
 - **Entry:** Close makes a new N-day high (Donchian breakout)
