@@ -1,6 +1,15 @@
 # Donchian entry-gate investigation — does the gate stack earn its cost?
 
-> **Status: OPEN — pre-registered BEAR-only test PASSED 2026-08-18 (§10).**
+> **Status: APPLIED 2026-08-18 — the gate is now a BEAR-only exclusion.**
+> `STRATEGY_ALLOWED_REGIMES["donchian_breakout"]` changed from `{TRENDING}`
+> to `{TRENDING, RANGING, VOLATILE}` in paper after the pre-registered test
+> in §10 passed all three criteria. **Switch date 2026-08-18** — quote it
+> with any Donchian statistic; pre- and post-change cohorts are not
+> comparable. Reverting is one line. A wiring defect found while applying
+> it (the settings dict was read by nothing but the dashboard) is recorded
+> in `11.59`.
+>
+> **Prior status, kept for the record:**
 > A pass authorises *proposing* the change via PR for paper observation; it is
 > not a live-behaviour change and not self-approving. Arm E (allow
 > TRENDING/RANGING/VOLATILE, block BEAR) returns **+41.0% / Sharpe 0.52 /

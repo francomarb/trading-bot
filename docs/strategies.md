@@ -252,23 +252,24 @@ All gates must pass for an entry to be allowed. Exits are never blocked.
 | Regime | Allowed |
 |---|---|
 | TRENDING | ✅ Yes |
-| RANGING | ❌ No |
-| VOLATILE | ❌ No |
+| RANGING | ✅ Yes *(since 2026-08-18)* |
+| VOLATILE | ✅ Yes *(since 2026-08-18)* |
 | BEAR | ❌ No |
 
-RANGING, VOLATILE and BEAR are blocked — **unchanged, but the original
-rationale for blocking RANGING and VOLATILE was measured and refuted on
-2026-08-18.** This paragraph used to assert that in a sideways market every
-N-day high is a false breakout and that Donchian needs a confirmed trend for
-positive expectancy. On SIP 2016-11→2026-08 over the `ai_bigtech` universe,
-raw-signal trades bucketed by SPY regime at entry give **RANGING mean R 0.71
-against TRENDING's 0.71** (RANGING with a *higher* win rate), and VOLATILE
-0.72 — the best of the four buckets. The gate's measured value is BEAR
-protection, not RANGING avoidance.
+**BEAR only is blocked — changed 2026-08-18 (`11.59`).** This paragraph used
+to assert that in a sideways market every N-day high is a false breakout and
+that Donchian needs a confirmed trend for positive expectancy. That was
+measured and refuted: on SIP 2016-11→2026-08 over `ai_bigtech`, raw-signal
+trades bucketed by SPY regime at entry give **RANGING mean R 0.71 against
+TRENDING's 0.71** (RANGING with a *higher* win rate) and **VOLATILE 0.72**,
+the best of the four buckets.
 
-The gate is **still `TRENDING`-only** pending the decision on `11.59`; a
-pre-registered BEAR-only alternative passed its criteria and is proposed, not
-applied. See [`donchian_regime_gate_investigation.md`](donchian_regime_gate_investigation.md).
+BEAR remains blocked because that is the gate's one measured value — 2022 was
+−47.8R ungated against −9.1R under TRENDING-only. A pre-registered test of
+this exact change passed all three criteria before it was applied. Accepted
+costs: 2022 worsens −9.1R → −16.1R, and entries rise ~40%, which `11.60`
+(correlated-entry heat cap) tracks. See
+[`donchian_regime_gate_investigation.md`](donchian_regime_gate_investigation.md).
 
 **Exit mechanics:**
 
