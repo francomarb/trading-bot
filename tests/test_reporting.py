@@ -17,6 +17,7 @@ import re
 import sqlite3
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
+from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
 import pandas as pd
@@ -58,6 +59,7 @@ from reporting.pnl import (
     StrategyStats,
     _instrument_class,
     _slippage_by_instrument,
+    unrealized_pnl_from_positions,
 )
 from risk.manager import RiskDecision, Side
 from strategies.base import OrderType
@@ -3251,20 +3253,81 @@ class TestExitBasisRefusalAndLifecycleRescue:
 # ── TestPnLTracker ──────────────────────────────────────────────────────────
 
 
+def _log_close(tl, *, day: str, symbol: str, strategy: str, pnl: float, seq: int = 1):
+    """Write one realized-P&L close row — what the engine logs on exit."""
+    tl.log(TradeRecord(
+        timestamp=f"{day}T15:{seq:02d}:00+00:00",
+        symbol=symbol, side="sell", qty=1, avg_fill_price=100.0,
+        order_id=f"{symbol}-close-{seq}",
+        strategy=strategy, reason="exit signal",
+        stop_price=0.0, entry_reference_price=100.0,
+        modeled_slippage_bps=0.0, realized_slippage_bps=0.0,
+        order_type="market", status="filled",
+        requested_qty=1, filled_qty=1,
+        realized_pnl=pnl,
+        entry_timestamp=f"{day}T13:00:00+00:00",
+        exit_timestamp=f"{day}T15:{seq:02d}:00+00:00",
+        position_type="single_leg",
+    ))
+
+
+class TestUnrealizedPnLFromPositions:
+    """`unrealized_pnl_from_positions` — the daily report's unrealized figure."""
+
+    def test_sums_broker_unrealized_across_positions(self):
+        positions = [
+            SimpleNamespace(symbol="AAPL", unrealized_pl=250.5),
+            SimpleNamespace(symbol="NVDA", unrealized_pl=-100.25),
+            SimpleNamespace(symbol="PLTR", unrealized_pl=0.0),
+        ]
+        assert unrealized_pnl_from_positions(positions) == pytest.approx(150.25)
+
+    def test_empty_book_is_zero(self):
+        assert unrealized_pnl_from_positions([]) == 0.0
+
+    def test_reads_the_real_position_dataclass(self):
+        """The helper is duck-typed on `.unrealized_pl`; production feeds
+        it `BrokerSnapshot.account.open_positions.values()`. Pin the
+        field name to the actual dataclass so a rename fails here rather
+        than quietly restoring $0.00 to the report."""
+        from risk.manager import Position
+
+        positions = {
+            "AAPL": Position(
+                symbol="AAPL", qty=10, avg_entry_price=200.0,
+                market_value=2_100.0, unrealized_pl=100.0,
+            ),
+            "NVDA": Position(
+                symbol="NVDA", qty=5, avg_entry_price=220.0,
+                market_value=1_075.0, unrealized_pl=-25.0,
+            ),
+        }
+        assert unrealized_pnl_from_positions(positions.values()) == pytest.approx(75.0)
+
+    def test_missing_unrealized_is_skipped_and_warned(self):
+        """A None must not silently become 0.0 — that is the exact
+        failure mode this function exists to end. It is skipped, and the
+        understatement is logged with the symbol."""
+        positions = [
+            SimpleNamespace(symbol="AAPL", unrealized_pl=300.0),
+            SimpleNamespace(symbol="NVDA", unrealized_pl=None),
+        ]
+        from loguru import logger as loguru_logger
+
+        messages: list[str] = []
+        sink_id = loguru_logger.add(messages.append, level="WARNING")
+        try:
+            total = unrealized_pnl_from_positions(positions)
+        finally:
+            loguru_logger.remove(sink_id)
+
+        assert total == pytest.approx(300.0)
+        logged = "".join(messages)
+        assert "NVDA" in logged
+        assert "understates" in logged
+
+
 class TestPnLTracker:
-    def test_record_trade_pnl(self, tmp_csv, tmp_daily_dir):
-        tracker = PnLTracker(
-            trade_csv_path=tmp_csv, daily_pnl_dir=tmp_daily_dir
-        )
-        tracker.record_trade_pnl("sma_crossover", 100.0, today="2026-04-16")
-        tracker.record_trade_pnl("sma_crossover", -50.0, today="2026-04-16")
-
-        summary = tracker.generate_daily_summary(day="2026-04-16")
-        assert summary.total_trades == 2
-        assert summary.realized_pnl == 50.0
-        assert summary.largest_win == 100.0
-        assert summary.largest_loss == -50.0
-
     def test_eod_summary_reads_trade_log_when_no_in_memory_events(
         self, tmp_csv, tmp_daily_dir,
     ):
@@ -3347,12 +3410,13 @@ class TestPnLTracker:
         assert summary.strategies["donchian_breakout"].trade_count == 1
 
     def test_per_strategy_attribution(self, tmp_csv, tmp_daily_dir):
+        tl = TradeLogger(path=tmp_csv)
+        _log_close(tl, day="2026-04-16", symbol="AAA", strategy="strat_a", pnl=200.0, seq=1)
+        _log_close(tl, day="2026-04-16", symbol="BBB", strategy="strat_a", pnl=-80.0, seq=2)
+        _log_close(tl, day="2026-04-16", symbol="CCC", strategy="strat_b", pnl=50.0, seq=3)
         tracker = PnLTracker(
             trade_csv_path=tmp_csv, daily_pnl_dir=tmp_daily_dir
         )
-        tracker.record_trade_pnl("strat_a", 200.0, today="2026-04-16")
-        tracker.record_trade_pnl("strat_a", -80.0, today="2026-04-16")
-        tracker.record_trade_pnl("strat_b", 50.0, today="2026-04-16")
 
         summary = tracker.generate_daily_summary(day="2026-04-16")
         assert "strat_a" in summary.strategies
@@ -3370,35 +3434,53 @@ class TestPnLTracker:
         assert b.trade_count == 1
         assert b.profit_factor == float("inf")  # no losses
 
-    def test_intraday_drawdown(self, tmp_csv, tmp_daily_dir):
+    def test_only_the_requested_days_closes_are_counted(self, tmp_csv, tmp_daily_dir):
+        """Day scoping lives in the SQL, not in a resettable in-memory
+        accumulator, so an adjacent day's closes never leak in."""
+        tl = TradeLogger(path=tmp_csv)
+        _log_close(tl, day="2026-04-16", symbol="AAA", strategy="s", pnl=100.0, seq=1)
+        _log_close(tl, day="2026-04-17", symbol="BBB", strategy="s", pnl=-200.0, seq=2)
         tracker = PnLTracker(
             trade_csv_path=tmp_csv, daily_pnl_dir=tmp_daily_dir
         )
-        tracker.record_trade_pnl("s", 100.0, today="2026-04-16")
-        tracker.record_trade_pnl("s", -150.0, today="2026-04-16")  # peak 100, now -50
-        tracker.record_trade_pnl("s", 80.0, today="2026-04-16")   # now 30
-
-        summary = tracker.generate_daily_summary(day="2026-04-16")
-        # Max drawdown from peak=100 to trough=-50 = 150
-        assert summary.max_intraday_drawdown == 150.0
-
-    def test_day_reset(self, tmp_csv, tmp_daily_dir):
-        tracker = PnLTracker(
-            trade_csv_path=tmp_csv, daily_pnl_dir=tmp_daily_dir
-        )
-        tracker.record_trade_pnl("s", 100.0, today="2026-04-16")
-        tracker.record_trade_pnl("s", -200.0, today="2026-04-17")  # new day
 
         summary = tracker.generate_daily_summary(day="2026-04-17")
         assert summary.total_trades == 1
         assert summary.realized_pnl == -200.0
-        assert summary.max_intraday_drawdown == 200.0
 
-    def test_write_daily_report(self, tmp_csv, tmp_daily_dir):
+    def test_unrealized_and_drawdown_reach_the_report(self, tmp_csv, tmp_daily_dir):
+        """Both fields shipped hardcoded at $0.00 for 71 daily reports:
+        `unrealized_pnl` was never passed by the only production caller,
+        and `max_intraday_drawdown` came from an accumulator nothing
+        fed. Assert the caller's values survive into the markdown.
+        """
         tracker = PnLTracker(
             trade_csv_path=tmp_csv, daily_pnl_dir=tmp_daily_dir
         )
-        tracker.record_trade_pnl("sma_crossover", 100.0, today="2026-04-16")
+        summary = tracker.generate_daily_summary(
+            day="2026-04-16",
+            session_start_equity=100_000.0,
+            session_end_equity=99_500.0,
+            unrealized_pnl=-1_234.56,
+            max_intraday_drawdown=780.25,
+        )
+
+        assert summary.unrealized_pnl == -1_234.56
+        assert summary.max_intraday_drawdown == 780.25
+
+        content = open(tracker.write_daily_report(summary)).read()
+        assert "| Unrealized P&L | $-1,234.56 |" in content
+        assert "| Max intraday drawdown | $780.25 |" in content
+
+    def test_write_daily_report(self, tmp_csv, tmp_daily_dir):
+        tl = TradeLogger(path=tmp_csv)
+        _log_close(
+            tl, day="2026-04-16", symbol="AAA",
+            strategy="sma_crossover", pnl=100.0,
+        )
+        tracker = PnLTracker(
+            trade_csv_path=tmp_csv, daily_pnl_dir=tmp_daily_dir
+        )
 
         summary = tracker.generate_daily_summary(
             day="2026-04-16",
@@ -3578,7 +3660,10 @@ class TestPnLTracker:
             weekly_report_dir=tmp_weekly_dir,
         )
         # Create a daily report first.
-        tracker.record_trade_pnl("s", 100.0, today="2026-04-16")
+        _log_close(
+            tl=TradeLogger(path=tmp_csv), day="2026-04-16",
+            symbol="AAA", strategy="s", pnl=100.0,
+        )
         summary = tracker.generate_daily_summary(day="2026-04-16")
         tracker.write_daily_report(summary)
 

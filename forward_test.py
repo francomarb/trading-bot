@@ -45,7 +45,7 @@ from regime.detector import MarketRegime, RegimeDetector
 from risk.allocator import SleeveAllocator
 from reporting.alerts import AlertDispatcher, LogFileBackend, TelegramAlertBackend, TelegramCommandListener
 from reporting.logger import TradeLogger, install_json_sink
-from reporting.pnl import PnLTracker
+from reporting.pnl import PnLTracker, unrealized_pnl_from_positions
 from risk.manager import RiskManager
 from data.watchlists import StaticWatchlistSource
 from sector.gauge import SectorMomentumGauge
@@ -480,6 +480,14 @@ def main() -> None:
                 day=today,
                 session_start_equity=engine._session_start_equity or snap.account.equity,
                 session_end_equity=snap.account.equity,
+                # Both of these were left at their 0.0 defaults until
+                # 2026-08-19, which is why every daily report written
+                # before then shows $0.00 unrealized and $0.00 drawdown
+                # even on days that ended with a dozen open positions.
+                unrealized_pnl=unrealized_pnl_from_positions(
+                    snap.account.open_positions.values()
+                ),
+                max_intraday_drawdown=engine.max_intraday_drawdown,
             )
             pnl_tracker.write_daily_report(summary)
             # Fire EOD summary alert (Telegram + log).

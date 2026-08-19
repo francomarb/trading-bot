@@ -6740,3 +6740,85 @@ class TestPostFillStopReAnchor:
         engine, _ = engine_factory()
         assert hasattr(engine, "_last_atr")
         assert isinstance(engine._last_atr, dict)
+
+
+# ── TestIntradayEquityDrawdown ──────────────────────────────────────────────
+
+
+class TestIntradayEquityDrawdown:
+    """
+    `max_intraday_drawdown` on the daily P&L report was $0.00 in all 71
+    reports written before 2026-08-19: it read an in-memory accumulator
+    fed only by `PnLTracker.record_trade_pnl`, which no production code
+    path ever called. The engine now derives it from the account-equity
+    path it already samples once per cycle.
+    """
+
+    def test_starts_flat_and_tracks_peak_to_trough(self, engine_factory):
+        engine, _ = engine_factory()
+        assert engine.max_intraday_drawdown == 0.0
+
+        engine._observe_equity(100_000.0)
+        engine._observe_equity(101_500.0)   # new peak
+        engine._observe_equity(99_800.0)    # -1,700 from peak
+        assert engine.max_intraday_drawdown == pytest.approx(1_700.0)
+
+        engine._observe_equity(100_900.0)   # recovery does not shrink the max
+        assert engine.max_intraday_drawdown == pytest.approx(1_700.0)
+
+        engine._observe_equity(99_000.0)    # deeper trough from the same peak
+        assert engine.max_intraday_drawdown == pytest.approx(2_500.0)
+
+    def test_a_rising_equity_path_has_no_drawdown(self, engine_factory):
+        engine, _ = engine_factory()
+        for equity in (100_000.0, 100_400.0, 101_000.0):
+            engine._observe_equity(equity)
+        assert engine.max_intraday_drawdown == 0.0
+
+    def test_peak_resets_on_utc_date_rollover(self, engine_factory):
+        """The field is per-day but this process runs for a week at a
+        time. Without the reset, Monday's peak would keep producing
+        drawdown against Tuesday's equity forever."""
+        engine, _ = engine_factory()
+        now = datetime(2026, 8, 18, 20, 0, tzinfo=timezone.utc)
+        engine._clock = lambda: now
+
+        engine._observe_equity(105_000.0)
+        engine._observe_equity(100_000.0)
+        assert engine.max_intraday_drawdown == pytest.approx(5_000.0)
+
+        now = datetime(2026, 8, 19, 14, 0, tzinfo=timezone.utc)
+        engine._clock = lambda: now
+        engine._observe_equity(100_000.0)
+        assert engine.max_intraday_drawdown == 0.0, (
+            "yesterday's peak must not carry into today's intraday drawdown"
+        )
+
+        engine._observe_equity(99_250.0)
+        assert engine.max_intraday_drawdown == pytest.approx(750.0)
+
+    def test_cycle_snapshots_feed_the_drawdown(self, engine_factory):
+        """Binds the wiring, not just the method: a normal open-market
+        cycle must push its snapshot equity through `_observe_equity`."""
+        engine, broker = engine_factory(snapshot=_snapshot(equity=100_000.0))
+        broker.sync_with_broker.return_value = _snapshot(equity=100_000.0)
+        engine._run_one_cycle()
+
+        broker.sync_with_broker.return_value = _snapshot(equity=97_600.0)
+        engine._run_one_cycle()
+
+        assert engine._last_cycle_equity == pytest.approx(97_600.0)
+        assert engine.max_intraday_drawdown == pytest.approx(2_400.0)
+
+    def test_market_closed_cycles_also_feed_the_drawdown(self, engine_factory):
+        """The bot holds overnight, so an extended-hours equity slide is
+        a real drawdown — market-closed cycles take a snapshot too."""
+        engine, broker = engine_factory(market_open=False)
+        engine.config = replace(engine.config, market_hours_only=True)
+
+        broker.sync_with_broker.return_value = _snapshot(equity=100_000.0)
+        engine._run_one_cycle()
+        broker.sync_with_broker.return_value = _snapshot(equity=98_900.0)
+        engine._run_one_cycle()
+
+        assert engine.max_intraday_drawdown == pytest.approx(1_100.0)

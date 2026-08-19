@@ -87,7 +87,6 @@ from execution.broker import (
 from execution.options_executor import SpreadLeg
 from execution.mleg_close import (
     MlegCloseScheduler,
-    MlegQuote,
     resolve_mleg_close_profile,
 )
 from indicators.technicals import add_atr
@@ -582,6 +581,16 @@ class TradingEngine:
         self._last_regime: str | None = None
         self._regime_fail_count: int = 0
         self._last_cycle_equity: float | None = None
+        # Intraday equity path, for the daily report's max-drawdown
+        # figure. Peak and drawdown reset on UTC date rollover so a
+        # multi-day session does not carry Monday's high-water mark into
+        # Tuesday's "intraday" drawdown. Fed by `_observe_equity` from
+        # every broker snapshot, market open or closed — this bot holds
+        # overnight, so an extended-hours equity slide is a real
+        # drawdown, not noise to be filtered out.
+        self._equity_peak_day: str | None = None
+        self._session_equity_peak: float | None = None
+        self._max_intraday_drawdown: float = 0.0
         self._last_snapshot: "BrokerSnapshot | None" = None
         self._last_stream_healthy: bool | None = None
 
@@ -851,6 +860,10 @@ class TradingEngine:
         # Capture truth-of-the-world before any decision.
         startup_snapshot = self.broker.sync_with_broker()
         self._session_start_equity = startup_snapshot.account.equity
+        # Seed the intraday equity peak from the same snapshot, so a
+        # decline during the very first cycle is measured against real
+        # equity rather than against an unset peak.
+        self._observe_equity(startup_snapshot.account.equity)
         self._last_snapshot = startup_snapshot
 
         # Recover broker-proven exits before ownership restoration. A position
@@ -1031,6 +1044,48 @@ class TradingEngine:
                 )
         self._operator_heartbeat_thread = None
 
+    # ── Intraday equity path ─────────────────────────────────────────────
+
+    def _observe_equity(self, equity: float) -> None:
+        """
+        Record one account-equity observation and update the running
+        intraday high-water mark and max drawdown.
+
+        Every broker snapshot the engine takes flows through here, which
+        is the only place `_last_cycle_equity` is assigned. Drawdown is
+        measured in dollars from the day's equity peak — mark-to-market,
+        so an unrealized slide in open positions registers immediately
+        rather than waiting for the position to close.
+
+        Peak and drawdown reset when the UTC date rolls over, because
+        the field this feeds is `max_intraday_drawdown` on a per-day
+        report and this process routinely runs for a week at a time.
+        """
+        self._last_cycle_equity = equity
+
+        day = self._clock().strftime("%Y-%m-%d")
+        if day != self._equity_peak_day:
+            self._equity_peak_day = day
+            self._session_equity_peak = equity
+            self._max_intraday_drawdown = 0.0
+            return
+
+        if self._session_equity_peak is None or equity > self._session_equity_peak:
+            self._session_equity_peak = equity
+            return
+
+        drawdown = self._session_equity_peak - equity
+        if drawdown > self._max_intraday_drawdown:
+            self._max_intraday_drawdown = drawdown
+
+    @property
+    def max_intraday_drawdown(self) -> float:
+        """
+        Largest peak-to-trough account-equity decline (dollars) observed
+        today. Read by the shutdown EOD report in `forward_test.py`.
+        """
+        return self._max_intraday_drawdown
+
     # ── Per-cycle pipeline ───────────────────────────────────────────────
 
     def _run_one_cycle(self) -> None:
@@ -1097,7 +1152,7 @@ class TradingEngine:
                     snapshot = self.broker.sync_with_broker(
                         session_start_equity=self._session_start_equity
                     )
-                    self._last_cycle_equity = snapshot.account.equity
+                    self._observe_equity(snapshot.account.equity)
                     self._last_snapshot = snapshot
                     if self._regime_detector is not None:
                         try:
@@ -1141,7 +1196,7 @@ class TradingEngine:
                 snapshot = self.broker.sync_with_broker(
                     session_start_equity=self._session_start_equity
                 )
-                self._last_cycle_equity = snapshot.account.equity
+                self._observe_equity(snapshot.account.equity)
                 self._last_snapshot = snapshot
             except Exception as e:
                 cycle_status = "sync_failed"
@@ -8406,7 +8461,6 @@ class TradingEngine:
         ownership on non-fill outcomes so external-close detection doesn't
         generate spurious warnings.
         """
-        import re as _re
         fills = self.broker.drain_option_fills()
         for decision, status_str, filled_qty, avg_fill_price, order_id, position_uid in fills:
             mapped = {"filled": OrderStatus.FILLED, "partially_filled": OrderStatus.PARTIAL}.get(
