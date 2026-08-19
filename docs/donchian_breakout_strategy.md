@@ -36,7 +36,7 @@ low exit only triggers when the trend genuinely fails.
 | `exit_window` | 15 days |
 | Variant name | Mid-range (30/15) |
 | Order type | **STOP_LIMIT** (`preferred_order_type`, shipped PR #62) — *was MARKET; the doc said MARKET until 2026-08-18* |
-| Regime gate | `TRENDING` only — blocked in BEAR, VOLATILE, RANGING. **The "RANGING gets faded / VOLATILE whipsaws" rationale was measured and refuted 2026-08-18** — see `11.59` and [`donchian_regime_gate_investigation.md`](donchian_regime_gate_investigation.md). Unchanged pending that decision. |
+| Regime gate | **BEAR-only exclusion** — allows TRENDING, RANGING, VOLATILE; blocks BEAR. **Changed 2026-08-18 (`11.59`)** from TRENDING-only, after a pre-registered test passed all three criteria. The old "RANGING gets faded / VOLATILE whipsaws" rationale was measured and refuted. See [`donchian_regime_gate_investigation.md`](donchian_regime_gate_investigation.md). |
 | Edge filter | `DonchianEdgeFilter`: stock > 200 SMA, earnings blackout (1 day before / 0 after), IEX-scaled liquidity floor |
 | Sleeve weight | 0.25 of gross capital |
 | Max positions | **8** (`STRATEGY_ALLOCATIONS["donchian_breakout"]["hard_max_positions"]`) — *doc said 5 until 2026-08-18* |

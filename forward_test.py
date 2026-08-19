@@ -133,6 +133,37 @@ def _build_sector_heat_snapshot(
     }
 
 
+def _allowed_regimes(strategy_name: str) -> frozenset:
+    """
+    Resolve a slot's allowed regimes from `settings.STRATEGY_ALLOWED_REGIMES`.
+
+    These used to be frozenset literals written out here, while
+    `STRATEGY_ALLOWED_REGIMES` sat in `config/settings.py` describing the same
+    fact. Nothing read the settings dict except `dashboard.py` — so the engine
+    ran the literals, the dashboard displayed the dict, and a change to either
+    one alone would silently disagree with the other. Editing only the settings
+    dict was a no-op on live behaviour.
+
+    Deriving from the dict makes it the single source of truth
+    ([[feedback_single_source_of_truth_params]]). `TestAllowedRegimesParity`
+    pins the resolution and the resulting sets.
+    """
+    try:
+        names = settings.STRATEGY_ALLOWED_REGIMES[strategy_name]
+    except KeyError:
+        raise KeyError(
+            f"STRATEGY_ALLOWED_REGIMES has no entry for {strategy_name!r}; "
+            f"known: {sorted(settings.STRATEGY_ALLOWED_REGIMES)}"
+        ) from None
+    try:
+        return frozenset(MarketRegime[name] for name in names)
+    except KeyError as exc:
+        raise ValueError(
+            f"STRATEGY_ALLOWED_REGIMES[{strategy_name!r}] names an unknown "
+            f"regime {exc.args[0]!r}; valid: {[m.name for m in MarketRegime]}"
+        ) from None
+
+
 def _git_version() -> str:
     """Return a concise git identity for the running bot code."""
     try:
@@ -221,7 +252,7 @@ def main() -> None:
             # SMA crossover works in both trending and ranging markets;
             # blocked only in BEAR and VOLATILE where edge and risk/reward
             # degrade significantly.
-            allowed_regimes=frozenset({MarketRegime.TRENDING, MarketRegime.RANGING}),
+            allowed_regimes=_allowed_regimes("sma_crossover"),
         ),
         StrategySlot(
             strategy=RSIReversion(
@@ -246,7 +277,7 @@ def main() -> None:
             # the structural SPY > 200 / BEAR veto is owned by the regime gate above.
             # Missing SMA history fails closed. Sector momentum: COLD sectors BLOCK entries
             # (mean-reversion in a cold sector = cluster risk).
-            allowed_regimes=frozenset({MarketRegime.TRENDING, MarketRegime.RANGING}),
+            allowed_regimes=_allowed_regimes("rsi_reversion"),
         ),
         StrategySlot(
             strategy=DonchianBreakout(
@@ -278,7 +309,7 @@ def main() -> None:
             # came from a 4y IEX per-symbol sweep ending 2026-04-28 and is NOT
             # comparable to the SIP portfolio-style numbers in the
             # investigation; quote the feed, window and method with either.
-            allowed_regimes=frozenset({MarketRegime.TRENDING}),
+            allowed_regimes=_allowed_regimes("donchian_breakout"),
         ),
         StrategySlot(
             strategy=SPYOptionsReversionStrategy(
@@ -296,7 +327,7 @@ def main() -> None:
             timeframe="5Min",
             # RSI reversion plays oversold bounces — avoid BEAR (stocks keep
             # falling past RSI 30) and VOLATILE (unpredictable snap-backs).
-            allowed_regimes=frozenset({MarketRegime.TRENDING, MarketRegime.RANGING}),
+            allowed_regimes=_allowed_regimes("spy_options_reversion"),
         ),
     ]
 
@@ -327,7 +358,7 @@ def main() -> None:
             watchlist_source=StaticWatchlistSource(
                 [_cs_symbol], name=f"credit_spread_{_cs_symbol.lower()}"
             ),
-            allowed_regimes=frozenset({MarketRegime.TRENDING, MarketRegime.RANGING}),
+            allowed_regimes=_allowed_regimes("credit_spread"),
         ))
 
     # Risk manager with production settings (shared across all slots).

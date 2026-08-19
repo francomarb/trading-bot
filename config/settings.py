@@ -572,19 +572,30 @@ STRATEGY_ALLOWED_REGIMES: dict[str, set[str]] = {
     "rsi_reversion":     {"TRENDING", "RANGING"},
     # Squeeze fires best after compression breaks (TRENDING) or during it (RANGING).
     "bollinger_squeeze": {"TRENDING", "RANGING"},
-    # TRENDING-only. The original rationale here — "Donchian whipsaws hard in
-    # RANGING regimes (every 20-day high gets faded), academic literature is
-    # unanimous" — was MEASURED AND REFUTED on 2026-08-18 for this universe.
-    # Raw-signal trades bucketed by SPY regime at entry, SIP 2016-11→2026-08,
-    # ai_bigtech: TRENDING mean R 0.71, RANGING mean R 0.71 (higher win rate),
-    # VOLATILE 0.72, BEAR 0.63. RANGING is not faded here.
-    # The gate's real, measured value is BEAR protection (2022: -47.8R ungated
-    # → -9.1R gated); it made 2018 worse (-13.7R → -19.5R).
-    # Kept at TRENDING pending the decision on `11.59` — a pre-registered
-    # BEAR-only alternative passed its criteria and is proposed in PR #111,
-    # NOT applied. Do not "restore" the old rationale.
+    # BEAR-only exclusion — changed from TRENDING-only on 2026-08-18 (`11.59`).
+    #
+    # The original rationale, "Donchian whipsaws hard in RANGING regimes (every
+    # 20-day high gets faded), academic literature is unanimous", was MEASURED
+    # AND REFUTED for this universe. Raw-signal trades bucketed by SPY regime
+    # at entry, SIP 2016-11→2026-08, ai_bigtech: TRENDING mean R 0.71,
+    # RANGING 0.71 (higher win rate), VOLATILE 0.72, BEAR 0.63.
+    #
+    # BEAR stays blocked because that is the gate's one measured value: 2022
+    # was -47.8R ungated against -9.1R under TRENDING-only. The pre-registered
+    # test of this exact change passed all three criteria (2022 -16.1R against
+    # a -20.0R bar; return +41.0% vs +27.4%; maxDD -15.9% vs -15.0%), and the
+    # BEAR-only arm beat TRENDING-only in 9 of 11 years while beating the
+    # UNGATED arm in both bad years.
+    #
+    # Accepted costs, recorded so they are not rediscovered as surprises:
+    # 2022 worsens -9.1R → -16.1R, 2026 worsens +60.3R → +51.3R, and entries
+    # rise ~40% (714 → 997 in the model), which raises concurrency toward the
+    # existing hard_max_positions=8 ceiling. `11.60` (correlated-entry heat
+    # cap) tracks that; the count cap is the interim control.
+    #
+    # Paper-mode change. Reverting is this one line.
     # See docs/donchian_regime_gate_investigation.md.
-    "donchian_breakout": {"TRENDING"},
+    "donchian_breakout": {"TRENDING", "RANGING", "VOLATILE"},
     "spy_options_reversion": {"TRENDING", "RANGING"},
     # Credit spreads sell premium — never in BEAR or VOLATILE (a vol spike
     # is exactly when defined-risk shorts hit max loss). See design doc §3.

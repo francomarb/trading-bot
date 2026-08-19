@@ -128,7 +128,12 @@ flowchart TD
 |----------|----------------|------------|
 | SMA Crossover | TRENDING, RANGING | BEAR, VOLATILE |
 | RSI Reversion | TRENDING, RANGING | BEAR, VOLATILE |
-| Donchian Breakout | TRENDING | RANGING, BEAR, VOLATILE |
+| Donchian Breakout | TRENDING, RANGING, VOLATILE | BEAR |
+
+> **Donchian changed 2026-08-18 (`11.59`)** from TRENDING-only to a BEAR-only
+> exclusion. The old rationale (RANGING fades every breakout) was measured and
+> refuted; BEAR stays blocked because that is the gate's one measured value.
+> See [`donchian_regime_gate_investigation.md`](donchian_regime_gate_investigation.md).
 
 ---
 
