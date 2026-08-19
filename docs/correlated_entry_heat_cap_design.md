@@ -641,11 +641,13 @@ Two things remain, and only one of them is a design question:
 
 Then implementation, whose acceptance is §6 Steps 1, 3 and 4.
 
-**Split out rather than resolved here:** the portfolio-level ceiling. Both
-reviews put it out of v1, and both gave the same reason — it introduces
-cross-strategy priority arbitration (who gets refused when the *book* is at
-its limit) that a single-sleeve control does not. It should get its own PLAN
-item once there is evidence cross-sleeve correlation actually bites.
+**Split out rather than resolved here:** the portfolio-level ceiling, now
+tracked as **PLAN `11.62`**. Both reviews put it out of v1 for the same
+reason — it introduces cross-strategy priority arbitration (who yields when
+the *book* is at its limit) that a single-sleeve control does not, and that
+arbitration is the actual work. `11.62` depends on this item shipping first,
+since it should reuse the primitive established here rather than
+re-implement it.
 
 ---
 
