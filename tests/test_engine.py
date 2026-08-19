@@ -28,6 +28,8 @@ Coverage map (one class per concern):
 
 from __future__ import annotations
 
+import json
+import os
 import time
 import sqlite3
 from dataclasses import replace
@@ -6822,3 +6824,121 @@ class TestIntradayEquityDrawdown:
         engine._run_one_cycle()
 
         assert engine.max_intraday_drawdown == pytest.approx(1_100.0)
+
+
+# ── TestIntradayDrawdownSurvivesRestart ─────────────────────────────────────
+
+
+class TestIntradayDrawdownSurvivesRestart:
+    """
+    The peak and max were process-memory only. `recycle_bot.sh` writes
+    the day's report at shutdown, the replacement engine starts with a
+    fresh peak, and *its* shutdown overwrites that same `{day}.md` with
+    only the post-restart decline — so a morning drawdown vanished from
+    the report that claims to cover the day.
+    """
+
+    def _state_file(self) -> str:
+        from config import settings
+
+        return settings.EQUITY_PATH_STATE_PATH
+
+    def test_peak_and_max_are_persisted(self, engine_factory):
+        engine, _ = engine_factory()
+        now = datetime(2026, 8, 19, 15, 0, tzinfo=timezone.utc)
+        engine._clock = lambda: now
+
+        engine._observe_equity(100_000.0)
+        engine._observe_equity(97_500.0)
+
+        with open(self._state_file()) as fh:
+            state = json.load(fh)
+        assert state["day"] == "2026-08-19"
+        assert state["equity_peak"] == pytest.approx(100_000.0)
+        assert state["max_intraday_drawdown"] == pytest.approx(2_500.0)
+
+    def test_same_day_restart_resumes_the_days_drawdown(self, engine_factory):
+        """The reviewer's scenario end to end: session 1 takes a
+        drawdown, recycle, session 2 must not report only its own."""
+        now = datetime(2026, 8, 19, 15, 0, tzinfo=timezone.utc)
+
+        first, _ = engine_factory()
+        first._clock = lambda: now
+        first._observe_equity(100_000.0)
+        first._observe_equity(96_000.0)      # -4,000 in the morning
+        assert first.max_intraday_drawdown == pytest.approx(4_000.0)
+
+        # Recycle: a brand-new engine object, same UTC day.
+        second, _ = engine_factory()
+        second._clock = lambda: now
+        assert second.max_intraday_drawdown == 0.0, "fresh object starts clean"
+
+        second._restore_equity_path_state()
+        assert second.max_intraday_drawdown == pytest.approx(4_000.0)
+        assert second._session_equity_peak == pytest.approx(100_000.0)
+
+        # A shallower afternoon dip must not shrink the day's figure.
+        second._observe_equity(99_000.0)
+        assert second.max_intraday_drawdown == pytest.approx(4_000.0)
+
+        # A deeper one extends it, measured from the restored peak.
+        second._observe_equity(94_500.0)
+        assert second.max_intraday_drawdown == pytest.approx(5_500.0)
+
+    def test_restore_runs_before_the_startup_snapshot_is_observed(
+        self, engine_factory,
+    ):
+        """Ordering matters: if the startup snapshot were observed
+        first it would become a new peak and the restored one would
+        never apply. Drive the real `start()`."""
+        now = datetime(2026, 8, 19, 15, 0, tzinfo=timezone.utc)
+
+        first, _ = engine_factory()
+        first._clock = lambda: now
+        first._observe_equity(100_000.0)
+
+        second, broker = engine_factory(snapshot=_snapshot(equity=93_000.0))
+        second._clock = lambda: now
+        broker.sync_with_broker.return_value = _snapshot(equity=93_000.0)
+        # max_cycles=0 still runs the full startup path (snapshot,
+        # restore, seed) and then exits the loop immediately.
+        second.start(max_cycles=0)
+
+        # 100,000 restored peak vs a 93,000 startup snapshot.
+        assert second.max_intraday_drawdown == pytest.approx(7_000.0)
+
+    def test_yesterdays_state_is_ignored(self, engine_factory):
+        first, _ = engine_factory()
+        first._clock = lambda: datetime(2026, 8, 18, 20, 0, tzinfo=timezone.utc)
+        first._observe_equity(100_000.0)
+        first._observe_equity(90_000.0)
+
+        second, _ = engine_factory()
+        second._clock = lambda: datetime(2026, 8, 19, 14, 0, tzinfo=timezone.utc)
+        second._restore_equity_path_state()
+
+        assert second.max_intraday_drawdown == 0.0
+        assert second._session_equity_peak is None
+
+    def test_malformed_state_does_not_block_startup(self, engine_factory):
+        engine, _ = engine_factory()
+        with open(self._state_file(), "w") as fh:
+            fh.write("{not json at all")
+
+        engine._restore_equity_path_state()   # must not raise
+
+        assert engine.max_intraday_drawdown == 0.0
+        engine._observe_equity(100_000.0)
+        engine._observe_equity(99_000.0)
+        assert engine.max_intraday_drawdown == pytest.approx(1_000.0)
+
+    def test_missing_state_file_is_a_normal_first_start(self, engine_factory):
+        engine, _ = engine_factory()
+        path = self._state_file()
+        if os.path.exists(path):
+            os.remove(path)
+
+        engine._restore_equity_path_state()
+
+        assert engine.max_intraday_drawdown == 0.0
+        assert engine._session_equity_peak is None

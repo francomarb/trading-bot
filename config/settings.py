@@ -1163,6 +1163,19 @@ TELEGRAM_COMMANDS_ENABLED: bool = (
 STATE_SNAPSHOT_PATH: str = "data/engine_state.json"
 DASHBOARD_PORT: int = int(os.getenv("DASHBOARD_PORT", "8501"))
 
+# EQUITY_PATH_STATE_PATH: the day's account-equity high-water mark and max
+#   drawdown, for the daily P&L report's `Max intraday drawdown`. Read at
+#   engine startup and re-adopted when the stored UTC day is still today,
+#   so `recycle_bot.sh` does not restart the metric at zero and let the
+#   second session's shutdown overwrite the day's report with only the
+#   post-restart decline. Deliberately NOT folded into
+#   STATE_SNAPSHOT_PATH: that file is a display snapshot for the
+#   dashboard/operator/alerts, rewritten every cycle and best-effort by
+#   contract, and hydrating engine state from it would make report
+#   correctness depend on a file nothing promises to keep. Same reasoning
+#   (and same atomic tmp→replace write) as OPERATOR_CONTROL_STATE_PATH.
+EQUITY_PATH_STATE_PATH: str = "data/equity_path_state.json"
+
 # ── Operator controls (Phase A — PR-2) ──────────────────────────────────────
 # Operator command queue + sticky halt. See docs/operator_controls_proposal.md
 # §13 Phase A and the operator-controls implementation plan.

@@ -476,6 +476,13 @@ def main() -> None:
         try:
             today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
             snap = broker.sync_with_broker()
+            # Feed the final snapshot to the equity path before reading
+            # the drawdown off it. Without this the report reflects only
+            # equity as of the last completed cycle, so a decline between
+            # that cycle and shutdown is missing from the very report
+            # that summarises the session — peak $100k, cycle $100k,
+            # shutdown $95k would still print $0.00.
+            engine._observe_equity(snap.account.equity)
             summary = pnl_tracker.generate_daily_summary(
                 day=today,
                 session_start_equity=engine._session_start_equity or snap.account.equity,

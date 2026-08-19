@@ -101,6 +101,53 @@ class TestDailySummaryCallSite:
         )
         assert ast.unparse(value) == "engine.max_intraday_drawdown"
 
+    def test_the_shutdown_snapshot_is_observed_before_it_is_reported(self):
+        """`engine.max_intraday_drawdown` is only as current as the last
+        equity observation. The shutdown handler takes a fresh snapshot
+        for `session_end_equity`; if that snapshot is not also fed to
+        the equity path, a decline between the final cycle and shutdown
+        is missing from the very report summarising the session — peak
+        $100k, last cycle $100k, shutdown $95k still prints $0.00.
+
+        Asserted on order of statements, because "it is called" is not
+        the property that matters — "it is called before the summary is
+        built" is.
+        """
+        tree = ast.parse(FORWARD_TEST.read_text())
+        main = next(
+            n for n in tree.body
+            if isinstance(n, ast.FunctionDef) and n.name == "main"
+        )
+
+        observe_lines = [
+            node.lineno
+            for node in ast.walk(main)
+            if isinstance(node, ast.Call)
+            and isinstance(node.func, ast.Attribute)
+            and node.func.attr == "_observe_equity"
+        ]
+        assert observe_lines, (
+            "forward_test.main() never feeds the shutdown snapshot to "
+            "engine._observe_equity, so the reported drawdown stops at the "
+            "last completed cycle."
+        )
+
+        summary_line = _daily_summary_call().lineno
+        sync_lines = [
+            node.lineno
+            for node in ast.walk(main)
+            if isinstance(node, ast.Call)
+            and isinstance(node.func, ast.Attribute)
+            and node.func.attr == "sync_with_broker"
+        ]
+        shutdown_sync = max(l for l in sync_lines if l < summary_line)
+
+        assert any(shutdown_sync < l < summary_line for l in observe_lines), (
+            f"_observe_equity (lines {observe_lines}) must be called between "
+            f"the shutdown sync_with_broker (line {shutdown_sync}) and the "
+            f"generate_daily_summary call (line {summary_line})."
+        )
+
 
 class TestRemovedInMemoryAccumulator:
     """`record_trade_pnl` fed an in-memory list that production never

@@ -74,6 +74,7 @@ def isolate_runtime_artifacts(tmp_path: Path, monkeypatch) -> None:
       - data/trades.db
       - data/trades_live.db
       - data/engine_state.json
+      - data/equity_path_state.json
       - logs/*.jsonl / alerts.log
     """
     from config import settings
@@ -82,6 +83,9 @@ def isolate_runtime_artifacts(tmp_path: Path, monkeypatch) -> None:
     monkeypatch.setattr(settings, "TRADE_LOG_DB_LIVE", str(tmp_path / "trades_live.db"))
     monkeypatch.setattr(settings, "TRADE_LOG_DB", str(tmp_path / "trades.db"))
     monkeypatch.setattr(settings, "STATE_SNAPSHOT_PATH", str(tmp_path / "engine_state.json"))
+    monkeypatch.setattr(
+        settings, "EQUITY_PATH_STATE_PATH", str(tmp_path / "equity_path_state.json")
+    )
     monkeypatch.setattr(settings, "JSON_LOG_FILE", str(tmp_path / "bot.jsonl"))
     monkeypatch.setattr(settings, "ALERT_LOG_FILE", str(tmp_path / "alerts.log"))
 

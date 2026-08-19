@@ -860,6 +860,11 @@ class TradingEngine:
         # Capture truth-of-the-world before any decision.
         startup_snapshot = self.broker.sync_with_broker()
         self._session_start_equity = startup_snapshot.account.equity
+        # Re-adopt today's peak BEFORE observing the startup snapshot:
+        # on a same-day recycle the restored peak is the day's, so this
+        # first observation can deepen the drawdown against it rather
+        # than silently becoming a new peak.
+        self._restore_equity_path_state()
         # Seed the intraday equity peak from the same snapshot, so a
         # decline during the very first cycle is measured against real
         # equity rather than against an unset peak.
@@ -1051,40 +1056,156 @@ class TradingEngine:
         Record one account-equity observation and update the running
         intraday high-water mark and max drawdown.
 
-        Every broker snapshot the engine takes flows through here, which
-        is the only place `_last_cycle_equity` is assigned. Drawdown is
-        measured in dollars from the day's equity peak — mark-to-market,
-        so an unrealized slide in open positions registers immediately
-        rather than waiting for the position to close.
+        Every broker snapshot the engine takes flows through here — the
+        per-cycle syncs, the startup snapshot, and the shutdown snapshot
+        the EOD report is built from — and this is the only place
+        `_last_cycle_equity` is assigned. Drawdown is measured in dollars
+        from the day's equity peak: mark-to-market, so an unrealized
+        slide in open positions registers immediately rather than
+        waiting for the position to close.
 
         Peak and drawdown reset when the UTC date rolls over, because
         the field this feeds is `max_intraday_drawdown` on a per-day
         report and this process routinely runs for a week at a time.
+
+        State that changes is persisted (see
+        `_persist_equity_path_state`) so a `recycle_bot.sh` mid-session
+        does not restart the day's metric at zero.
         """
         self._last_cycle_equity = equity
+        before = (
+            self._equity_peak_day,
+            self._session_equity_peak,
+            self._max_intraday_drawdown,
+        )
 
         day = self._clock().strftime("%Y-%m-%d")
         if day != self._equity_peak_day:
             self._equity_peak_day = day
             self._session_equity_peak = equity
             self._max_intraday_drawdown = 0.0
-            return
-
-        if self._session_equity_peak is None or equity > self._session_equity_peak:
+        elif self._session_equity_peak is None or equity > self._session_equity_peak:
             self._session_equity_peak = equity
-            return
+        else:
+            drawdown = self._session_equity_peak - equity
+            if drawdown > self._max_intraday_drawdown:
+                self._max_intraday_drawdown = drawdown
 
-        drawdown = self._session_equity_peak - equity
-        if drawdown > self._max_intraday_drawdown:
-            self._max_intraday_drawdown = drawdown
+        after = (
+            self._equity_peak_day,
+            self._session_equity_peak,
+            self._max_intraday_drawdown,
+        )
+        if after != before:
+            self._persist_equity_path_state()
 
     @property
     def max_intraday_drawdown(self) -> float:
         """
         Largest peak-to-trough account-equity decline (dollars) observed
-        today. Read by the shutdown EOD report in `forward_test.py`.
+        today, across bot restarts within the same UTC day.
+
+        Read by the shutdown EOD report in `forward_test.py`, which
+        observes its own final snapshot before reading this so a decline
+        after the last cycle still counts.
         """
         return self._max_intraday_drawdown
+
+    def _restore_equity_path_state(self) -> None:
+        """Re-adopt today's equity peak and max drawdown from disk.
+
+        Called from `start()` **before** the startup snapshot is
+        observed, so a same-day restart continues the day's metric
+        instead of restarting it at zero.
+
+        Without this, `recycle_bot.sh` silently truncated the number:
+        the outgoing process wrote the day's report at shutdown, the
+        replacement started with a fresh peak, and its own shutdown
+        overwrote that same `{day}.md` with only the post-restart
+        decline. A morning drawdown would simply vanish from the report
+        that claims to be the day's.
+
+        Stale state (stored day != today) is ignored rather than
+        cleared — `_observe_equity` resets on the day key anyway, and
+        leaving the file alone keeps yesterday's value readable if an
+        operator wants it.
+
+        Best-effort: a missing, unreadable, or malformed file logs and
+        continues with a fresh peak. A degraded drawdown figure must
+        never block startup.
+
+        Residual gap, stated honestly: equity that moves while no
+        process is running is unobserved. The first post-restart
+        observation catches the *net* move (it compares live equity to
+        the restored peak), but a peak or trough reached entirely during
+        downtime is lost. Closing that needs the broker's own intraday
+        equity series (`get_portfolio_history`), which is a larger
+        change and is not what this metric promises today.
+        """
+        path = getattr(settings, "EQUITY_PATH_STATE_PATH", None)
+        if not path:
+            return
+        try:
+            if not os.path.exists(path):
+                return
+            with open(path, "r") as fh:
+                state = json.load(fh)
+            if not isinstance(state, dict):
+                return
+            stored_day = state.get("day")
+            today = self._clock().strftime("%Y-%m-%d")
+            if stored_day != today:
+                logger.info(
+                    f"equity path state: stored day {stored_day!r} is not "
+                    f"today ({today}) — starting a fresh intraday peak"
+                )
+                return
+            peak = state.get("equity_peak")
+            drawdown = state.get("max_intraday_drawdown")
+            if peak is None:
+                return
+            self._equity_peak_day = today
+            self._session_equity_peak = float(peak)
+            self._max_intraday_drawdown = float(drawdown or 0.0)
+            logger.info(
+                f"equity path state restored for {today}: "
+                f"peak=${self._session_equity_peak:,.2f}, "
+                f"max drawdown=${self._max_intraday_drawdown:,.2f}"
+            )
+        except Exception as exc:
+            logger.warning(
+                f"equity path state restore skipped (path={path}): {exc} — "
+                "today's intraday drawdown restarts from this session"
+            )
+
+    def _persist_equity_path_state(self) -> None:
+        """Write today's equity peak / max drawdown atomically.
+
+        Same tmp→replace pattern as the state snapshot and the operator
+        control state: a crashed write leaves the previous good file,
+        never a partial one. Errors are logged and swallowed — losing
+        the persisted peak degrades a report field, and must not touch
+        the trading loop.
+        """
+        path = getattr(settings, "EQUITY_PATH_STATE_PATH", None)
+        if not path or self._equity_peak_day is None:
+            return
+        try:
+            parent = os.path.dirname(path)
+            if parent:
+                os.makedirs(parent, exist_ok=True)
+            payload = {
+                "day": self._equity_peak_day,
+                "equity_peak": self._session_equity_peak,
+                "max_intraday_drawdown": self._max_intraday_drawdown,
+                "updated_at": self._clock().isoformat(),
+            }
+            tmp = f"{path}.tmp"
+            with open(tmp, "w") as fh:
+                json.dump(payload, fh, indent=2)
+            os.replace(tmp, path)
+        except Exception as exc:
+            logger.warning(f"equity path state persist failed (path={path}): {exc}")
 
     # ── Per-cycle pipeline ───────────────────────────────────────────────
 
