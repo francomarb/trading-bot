@@ -1230,6 +1230,10 @@ class TradingEngine:
             # Regime detection — runs once per cycle, before any slot.
             # Exits are never blocked by regime; only new entries are gated.
             current_regime = None
+            # True unless the detector is configured but could not tell us the
+            # regime. Distinct from `current_regime is None`, which ALSO means
+            # "no detector configured" — a deliberate allow-all.
+            regime_known = True
             if self._regime_detector is not None:
                 try:
                     current_regime = self._regime_detector.detect()
@@ -1259,12 +1263,23 @@ class TradingEngine:
                         )
                         current_regime = MarketRegime(self._last_regime)
                     else:
+                        # Cold start, regime genuinely unknown. This used to
+                        # default to RANGING, which permits entries for every
+                        # sleeve that allows RANGING — fail-OPEN, and newly
+                        # dangerous once `11.59` added RANGING and VOLATILE to
+                        # Donchian. BEAR would be fail-closed but also triggers
+                        # `_sweep_bear_spread_exits()`, and a SPY data outage is
+                        # not a bear market — liquidating on it would be its own
+                        # defect. So: no regime, and every slot's entries are
+                        # blocked below. Exits and open positions are untouched.
                         logger.warning(
                             f"regime detection failed "
                             f"({self._regime_fail_count}x), no prior regime "
-                            "— defaulting to RANGING"
+                            "— regime UNKNOWN, blocking all new entries "
+                            "this cycle (fail-closed; exits unaffected)"
                         )
-                        current_regime = MarketRegime.RANGING
+                        current_regime = None
+                        regime_known = False
 
             # BEAR defensive sweep — runs at cycle level so the override is
             # never gated by per-symbol bar fetch failures, stale-data
@@ -1291,7 +1306,13 @@ class TradingEngine:
                 # Per-slot regime gate: block new entries if current regime is
                 # not in the slot's allowed set. Exits always proceed.
                 entry_allowed = True
-                if current_regime is not None and slot.allowed_regimes is not None:
+                if not regime_known:
+                    entry_allowed = False
+                    logger.info(
+                        f"[{slot.strategy.name}] regime UNKNOWN "
+                        "— new entries blocked this cycle (fail-closed)"
+                    )
+                elif current_regime is not None and slot.allowed_regimes is not None:
                     if current_regime not in slot.allowed_regimes:
                         entry_allowed = False
                         logger.info(
