@@ -69,18 +69,35 @@ from utils.options_lookup import build_opra_quote_lookup
 
 # ── Logging ──────────────────────────────────────────────────────────────────
 
-logger.remove()
-logger.add(
-    sys.stdout,
-    format=(
-        "<green>{time:YYYY-MM-DD HH:mm:ss}</green> | "
-        "<level>{level: <8}</level> | "
-        "<cyan>{name}</cyan>:<cyan>{function}</cyan> | "
-        "{message}"
-    ),
-    level="INFO",
-)
-logger.add("logs/forward_test.log", rotation="10 MB", retention="90 days", level="DEBUG")
+
+def _configure_logging() -> None:
+    """
+    Install this launcher's log sinks. Called from `main()`, NOT at import time.
+
+    These used to run at module scope, which meant merely *importing*
+    `forward_test` attached a DEBUG sink to the real `logs/forward_test.log`.
+    `tests/test_allowed_regimes_parity.py` imports this module to check the
+    regime wiring, and that one import made the entire pytest run write into
+    the operator's live log — 437KB per suite run of DRY-RUN orders and fake
+    engine cycles interleaved with real bot output. `tests/conftest.py`
+    redirects `bot.jsonl`, `alerts.log` and the trade DBs, but it cannot
+    intercept a bare `logger.add()` executed at import.
+
+    Bot behaviour is unchanged: `start_bot.sh` runs `python forward_test.py`,
+    so `main()` runs and installs exactly the same sinks as before.
+    """
+    logger.remove()
+    logger.add(
+        sys.stdout,
+        format=(
+            "<green>{time:YYYY-MM-DD HH:mm:ss}</green> | "
+            "<level>{level: <8}</level> | "
+            "<cyan>{name}</cyan>:<cyan>{function}</cyan> | "
+            "{message}"
+        ),
+        level="INFO",
+    )
+    logger.add("logs/forward_test.log", rotation="10 MB", retention="90 days", level="DEBUG")
 
 
 def _build_sector_heat_snapshot(
@@ -180,6 +197,7 @@ def _git_version() -> str:
 
 
 def main() -> None:
+    _configure_logging()
     logger.info("=" * 60)
     logger.info("Forward Test — Paper Trading (Phase 10)")
     logger.info("=" * 60)
