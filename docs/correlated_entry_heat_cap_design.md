@@ -1,6 +1,7 @@
 # Correlated-Entry Heat Cap — Design (PLAN `11.60`)
 
-**Status:** 🔄 **DRAFT — revision 2, after two independent design reviews.**
+**Status:** 🔄 **DRAFT — revision 3.** Two independent design reviews, plus a
+second pass from review 1 on rev 2.
 The five design forks in §5 are now **RESOLVED**: two reviews (Codex,
 Gemini/Antigravity) reached the same answer on each, independently. The
 enforcement model in §5.6 is resolved on evidence where the two reviews
@@ -11,7 +12,7 @@ Sections marked **CLOSED** were measured and rejected; do not re-propose
 without meeting the stated re-open bar. Sections marked **RESOLVED** carry
 the reasoning both reviews converged on. §7 lists what is still open.
 
-**Last updated:** 2026-08-19 (rev 2)
+**Last updated:** 2026-08-19 (rev 3)
 
 **Scope:** the `donchian_breakout` sleeve first, built as reusable per-strategy
 machinery. Slot allocation / candidate ranking is deliberately **out of scope**
@@ -401,9 +402,26 @@ cancel or expiry.
 | Event | Heat contribution |
 |---|---|
 | Entry submitted (resting) | **Reserved:** `intended_qty × (intended_limit_price − intended_stop_price)`. A buy stop-limit cannot fill above its limit, so this is the true worst case |
-| Entry fills | Reservation **replaced** by actual `(entry_fill − initial_stop) × filled_qty` |
-| Entry cancels / expires DAY | Reservation **released** |
-| Position exits | Contribution **released** |
+| Entry **fully** fills | Reservation **replaced** by actual `(entry_fill − initial_stop) × held_qty` |
+| Entry **partially** fills | **Both components held at once:** actual risk on the filled shares **+** worst-case reservation on the shares still resting |
+| Entry cancels / expires DAY | Release **only the unfilled portion's** reservation. Any filled shares keep their actual risk — they are a position now |
+| Position **partially** exits | Reduce heat **pro rata to the exited quantity**, not to zero |
+| Position fully exits | Contribution **released** |
+
+**Held quantity has its own authority.** Use `position_lifecycle.current_qty`
+(the parent row), **not** the entry order's `filled_qty`. The two agree only
+until the first partial exit, fractional residual cleanup, or reduction — after
+which `filled_qty` describes what was once bought and `current_qty` describes
+what is still at risk. Only the latter belongs in a heat figure.
+
+*Status of this path:* anticipatory, not a fix for an observed bug. All 142
+rows in the live trade log are `status='filled'`; no equity entry has partially
+filled yet. But `partial` is a supported state the reporting layer already
+handles (`read_realized_pnl_events_for_day` counts `status IN ('filled',
+'partial')`), the spread path already logs partial closes, and fractional
+quantities are routine. A cap that mis-handles the first partial fill would
+under- or over-count silently, so the accounting belongs in v1 even though it
+is currently unexercised.
 
 **Store.** [`position_lifecycle_orders`](../reporting/logger.py) is
 authoritative for reservations; filled trade rows remain the audit trail for
@@ -460,10 +478,27 @@ variant — not only aggregate returns.
 **Step 2 — design choice.** ✅ Done — §5.1–5.6 are resolved.
 
 **Step 3 — pre-register a level.** Test **discrete multiples of the existing
-0.40% per-trade risk unit**, not a continuous sweep. This is review 2's
-contribution and it is the right shape: the candidates derive from a parameter
-that already exists, so the exercise cannot quietly become the optimisation
-`11.56` warns about.
+0.40% per-trade risk unit**, not a continuous sweep. The candidates derive
+from a parameter that already exists, which keeps them interpretable.
+
+> ### ⚠️ Discretising narrows the search; it does not make the choice empirical
+>
+> Three candidates instead of thirty is still a selection if historical
+> outcome picks the winner. **The evidence describes the consequence of each
+> level. It cannot discover the right one.**
+>
+> The reason is in §1 of this document: the 27 closed live trades represent
+> roughly **six independent market-timing bets**. A sample that small, and that
+> clustered, cannot distinguish 3R from 5R — whichever looks best will
+> mostly be telling you which few market episodes the window happened to
+> contain. Choosing on that basis is `11.56` by instalment.
+>
+> **So the level is an operator risk-policy decision, not a measurement.** The
+> honest sequence is: use the evidence to state what each level *would have
+> done* (cohort sizes permitted, entries forgone, worst cohort loss bounded),
+> have the operator choose an appetite from that, pre-register it, and only
+> then evaluate forward on paper. A level chosen because one candidate made
+> the backtest look best has been fitted, however few candidates there were.
 
 | Candidate | % of equity | Implied positions at target size |
 |---|---|---|
@@ -524,10 +559,14 @@ proposal by verification — argue with the verification, not the conclusion.
 
 What genuinely remains:
 
-1. **The level.** Nothing here picks 3R, 4R or 5R. That is Step 1's evidence
-   to settle, and the callout above is the constraint to reason from: an
-   R-multiple cap silently redefines effective concurrency, and the suggested
-   4R baseline is already breached by the live book.
+1. **The level — an operator decision, not a review one.** Nothing here picks
+   3R, 4R or 5R, and §6 explains why the evidence cannot pick it either: at
+   ~6 independent market bets the sample cannot separate the candidates. What
+   reviewers can usefully do is sharpen *what each level would have cost* —
+   cohort sizes permitted, entries forgone, worst cohort loss bounded — so the
+   appetite is chosen with the trade-off visible. Two constraints to reason
+   from: an R-multiple cap silently redefines effective concurrency, and the
+   suggested 4R baseline is already breached by the live book.
 2. **The MARKET entry path** (§5.6). 3 of 17 Donchian entries were `market`.
    Reservation-and-immediate-settlement is the obvious handling; is there a
    reason it should differ?
