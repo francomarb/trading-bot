@@ -133,3 +133,77 @@ class TestDashboardAgreesWithEngine:
                 continue  # implemented but not wired into forward_test
             resolved = forward_test._allowed_regimes(name)
             assert {m.name for m in resolved} == set(names)
+
+
+class TestImportingForwardTestHasNoSideEffects:
+    """
+    `forward_test.py` is the live bot's entry point. Importing it — which this
+    very test module does — must not reach out and touch the operator's real
+    log files.
+
+    It used to. `logger.remove()` and two `logger.add()` calls sat at module
+    scope, so importing attached a DEBUG sink to `logs/forward_test.log` and
+    the whole pytest run then wrote into the live log: 437KB per suite run of
+    DRY-RUN orders and fake engine cycles interleaved with real bot output,
+    which is exactly the file used to diagnose the running bot.
+    `tests/conftest.py` redirects `bot.jsonl`, `alerts.log` and the trade DBs,
+    but cannot intercept a bare `logger.add()` executed at import time.
+    """
+
+    def _module_level_calls(self, func_name: str) -> list[int]:
+        import ast
+        from pathlib import Path
+
+        from config import settings
+
+        source = Path(settings.__file__).parent.parent / "forward_test.py"
+        tree = ast.parse(source.read_text())
+        hits = []
+        for node in tree.body:
+            # Module level only. Skip def/class bodies — a logger.add() inside
+            # _configure_logging() is the fix, not the defect, and ast.walk()
+            # would otherwise descend into it and flag it.
+            if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
+                continue
+            for sub in ast.walk(node):
+                if isinstance(sub, ast.Call):
+                    f = sub.func
+                    if isinstance(f, ast.Attribute) and f.attr == func_name:
+                        if isinstance(f.value, ast.Name) and f.value.id == "logger":
+                            hits.append(sub.lineno)
+        return hits
+
+    def test_no_module_level_logger_add(self):
+        hits = self._module_level_calls("add")
+        assert not hits, (
+            f"forward_test.py calls logger.add() at module scope (line(s) {hits}); "
+            "importing it would attach a sink to the operator's live log. Put "
+            "sink setup inside _configure_logging(), called from main()."
+        )
+
+    def test_no_module_level_logger_remove(self):
+        hits = self._module_level_calls("remove")
+        assert not hits, (
+            f"forward_test.py calls logger.remove() at module scope (line(s) {hits}); "
+            "importing it would tear down another process's log handlers."
+        )
+
+    def test_main_still_configures_logging(self):
+        """The bot must keep its sinks — start_bot.sh runs `python forward_test.py`."""
+        import ast
+        from pathlib import Path
+
+        from config import settings
+
+        source = Path(settings.__file__).parent.parent / "forward_test.py"
+        tree = ast.parse(source.read_text())
+        main = next(
+            n for n in tree.body
+            if isinstance(n, ast.FunctionDef) and n.name == "main"
+        )
+        called = {
+            sub.func.id
+            for sub in ast.walk(main)
+            if isinstance(sub, ast.Call) and isinstance(sub.func, ast.Name)
+        }
+        assert "_configure_logging" in called
