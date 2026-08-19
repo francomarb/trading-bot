@@ -17,6 +17,7 @@ import re
 import sqlite3
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
+from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
 import pandas as pd
@@ -58,6 +59,8 @@ from reporting.pnl import (
     StrategyStats,
     _instrument_class,
     _slippage_by_instrument,
+    max_drawdown_from_equity_path,
+    unrealized_pnl_from_positions,
 )
 from risk.manager import RiskDecision, Side
 from strategies.base import OrderType
@@ -465,6 +468,45 @@ class TestTradeLogger:
         """Missing-DB path returns []; never raises."""
         tl = TradeLogger(path="/nonexistent/path/trades.db")
         assert tl.read_realized_pnl_events_for_day("2026-06-09") == []
+
+    def test_read_realized_pnl_events_in_range_is_inclusive_of_both_ends(
+        self, tmp_csv,
+    ):
+        """The weekly report passes the window's first and last day, so
+        an exclusive bound would silently drop a Monday or a Sunday of
+        P&L from every digest."""
+        tl = TradeLogger(path=tmp_csv)
+        for day, pnl in [
+            ("2026-06-07", -1.0),   # day before the window
+            ("2026-06-08", 10.0),   # window start
+            ("2026-06-10", 20.0),   # middle
+            ("2026-06-14", 30.0),   # window end
+            ("2026-06-15", -2.0),   # day after the window
+        ]:
+            _log_close(tl, day=day, symbol="X", strategy="sma", pnl=pnl,
+                       seq=int(day[-2:]))
+
+        events = tl.read_realized_pnl_events_in_range("2026-06-08", "2026-06-14")
+        assert sorted(p for _, p in events) == [10.0, 20.0, 30.0]
+
+    def test_read_realized_pnl_events_for_day_delegates_to_the_range_query(
+        self, tmp_csv,
+    ):
+        """One definition of "which rows are a realized close", so the
+        daily and weekly reports cannot drift apart."""
+        tl = TradeLogger(path=tmp_csv)
+        _log_close(tl, day="2026-06-09", symbol="X", strategy="sma", pnl=42.0)
+
+        assert (
+            tl.read_realized_pnl_events_for_day("2026-06-09")
+            == tl.read_realized_pnl_events_in_range("2026-06-09", "2026-06-09")
+            == [("sma", 42.0)]
+        )
+
+    def test_read_realized_pnl_events_in_range_handles_missing_db(self):
+        """Missing-DB path returns []; never raises."""
+        tl = TradeLogger(path="/nonexistent/path/trades.db")
+        assert tl.read_realized_pnl_events_in_range("2026-06-01", "2026-06-30") == []
 
     def test_read_strategy_realized_pnl_summary_reconstructs_hwm(self, tmp_csv):
         tl = TradeLogger(path=tmp_csv)
@@ -3251,20 +3293,118 @@ class TestExitBasisRefusalAndLifecycleRescue:
 # ── TestPnLTracker ──────────────────────────────────────────────────────────
 
 
+def _log_close(tl, *, day: str, symbol: str, strategy: str, pnl: float, seq: int = 1):
+    """Write one realized-P&L close row — what the engine logs on exit."""
+    tl.log(TradeRecord(
+        timestamp=f"{day}T15:{seq:02d}:00+00:00",
+        symbol=symbol, side="sell", qty=1, avg_fill_price=100.0,
+        order_id=f"{symbol}-close-{seq}",
+        strategy=strategy, reason="exit signal",
+        stop_price=0.0, entry_reference_price=100.0,
+        modeled_slippage_bps=0.0, realized_slippage_bps=0.0,
+        order_type="market", status="filled",
+        requested_qty=1, filled_qty=1,
+        realized_pnl=pnl,
+        entry_timestamp=f"{day}T13:00:00+00:00",
+        exit_timestamp=f"{day}T15:{seq:02d}:00+00:00",
+        position_type="single_leg",
+    ))
+
+
+class TestMaxDrawdownFromEquityPath:
+    """Backs the daily report's `Max intraday drawdown` when reconciled
+    against the broker's own intraday equity series."""
+
+    def test_empty_and_rising_paths_have_no_drawdown(self):
+        assert max_drawdown_from_equity_path([]) == 0.0
+        assert max_drawdown_from_equity_path([100.0]) == 0.0
+        assert max_drawdown_from_equity_path([100.0, 101.0, 105.0]) == 0.0
+
+    def test_uses_running_peak_not_range(self):
+        """A low that precedes the high is not a drawdown. Taken from
+        the live paper account on 2026-08-19: trough 100,828.40 at
+        14:15Z, peak 101,615.53 at 16:19Z. The true peak-to-trough
+        decline was $577.88; `max - min` would claim $787.13 — a drop
+        that never happened.
+        """
+        path = [101_113.43, 100_828.40, 101_615.53, 101_037.65, 101_408.36]
+
+        assert max_drawdown_from_equity_path(path) == pytest.approx(577.88)
+        assert max(path) - min(path) == pytest.approx(787.13)
+
+    def test_worst_decline_wins_over_a_later_shallower_one(self):
+        path = [100.0, 90.0, 100.0, 95.0]
+        assert max_drawdown_from_equity_path(path) == pytest.approx(10.0)
+
+    def test_decline_is_measured_from_the_preceding_peak(self):
+        path = [100.0, 120.0, 80.0]
+        assert max_drawdown_from_equity_path(path) == pytest.approx(40.0)
+
+    def test_none_samples_are_skipped_not_treated_as_zero(self):
+        """Alpaca returns nulls for minutes it cannot value. Reading one
+        as $0 equity would manufacture a six-figure drawdown out of a
+        reporting gap."""
+        path = [100_000.0, None, 99_500.0, None]
+        assert max_drawdown_from_equity_path(path) == pytest.approx(500.0)
+
+
+class TestUnrealizedPnLFromPositions:
+    """`unrealized_pnl_from_positions` — the daily report's unrealized figure."""
+
+    def test_sums_broker_unrealized_across_positions(self):
+        positions = [
+            SimpleNamespace(symbol="AAPL", unrealized_pl=250.5),
+            SimpleNamespace(symbol="NVDA", unrealized_pl=-100.25),
+            SimpleNamespace(symbol="PLTR", unrealized_pl=0.0),
+        ]
+        assert unrealized_pnl_from_positions(positions) == pytest.approx(150.25)
+
+    def test_empty_book_is_zero(self):
+        assert unrealized_pnl_from_positions([]) == 0.0
+
+    def test_reads_the_real_position_dataclass(self):
+        """The helper is duck-typed on `.unrealized_pl`; production feeds
+        it `BrokerSnapshot.account.open_positions.values()`. Pin the
+        field name to the actual dataclass so a rename fails here rather
+        than quietly restoring $0.00 to the report."""
+        from risk.manager import Position
+
+        positions = {
+            "AAPL": Position(
+                symbol="AAPL", qty=10, avg_entry_price=200.0,
+                market_value=2_100.0, unrealized_pl=100.0,
+            ),
+            "NVDA": Position(
+                symbol="NVDA", qty=5, avg_entry_price=220.0,
+                market_value=1_075.0, unrealized_pl=-25.0,
+            ),
+        }
+        assert unrealized_pnl_from_positions(positions.values()) == pytest.approx(75.0)
+
+    def test_missing_unrealized_is_skipped_and_warned(self):
+        """A None must not silently become 0.0 — that is the exact
+        failure mode this function exists to end. It is skipped, and the
+        understatement is logged with the symbol."""
+        positions = [
+            SimpleNamespace(symbol="AAPL", unrealized_pl=300.0),
+            SimpleNamespace(symbol="NVDA", unrealized_pl=None),
+        ]
+        from loguru import logger as loguru_logger
+
+        messages: list[str] = []
+        sink_id = loguru_logger.add(messages.append, level="WARNING")
+        try:
+            total = unrealized_pnl_from_positions(positions)
+        finally:
+            loguru_logger.remove(sink_id)
+
+        assert total == pytest.approx(300.0)
+        logged = "".join(messages)
+        assert "NVDA" in logged
+        assert "understates" in logged
+
+
 class TestPnLTracker:
-    def test_record_trade_pnl(self, tmp_csv, tmp_daily_dir):
-        tracker = PnLTracker(
-            trade_csv_path=tmp_csv, daily_pnl_dir=tmp_daily_dir
-        )
-        tracker.record_trade_pnl("sma_crossover", 100.0, today="2026-04-16")
-        tracker.record_trade_pnl("sma_crossover", -50.0, today="2026-04-16")
-
-        summary = tracker.generate_daily_summary(day="2026-04-16")
-        assert summary.total_trades == 2
-        assert summary.realized_pnl == 50.0
-        assert summary.largest_win == 100.0
-        assert summary.largest_loss == -50.0
-
     def test_eod_summary_reads_trade_log_when_no_in_memory_events(
         self, tmp_csv, tmp_daily_dir,
     ):
@@ -3347,12 +3487,13 @@ class TestPnLTracker:
         assert summary.strategies["donchian_breakout"].trade_count == 1
 
     def test_per_strategy_attribution(self, tmp_csv, tmp_daily_dir):
+        tl = TradeLogger(path=tmp_csv)
+        _log_close(tl, day="2026-04-16", symbol="AAA", strategy="strat_a", pnl=200.0, seq=1)
+        _log_close(tl, day="2026-04-16", symbol="BBB", strategy="strat_a", pnl=-80.0, seq=2)
+        _log_close(tl, day="2026-04-16", symbol="CCC", strategy="strat_b", pnl=50.0, seq=3)
         tracker = PnLTracker(
             trade_csv_path=tmp_csv, daily_pnl_dir=tmp_daily_dir
         )
-        tracker.record_trade_pnl("strat_a", 200.0, today="2026-04-16")
-        tracker.record_trade_pnl("strat_a", -80.0, today="2026-04-16")
-        tracker.record_trade_pnl("strat_b", 50.0, today="2026-04-16")
 
         summary = tracker.generate_daily_summary(day="2026-04-16")
         assert "strat_a" in summary.strategies
@@ -3370,35 +3511,53 @@ class TestPnLTracker:
         assert b.trade_count == 1
         assert b.profit_factor == float("inf")  # no losses
 
-    def test_intraday_drawdown(self, tmp_csv, tmp_daily_dir):
+    def test_only_the_requested_days_closes_are_counted(self, tmp_csv, tmp_daily_dir):
+        """Day scoping lives in the SQL, not in a resettable in-memory
+        accumulator, so an adjacent day's closes never leak in."""
+        tl = TradeLogger(path=tmp_csv)
+        _log_close(tl, day="2026-04-16", symbol="AAA", strategy="s", pnl=100.0, seq=1)
+        _log_close(tl, day="2026-04-17", symbol="BBB", strategy="s", pnl=-200.0, seq=2)
         tracker = PnLTracker(
             trade_csv_path=tmp_csv, daily_pnl_dir=tmp_daily_dir
         )
-        tracker.record_trade_pnl("s", 100.0, today="2026-04-16")
-        tracker.record_trade_pnl("s", -150.0, today="2026-04-16")  # peak 100, now -50
-        tracker.record_trade_pnl("s", 80.0, today="2026-04-16")   # now 30
-
-        summary = tracker.generate_daily_summary(day="2026-04-16")
-        # Max drawdown from peak=100 to trough=-50 = 150
-        assert summary.max_intraday_drawdown == 150.0
-
-    def test_day_reset(self, tmp_csv, tmp_daily_dir):
-        tracker = PnLTracker(
-            trade_csv_path=tmp_csv, daily_pnl_dir=tmp_daily_dir
-        )
-        tracker.record_trade_pnl("s", 100.0, today="2026-04-16")
-        tracker.record_trade_pnl("s", -200.0, today="2026-04-17")  # new day
 
         summary = tracker.generate_daily_summary(day="2026-04-17")
         assert summary.total_trades == 1
         assert summary.realized_pnl == -200.0
-        assert summary.max_intraday_drawdown == 200.0
 
-    def test_write_daily_report(self, tmp_csv, tmp_daily_dir):
+    def test_unrealized_and_drawdown_reach_the_report(self, tmp_csv, tmp_daily_dir):
+        """Both fields shipped hardcoded at $0.00 for 71 daily reports:
+        `unrealized_pnl` was never passed by the only production caller,
+        and `max_intraday_drawdown` came from an accumulator nothing
+        fed. Assert the caller's values survive into the markdown.
+        """
         tracker = PnLTracker(
             trade_csv_path=tmp_csv, daily_pnl_dir=tmp_daily_dir
         )
-        tracker.record_trade_pnl("sma_crossover", 100.0, today="2026-04-16")
+        summary = tracker.generate_daily_summary(
+            day="2026-04-16",
+            session_start_equity=100_000.0,
+            session_end_equity=99_500.0,
+            unrealized_pnl=-1_234.56,
+            max_intraday_drawdown=780.25,
+        )
+
+        assert summary.unrealized_pnl == -1_234.56
+        assert summary.max_intraday_drawdown == 780.25
+
+        content = open(tracker.write_daily_report(summary)).read()
+        assert "| Unrealized P&L | $-1,234.56 |" in content
+        assert "| Max intraday drawdown | $780.25 |" in content
+
+    def test_write_daily_report(self, tmp_csv, tmp_daily_dir):
+        tl = TradeLogger(path=tmp_csv)
+        _log_close(
+            tl, day="2026-04-16", symbol="AAA",
+            strategy="sma_crossover", pnl=100.0,
+        )
+        tracker = PnLTracker(
+            trade_csv_path=tmp_csv, daily_pnl_dir=tmp_daily_dir
+        )
 
         summary = tracker.generate_daily_summary(
             day="2026-04-16",
@@ -3578,7 +3737,10 @@ class TestPnLTracker:
             weekly_report_dir=tmp_weekly_dir,
         )
         # Create a daily report first.
-        tracker.record_trade_pnl("s", 100.0, today="2026-04-16")
+        _log_close(
+            tl=TradeLogger(path=tmp_csv), day="2026-04-16",
+            symbol="AAA", strategy="s", pnl=100.0,
+        )
         summary = tracker.generate_daily_summary(day="2026-04-16")
         tracker.write_daily_report(summary)
 
@@ -3588,6 +3750,90 @@ class TestPnLTracker:
         content = open(path).read()
         assert "Weekly Report" in content
         assert "2026-04-16" in content
+
+    def test_weekly_report_carries_realized_pnl(
+        self, tmp_csv, tmp_daily_dir, tmp_weekly_dir,
+    ):
+        """The weekly report contained no dollar figure at all — only
+        fill counts and slippage. It was written before `realized_pnl`
+        was a column on `trades`, and the comment saying we only have
+        "fills, not round-trips" outlived the schema that made it true.
+        Two locals (`total_pnl`, `strat_pnls`) sat here unread.
+        """
+        tl = TradeLogger(path=tmp_csv)
+        _log_close(tl, day="2026-04-13", symbol="AAA", strategy="donchian", pnl=-292.80, seq=1)
+        _log_close(tl, day="2026-04-16", symbol="BBB", strategy="donchian", pnl=-271.11, seq=2)
+        tracker = PnLTracker(
+            trade_csv_path=tmp_csv,
+            daily_pnl_dir=tmp_daily_dir,
+            weekly_report_dir=tmp_weekly_dir,
+        )
+        for day in ("2026-04-13", "2026-04-16"):
+            tracker.write_daily_report(tracker.generate_daily_summary(day=day))
+
+        content = open(tracker.generate_weekly_report(week_end="2026-04-16")).read()
+
+        assert "| Realized P&L | $-563.91 |" in content
+        assert "| Closed trades | 2 |" in content
+        assert "## Per-Strategy Attribution" in content
+        assert "### donchian" in content
+        assert "| P&L | $-563.91 |" in content
+        assert "| Largest loss | $-292.80 |" in content
+
+    def test_weekly_pnl_equals_the_sum_of_its_daily_reports(
+        self, tmp_csv, tmp_daily_dir, tmp_weekly_dir,
+    ):
+        """The weekly and daily reports read realized P&L through the
+        same query for exactly this reason. If someone re-hand-rolls
+        either side's row filter, the two disagree and the weekly digest
+        is where nobody would notice.
+        """
+        tl = TradeLogger(path=tmp_csv)
+        # Spread of strategies, signs, and a zero-P&L close; plus a
+        # partial, which counts, and a row outside the window, which
+        # must not.
+        _log_close(tl, day="2026-04-13", symbol="AAA", strategy="sma", pnl=140.5, seq=1)
+        _log_close(tl, day="2026-04-14", symbol="BBB", strategy="rsi", pnl=-60.25, seq=2)
+        _log_close(tl, day="2026-04-14", symbol="CCC", strategy="sma", pnl=0.0, seq=3)
+        _log_close(tl, day="2026-04-16", symbol="DDD", strategy="donchian", pnl=-12.75, seq=4)
+        _log_close(tl, day="2026-04-09", symbol="EEE", strategy="sma", pnl=9_999.0, seq=5)
+        tracker = PnLTracker(
+            trade_csv_path=tmp_csv,
+            daily_pnl_dir=tmp_daily_dir,
+            weekly_report_dir=tmp_weekly_dir,
+        )
+
+        daily_total = 0.0
+        for day in ("2026-04-13", "2026-04-14", "2026-04-16"):
+            summary = tracker.generate_daily_summary(day=day)
+            tracker.write_daily_report(summary)
+            daily_total += summary.realized_pnl
+
+        content = open(tracker.generate_weekly_report(week_end="2026-04-16")).read()
+
+        assert daily_total == pytest.approx(67.5)
+        assert f"| Realized P&L | ${daily_total:,.2f} |" in content, content
+        assert "9,999" not in content, "a close outside the window leaked in"
+        # The zero-P&L close is a trade but neither a win nor a loss.
+        assert "| Closed trades | 4 |" in content
+
+    def test_weekly_report_with_no_closes_says_zero_not_nothing(
+        self, tmp_csv, tmp_daily_dir, tmp_weekly_dir,
+    ):
+        """A week of entries and no exits is a real state. It must
+        report $0.00 over 0 closed trades, not omit the row."""
+        tracker = PnLTracker(
+            trade_csv_path=tmp_csv,
+            daily_pnl_dir=tmp_daily_dir,
+            weekly_report_dir=tmp_weekly_dir,
+        )
+        tracker.write_daily_report(tracker.generate_daily_summary(day="2026-04-16"))
+
+        content = open(tracker.generate_weekly_report(week_end="2026-04-16")).read()
+
+        assert "| Realized P&L | $0.00 |" in content
+        assert "| Closed trades | 0 |" in content
+        assert "## Per-Strategy Attribution" not in content
 
 
 # ── TestStrategyStats ───────────────────────────────────────────────────────

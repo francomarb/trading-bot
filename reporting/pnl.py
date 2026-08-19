@@ -21,7 +21,7 @@ P&L tracking and reporting (Phase 9).
 Design principles:
   - All computation is from the trade database — single source of truth.
   - Reports are markdown files, human-readable, git-friendly.
-  - No external dependencies beyond pandas (already in stack).
+  - No external dependencies beyond the standard library.
 """
 
 from __future__ import annotations
@@ -31,7 +31,6 @@ import re
 from dataclasses import dataclass, field
 from datetime import date, datetime, timedelta, timezone
 
-import pandas as pd
 from loguru import logger
 
 from config import settings
@@ -62,6 +61,99 @@ INSTRUMENT_CLASSES: tuple[str, ...] = ("equity", "option")
 def _instrument_class(symbol: str | None) -> str:
     """"equity" or "option" for a trade-log symbol (OCC = option)."""
     return "option" if _OCC_SYMBOL_RE.match(str(symbol or "")) else "equity"
+
+
+def unrealized_pnl_from_positions(positions) -> float:
+    """
+    Sum broker-reported unrealized P&L across open positions.
+
+    `positions` is any iterable of objects carrying `unrealized_pl` — in
+    production `BrokerSnapshot.account.open_positions.values()`, whose
+    `unrealized_pl` is Alpaca's own mark-to-market for the position.
+
+    A position whose `unrealized_pl` is None contributes 0.0 *and is
+    logged*. That is deliberate: this function exists because the daily
+    report shipped a hardcoded $0.00 unrealized for 71 sessions, and a
+    silent None→0.0 coercion would reintroduce exactly that failure one
+    position at a time. Alpaca populates the field for every equity and
+    option position, so a warning here means the snapshot is degraded
+    and the total is an understatement, not that the position is flat.
+    """
+    total = 0.0
+    missing: list[str] = []
+    for pos in positions:
+        value = getattr(pos, "unrealized_pl", None)
+        if value is None:
+            missing.append(str(getattr(pos, "symbol", "?")))
+            continue
+        total += float(value)
+    if missing:
+        logger.warning(
+            f"unrealized P&L: broker reported no unrealized_pl for "
+            f"{len(missing)} position(s) ({', '.join(sorted(missing))}) — "
+            f"daily-report unrealized total ${total:,.2f} understates the book"
+        )
+    return total
+
+
+def max_drawdown_from_equity_path(equity) -> float:
+    """
+    Largest peak-to-trough decline, in dollars, over an equity series.
+
+    Standard running-peak definition: each point is compared to the
+    highest value seen *before or at* it, so the result is the worst
+    decline actually experienced — not the range (`max - min`), which
+    would report a drop that never happened whenever the low precedes
+    the high.
+
+    `None` entries are skipped. Alpaca's portfolio history returns nulls
+    for minutes it cannot value, and treating one as zero equity would
+    manufacture a catastrophic drawdown out of a reporting gap.
+
+    Returns 0.0 for an empty or monotonically rising series.
+    """
+    peak: float | None = None
+    worst = 0.0
+    for value in equity:
+        if value is None:
+            continue
+        point = float(value)
+        if peak is None or point > peak:
+            peak = point
+            continue
+        decline = peak - point
+        if decline > worst:
+            worst = decline
+    return worst
+
+
+def _stats_by_strategy(
+    events: list[tuple[str, float]],
+) -> dict[str, "StrategyStats"]:
+    """Fold ``(strategy, realized_pnl)`` events into per-strategy stats.
+
+    Shared by the daily and weekly reports so "what counts as a win" is
+    defined once. A zero-P&L close counts toward `trade_count` but is
+    neither a win nor a loss, which is what makes `wins + losses` legal
+    to be less than `trade_count`.
+    """
+    stats: dict[str, StrategyStats] = {}
+    for strategy_name, pnl in events:
+        if strategy_name not in stats:
+            stats[strategy_name] = StrategyStats(strategy_name=strategy_name)
+        s = stats[strategy_name]
+        s.trade_count += 1
+        s.total_pnl += pnl
+        s.trade_pnls.append(pnl)
+        if pnl > 0:
+            s.wins += 1
+            if pnl > s.largest_win:
+                s.largest_win = pnl
+        elif pnl < 0:
+            s.losses += 1
+            if pnl < s.largest_loss:
+                s.largest_loss = pnl
+    return stats
 
 
 def _slippage_by_instrument(trades: list[dict]) -> dict[str, dict]:
@@ -176,9 +268,17 @@ class DailySummary:
     date: str
     total_trades: int = 0
     realized_pnl: float = 0.0
+    # Broker mark-to-market across open positions at session end. Not
+    # derivable from the trade log (which only knows closed rows) — the
+    # caller supplies it from the broker snapshot.
     unrealized_pnl: float = 0.0
     largest_win: float = 0.0
     largest_loss: float = 0.0
+    # Peak-to-trough of *account equity* over the day, in dollars —
+    # mark-to-market, so open positions count. The pre-2026-08-19
+    # definition was peak-to-trough of cumulative realized P&L, which
+    # ignored the open book entirely and, because nothing in production
+    # fed it, was always 0.00.
     max_intraday_drawdown: float = 0.0
     session_start_equity: float = 0.0
     session_end_equity: float = 0.0
@@ -199,8 +299,10 @@ class PnLTracker:
     """
     Reads the trade database and computes P&L reports.
 
-    In-memory state tracks intraday P&L for the running drawdown
-    calculation. Persisted reports are markdown files.
+    Stateless with respect to the trading session: every number in a
+    report is derived from the trade database or passed in by the
+    caller, so a bot recycle mid-day cannot wipe the day's progress out
+    of the summary. Persisted reports are markdown files.
     """
 
     def __init__(
@@ -217,47 +319,6 @@ class PnLTracker:
         self._daily_dir = daily_pnl_dir or settings.DAILY_PNL_DIR
         self._weekly_dir = weekly_report_dir or settings.WEEKLY_REPORT_DIR
 
-        # Running intraday state (reset each day).
-        self._today: str = ""
-        self._intraday_pnl: float = 0.0
-        self._intraday_peak: float = 0.0
-        self._intraday_drawdown: float = 0.0
-        self._trade_pnls: list[tuple[str, float]] = []  # (strategy, pnl)
-
-    # ── Trade-level updates (called by the engine) ──────────────────────
-
-    def record_trade_pnl(
-        self,
-        strategy_name: str,
-        pnl: float,
-        *,
-        today: str | None = None,
-    ) -> None:
-        """
-        Record one closed trade's P&L. Called by the engine when a position
-        is closed (exit signal or stop hit).
-
-        `today` override is for tests; production uses UTC date.
-        """
-        day = today or datetime.now(timezone.utc).strftime("%Y-%m-%d")
-        if day != self._today:
-            self._reset_day(day)
-
-        self._trade_pnls.append((strategy_name, pnl))
-        self._intraday_pnl += pnl
-        if self._intraday_pnl > self._intraday_peak:
-            self._intraday_peak = self._intraday_pnl
-        dd = self._intraday_peak - self._intraday_pnl
-        if dd > self._intraday_drawdown:
-            self._intraday_drawdown = dd
-
-    def _reset_day(self, day: str) -> None:
-        self._today = day
-        self._intraday_pnl = 0.0
-        self._intraday_peak = 0.0
-        self._intraday_drawdown = 0.0
-        self._trade_pnls = []
-
     # ── Daily summary ───────────────────────────────────────────────────
 
     def generate_daily_summary(
@@ -267,57 +328,41 @@ class PnLTracker:
         session_start_equity: float = 0.0,
         session_end_equity: float = 0.0,
         unrealized_pnl: float = 0.0,
+        max_intraday_drawdown: float = 0.0,
     ) -> DailySummary:
         """
         Build a DailySummary from the day's realized-P&L events on disk
         (the trade log is the source of truth) plus DB slippage stats.
 
-        The in-memory ``_trade_pnls`` list is no longer used as the
-        primary source — the engine has never wired ``record_trade_pnl``
-        and the list was always empty in production, producing the
-        well-known "P&L=$+0.00, trades=0" EOD bug. We now query the
-        trade log directly via ``read_realized_pnl_events_for_day``,
-        which is restart-safe (a bot recycle mid-day no longer wipes
-        the day's progress from the summary).
+        Realized P&L comes from ``read_realized_pnl_events_for_day``,
+        which is restart-safe: a bot recycle mid-day does not wipe the
+        day's progress from the summary. This replaced an in-memory
+        accumulator that production never populated — the well-known
+        "P&L=$+0.00, trades=0" EOD bug.
 
-        Backward-compat: if any callers DID push events to
-        ``_trade_pnls`` via ``record_trade_pnl`` (legacy verify scripts,
-        tests), those are merged in on top of the DB-sourced events so
-        no existing harness silently regresses.
+        ``unrealized_pnl`` and ``max_intraday_drawdown`` are supplied by
+        the caller, because neither is derivable from the trade log:
+        unrealized P&L is a broker mark-to-market of *open* positions,
+        and the drawdown is an equity path sampled across the session.
+        The engine owns both (see ``TradingEngine.max_intraday_drawdown``
+        and ``unrealized_pnl_from_positions``). They previously defaulted
+        to a silent 0.0 that no caller ever overrode, so all 71 daily
+        reports written before this change show $0.00 in both fields
+        regardless of the actual book.
         """
-        day = day or self._today or datetime.now(timezone.utc).strftime("%Y-%m-%d")
+        day = day or datetime.now(timezone.utc).strftime("%Y-%m-%d")
 
-        # Authoritative source: every realized-P&L close row whose
-        # exit_timestamp falls on ``day``. Includes single-leg + spread
-        # closes and partial rows (their dollar contribution is honest).
+        # Sole source: every realized-P&L close row whose exit_timestamp
+        # falls on ``day``. Includes single-leg + spread closes and
+        # partial rows (their dollar contribution is honest).
         events: list[tuple[str, float]] = list(
             self._trade_logger.read_realized_pnl_events_for_day(day)
         )
-        # Backward-compat: merge any in-memory events from
-        # record_trade_pnl callers (legacy / tests). Duplicates are
-        # acceptable here because the legacy path was never wired in
-        # production; in practice this list will be empty for live runs.
-        events.extend(self._trade_pnls)
 
         # Per-strategy breakdown.
-        strats: dict[str, StrategyStats] = {}
-        for strat_name, pnl in events:
-            if strat_name not in strats:
-                strats[strat_name] = StrategyStats(strategy_name=strat_name)
-            s = strats[strat_name]
-            s.trade_count += 1
-            s.total_pnl += pnl
-            s.trade_pnls.append(pnl)
-            if pnl > 0:
-                s.wins += 1
-                if pnl > s.largest_win:
-                    s.largest_win = pnl
-            elif pnl < 0:
-                s.losses += 1
-                if pnl < s.largest_loss:
-                    s.largest_loss = pnl
+        strats = _stats_by_strategy(events)
 
-        # Aggregate (over the same merged events used above).
+        # Aggregate (over the same events used above).
         all_pnls = [p for _, p in events]
         total_trades = len(all_pnls)
         realized = sum(all_pnls)
@@ -341,7 +386,7 @@ class PnLTracker:
             unrealized_pnl=round(unrealized_pnl, 2),
             largest_win=round(largest_win, 2),
             largest_loss=round(largest_loss, 2),
-            max_intraday_drawdown=round(self._intraday_drawdown, 2),
+            max_intraday_drawdown=round(max_intraday_drawdown, 2),
             session_start_equity=round(session_start_equity, 2),
             session_end_equity=round(session_end_equity, 2),
             strategies=strats,
@@ -424,8 +469,22 @@ class PnLTracker:
         week_end: str | None = None,
     ) -> str | None:
         """
-        Aggregate the last 7 daily summary files into a weekly markdown
-        report. Returns the file path, or None if no daily reports exist.
+        Aggregate the 7-day window ending ``week_end`` into a weekly
+        markdown report. Returns the file path, or None if no daily
+        reports exist for the window.
+
+        The daily ``.md`` files are used only to decide the window is
+        worth reporting and to link to — this method never parses their
+        contents. Every figure is read fresh from the trade database:
+        realized P&L and per-strategy attribution through
+        ``read_realized_pnl_events_in_range`` (the same query the daily
+        report uses), fills and slippage through ``_trades_in_range``.
+
+        That independence is why the daily report's dead
+        ``unrealized_pnl`` / ``max_intraday_drawdown`` fields never
+        contaminated this report — but it is also why this one carried
+        no P&L at all until 2026-08-19, having been written when
+        ``realized_pnl`` was not yet a column on ``trades``.
         """
         end = (
             date.fromisoformat(week_end)
@@ -448,12 +507,23 @@ class PnLTracker:
         # Parse key metrics from trade CSV for the week.
         trades = self._trades_in_range(start.isoformat(), end.isoformat())
         total_trades = len(trades)
-        total_pnl = 0.0
-        strat_pnls: dict[str, list[float]] = {}
 
-        # We don't have per-trade P&L in the CSV (we have fills, not
-        # round-trips). Weekly report summarizes trade activity +
-        # adverse-only slippage from measured rows. Rows with NULL
+        # Realized P&L for the window, from the same query the daily
+        # report uses. This used to be omitted on the grounds that "we
+        # have fills, not round-trips" — true when the report was
+        # written, stale since `realized_pnl` became a column on
+        # `trades`. Two dead locals (`total_pnl = 0.0`, `strat_pnls`)
+        # sat here unread in the meantime, and the operator got a
+        # "Weekly Report" whose summary contained no dollar figure at
+        # all: the week of 2026-08-10 closed -$563.91 across two
+        # Donchian exits and reported neither number.
+        events = self._trade_logger.read_realized_pnl_events_in_range(
+            start.isoformat(), end.isoformat()
+        )
+        weekly_strats = _stats_by_strategy(events)
+        realized_pnl = sum(pnl for _, pnl in events)
+
+        # Adverse-only slippage from measured rows. Rows with NULL
         # slippage are skipped — not treated as zero — so paths that
         # legitimately have no benchmark (LIMIT entries, external
         # closes) don't drag the mean toward zero.
@@ -476,6 +546,8 @@ class PnLTracker:
             f"|---|---|",
             f"| Trading days with reports | {len(daily_files)} |",
             f"| Total fills | {total_trades} |",
+            f"| Realized P&L | ${realized_pnl:,.2f} |",
+            f"| Closed trades | {len(events)} |",
         ]
         # One row per instrument class that actually has measurements.
         # Basis points are not comparable across price scales, so there
@@ -500,6 +572,34 @@ class PnLTracker:
             "comparable and are never combined — an 8¢ miss is 2 bps on a "
             "$400 stock and 1,212 bps on a $0.66 contract (PLAN 11.50).",
             "",
+            "> `Total fills` counts every order that filled in the window, "
+            "entries included. `Closed trades` counts round-trips that "
+            "realized P&L, which is the denominator behind the figures "
+            "below. They are different numbers and a week can legitimately "
+            "have many fills and no closes.",
+            "",
+        ]
+        if weekly_strats:
+            lines += [
+                "## Per-Strategy Attribution",
+                "",
+            ]
+            for name, s in sorted(weekly_strats.items()):
+                lines += [
+                    f"### {name}",
+                    "",
+                    f"| Metric | Value |",
+                    f"|---|---|",
+                    f"| Closed trades | {s.trade_count} |",
+                    f"| P&L | ${s.total_pnl:,.2f} |",
+                    f"| Win rate | {s.win_rate:.1%} |",
+                    f"| Expectancy | ${s.expectancy:,.2f} |",
+                    f"| Profit factor | {s.profit_factor:.2f} |",
+                    f"| Largest win | ${s.largest_win:,.2f} |",
+                    f"| Largest loss | ${s.largest_loss:,.2f} |",
+                    "",
+                ]
+        lines += [
             "## Daily Reports",
             "",
         ]

@@ -81,6 +81,7 @@ with warnings.catch_warnings():
     from alpaca.trading.requests import (
         GetOrderByIdRequest,
         GetOrdersRequest,
+        GetPortfolioHistoryRequest,
         LimitOrderRequest,
         MarketOrderRequest,
         ReplaceOrderRequest,
@@ -1094,6 +1095,55 @@ class AlpacaBroker:
                 ),
             )
         return out
+
+    def get_intraday_equity_path(
+        self,
+        start: datetime,
+        end: datetime,
+    ) -> list[float]:
+        """
+        Account equity samples between `start` and `end`, oldest first.
+
+        Backs the daily report's `Max intraday drawdown`. The engine's
+        own per-cycle sampling only sees equity while the process is
+        running and only every cycle interval; this is the broker's own
+        1-minute series, so it covers the whole window including any
+        stretch when the bot was down between `recycle_bot.sh` runs.
+
+        `start`/`end` are passed explicitly rather than using Alpaca's
+        `period="1D"`, which returns a rolling 24-hour window ending
+        *now* — verified against the paper account on 2026-08-19, where
+        it spanned 2026-08-18T17:17Z → 2026-08-19T17:17Z. That crosses
+        UTC midnight and would fold part of yesterday into a figure the
+        report labels as today's.
+
+        `intraday_reporting="continuous"` includes pre/post-market and
+        overnight. That is deliberate and matches how the engine samples:
+        this bot holds positions overnight, so an extended-hours slide is
+        a real drawdown, not noise to filter out.
+
+        Returns `[]` on any failure — a degraded report field must never
+        propagate an exception into the shutdown path that writes it.
+        """
+        request = GetPortfolioHistoryRequest(
+            start=start,
+            end=end,
+            timeframe="1Min",
+            intraday_reporting="continuous",
+        )
+        try:
+            history = self._with_retry(
+                lambda: self._api.get_portfolio_history(request),
+                op_desc="get_portfolio_history",
+            )
+        except Exception as exc:
+            logger.warning(
+                f"portfolio history unavailable for "
+                f"{start.isoformat()} → {end.isoformat()}: {exc}"
+            )
+            return []
+        equity = getattr(history, "equity", None) or []
+        return [float(value) for value in equity if value is not None]
 
     def get_open_orders(self) -> list[OpenOrder]:
         """All currently-open orders, projected into `OpenOrder`."""

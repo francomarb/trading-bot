@@ -15,6 +15,8 @@ data/engine_state.json.tmp
 data/engine_state.json.bak.*
 data/operator_control_state.json
 data/operator_control_state.json.tmp
+data/equity_path_state.json
+data/equity_path_state.json.tmp
 data/historical/
 logs/
 .env

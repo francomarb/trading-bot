@@ -45,7 +45,7 @@ from regime.detector import MarketRegime, RegimeDetector
 from risk.allocator import SleeveAllocator
 from reporting.alerts import AlertDispatcher, LogFileBackend, TelegramAlertBackend, TelegramCommandListener
 from reporting.logger import TradeLogger, install_json_sink
-from reporting.pnl import PnLTracker
+from reporting.pnl import PnLTracker, unrealized_pnl_from_positions
 from risk.manager import RiskManager
 from data.watchlists import StaticWatchlistSource
 from sector.gauge import SectorMomentumGauge
@@ -476,10 +476,31 @@ def main() -> None:
         try:
             today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
             snap = broker.sync_with_broker()
+            # Feed the final snapshot to the equity path before reading
+            # the drawdown off it. Without this the report reflects only
+            # equity as of the last completed cycle, so a decline between
+            # that cycle and shutdown is missing from the very report
+            # that summarises the session — peak $100k, cycle $100k,
+            # shutdown $95k would still print $0.00.
+            engine._observe_equity(snap.account.equity)
+            # Then fold in the broker's own 1-minute equity series for
+            # the day, which covers stretches when this process was not
+            # running at all — the one thing per-cycle sampling cannot
+            # see. Combined with `max`, so an API failure degrades to
+            # the locally observed figure rather than losing it.
+            engine.reconcile_intraday_drawdown_from_broker(today)
             summary = pnl_tracker.generate_daily_summary(
                 day=today,
                 session_start_equity=engine._session_start_equity or snap.account.equity,
                 session_end_equity=snap.account.equity,
+                # Both of these were left at their 0.0 defaults until
+                # 2026-08-19, which is why every daily report written
+                # before then shows $0.00 unrealized and $0.00 drawdown
+                # even on days that ended with a dozen open positions.
+                unrealized_pnl=unrealized_pnl_from_positions(
+                    snap.account.open_positions.values()
+                ),
+                max_intraday_drawdown=engine.max_intraday_drawdown,
             )
             pnl_tracker.write_daily_report(summary)
             # Fire EOD summary alert (Telegram + log).
