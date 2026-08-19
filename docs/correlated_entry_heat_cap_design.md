@@ -112,8 +112,10 @@ GICS sectors, one trade.
 
 ## 4. Current state (verified 2026-08-19)
 
-**There is no heat cap, correlated-entry limit, or concurrent-entry throttle
-anywhere in `risk/`, `engine/`, or `config/`.**
+**There is no risk-weighted control anywhere in `risk/`, `engine/`, or
+`config/` — no heat cap and no correlated-entry limit.** A count-based
+ceiling does exist (`hard_max_positions`, below); it bounds how many
+positions a sleeve may hold, not how much risk they carry.
 
 What exists today:
 
@@ -187,9 +189,12 @@ The latter is *intended* risk (`equity × risk_per_trade_pct` at sizing time)
 and diverges materially once notional caps and whole-share flooring bite — the
 recorded ANET case carried **≈2.2× its intended budget**. Capping on intent
 would understate real heat by more than a factor of two. Both inputs are
-persisted on the entry trade row, so heat is computable from the trade log
-alone: no dependency on live broker stop orders, and restart-safe by
-construction.
+persisted on the entry trade row.
+
+**OPEN — which store does the cap read, and at what moment does it evaluate?**
+This document has not established that. Measuring heat after the fact and
+enforcing a limit before an entry is accepted are not necessarily the same
+read; do not assume they are.
 
 ### 5.2 Denominator — sleeve budget vs account equity
 
