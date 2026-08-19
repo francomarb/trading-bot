@@ -1,13 +1,17 @@
 # Correlated-Entry Heat Cap — Design (PLAN `11.60`)
 
-**Status:** 🔄 **DRAFT — under active discussion. Nothing here is decided.**
-This document exists to be argued with and iterated on, including by other
-agents with access to this repo (Codex, Antigravity). Sections marked
-**OPEN** are genuine forks awaiting evidence or a decision; sections marked
-**CLOSED** were already measured and must not be re-proposed without meeting
-the stated re-open bar.
+**Status:** 🔄 **DRAFT — revision 2, after two independent design reviews.**
+The five design forks in §5 are now **RESOLVED**: two reviews (Codex,
+Gemini/Antigravity) reached the same answer on each, independently. The
+enforcement model in §5.6 is resolved on evidence where the two reviews
+*disagreed*. The **cap level remains undecided** — that is §6 and it is
+deliberate.
 
-**Last updated:** 2026-08-19
+Sections marked **CLOSED** were measured and rejected; do not re-propose
+without meeting the stated re-open bar. Sections marked **RESOLVED** carry
+the reasoning both reviews converged on. §7 lists what is still open.
+
+**Last updated:** 2026-08-19 (rev 2)
 
 **Scope:** the `donchian_breakout` sleeve first, built as reusable per-strategy
 machinery. Slot allocation / candidate ranking is deliberately **out of scope**
@@ -93,6 +97,7 @@ Each was measured and rejected.
 | **Trailing / breakeven-at-+1R stop** | **CLOSED.** Tested: saves CIEN/TSLA/AVGO but clips ALAB on its 6-26 dip to entry. Net ≈ a wash. Static stop retained. | New evidence; note §5.1 depends on this staying closed |
 | **Blanket sector caps** | **REJECTED** as too blunt (`11.7`); calibrated targeted caps deferred to `11.8` pending evidence of a real concentration problem | Paper exposure showing a genuine sector concentration problem |
 | **Slice-based allocator** (`budget ÷ max_positions`) | **REJECTED** — v1 was tried and caused position-count starvation while capital sat idle. See `docs/capital_allocation_reference.md` §3.4 | Do not re-propose; fix is parameter reconciliation, not structural |
+| **Enforce the cap from filled positions** (`AccountState.open_positions` / the trade log) | **CLOSED — verified insufficient.** Proposed in review 2 with the claim "no intra-cycle race conditions". It is blind to the burst it exists to prevent; see §5.6 for the verification | Show that Donchian entries do not rest at the broker — they do (`trader.py:2269`) |
 
 **A note on sector caps specifically.** `PLAN.md` currently justifies
 preferring a heat cap over a sector cap with the observation that on the
@@ -142,9 +147,28 @@ any heat cap below that binds before `hard_max_positions` does, which is the
 intent. Second, the same book reads 1.99% or 1.50% depending only on which
 definition of R you pick. That is §5.1.
 
+**What is and is not already throttled — the precise version.** It would be
+wrong to say nothing constrains a burst today. `_pool_used_notional` sums
+positions **plus** pending order notional
+([`risk/allocator.py`](../risk/allocator.py)), so resting entry orders already
+consume sleeve and pool budget. A burst is bounded — **in notional**.
+
+> **The argument for this cap is therefore narrower and stronger than "nothing
+> throttles bursts": budget bounds notional, and nothing bounds risk.**
+
+Notional is a poor proxy for risk in this system by construction. Per `11.48`,
+dollar risk = capped notional × 2×ATR%, so a volatile name carries **2–4× the
+risk of a calm one at identical notional**. A budget denominated in notional
+cannot see that, which is precisely the gap a heat cap fills.
+
 ---
 
-## 5. OPEN — the design forks
+## 5. RESOLVED — the design forks
+
+Each fork below was reviewed independently by Codex and by
+Gemini/Antigravity. **Both reached the same answer on §5.1–§5.5**, which is
+why they are marked RESOLVED rather than Proposed. §5.6 is where the two
+reviews disagreed; it is resolved on verification, not on consensus.
 
 ### 5.1 Which R? — *initial risk at entry* vs *current risk-to-stop*
 
@@ -175,9 +199,11 @@ In classic Turtle the same measure is fine — but only because the stop
 trails, so real risk genuinely declines as a trade matures. This system does
 not have that, by an explicit prior decision.
 
-> **Proposed:** cap on **actual initial risk at entry, held fixed for the life
-> of the position.** Stable, decays only on exit, and composes directly with
-> `11.48` sizing.
+> **RESOLVED — both reviews concur:** cap on **actual initial risk at entry,
+> held fixed for the life of the position.** Stable, decays only on exit, and
+> composes directly with `11.48` sizing. Review 2 re-derived the inverted
+> incentive independently, in its own terms: a loser drifting toward its stop
+> "frees up heat to buy more falling knives into a deteriorating market".
 >
 > **Dependency to record:** if the trailing-stop question is ever re-opened,
 > current-risk-to-stop becomes viable and arguably better. These two decisions
@@ -223,10 +249,10 @@ in, and it keeps sleeves independent and self-governing.
    stretch) and wrong for **risk**: a 3% SPY drawdown does not care how much
    of the budget is idle. **Capital can stretch; risk appetite should not.**
 
-> **Proposed:** count only the sleeve's own positions (per-sleeve
-> independence), but denominate in **account equity** (stable, composes with
-> existing sizing). Reads as: *"Donchian may carry at most X% of equity in
-> open initial-R at once."*
+> **RESOLVED — both reviews concur:** count only the sleeve's own positions
+> (per-sleeve independence), but denominate in **account equity** (stable,
+> composes with existing sizing). Reads as: *"Donchian may carry at most X% of
+> equity in open initial-R at once."*
 
 ### 5.3 Scope of count — per-sleeve vs portfolio
 
@@ -240,9 +266,10 @@ size would consume on their own. The sleeves are correlated **in fact** even
 though they are separate **in config**, so a per-sleeve cap alone leaves total
 book heat free to stack.
 
-> **Proposed:** per-sleeve cap now; a portfolio-level ceiling later as a
-> second and higher backstop. **OPEN:** is the portfolio ceiling worth
-> specifying in this document, or does it belong in its own item?
+> **RESOLVED — both reviews concur:** per-sleeve cap now; **no portfolio-level
+> cap in v1.** Both reviews independently called it out of scope as a separate
+> cross-strategy risk-policy decision. It should get its own PLAN item rather
+> than a section here.
 
 ### 5.4 Control form
 
@@ -254,9 +281,11 @@ book heat free to stack.
 | **New entries per window** | **Disfavoured** — a fixed window has a boundary you can straddle. Two clusters landing either side both pass while being one bet, and the failure mode depends on where the window edge happens to fall relative to the market move. |
 | **Concurrent position count** | Already exists as `hard_max_positions = 8`. **Retain as last-resort insurance**, not as the primary control. |
 
-> **Proposed shape:** aggregate open initial-R as the live control, with the
-> existing count ceiling left in place beneath it as a hard backstop that
-> should never normally bind.
+> **RESOLVED — both reviews concur:** aggregate open initial-R as the live
+> control, with the existing count ceiling left in place beneath it as a hard
+> backstop that should never normally bind. Review 2 added the reason windows
+> fail that this document had not stated: calendar edge effects, where a
+> Friday/Monday split lets one economic burst present as two.
 
 ### 5.5 Reusability
 
@@ -272,9 +301,95 @@ seam already exists: `RiskManager` takes
 strategies that declare a cap get one, strategies that do not are
 unconstrained, and there is no special-casing anywhere.
 
-**OPEN:** should a strategy without a declared cap be *unconstrained*, or
-should there be a permissive global default? Unconstrained is simpler and
-matches the existing pattern; a default is safer but invents a number.
+> **RESOLVED — both reviews concur:** opt-in, and a strategy without an entry
+> is **unconstrained by heat**. No permissive global default — a default would
+> invent a number for four sleeves nobody has measured. Review 2's framing:
+> unconstrained strategies remain bounded by sleeve budget and
+> `hard_max_positions`, which §4 confirms is true for *notional* if not for
+> risk.
+
+Config shape (from review 2, matching the existing per-strategy dict pattern):
+
+```python
+STRATEGY_MAX_OPEN_HEAT_PCT: dict[str, float] = {
+    "donchian_breakout": 0.0XX,   # level pre-registered per §6 — NOT yet chosen
+}
+```
+
+Rejection surfaces as a new `RejectionCode.MAX_STRATEGY_HEAT_REACHED`,
+alongside the existing codes.
+
+---
+
+### 5.6 RESOLVED on verification — which store, and evaluated when
+
+This is the one question the two reviews answered **differently**. It is
+resolved by checking the code, not by counting votes.
+
+**Review 2 proposed** computing heat from `AccountState.open_positions` inside
+`RiskManager.evaluate()`, asserting *"No intra-cycle race conditions"* because
+`running_account` is updated after each fill.
+
+**That is insufficient, and verifiably so.** Donchian's
+`preferred_order_type = OrderType.STOP_LIMIT`, and the engine's own comment is
+explicit:
+
+> `# STOP_LIMIT (Donchian today) emit a broker-resting stop-limit entry`
+> — [`engine/trader.py:2269`](../engine/trader.py#L2269)
+
+The intra-cycle merge is gated on an actual fill:
+
+```python
+if filled is not None:                      # engine/trader.py:1606
+    updated_positions = {**running_account.open_positions, filled.symbol: filled}
+```
+
+A resting stop-limit produces no fill, so nothing merges — neither
+`running_account` nor the next cycle's `AccountState.open_positions` ever sees
+it. In the live lifecycle table, **14 of Donchian's 17 entry orders were
+`stop_limit`**, 9 of which expired unfilled. So a filled-position cap is blind
+to exactly the burst it exists to prevent: N orders resting at the broker,
+zero heat counted, all triggerable by one market move.
+
+**Review 1's model is the correct one.** Reserve worst-case risk at
+submission; replace the reservation with actual risk on fill; release on
+cancel or expiry.
+
+| Event | Heat contribution |
+|---|---|
+| Entry submitted (resting) | **Reserved:** `intended_qty × (intended_limit_price − intended_stop_price)`. A buy stop-limit cannot fill above its limit, so this is the true worst case |
+| Entry fills | Reservation **replaced** by actual `(entry_fill − initial_stop) × filled_qty` |
+| Entry cancels / expires DAY | Reservation **released** |
+| Position exits | Contribution **released** |
+
+**Store.** [`position_lifecycle_orders`](../reporting/logger.py) is
+authoritative for reservations; filled trade rows remain the audit trail for
+actual initial risk. This is sound **by construction, not by convention**:
+`_lifecycle_orders_insert_pending` runs *before* broker submit, and a failure
+aborts the submit ("aborting submit + rolling back position lock"). A broker
+order therefore cannot exist without a preceding lifecycle row. The rows
+already carry `intended_qty`, `intended_limit_price`, `intended_stop_price`,
+`status`, and the protective stop is known at submission because it is an OTO
+bracket child.
+
+**Two implementation details neither review raised:**
+
+1. **Not every Donchian entry rests.** 3 of 17 were `market` (the fractional
+   path). Those fill immediately, so the reservation and its replacement
+   collapse into one step — but the design must say so rather than assume all
+   entries rest.
+2. **`initial_risk_dollars` is an approximation, not an identity.** Measured
+   against `(fill − stop) × qty` on the 8 most recent Donchian entries: 5
+   exact, 3 off by ≤$0.45 (stop re-anchoring, `11.53`), and **2 of 30 rows are
+   NULL**. Good enough for a heat figure — differences under 0.2% — but it
+   needs a documented NULL fallback. It is far better populated than
+   `risk_budget_dollars`, which is NULL on 22 of 30.
+
+**Precondition to verify before shipping:** a protective-stop substrate row
+was once recorded stuck `pending` while its broker order was live. The
+insert-before-submit ordering makes the *entry* path sound, but a silently
+missing reservation would make the cap under-count. State this as verified,
+not inherited.
 
 ---
 
@@ -299,31 +414,92 @@ question must apply the same regime gate, edge filters, sizing rules and
 warmup semantics as the live engine, and must report **exit reasons** per
 variant — not only aggregate returns.
 
-**Step 2 — design choice.** Resolve §5.1–5.5 from the Step 1 evidence.
+**Step 2 — design choice.** ✅ Done — §5.1–5.6 are resolved.
 
-**Step 3 — pre-register a level** with a stated bar to clear before it is
-applied, and run it as an arm rather than a silent config change.
+**Step 3 — pre-register a level.** Test **discrete multiples of the existing
+0.40% per-trade risk unit**, not a continuous sweep. This is review 2's
+contribution and it is the right shape: the candidates derive from a parameter
+that already exists, so the exercise cannot quietly become the optimisation
+`11.56` warns about.
 
-**Step 4 — observability.** Whatever the cap, log every entry it blocks with
-the heat at that moment and the candidate that was declined. A control whose
-refusals leave no trace cannot be evaluated afterwards — this is the same flaw
-that makes today's slot allocation (PLAN `11.61`) impossible to audit.
+| Candidate | % of equity | Implied positions at target size |
+|---|---|---|
+| **3R** | 1.20% | 3 |
+| **4R** | 1.60% | 4 |
+| **5R** | 2.00% | 5 |
+
+> ### ⚠️ The suggested 4R baseline is already breached by the live book
+>
+> Review 2 recommended 4R (1.60%) as the baseline. **On 2026-08-19 the sleeve
+> was carrying 1.99% of equity across 6 open positions** — over that cap
+> before it is written. Flagged here so re-review starts from the fact rather
+> than rediscovering it.
+>
+> **Why it is breached, precisely.** The "4R = 4 standard positions" framing
+> assumes entries are sized *at* the 0.40% target. They are not: those 6
+> positions averaged **0.33%** each, because notional caps and whole-share
+> flooring clip most entries below target (the `11.48` finding). So the real
+> constraint a given R-multiple imposes is a **position count**, and it is a
+> lower count than the framing suggests — 1.60% ÷ 0.33% ≈ **4.8 positions**,
+> against a `hard_max_positions` of 8.
+>
+> **The consequence to pre-register, not discover later:** an R-multiple cap
+> silently redefines the sleeve's effective concurrency ceiling. At current
+> average sizing, 3R ≈ 3.6 positions, 4R ≈ 4.8, 5R ≈ 6.0. That is a material
+> tightening from 8, and 5R is approximately the status quo — it would not
+> have bound today at all. Whether that tightening is desirable is exactly the
+> question Step 1's evidence must answer; it should not arrive as a surprise
+> after the level is chosen.
+
+Pre-register the chosen level with a stated bar to clear before it is applied,
+and run it as an arm rather than a silent config change.
+
+**Step 4 — observability.** Whatever the cap, every refusal must emit a
+structured record (review 1's specification, adopted):
+
+| Field | Why |
+|---|---|
+| filled heat | the part already committed |
+| pending reserved heat | the part §5.6 exists to count |
+| candidate reservation | what was declined |
+| configured cap | so the record is self-describing across config changes |
+| symbol | attribution |
+
+A control whose refusals leave no trace cannot be evaluated afterwards — the
+same flaw that makes today's slot allocation (PLAN `11.61`) impossible to
+audit. Splitting filled from reserved matters for a second reason: it is the
+only way to tell a cap that is binding on real exposure from one binding on
+reservations that later expire unfilled.
 
 ---
 
-## 7. Questions for reviewers
+## 7. What is still open — for re-review
 
-1. **§5.1** — is there an argument for current-risk-to-stop that survives the
-   static stop, other than re-opening the trailing-stop question?
-2. **§5.2** — is the `can_stretch` objection decisive, or is there a
-   formulation where a sleeve-denominated cap does not drift?
-3. **§5.3** — should the portfolio-level ceiling be specified here or split?
-4. **§5.4** — is there a fourth control form worth considering that is not
-   count, aggregate R, or per-window?
-5. **§6** — what is the minimum evidence that would justify a specific level,
-   as opposed to merely justifying that a cap should exist?
-6. Anything in §3 that you believe was closed on insufficient evidence — but
-   argue against the stated re-open bar, not around it.
+§5 is resolved. Do not re-litigate §5.1–§5.5 without new evidence; two
+independent reviews converged on each. §5.6 was resolved against one review's
+proposal by verification — argue with the verification, not the conclusion.
+
+What genuinely remains:
+
+1. **The level.** Nothing here picks 3R, 4R or 5R. That is Step 1's evidence
+   to settle, and the callout above is the constraint to reason from: an
+   R-multiple cap silently redefines effective concurrency, and the suggested
+   4R baseline is already breached by the live book.
+2. **The MARKET entry path** (§5.6). 3 of 17 Donchian entries were `market`.
+   Reservation-and-immediate-settlement is the obvious handling; is there a
+   reason it should differ?
+3. **NULL `initial_risk_dollars`** (2 of 30 rows). What should the fallback
+   be — recompute from `(fill − stop) × qty`, or refuse to count the position
+   and log? Refusing is safer but makes the cap fail *open* on a data gap,
+   which is the failure direction this project usually rejects.
+4. **The substrate precondition** (§5.6). Is insert-before-submit sufficient
+   on its own, or does the reservation path need its own reconciliation pass
+   against broker open orders at startup?
+5. **Portfolio-level ceiling.** Both reviews put it out of scope for v1. Does
+   it deserve its own PLAN item now, or does it wait for evidence that
+   cross-sleeve correlation actually bites?
+6. Anything in §3 you believe was closed on insufficient evidence — but argue
+   against the stated re-open bar, not around it.
 
 ---
 
