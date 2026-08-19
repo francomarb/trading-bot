@@ -107,7 +107,7 @@ from reporting.logger import (
     is_execution_quality_measurement,
     single_leg_realized_slippage_bps,
 )
-from reporting.pnl import PnLTracker
+from reporting.pnl import PnLTracker, max_drawdown_from_equity_path
 from strategies.base import (
     BaseStrategy,
     MultiLegTradeRejected,
@@ -1110,6 +1110,77 @@ class TradingEngine:
         after the last cycle still counts.
         """
         return self._max_intraday_drawdown
+
+    def reconcile_intraday_drawdown_from_broker(self, day: str | None = None) -> float:
+        """
+        Fold the broker's own intraday equity series into today's max
+        drawdown, and return the reconciled figure.
+
+        This closes the one gap the engine's own sampling cannot: equity
+        that moved while no process was running. `_observe_equity` sees
+        the account once per cycle and only while the bot is up, so a
+        peak or trough reached entirely between a `recycle_bot.sh` stop
+        and the replacement's first cycle was invisible to it. Alpaca's
+        portfolio history covers the whole UTC day at 1-minute
+        resolution regardless of what this process was doing.
+
+        The two are combined with `max`, never replaced. The broker
+        series is more complete *and* finer-grained, so it normally
+        dominates — but the local path can still be the larger of the
+        two when a trough falls between the broker's minute marks, and a
+        drawdown this process directly observed must never be reported
+        as smaller than what it saw. `max` also makes the whole thing
+        degrade cleanly: if the API is unavailable the result is exactly
+        today's locally-observed number.
+
+        The window is the UTC day, matching `read_realized_pnl_events_
+        for_day` — every figure on one daily report is scoped to the
+        same day boundary. `end` is clamped to now for the current day
+        so a partial day is not requested into the future.
+        """
+        day = day or self._clock().strftime("%Y-%m-%d")
+        local = self._max_intraday_drawdown
+        try:
+            start = datetime.strptime(day, "%Y-%m-%d").replace(tzinfo=timezone.utc)
+        except ValueError:
+            logger.warning(
+                f"intraday drawdown reconcile: bad day {day!r}; "
+                f"keeping locally observed ${local:,.2f}"
+            )
+            return local
+
+        end = min(start + timedelta(days=1), self._clock())
+        if end <= start:
+            return local
+
+        try:
+            equity_path = self.broker.get_intraday_equity_path(start, end)
+        except Exception as exc:
+            logger.warning(
+                f"intraday drawdown reconcile failed: {exc} — "
+                f"keeping locally observed ${local:,.2f}"
+            )
+            return local
+
+        if not equity_path:
+            logger.info(
+                f"intraday drawdown reconcile: broker returned no equity "
+                f"samples for {day}; keeping locally observed ${local:,.2f}"
+            )
+            return local
+
+        broker_drawdown = max_drawdown_from_equity_path(equity_path)
+        reconciled = max(local, broker_drawdown)
+        if reconciled > local:
+            logger.info(
+                f"intraday drawdown for {day} raised to ${reconciled:,.2f} "
+                f"from broker equity path ({len(equity_path)} samples); "
+                f"this process observed ${local:,.2f}"
+            )
+        self._max_intraday_drawdown = reconciled
+        self._equity_peak_day = day
+        self._persist_equity_path_state()
+        return reconciled
 
     def _restore_equity_path_state(self) -> None:
         """Re-adopt today's equity peak and max drawdown from disk.

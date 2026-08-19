@@ -483,6 +483,12 @@ def main() -> None:
             # that summarises the session — peak $100k, cycle $100k,
             # shutdown $95k would still print $0.00.
             engine._observe_equity(snap.account.equity)
+            # Then fold in the broker's own 1-minute equity series for
+            # the day, which covers stretches when this process was not
+            # running at all — the one thing per-cycle sampling cannot
+            # see. Combined with `max`, so an API failure degrades to
+            # the locally observed figure rather than losing it.
+            engine.reconcile_intraday_drawdown_from_broker(today)
             summary = pnl_tracker.generate_daily_summary(
                 day=today,
                 session_start_equity=engine._session_start_equity or snap.account.equity,

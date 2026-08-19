@@ -6942,3 +6942,112 @@ class TestIntradayDrawdownSurvivesRestart:
 
         assert engine.max_intraday_drawdown == 0.0
         assert engine._session_equity_peak is None
+
+
+# ── TestBrokerEquityPathReconcile ───────────────────────────────────────────
+
+
+class TestBrokerEquityPathReconcile:
+    """
+    Per-cycle sampling cannot see equity that moved while no process was
+    running — a peak or trough reached entirely between a
+    `recycle_bot.sh` stop and the replacement's first cycle was
+    invisible. The broker's own 1-minute series covers the whole UTC day
+    regardless, and is folded in at shutdown.
+    """
+
+    DAY = "2026-08-19"
+
+    def _at(self, hour: int = 18):
+        return datetime(2026, 8, 19, hour, 0, tzinfo=timezone.utc)
+
+    def test_broker_series_raises_a_shallower_local_figure(self, engine_factory):
+        engine, broker = engine_factory()
+        engine._clock = lambda: self._at()
+        engine._observe_equity(100_000.0)
+        engine._observe_equity(99_800.0)          # only $200 seen locally
+        broker.get_intraday_equity_path.return_value = [
+            100_000.0, 94_500.0, 99_000.0,        # $5,500 while we were down
+        ]
+
+        assert engine.reconcile_intraday_drawdown_from_broker(self.DAY) == pytest.approx(5_500.0)
+        assert engine.max_intraday_drawdown == pytest.approx(5_500.0)
+
+    def test_a_deeper_locally_observed_figure_is_never_lowered(self, engine_factory):
+        """The broker series is 1-minute; a trough between its marks is
+        real and this process saw it. Combining with `max` means a
+        directly observed drawdown is never reported as smaller."""
+        engine, broker = engine_factory()
+        engine._clock = lambda: self._at()
+        engine._observe_equity(100_000.0)
+        engine._observe_equity(91_000.0)          # $9,000 observed directly
+        broker.get_intraday_equity_path.return_value = [100_000.0, 97_000.0]
+
+        assert engine.reconcile_intraday_drawdown_from_broker(self.DAY) == pytest.approx(9_000.0)
+
+    def test_requests_the_utc_day_clamped_to_now(self, engine_factory):
+        engine, broker = engine_factory()
+        engine._clock = lambda: self._at(hour=18)
+        broker.get_intraday_equity_path.return_value = []
+
+        engine.reconcile_intraday_drawdown_from_broker(self.DAY)
+
+        start, end = broker.get_intraday_equity_path.call_args.args
+        assert start == datetime(2026, 8, 19, 0, 0, tzinfo=timezone.utc)
+        assert end == self._at(hour=18), "must not request into the future"
+
+    def test_a_completed_past_day_spans_the_full_24h(self, engine_factory):
+        engine, broker = engine_factory()
+        engine._clock = lambda: datetime(2026, 8, 21, 9, 0, tzinfo=timezone.utc)
+        broker.get_intraday_equity_path.return_value = []
+
+        engine.reconcile_intraday_drawdown_from_broker(self.DAY)
+
+        start, end = broker.get_intraday_equity_path.call_args.args
+        assert start == datetime(2026, 8, 19, 0, 0, tzinfo=timezone.utc)
+        assert end == datetime(2026, 8, 20, 0, 0, tzinfo=timezone.utc)
+
+    def test_empty_series_keeps_the_local_figure(self, engine_factory):
+        engine, broker = engine_factory()
+        engine._clock = lambda: self._at()
+        engine._observe_equity(100_000.0)
+        engine._observe_equity(98_500.0)
+        broker.get_intraday_equity_path.return_value = []
+
+        assert engine.reconcile_intraday_drawdown_from_broker(self.DAY) == pytest.approx(1_500.0)
+
+    def test_broker_failure_keeps_the_local_figure(self, engine_factory):
+        """Runs inside the shutdown handler that writes the report — it
+        must degrade to the locally observed number, not explode."""
+        engine, broker = engine_factory()
+        engine._clock = lambda: self._at()
+        engine._observe_equity(100_000.0)
+        engine._observe_equity(97_750.0)
+        broker.get_intraday_equity_path.side_effect = RuntimeError("api down")
+
+        assert engine.reconcile_intraday_drawdown_from_broker(self.DAY) == pytest.approx(2_250.0)
+        assert engine.max_intraday_drawdown == pytest.approx(2_250.0)
+
+    def test_reconciled_figure_is_persisted(self, engine_factory):
+        from config import settings
+
+        engine, broker = engine_factory()
+        engine._clock = lambda: self._at()
+        engine._observe_equity(100_000.0)
+        broker.get_intraday_equity_path.return_value = [100_000.0, 93_000.0]
+
+        engine.reconcile_intraday_drawdown_from_broker(self.DAY)
+
+        with open(settings.EQUITY_PATH_STATE_PATH) as fh:
+            state = json.load(fh)
+        assert state["day"] == self.DAY
+        assert state["max_intraday_drawdown"] == pytest.approx(7_000.0)
+
+    def test_a_malformed_day_keeps_the_local_figure(self, engine_factory):
+        engine, broker = engine_factory()
+        engine._clock = lambda: self._at()
+        engine._observe_equity(100_000.0)
+        engine._observe_equity(99_000.0)
+
+        assert engine.reconcile_intraday_drawdown_from_broker("not-a-date") == pytest.approx(1_000.0)
+        broker.get_intraday_equity_path.assert_not_called()

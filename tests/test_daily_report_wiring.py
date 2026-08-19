@@ -148,6 +148,49 @@ class TestDailySummaryCallSite:
             f"generate_daily_summary call (line {summary_line})."
         )
 
+    def test_the_broker_equity_path_is_reconciled_before_reporting(self):
+        """Per-cycle sampling cannot see equity that moved while no
+        process was running, so the broker's own intraday series is
+        folded in before the report is built. Ordering again: after the
+        engine's own final observation, before the summary."""
+        tree = ast.parse(FORWARD_TEST.read_text())
+        main = next(
+            n for n in tree.body
+            if isinstance(n, ast.FunctionDef) and n.name == "main"
+        )
+
+        reconcile_lines = [
+            node.lineno
+            for node in ast.walk(main)
+            if isinstance(node, ast.Call)
+            and isinstance(node.func, ast.Attribute)
+            and node.func.attr == "reconcile_intraday_drawdown_from_broker"
+        ]
+        assert reconcile_lines, (
+            "forward_test.main() never calls "
+            "engine.reconcile_intraday_drawdown_from_broker, so a drawdown "
+            "reached entirely while the bot was down is missing from the "
+            "day's report."
+        )
+
+        observe_lines = [
+            node.lineno
+            for node in ast.walk(main)
+            if isinstance(node, ast.Call)
+            and isinstance(node.func, ast.Attribute)
+            and node.func.attr == "_observe_equity"
+        ]
+        summary_line = _daily_summary_call().lineno
+
+        assert any(
+            max(observe_lines) < l < summary_line for l in reconcile_lines
+        ), (
+            f"reconcile_intraday_drawdown_from_broker (lines "
+            f"{reconcile_lines}) must run after the final _observe_equity "
+            f"(lines {observe_lines}) and before generate_daily_summary "
+            f"(line {summary_line})."
+        )
+
 
 class TestRemovedInMemoryAccumulator:
     """`record_trade_pnl` fed an in-memory list that production never

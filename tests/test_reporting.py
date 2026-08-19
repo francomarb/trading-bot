@@ -59,6 +59,7 @@ from reporting.pnl import (
     StrategyStats,
     _instrument_class,
     _slippage_by_instrument,
+    max_drawdown_from_equity_path,
     unrealized_pnl_from_positions,
 )
 from risk.manager import RiskDecision, Side
@@ -3308,6 +3309,43 @@ def _log_close(tl, *, day: str, symbol: str, strategy: str, pnl: float, seq: int
         exit_timestamp=f"{day}T15:{seq:02d}:00+00:00",
         position_type="single_leg",
     ))
+
+
+class TestMaxDrawdownFromEquityPath:
+    """Backs the daily report's `Max intraday drawdown` when reconciled
+    against the broker's own intraday equity series."""
+
+    def test_empty_and_rising_paths_have_no_drawdown(self):
+        assert max_drawdown_from_equity_path([]) == 0.0
+        assert max_drawdown_from_equity_path([100.0]) == 0.0
+        assert max_drawdown_from_equity_path([100.0, 101.0, 105.0]) == 0.0
+
+    def test_uses_running_peak_not_range(self):
+        """A low that precedes the high is not a drawdown. Taken from
+        the live paper account on 2026-08-19: trough 100,828.40 at
+        14:15Z, peak 101,615.53 at 16:19Z. The true peak-to-trough
+        decline was $577.88; `max - min` would claim $787.13 — a drop
+        that never happened.
+        """
+        path = [101_113.43, 100_828.40, 101_615.53, 101_037.65, 101_408.36]
+
+        assert max_drawdown_from_equity_path(path) == pytest.approx(577.88)
+        assert max(path) - min(path) == pytest.approx(787.13)
+
+    def test_worst_decline_wins_over_a_later_shallower_one(self):
+        path = [100.0, 90.0, 100.0, 95.0]
+        assert max_drawdown_from_equity_path(path) == pytest.approx(10.0)
+
+    def test_decline_is_measured_from_the_preceding_peak(self):
+        path = [100.0, 120.0, 80.0]
+        assert max_drawdown_from_equity_path(path) == pytest.approx(40.0)
+
+    def test_none_samples_are_skipped_not_treated_as_zero(self):
+        """Alpaca returns nulls for minutes it cannot value. Reading one
+        as $0 equity would manufacture a six-figure drawdown out of a
+        reporting gap."""
+        path = [100_000.0, None, 99_500.0, None]
+        assert max_drawdown_from_equity_path(path) == pytest.approx(500.0)
 
 
 class TestUnrealizedPnLFromPositions:

@@ -96,6 +96,37 @@ def unrealized_pnl_from_positions(positions) -> float:
     return total
 
 
+def max_drawdown_from_equity_path(equity) -> float:
+    """
+    Largest peak-to-trough decline, in dollars, over an equity series.
+
+    Standard running-peak definition: each point is compared to the
+    highest value seen *before or at* it, so the result is the worst
+    decline actually experienced — not the range (`max - min`), which
+    would report a drop that never happened whenever the low precedes
+    the high.
+
+    `None` entries are skipped. Alpaca's portfolio history returns nulls
+    for minutes it cannot value, and treating one as zero equity would
+    manufacture a catastrophic drawdown out of a reporting gap.
+
+    Returns 0.0 for an empty or monotonically rising series.
+    """
+    peak: float | None = None
+    worst = 0.0
+    for value in equity:
+        if value is None:
+            continue
+        point = float(value)
+        if peak is None or point > peak:
+            peak = point
+            continue
+        decline = peak - point
+        if decline > worst:
+            worst = decline
+    return worst
+
+
 def _stats_by_strategy(
     events: list[tuple[str, float]],
 ) -> dict[str, "StrategyStats"]:

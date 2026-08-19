@@ -3826,3 +3826,89 @@ class TestExitSubstrate:
             "AAPL", position_uid="pos-X", poll_timeout=0.1,
         )
         assert result is not None
+
+
+# ── TestIntradayEquityPath ──────────────────────────────────────────────────
+
+
+class TestIntradayEquityPath:
+    """
+    `get_intraday_equity_path` backs the daily report's max intraday
+    drawdown. The engine's own sampling only sees equity while the
+    process runs; this is the broker's series, which covers stretches
+    when the bot was down.
+    """
+
+    def _window(self):
+        return (
+            datetime(2026, 8, 19, 0, 0, tzinfo=timezone.utc),
+            datetime(2026, 8, 19, 17, 19, tzinfo=timezone.utc),
+        )
+
+    def test_returns_equity_samples_oldest_first(self):
+        api = MagicMock()
+        api.get_portfolio_history.return_value = SimpleNamespace(
+            equity=[101_113.43, 100_828.40, 101_615.53],
+            timestamp=[1, 2, 3],
+        )
+        broker = _broker_with_mock(api)
+
+        assert broker.get_intraday_equity_path(*self._window()) == [
+            101_113.43, 100_828.40, 101_615.53,
+        ]
+
+    def test_requests_an_explicit_utc_window_not_a_rolling_period(self):
+        """Alpaca's `period="1D"` returns a rolling 24h window ending
+        now — verified against the paper account, where it spanned
+        2026-08-18T17:17Z to 2026-08-19T17:17Z. That crosses UTC
+        midnight and would fold yesterday into a figure the report
+        labels as today's."""
+        api = MagicMock()
+        api.get_portfolio_history.return_value = SimpleNamespace(equity=[], timestamp=[])
+        broker = _broker_with_mock(api)
+        start, end = self._window()
+
+        broker.get_intraday_equity_path(start, end)
+
+        request = api.get_portfolio_history.call_args.args[0]
+        assert request.start == start
+        assert request.end == end
+        assert request.period is None, "a period would override the explicit window"
+        assert request.timeframe == "1Min"
+
+    def test_requests_continuous_reporting_so_overnight_counts(self):
+        """The bot holds positions overnight, so an extended-hours slide
+        is a real drawdown. Market-hours-only reporting would drop it."""
+        api = MagicMock()
+        api.get_portfolio_history.return_value = SimpleNamespace(equity=[], timestamp=[])
+        broker = _broker_with_mock(api)
+
+        broker.get_intraday_equity_path(*self._window())
+
+        request = api.get_portfolio_history.call_args.args[0]
+        assert request.intraday_reporting == "continuous"
+
+    def test_null_samples_are_dropped(self):
+        api = MagicMock()
+        api.get_portfolio_history.return_value = SimpleNamespace(
+            equity=[100.0, None, 99.0], timestamp=[1, 2, 3],
+        )
+        broker = _broker_with_mock(api)
+
+        assert broker.get_intraday_equity_path(*self._window()) == [100.0, 99.0]
+
+    def test_api_failure_returns_empty_rather_than_raising(self):
+        """This runs inside the shutdown handler that writes the daily
+        report. A degraded field must not take the report with it."""
+        api = MagicMock()
+        api.get_portfolio_history.side_effect = APIError("boom")
+        broker = _broker_with_mock(api)
+
+        assert broker.get_intraday_equity_path(*self._window()) == []
+
+    def test_missing_equity_attribute_returns_empty(self):
+        api = MagicMock()
+        api.get_portfolio_history.return_value = SimpleNamespace(timestamp=[])
+        broker = _broker_with_mock(api)
+
+        assert broker.get_intraday_equity_path(*self._window()) == []
