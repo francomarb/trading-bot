@@ -161,6 +161,49 @@ dollar risk = capped notional × 2×ATR%, so a volatile name carries **2–4× t
 risk of a calm one at identical notional**. A budget denominated in notional
 cannot see that, which is precisely the gap a heat cap fills.
 
+### 4.1 How a heat cap interacts with the existing notional limits
+
+The heat cap does not replace the sleeve budget or the per-position notional
+cap, and it does not override them: an entry must pass **all** of them, so the
+tightest one binds. They bind in different volatility regimes, because
+Donchian's stop is 2 × ATR — a calm name has a *tight* stop and therefore needs
+a *large* position to carry a full 1R.
+
+Sleeve = 21.25% of equity; per-position cap = 40% of sleeve; 1R = 0.40% of
+equity. A position is notional-clipped whenever its stop sits closer than
+**4.7%** (i.e. ATR below ~2.4%).
+
+| Name's ATR | Stop distance | Position size | Risk it can carry | First limit to bind |
+|---|---|---|---|---|
+| 1.0% | 2% | 40% of sleeve (clipped) | **0.43R** | sleeve, at 2.5 positions |
+| 1.5% | 3% | 40% of sleeve (clipped) | **0.64R** | sleeve, at 2.5 positions |
+| 3.0% | 6% | 31% of sleeve | 1.00R | sleeve, at 3.2 positions |
+| 5.0% | 10% | 19% of sleeve | 1.00R | **heat cap, at 4 positions** |
+| 7.5% | 15% | 13% of sleeve | 1.00R | **heat cap, at 4 positions** |
+
+Two consequences worth stating plainly:
+
+1. **On calm names the heat cap never participates.** They are clipped so far
+   below target size that they cannot fill their own risk budget — a 1% ATR
+   name carries 0.43R, so the sleeve is exhausted at 2.5 positions while heat
+   is barely at 1R. The heat cap is not generous there; it is simply not the
+   operative constraint.
+2. **On volatile names the sleeve never participates.** A 7.5% ATR name uses
+   13% of the sleeve per position, so eight would fit on capital — but four
+   exhaust a 4R cap. This is the regime the cap exists for, and it is where
+   Donchian's universe currently sits (open positions on 2026-08-19 carried
+   stop distances of 7.4%–15.3%).
+
+**Neither substitutes for the other, and the notional cap is not redundant.**
+A heat figure assumes the stop holds. A tightly-stopped position that gaps
+through its stop overnight loses several times its booked R — a 2%-stop
+position gapping 12% loses ~6R. Notional cannot be gapped through; risk can.
+That is why the notional cap exists (`dc65435`) and why it stays.
+
+Whatever cap ships should therefore **log which limit refused an entry**.
+Otherwise the handover between the two — which follows the universe's
+volatility, not any config change — is invisible.
+
 ---
 
 ## 5. RESOLVED — the design forks
