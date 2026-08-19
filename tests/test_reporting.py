@@ -468,6 +468,45 @@ class TestTradeLogger:
         tl = TradeLogger(path="/nonexistent/path/trades.db")
         assert tl.read_realized_pnl_events_for_day("2026-06-09") == []
 
+    def test_read_realized_pnl_events_in_range_is_inclusive_of_both_ends(
+        self, tmp_csv,
+    ):
+        """The weekly report passes the window's first and last day, so
+        an exclusive bound would silently drop a Monday or a Sunday of
+        P&L from every digest."""
+        tl = TradeLogger(path=tmp_csv)
+        for day, pnl in [
+            ("2026-06-07", -1.0),   # day before the window
+            ("2026-06-08", 10.0),   # window start
+            ("2026-06-10", 20.0),   # middle
+            ("2026-06-14", 30.0),   # window end
+            ("2026-06-15", -2.0),   # day after the window
+        ]:
+            _log_close(tl, day=day, symbol="X", strategy="sma", pnl=pnl,
+                       seq=int(day[-2:]))
+
+        events = tl.read_realized_pnl_events_in_range("2026-06-08", "2026-06-14")
+        assert sorted(p for _, p in events) == [10.0, 20.0, 30.0]
+
+    def test_read_realized_pnl_events_for_day_delegates_to_the_range_query(
+        self, tmp_csv,
+    ):
+        """One definition of "which rows are a realized close", so the
+        daily and weekly reports cannot drift apart."""
+        tl = TradeLogger(path=tmp_csv)
+        _log_close(tl, day="2026-06-09", symbol="X", strategy="sma", pnl=42.0)
+
+        assert (
+            tl.read_realized_pnl_events_for_day("2026-06-09")
+            == tl.read_realized_pnl_events_in_range("2026-06-09", "2026-06-09")
+            == [("sma", 42.0)]
+        )
+
+    def test_read_realized_pnl_events_in_range_handles_missing_db(self):
+        """Missing-DB path returns []; never raises."""
+        tl = TradeLogger(path="/nonexistent/path/trades.db")
+        assert tl.read_realized_pnl_events_in_range("2026-06-01", "2026-06-30") == []
+
     def test_read_strategy_realized_pnl_summary_reconstructs_hwm(self, tmp_csv):
         tl = TradeLogger(path=tmp_csv)
         rows = [
@@ -3673,6 +3712,90 @@ class TestPnLTracker:
         content = open(path).read()
         assert "Weekly Report" in content
         assert "2026-04-16" in content
+
+    def test_weekly_report_carries_realized_pnl(
+        self, tmp_csv, tmp_daily_dir, tmp_weekly_dir,
+    ):
+        """The weekly report contained no dollar figure at all — only
+        fill counts and slippage. It was written before `realized_pnl`
+        was a column on `trades`, and the comment saying we only have
+        "fills, not round-trips" outlived the schema that made it true.
+        Two locals (`total_pnl`, `strat_pnls`) sat here unread.
+        """
+        tl = TradeLogger(path=tmp_csv)
+        _log_close(tl, day="2026-04-13", symbol="AAA", strategy="donchian", pnl=-292.80, seq=1)
+        _log_close(tl, day="2026-04-16", symbol="BBB", strategy="donchian", pnl=-271.11, seq=2)
+        tracker = PnLTracker(
+            trade_csv_path=tmp_csv,
+            daily_pnl_dir=tmp_daily_dir,
+            weekly_report_dir=tmp_weekly_dir,
+        )
+        for day in ("2026-04-13", "2026-04-16"):
+            tracker.write_daily_report(tracker.generate_daily_summary(day=day))
+
+        content = open(tracker.generate_weekly_report(week_end="2026-04-16")).read()
+
+        assert "| Realized P&L | $-563.91 |" in content
+        assert "| Closed trades | 2 |" in content
+        assert "## Per-Strategy Attribution" in content
+        assert "### donchian" in content
+        assert "| P&L | $-563.91 |" in content
+        assert "| Largest loss | $-292.80 |" in content
+
+    def test_weekly_pnl_equals_the_sum_of_its_daily_reports(
+        self, tmp_csv, tmp_daily_dir, tmp_weekly_dir,
+    ):
+        """The weekly and daily reports read realized P&L through the
+        same query for exactly this reason. If someone re-hand-rolls
+        either side's row filter, the two disagree and the weekly digest
+        is where nobody would notice.
+        """
+        tl = TradeLogger(path=tmp_csv)
+        # Spread of strategies, signs, and a zero-P&L close; plus a
+        # partial, which counts, and a row outside the window, which
+        # must not.
+        _log_close(tl, day="2026-04-13", symbol="AAA", strategy="sma", pnl=140.5, seq=1)
+        _log_close(tl, day="2026-04-14", symbol="BBB", strategy="rsi", pnl=-60.25, seq=2)
+        _log_close(tl, day="2026-04-14", symbol="CCC", strategy="sma", pnl=0.0, seq=3)
+        _log_close(tl, day="2026-04-16", symbol="DDD", strategy="donchian", pnl=-12.75, seq=4)
+        _log_close(tl, day="2026-04-09", symbol="EEE", strategy="sma", pnl=9_999.0, seq=5)
+        tracker = PnLTracker(
+            trade_csv_path=tmp_csv,
+            daily_pnl_dir=tmp_daily_dir,
+            weekly_report_dir=tmp_weekly_dir,
+        )
+
+        daily_total = 0.0
+        for day in ("2026-04-13", "2026-04-14", "2026-04-16"):
+            summary = tracker.generate_daily_summary(day=day)
+            tracker.write_daily_report(summary)
+            daily_total += summary.realized_pnl
+
+        content = open(tracker.generate_weekly_report(week_end="2026-04-16")).read()
+
+        assert daily_total == pytest.approx(67.5)
+        assert f"| Realized P&L | ${daily_total:,.2f} |" in content, content
+        assert "9,999" not in content, "a close outside the window leaked in"
+        # The zero-P&L close is a trade but neither a win nor a loss.
+        assert "| Closed trades | 4 |" in content
+
+    def test_weekly_report_with_no_closes_says_zero_not_nothing(
+        self, tmp_csv, tmp_daily_dir, tmp_weekly_dir,
+    ):
+        """A week of entries and no exits is a real state. It must
+        report $0.00 over 0 closed trades, not omit the row."""
+        tracker = PnLTracker(
+            trade_csv_path=tmp_csv,
+            daily_pnl_dir=tmp_daily_dir,
+            weekly_report_dir=tmp_weekly_dir,
+        )
+        tracker.write_daily_report(tracker.generate_daily_summary(day="2026-04-16"))
+
+        content = open(tracker.generate_weekly_report(week_end="2026-04-16")).read()
+
+        assert "| Realized P&L | $0.00 |" in content
+        assert "| Closed trades | 0 |" in content
+        assert "## Per-Strategy Attribution" not in content
 
 
 # ── TestStrategyStats ───────────────────────────────────────────────────────

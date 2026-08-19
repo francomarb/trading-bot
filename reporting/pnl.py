@@ -96,6 +96,35 @@ def unrealized_pnl_from_positions(positions) -> float:
     return total
 
 
+def _stats_by_strategy(
+    events: list[tuple[str, float]],
+) -> dict[str, "StrategyStats"]:
+    """Fold ``(strategy, realized_pnl)`` events into per-strategy stats.
+
+    Shared by the daily and weekly reports so "what counts as a win" is
+    defined once. A zero-P&L close counts toward `trade_count` but is
+    neither a win nor a loss, which is what makes `wins + losses` legal
+    to be less than `trade_count`.
+    """
+    stats: dict[str, StrategyStats] = {}
+    for strategy_name, pnl in events:
+        if strategy_name not in stats:
+            stats[strategy_name] = StrategyStats(strategy_name=strategy_name)
+        s = stats[strategy_name]
+        s.trade_count += 1
+        s.total_pnl += pnl
+        s.trade_pnls.append(pnl)
+        if pnl > 0:
+            s.wins += 1
+            if pnl > s.largest_win:
+                s.largest_win = pnl
+        elif pnl < 0:
+            s.losses += 1
+            if pnl < s.largest_loss:
+                s.largest_loss = pnl
+    return stats
+
+
 def _slippage_by_instrument(trades: list[dict]) -> dict[str, dict]:
     """Adverse-slippage stats split by instrument class.
 
@@ -300,24 +329,9 @@ class PnLTracker:
         )
 
         # Per-strategy breakdown.
-        strats: dict[str, StrategyStats] = {}
-        for strat_name, pnl in events:
-            if strat_name not in strats:
-                strats[strat_name] = StrategyStats(strategy_name=strat_name)
-            s = strats[strat_name]
-            s.trade_count += 1
-            s.total_pnl += pnl
-            s.trade_pnls.append(pnl)
-            if pnl > 0:
-                s.wins += 1
-                if pnl > s.largest_win:
-                    s.largest_win = pnl
-            elif pnl < 0:
-                s.losses += 1
-                if pnl < s.largest_loss:
-                    s.largest_loss = pnl
+        strats = _stats_by_strategy(events)
 
-        # Aggregate (over the same merged events used above).
+        # Aggregate (over the same events used above).
         all_pnls = [p for _, p in events]
         total_trades = len(all_pnls)
         realized = sum(all_pnls)
@@ -424,8 +438,22 @@ class PnLTracker:
         week_end: str | None = None,
     ) -> str | None:
         """
-        Aggregate the last 7 daily summary files into a weekly markdown
-        report. Returns the file path, or None if no daily reports exist.
+        Aggregate the 7-day window ending ``week_end`` into a weekly
+        markdown report. Returns the file path, or None if no daily
+        reports exist for the window.
+
+        The daily ``.md`` files are used only to decide the window is
+        worth reporting and to link to — this method never parses their
+        contents. Every figure is read fresh from the trade database:
+        realized P&L and per-strategy attribution through
+        ``read_realized_pnl_events_in_range`` (the same query the daily
+        report uses), fills and slippage through ``_trades_in_range``.
+
+        That independence is why the daily report's dead
+        ``unrealized_pnl`` / ``max_intraday_drawdown`` fields never
+        contaminated this report — but it is also why this one carried
+        no P&L at all until 2026-08-19, having been written when
+        ``realized_pnl`` was not yet a column on ``trades``.
         """
         end = (
             date.fromisoformat(week_end)
@@ -448,12 +476,23 @@ class PnLTracker:
         # Parse key metrics from trade CSV for the week.
         trades = self._trades_in_range(start.isoformat(), end.isoformat())
         total_trades = len(trades)
-        total_pnl = 0.0
-        strat_pnls: dict[str, list[float]] = {}
 
-        # We don't have per-trade P&L in the CSV (we have fills, not
-        # round-trips). Weekly report summarizes trade activity +
-        # adverse-only slippage from measured rows. Rows with NULL
+        # Realized P&L for the window, from the same query the daily
+        # report uses. This used to be omitted on the grounds that "we
+        # have fills, not round-trips" — true when the report was
+        # written, stale since `realized_pnl` became a column on
+        # `trades`. Two dead locals (`total_pnl = 0.0`, `strat_pnls`)
+        # sat here unread in the meantime, and the operator got a
+        # "Weekly Report" whose summary contained no dollar figure at
+        # all: the week of 2026-08-10 closed -$563.91 across two
+        # Donchian exits and reported neither number.
+        events = self._trade_logger.read_realized_pnl_events_in_range(
+            start.isoformat(), end.isoformat()
+        )
+        weekly_strats = _stats_by_strategy(events)
+        realized_pnl = sum(pnl for _, pnl in events)
+
+        # Adverse-only slippage from measured rows. Rows with NULL
         # slippage are skipped — not treated as zero — so paths that
         # legitimately have no benchmark (LIMIT entries, external
         # closes) don't drag the mean toward zero.
@@ -476,6 +515,8 @@ class PnLTracker:
             f"|---|---|",
             f"| Trading days with reports | {len(daily_files)} |",
             f"| Total fills | {total_trades} |",
+            f"| Realized P&L | ${realized_pnl:,.2f} |",
+            f"| Closed trades | {len(events)} |",
         ]
         # One row per instrument class that actually has measurements.
         # Basis points are not comparable across price scales, so there
@@ -500,6 +541,34 @@ class PnLTracker:
             "comparable and are never combined — an 8¢ miss is 2 bps on a "
             "$400 stock and 1,212 bps on a $0.66 contract (PLAN 11.50).",
             "",
+            "> `Total fills` counts every order that filled in the window, "
+            "entries included. `Closed trades` counts round-trips that "
+            "realized P&L, which is the denominator behind the figures "
+            "below. They are different numbers and a week can legitimately "
+            "have many fills and no closes.",
+            "",
+        ]
+        if weekly_strats:
+            lines += [
+                "## Per-Strategy Attribution",
+                "",
+            ]
+            for name, s in sorted(weekly_strats.items()):
+                lines += [
+                    f"### {name}",
+                    "",
+                    f"| Metric | Value |",
+                    f"|---|---|",
+                    f"| Closed trades | {s.trade_count} |",
+                    f"| P&L | ${s.total_pnl:,.2f} |",
+                    f"| Win rate | {s.win_rate:.1%} |",
+                    f"| Expectancy | ${s.expectancy:,.2f} |",
+                    f"| Profit factor | {s.profit_factor:.2f} |",
+                    f"| Largest win | ${s.largest_win:,.2f} |",
+                    f"| Largest loss | ${s.largest_loss:,.2f} |",
+                    "",
+                ]
+        lines += [
             "## Daily Reports",
             "",
         ]

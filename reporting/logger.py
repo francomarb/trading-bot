@@ -2342,15 +2342,35 @@ class TradeLogger:
         accumulator that resets on every bot recycle and was never
         populated in production (no caller of ``record_trade_pnl``).
 
-        ``day`` is the UTC date in ``YYYY-MM-DD`` format. Each row
-        with a non-null ``realized_pnl`` that closed on that day —
-        single-leg sell-side close rows AND credit-spread close rows —
-        contributes exactly one tuple. Partial-close rows
-        (``status='partial'``) are included: their dollar contribution
-        is real and belongs in the day's realized P&L total, the same
-        way the live allocator's running P&L counts them.
+        ``day`` is the UTC date in ``YYYY-MM-DD`` format. A single-day
+        window of ``read_realized_pnl_events_in_range``; see there for
+        which rows qualify.
         """
-        if not day or not os.path.exists(self._path):
+        if not day:
+            return []
+        return self.read_realized_pnl_events_in_range(day, day)
+
+    def read_realized_pnl_events_in_range(
+        self, start: str, end: str,
+    ) -> list[tuple[str, float]]:
+        """Return ``(strategy, realized_pnl)`` for every realized-P&L row
+        whose ``exit_timestamp`` falls in ``[start, end]`` inclusive.
+
+        ``start`` and ``end`` are UTC dates in ``YYYY-MM-DD`` format.
+        Each row with a non-null ``realized_pnl`` that closed in the
+        window — single-leg sell-side close rows AND credit-spread close
+        rows — contributes exactly one tuple. Partial-close rows
+        (``status='partial'``) are included: their dollar contribution is
+        real and belongs in the total, the same way the live allocator's
+        running P&L counts them.
+
+        The daily and weekly reports both read realized P&L through this
+        one query rather than each writing their own. Two hand-rolled
+        variants of "which rows count as a realized close" would drift,
+        and the weekly report is exactly where a quiet disagreement with
+        the daily numbers would go unnoticed.
+        """
+        if not start or not end or not os.path.exists(self._path):
             return []
         try:
             conn = self._ensure_db()
@@ -2362,9 +2382,9 @@ class TradeLogger:
             "WHERE (side = 'sell' OR position_type = 'spread') "
             "AND status IN ('filled', 'partial') "
             "AND realized_pnl IS NOT NULL "
-            "AND substr(exit_timestamp, 1, 10) = ? "
+            "AND substr(exit_timestamp, 1, 10) BETWEEN ? AND ? "
             "ORDER BY id ASC",
-            (day,),
+            (start, end),
         )
         return [
             (row["strategy"], float(row["realized_pnl"]))
