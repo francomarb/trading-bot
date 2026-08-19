@@ -38,7 +38,7 @@ Five strategy sleeves are running simultaneously in paper trading: SMA, RSI, Don
 | Status | **Paper Trading** |
 | Sleeve weight | 40% of deployable gross capital |
 | Max positions | 8 |
-| Per-position budget | ~$12,800 max notional at $100k paper equity |
+| Per-position budget | **$12,800** baseline at $100k paper equity (`max_position_pct_of_sleeve` 0.40 × $32k target sleeve); **up to $14,720** when the allocator stretch applies — `can_stretch: True` raises the effective sleeve to $36,800 while utilization < 80% and the equity pool has slack, and the cap is computed against the *effective* budget |
 
 **Signal logic:**
 - **Entry:** Fast SMA crosses *above* slow SMA (bullish crossover)
@@ -116,6 +116,7 @@ SMA crossover is the simplest trend-following signal. It captures sustained dire
 | Sleeve weight | 20% of equity (target) — carved from 0.25 when credit_spread was added |
 | Hard max positions | 8 |
 | Max position % of sleeve | 40% |
+| Per-position budget | **$6,400** baseline at $100k paper equity (0.40 × $16k target sleeve); **up to $7,360** with allocator stretch (`can_stretch: True`) |
 | Watchlist size | 29 names (`RSI_WATCHLIST`) |
 
 **Signal logic:**
