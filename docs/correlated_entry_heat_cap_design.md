@@ -1,7 +1,11 @@
 # Correlated-Entry Heat Cap — Design (PLAN `11.60`)
 
-**Status:** 🔄 **DRAFT — revision 3.** Two independent design reviews, plus a
-second pass from review 1 on rev 2.
+**Status:** ✅ **Design review closed — revision 4.** Two independent
+reviewers (Codex, Gemini/Antigravity), two rounds each. Every structural
+question is resolved: §5.1–§5.5 by convergence, §5.6 and its sub-questions by
+verification against the code. **The cap level is deliberately unchosen** —
+§6 explains why that is an operator decision rather than a finding, and §7
+lists the one design sub-decision still open.
 The five design forks in §5 are now **RESOLVED**: two reviews (Codex,
 Gemini/Antigravity) reached the same answer on each, independently. The
 enforcement model in §5.6 is resolved on evidence where the two reviews
@@ -12,7 +16,7 @@ Sections marked **CLOSED** were measured and rejected; do not re-propose
 without meeting the stated re-open bar. Sections marked **RESOLVED** carry
 the reasoning both reviews converged on. §7 lists what is still open.
 
-**Last updated:** 2026-08-19 (rev 3)
+**Last updated:** 2026-08-19 (rev 4)
 
 **Scope:** the `donchian_breakout` sleeve first, built as reusable per-strategy
 machinery. Slot allocation / candidate ranking is deliberately **out of scope**
@@ -433,24 +437,82 @@ already carry `intended_qty`, `intended_limit_price`, `intended_stop_price`,
 `status`, and the protective stop is known at submission because it is an OTO
 bracket child.
 
-**Two implementation details neither review raised:**
+#### 5.6.1 MARKET entries — same state machine, weaker guarantee
 
-1. **Not every Donchian entry rests.** 3 of 17 were `market` (the fractional
-   path). Those fill immediately, so the reservation and its replacement
-   collapse into one step — but the design must say so rather than assume all
-   entries rest.
-2. **`initial_risk_dollars` is an approximation, not an identity.** Measured
-   against `(fill − stop) × qty` on the 8 most recent Donchian entries: 5
-   exact, 3 off by ≤$0.45 (stop re-anchoring, `11.53`), and **2 of 30 rows are
-   NULL**. Good enough for a heat figure — differences under 0.2% — but it
-   needs a documented NULL fallback. It is far better populated than
-   `risk_budget_dollars`, which is NULL on 22 of 30.
+3 of 17 Donchian entries were `market` (the fractional path). **RESOLVED —
+both reviews concur:** run them through the identical reservation state
+machine rather than a special branch. Reserve at submit, transition to actual
+risk on fill, release on rejection. Because a market entry fills in the same
+cycle, reservation and replacement collapse into one step.
 
-**Precondition to verify before shipping:** a protective-stop substrate row
-was once recorded stuck `pending` while its broker order was live. The
-insert-before-submit ordering makes the *entry* path sound, but a silently
-missing reservation would make the cap under-count. State this as verified,
-not inherited.
+**But the two reservations are not equally strong, and the design must not
+pretend otherwise:**
+
+| Entry type | Reservation | Guarantee |
+|---|---|---|
+| `stop_limit` | `qty × (limit − stop)` | **True bound.** A buy stop-limit cannot fill above its limit |
+| `market` | `qty × (reference_price − stop)` | **Estimate.** No price ceiling exists; the fill can be worse than reference |
+
+The market reservation can therefore under-reserve by the slippage. The
+exposure is sub-second (it is replaced by actual risk in the same cycle) and
+slippage-sized, so this is acceptable — but it is an accepted approximation,
+not a guarantee, and should be labelled as one.
+
+#### 5.6.2 NULL `initial_risk_dollars` — fail closed, and mean it
+
+`initial_risk_dollars` is an approximation, not an identity. Measured against
+`(fill − stop) × qty` on the 8 most recent Donchian entries: 5 exact, 3 within
+half a dollar (stop re-anchoring, `11.53`), and **2 of 30 rows NULL**. Good
+enough for a heat figure — differences under 0.2% — but the NULLs need a
+documented fallback. (It is far better populated than `risk_budget_dollars`,
+NULL on 22 of 30.)
+
+**RESOLVED — a deterministic chain that never treats an unknown as zero:**
+
+1. Recompute from live position fields: `(avg_entry_price − stop_price) × current_qty`
+2. Stop price also unavailable → **see the caveat below**
+3. Log a structured WARNING naming which step was used
+
+Treating a NULL as zero heat is the one unacceptable option: it would relax
+the cap exactly during a data anomaly, which is the failure direction this
+project rejects elsewhere.
+
+> **⚠️ Caveat on step 2, which review 2 proposed as "fall back to nominal
+> `equity × risk_per_trade_pct`".** Nominal is **not** conservative. The ANET
+> case in this document carried **2.2× its nominal budget** after notional caps
+> and share flooring — and a position whose stop we cannot read is precisely
+> the kind we cannot rule out being one of those. Falling back to nominal fails
+> open by a smaller amount rather than not at all, which contradicts the
+> principle the chain is built on. **Open sub-decision:** apply a conservative
+> multiple to nominal, or treat an unknown-stop position as blocking new
+> entries while it is open. Name the choice; do not inherit it.
+
+#### 5.6.3 Restart — the reconciliation already exists
+
+**RESOLVED, and smaller than it looks.** Review 2 called explicit startup
+reconciliation against broker open orders "required", implying new machinery.
+It is already built: `_reconcile_substrate_via_rest` runs at **both** startup
+(P-3) and per cycle (P-2), takes substrate non-terminal rows, checks them
+against `snapshot.open_orders`, and advances any that terminated while the bot
+was down. It ran **4 times at the 2026-08-19 07:32 restart**, reconciling
+exactly the expired DAY entry orders this design would otherwise have carried
+as live reservations.
+
+So the requirement is not "build reconciliation" but an **ordering
+constraint**:
+
+> Derive heat from substrate rows only **after** `_reconcile_substrate_via_rest`
+> has run. Compute it before, and the cap counts reservations for orders that
+> died overnight — blocking entries against risk that no longer exists.
+
+Do not build a parallel reconciliation pass for the heat cap.
+
+**Precondition still to verify before shipping:** a protective-stop substrate
+row was once recorded stuck `pending` while its broker order was live. The
+insert-before-submit ordering makes the *entry* path sound, and the
+reconciliation pass covers the restart window, but a silently missing
+reservation would still make the cap under-count. State this as verified, not
+inherited.
 
 ---
 
@@ -500,11 +562,16 @@ from a parameter that already exists, which keeps them interpretable.
 > then evaluate forward on paper. A level chosen because one candidate made
 > the backtest look best has been fitted, however few candidates there were.
 
-| Candidate | % of equity | Implied positions at target size |
-|---|---|---|
-| **3R** | 1.20% | 3 |
-| **4R** | 1.60% | 4 |
-| **5R** | 2.00% | 5 |
+Trade-offs as characterised by review 2, which is the useful thing a reviewer
+can contribute here — describing each posture's cost, not choosing between
+them. "Positions" is at *actual* average sizing (0.33% of equity), not at the
+0.40% target; see the callout below for why those differ.
+
+| Candidate | % of equity | ≈ positions | Policy posture | What it costs / buys |
+|---|---|---|---|---|
+| **3R** | 1.20% | 3.6 | Strict defensive | Bounds worst correlated loss at 1.20%. Routinely refuses the 4th and 5th candidate in a sustained rally |
+| **4R** | 1.60% | 4.8 | Balanced budget | Clamps a June-2026-scale cluster while still allowing multi-name diversification. **Would have bound on positions #5 and #6 of the 2026-08-19 book** |
+| **5R** | 2.00% | 6.0 | Tail damper only | Prevents 7–8 position runaway and blocks outsized allocations when share flooring inflates risk (ANET at 2.2×). **Effectively at the current book, not above it** — 2.00% against 1.99% is 0.01pp of headroom, so one further position breaches it |
 
 > ### ⚠️ The suggested 4R baseline is already breached by the live book
 >
@@ -551,37 +618,34 @@ reservations that later expire unfilled.
 
 ---
 
-## 7. What is still open — for re-review
+## 7. What remains
 
-§5 is resolved. Do not re-litigate §5.1–§5.5 without new evidence; two
-independent reviews converged on each. §5.6 was resolved against one review's
-proposal by verification — argue with the verification, not the conclusion.
+**The design review is closed.** Two independent reviewers converged on every
+structural question across two rounds. §5.1–§5.5 resolved by convergence,
+§5.6 and its three sub-questions resolved by verification. Do not re-litigate
+without new evidence; argue with a verification rather than around it.
 
-What genuinely remains:
+Two things remain, and only one of them is a design question:
 
-1. **The level — an operator decision, not a review one.** Nothing here picks
-   3R, 4R or 5R, and §6 explains why the evidence cannot pick it either: at
-   ~6 independent market bets the sample cannot separate the candidates. What
-   reviewers can usefully do is sharpen *what each level would have cost* —
-   cohort sizes permitted, entries forgone, worst cohort loss bounded — so the
-   appetite is chosen with the trade-off visible. Two constraints to reason
-   from: an R-multiple cap silently redefines effective concurrency, and the
-   suggested 4R baseline is already breached by the live book.
-2. **The MARKET entry path** (§5.6). 3 of 17 Donchian entries were `market`.
-   Reservation-and-immediate-settlement is the obvious handling; is there a
-   reason it should differ?
-3. **NULL `initial_risk_dollars`** (2 of 30 rows). What should the fallback
-   be — recompute from `(fill − stop) × qty`, or refuse to count the position
-   and log? Refusing is safer but makes the cap fail *open* on a data gap,
-   which is the failure direction this project usually rejects.
-4. **The substrate precondition** (§5.6). Is insert-before-submit sufficient
-   on its own, or does the reservation path need its own reconciliation pass
-   against broker open orders at startup?
-5. **Portfolio-level ceiling.** Both reviews put it out of scope for v1. Does
-   it deserve its own PLAN item now, or does it wait for evidence that
-   cross-sleeve correlation actually bites?
-6. Anything in §3 you believe was closed on insufficient evidence — but argue
-   against the stated re-open bar, not around it.
+1. **The level — yours, not a reviewer's.** §6 explains why: at roughly six
+   independent market bets the sample cannot separate 3R from 5R, so evidence
+   can describe each posture's cost but not discover the right one. The ladder
+   table states the three trade-offs; pick an appetite from them, pre-register
+   it, then evaluate forward on paper.
+2. **One open sub-decision** (§5.6.2): when a position's stop price cannot be
+   read, does the fallback apply a conservative multiple to nominal risk, or
+   does it block new entries while that position is open? Nominal alone is not
+   conservative — the ANET case carried 2.2× nominal — so inheriting review 2's
+   proposal unchanged would fail open by a smaller amount rather than not at
+   all.
+
+Then implementation, whose acceptance is §6 Steps 1, 3 and 4.
+
+**Split out rather than resolved here:** the portfolio-level ceiling. Both
+reviews put it out of v1, and both gave the same reason — it introduces
+cross-strategy priority arbitration (who gets refused when the *book* is at
+its limit) that a single-sleeve control does not. It should get its own PLAN
+item once there is evidence cross-sleeve correlation actually bites.
 
 ---
 
