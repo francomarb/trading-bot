@@ -458,56 +458,70 @@ exposure is sub-second (it is replaced by actual risk in the same cycle) and
 slippage-sized, so this is acceptable — but it is an accepted approximation,
 not a guarantee, and should be labelled as one.
 
-#### 5.6.2 Reading a position's risk — staleness matters more than NULL
+#### 5.6.2 Read risk from the broker, not from stored fields
 
-**Do not read the stored aggregate as authoritative.** Compute heat from
-`(entry_price − stop currently in force) × current_qty`. Because the stop is
-static (§3), "currently in force" equals the entry-time stop in the normal
-case; the two diverge only when a stop has been repaired or replaced, and
-there the current one is the honest figure.
+**The broker is authoritative for filled positions.** Heat per open position is
 
-**Why not just read `initial_risk_dollars`.** It is NULL on 2 of 30 Donchian
-entry rows — but NULL is the *easy* failure, because it is detectable and
-triggers a fallback. `11.58` documents the dangerous one: the field can be
-**present and wrong**. SMCI on 2026-08-14 filled in three tranches
-(54 + 18 + 1 = 73) while the stored risk froze at the first tranche — a **26%
-understatement** that nothing detects. A cap reading that number would
-under-count heat and admit extra entries, silently. Two write-time races of
-this class have been found and fixed (`11.58` (a) and (a) round 2); reading a
-derived value rather than a frozen one removes the whole class rather than
-waiting for the third.
+```
+(position.avg_entry_price − resting_stop_order.stop_price) × position.qty
+```
 
-The stored field remains useful as a **cross-check**: compute, compare, log on
-disagreement. That turns a silent corruption into an observable one.
+Every input comes from the `sync_with_broker()` snapshot the engine already
+takes each cycle — `account.open_positions` for entry price and quantity,
+`open_orders` for the live protective stop. **No database read is involved.**
 
-**Fallback chain, when the stop price itself cannot be read.** The trades row
-carries more than one recorded stop, so there are real rungs before "unknown":
+This is the project's own durable position — *broker state is source of
+truth* — applied to a number that had been sourced from a local mirror of it.
 
-1. `stop_price` / `initial_stop_loss` on the entry row → recompute directly
-2. `initial_risk_per_share × current_qty`
-3. `initial_risk_dollars` as stored (accepting it may be stale)
-4. None available → **fail closed**, see below
+**Verified 2026-08-19.** Broker-derived heat reproduces the DB-derived figure
+to the cent on all six open Donchian positions, totalling 1.99% of equity
+either way. More importantly it is **immune to the failure class that made
+§5.6.2 necessary in the first place**: SMCI reads 410.99 from the broker — the
+correct figure — where the stored `initial_risk_dollars` had frozen at a 26%
+understatement (`11.58`). A derived value cannot go stale because there is
+nothing to keep in sync.
 
-Treating an unreadable position as **zero heat** is the one unacceptable
-option: it relaxes the cap precisely during a data anomaly, the failure
-direction this project rejects elsewhere.
+Three properties fall out for free:
 
-> **⚠️ Open sub-decision (the last one).** Review 2 proposed falling back to
-> nominal `equity × risk_per_trade_pct`. **Nominal is not conservative** — the
-> ANET case carried **2.2× nominal** after notional caps and share flooring,
-> and a position whose stop cannot be read is exactly the kind that might be
-> one of those. So rung 4 is either a conservative multiple of nominal, or
-> "this position blocks new entries while its risk is unknown". Name the
-> choice; do not inherit it.
+| | |
+|---|---|
+| **Partial exits** | Handled automatically. `avg_entry_price` is the cost basis of the *remaining* shares and `qty` is the *remaining* quantity, so the product tracks the position down without special accounting |
+| **Repaired stops** | Handled correctly. If a stop was rebuilt at a different level, the broker shows the level actually in force — which is the honest risk, and exactly what `_repair_missing_protective_stops` leaves stale in the stored field |
+| **Write races** | Eliminated. Both `11.58` races were disagreements between two writers of a stored number. There is no stored number |
 
-**On relying on the existing stop-repair machinery.** For stop *existence*,
-yes — `_repair_missing_protective_stops` runs every cycle and rebuilds
-protection within one cycle. The heat cap should not duplicate it. For the
-risk *figure*, no: `11.58` records that SMCI's stale value *"never healed
-because SMCI took `_repair_missing_protective_stops`, which does not rebase"*.
-Repair restores the stop; it does not correct the number. Deriving heat from
-the stop currently in force is what makes the repair machinery work *for* the
-cap rather than leave a hole in it.
+**The stored fields become a cross-check, not a source.** Compute from the
+broker, compare against `initial_risk_dollars`, log on disagreement. That
+converts a silent corruption into an observable one and gives `11.58` a
+standing regression detector rather than a third incident.
+
+**What still requires local state — and why it is not the same problem:**
+
+1. **Attribution.** The broker does not know which strategy owns a position.
+   That stays with the engine's ownership map, as it already is for every
+   other per-strategy control.
+2. **Reservations for resting entries.** A resting `STOP_LIMIT` entry exposes
+   its `qty`, `limit_price` and trigger via `OpenOrder` — but its protective
+   stop is an **OTO bracket child that does not exist at the broker until the
+   parent fills**. So the intended stop for an unfilled entry must still come
+   from `position_lifecycle_orders.intended_stop_price`. The broker cannot
+   answer a question about an order it has not created yet.
+
+So the authority splits cleanly by lifecycle stage: **substrate before fill,
+broker after.**
+
+**What "risk cannot be read" now means.** Not a data-quality cascade — a
+filled position with **no resting stop order at the broker**, i.e. one that is
+genuinely unprotected. That is a protection incident, and
+`_repair_missing_protective_stops` already owns it and runs every cycle.
+
+> **⚠️ The one open sub-decision, now narrower.** During the window between a
+> stop going missing and repair rebuilding it, what does the cap do with that
+> position? Counting it as zero heat is unacceptable — it would relax the cap
+> during a protection incident, the worst possible moment. The candidates are:
+> carry its last known risk, carry a conservative estimate, or treat the
+> incident as blocking new entries until protection is restored. The third is
+> the most conservative and arguably the most honest — an unprotected position
+> is a reason to stop adding risk, not to keep sizing against a guess.
 
 #### 5.6.3 Restart — the reconciliation already exists
 
@@ -681,12 +695,11 @@ Two things remain, and only one of them is a design question:
    2026-08-19 before any measurement run, and shipping **observation-only**
    first (§6 Step 3a). Revisable, but as a recorded policy change rather than
    a finding.
-2. **One open sub-decision** (§5.6.2): when a position's risk cannot be read
-   at all, does the last rung apply a conservative multiple to nominal risk,
-   or block new entries while that position is open? Nominal alone is not
-   conservative — the ANET case carried 2.2× nominal — so inheriting review 2's
-   proposal unchanged would fail open by a smaller amount rather than not at
-   all.
+2. **One open sub-decision** (§5.6.2), narrowed by sourcing risk from the
+   broker: during the window between a protective stop going missing and
+   `_repair_missing_protective_stops` rebuilding it, does the cap carry that
+   position's last known risk, a conservative estimate, or treat the
+   protection incident as blocking new entries until the stop is restored?
 
 Then implementation, whose acceptance is §6 Steps 1, 3 and 4.
 
