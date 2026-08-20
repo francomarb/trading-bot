@@ -1136,14 +1136,25 @@ class PositionLifecycleOrdersStore:
         A heat figure built only from filled positions is blind to exactly
         the cluster the cap exists to bound.
 
-        Reserved risk is the worst case the order can produce::
+        Reserved risk is the worst case the **unfilled remainder** can
+        produce::
 
-            intended_qty x (intended_limit_price - intended_stop_price)
+            max(0, intended_qty - filled_qty) x (intended_limit_price - intended_stop_price)
 
         which is a true bound for a stop-limit: it cannot fill above its
-        limit. Rows without both prices are skipped — in practice those are
-        MARKET entries, which have no limit and fill in the submitting cycle,
-        so they are counted as positions rather than reservations almost
+        limit.
+
+        **Subtracting `filled_qty` is not an optimisation — without it a
+        partially filled resting order is double-counted.** A row at
+        ``partially_filled`` is still non-terminal, so it appears here, while
+        the shares it has already filled are simultaneously counted by
+        `TradeLogger.read_open_risk_by_strategy_with_gaps`. A 40%-filled
+        entry would otherwise contribute actual risk on 40% *plus* a
+        reservation for 100%.
+
+        Rows without both prices are skipped — in practice those are MARKET
+        entries, which have no limit and fill in the submitting cycle, so they
+        are counted as positions rather than reservations almost
         immediately.
 
         Strategy attribution comes from the parent ``position_lifecycle``
@@ -1154,8 +1165,8 @@ class PositionLifecycleOrdersStore:
         """
         status_placeholders = ", ".join("?" for _ in NON_TERMINAL_ORDER_STATUSES)
         rows = self._conn.execute(
-            "SELECT p.strategy, o.intended_qty, o.intended_limit_price, "
-            "       o.intended_stop_price "
+            "SELECT p.strategy, o.intended_qty, o.filled_qty, "
+            "       o.intended_limit_price, o.intended_stop_price "
             "FROM position_lifecycle_orders o "
             "JOIN position_lifecycle p ON p.position_uid = o.position_uid "
             f"WHERE o.role = 'entry_primary' "
@@ -1165,10 +1176,11 @@ class PositionLifecycleOrdersStore:
             tuple(sorted(NON_TERMINAL_ORDER_STATUSES)),
         ).fetchall()
         totals: dict[str, float] = {}
-        for strategy, qty, limit_price, stop_price in rows:
+        for strategy, intended_qty, filled_qty, limit_price, stop_price in rows:
             if not strategy:
                 continue
-            risk = (float(limit_price) - float(stop_price)) * float(qty or 0.0)
+            unfilled = max(0.0, float(intended_qty or 0.0) - float(filled_qty or 0.0))
+            risk = (float(limit_price) - float(stop_price)) * unfilled
             if risk <= 0:
                 continue
             totals[strategy] = totals.get(strategy, 0.0) + risk

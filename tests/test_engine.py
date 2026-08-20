@@ -7154,6 +7154,25 @@ class TestHeatCapObservation:
         monkeypatch.setattr(settings, "STRATEGY_HEAT_CAP_ENFORCED", True)
         assert engine._heat_cap_allows(self._decision()) is False   # enforced
 
+    def test_unbounded_positions_refuse_under_enforcement(
+        self, engine_factory, monkeypatch,
+    ):
+        """Unknown risk must not become zero risk. A position with no
+        recorded initial risk makes the total a knowing understatement, so
+        enforcement must refuse rather than admit against it. Observation
+        continues, since its whole contract is not to block."""
+        from config import settings
+
+        engine, _ = engine_factory()
+        self._wire(engine, filled=100.0)   # far under the 1600 cap
+        engine.trade_logger.read_open_risk_by_strategy_with_gaps = (
+            lambda: ({"donchian_breakout": 100.0}, {"donchian_breakout": ["WYFI"]})
+        )
+
+        assert engine._heat_cap_allows(self._decision()) is True     # observation
+        monkeypatch.setattr(settings, "STRATEGY_HEAT_CAP_ENFORCED", True)
+        assert engine._heat_cap_allows(self._decision()) is False    # enforced
+
     def test_unbounded_positions_are_flagged_not_silently_dropped(self, engine_factory):
         engine, _ = engine_factory()
         self._wire(engine, filled=100.0)

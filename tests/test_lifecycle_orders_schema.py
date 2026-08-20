@@ -33,6 +33,7 @@ from engine.lifecycle import new_position_uid
 from engine.lifecycle_orders import (
     _CREATE_POSITION_LIFECYCLE_ORDERS_INDEXES_SQL,
     LIFECYCLE_ORDERS_SCHEMA_VERSION,
+    PositionLifecycleOrdersStore,
     NON_TERMINAL_ORDER_STATUSES,
     TERMINAL_ORDER_STATUSES,
     VALID_ORDER_ROLES,
@@ -392,3 +393,87 @@ class TestRoleAndStatusEnums:
         assert NON_TERMINAL_ORDER_STATUSES == (
             VALID_ORDER_STATUSES - TERMINAL_ORDER_STATUSES
         )
+
+
+class TestPendingEntryReservations:
+    """PLAN 11.60 — worst-case risk held by resting entry orders."""
+
+    def _store(self, tmp_path):
+        # Real schema path: the store executes no DDL; TradeLogger._ensure_db
+        # creates both tables through the same migration production uses.
+        conn = TradeLogger(path=str(tmp_path / "t.db"))._ensure_db()
+        return conn, PositionLifecycleOrdersStore(conn)
+
+    def _position(self, conn, uid, strategy="donchian_breakout"):
+        conn.execute(
+            "INSERT OR REPLACE INTO position_lifecycle("
+            "position_uid, schema_version, created_at, symbol, owner_key, "
+            "strategy, position_type, status, net_realized_pnl) "
+            "VALUES (?, 1, '2026-08-20T00:00:00+00:00', 'AAA', 'AAA', ?, "
+            "'single_leg', 'open', 0.0)",
+            (uid, strategy),
+        )
+
+    def _entry(self, conn, uid, *, intended, filled, limit, stop, status="working"):
+        conn.execute(
+            "INSERT INTO position_lifecycle_orders("
+            "position_uid, role, client_order_id, order_type, order_class, "
+            "time_in_force, side, intended_qty, filled_qty, intended_limit_price, "
+            "intended_stop_price, origin_kind, status, created_at, last_observed_at) "
+            "VALUES (?, 'entry_primary', ?, 'stop_limit', 'oto', 'day', 'buy', "
+            "?, ?, ?, ?, 'strategy', ?, '2026-08-20T00:00:00+00:00', "
+            "'2026-08-20T00:00:00+00:00')",
+            (uid, f"cid-{uid}", intended, filled, limit, stop, status),
+        )
+        conn.commit()
+
+    def test_unfilled_order_reserves_its_full_worst_case(self, tmp_path):
+        conn, store = self._store(tmp_path)
+        self._position(conn, "p1")
+        self._entry(conn, "p1", intended=100, filled=0, limit=110.0, stop=90.0)
+        assert store.read_pending_entry_reservations() == {
+            "donchian_breakout": pytest.approx(2000.0)
+        }
+
+    def test_partially_filled_order_reserves_only_the_remainder(self, tmp_path):
+        """The double-count this guards: a `partially_filled` row is still
+        non-terminal, so it appears here, while the shares already filled are
+        simultaneously counted by the trade log's open-risk reader. Reserving
+        the full intended qty books that 40% twice."""
+        conn, store = self._store(tmp_path)
+        self._position(conn, "p2")
+        self._entry(conn, "p2", intended=100, filled=40, limit=110.0, stop=90.0,
+                    status="partially_filled")
+        # Only the unfilled 60 may be reserved: 60 x (110 - 90) = 1200.
+        assert store.read_pending_entry_reservations() == {
+            "donchian_breakout": pytest.approx(1200.0)
+        }
+
+    def test_fully_filled_but_still_non_terminal_reserves_nothing(self, tmp_path):
+        conn, store = self._store(tmp_path)
+        self._position(conn, "p3")
+        self._entry(conn, "p3", intended=100, filled=100, limit=110.0, stop=90.0,
+                    status="partially_filled")
+        assert store.read_pending_entry_reservations() == {}
+
+    def test_terminal_orders_are_excluded(self, tmp_path):
+        conn, store = self._store(tmp_path)
+        self._position(conn, "p4")
+        self._entry(conn, "p4", intended=100, filled=0, limit=110.0, stop=90.0,
+                    status="canceled")
+        assert store.read_pending_entry_reservations() == {}
+
+    def test_market_entries_without_a_limit_are_skipped(self, tmp_path):
+        conn, store = self._store(tmp_path)
+        self._position(conn, "p5")
+        conn.execute(
+            "INSERT INTO position_lifecycle_orders("
+            "position_uid, role, client_order_id, order_type, order_class, "
+            "time_in_force, side, intended_qty, filled_qty, intended_stop_price, "
+            "origin_kind, status, created_at, last_observed_at) "
+            "VALUES ('p5', 'entry_primary', 'cid-p5', 'market', 'simple', 'day', "
+            "'buy', 10, 0, 90.0, 'strategy', 'working', "
+            "'2026-08-20T00:00:00+00:00', '2026-08-20T00:00:00+00:00')"
+        )
+        conn.commit()
+        assert store.read_pending_entry_reservations() == {}

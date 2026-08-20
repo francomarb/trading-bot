@@ -1101,12 +1101,26 @@ class TradingEngine:
         unpriced = gaps.get(strategy) or []
         if unpriced:
             # Risk that was never bounded (no stop at entry) cannot be given a
-            # number honestly. Say so rather than letting it read as zero.
+            # number honestly, so the total below is an understatement. Under
+            # enforcement that must refuse: admitting against a knowingly-low
+            # figure is unknown risk being treated as zero risk, which is the
+            # one posture this cap must never take.
             logger.warning(
                 f"[heat-cap] {strategy}: {len(unpriced)} open position(s) carry "
                 f"no recorded initial risk ({', '.join(sorted(unpriced))}) — "
-                f"heat is understated"
+                f"heat is understated; "
+                f"{'refusing entry' if settings.STRATEGY_HEAT_CAP_ENFORCED else 'allowing (observation mode)'}"
             )
+            if settings.STRATEGY_HEAT_CAP_ENFORCED:
+                _lc = self._lifecycle_counter_for(strategy)
+                if _lc is not None:
+                    _lc.risk_blocked += 1
+                self.alerts.order_rejection(
+                    decision.symbol, strategy,
+                    f"heat cap: {len(unpriced)} position(s) with unbounded risk",
+                    RejectionCode.MAX_STRATEGY_HEAT_REACHED.value,
+                )
+                return False
 
         if projected <= cap_dollars:
             logger.debug(

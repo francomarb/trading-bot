@@ -2215,20 +2215,7 @@ class TradeLogger:
     def read_open_risk_by_strategy(self) -> dict[str, float]:
         """Open initial-R per strategy, in dollars — the heat ledger.
 
-        PLAN 11.60. Risk is fixed when the bet is sized and does not change
-        afterwards, so this reads the value the position was admitted with
-        rather than re-deriving it from a current stop:
-
-            initial_risk_per_share x open_qty
-
-        `open_qty` comes from the same chronological replay used for
-        ownership restoration, so a partial exit reduces the contribution
-        pro rata and a full exit drops it, with no separate accounting.
-
-        Positions with no recorded `initial_risk_per_share` are **skipped and
-        the caller is told**, via the second element of the returned pair in
-        `read_open_risk_by_strategy_with_gaps`. A NULL there means risk was
-        never bounded (no stop at entry), which is not the same as zero.
+        PLAN 11.60. See `read_open_risk_by_strategy_with_gaps`.
         """
         totals, _ = self.read_open_risk_by_strategy_with_gaps()
         return totals
@@ -2236,25 +2223,68 @@ class TradeLogger:
     def read_open_risk_by_strategy_with_gaps(
         self,
     ) -> tuple[dict[str, float], dict[str, list[str]]]:
-        """`read_open_risk_by_strategy` plus the symbols it could not price.
+        """Open initial-R per strategy, plus the symbols that could not be priced.
 
-        Returns ``(totals_by_strategy, unpriced_symbols_by_strategy)``. A
-        symbol lands in the second map when it is open with no
-        `initial_risk_per_share` — risk that was never bounded. Callers must
-        not read its absence from the totals as zero risk.
+        Returns ``(totals_by_strategy, unpriced_symbols_by_strategy)``.
+
+        Risk is fixed when the bet is sized and does not change afterwards, so
+        this reads the value the position was admitted with rather than
+        re-deriving it from a current stop::
+
+            initial_risk_dollars x (open_qty / entry filled_qty)
+
+        **Why `initial_risk_dollars` and not `initial_risk_per_share x
+        open_qty`.** They disagree on multi-tranche fills. `initial_risk_dollars`
+        is LATEST-NON-NULL in the upsert and deliberately *follows the fills* —
+        each fill event rewrites it, and the completing fill or the cancellation
+        stands last (PR #105 review). `initial_risk_per_share` is
+        PRESERVE-FIRST-NON-NULL, so it freezes at the first tranche's price. An
+        entry that fills 40 shares at one price and 60 at another would keep the
+        first tranche's per-share risk and multiply it by the final quantity,
+        mis-stating the position's true initial risk in whichever direction the
+        second tranche moved.
+
+        The ratio pro-rates a partially exited position: `open_qty` comes from
+        the chronological replay (reduced by every sell), while the denominator
+        is the entry order's cumulative filled quantity.
+
+        A symbol lands in the gaps map when it is open but has no recorded
+        `initial_risk_dollars` — risk that was never bounded, which is not the
+        same as zero. Callers must not read its absence from the totals as no
+        risk; see `TradingEngine._heat_cap_allows`.
         """
         totals: dict[str, float] = {}
         gaps: dict[str, list[str]] = {}
-        for symbol, state in self._read_single_leg_open_state().items():
-            qty = float(state.get("open_qty") or 0.0)
-            strategy = state.get("strategy")
-            if not strategy or qty <= 0:
+        state = self._read_single_leg_open_state()
+        if not state:
+            return totals, gaps
+        try:
+            conn = self._ensure_db()
+        except sqlite3.Error:
+            return totals, gaps
+        conn.row_factory = sqlite3.Row
+
+        for symbol, position in state.items():
+            open_qty = float(position.get("open_qty") or 0.0)
+            strategy = position.get("strategy")
+            if not strategy or open_qty <= 0:
                 continue
-            rps = state.get("initial_risk_per_share")
-            if rps is None:
+            # Latest buy row for the symbol is this position's entry: the
+            # duplicate-position guard forbids pyramiding, and partial fills
+            # upsert onto the same order_id rather than appending.
+            row = conn.execute(
+                "SELECT initial_risk_dollars, filled_qty FROM trades "
+                "WHERE symbol = ? AND strategy = ? AND side = 'buy' "
+                "ORDER BY id DESC LIMIT 1",
+                (symbol, strategy),
+            ).fetchone()
+            risk = None if row is None else row["initial_risk_dollars"]
+            entry_qty = 0.0 if row is None else float(row["filled_qty"] or 0.0)
+            if risk is None or entry_qty <= 0:
                 gaps.setdefault(strategy, []).append(symbol)
                 continue
-            totals[strategy] = totals.get(strategy, 0.0) + float(rps) * qty
+            ratio = min(1.0, open_qty / entry_qty)
+            totals[strategy] = totals.get(strategy, 0.0) + float(risk) * ratio
         return totals, gaps
 
     def read_open_spread_positions(self) -> list[dict]:
