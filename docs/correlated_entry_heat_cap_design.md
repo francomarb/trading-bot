@@ -407,13 +407,17 @@ the bet size. Looking for a written stop there is looking for something that
 does not exist yet, by design. And once admitted, the position's contribution
 **is** the number it was admitted with. There is nothing to re-read.
 
-> **This is not a simplification, it is a correctness fix.** Re-deriving heat
-> from the *current* stop equals initial-R only because
-> `_repair_missing_protective_stops` happens to restore the *original* price
-> from the trade log. Its fallback `_reconstruct_missing_entry_context` need
-> not. A recomputing cap would then silently convert initial-R into
-> current-risk-to-stop — the semantics §5.1 explicitly rejected. A ledger
-> cannot drift into the wrong metric.
+> **This is not only a simplification, it is a correctness property.**
+> Re-deriving heat from whatever stop is currently in force equals initial-R
+> only while the two coincide. They normally do — the post-fill re-anchor
+> (`11.53`/`11.54`) moves the stop and `rebase_entry_stop` updates the trade
+> row to match, so `_repair_missing_protective_stops` later restores the
+> re-anchored level rather than a stale one. But `_reconstruct_missing_entry_context`,
+> the fallback for a position with **no trade-log context at all**,
+> reconstructs an "original-style" stop from the latest completed bar — a
+> level the position never actually carried. A recomputing cap would adopt it
+> and silently report current-risk-to-stop, the semantics §5.1 rejected. A
+> ledger cannot drift into the wrong metric, because it never asks.
 
 #### The ledger
 
@@ -474,7 +478,7 @@ ledger simply does not have:
 |---|---|
 | Stale `initial_risk_dollars` (`11.58` SMCI, 26% understatement) | Fixed at source by the LATEST-NON-NULL rule; read once at restart, not every cycle |
 | NULL fallback cascades | Reduced to one meaningful case — see below |
-| `_repair_missing_protective_stops` not rebasing risk | Irrelevant to heat. Still real for R-multiples feeding `11.48` and the health monitor |
+| ~~`_repair_missing_protective_stops` not rebasing risk~~ | **Not a defect — investigated 2026-08-20 and withdrawn.** Repair *should not* rebase: it restores from `read_latest_open_stop_price`, and `rebase_entry_stop` keeps that row describing the re-anchored stop. Rebase is a precondition for repair being correct, not a call repair is missing. The `11.58` quantity freeze was fixed at source by the LATEST-NON-NULL rule. Do not re-raise from `11.58`'s prose, which describes the pre-fix state |
 | A fractional residual that cannot carry a stop (QCOM 0.1, TSLA 0.39 — real, 2026-05-19) | Irrelevant. It carries the risk it was admitted with, pro-rated down. The cap never asks whether it has a stop |
 | "Block new entries while a position is unprotected" | **Withdrawn** — it had nothing to attach to, and as written would have halted the sleeve over a tenth of a share of dust |
 
