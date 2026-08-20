@@ -1,6 +1,6 @@
 # Correlated-Entry Heat Cap — Design (PLAN `11.60`)
 
-**Status:** ✅ **Design review closed — revision 5.** Level pre-registered at **4R**, shipping observation-only first. Two independent
+**Status:** ✅ **Design review closed — revision 6.** Level pre-registered at **4R**, shipping observation-only first. Two independent
 reviewers (Codex, Gemini/Antigravity), two rounds each. Every structural
 question is resolved: §5.1–§5.5 by convergence, §5.6 and its sub-questions by
 verification against the code. **The cap level is deliberately unchosen** —
@@ -16,7 +16,7 @@ Sections marked **CLOSED** were measured and rejected; do not re-propose
 without meeting the stated re-open bar. Sections marked **RESOLVED** carry
 the reasoning both reviews converged on. §7 lists what is still open.
 
-**Last updated:** 2026-08-19 (rev 5)
+**Last updated:** 2026-08-20 (rev 6)
 
 **Scope:** the `donchian_breakout` sleeve first, built as reusable per-strategy
 machinery. Slot allocation / candidate ranking is deliberately **out of scope**
@@ -369,221 +369,152 @@ alongside the existing codes.
 
 ---
 
-### 5.6 RESOLVED on verification — which store, and evaluated when
+### 5.6 RESOLVED on verification — heat is a ledger, not a query
 
-This is the one question the two reviews answered **differently**. It is
-resolved by checking the code, not by counting votes.
+This is the one question the two reviews answered **differently**, and the
+answer landed somewhere neither proposed.
 
-**Review 2 proposed** computing heat from `AccountState.open_positions` inside
-`RiskManager.evaluate()`, asserting *"No intra-cycle race conditions"* because
-`running_account` is updated after each fill.
+**Review 2 proposed** computing heat each cycle from
+`AccountState.open_positions`, asserting *"no intra-cycle race conditions"*.
+That is insufficient: Donchian's `preferred_order_type = OrderType.STOP_LIMIT`
+and the engine's own comment says these *"emit a broker-resting stop-limit
+entry"* ([`trader.py:2269`](../engine/trader.py#L2269)). The intra-cycle merge
+is gated on `if filled is not None`, so a resting order merges nothing —
+**14 of Donchian's 17 entry orders were `stop_limit`**, 9 expiring unfilled. A
+filled-position cap is blind to the burst it exists to prevent.
 
-**That is insufficient, and verifiably so.** Donchian's
-`preferred_order_type = OrderType.STOP_LIMIT`, and the engine's own comment is
-explicit:
+**Review 1 proposed** reserving worst-case risk at submission from
+`position_lifecycle_orders`. Correct, and adopted below.
 
-> `# STOP_LIMIT (Donchian today) emit a broker-resting stop-limit entry`
-> — [`engine/trader.py:2269`](../engine/trader.py#L2269)
+**But both framed heat as something to *recompute*.** It is not. Risk is
+determined once — when the bet is sized — and under initial-R semantics
+(§5.1) nothing afterwards changes it. So the cap maintains a **ledger**:
+admit, carry, adjust on lifecycle events, release.
 
-The intra-cycle merge is gated on an actual fill:
+#### Why the stop is never looked up after admission
 
-```python
-if filled is not None:                      # engine/trader.py:1606
-    updated_positions = {**running_account.open_positions, filled.symbol: filled}
-```
+The stop is an **input to sizing, not a product of order placement.** Verified
+order inside `RiskManager.evaluate()`: validation → kill switches → cooldown →
+duplicate guard → max-positions → **stop computed** (`_stop_price_for`, a pure
+ATR expression that always yields a value, rejected if non-positive or not
+below entry) → **qty sized** (`_size_position`, which consumes that stop,
+since `qty = risk_budget ÷ stop distance`) → live-size adjustment →
+`RiskDecision`.
 
-A resting stop-limit produces no fill, so nothing merges — neither
-`running_account` nor the next cycle's `AccountState.open_positions` ever sees
-it. In the live lifecycle table, **14 of Donchian's 17 entry orders were
-`stop_limit`**, 9 of which expired unfilled. So a filled-position cap is blind
-to exactly the burst it exists to prevent: N orders resting at the broker,
-zero heat counted, all triggerable by one market move.
+So at the moment the cap admits or refuses, there is no stop *order* and no
+stop *record* — but the stop *value* exists and is the number that determined
+the bet size. Looking for a written stop there is looking for something that
+does not exist yet, by design. And once admitted, the position's contribution
+**is** the number it was admitted with. There is nothing to re-read.
 
-**Review 1's model is the correct one.** Reserve worst-case risk at
-submission; replace the reservation with actual risk on fill; release on
-cancel or expiry.
+> **This is not a simplification, it is a correctness fix.** Re-deriving heat
+> from the *current* stop equals initial-R only because
+> `_repair_missing_protective_stops` happens to restore the *original* price
+> from the trade log. Its fallback `_reconstruct_missing_entry_context` need
+> not. A recomputing cap would then silently convert initial-R into
+> current-risk-to-stop — the semantics §5.1 explicitly rejected. A ledger
+> cannot drift into the wrong metric.
 
-**Risk is knowable before anything is written, because the stop is an input
-to sizing rather than a product of order placement.** Inside
-`RiskManager.evaluate()` the order is: validation → kill switches → cooldown →
-duplicate guard → max-positions → **stop computed** (`_stop_price_for`, from
-ATR) → **qty sized** (`_size_position`, which consumes that stop, since
-`qty = risk_budget ÷ stop distance`) → live-size adjustment. Only then is the
-`RiskDecision` returned.
+#### The ledger
 
-So at the moment the cap must admit or refuse a candidate there is no stop
-*order* and no stop *record* — but the stop *value* exists, and it is the very
-number that determined the bet size. Looking for a written stop at that stage
-is looking for something that does not exist yet, by design.
-
-The same quantity simply changes custodian as the order becomes real:
-
-| Stage | Authoritative source | Why |
-|---|---|---|
-| **Candidate**, inside `evaluate()` | Computed in memory from the decision being built | Nothing is written yet; there is nothing to reconcile against |
-| Submitted / resting | Substrate `intended_qty`, `intended_limit_price`, `intended_stop_price` | Same numbers, now persisted. The broker has no protective stop yet — it is an OTO child |
-| Filled | Broker: `(avg_entry_price − resting stop_price) × qty` | A written stop now exists and is the truth |
-| Exited | — | Released |
-
-> **Consistency requirement.** The candidate check must use the **worst-case
-> entry price** — `RiskDecision.entry_max_price`, documented as *"PLAN 11.32
-> entry price cap: worst-case fill ceiling (BUY)"* — **not** `reference_price`.
-> A Donchian `STOP_LIMIT` can fill above reference, so admitting on reference
-> and then reserving on limit means the cap approves one number and books a
-> larger one. It would breach itself through its own accounting. **The number
-> used to admit must equal the number reserved.**
-
-| Event | Heat contribution |
+| Event | Effect on the sleeve's heat |
 |---|---|
-| Entry submitted (resting) | **Reserved:** `intended_qty × (intended_limit_price − intended_stop_price)`. A buy stop-limit cannot fill above its limit, so this is the true worst case |
-| Entry **fully** fills | Reservation **replaced** by actual `(entry_fill − initial_stop) × held_qty` |
-| Entry **partially** fills | **Both components held at once:** actual risk on the filled shares **+** worst-case reservation on the shares still resting |
-| Entry cancels / expires DAY | Release **only the unfilled portion's** reservation. Any filled shares keep their actual risk — they are a position now |
-| Position **partially** exits | Reduce heat **pro rata to the exited quantity**, not to zero |
-| Position fully exits | Contribution **released** |
+| **Candidate admitted** (in `evaluate()`, post-sizing) | `+ (worst-case entry − stop_price) × qty`, computed from the decision being built |
+| Entry submitted (resting) | Reservation persisted as `intended_qty × (intended_limit_price − intended_stop_price)` |
+| Entry **fully** fills | Reservation becomes actual fill-to-stop risk |
+| Entry **partially** fills | Actual risk on filled shares **+** reservation still standing on the unfilled remainder |
+| Entry cancels / expires DAY | Release **only the unfilled portion**; filled shares keep their risk |
+| Position **partially** exits | Reduce **pro rata** to the exited quantity |
+| Position fully exits, or is closed externally | Release |
 
-**Held quantity has its own authority.** Use `position_lifecycle.current_qty`
-(the parent row), **not** the entry order's `filled_qty`. The two agree only
-until the first partial exit, fractional residual cleanup, or reduction — after
-which `filled_qty` describes what was once bought and `current_qty` describes
-what is still at risk. Only the latter belongs in a heat figure.
+> **Consistency requirement.** Admission must use the **worst-case entry
+> price** — `RiskDecision.entry_max_price`, documented as *"PLAN 11.32 entry
+> price cap: worst-case fill ceiling (BUY)"* — not `reference_price`. A
+> `STOP_LIMIT` can fill above reference, so admitting on reference while
+> reserving on limit means the cap approves one number and books a larger one.
+> **The number used to admit must equal the number reserved.**
 
-*Status of this path:* anticipatory, not a fix for an observed bug. All 142
-rows in the live trade log are `status='filled'`; no equity entry has partially
-filled yet. But `partial` is a supported state the reporting layer already
-handles (`read_realized_pnl_events_for_day` counts `status IN ('filled',
-'partial')`), the spread path already logs partial closes, and fractional
-quantities are routine. A cap that mis-handles the first partial fill would
-under- or over-count silently, so the accounting belongs in v1 even though it
-is currently unexercised.
+#### Rebuilding the ledger after a restart — the only read
 
-**Store.** [`position_lifecycle_orders`](../reporting/logger.py) is
-authoritative for reservations; filled trade rows remain the audit trail for
-actual initial risk. This is sound **by construction, not by convention**:
-`_lifecycle_orders_insert_pending` runs *before* broker submit, and a failure
-aborts the submit ("aborting submit + rolling back position lock"). A broker
-order therefore cannot exist without a preceding lifecycle row. The rows
-already carry `intended_qty`, `intended_limit_price`, `intended_stop_price`,
-`status`, and the protective stop is known at submission because it is an OTO
-bracket child.
+An in-memory ledger is lost on recycle, and nothing in the engine restores
+per-position risk today (verified: `_restore_ownership_from_db`,
+`_restore_entry_prices_from_db`, `_restore_allocator_pnl_from_db` — no risk
+equivalent). This is the one place the cap reads rather than carries, and the
+sources already exist:
 
-#### 5.6.1 MARKET entries — same state machine, weaker guarantee
-
-3 of 17 Donchian entries were `market` (the fractional path). **RESOLVED —
-both reviews concur:** run them through the identical reservation state
-machine rather than a special branch. Reserve at submit, transition to actual
-risk on fill, release on rejection. Because a market entry fills in the same
-cycle, reservation and replacement collapse into one step.
-
-**But the two reservations are not equally strong, and the design must not
-pretend otherwise:**
-
-| Entry type | Reservation | Guarantee |
-|---|---|---|
-| `stop_limit` | `qty × (limit − stop)` | **True bound.** A buy stop-limit cannot fill above its limit |
-| `market` | `qty × (reference_price − stop)` | **Estimate.** No price ceiling exists; the fill can be worse than reference |
-
-The market reservation can therefore under-reserve by the slippage. The
-exposure is sub-second (it is replaced by actual risk in the same cycle) and
-slippage-sized, so this is acceptable — but it is an accepted approximation,
-not a guarantee, and should be labelled as one.
-
-#### 5.6.2 Read risk from the broker, not from stored fields
-
-**The broker is authoritative for filled positions.** Heat per open position is
-
-```
-(position.avg_entry_price − resting_stop_order.stop_price) × position.qty
-```
-
-Every input comes from the `sync_with_broker()` snapshot the engine already
-takes each cycle — `account.open_positions` for entry price and quantity,
-`open_orders` for the live protective stop. **No database read is involved.**
-
-This is the project's own durable position — *broker state is source of
-truth* — applied to a number that had been sourced from a local mirror of it.
-
-**Verified 2026-08-19.** Broker-derived heat reproduces the DB-derived figure
-to the cent on all six open Donchian positions, totalling 1.99% of equity
-either way. More importantly it is **immune to the failure class that made
-§5.6.2 necessary in the first place**: SMCI reads 410.99 from the broker — the
-correct figure — where the stored `initial_risk_dollars` had frozen at a 26%
-understatement (`11.58`). A derived value cannot go stale because there is
-nothing to keep in sync.
-
-Three properties fall out for free:
-
-| | |
+| Stage at restart | Source |
 |---|---|
-| **Partial exits** | Handled automatically. `avg_entry_price` is the cost basis of the *remaining* shares and `qty` is the *remaining* quantity, so the product tracks the position down without special accounting |
-| **Repaired stops** | Handled correctly. If a stop was rebuilt at a different level, the broker shows the level actually in force — which is the honest risk, and exactly what `_repair_missing_protective_stops` leaves stale in the stored field |
-| **Write races** | Eliminated. Both `11.58` races were disagreements between two writers of a stored number. There is no stored number |
+| Filled positions | `trades.initial_risk_dollars` on the entry row |
+| Held quantity | `position_lifecycle.current_qty` ÷ `entry_qty` (pro-rates partial exits) |
+| Resting entries | `position_lifecycle_orders.intended_*` — the trade log is NULL here **by design**, since nothing filled |
 
-**The stored fields become a cross-check, not a source.** Compute from the
-broker, compare against `initial_risk_dollars`, log on disagreement. That
-converts a silent corruption into an observable one and gives `11.58` a
-standing regression detector rather than a third incident.
+`initial_risk_dollars` is the right source and is **already maintained as a
+ledger value**: computed as `|actual fill − initial_stop| × cumulative filled
+qty`, written LATEST-NON-NULL so each successive fill rewrites it, with the
+completing fill or the cancellation standing last. That is the `11.58` fix
+(PR #105 review), and it is why the field now tracks reality rather than
+freezing at the first partial.
 
-**What still requires local state — and why it is not the same problem:**
+**Verified 2026-08-19 — three independent constructions agree at 1.99% of
+equity** across the six open Donchian positions: DB-derived (trade-log fill
+price × broker stop), broker-derived (`avg_entry_price` × resting stop), and
+the ledger (`initial_risk_dollars` pro-rated by `current_qty ÷ entry_qty`).
+The ledger needs no stop lookup at all.
 
-1. **Attribution.** The broker does not know which strategy owns a position.
-   That stays with the engine's ownership map, as it already is for every
-   other per-strategy control.
-2. **Reservations for resting entries.** A resting `STOP_LIMIT` entry exposes
-   its `qty`, `limit_price` and trigger via `OpenOrder` — but its protective
-   stop is an **OTO bracket child that does not exist at the broker until the
-   parent fills**. So the intended stop for an unfilled entry must still come
-   from `position_lifecycle_orders.intended_stop_price`. The broker cannot
-   answer a question about an order it has not created yet.
+Closure is tracked, so the ledger does not silently drift: `position_lifecycle`
+carries `closed` (36), `canceled` (29) and **`external_closed` (6)** — an
+operator closing a position by hand is observed, not missed.
 
-So the authority splits cleanly by lifecycle stage: **substrate before fill,
-broker after.**
+#### What the ledger model removes
 
-**What "risk cannot be read" now means.** Not a data-quality cascade — a
-filled position with **no resting stop order at the broker**, i.e. one that is
-genuinely unprotected. That is a protection incident, and
-`_repair_missing_protective_stops` already owns it and runs every cycle.
+Framing heat as a per-cycle query dragged in a chain of problems that the
+ledger simply does not have:
 
-> **RESOLVED — operator decision, 2026-08-19: block new entries until the stop
-> is restored.** During the window between a protective stop going missing and
-> `_repair_missing_protective_stops` rebuilding it, the sleeve takes no new
-> entries. Not "carry the last known risk", not "estimate" — an unprotected
-> position is a reason to stop adding risk, not to keep sizing against a
-> guess. The window is short (repair runs every cycle, ≤5 min) and the
-> condition is rare, so the cost is small and the alternative is relaxing a
-> risk control during a protection incident.
->
-> This also fails in the right direction: the refusal is loud and logged,
-> where an estimate would be silent.
+| Problem | Status under the ledger |
+|---|---|
+| Stale `initial_risk_dollars` (`11.58` SMCI, 26% understatement) | Fixed at source by the LATEST-NON-NULL rule; read once at restart, not every cycle |
+| NULL fallback cascades | Reduced to one meaningful case — see below |
+| `_repair_missing_protective_stops` not rebasing risk | Irrelevant to heat. Still real for R-multiples feeding `11.48` and the health monitor |
+| A fractional residual that cannot carry a stop (QCOM 0.1, TSLA 0.39 — real, 2026-05-19) | Irrelevant. It carries the risk it was admitted with, pro-rated down. The cap never asks whether it has a stop |
+| "Block new entries while a position is unprotected" | **Withdrawn** — it had nothing to attach to, and as written would have halted the sleeve over a tenth of a share of dust |
 
-#### 5.6.3 Restart — the reconciliation already exists
+**The one NULL that still means something.** `initial_risk_dollars` is NULL
+when no stop existed at entry — the logger's own reasoning: *"you cannot
+express a loss in units of a risk that was never bounded."* That is a position
+whose risk was never **defined**, which is different from one whose stop is
+momentarily missing. Both live instances are historical and both causes are
+fixed (PWR 2026-05-01, pre-substrate; WYFI 2026-06-18, the `11.58(b)`
+zero-stop bug). If one recurs, the position cannot be given a heat number
+honestly, and the cap should refuse new entries while it is open rather than
+invent one.
 
-**RESOLVED, and smaller than it looks.** Review 2 called explicit startup
-reconciliation against broker open orders "required", implying new machinery.
-It is already built: `_reconcile_substrate_via_rest` runs at **both** startup
-(P-3) and per cycle (P-2), takes substrate non-terminal rows, checks them
-against `snapshot.open_orders`, and advances any that terminated while the bot
-was down. It ran **4 times at the 2026-08-19 07:32 restart**, reconciling
-exactly the expired DAY entry orders this design would otherwise have carried
-as live reservations.
+#### MARKET entries — same ledger, weaker admission guarantee
 
-So the requirement is not "build reconciliation" but an **ordering
-constraint**:
+3 of 17 Donchian entries were `market` (the fractional path). Same ledger, no
+special branch: admitted, reserved, and settled in the same cycle because the
+fill is immediate. But the two admissions differ in strength:
 
-> Derive heat from substrate rows only **after** `_reconcile_substrate_via_rest`
-> has run. Compute it before, and the cap counts reservations for orders that
-> died overnight — blocking entries against risk that no longer exists.
+| Entry type | Admission figure | Guarantee |
+|---|---|---|
+| `stop_limit` | `qty × (limit − stop)` | **True bound.** Cannot fill above its limit |
+| `market` | `qty × (reference − stop)` | **Estimate.** No price ceiling; the fill can be worse |
 
-Do not build a parallel reconciliation pass for the heat cap.
+The market figure can under-admit by the slippage. Exposure is sub-second and
+slippage-sized, so it is accepted — as an approximation, explicitly, not
+labelled a bound alongside one that is.
 
-**Precondition still to verify before shipping:** a protective-stop substrate
-row was once recorded stuck `pending` while its broker order was live. The
-insert-before-submit ordering makes the *entry* path sound, and the
-reconciliation pass covers the restart window, but a silently missing
-reservation would still make the cap under-count. State this as verified, not
-inherited.
+#### Restart reconciliation already exists — mind the ordering
 
----
+`_reconcile_substrate_via_rest` runs at **both** startup (P-3) and per cycle
+(P-2), checking substrate non-terminal rows against `snapshot.open_orders` and
+advancing any that terminated while the bot was down. It ran **4 times at the
+2026-08-19 07:32 restart**, reconciling exactly the expired DAY entry orders
+this design would otherwise rebuild as live reservations.
+
+> Rebuild the ledger **after** that pass has run. Before it, the cap would
+> carry reservations for orders that died overnight and refuse entries against
+> risk that no longer exists. Do not build a parallel reconciliation.
+
 
 ## 6. Acceptance — measurement before a level
 
@@ -728,9 +659,12 @@ Two things remain, and only one of them is a design question:
    2026-08-19 before any measurement run, and shipping **observation-only**
    first (§6 Step 3a). Revisable, but as a recorded policy change rather than
    a finding.
-2. ~~The last sub-decision~~ ✅ **Decided: block new entries while a managed
-   position is unprotected** (§5.6.2). All design questions are now closed;
-   what remains is implementation against §6.
+2. ~~The last sub-decision~~ ✅ **Withdrawn, not decided.** Reframing heat as
+   a ledger (§5.6) removed the question: the cap never asks whether an open
+   position currently has a stop, so "block while unprotected" had nothing to
+   attach to. The one residual case — a position whose risk was never
+   *bounded*, i.e. NULL `initial_risk_dollars` — is handled in §5.6. All
+   design questions are closed; what remains is implementation against §6.
 
 Then implementation, whose acceptance is §6 Steps 1, 3 and 4.
 
