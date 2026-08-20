@@ -32,6 +32,8 @@ import json
 import os
 import time
 import sqlite3
+
+from loguru import logger
 from dataclasses import replace
 from datetime import datetime, timedelta, timezone
 from types import SimpleNamespace
@@ -7051,3 +7053,166 @@ class TestBrokerEquityPathReconcile:
 
         assert engine.reconcile_intraday_drawdown_from_broker("not-a-date") == pytest.approx(1_000.0)
         broker.get_intraday_equity_path.assert_not_called()
+
+
+# ── TestHeatCapObservation ──────────────────────────────────────────────────
+
+
+class TestHeatCapObservation:
+    """
+    PLAN 11.60, shipped observation-only: the cap computes and logs but
+    refuses nothing until `STRATEGY_HEAT_CAP_ENFORCED` is flipped.
+    """
+
+    def _decision(self, qty=10, stop=90.0, strategy="donchian_breakout"):
+        from risk.manager import RiskDecision, Side
+
+        return RiskDecision(
+            symbol="AAPL", side=Side.BUY, qty=qty,
+            entry_reference_price=100.0, stop_price=stop,
+            strategy_name=strategy, reason="test",
+            order_type=OrderType.STOP_LIMIT,
+            entry_trigger_price=100.0, limit_price=110.0,
+        )
+        # candidate risk = (limit 110 - stop 90) x qty 10 = $200
+
+    def _wire(self, engine, *, filled=0.0, pending=0.0, equity=100_000.0):
+        engine._last_cycle_equity = equity
+        engine.trade_logger.read_open_risk_by_strategy_with_gaps = (
+            lambda: ({"donchian_breakout": filled}, {})
+        )
+        engine.lifecycle_orders_store = MagicMock()
+        engine.lifecycle_orders_store.read_pending_entry_reservations = (
+            lambda: {"donchian_breakout": pending}
+        )
+
+    def test_strategy_without_a_cap_is_unconstrained(self, engine_factory, monkeypatch):
+        engine, _ = engine_factory()
+        self._wire(engine, filled=99_999.0)
+        assert engine._heat_cap_allows(self._decision(strategy="sma_crossover")) is True
+
+    def test_under_the_cap_allows(self, engine_factory):
+        engine, _ = engine_factory()
+        # cap = 1.6% of 100k = 1600; filled 500 + candidate 100 = 600
+        self._wire(engine, filled=500.0)
+        assert engine._heat_cap_allows(self._decision()) is True
+
+    def test_over_the_cap_still_allows_in_observation_mode(self, engine_factory):
+        """The whole point of shipping this way: it must not block."""
+        engine, _ = engine_factory()
+        self._wire(engine, filled=1_590.0)   # + candidate 100 -> 1690 > 1600
+        assert engine._heat_cap_allows(self._decision()) is True
+
+    def test_over_the_cap_logs_a_structured_record(self, engine_factory):
+        engine, _ = engine_factory()
+        self._wire(engine, filled=1_000.0, pending=550.0)   # +100 -> 1650 > 1600
+        messages: list[str] = []
+        sink = logger.add(messages.append, level="WARNING")
+        try:
+            engine._heat_cap_allows(self._decision())
+        finally:
+            logger.remove(sink)
+        logged = "".join(messages)
+        assert "OBSERVED" in logged
+        for field in ("filled_heat", "pending_reserved", "candidate",
+                      "projected", "cap=", "entry_source"):
+            assert field in logged, f"{field} missing from the refusal record"
+
+    def test_pending_reservations_count_toward_heat(self, engine_factory):
+        """A resting STOP_LIMIT burst is the case the cap exists for. If
+        reservations were ignored, this would sit under the cap."""
+        engine, _ = engine_factory()
+        self._wire(engine, filled=0.0, pending=1_550.0)   # +100 -> 1650 > 1600
+        messages: list[str] = []
+        sink = logger.add(messages.append, level="WARNING")
+        try:
+            engine._heat_cap_allows(self._decision())
+        finally:
+            logger.remove(sink)
+        assert "OBSERVED" in "".join(messages)
+
+    def test_enforced_mode_refuses(self, engine_factory, monkeypatch):
+        from config import settings
+
+        engine, _ = engine_factory()
+        monkeypatch.setattr(settings, "STRATEGY_HEAT_CAP_ENFORCED", True)
+        self._wire(engine, filled=1_590.0)
+        assert engine._heat_cap_allows(self._decision()) is False
+
+    def test_unreadable_heat_does_not_read_as_zero(self, engine_factory, monkeypatch):
+        """Degraded data must not relax the cap. Observation still allows,
+        but enforcement refuses rather than treating unknown as no risk."""
+        from config import settings
+
+        engine, _ = engine_factory()
+        self._wire(engine)
+        def boom():
+            raise sqlite3.Error("db down")
+        engine.trade_logger.read_open_risk_by_strategy_with_gaps = boom
+
+        assert engine._heat_cap_allows(self._decision()) is True    # observation
+        monkeypatch.setattr(settings, "STRATEGY_HEAT_CAP_ENFORCED", True)
+        assert engine._heat_cap_allows(self._decision()) is False   # enforced
+
+    def test_a_real_database_failure_refuses_under_enforcement(
+        self, engine_factory, monkeypatch,
+    ):
+        """The test above patches the reader itself, so it cannot catch a
+        failure the reader *swallows*. This one breaks the database
+        underneath a real `TradeLogger` and drives the real reader.
+
+        The bug it guards: the shared replay helper absorbs a failed
+        `_ensure_db()` into an empty result, so an unavailable trade DB
+        would present as zero open heat and admit the entry.
+        """
+        from config import settings
+        from reporting.logger import TradeLogger
+
+        engine, _ = engine_factory()
+        engine._last_cycle_equity = 100_000.0
+        engine.lifecycle_orders_store = MagicMock()
+        engine.lifecycle_orders_store.read_pending_entry_reservations = lambda: {}
+
+        real_logger = TradeLogger(path=str(settings.TRADE_LOG_DB))
+        def _boom():
+            raise sqlite3.OperationalError("unable to open database file")
+        real_logger._ensure_db = _boom
+        engine.trade_logger = real_logger
+
+        assert engine._heat_cap_allows(self._decision()) is True     # observation
+        monkeypatch.setattr(settings, "STRATEGY_HEAT_CAP_ENFORCED", True)
+        assert engine._heat_cap_allows(self._decision()) is False    # enforced
+
+    def test_unbounded_positions_refuse_under_enforcement(
+        self, engine_factory, monkeypatch,
+    ):
+        """Unknown risk must not become zero risk. A position with no
+        recorded initial risk makes the total a knowing understatement, so
+        enforcement must refuse rather than admit against it. Observation
+        continues, since its whole contract is not to block."""
+        from config import settings
+
+        engine, _ = engine_factory()
+        self._wire(engine, filled=100.0)   # far under the 1600 cap
+        engine.trade_logger.read_open_risk_by_strategy_with_gaps = (
+            lambda: ({"donchian_breakout": 100.0}, {"donchian_breakout": ["WYFI"]})
+        )
+
+        assert engine._heat_cap_allows(self._decision()) is True     # observation
+        monkeypatch.setattr(settings, "STRATEGY_HEAT_CAP_ENFORCED", True)
+        assert engine._heat_cap_allows(self._decision()) is False    # enforced
+
+    def test_unbounded_positions_are_flagged_not_silently_dropped(self, engine_factory):
+        engine, _ = engine_factory()
+        self._wire(engine, filled=100.0)
+        engine.trade_logger.read_open_risk_by_strategy_with_gaps = (
+            lambda: ({"donchian_breakout": 100.0}, {"donchian_breakout": ["WYFI"]})
+        )
+        messages: list[str] = []
+        sink = logger.add(messages.append, level="WARNING")
+        try:
+            engine._heat_cap_allows(self._decision())
+        finally:
+            logger.remove(sink)
+        logged = "".join(messages)
+        assert "WYFI" in logged and "understated" in logged

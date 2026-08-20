@@ -689,6 +689,32 @@ STRATEGY_ALLOCATIONS: dict[str, dict] = {
     },
 }
 
+# ── Correlated-entry heat cap (PLAN 11.60) ──────────────────────────────────
+# "Heat" is total open risk carried at once: the sum, across a sleeve's open
+# positions and its resting entry reservations, of what would be lost if every
+# one resolved at its stop. Breakout entries fire market-wide together, so they
+# are not independent bets — see docs/correlated_entry_heat_cap_design.md.
+#
+# Denominated in ACCOUNT EQUITY, not sleeve budget: per-trade risk already is
+# (`equity x risk_per_trade_pct`), and a sleeve budget stretches when other
+# sleeves are idle. Capital can stretch; risk appetite should not.
+#
+# Opt-in per strategy. A strategy without an entry is unconstrained by heat
+# (still bounded by its sleeve budget and hard_max_positions). SMA crossover is
+# deliberately absent: its entries are individually-timed MA crosses that do
+# not arrive in bursts.
+#
+# STRATEGY_HEAT_CAP_ENFORCED=False ships this OBSERVATION-ONLY: heat is
+# computed and every would-be refusal is logged, but nothing is blocked. Same
+# posture as PAPER_STRATEGY_DRAWDOWN_GATE_ENABLED, and for the same reason —
+# accumulate evidence on what the level costs before it costs a trade. The
+# level below was pre-registered before any measurement run; changing it is a
+# recorded policy decision, not a backtest output.
+STRATEGY_MAX_OPEN_HEAT_PCT: dict[str, float] = {
+    "donchian_breakout": 0.016,   # 4R at the 0.40% per-trade risk target
+}
+STRATEGY_HEAT_CAP_ENFORCED: bool = False
+
 ALLOCATOR_STRETCH_UTILIZATION_THRESHOLD = 0.80
 ALLOCATOR_DEFAULT_STRETCH_PCT = 0.15
 MIN_TRADE_NOTIONAL = 100.0      # Reject entries if sleeve available < this

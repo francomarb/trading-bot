@@ -5270,3 +5270,144 @@ class TestRiskBasisQty:
         assert "risk_basis_qty(" in entry_src
         assert "risk_basis_qty(" in rebase_src
         assert "filled_qty or result.requested_qty" not in entry_src
+
+
+# ── TestOpenRiskLedger ──────────────────────────────────────────────────────
+
+
+def _entry_row(*, symbol, strategy, qty, fill, stop, order_id, ird, seq=1,
+               requested=None):
+    """One entry row as the logger upserts it.
+
+    `requested_qty` is an identity column and never changes across the
+    order's lifetime; `filled_qty` is what grows tranche by tranche, and
+    `initial_risk_dollars` is rewritten on each fill event.
+    """
+    return TradeRecord(
+        timestamp=f"2026-08-0{seq}T13:30:00+00:00",
+        symbol=symbol, side="buy", qty=qty, avg_fill_price=fill,
+        order_id=order_id, strategy=strategy, reason="entry",
+        stop_price=stop, entry_reference_price=fill,
+        modeled_slippage_bps=0.0, realized_slippage_bps=0.0,
+        order_type="stop_limit", status="filled",
+        requested_qty=requested if requested is not None else qty,
+        filled_qty=qty,
+        initial_stop_loss=stop,
+        initial_risk_per_share=abs(fill - stop),
+        initial_risk_dollars=ird,
+        position_type="single_leg",
+    )
+
+
+class TestOpenRiskLedger:
+    """PLAN 11.60 heat ledger — `read_open_risk_by_strategy_with_gaps`."""
+
+    def test_multi_tranche_fill_uses_the_maintained_aggregate(self, tmp_csv):
+        """The defect this guards: `initial_risk_per_share` is
+        PRESERVE-FIRST-NON-NULL and freezes at the first tranche's price,
+        while `initial_risk_dollars` is LATEST-NON-NULL and follows the
+        fills. Reading per-share × final qty mis-states the position."""
+        tl = TradeLogger(path=tmp_csv)
+        # One order for 100. Tranche 1 fills 40 @ 100 (stop 90 -> rps 10).
+        tl.log(_entry_row(symbol="AAA", strategy="donchian_breakout", qty=40,
+                          requested=100, fill=100.0, stop=90.0,
+                          order_id="e1", ird=400.0))
+        # Tranche 2 completes it; cumulative 100 @ a 102 average -> ird 1200.
+        tl.log(_entry_row(symbol="AAA", strategy="donchian_breakout", qty=100,
+                          requested=100, fill=102.0, stop=90.0,
+                          order_id="e1", ird=1200.0, seq=2))
+
+        totals, gaps = tl.read_open_risk_by_strategy_with_gaps()
+
+        assert gaps == {}
+        # Correct: the maintained aggregate, 1200.
+        # The frozen-per-share bug would give 10 (tranche 1) x 100 = 1000.
+        assert totals["donchian_breakout"] == pytest.approx(1200.0)
+
+    def test_partial_exit_pro_rates_the_contribution(self, tmp_csv):
+        tl = TradeLogger(path=tmp_csv)
+        tl.log(_entry_row(symbol="BBB", strategy="donchian_breakout", qty=100,
+                          fill=100.0, stop=90.0, order_id="e2", ird=1000.0))
+        # Sell 40 of 100 — 60% of the position remains.
+        tl.log(TradeRecord(
+            timestamp="2026-08-05T15:00:00+00:00",
+            symbol="BBB", side="sell", qty=40, avg_fill_price=105.0,
+            order_id="x2", strategy="donchian_breakout", reason="partial exit",
+            stop_price=0.0, entry_reference_price=100.0,
+            modeled_slippage_bps=0.0, realized_slippage_bps=0.0,
+            order_type="market", status="filled",
+            requested_qty=40, filled_qty=40, realized_pnl=200.0,
+            entry_timestamp="2026-08-01T13:30:00+00:00",
+            exit_timestamp="2026-08-05T15:00:00+00:00",
+            position_type="single_leg",
+        ))
+
+        totals, _ = tl.read_open_risk_by_strategy_with_gaps()
+        assert totals["donchian_breakout"] == pytest.approx(600.0)
+
+    def test_position_without_recorded_risk_is_reported_as_a_gap(self, tmp_csv):
+        """Risk that was never bounded must not read as zero."""
+        tl = TradeLogger(path=tmp_csv)
+        row = _entry_row(symbol="CCC", strategy="donchian_breakout", qty=10,
+                         fill=100.0, stop=90.0, order_id="e3", ird=None)
+        tl.log(row)
+
+        totals, gaps = tl.read_open_risk_by_strategy_with_gaps()
+        assert "donchian_breakout" not in totals
+        assert gaps["donchian_breakout"] == ["CCC"]
+
+    def test_database_failure_propagates_rather_than_reading_as_zero(self, tmp_csv):
+        """The bug this guards: the shared replay helper swallows a failed
+        `_ensure_db()` and returns {}, which is indistinguishable from "no
+        open positions". A caller enforcing a risk cap would then read an
+        unavailable database as zero open heat and admit the entry.
+
+        This reader must let the failure reach the caller instead.
+        """
+        tl = TradeLogger(path=tmp_csv)
+        tl.log(_entry_row(symbol="EEE", strategy="donchian_breakout", qty=10,
+                          fill=100.0, stop=90.0, order_id="e5", ird=100.0))
+        # Sanity: it reads fine before the database is broken.
+        assert tl.read_open_risk_by_strategy_with_gaps()[0] == {
+            "donchian_breakout": pytest.approx(100.0)
+        }
+
+        def _boom():
+            raise sqlite3.OperationalError("unable to open database file")
+
+        tl._ensure_db = _boom
+        with pytest.raises(sqlite3.OperationalError):
+            tl.read_open_risk_by_strategy_with_gaps()
+
+    def test_replay_query_failure_also_propagates(self, tmp_csv):
+        """Same posture one layer down: a broken SELECT inside the replay
+        must not be absorbed into an empty, healthy-looking result."""
+        tl = TradeLogger(path=tmp_csv)
+        tl.log(_entry_row(symbol="FFF", strategy="donchian_breakout", qty=10,
+                          fill=100.0, stop=90.0, order_id="e6", ird=100.0))
+
+        def _boom():
+            raise sqlite3.OperationalError("no such table: trades")
+
+        tl._read_single_leg_open_state = _boom
+        with pytest.raises(sqlite3.OperationalError):
+            tl.read_open_risk_by_strategy_with_gaps()
+
+    def test_fully_exited_position_contributes_nothing(self, tmp_csv):
+        tl = TradeLogger(path=tmp_csv)
+        tl.log(_entry_row(symbol="DDD", strategy="donchian_breakout", qty=10,
+                          fill=100.0, stop=90.0, order_id="e4", ird=100.0))
+        tl.log(TradeRecord(
+            timestamp="2026-08-05T15:00:00+00:00",
+            symbol="DDD", side="sell", qty=10, avg_fill_price=105.0,
+            order_id="x4", strategy="donchian_breakout", reason="exit",
+            stop_price=0.0, entry_reference_price=100.0,
+            modeled_slippage_bps=0.0, realized_slippage_bps=0.0,
+            order_type="market", status="filled",
+            requested_qty=10, filled_qty=10, realized_pnl=50.0,
+            entry_timestamp="2026-08-01T13:30:00+00:00",
+            exit_timestamp="2026-08-05T15:00:00+00:00",
+            position_type="single_leg",
+        ))
+        totals, gaps = tl.read_open_risk_by_strategy_with_gaps()
+        assert totals == {} and gaps == {}
