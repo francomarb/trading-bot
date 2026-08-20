@@ -514,14 +514,17 @@ filled position with **no resting stop order at the broker**, i.e. one that is
 genuinely unprotected. That is a protection incident, and
 `_repair_missing_protective_stops` already owns it and runs every cycle.
 
-> **⚠️ The one open sub-decision, now narrower.** During the window between a
-> stop going missing and repair rebuilding it, what does the cap do with that
-> position? Counting it as zero heat is unacceptable — it would relax the cap
-> during a protection incident, the worst possible moment. The candidates are:
-> carry its last known risk, carry a conservative estimate, or treat the
-> incident as blocking new entries until protection is restored. The third is
-> the most conservative and arguably the most honest — an unprotected position
-> is a reason to stop adding risk, not to keep sizing against a guess.
+> **RESOLVED — operator decision, 2026-08-19: block new entries until the stop
+> is restored.** During the window between a protective stop going missing and
+> `_repair_missing_protective_stops` rebuilding it, the sleeve takes no new
+> entries. Not "carry the last known risk", not "estimate" — an unprotected
+> position is a reason to stop adding risk, not to keep sizing against a
+> guess. The window is short (repair runs every cycle, ≤5 min) and the
+> condition is rare, so the cost is small and the alternative is relaxing a
+> risk control during a protection incident.
+>
+> This also fails in the right direction: the refusal is loud and logged,
+> where an estimate would be silent.
 
 #### 5.6.3 Restart — the reconciliation already exists
 
@@ -695,11 +698,9 @@ Two things remain, and only one of them is a design question:
    2026-08-19 before any measurement run, and shipping **observation-only**
    first (§6 Step 3a). Revisable, but as a recorded policy change rather than
    a finding.
-2. **One open sub-decision** (§5.6.2), narrowed by sourcing risk from the
-   broker: during the window between a protective stop going missing and
-   `_repair_missing_protective_stops` rebuilding it, does the cap carry that
-   position's last known risk, a conservative estimate, or treat the
-   protection incident as blocking new entries until the stop is restored?
+2. ~~The last sub-decision~~ ✅ **Decided: block new entries while a managed
+   position is unprotected** (§5.6.2). All design questions are now closed;
+   what remains is implementation against §6.
 
 Then implementation, whose acceptance is §6 Steps 1, 3 and 4.
 
