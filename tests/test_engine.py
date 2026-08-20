@@ -7154,6 +7154,35 @@ class TestHeatCapObservation:
         monkeypatch.setattr(settings, "STRATEGY_HEAT_CAP_ENFORCED", True)
         assert engine._heat_cap_allows(self._decision()) is False   # enforced
 
+    def test_a_real_database_failure_refuses_under_enforcement(
+        self, engine_factory, monkeypatch,
+    ):
+        """The test above patches the reader itself, so it cannot catch a
+        failure the reader *swallows*. This one breaks the database
+        underneath a real `TradeLogger` and drives the real reader.
+
+        The bug it guards: the shared replay helper absorbs a failed
+        `_ensure_db()` into an empty result, so an unavailable trade DB
+        would present as zero open heat and admit the entry.
+        """
+        from config import settings
+        from reporting.logger import TradeLogger
+
+        engine, _ = engine_factory()
+        engine._last_cycle_equity = 100_000.0
+        engine.lifecycle_orders_store = MagicMock()
+        engine.lifecycle_orders_store.read_pending_entry_reservations = lambda: {}
+
+        real_logger = TradeLogger(path=str(settings.TRADE_LOG_DB))
+        def _boom():
+            raise sqlite3.OperationalError("unable to open database file")
+        real_logger._ensure_db = _boom
+        engine.trade_logger = real_logger
+
+        assert engine._heat_cap_allows(self._decision()) is True     # observation
+        monkeypatch.setattr(settings, "STRATEGY_HEAT_CAP_ENFORCED", True)
+        assert engine._heat_cap_allows(self._decision()) is False    # enforced
+
     def test_unbounded_positions_refuse_under_enforcement(
         self, engine_factory, monkeypatch,
     ):

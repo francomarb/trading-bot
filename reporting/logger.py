@@ -2255,14 +2255,26 @@ class TradeLogger:
         """
         totals: dict[str, float] = {}
         gaps: dict[str, list[str]] = {}
+
+        # Open the connection FIRST, and let sqlite3.Error propagate.
+        #
+        # This reader must NOT do what its neighbours do. The shared replay
+        # helper swallows a failed `_ensure_db()` and returns `{}`, which is
+        # indistinguishable from "no open positions" — fine for ownership
+        # restoration, unacceptable here: a caller enforcing a risk cap would
+        # read an unavailable database as zero open heat and admit the entry.
+        # Unknown risk must not become zero risk, so the failure has to reach
+        # the caller. `TradingEngine._heat_cap_allows` refuses on it when
+        # enforcement is on.
+        #
+        # A database that does not exist yet is a different case and stays
+        # zero: no trades have been logged, so there is genuinely no heat.
+        conn = self._ensure_db()
+        conn.row_factory = sqlite3.Row
+
         state = self._read_single_leg_open_state()
         if not state:
             return totals, gaps
-        try:
-            conn = self._ensure_db()
-        except sqlite3.Error:
-            return totals, gaps
-        conn.row_factory = sqlite3.Row
 
         for symbol, position in state.items():
             open_qty = float(position.get("open_qty") or 0.0)

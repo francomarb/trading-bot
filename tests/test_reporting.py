@@ -5356,6 +5356,43 @@ class TestOpenRiskLedger:
         assert "donchian_breakout" not in totals
         assert gaps["donchian_breakout"] == ["CCC"]
 
+    def test_database_failure_propagates_rather_than_reading_as_zero(self, tmp_csv):
+        """The bug this guards: the shared replay helper swallows a failed
+        `_ensure_db()` and returns {}, which is indistinguishable from "no
+        open positions". A caller enforcing a risk cap would then read an
+        unavailable database as zero open heat and admit the entry.
+
+        This reader must let the failure reach the caller instead.
+        """
+        tl = TradeLogger(path=tmp_csv)
+        tl.log(_entry_row(symbol="EEE", strategy="donchian_breakout", qty=10,
+                          fill=100.0, stop=90.0, order_id="e5", ird=100.0))
+        # Sanity: it reads fine before the database is broken.
+        assert tl.read_open_risk_by_strategy_with_gaps()[0] == {
+            "donchian_breakout": pytest.approx(100.0)
+        }
+
+        def _boom():
+            raise sqlite3.OperationalError("unable to open database file")
+
+        tl._ensure_db = _boom
+        with pytest.raises(sqlite3.OperationalError):
+            tl.read_open_risk_by_strategy_with_gaps()
+
+    def test_replay_query_failure_also_propagates(self, tmp_csv):
+        """Same posture one layer down: a broken SELECT inside the replay
+        must not be absorbed into an empty, healthy-looking result."""
+        tl = TradeLogger(path=tmp_csv)
+        tl.log(_entry_row(symbol="FFF", strategy="donchian_breakout", qty=10,
+                          fill=100.0, stop=90.0, order_id="e6", ird=100.0))
+
+        def _boom():
+            raise sqlite3.OperationalError("no such table: trades")
+
+        tl._read_single_leg_open_state = _boom
+        with pytest.raises(sqlite3.OperationalError):
+            tl.read_open_risk_by_strategy_with_gaps()
+
     def test_fully_exited_position_contributes_nothing(self, tmp_csv):
         tl = TradeLogger(path=tmp_csv)
         tl.log(_entry_row(symbol="DDD", strategy="donchian_breakout", qty=10,
