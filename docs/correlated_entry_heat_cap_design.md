@@ -403,6 +403,36 @@ zero heat counted, all triggerable by one market move.
 submission; replace the reservation with actual risk on fill; release on
 cancel or expiry.
 
+**Risk is knowable before anything is written, because the stop is an input
+to sizing rather than a product of order placement.** Inside
+`RiskManager.evaluate()` the order is: validation → kill switches → cooldown →
+duplicate guard → max-positions → **stop computed** (`_stop_price_for`, from
+ATR) → **qty sized** (`_size_position`, which consumes that stop, since
+`qty = risk_budget ÷ stop distance`) → live-size adjustment. Only then is the
+`RiskDecision` returned.
+
+So at the moment the cap must admit or refuse a candidate there is no stop
+*order* and no stop *record* — but the stop *value* exists, and it is the very
+number that determined the bet size. Looking for a written stop at that stage
+is looking for something that does not exist yet, by design.
+
+The same quantity simply changes custodian as the order becomes real:
+
+| Stage | Authoritative source | Why |
+|---|---|---|
+| **Candidate**, inside `evaluate()` | Computed in memory from the decision being built | Nothing is written yet; there is nothing to reconcile against |
+| Submitted / resting | Substrate `intended_qty`, `intended_limit_price`, `intended_stop_price` | Same numbers, now persisted. The broker has no protective stop yet — it is an OTO child |
+| Filled | Broker: `(avg_entry_price − resting stop_price) × qty` | A written stop now exists and is the truth |
+| Exited | — | Released |
+
+> **Consistency requirement.** The candidate check must use the **worst-case
+> entry price** — `RiskDecision.entry_max_price`, documented as *"PLAN 11.32
+> entry price cap: worst-case fill ceiling (BUY)"* — **not** `reference_price`.
+> A Donchian `STOP_LIMIT` can fill above reference, so admitting on reference
+> and then reserving on limit means the cap approves one number and books a
+> larger one. It would breach itself through its own accounting. **The number
+> used to admit must equal the number reserved.**
+
 | Event | Heat contribution |
 |---|---|
 | Entry submitted (resting) | **Reserved:** `intended_qty × (intended_limit_price − intended_stop_price)`. A buy stop-limit cannot fill above its limit, so this is the true worst case |
