@@ -1,6 +1,6 @@
 # Correlated-Entry Heat Cap — Design (PLAN `11.60`)
 
-**Status:** ✅ **Design review closed — revision 4.** Two independent
+**Status:** ✅ **Design review closed — revision 5.** Level pre-registered at **4R**, shipping observation-only first. Two independent
 reviewers (Codex, Gemini/Antigravity), two rounds each. Every structural
 question is resolved: §5.1–§5.5 by convergence, §5.6 and its sub-questions by
 verification against the code. **The cap level is deliberately unchosen** —
@@ -16,7 +16,7 @@ Sections marked **CLOSED** were measured and rejected; do not re-propose
 without meeting the stated re-open bar. Sections marked **RESOLVED** carry
 the reasoning both reviews converged on. §7 lists what is still open.
 
-**Last updated:** 2026-08-19 (rev 4)
+**Last updated:** 2026-08-19 (rev 5)
 
 **Scope:** the `donchian_breakout` sleeve first, built as reusable per-strategy
 machinery. Slot allocation / candidate ranking is deliberately **out of scope**
@@ -458,34 +458,56 @@ exposure is sub-second (it is replaced by actual risk in the same cycle) and
 slippage-sized, so this is acceptable — but it is an accepted approximation,
 not a guarantee, and should be labelled as one.
 
-#### 5.6.2 NULL `initial_risk_dollars` — fail closed, and mean it
+#### 5.6.2 Reading a position's risk — staleness matters more than NULL
 
-`initial_risk_dollars` is an approximation, not an identity. Measured against
-`(fill − stop) × qty` on the 8 most recent Donchian entries: 5 exact, 3 within
-half a dollar (stop re-anchoring, `11.53`), and **2 of 30 rows NULL**. Good
-enough for a heat figure — differences under 0.2% — but the NULLs need a
-documented fallback. (It is far better populated than `risk_budget_dollars`,
-NULL on 22 of 30.)
+**Do not read the stored aggregate as authoritative.** Compute heat from
+`(entry_price − stop currently in force) × current_qty`. Because the stop is
+static (§3), "currently in force" equals the entry-time stop in the normal
+case; the two diverge only when a stop has been repaired or replaced, and
+there the current one is the honest figure.
 
-**RESOLVED — a deterministic chain that never treats an unknown as zero:**
+**Why not just read `initial_risk_dollars`.** It is NULL on 2 of 30 Donchian
+entry rows — but NULL is the *easy* failure, because it is detectable and
+triggers a fallback. `11.58` documents the dangerous one: the field can be
+**present and wrong**. SMCI on 2026-08-14 filled in three tranches
+(54 + 18 + 1 = 73) while the stored risk froze at the first tranche — a **26%
+understatement** that nothing detects. A cap reading that number would
+under-count heat and admit extra entries, silently. Two write-time races of
+this class have been found and fixed (`11.58` (a) and (a) round 2); reading a
+derived value rather than a frozen one removes the whole class rather than
+waiting for the third.
 
-1. Recompute from live position fields: `(avg_entry_price − stop_price) × current_qty`
-2. Stop price also unavailable → **see the caveat below**
-3. Log a structured WARNING naming which step was used
+The stored field remains useful as a **cross-check**: compute, compare, log on
+disagreement. That turns a silent corruption into an observable one.
 
-Treating a NULL as zero heat is the one unacceptable option: it would relax
-the cap exactly during a data anomaly, which is the failure direction this
-project rejects elsewhere.
+**Fallback chain, when the stop price itself cannot be read.** The trades row
+carries more than one recorded stop, so there are real rungs before "unknown":
 
-> **⚠️ Caveat on step 2, which review 2 proposed as "fall back to nominal
-> `equity × risk_per_trade_pct`".** Nominal is **not** conservative. The ANET
-> case in this document carried **2.2× its nominal budget** after notional caps
-> and share flooring — and a position whose stop we cannot read is precisely
-> the kind we cannot rule out being one of those. Falling back to nominal fails
-> open by a smaller amount rather than not at all, which contradicts the
-> principle the chain is built on. **Open sub-decision:** apply a conservative
-> multiple to nominal, or treat an unknown-stop position as blocking new
-> entries while it is open. Name the choice; do not inherit it.
+1. `stop_price` / `initial_stop_loss` on the entry row → recompute directly
+2. `initial_risk_per_share × current_qty`
+3. `initial_risk_dollars` as stored (accepting it may be stale)
+4. None available → **fail closed**, see below
+
+Treating an unreadable position as **zero heat** is the one unacceptable
+option: it relaxes the cap precisely during a data anomaly, the failure
+direction this project rejects elsewhere.
+
+> **⚠️ Open sub-decision (the last one).** Review 2 proposed falling back to
+> nominal `equity × risk_per_trade_pct`. **Nominal is not conservative** — the
+> ANET case carried **2.2× nominal** after notional caps and share flooring,
+> and a position whose stop cannot be read is exactly the kind that might be
+> one of those. So rung 4 is either a conservative multiple of nominal, or
+> "this position blocks new entries while its risk is unknown". Name the
+> choice; do not inherit it.
+
+**On relying on the existing stop-repair machinery.** For stop *existence*,
+yes — `_repair_missing_protective_stops` runs every cycle and rebuilds
+protection within one cycle. The heat cap should not duplicate it. For the
+risk *figure*, no: `11.58` records that SMCI's stale value *"never healed
+because SMCI took `_repair_missing_protective_stops`, which does not rebase"*.
+Repair restores the stop; it does not correct the number. Deriving heat from
+the stop currently in force is what makes the repair machinery work *for* the
+cap rather than leave a hole in it.
 
 #### 5.6.3 Restart — the reconciliation already exists
 
@@ -596,8 +618,36 @@ them. "Positions" is at *actual* average sizing (0.33% of equity), not at the
 > question Step 1's evidence must answer; it should not arrive as a surprise
 > after the level is chosen.
 
-Pre-register the chosen level with a stated bar to clear before it is applied,
-and run it as an arm rather than a silent config change.
+**PRE-REGISTERED LEVEL: 4R — 1.60% of equity.** Operator decision, recorded
+2026-08-19, before any measurement run. It is written here so that a later
+"the evidence supported 4R" cannot be reconstructed after the fact: the
+evidence had not been gathered when this was chosen. Changing it later is
+allowed and should be recorded the same way, with the reason.
+
+**Step 3a — ship in observation-only mode first.** The cap computes and logs;
+it refuses nothing until a flag is flipped. This follows the established
+pattern of `PAPER_STRATEGY_DRAWDOWN_GATE_ENABLED`, whose comment states the
+same rationale — *"Paper development defaults to observation-only at every
+sample size so strategies can accumulate tuning evidence"*.
+
+Two reasons it matters here specifically:
+
+1. **Day one would otherwise freeze the sleeve.** Donchian carries 1.99%
+   against a 1.60% cap, so enforcement from the first cycle blocks every new
+   entry until roughly two positions exit. That may be the intended
+   tightening, but it should be a decision taken with data, not the
+   deployment's opening move.
+2. **It produces the consequence data §6 actually needs** — how often 4R
+   binds, which candidates it declines, how long the sleeve sits at the
+   ceiling — without any of it costing a trade.
+
+> **What observation-only does *not* do.** It does not discover the right
+> level. The sample problem in the callout above is unchanged by watching it
+> for longer: at roughly six independent market bets, more observation
+> sharpens *what a level costs* without making the choice between 3R, 4R and
+> 5R empirical. Tune the number if the observed cost is unacceptable — that is
+> a policy revision, and it should be recorded as one rather than presented as
+> a finding.
 
 **Step 4 — observability.** Whatever the cap, every refusal must emit a
 structured record (review 1's specification, adopted):
@@ -627,14 +677,13 @@ without new evidence; argue with a verification rather than around it.
 
 Two things remain, and only one of them is a design question:
 
-1. **The level — yours, not a reviewer's.** §6 explains why: at roughly six
-   independent market bets the sample cannot separate 3R from 5R, so evidence
-   can describe each posture's cost but not discover the right one. The ladder
-   table states the three trade-offs; pick an appetite from them, pre-register
-   it, then evaluate forward on paper.
-2. **One open sub-decision** (§5.6.2): when a position's stop price cannot be
-   read, does the fallback apply a conservative multiple to nominal risk, or
-   does it block new entries while that position is open? Nominal alone is not
+1. ~~The level~~ ✅ **Decided: 4R (1.60% of equity)**, pre-registered
+   2026-08-19 before any measurement run, and shipping **observation-only**
+   first (§6 Step 3a). Revisable, but as a recorded policy change rather than
+   a finding.
+2. **One open sub-decision** (§5.6.2): when a position's risk cannot be read
+   at all, does the last rung apply a conservative multiple to nominal risk,
+   or block new entries while that position is open? Nominal alone is not
    conservative — the ANET case carried 2.2× nominal — so inheriting review 2's
    proposal unchanged would fail open by a smaller amount rather than not at
    all.
