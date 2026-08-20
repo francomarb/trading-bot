@@ -33,10 +33,23 @@ per-trade risk dollars combined with a stated percentage reconstruct the
 account size, which is the exact leak this rule prevents. If you need an
 absolute magnitude, give a ratio instead.
 
-**Evidence over intuition.** Every claim about live behaviour in this document
-was verified in code or in `data/trades.db` on the stated date. If you add a
-claim, say how you checked it. If you cannot check it, mark it as a
-hypothesis.
+**Evidence over intuition, with provenance stated.** Claims here fall into two
+classes and must not be blurred:
+
+- **Verified** — checked against the code or `data/trades.db` on the stated
+  date. Live-behaviour claims must be in this class.
+- **Cited** — taken from another document's write-up of offline research
+  (`11.56`, `11.59`, `11.58`, the trailing-stop investigation). These are
+  reported with their source and **are not independent verification**.
+
+The distinction matters because a design document describes the state at the
+time it was written. `11.58` in particular describes a **pre-fix** state, and
+quoting its prose as current behaviour produced two wrong claims in earlier
+revisions of this document — one of them load-bearing. A **2026-08-20 audit
+pass** re-checked every live-behaviour claim here against code and data;
+corrections are marked inline where they changed a conclusion.
+
+If you add a claim, say which class it is and how you checked it.
 
 **Cite the reader's own sources.** The code, `PLAN.md`, `docs/`, `data/trades.db`
 and `logs/` are all readable locally. Point at `file:line` rather than
@@ -56,18 +69,19 @@ resolves the entire burst at once.
 
 | Window | Entries | What happened |
 |---|---|---|
-| 2026-06-01 → 06-05 | 6 (SMCI, QCOM, IONQ, ARM, MRVL, ASML) | SPY fell 2.5–2.9%; **five dead within 1–8 days**; ARM and MRVL lasted a single day each |
-| 2026-08-04 → 08-07 | 3 (GOOG, AMZN, AVGO) | SPY flat; **all three dead** |
+| 2026-06-01 → 06-05 | 6 (SMCI, QCOM, IONQ, ARM, MRVL, ASML) | SPY fell **−2.55% close-to-close, −2.90% high-to-low**; **five dead within 1–8 days**; ARM and MRVL lasted a single day each. ASML alone survived (33 days, +293.90) |
+| 2026-08-04 → 08-07 | **4** (GOOG, AMZN, MSFT, AVGO) | SPY flat (**+0.17%** close-to-close, −1.20% high-to-low). Three closed at a loss over **7–11 days** (−292.80, −271.11, −290.71); **MSFT is still open** and currently underwater. A weaker clustering illustration than June: same direction, but the exits were spread rather than simultaneous |
 
 The consequence is not only risk concentration — it is **sample poverty**. The
-27 closed live trades at the time of the 11.60 write-up represented roughly
-**six independent market-timing bets**. Every Donchian statistic therefore
+27 closed live trades at the time of the `11.60` write-up (**29 as of
+2026-08-20**) represented roughly **six independent market-timing bets**. Every Donchian statistic therefore
 rests on a far smaller effective sample than the trade count implies. This
 matters for the operator's stated goal of accumulating more trades: clustered
 trades grow the count much faster than they grow the evidence.
 
 **Why now.** The `11.59` gate change (2026-08-18, BEAR-only exclusion) raises
-modelled entries **714 → 997 (+40%)**. Loosening the gate makes clustering
+modelled entries **714 → 997 (+40%)** *(cited from `11.59`'s A/B run via
+`scripts/donchian_gate_ab.py`; not re-run for this document)*. Loosening the gate makes clustering
 strictly worse. Neither the gate A/B harness nor any backtest in this repo
 models concurrency, shared capital, or the allocator budget.
 
@@ -98,8 +112,8 @@ Each was measured and rejected.
 
 | Question | Outcome | Re-open bar |
 |---|---|---|
-| **Rank/filter entries by predicted quality** (overextension veto, RSI level, run-up) | **CLOSED by `11.56`** (2026-08-10, "hypothesis NOT supported"). The separator between winners and losers is SPY's move *during the hold* — not knowable at entry. Median MFE: losers +0.42R vs winners +2.55R. | ≥30 closed trades under current config, ONE feature named before looking, \|r\| ≥ 0.4, not a sweep |
-| **Trailing / breakeven-at-+1R stop** | **CLOSED.** Tested: saves CIEN/TSLA/AVGO but clips ALAB on its 6-26 dip to entry. Net ≈ a wash. Static stop retained. | New evidence; note §5.1 depends on this staying closed |
+| **Rank/filter entries by predicted quality** (overextension veto, RSI level, run-up) | **CLOSED by `11.56`** (2026-08-10, "hypothesis NOT supported"). The separator between winners and losers is SPY's move *during the hold* — not knowable at entry. Median MFE: losers +0.42R vs winners +2.55R *(cited from `11.56`)*. | ≥30 closed trades under current config, ONE feature named before looking, \|r\| ≥ 0.4, not a sweep |
+| **Trailing / breakeven-at-+1R stop** | **CLOSED.** Tested: saves CIEN/TSLA/AVGO but clips ALAB on its 6-26 dip to entry. Net ≈ a wash. Static stop retained *(cited from the trailing-stop investigation)*. | New evidence; note §5.1 depends on this staying closed |
 | **Blanket sector caps** | **REJECTED** as too blunt (`11.7`); calibrated targeted caps deferred to `11.8` pending evidence of a real concentration problem | Paper exposure showing a genuine sector concentration problem |
 | **Slice-based allocator** (`budget ÷ max_positions`) | **REJECTED** — v1 was tried and caused position-count starvation while capital sat idle. See `docs/capital_allocation_reference.md` §3.4 | Do not re-propose; fix is parameter reconciliation, not structural |
 | **Enforce the cap from filled positions** (`AccountState.open_positions` / the trade log) | **CLOSED — verified insufficient.** Proposed in review 2 with the claim "no intra-cycle race conditions". It is blind to the burst it exists to prevent; see §5.6 for the verification | Show that Donchian entries do not rest at the broker — they do (`trader.py:2269`) |
@@ -203,7 +217,11 @@ Two consequences worth stating plainly:
 A heat figure assumes the stop holds. A tightly-stopped position that gaps
 through its stop overnight loses several times its booked R — a 2%-stop
 position gapping 12% loses ~6R. Notional cannot be gapped through; risk can.
-That is why the notional cap exists (`dc65435`) and why it stays.
+The per-position notional cap (`dc65435`, 2026-04-22) is what bounds this.
+Note its **stated** rationale is capital concentration, not gap risk — *"A
+tight stop must not let one trade consume the whole gross-exposure sleeve"* —
+so the gap-risk benefit above is an independent property of the same control,
+not the reason it was introduced.
 
 Whatever cap ships should therefore **log which limit refused an entry**.
 Otherwise the handover between the two — which follows the universe's
@@ -261,8 +279,18 @@ not have that, by an explicit prior decision.
 `(entry_fill − initial_stop) × filled_qty`, **not** `risk_budget_dollars`.
 The latter is *intended* risk (`equity × risk_per_trade_pct` at sizing time)
 and diverges materially once notional caps and whole-share flooring bite — the
-recorded ANET case carried **≈2.2× its intended budget**. Capping on intent
-would understate real heat by more than a factor of two. Both inputs are
+dispersion between what was intended and what was carried is real and
+**verified 2026-08-20**: across the 28 Donchian entries with a recorded
+initial risk, the spread is **28.8×** (min to max); among the 8 that also
+carry a `risk_budget_dollars`, **3.4×**. Capping on intent rather than on
+carried risk therefore mis-states heat by a wide and variable margin.
+
+> *Correction, 2026-08-20 audit:* earlier revisions cited "the ANET case
+> carried ≈2.2× its intended budget", taken from `11.58`'s prose. That figure
+> is **not reproducible** — both ANET entry rows have a NULL
+> `risk_budget_dollars`, so no ratio can be computed, and neither recorded
+> initial risk matches the dollar amount in that prose. `11.58` describes a
+> pre-fix state. The dispersion figures above replace it and are measured. Both inputs are
 persisted on the entry trade row.
 
 **OPEN — which store does the cap read, and at what moment does it evaluate?**
@@ -575,7 +603,7 @@ them. "Positions" is at *actual* average sizing (0.33% of equity), not at the
 |---|---|---|---|---|
 | **3R** | 1.20% | 3.6 | Strict defensive | Bounds worst correlated loss at 1.20%. Routinely refuses the 4th and 5th candidate in a sustained rally |
 | **4R** | 1.60% | 4.8 | Balanced budget | Clamps a June-2026-scale cluster while still allowing multi-name diversification. **Would have bound on positions #5 and #6 of the 2026-08-19 book** |
-| **5R** | 2.00% | 6.0 | Tail damper only | Prevents 7–8 position runaway and blocks outsized allocations when share flooring inflates risk (ANET at 2.2×). **Effectively at the current book, not above it** — 2.00% against 1.99% is 0.01pp of headroom, so one further position breaches it |
+| **5R** | 2.00% | 6.0 | Tail damper only | Prevents 7–8 position runaway and blocks outsized allocations when share flooring inflates risk (carried-risk dispersion is 28.8× across recorded entries). **Effectively at the current book, not above it** — 2.00% against 1.99% is 0.01pp of headroom, so one further position breaches it |
 
 > ### ⚠️ The suggested 4R baseline is already breached by the live book
 >
