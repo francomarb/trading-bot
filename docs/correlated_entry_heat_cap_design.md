@@ -452,19 +452,51 @@ does not exist yet, by design. And once admitted, the position's contribution
 | Event | Effect on the sleeve's heat |
 |---|---|
 | **Candidate admitted** (in `evaluate()`, post-sizing) | `+ (worst-case entry − stop_price) × qty`, computed from the decision being built |
-| Entry submitted (resting) | Reservation persisted as `intended_qty × (intended_limit_price − intended_stop_price)` |
+| Entry submitted (resting) | Reservation persisted as `intended_qty × (worst-case entry − intended_stop_price)`, using **the same worst-case entry value the candidate was admitted with** (see the table below). For `STOP_LIMIT` that is `intended_limit_price`, populated on all 24 such rows |
 | Entry **fully** fills | Reservation becomes actual fill-to-stop risk |
 | Entry **partially** fills | Actual risk on filled shares **+** reservation still standing on the unfilled remainder |
 | Entry cancels / expires DAY | Release **only the unfilled portion**; filled shares keep their risk |
 | Position **partially** exits | Reduce **pro rata** to the exited quantity |
 | Position fully exits, or is closed externally | Release |
 
-> **Consistency requirement.** Admission must use the **worst-case entry
-> price** — `RiskDecision.entry_max_price`, documented as *"PLAN 11.32 entry
-> price cap: worst-case fill ceiling (BUY)"* — not `reference_price`. A
-> `STOP_LIMIT` can fill above reference, so admitting on reference while
-> reserving on limit means the cap approves one number and books a larger one.
-> **The number used to admit must equal the number reserved.**
+> **Consistency requirement.** Admission and the persisted reservation must
+> use **the same worst-case entry value**. If admission used
+> `reference_price` while the reservation used the limit, the cap would
+> approve one number and book a larger one — breaching itself through its own
+> accounting.
+>
+> **That value is order-type-aware. There is no single field.**
+>
+> | Entry type | Worst-case entry value | Strength |
+> |---|---|---|
+> | `STOP_LIMIT` (Donchian) | `decision.limit_price` | **Bound** — the broker submits with this cap |
+> | MARKET *with* a price cap | `decision.entry_max_price` | **Bound** |
+> | MARKET *without* a cap | `decision.entry_reference_price` | **Estimate** — no ceiling exists |
+>
+> ⚠️ **Correction, 2026-08-20 (review).** Earlier revisions said to use
+> `RiskDecision.entry_max_price` for all entries. **That is wrong for exactly
+> the orders this cap exists to control.** Verified in code:
+> [`trader.py:2246`](../engine/trader.py#L2246) initialises
+> `entry_max_price = None` and populates it **only** when
+> `strategy.preferred_order_type is OrderType.MARKET` — the comment says
+> "the cap is for plain equity MARKET entries only". Donchian declares
+> `STOP_LIMIT`, so it writes its ceiling to `Signal.limit_price` instead
+> ([`trader.py:2306`](../engine/trader.py#L2306), via `compute_cap_price`
+> off the trigger). `RiskManager` copies the two **separately** into the
+> decision ([`manager.py:1355`](../risk/manager.py#L1355)), and the broker
+> submits the stop-limit from `decision.limit_price`, raising if it is None
+> ([`broker.py:1667`](../execution/broker.py#L1667)).
+>
+> The data agrees: across `position_lifecycle_orders`, all **24**
+> `stop_limit` entry rows carry a non-NULL `intended_limit_price`, while all
+> **9** `market` rows have it NULL.
+>
+> Stronger still — `entry_max_price` is currently **never** populated for any
+> live strategy. Its branch needs MARKET *and* an `ENTRY_PRICE_CAPS` policy;
+> the only configured policy is `donchian_breakout`, which is `STOP_LIMIT`,
+> and `sma_crossover` (MARKET) has no policy. The "capped MARKET" row above
+> is correct but **currently unreachable** — keep it so the rule stays right
+> when a cap is added.
 
 #### Rebuilding the ledger after a restart — the only read
 
@@ -526,10 +558,14 @@ invent one.
 special branch: admitted, reserved, and settled in the same cycle because the
 fill is immediate. But the two admissions differ in strength:
 
-| Entry type | Admission figure | Guarantee |
+Both use the order-type-aware worst-case entry value defined above — one
+rule, not a second variant. What differs is how strong that value is:
+
+| Entry type | Worst-case source | Guarantee |
 |---|---|---|
-| `stop_limit` | `qty × (limit − stop)` | **True bound.** Cannot fill above its limit |
-| `market` | `qty × (reference − stop)` | **Estimate.** No price ceiling; the fill can be worse |
+| `stop_limit` | `decision.limit_price` | **Bound.** Cannot fill above its limit |
+| MARKET, capped | `decision.entry_max_price` | **Bound** (currently unreachable — no MARKET strategy has a cap policy) |
+| MARKET, uncapped | `decision.entry_reference_price` | **Estimate.** No price ceiling; the fill can be worse |
 
 The market figure can under-admit by the slippage. Exposure is sub-second and
 slippage-sized, so it is accepted — as an approximation, explicitly, not
