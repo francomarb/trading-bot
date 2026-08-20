@@ -2212,6 +2212,51 @@ class TradeLogger:
             if state["open_qty"] > 0 and state["strategy"]
         }
 
+    def read_open_risk_by_strategy(self) -> dict[str, float]:
+        """Open initial-R per strategy, in dollars — the heat ledger.
+
+        PLAN 11.60. Risk is fixed when the bet is sized and does not change
+        afterwards, so this reads the value the position was admitted with
+        rather than re-deriving it from a current stop:
+
+            initial_risk_per_share x open_qty
+
+        `open_qty` comes from the same chronological replay used for
+        ownership restoration, so a partial exit reduces the contribution
+        pro rata and a full exit drops it, with no separate accounting.
+
+        Positions with no recorded `initial_risk_per_share` are **skipped and
+        the caller is told**, via the second element of the returned pair in
+        `read_open_risk_by_strategy_with_gaps`. A NULL there means risk was
+        never bounded (no stop at entry), which is not the same as zero.
+        """
+        totals, _ = self.read_open_risk_by_strategy_with_gaps()
+        return totals
+
+    def read_open_risk_by_strategy_with_gaps(
+        self,
+    ) -> tuple[dict[str, float], dict[str, list[str]]]:
+        """`read_open_risk_by_strategy` plus the symbols it could not price.
+
+        Returns ``(totals_by_strategy, unpriced_symbols_by_strategy)``. A
+        symbol lands in the second map when it is open with no
+        `initial_risk_per_share` — risk that was never bounded. Callers must
+        not read its absence from the totals as zero risk.
+        """
+        totals: dict[str, float] = {}
+        gaps: dict[str, list[str]] = {}
+        for symbol, state in self._read_single_leg_open_state().items():
+            qty = float(state.get("open_qty") or 0.0)
+            strategy = state.get("strategy")
+            if not strategy or qty <= 0:
+                continue
+            rps = state.get("initial_risk_per_share")
+            if rps is None:
+                gaps.setdefault(strategy, []).append(symbol)
+                continue
+            totals[strategy] = totals.get(strategy, 0.0) + float(rps) * qty
+        return totals, gaps
+
     def read_open_spread_positions(self) -> list[dict]:
         """
         Reconstruct currently-open multi-leg credit spreads from the trade log.

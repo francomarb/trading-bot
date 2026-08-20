@@ -42,6 +42,8 @@ from risk.manager import (
     RiskRejection,
     Side,
     Signal,
+    candidate_entry_risk,
+    worst_case_entry_price,
 )
 
 
@@ -1429,3 +1431,59 @@ class TestRiskBudgetIsRecorded:
         assert d.risk_budget_dollars == pytest.approx(600.0)
         assert reconstructed != pytest.approx(d.risk_budget_dollars, rel=0.05)
 
+
+
+# ── TestWorstCaseEntryPrice ─────────────────────────────────────────────────
+
+
+class TestWorstCaseEntryPrice:
+    """PLAN 11.60. The heat cap admits and reserves on the same worst-case
+    entry value, and there is no single field that holds it."""
+
+    def _decision(self, **kw):
+        base = dict(
+            symbol="AAPL", side=Side.BUY, qty=10,
+            entry_reference_price=100.0, stop_price=90.0,
+            strategy_name="donchian_breakout", reason="test",
+        )
+        base.update(kw)
+        return RiskDecision(**base)
+
+    def test_stop_limit_uses_limit_price_not_reference(self):
+        """The defect this guards: `entry_max_price` is populated only for
+        MARKET strategies, so reading it for Donchian yields None and any
+        fallback to reference under-reserves — the fill can land above it."""
+        d = self._decision(
+            order_type=OrderType.STOP_LIMIT,
+            entry_trigger_price=101.0, limit_price=103.0,
+        )
+        price, source = worst_case_entry_price(d)
+        assert (price, source) == (103.0, "limit_price")
+        assert candidate_entry_risk(d) == pytest.approx((103.0 - 90.0) * 10)
+
+    def test_capped_market_uses_entry_max_price(self):
+        d = self._decision(order_type=OrderType.MARKET, entry_max_price=102.0)
+        assert worst_case_entry_price(d) == (102.0, "entry_max_price")
+        assert candidate_entry_risk(d) == pytest.approx((102.0 - 90.0) * 10)
+
+    def test_uncapped_market_falls_back_to_reference_as_an_estimate(self):
+        d = self._decision(order_type=OrderType.MARKET)
+        assert worst_case_entry_price(d) == (100.0, "entry_reference_price")
+        assert candidate_entry_risk(d) == pytest.approx((100.0 - 90.0) * 10)
+
+    def test_stop_limit_cannot_carry_entry_max_price_at_all(self):
+        """The reason the order-type-aware rule is necessary, enforced one
+        layer below it: `RiskDecision` itself refuses the combination. A
+        heat check reading `entry_max_price` for Donchian is not merely
+        reading a None — it is reading a field the type forbids there."""
+        with pytest.raises(ValueError, match="capping MARKET entries"):
+            self._decision(
+                order_type=OrderType.STOP_LIMIT, entry_trigger_price=101.0,
+                limit_price=103.0, entry_max_price=99.0,
+            )
+
+    def test_inverted_stop_is_rejected_before_risk_is_computed(self):
+        """`candidate_entry_risk` clamps at zero, but it never sees an
+        inverted stop: the decision cannot be constructed with one."""
+        with pytest.raises(ValueError, match="stop must be strictly below"):
+            self._decision(order_type=OrderType.MARKET, stop_price=150.0)

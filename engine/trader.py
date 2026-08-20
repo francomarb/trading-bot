@@ -99,6 +99,8 @@ from risk.manager import (
     RiskRejection,
     Side,
     Signal,
+    candidate_entry_risk,
+    worst_case_entry_price,
 )
 from reporting.alerts import AlertDispatcher
 from reporting.logger import (
@@ -1048,6 +1050,96 @@ class TradingEngine:
                     "daemon=True ensures it won't block process exit"
                 )
         self._operator_heartbeat_thread = None
+
+    # ── Correlated-entry heat cap (PLAN 11.60) ───────────────────────────
+
+    def _heat_cap_allows(self, decision: "RiskDecision") -> bool:
+        """Evaluate the sleeve's open heat against its cap for one candidate.
+
+        Returns True when the entry may proceed. In observation mode it
+        always returns True and only logs — the point of shipping that way
+        first is to learn what the level costs before it costs a trade.
+
+        Heat is a ledger, not a re-derivation: each open position contributes
+        the risk it was admitted with (`initial_risk_per_share x open_qty`,
+        so a partial exit reduces it pro rata), and each resting entry order
+        contributes its worst-case reservation. Nothing re-reads a stop.
+        """
+        cap_pct = settings.STRATEGY_MAX_OPEN_HEAT_PCT.get(decision.strategy_name)
+        if not cap_pct:
+            return True
+        equity = self._last_cycle_equity or self._session_start_equity
+        if not equity or equity <= 0:
+            return True
+
+        try:
+            filled_by_strategy, gaps = (
+                self.trade_logger.read_open_risk_by_strategy_with_gaps()
+            )
+            pending_by_strategy = (
+                self.lifecycle_orders_store.read_pending_entry_reservations()
+                if self.lifecycle_orders_store is not None else {}
+            )
+        except Exception as exc:
+            # A heat figure we cannot compute must not silently read as zero,
+            # which would relax the cap exactly when the data is degraded.
+            logger.warning(
+                f"[heat-cap] {decision.strategy_name} {decision.symbol}: "
+                f"could not compute open heat ({type(exc).__name__}: {exc}) — "
+                f"{'allowing (observation mode)' if not settings.STRATEGY_HEAT_CAP_ENFORCED else 'refusing entry'}"
+            )
+            return not settings.STRATEGY_HEAT_CAP_ENFORCED
+
+        strategy = decision.strategy_name
+        filled = filled_by_strategy.get(strategy, 0.0)
+        pending = pending_by_strategy.get(strategy, 0.0)
+        candidate = candidate_entry_risk(decision)
+        _, price_source = worst_case_entry_price(decision)
+        cap_dollars = equity * cap_pct
+        projected = filled + pending + candidate
+
+        unpriced = gaps.get(strategy) or []
+        if unpriced:
+            # Risk that was never bounded (no stop at entry) cannot be given a
+            # number honestly. Say so rather than letting it read as zero.
+            logger.warning(
+                f"[heat-cap] {strategy}: {len(unpriced)} open position(s) carry "
+                f"no recorded initial risk ({', '.join(sorted(unpriced))}) — "
+                f"heat is understated"
+            )
+
+        if projected <= cap_dollars:
+            logger.debug(
+                f"[heat-cap] {strategy} {decision.symbol}: "
+                f"filled={filled:.2f} pending={pending:.2f} "
+                f"candidate={candidate:.2f} -> {projected / equity * 100:.2f}% "
+                f"of {cap_pct * 100:.2f}% cap"
+            )
+            return True
+
+        # Structured refusal record — the fields a later calibration pass
+        # needs, split so a cap binding on real exposure is distinguishable
+        # from one binding on reservations that later expire unfilled.
+        mode = "ENFORCED" if settings.STRATEGY_HEAT_CAP_ENFORCED else "OBSERVED"
+        logger.warning(
+            f"[heat-cap] {mode} {strategy} {decision.symbol}: "
+            f"filled_heat=${filled:,.2f} pending_reserved=${pending:,.2f} "
+            f"candidate=${candidate:,.2f} projected=${projected:,.2f} "
+            f"cap=${cap_dollars:,.2f} ({cap_pct * 100:.2f}% of equity) "
+            f"qty={decision.qty} entry_source={price_source}"
+        )
+        if not settings.STRATEGY_HEAT_CAP_ENFORCED:
+            return True
+
+        _lc = self._lifecycle_counter_for(strategy)
+        if _lc is not None:
+            _lc.risk_blocked += 1
+        self.alerts.order_rejection(
+            decision.symbol, strategy,
+            f"heat cap: projected ${projected:,.2f} > ${cap_dollars:,.2f}",
+            RejectionCode.MAX_STRATEGY_HEAT_REACHED.value,
+        )
+        return False
 
     # ── Intraday equity path ─────────────────────────────────────────────
 
@@ -2350,6 +2442,17 @@ class TradingEngine:
             )
             return None
         assert isinstance(decision, RiskDecision)
+
+        # PLAN 11.60 correlated-entry heat cap. Observation-only unless
+        # settings.STRATEGY_HEAT_CAP_ENFORCED. Placed here because this is the
+        # first point where the decision is final — qty and stop are settled,
+        # so the candidate's worst-case risk is knowable — and still before
+        # submission, which is where a correlated burst is actually admitted.
+        if not self._heat_cap_allows(decision):
+            self._mark_signal_bar_processed(
+                signal_key, signal_bar, strategy_statuses, strategy_reasons, symbol
+            )
+            return None
 
         # Arrival-price benchmark for execution-quality slippage measurement
         # (industry TCA: Implementation Shortfall vs Arrival Price). Capture

@@ -83,6 +83,49 @@ class Position:
     unrealized_plpc: float | None = None
 
 
+def worst_case_entry_price(decision: "RiskDecision") -> tuple[float, str]:
+    """Highest price a not-yet-submitted BUY decision can fill at.
+
+    PLAN 11.60. Used for both heat admission and the persisted reservation,
+    which must be the same number — admitting on one price and reserving on
+    a higher one lets the cap breach itself through its own accounting.
+
+    There is no single field for this; it is order-type aware:
+
+    ===================  ==============================  ==========
+    Entry type           Source                          Strength
+    ===================  ==============================  ==========
+    ``STOP_LIMIT``       ``limit_price``                 bound
+    MARKET, capped       ``entry_max_price``             bound
+    MARKET, uncapped     ``entry_reference_price``       estimate
+    ===================  ==============================  ==========
+
+    ``entry_max_price`` is populated only for strategies whose
+    ``preferred_order_type`` is MARKET *and* which have an
+    ``ENTRY_PRICE_CAPS`` policy — see `engine/trader.py`'s PLAN 11.32 block.
+    Donchian is STOP_LIMIT, so it carries its ceiling in ``limit_price``
+    instead; reading ``entry_max_price`` for it would yield None.
+
+    Returns ``(price, source_field)`` so callers can log which branch ran —
+    the uncapped-MARKET branch is an estimate and should be visible as one.
+    """
+    if decision.order_type is OrderType.STOP_LIMIT and decision.limit_price is not None:
+        return float(decision.limit_price), "limit_price"
+    if decision.entry_max_price is not None:
+        return float(decision.entry_max_price), "entry_max_price"
+    return float(decision.entry_reference_price), "entry_reference_price"
+
+
+def candidate_entry_risk(decision: "RiskDecision") -> float:
+    """Worst-case dollars at risk if this decision fills and hits its stop.
+
+    Equity single-leg only — the heat cap (PLAN 11.60) applies to equity
+    breakout sleeves, and options paths size through their own envelopes.
+    """
+    entry, _ = worst_case_entry_price(decision)
+    return max(0.0, (entry - float(decision.stop_price)) * float(decision.qty))
+
+
 @dataclass(frozen=True)
 class AccountState:
     """
@@ -153,6 +196,9 @@ class RejectionCode(str, Enum):
     GROSS_EXPOSURE_CAP = "gross_exposure_cap"
     INSUFFICIENT_CASH = "insufficient_cash"
     UNSUPPORTED_SIDE = "unsupported_side"
+    # PLAN 11.60. Only reachable when STRATEGY_HEAT_CAP_ENFORCED is on;
+    # observation mode logs without rejecting.
+    MAX_STRATEGY_HEAT_REACHED = "max_strategy_heat_reached"
 
 
 @dataclass(frozen=True)

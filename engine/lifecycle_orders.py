@@ -1127,6 +1127,53 @@ class PositionLifecycleOrdersStore:
         rows = self._conn.execute(sql, params).fetchall()
         return [_row_from_tuple(r) for r in rows]
 
+    def read_pending_entry_reservations(self) -> dict[str, float]:
+        """Worst-case risk held by *resting* entry orders, per strategy.
+
+        PLAN 11.60. A Donchian entry rests at the broker as a DAY
+        ``STOP_LIMIT`` and can sit unfilled for a whole session, so a
+        correlated burst goes live before any of it reaches the trade log.
+        A heat figure built only from filled positions is blind to exactly
+        the cluster the cap exists to bound.
+
+        Reserved risk is the worst case the order can produce::
+
+            intended_qty x (intended_limit_price - intended_stop_price)
+
+        which is a true bound for a stop-limit: it cannot fill above its
+        limit. Rows without both prices are skipped — in practice those are
+        MARKET entries, which have no limit and fill in the submitting cycle,
+        so they are counted as positions rather than reservations almost
+        immediately.
+
+        Strategy attribution comes from the parent ``position_lifecycle``
+        row; the per-order table does not carry it.
+
+        Callers should read this **after** substrate reconciliation has run,
+        or it will include orders that terminated while the process was down.
+        """
+        status_placeholders = ", ".join("?" for _ in NON_TERMINAL_ORDER_STATUSES)
+        rows = self._conn.execute(
+            "SELECT p.strategy, o.intended_qty, o.intended_limit_price, "
+            "       o.intended_stop_price "
+            "FROM position_lifecycle_orders o "
+            "JOIN position_lifecycle p ON p.position_uid = o.position_uid "
+            f"WHERE o.role = 'entry_primary' "
+            f"AND o.status IN ({status_placeholders}) "
+            "AND o.intended_limit_price IS NOT NULL "
+            "AND o.intended_stop_price IS NOT NULL",
+            tuple(sorted(NON_TERMINAL_ORDER_STATUSES)),
+        ).fetchall()
+        totals: dict[str, float] = {}
+        for strategy, qty, limit_price, stop_price in rows:
+            if not strategy:
+                continue
+            risk = (float(limit_price) - float(stop_price)) * float(qty or 0.0)
+            if risk <= 0:
+                continue
+            totals[strategy] = totals.get(strategy, 0.0) + risk
+        return totals
+
     def get_non_terminal_for_position(
         self, position_uid: str
     ) -> list[PositionLifecycleOrderRow]:
