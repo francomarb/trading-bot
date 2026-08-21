@@ -127,7 +127,7 @@ flowchart TD
 | Strategy | Allowed Regimes | Blocked By |
 |----------|----------------|------------|
 | SMA Crossover | TRENDING, RANGING | BEAR, VOLATILE |
-| RSI Reversion | TRENDING, RANGING | BEAR, VOLATILE |
+| RSI Reversion | All (`allowed_regimes=None`) | None |
 | Donchian Breakout | TRENDING | RANGING, BEAR, VOLATILE |
 
 ---

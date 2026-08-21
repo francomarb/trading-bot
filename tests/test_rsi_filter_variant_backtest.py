@@ -118,3 +118,17 @@ def test_sector_gate_uses_production_cold_threshold() -> None:
     decision = edge_filter(df)
 
     assert decision.allowed.tolist() == [True, False, False]
+
+
+def test_historical_filtered_rsi_accepts_current_regime_argument() -> None:
+    df = _bars_from_closes([100.0, 101.0, 99.0, 95.0, 93.0, 97.0, 102.0])
+    strategy = harness.HistoricalFilteredRSI()
+
+    signals = strategy.generate_signals(
+        df,
+        symbol="MSFT",
+        current_regime=MarketRegime.RANGING,
+    )
+
+    assert len(signals.entries) == len(df)
+    assert len(signals.exits) == len(df)

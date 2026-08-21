@@ -2,6 +2,11 @@
 
 **Generated:** 2026-05-01 (RSI row updated from portfolio backtest reports — see methodology note 2)
 
+> Historical snapshot. The active RSI production configuration was reset on
+> 2026-08-21 to RSI3 `<15`, quick exits, all regimes, and only stock
+> SMA200/liquidity edge gates. Re-run the comparison before using this document
+> for current RSI decisions.
+
 This is a snapshot reference comparing the active strategies under backtest settings. Re-run via `python scripts/compare_strategy_sharpes.py` (SMA / BB Squeeze / Donchian); RSI numbers come from the dedicated portfolio backtest in `docs/reports/rsi_portfolio_backtest_latest.md`.
 
 ## Held-constant settings

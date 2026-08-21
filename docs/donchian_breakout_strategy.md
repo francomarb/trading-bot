@@ -296,6 +296,9 @@ universe coherence.
 
 ### Cross-strategy comparison
 
+Historical snapshot. The RSI row below reflects the old RSI14 configuration,
+not the active 2026-08-21 RSI3 quick-exit reset.
+
 | Strategy | Sharpe | MeanRet | MeanDD | Trades |
 |---|---:|---:|---:|---:|
 | SMA Crossover (20/50) | +0.33 | +37.3% | -20.8% | 58 |

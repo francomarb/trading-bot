@@ -83,6 +83,9 @@ cap — **visibly and exceptionally**, which is that cap's designed role
 
 ## 4. Measured watchlist volatility (SIP, ATR14/close, 2026-07-13)
 
+This is a historical sizing snapshot from 2026-07-13, before NFLX was added to
+`RSI_WATCHLIST`. Do not read the `n` column as the current live watchlist size.
+
 | Watchlist | n | min | p10 | median | p90 |
 |---|---|---|---|---|---|
 | SMA | 50 | 1.3% (GSAT) | 4.0% | 7.1% | 10.5% |

@@ -1552,6 +1552,35 @@ class TradingEngine:
                     _lc.edge_filter_blocked += 1
                 # else: candidate passes both gates; sleeve/risk
                 # counters increment downstream when applicable.
+            if strategy.name == "rsi_reversion":
+                try:
+                    observation_getter = getattr(strategy, "latest_observation", None)
+                    observation = (
+                        observation_getter(df) if callable(observation_getter) else {}
+                    )
+                    edge_filter = getattr(strategy, "_edge_filter", None)
+                    metrics_getter = getattr(edge_filter, "last_metrics", None)
+                    edge_metrics = metrics_getter if isinstance(metrics_getter, dict) else {}
+                    regime_value = current_regime.value if current_regime is not None else "none"
+                    logger.info(
+                        "RSI_CANDIDATE "
+                        f"symbol={symbol} bar={latest_ts.isoformat()} "
+                        f"regime={regime_value} raw_entry={raw_entry} "
+                        f"edge_allowed={edge_allowed} entry_after_filters={last_entry} "
+                        f"rsi={observation.get('rsi')} "
+                        f"oversold={observation.get('oversold')} "
+                        f"entry_mode={observation.get('entry_mode')} "
+                        f"stock_above_sma={edge_metrics.get('stock_above_sma')} "
+                        f"stock_sma={edge_metrics.get('stock_sma')} "
+                        f"liquid={edge_metrics.get('liquid')} "
+                        f"avg_dollar_vol={edge_metrics.get('avg_dollar_vol')} "
+                        f"reasons={edge_reasons}"
+                    )
+                except Exception as exc:  # noqa: BLE001
+                    logger.warning(
+                        f"[{strategy.name}] {symbol}: RSI_CANDIDATE diagnostics "
+                        f"unavailable — {type(exc).__name__}: {exc}"
+                    )
 
         position = self._get_position_for(symbol, snapshot)
         if strategy.name == "donchian_breakout" and position is not None:

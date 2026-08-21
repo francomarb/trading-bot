@@ -95,7 +95,7 @@ trading-bot/
 │   ├── filters/
 │   │   ├── common.py          # SPYTrendFilter + CompositeEdgeFilter
 │   │   ├── sma_crossover.py   # SMAEdgeFilter: stock > 200 SMA, volume expansion
-│   │   ├── rsi_reversion.py   # RSIEdgeFilter: SPY50 band, earnings, liquidity, active-breakdown
+│   │   ├── rsi_reversion.py   # RSIEdgeFilter: stock SMA200 + liquidity
 │   │   ├── donchian_breakout.py      # DonchianEdgeFilter: stock > 200 SMA, liquidity, earnings
 │   │   ├── spy_options_reversion.py  # SPYOptionsEdgeFilter: SPY > 100 SMA + TRENDING-only VIX-percentile gate
 │   │   ├── credit_spread.py   # CreditSpreadEdgeFilter: trend + IV proxy + earnings
@@ -397,7 +397,7 @@ Each slot binds a strategy to its symbol universe, timeframe, and allowed regime
 | Strategy | File | Status | Order Type | Allowed Regimes | Sleeve |
 |---|---|---|---|---|---|
 | SMA Crossover | `sma_crossover.py` | **Paper Trading** | MARKET | TRENDING, RANGING | 40% (equity) |
-| RSI Reversion | `rsi_reversion.py` | **Paper Trading** | LIMIT | TRENDING, RANGING | 20% (equity) |
+| RSI Reversion | `rsi_reversion.py` | **Paper Trading** | LIMIT | All (`allowed_regimes=None`) | 20% (equity) |
 | Donchian Breakout | `donchian_breakout.py` | **Paper Trading** | MARKET | TRENDING only | 25% (equity) |
 | SPY Options RSI Reversion | `spy_options_reversion.py` | **Paper Trading** | LIMIT (async bracket) | TRENDING, RANGING | 5% (isolated) |
 | Credit Spread (SPY + QQQ) | `credit_spread.py` | **Paper Trading** | MLEG combo (async) | TRENDING, RANGING | 10% (isolated, shared across underlyings) |

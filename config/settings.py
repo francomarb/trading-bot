@@ -434,10 +434,9 @@ RSI_WATCHLIST = [
     "CAT", "CIEN", "MCO", "AMZN", "EQIX", "RTX", "META", "HD",
     "SOFI", "ARM", "MSTR",
 ]
-# RSI macro gate tolerance. RSI still requires SPY to be near its 50-day
-# trend, but a 1% band avoids starving mean-reversion entries on tiny SPY
-# dips below the moving average. The structural SPY > 200 / BEAR veto is
-# enforced by RegimeDetector at the strategy-slot level.
+# Legacy/reference RSI macro-gate tolerance used by the historical
+# `scripts/rsi_filter_variant_backtest.py` SPY50 study. The active RSI3
+# quick-exit production slot does not use a SPY50 gate.
 RSI_SPY50_TOLERANCE_PCT = 0.01
 # Bollinger Squeeze (TTM-style volatility breakout) — IMPLEMENTED BUT NOT
 # ACTIVE. Cross-universe research (docs/bollinger_squeeze_universe_research.md)
@@ -569,7 +568,9 @@ SECTOR_MOMENTUM_SMOOTH_WINDOW: int = 5
 
 STRATEGY_ALLOWED_REGIMES: dict[str, set[str]] = {
     "sma_crossover":     {"TRENDING", "RANGING"},
-    "rsi_reversion":     {"TRENDING", "RANGING"},
+    # Empty set means no configured regime restriction for dashboard/config
+    # consumers. The live slot expresses this as allowed_regimes=None.
+    "rsi_reversion":     set(),
     # Squeeze fires best after compression breaks (TRENDING) or during it (RANGING).
     "bollinger_squeeze": {"TRENDING", "RANGING"},
     # Donchian whipsaws hard in RANGING regimes (every 20-day high gets faded).
@@ -702,11 +703,10 @@ STRATEGY_RISK_PER_TRADE_PCT: dict[str, float] = {
 # usable operator signal instead of dead code. MinTRL-based rigorous
 # replacement remains follow-up §F1.
 #
-# rsi_reversion stays the lowest (8) because its tight filters
-# (SPY trend, earnings blackout, no-new-low) produce observed
-# multi-month zero-trade stretches. The "RSI isn't firing" case is
-# still handled by L3 Drift independently of whether Edge ever
-# reaches CONCLUSIVE.
+# rsi_reversion stays the lowest (8) because its prior tight filter stack
+# produced observed multi-month zero-trade stretches. The active RSI3
+# quick-exit experiment should trade more often, but the lower floor remains
+# appropriate until paper evidence proves its realized cadence.
 #
 # See docs/strategy_health_design.md §8.
 STRATEGY_MIN_TRADES_FOR_VERDICT: dict[str, int] = {

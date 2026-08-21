@@ -123,10 +123,16 @@ def main() -> int:
             settings.SMA_WATCHLIST,
         ),
         (
-            "RSI Reversion (14, 30/70)",
+            "RSI Reversion (3, <15 quick exit)",
             "RSI_WATCHLIST (static snapshot of dynamic scanner output — see caveat below)",
             lambda: RSIReversion(
-                period=14, oversold=30, overbought=70, edge_filter=RSIEdgeFilter()
+                period=3,
+                oversold=15,
+                overbought=70,
+                entry_mode="level_below",
+                exit_sma_window=5,
+                quick_exit_rsi=55,
+                edge_filter=RSIEdgeFilter(),
             ),
             settings.RSI_WATCHLIST,
         ),

@@ -7,7 +7,7 @@ Tests cover:
   - EarningsBlackout: within/outside blackout window, set_symbol, yfinance
     failure graceful degradation, caching, edge cases.
   - SMAEdgeFilter: stock SMA, volume expansion, earnings blackout (2d/0d).
-  - RSIEdgeFilter: SPY50 band + earnings blackout (3d/2d) + liquidity + active-breakdown gate.
+  - RSIEdgeFilter: stock SMA200 + liquidity for the RSI3 quick-exit experiment.
   - BaseStrategy integration: symbol passed through generate_signals → set_symbol.
 
 No real network calls. All external dependencies (fetch_symbol, yfinance) are
@@ -552,129 +552,50 @@ def _liquid_df(n: int, avg_vol: int = 1_000_000) -> pd.DataFrame:
 
 
 class TestRSIEdgeFilter:
-    """RSIEdgeFilter: SPY50 band + earnings blackout + liquidity + breakdown gate."""
+    """RSIEdgeFilter: stock SMA200 + liquidity only."""
 
-    def _spy_allows(self, f: RSIEdgeFilter) -> None:
-        f._spy_filter._spy_cache = _spy_df(list(range(1, 211)))
-        f._spy_filter._cache_time = float("inf")
+    # ── Liquidity gate ────────────────────────────────────────────────────────
 
-    def _spy_blocks(self, f: RSIEdgeFilter) -> None:
-        f._spy_filter._spy_cache = _spy_df(list(range(210, 0, -1)))
-        f._spy_filter._cache_time = float("inf")
-
-    def _clear_earnings(self, f: RSIEdgeFilter, symbol: str = "MU") -> None:
-        """Seed earnings cache with no upcoming dates for symbol."""
-        f._earnings._cache[symbol] = (datetime.date.today(), [])
-
-    # ── SPY gate ─────────────────────────────────────────────────────────────
-
-    def test_spy_gate_allows(self):
-        f = RSIEdgeFilter(notional_min_avg=0)   # disable vol/low gates
+    def test_stock_above_sma_and_liquid_allows(self):
+        f = RSIEdgeFilter(vol_min_window=5, notional_min_avg=500_000)
         f.set_symbol("MU")
-        self._spy_allows(f)
-        self._clear_earnings(f)
-        decision = f(_liquid_df(25, avg_vol=1_000_000))
+        decision = f(_liquid_df(220, avg_vol=1_000_000))
         assert isinstance(decision, EdgeFilterDecision)
         assert decision.allowed.iloc[-1]
         assert decision.latest_reasons == []
 
-    def test_spy_gate_blocks(self):
-        f = RSIEdgeFilter(notional_min_avg=0)
+    def test_stock_below_sma_blocks(self):
+        f = RSIEdgeFilter(vol_min_window=5, notional_min_avg=0)
         f.set_symbol("MU")
-        self._spy_blocks(f)
-        self._clear_earnings(f)
-        decision = f(_liquid_df(25, avg_vol=1_000_000))
-        assert not decision.allowed.iloc[-1]
-        assert decision.latest_reasons == [
-            "SPY trend gate failed: SPY 1.00 ≤ SMA50 tolerance floor 25.25 "
-            "(SMA 25.50, tolerance 1.0%)"
-        ]
-
-    def test_spy_gate_allows_within_one_percent_band(self):
-        f = RSIEdgeFilter(notional_min_avg=0)
-        f.set_symbol("MU")
-        f._spy_filter._spy_cache = _spy_df([100.0] * 49 + [99.5])
-        f._spy_filter._cache_time = float("inf")
-        self._clear_earnings(f)
-
-        decision = f(_liquid_df(25, avg_vol=1_000_000))
-
-        assert decision.allowed.iloc[-1]
-        assert decision.latest_reasons == []
-
-    def test_spy_gate_blocks_when_sma50_history_is_short(self):
-        f = RSIEdgeFilter(notional_min_avg=0)
-        f.set_symbol("MU")
-        self._clear_earnings(f)
-        f._spy_filter._spy_cache = _spy_df(list(range(1, 43)))
-        f._spy_filter._cache_time = float("inf")
-
-        decision = f(_liquid_df(25, avg_vol=1_000_000))
-
-        assert not decision.allowed.iloc[-1]
-        assert decision.latest_reasons == [
-            "SPY trend gate failed: insufficient SPY history for SMA50: "
-            "42 bars available, 50 required"
-        ]
-
-    def test_spy_history_lookback_has_trading_day_buffer(self):
-        f = RSIEdgeFilter()
-        assert f._spy_filter._lookback_days == 320
-
-    def test_spy_50_window_required(self):
-        """RSI keeps only the SPY 50SMA gate; SPY 200SMA belongs to regime."""
-        f = RSIEdgeFilter(notional_min_avg=0)
-        f.set_symbol("MU")
-        self._clear_earnings(f)
-        df = _liquid_df(25, avg_vol=1_000_000)
-        assert f._spy_filter._windows == [50]
-
-        with patch.object(f._spy_filter, "_check", return_value=(True, "ok")):
-            assert f(df).allowed.iloc[-1]
-
-        with patch.object(f._spy_filter, "_check", return_value=(False, "below 50SMA")):
-            decision = f(df)
-            assert not decision.allowed.iloc[-1]
-            assert decision.latest_reasons == ["SPY trend gate failed: below 50SMA"]
-
-    # ── Earnings blackout gate ────────────────────────────────────────────────
-
-    def test_earnings_blackout_blocks(self):
-        f = RSIEdgeFilter(days_before=3, days_after=2, notional_min_avg=0)
-        f.set_symbol("MU")
-        self._spy_allows(f)
-        df = _today_df()
-        last_bar = df.index[-1].date()
-        tomorrow = last_bar + datetime.timedelta(days=1)
-        f._earnings._cache["MU"] = (datetime.date.today(), [tomorrow])
+        closes = [100.0] * 210 + [80.0]
+        idx = pd.date_range("2020-01-01", periods=len(closes), freq="B")
+        df = pd.DataFrame(
+            {
+                "close": closes,
+                "open": closes,
+                "high": closes,
+                "low": closes,
+                "volume": [1_000_000] * len(closes),
+            },
+            index=idx,
+        )
         decision = f(df)
         assert not decision.allowed.iloc[-1]
-        assert decision.latest_reasons == ["earnings blackout"]
+        assert any("stock below SMA200" in reason for reason in decision.latest_reasons)
 
-    def test_earnings_far_away_allows(self):
-        f = RSIEdgeFilter(days_before=3, days_after=2, notional_min_avg=0)
+    def test_stock_sma_history_short_fails_closed(self):
+        f = RSIEdgeFilter(stock_sma_window=200, vol_min_window=5, notional_min_avg=0)
         f.set_symbol("MU")
-        self._spy_allows(f)
-        far = datetime.date.today() + datetime.timedelta(days=30)
-        f._earnings._cache["MU"] = (datetime.date.today(), [far])
         decision = f(_liquid_df(25, avg_vol=1_000_000))
-        assert decision.allowed.iloc[-1]
-        assert decision.latest_reasons == []
-
-    def test_days_before_after_defaults(self):
-        """Default blackout window is 3 days before, 2 days after."""
-        f = RSIEdgeFilter()
-        assert f._earnings._days_before == 3
-        assert f._earnings._days_after == 2
-
-    # ── Liquidity gate ────────────────────────────────────────────────────────
+        assert not decision.allowed.iloc[-1]
+        assert decision.latest_reasons == [
+            "stock trend unavailable: need 200 bars for SMA200"
+        ]
 
     def test_volume_above_threshold_allows(self):
         f = RSIEdgeFilter(vol_min_window=5, notional_min_avg=500_000)
         f.set_symbol("MU")
-        self._spy_allows(f)
-        self._clear_earnings(f)
-        df = _liquid_df(25, avg_vol=1_000_000)   # 1M >> 500K
+        df = _liquid_df(220, avg_vol=1_000_000)
         decision = f(df)
         assert decision.allowed.iloc[-1]
         assert decision.latest_reasons == []
@@ -682,162 +603,95 @@ class TestRSIEdgeFilter:
     def test_volume_below_threshold_blocks(self):
         f = RSIEdgeFilter(vol_min_window=5, notional_min_avg=500_000)
         f.set_symbol("MU")
-        self._spy_allows(f)
-        self._clear_earnings(f)
-        df = _liquid_df(25, avg_vol=500)     # 500 * 25 (close) = 12.5K < 25K (downscaled)
+        df = _liquid_df(220, avg_vol=5)
         decision = f(df)
         assert not decision.allowed.iloc[-1]
         assert any("liquidity too low" in reason for reason in decision.latest_reasons)
 
     def test_volume_no_column_fails_open(self):
-        """No volume column → fail open. Uses rising closes so new_low gate passes."""
+        """No volume column → liquidity gate fails open."""
         f = RSIEdgeFilter(vol_min_window=5, notional_min_avg=500_000)
         f.set_symbol("MU")
-        self._spy_allows(f)
-        self._clear_earnings(f)
-        closes = list(range(1, 26))   # rising — new_low gate passes
-        idx = pd.date_range("2020-01-01", periods=25, freq="B")
-        df = pd.DataFrame({"close": closes}, index=idx)   # no volume column
+        closes = list(range(1, 221))
+        idx = pd.date_range("2020-01-01", periods=220, freq="B")
+        df = pd.DataFrame({"close": closes}, index=idx)
         decision = f(df)
-        assert decision.allowed.iloc[-1]   # fail open on volume
+        assert decision.allowed.iloc[-1]
         assert decision.latest_reasons == []
 
     def test_volume_nan_fails_open(self):
         """Fewer bars than vol_min_window → NaN avg → fail open."""
-        f = RSIEdgeFilter(vol_min_window=20, notional_min_avg=500_000)
+        f = RSIEdgeFilter(
+            stock_sma_window=5, vol_min_window=20, notional_min_avg=500_000
+        )
         f.set_symbol("MU")
-        self._spy_allows(f)
-        self._clear_earnings(f)
         df = _liquid_df(5, avg_vol=100_000)   # only 5 bars, need 20
         decision = f(df)
-        assert decision.allowed.iloc[-1]   # fail open
-        assert decision.latest_reasons == []
-
-    # ── Active-breakdown gate ─────────────────────────────────────────────────
-
-    def test_active_breakdown_gate_allows_rising_stock(self):
-        """Rising stock → last close above prior-N min → allowed."""
-        f = RSIEdgeFilter(new_low_window=5, notional_min_avg=0)
-        f.set_symbol("MU")
-        self._spy_allows(f)
-        self._clear_earnings(f)
-        df = _liquid_df(25, avg_vol=1_000_000)   # closes 1..25, always rising
-        decision = f(df)
         assert decision.allowed.iloc[-1]
         assert decision.latest_reasons == []
-
-    def test_new_low_below_200_sma_blocks(self):
-        """Stock making a new 5-day low below its 200 SMA → blocked."""
-        f = RSIEdgeFilter(new_low_window=5, notional_min_avg=0)
-        f.set_symbol("MU")
-        self._spy_allows(f)
-        self._clear_earnings(f)
-        closes = [100.0] * 195 + [10, 11, 12, 13, 14, 15, 16, 5]
-        idx = pd.date_range("2020-01-01", periods=len(closes), freq="B")
-        df = pd.DataFrame(
-            {"close": closes, "open": closes, "high": closes,
-             "low": closes, "volume": [1_000_000] * len(closes)},
-            index=idx,
-        )
-        decision = f(df)
-        assert not decision.allowed.iloc[-1]
-        assert decision.latest_reasons == ["new 5-day low below 200 SMA (active breakdown)"]
-
-    def test_new_low_above_200_sma_allows(self):
-        """Stock making a short-term low above its 200 SMA remains eligible."""
-        f = RSIEdgeFilter(new_low_window=5, notional_min_avg=0)
-        f.set_symbol("MU")
-        self._spy_allows(f)
-        self._clear_earnings(f)
-        closes = [50.0] * 195 + [100, 101, 102, 103, 104, 105, 106, 99]
-        idx = pd.date_range("2020-01-01", periods=len(closes), freq="B")
-        df = pd.DataFrame(
-            {"close": closes, "open": closes, "high": closes,
-             "low": closes, "volume": [1_000_000] * len(closes)},
-            index=idx,
-        )
-        decision = f(df)
-        assert decision.allowed.iloc[-1]
-        assert decision.latest_reasons == []
-
-    def test_new_low_nan_fails_open(self):
-        """Fewer bars than new_low_window + 1 → NaN prior_min → fail open."""
-        f = RSIEdgeFilter(new_low_window=20, notional_min_avg=0)
-        f.set_symbol("MU")
-        self._spy_allows(f)
-        self._clear_earnings(f)
-        df = _liquid_df(5)   # only 5 bars, need 21 for prior_min to be non-NaN
-        with patch("strategies.filters.rsi_reversion.logger.warning") as warn:
-            decision = f(df)
-        assert decision.allowed.iloc[-1]   # fail open
-        assert decision.latest_reasons == []
-        warn.assert_called_once()
-        assert "active-breakdown gate failed open" in warn.call_args.args[0]
 
     # ── Structural / combined ─────────────────────────────────────────────────
 
-    def test_all_four_gates_pass(self):
-        f = RSIEdgeFilter(vol_min_window=5, notional_min_avg=500_000, new_low_window=5)
+    def test_all_gates_pass(self):
+        f = RSIEdgeFilter(vol_min_window=5, notional_min_avg=500_000)
         f.set_symbol("MU")
-        self._spy_allows(f)
-        self._clear_earnings(f)
-        df = _liquid_df(25, avg_vol=1_000_000)
+        df = _liquid_df(220, avg_vol=1_000_000)
         decision = f(df)
         assert decision.allowed.iloc[-1]
         assert decision.latest_reasons == []
 
-    def test_no_stock_sma_attribute(self):
-        """Stock-level 50 SMA gate must not exist on RSIEdgeFilter."""
+    def test_no_removed_gate_helpers(self):
+        """Removed RSI gates must not remain hidden inside RSIEdgeFilter."""
         f = RSIEdgeFilter()
-        assert not hasattr(f, "_stock_sma_window")
-        assert not hasattr(f, "_stock_above_sma")
+        assert not hasattr(f, "_spy_filter")
+        assert not hasattr(f, "_earnings")
+        assert not hasattr(f, "_no_active_breakdown")
 
-    def test_set_symbol_routes_to_earnings(self):
+    def test_set_symbol_stores_symbol(self):
         f = RSIEdgeFilter()
         f.set_symbol("CDNS")
         assert f._symbol == "CDNS"
-        assert f._earnings._symbol == "CDNS"
 
     def test_gate_series_aligned_to_df(self):
         f = RSIEdgeFilter(notional_min_avg=0)
         f.set_symbol("MU")
-        self._spy_allows(f)
-        self._clear_earnings(f)
-        df = _liquid_df(25)
+        df = _liquid_df(220)
         decision = f(df)
         assert list(decision.allowed.index) == list(df.index)
         assert list(decision.reasons.index) == list(df.index)
 
     def test_multiple_block_reasons_are_preserved(self):
-        f = RSIEdgeFilter(vol_min_window=5, notional_min_avg=500_000, new_low_window=5)
+        f = RSIEdgeFilter(vol_min_window=5, notional_min_avg=500_000)
         f.set_symbol("MU")
-        self._spy_blocks(f)
-        closes = [100.0] * 195 + [10, 11, 12, 13, 14, 15, 16, 5]
+        closes = [100.0] * 210 + [80.0]
         idx = pd.date_range("2020-01-01", periods=len(closes), freq="B")
         df = pd.DataFrame(
             {"close": closes, "open": closes, "high": closes,
-             "low": closes, "volume": [500] * len(closes)},
+             "low": closes, "volume": [5] * len(closes)},
             index=idx,
         )
-        tomorrow = df.index[-1].date() + datetime.timedelta(days=1)
-        f._earnings._cache["MU"] = (datetime.date.today(), [tomorrow])
 
         decision = f(df)
 
         assert not decision.allowed.iloc[-1]
-        assert decision.latest_reasons == [
-            "SPY trend gate failed: SPY 1.00 ≤ SMA50 tolerance floor 25.25 "
-            "(SMA 25.50, tolerance 1.0%)",
-            "earnings blackout",
-            "liquidity too low (avg_dollar_vol5=$6,300 < $500,000)",
-            "new 5-day low below 200 SMA (active breakdown)",
-        ]
+        assert len(decision.latest_reasons) == 2
+        assert any("stock below SMA200" in reason for reason in decision.latest_reasons)
+        assert any("liquidity too low" in reason for reason in decision.latest_reasons)
+
+    def test_last_metrics_are_recorded(self):
+        f = RSIEdgeFilter(vol_min_window=5, notional_min_avg=500_000)
+        f.set_symbol("MU")
+        decision = f(_liquid_df(220, avg_vol=1_000_000))
+        assert decision.allowed.iloc[-1]
+        metrics = f.last_metrics
+        assert metrics["stock_above_sma"] is True
+        assert metrics["liquid"] is True
+        assert metrics["stock_sma"] is not None
+        assert metrics["avg_dollar_vol"] is not None
 
     def test_strategy_inspect_signals_preserves_structured_reason(self):
         f = RSIEdgeFilter(notional_min_avg=0)
         f.set_symbol("MU")
-        self._spy_blocks(f)
-        self._clear_earnings(f)
         class _AlwaysEntryRSI(RSIReversion):
             def _raw_signals(self, df):
                 entries = pd.Series([False] * (len(df) - 1) + [True], index=df.index, dtype=bool)
@@ -845,7 +699,7 @@ class TestRSIEdgeFilter:
                 return SignalFrame(entries=entries, exits=exits)
 
         strategy = _AlwaysEntryRSI(period=2, oversold=30, overbought=70, edge_filter=f)
-        closes = [100.0, 90.0, 80.0, 70.0]
+        closes = [100.0] * 210 + [80.0]
         idx = pd.date_range("2020-01-01", periods=len(closes), freq="B")
         df = pd.DataFrame(
             {"close": closes, "open": closes, "high": closes, "low": closes, "volume": [1_000_000] * len(closes)},
@@ -857,10 +711,8 @@ class TestRSIEdgeFilter:
         assert raw.entries.any()
         assert not filtered.entries.any()
         assert edge_allowed is False
-        assert edge_reasons == [
-            "SPY trend gate failed: SPY 1.00 ≤ SMA50 tolerance floor 25.25 "
-            "(SMA 25.50, tolerance 1.0%)"
-        ]
+        assert len(edge_reasons) == 1
+        assert "stock below SMA200" in edge_reasons[0]
 
 
 # ── TestBaseStrategySymbolInjection ───────────────────────────────────────────

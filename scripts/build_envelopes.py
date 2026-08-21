@@ -71,22 +71,9 @@ from strategies.sma_crossover import SMACrossover  # noqa: E402
 #     symbol's own historical df). These are real envelope-shaping
 #     filters and they work as intended.
 #
-#   - **Earnings blackout** is symbol-aware. The backtest now passes
-#     `symbol=` through `generate_signals` (backtest/runner.py was
-#     fixed in this PR), so EarningsBlackout can resolve. Whether
-#     it actually rejects depends on whether the offline earnings
-#     cache has data for the symbol over the backtest window.
-#
-#   - **SPY trend gate (SPYTrendFilter / RSI 50-SMA band)** is a
-#     live-cycle filter: it fetches CURRENT SPY state at filter
-#     construction. During the historical backtest, that same
-#     build-time SPY snapshot is applied to every bar, instead of
-#     replaying per-bar historical SPY state. For RSI, the edge filter
-#     currently uses a 1% tolerance around SPY's 50-day SMA; the
-#     structural SPY 200 / BEAR veto is owned by RegimeDetector outside
-#     this filter. **Real fix would require a historical-SPY-injection
-#     mode on SPYTrendFilter** —
-#     out of v1 scope; logged as follow-up §F-future (post-11.10h).
+#   - **RSI Reversion** now uses the simplified RSI3 quick-exit filter:
+#     stock close > SMA200 and a 20-day dollar-volume floor. Those gates
+#     replay per-bar from the symbol's own historical df.
 #
 #   - **SectorMomentumFilter** is intentionally omitted entirely
 #     (offline-unfriendly state).
@@ -98,15 +85,9 @@ from strategies.sma_crossover import SMACrossover  # noqa: E402
 # (11.10d) widens its drift bands accordingly.
 FILTER_FIDELITY_NOTE = (
     "filter_fidelity=partial_stock_gates_only. Stock-level gates "
-    "(200-SMA, volume, 20-day low, liquidity, ATR) replay per-bar "
-    "correctly from the symbol's df. Earnings blackout is symbol-aware "
-    "and now receives the symbol context (PR #17 fix to "
-    "backtest/runner.py), but its replay quality depends on whether the "
-    "offline earnings cache has data for the backtest window. SPY trend "
-    "gates (for RSI: 50-SMA band; structural SPY200 is regime-owned) use "
-    "the build-time SPY snapshot and apply "
-    "that same decision to every historical bar — not per-bar historical "
-    "SPY state. SectorMomentumFilter is omitted entirely (offline-"
+    "(200-SMA, volume/liquidity, ATR) replay per-bar correctly from the "
+    "symbol's df. RSI Reversion currently uses only stock SMA200 plus "
+    "dollar-volume liquidity in its edge filter. SectorMomentumFilter is omitted entirely (offline-"
     "unfriendly). Net: envelope OVER-counts production-allowed signals; "
     "trade-frequency / block-rate bands are upper bounds. The 11.10g "
     "calibration script can re-tune from live paper counters."
@@ -117,10 +98,8 @@ FILTER_FIDELITY_NOTE = (
 
 
 # Each spec encapsulates: how to construct the strategy at production
-# config (no edge filter — we want the raw strategy envelope; live edge
-# filtering shows up later as the L3 lifecycle drift signal), which
-# symbols form its watchlist, what timeframe, and which ATR stop to
-# simulate. Mirrors the forward_test.py production instantiations.
+# config, which symbols form its watchlist, what timeframe, and which ATR
+# stop to simulate. Mirrors the forward_test.py production instantiations.
 #
 # Options strategies (spy_options_reversion, credit_spread) require live
 # OPRA quote lookups at construction — not feasible offline. They get a
@@ -137,7 +116,13 @@ def _sma_builder():
 
 def _rsi_builder():
     return RSIReversion(
-        period=14, oversold=30, overbought=70, edge_filter=RSIEdgeFilter()
+        period=3,
+        oversold=15,
+        overbought=70,
+        entry_mode="level_below",
+        exit_sma_window=5,
+        quick_exit_rsi=55,
+        edge_filter=RSIEdgeFilter(),
     )
 
 

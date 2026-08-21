@@ -463,7 +463,14 @@ def main() -> None:
         use_cache=True,
     )
 
-    strategy = RSIReversion()
+    strategy = RSIReversion(
+        period=3,
+        oversold=15,
+        overbought=70,
+        entry_mode="level_below",
+        exit_sma_window=5,
+        quick_exit_rsi=55,
+    )
     cfg = BacktestConfig()
     results: list[PortfolioBacktestResult] = []
     for basket_name in args.baskets:
