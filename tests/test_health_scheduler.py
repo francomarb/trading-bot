@@ -19,7 +19,7 @@ Covers:
 from __future__ import annotations
 
 import sqlite3
-from datetime import datetime, timedelta, timezone
+from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
 from unittest.mock import MagicMock
 
@@ -487,3 +487,127 @@ class TestLongWindowTrigger:
         scheduler()  # must not raise
         types = [c.args[0].period_type for c in mock_run_review.call_args_list]
         assert "monthly" in types and "yearly" in types
+
+
+class TestLongWindowCannotFireTheSilentKiller:
+    """
+    Regression for the PR #120 review P1.
+
+    `persist_state=False` stops the counter being SAVED but not being
+    LOADED: `assess_all_strategies` threads the persisted weekly count into
+    the assessment. Sitting on two persisted weekly negatives, a
+    long-window run whose signals agree would project 2+1=3, return
+    NEGATIVE and dispatch `STRATEGY_EDGE_LOSS` — on an observation that is
+    not a weekly check, and re-alert every month because it never persists
+    the increment.
+
+    The fix is `use_persistence=False`, which feeds the assessment a zeroed
+    state so the `>= 3` gate is unreachable from this run.
+    """
+
+    @staticmethod
+    def _seed_two_weekly_negatives(state_path: Path, strategy: str) -> None:
+        import json
+
+        state_path.write_text(json.dumps({
+            "schema_version": 1,
+            strategy: {
+                "negative_weeks": 2,
+                "last_check": "2026-06-22",
+                "last_verdict": "NEGATIVE",
+            },
+        }))
+
+    def test_zeroed_state_is_threaded_when_use_persistence_is_false(
+        self, db_conn, tmp_path, monkeypatch,
+    ):
+        """The counter must not reach the assessor at all."""
+        from strategies.health.persistence import PersistenceState
+        import strategies.health.reviewer as rv
+
+        state_path = tmp_path / "health_state.json"
+        self._seed_two_weekly_negatives(state_path, "donchian_breakout")
+
+        seen: list[PersistenceState] = []
+        real = rv.assess_strategy
+
+        def spy(strategy_name, window, **kwargs):
+            seen.append(kwargs["persistence_state"])
+            return real(strategy_name, window, **kwargs)
+
+        monkeypatch.setattr(rv, "assess_strategy", spy)
+        window = rv.window_from_args("yearly", end_date=date(2026, 7, 1))
+
+        rv.assess_all_strategies(
+            window, conn=db_conn, state_path=state_path,
+            strategies=["donchian_breakout"],
+            persist_state=False, use_persistence=False,
+        )
+        assert seen, "assess_strategy was never called — spy did not bind"
+        assert seen[0].negative_weeks == 0, (
+            "the persisted weekly count reached the assessor; the 3-week "
+            "gate could be satisfied by a non-weekly observation"
+        )
+
+    def test_the_same_call_with_persistence_enabled_does_see_the_count(
+        self, db_conn, tmp_path, monkeypatch,
+    ):
+        """Guards the test above from passing vacuously."""
+        from strategies.health.persistence import PersistenceState
+        import strategies.health.reviewer as rv
+
+        state_path = tmp_path / "health_state.json"
+        self._seed_two_weekly_negatives(state_path, "donchian_breakout")
+
+        seen: list[PersistenceState] = []
+        real = rv.assess_strategy
+
+        def spy(strategy_name, window, **kwargs):
+            seen.append(kwargs["persistence_state"])
+            return real(strategy_name, window, **kwargs)
+
+        monkeypatch.setattr(rv, "assess_strategy", spy)
+        window = rv.window_from_args("weekly", end_date=date(2026, 7, 1))
+
+        rv.assess_all_strategies(
+            window, conn=db_conn, state_path=state_path,
+            strategies=["donchian_breakout"],
+            persist_state=False, use_persistence=True,
+        )
+        assert seen[0].negative_weeks == 2
+
+    def test_scheduled_long_window_run_dispatches_no_edge_loss_alert(
+        self, db_conn, tmp_path, monkeypatch,
+    ):
+        """End-to-end through the scheduler with the seeded counter."""
+        import strategies.health.reviewer as rv
+
+        state_path = tmp_path / "health_state.json"
+        self._seed_two_weekly_negatives(state_path, "donchian_breakout")
+        sent: list[str] = []
+        dispatcher = MagicMock()
+        dispatcher.strategy_edge_loss.side_effect = lambda *a, **k: sent.append("EDGE_LOSS")
+
+        captured: dict = {}
+
+        def capture(window, **kwargs):
+            captured.update(kwargs)
+            captured["period_type"] = window.period_type
+            return (None, [])
+
+        monkeypatch.setattr("strategies.health.scheduler.run_review", capture)
+
+        scheduler = HealthReviewScheduler(
+            conn_factory=lambda: db_conn,
+            dispatcher=dispatcher,
+            clock=lambda: _FIRST_OF_MONTH_MIDWEEK,
+        )
+        scheduler()
+
+        assert captured.get("period_type") == "yearly"
+        assert captured.get("use_persistence") is False, (
+            "the scheduled long-window run must not be gated on the weekly "
+            "persistence counter"
+        )
+        assert captured.get("persist_state") is False
+        assert sent == []

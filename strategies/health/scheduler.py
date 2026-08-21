@@ -234,11 +234,21 @@ class HealthReviewScheduler:
         Donchian closes; a 365-day window sees 27 of 25 and reports
         measured R-expectancy with a confidence interval.
 
-        Read-only by design: `persist_state=False`. `negative_weeks` is
-        documented as *consecutive weekly checks* and keys idempotency on
-        `period_end`, which this run shares with the monthly one. Writing
-        from here would either be swallowed as a same-day no-op or clobber
-        the weekly cadence's count with a different window's answer.
+        Observational by design: `persist_state=False` AND
+        `use_persistence=False`. `negative_weeks` is documented as
+        *consecutive weekly checks*, so this run must neither advance it
+        nor be gated on it.
+
+        `persist_state=False` alone is NOT sufficient (PR #120 review, P1):
+        the persisted weekly count is still loaded and threaded into the
+        assessment, so a long-window run sitting on two persisted weekly
+        negatives would project 3, return NEGATIVE and dispatch
+        `STRATEGY_EDGE_LOSS` — on a non-weekly observation, contributing no
+        weekly check of its own, and re-alerting every month because it
+        never persists the increment. `use_persistence=False` feeds the
+        assessment a zeroed state so the `>= 3` gate cannot be reached from
+        here. Health alerts (L1/L2/L3) are not persistence-gated and still
+        fire normally.
         """
         if today.day != 1:
             return
@@ -249,7 +259,11 @@ class HealthReviewScheduler:
             f"ending {today.isoformat()}"
         )
         try:
-            self._run(window_from_args("yearly", end_date=today), persist_state=False)
+            self._run(
+                window_from_args("yearly", end_date=today),
+                persist_state=False,
+                use_persistence=False,
+            )
         except Exception as exc:  # noqa: BLE001
             logger.warning(
                 f"long-window health review failed for period ending "
@@ -259,7 +273,9 @@ class HealthReviewScheduler:
         # failure must not re-fire every cycle for the rest of the day.
         self.last_long_window_fired_date = today
 
-    def _run(self, window, *, persist_state: bool = True) -> None:
+    def _run(
+        self, window, *, persist_state: bool = True, use_persistence: bool = True,
+    ) -> None:
         """Invoke the reviewer with the given window. Persists state by
         default (scheduled weekly/monthly runs are the canonical cadence
         the persistence file is designed for); the long-window run passes
@@ -271,4 +287,5 @@ class HealthReviewScheduler:
             dispatcher=self.dispatcher,
             dry_run=False,
             persist_state=persist_state,
+            use_persistence=use_persistence,
         )

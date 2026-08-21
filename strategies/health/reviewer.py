@@ -684,6 +684,7 @@ def assess_all_strategies(
     engine_state_path: str | Path | None = None,
     strategies: Sequence[str] | None = None,
     persist_state: bool = True,
+    use_persistence: bool = True,
 ) -> list[AssessmentBundle]:
     """Run the full assessment pipeline for all (or a filtered set of)
     strategies for the given window.
@@ -752,7 +753,19 @@ def assess_all_strategies(
                     benchmark_cache[cache_key] = None
             benchmark_return = benchmark_cache[cache_key]
 
-        prev_state = state_file.get_or_default(strategy_name)
+        # `use_persistence=False` is observational mode: the assessment
+        # neither reads nor advances the silent-killer counter. Feeding it
+        # a zeroed state caps the projection at 1, so the `>= 3` gate can
+        # never be satisfied from this run. Without this, `persist_state`
+        # alone is not enough — the loaded weekly count is still THREADED
+        # IN, so a non-weekly run sitting on two persisted weekly negatives
+        # would project 3 and dispatch STRATEGY_EDGE_LOSS while
+        # contributing no weekly observation of its own, and would re-alert
+        # on every subsequent run because it never persists the increment.
+        prev_state = (
+            state_file.get_or_default(strategy_name)
+            if use_persistence else PersistenceState()
+        )
         bundle, new_state = assess_strategy(
             strategy_name,
             window,
@@ -762,7 +775,8 @@ def assess_all_strategies(
             benchmark_return=benchmark_return,
         )
         bundles.append(bundle)
-        state_file = state_file.with_updated(strategy_name, new_state)
+        if use_persistence:
+            state_file = state_file.with_updated(strategy_name, new_state)
 
     # Save the threaded state ONCE at the end (atomic) — unless
     # persist_state=False (dry-run preview). See docstring.
@@ -783,6 +797,7 @@ def run_review(
     strategies: Sequence[str] | None = None,
     dry_run: bool = False,
     persist_state: bool = True,
+    use_persistence: bool = True,
 ) -> tuple[Path | None, list[AssessmentBundle]]:
     """End-to-end: assess all strategies, render markdown, dispatch
     alerts. Returns (report_path, bundles).
@@ -812,6 +827,7 @@ def run_review(
         engine_state_path=engine_state_path,
         strategies=strategies,
         persist_state=persist_state and not dry_run,
+        use_persistence=use_persistence,
     )
 
     markdown = render_markdown(bundles, window)
