@@ -97,7 +97,7 @@ trading-bot/
 │       ├── assessor.py        # HealthAssessor — L1/L2/L3 forensic checks
 │       ├── edge.py            # EdgeAssessor — three-signal verdict + recommendation
 │       ├── reviewer.py        # Orchestrates assessors, renders weekly/monthly reports + alerts
-│       └── scheduler.py       # HealthReviewScheduler — Monday + first-of-month post-cycle hook
+│       └── scheduler.py       # HealthReviewScheduler — Monday weekly + first-of-month monthly & trailing-365d post-cycle hook
 ├── regime/
 │   └── detector.py            # RegimeDetector: BEAR/VOLATILE/TRENDING/RANGING (ADX + ATR%)
 ├── sector/

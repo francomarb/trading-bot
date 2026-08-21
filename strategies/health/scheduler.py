@@ -29,14 +29,22 @@ Per design §10 cadence + §1.2 invariant:
   - Monday (weekday=0, UTC) → weekly report for the *completed*
     Mon→Mon week ending at the current Monday
   - First of month (UTC) → monthly report
+  - First of month (UTC) → trailing-365-day report. Added because the
+    weekly and monthly windows filter trades by date, so their sample
+    never accumulates toward STRATEGY_MIN_TRADES_FOR_VERDICT and both
+    report INSUFFICIENT indefinitely at this bot's trade rate. Runs
+    observationally (persist_state=False AND use_persistence=False) so a
+    non-weekly observation can neither advance nor satisfy the
+    3-consecutive-weekly-checks silent-killer gate.
   - The hook NEVER modifies trading state; it only triggers the
     reviewer which writes a markdown report + dispatches alerts.
   - Engine-loop hook failures are absorbed by the engine's
     try/except wrap (engine/trader.py:start post_cycle_hook).
 
 Idempotency is double-protected:
-  1. In-memory: the scheduler tracks `last_weekly_fired_date` and
-     `last_monthly_fired_date` and short-circuits when called
+  1. In-memory: the scheduler tracks `last_weekly_fired_date`,
+     `last_monthly_fired_date` and `last_long_window_fired_date`, and
+     short-circuits when called
      repeatedly on the same trigger day.
   2. On-disk: even without (1), the lifecycle_counters table's
      UNIQUE(period_type, period_start, strategy_name) constraint
