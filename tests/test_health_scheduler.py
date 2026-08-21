@@ -170,17 +170,23 @@ class TestMonthlyTrigger:
     def test_first_of_month_midweek_fires_monthly_only(
         self, db_conn, mock_run_review,
     ):
-        """July 1, 2026 is a Wednesday — only monthly should fire."""
+        """July 1, 2026 is a Wednesday — monthly + long-window fire, not weekly.
+
+        The long-window run was added alongside monthly because the
+        weekly/monthly windows filter trades by date and so never
+        accumulate enough sample to clear the sufficiency floor.
+        """
         scheduler = _make_scheduler(
             db_conn, clock_value=_FIRST_OF_MONTH_MIDWEEK,
         )
         scheduler()
-        assert mock_run_review.call_count == 1
-        args, kwargs = mock_run_review.call_args
-        window = args[0] if args else kwargs.get("window")
-        if window is None:
-            window = args[0]
-        assert window.period_type == "monthly"
+        assert mock_run_review.call_count == 2
+        types = [c.args[0].period_type for c in mock_run_review.call_args_list]
+        assert types == ["monthly", "yearly"]
+        # The long-window run must NOT advance the weekly persistence counter.
+        by_type = {c.args[0].period_type: c.kwargs for c in mock_run_review.call_args_list}
+        assert by_type["yearly"].get("persist_state") is False
+        assert by_type["monthly"].get("persist_state") is not False
 
     def test_second_of_month_does_not_fire_monthly(
         self, db_conn, mock_run_review,
@@ -198,24 +204,24 @@ class TestMonthlyTrigger:
         )
         for _ in range(5):
             scheduler()
-        assert mock_run_review.call_count == 1
+        # monthly + long-window, once each, however many cycles run.
+        assert mock_run_review.call_count == 2
 
 
 # ── Both fire on Monday + first ───────────────────────────────────────
 
 
 class TestBothFireOnOverlap:
-    """When the 1st of the month is also a Monday, BOTH weekly and
-    monthly reviews fire (independent state tracking). June 1, 2026
-    is a Monday."""
+    """When the 1st of the month is also a Monday, weekly, monthly and
+    the long-window review all fire (independent state tracking).
+    June 1, 2026 is a Monday."""
 
     def test_monday_first_fires_both(self, db_conn, mock_run_review):
         scheduler = _make_scheduler(
             db_conn, clock_value=_FIRST_OF_MONTH_AND_MONDAY,
         )
         scheduler()
-        assert mock_run_review.call_count == 2
-        # Inspect both calls — one weekly, one monthly.
+        assert mock_run_review.call_count == 3
         types = []
         for call in mock_run_review.call_args_list:
             args, kwargs = call
@@ -223,6 +229,7 @@ class TestBothFireOnOverlap:
             types.append(window.period_type)
         assert "weekly" in types
         assert "monthly" in types
+        assert "yearly" in types
 
 
 # ── Failure tolerance ─────────────────────────────────────────────────
@@ -402,3 +409,81 @@ class TestWeeklyFailureIsolationIsTwoWay:
         sched = self._sched(db_conn, tracker, conn_factory=_boom)
         sched()   # must not raise into the trading loop
         assert sched.last_weekly_fired_date == _MONDAY.date()
+
+
+class TestLongWindowTrigger:
+    """The trailing-365-day review (added 2026-08-21).
+
+    Weekly and monthly windows filter trades by date, so their sample is
+    only that period's closes and never accumulates toward
+    STRATEGY_MIN_TRADES_FOR_VERDICT. At this bot's trade rate no strategy
+    can clear its floor inside either window, so both report INSUFFICIENT
+    indefinitely. The long window is the only scheduled run that can
+    produce a measured verdict.
+    """
+
+    def test_fires_on_first_of_month(self, db_conn, mock_run_review):
+        scheduler = _make_scheduler(
+            db_conn, clock_value=_FIRST_OF_MONTH_MIDWEEK,
+        )
+        scheduler()
+        types = [c.args[0].period_type for c in mock_run_review.call_args_list]
+        assert "yearly" in types
+
+    def test_does_not_fire_midmonth(self, db_conn, mock_run_review):
+        clock = datetime(2026, 6, 15, 18, 0, tzinfo=timezone.utc)
+        scheduler = _make_scheduler(db_conn, clock_value=clock)
+        scheduler()
+        types = [c.args[0].period_type for c in mock_run_review.call_args_list]
+        assert "yearly" not in types
+
+    def test_window_spans_365_days(self, db_conn, mock_run_review):
+        scheduler = _make_scheduler(
+            db_conn, clock_value=_FIRST_OF_MONTH_MIDWEEK,
+        )
+        scheduler()
+        w = next(c.args[0] for c in mock_run_review.call_args_list
+                 if c.args[0].period_type == "yearly")
+        assert (w.period_end - w.period_start).days == 365
+
+    def test_is_read_only_for_persistence(self, db_conn, mock_run_review):
+        """
+        `negative_weeks` is documented as *consecutive weekly checks* and
+        keys idempotency on `period_end`, which this run shares with the
+        monthly one. Persisting from here would either be swallowed as a
+        same-day no-op or clobber the weekly cadence's count with a
+        different window's answer.
+        """
+        scheduler = _make_scheduler(
+            db_conn, clock_value=_FIRST_OF_MONTH_MIDWEEK,
+        )
+        scheduler()
+        kw = next(c.kwargs for c in mock_run_review.call_args_list
+                  if c.args[0].period_type == "yearly")
+        assert kw.get("persist_state") is False
+
+    def test_idempotent_within_the_day(self, db_conn, mock_run_review):
+        scheduler = _make_scheduler(
+            db_conn, clock_value=_FIRST_OF_MONTH_MIDWEEK,
+        )
+        for _ in range(5):
+            scheduler()
+        yearly = [c for c in mock_run_review.call_args_list
+                  if c.args[0].period_type == "yearly"]
+        assert len(yearly) == 1
+
+    def test_failure_does_not_reach_the_engine_or_block_other_runs(
+        self, db_conn, mock_run_review,
+    ):
+        """A long-window failure must not suppress the monthly review."""
+        def boom(window, **kwargs):
+            if window.period_type == "yearly":
+                raise RuntimeError("long-window blew up")
+            return (None, [])
+        mock_run_review.side_effect = boom
+        scheduler = _make_scheduler(
+            db_conn, clock_value=_FIRST_OF_MONTH_MIDWEEK,
+        )
+        scheduler()  # must not raise
+        types = [c.args[0].period_type for c in mock_run_review.call_args_list]
+        assert "monthly" in types and "yearly" in types

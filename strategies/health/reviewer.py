@@ -782,6 +782,7 @@ def run_review(
     engine_state_path: str | Path | None = None,
     strategies: Sequence[str] | None = None,
     dry_run: bool = False,
+    persist_state: bool = True,
 ) -> tuple[Path | None, list[AssessmentBundle]]:
     """End-to-end: assess all strategies, render markdown, dispatch
     alerts. Returns (report_path, bundles).
@@ -793,6 +794,16 @@ def run_review(
     state is not written back. This means an operator can run
     dry-run previews repeatedly without inadvertently advancing the
     silent-killer counter outside the scheduled weekly cadence.
+
+    `persist_state=False` writes the report and dispatches alerts as
+    normal but leaves the persistence file untouched. This exists for
+    the long-window run: `PersistenceState.negative_weeks` is defined as
+    *consecutive weekly checks*, and both it and the weekly/monthly runs
+    key idempotency on `window.period_end`. A long-window run sharing a
+    period_end with the monthly run would either be swallowed as a
+    same-day no-op or overwrite the weekly cadence's count with a
+    different window's answer. Keeping it read-only leaves that counter
+    meaning exactly what its docstring says.
     """
     bundles = assess_all_strategies(
         window,
@@ -800,7 +811,7 @@ def run_review(
         state_path=state_path,
         engine_state_path=engine_state_path,
         strategies=strategies,
-        persist_state=not dry_run,
+        persist_state=persist_state and not dry_run,
     )
 
     markdown = render_markdown(bundles, window)
