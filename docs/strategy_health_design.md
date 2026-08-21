@@ -41,7 +41,7 @@ These four bullets are the user's stated priorities. **Every design decision mus
 **This is the strongest design rule in v1 and overrides anything else in this document.** The bot's job in v1 is to **compute assessments and emit reports/alerts**. It does not take action. Every operational decision — change a sleeve weight, pause a strategy, reduce size, re-enable after quarantine — is made by the **operator reading the reports**, not by the bot acting on its own conclusions.
 
 **What the bot is allowed to do in v1:**
-- Compute `EdgeReport` and `HealthReport` per strategy on weekly/monthly cadence
+- Compute `EdgeReport` and `HealthReport` per strategy on weekly / monthly / trailing-365-day cadence
 - Write markdown reports to `data/health_reports/`
 - Render a read-only dashboard panel
 - Send Telegram alerts on defined state transitions (including the silent-killer alarm)
@@ -395,9 +395,33 @@ Three independent signals + persistence requirement. All operate on **R-expectan
 |---|---|---|
 | **Weekly (Monday, completed Mon→Mon week)** | Full L1–L3 + EdgeReport per strategy | Markdown report in `data/health_reports/weekly_YYYY-WW.md`; Telegram summary |
 | **Monthly** | Same + envelope-vs-actual charts + prior-period comparison | Markdown in `data/health_reports/monthly_YYYY-MM.md`; Telegram summary |
+| **Long window (trailing 365 days, first of month)** | Same assessment over a 365-day window | Markdown in `data/health_reports/yearly_<start>_<end>.md`; Telegram summary |
 | **On-demand CLI** | `scripts/strategy_health_review.py --window {weekly,monthly,yearly} [--strategy X]` | stdout + markdown file |
 
 Continuous per-cycle L1/L2 in the engine snapshot is deferred — v1 ships weekly-report-only to keep engine surface area minimal.
+
+**Why the long window was added (2026-08-21).** The weekly and monthly
+assessments filter trades by date (`period_start <= timestamp < period_end`),
+so their sample is only that period's closes — it does not accumulate toward
+`STRATEGY_MIN_TRADES_FOR_VERDICT`. Measured against the floors in §8, no
+strategy at this bot's trade rate can reach its floor inside either window, so
+both report INSUFFICIENT indefinitely and the "time to CONCLUSIVE" table in §8
+cannot be satisfied by either scheduled run. Observed on one day: the weekly
+window saw **2 of 25** Donchian closes; the 365-day window saw **27 of 25**,
+with measured R-expectancy and a CI, plus two `slippage_realized_vs_modeled
+_bps_p95` L2 checks reading BROKEN that no weekly report had the sample to
+evaluate.
+
+The long-window run is **observational**: it passes `persist_state=False` AND
+`use_persistence=False`. `PersistenceState.negative_weeks` is defined as
+*consecutive weekly checks* (§9), so a non-weekly observation must neither
+advance it nor be gated on it. `persist_state=False` alone is insufficient —
+the persisted count is still loaded and threaded into the assessment, so a
+long-window run sitting on two persisted weekly negatives would project 3 and
+dispatch `STRATEGY_EDGE_LOSS` without contributing a weekly check (PR #120
+review). `use_persistence=False` feeds the assessment a zeroed state, capping
+the projection at 1. Health alerts (L1/L2/L3) are not persistence-gated and
+still fire.
 
 ---
 
@@ -447,7 +471,7 @@ strategies/health/
 ├── edge.py            # EdgeAssessor: computes EdgeReport; combines signals into verdict
 ├── persistence.py     # Tracks NEGATIVE-verdict state across weekly checks (3-week rule)
 ├── reports.py         # Dataclasses: HealthReport, EdgeReport, CheckResult, Sufficiency
-└── reviewer.py        # Weekly/monthly report rendering; Telegram summary
+└── reviewer.py        # Weekly/monthly/long-window rendering; Telegram summary
 ```
 
 External pieces:
@@ -455,7 +479,7 @@ External pieces:
 - `scripts/build_envelopes.py` — one-shot per strategy; runs single backtest at production config and writes envelope JSON.
 - `scripts/strategy_health_review.py` — CLI for on-demand reviews.
 - `dashboard.py` — new "Strategy Health & Edge" panel rendering both scorecards per strategy.
-- `forward_test.py` — wires `HealthReviewScheduler` as the engine `post_cycle_hook`: weekly reviewer on Monday (completed week), monthly reviewer on the first of the month.
+- `forward_test.py` — wires `HealthReviewScheduler` as the engine `post_cycle_hook`: weekly reviewer on Monday (completed week), monthly reviewer on the first of the month, and the trailing-365-day reviewer also on the first of the month.
 - `reporting/alerts.py` — new alert types (§11).
 
 **No changes to trading decision behavior in `risk/allocator.py`, `risk/manager.py`, or `engine/trader.py`** — the advisory-only invariant (§1.2) is unchanged. v1 does add **observability-only wiring to `engine/trader.py`**: ~30 LOC to emit per-cycle gate counts (raw_signals, regime_blocked, edge_filter_blocked, sleeve_blocked, risk_blocked, submitted, filled_entries) into the new `strategy_lifecycle_counters` SQLite table (§12.4.1). These counter increments happen *after* each existing gate has already made its decision and have **zero influence on whether a signal is taken** — they are pure measurement of decisions the engine already made. Counter writes are also failure-tolerant: a write error is logged but never raises into the trading loop.
@@ -591,7 +615,7 @@ Single-list reference of exactly what ships in v1, so the eventual implementatio
 - `strategies/health/persistence.py` — reads/writes `data/health_state.json` for 3-week NEGATIVE persistence. §12.4.2
 - `strategies/health/lifecycle.py` — reads/writes `strategy_lifecycle_counters` table; defines counter unit semantics. §12.4.1
 - `strategies/health/reports.py` — dataclasses: `HealthReport`, `EdgeReport`, `CheckResult`, `Sufficiency`, `Recommendation`.
-- `strategies/health/reviewer.py` — weekly/monthly report rendering; Telegram summary. §10, §12.6
+- `strategies/health/reviewer.py` — weekly/monthly/long-window report rendering; Telegram summary. §10, §12.6
 
 **New scripts:**
 - `scripts/build_envelopes.py` — one-shot per strategy; runs single backtest at production config and writes envelope JSON.

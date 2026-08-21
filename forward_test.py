@@ -453,9 +453,19 @@ def main() -> None:
         logger.info("Telegram command listener started (/status, /halt)")
 
     # PLAN 11.10g: Strategy Health & Edge review scheduler. Wired
-    # as engine's post_cycle_hook so the Monday-completed-week
-    # weekly + first-of-month monthly reviewer runs alongside the
-    # trading loop without needing an external cron / systemd timer.
+    # as engine's post_cycle_hook so the Monday-completed-week weekly,
+    # first-of-month monthly, and first-of-month trailing-365-day
+    # reviewers run alongside the trading loop without needing an
+    # external cron / systemd timer.
+    #
+    # The long window exists because the weekly and monthly assessments
+    # filter trades by date, so their sample never accumulates toward
+    # STRATEGY_MIN_TRADES_FOR_VERDICT and both report INSUFFICIENT
+    # indefinitely at this bot's trade rate. It runs observationally
+    # (persist_state=False AND use_persistence=False) so a non-weekly
+    # observation can neither advance nor satisfy the 3-consecutive-
+    # weekly-checks silent-killer gate. See docs/strategy_health_design.md
+    # section 10.
     # Hook failure is absorbed by the engine's try/except wrap —
     # never crashes the trading loop.
     from strategies.health.scheduler import HealthReviewScheduler
