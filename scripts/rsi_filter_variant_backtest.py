@@ -1,18 +1,21 @@
 #!/usr/bin/env python3
-"""Production-style RSI filter variant backtest.
+"""Historical RSI14 filter variant backtest.
 
 This is a research harness for comparing RSI edge-filter variants using the
 same shared-capital assumptions as ``scripts/rsi_portfolio_backtest.py`` plus
 the ATR protective stop used by the live bot.
 Unlike the older RSI reports, entries are gated by historical equivalents of
-the live filters on each signal bar:
+the prior RSI14 filter stack on each signal bar:
 
 - regime gate: allow only TRENDING/RANGING, block BEAR/VOLATILE
 - RSI-specific SPY 50 SMA gate mode (hard, removed, tolerance band, or grace)
 - earnings blackout, fail-open when earnings data is unavailable
 - 20-day average dollar-volume liquidity floor
-- sector momentum block at production COLD threshold
+- configurable sector momentum threshold
 - configurable stock breakdown gate
+
+As of the 2026-08 RSI3 reset, this harness is historical/reference only and
+does not mirror active production RSI.
 """
 
 from __future__ import annotations
@@ -167,8 +170,13 @@ class HistoricalFilteredRSI(RSIReversion):
         df: pd.DataFrame,
         *,
         symbol: str | None = None,
+        current_regime=None,
     ) -> tuple[SignalFrame, SignalFrame, bool | None, list[str]]:
-        return super().inspect_signals(df, symbol=symbol)
+        return super().inspect_signals(
+            df,
+            symbol=symbol or "",
+            current_regime=current_regime,
+        )
 
 
 def _breakdown_gate(close: pd.Series, mode: str) -> pd.Series:
@@ -545,6 +553,7 @@ def _run_variant(
     earnings_by_symbol: dict[str, list[pd.Timestamp]],
     config: BacktestConfig,
     max_positions: int,
+    sector_score_threshold: float,
 ) -> PortfolioBacktestResult:
     edge_filter = HistoricalRSIFilter(
         spy_gate=spy_gate,
@@ -553,6 +562,7 @@ def _run_variant(
         sector_by_symbol=sector_by_symbol,
         earnings_by_symbol=earnings_by_symbol,
         breakdown_mode=variant.breakdown_mode,
+        sector_score_threshold=sector_score_threshold,
     )
     strategy = HistoricalFilteredRSI(edge_filter=edge_filter)
     open_df, low_df, close_df, entries_df, limits_df, exits_df, stop_df = (
@@ -576,14 +586,21 @@ def _run_variant(
     )
 
 
-def _render(results: list[PortfolioBacktestResult], *, feed: str, start: datetime, end: datetime) -> str:
+def _render(
+    results: list[PortfolioBacktestResult],
+    *,
+    feed: str,
+    start: datetime,
+    end: datetime,
+    sector_score_threshold: float,
+) -> str:
     lines = [
         f"# RSI Filter Variant Backtest - {datetime.now(timezone.utc).isoformat(timespec='seconds')}",
         "",
         f"- Feed: `{feed}`",
         f"- Window: {start.date()} to {end.date()}",
         "- Shared-capital portfolio, next-session RSI limit-touch entries, ATR protective stops, 5 bps slippage on market exits/stops, $0 commission.",
-        f"- Filters modeled per historical bar: regime, selected SPY50 policy, earnings fail-open, liquidity, sector score <= {_COLD_THRESHOLD} block, and selected breakdown gate.",
+        f"- Filters modeled per historical bar: regime, selected SPY50 policy, earnings fail-open, liquidity, sector score <= {sector_score_threshold:g} block, and selected breakdown gate.",
         "",
         "| Variant | Symbols | Trades | Return | CAGR | Sharpe | Sortino | MaxDD | Win % | PF | Avg Util | Avg Open Pos | Final Equity |",
         "|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|",
@@ -620,6 +637,15 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--feed", choices=["sip"], default="sip")
     parser.add_argument("--end-delay-minutes", type=int, default=60)
     parser.add_argument("--max-positions", type=int, default=5)
+    parser.add_argument(
+        "--sector-score-threshold",
+        type=float,
+        default=-3.0,
+        help=(
+            "Block sector scores <= threshold. Default -3 matches the prior "
+            "RSI14 mean-reversion sector override; use -2 for generic COLD threshold."
+        ),
+    )
     parser.add_argument("--output", type=Path, default=Path("logs/rsi_filter_variant_backtest_latest.md"))
     return parser.parse_args()
 
@@ -683,10 +709,17 @@ def main() -> None:
             earnings_by_symbol=earnings_by_symbol,
             config=cfg,
             max_positions=args.max_positions,
+            sector_score_threshold=args.sector_score_threshold,
         )
         for variant in variants
     ]
-    report = _render(results, feed=args.feed, start=start, end=end)
+    report = _render(
+        results,
+        feed=args.feed,
+        start=start,
+        end=end,
+        sector_score_threshold=args.sector_score_threshold,
+    )
     print(report)
     args.output.parent.mkdir(parents=True, exist_ok=True)
     args.output.write_text(report, encoding="utf-8")

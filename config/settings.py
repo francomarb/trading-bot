@@ -434,11 +434,22 @@ RSI_WATCHLIST = [
     "CAT", "CIEN", "MCO", "AMZN", "EQIX", "RTX", "META", "HD",
     "SOFI", "ARM", "MSTR",
 ]
-# RSI macro gate tolerance. RSI still requires SPY to be near its 50-day
-# trend, but a 1% band avoids starving mean-reversion entries on tiny SPY
-# dips below the moving average. The structural SPY > 200 / BEAR veto is
-# enforced by RegimeDetector at the strategy-slot level.
+# Legacy/reference RSI macro-gate tolerance used by the historical
+# `scripts/rsi_filter_variant_backtest.py` SPY50 study. The active RSI3
+# quick-exit production slot does not use a SPY50 gate.
 RSI_SPY50_TOLERANCE_PCT = 0.01
+
+# Active equity RSI Reversion production parameters. Keep production,
+# research scripts, and envelope builders pointed at this single source so
+# paper evidence is gathered from the same strategy the bot trades.
+RSI_REVERSION_PARAMS: dict[str, int | float | str | None] = {
+    "period": 3,
+    "oversold": 15.0,
+    "overbought": 70.0,
+    "entry_mode": "level_below",
+    "exit_sma_window": 5,
+    "quick_exit_rsi": 55.0,
+}
 # Bollinger Squeeze (TTM-style volatility breakout) — IMPLEMENTED BUT NOT
 # ACTIVE. Cross-universe research (docs/bollinger_squeeze_universe_research.md)
 # concluded sector ETFs are the optimal universe (Sharpe +0.22, MeanDD -7.7%
@@ -569,7 +580,9 @@ SECTOR_MOMENTUM_SMOOTH_WINDOW: int = 5
 
 STRATEGY_ALLOWED_REGIMES: dict[str, set[str]] = {
     "sma_crossover":     {"TRENDING", "RANGING"},
-    "rsi_reversion":     {"TRENDING", "RANGING"},
+    # Dashboard/config consumers represent RSI's live allowed_regimes=None as
+    # every named regime. The engine slot remains the source of trading truth.
+    "rsi_reversion":     {"TRENDING", "RANGING", "VOLATILE", "BEAR"},
     # Squeeze fires best after compression breaks (TRENDING) or during it (RANGING).
     "bollinger_squeeze": {"TRENDING", "RANGING"},
     # BEAR-only exclusion — changed from TRENDING-only on 2026-08-18 (`11.59`).
@@ -749,11 +762,10 @@ STRATEGY_RISK_PER_TRADE_PCT: dict[str, float] = {
 # usable operator signal instead of dead code. MinTRL-based rigorous
 # replacement remains follow-up §F1.
 #
-# rsi_reversion stays the lowest (8) because its tight filters
-# (SPY trend, earnings blackout, no-new-low) produce observed
-# multi-month zero-trade stretches. The "RSI isn't firing" case is
-# still handled by L3 Drift independently of whether Edge ever
-# reaches CONCLUSIVE.
+# rsi_reversion stays the lowest (8) because its prior tight filter stack
+# produced observed multi-month zero-trade stretches. The active RSI3
+# quick-exit experiment should trade more often, but the lower floor remains
+# appropriate until paper evidence proves its realized cadence.
 #
 # See docs/strategy_health_design.md §8.
 STRATEGY_MIN_TRADES_FOR_VERDICT: dict[str, int] = {

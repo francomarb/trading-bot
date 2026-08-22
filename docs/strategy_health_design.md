@@ -328,10 +328,11 @@ v1 uses a simple per-strategy config:
 # As-built name in config/settings.py is STRATEGY_MIN_TRADES_FOR_VERDICT.
 STRATEGY_MIN_TRADES_FOR_VERDICT = {
     "sma_crossover": 30,
-    "rsi_reversion": 25,         # lowered from initial 50 — RSI's tight filters
-                                 # (SPY trend, earnings blackout, active-breakdown) gate
-                                 # very heavily in some regimes; observed 2-month
-                                 # zero-trade stretches in paper. 25 is reachable.
+    "rsi_reversion": 25,         # lowered from initial 50 after RSI showed
+                                 # multi-month zero-trade stretches in paper.
+                                 # Active RSI3 uses a simpler stock-SMA/liquidity
+                                 # filter, but the floor should move only after
+                                 # live cadence proves the reset.
                                  # The "RSI isn't firing" case is handled by L3
                                  # Drift (trade-frequency vs envelope), not by
                                  # withholding an Edge verdict forever.

@@ -12,10 +12,12 @@ Two distinct things are pinned here:
    way ([[feedback_single_source_of_truth_params]],
    [[feedback_fix_the_writer_production_uses]]).
 
-2. **The `11.59` gate change.** Donchian moved from TRENDING-only to a
-   BEAR-only exclusion on 2026-08-18. The set is asserted explicitly so a
-   silent revert fails rather than passing quietly, and so the four sleeves
-   that were *not* meant to change are pinned at their pre-change values.
+2. **The intentional gate changes.** Donchian moved from TRENDING-only to a
+   BEAR-only exclusion on 2026-08-18. RSI Reversion later moved to
+   `allowed_regimes=None` as part of the RSI3 starvation reset. Both changes
+   are asserted explicitly so a silent revert fails rather than passing
+   quietly, and so the sleeves that were *not* meant to change are pinned at
+   their pre-change values.
 """
 
 from __future__ import annotations
@@ -27,11 +29,10 @@ from regime.detector import MarketRegime
 
 
 # The literals exactly as they stood in forward_test.py at 94ca862, before the
-# resolver replaced them. Four of these must never have changed; Donchian is
-# the one deliberate change and is asserted separately below.
+# resolver replaced them. These must never change accidentally; Donchian and
+# RSI are deliberate changes and are asserted separately below.
 PRE_CHANGE_LITERALS = {
     "sma_crossover": frozenset({MarketRegime.TRENDING, MarketRegime.RANGING}),
-    "rsi_reversion": frozenset({MarketRegime.TRENDING, MarketRegime.RANGING}),
     "spy_options_reversion": frozenset({MarketRegime.TRENDING, MarketRegime.RANGING}),
     "credit_spread": frozenset({MarketRegime.TRENDING, MarketRegime.RANGING}),
 }
@@ -53,7 +54,8 @@ class TestResolverIsTheOnlySource:
             "slots must derive from settings.STRATEGY_ALLOWED_REGIMES via "
             "_allowed_regimes() or the settings dict becomes decorative again"
         )
-        assert text.count("allowed_regimes=_allowed_regimes(") == 5
+        assert text.count("allowed_regimes=_allowed_regimes(") == 4
+        assert text.count("allowed_regimes=None") == 1
 
     def test_resolver_maps_names_to_enum_members(self):
         import forward_test
@@ -109,6 +111,30 @@ class TestDonchianBearOnlyGate:
         assert MarketRegime.RANGING in allowed
         assert MarketRegime.VOLATILE in allowed
         assert MarketRegime.BEAR not in allowed
+
+
+class TestRSIAllRegimeReset:
+    """RSI3 starvation reset — active equity RSI intentionally opts out of regime gating."""
+
+    def test_settings_exposes_all_regimes_for_config_consumers(self):
+        assert settings.STRATEGY_ALLOWED_REGIMES["rsi_reversion"] == {
+            "TRENDING",
+            "RANGING",
+            "VOLATILE",
+            "BEAR",
+        }
+
+    def test_forward_test_slot_uses_none_for_engine_all_regime_semantics(self):
+        """
+        The live engine's all-regime contract is `StrategySlot.allowed_regimes=None`.
+        The settings dict still lists every regime for dashboard/config consumers
+        that need an iterable representation.
+        """
+        from pathlib import Path
+
+        source = Path(settings.__file__).parent.parent / "forward_test.py"
+        text = source.read_text()
+        assert "allowed_regimes=None" in text
 
 
 class TestOtherSleevesUnchanged:

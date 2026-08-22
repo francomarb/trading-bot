@@ -358,6 +358,22 @@ def watchlist_symbol_state(
     return None
 
 
+def regime_gate_allows(
+    regime: str | None,
+    allowed_regimes: set[str] | None,
+) -> bool | None:
+    """Return dashboard entry-gate status for a strategy/regime pair.
+
+    `None` or an empty set means unrestricted for dashboard/config display,
+    matching the engine's `StrategySlot.allowed_regimes=None` convention.
+    """
+    if regime is None:
+        return None
+    if not allowed_regimes:
+        return True
+    return regime in allowed_regimes
+
+
 @st.cache_data(ttl=60, show_spinner=False)
 def load_broker_account_curve(live_trading: bool, period: str = "1M") -> pd.DataFrame:
     """
@@ -2162,10 +2178,8 @@ def render_dashboard() -> None:
         tabs = st.tabs([s.replace("_", " ").title() for s in strategy_watchlists])
         for tab, (strat_name, symbols) in zip(tabs, strategy_watchlists.items()):
             with tab:
-                allowed = strategy_allowed_regimes.get(strat_name, set())
-                regime_ok = (
-                    regime in allowed if regime else None
-                )
+                allowed = strategy_allowed_regimes.get(strat_name)
+                regime_ok = regime_gate_allows(regime, allowed)
                 gate_label = (
                     "✅ Entries allowed" if regime_ok
                     else ("🚫 Entries blocked" if regime_ok is False else "⚪ Market closed")

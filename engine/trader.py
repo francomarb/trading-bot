@@ -1604,10 +1604,11 @@ class TradingEngine:
                     if self._regime_fail_count >= max_failures:
                         logger.error(
                             f"regime detection failed {self._regime_fail_count} "
-                            f"consecutive times: {exc} — falling back to BEAR "
-                            "(fail-closed)"
+                            f"consecutive times: {exc} — regime UNKNOWN, "
+                            "blocking all new entries (fail-closed; exits unaffected)"
                         )
-                        current_regime = MarketRegime.BEAR
+                        current_regime = None
+                        regime_known = False
                     elif self._last_regime is not None:
                         logger.warning(
                             f"regime detection failed "
@@ -1674,6 +1675,22 @@ class TradingEngine:
                             f"{sorted(r.value for r in slot.allowed_regimes)} "
                             "— new entries blocked this cycle"
                         )
+                if not regime_known:
+                    slot_regime_block_reason = (
+                        "regime unknown after detection failure; "
+                        "fail-closed entry block active"
+                    )
+                elif (
+                    current_regime is not None
+                    and slot.allowed_regimes is not None
+                    and not entry_allowed
+                ):
+                    slot_regime_block_reason = (
+                        f"regime {current_regime.value} not in allowed set "
+                        f"{sorted(r.value for r in slot.allowed_regimes)}"
+                    )
+                else:
+                    slot_regime_block_reason = None
 
                 symbols = slot.active_symbols()
                 strategy_statuses: dict[str, str] = {}
@@ -1698,12 +1715,7 @@ class TradingEngine:
                             slot.timeframe,
                             market_open=market_open,
                             entry_allowed=entry_allowed,
-                            regime_block_reason=(
-                                f"regime {current_regime.value} not in allowed set "
-                                f"{sorted(r.value for r in slot.allowed_regimes)}"
-                                if current_regime is not None and slot.allowed_regimes is not None and not entry_allowed
-                                else None
-                            ),
+                            regime_block_reason=slot_regime_block_reason,
                             current_regime=current_regime,
                             order_strategy=order_strategy,
                             strategy_statuses=strategy_statuses,
@@ -1926,6 +1938,35 @@ class TradingEngine:
                     _lc.edge_filter_blocked += 1
                 # else: candidate passes both gates; sleeve/risk
                 # counters increment downstream when applicable.
+            if strategy.name == "rsi_reversion":
+                try:
+                    observation_getter = getattr(strategy, "latest_observation", None)
+                    observation = (
+                        observation_getter(df) if callable(observation_getter) else {}
+                    )
+                    edge_filter = getattr(strategy, "_edge_filter", None)
+                    metrics_getter = getattr(edge_filter, "last_metrics", None)
+                    edge_metrics = metrics_getter if isinstance(metrics_getter, dict) else {}
+                    regime_value = current_regime.value if current_regime is not None else "none"
+                    logger.info(
+                        "RSI_CANDIDATE "
+                        f"symbol={symbol} bar={latest_ts.isoformat()} "
+                        f"regime={regime_value} raw_entry={raw_entry} "
+                        f"edge_allowed={edge_allowed} entry_after_filters={last_entry} "
+                        f"rsi={observation.get('rsi')} "
+                        f"oversold={observation.get('oversold')} "
+                        f"entry_mode={observation.get('entry_mode')} "
+                        f"stock_above_sma={edge_metrics.get('stock_above_sma')} "
+                        f"stock_sma={edge_metrics.get('stock_sma')} "
+                        f"liquid={edge_metrics.get('liquid')} "
+                        f"avg_dollar_vol={edge_metrics.get('avg_dollar_vol')} "
+                        f"reasons={edge_reasons}"
+                    )
+                except Exception as exc:  # noqa: BLE001
+                    logger.warning(
+                        f"[{strategy.name}] {symbol}: RSI_CANDIDATE diagnostics "
+                        f"unavailable — {type(exc).__name__}: {exc}"
+                    )
 
         position = self._get_position_for(symbol, snapshot)
         if strategy.name == "donchian_breakout" and position is not None:

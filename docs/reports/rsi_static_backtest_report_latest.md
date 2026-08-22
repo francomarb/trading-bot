@@ -1,5 +1,8 @@
 # RSI Backtest Report - 2026-05-01T13:28:47+00:00
 
+> Historical RSI14 static-universe report. It does not represent the active
+> 2026-08-21 RSI3 quick-exit production configuration.
+
 - Rule version: `rsi_backtest_report_v1`
 - Strategy: `RSIReversion(period=14, oversold=30, overbought=70)`
 - Promoted symbols: IBM, ABBV, CRDO, WFC, CVX, ANET, IONQ, CAT, OXY, BE, XOM, RTX, AXP, BKNG, BAC, GS, CEG, LMT, WMT, LLY, PG, LIN, AMGN, TMUS

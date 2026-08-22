@@ -39,6 +39,7 @@ if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
 from backtest.runner import BacktestConfig
+from config import settings
 from config.settings import RSI_WATCHLIST
 from data.fetcher import fetch_symbols
 from strategies.rsi_reversion import RSIReversion
@@ -463,7 +464,7 @@ def main() -> None:
         use_cache=True,
     )
 
-    strategy = RSIReversion()
+    strategy = RSIReversion(**settings.RSI_REVERSION_PARAMS)
     cfg = BacktestConfig()
     results: list[PortfolioBacktestResult] = []
     for basket_name in args.baskets:

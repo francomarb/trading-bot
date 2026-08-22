@@ -117,23 +117,25 @@ SMA crossover is the simplest trend-following signal. It captures sustained dire
 | Hard max positions | 8 |
 | Max position % of sleeve | 40% |
 | Per-position budget | **$6,400** baseline at $100k paper equity (0.40 × $16k target sleeve); **up to $7,360** with allocator stretch (`can_stretch: True`) |
-| Watchlist size | 29 names (`RSI_WATCHLIST`) |
+| Watchlist size | 30 names (`RSI_WATCHLIST`) |
 
 **Signal logic:**
-- **Entry:** RSI crosses *below* the oversold threshold (fading a sell-off)
-- **Exit:** RSI crosses *above* the overbought threshold (taking profit on reversion)
+- **Entry:** RSI3 is below 15 while the symbol is flat
+- **Exit:** close is above SMA5 or RSI3 is above 55
 
-Both signals require a confirmed threshold crossing — the previous bar's RSI must have been on the opposite side. Bars where RSI is NaN (early warmup period) produce no signal.
+The active production configuration uses level-below entry, not cross-only entry. The engine's normal ownership and pending-order checks prevent duplicate stacking in the same symbol.
 
-**Default parameters:**
+**Production parameters:**
 
 | Parameter | Default | Description |
 |---|---|---|
-| `period` | 14 | RSI lookback period (bars) |
-| `oversold` | 30 | Entry threshold (RSI below this) |
-| `overbought` | 70 | Exit threshold (RSI above this) |
+| `period` | 3 | RSI lookback period (bars) |
+| `oversold` | 15 | Entry threshold |
+| `entry_mode` | `level_below` | Candidate whenever RSI3 is below the threshold |
+| `exit_sma_window` | 5 | Exit when close recovers above SMA5 |
+| `quick_exit_rsi` | 55 | Exit when RSI3 has recovered |
 
-**Required bars:** `period + 1` (15 with defaults)
+**Required bars:** 5 with production settings.
 
 **Edge filter (`strategies/filters/rsi_reversion.py` — `RSIEdgeFilter`):**
 
@@ -141,49 +143,50 @@ All gates must pass for an entry to be allowed. Exits are never blocked.
 
 | Gate | Rule | Rationale |
 |---|---|---|
-| SPY 50 SMA band | SPY close >= 99% of 50-day SMA | Blocks entries during material intermediate downtrends without starving tiny SPY undercuts |
-| Earnings blackout | No entry within 3 bars before / 2 bars after earnings | Avoids binary-event risk on a mean-reversion strategy |
-| Liquidity floor | 20-day avg dollar volume ≥ $10M | Thin stocks fill partially and exit wide, destroying the edge |
-| Active breakdown | New 20-day low **and** below 200 SMA | Blocks entries in active individual breakdowns without rejecting healthy long-term pullbacks |
+| Stock trend | `close > SMA200` | Avoid buying dips in companies already below long-term trend |
+| Liquidity floor | 20-day avg dollar volume >= $10M | Thin stocks fill partially and exit wide, destroying the edge |
 
-Note: the structural SPY 200 SMA / BEAR-market veto is owned by the engine-level regime detector. `RSIEdgeFilter` keeps only the RSI-specific SPY 50 SMA confirmation band.
-
-**Sector momentum filter (`strategies/filters/sector_momentum.py` — `SectorMomentumFilter`):**
-
-`sector_entry_policy="block"` — entries are blocked when the stock's sector is COLD (score ≤ -2). Rationale: mean-reversion in a cold sector is cluster risk — the stock may be oversold precisely because its sector is in structural breakdown, and the expected reversion may never arrive.
+SPY50, earnings blackout, active-breakdown, sector COLD, and regime gates were removed from active RSI3 production after the 2026-08 starvation audit. They may still appear in historical research scripts and docs.
 
 **Regime gating:**
 
 | Regime | Allowed |
 |---|---|
-| TRENDING | ✅ Yes |
-| RANGING | ✅ Yes |
-| VOLATILE | ❌ No |
-| BEAR | ❌ No |
+| TRENDING | Yes |
+| RANGING | Yes |
+| VOLATILE | Yes |
+| BEAR | Yes |
+
+The live slot expresses this as `allowed_regimes=None`.
 
 **Exit mechanics:**
 
 | Trigger | Mechanism | Code |
 |---|---|---|
-| Overbought RSI | RSI crosses above overbought threshold → strategy emits exit signal | `strategies/rsi_reversion.py` |
+| Quick bounce | Close above SMA5 or RSI3 above 55 -> strategy emits exit signal | `strategies/rsi_reversion.py` |
 | ATR stop-loss | Price falls to `entry_price − (ATR × 2.0)` → broker stop fires | `risk/manager.py` |
 
-Unlike SMA Crossover, RSI Reversion has an implicit profit target: it exits when price has reverted enough to push RSI above overbought. The ATR stop handles the case where the expected reversion does not materialize.
+Unlike the old RSI14 configuration, active RSI3 does not wait for a full RSI70 overbought print. It exits on an earlier bounce so the strategy does not drift back into a slow "wait for bigger recovery" design.
 
 RSI uses LIMIT orders for entry — price is controlled, so no fractional-share path is used (LIMIT/GTC always uses whole-share `floor()`).
 
-**Watchlist:** 29 names in `RSI_WATCHLIST` (`config/settings.py`).
+**Watchlist:** 30 names in `RSI_WATCHLIST` (`config/settings.py`).
 Treat the deployment guide as the live source of truth — the
 embedded list above the current edit was 28 names and stale. The
 deployment guide reflects the current composition and the
 2026-04-30 expansion rationale.
+
+**Starvation audit:** the 2026-08-17 paper-run investigation found that the old
+RSI14 plus stacked-filter design was almost unworkable in live paper: scarce raw
+signals, heavy edge-filter blocking, and one broker-connectivity miss. See
+[`rsi_reversion_starvation_audit.md`](rsi_reversion_starvation_audit.md).
 
 **Why this strategy:**
 RSI mean reversion profits when prices snap back from extremes. It performs well in ranging/sideways markets where SMA crossover suffers, providing natural regime diversification when both strategies run simultaneously.
 
 **Research notes:**
 
-- *2026-05-13 — crossing vs. state entry.* Tested replacing the edge-triggered entry `(rsi < oversold) & (prev_rsi >= oversold)` with a level-triggered version `(rsi < oversold)`, motivated by paper-run signal silence. On the current 28-name basket over 2021-05-13 to 2026-05-13 (SIP, 5 bps, `max_positions=5`): state entry roughly doubled trade count (19 → 38) and avg concurrent positions (1.53 → 2.96), but Sharpe fell 0.84 → 0.77 and MaxDD widened from −21.3% to −33.7%. Win rate improved (73.7% → 81.6%) but profit factor collapsed (13.75 → 4.46). Per-symbol metrics were nearly identical; the divergence comes entirely from portfolio-level collision behavior — more concurrent oversold names means a market dip clusters correlated exposure. Conclusion: density goal met but risk-adjusted return worse. Crossing rule retained.
+- *2026-08-21 — simplification reset.* Active paper config moved to RSI3 `<15`, level-below entry, close>SMA5 or RSI3>55 exit, all regimes, and only stock SMA200/liquidity gates. Reference SIP backtests are treated as orientation, not final truth; live paper evidence decides whether this configuration is viable.
 
 ---
 

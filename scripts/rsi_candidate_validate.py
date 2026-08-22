@@ -28,12 +28,13 @@ if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
 from backtest.runner import BacktestConfig, run_backtest
+from config import settings
 from indicators.technicals import add_atr, add_rsi
 from scripts.sma_watchlist_scan import configure_logging, fetch_daily_bars
 from strategies.rsi_reversion import RSIReversion
 
 
-RULE_VERSION = "rsi_validation_v1"
+RULE_VERSION = "rsi_validation_v2_rsi3_quick_exit"
 DEFAULT_SYMBOLS = ["DINO", "CDNS"]
 DEFAULT_CONTROLS = ["NVDA", "MSFT"]
 SCANNER_CANDIDATES = [
@@ -50,15 +51,28 @@ SCANNER_CANDIDATES = [
     "SN",
 ]
 
+_RSI_PARAMS = settings.RSI_REVERSION_PARAMS
+
 
 @dataclass(frozen=True)
 class ValidationConfig:
     """RSI validation thresholds and assumptions."""
 
-    rsi_period: int = 14
-    oversold: float = 30.0
-    overbought: float = 70.0
-    reversion_threshold: float = 50.0
+    rsi_period: int = int(_RSI_PARAMS["period"])
+    oversold: float = float(_RSI_PARAMS["oversold"])
+    overbought: float = float(_RSI_PARAMS["overbought"])
+    entry_mode: str = str(_RSI_PARAMS["entry_mode"])
+    exit_sma_window: int | None = (
+        int(_RSI_PARAMS["exit_sma_window"])
+        if _RSI_PARAMS["exit_sma_window"] is not None
+        else None
+    )
+    quick_exit_rsi: float | None = (
+        float(_RSI_PARAMS["quick_exit_rsi"])
+        if _RSI_PARAMS["quick_exit_rsi"] is not None
+        else None
+    )
+    reversion_threshold: float = 55.0
     event_window_days: int = 10
     atr_period: int = 14
     atr_stop_multiplier: float = 2.0
@@ -138,6 +152,9 @@ def validate_symbols(
             period=config.rsi_period,
             oversold=config.oversold,
             overbought=config.overbought,
+            entry_mode=config.entry_mode,
+            exit_sma_window=config.exit_sma_window,
+            quick_exit_rsi=config.quick_exit_rsi,
         )
         bt = run_backtest(
             strategy,
@@ -171,13 +188,16 @@ def extract_oversold_events(
     symbol: str,
     config: ValidationConfig,
 ) -> list[EventRecord]:
-    """Return every RSI cross below oversold and its next-N-day outcome."""
+    """Return every RSI oversold event and its next-N-day outcome."""
     work = add_rsi(df, config.rsi_period)
     work = add_atr(work, config.atr_period)
     rsi_col = f"rsi_{config.rsi_period}"
     atr_col = f"atr_{config.atr_period}"
     rsi = work[rsi_col]
-    events = (rsi < config.oversold) & (rsi.shift(1) >= config.oversold)
+    if config.entry_mode == "level_below":
+        events = rsi < config.oversold
+    else:
+        events = (rsi < config.oversold) & (rsi.shift(1) >= config.oversold)
     records: list[EventRecord] = []
 
     for idx, is_event in enumerate(events.fillna(False).tolist()):
@@ -252,7 +272,8 @@ def render_report(
         f"- Data window: {start.date()} to {end.date()}",
         f"- Data end timestamp: {end.isoformat(timespec='seconds')}",
         f"- RSI: period={config.rsi_period}, oversold={config.oversold:g}, "
-        f"overbought={config.overbought:g}",
+        f"entry_mode={config.entry_mode}, exit_sma_window={config.exit_sma_window}, "
+        f"quick_exit_rsi={config.quick_exit_rsi}",
         f"- Costs: slippage={config.slippage_bps:g} bps, "
         f"commission=${config.commission_per_trade:.2f}",
         "",

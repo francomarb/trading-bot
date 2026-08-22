@@ -20,6 +20,7 @@ from __future__ import annotations
 import pandas as pd
 import pytest
 
+from config import settings
 from strategies.base import BaseStrategy, EdgeFilterDecision, OrderType, SignalFrame
 from strategies.rsi_reversion import RSIReversion
 from strategies.sma_crossover import SMACrossover
@@ -356,6 +357,7 @@ class TestRequiredBars:
     def test_rsi_reversion_returns_period_plus_one(self):
         assert RSIReversion(period=14).required_bars() == 15
         assert RSIReversion(period=5).required_bars() == 6
+        assert RSIReversion(period=3, exit_sma_window=5).required_bars() == 5
 
     def test_spy_options_reversion_returns_rsi_length_plus_five(self):
         assert SPYOptionsReversionStrategy(rsi_length=14).required_bars() == 19
@@ -366,6 +368,22 @@ class TestRequiredBars:
 
 
 class TestRSIReversionParams:
+    def test_active_rsi_reversion_params_are_centralized_in_settings(self):
+        assert settings.RSI_REVERSION_PARAMS == {
+            "period": 3,
+            "oversold": 15.0,
+            "overbought": 70.0,
+            "entry_mode": "level_below",
+            "exit_sma_window": 5,
+            "quick_exit_rsi": 55.0,
+        }
+        assert settings.STRATEGY_ALLOWED_REGIMES["rsi_reversion"] == {
+            "TRENDING",
+            "RANGING",
+            "VOLATILE",
+            "BEAR",
+        }
+
     def test_period_must_be_positive_int(self):
         with pytest.raises(TypeError):
             RSIReversion(period=3.5)
@@ -383,6 +401,16 @@ class TestRSIReversionParams:
             RSIReversion(oversold=0, overbought=70)
         with pytest.raises(ValueError):
             RSIReversion(oversold=30, overbought=100)
+
+    def test_entry_mode_must_be_known(self):
+        with pytest.raises(ValueError, match="entry_mode"):
+            RSIReversion(entry_mode="cross_above")
+
+    def test_quick_exit_params_must_be_valid(self):
+        with pytest.raises(ValueError, match="exit_sma_window"):
+            RSIReversion(exit_sma_window=0)
+        with pytest.raises(ValueError, match="quick_exit_rsi"):
+            RSIReversion(oversold=15, quick_exit_rsi=10)
 
     def test_default_order_type_is_limit(self):
         assert RSIReversion().preferred_order_type == OrderType.LIMIT
@@ -434,6 +462,60 @@ class TestRSIReversionSignals:
         entry_idx = sig.entries[sig.entries].index.min()
         exit_idx = sig.exits[sig.exits].index.min()
         assert entry_idx < exit_idx
+
+    def test_level_below_entry_can_fire_on_consecutive_oversold_bars(self):
+        df = _df([100.0] * 5 + [95.0, 90.0, 85.0, 80.0, 75.0, 70.0])
+        sig = RSIReversion(
+            period=3,
+            oversold=15,
+            overbought=70,
+            entry_mode="level_below",
+        ).generate_signals(df)
+        assert sig.entries.sum() >= 2
+
+    def test_quick_exit_on_close_above_sma_when_rsi_recovery_disabled(self):
+        df = _df([100.0, 100.0, 100.0, 90.0, 80.0, 79.0, 81.0])
+        sig = RSIReversion(
+            period=3,
+            oversold=15,
+            overbought=70,
+            entry_mode="level_below",
+            exit_sma_window=3,
+            quick_exit_rsi=None,
+        ).generate_signals(df)
+        assert sig.entries.any()
+        assert sig.exits[sig.exits].index.tolist() == [df.index[-1]]
+
+    def test_quick_exit_on_rsi_recovery_when_sma_exit_disabled(self):
+        df = _df([100.0, 100.0, 100.0, 90.0, 80.0, 85.0, 90.0, 95.0])
+        sig = RSIReversion(
+            period=3,
+            oversold=15,
+            overbought=70,
+            entry_mode="level_below",
+            exit_sma_window=None,
+            quick_exit_rsi=55,
+        ).generate_signals(df)
+        assert sig.entries.any()
+        assert sig.exits[sig.exits].index.tolist() == [df.index[-1]]
+
+    def test_latest_observation_reports_compact_rsi_state(self):
+        df = _df([100.0] * 5 + [90.0, 80.0, 85.0, 90.0, 95.0])
+        strategy = RSIReversion(
+            period=3,
+            oversold=15,
+            overbought=70,
+            entry_mode="level_below",
+            exit_sma_window=3,
+            quick_exit_rsi=55,
+        )
+        observation = strategy.latest_observation(df)
+        assert observation["entry_mode"] == "level_below"
+        assert observation["oversold"] == 15.0
+        assert observation["exit_sma_window"] == 3
+        assert observation["quick_exit_rsi"] == 55.0
+        assert observation["rsi"] is not None
+        assert observation["exit_sma"] is not None
 
     def test_no_signals_on_monotonic_uptrend(self):
         df = _df(list(range(1, 40)))

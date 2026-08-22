@@ -209,7 +209,7 @@ Indexed on `(position_id, ts)`. Written by `engine/trader.py` at session close. 
 | Archetype | Strategies in bucket | Distinctive expectations |
 |---|---|---|
 | **Trend-following equities** | SMA crossover, Donchian breakout | Wide expected hold time; sparse signals → small-N tolerance; can chase entries up to a cap (11.32); higher slippage tolerance acceptable on momentum names |
-| **Mean-reversion equities** | RSI reversion | Limit orders → fill rate is critical health metric; entry slippage near zero (passive fills); earnings blackout discipline → blackout violations are L1 BROKEN |
+| **Mean-reversion equities** | RSI reversion | Limit orders → fill rate is critical health metric; entry slippage near zero (passive fills); candidate cadence and clustered dip-buying are key paper-watch signals |
 | **Breakout trend** | Donchian breakout (sub-bucket of trend) | Watch entry chase tightly; signal clustering on universe-wide breakout days is expected, not anomalous |
 | **Options long premium** | SPY options reversion | Spread quality is dominant L2 metric; theta decay → expected daily MTM drift; premium-paid efficiency in EdgeReport |
 | **Options short premium / multi-leg** | Credit spreads | Atomic combo fill rate; net credit captured vs spread width; assignment risk near expiry as L1 check |

@@ -358,8 +358,9 @@ class TestProductionFilterWiring:
             out_dir=tmp_path,
         )
         notes_joined = " ".join(env.notes)
-        # All four key facts must be present in the operator-facing notes:
-        assert "SPY trend" in notes_joined  # live-cycle leakage
+        # Key facts must be present in the operator-facing notes:
+        assert "stock SMA200" in notes_joined  # active RSI gate fidelity
+        assert "dollar-volume liquidity" in notes_joined
         assert "SectorMomentumFilter" in notes_joined  # omission
         assert "stock-level" in notes_joined.lower()  # what replays
         assert "OVER-counts" in notes_joined  # net effect

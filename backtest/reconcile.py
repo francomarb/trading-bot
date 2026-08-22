@@ -109,7 +109,7 @@ class Reconciler:
         return_divergence_threshold: float | None = None,
         max_slippage_threshold: float | None = None,
         timeframe: str = "1Day",
-        history_lookback_days: int = 200,
+        history_lookback_days: int = 420,
     ) -> None:
         from reporting.logger import TradeLogger
 

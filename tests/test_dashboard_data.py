@@ -26,6 +26,7 @@ from dashboard import (
     load_trades,
     merge_display_positions_detail,
     multi_leg_display_rows,
+    regime_gate_allows,
     realized_trade_events,
     refresh_multi_leg_positions,
     resolve_account_metrics,
@@ -131,6 +132,23 @@ class TestLoadTrades:
         assert df.empty
         assert "load_error" in df.attrs
         assert "broken db" in df.attrs["load_error"]
+
+
+class TestRegimeGateAllows:
+    def test_full_regime_set_allows_rsi_dashboard_all_regimes(self):
+        allowed = {"TRENDING", "RANGING", "VOLATILE", "BEAR"}
+        for regime in allowed:
+            assert regime_gate_allows(regime, allowed) is True
+
+    def test_empty_set_means_unrestricted_for_dashboard_display(self):
+        assert regime_gate_allows("BEAR", set()) is True
+        assert regime_gate_allows("TRENDING", None) is True
+
+    def test_regime_not_in_nonempty_set_blocks(self):
+        assert regime_gate_allows("BEAR", {"TRENDING", "RANGING"}) is False
+
+    def test_missing_regime_is_unknown(self):
+        assert regime_gate_allows(None, {"TRENDING"}) is None
 
 
 # ── load_engine_state ────────────────────────────────────────────────────────

@@ -7,20 +7,24 @@ exits are never blocked regardless of regime.
 
 Ownership model
 ---------------
-This module owns macro-level SPY rules that apply universally across all
-long-only strategies:
-  - BEAR      : SPY < 200-day SMA — no new longs, period.
+This module owns macro-level SPY regime classification shared by all slots.
+Slot-level `allowed_regimes` decides whether a classification blocks entries:
+  - BEAR      : SPY < 200-day SMA — blocks new longs for slots that declare a
+                BEAR veto.
   - VOLATILE  : ATR% in the top 80th percentile of recent history — extreme
                 volatility degrades every strategy's edge and inflates slippage.
 
-Strategy-specific SPY rules stay in their edge filters:
-  - RSIEdgeFilter keeps SPY > 50 SMA (mean-reversion degrades in corrections).
+Strategy-specific SPY rules stay in their edge filters when a strategy needs
+them.
   - SMAEdgeFilter's SPY > 200 SMA check is DISABLED (this module owns it now).
+  - The active equity RSI3 reset currently uses no SPY edge-filter gate; it
+    keeps only stock-local SMA200/liquidity protection.
 
 Regimes
 -------
   BEAR      SPY close < SPY 200-day SMA.
-            No new long entries for any strategy. Hard stop.
+            Entry blocking is slot-owned: regime-gated long strategies usually
+            block BEAR; RSI3 currently opts into all detected regimes.
 
   VOLATILE  Current ATR% (ATR14 / close) BOTH ranks above the
             `vol_percentile_threshold` (default 80th) of its trailing
@@ -58,7 +62,7 @@ same default silently became entry-PERMITTING. A fabricated value also hid the
 failure from the engine's consecutive-failure counter, since returning a value
 is not an error. The engine now blocks new entries while the regime is unknown,
 without triggering the BEAR defensive sweep — a data outage is not a bear
-market.
+market. Entry blocking remains the engine slot's responsibility.
 
 VIX integration
 ---------------
@@ -118,7 +122,7 @@ class MarketRegime(Enum):
     TRENDING = "trending"   # ADX ≥ 25, SPY above MAs — trend-following favoured
     RANGING  = "ranging"    # ADX ≤ 20 or ambiguous — mean-reversion favoured
     VOLATILE = "volatile"   # ATR% > 80th percentile — all new entries blocked
-    BEAR     = "bear"       # SPY < 200 SMA — all new longs blocked
+    BEAR     = "bear"       # SPY < 200 SMA — slot-level gate decides blocking
 
 
 # ── Detector ──────────────────────────────────────────────────────────────────

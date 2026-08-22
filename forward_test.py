@@ -274,28 +274,18 @@ def main() -> None:
         ),
         StrategySlot(
             strategy=RSIReversion(
-                period=14, oversold=30, overbought=70,
-                edge_filter=CompositeEdgeFilter([
-                    RSIEdgeFilter(),
-                    SectorMomentumFilter(
-                        gauge=sector_gauge, resolver=sector_resolver,
-                        sector_entry_policy="block",
-                        score_threshold=-3,
-                    ),
-                ]),
+                **settings.RSI_REVERSION_PARAMS,
+                edge_filter=RSIEdgeFilter(),
             ),
             watchlist_source=StaticWatchlistSource(
                 list(settings.RSI_WATCHLIST), name="rsi"
             ),
-            # RSI reversion works in both trending and ranging markets;
-            # blocked in BEAR (stocks can keep falling past oversold) and
-            # VOLATILE (fear-driven overshoots are unpredictable and the
-            # snap-back timing is unreliable). The RSI edge filter adds the
-            # RSI-specific SPY 50 SMA confirmation with a 1% tolerance band;
-            # the structural SPY > 200 / BEAR veto is owned by the regime gate above.
-            # Missing SMA history fails closed. Sector momentum: COLD sectors BLOCK entries
-            # (mean-reversion in a cold sector = cluster risk).
-            allowed_regimes=_allowed_regimes("rsi_reversion"),
+            # RSI3 quick-exit experiment intentionally trades in all regimes.
+            # Protection is stock-local and order/risk based: close > SMA200,
+            # liquidity floor, ATR stop, sleeve sizing, max-position caps, and
+            # global risk halts. No SPY50, sector, earnings, breakdown, or
+            # regime gate is stacked here while live paper evidence is gathered.
+            allowed_regimes=None,
         ),
         StrategySlot(
             strategy=DonchianBreakout(

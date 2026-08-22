@@ -127,18 +127,15 @@ the market pricing bankruptcy or permanent impairment.
 
 Required before allowing new RSI entries:
 
-- engine-level regime must be `TRENDING` or `RANGING`
-- `RSIEdgeFilter` requires SPY close >= 99% of its 50-day SMA
+- active production RSI3 does not use a regime gate
+- active `RSIEdgeFilter` requires stock close > SMA200 and 20-day average dollar volume >= $10M
 
 Rationale:
 
-Long-only mean reversion degrades in broad market downtrends. In those regimes,
-oversold can become more oversold.
-
-The structural SPY 200-day BEAR veto is owned by `RegimeDetector`, not duplicated
-inside `RSIEdgeFilter`. The SPY 50 SMA band is an edge-filter rule, not a
-watchlist-membership rule. The scanner may report it, but the engine gates
-entries at runtime.
+The 2026-08 reset deliberately stopped using broad-market gates as watchlist
+membership criteria. The runtime question is now whether RSI3 can trade enough
+while protected by stock-local trend, liquidity, ATR stops, sleeve limits, and
+global risk controls.
 
 ### 5. Symbol Structure
 
@@ -164,8 +161,8 @@ trend-following-heavy and would remove many useful pullback candidates.
 
 Required:
 
-- at least 3 RSI(14) oversold events in the last 252 trading days
-- at least 50% of those events reverted to RSI(14) >= 50 within 10 trading days
+- at least 3 RSI(3) oversold events in the last 252 trading days
+- at least 50% of those events reverted to RSI(3) >= 55 or close > SMA5 within 10 trading days
 - no more than 2 ATR-stop-style failures in the last 252 trading days
 
 Rationale:

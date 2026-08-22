@@ -29,7 +29,7 @@ from scripts.sma_watchlist_scan import configure_logging, fetch_daily_bars
 from strategies.rsi_reversion import RSIReversion
 
 
-RULE_VERSION = "rsi_backtest_report_v1"
+RULE_VERSION = "rsi_backtest_report_v2_rsi3_quick_exit"
 DEFAULT_COMPARISONS = ["ABNB", "DINO"]
 
 
@@ -85,6 +85,9 @@ def run_symbol_backtests(
         period=validation_config.rsi_period,
         oversold=validation_config.oversold,
         overbought=validation_config.overbought,
+        entry_mode=validation_config.entry_mode,
+        exit_sma_window=validation_config.exit_sma_window,
+        quick_exit_rsi=validation_config.quick_exit_rsi,
     )
 
     for symbol in promoted + comparisons:
@@ -138,7 +141,10 @@ def render_report(
         f"- Rule version: `{RULE_VERSION}`",
         f"- Strategy: `RSIReversion(period={validation_config.rsi_period}, "
         f"oversold={validation_config.oversold:g}, "
-        f"overbought={validation_config.overbought:g})`",
+        f"overbought={validation_config.overbought:g}, "
+        f"entry_mode={validation_config.entry_mode!r}, "
+        f"exit_sma_window={validation_config.exit_sma_window}, "
+        f"quick_exit_rsi={validation_config.quick_exit_rsi})`",
         f"- Promoted symbols: {', '.join(promoted)}",
         f"- Comparison symbols: {', '.join(comparisons)}",
         f"- Alpaca feed: `{feed}`",

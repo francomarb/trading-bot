@@ -95,7 +95,7 @@ trading-bot/
 │   ├── filters/
 │   │   ├── common.py          # SPYTrendFilter + CompositeEdgeFilter
 │   │   ├── sma_crossover.py   # SMAEdgeFilter: stock > 200 SMA, volume expansion
-│   │   ├── rsi_reversion.py   # RSIEdgeFilter: SPY50 band, earnings, liquidity, active-breakdown
+│   │   ├── rsi_reversion.py   # RSIEdgeFilter: stock SMA200 + liquidity
 │   │   ├── donchian_breakout.py      # DonchianEdgeFilter: stock > 200 SMA, liquidity, earnings
 │   │   ├── spy_options_reversion.py  # SPYOptionsEdgeFilter: SPY > 100 SMA + TRENDING-only VIX-percentile gate
 │   │   ├── credit_spread.py   # CreditSpreadEdgeFilter: trend + IV proxy + earnings
@@ -230,10 +230,15 @@ Key rules:
 
 | Regime | Condition | SMA | RSI | Donchian | SPY Options | Credit Spread |
 |---|---|---|---|---|---|---|
-| BEAR | SPY < 200-day SMA | ❌ | ❌ | ❌ | ❌ | ❌ |
-| VOLATILE | ATR% above 80th percentile of trailing 126 bars | ❌ | ❌ | ❌ | ❌ | ❌ |
+| BEAR | SPY < 200-day SMA | ❌ | ✅ | ❌ | ❌ | ❌ |
+| VOLATILE | ATR% above 80th percentile of trailing 126 bars | ❌ | ✅ | ❌ | ❌ | ❌ |
 | TRENDING | ADX ≥ 25 | ✅ | ✅ | ✅ | ✅ | ✅ |
 | RANGING | ADX ≤ 20 (or ambiguous zone, SMA50 slope tie-break) | ✅ | ✅ | ❌ | ✅ | ✅ |
+
+RSI here means the active equity RSI3 reset slot, which intentionally declares
+`allowed_regimes=None` and can trade all detected regimes. Repeated regime
+detection failures still trigger the engine-level fail-closed guard and block
+new entries for every slot, including RSI.
 
 **Classification priority:** BEAR → VOLATILE → TRENDING/RANGING (ADX + slope).
 
@@ -397,7 +402,7 @@ Each slot binds a strategy to its symbol universe, timeframe, and allowed regime
 | Strategy | File | Status | Order Type | Allowed Regimes | Sleeve |
 |---|---|---|---|---|---|
 | SMA Crossover | `sma_crossover.py` | **Paper Trading** | MARKET | TRENDING, RANGING | 40% (equity) |
-| RSI Reversion | `rsi_reversion.py` | **Paper Trading** | LIMIT | TRENDING, RANGING | 20% (equity) |
+| RSI Reversion | `rsi_reversion.py` | **Paper Trading** | LIMIT | All (`allowed_regimes=None`) | 20% (equity) |
 | Donchian Breakout | `donchian_breakout.py` | **Paper Trading** | MARKET | TRENDING only | 25% (equity) |
 | SPY Options RSI Reversion | `spy_options_reversion.py` | **Paper Trading** | LIMIT (async bracket) | TRENDING, RANGING | 5% (isolated) |
 | Credit Spread (SPY + QQQ) | `credit_spread.py` | **Paper Trading** | MLEG combo (async) | TRENDING, RANGING | 10% (isolated, shared across underlyings) |

@@ -185,8 +185,8 @@ Before scoring, remove symbols that fail basic quality standards.
 ### Example baseline filters
 
 These are scanner examples, not the live `RSIEdgeFilter` contract. The current
-production edge filter uses the regime gate, SPY 50 SMA band, earnings,
-liquidity, sector, and active-breakdown checks at runtime.
+production edge filter uses only stock SMA200 and liquidity at runtime for the
+RSI3 quick-exit paper experiment.
 
 - minimum price threshold
 - minimum average daily dollar volume
