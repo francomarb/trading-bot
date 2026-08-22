@@ -230,10 +230,15 @@ Key rules:
 
 | Regime | Condition | SMA | RSI | Donchian | SPY Options | Credit Spread |
 |---|---|---|---|---|---|---|
-| BEAR | SPY < 200-day SMA | ❌ | ❌ | ❌ | ❌ | ❌ |
-| VOLATILE | ATR% above 80th percentile of trailing 126 bars | ❌ | ❌ | ❌ | ❌ | ❌ |
+| BEAR | SPY < 200-day SMA | ❌ | ✅ | ❌ | ❌ | ❌ |
+| VOLATILE | ATR% above 80th percentile of trailing 126 bars | ❌ | ✅ | ❌ | ❌ | ❌ |
 | TRENDING | ADX ≥ 25 | ✅ | ✅ | ✅ | ✅ | ✅ |
 | RANGING | ADX ≤ 20 (or ambiguous zone, SMA50 slope tie-break) | ✅ | ✅ | ❌ | ✅ | ✅ |
+
+RSI here means the active equity RSI3 reset slot, which intentionally declares
+`allowed_regimes=None` and can trade all detected regimes. Repeated regime
+detection failures still trigger the engine-level fail-closed guard and block
+new entries for every slot, including RSI.
 
 **Classification priority:** BEAR → VOLATILE → TRENDING/RANGING (ADX + slope).
 
