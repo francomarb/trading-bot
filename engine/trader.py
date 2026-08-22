@@ -1230,6 +1230,7 @@ class TradingEngine:
             # Regime detection — runs once per cycle, before any slot.
             # Exits are never blocked by regime; only new entries are gated.
             current_regime = None
+            regime_fail_closed = False
             if self._regime_detector is not None:
                 try:
                     current_regime = self._regime_detector.detect()
@@ -1251,6 +1252,7 @@ class TradingEngine:
                             "(fail-closed)"
                         )
                         current_regime = MarketRegime.BEAR
+                        regime_fail_closed = True
                     elif self._last_regime is not None:
                         logger.warning(
                             f"regime detection failed "
@@ -1291,7 +1293,14 @@ class TradingEngine:
                 # Per-slot regime gate: block new entries if current regime is
                 # not in the slot's allowed set. Exits always proceed.
                 entry_allowed = True
-                if current_regime is not None and slot.allowed_regimes is not None:
+                if regime_fail_closed:
+                    entry_allowed = False
+                    logger.info(
+                        f"[{slot.strategy.name}] regime detection fail-closed "
+                        f"to {current_regime.value if current_regime else 'unknown'} "
+                        "— new entries blocked this cycle"
+                    )
+                elif current_regime is not None and slot.allowed_regimes is not None:
                     if current_regime not in slot.allowed_regimes:
                         entry_allowed = False
                         logger.info(
@@ -1300,6 +1309,22 @@ class TradingEngine:
                             f"{sorted(r.value for r in slot.allowed_regimes)} "
                             "— new entries blocked this cycle"
                         )
+                if regime_fail_closed:
+                    slot_regime_block_reason = (
+                        "regime detection failed too many consecutive times; "
+                        "fail-closed entry block active"
+                    )
+                elif (
+                    current_regime is not None
+                    and slot.allowed_regimes is not None
+                    and not entry_allowed
+                ):
+                    slot_regime_block_reason = (
+                        f"regime {current_regime.value} not in allowed set "
+                        f"{sorted(r.value for r in slot.allowed_regimes)}"
+                    )
+                else:
+                    slot_regime_block_reason = None
 
                 symbols = slot.active_symbols()
                 strategy_statuses: dict[str, str] = {}
@@ -1324,12 +1349,7 @@ class TradingEngine:
                             slot.timeframe,
                             market_open=market_open,
                             entry_allowed=entry_allowed,
-                            regime_block_reason=(
-                                f"regime {current_regime.value} not in allowed set "
-                                f"{sorted(r.value for r in slot.allowed_regimes)}"
-                                if current_regime is not None and slot.allowed_regimes is not None and not entry_allowed
-                                else None
-                            ),
+                            regime_block_reason=slot_regime_block_reason,
                             current_regime=current_regime,
                             order_strategy=order_strategy,
                             strategy_statuses=strategy_statuses,

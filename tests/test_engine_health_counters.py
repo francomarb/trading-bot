@@ -306,6 +306,52 @@ class TestCounterEmissions:
         assert c.submitted == 1
         assert c.filled_entries == 0
 
+    def test_rsi_candidate_log_includes_signal_and_filter_diagnostics(
+        self, make_engine,
+    ):
+        class _AllowingMetricsFilter:
+            def __call__(self, df):
+                return EdgeFilterDecision(
+                    allowed=pd.Series([True] * len(df), index=df.index, dtype=bool),
+                    reasons=pd.Series([[] for _ in range(len(df))], index=df.index),
+                )
+
+            def set_symbol(self, symbol):
+                self.symbol = symbol
+
+            @property
+            def last_metrics(self):
+                return {
+                    "stock_above_sma": True,
+                    "stock_sma": 99.5,
+                    "liquid": True,
+                    "avg_dollar_vol": 12_500_000.0,
+                }
+
+        engine, _, strategy, _ = make_engine(entry_on_last_bar=True)
+        strategy.name = "rsi_reversion"
+        strategy._edge_filter = _AllowingMetricsFilter()
+        strategy.latest_observation = lambda _df: {
+            "rsi": 12.5,
+            "oversold": 15.0,
+            "entry_mode": "level_below",
+        }
+
+        with patch("engine.trader.logger.info") as info:
+            engine._run_one_cycle()
+
+        messages = [call.args[0] for call in info.call_args_list if call.args]
+        candidate_logs = [m for m in messages if m.startswith("RSI_CANDIDATE ")]
+        assert len(candidate_logs) == 1
+        log_line = candidate_logs[0]
+        assert "symbol=AAPL" in log_line
+        assert "rsi=12.5" in log_line
+        assert "oversold=15.0" in log_line
+        assert "entry_mode=level_below" in log_line
+        assert "stock_above_sma=True" in log_line
+        assert "liquid=True" in log_line
+        assert "avg_dollar_vol=12500000.0" in log_line
+
 
 class TestMutualExclusivity:
     """Per design §12.4.1: only ONE block counter increments per

@@ -138,7 +138,7 @@ Top symbols by `RSI_FILTER_BLOCKED` evaluation count:
 | Earnings blackout | 3 calendar days before, 2 after | Earnings gaps can invalidate "oversold" mean reversion before the trade can work | Strong blocker in retained logs. It is risk-rational, but it collides with sparse raw setup frequency. |
 | Liquidity | 20-day average dollar volume >= $10M | Passive limit orders need fillable names | No retained starvation evidence. |
 | Active breakdown | New 20-day low and below 200 SMA | Distinguish a normal pullback from a falling-knife breakdown | Biggest retained blocker family. The current below-200-SMA refinement is more reasonable than the older blanket new-low gate, but the family remains the main protection/cadence trade-off. |
-| Sector momentum | Block only at score <= -3 for RSI | Avoid correlated dip buys when a sector is in genuine freefall; looser than the global COLD score <= -2 threshold | Retained sector blocks exist but are not the dominant explanation. Documentation must be explicit that live RSI uses `-3`, not the generic sector COLD boundary. |
+| Sector momentum | Prior RSI14 wiring blocked only at score <= -3 | Avoid correlated dip buys when a sector is in genuine freefall; looser than the global COLD score <= -2 threshold | Retained sector blocks exist but are not the dominant explanation. Active RSI3 no longer uses a sector gate. |
 
 ## Documentation And Parity Notes
 

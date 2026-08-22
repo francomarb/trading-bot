@@ -438,6 +438,18 @@ RSI_WATCHLIST = [
 # `scripts/rsi_filter_variant_backtest.py` SPY50 study. The active RSI3
 # quick-exit production slot does not use a SPY50 gate.
 RSI_SPY50_TOLERANCE_PCT = 0.01
+
+# Active equity RSI Reversion production parameters. Keep production,
+# research scripts, and envelope builders pointed at this single source so
+# paper evidence is gathered from the same strategy the bot trades.
+RSI_REVERSION_PARAMS: dict[str, int | float | str | None] = {
+    "period": 3,
+    "oversold": 15.0,
+    "overbought": 70.0,
+    "entry_mode": "level_below",
+    "exit_sma_window": 5,
+    "quick_exit_rsi": 55.0,
+}
 # Bollinger Squeeze (TTM-style volatility breakout) — IMPLEMENTED BUT NOT
 # ACTIVE. Cross-universe research (docs/bollinger_squeeze_universe_research.md)
 # concluded sector ETFs are the optimal universe (Sharpe +0.22, MeanDD -7.7%
@@ -568,9 +580,9 @@ SECTOR_MOMENTUM_SMOOTH_WINDOW: int = 5
 
 STRATEGY_ALLOWED_REGIMES: dict[str, set[str]] = {
     "sma_crossover":     {"TRENDING", "RANGING"},
-    # Empty set means no configured regime restriction for dashboard/config
-    # consumers. The live slot expresses this as allowed_regimes=None.
-    "rsi_reversion":     set(),
+    # Dashboard/config consumers represent RSI's live allowed_regimes=None as
+    # every named regime. The engine slot remains the source of trading truth.
+    "rsi_reversion":     {"TRENDING", "RANGING", "VOLATILE", "BEAR"},
     # Squeeze fires best after compression breaks (TRENDING) or during it (RANGING).
     "bollinger_squeeze": {"TRENDING", "RANGING"},
     # Donchian whipsaws hard in RANGING regimes (every 20-day high gets faded).

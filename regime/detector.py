@@ -13,9 +13,9 @@ long-only strategies:
   - VOLATILE  : ATR% in the top 80th percentile of recent history — extreme
                 volatility degrades every strategy's edge and inflates slippage.
 
-Strategy-specific SPY rules stay in their edge filters:
-  - RSIEdgeFilter keeps SPY > 50 SMA (mean-reversion degrades in corrections).
-  - SMAEdgeFilter's SPY > 200 SMA check is DISABLED (this module owns it now).
+Strategy-specific SPY rules stay in their edge filters when a strategy needs
+them. The active equity RSI3 reset currently uses no SPY edge-filter gate; it
+keeps only stock-local SMA200/liquidity protection.
 
 Regimes
 -------

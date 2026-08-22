@@ -28,6 +28,7 @@ if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
 from backtest.runner import BacktestConfig, run_backtest
+from config import settings
 from indicators.technicals import add_atr, add_rsi
 from scripts.sma_watchlist_scan import configure_logging, fetch_daily_bars
 from strategies.rsi_reversion import RSIReversion
@@ -50,17 +51,27 @@ SCANNER_CANDIDATES = [
     "SN",
 ]
 
+_RSI_PARAMS = settings.RSI_REVERSION_PARAMS
+
 
 @dataclass(frozen=True)
 class ValidationConfig:
     """RSI validation thresholds and assumptions."""
 
-    rsi_period: int = 3
-    oversold: float = 15.0
-    overbought: float = 70.0
-    entry_mode: str = "level_below"
-    exit_sma_window: int | None = 5
-    quick_exit_rsi: float | None = 55.0
+    rsi_period: int = int(_RSI_PARAMS["period"])
+    oversold: float = float(_RSI_PARAMS["oversold"])
+    overbought: float = float(_RSI_PARAMS["overbought"])
+    entry_mode: str = str(_RSI_PARAMS["entry_mode"])
+    exit_sma_window: int | None = (
+        int(_RSI_PARAMS["exit_sma_window"])
+        if _RSI_PARAMS["exit_sma_window"] is not None
+        else None
+    )
+    quick_exit_rsi: float | None = (
+        float(_RSI_PARAMS["quick_exit_rsi"])
+        if _RSI_PARAMS["quick_exit_rsi"] is not None
+        else None
+    )
     reversion_threshold: float = 55.0
     event_window_days: int = 10
     atr_period: int = 14

@@ -126,12 +126,7 @@ def main() -> int:
             "RSI Reversion (3, <15 quick exit)",
             "RSI_WATCHLIST (static snapshot of dynamic scanner output — see caveat below)",
             lambda: RSIReversion(
-                period=3,
-                oversold=15,
-                overbought=70,
-                entry_mode="level_below",
-                exit_sma_window=5,
-                quick_exit_rsi=55,
+                **settings.RSI_REVERSION_PARAMS,
                 edge_filter=RSIEdgeFilter(),
             ),
             settings.RSI_WATCHLIST,

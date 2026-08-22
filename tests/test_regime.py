@@ -608,6 +608,23 @@ class TestEngineRegimeGate:
             engine.start(max_cycles=1)
         broker.place_order.assert_called_once()
 
+    def test_regime_fail_closed_blocks_even_when_allowed_regimes_is_none(self):
+        """All-regime slots still fail closed when regime detection is unavailable."""
+        engine, broker = self._make_engine(
+            regime=MarketRegime.TRENDING,  # detect() raises instead
+            allowed_regimes=None,
+            entry_signal=True,
+        )
+        engine._regime_detector.detect.side_effect = RuntimeError("SPY down")
+
+        bars = self._bars()
+        with patch("engine.trader.fetch_symbol", return_value=(bars, SimpleNamespace(api_calls=0))):
+            with patch("config.settings.REGIME_MAX_CONSECUTIVE_FAILURES", 1):
+                engine.start(max_cycles=1)
+
+        broker.place_order.assert_not_called()
+        assert engine._regime_fail_count == 1
+
     def test_volatile_regime_blocks_entry(self):
         engine, broker = self._make_engine(
             regime=MarketRegime.VOLATILE,

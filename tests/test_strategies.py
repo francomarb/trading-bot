@@ -20,6 +20,7 @@ from __future__ import annotations
 import pandas as pd
 import pytest
 
+from config import settings
 from strategies.base import BaseStrategy, EdgeFilterDecision, OrderType, SignalFrame
 from strategies.rsi_reversion import RSIReversion
 from strategies.sma_crossover import SMACrossover
@@ -367,6 +368,22 @@ class TestRequiredBars:
 
 
 class TestRSIReversionParams:
+    def test_active_rsi_reversion_params_are_centralized_in_settings(self):
+        assert settings.RSI_REVERSION_PARAMS == {
+            "period": 3,
+            "oversold": 15.0,
+            "overbought": 70.0,
+            "entry_mode": "level_below",
+            "exit_sma_window": 5,
+            "quick_exit_rsi": 55.0,
+        }
+        assert settings.STRATEGY_ALLOWED_REGIMES["rsi_reversion"] == {
+            "TRENDING",
+            "RANGING",
+            "VOLATILE",
+            "BEAR",
+        }
+
     def test_period_must_be_positive_int(self):
         with pytest.raises(TypeError):
             RSIReversion(period=3.5)
@@ -456,18 +473,31 @@ class TestRSIReversionSignals:
         ).generate_signals(df)
         assert sig.entries.sum() >= 2
 
-    def test_quick_exit_on_close_above_sma_or_rsi_recovery(self):
-        df = _df([100.0] * 5 + [90.0, 80.0, 85.0, 90.0, 95.0])
+    def test_quick_exit_on_close_above_sma_when_rsi_recovery_disabled(self):
+        df = _df([100.0, 100.0, 100.0, 90.0, 80.0, 79.0, 81.0])
         sig = RSIReversion(
             period=3,
             oversold=15,
             overbought=70,
             entry_mode="level_below",
             exit_sma_window=3,
+            quick_exit_rsi=None,
+        ).generate_signals(df)
+        assert sig.entries.any()
+        assert sig.exits[sig.exits].index.tolist() == [df.index[-1]]
+
+    def test_quick_exit_on_rsi_recovery_when_sma_exit_disabled(self):
+        df = _df([100.0, 100.0, 100.0, 90.0, 80.0, 85.0, 90.0, 95.0])
+        sig = RSIReversion(
+            period=3,
+            oversold=15,
+            overbought=70,
+            entry_mode="level_below",
+            exit_sma_window=None,
             quick_exit_rsi=55,
         ).generate_signals(df)
         assert sig.entries.any()
-        assert sig.exits.any()
+        assert sig.exits[sig.exits].index.tolist() == [df.index[-1]]
 
     def test_latest_observation_reports_compact_rsi_state(self):
         df = _df([100.0] * 5 + [90.0, 80.0, 85.0, 90.0, 95.0])

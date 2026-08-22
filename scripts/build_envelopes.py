@@ -116,12 +116,7 @@ def _sma_builder():
 
 def _rsi_builder():
     return RSIReversion(
-        period=3,
-        oversold=15,
-        overbought=70,
-        entry_mode="level_below",
-        exit_sma_window=5,
-        quick_exit_rsi=55,
+        **settings.RSI_REVERSION_PARAMS,
         edge_filter=RSIEdgeFilter(),
     )
 

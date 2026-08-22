@@ -1,18 +1,21 @@
 #!/usr/bin/env python3
-"""Production-style RSI filter variant backtest.
+"""Historical RSI14 filter variant backtest.
 
 This is a research harness for comparing RSI edge-filter variants using the
 same shared-capital assumptions as ``scripts/rsi_portfolio_backtest.py`` plus
 the ATR protective stop used by the live bot.
 Unlike the older RSI reports, entries are gated by historical equivalents of
-the live filters on each signal bar:
+the prior RSI14 filter stack on each signal bar:
 
 - regime gate: allow only TRENDING/RANGING, block BEAR/VOLATILE
 - RSI-specific SPY 50 SMA gate mode (hard, removed, tolerance band, or grace)
 - earnings blackout, fail-open when earnings data is unavailable
 - 20-day average dollar-volume liquidity floor
-- sector momentum block at production COLD threshold
+- configurable sector momentum threshold
 - configurable stock breakdown gate
+
+As of the 2026-08 RSI3 reset, this harness is historical/reference only and
+does not mirror active production RSI.
 """
 
 from __future__ import annotations
@@ -639,8 +642,8 @@ def parse_args() -> argparse.Namespace:
         type=float,
         default=-3.0,
         help=(
-            "Block sector scores <= threshold. Default -3 matches live RSI's "
-            "mean-reversion sector override; use -2 for generic COLD threshold."
+            "Block sector scores <= threshold. Default -3 matches the prior "
+            "RSI14 mean-reversion sector override; use -2 for generic COLD threshold."
         ),
     )
     parser.add_argument("--output", type=Path, default=Path("logs/rsi_filter_variant_backtest_latest.md"))
