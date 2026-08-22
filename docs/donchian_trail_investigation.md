@@ -22,6 +22,14 @@
 > comparison, not a same-trade comparison). Donchian-low trail washes vs
 > static everywhere. **The recommendation is to keep the static stop.**
 
+> **See also (2026-08-18):**
+> [`docs/donchian_regime_gate_investigation.md`](donchian_regime_gate_investigation.md)
+> reuses this document's simulator and method to ask a different question —
+> whether the **entry gates** earn their cost. It supersedes the ungated
+> `+24.2%` baseline quoted in §5 below, which counts warmup trades; the new
+> harness sets `trade_start` and reports `+51.7%` for the same arm. Do not
+> quote the §5 ungated row.
+
 ## Revision history
 
 - **2026-06-08 (R5) — SIP re-test landed; closure confirmed.** The active

@@ -45,7 +45,7 @@ from regime.detector import MarketRegime, RegimeDetector
 from risk.allocator import SleeveAllocator
 from reporting.alerts import AlertDispatcher, LogFileBackend, TelegramAlertBackend, TelegramCommandListener
 from reporting.logger import TradeLogger, install_json_sink
-from reporting.pnl import PnLTracker
+from reporting.pnl import PnLTracker, unrealized_pnl_from_positions
 from risk.manager import RiskManager
 from data.watchlists import StaticWatchlistSource
 from sector.gauge import SectorMomentumGauge
@@ -69,18 +69,35 @@ from utils.options_lookup import build_opra_quote_lookup
 
 # ── Logging ──────────────────────────────────────────────────────────────────
 
-logger.remove()
-logger.add(
-    sys.stdout,
-    format=(
-        "<green>{time:YYYY-MM-DD HH:mm:ss}</green> | "
-        "<level>{level: <8}</level> | "
-        "<cyan>{name}</cyan>:<cyan>{function}</cyan> | "
-        "{message}"
-    ),
-    level="INFO",
-)
-logger.add("logs/forward_test.log", rotation="10 MB", retention="90 days", level="DEBUG")
+
+def _configure_logging() -> None:
+    """
+    Install this launcher's log sinks. Called from `main()`, NOT at import time.
+
+    These used to run at module scope, which meant merely *importing*
+    `forward_test` attached a DEBUG sink to the real `logs/forward_test.log`.
+    `tests/test_allowed_regimes_parity.py` imports this module to check the
+    regime wiring, and that one import made the entire pytest run write into
+    the operator's live log — 437KB per suite run of DRY-RUN orders and fake
+    engine cycles interleaved with real bot output. `tests/conftest.py`
+    redirects `bot.jsonl`, `alerts.log` and the trade DBs, but it cannot
+    intercept a bare `logger.add()` executed at import.
+
+    Bot behaviour is unchanged: `start_bot.sh` runs `python forward_test.py`,
+    so `main()` runs and installs exactly the same sinks as before.
+    """
+    logger.remove()
+    logger.add(
+        sys.stdout,
+        format=(
+            "<green>{time:YYYY-MM-DD HH:mm:ss}</green> | "
+            "<level>{level: <8}</level> | "
+            "<cyan>{name}</cyan>:<cyan>{function}</cyan> | "
+            "{message}"
+        ),
+        level="INFO",
+    )
+    logger.add("logs/forward_test.log", rotation="10 MB", retention="90 days", level="DEBUG")
 
 
 def _build_sector_heat_snapshot(
@@ -133,6 +150,37 @@ def _build_sector_heat_snapshot(
     }
 
 
+def _allowed_regimes(strategy_name: str) -> frozenset:
+    """
+    Resolve a slot's allowed regimes from `settings.STRATEGY_ALLOWED_REGIMES`.
+
+    These used to be frozenset literals written out here, while
+    `STRATEGY_ALLOWED_REGIMES` sat in `config/settings.py` describing the same
+    fact. Nothing read the settings dict except `dashboard.py` — so the engine
+    ran the literals, the dashboard displayed the dict, and a change to either
+    one alone would silently disagree with the other. Editing only the settings
+    dict was a no-op on live behaviour.
+
+    Deriving from the dict makes it the single source of truth
+    ([[feedback_single_source_of_truth_params]]). `TestAllowedRegimesParity`
+    pins the resolution and the resulting sets.
+    """
+    try:
+        names = settings.STRATEGY_ALLOWED_REGIMES[strategy_name]
+    except KeyError:
+        raise KeyError(
+            f"STRATEGY_ALLOWED_REGIMES has no entry for {strategy_name!r}; "
+            f"known: {sorted(settings.STRATEGY_ALLOWED_REGIMES)}"
+        ) from None
+    try:
+        return frozenset(MarketRegime[name] for name in names)
+    except KeyError as exc:
+        raise ValueError(
+            f"STRATEGY_ALLOWED_REGIMES[{strategy_name!r}] names an unknown "
+            f"regime {exc.args[0]!r}; valid: {[m.name for m in MarketRegime]}"
+        ) from None
+
+
 def _git_version() -> str:
     """Return a concise git identity for the running bot code."""
     try:
@@ -149,6 +197,7 @@ def _git_version() -> str:
 
 
 def main() -> None:
+    _configure_logging()
     logger.info("=" * 60)
     logger.info("Forward Test — Paper Trading (Phase 10)")
     logger.info("=" * 60)
@@ -221,7 +270,7 @@ def main() -> None:
             # SMA crossover works in both trending and ranging markets;
             # blocked only in BEAR and VOLATILE where edge and risk/reward
             # degrade significantly.
-            allowed_regimes=frozenset({MarketRegime.TRENDING, MarketRegime.RANGING}),
+            allowed_regimes=_allowed_regimes("sma_crossover"),
         ),
         StrategySlot(
             strategy=RSIReversion(
@@ -253,14 +302,22 @@ def main() -> None:
                 list(settings.DONCHIAN_WATCHLIST), name="donchian"
             ),
             # Donchian breakout is a pure trend-continuation strategy.
-            # Literature is unanimous: restrict to TRENDING only.
-            # RANGING → every N-day high is a false breakout that reverses;
-            # BEAR    → blocked by regime detector (no long entries in downtrend);
-            # VOLATILE → erratic price action produces whipsaws with wide ATR stops.
-            # Backtest validation: Mid-range (30/15), Sharpe +0.85, 32-name
-            # AI/Bigtech universe, 4y window ending 2026-04-28 (2× ATR stops).
-            # Sleeve: 0.25 weight, max 5 concurrent positions.
-            allowed_regimes=frozenset({MarketRegime.TRENDING}),
+            # TRENDING-only. The per-regime rationale that used to sit here
+            # ("RANGING → every N-day high is a false breakout"; "VOLATILE →
+            # whipsaws") was MEASURED AND REFUTED on 2026-08-18: on SIP
+            # 2016-11→2026-08, ai_bigtech, RANGING entries return mean R 0.71
+            # against TRENDING's 0.71, and VOLATILE 0.72 is the best bucket of
+            # the four. The gate's measured value is BEAR protection only.
+            # Kept at TRENDING pending the `11.59` decision (PR #111 proposes a
+            # BEAR-only alternative; it is NOT applied). Canonical rationale:
+            # config/settings.py STRATEGY_ALLOWED_REGIMES and
+            # docs/donchian_regime_gate_investigation.md — do not restate it
+            # here, and do not restore the refuted version.
+            # Historical note: the "Sharpe +0.85" figure previously cited here
+            # came from a 4y IEX per-symbol sweep ending 2026-04-28 and is NOT
+            # comparable to the SIP portfolio-style numbers in the
+            # investigation; quote the feed, window and method with either.
+            allowed_regimes=_allowed_regimes("donchian_breakout"),
         ),
         StrategySlot(
             strategy=SPYOptionsReversionStrategy(
@@ -278,7 +335,7 @@ def main() -> None:
             timeframe="5Min",
             # RSI reversion plays oversold bounces — avoid BEAR (stocks keep
             # falling past RSI 30) and VOLATILE (unpredictable snap-backs).
-            allowed_regimes=frozenset({MarketRegime.TRENDING, MarketRegime.RANGING}),
+            allowed_regimes=_allowed_regimes("spy_options_reversion"),
         ),
     ]
 
@@ -309,7 +366,7 @@ def main() -> None:
             watchlist_source=StaticWatchlistSource(
                 [_cs_symbol], name=f"credit_spread_{_cs_symbol.lower()}"
             ),
-            allowed_regimes=frozenset({MarketRegime.TRENDING, MarketRegime.RANGING}),
+            allowed_regimes=_allowed_regimes("credit_spread"),
         ))
 
     # Risk manager with production settings (shared across all slots).
@@ -386,9 +443,19 @@ def main() -> None:
         logger.info("Telegram command listener started (/status, /halt)")
 
     # PLAN 11.10g: Strategy Health & Edge review scheduler. Wired
-    # as engine's post_cycle_hook so the Monday-completed-week
-    # weekly + first-of-month monthly reviewer runs alongside the
-    # trading loop without needing an external cron / systemd timer.
+    # as engine's post_cycle_hook so the Monday-completed-week weekly,
+    # first-of-month monthly, and first-of-month trailing-365-day
+    # reviewers run alongside the trading loop without needing an
+    # external cron / systemd timer.
+    #
+    # The long window exists because the weekly and monthly assessments
+    # filter trades by date, so their sample never accumulates toward
+    # STRATEGY_MIN_TRADES_FOR_VERDICT and both report INSUFFICIENT
+    # indefinitely at this bot's trade rate. It runs observationally
+    # (persist_state=False AND use_persistence=False) so a non-weekly
+    # observation can neither advance nor satisfy the 3-consecutive-
+    # weekly-checks silent-killer gate. See docs/strategy_health_design.md
+    # section 10.
     # Hook failure is absorbed by the engine's try/except wrap —
     # never crashes the trading loop.
     from strategies.health.scheduler import HealthReviewScheduler
@@ -409,10 +476,31 @@ def main() -> None:
         try:
             today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
             snap = broker.sync_with_broker()
+            # Feed the final snapshot to the equity path before reading
+            # the drawdown off it. Without this the report reflects only
+            # equity as of the last completed cycle, so a decline between
+            # that cycle and shutdown is missing from the very report
+            # that summarises the session — peak $100k, cycle $100k,
+            # shutdown $95k would still print $0.00.
+            engine._observe_equity(snap.account.equity)
+            # Then fold in the broker's own 1-minute equity series for
+            # the day, which covers stretches when this process was not
+            # running at all — the one thing per-cycle sampling cannot
+            # see. Combined with `max`, so an API failure degrades to
+            # the locally observed figure rather than losing it.
+            engine.reconcile_intraday_drawdown_from_broker(today)
             summary = pnl_tracker.generate_daily_summary(
                 day=today,
                 session_start_equity=engine._session_start_equity or snap.account.equity,
                 session_end_equity=snap.account.equity,
+                # Both of these were left at their 0.0 defaults until
+                # 2026-08-19, which is why every daily report written
+                # before then shows $0.00 unrealized and $0.00 drawdown
+                # even on days that ended with a dozen open positions.
+                unrealized_pnl=unrealized_pnl_from_positions(
+                    snap.account.open_positions.values()
+                ),
+                max_intraday_drawdown=engine.max_intraday_drawdown,
             )
             pnl_tracker.write_daily_report(summary)
             # Fire EOD summary alert (Telegram + log).

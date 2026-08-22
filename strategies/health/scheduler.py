@@ -29,14 +29,22 @@ Per design §10 cadence + §1.2 invariant:
   - Monday (weekday=0, UTC) → weekly report for the *completed*
     Mon→Mon week ending at the current Monday
   - First of month (UTC) → monthly report
+  - First of month (UTC) → trailing-365-day report. Added because the
+    weekly and monthly windows filter trades by date, so their sample
+    never accumulates toward STRATEGY_MIN_TRADES_FOR_VERDICT and both
+    report INSUFFICIENT indefinitely at this bot's trade rate. Runs
+    observationally (persist_state=False AND use_persistence=False) so a
+    non-weekly observation can neither advance nor satisfy the
+    3-consecutive-weekly-checks silent-killer gate.
   - The hook NEVER modifies trading state; it only triggers the
     reviewer which writes a markdown report + dispatches alerts.
   - Engine-loop hook failures are absorbed by the engine's
     try/except wrap (engine/trader.py:start post_cycle_hook).
 
 Idempotency is double-protected:
-  1. In-memory: the scheduler tracks `last_weekly_fired_date` and
-     `last_monthly_fired_date` and short-circuits when called
+  1. In-memory: the scheduler tracks `last_weekly_fired_date`,
+     `last_monthly_fired_date` and `last_long_window_fired_date`, and
+     short-circuits when called
      repeatedly on the same trigger day.
   2. On-disk: even without (1), the lifecycle_counters table's
      UNIQUE(period_type, period_start, strategy_name) constraint
@@ -104,6 +112,7 @@ class HealthReviewScheduler:
     pnl_tracker: "PnLTracker | None" = None
     last_weekly_fired_date: date | None = None
     last_monthly_fired_date: date | None = None
+    last_long_window_fired_date: date | None = None
 
     def __call__(self) -> None:
         """Engine's post_cycle_hook entry point.
@@ -116,6 +125,7 @@ class HealthReviewScheduler:
             today = self.clock().date()
             self._maybe_fire_weekly(today)
             self._maybe_fire_monthly(today)
+            self._maybe_fire_long_window(today)
         except Exception as exc:  # noqa: BLE001
             # Belt-and-suspenders — the engine also wraps the hook
             # call in try/except, but log the actual error here too
@@ -216,14 +226,74 @@ class HealthReviewScheduler:
         self._run(window)
         self.last_monthly_fired_date = today
 
-    def _run(self, window) -> None:
-        """Invoke the reviewer with the given window. Persists state
-        (this is NOT a dry-run — scheduled runs are the canonical
-        cadence the persistence file is designed for)."""
+    def _maybe_fire_long_window(self, today: date) -> None:
+        """Fire the trailing-365-day review on the first of the month.
+
+        Why this exists: the weekly and monthly windows filter trades by
+        date (`period_start <= timestamp < period_end`), so their sample
+        is only that week's or month's closes — it does not accumulate.
+        Measured against `STRATEGY_MIN_TRADES_FOR_VERDICT` (8-25), no
+        strategy at this bot's trade rate can reach its floor inside
+        either window, so both report INSUFFICIENT indefinitely. The
+        design's own "time to CONCLUSIVE" table (4-12 months for
+        Donchian) only holds over a window that spans months.
+
+        Concretely, on the same day: the weekly window saw 2 of 25
+        Donchian closes; a 365-day window sees 27 of 25 and reports
+        measured R-expectancy with a confidence interval.
+
+        Observational by design: `persist_state=False` AND
+        `use_persistence=False`. `negative_weeks` is documented as
+        *consecutive weekly checks*, so this run must neither advance it
+        nor be gated on it.
+
+        `persist_state=False` alone is NOT sufficient (PR #120 review, P1):
+        the persisted weekly count is still loaded and threaded into the
+        assessment, so a long-window run sitting on two persisted weekly
+        negatives would project 3, return NEGATIVE and dispatch
+        `STRATEGY_EDGE_LOSS` — on a non-weekly observation, contributing no
+        weekly check of its own, and re-alerting every month because it
+        never persists the increment. `use_persistence=False` feeds the
+        assessment a zeroed state so the `>= 3` gate cannot be reached from
+        here. Health alerts (L1/L2/L3) are not persistence-gated and still
+        fire normally.
+        """
+        if today.day != 1:
+            return
+        if self.last_long_window_fired_date == today:
+            return
+        logger.info(
+            f"health-review scheduler: firing LONG-WINDOW (365d) review "
+            f"ending {today.isoformat()}"
+        )
+        try:
+            self._run(
+                window_from_args("yearly", end_date=today),
+                persist_state=False,
+                use_persistence=False,
+            )
+        except Exception as exc:  # noqa: BLE001
+            logger.warning(
+                f"long-window health review failed for period ending "
+                f"{today.isoformat()} (trading unaffected): {exc}"
+            )
+        # Marked regardless — the writer is idempotent-by-overwrite and a
+        # failure must not re-fire every cycle for the rest of the day.
+        self.last_long_window_fired_date = today
+
+    def _run(
+        self, window, *, persist_state: bool = True, use_persistence: bool = True,
+    ) -> None:
+        """Invoke the reviewer with the given window. Persists state by
+        default (scheduled weekly/monthly runs are the canonical cadence
+        the persistence file is designed for); the long-window run passes
+        `persist_state=False` — see `_maybe_fire_long_window`."""
         conn = self.conn_factory()
         run_review(
             window,
             conn=conn,
             dispatcher=self.dispatcher,
             dry_run=False,
+            persist_state=persist_state,
+            use_persistence=use_persistence,
         )

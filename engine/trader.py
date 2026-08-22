@@ -87,7 +87,6 @@ from execution.broker import (
 from execution.options_executor import SpreadLeg
 from execution.mleg_close import (
     MlegCloseScheduler,
-    MlegQuote,
     resolve_mleg_close_profile,
 )
 from indicators.technicals import add_atr
@@ -100,6 +99,8 @@ from risk.manager import (
     RiskRejection,
     Side,
     Signal,
+    candidate_entry_risk,
+    worst_case_entry_price,
 )
 from reporting.alerts import AlertDispatcher
 from reporting.logger import (
@@ -108,7 +109,7 @@ from reporting.logger import (
     is_execution_quality_measurement,
     single_leg_realized_slippage_bps,
 )
-from reporting.pnl import PnLTracker
+from reporting.pnl import PnLTracker, max_drawdown_from_equity_path
 from strategies.base import (
     BaseStrategy,
     MultiLegTradeRejected,
@@ -582,6 +583,16 @@ class TradingEngine:
         self._last_regime: str | None = None
         self._regime_fail_count: int = 0
         self._last_cycle_equity: float | None = None
+        # Intraday equity path, for the daily report's max-drawdown
+        # figure. Peak and drawdown reset on UTC date rollover so a
+        # multi-day session does not carry Monday's high-water mark into
+        # Tuesday's "intraday" drawdown. Fed by `_observe_equity` from
+        # every broker snapshot, market open or closed — this bot holds
+        # overnight, so an extended-hours equity slide is a real
+        # drawdown, not noise to be filtered out.
+        self._equity_peak_day: str | None = None
+        self._session_equity_peak: float | None = None
+        self._max_intraday_drawdown: float = 0.0
         self._last_snapshot: "BrokerSnapshot | None" = None
         self._last_stream_healthy: bool | None = None
 
@@ -851,6 +862,15 @@ class TradingEngine:
         # Capture truth-of-the-world before any decision.
         startup_snapshot = self.broker.sync_with_broker()
         self._session_start_equity = startup_snapshot.account.equity
+        # Re-adopt today's peak BEFORE observing the startup snapshot:
+        # on a same-day recycle the restored peak is the day's, so this
+        # first observation can deepen the drawdown against it rather
+        # than silently becoming a new peak.
+        self._restore_equity_path_state()
+        # Seed the intraday equity peak from the same snapshot, so a
+        # decline during the very first cycle is measured against real
+        # equity rather than against an unset peak.
+        self._observe_equity(startup_snapshot.account.equity)
         self._last_snapshot = startup_snapshot
 
         # Recover broker-proven exits before ownership restoration. A position
@@ -1031,6 +1051,339 @@ class TradingEngine:
                 )
         self._operator_heartbeat_thread = None
 
+    # ── Correlated-entry heat cap (PLAN 11.60) ───────────────────────────
+
+    def _heat_cap_allows(self, decision: "RiskDecision") -> bool:
+        """Evaluate the sleeve's open heat against its cap for one candidate.
+
+        Returns True when the entry may proceed. In observation mode it
+        always returns True and only logs — the point of shipping that way
+        first is to learn what the level costs before it costs a trade.
+
+        Heat is a ledger, not a re-derivation: each open position contributes
+        the risk it was admitted with (`initial_risk_per_share x open_qty`,
+        so a partial exit reduces it pro rata), and each resting entry order
+        contributes its worst-case reservation. Nothing re-reads a stop.
+        """
+        cap_pct = settings.STRATEGY_MAX_OPEN_HEAT_PCT.get(decision.strategy_name)
+        if not cap_pct:
+            return True
+        equity = self._last_cycle_equity or self._session_start_equity
+        if not equity or equity <= 0:
+            return True
+
+        try:
+            filled_by_strategy, gaps = (
+                self.trade_logger.read_open_risk_by_strategy_with_gaps()
+            )
+            pending_by_strategy = (
+                self.lifecycle_orders_store.read_pending_entry_reservations()
+                if self.lifecycle_orders_store is not None else {}
+            )
+        except Exception as exc:
+            # A heat figure we cannot compute must not silently read as zero,
+            # which would relax the cap exactly when the data is degraded.
+            logger.warning(
+                f"[heat-cap] {decision.strategy_name} {decision.symbol}: "
+                f"could not compute open heat ({type(exc).__name__}: {exc}) — "
+                f"{'allowing (observation mode)' if not settings.STRATEGY_HEAT_CAP_ENFORCED else 'refusing entry'}"
+            )
+            return not settings.STRATEGY_HEAT_CAP_ENFORCED
+
+        strategy = decision.strategy_name
+        filled = filled_by_strategy.get(strategy, 0.0)
+        pending = pending_by_strategy.get(strategy, 0.0)
+        candidate = candidate_entry_risk(decision)
+        _, price_source = worst_case_entry_price(decision)
+        cap_dollars = equity * cap_pct
+        projected = filled + pending + candidate
+
+        unpriced = gaps.get(strategy) or []
+        if unpriced:
+            # Risk that was never bounded (no stop at entry) cannot be given a
+            # number honestly, so the total below is an understatement. Under
+            # enforcement that must refuse: admitting against a knowingly-low
+            # figure is unknown risk being treated as zero risk, which is the
+            # one posture this cap must never take.
+            logger.warning(
+                f"[heat-cap] {strategy}: {len(unpriced)} open position(s) carry "
+                f"no recorded initial risk ({', '.join(sorted(unpriced))}) — "
+                f"heat is understated; "
+                f"{'refusing entry' if settings.STRATEGY_HEAT_CAP_ENFORCED else 'allowing (observation mode)'}"
+            )
+            if settings.STRATEGY_HEAT_CAP_ENFORCED:
+                _lc = self._lifecycle_counter_for(strategy)
+                if _lc is not None:
+                    _lc.risk_blocked += 1
+                self.alerts.order_rejection(
+                    decision.symbol, strategy,
+                    f"heat cap: {len(unpriced)} position(s) with unbounded risk",
+                    RejectionCode.MAX_STRATEGY_HEAT_REACHED.value,
+                )
+                return False
+
+        if projected <= cap_dollars:
+            logger.debug(
+                f"[heat-cap] {strategy} {decision.symbol}: "
+                f"filled={filled:.2f} pending={pending:.2f} "
+                f"candidate={candidate:.2f} -> {projected / equity * 100:.2f}% "
+                f"of {cap_pct * 100:.2f}% cap"
+            )
+            return True
+
+        # Structured refusal record — the fields a later calibration pass
+        # needs, split so a cap binding on real exposure is distinguishable
+        # from one binding on reservations that later expire unfilled.
+        mode = "ENFORCED" if settings.STRATEGY_HEAT_CAP_ENFORCED else "OBSERVED"
+        logger.warning(
+            f"[heat-cap] {mode} {strategy} {decision.symbol}: "
+            f"filled_heat=${filled:,.2f} pending_reserved=${pending:,.2f} "
+            f"candidate=${candidate:,.2f} projected=${projected:,.2f} "
+            f"cap=${cap_dollars:,.2f} ({cap_pct * 100:.2f}% of equity) "
+            f"qty={decision.qty} entry_source={price_source}"
+        )
+        if not settings.STRATEGY_HEAT_CAP_ENFORCED:
+            return True
+
+        _lc = self._lifecycle_counter_for(strategy)
+        if _lc is not None:
+            _lc.risk_blocked += 1
+        self.alerts.order_rejection(
+            decision.symbol, strategy,
+            f"heat cap: projected ${projected:,.2f} > ${cap_dollars:,.2f}",
+            RejectionCode.MAX_STRATEGY_HEAT_REACHED.value,
+        )
+        return False
+
+    # ── Intraday equity path ─────────────────────────────────────────────
+
+    def _observe_equity(self, equity: float) -> None:
+        """
+        Record one account-equity observation and update the running
+        intraday high-water mark and max drawdown.
+
+        Every broker snapshot the engine takes flows through here — the
+        per-cycle syncs, the startup snapshot, and the shutdown snapshot
+        the EOD report is built from — and this is the only place
+        `_last_cycle_equity` is assigned. Drawdown is measured in dollars
+        from the day's equity peak: mark-to-market, so an unrealized
+        slide in open positions registers immediately rather than
+        waiting for the position to close.
+
+        Peak and drawdown reset when the UTC date rolls over, because
+        the field this feeds is `max_intraday_drawdown` on a per-day
+        report and this process routinely runs for a week at a time.
+
+        State that changes is persisted (see
+        `_persist_equity_path_state`) so a `recycle_bot.sh` mid-session
+        does not restart the day's metric at zero.
+        """
+        self._last_cycle_equity = equity
+        before = (
+            self._equity_peak_day,
+            self._session_equity_peak,
+            self._max_intraday_drawdown,
+        )
+
+        day = self._clock().strftime("%Y-%m-%d")
+        if day != self._equity_peak_day:
+            self._equity_peak_day = day
+            self._session_equity_peak = equity
+            self._max_intraday_drawdown = 0.0
+        elif self._session_equity_peak is None or equity > self._session_equity_peak:
+            self._session_equity_peak = equity
+        else:
+            drawdown = self._session_equity_peak - equity
+            if drawdown > self._max_intraday_drawdown:
+                self._max_intraday_drawdown = drawdown
+
+        after = (
+            self._equity_peak_day,
+            self._session_equity_peak,
+            self._max_intraday_drawdown,
+        )
+        if after != before:
+            self._persist_equity_path_state()
+
+    @property
+    def max_intraday_drawdown(self) -> float:
+        """
+        Largest peak-to-trough account-equity decline (dollars) observed
+        today, across bot restarts within the same UTC day.
+
+        Read by the shutdown EOD report in `forward_test.py`, which
+        observes its own final snapshot before reading this so a decline
+        after the last cycle still counts.
+        """
+        return self._max_intraday_drawdown
+
+    def reconcile_intraday_drawdown_from_broker(self, day: str | None = None) -> float:
+        """
+        Fold the broker's own intraday equity series into today's max
+        drawdown, and return the reconciled figure.
+
+        This closes the one gap the engine's own sampling cannot: equity
+        that moved while no process was running. `_observe_equity` sees
+        the account once per cycle and only while the bot is up, so a
+        peak or trough reached entirely between a `recycle_bot.sh` stop
+        and the replacement's first cycle was invisible to it. Alpaca's
+        portfolio history covers the whole UTC day at 1-minute
+        resolution regardless of what this process was doing.
+
+        The two are combined with `max`, never replaced. The broker
+        series is more complete *and* finer-grained, so it normally
+        dominates — but the local path can still be the larger of the
+        two when a trough falls between the broker's minute marks, and a
+        drawdown this process directly observed must never be reported
+        as smaller than what it saw. `max` also makes the whole thing
+        degrade cleanly: if the API is unavailable the result is exactly
+        today's locally-observed number.
+
+        The window is the UTC day, matching `read_realized_pnl_events_
+        for_day` — every figure on one daily report is scoped to the
+        same day boundary. `end` is clamped to now for the current day
+        so a partial day is not requested into the future.
+        """
+        day = day or self._clock().strftime("%Y-%m-%d")
+        local = self._max_intraday_drawdown
+        try:
+            start = datetime.strptime(day, "%Y-%m-%d").replace(tzinfo=timezone.utc)
+        except ValueError:
+            logger.warning(
+                f"intraday drawdown reconcile: bad day {day!r}; "
+                f"keeping locally observed ${local:,.2f}"
+            )
+            return local
+
+        end = min(start + timedelta(days=1), self._clock())
+        if end <= start:
+            return local
+
+        try:
+            equity_path = self.broker.get_intraday_equity_path(start, end)
+        except Exception as exc:
+            logger.warning(
+                f"intraday drawdown reconcile failed: {exc} — "
+                f"keeping locally observed ${local:,.2f}"
+            )
+            return local
+
+        if not equity_path:
+            logger.info(
+                f"intraday drawdown reconcile: broker returned no equity "
+                f"samples for {day}; keeping locally observed ${local:,.2f}"
+            )
+            return local
+
+        broker_drawdown = max_drawdown_from_equity_path(equity_path)
+        reconciled = max(local, broker_drawdown)
+        if reconciled > local:
+            logger.info(
+                f"intraday drawdown for {day} raised to ${reconciled:,.2f} "
+                f"from broker equity path ({len(equity_path)} samples); "
+                f"this process observed ${local:,.2f}"
+            )
+        self._max_intraday_drawdown = reconciled
+        self._equity_peak_day = day
+        self._persist_equity_path_state()
+        return reconciled
+
+    def _restore_equity_path_state(self) -> None:
+        """Re-adopt today's equity peak and max drawdown from disk.
+
+        Called from `start()` **before** the startup snapshot is
+        observed, so a same-day restart continues the day's metric
+        instead of restarting it at zero.
+
+        Without this, `recycle_bot.sh` silently truncated the number:
+        the outgoing process wrote the day's report at shutdown, the
+        replacement started with a fresh peak, and its own shutdown
+        overwrote that same `{day}.md` with only the post-restart
+        decline. A morning drawdown would simply vanish from the report
+        that claims to be the day's.
+
+        Stale state (stored day != today) is ignored rather than
+        cleared — `_observe_equity` resets on the day key anyway, and
+        leaving the file alone keeps yesterday's value readable if an
+        operator wants it.
+
+        Best-effort: a missing, unreadable, or malformed file logs and
+        continues with a fresh peak. A degraded drawdown figure must
+        never block startup.
+
+        Residual gap, stated honestly: equity that moves while no
+        process is running is unobserved. The first post-restart
+        observation catches the *net* move (it compares live equity to
+        the restored peak), but a peak or trough reached entirely during
+        downtime is lost. Closing that needs the broker's own intraday
+        equity series (`get_portfolio_history`), which is a larger
+        change and is not what this metric promises today.
+        """
+        path = getattr(settings, "EQUITY_PATH_STATE_PATH", None)
+        if not path:
+            return
+        try:
+            if not os.path.exists(path):
+                return
+            with open(path, "r") as fh:
+                state = json.load(fh)
+            if not isinstance(state, dict):
+                return
+            stored_day = state.get("day")
+            today = self._clock().strftime("%Y-%m-%d")
+            if stored_day != today:
+                logger.info(
+                    f"equity path state: stored day {stored_day!r} is not "
+                    f"today ({today}) — starting a fresh intraday peak"
+                )
+                return
+            peak = state.get("equity_peak")
+            drawdown = state.get("max_intraday_drawdown")
+            if peak is None:
+                return
+            self._equity_peak_day = today
+            self._session_equity_peak = float(peak)
+            self._max_intraday_drawdown = float(drawdown or 0.0)
+            logger.info(
+                f"equity path state restored for {today}: "
+                f"peak=${self._session_equity_peak:,.2f}, "
+                f"max drawdown=${self._max_intraday_drawdown:,.2f}"
+            )
+        except Exception as exc:
+            logger.warning(
+                f"equity path state restore skipped (path={path}): {exc} — "
+                "today's intraday drawdown restarts from this session"
+            )
+
+    def _persist_equity_path_state(self) -> None:
+        """Write today's equity peak / max drawdown atomically.
+
+        Same tmp→replace pattern as the state snapshot and the operator
+        control state: a crashed write leaves the previous good file,
+        never a partial one. Errors are logged and swallowed — losing
+        the persisted peak degrades a report field, and must not touch
+        the trading loop.
+        """
+        path = getattr(settings, "EQUITY_PATH_STATE_PATH", None)
+        if not path or self._equity_peak_day is None:
+            return
+        try:
+            parent = os.path.dirname(path)
+            if parent:
+                os.makedirs(parent, exist_ok=True)
+            payload = {
+                "day": self._equity_peak_day,
+                "equity_peak": self._session_equity_peak,
+                "max_intraday_drawdown": self._max_intraday_drawdown,
+                "updated_at": self._clock().isoformat(),
+            }
+            tmp = f"{path}.tmp"
+            with open(tmp, "w") as fh:
+                json.dump(payload, fh, indent=2)
+            os.replace(tmp, path)
+        except Exception as exc:
+            logger.warning(f"equity path state persist failed (path={path}): {exc}")
+
     # ── Per-cycle pipeline ───────────────────────────────────────────────
 
     def _run_one_cycle(self) -> None:
@@ -1097,7 +1450,7 @@ class TradingEngine:
                     snapshot = self.broker.sync_with_broker(
                         session_start_equity=self._session_start_equity
                     )
-                    self._last_cycle_equity = snapshot.account.equity
+                    self._observe_equity(snapshot.account.equity)
                     self._last_snapshot = snapshot
                     if self._regime_detector is not None:
                         try:
@@ -1141,7 +1494,7 @@ class TradingEngine:
                 snapshot = self.broker.sync_with_broker(
                     session_start_equity=self._session_start_equity
                 )
-                self._last_cycle_equity = snapshot.account.equity
+                self._observe_equity(snapshot.account.equity)
                 self._last_snapshot = snapshot
             except Exception as e:
                 cycle_status = "sync_failed"
@@ -1230,7 +1583,10 @@ class TradingEngine:
             # Regime detection — runs once per cycle, before any slot.
             # Exits are never blocked by regime; only new entries are gated.
             current_regime = None
-            regime_fail_closed = False
+            # True unless the detector is configured but could not tell us the
+            # regime. Distinct from `current_regime is None`, which ALSO means
+            # "no detector configured" — a deliberate allow-all.
+            regime_known = True
             if self._regime_detector is not None:
                 try:
                     current_regime = self._regime_detector.detect()
@@ -1248,11 +1604,11 @@ class TradingEngine:
                     if self._regime_fail_count >= max_failures:
                         logger.error(
                             f"regime detection failed {self._regime_fail_count} "
-                            f"consecutive times: {exc} — falling back to BEAR "
-                            "(fail-closed)"
+                            f"consecutive times: {exc} — regime UNKNOWN, "
+                            "blocking all new entries (fail-closed; exits unaffected)"
                         )
-                        current_regime = MarketRegime.BEAR
-                        regime_fail_closed = True
+                        current_regime = None
+                        regime_known = False
                     elif self._last_regime is not None:
                         logger.warning(
                             f"regime detection failed "
@@ -1261,12 +1617,23 @@ class TradingEngine:
                         )
                         current_regime = MarketRegime(self._last_regime)
                     else:
+                        # Cold start, regime genuinely unknown. This used to
+                        # default to RANGING, which permits entries for every
+                        # sleeve that allows RANGING — fail-OPEN, and newly
+                        # dangerous once `11.59` added RANGING and VOLATILE to
+                        # Donchian. BEAR would be fail-closed but also triggers
+                        # `_sweep_bear_spread_exits()`, and a SPY data outage is
+                        # not a bear market — liquidating on it would be its own
+                        # defect. So: no regime, and every slot's entries are
+                        # blocked below. Exits and open positions are untouched.
                         logger.warning(
                             f"regime detection failed "
                             f"({self._regime_fail_count}x), no prior regime "
-                            "— defaulting to RANGING"
+                            "— regime UNKNOWN, blocking all new entries "
+                            "this cycle (fail-closed; exits unaffected)"
                         )
-                        current_regime = MarketRegime.RANGING
+                        current_regime = None
+                        regime_known = False
 
             # BEAR defensive sweep — runs at cycle level so the override is
             # never gated by per-symbol bar fetch failures, stale-data
@@ -1293,12 +1660,11 @@ class TradingEngine:
                 # Per-slot regime gate: block new entries if current regime is
                 # not in the slot's allowed set. Exits always proceed.
                 entry_allowed = True
-                if regime_fail_closed:
+                if not regime_known:
                     entry_allowed = False
                     logger.info(
-                        f"[{slot.strategy.name}] regime detection fail-closed "
-                        f"to {current_regime.value if current_regime else 'unknown'} "
-                        "— new entries blocked this cycle"
+                        f"[{slot.strategy.name}] regime UNKNOWN "
+                        "— new entries blocked this cycle (fail-closed)"
                     )
                 elif current_regime is not None and slot.allowed_regimes is not None:
                     if current_regime not in slot.allowed_regimes:
@@ -1309,9 +1675,9 @@ class TradingEngine:
                             f"{sorted(r.value for r in slot.allowed_regimes)} "
                             "— new entries blocked this cycle"
                         )
-                if regime_fail_closed:
+                if not regime_known:
                     slot_regime_block_reason = (
-                        "regime detection failed too many consecutive times; "
+                        "regime unknown after detection failure; "
                         "fail-closed entry block active"
                     )
                 elif (
@@ -2132,6 +2498,17 @@ class TradingEngine:
             return None
         assert isinstance(decision, RiskDecision)
 
+        # PLAN 11.60 correlated-entry heat cap. Observation-only unless
+        # settings.STRATEGY_HEAT_CAP_ENFORCED. Placed here because this is the
+        # first point where the decision is final — qty and stop are settled,
+        # so the candidate's worst-case risk is knowable — and still before
+        # submission, which is where a correlated burst is actually admitted.
+        if not self._heat_cap_allows(decision):
+            self._mark_signal_bar_processed(
+                signal_key, signal_bar, strategy_statuses, strategy_reasons, symbol
+            )
+            return None
+
         # Arrival-price benchmark for execution-quality slippage measurement
         # (industry TCA: Implementation Shortfall vs Arrival Price). Capture
         # the NBBO midpoint immediately before submission so the eventual
@@ -2939,8 +3316,16 @@ class TradingEngine:
                 f"qty={qty} price={price} strategy={owner} "
                 f"position_uid={order_row.position_uid[:18]}…"
             )
-            logger.warning(msg)
-            self.alerts.broker_error(msg)
+            logger.info(msg)
+            self.alerts.trade_executed(
+                symbol=raw_symbol,
+                strategy=owner,
+                side="sell",
+                qty=qty,
+                price=price,
+                reason="protective stop filled",
+                position_uid=order_row.position_uid,
+            )
             self._external_close_suspects.pop(owner_key, None)
 
             if has_residual:
@@ -8426,7 +8811,6 @@ class TradingEngine:
         ownership on non-fill outcomes so external-close detection doesn't
         generate spurious warnings.
         """
-        import re as _re
         fills = self.broker.drain_option_fills()
         for decision, status_str, filled_qty, avg_fill_price, order_id, position_uid in fills:
             mapped = {"filled": OrderStatus.FILLED, "partially_filled": OrderStatus.PARTIAL}.get(

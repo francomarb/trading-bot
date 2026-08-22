@@ -2686,6 +2686,16 @@ class TestSubstrateStopFillDispatchSemantics:
             update_lifecycle=False,
             position_uid_override=uid,
         )
+        engine.alerts.trade_executed.assert_called_once_with(
+            symbol="FRO",
+            strategy="sma_crossover",
+            side="sell",
+            qty=49.0,
+            price=17.25,
+            reason="protective stop filled",
+            position_uid=uid,
+        )
+        engine.alerts.broker_error.assert_not_called()
         assert "FRO" not in engine._positions
         assert "FRO" not in engine._entry_prices
         assert "FRO" not in engine._external_close_suspects
@@ -2774,6 +2784,16 @@ class TestSubstrateStopFillDispatchSemantics:
             update_lifecycle=False,
             position_uid_override=uid,
         )
+        engine.alerts.trade_executed.assert_called_once_with(
+            symbol="GOOG",
+            strategy="donchian_breakout",
+            side="sell",
+            qty=7.0,
+            price=378.85,
+            reason="protective stop filled",
+            position_uid=uid,
+        )
+        engine.alerts.broker_error.assert_not_called()
         assert "GOOG" in engine._positions
         assert engine._entry_prices["GOOG"] == pytest.approx(391.0)
         assert "GOOG" not in engine._external_close_suspects

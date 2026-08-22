@@ -585,9 +585,30 @@ STRATEGY_ALLOWED_REGIMES: dict[str, set[str]] = {
     "rsi_reversion":     {"TRENDING", "RANGING", "VOLATILE", "BEAR"},
     # Squeeze fires best after compression breaks (TRENDING) or during it (RANGING).
     "bollinger_squeeze": {"TRENDING", "RANGING"},
-    # Donchian whipsaws hard in RANGING regimes (every 20-day high gets faded).
-    # Restrict to TRENDING only — academic literature is unanimous on this.
-    "donchian_breakout": {"TRENDING"},
+    # BEAR-only exclusion — changed from TRENDING-only on 2026-08-18 (`11.59`).
+    #
+    # The original rationale, "Donchian whipsaws hard in RANGING regimes (every
+    # 20-day high gets faded), academic literature is unanimous", was MEASURED
+    # AND REFUTED for this universe. Raw-signal trades bucketed by SPY regime
+    # at entry, SIP 2016-11→2026-08, ai_bigtech: TRENDING mean R 0.71,
+    # RANGING 0.71 (higher win rate), VOLATILE 0.72, BEAR 0.63.
+    #
+    # BEAR stays blocked because that is the gate's one measured value: 2022
+    # was -47.8R ungated against -9.1R under TRENDING-only. The pre-registered
+    # test of this exact change passed all three criteria (2022 -16.1R against
+    # a -20.0R bar; return +41.0% vs +27.4%; maxDD -15.9% vs -15.0%), and the
+    # BEAR-only arm beat TRENDING-only in 9 of 11 years while beating the
+    # UNGATED arm in both bad years.
+    #
+    # Accepted costs, recorded so they are not rediscovered as surprises:
+    # 2022 worsens -9.1R → -16.1R, 2026 worsens +60.3R → +51.3R, and entries
+    # rise ~40% (714 → 997 in the model), which raises concurrency toward the
+    # existing hard_max_positions=8 ceiling. `11.60` (correlated-entry heat
+    # cap) tracks that; the count cap is the interim control.
+    #
+    # Paper-mode change. Reverting is this one line.
+    # See docs/donchian_regime_gate_investigation.md.
+    "donchian_breakout": {"TRENDING", "RANGING", "VOLATILE"},
     "spy_options_reversion": {"TRENDING", "RANGING"},
     # Credit spreads sell premium — never in BEAR or VOLATILE (a vol spike
     # is exactly when defined-risk shorts hit max loss). See design doc §3.
@@ -680,6 +701,32 @@ STRATEGY_ALLOCATIONS: dict[str, dict] = {
         "max_position_pct_of_sleeve": 0.40,
     },
 }
+
+# ── Correlated-entry heat cap (PLAN 11.60) ──────────────────────────────────
+# "Heat" is total open risk carried at once: the sum, across a sleeve's open
+# positions and its resting entry reservations, of what would be lost if every
+# one resolved at its stop. Breakout entries fire market-wide together, so they
+# are not independent bets — see docs/correlated_entry_heat_cap_design.md.
+#
+# Denominated in ACCOUNT EQUITY, not sleeve budget: per-trade risk already is
+# (`equity x risk_per_trade_pct`), and a sleeve budget stretches when other
+# sleeves are idle. Capital can stretch; risk appetite should not.
+#
+# Opt-in per strategy. A strategy without an entry is unconstrained by heat
+# (still bounded by its sleeve budget and hard_max_positions). SMA crossover is
+# deliberately absent: its entries are individually-timed MA crosses that do
+# not arrive in bursts.
+#
+# STRATEGY_HEAT_CAP_ENFORCED=False ships this OBSERVATION-ONLY: heat is
+# computed and every would-be refusal is logged, but nothing is blocked. Same
+# posture as PAPER_STRATEGY_DRAWDOWN_GATE_ENABLED, and for the same reason —
+# accumulate evidence on what the level costs before it costs a trade. The
+# level below was pre-registered before any measurement run; changing it is a
+# recorded policy decision, not a backtest output.
+STRATEGY_MAX_OPEN_HEAT_PCT: dict[str, float] = {
+    "donchian_breakout": 0.016,   # 4R at the 0.40% per-trade risk target
+}
+STRATEGY_HEAT_CAP_ENFORCED: bool = False
 
 ALLOCATOR_STRETCH_UTILIZATION_THRESHOLD = 0.80
 ALLOCATOR_DEFAULT_STRETCH_PCT = 0.15
@@ -1153,6 +1200,19 @@ TELEGRAM_COMMANDS_ENABLED: bool = (
 # The Streamlit dashboard reads this file to show live bot status.
 STATE_SNAPSHOT_PATH: str = "data/engine_state.json"
 DASHBOARD_PORT: int = int(os.getenv("DASHBOARD_PORT", "8501"))
+
+# EQUITY_PATH_STATE_PATH: the day's account-equity high-water mark and max
+#   drawdown, for the daily P&L report's `Max intraday drawdown`. Read at
+#   engine startup and re-adopted when the stored UTC day is still today,
+#   so `recycle_bot.sh` does not restart the metric at zero and let the
+#   second session's shutdown overwrite the day's report with only the
+#   post-restart decline. Deliberately NOT folded into
+#   STATE_SNAPSHOT_PATH: that file is a display snapshot for the
+#   dashboard/operator/alerts, rewritten every cycle and best-effort by
+#   contract, and hydrating engine state from it would make report
+#   correctness depend on a file nothing promises to keep. Same reasoning
+#   (and same atomic tmp→replace write) as OPERATOR_CONTROL_STATE_PATH.
+EQUITY_PATH_STATE_PATH: str = "data/equity_path_state.json"
 
 # ── Operator controls (Phase A — PR-2) ──────────────────────────────────────
 # Operator command queue + sticky halt. See docs/operator_controls_proposal.md

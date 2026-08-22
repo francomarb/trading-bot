@@ -25,7 +25,8 @@ maximum, not the maximum that includes today.
 
 Order type
 ----------
-STOP_LIMIT (PLAN 11.47) — the broker arms a stop at the prior-N-day high,
+STOP_LIMIT (shipped in PR #62; stop-distance follow-up is PLAN 11.54) — the
+broker arms a stop at the prior-N-day high,
 the same level that produced the signal. The stop only triggers if price
 trades through that level the next session, which prevents the
 failed-breakout case (gap-down opens that filled hundreds of dollars

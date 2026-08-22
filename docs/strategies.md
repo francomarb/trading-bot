@@ -38,7 +38,7 @@ Five strategy sleeves are running simultaneously in paper trading: SMA, RSI, Don
 | Status | **Paper Trading** |
 | Sleeve weight | 40% of deployable gross capital |
 | Max positions | 8 |
-| Per-position budget | ~$12,800 max notional at $100k paper equity |
+| Per-position budget | **$12,800** baseline at $100k paper equity (`max_position_pct_of_sleeve` 0.40 × $32k target sleeve); **up to $14,720** when the allocator stretch applies — `can_stretch: True` raises the effective sleeve to $36,800 while utilization < 80% and the equity pool has slack, and the cap is computed against the *effective* budget |
 
 **Signal logic:**
 - **Entry:** Fast SMA crosses *above* slow SMA (bullish crossover)
@@ -116,6 +116,7 @@ SMA crossover is the simplest trend-following signal. It captures sustained dire
 | Sleeve weight | 20% of equity (target) — carved from 0.25 when credit_spread was added |
 | Hard max positions | 8 |
 | Max position % of sleeve | 40% |
+| Per-position budget | **$6,400** baseline at $100k paper equity (0.40 × $16k target sleeve); **up to $7,360** with allocator stretch (`can_stretch: True`) |
 | Watchlist size | 30 names (`RSI_WATCHLIST`) |
 
 **Signal logic:**
@@ -198,12 +199,18 @@ RSI mean reversion profits when prices snap back from extremes. It performs well
 | File | `strategies/donchian_breakout.py` |
 | Class | `DonchianBreakout` |
 | Type | Trend-continuation (Turtle System 1) |
-| Order type | MARKET |
+| Order type | **STOP_LIMIT** (shipped PR #62) |
 | Status | **Paper Trading** |
 | Sleeve weight | 25% of gross capital |
-| Max positions | 5 |
-| Per-position budget | ~$4,000 at $100k paper equity |
+| Max positions | **8** (`hard_max_positions`) |
+| Per-position budget | **$8,000** baseline at $100k paper equity (`max_position_pct_of_sleeve` 0.40 × $20k target sleeve); **up to $9,200** when the allocator stretch applies — `can_stretch: True` raises the effective sleeve to $23,000 while utilization < 80% and the equity pool has slack, and the cap is computed against the *effective* budget |
 | Activated | 2026-05-01 |
+
+> **Corrected 2026-08-18.** This table previously said MARKET / 5 positions /
+> ~$4,000, all three stale, and quoted the baseline cap without the stretch
+> ceiling. `config/settings.py` is the source of truth; see
+> [`donchian_breakout_strategy.md`](donchian_breakout_strategy.md) for the full
+> capital math and `11.59` for the open regime-gate question.
 
 **Signal logic:**
 - **Entry:** Close makes a new N-day high (Donchian breakout)
@@ -249,11 +256,24 @@ All gates must pass for an entry to be allowed. Exits are never blocked.
 | Regime | Allowed |
 |---|---|
 | TRENDING | ✅ Yes |
-| RANGING | ❌ No |
-| VOLATILE | ❌ No |
+| RANGING | ✅ Yes *(since 2026-08-18)* |
+| VOLATILE | ✅ Yes *(since 2026-08-18)* |
 | BEAR | ❌ No |
 
-RANGING is explicitly blocked — in a sideways market every N-day high is a false breakout that reverses. Donchian needs a confirmed trend to produce positive expectancy.
+**BEAR only is blocked — changed 2026-08-18 (`11.59`).** This paragraph used
+to assert that in a sideways market every N-day high is a false breakout and
+that Donchian needs a confirmed trend for positive expectancy. That was
+measured and refuted: on SIP 2016-11→2026-08 over `ai_bigtech`, raw-signal
+trades bucketed by SPY regime at entry give **RANGING mean R 0.71 against
+TRENDING's 0.71** (RANGING with a *higher* win rate) and **VOLATILE 0.72**,
+the best of the four buckets.
+
+BEAR remains blocked because that is the gate's one measured value — 2022 was
+−47.8R ungated against −9.1R under TRENDING-only. A pre-registered test of
+this exact change passed all three criteria before it was applied. Accepted
+costs: 2022 worsens −9.1R → −16.1R, and entries rise ~40%, which `11.60`
+(correlated-entry heat cap) tracks. See
+[`donchian_regime_gate_investigation.md`](donchian_regime_gate_investigation.md).
 
 **Exit mechanics:**
 
@@ -266,7 +286,19 @@ RANGING is explicitly blocked — in a sideways market every N-day high is a fal
 32-name ai_bigtech universe: 23 AI core names (NVDA, MSFT, GOOGL, META, AMZN, etc.) + 9 AI-adjacent names (semiconductor equipment, data-centre power, quantum). See [`docs/donchian_breakout_strategy.md`](donchian_breakout_strategy.md) for the full universe methodology.
 
 **Why this strategy:**
-Donchian breakout is a pure trend-continuation system (Turtle Trading, System 1). It profits when a stock breaks to new highs with momentum and rides the trend until it reverses. It generates no signals in sideways or declining markets, making it naturally complementary to RSI Reversion. Restricted to the TRENDING regime only to eliminate false breakouts in range-bound conditions.
+Donchian breakout is a pure trend-continuation system (Turtle Trading, System 1). It profits when a stock breaks to new highs with momentum and rides the trend until it reverses. Restricted to the TRENDING regime only.
+
+> **Two claims removed here on 2026-08-18, both measured false.** (1) *"It
+> generates no signals in sideways or declining markets"* — the raw signal
+> fires plentifully in both: 443 RANGING and 160 BEAR entries against
+> TRENDING's 520 over SIP 2016-11→2026-08. Those entries are **blocked by the
+> regime gate**, which is not the same as not existing, and the difference
+> matters when reasoning about how much the gate costs. (2) *"Restricted to
+> TRENDING only to eliminate false breakouts in range-bound conditions"* —
+> RANGING entries return mean R 0.71 against TRENDING's 0.71, so there is no
+> false-breakout penalty to eliminate. The gate's measured value is BEAR
+> protection. See `11.59` and
+> [`donchian_regime_gate_investigation.md`](donchian_regime_gate_investigation.md).
 
 ---
 

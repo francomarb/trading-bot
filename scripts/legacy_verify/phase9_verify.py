@@ -25,7 +25,6 @@ import sys
 import time
 from datetime import datetime, timezone
 from pathlib import Path
-from unittest.mock import patch
 
 ROOT = Path(__file__).resolve().parents[2]
 if str(ROOT) not in sys.path:
@@ -33,10 +32,9 @@ if str(ROOT) not in sys.path:
 
 from loguru import logger
 
-from config import settings
 from engine.trader import EngineConfig, TradingEngine
 from execution.broker import AlpacaBroker, OrderResult, OrderStatus
-from reporting.alerts import AlertDispatcher, AlertType, LogFileBackend
+from reporting.alerts import AlertDispatcher, LogFileBackend
 from reporting.logger import TradeLogger, install_json_sink
 from reporting.pnl import PnLTracker
 from risk.manager import RiskDecision, RiskManager, Side
@@ -190,21 +188,36 @@ def test_daily_pnl(tmp_dir: str, csv_path: str) -> None:
     )
 
     today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
-    tracker.record_trade_pnl("phase9_verify", 50.0, today=today)
-    tracker.record_trade_pnl("phase9_verify", -20.0, today=today)
 
+    # This used to inject two synthetic P&L events via
+    # `record_trade_pnl`, an in-memory accumulator that production never
+    # called — so the section verified a code path the bot does not run.
+    # It now asserts against the AAPL 150.05 → 155.00 close that
+    # `test_trade_csv` already wrote to this DB, which is the same
+    # trade-log read the live EOD summary performs.
     summary = tracker.generate_daily_summary(
         day=today,
         session_start_equity=100_000.0,
         session_end_equity=100_030.0,
-        unrealized_pnl=0.0,
+        unrealized_pnl=125.0,
+        max_intraday_drawdown=40.0,
     )
 
-    check("daily summary has 2 trades", summary.total_trades == 2)
+    check("daily summary has 1 trade", summary.total_trades == 1)
     check(
-        "realized P&L is $30",
-        summary.realized_pnl == 30.0,
+        "realized P&L is $4.95 (155.00 - 150.05)",
+        summary.realized_pnl == 4.95,
         f"got ${summary.realized_pnl}",
+    )
+    check(
+        "unrealized P&L passes through",
+        summary.unrealized_pnl == 125.0,
+        f"got ${summary.unrealized_pnl}",
+    )
+    check(
+        "max intraday drawdown passes through",
+        summary.max_intraday_drawdown == 40.0,
+        f"got ${summary.max_intraday_drawdown}",
     )
     check(
         "per-strategy 'phase9_verify' present",
@@ -212,8 +225,8 @@ def test_daily_pnl(tmp_dir: str, csv_path: str) -> None:
     )
     if "phase9_verify" in summary.strategies:
         s = summary.strategies["phase9_verify"]
-        check("strategy wins=1, losses=1", s.wins == 1 and s.losses == 1)
-        check("strategy expectancy=$15", s.expectancy == 15.0)
+        check("strategy wins=1, losses=0", s.wins == 1 and s.losses == 0)
+        check("strategy expectancy=$4.95", s.expectancy == 4.95)
 
     path = tracker.write_daily_report(summary)
     check("daily markdown written", os.path.exists(path), path)

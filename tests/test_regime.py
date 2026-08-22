@@ -28,7 +28,7 @@ import pandas as pd
 import pytest
 
 from indicators.technicals import add_adx
-from regime.detector import MarketRegime, RegimeDetector
+from regime.detector import MarketRegime, RegimeDetector, RegimeUnavailableError
 from strategies.base import BaseStrategy, OrderType, SignalFrame, StrategySlot
 
 
@@ -364,11 +364,19 @@ class TestRegimeCache:
 
 
 class TestRegimeFallback:
-    def test_fetch_failure_returns_ranging_with_no_cache(self):
+    def test_fetch_failure_with_no_cache_raises_rather_than_inventing_a_regime(self):
+        """
+        Was `test_fetch_failure_returns_ranging_with_no_cache`, asserting the
+        detector returns RANGING here. That was fail-OPEN: RANGING permits
+        entries for every sleeve that allows it, and `11.59` added RANGING and
+        VOLATILE to Donchian's allowed set. Returning a value also hid the
+        failure from the engine's consecutive-failure counter, because
+        returning is not raising. Unknown must be signalled, not fabricated.
+        """
         d = _make_detector()
         with patch.object(d, "_fetch_spy", return_value=None):
-            regime = d.detect()
-        assert regime == MarketRegime.RANGING
+            with pytest.raises(RegimeUnavailableError, match="regime is unknown"):
+                d.detect()
 
     def test_fetch_failure_returns_last_cached_regime(self):
         spy = _make_spy(210, start_price=400.0, trend=0.5)
@@ -401,11 +409,12 @@ class TestRegimeFallback:
             "_spy_cache_time must advance on failure to rate-limit retries"
         )
 
-    def test_empty_dataframe_falls_back(self):
+    def test_empty_dataframe_with_no_cache_raises(self):
+        """An empty frame is the same unknown state as no frame at all."""
         d = _make_detector()
         with patch.object(d, "_fetch_spy", return_value=pd.DataFrame()):
-            regime = d.detect()
-        assert regime == MarketRegime.RANGING
+            with pytest.raises(RegimeUnavailableError):
+                d.detect()
 
 
 # ── StrategySlot.allowed_regimes ─────────────────────────────────────────────
@@ -689,6 +698,74 @@ class TestEngineRegimeGate:
         assert broker.place_order.call_count == 1
         assert engine._regime_fail_count == 1
 
+    def test_cold_start_unknown_regime_blocks_entries_even_when_ranging_is_allowed(self):
+        """
+        The P1 from review of PR #113, reproduced end-to-end.
+
+        `RegimeDetector.detect()` swallowed its own SPY fetch error and returned
+        RANGING when it had no cached regime, so it never raised and the
+        engine's consecutive-failure BEAR path was unreachable for this mode.
+        With `11.59` adding RANGING to Donchian's allowed set, an unavailable
+        regime gate became an entry-PERMITTING state — the exact inverse of the
+        BEAR protection the gate exists for.
+
+        The slot here allows RANGING, which is what made the old behaviour
+        dangerous. If the fix regresses, the entry goes through and this fails.
+        """
+        engine, broker = self._make_engine(
+            regime=MarketRegime.TRENDING,
+            allowed_regimes=frozenset(
+                {MarketRegime.TRENDING, MarketRegime.RANGING, MarketRegime.VOLATILE}
+            ),
+            entry_signal=True,
+        )
+        engine._regime_detector.detect.side_effect = RegimeUnavailableError(
+            "SPY data unavailable and no cached regime — regime is unknown"
+        )
+
+        bars = self._bars()
+        with patch("engine.trader.fetch_symbol", return_value=(bars, SimpleNamespace(api_calls=0))):
+            with patch("config.settings.REGIME_MAX_CONSECUTIVE_FAILURES", 99):
+                engine.start(max_cycles=1)
+
+        assert broker.place_order.call_count == 0, (
+            "an unknown regime must not permit entries, even for a slot that "
+            "allows RANGING and VOLATILE"
+        )
+
+    def test_unknown_regime_does_not_trigger_the_bear_defensive_sweep(self):
+        """
+        Fail-closed must not mean fail-BEAR. Defaulting to BEAR would block
+        entries correctly but also fire `_sweep_bear_spread_exits()`, force-
+        closing credit spreads on what may be nothing worse than a data
+        outage. A SPY fetch failure is not a bear market.
+        """
+        engine, broker = self._make_engine(
+            regime=MarketRegime.TRENDING,
+            allowed_regimes=frozenset({MarketRegime.TRENDING, MarketRegime.RANGING}),
+            entry_signal=True,
+        )
+        engine._regime_detector.detect.side_effect = RegimeUnavailableError("unknown")
+
+        bars = self._bars()
+        with patch.object(engine, "_sweep_bear_spread_exits") as sweep:
+            with patch("engine.trader.fetch_symbol", return_value=(bars, SimpleNamespace(api_calls=0))):
+                with patch("config.settings.REGIME_MAX_CONSECUTIVE_FAILURES", 99):
+                    engine.start(max_cycles=1)
+
+        assert broker.place_order.call_count == 0
+        sweep.assert_not_called()
+
+    def test_cached_regime_is_still_used_when_spy_is_unavailable(self):
+        """
+        The fix must not over-correct: a detector holding a recent regime keeps
+        returning it. Only the genuinely-unknown cold start is fail-closed.
+        """
+        d = _make_detector()
+        d._last_regime = MarketRegime.TRENDING
+        with patch.object(d, "_fetch_spy", return_value=None):
+            assert d.detect() == MarketRegime.TRENDING
+
     def test_regime_detection_consecutive_failures_fall_to_bear(self):
         """After N consecutive failures, fall back to BEAR (fail-closed)."""
         engine, broker = self._make_engine(
@@ -703,8 +780,13 @@ class TestEngineRegimeGate:
             with patch("config.settings.REGIME_MAX_CONSECUTIVE_FAILURES", 2):
                 engine.start(max_cycles=3)
 
-        # Cycle 1: fail → RANGING (allowed) → entry placed
+        # Cycle 1: fail, no prior regime → UNKNOWN → blocked (fail-closed).
+        #   This assertion used to be `== 1`, i.e. the test PINNED the
+        #   fail-open behaviour: cycle 1 defaulted to RANGING and placed a
+        #   live entry with no idea what the market was doing. That default
+        #   became actively dangerous when `11.59` added RANGING to Donchian's
+        #   allowed set, and the fix makes an unknown regime block instead.
         # Cycle 2: fail → BEAR (fail-closed, 2 consecutive) → blocked
         # Cycle 3: fail → BEAR (still fail-closed) → blocked
-        assert broker.place_order.call_count == 1
+        assert broker.place_order.call_count == 0
         assert engine._regime_fail_count == 3

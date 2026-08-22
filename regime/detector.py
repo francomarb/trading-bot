@@ -52,10 +52,17 @@ Regimes
 Fail-safe
 ---------
 If SPY data is unavailable (fetch error), the detector returns the last cached
-regime if one exists, or RANGING (the most conservative non-blocking default)
-with a WARNING log. It never silently substitutes stale data for a BEAR or
-VOLATILE classification — if the cache is fresh enough it is used; otherwise
-RANGING. Entry blocking remains the engine slot's responsibility.
+regime if one exists. If there is no cached regime either — a cold start with no
+SPY data — it raises `RegimeUnavailableError` rather than inventing one.
+
+It previously returned RANGING here, called "the most conservative non-blocking
+default". That was only true while no sleeve we cared about traded in RANGING.
+`11.59` added RANGING and VOLATILE to Donchian's allowed set, at which point the
+same default silently became entry-PERMITTING. A fabricated value also hid the
+failure from the engine's consecutive-failure counter, since returning a value
+is not an error. The engine now blocks new entries while the regime is unknown,
+without triggering the BEAR defensive sweep — a data outage is not a bear
+market. Entry blocking remains the engine slot's responsibility.
 
 VIX integration
 ---------------
@@ -96,6 +103,19 @@ from indicators.technicals import add_adx, add_atr, add_sma
 
 
 # ── Regime enum ───────────────────────────────────────────────────────────────
+
+
+class RegimeUnavailableError(RuntimeError):
+    """
+    Raised when the regime cannot be determined at all — no SPY data and no
+    cached regime from a previous cycle.
+
+    Deliberately NOT a regime value. Any fabricated stand-in is wrong in one
+    direction or the other: RANGING permits entries for every sleeve that
+    allows it, and BEAR triggers defensive liquidation. The caller has to
+    choose, and the engine chooses to block new entries while leaving exits
+    and open positions alone.
+    """
 
 
 class MarketRegime(Enum):
@@ -185,12 +205,26 @@ class RegimeDetector:
 
         spy = self._fetch_spy()
         if spy is None or spy.empty:
-            fallback = self._last_regime or MarketRegime.RANGING
-            logger.warning(
-                f"RegimeDetector: no SPY data — returning {fallback.value!r} "
-                "(last cached or conservative default)"
+            if self._last_regime is not None:
+                logger.warning(
+                    f"RegimeDetector: no SPY data — returning last known regime "
+                    f"{self._last_regime.value!r}"
+                )
+                return self._last_regime
+            # Cold start with no SPY data: the regime is genuinely UNKNOWN.
+            # This used to return RANGING, described as "the most conservative
+            # non-blocking default". That was only conservative while every
+            # RANGING-allowing sleeve was one we were happy to trade blind —
+            # and it stopped being true when `11.59` added RANGING and VOLATILE
+            # to Donchian's allowed set, turning an unavailable gate into an
+            # entry-PERMITTING state. Fabricating a regime here also hid the
+            # failure from the engine's consecutive-failure counter, because
+            # returning a value is not an error.
+            # Raise instead, so the caller decides — see
+            # [[feedback_fails_open_needs_context]].
+            raise RegimeUnavailableError(
+                "SPY data unavailable and no cached regime — regime is unknown"
             )
-            return fallback
 
         regime = self._classify(spy)
         self._last_regime      = regime

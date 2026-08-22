@@ -28,8 +28,12 @@ Coverage map (one class per concern):
 
 from __future__ import annotations
 
+import json
+import os
 import time
 import sqlite3
+
+from loguru import logger
 from dataclasses import replace
 from datetime import datetime, timedelta, timezone
 from types import SimpleNamespace
@@ -6740,3 +6744,475 @@ class TestPostFillStopReAnchor:
         engine, _ = engine_factory()
         assert hasattr(engine, "_last_atr")
         assert isinstance(engine._last_atr, dict)
+
+
+# ── TestIntradayEquityDrawdown ──────────────────────────────────────────────
+
+
+class TestIntradayEquityDrawdown:
+    """
+    `max_intraday_drawdown` on the daily P&L report was $0.00 in all 71
+    reports written before 2026-08-19: it read an in-memory accumulator
+    fed only by `PnLTracker.record_trade_pnl`, which no production code
+    path ever called. The engine now derives it from the account-equity
+    path it already samples once per cycle.
+    """
+
+    def test_starts_flat_and_tracks_peak_to_trough(self, engine_factory):
+        engine, _ = engine_factory()
+        assert engine.max_intraday_drawdown == 0.0
+
+        engine._observe_equity(100_000.0)
+        engine._observe_equity(101_500.0)   # new peak
+        engine._observe_equity(99_800.0)    # -1,700 from peak
+        assert engine.max_intraday_drawdown == pytest.approx(1_700.0)
+
+        engine._observe_equity(100_900.0)   # recovery does not shrink the max
+        assert engine.max_intraday_drawdown == pytest.approx(1_700.0)
+
+        engine._observe_equity(99_000.0)    # deeper trough from the same peak
+        assert engine.max_intraday_drawdown == pytest.approx(2_500.0)
+
+    def test_a_rising_equity_path_has_no_drawdown(self, engine_factory):
+        engine, _ = engine_factory()
+        for equity in (100_000.0, 100_400.0, 101_000.0):
+            engine._observe_equity(equity)
+        assert engine.max_intraday_drawdown == 0.0
+
+    def test_peak_resets_on_utc_date_rollover(self, engine_factory):
+        """The field is per-day but this process runs for a week at a
+        time. Without the reset, Monday's peak would keep producing
+        drawdown against Tuesday's equity forever."""
+        engine, _ = engine_factory()
+        now = datetime(2026, 8, 18, 20, 0, tzinfo=timezone.utc)
+        engine._clock = lambda: now
+
+        engine._observe_equity(105_000.0)
+        engine._observe_equity(100_000.0)
+        assert engine.max_intraday_drawdown == pytest.approx(5_000.0)
+
+        now = datetime(2026, 8, 19, 14, 0, tzinfo=timezone.utc)
+        engine._clock = lambda: now
+        engine._observe_equity(100_000.0)
+        assert engine.max_intraday_drawdown == 0.0, (
+            "yesterday's peak must not carry into today's intraday drawdown"
+        )
+
+        engine._observe_equity(99_250.0)
+        assert engine.max_intraday_drawdown == pytest.approx(750.0)
+
+    def test_cycle_snapshots_feed_the_drawdown(self, engine_factory):
+        """Binds the wiring, not just the method: a normal open-market
+        cycle must push its snapshot equity through `_observe_equity`."""
+        engine, broker = engine_factory(snapshot=_snapshot(equity=100_000.0))
+        broker.sync_with_broker.return_value = _snapshot(equity=100_000.0)
+        engine._run_one_cycle()
+
+        broker.sync_with_broker.return_value = _snapshot(equity=97_600.0)
+        engine._run_one_cycle()
+
+        assert engine._last_cycle_equity == pytest.approx(97_600.0)
+        assert engine.max_intraday_drawdown == pytest.approx(2_400.0)
+
+    def test_market_closed_cycles_also_feed_the_drawdown(self, engine_factory):
+        """The bot holds overnight, so an extended-hours equity slide is
+        a real drawdown — market-closed cycles take a snapshot too."""
+        engine, broker = engine_factory(market_open=False)
+        engine.config = replace(engine.config, market_hours_only=True)
+
+        broker.sync_with_broker.return_value = _snapshot(equity=100_000.0)
+        engine._run_one_cycle()
+        broker.sync_with_broker.return_value = _snapshot(equity=98_900.0)
+        engine._run_one_cycle()
+
+        assert engine.max_intraday_drawdown == pytest.approx(1_100.0)
+
+
+# ── TestIntradayDrawdownSurvivesRestart ─────────────────────────────────────
+
+
+class TestIntradayDrawdownSurvivesRestart:
+    """
+    The peak and max were process-memory only. `recycle_bot.sh` writes
+    the day's report at shutdown, the replacement engine starts with a
+    fresh peak, and *its* shutdown overwrites that same `{day}.md` with
+    only the post-restart decline — so a morning drawdown vanished from
+    the report that claims to cover the day.
+    """
+
+    def _state_file(self) -> str:
+        from config import settings
+
+        return settings.EQUITY_PATH_STATE_PATH
+
+    def test_peak_and_max_are_persisted(self, engine_factory):
+        engine, _ = engine_factory()
+        now = datetime(2026, 8, 19, 15, 0, tzinfo=timezone.utc)
+        engine._clock = lambda: now
+
+        engine._observe_equity(100_000.0)
+        engine._observe_equity(97_500.0)
+
+        with open(self._state_file()) as fh:
+            state = json.load(fh)
+        assert state["day"] == "2026-08-19"
+        assert state["equity_peak"] == pytest.approx(100_000.0)
+        assert state["max_intraday_drawdown"] == pytest.approx(2_500.0)
+
+    def test_same_day_restart_resumes_the_days_drawdown(self, engine_factory):
+        """The reviewer's scenario end to end: session 1 takes a
+        drawdown, recycle, session 2 must not report only its own."""
+        now = datetime(2026, 8, 19, 15, 0, tzinfo=timezone.utc)
+
+        first, _ = engine_factory()
+        first._clock = lambda: now
+        first._observe_equity(100_000.0)
+        first._observe_equity(96_000.0)      # -4,000 in the morning
+        assert first.max_intraday_drawdown == pytest.approx(4_000.0)
+
+        # Recycle: a brand-new engine object, same UTC day.
+        second, _ = engine_factory()
+        second._clock = lambda: now
+        assert second.max_intraday_drawdown == 0.0, "fresh object starts clean"
+
+        second._restore_equity_path_state()
+        assert second.max_intraday_drawdown == pytest.approx(4_000.0)
+        assert second._session_equity_peak == pytest.approx(100_000.0)
+
+        # A shallower afternoon dip must not shrink the day's figure.
+        second._observe_equity(99_000.0)
+        assert second.max_intraday_drawdown == pytest.approx(4_000.0)
+
+        # A deeper one extends it, measured from the restored peak.
+        second._observe_equity(94_500.0)
+        assert second.max_intraday_drawdown == pytest.approx(5_500.0)
+
+    def test_restore_runs_before_the_startup_snapshot_is_observed(
+        self, engine_factory,
+    ):
+        """Ordering matters: if the startup snapshot were observed
+        first it would become a new peak and the restored one would
+        never apply. Drive the real `start()`."""
+        now = datetime(2026, 8, 19, 15, 0, tzinfo=timezone.utc)
+
+        first, _ = engine_factory()
+        first._clock = lambda: now
+        first._observe_equity(100_000.0)
+
+        second, broker = engine_factory(snapshot=_snapshot(equity=93_000.0))
+        second._clock = lambda: now
+        broker.sync_with_broker.return_value = _snapshot(equity=93_000.0)
+        # max_cycles=0 still runs the full startup path (snapshot,
+        # restore, seed) and then exits the loop immediately.
+        second.start(max_cycles=0)
+
+        # 100,000 restored peak vs a 93,000 startup snapshot.
+        assert second.max_intraday_drawdown == pytest.approx(7_000.0)
+
+    def test_yesterdays_state_is_ignored(self, engine_factory):
+        first, _ = engine_factory()
+        first._clock = lambda: datetime(2026, 8, 18, 20, 0, tzinfo=timezone.utc)
+        first._observe_equity(100_000.0)
+        first._observe_equity(90_000.0)
+
+        second, _ = engine_factory()
+        second._clock = lambda: datetime(2026, 8, 19, 14, 0, tzinfo=timezone.utc)
+        second._restore_equity_path_state()
+
+        assert second.max_intraday_drawdown == 0.0
+        assert second._session_equity_peak is None
+
+    def test_malformed_state_does_not_block_startup(self, engine_factory):
+        engine, _ = engine_factory()
+        with open(self._state_file(), "w") as fh:
+            fh.write("{not json at all")
+
+        engine._restore_equity_path_state()   # must not raise
+
+        assert engine.max_intraday_drawdown == 0.0
+        engine._observe_equity(100_000.0)
+        engine._observe_equity(99_000.0)
+        assert engine.max_intraday_drawdown == pytest.approx(1_000.0)
+
+    def test_missing_state_file_is_a_normal_first_start(self, engine_factory):
+        engine, _ = engine_factory()
+        path = self._state_file()
+        if os.path.exists(path):
+            os.remove(path)
+
+        engine._restore_equity_path_state()
+
+        assert engine.max_intraday_drawdown == 0.0
+        assert engine._session_equity_peak is None
+
+
+# ── TestBrokerEquityPathReconcile ───────────────────────────────────────────
+
+
+class TestBrokerEquityPathReconcile:
+    """
+    Per-cycle sampling cannot see equity that moved while no process was
+    running — a peak or trough reached entirely between a
+    `recycle_bot.sh` stop and the replacement's first cycle was
+    invisible. The broker's own 1-minute series covers the whole UTC day
+    regardless, and is folded in at shutdown.
+    """
+
+    DAY = "2026-08-19"
+
+    def _at(self, hour: int = 18):
+        return datetime(2026, 8, 19, hour, 0, tzinfo=timezone.utc)
+
+    def test_broker_series_raises_a_shallower_local_figure(self, engine_factory):
+        engine, broker = engine_factory()
+        engine._clock = lambda: self._at()
+        engine._observe_equity(100_000.0)
+        engine._observe_equity(99_800.0)          # only $200 seen locally
+        broker.get_intraday_equity_path.return_value = [
+            100_000.0, 94_500.0, 99_000.0,        # $5,500 while we were down
+        ]
+
+        assert engine.reconcile_intraday_drawdown_from_broker(self.DAY) == pytest.approx(5_500.0)
+        assert engine.max_intraday_drawdown == pytest.approx(5_500.0)
+
+    def test_a_deeper_locally_observed_figure_is_never_lowered(self, engine_factory):
+        """The broker series is 1-minute; a trough between its marks is
+        real and this process saw it. Combining with `max` means a
+        directly observed drawdown is never reported as smaller."""
+        engine, broker = engine_factory()
+        engine._clock = lambda: self._at()
+        engine._observe_equity(100_000.0)
+        engine._observe_equity(91_000.0)          # $9,000 observed directly
+        broker.get_intraday_equity_path.return_value = [100_000.0, 97_000.0]
+
+        assert engine.reconcile_intraday_drawdown_from_broker(self.DAY) == pytest.approx(9_000.0)
+
+    def test_requests_the_utc_day_clamped_to_now(self, engine_factory):
+        engine, broker = engine_factory()
+        engine._clock = lambda: self._at(hour=18)
+        broker.get_intraday_equity_path.return_value = []
+
+        engine.reconcile_intraday_drawdown_from_broker(self.DAY)
+
+        start, end = broker.get_intraday_equity_path.call_args.args
+        assert start == datetime(2026, 8, 19, 0, 0, tzinfo=timezone.utc)
+        assert end == self._at(hour=18), "must not request into the future"
+
+    def test_a_completed_past_day_spans_the_full_24h(self, engine_factory):
+        engine, broker = engine_factory()
+        engine._clock = lambda: datetime(2026, 8, 21, 9, 0, tzinfo=timezone.utc)
+        broker.get_intraday_equity_path.return_value = []
+
+        engine.reconcile_intraday_drawdown_from_broker(self.DAY)
+
+        start, end = broker.get_intraday_equity_path.call_args.args
+        assert start == datetime(2026, 8, 19, 0, 0, tzinfo=timezone.utc)
+        assert end == datetime(2026, 8, 20, 0, 0, tzinfo=timezone.utc)
+
+    def test_empty_series_keeps_the_local_figure(self, engine_factory):
+        engine, broker = engine_factory()
+        engine._clock = lambda: self._at()
+        engine._observe_equity(100_000.0)
+        engine._observe_equity(98_500.0)
+        broker.get_intraday_equity_path.return_value = []
+
+        assert engine.reconcile_intraday_drawdown_from_broker(self.DAY) == pytest.approx(1_500.0)
+
+    def test_broker_failure_keeps_the_local_figure(self, engine_factory):
+        """Runs inside the shutdown handler that writes the report — it
+        must degrade to the locally observed number, not explode."""
+        engine, broker = engine_factory()
+        engine._clock = lambda: self._at()
+        engine._observe_equity(100_000.0)
+        engine._observe_equity(97_750.0)
+        broker.get_intraday_equity_path.side_effect = RuntimeError("api down")
+
+        assert engine.reconcile_intraday_drawdown_from_broker(self.DAY) == pytest.approx(2_250.0)
+        assert engine.max_intraday_drawdown == pytest.approx(2_250.0)
+
+    def test_reconciled_figure_is_persisted(self, engine_factory):
+        from config import settings
+
+        engine, broker = engine_factory()
+        engine._clock = lambda: self._at()
+        engine._observe_equity(100_000.0)
+        broker.get_intraday_equity_path.return_value = [100_000.0, 93_000.0]
+
+        engine.reconcile_intraday_drawdown_from_broker(self.DAY)
+
+        with open(settings.EQUITY_PATH_STATE_PATH) as fh:
+            state = json.load(fh)
+        assert state["day"] == self.DAY
+        assert state["max_intraday_drawdown"] == pytest.approx(7_000.0)
+
+    def test_a_malformed_day_keeps_the_local_figure(self, engine_factory):
+        engine, broker = engine_factory()
+        engine._clock = lambda: self._at()
+        engine._observe_equity(100_000.0)
+        engine._observe_equity(99_000.0)
+
+        assert engine.reconcile_intraday_drawdown_from_broker("not-a-date") == pytest.approx(1_000.0)
+        broker.get_intraday_equity_path.assert_not_called()
+
+
+# ── TestHeatCapObservation ──────────────────────────────────────────────────
+
+
+class TestHeatCapObservation:
+    """
+    PLAN 11.60, shipped observation-only: the cap computes and logs but
+    refuses nothing until `STRATEGY_HEAT_CAP_ENFORCED` is flipped.
+    """
+
+    def _decision(self, qty=10, stop=90.0, strategy="donchian_breakout"):
+        from risk.manager import RiskDecision, Side
+
+        return RiskDecision(
+            symbol="AAPL", side=Side.BUY, qty=qty,
+            entry_reference_price=100.0, stop_price=stop,
+            strategy_name=strategy, reason="test",
+            order_type=OrderType.STOP_LIMIT,
+            entry_trigger_price=100.0, limit_price=110.0,
+        )
+        # candidate risk = (limit 110 - stop 90) x qty 10 = $200
+
+    def _wire(self, engine, *, filled=0.0, pending=0.0, equity=100_000.0):
+        engine._last_cycle_equity = equity
+        engine.trade_logger.read_open_risk_by_strategy_with_gaps = (
+            lambda: ({"donchian_breakout": filled}, {})
+        )
+        engine.lifecycle_orders_store = MagicMock()
+        engine.lifecycle_orders_store.read_pending_entry_reservations = (
+            lambda: {"donchian_breakout": pending}
+        )
+
+    def test_strategy_without_a_cap_is_unconstrained(self, engine_factory, monkeypatch):
+        engine, _ = engine_factory()
+        self._wire(engine, filled=99_999.0)
+        assert engine._heat_cap_allows(self._decision(strategy="sma_crossover")) is True
+
+    def test_under_the_cap_allows(self, engine_factory):
+        engine, _ = engine_factory()
+        # cap = 1.6% of 100k = 1600; filled 500 + candidate 100 = 600
+        self._wire(engine, filled=500.0)
+        assert engine._heat_cap_allows(self._decision()) is True
+
+    def test_over_the_cap_still_allows_in_observation_mode(self, engine_factory):
+        """The whole point of shipping this way: it must not block."""
+        engine, _ = engine_factory()
+        self._wire(engine, filled=1_590.0)   # + candidate 100 -> 1690 > 1600
+        assert engine._heat_cap_allows(self._decision()) is True
+
+    def test_over_the_cap_logs_a_structured_record(self, engine_factory):
+        engine, _ = engine_factory()
+        self._wire(engine, filled=1_000.0, pending=550.0)   # +100 -> 1650 > 1600
+        messages: list[str] = []
+        sink = logger.add(messages.append, level="WARNING")
+        try:
+            engine._heat_cap_allows(self._decision())
+        finally:
+            logger.remove(sink)
+        logged = "".join(messages)
+        assert "OBSERVED" in logged
+        for field in ("filled_heat", "pending_reserved", "candidate",
+                      "projected", "cap=", "entry_source"):
+            assert field in logged, f"{field} missing from the refusal record"
+
+    def test_pending_reservations_count_toward_heat(self, engine_factory):
+        """A resting STOP_LIMIT burst is the case the cap exists for. If
+        reservations were ignored, this would sit under the cap."""
+        engine, _ = engine_factory()
+        self._wire(engine, filled=0.0, pending=1_550.0)   # +100 -> 1650 > 1600
+        messages: list[str] = []
+        sink = logger.add(messages.append, level="WARNING")
+        try:
+            engine._heat_cap_allows(self._decision())
+        finally:
+            logger.remove(sink)
+        assert "OBSERVED" in "".join(messages)
+
+    def test_enforced_mode_refuses(self, engine_factory, monkeypatch):
+        from config import settings
+
+        engine, _ = engine_factory()
+        monkeypatch.setattr(settings, "STRATEGY_HEAT_CAP_ENFORCED", True)
+        self._wire(engine, filled=1_590.0)
+        assert engine._heat_cap_allows(self._decision()) is False
+
+    def test_unreadable_heat_does_not_read_as_zero(self, engine_factory, monkeypatch):
+        """Degraded data must not relax the cap. Observation still allows,
+        but enforcement refuses rather than treating unknown as no risk."""
+        from config import settings
+
+        engine, _ = engine_factory()
+        self._wire(engine)
+        def boom():
+            raise sqlite3.Error("db down")
+        engine.trade_logger.read_open_risk_by_strategy_with_gaps = boom
+
+        assert engine._heat_cap_allows(self._decision()) is True    # observation
+        monkeypatch.setattr(settings, "STRATEGY_HEAT_CAP_ENFORCED", True)
+        assert engine._heat_cap_allows(self._decision()) is False   # enforced
+
+    def test_a_real_database_failure_refuses_under_enforcement(
+        self, engine_factory, monkeypatch,
+    ):
+        """The test above patches the reader itself, so it cannot catch a
+        failure the reader *swallows*. This one breaks the database
+        underneath a real `TradeLogger` and drives the real reader.
+
+        The bug it guards: the shared replay helper absorbs a failed
+        `_ensure_db()` into an empty result, so an unavailable trade DB
+        would present as zero open heat and admit the entry.
+        """
+        from config import settings
+        from reporting.logger import TradeLogger
+
+        engine, _ = engine_factory()
+        engine._last_cycle_equity = 100_000.0
+        engine.lifecycle_orders_store = MagicMock()
+        engine.lifecycle_orders_store.read_pending_entry_reservations = lambda: {}
+
+        real_logger = TradeLogger(path=str(settings.TRADE_LOG_DB))
+        def _boom():
+            raise sqlite3.OperationalError("unable to open database file")
+        real_logger._ensure_db = _boom
+        engine.trade_logger = real_logger
+
+        assert engine._heat_cap_allows(self._decision()) is True     # observation
+        monkeypatch.setattr(settings, "STRATEGY_HEAT_CAP_ENFORCED", True)
+        assert engine._heat_cap_allows(self._decision()) is False    # enforced
+
+    def test_unbounded_positions_refuse_under_enforcement(
+        self, engine_factory, monkeypatch,
+    ):
+        """Unknown risk must not become zero risk. A position with no
+        recorded initial risk makes the total a knowing understatement, so
+        enforcement must refuse rather than admit against it. Observation
+        continues, since its whole contract is not to block."""
+        from config import settings
+
+        engine, _ = engine_factory()
+        self._wire(engine, filled=100.0)   # far under the 1600 cap
+        engine.trade_logger.read_open_risk_by_strategy_with_gaps = (
+            lambda: ({"donchian_breakout": 100.0}, {"donchian_breakout": ["WYFI"]})
+        )
+
+        assert engine._heat_cap_allows(self._decision()) is True     # observation
+        monkeypatch.setattr(settings, "STRATEGY_HEAT_CAP_ENFORCED", True)
+        assert engine._heat_cap_allows(self._decision()) is False    # enforced
+
+    def test_unbounded_positions_are_flagged_not_silently_dropped(self, engine_factory):
+        engine, _ = engine_factory()
+        self._wire(engine, filled=100.0)
+        engine.trade_logger.read_open_risk_by_strategy_with_gaps = (
+            lambda: ({"donchian_breakout": 100.0}, {"donchian_breakout": ["WYFI"]})
+        )
+        messages: list[str] = []
+        sink = logger.add(messages.append, level="WARNING")
+        try:
+            engine._heat_cap_allows(self._decision())
+        finally:
+            logger.remove(sink)
+        logged = "".join(messages)
+        assert "WYFI" in logged and "understated" in logged

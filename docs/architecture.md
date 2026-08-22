@@ -111,7 +111,7 @@ trading-bot/
 │       ├── assessor.py        # HealthAssessor — L1/L2/L3 forensic checks
 │       ├── edge.py            # EdgeAssessor — three-signal verdict + recommendation
 │       ├── reviewer.py        # Orchestrates assessors, renders reports, dispatches alerts
-│       └── scheduler.py       # HealthReviewScheduler — Monday + first-of-month hook
+│       └── scheduler.py       # HealthReviewScheduler — Monday weekly + first-of-month monthly & trailing-365d hook
 │
 ├── sector/
 │   ├── __init__.py
