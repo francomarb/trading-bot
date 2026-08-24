@@ -428,11 +428,19 @@ class TestSettings:
 
     def test_pairs_are_configured_and_independent(self):
         pairs = settings.LEVERAGED_TREND_PAIRS
-        assert {"QQQ", "XLK", "SPY", "SMH"} <= set(pairs)
+        assert {"QQQ", "XLK", "SPY", "SMH", "XLF", "XLE"} <= set(pairs)
         assert pairs["QQQ"] == "TQQQ"
         assert pairs["XLK"] == "TECL"
         assert pairs["SPY"] == "SPXL"
         assert pairs["SMH"] == "SOXL"
+        assert pairs["XLF"] == "FAS"
+        assert pairs["XLE"] == "ERX"
+
+    def test_no_fund_is_reused_across_underlyings(self):
+        # Two underlyings sharing a fund would render the same holding twice
+        # under conflicting phase signals.
+        funds = [f for f in settings.LEVERAGED_TREND_PAIRS.values() if f]
+        assert len(funds) == len(set(funds))
 
     def test_every_underlying_is_distinct_from_its_fund(self):
         # A pair mapping an underlying to itself would render a monitor that

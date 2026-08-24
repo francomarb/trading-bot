@@ -1295,6 +1295,8 @@ LEVERAGED_TREND_PAIRS: dict[str, str | None] = {
     "XLK": "TECL",
     "SPY": "SPXL",
     "SMH": "SOXL",
+    "XLF": "FAS",
+    "XLE": "ERX",
 }
 LEVERAGED_TREND_SMA_LENGTH: int = 200
 LEVERAGED_TREND_EXIT_DAYS: int = 3
