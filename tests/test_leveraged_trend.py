@@ -1,14 +1,17 @@
 """
 Tests for the leveraged-ETF 200-day SMA phase monitor.
 
-The logic tests run with ``sma_length=10`` against a base of 100.0 with
-excursions to 80/120: a 10-bar SMA anchored on a long flat base moves slowly
-enough that a multi-session excursion stays cleanly on one side of the line.
-A flat series would converge the SMA onto the close and dissolve the streak
-being tested, which is why the excursions are large relative to the base.
+The state-machine tests run with ``sma_length=2``, where the SMA is the mean
+of the current and previous close. That makes each bar's side of the line
+exactly controllable: a close that rose sits strictly above its own SMA, one
+that fell sits strictly below, and one that is unchanged lands exactly on it.
+``_closes_from_sides`` builds a series from a side pattern on that basis.
 
-Expected streaks and phases below are reasoned from the series, not read back
-from the implementation.
+The alternative — a flat base with excursions — cannot express the "exactly on
+the line" case at all, and worse, its own base bars sit ON the SMA rather than
+above it, which would silently seed the wrong phase. ``add_sma`` itself is
+covered by ``tests/test_technicals.py``; what needs exercising here is the
+replay, and the replay does not care how long the average is.
 """
 
 from __future__ import annotations
@@ -28,8 +31,6 @@ from monitors.leveraged_trend import (
 )
 
 BASE = 100.0
-DOWN = 80.0
-UP = 120.0
 
 
 def _frame(closes: list[float], *, start: str = "2026-01-05") -> pd.DataFrame:
@@ -47,99 +48,202 @@ def _frame(closes: list[float], *, start: str = "2026-01-05") -> pd.DataFrame:
     )
 
 
-def _evaluate(closes: list[float], **kwargs):
-    params = {"sma_length": 10, "exit_days": 3, "entry_days": 5}
+def _closes_from_sides(sides: str, *, start: float = BASE, step: float = 1.0) -> list[float]:
+    """
+    Build closes whose position against a 2-bar SMA follows ``sides``.
+
+    One character per EVALUABLE bar; a leading anchor close is prepended for
+    the SMA warmup and is dropped by the evaluator.
+
+        'A' — close rose, so it sits strictly above the 2-bar mean
+        'B' — close fell, so it sits strictly below
+        'E' — close unchanged, so it lands exactly on the line
+
+    Integer-valued steps keep every midpoint exactly representable, so 'E'
+    means bit-exact equality rather than "close enough".
+    """
+    closes = [start]
+    for ch in sides:
+        last = closes[-1]
+        closes.append({"A": last + step, "B": last - step, "E": last}[ch])
+    return closes
+
+
+def _evaluate(sides: str, **kwargs):
+    """Evaluate a side pattern, e.g. 'AAABBB'."""
+    params = {"sma_length": 2, "exit_days": 3, "entry_days": 5}
     params.update(kwargs)
-    return evaluate_series(_frame(closes), underlying="TEST", **params)
+    return evaluate_series(
+        _frame(_closes_from_sides(sides)), underlying="TEST", **params
+    )
+
+
+class TestFixture:
+    """The side-pattern helper must mean what the other tests assume."""
+
+    @pytest.mark.parametrize(
+        "side,expect_below,expect_above",
+        [("A", False, True), ("B", True, False), ("E", False, False)],
+    )
+    def test_each_side_character_lands_where_claimed(
+        self, side, expect_below, expect_above
+    ):
+        from indicators.technicals import add_sma
+
+        frame = add_sma(_frame(_closes_from_sides(side)), 2)
+        row = frame.iloc[-1]
+        assert bool(row["close"] < row["sma_2"]) is expect_below
+        assert bool(row["close"] > row["sma_2"]) is expect_above
 
 
 class TestPhaseOut:
-    """3 consecutive closes below the SMA confirm a phase-out."""
+    """3 consecutive closes strictly below the SMA confirm a phase-out."""
 
     def test_third_consecutive_close_below_flips_to_out(self):
-        state = _evaluate([BASE] * 20 + [DOWN] * 3)
+        state = _evaluate("AAAAABBB")
         assert state.phase is Phase.OUT
         assert state.below_streak == 3
 
     def test_two_closes_below_do_not_flip(self):
-        state = _evaluate([BASE] * 20 + [DOWN] * 2)
+        state = _evaluate("AAAAABB")
         assert state.phase is Phase.IN
         assert state.below_streak == 2
         assert state.sessions_to_signal == 1
 
     def test_transition_is_recorded_on_the_confirming_session(self):
-        state = _evaluate([BASE] * 20 + [DOWN] * 3)
+        state = _evaluate("AAAAABBB")
         assert len(state.transitions) == 1
-        transition = state.transitions[0]
-        assert transition.phase is Phase.OUT
-        # 20 base bars + 3 down bars; the 23rd bar (index 22) confirms.
-        assert transition.transition_date == state.last_bar_date
+        assert state.transitions[0].phase is Phase.OUT
+        assert state.transitions[0].transition_date == state.last_bar_date
+        assert state.phase_since == state.last_bar_date
+        assert state.sessions_in_phase == 0
 
 
 class TestFlappingIsFiltered:
     """A close back across the line resets the streak — the whole point."""
 
     def test_two_below_then_one_above_resets_the_streak(self):
-        state = _evaluate([BASE] * 20 + [DOWN, DOWN, UP, DOWN, DOWN])
+        state = _evaluate("AAAAABBABB")
         assert state.phase is Phase.IN
         assert state.transitions == ()
         # The final two bars are a fresh streak, not a continuation of four.
         assert state.below_streak == 2
 
     def test_four_above_while_out_does_not_phase_in(self):
-        closes = [BASE] * 20 + [DOWN] * 3 + [UP] * 4
-        state = _evaluate(closes)
+        state = _evaluate("AAAAABBBAAAA")
         assert state.phase is Phase.OUT
         assert state.above_streak == 4
         assert state.sessions_to_signal == 1
 
     def test_fifth_consecutive_close_above_phases_in(self):
-        closes = [BASE] * 20 + [DOWN] * 3 + [UP] * 5
-        state = _evaluate(closes)
+        state = _evaluate("AAAAABBBAAAAA")
         assert state.phase is Phase.IN
         assert state.above_streak == 5
         assert [t.phase for t in state.transitions] == [Phase.OUT, Phase.IN]
 
     def test_a_break_in_the_re_entry_run_restarts_the_count(self):
         # Four above, one below, four above — never five consecutive.
-        closes = [BASE] * 20 + [DOWN] * 3 + [UP] * 4 + [DOWN] + [UP] * 4
-        state = _evaluate(closes)
+        state = _evaluate("AAAAABBBAAAABAAAA")
         assert state.phase is Phase.OUT
         assert state.above_streak == 4
         assert [t.phase for t in state.transitions] == [Phase.OUT]
 
 
-class TestSmaBoundary:
-    """A close exactly on the SMA is not a breach."""
+class TestOnTheLineIsNeitherSide:
+    """
+    The rule is strict in BOTH directions.
 
-    def test_flat_series_sits_on_its_sma_and_stays_in(self):
-        state = _evaluate([BASE] * 25)
-        assert state.close == state.sma
-        assert state.phase is Phase.IN
+    A close landing exactly on the SMA is not a breach and not a confirmation.
+    Folding it into "above" would let on-the-line closes complete a phase-IN
+    run the rule never granted.
+    """
+
+    def test_on_the_line_resets_both_streaks(self):
+        state = _evaluate("AAAAABBE")
         assert state.below_streak == 0
-        assert state.above_streak > 0
+        assert state.above_streak == 0
+        assert state.phase is Phase.IN
+
+    def test_on_the_line_holds_the_phase_rather_than_flipping_it(self):
+        state = _evaluate("AAAAABBBEE")
+        # Already OUT; two on-the-line closes must not start an entry run.
+        assert state.phase is Phase.OUT
+        assert state.above_streak == 0
+
+    def test_five_on_the_line_closes_cannot_phase_in(self):
+        state = _evaluate("AAAAABBBEEEEE")
+        assert state.phase is Phase.OUT
+        assert [t.phase for t in state.transitions] == [Phase.OUT]
+
+    def test_three_on_the_line_closes_cannot_phase_out(self):
+        state = _evaluate("AAAAAEEE")
+        assert state.phase is Phase.IN
+        assert state.transitions == ()
+
+    def test_on_the_line_breaks_a_re_entry_run(self):
+        # Four above, one on the line, one above: the run restarts at 1.
+        state = _evaluate("AAAAABBBAAAAEA")
+        assert state.phase is Phase.OUT
+        assert state.above_streak == 1
+
+    def test_on_the_line_breaks_an_exit_run(self):
+        state = _evaluate("AAAAABBEBB")
+        assert state.phase is Phase.IN
+        assert state.below_streak == 2
+        assert state.transitions == ()
+
+    def test_a_series_entirely_on_the_line_has_no_phase(self):
+        state = _evaluate("EEEEE")
+        assert state.phase is Phase.UNKNOWN
+        assert state.error == "every close sits exactly on the SMA"
+        assert state.sessions_to_signal is None
 
 
 class TestSeedPhase:
-    """The seed comes from the data, not an assumption."""
+    """
+    The seed comes from the data, and is never dressed up as a signal.
+
+    A phase already held when the window opens has no confirmed start date:
+    it may have begun long before the data does.
+    """
 
     def test_window_opening_below_the_sma_seeds_out(self):
-        # A monotonic decline: every evaluable bar closes below its own SMA.
-        closes = [200.0 - i for i in range(25)]
-        state = _evaluate(closes)
+        state = _evaluate("BBBBB")
         assert state.phase is Phase.OUT
-        # Seeded from the data, NOT transitioned into: the first evaluable bar
-        # was already below, so there is no phase-OUT event to report and the
-        # monitor does not manufacture one it never observed.
         assert state.transitions == ()
         assert state.last_cross_date is None
-        # 25 bars, 10-bar warmup -> 16 evaluable bars, seeded at the first.
-        assert state.sessions_in_phase == 15
 
     def test_window_opening_above_the_sma_seeds_in(self):
-        closes = [100.0 + i for i in range(25)]
-        state = _evaluate(closes)
+        state = _evaluate("AAAAA")
         assert state.phase is Phase.IN
+        assert state.transitions == ()
+
+    def test_seeded_phase_reports_no_confirmed_start_date(self):
+        state = _evaluate("AAAAA")
+        assert state.phase_is_seeded is True
+        assert state.phase_since is None
+        assert state.sessions_in_phase is None
+        assert state.days_since_phase_change is None
+
+    def test_seeded_phase_exposes_the_window_start_as_a_lower_bound(self):
+        state = _evaluate("AAAAA")
+        assert state.observed_from is not None
+        assert state.observed_from < state.last_bar_date
+        assert state.days_observed == (
+            state.last_bar_date - state.observed_from
+        ).days
+
+    def test_an_observed_transition_is_not_seeded(self):
+        state = _evaluate("AAAAABBB")
+        assert state.phase_is_seeded is False
+        assert state.phase_since is not None
+        assert state.days_since_phase_change == 0
+
+    def test_seed_ignores_leading_on_the_line_closes(self):
+        # The first two bars sit on the line and pick no side; the seed comes
+        # from the first bar that does.
+        state = _evaluate("EEBBB")
+        assert state.phase is Phase.OUT
         assert state.transitions == ()
 
 
@@ -147,7 +251,7 @@ class TestCrossTracking:
     """The raw SMA cross is tracked separately from the confirmed signal."""
 
     def test_last_cross_precedes_the_confirmed_transition(self):
-        state = _evaluate([BASE] * 20 + [DOWN] * 3)
+        state = _evaluate("AAAAABBB")
         assert state.last_cross_date is not None
         assert state.phase_since is not None
         # The line was crossed on the first down bar; the phase confirmed two
@@ -157,17 +261,35 @@ class TestCrossTracking:
         assert state.sessions_in_phase == 0
 
     def test_no_cross_in_window_reports_none(self):
-        state = _evaluate([BASE] * 25)
+        state = _evaluate("AAAAA")
         assert state.last_cross_date is None
         assert state.sessions_since_cross is None
         assert state.days_since_cross is None
+
+    def test_touching_the_line_and_returning_is_not_a_cross(self):
+        # Above, on the line, above again: the price reached the line but
+        # never passed through it.
+        state = _evaluate("AAAAAEAA")
+        assert state.last_cross_date is None
+
+    def test_dropping_to_the_line_and_back_below_is_not_a_new_cross(self):
+        state = _evaluate("AAAAABEB")
+        # One cross only, at the first bar below.
+        assert state.sessions_since_cross == 2
+
+    def test_passing_through_the_line_is_a_cross_on_the_far_side(self):
+        # Below, on the line, above: the crossing lands on the bar that
+        # actually reaches the other side, not on the on-the-line bar.
+        state = _evaluate("AAAAABEA")
+        assert state.sessions_since_cross == 0
+        assert state.last_cross_date == state.last_bar_date
 
 
 class TestFailsTowardStayingOut:
     """Insufficient or unusable data must never present as phase-IN."""
 
     def test_history_shorter_than_the_sma_is_unknown(self):
-        state = _evaluate([BASE] * 5, sma_length=10)
+        state = _evaluate("AAAA", sma_length=10)
         assert state.phase is Phase.UNKNOWN
         assert state.error is not None
         assert "insufficient history" in state.error
@@ -180,8 +302,14 @@ class TestFailsTowardStayingOut:
         assert state.error == "no bars"
 
     def test_unknown_reports_no_pending_signal(self):
-        state = _evaluate([BASE] * 5, sma_length=10)
+        state = _evaluate("AAAA", sma_length=10)
         assert state.sessions_to_signal is None
+
+    def test_unknown_is_never_reported_as_seeded(self):
+        # `phase_is_seeded` gates the '>=' lower-bound rendering; UNKNOWN has
+        # no phase to bound.
+        assert _evaluate("EEEEE").phase_is_seeded is False
+        assert _evaluate("AAAA", sma_length=10).phase_is_seeded is False
 
 
 class TestDropInProgressBar:
@@ -191,7 +319,7 @@ class TestDropInProgressBar:
     TODAY_BAR = "2026-08-24"
 
     def _two_bars(self) -> pd.DataFrame:
-        return _frame([BASE, DOWN], start="2026-08-21")
+        return _frame(_closes_from_sides("A"), start="2026-08-21")
 
     def test_current_session_bar_is_dropped_before_the_cutoff(self):
         df = self._two_bars()
@@ -235,8 +363,7 @@ class TestLoadMonitorState:
     ):
         # 22 completed sessions ending Friday 2026-08-21, plus a live Monday
         # bar. Only the completed sessions may reach the evaluator.
-        closes = [BASE] * 21 + [BASE] + [DOWN]
-        df = _frame(closes, start="2026-07-22")
+        df = _frame(_closes_from_sides("A" * 22), start="2026-07-22")
         assert pd.Timestamp(df.index[-1]).tz_convert(
             "America/New_York"
         ).date() == date(2026, 8, 21)
@@ -256,7 +383,7 @@ class TestLoadMonitorState:
             "QQQ",
             "TQQQ",
             now=datetime(2026, 8, 24, 18, 0, tzinfo=timezone.utc),
-            sma_length=10,
+            sma_length=2,
         )
         assert state.last_bar_date == date(2026, 8, 21)
 
@@ -282,12 +409,12 @@ class TestLoadMonitorState:
             captured["symbol"] = symbol
             captured["timeframe"] = timeframe
             captured["feed"] = kwargs.get("feed")
-            return _frame([BASE] * 25), None
+            return _frame(_closes_from_sides("A" * 24)), None
 
         monkeypatch.setattr(
             leveraged_trend.fetcher, "fetch_symbol", _capture
         )
-        state = load_monitor_state("SPY", None, sma_length=10)
+        state = load_monitor_state("SPY", None, sma_length=2)
         assert captured["symbol"] == "SPY"
         assert captured["timeframe"] == "1Day"
         # SIP, not the engine's IEX — the rule keys off the official close.

@@ -7,10 +7,14 @@ The operator holds leveraged funds (TQQQ, TECL, ...) outside this bot. The
 phase-in / phase-out decision for those holdings is driven by the *unleveraged*
 underlying's position relative to its 200-day SMA, filtered for noise:
 
-    * phase-OUT signal — underlying closes BELOW its 200-day SMA on
+    * phase-OUT signal — underlying closes strictly BELOW its 200-day SMA on
       ``exit_days`` consecutive completed sessions.
-    * phase-IN signal  — underlying closes ABOVE its 200-day SMA on
+    * phase-IN signal  — underlying closes strictly ABOVE its 200-day SMA on
       ``entry_days`` consecutive completed sessions.
+
+Both halves are strict, so a close landing exactly ON the SMA satisfies
+neither. It breaks both confirmation runs without changing the phase, and it
+is not a crossing — the price reached the line but did not pass through it.
 
 Each underlying is an INDEPENDENT state machine. QQQ and XLK track different
 indices and routinely disagree (verified 2026-08-24: QQQ phased in 2026-04-14,
@@ -41,7 +45,13 @@ Design notes
    the basic tier and the 15-minute delay is irrelevant to a daily bar read
    after the close.
 
-4. **``UNKNOWN`` fails toward staying out.** Insufficient history, a NaN SMA or
+4. **Equality is a third state, not a tie broken toward one side.** Folding
+   "on the line" into "above" would let a run of on-the-line closes confirm a
+   phase-IN that the strict rule never granted; folding it into "below" would
+   do the mirror image for phase-OUT. Neither direction is defensible, so
+   equality resets both runs and holds the phase where it is.
+
+5. **``UNKNOWN`` fails toward staying out.** Insufficient history, a NaN SMA or
    a fetch failure yields ``Phase.UNKNOWN``, which is rendered as "no signal"
    and must never be presented as a phase-IN. There is no automation behind
    this monitor, so the failure mode is a blank cell rather than a bad trade —
@@ -89,9 +99,16 @@ class TrendMonitorState:
     Everything the dashboard renders for one underlying.
 
     ``below_streak`` / ``above_streak`` are counts of trailing consecutive
-    COMPLETED sessions on that side of the SMA. Exactly one of them is
-    non-zero (a close exactly equal to the SMA counts as not-below, i.e.
-    toward the above streak, so ``phase_out`` requires a strict breach).
+    COMPLETED sessions strictly on that side of the SMA. At most one is
+    non-zero; a close exactly on the SMA zeroes both, because the rule is
+    strict in both directions.
+
+    ``phase_since`` is the date of an OBSERVED transition and is ``None``
+    when the phase was seeded from the first bar in the window rather than
+    confirmed by a signal inside it. ``observed_from`` is the window's first
+    evaluable bar, which callers may present as a lower bound on how long
+    the phase has held. Never render ``observed_from`` as if it were
+    ``phase_since``: it is where the data starts, not where the signal fired.
     """
 
     underlying: str
@@ -108,6 +125,7 @@ class TrendMonitorState:
     phase: Phase
     phase_since: date | None
     sessions_in_phase: int | None
+    observed_from: date | None
     last_cross_date: date | None
     sessions_since_cross: int | None
     transitions: tuple[PhaseTransition, ...]
@@ -137,11 +155,34 @@ class TrendMonitorState:
         return max(self.entry_days - self.above_streak, 0)
 
     @property
+    def phase_is_seeded(self) -> bool:
+        """
+        True when the phase was read off the window's first bar rather than
+        confirmed by a signal inside it.
+
+        Callers must not present a seeded phase's age as a confirmed one —
+        the phase may have held since long before the window opened.
+        """
+        return self.phase is not Phase.UNKNOWN and self.phase_since is None
+
+    @property
     def days_since_phase_change(self) -> int | None:
-        """Calendar days since the confirmed phase change."""
+        """
+        Calendar days since the confirmed phase change.
+
+        ``None`` for a seeded phase; use :attr:`days_observed` as a lower
+        bound in that case.
+        """
         if self.phase_since is None or self.last_bar_date is None:
             return None
         return (self.last_bar_date - self.phase_since).days
+
+    @property
+    def days_observed(self) -> int | None:
+        """Calendar days covered by the evaluable window."""
+        if self.observed_from is None or self.last_bar_date is None:
+            return None
+        return (self.last_bar_date - self.observed_from).days
 
     @property
     def days_since_cross(self) -> int | None:
@@ -227,6 +268,7 @@ def evaluate_series(
         phase=Phase.UNKNOWN,
         phase_since=None,
         sessions_in_phase=None,
+        observed_from=None,
         last_cross_date=None,
         sessions_since_cross=None,
         transitions=(),
@@ -260,28 +302,70 @@ def evaluate_series(
     smas = evaluable[sma_col].astype(float).to_numpy()
     dates = [pd.Timestamp(ts).date() for ts in evaluable.index]
 
-    # A close exactly on the SMA counts as "not below": phase-OUT requires a
-    # strict breach, and the two streaks stay mutually exclusive.
+    # Three states, not two. Both halves of the rule are strict, so a close
+    # exactly on the SMA is neither a breach nor a confirmation: it resets
+    # both runs and leaves the phase alone. Folding it into "above" would let
+    # on-the-line closes confirm a phase-IN the rule never granted.
     is_below = closes < smas
+    is_above = closes > smas
 
-    phase = Phase.OUT if bool(is_below[0]) else Phase.IN
-    phase_since_idx = 0
+    # The seed is taken from the first bar that sits definitively on one side.
+    first_definite: int | None = None
+    for idx in range(len(evaluable)):
+        if bool(is_below[idx]) or bool(is_above[idx]):
+            first_definite = idx
+            break
+
+    last = len(evaluable) - 1
+    if first_definite is None:
+        # Every evaluable close sits exactly on its own SMA — degenerate, but
+        # reachable on a synthetic or halted series. There is no side to be on,
+        # so there is no phase to report.
+        return TrendMonitorState(
+            **{
+                **empty.__dict__,
+                "last_bar_date": dates[last],
+                "close": float(closes[last]),
+                "sma": float(smas[last]),
+                "dist_pct": 0.0,
+                "observed_from": dates[0],
+                "error": "every close sits exactly on the SMA",
+            }
+        )
+
+    phase = Phase.OUT if bool(is_below[first_definite]) else Phase.IN
+    # None until the replay OBSERVES a transition. A seeded phase has no
+    # confirmed start date; reporting the window's first bar as one would
+    # dress the edge of the data up as a signal.
+    phase_since_idx: int | None = None
     last_cross_idx: int | None = None
+    last_definite_below: bool | None = None
     below_streak = 0
     above_streak = 0
     transitions: list[PhaseTransition] = []
 
     for idx in range(len(evaluable)):
         below = bool(is_below[idx])
-        if idx > 0 and below != bool(is_below[idx - 1]):
-            last_cross_idx = idx
+        above = bool(is_above[idx])
 
         if below:
             below_streak += 1
             above_streak = 0
-        else:
+        elif above:
             above_streak += 1
             below_streak = 0
+        else:
+            # On the line: breaks both runs, confirms neither.
+            below_streak = 0
+            above_streak = 0
+
+        # Only definite sides can cross. Touching the line and returning to
+        # the same side is not a crossing, so on-the-line bars are skipped
+        # rather than counted as a side change.
+        if below or above:
+            if last_definite_below is not None and below != last_definite_below:
+                last_cross_idx = idx
+            last_definite_below = below
 
         if phase is Phase.IN and below_streak >= exit_days:
             phase = Phase.OUT
@@ -296,7 +380,6 @@ def evaluate_series(
                 PhaseTransition(dates[idx], Phase.IN, closes[idx], smas[idx])
             )
 
-    last = len(evaluable) - 1
     return TrendMonitorState(
         underlying=underlying,
         leveraged=leveraged,
@@ -310,8 +393,13 @@ def evaluate_series(
         exit_days=exit_days,
         entry_days=entry_days,
         phase=phase,
-        phase_since=dates[phase_since_idx],
-        sessions_in_phase=last - phase_since_idx,
+        phase_since=(
+            dates[phase_since_idx] if phase_since_idx is not None else None
+        ),
+        sessions_in_phase=(
+            last - phase_since_idx if phase_since_idx is not None else None
+        ),
+        observed_from=dates[0],
         last_cross_date=dates[last_cross_idx] if last_cross_idx is not None else None,
         sessions_since_cross=(
             last - last_cross_idx if last_cross_idx is not None else None
@@ -372,6 +460,7 @@ def load_monitor_state(
             phase=Phase.UNKNOWN,
             phase_since=None,
             sessions_in_phase=None,
+            observed_from=None,
             last_cross_date=None,
             sessions_since_cross=None,
             transitions=(),

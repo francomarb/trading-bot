@@ -1246,14 +1246,47 @@ def _phase_badge(phase: Phase) -> str:
 
 
 def _streak_label(state: TrendMonitorState) -> str:
-    """Human-readable trailing streak, e.g. '2 sessions below'."""
+    """
+    Human-readable trailing streak, e.g. '2 sessions below'.
+
+    Both counters are zero only when the latest close landed exactly on the
+    SMA, which is neither side. Falling through to the above-branch there
+    would print '0 sessions above' and assert a run that does not exist.
+    """
     if state.phase is Phase.UNKNOWN:
         return "—"
     if state.below_streak:
         n = state.below_streak
         return f"{n} session{'s' if n != 1 else ''} below"
-    n = state.above_streak
-    return f"{n} session{'s' if n != 1 else ''} above"
+    if state.above_streak:
+        n = state.above_streak
+        return f"{n} session{'s' if n != 1 else ''} above"
+    return "on the SMA"
+
+
+def _phase_since_label(state: TrendMonitorState) -> str:
+    """
+    Date of the confirmed signal, or the window start marked as a lower bound.
+
+    A seeded phase — one already held when the data begins — has no confirmed
+    start date. Rendering the window's first bar as "Phase Since" would
+    present the edge of the dataset as a signal that never fired, so the
+    seeded case is prefixed with '≥'.
+    """
+    if state.phase_since is not None:
+        return state.phase_since.isoformat()
+    if state.phase_is_seeded and state.observed_from is not None:
+        return f"≥ {state.observed_from.isoformat()}"
+    return "—"
+
+
+def _days_in_phase_label(state: TrendMonitorState) -> str:
+    """Age of the current phase, '≥'-prefixed when it predates the window."""
+    if state.days_since_phase_change is not None:
+        return str(state.days_since_phase_change)
+    if state.phase_is_seeded and state.days_observed is not None:
+        return f"≥ {state.days_observed}"
+    return "—"
 
 
 def _next_signal_label(state: TrendMonitorState) -> str:
@@ -1323,10 +1356,8 @@ def _render_leveraged_trend_panel() -> None:
             "Phase": _phase_badge(s.phase),
             "Streak": _streak_label(s),
             "Next Signal": _next_signal_label(s),
-            "Phase Since": (
-                s.phase_since.isoformat() if s.phase_since else "—"
-            ),
-            "Days In Phase": s.days_since_phase_change,
+            "Phase Since": _phase_since_label(s),
+            "Days In Phase": _days_in_phase_label(s),
             "Last Cross": (
                 s.last_cross_date.isoformat() if s.last_cross_date else "—"
             ),
@@ -1354,8 +1385,16 @@ def _render_leveraged_trend_panel() -> None:
                 help="Sessions remaining before the noise filter would flip "
                      "the phase. '—' means nothing is pending.",
             ),
-            "Days In Phase": st.column_config.NumberColumn(
-                format="%d", help="Calendar days since the confirmed signal.",
+            "Phase Since": st.column_config.TextColumn(
+                help="Date of the confirmed signal. A '≥' prefix marks the "
+                     "start of the loaded window rather than a signal: the "
+                     "phase was already held when the data begins, so its "
+                     "true start is unknown and at least this old.",
+            ),
+            "Days In Phase": st.column_config.TextColumn(
+                help="Calendar days since the confirmed signal. A '≥' prefix "
+                     "means no signal fired inside the loaded window, so the "
+                     "phase has held at least this long and probably longer.",
             ),
             "Last Cross": st.column_config.TextColumn(
                 help="Last session the close crossed the SMA line in either "
