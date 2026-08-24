@@ -225,7 +225,7 @@ class TestSeedPhase:
         assert state.sessions_in_phase is None
         assert state.days_since_phase_change is None
 
-    def test_seeded_phase_exposes_the_window_start_as_a_lower_bound(self):
+    def test_seeded_phase_exposes_a_lower_bound_on_its_age(self):
         state = _evaluate("AAAAA")
         assert state.observed_from is not None
         assert state.observed_from < state.last_bar_date
@@ -245,6 +245,30 @@ class TestSeedPhase:
         state = _evaluate("EEBBB")
         assert state.phase is Phase.OUT
         assert state.transitions == ()
+
+    def test_lower_bound_anchors_where_the_phase_began_not_where_data_did(self):
+        # Evaluable bars run 2026-01-06 .. 2026-01-12. The first two sit on
+        # the line, so no phase exists until 2026-01-08. Anchoring the bound
+        # at the start of the data would claim the OUT phase held for 6 days
+        # when it has only been determinable for 4.
+        state = _evaluate("EEBBB")
+        assert state.phase_is_seeded is True
+        assert state.observed_from == date(2026, 1, 8)
+        assert state.last_bar_date == date(2026, 1, 12)
+        assert state.days_observed == 4
+
+    def test_lower_bound_starts_at_the_first_bar_when_it_picks_a_side(self):
+        # No leading on-the-line bars, so the bound is the first evaluable bar.
+        state = _evaluate("BBBBB")
+        assert state.observed_from == date(2026, 1, 6)
+        assert state.days_observed == 6
+
+    def test_a_series_with_no_side_has_no_lower_bound(self):
+        # Nothing ever establishes a phase, so there is nothing to bound.
+        state = _evaluate("EEEEE")
+        assert state.phase is Phase.UNKNOWN
+        assert state.observed_from is None
+        assert state.days_observed is None
 
 
 class TestCrossTracking:

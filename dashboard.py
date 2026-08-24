@@ -1269,9 +1269,10 @@ def _phase_since_label(state: TrendMonitorState) -> str:
     Date of the confirmed signal, or the window start marked as a lower bound.
 
     A seeded phase — one already held when the data begins — has no confirmed
-    start date. Rendering the window's first bar as "Phase Since" would
-    present the edge of the dataset as a signal that never fired, so the
-    seeded case is prefixed with '≥'.
+    start date. Rendering its lower bound as "Phase Since" would present the
+    edge of the dataset as a signal that never fired, so the seeded case is
+    prefixed with '≥'. The bound is the first session on which the phase
+    could be determined, which is not necessarily where the data starts.
     """
     if state.phase_since is not None:
         return state.phase_since.isoformat()
@@ -1386,10 +1387,11 @@ def _render_leveraged_trend_panel() -> None:
                      "the phase. '—' means nothing is pending.",
             ),
             "Phase Since": st.column_config.TextColumn(
-                help="Date of the confirmed signal. A '≥' prefix marks the "
-                     "start of the loaded window rather than a signal: the "
-                     "phase was already held when the data begins, so its "
-                     "true start is unknown and at least this old.",
+                help="Date of the confirmed signal. A '≥' prefix is not a "
+                     "signal date: it is the earliest session on which the "
+                     "phase could be determined at all, because the phase "
+                     "was already held when the data begins. Its true start "
+                     "is unknown and no later than this.",
             ),
             "Days In Phase": st.column_config.TextColumn(
                 help="Calendar days since the confirmed signal. A '≥' prefix "

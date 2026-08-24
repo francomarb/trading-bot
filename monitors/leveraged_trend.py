@@ -104,11 +104,18 @@ class TrendMonitorState:
     strict in both directions.
 
     ``phase_since`` is the date of an OBSERVED transition and is ``None``
-    when the phase was seeded from the first bar in the window rather than
-    confirmed by a signal inside it. ``observed_from`` is the window's first
-    evaluable bar, which callers may present as a lower bound on how long
-    the phase has held. Never render ``observed_from`` as if it were
-    ``phase_since``: it is where the data starts, not where the signal fired.
+    when the phase was seeded from the window rather than confirmed by a
+    signal inside it.
+
+    ``observed_from`` is the first session on which a phase could be
+    determined at all — the first close on either side of the SMA, which is
+    not necessarily the first evaluable bar, since a window can open with
+    closes sitting exactly on the line. Callers may present it as a lower
+    bound on how long the phase has held. Anchoring that bound at the start
+    of the data instead would claim the phase held across bars where no
+    phase existed yet. Never render ``observed_from`` as if it were
+    ``phase_since``: it is the earliest the phase could be seen, not where
+    the signal fired.
     """
 
     underlying: str
@@ -179,7 +186,7 @@ class TrendMonitorState:
 
     @property
     def days_observed(self) -> int | None:
-        """Calendar days covered by the evaluable window."""
+        """Calendar days since the phase first became determinable."""
         if self.observed_from is None or self.last_bar_date is None:
             return None
         return (self.last_bar_date - self.observed_from).days
@@ -328,7 +335,9 @@ def evaluate_series(
                 "close": float(closes[last]),
                 "sma": float(smas[last]),
                 "dist_pct": 0.0,
-                "observed_from": dates[0],
+                # No bar picks a side, so no phase is ever established and
+                # there is nothing for a lower bound to anchor to.
+                "observed_from": None,
                 "error": "every close sits exactly on the SMA",
             }
         )
@@ -399,7 +408,11 @@ def evaluate_series(
         sessions_in_phase=(
             last - phase_since_idx if phase_since_idx is not None else None
         ),
-        observed_from=dates[0],
+        # The first bar that establishes a phase, NOT the first evaluable
+        # bar. A window opening with on-the-line closes has no phase until
+        # some close picks a side; anchoring the lower bound earlier would
+        # claim the phase held while it did not yet exist.
+        observed_from=dates[first_definite],
         last_cross_date=dates[last_cross_idx] if last_cross_idx is not None else None,
         sessions_since_cross=(
             last - last_cross_idx if last_cross_idx is not None else None
