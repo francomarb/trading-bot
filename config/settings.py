@@ -1293,8 +1293,8 @@ LIFECYCLE_PENDING_GRACE_SECONDS: int = 300
 LEVERAGED_TREND_PAIRS: dict[str, str | None] = {
     "QQQ": "TQQQ",
     "XLK": "TECL",
-    "SPY": None,
-    "SMH": None,
+    "SPY": "SPXL",
+    "SMH": "SOXL",
 }
 LEVERAGED_TREND_SMA_LENGTH: int = 200
 LEVERAGED_TREND_EXIT_DAYS: int = 3

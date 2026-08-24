@@ -304,6 +304,14 @@ class TestSettings:
         assert {"QQQ", "XLK", "SPY", "SMH"} <= set(pairs)
         assert pairs["QQQ"] == "TQQQ"
         assert pairs["XLK"] == "TECL"
+        assert pairs["SPY"] == "SPXL"
+        assert pairs["SMH"] == "SOXL"
+
+    def test_every_underlying_is_distinct_from_its_fund(self):
+        # A pair mapping an underlying to itself would render a monitor that
+        # claims to track an unleveraged index while naming a leveraged fund.
+        for underlying, fund in settings.LEVERAGED_TREND_PAIRS.items():
+            assert fund != underlying
 
     def test_reentry_demands_more_confirmation_than_exit(self):
         # The asymmetry is the noise filter: leave fast, return slowly.
