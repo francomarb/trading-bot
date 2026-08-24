@@ -12,6 +12,9 @@ import pandas as pd
 import pytest
 
 from dashboard import (
+    _days_in_phase_label,
+    _phase_since_label,
+    _streak_label,
     broker_position_detail,
     compute_equity_curve,
     filter_realized_curve_window,
@@ -1344,3 +1347,74 @@ class TestStopGapDollarsColumn:
         row = stats[stats["strategy"] == "donchian_breakout"].iloc[0]
         assert row["stop_gap_dollars"] == pytest.approx(204.36, abs=0.01)
         assert pd.isna(row["avg_adverse_slippage_bps"])
+
+
+class TestLeveragedTrendLabels:
+    """
+    Presentation contract for the leveraged-fund trend monitor.
+
+    The distinction these guard is the whole point of the columns: a
+    CONFIRMED phase change has a date behind it, a SEEDED one does not —
+    the phase was already held when the data begins, so its true start is
+    unknown and only a lower bound can be honestly shown.
+    """
+
+    @staticmethod
+    def _state(sides: str, **kwargs):
+        from monitors.leveraged_trend import evaluate_series
+
+        closes = [100.0]
+        for ch in sides:
+            closes.append(
+                {"A": closes[-1] + 1.0, "B": closes[-1] - 1.0, "E": closes[-1]}[ch]
+            )
+        index = pd.bdate_range(
+            start="2026-01-05", periods=len(closes), tz="America/New_York"
+        ).tz_convert("UTC")
+        frame = pd.DataFrame({"close": closes}, index=index)
+        params = {"sma_length": 2, "exit_days": 3, "entry_days": 5}
+        params.update(kwargs)
+        return evaluate_series(frame, underlying="TEST", **params)
+
+    def test_confirmed_transition_renders_a_bare_date(self):
+        state = self._state("AAAAABBB")
+        assert state.phase_since is not None
+        assert _phase_since_label(state) == state.phase_since.isoformat()
+        assert "≥" not in _phase_since_label(state)
+        assert _days_in_phase_label(state) == "0"
+
+    def test_seeded_phase_renders_the_window_start_as_a_lower_bound(self):
+        state = self._state("AAAAA")
+        assert state.phase_is_seeded is True
+        label = _phase_since_label(state)
+        assert label.startswith("≥ ")
+        assert label.endswith(state.observed_from.isoformat())
+        assert _days_in_phase_label(state) == f"≥ {state.days_observed}"
+
+    def test_a_seeded_phase_never_renders_as_a_confirmed_one(self):
+        # The defect this guards: the window's first bar presented as a
+        # signal date, with an age computed from it.
+        state = self._state("AAAAA")
+        assert _phase_since_label(state) != state.observed_from.isoformat()
+        assert _days_in_phase_label(state) != str(state.days_observed)
+
+    def test_unknown_phase_renders_a_dash(self):
+        state = self._state("EEEEE")
+        assert _phase_since_label(state) == "—"
+        assert _days_in_phase_label(state) == "—"
+        assert _streak_label(state) == "—"
+
+    def test_on_the_line_close_reports_neither_streak(self):
+        state = self._state("AAAAABBE")
+        # Zero above and zero below. Falling through to the above-branch here
+        # would print "0 sessions above" and assert a run that does not exist.
+        assert state.above_streak == 0 and state.below_streak == 0
+        assert _streak_label(state) == "on the SMA"
+
+    def test_a_real_run_still_reports_its_direction(self):
+        assert _streak_label(self._state("AAAAABB")) == "2 sessions below"
+        assert _streak_label(self._state("AAAAA")) == "5 sessions above"
+
+    def test_single_session_streak_is_not_pluralised(self):
+        assert _streak_label(self._state("AAAAAB")) == "1 session below"
+

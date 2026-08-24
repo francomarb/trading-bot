@@ -38,6 +38,11 @@ from reporting.logger import (
     STOP_GAP_KINDS,
 )
 from engine.positions import build_credit_spread_snapshot, owner_key_for
+from monitors.leveraged_trend import (
+    Phase,
+    TrendMonitorState,
+    load_all_monitor_states,
+)
 
 
 # ── Data loading helpers (pure functions — tested independently) ─────────────
@@ -1232,6 +1237,221 @@ def _regime_color(regime: str | None) -> str:
     return colors.get(key, "⚪")
 
 
+def _phase_badge(phase: Phase) -> str:
+    return {
+        Phase.IN: "🟢 IN",
+        Phase.OUT: "🔴 OUT",
+        Phase.UNKNOWN: "⚪ UNKNOWN",
+    }[phase]
+
+
+def _streak_label(state: TrendMonitorState) -> str:
+    """
+    Human-readable trailing streak, e.g. '2 sessions below'.
+
+    Both counters are zero only when the latest close landed exactly on the
+    SMA, which is neither side. Falling through to the above-branch there
+    would print '0 sessions above' and assert a run that does not exist.
+    """
+    if state.phase is Phase.UNKNOWN:
+        return "—"
+    if state.below_streak:
+        n = state.below_streak
+        return f"{n} session{'s' if n != 1 else ''} below"
+    if state.above_streak:
+        n = state.above_streak
+        return f"{n} session{'s' if n != 1 else ''} above"
+    return "on the SMA"
+
+
+def _phase_since_label(state: TrendMonitorState) -> str:
+    """
+    Date of the confirmed signal, or the window start marked as a lower bound.
+
+    A seeded phase — one already held when the data begins — has no confirmed
+    start date. Rendering its lower bound as "Phase Since" would present the
+    edge of the dataset as a signal that never fired, so the seeded case is
+    prefixed with '≥'. The bound is the first session on which the phase
+    could be determined, which is not necessarily where the data starts.
+    """
+    if state.phase_since is not None:
+        return state.phase_since.isoformat()
+    if state.phase_is_seeded and state.observed_from is not None:
+        return f"≥ {state.observed_from.isoformat()}"
+    return "—"
+
+
+def _days_in_phase_label(state: TrendMonitorState) -> str:
+    """Age of the current phase, '≥'-prefixed when it predates the window."""
+    if state.days_since_phase_change is not None:
+        return str(state.days_since_phase_change)
+    if state.phase_is_seeded and state.days_observed is not None:
+        return f"≥ {state.days_observed}"
+    return "—"
+
+
+def _next_signal_label(state: TrendMonitorState) -> str:
+    """
+    How close the noise filter is to flipping the phase.
+
+    '—' means the current streak runs with the phase already held, so no
+    signal is pending. A count of 0 cannot appear: the replay flips the
+    phase on the session the requirement is met.
+    """
+    remaining = state.sessions_to_signal
+    if remaining is None:
+        return "—"
+    target = "OUT" if state.phase is Phase.IN else "IN"
+    return f"{target} in {remaining} session{'s' if remaining != 1 else ''}"
+
+
+@st.cache_data(ttl=900, show_spinner=False)
+def load_leveraged_trend_states() -> list[TrendMonitorState]:
+    """
+    Phase state for every configured underlying.
+
+    Cached for 15 minutes: the underlying signal is a daily close, and the
+    monitor deliberately ignores the in-progress bar, so a shorter TTL would
+    re-fetch bars that cannot have changed.
+    """
+    return load_all_monitor_states()
+
+
+def _render_leveraged_trend_panel() -> None:
+    """
+    Render the 200-day SMA phase monitor for externally-held leveraged funds.
+
+    Read-only and entirely outside the trading loop — the bot does not trade
+    these funds. Each underlying is an independent state machine; see
+    `monitors/leveraged_trend.py` for the rule and its rationale.
+    """
+    try:
+        states = load_leveraged_trend_states()
+    except Exception as exc:  # noqa: BLE001 — never break the page on a monitor
+        st.warning(f"Leveraged trend monitor unavailable: {exc}")
+        return
+
+    if not states:
+        st.info("No underlyings configured for the leveraged trend monitor.")
+        return
+
+    exit_days = states[0].exit_days
+    entry_days = states[0].entry_days
+    render_section_header(
+        "Leveraged Fund Trend Monitor",
+        f"Daily close vs {states[0].sma_length_label} on the unleveraged "
+        f"underlying. Phase-OUT after {exit_days} consecutive closes below; "
+        f"phase-IN after {entry_days} consecutive closes above. Monitor only "
+        "— these funds are held outside the bot and are never traded by it.",
+        kicker="Context",
+    )
+
+    rows = []
+    for s in states:
+        rows.append({
+            "Underlying": s.underlying,
+            "Fund": s.leveraged or "—",
+            "Close": s.close,
+            "SMA 200": s.sma,
+            "Dist %": s.dist_pct,
+            "Phase": _phase_badge(s.phase),
+            "Streak": _streak_label(s),
+            "Next Signal": _next_signal_label(s),
+            "Phase Since": _phase_since_label(s),
+            "Days In Phase": _days_in_phase_label(s),
+            "Last Cross": (
+                s.last_cross_date.isoformat() if s.last_cross_date else "—"
+            ),
+            "Days Since Cross": s.days_since_cross,
+        })
+
+    st.dataframe(
+        pd.DataFrame(rows),
+        width="stretch",
+        hide_index=True,
+        column_config={
+            "Close": st.column_config.NumberColumn(format="$%.2f"),
+            "SMA 200": st.column_config.NumberColumn(format="$%.2f"),
+            "Dist %": st.column_config.NumberColumn(
+                format="%.2f%%",
+                help="Distance of the latest close above (+) or below (-) "
+                     "its 200-day SMA.",
+            ),
+            "Streak": st.column_config.TextColumn(
+                help="Trailing consecutive completed sessions on the current "
+                     "side of the SMA. Resets to zero on any close that "
+                     "crosses back.",
+            ),
+            "Next Signal": st.column_config.TextColumn(
+                help="Sessions remaining before the noise filter would flip "
+                     "the phase. '—' means nothing is pending.",
+            ),
+            "Phase Since": st.column_config.TextColumn(
+                help="Date of the confirmed signal. A '≥' prefix is not a "
+                     "signal date: it is the earliest session on which the "
+                     "phase could be determined at all, because the phase "
+                     "was already held when the data begins. Its true start "
+                     "is unknown and no later than this.",
+            ),
+            "Days In Phase": st.column_config.TextColumn(
+                help="Calendar days since the confirmed signal. A '≥' prefix "
+                     "means no signal fired inside the loaded window, so the "
+                     "phase has held at least this long and probably longer.",
+            ),
+            "Last Cross": st.column_config.TextColumn(
+                help="Last session the close crossed the SMA line in either "
+                     "direction — the raw crossing, before the noise filter.",
+            ),
+            "Days Since Cross": st.column_config.NumberColumn(format="%d"),
+        },
+    )
+
+    errored = [s for s in states if s.error]
+    if errored:
+        for s in errored:
+            st.caption(f"⚠️ {s.underlying}: {s.error}")
+
+    dated = [s for s in states if s.last_bar_date is not None]
+    if dated:
+        last_bar = max(s.last_bar_date for s in dated)
+        st.caption(
+            f"Last completed session: {last_bar.isoformat()} "
+            f"(SIP consolidated closes; the in-progress session is excluded "
+            f"until {settings.LEVERAGED_TREND_SESSION_COMPLETE_ET} ET)."
+        )
+
+    with st.expander("Phase transition history"):
+        history_rows = []
+        for s in states:
+            for t in s.transitions:
+                history_rows.append({
+                    "Date": t.transition_date.isoformat(),
+                    "Underlying": s.underlying,
+                    "Fund": s.leveraged or "—",
+                    "Signal": _phase_badge(t.phase),
+                    "Close": t.close,
+                    "SMA 200": t.sma,
+                })
+        if not history_rows:
+            st.caption("No confirmed phase changes in the loaded window.")
+        else:
+            st.dataframe(
+                pd.DataFrame(history_rows).sort_values(
+                    "Date", ascending=False,
+                ),
+                width="stretch",
+                hide_index=True,
+                column_config={
+                    "Close": st.column_config.NumberColumn(format="$%.2f"),
+                    "SMA 200": st.column_config.NumberColumn(format="$%.2f"),
+                },
+            )
+        st.caption(
+            "Confirmed signals only — the session each streak requirement "
+            "was met, not the raw SMA crossing that preceded it."
+        )
+
+
 def _sector_class_badge(classification: str | None) -> str:
     labels = {
         "hot": "🔥 HOT",
@@ -2068,6 +2288,10 @@ def render_dashboard() -> None:
             },
         )
         st.divider()
+
+    # ── Leveraged fund trend monitor ────────────────────────────────────
+    _render_leveraged_trend_panel()
+    st.divider()
 
     # ── Sector heat ─────────────────────────────────────────────────────
     sector_heat = state.get("sector_heat") or {}

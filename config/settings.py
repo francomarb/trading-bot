@@ -1253,3 +1253,54 @@ OPERATOR_COMMAND_EXPIRY_SECONDS: int = 180  # 3 minutes; Phase B heartbeat polls
 OPERATOR_COMMAND_HEARTBEAT_SECONDS: int = 5
 OPERATOR_CONTROL_STATE_PATH: str = "data/operator_control_state.json"
 LIFECYCLE_PENDING_GRACE_SECONDS: int = 300
+
+
+# ── Leveraged-ETF trend monitor (dashboard-only) ─────────────────────────────
+#
+# Read-only operator monitor for leveraged funds held OUTSIDE this bot
+# (TQQQ, TECL, ...). It tracks the *unleveraged* underlying's daily close
+# against its 200-day SMA and reports a noise-filtered phase state.
+#
+# The bot does not and cannot trade these funds — `utils.asset_filters.
+# is_stock_like` rejects leveraged products. Nothing here is wired into the
+# trading loop; `monitors/leveraged_trend.py` is consumed by `dashboard.py`
+# alone.
+#
+# LEVERAGED_TREND_PAIRS maps underlying → the leveraged fund it governs, or
+#   None when the underlying is watched for context without a named fund.
+#   Each entry is an INDEPENDENT state machine: QQQ and XLK track different
+#   indices and diverge for months at a time (verified 2026-08-24 — QQQ
+#   phased in 2026-04-14, XLK not until 2026-08-10).
+#
+# LEVERAGED_TREND_EXIT_DAYS / _ENTRY_DAYS are asymmetric on purpose. Exiting
+#   on 3 consecutive closes below reacts quickly to a breakdown; re-entering
+#   only after 5 consecutive closes above demands more confirmation, which is
+#   what suppresses flapping around the line. Both count COMPLETED sessions.
+#
+# LEVERAGED_TREND_FEED is 'sip', not the engine's 'iex'. The rule keys off the
+#   official consolidated close; an IEX daily close is one venue's last trade
+#   and can differ by a few cents — enough to flip a marginal day on a
+#   threshold rule. Delayed SIP is free on the basic tier and the 15-minute
+#   lag is irrelevant to a daily bar read after the close.
+#
+# LEVERAGED_TREND_SESSION_COMPLETE_ET is when the current session's daily bar
+#   is treated as final: the 16:00 ET close plus the 15-minute delayed-SIP
+#   lag. Before this time the in-progress bar is dropped so an unfinished
+#   close cannot advance a streak.
+#
+# LEVERAGED_TREND_HISTORY_YEARS covers the SMA warmup (200 sessions ≈ 0.8y)
+#   plus enough evaluable history to show several past transitions.
+LEVERAGED_TREND_PAIRS: dict[str, str | None] = {
+    "QQQ": "TQQQ",
+    "XLK": "TECL",
+    "SPY": "SPXL",
+    "SMH": "SOXL",
+    "XLF": "FAS",
+    "XLE": "ERX",
+}
+LEVERAGED_TREND_SMA_LENGTH: int = 200
+LEVERAGED_TREND_EXIT_DAYS: int = 3
+LEVERAGED_TREND_ENTRY_DAYS: int = 5
+LEVERAGED_TREND_FEED: str = os.getenv("LEVERAGED_TREND_FEED", "sip").lower()
+LEVERAGED_TREND_SESSION_COMPLETE_ET: str = "16:15"
+LEVERAGED_TREND_HISTORY_YEARS: int = 5
