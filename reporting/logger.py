@@ -1734,8 +1734,9 @@ class TradeLogger:
         """
         Write trade-log rows for a multi-leg (MLEG) credit-spread fill (11.29).
 
-        **One row per leg**, both keyed by the same ``position_id`` with
-        ``position_type='spread'``. Recording both OCC legs is what lets
+        **One row per leg**, both keyed by the same raw ``position_id`` with
+        ``position_type='spread'``. Their ``position_uid`` uses the canonical
+        ``pos_<position_id>`` lifecycle identity. Recording both OCC legs lets
         startup reconciliation rebuild the full spread Position after a
         restart — a single short-leg row alone cannot identify the long leg.
 
@@ -1774,7 +1775,10 @@ class TradeLogger:
         standalone position — see ``read_open_spread_positions`` for the
         spread-aware restore path.
         """
+        from engine.positions import spread_substrate_uid
+
         now_iso = datetime.now(timezone.utc).isoformat()
+        position_uid = spread_substrate_uid(position_id)
         default_reason = "spread entry" if opening else "spread exit"
         # Short leg: sold to open / bought to close. Long leg: the reverse.
         short_side = "sell" if opening else "buy"
@@ -1889,12 +1893,9 @@ class TradeLogger:
                 exit_timestamp=None if opening else now_iso,
                 position_id=position_id,
                 position_type="spread",
-                # PR #56 R4: persist position_uid so restart restoration
-                # via read_strategy_realized_pnl_summary's dedup set
-                # matches the live allocator's (which receives
-                # position_uid=position_id for spreads — see the
-                # credit-spread close path in engine/trader.py).
-                position_uid=position_id,
+                # Keep the raw UUID for spread reconstruction; position_uid
+                # must match the parent lifecycle row exactly.
+                position_uid=position_uid,
                 slippage_benchmark_price=new_benchmark_price,
                 slippage_benchmark_kind=new_benchmark_kind,
                 slippage_benchmark_timestamp=now_iso if new_benchmark_price is not None else None,
@@ -2508,6 +2509,8 @@ class TradeLogger:
         sorted list so the allocator can restore the same dedup state
         on restart.
         """
+        from engine.positions import spread_substrate_uid
+
         include = set(strategies or [])
         summary: dict[str, dict] = {
             strategy: {
@@ -2539,7 +2542,7 @@ class TradeLogger:
         # but they do NOT increment trade_count (that gate lives in
         # the loop body below).
         cursor = conn.execute(
-            "SELECT strategy, realized_pnl, position_uid, status "
+            "SELECT strategy, realized_pnl, position_uid, position_type, status "
             "FROM trades "
             "WHERE (side = 'sell' OR position_type = 'spread') "
             "AND status IN ('filled', 'partial') "
@@ -2571,6 +2574,10 @@ class TradeLogger:
             if row["status"] != "filled":
                 continue
             position_uid = row["position_uid"] if "position_uid" in row.keys() else None
+            if position_uid and row["position_type"] == "spread":
+                # Legacy spread rows stored the raw UUID here. Normalize them
+                # at replay so allocator dedup state matches canonical rows.
+                position_uid = spread_substrate_uid(position_uid)
             if position_uid:
                 if position_uid not in summary[strategy]["seen_position_uids"]:
                     summary[strategy]["seen_position_uids"].add(position_uid)

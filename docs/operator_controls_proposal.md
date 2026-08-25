@@ -112,7 +112,7 @@ Keep existing position_id / owner_key behavior for broker aggregation.
 Add position_uid for immutable lifecycle identity.
 ```
 
-For spreads, the existing `position_id` UUID remains the owner key used by the engine to track the multi-leg broker aggregate. `position_uid` is added alongside that existing spread `position_id`; it is not a rename or replacement. Do not repurpose the existing spread UUID as the lifecycle ID.
+For spreads, the existing `position_id` UUID remains the owner key used by the engine to track and reconstruct the multi-leg broker aggregate. The canonical lifecycle identity is `spread_substrate_uid(position_id)` (`pos_<position_id>`), and spread trade rows carry both values in their respective columns. `position_uid` is not a rename or replacement for the raw spread UUID. This exact identity match lets `show-position` join the parent to its fills and report the parent's refreshed realized P&L.
 
 ---
 

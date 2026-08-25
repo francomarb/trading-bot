@@ -9455,6 +9455,20 @@ class TradingEngine:
                 f"position_id={position_id[:8]}: {exc}"
             )
 
+    def _refresh_spread_lifecycle_pnl(self, position_id: str) -> None:
+        """Refresh the spread parent's P&L after its trade row is durable."""
+        if self.lifecycle_store is None:
+            return
+        try:
+            self.lifecycle_store.refresh_realized_pnl(
+                position_uid=spread_substrate_uid(position_id),
+            )
+        except Exception as exc:
+            logger.warning(
+                f"spread lifecycle P&L refresh failed for "
+                f"position_id={position_id[:8]}: {exc}"
+            )
+
     # ── Substrate-backed pending-close query (§10.7 C4) ──
     #
     # The single source of truth for "does this spread have a close in
@@ -10146,7 +10160,7 @@ class TradingEngine:
                         if self._allocator is not None:
                             self._allocator.record_realized_pnl(
                                 strategy_name, partial_pnl,
-                                position_uid=position_id,
+                                position_uid=spread_substrate_uid(position_id),
                                 is_full_close=False,
                             )
                         try:
@@ -10163,6 +10177,7 @@ class TradingEngine:
                                 reason="spread exit (partial)",
                                 is_full_close=False,
                             )
+                            self._refresh_spread_lifecycle_pnl(position_id)
                         except Exception as exc:
                             logger.error(
                                 f"[{strategy_name}] partial-close trade-log "
@@ -10241,7 +10256,7 @@ class TradingEngine:
                         if self._allocator is not None:
                             self._allocator.record_realized_pnl(
                                 strategy_name, realized_pnl,
-                                position_uid=position_id,
+                                position_uid=spread_substrate_uid(position_id),
                                 is_full_close=full_close,
                             )
                     logger.info(
@@ -10284,6 +10299,7 @@ class TradingEngine:
                     submitted_limit_price=submitted_limit_price,
                     initial_risk_dollars=close_risk_dollars,
                 )
+                self._refresh_spread_lifecycle_pnl(position_id)
                 self.alerts.trade_executed(
                     symbol=short_occ,
                     strategy=strategy_name,

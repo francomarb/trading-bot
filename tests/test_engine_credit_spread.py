@@ -366,6 +366,7 @@ class TestDrainSpreadFills:
         assert len(rows) == 2
         assert all(r["position_type"] == "spread" for r in rows)
         assert all(r["position_id"] == "p1" for r in rows)
+        assert all(r["position_uid"] == "pos_p1" for r in rows)
         # Short leg sold to open, long leg bought to open.
         assert {r["side"] for r in rows} == {"sell", "buy"}
 
@@ -441,6 +442,10 @@ class TestDrainSpreadFills:
         name, pnl = engine._allocator.record_realized_pnl.call_args.args
         assert name == "credit_spread"
         assert pnl == pytest.approx(85.0)
+        assert (
+            engine._allocator.record_realized_pnl.call_args.kwargs["position_uid"]
+            == "pos_p1"
+        )
         # Persisted on the close row so it survives a restart.
         close_rows = [
             r for r in engine.trade_logger.read_all()
@@ -448,6 +453,8 @@ class TestDrainSpreadFills:
         ]
         assert len(close_rows) == 1
         assert close_rows[0]["realized_pnl"] == pytest.approx(85.0)
+        parent = engine.lifecycle_store.get_by_position_uid("pos_p1")
+        assert parent.net_realized_pnl == pytest.approx(85.0)
 
     def test_close_filled_logs_slippage_vs_submitted_debit(self, tmp_path):
         strategy = _strategy()
@@ -569,7 +576,7 @@ class TestDrainSpreadFills:
         # contributes to dollar math but does NOT increment trade_count.
         engine._allocator.record_realized_pnl.assert_called_once()
         kwargs = engine._allocator.record_realized_pnl.call_args.kwargs
-        assert kwargs["position_uid"] == "p1"
+        assert kwargs["position_uid"] == "pos_p1"
         assert kwargs["is_full_close"] is False
         # Operator alerted via broker_error.
         engine.alerts.broker_error.assert_called_once()
@@ -582,6 +589,9 @@ class TestDrainSpreadFills:
             if r["position_type"] == "spread" and r["status"] == "partial"
         ]
         assert len(partial_rows) == 2  # one row per leg
+        parent = engine.lifecycle_store.get_by_position_uid("pos_p1")
+        assert parent.status == "open"
+        assert parent.net_realized_pnl == pytest.approx(65.0)
 
     def test_partial_close_pending_state_blocks_next_cycle_dispatch(self, tmp_path):
         """PR #56 R6: the operational guarantee of the previous test.
