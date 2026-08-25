@@ -175,7 +175,7 @@ Statuses below cover the SUBSTRATE-LANDED portion of the PR. Items still in the 
 | 23 | Direct `pending → filled` via fast path | §6.3 / §6.4 R11-P1 | 4 | ✅ |
 | 24 | Direct `pending → canceled` via recovery | §6.3 / §6.4 R12 | 4 | ✅ |
 | 25 | `PRAGMA foreign_keys = ON;` enforces FKs | §6.2 R13-G1 | 1 | ✅ |
-| 26 | `net_realized_pnl` rollup from `trades` (not orders table) | §6.6 R13-G2 | 4 | ✅ |
+| 26 | `net_realized_pnl` rollup from `trades` (not orders table); spread rows use their canonical lifecycle UID and refresh after accounting write | §6.6 R13-G2; 2026-08-25 spread follow-up | 4 + production-shaped spread regressions | ✅ / fix in review |
 
 26/26 ✅ as of consumer-wiring branch. The original 21/26 (substrate phase) plus the 5 deferred items (#8, #9, #10, #17, #22) all landed via the planned consumer-wiring steps. Test anchors are listed in the table above for each item.
 

@@ -538,6 +538,28 @@ class PositionLifecycleStore:
         self._conn.execute(sql, params)
         self._conn.commit()
 
+    def refresh_realized_pnl(self, *, position_uid: str) -> float:
+        """Recompute a position's realized P&L from the trade ledger.
+
+        ``trades`` owns realized execution economics; the lifecycle parent
+        stores only their aggregate for operator inspection. Call this after
+        the corresponding trade rows have been committed.
+        """
+        _validate_position_uid(position_uid)
+        row = self._conn.execute(
+            "SELECT COALESCE(SUM(realized_pnl), 0.0) "
+            "FROM trades WHERE position_uid = ?",
+            (position_uid,),
+        ).fetchone()
+        realized_pnl = float(row[0] if row is not None else 0.0)
+        self._conn.execute(
+            "UPDATE position_lifecycle SET net_realized_pnl = ? "
+            "WHERE position_uid = ?",
+            (realized_pnl, position_uid),
+        )
+        self._conn.commit()
+        return realized_pnl
+
     def synthesize_for_existing(
         self,
         *,

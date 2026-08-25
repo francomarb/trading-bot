@@ -1351,7 +1351,26 @@ class TestSpreadLogging:
         summary = tl.read_strategy_realized_pnl_summary(["credit_spread"])
         assert summary["credit_spread"]["realized_pnl"] == pytest.approx(-250.0)
         assert summary["credit_spread"]["trade_count"] == 1
-        assert summary["credit_spread"]["seen_position_uids"] == ["uuid-X"]
+        assert summary["credit_spread"]["seen_position_uids"] == ["pos_uuid-X"]
+
+    def test_realized_pnl_summary_normalizes_legacy_raw_spread_uid(self, tmp_csv):
+        tl = TradeLogger(path=tmp_csv)
+        tl.log_spread_fill(
+            position_id="legacy-X", strategy="credit_spread",
+            short_occ=self._SHORT, long_occ=self._LONG,
+            qty=1, net_price=1.20, opening=False,
+            realized_pnl=-120.0,
+        )
+        conn = tl._ensure_db()
+        conn.execute(
+            "UPDATE trades SET position_uid = 'legacy-X' "
+            "WHERE position_type = 'spread'"
+        )
+        conn.commit()
+
+        summary = tl.read_strategy_realized_pnl_summary(["credit_spread"])
+
+        assert summary["credit_spread"]["seen_position_uids"] == ["pos_legacy-X"]
 
     def test_spread_legs_excluded_from_single_leg_owner_views(self, tmp_csv):
         tl = TradeLogger(path=tmp_csv)
