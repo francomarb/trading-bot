@@ -3897,6 +3897,25 @@ class TestAlertDispatcher:
         assert len(backend.alerts) == 1
         assert backend.alerts[0].message == "test"
 
+    def test_fire_does_not_emit_duplicate_warning(self, monkeypatch):
+        backend = _CollectorBackend()
+        dispatcher = AlertDispatcher(backends=[backend], cooldown_seconds=0)
+        warning = MagicMock()
+        monkeypatch.setattr("reporting.alerts.logger.warning", warning)
+
+        sent = dispatcher.fire(
+            Alert(
+                alert_type=AlertType.TRADE_EXECUTED,
+                severity=AlertSeverity.INFO,
+                message="filled",
+                symbol="AAPL",
+            )
+        )
+
+        assert sent is True
+        assert len(backend.alerts) == 1
+        warning.assert_not_called()
+
     def test_cooldown_suppression(self):
         backend = _CollectorBackend()
         dispatcher = AlertDispatcher(backends=[backend], cooldown_seconds=600)

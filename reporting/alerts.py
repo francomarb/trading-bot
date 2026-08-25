@@ -422,8 +422,8 @@ class AlertDispatcher:
                 # Alert failure must never crash the bot.
                 logger.error(f"alert backend {type(backend).__name__} failed: {e}")
 
-        # Also log to the main log stream.
-        logger.warning(f"ALERT: {alert.format()}")
+        # Backends own delivery. LogFileBackend's bound record already reaches
+        # the main Loguru sinks as well as the dedicated alerts log.
         return True
 
     # ── Convenience factory methods ─────────────────────────────────────
