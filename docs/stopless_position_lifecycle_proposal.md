@@ -9,6 +9,19 @@ QQQ→TQQQ.
 **Architectural scope:** bot-wide. This is a position/risk substrate capability,
 not a leveraged-trend special case.
 
+**Existing defect exposed:** review also found a reachable recovery failure on
+the active single-leg options path. Normal dispatch pre-registers ownership and
+therefore avoids reconstructing a `RiskDecision`, but recovery after a crash/
+restart can encounter the fill before ownership is bound. Today the simple
+LIMIT entry row omits the strategy's intended hard-stop price, recovery converts
+that NULL to `0.0`, `RiskDecision` rejects it, and the outer handler emits
+CRITICAL without binding ownership. The options sleeve must not be classified
+as `SIGNAL_EXIT_ONLY`: it requires a broker GTC stop installed after fill and
+later ratcheted. The durable contract must preserve that `BROKER_STOP` intent
+through a simple entry and route recovery to the option-specific stop path.
+This defect justifies the substrate work independently of whether leveraged
+trend is ever activated.
+
 ## 1. Decision Summary
 
 Extend the existing `RiskManager`, broker, and durable position lifecycle with
@@ -64,10 +77,10 @@ lookup is not authoritative:
   authority.
 
 Persist the policy on `position_lifecycle`, where it describes the position as
-a whole. Also capture it on the immutable `entry_primary` order intent, either
-as first-class columns or as a versioned typed intent payload. The order copy
-closes the pre-fill recovery window; the position copy supports every
-post-fill consumer without reverse-engineering an entry order.
+a whole. Also capture it on the immutable `entry_primary` order intent as
+first-class validated columns. The order copy closes the pre-fill recovery
+window; the position copy supports every post-fill consumer without reverse-
+engineering an entry order.
 
 Recommended first-class fields:
 
@@ -81,8 +94,10 @@ position_lifecycle_orders.protection_model   NOT NULL for entry roles
 
 `metadata_json` exists, but these values control order placement and repair.
 First-class validated columns make invalid combinations queryable and prevent
-silent metadata-key drift. If review chooses a versioned intent object instead,
-its schema and validation must provide equivalent guarantees.
+silent metadata-key drift. Migration may need a staged nullable-add/backfill/
+validate sequence before enforcing `NOT NULL`; the final schema must make an
+absent or invalid policy impossible for new entry intents. Position and entry-
+order copies must be created atomically and protected against disagreement.
 
 ## 4. Typed Risk Contract
 
@@ -130,7 +145,11 @@ Suggested decision/accounting fields:
 `AlpacaBroker.place_order()` remains the sole entry router.
 
 For `BROKER_STOP`, preserve today's whole-share OTO and fractional-entry plus
-standalone-stop behavior.
+standalone-stop behavior. Single-leg options are also `BROKER_STOP`, but their
+simple LIMIT entry cannot attach the stop atomically: persist the intended hard-
+stop price and install/reconcile it after fill through the existing option GTC-
+stop path. Recovery must never route an OCC contract through the equity
+`place_protective_stop()` helper.
 
 For `SIGNAL_EXIT_ONLY` equities:
 
@@ -195,8 +214,24 @@ Required behavior:
 - reconstruct `RiskDecision` with nullable stop and persisted policies.
 
 Today substrate recovery converts `intended_stop_price=NULL` to `0.0`, and
-`RiskDecision` rejects it. That conversion must be removed; a null stop is valid
-only under the persisted `SIGNAL_EXIT_ONLY` contract.
+`RiskDecision` rejects it. This is already reachable on the active options
+sleeve when a LIMIT entry fills across a crash/restart boundary before normal
+dispatch has pre-registered ownership. The current ownership gate prevents
+false CRITICALs for the common already-bound case, but does not repair the
+unbound recovery case.
+
+The two cases must not be conflated:
+
+- future `SIGNAL_EXIT_ONLY` equity: NULL is valid and recovery must not create a
+  stop;
+- current single-leg option: protection is `BROKER_STOP`; persist the intended
+  hard-stop price even though `order_class='simple'`, then recover through the
+  option-specific post-fill GTC-stop path.
+
+Replacing the conversion with `_finite_or_none()` alone fixes neither contract:
+`RiskDecision` still rejects NULL, and the shared recovered side effects would
+route a missing OCC stop through the equity repair helper. Validation,
+persisted intent, and asset-appropriate side effects must agree.
 
 ### 6.4 Missing entry-context reconstruction — critical
 
@@ -245,6 +280,11 @@ persisted order role when available. A genuinely existing stop fill remains
 recoverable as an anomalous/stale-order event, but stop history must not be the
 assumed normal close mechanism.
 
+V1 does not require reordering the established `BROKER_STOP` recovery path.
+Making generic SELL history the common first step for every protection model is
+a separate cleanup decision, gated on complete substrate order-role attribution
+and regression evidence that current stop-fill classification is preserved.
+
 ### 6.8 Health, dashboard, and alerts
 
 Missing-stop health checks must be policy-aware:
@@ -256,27 +296,37 @@ Missing-stop health checks must be policy-aware:
   anomaly.
 
 Do not silently cancel an unexpected stop during initial rollout. Alert with
-position identity and require an operator decision unless broker/order ownership
-is proven sufficiently to make cancellation safe.
+position identity, block new entries for the owning strategy only, and require
+an operator decision. Do not turn a position-local reconciliation anomaly into
+a global account halt, and do not auto-cancel in V1.
 
 ## 7. Exposure and Heat Accounting
 
 The current correlated-entry heat ledger is denominated in initial dollars to a
 protective stop. An open position with no `initial_risk_dollars` is placed in a
-gap set and may block further entries under enforcement. That behavior remains
-correct for a position claiming `STOP_DISTANCE`; it is incorrect as a data-
-quality diagnosis for intentional `NOTIONAL` sizing.
+gap set. When that position's owning strategy has a configured heat cap and cap
+enforcement is enabled, the gap may block further entries in that strategy's
+sleeve. It cannot block another strategy's entries through this check. That
+behavior remains correct for a position claiming `STOP_DISTANCE`; it is
+incorrect as a data-quality diagnosis for intentional `NOTIONAL` sizing.
 
 Do not fabricate an R value for stopless positions. Add a parallel measurement
 inside the same risk-assessment system:
 
 - stop-risk heat for `STOP_DISTANCE` positions;
-- notional/effective exposure for `NOTIONAL` positions;
+- approved notional plus both stated and stress-adjusted effective exposure for
+  `NOTIONAL` positions;
 - defined maximum loss for `DEFINED_MAX_LOSS` positions.
 
 Portfolio admission can then enforce the applicable metric plus universal gross
 exposure and concentration ceilings. Consumers must distinguish "not applicable
 under this sizing model" from "required admission data is missing."
+
+Keep the two leverage views distinct. The fund's stated multiplier documents
+its daily target; a separately configured stress multiplier expresses the
+operator's conservative gap/path-risk assumption. Do not derive a supposedly
+precise stress value from the stated 3x label, and do not ship a guessed stress
+multiplier without calibration and an explicit operator decision.
 
 ## 8. Migration and Compatibility
 
@@ -290,7 +340,9 @@ Recommended rollout:
 4. Wire read-only policy resolution through repair, recovery, operator, health,
    and heat paths while all current strategies remain `BROKER_STOP`.
 5. Add the `NOTIONAL + SIGNAL_EXIT_ONLY` entry path.
-6. Activate leveraged trend on paper only after the complete seam suite passes.
+6. Treat architectural completion as necessary but insufficient for leveraged-
+   trend activation. Paper activation requires its separate strategy-evidence
+   gates in PLAN 11.64 as well as the complete seam suite.
 
 Schema migration must be idempotent and compatible with databases created before
 these columns existed. Open-position ambiguity is a preflight failure; closed
@@ -325,6 +377,9 @@ broker behavior.
 ### Recovery and restart
 
 - Asynchronous stopless fill binds ownership with a null stop and no CRITICAL.
+- Asynchronous/restart-recovered option fill retains `BROKER_STOP`, rebuilds a
+  decision from its persisted hard-stop intent, and uses the option GTC-stop
+  path rather than equity stop repair.
 - Restart restores policies from lifecycle/order substrate, not current strategy
   configuration.
 - Partial-fill then final-fill recovery remains idempotent.
@@ -374,19 +429,24 @@ the stopped-strategy regression suite remains green.
 - Paper/live activation of leveraged trend.
 - Reclassifying current production positions as stopless.
 
-## 11. Review Questions
+## 11. Review Resolutions and Remaining Question
 
-1. Should the two policy fields be first-class columns, or a versioned typed
-   lifecycle intent payload with equivalent database validation?
-2. For an unexpected owned stop on a `SIGNAL_EXIT_ONLY` position, should V1
-   always halt new entries pending operator review, or alert without halting?
-3. Should effective exposure use the fund's stated leverage multiplier, a
-   configurable conservative multiplier, or both stated and stress-adjusted
-   values?
-4. Should generic SELL-history reconciliation be made the common first step for
-   all protection models, with order role determining stop-vs-signal
-   classification afterward?
+Review resolved four design forks:
 
-These questions affect implementation details, not the central decision: stop
-intent is durable position state, and every repair/reconciliation consumer must
-honor it.
+1. Use first-class validated lifecycle and entry-order columns, with atomic
+   creation and migration-safe constraint enforcement.
+2. An unexpected owned stop on `SIGNAL_EXIT_ONLY` alerts and blocks new entries
+   for the owning strategy only. It does not globally halt the account and is
+   not auto-cancelled in V1.
+3. Persist stated leverage and a distinct configurable stress-adjusted exposure
+   basis. Calibration and the selected stress multiplier remain operator risk-
+   policy decisions before activation.
+4. Generic SELL-history-first recovery is required for `SIGNAL_EXIT_ONLY`.
+   Reordering `BROKER_STOP` recovery is deferred unless substrate attribution
+   and regression evidence justify a common path.
+
+One implementation question remains: whether the strategy-local entry block
+for unexpected protection should reuse the existing durable pause-strategy
+control state or be a distinct automatically managed reconciliation halt. The
+choice must preserve operator visibility, restart durability, and an explicit
+clear condition; it must not become an in-memory-only flag.
