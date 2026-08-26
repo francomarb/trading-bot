@@ -233,6 +233,10 @@ Replacing the conversion with `_finite_or_none()` alone fixes neither contract:
 route a missing OCC stop through the equity repair helper. Validation,
 persisted intent, and asset-appropriate side effects must agree.
 
+The implementation PR must also correct the stale recovery comment that says
+option exits are strategy-managed rather than stop-managed. It describes an
+older architecture and now contradicts the durable option GTC-stop path.
+
 ### 6.4 Missing entry-context reconstruction — critical
 
 `_reconstruct_missing_entry_context()` presently manufactures an ATR stop from
@@ -299,6 +303,37 @@ Do not silently cancel an unexpected stop during initial rollout. Alert with
 position identity, block new entries for the owning strategy only, and require
 an operator decision. Do not turn a position-local reconciliation anomaly into
 a global account halt, and do not auto-cancel in V1.
+
+The strategy-local block reuses the existing durable control-state persistence
+mechanism, but not its current one-record-per-strategy representation. Pause
+state becomes cause-keyed so operator intent and automatic reconciliation
+latches can coexist:
+
+```text
+paused_strategies[strategy_name][cause] = {
+    reason,
+    command_uid,
+    detected_at,
+    position_uid,
+}
+```
+
+V1 requires at least `OPERATOR` and `UNEXPECTED_PROTECTION` causes. A strategy
+is paused while any cause remains. Operator pause/resume changes only the
+`OPERATOR` cause. Detection always records `UNEXPECTED_PROTECTION`, even when
+another cause already pauses the strategy. A generic operator resume cannot
+clear it.
+
+Clearing `UNEXPECTED_PROTECTION` requires an explicit reconciliation-resolution
+action. That action must read current broker/substrate state, refuse while the
+unexpected owned stop remains unresolved, and persist the cleared cause only
+after the proof succeeds. The exact CLI command spelling is an implementation
+detail; the cause isolation and proof-gated clear are architectural invariants.
+
+The control-state migration is backward compatible: an existing persisted
+single pause record is interpreted as the `OPERATOR` cause. New writes carry a
+schema version and the cause-keyed representation. Restore must fail closed for
+an unknown cause rather than silently discarding a block.
 
 ## 7. Exposure and Heat Accounting
 
@@ -379,7 +414,9 @@ broker behavior.
 - Asynchronous stopless fill binds ownership with a null stop and no CRITICAL.
 - Asynchronous/restart-recovered option fill retains `BROKER_STOP`, rebuilds a
   decision from its persisted hard-stop intent, and uses the option GTC-stop
-  path rather than equity stop repair.
+  path rather than equity stop repair. The test must spy on both broker helpers
+  and assert that the option helper is called while the equity
+  `place_protective_stop()` helper is never called.
 - Restart restores policies from lifecycle/order substrate, not current strategy
   configuration.
 - Partial-fill then final-fill recovery remains idempotent.
@@ -400,6 +437,22 @@ broker behavior.
 - Missing-stop health is N/A for stopless positions.
 - Dashboard and alerts clearly distinguish required, not required, missing, and
   unexpected protection.
+
+### Strategy-local reconciliation block
+
+- Unexpected protection adds an `UNEXPECTED_PROTECTION` cause and persists it.
+- If the strategy is already operator-paused, detection records a second cause;
+  it is not an idempotent no-op.
+- Operator resume removes only `OPERATOR`; the unresolved reconciliation cause
+  continues blocking entries.
+- Reconciliation resolution refuses to clear while the unexpected stop remains
+  in broker/substrate state and succeeds after that state is proven clean.
+- Restart restores both simultaneous causes and preserves their independent
+  clear behavior.
+- Test both event orders: operator pause then anomaly, and anomaly then operator
+  pause.
+- A legacy persisted single pause restores as `OPERATOR`; an unknown persisted
+  cause fails closed and is surfaced to the operator.
 
 ### Seam test
 
@@ -429,7 +482,7 @@ the stopped-strategy regression suite remains green.
 - Paper/live activation of leveraged trend.
 - Reclassifying current production positions as stopless.
 
-## 11. Review Resolutions and Remaining Question
+## 11. Review Resolutions
 
 Review resolved four design forks:
 
@@ -444,9 +497,8 @@ Review resolved four design forks:
 4. Generic SELL-history-first recovery is required for `SIGNAL_EXIT_ONLY`.
    Reordering `BROKER_STOP` recovery is deferred unless substrate attribution
    and regression evidence justify a common path.
-
-One implementation question remains: whether the strategy-local entry block
-for unexpected protection should reuse the existing durable pause-strategy
-control state or be a distinct automatically managed reconciliation halt. The
-choice must preserve operator visibility, restart durability, and an explicit
-clear condition; it must not become an in-memory-only flag.
+5. Reuse the existing durable pause-strategy persistence mechanism, evolved to
+   hold multiple typed causes per strategy. Operator and reconciliation causes
+   are independent latches; neither can accidentally clear the other.
+6. `UNEXPECTED_PROTECTION` has a proof-gated, explicit resolution path. It is
+   never cleared by generic `resume-strategy` and never exists only in memory.
