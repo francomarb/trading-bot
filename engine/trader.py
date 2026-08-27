@@ -116,6 +116,7 @@ from strategies.base import (
     MultiLegTradeRejected,
     OptionTradeRejected,
     OrderType,
+    PositionTarget,
     StrategySlot,
 )
 from utils.option_symbols import is_occ_option, parse_occ_symbol
@@ -269,6 +270,20 @@ def _recent_bar_alignment_error(
         f"execution_only={_sample(execution_only)} "
         f"signal_only={_sample(signal_only)}"
     )
+
+
+def _current_position_target(
+    strategy: BaseStrategy,
+    df: pd.DataFrame,
+) -> PositionTarget | None:
+    """Read and validate a strategy's optional state-based position target."""
+    target = strategy.current_position_target(df)
+    if target is not None and not isinstance(target, PositionTarget):
+        raise TypeError(
+            f"{strategy.name}.current_position_target() must return "
+            f"PositionTarget or None, got {target!r}"
+        )
+    return target
 
 
 _OPERATOR_HALT_REASON_PREFIXES = ("operator_halt:", "operator_halt_sticky:")
@@ -1732,10 +1747,16 @@ class TradingEngine:
                     slot_regime_block_reason = None
 
                 symbols = slot.active_symbols()
-                strategy_statuses: dict[str, str] = {}
-                strategy_reasons: dict[str, list[str]] = {}
-                self._watchlist_statuses[slot.strategy.name] = strategy_statuses
-                self._watchlist_reasons[slot.strategy.name] = strategy_reasons
+                # Multiple slots may intentionally share one strategy name
+                # (leveraged trend has one independent slot per pair). Merge
+                # their symbols into one dashboard strategy map instead of
+                # letting the final slot overwrite every earlier one.
+                strategy_statuses = self._watchlist_statuses.setdefault(
+                    slot.strategy.name, {}
+                )
+                strategy_reasons = self._watchlist_reasons.setdefault(
+                    slot.strategy.name, {}
+                )
                 for symbol in symbols:
                     strategy_statuses[symbol] = self._baseline_watchlist_status(
                         symbol,
@@ -1951,7 +1972,12 @@ class TradingEngine:
                     if not closed:
                         try:
                             signals = strategy._raw_signals(df)
-                            if bool(signals.exits.iloc[-1]):
+                            position_target = _current_position_target(strategy, df)
+                            should_exit = (
+                                bool(signals.exits.iloc[-1])
+                                or position_target is PositionTarget.FLAT
+                            )
+                            if should_exit:
                                 owner = self._get_owner(symbol)
                                 if owner is not None and owner != strategy.name:
                                     processed_owner_conflict = True
@@ -1995,6 +2021,30 @@ class TradingEngine:
         raw_entry = bool(raw_signals.entries.iloc[-1])
         last_entry = bool(signals.entries.iloc[-1])
         last_exit = bool(signals.exits.iloc[-1])
+        position = self._get_position_for(symbol, snapshot)
+        position_target = _current_position_target(strategy, df)
+
+        # State-based strategies reconcile broker reality to the currently
+        # confirmed target. This is distinct from manufacturing a transition
+        # signal on the latest bar: the strategy's SignalFrame stays event-
+        # driven for backtest parity, while a cold start or delayed retry can
+        # still converge to LONG/FLAT. Normal filters, regime, sleeve, risk,
+        # ownership, and execution gates remain authoritative below.
+        if position_target is PositionTarget.LONG and position is None:
+            if not raw_entry:
+                raw_entry = True
+                last_entry = edge_allowed is not False
+                logger.info(
+                    f"[{strategy.name}] {symbol}: position-target reconciliation "
+                    "requests LONG while broker position is flat"
+                )
+        elif position_target is PositionTarget.FLAT and position is not None:
+            if not last_exit:
+                last_exit = True
+                logger.info(
+                    f"[{strategy.name}] {symbol}: position-target reconciliation "
+                    "requests FLAT while broker position is open"
+                )
 
         # PLAN 11.10f: lifecycle counter — raw_signals + gate-order
         # attribution. Per design §12.4.1 the documented gate order is
@@ -2051,7 +2101,6 @@ class TradingEngine:
                         f"unavailable — {type(exc).__name__}: {exc}"
                     )
 
-        position = self._get_position_for(symbol, snapshot)
         if strategy.name == "donchian_breakout" and position is not None:
             try:
                 observation = _donchian_exit_observation(df)
@@ -12087,8 +12136,8 @@ class TradingEngine:
             strat_name = slot.strategy.name
             strat_previous = previous.get(strat_name, {})
             strat_previous_reasons = previous_reasons.get(strat_name, {})
-            strat_statuses: dict[str, str] = {}
-            strat_reasons: dict[str, list[str]] = {}
+            strat_statuses = refreshed.setdefault(strat_name, {})
+            strat_reasons = refreshed_reasons.setdefault(strat_name, {})
             for symbol in slot.active_symbols():
                 baseline = self._baseline_watchlist_status(
                     symbol,
@@ -12108,8 +12157,6 @@ class TradingEngine:
                 else:
                     strat_statuses[symbol] = baseline
                     strat_reasons[symbol] = []
-            refreshed[strat_name] = strat_statuses
-            refreshed_reasons[strat_name] = strat_reasons
         self._watchlist_statuses = refreshed
         self._watchlist_reasons = refreshed_reasons
 

@@ -1319,11 +1319,11 @@ def load_leveraged_trend_states() -> list[TrendMonitorState]:
 
 def _render_leveraged_trend_panel() -> None:
     """
-    Render the 200-day SMA phase monitor for externally-held leveraged funds.
+    Render the read-only 200-day SMA phase view used by leveraged trend.
 
-    Read-only and entirely outside the trading loop — the bot does not trade
-    these funds. Each underlying is an independent state machine; see
-    `monitors/leveraged_trend.py` for the rule and its rationale.
+    The panel does not place orders; the paper engine independently evaluates
+    the same configured rule through ``strategies/leveraged_trend.py``. Each
+    underlying remains an independent state machine.
     """
     try:
         states = load_leveraged_trend_states()
@@ -1341,8 +1341,10 @@ def _render_leveraged_trend_panel() -> None:
         "Leveraged Fund Trend Monitor",
         f"Daily close vs {states[0].sma_length_label} on the unleveraged "
         f"underlying. Phase-OUT after {exit_days} consecutive closes below; "
-        f"phase-IN after {entry_days} consecutive closes above. Monitor only "
-        "— these funds are held outside the bot and are never traded by it.",
+        f"phase-IN after {entry_days} consecutive closes above. The panel is "
+        "read-only; when the paper strategy switch is enabled, the engine "
+        "reconciles its four configured execution funds to these confirmed "
+        "position targets through the normal risk and lifecycle gates.",
         kicker="Context",
     )
 

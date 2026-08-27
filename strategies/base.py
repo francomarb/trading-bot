@@ -72,6 +72,19 @@ class OrderType(Enum):
     STOP_LIMIT = "stop_limit"
 
 
+class PositionTarget(Enum):
+    """Current broker position required by a state-based strategy.
+
+    Event-driven strategies return no target and rely exclusively on their
+    ``SignalFrame`` transition events. A state-based strategy may additionally
+    declare LONG or FLAT so the engine can reconcile a cold start or restart
+    without pretending an old transition occurred on the latest bar.
+    """
+
+    LONG = "long"
+    FLAT = "flat"
+
+
 @dataclass(frozen=True)
 class SignalFrame:
     """
@@ -329,6 +342,16 @@ class BaseStrategy(ABC):
         Returns True to trigger an immediate market exit.
         """
         return False
+
+    def current_position_target(self, df: pd.DataFrame) -> PositionTarget | None:
+        """Return the latest state-based position target, if one exists.
+
+        ``None`` preserves the normal event-driven contract. ``LONG`` or
+        ``FLAT`` asks the engine to emit an action only when broker reality
+        disagrees with the fully confirmed strategy state. Every normal entry,
+        exit, ownership, allocator, risk, and execution gate still applies.
+        """
+        return None
 
     # Concrete strategies implement this.
     @abstractmethod

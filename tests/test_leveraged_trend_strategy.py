@@ -1,4 +1,4 @@
-"""Contract tests for the signal-only leveraged trend research strategy."""
+"""Contract tests for the paper-active leveraged trend strategy."""
 
 from __future__ import annotations
 
@@ -13,6 +13,7 @@ from backtest.leveraged_trend import (
     run_pair_backtest,
 )
 from backtest.runner import BacktestConfig
+from strategies.base import PositionTarget
 from strategies.leveraged_trend import LeveragedTrend
 
 
@@ -93,6 +94,43 @@ class TestLeveragedTrendSignals:
             sma_length=2, entry_days=2, exit_days=2
         ).generate_signals(frame)
         assert int(signals.entries.sum()) == 1
+
+    def test_current_long_target_does_not_fabricate_a_latest_transition(self):
+        frame = _frame([100, 101, 102, 103, 104, 105, 106])
+        strategy = LeveragedTrend(sma_length=2, entry_days=2, exit_days=2)
+
+        signals = strategy.generate_signals(frame)
+
+        assert not bool(signals.entries.iloc[-1])
+        assert int(signals.entries.sum()) == 1
+        assert strategy.current_position_target(frame) is PositionTarget.LONG
+
+    def test_current_flat_target_survives_after_historical_exit(self):
+        frame = _frame([100, 101, 102, 101, 100, 99])
+        strategy = LeveragedTrend(sma_length=2, entry_days=2, exit_days=2)
+
+        signals = strategy.generate_signals(frame)
+
+        assert int(signals.exits.sum()) == 1
+        assert strategy.current_position_target(frame) is PositionTarget.FLAT
+
+    def test_target_is_unknown_until_sma_is_evaluable(self):
+        frame = _frame([100])
+        strategy = LeveragedTrend(sma_length=2, entry_days=2, exit_days=2)
+
+        assert strategy.current_position_target(frame) is None
+
+    def test_target_is_unknown_without_a_complete_confirmation(self):
+        frame = _frame([100, 100, 100, 100])
+        strategy = LeveragedTrend(sma_length=2, entry_days=2, exit_days=2)
+
+        assert strategy.current_position_target(frame) is None
+
+    def test_equality_holds_the_confirmed_long_target(self):
+        frame = _frame([100, 101, 102, 102])
+        strategy = LeveragedTrend(sma_length=2, entry_days=2, exit_days=2)
+
+        assert strategy.current_position_target(frame) is PositionTarget.LONG
 
     def test_fresh_confirmation_can_reenter_after_exit(self):
         frame = _frame([100, 101, 102, 101, 100, 101, 102])

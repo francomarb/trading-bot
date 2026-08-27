@@ -8,15 +8,17 @@ the adjusted daily close of the unleveraged benchmark ETF.
 
 Signal semantics
 ----------------
-* Start OUT (cash).  Do not seed an open position merely because the first
-  evaluable close happens to be above its SMA.
+* Historical replay starts OUT (cash). The first entry still requires a fully
+  confirmed run; the first evaluable close alone never creates a transition.
 * Enter after ``entry_days`` consecutive signal closes strictly above SMA.
 * Exit after ``exit_days`` consecutive signal closes strictly below SMA.
 * A close exactly on the SMA resets both streaks and changes no position.
 
 Signals are emitted on the completed close that confirms the streak.  The
 backtester owns the look-ahead-safe shift to the following session's open.
-There is no stop-loss or secondary exit in this baseline.
+Separately, ``current_position_target`` exposes the ending confirmed LONG/FLAT
+state so the live engine can reconcile a cold start without inventing a new
+transition event. There is no stop-loss or secondary exit in this baseline.
 """
 
 from __future__ import annotations
@@ -28,7 +30,7 @@ from risk.models import (
     ProtectionModel,
     SizingModel,
 )
-from strategies.base import BaseStrategy, OrderType, SignalFrame
+from strategies.base import BaseStrategy, OrderType, PositionTarget, SignalFrame
 
 
 class LeveragedTrend(BaseStrategy):
@@ -93,7 +95,10 @@ class LeveragedTrend(BaseStrategy):
         """Bars required to warm the SMA and complete either confirmation."""
         return self.sma_length + max(self.entry_days, self.exit_days) - 1
 
-    def _raw_signals(self, df: pd.DataFrame) -> SignalFrame:
+    def _replay(
+        self, df: pd.DataFrame
+    ) -> tuple[SignalFrame, PositionTarget | None]:
+        """Replay transition events and return the confirmed ending target."""
         if self.signal_column not in df.columns:
             raise ValueError(
                 "LeveragedTrend requires an explicit "
@@ -118,6 +123,7 @@ class LeveragedTrend(BaseStrategy):
         entries = pd.Series(False, index=df.index, dtype=bool)
         exits = pd.Series(False, index=df.index, dtype=bool)
         in_position = False
+        target: PositionTarget | None = None
         above_streak = 0
         below_streak = 0
 
@@ -138,6 +144,15 @@ class LeveragedTrend(BaseStrategy):
                 above_streak = 0
                 below_streak = 0
 
+            # The live fetch window is finite and may begin after the true
+            # phase started. Infer a target only after this window contains a
+            # complete confirmation in either direction; until then the prior
+            # state is unknowable and reconciliation must do nothing.
+            if above_streak >= self.entry_days:
+                target = PositionTarget.LONG
+            elif below_streak >= self.exit_days:
+                target = PositionTarget.FLAT
+
             if not in_position and above_streak >= self.entry_days:
                 entries.iloc[idx] = True
                 in_position = True
@@ -145,7 +160,17 @@ class LeveragedTrend(BaseStrategy):
                 exits.iloc[idx] = True
                 in_position = False
 
-        return SignalFrame(entries=entries, exits=exits)
+        return SignalFrame(entries=entries, exits=exits), target
+
+    def _raw_signals(self, df: pd.DataFrame) -> SignalFrame:
+        """Return confirmed transition events for backtest/live parity."""
+        signals, _target = self._replay(df)
+        return signals
+
+    def current_position_target(self, df: pd.DataFrame) -> PositionTarget | None:
+        """Return LONG/FLAT for the latest fully replayed confirmed phase."""
+        _signals, target = self._replay(df)
+        return target
 
     def __repr__(self) -> str:
         return (

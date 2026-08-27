@@ -64,7 +64,9 @@ from reporting.logger import TradeLogger
 from risk.manager import (
     AccountState,
     Position,
+    RejectionCode,
     RiskDecision,
+    RiskRejection,
     RiskManager,
     Side,
 )
@@ -74,9 +76,11 @@ from strategies.base import (
     EdgeFilterDecision,
     OptionTradeRejected,
     OrderType,
+    PositionTarget,
     SignalFrame,
     StrategySlot,
 )
+from strategies.leveraged_trend import LeveragedTrend
 
 
 # ── Fakes ────────────────────────────────────────────────────────────────────
@@ -107,6 +111,28 @@ class FakeStrategy(BaseStrategy):
             entries=pd.Series(e, index=df.index, dtype=bool),
             exits=pd.Series(x, index=df.index, dtype=bool),
         )
+
+
+class TargetStateStrategy(FakeStrategy):
+    """Fake event strategy with an independently controlled current target."""
+
+    def __init__(
+        self,
+        *,
+        target: PositionTarget | None,
+        entries: list[bool] | None = None,
+        exits: list[bool] | None = None,
+        edge_filter=None,
+    ):
+        super().__init__(
+            entries=entries or [False],
+            exits=exits or [False],
+            edge_filter=edge_filter,
+        )
+        self.target = target
+
+    def current_position_target(self, df: pd.DataFrame) -> PositionTarget | None:
+        return self.target
 
 
 def _bars(n: int = 60, end: datetime = T0, base: float = 100.0) -> pd.DataFrame:
@@ -563,6 +589,50 @@ class TestDualAssetBarAlignment:
             required_bars=50,
         ) is None
 
+    def test_confirmed_historical_in_phase_bootstraps_current_paper_entry(
+        self,
+        engine_factory,
+        monkeypatch,
+    ):
+        execution = _bars(n=60, base=30.0)
+        signal = _bars(n=60, base=100.0)
+        rising = [100.0 + index for index in range(len(signal))]
+        signal["open"] = rising
+        signal["high"] = [value + 1.0 for value in rising]
+        signal["low"] = [value - 1.0 for value in rising]
+        signal["close"] = rising
+        frames = {"SPXL": execution, "SPY": signal}
+
+        def _fetch(symbol, start, end, timeframe="1Day", **kwargs):
+            return frames[symbol], SimpleNamespace(api_calls=0)
+
+        monkeypatch.setattr("engine.trader.fetch_symbol", _fetch)
+        engine, broker = engine_factory()
+        strategy = LeveragedTrend(
+            sma_length=2,
+            entry_days=2,
+            exit_days=2,
+            target_notional_pct=0.05,
+        )
+        engine.slots[0].strategy = strategy
+        broker.place_order.return_value = _filled_result("SPXL", 1, 33.0)
+        snapshot = _snapshot()
+
+        engine._process_symbol(
+            "SPXL",
+            snapshot,
+            snapshot.account,
+            strategy,
+            engine.slots[0].timeframe,
+            signal_symbol="SPY",
+            data_feed="sip",
+        )
+
+        broker.place_order.assert_called_once()
+        decision = broker.place_order.call_args.args[0]
+        assert decision.symbol == "SPXL"
+        assert decision.protection_model is ProtectionModel.SIGNAL_EXIT_ONLY
+
     @pytest.mark.parametrize(
         "mismatch",
         ["missing-latest-signal", "missing-latest-execution", "internal-gap"],
@@ -800,6 +870,177 @@ class TestProcessSymbol:
         broker.place_order.assert_not_called()
         broker.close_position.assert_not_called()
 
+    def test_long_position_target_bootstraps_flat_broker(self, engine_factory):
+        engine, broker = engine_factory()
+        engine.slots[0].strategy = TargetStateStrategy(
+            target=PositionTarget.LONG
+        )
+        snapshot = _snapshot()
+        engine._session_start_equity = snapshot.account.equity
+
+        self._process(engine, "AAPL", snapshot)
+
+        broker.place_order.assert_called_once()
+        broker.close_position.assert_not_called()
+
+    def test_long_position_target_still_obeys_regime_gate(self, engine_factory):
+        engine, broker = engine_factory()
+        strategy = TargetStateStrategy(target=PositionTarget.LONG)
+        engine.slots[0].strategy = strategy
+        snapshot = _snapshot()
+
+        engine._process_symbol(
+            "AAPL",
+            snapshot,
+            snapshot.account,
+            strategy,
+            engine.slots[0].timeframe,
+            entry_allowed=False,
+            regime_block_reason="test regime block",
+        )
+
+        broker.place_order.assert_not_called()
+
+    def test_long_position_target_still_obeys_edge_filter(self, engine_factory):
+        def _blocked(df):
+            return pd.Series(False, index=df.index, dtype=bool)
+
+        engine, broker = engine_factory()
+        engine.slots[0].strategy = TargetStateStrategy(
+            target=PositionTarget.LONG,
+            edge_filter=_blocked,
+        )
+        snapshot = _snapshot()
+
+        self._process(engine, "AAPL", snapshot)
+
+        broker.place_order.assert_not_called()
+
+    def test_flat_position_target_closes_open_broker_position(self, engine_factory):
+        engine, broker = engine_factory()
+        engine.slots[0].strategy = TargetStateStrategy(
+            target=PositionTarget.FLAT
+        )
+        positions = {"AAPL": Position("AAPL", 10, 100.0, 1_010.0)}
+        snapshot = _snapshot(positions=positions)
+
+        self._process(engine, "AAPL", snapshot)
+
+        broker.close_position.assert_called_once_with("AAPL", position_uid=None)
+        broker.place_order.assert_not_called()
+
+    def test_long_target_does_not_duplicate_existing_position(self, engine_factory):
+        engine, broker = engine_factory()
+        engine.slots[0].strategy = TargetStateStrategy(
+            target=PositionTarget.LONG
+        )
+        positions = {"AAPL": Position("AAPL", 10, 100.0, 1_010.0)}
+        snapshot = _snapshot(positions=positions)
+
+        self._process(engine, "AAPL", snapshot)
+
+        broker.place_order.assert_not_called()
+        broker.close_position.assert_not_called()
+
+    def test_long_position_target_still_obeys_pending_entry_gate(
+        self, engine_factory
+    ):
+        engine, broker = engine_factory()
+        strategy = TargetStateStrategy(target=PositionTarget.LONG)
+        engine.slots[0].strategy = strategy
+        pending = OpenOrder(
+            order_id="buy-1",
+            symbol="AAPL",
+            side=Side.BUY,
+            qty=1,
+            order_type=OrderType.MARKET,
+            status="open",
+            submitted_at=T0,
+            limit_price=None,
+            stop_price=None,
+            client_order_id="fake_strategy-abc123",
+        )
+        snapshot = _snapshot(open_orders=[pending])
+
+        engine._process_symbol(
+            "AAPL",
+            snapshot,
+            snapshot.account,
+            strategy,
+            engine.slots[0].timeframe,
+            order_strategy={"buy-1": strategy.name},
+        )
+
+        broker.place_order.assert_not_called()
+
+    def test_long_position_target_still_obeys_sleeve_gate(self, engine_factory):
+        from risk.allocator import SleeveRejection, SleeveRejectionCode
+
+        engine, broker = engine_factory()
+        strategy = TargetStateStrategy(target=PositionTarget.LONG)
+        engine.slots[0].strategy = strategy
+        engine._allocator = MagicMock()
+        engine._allocator.check.return_value = SleeveRejection(
+            strategy_name=strategy.name,
+            code=SleeveRejectionCode.SLEEVE_FULL,
+            message="test sleeve is full",
+        )
+        snapshot = _snapshot()
+
+        self._process(engine, "AAPL", snapshot)
+
+        engine._allocator.check.assert_called_once()
+        broker.place_order.assert_not_called()
+
+    def test_long_position_target_still_obeys_risk_rejection(self, engine_factory):
+        engine, broker = engine_factory()
+        strategy = TargetStateStrategy(target=PositionTarget.LONG)
+        engine.slots[0].strategy = strategy
+        engine.risk.evaluate = MagicMock(
+            return_value=RiskRejection(
+                code=RejectionCode.INSUFFICIENT_CASH,
+                message="test insufficient cash",
+                symbol="AAPL",
+                strategy_name=strategy.name,
+            )
+        )
+        snapshot = _snapshot()
+
+        self._process(engine, "AAPL", snapshot)
+
+        engine.risk.evaluate.assert_called_once()
+        broker.place_order.assert_not_called()
+
+    def test_flat_position_target_respects_position_owner(self, engine_factory):
+        engine, broker = engine_factory()
+        strategy = TargetStateStrategy(target=PositionTarget.FLAT)
+        engine.slots[0].strategy = strategy
+        engine._register_single_leg(
+            strategy_name="donchian_breakout", symbol="AAPL"
+        )
+        positions = {"AAPL": Position("AAPL", 10, 100.0, 1_010.0)}
+        snapshot = _snapshot(positions=positions)
+
+        self._process(engine, "AAPL", snapshot)
+
+        broker.close_position.assert_not_called()
+
+    def test_flat_position_target_still_obeys_pending_close_gate(
+        self, engine_factory
+    ):
+        engine, broker = engine_factory()
+        strategy = TargetStateStrategy(target=PositionTarget.FLAT)
+        engine.slots[0].strategy = strategy
+        positions = {"AAPL": Position("AAPL", 10, 100.0, 1_010.0)}
+        snapshot = _snapshot(
+            positions=positions,
+            open_orders=[_open_sell_order("AAPL")],
+        )
+
+        self._process(engine, "AAPL", snapshot)
+
+        broker.close_position.assert_not_called()
+
     def test_processed_bar_still_runs_single_leg_emergency_exit(
         self, engine_factory, patch_fetch
     ):
@@ -860,6 +1101,24 @@ class TestProcessSymbol:
         engine._session_start_equity = snap.account.equity
 
         self._process(engine, "AAPL", snap)
+
+        broker.close_position.assert_called_once_with("AAPL", position_uid=None)
+
+    def test_processed_bar_still_retries_flat_position_target(
+        self, engine_factory, patch_fetch
+    ):
+        engine, broker = engine_factory()
+        strategy = TargetStateStrategy(target=PositionTarget.FLAT)
+        engine.slots[0].strategy = strategy
+        engine._register_single_leg(strategy_name=strategy.name, symbol="AAPL")
+        signal_key = (strategy.name, "AAPL", engine.slots[0].timeframe)
+        engine._processed_signal_bars[signal_key] = pd.Timestamp(
+            patch_fetch["df"].index[-1]
+        )
+        positions = {"AAPL": Position("AAPL", 10, 100.0, 1_010.0)}
+        snapshot = _snapshot(positions=positions)
+
+        self._process(engine, "AAPL", snapshot)
 
         broker.close_position.assert_called_once_with("AAPL", position_uid=None)
 
@@ -1739,6 +1998,46 @@ class TestOptionsPathSlippageContract:
 
 
 class TestMultiSlot:
+    def test_same_strategy_slots_merge_open_cycle_watchlist_statuses(
+        self, engine_factory
+    ):
+        engine, _broker = engine_factory()
+        engine.slots.append(
+            StrategySlot(
+                strategy=FakeStrategy(entries=[False], exits=[False]),
+                symbols=["MSFT"],
+            )
+        )
+
+        engine._run_one_cycle()
+
+        assert engine._watchlist_statuses["fake_strategy"] == {
+            "AAPL": "No Signal",
+            "MSFT": "No Signal",
+        }
+
+    def test_same_strategy_slots_merge_snapshot_refresh_statuses(
+        self, engine_factory
+    ):
+        engine, _broker = engine_factory()
+        engine.slots.append(
+            StrategySlot(
+                strategy=FakeStrategy(entries=[False], exits=[False]),
+                symbols=["MSFT"],
+            )
+        )
+
+        engine._refresh_watchlist_statuses(
+            _snapshot(),
+            order_strategy={},
+            preserve_existing=False,
+        )
+
+        assert engine._watchlist_statuses["fake_strategy"] == {
+            "AAPL": "No Signal",
+            "MSFT": "No Signal",
+        }
+
     def test_multi_slot_processes_all_slots(self, patch_fetch, tmp_path):
         """Two slots with different strategies and symbols — both fire."""
         from strategies.base import StrategySlot
