@@ -145,10 +145,11 @@ Using the existing Alpaca SIP cache through 2026-08-25, with 5 bps slippage:
   account sleeve; it is materially less spectacular than letting four
   standalone leveraged equity curves compound without rebalancing.
 
-The remaining evidence item before calling the paper rollout complete is the
-pre-2016/2008-style synthetic daily-reset stress study. Alpaca SIP begins in
-2016 for these pairs, so that artifact needs separately sourced underlying
-history and explicit provenance; it must not be mislabeled as SIP fund data.
+Alpaca SIP begins in 2016 for these pairs and does not provide the requested
+pre-2016/2008 window. That coverage limitation is accepted for the paper
+battle-test stage: no external series is blended into the SIP result and no
+synthetic history is represented as broker data. The missing period remains a
+known evidence limitation, not a paper-activation blocker.
 
 ## Deferred Questions
 
