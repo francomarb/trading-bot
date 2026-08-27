@@ -275,6 +275,27 @@ class TestPlaceOrderContract:
         assert getattr(request, "order_class", None) is None
         assert getattr(request, "stop_loss", None) is None
 
+    @pytest.mark.parametrize(
+        "field,value,match",
+        [
+            ("entry_max_price", 105.0, "entry_max_price"),
+            ("order_type", OrderType.LIMIT, "MARKET entries only"),
+        ],
+    )
+    def test_signal_exit_only_cannot_silently_downgrade_entry_controls(
+        self, field, value, match
+    ):
+        decision = _stopless_decision()
+        object.__setattr__(decision, field, value)
+        if field == "order_type":
+            object.__setattr__(decision, "limit_price", 99.0)
+        broker = _broker_with_mock(MagicMock())
+
+        with pytest.raises(ValueError, match=match):
+            broker.place_order(decision)
+
+        broker._api.submit_order.assert_not_called()
+
 
 class TestBrokerConnections:
     def test_close_connections_closes_underlying_session(self):

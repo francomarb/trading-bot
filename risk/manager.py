@@ -375,6 +375,14 @@ class RiskDecision:
                 raise ValueError("NOTIONAL requires SIGNAL_EXIT_ONLY in V1")
             if self.stop_price is not None:
                 raise ValueError("NOTIONAL + SIGNAL_EXIT_ONLY requires stop_price=None")
+            if self.order_type is not OrderType.MARKET:
+                raise ValueError(
+                    "SIGNAL_EXIT_ONLY supports MARKET entries only in V1"
+                )
+            if self.entry_max_price is not None:
+                raise ValueError(
+                    "SIGNAL_EXIT_ONLY does not support entry_max_price in V1"
+                )
             if (
                 self.approved_notional_dollars is None
                 or self.approved_notional_dollars <= 0
@@ -1413,6 +1421,18 @@ class RiskManager:
                 return self._reject(
                     RejectionCode.INVALID_SIGNAL,
                     "NOTIONAL + SIGNAL_EXIT_ONLY must not carry a stop override",
+                    signal,
+                )
+            if signal.order_type is not OrderType.MARKET:
+                return self._reject(
+                    RejectionCode.INVALID_SIGNAL,
+                    "SIGNAL_EXIT_ONLY supports MARKET entries only in V1",
+                    signal,
+                )
+            if signal.entry_max_price is not None:
+                return self._reject(
+                    RejectionCode.INVALID_SIGNAL,
+                    "SIGNAL_EXIT_ONLY does not support entry_max_price in V1",
                     signal,
                 )
         elif signal.protection_model is not ProtectionModel.BROKER_STOP:

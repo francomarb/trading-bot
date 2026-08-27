@@ -99,6 +99,13 @@ validate sequence before enforcing `NOT NULL`; the final schema must make an
 absent or invalid policy impossible for new entry intents. Position and entry-
 order copies must be created atomically and protected against disagreement.
 
+Implementation resolution (PR #125 review): fresh tables use the CHECK/NOT
+NULL declarations above. Existing SQLite tables receive the columns through
+the compatible additive migration, are backfilled first, and then receive
+INSERT/UPDATE validation triggers that enforce the same policy matrix. This is
+necessary because SQLite cannot retrofit table-level CHECK constraints with
+`ALTER TABLE ... ADD COLUMN`.
+
 ## 4. Typed Risk Contract
 
 Introduce enums in the risk domain rather than strings distributed across
@@ -160,6 +167,13 @@ For `SIGNAL_EXIT_ONLY` equities:
 - return an execution result that distinguishes "protection not required" from
   "stop placement attempted and failed."
 
+V1 accepts only an uncapped MARKET entry for this protection model. A LIMIT,
+STOP_LIMIT, or `entry_max_price` decision is rejected by both `RiskManager` and
+the broker boundary before any lifecycle or broker side effect. This keeps a
+future configuration change from silently downgrading a requested price
+control to an unbounded market order; adding capped stopless entries requires a
+separately tested simple-LIMIT execution contract.
+
 That final distinction should be typed. Reusing `placed_stop_price=None` alone
 is ambiguous because it currently covers both intentional absence and a failed
 or impossible stop placement.
@@ -199,6 +213,10 @@ protection model requires such a stop.
 The helper should require proof of `BROKER_STOP`, preferably in its typed input
 or precondition. A `SIGNAL_EXIT_ONLY` fractional position is a legitimate open
 position and must remain available to normal strategy exits.
+
+Implementation resolution (PR #125 review): the destructive helper requires a
+typed `protection_model` argument and returns before stop-fill lookup or broker
+close unless that value is `BROKER_STOP`.
 
 ### 6.3 Recovered entry side effects — critical
 
@@ -260,6 +278,11 @@ Required behavior:
   stop-specific status under a documented API contract), with no degraded flag;
 - always retain the original position protection model on the residual
   lifecycle.
+
+Operator handlers resolve this value through the same fail-safe lifecycle
+policy helper used by stop repair. Missing, invalid, or unreadable legacy policy
+therefore falls back to the conservative stopped posture instead of raising
+mid-command.
 
 This proposal does not implement strategy-driven partial exits; that remains a
 separate bot-wide feature. It only ensures existing operator reductions do not

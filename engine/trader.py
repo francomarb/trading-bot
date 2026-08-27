@@ -5629,8 +5629,8 @@ class TradingEngine:
                 "broker_order_id": result.order_id,
             }
             if not is_full_close:
-                protection_model = ProtectionModel(
-                    lifecycle_row.protection_model
+                _sizing_model, protection_model = self._position_risk_policy(
+                    symbol=lifecycle_row.symbol
                 )
                 if protection_model is ProtectionModel.SIGNAL_EXIT_ONLY:
                     result_payload["protection_status"] = "not_required"
@@ -5893,8 +5893,8 @@ class TradingEngine:
             # strategy's risk parameters, and ordering it sequentially —
             # significant extra complexity for v1. v1 contract: report
             # the degraded state, let cycle repair handle it.
-            protection_model = ProtectionModel(
-                lifecycle_row.protection_model
+            _sizing_model, protection_model = self._position_risk_policy(
+                symbol=lifecycle_row.symbol
             )
             result_payload = {
                 "position_uid": lifecycle_row.position_uid,
@@ -5968,8 +5968,21 @@ class TradingEngine:
         symbol: str,
         owner: str,
         position: Position,
+        protection_model: ProtectionModel,
     ) -> None:
-        """Auto-close a managed residual equity stub that cannot carry a broker stop."""
+        """Auto-close a stopped residual that cannot carry a broker stop.
+
+        ``protection_model`` is deliberately required at this destructive
+        boundary.  The repair loop normally calls this only after resolving a
+        lifecycle to ``BROKER_STOP``; the explicit precondition prevents a
+        future direct caller from liquidating a healthy stopless residual.
+        """
+        if protection_model is not ProtectionModel.BROKER_STOP:
+            logger.error(
+                f"{symbol}: refusing fractional residual cleanup for "
+                f"protection_model={protection_model.value}"
+            )
+            return
         stop_fill = self._lookup_recent_stop_fill(symbol=symbol, owner=owner)
         if stop_fill is not None:
             self._record_recovered_stop_fill(
@@ -7776,6 +7789,7 @@ class TradingEngine:
                             symbol=symbol,
                             owner=owner,
                             position=position,
+                            protection_model=protection_model,
                         )
                     else:
                         logger.debug(
@@ -7857,6 +7871,7 @@ class TradingEngine:
                         symbol=symbol,
                         owner=owner,
                         position=position,
+                        protection_model=protection_model,
                     )
                 else:
                     logger.debug(

@@ -54,6 +54,11 @@ persisted policy rather than inferring from a ticker or strategy name. A
 `StrategySlot` may also map an execution symbol to a distinct signal symbol and
 select a per-slot data feed; leveraged trend uses this contract for
 benchmark-close signals and 3x-fund execution on delayed SIP daily bars.
+Fresh and migrated lifecycle databases enforce the policy matrix at the
+database boundary (fresh-table constraints plus migration-safe triggers).
+Signal-exit-only V1 entries are deliberately uncapped DAY market orders;
+non-market or price-capped shapes fail before submission rather than silently
+losing their requested price control.
 
 ---
 

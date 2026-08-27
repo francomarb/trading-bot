@@ -137,6 +137,70 @@ CREATE TABLE IF NOT EXISTS position_lifecycle_orders (
 """
 
 
+# Additive SQLite migrations cannot retrofit the CHECK constraints from the
+# fresh-table DDL.  These triggers mirror that matrix for databases which
+# already had ``position_lifecycle_orders`` before the policy columns landed.
+_CREATE_POSITION_LIFECYCLE_ORDERS_POLICY_TRIGGERS_SQL = (
+    """
+    CREATE TRIGGER IF NOT EXISTS trg_lifecycle_orders_policy_insert
+    BEFORE INSERT ON position_lifecycle_orders
+    FOR EACH ROW
+    WHEN (NEW.sizing_model IS NOT NULL AND NEW.sizing_model NOT IN (
+              'stop_distance', 'notional', 'defined_max_loss'
+          ))
+      OR (NEW.protection_model IS NOT NULL AND NEW.protection_model NOT IN (
+              'broker_stop', 'signal_exit_only'
+          ))
+      OR (
+          NEW.role IN ('entry_primary', 'entry_residual')
+          AND (
+              NEW.sizing_model IS NULL
+              OR NEW.protection_model IS NULL
+              OR NOT (
+                  (NEW.sizing_model = 'stop_distance'
+                   AND NEW.protection_model = 'broker_stop')
+                  OR (NEW.sizing_model = 'notional'
+                      AND NEW.protection_model = 'signal_exit_only')
+                  OR NEW.sizing_model = 'defined_max_loss'
+              )
+          )
+      )
+    BEGIN
+        SELECT RAISE(ABORT, 'invalid lifecycle order risk policy');
+    END
+    """,
+    """
+    CREATE TRIGGER IF NOT EXISTS trg_lifecycle_orders_policy_update
+    BEFORE UPDATE OF role, sizing_model, protection_model
+    ON position_lifecycle_orders
+    FOR EACH ROW
+    WHEN (NEW.sizing_model IS NOT NULL AND NEW.sizing_model NOT IN (
+              'stop_distance', 'notional', 'defined_max_loss'
+          ))
+      OR (NEW.protection_model IS NOT NULL AND NEW.protection_model NOT IN (
+              'broker_stop', 'signal_exit_only'
+          ))
+      OR (
+          NEW.role IN ('entry_primary', 'entry_residual')
+          AND (
+              NEW.sizing_model IS NULL
+              OR NEW.protection_model IS NULL
+              OR NOT (
+                  (NEW.sizing_model = 'stop_distance'
+                   AND NEW.protection_model = 'broker_stop')
+                  OR (NEW.sizing_model = 'notional'
+                      AND NEW.protection_model = 'signal_exit_only')
+                  OR NEW.sizing_model = 'defined_max_loss'
+              )
+          )
+      )
+    BEGIN
+        SELECT RAISE(ABORT, 'invalid lifecycle order risk policy');
+    END
+    """,
+)
+
+
 # Unique constraints. Non-unique indexes don't enforce exactly-once
 # (PR #59 review-2 P1.3 finding). order_id is NULL while pending;
 # the partial unique index permits multiple NULLs while rejecting

@@ -123,6 +123,61 @@ CREATE TABLE IF NOT EXISTS position_lifecycle (
 """
 
 
+# SQLite cannot add CHECK / NOT NULL constraints to an existing table with
+# ``ALTER TABLE ... ADD COLUMN``.  Production databases therefore need
+# triggers that enforce the same policy matrix as the fresh-table DDL after
+# the additive migration/backfill completes.  The triggers are also installed
+# on fresh databases so one database-level contract applies to both paths.
+_CREATE_POSITION_LIFECYCLE_POLICY_TRIGGERS_SQL = (
+    """
+    CREATE TRIGGER IF NOT EXISTS trg_position_lifecycle_policy_insert
+    BEFORE INSERT ON position_lifecycle
+    FOR EACH ROW
+    WHEN NEW.sizing_model IS NULL
+      OR NEW.protection_model IS NULL
+      OR NEW.sizing_model NOT IN (
+          'stop_distance', 'notional', 'defined_max_loss'
+      )
+      OR NEW.protection_model NOT IN (
+          'broker_stop', 'signal_exit_only'
+      )
+      OR NOT (
+          (NEW.sizing_model = 'stop_distance'
+           AND NEW.protection_model = 'broker_stop')
+          OR (NEW.sizing_model = 'notional'
+              AND NEW.protection_model = 'signal_exit_only')
+          OR NEW.sizing_model = 'defined_max_loss'
+      )
+    BEGIN
+        SELECT RAISE(ABORT, 'invalid position lifecycle risk policy');
+    END
+    """,
+    """
+    CREATE TRIGGER IF NOT EXISTS trg_position_lifecycle_policy_update
+    BEFORE UPDATE OF sizing_model, protection_model ON position_lifecycle
+    FOR EACH ROW
+    WHEN NEW.sizing_model IS NULL
+      OR NEW.protection_model IS NULL
+      OR NEW.sizing_model NOT IN (
+          'stop_distance', 'notional', 'defined_max_loss'
+      )
+      OR NEW.protection_model NOT IN (
+          'broker_stop', 'signal_exit_only'
+      )
+      OR NOT (
+          (NEW.sizing_model = 'stop_distance'
+           AND NEW.protection_model = 'broker_stop')
+          OR (NEW.sizing_model = 'notional'
+              AND NEW.protection_model = 'signal_exit_only')
+          OR NEW.sizing_model = 'defined_max_loss'
+      )
+    BEGIN
+        SELECT RAISE(ABORT, 'invalid position lifecycle risk policy');
+    END
+    """,
+)
+
+
 _CREATE_POSITION_LIFECYCLE_LEGS_SQL = """
 CREATE TABLE IF NOT EXISTS position_lifecycle_legs (
     id                  INTEGER PRIMARY KEY AUTOINCREMENT,

@@ -256,6 +256,32 @@ class TestNotionalSignalExitSizing:
         assert isinstance(rejection, RiskRejection)
         assert rejection.code is RejectionCode.INVALID_SIGNAL
 
+    @pytest.mark.parametrize(
+        "overrides,expected_message",
+        [
+            (
+                {"entry_max_price": 105.0},
+                "does not support entry_max_price",
+            ),
+            (
+                {"order_type": OrderType.LIMIT, "limit_price": 99.0},
+                "supports MARKET entries only",
+            ),
+        ],
+    )
+    def test_unsupported_stopless_entry_shape_is_rejected_before_dispatch(
+        self, overrides, expected_message
+    ):
+        rejection = _mgr().evaluate(
+            self._notional_signal(**overrides),
+            _account(),
+            now=T0,
+        )
+
+        assert isinstance(rejection, RiskRejection)
+        assert rejection.code is RejectionCode.INVALID_SIGNAL
+        assert expected_message in rejection.message
+
     def test_zero_equity_rejected(self):
         rej = _mgr().evaluate(_signal(), _account(equity=0.0), now=T0)
         assert isinstance(rej, RiskRejection)

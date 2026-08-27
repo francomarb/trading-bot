@@ -2406,6 +2406,7 @@ class TestWatchlistStatuses:
             symbol="AAPL",
             owner="fake_strategy",
             position=snapshot.account.open_positions["AAPL"],
+            protection_model=ProtectionModel.BROKER_STOP,
         )
 
     # P-6: tests for the legacy _suspect_orders / _recover_suspect_orders
@@ -2467,6 +2468,25 @@ class TestProtectionPolicyReconciliation:
         broker.replace_day_stop_with_standalone_gtc.assert_not_called()
         engine._reconstruct_missing_entry_context.assert_not_called()
         engine._close_fractional_residual_position.assert_not_called()
+
+    def test_fractional_cleanup_helper_refuses_signal_exit_policy(
+        self, engine_factory
+    ):
+        position = Position("SPXL", 0.5, 100.0, 50.0)
+        snapshot = _snapshot(positions={"SPXL": position})
+        engine, broker = engine_factory(snapshot=snapshot)
+        engine._lookup_recent_stop_fill = MagicMock()
+
+        engine._close_fractional_residual_position(
+            snapshot=snapshot,
+            symbol="SPXL",
+            owner="leveraged_trend",
+            position=position,
+            protection_model=ProtectionModel.SIGNAL_EXIT_ONLY,
+        )
+
+        engine._lookup_recent_stop_fill.assert_not_called()
+        broker.close_position.assert_not_called()
 
     def test_signal_exit_recovery_never_places_a_stop(self, engine_factory):
         snapshot = _snapshot(

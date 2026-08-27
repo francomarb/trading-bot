@@ -770,6 +770,7 @@ class TradeLogger:
                 _CREATE_POSITION_LIFECYCLE_SQL,
                 _CREATE_POSITION_LIFECYCLE_LEGS_SQL,
                 _CREATE_POSITION_LIFECYCLE_INDEXES_SQL,
+                _CREATE_POSITION_LIFECYCLE_POLICY_TRIGGERS_SQL,
             )
             conn.execute(_CREATE_POSITION_LIFECYCLE_SQL)
             conn.execute(_CREATE_POSITION_LIFECYCLE_LEGS_SQL)
@@ -810,6 +811,8 @@ class TradeLogger:
                 "OR stated_leverage_multiplier IS NULL "
                 "OR stress_exposure_multiplier IS NULL"
             )
+            for trigger_sql in _CREATE_POSITION_LIFECYCLE_POLICY_TRIGGERS_SQL:
+                conn.execute(trigger_sql)
             for index_sql in _CREATE_POSITION_LIFECYCLE_INDEXES_SQL:
                 conn.execute(index_sql)
             # Order lifecycle foundation (PR #59): per-order substrate.
@@ -819,6 +822,7 @@ class TradeLogger:
             from engine.lifecycle_orders import (
                 _CREATE_POSITION_LIFECYCLE_ORDERS_SQL,
                 _CREATE_POSITION_LIFECYCLE_ORDERS_INDEXES_SQL,
+                _CREATE_POSITION_LIFECYCLE_ORDERS_POLICY_TRIGGERS_SQL,
                 _UNIQ_ONE_ACTIVE_POSITION_PER_OWNER_KEY_SQL,
                 _UNIQ_TRADES_ORDER_ID_SINGLE_LEG_SQL,
                 run_preflight_or_raise,
@@ -861,6 +865,10 @@ class TradeLogger:
                 "OR stated_leverage_multiplier IS NULL "
                 "OR stress_exposure_multiplier IS NULL)"
             )
+            for trigger_sql in (
+                _CREATE_POSITION_LIFECYCLE_ORDERS_POLICY_TRIGGERS_SQL
+            ):
+                conn.execute(trigger_sql)
             for index_sql in _CREATE_POSITION_LIFECYCLE_ORDERS_INDEXES_SQL:
                 conn.execute(index_sql)
             # Migration preflight (PR #59 §12.2 / R7-P1b / R9-P1c,

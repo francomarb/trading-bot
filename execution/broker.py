@@ -1572,6 +1572,16 @@ class AlpacaBroker:
             )
 
         if decision.protection_model is ProtectionModel.SIGNAL_EXIT_ONLY:
+            if decision.order_type is not OrderType.MARKET:
+                raise ValueError(
+                    "SIGNAL_EXIT_ONLY broker entry supports MARKET entries "
+                    "only in V1"
+                )
+            if decision.entry_max_price is not None:
+                raise ValueError(
+                    "SIGNAL_EXIT_ONLY broker entry does not support "
+                    "entry_max_price in V1"
+                )
             return self._place_fractional_order(
                 decision,
                 poll_timeout=poll_timeout,
@@ -1994,22 +2004,28 @@ class AlpacaBroker:
         # dry-run guard below; same reasoning as in place_order().
         position_uid: str | None = None
 
-        # PLAN 11.32: defense in depth. place_order() floors fractional qty
-        # to whole shares when entry_max_price is set so the capped DAY
-        # LIMIT + OTO path applies. If we ever reach this branch with a cap
-        # set, it means the floor logic was bypassed or removed — log an
-        # ERROR so it's loud in alerts.
-        if decision.entry_max_price is not None:
-            logger.error(
-                f"[entry-guard] {decision.symbol}: BUG — entry_max_price "
-                f"${decision.entry_max_price:.2f} reached the fractional path "
-                f"(qty={decision.qty}). The cap will NOT be enforced. "
-                f"Investigate place_order() floor logic."
-            )
-
         signal_exit_only = (
             decision.protection_model is ProtectionModel.SIGNAL_EXIT_ONLY
         )
+        if signal_exit_only and decision.order_type is not OrderType.MARKET:
+            raise ValueError(
+                "SIGNAL_EXIT_ONLY simple entry supports MARKET entries only "
+                "in V1"
+            )
+        if signal_exit_only and decision.entry_max_price is not None:
+            raise ValueError(
+                "SIGNAL_EXIT_ONLY simple entry does not support "
+                "entry_max_price in V1"
+            )
+        # PLAN 11.32: defense in depth for stopped fractional decisions.
+        # place_order() floors capped quantities into the whole-share capped
+        # LIMIT+OTO path. Reaching this helper with a cap is therefore a
+        # caller bug and must fail before any lifecycle or broker side effect.
+        if decision.entry_max_price is not None:
+            raise ValueError(
+                f"entry_max_price ${decision.entry_max_price:.2f} reached "
+                "the fractional simple-order path"
+            )
         protection_text = (
             "signal-exit protection"
             if signal_exit_only

@@ -115,6 +115,9 @@ strategy-specific risk bypass:
 - The broker submits a simple DAY market entry with no attached or follow-up
   stop. Missing-stop repair, ATR reconstruction, and fractional residual
   cleanup explicitly skip these positions.
+- V1 deliberately rejects a leveraged-trend LIMIT, STOP_LIMIT, or
+  `entry_max_price` configuration before dispatch. Supporting a price cap later
+  requires a simple DAY LIMIT path; it cannot silently fall back to MARKET.
 - Unexpected protection is left untouched, alerts, and adds a durable
   strategy-local `UNEXPECTED_PROTECTION` pause cause. It cannot be cleared by
   ordinary `resume-strategy`; the explicit resolution command requires clean
