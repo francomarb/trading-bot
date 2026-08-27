@@ -16,6 +16,7 @@ Covers:
 from __future__ import annotations
 
 import json
+from types import SimpleNamespace
 from unittest.mock import MagicMock
 
 import pytest
@@ -24,6 +25,8 @@ from engine.operator_queue import OperatorCommandStore, new_command_uid
 from engine.trader import TradingEngine
 from reporting.logger import TradeLogger
 from risk.manager import RiskManager
+from risk.models import StrategyPauseCause
+from risk.manager import Side
 
 
 def _build_engine(tmp_path):
@@ -245,7 +248,68 @@ class TestStickyPauseRestore:
         engine._restore_control_state()
         assert engine.risk.is_strategy_paused("sma_crossover") is True
         snap = engine.risk.paused_strategies_snapshot()
-        assert snap["sma_crossover"]["reason"] == "from prior"
+        assert snap["sma_crossover"]["operator"]["reason"] == "from prior"
+
+    def test_restore_cause_keyed_pauses_keeps_both_latches(
+        self, tmp_path, monkeypatch
+    ):
+        engine, _store, state_path = _build_engine(tmp_path)
+        monkeypatch.setattr(
+            "config.settings.OPERATOR_CONTROL_STATE_PATH", state_path
+        )
+        with open(state_path, "w") as fh:
+            json.dump(
+                {
+                    "schema_version": 2,
+                    "paused_strategies": {
+                        "leveraged_trend": {
+                            "operator": {"reason": "manual review"},
+                            "unexpected_protection": {
+                                "reason": "unexpected stop",
+                                "position_uid": "pos_abc",
+                            },
+                        }
+                    },
+                },
+                fh,
+            )
+
+        engine._restore_control_state()
+
+        snap = engine.risk.paused_strategies_snapshot()["leveraged_trend"]
+        assert set(snap) == {"operator", "unexpected_protection"}
+        assert engine.risk.resume_strategy(
+            strategy_name="leveraged_trend"
+        ) is True
+        assert engine.risk.is_strategy_paused("leveraged_trend") is True
+        assert set(
+            engine.risk.paused_strategies_snapshot()["leveraged_trend"]
+        ) == {"unexpected_protection"}
+
+    def test_unknown_cause_restores_fail_closed(self, tmp_path, monkeypatch):
+        engine, _store, state_path = _build_engine(tmp_path)
+        monkeypatch.setattr(
+            "config.settings.OPERATOR_CONTROL_STATE_PATH", state_path
+        )
+        with open(state_path, "w") as fh:
+            json.dump(
+                {
+                    "schema_version": 2,
+                    "paused_strategies": {
+                        "leveraged_trend": {
+                            "future_cause": {"reason": "newer writer"}
+                        }
+                    },
+                },
+                fh,
+            )
+
+        engine._restore_control_state()
+
+        assert engine.risk.is_strategy_paused("leveraged_trend") is True
+        causes = engine.risk.paused_strategies_snapshot()["leveraged_trend"]
+        assert set(causes) == {StrategyPauseCause.UNKNOWN_PERSISTED.value}
+        assert causes["unknown_persisted"]["original_cause"] == "future_cause"
 
     def test_restore_handles_mixed_halt_plus_pauses(self, tmp_path, monkeypatch):
         engine, store, state_path = _build_engine(tmp_path)
@@ -287,6 +351,80 @@ class TestProcessSymbolGate:
         assert risk.is_entries_paused() is False
         risk.pause_entries(reason="t", command_uid="c")
         assert risk.is_entries_paused() is True
+
+
+class TestUnexpectedProtectionResolution:
+    def _latched_engine(self, tmp_path, monkeypatch, *, open_orders):
+        engine, store, state_path = _build_engine(tmp_path)
+        monkeypatch.setattr(
+            "config.settings.OPERATOR_CONTROL_STATE_PATH", state_path
+        )
+        engine._session_start_equity = 100_000.0
+        row = SimpleNamespace(
+            position_uid="pos_abc123",
+            symbol="SPXL",
+            strategy="leveraged_trend",
+        )
+        engine.lifecycle_store = MagicMock()
+        engine.lifecycle_store.get_by_position_uid.return_value = row
+        engine.lifecycle_orders_store = MagicMock()
+        engine.lifecycle_orders_store.get_non_terminal_for_position.return_value = []
+        engine.broker.sync_with_broker.return_value = SimpleNamespace(
+            open_orders=open_orders,
+            account=SimpleNamespace(open_positions={}),
+        )
+        engine.risk.pause_strategy_cause(
+            strategy_name="leveraged_trend",
+            cause=StrategyPauseCause.UNEXPECTED_PROTECTION,
+            reason="unexpected stop",
+            position_uid=row.position_uid,
+        )
+        return engine, store
+
+    def test_resolution_clears_only_after_clean_proof(self, tmp_path, monkeypatch):
+        engine, store = self._latched_engine(
+            tmp_path, monkeypatch, open_orders=[]
+        )
+        uid = new_command_uid()
+        store.insert(
+            command_uid=uid,
+            action="resolve-unexpected-protection",
+            reason="broker stop canceled and substrate reconciled",
+            target_strategy="leveraged_trend",
+        )
+
+        engine._process_operator_commands()
+
+        row = store.get_by_command_uid(uid)
+        assert row.status == "succeeded"
+        assert row.result["reconciliation_proven_clean"] is True
+        assert engine.risk.is_strategy_paused("leveraged_trend") is False
+
+    def test_resolution_refuses_while_broker_stop_remains(
+        self, tmp_path, monkeypatch
+    ):
+        stop = SimpleNamespace(
+            symbol="SPXL",
+            side=Side.SELL,
+            stop_price=90.0,
+            order_id="stop-1",
+        )
+        engine, store = self._latched_engine(
+            tmp_path, monkeypatch, open_orders=[stop]
+        )
+        uid = new_command_uid()
+        store.insert(
+            command_uid=uid,
+            action="resolve-unexpected-protection",
+            reason="try clear",
+            target_strategy="leveraged_trend",
+        )
+
+        engine._process_operator_commands()
+
+        row = store.get_by_command_uid(uid)
+        assert row.status == "rejected_validation"
+        assert engine.risk.is_strategy_paused("leveraged_trend") is True
 
     def test_gate_per_strategy_is_scoped(self):
         risk = RiskManager()

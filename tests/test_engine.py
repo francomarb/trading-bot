@@ -47,6 +47,7 @@ from engine.trader import (
     TradingEngine,
     _donchian_exit_observation,
     _lookback_days,
+    _recent_bar_alignment_error,
 )
 from engine.lifecycle_orders import OrderEvent
 from execution.broker import (
@@ -67,6 +68,7 @@ from risk.manager import (
     RiskManager,
     Side,
 )
+from risk.models import ProtectionModel, SizingModel
 from strategies.base import (
     BaseStrategy,
     EdgeFilterDecision,
@@ -546,6 +548,67 @@ class TestLookbackDays:
 
 
 # ── _process_symbol: every branch ────────────────────────────────────────────
+
+
+class TestDualAssetBarAlignment:
+    """Signal and execution calendars must agree across the decision window."""
+
+    def test_older_coverage_difference_is_allowed(self):
+        execution = _bars(n=60)
+        signal = _bars(n=65)
+
+        assert _recent_bar_alignment_error(
+            execution.index,
+            signal.index,
+            required_bars=50,
+        ) is None
+
+    @pytest.mark.parametrize(
+        "mismatch",
+        ["missing-latest-signal", "missing-latest-execution", "internal-gap"],
+    )
+    def test_recent_mismatch_fails_closed_before_signal_evaluation(
+        self,
+        engine_factory,
+        monkeypatch,
+        mismatch,
+    ):
+        execution = _bars(n=60)
+        signal = execution.copy()
+        if mismatch == "missing-latest-signal":
+            signal = signal.iloc[:-1]
+        elif mismatch == "missing-latest-execution":
+            execution = execution.iloc[:-1]
+        else:
+            signal = signal.drop(signal.index[-10])
+
+        frames = {"SPXL": execution, "SPY": signal}
+
+        def _fetch(symbol, start, end, timeframe="1Day", **kwargs):
+            return frames[symbol], SimpleNamespace(api_calls=0)
+
+        monkeypatch.setattr("engine.trader.fetch_symbol", _fetch)
+        engine, broker = engine_factory(entries=[False] * 59 + [True])
+        engine.alerts = MagicMock()
+        strategy = engine.slots[0].strategy
+        snapshot = _snapshot()
+
+        engine._process_symbol(
+            "SPXL",
+            snapshot,
+            snapshot.account,
+            strategy,
+            engine.slots[0].timeframe,
+            signal_symbol="SPY",
+            data_feed="sip",
+        )
+
+        assert strategy.raw_calls == 0
+        broker.place_order.assert_not_called()
+        engine.alerts.stale_data.assert_called_once()
+        alert_message = engine.alerts.stale_data.call_args.args[1]
+        assert "dual-asset bars misaligned" in alert_message
+        assert "required_window=50" in alert_message
 
 
 class TestProcessSymbol:
@@ -2405,6 +2468,7 @@ class TestWatchlistStatuses:
             symbol="AAPL",
             owner="fake_strategy",
             position=snapshot.account.open_positions["AAPL"],
+            protection_model=ProtectionModel.BROKER_STOP,
         )
 
     # P-6: tests for the legacy _suspect_orders / _recover_suspect_orders
@@ -2416,6 +2480,143 @@ class TestWatchlistStatuses:
     #   - tests/test_apply_order_event.py::TestCycleReconcileStoreQuery
     #   - tests/test_apply_order_event.py::TestSubstrateEntryFillDispatchSemantics
     #   - tests/test_stream.py::TestLifecycleEventQueue
+
+
+class TestProtectionPolicyReconciliation:
+    """Lifecycle policy, not ticker identity, controls stop recovery."""
+
+    @staticmethod
+    def _open_signal_exit_lifecycle(engine: TradingEngine, symbol: str) -> None:
+        uid = "pos_" + "e" * 32
+        engine.lifecycle_store.create_pending(
+            position_uid=uid,
+            symbol=symbol,
+            owner_key=symbol,
+            strategy="leveraged_trend",
+            position_type="single_leg",
+            entry_qty=5.0,
+            sizing_model=SizingModel.NOTIONAL,
+            protection_model=ProtectionModel.SIGNAL_EXIT_ONLY,
+            approved_notional_dollars=500.0,
+            stated_leverage_multiplier=3.0,
+            stress_exposure_multiplier=3.0,
+            stated_effective_exposure_dollars=1500.0,
+            stress_effective_exposure_dollars=1500.0,
+        )
+        engine.lifecycle_store.mark_open(
+            position_uid=uid,
+            avg_entry_price=100.0,
+            current_qty=5.0,
+        )
+
+    def test_signal_exit_position_is_not_repaired_or_dust_closed(
+        self, engine_factory
+    ):
+        snapshot = _snapshot(
+            positions={"SPXL": Position("SPXL", 0.5, 100.0, 50.0)},
+            open_orders=[],
+        )
+        engine, broker = engine_factory(snapshot=snapshot)
+        engine._register_single_leg(
+            strategy_name="leveraged_trend", symbol="SPXL"
+        )
+        self._open_signal_exit_lifecycle(engine, "SPXL")
+        engine._reconstruct_missing_entry_context = MagicMock()
+        engine._close_fractional_residual_position = MagicMock()
+
+        engine._repair_missing_protective_stops(snapshot)
+
+        broker.place_protective_stop.assert_not_called()
+        broker.replace_day_stop_with_standalone_gtc.assert_not_called()
+        engine._reconstruct_missing_entry_context.assert_not_called()
+        engine._close_fractional_residual_position.assert_not_called()
+
+    def test_fractional_cleanup_helper_refuses_signal_exit_policy(
+        self, engine_factory
+    ):
+        position = Position("SPXL", 0.5, 100.0, 50.0)
+        snapshot = _snapshot(positions={"SPXL": position})
+        engine, broker = engine_factory(snapshot=snapshot)
+        engine._lookup_recent_stop_fill = MagicMock()
+
+        engine._close_fractional_residual_position(
+            snapshot=snapshot,
+            symbol="SPXL",
+            owner="leveraged_trend",
+            position=position,
+            protection_model=ProtectionModel.SIGNAL_EXIT_ONLY,
+        )
+
+        engine._lookup_recent_stop_fill.assert_not_called()
+        broker.close_position.assert_not_called()
+
+    def test_signal_exit_recovery_never_places_a_stop(self, engine_factory):
+        snapshot = _snapshot(
+            positions={"SPXL": Position("SPXL", 5.0, 100.0, 500.0)},
+            open_orders=[],
+        )
+        engine, broker = engine_factory(snapshot=snapshot)
+        decision = RiskDecision(
+            symbol="SPXL",
+            side=Side.BUY,
+            qty=5.0,
+            entry_reference_price=100.0,
+            stop_price=None,
+            strategy_name="leveraged_trend",
+            reason="substrate recovery",
+            sizing_model=SizingModel.NOTIONAL,
+            protection_model=ProtectionModel.SIGNAL_EXIT_ONLY,
+            approved_notional_dollars=500.0,
+            stated_leverage_multiplier=3.0,
+            stress_exposure_multiplier=3.0,
+            stated_effective_exposure_dollars=1500.0,
+            stress_effective_exposure_dollars=1500.0,
+        )
+
+        engine._ensure_recovered_protective_stop(
+            snapshot=snapshot,
+            position=snapshot.account.open_positions["SPXL"],
+            decision=decision,
+            fill_price=100.0,
+        )
+
+        broker.place_protective_stop.assert_not_called()
+        broker.submit_option_gtc_stop.assert_not_called()
+
+    def test_recovered_option_uses_option_stop_submission(self, engine_factory):
+        occ = "SPY260516C00520000"
+        snapshot = _snapshot(
+            positions={occ: Position(occ, 2.0, 10.0, 2000.0)},
+            open_orders=[],
+        )
+        engine, broker = engine_factory(snapshot=snapshot)
+        repaired = _open_stop_order(occ, 8.0)
+        broker.submit_option_gtc_stop.return_value = repaired
+        decision = RiskDecision(
+            symbol=occ,
+            side=Side.BUY,
+            qty=2.0,
+            entry_reference_price=10.0,
+            stop_price=8.0,
+            strategy_name="generic_single_leg_options",
+            reason="substrate recovery",
+            order_type=OrderType.LIMIT,
+            limit_price=10.0,
+        )
+
+        engine._ensure_recovered_protective_stop(
+            snapshot=snapshot,
+            position=snapshot.account.open_positions[occ],
+            decision=decision,
+            fill_price=10.0,
+        )
+
+        broker.submit_option_gtc_stop.assert_called_once()
+        kwargs = broker.submit_option_gtc_stop.call_args.kwargs
+        assert kwargs["symbol"] == occ
+        assert kwargs["qty"] == 2
+        assert kwargs["stop_price"] == 8.0
+        broker.place_protective_stop.assert_not_called()
 
 
 # ── Scanner cadence ────────────────────────────────────────────────────────

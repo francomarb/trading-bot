@@ -35,6 +35,8 @@ from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
 from typing import Iterable, Sequence
 
+from risk.models import ProtectionModel, SizingModel
+
 
 # ── Schema version ──
 
@@ -68,6 +70,13 @@ CREATE TABLE IF NOT EXISTS position_lifecycle_orders (
     intended_trigger_price        REAL,
     intended_limit_price          REAL,
     intended_take_profit_price    REAL,
+    sizing_model                  TEXT,
+    protection_model              TEXT,
+    approved_notional_dollars     REAL,
+    stated_leverage_multiplier    REAL,
+    stress_exposure_multiplier    REAL,
+    stated_effective_exposure_dollars REAL,
+    stress_effective_exposure_dollars REAL,
 
     -- Order relationships.
     parent_order_id               TEXT,
@@ -111,9 +120,85 @@ CREATE TABLE IF NOT EXISTS position_lifecycle_orders (
     last_observed_broker_updated_at TEXT,
     last_observed_at              TEXT    NOT NULL,
 
-    FOREIGN KEY(position_uid) REFERENCES position_lifecycle(position_uid)
+    FOREIGN KEY(position_uid) REFERENCES position_lifecycle(position_uid),
+    CHECK (
+        role NOT IN ('entry_primary', 'entry_residual')
+        OR (sizing_model IS NOT NULL AND protection_model IS NOT NULL)
+    ),
+    CHECK (sizing_model IS NULL OR sizing_model IN ('stop_distance', 'notional', 'defined_max_loss')),
+    CHECK (protection_model IS NULL OR protection_model IN ('broker_stop', 'signal_exit_only')),
+    CHECK (
+        role NOT IN ('entry_primary', 'entry_residual')
+        OR (sizing_model = 'stop_distance' AND protection_model = 'broker_stop')
+        OR (sizing_model = 'notional' AND protection_model = 'signal_exit_only')
+        OR sizing_model = 'defined_max_loss'
+    )
 );
 """
+
+
+# Additive SQLite migrations cannot retrofit the CHECK constraints from the
+# fresh-table DDL.  These triggers mirror that matrix for databases which
+# already had ``position_lifecycle_orders`` before the policy columns landed.
+_CREATE_POSITION_LIFECYCLE_ORDERS_POLICY_TRIGGERS_SQL = (
+    """
+    CREATE TRIGGER IF NOT EXISTS trg_lifecycle_orders_policy_insert
+    BEFORE INSERT ON position_lifecycle_orders
+    FOR EACH ROW
+    WHEN (NEW.sizing_model IS NOT NULL AND NEW.sizing_model NOT IN (
+              'stop_distance', 'notional', 'defined_max_loss'
+          ))
+      OR (NEW.protection_model IS NOT NULL AND NEW.protection_model NOT IN (
+              'broker_stop', 'signal_exit_only'
+          ))
+      OR (
+          NEW.role IN ('entry_primary', 'entry_residual')
+          AND (
+              NEW.sizing_model IS NULL
+              OR NEW.protection_model IS NULL
+              OR NOT (
+                  (NEW.sizing_model = 'stop_distance'
+                   AND NEW.protection_model = 'broker_stop')
+                  OR (NEW.sizing_model = 'notional'
+                      AND NEW.protection_model = 'signal_exit_only')
+                  OR NEW.sizing_model = 'defined_max_loss'
+              )
+          )
+      )
+    BEGIN
+        SELECT RAISE(ABORT, 'invalid lifecycle order risk policy');
+    END
+    """,
+    """
+    CREATE TRIGGER IF NOT EXISTS trg_lifecycle_orders_policy_update
+    BEFORE UPDATE OF role, sizing_model, protection_model
+    ON position_lifecycle_orders
+    FOR EACH ROW
+    WHEN (NEW.sizing_model IS NOT NULL AND NEW.sizing_model NOT IN (
+              'stop_distance', 'notional', 'defined_max_loss'
+          ))
+      OR (NEW.protection_model IS NOT NULL AND NEW.protection_model NOT IN (
+              'broker_stop', 'signal_exit_only'
+          ))
+      OR (
+          NEW.role IN ('entry_primary', 'entry_residual')
+          AND (
+              NEW.sizing_model IS NULL
+              OR NEW.protection_model IS NULL
+              OR NOT (
+                  (NEW.sizing_model = 'stop_distance'
+                   AND NEW.protection_model = 'broker_stop')
+                  OR (NEW.sizing_model = 'notional'
+                      AND NEW.protection_model = 'signal_exit_only')
+                  OR NEW.sizing_model = 'defined_max_loss'
+              )
+          )
+      )
+    BEGIN
+        SELECT RAISE(ABORT, 'invalid lifecycle order risk policy');
+    END
+    """,
+)
 
 
 # Unique constraints. Non-unique indexes don't enforce exactly-once
@@ -587,6 +672,13 @@ class PositionLifecycleOrderRow:
     intended_trigger_price: float | None
     intended_limit_price: float | None
     intended_take_profit_price: float | None
+    sizing_model: str | None
+    protection_model: str | None
+    approved_notional_dollars: float | None
+    stated_leverage_multiplier: float | None
+    stress_exposure_multiplier: float | None
+    stated_effective_exposure_dollars: float | None
+    stress_effective_exposure_dollars: float | None
 
     parent_order_id: str | None
     replaces_order_id: str | None
@@ -615,7 +707,10 @@ _SELECT_LIFECYCLE_ORDER_COLUMNS = (
     "SELECT id, position_uid, role, order_id, client_order_id, "
     "order_type, order_class, time_in_force, side, intended_qty, "
     "intended_stop_price, intended_trigger_price, intended_limit_price, "
-    "intended_take_profit_price, parent_order_id, replaces_order_id, "
+    "intended_take_profit_price, sizing_model, protection_model, "
+    "approved_notional_dollars, stated_leverage_multiplier, "
+    "stress_exposure_multiplier, stated_effective_exposure_dollars, "
+    "stress_effective_exposure_dollars, parent_order_id, replaces_order_id, "
     "origin_kind, operator_command_uid, "
     "slippage_benchmark_price, slippage_benchmark_kind, "
     "slippage_benchmark_timestamp, slippage_measurement_quality, "
@@ -642,22 +737,29 @@ def _row_from_tuple(row: tuple) -> PositionLifecycleOrderRow:
         intended_trigger_price=row[11],
         intended_limit_price=row[12],
         intended_take_profit_price=row[13],
-        parent_order_id=row[14],
-        replaces_order_id=row[15],
-        origin_kind=row[16],
-        operator_command_uid=row[17],
-        slippage_benchmark_price=row[18],
-        slippage_benchmark_kind=row[19],
-        slippage_benchmark_timestamp=row[20],
-        slippage_measurement_quality=row[21],
-        status=row[22],
-        filled_qty=row[23],
-        avg_fill_price=row[24],
-        created_at=row[25],
-        submitted_at=row[26],
-        terminal_at=row[27],
-        last_observed_broker_updated_at=row[28],
-        last_observed_at=row[29],
+        sizing_model=row[14],
+        protection_model=row[15],
+        approved_notional_dollars=row[16],
+        stated_leverage_multiplier=row[17],
+        stress_exposure_multiplier=row[18],
+        stated_effective_exposure_dollars=row[19],
+        stress_effective_exposure_dollars=row[20],
+        parent_order_id=row[21],
+        replaces_order_id=row[22],
+        origin_kind=row[23],
+        operator_command_uid=row[24],
+        slippage_benchmark_price=row[25],
+        slippage_benchmark_kind=row[26],
+        slippage_benchmark_timestamp=row[27],
+        slippage_measurement_quality=row[28],
+        status=row[29],
+        filled_qty=row[30],
+        avg_fill_price=row[31],
+        created_at=row[32],
+        submitted_at=row[33],
+        terminal_at=row[34],
+        last_observed_broker_updated_at=row[35],
+        last_observed_at=row[36],
     )
 
 
@@ -708,6 +810,13 @@ class PositionLifecycleOrdersStore:
         intended_trigger_price: float | None = None,
         intended_limit_price: float | None = None,
         intended_take_profit_price: float | None = None,
+        sizing_model: SizingModel | None = None,
+        protection_model: ProtectionModel | None = None,
+        approved_notional_dollars: float | None = None,
+        stated_leverage_multiplier: float | None = None,
+        stress_exposure_multiplier: float | None = None,
+        stated_effective_exposure_dollars: float | None = None,
+        stress_effective_exposure_dollars: float | None = None,
         parent_order_id: str | None = None,
         replaces_order_id: str | None = None,
         origin_kind: str = "bot",
@@ -744,6 +853,14 @@ class PositionLifecycleOrdersStore:
             raise ValueError(
                 f"intended_qty must be positive; got {intended_qty}"
             )
+        if role in ENTRY_SIDE_ROLES:
+            sizing_model = sizing_model or SizingModel.STOP_DISTANCE
+            protection_model = protection_model or ProtectionModel.BROKER_STOP
+            _validate_policy(sizing_model, protection_model)
+        elif sizing_model is not None or protection_model is not None:
+            if sizing_model is None or protection_model is None:
+                raise ValueError("order lifecycle policy must be supplied as a pair")
+            _validate_policy(sizing_model, protection_model)
 
         now = _utc_now_iso()
         cursor = self._conn.execute(
@@ -755,6 +872,10 @@ class PositionLifecycleOrdersStore:
                 intended_qty,
                 intended_stop_price, intended_trigger_price,
                 intended_limit_price, intended_take_profit_price,
+                sizing_model, protection_model, approved_notional_dollars,
+                stated_leverage_multiplier, stress_exposure_multiplier,
+                stated_effective_exposure_dollars,
+                stress_effective_exposure_dollars,
                 parent_order_id, replaces_order_id,
                 origin_kind, operator_command_uid,
                 slippage_benchmark_price, slippage_benchmark_kind,
@@ -768,6 +889,7 @@ class PositionLifecycleOrdersStore:
                 ?, ?, ?, ?,
                 ?,
                 ?, ?, ?, ?,
+                ?, ?, ?, ?, ?, ?, ?,
                 ?, ?,
                 ?, ?,
                 ?, ?, ?, ?,
@@ -783,6 +905,13 @@ class PositionLifecycleOrdersStore:
                 float(intended_qty),
                 intended_stop_price, intended_trigger_price,
                 intended_limit_price, intended_take_profit_price,
+                sizing_model.value if sizing_model is not None else None,
+                protection_model.value if protection_model is not None else None,
+                approved_notional_dollars,
+                stated_leverage_multiplier,
+                stress_exposure_multiplier,
+                stated_effective_exposure_dollars,
+                stress_effective_exposure_dollars,
                 parent_order_id, replaces_order_id,
                 origin_kind, operator_command_uid,
                 slippage_benchmark_price, slippage_benchmark_kind,
@@ -1229,6 +1358,12 @@ class PositionLifecycleOrdersStore:
                    plo.time_in_force, plo.side, plo.intended_qty,
                    plo.intended_stop_price, plo.intended_trigger_price,
                    plo.intended_limit_price, plo.intended_take_profit_price,
+                   plo.sizing_model, plo.protection_model,
+                   plo.approved_notional_dollars,
+                   plo.stated_leverage_multiplier,
+                   plo.stress_exposure_multiplier,
+                   plo.stated_effective_exposure_dollars,
+                   plo.stress_effective_exposure_dollars,
                    plo.parent_order_id, plo.replaces_order_id,
                    plo.origin_kind, plo.operator_command_uid,
                    plo.slippage_benchmark_price, plo.slippage_benchmark_kind,
@@ -1324,6 +1459,12 @@ class PositionLifecycleOrdersStore:
             "plo.time_in_force, plo.side, plo.intended_qty, "
             "plo.intended_stop_price, plo.intended_trigger_price, "
             "plo.intended_limit_price, plo.intended_take_profit_price, "
+            "plo.sizing_model, plo.protection_model, "
+            "plo.approved_notional_dollars, "
+            "plo.stated_leverage_multiplier, "
+            "plo.stress_exposure_multiplier, "
+            "plo.stated_effective_exposure_dollars, "
+            "plo.stress_effective_exposure_dollars, "
             "plo.parent_order_id, plo.replaces_order_id, "
             "plo.origin_kind, plo.operator_command_uid, "
             "plo.slippage_benchmark_price, plo.slippage_benchmark_kind, "
@@ -1385,6 +1526,28 @@ def _validate_role(role: str) -> None:
         raise ValueError(
             f"role must be one of {sorted(VALID_ORDER_ROLES)}; "
             f"got {role!r}"
+        )
+
+
+def _validate_policy(
+    sizing_model: SizingModel,
+    protection_model: ProtectionModel,
+) -> None:
+    if not isinstance(sizing_model, SizingModel):
+        raise TypeError("sizing_model must be a SizingModel")
+    if not isinstance(protection_model, ProtectionModel):
+        raise TypeError("protection_model must be a ProtectionModel")
+    valid = (
+        sizing_model is SizingModel.STOP_DISTANCE
+        and protection_model is ProtectionModel.BROKER_STOP
+    ) or (
+        sizing_model is SizingModel.NOTIONAL
+        and protection_model is ProtectionModel.SIGNAL_EXIT_ONLY
+    ) or sizing_model is SizingModel.DEFINED_MAX_LOSS
+    if not valid:
+        raise ValueError(
+            f"invalid sizing/protection policy: {sizing_model.value} + "
+            f"{protection_model.value}"
         )
 
 

@@ -613,6 +613,10 @@ STRATEGY_ALLOWED_REGIMES: dict[str, set[str]] = {
     # Credit spreads sell premium — never in BEAR or VOLATILE (a vol spike
     # is exactly when defined-risk shorts hit max loss). See design doc §3.
     "credit_spread": {"TRENDING", "RANGING"},
+    # Leveraged trend owns its benchmark-specific SMA200 regime. A second
+    # account-wide SPY regime gate would incorrectly suppress QQQ/XLK/SOXX
+    # signals and add noise to the deliberately slow state machine.
+    "leveraged_trend": {"TRENDING", "RANGING", "VOLATILE", "BEAR"},
 }
 
 # ── Capital allocation (Immediate allocator enhancements) ───────────────────
@@ -649,7 +653,7 @@ STRATEGY_ALLOCATIONS: dict[str, dict] = {
     # docs/allocator_risk_target_reconciliation.md §9. MAX_POSITION_PCT
     # remains the global hard ceiling above these.
     "sma_crossover": {
-        "target_pct": 0.40,
+        "target_pct": 0.30,
         "type": "equity",
         "priority": 3,
         "can_stretch": True,
@@ -658,7 +662,7 @@ STRATEGY_ALLOCATIONS: dict[str, dict] = {
         "risk_per_trade_pct": 0.006,   # 0.60% — covers watchlist ATR% ≥ 3.0 (all but GSAT)
     },
     "rsi_reversion": {
-        "target_pct": 0.20,
+        "target_pct": 0.15,
         "type": "equity",
         "priority": 1,
         "can_stretch": True,
@@ -667,13 +671,25 @@ STRATEGY_ALLOCATIONS: dict[str, dict] = {
         "risk_per_trade_pct": 0.0025,  # 0.25% — covers watchlist ATR% ≥ 2.0 (all but KBE)
     },
     "donchian_breakout": {
-        "target_pct": 0.25,
+        "target_pct": 0.15,
         "type": "equity",
         "priority": 2,
         "can_stretch": True,
         "hard_max_positions": 8,
         "max_position_pct_of_sleeve": 0.40,
         "risk_per_trade_pct": 0.004,   # 0.40% — covers watchlist ATR% ≥ 2.5 (full list; AAPL 2.6 is the floor)
+    },
+    # Paper-only leveraged-index sleeve: 25% of deployable capital = 20% of
+    # account equity at the 80% gross ceiling. Four equal pair slots request
+    # 5% of account equity each and cannot stretch. This is a correlated
+    # sleeve, so per-position concentration is fixed at one quarter.
+    "leveraged_trend": {
+        "target_pct": 0.25,
+        "type": "equity",
+        "priority": 5,
+        "can_stretch": False,
+        "hard_max_positions": 4,
+        "max_position_pct_of_sleeve": 0.25,
     },
     "spy_options_reversion": {
         "target_pct": 0.05,
@@ -1255,16 +1271,13 @@ OPERATOR_CONTROL_STATE_PATH: str = "data/operator_control_state.json"
 LIFECYCLE_PENDING_GRACE_SECONDS: int = 300
 
 
-# ── Leveraged-ETF trend monitor (dashboard-only) ─────────────────────────────
+# ── Leveraged-ETF trend monitor + paper strategy ─────────────────────────────
 #
-# Read-only operator monitor for leveraged funds held OUTSIDE this bot
-# (TQQQ, TECL, ...). It tracks the *unleveraged* underlying's daily close
-# against its 200-day SMA and reports a noise-filtered phase state.
-#
-# The bot does not and cannot trade these funds — `utils.asset_filters.
-# is_stock_like` rejects leveraged products. Nothing here is wired into the
-# trading loop; `monitors/leveraged_trend.py` is consumed by `dashboard.py`
-# alone.
+# The monitor and paper strategy share the benchmark/fund identity but retain
+# separate settings: the monitor may show context-only pairs, while the
+# tradable map below is an explicit static allowlist with per-pair risk and
+# confirmation parameters. Scanner stock-like heuristics remain unchanged;
+# leveraged products never enter another strategy through discovery.
 #
 # LEVERAGED_TREND_PAIRS maps underlying → the leveraged fund it governs, or
 #   None when the underlying is watched for context without a named fund.
@@ -1273,7 +1286,7 @@ LIFECYCLE_PENDING_GRACE_SECONDS: int = 300
 #   phased in 2026-04-14, XLK not until 2026-08-10).
 #
 # LEVERAGED_TREND_EXIT_DAYS / _ENTRY_DAYS are asymmetric on purpose. Exiting
-#   on 3 consecutive closes below reacts quickly to a breakdown; re-entering
+#   on 2 consecutive closes below reacts quickly to a breakdown; re-entering
 #   only after 5 consecutive closes above demands more confirmation, which is
 #   what suppresses flapping around the line. Both count COMPLETED sessions.
 #
@@ -1294,13 +1307,66 @@ LEVERAGED_TREND_PAIRS: dict[str, str | None] = {
     "QQQ": "TQQQ",
     "XLK": "TECL",
     "SPY": "SPXL",
-    "SMH": "SOXL",
+    # SOXX and SOXL share the NYSE Semiconductor Index benchmark.  SMH
+    # tracks a different 25-name MVIS index and is not a clean signal proxy.
+    "SOXX": "SOXL",
     "XLF": "FAS",
     "XLE": "ERX",
 }
 LEVERAGED_TREND_SMA_LENGTH: int = 200
-LEVERAGED_TREND_EXIT_DAYS: int = 3
+LEVERAGED_TREND_EXIT_DAYS: int = 2
 LEVERAGED_TREND_ENTRY_DAYS: int = 5
 LEVERAGED_TREND_FEED: str = os.getenv("LEVERAGED_TREND_FEED", "sip").lower()
 LEVERAGED_TREND_SESSION_COMPLETE_ET: str = "16:15"
 LEVERAGED_TREND_HISTORY_YEARS: int = 5
+
+# Paper activation is deliberately a paper-specific switch. If this remains
+# true during any future live-mode transition, forward_test.py refuses startup
+# instead of silently activating the strategy with live capital.
+LEVERAGED_TREND_PAPER_ENABLED: bool = os.getenv(
+    "LEVERAGED_TREND_PAPER_ENABLED", "true"
+).lower() in ("true", "1", "yes")
+
+# Per-pair strategy policy. Each target is 5% of account equity, for a maximum
+# 20% actual-notional sleeve when all four positions are open. The fund's 3x
+# daily target and the currently selected 3x stress-accounting multiplier are
+# persisted separately so the latter can be recalibrated without rewriting
+# historical positions. No hard stop is configured; exits are signal-only.
+LEVERAGED_TREND_INSTRUMENTS: dict[str, dict[str, float | int | str]] = {
+    "SPY": {
+        "trading_symbol": "SPXL",
+        "sma_length": 200,
+        "entry_days": 5,
+        "exit_days": 2,
+        "target_notional_pct": 0.05,
+        "stated_leverage_multiplier": 3.0,
+        "stress_exposure_multiplier": 3.0,
+    },
+    "QQQ": {
+        "trading_symbol": "TQQQ",
+        "sma_length": 200,
+        "entry_days": 5,
+        "exit_days": 2,
+        "target_notional_pct": 0.05,
+        "stated_leverage_multiplier": 3.0,
+        "stress_exposure_multiplier": 3.0,
+    },
+    "XLK": {
+        "trading_symbol": "TECL",
+        "sma_length": 200,
+        "entry_days": 5,
+        "exit_days": 2,
+        "target_notional_pct": 0.05,
+        "stated_leverage_multiplier": 3.0,
+        "stress_exposure_multiplier": 3.0,
+    },
+    "SOXX": {
+        "trading_symbol": "SOXL",
+        "sma_length": 200,
+        "entry_days": 5,
+        "exit_days": 2,
+        "target_notional_pct": 0.05,
+        "stated_leverage_multiplier": 3.0,
+        "stress_exposure_multiplier": 3.0,
+    },
+}

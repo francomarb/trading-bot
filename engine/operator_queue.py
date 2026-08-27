@@ -144,6 +144,7 @@ VALID_ACTIONS = frozenset({
     "resume-entries",
     "pause-strategy",
     "resume-strategy",
+    "resolve-unexpected-protection",
     "close-position",
     "reduce-position",
     "cancel-position-orders",

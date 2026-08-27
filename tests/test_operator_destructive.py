@@ -22,6 +22,7 @@ from __future__ import annotations
 
 import sqlite3
 from datetime import datetime, timezone
+from types import SimpleNamespace
 from unittest.mock import MagicMock
 
 import pytest
@@ -705,6 +706,52 @@ class TestReviewFindings:
         assert row.result["is_full_close"] is True
         assert "degraded" not in row.result
         assert "protection_status" not in row.result
+
+    @pytest.mark.parametrize("action", ["close-position", "reduce-position"])
+    def test_invalid_persisted_policy_fails_safe_to_broker_stop_reporting(
+        self, tmp_path, action
+    ):
+        """Operator paths must not crash while interpreting legacy/corrupt
+        policy text.  The shared lifecycle resolver fails safe to the stopped
+        posture, so a residual is reported as awaiting stop repair."""
+        engine, queue = _build_engine(tmp_path, broker_qty=10.0)
+        pos_uid = _seed_open_lifecycle(engine)
+        engine.lifecycle_store.get_open_for_owner_key = MagicMock(
+            return_value=SimpleNamespace(
+                sizing_model="broken",
+                protection_model="broken",
+            )
+        )
+        requested_qty = 10.0 if action == "close-position" else 3.0
+        engine.broker.close_position.return_value = OrderResult(
+            status=(
+                OrderStatus.PARTIAL
+                if action == "close-position"
+                else OrderStatus.FILLED
+            ),
+            order_id="policy-fallback",
+            symbol="AAPL",
+            requested_qty=requested_qty,
+            filled_qty=3.0,
+            avg_fill_price=108.0,
+            raw_status="partially_filled",
+        )
+        engine._record_realized_pnl = MagicMock()
+
+        command_uid = new_command_uid()
+        queue.insert(
+            command_uid=command_uid,
+            action=action,
+            reason="test corrupt policy fallback",
+            target_position_uid=pos_uid,
+            params={"pct": 30} if action == "reduce-position" else None,
+        )
+        engine._process_operator_commands()
+
+        row = queue.get_by_command_uid(command_uid)
+        assert row.status == "succeeded"
+        assert row.result.get("degraded") is True
+        assert row.result.get("protection_status") == "pending_repair_cycle"
 
     # ── N: close-position zero-fill defensive guard ──
 

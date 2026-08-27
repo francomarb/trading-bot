@@ -58,6 +58,7 @@ from typing import Deque
 from loguru import logger
 
 from config import settings
+from risk.models import ProtectionModel, SizingModel, StrategyPauseCause
 from strategies.base import OrderType
 
 
@@ -122,6 +123,12 @@ def candidate_entry_risk(decision: "RiskDecision") -> float:
     Equity single-leg only — the heat cap (PLAN 11.60) applies to equity
     breakout sleeves, and options paths size through their own envelopes.
     """
+    if decision.sizing_model is not SizingModel.STOP_DISTANCE:
+        raise ValueError(
+            "candidate_entry_risk is only defined for STOP_DISTANCE decisions"
+        )
+    if decision.stop_price is None:
+        raise ValueError("STOP_DISTANCE decision is missing stop_price")
     entry, _ = worst_case_entry_price(decision)
     return max(0.0, (entry - float(decision.stop_price)) * float(decision.qty))
 
@@ -163,7 +170,7 @@ class Signal:
     side: Side
     strategy_name: str
     reference_price: float
-    atr: float
+    atr: float | None
     reason: str = ""  # human-readable trade thesis (logged with the decision)
     # Strategy declares its preferred entry order type (PLAN 4.8). Hard-risk
     # exits (stop-outs, circuit breakers) are always market regardless.
@@ -181,6 +188,18 @@ class Signal:
     # PLAN 11.47 STOP_LIMIT entries: broker-resting stop trigger above the
     # prior-N-day high. Required only when order_type is STOP_LIMIT.
     entry_trigger_price: float | None = None
+    # Orthogonal lifecycle policy. Existing strategies retain the stopped,
+    # stop-distance defaults; stopless strategies must opt in explicitly.
+    sizing_model: SizingModel = SizingModel.STOP_DISTANCE
+    protection_model: ProtectionModel = ProtectionModel.BROKER_STOP
+    # Requested account-equity slice for NOTIONAL sizing. RiskManager applies
+    # every universal cash, sleeve, concentration, gross, and halt cap after
+    # this request; the strategy never approves its own final size.
+    target_notional_pct: float | None = None
+    # Daily leverage target and separately calibrated conservative exposure
+    # multiplier. They are persisted independently on the admitted decision.
+    stated_leverage_multiplier: float = 1.0
+    stress_exposure_multiplier: float = 1.0
 
 
 class RejectionCode(str, Enum):
@@ -226,7 +245,7 @@ class RiskDecision:
     side: Side
     qty: float  # int when FRACTIONAL_ENABLED=False, float (2 dp) when True
     entry_reference_price: float
-    stop_price: float
+    stop_price: float | None
     strategy_name: str
     reason: str
     # Strategy-chosen entry type. Phase 7 broker reads this and routes
@@ -249,8 +268,15 @@ class RiskDecision:
     # either — caps and whole-share flooring break the identity, giving
     # ANET $895 against a ~$398 budget.
     risk_budget_dollars: float | None = None
+    sizing_model: SizingModel = SizingModel.STOP_DISTANCE
+    protection_model: ProtectionModel = ProtectionModel.BROKER_STOP
+    approved_notional_dollars: float | None = None
+    stated_leverage_multiplier: float = 1.0
+    stress_exposure_multiplier: float = 1.0
+    stated_effective_exposure_dollars: float | None = None
+    stress_effective_exposure_dollars: float | None = None
 
-    def stop_for_fill(self, fill_price: float | None) -> float:
+    def stop_for_fill(self, fill_price: float | None) -> float | None:
         """Protective stop re-anchored to the price we actually filled at.
 
         `stop_price` is computed from `entry_reference_price`, which is
@@ -299,6 +325,10 @@ class RiskDecision:
         was deleted rather than left as a trap. The engine derives the
         offset from `k × TradingEngine._last_atr[symbol]` instead.
         """
+        if self.protection_model is ProtectionModel.SIGNAL_EXIT_ONLY:
+            return None
+        if self.stop_price is None:
+            return None
         if self.order_type is OrderType.STOP_LIMIT:
             return self.stop_price
         if fill_price is None:
@@ -331,18 +361,52 @@ class RiskDecision:
             raise ValueError(
                 f"entry_reference_price must be positive, got {self.entry_reference_price}"
             )
-        if self.stop_price <= 0:
-            raise ValueError(f"stop_price must be positive, got {self.stop_price}")
-        if self.side is Side.BUY and self.stop_price >= self.entry_reference_price:
-            raise ValueError(
-                "long stop must be strictly below entry "
-                f"(entry={self.entry_reference_price}, stop={self.stop_price})"
-            )
-        if self.side is Side.SELL and self.stop_price <= self.entry_reference_price:
-            raise ValueError(
-                "short stop must be strictly above entry "
-                f"(entry={self.entry_reference_price}, stop={self.stop_price})"
-            )
+        if not isinstance(self.sizing_model, SizingModel):
+            raise TypeError("sizing_model must be a SizingModel")
+        if not isinstance(self.protection_model, ProtectionModel):
+            raise TypeError("protection_model must be a ProtectionModel")
+        if self.sizing_model is SizingModel.STOP_DISTANCE:
+            if self.protection_model is not ProtectionModel.BROKER_STOP:
+                raise ValueError("STOP_DISTANCE requires BROKER_STOP protection")
+            if self.stop_price is None or self.stop_price <= 0:
+                raise ValueError(f"stop_price must be positive, got {self.stop_price}")
+        elif self.sizing_model is SizingModel.NOTIONAL:
+            if self.protection_model is not ProtectionModel.SIGNAL_EXIT_ONLY:
+                raise ValueError("NOTIONAL requires SIGNAL_EXIT_ONLY in V1")
+            if self.stop_price is not None:
+                raise ValueError("NOTIONAL + SIGNAL_EXIT_ONLY requires stop_price=None")
+            if self.order_type is not OrderType.MARKET:
+                raise ValueError(
+                    "SIGNAL_EXIT_ONLY supports MARKET entries only in V1"
+                )
+            if self.entry_max_price is not None:
+                raise ValueError(
+                    "SIGNAL_EXIT_ONLY does not support entry_max_price in V1"
+                )
+            if (
+                self.approved_notional_dollars is None
+                or self.approved_notional_dollars <= 0
+            ):
+                raise ValueError(
+                    "NOTIONAL decision requires positive approved_notional_dollars"
+                )
+        else:
+            raise ValueError("DEFINED_MAX_LOSS is not supported by RiskDecision V1")
+        if self.stated_leverage_multiplier <= 0:
+            raise ValueError("stated_leverage_multiplier must be positive")
+        if self.stress_exposure_multiplier <= 0:
+            raise ValueError("stress_exposure_multiplier must be positive")
+        if self.stop_price is not None:
+            if self.side is Side.BUY and self.stop_price >= self.entry_reference_price:
+                raise ValueError(
+                    "long stop must be strictly below entry "
+                    f"(entry={self.entry_reference_price}, stop={self.stop_price})"
+                )
+            if self.side is Side.SELL and self.stop_price <= self.entry_reference_price:
+                raise ValueError(
+                    "short stop must be strictly above entry "
+                    f"(entry={self.entry_reference_price}, stop={self.stop_price})"
+                )
         if self.order_type is OrderType.LIMIT and (
             self.limit_price is None or self.limit_price <= 0
         ):
@@ -419,7 +483,11 @@ class RiskDecision:
                     "entry_max_price is for capping MARKET entries; "
                     "STOP_LIMIT orders cap their fill via limit_price"
                 )
-            if self.side is Side.BUY and self.entry_max_price < self.stop_price:
+            if (
+                self.side is Side.BUY
+                and self.stop_price is not None
+                and self.entry_max_price < self.stop_price
+            ):
                 raise ValueError(
                     f"BUY entry_max_price {self.entry_max_price} must be "
                     f">= stop_price {self.stop_price}"
@@ -557,7 +625,7 @@ class RiskManager:
         self._entries_paused: bool = False
         self._entries_paused_reason: str | None = None
         self._entries_paused_command_uid: str | None = None
-        self._paused_strategies: dict[str, dict] = {}
+        self._paused_strategies: dict[str, dict[str, dict]] = {}
 
     # ── Kill-switch state ────────────────────────────────────────────────
 
@@ -621,7 +689,10 @@ class RiskManager:
         """Read-only snapshot of paused-strategy metadata. Returns a
         deep copy so callers (CLI / dashboard / engine_state.json)
         can iterate without holding a reference into RiskManager state."""
-        return {name: dict(meta) for name, meta in self._paused_strategies.items()}
+        return {
+            name: {cause: dict(meta) for cause, meta in causes.items()}
+            for name, causes in self._paused_strategies.items()
+        }
 
     def pause_entries(
         self,
@@ -669,42 +740,91 @@ class RiskManager:
         reason: str,
         command_uid: str | None = None,
     ) -> bool:
-        """Pause entries for one strategy only.
+        """Add the operator-controlled pause cause for one strategy.
 
         Returns True if state changed, False if the strategy was
         already paused.
         """
+        return self.pause_strategy_cause(
+            strategy_name=strategy_name,
+            cause=StrategyPauseCause.OPERATOR,
+            reason=reason,
+            command_uid=command_uid,
+        )
+
+    def pause_strategy_cause(
+        self,
+        *,
+        strategy_name: str,
+        cause: StrategyPauseCause,
+        reason: str,
+        command_uid: str | None = None,
+        position_uid: str | None = None,
+        original_cause: str | None = None,
+    ) -> bool:
+        """Add one independent strategy-pause cause.
+
+        Causes are idempotent individually. An operator pause never masks an
+        unexpected-protection latch, and vice versa.
+        """
         if not strategy_name:
             raise ValueError("strategy_name must not be empty")
-        if strategy_name in self._paused_strategies:
+        if not isinstance(cause, StrategyPauseCause):
+            raise TypeError("cause must be a StrategyPauseCause")
+        causes = self._paused_strategies.setdefault(strategy_name, {})
+        if cause.value in causes:
             return False
         from datetime import datetime, timezone
 
-        self._paused_strategies[strategy_name] = {
+        meta = {
             "reason": reason,
             "command_uid": command_uid,
-            "paused_at": datetime.now(timezone.utc).isoformat(),
+            "detected_at": datetime.now(timezone.utc).isoformat(),
+            "position_uid": position_uid,
         }
+        if original_cause is not None:
+            meta["original_cause"] = original_cause
+        causes[cause.value] = meta
         logger.warning(
-            f"RiskManager strategy '{strategy_name}' paused: {reason} "
+            f"RiskManager strategy '{strategy_name}' paused "
+            f"[{cause.value}]: {reason} "
             f"(cmd={(command_uid or '-')[:18]}…)"
         )
         return True
 
     def resume_strategy(self, *, strategy_name: str) -> bool:
-        """Clear the per-strategy pause flag for one strategy.
+        """Clear only the operator pause cause for one strategy.
 
         Returns True if state changed, False if the strategy was not
         paused.
         """
+        return self.resume_strategy_cause(
+            strategy_name=strategy_name,
+            cause=StrategyPauseCause.OPERATOR,
+        )
+
+    def resume_strategy_cause(
+        self,
+        *,
+        strategy_name: str,
+        cause: StrategyPauseCause,
+    ) -> bool:
+        """Clear exactly one pause cause, leaving other latches intact."""
         if not strategy_name:
             raise ValueError("strategy_name must not be empty")
-        meta = self._paused_strategies.pop(strategy_name, None)
+        if not isinstance(cause, StrategyPauseCause):
+            raise TypeError("cause must be a StrategyPauseCause")
+        causes = self._paused_strategies.get(strategy_name)
+        if not causes:
+            return False
+        meta = causes.pop(cause.value, None)
         if meta is None:
             return False
+        if not causes:
+            self._paused_strategies.pop(strategy_name, None)
         logger.info(
-            f"RiskManager strategy '{strategy_name}' resumed "
-            f"(prior reason: {meta.get('reason')!r})"
+            f"RiskManager strategy '{strategy_name}' pause cleared "
+            f"[{cause.value}] (prior reason: {meta.get('reason')!r})"
         )
         return True
 
@@ -1156,6 +1276,48 @@ class RiskManager:
             )
         return raw_qty
 
+    def _size_notional_position(
+        self,
+        signal: Signal,
+        account: AccountState,
+        *,
+        notional_cap: float | None,
+    ) -> tuple[float, float]:
+        """Size a stopless entry from requested notional, then apply all caps.
+
+        Returns ``(qty, approved_notional_dollars)``. The strategy requests an
+        account-equity slice; RiskManager remains authoritative by clipping it
+        to the global position cap, remaining gross budget, cash, and allocator
+        sleeve budget. No stop-derived value participates in this path.
+        """
+        if signal.target_notional_pct is None:
+            raise ValueError("NOTIONAL signal requires target_notional_pct")
+        price = float(signal.entry_max_price or signal.reference_price)
+        requested = account.equity * signal.target_notional_pct
+        max_position = account.equity * self.max_position_notional_pct
+        max_gross = account.equity * self.max_gross_exposure_pct
+        remaining_gross = max(0.0, max_gross - account.gross_exposure())
+        caps = [requested, max_position, remaining_gross]
+        if signal.side is Side.BUY:
+            caps.append(max(0.0, account.cash))
+        if notional_cap is not None:
+            caps.append(max(0.0, notional_cap))
+        approved_ceiling = min(caps)
+        if approved_ceiling <= 0 or price <= 0:
+            return 0.0, 0.0
+
+        fractional = (
+            settings.FRACTIONAL_ENABLED
+            and signal.order_type is OrderType.MARKET
+        )
+        qty = (
+            math.floor((approved_ceiling / price) * 100) / 100
+            if fractional
+            else float(math.floor(approved_ceiling / price))
+        )
+        approved = qty * price
+        return max(qty, 0.0), max(approved, 0.0)
+
     @staticmethod
     def _reject(
         code: RejectionCode, message: str, signal: Signal
@@ -1196,16 +1358,87 @@ class RiskManager:
         now = now or datetime.now(timezone.utc)
 
         # 1. Signal validation — reject malformed inputs up front.
+        if not isinstance(signal.sizing_model, SizingModel):
+            return self._reject(
+                RejectionCode.INVALID_SIGNAL,
+                "sizing_model must be a SizingModel",
+                signal,
+            )
+        if not isinstance(signal.protection_model, ProtectionModel):
+            return self._reject(
+                RejectionCode.INVALID_SIGNAL,
+                "protection_model must be a ProtectionModel",
+                signal,
+            )
+        if signal.stated_leverage_multiplier <= 0:
+            return self._reject(
+                RejectionCode.INVALID_SIGNAL,
+                "stated_leverage_multiplier must be positive",
+                signal,
+            )
+        if signal.stress_exposure_multiplier <= 0:
+            return self._reject(
+                RejectionCode.INVALID_SIGNAL,
+                "stress_exposure_multiplier must be positive",
+                signal,
+            )
         if signal.reference_price <= 0:
             return self._reject(
                 RejectionCode.INVALID_SIGNAL,
                 f"reference_price must be > 0, got {signal.reference_price}",
                 signal,
             )
-        if signal.atr <= 0 or math.isnan(signal.atr):
+        if (
+            signal.sizing_model is SizingModel.STOP_DISTANCE
+            and (
+                signal.atr is None
+                or signal.atr <= 0
+                or math.isnan(signal.atr)
+            )
+        ):
             return self._reject(
                 RejectionCode.INVALID_SIGNAL,
                 f"atr must be > 0, got {signal.atr}",
+                signal,
+            )
+        if signal.sizing_model is SizingModel.NOTIONAL:
+            if signal.protection_model is not ProtectionModel.SIGNAL_EXIT_ONLY:
+                return self._reject(
+                    RejectionCode.INVALID_SIGNAL,
+                    "NOTIONAL requires SIGNAL_EXIT_ONLY in V1",
+                    signal,
+                )
+            if (
+                signal.target_notional_pct is None
+                or not 0 < signal.target_notional_pct <= 1
+            ):
+                return self._reject(
+                    RejectionCode.INVALID_SIGNAL,
+                    "NOTIONAL target_notional_pct must be in (0, 1]",
+                    signal,
+                )
+            if signal.stop_price_override is not None:
+                return self._reject(
+                    RejectionCode.INVALID_SIGNAL,
+                    "NOTIONAL + SIGNAL_EXIT_ONLY must not carry a stop override",
+                    signal,
+                )
+            if signal.order_type is not OrderType.MARKET:
+                return self._reject(
+                    RejectionCode.INVALID_SIGNAL,
+                    "SIGNAL_EXIT_ONLY supports MARKET entries only in V1",
+                    signal,
+                )
+            if signal.entry_max_price is not None:
+                return self._reject(
+                    RejectionCode.INVALID_SIGNAL,
+                    "SIGNAL_EXIT_ONLY does not support entry_max_price in V1",
+                    signal,
+                )
+        elif signal.protection_model is not ProtectionModel.BROKER_STOP:
+            return self._reject(
+                RejectionCode.INVALID_SIGNAL,
+                "STOP_DISTANCE requires BROKER_STOP protection",
                 signal,
             )
         if account.equity <= 0:
@@ -1305,26 +1538,39 @@ class RiskManager:
                 signal,
             )
 
-        # 6. Stop & sizing.
-        stop_price = self._stop_price_for(signal)
-        if stop_price <= 0:
-            return self._reject(
-                RejectionCode.INVALID_STOP,
-                f"computed stop price {stop_price} is non-positive",
-                signal,
-            )
-        if signal.side is Side.BUY and stop_price >= signal.reference_price:
-            return self._reject(
-                RejectionCode.INVALID_STOP,
-                f"long stop {stop_price} not below entry {signal.reference_price}",
-                signal,
-            )
+        # 6. Sizing and, only where required, stop construction.
+        stop_price: float | None = None
+        approved_notional: float | None = None
+        if signal.sizing_model is SizingModel.NOTIONAL:
+            try:
+                qty, approved_notional = self._size_notional_position(
+                    signal, account, notional_cap=notional_cap
+                )
+            except ValueError as exc:
+                return self._reject(
+                    RejectionCode.INVALID_SIGNAL, str(exc), signal
+                )
+        else:
+            stop_price = self._stop_price_for(signal)
+            if stop_price <= 0:
+                return self._reject(
+                    RejectionCode.INVALID_STOP,
+                    f"computed stop price {stop_price} is non-positive",
+                    signal,
+                )
+            if signal.side is Side.BUY and stop_price >= signal.reference_price:
+                return self._reject(
+                    RejectionCode.INVALID_STOP,
+                    f"long stop {stop_price} not below entry {signal.reference_price}",
+                    signal,
+                )
         # STOP_LIMIT-specific: the protective stop must sit strictly below
         # the arming trigger so the OTO leg never enters a crossed state at
         # submit time. Reject as INVALID_STOP rather than letting RiskDecision
         # raise — keeps the engine's rejection-handling path uniform.
         if (
-            signal.order_type is OrderType.STOP_LIMIT
+            stop_price is not None
+            and signal.order_type is OrderType.STOP_LIMIT
             and signal.side is Side.BUY
             and signal.entry_trigger_price is not None
             and stop_price >= signal.entry_trigger_price
@@ -1336,14 +1582,18 @@ class RiskManager:
                 signal,
             )
 
-        qty = self._size_position(signal, stop_price, account, notional_cap=notional_cap)
+        if signal.sizing_model is SizingModel.STOP_DISTANCE:
+            assert stop_price is not None
+            qty = self._size_position(
+                signal, stop_price, account, notional_cap=notional_cap
+            )
 
         # Live-trading size multiplier (10.G1): scale down on first live exposure.
         # PLAN 11.47 R2 P1: only apply when sizing produced a positive qty.
-        # max(1, ...) and max(0.01, ...) below were reviving a zero-share
-        # sizing rejection back into a 1-share / 0.01-share order, which on
-        # STOP_LIMIT violates the never-round-up-beyond-budget invariant.
-        # Letting qty stay 0 falls into the POSITION_TOO_SMALL branch below.
+        # Minimum-share floors here used to revive either a zero-share sizing
+        # rejection or a positive quantity that scaled below broker
+        # granularity. Letting qty stay 0 preserves the approved risk budget
+        # and falls into the POSITION_TOO_SMALL branch below.
         if (
             qty > 0
             and settings.LIVE_TRADING
@@ -1354,12 +1604,15 @@ class RiskManager:
                 and signal.order_type is OrderType.MARKET
             )
             if _is_fractional:
-                qty = max(
-                    0.01,
-                    math.floor(qty * settings.LIVE_SIZE_MULTIPLIER * 100) / 100,
+                qty = (
+                    math.floor(qty * settings.LIVE_SIZE_MULTIPLIER * 100) / 100
                 )
             else:
-                qty = max(1, math.floor(qty * settings.LIVE_SIZE_MULTIPLIER))
+                qty = math.floor(qty * settings.LIVE_SIZE_MULTIPLIER)
+            if signal.sizing_model is SizingModel.NOTIONAL:
+                approved_notional = qty * float(
+                    signal.entry_max_price or signal.reference_price
+                )
 
         if qty <= 0:
             # Distinguish gross-exposure exhaustion from cash exhaustion for
@@ -1382,11 +1635,15 @@ class RiskManager:
                     f"${signal.reference_price:.2f}",
                     signal,
                 )
+            detail = (
+                f"requested_notional_pct={signal.target_notional_pct}"
+                if signal.sizing_model is SizingModel.NOTIONAL
+                else f"stop_distance=${abs(signal.reference_price - float(stop_price)):.4f}"
+            )
             return self._reject(
                 RejectionCode.POSITION_TOO_SMALL,
                 f"sized position rounds to 0 shares "
-                f"(equity=${account.equity:.2f}, stop_distance="
-                f"${abs(signal.reference_price - stop_price):.4f})",
+                f"(equity=${account.equity:.2f}, {detail})",
                 signal,
             )
 
@@ -1409,11 +1666,29 @@ class RiskManager:
             # be reconstructed from current config.
             risk_budget_dollars=self.risk_budget_dollars(
                 account, signal.strategy_name,
+            ) if signal.sizing_model is SizingModel.STOP_DISTANCE else None,
+            sizing_model=signal.sizing_model,
+            protection_model=signal.protection_model,
+            approved_notional_dollars=approved_notional,
+            stated_leverage_multiplier=signal.stated_leverage_multiplier,
+            stress_exposure_multiplier=signal.stress_exposure_multiplier,
+            stated_effective_exposure_dollars=(
+                approved_notional * signal.stated_leverage_multiplier
+                if approved_notional is not None else None
             ),
+            stress_effective_exposure_dollars=(
+                approved_notional * signal.stress_exposure_multiplier
+                if approved_notional is not None else None
+            ),
+        )
+        protection = (
+            f"stop ${decision.stop_price:.2f}"
+            if decision.stop_price is not None
+            else "signal-exit protection"
         )
         logger.info(
             f"risk approved {decision.symbol}: {decision.qty} shares @ "
-            f"${decision.entry_reference_price:.2f}, stop ${decision.stop_price:.2f} "
+            f"${decision.entry_reference_price:.2f}, {protection} "
             f"({decision.strategy_name})"
         )
         return decision

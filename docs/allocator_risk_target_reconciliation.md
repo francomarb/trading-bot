@@ -122,7 +122,9 @@ Notes:
   the table's coverage math scales linearly.
 - `MAX_POSITION_PCT = 0.02` remains as the global hard ceiling / validation
   bound; the new per-strategy targets sit beneath it.
-- `LIVE_SIZE_MULTIPLIER` continues to apply after sizing, unchanged.
+- `LIVE_SIZE_MULTIPLIER` continues to apply after sizing. If downward scaling
+  falls below whole/fractional share granularity, the entry rejects as
+  `POSITION_TOO_SMALL`; the multiplier never rounds the trade back up.
 
 ## 7. Implementation sketch (single PR once §6 is signed off)
 

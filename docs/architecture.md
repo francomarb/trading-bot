@@ -47,6 +47,22 @@ Watchlist → raw strategy signal → edge filter (+ sector momentum/IV) → reg
 
 For single-leg options, the execution path diverges after the risk manager: the broker detects the OCC symbol and dispatches an `OptionsExecutionWorker` thread that handles the async limit-entry + bracket lifecycle independently of the engine loop. Multi-leg options strategies such as credit spreads bypass `RiskManager.evaluate` after the sleeve check because max loss is defined by the spread; they route through the MLEG combo path and `SpreadExecutionWorker`.
 
+Single-leg equity lifecycle policy is explicit and durable. Traditional
+strategies use `STOP_DISTANCE + BROKER_STOP`; intentionally stopless trend
+positions use `NOTIONAL + SIGNAL_EXIT_ONLY`. Repair and restart code reads that
+persisted policy rather than inferring from a ticker or strategy name. A
+`StrategySlot` may also map an execution symbol to a distinct signal symbol and
+select a per-slot data feed; leveraged trend uses this contract for
+benchmark-close signals and 3x-fund execution on delayed SIP daily bars.
+The engine requires exact timestamp parity across the recent strategy/ATR
+decision window before joining dual-asset frames. A mismatch alerts and skips
+the symbol for that cycle instead of silently evaluating a shortened calendar.
+Fresh and migrated lifecycle databases enforce the policy matrix at the
+database boundary (fresh-table constraints plus migration-safe triggers).
+Signal-exit-only V1 entries are deliberately uncapped DAY market orders;
+non-market or price-capped shapes fail before submission rather than silently
+losing their requested price control.
+
 ---
 
 ## Project Structure
@@ -92,6 +108,7 @@ trading-bot/
 │   ├── donchian_breakout.py   # Trend-continuation: Turtle System 1 (30/15, ai_bigtech)
 │   ├── spy_options_reversion.py  # Options mean-reversion: SPY calls on RSI recovery
 │   ├── credit_spread.py       # Defined-risk bull put credit spreads (SPY + QQQ)
+│   ├── leveraged_trend.py     # Research-only: underlying SMA phase → aligned 3x ETF
 │   ├── filters/
 │   │   ├── common.py          # SPYTrendFilter + CompositeEdgeFilter
 │   │   ├── sma_crossover.py   # SMAEdgeFilter: stock > 200 SMA, volume expansion
@@ -155,6 +172,7 @@ trading-bot/
 │   ├── __init__.py
 │   ├── runner.py              # vectorbt backtesting harness
 │   ├── reconcile.py           # Forward-test reconciliation (paper vs backtest)
+│   ├── leveraged_trend.py     # SIP pair alignment + confirmation-grid research
 │   └── spy_options_backtest.py  # SPY options strategy backtester (daily proxy)
 │
 ├── scripts/
@@ -162,6 +180,7 @@ trading-bot/
 │   ├── gonogo.py              # Go/no-go checker for live readiness
 │   ├── build_envelopes.py     # Builds per-strategy backtest envelopes (health monitor)
 │   ├── calibrate_health_thresholds.py  # Health-threshold diff suggestions from N weeks of data
+│   ├── backtest_leveraged_trend.py  # Reproducible SIP grid/report (research only)
 │   ├── strategy_health_review.py  # On-demand strategy health/edge report CLI
 │   ├── post_mortem.py         # Post-trade diagnostic reporting (RS, MA trends)
 │   ├── preflight.py           # Pre-flight checklist (must exit 0 before live flip)
@@ -590,7 +609,9 @@ The MLEG limit-price sign convention was confirmed against the Alpaca paper API 
 #### Other execution rules
 
 - `DRY_RUN=True` logs orders without submitting (final sanity check before live)
-- `LIVE_SIZE_MULTIPLIER=0.25` scales live position sizes to 25% at launch
+- `LIVE_SIZE_MULTIPLIER=0.25` scales live position sizes down to 25% at launch;
+  quantities below whole/fractional granularity reject as `POSITION_TOO_SMALL`
+  rather than being rounded back up
 - Order errors are caught, logged, and never crash the bot
 - Position ownership is tracked per strategy to prevent cross-strategy interference
 - WebSocket streaming (Phase 10.E1) is the primary fill notification path; REST polling is the fallback

@@ -61,6 +61,7 @@ from strategies.filters.sector_momentum import SectorMomentumFilter
 from strategies.filters.sma_crossover import SMAEdgeFilter
 from strategies.filters.spy_options_reversion import SPYOptionsEdgeFilter
 from strategies.rsi_reversion import RSIReversion
+from strategies.leveraged_trend import LeveragedTrend
 from strategies.sma_crossover import SMACrossover
 from strategies.spy_options_reversion import SPYOptionsReversionStrategy
 from utils.iv_proxy import IVProxyResolver
@@ -203,6 +204,11 @@ def main() -> None:
     logger.info("=" * 60)
     logger.info(f"bot version: {_git_version()}")
     logger.info(f"python={sys.version.split()[0]} paper={settings.ALPACA_PAPER}")
+    if settings.LEVERAGED_TREND_PAPER_ENABLED and not settings.ALPACA_PAPER:
+        raise RuntimeError(
+            "LEVERAGED_TREND_PAPER_ENABLED is paper-only; set it false before "
+            "starting any live-mode process"
+        )
 
     # JSON structured log.
     install_json_sink()
@@ -338,6 +344,38 @@ def main() -> None:
             allowed_regimes=_allowed_regimes("spy_options_reversion"),
         ),
     ]
+
+    # ── Leveraged index trend paper sleeve (PLAN 11.64) ────────────────
+    # One slot per pair keeps entry/exit confirmations and sizing independently
+    # configurable while sharing one allocator/risk/health strategy identity.
+    # Execution bars are the 3x fund; signal_close is joined from the stable
+    # unleveraged benchmark. Delayed consolidated SIP is intentional for this
+    # completed-daily-close strategy even while other paper slots use IEX.
+    if settings.LEVERAGED_TREND_PAPER_ENABLED:
+        for _signal_symbol, _pair in settings.LEVERAGED_TREND_INSTRUMENTS.items():
+            _trading_symbol = str(_pair["trading_symbol"])
+            slots.append(StrategySlot(
+                strategy=LeveragedTrend(
+                    sma_length=int(_pair["sma_length"]),
+                    entry_days=int(_pair["entry_days"]),
+                    exit_days=int(_pair["exit_days"]),
+                    target_notional_pct=float(_pair["target_notional_pct"]),
+                    stated_leverage_multiplier=float(
+                        _pair["stated_leverage_multiplier"]
+                    ),
+                    stress_exposure_multiplier=float(
+                        _pair["stress_exposure_multiplier"]
+                    ),
+                ),
+                watchlist_source=StaticWatchlistSource(
+                    [_trading_symbol],
+                    name=f"leveraged_trend_{_signal_symbol.lower()}",
+                ),
+                timeframe="1Day",
+                allowed_regimes=_allowed_regimes("leveraged_trend"),
+                signal_symbols={_trading_symbol: _signal_symbol},
+                data_feed=settings.LEVERAGED_TREND_FEED,
+            ))
 
     # ── Credit spread slots (11.29) ──────────────────────────────────────
     # One CreditSpread instance per underlying (SPY + QQQ at v1); all share

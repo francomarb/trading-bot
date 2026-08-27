@@ -76,6 +76,8 @@ from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from typing import Iterable
 
+from risk.models import ProtectionModel, SizingModel
+
 
 LIFECYCLE_SCHEMA_VERSION = 1
 
@@ -102,9 +104,78 @@ CREATE TABLE IF NOT EXISTS position_lifecycle (
     entry_client_order_id   TEXT,
     first_fill_at           TEXT,
     last_fill_at            TEXT,
-    metadata_json           TEXT
+    sizing_model            TEXT    NOT NULL DEFAULT 'stop_distance',
+    protection_model        TEXT    NOT NULL DEFAULT 'broker_stop',
+    approved_notional_dollars REAL,
+    stated_leverage_multiplier REAL NOT NULL DEFAULT 1.0,
+    stress_exposure_multiplier REAL NOT NULL DEFAULT 1.0,
+    stated_effective_exposure_dollars REAL,
+    stress_effective_exposure_dollars REAL,
+    metadata_json           TEXT,
+    CHECK (sizing_model IN ('stop_distance', 'notional', 'defined_max_loss')),
+    CHECK (protection_model IN ('broker_stop', 'signal_exit_only')),
+    CHECK (
+        (sizing_model = 'stop_distance' AND protection_model = 'broker_stop')
+        OR (sizing_model = 'notional' AND protection_model = 'signal_exit_only')
+        OR sizing_model = 'defined_max_loss'
+    )
 );
 """
+
+
+# SQLite cannot add CHECK / NOT NULL constraints to an existing table with
+# ``ALTER TABLE ... ADD COLUMN``.  Production databases therefore need
+# triggers that enforce the same policy matrix as the fresh-table DDL after
+# the additive migration/backfill completes.  The triggers are also installed
+# on fresh databases so one database-level contract applies to both paths.
+_CREATE_POSITION_LIFECYCLE_POLICY_TRIGGERS_SQL = (
+    """
+    CREATE TRIGGER IF NOT EXISTS trg_position_lifecycle_policy_insert
+    BEFORE INSERT ON position_lifecycle
+    FOR EACH ROW
+    WHEN NEW.sizing_model IS NULL
+      OR NEW.protection_model IS NULL
+      OR NEW.sizing_model NOT IN (
+          'stop_distance', 'notional', 'defined_max_loss'
+      )
+      OR NEW.protection_model NOT IN (
+          'broker_stop', 'signal_exit_only'
+      )
+      OR NOT (
+          (NEW.sizing_model = 'stop_distance'
+           AND NEW.protection_model = 'broker_stop')
+          OR (NEW.sizing_model = 'notional'
+              AND NEW.protection_model = 'signal_exit_only')
+          OR NEW.sizing_model = 'defined_max_loss'
+      )
+    BEGIN
+        SELECT RAISE(ABORT, 'invalid position lifecycle risk policy');
+    END
+    """,
+    """
+    CREATE TRIGGER IF NOT EXISTS trg_position_lifecycle_policy_update
+    BEFORE UPDATE OF sizing_model, protection_model ON position_lifecycle
+    FOR EACH ROW
+    WHEN NEW.sizing_model IS NULL
+      OR NEW.protection_model IS NULL
+      OR NEW.sizing_model NOT IN (
+          'stop_distance', 'notional', 'defined_max_loss'
+      )
+      OR NEW.protection_model NOT IN (
+          'broker_stop', 'signal_exit_only'
+      )
+      OR NOT (
+          (NEW.sizing_model = 'stop_distance'
+           AND NEW.protection_model = 'broker_stop')
+          OR (NEW.sizing_model = 'notional'
+              AND NEW.protection_model = 'signal_exit_only')
+          OR NEW.sizing_model = 'defined_max_loss'
+      )
+    BEGIN
+        SELECT RAISE(ABORT, 'invalid position lifecycle risk policy');
+    END
+    """,
+)
 
 
 _CREATE_POSITION_LIFECYCLE_LEGS_SQL = """
@@ -252,6 +323,13 @@ class PositionLifecycleRow:
     entry_client_order_id: str | None
     first_fill_at: str | None
     last_fill_at: str | None
+    sizing_model: str
+    protection_model: str
+    approved_notional_dollars: float | None
+    stated_leverage_multiplier: float
+    stress_exposure_multiplier: float
+    stated_effective_exposure_dollars: float | None
+    stress_effective_exposure_dollars: float | None
     metadata: dict = field(default_factory=dict)
     legs: tuple[PositionLifecycleLeg, ...] = ()
 
@@ -292,6 +370,13 @@ class PositionLifecycleStore:
         entry_qty: float | None,
         entry_client_order_id: str | None = None,
         entry_order_id: str | None = None,
+        sizing_model: SizingModel = SizingModel.STOP_DISTANCE,
+        protection_model: ProtectionModel = ProtectionModel.BROKER_STOP,
+        approved_notional_dollars: float | None = None,
+        stated_leverage_multiplier: float = 1.0,
+        stress_exposure_multiplier: float = 1.0,
+        stated_effective_exposure_dollars: float | None = None,
+        stress_effective_exposure_dollars: float | None = None,
         legs: Iterable[PositionLifecycleLeg] = (),
         metadata: dict | None = None,
     ) -> None:
@@ -313,6 +398,7 @@ class PositionLifecycleStore:
             raise ValueError("owner_key must not be empty")
         if not strategy:
             raise ValueError("strategy must not be empty")
+        _validate_policy(sizing_model, protection_model)
 
         now = _utc_now_iso()
         meta_json = json.dumps(metadata) if metadata else None
@@ -325,8 +411,12 @@ class PositionLifecycleStore:
                 entry_qty, current_qty, avg_entry_price,
                 net_realized_pnl,
                 entry_order_id, entry_client_order_id,
-                first_fill_at, last_fill_at, metadata_json
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                first_fill_at, last_fill_at,
+                sizing_model, protection_model, approved_notional_dollars,
+                stated_leverage_multiplier, stress_exposure_multiplier,
+                stated_effective_exposure_dollars,
+                stress_effective_exposure_dollars, metadata_json
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             (
                 LIFECYCLE_SCHEMA_VERSION,
@@ -346,6 +436,13 @@ class PositionLifecycleStore:
                 entry_client_order_id,
                 None,
                 None,
+                sizing_model.value,
+                protection_model.value,
+                approved_notional_dollars,
+                stated_leverage_multiplier,
+                stress_exposure_multiplier,
+                stated_effective_exposure_dollars,
+                stress_effective_exposure_dollars,
                 meta_json,
             ),
         )
@@ -602,6 +699,15 @@ class PositionLifecycleStore:
             _validate_position_uid(position_uid)
         now = _utc_now_iso()
         first = first_fill_at or now
+        if position_type == "spread":
+            sizing_model = SizingModel.DEFINED_MAX_LOSS
+            protection_model = ProtectionModel.SIGNAL_EXIT_ONLY
+        else:
+            # A synthesized single-leg position has lost its immutable entry
+            # intent. Fail safe to stopped protection; never infer stopless
+            # policy from a strategy name or ticker.
+            sizing_model = SizingModel.STOP_DISTANCE
+            protection_model = ProtectionModel.BROKER_STOP
         meta = {
             "synthesized": True,
             "note": backfill_note,
@@ -615,8 +721,12 @@ class PositionLifecycleStore:
                 entry_qty, current_qty, avg_entry_price,
                 net_realized_pnl,
                 entry_order_id, entry_client_order_id,
-                first_fill_at, last_fill_at, metadata_json
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                first_fill_at, last_fill_at,
+                sizing_model, protection_model, approved_notional_dollars,
+                stated_leverage_multiplier, stress_exposure_multiplier,
+                stated_effective_exposure_dollars,
+                stress_effective_exposure_dollars, metadata_json
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             (
                 LIFECYCLE_SCHEMA_VERSION,
@@ -636,6 +746,13 @@ class PositionLifecycleStore:
                 None,
                 first,
                 first,
+                sizing_model.value,
+                protection_model.value,
+                None,
+                1.0,
+                1.0,
+                None,
+                None,
                 json.dumps(meta),
             ),
         )
@@ -743,11 +860,11 @@ class PositionLifecycleStore:
     def _row_with_legs(self, row: tuple) -> PositionLifecycleRow:
         position_uid = row[0]
         meta = {}
-        if row[16]:
+        if row[23]:
             try:
-                meta = json.loads(row[16])
+                meta = json.loads(row[23])
             except (TypeError, ValueError):
-                meta = {"_raw": row[16]}
+                meta = {"_raw": row[23]}
         legs = tuple(self.get_legs_for(position_uid))
         return PositionLifecycleRow(
             position_uid=position_uid,
@@ -766,6 +883,13 @@ class PositionLifecycleStore:
             entry_client_order_id=row[13],
             first_fill_at=row[14],
             last_fill_at=row[15],
+            sizing_model=row[16],
+            protection_model=row[17],
+            approved_notional_dollars=row[18],
+            stated_leverage_multiplier=row[19],
+            stress_exposure_multiplier=row[20],
+            stated_effective_exposure_dollars=row[21],
+            stress_effective_exposure_dollars=row[22],
             metadata=meta,
             legs=legs,
         )
@@ -775,7 +899,11 @@ _SELECT_LIFECYCLE_COLUMNS = (
     "SELECT position_uid, created_at, closed_at, symbol, owner_key, "
     "strategy, position_type, status, entry_qty, current_qty, "
     "avg_entry_price, net_realized_pnl, entry_order_id, "
-    "entry_client_order_id, first_fill_at, last_fill_at, metadata_json "
+    "entry_client_order_id, first_fill_at, last_fill_at, sizing_model, "
+    "protection_model, approved_notional_dollars, "
+    "stated_leverage_multiplier, stress_exposure_multiplier, "
+    "stated_effective_exposure_dollars, stress_effective_exposure_dollars, "
+    "metadata_json "
     "FROM position_lifecycle"
 )
 
@@ -797,6 +925,28 @@ def _validate_position_type(position_type: str) -> None:
         raise ValueError(
             f"position_type must be one of {sorted(VALID_POSITION_TYPES)}; "
             f"got {position_type!r}"
+        )
+
+
+def _validate_policy(
+    sizing_model: SizingModel,
+    protection_model: ProtectionModel,
+) -> None:
+    if not isinstance(sizing_model, SizingModel):
+        raise TypeError("sizing_model must be a SizingModel")
+    if not isinstance(protection_model, ProtectionModel):
+        raise TypeError("protection_model must be a ProtectionModel")
+    valid = (
+        sizing_model is SizingModel.STOP_DISTANCE
+        and protection_model is ProtectionModel.BROKER_STOP
+    ) or (
+        sizing_model is SizingModel.NOTIONAL
+        and protection_model is ProtectionModel.SIGNAL_EXIT_ONLY
+    ) or sizing_model is SizingModel.DEFINED_MAX_LOSS
+    if not valid:
+        raise ValueError(
+            f"invalid sizing/protection policy: {sizing_model.value} + "
+            f"{protection_model.value}"
         )
 
 

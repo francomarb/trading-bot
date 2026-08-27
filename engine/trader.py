@@ -110,6 +110,7 @@ from reporting.logger import (
     single_leg_realized_slippage_bps,
 )
 from reporting.pnl import PnLTracker, max_drawdown_from_equity_path
+from risk.models import ProtectionModel, SizingModel, StrategyPauseCause
 from strategies.base import (
     BaseStrategy,
     MultiLegTradeRejected,
@@ -230,6 +231,44 @@ def _lookback_days(required_bars: int, timeframe: str, config_lookback: int) -> 
     days_per_bar = _CALENDAR_DAYS_PER_BAR.get(timeframe, 1.5)
     strategy_days = int(required_bars * days_per_bar) + 5  # +5 day buffer
     return max(strategy_days, config_lookback)
+
+
+def _recent_bar_alignment_error(
+    execution_index: pd.Index,
+    signal_index: pd.Index,
+    *,
+    required_bars: int,
+) -> str | None:
+    """Describe a recent dual-asset calendar mismatch, or return ``None``.
+
+    Older coverage differences are harmless once both assets supply the full
+    decision window. Inside that window, however, an inner join would silently
+    drop a missing session and could evaluate a stale or mathematically altered
+    signal. Indexes are normalized to UTC so equivalent timezone renderings do
+    not create a false mismatch.
+    """
+    execution_recent = pd.DatetimeIndex(
+        pd.to_datetime(execution_index, utc=True)
+    ).sort_values()[-required_bars:]
+    signal_recent = pd.DatetimeIndex(
+        pd.to_datetime(signal_index, utc=True)
+    ).sort_values()[-required_bars:]
+    if execution_recent.equals(signal_recent):
+        return None
+
+    execution_only = execution_recent.difference(signal_recent)
+    signal_only = signal_recent.difference(execution_recent)
+
+    def _sample(index: pd.DatetimeIndex) -> list[str]:
+        return [timestamp.isoformat() for timestamp in index[-3:]]
+
+    return (
+        f"required_window={required_bars} "
+        f"execution_bars={len(execution_recent)} "
+        f"signal_bars={len(signal_recent)} "
+        f"execution_only={_sample(execution_only)} "
+        f"signal_only={_sample(signal_only)}"
+    )
 
 
 _OPERATOR_HALT_REASON_PREFIXES = ("operator_halt:", "operator_halt_sticky:")
@@ -1720,6 +1759,8 @@ class TradingEngine:
                             order_strategy=order_strategy,
                             strategy_statuses=strategy_statuses,
                             strategy_reasons=strategy_reasons,
+                            signal_symbol=slot.signal_symbol_for(symbol),
+                            data_feed=slot.data_feed,
                         )
                         if filled is not None:
                             new_positions += 1
@@ -1786,6 +1827,8 @@ class TradingEngine:
         order_strategy: dict[str, str] | None = None,
         strategy_statuses: dict[str, str] | None = None,
         strategy_reasons: dict[str, list[str]] | None = None,
+        signal_symbol: str | None = None,
+        data_feed: str | None = None,
     ) -> Position | None:
         """
         The full per-symbol decision path. Returns a Position if an entry was
@@ -1803,9 +1846,49 @@ class TradingEngine:
         try:
             # Live engine path — use the bot's runtime data feed.
             from config.settings import ALPACA_DATA_FEED
+            selected_feed = data_feed or ALPACA_DATA_FEED
             df, stats = fetch_symbol(
-                symbol, start, end, timeframe=timeframe, feed=ALPACA_DATA_FEED
+                symbol, start, end, timeframe=timeframe, feed=selected_feed
             )
+            signal_symbol = signal_symbol or symbol
+            if signal_symbol != symbol:
+                signal_df, _ = fetch_symbol(
+                    signal_symbol,
+                    start,
+                    end,
+                    timeframe=timeframe,
+                    feed=selected_feed,
+                )
+                if signal_df.empty:
+                    logger.warning(
+                        f"{symbol}: signal asset {signal_symbol} returned no bars"
+                    )
+                    return
+                required_alignment_bars = max(
+                    strategy.required_bars(), self.config.atr_length + 1
+                )
+                alignment_error = _recent_bar_alignment_error(
+                    df.index,
+                    signal_df.index,
+                    required_bars=required_alignment_bars,
+                )
+                if alignment_error is not None:
+                    message = (
+                        f"{symbol}/{signal_symbol}: dual-asset bars misaligned — "
+                        f"{alignment_error}"
+                    )
+                    logger.warning(message)
+                    self.alerts.stale_data(symbol, message)
+                    return
+                signal_columns = [
+                    column
+                    for column in ("open", "high", "low", "close", "volume")
+                    if column in signal_df.columns
+                ]
+                renamed = signal_df[signal_columns].rename(
+                    columns={column: f"signal_{column}" for column in signal_columns}
+                )
+                df = df.join(renamed, how="inner").sort_index()
         except Exception as e:
             logger.error(f"{symbol}: fetch failed: {e}")
             return
@@ -2200,9 +2283,13 @@ class TradingEngine:
 
         if self.risk.is_strategy_paused(strategy.name):
             paused = self.risk.paused_strategies_snapshot().get(strategy.name, {})
+            pause_summary = "; ".join(
+                f"{cause}: {meta.get('reason') or 'no reason'}"
+                for cause, meta in sorted(paused.items())
+            )
             soft_reason = (
                 f"pause-strategy {strategy.name}: "
-                f"{paused.get('reason') or 'paused by operator'}"
+                f"{pause_summary or 'paused'}"
             )
             logger.info(
                 f"[{strategy.name}] {symbol}: entry blocked — {soft_reason}"
@@ -2466,6 +2553,7 @@ class TradingEngine:
         elif signal_order_type is OrderType.LIMIT:
             signal_limit_price = target_price
 
+        risk_profile = strategy.risk_profile(target_symbol)
         sig = Signal(
             symbol=target_symbol,
             side=Side.BUY,
@@ -2479,6 +2567,15 @@ class TradingEngine:
             stop_price_override=stop_price,
             entry_max_price=entry_max_price,
             entry_trigger_price=entry_trigger_price,
+            sizing_model=risk_profile.sizing_model,
+            protection_model=risk_profile.protection_model,
+            target_notional_pct=risk_profile.target_notional_pct,
+            stated_leverage_multiplier=(
+                risk_profile.stated_leverage_multiplier
+            ),
+            stress_exposure_multiplier=(
+                risk_profile.stress_exposure_multiplier
+            ),
         )
         decision = self.risk.evaluate(sig, account, notional_cap=notional_cap)
         if isinstance(decision, RiskRejection):
@@ -2941,16 +3038,11 @@ class TradingEngine:
 
             # ── Side effects (single-shot via ownership gate) ──
             #
-            # PR #68 round-3 review P2: the RiskDecision construction
-            # used by the side-effects helper lives INSIDE this branch
-            # because option LIMIT entry substrate rows are
-            # intentionally created with intended_stop_price=None (per
-            # execution/broker.py — option exits are strategy-managed,
-            # not stop-managed) and RiskDecision.__post_init__ rejects
-            # stop_price <= 0. Pre-fix the round-2 hoist outside the
-            # gate raised on every async option fill that arrived
-            # after the synchronous path had already bound ownership,
-            # emitting a false CRITICAL on the live options sleeve.
+            # Build the RiskDecision only when recovery actually needs
+            # side effects. Policy and stop intent come from the substrate,
+            # never from ticker or strategy-name inference: a signal-exit
+            # entry legitimately has no stop, while a broker-stop entry
+            # must carry the stop that was approved before submission.
             # The focused-UPDATE accounting block below doesn't need a
             # RiskDecision; it reads everything off `order_row` and
             # `event`.
@@ -3001,15 +3093,72 @@ class TradingEngine:
                                 )
                             else:
                                 recovered_order_type = OrderType.MARKET
+                        recovered_sizing = SizingModel(
+                            getattr(order_row, "sizing_model", None)
+                            or getattr(pos_row, "sizing_model", None)
+                            or SizingModel.STOP_DISTANCE.value
+                        )
+                        recovered_protection = ProtectionModel(
+                            getattr(order_row, "protection_model", None)
+                            or getattr(pos_row, "protection_model", None)
+                            or ProtectionModel.BROKER_STOP.value
+                        )
                         recovered_decision = RiskDecision(
                             symbol=symbol,
                             side=Side.BUY,
                             qty=float(order_row.intended_qty),
                             entry_reference_price=float(event.avg_fill_price),
-                            stop_price=float(order_row.intended_stop_price or 0.0),
+                            stop_price=(
+                                float(order_row.intended_stop_price)
+                                if order_row.intended_stop_price is not None
+                                else None
+                            ),
                             strategy_name=pos_row.strategy,
                             reason="substrate dispatch",
                             order_type=recovered_order_type,
+                            sizing_model=recovered_sizing,
+                            protection_model=recovered_protection,
+                            approved_notional_dollars=(
+                                float(getattr(order_row, "approved_notional_dollars"))
+                                if getattr(
+                                    order_row, "approved_notional_dollars", None
+                                ) is not None
+                                else None
+                            ),
+                            stated_leverage_multiplier=float(
+                                getattr(
+                                    order_row, "stated_leverage_multiplier", None
+                                ) or 1.0
+                            ),
+                            stress_exposure_multiplier=float(
+                                getattr(
+                                    order_row, "stress_exposure_multiplier", None
+                                ) or 1.0
+                            ),
+                            stated_effective_exposure_dollars=(
+                                float(getattr(
+                                    order_row,
+                                    "stated_effective_exposure_dollars",
+                                ))
+                                if getattr(
+                                    order_row,
+                                    "stated_effective_exposure_dollars",
+                                    None,
+                                ) is not None
+                                else None
+                            ),
+                            stress_effective_exposure_dollars=(
+                                float(getattr(
+                                    order_row,
+                                    "stress_effective_exposure_dollars",
+                                ))
+                                if getattr(
+                                    order_row,
+                                    "stress_effective_exposure_dollars",
+                                    None,
+                                ) is not None
+                                else None
+                            ),
                             **recovered_extra_kwargs,
                         )
                         self._apply_recovered_entry_side_effects(
@@ -3422,6 +3571,19 @@ class TradingEngine:
         open position can never have its live stop moved by this path.
         """
         symbol = decision.symbol
+        if decision.protection_model is ProtectionModel.SIGNAL_EXIT_ONLY:
+            existing = self._protective_stop_order(symbol, snapshot)
+            if existing is not None:
+                self._latch_unexpected_protection(
+                    symbol=symbol,
+                    strategy_name=decision.strategy_name,
+                    stop_order_id=existing.order_id,
+                )
+            return
+        if decision.stop_price is None:
+            raise ValueError(
+                f"{symbol}: broker-stop recovery requires intended stop price"
+            )
         existing = self._protective_stop_order(symbol, snapshot)
         if existing is not None:
             if str(existing.time_in_force or "").lower() == "day":
@@ -3526,13 +3688,24 @@ class TradingEngine:
                     f"{type(exc).__name__}: {exc} — proceeding without "
                     f"substrate row"
                 )
-        repaired = self.broker.place_protective_stop(
-            symbol=symbol,
-            qty=stop_qty,
-            stop_price=decision.stop_price,
-            client_order_id_prefix=f"{decision.strategy_name}-recover-stop",
-            position_uid=_recover_uid,
-        )
+        if _OCC_PAT.match(symbol):
+            repaired = self.broker.submit_option_gtc_stop(
+                symbol=symbol,
+                qty=stop_qty,
+                stop_price=decision.stop_price,
+                client_order_id_prefix=(
+                    f"{decision.strategy_name}-recover-option-stop"
+                ),
+                position_uid=_recover_uid,
+            )
+        else:
+            repaired = self.broker.place_protective_stop(
+                symbol=symbol,
+                qty=stop_qty,
+                stop_price=decision.stop_price,
+                client_order_id_prefix=f"{decision.strategy_name}-recover-stop",
+                position_uid=_recover_uid,
+            )
         snapshot.open_orders.append(repaired)
         logger.warning(
             f"{symbol}: restored protective stop immediately after suspect "
@@ -4224,26 +4397,51 @@ class TradingEngine:
         # Phase B — pause-strategy restore.
         paused_strategies = state.get("paused_strategies") or {}
         if isinstance(paused_strategies, dict):
-            for strategy_name, meta in paused_strategies.items():
-                if not isinstance(meta, dict):
+            for strategy_name, stored in paused_strategies.items():
+                if not isinstance(stored, dict):
                     continue
-                try:
-                    reason = str(meta.get("reason") or "restored from prior session")
-                    command_uid = meta.get("command_uid")
-                    self.risk.pause_strategy(
-                        strategy_name=strategy_name,
-                        reason=reason,
-                        command_uid=command_uid,
-                    )
-                    logger.warning(
-                        f"pause-strategy '{strategy_name}' restored "
-                        f"from {path}: {reason}"
-                    )
-                except Exception as exc:
-                    logger.warning(
-                        f"pause-strategy restore failed for "
-                        f"{strategy_name!r}: {exc}"
-                    )
+                # Legacy Phase-B shape was one metadata record directly
+                # under the strategy name. Interpret it as OPERATOR.
+                if "reason" in stored or "command_uid" in stored:
+                    stored_causes = {StrategyPauseCause.OPERATOR.value: stored}
+                else:
+                    stored_causes = stored
+                for cause_name, meta in stored_causes.items():
+                    if not isinstance(meta, dict):
+                        continue
+                    try:
+                        try:
+                            cause = StrategyPauseCause(cause_name)
+                        except ValueError:
+                            # Never discard an unrecognized durable latch.
+                            cause = StrategyPauseCause.UNKNOWN_PERSISTED
+                            meta = dict(meta)
+                            meta["original_cause"] = cause_name
+                            logger.critical(
+                                f"pause-strategy '{strategy_name}' restored "
+                                f"unknown cause {cause_name!r}; entries remain "
+                                "blocked fail-closed"
+                            )
+                        reason = str(
+                            meta.get("reason") or "restored from prior session"
+                        )
+                        self.risk.pause_strategy_cause(
+                            strategy_name=strategy_name,
+                            cause=cause,
+                            reason=reason,
+                            command_uid=meta.get("command_uid"),
+                            position_uid=meta.get("position_uid"),
+                            original_cause=meta.get("original_cause"),
+                        )
+                        logger.warning(
+                            f"pause-strategy '{strategy_name}' "
+                            f"[{cause.value}] restored from {path}: {reason}"
+                        )
+                    except Exception as exc:
+                        logger.critical(
+                            f"pause-strategy restore failed for "
+                            f"{strategy_name!r}/{cause_name!r}: {exc}"
+                        )
 
     # Backward-compat alias retained so tests written against the
     # PR-2 method name keep working. Same behavior; the rename to
@@ -4313,6 +4511,7 @@ class TradingEngine:
         if paused:
             payload["paused_strategies"] = paused
         if payload:
+            payload["schema_version"] = 2
             payload["set_at"] = datetime.now(timezone.utc).isoformat()
 
         try:
@@ -4449,6 +4648,8 @@ class TradingEngine:
                 self._apply_operator_pause_strategy(claimed)
             elif claimed.action == "resume-strategy":
                 self._apply_operator_resume_strategy(claimed)
+            elif claimed.action == "resolve-unexpected-protection":
+                self._apply_operator_resolve_unexpected_protection(claimed)
             elif claimed.action == "close-position":
                 self._apply_operator_close_position(claimed)
             elif claimed.action == "reduce-position":
@@ -4832,12 +5033,14 @@ class TradingEngine:
             )
             return
         self._persist_control_state()
+        still_paused = self.risk.is_strategy_paused(strategy_name)
         try:
             # PR-65 review F4: INFO-severity operator_action alert.
             self.alerts.operator_action(
                 f"operator resume-strategy {strategy_name}: {command.reason} "
                 f"(cmd={command.command_uid[:18]}…) — "
-                f"{strategy_name} entries unblocked"
+                f"operator pause cleared; entries "
+                f"{'remain blocked by another cause' if still_paused else 'unblocked'}"
             )
         except Exception as exc:
             logger.warning(f"resume-strategy alert failed: {exc}")
@@ -4845,12 +5048,104 @@ class TradingEngine:
             command_uid=command.command_uid,
             result={
                 "strategy": strategy_name,
-                "paused": False,
+                "paused": still_paused,
+                "operator_cause_cleared": state_changed,
                 "already_resumed": not state_changed,
             },
         )
         logger.info(
-            f"strategy '{strategy_name}' resumed by operator: {command.reason}"
+            f"strategy '{strategy_name}' operator pause cleared: "
+            f"{command.reason}; still_paused={still_paused}"
+        )
+
+    def _apply_operator_resolve_unexpected_protection(self, command) -> None:
+        """Proof-gated clear of an unexpected-protection strategy latch."""
+        strategy_name = (command.target_strategy or "").strip()
+        if not strategy_name:
+            self.operator_command_store.mark_rejected(
+                command_uid=command.command_uid,
+                status="rejected_validation",
+                result={
+                    "note": (
+                        "target_strategy is required for "
+                        "resolve-unexpected-protection"
+                    )
+                },
+            )
+            return
+        causes = self.risk.paused_strategies_snapshot().get(strategy_name, {})
+        meta = causes.get(StrategyPauseCause.UNEXPECTED_PROTECTION.value)
+        if meta is None:
+            self.operator_command_store.mark_succeeded(
+                command_uid=command.command_uid,
+                result={
+                    "strategy": strategy_name,
+                    "already_resolved": True,
+                    "paused": self.risk.is_strategy_paused(strategy_name),
+                },
+            )
+            return
+        position_uid = meta.get("position_uid")
+        row = (
+            self.lifecycle_store.get_by_position_uid(position_uid)
+            if self.lifecycle_store is not None and position_uid
+            else None
+        )
+        if row is None:
+            self.operator_command_store.mark_failed(
+                command_uid=command.command_uid,
+                result={
+                    "error": "latched position lifecycle cannot be resolved",
+                    "position_uid": position_uid,
+                },
+            )
+            return
+        snapshot = self.broker.sync_with_broker(
+            session_start_equity=self._session_start_equity,
+        )
+        broker_stop = self._protective_stop_order(row.symbol, snapshot)
+        substrate_stops = []
+        if self.lifecycle_orders_store is not None:
+            substrate_stops = [
+                item
+                for item in self.lifecycle_orders_store.get_non_terminal_for_position(
+                    row.position_uid
+                )
+                if item.role in {"protective_stop", "replacement_stop"}
+            ]
+        if broker_stop is not None or substrate_stops:
+            self.operator_command_store.mark_rejected(
+                command_uid=command.command_uid,
+                status="rejected_validation",
+                result={
+                    "note": "unexpected protection remains unresolved",
+                    "position_uid": row.position_uid,
+                    "broker_stop_order_id": (
+                        broker_stop.order_id if broker_stop is not None else None
+                    ),
+                    "substrate_stop_order_ids": [
+                        item.order_id for item in substrate_stops
+                    ],
+                },
+            )
+            return
+        self.risk.resume_strategy_cause(
+            strategy_name=strategy_name,
+            cause=StrategyPauseCause.UNEXPECTED_PROTECTION,
+        )
+        self._persist_control_state()
+        self.operator_command_store.mark_succeeded(
+            command_uid=command.command_uid,
+            result={
+                "strategy": strategy_name,
+                "position_uid": row.position_uid,
+                "paused": self.risk.is_strategy_paused(strategy_name),
+                "reconciliation_proven_clean": True,
+            },
+        )
+        self.alerts.operator_action(
+            f"unexpected protection resolved for {strategy_name} "
+            f"({row.position_uid[:18]}…): {command.reason}"
         )
 
     # ── Operator destructive position controls (Phase C) ──────────────
@@ -5388,15 +5683,21 @@ class TradingEngine:
                 "broker_order_id": result.order_id,
             }
             if not is_full_close:
-                result_payload["degraded"] = True
-                result_payload["protection_status"] = "pending_repair_cycle"
-                result_payload["protection_note"] = (
-                    "broker.close_position cancelled the protective "
-                    "stop before the partial close; residual is "
-                    "unprotected until the engine's per-cycle stop "
-                    "repair pass restores it, OR until the operator "
-                    "re-issues close-position to finish the job"
+                _sizing_model, protection_model = self._position_risk_policy(
+                    symbol=lifecycle_row.symbol
                 )
+                if protection_model is ProtectionModel.SIGNAL_EXIT_ONLY:
+                    result_payload["protection_status"] = "not_required"
+                else:
+                    result_payload["degraded"] = True
+                    result_payload["protection_status"] = "pending_repair_cycle"
+                    result_payload["protection_note"] = (
+                        "broker.close_position cancelled the protective "
+                        "stop before the partial close; residual is "
+                        "unprotected until the engine's per-cycle stop "
+                        "repair pass restores it, OR until the operator "
+                        "re-issues close-position to finish the job"
+                    )
             # Mark queue row succeeded. The lifecycle row's pending→closed
             # transition runs inside _record_realized_pnl via
             # _close_lifecycle_for_owner_key (when is_full_close=True);
@@ -5406,11 +5707,12 @@ class TradingEngine:
                 result=result_payload,
             )
             try:
-                degraded_tag = (
-                    "" if is_full_close
-                    else " — DEGRADED: residual unprotected until "
-                         "next cycle's stop repair"
-                )
+                degraded_tag = ""
+                if result_payload.get("degraded"):
+                    degraded_tag = (
+                        " — DEGRADED: residual unprotected until "
+                        "next cycle's stop repair"
+                    )
                 self.alerts.operator_action(
                     f"operator close-position "
                     f"({'FULL' if is_full_close else 'PARTIAL'}): "
@@ -5422,8 +5724,9 @@ class TradingEngine:
             except Exception as exc:
                 logger.warning(f"close-position alert failed: {exc}")
             degraded_log = (
-                "" if is_full_close
-                else " DEGRADED protection until repair-cycle"
+                " DEGRADED protection until repair-cycle"
+                if result_payload.get("degraded")
+                else ""
             )
             logger.warning(
                 f"close-position by operator "
@@ -5644,18 +5947,24 @@ class TradingEngine:
             # strategy's risk parameters, and ordering it sequentially —
             # significant extra complexity for v1. v1 contract: report
             # the degraded state, let cycle repair handle it.
-            self.operator_command_store.mark_succeeded(
-                command_uid=command.command_uid,
-                result={
-                    "position_uid": lifecycle_row.position_uid,
-                    "symbol": lifecycle_row.symbol,
-                    "pct": pct,
-                    "requested_qty": reduce_qty,
-                    "filled_qty": filled_qty,
-                    "close_price": close_price,
-                    "residual_qty": max(0.0, current_qty - filled_qty),
-                    "broker_status": getattr(result.status, "value", str(result.status)),
-                    "broker_order_id": result.order_id,
+            _sizing_model, protection_model = self._position_risk_policy(
+                symbol=lifecycle_row.symbol
+            )
+            result_payload = {
+                "position_uid": lifecycle_row.position_uid,
+                "symbol": lifecycle_row.symbol,
+                "pct": pct,
+                "requested_qty": reduce_qty,
+                "filled_qty": filled_qty,
+                "close_price": close_price,
+                "residual_qty": max(0.0, current_qty - filled_qty),
+                "broker_status": getattr(result.status, "value", str(result.status)),
+                "broker_order_id": result.order_id,
+            }
+            if protection_model is ProtectionModel.SIGNAL_EXIT_ONLY:
+                result_payload["protection_status"] = "not_required"
+            else:
+                result_payload.update({
                     "degraded": True,
                     "protection_status": "pending_repair_cycle",
                     "protection_note": (
@@ -5664,23 +5973,36 @@ class TradingEngine:
                         "until the engine's per-cycle stop repair pass "
                         "restores it"
                     ),
-                },
+                })
+            self.operator_command_store.mark_succeeded(
+                command_uid=command.command_uid,
+                result=result_payload,
             )
             try:
+                protection_note = ""
+                if result_payload.get("degraded"):
+                    protection_note = (
+                        " — DEGRADED: residual unprotected until next "
+                        "cycle's stop repair"
+                    )
                 self.alerts.operator_action(
                     f"operator reduce-position: {lifecycle_row.symbol} "
                     f"({lifecycle_row.position_uid[:18]}…) "
                     f"−{filled_qty} @ ${close_price:.2f} "
                     f"({pct:.0f}% of {current_qty}) "
-                    f"— DEGRADED: residual unprotected until next "
-                    f"cycle's stop repair — {command.reason}"
+                    f"{protection_note} — {command.reason}"
                 )
             except Exception as exc:
                 logger.warning(f"reduce-position alert failed: {exc}")
+            degraded_log = (
+                " DEGRADED protection until repair-cycle"
+                if result_payload.get("degraded")
+                else " protection=not_required"
+            )
             logger.warning(
                 f"reduce-position by operator: {lifecycle_row.symbol} "
                 f"reduced={filled_qty}/{current_qty} (pct={pct}) "
-                f"DEGRADED protection until repair-cycle "
+                f"{degraded_log} "
                 f"reason={command.reason!r}"
             )
         except Exception as exc:
@@ -5700,8 +6022,21 @@ class TradingEngine:
         symbol: str,
         owner: str,
         position: Position,
+        protection_model: ProtectionModel,
     ) -> None:
-        """Auto-close a managed residual equity stub that cannot carry a broker stop."""
+        """Auto-close a stopped residual that cannot carry a broker stop.
+
+        ``protection_model`` is deliberately required at this destructive
+        boundary.  The repair loop normally calls this only after resolving a
+        lifecycle to ``BROKER_STOP``; the explicit precondition prevents a
+        future direct caller from liquidating a healthy stopless residual.
+        """
+        if protection_model is not ProtectionModel.BROKER_STOP:
+            logger.error(
+                f"{symbol}: refusing fractional residual cleanup for "
+                f"protection_model={protection_model.value}"
+            )
+            return
         stop_fill = self._lookup_recent_stop_fill(symbol=symbol, owner=owner)
         if stop_fill is not None:
             self._record_recovered_stop_fill(
@@ -7232,11 +7567,35 @@ class TradingEngine:
             if symbol in broker_symbols or owner_key_for(symbol) in broker_owner_keys:
                 continue
             try:
-                stop_fill = self._lookup_recent_stop_fill(
-                    symbol=symbol,
-                    owner=owner,
-                    until=snapshot.fetched_at,
-                )
+                _sizing, protection = self._position_risk_policy(symbol=symbol)
+                stop_fill = None
+                exit_fills = []
+                if protection is ProtectionModel.SIGNAL_EXIT_ONLY:
+                    exit_fills = self._lookup_recent_exit_fills(
+                        symbol=symbol,
+                        owner=owner,
+                        until=snapshot.fetched_at,
+                    )
+                    if not exit_fills:
+                        # A real stale/anomalous stop fill remains recoverable,
+                        # but is not assumed to be the normal close mechanism.
+                        stop_fill = self._lookup_recent_stop_fill(
+                            symbol=symbol,
+                            owner=owner,
+                            until=snapshot.fetched_at,
+                        )
+                else:
+                    stop_fill = self._lookup_recent_stop_fill(
+                        symbol=symbol,
+                        owner=owner,
+                        until=snapshot.fetched_at,
+                    )
+                    if stop_fill is None:
+                        exit_fills = self._lookup_recent_exit_fills(
+                            symbol=symbol,
+                            owner=owner,
+                            until=snapshot.fetched_at,
+                        )
                 if stop_fill is not None:
                     self._record_recovered_stop_fill(
                         symbol=symbol,
@@ -7244,11 +7603,6 @@ class TradingEngine:
                         stop_fill=stop_fill,
                     )
                     continue
-                exit_fills = self._lookup_recent_exit_fills(
-                    symbol=symbol,
-                    owner=owner,
-                    until=snapshot.fetched_at,
-                )
                 if not exit_fills:
                     logger.warning(
                         f"restart: {symbol} is open in the trade DB but absent "
@@ -7367,6 +7721,82 @@ class TradingEngine:
         )
         return True
 
+    def _latch_unexpected_protection(
+        self,
+        *,
+        symbol: str,
+        strategy_name: str,
+        stop_order_id: str,
+    ) -> None:
+        """Persist a strategy-local block for a stopless-position anomaly."""
+        position_uid: str | None = None
+        if self.lifecycle_store is not None:
+            try:
+                row = self.lifecycle_store.get_open_for_owner_key(
+                    owner_key_for(symbol)
+                )
+                if row is not None:
+                    position_uid = row.position_uid
+            except Exception as exc:
+                logger.error(
+                    f"{symbol}: could not resolve lifecycle identity for "
+                    f"unexpected protection: {exc}"
+                )
+        msg = (
+            f"{symbol}: signal-exit-only lifecycle has unexpected broker "
+            f"stop {stop_order_id}; order left unchanged and "
+            f"{strategy_name} entries blocked pending explicit reconciliation"
+        )
+        changed = self.risk.pause_strategy_cause(
+            strategy_name=strategy_name,
+            cause=StrategyPauseCause.UNEXPECTED_PROTECTION,
+            reason=msg,
+            position_uid=position_uid,
+        )
+        self._persist_control_state()
+        if changed:
+            logger.critical(msg)
+            self.alerts.broker_error(msg)
+        else:
+            logger.debug(f"{msg} (already latched)")
+
+    def _position_risk_policy(
+        self,
+        *,
+        symbol: str,
+    ) -> tuple[SizingModel, ProtectionModel]:
+        """Resolve persisted lifecycle policy for an open position.
+
+        Lifecycle state is authoritative. Legacy or unavailable rows fail
+        safely to the historical stopped-equity policy; this method never
+        guesses from a ticker or strategy name.
+        """
+        if self.lifecycle_store is None:
+            return SizingModel.STOP_DISTANCE, ProtectionModel.BROKER_STOP
+        try:
+            row = self.lifecycle_store.get_open_for_owner_key(
+                owner_key_for(symbol)
+            )
+        except Exception as exc:
+            logger.error(
+                f"{symbol}: lifecycle policy lookup failed "
+                f"({type(exc).__name__}: {exc}); defaulting to broker-stop"
+            )
+            return SizingModel.STOP_DISTANCE, ProtectionModel.BROKER_STOP
+        if row is None:
+            return SizingModel.STOP_DISTANCE, ProtectionModel.BROKER_STOP
+        try:
+            sizing = SizingModel(row.sizing_model)
+            protection = ProtectionModel(row.protection_model)
+        except (TypeError, ValueError) as exc:
+            logger.error(
+                f"{symbol}: invalid lifecycle risk policy "
+                f"{row.sizing_model!r}/{row.protection_model!r} ({exc}); "
+                "defaulting to broker-stop"
+            )
+            return SizingModel.STOP_DISTANCE, ProtectionModel.BROKER_STOP
+        return sizing, protection
+
     def _repair_missing_protective_stops(
         self,
         snapshot: BrokerSnapshot,
@@ -7389,6 +7819,18 @@ class TradingEngine:
             owner = self._get_owner(symbol)
             if owner is None:
                 continue
+            _sizing_model, protection_model = self._position_risk_policy(
+                symbol=symbol
+            )
+            if protection_model is ProtectionModel.SIGNAL_EXIT_ONLY:
+                unexpected = self._protective_stop_order(symbol, snapshot)
+                if unexpected is not None:
+                    self._latch_unexpected_protection(
+                        symbol=symbol,
+                        strategy_name=owner,
+                        stop_order_id=unexpected.order_id,
+                    )
+                continue
             stop_qty = abs(int(position.qty))
             existing = self._protective_stop_order(symbol, snapshot)
             if existing is not None:
@@ -7401,6 +7843,7 @@ class TradingEngine:
                             symbol=symbol,
                             owner=owner,
                             position=position,
+                            protection_model=protection_model,
                         )
                     else:
                         logger.debug(
@@ -7482,6 +7925,7 @@ class TradingEngine:
                         symbol=symbol,
                         owner=owner,
                         position=position,
+                        protection_model=protection_model,
                     )
                 else:
                     logger.debug(
@@ -7546,6 +7990,16 @@ class TradingEngine:
         not a new fill.
         """
         if _OCC_PAT.match(symbol):
+            return None
+
+        _sizing_model, protection_model = self._position_risk_policy(
+            symbol=symbol
+        )
+        if protection_model is ProtectionModel.SIGNAL_EXIT_ONLY:
+            logger.debug(
+                f"{symbol}: missing-entry reconstruction skipped for "
+                "signal-exit-only lifecycle"
+            )
             return None
 
         slot = next(
@@ -7857,7 +8311,25 @@ class TradingEngine:
                         initial_risk_dollars=ext_close_risk_dollars,
                     )
                 else:
-                    stop_fill = self._lookup_recent_stop_fill(symbol=symbol, owner=owner)
+                    _sizing, protection = self._position_risk_policy(symbol=symbol)
+                    stop_fill = None
+                    exit_fills = []
+                    if protection is ProtectionModel.SIGNAL_EXIT_ONLY:
+                        exit_fills = self._lookup_recent_exit_fills(
+                            symbol=symbol, owner=owner,
+                        )
+                        if not exit_fills:
+                            stop_fill = self._lookup_recent_stop_fill(
+                                symbol=symbol, owner=owner,
+                            )
+                    else:
+                        stop_fill = self._lookup_recent_stop_fill(
+                            symbol=symbol, owner=owner,
+                        )
+                        if stop_fill is None:
+                            exit_fills = self._lookup_recent_exit_fills(
+                                symbol=symbol, owner=owner,
+                            )
                     self._pop_position(symbol)
                     if stop_fill is not None:
                         self._record_recovered_stop_fill(
@@ -7871,10 +8343,6 @@ class TradingEngine:
                             "protective stop fill from broker history"
                         )
                     else:
-                        exit_fills = self._lookup_recent_exit_fills(
-                            symbol=symbol,
-                            owner=owner,
-                        )
                         if exit_fills:
                             for index, exit_fill in enumerate(exit_fills):
                                 self._record_recovered_exit_fill(

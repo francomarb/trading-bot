@@ -54,7 +54,7 @@ class TestResolverIsTheOnlySource:
             "slots must derive from settings.STRATEGY_ALLOWED_REGIMES via "
             "_allowed_regimes() or the settings dict becomes decorative again"
         )
-        assert text.count("allowed_regimes=_allowed_regimes(") == 4
+        assert text.count("allowed_regimes=_allowed_regimes(") == 5
         assert text.count("allowed_regimes=None") == 1
 
     def test_resolver_maps_names_to_enum_members(self):

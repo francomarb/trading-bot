@@ -617,7 +617,17 @@ Research-style doc: [`bollinger_squeeze_universe_research.md`](bollinger_squeeze
 
 ## Planned Strategies
 
-No additional strategies are planned at this time. The go/no-go framework (`scripts/gonogo.py`) must confirm the five-strategy paper run meets all thresholds before adding more complexity. Phase 11 will add dynamic per-strategy weight rebalancing and cross-sleeve borrowing.
+**LeveragedTrend** (`strategies/leveraged_trend.py`) is implemented as a
+research-only signal generator and is not wired into `forward_test.py`. It
+uses an unleveraged ETF's confirmed SMA200 phase to trade its benchmark-aligned
+3x fund. The committed Alpaca SIP study covers SPY→SPXL, QQQ→TQQQ, XLK→TECL,
+and SOXX→SOXL from 2016 onward. The 5-above/2-below candidate has attractive
+standalone returns but drawdowns of roughly 42–72%, so it is not approved for
+paper activation. Full contract, results, and engine blockers:
+[`leveraged_trend_strategy.md`](leveraged_trend_strategy.md).
+
+The five-strategy paper go/no-go remains the current operational priority;
+this research candidate does not change the active sleeve set.
 
 A second multi-leg options strategy (iron condor, calendar, etc.) is intentionally easy to add — the engine MLEG path (`dispatch_spread_order`, `SpreadExecutionWorker`, the two-leg `Position` model, startup spread reconstruction) is leg-count-agnostic and duck-typed on the strategy hooks (`build_spread_execution`, `evaluate_spread_exit`, `register_spread`/`release_spread`, `open_spreads`). Two engine helpers still hardcode `strategy_name == "credit_spread"` (the global concurrent counter and the startup-reconstruction strategy lookup); see PLAN.md **11.31** — generalize them before adding strategy #2.
 

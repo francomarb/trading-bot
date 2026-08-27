@@ -71,6 +71,100 @@ def _column_set(conn: sqlite3.Connection, table: str) -> set[str]:
     }
 
 
+def _create_pre_policy_lifecycle_schema(path: str) -> None:
+    """Create the exact policy-less table shape that predates PR #125."""
+    conn = sqlite3.connect(path)
+    conn.executescript(
+        """
+        CREATE TABLE position_lifecycle (
+            position_uid TEXT PRIMARY KEY,
+            schema_version INTEGER NOT NULL DEFAULT 1,
+            created_at TEXT NOT NULL,
+            closed_at TEXT,
+            symbol TEXT NOT NULL,
+            owner_key TEXT NOT NULL,
+            strategy TEXT NOT NULL,
+            position_type TEXT NOT NULL,
+            status TEXT NOT NULL,
+            entry_qty REAL,
+            current_qty REAL,
+            avg_entry_price REAL,
+            net_realized_pnl REAL NOT NULL DEFAULT 0.0,
+            entry_order_id TEXT,
+            entry_client_order_id TEXT,
+            first_fill_at TEXT,
+            last_fill_at TEXT,
+            metadata_json TEXT
+        );
+
+        CREATE TABLE position_lifecycle_legs (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            position_uid TEXT NOT NULL,
+            symbol TEXT NOT NULL,
+            side TEXT NOT NULL,
+            qty REAL NOT NULL,
+            avg_entry_price REAL,
+            FOREIGN KEY(position_uid) REFERENCES position_lifecycle(position_uid)
+        );
+
+        CREATE TABLE position_lifecycle_orders (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            position_uid TEXT NOT NULL,
+            role TEXT NOT NULL,
+            order_id TEXT,
+            client_order_id TEXT NOT NULL,
+            order_type TEXT NOT NULL,
+            order_class TEXT NOT NULL,
+            time_in_force TEXT NOT NULL,
+            side TEXT NOT NULL,
+            intended_qty REAL NOT NULL,
+            intended_stop_price REAL,
+            intended_trigger_price REAL,
+            intended_limit_price REAL,
+            intended_take_profit_price REAL,
+            parent_order_id TEXT,
+            replaces_order_id TEXT,
+            origin_kind TEXT NOT NULL DEFAULT 'bot',
+            operator_command_uid TEXT,
+            slippage_benchmark_price REAL,
+            slippage_benchmark_kind TEXT,
+            slippage_benchmark_timestamp TEXT,
+            slippage_measurement_quality TEXT,
+            status TEXT NOT NULL,
+            filled_qty REAL NOT NULL DEFAULT 0.0,
+            avg_fill_price REAL,
+            created_at TEXT NOT NULL,
+            submitted_at TEXT,
+            terminal_at TEXT,
+            last_observed_broker_updated_at TEXT,
+            last_observed_at TEXT NOT NULL,
+            FOREIGN KEY(position_uid) REFERENCES position_lifecycle(position_uid)
+        );
+
+        INSERT INTO position_lifecycle (
+            position_uid, created_at, symbol, owner_key, strategy,
+            position_type, status, entry_qty, current_qty
+        ) VALUES (
+            'legacy-pos', '2026-08-01T00:00:00+00:00', 'AAPL', 'AAPL',
+            'sma_crossover', 'single_leg', 'open', 10, 10
+        );
+
+        INSERT INTO position_lifecycle_orders (
+            position_uid, role, client_order_id, order_type, order_class,
+            time_in_force, side, intended_qty, intended_stop_price, status,
+            created_at, last_observed_at
+        ) VALUES (
+            'legacy-pos', 'entry_primary', 'legacy-entry', 'market', 'oto',
+            'gtc', 'buy', 10, 95, 'filled',
+            '2026-08-01T00:00:00+00:00',
+            '2026-08-01T00:00:00+00:00'
+        );
+        """
+    )
+    conn.commit()
+    conn.close()
+
+
 # ── Schema creation ────────────────────────────────────────────────────────
 
 
@@ -94,6 +188,13 @@ class TestPositionLifecycleOrdersSchema:
         "intended_trigger_price",
         "intended_limit_price",
         "intended_take_profit_price",
+        "sizing_model",
+        "protection_model",
+        "approved_notional_dollars",
+        "stated_leverage_multiplier",
+        "stress_exposure_multiplier",
+        "stated_effective_exposure_dollars",
+        "stress_effective_exposure_dollars",
         "parent_order_id",
         "replaces_order_id",
         "origin_kind",
@@ -152,6 +253,103 @@ class TestPositionLifecycleOrdersSchema:
         finally:
             conn.close()
         assert "uniq_one_active_position_per_owner_key" in indexes
+
+
+class TestPolicyConstraintMigration:
+    """Migrated databases enforce the same policy matrix as fresh DDL."""
+
+    def _migrated(self, tmp_db_path: str) -> sqlite3.Connection:
+        _create_pre_policy_lifecycle_schema(tmp_db_path)
+        return TradeLogger(path=tmp_db_path)._ensure_db()
+
+    def test_backfills_legacy_position_and_entry_order_policy(
+        self, tmp_db_path: str
+    ):
+        conn = self._migrated(tmp_db_path)
+        position_policy = conn.execute(
+            "SELECT sizing_model, protection_model "
+            "FROM position_lifecycle WHERE position_uid='legacy-pos'"
+        ).fetchone()
+        order_policy = conn.execute(
+            "SELECT sizing_model, protection_model "
+            "FROM position_lifecycle_orders "
+            "WHERE client_order_id='legacy-entry'"
+        ).fetchone()
+
+        assert position_policy == ("stop_distance", "broker_stop")
+        assert order_policy == ("stop_distance", "broker_stop")
+
+    @pytest.mark.parametrize(
+        "sizing,protection",
+        [
+            (None, "broker_stop"),
+            ("stop_distance", None),
+            ("broken", "broker_stop"),
+            ("stop_distance", "signal_exit_only"),
+            ("notional", "broker_stop"),
+        ],
+    )
+    def test_migrated_position_rejects_absent_or_invalid_policy(
+        self, tmp_db_path: str, sizing, protection
+    ):
+        conn = self._migrated(tmp_db_path)
+
+        with pytest.raises(sqlite3.IntegrityError, match="risk policy"):
+            conn.execute(
+                "UPDATE position_lifecycle SET sizing_model=?, "
+                "protection_model=? WHERE position_uid='legacy-pos'",
+                (sizing, protection),
+            )
+
+    @pytest.mark.parametrize(
+        "sizing,protection",
+        [
+            (None, None),
+            ("broken", "broker_stop"),
+            ("stop_distance", "signal_exit_only"),
+            ("notional", "broker_stop"),
+        ],
+    )
+    def test_migrated_entry_order_rejects_absent_or_invalid_policy(
+        self, tmp_db_path: str, sizing, protection
+    ):
+        conn = self._migrated(tmp_db_path)
+
+        with pytest.raises(sqlite3.IntegrityError, match="risk policy"):
+            conn.execute(
+                "UPDATE position_lifecycle_orders SET sizing_model=?, "
+                "protection_model=? WHERE client_order_id='legacy-entry'",
+                (sizing, protection),
+            )
+
+    def test_migrated_non_entry_may_remain_policy_neutral(
+        self, tmp_db_path: str
+    ):
+        conn = self._migrated(tmp_db_path)
+
+        conn.execute(
+            "INSERT INTO position_lifecycle_orders ("
+            "position_uid, role, client_order_id, order_type, order_class, "
+            "time_in_force, side, intended_qty, status, created_at, "
+            "last_observed_at) VALUES ("
+            "'legacy-pos', 'exit', 'legacy-exit', 'market', 'simple', "
+            "'day', 'sell', 10, 'pending', "
+            "'2026-08-02T00:00:00+00:00', "
+            "'2026-08-02T00:00:00+00:00')"
+        )
+
+        row = conn.execute(
+            "SELECT sizing_model, protection_model "
+            "FROM position_lifecycle_orders "
+            "WHERE client_order_id='legacy-exit'"
+        ).fetchone()
+        assert row == (None, None)
+
+        with pytest.raises(sqlite3.IntegrityError, match="risk policy"):
+            conn.execute(
+                "UPDATE position_lifecycle_orders SET role='entry_residual' "
+                "WHERE client_order_id='legacy-exit'"
+            )
 
 
 # ── PRAGMA foreign_keys enforcement (Test 25, R13-G1) ──────────────────────
@@ -419,9 +617,11 @@ class TestPendingEntryReservations:
             "INSERT INTO position_lifecycle_orders("
             "position_uid, role, client_order_id, order_type, order_class, "
             "time_in_force, side, intended_qty, filled_qty, intended_limit_price, "
-            "intended_stop_price, origin_kind, status, created_at, last_observed_at) "
+            "intended_stop_price, sizing_model, protection_model, origin_kind, "
+            "status, created_at, last_observed_at) "
             "VALUES (?, 'entry_primary', ?, 'stop_limit', 'oto', 'day', 'buy', "
-            "?, ?, ?, ?, 'strategy', ?, '2026-08-20T00:00:00+00:00', "
+            "?, ?, ?, ?, 'stop_distance', 'broker_stop', 'strategy', ?, "
+            "'2026-08-20T00:00:00+00:00', "
             "'2026-08-20T00:00:00+00:00')",
             (uid, f"cid-{uid}", intended, filled, limit, stop, status),
         )
@@ -470,9 +670,11 @@ class TestPendingEntryReservations:
             "INSERT INTO position_lifecycle_orders("
             "position_uid, role, client_order_id, order_type, order_class, "
             "time_in_force, side, intended_qty, filled_qty, intended_stop_price, "
-            "origin_kind, status, created_at, last_observed_at) "
+            "sizing_model, protection_model, origin_kind, status, created_at, "
+            "last_observed_at) "
             "VALUES ('p5', 'entry_primary', 'cid-p5', 'market', 'simple', 'day', "
-            "'buy', 10, 0, 90.0, 'strategy', 'working', "
+            "'buy', 10, 0, 90.0, 'stop_distance', 'broker_stop', 'strategy', "
+            "'working', "
             "'2026-08-20T00:00:00+00:00', '2026-08-20T00:00:00+00:00')"
         )
         conn.commit()

@@ -105,6 +105,7 @@ from config.settings import (
     RESTING_ENTRY_CONFIRM_TIMEOUT_SECONDS,
 )
 from risk.manager import AccountState, Position, RiskDecision, Side
+from risk.models import ProtectionModel
 from strategies.base import OrderType
 
 
@@ -195,6 +196,9 @@ class OrderResult:
     # was added to remove.
     placed_stop_price: float | None = None
     stop_placement_reported: bool = False
+    # Typed interpretation of stop absence. ``not_required`` is healthy for
+    # SIGNAL_EXIT_ONLY; ``failed`` is degraded for BROKER_STOP.
+    protection_status: str = "unknown"
 
     @property
     def is_terminal(self) -> bool:
@@ -463,6 +467,17 @@ class AlpacaBroker:
                 position_type=position_type,
                 entry_qty=float(decision.qty),
                 entry_client_order_id=client_order_id,
+                sizing_model=decision.sizing_model,
+                protection_model=decision.protection_model,
+                approved_notional_dollars=decision.approved_notional_dollars,
+                stated_leverage_multiplier=decision.stated_leverage_multiplier,
+                stress_exposure_multiplier=decision.stress_exposure_multiplier,
+                stated_effective_exposure_dollars=(
+                    decision.stated_effective_exposure_dollars
+                ),
+                stress_effective_exposure_dollars=(
+                    decision.stress_effective_exposure_dollars
+                ),
             )
             return uid
         except Exception as exc:
@@ -634,6 +649,17 @@ class AlpacaBroker:
                 intended_stop_price=intended_stop_price,
                 intended_trigger_price=intended_trigger_price,
                 intended_limit_price=intended_limit_price,
+                sizing_model=decision.sizing_model,
+                protection_model=decision.protection_model,
+                approved_notional_dollars=decision.approved_notional_dollars,
+                stated_leverage_multiplier=decision.stated_leverage_multiplier,
+                stress_exposure_multiplier=decision.stress_exposure_multiplier,
+                stated_effective_exposure_dollars=(
+                    decision.stated_effective_exposure_dollars
+                ),
+                stress_effective_exposure_dollars=(
+                    decision.stress_effective_exposure_dollars
+                ),
                 parent_order_id=parent_order_id,
                 replaces_order_id=replaces_order_id,
                 slippage_benchmark_price=slippage_benchmark_price,
@@ -1457,10 +1483,8 @@ class AlpacaBroker:
                 decision=decision,
                 client_order_id=client_order_id,
             )
-            # Foundation commit 6 — options orders are 'simple' LIMIT
-            # (no broker-attached stop_loss leg; the strategy manages
-            # exits via separate LIMIT orders via the spy options
-            # reversion strategy). TIF=day.
+            # Options enter with a simple DAY LIMIT, then the engine installs
+            # and ratchets their required standalone GTC broker stop.
             self._lifecycle_orders_insert_pending(
                 position_uid=position_uid,
                 role="entry_primary",
@@ -1473,6 +1497,7 @@ class AlpacaBroker:
                     if decision.limit_price is not None
                     else None
                 ),
+                intended_stop_price=float(decision.stop_price),
                 slippage_benchmark_price=slippage_benchmark_price,
                 slippage_benchmark_kind=slippage_benchmark_kind,
                 slippage_benchmark_timestamp=slippage_benchmark_timestamp,
@@ -1546,6 +1571,27 @@ class AlpacaBroker:
                 message="dispatched to OptionsExecutionWorker",
             )
 
+        if decision.protection_model is ProtectionModel.SIGNAL_EXIT_ONLY:
+            if decision.order_type is not OrderType.MARKET:
+                raise ValueError(
+                    "SIGNAL_EXIT_ONLY broker entry supports MARKET entries "
+                    "only in V1"
+                )
+            if decision.entry_max_price is not None:
+                raise ValueError(
+                    "SIGNAL_EXIT_ONLY broker entry does not support "
+                    "entry_max_price in V1"
+                )
+            return self._place_fractional_order(
+                decision,
+                poll_timeout=poll_timeout,
+                poll_interval=poll_interval,
+                slippage_benchmark_price=slippage_benchmark_price,
+                slippage_benchmark_kind=slippage_benchmark_kind,
+                slippage_benchmark_timestamp=slippage_benchmark_timestamp,
+                slippage_measurement_quality=slippage_measurement_quality,
+            )
+
         # PLAN 11.32: when an entry price cap is in effect, force the
         # whole-share path so the capped DAY LIMIT + OTO branch applies.
         # Alpaca's fractional path is market-only and cannot enforce a
@@ -1608,6 +1654,8 @@ class AlpacaBroker:
         # preflight dry run would leak rows that look like real
         # positions to the operator CLI).
         position_uid: str | None = None
+        if decision.stop_price is None:
+            raise ValueError("BROKER_STOP decision is missing stop_price")
         stop_loss = StopLossRequest(stop_price=round(decision.stop_price, 2))
         # PLAN 11.53: the OTO child is attached BEFORE the fill, so it can
         # only carry the reference-derived level. Record that as what was
@@ -1931,13 +1979,15 @@ class AlpacaBroker:
         slippage_measurement_quality: str | None = None,
     ) -> OrderResult:
         """
-        Fractional market entry path — only reached when FRACTIONAL_ENABLED=True
-        and decision.qty has a decimal part.
+        Simple DAY market entry path.
 
-        Alpaca fractional shares require DAY TIF and cannot use OTO order class,
-        so the entry and stop are submitted as two separate orders:
+        This handles fractional stopped equities and every signal-exit-only
+        equity (whole or fractional). Alpaca fractional shares cannot use OTO,
+        and signal-exit-only decisions intentionally have no stop child, so
+        both contracts share the same simple entry submission:
           1. DAY MarketOrderRequest (fractional qty, no stop leg).
-          2. After confirmed fill: GTC StopOrderRequest for floor(qty) whole shares.
+          2. For BROKER_STOP only, after confirmed fill: GTC StopOrderRequest
+             for floor(qty) whole shares.
 
         If floor(qty) == 0 (qty < 1 share), no stop can be submitted — the
         position exits via engine exit signals only (logged as WARNING).
@@ -1954,23 +2004,36 @@ class AlpacaBroker:
         # dry-run guard below; same reasoning as in place_order().
         position_uid: str | None = None
 
-        # PLAN 11.32: defense in depth. place_order() floors fractional qty
-        # to whole shares when entry_max_price is set so the capped DAY
-        # LIMIT + OTO path applies. If we ever reach this branch with a cap
-        # set, it means the floor logic was bypassed or removed — log an
-        # ERROR so it's loud in alerts.
-        if decision.entry_max_price is not None:
-            logger.error(
-                f"[entry-guard] {decision.symbol}: BUG — entry_max_price "
-                f"${decision.entry_max_price:.2f} reached the fractional path "
-                f"(qty={decision.qty}). The cap will NOT be enforced. "
-                f"Investigate place_order() floor logic."
+        signal_exit_only = (
+            decision.protection_model is ProtectionModel.SIGNAL_EXIT_ONLY
+        )
+        if signal_exit_only and decision.order_type is not OrderType.MARKET:
+            raise ValueError(
+                "SIGNAL_EXIT_ONLY simple entry supports MARKET entries only "
+                "in V1"
             )
-
+        if signal_exit_only and decision.entry_max_price is not None:
+            raise ValueError(
+                "SIGNAL_EXIT_ONLY simple entry does not support "
+                "entry_max_price in V1"
+            )
+        # PLAN 11.32: defense in depth for stopped fractional decisions.
+        # place_order() floors capped quantities into the whole-share capped
+        # LIMIT+OTO path. Reaching this helper with a cap is therefore a
+        # caller bug and must fail before any lifecycle or broker side effect.
+        if decision.entry_max_price is not None:
+            raise ValueError(
+                f"entry_max_price ${decision.entry_max_price:.2f} reached "
+                "the fractional simple-order path"
+            )
+        protection_text = (
+            "signal-exit protection"
+            if signal_exit_only
+            else f"stop ${decision.stop_price:.2f}"
+        )
         logger.info(
-            f"placing fractional market buy {decision.qty} {decision.symbol} "
-            f"[DAY, stop ${decision.stop_price:.2f}, "
-            f"client_id={client_order_id}]"
+            f"placing simple DAY market buy {decision.qty} {decision.symbol} "
+            f"[{protection_text}, client_id={client_order_id}]"
         )
 
         if self._dry_run:
@@ -1987,6 +2050,10 @@ class AlpacaBroker:
                 avg_fill_price=decision.entry_reference_price,
                 raw_status="dry_run",
                 message="dry run — no order submitted",
+                stop_placement_reported=True,
+                protection_status=(
+                    "not_required" if signal_exit_only else "failed"
+                ),
             )
 
         # Operator Controls Phase A — pending lifecycle row written
@@ -2007,7 +2074,10 @@ class AlpacaBroker:
             decision=decision,
             order_class="simple",
             time_in_force="day",
-            intended_stop_price=float(decision.stop_price),
+            intended_stop_price=(
+                float(decision.stop_price)
+                if decision.stop_price is not None else None
+            ),
             slippage_benchmark_price=slippage_benchmark_price,
             slippage_benchmark_kind=slippage_benchmark_kind,
             slippage_benchmark_timestamp=slippage_benchmark_timestamp,
@@ -2100,7 +2170,9 @@ class AlpacaBroker:
         # unprotected fractional entry must not report a stop the trade
         # log would then record as existing.
         placed_stop: float | None = None
-        if result.status is OrderStatus.FILLED:
+        if result.status is OrderStatus.FILLED and not signal_exit_only:
+            if decision.stop_price is None:
+                raise ValueError("BROKER_STOP decision is missing stop_price")
             stop_qty = math.floor(decision.qty)
             if stop_qty >= 1:
                 # PLAN 11.53: anchor the stop to the price we actually
@@ -2109,6 +2181,8 @@ class AlpacaBroker:
                 # fill, so the correct anchor is simply available — no
                 # cancel/replace and no drift threshold needed.
                 anchored_stop = decision.stop_for_fill(result.avg_fill_price)
+                if anchored_stop is None:
+                    raise ValueError("BROKER_STOP decision produced no stop")
                 if abs(anchored_stop - decision.stop_price) > 0.005:
                     logger.info(
                         f"{decision.symbol}: stop re-anchored to fill — "
@@ -2171,6 +2245,11 @@ class AlpacaBroker:
         return replace(
             result, position_uid=position_uid, placed_stop_price=placed_stop,
             stop_placement_reported=True,
+            protection_status=(
+                "not_required"
+                if signal_exit_only
+                else "placed" if placed_stop is not None else "failed"
+            ),
         )
 
     def reconcile_submitted_order(
