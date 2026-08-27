@@ -92,6 +92,7 @@ trading-bot/
 │   ├── donchian_breakout.py   # Trend-continuation: Turtle System 1 (30/15, ai_bigtech)
 │   ├── spy_options_reversion.py  # Options mean-reversion: SPY calls on RSI recovery
 │   ├── credit_spread.py       # Defined-risk bull put credit spreads (SPY + QQQ)
+│   ├── leveraged_trend.py     # Research-only: underlying SMA phase → aligned 3x ETF
 │   ├── filters/
 │   │   ├── common.py          # SPYTrendFilter + CompositeEdgeFilter
 │   │   ├── sma_crossover.py   # SMAEdgeFilter: stock > 200 SMA, volume expansion
@@ -155,6 +156,7 @@ trading-bot/
 │   ├── __init__.py
 │   ├── runner.py              # vectorbt backtesting harness
 │   ├── reconcile.py           # Forward-test reconciliation (paper vs backtest)
+│   ├── leveraged_trend.py     # SIP pair alignment + confirmation-grid research
 │   └── spy_options_backtest.py  # SPY options strategy backtester (daily proxy)
 │
 ├── scripts/
@@ -162,6 +164,7 @@ trading-bot/
 │   ├── gonogo.py              # Go/no-go checker for live readiness
 │   ├── build_envelopes.py     # Builds per-strategy backtest envelopes (health monitor)
 │   ├── calibrate_health_thresholds.py  # Health-threshold diff suggestions from N weeks of data
+│   ├── backtest_leveraged_trend.py  # Reproducible SIP grid/report (research only)
 │   ├── strategy_health_review.py  # On-demand strategy health/edge report CLI
 │   ├── post_mortem.py         # Post-trade diagnostic reporting (RS, MA trends)
 │   ├── preflight.py           # Pre-flight checklist (must exit 0 before live flip)

@@ -452,11 +452,11 @@ class TestSettings:
 
     def test_pairs_are_configured_and_independent(self):
         pairs = settings.LEVERAGED_TREND_PAIRS
-        assert {"QQQ", "XLK", "SPY", "SMH", "XLF", "XLE"} <= set(pairs)
+        assert {"QQQ", "XLK", "SPY", "SOXX", "XLF", "XLE"} <= set(pairs)
         assert pairs["QQQ"] == "TQQQ"
         assert pairs["XLK"] == "TECL"
         assert pairs["SPY"] == "SPXL"
-        assert pairs["SMH"] == "SOXL"
+        assert pairs["SOXX"] == "SOXL"
         assert pairs["XLF"] == "FAS"
         assert pairs["XLE"] == "ERX"
 

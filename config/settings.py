@@ -1294,7 +1294,9 @@ LEVERAGED_TREND_PAIRS: dict[str, str | None] = {
     "QQQ": "TQQQ",
     "XLK": "TECL",
     "SPY": "SPXL",
-    "SMH": "SOXL",
+    # SOXX and SOXL share the NYSE Semiconductor Index benchmark.  SMH
+    # tracks a different 25-name MVIS index and is not a clean signal proxy.
+    "SOXX": "SOXL",
     "XLF": "FAS",
     "XLE": "ERX",
 }
