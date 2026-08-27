@@ -25,8 +25,8 @@ when used to govern SOXL.
 
 - Data: Alpaca delayed SIP daily bars with `adjustment="all"`.
 - Indicator: SMA of the signal asset's adjusted daily close; default 200 sessions.
-- Initial state: OUT (cash). The strategy never seeds a position merely because
-  the first evaluable bar is above its SMA.
+- Historical replay starts OUT (cash). The first entry transition requires the
+  full confirmation run; the first evaluable bar alone never creates a signal.
 - Entry: `entry_days` consecutive completed closes strictly above the SMA.
 - Exit: `exit_days` consecutive completed closes strictly below the SMA.
 - Equality: a close exactly on the SMA resets both streaks and changes no state.
@@ -128,6 +128,15 @@ strategy-specific risk bypass:
   throughout the strategy's recent decision window (including ATR warmup).
   A missing or extra recent bar alerts and skips the cycle; differing older
   coverage is allowed once both assets supply the complete decision window.
+- Transition events remain the backtest contract. For paper cold starts and
+  restarts, the strategy also exposes its fully replayed current position
+  target (`LONG` or `FLAT`). The engine reconciles only a disagreement with
+  broker reality: flat+LONG follows the ordinary entry gates, while open+FLAT
+  follows the ordinary signal-exit path. This prevents activation from waiting
+  months for a transition that happened before the bot was deployed, without
+  fabricating a new historical signal or bypassing risk. If the finite fetch
+  window contains no complete confirmation in either direction, the target is
+  unknown and the engine takes no reconciliation action.
 - The switch is named `LEVERAGED_TREND_PAPER_ENABLED`; startup refuses if it is
   enabled while the account is in live mode.
 

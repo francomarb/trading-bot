@@ -3,8 +3,8 @@ Leveraged-ETF trend monitor — 200-day SMA phase state on the UNDERLYING index.
 
 Purpose
 -------
-The operator holds leveraged funds (TQQQ, TECL, ...) outside this bot. The
-phase-in / phase-out decision for those holdings is driven by the *unleveraged*
+Provide the read-only dashboard phase view for leveraged funds (TQQQ, TECL,
+...). The phase-in / phase-out decision is driven by the *unleveraged*
 underlying's position relative to its 200-day SMA, filtered for noise:
 
     * phase-OUT signal — underlying closes strictly BELOW its 200-day SMA on
@@ -22,10 +22,11 @@ XLK not until 2026-08-10, a four-month divergence).
 
 Scope — this module NEVER trades
 --------------------------------
-This is an operator-facing monitor consumed by ``dashboard.py``. It places no
-orders, touches no engine state, and is not wired into the trading loop. The
-bot cannot trade leveraged products at all: ``utils.asset_filters.is_stock_like``
-rejects them by construction.
+This operator-facing monitor is consumed by ``dashboard.py``. It places no
+orders and touches no engine state. Paper execution lives separately in
+``strategies/leveraged_trend.py`` and the normal engine/risk/lifecycle path;
+keeping this module read-only prevents a dashboard refresh from ever creating
+broker side effects.
 
 Design notes
 ------------

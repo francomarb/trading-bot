@@ -481,3 +481,10 @@ class TestSettings:
 
     def test_monitor_feed_is_sip(self):
         assert settings.LEVERAGED_TREND_FEED == "sip"
+
+    def test_active_dashboard_watchlist_comes_from_execution_registry(self):
+        expected = [
+            str(config["trading_symbol"])
+            for config in settings.LEVERAGED_TREND_INSTRUMENTS.values()
+        ]
+        assert settings.STRATEGY_WATCHLISTS["leveraged_trend"] == expected

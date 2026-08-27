@@ -108,7 +108,7 @@ trading-bot/
 │   ├── donchian_breakout.py   # Trend-continuation: Turtle System 1 (30/15, ai_bigtech)
 │   ├── spy_options_reversion.py  # Options mean-reversion: SPY calls on RSI recovery
 │   ├── credit_spread.py       # Defined-risk bull put credit spreads (SPY + QQQ)
-│   ├── leveraged_trend.py     # Research-only: underlying SMA phase → aligned 3x ETF
+│   ├── leveraged_trend.py     # Paper: underlying SMA phase → aligned 3x ETF
 │   ├── filters/
 │   │   ├── common.py          # SPYTrendFilter + CompositeEdgeFilter
 │   │   ├── sma_crossover.py   # SMAEdgeFilter: stock > 200 SMA, volume expansion
@@ -326,6 +326,9 @@ class BaseStrategy(ABC):
 
     def generate_signals(self, df: pd.DataFrame) -> SignalFrame: ...
 
+    def current_position_target(self, df: pd.DataFrame) -> PositionTarget | None:
+        """Optional state-based LONG/FLAT target; default None."""
+
     def required_bars(self) -> int:
         """Minimum bars needed for a valid signal. Default: 50."""
         return 50
@@ -337,6 +340,14 @@ class BaseStrategy(ABC):
 - Both share the same DatetimeIndex as the input bars
 - Signals at bar t depend only on data up to and including t (no look-ahead)
 - The engine shifts execution to bar t+1's open
+
+State-based strategies may additionally return a typed `PositionTarget.LONG`
+or `PositionTarget.FLAT`. The `SignalFrame` remains transition-based for
+backtest parity; the engine uses the target only when the broker position is
+out of sync with the fully confirmed current state. A target-derived entry
+still traverses edge, regime, sleeve, account, risk, and execution gates, and
+a target-derived exit still traverses ownership and normal close lifecycle.
+The default is `None`, so existing event-driven strategies are unchanged.
 
 **Options extension points on BaseStrategy:**
 

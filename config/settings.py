@@ -1370,3 +1370,12 @@ LEVERAGED_TREND_INSTRUMENTS: dict[str, dict[str, float | int | str]] = {
         "stress_exposure_multiplier": 3.0,
     },
 }
+
+# Dashboard metadata is derived from the same execution-instrument registry
+# that forward_test.py uses to build slots. Populate it here, after the
+# registry exists, so adding/removing a pair cannot leave the Active
+# Watchlists panel stale or require a second hardcoded symbol list.
+STRATEGY_WATCHLISTS["leveraged_trend"] = [
+    str(config["trading_symbol"])
+    for config in LEVERAGED_TREND_INSTRUMENTS.values()
+]
