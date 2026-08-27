@@ -128,6 +128,12 @@ Initial paper allocation is 25% of deployable capital, equal to 20% of account
 equity under the 80% gross ceiling. Each of four correlated positions requests
 5% of account equity, cannot stretch, and remains subject to the global 10%
 single-position cap. This is a battle-test allocation, not a live allocation.
+V1 enforces those limits on actual ETF market value. It records each fund's
+stated and stress-adjusted effective exposure but does not use those derived
+figures as a second admission ceiling. Because the sleeve is long-only,
+unmargined, and non-stretching, its hard loss remains bounded by the capital
+allocated to it; aggregate leverage-aware portfolio admission is tracked as
+the later bot-wide enhancement in PLAN 11.66.
 
 ### Temporal and combined evidence
 
@@ -156,7 +162,7 @@ known evidence limitation, not a paper-activation blocker.
 - Whether 5/2 remains preferable under temporal validation rather than the
   full-window sensitivity table.
 - Whether all four pairs should ever run together.
-- Effective-exposure and aggregate heat limits.
+- Effective-exposure and aggregate heat limits (PLAN 11.66).
 - BIL/SGOV versus cash when inactive.
 - Catastrophe overlay. The signal-only baseline is the required control; an
   overlay survives only if separately measured evidence justifies it.
