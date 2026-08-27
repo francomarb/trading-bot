@@ -47,6 +47,14 @@ Watchlist → raw strategy signal → edge filter (+ sector momentum/IV) → reg
 
 For single-leg options, the execution path diverges after the risk manager: the broker detects the OCC symbol and dispatches an `OptionsExecutionWorker` thread that handles the async limit-entry + bracket lifecycle independently of the engine loop. Multi-leg options strategies such as credit spreads bypass `RiskManager.evaluate` after the sleeve check because max loss is defined by the spread; they route through the MLEG combo path and `SpreadExecutionWorker`.
 
+Single-leg equity lifecycle policy is explicit and durable. Traditional
+strategies use `STOP_DISTANCE + BROKER_STOP`; intentionally stopless trend
+positions use `NOTIONAL + SIGNAL_EXIT_ONLY`. Repair and restart code reads that
+persisted policy rather than inferring from a ticker or strategy name. A
+`StrategySlot` may also map an execution symbol to a distinct signal symbol and
+select a per-slot data feed; leveraged trend uses this contract for
+benchmark-close signals and 3x-fund execution on delayed SIP daily bars.
+
 ---
 
 ## Project Structure

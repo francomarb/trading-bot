@@ -47,6 +47,7 @@ import pandas as pd
 
 if TYPE_CHECKING:
     from data.watchlists import WatchlistSource
+    from risk.models import PositionRiskProfile
 
 
 # ── Shared types ─────────────────────────────────────────────────────────────
@@ -310,6 +311,17 @@ class BaseStrategy(ABC):
         """
         return 50
 
+    def risk_profile(self, symbol: str) -> "PositionRiskProfile":
+        """Return immutable entry-risk intent for ``symbol``.
+
+        Existing strategies inherit the stopped, stop-distance default. A
+        strategy that requests another lifecycle policy must override this
+        method; RiskManager still validates and caps the resulting request.
+        """
+        from risk.models import PositionRiskProfile
+
+        return PositionRiskProfile()
+
     def inspect_open_positions(self, position, latest_close: float) -> bool:
         """
         Hook called by the engine during the cycle loop to allow the strategy
@@ -465,6 +477,14 @@ class StrategySlot:
     scanner: Scanner | None = None
     scan_interval_seconds: float = 0
     allowed_regimes: "frozenset | None" = None  # frozenset[MarketRegime] | None
+    # Optional execution-symbol → signal-symbol mapping for dual-asset
+    # strategies. The engine trades active_symbols() while joining the mapped
+    # signal asset's bars under ``signal_*`` columns.
+    signal_symbols: dict[str, str] = field(default_factory=dict)
+    # Optional per-slot market-data feed override. Research-driven daily
+    # strategies may require consolidated SIP while the rest of paper runtime
+    # remains on IEX.
+    data_feed: str | None = None
 
     # Internal: monotonic timestamp of the last scanner invocation.
     _last_scan_time: float = field(default=0.0, init=False, repr=False)
@@ -488,3 +508,7 @@ class StrategySlot:
                 self.symbols = self.scanner.scan()
                 self._last_scan_time = now
         return self.symbols
+
+    def signal_symbol_for(self, trading_symbol: str) -> str:
+        """Return the explicit signal asset, or the trading asset itself."""
+        return self.signal_symbols.get(trading_symbol, trading_symbol)

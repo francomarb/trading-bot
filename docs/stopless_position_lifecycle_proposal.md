@@ -1,7 +1,7 @@
 # Stopless Position Lifecycle and Notional Risk Proposal
 
-**Status:** proposal for review; no runtime activation is authorized by this
-document.
+**Status:** approved and merged in PR #124; implementation is proceeding on a
+paper-only branch. This document still does not authorize live activation.
 
 **Primary consumer:** leveraged-index trend strategies such as SPY→SPXL and
 QQQ→TQQQ.

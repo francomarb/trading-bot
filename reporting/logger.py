@@ -773,6 +773,43 @@ class TradeLogger:
             )
             conn.execute(_CREATE_POSITION_LIFECYCLE_SQL)
             conn.execute(_CREATE_POSITION_LIFECYCLE_LEGS_SQL)
+            lifecycle_columns = {
+                row[1]
+                for row in conn.execute(
+                    "PRAGMA table_info(position_lifecycle)"
+                ).fetchall()
+            }
+            for column, definition in {
+                "sizing_model": "TEXT",
+                "protection_model": "TEXT",
+                "approved_notional_dollars": "REAL",
+                "stated_leverage_multiplier": "REAL",
+                "stress_exposure_multiplier": "REAL",
+                "stated_effective_exposure_dollars": "REAL",
+                "stress_effective_exposure_dollars": "REAL",
+            }.items():
+                if column not in lifecycle_columns:
+                    conn.execute(
+                        f"ALTER TABLE position_lifecycle ADD COLUMN "
+                        f"{column} {definition}"
+                    )
+            # Existing single-leg positions fail safe to stopped protection.
+            # Defined-loss spreads are structural exceptions; no ticker or
+            # strategy-name inference participates in this migration.
+            conn.execute(
+                "UPDATE position_lifecycle SET "
+                "sizing_model = CASE WHEN position_type = 'spread' "
+                "THEN 'defined_max_loss' ELSE 'stop_distance' END, "
+                "protection_model = CASE WHEN position_type = 'spread' "
+                "THEN 'signal_exit_only' ELSE 'broker_stop' END, "
+                "stated_leverage_multiplier = "
+                "COALESCE(stated_leverage_multiplier, 1.0), "
+                "stress_exposure_multiplier = "
+                "COALESCE(stress_exposure_multiplier, 1.0) "
+                "WHERE sizing_model IS NULL OR protection_model IS NULL "
+                "OR stated_leverage_multiplier IS NULL "
+                "OR stress_exposure_multiplier IS NULL"
+            )
             for index_sql in _CREATE_POSITION_LIFECYCLE_INDEXES_SQL:
                 conn.execute(index_sql)
             # Order lifecycle foundation (PR #59): per-order substrate.
@@ -787,6 +824,43 @@ class TradeLogger:
                 run_preflight_or_raise,
             )
             conn.execute(_CREATE_POSITION_LIFECYCLE_ORDERS_SQL)
+            order_columns = {
+                row[1]
+                for row in conn.execute(
+                    "PRAGMA table_info(position_lifecycle_orders)"
+                ).fetchall()
+            }
+            for column, definition in {
+                "sizing_model": "TEXT",
+                "protection_model": "TEXT",
+                "approved_notional_dollars": "REAL",
+                "stated_leverage_multiplier": "REAL",
+                "stress_exposure_multiplier": "REAL",
+                "stated_effective_exposure_dollars": "REAL",
+                "stress_effective_exposure_dollars": "REAL",
+            }.items():
+                if column not in order_columns:
+                    conn.execute(
+                        f"ALTER TABLE position_lifecycle_orders ADD COLUMN "
+                        f"{column} {definition}"
+                    )
+            conn.execute(
+                "UPDATE position_lifecycle_orders AS orders SET "
+                "sizing_model = (SELECT lifecycle.sizing_model FROM "
+                "position_lifecycle AS lifecycle WHERE "
+                "lifecycle.position_uid = orders.position_uid), "
+                "protection_model = (SELECT lifecycle.protection_model FROM "
+                "position_lifecycle AS lifecycle WHERE "
+                "lifecycle.position_uid = orders.position_uid), "
+                "stated_leverage_multiplier = COALESCE("
+                "stated_leverage_multiplier, 1.0), "
+                "stress_exposure_multiplier = COALESCE("
+                "stress_exposure_multiplier, 1.0) "
+                "WHERE role IN ('entry_primary', 'entry_residual') "
+                "AND (sizing_model IS NULL OR protection_model IS NULL "
+                "OR stated_leverage_multiplier IS NULL "
+                "OR stress_exposure_multiplier IS NULL)"
+            )
             for index_sql in _CREATE_POSITION_LIFECYCLE_ORDERS_INDEXES_SQL:
                 conn.execute(index_sql)
             # Migration preflight (PR #59 §12.2 / R7-P1b / R9-P1c,

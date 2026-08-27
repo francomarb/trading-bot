@@ -23,6 +23,11 @@ from __future__ import annotations
 
 import pandas as pd
 
+from risk.models import (
+    PositionRiskProfile,
+    ProtectionModel,
+    SizingModel,
+)
 from strategies.base import BaseStrategy, OrderType, SignalFrame
 
 
@@ -39,6 +44,9 @@ class LeveragedTrend(BaseStrategy):
         entry_days: int = 5,
         exit_days: int = 2,
         signal_column: str = "signal_close",
+        target_notional_pct: float = 0.10,
+        stated_leverage_multiplier: float = 3.0,
+        stress_exposure_multiplier: float = 3.0,
     ) -> None:
         super().__init__()
         for name, value in (
@@ -54,11 +62,32 @@ class LeveragedTrend(BaseStrategy):
             raise TypeError("signal_column must be a string")
         if not signal_column:
             raise ValueError("signal_column must not be empty")
+        if not 0 < target_notional_pct <= 1:
+            raise ValueError("target_notional_pct must be in (0, 1]")
+        if stated_leverage_multiplier <= 0:
+            raise ValueError("stated_leverage_multiplier must be positive")
+        if stress_exposure_multiplier < stated_leverage_multiplier:
+            raise ValueError(
+                "stress_exposure_multiplier must be >= stated leverage"
+            )
 
         self.sma_length = sma_length
         self.entry_days = entry_days
         self.exit_days = exit_days
         self.signal_column = signal_column
+        self.target_notional_pct = target_notional_pct
+        self.stated_leverage_multiplier = stated_leverage_multiplier
+        self.stress_exposure_multiplier = stress_exposure_multiplier
+
+    def risk_profile(self, symbol: str) -> PositionRiskProfile:
+        """Request stopless notional sizing; RiskManager applies final caps."""
+        return PositionRiskProfile(
+            sizing_model=SizingModel.NOTIONAL,
+            protection_model=ProtectionModel.SIGNAL_EXIT_ONLY,
+            target_notional_pct=self.target_notional_pct,
+            stated_leverage_multiplier=self.stated_leverage_multiplier,
+            stress_exposure_multiplier=self.stress_exposure_multiplier,
+        )
 
     def required_bars(self) -> int:
         """Bars required to warm the SMA and complete either confirmation."""

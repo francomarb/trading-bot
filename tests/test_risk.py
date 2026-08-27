@@ -45,6 +45,7 @@ from risk.manager import (
     candidate_entry_risk,
     worst_case_entry_price,
 )
+from risk.models import ProtectionModel, SizingModel
 
 
 # ── Fixtures / helpers ───────────────────────────────────────────────────────
@@ -178,6 +179,82 @@ class TestSignalValidation:
         rej = _mgr().evaluate(_signal(atr=0.0), _account(), now=T0)
         assert isinstance(rej, RiskRejection)
         assert rej.code is RejectionCode.INVALID_SIGNAL
+
+
+class TestNotionalSignalExitSizing:
+    @staticmethod
+    def _notional_signal(**overrides) -> Signal:
+        values = {
+            "symbol": "SPXL",
+            "side": Side.BUY,
+            "strategy_name": "leveraged_trend",
+            "reference_price": 100.0,
+            "atr": None,
+            "reason": "SPY confirmed above SMA200",
+            "sizing_model": SizingModel.NOTIONAL,
+            "protection_model": ProtectionModel.SIGNAL_EXIT_ONLY,
+            "target_notional_pct": 0.05,
+            "stated_leverage_multiplier": 3.0,
+            "stress_exposure_multiplier": 4.0,
+        }
+        values.update(overrides)
+        return Signal(**values)
+
+    def test_approves_without_atr_or_stop_and_persists_exposure(self):
+        decision = _mgr(max_position_notional_pct=0.10).evaluate(
+            self._notional_signal(), _account(), now=T0
+        )
+
+        assert isinstance(decision, RiskDecision)
+        assert decision.qty == 50.0
+        assert decision.stop_price is None
+        assert decision.approved_notional_dollars == 5_000.0
+        assert decision.stated_effective_exposure_dollars == 15_000.0
+        assert decision.stress_effective_exposure_dollars == 20_000.0
+
+    @pytest.mark.parametrize(
+        "account,notional_cap,expected_notional",
+        [
+            (_account(cash=2_000.0), None, 2_000.0),
+            (_account(), 1_500.0, 1_500.0),
+            (
+                _account(
+                    positions={
+                        "MSFT": Position("MSFT", 1, 100.0, 49_000.0)
+                    }
+                ),
+                None,
+                1_000.0,
+            ),
+        ],
+    )
+    def test_clips_by_cash_sleeve_and_remaining_gross(
+        self, account, notional_cap, expected_notional
+    ):
+        decision = _mgr(
+            max_position_notional_pct=0.10,
+            max_gross_exposure_pct=0.50,
+        ).evaluate(
+            self._notional_signal(),
+            account,
+            now=T0,
+            notional_cap=notional_cap,
+        )
+
+        assert isinstance(decision, RiskDecision)
+        assert decision.approved_notional_dollars == expected_notional
+
+    def test_invalid_policy_pair_rejected(self):
+        rejection = _mgr().evaluate(
+            self._notional_signal(
+                protection_model=ProtectionModel.BROKER_STOP
+            ),
+            _account(),
+            now=T0,
+        )
+
+        assert isinstance(rejection, RiskRejection)
+        assert rejection.code is RejectionCode.INVALID_SIGNAL
 
     def test_zero_equity_rejected(self):
         rej = _mgr().evaluate(_signal(), _account(equity=0.0), now=T0)

@@ -94,6 +94,13 @@ class TestPositionLifecycleOrdersSchema:
         "intended_trigger_price",
         "intended_limit_price",
         "intended_take_profit_price",
+        "sizing_model",
+        "protection_model",
+        "approved_notional_dollars",
+        "stated_leverage_multiplier",
+        "stress_exposure_multiplier",
+        "stated_effective_exposure_dollars",
+        "stress_effective_exposure_dollars",
         "parent_order_id",
         "replaces_order_id",
         "origin_kind",
@@ -419,9 +426,11 @@ class TestPendingEntryReservations:
             "INSERT INTO position_lifecycle_orders("
             "position_uid, role, client_order_id, order_type, order_class, "
             "time_in_force, side, intended_qty, filled_qty, intended_limit_price, "
-            "intended_stop_price, origin_kind, status, created_at, last_observed_at) "
+            "intended_stop_price, sizing_model, protection_model, origin_kind, "
+            "status, created_at, last_observed_at) "
             "VALUES (?, 'entry_primary', ?, 'stop_limit', 'oto', 'day', 'buy', "
-            "?, ?, ?, ?, 'strategy', ?, '2026-08-20T00:00:00+00:00', "
+            "?, ?, ?, ?, 'stop_distance', 'broker_stop', 'strategy', ?, "
+            "'2026-08-20T00:00:00+00:00', "
             "'2026-08-20T00:00:00+00:00')",
             (uid, f"cid-{uid}", intended, filled, limit, stop, status),
         )
@@ -470,9 +479,11 @@ class TestPendingEntryReservations:
             "INSERT INTO position_lifecycle_orders("
             "position_uid, role, client_order_id, order_type, order_class, "
             "time_in_force, side, intended_qty, filled_qty, intended_stop_price, "
-            "origin_kind, status, created_at, last_observed_at) "
+            "sizing_model, protection_model, origin_kind, status, created_at, "
+            "last_observed_at) "
             "VALUES ('p5', 'entry_primary', 'cid-p5', 'market', 'simple', 'day', "
-            "'buy', 10, 0, 90.0, 'strategy', 'working', "
+            "'buy', 10, 0, 90.0, 'stop_distance', 'broker_stop', 'strategy', "
+            "'working', "
             "'2026-08-20T00:00:00+00:00', '2026-08-20T00:00:00+00:00')"
         )
         conn.commit()

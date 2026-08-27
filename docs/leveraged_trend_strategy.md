@@ -1,6 +1,8 @@
 # Leveraged Trend Strategy
 
-**Status:** research implementation complete; not wired to paper or live trading.
+**Status:** implementation candidate wired behind a paper-only switch; never
+enabled in live mode. Merge, review, and a controlled bot recycle are still
+required before it begins collecting paper evidence.
 
 ## Thesis
 
@@ -100,6 +102,53 @@ bars; this strategy needs a durable two-asset data contract. In addition:
 
 Until those contracts are designed and tested, this module remains a
 reproducible research strategy only.
+
+## Paper Implementation Candidate (2026-08-26)
+
+The implementation branch now uses the bot's normal lifecycle rather than a
+strategy-specific risk bypass:
+
+- `RiskManager` admits `NOTIONAL + SIGNAL_EXIT_ONLY` entries and retains cash,
+  actual-gross, account, position-count, allocator, and halt ceilings.
+- Position and entry-order lifecycle rows persist the sizing/protection models,
+  approved notional, stated leverage, and stress-exposure assumptions.
+- The broker submits a simple DAY market entry with no attached or follow-up
+  stop. Missing-stop repair, ATR reconstruction, and fractional residual
+  cleanup explicitly skip these positions.
+- Unexpected protection is left untouched, alerts, and adds a durable
+  strategy-local `UNEXPECTED_PROTECTION` pause cause. It cannot be cleared by
+  ordinary `resume-strategy`; the explicit resolution command requires clean
+  broker and substrate state.
+- Each trading symbol is statically mapped to its benchmark in a dual-asset
+  `StrategySlot`, and both daily series use delayed SIP.
+- The switch is named `LEVERAGED_TREND_PAPER_ENABLED`; startup refuses if it is
+  enabled while the account is in live mode.
+
+Initial paper allocation is 25% of deployable capital, equal to 20% of account
+equity under the 80% gross ceiling. Each of four correlated positions requests
+5% of account equity, cannot stretch, and remains subject to the global 10%
+single-position cap. This is a battle-test allocation, not a live allocation.
+
+### Temporal and combined evidence
+
+Using the existing Alpaca SIP cache through 2026-08-25, with 5 bps slippage:
+
+- Training window through 2021: the 5/2 setting was not the in-sample Calmar
+  winner (2/1 was), which is useful evidence against presenting 5/2 as an
+  optimized maximum.
+- 2022-forward holdout: 5/2 stayed positive on all four pairs. Pair CAGRs were
+  13.5% SPXL, 25.1% TQQQ, 17.2% TECL, and 29.1% SOXL. Drawdowns were still
+  severe, from -42.1% to -72.4%.
+- A daily rebalanced account simulation with four equal 5% targets and 80%
+  cash finished at $263,285 from $100,000 (9.5% CAGR, -14.5% maximum
+  drawdown). This is the closest research analogue to the configured 20%
+  account sleeve; it is materially less spectacular than letting four
+  standalone leveraged equity curves compound without rebalancing.
+
+The remaining evidence item before calling the paper rollout complete is the
+pre-2016/2008-style synthetic daily-reset stress study. Alpaca SIP begins in
+2016 for these pairs, so that artifact needs separately sourced underlying
+history and explicit provenance; it must not be mislabeled as SIP fund data.
 
 ## Deferred Questions
 

@@ -47,6 +47,7 @@ from risk.manager import (
     RiskDecision,
     Side,
 )
+from risk.models import ProtectionModel, SizingModel
 from strategies.base import OrderType
 
 
@@ -94,6 +95,26 @@ def _decision(
         limit_price=limit_price,
         entry_max_price=entry_max_price,
         entry_trigger_price=entry_trigger_price,
+    )
+
+
+def _stopless_decision(*, qty: float = 10.0) -> RiskDecision:
+    notional = qty * 100.0
+    return RiskDecision(
+        symbol="SPXL",
+        side=Side.BUY,
+        qty=qty,
+        entry_reference_price=100.0,
+        stop_price=None,
+        strategy_name="leveraged_trend",
+        reason="SPY confirmed above SMA200",
+        sizing_model=SizingModel.NOTIONAL,
+        protection_model=ProtectionModel.SIGNAL_EXIT_ONLY,
+        approved_notional_dollars=notional,
+        stated_leverage_multiplier=3.0,
+        stress_exposure_multiplier=3.0,
+        stated_effective_exposure_dollars=notional * 3.0,
+        stress_effective_exposure_dollars=notional * 3.0,
     )
 
 
@@ -229,6 +250,30 @@ class TestPlaceOrderContract:
         broker = _broker_with_mock(api)
         with pytest.raises(TypeError):
             broker.place_order(None)  # type: ignore[arg-type]
+
+    @pytest.mark.parametrize("qty", [10.0, 10.5])
+    def test_signal_exit_only_submits_one_simple_day_order(self, qty):
+        api = MagicMock()
+        api.submit_order.return_value = _alpaca_order(
+            id="stopless-entry", status="filled", qty=qty,
+            filled_qty=qty, filled_avg_price=100.25,
+            symbol="SPXL",
+        )
+        api.get_order_by_id.return_value = api.submit_order.return_value
+        broker = _broker_with_mock(api)
+
+        result = broker.place_order(
+            _stopless_decision(qty=qty), poll_timeout=0.1
+        )
+
+        assert result.status is OrderStatus.FILLED
+        assert result.protection_status == "not_required"
+        assert result.placed_stop_price is None
+        assert api.submit_order.call_count == 1
+        request = api.submit_order.call_args.args[0]
+        assert request.time_in_force.value == "day"
+        assert getattr(request, "order_class", None) is None
+        assert getattr(request, "stop_loss", None) is None
 
 
 class TestBrokerConnections:

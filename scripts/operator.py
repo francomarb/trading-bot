@@ -503,6 +503,19 @@ def cmd_resume_strategy(args: argparse.Namespace) -> int:
     return _enqueue_simple_action(args, action="resume-strategy", expected_confirm="resume")
 
 
+def cmd_resolve_unexpected_protection(args: argparse.Namespace) -> int:
+    if not (args.strategy and args.strategy.strip()):
+        sys.stderr.write(
+            "error: resolve-unexpected-protection requires --strategy <name>\n"
+        )
+        return 2
+    return _enqueue_simple_action(
+        args,
+        action="resolve-unexpected-protection",
+        expected_confirm="resolve",
+    )
+
+
 # ── Subcommand: destructive position controls (Phase C) ─────────
 
 
@@ -677,6 +690,17 @@ def _build_parser() -> argparse.ArgumentParser:
         help="must be literally `resume` to confirm",
     )
 
+    sp_rup = sub.add_parser(
+        "resolve-unexpected-protection",
+        help="clear a reconciliation latch only after broker/substrate proof",
+    )
+    sp_rup.add_argument("--strategy", required=True, help="strategy name")
+    sp_rup.add_argument("--reason", required=True, help="resolution audit note")
+    sp_rup.add_argument(
+        "--confirm", default="",
+        help="must be literally `resolve` to confirm",
+    )
+
     # Phase C — destructive position controls. All three accept a
     # position_uid argument and require --confirm <first-10-hex> of
     # that uid, so a typo can't fire against the wrong position.
@@ -731,6 +755,7 @@ _DISPATCH = {
     "resume-entries": cmd_resume_entries,
     "pause-strategy": cmd_pause_strategy,
     "resume-strategy": cmd_resume_strategy,
+    "resolve-unexpected-protection": cmd_resolve_unexpected_protection,
     "close-position": cmd_close_position,
     "reduce-position": cmd_reduce_position,
     "cancel-position-orders": cmd_cancel_position_orders,
