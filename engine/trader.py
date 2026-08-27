@@ -233,6 +233,44 @@ def _lookback_days(required_bars: int, timeframe: str, config_lookback: int) -> 
     return max(strategy_days, config_lookback)
 
 
+def _recent_bar_alignment_error(
+    execution_index: pd.Index,
+    signal_index: pd.Index,
+    *,
+    required_bars: int,
+) -> str | None:
+    """Describe a recent dual-asset calendar mismatch, or return ``None``.
+
+    Older coverage differences are harmless once both assets supply the full
+    decision window. Inside that window, however, an inner join would silently
+    drop a missing session and could evaluate a stale or mathematically altered
+    signal. Indexes are normalized to UTC so equivalent timezone renderings do
+    not create a false mismatch.
+    """
+    execution_recent = pd.DatetimeIndex(
+        pd.to_datetime(execution_index, utc=True)
+    ).sort_values()[-required_bars:]
+    signal_recent = pd.DatetimeIndex(
+        pd.to_datetime(signal_index, utc=True)
+    ).sort_values()[-required_bars:]
+    if execution_recent.equals(signal_recent):
+        return None
+
+    execution_only = execution_recent.difference(signal_recent)
+    signal_only = signal_recent.difference(execution_recent)
+
+    def _sample(index: pd.DatetimeIndex) -> list[str]:
+        return [timestamp.isoformat() for timestamp in index[-3:]]
+
+    return (
+        f"required_window={required_bars} "
+        f"execution_bars={len(execution_recent)} "
+        f"signal_bars={len(signal_recent)} "
+        f"execution_only={_sample(execution_only)} "
+        f"signal_only={_sample(signal_only)}"
+    )
+
+
 _OPERATOR_HALT_REASON_PREFIXES = ("operator_halt:", "operator_halt_sticky:")
 
 
@@ -1825,6 +1863,22 @@ class TradingEngine:
                     logger.warning(
                         f"{symbol}: signal asset {signal_symbol} returned no bars"
                     )
+                    return
+                required_alignment_bars = max(
+                    strategy.required_bars(), self.config.atr_length + 1
+                )
+                alignment_error = _recent_bar_alignment_error(
+                    df.index,
+                    signal_df.index,
+                    required_bars=required_alignment_bars,
+                )
+                if alignment_error is not None:
+                    message = (
+                        f"{symbol}/{signal_symbol}: dual-asset bars misaligned — "
+                        f"{alignment_error}"
+                    )
+                    logger.warning(message)
+                    self.alerts.stale_data(symbol, message)
                     return
                 signal_columns = [
                     column

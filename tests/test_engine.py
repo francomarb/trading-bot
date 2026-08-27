@@ -47,6 +47,7 @@ from engine.trader import (
     TradingEngine,
     _donchian_exit_observation,
     _lookback_days,
+    _recent_bar_alignment_error,
 )
 from engine.lifecycle_orders import OrderEvent
 from execution.broker import (
@@ -547,6 +548,67 @@ class TestLookbackDays:
 
 
 # ── _process_symbol: every branch ────────────────────────────────────────────
+
+
+class TestDualAssetBarAlignment:
+    """Signal and execution calendars must agree across the decision window."""
+
+    def test_older_coverage_difference_is_allowed(self):
+        execution = _bars(n=60)
+        signal = _bars(n=65)
+
+        assert _recent_bar_alignment_error(
+            execution.index,
+            signal.index,
+            required_bars=50,
+        ) is None
+
+    @pytest.mark.parametrize(
+        "mismatch",
+        ["missing-latest-signal", "missing-latest-execution", "internal-gap"],
+    )
+    def test_recent_mismatch_fails_closed_before_signal_evaluation(
+        self,
+        engine_factory,
+        monkeypatch,
+        mismatch,
+    ):
+        execution = _bars(n=60)
+        signal = execution.copy()
+        if mismatch == "missing-latest-signal":
+            signal = signal.iloc[:-1]
+        elif mismatch == "missing-latest-execution":
+            execution = execution.iloc[:-1]
+        else:
+            signal = signal.drop(signal.index[-10])
+
+        frames = {"SPXL": execution, "SPY": signal}
+
+        def _fetch(symbol, start, end, timeframe="1Day", **kwargs):
+            return frames[symbol], SimpleNamespace(api_calls=0)
+
+        monkeypatch.setattr("engine.trader.fetch_symbol", _fetch)
+        engine, broker = engine_factory(entries=[False] * 59 + [True])
+        engine.alerts = MagicMock()
+        strategy = engine.slots[0].strategy
+        snapshot = _snapshot()
+
+        engine._process_symbol(
+            "SPXL",
+            snapshot,
+            snapshot.account,
+            strategy,
+            engine.slots[0].timeframe,
+            signal_symbol="SPY",
+            data_feed="sip",
+        )
+
+        assert strategy.raw_calls == 0
+        broker.place_order.assert_not_called()
+        engine.alerts.stale_data.assert_called_once()
+        alert_message = engine.alerts.stale_data.call_args.args[1]
+        assert "dual-asset bars misaligned" in alert_message
+        assert "required_window=50" in alert_message
 
 
 class TestProcessSymbol:

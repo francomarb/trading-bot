@@ -124,6 +124,10 @@ strategy-specific risk bypass:
   broker and substrate state.
 - Each trading symbol is statically mapped to its benchmark in a dual-asset
   `StrategySlot`, and both daily series use delayed SIP.
+- Before joining the two series, the engine requires identical bar timestamps
+  throughout the strategy's recent decision window (including ATR warmup).
+  A missing or extra recent bar alerts and skips the cycle; differing older
+  coverage is allowed once both assets supply the complete decision window.
 - The switch is named `LEVERAGED_TREND_PAPER_ENABLED`; startup refuses if it is
   enabled while the account is in live mode.
 

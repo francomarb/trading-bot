@@ -1590,10 +1590,10 @@ class RiskManager:
 
         # Live-trading size multiplier (10.G1): scale down on first live exposure.
         # PLAN 11.47 R2 P1: only apply when sizing produced a positive qty.
-        # max(1, ...) and max(0.01, ...) below were reviving a zero-share
-        # sizing rejection back into a 1-share / 0.01-share order, which on
-        # STOP_LIMIT violates the never-round-up-beyond-budget invariant.
-        # Letting qty stay 0 falls into the POSITION_TOO_SMALL branch below.
+        # Minimum-share floors here used to revive either a zero-share sizing
+        # rejection or a positive quantity that scaled below broker
+        # granularity. Letting qty stay 0 preserves the approved risk budget
+        # and falls into the POSITION_TOO_SMALL branch below.
         if (
             qty > 0
             and settings.LIVE_TRADING
@@ -1604,12 +1604,11 @@ class RiskManager:
                 and signal.order_type is OrderType.MARKET
             )
             if _is_fractional:
-                qty = max(
-                    0.01,
-                    math.floor(qty * settings.LIVE_SIZE_MULTIPLIER * 100) / 100,
+                qty = (
+                    math.floor(qty * settings.LIVE_SIZE_MULTIPLIER * 100) / 100
                 )
             else:
-                qty = max(1, math.floor(qty * settings.LIVE_SIZE_MULTIPLIER))
+                qty = math.floor(qty * settings.LIVE_SIZE_MULTIPLIER)
             if signal.sizing_model is SizingModel.NOTIONAL:
                 approved_notional = qty * float(
                     signal.entry_max_price or signal.reference_price

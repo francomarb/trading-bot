@@ -485,6 +485,45 @@ class TestSignalValidationStopLimit:
         assert isinstance(rej, RiskRejection)
         assert rej.code is RejectionCode.POSITION_TOO_SMALL
 
+    @pytest.mark.parametrize(
+        ("fractional_enabled", "pre_scale_qty"),
+        [
+            pytest.param(False, 1, id="whole-share"),
+            pytest.param(True, 0.02, id="fractional"),
+        ],
+    )
+    def test_live_multiplier_does_not_floor_post_scale_zero(
+        self,
+        monkeypatch,
+        fractional_enabled,
+        pre_scale_qty,
+    ):
+        """A launch multiplier may reject a tiny trade, never enlarge it."""
+        from risk import manager as risk_manager_module
+
+        monkeypatch.setattr(risk_manager_module.settings, "LIVE_TRADING", True)
+        monkeypatch.setattr(
+            risk_manager_module.settings, "LIVE_SIZE_MULTIPLIER", 0.25
+        )
+        monkeypatch.setattr(
+            risk_manager_module.settings,
+            "FRACTIONAL_ENABLED",
+            fractional_enabled,
+        )
+
+        mgr = _mgr(max_position_pct=0.02)
+        monkeypatch.setattr(
+            mgr, "_size_position", lambda *args, **kwargs: pre_scale_qty
+        )
+        rejection = mgr.evaluate(
+            _signal(order_type=OrderType.MARKET, price=100.0, atr=2.5),
+            _account(equity=100_000.0, cash=100_000.0),
+            now=T0,
+        )
+
+        assert isinstance(rejection, RiskRejection)
+        assert rejection.code is RejectionCode.POSITION_TOO_SMALL
+
     def test_stop_limit_sub_share_rejected(self):
         # 1 share at the entry trigger needs ~$100.5 of risk budget.
         # max_position_pct=0.02 → risk_dollars = equity * 0.02. With

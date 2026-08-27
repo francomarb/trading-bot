@@ -54,6 +54,9 @@ persisted policy rather than inferring from a ticker or strategy name. A
 `StrategySlot` may also map an execution symbol to a distinct signal symbol and
 select a per-slot data feed; leveraged trend uses this contract for
 benchmark-close signals and 3x-fund execution on delayed SIP daily bars.
+The engine requires exact timestamp parity across the recent strategy/ATR
+decision window before joining dual-asset frames. A mismatch alerts and skips
+the symbol for that cycle instead of silently evaluating a shortened calendar.
 Fresh and migrated lifecycle databases enforce the policy matrix at the
 database boundary (fresh-table constraints plus migration-safe triggers).
 Signal-exit-only V1 entries are deliberately uncapped DAY market orders;
@@ -606,7 +609,9 @@ The MLEG limit-price sign convention was confirmed against the Alpaca paper API 
 #### Other execution rules
 
 - `DRY_RUN=True` logs orders without submitting (final sanity check before live)
-- `LIVE_SIZE_MULTIPLIER=0.25` scales live position sizes to 25% at launch
+- `LIVE_SIZE_MULTIPLIER=0.25` scales live position sizes down to 25% at launch;
+  quantities below whole/fractional granularity reject as `POSITION_TOO_SMALL`
+  rather than being rounded back up
 - Order errors are caught, logged, and never crash the bot
 - Position ownership is tracked per strategy to prevent cross-strategy interference
 - WebSocket streaming (Phase 10.E1) is the primary fill notification path; REST polling is the fallback
