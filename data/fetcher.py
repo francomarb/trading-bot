@@ -295,7 +295,10 @@ def fetch_latest_quote(
     """
     if not symbol:
         return None
-    captured_at = datetime.now(timezone.utc)
+    # `requested_at` is only for rejection events that have no response to
+    # time against. Freshness MUST be measured from `received_at`, taken
+    # immediately after the response returns -- see the age computation below.
+    requested_at = datetime.now(timezone.utc)
     if max_age_seconds is None:
         max_age_seconds = ARRIVAL_QUOTE_MAX_AGE_SECONDS
     try:
@@ -305,19 +308,25 @@ def fetch_latest_quote(
         )
     except (APIError, Exception) as exc:  # noqa: BLE001 — never raise into trading loop
         logger.warning(f"{symbol}: latest-quote fetch failed: {exc}")
-        _reject(symbol, captured_at, "api_error")
+        _reject(symbol, requested_at, "api_error")
         return None
+    # Taken immediately after the response returns. Using the pre-request time
+    # here subtracts network latency from the age: a quote 10ms old on arrival
+    # reported -45ms after a 50ms round trip and was certified against a
+    # zero-second limit (PR #127 review P1). With the 30s API timeout a
+    # borderline quote could be materially stale and still read as `primary`.
+    received_at = datetime.now(timezone.utc)
     quote = result.get(symbol) if isinstance(result, dict) else None
     if quote is None:
         logger.warning(f"{symbol}: no quote returned for symbol — rejected")
-        _reject(symbol, captured_at, "no_quote")
+        _reject(symbol, received_at, "no_quote")
         return None
     try:
         bid = float(getattr(quote, "bid_price", 0.0) or 0.0)
         ask = float(getattr(quote, "ask_price", 0.0) or 0.0)
     except (TypeError, ValueError):
         logger.warning(f"{symbol}: arrival quote has malformed prices — rejected")
-        _reject(symbol, captured_at, "malformed_prices")
+        _reject(symbol, received_at, "malformed_prices")
         return None
     if not (math.isfinite(bid) and math.isfinite(ask)):
         # NaN/inf reach here as floats and survive every `<= 0` comparison.
@@ -328,7 +337,7 @@ def fetch_latest_quote(
             f"{symbol}: arrival quote has non-finite prices (bid={bid}, ask={ask}) "
             "— rejected"
         )
-        _reject(symbol, captured_at, "non_finite", bid=bid, ask=ask)
+        _reject(symbol, received_at, "non_finite", bid=bid, ask=ask)
         return None
     if bid <= 0 or ask <= 0:
         # Alpaca staff on IEX: "there can be a lot of 0 price and size quotes".
@@ -339,7 +348,7 @@ def fetch_latest_quote(
             f"{symbol}: arrival quote is one-sided (bid={bid}, ask={ask}) "
             "— rejected (expected on IEX; see 10.D1)"
         )
-        _reject(symbol, captured_at, "zero_side", bid=bid, ask=ask)
+        _reject(symbol, received_at, "zero_side", bid=bid, ask=ask)
         return None
     if ask < bid:
         # Crossed book. This function's docstring has claimed to reject crossed
@@ -353,7 +362,7 @@ def fetch_latest_quote(
         logger.warning(
             f"{symbol}: arrival quote is crossed (bid={bid} > ask={ask}) — rejected"
         )
-        _reject(symbol, captured_at, "crossed", bid=bid, ask=ask)
+        _reject(symbol, received_at, "crossed", bid=bid, ask=ask)
         return None
 
     # A LOCKED book (bid == ask) is deliberately allowed: it is a real, if
@@ -369,14 +378,14 @@ def fetch_latest_quote(
         # as an execution-quality benchmark. Reject rather than assume fresh.
         _emit_arrival_quote_event(
             symbol, midpoint, bid, ask, spread_bps,
-            quote_timestamp=None, captured_at=captured_at,
+            quote_timestamp=None, captured_at=received_at,
             age_seconds=None, accepted=False, reason="no_quote_timestamp",
         )
         return None
     try:
         if qts.tzinfo is None:
             qts = qts.replace(tzinfo=timezone.utc)
-        age_seconds = (captured_at - qts).total_seconds()
+        age_seconds = (received_at - qts).total_seconds()
     except (AttributeError, TypeError, ValueError) as exc:
         # A timestamp we cannot do arithmetic on is the same situation as no
         # timestamp: the age is unknowable, so the quote cannot be certified.
@@ -387,7 +396,7 @@ def fetch_latest_quote(
         )
         _emit_arrival_quote_event(
             symbol, midpoint, bid, ask, spread_bps,
-            quote_timestamp=None, captured_at=captured_at,
+            quote_timestamp=None, captured_at=received_at,
             age_seconds=None, accepted=False, reason="bad_quote_timestamp",
         )
         return None
@@ -396,18 +405,22 @@ def fetch_latest_quote(
     accepted = age_seconds <= max_age_seconds
     _emit_arrival_quote_event(
         symbol, midpoint, bid, ask, spread_bps,
-        quote_timestamp=qts, captured_at=captured_at,
+        quote_timestamp=qts, captured_at=received_at,
         age_seconds=age_seconds, accepted=accepted,
-        reason=None if accepted else ("stale_frozen" if is_repeat else "stale"),
+        reason=None if accepted else ("stale_repeat" if is_repeat else "stale"),
         repeat_of_previous=is_repeat, consecutive_repeats=repeats,
     )
     if not accepted:
-        # A quote that is stale AND identical to the previous one is a frozen
-        # book — IEX has stopped publishing for this symbol, rather than merely
-        # lagging. Distinguished in the log because the two call for different
-        # remedies: a lag might be tolerable, a freeze never is.
+        # The quote is stale AND byte-identical to the one we saw last time.
+        # This proves only that NO NEWER QUOTE WAS RETURNED between our two
+        # requests — it does NOT prove the venue stopped publishing. On a
+        # sparse venue or a quiet symbol, an unchanged quote can be legitimate
+        # inactivity. Diagnosing an actual feed failure needs corroboration the
+        # telemetry does not have: market activity on the symbol over the same
+        # interval, or a cross-feed comparison. Named `stale_repeat`, not
+        # "frozen", for exactly that reason (PR #127 review P2).
         frozen = (
-            f" [FROZEN BOOK — same quote {repeats}x in a row]" if is_repeat else ""
+            f" [repeat — same quote returned {repeats}x in a row]" if is_repeat else ""
         )
         logger.warning(
             f"{symbol}: arrival quote rejected as stale — age={age_seconds:.1f}s "
@@ -419,15 +432,18 @@ def fetch_latest_quote(
     return ArrivalQuote(
         symbol=symbol, midpoint=midpoint, bid=bid, ask=ask,
         spread_bps=spread_bps, quote_timestamp=qts,
-        captured_at=captured_at, age_seconds=age_seconds,
+        captured_at=received_at, age_seconds=age_seconds,
     )
 
 
-# Last quote timestamp seen per symbol, for frozen-book detection. Bounded by
+# Last quote timestamp seen per symbol, for repeat detection. Bounded by
 # universe size (~132 symbols). A quote that is BOTH stale and identical to the
-# one we saw last time is a frozen book, which is qualitatively different from
-# a quote that is merely a little behind — the first means IEX has stopped
-# publishing for that symbol, the second is normal for a quiet name.
+# one we saw last time is worth separating from one that is merely a little
+# behind — but it proves only that no newer quote was returned between the two
+# requests, NOT that the venue stopped publishing. On a sparse venue or a quiet
+# symbol that can be legitimate inactivity. Corroborating a real feed failure
+# needs evidence this telemetry does not carry: market activity on the symbol
+# over the same interval, or a cross-feed comparison.
 _LAST_QUOTE_TS: dict[str, datetime] = {}
 
 
@@ -453,7 +469,11 @@ def _reject(
 
 
 def _note_repeat(symbol: str, qts: datetime) -> tuple[bool, int]:
-    """Return (is_repeat, consecutive_repeats) for this symbol's quote stamp."""
+    """Return (is_repeat, consecutive_repeats) for this symbol's quote stamp.
+
+    `is_repeat` means the venue returned the same quote timestamp as last time.
+    It is evidence, not a diagnosis — see the module note above.
+    """
     previous = _LAST_QUOTE_TS.get(symbol)
     is_repeat = previous is not None and previous == qts
     if is_repeat:

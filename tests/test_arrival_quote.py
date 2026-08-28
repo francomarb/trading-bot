@@ -263,18 +263,70 @@ class TestEveryRejectionIsObservable:
         assert self._capture(run)[-1]["reject_reason"] == "api_error"
 
 
-class TestFrozenBookDetection:
+class TestAgeIsMeasuredFromTheResponse:
     """
-    A quote that is stale AND identical to the previous one means IEX has
-    stopped publishing for that symbol, which is qualitatively different from a
-    quote that is merely lagging. Distinguished because the remedies differ.
+    PR #127 review P1. `captured_at` was taken BEFORE the REST call, so network
+    latency was subtracted from the reported age: a quote 10ms old on arrival
+    reported -45ms after a 50ms round trip and was certified against a
+    zero-second limit. With the 30s API timeout a borderline quote could be
+    materially stale and still read as `primary`.
+    """
+
+    @staticmethod
+    def _slow_client(latency_s: float, quote_age_ms: float):
+        class Slow:
+            def get_stock_latest_quote(self, req):
+                import time
+
+                time.sleep(latency_s)
+                q = MagicMock()
+                q.bid_price, q.ask_price = 100.0, 100.10
+                # Age is relative to the moment the response is produced.
+                q.timestamp = dt.datetime.now(dt.timezone.utc) - dt.timedelta(
+                    milliseconds=quote_age_ms
+                )
+                return {"AAA": q}
+
+        return Slow()
+
+    def test_age_is_not_negative_when_the_request_is_slow(self):
+        client = self._slow_client(latency_s=0.05, quote_age_ms=10)
+        with patch.object(fetcher, "_get_client", return_value=client):
+            q = fetch_latest_quote("AAA", max_age_seconds=30.0)
+        assert q is not None
+        assert q.age_seconds > 0, (
+            f"age {q.age_seconds:.3f}s is negative — measured from before the "
+            "request, so network latency was subtracted"
+        )
+        assert q.age_seconds == pytest.approx(0.010, abs=0.02)
+
+    def test_latency_cannot_smuggle_a_quote_past_a_zero_second_limit(self):
+        """The reviewer's exact repro: 50ms request, 10ms-old quote, max_age=0."""
+        client = self._slow_client(latency_s=0.05, quote_age_ms=10)
+        with patch.object(fetcher, "_get_client", return_value=client):
+            assert fetch_latest_quote("AAA", max_age_seconds=0.0) is None
+
+    def test_captured_at_is_after_the_quote_timestamp(self):
+        client = self._slow_client(latency_s=0.02, quote_age_ms=5)
+        with patch.object(fetcher, "_get_client", return_value=client):
+            q = fetch_latest_quote("AAA", max_age_seconds=30.0)
+        assert q.captured_at > q.quote_timestamp
+
+
+class TestStaleRepeatDetection:
+    """
+    A quote that is stale AND identical to the previous one is tagged
+    `stale_repeat`. That is EVIDENCE, not a diagnosis: it proves only that no
+    newer quote was returned between two requests, not that the venue stopped
+    publishing — on a sparse venue or a quiet symbol it can be legitimate
+    inactivity (PR #127 review P2).
     """
 
     def setup_method(self):
         fetcher._LAST_QUOTE_TS.clear()
         fetcher._REPEAT_COUNTS.clear()
 
-    def test_repeated_stale_quote_is_flagged_frozen(self):
+    def test_repeated_stale_quote_is_flagged_as_a_repeat(self):
         ts = dt.datetime.now(dt.timezone.utc) - dt.timedelta(seconds=900)
         events = []
         real = fetcher.logger.bind
@@ -293,11 +345,11 @@ class TestFrozenBookDetection:
 
         assert events[0]["reject_reason"] == "stale"
         assert events[0]["repeat_of_previous"] is False
-        assert events[1]["reject_reason"] == "stale_frozen"
+        assert events[1]["reject_reason"] == "stale_repeat"
         assert events[1]["consecutive_repeats"] == 1
         assert events[2]["consecutive_repeats"] == 2
 
-    def test_a_moving_book_is_not_flagged_frozen(self):
+    def test_a_moving_book_is_not_flagged_as_a_repeat(self):
         """Guards the test above from passing vacuously."""
         events = []
         real = fetcher.logger.bind

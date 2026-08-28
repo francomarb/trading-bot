@@ -346,7 +346,7 @@ measurement, and the existing fallback already expresses that.
 
 `reject_reason` is one of: `api_error`, `no_quote`, `malformed_prices`,
 `non_finite`, `zero_side`, `crossed`, `no_quote_timestamp`,
-`bad_quote_timestamp`, `stale`, `stale_frozen`.
+`bad_quote_timestamp`, `stale`, `stale_repeat`.
 
 Two of these matter more than the rest on IEX:
 
@@ -355,11 +355,18 @@ Two of these matter more than the rest on IEX:
   returned silently — no log, no event — so the one failure mode the vendor
   explicitly warns about was the one we could not see. A morning of all-zero
   quotes was indistinguishable from never having asked.
-- **`stale_frozen`** means the quote was stale **and byte-identical to the
-  previous one for that symbol** — IEX has stopped publishing for it, rather
-  than merely lagging. The distinction matters because the remedies differ: a
-  lag might be tolerable, a freeze never is. `consecutive_repeats` counts how
-  long it has been frozen. It lives in the structured log
+- **`stale_repeat`** means the quote was stale **and byte-identical to the
+  previous one for that symbol**. Read it as *evidence, not a diagnosis*: it
+  proves only that **no newer quote was returned between our two requests**. It
+  does **not** prove the venue stopped publishing — on a sparse venue or a
+  quiet symbol an unchanged quote can be legitimate inactivity.
+  `consecutive_repeats` counts how many requests in a row saw the same stamp.
+
+  **Before concluding a feed failure, corroborate with evidence this telemetry
+  does not carry:** whether the symbol actually traded over the same interval
+  (bars or the tape), or how a second feed quoted it. This matters because the
+  recipe below suggests excluding symbols on the strength of this signal, and
+  excluding a legitimately quiet name would be the wrong call. It lives in the structured log
 rather than on the trade row, following the `credit_spread_pick` precedent;
 correlate by `symbol` + capture time. `bot.jsonl` rotates at 10MB with 30-day
 retention, which outlasts the calibration window.
@@ -401,9 +408,9 @@ EOF
 | pattern | reading | action |
 |---|---|---|
 | `zero_side` dominates | IEX is not quoting these symbols. This is the failure Alpaca staff name explicitly. | Quantified case for paid SIP; no code fix helps. |
-| `stale` / `stale_frozen` dominate, ages large | Quotes are genuinely old — the staleness hypothesis. | The guard is the right fix; consider tuning the threshold down. |
+| `stale` / `stale_repeat` dominate, ages large | Quotes are genuinely old — the staleness hypothesis. | The guard is the right fix; consider tuning the threshold down. |
 | Ages small but spreads large | Books are fresh but **unrepresentative** — the competing hypothesis. | The age guard is treating the wrong cause. Wants a spread-width guard, or SIP. |
-| High `consecutive_repeats` on specific symbols | IEX has stopped publishing for those names specifically. | Consider excluding them from execution-quality measurement rather than the whole feed. |
+| High `consecutive_repeats` on specific symbols | No newer quote was returned for those names. **Not yet a diagnosis** — could be a feed failure OR a legitimately quiet symbol. | Corroborate first: did the symbol trade over that interval? If it traded and the quote never moved, that is a feed failure and those symbols can be excluded from execution-quality measurement. If it did not trade, this is normal inactivity — exclude nothing. |
 | Mostly `ACCEPTED`, few rejections | The feed is behaving; benchmark contamination is not the current problem. | Look elsewhere. |
 
 Counts beat anecdote here: the 2026-08-27 audit that started this work was only
