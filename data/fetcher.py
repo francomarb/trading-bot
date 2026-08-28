@@ -23,6 +23,7 @@ SDK: alpaca-py (official, replaces deprecated alpaca-trade-api).
 from __future__ import annotations
 
 import json
+import math
 import time
 from dataclasses import dataclass
 from datetime import date, datetime, timedelta, timezone
@@ -262,8 +263,10 @@ def fetch_latest_quote(
     """Fetch the latest IEX quote for `symbol` as an arrival-price benchmark.
 
     Returns ``None`` — meaning "no usable benchmark" — when the quote is
-    unavailable, malformed, one-sided (crossed / locked book, pre-market
-    quoting gap), or **older than `max_age_seconds`**. Callers treat ``None``
+    unavailable, malformed, non-finite, one-sided (a zero bid or ask —
+    pre-market quoting gap, halt, illiquid symbol), **crossed** (ask < bid), or
+    **older than `max_age_seconds`**. A locked book (bid == ask) IS accepted;
+    the midpoint is unambiguous and the zero spread is recorded. Callers treat ``None``
     as "fall back to a non-execution-quality benchmark", which is what keeps a
     bad reading out of the calibration pool rather than silently polluting it.
 
@@ -299,9 +302,36 @@ def fetch_latest_quote(
         ask = float(getattr(quote, "ask_price", 0.0) or 0.0)
     except (TypeError, ValueError):
         return None
+    if not (math.isfinite(bid) and math.isfinite(ask)):
+        # NaN/inf reach here as floats and survive every `<= 0` comparison.
+        # The engine's `_finite_or_none` happens to catch them downstream, but
+        # relying on a caller's guard for a contract this function claims to
+        # enforce is how the crossed-book case below slipped through.
+        logger.warning(
+            f"{symbol}: arrival quote has non-finite prices (bid={bid}, ask={ask}) "
+            "— rejected"
+        )
+        return None
     if bid <= 0 or ask <= 0:
         return None
+    if ask < bid:
+        # Crossed book. This function's docstring has claimed to reject crossed
+        # books since it was written, but only ever tested for a zero side, so
+        # a crossed quote was accepted with a plausible-looking finite midpoint
+        # and a NEGATIVE spread. `_finite_or_none` does NOT catch it — the
+        # midpoint is finite and positive — so it would be certified
+        # `arrival_midpoint` / `primary` and enter the calibration pool.
+        # Found in review of PR #127; reproduced with bid=101, ask=100 giving
+        # midpoint 100.50 and spread -99.50 bps.
+        logger.warning(
+            f"{symbol}: arrival quote is crossed (bid={bid} > ask={ask}) — rejected"
+        )
+        return None
 
+    # A LOCKED book (bid == ask) is deliberately allowed: it is a real, if
+    # transient, market state and the midpoint is unambiguous. It records
+    # spread_bps=0.0, which is visible in the arrival_quote event if it later
+    # proves to correlate with bad benchmarks.
     midpoint = (bid + ask) / 2.0
     spread_bps = (ask - bid) / midpoint * 10_000 if midpoint > 0 else float("nan")
 

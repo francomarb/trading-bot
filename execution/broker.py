@@ -935,11 +935,22 @@ class AlpacaBroker:
     # ── Read-side: account, positions, orders ────────────────────────────
 
     def get_latest_quote_midpoint(self, symbol: str) -> float | None:
-        """Return the NBBO midpoint (arrival price) for `symbol` at submission time.
+        """Return the IEX BBO midpoint (arrival price) for `symbol` at submission time.
+
+        NOT the NBBO. This docstring said "NBBO" until 2026-08-28; the request
+        hardcodes `feed=DataFeed.IEX`, which is one venue at roughly 2-3% of
+        consolidated volume. The distinction matters for `10.D1`: an IEX
+        midpoint can be unrepresentative of the consolidated market even when
+        it is perfectly fresh, which is one of the two live hypotheses for the
+        2026-08-27 slippage audit.
 
         Thin convenience wrapper around `data.fetcher.fetch_latest_quote_midpoint`
         so the engine's entry-flow code reads as `broker.get_latest_quote_midpoint(...)`.
-        Returns None on quote-fetch failure or one-sided book — never raises.
+        Returns None on quote-fetch failure, a one-sided or crossed book,
+        non-finite prices, or a quote older than
+        `ARRIVAL_QUOTE_MAX_AGE_SECONDS` — never raises. A None routes the
+        caller to `fallback_latest_close` / quality='fallback', keeping an
+        uncertifiable reading out of the execution-quality pool.
 
         Used by the trading loop to capture the canonical pre-trade
         benchmark for execution-quality slippage measurement

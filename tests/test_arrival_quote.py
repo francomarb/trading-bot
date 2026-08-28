@@ -137,6 +137,49 @@ class TestProvenanceCapture:
         )
 
 
+class TestQuoteShapeValidation:
+    """
+    PR #127 review P2-1. The docstring claimed to reject crossed books since it
+    was written, but only ever tested for a zero side. A crossed quote was
+    accepted with a plausible finite midpoint and a NEGATIVE spread, and
+    `_finite_or_none` does not catch it — so it would be certified
+    `arrival_midpoint` / `primary` and enter the calibration pool.
+    """
+
+    def test_crossed_book_is_rejected(self):
+        """Reproduced in review: bid=101, ask=100 -> mid 100.50, spread -99.50."""
+        with _patched(_quote(age_seconds=1.0, bid=101.0, ask=100.0)):
+            assert fetch_latest_quote("AAA") is None
+
+    def test_locked_book_is_allowed_and_records_zero_spread(self):
+        """Deliberate: a locked book is a real state with an unambiguous
+        midpoint. The zero spread is recorded so it can be revisited if it
+        correlates with bad benchmarks."""
+        with _patched(_quote(age_seconds=1.0, bid=100.0, ask=100.0)):
+            q = fetch_latest_quote("AAA")
+        assert q is not None
+        assert q.midpoint == pytest.approx(100.0)
+        assert q.spread_bps == pytest.approx(0.0)
+
+    @pytest.mark.parametrize("bid,ask", [
+        (float("nan"), 100.0), (100.0, float("nan")),
+        (float("inf"), 100.0), (100.0, float("inf")),
+        (float("-inf"), 100.0),
+    ])
+    def test_non_finite_prices_are_rejected(self, bid, ask):
+        """NaN/inf survive every `<= 0` comparison and produce a NaN/inf
+        midpoint. Rejected here rather than relying on a caller's guard."""
+        with _patched(_quote(age_seconds=1.0, bid=bid, ask=ask)):
+            assert fetch_latest_quote("AAA") is None
+
+    def test_a_crossed_quote_never_yields_a_negative_spread(self):
+        """The invariant: no accepted quote may report a negative spread."""
+        for bid, ask in [(101.0, 100.0), (100.5, 100.0), (200.0, 1.0)]:
+            with _patched(_quote(age_seconds=1.0, bid=bid, ask=ask)):
+                q = fetch_latest_quote("AAA")
+            assert q is None or q.spread_bps >= 0
+
+
 class TestExistingBehaviourPreserved:
     def test_midpoint_wrapper_still_returns_a_float(self):
         with _patched(_quote(age_seconds=1.0)):

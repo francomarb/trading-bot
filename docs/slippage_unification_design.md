@@ -315,6 +315,43 @@ Column semantics:
   - `unavailable`
 - `slippage_benchmark_timestamp`
   - when the benchmark was observed or defined
+  - **Caveat (2026-08-28):** on the `arrival_midpoint` path this stores the
+    *capture* time (`now` at submit), never the quote's own venue timestamp.
+    A quote of any age therefore looked identical in the data, which is how
+    eight contaminated samples entered the pool undetected. The quote's own
+    timestamp, age and spread are now emitted as an `arrival_quote` structured
+    event instead — see the freshness contract below.
+
+### Arrival-quote freshness and provenance contract (10.D1, 2026-08-28)
+
+A quote may only be certified `arrival_midpoint` / `primary` when **all** hold:
+
+| condition | rejected when |
+|---|---|
+| both sides present | `bid <= 0` or `ask <= 0` |
+| both sides finite | `bid` or `ask` is NaN / ±inf |
+| book not crossed | `ask < bid` (locked, `ask == bid`, is allowed) |
+| age known | the quote carries no usable venue timestamp |
+| age fresh | `age > ARRIVAL_QUOTE_MAX_AGE_SECONDS` |
+
+Failing any of these returns `None`, which routes the caller to
+`fallback_latest_close` / `fallback`. The rejection is deliberately *not* a
+new benchmark kind: an uncertifiable quote is not an execution-quality
+measurement, and the existing fallback already expresses that.
+
+**Provenance** is emitted as an `arrival_quote` event on every capture,
+accepted or rejected, carrying `quote_timestamp`, `age_seconds`, `bid`, `ask`,
+`spread_bps`, `accepted` and `reject_reason`. It lives in the structured log
+rather than on the trade row, following the `credit_spread_pick` precedent;
+correlate by `symbol` + capture time. `bot.jsonl` rotates at 10MB with 30-day
+retention, which outlasts the calibration window.
+
+**`ARRIVAL_QUOTE_MAX_AGE_SECONDS` is provisional.** Quote age was never
+recorded before this contract existed, so the 30s default is not calibrated.
+It also addresses only one of two hypotheses for the 2026-08-27 audit: the
+other is that the IEX book was *fresh but unrepresentative*. If captured ages
+come back small while `spread_bps` comes back large, the guard is treating the
+wrong cause and the answer is a spread-width guard or SIP quotes.
 - `slippage_measurement_quality`
   - `primary`
   - `fallback`
