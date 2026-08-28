@@ -202,3 +202,124 @@ class TestExistingBehaviourPreserved:
         client.get_stock_latest_quote.side_effect = RuntimeError("API down")
         with patch.object(fetcher, "_get_client", return_value=client):
             assert fetch_latest_quote("AAA") is None
+
+
+class TestEveryRejectionIsObservable:
+    """
+    Until 2026-08-28 seven `return None` paths were silent — no log, no event.
+    The worst was the zero-side case, which Alpaca staff say is the MOST common
+    failure on IEX ("there can be a lot of 0 price and size quotes"). A morning
+    of all-zero quotes produced no events at all, making "IEX gave us nothing"
+    indistinguishable from "we never asked".
+    """
+
+    @staticmethod
+    def _capture(fn):
+        events = []
+        real = fetcher.logger.bind
+
+        def spy(**kw):
+            if kw.get("event") == "arrival_quote":
+                events.append(kw)
+            return real(**kw)
+
+        with patch.object(fetcher.logger, "bind", side_effect=spy):
+            fn()
+        return events
+
+    @pytest.mark.parametrize("bid,ask,reason", [
+        (0.0, 100.0, "zero_side"),
+        (100.0, 0.0, "zero_side"),
+        (101.0, 100.0, "crossed"),
+        (float("nan"), 100.0, "non_finite"),
+        (100.0, float("inf"), "non_finite"),
+    ])
+    def test_shape_rejections_emit_a_reason(self, bid, ask, reason):
+        def run():
+            with _patched(_quote(age_seconds=1.0, bid=bid, ask=ask)):
+                assert fetch_latest_quote("AAA") is None
+
+        events = self._capture(run)
+        assert events, f"no event emitted for {reason}"
+        assert events[-1]["reject_reason"] == reason
+        assert events[-1]["accepted"] is False
+
+    def test_missing_quote_emits_a_reason(self):
+        def run():
+            client = MagicMock()
+            client.get_stock_latest_quote.return_value = {}
+            with patch.object(fetcher, "_get_client", return_value=client):
+                assert fetch_latest_quote("AAA") is None
+
+        assert self._capture(run)[-1]["reject_reason"] == "no_quote"
+
+    def test_api_failure_emits_a_reason(self):
+        def run():
+            client = MagicMock()
+            client.get_stock_latest_quote.side_effect = RuntimeError("down")
+            with patch.object(fetcher, "_get_client", return_value=client):
+                assert fetch_latest_quote("AAA") is None
+
+        assert self._capture(run)[-1]["reject_reason"] == "api_error"
+
+
+class TestFrozenBookDetection:
+    """
+    A quote that is stale AND identical to the previous one means IEX has
+    stopped publishing for that symbol, which is qualitatively different from a
+    quote that is merely lagging. Distinguished because the remedies differ.
+    """
+
+    def setup_method(self):
+        fetcher._LAST_QUOTE_TS.clear()
+        fetcher._REPEAT_COUNTS.clear()
+
+    def test_repeated_stale_quote_is_flagged_frozen(self):
+        ts = dt.datetime.now(dt.timezone.utc) - dt.timedelta(seconds=900)
+        events = []
+        real = fetcher.logger.bind
+
+        def spy(**kw):
+            if kw.get("event") == "arrival_quote":
+                events.append(kw)
+            return real(**kw)
+
+        with patch.object(fetcher.logger, "bind", side_effect=spy):
+            for _ in range(3):
+                q = _quote(age_seconds=900.0)
+                q.timestamp = ts  # the SAME quote every time
+                with _patched(q, symbol="BBB"):
+                    fetch_latest_quote("BBB")
+
+        assert events[0]["reject_reason"] == "stale"
+        assert events[0]["repeat_of_previous"] is False
+        assert events[1]["reject_reason"] == "stale_frozen"
+        assert events[1]["consecutive_repeats"] == 1
+        assert events[2]["consecutive_repeats"] == 2
+
+    def test_a_moving_book_is_not_flagged_frozen(self):
+        """Guards the test above from passing vacuously."""
+        events = []
+        real = fetcher.logger.bind
+
+        def spy(**kw):
+            if kw.get("event") == "arrival_quote":
+                events.append(kw)
+            return real(**kw)
+
+        with patch.object(fetcher.logger, "bind", side_effect=spy):
+            for age in (900.0, 899.0, 898.0):  # a different quote each time
+                with _patched(_quote(age_seconds=age), symbol="CCC"):
+                    fetch_latest_quote("CCC")
+
+        assert all(e["reject_reason"] == "stale" for e in events)
+        assert all(e["repeat_of_previous"] is False for e in events)
+
+    def test_repeat_state_is_per_symbol(self):
+        ts = dt.datetime.now(dt.timezone.utc) - dt.timedelta(seconds=900)
+        for sym in ("DDD", "EEE"):
+            q = _quote(age_seconds=900.0)
+            q.timestamp = ts
+            with _patched(q, symbol=sym):
+                fetch_latest_quote(sym)
+        assert fetcher._REPEAT_COUNTS == {"DDD": 0, "EEE": 0}

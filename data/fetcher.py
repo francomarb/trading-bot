@@ -295,6 +295,7 @@ def fetch_latest_quote(
     """
     if not symbol:
         return None
+    captured_at = datetime.now(timezone.utc)
     if max_age_seconds is None:
         max_age_seconds = ARRIVAL_QUOTE_MAX_AGE_SECONDS
     try:
@@ -304,14 +305,19 @@ def fetch_latest_quote(
         )
     except (APIError, Exception) as exc:  # noqa: BLE001 — never raise into trading loop
         logger.warning(f"{symbol}: latest-quote fetch failed: {exc}")
+        _reject(symbol, captured_at, "api_error")
         return None
     quote = result.get(symbol) if isinstance(result, dict) else None
     if quote is None:
+        logger.warning(f"{symbol}: no quote returned for symbol — rejected")
+        _reject(symbol, captured_at, "no_quote")
         return None
     try:
         bid = float(getattr(quote, "bid_price", 0.0) or 0.0)
         ask = float(getattr(quote, "ask_price", 0.0) or 0.0)
     except (TypeError, ValueError):
+        logger.warning(f"{symbol}: arrival quote has malformed prices — rejected")
+        _reject(symbol, captured_at, "malformed_prices")
         return None
     if not (math.isfinite(bid) and math.isfinite(ask)):
         # NaN/inf reach here as floats and survive every `<= 0` comparison.
@@ -322,8 +328,18 @@ def fetch_latest_quote(
             f"{symbol}: arrival quote has non-finite prices (bid={bid}, ask={ask}) "
             "— rejected"
         )
+        _reject(symbol, captured_at, "non_finite", bid=bid, ask=ask)
         return None
     if bid <= 0 or ask <= 0:
+        # Alpaca staff on IEX: "there can be a lot of 0 price and size quotes".
+        # This is the single most-expected rejection on this feed, and until
+        # 2026-08-28 it returned silently — no log, no event — so the one
+        # failure mode the vendor warns about was the one we were blind to.
+        logger.warning(
+            f"{symbol}: arrival quote is one-sided (bid={bid}, ask={ask}) "
+            "— rejected (expected on IEX; see 10.D1)"
+        )
+        _reject(symbol, captured_at, "zero_side", bid=bid, ask=ask)
         return None
     if ask < bid:
         # Crossed book. This function's docstring has claimed to reject crossed
@@ -337,6 +353,7 @@ def fetch_latest_quote(
         logger.warning(
             f"{symbol}: arrival quote is crossed (bid={bid} > ask={ask}) — rejected"
         )
+        _reject(symbol, captured_at, "crossed", bid=bid, ask=ask)
         return None
 
     # A LOCKED book (bid == ask) is deliberately allowed: it is a real, if
@@ -346,7 +363,6 @@ def fetch_latest_quote(
     midpoint = (bid + ask) / 2.0
     spread_bps = (ask - bid) / midpoint * 10_000 if midpoint > 0 else float("nan")
 
-    captured_at = datetime.now(timezone.utc)
     qts = getattr(quote, "timestamp", None)
     if qts is None:
         # No venue timestamp — age is unknowable, so this cannot be certified
@@ -376,18 +392,27 @@ def fetch_latest_quote(
         )
         return None
 
+    is_repeat, repeats = _note_repeat(symbol, qts)
     accepted = age_seconds <= max_age_seconds
     _emit_arrival_quote_event(
         symbol, midpoint, bid, ask, spread_bps,
         quote_timestamp=qts, captured_at=captured_at,
         age_seconds=age_seconds, accepted=accepted,
-        reason=None if accepted else "stale",
+        reason=None if accepted else ("stale_frozen" if is_repeat else "stale"),
+        repeat_of_previous=is_repeat, consecutive_repeats=repeats,
     )
     if not accepted:
+        # A quote that is stale AND identical to the previous one is a frozen
+        # book — IEX has stopped publishing for this symbol, rather than merely
+        # lagging. Distinguished in the log because the two call for different
+        # remedies: a lag might be tolerable, a freeze never is.
+        frozen = (
+            f" [FROZEN BOOK — same quote {repeats}x in a row]" if is_repeat else ""
+        )
         logger.warning(
             f"{symbol}: arrival quote rejected as stale — age={age_seconds:.1f}s "
-            f"> {max_age_seconds:.0f}s (mid={midpoint:.4f}, spread={spread_bps:.1f}bps). "
-            "Falling back to a non-execution-quality benchmark."
+            f"> {max_age_seconds:.0f}s (mid={midpoint:.4f}, spread={spread_bps:.1f}bps)"
+            f"{frozen}. Falling back to a non-execution-quality benchmark."
         )
         return None
 
@@ -398,10 +423,56 @@ def fetch_latest_quote(
     )
 
 
+# Last quote timestamp seen per symbol, for frozen-book detection. Bounded by
+# universe size (~132 symbols). A quote that is BOTH stale and identical to the
+# one we saw last time is a frozen book, which is qualitatively different from
+# a quote that is merely a little behind — the first means IEX has stopped
+# publishing for that symbol, the second is normal for a quiet name.
+_LAST_QUOTE_TS: dict[str, datetime] = {}
+
+
+def _reject(
+    symbol: str, captured_at: datetime, reason: str,
+    *, bid: float | None = None, ask: float | None = None,
+) -> None:
+    """Emit an arrival_quote event for a shape/availability rejection.
+
+    Every `return None` in `fetch_latest_quote` routes through here or through
+    the timestamp branches. Until 2026-08-28 seven of them returned silently,
+    so `arrival_quote` recorded a quote only if it survived as far as the age
+    check — meaning a morning of all-zero IEX quotes produced NO events at all
+    and was indistinguishable from never having tried.
+    """
+    _emit_arrival_quote_event(
+        symbol, float("nan"), bid if bid is not None else float("nan"),
+        ask if ask is not None else float("nan"), float("nan"),
+        quote_timestamp=None, captured_at=captured_at,
+        age_seconds=None, accepted=False, reason=reason,
+        repeat_of_previous=None, consecutive_repeats=None,
+    )
+
+
+def _note_repeat(symbol: str, qts: datetime) -> tuple[bool, int]:
+    """Return (is_repeat, consecutive_repeats) for this symbol's quote stamp."""
+    previous = _LAST_QUOTE_TS.get(symbol)
+    is_repeat = previous is not None and previous == qts
+    if is_repeat:
+        count = _REPEAT_COUNTS.get(symbol, 0) + 1
+    else:
+        count = 0
+    _REPEAT_COUNTS[symbol] = count
+    _LAST_QUOTE_TS[symbol] = qts
+    return is_repeat, count
+
+
+_REPEAT_COUNTS: dict[str, int] = {}
+
+
 def _emit_arrival_quote_event(
     symbol: str, midpoint: float, bid: float, ask: float, spread_bps: float,
     *, quote_timestamp, captured_at, age_seconds, accepted: bool,
-    reason: str | None,
+    reason: str | None, repeat_of_previous: bool | None = None,
+    consecutive_repeats: int | None = None,
 ) -> None:
     """Observational only — never blocks a trade, never raises."""
     try:
@@ -417,6 +488,8 @@ def _emit_arrival_quote_event(
             age_seconds=round(age_seconds, 3) if age_seconds is not None else None,
             accepted=accepted,
             reject_reason=reason,
+            repeat_of_previous=repeat_of_previous,
+            consecutive_repeats=consecutive_repeats,
             feed="iex",
         ).debug(f"arrival_quote {symbol} accepted={accepted}")
     except Exception:  # noqa: BLE001 — instrumentation must never break trading

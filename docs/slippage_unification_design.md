@@ -339,9 +339,27 @@ Failing any of these returns `None`, which routes the caller to
 new benchmark kind: an uncertifiable quote is not an execution-quality
 measurement, and the existing fallback already expresses that.
 
-**Provenance** is emitted as an `arrival_quote` event on every capture,
-accepted or rejected, carrying `quote_timestamp`, `age_seconds`, `bid`, `ask`,
-`spread_bps`, `accepted` and `reject_reason`. It lives in the structured log
+**Provenance** is emitted as an `arrival_quote` event on **every** capture and
+**every** rejection, carrying `quote_timestamp`, `age_seconds`, `bid`, `ask`,
+`spread_bps`, `accepted`, `reject_reason`, `repeat_of_previous` and
+`consecutive_repeats`.
+
+`reject_reason` is one of: `api_error`, `no_quote`, `malformed_prices`,
+`non_finite`, `zero_side`, `crossed`, `no_quote_timestamp`,
+`bad_quote_timestamp`, `stale`, `stale_frozen`.
+
+Two of these matter more than the rest on IEX:
+
+- **`zero_side`** is the failure Alpaca staff say is most common on this feed
+  (*"there can be a lot of 0 price and size quotes"*). Until 2026-08-28 it
+  returned silently — no log, no event — so the one failure mode the vendor
+  explicitly warns about was the one we could not see. A morning of all-zero
+  quotes was indistinguishable from never having asked.
+- **`stale_frozen`** means the quote was stale **and byte-identical to the
+  previous one for that symbol** — IEX has stopped publishing for it, rather
+  than merely lagging. The distinction matters because the remedies differ: a
+  lag might be tolerable, a freeze never is. `consecutive_repeats` counts how
+  long it has been frozen. It lives in the structured log
 rather than on the trade row, following the `credit_spread_pick` precedent;
 correlate by `symbol` + capture time. `bot.jsonl` rotates at 10MB with 30-day
 retention, which outlasts the calibration window.
