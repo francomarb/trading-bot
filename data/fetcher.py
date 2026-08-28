@@ -38,7 +38,12 @@ from alpaca.data.timeframe import TimeFrame, TimeFrameUnit
 from loguru import logger
 from requests.adapters import HTTPAdapter
 
-from config.settings import ALPACA_API_KEY, ALPACA_SECRET_KEY, ALPACA_DATA_FEED
+from config.settings import (
+    ALPACA_API_KEY,
+    ALPACA_SECRET_KEY,
+    ALPACA_DATA_FEED,
+    ARRIVAL_QUOTE_MAX_AGE_SECONDS,
+)
 
 
 # ── Paths & constants ────────────────────────────────────────────────────────
@@ -231,31 +236,53 @@ def require_fresh(df: pd.DataFrame, max_age: timedelta, symbol: str, now: dateti
 # ── Arrival-price quote ──────────────────────────────────────────────────────
 
 
-def fetch_latest_quote_midpoint(symbol: str) -> float | None:
-    """Fetch the latest NBBO quote midpoint for `symbol` (the arrival price).
+@dataclass(frozen=True)
+class ArrivalQuote:
+    """A quote captured as the arrival-price benchmark, with its provenance.
 
-    Returns ``(bid + ask) / 2`` when both sides of the book are finite and
-    positive. Returns ``None`` when the quote is unavailable, malformed,
-    or one side is zero (e.g. crossed / locked book, pre-market quoting
-    gap, illiquid symbol).
+    `quote_timestamp` is the venue's own timestamp for the quote — NOT when we
+    fetched it. That distinction is the whole point: before this existed, only
+    the capture time was recorded, so a quote could be arbitrarily old and
+    nothing downstream could tell.
+    """
 
-    This is the canonical pre-trade arrival price for execution-quality
-    slippage measurement per industry TCA practice (Implementation
-    Shortfall vs Arrival Price; see Talos/QuestDB TCA references).
-    Callers in the engine fetch this immediately before submitting an
-    order so that any subsequent fill can be compared against the
-    market state at order-submission time, rather than against the
-    decision-time bar close (which would conflate execution slippage
-    with signal-to-fill alpha decay).
+    symbol: str
+    midpoint: float
+    bid: float
+    ask: float
+    spread_bps: float
+    quote_timestamp: datetime
+    captured_at: datetime
+    age_seconds: float
 
-    Paper-trading note: with the IEX feed (the only one available on a
-    paper Alpaca subscription), the quote represents IEX BBO only, not
-    full SIP NBBO. The midpoint is still the cleanest available
-    arrival-price proxy; production should switch to SIP via the
-    feed override at the client construction layer.
+
+def fetch_latest_quote(
+    symbol: str, *, max_age_seconds: float | None = None,
+) -> ArrivalQuote | None:
+    """Fetch the latest IEX quote for `symbol` as an arrival-price benchmark.
+
+    Returns ``None`` — meaning "no usable benchmark" — when the quote is
+    unavailable, malformed, one-sided (crossed / locked book, pre-market
+    quoting gap), or **older than `max_age_seconds`**. Callers treat ``None``
+    as "fall back to a non-execution-quality benchmark", which is what keeps a
+    bad reading out of the calibration pool rather than silently polluting it.
+
+    Emits an ``arrival_quote`` event on every capture, accepted or rejected,
+    carrying `age_seconds` and `spread_bps`. Those two fields were never
+    recorded before and are what allow the staleness threshold to be
+    calibrated — and, more importantly, what distinguish a stale quote from a
+    fresh-but-wide one. See `ARRIVAL_QUOTE_MAX_AGE_SECONDS` in settings for the
+    audit that motivated this and for the competing hypothesis.
+
+    Paper-trading note: with the IEX feed (the only one available on a paper
+    Alpaca subscription) this is IEX BBO, not full SIP NBBO. IEX is a single
+    venue at roughly 2-3% of consolidated volume, so its book can be
+    unrepresentative even when perfectly fresh.
     """
     if not symbol:
         return None
+    if max_age_seconds is None:
+        max_age_seconds = ARRIVAL_QUOTE_MAX_AGE_SECONDS
     try:
         client = _get_client()
         result = client.get_stock_latest_quote(
@@ -274,7 +301,96 @@ def fetch_latest_quote_midpoint(symbol: str) -> float | None:
         return None
     if bid <= 0 or ask <= 0:
         return None
-    return (bid + ask) / 2.0
+
+    midpoint = (bid + ask) / 2.0
+    spread_bps = (ask - bid) / midpoint * 10_000 if midpoint > 0 else float("nan")
+
+    captured_at = datetime.now(timezone.utc)
+    qts = getattr(quote, "timestamp", None)
+    if qts is None:
+        # No venue timestamp — age is unknowable, so this cannot be certified
+        # as an execution-quality benchmark. Reject rather than assume fresh.
+        _emit_arrival_quote_event(
+            symbol, midpoint, bid, ask, spread_bps,
+            quote_timestamp=None, captured_at=captured_at,
+            age_seconds=None, accepted=False, reason="no_quote_timestamp",
+        )
+        return None
+    try:
+        if qts.tzinfo is None:
+            qts = qts.replace(tzinfo=timezone.utc)
+        age_seconds = (captured_at - qts).total_seconds()
+    except (AttributeError, TypeError, ValueError) as exc:
+        # A timestamp we cannot do arithmetic on is the same situation as no
+        # timestamp: the age is unknowable, so the quote cannot be certified.
+        # Reject rather than raise — this function's contract is that it never
+        # raises into the trading loop.
+        logger.warning(
+            f"{symbol}: arrival quote has an unusable timestamp ({qts!r}): {exc}"
+        )
+        _emit_arrival_quote_event(
+            symbol, midpoint, bid, ask, spread_bps,
+            quote_timestamp=None, captured_at=captured_at,
+            age_seconds=None, accepted=False, reason="bad_quote_timestamp",
+        )
+        return None
+
+    accepted = age_seconds <= max_age_seconds
+    _emit_arrival_quote_event(
+        symbol, midpoint, bid, ask, spread_bps,
+        quote_timestamp=qts, captured_at=captured_at,
+        age_seconds=age_seconds, accepted=accepted,
+        reason=None if accepted else "stale",
+    )
+    if not accepted:
+        logger.warning(
+            f"{symbol}: arrival quote rejected as stale — age={age_seconds:.1f}s "
+            f"> {max_age_seconds:.0f}s (mid={midpoint:.4f}, spread={spread_bps:.1f}bps). "
+            "Falling back to a non-execution-quality benchmark."
+        )
+        return None
+
+    return ArrivalQuote(
+        symbol=symbol, midpoint=midpoint, bid=bid, ask=ask,
+        spread_bps=spread_bps, quote_timestamp=qts,
+        captured_at=captured_at, age_seconds=age_seconds,
+    )
+
+
+def _emit_arrival_quote_event(
+    symbol: str, midpoint: float, bid: float, ask: float, spread_bps: float,
+    *, quote_timestamp, captured_at, age_seconds, accepted: bool,
+    reason: str | None,
+) -> None:
+    """Observational only — never blocks a trade, never raises."""
+    try:
+        logger.bind(
+            event="arrival_quote",
+            symbol=symbol,
+            midpoint=midpoint,
+            bid=bid,
+            ask=ask,
+            spread_bps=round(spread_bps, 2) if spread_bps == spread_bps else None,
+            quote_timestamp=quote_timestamp.isoformat() if quote_timestamp else None,
+            captured_at=captured_at.isoformat(),
+            age_seconds=round(age_seconds, 3) if age_seconds is not None else None,
+            accepted=accepted,
+            reject_reason=reason,
+            feed="iex",
+        ).debug(f"arrival_quote {symbol} accepted={accepted}")
+    except Exception:  # noqa: BLE001 — instrumentation must never break trading
+        pass
+
+
+def fetch_latest_quote_midpoint(symbol: str) -> float | None:
+    """Latest usable arrival midpoint, or ``None``.
+
+    Thin wrapper over `fetch_latest_quote` preserved so existing callers keep
+    their signature. ``None`` now additionally means "the quote was too old to
+    certify", which routes the caller to a fallback benchmark.
+    """
+    quote = fetch_latest_quote(symbol)
+    return quote.midpoint if quote is not None else None
 
 
 # ── Cache ────────────────────────────────────────────────────────────────────

@@ -40,6 +40,38 @@ ALPACA_DATA_FEED: str = os.getenv("ALPACA_DATA_FEED", "iex").lower()
 # offline analysis to SIP removes the approximation.
 BACKTEST_DATA_FEED: str = os.getenv("BACKTEST_DATA_FEED", "sip").lower()
 
+# ── Arrival-quote staleness guard (10.D1) ───────────────────────────────────
+# Maximum age of the IEX quote used as the arrival-price benchmark for
+# execution-quality slippage. Older quotes are rejected, which routes the row
+# to `fallback_latest_close` / quality='fallback' instead of fabricating an
+# `arrival_midpoint` / 'primary' reading.
+#
+# Why: the 2026-08-27 audit found 8 of 15 execution-quality MARKET samples were
+# measured against a benchmark that did not describe the market. Verified
+# against the SIP consolidated tape, the FILL landed inside the traded minute
+# range while the BENCHMARK sat outside it — ARM's benchmark was 3.3% below the
+# market, NVT's 2.2% above. All 8 were within 10 minutes of the open; the 7
+# samples after 10:30 ET are all within ±6 bps of their fills. The defect is
+# symmetric and `adverse = max(0, signed)` hides half of it: ARM logged a
+# −428 bps "price improvement", which a market order cannot achieve.
+#
+# PROVISIONAL — this threshold is not calibrated, because quote age was never
+# recorded before this change. `fetch_latest_quote` now emits an
+# `arrival_quote` event carrying `age_seconds` and `spread_bps` on every
+# capture, accepted or rejected. Revisit once ~20 events exist.
+#
+# It also has to be said that staleness is only ONE of two hypotheses for the
+# audit's finding. The other is that the IEX BBO was fresh but unrepresentative
+# — IEX is a single venue at ~2-3% of consolidated volume, and its book can be
+# wide or thin in the opening minutes. If the recorded ages come back small
+# while `spread_bps` comes back large, this guard is treating the wrong cause
+# and the fix is a spread-width guard or a SIP quote, not a shorter max age.
+# The instrumentation is what tells the two apart; do not assume this setting
+# solved it.
+ARRIVAL_QUOTE_MAX_AGE_SECONDS: float = float(
+    os.getenv("ARRIVAL_QUOTE_MAX_AGE_SECONDS", "30")
+)
+
 # Derived base URL — used only by legacy verify scripts; alpaca-py uses the
 # `paper=` flag on TradingClient directly.
 ALPACA_BASE_URL = (
