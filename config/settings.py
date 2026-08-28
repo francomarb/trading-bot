@@ -68,6 +68,40 @@ BACKTEST_DATA_FEED: str = os.getenv("BACKTEST_DATA_FEED", "sip").lower()
 # and the fix is a spread-width guard or a SIP quote, not a shorter max age.
 # The instrumentation is what tells the two apart; do not assume this setting
 # solved it.
+#
+# What Alpaca actually documents (checked 2026-08-28):
+#   - Latest endpoints are NOT freshness-filtered. Market Data FAQ: "the data
+#     is never manipulated in any way. These endpoints always return the data
+#     as it was received at the time." The endpoint hands back the last quote
+#     it received however old it is, so validating age is the CALLER's job.
+#     https://docs.alpaca.markets/us/docs/market-data-faq
+#   - Quotes carry the field to check it with: `t`, "RFC-3339 formatted
+#     timestamp with nanosecond precision".
+#     https://docs.alpaca.markets/us/docs/real-time-stock-pricing-data
+#   - There is NO official staleness threshold. No max age, no recommended
+#     window, no guidance on validating quote age anywhere in the docs or
+#     forum. 30 is OURS — not a vendor-recommended value. (Alpaca does ship
+#     `data_timeout` staleness detection for STREAMING, disabled by default,
+#     and nothing equivalent for the REST latest-quote endpoint.)
+#   - Alpaca staff advise AGAINST IEX for quotes: "if specifying feed=iex
+#     there can be a lot of 0 price and size quotes", and "do not specify IEX"
+#     unless testing or wanting an estimate. Their freshness assurance is
+#     explicitly conditioned on the full feed — "one can generally expect
+#     there always to be a quote ... when fetching full market data". IEX is
+#     ~2.5% of US equity volume.
+#     https://forum.alpaca.markets/t/understanding-quote-data/13098
+#
+# That last point raises the odds on the fresh-but-unrepresentative
+# hypothesis: a sparse book is exactly what Alpaca describes. It also
+# validates the existing `bid <= 0 or ask <= 0` guard, which rejects the
+# condition they name.
+#
+# BUT THE REMEDY IS NOT FREE. Real-time SIP requires the paid Algo Trader Plus
+# subscription; the free tier's SIP is delayed 15 minutes, which is useless as
+# an arrival price — a 15-minute-old consolidated quote is worse than a stale
+# IEX one. So if the captured ages come back small while `spread_bps` comes
+# back large, the decision is a COST decision (pay for real-time SIP) rather
+# than a threshold tweak. Do not present it as a free fix.
 ARRIVAL_QUOTE_MAX_AGE_SECONDS: float = float(
     os.getenv("ARRIVAL_QUOTE_MAX_AGE_SECONDS", "30")
 )

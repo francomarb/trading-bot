@@ -278,9 +278,20 @@ def fetch_latest_quote(
     audit that motivated this and for the competing hypothesis.
 
     Paper-trading note: with the IEX feed (the only one available on a paper
-    Alpaca subscription) this is IEX BBO, not full SIP NBBO. IEX is a single
-    venue at roughly 2-3% of consolidated volume, so its book can be
-    unrepresentative even when perfectly fresh.
+    Alpaca subscription) this is IEX BBO, not full SIP NBBO. IEX is ~2.5% of US
+    equity volume by Alpaca's own figure, so its book can be unrepresentative
+    even when perfectly fresh.
+
+    Why the age check lives here rather than being the vendor's job (checked
+    2026-08-28): Alpaca's Market Data FAQ states the latest endpoints return
+    "the data ... as it was received at the time" and are "never manipulated in
+    any way" — the last received quote comes back however old it is. They
+    supply the timestamp (`t`, RFC-3339, nanosecond precision) but publish no
+    staleness threshold anywhere, so `ARRIVAL_QUOTE_MAX_AGE_SECONDS` is our
+    number, not theirs. Alpaca staff separately advise against IEX for quotes
+    ("do not specify IEX" unless testing; "there can be a lot of 0 price and
+    size quotes"), which is worth weighing before concluding that staleness —
+    rather than a sparse book — was the cause of the 10.D1 contamination.
     """
     if not symbol:
         return None

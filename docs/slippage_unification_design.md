@@ -349,9 +349,39 @@ retention, which outlasts the calibration window.
 **`ARRIVAL_QUOTE_MAX_AGE_SECONDS` is provisional.** Quote age was never
 recorded before this contract existed, so the 30s default is not calibrated.
 It also addresses only one of two hypotheses for the 2026-08-27 audit: the
-other is that the IEX book was *fresh but unrepresentative*. If captured ages
-come back small while `spread_bps` comes back large, the guard is treating the
-wrong cause and the answer is a spread-width guard or SIP quotes.
+other is that the IEX book was *fresh but unrepresentative*.
+
+#### What Alpaca documents about quote freshness (checked 2026-08-28)
+
+Validating age is **the caller's responsibility**, confirmed by the vendor:
+
+| claim | source |
+|---|---|
+| Latest endpoints are not freshness-filtered — *"the data is never manipulated in any way. These endpoints always return the data as it was received at the time."* The last received quote is returned however old it is. | [Market Data FAQ](https://docs.alpaca.markets/us/docs/market-data-faq) |
+| Quotes carry `t`, an *"RFC-3339 formatted timestamp with nanosecond precision"* — the age is checkable. | [Real-time Stock Data](https://docs.alpaca.markets/us/docs/real-time-stock-pricing-data) |
+| **No official staleness threshold exists** — no max age, no recommended window, no guidance on validating age, in either the docs or the forum. Alpaca ships `data_timeout` staleness detection for *streaming* (disabled by default) and nothing equivalent for REST latest-quote. | docs + forum search |
+| Alpaca staff advise **against IEX for quotes**: *"if specifying `feed=iex` there can be a lot of 0 price and size quotes"*, and *"do not specify IEX"* unless testing or wanting an estimate. Their freshness assurance is conditioned on the full feed — *"one can generally expect there always to be a quote … when fetching full market data"*. IEX is ~2.5% of US equity volume. | [Understanding quote data](https://forum.alpaca.markets/t/understanding-quote-data/13098) |
+
+Two consequences:
+
+1. **30s is ours, not Alpaca's.** Nothing in their documentation supports or
+   contradicts it. Do not cite it as a vendor-recommended value.
+2. **The vendor's own advice raises the odds on the fresh-but-unrepresentative
+   hypothesis.** "A lot of 0 price and size quotes" describes a sparse book,
+   which is that hypothesis almost verbatim. It also independently validates
+   the pre-existing `bid <= 0 or ask <= 0` guard.
+
+#### The remedy is not free
+
+If captured ages come back small while `spread_bps` comes back large, the
+guard is treating the wrong cause — and the answer is **not** a shorter max
+age. It is a spread-width guard, or SIP quotes.
+
+**SIP is a paid dependency.** Real-time SIP requires the Algo Trader Plus
+subscription; the free tier's SIP is delayed 15 minutes, which is useless as
+an arrival price — a 15-minute-old consolidated quote is a worse benchmark
+than a stale IEX one. So that branch is a **cost decision**, not a code
+change, and should be presented to the operator as such.
 - `slippage_measurement_quality`
   - `primary`
   - `fallback`
