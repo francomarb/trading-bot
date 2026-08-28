@@ -293,12 +293,19 @@ def fetch_latest_quote(
     size quotes"), which is worth weighing before concluding that staleness —
     rather than a sparse book — was the cause of the 10.D1 contamination.
     """
-    if not symbol:
-        return None
     # `requested_at` is only for rejection events that have no response to
     # time against. Freshness MUST be measured from `received_at`, taken
     # immediately after the response returns -- see the age computation below.
     requested_at = datetime.now(timezone.utc)
+    if not symbol:
+        # Emitted rather than returned silently so the invariant is
+        # unconditional: EVERY `return None` in this function produces an
+        # arrival_quote event. A caveated invariant ("every rejection except
+        # ...") is one nobody can check; this one has a test that enumerates
+        # the return paths. An empty symbol is a caller bug rather than a feed
+        # condition, and is worth seeing for that reason.
+        _reject(symbol, requested_at, "empty_symbol")
+        return None
     if max_age_seconds is None:
         max_age_seconds = ARRIVAL_QUOTE_MAX_AGE_SECONDS
     try:
@@ -419,13 +426,13 @@ def fetch_latest_quote(
         # telemetry does not have: market activity on the symbol over the same
         # interval, or a cross-feed comparison. Named `stale_repeat`, not
         # "frozen", for exactly that reason (PR #127 review P2).
-        frozen = (
+        repeat_note = (
             f" [repeat — same quote returned {repeats}x in a row]" if is_repeat else ""
         )
         logger.warning(
             f"{symbol}: arrival quote rejected as stale — age={age_seconds:.1f}s "
             f"> {max_age_seconds:.0f}s (mid={midpoint:.4f}, spread={spread_bps:.1f}bps)"
-            f"{frozen}. Falling back to a non-execution-quality benchmark."
+            f"{repeat_note}. Falling back to a non-execution-quality benchmark."
         )
         return None
 

@@ -381,7 +381,7 @@ feed is good enough, count the rejection reasons. Events land in
 ```bash
 python3 - <<'EOF'
 import json, glob, collections
-reasons, ages, spreads, frozen = collections.Counter(), [], [], collections.Counter()
+reasons, ages, spreads, repeats = collections.Counter(), [], [], collections.Counter()
 for f in glob.glob("logs/bot*.jsonl"):
     for line in open(f, errors="ignore"):
         if '"arrival_quote"' not in line:
@@ -393,13 +393,13 @@ for f in glob.glob("logs/bot*.jsonl"):
         if e.get("spread_bps") is not None:
             spreads.append(e["spread_bps"])
         if e.get("consecutive_repeats"):
-            frozen[e["symbol"]] = max(frozen[e["symbol"]], e["consecutive_repeats"])
+            repeats[e["symbol"]] = max(repeats[e["symbol"]], e["consecutive_repeats"])
 print("reject reasons:", dict(reasons))
 print("ages   n=%d median=%.2fs max=%.1fs" % (
     len(ages), sorted(ages)[len(ages)//2], max(ages)) if ages else "no ages")
 print("spreads n=%d median=%.1fbps max=%.1fbps" % (
     len(spreads), sorted(spreads)[len(spreads)//2], max(spreads)) if spreads else "no spreads")
-print("longest frozen books:", frozen.most_common(5))
+print("longest quote-repeat runs:", repeats.most_common(5))
 EOF
 ```
 

@@ -375,3 +375,78 @@ class TestStaleRepeatDetection:
             with _patched(q, symbol=sym):
                 fetch_latest_quote(sym)
         assert fetcher._REPEAT_COUNTS == {"DDD": 0, "EEE": 0}
+
+
+class TestEveryReturnPathEmitsAnEvent:
+    """
+    Keeps the invariant unconditional and checkable: EVERY `return None` in
+    `fetch_latest_quote` produces an arrival_quote event.
+
+    The PR narrative claimed "every rejection is observable" while the
+    empty-symbol guard still returned silently (PR #127 review, non-blocking).
+    A caveated invariant is one nobody can verify, so the caveat was removed
+    from the code rather than added to the prose — and this test enumerates the
+    paths so it stays that way.
+    """
+
+    @staticmethod
+    def _events_for(call):
+        events = []
+        real = fetcher.logger.bind
+
+        def spy(**kw):
+            if kw.get("event") == "arrival_quote":
+                events.append(kw)
+            return real(**kw)
+
+        with patch.object(fetcher.logger, "bind", side_effect=spy):
+            result = call()
+        return result, events
+
+    def test_empty_symbol_emits(self):
+        result, events = self._events_for(lambda: fetch_latest_quote(""))
+        assert result is None
+        assert events and events[-1]["reject_reason"] == "empty_symbol"
+
+    @pytest.mark.parametrize("reason,setup", [
+        ("zero_side", dict(bid=0.0, ask=100.0, age=1.0)),
+        ("crossed", dict(bid=101.0, ask=100.0, age=1.0)),
+        ("non_finite", dict(bid=float("nan"), ask=100.0, age=1.0)),
+        ("stale", dict(bid=100.0, ask=100.1, age=900.0)),
+    ])
+    def test_each_rejection_path_emits(self, reason, setup):
+        fetcher._LAST_QUOTE_TS.clear()
+        fetcher._REPEAT_COUNTS.clear()
+
+        def call():
+            with _patched(_quote(age_seconds=setup["age"], bid=setup["bid"],
+                                 ask=setup["ask"])):
+                return fetch_latest_quote("AAA")
+
+        result, events = self._events_for(call)
+        assert result is None
+        assert events[-1]["reject_reason"] == reason
+
+    def test_no_silent_return_none_remains(self):
+        """
+        Source-level guard: every `return None` inside `fetch_latest_quote`
+        must be preceded by an emit. Counts the emit call sites against the
+        return sites so a newly added silent path fails here.
+        """
+        import inspect
+
+        src = inspect.getsource(fetcher.fetch_latest_quote)
+        # Count STATEMENTS, not substring hits — the function's own comment
+        # explains the invariant using the words "return None", and a naive
+        # count picked that up and reported a phantom silent path.
+        lines = [ln.strip() for ln in src.splitlines()]
+        returns = sum(1 for ln in lines if ln.startswith("return None"))
+        emits = sum(
+            1 for ln in lines
+            if ln.startswith("_reject(") or ln.startswith("_emit_arrival_quote_event(")
+        )
+        assert returns > 0, "no return paths found — the selector is wrong"
+        assert emits >= returns, (
+            f"{returns} `return None` statements but only {emits} emit sites in "
+            "fetch_latest_quote — a rejection would be invisible"
+        )
