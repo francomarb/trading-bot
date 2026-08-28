@@ -364,6 +364,53 @@ rather than on the trade row, following the `credit_spread_pick` precedent;
 correlate by `symbol` + capture time. `bot.jsonl` rotates at 10MB with 30-day
 retention, which outlasts the calibration window.
 
+#### Diagnosing IEX quote reliability (operator recipe)
+
+If arrival benchmarks are going missing, or you are weighing whether the IEX
+feed is good enough, count the rejection reasons. Events land in
+`logs/bot.jsonl` (and its rotations) under `record.extra`, `event ==
+"arrival_quote"`:
+
+```bash
+python3 - <<'EOF'
+import json, glob, collections
+reasons, ages, spreads, frozen = collections.Counter(), [], [], collections.Counter()
+for f in glob.glob("logs/bot*.jsonl"):
+    for line in open(f, errors="ignore"):
+        if '"arrival_quote"' not in line:
+            continue
+        e = json.loads(line)["record"]["extra"]
+        reasons[e.get("reject_reason") or "ACCEPTED"] += 1
+        if e.get("age_seconds") is not None:
+            ages.append(e["age_seconds"])
+        if e.get("spread_bps") is not None:
+            spreads.append(e["spread_bps"])
+        if e.get("consecutive_repeats"):
+            frozen[e["symbol"]] = max(frozen[e["symbol"]], e["consecutive_repeats"])
+print("reject reasons:", dict(reasons))
+print("ages   n=%d median=%.2fs max=%.1fs" % (
+    len(ages), sorted(ages)[len(ages)//2], max(ages)) if ages else "no ages")
+print("spreads n=%d median=%.1fbps max=%.1fbps" % (
+    len(spreads), sorted(spreads)[len(spreads)//2], max(spreads)) if spreads else "no spreads")
+print("longest frozen books:", frozen.most_common(5))
+EOF
+```
+
+**How to read it**, and what each outcome argues for:
+
+| pattern | reading | action |
+|---|---|---|
+| `zero_side` dominates | IEX is not quoting these symbols. This is the failure Alpaca staff name explicitly. | Quantified case for paid SIP; no code fix helps. |
+| `stale` / `stale_frozen` dominate, ages large | Quotes are genuinely old — the staleness hypothesis. | The guard is the right fix; consider tuning the threshold down. |
+| Ages small but spreads large | Books are fresh but **unrepresentative** — the competing hypothesis. | The age guard is treating the wrong cause. Wants a spread-width guard, or SIP. |
+| High `consecutive_repeats` on specific symbols | IEX has stopped publishing for those names specifically. | Consider excluding them from execution-quality measurement rather than the whole feed. |
+| Mostly `ACCEPTED`, few rejections | The feed is behaving; benchmark contamination is not the current problem. | Look elsewhere. |
+
+Counts beat anecdote here: the 2026-08-27 audit that started this work was only
+possible because fills and benchmarks were both on record. The same applies to
+the feed itself — do not argue about IEX quality from memory when the events
+can be counted.
+
 **`ARRIVAL_QUOTE_MAX_AGE_SECONDS` is provisional.** Quote age was never
 recorded before this contract existed, so the 30s default is not calibrated.
 It also addresses only one of two hypotheses for the 2026-08-27 audit: the
