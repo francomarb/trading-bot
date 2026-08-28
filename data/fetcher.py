@@ -23,6 +23,7 @@ SDK: alpaca-py (official, replaces deprecated alpaca-trade-api).
 from __future__ import annotations
 
 import json
+import math
 import time
 from dataclasses import dataclass
 from datetime import date, datetime, timedelta, timezone
@@ -38,7 +39,12 @@ from alpaca.data.timeframe import TimeFrame, TimeFrameUnit
 from loguru import logger
 from requests.adapters import HTTPAdapter
 
-from config.settings import ALPACA_API_KEY, ALPACA_SECRET_KEY, ALPACA_DATA_FEED
+from config.settings import (
+    ALPACA_API_KEY,
+    ALPACA_SECRET_KEY,
+    ALPACA_DATA_FEED,
+    ARRIVAL_QUOTE_MAX_AGE_SECONDS,
+)
 
 
 # ── Paths & constants ────────────────────────────────────────────────────────
@@ -231,31 +237,77 @@ def require_fresh(df: pd.DataFrame, max_age: timedelta, symbol: str, now: dateti
 # ── Arrival-price quote ──────────────────────────────────────────────────────
 
 
-def fetch_latest_quote_midpoint(symbol: str) -> float | None:
-    """Fetch the latest NBBO quote midpoint for `symbol` (the arrival price).
+@dataclass(frozen=True)
+class ArrivalQuote:
+    """A quote captured as the arrival-price benchmark, with its provenance.
 
-    Returns ``(bid + ask) / 2`` when both sides of the book are finite and
-    positive. Returns ``None`` when the quote is unavailable, malformed,
-    or one side is zero (e.g. crossed / locked book, pre-market quoting
-    gap, illiquid symbol).
-
-    This is the canonical pre-trade arrival price for execution-quality
-    slippage measurement per industry TCA practice (Implementation
-    Shortfall vs Arrival Price; see Talos/QuestDB TCA references).
-    Callers in the engine fetch this immediately before submitting an
-    order so that any subsequent fill can be compared against the
-    market state at order-submission time, rather than against the
-    decision-time bar close (which would conflate execution slippage
-    with signal-to-fill alpha decay).
-
-    Paper-trading note: with the IEX feed (the only one available on a
-    paper Alpaca subscription), the quote represents IEX BBO only, not
-    full SIP NBBO. The midpoint is still the cleanest available
-    arrival-price proxy; production should switch to SIP via the
-    feed override at the client construction layer.
+    `quote_timestamp` is the venue's own timestamp for the quote — NOT when we
+    fetched it. That distinction is the whole point: before this existed, only
+    the capture time was recorded, so a quote could be arbitrarily old and
+    nothing downstream could tell.
     """
+
+    symbol: str
+    midpoint: float
+    bid: float
+    ask: float
+    spread_bps: float
+    quote_timestamp: datetime
+    captured_at: datetime
+    age_seconds: float
+
+
+def fetch_latest_quote(
+    symbol: str, *, max_age_seconds: float | None = None,
+) -> ArrivalQuote | None:
+    """Fetch the latest IEX quote for `symbol` as an arrival-price benchmark.
+
+    Returns ``None`` — meaning "no usable benchmark" — when the quote is
+    unavailable, malformed, non-finite, one-sided (a zero bid or ask —
+    pre-market quoting gap, halt, illiquid symbol), **crossed** (ask < bid), or
+    **older than `max_age_seconds`**. A locked book (bid == ask) IS accepted;
+    the midpoint is unambiguous and the zero spread is recorded. Callers treat ``None``
+    as "fall back to a non-execution-quality benchmark", which is what keeps a
+    bad reading out of the calibration pool rather than silently polluting it.
+
+    Emits an ``arrival_quote`` event on every capture, accepted or rejected,
+    carrying `age_seconds` and `spread_bps`. Those two fields were never
+    recorded before and are what allow the staleness threshold to be
+    calibrated — and, more importantly, what distinguish a stale quote from a
+    fresh-but-wide one. See `ARRIVAL_QUOTE_MAX_AGE_SECONDS` in settings for the
+    audit that motivated this and for the competing hypothesis.
+
+    Paper-trading note: with the IEX feed (the only one available on a paper
+    Alpaca subscription) this is IEX BBO, not full SIP NBBO. IEX is ~2.5% of US
+    equity volume by Alpaca's own figure, so its book can be unrepresentative
+    even when perfectly fresh.
+
+    Why the age check lives here rather than being the vendor's job (checked
+    2026-08-28): Alpaca's Market Data FAQ states the latest endpoints return
+    "the data ... as it was received at the time" and are "never manipulated in
+    any way" — the last received quote comes back however old it is. They
+    supply the timestamp (`t`, RFC-3339, nanosecond precision) but publish no
+    staleness threshold anywhere, so `ARRIVAL_QUOTE_MAX_AGE_SECONDS` is our
+    number, not theirs. Alpaca staff separately advise against IEX for quotes
+    ("do not specify IEX" unless testing; "there can be a lot of 0 price and
+    size quotes"), which is worth weighing before concluding that staleness —
+    rather than a sparse book — was the cause of the 10.D1 contamination.
+    """
+    # `requested_at` is only for rejection events that have no response to
+    # time against. Freshness MUST be measured from `received_at`, taken
+    # immediately after the response returns -- see the age computation below.
+    requested_at = datetime.now(timezone.utc)
     if not symbol:
+        # Emitted rather than returned silently so the invariant is
+        # unconditional: EVERY `return None` in this function produces an
+        # arrival_quote event. A caveated invariant ("every rejection except
+        # ...") is one nobody can check; this one has a test that enumerates
+        # the return paths. An empty symbol is a caller bug rather than a feed
+        # condition, and is worth seeing for that reason.
+        _reject(symbol, requested_at, "empty_symbol")
         return None
+    if max_age_seconds is None:
+        max_age_seconds = ARRIVAL_QUOTE_MAX_AGE_SECONDS
     try:
         client = _get_client()
         result = client.get_stock_latest_quote(
@@ -263,18 +315,223 @@ def fetch_latest_quote_midpoint(symbol: str) -> float | None:
         )
     except (APIError, Exception) as exc:  # noqa: BLE001 — never raise into trading loop
         logger.warning(f"{symbol}: latest-quote fetch failed: {exc}")
+        _reject(symbol, requested_at, "api_error")
         return None
+    # Taken immediately after the response returns. Using the pre-request time
+    # here subtracts network latency from the age: a quote 10ms old on arrival
+    # reported -45ms after a 50ms round trip and was certified against a
+    # zero-second limit (PR #127 review P1). With the 30s API timeout a
+    # borderline quote could be materially stale and still read as `primary`.
+    received_at = datetime.now(timezone.utc)
     quote = result.get(symbol) if isinstance(result, dict) else None
     if quote is None:
+        logger.warning(f"{symbol}: no quote returned for symbol — rejected")
+        _reject(symbol, received_at, "no_quote")
         return None
     try:
         bid = float(getattr(quote, "bid_price", 0.0) or 0.0)
         ask = float(getattr(quote, "ask_price", 0.0) or 0.0)
     except (TypeError, ValueError):
+        logger.warning(f"{symbol}: arrival quote has malformed prices — rejected")
+        _reject(symbol, received_at, "malformed_prices")
+        return None
+    if not (math.isfinite(bid) and math.isfinite(ask)):
+        # NaN/inf reach here as floats and survive every `<= 0` comparison.
+        # The engine's `_finite_or_none` happens to catch them downstream, but
+        # relying on a caller's guard for a contract this function claims to
+        # enforce is how the crossed-book case below slipped through.
+        logger.warning(
+            f"{symbol}: arrival quote has non-finite prices (bid={bid}, ask={ask}) "
+            "— rejected"
+        )
+        _reject(symbol, received_at, "non_finite", bid=bid, ask=ask)
         return None
     if bid <= 0 or ask <= 0:
+        # Alpaca staff on IEX: "there can be a lot of 0 price and size quotes".
+        # This is the single most-expected rejection on this feed, and until
+        # 2026-08-28 it returned silently — no log, no event — so the one
+        # failure mode the vendor warns about was the one we were blind to.
+        logger.warning(
+            f"{symbol}: arrival quote is one-sided (bid={bid}, ask={ask}) "
+            "— rejected (expected on IEX; see 10.D1)"
+        )
+        _reject(symbol, received_at, "zero_side", bid=bid, ask=ask)
         return None
-    return (bid + ask) / 2.0
+    if ask < bid:
+        # Crossed book. This function's docstring has claimed to reject crossed
+        # books since it was written, but only ever tested for a zero side, so
+        # a crossed quote was accepted with a plausible-looking finite midpoint
+        # and a NEGATIVE spread. `_finite_or_none` does NOT catch it — the
+        # midpoint is finite and positive — so it would be certified
+        # `arrival_midpoint` / `primary` and enter the calibration pool.
+        # Found in review of PR #127; reproduced with bid=101, ask=100 giving
+        # midpoint 100.50 and spread -99.50 bps.
+        logger.warning(
+            f"{symbol}: arrival quote is crossed (bid={bid} > ask={ask}) — rejected"
+        )
+        _reject(symbol, received_at, "crossed", bid=bid, ask=ask)
+        return None
+
+    # A LOCKED book (bid == ask) is deliberately allowed: it is a real, if
+    # transient, market state and the midpoint is unambiguous. It records
+    # spread_bps=0.0, which is visible in the arrival_quote event if it later
+    # proves to correlate with bad benchmarks.
+    midpoint = (bid + ask) / 2.0
+    spread_bps = (ask - bid) / midpoint * 10_000 if midpoint > 0 else float("nan")
+
+    qts = getattr(quote, "timestamp", None)
+    if qts is None:
+        # No venue timestamp — age is unknowable, so this cannot be certified
+        # as an execution-quality benchmark. Reject rather than assume fresh.
+        _emit_arrival_quote_event(
+            symbol, midpoint, bid, ask, spread_bps,
+            quote_timestamp=None, captured_at=received_at,
+            age_seconds=None, accepted=False, reason="no_quote_timestamp",
+        )
+        return None
+    try:
+        if qts.tzinfo is None:
+            qts = qts.replace(tzinfo=timezone.utc)
+        age_seconds = (received_at - qts).total_seconds()
+    except (AttributeError, TypeError, ValueError) as exc:
+        # A timestamp we cannot do arithmetic on is the same situation as no
+        # timestamp: the age is unknowable, so the quote cannot be certified.
+        # Reject rather than raise — this function's contract is that it never
+        # raises into the trading loop.
+        logger.warning(
+            f"{symbol}: arrival quote has an unusable timestamp ({qts!r}): {exc}"
+        )
+        _emit_arrival_quote_event(
+            symbol, midpoint, bid, ask, spread_bps,
+            quote_timestamp=None, captured_at=received_at,
+            age_seconds=None, accepted=False, reason="bad_quote_timestamp",
+        )
+        return None
+
+    is_repeat, repeats = _note_repeat(symbol, qts)
+    accepted = age_seconds <= max_age_seconds
+    _emit_arrival_quote_event(
+        symbol, midpoint, bid, ask, spread_bps,
+        quote_timestamp=qts, captured_at=received_at,
+        age_seconds=age_seconds, accepted=accepted,
+        reason=None if accepted else ("stale_repeat" if is_repeat else "stale"),
+        repeat_of_previous=is_repeat, consecutive_repeats=repeats,
+    )
+    if not accepted:
+        # The quote is stale AND byte-identical to the one we saw last time.
+        # This proves only that NO NEWER QUOTE WAS RETURNED between our two
+        # requests — it does NOT prove the venue stopped publishing. On a
+        # sparse venue or a quiet symbol, an unchanged quote can be legitimate
+        # inactivity. Diagnosing an actual feed failure needs corroboration the
+        # telemetry does not have: market activity on the symbol over the same
+        # interval, or a cross-feed comparison. Named `stale_repeat`, not
+        # "frozen", for exactly that reason (PR #127 review P2).
+        repeat_note = (
+            f" [repeat — same quote returned {repeats}x in a row]" if is_repeat else ""
+        )
+        logger.warning(
+            f"{symbol}: arrival quote rejected as stale — age={age_seconds:.1f}s "
+            f"> {max_age_seconds:.0f}s (mid={midpoint:.4f}, spread={spread_bps:.1f}bps)"
+            f"{repeat_note}. Falling back to a non-execution-quality benchmark."
+        )
+        return None
+
+    return ArrivalQuote(
+        symbol=symbol, midpoint=midpoint, bid=bid, ask=ask,
+        spread_bps=spread_bps, quote_timestamp=qts,
+        captured_at=received_at, age_seconds=age_seconds,
+    )
+
+
+# Last quote timestamp seen per symbol, for repeat detection. Bounded by
+# universe size (~132 symbols). A quote that is BOTH stale and identical to the
+# one we saw last time is worth separating from one that is merely a little
+# behind — but it proves only that no newer quote was returned between the two
+# requests, NOT that the venue stopped publishing. On a sparse venue or a quiet
+# symbol that can be legitimate inactivity. Corroborating a real feed failure
+# needs evidence this telemetry does not carry: market activity on the symbol
+# over the same interval, or a cross-feed comparison.
+_LAST_QUOTE_TS: dict[str, datetime] = {}
+
+
+def _reject(
+    symbol: str, captured_at: datetime, reason: str,
+    *, bid: float | None = None, ask: float | None = None,
+) -> None:
+    """Emit an arrival_quote event for a shape/availability rejection.
+
+    Every `return None` in `fetch_latest_quote` routes through here or through
+    the timestamp branches. Until 2026-08-28 seven of them returned silently,
+    so `arrival_quote` recorded a quote only if it survived as far as the age
+    check — meaning a morning of all-zero IEX quotes produced NO events at all
+    and was indistinguishable from never having tried.
+    """
+    _emit_arrival_quote_event(
+        symbol, float("nan"), bid if bid is not None else float("nan"),
+        ask if ask is not None else float("nan"), float("nan"),
+        quote_timestamp=None, captured_at=captured_at,
+        age_seconds=None, accepted=False, reason=reason,
+        repeat_of_previous=None, consecutive_repeats=None,
+    )
+
+
+def _note_repeat(symbol: str, qts: datetime) -> tuple[bool, int]:
+    """Return (is_repeat, consecutive_repeats) for this symbol's quote stamp.
+
+    `is_repeat` means the venue returned the same quote timestamp as last time.
+    It is evidence, not a diagnosis — see the module note above.
+    """
+    previous = _LAST_QUOTE_TS.get(symbol)
+    is_repeat = previous is not None and previous == qts
+    if is_repeat:
+        count = _REPEAT_COUNTS.get(symbol, 0) + 1
+    else:
+        count = 0
+    _REPEAT_COUNTS[symbol] = count
+    _LAST_QUOTE_TS[symbol] = qts
+    return is_repeat, count
+
+
+_REPEAT_COUNTS: dict[str, int] = {}
+
+
+def _emit_arrival_quote_event(
+    symbol: str, midpoint: float, bid: float, ask: float, spread_bps: float,
+    *, quote_timestamp, captured_at, age_seconds, accepted: bool,
+    reason: str | None, repeat_of_previous: bool | None = None,
+    consecutive_repeats: int | None = None,
+) -> None:
+    """Observational only — never blocks a trade, never raises."""
+    try:
+        logger.bind(
+            event="arrival_quote",
+            symbol=symbol,
+            midpoint=midpoint,
+            bid=bid,
+            ask=ask,
+            spread_bps=round(spread_bps, 2) if spread_bps == spread_bps else None,
+            quote_timestamp=quote_timestamp.isoformat() if quote_timestamp else None,
+            captured_at=captured_at.isoformat(),
+            age_seconds=round(age_seconds, 3) if age_seconds is not None else None,
+            accepted=accepted,
+            reject_reason=reason,
+            repeat_of_previous=repeat_of_previous,
+            consecutive_repeats=consecutive_repeats,
+            feed="iex",
+        ).debug(f"arrival_quote {symbol} accepted={accepted}")
+    except Exception:  # noqa: BLE001 — instrumentation must never break trading
+        pass
+
+
+def fetch_latest_quote_midpoint(symbol: str) -> float | None:
+    """Latest usable arrival midpoint, or ``None``.
+
+    Thin wrapper over `fetch_latest_quote` preserved so existing callers keep
+    their signature. ``None`` now additionally means "the quote was too old to
+    certify", which routes the caller to a fallback benchmark.
+    """
+    quote = fetch_latest_quote(symbol)
+    return quote.midpoint if quote is not None else None
 
 
 # ── Cache ────────────────────────────────────────────────────────────────────

@@ -315,6 +315,145 @@ Column semantics:
   - `unavailable`
 - `slippage_benchmark_timestamp`
   - when the benchmark was observed or defined
+  - **Caveat (2026-08-28):** on the `arrival_midpoint` path this stores the
+    *capture* time (`now` at submit), never the quote's own venue timestamp.
+    A quote of any age therefore looked identical in the data, which is how
+    eight contaminated samples entered the pool undetected. The quote's own
+    timestamp, age and spread are now emitted as an `arrival_quote` structured
+    event instead — see the freshness contract below.
+
+### Arrival-quote freshness and provenance contract (10.D1, 2026-08-28)
+
+A quote may only be certified `arrival_midpoint` / `primary` when **all** hold:
+
+| condition | rejected when |
+|---|---|
+| both sides present | `bid <= 0` or `ask <= 0` |
+| both sides finite | `bid` or `ask` is NaN / ±inf |
+| book not crossed | `ask < bid` (locked, `ask == bid`, is allowed) |
+| age known | the quote carries no usable venue timestamp |
+| age fresh | `age > ARRIVAL_QUOTE_MAX_AGE_SECONDS` |
+
+Failing any of these returns `None`, which routes the caller to
+`fallback_latest_close` / `fallback`. The rejection is deliberately *not* a
+new benchmark kind: an uncertifiable quote is not an execution-quality
+measurement, and the existing fallback already expresses that.
+
+**Provenance** is emitted as an `arrival_quote` event on **every** capture and
+**every** rejection, carrying `quote_timestamp`, `age_seconds`, `bid`, `ask`,
+`spread_bps`, `accepted`, `reject_reason`, `repeat_of_previous` and
+`consecutive_repeats`.
+
+`reject_reason` is one of: `api_error`, `no_quote`, `malformed_prices`,
+`non_finite`, `zero_side`, `crossed`, `no_quote_timestamp`,
+`bad_quote_timestamp`, `stale`, `stale_repeat`.
+
+Two of these matter more than the rest on IEX:
+
+- **`zero_side`** is the failure Alpaca staff say is most common on this feed
+  (*"there can be a lot of 0 price and size quotes"*). Until 2026-08-28 it
+  returned silently — no log, no event — so the one failure mode the vendor
+  explicitly warns about was the one we could not see. A morning of all-zero
+  quotes was indistinguishable from never having asked.
+- **`stale_repeat`** means the quote was stale **and byte-identical to the
+  previous one for that symbol**. Read it as *evidence, not a diagnosis*: it
+  proves only that **no newer quote was returned between our two requests**. It
+  does **not** prove the venue stopped publishing — on a sparse venue or a
+  quiet symbol an unchanged quote can be legitimate inactivity.
+  `consecutive_repeats` counts how many requests in a row saw the same stamp.
+
+  **Before concluding a feed failure, corroborate with evidence this telemetry
+  does not carry:** whether the symbol actually traded over the same interval
+  (bars or the tape), or how a second feed quoted it. This matters because the
+  recipe below suggests excluding symbols on the strength of this signal, and
+  excluding a legitimately quiet name would be the wrong call. It lives in the structured log
+rather than on the trade row, following the `credit_spread_pick` precedent;
+correlate by `symbol` + capture time. `bot.jsonl` rotates at 10MB with 30-day
+retention, which outlasts the calibration window.
+
+#### Diagnosing IEX quote reliability (operator recipe)
+
+If arrival benchmarks are going missing, or you are weighing whether the IEX
+feed is good enough, count the rejection reasons. Events land in
+`logs/bot.jsonl` (and its rotations) under `record.extra`, `event ==
+"arrival_quote"`:
+
+```bash
+python3 - <<'EOF'
+import json, glob, collections
+reasons, ages, spreads, repeats = collections.Counter(), [], [], collections.Counter()
+for f in glob.glob("logs/bot*.jsonl"):
+    for line in open(f, errors="ignore"):
+        if '"arrival_quote"' not in line:
+            continue
+        e = json.loads(line)["record"]["extra"]
+        reasons[e.get("reject_reason") or "ACCEPTED"] += 1
+        if e.get("age_seconds") is not None:
+            ages.append(e["age_seconds"])
+        if e.get("spread_bps") is not None:
+            spreads.append(e["spread_bps"])
+        if e.get("consecutive_repeats"):
+            repeats[e["symbol"]] = max(repeats[e["symbol"]], e["consecutive_repeats"])
+print("reject reasons:", dict(reasons))
+print("ages   n=%d median=%.2fs max=%.1fs" % (
+    len(ages), sorted(ages)[len(ages)//2], max(ages)) if ages else "no ages")
+print("spreads n=%d median=%.1fbps max=%.1fbps" % (
+    len(spreads), sorted(spreads)[len(spreads)//2], max(spreads)) if spreads else "no spreads")
+print("longest quote-repeat runs:", repeats.most_common(5))
+EOF
+```
+
+**How to read it**, and what each outcome argues for:
+
+| pattern | reading | action |
+|---|---|---|
+| `zero_side` dominates | IEX is not quoting these symbols. This is the failure Alpaca staff name explicitly. | Quantified case for paid SIP; no code fix helps. |
+| `stale` / `stale_repeat` dominate, ages large | Quotes are genuinely old — the staleness hypothesis. | The guard is the right fix; consider tuning the threshold down. |
+| Ages small but spreads large | Books are fresh but **unrepresentative** — the competing hypothesis. | The age guard is treating the wrong cause. Wants a spread-width guard, or SIP. |
+| High `consecutive_repeats` on specific symbols | No newer quote was returned for those names. **Not yet a diagnosis** — could be a feed failure OR a legitimately quiet symbol. | Corroborate first: did the symbol trade over that interval? If it traded and the quote never moved, that is a feed failure and those symbols can be excluded from execution-quality measurement. If it did not trade, this is normal inactivity — exclude nothing. |
+| Mostly `ACCEPTED`, few rejections | The feed is behaving; benchmark contamination is not the current problem. | Look elsewhere. |
+
+Counts beat anecdote here: the 2026-08-27 audit that started this work was only
+possible because fills and benchmarks were both on record. The same applies to
+the feed itself — do not argue about IEX quality from memory when the events
+can be counted.
+
+**`ARRIVAL_QUOTE_MAX_AGE_SECONDS` is provisional.** Quote age was never
+recorded before this contract existed, so the 30s default is not calibrated.
+It also addresses only one of two hypotheses for the 2026-08-27 audit: the
+other is that the IEX book was *fresh but unrepresentative*.
+
+#### What Alpaca documents about quote freshness (checked 2026-08-28)
+
+Validating age is **the caller's responsibility**, confirmed by the vendor:
+
+| claim | source |
+|---|---|
+| Latest endpoints are not freshness-filtered — *"the data is never manipulated in any way. These endpoints always return the data as it was received at the time."* The last received quote is returned however old it is. | [Market Data FAQ](https://docs.alpaca.markets/us/docs/market-data-faq) |
+| Quotes carry `t`, an *"RFC-3339 formatted timestamp with nanosecond precision"* — the age is checkable. | [Real-time Stock Data](https://docs.alpaca.markets/us/docs/real-time-stock-pricing-data) |
+| **No official staleness threshold exists** — no max age, no recommended window, no guidance on validating age, in either the docs or the forum. Alpaca ships `data_timeout` staleness detection for *streaming* (disabled by default) and nothing equivalent for REST latest-quote. | docs + forum search |
+| Alpaca staff advise **against IEX for quotes**: *"if specifying `feed=iex` there can be a lot of 0 price and size quotes"*, and *"do not specify IEX"* unless testing or wanting an estimate. Their freshness assurance is conditioned on the full feed — *"one can generally expect there always to be a quote … when fetching full market data"*. IEX is ~2.5% of US equity volume. | [Understanding quote data](https://forum.alpaca.markets/t/understanding-quote-data/13098) |
+
+Two consequences:
+
+1. **30s is ours, not Alpaca's.** Nothing in their documentation supports or
+   contradicts it. Do not cite it as a vendor-recommended value.
+2. **The vendor's own advice raises the odds on the fresh-but-unrepresentative
+   hypothesis.** "A lot of 0 price and size quotes" describes a sparse book,
+   which is that hypothesis almost verbatim. It also independently validates
+   the pre-existing `bid <= 0 or ask <= 0` guard.
+
+#### The remedy is not free
+
+If captured ages come back small while `spread_bps` comes back large, the
+guard is treating the wrong cause — and the answer is **not** a shorter max
+age. It is a spread-width guard, or SIP quotes.
+
+**SIP is a paid dependency.** Real-time SIP requires the Algo Trader Plus
+subscription; the free tier's SIP is delayed 15 minutes, which is useless as
+an arrival price — a 15-minute-old consolidated quote is a worse benchmark
+than a stale IEX one. So that branch is a **cost decision**, not a code
+change, and should be presented to the operator as such.
 - `slippage_measurement_quality`
   - `primary`
   - `fallback`

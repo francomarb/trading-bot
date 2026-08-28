@@ -608,9 +608,25 @@ class TestFetchLatestQuoteMidpoint:
         return client
 
     def test_returns_midpoint_of_two_sided_quote(self, mock_client):
-        quote = MagicMock(bid_price=100.0, ask_price=100.20)
+        # A real alpaca `Quote` always carries `timestamp: datetime`, and since
+        # the 10.D1 staleness guard the age is what certifies the quote as an
+        # execution-quality benchmark. The original fixture omitted it, which
+        # modelled a quote that cannot exist.
+        import datetime as _dt
+
+        quote = MagicMock(
+            bid_price=100.0, ask_price=100.20,
+            timestamp=_dt.datetime.now(_dt.timezone.utc),
+        )
         mock_client.get_stock_latest_quote.return_value = {"AAPL": quote}
         assert fetcher.fetch_latest_quote_midpoint("AAPL") == pytest.approx(100.10)
+
+    def test_unusable_timestamp_returns_none_rather_than_raising(self, mock_client):
+        """The documented contract is that this never raises into the trading
+        loop. An age we cannot compute means the quote cannot be certified."""
+        quote = MagicMock(bid_price=100.0, ask_price=100.20, timestamp="not-a-datetime")
+        mock_client.get_stock_latest_quote.return_value = {"AAPL": quote}
+        assert fetcher.fetch_latest_quote_midpoint("AAPL") is None
 
     def test_returns_none_on_zero_bid(self, mock_client):
         """One-sided book (pre-market, halt, illiquid) is not a usable
