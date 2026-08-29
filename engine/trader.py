@@ -3167,6 +3167,31 @@ class TradingEngine:
                             order_type=recovered_order_type,
                             sizing_model=recovered_sizing,
                             protection_model=recovered_protection,
+                            risk_budget_dollars=(
+                                float(order_row.risk_budget_dollars)
+                                if getattr(order_row, "risk_budget_dollars", None)
+                                is not None
+                                else None
+                            ),
+                            approved_risk_dollars=(
+                                float(order_row.approved_risk_dollars)
+                                if getattr(order_row, "approved_risk_dollars", None)
+                                is not None
+                                else None
+                            ),
+                            risk_clip_kind=getattr(
+                                order_row, "risk_clip_kind", None
+                            ),
+                            applied_size_multiplier=(
+                                float(order_row.applied_size_multiplier)
+                                if getattr(
+                                    order_row,
+                                    "applied_size_multiplier",
+                                    None,
+                                )
+                                is not None
+                                else None
+                            ),
                             approved_notional_dollars=(
                                 float(getattr(order_row, "approved_notional_dollars"))
                                 if getattr(

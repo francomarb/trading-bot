@@ -49,6 +49,7 @@ The `evaluate` flow (in order of cheapness → expense):
 from __future__ import annotations
 
 import math
+import re
 from collections import defaultdict, deque
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
@@ -68,6 +69,14 @@ from strategies.base import OrderType
 class Side(str, Enum):
     BUY = "buy"
     SELL = "sell"
+
+
+VALID_RISK_CLIP_KINDS = frozenset({
+    "global_notional",
+    "gross_exposure",
+    "cash",
+    "sleeve_notional",
+})
 
 
 @dataclass(frozen=True)
@@ -268,6 +277,14 @@ class RiskDecision:
     # either — caps and whole-share flooring break the identity, giving
     # ANET $895 against a ~$398 budget.
     risk_budget_dollars: float | None = None
+    # Decision-time risk after share-granularity rounding and every cap,
+    # but before the broker fill can move the realized risk. Together with
+    # risk_clip_kind this is the durable acceptance evidence for PLAN 11.48.
+    approved_risk_dollars: float | None = None
+    risk_clip_kind: str | None = None
+    # Launch scaling is independent of the exposure-cap stack. Keeping it
+    # separate preserves the binding cap when both reduce the same order.
+    applied_size_multiplier: float | None = 1.0
     sizing_model: SizingModel = SizingModel.STOP_DISTANCE
     protection_model: ProtectionModel = ProtectionModel.BROKER_STOP
     approved_notional_dollars: float | None = None
@@ -370,6 +387,14 @@ class RiskDecision:
                 raise ValueError("STOP_DISTANCE requires BROKER_STOP protection")
             if self.stop_price is None or self.stop_price <= 0:
                 raise ValueError(f"stop_price must be positive, got {self.stop_price}")
+            if (
+                self.risk_budget_dollars is not None
+                and self.approved_risk_dollars is not None
+                and self.approved_risk_dollars > self.risk_budget_dollars + 1e-6
+            ):
+                raise ValueError(
+                    "approved_risk_dollars must not exceed risk_budget_dollars"
+                )
         elif self.sizing_model is SizingModel.NOTIONAL:
             if self.protection_model is not ProtectionModel.SIGNAL_EXIT_ONLY:
                 raise ValueError("NOTIONAL requires SIGNAL_EXIT_ONLY in V1")
@@ -392,6 +417,18 @@ class RiskDecision:
                 )
         else:
             raise ValueError("DEFINED_MAX_LOSS is not supported by RiskDecision V1")
+        if (
+            self.risk_clip_kind is not None
+            and self.risk_clip_kind not in VALID_RISK_CLIP_KINDS
+        ):
+            raise ValueError(
+                f"risk_clip_kind must be one of {sorted(VALID_RISK_CLIP_KINDS)}"
+            )
+        if (
+            self.applied_size_multiplier is not None
+            and self.applied_size_multiplier <= 0
+        ):
+            raise ValueError("applied_size_multiplier must be positive")
         if self.stated_leverage_multiplier <= 0:
             raise ValueError("stated_leverage_multiplier must be positive")
         if self.stress_exposure_multiplier <= 0:
@@ -1154,7 +1191,7 @@ class RiskManager:
         stop_price: float,
         account: AccountState,
         notional_cap: float | None = None,
-    ) -> float:
+    ) -> tuple[float, str | None]:
         """
         Fixed-fractional sizing on stop distance:
             risk_dollars = equity * risk_per_trade_pct[strategy]
@@ -1176,7 +1213,6 @@ class RiskManager:
           Broker uses OTO GTC exactly as before — this path is byte-for-byte
           identical to the pre-fractional implementation.
         """
-        import re
         is_option = bool(re.match(r"^[A-Z]{1,6}[0-9]{6}[CP][0-9]{8}$", signal.symbol))
 
         # Choose floor function based on fractional mode.
@@ -1216,13 +1252,13 @@ class RiskManager:
         risk_dollars = self.risk_budget_dollars(account, signal.strategy_name)
         stop_distance = abs(sizing_price - stop_price)
         if stop_distance <= 0:
-            return 0
+            return 0, None
 
         multiplier = 100.0 if is_option else 1.0
 
         raw_qty = _floor(risk_dollars / (stop_distance * multiplier))
         if raw_qty <= 0:
-            return 0
+            return 0, None
 
         # The caps below are brakes, not the sizer. Track which one (if
         # any) overrules the risk-sized qty so the clip is visible in the
@@ -1231,6 +1267,7 @@ class RiskManager:
         # drifted below the risk target's coverage point.
         risk_qty = raw_qty
         binding_cap: str | None = None
+        binding_cap_kind: str | None = None
 
         # Cap by per-position notional budget so tight stops do not consume
         # the whole sleeve in a single position.
@@ -1240,6 +1277,7 @@ class RiskManager:
             if notional_qty_cap < raw_qty:
                 raw_qty = notional_qty_cap
                 binding_cap = f"global notional cap ${max_position_notional:,.0f}"
+                binding_cap_kind = "global_notional"
 
         # Cap by remaining gross-exposure budget.
         max_gross = account.equity * self.max_gross_exposure_pct
@@ -1249,6 +1287,7 @@ class RiskManager:
             if gross_qty_cap < raw_qty:
                 raw_qty = gross_qty_cap
                 binding_cap = f"remaining gross exposure ${remaining_gross:,.0f}"
+                binding_cap_kind = "gross_exposure"
 
         # Cap by cash on hand (a buy must be payable).
         if signal.side is Side.BUY and sizing_price > 0:
@@ -1256,6 +1295,7 @@ class RiskManager:
             if cash_qty_cap < raw_qty:
                 raw_qty = cash_qty_cap
                 binding_cap = f"cash on hand ${max(0.0, account.cash):,.0f}"
+                binding_cap_kind = "cash"
 
         # Cap by sleeve budget (supplied by SleeveAllocator when active).
         # This prevents one strategy from consuming another's reserved capital.
@@ -1264,6 +1304,7 @@ class RiskManager:
             if sleeve_qty_cap < raw_qty:
                 raw_qty = sleeve_qty_cap
                 binding_cap = f"sleeve notional_cap=${notional_cap:,.0f}"
+                binding_cap_kind = "sleeve_notional"
 
         raw_qty = max(raw_qty, 0)
         if binding_cap is not None and raw_qty < risk_qty:
@@ -1274,7 +1315,7 @@ class RiskManager:
                 f"risk ${implied_risk:,.0f} vs target ${risk_dollars:,.0f} "
                 f"({risk_dollars / account.equity:.2%} of equity)"
             )
-        return raw_qty
+        return raw_qty, binding_cap_kind
 
     def _size_notional_position(
         self,
@@ -1541,6 +1582,8 @@ class RiskManager:
         # 6. Sizing and, only where required, stop construction.
         stop_price: float | None = None
         approved_notional: float | None = None
+        risk_clip_kind: str | None = None
+        applied_size_multiplier = 1.0
         if signal.sizing_model is SizingModel.NOTIONAL:
             try:
                 qty, approved_notional = self._size_notional_position(
@@ -1584,7 +1627,7 @@ class RiskManager:
 
         if signal.sizing_model is SizingModel.STOP_DISTANCE:
             assert stop_price is not None
-            qty = self._size_position(
+            qty, risk_clip_kind = self._size_position(
                 signal, stop_price, account, notional_cap=notional_cap
             )
 
@@ -1599,6 +1642,7 @@ class RiskManager:
             and settings.LIVE_TRADING
             and settings.LIVE_SIZE_MULTIPLIER != 1.0
         ):
+            applied_size_multiplier = settings.LIVE_SIZE_MULTIPLIER
             _is_fractional = (
                 settings.FRACTIONAL_ENABLED
                 and signal.order_type is OrderType.MARKET
@@ -1647,6 +1691,26 @@ class RiskManager:
                 signal,
             )
 
+        approved_risk_dollars: float | None = None
+        if signal.sizing_model is SizingModel.STOP_DISTANCE:
+            assert stop_price is not None
+            sizing_price = (
+                signal.limit_price
+                if signal.order_type is OrderType.STOP_LIMIT
+                and signal.limit_price is not None
+                else signal.reference_price
+            )
+            contract_multiplier = (
+                100.0
+                if re.match(r"^[A-Z]{1,6}[0-9]{6}[CP][0-9]{8}$", signal.symbol)
+                else 1.0
+            )
+            approved_risk_dollars = (
+                abs(float(sizing_price) - float(stop_price))
+                * float(qty)
+                * contract_multiplier
+            )
+
         decision = RiskDecision(
             symbol=signal.symbol,
             side=signal.side,
@@ -1667,6 +1731,9 @@ class RiskManager:
             risk_budget_dollars=self.risk_budget_dollars(
                 account, signal.strategy_name,
             ) if signal.sizing_model is SizingModel.STOP_DISTANCE else None,
+            approved_risk_dollars=approved_risk_dollars,
+            risk_clip_kind=risk_clip_kind,
+            applied_size_multiplier=applied_size_multiplier,
             sizing_model=signal.sizing_model,
             protection_model=signal.protection_model,
             approved_notional_dollars=approved_notional,

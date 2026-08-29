@@ -145,6 +145,34 @@ class TestInsertPending:
         assert row.slippage_benchmark_timestamp == "2026-06-12T10:00:00+00:00"
         assert row.slippage_measurement_quality == "primary"
 
+    def test_captures_decision_time_risk_evidence(
+        self,
+        pos_store: PositionLifecycleStore,
+        orders_store: PositionLifecycleOrdersStore,
+    ):
+        uid = _seed_position(pos_store)
+        row_id = orders_store.insert_pending(
+            position_uid=uid,
+            role="entry_primary",
+            client_order_id="sma-risk-evidence",
+            order_type="market",
+            order_class="oto",
+            time_in_force="gtc",
+            side="buy",
+            intended_qty=10.0,
+            risk_budget_dollars=600.0,
+            approved_risk_dollars=480.0,
+            risk_clip_kind="sleeve_notional",
+            applied_size_multiplier=0.25,
+        )
+
+        row = orders_store.get_by_id(row_id)
+        assert row is not None
+        assert row.risk_budget_dollars == pytest.approx(600.0)
+        assert row.approved_risk_dollars == pytest.approx(480.0)
+        assert row.risk_clip_kind == "sleeve_notional"
+        assert row.applied_size_multiplier == pytest.approx(0.25)
+
     def test_rejects_invalid_role(
         self,
         pos_store: PositionLifecycleStore,

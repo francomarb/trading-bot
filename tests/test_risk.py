@@ -476,7 +476,7 @@ class TestSignalValidationStopLimit:
         monkeypatch.setattr(risk_manager_module.settings, "FRACTIONAL_ENABLED", True)
 
         mgr = _mgr(max_position_pct=0.02)
-        monkeypatch.setattr(mgr, "_size_position", lambda *a, **k: 0)
+        monkeypatch.setattr(mgr, "_size_position", lambda *a, **k: (0, None))
         rej = mgr.evaluate(
             _signal(order_type=OrderType.MARKET, price=100.0, atr=2.5),
             _account(equity=100_000.0, cash=100_000.0),
@@ -513,7 +513,9 @@ class TestSignalValidationStopLimit:
 
         mgr = _mgr(max_position_pct=0.02)
         monkeypatch.setattr(
-            mgr, "_size_position", lambda *args, **kwargs: pre_scale_qty
+            mgr,
+            "_size_position",
+            lambda *args, **kwargs: (pre_scale_qty, None),
         )
         rejection = mgr.evaluate(
             _signal(order_type=OrderType.MARKET, price=100.0, atr=2.5),
@@ -734,6 +736,36 @@ class TestPerStrategyRiskTargets:
         assert isinstance(result, RiskDecision)
         loss_at_stop = result.qty * (result.entry_reference_price - result.stop_price)
         assert loss_at_stop == pytest.approx(400.0, rel=0.01)
+        assert result.risk_budget_dollars == pytest.approx(400.0)
+        assert result.approved_risk_dollars == pytest.approx(loss_at_stop)
+        assert result.risk_clip_kind is None
+
+    def test_whole_share_rounding_is_not_a_failed_target(self):
+        # ARM-like RSI example: the target supports 6.15 shares, so the
+        # broker-valid whole-share decision is 6 shares. The unused risk is
+        # smaller than one share's stop risk and no cap is involved.
+        mgr = self._target_mgr(max_position_notional_pct=1.0)
+        result = mgr.evaluate(
+            _signal(
+                strategy="rsi_reversion",
+                price=243.41,
+                atr=20.31,
+                order_type=OrderType.LIMIT,
+                limit_price=243.41,
+            ),
+            _account(equity=100_000.0),
+            now=T0,
+        )
+        assert isinstance(result, RiskDecision)
+        assert result.qty == 6
+        assert result.risk_clip_kind is None
+        assert result.approved_risk_dollars is not None
+        assert result.risk_budget_dollars is not None
+        one_share_risk = result.entry_reference_price - result.stop_price
+        assert result.approved_risk_dollars <= result.risk_budget_dollars
+        assert (
+            result.risk_budget_dollars - result.approved_risk_dollars
+        ) < one_share_risk
 
     def test_equal_dollar_risk_across_volatility(self):
         """The point of 11.48: calm and wild names lose the same dollars
@@ -771,6 +803,8 @@ class TestPerStrategyRiskTargets:
         assert isinstance(result, RiskDecision)
         loss_at_stop = result.qty * (result.entry_reference_price - result.stop_price)
         assert loss_at_stop == pytest.approx(200.0, rel=0.01)
+        assert result.approved_risk_dollars == pytest.approx(loss_at_stop)
+        assert result.risk_clip_kind == "global_notional"
         logged = "".join(messages)
         assert "clipped by" in logged
         assert "global notional cap" in logged
@@ -792,7 +826,53 @@ class TestPerStrategyRiskTargets:
             loguru_logger.remove(sink_id)
         assert isinstance(result, RiskDecision)
         assert result.qty * 100.0 <= 8_000.0
+        assert result.risk_clip_kind == "sleeve_notional"
         assert "sleeve notional_cap" in "".join(messages)
+
+    @pytest.mark.parametrize(
+        ("live", "notional_cap", "expected_qty", "expected_clip"),
+        [
+            (False, None, 62, None),
+            (False, 3_000.0, 30, "sleeve_notional"),
+            (True, None, 15, None),
+            (True, 3_000.0, 7, "sleeve_notional"),
+        ],
+        ids=("paper-clean", "paper-cap", "live-clean", "live-cap"),
+    )
+    def test_live_multiplier_is_separate_from_binding_cap(
+        self,
+        monkeypatch,
+        live,
+        notional_cap,
+        expected_qty,
+        expected_clip,
+    ):
+        from risk import manager as risk_manager_module
+
+        monkeypatch.setattr(risk_manager_module.settings, "LIVE_TRADING", live)
+        monkeypatch.setattr(
+            risk_manager_module.settings, "LIVE_SIZE_MULTIPLIER", 0.25
+        )
+        mgr = self._target_mgr(max_position_notional_pct=1.0)
+        result = mgr.evaluate(
+            _signal(
+                strategy="rsi_reversion",
+                price=100.0,
+                atr=2.0,
+                order_type=OrderType.LIMIT,
+                limit_price=100.0,
+            ),
+            _account(equity=100_000.0),
+            now=T0,
+            notional_cap=notional_cap,
+        )
+
+        assert isinstance(result, RiskDecision)
+        assert result.qty == expected_qty
+        assert result.risk_clip_kind == expected_clip
+        assert result.applied_size_multiplier == pytest.approx(
+            0.25 if live else 1.0
+        )
 
     def test_fallback_to_global_ceiling_for_unlisted_strategy(self):
         # Strategies without a target (options/credit-spread paths) keep

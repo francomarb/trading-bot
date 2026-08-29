@@ -1,13 +1,8 @@
 # Allocator Risk-Target Reconciliation
 
-**Status:** ACCEPTED 2026-07-13 (operator sign-off on the §6 targets as
-proposed: donchian 0.40% / sma 0.60% / rsi 0.25%). Implemented per §7 on
-`feat/allocator-risk-targets`: `STRATEGY_ALLOCATIONS[*].risk_per_trade_pct`
-+ derived `STRATEGY_RISK_PER_TRADE_PCT` with import-time validation,
-per-strategy sizing + binding-cap clip logging in
-`RiskManager._size_position`, tests in
-`tests/test_risk.py::TestPerStrategyRiskTargets`. Paper acceptance per §8
-pending.
+**Status:** VERIFIED 2026-08-28. Per-strategy targets are implemented and the
+paper sample passed the decision-time acceptance rules in §8. Decision budget,
+approved risk, and any binding cap are durable across late fills.
 **Date:** 2026-07-13
 **Origin:** Donchian trade-profile audit (2026-07-12) and the RiskManager
 sizing audit that followed it (see PR #82 for the P&L-integrity fixes that
@@ -126,7 +121,7 @@ Notes:
   falls below whole/fractional share granularity, the entry rejects as
   `POSITION_TOO_SMALL`; the multiplier never rounds the trade back up.
 
-## 7. Implementation sketch (single PR once §6 is signed off)
+## 7. Implementation
 
 1. `config/settings.py`: add `risk_per_trade_pct` to `STRATEGY_ALLOCATIONS`
    entries (equity strategies only), with a validation check that each is
@@ -142,19 +137,34 @@ Notes:
    asserting risk rule binds above the coverage point and the cap clips below
    it; regression test that two same-cycle signals receive equal risk when
    capital is ample.
-5. No changes to: entry signals, stops, exits, sleeve budgets, priorities,
+5. Persist `risk_budget_dollars`, `approved_risk_dollars`, `risk_clip_kind`,
+   and `applied_size_multiplier` on the pending order before submission.
+   Late-fill recovery copies those values to the trade row. The launch
+   multiplier is separate so it cannot overwrite the binding exposure cap.
+6. No changes to: entry signals, stops, exits, sleeve budgets, priorities,
    stretch, count rails, options/credit-spread sizing, drawdown gates.
 
-## 8. Acceptance / verification (paper, evidence-gated per house rule)
+## 8. Acceptance / verification
 
-1. After the first 6 equity entries post-deploy: `initial_risk_dollars`
-   within ±10% of `T × equity` for every entry whose ATR% is above the
-   coverage point; clipped entries logged with the binding cap.
-2. No recurrence of the freed-capital lottery: two entries in the same cycle
-   differ in risk only via the documented caps.
-3. `strategy_lifecycle_counters.sleeve_blocked` does not materially exceed
-   its pre-change baseline (guards against re-creating the v1 starvation
-   problem this must not reintroduce).
+Decision-time sizing is the acceptance surface; fill-time risk is a separate
+execution result.
+
+1. `approved_risk_dollars` never exceeds `risk_budget_dollars`.
+2. Without a cap or launch multiplier, unused risk is smaller than one broker
+   quantity increment times the decision stop distance (one share for
+   whole-share orders, 0.01 share for fractional orders).
+3. If a cap reduces quantity, `risk_clip_kind` names the binding cap.
+4. `applied_size_multiplier` records launch scaling independently of caps.
+5. Same-cycle entries differ only through quantity granularity, a named cap,
+   or the stored multiplier, and sleeve-block counters show no material
+   regression.
+
+**Paper result, 2026-08-28:** five unclipped entries passed. PWR and KBE were
+named sleeve-cap clips. ARM was valid whole-share rounding; its favourable
+fill reduced fill-time risk and was not a sizing failure. No freed-capital
+lottery or sleeve-starvation regression was found. The late-fill MRVL row
+exposed the missing durable fields fixed in §7; historical NULLs remain NULL
+because reconstructing them would fabricate evidence.
 
 ## 9. Rejection / re-open conditions
 

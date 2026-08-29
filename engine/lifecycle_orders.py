@@ -73,6 +73,10 @@ CREATE TABLE IF NOT EXISTS position_lifecycle_orders (
     sizing_model                  TEXT,
     protection_model              TEXT,
     approved_notional_dollars     REAL,
+    risk_budget_dollars           REAL,
+    approved_risk_dollars         REAL,
+    risk_clip_kind                TEXT,
+    applied_size_multiplier       REAL,
     stated_leverage_multiplier    REAL,
     stress_exposure_multiplier    REAL,
     stated_effective_exposure_dollars REAL,
@@ -675,6 +679,10 @@ class PositionLifecycleOrderRow:
     sizing_model: str | None
     protection_model: str | None
     approved_notional_dollars: float | None
+    risk_budget_dollars: float | None
+    approved_risk_dollars: float | None
+    risk_clip_kind: str | None
+    applied_size_multiplier: float | None
     stated_leverage_multiplier: float | None
     stress_exposure_multiplier: float | None
     stated_effective_exposure_dollars: float | None
@@ -708,7 +716,9 @@ _SELECT_LIFECYCLE_ORDER_COLUMNS = (
     "order_type, order_class, time_in_force, side, intended_qty, "
     "intended_stop_price, intended_trigger_price, intended_limit_price, "
     "intended_take_profit_price, sizing_model, protection_model, "
-    "approved_notional_dollars, stated_leverage_multiplier, "
+    "approved_notional_dollars, risk_budget_dollars, "
+    "approved_risk_dollars, risk_clip_kind, applied_size_multiplier, "
+    "stated_leverage_multiplier, "
     "stress_exposure_multiplier, stated_effective_exposure_dollars, "
     "stress_effective_exposure_dollars, parent_order_id, replaces_order_id, "
     "origin_kind, operator_command_uid, "
@@ -740,26 +750,30 @@ def _row_from_tuple(row: tuple) -> PositionLifecycleOrderRow:
         sizing_model=row[14],
         protection_model=row[15],
         approved_notional_dollars=row[16],
-        stated_leverage_multiplier=row[17],
-        stress_exposure_multiplier=row[18],
-        stated_effective_exposure_dollars=row[19],
-        stress_effective_exposure_dollars=row[20],
-        parent_order_id=row[21],
-        replaces_order_id=row[22],
-        origin_kind=row[23],
-        operator_command_uid=row[24],
-        slippage_benchmark_price=row[25],
-        slippage_benchmark_kind=row[26],
-        slippage_benchmark_timestamp=row[27],
-        slippage_measurement_quality=row[28],
-        status=row[29],
-        filled_qty=row[30],
-        avg_fill_price=row[31],
-        created_at=row[32],
-        submitted_at=row[33],
-        terminal_at=row[34],
-        last_observed_broker_updated_at=row[35],
-        last_observed_at=row[36],
+        risk_budget_dollars=row[17],
+        approved_risk_dollars=row[18],
+        risk_clip_kind=row[19],
+        applied_size_multiplier=row[20],
+        stated_leverage_multiplier=row[21],
+        stress_exposure_multiplier=row[22],
+        stated_effective_exposure_dollars=row[23],
+        stress_effective_exposure_dollars=row[24],
+        parent_order_id=row[25],
+        replaces_order_id=row[26],
+        origin_kind=row[27],
+        operator_command_uid=row[28],
+        slippage_benchmark_price=row[29],
+        slippage_benchmark_kind=row[30],
+        slippage_benchmark_timestamp=row[31],
+        slippage_measurement_quality=row[32],
+        status=row[33],
+        filled_qty=row[34],
+        avg_fill_price=row[35],
+        created_at=row[36],
+        submitted_at=row[37],
+        terminal_at=row[38],
+        last_observed_broker_updated_at=row[39],
+        last_observed_at=row[40],
     )
 
 
@@ -813,6 +827,10 @@ class PositionLifecycleOrdersStore:
         sizing_model: SizingModel | None = None,
         protection_model: ProtectionModel | None = None,
         approved_notional_dollars: float | None = None,
+        risk_budget_dollars: float | None = None,
+        approved_risk_dollars: float | None = None,
+        risk_clip_kind: str | None = None,
+        applied_size_multiplier: float | None = None,
         stated_leverage_multiplier: float | None = None,
         stress_exposure_multiplier: float | None = None,
         stated_effective_exposure_dollars: float | None = None,
@@ -873,6 +891,8 @@ class PositionLifecycleOrdersStore:
                 intended_stop_price, intended_trigger_price,
                 intended_limit_price, intended_take_profit_price,
                 sizing_model, protection_model, approved_notional_dollars,
+                risk_budget_dollars, approved_risk_dollars, risk_clip_kind,
+                applied_size_multiplier,
                 stated_leverage_multiplier, stress_exposure_multiplier,
                 stated_effective_exposure_dollars,
                 stress_effective_exposure_dollars,
@@ -889,7 +909,7 @@ class PositionLifecycleOrdersStore:
                 ?, ?, ?, ?,
                 ?,
                 ?, ?, ?, ?,
-                ?, ?, ?, ?, ?, ?, ?,
+                ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?,
                 ?, ?,
                 ?, ?,
                 ?, ?, ?, ?,
@@ -908,6 +928,10 @@ class PositionLifecycleOrdersStore:
                 sizing_model.value if sizing_model is not None else None,
                 protection_model.value if protection_model is not None else None,
                 approved_notional_dollars,
+                risk_budget_dollars,
+                approved_risk_dollars,
+                risk_clip_kind,
+                applied_size_multiplier,
                 stated_leverage_multiplier,
                 stress_exposure_multiplier,
                 stated_effective_exposure_dollars,
@@ -1360,6 +1384,8 @@ class PositionLifecycleOrdersStore:
                    plo.intended_limit_price, plo.intended_take_profit_price,
                    plo.sizing_model, plo.protection_model,
                    plo.approved_notional_dollars,
+                   plo.risk_budget_dollars, plo.approved_risk_dollars,
+                   plo.risk_clip_kind, plo.applied_size_multiplier,
                    plo.stated_leverage_multiplier,
                    plo.stress_exposure_multiplier,
                    plo.stated_effective_exposure_dollars,
@@ -1461,6 +1487,8 @@ class PositionLifecycleOrdersStore:
             "plo.intended_limit_price, plo.intended_take_profit_price, "
             "plo.sizing_model, plo.protection_model, "
             "plo.approved_notional_dollars, "
+            "plo.risk_budget_dollars, plo.approved_risk_dollars, "
+            "plo.risk_clip_kind, plo.applied_size_multiplier, "
             "plo.stated_leverage_multiplier, "
             "plo.stress_exposure_multiplier, "
             "plo.stated_effective_exposure_dollars, "
@@ -1685,6 +1713,8 @@ INSERT INTO trades (
     strategy, reason, stop_price, entry_reference_price,
     modeled_slippage_bps, realized_slippage_bps,
     order_type, status, requested_qty, filled_qty,
+    risk_budget_dollars, approved_risk_dollars, risk_clip_kind,
+    applied_size_multiplier,
     initial_stop_loss, initial_risk_per_share, initial_risk_dollars,
     realized_pnl, r_multiple,
     entry_timestamp, exit_timestamp,
@@ -1698,6 +1728,8 @@ INSERT INTO trades (
     :strategy, :reason, 0.0, COALESCE(:slippage_benchmark_price, 0.0),
     NULL, NULL,
     :order_type, :order_status, :intended_qty, :filled_qty,
+    :risk_budget_dollars, :approved_risk_dollars, :risk_clip_kind,
+    :applied_size_multiplier,
     NULL, NULL, NULL,
     NULL, NULL,
     -- entry_timestamp is the time the POSITION was entered, not the time
@@ -1729,6 +1761,10 @@ DO UPDATE SET
     slippage_benchmark_timestamp  = COALESCE(trades.slippage_benchmark_timestamp,  excluded.slippage_benchmark_timestamp),
     slippage_measurement_quality  = COALESCE(trades.slippage_measurement_quality,  excluded.slippage_measurement_quality),
     execution_id                  = COALESCE(excluded.execution_id, trades.execution_id),
+    risk_budget_dollars           = COALESCE(trades.risk_budget_dollars, excluded.risk_budget_dollars),
+    approved_risk_dollars         = COALESCE(trades.approved_risk_dollars, excluded.approved_risk_dollars),
+    risk_clip_kind                = COALESCE(trades.risk_clip_kind, excluded.risk_clip_kind),
+    applied_size_multiplier       = COALESCE(trades.applied_size_multiplier, excluded.applied_size_multiplier),
     -- initial_risk_dollars must FOLLOW the fills, not freeze at the first
     -- partial. This is the production path for later fills: the accounting
     -- writer logs the entry once, on fill CONFIRMATION, and every
@@ -1947,6 +1983,8 @@ def apply_order_event(
         """
         SELECT plo.id, plo.position_uid, plo.role, plo.side,
                plo.order_type, plo.intended_qty,
+               plo.risk_budget_dollars, plo.approved_risk_dollars,
+               plo.risk_clip_kind, plo.applied_size_multiplier,
                plo.slippage_benchmark_price, plo.slippage_benchmark_kind,
                plo.slippage_benchmark_timestamp, plo.slippage_measurement_quality,
                pl.symbol, pl.strategy, pl.owner_key, pl.position_type
@@ -1965,6 +2003,8 @@ def apply_order_event(
     (
         row_id, position_uid, role, side,
         order_type, intended_qty,
+        risk_budget_dollars, approved_risk_dollars, risk_clip_kind,
+        applied_size_multiplier,
         slip_price, slip_kind, slip_ts, slip_quality,
         symbol, strategy, owner_key, position_type,
     ) = pre_row
@@ -2035,6 +2075,10 @@ def apply_order_event(
                         "order_type": order_type,
                         "order_status": event.status,
                         "intended_qty": float(intended_qty),
+                        "risk_budget_dollars": risk_budget_dollars,
+                        "approved_risk_dollars": approved_risk_dollars,
+                        "risk_clip_kind": risk_clip_kind,
+                        "applied_size_multiplier": applied_size_multiplier,
                         "position_id": owner_key,
                         "position_uid": position_uid,
                         "slippage_benchmark_price": slip_price,
