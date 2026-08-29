@@ -137,9 +137,10 @@ Notes:
    asserting risk rule binds above the coverage point and the cap clips below
    it; regression test that two same-cycle signals receive equal risk when
    capital is ample.
-5. Persist `risk_budget_dollars`, `approved_risk_dollars`, and
-   `risk_clip_kind` on the pending order before submission. Late-fill recovery
-   copies those values to the trade row.
+5. Persist `risk_budget_dollars`, `approved_risk_dollars`, `risk_clip_kind`,
+   and `applied_size_multiplier` on the pending order before submission.
+   Late-fill recovery copies those values to the trade row. The launch
+   multiplier is separate so it cannot overwrite the binding exposure cap.
 6. No changes to: entry signals, stops, exits, sleeve budgets, priorities,
    stretch, count rails, options/credit-spread sizing, drawdown gates.
 
@@ -149,12 +150,14 @@ Decision-time sizing is the acceptance surface; fill-time risk is a separate
 execution result.
 
 1. `approved_risk_dollars` never exceeds `risk_budget_dollars`.
-2. Without a cap, unused risk is smaller than one broker quantity increment
-   times the decision stop distance (one share for whole-share orders, 0.01
-   share for fractional orders).
+2. Without a cap or launch multiplier, unused risk is smaller than one broker
+   quantity increment times the decision stop distance (one share for
+   whole-share orders, 0.01 share for fractional orders).
 3. If a cap reduces quantity, `risk_clip_kind` names the binding cap.
-4. Same-cycle entries differ only through quantity granularity or a named cap,
-   and sleeve-block counters show no material regression.
+4. `applied_size_multiplier` records launch scaling independently of caps.
+5. Same-cycle entries differ only through quantity granularity, a named cap,
+   or the stored multiplier, and sleeve-block counters show no material
+   regression.
 
 **Paper result, 2026-08-28:** five unclipped entries passed. PWR and KBE were
 named sleeve-cap clips. ARM was valid whole-share rounding; its favourable

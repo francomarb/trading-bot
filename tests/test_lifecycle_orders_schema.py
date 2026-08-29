@@ -194,6 +194,7 @@ class TestPositionLifecycleOrdersSchema:
         "risk_budget_dollars",
         "approved_risk_dollars",
         "risk_clip_kind",
+        "applied_size_multiplier",
         "stated_leverage_multiplier",
         "stress_exposure_multiplier",
         "stated_effective_exposure_dollars",

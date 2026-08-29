@@ -3182,6 +3182,16 @@ class TradingEngine:
                             risk_clip_kind=getattr(
                                 order_row, "risk_clip_kind", None
                             ),
+                            applied_size_multiplier=(
+                                float(order_row.applied_size_multiplier)
+                                if getattr(
+                                    order_row,
+                                    "applied_size_multiplier",
+                                    None,
+                                )
+                                is not None
+                                else None
+                            ),
                             approved_notional_dollars=(
                                 float(getattr(order_row, "approved_notional_dollars"))
                                 if getattr(

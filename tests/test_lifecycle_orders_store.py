@@ -163,6 +163,7 @@ class TestInsertPending:
             risk_budget_dollars=600.0,
             approved_risk_dollars=480.0,
             risk_clip_kind="sleeve_notional",
+            applied_size_multiplier=0.25,
         )
 
         row = orders_store.get_by_id(row_id)
@@ -170,6 +171,7 @@ class TestInsertPending:
         assert row.risk_budget_dollars == pytest.approx(600.0)
         assert row.approved_risk_dollars == pytest.approx(480.0)
         assert row.risk_clip_kind == "sleeve_notional"
+        assert row.applied_size_multiplier == pytest.approx(0.25)
 
     def test_rejects_invalid_role(
         self,

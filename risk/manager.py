@@ -76,7 +76,6 @@ VALID_RISK_CLIP_KINDS = frozenset({
     "gross_exposure",
     "cash",
     "sleeve_notional",
-    "live_size_multiplier",
 })
 
 
@@ -283,6 +282,9 @@ class RiskDecision:
     # risk_clip_kind this is the durable acceptance evidence for PLAN 11.48.
     approved_risk_dollars: float | None = None
     risk_clip_kind: str | None = None
+    # Launch scaling is independent of the exposure-cap stack. Keeping it
+    # separate preserves the binding cap when both reduce the same order.
+    applied_size_multiplier: float | None = 1.0
     sizing_model: SizingModel = SizingModel.STOP_DISTANCE
     protection_model: ProtectionModel = ProtectionModel.BROKER_STOP
     approved_notional_dollars: float | None = None
@@ -422,6 +424,11 @@ class RiskDecision:
             raise ValueError(
                 f"risk_clip_kind must be one of {sorted(VALID_RISK_CLIP_KINDS)}"
             )
+        if (
+            self.applied_size_multiplier is not None
+            and self.applied_size_multiplier <= 0
+        ):
+            raise ValueError("applied_size_multiplier must be positive")
         if self.stated_leverage_multiplier <= 0:
             raise ValueError("stated_leverage_multiplier must be positive")
         if self.stress_exposure_multiplier <= 0:
@@ -1576,6 +1583,7 @@ class RiskManager:
         stop_price: float | None = None
         approved_notional: float | None = None
         risk_clip_kind: str | None = None
+        applied_size_multiplier = 1.0
         if signal.sizing_model is SizingModel.NOTIONAL:
             try:
                 qty, approved_notional = self._size_notional_position(
@@ -1634,6 +1642,7 @@ class RiskManager:
             and settings.LIVE_TRADING
             and settings.LIVE_SIZE_MULTIPLIER != 1.0
         ):
+            applied_size_multiplier = settings.LIVE_SIZE_MULTIPLIER
             _is_fractional = (
                 settings.FRACTIONAL_ENABLED
                 and signal.order_type is OrderType.MARKET
@@ -1644,8 +1653,6 @@ class RiskManager:
                 )
             else:
                 qty = math.floor(qty * settings.LIVE_SIZE_MULTIPLIER)
-            if signal.sizing_model is SizingModel.STOP_DISTANCE:
-                risk_clip_kind = "live_size_multiplier"
             if signal.sizing_model is SizingModel.NOTIONAL:
                 approved_notional = qty * float(
                     signal.entry_max_price or signal.reference_price
@@ -1726,6 +1733,7 @@ class RiskManager:
             ) if signal.sizing_model is SizingModel.STOP_DISTANCE else None,
             approved_risk_dollars=approved_risk_dollars,
             risk_clip_kind=risk_clip_kind,
+            applied_size_multiplier=applied_size_multiplier,
             sizing_model=signal.sizing_model,
             protection_model=signal.protection_model,
             approved_notional_dollars=approved_notional,

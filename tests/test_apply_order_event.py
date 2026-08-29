@@ -319,6 +319,7 @@ class TestDirectPendingToFilled:
             risk_budget_dollars=250.0,
             approved_risk_dollars=180.0,
             risk_clip_kind="sleeve_notional",
+            applied_size_multiplier=0.25,
         )
         order_id = _attach_and_get_order_id(
             orders_store, "cli-risk-evidence"
@@ -337,7 +338,8 @@ class TestDirectPendingToFilled:
 
         assert outcome.applied is True
         row = conn.execute(
-            "SELECT risk_budget_dollars, approved_risk_dollars, risk_clip_kind "
+            "SELECT risk_budget_dollars, approved_risk_dollars, risk_clip_kind, "
+            "applied_size_multiplier "
             "FROM trades WHERE order_id = ?",
             (order_id,),
         ).fetchone()
@@ -345,6 +347,7 @@ class TestDirectPendingToFilled:
         assert row[0] == pytest.approx(250.0)
         assert row[1] == pytest.approx(180.0)
         assert row[2] == "sleeve_notional"
+        assert row[3] == pytest.approx(0.25)
 
 
 # Test 24 — Direct pending → canceled recovery (R12)

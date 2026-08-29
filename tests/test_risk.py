@@ -829,6 +829,51 @@ class TestPerStrategyRiskTargets:
         assert result.risk_clip_kind == "sleeve_notional"
         assert "sleeve notional_cap" in "".join(messages)
 
+    @pytest.mark.parametrize(
+        ("live", "notional_cap", "expected_qty", "expected_clip"),
+        [
+            (False, None, 62, None),
+            (False, 3_000.0, 30, "sleeve_notional"),
+            (True, None, 15, None),
+            (True, 3_000.0, 7, "sleeve_notional"),
+        ],
+        ids=("paper-clean", "paper-cap", "live-clean", "live-cap"),
+    )
+    def test_live_multiplier_is_separate_from_binding_cap(
+        self,
+        monkeypatch,
+        live,
+        notional_cap,
+        expected_qty,
+        expected_clip,
+    ):
+        from risk import manager as risk_manager_module
+
+        monkeypatch.setattr(risk_manager_module.settings, "LIVE_TRADING", live)
+        monkeypatch.setattr(
+            risk_manager_module.settings, "LIVE_SIZE_MULTIPLIER", 0.25
+        )
+        mgr = self._target_mgr(max_position_notional_pct=1.0)
+        result = mgr.evaluate(
+            _signal(
+                strategy="rsi_reversion",
+                price=100.0,
+                atr=2.0,
+                order_type=OrderType.LIMIT,
+                limit_price=100.0,
+            ),
+            _account(equity=100_000.0),
+            now=T0,
+            notional_cap=notional_cap,
+        )
+
+        assert isinstance(result, RiskDecision)
+        assert result.qty == expected_qty
+        assert result.risk_clip_kind == expected_clip
+        assert result.applied_size_multiplier == pytest.approx(
+            0.25 if live else 1.0
+        )
+
     def test_fallback_to_global_ceiling_for_unlisted_strategy(self):
         # Strategies without a target (options/credit-spread paths) keep
         # the pre-11.48 behavior: max_position_pct sizes the trade.

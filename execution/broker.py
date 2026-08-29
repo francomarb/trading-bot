@@ -655,6 +655,7 @@ class AlpacaBroker:
                 risk_budget_dollars=decision.risk_budget_dollars,
                 approved_risk_dollars=decision.approved_risk_dollars,
                 risk_clip_kind=decision.risk_clip_kind,
+                applied_size_multiplier=decision.applied_size_multiplier,
                 stated_leverage_multiplier=decision.stated_leverage_multiplier,
                 stress_exposure_multiplier=decision.stress_exposure_multiplier,
                 stated_effective_exposure_dollars=(

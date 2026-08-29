@@ -439,6 +439,7 @@ TRADE_COLUMNS = [
     "risk_budget_dollars",
     "approved_risk_dollars",
     "risk_clip_kind",
+    "applied_size_multiplier",
     "initial_stop_loss",
     "initial_risk_per_share",
     "initial_risk_dollars",
@@ -484,6 +485,7 @@ CREATE TABLE IF NOT EXISTS trades (
     risk_budget_dollars   REAL,
     approved_risk_dollars REAL,
     risk_clip_kind        TEXT,
+    applied_size_multiplier REAL,
     initial_stop_loss     REAL,
     initial_risk_per_share REAL,
     initial_risk_dollars  REAL,
@@ -515,6 +517,7 @@ _MIGRATION_COLUMNS = {
     "risk_budget_dollars": "REAL",
     "approved_risk_dollars": "REAL",
     "risk_clip_kind": "TEXT",
+    "applied_size_multiplier": "REAL",
     "initial_stop_loss": "REAL",
     "initial_risk_per_share": "REAL",
     "initial_risk_dollars": "REAL",
@@ -648,6 +651,7 @@ class TradeRecord:
     # stable name of the cap that reduced it (if any).
     approved_risk_dollars: float | None = None
     risk_clip_kind: str | None = None
+    applied_size_multiplier: float | None = None
     realized_pnl: float | None = None
     r_multiple: float | None = None
     entry_timestamp: str | None = None
@@ -852,6 +856,7 @@ class TradeLogger:
                 "risk_budget_dollars": "REAL",
                 "approved_risk_dollars": "REAL",
                 "risk_clip_kind": "TEXT",
+                "applied_size_multiplier": "REAL",
                 "stated_leverage_multiplier": "REAL",
                 "stress_exposure_multiplier": "REAL",
                 "stated_effective_exposure_dollars": "REAL",
@@ -1181,6 +1186,9 @@ class TradeLogger:
                 decision, "approved_risk_dollars", None
             ),
             risk_clip_kind=getattr(decision, "risk_clip_kind", None),
+            applied_size_multiplier=getattr(
+                decision, "applied_size_multiplier", None
+            ),
             realized_pnl=None,
             r_multiple=None,
             entry_timestamp=now_iso,
@@ -1442,6 +1450,7 @@ class TradeLogger:
         "risk_budget_dollars",
         "approved_risk_dollars",
         "risk_clip_kind",
+        "applied_size_multiplier",
         # Entry / exit timestamps anchor the trade-window math in
         # reporting/metrics.py and post_mortem analysis. Set-once at
         # the corresponding lifecycle event.
