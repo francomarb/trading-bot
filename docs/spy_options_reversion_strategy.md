@@ -339,18 +339,17 @@ Mean 88.2 bps — reported under a heading that reads as execution quality. It
 was never that. It was the average distance past the stop trigger, which is a
 real and important number, just not the one the label claimed.
 
-The family filter is correct and took the L2 count from 4 to **0**. Nothing
-else consumes stop-gap erosion, so the measurement now exists in the database
-and is reported nowhere.
+The family filter correctly took the execution-quality L2 count from 4 to **0**.
+PLAN 11.49 subsequently added a separate stop-gap surface to Strategy Health and
+the dashboard, so these rows remain visible without being mislabeled or alarmed.
 
 Two of those four rows are also independently suspect: a sell stop cannot
 normally fill *above* its trigger, yet 2026-06-12 and 2026-06-15 show fills
 17% above the recorded benchmark, clamping to 0.0 adverse and dragging the
-mean down. Those are the same June 12/15 dates as the unresolved immediate-fill
-mechanism tracked under "SPY option trailing durability" in PLAN.md — most
-likely a stale benchmark on the trailing-stop replacement path. Worth
-confirming when 11.49 is built, since a stop-gap metric computed against a
-stale stop level would inherit the same defect.
+mean down. Those are the same June 12/15 dates as the historical immediate-fill
+incident tracked under "SPY option trailing durability" in PLAN.md. The exact
+old mechanism was not reconstructable; later diagnostics observed 14 clean
+ratchets without reproducing it. PLAN carries the final closed disposition.
 
 **Why this matters more here than elsewhere.** This is a 25%-hard-stop strategy
 on a leveraged instrument. "How far past my stop did I actually get out" is the
@@ -360,14 +359,13 @@ this found real evidence of erosion: a 2026-07-01 stop fill at 18.72 against a
 Those are not disasters, but they are exactly the quantity that should be
 trended rather than discovered by hand.
 
-It also feeds two open items: `11.26` (options picker audit — fill quality on
-the 10% fatal-spread threshold) and the unresolved June 12/15 immediate-fill
-mechanism tracked under "SPY option trailing durability" in PLAN.md.
+It still feeds `11.26` (options picker audit — fill quality on the 10% fatal-spread
+threshold). The June 12/15 trailing-stop incident watch is closed after later
+diagnostics did not reproduce it.
 
-The fix is consumer-side only — `STOP_GAP_KINDS` already exists and the rows are
-already tagged correctly. It must be a **separate** reported figure; merging it
-back into the execution-quality number is what produced the original defect.
-See PLAN `11.49` for scope and acceptance.
+The shipped consumer-side fix keeps `STOP_GAP_KINDS` as a **separate** reported
+figure. Merging it back into execution quality would recreate the original
+defect. See closed PLAN `11.49` for scope and acceptance.
 
 ---
 

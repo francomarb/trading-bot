@@ -44,11 +44,12 @@ remain within a conservative quality ceiling. A failed quality check leaves
 the existing broker stop active and retries next cycle; missing-stop creation
 and required GTC/quantity maintenance remain fail-safe and are not blocked.
 
-The fill-timing mechanism remains unresolved. A separate, temporary diagnostic
-is being reviewed to capture broker and WebSocket evidence only for
-`spy_options_reversion`. It is disabled by default, writes to a disposable
-standalone DB, and does not close this follow-up by itself. See
-`docs/option_stop_replace_diagnostics.md`.
+The exact June incident mechanism could not be reconstructed from historical
+quotes. A later temporary diagnostic captured broker and WebSocket evidence for
+`spy_options_reversion`; the observed position completed 14 replacements without
+reproducing the immediate fill. The diagnostic is disabled by default and writes
+to a disposable standalone DB. See `docs/option_stop_replace_diagnostics.md` and
+PLAN for the operator's final disposition.
 
 The `spy_options_reversion` position in `SPY260702C00724000` closed profitably:
 

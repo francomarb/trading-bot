@@ -4,7 +4,7 @@
 
 This document defines the target architecture for the Alpaca trading bot. It is the source of truth for structural decisions, coding conventions, and the go/no-go framework for live capital deployment. All refactoring and new development should align with this guide.
 
-The bot is built in Python using `alpaca-py`. Five strategy sleeves are active in paper trading: SMA Crossover (trend-following), RSI Reversion (mean-reversion), Donchian Breakout (trend-continuation), SPY Options RSI Reversion (single-leg options mean-reversion), and Credit Spread (SPY + QQQ bull put spreads). The current live GO/NO-GO gate is the combined five-strategy paper run after the Phase 10/11 safety and execution-calibration work is complete.
+The bot is built in Python using `alpaca-py`. Six strategy sleeves are active in paper trading: SMA Crossover, RSI Reversion, Donchian Breakout, Leveraged Trend, SPY Options RSI Reversion, and Credit Spread. The current live GO/NO-GO gate is the combined six-strategy paper run after the Phase 10/11 safety and execution-calibration work is complete.
 
 ---
 
@@ -431,9 +431,10 @@ Each slot binds a strategy to its symbol universe, timeframe, and allowed regime
 
 | Strategy | File | Status | Order Type | Allowed Regimes | Sleeve |
 |---|---|---|---|---|---|
-| SMA Crossover | `sma_crossover.py` | **Paper Trading** | MARKET | TRENDING, RANGING | 40% (equity) |
-| RSI Reversion | `rsi_reversion.py` | **Paper Trading** | LIMIT | All (`allowed_regimes=None`) | 20% (equity) |
-| Donchian Breakout | `donchian_breakout.py` | **Paper Trading** | MARKET | TRENDING only | 25% (equity) |
+| SMA Crossover | `sma_crossover.py` | **Paper Trading** | MARKET | TRENDING, RANGING | 30% (equity) |
+| RSI Reversion | `rsi_reversion.py` | **Paper Trading** | LIMIT | All (`allowed_regimes=None`) | 15% (equity) |
+| Donchian Breakout | `donchian_breakout.py` | **Paper Trading** | STOP_LIMIT | TRENDING, RANGING, VOLATILE | 15% (equity) |
+| Leveraged Trend (SPXL/TQQQ/TECL/SOXL) | `leveraged_trend.py` | **Paper Trading** | MARKET | All | 25% (equity, no stretch) |
 | SPY Options RSI Reversion | `spy_options_reversion.py` | **Paper Trading** | LIMIT (async bracket) | TRENDING, RANGING | 5% (isolated) |
 | Credit Spread (SPY + QQQ) | `credit_spread.py` | **Paper Trading** | MLEG combo (async) | TRENDING, RANGING | 10% (isolated, shared across underlyings) |
 
@@ -451,10 +452,11 @@ Target budget       = deployable_capital × target_pct
 Max one position    = effective_budget × max_position_pct_of_sleeve
 ```
 
-At $100k equity, 80% deployable gross, 85/15 pool split, and a 40% concentration cap on equity/credit-spread sleeves:
-- SMA target sleeve: $100k × 0.80 × 0.40 = $32,000 → up to $14,720 in one position when stretched
-- RSI target sleeve: $100k × 0.80 × 0.20 = $16,000 → up to $7,360 in one position when stretched
-- Donchian target sleeve: $100k × 0.80 × 0.25 = $20,000 → up to $9,200 in one position when stretched
+At $100k equity, 80% deployable gross, and an 85/15 pool split:
+- SMA target sleeve: $100k × 0.80 × 0.30 = $24,000 → up to $11,040 in one position when stretched
+- RSI target sleeve: $100k × 0.80 × 0.15 = $12,000 → up to $5,520 in one position when stretched
+- Donchian target sleeve: $100k × 0.80 × 0.15 = $12,000 → up to $5,520 in one position when stretched
+- Leveraged Trend sleeve: $100k × 0.80 × 0.25 = $20,000 → $5,000 per position, no stretch
 - SPY options sleeve: $100k × 0.80 × 0.05 = $4,000 isolated → one position max
 - Credit-spread sleeve: $100k × 0.80 × 0.10 = $8,000 isolated, shared by SPY + QQQ → up to $3,200 max loss in one spread
 
@@ -685,7 +687,7 @@ Full v1 design and rationale: `docs/strategy_health_design.md`. Deliberately def
 Before committing live capital, ALL of the following must be satisfied:
 
 1. Minimum **50 closed trades** in paper trading (statistical significance)
-2. Paper trading period spans **at least 4 weeks** across varying market conditions, with all five active strategy sleeves running
+2. Paper trading period spans **at least 4 weeks** across varying market conditions, with all six active strategy sleeves running
 3. All five metrics meet their thresholds (see table above)
 4. Bot has run for at least **72 hours continuously** without crashes or errors
 5. Risk manager daily halt has never been triggered without being intentional

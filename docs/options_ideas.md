@@ -42,26 +42,24 @@
    side only. A bear call spread layer (Iron Condor) is the obvious symmetric
    complement.
 
-### What's actually an empty roster vs. an out-of-scope zone
+### Where regime coverage is still thin
 
-The five active strategies are all gated to TRENDING + RANGING (Donchian is
-TRENDING-only). **BEAR and VOLATILE currently have zero active strategies** —
-when the regime detector flips, the bot sits in cash. That's not a
-deliberate "never trade BEAR" posture; it's an empty roster. The right
-framing for adding options strategies is *which regimes is each candidate
-active in*, not just *which gap does it fill*.
+The six active strategies no longer leave BEAR and VOLATILE empty. Leveraged
+Trend is allowed in all four regimes, RSI3 is ungated, and Donchian also trades
+VOLATILE after the 2026-08-18 gate change. Coverage is still uneven: BEAR
+depends on Leveraged Trend and RSI3, while the options sleeves remain limited
+to TRENDING and RANGING. The right framing for an additional options strategy
+is therefore *whether it adds a distinct source of return in an
+under-diversified regime*, not whether it fills a completely empty roster.
 
-Strategy Health (PLAN 11.10) is the operator-facing mechanism that makes
-this roster thinking workable: it surfaces underperforming strategies as
-WATCH / DEGRADED / BROKEN with weekly/monthly reports and Telegram alerts,
-so a strategy that stops earning its sleeve can be shelved (set
-`enabled=False`) without leaving the codebase. The five-strategy ceiling
-isn't on *coded* strategies — it's on *concurrently active* ones in a given
-regime. A BEAR-active strategy and a TRENDING-active strategy are not
-competing for the same paper-watch attention because they never run at the
-same time.
+Strategy Health (PLAN 11.10) surfaces underperforming strategies as WATCH /
+DEGRADED / BROKEN with weekly/monthly reports and Telegram alerts, so a
+strategy that stops earning its sleeve can be shelved (`enabled=False`)
+without removing its code. Any new strategy still consumes review attention
+and allocator capacity; a complementary regime profile reduces overlap but
+does not remove that cost.
 
-### Truly out of scope (not just empty roster)
+### Truly out of scope
 - **0DTE / weekly intraday.** Architectural mismatch — cycle-based engine,
   daily-bar indicators, no intraday quote streaming for non-options paths.
 - **Naked premium** (uncovered strangles, naked puts on non-ownership
@@ -303,8 +301,8 @@ the engine is already strategy-name-agnostic and leg-count-agnostic.
     pattern, verified for the new strategy's leg structure).
   - Spread valuation and mark sources (PLAN 11.39's `multi_leg_positions`
     snapshot extended to the new structure).
-  - Close retry behavior (PLAN 11.41 is an open follow-up for credit spread
-    close tuning; a new strategy inherits the same problem).
+  - Close-walk behavior (PLAN 11.41 accepted the current bounded limit walk;
+    a new strategy would still need to integrate and test it).
   - Slippage attribution (PLAN 11.42 just shipped for credit spread; the
     new strategy needs the same plumbing wired through).
   - Strategy Health thresholds and verdict attribution.
@@ -315,11 +313,9 @@ the engine is already strategy-name-agnostic and leg-count-agnostic.
   spread integration, not a few-hour extension.
 - **Capital implication:** no new sleeve. Same max loss per position; just
   more credit collected when both legs are active.
-- **Gating:** 11.30 paper-watch on the bull put. If puts ride to 50% profit
-  without testing strikes, the call side (with the asymmetric/trend
-  refinements above) adds genuine premium. If puts are getting whipsawed,
-  IC doubles the whipsaw — IVR filter (Tier 1 #A) probably needs to land
-  first.
+- **Gating:** 11.30 closed with operational mechanics but an unprofitable
+  observed sample. Do not promote the iron-condor extension from this evidence;
+  it would add another short leg to a strategy that has not shown expectancy.
 
 #### C. SPY Options debit-spread variant (new class, IV-rank-gated)
 Today `spy_options_reversion` buys naked SPY calls. In rich-IV regimes, the
@@ -444,15 +440,16 @@ BollingerSqueeze strategy without abandoning its equity version.
 
 ---
 
-### Regime-rotational — fill the empty BEAR/VOLATILE roster
+### Regime-rotational — diversify BEAR/VOLATILE coverage
 
-These don't compete with the existing five strategies for paper-watch
-attention or capital because they activate only in regimes where the
-current roster is dormant. Capital-feasible (defined-risk multi-leg or
-single-leg within existing sleeves) and rely on Strategy Health for
-informed shelve/revive decisions over time.
+These candidates would add options-specific return sources in regimes where
+the current roster has less diversification. They still compete for
+paper-watch attention and capital; regime separation reduces overlap but does
+not make either resource free. They are capital-feasible (defined-risk
+multi-leg or single-leg within existing sleeves) and rely on Strategy Health
+for informed shelve/revive decisions over time.
 
-#### G. Bear call credit spread (mirror of bull put — fills BEAR roster)
+#### G. Bear call credit spread (mirror of bull put — diversifies BEAR)
 Sell OTM call spread above market in BEAR. Profits when underlying falls
 or stays put. The structural mirror of the existing bull put credit spread.
 
@@ -757,8 +754,8 @@ assigned → CC → called away → CSP …
 ### Default linear path (if everything performs as designed)
 
 The recommended default sequencing — independent of waiting for any
-single paper-watch — assuming credit spread reaches a settled, profitable
-verdict during 11.30:
+single paper-watch. The 11.30 review has now settled without a profitable
+verdict, so the dependent strategy expansions below remain parked:
 
 **Track 1 — ships immediately, no paper-watch dependency:**
 - **`utils/iv_rank.py` utility** (Tier 1 #A, step 1). Pure math helper.
@@ -772,7 +769,7 @@ verdict during 11.30:
   prolonged-BEAR confirmation fires (T-bill yield rather than strategy
   edge to validate).
 
-**Track 2 — sequenced after 11.30 credit-spread paper-watch settles:**
+**Track 2 — parked after the unprofitable 11.30 review:**
 
 1. **IVR wiring into credit spread filter** (Tier 1 #A, step 2). Use
    11.30 evidence to choose between replace-floor / AND-with-floor /

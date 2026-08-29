@@ -699,8 +699,8 @@ STRATEGY_ALLOWED_REGIMES: dict[str, set[str]] = {
 #
 # Example at $100k equity and 80% deployable gross:
 #   deployable capital = $80,000
-#   SMA target budget  = $80,000 × 0.45 = $36,000
-#   40% concentration  = $14,400 max notional in one SMA position
+#   SMA target budget  = $80,000 × 0.30 = $24,000
+#   40% concentration  = $9,600 max notional in one SMA position
 #
 # Equity strategies may stretch up to 115% of target while total deployable
 # utilization remains below 80%, borrowing only from idle equity-pool capital.

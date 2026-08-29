@@ -38,29 +38,26 @@ low exit only triggers when the trend genuinely fails.
 | Order type | **STOP_LIMIT** (`preferred_order_type`, shipped PR #62) — *was MARKET; the doc said MARKET until 2026-08-18* |
 | Regime gate | **BEAR-only exclusion** — allows TRENDING, RANGING, VOLATILE; blocks BEAR. **Changed 2026-08-18 (`11.59`)** from TRENDING-only, after a pre-registered test passed all three criteria. The old "RANGING gets faded / VOLATILE whipsaws" rationale was measured and refuted. See [`donchian_regime_gate_investigation.md`](donchian_regime_gate_investigation.md). |
 | Edge filter | `DonchianEdgeFilter`: stock > 200 SMA, earnings blackout (1 day before / 0 after), IEX-scaled liquidity floor |
-| Sleeve weight | 0.25 of gross capital |
+| Sleeve weight | 0.15 of deployable gross capital |
 | Max positions | **8** (`STRATEGY_ALLOCATIONS["donchian_breakout"]["hard_max_positions"]`) — *doc said 5 until 2026-08-18* |
 | ATR stop | 2× ATR (engine's `ATR_STOP_MULTIPLIER`) |
 | HWM drawdown gate | Live (and opt-in mature paper): entries pause if cumulative realized P&L drops >15% of sleeve budget below peak; default paper reports the breach without pausing |
 | Universe | `DONCHIAN_WATCHLIST` — 32 names (see below) |
 
-**Capital math at $100k equity** *(recomputed from `config/settings.py`
-2026-08-18 — the previous version derived every line from a stale
-`max positions = 5` and a `2%` per-trade risk that the allocator does not
-use, and was wrong on all three figures):*
+**Capital math at $100k equity** *(from `config/settings.py`, 2026-08-29):*
 
-- **Target sleeve budget** = $100k × `MAX_GROSS_EXPOSURE_PCT` 0.80 × `target_pct` 0.25 = **$20,000**
-- **Per-position notional cap — baseline** = $20,000 × `max_position_pct_of_sleeve` 0.40 = **$8,000** *(not $20,000 ÷ 8 — the cap is a percentage, not an even split)*
-- **Per-position notional cap — stretch maximum** = **$9,200**. Donchian sets
+- **Target sleeve budget** = $100k × `MAX_GROSS_EXPOSURE_PCT` 0.80 × `target_pct` 0.15 = **$12,000**
+- **Per-position notional cap — baseline** = $12,000 × `max_position_pct_of_sleeve` 0.40 = **$4,800** *(not $12,000 ÷ 8 — the cap is a percentage, not an even split)*
+- **Per-position notional cap — stretch maximum** = **$5,520**. Donchian sets
   `can_stretch: True`, so when total deployable utilization is below
   `ALLOCATOR_STRETCH_UTILIZATION_THRESHOLD` (0.80) **and** the equity pool has
   slack, the allocator raises the effective sleeve to
-  `target × (1 + stretch_pct 0.15)` = **$23,000**. The concentration cap is
+  `target × (1 + stretch_pct 0.15)` = **$13,800**. The concentration cap is
   computed against that **effective** budget, not the target
   ([`risk/allocator.py`](../risk/allocator.py) — `max_position_notional =
   min(available, effective_budget × max_position_pct_of_sleeve)`), so it rises
-  with it: $23,000 × 0.40 = $9,200. Borrowed capacity is returned as the pool
-  fills, so $8,000 is the number to plan with and $9,200 is the ceiling a
+  with it: $13,800 × 0.40 = $5,520. Borrowed capacity is returned as the pool
+  fills, so $4,800 is the number to plan with and $5,520 is the ceiling a
   single position can actually reach.
 - **Risk per trade** = `risk_per_trade_pct` 0.004 × $100k = **$400** *(target; sizing is risk-first in `RiskManager`, and `11.48` tracks the gap between this target and recorded risk)*
 - **Planned max simultaneous risk** (all 8 stops fire at target size) = 8 × $400 = **$3,200** — well inside the 5% daily-loss kill switch
@@ -340,14 +337,16 @@ Donchian is the highest-Sharpe strategy in the codebase by a 2.6× margin over S
 | Beats SMA on at least one metric | Sharpe OR MeanDD | ✅ Sharpe (2.6× SMA) |
 | MeanDD with ATR stops | ≤ 25% | ❌ -35.1% (structural, see below) |
 
-**Decision:** Activate at 0.25 sleeve weight. The DD gate misses by ~10pp, but
-the per-symbol averaged MeanDD overstates portfolio-level drawdown:
+**Original decision:** Activate at 0.25 sleeve weight. The current paper
+allocation is 0.15 after the Leveraged Trend sleeve was added. The DD gate
+misses by ~10pp, but the per-symbol averaged MeanDD overstates portfolio-level
+drawdown:
 - In production the engine runs one $100k pool, gross exposure capped at 80%
-- With 0.25 sleeve, the maximum Donchian contribution to portfolio DD ≈ 0.25 × 35% = −8.7%
+- The current target is 12% of account equity (0.80 deployable × 0.15 sleeve); applying the 35.1% sleeve drawdown gives an approximate −4.2% account-level contribution
 - In live mode, the HWM drawdown gate adds a further backstop: if cumulative realized
-  P&L drops >15% of the $20k sleeve budget ($3k) below its peak, new entries pause
+  P&L drops >15% of the $12k sleeve budget ($1.8k) below its peak, new entries pause
   automatically. Default paper mode reports this condition without pausing entries.
-- The TRENDING-only regime gate prevents new entries entirely during market downturns
+- The BEAR-only regime gate prevents new entries in BEAR while allowing measured RANGING and VOLATILE opportunities
 
 ---
 
@@ -357,16 +356,16 @@ Eight independent layers are active when Donchian runs in production:
 
 | Layer | Mechanism | Scope |
 |---|---|---|
-| Regime gate | `allowed_regimes={TRENDING}` — blocks entries in BEAR, VOLATILE, RANGING | No new entries |
+| Regime gate | `allowed_regimes={TRENDING,RANGING,VOLATILE}` — blocks entries in BEAR | No new entries in BEAR |
 | HWM drawdown gate | Live / opt-in mature paper: pause entries if cumulative realized P&L >15% below sleeve peak; default paper observes only | No new entries when armed |
-| ATR stop | 2× ATR below the **signal-bar close** — see caveat below | Per-trade loss cap |
+| ATR stop | 2× ATR below the actual fill after the DAY→GTC rebuild | Per-trade loss cap |
 | Per-position risk target | `risk_per_trade_pct=0.40%` of equity at risk per trade (11.48), beneath the `MAX_POSITION_PCT=2%` global ceiling | Per-trade sizing |
 | Sleeve max positions | 8 concurrent Donchian positions maximum (`hard_max_positions`) | Concentration cap |
 | Gross exposure cap | `MAX_GROSS_EXPOSURE_PCT=0.80` | Portfolio-level |
 | Daily session loss cap | `MAX_DAILY_LOSS_PCT=5%` — engine halts against Alpaca prior-close when available | Portfolio-level |
 | Hard dollar loss cap | `HARD_DOLLAR_LOSS_CAP=$2,000` from Alpaca prior-close when available | Emergency halt |
 
-### Caveat: the ATR stop is not 2× ATR from the entry (PLAN 11.54)
+### STOP_LIMIT risk-deployment posture (PLAN 11.54)
 
 > **✅ FIXED for new entries, 2026-08-09.** The post-fill DAY→GTC stop
 > rebuild now prices the replacement at `fill − k×ATR`, using the ATR the
@@ -466,13 +465,10 @@ from 2026-08-03. With the real denominator:
 
 Consistent ~2/3 deployment in a 65–71% band — systematic, not sporadic.
 
-**What still needs the positions to close.** Room is the *condition*; the cost
-is the *consequence*, and only outcomes supply it. AMZN sitting at 68.4% says
-it is more exposed to being stopped by noise. It does not say it will be, nor
-that a full-room stop would have changed anything — that needs the price path
-after the stop. The fix choice depends on **how often short room converts into
-a lost trade that would otherwise have worked**, and that conversion rate is
-what the closes are for.
+**What remains separate.** Room is the *condition*; opportunity cost is the
+*consequence*. The completed current-era cohort contains only stop losses, so
+it can verify the risk basis but cannot measure profits foregone through smaller
+positions. PLAN `11.54a` waits for winning exits before asking that question.
 
 **Reproduce:** entry fill and stop from `trades` / `position_lifecycle_orders`
 (`role='entry_primary'`, use `created_at` for the submit date); ATR via
@@ -487,18 +483,12 @@ observed entry exceeded its budget.
 
 **Strategy performance is affected, in both directions.** A fill below the
 reference close leaves the stop closer than 2× ATR, so ordinary noise can end
-the trade before it works — WYFI kept 73% of its intended room and was stopped
-out, and AMZN is currently open on 68%. A fill well below the chase cap leaves
-the position smaller than the risk target calls for — the four measured entries
-deployed 65–71% of budget. On the evidence so far the two costs are **not**
-equally frequent: five of seven entries landed long (108–116%) and two short,
-so under-deployment is the common case and premature stopping the occasional
-one. That ratio is from seven entries and should not be treated as settled.
-
-Do **not** apply the `11.53` re-anchor here: it works from `reference − stop`,
-which on AAPL would have cut deployed risk from 64.4% to 55%. `stop_for_fill`
-returns STOP_LIMIT decisions unchanged for exactly this reason. Gather evidence
-before choosing a fix. See PLAN `11.54`.
+the trade before it works. That stop-distance defect is fixed for new entries.
+A fill well below the chase cap can still leave the position smaller than the
+risk target because sizing uses the worst permitted fill. The 11.54 review
+accepted this conservative under-deployment: it preserves the hard risk bound
+without adding trigger-based sizing complexity. Possible foregone upside is a
+separate `11.54a` audit, parked until winning current-configuration trades exist.
 
 **Date correction (2026-08-09):** this section previously read "STOP_LIMIT only
 landed 2026-07-09". That is wrong — PR #62 merged **2026-06-14** (`16bcbfb`),
@@ -508,33 +498,12 @@ The correct evidence window for STOP_LIMIT behaviour opens 2026-06-14.
 
 ### Reading realized Donchian P&L: mind the configuration eras
 
-Realized P&L for this strategy is dominated by superseded configurations, and
-reading it without that inverts the conclusion. **No Donchian trade has closed
-under the current configuration.**
-
-| Entry era | Entries | Order type | Risk range | Closed P&L |
-|---|---|---|---|---|
-| 05-01 → 06-12 | 16 | market | $36 – $1,600 (44×) | −$1,214 |
-| 06-18 → 07-09 (STOP_LIMIT, pre-fix) | 2 | stop_limit | $778 | −$873 |
-| 07-28 (post-11.48 sizing) | 1 | stop_limit | $211 | −$449 (overnight gap) |
-| 08-04 → 08-07 (post fill-anchored stop) | 4 | stop_limit | $269 – $295 (1.1×) | none closed |
-
-Per-strategy risk targets landed 2026-07-13 (11.48), the fill-anchored stop
-2026-08-01 (`efe0d74`), budget persistence 2026-08-03 (`b5ca503`). The entry
-risk range is the clearest evidence 11.48 worked: **44× dispersion before,
-1.1× after**.
-
-Split by exit reason across all 19 closed trades, the strategy's own exit is
-profitable and the protective stop carries the loss:
-
-| Exit | n | P&L | Avg R |
-|---|---|---|---|
-| `exit signal` (Donchian trend exit) | 5 | **+$1,882** | **+1.17** |
-| `stop_triggered` | 13 | **−$3,872** | −0.96 |
-
-That is directional support for `11.54`'s premise, but **10 of those 13
-stop-outs are pre-2026-06-14 MARKET entries** and say nothing about STOP_LIMIT
-anchoring. Only WYFI, ANET and AAPL are STOP_LIMIT-era.
+Per-strategy risk targets, fill-anchored stops, and budget persistence arrived
+in separate changes, so older P&L does not describe the current configuration.
+As of the 11.54 close decision, 12 current-era STOP_LIMIT entries had produced
+six completed outcomes; all six were stop exits near −1R. That verifies the risk
+basis but provides no winning cohort from which to measure the opportunity cost
+of conservative sizing. PLAN `11.54a` owns that later, winner-only trigger.
 
 ### 30/10 versus 30/15 paper evidence collection (started 2026-08-12)
 
