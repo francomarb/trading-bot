@@ -303,8 +303,8 @@ the engine is already strategy-name-agnostic and leg-count-agnostic.
     pattern, verified for the new strategy's leg structure).
   - Spread valuation and mark sources (PLAN 11.39's `multi_leg_positions`
     snapshot extended to the new structure).
-  - Close retry behavior (PLAN 11.41 is an open follow-up for credit spread
-    close tuning; a new strategy inherits the same problem).
+  - Close-walk behavior (PLAN 11.41 accepted the current bounded limit walk;
+    a new strategy would still need to integrate and test it).
   - Slippage attribution (PLAN 11.42 just shipped for credit spread; the
     new strategy needs the same plumbing wired through).
   - Strategy Health thresholds and verdict attribution.
@@ -315,11 +315,9 @@ the engine is already strategy-name-agnostic and leg-count-agnostic.
   spread integration, not a few-hour extension.
 - **Capital implication:** no new sleeve. Same max loss per position; just
   more credit collected when both legs are active.
-- **Gating:** 11.30 paper-watch on the bull put. If puts ride to 50% profit
-  without testing strikes, the call side (with the asymmetric/trend
-  refinements above) adds genuine premium. If puts are getting whipsawed,
-  IC doubles the whipsaw — IVR filter (Tier 1 #A) probably needs to land
-  first.
+- **Gating:** 11.30 closed with operational mechanics but an unprofitable
+  observed sample. Do not promote the iron-condor extension from this evidence;
+  it would add another short leg to a strategy that has not shown expectancy.
 
 #### C. SPY Options debit-spread variant (new class, IV-rank-gated)
 Today `spy_options_reversion` buys naked SPY calls. In rich-IV regimes, the
@@ -757,8 +755,8 @@ assigned → CC → called away → CSP …
 ### Default linear path (if everything performs as designed)
 
 The recommended default sequencing — independent of waiting for any
-single paper-watch — assuming credit spread reaches a settled, profitable
-verdict during 11.30:
+single paper-watch. The 11.30 review has now settled without a profitable
+verdict, so the dependent strategy expansions below remain parked:
 
 **Track 1 — ships immediately, no paper-watch dependency:**
 - **`utils/iv_rank.py` utility** (Tier 1 #A, step 1). Pure math helper.
@@ -772,7 +770,7 @@ verdict during 11.30:
   prolonged-BEAR confirmation fires (T-bill yield rather than strategy
   edge to validate).
 
-**Track 2 — sequenced after 11.30 credit-spread paper-watch settles:**
+**Track 2 — parked after the unprofitable 11.30 review:**
 
 1. **IVR wiring into credit spread filter** (Tier 1 #A, step 2). Use
    11.30 evidence to choose between replace-floor / AND-with-floor /

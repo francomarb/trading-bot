@@ -440,7 +440,7 @@ A bull put credit spread sells the short (higher-strike) put and buys the long (
 | `trend_sma_buffer_pct` | 0.00 | 0.01 | QQQ requires close > 50 SMA by 1%; SPY keeps the original trend gate |
 | `iv_proxy_source` | `vix` | `vix` | QQQ tracks SPX closely; VIX is the proxy |
 | `min_iv_proxy` | 14 | 14 | VIX index points — entry blocked when premium is thin |
-| `min_credit_pct_of_width` | 0.13 | 0.13 | Floor on net credit / width. **Note:** the design doc default is 0.25, but the 11.28 merge gate showed real ~17Δ $10-wide SPY spreads collect only ~13–15% of width — 0.25 would reject nearly every spread. SPY may still sit idle in normal-vol conditions while QQQ trades comfortably; PLAN.md 11.30 will revisit. |
+| `min_credit_pct_of_width` | 0.13 | 0.13 | Floor on net credit / width. The 11.30 review closed without broad retuning; `11.63` is the only active entry-execution optimization. |
 | `max_concurrent_positions` | 3 | 3 | Per instance |
 | `max_per_expiration` | 1 | 1 | Don't stack on one expiration |
 | `min_dte_gap_between_opens` | 7 | 7 | Calendar diversification |
@@ -494,10 +494,10 @@ Exit:
 2. On a trigger: `broker.dispatch_spread_order(closing=True, position_id=<existing>)` — the broker reverses the legs into the `*_TO_CLOSE` trade and the same worker handles it. The close order's positive debit limit is the current modeled spread mid (`short mid − long mid`), rounded to cents. A pending close row is inserted into `position_lifecycle_orders` (role=`exit`) before dispatch; the substrate's `uniq_one_active_close_per_position` partial unique index is what blocks double-submission of a close. Restart-safe (§10.7 spread lifecycle PR).
 3. On the close fill: `_drain_spread_fills` close path drops the `Position`, releases it on the strategy, records realized P&L `= (net_credit − net_debit) × qty × 100` into the **allocator's HWM / sleeve-drawdown gate**, and writes the close row to the trade DB. **If the fill price is unavailable** (stream "filled" + REST follow-up failure) the position still closes but realized P&L is left unset, never fabricated to zero.
 
-Current paper behavior on an unfilled close timeout is **cancel + retry later**,
-not immediate escalation to a more marketable debit or to a market order. That
-execution-quality trade-off is intentional for v1 and is tracked as a tuning
-follow-up in [PLAN.md](/Users/franco/trading-bot/PLAN.md) (`11.41`).
+Current close behavior uses a bounded sequence of increasingly marketable limit
+rungs, with a market fallback reserved for the strongest exit reasons. The
+11.41 paper review observed every close completing on a limit rung, so the walk
+was accepted unchanged; reopen only on a concrete close failure or market step.
 
 **Trade-DB layout:** one row per leg per fill, both rows sharing the spread's `position_id` with `position_type='spread'`. Spread rows are excluded from `read_all_open_owners` / `read_owner_for_symbol` (a spread leg is not a standalone single-leg position) — they restore via the dedicated `read_open_spread_positions` path. Realized P&L on a close rides the short-leg row; `read_strategy_realized_pnl_summary` counts spread rows alongside single-leg sells so credit-spread P&L feeds the HWM gate on restart too.
 
@@ -527,7 +527,10 @@ follow-up in [PLAN.md](/Users/franco/trading-bot/PLAN.md) (`11.41`).
 
 **Critical caveat — negative skew.** Many small wins, occasional large losers. Sharpe is high but the path is bumpy. There will be weeks where the sleeve looks ugly even while expectancy holds long-term. **Acceptance of this characteristic is a prerequisite for running the strategy.**
 
-**Why this strategy:** the existing strategies are all long-premium / long-direction. Credit spreads are structurally short-premium — they earn the volatility risk premium that retail option *buyers* pay, with defined risk capped by the strike width. The mechanics align with what works in retail options (collect theta, exit at 50% of max profit, time-stop the gamma cliff). The 10% sleeve keeps total exposure bounded while the strategy is paper-validated; PLAN.md **11.30** is the calibration pass after 20–30 paper cycles.
+**Paper conclusion:** entry and exit mechanics are operational, but the observed
+sample is not profitable. The broad 11.30/11.34/11.41 watches are closed rather
+than repeatedly retuning the strategy. The only active execution optimization is
+the bounded entry walk under PLAN `11.63`; wait for its pre-registered sample.
 
 ---
 
@@ -601,7 +604,7 @@ At $100k paper equity:
 - Options (single-leg) target sleeve: $80k × 0.05 = $4,000, isolated, no stretch
 - Credit Spread target sleeve: $80k × 0.10 = $8,000, isolated, no stretch — shared across SPY + QQQ instances, per-position max loss capped at $80k × 0.10 × 0.40 = $3,200
 
-The credit-spread rebalance trimmed SMA (0.45 → 0.40) and RSI (0.25 → 0.20) to fund the new 0.10 isolated sleeve; Donchian and SPY Options were left unchanged. The 11.30 paper-watch pass will revisit these weights once real fills accumulate.
+The credit-spread rebalance trimmed SMA (0.45 → 0.40) and RSI (0.25 → 0.20) to fund the new 0.10 isolated sleeve; Donchian and SPY Options were left unchanged. The 11.30 review closed without changing these weights.
 
 Elastic borrowing is equity-only: idle equity capital may be borrowed up to 115% of target while total deployable utilization remains below 80%. `hard_max_positions` is a safety ceiling, not the sizing formula.
 

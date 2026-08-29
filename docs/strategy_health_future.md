@@ -337,7 +337,7 @@ class HealthCheck(Protocol):
 
 **Why deferred vs. pre-emptively building:** the gap only became operator-visible when actual runner periods produced reports that mismatched operator intuition. Pre-merge there was no concrete example to ground the field choices against. The 2026-06 May report is now that example.
 
-**Trigger to build:** any time after v1 ships AND a runner-period report misreads the sleeve. The 2026-06 trigger has fired. Reasonable to bundle into the 11.10h tuning PR.
+**Trigger to build:** any time after v1 ships AND a runner-period report misreads the sleeve. The 2026-06 trigger has fired. Track this independently; 11.10h closed with no threshold-tuning PR.
 
 **Data source contract:** `engine_state.json::positions_detail` is the canonical snapshot the engine writes per cycle. It already carries `avg_entry_price`, `current_price`, `qty`, `multiplier`, `strategy_name` (or `strategy` / `owner` fallback). No engine code change needed — pure read-side enhancement to the reviewer.
 

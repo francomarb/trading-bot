@@ -1,6 +1,6 @@
 # Strategy Health & Edge Monitor — v1 Design
 
-**Status:** Implemented (v1) — shipped 2026-05-19 across PRs #16–#22 (PLAN.md 11.10a–g). Code lives in `strategies/health/`. The remaining open item is **11.10h** — a 4-week paper-watch + threshold calibration pass (no new code until the tuning PR). This doc is the as-built design reference; deviations made during implementation, if any, are noted inline.
+**Status:** Implemented and paper-watched. The 11.10h calibration review closed with no threshold changes after producing no false alarms or defensible tuning signal. Code lives in `strategies/health/`; routine scheduled reports continue.
 **PLAN.md item:** 11.10
 **Related items:** 11.9 (dynamic capital allocation — downstream consumer), 11.11 (re-enable workflow — manual gate for quarantined strategies), 11.12 (Kelly criterion — advisory, complementary), 11.14 (read-only dashboard — render target)
 **Future work:** see [strategy_health_future.md](strategy_health_future.md) for the follow-up roadmap (PSR/DSR/MinTRL, CUSUM, signal-lifecycle table, MAE/MFE, auto-throttle, etc.) — deliberately split out so this doc stays focused on what ships now.
