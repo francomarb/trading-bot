@@ -298,6 +298,54 @@ class TestDirectPendingToFilled:
         assert current_qty == 10.0
         assert avg_entry == pytest.approx(150.50)
 
+    def test_fill_carries_durable_decision_risk_evidence(
+        self,
+        conn: sqlite3.Connection,
+        pos_store: PositionLifecycleStore,
+        orders_store: PositionLifecycleOrdersStore,
+    ):
+        """A fill reconstructed from the order substrate must not lose the
+        sizing evidence that existed before broker submission."""
+        uid = _seed_position(pos_store)
+        orders_store.insert_pending(
+            position_uid=uid,
+            role="entry_primary",
+            client_order_id="cli-risk-evidence",
+            order_type="market",
+            order_class="oto",
+            time_in_force="gtc",
+            side="buy",
+            intended_qty=6.0,
+            risk_budget_dollars=250.0,
+            approved_risk_dollars=180.0,
+            risk_clip_kind="sleeve_notional",
+        )
+        order_id = _attach_and_get_order_id(
+            orders_store, "cli-risk-evidence"
+        )
+
+        outcome = apply_order_event(
+            conn,
+            OrderEvent(
+                order_id=order_id,
+                status="filled",
+                filled_qty=6.0,
+                avg_fill_price=150.50,
+                broker_updated_at="2026-06-12T10:01:00+00:00",
+            ),
+        )
+
+        assert outcome.applied is True
+        row = conn.execute(
+            "SELECT risk_budget_dollars, approved_risk_dollars, risk_clip_kind "
+            "FROM trades WHERE order_id = ?",
+            (order_id,),
+        ).fetchone()
+        assert row is not None
+        assert row[0] == pytest.approx(250.0)
+        assert row[1] == pytest.approx(180.0)
+        assert row[2] == "sleeve_notional"
+
 
 # Test 24 — Direct pending → canceled recovery (R12)
 class TestDirectPendingToCanceled:

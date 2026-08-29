@@ -358,6 +358,11 @@ CREATE TABLE position_lifecycle_orders (
     intended_limit_price          REAL,                -- limit / capped market / stop_limit
     intended_take_profit_price    REAL,                -- bracket take-profit child
 
+    -- Decision-time sizing evidence (captured before submit; immutable)
+    risk_budget_dollars           REAL,                -- strategy target
+    approved_risk_dollars         REAL,                -- risk after rounding/caps
+    risk_clip_kind                TEXT,                -- NULL or stable binding-cap name
+
     -- Order relationships
     parent_order_id               TEXT,                -- OTO/bracket: order_id of the parent
     replaces_order_id             TEXT,                -- replacement_stop: order_id being replaced
@@ -1220,8 +1225,8 @@ Explicit so the implementation PR cannot silently expand any one table into anot
 | Table | Owns | Does NOT own |
 |---|---|---|
 | `position_lifecycle` | One row per logical position. Aggregate state (`status`, `current_qty`, `avg_entry_price`, `net_realized_pnl`). Identity (`position_uid`, `owner_key`, `strategy`, `position_type`). Lifecycle creation / termination timestamps. | Per-order metadata. Order-level state. Computed slippage values. Trade-by-trade fills. |
-| `position_lifecycle_orders` (new) | Durable per-order intent (order_type, order_class, TIF, intended prices, qty). Broker identity (`order_id`, `client_order_id`). Per-order lifecycle state and reconciliation anchor. Pre-fill slippage benchmark provenance. Relationships between orders (parent / replaces). Origin (bot vs. operator command). | Position-level rollups. Computed realized slippage. Trade-row primary keys. |
-| `trades` | **One row per `order_id`** carrying cumulative aggregate state (`filled_qty`, `avg_fill_price` VWAP). Realized P&L. Computed `slippage_signed_bps` / `slippage_adverse_bps`. Slippage measurement quality of the actual fill. Optional `execution_id` as audit metadata only. | Pre-submit order intent. Per-order broker state. Order relationships. Per-execution detail (out of scope; would require a separate execution ledger, deliberately not introduced). |
+| `position_lifecycle_orders` (new) | Durable per-order intent (order_type, order_class, TIF, intended prices, qty). Decision-time sizing evidence (`risk_budget_dollars`, `approved_risk_dollars`, `risk_clip_kind`). Broker identity (`order_id`, `client_order_id`). Per-order lifecycle state and reconciliation anchor. Pre-fill slippage benchmark provenance. Relationships between orders (parent / replaces). Origin (bot vs. operator command). | Position-level rollups. Computed realized slippage. Trade-row primary keys. |
+| `trades` | **One row per `order_id`** carrying cumulative aggregate state (`filled_qty`, `avg_fill_price` VWAP). The copied decision-time sizing evidence needed for analysis. Realized P&L. Computed `slippage_signed_bps` / `slippage_adverse_bps`. Slippage measurement quality of the actual fill. Optional `execution_id` as audit metadata only. | Pre-submit order intent authority. Per-order broker state. Order relationships. Per-execution detail (out of scope; would require a separate execution ledger, deliberately not introduced). |
 
 This boundary is the load-bearing answer to "the per-order table is not a second slippage-reporting store." Foundation PR persists pre-fill benchmark provenance on the order row; the trades row continues to be the source of truth for computed slippage. Phase 2 consumer migration reads computed values from `trades` exactly as it does today.
 
