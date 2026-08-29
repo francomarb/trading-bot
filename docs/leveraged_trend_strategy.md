@@ -1,8 +1,7 @@
 # Leveraged Trend Strategy
 
-**Status:** implementation candidate wired behind a paper-only switch; never
-enabled in live mode. Merge, review, and a controlled bot recycle are still
-required before it begins collecting paper evidence.
+**Status:** merged and paper active behind a paper-only switch; four entries
+are open and exit evidence is still pending. Live mode remains unauthorized.
 
 ## Thesis
 

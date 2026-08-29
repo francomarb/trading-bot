@@ -38,29 +38,26 @@ low exit only triggers when the trend genuinely fails.
 | Order type | **STOP_LIMIT** (`preferred_order_type`, shipped PR #62) — *was MARKET; the doc said MARKET until 2026-08-18* |
 | Regime gate | **BEAR-only exclusion** — allows TRENDING, RANGING, VOLATILE; blocks BEAR. **Changed 2026-08-18 (`11.59`)** from TRENDING-only, after a pre-registered test passed all three criteria. The old "RANGING gets faded / VOLATILE whipsaws" rationale was measured and refuted. See [`donchian_regime_gate_investigation.md`](donchian_regime_gate_investigation.md). |
 | Edge filter | `DonchianEdgeFilter`: stock > 200 SMA, earnings blackout (1 day before / 0 after), IEX-scaled liquidity floor |
-| Sleeve weight | 0.25 of gross capital |
+| Sleeve weight | 0.15 of deployable gross capital |
 | Max positions | **8** (`STRATEGY_ALLOCATIONS["donchian_breakout"]["hard_max_positions"]`) — *doc said 5 until 2026-08-18* |
 | ATR stop | 2× ATR (engine's `ATR_STOP_MULTIPLIER`) |
 | HWM drawdown gate | Live (and opt-in mature paper): entries pause if cumulative realized P&L drops >15% of sleeve budget below peak; default paper reports the breach without pausing |
 | Universe | `DONCHIAN_WATCHLIST` — 32 names (see below) |
 
-**Capital math at $100k equity** *(recomputed from `config/settings.py`
-2026-08-18 — the previous version derived every line from a stale
-`max positions = 5` and a `2%` per-trade risk that the allocator does not
-use, and was wrong on all three figures):*
+**Capital math at $100k equity** *(from `config/settings.py`, 2026-08-29):*
 
-- **Target sleeve budget** = $100k × `MAX_GROSS_EXPOSURE_PCT` 0.80 × `target_pct` 0.25 = **$20,000**
-- **Per-position notional cap — baseline** = $20,000 × `max_position_pct_of_sleeve` 0.40 = **$8,000** *(not $20,000 ÷ 8 — the cap is a percentage, not an even split)*
-- **Per-position notional cap — stretch maximum** = **$9,200**. Donchian sets
+- **Target sleeve budget** = $100k × `MAX_GROSS_EXPOSURE_PCT` 0.80 × `target_pct` 0.15 = **$12,000**
+- **Per-position notional cap — baseline** = $12,000 × `max_position_pct_of_sleeve` 0.40 = **$4,800** *(not $12,000 ÷ 8 — the cap is a percentage, not an even split)*
+- **Per-position notional cap — stretch maximum** = **$5,520**. Donchian sets
   `can_stretch: True`, so when total deployable utilization is below
   `ALLOCATOR_STRETCH_UTILIZATION_THRESHOLD` (0.80) **and** the equity pool has
   slack, the allocator raises the effective sleeve to
-  `target × (1 + stretch_pct 0.15)` = **$23,000**. The concentration cap is
+  `target × (1 + stretch_pct 0.15)` = **$13,800**. The concentration cap is
   computed against that **effective** budget, not the target
   ([`risk/allocator.py`](../risk/allocator.py) — `max_position_notional =
   min(available, effective_budget × max_position_pct_of_sleeve)`), so it rises
-  with it: $23,000 × 0.40 = $9,200. Borrowed capacity is returned as the pool
-  fills, so $8,000 is the number to plan with and $9,200 is the ceiling a
+  with it: $13,800 × 0.40 = $5,520. Borrowed capacity is returned as the pool
+  fills, so $4,800 is the number to plan with and $5,520 is the ceiling a
   single position can actually reach.
 - **Risk per trade** = `risk_per_trade_pct` 0.004 × $100k = **$400** *(target; sizing is risk-first in `RiskManager`, and `11.48` tracks the gap between this target and recorded risk)*
 - **Planned max simultaneous risk** (all 8 stops fire at target size) = 8 × $400 = **$3,200** — well inside the 5% daily-loss kill switch
@@ -340,14 +337,16 @@ Donchian is the highest-Sharpe strategy in the codebase by a 2.6× margin over S
 | Beats SMA on at least one metric | Sharpe OR MeanDD | ✅ Sharpe (2.6× SMA) |
 | MeanDD with ATR stops | ≤ 25% | ❌ -35.1% (structural, see below) |
 
-**Decision:** Activate at 0.25 sleeve weight. The DD gate misses by ~10pp, but
-the per-symbol averaged MeanDD overstates portfolio-level drawdown:
+**Original decision:** Activate at 0.25 sleeve weight. The current paper
+allocation is 0.15 after the Leveraged Trend sleeve was added. The DD gate
+misses by ~10pp, but the per-symbol averaged MeanDD overstates portfolio-level
+drawdown:
 - In production the engine runs one $100k pool, gross exposure capped at 80%
-- With 0.25 sleeve, the maximum Donchian contribution to portfolio DD ≈ 0.25 × 35% = −8.7%
+- The current target is 12% of account equity (0.80 deployable × 0.15 sleeve); applying the 35.1% sleeve drawdown gives an approximate −4.2% account-level contribution
 - In live mode, the HWM drawdown gate adds a further backstop: if cumulative realized
-  P&L drops >15% of the $20k sleeve budget ($3k) below its peak, new entries pause
+  P&L drops >15% of the $12k sleeve budget ($1.8k) below its peak, new entries pause
   automatically. Default paper mode reports this condition without pausing entries.
-- The TRENDING-only regime gate prevents new entries entirely during market downturns
+- The BEAR-only regime gate prevents new entries in BEAR while allowing measured RANGING and VOLATILE opportunities
 
 ---
 

@@ -18,7 +18,7 @@ This document catalogues every strategy in the bot, its signal logic, edge filte
 
 ## Active Strategies
 
-Five strategy sleeves are running simultaneously in paper trading: SMA, RSI, Donchian, SPY Options, and Credit Spread. They share a single `RiskManager`; the `SleeveAllocator` splits deployable capital into an equity pool and an isolated-options pool.
+Six strategy sleeves are running simultaneously in paper trading: SMA, RSI, Donchian, Leveraged Trend, SPY Options, and Credit Spread. They share a single `RiskManager`; the `SleeveAllocator` splits deployable capital into an equity pool and an isolated-options pool.
 
 > **Live configuration lives in the per-strategy deployment guides linked under each section below.** This catalog summarises signal logic, edge filters, and sleeve mechanics; it may lag the dedicated guides on day-to-day parameter changes (watchlist composition, sleeve weights, etc.). When in doubt, treat the deployment guide as the source of truth.
 
@@ -36,9 +36,9 @@ Five strategy sleeves are running simultaneously in paper trading: SMA, RSI, Don
 | Type | Trend-following |
 | Order type | MARKET |
 | Status | **Paper Trading** |
-| Sleeve weight | 40% of deployable gross capital |
+| Sleeve weight | 30% of deployable gross capital |
 | Max positions | 8 |
-| Per-position budget | **$12,800** baseline at $100k paper equity (`max_position_pct_of_sleeve` 0.40 × $32k target sleeve); **up to $14,720** when the allocator stretch applies — `can_stretch: True` raises the effective sleeve to $36,800 while utilization < 80% and the equity pool has slack, and the cap is computed against the *effective* budget |
+| Per-position budget | **$9,600** baseline at $100k paper equity (`max_position_pct_of_sleeve` 0.40 × $24k target sleeve); **up to $11,040** when allocator stretch applies — `can_stretch: True` raises the effective sleeve to $27,600 while utilization < 80% and the equity pool has slack |
 
 **Signal logic:**
 - **Entry:** Fast SMA crosses *above* slow SMA (bullish crossover)
@@ -113,10 +113,10 @@ SMA crossover is the simplest trend-following signal. It captures sustained dire
 | Type | Mean-reversion |
 | Order type | LIMIT |
 | Status | **Paper Trading** |
-| Sleeve weight | 20% of equity (target) — carved from 0.25 when credit_spread was added |
+| Sleeve weight | 15% of deployable gross capital |
 | Hard max positions | 8 |
 | Max position % of sleeve | 40% |
-| Per-position budget | **$6,400** baseline at $100k paper equity (0.40 × $16k target sleeve); **up to $7,360** with allocator stretch (`can_stretch: True`) |
+| Per-position budget | **$4,800** baseline at $100k paper equity (0.40 × $12k target sleeve); **up to $5,520** with allocator stretch (`can_stretch: True`) |
 | Watchlist size | 30 names (`RSI_WATCHLIST`) |
 
 **Signal logic:**
@@ -201,16 +201,14 @@ RSI mean reversion profits when prices snap back from extremes. It performs well
 | Type | Trend-continuation (Turtle System 1) |
 | Order type | **STOP_LIMIT** (shipped PR #62) |
 | Status | **Paper Trading** |
-| Sleeve weight | 25% of gross capital |
+| Sleeve weight | 15% of deployable gross capital |
 | Max positions | **8** (`hard_max_positions`) |
-| Per-position budget | **$8,000** baseline at $100k paper equity (`max_position_pct_of_sleeve` 0.40 × $20k target sleeve); **up to $9,200** when the allocator stretch applies — `can_stretch: True` raises the effective sleeve to $23,000 while utilization < 80% and the equity pool has slack, and the cap is computed against the *effective* budget |
+| Per-position budget | **$4,800** baseline at $100k paper equity (`max_position_pct_of_sleeve` 0.40 × $12k target sleeve); **up to $5,520** when allocator stretch applies — `can_stretch: True` raises the effective sleeve to $13,800 while utilization < 80% and the equity pool has slack |
 | Activated | 2026-05-01 |
 
-> **Corrected 2026-08-18.** This table previously said MARKET / 5 positions /
-> ~$4,000, all three stale, and quoted the baseline cap without the stretch
-> ceiling. `config/settings.py` is the source of truth; see
-> [`donchian_breakout_strategy.md`](donchian_breakout_strategy.md) for the full
-> capital math and `11.59` for the open regime-gate question.
+`config/settings.py` is the source of truth; see
+[`donchian_breakout_strategy.md`](donchian_breakout_strategy.md) for the full
+capital and regime-gate rationale.
 
 **Signal logic:**
 - **Entry:** Close makes a new N-day high (Donchian breakout)
@@ -286,7 +284,7 @@ costs: 2022 worsens −9.1R → −16.1R, and entries rise ~40%, which `11.60`
 32-name ai_bigtech universe: 23 AI core names (NVDA, MSFT, GOOGL, META, AMZN, etc.) + 9 AI-adjacent names (semiconductor equipment, data-centre power, quantum). See [`docs/donchian_breakout_strategy.md`](donchian_breakout_strategy.md) for the full universe methodology.
 
 **Why this strategy:**
-Donchian breakout is a pure trend-continuation system (Turtle Trading, System 1). It profits when a stock breaks to new highs with momentum and rides the trend until it reverses. Restricted to the TRENDING regime only.
+Donchian breakout is a pure trend-continuation system (Turtle Trading, System 1). It profits when a stock breaks to new highs with momentum and rides the trend until it reverses. It is allowed in TRENDING, RANGING, and VOLATILE regimes; only BEAR is blocked.
 
 > **Two claims removed here on 2026-08-18, both measured false.** (1) *"It
 > generates no signals in sideways or declining markets"* — the raw signal
@@ -536,18 +534,18 @@ the bounded entry walk under PLAN `11.63`; wait for its pre-registered sample.
 
 ## Strategy Diversification
 
-All five strategies provide complementary coverage across market regimes:
+The six active strategies provide the following regime coverage:
 
-| Market Regime | SMA Crossover | RSI Reversion | Donchian Breakout | SPY Options | Credit Spread |
-|---|---|---|---|---|---|
-| Strong trend | ✅ Profitable | ⚠️ Few signals | ✅ Profitable | ✅ Active | ✅ Active |
-| Sideways/range | ⚠️ Whipsawed | ✅ Profitable | ❌ Blocked | ✅ Active | ✅ Active |
-| Volatile crash | ❌ Blocked | ❌ Blocked | ❌ Blocked | ❌ Blocked | ❌ Blocked |
-| Bear market | ❌ Blocked | ❌ Blocked | ❌ Blocked | ❌ Blocked | ❌ Blocked |
+| Market Regime | SMA Crossover | RSI Reversion | Donchian Breakout | Leveraged Trend | SPY Options | Credit Spread |
+|---|---|---|---|---|---|---|
+| Strong trend | ✅ Allowed | ✅ Allowed | ✅ Allowed | ✅ Allowed | ✅ Allowed | ✅ Allowed |
+| Sideways/range | ✅ Allowed | ✅ Allowed | ✅ Allowed | ✅ Allowed | ✅ Allowed | ✅ Allowed |
+| Volatile | ❌ Blocked | ✅ Allowed | ✅ Allowed | ✅ Allowed | ❌ Blocked | ❌ Blocked |
+| Bear market | ❌ Blocked | ✅ Allowed | ❌ Blocked | ✅ Allowed | ❌ Blocked | ❌ Blocked |
 
-The first four are long-premium / long-direction; the credit spread is short-premium / theta-positive — they earn opposite sides of the volatility risk premium, so the credit-spread sleeve diversifies the portfolio's volatility exposure (it earns when realized vol < implied vol, the others depend on directional moves).
+SMA, RSI, Donchian, Leveraged Trend, and SPY Options are long-directional; the credit spread is short-premium / theta-positive. The credit-spread sleeve therefore diversifies volatility exposure, although its regime gate keeps it out of VOLATILE and BEAR conditions.
 
-All five strategies share a single `RiskManager` and a portfolio allocator. The allocator splits deployable capital into a shared `equity` pool and an isolated options vault, then enforces per-strategy target budgets, concentration caps, and hard count ceilings. Risk sizing still lives in `RiskManager` — except for credit spreads, which bypass `RiskManager.evaluate` because their max loss is defined by the spread width and capped by the sleeve notional; the allocator HWM / sleeve-drawdown state is updated via `record_realized_pnl` on every close. The HWM gate blocks entries in live mode (and optionally for mature paper strategies); default paper mode records the condition without blocking entries.
+All six strategies share a single `RiskManager` and portfolio allocator. The allocator splits deployable capital into a shared `equity` pool and an isolated options vault, then enforces per-strategy target budgets, concentration caps, and hard count ceilings. Risk sizing still lives in `RiskManager` — except for credit spreads, which bypass `RiskManager.evaluate` because their max loss is defined by spread width and capped by sleeve notional; the allocator HWM / sleeve-drawdown state is updated via `record_realized_pnl` on every close. The HWM gate blocks entries in live mode (and optionally for mature paper strategies); default paper mode records the condition without blocking entries.
 
 ---
 
@@ -563,22 +561,27 @@ CAPITAL_POOLS = {
 
 STRATEGY_ALLOCATIONS = {
     "sma_crossover": {
-        "target_pct": 0.40, "type": "equity", "priority": 3,
+        "target_pct": 0.30, "type": "equity", "priority": 3,
         "can_stretch": True, "hard_max_positions": 8,
         "max_position_pct_of_sleeve": 0.40,
         "risk_per_trade_pct": 0.006,   # 11.48: 0.60% of equity risk-to-stop
     },
     "rsi_reversion": {
-        "target_pct": 0.20, "type": "equity", "priority": 1,
+        "target_pct": 0.15, "type": "equity", "priority": 1,
         "can_stretch": True, "hard_max_positions": 8,
         "max_position_pct_of_sleeve": 0.40,
         "risk_per_trade_pct": 0.0025,  # 11.48: 0.25% of equity risk-to-stop
     },
     "donchian_breakout": {
-        "target_pct": 0.25, "type": "equity", "priority": 2,
+        "target_pct": 0.15, "type": "equity", "priority": 2,
         "can_stretch": True, "hard_max_positions": 8,
         "max_position_pct_of_sleeve": 0.40,
         "risk_per_trade_pct": 0.004,   # 11.48: 0.40% of equity risk-to-stop
+    },
+    "leveraged_trend": {
+        "target_pct": 0.25, "type": "equity", "priority": 5,
+        "can_stretch": False, "hard_max_positions": 4,
+        "max_position_pct_of_sleeve": 0.25,
     },
     "spy_options_reversion": {
         "target_pct": 0.05, "type": "isolated", "priority": 0,
@@ -586,8 +589,8 @@ STRATEGY_ALLOCATIONS = {
         "max_position_pct_of_sleeve": 1.00,
     },
     "credit_spread": {
-        "target_pct": 0.10, "type": "isolated", "priority": 0,
-        "can_stretch": False, "hard_max_positions": 8,
+        "target_pct": 0.10, "type": "isolated", "priority": 4,
+        "can_stretch": False, "hard_max_positions": 2,
         "max_position_pct_of_sleeve": 0.40,
     },
 }
@@ -596,15 +599,16 @@ MAX_GROSS_EXPOSURE_PCT = 0.80
 
 At $100k paper equity:
 - Gross ceiling: $100k × 0.80 = $80,000
-- Equity pool: $80k × 0.85 = $68,000 shared by SMA / RSI / Donchian
+- Equity pool: $80k × 0.85 = $68,000 shared by SMA / RSI / Donchian / Leveraged Trend
 - Options vault: $80k × 0.15 = $12,000 shared by SPY Options + Credit Spread (isolated, never stretches)
-- SMA target sleeve: $80k × 0.40 = $32,000, stretch cap $36,800, max single position $12,800
-- RSI target sleeve: $80k × 0.20 = $16,000, stretch cap $18,400, max single position $6,400
-- Donchian target sleeve: $80k × 0.25 = $20,000, stretch cap $23,000, max single position $8,000
+- SMA target sleeve: $80k × 0.30 = $24,000, stretch cap $27,600, baseline max single position $9,600
+- RSI target sleeve: $80k × 0.15 = $12,000, stretch cap $13,800, baseline max single position $4,800
+- Donchian target sleeve: $80k × 0.15 = $12,000, stretch cap $13,800, baseline max single position $4,800
+- Leveraged Trend target sleeve: $80k × 0.25 = $20,000, no stretch, max single position $5,000
 - Options (single-leg) target sleeve: $80k × 0.05 = $4,000, isolated, no stretch
 - Credit Spread target sleeve: $80k × 0.10 = $8,000, isolated, no stretch — shared across SPY + QQQ instances, per-position max loss capped at $80k × 0.10 × 0.40 = $3,200
 
-The credit-spread rebalance trimmed SMA (0.45 → 0.40) and RSI (0.25 → 0.20) to fund the new 0.10 isolated sleeve; Donchian and SPY Options were left unchanged. The 11.30 review closed without changing these weights.
+These are the current paper allocations. The 11.30 review closed without further credit-spread tuning; future optimization is tracked separately under 11.63.
 
 Elastic borrowing is equity-only: idle equity capital may be borrowed up to 115% of target while total deployable utilization remains below 80%. `hard_max_positions` is a safety ceiling, not the sizing formula.
 
