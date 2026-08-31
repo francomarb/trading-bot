@@ -5820,85 +5820,89 @@ class TradingEngine:
             )
 
     def _apply_operator_reduce_position(self, command) -> None:
-        """Handle ``reduce-position``: partial close by pct.
+        """Handle ``reduce-position``: partial close by exact quantity.
 
         Flow per proposal §10 + §11:
           1. Validate + acquire lock via _destructive_setup.
-          2. Read --pct from command.params (default 50 if absent).
-          3. Compute reduce_qty from broker_pos.qty at command-execution
-             time (NOT at CLI submit time). Round down for whole-share
-             equities; reject if reduce_qty rounds to zero. Reject if
-             reduce_qty >= broker_pos.qty (use close-position instead).
+          2. Read exact --qty from command.params. It is expressed in the
+             asset's natural unit: shares for equities, contracts for
+             single-leg options.
+          3. Validate qty against broker_pos.qty at command-execution time.
+             Qty must be a positive whole number and strictly smaller than
+             the fresh broker position (use close-position for the full qty).
           4. Same pending-close / stop-cancel prologue as close-position.
           5. Submit a market reduce via broker. Substrate row tagged
              role='partial_close', origin_kind='operator', uid.
           6. On fill: call _record_realized_pnl with
              is_full_close=False so the lifecycle's current_qty drops
              to residual via _reduce_lifecycle_for_owner_key.
-          7. Re-submit a protective stop for the residual? Phase C
-             leaves stop recreation to the next cycle's automatic stop
-             repair path (engine/trader.py:_repair_missing_protective_stops)
-             rather than racing here — the broker may have lots of
-             intermediate state during the reduce, and the repair pass
-             is already exercised in production.
+          7. Restore residual protection on the next cycle. Equities use
+             ``_repair_missing_protective_stops``; single-leg options use
+             ``_sync_option_trailing_stops``.
 
-        Phase C scope: equity single-leg only (matches the broker
-        helper's existing path). Spread/option reduce is out of scope
-        per the proposal §10 deferrals.
+        Phase C scope: single-leg equities and single-leg options. MLEG/
+        spread positions are rejected by ``_destructive_setup`` because a
+        one-symbol close would break spread atomicity.
         """
         lifecycle_row, broker_pos, holder = self._destructive_setup(command)
         if lifecycle_row is None:
             return
 
         try:
-            # --pct comes through params_json on the command row. The
-            # CLI carries it; we validate the type + range here.
+            # Exact --qty comes through params_json. Revalidate here because
+            # operator_commands is a durable boundary and rows can outlive the
+            # CLI process that created them.
             params = command.params or {}
             try:
-                pct = float(params.get("pct", 50))
-            except (TypeError, ValueError):
-                self.operator_command_store.mark_rejected(
-                    command_uid=command.command_uid,
-                    status="rejected_validation",
-                    result={"note": "params.pct must be numeric"},
-                )
-                return
-            if not (0 < pct < 100):
-                self.operator_command_store.mark_rejected(
-                    command_uid=command.command_uid,
-                    status="rejected_validation",
-                    result={"note": f"params.pct must be in (0, 100); got {pct}"},
-                )
-                return
-
-            current_qty = float(broker_pos.qty or 0.0)
-            if current_qty <= 0:
-                self.operator_command_store.mark_rejected(
-                    command_uid=command.command_uid,
-                    status="rejected_validation",
-                    result={"note": "broker reports non-positive qty"},
-                )
-                return
-
-            # Quantity rounding per proposal §10. Whole-share for now;
-            # fractional positions will need TIF + order-type
-            # constraint checking before they can take fractional close
-            # — leave fractional reduce out of Phase C v1.
-            raw_reduce = current_qty * pct / 100.0
-            import math
-            reduce_qty = math.floor(raw_reduce)
-            if reduce_qty <= 0:
+                if isinstance(params["qty"], bool):
+                    raise TypeError
+                requested_qty = float(params["qty"])
+            except KeyError:
                 self.operator_command_store.mark_rejected(
                     command_uid=command.command_uid,
                     status="rejected_validation",
                     result={
                         "note": (
-                            f"computed reduce qty rounds to zero "
-                            f"(pct={pct}, current_qty={current_qty})"
-                        ),
+                            "params.qty is required; percentage-based "
+                            "reduce commands are not supported"
+                        )
                     },
                 )
                 return
+            except (TypeError, ValueError):
+                self.operator_command_store.mark_rejected(
+                    command_uid=command.command_uid,
+                    status="rejected_validation",
+                    result={"note": "params.qty must be numeric"},
+                )
+                return
+            if (
+                not math.isfinite(requested_qty)
+                or requested_qty <= 0
+                or not requested_qty.is_integer()
+            ):
+                self.operator_command_store.mark_rejected(
+                    command_uid=command.command_uid,
+                    status="rejected_validation",
+                    result={
+                        "note": (
+                            "params.qty must be a positive whole number of "
+                            f"shares or contracts; got {params.get('qty')!r}"
+                        )
+                    },
+                )
+                return
+            reduce_qty = int(requested_qty)
+
+            current_qty = float(broker_pos.qty or 0.0)
+            if not math.isfinite(current_qty) or current_qty <= 0:
+                self.operator_command_store.mark_rejected(
+                    command_uid=command.command_uid,
+                    status="rejected_validation",
+                    result={"note": "broker reports invalid or non-positive qty"},
+                )
+                return
+
             if reduce_qty >= current_qty:
                 self.operator_command_store.mark_rejected(
                     command_uid=command.command_uid,
@@ -5907,6 +5911,19 @@ class TradingEngine:
                         "note": (
                             f"computed reduce qty ({reduce_qty}) covers "
                             f"the full position ({current_qty}); use "
+                            "close-position instead"
+                        ),
+                    },
+                )
+                return
+            if current_qty - reduce_qty < 1:
+                self.operator_command_store.mark_rejected(
+                    command_uid=command.command_uid,
+                    status="rejected_validation",
+                    result={
+                        "note": (
+                            f"reduce qty ({reduce_qty}) would leave less than "
+                            f"one whole share or contract ({current_qty}); use "
                             "close-position instead"
                         ),
                     },
@@ -6012,9 +6029,9 @@ class TradingEngine:
             # broker.close_position cleared any protective stop along
             # with the reduce. Mark the row 'succeeded' but flag the
             # `protection_status` so the operator knows the residual is
-            # temporarily unprotected until the next cycle's
-            # `_repair_missing_protective_stops` runs. Per-cycle repair
-            # is bounded by ENGINE_CYCLE_INTERVAL_SECONDS (default 300s);
+            # temporarily unprotected until the next cycle's equity stop
+            # repair or option trailing-stop sync runs. Per-cycle repair is
+            # bounded by ENGINE_CYCLE_INTERVAL_SECONDS (default 300s);
             # for shorter exposure the operator can fire a fresh halt or
             # full close. Recreating the stop inline here would require
             # waiting on the partial fill confirmation, looking up the
@@ -6024,10 +6041,14 @@ class TradingEngine:
             _sizing_model, protection_model = self._position_risk_policy(
                 symbol=lifecycle_row.symbol
             )
+            quantity_unit = (
+                "contracts" if _OCC_PAT.match(lifecycle_row.symbol) else "shares"
+            )
             result_payload = {
                 "position_uid": lifecycle_row.position_uid,
                 "symbol": lifecycle_row.symbol,
-                "pct": pct,
+                "quantity_unit": quantity_unit,
+                "current_qty": current_qty,
                 "requested_qty": reduce_qty,
                 "filled_qty": filled_qty,
                 "close_price": close_price,
@@ -6044,7 +6065,7 @@ class TradingEngine:
                     "protection_note": (
                         "broker.close_position cancelled the protective "
                         "stop before the reduce; residual is unprotected "
-                        "until the engine's per-cycle stop repair pass "
+                        "until the engine's per-cycle protection sync "
                         "restores it"
                     ),
                 })
@@ -6062,8 +6083,9 @@ class TradingEngine:
                 self.alerts.operator_action(
                     f"operator reduce-position: {lifecycle_row.symbol} "
                     f"({lifecycle_row.position_uid[:18]}…) "
-                    f"−{filled_qty} @ ${close_price:.2f} "
-                    f"({pct:.0f}% of {current_qty}) "
+                    f"−{filled_qty:g} {quantity_unit} @ ${close_price:.2f} "
+                    f"(from {current_qty:g}, residual "
+                    f"{max(0.0, current_qty - filled_qty):g}) "
                     f"{protection_note} — {command.reason}"
                 )
             except Exception as exc:
@@ -6075,7 +6097,7 @@ class TradingEngine:
             )
             logger.warning(
                 f"reduce-position by operator: {lifecycle_row.symbol} "
-                f"reduced={filled_qty}/{current_qty} (pct={pct}) "
+                f"reduced={filled_qty:g}/{current_qty:g} {quantity_unit} "
                 f"{degraded_log} "
                 f"reason={command.reason!r}"
             )

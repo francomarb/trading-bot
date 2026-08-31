@@ -9,7 +9,7 @@ Covers:
   - Symbol-lock acquired + released by each handler
   - close-position end-to-end: cancels pre-existing stops, broker
     submit, _record_realized_pnl reintegration
-  - reduce-position: --pct parsing, rounding, partial flow, lifecycle
+  - reduce-position: exact --qty validation, partial flow, lifecycle
     current_qty drops to residual
   - cancel-position-orders: walks substrate non-terminal sell-side rows,
     calls broker.cancel_order on each, NOT on entry rows
@@ -37,7 +37,13 @@ from reporting.logger import TradeLogger
 from risk.manager import AccountState, Position, RiskManager
 
 
-def _build_engine(tmp_path, *, broker_qty: float = 10.0, broker_price: float = 100.0):
+def _build_engine(
+    tmp_path,
+    *,
+    broker_qty: float = 10.0,
+    broker_price: float = 100.0,
+    symbol: str = "AAPL",
+):
     db_path = tmp_path / "trades.db"
     tl = TradeLogger(path=str(db_path))
     conn = tl._ensure_db()
@@ -56,7 +62,7 @@ def _build_engine(tmp_path, *, broker_qty: float = 10.0, broker_price: float = 1
     engine._session_start_equity = 100_000.0
     # Stub bookkeeping used by _record_realized_pnl.
     engine._allocator = MagicMock()
-    engine._entry_prices = {"AAPL": 95.0}
+    engine._entry_prices = {symbol: 95.0}
     engine._close_lifecycle_for_owner_key = lambda owner_key, external=False: None
     engine._reduce_lifecycle_for_owner_key = lambda owner_key, reduced_by: None
 
@@ -64,8 +70,8 @@ def _build_engine(tmp_path, *, broker_qty: float = 10.0, broker_price: float = 1
     # open_positions.get(symbol) returns a Position with broker_qty.
     engine.broker = MagicMock()
     positions = {} if broker_qty <= 0 else {
-        "AAPL": Position(
-            symbol="AAPL",
+        symbol: Position(
+            symbol=symbol,
             qty=broker_qty,
             avg_entry_price=broker_price,
             market_value=broker_qty * broker_price,
@@ -84,18 +90,25 @@ def _build_engine(tmp_path, *, broker_qty: float = 10.0, broker_price: float = 1
     return engine, queue
 
 
-def _seed_open_lifecycle(engine):
+def _seed_open_lifecycle(
+    engine,
+    *,
+    symbol: str = "AAPL",
+    owner_key: str | None = None,
+    strategy: str = "sma_crossover",
+    qty: float = 10.0,
+):
     uid = new_position_uid()
     engine.lifecycle_store.create_pending(
         position_uid=uid,
-        symbol="AAPL",
-        owner_key="AAPL",
-        strategy="sma_crossover",
+        symbol=symbol,
+        owner_key=owner_key or symbol,
+        strategy=strategy,
         position_type="single_leg",
-        entry_qty=10.0,
+        entry_qty=qty,
     )
     engine.lifecycle_store.mark_open(
-        position_uid=uid, avg_entry_price=95.0, current_qty=10.0,
+        position_uid=uid, avg_entry_price=95.0, current_qty=qty,
     )
     return uid
 
@@ -280,10 +293,9 @@ class TestClosePosition:
 
 
 class TestReducePosition:
-    def test_reduce_pct_rounds_down(self, tmp_path):
+    def test_reduce_uses_exact_qty(self, tmp_path):
         engine, queue = _build_engine(tmp_path, broker_qty=10.0)
         pos_uid = _seed_open_lifecycle(engine)
-        # 33% of 10 = 3.3 → floor = 3.
         engine.broker.close_position.return_value = OrderResult(
             status=OrderStatus.FILLED,
             order_id="alpaca-rdc-1",
@@ -298,7 +310,7 @@ class TestReducePosition:
         queue.insert(
             command_uid=uid, action="reduce-position", reason="t",
             target_position_uid=pos_uid,
-            params={"pct": 33.0},
+            params={"qty": 3},
         )
         engine._process_operator_commands()
 
@@ -311,59 +323,122 @@ class TestReducePosition:
         assert row.status == "succeeded"
         assert row.result["requested_qty"] == 3
         assert row.result["residual_qty"] == 7.0
+        assert row.result["quantity_unit"] == "shares"
 
-    def test_reduce_pct_floors_to_zero_rejects(self, tmp_path):
-        engine, queue = _build_engine(tmp_path, broker_qty=2.0)
+    def test_reduce_full_qty_rejects_use_close(self, tmp_path):
+        engine, queue = _build_engine(tmp_path, broker_qty=3.0)
         pos_uid = _seed_open_lifecycle(engine)
         uid = new_command_uid()
         queue.insert(
             command_uid=uid, action="reduce-position", reason="t",
-            target_position_uid=pos_uid,
-            params={"pct": 25.0},  # 25% of 2 = 0.5 → floor = 0
+            target_position_uid=pos_uid, params={"qty": 3},
         )
         engine._process_operator_commands()
         row = queue.get_by_command_uid(uid)
         assert row.status == "rejected_validation"
-        assert "rounds to zero" in (row.result.get("note") or "")
+        assert "use close-position" in (row.result.get("note") or "")
         engine.broker.close_position.assert_not_called()
 
-    def test_reduce_full_qty_rejects_use_close(self, tmp_path):
-        engine, queue = _build_engine(tmp_path, broker_qty=10.0)
+    def test_reduce_qty_above_current_rejects(self, tmp_path):
+        engine, queue = _build_engine(tmp_path, broker_qty=3.0)
         pos_uid = _seed_open_lifecycle(engine)
         uid = new_command_uid()
         queue.insert(
             command_uid=uid, action="reduce-position", reason="t",
-            target_position_uid=pos_uid,
-            params={"pct": 99.99},  # 99.99% of 10 → 9.999 → floor 9; not full
-        )
-        engine.broker.close_position.return_value = OrderResult(
-            status=OrderStatus.FILLED,
-            order_id="alpaca-r-1",
-            symbol="AAPL",
-            requested_qty=9, filled_qty=9, avg_fill_price=108.0,
-            raw_status="filled",
+            target_position_uid=pos_uid, params={"qty": 4},
         )
         engine._process_operator_commands()
-        # 9 is partial, allowed. (Above 99.99 is parsed as pct=99.99
-        # → reduce 9.999 → floor 9, which is partial.)
         row = queue.get_by_command_uid(uid)
-        assert row.status == "succeeded"
+        assert row.status == "rejected_validation"
+        assert "use close-position" in (row.result.get("note") or "")
+        engine.broker.close_position.assert_not_called()
 
-    def test_reduce_invalid_pct_rejects(self, tmp_path):
+    def test_reduce_rejects_fractional_only_residual(self, tmp_path):
+        engine, queue = _build_engine(tmp_path, broker_qty=3.5)
+        pos_uid = _seed_open_lifecycle(engine, qty=3.5)
+        uid = new_command_uid()
+        queue.insert(
+            command_uid=uid, action="reduce-position", reason="t",
+            target_position_uid=pos_uid, params={"qty": 3},
+        )
+        engine._process_operator_commands()
+        row = queue.get_by_command_uid(uid)
+        assert row.status == "rejected_validation"
+        assert "less than one whole" in (row.result.get("note") or "")
+        engine.broker.close_position.assert_not_called()
+
+    @pytest.mark.parametrize("params", [
+        {}, {"qty": 0}, {"qty": -1}, {"qty": 1.5},
+        {"qty": float("nan")}, {"qty": float("inf")}, {"qty": True},
+        {"qty": "bad"},
+        {"pct": 50},
+    ])
+    def test_reduce_invalid_or_legacy_qty_rejects(self, tmp_path, params):
         engine, queue = _build_engine(tmp_path)
         pos_uid = _seed_open_lifecycle(engine)
-        for bad in (0, 100, -10, 150):
-            uid = new_command_uid()
-            queue.insert(
-                command_uid=uid, action="reduce-position", reason="t",
-                target_position_uid=pos_uid,
-                params={"pct": bad},
-            )
-            engine._process_operator_commands()
-            row = queue.get_by_command_uid(uid)
-            assert row.status == "rejected_validation", (
-                f"pct={bad} should reject"
-            )
+        uid = new_command_uid()
+        queue.insert(
+            command_uid=uid, action="reduce-position", reason="t",
+            target_position_uid=pos_uid, params=params,
+        )
+        engine._process_operator_commands()
+        row = queue.get_by_command_uid(uid)
+        assert row.status == "rejected_validation"
+        engine.broker.close_position.assert_not_called()
+
+    @pytest.mark.parametrize(
+        ("current_qty", "reduce_qty", "residual_qty"),
+        [(2, 1, 1), (3, 1, 2), (3, 2, 1)],
+    )
+    def test_reduce_single_leg_option_by_exact_contracts(
+        self, tmp_path, current_qty, reduce_qty, residual_qty,
+    ):
+        occ = "SPY260925C00700000"
+        engine, queue = _build_engine(
+            tmp_path, broker_qty=float(current_qty), broker_price=10.0, symbol=occ,
+        )
+        pos_uid = _seed_open_lifecycle(
+            engine,
+            symbol=occ,
+            owner_key="SPY",
+            strategy="spy_options_reversion",
+            qty=float(current_qty),
+        )
+        engine._record_realized_pnl = MagicMock()
+        engine.broker.close_position.return_value = OrderResult(
+            status=OrderStatus.FILLED,
+            order_id="alpaca-opt-reduce",
+            symbol=occ,
+            requested_qty=float(reduce_qty),
+            filled_qty=float(reduce_qty),
+            avg_fill_price=12.0,
+            raw_status="filled",
+        )
+
+        uid = new_command_uid()
+        queue.insert(
+            command_uid=uid,
+            action="reduce-position",
+            reason="reduce option exposure",
+            target_position_uid=pos_uid,
+            params={"qty": reduce_qty},
+        )
+        engine._process_operator_commands()
+
+        engine.broker.close_position.assert_called_once_with(
+            occ,
+            position_uid=pos_uid,
+            partial_qty=reduce_qty,
+            operator_command_uid=uid,
+        )
+        engine._record_realized_pnl.assert_called_once()
+        assert engine._record_realized_pnl.call_args.kwargs["multiplier"] == 100
+        row = queue.get_by_command_uid(uid)
+        assert row.status == "succeeded"
+        assert row.result["quantity_unit"] == "contracts"
+        assert row.result["current_qty"] == float(current_qty)
+        assert row.result["requested_qty"] == reduce_qty
+        assert row.result["residual_qty"] == float(residual_qty)
 
 
 # ── cancel-position-orders ──────────────────────────────────────
@@ -540,7 +615,7 @@ class TestReviewFindings:
         uid = new_command_uid()
         queue.insert(
             command_uid=uid, action="reduce-position", reason="t",
-            target_position_uid=pos_uid, params={"pct": 30},
+            target_position_uid=pos_uid, params={"qty": 3},
         )
         engine._process_operator_commands()
 
@@ -583,7 +658,7 @@ class TestReviewFindings:
         uid = new_command_uid()
         queue.insert(
             command_uid=uid, action="reduce-position", reason="t",
-            target_position_uid=pos_uid, params={"pct": 30},
+            target_position_uid=pos_uid, params={"qty": 3},
         )
         engine._process_operator_commands()
 
@@ -594,7 +669,13 @@ class TestReviewFindings:
 
     # ── F3: spread rejection ──
 
-    def test_destructive_setup_rejects_spread_lifecycles(self, tmp_path):
+    @pytest.mark.parametrize(
+        ("action", "params"),
+        [("close-position", None), ("reduce-position", {"qty": 1})],
+    )
+    def test_destructive_setup_rejects_spread_lifecycles(
+        self, tmp_path, action, params,
+    ):
         engine, queue = _build_engine(tmp_path)
         # Seed a spread lifecycle.
         spread_uid = new_position_uid()
@@ -613,8 +694,8 @@ class TestReviewFindings:
 
         uid = new_command_uid()
         queue.insert(
-            command_uid=uid, action="close-position", reason="t",
-            target_position_uid=spread_uid,
+            command_uid=uid, action=action, reason="t",
+            target_position_uid=spread_uid, params=params,
         )
         engine._process_operator_commands()
 
@@ -637,7 +718,7 @@ class TestReviewFindings:
         uid = new_command_uid()
         queue.insert(
             command_uid=uid, action="reduce-position", reason="t",
-            target_position_uid=pos_uid, params={"pct": 30},
+            target_position_uid=pos_uid, params={"qty": 3},
         )
         engine._process_operator_commands()
 
@@ -744,7 +825,7 @@ class TestReviewFindings:
             action=action,
             reason="test corrupt policy fallback",
             target_position_uid=pos_uid,
-            params={"pct": 30} if action == "reduce-position" else None,
+            params={"qty": 3} if action == "reduce-position" else None,
         )
         engine._process_operator_commands()
 

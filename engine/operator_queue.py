@@ -129,10 +129,10 @@ VALID_STATUSES = frozenset({
 #   submits a closing order via the engine (origin_kind='operator' on
 #   the substrate row), waits for fill confirmation, then releases the
 #   symbol lock.
-# - reduce-position: partial close. Same flow but the engine computes
-#   the reduce qty from the operator's --pct (carried in params_json)
-#   and updates the lifecycle's current_qty to the residual via the
-#   existing _reduce_lifecycle_for_owner_key helper.
+# - reduce-position: partial close. Same flow but the operator supplies
+#   an exact whole-unit --qty (shares for equities, contracts for single-
+#   leg options) in params_json. The engine validates it against fresh
+#   broker quantity and updates lifecycle current_qty to the residual.
 # - cancel-position-orders: cancel every non-terminal protective stop
 #   / exit / partial_close row for the position. Does NOT submit any
 #   new orders. Useful before a manual close or when a stale broker

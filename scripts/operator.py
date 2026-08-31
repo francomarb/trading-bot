@@ -1,4 +1,4 @@
-"""Operator control CLI (Operator Controls Phase A PR-2).
+"""Operator control CLI (Operator Controls Phases A-C).
 
 Reads bot state and writes operator commands to the durable queue
 defined in `engine.operator_queue`. The CLI itself NEVER calls Alpaca
@@ -7,10 +7,10 @@ and NEVER mutates the engine directly — it writes a row to the
 on its per-cycle poll. See `docs/operator_controls_proposal.md` §4
 for the design rationale.
 
-Subcommands (Phase A):
+Read-only and emergency subcommands:
 
   status               — running state + cycle + halt + open positions
-  positions            — list open lifecycle rows (equity only in Phase A)
+  positions            — list open lifecycle rows
   show-position <uid>  — full lifecycle metadata + linked trades
   commands [--limit N] — recent operator command audit trail
   halt                 — write a sticky halt command (requires --confirm halt)
@@ -21,15 +21,17 @@ authority boundary — anyone with shell access on this machine can run
 it. Write commands all require `--reason` and `--confirm` so a typo
 cannot fire a destructive action.
 
-Phase B/C subcommands (pause-entries, reduce-position, etc.) are NOT
-present here. They would be added in their own PR following the
-proposal §5 sequencing.
+Phase B/C also provide soft pause controls and three position-scoped
+destructive commands. ``reduce-position`` takes an exact whole-unit
+``--qty``: shares for equities and contracts for single-leg options.
+MLEG/spread positions are rejected by the engine.
 """
 
 from __future__ import annotations
 
 import argparse
 import json
+import math
 import os
 import sqlite3
 import sys
@@ -46,6 +48,7 @@ from engine.operator_queue import (  # noqa: E402
     OperatorCommandStore,
     new_command_uid,
 )
+from utils.option_symbols import is_occ_option  # noqa: E402
 
 
 # ── Connection / store helpers ────────────────────────────────────────
@@ -565,6 +568,18 @@ def _enqueue_destructive_action(
     print(f"reason:      {args.reason}")
     if params:
         print(f"params:      {params}")
+    if action == "reduce-position" and params and "qty" in params:
+        row = _lifecycle_store(conn).get_by_position_uid(uid)
+        if row is not None and row.position_type == "single_leg":
+            unit = "contracts" if is_occ_option(row.symbol) else "shares"
+            requested_qty = int(params["qty"])
+            print(f"asset:       {row.symbol}")
+            print(f"reduce:      {requested_qty} {unit}")
+            if row.current_qty is not None:
+                residual = float(row.current_qty) - requested_qty
+                print(f"recorded qty: {float(row.current_qty):g} {unit}")
+                print(f"expected rem: {residual:g} {unit}")
+            print("broker qty:  revalidated by the engine before submission")
     print(
         f"engine heartbeat drains the queue every "
         f"~{settings.OPERATOR_COMMAND_HEARTBEAT_SECONDS}s; use "
@@ -579,17 +594,18 @@ def cmd_close_position(args: argparse.Namespace) -> int:
 
 def cmd_reduce_position(args: argparse.Namespace) -> int:
     try:
-        pct = float(args.pct)
+        qty = float(args.qty)
     except (TypeError, ValueError):
-        sys.stderr.write(f"error: --pct must be numeric; got {args.pct!r}\n")
+        sys.stderr.write(f"error: --qty must be numeric; got {args.qty!r}\n")
         return 2
-    if not (0 < pct < 100):
+    if not math.isfinite(qty) or qty <= 0 or not qty.is_integer():
         sys.stderr.write(
-            f"error: --pct must be in (0, 100); got {pct}\n"
+            "error: --qty must be a positive whole number of shares "
+            f"or contracts; got {args.qty!r}\n"
         )
         return 2
     return _enqueue_destructive_action(
-        args, action="reduce-position", params={"pct": pct},
+        args, action="reduce-position", params={"qty": int(qty)},
     )
 
 
@@ -717,12 +733,15 @@ def _build_parser() -> argparse.ArgumentParser:
 
     sp_rp = sub.add_parser(
         "reduce-position",
-        help="partially close one lifecycle (--pct)",
+        help="partially close one lifecycle by exact shares/contracts",
     )
     sp_rp.add_argument("position_uid", help="full pos_<hex> identifier")
     sp_rp.add_argument(
-        "--pct", required=True, type=float,
-        help="percentage of current position qty to reduce (0 < pct < 100)",
+        "--qty", required=True,
+        help=(
+            "exact whole quantity to sell: shares for equities or contracts "
+            "for single-leg options; must be smaller than current broker qty"
+        ),
     )
     sp_rp.add_argument("--reason", required=True, help="why are you reducing?")
     sp_rp.add_argument(
