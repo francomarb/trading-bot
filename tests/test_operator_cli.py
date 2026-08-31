@@ -544,12 +544,12 @@ class TestPhaseCDestructiveControls:
         assert match[0].target_position_uid == self._UID
         assert match[0].status == "pending"
 
-    def test_reduce_position_writes_pct_in_params(self, db_paths):
+    def test_reduce_position_writes_exact_qty_in_params(self, db_paths):
         db_path, state_path = db_paths
         rc, out, _ = _run([
             "--db", db_path, "--state-path", state_path,
             "reduce-position", self._UID,
-            "--pct", "33",
+            "--qty", "1",
             "--reason", "take some off",
             "--confirm", self._CONFIRM,
         ])
@@ -562,19 +562,68 @@ class TestPhaseCDestructiveControls:
         recent = store.recent(limit=5)
         match = [r for r in recent if r.action == "reduce-position"]
         assert len(match) == 1
-        assert match[0].params.get("pct") == 33.0
+        assert match[0].params == {"qty": 1}
 
-    def test_reduce_position_rejects_pct_out_of_range(self, db_paths):
+    @pytest.mark.parametrize("bad", ["0", "-5", "1.5", "nan", "inf", "nope"])
+    def test_reduce_position_rejects_non_positive_or_non_whole_qty(
+        self, db_paths, bad,
+    ):
         db_path, state_path = db_paths
-        for bad in (0, 100, -5, 150):
-            rc, _, err = _run([
-                "--db", db_path, "--state-path", state_path,
-                "reduce-position", self._UID,
-                "--pct", str(bad),
-                "--reason", "t",
-                "--confirm", self._CONFIRM,
-            ])
-            assert rc != 0, f"pct={bad} should refuse"
+        rc, _, err = _run([
+            "--db", db_path, "--state-path", state_path,
+            "reduce-position", self._UID,
+            "--qty", bad,
+            "--reason", "t",
+            "--confirm", self._CONFIRM,
+        ])
+        assert rc != 0
+        assert "--qty" in err
+
+    def test_reduce_position_no_longer_accepts_pct(self, db_paths):
+        db_path, state_path = db_paths
+        rc, _, err = _run([
+            "--db", db_path, "--state-path", state_path,
+            "reduce-position", self._UID,
+            "--pct", "50",
+            "--reason", "t",
+            "--confirm", self._CONFIRM,
+        ])
+        assert rc != 0
+        assert "--qty" in err
+
+    def test_reduce_position_previews_option_contract_units(self, db_paths):
+        db_path, state_path = db_paths
+        import sqlite3
+
+        conn = sqlite3.connect(db_path)
+        lifecycle = PositionLifecycleStore(conn)
+        lifecycle.create_pending(
+            position_uid=self._UID,
+            symbol="SPY260925C00700000",
+            owner_key="SPY",
+            strategy="spy_options_reversion",
+            position_type="single_leg",
+            entry_qty=3.0,
+        )
+        lifecycle.mark_open(
+            position_uid=self._UID,
+            avg_entry_price=10.0,
+            current_qty=3.0,
+        )
+
+        rc, out, _ = _run([
+            "--db", db_path, "--state-path", state_path,
+            "reduce-position", self._UID,
+            "--qty", "1",
+            "--reason", "reduce option exposure",
+            "--confirm", self._CONFIRM,
+        ])
+
+        assert rc == 0
+        assert "reduce:      1 contracts" in out
+        assert "recorded qty: 3 contracts" in out
+        assert "expected rem: 2 contracts" in out
+        assert "revalidated by the engine" in out
 
     def test_cancel_position_orders_writes_queue_row(self, db_paths):
         db_path, state_path = db_paths

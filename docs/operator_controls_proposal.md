@@ -1,6 +1,6 @@
 # Operator Controls & Unique Position Identity — v1 Proposal
 
-**Status:** Shipped — Phase A (PR #33 + #41), Phase B (PR #65), Phase C (PR #66, merged 2026-06-16). Doc retained as the design reference; §13 implementation sketch is historical. Operator controls is feature-complete for v1; remaining work is paper-bake evidence before live. The §17 amendment dissolved the original Phase A "deferred items" table in full.  
+**Status:** Shipped — Phase A (PR #33 + #41), Phase B (PR #65), Phase C (PR #66, merged 2026-06-16). Doc retained as the design reference; §13 implementation sketch is historical. The command surface is shipped, but reduce-position accounting and immediate residual protection must be completed before destructive paper drills. The §17 amendment dissolved the original Phase A "deferred items" table in full.
 **Author intent:** Written for Codex, Claude, Gemini, and the human operator to audit before implementation.  
 **Primary goal:** Give the operator safe, precise, auditable control over live bot risk without turning the bot into a manual trading terminal.
 
@@ -135,7 +135,7 @@ pos_91cfaae6f08f43169bb4a4f7b33d87ae     MU      sma_crossover  34    116.30   1
 Then target one exact position:
 
 ```bash
-./operator.py reduce-position pos_f3b1a6d9e9554d2093c47f03c46ef9c1 --pct 50 --reason "take profit before event risk"
+./operator.py reduce-position pos_f3b1a6d9e9554d2093c47f03c46ef9c1 --qty 5 --reason "take profit before event risk"
 ./operator.py close-position pos_f3b1a6d9e9554d2093c47f03c46ef9c1 --reason "manual exit before SMA signal"
 ```
 
@@ -180,7 +180,7 @@ V1 should be small, risk-reducing, and auditable.
 
 | Command | Example | Rationale |
 |---|---|---|
-| `reduce-position` | `./operator.py reduce-position pos_... --pct 50 --reason "take profit"` | Partial close by exact lifecycle ID. Critical for profit-taking, event-risk reduction, and operator risk management. |
+| `reduce-position` | `./operator.py reduce-position pos_... --qty 5 --reason "take profit"` | Reduce a single-leg position by exact whole shares or contracts. MLEG spreads are rejected. |
 | `close-position` | `./operator.py close-position pos_... --reason "manual exit"` | Full close by exact lifecycle ID. Safer than symbol/strategy labels. |
 | `cancel-position-orders` | `./operator.py cancel-position-orders pos_... --reason "stale protective order"` | Cancel open orders tied to one position. Useful before a reduce/close or when an order is stale. |
 
@@ -199,7 +199,7 @@ V1 minimum viable subset:
 ./operator.py show-position <position_uid>
 ./operator.py pause-entries --reason "..."
 ./operator.py resume-entries --reason "..."
-./operator.py reduce-position <position_uid> --pct 50 --reason "..."
+./operator.py reduce-position <position_uid> --qty 5 --reason "..."
 ./operator.py close-position <position_uid> --reason "..."
 ./operator.py halt --reason "..."
 ./operator.py commands
@@ -254,7 +254,7 @@ Suggested table: `operator_commands`
 | `action` | TEXT NOT NULL | `reduce_position`, `close_position`, `pause_entries`, etc. |
 | `target_position_uid` | TEXT | Required for position-specific actions |
 | `target_strategy` | TEXT | Required for strategy-specific controls |
-| `params_json` | TEXT NOT NULL | Qty, pct, flags, confirmation, etc. |
+| `params_json` | TEXT NOT NULL | Exact qty, flags, confirmation, etc. |
 | `reason` | TEXT NOT NULL | Required for state-changing commands |
 | `status` | TEXT NOT NULL | `pending`, `accepted`, `rejected`, `executing`, `succeeded`, `failed` |
 | `result_json` | TEXT | Broker result, rejection reason, final state |
@@ -410,8 +410,8 @@ For `reduce-position`:
 2. Position lifecycle status is open or reducible.
 3. Broker still has the corresponding symbol/legs.
 4. The strategy recorded in DB still owns that position.
-5. Requested `qty` or `pct` is valid.
-6. Requested reduce quantity does not exceed broker quantity.
+5. Requested `qty` is a positive whole number of shares or contracts.
+6. Requested reduce quantity is smaller than the fresh broker quantity; use `close-position` for the full quantity.
 7. Existing close orders are checked to avoid duplicate exits.
 8. Protective stop order quantity is canceled/replaced or otherwise reconciled.
 9. The order generated is risk-reducing only.
@@ -452,13 +452,13 @@ Partial closes must be handled as first-class lifecycle events.
 Example:
 
 ```bash
-./operator.py reduce-position pos_f3b1... --pct 50 --reason "take profit"
+./operator.py reduce-position pos_f3b1... --qty 1 --reason "take profit"
 ```
 
 Expected behavior:
 
 1. Bot validates the command.
-2. Bot computes the reduce quantity from current broker quantity.
+2. Bot validates the exact quantity against current broker quantity.
 3. Bot cancels or adjusts any pending protective order if needed.
 4. Bot submits a reducing order.
 5. Bot records the order with `position_uid`.
@@ -491,13 +491,13 @@ The lifecycle-level final R can then be computed from cumulative realized P&L ag
 
 Health/edge reporting must be reviewed so partial exits do not accidentally inflate trade count unless "trade count" is intentionally defined as fill/exit-event count. Lifecycle-level reporting should be able to distinguish one position with three partial exits from three independent positions.
 
-Quantity rounding policy for `--pct`:
+Quantity policy for `--qty`:
 
-- Compute reduce quantity from current broker quantity at command execution time, not CLI creation time.
-- Round down for whole-share equities.
-- Fail/reject if the computed quantity is zero.
-- Show the computed reduce quantity in the confirmation prompt.
-- Fractional positions may use fractional quantities only where Alpaca/order type/time-in-force constraints allow them.
+- The operator enters exact natural units: shares for equities, contracts for single-leg options.
+- Quantity must be a positive whole number; percentages, dollar amounts, and fractional contracts are not accepted.
+- The engine validates against fresh broker quantity when it executes the queued command.
+- Quantity must leave at least one whole unit open; use `close-position` for a full exit.
+- MLEG spreads are out of scope and rejected.
 
 ---
 
