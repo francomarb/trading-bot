@@ -30,6 +30,7 @@ import pytest
 from engine.lifecycle import PositionLifecycleStore, new_position_uid
 from engine.lifecycle_orders import PositionLifecycleOrdersStore
 from engine.operator_queue import OperatorCommandStore, new_command_uid
+from engine.positions import owner_key_for
 from engine.symbol_locks import SymbolLockRegistry
 from engine.trader import TradingEngine
 from execution.broker import OrderResult, OrderStatus
@@ -62,7 +63,7 @@ def _build_engine(
     engine._session_start_equity = 100_000.0
     # Stub bookkeeping used by _record_realized_pnl.
     engine._allocator = MagicMock()
-    engine._entry_prices = {symbol: 95.0}
+    engine._entry_prices = {owner_key_for(symbol): 95.0}
     engine._close_lifecycle_for_owner_key = lambda owner_key, external=False: None
     engine._reduce_lifecycle_for_owner_key = lambda owner_key, reduced_by: None
 
@@ -404,7 +405,7 @@ class TestReducePosition:
             strategy="spy_options_reversion",
             qty=float(current_qty),
         )
-        engine._record_realized_pnl = MagicMock()
+        engine._entry_prices["SPY"] = 10.0
         engine.broker.close_position.return_value = OrderResult(
             status=OrderStatus.FILLED,
             order_id="alpaca-opt-reduce",
@@ -431,8 +432,12 @@ class TestReducePosition:
             partial_qty=reduce_qty,
             operator_command_uid=uid,
         )
-        engine._record_realized_pnl.assert_called_once()
-        assert engine._record_realized_pnl.call_args.kwargs["multiplier"] == 100
+        engine._allocator.record_realized_pnl.assert_called_once_with(
+            "spy_options_reversion",
+            pytest.approx((12.0 - 10.0) * reduce_qty * 100),
+            position_uid=pos_uid,
+            is_full_close=False,
+        )
         row = queue.get_by_command_uid(uid)
         assert row.status == "succeeded"
         assert row.result["quantity_unit"] == "contracts"
