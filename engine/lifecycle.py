@@ -537,17 +537,11 @@ class PositionLifecycleStore:
 
         Does NOT change ``status`` — a partially-closed row stays in
         whatever non-terminal status it was already in (``open`` or
-        ``partially_filled``). For Phase A the operator CLI keys off
-        ``status`` for the open/closed split and off ``current_qty``
-        for the displayed size; that's enough to surface "this
-        position is still open but smaller than entry."
-
-        Full partial-close lifecycle accounting (per-event realized R,
-        ``net_realized_pnl`` accumulation, a dedicated
-        ``partially_closed`` state if needed) is bundled into Phase C
-        per the operator-controls implementation plan. This helper is
-        the minimum needed so the operator CLI does not show stale
-        entry quantity after a partial-fill exit.
+        ``partially_filled``). The operator CLI uses ``current_qty`` to
+        show that the position remains open at a smaller size. Realized
+        execution economics live in ``trades``; the operator reduce
+        handler writes that event and refreshes ``net_realized_pnl``
+        separately.
 
         Raises ValueError when ``current_qty <= 0`` — those cases must
         use ``mark_closed`` instead so the row reaches a terminal

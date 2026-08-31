@@ -1,6 +1,6 @@
 # Operator Controls & Unique Position Identity — v1 Proposal
 
-**Status:** Shipped — Phase A (PR #33 + #41), Phase B (PR #65), Phase C (PR #66, merged 2026-06-16). Doc retained as the design reference; §13 implementation sketch is historical. The command surface is shipped and option exits feed the allocator, but durable partial-close accounting and immediate residual protection must be completed before destructive paper drills. The §17 amendment dissolved the original Phase A "deferred items" table in full.
+**Status:** Shipped — Phase A (PR #33 + #41), Phase B (PR #65), Phase C (PR #66, merged 2026-06-16). Doc retained as the design reference; §13 implementation sketch is historical. Operator reductions now have durable partial-close accounting for equities and single-leg options. Immediate residual protection remains required before destructive paper drills. The §17 amendment dissolved the original Phase A "deferred items" table in full.
 **Author intent:** Written for Codex, Claude, Gemini, and the human operator to audit before implementation.  
 **Primary goal:** Give the operator safe, precise, auditable control over live bot risk without turning the bot into a manual trading terminal.
 

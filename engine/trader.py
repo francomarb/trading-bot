@@ -3973,7 +3973,8 @@ class TradingEngine:
         measurement_quality: str | None = None,
         timestamp_override: datetime | None = None,
         reason: str = "exit signal",
-    ) -> None:
+        is_full_close: bool | None = None,
+    ) -> bool:
         """Log an exit fill to the trade database.
 
         ``benchmark_kind`` defaults to None, which ``build_close_record``
@@ -3998,7 +3999,7 @@ class TradingEngine:
         fall through to "each row counts as one" for single-leg closes.
         """
         if result.status not in {OrderStatus.FILLED, OrderStatus.PARTIAL}:
-            return
+            return False
         # Look up position_uid from the lifecycle store. Best-effort —
         # failures don't block the log write, but the record is
         # written with position_uid=None and restart dedup will treat
@@ -4025,10 +4026,13 @@ class TradingEngine:
                 timestamp_override=timestamp_override,
                 reason=reason,
                 position_uid=position_uid,
+                is_full_close=is_full_close,
             )
             self.trade_logger.log(record)
+            return True
         except Exception as e:
             logger.error(f"trade logging (close) failed: {e}")
+            return False
 
     def _record_recovered_exit_fill(
         self,
@@ -4184,10 +4188,9 @@ class TradingEngine:
                       — ``_reduce_lifecycle_for_owner_key`` subtracts
                       the closed qty from ``current_qty`` via
                       ``mark_residual`` so the operator CLI shows
-                      accurate size. Full partial-close accounting
-                      (per-event realized R, ``net_realized_pnl``
-                      accumulation) remains a Phase C concern per the
-                      implementation plan.
+                      accurate size. The caller owns the durable trade
+                      event; the operator reduce handler writes it before
+                      invoking this runtime accounting path.
 
         Startup restores entry prices for still-open positions from the trade log,
         so normal restart/reconcile flows continue feeding the HWM gate. If the
@@ -4284,10 +4287,9 @@ class TradingEngine:
         entry qty), falls back to ``mark_closed`` so the row reaches a
         terminal status rather than sitting at qty=0 indefinitely.
 
-        Phase A scope: equity single-leg only. Spread / options
-        partial reductions land with the Phase C lifecycle wiring
-        for those workers. Wrapped in try/except so store failures
-        never raise into the close path.
+        Supports single-leg equities and options; spread reductions are
+        separate multi-leg operations. Wrapped in try/except so store
+        failures never raise into the close path.
         """
         if self.lifecycle_store is None:
             return
@@ -6019,9 +6021,42 @@ class TradingEngine:
                 )
                 return
 
-            # PnL + lifecycle current_qty drop. is_full_close=False so
-            # _record_realized_pnl calls _reduce_lifecycle_for_owner_key
-            # to update current_qty to the residual (Phase A helper).
+            # Durable accounting comes before the in-memory allocator update.
+            # The substrate row and this richer close record share order_id,
+            # so TradeLogger.log UPSERTs realized P&L/R/timestamps onto the
+            # broker-truth row instead of creating a second exit. A fully
+            # filled reduce order is still status='partial' at the trade level
+            # because the parent position remains open.
+            accounting_error: str | None = None
+            durable_realized_pnl: float | None = None
+            accounting_logged = self._log_close(
+                result,
+                0.0,
+                lifecycle_row.strategy,
+                benchmark_kind="unavailable",
+                measurement_quality="unavailable",
+                timestamp_override=result.filled_at or result.submitted_at,
+                reason=f"operator reduce: {command.reason}",
+                is_full_close=False,
+            )
+            if not accounting_logged:
+                accounting_error = "durable partial-close trade write failed"
+            else:
+                try:
+                    durable_realized_pnl = self.lifecycle_store.refresh_realized_pnl(
+                        position_uid=lifecycle_row.position_uid,
+                    )
+                except Exception as exc:
+                    accounting_error = (
+                        "lifecycle realized-P&L refresh failed: "
+                        f"{type(exc).__name__}: {exc}"
+                    )
+
+            # Live allocator + lifecycle current_qty update. This must still
+            # run if the durable accounting write failed because the broker
+            # fill already happened; refusing to reflect it locally would
+            # create a second, larger divergence. The command is marked failed
+            # below with an explicit DO-NOT-RETRY warning in that case.
             self._record_realized_pnl(
                 symbol=lifecycle_row.symbol,
                 strategy_name=lifecycle_row.strategy,
@@ -6031,6 +6066,32 @@ class TradingEngine:
                 external=False,
                 is_full_close=False,
             )
+
+            if accounting_error is not None:
+                error_result = {
+                    "position_uid": lifecycle_row.position_uid,
+                    "symbol": lifecycle_row.symbol,
+                    "broker_fill_occurred": True,
+                    "filled_qty": filled_qty,
+                    "close_price": close_price,
+                    "accounting_status": "failed",
+                    "error": accounting_error,
+                    "note": (
+                        "The broker reduction filled. DO NOT retry this command; "
+                        "repair durable accounting before another reduction."
+                    ),
+                }
+                self.operator_command_store.mark_failed(
+                    command_uid=command.command_uid,
+                    result=error_result,
+                )
+                logger.critical(
+                    f"reduce-position accounting FAILED after broker fill: "
+                    f"{lifecycle_row.symbol} position_uid="
+                    f"{lifecycle_row.position_uid} qty={filled_qty} — "
+                    f"{accounting_error}; DO NOT retry automatically"
+                )
+                return
 
             # PR-66 review F5: cancel-sibling-first inside
             # broker.close_position cleared any protective stop along
@@ -6062,6 +6123,8 @@ class TradingEngine:
                 "residual_qty": max(0.0, current_qty - filled_qty),
                 "broker_status": getattr(result.status, "value", str(result.status)),
                 "broker_order_id": result.order_id,
+                "accounting_status": "persisted",
+                "lifecycle_net_realized_pnl": durable_realized_pnl,
             }
             if protection_model is ProtectionModel.SIGNAL_EXIT_ONLY:
                 result_payload["protection_status"] = "not_required"
