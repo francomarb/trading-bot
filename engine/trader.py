@@ -3441,8 +3441,9 @@ class TradingEngine:
             )
             if wrote:
                 self._pop_position(symbol)
-                self._entry_prices.pop(symbol, None)
-                self._external_close_suspects.pop(symbol, None)
+                entry_key = owner_key_for(symbol)
+                self._entry_prices.pop(entry_key, None)
+                self._external_close_suspects.pop(entry_key, None)
                 logger.warning(
                     f"substrate exit-fill dispatch: cleared "
                     f"ownership for {symbol} ({owner}) via "
@@ -4238,11 +4239,17 @@ class TradingEngine:
 
         if self._allocator is None:
             return
-        entry_price = self._entry_prices.get(symbol)
+        # Runtime position state is keyed by owner_key. For equities that is
+        # the ticker itself; for a single-leg OCC option it is the underlying.
+        # Exit callers may legitimately pass either shape, so normalize at
+        # this shared accounting boundary instead of requiring every caller
+        # to remember the cache's keying convention.
+        entry_key = owner_key_for(symbol)
+        entry_price = self._entry_prices.get(entry_key)
         if entry_price is None or entry_price <= 0.0 or qty <= 0:
             logger.debug(
                 f"[{strategy_name}] {symbol}: skipping P&L update — "
-                f"entry_price={entry_price} qty={qty}"
+                f"entry_key={entry_key} entry_price={entry_price} qty={qty}"
             )
             return
         realized_pnl = (close_price - entry_price) * qty * multiplier

@@ -4447,8 +4447,10 @@ class TestOptionsEngineFixes:
 
     # Fix 4: 100x multiplier for options P&L ─────────────────────────────────
 
-    def test_record_realized_pnl_applies_100x_for_options(self, tmp_path):
-        """Options P&L must be multiplied by 100 (one contract = 100 shares)."""
+    def test_record_realized_pnl_normalizes_occ_to_underlying_entry_key(
+        self, tmp_path,
+    ):
+        """OCC exits use the underlying-keyed entry premium and 100x multiplier."""
         from unittest.mock import MagicMock
         from risk.allocator import SleeveAllocator
 
@@ -4457,9 +4459,19 @@ class TestOptionsEngineFixes:
         engine._allocator = allocator
         engine._entry_prices["SPY"] = 10.0  # option premium at entry
 
+        # Production stores the entry premium under owner_key='SPY', while
+        # substrate/operator exit paths pass the exact OCC contract.
+        occ = "SPY260516C00520000"
         # 2 contracts, exit premium $15, gain = (15-10)*2*100 = $1 000
-        engine._record_realized_pnl("SPY", "spy_options_reversion", 15.0, 2, multiplier=100)
-        allocator.record_realized_pnl.assert_called_once_with("spy_options_reversion", 1000.0, position_uid=None, is_full_close=True)
+        engine._record_realized_pnl(
+            occ, "spy_options_reversion", 15.0, 2, multiplier=100,
+        )
+        allocator.record_realized_pnl.assert_called_once_with(
+            "spy_options_reversion",
+            1000.0,
+            position_uid=None,
+            is_full_close=True,
+        )
 
     def test_record_realized_pnl_no_multiplier_for_equity(self, tmp_path):
         """Equity P&L uses multiplier=1 (default) — result unchanged."""

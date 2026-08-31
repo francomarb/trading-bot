@@ -2411,8 +2411,22 @@ class TestExitDispatchEndToEnd:
     in-engine substrate connection — and assert the side effects
     actually fire."""
 
+    @pytest.mark.parametrize(
+        (
+            "broker_symbol", "owner_key", "strategy", "qty",
+            "entry_price", "exit_price", "multiplier",
+        ),
+        [
+            ("AAPL", "AAPL", "sma_crossover", 10.0, 100.0, 105.0, 1),
+            (
+                "SPY260925C00700000", "SPY", "spy_options_reversion",
+                2.0, 10.0, 12.0, 100,
+            ),
+        ],
+    )
     def test_exit_dispatch_fires_pnl_and_cleanup_after_substrate_write(
-        self, tmp_path,
+        self, tmp_path, broker_symbol, owner_key, strategy, qty,
+        entry_price, exit_price, multiplier,
     ):
         """The reviewer's exact reproduction. After apply_order_event
         writes the exit trade row, the dispatch must STILL fire
@@ -2421,7 +2435,7 @@ class TestExitDispatchEndToEnd:
         from types import SimpleNamespace
         from engine.lifecycle_orders import apply_order_event
         from engine.trader import TradingEngine
-        from engine.positions import Position
+        from engine.positions import Position, owner_key_for
         from execution.broker import BrokerSnapshot
         from risk.manager import RiskDecision, Side
         from strategies.base import OrderType
@@ -2433,17 +2447,21 @@ class TestExitDispatchEndToEnd:
         engine.trade_logger = MagicMock()
         engine.alerts = MagicMock()
         engine.risk = MagicMock()
-        engine._positions = {"AAPL": Position(
-            position_id="AAPL", position_type="single_leg",
-            strategy_name="sma_crossover",
+        engine._positions = {owner_key: Position(
+            position_id=owner_key, position_type="single_leg",
+            strategy_name=strategy,
         )}
-        engine._entry_prices = {"AAPL": 100.0}
+        engine._entry_prices = {owner_key: entry_price}
         engine._external_close_suspects = {}
         # Mock spec stubs out _has_position / _pop_position; wire
         # them to real dict semantics so the dispatch's gate and
         # cleanup are observable.
-        engine._has_position = lambda sym: sym in engine._positions
-        engine._pop_position = lambda sym: engine._positions.pop(sym, None)
+        engine._has_position = (
+            lambda sym: owner_key_for(sym) in engine._positions
+        )
+        engine._pop_position = (
+            lambda sym: engine._positions.pop(owner_key_for(sym), None)
+        )
         # Bind the REAL _record_recovered_exit_fill and its
         # dependencies so the dispatch's call into it actually
         # writes the close log and fires the alert.
@@ -2452,7 +2470,10 @@ class TestExitDispatchEndToEnd:
         )
         engine._record_fill = lambda *a, **kw: None  # HWM gate noop
         engine._log_close = lambda *a, **kw: None  # trade_logger already has the row
-        engine._record_realized_pnl = MagicMock()
+        engine._allocator = MagicMock()
+        engine._record_realized_pnl = (
+            TradingEngine._record_realized_pnl.__get__(engine)
+        )
 
         # Real substrate connection from a TradeLogger.
         from reporting.logger import TradeLogger
@@ -2469,17 +2490,17 @@ class TestExitDispatchEndToEnd:
         # Seed: an open position with an exit order pending.
         uid = new_position_uid()
         pos_store.create_pending(
-            position_uid=uid, symbol="AAPL", owner_key="AAPL",
-            strategy="sma_crossover", position_type="single_leg",
-            entry_qty=10.0,
+            position_uid=uid, symbol=broker_symbol, owner_key=owner_key,
+            strategy=strategy, position_type="single_leg",
+            entry_qty=qty,
         )
         pos_store.mark_open(
-            position_uid=uid, avg_entry_price=100.0, current_qty=10.0,
+            position_uid=uid, avg_entry_price=entry_price, current_qty=qty,
         )
         orders_store.insert_pending(
             position_uid=uid, role="exit", client_order_id="cli-exit-1",
             order_type="market", order_class="simple",
-            time_in_force="day", side="sell", intended_qty=10.0,
+            time_in_force="day", side="sell", intended_qty=qty,
         )
         orders_store.attach_broker_order_id(
             client_order_id="cli-exit-1", order_id="alpaca-exit-1",
@@ -2491,7 +2512,7 @@ class TestExitDispatchEndToEnd:
             conn,
             OrderEvent(
                 order_id="alpaca-exit-1", status="filled",
-                filled_qty=10.0, avg_fill_price=105.0,
+                filled_qty=qty, avg_fill_price=exit_price,
                 broker_updated_at="2026-06-16T10:30:00+00:00",
             ),
             reason="stream",
@@ -2506,13 +2527,13 @@ class TestExitDispatchEndToEnd:
         # dedup signal instead) and fire side effects.
         event = OrderEvent(
             order_id="alpaca-exit-1", status="filled",
-            filled_qty=10.0, avg_fill_price=105.0,
+            filled_qty=qty, avg_fill_price=exit_price,
             broker_updated_at="2026-06-16T10:30:00+00:00",
         )
         snapshot = BrokerSnapshot(
             account=SimpleNamespace(
                 equity=100_000.0, cash=50_000.0, buying_power=50_000.0,
-                open_positions={},  # broker no longer holds AAPL
+                open_positions={},  # broker no longer holds the position
             ),
             open_orders=[],
         )
@@ -2525,21 +2546,16 @@ class TestExitDispatchEndToEnd:
         # Side effects should have fired even though the trade row
         # was already in trades:
         # 1. Ownership cleared from _positions
-        assert "AAPL" not in engine._positions
+        assert owner_key not in engine._positions
         # 2. Entry-price cache cleared
-        assert "AAPL" not in engine._entry_prices
+        assert owner_key not in engine._entry_prices
         # 3. alerts.trade_executed fired
         engine.alerts.trade_executed.assert_called_once()
-        engine._record_realized_pnl.assert_called_once_with(
-            "AAPL",
-            "sma_crossover",
-            105.0,
-            10.0,
-            multiplier=1,
-            external=False,
+        engine._allocator.record_realized_pnl.assert_called_once_with(
+            strategy,
+            pytest.approx((exit_price - entry_price) * qty * multiplier),
+            position_uid=uid,
             is_full_close=True,
-            update_lifecycle=False,
-            position_uid_override=uid,
         )
 
     def test_exit_dispatch_idempotent_via_ownership_gate(self, tmp_path):
