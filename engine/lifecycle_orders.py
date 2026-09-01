@@ -2060,6 +2060,15 @@ def apply_order_event(
             # with one row per leg. Auto-UPserting them here would create
             # a fake single-leg row and poison read_all_open_owners().
             if float(event.filled_qty) > 0 and position_type == "single_leg":
+                # ``position_lifecycle_orders.status`` describes the broker
+                # order, while ``trades.status`` describes the position event.
+                # A partial_close order may be completely filled, but the
+                # parent position deliberately remains open. Preserve that
+                # semantic distinction regardless of whether the substrate
+                # event arrives before or after the accounting writer.
+                trade_status = (
+                    "partial" if role == "partial_close" else event.status
+                )
                 conn.execute(
                     _TRADES_UPSERT_SQL,
                     {
@@ -2073,7 +2082,7 @@ def apply_order_event(
                         "strategy": strategy,
                         "reason": reason or f"{role}:{event.status}",
                         "order_type": order_type,
-                        "order_status": event.status,
+                        "order_status": trade_status,
                         "intended_qty": float(intended_qty),
                         "risk_budget_dollars": risk_budget_dollars,
                         "approved_risk_dollars": approved_risk_dollars,

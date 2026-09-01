@@ -1219,6 +1219,7 @@ class TradeLogger:
         timestamp_override: datetime | None = None,
         reason: str = "exit signal",
         position_uid: str | None = None,
+        is_full_close: bool | None = None,
     ) -> TradeRecord:
         """
         Build a TradeRecord for a position close (exit). Closes don't have
@@ -1350,6 +1351,9 @@ class TradeLogger:
                 new_signed_bps = signed
                 new_adverse_bps = max(0.0, signed)
 
+        trade_status = (
+            "partial" if is_full_close is False else result.status.value
+        )
         return TradeRecord(
             timestamp=now_iso,
             symbol=result.symbol,
@@ -1364,7 +1368,11 @@ class TradeLogger:
             modeled_slippage_bps=None,
             realized_slippage_bps=None,
             order_type="market",
-            status=result.status.value,
+            # Order completion and position completion are different facts.
+            # A reduce order can be fully filled while its parent position
+            # remains open; persist the latter as semantic status='partial'
+            # so restart accounting does not count a completed round trip.
+            status=trade_status,
             requested_qty=result.requested_qty,
             filled_qty=result.filled_qty,
             initial_stop_loss=initial_stop_loss,

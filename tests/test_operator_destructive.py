@@ -28,13 +28,17 @@ from unittest.mock import MagicMock
 import pytest
 
 from engine.lifecycle import PositionLifecycleStore, new_position_uid
-from engine.lifecycle_orders import PositionLifecycleOrdersStore
+from engine.lifecycle_orders import (
+    OrderEvent,
+    PositionLifecycleOrdersStore,
+    apply_order_event,
+)
 from engine.operator_queue import OperatorCommandStore, new_command_uid
 from engine.positions import owner_key_for
 from engine.symbol_locks import SymbolLockRegistry
 from engine.trader import TradingEngine
 from execution.broker import OrderResult, OrderStatus
-from reporting.logger import TradeLogger
+from reporting.logger import TradeLogger, TradeRecord
 from risk.manager import AccountState, Position, RiskManager
 
 
@@ -98,6 +102,7 @@ def _seed_open_lifecycle(
     owner_key: str | None = None,
     strategy: str = "sma_crossover",
     qty: float = 10.0,
+    entry_price: float = 95.0,
 ):
     uid = new_position_uid()
     engine.lifecycle_store.create_pending(
@@ -109,12 +114,91 @@ def _seed_open_lifecycle(
         entry_qty=qty,
     )
     engine.lifecycle_store.mark_open(
-        position_uid=uid, avg_entry_price=95.0, current_qty=qty,
+        position_uid=uid, avg_entry_price=entry_price, current_qty=qty,
     )
     return uid
 
 
+def _seed_entry_trade(
+    engine,
+    *,
+    position_uid: str,
+    symbol: str,
+    strategy: str,
+    qty: float,
+    entry_price: float,
+    initial_risk_per_share: float,
+) -> None:
+    """Write the production accounting anchors a partial close consumes."""
+    multiplier = 100 if owner_key_for(symbol) != symbol else 1
+    entered_at = "2026-08-28T14:30:00+00:00"
+    engine.trade_logger.log(TradeRecord(
+        timestamp=entered_at,
+        symbol=symbol,
+        side="buy",
+        qty=qty,
+        avg_fill_price=entry_price,
+        order_id=f"entry-{position_uid}",
+        strategy=strategy,
+        reason="test entry",
+        stop_price=entry_price - initial_risk_per_share,
+        entry_reference_price=entry_price,
+        modeled_slippage_bps=None,
+        realized_slippage_bps=None,
+        order_type="market",
+        status="filled",
+        requested_qty=qty,
+        filled_qty=qty,
+        initial_stop_loss=entry_price - initial_risk_per_share,
+        initial_risk_per_share=initial_risk_per_share,
+        initial_risk_dollars=(
+            initial_risk_per_share * qty * multiplier
+        ),
+        entry_timestamp=entered_at,
+        position_id=owner_key_for(symbol),
+        position_type="single_leg",
+        position_uid=position_uid,
+    ))
+
+
 # ── Validation / setup ─────────────────────────────────────────────
+
+
+def _seed_filled_entry_lifecycle_order(
+    engine,
+    *,
+    position_uid: str,
+    qty: float,
+    entry_price: float,
+) -> None:
+    """Write the production entry order that makes quantity rollup active."""
+    client_order_id = f"entry-client-{position_uid}"
+    order_id = f"entry-{position_uid}"
+    engine.lifecycle_orders_store.insert_pending(
+        position_uid=position_uid,
+        role="entry_primary",
+        client_order_id=client_order_id,
+        order_type="market",
+        order_class="simple",
+        time_in_force="day",
+        side="buy",
+        intended_qty=qty,
+    )
+    engine.lifecycle_orders_store.attach_broker_order_id(
+        client_order_id=client_order_id,
+        order_id=order_id,
+    )
+    outcome = apply_order_event(
+        engine.trade_logger._ensure_db(),
+        OrderEvent(
+            order_id=order_id,
+            status="filled",
+            filled_qty=qty,
+            avg_fill_price=entry_price,
+            broker_updated_at="2026-08-28T14:30:00+00:00",
+        ),
+    )
+    assert outcome.applied is True
 
 
 class TestDestructiveSetupValidation:
@@ -404,6 +488,7 @@ class TestReducePosition:
             owner_key="SPY",
             strategy="spy_options_reversion",
             qty=float(current_qty),
+            entry_price=10.0,
         )
         engine._entry_prices["SPY"] = 10.0
         engine.broker.close_position.return_value = OrderResult(
@@ -447,6 +532,264 @@ class TestReducePosition:
 
 
 # ── cancel-position-orders ──────────────────────────────────────
+
+
+class TestDurableReduceAccounting:
+    @pytest.mark.parametrize("substrate_first", [True, False])
+    @pytest.mark.parametrize(
+        (
+            "symbol", "owner_key", "strategy", "current_qty", "reduce_qty",
+            "entry_price", "close_price", "initial_risk_per_share",
+            "expected_pnl", "expected_r",
+        ),
+        [
+            (
+                "AAPL", "AAPL", "sma_crossover", 10.0, 3,
+                95.0, 110.0, 5.0, 45.0, 3.0,
+            ),
+            (
+                "SPY260925C00700000", "SPY", "spy_options_reversion", 3.0, 1,
+                10.0, 12.0, 2.0, 200.0, 1.0,
+            ),
+        ],
+    )
+    def test_reduce_persists_one_restart_safe_partial_close(
+        self,
+        tmp_path,
+        substrate_first,
+        symbol,
+        owner_key,
+        strategy,
+        current_qty,
+        reduce_qty,
+        entry_price,
+        close_price,
+        initial_risk_per_share,
+        expected_pnl,
+        expected_r,
+    ):
+        """Broker truth and enriched accounting may arrive in either order."""
+        engine, queue = _build_engine(
+            tmp_path,
+            broker_qty=current_qty,
+            broker_price=entry_price,
+            symbol=symbol,
+        )
+        position_uid = _seed_open_lifecycle(
+            engine,
+            symbol=symbol,
+            owner_key=owner_key,
+            strategy=strategy,
+            qty=current_qty,
+            entry_price=entry_price,
+        )
+        _seed_entry_trade(
+            engine,
+            position_uid=position_uid,
+            symbol=symbol,
+            strategy=strategy,
+            qty=current_qty,
+            entry_price=entry_price,
+            initial_risk_per_share=initial_risk_per_share,
+        )
+        _seed_filled_entry_lifecycle_order(
+            engine,
+            position_uid=position_uid,
+            qty=current_qty,
+            entry_price=entry_price,
+        )
+        # Deliberately disagree with the weighted durable basis. The live
+        # allocator must receive the committed close record's P&L, not this
+        # stale/incomplete runtime cache value.
+        engine._entry_prices[owner_key] = entry_price + 1.0
+
+        command_uid = new_command_uid()
+        order_id = "operator-reduce-order"
+        broker_updated_at = "2026-08-28T15:00:00+00:00"
+        result = OrderResult(
+            status=OrderStatus.FILLED,
+            order_id=order_id,
+            symbol=symbol,
+            requested_qty=float(reduce_qty),
+            filled_qty=float(reduce_qty),
+            avg_fill_price=close_price,
+            raw_status="filled",
+            submitted_at=datetime(2026, 8, 28, 14, 59, tzinfo=timezone.utc),
+            filled_at=datetime(2026, 8, 28, 15, 0, tzinfo=timezone.utc),
+        )
+
+        def close_position(*_args, **_kwargs):
+            engine.lifecycle_orders_store.insert_pending(
+                position_uid=position_uid,
+                role="partial_close",
+                client_order_id="operator-reduce-cloid",
+                order_type="market",
+                order_class="simple",
+                time_in_force="day",
+                side="sell",
+                intended_qty=float(reduce_qty),
+                origin_kind="operator",
+                operator_command_uid=command_uid,
+            )
+            engine.lifecycle_orders_store.attach_broker_order_id(
+                client_order_id="operator-reduce-cloid",
+                order_id=order_id,
+            )
+            if substrate_first:
+                apply_order_event(
+                    engine.trade_logger._ensure_db(),
+                    OrderEvent(
+                        order_id=order_id,
+                        status="filled",
+                        filled_qty=float(reduce_qty),
+                        avg_fill_price=close_price,
+                        broker_updated_at=broker_updated_at,
+                    ),
+                )
+            return result
+
+        engine.broker.close_position.side_effect = close_position
+        queue.insert(
+            command_uid=command_uid,
+            action="reduce-position",
+            reason="trim exposure",
+            target_position_uid=position_uid,
+            params={"qty": reduce_qty},
+        )
+        engine._process_operator_commands()
+
+        if not substrate_first:
+            outcome = apply_order_event(
+                engine.trade_logger._ensure_db(),
+                OrderEvent(
+                    order_id=order_id,
+                    status="filled",
+                    filled_qty=float(reduce_qty),
+                    avg_fill_price=close_price,
+                    broker_updated_at=broker_updated_at,
+                ),
+            )
+            assert outcome.applied is True
+
+        conn = engine.trade_logger._ensure_db()
+        conn.row_factory = sqlite3.Row
+        trade_rows = conn.execute(
+            "SELECT * FROM trades WHERE order_id = ?", (order_id,),
+        ).fetchall()
+        assert len(trade_rows) == 1
+        trade = trade_rows[0]
+        assert trade["status"] == "partial"
+        assert trade["position_uid"] == position_uid
+        assert trade["realized_pnl"] == pytest.approx(expected_pnl)
+        assert trade["r_multiple"] == pytest.approx(expected_r)
+        assert trade["entry_timestamp"] is not None
+        assert trade["exit_timestamp"] is not None
+        assert trade["reason"] == "operator reduce: trim exposure"
+
+        lifecycle = engine.lifecycle_store.get_by_position_uid(position_uid)
+        assert lifecycle.status == "partially_filled"
+        assert lifecycle.current_qty == pytest.approx(current_qty - reduce_qty)
+        assert lifecycle.net_realized_pnl == pytest.approx(expected_pnl)
+
+        engine._allocator.record_realized_pnl.assert_called_once_with(
+            strategy,
+            pytest.approx(expected_pnl),
+            position_uid=position_uid,
+            is_full_close=False,
+        )
+        summary = engine.trade_logger.read_strategy_realized_pnl_summary([strategy])
+        assert summary[strategy] == {
+            "realized_pnl": pytest.approx(expected_pnl),
+            "hwm": pytest.approx(expected_pnl),
+            "trade_count": 0.0,
+            "seen_position_uids": [],
+        }
+
+        command = queue.get_by_command_uid(command_uid)
+        assert command.status == "succeeded"
+        assert command.result["accounting_status"] == "persisted"
+        assert command.result["lifecycle_net_realized_pnl"] == pytest.approx(
+            expected_pnl
+        )
+
+    def test_accounting_failure_after_fill_is_explicit_and_not_retryable(
+        self, tmp_path,
+    ):
+        engine, queue = _build_engine(tmp_path, broker_qty=10.0)
+        position_uid = _seed_open_lifecycle(engine)
+        engine.broker.close_position.return_value = OrderResult(
+            status=OrderStatus.FILLED,
+            order_id="reduce-filled-accounting-failed",
+            symbol="AAPL",
+            requested_qty=2.0,
+            filled_qty=2.0,
+            avg_fill_price=101.0,
+            raw_status="filled",
+        )
+        engine._log_close = MagicMock(return_value=None)
+        engine._record_realized_pnl = MagicMock()
+
+        command_uid = new_command_uid()
+        queue.insert(
+            command_uid=command_uid,
+            action="reduce-position",
+            reason="trim exposure",
+            target_position_uid=position_uid,
+            params={"qty": 2},
+        )
+        engine._process_operator_commands()
+
+        command = queue.get_by_command_uid(command_uid)
+        assert command.status == "failed"
+        assert command.result["broker_fill_occurred"] is True
+        assert command.result["accounting_status"] == "failed"
+        assert command.result["durable_trade_status"] == "failed"
+        assert command.result["lifecycle_aggregate_status"] == "not_attempted"
+        assert command.result["lifecycle_quantity_status"] == "persisted"
+        assert "Durable trade accounting is missing" in command.result["note"]
+        assert "DO NOT retry" in command.result["note"]
+        engine._record_realized_pnl.assert_called_once()
+
+    def test_aggregate_refresh_failure_preserves_durable_trade_distinction(
+        self, tmp_path,
+    ):
+        engine, queue = _build_engine(tmp_path, broker_qty=10.0)
+        position_uid = _seed_open_lifecycle(engine)
+        engine.broker.close_position.return_value = OrderResult(
+            status=OrderStatus.FILLED,
+            order_id="reduce-filled-aggregate-failed",
+            symbol="AAPL",
+            requested_qty=2.0,
+            filled_qty=2.0,
+            avg_fill_price=101.0,
+            raw_status="filled",
+        )
+        engine.lifecycle_store.refresh_realized_pnl = MagicMock(
+            side_effect=sqlite3.OperationalError("aggregate unavailable")
+        )
+
+        command_uid = new_command_uid()
+        queue.insert(
+            command_uid=command_uid,
+            action="reduce-position",
+            reason="trim exposure",
+            target_position_uid=position_uid,
+            params={"qty": 2},
+        )
+        engine._process_operator_commands()
+
+        command = queue.get_by_command_uid(command_uid)
+        assert command.status == "failed"
+        assert command.result["durable_trade_status"] == "persisted"
+        assert command.result["lifecycle_aggregate_status"] == "failed"
+        assert command.result["lifecycle_quantity_status"] == "persisted"
+        assert "durable trade row was written" in command.result["note"]
+        assert "DO NOT retry" in command.result["note"]
+        trade = engine.trade_logger._ensure_db().execute(
+            "SELECT realized_pnl, status FROM trades WHERE order_id = ?",
+            ("reduce-filled-aggregate-failed",),
+        ).fetchone()
+        assert tuple(trade) == (12.0, "partial")
 
 
 class TestCancelPositionOrders:
@@ -804,6 +1147,7 @@ class TestReviewFindings:
         pos_uid = _seed_open_lifecycle(engine)
         engine.lifecycle_store.get_open_for_owner_key = MagicMock(
             return_value=SimpleNamespace(
+                position_uid=pos_uid,
                 sizing_model="broken",
                 protection_model="broken",
             )
