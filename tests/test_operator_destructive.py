@@ -21,6 +21,7 @@ Covers:
 from __future__ import annotations
 
 import sqlite3
+from dataclasses import replace
 from datetime import datetime, timezone
 from types import SimpleNamespace
 from unittest.mock import MagicMock
@@ -39,7 +40,8 @@ from engine.symbol_locks import SymbolLockRegistry
 from engine.trader import TradingEngine
 from execution.broker import OrderResult, OrderStatus
 from reporting.logger import TradeLogger, TradeRecord
-from risk.manager import AccountState, Position, RiskManager
+from risk.manager import AccountState, Position, RiskManager, Side
+from risk.models import ProtectionModel, SizingModel
 
 
 def _build_engine(
@@ -74,6 +76,33 @@ def _build_engine(
     # Mock broker. sync_with_broker returns a snapshot whose
     # open_positions.get(symbol) returns a Position with broker_qty.
     engine.broker = MagicMock()
+    engine.broker.cancel_order.return_value = True
+    engine.broker.settle_close_order.side_effect = lambda result: replace(
+        result, raw_status="canceled"
+    )
+    engine.broker.get_open_orders.return_value = [
+        SimpleNamespace(
+            order_id="existing-stop",
+            symbol=symbol,
+            side=Side.SELL,
+            qty=broker_qty,
+            stop_price=90.0,
+            time_in_force="gtc",
+        )
+    ] if broker_qty > 0 else []
+
+    def _accepted_stop(**kwargs):
+        return SimpleNamespace(
+            order_id="operator-residual-stop",
+            symbol=kwargs["symbol"],
+            side=Side.SELL,
+            qty=float(kwargs["qty"]),
+            stop_price=float(kwargs["stop_price"]),
+            time_in_force="gtc",
+        )
+
+    engine.broker.place_protective_stop.side_effect = _accepted_stop
+    engine.broker.submit_option_gtc_stop.side_effect = _accepted_stop
     positions = {} if broker_qty <= 0 else {
         symbol: Position(
             symbol=symbol,
@@ -1052,9 +1081,9 @@ class TestReviewFindings:
         assert "single_leg only" in (row.result.get("note") or "")
         engine.broker.close_position.assert_not_called()
 
-    # ── F5: reduce-position protection_status flag ──
+    # ── Immediate residual protection ──
 
-    def test_reduce_succeeded_carries_degraded_protection_flag(self, tmp_path):
+    def test_reduce_succeeds_only_after_residual_stop_restored(self, tmp_path):
         engine, queue = _build_engine(tmp_path, broker_qty=10.0)
         pos_uid = _seed_open_lifecycle(engine)
         engine.broker.close_position.return_value = OrderResult(
@@ -1072,19 +1101,21 @@ class TestReviewFindings:
 
         row = queue.get_by_command_uid(uid)
         assert row.status == "succeeded"
-        # Reviewer F5: succeeded result MUST carry the degraded flag
-        # so the operator knows the residual is temporarily unprotected.
-        assert row.result.get("degraded") is True
-        assert row.result.get("protection_status") == "pending_repair_cycle"
-        assert "unprotected" in (row.result.get("protection_note") or "")
+        assert row.result.get("degraded") is None
+        assert row.result.get("protection_status") == "restored"
+        assert row.result.get("protective_stop_order_id") == (
+            "operator-residual-stop"
+        )
+        engine.broker.place_protective_stop.assert_called_once_with(
+            symbol="AAPL", qty=7, stop_price=90.0,
+            client_order_id_prefix="operator-residual-stop",
+            position_uid=pos_uid,
+        )
 
     # ── P2#1: close-position PARTIAL carries same degraded flag ──
 
-    def test_close_partial_carries_degraded_protection_flag(self, tmp_path):
-        """A PARTIAL close-position fill leaves residual at the broker
-        with the protective stop cancelled — mirror the reduce-position
-        contract and report `degraded=True` with `protection_status`
-        so the operator sees the gap immediately."""
+    def test_close_partial_settles_then_restores_residual_stop(self, tmp_path):
+        """A partial full-close cannot succeed until its residual is safe."""
         engine, queue = _build_engine(tmp_path, broker_qty=10.0)
         pos_uid = _seed_open_lifecycle(engine)
         engine.broker.close_position.return_value = OrderResult(
@@ -1106,9 +1137,10 @@ class TestReviewFindings:
         row = queue.get_by_command_uid(uid)
         assert row.status == "succeeded"
         assert row.result["is_full_close"] is False
-        assert row.result.get("degraded") is True
-        assert row.result.get("protection_status") == "pending_repair_cycle"
-        assert "unprotected" in (row.result.get("protection_note") or "")
+        assert row.result.get("degraded") is None
+        assert row.result.get("protection_status") == "restored"
+        engine.broker.settle_close_order.assert_called_once()
+        engine.broker.place_protective_stop.assert_called_once()
 
     def test_close_full_does_not_carry_degraded_flag(self, tmp_path):
         """A clean FULL close has no residual and no protection gap —
@@ -1142,7 +1174,7 @@ class TestReviewFindings:
     ):
         """Operator paths must not crash while interpreting legacy/corrupt
         policy text.  The shared lifecycle resolver fails safe to the stopped
-        posture, so a residual is reported as awaiting stop repair."""
+        posture, so a residual is immediately protected."""
         engine, queue = _build_engine(tmp_path, broker_qty=10.0)
         pos_uid = _seed_open_lifecycle(engine)
         engine.lifecycle_store.get_open_for_owner_key = MagicMock(
@@ -1180,8 +1212,8 @@ class TestReviewFindings:
 
         row = queue.get_by_command_uid(command_uid)
         assert row.status == "succeeded"
-        assert row.result.get("degraded") is True
-        assert row.result.get("protection_status") == "pending_repair_cycle"
+        assert row.result.get("degraded") is None
+        assert row.result.get("protection_status") == "restored"
 
     # ── N: close-position zero-fill defensive guard ──
 
@@ -1330,3 +1362,250 @@ class TestProposalInvariant:
         assert call["qty"] == 10.0
         assert call["is_full_close"] is True
         assert call["external"] is False
+
+
+class TestImmediateResidualProtection:
+    def test_fresh_qty_available_blocks_stop_while_qty_is_reserved(self, tmp_path):
+        engine, queue = _build_engine(tmp_path, broker_qty=10.0)
+        pos_uid = _seed_open_lifecycle(engine)
+        engine.broker.close_position.return_value = OrderResult(
+            status=OrderStatus.FILLED, order_id="reduce-filled", symbol="AAPL",
+            requested_qty=3.0, filled_qty=3.0,
+            avg_fill_price=108.0, raw_status="filled",
+        )
+        engine.broker.get_positions.return_value = {
+            "AAPL": Position(
+                symbol="AAPL", qty=7.0, qty_available=5.0,
+                avg_entry_price=100.0, market_value=700.0,
+            )
+        }
+
+        uid = new_command_uid()
+        queue.insert(
+            command_uid=uid, action="reduce-position", reason="test",
+            target_position_uid=pos_uid, params={"qty": 3},
+        )
+        engine._process_operator_commands()
+
+        row = queue.get_by_command_uid(uid)
+        assert row.status == "failed"
+        assert row.result["broker_fill_occurred"] is True
+        assert row.result["protection_status"] == "failed"
+        assert "only 5 of 7 available" in row.result["protection_note"]
+        engine.broker.place_protective_stop.assert_not_called()
+
+    def test_fresh_empty_position_set_reports_flat_without_stop(self, tmp_path):
+        engine, _queue = _build_engine(tmp_path, broker_qty=10.0)
+        _seed_open_lifecycle(engine)
+        lifecycle = engine.lifecycle_store.get_open_for_owner_key("AAPL")
+        assert lifecycle is not None
+        recipe = engine._capture_operator_residual_protection(
+            lifecycle_row=lifecycle
+        )
+        engine.broker.get_positions.return_value = {}
+
+        outcome = engine._ensure_operator_residual_protection(
+            lifecycle_row=lifecycle,
+            recipe=recipe,
+            expected_residual_qty=7.0,
+        )
+
+        assert outcome.status == "flat"
+        assert outcome.residual_qty == 0.0
+        engine.broker.place_protective_stop.assert_not_called()
+
+    def test_cycle_stop_sync_is_blocked_by_operator_lock_or_working_close(
+        self, tmp_path
+    ):
+        engine, _queue = _build_engine(tmp_path, broker_qty=10.0)
+        pos_uid = _seed_open_lifecycle(engine)
+        holder = engine.symbol_locks.acquire(
+            owner_key="AAPL", kind="operator", identifier="cmd-test"
+        )
+        assert holder is not None
+        assert engine._close_side_transition_blocks_stop_sync("AAPL") is True
+        engine.symbol_locks.release(owner_key="AAPL", holder=holder)
+
+        engine.lifecycle_orders_store.insert_pending(
+            position_uid=pos_uid,
+            role="partial_close",
+            client_order_id="partial-working",
+            order_type="market",
+            order_class="simple",
+            time_in_force="day",
+            side="sell",
+            intended_qty=3.0,
+        )
+
+        assert engine._close_side_transition_blocks_stop_sync("AAPL") is True
+
+    def test_single_leg_option_reduce_restores_exact_contract_stop(self, tmp_path):
+        occ = "SPY260901C00500000"
+        engine, queue = _build_engine(
+            tmp_path, broker_qty=3.0, broker_price=5.0, symbol=occ
+        )
+        pos_uid = _seed_open_lifecycle(
+            engine, symbol=occ, owner_key=owner_key_for(occ),
+            strategy="spy_options_reversion", qty=3.0, entry_price=5.0,
+        )
+        engine.broker.close_position.return_value = OrderResult(
+            status=OrderStatus.FILLED, order_id="opt-reduce", symbol=occ,
+            requested_qty=1.0, filled_qty=1.0,
+            avg_fill_price=6.0, raw_status="filled",
+        )
+
+        uid = new_command_uid()
+        queue.insert(
+            command_uid=uid, action="reduce-position", reason="test",
+            target_position_uid=pos_uid, params={"qty": 1},
+        )
+        engine._process_operator_commands()
+
+        row = queue.get_by_command_uid(uid)
+        assert row.status == "succeeded"
+        assert row.result["protection_status"] == "restored"
+        engine.broker.submit_option_gtc_stop.assert_called_once_with(
+            symbol=occ, qty=2.0, stop_price=90.0,
+            client_order_id_prefix="operator-residual-stop",
+            position_uid=pos_uid,
+        )
+        engine.broker.place_protective_stop.assert_not_called()
+
+    def test_signal_exit_only_reduce_needs_no_broker_stop(self, tmp_path):
+        engine, queue = _build_engine(tmp_path, broker_qty=10.0)
+        pos_uid = _seed_open_lifecycle(engine)
+        engine._position_risk_policy = MagicMock(return_value=(
+            SizingModel.NOTIONAL, ProtectionModel.SIGNAL_EXIT_ONLY,
+        ))
+        engine.broker.close_position.return_value = OrderResult(
+            status=OrderStatus.FILLED, order_id="reduce-1", symbol="AAPL",
+            requested_qty=3.0, filled_qty=3.0,
+            avg_fill_price=108.0, raw_status="filled",
+        )
+
+        uid = new_command_uid()
+        queue.insert(
+            command_uid=uid, action="reduce-position", reason="test",
+            target_position_uid=pos_uid, params={"qty": 3},
+        )
+        engine._process_operator_commands()
+
+        row = queue.get_by_command_uid(uid)
+        assert row.status == "succeeded"
+        assert row.result["protection_status"] == "not_required"
+        engine.broker.place_protective_stop.assert_not_called()
+
+    def test_fractional_broker_stop_residual_is_rejected_before_close(self, tmp_path):
+        engine, queue = _build_engine(tmp_path, broker_qty=10.5)
+        pos_uid = _seed_open_lifecycle(engine, qty=10.5)
+
+        uid = new_command_uid()
+        queue.insert(
+            command_uid=uid, action="reduce-position", reason="test",
+            target_position_uid=pos_uid, params={"qty": 3},
+        )
+        engine._process_operator_commands()
+
+        row = queue.get_by_command_uid(uid)
+        assert row.status == "rejected_validation"
+        assert "fractional" in row.result["note"]
+        engine.broker.close_position.assert_not_called()
+
+    def test_unknown_partial_does_not_submit_competing_stop(self, tmp_path):
+        engine, queue = _build_engine(tmp_path, broker_qty=10.0)
+        pos_uid = _seed_open_lifecycle(engine)
+        partial = OrderResult(
+            status=OrderStatus.PARTIAL, order_id="close-working",
+            symbol="AAPL", requested_qty=3.0, filled_qty=1.0,
+            avg_fill_price=108.0, raw_status="partially_filled",
+        )
+        engine.broker.close_position.return_value = partial
+        engine.broker.settle_close_order.side_effect = None
+        engine.broker.settle_close_order.return_value = replace(
+            partial, status=OrderStatus.UNKNOWN,
+            message="remainder may still be working",
+        )
+
+        uid = new_command_uid()
+        queue.insert(
+            command_uid=uid, action="reduce-position", reason="test",
+            target_position_uid=pos_uid, params={"qty": 3},
+        )
+        engine._process_operator_commands()
+
+        row = queue.get_by_command_uid(uid)
+        assert row.status == "failed"
+        assert row.result["protection_status"] == "indeterminate_close_order"
+        engine.broker.place_protective_stop.assert_not_called()
+
+    def test_terminal_canceled_close_with_fill_is_accounted_and_protected(
+        self, tmp_path
+    ):
+        engine, queue = _build_engine(tmp_path, broker_qty=10.0)
+        pos_uid = _seed_open_lifecycle(engine)
+        engine.broker.close_position.return_value = OrderResult(
+            status=OrderStatus.CANCELED, order_id="close-canceled",
+            symbol="AAPL", requested_qty=3.0, filled_qty=2.0,
+            avg_fill_price=108.0, raw_status="canceled",
+        )
+
+        uid = new_command_uid()
+        queue.insert(
+            command_uid=uid, action="reduce-position", reason="test",
+            target_position_uid=pos_uid, params={"qty": 3},
+        )
+        engine._process_operator_commands()
+
+        row = queue.get_by_command_uid(uid)
+        assert row.status == "succeeded"
+        assert row.result["filled_qty"] == pytest.approx(2.0)
+        assert row.result["residual_qty"] == pytest.approx(8.0)
+        assert row.result["protection_status"] == "restored"
+        engine.broker.settle_close_order.assert_not_called()
+
+    def test_rejected_reduce_replaces_uncertain_original_protection(self, tmp_path):
+        engine, queue = _build_engine(tmp_path, broker_qty=10.0)
+        pos_uid = _seed_open_lifecycle(engine)
+        engine.broker.close_position.return_value = OrderResult(
+            status=OrderStatus.REJECTED, order_id=None, symbol="AAPL",
+            requested_qty=3.0, filled_qty=0.0,
+            avg_fill_price=None, raw_status="rejected",
+        )
+
+        uid = new_command_uid()
+        queue.insert(
+            command_uid=uid, action="reduce-position", reason="test",
+            target_position_uid=pos_uid, params={"qty": 3},
+        )
+        engine._process_operator_commands()
+
+        row = queue.get_by_command_uid(uid)
+        assert row.status == "failed"
+        assert row.result["protection_status"] == "restored"
+        engine.broker.place_protective_stop.assert_called_once()
+
+    def test_stop_submit_failure_is_failed_after_fill_do_not_retry(self, tmp_path):
+        engine, queue = _build_engine(tmp_path, broker_qty=10.0)
+        pos_uid = _seed_open_lifecycle(engine)
+        engine.broker.close_position.return_value = OrderResult(
+            status=OrderStatus.FILLED, order_id="reduce-filled", symbol="AAPL",
+            requested_qty=3.0, filled_qty=3.0,
+            avg_fill_price=108.0, raw_status="filled",
+        )
+        engine.broker.place_protective_stop.side_effect = RuntimeError(
+            "stop rejected"
+        )
+
+        uid = new_command_uid()
+        queue.insert(
+            command_uid=uid, action="reduce-position", reason="test",
+            target_position_uid=pos_uid, params={"qty": 3},
+        )
+        engine._process_operator_commands()
+
+        row = queue.get_by_command_uid(uid)
+        assert row.status == "failed"
+        assert row.result["broker_fill_occurred"] is True
+        assert row.result["protection_status"] == "failed"
+        assert "DO NOT retry" in row.result["note"]
+        engine.alerts.broker_error.assert_called_once()

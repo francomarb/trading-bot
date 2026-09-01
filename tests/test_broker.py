@@ -24,6 +24,7 @@ loops are exercised.
 
 from __future__ import annotations
 
+from dataclasses import replace
 from datetime import datetime, timezone
 from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
@@ -1564,6 +1565,99 @@ class TestClosePosition:
         # Only the AAPL sibling was canceled, not the unrelated MSFT order.
         api.cancel_order_by_id.assert_called_once_with("aapl-stop")
 
+    def test_close_does_not_cancel_same_symbol_buy_order(self):
+        api = MagicMock()
+        api.get_all_positions.return_value = [
+            SimpleNamespace(
+                symbol="AAPL", qty="10", avg_entry_price="100",
+                market_value="1010",
+            )
+        ]
+        api.get_orders.return_value = [
+            SimpleNamespace(
+                id="aapl-buy", symbol="AAPL", side="buy", qty="1",
+                type="limit", status="open", limit_price="90",
+                stop_price=None, submitted_at="2026-04-15T14:30:00Z",
+            )
+        ]
+        api.close_position.return_value = _alpaca_order(status="accepted")
+        api.get_order_by_id.return_value = _alpaca_order(
+            status="filled", filled_qty=10, filled_avg_price=101.0
+        )
+
+        result = _broker_with_mock(api).close_position("AAPL", poll_timeout=0.0)
+
+        assert result.status is OrderStatus.FILLED
+        api.cancel_order_by_id.assert_not_called()
+
+    def test_close_refuses_submit_when_sell_cancel_is_not_confirmed(self):
+        api = MagicMock()
+        api.get_all_positions.return_value = [
+            SimpleNamespace(
+                symbol="AAPL", qty="10", avg_entry_price="100",
+                market_value="1010",
+            )
+        ]
+        api.get_orders.return_value = [
+            SimpleNamespace(
+                id="aapl-stop", symbol="AAPL", side="sell", qty="10",
+                type="stop", status="open", limit_price=None,
+                stop_price="95", submitted_at="2026-04-15T14:30:00Z",
+            )
+        ]
+        broker = _broker_with_mock(api)
+        broker.cancel_order = MagicMock(return_value=False)
+
+        result = broker.close_position("AAPL", poll_timeout=0.0)
+
+        assert result.status is OrderStatus.REJECTED
+        assert "could not confirm cancellation" in result.message
+        api.close_position.assert_not_called()
+
+    def test_settle_partial_cancels_remainder_and_returns_terminal_partial(self):
+        broker = _broker_with_mock(MagicMock())
+        broker.cancel_order = MagicMock(return_value=True)
+        broker._poll_until_terminal = MagicMock(return_value=OrderResult(
+            status=OrderStatus.CANCELED,
+            order_id="close-1",
+            symbol="AAPL",
+            requested_qty=10.0,
+            filled_qty=4.0,
+            avg_fill_price=101.0,
+            raw_status="canceled",
+        ))
+        initial = replace(
+            broker._poll_until_terminal.return_value,
+            status=OrderStatus.PARTIAL,
+            raw_status="partially_filled",
+        )
+
+        settled = broker.settle_close_order(initial, poll_timeout=0.0)
+
+        assert settled.status is OrderStatus.PARTIAL
+        assert settled.raw_status == "canceled"
+        assert settled.filled_qty == pytest.approx(4.0)
+        broker.cancel_order.assert_called_once_with("close-1")
+
+    def test_settle_partial_returns_unknown_when_remainder_stays_working(self):
+        broker = _broker_with_mock(MagicMock())
+        broker.cancel_order = MagicMock(return_value=True)
+        initial = OrderResult(
+            status=OrderStatus.PARTIAL,
+            order_id="close-1",
+            symbol="AAPL",
+            requested_qty=10.0,
+            filled_qty=4.0,
+            avg_fill_price=101.0,
+            raw_status="partially_filled",
+        )
+        broker._poll_until_terminal = MagicMock(return_value=initial)
+
+        settled = broker.settle_close_order(initial, poll_timeout=0.0)
+
+        assert settled.status is OrderStatus.UNKNOWN
+        assert "non-terminal" in settled.message
+
     def test_confirmation_error_returns_unknown_with_exact_order_id(self):
         api = MagicMock()
         api.get_all_positions.return_value = [
@@ -1657,6 +1751,20 @@ class TestReadSide:
             avg_entry_price=727.67,
             market_value=4083.26,
         )
+
+    def test_get_positions_preserves_broker_qty_available(self):
+        api = MagicMock()
+        api.get_all_positions.return_value = [
+            SimpleNamespace(
+                symbol="AAPL", qty="10", qty_available="7",
+                avg_entry_price="100", market_value="1010",
+            )
+        ]
+
+        position = _broker_with_mock(api).get_positions()["AAPL"]
+
+        assert position.qty == pytest.approx(10.0)
+        assert position.qty_available == pytest.approx(7.0)
 
     def test_sync_bundles_account_positions_and_orders(self):
         api = MagicMock()

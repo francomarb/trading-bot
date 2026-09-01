@@ -91,6 +91,10 @@ class Position:
     cost_basis: float | None = None
     unrealized_pl: float | None = None
     unrealized_plpc: float | None = None
+    # Broker-reported quantity not reserved by working orders.  Alpaca uses
+    # this to explain why a close/stop can be rejected even though the gross
+    # position quantity is large enough.
+    qty_available: float | None = None
 
 
 def worst_case_entry_price(decision: "RiskDecision") -> tuple[float, str]:
