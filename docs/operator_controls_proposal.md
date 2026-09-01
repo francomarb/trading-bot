@@ -463,7 +463,7 @@ Expected behavior:
 4. Bot submits a reducing order.
 5. Bot records the order with `position_uid`.
 6. Bot records fill(s) as partial close rows.
-7. Bot leaves the position open if remaining qty > 0.
+7. Bot writes the absolute broker-derived residual quantity and leaves the position open if remaining qty > 0. This is idempotent with the order-substrate rollup whichever arrives first.
 8. Bot updates entry/risk context as needed for remaining quantity.
 9. Bot keeps the same `position_uid` for the remaining position.
 10. Bot marks the lifecycle closed only when remaining broker quantity reaches zero.
@@ -480,6 +480,10 @@ Record each partial close as a realized event linked to the same `position_uid`.
 - remaining open qty
 - unrealized P&L on remaining qty
 - total lifecycle P&L once fully closed
+
+The live allocator uses that committed event's realized P&L rather than
+recomputing it from the runtime entry-price cache. Live state and restart replay
+therefore use the same weighted broker-fill basis.
 
 For R-multiple reporting, calculate each partial close event against the initial risk allocated to the closed portion:
 
