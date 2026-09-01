@@ -267,13 +267,15 @@ operation only.
 
 ### 6.5 Operator partial closes and reductions
 
-Partial `close-position` and `reduce-position` results currently declare every
-residual equity position degraded and `pending_repair_cycle`. For
-`SIGNAL_EXIT_ONLY`, the residual is healthy and no repair is pending.
+Partial `close-position` and `reduce-position` results now settle the close
+order before inspecting the residual. A broker-stop residual must have exact
+GTC protection verified or restored before the command succeeds;
+`SIGNAL_EXIT_ONLY` remains healthy without a broker stop.
 
 Required behavior:
 
-- stopped position: preserve cancel/reduce/repair status;
+- stopped position: report `verified` or `restored`; a failed repair is a
+  failed-after-fill command with an explicit do-not-retry warning;
 - signal-exit position: report `protection_status='not_required'` (or omit the
   stop-specific status under a documented API contract), with no degraded flag;
 - always retain the original position protection model on the residual

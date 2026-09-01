@@ -80,6 +80,7 @@ from execution.broker import (
     AlpacaBroker,
     BrokerOrderAuditSnapshot,
     BrokerSnapshot,
+    OpenOrder,
     OptionQuote,
     OrderResult,
     OrderStatus,
@@ -171,6 +172,28 @@ _SUBSTRATE_NULL_ATTACH_SWEEP_STALE_SECONDS = 3600
 # longer than one cycle so a failing row is skipped for at least
 # one full sweep pass.
 _SUBSTRATE_NULL_ATTACH_SWEEP_BACKOFF_SECONDS = 300
+
+
+@dataclass(frozen=True)
+class _ResidualProtectionRecipe:
+    """Protection that must survive an operator close/reduce transition."""
+
+    required: bool
+    stop_price: float | None
+
+
+@dataclass(frozen=True)
+class _ResidualProtectionOutcome:
+    """Typed result returned before an operator command may say succeeded."""
+
+    status: str
+    residual_qty: float
+    stop_order_id: str | None = None
+    note: str = ""
+
+    @property
+    def ok(self) -> bool:
+        return self.status in {"flat", "not_required", "verified", "restored"}
 
 
 @dataclass(frozen=True)
@@ -5602,6 +5625,267 @@ class TradingEngine:
                 owner_key=lifecycle_row.owner_key, holder=holder,
             )
 
+    def _capture_operator_residual_protection(
+        self,
+        *,
+        lifecycle_row,
+    ) -> _ResidualProtectionRecipe:
+        """Capture the broker stop that a close operation is about to cancel."""
+        _sizing, protection_model = self._position_risk_policy(
+            symbol=lifecycle_row.symbol
+        )
+        if protection_model is ProtectionModel.SIGNAL_EXIT_ONLY:
+            return _ResidualProtectionRecipe(
+                required=False,
+                stop_price=None,
+            )
+
+        try:
+            open_orders = list(self.broker.get_open_orders())
+        except Exception as exc:
+            logger.warning(
+                f"{lifecycle_row.symbol}: could not snapshot protection before "
+                f"operator close: {exc}"
+            )
+            open_orders = []
+        stops = [
+            order for order in open_orders
+            if self._is_matching_symbol(lifecycle_row.symbol, order.symbol)
+            and order.side is Side.SELL
+            and order.stop_price is not None
+        ]
+        if len(stops) > 1:
+            raise ValueError(
+                f"multiple protective stops exist for {lifecycle_row.symbol}; "
+                "reconcile them before an operator reduction"
+            )
+        existing = stops[0] if stops else None
+        stop_price = (
+            float(existing.stop_price)
+            if existing is not None and existing.stop_price is not None
+            else None
+        )
+        if stop_price is None and is_occ_option(lifecycle_row.symbol):
+            trailing_store = getattr(self, "option_trailing_store", None)
+            if trailing_store is not None:
+                try:
+                    row = trailing_store.get_by_occ(lifecycle_row.symbol)
+                    if row is not None and row.current_stop_price is not None:
+                        stop_price = float(row.current_stop_price)
+                except Exception as exc:
+                    logger.warning(
+                        f"{lifecycle_row.symbol}: option stop-state lookup failed "
+                        f"before operator close: {exc}"
+                    )
+        if stop_price is None and not is_occ_option(lifecycle_row.symbol):
+            stop_price = self.trade_logger.read_latest_open_stop_price(
+                symbol=lifecycle_row.symbol,
+                strategy=lifecycle_row.strategy,
+            )
+        return _ResidualProtectionRecipe(
+            required=True,
+            stop_price=stop_price,
+        )
+
+    @staticmethod
+    def _operator_stop_matches(
+        order: OpenOrder,
+        *,
+        symbol: str,
+        qty: float,
+        stop_price: float,
+    ) -> bool:
+        """Whether an accepted broker order proves exact residual protection."""
+        try:
+            order_qty = abs(float(order.qty))
+            order_stop = float(order.stop_price or 0.0)
+        except (TypeError, ValueError):
+            return False
+        tif = str(order.time_in_force or "").lower()
+        return (
+            TradingEngine._is_matching_symbol(symbol, order.symbol)
+            and order.side is Side.SELL
+            and abs(order_qty - qty) <= 1e-9
+            and order_stop + 0.005 >= stop_price
+            and tif == "gtc"
+        )
+
+    def _ensure_operator_residual_protection(
+        self,
+        *,
+        lifecycle_row,
+        recipe: _ResidualProtectionRecipe,
+        expected_residual_qty: float,
+        replace_existing: bool = False,
+    ) -> _ResidualProtectionOutcome:
+        """Immediately verify or restore protection using fresh broker truth."""
+        if not recipe.required:
+            return _ResidualProtectionOutcome(
+                status="not_required", residual_qty=max(0.0, expected_residual_qty)
+            )
+        if recipe.stop_price is None or recipe.stop_price <= 0:
+            return _ResidualProtectionOutcome(
+                status="failed",
+                residual_qty=max(0.0, expected_residual_qty),
+                note="no recoverable protective stop price",
+            )
+
+        residual_qty = max(0.0, float(expected_residual_qty))
+        qty_available: float | None = None
+        try:
+            positions = self.broker.get_positions()
+            if isinstance(positions, dict):
+                fresh_position = positions.get(lifecycle_row.symbol)
+                if fresh_position is None:
+                    return _ResidualProtectionOutcome(
+                        status="flat", residual_qty=0.0
+                    )
+                residual_qty = abs(float(fresh_position.qty or 0.0))
+                raw_available = getattr(fresh_position, "qty_available", None)
+                if raw_available is not None:
+                    qty_available = abs(float(raw_available))
+        except Exception as exc:
+            logger.warning(
+                f"{lifecycle_row.symbol}: fresh residual position read failed; "
+                f"using settled expected qty {expected_residual_qty}: {exc}"
+            )
+        if residual_qty <= 0:
+            return _ResidualProtectionOutcome(status="flat", residual_qty=0.0)
+        whole_qty = int(residual_qty)
+        if abs(residual_qty - whole_qty) > 1e-9:
+            return _ResidualProtectionOutcome(
+                status="failed",
+                residual_qty=residual_qty,
+                note=(
+                    "broker-stop residual is fractional; exact standalone "
+                    "stop protection requires whole shares/contracts"
+                ),
+            )
+        if qty_available is not None and qty_available + 1e-9 < residual_qty:
+            return _ResidualProtectionOutcome(
+                status="failed",
+                residual_qty=residual_qty,
+                note=(
+                    f"broker reports only {qty_available:g} of {residual_qty:g} "
+                    "available; a close-side order may still be working"
+                ),
+            )
+
+        try:
+            open_orders = list(self.broker.get_open_orders())
+        except Exception as exc:
+            return _ResidualProtectionOutcome(
+                status="failed", residual_qty=residual_qty,
+                note=f"could not verify broker orders: {exc}",
+            )
+        existing_stops = [
+            order for order in open_orders
+            if self._is_matching_symbol(lifecycle_row.symbol, order.symbol)
+            and order.side is Side.SELL
+            and order.stop_price is not None
+        ]
+        for existing in existing_stops:
+            if not replace_existing and self._operator_stop_matches(
+                existing,
+                symbol=lifecycle_row.symbol,
+                qty=residual_qty,
+                stop_price=recipe.stop_price,
+            ):
+                return _ResidualProtectionOutcome(
+                    status="verified",
+                    residual_qty=residual_qty,
+                    stop_order_id=existing.order_id,
+                )
+        for existing in existing_stops:
+            if not self.broker.cancel_order(existing.order_id):
+                return _ResidualProtectionOutcome(
+                    status="failed", residual_qty=residual_qty,
+                    note=(
+                        "could not cancel stale/wrong-sized protective stop "
+                        f"{existing.order_id}"
+                    ),
+                )
+
+        try:
+            if is_occ_option(lifecycle_row.symbol):
+                restored = self.broker.submit_option_gtc_stop(
+                    symbol=lifecycle_row.symbol,
+                    qty=residual_qty,
+                    stop_price=recipe.stop_price,
+                    client_order_id_prefix="operator-residual-stop",
+                    position_uid=lifecycle_row.position_uid,
+                )
+            else:
+                restored = self.broker.place_protective_stop(
+                    symbol=lifecycle_row.symbol,
+                    qty=whole_qty,
+                    stop_price=recipe.stop_price,
+                    client_order_id_prefix="operator-residual-stop",
+                    position_uid=lifecycle_row.position_uid,
+                )
+        except Exception as exc:
+            return _ResidualProtectionOutcome(
+                status="failed", residual_qty=residual_qty,
+                note=f"replacement protective stop submission failed: {exc}",
+            )
+        if restored is None or not self._operator_stop_matches(
+            restored,
+            symbol=lifecycle_row.symbol,
+            qty=residual_qty,
+            stop_price=recipe.stop_price,
+        ):
+            return _ResidualProtectionOutcome(
+                status="failed", residual_qty=residual_qty,
+                note="broker response did not verify exact GTC residual protection",
+            )
+        return _ResidualProtectionOutcome(
+            status="restored",
+            residual_qty=residual_qty,
+            stop_order_id=restored.order_id,
+        )
+
+    def _settle_operator_close_result(self, result: OrderResult) -> OrderResult:
+        """Cancel/settle a working partial and persist its terminal broker event."""
+        if result.status is OrderStatus.CANCELED and result.filled_qty > 0:
+            # The broker remainder is already terminal; retain its raw
+            # ``canceled`` state while exposing the cumulative execution as a
+            # position-level partial close to the operator/accounting path.
+            settled = replace(result, status=OrderStatus.PARTIAL)
+        elif result.status is OrderStatus.PARTIAL:
+            settled = self.broker.settle_close_order(result)
+        else:
+            return result
+        raw_status = str(settled.raw_status or "").lower()
+        if (
+            self.lifecycle_orders_store is not None
+            and settled.order_id
+            and raw_status in {"filled", "canceled", "expired", "rejected"}
+        ):
+            from engine.lifecycle_orders import OrderEvent, apply_order_event
+
+            substrate_status = {
+                "expired": "canceled",
+            }.get(raw_status, raw_status)
+            try:
+                apply_order_event(
+                    self.lifecycle_orders_store._conn,
+                    OrderEvent(
+                        order_id=settled.order_id,
+                        status=substrate_status,
+                        filled_qty=float(settled.filled_qty or 0.0),
+                        avg_fill_price=settled.avg_fill_price,
+                        broker_updated_at=datetime.now(timezone.utc).isoformat(),
+                        execution_id=None,
+                    ),
+                    reason="operator_close_settlement",
+                )
+            except Exception as exc:
+                logger.critical(
+                    f"operator close settlement substrate update failed for "
+                    f"{settled.order_id}: {type(exc).__name__}: {exc}"
+                )
+        return settled
+
     def _apply_operator_close_position(self, command) -> None:
         """Handle ``close-position``: full close of one lifecycle by uid.
 
@@ -5615,18 +5899,31 @@ class TradingEngine:
           4. Submit a market/marketable close via broker.close_position.
              The broker writes a substrate row with role='exit',
              origin_kind='operator', operator_command_uid=command.uid.
-          5. Wait for the close fill via the heartbeat-driven substrate
-             dispatch (TIMEOUT path returns the queue row as failed).
+          5. Settle any timed-out partial fill by canceling its remainder.
           6. Run the existing _record_realized_pnl path so allocator +
              PnL accounting match automatic exits (proposal §13
              invariant).
-          7. Release lock; mark command succeeded.
+          7. If quantity remains, restore/verify exact residual protection;
+             only then release the lock and mark the command succeeded.
         """
         lifecycle_row, broker_pos, holder = self._destructive_setup(command)
         if lifecycle_row is None:
             return
 
         try:
+            try:
+                protection_recipe = self._capture_operator_residual_protection(
+                    lifecycle_row=lifecycle_row
+                )
+            except Exception as exc:
+                self.operator_command_store.mark_rejected(
+                    command_uid=command.command_uid,
+                    status="rejected_validation",
+                    result={
+                        "note": f"could not establish current protection: {exc}"
+                    },
+                )
+                return
             # In-flight close guard — proposal §11 + §14.
             # The DB's uniq_one_active_close_per_position partial
             # unique index will also block, but failing fast here gives
@@ -5654,20 +5951,10 @@ class TradingEngine:
                     )
                     return
 
-                # Cancel any protective stop before sending the close —
-                # proposal §11.
-                stop_roles = {"protective_stop", "replacement_stop"}
-                for r in non_terminal:
-                    if r.role not in stop_roles or r.order_id is None:
-                        continue
-                    try:
-                        self.broker.cancel_order(r.order_id)
-                    except Exception as exc:
-                        logger.warning(
-                            f"close-position {command.command_uid[:18]}…: "
-                            f"failed to cancel stop {r.order_id}: {exc} "
-                            "(continuing; broker will reconcile)"
-                        )
+                # Protective siblings are canceled once, at the broker
+                # boundary immediately before close submission.  Doing it
+                # here as well creates a cancel/cancel race against Alpaca's
+                # eventually-consistent open-order view.
 
             # Submit the close. The broker's close_position attaches
             # operator_command_uid to the substrate row written by
@@ -5691,6 +5978,8 @@ class TradingEngine:
                 )
                 return
 
+            result = self._settle_operator_close_result(result)
+
             # PR-66 review F1: gate accounting on result.status.
             # Mirror _close_single_leg_position — a REJECTED, TIMEOUT,
             # UNKNOWN, or zero-fill result must NOT advance lifecycle
@@ -5699,6 +5988,19 @@ class TradingEngine:
             # the broker would still locally close the lifecycle at
             # $0.00 PnL and tell the operator "succeeded".
             if result.status not in {OrderStatus.FILLED, OrderStatus.PARTIAL}:
+                protection_status = "indeterminate_close_order"
+                protection_note = (
+                    "close order state is not terminal; no competing stop was submitted"
+                )
+                if result.status in {OrderStatus.REJECTED, OrderStatus.CANCELED}:
+                    restored = self._ensure_operator_residual_protection(
+                        lifecycle_row=lifecycle_row,
+                        recipe=protection_recipe,
+                        expected_residual_qty=abs(float(broker_pos.qty)),
+                        replace_existing=True,
+                    )
+                    protection_status = restored.status
+                    protection_note = restored.note
                 self.operator_command_store.mark_failed(
                     command_uid=command.command_uid,
                     result={
@@ -5708,6 +6010,8 @@ class TradingEngine:
                         "broker_order_id": result.order_id,
                         "raw_status": result.raw_status,
                         "message": result.message,
+                        "protection_status": protection_status,
+                        "protection_note": protection_note,
                         "note": (
                             "broker close did not produce a fill; "
                             "lifecycle and PnL accounting were NOT "
@@ -5716,6 +6020,20 @@ class TradingEngine:
                         ),
                     },
                 )
+                if protection_status not in {
+                    "flat", "not_required", "verified", "restored"
+                }:
+                    logger.critical(
+                        f"{lifecycle_row.symbol}: operator close failed with "
+                        f"protection={protection_status}: {protection_note}"
+                    )
+                    try:
+                        self.alerts.broker_error(
+                            f"{lifecycle_row.symbol}: operator close state is "
+                            f"{protection_status}; inspect broker orders now"
+                        )
+                    except Exception as exc:
+                        logger.warning(f"operator close failure alert failed: {exc}")
                 logger.error(
                     f"close-position by operator: {lifecycle_row.symbol} "
                     f"broker returned status={result.status} "
@@ -5792,21 +6110,49 @@ class TradingEngine:
                 "broker_order_id": result.order_id,
             }
             if not is_full_close:
-                _sizing_model, protection_model = self._position_risk_policy(
-                    symbol=lifecycle_row.symbol
+                protection = self._ensure_operator_residual_protection(
+                    lifecycle_row=lifecycle_row,
+                    recipe=protection_recipe,
+                    expected_residual_qty=max(
+                        0.0, abs(float(broker_pos.qty)) - close_qty
+                    ),
                 )
-                if protection_model is ProtectionModel.SIGNAL_EXIT_ONLY:
-                    result_payload["protection_status"] = "not_required"
-                else:
-                    result_payload["degraded"] = True
-                    result_payload["protection_status"] = "pending_repair_cycle"
-                    result_payload["protection_note"] = (
-                        "broker.close_position cancelled the protective "
-                        "stop before the partial close; residual is "
-                        "unprotected until the engine's per-cycle stop "
-                        "repair pass restores it, OR until the operator "
-                        "re-issues close-position to finish the job"
+                result_payload["protection_status"] = protection.status
+                result_payload["residual_qty"] = protection.residual_qty
+                if protection.stop_order_id is not None:
+                    result_payload["protective_stop_order_id"] = (
+                        protection.stop_order_id
                     )
+                if not protection.ok:
+                    result_payload.update({
+                        "degraded": True,
+                        "broker_fill_occurred": True,
+                        "protection_note": protection.note,
+                        "note": (
+                            "The broker close partially filled. DO NOT retry "
+                            "this command; residual protection was not verified."
+                        ),
+                    })
+                    self.operator_command_store.mark_failed(
+                        command_uid=command.command_uid,
+                        result=result_payload,
+                    )
+                    logger.critical(
+                        f"operator close left unverified residual protection: "
+                        f"{lifecycle_row.symbol} qty={protection.residual_qty:g}: "
+                        f"{protection.note}; DO NOT retry the close automatically"
+                    )
+                    try:
+                        self.alerts.broker_error(
+                            f"{lifecycle_row.symbol}: operator close partially "
+                            "filled but residual protection could not be "
+                            "verified; DO NOT retry the close"
+                        )
+                    except Exception as exc:
+                        logger.warning(
+                            f"operator close protection alert failed: {exc}"
+                        )
+                    return
             # Mark queue row succeeded. The lifecycle row's pending→closed
             # transition runs inside _record_realized_pnl via
             # _close_lifecycle_for_owner_key (when is_full_close=True);
@@ -5816,26 +6162,19 @@ class TradingEngine:
                 result=result_payload,
             )
             try:
-                degraded_tag = ""
-                if result_payload.get("degraded"):
-                    degraded_tag = (
-                        " — DEGRADED: residual unprotected until "
-                        "next cycle's stop repair"
-                    )
                 self.alerts.operator_action(
                     f"operator close-position "
                     f"({'FULL' if is_full_close else 'PARTIAL'}): "
                     f"{lifecycle_row.symbol} "
                     f"({lifecycle_row.position_uid[:18]}…) "
                     f"@ ${close_price:.2f} × {close_qty}"
-                    f"{degraded_tag} — {command.reason}"
+                    f" — {command.reason}"
                 )
             except Exception as exc:
                 logger.warning(f"close-position alert failed: {exc}")
             degraded_log = (
-                " DEGRADED protection until repair-cycle"
-                if result_payload.get("degraded")
-                else ""
+                f" protection={result_payload['protection_status']}"
+                if "protection_status" in result_payload else ""
             )
             logger.warning(
                 f"close-position by operator "
@@ -5871,9 +6210,8 @@ class TradingEngine:
           6. On fill: call _record_realized_pnl with
              is_full_close=False so the lifecycle's current_qty drops
              to residual via _reduce_lifecycle_for_owner_key.
-          7. Restore residual protection on the next cycle. Equities use
-             ``_repair_missing_protective_stops``; single-leg options use
-             ``_sync_option_trailing_stops``.
+          7. Settle any working partial remainder, then immediately restore
+             and verify exact residual protection before reporting success.
 
         Phase C scope: single-leg equities and single-leg options. MLEG/
         spread positions are rejected by ``_destructive_setup`` because a
@@ -5965,6 +6303,49 @@ class TradingEngine:
                 )
                 return
 
+            try:
+                protection_recipe = self._capture_operator_residual_protection(
+                    lifecycle_row=lifecycle_row
+                )
+            except Exception as exc:
+                self.operator_command_store.mark_rejected(
+                    command_uid=command.command_uid,
+                    status="rejected_validation",
+                    result={
+                        "note": f"could not establish current protection: {exc}"
+                    },
+                )
+                return
+            proposed_residual = current_qty - reduce_qty
+            if (
+                protection_recipe.required
+                and abs(proposed_residual - int(proposed_residual)) > 1e-9
+            ):
+                self.operator_command_store.mark_rejected(
+                    command_uid=command.command_uid,
+                    status="rejected_validation",
+                    result={
+                        "note": (
+                            "reduce-position would leave a fractional "
+                            "broker-stop residual that cannot be protected "
+                            "exactly with the bot's whole-share stop path"
+                        )
+                    },
+                )
+                return
+            if protection_recipe.required and protection_recipe.stop_price is None:
+                self.operator_command_store.mark_rejected(
+                    command_uid=command.command_uid,
+                    status="rejected_validation",
+                    result={
+                        "note": (
+                            "no recoverable protective stop price; refusing "
+                            "to create an unprotected residual"
+                        )
+                    },
+                )
+                return
+
             # In-flight close guard (same as close-position).
             if self.lifecycle_orders_store is not None:
                 non_terminal = self.lifecycle_orders_store.get_non_terminal_for_position(
@@ -6003,11 +6384,26 @@ class TradingEngine:
                 )
                 return
 
+            result = self._settle_operator_close_result(result)
+
             # PR-66 review F1: same status gate as close-position.
             # A REJECTED/TIMEOUT/UNKNOWN/zero-fill reduce must NOT
             # advance lifecycle current_qty or PnL — otherwise the
             # row would silently report a phantom reduction.
             if result.status not in {OrderStatus.FILLED, OrderStatus.PARTIAL}:
+                protection_status = "indeterminate_close_order"
+                protection_note = (
+                    "close order state is not terminal; no competing stop was submitted"
+                )
+                if result.status in {OrderStatus.REJECTED, OrderStatus.CANCELED}:
+                    restored = self._ensure_operator_residual_protection(
+                        lifecycle_row=lifecycle_row,
+                        recipe=protection_recipe,
+                        expected_residual_qty=current_qty,
+                        replace_existing=True,
+                    )
+                    protection_status = restored.status
+                    protection_note = restored.note
                 self.operator_command_store.mark_failed(
                     command_uid=command.command_uid,
                     result={
@@ -6017,6 +6413,8 @@ class TradingEngine:
                         "broker_order_id": result.order_id,
                         "raw_status": result.raw_status,
                         "message": result.message,
+                        "protection_status": protection_status,
+                        "protection_note": protection_note,
                         "note": (
                             "broker reduce did not produce a fill; "
                             "lifecycle and PnL accounting were NOT "
@@ -6024,6 +6422,20 @@ class TradingEngine:
                         ),
                     },
                 )
+                if protection_status not in {
+                    "flat", "not_required", "verified", "restored"
+                }:
+                    logger.critical(
+                        f"{lifecycle_row.symbol}: operator reduce failed with "
+                        f"protection={protection_status}: {protection_note}"
+                    )
+                    try:
+                        self.alerts.broker_error(
+                            f"{lifecycle_row.symbol}: operator reduction state "
+                            f"is {protection_status}; inspect broker orders now"
+                        )
+                    except Exception as exc:
+                        logger.warning(f"operator reduce failure alert failed: {exc}")
                 logger.error(
                     f"reduce-position by operator: {lifecycle_row.symbol} "
                     f"broker returned status={result.status} "
@@ -6193,21 +6605,10 @@ class TradingEngine:
                 )
                 return
 
-            # PR-66 review F5: cancel-sibling-first inside
-            # broker.close_position cleared any protective stop along
-            # with the reduce. Mark the row 'succeeded' but flag the
-            # `protection_status` so the operator knows the residual is
-            # temporarily unprotected until the next cycle's equity stop
-            # repair or option trailing-stop sync runs. Per-cycle repair is
-            # bounded by ENGINE_CYCLE_INTERVAL_SECONDS (default 300s);
-            # for shorter exposure the operator can fire a fresh halt or
-            # full close. Recreating the stop inline here would require
-            # waiting on the partial fill confirmation, looking up the
-            # strategy's risk parameters, and ordering it sequentially —
-            # significant extra complexity for v1. v1 contract: report
-            # the degraded state, let cycle repair handle it.
-            _sizing_model, protection_model = self._position_risk_policy(
-                symbol=lifecycle_row.symbol
+            protection = self._ensure_operator_residual_protection(
+                lifecycle_row=lifecycle_row,
+                recipe=protection_recipe,
+                expected_residual_qty=residual_qty,
             )
             quantity_unit = (
                 "contracts" if _OCC_PAT.match(lifecycle_row.symbol) else "shares"
@@ -6220,7 +6621,7 @@ class TradingEngine:
                 "requested_qty": reduce_qty,
                 "filled_qty": filled_qty,
                 "close_price": close_price,
-                "residual_qty": residual_qty,
+                "residual_qty": protection.residual_qty,
                 "broker_status": getattr(result.status, "value", str(result.status)),
                 "broker_order_id": result.order_id,
                 "accounting_status": "persisted",
@@ -6228,46 +6629,57 @@ class TradingEngine:
                 "durable_trade_status": durable_trade_status,
                 "lifecycle_aggregate_status": lifecycle_aggregate_status,
                 "lifecycle_quantity_status": lifecycle_quantity_status,
+                "protection_status": protection.status,
             }
-            if protection_model is ProtectionModel.SIGNAL_EXIT_ONLY:
-                result_payload["protection_status"] = "not_required"
-            else:
+            if protection.stop_order_id is not None:
+                result_payload["protective_stop_order_id"] = (
+                    protection.stop_order_id
+                )
+            if not protection.ok:
                 result_payload.update({
                     "degraded": True,
-                    "protection_status": "pending_repair_cycle",
-                    "protection_note": (
-                        "broker.close_position cancelled the protective "
-                        "stop before the reduce; residual is unprotected "
-                        "until the engine's per-cycle protection sync "
-                        "restores it"
+                    "broker_fill_occurred": True,
+                    "protection_note": protection.note,
+                    "note": (
+                        "The broker reduction filled. DO NOT retry this "
+                        "command; residual protection was not verified."
                     ),
                 })
+                self.operator_command_store.mark_failed(
+                    command_uid=command.command_uid,
+                    result=result_payload,
+                )
+                logger.critical(
+                    f"operator reduce left unverified residual protection: "
+                    f"{lifecycle_row.symbol} qty={protection.residual_qty:g}: "
+                    f"{protection.note}; DO NOT retry the reduction"
+                )
+                try:
+                    self.alerts.broker_error(
+                        f"{lifecycle_row.symbol}: operator reduction filled but "
+                        "residual protection could not be verified; DO NOT retry"
+                    )
+                except Exception as exc:
+                    logger.warning(
+                        f"operator reduce protection alert failed: {exc}"
+                    )
+                return
             self.operator_command_store.mark_succeeded(
                 command_uid=command.command_uid,
                 result=result_payload,
             )
             try:
-                protection_note = ""
-                if result_payload.get("degraded"):
-                    protection_note = (
-                        " — DEGRADED: residual unprotected until next "
-                        "cycle's stop repair"
-                    )
                 self.alerts.operator_action(
                     f"operator reduce-position: {lifecycle_row.symbol} "
                     f"({lifecycle_row.position_uid[:18]}…) "
                     f"−{filled_qty:g} {quantity_unit} @ ${close_price:.2f} "
                     f"(from {current_qty:g}, residual "
                     f"{max(0.0, current_qty - filled_qty):g}) "
-                    f"{protection_note} — {command.reason}"
+                    f"protection={protection.status} — {command.reason}"
                 )
             except Exception as exc:
                 logger.warning(f"reduce-position alert failed: {exc}")
-            degraded_log = (
-                " DEGRADED protection until repair-cycle"
-                if result_payload.get("degraded")
-                else " protection=not_required"
-            )
+            degraded_log = f" protection={protection.status}"
             logger.warning(
                 f"reduce-position by operator: {lifecycle_row.symbol} "
                 f"reduced={filled_qty:g}/{current_qty:g} {quantity_unit} "
@@ -7084,6 +7496,12 @@ class TradingEngine:
             owner_key = owner_key_for(occ)
             owner = self._get_owner(owner_key)
             if owner is None:
+                continue
+            if self._close_side_transition_blocks_stop_sync(occ):
+                logger.debug(
+                    f"[{owner}] {occ}: option stop sync deferred during "
+                    "close-side transition"
+                )
                 continue
             lifecycle_row = (
                 self.lifecycle_store.get_open_for_owner_key(owner_key)
@@ -8066,6 +8484,32 @@ class TradingEngine:
             return SizingModel.STOP_DISTANCE, ProtectionModel.BROKER_STOP
         return sizing, protection
 
+    def _close_side_transition_blocks_stop_sync(self, symbol: str) -> bool:
+        """Do not race a working close or an operator-held symbol lock."""
+        owner_key = owner_key_for(symbol)
+        locks = getattr(self, "symbol_locks", None)
+        if locks is not None and locks.is_locked(owner_key):
+            return True
+        lifecycle_store = getattr(self, "lifecycle_store", None)
+        lifecycle_orders_store = getattr(self, "lifecycle_orders_store", None)
+        if lifecycle_store is None or lifecycle_orders_store is None:
+            return False
+        try:
+            lifecycle = lifecycle_store.get_open_for_owner_key(owner_key)
+            if lifecycle is None:
+                return False
+            return any(
+                row.role in {"exit", "partial_close"}
+                for row in lifecycle_orders_store.get_non_terminal_for_position(
+                    lifecycle.position_uid
+                )
+            )
+        except Exception as exc:
+            logger.warning(
+                f"{symbol}: close-side guard lookup failed; deferring stop sync: {exc}"
+            )
+            return True
+
     def _repair_missing_protective_stops(
         self,
         snapshot: BrokerSnapshot,
@@ -8087,6 +8531,12 @@ class TradingEngine:
                 continue
             owner = self._get_owner(symbol)
             if owner is None:
+                continue
+            if self._close_side_transition_blocks_stop_sync(symbol):
+                logger.debug(
+                    f"{symbol}: protective-stop repair deferred during "
+                    "close-side transition"
+                )
                 continue
             _sizing_model, protection_model = self._position_risk_policy(
                 symbol=symbol

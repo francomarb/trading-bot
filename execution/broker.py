@@ -120,14 +120,14 @@ class BrokerError(Exception):
 class OrderStatus(str, Enum):
     """Terminal + intermediate states for an `OrderResult`.
 
-    Terminal: FILLED, PARTIAL, REJECTED, CANCELED, TIMEOUT.
+    Terminal: FILLED, PARTIAL, REJECTED, CANCELED, TIMEOUT, UNKNOWN.
     Non-terminal (only seen if the caller skips polling): ACCEPTED, PENDING.
     """
 
     ACCEPTED = "accepted"        # broker has the order, not yet working
     PENDING = "pending"          # working but not filled
     FILLED = "filled"            # fully filled — terminal
-    PARTIAL = "partial"          # partially filled and no further activity — terminal
+    PARTIAL = "partial"          # partial fill whose remainder is conclusively terminal
     REJECTED = "rejected"        # broker rejected — terminal
     CANCELED = "canceled"        # canceled before/during fill — terminal
     TIMEOUT = "timeout"          # poll deadline exceeded — terminal (caller decides next step)
@@ -137,7 +137,10 @@ class OrderStatus(str, Enum):
 # Alpaca status → our enum. Anything not listed maps to PENDING and we keep polling.
 _ALPACA_TERMINAL: dict[str, OrderStatus] = {
     "filled": OrderStatus.FILLED,
-    "partially_filled": OrderStatus.PARTIAL,  # treated terminal at timeout only
+    # Alpaca's partially_filled state is still working.  Polling handles it
+    # specially and only returns local PARTIAL at its deadline; callers that
+    # need a safe residual must then cancel/settle the remainder.
+    "partially_filled": OrderStatus.PARTIAL,
     "canceled": OrderStatus.CANCELED,
     "expired": OrderStatus.CANCELED,
     "rejected": OrderStatus.REJECTED,
@@ -1132,6 +1135,11 @@ class AlpacaBroker:
                 unrealized_plpc=(
                     float(p.unrealized_plpc)
                     if getattr(p, "unrealized_plpc", None) is not None
+                    else None
+                ),
+                qty_available=(
+                    float(p.qty_available)
+                    if getattr(p, "qty_available", None) is not None
                     else None
                 ),
             )
@@ -2699,9 +2707,10 @@ class AlpacaBroker:
         exits (engine stop-out, kill-switch liquidation) — always MARKET,
         ignoring any strategy preferred order type.
 
-        Any open orders on the same symbol (typically the OTO stop_loss leg
-        attached at entry) are canceled first — Alpaca otherwise reserves the
-        shares against those siblings and rejects the close as
+        Open SELL orders on the same symbol (typically the OTO stop_loss leg
+        attached at entry) are canceled first; unrelated BUY orders are left
+        alone. Alpaca otherwise reserves shares against close-side siblings
+        and rejects the close as
         "insufficient qty available". A hard exit must not fail because of an
         already-attached stop.
 
@@ -2744,10 +2753,30 @@ class AlpacaBroker:
             qty = total_qty
             is_partial = False
 
-        # Cancel sibling orders so their shares are freed for the close.
+        # Cancel close-side sibling orders so their shares/contracts are
+        # freed for the close.  BUY orders do not reserve the held position
+        # and must not be canceled merely because they share a symbol.
+        cancel_failures: list[str] = []
         for o in self.get_open_orders():
-            if o.symbol == symbol:
-                self.cancel_order(o.order_id)
+            if o.symbol == symbol and o.side is Side.SELL:
+                if not self.cancel_order(o.order_id):
+                    cancel_failures.append(o.order_id)
+        if cancel_failures:
+            message = (
+                "could not confirm cancellation of close-side order(s): "
+                + ", ".join(cancel_failures)
+            )
+            logger.error(f"close_position({symbol}) refused: {message}")
+            return OrderResult(
+                status=OrderStatus.REJECTED,
+                order_id=None,
+                symbol=symbol,
+                requested_qty=qty,
+                filled_qty=0.0,
+                avg_fill_price=None,
+                raw_status=None,
+                message=message,
+            )
 
         try:
             if is_partial:
@@ -2818,6 +2847,80 @@ class AlpacaBroker:
                 requested_qty=qty,
                 error=e,
             )
+
+    def settle_close_order(
+        self,
+        result: OrderResult,
+        *,
+        poll_timeout: float = ORDER_CONFIRM_TIMEOUT_SECONDS,
+        poll_interval: float = 1.0,
+    ) -> OrderResult:
+        """Make a timed-out partial close safe to reason about.
+
+        Alpaca's ``partially_filled`` status is non-terminal: its unfilled
+        remainder can still execute.  A caller must not place a residual stop
+        alongside that working SELL order.  Cancel the remainder, wait for a
+        terminal broker state, and return the final cumulative fill.  A
+        canceled order with fills is represented as local ``PARTIAL``; failure
+        to prove terminality is ``UNKNOWN``.
+        """
+        if result.status is not OrderStatus.PARTIAL:
+            return result
+        if not result.order_id:
+            return replace(
+                result,
+                status=OrderStatus.UNKNOWN,
+                message="partial close has no broker order id to settle",
+            )
+        if not self.cancel_order(result.order_id):
+            try:
+                observed = self.reconcile_submitted_order(
+                    order_id=result.order_id,
+                    symbol=result.symbol,
+                    requested_qty=result.requested_qty,
+                )
+            except Exception as exc:
+                return replace(
+                    result,
+                    status=OrderStatus.UNKNOWN,
+                    message=f"partial close cancellation/reconcile failed: {exc}",
+                )
+            if observed.status is OrderStatus.FILLED:
+                return observed
+            return replace(
+                observed,
+                status=OrderStatus.UNKNOWN,
+                message=(
+                    "partial close remainder cancellation was not confirmed; "
+                    "broker order may still be working"
+                ),
+            )
+        settled = self._poll_until_terminal(
+            order_id=result.order_id,
+            symbol=result.symbol,
+            requested_qty=result.requested_qty,
+            timeout=poll_timeout,
+            interval=poll_interval,
+        )
+        if settled.status is OrderStatus.CANCELED and settled.filled_qty > 0:
+            return replace(
+                settled,
+                status=OrderStatus.PARTIAL,
+                message=(
+                    f"partial: filled {settled.filled_qty}/"
+                    f"{settled.requested_qty}; remainder canceled"
+                ),
+            )
+        if settled.status is OrderStatus.PARTIAL:
+            return replace(
+                settled,
+                status=OrderStatus.UNKNOWN,
+                message=(
+                    "partial close remained non-terminal after cancellation "
+                    "deadline"
+                ),
+            )
+        return settled
 
     def place_protective_stop(
         self,

@@ -1,6 +1,6 @@
 # Operator Controls & Unique Position Identity — v1 Proposal
 
-**Status:** Shipped — Phase A (PR #33 + #41), Phase B (PR #65), Phase C (PR #66, merged 2026-06-16). Doc retained as the design reference; §13 implementation sketch is historical. Operator reductions now have durable partial-close accounting for equities and single-leg options. Immediate residual protection remains required before destructive paper drills. The §17 amendment dissolved the original Phase A "deferred items" table in full.
+**Status:** Shipped — Phase A (PR #33 + #41), Phase B (PR #65), Phase C (PR #66, merged 2026-06-16). Doc retained as the design reference; §13 implementation sketch is historical. Operator reductions have durable partial-close accounting and immediate residual protection for whole-unit equities and single-leg options. Destructive paper drills remain outstanding. The §17 amendment dissolved the original Phase A "deferred items" table in full.
 **Author intent:** Written for Codex, Claude, Gemini, and the human operator to audit before implementation.  
 **Primary goal:** Give the operator safe, precise, auditable control over live bot risk without turning the bot into a manual trading terminal.
 
@@ -501,6 +501,7 @@ Quantity policy for `--qty`:
 - Quantity must be a positive whole number; percentages, dollar amounts, and fractional contracts are not accepted.
 - The engine validates against fresh broker quantity when it executes the queued command.
 - Quantity must leave at least one whole unit open; use `close-position` for a full exit.
+- A broker-stop equity reduction is rejected when it would leave a fractional residual, because the standalone stop path protects whole shares only.
 - MLEG spreads are out of scope and rejected.
 
 ---
@@ -525,10 +526,11 @@ Recommended sequence:
 
 1. Lock the symbol/position lifecycle as `reducing` or `closing`.
 2. Freeze strategy decisions for that symbol while the operator command is active.
-3. Cancel the existing stop and wait for broker confirmation.
+3. Cancel the existing stop at the broker close boundary.
 4. Submit the reduce/close order.
-5. After fill, recreate a correctly sized stop if quantity remains.
-6. Release the lock after broker and local state reconcile.
+5. If it partially fills, cancel the remainder and prove the close order terminal before placing another sell order.
+6. Read fresh broker quantity and immediately verify or recreate the GTC stop at the prior stop price.
+7. Release the lock only after accounting and protection reconcile.
 
 Known race: a broker-side stop can fill while the bot is trying to cancel it. The implementation must treat this as a first-class reconciliation path: if the stop fills, the operator command should be rejected or marked superseded rather than submitting an additional reduce/close.
 
@@ -537,7 +539,7 @@ V1 order-type default:
 - For equity/manual SMA-style closes and reductions, default to market or marketable orders after stop cancellation confirmation to minimize the unprotected window.
 - Market orders are allowed only during regular trading hours, when the symbol is tradable/not halted, and when no operator `--limit` override is supplied.
 - Outside those conditions, use a marketable limit or reject until conditions are safe enough to execute.
-- For options and spreads, do not default to plain market orders. Use strategy-specific close logic or marketable limits because bid/ask behavior can be much worse.
+- Single-leg option operator reductions use exact whole contracts through the broker close endpoint. MLEG spreads remain rejected because a one-leg reduction would break spread atomicity.
 
 ### 11.1 Symbol-level locks
 
