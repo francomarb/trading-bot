@@ -14,7 +14,7 @@ Coverage map (one class per concern):
     bound, gross exposure cap, cash cap
   - TestDuplicateAndMaxPositions: 6.4, 6.8
   - TestDailyLoss: 6.5 — % drawdown circuit breaker engages and persists
-  - TestHardDollarCap: 6.6
+  - TestAccountLossHalt: percentage account-loss halt (was HardDollarCap)
   - TestStrategyCooldown: 6.9 — loss-streak triggers per-strategy disable;
     elapses correctly; wins reset; one strategy doesn't block another
   - TestBrokerErrorStreak: 6.10 — N errors in window → halt; old errors fall
@@ -111,7 +111,6 @@ def _mgr(**overrides) -> RiskManager:
         max_gross_exposure_pct=0.50,
         atr_stop_multiplier=2.0,
         max_daily_loss_pct=0.05,
-        hard_dollar_loss_cap=2_000.0,
         loss_streak_threshold=3,
         loss_streak_cooldown_hours=24,
         broker_error_threshold=3,
@@ -141,7 +140,6 @@ class TestRiskManagerConstruction:
             ("atr_stop_multiplier", 0),
             ("max_daily_loss_pct", 0),
             ("max_daily_loss_pct", 1.0),
-            ("hard_dollar_loss_cap", 0),
             ("loss_streak_threshold", 0),
             ("loss_streak_cooldown_hours", 0),
             ("broker_error_threshold", 0),
@@ -958,9 +956,7 @@ class TestDuplicateAndMaxPositions:
 
 class TestDailyLoss:
     def test_drawdown_below_threshold_allows_trade(self):
-        # hard_dollar_loss_cap intentionally large here so the % gate is the
-        # only daily-loss gate in play.
-        mgr = _mgr(max_daily_loss_pct=0.05, hard_dollar_loss_cap=1_000_000.0)
+        mgr = _mgr(max_daily_loss_pct=0.05)
         # Down 4% — still under the 5% gate.
         result = mgr.evaluate(
             _signal(),
@@ -971,7 +967,7 @@ class TestDailyLoss:
         assert mgr.is_halted() is False
 
     def test_drawdown_at_or_above_threshold_halts(self):
-        mgr = _mgr(max_daily_loss_pct=0.05, hard_dollar_loss_cap=1_000_000.0)
+        mgr = _mgr(max_daily_loss_pct=0.05)
         rej = mgr.evaluate(
             _signal(),
             _account(equity=95_000.0, session_start=100_000.0),
@@ -982,7 +978,7 @@ class TestDailyLoss:
         assert mgr.is_halted() is True
 
     def test_halt_persists_for_subsequent_signals(self):
-        mgr = _mgr(max_daily_loss_pct=0.05, hard_dollar_loss_cap=1_000_000.0)
+        mgr = _mgr(max_daily_loss_pct=0.05)
         mgr.evaluate(
             _signal(),
             _account(equity=95_000.0, session_start=100_000.0),
@@ -994,7 +990,7 @@ class TestDailyLoss:
         assert rej2.code is RejectionCode.HALTED
 
     def test_reset_kill_switches_clears_halt(self):
-        mgr = _mgr(max_daily_loss_pct=0.05, hard_dollar_loss_cap=1_000_000.0)
+        mgr = _mgr(max_daily_loss_pct=0.05)
         mgr.evaluate(
             _signal(),
             _account(equity=95_000.0, session_start=100_000.0),
@@ -1010,9 +1006,15 @@ class TestDailyLoss:
 # ── Hard dollar cap ─────────────────────────────────────────────────────────
 
 
-class TestHardDollarCap:
-    def test_dollar_loss_below_cap_allows(self):
-        mgr = _mgr(hard_dollar_loss_cap=2_000.0, max_daily_loss_pct=0.99)
+class TestAccountLossHalt:
+    # Retargeted from the removed flat HARD_DOLLAR_LOSS_CAP to the percentage
+    # cap (MAX_DAILY_LOSS_PCT), which is now the sole account-loss halt. These
+    # cover the shared evaluate_account machinery — previous-close preference,
+    # stickiness, baseline rollover clear/refresh, session-start fallback — not
+    # the (deleted) dollar threshold itself. Threshold 1.8% so a 2.0% loss
+    # trips while a 1.49% new-baseline loss clears.
+    def test_loss_below_threshold_allows(self):
+        mgr = _mgr(max_daily_loss_pct=0.018)
         result = mgr.evaluate(
             _signal(),
             _account(equity=98_500.0, session_start=100_000.0),
@@ -1020,20 +1022,19 @@ class TestHardDollarCap:
         )
         assert isinstance(result, RiskDecision)
 
-    def test_dollar_loss_at_cap_halts(self):
-        # max_daily_loss_pct set high so daily-loss doesn't trip first.
-        mgr = _mgr(hard_dollar_loss_cap=2_000.0, max_daily_loss_pct=0.99)
+    def test_loss_at_threshold_halts(self):
+        mgr = _mgr(max_daily_loss_pct=0.018)
         rej = mgr.evaluate(
             _signal(),
             _account(equity=98_000.0, session_start=100_000.0),
             now=T0,
         )
         assert isinstance(rej, RiskRejection)
-        assert rej.code is RejectionCode.HARD_DOLLAR_CAP
+        assert rej.code is RejectionCode.DAILY_LOSS_LIMIT
         assert mgr.is_halted()
 
     def test_account_check_prefers_alpaca_previous_close(self):
-        mgr = _mgr(hard_dollar_loss_cap=2_000.0, max_daily_loss_pct=0.99)
+        mgr = _mgr(max_daily_loss_pct=0.018)
         code = mgr.evaluate_account(
             _account(
                 equity=98_000.0,
@@ -1041,13 +1042,13 @@ class TestHardDollarCap:
                 previous_close=100_000.0,
             )
         )
-        assert code is RejectionCode.HARD_DOLLAR_CAP
+        assert code is RejectionCode.DAILY_LOSS_LIMIT
         assert mgr.is_halted()
         assert "previous close" in (mgr.halt_reason() or "")
-        assert mgr._halt_code is RejectionCode.HARD_DOLLAR_CAP
+        assert mgr._halt_code is RejectionCode.DAILY_LOSS_LIMIT
 
     def test_account_halt_stays_sticky_for_same_broker_baseline(self):
-        mgr = _mgr(hard_dollar_loss_cap=2_000.0, max_daily_loss_pct=0.99)
+        mgr = _mgr(max_daily_loss_pct=0.018)
         code = mgr.evaluate_account(
             _account(
                 equity=98_000.0,
@@ -1055,7 +1056,7 @@ class TestHardDollarCap:
                 previous_close=100_000.0,
             )
         )
-        assert code is RejectionCode.HARD_DOLLAR_CAP
+        assert code is RejectionCode.DAILY_LOSS_LIMIT
 
         # Intraday recovery does not auto-clear the kill switch while the
         # broker prior-close baseline is unchanged.
@@ -1070,7 +1071,7 @@ class TestHardDollarCap:
         assert mgr.is_halted()
 
     def test_account_halt_clears_when_new_broker_baseline_is_healthy(self):
-        mgr = _mgr(hard_dollar_loss_cap=2_000.0, max_daily_loss_pct=0.99)
+        mgr = _mgr(max_daily_loss_pct=0.018)
         code = mgr.evaluate_account(
             _account(
                 equity=98_000.0,
@@ -1078,7 +1079,7 @@ class TestHardDollarCap:
                 previous_close=100_000.0,
             )
         )
-        assert code is RejectionCode.HARD_DOLLAR_CAP
+        assert code is RejectionCode.DAILY_LOSS_LIMIT
 
         code = mgr.evaluate_account(
             _account(
@@ -1092,7 +1093,7 @@ class TestHardDollarCap:
         assert mgr.halt_reason() is None
 
     def test_account_halt_refreshes_when_new_broker_baseline_still_breaches(self):
-        mgr = _mgr(hard_dollar_loss_cap=2_000.0, max_daily_loss_pct=0.99)
+        mgr = _mgr(max_daily_loss_pct=0.018)
         code = mgr.evaluate_account(
             _account(
                 equity=98_000.0,
@@ -1100,7 +1101,7 @@ class TestHardDollarCap:
                 previous_close=100_000.0,
             )
         )
-        assert code is RejectionCode.HARD_DOLLAR_CAP
+        assert code is RejectionCode.DAILY_LOSS_LIMIT
         old_reason = mgr.halt_reason()
 
         code = mgr.evaluate_account(
@@ -1110,21 +1111,21 @@ class TestHardDollarCap:
                 previous_close=104_000.0,
             )
         )
-        assert code is RejectionCode.HARD_DOLLAR_CAP
+        assert code is RejectionCode.DAILY_LOSS_LIMIT
         assert mgr.is_halted()
-        assert mgr._halt_code is RejectionCode.HARD_DOLLAR_CAP
+        assert mgr._halt_code is RejectionCode.DAILY_LOSS_LIMIT
         assert mgr.halt_reason() != old_reason
 
     def test_account_check_falls_back_to_process_session_start(self):
-        mgr = _mgr(hard_dollar_loss_cap=2_000.0, max_daily_loss_pct=0.99)
+        mgr = _mgr(max_daily_loss_pct=0.018)
         code = mgr.evaluate_account(
             _account(equity=98_000.0, session_start=100_000.0)
         )
-        assert code is RejectionCode.HARD_DOLLAR_CAP
+        assert code is RejectionCode.DAILY_LOSS_LIMIT
         assert "session start" in (mgr.halt_reason() or "")
 
     def test_signal_evaluation_uses_previous_close_after_restart(self):
-        mgr = _mgr(hard_dollar_loss_cap=2_000.0, max_daily_loss_pct=0.99)
+        mgr = _mgr(max_daily_loss_pct=0.018)
         rej = mgr.evaluate(
             _signal(),
             _account(
@@ -1135,7 +1136,24 @@ class TestHardDollarCap:
             now=T0,
         )
         assert isinstance(rej, RiskRejection)
-        assert rej.code is RejectionCode.HARD_DOLLAR_CAP
+        assert rej.code is RejectionCode.DAILY_LOSS_LIMIT
+
+
+class TestHardDollarCapRetired:
+    """The flat HARD_DOLLAR_LOSS_CAP was removed — it tripped on ordinary
+    market noise once the account grew and did not scale. Account drawdown is
+    owned solely by MAX_DAILY_LOSS_PCT. Guard against reintroduction."""
+
+    def test_no_hard_dollar_setting(self):
+        from config import settings
+        assert not hasattr(settings, "HARD_DOLLAR_LOSS_CAP")
+
+    def test_risk_manager_rejects_the_removed_kwarg(self):
+        with pytest.raises(TypeError):
+            RiskManager(hard_dollar_loss_cap=2_000.0)
+
+    def test_rejection_code_has_no_hard_dollar_cap(self):
+        assert not hasattr(RejectionCode, "HARD_DOLLAR_CAP")
 
 
 # ── Strategy cooldown ───────────────────────────────────────────────────────

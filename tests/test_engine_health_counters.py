@@ -174,7 +174,6 @@ def make_engine(patch_fetch, tmp_path):
             max_gross_exposure_pct=0.50,
             atr_stop_multiplier=2.0,
             max_daily_loss_pct=0.05,
-            hard_dollar_loss_cap=1_000_000.0,
             loss_streak_threshold=10,
             broker_error_threshold=10,
         )
@@ -421,8 +420,7 @@ class TestPerCycleBatching:
         risk = RiskManager(
             max_position_pct=0.02, max_open_positions=5,
             max_gross_exposure_pct=0.50, atr_stop_multiplier=2.0,
-            max_daily_loss_pct=0.05, hard_dollar_loss_cap=1_000_000.0,
-            loss_streak_threshold=10, broker_error_threshold=10,
+            max_daily_loss_pct=0.05,            loss_streak_threshold=10, broker_error_threshold=10,
         )
         cfg = EngineConfig(
             history_lookback_days=120, cycle_interval_seconds=0.01,
@@ -537,8 +535,7 @@ class TestRiskControlsSnapshot:
         risk = RiskManager(
             max_position_pct=0.02, max_open_positions=5,
             max_gross_exposure_pct=0.50, atr_stop_multiplier=2.0,
-            max_daily_loss_pct=0.05, hard_dollar_loss_cap=1_000_000.0,
-            loss_streak_threshold=10, broker_error_threshold=10,
+            max_daily_loss_pct=0.05,            loss_streak_threshold=10, broker_error_threshold=10,
         )
         assert risk.cooldown_snapshot() == {}
 
@@ -547,8 +544,7 @@ class TestRiskControlsSnapshot:
         risk = RiskManager(
             max_position_pct=0.02, max_open_positions=5,
             max_gross_exposure_pct=0.50, atr_stop_multiplier=2.0,
-            max_daily_loss_pct=0.05, hard_dollar_loss_cap=1_000_000.0,
-            loss_streak_threshold=3, broker_error_threshold=10,
+            max_daily_loss_pct=0.05,            loss_streak_threshold=3, broker_error_threshold=10,
             loss_streak_cooldown_hours=12,
         )
         now = datetime(2026, 5, 19, 12, 0, tzinfo=timezone.utc)
@@ -564,8 +560,7 @@ class TestRiskControlsSnapshot:
         risk = RiskManager(
             max_position_pct=0.02, max_open_positions=5,
             max_gross_exposure_pct=0.50, atr_stop_multiplier=2.0,
-            max_daily_loss_pct=0.05, hard_dollar_loss_cap=1_000_000.0,
-            loss_streak_threshold=3, broker_error_threshold=10,
+            max_daily_loss_pct=0.05,            loss_streak_threshold=3, broker_error_threshold=10,
             loss_streak_cooldown_hours=12,
         )
         now = datetime(2026, 5, 19, 12, 0, tzinfo=timezone.utc)
@@ -812,8 +807,7 @@ class TestCreditSpreadCounters:
         risk = RiskManager(
             max_position_pct=0.02, max_open_positions=5,
             max_gross_exposure_pct=0.50, atr_stop_multiplier=2.0,
-            max_daily_loss_pct=0.05, hard_dollar_loss_cap=1_000_000.0,
-            loss_streak_threshold=10, broker_error_threshold=10,
+            max_daily_loss_pct=0.05,            loss_streak_threshold=10, broker_error_threshold=10,
         )
         cfg = EngineConfig(
             history_lookback_days=120, cycle_interval_seconds=0.01,

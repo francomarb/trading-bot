@@ -363,7 +363,7 @@ Eight independent layers are active when Donchian runs in production:
 | Sleeve max positions | 8 concurrent Donchian positions maximum (`hard_max_positions`) | Concentration cap |
 | Gross exposure cap | `MAX_GROSS_EXPOSURE_PCT=0.80` | Portfolio-level |
 | Daily session loss cap | `MAX_DAILY_LOSS_PCT=5%` — engine halts against Alpaca prior-close when available | Portfolio-level |
-| Hard dollar loss cap | `HARD_DOLLAR_LOSS_CAP=$2,000` from Alpaca prior-close when available | Emergency halt |
+| Daily loss cap | `MAX_DAILY_LOSS_PCT=5%` below Alpaca prior-close (session-start fallback) | Emergency halt — scales with equity; the flat `HARD_DOLLAR_LOSS_CAP` was retired 2026-09-01 |
 
 ### STOP_LIMIT risk-deployment posture (PLAN 11.54)
 

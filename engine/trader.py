@@ -2480,7 +2480,7 @@ class TradingEngine:
                 strategy=strategy,
                 symbol=symbol,
                 underlying_close=latest_close,
-                notional_cap=notional_cap,
+                notional_cap=self._launch_throttled_notional(notional_cap),
                 signal_key=signal_key,
                 signal_bar=signal_bar,
                 strategy_statuses=strategy_statuses,
@@ -10912,6 +10912,28 @@ class TradingEngine:
             )
             return None, None
         return walk, provider
+
+    def _launch_throttled_notional(self, notional_cap: float | None) -> float | None:
+        """Apply the live launch size multiplier to an MLEG spread budget.
+
+        MLEG credit spreads size directly from the sleeve notional and bypass
+        RiskManager's per-qty ``LIVE_SIZE_MULTIPLIER`` (that throttle is
+        single-leg only, applied to a share/contract count). Without this,
+        a live launch would de-risk single-leg orders to 25% while credit
+        spreads kept 100% of their sleeve budget — and preflight's
+        "sizes start throttled" gate would over-claim.
+
+        Live-only, mirroring the single-leg gate. Single-leg and single-leg-
+        option orders never reach the MLEG dispatch branch, so scaling the
+        budget here cannot double-scale them.
+        """
+        if (
+            notional_cap is not None
+            and settings.LIVE_TRADING
+            and settings.LIVE_SIZE_MULTIPLIER != 1.0
+        ):
+            return notional_cap * settings.LIVE_SIZE_MULTIPLIER
+        return notional_cap
 
     def _enter_multi_leg(
         self,

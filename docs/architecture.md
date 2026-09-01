@@ -475,7 +475,7 @@ The isolated options pool uses the same `SleeveAllocator` and HWM drawdown gate 
   equity, 11.48) beneath the `MAX_POSITION_PCT` 2% global ceiling, which also
   serves as the fallback for strategies without a target. (Pre-11.48: a single
   2% rule that the notional caps overruled on essentially every entry.)
-- Enforce daily / hard-dollar loss limits against Alpaca prior-close equity when
+- Enforce the daily percentage loss limit against Alpaca prior-close equity when
   available; account-loss halts stay sticky for that broker baseline and
   recompute after baseline rollover.
 - Apply stop-loss levels to every order (ATR-based for equities; bracket legs for options)
@@ -518,8 +518,7 @@ For single-leg options, fractional sizing is disabled (`and not is_option` guard
 | `MAX_POSITION_NOTIONAL_PCT` | Max notional for one position as % of equity | 10% |
 | `MAX_OPEN_POSITIONS` | Max concurrent global positions; per-strategy caps are enforced by the sleeve allocator | 30 |
 | `MAX_GROSS_EXPOSURE_PCT` | Max total gross notional as % of equity | 80% |
-| `MAX_DAILY_LOSS_PCT` | Halt for the session if equity down this much | 5% |
-| `HARD_DOLLAR_LOSS_CAP` | Absolute $ loss cap from session start | $2,000 |
+| `MAX_DAILY_LOSS_PCT` | Account drawdown halt below Alpaca prior-close (session-start fallback); scales with equity | 5% |
 | `ATR_STOP_MULTIPLIER` | Stop = entry − k × ATR (equities only) | 2.0 |
 | `LOSS_STREAK_THRESHOLD` | Disable strategy after N consecutive losses | 3 |
 | `STRATEGY_ALLOCATIONS` | Per-strategy target %, pool type, priority, hard count limit, and concentration cap | see above |

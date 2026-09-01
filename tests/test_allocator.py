@@ -841,7 +841,6 @@ class TestRiskManagerNotionalCap:
             max_gross_exposure_pct=0.80,
             atr_stop_multiplier=2.0,
             max_daily_loss_pct=0.10,
-            hard_dollar_loss_cap=10_000.0,
             loss_streak_threshold=10,
             broker_error_threshold=10,
         )
@@ -945,7 +944,6 @@ class TestEngineAllocatorIntegration:
                 max_gross_exposure_pct=0.80,
                 atr_stop_multiplier=2.0,
                 max_daily_loss_pct=0.10,
-                hard_dollar_loss_cap=10_000.0,
                 loss_streak_threshold=10,
                 broker_error_threshold=10,
             ),

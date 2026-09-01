@@ -27,8 +27,8 @@ Design principles
    so these caps bind exceptionally, not routinely — a cap that overrules
    the risk-sized qty logs the clip and the binding cap by name.
 
-3. **Multiple independent kill switches.** Daily-loss %, hard-dollar cap,
-   broker-error streak, and slippage drift each halt trading independently.
+3. **Multiple independent kill switches.** Daily-loss %, broker-error
+   streak, and slippage drift each halt trading independently.
    Account-loss halts stay sticky for the broker baseline they tripped on;
    non-account halts stay halted until `reset_kill_switches()` is explicitly
    called by an operator.
@@ -152,7 +152,7 @@ class AccountState:
     Snapshot of broker state passed into `RiskManager.evaluate`.
 
     `previous_close_equity` is Alpaca's prior trading-day close and is the
-    preferred baseline for daily-loss and hard-dollar kill switches. The
+    preferred baseline for the daily-loss kill switch. The
     process-local `session_start_equity` is retained as a conservative fallback
     when the broker does not provide prior-close equity.
     """
@@ -221,7 +221,6 @@ class RejectionCode(str, Enum):
     DUPLICATE_POSITION = "duplicate_position"
     MAX_POSITIONS_REACHED = "max_positions_reached"
     DAILY_LOSS_LIMIT = "daily_loss_limit"
-    HARD_DOLLAR_CAP = "hard_dollar_cap"
     INVALID_SIGNAL = "invalid_signal"
     INVALID_STOP = "invalid_stop"
     POSITION_TOO_SMALL = "position_too_small"
@@ -559,7 +558,6 @@ class RiskManager:
         max_gross_exposure_pct: float = settings.MAX_GROSS_EXPOSURE_PCT,
         atr_stop_multiplier: float = settings.ATR_STOP_MULTIPLIER,
         max_daily_loss_pct: float = settings.MAX_DAILY_LOSS_PCT,
-        hard_dollar_loss_cap: float = settings.HARD_DOLLAR_LOSS_CAP,
         loss_streak_threshold: int = settings.LOSS_STREAK_THRESHOLD,
         loss_streak_cooldown_hours: float = settings.LOSS_STREAK_COOLDOWN_HOURS,
         broker_error_threshold: int = settings.BROKER_ERROR_STREAK_THRESHOLD,
@@ -598,8 +596,6 @@ class RiskManager:
             raise ValueError("atr_stop_multiplier must be > 0")
         if not (0 < max_daily_loss_pct < 1):
             raise ValueError("max_daily_loss_pct must be in (0, 1)")
-        if hard_dollar_loss_cap <= 0:
-            raise ValueError("hard_dollar_loss_cap must be > 0")
         if loss_streak_threshold < 1:
             raise ValueError("loss_streak_threshold must be >= 1")
         if loss_streak_cooldown_hours <= 0:
@@ -621,7 +617,6 @@ class RiskManager:
         self.max_gross_exposure_pct = max_gross_exposure_pct
         self.atr_stop_multiplier = atr_stop_multiplier
         self.max_daily_loss_pct = max_daily_loss_pct
-        self.hard_dollar_loss_cap = hard_dollar_loss_cap
         self.loss_streak_threshold = loss_streak_threshold
         self.loss_streak_cooldown = timedelta(hours=loss_streak_cooldown_hours)
         self.broker_error_threshold = broker_error_threshold
@@ -885,15 +880,6 @@ class RiskManager:
                 f"{self.max_daily_loss_pct * 100:.2f}% from {baseline_name}",
                 baseline,
             )
-
-        dollar_loss = baseline - account.equity
-        if dollar_loss >= self.hard_dollar_loss_cap:
-            return (
-                RejectionCode.HARD_DOLLAR_CAP,
-                f"dollar loss ${dollar_loss:.2f} >= "
-                f"cap ${self.hard_dollar_loss_cap:.2f} from {baseline_name}",
-                baseline,
-            )
         return None
 
     def _account_loss_baseline(self, account: AccountState) -> tuple[float, str]:
@@ -907,7 +893,6 @@ class RiskManager:
     def _halt_is_account_loss(self) -> bool:
         return self._halt_code in {
             RejectionCode.DAILY_LOSS_LIMIT,
-            RejectionCode.HARD_DOLLAR_CAP,
         }
 
     def evaluate_account(self, account: AccountState) -> RejectionCode | None:

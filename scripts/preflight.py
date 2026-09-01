@@ -76,16 +76,22 @@ def run() -> int:
     else:
         _ok("SLIPPAGE_DRIFT_ENABLED=True")
 
-    # 5. Hard dollar loss cap must be ≤ $1,000 for initial live launch.
-    cap = settings.HARD_DOLLAR_LOSS_CAP
-    if cap > 1_000.0:
+    # 5. Live position sizing must start throttled.
+    #    The flat HARD_DOLLAR_LOSS_CAP was retired (it trips on ordinary
+    #    market noise once the account is large enough and does not scale);
+    #    account drawdown is owned by MAX_DAILY_LOSS_PCT. The "start tiny"
+    #    intent for a first live launch is now enforced on the size scaler
+    #    that actually bounds how much capital each trade deploys.
+    mult = settings.LIVE_SIZE_MULTIPLIER
+    if not (0 < mult <= 0.25):
         _fail(
-            f"HARD_DOLLAR_LOSS_CAP=${cap:,.2f} — set to ≤ $1,000 "
-            "for the initial live launch. Raise it deliberately after proving stability."
+            f"LIVE_SIZE_MULTIPLIER={mult} — set to (0, 0.25] for the initial "
+            "live launch so position sizes start at ≤25%. Raise it deliberately "
+            "after proving stability."
         )
         failures += 1
     else:
-        _ok(f"HARD_DOLLAR_LOSS_CAP=${cap:,.2f} (≤ $1,000)")
+        _ok(f"LIVE_SIZE_MULTIPLIER={mult} (≤ 0.25 — sizes start throttled)")
 
     # 6. Go/no-go approval must be confirmed.
     gonogo = os.getenv("GONOGO_APPROVED", "").strip().lower()
