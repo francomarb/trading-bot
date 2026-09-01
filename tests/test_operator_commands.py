@@ -182,6 +182,39 @@ class TestClaimNextPending:
         second = store.claim_next_pending(expiry_seconds=180)
         assert second is None
 
+    def test_action_filter_claims_only_matching_lane(self, store):
+        destructive_uid = new_command_uid()
+        soft_uid = new_command_uid()
+        store.insert(
+            command_uid=destructive_uid,
+            action="cancel-position-orders",
+            reason="destructive",
+        )
+        store.insert(
+            command_uid=soft_uid,
+            action="halt",
+            reason="soft",
+        )
+
+        claimed = store.claim_next_pending(
+            expiry_seconds=180,
+            actions={"halt", "pause-entries"},
+        )
+
+        assert claimed is not None
+        assert claimed.command_uid == soft_uid
+        assert store.get_by_command_uid(destructive_uid).status == "pending"
+
+    def test_empty_action_filter_claims_nothing(self, store):
+        uid = new_command_uid()
+        store.insert(command_uid=uid, action="halt", reason="soft")
+
+        assert store.claim_next_pending(
+            expiry_seconds=180,
+            actions=set(),
+        ) is None
+        assert store.get_by_command_uid(uid).status == "pending"
+
     def test_expires_stale_pending(self, store):
         # Insert with a backdated created_at to simulate staleness.
         # Bypass insert validation by writing directly to confirm the

@@ -135,6 +135,21 @@ if TYPE_CHECKING:
 # Matches any OCC option symbol: underlying (1–6 letters) + YYMMDD + C/P + 8-digit strike.
 _OCC_PAT = re.compile(r"^[A-Z]{1,6}[0-9]{6}[CP][0-9]{8}$")
 
+_DESTRUCTIVE_OPERATOR_ACTIONS = frozenset({
+    "close-position",
+    "reduce-position",
+    "cancel-position-orders",
+})
+_HEARTBEAT_OPERATOR_ACTIONS = frozenset({
+    "halt",
+    "resume-after-halt",
+    "pause-entries",
+    "resume-entries",
+    "pause-strategy",
+    "resume-strategy",
+    "resolve-unexpected-protection",
+})
+
 
 # P-2: cap on substrate cycle-reconciliation REST calls per cycle.
 # A large gap (e.g., after a long stream outage) catches up over
@@ -1041,12 +1056,11 @@ class TradingEngine:
         # pause-strategy flags from the same file.
         self._restore_control_state()
 
-        # Operator Controls Phase B — start the fast heartbeat that
-        # drains the operator queue every OPERATOR_COMMAND_HEARTBEAT_SECONDS.
-        # Independent of the trading cycle so commands drain regardless
-        # of market state and at sub-second latency. Best-effort: if
-        # initialisation fails the trading loop still runs (commands
-        # would fall back to expiry).
+        # Operator Controls Phase B — start the fast heartbeat for soft
+        # controls. Destructive commands are claimed by the engine thread at
+        # safe cycle/sleep boundaries because they use its SQLite stores.
+        # Best-effort: if heartbeat initialisation fails the trading loop still
+        # runs (soft commands would fall back to expiry).
         self._start_operator_heartbeat()
 
         self._sync_managed_stop_legs(startup_snapshot)
@@ -1069,6 +1083,12 @@ class TradingEngine:
             while self._running:
                 self._cycle_count += 1
                 self._run_one_cycle()
+                # Destructive operator handlers touch the engine's
+                # single-threaded lifecycle/trade persistence. They remain
+                # pending until the engine thread claims and executes one here
+                # at the first safe boundary after a complete cycle.
+                if self._running:
+                    self._process_operator_destructive_command()
                 # PLAN 11.10g: optional per-cycle hook (forward_test.py
                 # wires the Monday-completed-week + first-of-month
                 # health-review scheduler here).
@@ -1514,13 +1534,9 @@ class TradingEngine:
                 f"slots={len(self.slots)}"
             )
 
-            # Operator Controls Phase B — queue polling moved to the
-            # `_operator_heartbeat_thread` daemon (started in `start()`),
-            # which drains commands every OPERATOR_COMMAND_HEARTBEAT_SECONDS
-            # independent of the trading cycle. The earlier per-cycle
-            # poll (Phase A PR-2 F1 fix) is no longer required because
-            # the heartbeat runs regardless of market state and at
-            # sub-second drain latency.
+            # Soft controls are polled by the heartbeat independent of market
+            # state. Destructive controls run on the engine thread immediately
+            # after this complete cycle, including this market-closed path.
 
             if not market_open:
                 cycle_status = "market_closed"
@@ -4723,7 +4739,9 @@ class TradingEngine:
         interval = max(1, int(settings.OPERATOR_COMMAND_HEARTBEAT_SECONDS))
         while self._running:
             try:
-                self._process_operator_commands()
+                self._process_operator_commands(
+                    actions=_HEARTBEAT_OPERATOR_ACTIONS,
+                )
             except Exception as exc:
                 logger.warning(
                     f"operator heartbeat: drain raised "
@@ -4735,15 +4753,17 @@ class TradingEngine:
                 break
         logger.debug("operator heartbeat thread exiting")
 
-    def _process_operator_commands(self) -> None:
+    def _process_operator_commands(
+        self,
+        *,
+        actions: frozenset[str] | None = None,
+    ) -> None:
         """Drain one queued operator command per call.
 
-        Called by the heartbeat thread (Phase B). Phase A routes
-        ``halt`` and ``resume-after-halt``; Phase B adds the four
-        soft-pause actions. Every
-        other action is terminated with
-        ``status='rejected_unsupported_phase_a'`` so the operator sees
-        an audited refusal rather than a silent no-op.
+        The heartbeat passes the non-destructive action lane. The engine
+        thread passes the destructive lane because those handlers use its
+        thread-affine SQLite stores. Tests and legacy direct callers may omit
+        ``actions`` to claim the oldest command of any kind.
 
         Best-effort: a queue I/O failure logs a warning and never
         aborts the cycle. Same discipline as
@@ -4754,6 +4774,7 @@ class TradingEngine:
         try:
             claimed = self.operator_command_store.claim_next_pending(
                 expiry_seconds=settings.OPERATOR_COMMAND_EXPIRY_SECONDS,
+                actions=actions,
             )
         except Exception as exc:
             logger.warning(f"operator queue: claim failed: {exc}")
@@ -4766,6 +4787,11 @@ class TradingEngine:
             f"cmd={claimed.command_uid[:18]}… by={claimed.requested_by} "
             f"reason={claimed.reason!r}"
         )
+
+        self._dispatch_operator_command(claimed)
+
+    def _dispatch_operator_command(self, claimed) -> None:
+        """Execute one already-claimed command on the current thread."""
 
         try:
             if claimed.action == "halt":
@@ -4818,6 +4844,16 @@ class TradingEngine:
                 logger.warning(
                     f"operator command failed-mark also failed: {inner}"
                 )
+
+    def _process_operator_destructive_command(self) -> None:
+        """Claim and execute one destructive command on the engine thread.
+
+        Lifecycle, order-substrate, trade-logger, and broker persistence share
+        the engine thread's SQLite connection. Keeping the row ``pending``
+        until this method runs avoids both cross-thread access and an extended
+        accepted-but-not-executed crash window.
+        """
+        self._process_operator_commands(actions=_DESTRUCTIVE_OPERATOR_ACTIONS)
 
     def _apply_operator_halt(self, command) -> None:
         """Handle the ``halt`` operator command.
@@ -5320,8 +5356,8 @@ class TradingEngine:
         success and ``(None, None, None)`` after writing a rejection
         / failure on the command. Handlers must release the returned
         ``lock_holder`` in their finally clause; the lock is
-        engine-process-local and acquire/release pairs are required for
-        correctness across cycle/heartbeat threads.
+        engine-process-local and acquire/release pairs remain required around
+        every broker-mutating handler.
         """
         if not command.target_position_uid:
             self.operator_command_store.mark_rejected(
@@ -6512,10 +6548,9 @@ class TradingEngine:
 
             # Set an absolute residual derived from the fresh pre-submit
             # broker quantity. apply_order_event may have already rolled the
-            # lifecycle down from the durable order ledger on the main cycle
-            # while this handler runs on the heartbeat thread. Subtracting
-            # again would double-reduce (10 -> 7 -> 4); setting 7 is idempotent
-            # whether the handler or substrate arrives first.
+            # lifecycle down from the durable order ledger. Subtracting again
+            # would double-reduce (10 -> 7 -> 4); setting 7 is idempotent
+            # whether the handler or substrate event arrives first.
             residual_qty = current_qty - filled_qty
             if residual_qty <= 0:
                 lifecycle_quantity_status = "failed"
@@ -10187,18 +10222,10 @@ class TradingEngine:
             logger.info(f"{symbol}: close requested but a close order is already pending — skipping")
             return False
 
-        # PR-66 review F4: honor the Phase C symbol lock so a strategy
-        # exit cannot race an operator close-position / reduce-position
-        # on the same owner_key. The heartbeat thread (which runs the
-        # operator handlers) is concurrent with the cycle thread (which
-        # runs strategy exits); without the lock both could submit
-        # SELL orders to Alpaca for the same shares and the second
-        # would oversell. Acquire under kind='strategy_exit'; if the
-        # operator already holds the lock, skip this strategy exit —
-        # the operator command is in flight and will close the
-        # position itself. The next cycle's signal will fire again if
-        # the operator command was a partial reduce, or it'll see the
-        # position gone if the operator command was a full close.
+        # PR-66 review F4: honor the Phase C symbol lock so no strategy exit
+        # can overlap an operator close/reduce on the same owner_key. Current
+        # destructive routing is engine-thread serial, while the lock remains
+        # the explicit ownership invariant around every broker mutation.
         owner_key_str = owner_key_for(position.symbol)
         lock_holder = None
         registry = getattr(self, "symbol_locks", None)
@@ -12878,9 +12905,13 @@ class TradingEngine:
         """
         Sleep responsive to `stop()`: wake every second to re-check the
         running flag so SIGINT doesn't have to wait out a 5-minute cycle.
+        The engine thread also claims and executes one pending destructive
+        operator command here, keeping normal latency near one second without
+        crossing SQLite's thread-affinity boundary.
         """
         deadline = time.monotonic() + seconds
         while self._running and time.monotonic() < deadline:
+            self._process_operator_destructive_command()
             time.sleep(min(1.0, max(0.0, deadline - time.monotonic())))
 
     def _install_signal_handlers(self) -> None:
