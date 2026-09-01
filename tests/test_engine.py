@@ -359,7 +359,6 @@ def engine_factory(patch_fetch, tmp_path):
             max_gross_exposure_pct=0.50,
             atr_stop_multiplier=2.0,
             max_daily_loss_pct=0.05,
-            hard_dollar_loss_cap=1_000_000.0,
             loss_streak_threshold=10,
             broker_error_threshold=10,
         )
@@ -461,8 +460,7 @@ class TestMlegEndOfSessionBypass:
         risk = RiskManager(
             max_position_pct=0.02, max_open_positions=5,
             max_gross_exposure_pct=0.50, atr_stop_multiplier=2.0,
-            max_daily_loss_pct=0.05, hard_dollar_loss_cap=1_000_000.0,
-            loss_streak_threshold=10, broker_error_threshold=1,
+            max_daily_loss_pct=0.05,            loss_streak_threshold=10, broker_error_threshold=1,
         )
         return TradingEngine(
             strategy=FakeStrategy(entries=[False], exits=[False]),
@@ -518,7 +516,6 @@ class TestEngineConfig:
             max_gross_exposure_pct=0.50,
             atr_stop_multiplier=2.0,
             max_daily_loss_pct=0.05,
-            hard_dollar_loss_cap=1_000_000.0,
             loss_streak_threshold=10,
             broker_error_threshold=1,
         )
@@ -1304,8 +1301,7 @@ class TestRunOneCycle:
             snapshot=snap,
             market_open=True,
         )
-        engine.risk.hard_dollar_loss_cap = 2_000.0
-        engine.risk.max_daily_loss_pct = 0.99
+        engine.risk.max_daily_loss_pct = 0.018  # 2% loss trips the % account cap
         engine._session_start_equity = 98_000.0
         engine._cycle_count = 1
 
@@ -1324,8 +1320,7 @@ class TestRunOneCycle:
             snapshot=snap,
             market_open=True,
         )
-        engine.risk.hard_dollar_loss_cap = 2_000.0
-        engine.risk.max_daily_loss_pct = 0.99
+        engine.risk.max_daily_loss_pct = 0.018  # 2% loss trips the % account cap
         engine.risk.evaluate_account(
             AccountState(
                 equity=98_000.0,
@@ -2065,7 +2060,6 @@ class TestMultiSlot:
             max_gross_exposure_pct=0.50,
             atr_stop_multiplier=2.0,
             max_daily_loss_pct=0.05,
-            hard_dollar_loss_cap=1_000_000.0,
             loss_streak_threshold=10,
             broker_error_threshold=10,
         )
@@ -3025,7 +3019,6 @@ def _engine_with_db(
         max_gross_exposure_pct=0.50,
         atr_stop_multiplier=2.0,
         max_daily_loss_pct=0.05,
-        hard_dollar_loss_cap=1_000_000.0,
         loss_streak_threshold=10,
         broker_error_threshold=10,
     )
@@ -3950,7 +3943,6 @@ class TestOptionsEngineFixes:
             max_gross_exposure_pct=0.50,
             atr_stop_multiplier=2.0,
             max_daily_loss_pct=0.05,
-            hard_dollar_loss_cap=1_000_000.0,
             loss_streak_threshold=10,
             broker_error_threshold=10,
         )
@@ -4669,7 +4661,6 @@ class TestGenericSingleLegOptionTrailingStops:
             max_gross_exposure_pct=0.50,
             atr_stop_multiplier=2.0,
             max_daily_loss_pct=0.05,
-            hard_dollar_loss_cap=1_000_000.0,
             loss_streak_threshold=10,
             broker_error_threshold=10,
         )
@@ -6333,7 +6324,6 @@ class TestExitPathBenchmarkKind:
             max_gross_exposure_pct=0.50,
             atr_stop_multiplier=2.0,
             max_daily_loss_pct=0.05,
-            hard_dollar_loss_cap=1_000_000.0,
             loss_streak_threshold=10,
             broker_error_threshold=10,
         )
@@ -6655,7 +6645,6 @@ class TestSlippageMonitorSeeding:
             max_gross_exposure_pct=0.50,
             atr_stop_multiplier=2.0,
             max_daily_loss_pct=0.05,
-            hard_dollar_loss_cap=1_000_000.0,
             loss_streak_threshold=10,
             broker_error_threshold=10,
         )
@@ -6831,8 +6820,7 @@ class TestSubstrateStopFillSeamEndToEnd:
         risk = RiskManager(
             max_position_pct=0.02, max_open_positions=5,
             max_gross_exposure_pct=0.50, atr_stop_multiplier=2.0,
-            max_daily_loss_pct=0.05, hard_dollar_loss_cap=1_000_000.0,
-            loss_streak_threshold=10, broker_error_threshold=10,
+            max_daily_loss_pct=0.05,            loss_streak_threshold=10, broker_error_threshold=10,
         )
         engine = TradingEngine(
             strategy=strategy, symbols=["AAPL"], risk=risk, broker=broker,

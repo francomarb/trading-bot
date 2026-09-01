@@ -553,7 +553,6 @@ class TestEngineRegimeGate:
             max_gross_exposure_pct=0.90,
             atr_stop_multiplier=2.0,
             max_daily_loss_pct=0.50,
-            hard_dollar_loss_cap=1_000_000.0,
             loss_streak_threshold=50,
             broker_error_threshold=50,
         )

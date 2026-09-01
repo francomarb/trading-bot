@@ -1142,9 +1142,8 @@ MAX_GROSS_EXPOSURE_PCT = 0.80   # 80% of equity tradeable across all strategies
 # Stop-loss
 ATR_STOP_MULTIPLIER = 2.0       # Stop = entry - k * ATR (long); always defined pre-entry
 
-# Daily / hard kill switches
-MAX_DAILY_LOSS_PCT = 0.05       # Halt for the session if equity down 5% from session start
-HARD_DOLLAR_LOSS_CAP = 2_000.0  # Absolute $ loss cap from session start; CRITICAL halt
+# Daily kill switch (account drawdown)
+MAX_DAILY_LOSS_PCT = 0.05       # Halt entries when equity is >=5% below Alpaca prior-day close (session-start fallback). Evaluated every cycle; re-arms on baseline rollover.
 
 # Loss-streak cooldown (per strategy)
 LOSS_STREAK_THRESHOLD = 3       # Disable strategy after N consecutive losing trades
