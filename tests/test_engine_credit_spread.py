@@ -2625,3 +2625,77 @@ class TestSpreadCloseReconciler:
             position_id="p2", role="exit",
             client_order_id="restart-attempt-cloid", qty=1.0,
         ) is False
+
+
+# ── TestLaunchThrottleCoversMLEG ────────────────────────────────────────────
+
+
+class TestLaunchThrottleCoversMLEG:
+    """PR #135 review P1. LIVE_SIZE_MULTIPLIER throttles single-leg orders
+    inside RiskManager, but MLEG credit spreads size directly from the sleeve
+    notional and bypass that path. Without an equivalent throttle on the
+    spread budget, a live launch would de-risk single-leg orders to 25% while
+    spreads kept 100%, and preflight's "sizes start throttled" would over-claim.
+    """
+
+    def _engine_for_helper(self, tmp_path):
+        engine, _ = _engine(tmp_path, _strategy())
+        return engine
+
+    def test_helper_scales_the_spread_budget_live(self, tmp_path, monkeypatch):
+        import engine.trader as trader_module
+
+        engine = self._engine_for_helper(tmp_path)
+        monkeypatch.setattr(trader_module.settings, "LIVE_TRADING", True)
+        monkeypatch.setattr(trader_module.settings, "LIVE_SIZE_MULTIPLIER", 0.25)
+        assert engine._launch_throttled_notional(40_000.0) == pytest.approx(10_000.0)
+
+    def test_helper_is_a_noop_in_paper(self, tmp_path, monkeypatch):
+        import engine.trader as trader_module
+
+        engine = self._engine_for_helper(tmp_path)
+        monkeypatch.setattr(trader_module.settings, "LIVE_TRADING", False)
+        monkeypatch.setattr(trader_module.settings, "LIVE_SIZE_MULTIPLIER", 0.25)
+        assert engine._launch_throttled_notional(40_000.0) == pytest.approx(40_000.0)
+
+    def test_helper_is_a_noop_at_full_multiplier(self, tmp_path, monkeypatch):
+        import engine.trader as trader_module
+
+        engine = self._engine_for_helper(tmp_path)
+        monkeypatch.setattr(trader_module.settings, "LIVE_TRADING", True)
+        monkeypatch.setattr(trader_module.settings, "LIVE_SIZE_MULTIPLIER", 1.0)
+        assert engine._launch_throttled_notional(40_000.0) == pytest.approx(40_000.0)
+
+    def test_helper_passes_none_through(self, tmp_path, monkeypatch):
+        import engine.trader as trader_module
+
+        engine = self._engine_for_helper(tmp_path)
+        monkeypatch.setattr(trader_module.settings, "LIVE_TRADING", True)
+        monkeypatch.setattr(trader_module.settings, "LIVE_SIZE_MULTIPLIER", 0.25)
+        assert engine._launch_throttled_notional(None) is None
+
+    def test_mleg_dispatch_wires_the_throttle_not_the_raw_budget(self):
+        """The MLEG branch must pass the throttled budget to _enter_multi_leg.
+        A regression to the raw `notional_cap` would silently un-throttle
+        spreads at live launch while preflight still reported throttled."""
+        import ast
+        from pathlib import Path
+        from config import settings as _s
+
+        source = Path(_s.__file__).parent.parent / "engine" / "trader.py"
+        tree = ast.parse(source.read_text())
+        calls = [
+            node for node in ast.walk(tree)
+            if isinstance(node, ast.Call)
+            and isinstance(node.func, ast.Attribute)
+            and node.func.attr == "_enter_multi_leg"
+        ]
+        assert calls, "no _enter_multi_leg call found"
+        for call in calls:
+            kw = {k.arg: k.value for k in call.keywords}
+            assert "notional_cap" in kw, "_enter_multi_leg called without notional_cap"
+            src = ast.unparse(kw["notional_cap"])
+            assert "_launch_throttled_notional" in src, (
+                f"_enter_multi_leg received raw budget {src!r} — the launch "
+                "throttle is bypassed for credit spreads"
+            )
