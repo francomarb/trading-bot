@@ -5702,6 +5702,9 @@ class TradingEngine:
         except (TypeError, ValueError):
             return False
         tif = str(order.time_in_force or "").lower()
+        # For a long position's SELL stop, a higher trigger exits sooner and
+        # is therefore at least as protective as the captured stop.  Lower
+        # prices are deliberately rejected; this tolerance is one-sided.
         return (
             TradingEngine._is_matching_symbol(symbol, order.symbol)
             and order.side is Side.SELL

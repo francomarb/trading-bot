@@ -1365,6 +1365,55 @@ class TestProposalInvariant:
 
 
 class TestImmediateResidualProtection:
+    def test_fresh_qty_available_blocks_stop_while_qty_is_reserved(self, tmp_path):
+        engine, queue = _build_engine(tmp_path, broker_qty=10.0)
+        pos_uid = _seed_open_lifecycle(engine)
+        engine.broker.close_position.return_value = OrderResult(
+            status=OrderStatus.FILLED, order_id="reduce-filled", symbol="AAPL",
+            requested_qty=3.0, filled_qty=3.0,
+            avg_fill_price=108.0, raw_status="filled",
+        )
+        engine.broker.get_positions.return_value = {
+            "AAPL": Position(
+                symbol="AAPL", qty=7.0, qty_available=5.0,
+                avg_entry_price=100.0, market_value=700.0,
+            )
+        }
+
+        uid = new_command_uid()
+        queue.insert(
+            command_uid=uid, action="reduce-position", reason="test",
+            target_position_uid=pos_uid, params={"qty": 3},
+        )
+        engine._process_operator_commands()
+
+        row = queue.get_by_command_uid(uid)
+        assert row.status == "failed"
+        assert row.result["broker_fill_occurred"] is True
+        assert row.result["protection_status"] == "failed"
+        assert "only 5 of 7 available" in row.result["protection_note"]
+        engine.broker.place_protective_stop.assert_not_called()
+
+    def test_fresh_empty_position_set_reports_flat_without_stop(self, tmp_path):
+        engine, _queue = _build_engine(tmp_path, broker_qty=10.0)
+        _seed_open_lifecycle(engine)
+        lifecycle = engine.lifecycle_store.get_open_for_owner_key("AAPL")
+        assert lifecycle is not None
+        recipe = engine._capture_operator_residual_protection(
+            lifecycle_row=lifecycle
+        )
+        engine.broker.get_positions.return_value = {}
+
+        outcome = engine._ensure_operator_residual_protection(
+            lifecycle_row=lifecycle,
+            recipe=recipe,
+            expected_residual_qty=7.0,
+        )
+
+        assert outcome.status == "flat"
+        assert outcome.residual_qty == 0.0
+        engine.broker.place_protective_stop.assert_not_called()
+
     def test_cycle_stop_sync_is_blocked_by_operator_lock_or_working_close(
         self, tmp_path
     ):
