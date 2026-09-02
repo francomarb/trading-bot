@@ -534,6 +534,8 @@ class TestPhaseCDestructiveControls:
         ])
         assert rc == 0
         assert "queued close-position" in out
+        assert "next safe cycle or sleep boundary" in out
+        assert "heartbeat drains" not in out
 
         import sqlite3
         conn = sqlite3.connect(db_path)

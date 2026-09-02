@@ -1,6 +1,6 @@
 # Operator Controls & Unique Position Identity — v1 Proposal
 
-**Status:** Shipped — Phase A (PR #33 + #41), Phase B (PR #65), Phase C (PR #66, merged 2026-06-16). Doc retained as the design reference; §13 implementation sketch is historical. Operator reductions have durable partial-close accounting and immediate residual protection for whole-unit equities and single-leg options. Destructive paper drills remain outstanding. The §17 amendment dissolved the original Phase A "deferred items" table in full.
+**Status:** Shipped — Phase A (PR #33 + #41), Phase B (PR #65), Phase C (PR #66, merged 2026-06-16). Doc retained as the design reference; §13 implementation sketch is historical. Operator reductions have durable partial-close accounting and immediate residual protection for whole-unit equities and single-leg options. Paper drills are active; cancel and a full broker close have run, while equity/option reduction and reduction-restart checks remain. The §17 amendment dissolved the original Phase A "deferred items" table in full.
 **Author intent:** Written for Codex, Claude, Gemini, and the human operator to audit before implementation.  
 **Primary goal:** Give the operator safe, precise, auditable control over live bot risk without turning the bot into a manual trading terminal.
 
@@ -638,6 +638,20 @@ durably `pending` until the engine thread can claim and execute them during
 inter-cycle sleep or immediately after a cycle. The main trade connection keeps
 `check_same_thread=True`; no shared-transaction workaround is introduced.
 
+**Full-close correction (2026-09-02):** The first full-close drill flattened
+the broker position, but the synchronous handler did not persist an enriched
+close trade. The next substrate pass reconciled the order while leaving its
+realized P&L null, and both paths added the same P&L to the live allocator.
+The corrected handler now enriches the substrate row before reporting success,
+refreshes lifecycle P&L from that durable row, passes that exact amount to the
+allocator once, and immediately drops engine ownership so delayed substrate
+observations are idempotent. A filled broker close with incomplete accounting
+is reported as failed with an explicit **DO NOT retry** warning; the confirmed
+fill must be repaired rather than submitted again.
+The one affected paper row was repaired from its recorded entry and broker fill
+after a database backup; recycle restored the corrected amount once and startup
+reconciliation returned NORMAL.
+
 ### Phase C invariant: allocator and PnL reintegration
 
 Manual reduce/close fills must flow through the same accounting path as automatic exits.
@@ -773,7 +787,7 @@ For **Operator Controls Phase C** this means:
 - `close-position` / `reduce-position` / `cancel-position-orders` actions, each routed through the operator queue with the `--confirm <position_uid_short>` typo-guard
 - `SymbolLockRegistry` engine-side wrapper around the foundation's DB-level uniqueness
 - Substrate row tagging: every operator-driven exit/partial-close carries `origin_kind='operator'` + `operator_command_uid` on `position_lifecycle_orders`
-- Allocator + PnL reintegration through the existing `_record_realized_pnl` path — operator-driven exits look identical to automatic exits downstream
+- Durable close/reduce accounting enriches the substrate trade row first, refreshes lifecycle P&L from that row, and passes the same realized amount once to the allocator
 - The Phase A "deferred items" table (`Position.position_uid`, in-memory startup re-attach, `operator_command_uid`/`client_order_id` columns on `trades`, `position_uid` in `engine_state.json`) is **retired in full**: every item is either now obsolete (foundation absorbed it) or migrated to its appropriate Phase C handler. No outstanding Phase A deferrals remain.
 
 ### 17.2 Read-side consumers — still organic adoption, value uneven

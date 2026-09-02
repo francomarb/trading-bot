@@ -4014,6 +4014,7 @@ class TradingEngine:
         timestamp_override: datetime | None = None,
         reason: str = "exit signal",
         is_full_close: bool | None = None,
+        position_uid_override: str | None = None,
     ) -> TradeRecord | None:
         """Log an exit fill to the trade database.
 
@@ -4040,7 +4041,9 @@ class TradingEngine:
 
         Returns the committed record so callers that also update runtime
         accounting can use the exact durable realized-P&L basis. ``None``
-        means no record was written.
+        means no record was written. ``position_uid_override`` is for callers
+        that already hold lifecycle identity; it remains valid when an early
+        substrate event has already made the lifecycle terminal.
         """
         if result.status not in {OrderStatus.FILLED, OrderStatus.PARTIAL}:
             return None
@@ -4048,18 +4051,19 @@ class TradingEngine:
         # failures don't block the log write, but the record is
         # written with position_uid=None and restart dedup will treat
         # it as legacy.
-        position_uid: str | None = None
-        try:
-            row = self.lifecycle_store.get_open_for_owner_key(
-                owner_key_for(result.symbol),
-            )
-            if row is not None:
-                position_uid = row.position_uid
-        except Exception as exc:
-            logger.debug(
-                f"_log_close: position_uid lookup raised "
-                f"{type(exc).__name__}: {exc} — proceeding without"
-            )
+        position_uid = position_uid_override
+        if position_uid is None:
+            try:
+                row = self.lifecycle_store.get_open_for_owner_key(
+                    owner_key_for(result.symbol),
+                )
+                if row is not None:
+                    position_uid = row.position_uid
+            except Exception as exc:
+                logger.debug(
+                    f"_log_close: position_uid lookup raised "
+                    f"{type(exc).__name__}: {exc} — proceeding without"
+                )
         try:
             record = self.trade_logger.build_close_record(
                 result,
@@ -5925,6 +5929,134 @@ class TradingEngine:
                 )
         return settled
 
+    def _persist_operator_close_fill(
+        self,
+        *,
+        lifecycle_row,
+        result: OrderResult,
+        current_qty: float,
+        command_reason: str,
+        is_full_close: bool,
+    ) -> dict:
+        """Persist one operator close fill before reporting command success.
+
+        The durable trade row is the restart source of truth. Runtime allocator
+        accounting uses that exact value once; a full close also drops engine
+        ownership immediately so a later substrate observation cannot dispatch
+        the same fill a second time.
+        """
+        close_price = float(result.avg_fill_price or 0.0)
+        filled_qty = float(result.filled_qty or 0.0)
+        errors: list[str] = []
+        durable_realized_pnl: float | None = None
+        lifecycle_net_realized_pnl: float | None = None
+        durable_trade_status = "failed"
+        lifecycle_aggregate_status = "not_attempted"
+        lifecycle_quantity_status = "not_attempted"
+
+        close_record = self._log_close(
+            result,
+            0.0,
+            lifecycle_row.strategy,
+            benchmark_kind="unavailable",
+            measurement_quality="unavailable",
+            timestamp_override=result.filled_at or result.submitted_at,
+            reason=f"operator close: {command_reason}",
+            is_full_close=is_full_close,
+            position_uid_override=lifecycle_row.position_uid,
+        )
+        if close_record is None:
+            errors.append("durable close trade write failed")
+        else:
+            durable_trade_status = "persisted"
+            durable_realized_pnl = close_record.realized_pnl
+            if durable_realized_pnl is None:
+                durable_trade_status = "incomplete"
+                errors.append("durable close trade row has no realized P&L")
+            try:
+                lifecycle_net_realized_pnl = (
+                    self.lifecycle_store.refresh_realized_pnl(
+                        position_uid=lifecycle_row.position_uid,
+                    )
+                )
+                lifecycle_aggregate_status = "persisted"
+            except Exception as exc:
+                lifecycle_aggregate_status = "failed"
+                errors.append(
+                    "lifecycle realized-P&L refresh failed: "
+                    f"{type(exc).__name__}: {exc}"
+                )
+
+        residual_qty = max(0.0, current_qty - filled_qty)
+        try:
+            if is_full_close:
+                self.lifecycle_store.mark_closed(
+                    position_uid=lifecycle_row.position_uid,
+                    external=False,
+                )
+                residual_qty = 0.0
+            elif residual_qty <= 0:
+                raise ValueError(
+                    "partial close did not leave a positive residual: "
+                    f"current_qty={current_qty}, filled_qty={filled_qty}"
+                )
+            else:
+                self.lifecycle_store.mark_residual(
+                    position_uid=lifecycle_row.position_uid,
+                    current_qty=residual_qty,
+                    last_fill_at=(
+                        result.filled_at.isoformat()
+                        if result.filled_at is not None else None
+                    ),
+                )
+            lifecycle_quantity_status = "persisted"
+        except Exception as exc:
+            lifecycle_quantity_status = "failed"
+            errors.append(
+                "lifecycle quantity write failed: "
+                f"{type(exc).__name__}: {exc}"
+            )
+
+        if durable_realized_pnl is not None:
+            try:
+                self._record_realized_pnl(
+                    symbol=lifecycle_row.symbol,
+                    strategy_name=lifecycle_row.strategy,
+                    close_price=close_price,
+                    qty=filled_qty,
+                    multiplier=100 if _OCC_PAT.match(lifecycle_row.symbol) else 1,
+                    external=False,
+                    is_full_close=is_full_close,
+                    update_lifecycle=False,
+                    position_uid_override=lifecycle_row.position_uid,
+                    realized_pnl_override=durable_realized_pnl,
+                )
+            except Exception as exc:
+                errors.append(
+                    "runtime sleeve accounting failed: "
+                    f"{type(exc).__name__}: {exc}"
+                )
+
+        if is_full_close:
+            self._pop_position(lifecycle_row.symbol)
+            entry_key = owner_key_for(lifecycle_row.symbol)
+            self._entry_prices.pop(entry_key, None)
+            self._external_close_suspects.pop(entry_key, None)
+            self._cleanup_option_trailing_state(
+                lifecycle_row.symbol,
+                reason="operator full close",
+            )
+
+        return {
+            "errors": errors,
+            "durable_realized_pnl": durable_realized_pnl,
+            "lifecycle_net_realized_pnl": lifecycle_net_realized_pnl,
+            "durable_trade_status": durable_trade_status,
+            "lifecycle_aggregate_status": lifecycle_aggregate_status,
+            "lifecycle_quantity_status": lifecycle_quantity_status,
+            "residual_qty": residual_qty,
+        }
+
     def _apply_operator_close_position(self, command) -> None:
         """Handle ``close-position``: full close of one lifecycle by uid.
 
@@ -5939,9 +6071,8 @@ class TradingEngine:
              The broker writes a substrate row with role='exit',
              origin_kind='operator', operator_command_uid=command.uid.
           5. Settle any timed-out partial fill by canceling its remainder.
-          6. Run the existing _record_realized_pnl path so allocator +
-             PnL accounting match automatic exits (proposal §13
-             invariant).
+          6. Persist the enriched close trade, refresh lifecycle P&L,
+             and update the allocator from that exact durable amount.
           7. If quantity remains, restore/verify exact residual protection;
              only then release the lock and mark the command succeeded.
         """
@@ -6114,17 +6245,11 @@ class TradingEngine:
             # the normal exit path on the next cycle.
             is_full_close = result.status is OrderStatus.FILLED
 
-            # Accounting reintegration (proposal §13 Phase C invariant):
-            # operator-driven exits flow through the same accounting
-            # path as automatic exits so the SleeveAllocator HWM gate
-            # + realized PnL look identical downstream.
-            self._record_realized_pnl(
-                symbol=lifecycle_row.symbol,
-                strategy_name=lifecycle_row.strategy,
-                close_price=close_price,
-                qty=close_qty,
-                multiplier=100 if _OCC_PAT.match(lifecycle_row.symbol) else 1,
-                external=False,
+            accounting = self._persist_operator_close_fill(
+                lifecycle_row=lifecycle_row,
+                result=result,
+                current_qty=abs(float(broker_pos.qty)),
+                command_reason=command.reason,
                 is_full_close=is_full_close,
             )
 
@@ -6147,6 +6272,19 @@ class TradingEngine:
                 "is_full_close": is_full_close,
                 "broker_status": getattr(result.status, "value", str(result.status)),
                 "broker_order_id": result.order_id,
+                "accounting_status": (
+                    "persisted" if not accounting["errors"] else "failed"
+                ),
+                "durable_trade_status": accounting["durable_trade_status"],
+                "lifecycle_aggregate_status": (
+                    accounting["lifecycle_aggregate_status"]
+                ),
+                "lifecycle_quantity_status": (
+                    accounting["lifecycle_quantity_status"]
+                ),
+                "lifecycle_net_realized_pnl": (
+                    accounting["lifecycle_net_realized_pnl"]
+                ),
             }
             if not is_full_close:
                 protection = self._ensure_operator_residual_protection(
@@ -6192,10 +6330,38 @@ class TradingEngine:
                             f"operator close protection alert failed: {exc}"
                         )
                     return
-            # Mark queue row succeeded. The lifecycle row's pending→closed
-            # transition runs inside _record_realized_pnl via
-            # _close_lifecycle_for_owner_key (when is_full_close=True);
-            # on PARTIAL the row stays open at the residual qty.
+            if accounting["errors"]:
+                result_payload.update({
+                    "broker_fill_occurred": True,
+                    "accounting_errors": accounting["errors"],
+                    "note": (
+                        "The broker close filled, but durable accounting is "
+                        "incomplete. DO NOT retry this command; repair the "
+                        "record from the confirmed broker fill."
+                    ),
+                })
+                self.operator_command_store.mark_failed(
+                    command_uid=command.command_uid,
+                    result=result_payload,
+                )
+                logger.critical(
+                    f"operator close filled but durable accounting failed: "
+                    f"{lifecycle_row.symbol}: {accounting['errors']}; "
+                    "DO NOT retry the close"
+                )
+                try:
+                    self.alerts.broker_error(
+                        f"{lifecycle_row.symbol}: operator close filled but "
+                        "durable accounting is incomplete; DO NOT retry"
+                    )
+                except Exception as exc:
+                    logger.warning(
+                        f"operator close accounting alert failed: {exc}"
+                    )
+                return
+            # Mark queue row succeeded only after the durable trade,
+            # lifecycle aggregate/quantity, allocator, and any residual
+            # protection all agree.
             self.operator_command_store.mark_succeeded(
                 command_uid=command.command_uid,
                 result=result_payload,
