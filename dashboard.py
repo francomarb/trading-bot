@@ -33,9 +33,8 @@ import streamlit as st
 
 from config import settings
 from reporting.logger import (
-    CALIBRATION_GRADE_QUALITIES,
-    EXECUTION_QUALITY_KINDS,
     STOP_GAP_KINDS,
+    is_execution_quality_measurement,
 )
 from engine.positions import build_credit_spread_snapshot, owner_key_for
 from monitors.leveraged_trend import (
@@ -800,23 +799,32 @@ def _stop_gap_dollars(frame: pd.DataFrame) -> float:
 def _execution_quality_mask(
     frame: pd.DataFrame, index: pd.Index
 ) -> "pd.Series[bool]":
-    """Vectorized form of `is_execution_quality_measurement`.
-
-    Both dimensions must hold: the benchmark kind must belong to the
-    execution-quality family, and the quality tier must be live rather
-    than reconstructed. Kept as a thin wrapper over the shared frozensets
-    in `reporting.logger` so the dashboard cannot drift away from the
-    definition used by health / calibration / reconcile / pnl / the drift
-    kill switch.
-    """
+    """Pandas adapter for the canonical execution-quality predicate."""
     kind = frame.get(
         "slippage_benchmark_kind", pd.Series(index=index, dtype=object)
-    )
+    ).reindex(index)
     quality = frame.get(
         "slippage_measurement_quality", pd.Series(index=index, dtype=object)
+    ).reindex(index)
+    version = pd.to_numeric(
+        frame.get(
+            "slippage_measurement_version",
+            pd.Series(index=index, dtype=object),
+        ).reindex(index),
+        errors="coerce",
     )
-    return kind.isin(EXECUTION_QUALITY_KINDS) & quality.isin(
-        CALIBRATION_GRADE_QUALITIES
+    return pd.Series(
+        (
+            is_execution_quality_measurement(
+                benchmark_kind,
+                measurement_quality,
+                None if pd.isna(measurement_version) else int(measurement_version),
+            )
+            for benchmark_kind, measurement_quality, measurement_version
+            in zip(kind, quality, version, strict=True)
+        ),
+        index=index,
+        dtype=bool,
     )
 
 
@@ -886,11 +894,9 @@ def compute_strategy_stats(trades_df: pd.DataFrame) -> pd.DataFrame:
             # must contribute neither value nor weight to the
             # weighted average.
             #
-            # Phase 2 quality whitelist: also mask to NaN any row
-            # whose measurement_quality isn't 'primary' or 'fallback'
-            # so recovered/unavailable rows (reconstructed or
-            # synthetic measurements) don't pollute the strategy
-            # average, matching health / calibration / reconcile / pnl.
+            # Shared execution-quality contract: mask wrong benchmark
+            # families, reconstructed qualities and pre-contract arrival
+            # rows, matching health / calibration / reconcile / pnl.
             adverse_series = pd.to_numeric(
                 exits.get("slippage_adverse_bps", pd.Series(index=exits.index)),
                 errors="coerce",

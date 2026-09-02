@@ -12,6 +12,7 @@ import pandas as pd
 import pytest
 
 from dashboard import (
+    _execution_quality_mask,
     _days_in_phase_label,
     _phase_since_label,
     _streak_label,
@@ -35,6 +36,10 @@ from dashboard import (
     resolve_account_metrics,
     slippage_measurement_note,
     watchlist_symbol_state,
+)
+from reporting.logger import (
+    ARRIVAL_MIDPOINT_CONTRACT_VERSION,
+    is_execution_quality_measurement,
 )
 
 # ── Helpers ──────────────────────────────────────────────────────────────────
@@ -670,6 +675,43 @@ class TestComputeRollingSharpe:
 # ── compute_strategy_stats ───────────────────────────────────────────────────
 
 
+class TestExecutionQualityMaskParity:
+    def test_matches_canonical_predicate_across_versions(self):
+        rows = [
+            (kind, quality, version)
+            for kind in (
+                "arrival_midpoint", "combo_limit", "fallback_latest_close",
+                "not_a_kind",
+            )
+            for quality in (
+                "primary", "fallback", "recovered", "unavailable",
+            )
+            for version in (None, 1, ARRIVAL_MIDPOINT_CONTRACT_VERSION)
+        ]
+        frame = pd.DataFrame(
+            rows,
+            columns=(
+                "slippage_benchmark_kind",
+                "slippage_measurement_quality",
+                "slippage_measurement_version",
+            ),
+        )
+        actual = _execution_quality_mask(frame, frame.index).tolist()
+        expected = [
+            is_execution_quality_measurement(kind, quality, version)
+            for kind, quality, version in rows
+        ]
+        assert actual == expected
+
+    def test_numeric_text_version_is_accepted(self):
+        frame = pd.DataFrame({
+            "slippage_benchmark_kind": ["arrival_midpoint"],
+            "slippage_measurement_quality": ["primary"],
+            "slippage_measurement_version": ["2"],
+        })
+        assert _execution_quality_mask(frame, frame.index).tolist() == [True]
+
+
 class TestComputeStrategyStats:
     def _make_df(self, rows: list[dict]) -> pd.DataFrame:
         # Rows that carry a measured slippage_adverse_bps but no explicit
@@ -682,6 +724,10 @@ class TestComputeStrategyStats:
             if "slippage_adverse_bps" in row:
                 row.setdefault("slippage_measurement_quality", "primary")
                 row.setdefault("slippage_benchmark_kind", "arrival_midpoint")
+                row.setdefault(
+                    "slippage_measurement_version",
+                    ARRIVAL_MIDPOINT_CONTRACT_VERSION,
+                )
         df = pd.DataFrame(rows)
         if "timestamp" in df.columns:
             df["timestamp"] = pd.to_datetime(df["timestamp"], utc=True)
