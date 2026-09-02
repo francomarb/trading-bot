@@ -135,7 +135,8 @@ if TYPE_CHECKING:
 # Matches any OCC option symbol: underlying (1–6 letters) + YYMMDD + C/P + 8-digit strike.
 _OCC_PAT = re.compile(r"^[A-Z]{1,6}[0-9]{6}[CP][0-9]{8}$")
 
-_DESTRUCTIVE_OPERATOR_ACTIONS = frozenset({
+_ENGINE_THREAD_OPERATOR_ACTIONS = frozenset({
+    "resolve-unexpected-protection",
     "close-position",
     "reduce-position",
     "cancel-position-orders",
@@ -147,7 +148,6 @@ _HEARTBEAT_OPERATOR_ACTIONS = frozenset({
     "resume-entries",
     "pause-strategy",
     "resume-strategy",
-    "resolve-unexpected-protection",
 })
 
 
@@ -1056,9 +1056,9 @@ class TradingEngine:
         # pause-strategy flags from the same file.
         self._restore_control_state()
 
-        # Operator Controls Phase B — start the fast heartbeat for soft
-        # controls. Destructive commands are claimed by the engine thread at
-        # safe cycle/sleep boundaries because they use its SQLite stores.
+        # Operator Controls Phase B — start the fast heartbeat for handlers
+        # that do not touch engine-thread SQLite state. Thread-affine commands
+        # are claimed by the engine thread at safe cycle/sleep boundaries.
         # Best-effort: if heartbeat initialisation fails the trading loop still
         # runs (soft commands would fall back to expiry).
         self._start_operator_heartbeat()
@@ -1083,12 +1083,12 @@ class TradingEngine:
             while self._running:
                 self._cycle_count += 1
                 self._run_one_cycle()
-                # Destructive operator handlers touch the engine's
+                # Thread-affine operator handlers touch the engine's
                 # single-threaded lifecycle/trade persistence. They remain
                 # pending until the engine thread claims and executes one here
                 # at the first safe boundary after a complete cycle.
                 if self._running:
-                    self._process_operator_destructive_command()
+                    self._process_operator_engine_thread_command()
                 # PLAN 11.10g: optional per-cycle hook (forward_test.py
                 # wires the Monday-completed-week + first-of-month
                 # health-review scheduler here).
@@ -1534,9 +1534,9 @@ class TradingEngine:
                 f"slots={len(self.slots)}"
             )
 
-            # Soft controls are polled by the heartbeat independent of market
-            # state. Destructive controls run on the engine thread immediately
-            # after this complete cycle, including this market-closed path.
+            # Heartbeat-safe controls are polled independent of market state.
+            # Thread-affine controls run on the engine thread immediately after
+            # this complete cycle, including this market-closed path.
 
             if not market_open:
                 cycle_status = "market_closed"
@@ -4845,15 +4845,15 @@ class TradingEngine:
                     f"operator command failed-mark also failed: {inner}"
                 )
 
-    def _process_operator_destructive_command(self) -> None:
-        """Claim and execute one destructive command on the engine thread.
+    def _process_operator_engine_thread_command(self) -> None:
+        """Claim and execute one thread-affine command on the engine thread.
 
         Lifecycle, order-substrate, trade-logger, and broker persistence share
         the engine thread's SQLite connection. Keeping the row ``pending``
         until this method runs avoids both cross-thread access and an extended
         accepted-but-not-executed crash window.
         """
-        self._process_operator_commands(actions=_DESTRUCTIVE_OPERATOR_ACTIONS)
+        self._process_operator_commands(actions=_ENGINE_THREAD_OPERATOR_ACTIONS)
 
     def _apply_operator_halt(self, command) -> None:
         """Handle the ``halt`` operator command.
@@ -12905,13 +12905,13 @@ class TradingEngine:
         """
         Sleep responsive to `stop()`: wake every second to re-check the
         running flag so SIGINT doesn't have to wait out a 5-minute cycle.
-        The engine thread also claims and executes one pending destructive
+        The engine thread also claims and executes one pending thread-affine
         operator command here, keeping normal latency near one second without
         crossing SQLite's thread-affinity boundary.
         """
         deadline = time.monotonic() + seconds
         while self._running and time.monotonic() < deadline:
-            self._process_operator_destructive_command()
+            self._process_operator_engine_thread_command()
             time.sleep(min(1.0, max(0.0, deadline - time.monotonic())))
 
     def _install_signal_handlers(self) -> None:

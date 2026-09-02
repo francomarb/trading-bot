@@ -5,8 +5,9 @@ Why this module exists
 Operator Controls Phase A PR-2. The proposal (`docs/operator_controls_proposal.md`
 §7) defines a SQLite-backed command queue as the single channel through which
 operator intent reaches the running bot. The CLI (`scripts/operator.py`) writes
-rows. A dedicated heartbeat claims soft controls, while the engine thread
-claims broker-mutating commands at safe cycle/sleep boundaries.
+rows. A dedicated heartbeat claims handlers that do not read engine-owned
+SQLite stores, while the engine thread claims store-dependent commands at safe
+cycle/sleep boundaries.
 
 For Phase A only two state-changing actions land:
 - ``halt``                 — sticky kill switch via existing `RiskManager`
@@ -322,8 +323,8 @@ class OperatorCommandStore:
 
             # Pick the oldest remaining pending row in this caller's action
             # lane. The heartbeat and engine thread use disjoint lanes so
-            # soft controls stay prompt while destructive handlers retain
-            # the lifecycle connection's thread affinity.
+            # heartbeat-safe controls stay prompt while store-dependent
+            # handlers retain the lifecycle connection's thread affinity.
             if action_values == ():
                 row = None
             else:

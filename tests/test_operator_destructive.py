@@ -275,7 +275,7 @@ class TestDestructiveThreadRouting:
 
         # The lifecycle connection was created on this engine thread. This
         # would have raised sqlite3.ProgrammingError on the old heartbeat path.
-        engine._process_operator_destructive_command()
+        engine._process_operator_engine_thread_command()
 
         completed = command_store.get_by_command_uid(command_uid)
         assert completed is not None
@@ -284,23 +284,34 @@ class TestDestructiveThreadRouting:
             "paper-drill-stop-order"
         )
 
-    def test_production_routes_destructive_handlers_to_engine_thread(self):
+    def test_production_routes_all_actions_to_exactly_one_thread_lane(self):
         import inspect
-        from engine.trader import _DESTRUCTIVE_OPERATOR_ACTIONS
+        from engine.operator_queue import VALID_ACTIONS
+        from engine.trader import (
+            _ENGINE_THREAD_OPERATOR_ACTIONS,
+            _HEARTBEAT_OPERATOR_ACTIONS,
+        )
 
         source = inspect.getsource(TradingEngine._operator_heartbeat_loop)
         assert "actions=_HEARTBEAT_OPERATOR_ACTIONS" in source
-        assert "_process_operator_destructive_command" in inspect.getsource(
+        assert "_process_operator_engine_thread_command" in inspect.getsource(
             TradingEngine.start
         )
-        assert "_process_operator_destructive_command" in inspect.getsource(
+        assert "_process_operator_engine_thread_command" in inspect.getsource(
             TradingEngine._sleep
         )
-        assert _DESTRUCTIVE_OPERATOR_ACTIONS == {
+        assert _ENGINE_THREAD_OPERATOR_ACTIONS == {
+            "resolve-unexpected-protection",
             "close-position",
             "reduce-position",
             "cancel-position-orders",
         }
+        assert _HEARTBEAT_OPERATOR_ACTIONS.isdisjoint(
+            _ENGINE_THREAD_OPERATOR_ACTIONS
+        )
+        assert (
+            _HEARTBEAT_OPERATOR_ACTIONS | _ENGINE_THREAD_OPERATOR_ACTIONS
+        ) == VALID_ACTIONS
 
 
 class TestDestructiveSetupValidation:

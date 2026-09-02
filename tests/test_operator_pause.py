@@ -16,13 +16,17 @@ Covers:
 from __future__ import annotations
 
 import json
+import sqlite3
+import threading
 from types import SimpleNamespace
 from unittest.mock import MagicMock
 
 import pytest
 
+from engine.lifecycle import PositionLifecycleStore, new_position_uid
+from engine.lifecycle_orders import PositionLifecycleOrdersStore
 from engine.operator_queue import OperatorCommandStore, new_command_uid
-from engine.trader import TradingEngine
+from engine.trader import TradingEngine, _HEARTBEAT_OPERATOR_ACTIONS
 from reporting.logger import TradeLogger
 from risk.manager import RiskManager
 from risk.models import StrategyPauseCause
@@ -399,6 +403,78 @@ class TestUnexpectedProtectionResolution:
         assert row.status == "succeeded"
         assert row.result["reconciliation_proven_clean"] is True
         assert engine.risk.is_strategy_paused("leveraged_trend") is False
+
+    def test_foreign_heartbeat_leaves_real_latch_for_engine_thread(
+        self, tmp_path, monkeypatch
+    ):
+        """Production-shaped regression for thread-affine latch resolution."""
+        engine, _, state_path = _build_engine(tmp_path)
+        monkeypatch.setattr(
+            "config.settings.OPERATOR_CONTROL_STATE_PATH", state_path
+        )
+        engine._session_start_equity = 100_000.0
+
+        main_conn = engine.trade_logger._ensure_db()
+        engine.lifecycle_store = PositionLifecycleStore(main_conn)
+        engine.lifecycle_orders_store = PositionLifecycleOrdersStore(main_conn)
+        position_uid = new_position_uid()
+        engine.lifecycle_store.create_pending(
+            position_uid=position_uid,
+            symbol="SPXL",
+            owner_key="SPXL",
+            strategy="leveraged_trend",
+            position_type="single_leg",
+            entry_qty=2.0,
+        )
+        engine.lifecycle_store.mark_open(
+            position_uid=position_uid,
+            avg_entry_price=100.0,
+            current_qty=2.0,
+        )
+        engine.broker.sync_with_broker.return_value = SimpleNamespace(
+            open_orders=[],
+            account=SimpleNamespace(open_positions={}),
+        )
+        engine.risk.pause_strategy_cause(
+            strategy_name="leveraged_trend",
+            cause=StrategyPauseCause.UNEXPECTED_PROTECTION,
+            reason="unexpected stop",
+            position_uid=position_uid,
+        )
+
+        op_conn = sqlite3.connect(
+            engine.trade_logger._path,
+            check_same_thread=False,
+        )
+        op_conn.execute("PRAGMA foreign_keys = ON")
+        command_store = OperatorCommandStore(op_conn)
+        engine.operator_command_store = command_store
+        command_uid = new_command_uid()
+        command_store.insert(
+            command_uid=command_uid,
+            action="resolve-unexpected-protection",
+            reason="cross-thread latch regression",
+            target_strategy="leveraged_trend",
+        )
+
+        heartbeat = threading.Thread(
+            target=lambda: engine._process_operator_commands(
+                actions=_HEARTBEAT_OPERATOR_ACTIONS
+            )
+        )
+        heartbeat.start()
+        heartbeat.join(timeout=2.0)
+        assert not heartbeat.is_alive()
+        assert command_store.get_by_command_uid(command_uid).status == "pending"
+        assert engine.risk.is_strategy_paused("leveraged_trend") is True
+
+        engine._process_operator_engine_thread_command()
+
+        completed = command_store.get_by_command_uid(command_uid)
+        assert completed.status == "succeeded"
+        assert completed.result["reconciliation_proven_clean"] is True
+        assert engine.risk.is_strategy_paused("leveraged_trend") is False
+        op_conn.close()
 
     def test_resolution_refuses_while_broker_stop_remains(
         self, tmp_path, monkeypatch

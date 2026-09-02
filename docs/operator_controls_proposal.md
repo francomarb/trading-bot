@@ -306,9 +306,10 @@ Implementation requirement:
 
 - `OPERATOR_COMMAND_EXPIRY_SECONDS = 180` should live in `config/settings.py`.
 - `OPERATOR_COMMAND_HEARTBEAT_SECONDS = 5` should live in `config/settings.py`.
-- Non-destructive command polling runs on the fast heartbeat independent of
-  slow strategy cycles. Destructive commands remain `pending` until the engine
-  thread reaches a safe boundary, then that thread claims and executes one.
+- Heartbeat-safe command polling runs independently of slow strategy cycles.
+  Commands that read lifecycle/trade SQLite state — close, reduce, cancel, and
+  `resolve-unexpected-protection` — remain `pending` until the engine thread
+  reaches a safe boundary, then that thread claims and executes one.
   This preserves SQLite's deliberate single-thread lifecycle/trade connection
   and avoids a durable `accepted` row waiting in an in-memory handoff.
 - The expiry can be lowered to 60 seconds only after the fast heartbeat is implemented, verified, and shown not to miss valid commands during normal bot operation.
@@ -631,9 +632,10 @@ heartbeat thread called the destructive handler through lifecycle stores whose
 SQLite connection was created by the engine thread. Soft controls worked
 because `operator_commands` already owns a separate cross-thread connection.
 The corrected routing separates the queue into two action lanes: the heartbeat
-continues to claim soft controls, while close/reduce/cancel stay durably
-`pending` until the engine thread can claim and execute them during inter-cycle
-sleep or immediately after a cycle. The main trade connection keeps
+continues to claim handlers that do not read engine-owned stores, while
+close/reduce/cancel and proof-gated unexpected-protection resolution stay
+durably `pending` until the engine thread can claim and execute them during
+inter-cycle sleep or immediately after a cycle. The main trade connection keeps
 `check_same_thread=True`; no shared-transaction workaround is introduced.
 
 ### Phase C invariant: allocator and PnL reintegration
