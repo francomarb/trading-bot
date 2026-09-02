@@ -581,9 +581,9 @@ def _enqueue_destructive_action(
                 print(f"expected rem: {residual:g} {unit}")
             print("broker qty:  revalidated by the engine before submission")
     print(
-        f"engine heartbeat drains the queue every "
-        f"~{settings.OPERATOR_COMMAND_HEARTBEAT_SECONDS}s; use "
-        f"`operator.py commands` to see the result."
+        "the engine processes this store-dependent command at the next "
+        "safe cycle or sleep boundary; use `operator.py commands` to see "
+        "the result."
     )
     return 0
 

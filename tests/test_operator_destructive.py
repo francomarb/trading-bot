@@ -71,6 +71,9 @@ def _build_engine(
     # Stub bookkeeping used by _record_realized_pnl.
     engine._allocator = MagicMock()
     engine._entry_prices = {owner_key_for(symbol): 95.0}
+    engine._positions = {}
+    engine._external_close_suspects = {}
+    engine._cleanup_option_trailing_state = MagicMock()
     engine._close_lifecycle_for_owner_key = lambda owner_key, external=False: None
     engine._reduce_lifecycle_for_owner_key = lambda owner_key, reduced_by: None
 
@@ -903,6 +906,157 @@ class TestDurableReduceAccounting:
             ("reduce-filled-aggregate-failed",),
         ).fetchone()
         assert tuple(trade) == (12.0, "partial")
+
+
+class TestDurableFullCloseAccounting:
+    def test_full_close_is_persisted_once_when_substrate_arrives_first(
+        self, tmp_path,
+    ):
+        """The synchronous handler owns enrichment and delayed dispatch skips."""
+        engine, queue = _build_engine(tmp_path, broker_qty=10.0)
+        position_uid = _seed_open_lifecycle(engine)
+        _seed_entry_trade(
+            engine,
+            position_uid=position_uid,
+            symbol="AAPL",
+            strategy="sma_crossover",
+            qty=10.0,
+            entry_price=95.0,
+            initial_risk_per_share=5.0,
+        )
+        _seed_filled_entry_lifecycle_order(
+            engine,
+            position_uid=position_uid,
+            qty=10.0,
+            entry_price=95.0,
+        )
+        engine._positions["AAPL"] = SimpleNamespace(
+            strategy_name="sma_crossover"
+        )
+
+        command_uid = new_command_uid()
+        order_id = "operator-full-close-order"
+        event = OrderEvent(
+            order_id=order_id,
+            status="filled",
+            filled_qty=10.0,
+            avg_fill_price=110.0,
+            broker_updated_at="2026-09-02T15:00:00+00:00",
+        )
+        result = OrderResult(
+            status=OrderStatus.FILLED,
+            order_id=order_id,
+            symbol="AAPL",
+            requested_qty=10.0,
+            filled_qty=10.0,
+            avg_fill_price=110.0,
+            raw_status="filled",
+            submitted_at=datetime(2026, 9, 2, 14, 59, tzinfo=timezone.utc),
+            filled_at=datetime(2026, 9, 2, 15, 0, tzinfo=timezone.utc),
+        )
+
+        def close_position(*_args, **_kwargs):
+            engine.lifecycle_orders_store.insert_pending(
+                position_uid=position_uid,
+                role="exit",
+                client_order_id="operator-full-close-client",
+                order_type="market",
+                order_class="simple",
+                time_in_force="day",
+                side="sell",
+                intended_qty=10.0,
+                origin_kind="operator",
+                operator_command_uid=command_uid,
+            )
+            engine.lifecycle_orders_store.attach_broker_order_id(
+                client_order_id="operator-full-close-client",
+                order_id=order_id,
+            )
+            applied = apply_order_event(
+                engine.trade_logger._ensure_db(), event,
+            )
+            assert applied.applied is True
+            return result
+
+        engine.broker.close_position.side_effect = close_position
+        queue.insert(
+            command_uid=command_uid,
+            action="close-position",
+            reason="paper full-close drill",
+            target_position_uid=position_uid,
+        )
+        engine._process_operator_commands()
+
+        command = queue.get_by_command_uid(command_uid)
+        assert command.status == "succeeded"
+        assert command.result["accounting_status"] == "persisted"
+        assert command.result["lifecycle_net_realized_pnl"] == pytest.approx(
+            150.0
+        )
+        trade = engine.trade_logger._ensure_db().execute(
+            "SELECT position_uid, realized_pnl, status, reason "
+            "FROM trades WHERE order_id = ?",
+            (order_id,),
+        ).fetchone()
+        assert tuple(trade) == (
+            position_uid,
+            150.0,
+            "filled",
+            "operator close: paper full-close drill",
+        )
+        lifecycle = engine.lifecycle_store.get_by_position_uid(position_uid)
+        assert lifecycle.status == "closed"
+        assert lifecycle.current_qty == 0.0
+        assert lifecycle.net_realized_pnl == pytest.approx(150.0)
+        engine._allocator.record_realized_pnl.assert_called_once_with(
+            "sma_crossover",
+            pytest.approx(150.0),
+            position_uid=position_uid,
+            is_full_close=True,
+        )
+        assert engine._has_position("AAPL") is False
+
+        # A stream/poll observation after the synchronous handler must not
+        # add the same P&L to the allocator a second time.
+        engine._maybe_dispatch_substrate_exit_fill(event=event, snapshot=None)
+        assert engine._allocator.record_realized_pnl.call_count == 1
+
+    def test_full_close_accounting_failure_is_explicit_and_not_retryable(
+        self, tmp_path,
+    ):
+        engine, queue = _build_engine(tmp_path, broker_qty=10.0)
+        position_uid = _seed_open_lifecycle(engine)
+        engine._positions["AAPL"] = SimpleNamespace(
+            strategy_name="sma_crossover"
+        )
+        engine.broker.close_position.return_value = OrderResult(
+            status=OrderStatus.FILLED,
+            order_id="full-close-accounting-failed",
+            symbol="AAPL",
+            requested_qty=10.0,
+            filled_qty=10.0,
+            avg_fill_price=101.0,
+            raw_status="filled",
+        )
+        engine._log_close = MagicMock(return_value=None)
+
+        command_uid = new_command_uid()
+        queue.insert(
+            command_uid=command_uid,
+            action="close-position",
+            reason="manual exit",
+            target_position_uid=position_uid,
+        )
+        engine._process_operator_commands()
+
+        command = queue.get_by_command_uid(command_uid)
+        assert command.status == "failed"
+        assert command.result["broker_fill_occurred"] is True
+        assert command.result["accounting_status"] == "failed"
+        assert command.result["durable_trade_status"] == "failed"
+        assert "DO NOT retry" in command.result["note"]
+        assert engine._has_position("AAPL") is False
+        engine._allocator.record_realized_pnl.assert_not_called()
 
 
 class TestCancelPositionOrders:
