@@ -64,10 +64,9 @@ BACKTEST_DATA_FEED: str = os.getenv("BACKTEST_DATA_FEED", "sip").lower()
 # audit's finding. The other is that the IEX BBO was fresh but unrepresentative
 # — IEX is a single venue at ~2-3% of consolidated volume, and its book can be
 # wide or thin in the opening minutes. If the recorded ages come back small
-# while `spread_bps` comes back large, this guard is treating the wrong cause
-# and the fix is a spread-width guard or a SIP quote, not a shorter max age.
-# The instrumentation is what tells the two apart; do not assume this setting
-# solved it.
+# while `spread_bps` comes back large, the age guard is treating the wrong
+# cause. `ARRIVAL_QUOTE_MAX_SPREAD_BPS` below now handles that case; paid SIP
+# remains the higher-quality feed option.
 #
 # What Alpaca actually documents (checked 2026-08-28):
 #   - Latest endpoints are NOT freshness-filtered. Market Data FAQ: "the data
@@ -96,14 +95,18 @@ BACKTEST_DATA_FEED: str = os.getenv("BACKTEST_DATA_FEED", "sip").lower()
 # validates the existing `bid <= 0 or ask <= 0` guard, which rejects the
 # condition they name.
 #
-# BUT THE REMEDY IS NOT FREE. Real-time SIP requires the paid Algo Trader Plus
-# subscription; the free tier's SIP is delayed 15 minutes, which is useless as
-# an arrival price — a 15-minute-old consolidated quote is worse than a stale
-# IEX one. So if the captured ages come back small while `spread_bps` comes
-# back large, the decision is a COST decision (pay for real-time SIP) rather
-# than a threshold tweak. Do not present it as a free fix.
+# Real-time SIP requires the paid Algo Trader Plus subscription. Basic-tier
+# historical SIP may be queried with a delay, but the latest SIP endpoint
+# requires the subscription; it does not provide a free delayed quote.
 ARRIVAL_QUOTE_MAX_AGE_SECONDS: float = float(
     os.getenv("ARRIVAL_QUOTE_MAX_AGE_SECONDS", "30")
+)
+
+# At a 10 bps spread, half-spread uncertainty is already the full 5 bps
+# MARKET-order model. Wider quotes remain observable but cannot certify an
+# arrival midpoint; rejecting the measurement does not block the order.
+ARRIVAL_QUOTE_MAX_SPREAD_BPS: float = float(
+    os.getenv("ARRIVAL_QUOTE_MAX_SPREAD_BPS", "10")
 )
 
 # Derived base URL — used only by legacy verify scripts; alpaca-py uses the

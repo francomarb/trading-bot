@@ -33,6 +33,7 @@ from reporting.alerts import (
     LogFileBackend,
 )
 from reporting.logger import (
+    ARRIVAL_MIDPOINT_CONTRACT_VERSION,
     ENTRY_BASIS_BROKER_FILL,
     ENTRY_BASIS_MIXED,
     ENTRY_BASIS_REFERENCE_FALLBACK,
@@ -2075,6 +2076,10 @@ class TestBuildRecordSlippageContract:
         )
         assert record.slippage_benchmark_kind == "arrival_midpoint"
         assert record.slippage_measurement_quality == "primary"
+        assert (
+            record.slippage_measurement_version
+            == ARRIVAL_MIDPOINT_CONTRACT_VERSION
+        )
         assert record.slippage_benchmark_price == pytest.approx(150.0)
         assert record.slippage_benchmark_timestamp is not None
         assert record.slippage_signed_bps is not None
@@ -2183,6 +2188,7 @@ class TestBuildRecordSlippageContract:
         )
         assert record.slippage_benchmark_kind == "arrival_midpoint"
         assert record.slippage_measurement_quality == "recovered"
+        assert record.slippage_measurement_version is None
 
     def test_legacy_columns_null_on_new_market_rows(
         self, sample_decision, sample_result
@@ -2255,6 +2261,10 @@ class TestBuildCloseRecordSlippageContract:
         )
         assert record.slippage_benchmark_kind == "arrival_midpoint"
         assert record.slippage_measurement_quality == "primary"
+        assert (
+            record.slippage_measurement_version
+            == ARRIVAL_MIDPOINT_CONTRACT_VERSION
+        )
         assert record.slippage_benchmark_price == pytest.approx(151.50)
         assert record.slippage_signed_bps is not None
 
@@ -4261,7 +4271,10 @@ class TestExecutionQualitySlippageSeedRead:
     """`read_recent_execution_quality_slippage` feeds the kill switch's
     startup rehydration. Its selection must match `_record_fill`'s."""
 
-    def _seed(self, tl, *, kind, quality, adverse, order_type="market", oid):
+    def _seed(
+        self, tl, *, kind, quality, adverse, order_type="market", oid,
+        measurement_version=ARRIVAL_MIDPOINT_CONTRACT_VERSION,
+    ):
         tl.log(
             TradeRecord(
                 position_type="single_leg",
@@ -4285,6 +4298,7 @@ class TestExecutionQualitySlippageSeedRead:
                 slippage_adverse_bps=adverse,
                 slippage_benchmark_kind=kind,
                 slippage_measurement_quality=quality,
+                slippage_measurement_version=measurement_version,
             )
         )
 
@@ -4301,6 +4315,24 @@ class TestExecutionQualitySlippageSeedRead:
         self._seed(tl, kind="arrival_midpoint", quality="primary",
                    adverse=3.0, order_type="limit", oid="a")
         assert tl.read_recent_execution_quality_slippage(50) == []
+
+    def test_excludes_pre_guard_arrival_midpoints(self, tmp_path):
+        """Old rows called themselves primary but lack the spread contract."""
+        tl = TradeLogger(path=str(tmp_path / "trades.db"))
+        self._seed(
+            tl, kind="arrival_midpoint", quality="primary", adverse=199.0,
+            measurement_version=None, oid="legacy",
+        )
+        assert tl.read_recent_execution_quality_slippage(50) == []
+
+    def test_old_combo_limit_measurements_are_not_discarded(self, tmp_path):
+        """The contamination was specific to the arrival-quote writer."""
+        tl = TradeLogger(path=str(tmp_path / "trades.db"))
+        self._seed(
+            tl, kind="combo_limit", quality="primary", adverse=4.0,
+            measurement_version=None, oid="combo",
+        )
+        assert tl.read_recent_execution_quality_slippage(50) == [4.0]
 
     def test_excludes_recovered_quality(self, tmp_path):
         tl = TradeLogger(path=str(tmp_path / "trades.db"))

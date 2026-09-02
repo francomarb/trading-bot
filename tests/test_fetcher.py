@@ -615,7 +615,7 @@ class TestFetchLatestQuoteMidpoint:
         import datetime as _dt
 
         quote = MagicMock(
-            bid_price=100.0, ask_price=100.20,
+            bid_price=100.05, ask_price=100.15,
             timestamp=_dt.datetime.now(_dt.timezone.utc),
         )
         mock_client.get_stock_latest_quote.return_value = {"AAPL": quote}

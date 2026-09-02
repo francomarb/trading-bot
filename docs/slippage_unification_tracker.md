@@ -43,6 +43,11 @@ What landed:
 - **`Literal[...]` enum aliases** (`SlippageBenchmarkKind`,
   `SlippageMeasurementQuality`) in `reporting.logger` so every writer
   call site is type-checked.
+- **2026-09-02 calibration follow-up:**
+  `slippage_measurement_version INTEGER` marks arrival-midpoint rows written
+  under the freshness plus 10 bps spread contract. The drift-monitor seed
+  excludes older unversioned arrival rows; existing combo-limit evidence is
+  unchanged.
 - **Stateless stop benchmarking** — `log_stop_fill` now accepts
   `stop_price: float | None` directly from the broker order at fill
   time. WebSocket path reads `update.order.stop_price`; recovery path

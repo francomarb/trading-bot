@@ -73,6 +73,11 @@ EXECUTION_QUALITY_KINDS: frozenset[str] = frozenset({
     "combo_limit",        # spread fill vs the combo limit we submitted
 })
 
+# Arrival-midpoint contract v2 adds both freshness and <=10 bps spread
+# certification. Pre-existing rows have no version and are excluded from
+# drift-monitor startup seeding even if their old writer called them primary.
+ARRIVAL_MIDPOINT_CONTRACT_VERSION = 2
+
 IMPLEMENTATION_SHORTFALL_KINDS: frozenset[str] = frozenset({
     "decision_price",         # fill vs the price the strategy decided on
     "fallback_latest_close",  # fill vs a prior bar close — market drift
@@ -454,6 +459,7 @@ TRADE_COLUMNS = [
     "slippage_benchmark_kind",
     "slippage_benchmark_timestamp",
     "slippage_measurement_quality",
+    "slippage_measurement_version",
     "slippage_signed_bps",
     "slippage_adverse_bps",
     "stop_trigger_price",
@@ -500,6 +506,7 @@ CREATE TABLE IF NOT EXISTS trades (
     slippage_benchmark_kind      TEXT,
     slippage_benchmark_timestamp TEXT,
     slippage_measurement_quality TEXT,
+    slippage_measurement_version INTEGER,
     slippage_signed_bps          REAL,
     slippage_adverse_bps         REAL,
     stop_trigger_price           REAL
@@ -549,6 +556,7 @@ _MIGRATION_COLUMNS = {
     "slippage_benchmark_kind": "TEXT",
     "slippage_benchmark_timestamp": "TEXT",
     "slippage_measurement_quality": "TEXT",
+    "slippage_measurement_version": "INTEGER",
     "slippage_signed_bps": "REAL",
     "slippage_adverse_bps": "REAL",
     "stop_trigger_price": "REAL",
@@ -689,6 +697,7 @@ class TradeRecord:
     slippage_benchmark_kind: SlippageBenchmarkKind | None = None
     slippage_benchmark_timestamp: str | None = None
     slippage_measurement_quality: SlippageMeasurementQuality | None = None
+    slippage_measurement_version: int | None = None
     slippage_signed_bps: float | None = None
     slippage_adverse_bps: float | None = None
     stop_trigger_price: float | None = None
@@ -1200,6 +1209,12 @@ class TradeLogger:
             slippage_benchmark_kind=new_benchmark_kind,
             slippage_benchmark_timestamp=new_benchmark_timestamp,
             slippage_measurement_quality=new_quality,
+            slippage_measurement_version=(
+                ARRIVAL_MIDPOINT_CONTRACT_VERSION
+                if new_benchmark_kind == "arrival_midpoint"
+                and new_quality == "primary"
+                else None
+            ),
             slippage_signed_bps=(
                 round(new_signed_bps, 2) if new_signed_bps is not None else None
             ),
@@ -1393,6 +1408,12 @@ class TradeLogger:
             slippage_benchmark_kind=new_benchmark_kind,
             slippage_benchmark_timestamp=new_benchmark_timestamp,
             slippage_measurement_quality=new_quality,
+            slippage_measurement_version=(
+                ARRIVAL_MIDPOINT_CONTRACT_VERSION
+                if new_benchmark_kind == "arrival_midpoint"
+                and new_quality == "primary"
+                else None
+            ),
             slippage_signed_bps=(
                 round(new_signed_bps, 2) if new_signed_bps is not None else None
             ),
@@ -1443,6 +1464,7 @@ class TradeLogger:
         "slippage_benchmark_kind",
         "slippage_benchmark_timestamp",
         "slippage_measurement_quality",
+        "slippage_measurement_version",
         # Legacy modeled-slippage benchmark. Captured at submit time
         # from the arrival price; a later cycle-reconciliation log()
         # call without the original benchmark must not zero it.
@@ -1730,6 +1752,8 @@ class TradeLogger:
             `fallback_latest_close` row measures market drift between
             the last bar close and the fill, not fill quality.
           - live quality tiers only, never reconstructed ones.
+          - arrival-midpoint contract v2 only. Older rows predate the quote
+            freshness/spread guards and cannot be certified after the fact.
 
         If these two selections ever diverge, the kill switch would
         judge live fills against a differently-shaped history;
@@ -1744,9 +1768,11 @@ class TradeLogger:
             "WHERE order_type = 'market' "
             "AND status IN ('filled', 'partial') "
             f"AND {predicate} "
+            "AND (slippage_benchmark_kind != 'arrival_midpoint' "
+            "OR slippage_measurement_version >= ?) "
             "AND slippage_adverse_bps IS NOT NULL "
             "ORDER BY id DESC LIMIT ?",
-            (*predicate_params, last_n),
+            (*predicate_params, ARRIVAL_MIDPOINT_CONTRACT_VERSION, last_n),
         )
         out: list[float] = []
         for (adverse,) in cursor.fetchall():
