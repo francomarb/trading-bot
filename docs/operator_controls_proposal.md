@@ -1,6 +1,6 @@
 # Operator Controls & Unique Position Identity — v1 Proposal
 
-**Status:** Shipped — Phase A (PR #33 + #41), Phase B (PR #65), Phase C (PR #66, merged 2026-06-16). Doc retained as the design reference; §13 implementation sketch is historical. Operator reductions have durable partial-close accounting and immediate residual protection for whole-unit equities and single-leg options. Paper drills are active; cancel and a full broker close have run, while equity/option reduction and reduction-restart checks remain. The §17 amendment dissolved the original Phase A "deferred items" table in full.
+**Status:** Shipped and paper-validated — Phase A (PR #33 + #41), Phase B (PR #65), Phase C (PR #66, merged 2026-06-16). The 2026-09-02 drills passed pause/resume, cancel, full close, exact-share equity reduction, exact-contract single-leg option reduction, residual protection, durable accounting, and restart recovery. Genuine unexpected-protection latch clearing is unit-tested and awaits a naturally occurring latch. The §17 amendment dissolved the original Phase A "deferred items" table in full.
 **Author intent:** Written for Codex, Claude, Gemini, and the human operator to audit before implementation.  
 **Primary goal:** Give the operator safe, precise, auditable control over live bot risk without turning the bot into a manual trading terminal.
 
@@ -651,6 +651,15 @@ fill must be repaired rather than submitted again.
 The one affected paper row was repaired from its recorded entry and broker fill
 after a database backup; recycle restored the corrected amount once and startup
 reconciliation returned NORMAL.
+
+**Paper validation completed (2026-09-02):** An equity reduction and a
+single-leg option reduction both filled by exact whole quantity, persisted one
+partial-close trade, left the lifecycle at the broker residual, and restored
+one exact-quantity GTC stop. Recycles restored each realized amount once and
+reconciled the option trailing-state pointer to the replacement stop with
+NORMAL startup. Entry pause also survived restart and was lifted after the
+drills. Two non-blocking hardening items remain in `PLAN.md`: degraded-basis
+allocator parity for reductions and more expiry margin for long engine cycles.
 
 ### Phase C invariant: allocator and PnL reintegration
 
