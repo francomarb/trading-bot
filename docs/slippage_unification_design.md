@@ -334,7 +334,7 @@ A quote may only be certified `arrival_midpoint` / `primary` when **all** hold:
 | book not crossed | `ask < bid` (locked, `ask == bid`, is allowed) |
 | age known | the quote carries no usable venue timestamp |
 | age fresh | `age > ARRIVAL_QUOTE_MAX_AGE_SECONDS` |
-| spread precise enough | `spread_bps > ARRIVAL_QUOTE_MAX_SPREAD_BPS` (default 10) |
+| spread precise enough | `spread_bps > ARRIVAL_QUOTE_MAX_SPREAD_BPS` (default `2 × SLIPPAGE_MODEL_MARKET_BPS`, currently 10) |
 
 Failing any of these returns `None`, which routes the caller to
 `fallback_latest_close` / `fallback`. The rejection is deliberately *not* a
@@ -350,18 +350,18 @@ measurement, and the existing fallback already expresses that.
 `non_finite`, `zero_side`, `crossed`, `no_quote_timestamp`,
 `bad_quote_timestamp`, `stale`, `stale_repeat`, `wide_spread`.
 
-The 10 bps ceiling follows the calibration model: half of a 10 bps spread is
-already the full 5 bps MARKET-order allowance. A wider IEX midpoint is too
-imprecise to judge a fill against. Rejection only downgrades the measurement
-to fallback; it does not prevent order submission. The clean calibration
-epoch begins after this guard is deployed; older arrival-midpoint rows are not
-eligible.
+The default ceiling follows the calibration model: half of the maximum spread
+equals the full MARKET-order allowance. A wider IEX midpoint is too imprecise
+to judge a fill against. Rejection only downgrades the measurement to fallback;
+it does not prevent order submission. The clean calibration epoch begins after
+this guard is deployed; older arrival-midpoint rows are not eligible.
 
 New certified arrival-midpoint rows carry `slippage_measurement_version=2`.
-The startup seed query requires that version for this benchmark kind, so the
-discard rule survives process restarts instead of depending on an operator to
-remember a date cutoff. Existing `combo_limit` rows are unaffected because
-their benchmark did not use the defective arrival-quote writer.
+Every shared execution-quality consumer requires that version for this
+benchmark kind, so the discard rule applies equally to kill-switch seeding,
+health, calibration, P&L, dashboard aggregates and reconciliation. Existing
+`combo_limit` rows are unaffected because their benchmark did not use the
+defective arrival-quote writer.
 
 Three of these matter more than the rest on IEX:
 
@@ -901,7 +901,7 @@ rather than re-deriving the rule.
 Use:
 
 - the same `slippage_adverse_bps` family,
-- with explicit filters on `measurement_quality`.
+- with the shared benchmark-kind, quality and arrival-contract-version filter.
 
 ### Dashboard Recent Trades
 

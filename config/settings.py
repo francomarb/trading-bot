@@ -102,11 +102,20 @@ ARRIVAL_QUOTE_MAX_AGE_SECONDS: float = float(
     os.getenv("ARRIVAL_QUOTE_MAX_AGE_SECONDS", "30")
 )
 
-# At a 10 bps spread, half-spread uncertainty is already the full 5 bps
-# MARKET-order model. Wider quotes remain observable but cannot certify an
-# arrival midpoint; rejecting the measurement does not block the order.
+# Expected execution cost for MARKET orders in bps. Shared with the backtest
+# default and defined here so the quote-precision guard cannot silently drift
+# away from the model it protects.
+SLIPPAGE_MODEL_MARKET_BPS = 5.0
+
+# By default, half-spread uncertainty may be no larger than the full MARKET
+# model (`max spread = 2 * modeled bps`). Wider quotes remain observable but
+# cannot certify an arrival midpoint; rejecting the measurement does not block
+# the order. The environment override supports a deliberately separate cap.
 ARRIVAL_QUOTE_MAX_SPREAD_BPS: float = float(
-    os.getenv("ARRIVAL_QUOTE_MAX_SPREAD_BPS", "10")
+    os.getenv(
+        "ARRIVAL_QUOTE_MAX_SPREAD_BPS",
+        str(2.0 * SLIPPAGE_MODEL_MARKET_BPS),
+    )
 )
 
 # Derived base URL — used only by legacy verify scripts; alpaca-py uses the
@@ -1164,10 +1173,6 @@ SLIPPAGE_DRIFT_MULTIPLIER = 3.0      # Halt if mean realized slippage > k * mean
 # Enable once you have enough paper fills to validate the threshold (≥ min_samples).
 # Must be True before going live (Phase 10).
 SLIPPAGE_DRIFT_ENABLED = False
-# Expected execution cost for MARKET orders in bps. Matches the backtest default
-# (runner.py slippage_bps=5). LIMIT orders model 0 bps (price is controlled).
-SLIPPAGE_MODEL_MARKET_BPS = 5.0
-
 # ── Live-trading safety overrides (Phase 10.G) ──────────────────────────────
 # Scale calculated position sizes to this fraction when LIVE_TRADING=True.
 # Default 0.25 = start live at 25% of the paper-tested size.

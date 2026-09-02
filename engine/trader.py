@@ -105,6 +105,7 @@ from risk.manager import (
 )
 from reporting.alerts import AlertDispatcher
 from reporting.logger import (
+    ARRIVAL_MIDPOINT_CONTRACT_VERSION,
     ENTRY_BASIS_BROKER_FILL,
     TradeLogger,
     TradeRecord,
@@ -3924,7 +3925,13 @@ class TradingEngine:
         if order_type != "market":
             return
         if not is_execution_quality_measurement(
-            benchmark_kind, measurement_quality
+            benchmark_kind,
+            measurement_quality,
+            (
+                ARRIVAL_MIDPOINT_CONTRACT_VERSION
+                if benchmark_kind == "arrival_midpoint"
+                else None
+            ),
         ):
             logger.debug(
                 f"slippage monitor: skipping {result.symbol} fill — "

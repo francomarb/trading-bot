@@ -130,10 +130,11 @@ def _collect_slippage_observations(
     identical to the assessor. It excludes two classes of row:
     benchmarks outside the execution-quality family (a
     `fallback_latest_close` row measures market drift between the last
-    bar close and the fill, not fill quality), and reconstructed
-    quality tiers (codepaths §5, §8, §9 rebuild the benchmark from
-    broker history). Calibrating on either would tune the drift
-    thresholds against something other than execution.
+    bar close and the fill, not fill quality), reconstructed quality tiers
+    (codepaths §5, §8, §9 rebuild the benchmark from broker history), and
+    arrival-midpoint rows that predate the current quote-validity contract.
+    Calibrating on any of these would tune thresholds against something
+    other than trustworthy execution evidence.
     """
     predicate, predicate_params = execution_quality_sql()
     cursor = conn.execute(

@@ -20,6 +20,8 @@ from unittest.mock import MagicMock, patch
 import pandas as pd
 import pytest
 
+from reporting.logger import ARRIVAL_MIDPOINT_CONTRACT_VERSION
+
 from backtest.reconcile import (
     Reconciler,
     ReconciliationResult,
@@ -105,6 +107,10 @@ def _write_trades(path: str, rows: list[dict]) -> None:
             ),
             slippage_benchmark_kind=row.get(
                 "slippage_benchmark_kind", "arrival_midpoint",
+            ),
+            slippage_measurement_version=row.get(
+                "slippage_measurement_version",
+                ARRIVAL_MIDPOINT_CONTRACT_VERSION,
             ),
         )
         tl.log(record)

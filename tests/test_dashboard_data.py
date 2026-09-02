@@ -48,6 +48,7 @@ _TRADE_COLUMNS = [
     "initial_risk_per_share", "initial_risk_dollars",
     "realized_pnl", "r_multiple", "entry_timestamp", "exit_timestamp",
     "slippage_benchmark_kind", "slippage_measurement_quality",
+    "slippage_measurement_version",
     "slippage_signed_bps", "slippage_adverse_bps",
 ]
 

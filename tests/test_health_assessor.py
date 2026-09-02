@@ -25,7 +25,7 @@ from pathlib import Path
 
 import pytest
 
-from reporting.logger import TradeLogger
+from reporting.logger import ARRIVAL_MIDPOINT_CONTRACT_VERSION, TradeLogger
 from strategies.health.assessor import (
     HealthAssessor,
     HealthInputs,
@@ -61,6 +61,7 @@ def _seed_filled_trade(
     adverse_bps: float | None = 0.0,
     measurement_quality: str = "primary",
     benchmark_kind: str = "arrival_midpoint",
+    measurement_version: int | None = ARRIVAL_MIDPOINT_CONTRACT_VERSION,
 ) -> None:
     """Seed a row matching the L2 check queries.
 
@@ -77,14 +78,14 @@ def _seed_filled_trade(
         "timestamp, symbol, side, qty, avg_fill_price, order_id, "
         "strategy, reason, stop_price, entry_reference_price, "
         "slippage_signed_bps, slippage_adverse_bps, slippage_measurement_quality, "
-        "slippage_benchmark_kind, "
+        "slippage_benchmark_kind, slippage_measurement_version, "
         "order_type, status, requested_qty, filled_qty"
         ") VALUES (?, 'X', 'sell', 1.0, 100.0, 'oid', ?, 'exit', "
-        "95.0, 100.0, ?, ?, ?, ?, 'market', ?, 1.0, 1.0)",
+        "95.0, 100.0, ?, ?, ?, ?, ?, 'market', ?, 1.0, 1.0)",
         (
             timestamp, strategy,
             adverse_bps, adverse_bps, measurement_quality, benchmark_kind,
-            status,
+            measurement_version, status,
         ),
     )
     conn.commit()
@@ -651,6 +652,23 @@ class TestMeasurementQualityFilter:
     Fails-closed shape: any future quality enum is excluded by
     default until explicitly added to the whitelist.
     """
+
+    def test_pre_guard_arrival_rows_are_excluded_from_p95(self, db_conn):
+        _seed_filled_trade(
+            db_conn, strategy="x", timestamp="2026-05-19T09:00:00",
+            adverse_bps=5.0,
+        )
+        _seed_filled_trade(
+            db_conn, strategy="x", timestamp="2026-05-20T09:00:00",
+            adverse_bps=1205.3, measurement_version=None,
+        )
+        report = HealthAssessor().assess(_standard_inputs(db_conn))
+        slip = next(
+            c for c in report.checks
+            if c.name == "slippage_realized_vs_modeled_bps_p95"
+        )
+        assert slip.numeric_value == pytest.approx(5.0)
+        assert slip.status == HealthStatus.HEALTHY
 
     def test_recovered_rows_excluded_from_p95(self, db_conn):
         # One clean fill (5 bps adverse) + one recovered-quality row

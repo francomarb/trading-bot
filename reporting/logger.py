@@ -105,20 +105,35 @@ CALIBRATION_GRADE_QUALITIES: frozenset[str] = frozenset({"primary", "fallback"})
 def is_execution_quality_measurement(
     benchmark_kind: str | None,
     measurement_quality: str | None,
+    measurement_version: int | None = None,
 ) -> bool:
     """True when a row's slippage value actually measures execution quality.
 
-    Both dimensions must hold: the benchmark has to belong to the
-    execution-quality family (what is being measured) and the quality tier
-    has to be live rather than reconstructed (how much we trust it).
+    The benchmark has to belong to the execution-quality family (what is
+    being measured), the quality tier has to be live rather than reconstructed
+    (how much we trust it), and arrival-midpoint rows must use the current
+    measurement contract.
 
-    This is the single definition consumed by the drift kill switch, the
-    health assessor, the calibration script, the PnL reports, the dashboard
-    and the reconcile gate. Callers must not re-implement it.
+    Arrival-midpoint rows additionally require the current measurement
+    contract version. Older rows predate quote freshness/spread certification
+    and cannot be made trustworthy after the fact. Other benchmark families
+    are unaffected by that writer-specific migration.
+
+    This is the single definition consumed by the drift kill switch, health,
+    calibration, PnL, dashboard and reconcile. Callers must not re-implement it.
     """
-    return (
+    family_and_quality_match = (
         benchmark_kind in EXECUTION_QUALITY_KINDS
         and measurement_quality in CALIBRATION_GRADE_QUALITIES
+    )
+    if not family_and_quality_match:
+        return False
+    return (
+        benchmark_kind != "arrival_midpoint"
+        or (
+            measurement_version is not None
+            and measurement_version >= ARRIVAL_MIDPOINT_CONTRACT_VERSION
+        )
     )
 
 
@@ -134,9 +149,11 @@ def execution_quality_sql() -> tuple[str, tuple[str, ...]]:
     qualities = tuple(sorted(CALIBRATION_GRADE_QUALITIES))
     fragment = (
         f"slippage_benchmark_kind IN ({', '.join('?' * len(kinds))}) "
-        f"AND slippage_measurement_quality IN ({', '.join('?' * len(qualities))})"
+        f"AND slippage_measurement_quality IN ({', '.join('?' * len(qualities))}) "
+        "AND (slippage_benchmark_kind != 'arrival_midpoint' "
+        "OR slippage_measurement_version >= ?)"
     )
-    return fragment, kinds + qualities
+    return fragment, kinds + qualities + (ARRIVAL_MIDPOINT_CONTRACT_VERSION,)
 
 
 from loguru import logger
@@ -1212,7 +1229,11 @@ class TradeLogger:
             slippage_measurement_version=(
                 ARRIVAL_MIDPOINT_CONTRACT_VERSION
                 if new_benchmark_kind == "arrival_midpoint"
-                and new_quality == "primary"
+                and is_execution_quality_measurement(
+                    new_benchmark_kind,
+                    new_quality,
+                    ARRIVAL_MIDPOINT_CONTRACT_VERSION,
+                )
                 else None
             ),
             slippage_signed_bps=(
@@ -1411,7 +1432,11 @@ class TradeLogger:
             slippage_measurement_version=(
                 ARRIVAL_MIDPOINT_CONTRACT_VERSION
                 if new_benchmark_kind == "arrival_midpoint"
-                and new_quality == "primary"
+                and is_execution_quality_measurement(
+                    new_benchmark_kind,
+                    new_quality,
+                    ARRIVAL_MIDPOINT_CONTRACT_VERSION,
+                )
                 else None
             ),
             slippage_signed_bps=(
@@ -1755,9 +1780,11 @@ class TradeLogger:
           - arrival-midpoint contract v2 only. Older rows predate the quote
             freshness/spread guards and cannot be certified after the fact.
 
-        If these two selections ever diverge, the kill switch would
-        judge live fills against a differently-shaped history;
-        `TestSeedMatchesRecordFill` pins them together.
+        If these selections ever diverge, the kill switch would judge live
+        fills against a differently-shaped history;
+        `TestSlippageFamilies.test_sql_predicate_matches_python_predicate`
+        pins the shared SQL/Python definition and
+        `TestExecutionQualitySlippageSeedRead` pins seeding.
         """
         if not os.path.exists(self._path):
             return []
@@ -1768,11 +1795,9 @@ class TradeLogger:
             "WHERE order_type = 'market' "
             "AND status IN ('filled', 'partial') "
             f"AND {predicate} "
-            "AND (slippage_benchmark_kind != 'arrival_midpoint' "
-            "OR slippage_measurement_version >= ?) "
             "AND slippage_adverse_bps IS NOT NULL "
             "ORDER BY id DESC LIMIT ?",
-            (*predicate_params, ARRIVAL_MIDPOINT_CONTRACT_VERSION, last_n),
+            (*predicate_params, last_n),
         )
         out: list[float] = []
         for (adverse,) in cursor.fetchall():

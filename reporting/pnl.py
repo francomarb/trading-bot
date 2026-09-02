@@ -199,7 +199,9 @@ def _adverse_bps(trade: dict) -> float | None:
         (`fallback_latest_close` measures market drift between the
         last bar close and the fill, not fill quality), OR
       - rows whose quality is reconstructed rather than live
-        (`recovered`, `unavailable`, future enums, or a typo).
+        (`recovered`, `unavailable`, future enums, or a typo), OR
+      - arrival-midpoint rows written before the current quote-validity
+        contract.
 
     All three mean the row has no honest execution measurement and
     must be skipped — defaulting to 0 silently dilutes operator-facing
@@ -207,7 +209,9 @@ def _adverse_bps(trade: dict) -> float | None:
     movement as though it were execution cost.
     """
     if not is_execution_quality_measurement(
-        trade.get(_BENCHMARK_KIND_COLUMN), trade.get(_QUALITY_COLUMN)
+        trade.get(_BENCHMARK_KIND_COLUMN),
+        trade.get(_QUALITY_COLUMN),
+        trade.get("slippage_measurement_version"),
     ):
         return None
     raw = trade.get(_SLIPPAGE_COLUMN)
