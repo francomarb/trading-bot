@@ -701,6 +701,67 @@ def compute_rolling_sharpe(
 _OCC_SYMBOL_RE = re.compile(r"^[A-Z]{1,6}[0-9]{6}[CP][0-9]{8}$")
 
 
+def slippage_measurement_note(row: pd.Series) -> str:
+    """Explain what a Recent Trades slippage cell does—or does not—measure.
+
+    The note is derived only from persisted trade provenance. It deliberately
+    avoids claiming that ``unavailable`` means a stale quote: that state is
+    shared by option exits, fractional-residual cleanup, recovery/external
+    rows, passive spread legs, and genuinely missing benchmarks.
+    """
+    def _text(name: str) -> str:
+        value = row.get(name)
+        return "" if value is None or pd.isna(value) else str(value).strip()
+
+    kind = _text("slippage_benchmark_kind").lower()
+    quality = _text("slippage_measurement_quality").lower()
+    order_type = _text("order_type").lower()
+    position_type = _text("position_type").lower()
+    reason = _text("reason").lower()
+    symbol = _text("symbol").upper()
+    qty = _as_float(row.get("filled_qty"))
+    if qty is None:
+        qty = _as_float(row.get("qty"))
+
+    quality_suffix = (
+        " (recovered from broker history)" if quality == "recovered" else ""
+    )
+    if kind == "arrival_midpoint":
+        return "Execution vs IEX midpoint at submission" + quality_suffix
+    if kind == "combo_limit":
+        return "Spread execution vs submitted combo limit" + quality_suffix
+    if kind == "active_stop_price":
+        return "Stop gap vs active trigger; not execution quality" + quality_suffix
+    if kind == "fallback_latest_close":
+        return "Fallback vs latest bar close; not execution quality"
+    if kind == "decision_price":
+        return "Implementation shortfall vs strategy decision price"
+    if kind == "limit_price":
+        return "Not measured: limit/stop-limit fill"
+
+    if kind == "unavailable":
+        if _OCC_SYMBOL_RE.match(symbol) and order_type == "market":
+            return "Not measured: option arrival benchmark unsupported"
+        if position_type in {"spread", "mleg"}:
+            return "No per-leg measurement; combo metric is on the economic row"
+        if "external" in reason:
+            return "Not measured: external close has no original benchmark"
+        if quality == "recovered":
+            return "Not measured: original benchmark unavailable during recovery"
+        if (
+            order_type == "market"
+            and _text("side").lower() == "sell"
+            and qty is not None
+            and 0 < abs(qty) < 1
+        ):
+            return "No benchmark; fractional residual cleanups use this state"
+        return "Not measured: no valid benchmark was persisted"
+
+    if not kind:
+        return "Not measured: legacy row has no benchmark provenance"
+    return f"Measured vs {kind} benchmark"
+
+
 def _stop_gap_dollars(frame: pd.DataFrame) -> float:
     """Total dollars lost past the stop trigger for one strategy's rows.
 
@@ -2477,15 +2538,20 @@ def render_dashboard() -> None:
         # measurement context each slippage number came from
         # (arrival_midpoint vs active_stop_price vs limit_price vs
         # unavailable; primary vs fallback vs recovered).
+        recent_rows = trades_df.tail(20).copy()
+        recent_rows["Measurement Note"] = recent_rows.apply(
+            slippage_measurement_note, axis=1
+        )
         display_cols = [
             "timestamp", "symbol", "side", "qty", "avg_fill_price",
             "strategy", "reason",
             "slippage_signed_bps",
             "slippage_benchmark_kind",
             "slippage_measurement_quality",
+            "Measurement Note",
         ]
-        available = [c for c in display_cols if c in trades_df.columns]
-        recent = trades_df[available].tail(20).copy()
+        available = [c for c in display_cols if c in recent_rows.columns]
+        recent = recent_rows[available].copy()
         if "timestamp" in recent.columns:
             recent["timestamp"] = recent["timestamp"].map(format_local_timestamp)
         if "avg_fill_price" in recent.columns:

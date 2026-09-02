@@ -893,6 +893,14 @@ Show, at minimum:
 - `Benchmark`
 - `Benchmark Kind`
 - `Quality`
+- `Measurement Note`
+
+`Measurement Note` is an operator-readable interpretation of the persisted
+benchmark provenance. It must not equate `unavailable` with quote staleness:
+option exits, fractional-residual cleanup, recovery/external rows, passive
+spread legs, and genuinely missing benchmarks all share that state. Where the
+exact cause is not persisted, the note must say so rather than infer a quote
+failure.
 
 Optional:
 

@@ -33,6 +33,7 @@ from dashboard import (
     realized_trade_events,
     refresh_multi_leg_positions,
     resolve_account_metrics,
+    slippage_measurement_note,
     watchlist_symbol_state,
 )
 
@@ -135,6 +136,61 @@ class TestLoadTrades:
         assert df.empty
         assert "load_error" in df.attrs
         assert "broken db" in df.attrs["load_error"]
+
+
+class TestSlippageMeasurementNote:
+    @pytest.mark.parametrize(
+        ("row", "expected"),
+        [
+            (
+                {"slippage_benchmark_kind": "arrival_midpoint"},
+                "Execution vs IEX midpoint at submission",
+            ),
+            (
+                {"slippage_benchmark_kind": "fallback_latest_close"},
+                "Fallback vs latest bar close; not execution quality",
+            ),
+            (
+                {"slippage_benchmark_kind": "limit_price"},
+                "Not measured: limit/stop-limit fill",
+            ),
+            (
+                {
+                    "slippage_benchmark_kind": "active_stop_price",
+                    "slippage_measurement_quality": "recovered",
+                },
+                "Stop gap vs active trigger; not execution quality "
+                "(recovered from broker history)",
+            ),
+        ],
+    )
+    def test_explains_benchmark_family(self, row, expected):
+        assert slippage_measurement_note(pd.Series(row)) == expected
+
+    def test_unavailable_option_exit_is_not_called_stale(self):
+        note = slippage_measurement_note(pd.Series({
+            "symbol": "SPY260918C00600000",
+            "order_type": "market",
+            "slippage_benchmark_kind": "unavailable",
+            "slippage_measurement_quality": "unavailable",
+        }))
+        assert note == "Not measured: option arrival benchmark unsupported"
+        assert "stale" not in note
+
+    def test_unavailable_fractional_cleanup_is_explained_cautiously(self):
+        note = slippage_measurement_note(pd.Series({
+            "symbol": "AAPL",
+            "side": "sell",
+            "filled_qty": 0.46,
+            "order_type": "market",
+            "slippage_benchmark_kind": "unavailable",
+        }))
+        assert note == "No benchmark; fractional residual cleanups use this state"
+
+    def test_null_legacy_provenance_is_distinct_from_zero(self):
+        assert slippage_measurement_note(pd.Series({})) == (
+            "Not measured: legacy row has no benchmark provenance"
+        )
 
 
 class TestRegimeGateAllows:
@@ -1417,4 +1473,3 @@ class TestLeveragedTrendLabels:
 
     def test_single_session_streak_is_not_pluralised(self):
         assert _streak_label(self._state("AAAAAB")) == "1 session below"
-
