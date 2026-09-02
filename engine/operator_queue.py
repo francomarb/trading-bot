@@ -5,7 +5,9 @@ Why this module exists
 Operator Controls Phase A PR-2. The proposal (`docs/operator_controls_proposal.md`
 §7) defines a SQLite-backed command queue as the single channel through which
 operator intent reaches the running bot. The CLI (`scripts/operator.py`) writes
-rows; the engine's per-cycle poll claims and processes them.
+rows. A dedicated heartbeat claims handlers that do not read engine-owned
+SQLite stores, while the engine thread claims store-dependent commands at safe
+cycle/sleep boundaries.
 
 For Phase A only two state-changing actions land:
 - ``halt``                 — sticky kill switch via existing `RiskManager`
@@ -37,7 +39,8 @@ Crash-recovery semantics (proposal §7.1)
 ----------------------------------------
 - A command is created in ``status='pending'``.
 - ``claim_next_pending`` atomically transitions the oldest still-fresh
-  pending command to ``status='accepted'`` and returns it. Any pending row
+  pending command in the caller's optional action lane to
+  ``status='accepted'`` and returns it. Any pending row
   older than ``OPERATOR_COMMAND_EXPIRY_SECONDS`` is transitioned to
   ``status='rejected_expired'`` and skipped — stale intent must not auto-fire.
 - The engine processes the accepted command and transitions it to
@@ -52,6 +55,7 @@ import json
 import sqlite3
 import threading
 import uuid
+from collections.abc import Collection
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 
@@ -286,6 +290,7 @@ class OperatorCommandStore:
         *,
         now_iso: str | None = None,
         expiry_seconds: int,
+        actions: Collection[str] | None = None,
     ) -> OperatorCommandRow | None:
         """Atomically claim the oldest still-fresh pending command.
 
@@ -293,7 +298,8 @@ class OperatorCommandStore:
           1. Expire stale rows: any ``pending`` row older than
              ``expiry_seconds`` is set to ``rejected_expired`` so it
              never auto-fires.
-          2. Pick the oldest remaining ``pending`` row.
+          2. Pick the oldest remaining ``pending`` row matching ``actions``
+             when a caller supplies an action set.
           3. Transition it to ``accepted`` and stamp ``accepted_at``.
 
         Returns the claimed row, or None when no fresh pending row
@@ -304,6 +310,7 @@ class OperatorCommandStore:
         """
         now = now_iso or _utc_now_iso()
         cutoff = _iso_minus_seconds(now, expiry_seconds)
+        action_values = tuple(sorted(set(actions))) if actions is not None else None
 
         with self._lock:
             # Expire stale rows first. Idempotent — operates only on `pending`.
@@ -314,13 +321,27 @@ class OperatorCommandStore:
                 (now, cutoff),
             )
 
-            # Pick the oldest remaining pending row.
-            row = self._conn.execute(
-                "SELECT id, " + _SELECT_COLUMNS_CSV + " "
-                "FROM operator_commands "
-                "WHERE status = 'pending' "
-                "ORDER BY created_at ASC LIMIT 1"
-            ).fetchone()
+            # Pick the oldest remaining pending row in this caller's action
+            # lane. The heartbeat and engine thread use disjoint lanes so
+            # heartbeat-safe controls stay prompt while store-dependent
+            # handlers retain the lifecycle connection's thread affinity.
+            if action_values == ():
+                row = None
+            else:
+                action_clause = ""
+                params: tuple[str, ...] = ()
+                if action_values is not None:
+                    placeholders = ", ".join("?" for _ in action_values)
+                    action_clause = f"AND action IN ({placeholders}) "
+                    params = action_values
+                row = self._conn.execute(
+                    "SELECT id, " + _SELECT_COLUMNS_CSV + " "
+                    "FROM operator_commands "
+                    "WHERE status = 'pending' "
+                    + action_clause
+                    + "ORDER BY created_at ASC LIMIT 1",
+                    params,
+                ).fetchone()
             if row is None:
                 self._conn.commit()
                 return None

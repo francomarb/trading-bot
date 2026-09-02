@@ -21,6 +21,7 @@ Covers:
 from __future__ import annotations
 
 import sqlite3
+import threading
 from dataclasses import replace
 from datetime import datetime, timezone
 from types import SimpleNamespace
@@ -228,6 +229,89 @@ def _seed_filled_entry_lifecycle_order(
         ),
     )
     assert outcome.applied is True
+
+
+class TestDestructiveThreadRouting:
+    def test_heartbeat_leaves_pending_and_engine_executes_cancel(self, tmp_path):
+        """Regression for the cross-thread failure found by the paper drill."""
+        engine, command_store = _build_engine(tmp_path)
+        position_uid = _seed_open_lifecycle(engine)
+        engine.lifecycle_orders_store.insert_pending(
+            position_uid=position_uid,
+            role="protective_stop",
+            client_order_id="paper-drill-stop-client",
+            order_type="stop",
+            order_class="simple",
+            time_in_force="gtc",
+            side="sell",
+            intended_qty=10.0,
+            intended_stop_price=90.0,
+        )
+        engine.lifecycle_orders_store.attach_broker_order_id(
+            client_order_id="paper-drill-stop-client",
+            order_id="paper-drill-stop-order",
+        )
+        command_uid = new_command_uid()
+        command_store.insert(
+            command_uid=command_uid,
+            action="cancel-position-orders",
+            reason="cross-thread regression",
+            target_position_uid=position_uid,
+        )
+
+        def heartbeat_poll() -> None:
+            engine._operator_heartbeat_thread = threading.current_thread()
+            engine._process_operator_commands(actions=frozenset({"halt"}))
+
+        heartbeat = threading.Thread(target=heartbeat_poll)
+        heartbeat.start()
+        heartbeat.join(timeout=2.0)
+        assert not heartbeat.is_alive()
+
+        claimed = command_store.get_by_command_uid(command_uid)
+        assert claimed is not None
+        assert claimed.status == "pending"
+        engine.broker.cancel_order.assert_not_called()
+
+        # The lifecycle connection was created on this engine thread. This
+        # would have raised sqlite3.ProgrammingError on the old heartbeat path.
+        engine._process_operator_engine_thread_command()
+
+        completed = command_store.get_by_command_uid(command_uid)
+        assert completed is not None
+        assert completed.status == "succeeded"
+        engine.broker.cancel_order.assert_called_once_with(
+            "paper-drill-stop-order"
+        )
+
+    def test_production_routes_all_actions_to_exactly_one_thread_lane(self):
+        import inspect
+        from engine.operator_queue import VALID_ACTIONS
+        from engine.trader import (
+            _ENGINE_THREAD_OPERATOR_ACTIONS,
+            _HEARTBEAT_OPERATOR_ACTIONS,
+        )
+
+        source = inspect.getsource(TradingEngine._operator_heartbeat_loop)
+        assert "actions=_HEARTBEAT_OPERATOR_ACTIONS" in source
+        assert "_process_operator_engine_thread_command" in inspect.getsource(
+            TradingEngine.start
+        )
+        assert "_process_operator_engine_thread_command" in inspect.getsource(
+            TradingEngine._sleep
+        )
+        assert _ENGINE_THREAD_OPERATOR_ACTIONS == {
+            "resolve-unexpected-protection",
+            "close-position",
+            "reduce-position",
+            "cancel-position-orders",
+        }
+        assert _HEARTBEAT_OPERATOR_ACTIONS.isdisjoint(
+            _ENGINE_THREAD_OPERATOR_ACTIONS
+        )
+        assert (
+            _HEARTBEAT_OPERATOR_ACTIONS | _ENGINE_THREAD_OPERATOR_ACTIONS
+        ) == VALID_ACTIONS
 
 
 class TestDestructiveSetupValidation:
