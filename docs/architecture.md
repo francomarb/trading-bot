@@ -4,7 +4,7 @@
 
 This document defines the target architecture for the Alpaca trading bot. It is the source of truth for structural decisions, coding conventions, and the go/no-go framework for live capital deployment. All refactoring and new development should align with this guide.
 
-The bot is built in Python using `alpaca-py`. Six strategy sleeves are active in paper trading: SMA Crossover, RSI Reversion, Donchian Breakout, Leveraged Trend, SPY Options RSI Reversion, and Credit Spread. The current live GO/NO-GO gate is the combined six-strategy paper run after the Phase 10/11 safety and execution-calibration work is complete.
+The bot is built in Python using `alpaca-py`. Six strategy sleeves are active in paper trading: SMA Crossover, RSI Reversion, Donchian Breakout, Leveraged Trend, SPY Options RSI Reversion, and Credit Spread. Paper mode is the development environment: strategies are evaluated individually for live eligibility, and no strategy is preselected or required to graduate alongside the others.
 
 ---
 
@@ -683,19 +683,26 @@ Full v1 design and rationale: `docs/strategy_health_design.md`. Deliberately def
 
 ## Go/No-Go Framework
 
-Before committing live capital, ALL of the following must be satisfied:
+Before committing live capital, the strategy under consideration must satisfy the
+strategy-specific gates below. Shared platform gates must also pass before any live
+launch. Passing these checks makes a strategy eligible for operator review; only an
+explicit operator decision authorizes its inclusion.
 
-1. Minimum **50 closed trades** in paper trading (statistical significance)
-2. Paper trading period spans **at least 4 weeks** across varying market conditions, with all six active strategy sleeves running
+1. Target **50 closed trades** in paper trading; a smaller sample for a slow strategy requires documented forward-test reconciliation and an explicit statement of the remaining uncertainty
+2. Paper trading spans **at least 4 weeks** and more than one market condition where practical; untested conditions are documented
 3. All five metrics meet their thresholds (see table above)
-4. Bot has run for at least **72 hours continuously** without crashes or errors
-5. Risk manager daily halt has never been triggered without being intentional
-6. `scripts/preflight.py` exits 0 against the live endpoint
-7. `SLIPPAGE_DRIFT_ENABLED=True` — kill switch calibrated from real fills. Calibrate against the **execution-quality family only** (PR #84); a pool that includes `fallback_latest_close` rows reads ~200 bps and would set a threshold that can never fire on genuine degradation. Leave headroom: the arrival midpoint is IEX BBO, not full SIP NBBO, on a paper account.
+4. Net profitability remains positive after realistic fees and slippage and is not dominated by one exceptional winner
+5. Drawdown, loss streaks, and capital usage remain within the strategy's documented limits
+6. The strategy's entries, exits, protection, attribution, accounting, restart recovery, and operator controls have reliable paper evidence
+7. The bot has run for at least **72 hours continuously** without crashes or errors
+8. The risk manager daily halt has never been triggered without being intentional
+9. `scripts/preflight.py` exits 0 against the live endpoint
+10. `SLIPPAGE_DRIFT_ENABLED=True` — kill switch calibrated from real fills. Calibrate against the **execution-quality family only** (PR #84); a pool that includes `fallback_latest_close` rows reads ~200 bps and would set a threshold that can never fire on genuine degradation. Leave headroom: the arrival midpoint is IEX BBO, not full SIP NBBO, on a paper account.
+11. The operator reviews the evidence and explicitly approves the strategy for live inclusion
 
 Run the checker: `python scripts/gonogo.py` (exit code 0 = GO, 1 = NO-GO).
 
-For slow daily-bar strategies, 50 closed trades may not be attainable in a 2–4 week paper window. In that case, forward-test reconciliation and operational stability are the primary stabilization gates.
+For slow daily-bar strategies, 50 closed trades may not be attainable in a short paper window. In that case, forward-test reconciliation and operational stability provide supporting evidence but do not erase the smaller sample's uncertainty. A strategy that does not graduate remains in paper development and does not block a different strategy from being considered.
 
 ---
 

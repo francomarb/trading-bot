@@ -15,15 +15,17 @@ The bot is running in Alpaca paper mode as a six-sleeve portfolio:
 | Equity | SMA Crossover | Static SMA watchlist | Paper active | Trend-following; market entries; sector COLD warns |
 | Equity | RSI Reversion | Static RSI watchlist | Paper active | RSI3 quick-exit reset; limit entries; stock SMA200/liquidity gates |
 | Equity | Donchian Breakout | AI/big-tech watchlist | Paper active | Trend-continuation; TRENDING/RANGING/VOLATILE, BEAR blocked |
-| Equity | Leveraged Trend | SPXL, TQQQ, TECL, SOXL | Paper active | Four paper-only slots; signal exits; no live authorization |
+| Equity | Leveraged Trend | SPXL, TQQQ, TECL, SOXL | Paper active | Four slots; signal exits |
 | Isolated options | SPY Options Reversion | SPY calls | Paper active | Single-leg options; underlying-keyed ownership |
 | Isolated options | Credit Spread | SPY + QQQ bull put spreads | Paper active | MLEG combos; UUID-keyed positions; SPY/QQQ share one sleeve |
 
 Runtime posture:
 
 - Launch method: local `tmux` via `./start_bot.sh` / `./recycle_bot.sh`
-- Current live posture: **not live**, paper validation continues
-- Current required live blockers: slippage drift calibration, final paper GO/NO-GO, live hard-cap config, VPS deployment hardening
+- Current execution mode: **not live**, paper validation continues
+- Current live posture: strategies graduate individually from paper development; none is preselected for live use
+- Before an actual live launch: at least one strategy must be operator-approved, slippage calibration must pass, the live-size throttle must be verified, and deployment hardening must be complete
+- VPS work is intentionally deferred until the operator is satisfied that one or more strategies merit live consideration
 - Current ownership model: `_positions: dict[position_id, Position]`
   - Equity and single-leg options use `owner_key_for(symbol)` as `position_id`
   - Spreads use UUID `position_id`
@@ -41,11 +43,28 @@ Current allocation model:
 
 ## Live Readiness Gates
 
-These are the items that must be green before any live flip.
+Paper evidence is assessed per strategy. One strategy's weak or incomplete evidence
+does not block another strategy from graduating, and meeting the criteria makes a
+strategy eligible for operator review rather than automatically authorizing it for live use.
+
+### Strategy Graduation Criteria
+
+A strategy may be considered for live inclusion only when:
+
+- It has a meaningful paper sample for its trading frequency, including completed entries and exits over enough time to avoid judging a short favorable streak.
+- Net results remain positive after realistic fees and slippage, expectancy is positive, and profitability is not dominated by one exceptional winner.
+- Drawdown, loss streaks, and capital usage stay within the strategy's documented risk limits.
+- Evidence covers more than one market condition where practical, or clearly states which conditions remain untested.
+- Entries, exits, protective orders, attribution, accounting, restart recovery, and operator controls work reliably for that strategy's instruments.
+- The operator reviews the evidence and explicitly approves inclusion. Graduation is a decision, not an automatic threshold crossing.
+
+Strategies that have not graduated remain in paper development and continue collecting
+evidence or receiving reviewed improvements; they do not prevent an approved strategy
+from proceeding.
 
 | Gate | Status | Action |
 |---|---|---|
-| Combined six-sleeve paper run | 🔄 In progress | RSI3 has 3 completed round trips; Leveraged Trend has 4 open entries and no exits. Continue until every sleeve has meaningful entry and exit evidence. |
+| Per-strategy paper graduation | 🔄 In progress | Collect and review each strategy's evidence against the graduation criteria above. No strategy is preselected, and the portfolio does not require every strategy to pass together. |
 | Slippage calibration (`10.D1`) | ⏸ 0 qualifying fills | Discard all earlier arrival-midpoint rows, including the lone fresh-but-665-bps-wide post-PR #127 fill. Start a clean pool after the 10 bps spread guard is deployed; review after at least 10 execution-quality MARKET fills. |
 | Slippage drift enabled (`10.D2`) | ⬜ Blocked by calibration | Set `SLIPPAGE_DRIFT_ENABLED=True` only after calibration is sane. Pre-fix this would have halted the bot on ~the 10th market fill at 13× the threshold for reasons unrelated to execution quality. The sample pool now also survives restarts (`RiskManager.seed_slippage_samples`, seeded at engine start) — before, `_slippage_samples` reset to empty every restart and could rarely reach `SLIPPAGE_DRIFT_MIN_SAMPLES=10` in one process lifetime. |
 | Strategy Health threshold watch (`11.10h`) | ✅ Closed — no tuning | The watch produced no false alarms and no defensible threshold change. Continue routine scheduled reports. |
@@ -56,8 +75,8 @@ These are the items that must be green before any live flip.
 | Single-leg exit fill durability | ✅ Reconfirmed end to end | Post-PR #61 substrate exit rows now include filled SMA, RSI, and SPY-options closes. The former “awaiting a signal-driven close” note is obsolete. |
 | Live launch throttle (`10.G2`) | ⬜ Set at live flip | The flat `HARD_DOLLAR_LOSS_CAP` was retired 2026-09-01 (tripped on ordinary market noise once the account grew; did not scale). Account drawdown is owned by `MAX_DAILY_LOSS_PCT` (5%, scales); the launch-only "start tiny" gate is now `LIVE_SIZE_MULTIPLIER` ≤ 0.25, verified by preflight. |
 | Preflight + dry run (`10.G5`) | ✅ Code complete | Re-run immediately before live flip |
-| VPS deployment (`10.H1-H5`) | ⬜ Not started | Provision production runtime, systemd, secure env, log shipping |
-| Final GO/NO-GO package | ⬜ Not started | Summarize paper evidence, operational stability, and open risks |
+| VPS deployment (`10.H1-H5`) | ⏸ Deferred by operator | Resume only after the operator is satisfied that at least one strategy merits live consideration. Then provision the production runtime, systemd, secure env, and log shipping. |
+| Final strategy GO/NO-GO package | ⬜ Not started | For each strategy under consideration, summarize profitability, risk, operational evidence, untested conditions, and open risks for an explicit operator decision. The result may approve zero, one, or multiple strategies. |
 
 ---
 
@@ -68,8 +87,8 @@ These are the items that must be green before any live flip.
 | Item | Why It Matters | Acceptance |
 |---|---|---|
 | Slippage kill-switch calibration | Live trading must halt if execution quality drifts beyond modeled edge | Paper fill audit shows thresholds are reasonable; `SLIPPAGE_DRIFT_ENABLED=True` before live |
-| Five-sleeve paper GO/NO-GO | The current bot is broader than the old SMA/RSI gate; evidence must cover all active sleeves | Documented GO/NO-GO report covering entries, exits, attribution, startup reconciliation, allocator behavior, health reports |
-| VPS/systemd deployment | Local Mac + tmux is acceptable for paper, not for real capital | VPS provisioned, secrets deployed safely, `systemd` restarts bot on crash/boot, logs are recoverable |
+| Per-strategy graduation GO/NO-GO | Live eligibility must rest on strategy-specific profitability, risk, and operational evidence rather than the result of the whole paper portfolio | Apply the graduation criteria above to each strategy under consideration; document the evidence and operator decision without requiring every active strategy to pass |
+| VPS/systemd deployment | **Deferred until at least one strategy merits live consideration.** Local Mac + tmux remains the paper-development environment. | After the operator authorizes this work: VPS provisioned, secrets deployed safely, `systemd` restarts bot on crash/boot, logs are recoverable |
 | Live `.env` launch throttle | Launch-only protection: start sizes small | `LIVE_SIZE_MULTIPLIER` ≤ 0.25 verified by preflight (replaced the retired `HARD_DOLLAR_LOSS_CAP`). Malfunction is caught by the broker-error-streak and slippage-drift kill switches, not a flat dollar floor. |
 | ~~Operator controls Phase A + B + C (`docs/operator_controls_proposal.md`)~~ | ✅ **PAPER-VALIDATED 2026-09-02.** Pause/resume, cancel, full close, exact-share equity reduce, exact-contract single-leg option reduce, residual GTC protection, durable P&L, and restart recovery all passed. The full-close defect found during the drill was fixed in PR #137; its repaired row and both reductions restored exactly once after recycle with NORMAL startup. | Closed. Genuine unexpected-protection latch clearing remains unit-tested and should be exercised operationally only when a real latch occurs; do not manufacture unsafe broker state for evidence. |
 | Order lifecycle foundation (`docs/order_lifecycle_state_machine.md`) | ✅ **Shipped and exercised.** Durable per-order state, submit-time writes, stream/cycle/startup reconciliation, and substrate-driven dispatch are active. Filled substrate exits now exist for SMA, RSI, SPY options, Donchian, and credit spreads. | Foundation evidence is complete; track optional cleanup in its own follow-ups. |
