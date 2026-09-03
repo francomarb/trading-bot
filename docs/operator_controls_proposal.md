@@ -626,7 +626,7 @@ No broker-mutating operator commands should ship in Phase A. `halt` is allowed b
 6. Wire manual close/reduce fills into lifecycle, trade log, PnL, and sleeve allocator state.
 7. Verify in dry-run and paper trading before any live use.
 
-**Paper-drill correction (2026-09-01):** The first live paper
+**Paper-drill correction (2026-09-01):** The first paper
 `cancel-position-orders` drill failed before broker dispatch because the
 heartbeat thread called the destructive handler through lifecycle stores whose
 SQLite connection was created by the engine thread. Soft controls worked

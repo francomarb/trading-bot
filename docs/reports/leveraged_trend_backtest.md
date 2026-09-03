@@ -1,6 +1,8 @@
 # Leveraged trend confirmation study
 
-This is a research result, not an activated paper or live strategy.
+This is the historical research result that preceded paper activation. The
+strategy is now active in paper development; this report alone is not live
+approval.
 
 ## Contract
 

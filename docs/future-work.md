@@ -1,11 +1,12 @@
 # Future Work: Sentiment Module + Options-Capable Architecture
 
-This note captures a forward-looking architecture for evolving the trading bot from the current equity-style, pluggable strategy framework into a system that can support:
+This note is a historical forward-looking design record from the earlier SMA/RSI stage.
+Several capabilities it proposed now exist. Use `PLAN.md`, `docs/architecture.md`,
+and `docs/strategies.md` for current state and priority. Its remaining ideas cover:
 
-- current strategies: SMA and RSI
 - future custom alpha-generating strategies
 - a sentiment/meta-signal layer
-- SPY options as a trade expression layer
+- additional instrument-expression layers
 - more advanced portfolio/risk allocation
 
 The goal is to preserve stability now while preparing the right extension points for the next stage.
@@ -22,7 +23,10 @@ The bot already has strong architectural foundations:
 - broker/execution separation
 - reporting/logging
 
-At the moment, SMA and RSI are the only strategies. That is fine. The next evolution should **not** replace them. Instead, the architecture should be extended so new modules can sit **around** or **below** existing strategies.
+The bot now runs six paper-development sleeves spanning equities, single-leg
+options, and multi-leg options. The architectural principle below remains useful:
+new modules should sit **around** or **below** strategies rather than replacing
+their responsibility for generating an investment thesis.
 
 Important principle:
 
@@ -303,7 +307,8 @@ Notes:
 
 ## 7) What can be implemented now with low stability risk
 
-These items are the best candidates to start early without disrupting the current SMA/RSI paper-trading stability.
+These were the best candidates identified at the time for extending the earlier
+SMA/RSI paper runtime with low stability risk.
 
 ### Safe early additions
 

@@ -762,7 +762,7 @@ verdict, so the dependent strategy expansions below remain parked:
   Build it now.
 - **`spy_options_reversion` IVR observation logging** (Tier 1 #A, step 1
   application). Zero behavior change; builds evidence base in the
-  background. ✅ Shipped — and the evidence graduated it to a live
+  background. ✅ Shipped — and the evidence graduated it into the production
   TRENDING-only VIX-percentile gate (PLAN 11.46b, 2026-07-09).
 - **SGOV defensive cash sweep** (PLAN 11.44). Independent of options
   entirely; clearer edge thesis than bear-side options once

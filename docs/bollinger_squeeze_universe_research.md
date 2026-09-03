@@ -1,7 +1,8 @@
 # Bollinger Squeeze — Universe Research & Cross-Universe Backtest
 
-**Status:** Research artifact. Used to decide which universe(s) to deploy the
-strategy on; informs the final `BOLLINGER_WATCHLIST` and sleeve allocation.
+**Status:** Research artifact; the strategy is implemented but parked and is
+not wired into `forward_test.py`. This study informed the existing
+`BOLLINGER_WATCHLIST`; current status lives in `PLAN.md` and `strategies.md`.
 
 **Last updated:** 2026-04-29
 

@@ -10,7 +10,7 @@ This document catalogues every strategy in the bot, its signal logic, edge filte
 |---|---|
 | **Development** | Code written, not yet backtested |
 | **Backtesting** | Backtested with vectorbt, tuning parameters |
-| **Paper Trading** | Running live on Alpaca paper account |
+| **Paper Trading** | Running against the Alpaca paper account |
 | **Live** | Deployed with real capital |
 | **Retired** | Disabled after failing go/no-go or underperforming |
 
@@ -20,7 +20,12 @@ This document catalogues every strategy in the bot, its signal logic, edge filte
 
 Six strategy sleeves are running simultaneously in paper trading: SMA, RSI, Donchian, Leveraged Trend, SPY Options, and Credit Spread. They share a single `RiskManager`; the `SleeveAllocator` splits deployable capital into an equity pool and an isolated-options pool.
 
-> **Live configuration lives in the per-strategy deployment guides linked under each section below.** This catalog summarises signal logic, edge filters, and sleeve mechanics; it may lag the dedicated guides on day-to-day parameter changes (watchlist composition, sleeve weights, etc.). When in doubt, treat the deployment guide as the source of truth.
+Paper activation is development status, not live approval. Strategies are
+evaluated independently against the graduation criteria in `PLAN.md` and
+`architecture.md`; none is preselected, and only an explicit operator decision
+can approve live inclusion.
+
+> **Runtime configuration lives in the per-strategy deployment guides linked under each section below.** This catalog summarises signal logic, edge filters, and sleeve mechanics; it may lag the dedicated guides on day-to-day parameter changes (watchlist composition, sleeve weights, etc.). When in doubt, treat the deployment guide as the source of truth.
 
 ---
 
@@ -171,13 +176,13 @@ Unlike the old RSI14 configuration, active RSI3 does not wait for a full RSI70 o
 RSI uses LIMIT orders for entry — price is controlled, so no fractional-share path is used (LIMIT/GTC always uses whole-share `floor()`).
 
 **Watchlist:** 30 names in `RSI_WATCHLIST` (`config/settings.py`).
-Treat the deployment guide as the live source of truth — the
+Treat the deployment guide as the runtime source of truth — the
 embedded list above the current edit was 28 names and stale. The
 deployment guide reflects the current composition and the
 2026-04-30 expansion rationale.
 
 **Starvation audit:** the 2026-08-17 paper-run investigation found that the old
-RSI14 plus stacked-filter design was almost unworkable in live paper: scarce raw
+RSI14 plus stacked-filter design was almost unworkable in paper: scarce raw
 signals, heavy edge-filter blocking, and one broker-connectivity miss. See
 [`rsi_reversion_starvation_audit.md`](rsi_reversion_starvation_audit.md).
 
@@ -186,7 +191,7 @@ RSI mean reversion profits when prices snap back from extremes. It performs well
 
 **Research notes:**
 
-- *2026-08-21 — simplification reset.* Active paper config moved to RSI3 `<15`, level-below entry, close>SMA5 or RSI3>55 exit, all regimes, and only stock SMA200/liquidity gates. Reference SIP backtests are treated as orientation, not final truth; live paper evidence decides whether this configuration is viable.
+- *2026-08-21 — simplification reset.* Active paper config moved to RSI3 `<15`, level-below entry, close>SMA5 or RSI3>55 exit, all regimes, and only stock SMA200/liquidity gates. Reference SIP backtests are treated as orientation, not final truth; paper evidence decides whether this configuration is viable.
 
 ---
 
@@ -407,7 +412,7 @@ The equity strategies are all long-biased and rely on sustained price trends. SP
 
 ### Credit Spread
 
-> 📘 **Deployment guide:** [`credit_spread_strategy.md`](credit_spread_strategy.md) — live deployment config at the top; original design proposal preserved below as research/rationale record.
+> 📘 **Deployment guide:** [`credit_spread_strategy.md`](credit_spread_strategy.md) — current paper runtime config at the top; original design proposal preserved below as research/rationale record.
 
 | Field | Value |
 |---|---|
@@ -625,7 +630,7 @@ Research-style doc: [`bollinger_squeeze_universe_research.md`](bollinger_squeeze
 ## Leveraged Trend (paper-active)
 
 **LeveragedTrend** (`strategies/leveraged_trend.py`) is wired into
-`forward_test.py` behind the paper-only activation switch. It uses an
+`forward_test.py` behind a paper-specific activation switch. It uses an
 unleveraged ETF's confirmed SMA200 phase to trade its benchmark-aligned 3x
 fund across SPY→SPXL, QQQ→TQQQ, XLK→TECL, and SOXX→SOXL. The initial
 configuration is 5 closes above to enter and 2 below to exit, independently
@@ -636,7 +641,8 @@ activation or restart, the strategy also declares its current confirmed
 LONG/FLAT target, allowing the engine to reconcile a flat account into an
 already-active phase through the ordinary risk and lifecycle gates. The SIP
 study begins in 2016 and observed severe standalone drawdowns of roughly
-42–72%; paper activation is evidence gathering, not live approval. Full
+42–72%; paper activation is evidence gathering. Any future live inclusion
+must satisfy the common graduation criteria and receive operator approval. Full
 contract and results: [`leveraged_trend_strategy.md`](leveraged_trend_strategy.md).
 
 A second multi-leg options strategy (iron condor, calendar, etc.) is intentionally easy to add — the engine MLEG path (`dispatch_spread_order`, `SpreadExecutionWorker`, the two-leg `Position` model, startup spread reconstruction) is leg-count-agnostic and duck-typed on the strategy hooks (`build_spread_execution`, `evaluate_spread_exit`, `register_spread`/`release_spread`, `open_spreads`). Two engine helpers still hardcode `strategy_name == "credit_spread"` (the global concurrent counter and the startup-reconstruction strategy lookup); see PLAN.md **11.31** — generalize them before adding strategy #2.

@@ -10,7 +10,7 @@ RSI Reversion is a short-term mean-reversion sleeve. The active paper experiment
 
 > Buy meaningful short-term oversold conditions in liquid stocks that are still above long-term trend, then exit on the first practical bounce.
 
-This is a reset from the earlier conservative RSI14 design, which produced months of no fills. Backtests are used as a reference only; live paper evidence and broker/trade logs remain the authority for whether the strategy is viable.
+This is a reset from the earlier conservative RSI14 design, which produced months of no fills. Backtests are used as a reference only; paper evidence and broker/trade logs remain the authority for whether the strategy is viable.
 
 ## Production Configuration
 
@@ -103,7 +103,7 @@ The 2026-08 starvation audit found the old design was starved by two things:
 
 Reference SIP studies for the RSI3 quick-exit candidate showed materially higher signal density, but those numbers are not treated as final truth. The paper run is the decision source. The acceptance question is:
 
-> Does the simplified RSI3 strategy produce enough live paper candidates and fills to evaluate expectancy without immediately showing unacceptable drawdown or clustered failures?
+> Does the simplified RSI3 strategy produce enough paper candidates and fills to evaluate expectancy without immediately showing unacceptable drawdown or clustered failures?
 
 Historical audit: [`rsi_reversion_starvation_audit.md`](rsi_reversion_starvation_audit.md).
 

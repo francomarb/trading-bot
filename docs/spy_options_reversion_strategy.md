@@ -1,6 +1,6 @@
 # SPY Options RSI Reversion — Strategy Research & Deployment Guide
 
-**Status:** ✅ **ACTIVE** — wired in `forward_test.py`.
+**Status:** ✅ **PAPER ACTIVE** — wired in `forward_test.py`.
 
 **Last updated:** 2026-07-09 (TRENDING-only VIX-percentile entry gate — PLAN 11.46b)
 
@@ -93,7 +93,7 @@ no-filter variants bleed badly in 2022 — the filter is load-bearing, not cosme
 The 2022-whipsaw "future improvement" noted below (a volatility gate) was implemented
 after the 11.46b VIX observation logs, a **production-mirrored** backtest
 (`backtest/spy_options_backtest.py`, 100 SMA + regime gate, 2018–2025), and the first
-live paper trades all converged on the same finding: the oversold-bounce edge splits by
+paper trades all converged on the same finding: the oversold-bounce edge splits by
 **regime × implied vol**, and one quadrant is toxic.
 
 Regime × IVR cross-tab (production-mirrored baseline, total P&L% | n):
@@ -111,7 +111,7 @@ dip in a *calm* uptrend is noise/continuation that theta grinds the long call ou
 `SPY_OPTIONS_MIN_VIX_PERCENTILE` (0.60) of its trailing-1-year **≤-percentile**
 (`IVProxyResolver.resolve_rank(...).percentile`). RANGING is exempt.
 
-- **Percentile, not min-max rank.** This matters: the three live winners had VIX
+- **Percentile, not min-max rank.** This matters: the three paper winners had VIX
   percentile 0.64 / 0.75 / 0.85 but min-max `rank` only 0.25 / 0.33 / 0.43 — a
   `rank ≥ 0.60` gate would have blocked all three winners.
 - **Regime stays at the engine.** `RegimeDetector` detects regime; the filter receives
@@ -119,14 +119,14 @@ dip in a *calm* uptrend is noise/continuation that theta grinds the long call ou
   itself. Fail-closed in TRENDING when the percentile is unavailable/insufficient.
 
 **Effect (production-mirrored backtest):** baseline +400% / pf 1.69 → gated
-+504% / pf 2.33, 23 trades. **Live paper confirmation:** all six post-hardening entries
++504% / pf 2.33, 23 trades. **Paper confirmation:** all six post-hardening entries
 were TRENDING; the gate keeps the three winners (+$4,169) and blocks the three losers
 (−$3,094) — a clean 6/6 separation.
 
 **Caveat:** the daily Black-Scholes backtest has no bid/ask spread, commission, or
 intraday premium noise, so absolute %s are an optimistic ceiling; the *relative*
 comparisons (baseline vs gate, the cross-tab) are the trustworthy signal. Advisory until
-confirmed on live paper — in particular the RANGING path is untested live.
+confirmed in paper evidence — in particular the RANGING path remains untested.
 
 ---
 
@@ -284,7 +284,7 @@ exits) or worse (whipsaws that recover but were stopped intraday).
 
 **Important caveat:** This backtest uses daily bars as a proxy for the live 5-minute signal.
 On daily bars RSI 45 fires ~6 times per year; the 5-minute version will fire more often
-because intraday RSI oscillates more.  Trade frequency in live paper trading is expected
+because intraday RSI oscillates more. Trade frequency in paper trading is expected
 to be higher.  Per-trade quality should be similar or better (5-min signals are faster
 to resolve; less overnight risk).
 

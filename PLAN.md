@@ -52,7 +52,7 @@ strategy eligible for operator review rather than automatically authorizing it f
 A strategy may be considered for live inclusion only when:
 
 - It has a meaningful paper sample for its trading frequency, including completed entries and exits over enough time to avoid judging a short favorable streak.
-- Net results remain positive after realistic fees and slippage, expectancy is positive, and profitability is not dominated by one exceptional winner.
+- Net results and expectancy remain positive after realistic fees and slippage across meaningful subperiods, and profitability is not dominated by one exceptional winner.
 - Drawdown, loss streaks, and capital usage stay within the strategy's documented risk limits.
 - Evidence covers more than one market condition where practical, or clearly states which conditions remain untested.
 - Entries, exits, protective orders, attribution, accounting, restart recovery, and operator controls work reliably for that strategy's instruments.
@@ -76,7 +76,7 @@ from proceeding.
 | Live launch throttle (`10.G2`) | ⬜ Set at live flip | The flat `HARD_DOLLAR_LOSS_CAP` was retired 2026-09-01 (tripped on ordinary market noise once the account grew; did not scale). Account drawdown is owned by `MAX_DAILY_LOSS_PCT` (5%, scales); the launch-only "start tiny" gate is now `LIVE_SIZE_MULTIPLIER` ≤ 0.25, verified by preflight. |
 | Preflight + dry run (`10.G5`) | ✅ Code complete | Re-run immediately before live flip |
 | VPS deployment (`10.H1-H5`) | ⏸ Deferred by operator | Resume only after the operator is satisfied that at least one strategy merits live consideration. Then provision the production runtime, systemd, secure env, and log shipping. |
-| Final strategy GO/NO-GO package | ⬜ Not started | For each strategy under consideration, summarize profitability, risk, operational evidence, untested conditions, and open risks for an explicit operator decision. The result may approve zero, one, or multiple strategies. |
+| Final strategy GO/NO-GO package | ⬜ Not started | For each strategy under consideration, summarize profitability, risk, operational evidence, untested conditions, and open risks for an explicit operator decision. The result may approve zero, one, or multiple strategies. The current `scripts/gonogo.py` aggregates the whole DB; add strategy filtering before using it for graduation evidence. |
 
 ---
 
@@ -87,7 +87,7 @@ from proceeding.
 | Item | Why It Matters | Acceptance |
 |---|---|---|
 | Slippage kill-switch calibration | Live trading must halt if execution quality drifts beyond modeled edge | Paper fill audit shows thresholds are reasonable; `SLIPPAGE_DRIFT_ENABLED=True` before live |
-| Per-strategy graduation GO/NO-GO | Live eligibility must rest on strategy-specific profitability, risk, and operational evidence rather than the result of the whole paper portfolio | Apply the graduation criteria above to each strategy under consideration; document the evidence and operator decision without requiring every active strategy to pass |
+| Per-strategy graduation GO/NO-GO | Live eligibility must rest on strategy-specific profitability, risk, and operational evidence rather than the result of the whole paper portfolio | Add a strategy selector to the currently portfolio-wide `scripts/gonogo.py`; apply the graduation criteria above to each strategy under consideration; document the evidence and operator decision without requiring every active strategy to pass |
 | VPS/systemd deployment | **Deferred until at least one strategy merits live consideration.** Local Mac + tmux remains the paper-development environment. | After the operator authorizes this work: VPS provisioned, secrets deployed safely, `systemd` restarts bot on crash/boot, logs are recoverable |
 | Live `.env` launch throttle | Launch-only protection: start sizes small | `LIVE_SIZE_MULTIPLIER` ≤ 0.25 verified by preflight (replaced the retired `HARD_DOLLAR_LOSS_CAP`). Malfunction is caught by the broker-error-streak and slippage-drift kill switches, not a flat dollar floor. |
 | ~~Operator controls Phase A + B + C (`docs/operator_controls_proposal.md`)~~ | ✅ **PAPER-VALIDATED 2026-09-02.** Pause/resume, cancel, full close, exact-share equity reduce, exact-contract single-leg option reduce, residual GTC protection, durable P&L, and restart recovery all passed. The full-close defect found during the drill was fixed in PR #137; its repaired row and both reductions restored exactly once after recycle with NORMAL startup. | Closed. Genuine unexpected-protection latch clearing remains unit-tested and should be exercised operationally only when a real latch occurs; do not manufacture unsafe broker state for evidence. |

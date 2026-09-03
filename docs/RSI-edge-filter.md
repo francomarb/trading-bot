@@ -49,7 +49,7 @@ Those gates are deliberately **not** part of the active RSI3 experiment:
 | Sector momentum block | Removed from production RSI3 |
 | Regime gate | Disabled for RSI via `allowed_regimes=None` |
 
-This is a design reset, not a claim that those risks are imaginary. The live paper question is narrower: can a simple RSI3 dip signal produce enough clean evidence when protected only by stock trend, liquidity, ATR stops, sleeve limits, max-position caps, and global risk halts?
+This is a design reset, not a claim that those risks are imaginary. The paper-evidence question is narrower: can a simple RSI3 dip signal produce enough clean evidence when protected only by stock trend, liquidity, ATR stops, sleeve limits, max-position caps, and global risk halts?
 
 ## Observability
 
