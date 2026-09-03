@@ -4768,6 +4768,7 @@ class TradingEngine:
         self,
         *,
         actions: frozenset[str] | None = None,
+        expiry_seconds: int | None = None,
     ) -> None:
         """Drain one queued operator command per call.
 
@@ -4782,9 +4783,13 @@ class TradingEngine:
         """
         if self.operator_command_store is None:
             return
+        effective_expiry = (
+            settings.OPERATOR_COMMAND_EXPIRY_SECONDS
+            if expiry_seconds is None else expiry_seconds
+        )
         try:
             claimed = self.operator_command_store.claim_next_pending(
-                expiry_seconds=settings.OPERATOR_COMMAND_EXPIRY_SECONDS,
+                expiry_seconds=effective_expiry,
                 actions=actions,
             )
         except Exception as exc:
@@ -4864,7 +4869,12 @@ class TradingEngine:
         until this method runs avoids both cross-thread access and an extended
         accepted-but-not-executed crash window.
         """
-        self._process_operator_commands(actions=_ENGINE_THREAD_OPERATOR_ACTIONS)
+        self._process_operator_commands(
+            actions=_ENGINE_THREAD_OPERATOR_ACTIONS,
+            expiry_seconds=(
+                settings.OPERATOR_ENGINE_THREAD_COMMAND_EXPIRY_SECONDS
+            ),
+        )
 
     def _apply_operator_halt(self, command) -> None:
         """Handle the ``halt`` operator command.

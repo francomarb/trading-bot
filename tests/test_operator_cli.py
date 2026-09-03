@@ -535,6 +535,7 @@ class TestPhaseCDestructiveControls:
         assert rc == 0
         assert "queued close-position" in out
         assert "next safe cycle or sleep boundary" in out
+        assert "expires after 900s" in out
         assert "heartbeat drains" not in out
 
         import sqlite3

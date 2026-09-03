@@ -161,6 +161,29 @@ class TestInsert:
 
 
 class TestClaimNextPending:
+    @staticmethod
+    def _insert_at(
+        store: OperatorCommandStore,
+        *,
+        command_uid: str,
+        action: str,
+        created_at: str,
+    ) -> None:
+        store._conn.execute(
+            "INSERT INTO operator_commands ("
+            "schema_version, command_uid, created_at, action, reason, "
+            "status, params_json"
+            ") VALUES (?, ?, ?, ?, ?, 'pending', '{}')",
+            (
+                OPERATOR_QUEUE_SCHEMA_VERSION,
+                command_uid,
+                created_at,
+                action,
+                "expiry test",
+            ),
+        )
+        store._conn.commit()
+
     def test_returns_none_when_empty(self, store):
         assert store.claim_next_pending(expiry_seconds=180) is None
 
@@ -210,6 +233,79 @@ class TestClaimNextPending:
         store.insert(command_uid=uid, action="halt", reason="soft")
 
         assert store.claim_next_pending(
+            expiry_seconds=180,
+            actions=set(),
+        ) is None
+        assert store.get_by_command_uid(uid).status == "pending"
+
+    def test_expiry_is_scoped_to_the_callers_action_lane(self, store):
+        now = datetime.now(timezone.utc)
+        created_at = (now - timedelta(seconds=300)).isoformat()
+        soft_uid = new_command_uid()
+        engine_uid = new_command_uid()
+        self._insert_at(
+            store,
+            command_uid=soft_uid,
+            action="halt",
+            created_at=created_at,
+        )
+        self._insert_at(
+            store,
+            command_uid=engine_uid,
+            action="reduce-position",
+            created_at=created_at,
+        )
+
+        claimed = store.claim_next_pending(
+            now_iso=now.isoformat(),
+            expiry_seconds=180,
+            actions={"halt"},
+        )
+
+        assert claimed is None
+        assert store.get_by_command_uid(soft_uid).status == "rejected_expired"
+        assert store.get_by_command_uid(engine_uid).status == "pending"
+
+        engine_claim = store.claim_next_pending(
+            now_iso=now.isoformat(),
+            expiry_seconds=900,
+            actions={"reduce-position"},
+        )
+        assert engine_claim is not None
+        assert engine_claim.command_uid == engine_uid
+        assert engine_claim.status == "accepted"
+
+    def test_engine_lane_rejects_command_older_than_extended_window(
+        self, store,
+    ):
+        now = datetime.now(timezone.utc)
+        uid = new_command_uid()
+        self._insert_at(
+            store,
+            command_uid=uid,
+            action="close-position",
+            created_at=(now - timedelta(seconds=901)).isoformat(),
+        )
+
+        assert store.claim_next_pending(
+            now_iso=now.isoformat(),
+            expiry_seconds=900,
+            actions={"close-position"},
+        ) is None
+        assert store.get_by_command_uid(uid).status == "rejected_expired"
+
+    def test_empty_action_filter_does_not_expire_stale_rows(self, store):
+        now = datetime.now(timezone.utc)
+        uid = new_command_uid()
+        self._insert_at(
+            store,
+            command_uid=uid,
+            action="halt",
+            created_at=(now - timedelta(seconds=901)).isoformat(),
+        )
+
+        assert store.claim_next_pending(
+            now_iso=now.isoformat(),
             expiry_seconds=180,
             actions=set(),
         ) is None

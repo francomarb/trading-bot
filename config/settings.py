@@ -1307,24 +1307,18 @@ EQUITY_PATH_STATE_PATH: str = "data/equity_path_state.json"
 # Operator command queue + sticky halt. See docs/operator_controls_proposal.md
 # §13 Phase A and the operator-controls implementation plan.
 #
-# OPERATOR_COMMAND_EXPIRY_SECONDS: how old a `pending` operator command may
-#   be before the engine rejects it on pickup with status='rejected_expired'.
-#   Defensive: an old command is operator intent that may no longer match
-#   current state, so a stale halt or future destructive command should not
-#   auto-fire.
+# OPERATOR_COMMAND_EXPIRY_SECONDS: stale-intent window for controls claimed by
+#   the fast heartbeat. Three minutes is comfortably above its five-second
+#   cadence while still rejecting commands left behind by a stalled bot.
 #
-#   PR-2 reviewer fix F1: in Phase A the engine polls once per main cycle
-#   (every CYCLE_INTERVAL_SECONDS = 300s). The expiry must be safely
-#   greater than one cycle interval plus jitter, otherwise a halt queued
-#   right after a poll will get rejected_expired before the next poll
-#   sees it. 1800s gives the bot up to 5 missed cycles (or a brief
-#   restart) to drain the queue before any operator command auto-expires.
-#   Phase B will add a fast heartbeat (~5s) and this value can drop
-#   back to 180-300s at that point.
+# OPERATOR_ENGINE_THREAD_COMMAND_EXPIRY_SECONDS: wait budget for close, reduce,
+#   cancel, and proof-gated latch resolution. These commands stay pending while
+#   a strategy cycle is active because their stores are engine-thread-affine.
+#   Fifteen minutes covers observed non-stalled cycle durations with margin;
+#   commands surviving a severe API stall are rejected as stale.
 #
-# OPERATOR_COMMAND_HEARTBEAT_SECONDS: target poll cadence for processing the
-#   queue. Defined here for Phase B's fast heartbeat thread; Phase A still
-#   polls once per main engine cycle (5 min) — see the F1 note above.
+# OPERATOR_COMMAND_HEARTBEAT_SECONDS: target poll cadence for heartbeat-safe
+#   controls. Engine-thread commands are checked at safe cycle/sleep boundaries.
 #
 # OPERATOR_CONTROL_STATE_PATH: durable record of sticky halt state. Read at
 #   engine startup so a halt issued before a restart re-engages immediately.
@@ -1338,7 +1332,8 @@ EQUITY_PATH_STATE_PATH: str = "data/equity_path_state.json"
 #   `_lifecycle_mark_filled`. Older pending rows are still closed (almost
 #   certainly orphaned from a crashed submit). 5 min is longer than the
 #   longest fill-confirm window (BROKER_ORDER_CONFIRM_WINDOW_SECONDS).
-OPERATOR_COMMAND_EXPIRY_SECONDS: int = 180  # 3 minutes; Phase B heartbeat polls every 5s so commands drain well within this window
+OPERATOR_COMMAND_EXPIRY_SECONDS: int = 180
+OPERATOR_ENGINE_THREAD_COMMAND_EXPIRY_SECONDS: int = 900
 OPERATOR_COMMAND_HEARTBEAT_SECONDS: int = 5
 OPERATOR_CONTROL_STATE_PATH: str = "data/operator_control_state.json"
 LIFECYCLE_PENDING_GRACE_SECONDS: int = 300

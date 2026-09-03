@@ -40,9 +40,10 @@ Crash-recovery semantics (proposal §7.1)
 - A command is created in ``status='pending'``.
 - ``claim_next_pending`` atomically transitions the oldest still-fresh
   pending command in the caller's optional action lane to
-  ``status='accepted'`` and returns it. Any pending row
-  older than ``OPERATOR_COMMAND_EXPIRY_SECONDS`` is transitioned to
-  ``status='rejected_expired'`` and skipped — stale intent must not auto-fire.
+  ``status='accepted'`` and returns it. Pending rows in that same lane older
+  than its configured expiry are transitioned to ``status='rejected_expired'``
+  and skipped — stale intent must not auto-fire, and one lane must not consume
+  the other lane's wait budget.
 - The engine processes the accepted command and transitions it to
   ``succeeded`` / ``failed`` / ``rejected_<...>``.
 - ``client_order_id`` plumbing exists in the schema for Phase C destructive
@@ -295,9 +296,9 @@ class OperatorCommandStore:
         """Atomically claim the oldest still-fresh pending command.
 
         Steps in one transaction:
-          1. Expire stale rows: any ``pending`` row older than
-             ``expiry_seconds`` is set to ``rejected_expired`` so it
-             never auto-fires.
+          1. Expire stale rows in the selected action lane: any matching
+             ``pending`` row older than ``expiry_seconds`` is set to
+             ``rejected_expired`` so it never auto-fires.
           2. Pick the oldest remaining ``pending`` row matching ``actions``
              when a caller supplies an action set.
           3. Transition it to ``accepted`` and stamp ``accepted_at``.
@@ -312,14 +313,25 @@ class OperatorCommandStore:
         cutoff = _iso_minus_seconds(now, expiry_seconds)
         action_values = tuple(sorted(set(actions))) if actions is not None else None
 
+        action_clause = ""
+        action_params: tuple[str, ...] = ()
+        if action_values:
+            placeholders = ", ".join("?" for _ in action_values)
+            action_clause = f"AND action IN ({placeholders}) "
+            action_params = action_values
+
         with self._lock:
-            # Expire stale rows first. Idempotent — operates only on `pending`.
-            self._conn.execute(
-                "UPDATE operator_commands "
-                "SET status = 'rejected_expired', completed_at = ? "
-                "WHERE status = 'pending' AND created_at < ?",
-                (now, cutoff),
-            )
+            # Expire stale rows in this caller's lane only. The heartbeat and
+            # engine thread intentionally use different wait budgets; a poll
+            # for one lane must never expire commands owned by the other.
+            if action_values != ():
+                self._conn.execute(
+                    "UPDATE operator_commands "
+                    "SET status = 'rejected_expired', completed_at = ? "
+                    "WHERE status = 'pending' AND created_at < ? "
+                    + action_clause,
+                    (now, cutoff, *action_params),
+                )
 
             # Pick the oldest remaining pending row in this caller's action
             # lane. The heartbeat and engine thread use disjoint lanes so
@@ -328,19 +340,13 @@ class OperatorCommandStore:
             if action_values == ():
                 row = None
             else:
-                action_clause = ""
-                params: tuple[str, ...] = ()
-                if action_values is not None:
-                    placeholders = ", ".join("?" for _ in action_values)
-                    action_clause = f"AND action IN ({placeholders}) "
-                    params = action_values
                 row = self._conn.execute(
                     "SELECT id, " + _SELECT_COLUMNS_CSV + " "
                     "FROM operator_commands "
                     "WHERE status = 'pending' "
                     + action_clause
                     + "ORDER BY created_at ASC LIMIT 1",
-                    params,
+                    action_params,
                 ).fetchone()
             if row is None:
                 self._conn.commit()
