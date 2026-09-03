@@ -169,7 +169,8 @@ class Reconciler:
         # the drift kill switch. Two classes of row are skipped:
         # benchmarks outside the execution-quality family (a
         # `fallback_latest_close` row measures market drift, not fill
-        # quality) and reconstructed / absent measurements. Neither may
+        # quality), reconstructed / absent measurements, and pre-contract
+        # arrival-midpoint rows. None may
         # satisfy the gate by silently contributing zero — pre-Phase-2
         # this read the retired `realized_slippage_bps` column, which is
         # NULL on every current row and would have disabled the gate.
@@ -178,6 +179,7 @@ class Reconciler:
             if not is_execution_quality_measurement(
                 t.get("slippage_benchmark_kind"),
                 t.get("slippage_measurement_quality"),
+                t.get("slippage_measurement_version"),
             ):
                 continue
             raw = t.get("slippage_adverse_bps")

@@ -297,6 +297,7 @@ Add these columns:
 - `slippage_benchmark_kind TEXT`
 - `slippage_benchmark_timestamp TEXT`
 - `slippage_measurement_quality TEXT`
+- `slippage_measurement_version INTEGER`
 - `slippage_signed_bps REAL`
 - `slippage_adverse_bps REAL`
 - `stop_trigger_price REAL`
@@ -333,6 +334,7 @@ A quote may only be certified `arrival_midpoint` / `primary` when **all** hold:
 | book not crossed | `ask < bid` (locked, `ask == bid`, is allowed) |
 | age known | the quote carries no usable venue timestamp |
 | age fresh | `age > ARRIVAL_QUOTE_MAX_AGE_SECONDS` |
+| spread precise enough | `spread_bps > ARRIVAL_QUOTE_MAX_SPREAD_BPS` (default `2 × SLIPPAGE_MODEL_MARKET_BPS`, currently 10) |
 
 Failing any of these returns `None`, which routes the caller to
 `fallback_latest_close` / `fallback`. The rejection is deliberately *not* a
@@ -346,9 +348,22 @@ measurement, and the existing fallback already expresses that.
 
 `reject_reason` is one of: `api_error`, `no_quote`, `malformed_prices`,
 `non_finite`, `zero_side`, `crossed`, `no_quote_timestamp`,
-`bad_quote_timestamp`, `stale`, `stale_repeat`.
+`bad_quote_timestamp`, `stale`, `stale_repeat`, `wide_spread`.
 
-Two of these matter more than the rest on IEX:
+The default ceiling follows the calibration model: half of the maximum spread
+equals the full MARKET-order allowance. A wider IEX midpoint is too imprecise
+to judge a fill against. Rejection only downgrades the measurement to fallback;
+it does not prevent order submission. The clean calibration epoch begins after
+this guard is deployed; older arrival-midpoint rows are not eligible.
+
+New certified arrival-midpoint rows carry `slippage_measurement_version=2`.
+Every shared execution-quality consumer requires that version for this
+benchmark kind, so the discard rule applies equally to kill-switch seeding,
+health, calibration, P&L, dashboard aggregates and reconciliation. Existing
+`combo_limit` rows are unaffected because their benchmark did not use the
+defective arrival-quote writer.
+
+Three of these matter more than the rest on IEX:
 
 - **`zero_side`** is the failure Alpaca staff say is most common on this feed
   (*"there can be a lot of 0 price and size quotes"*). Until 2026-08-28 it
@@ -370,6 +385,9 @@ Two of these matter more than the rest on IEX:
 rather than on the trade row, following the `credit_spread_pick` precedent;
 correlate by `symbol` + capture time. `bot.jsonl` rotates at 10MB with 30-day
 retention, which outlasts the calibration window.
+- **`wide_spread`** means the quote was fresh but its midpoint was too
+  imprecise for the 5 bps calibration model. The event retains the observed
+  spread; the associated order may still proceed using a fallback benchmark.
 
 #### Diagnosing IEX quote reliability (operator recipe)
 
@@ -409,7 +427,7 @@ EOF
 |---|---|---|
 | `zero_side` dominates | IEX is not quoting these symbols. This is the failure Alpaca staff name explicitly. | Quantified case for paid SIP; no code fix helps. |
 | `stale` / `stale_repeat` dominate, ages large | Quotes are genuinely old — the staleness hypothesis. | The guard is the right fix; consider tuning the threshold down. |
-| Ages small but spreads large | Books are fresh but **unrepresentative** — the competing hypothesis. | The age guard is treating the wrong cause. Wants a spread-width guard, or SIP. |
+| Ages small but spreads large | Books are fresh but **unrepresentative** — the competing hypothesis. | The 10 bps spread guard excludes these measurements; paid SIP remains the feed-quality alternative. |
 | High `consecutive_repeats` on specific symbols | No newer quote was returned for those names. **Not yet a diagnosis** — could be a feed failure OR a legitimately quiet symbol. | Corroborate first: did the symbol trade over that interval? If it traded and the quote never moved, that is a feed failure and those symbols can be excluded from execution-quality measurement. If it did not trade, this is normal inactivity — exclude nothing. |
 | Mostly `ACCEPTED`, few rejections | The feed is behaving; benchmark contamination is not the current problem. | Look elsewhere. |
 
@@ -883,7 +901,7 @@ rather than re-deriving the rule.
 Use:
 
 - the same `slippage_adverse_bps` family,
-- with explicit filters on `measurement_quality`.
+- with the shared benchmark-kind, quality and arrival-contract-version filter.
 
 ### Dashboard Recent Trades
 

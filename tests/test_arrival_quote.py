@@ -102,7 +102,7 @@ class TestProvenanceCapture:
         tell them apart.
         """
         with _patched(_quote(age_seconds=1.0, bid=100.0, ask=102.0)):
-            q = fetch_latest_quote("AAA")
+            q = fetch_latest_quote("AAA", max_spread_bps=500.0)
         assert q.spread_bps == pytest.approx(198.0, abs=1.0)
 
     def test_event_is_emitted_for_rejected_quotes_too(self):
@@ -180,6 +180,41 @@ class TestQuoteShapeValidation:
             assert q is None or q.spread_bps >= 0
 
 
+class TestSpreadGuard:
+    """A fresh but wide IEX book is not a precise arrival benchmark."""
+
+    def test_quote_within_ten_bps_is_accepted(self):
+        with _patched(_quote(age_seconds=1.0, bid=99.96, ask=100.04)):
+            quote = fetch_latest_quote("AAA")
+        assert quote is not None
+        assert quote.spread_bps == pytest.approx(8.0)
+
+    def test_quote_wider_than_ten_bps_is_rejected(self):
+        with _patched(_quote(age_seconds=1.0, bid=99.94, ask=100.06)):
+            assert fetch_latest_quote("AAA") is None
+
+    def test_caller_can_override_spread_threshold(self):
+        quote = _quote(age_seconds=1.0, bid=99.94, ask=100.06)
+        with _patched(quote):
+            assert fetch_latest_quote("AAA", max_spread_bps=20.0) is not None
+
+    def test_wide_spread_rejection_is_observable(self):
+        events = []
+        real_bind = fetcher.logger.bind
+
+        def spy(**kw):
+            if kw.get("event") == "arrival_quote":
+                events.append(kw)
+            return real_bind(**kw)
+
+        with patch.object(fetcher.logger, "bind", side_effect=spy):
+            with _patched(_quote(age_seconds=1.0, bid=99.0, ask=101.0)):
+                assert fetch_latest_quote("AAA") is None
+        assert events[-1]["accepted"] is False
+        assert events[-1]["reject_reason"] == "wide_spread"
+        assert events[-1]["spread_bps"] == pytest.approx(200.0)
+
+
 class TestExistingBehaviourPreserved:
     def test_midpoint_wrapper_still_returns_a_float(self):
         with _patched(_quote(age_seconds=1.0)):
@@ -233,6 +268,7 @@ class TestEveryRejectionIsObservable:
         (101.0, 100.0, "crossed"),
         (float("nan"), 100.0, "non_finite"),
         (100.0, float("inf"), "non_finite"),
+        (99.0, 101.0, "wide_spread"),
     ])
     def test_shape_rejections_emit_a_reason(self, bid, ask, reason):
         def run():
@@ -412,6 +448,7 @@ class TestEveryReturnPathEmitsAnEvent:
         ("zero_side", dict(bid=0.0, ask=100.0, age=1.0)),
         ("crossed", dict(bid=101.0, ask=100.0, age=1.0)),
         ("non_finite", dict(bid=float("nan"), ask=100.0, age=1.0)),
+        ("wide_spread", dict(bid=99.0, ask=101.0, age=1.0)),
         ("stale", dict(bid=100.0, ask=100.1, age=900.0)),
     ])
     def test_each_rejection_path_emits(self, reason, setup):

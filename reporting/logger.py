@@ -73,6 +73,11 @@ EXECUTION_QUALITY_KINDS: frozenset[str] = frozenset({
     "combo_limit",        # spread fill vs the combo limit we submitted
 })
 
+# Arrival-midpoint contract v2 adds both freshness and <=10 bps spread
+# certification. Pre-existing rows have no version and are excluded from
+# drift-monitor startup seeding even if their old writer called them primary.
+ARRIVAL_MIDPOINT_CONTRACT_VERSION = 2
+
 IMPLEMENTATION_SHORTFALL_KINDS: frozenset[str] = frozenset({
     "decision_price",         # fill vs the price the strategy decided on
     "fallback_latest_close",  # fill vs a prior bar close — market drift
@@ -100,20 +105,35 @@ CALIBRATION_GRADE_QUALITIES: frozenset[str] = frozenset({"primary", "fallback"})
 def is_execution_quality_measurement(
     benchmark_kind: str | None,
     measurement_quality: str | None,
+    measurement_version: int | None = None,
 ) -> bool:
     """True when a row's slippage value actually measures execution quality.
 
-    Both dimensions must hold: the benchmark has to belong to the
-    execution-quality family (what is being measured) and the quality tier
-    has to be live rather than reconstructed (how much we trust it).
+    The benchmark has to belong to the execution-quality family (what is
+    being measured), the quality tier has to be live rather than reconstructed
+    (how much we trust it), and arrival-midpoint rows must use the current
+    measurement contract.
 
-    This is the single definition consumed by the drift kill switch, the
-    health assessor, the calibration script, the PnL reports, the dashboard
-    and the reconcile gate. Callers must not re-implement it.
+    Arrival-midpoint rows additionally require the current measurement
+    contract version. Older rows predate quote freshness/spread certification
+    and cannot be made trustworthy after the fact. Other benchmark families
+    are unaffected by that writer-specific migration.
+
+    This is the single definition consumed by the drift kill switch, health,
+    calibration, PnL, dashboard and reconcile. Callers must not re-implement it.
     """
-    return (
+    family_and_quality_match = (
         benchmark_kind in EXECUTION_QUALITY_KINDS
         and measurement_quality in CALIBRATION_GRADE_QUALITIES
+    )
+    if not family_and_quality_match:
+        return False
+    return (
+        benchmark_kind != "arrival_midpoint"
+        or (
+            measurement_version is not None
+            and measurement_version >= ARRIVAL_MIDPOINT_CONTRACT_VERSION
+        )
     )
 
 
@@ -129,9 +149,11 @@ def execution_quality_sql() -> tuple[str, tuple[str, ...]]:
     qualities = tuple(sorted(CALIBRATION_GRADE_QUALITIES))
     fragment = (
         f"slippage_benchmark_kind IN ({', '.join('?' * len(kinds))}) "
-        f"AND slippage_measurement_quality IN ({', '.join('?' * len(qualities))})"
+        f"AND slippage_measurement_quality IN ({', '.join('?' * len(qualities))}) "
+        "AND (slippage_benchmark_kind != 'arrival_midpoint' "
+        "OR slippage_measurement_version >= ?)"
     )
-    return fragment, kinds + qualities
+    return fragment, kinds + qualities + (ARRIVAL_MIDPOINT_CONTRACT_VERSION,)
 
 
 from loguru import logger
@@ -454,6 +476,7 @@ TRADE_COLUMNS = [
     "slippage_benchmark_kind",
     "slippage_benchmark_timestamp",
     "slippage_measurement_quality",
+    "slippage_measurement_version",
     "slippage_signed_bps",
     "slippage_adverse_bps",
     "stop_trigger_price",
@@ -500,6 +523,7 @@ CREATE TABLE IF NOT EXISTS trades (
     slippage_benchmark_kind      TEXT,
     slippage_benchmark_timestamp TEXT,
     slippage_measurement_quality TEXT,
+    slippage_measurement_version INTEGER,
     slippage_signed_bps          REAL,
     slippage_adverse_bps         REAL,
     stop_trigger_price           REAL
@@ -549,6 +573,7 @@ _MIGRATION_COLUMNS = {
     "slippage_benchmark_kind": "TEXT",
     "slippage_benchmark_timestamp": "TEXT",
     "slippage_measurement_quality": "TEXT",
+    "slippage_measurement_version": "INTEGER",
     "slippage_signed_bps": "REAL",
     "slippage_adverse_bps": "REAL",
     "stop_trigger_price": "REAL",
@@ -689,6 +714,7 @@ class TradeRecord:
     slippage_benchmark_kind: SlippageBenchmarkKind | None = None
     slippage_benchmark_timestamp: str | None = None
     slippage_measurement_quality: SlippageMeasurementQuality | None = None
+    slippage_measurement_version: int | None = None
     slippage_signed_bps: float | None = None
     slippage_adverse_bps: float | None = None
     stop_trigger_price: float | None = None
@@ -1200,6 +1226,16 @@ class TradeLogger:
             slippage_benchmark_kind=new_benchmark_kind,
             slippage_benchmark_timestamp=new_benchmark_timestamp,
             slippage_measurement_quality=new_quality,
+            slippage_measurement_version=(
+                ARRIVAL_MIDPOINT_CONTRACT_VERSION
+                if new_benchmark_kind == "arrival_midpoint"
+                and is_execution_quality_measurement(
+                    new_benchmark_kind,
+                    new_quality,
+                    ARRIVAL_MIDPOINT_CONTRACT_VERSION,
+                )
+                else None
+            ),
             slippage_signed_bps=(
                 round(new_signed_bps, 2) if new_signed_bps is not None else None
             ),
@@ -1393,6 +1429,16 @@ class TradeLogger:
             slippage_benchmark_kind=new_benchmark_kind,
             slippage_benchmark_timestamp=new_benchmark_timestamp,
             slippage_measurement_quality=new_quality,
+            slippage_measurement_version=(
+                ARRIVAL_MIDPOINT_CONTRACT_VERSION
+                if new_benchmark_kind == "arrival_midpoint"
+                and is_execution_quality_measurement(
+                    new_benchmark_kind,
+                    new_quality,
+                    ARRIVAL_MIDPOINT_CONTRACT_VERSION,
+                )
+                else None
+            ),
             slippage_signed_bps=(
                 round(new_signed_bps, 2) if new_signed_bps is not None else None
             ),
@@ -1443,6 +1489,7 @@ class TradeLogger:
         "slippage_benchmark_kind",
         "slippage_benchmark_timestamp",
         "slippage_measurement_quality",
+        "slippage_measurement_version",
         # Legacy modeled-slippage benchmark. Captured at submit time
         # from the arrival price; a later cycle-reconciliation log()
         # call without the original benchmark must not zero it.
@@ -1730,10 +1777,14 @@ class TradeLogger:
             `fallback_latest_close` row measures market drift between
             the last bar close and the fill, not fill quality.
           - live quality tiers only, never reconstructed ones.
+          - arrival-midpoint contract v2 only. Older rows predate the quote
+            freshness/spread guards and cannot be certified after the fact.
 
-        If these two selections ever diverge, the kill switch would
-        judge live fills against a differently-shaped history;
-        `TestSeedMatchesRecordFill` pins them together.
+        If these selections ever diverge, the kill switch would judge live
+        fills against a differently-shaped history;
+        `TestSlippageFamilies.test_sql_predicate_matches_python_predicate`
+        pins the shared SQL/Python definition and
+        `TestExecutionQualitySlippageSeedRead` pins seeding.
         """
         if not os.path.exists(self._path):
             return []

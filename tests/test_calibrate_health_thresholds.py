@@ -18,7 +18,7 @@ from pathlib import Path
 import pytest
 
 from config import settings
-from reporting.logger import TradeLogger
+from reporting.logger import ARRIVAL_MIDPOINT_CONTRACT_VERSION, TradeLogger
 from scripts.calibrate_health_thresholds import (
     _collect_drift_observations,
     _collect_slippage_observations,
@@ -102,6 +102,7 @@ _SLIPPAGE_OID_COUNTER = [0]
 def _seed_slippage_trade(
     conn, *, strategy, timestamp, adverse_bps, measurement_quality="primary",
     benchmark_kind="arrival_midpoint",
+    measurement_version=ARRIVAL_MIDPOINT_CONTRACT_VERSION,
 ):
     """Seed a row matching the collector query.
 
@@ -122,13 +123,14 @@ def _seed_slippage_trade(
         "timestamp, symbol, side, qty, avg_fill_price, order_id, "
         "strategy, reason, stop_price, entry_reference_price, "
         "slippage_signed_bps, slippage_adverse_bps, slippage_measurement_quality, "
-        "slippage_benchmark_kind, "
+        "slippage_benchmark_kind, slippage_measurement_version, "
         "order_type, status, requested_qty, filled_qty"
         ") VALUES (?, 'X', 'sell', 1.0, 100.0, ?, ?, 'exit', "
-        "95.0, 100.0, ?, ?, ?, ?, 'market', 'filled', 1.0, 1.0)",
+        "95.0, 100.0, ?, ?, ?, ?, ?, 'market', 'filled', 1.0, 1.0)",
         (
             timestamp, oid, strategy,
             adverse_bps, adverse_bps, measurement_quality, benchmark_kind,
+            measurement_version,
         ),
     )
     conn.commit()
@@ -159,6 +161,15 @@ class TestSlippageCollector:
             start=date(2026, 4, 1), end=date(2026, 5, 1),
         )
         assert sorted(out) == [0.0, 0.0, 30.0, 100.0]
+
+    def test_excludes_pre_guard_arrival_rows(self, db_conn):
+        _seed_slippage_trade(
+            db_conn, strategy="x", timestamp="2026-04-15T10:00:00",
+            adverse_bps=199.0, measurement_version=None,
+        )
+        assert _collect_slippage_observations(
+            db_conn, "x", start=date(2026, 4, 1), end=date(2026, 5, 1),
+        ) == []
 
     def test_excludes_other_strategies(self, db_conn):
         _seed_slippage_trade(

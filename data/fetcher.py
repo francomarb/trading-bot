@@ -44,6 +44,7 @@ from config.settings import (
     ALPACA_SECRET_KEY,
     ALPACA_DATA_FEED,
     ARRIVAL_QUOTE_MAX_AGE_SECONDS,
+    ARRIVAL_QUOTE_MAX_SPREAD_BPS,
 )
 
 
@@ -259,13 +260,14 @@ class ArrivalQuote:
 
 def fetch_latest_quote(
     symbol: str, *, max_age_seconds: float | None = None,
+    max_spread_bps: float | None = None,
 ) -> ArrivalQuote | None:
     """Fetch the latest IEX quote for `symbol` as an arrival-price benchmark.
 
     Returns ``None`` — meaning "no usable benchmark" — when the quote is
     unavailable, malformed, non-finite, one-sided (a zero bid or ask —
     pre-market quoting gap, halt, illiquid symbol), **crossed** (ask < bid), or
-    **older than `max_age_seconds`**. A locked book (bid == ask) IS accepted;
+    **older than `max_age_seconds`**, or wider than `max_spread_bps`. A locked book (bid == ask) IS accepted;
     the midpoint is unambiguous and the zero spread is recorded. Callers treat ``None``
     as "fall back to a non-execution-quality benchmark", which is what keeps a
     bad reading out of the calibration pool rather than silently polluting it.
@@ -308,6 +310,8 @@ def fetch_latest_quote(
         return None
     if max_age_seconds is None:
         max_age_seconds = ARRIVAL_QUOTE_MAX_AGE_SECONDS
+    if max_spread_bps is None:
+        max_spread_bps = ARRIVAL_QUOTE_MAX_SPREAD_BPS
     try:
         client = _get_client()
         result = client.get_stock_latest_quote(
@@ -409,31 +413,44 @@ def fetch_latest_quote(
         return None
 
     is_repeat, repeats = _note_repeat(symbol, qts)
-    accepted = age_seconds <= max_age_seconds
+    age_accepted = age_seconds <= max_age_seconds
+    spread_accepted = spread_bps <= max_spread_bps
+    accepted = age_accepted and spread_accepted
+    if not age_accepted:
+        reason = "stale_repeat" if is_repeat else "stale"
+    elif not spread_accepted:
+        reason = "wide_spread"
+    else:
+        reason = None
     _emit_arrival_quote_event(
         symbol, midpoint, bid, ask, spread_bps,
         quote_timestamp=qts, captured_at=received_at,
         age_seconds=age_seconds, accepted=accepted,
-        reason=None if accepted else ("stale_repeat" if is_repeat else "stale"),
+        reason=reason,
         repeat_of_previous=is_repeat, consecutive_repeats=repeats,
     )
     if not accepted:
-        # The quote is stale AND byte-identical to the one we saw last time.
-        # This proves only that NO NEWER QUOTE WAS RETURNED between our two
-        # requests — it does NOT prove the venue stopped publishing. On a
-        # sparse venue or a quiet symbol, an unchanged quote can be legitimate
-        # inactivity. Diagnosing an actual feed failure needs corroboration the
-        # telemetry does not have: market activity on the symbol over the same
-        # interval, or a cross-feed comparison. Named `stale_repeat`, not
-        # "frozen", for exactly that reason (PR #127 review P2).
-        repeat_note = (
-            f" [repeat — same quote returned {repeats}x in a row]" if is_repeat else ""
-        )
-        logger.warning(
-            f"{symbol}: arrival quote rejected as stale — age={age_seconds:.1f}s "
-            f"> {max_age_seconds:.0f}s (mid={midpoint:.4f}, spread={spread_bps:.1f}bps)"
-            f"{repeat_note}. Falling back to a non-execution-quality benchmark."
-        )
+        if not age_accepted:
+            # A stale repeated quote proves only that no newer quote was
+            # returned between requests, not that the venue stopped publishing.
+            repeat_note = (
+                f" [repeat — same quote returned {repeats}x in a row]"
+                if is_repeat else ""
+            )
+            logger.warning(
+                f"{symbol}: arrival quote rejected as stale — "
+                f"age={age_seconds:.1f}s > {max_age_seconds:.0f}s "
+                f"(mid={midpoint:.4f}, spread={spread_bps:.1f}bps)"
+                f"{repeat_note}. Falling back to a non-execution-quality "
+                "benchmark."
+            )
+        else:
+            logger.warning(
+                f"{symbol}: arrival quote rejected as too wide — "
+                f"spread={spread_bps:.1f}bps > {max_spread_bps:.1f}bps "
+                f"(age={age_seconds:.1f}s). Falling back to a "
+                "non-execution-quality benchmark; order submission is unaffected."
+            )
         return None
 
     return ArrivalQuote(

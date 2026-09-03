@@ -33,6 +33,7 @@ from reporting.alerts import (
     LogFileBackend,
 )
 from reporting.logger import (
+    ARRIVAL_MIDPOINT_CONTRACT_VERSION,
     ENTRY_BASIS_BROKER_FILL,
     ENTRY_BASIS_MIXED,
     ENTRY_BASIS_REFERENCE_FALLBACK,
@@ -2075,6 +2076,10 @@ class TestBuildRecordSlippageContract:
         )
         assert record.slippage_benchmark_kind == "arrival_midpoint"
         assert record.slippage_measurement_quality == "primary"
+        assert (
+            record.slippage_measurement_version
+            == ARRIVAL_MIDPOINT_CONTRACT_VERSION
+        )
         assert record.slippage_benchmark_price == pytest.approx(150.0)
         assert record.slippage_benchmark_timestamp is not None
         assert record.slippage_signed_bps is not None
@@ -2183,6 +2188,24 @@ class TestBuildRecordSlippageContract:
         )
         assert record.slippage_benchmark_kind == "arrival_midpoint"
         assert record.slippage_measurement_quality == "recovered"
+        assert record.slippage_measurement_version is None
+
+    def test_arrival_midpoint_fallback_quality_is_versioned(
+        self, sample_decision, sample_result
+    ):
+        """Future calibration-grade qualities must survive restart parity."""
+        tl = TradeLogger(path="/dev/null")
+        record = tl.build_record(
+            sample_decision,
+            sample_result,
+            modeled_price=150.0,
+            benchmark_kind="arrival_midpoint",
+            measurement_quality="fallback",
+        )
+        assert (
+            record.slippage_measurement_version
+            == ARRIVAL_MIDPOINT_CONTRACT_VERSION
+        )
 
     def test_legacy_columns_null_on_new_market_rows(
         self, sample_decision, sample_result
@@ -2255,6 +2278,10 @@ class TestBuildCloseRecordSlippageContract:
         )
         assert record.slippage_benchmark_kind == "arrival_midpoint"
         assert record.slippage_measurement_quality == "primary"
+        assert (
+            record.slippage_measurement_version
+            == ARRIVAL_MIDPOINT_CONTRACT_VERSION
+        )
         assert record.slippage_benchmark_price == pytest.approx(151.50)
         assert record.slippage_signed_bps is not None
 
@@ -4202,7 +4229,15 @@ class TestSlippageFamilies:
         )
 
     def test_arrival_midpoint_is_execution_quality(self):
-        assert is_execution_quality_measurement("arrival_midpoint", "primary")
+        assert is_execution_quality_measurement(
+            "arrival_midpoint", "primary", ARRIVAL_MIDPOINT_CONTRACT_VERSION
+        )
+
+    @pytest.mark.parametrize("version", [None, 1])
+    def test_pre_guard_arrival_midpoint_is_not_execution_quality(self, version):
+        assert not is_execution_quality_measurement(
+            "arrival_midpoint", "primary", version
+        )
 
     def test_stop_gap_is_not_execution_quality(self):
         assert not is_execution_quality_measurement("active_stop_price", "primary")
@@ -4211,7 +4246,9 @@ class TestSlippageFamilies:
     def test_reconstructed_qualities_rejected_even_for_good_kind(self, quality):
         """Both dimensions must hold. A reconstructed benchmark is not a
         live observation even when its kind is right."""
-        assert not is_execution_quality_measurement("arrival_midpoint", quality)
+        assert not is_execution_quality_measurement(
+            "arrival_midpoint", quality, ARRIVAL_MIDPOINT_CONTRACT_VERSION
+        )
 
     @pytest.mark.parametrize("kind", [None, "", "not_a_kind"])
     def test_unknown_kinds_fail_closed(self, kind):
@@ -4225,30 +4262,34 @@ class TestSlippageFamilies:
         """
         db = tmp_path / "t.db"
         conn = sqlite3.connect(db)
-        conn.execute(
-            "CREATE TABLE trades (kind TEXT, quality TEXT)"
-        )
+        conn.execute("CREATE TABLE trades (kind TEXT, quality TEXT, version INTEGER)")
         combos = [
-            (k, q)
+            (k, q, version)
             for k in list(SlippageBenchmarkKind.__args__) + ["not_a_kind"]
             for q in ["primary", "fallback", "recovered", "unavailable", "typo"]
+            for version in [None, 1, ARRIVAL_MIDPOINT_CONTRACT_VERSION]
         ]
-        conn.executemany("INSERT INTO trades VALUES (?, ?)", combos)
+        conn.executemany("INSERT INTO trades VALUES (?, ?, ?)", combos)
         conn.commit()
 
         fragment, params = execution_quality_sql()
         fragment = fragment.replace(
             "slippage_benchmark_kind", "kind"
-        ).replace("slippage_measurement_quality", "quality")
+        ).replace("slippage_measurement_quality", "quality").replace(
+            "slippage_measurement_version", "version"
+        )
         sql_rows = set(
             conn.execute(
-                f"SELECT kind, quality FROM trades WHERE {fragment}", params
+                f"SELECT kind, quality, version FROM trades WHERE {fragment}",
+                params,
             ).fetchall()
         )
         conn.close()
 
         python_rows = {
-            (k, q) for k, q in combos if is_execution_quality_measurement(k, q)
+            (k, q, version)
+            for k, q, version in combos
+            if is_execution_quality_measurement(k, q, version)
         }
         assert sql_rows == python_rows
 
@@ -4261,7 +4302,10 @@ class TestExecutionQualitySlippageSeedRead:
     """`read_recent_execution_quality_slippage` feeds the kill switch's
     startup rehydration. Its selection must match `_record_fill`'s."""
 
-    def _seed(self, tl, *, kind, quality, adverse, order_type="market", oid):
+    def _seed(
+        self, tl, *, kind, quality, adverse, order_type="market", oid,
+        measurement_version=ARRIVAL_MIDPOINT_CONTRACT_VERSION,
+    ):
         tl.log(
             TradeRecord(
                 position_type="single_leg",
@@ -4285,6 +4329,7 @@ class TestExecutionQualitySlippageSeedRead:
                 slippage_adverse_bps=adverse,
                 slippage_benchmark_kind=kind,
                 slippage_measurement_quality=quality,
+                slippage_measurement_version=measurement_version,
             )
         )
 
@@ -4301,6 +4346,24 @@ class TestExecutionQualitySlippageSeedRead:
         self._seed(tl, kind="arrival_midpoint", quality="primary",
                    adverse=3.0, order_type="limit", oid="a")
         assert tl.read_recent_execution_quality_slippage(50) == []
+
+    def test_excludes_pre_guard_arrival_midpoints(self, tmp_path):
+        """Old rows called themselves primary but lack the spread contract."""
+        tl = TradeLogger(path=str(tmp_path / "trades.db"))
+        self._seed(
+            tl, kind="arrival_midpoint", quality="primary", adverse=199.0,
+            measurement_version=None, oid="legacy",
+        )
+        assert tl.read_recent_execution_quality_slippage(50) == []
+
+    def test_old_combo_limit_measurements_are_not_discarded(self, tmp_path):
+        """The contamination was specific to the arrival-quote writer."""
+        tl = TradeLogger(path=str(tmp_path / "trades.db"))
+        self._seed(
+            tl, kind="combo_limit", quality="primary", adverse=4.0,
+            measurement_version=None, oid="combo",
+        )
+        assert tl.read_recent_execution_quality_slippage(50) == [4.0]
 
     def test_excludes_recovered_quality(self, tmp_path):
         tl = TradeLogger(path=str(tmp_path / "trades.db"))
@@ -4779,6 +4842,7 @@ class TestSlippageNeverPoolsAcrossInstruments:
             "slippage_adverse_bps": bps,
             "slippage_benchmark_kind": "arrival_midpoint",
             "slippage_measurement_quality": "primary",
+            "slippage_measurement_version": ARRIVAL_MIDPOINT_CONTRACT_VERSION,
             "order_id": oid,
         }
 
@@ -4817,6 +4881,11 @@ class TestSlippageNeverPoolsAcrossInstruments:
         must not read as perfect execution."""
         out = _slippage_by_instrument([self._row("AAPL", 2.0, "a")])
         assert "option" not in out
+
+    def test_pre_guard_arrival_row_is_not_aggregated(self):
+        row = self._row("AAPL", 199.0, "legacy")
+        row["slippage_measurement_version"] = None
+        assert _slippage_by_instrument([row]) == {}
 
     def test_unmeasured_rows_are_excluded_entirely(self):
         rows = [

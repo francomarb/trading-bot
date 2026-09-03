@@ -445,7 +445,7 @@ def _slippage_p95_bps(
     Row selection uses the shared `execution_quality_sql()` predicate so
     this query, the drift kill switch, the calibration script, the PnL
     reports, the dashboard and the reconcile gate cannot drift apart.
-    It gates on two dimensions:
+    It gates on three dimensions:
 
       - benchmark kind must be in the execution-quality family. A
         `fallback_latest_close` row measures how far price moved
@@ -457,6 +457,8 @@ def _slippage_p95_bps(
         distribution until it is explicitly opted in, and isolates the
         recovered/unavailable rows whose benchmarks were rebuilt after
         the fact (codepaths §5, §8, §9).
+      - arrival-midpoint rows must carry the current measurement-contract
+        version. Unversioned rows predate the quote freshness/spread guards.
     """
     predicate, predicate_params = execution_quality_sql()
     cursor = conn.execute(

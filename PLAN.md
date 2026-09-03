@@ -46,7 +46,7 @@ These are the items that must be green before any live flip.
 | Gate | Status | Action |
 |---|---|---|
 | Combined six-sleeve paper run | 🔄 In progress | RSI3 has 3 completed round trips; Leveraged Trend has 4 open entries and no exits. Continue until every sleeve has meaningful entry and exit evidence. |
-| Slippage calibration (`10.D1`) | ⏸ 0 qualifying post-PR #127 fills | Discard the contaminated pre-guard pool. Review after at least 10 post-guard execution-quality MARKET fills. |
+| Slippage calibration (`10.D1`) | ⏸ 0 qualifying fills | Discard all earlier arrival-midpoint rows, including the lone fresh-but-665-bps-wide post-PR #127 fill. Start a clean pool after the 10 bps spread guard is deployed; review after at least 10 execution-quality MARKET fills. |
 | Slippage drift enabled (`10.D2`) | ⬜ Blocked by calibration | Set `SLIPPAGE_DRIFT_ENABLED=True` only after calibration is sane. Pre-fix this would have halted the bot on ~the 10th market fill at 13× the threshold for reasons unrelated to execution quality. The sample pool now also survives restarts (`RiskManager.seed_slippage_samples`, seeded at engine start) — before, `_slippage_samples` reset to empty every restart and could rarely reach `SLIPPAGE_DRIFT_MIN_SAMPLES=10` in one process lifetime. |
 | Strategy Health threshold watch (`11.10h`) | ✅ Closed — no tuning | The watch produced no false alarms and no defensible threshold change. Continue routine scheduled reports. |
 | RSI3 simplification paper-watch (`11.23`) | 🔄 3 completed round trips | The reset is producing trades, but three outcomes are too few to judge expectancy or clustered dip-buying. |

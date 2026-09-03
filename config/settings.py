@@ -64,10 +64,9 @@ BACKTEST_DATA_FEED: str = os.getenv("BACKTEST_DATA_FEED", "sip").lower()
 # audit's finding. The other is that the IEX BBO was fresh but unrepresentative
 # — IEX is a single venue at ~2-3% of consolidated volume, and its book can be
 # wide or thin in the opening minutes. If the recorded ages come back small
-# while `spread_bps` comes back large, this guard is treating the wrong cause
-# and the fix is a spread-width guard or a SIP quote, not a shorter max age.
-# The instrumentation is what tells the two apart; do not assume this setting
-# solved it.
+# while `spread_bps` comes back large, the age guard is treating the wrong
+# cause. `ARRIVAL_QUOTE_MAX_SPREAD_BPS` below now handles that case; paid SIP
+# remains the higher-quality feed option.
 #
 # What Alpaca actually documents (checked 2026-08-28):
 #   - Latest endpoints are NOT freshness-filtered. Market Data FAQ: "the data
@@ -96,14 +95,27 @@ BACKTEST_DATA_FEED: str = os.getenv("BACKTEST_DATA_FEED", "sip").lower()
 # validates the existing `bid <= 0 or ask <= 0` guard, which rejects the
 # condition they name.
 #
-# BUT THE REMEDY IS NOT FREE. Real-time SIP requires the paid Algo Trader Plus
-# subscription; the free tier's SIP is delayed 15 minutes, which is useless as
-# an arrival price — a 15-minute-old consolidated quote is worse than a stale
-# IEX one. So if the captured ages come back small while `spread_bps` comes
-# back large, the decision is a COST decision (pay for real-time SIP) rather
-# than a threshold tweak. Do not present it as a free fix.
+# Real-time SIP requires the paid Algo Trader Plus subscription. Basic-tier
+# historical SIP may be queried with a delay, but the latest SIP endpoint
+# requires the subscription; it does not provide a free delayed quote.
 ARRIVAL_QUOTE_MAX_AGE_SECONDS: float = float(
     os.getenv("ARRIVAL_QUOTE_MAX_AGE_SECONDS", "30")
+)
+
+# Expected execution cost for MARKET orders in bps. Shared with the backtest
+# default and defined here so the quote-precision guard cannot silently drift
+# away from the model it protects.
+SLIPPAGE_MODEL_MARKET_BPS = 5.0
+
+# By default, half-spread uncertainty may be no larger than the full MARKET
+# model (`max spread = 2 * modeled bps`). Wider quotes remain observable but
+# cannot certify an arrival midpoint; rejecting the measurement does not block
+# the order. The environment override supports a deliberately separate cap.
+ARRIVAL_QUOTE_MAX_SPREAD_BPS: float = float(
+    os.getenv(
+        "ARRIVAL_QUOTE_MAX_SPREAD_BPS",
+        str(2.0 * SLIPPAGE_MODEL_MARKET_BPS),
+    )
 )
 
 # Derived base URL — used only by legacy verify scripts; alpaca-py uses the
@@ -1161,10 +1173,6 @@ SLIPPAGE_DRIFT_MULTIPLIER = 3.0      # Halt if mean realized slippage > k * mean
 # Enable once you have enough paper fills to validate the threshold (≥ min_samples).
 # Must be True before going live (Phase 10).
 SLIPPAGE_DRIFT_ENABLED = False
-# Expected execution cost for MARKET orders in bps. Matches the backtest default
-# (runner.py slippage_bps=5). LIMIT orders model 0 bps (price is controlled).
-SLIPPAGE_MODEL_MARKET_BPS = 5.0
-
 # ── Live-trading safety overrides (Phase 10.G) ──────────────────────────────
 # Scale calculated position sizes to this fraction when LIVE_TRADING=True.
 # Default 0.25 = start live at 25% of the paper-tested size.
