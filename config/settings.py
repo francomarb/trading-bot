@@ -19,9 +19,14 @@ ALPACA_PAPER: bool = not LIVE_TRADING
 
 # Data feed selection (Phase 10)
 #
-# Live engine on a paper account uses 'iex' (free, real-time). The paid
-# Algo Trader Plus subscription ($99/mo) is required for real-time SIP, used
-# only when the engine goes live with real money.
+# Main live stock-feed switch for engine bars and arrival quotes. Paper uses
+# 'iex' (free, real-time). Do not select 'sip' until a real-time SIP
+# subscription is active and verified: Basic accounts may query delayed SIP
+# history, but SIP latest endpoints require the paid subscription.
+#
+# Deliberate exceptions are not competing live-feed switches: offline research
+# uses BACKTEST_DATA_FEED, leveraged_trend uses completed delayed-SIP daily bars,
+# and option quotes use Alpaca's OPRA option-data path.
 ALPACA_DATA_FEED: str = os.getenv("ALPACA_DATA_FEED", "iex").lower()
 
 # Offline / backtest data feed. Basic Alpaca accounts can query SIP
@@ -41,7 +46,7 @@ ALPACA_DATA_FEED: str = os.getenv("ALPACA_DATA_FEED", "iex").lower()
 BACKTEST_DATA_FEED: str = os.getenv("BACKTEST_DATA_FEED", "sip").lower()
 
 # ── Arrival-quote staleness guard (10.D1) ───────────────────────────────────
-# Maximum age of the IEX quote used as the arrival-price benchmark for
+# Maximum age of the configured live stock quote used as the arrival benchmark.
 # execution-quality slippage. Older quotes are rejected, which routes the row
 # to `fallback_latest_close` / quality='fallback' instead of fabricating an
 # `arrival_midpoint` / 'primary' reading.

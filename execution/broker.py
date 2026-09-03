@@ -942,14 +942,13 @@ class AlpacaBroker:
     # ── Read-side: account, positions, orders ────────────────────────────
 
     def get_latest_quote_midpoint(self, symbol: str) -> float | None:
-        """Return the IEX BBO midpoint (arrival price) for `symbol` at submission time.
+        """Return the configured stock-feed midpoint at submission time.
 
-        NOT the NBBO. This docstring said "NBBO" until 2026-08-28; the request
-        hardcodes `feed=DataFeed.IEX`, which is one venue at roughly 2-3% of
-        consolidated volume. The distinction matters for `10.D1`: an IEX
-        midpoint can be unrepresentative of the consolidated market even when
-        it is perfectly fresh, which is one of the two live hypotheses for the
-        2026-08-27 slippage audit.
+        The request follows ``ALPACA_DATA_FEED``. With the current ``iex``
+        paper configuration this is IEX BBO, not consolidated NBBO; a future
+        paid ``sip`` setting switches both live stock bars and this quote path.
+        The distinction matters for `10.D1`: an IEX midpoint can be
+        unrepresentative of the consolidated market even when perfectly fresh.
 
         Thin convenience wrapper around `data.fetcher.fetch_latest_quote_midpoint`
         so the engine's entry-flow code reads as `broker.get_latest_quote_midpoint(...)`.

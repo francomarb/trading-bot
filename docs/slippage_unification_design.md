@@ -344,11 +344,19 @@ measurement, and the existing fallback already expresses that.
 **Provenance** is emitted as an `arrival_quote` event on **every** capture and
 **every** rejection, carrying `quote_timestamp`, `age_seconds`, `bid`, `ask`,
 `spread_bps`, `accepted`, `reject_reason`, `repeat_of_previous` and
-`consecutive_repeats`.
+`consecutive_repeats`. The event's `feed` is the normalized value actually
+used by the stock quote request.
 
-`reject_reason` is one of: `api_error`, `no_quote`, `malformed_prices`,
+`reject_reason` is one of: `invalid_feed`, `api_error`, `no_quote`, `malformed_prices`,
 `non_finite`, `zero_side`, `crossed`, `no_quote_timestamp`,
 `bad_quote_timestamp`, `stale`, `stale_repeat`, `wide_spread`.
+
+`ALPACA_DATA_FEED` is the main live stock-feed switch: it controls both engine
+bars and stock arrival quotes. It remains `iex` on the Basic paper setup.
+Changing it to `sip` is only valid after real-time SIP entitlement is active
+and verified. Offline research (`BACKTEST_DATA_FEED`), leveraged trend's
+completed delayed-SIP daily bars, and OPRA option quotes are deliberate
+exceptions rather than competing arrival-quote settings.
 
 The default ceiling follows the calibration model: half of the maximum spread
 equals the full MARKET-order allowance. A wider IEX midpoint is too imprecise
@@ -467,11 +475,12 @@ If captured ages come back small while `spread_bps` comes back large, the
 guard is treating the wrong cause — and the answer is **not** a shorter max
 age. It is a spread-width guard, or SIP quotes.
 
-**SIP is a paid dependency.** Real-time SIP requires the Algo Trader Plus
-subscription; the free tier's SIP is delayed 15 minutes, which is useless as
-an arrival price — a 15-minute-old consolidated quote is a worse benchmark
-than a stale IEX one. So that branch is a **cost decision**, not a code
-change, and should be presented to the operator as such.
+**Real-time SIP is a paid dependency.** The Basic tier permits historical SIP
+queries only when their end time is at least 15 minutes old; the latest SIP
+endpoint does not turn into a delayed quote and instead rejects an
+unentitled request. Therefore `ALPACA_DATA_FEED` must remain `iex` until the
+subscription is active. Moving the main switch to `sip` is a cost and
+operational-readiness decision, not part of this code fix.
 - `slippage_measurement_quality`
   - `primary`
   - `fallback`

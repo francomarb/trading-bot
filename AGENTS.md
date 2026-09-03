@@ -216,8 +216,10 @@ python scripts/legacy_verify/phase9_verify.py
   - **SIP subscription tiers**: real-time SIP requires the paid Algo Trader Plus
     subscription (~$99/mo). **Delayed SIP** (bars ≥15 minutes old) is available on
     the basic, no-cost tier — perfect for any offline work.
-  - **Live engine, paper account**: `feed="iex"` (free real-time bars on basic
-    tier). Default in `ALPACA_DATA_FEED` env var.
+  - **Live engine, paper account**: `feed="iex"` (free real-time stock bars and
+    arrival quotes on basic tier). This is the default main stock-feed switch
+    in `ALPACA_DATA_FEED`; do not select `sip` until real-time SIP entitlement
+    is active and verified.
   - **Live engine, live account**: `feed="sip"` real-time (needs the paid
     subscription).
   - **Research / backtests / audits / calibration**: `feed="sip"` (delayed,
