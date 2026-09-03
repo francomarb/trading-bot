@@ -155,14 +155,13 @@ Current behavior:
 
 - combo slippage is measured against the submitted combo limit on the economic
   short leg.
-- the paired long-leg row carries `0.0`.
+- the paired long-leg row carries NULL for its unavailable individual fill,
+  reference, and slippage values.
 
 Implication:
 
-- the strategy-level logic can mostly reconstruct the intended value,
-- but row-level recent-trades display is noisy because two rows represent one
-  combo event and one of them is a structural zero rather than "not
-  applicable."
+- strategy-level economics remain on the short-leg row, while row-level
+  consumers can distinguish "not applicable" from a real zero measurement.
 
 ### 7. Dashboard and reporting consumers
 

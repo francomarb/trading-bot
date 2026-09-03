@@ -1002,6 +1002,31 @@ class TestTradeLogger:
         assert "position_id" in cols
         assert "position_type" in cols
 
+    def test_zero_price_sentinels_are_normalized_without_backfill(self, tmp_csv):
+        tl = TradeLogger(path=tmp_csv)
+        conn = tl._ensure_db()
+        conn.executemany(
+            "INSERT INTO trades (timestamp, symbol, side, qty, strategy, reason, "
+            "status, position_type, avg_fill_price, entry_reference_price) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            [
+                ("2026-08-01T00:00:00Z", "NOW", "buy", 1, "donchian_breakout", "entry", "filled", "single_leg", 124.03, 0.0),
+                ("2026-08-02T00:00:00Z", "SPYPUTLONG", "buy", 1, "credit_spread", "entry", "filled", "spread", 0.0, 0.0),
+                ("2026-08-03T00:00:00Z", "AAPL", "buy", 1, "sma_crossover", "entry", "filled", "single_leg", 200.0, 199.5),
+            ],
+        )
+        conn.commit()
+        tl.close()
+
+        rows = TradeLogger(path=tmp_csv).read_all()
+        by_symbol = {row["symbol"]: row for row in rows}
+        assert by_symbol["NOW"]["entry_reference_price"] is None
+        assert by_symbol["NOW"]["avg_fill_price"] == pytest.approx(124.03)
+        assert by_symbol["SPYPUTLONG"]["entry_reference_price"] is None
+        assert by_symbol["SPYPUTLONG"]["avg_fill_price"] is None
+        assert by_symbol["AAPL"]["entry_reference_price"] == pytest.approx(199.5)
+        assert by_symbol["AAPL"]["avg_fill_price"] == pytest.approx(200.0)
+
     def test_position_id_backfill_populates_existing_rows(self, tmp_csv):
         """Pre-11.27 rows are backfilled to position_id = owner_key_for(symbol):
         equities keep symbol, OCC options collapse to the underlying."""
@@ -1134,11 +1159,13 @@ class TestSpreadLogging:
         assert all(r["position_id"] == "uuid-1" for r in rows)
         assert all(r["position_type"] == "spread" for r in rows)
         by_symbol = {r["symbol"]: r for r in rows}
-        # Short leg sold to open, carries the net credit; long leg bought, 0.0.
+        # Short leg sold to open and carries the net credit. Alpaca's combo
+        # result has no individual long-leg price, so that value is NULL.
         assert by_symbol[self._SHORT]["side"] == "sell"
         assert by_symbol[self._SHORT]["avg_fill_price"] == pytest.approx(2.54)
         assert by_symbol[self._LONG]["side"] == "buy"
-        assert by_symbol[self._LONG]["avg_fill_price"] == pytest.approx(0.0)
+        assert by_symbol[self._LONG]["avg_fill_price"] is None
+        assert by_symbol[self._LONG]["entry_reference_price"] is None
 
     def test_close_reverses_leg_sides(self, tmp_csv):
         tl = TradeLogger(path=tmp_csv)
@@ -1956,6 +1983,7 @@ class TestSlippageUnificationSchema:
                 symbol TEXT NOT NULL,
                 side TEXT NOT NULL,
                 qty REAL NOT NULL,
+                avg_fill_price REAL,
                 strategy TEXT NOT NULL,
                 reason TEXT NOT NULL,
                 status TEXT NOT NULL,

@@ -3193,11 +3193,20 @@ class TradingEngine:
                             or getattr(pos_row, "protection_model", None)
                             or ProtectionModel.BROKER_STOP.value
                         )
+                        stored_entry_reference = getattr(
+                            order_row, "entry_reference_price", None
+                        )
+                        recovered_entry_reference = (
+                            float(stored_entry_reference)
+                            if stored_entry_reference is not None
+                            and float(stored_entry_reference) > 0
+                            else float(event.avg_fill_price)
+                        )
                         recovered_decision = RiskDecision(
                             symbol=symbol,
                             side=Side.BUY,
                             qty=float(order_row.intended_qty),
-                            entry_reference_price=float(event.avg_fill_price),
+                            entry_reference_price=recovered_entry_reference,
                             stop_price=(
                                 float(order_row.intended_stop_price)
                                 if order_row.intended_stop_price is not None
@@ -3727,10 +3736,10 @@ class TradingEngine:
                 #
                 # The offset comes from the stashed ATR, NOT from the
                 # decision's own `reference − stop` distance. On this path
-                # the substrate reconstructs the decision with
-                # `entry_reference_price = avg_fill_price`, so that
-                # distance collapses to `fill − stop` and re-anchoring
-                # against it is a no-op — see the warning on
+                # legacy substrate rows may reconstruct the decision with
+                # `entry_reference_price = avg_fill_price` when the original
+                # reference was not persisted, so that distance collapses to
+                # `fill − stop` and re-anchoring against it is a no-op — see the warning on
                 # `RiskDecision.stop_for_fill`. k×ATR is the actual design
                 # intent and the only thing that reproduces the backtest,
                 # which models the stop as `entry_price − k×ATR`.
@@ -3880,7 +3889,7 @@ class TradingEngine:
         self,
         result: OrderResult,
         *,
-        modeled_price: float,
+        modeled_price: float | None,
         benchmark_kind: str | None,
         measurement_quality: str | None,
         order_type: str = "market",
@@ -3940,7 +3949,11 @@ class TradingEngine:
                 "execution-quality measurement"
             )
             return
-        if result.avg_fill_price is None or modeled_price <= 0:
+        if (
+            result.avg_fill_price is None
+            or modeled_price is None
+            or modeled_price <= 0
+        ):
             return
         modeled_bps = SLIPPAGE_MODEL_MARKET_BPS
         signed_bps = single_leg_realized_slippage_bps(
@@ -3957,7 +3970,7 @@ class TradingEngine:
         self,
         decision: RiskDecision,
         result: OrderResult,
-        modeled_price: float,
+        modeled_price: float | None,
         *,
         record_slippage: bool = True,
         timestamp_override: datetime | None = None,
@@ -4013,7 +4026,7 @@ class TradingEngine:
     def _log_close(
         self,
         result: OrderResult,
-        modeled_price: float,
+        modeled_price: float | None,
         strategy_name: str = "",
         *,
         benchmark_kind: str | None = None,
@@ -4095,7 +4108,7 @@ class TradingEngine:
         symbol: str,
         owner: str,
         exit_fill,
-        modeled_price: float = 0.0,
+        modeled_price: float | None = None,
         benchmark_kind: str = "unavailable",
         alert_reason: str = "broker-history exit recovery",
         is_full_close: bool | None = None,
@@ -5973,7 +5986,7 @@ class TradingEngine:
 
         close_record = self._log_close(
             result,
-            0.0,
+            None,
             lifecycle_row.strategy,
             benchmark_kind="unavailable",
             measurement_quality="unavailable",
@@ -6695,7 +6708,7 @@ class TradingEngine:
             lifecycle_quantity_status = "not_attempted"
             close_record = self._log_close(
                 result,
-                0.0,
+                None,
                 lifecycle_row.strategy,
                 benchmark_kind="unavailable",
                 measurement_quality="unavailable",

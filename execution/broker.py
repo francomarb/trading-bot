@@ -673,6 +673,7 @@ class AlpacaBroker:
                 slippage_benchmark_kind=slippage_benchmark_kind,
                 slippage_benchmark_timestamp=slippage_benchmark_timestamp,
                 slippage_measurement_quality=slippage_measurement_quality,
+                entry_reference_price=float(decision.entry_reference_price),
             )
         except Exception as exc:
             # Roll back the position-level pending row so the owner-key

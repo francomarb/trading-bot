@@ -124,6 +124,11 @@ CREATE TABLE IF NOT EXISTS position_lifecycle_orders (
     last_observed_broker_updated_at TEXT,
     last_observed_at              TEXT    NOT NULL,
 
+    -- Decision-time entry context. Distinct from the slippage benchmark:
+    -- passive LIMIT / STOP_LIMIT entries have no arrival benchmark but still
+    -- have a genuine strategy reference price.
+    entry_reference_price         REAL,
+
     FOREIGN KEY(position_uid) REFERENCES position_lifecycle(position_uid),
     CHECK (
         role NOT IN ('entry_primary', 'entry_residual')
@@ -709,6 +714,7 @@ class PositionLifecycleOrderRow:
 
     last_observed_broker_updated_at: str | None
     last_observed_at: str
+    entry_reference_price: float | None
 
 
 _SELECT_LIFECYCLE_ORDER_COLUMNS = (
@@ -726,7 +732,8 @@ _SELECT_LIFECYCLE_ORDER_COLUMNS = (
     "slippage_benchmark_timestamp, slippage_measurement_quality, "
     "status, filled_qty, avg_fill_price, "
     "created_at, submitted_at, terminal_at, "
-    "last_observed_broker_updated_at, last_observed_at "
+    "last_observed_broker_updated_at, last_observed_at, "
+    "entry_reference_price "
     "FROM position_lifecycle_orders"
 )
 
@@ -774,6 +781,7 @@ def _row_from_tuple(row: tuple) -> PositionLifecycleOrderRow:
         terminal_at=row[38],
         last_observed_broker_updated_at=row[39],
         last_observed_at=row[40],
+        entry_reference_price=row[41],
     )
 
 
@@ -843,6 +851,7 @@ class PositionLifecycleOrdersStore:
         slippage_benchmark_kind: str | None = None,
         slippage_benchmark_timestamp: str | None = None,
         slippage_measurement_quality: str | None = None,
+        entry_reference_price: float | None = None,
     ) -> int:
         """Insert a per-order row at ``status='pending'`` BEFORE the
         broker submit goes out. Returns the autoincrement id.
@@ -902,7 +911,8 @@ class PositionLifecycleOrdersStore:
                 slippage_benchmark_timestamp, slippage_measurement_quality,
                 status, filled_qty, avg_fill_price,
                 created_at, submitted_at, terminal_at,
-                last_observed_broker_updated_at, last_observed_at
+                last_observed_broker_updated_at, last_observed_at,
+                entry_reference_price
             ) VALUES (
                 ?, ?,
                 NULL, ?,
@@ -915,7 +925,7 @@ class PositionLifecycleOrdersStore:
                 ?, ?, ?, ?,
                 'pending', 0.0, NULL,
                 ?, NULL, NULL,
-                NULL, ?
+                NULL, ?, ?
             )
             """,
             (
@@ -940,7 +950,7 @@ class PositionLifecycleOrdersStore:
                 origin_kind, operator_command_uid,
                 slippage_benchmark_price, slippage_benchmark_kind,
                 slippage_benchmark_timestamp, slippage_measurement_quality,
-                now, now,
+                now, now, entry_reference_price,
             ),
         )
         self._conn.commit()
@@ -1397,7 +1407,8 @@ class PositionLifecycleOrdersStore:
                    plo.slippage_measurement_quality,
                    plo.status, plo.filled_qty, plo.avg_fill_price,
                    plo.created_at, plo.submitted_at, plo.terminal_at,
-                   plo.last_observed_broker_updated_at, plo.last_observed_at
+                   plo.last_observed_broker_updated_at, plo.last_observed_at,
+                   plo.entry_reference_price
             FROM position_lifecycle_orders plo
             JOIN position_lifecycle pl ON pl.position_uid = plo.position_uid
             WHERE pl.position_type = 'spread'
@@ -1500,7 +1511,8 @@ class PositionLifecycleOrdersStore:
             "plo.slippage_measurement_quality, "
             "plo.status, plo.filled_qty, plo.avg_fill_price, "
             "plo.created_at, plo.submitted_at, plo.terminal_at, "
-            "plo.last_observed_broker_updated_at, plo.last_observed_at "
+            "plo.last_observed_broker_updated_at, plo.last_observed_at, "
+            "plo.entry_reference_price "
             "FROM position_lifecycle_orders plo "
             "JOIN position_lifecycle pl "
             "  ON pl.position_uid = plo.position_uid "
@@ -1725,7 +1737,7 @@ INSERT INTO trades (
     execution_id
 ) VALUES (
     :now, :symbol, :side, :filled_qty, :avg_fill_price, :order_id,
-    :strategy, :reason, 0.0, COALESCE(:slippage_benchmark_price, 0.0),
+    :strategy, :reason, 0.0, :entry_reference_price,
     NULL, NULL,
     :order_type, :order_status, :intended_qty, :filled_qty,
     :risk_budget_dollars, :approved_risk_dollars, :risk_clip_kind,
@@ -1987,7 +1999,8 @@ def apply_order_event(
                plo.risk_clip_kind, plo.applied_size_multiplier,
                plo.slippage_benchmark_price, plo.slippage_benchmark_kind,
                plo.slippage_benchmark_timestamp, plo.slippage_measurement_quality,
-               pl.symbol, pl.strategy, pl.owner_key, pl.position_type
+               pl.symbol, pl.strategy, pl.owner_key, pl.position_type,
+               plo.entry_reference_price
         FROM position_lifecycle_orders plo
         JOIN position_lifecycle pl
           ON pl.position_uid = plo.position_uid
@@ -2006,7 +2019,7 @@ def apply_order_event(
         risk_budget_dollars, approved_risk_dollars, risk_clip_kind,
         applied_size_multiplier,
         slip_price, slip_kind, slip_ts, slip_quality,
-        symbol, strategy, owner_key, position_type,
+        symbol, strategy, owner_key, position_type, entry_reference_price,
     ) = pre_row
 
     now = _utc_now_iso()
@@ -2095,6 +2108,7 @@ def apply_order_event(
                         "slippage_benchmark_timestamp": slip_ts,
                         "slippage_measurement_quality": slip_quality,
                         "execution_id": event.execution_id,
+                        "entry_reference_price": entry_reference_price,
                     },
                 )
 

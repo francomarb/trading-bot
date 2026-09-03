@@ -119,6 +119,7 @@ def _insert_entry(
     side: str = "buy",
     role: str = "entry_primary",
     benchmark: bool = True,
+    entry_reference_price: float | None = None,
 ) -> int:
     return orders_store.insert_pending(
         position_uid=position_uid,
@@ -133,6 +134,7 @@ def _insert_entry(
         slippage_benchmark_kind="arrival_midpoint" if benchmark else None,
         slippage_benchmark_timestamp="2026-06-12T10:00:00+00:00" if benchmark else None,
         slippage_measurement_quality="primary" if benchmark else None,
+        entry_reference_price=entry_reference_price,
     )
 
 
@@ -217,6 +219,68 @@ def _get_order(conn: sqlite3.Connection, order_id: str) -> tuple:
 
 
 class TestApplyOrderEventBasic:
+    def test_passive_entry_preserves_decision_reference_without_benchmark(
+        self,
+        conn: sqlite3.Connection,
+        pos_store: PositionLifecycleStore,
+        orders_store: PositionLifecycleOrdersStore,
+    ):
+        uid = _seed_position(pos_store, strategy="donchian_breakout")
+        _insert_entry(
+            orders_store,
+            uid,
+            benchmark=False,
+            entry_reference_price=149.75,
+        )
+        order_id = _attach_and_get_order_id(orders_store, "cli-entry")
+
+        apply_order_event(
+            conn,
+            OrderEvent(
+                order_id=order_id,
+                status="filled",
+                filled_qty=10.0,
+                avg_fill_price=150.25,
+                broker_updated_at="2026-06-12T10:01:00+00:00",
+            ),
+        )
+
+        row = conn.execute(
+            "SELECT entry_reference_price, slippage_benchmark_price "
+            "FROM trades WHERE order_id = ?",
+            (order_id,),
+        ).fetchone()
+        assert row is not None
+        assert row[0] == pytest.approx(149.75)
+        assert row[1] is None
+
+    def test_exit_without_reference_writes_null_not_zero(
+        self,
+        conn: sqlite3.Connection,
+        pos_store: PositionLifecycleStore,
+        orders_store: PositionLifecycleOrdersStore,
+    ):
+        uid = _seed_position(pos_store)
+        _insert_exit(orders_store, uid)
+        order_id = _attach_and_get_order_id(orders_store, "cli-exit")
+
+        apply_order_event(
+            conn,
+            OrderEvent(
+                order_id=order_id,
+                status="filled",
+                filled_qty=10.0,
+                avg_fill_price=151.0,
+                broker_updated_at="2026-06-12T10:01:00+00:00",
+            ),
+        )
+
+        row = conn.execute(
+            "SELECT entry_reference_price FROM trades WHERE order_id = ?",
+            (order_id,),
+        ).fetchone()
+        assert row == (None,)
+
     def test_unknown_order_id_returns_outcome(
         self, conn: sqlite3.Connection
     ):
@@ -3165,6 +3229,7 @@ class TestEntryDispatchSlippageCompleteness:
             slippage_benchmark_kind="limit_price",
             slippage_benchmark_timestamp=None,
             slippage_measurement_quality="unavailable",
+            entry_reference_price=251.25,
         )
         orders_store.attach_broker_order_id(
             client_order_id="cli-entry-limit-1",
@@ -3204,11 +3269,16 @@ class TestEntryDispatchSlippageCompleteness:
         row = tl._ensure_db().execute(
             "SELECT order_type, slippage_benchmark_price, "
             "slippage_benchmark_kind, slippage_measurement_quality, "
-            "slippage_signed_bps, slippage_adverse_bps FROM trades "
+            "slippage_signed_bps, slippage_adverse_bps, "
+            "entry_reference_price FROM trades "
             "WHERE order_id='alpaca-entry-limit-1'"
         ).fetchone()
         assert row == ("limit", None, "limit_price", "unavailable",
-                       None, None)
+                       None, None, 251.25)
+        recovered_decision = (
+            engine._ensure_recovered_protective_stop.call_args.kwargs["decision"]
+        )
+        assert recovered_decision.entry_reference_price == pytest.approx(251.25)
 
     def test_partial_entry_fill_dispatches_and_binds_ownership(
         self, tmp_path,

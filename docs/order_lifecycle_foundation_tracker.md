@@ -28,6 +28,11 @@ Two phases on `feat/order-lifecycle-foundation-impl`:
   - **B. PR #60 review-fix series** (commits 7-22): six rounds of
     ChatGPT review against (A), each landed as 2–3 focused fix
     commits. End-state ahead of the consumer-wiring phase.
+  - **11.58(b) data correction:** single-leg entry rows now carry the
+    strategy's decision-time `entry_reference_price` in the durable order
+    intent. This remains separate from the execution benchmark, which is
+    legitimately NULL for passive LIMIT and STOP_LIMIT entries. Unknown
+    prices are stored as NULL, never numeric zero.
 
 | Git # | Phase | Commit | Doc anchor | Tests | Status |
 |---|---|---|---|---|---|

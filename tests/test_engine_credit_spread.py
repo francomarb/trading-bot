@@ -467,7 +467,8 @@ class TestDrainSpreadFills:
 
         close_rows = [
             r for r in engine.trade_logger.read_all()
-            if r["reason"] == "spread exit" and r["avg_fill_price"] > 0
+            if r["reason"] == "spread exit"
+            and (r["avg_fill_price"] or 0) > 0
         ]
         assert len(close_rows) == 1
         assert close_rows[0]["entry_reference_price"] == pytest.approx(0.60)
