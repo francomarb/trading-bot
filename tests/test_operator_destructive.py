@@ -945,6 +945,12 @@ class TestDurableReduceAccounting:
             ("reduce-filled-aggregate-failed",),
         ).fetchone()
         assert tuple(trade) == (12.0, "partial")
+        engine._allocator.record_realized_pnl.assert_called_once_with(
+            "sma_crossover",
+            pytest.approx(12.0),
+            position_uid=position_uid,
+            is_full_close=False,
+        )
 
 
 class TestDurableFullCloseAccounting:
