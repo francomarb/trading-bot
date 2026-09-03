@@ -1,6 +1,6 @@
 # Operator Controls & Unique Position Identity — v1 Proposal
 
-**Status:** Shipped and paper-validated — Phase A (PR #33 + #41), Phase B (PR #65), Phase C (PR #66, merged 2026-06-16). The 2026-09-02 drills passed pause/resume, cancel, full close, exact-share equity reduction, exact-contract single-leg option reduction, residual protection, durable accounting, and restart recovery. Genuine unexpected-protection latch clearing is unit-tested and awaits a naturally occurring latch. The §17 amendment dissolved the original Phase A "deferred items" table in full.
+**Status:** Shipped and paper-validated — Phase A (PR #33 + #41), Phase B (PR #65), Phase C (PR #66, merged 2026-06-16). The 2026-09-02 drills passed pause/resume, cancel, full close, exact-share equity reduction, exact-contract single-leg option reduction, residual protection, durable accounting, and restart recovery. Degraded-accounting parity now also prevents a reduction from updating the live allocator when its durable realized P&L is unavailable. Genuine unexpected-protection latch clearing is unit-tested and awaits a naturally occurring latch. The §17 amendment dissolved the original Phase A "deferred items" table in full.
 **Author intent:** Written for Codex, Claude, Gemini, and the human operator to audit before implementation.  
 **Primary goal:** Give the operator safe, precise, auditable control over live bot risk without turning the bot into a manual trading terminal.
 
@@ -658,8 +658,9 @@ partial-close trade, left the lifecycle at the broker residual, and restored
 one exact-quantity GTC stop. Recycles restored each realized amount once and
 reconciled the option trailing-state pointer to the replacement stop with
 NORMAL startup. Entry pause also survived restart and was lifted after the
-drills. Two non-blocking hardening items remain in `PLAN.md`: degraded-basis
-allocator parity for reductions and more expiry margin for long engine cycles.
+drills. The degraded-basis allocator follow-up is complete: reductions now
+update live allocation state only from durable realized P&L, matching full
+closes. More expiry margin for long engine cycles remains in `PLAN.md`.
 
 ### Phase C invariant: allocator and PnL reintegration
 

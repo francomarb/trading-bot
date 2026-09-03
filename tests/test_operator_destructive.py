@@ -864,7 +864,46 @@ class TestDurableReduceAccounting:
         assert command.result["lifecycle_quantity_status"] == "persisted"
         assert "Durable trade accounting is missing" in command.result["note"]
         assert "DO NOT retry" in command.result["note"]
-        engine._record_realized_pnl.assert_called_once()
+        engine._record_realized_pnl.assert_not_called()
+
+    def test_missing_durable_pnl_does_not_fall_back_to_runtime_estimate(
+        self, tmp_path,
+    ):
+        engine, queue = _build_engine(tmp_path, broker_qty=10.0)
+        position_uid = _seed_open_lifecycle(engine)
+        engine.broker.close_position.return_value = OrderResult(
+            status=OrderStatus.FILLED,
+            order_id="reduce-filled-pnl-missing",
+            symbol="AAPL",
+            requested_qty=2.0,
+            filled_qty=2.0,
+            avg_fill_price=101.0,
+            raw_status="filled",
+        )
+        engine._log_close = MagicMock(
+            return_value=SimpleNamespace(realized_pnl=None)
+        )
+        engine._record_realized_pnl = MagicMock()
+
+        command_uid = new_command_uid()
+        queue.insert(
+            command_uid=command_uid,
+            action="reduce-position",
+            reason="trim exposure",
+            target_position_uid=position_uid,
+            params={"qty": 2},
+        )
+        engine._process_operator_commands()
+
+        command = queue.get_by_command_uid(command_uid)
+        assert command.status == "failed"
+        assert command.result["broker_fill_occurred"] is True
+        assert command.result["durable_trade_status"] == "incomplete"
+        assert command.result["lifecycle_aggregate_status"] == "persisted"
+        assert command.result["lifecycle_quantity_status"] == "persisted"
+        assert "lacks realized P&L" in command.result["note"]
+        assert "DO NOT retry" in command.result["note"]
+        engine._record_realized_pnl.assert_not_called()
 
     def test_aggregate_refresh_failure_preserves_durable_trade_distinction(
         self, tmp_path,
