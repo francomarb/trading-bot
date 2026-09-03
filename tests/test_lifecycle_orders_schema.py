@@ -215,6 +215,7 @@ class TestPositionLifecycleOrdersSchema:
         "terminal_at",
         "last_observed_broker_updated_at",
         "last_observed_at",
+        "entry_reference_price",
     }
 
     EXPECTED_INDEXES = {

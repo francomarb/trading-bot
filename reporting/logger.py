@@ -531,6 +531,11 @@ CREATE TABLE IF NOT EXISTS trades (
 """
 
 _MIGRATION_COLUMNS = {
+    # PLAN 11.58(b): legacy/minimal schemas may predate these original
+    # price fields. They are nullable because an unavailable price is NULL,
+    # never a numeric zero sentinel.
+    "avg_fill_price": "REAL",
+    "entry_reference_price": "REAL",
     # PLAN 11.54 — dollars the strategy INTENDED to risk on this trade
     # (`equity x risk_per_trade_pct` at sizing time). Nullable; rows
     # predating 2026-08-03 are NULL and must stay that way. Do NOT
@@ -660,7 +665,7 @@ class TradeRecord:
     strategy: str
     reason: str
     stop_price: float
-    entry_reference_price: float
+    entry_reference_price: float | None
     modeled_slippage_bps: float | None
     realized_slippage_bps: float | None
     order_type: str
@@ -876,6 +881,7 @@ class TradeLogger:
                 ).fetchall()
             }
             for column, definition in {
+                "entry_reference_price": "REAL",
                 "sizing_model": "TEXT",
                 "protection_model": "TEXT",
                 "approved_notional_dollars": "REAL",
@@ -944,6 +950,21 @@ class TradeLogger:
             # conflicts here; any IntegrityError signals a bug in
             # detect_trades_order_id_duplicates and must raise loudly.
             conn.execute(_BACKFILL_SQL)
+            # PLAN 11.58(b): zero is never a valid price. Older writers used
+            # it for "unknown", which survives IS NOT NULL checks and looks
+            # like real data. Normalize only the sentinel to NULL; do not
+            # infer or backfill any price.
+            conn.execute(
+                "UPDATE trades SET entry_reference_price = NULL "
+                "WHERE entry_reference_price = 0.0"
+            )
+            # MLEG combo fills expose net economics, not individual long-leg
+            # fills. Their historical zero fill is the same missing-value
+            # sentinel and is safe to normalize within spread rows only.
+            conn.execute(
+                "UPDATE trades SET avg_fill_price = NULL "
+                "WHERE position_type = 'spread' AND avg_fill_price = 0.0"
+            )
             conn.execute(_POSITION_ID_INDEX_SQL)
             conn.execute(_POSITION_UID_INDEX_SQL)
             # 11.10c: signal-lifecycle counter table for the Strategy Health
@@ -1249,7 +1270,7 @@ class TradeLogger:
         result,    # OrderResult from close_position
         *,
         strategy_name: str,
-        modeled_price: float,
+        modeled_price: float | None,
         benchmark_kind: SlippageBenchmarkKind | None = None,
         measurement_quality: SlippageMeasurementQuality | None = None,
         timestamp_override: datetime | None = None,
@@ -1367,7 +1388,11 @@ class TradeLogger:
         new_signed_bps: float | None = None
         new_adverse_bps: float | None = None
 
-        if new_benchmark_kind == "unavailable" or modeled_price <= 0:
+        if (
+            new_benchmark_kind == "unavailable"
+            or modeled_price is None
+            or modeled_price <= 0
+        ):
             new_benchmark_kind = "unavailable"
             new_quality = measurement_quality or "unavailable"
         else:
@@ -1400,7 +1425,11 @@ class TradeLogger:
             strategy=strategy_name,
             reason=reason,
             stop_price=0.0,
-            entry_reference_price=modeled_price,
+            entry_reference_price=(
+                float(modeled_price)
+                if modeled_price is not None and modeled_price > 0
+                else None
+            ),
             modeled_slippage_bps=None,
             realized_slippage_bps=None,
             order_type="market",
@@ -1857,7 +1886,7 @@ class TradeLogger:
             strategy=strategy,
             reason=reason,
             stop_price=0.0,
-            entry_reference_price=0.0,
+            entry_reference_price=None,
             modeled_slippage_bps=None,
             realized_slippage_bps=None,
             order_type="unknown",
@@ -1914,7 +1943,8 @@ class TradeLogger:
         sells the short (higher-strike) put and buys the long (lower-strike)
         put; closing reverses both. The net economics (``net_price`` — credit
         received on open, debit paid on close, both positive) go on the
-        short-leg row; the long-leg row carries ``avg_fill_price=0.0``.
+        short-leg row; the long-leg row carries NULL because Alpaca's combo
+        result does not expose an individual leg fill price.
         When ``submitted_limit_price`` is provided, the short-leg
         ``entry_reference_price`` stores the absolute submitted combo limit
         used for slippage attribution rather than the actual net fill price.
@@ -1953,10 +1983,15 @@ class TradeLogger:
         # Short leg: sold to open / bought to close. Long leg: the reverse.
         short_side = "sell" if opening else "buy"
         long_side = "buy" if opening else "sell"
-        short_ref_price = (
+        submitted_reference = (
             abs(float(submitted_limit_price))
             if submitted_limit_price is not None
-            else net_price
+            else None
+        )
+        short_ref_price: float | None = (
+            submitted_reference
+            if submitted_reference is not None and submitted_reference > 0
+            else (float(net_price) if float(net_price) > 0 else None)
         )
         short_slippage_bps = (
             round(float(realized_slippage_bps), 2)
@@ -2025,10 +2060,10 @@ class TradeLogger:
         def _leg_record(
             symbol: str,
             side: str,
-            price: float,
+            price: float | None,
             pnl: float | None,
             *,
-            entry_reference_price: float,
+            entry_reference_price: float | None,
             risk_dollars: float | None,
             r_mult: float | None,
             new_benchmark_kind: SlippageBenchmarkKind,
@@ -2079,11 +2114,12 @@ class TradeLogger:
             )
 
         # realized_pnl, initial_risk_dollars, and r_multiple ride the short-leg
-        # row alongside the net economics; the long-leg row stays at 0.0 / None.
+        # row alongside the net economics; the long-leg row has no individual
+        # fill or reference price in Alpaca's combo result, so both are NULL.
         self.log(_leg_record(
             short_occ,
             short_side,
-            net_price,
+            float(net_price) if float(net_price) > 0 else None,
             realized_pnl,
             entry_reference_price=short_ref_price,
             risk_dollars=basis,
@@ -2099,9 +2135,9 @@ class TradeLogger:
         self.log(_leg_record(
             long_occ,
             long_side,
-            0.0,
             None,
-            entry_reference_price=0.0,
+            None,
+            entry_reference_price=None,
             risk_dollars=None,
             r_mult=None,
             new_benchmark_kind="unavailable",
@@ -2208,13 +2244,15 @@ class TradeLogger:
         realized_pnl = None
         r_multiple = None
         entry_timestamp = None
-        entry_reference_price = 0.0
+        entry_reference_price: float | None = None
         multiplier = _contract_multiplier(symbol)
         if context is not None:
             initial_stop_loss = context["initial_stop_loss"]
             initial_risk_per_share = context["initial_risk_per_share"]
             entry_timestamp = context["entry_timestamp"]
-            entry_reference_price = float(context["entry_reference_price"] or 0.0)
+            raw_reference = context["entry_reference_price"]
+            if raw_reference is not None and float(raw_reference) > 0:
+                entry_reference_price = float(raw_reference)
         if initial_risk_per_share is None or entry_timestamp is None:
             # Ordering-independent fallback. The substrate persists this
             # stop's sell row before dispatching here, so the open-state
@@ -2237,10 +2275,13 @@ class TradeLogger:
                 if entry_timestamp is None and recovered["entry_timestamp"]:
                     entry_timestamp = recovered["entry_timestamp"]
                     got.append("entry timestamp")
-                if not entry_reference_price:
-                    entry_reference_price = float(
-                        recovered["entry_reference_price"] or 0.0
-                    )
+                if entry_reference_price is None:
+                    recovered_reference = recovered["entry_reference_price"]
+                    if (
+                        recovered_reference is not None
+                        and float(recovered_reference) > 0
+                    ):
+                        entry_reference_price = float(recovered_reference)
                 if got:
                     logger.info(
                         f"{symbol} [{strategy}] log_stop_fill: "

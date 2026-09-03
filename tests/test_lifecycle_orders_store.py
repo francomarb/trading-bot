@@ -145,6 +145,33 @@ class TestInsertPending:
         assert row.slippage_benchmark_timestamp == "2026-06-12T10:00:00+00:00"
         assert row.slippage_measurement_quality == "primary"
 
+    def test_captures_entry_reference_separately_from_slippage_benchmark(
+        self,
+        pos_store: PositionLifecycleStore,
+        orders_store: PositionLifecycleOrdersStore,
+    ):
+        """Passive entries retain strategy context even though they have no
+        arrival-price slippage measurement."""
+        uid = _seed_position(pos_store)
+        row_id = orders_store.insert_pending(
+            position_uid=uid,
+            role="entry_primary",
+            client_order_id="donchian-stop-limit",
+            order_type="stop_limit",
+            order_class="oto",
+            time_in_force="day",
+            side="buy",
+            intended_qty=10.0,
+            intended_trigger_price=101.0,
+            intended_limit_price=102.0,
+            entry_reference_price=100.25,
+        )
+
+        row = orders_store.get_by_id(row_id)
+        assert row is not None
+        assert row.entry_reference_price == pytest.approx(100.25)
+        assert row.slippage_benchmark_price is None
+
     def test_captures_decision_time_risk_evidence(
         self,
         pos_store: PositionLifecycleStore,
