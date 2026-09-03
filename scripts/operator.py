@@ -39,7 +39,7 @@ from datetime import datetime, timezone
 from typing import Iterable
 
 # Path bootstrap so `python scripts/operator.py` works from any cwd
-# without an editable install. Mirrors the pattern in scripts/gonogo.py.
+# without an editable install. Keep script execution independent of installation.
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from config import settings  # noqa: E402

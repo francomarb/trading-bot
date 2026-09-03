@@ -81,7 +81,6 @@ trading-bot/
 │   ├── pnl.py                 # PnLTracker — daily/weekly reports
 │   └── alerts.py              # AlertDispatcher with pluggable backends
 ├── scripts/
-│   ├── gonogo.py              # Go/no-go checker for live readiness
 │   └── legacy_verify/         # Historical paper integration checks (manual)
 ├── tests/                     # 352 unit tests (pytest)
 ├── logs/                      # Rotating log files (gitignored)

@@ -126,7 +126,6 @@ trading-bot/
 ├── dashboard.py               # Streamlit read-only analytics dashboard
 ├── scripts/
 │   ├── preflight.py           # Pre-flight checklist (must exit 0 before live flip)
-│   ├── gonogo.py              # Go/no-go checker for live readiness
 │   ├── build_envelopes.py     # Builds per-strategy backtest envelopes for the health monitor
 │   ├── strategy_health_review.py # On-demand strategy health/edge report CLI
 │   ├── calibrate_health_thresholds.py # Suggests health-threshold diffs from N weeks of data

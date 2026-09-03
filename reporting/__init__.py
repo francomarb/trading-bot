@@ -3,7 +3,7 @@
 Provides:
   - `TradeLogger` — append-only SQLite trade log + structured JSON loguru sink.
   - `PnLTracker` — daily/weekly P&L summaries with per-strategy attribution.
-  - `MetricsSnapshot` / `compute_metrics` — live go/no-go performance metrics.
+  - `MetricsSnapshot` / `compute_metrics` — performance diagnostics.
   - `AlertDispatcher` — operator alerts with pluggable backends.
 """
 

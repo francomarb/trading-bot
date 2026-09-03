@@ -70,26 +70,15 @@ tmux attach -t bot
 tmux send-keys -t bot C-c
 ```
 
-## Go/No-Go Checker
+## Strategy Graduation
 
-Before deploying with live capital, run the go/no-go checker against paper trading results:
-
-```bash
-python scripts/gonogo.py              # human-readable report
-python scripts/gonogo.py --json       # machine-readable output
-```
-
-Thresholds (from [architecture.md](docs/architecture.md)):
-
-| Metric | Threshold |
-|---|---|
-| Minimum trades | >= 50 |
-| Trading span | >= 4 weeks |
-| Sharpe Ratio | > 1.0 |
-| Max Drawdown | < 15% |
-| Profit Factor | > 1.3 |
-| Win Rate | > 45% |
-| Avg Win / Avg Loss | > 1.5 |
+Paper strategies are evaluated individually for possible live inclusion. No
+strategy is preselected, and the operator makes the final decision from the
+documented profitability, risk, execution, and operational evidence. The former
+portfolio-wide `gonogo.py` checker was retired because it could not represent
+the bot's current strategy and position types. See [PLAN.md](PLAN.md) and the
+[architecture guide](docs/architecture.md) for the graduation criteria and the
+tracked replacement report.
 
 The 50-trade threshold is a statistical live-readiness gate. With five active
 strategies the combined trade rate is higher, but daily-bar trend strategies

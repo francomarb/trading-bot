@@ -177,7 +177,6 @@ trading-bot/
 │
 ├── scripts/
 │   ├── __init__.py
-│   ├── gonogo.py              # Go/no-go checker for live readiness
 │   ├── build_envelopes.py     # Builds per-strategy backtest envelopes (health monitor)
 │   ├── calibrate_health_thresholds.py  # Health-threshold diff suggestions from N weeks of data
 │   ├── backtest_leveraged_trend.py  # Reproducible SIP grid/report (research only)
@@ -208,7 +207,6 @@ trading-bot/
 │   ├── test_metrics.py
 │   ├── test_regime.py
 │   ├── test_filters.py
-│   ├── test_gonogo.py
 │   ├── test_sector_gauge.py
 │   ├── test_sector_resolver.py
 │   ├── test_spy_options_reversion.py  # Signals, guards, trailing stop, edge filter
@@ -650,21 +648,21 @@ Every row carries a `position_id` and `position_type` (added in 11.27). For sing
 
 **Metrics computed (`reporting/metrics.py`):**
 
-| Metric | Formula | Current aggregate-checker default |
-|---|---|---|
-| Sharpe Ratio | (Mean return − Risk-free rate) / Std dev of returns | > 1.0 |
-| Max Drawdown | Largest peak-to-trough drop | < 15% |
-| Profit Factor | Gross profit / Gross loss | > 1.3 |
-| Win Rate | Winning trades / Total trades | > 45% |
-| Avg Win / Avg Loss | Mean winning PnL / Mean losing PnL | > 1.5 |
+`reporting/metrics.py` computes generic dashboard diagnostics such as Sharpe,
+drawdown, profit factor, win rate, and average win/loss from a supplied P&L
+series. These metrics do not issue a live-readiness verdict.
 
-Metrics are computed by `compute_metrics()` from a list of per-trade P&L values. The current `MetricsSnapshot.meets_go_thresholds()` method checks all five defaults at once. These generic defaults describe the existing portfolio-wide checker; they are not universal graduation thresholds for every strategy payoff shape.
-
-**Go/no-go checker (`scripts/gonogo.py`):**
-CLI tool that reads the trade DB, pairs buy/sell fills into round-trip P&Ls, computes all metrics, and renders a GO/NO-GO verdict. Supports `--json` for machine-readable output. **Current limitation:** it aggregates every strategy in the selected database and has no strategy filter, so its verdict is a portfolio diagnostic rather than valid strategy-graduation evidence. Add explicit strategy selection before using it for a final graduation decision.
+The April-era portfolio-wide `scripts/gonogo.py` checker was removed in 2026-09.
+It paired raw buys and sells with a FIFO long-only model, mixed all strategies,
+and applied one universal threshold set. That cannot represent current
+single-leg, MLEG, partial-close, configuration-epoch, and strategy-specific
+payoff semantics. `PLAN.md` tracks its replacement: a per-strategy evidence
+report built from authoritative realized-P&L and operational records. The
+replacement must report facts and uncertainty; operator approval remains the
+live-inclusion decision.
 
 **Pre-flight checklist (`scripts/preflight.py`):**
-Must exit 0 before any live capital is committed. Validates: credentials point to the live endpoint, buying power meets minimum, `SLIPPAGE_DRIFT_ENABLED=True`, dry-run cycle passes, and the operator has explicitly set `GONOGO_APPROVED=yes`. It does not read or validate a GO/NO-GO evidence file.
+Must exit 0 before any live capital is committed. Validates: credentials point to the live endpoint, buying power meets minimum, `SLIPPAGE_DRIFT_ENABLED=True`, dry-run cycle passes, and the operator has explicitly set `STRATEGY_GRADUATION_APPROVED=yes`. Until the replacement graduation report is implemented, this is a manual operator assertion rather than validation of an evidence artifact.
 
 #### Strategy Health & Edge Monitor (`strategies/health/`, PLAN.md 11.10)
 
@@ -699,8 +697,6 @@ explicit operator decision authorizes its inclusion.
 9. `scripts/preflight.py` exits 0 against the live endpoint
 10. `SLIPPAGE_DRIFT_ENABLED=True` — kill switch calibrated from real fills. Calibrate against the **execution-quality family only** (PR #84); a pool that includes `fallback_latest_close` rows reads ~200 bps and would set a threshold that can never fire on genuine degradation. Leave headroom: the arrival midpoint is IEX BBO, not full SIP NBBO, on a paper account.
 11. The operator reviews the evidence and explicitly approves the strategy for live inclusion
-
-Run the current portfolio-wide checker: `python scripts/gonogo.py` (exit code 0 = aggregate GO, 1 = aggregate NO-GO). Do not treat that aggregate verdict as approval of any individual strategy.
 
 For slow daily-bar strategies, 50 closed trades may not be attainable in a short paper window. In that case, forward-test reconciliation and operational stability provide supporting evidence but do not erase the smaller sample's uncertainty. A strategy that does not graduate remains in paper development and does not block a different strategy from being considered.
 

@@ -5,7 +5,7 @@ Run this script and confirm it exits 0 before setting LIVE_TRADING=true.
 Every check is explicit so failures point directly to what needs fixing.
 
 Usage:
-    LIVE_TRADING=true GONOGO_APPROVED=yes python scripts/preflight.py
+    LIVE_TRADING=true STRATEGY_GRADUATION_APPROVED=yes python scripts/preflight.py
 """
 
 from __future__ import annotations
@@ -24,6 +24,12 @@ def _ok(msg: str) -> None:
 
 def _warn(msg: str) -> None:
     print(f"  WARN  {msg}")
+
+
+def _strategy_graduation_approved() -> bool:
+    """Return whether the operator explicitly approved the selected strategies."""
+    value = os.getenv("STRATEGY_GRADUATION_APPROVED", "")
+    return value.strip().lower() in ("yes", "true", "1")
 
 
 def run() -> int:
@@ -93,16 +99,15 @@ def run() -> int:
     else:
         _ok(f"LIVE_SIZE_MULTIPLIER={mult} (≤ 0.25 — sizes start throttled)")
 
-    # 6. Go/no-go approval must be confirmed.
-    gonogo = os.getenv("GONOGO_APPROVED", "").strip().lower()
-    if gonogo not in ("yes", "true", "1"):
+    # 6. Explicit operator approval of the selected strategy set is required.
+    if not _strategy_graduation_approved():
         _fail(
-            "GONOGO_APPROVED env var not set — run scripts/gonogo.py first "
-            "and set GONOGO_APPROVED=yes if the result is GO"
+            "STRATEGY_GRADUATION_APPROVED env var not set — review and "
+            "explicitly approve the selected strategies before live launch"
         )
         failures += 1
     else:
-        _ok("GONOGO_APPROVED=yes")
+        _ok("STRATEGY_GRADUATION_APPROVED=yes")
 
     # 7. Live trade DB must be separate from paper DB.
     if settings.TRADE_LOG_DB == settings.TRADE_LOG_DB_PAPER:
