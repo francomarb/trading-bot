@@ -262,7 +262,7 @@ def fetch_latest_quote(
     symbol: str, *, max_age_seconds: float | None = None,
     max_spread_bps: float | None = None,
 ) -> ArrivalQuote | None:
-    """Fetch the latest IEX quote for `symbol` as an arrival-price benchmark.
+    """Fetch the latest stock quote for `symbol` as an arrival-price benchmark.
 
     Returns ``None`` — meaning "no usable benchmark" — when the quote is
     unavailable, malformed, non-finite, one-sided (a zero bid or ask —
@@ -279,10 +279,11 @@ def fetch_latest_quote(
     fresh-but-wide one. See `ARRIVAL_QUOTE_MAX_AGE_SECONDS` in settings for the
     audit that motivated this and for the competing hypothesis.
 
-    Paper-trading note: with the IEX feed (the only one available on a paper
-    Alpaca subscription) this is IEX BBO, not full SIP NBBO. IEX is ~2.5% of US
-    equity volume by Alpaca's own figure, so its book can be unrepresentative
-    even when perfectly fresh.
+    The request follows ``ALPACA_DATA_FEED``, the live engine's main stock-feed
+    switch. On the current Basic paper setup that setting remains ``iex``;
+    real-time ``sip`` latest quotes require a paid subscription. IEX is one
+    venue rather than the consolidated NBBO, so its book can be
+    unrepresentative even when perfectly fresh.
 
     Why the age check lives here rather than being the vendor's job (checked
     2026-08-28): Alpaca's Market Data FAQ states the latest endpoints return
@@ -299,6 +300,15 @@ def fetch_latest_quote(
     # time against. Freshness MUST be measured from `received_at`, taken
     # immediately after the response returns -- see the age computation below.
     requested_at = datetime.now(timezone.utc)
+    try:
+        feed_label = _validate_feed(ALPACA_DATA_FEED)
+    except ValueError as exc:
+        # Preserve the quote helper's never-raise contract. Bar fetching also
+        # rejects this configuration, so no trade can silently use another
+        # feed; this event makes the configuration error explicit.
+        logger.error(f"arrival-quote feed configuration is invalid: {exc}")
+        _reject(symbol, requested_at, "invalid_feed", feed=None)
+        return None
     if not symbol:
         # Emitted rather than returned silently so the invariant is
         # unconditional: EVERY `return None` in this function produces an
@@ -306,7 +316,7 @@ def fetch_latest_quote(
         # ...") is one nobody can check; this one has a test that enumerates
         # the return paths. An empty symbol is a caller bug rather than a feed
         # condition, and is worth seeing for that reason.
-        _reject(symbol, requested_at, "empty_symbol")
+        _reject(symbol, requested_at, "empty_symbol", feed=feed_label)
         return None
     if max_age_seconds is None:
         max_age_seconds = ARRIVAL_QUOTE_MAX_AGE_SECONDS
@@ -315,11 +325,14 @@ def fetch_latest_quote(
     try:
         client = _get_client()
         result = client.get_stock_latest_quote(
-            StockLatestQuoteRequest(symbol_or_symbols=symbol, feed=DataFeed.IEX)
+            StockLatestQuoteRequest(
+                symbol_or_symbols=symbol,
+                feed=_FEED_MAP[feed_label],
+            )
         )
     except (APIError, Exception) as exc:  # noqa: BLE001 — never raise into trading loop
         logger.warning(f"{symbol}: latest-quote fetch failed: {exc}")
-        _reject(symbol, requested_at, "api_error")
+        _reject(symbol, requested_at, "api_error", feed=feed_label)
         return None
     # Taken immediately after the response returns. Using the pre-request time
     # here subtracts network latency from the age: a quote 10ms old on arrival
@@ -330,14 +343,14 @@ def fetch_latest_quote(
     quote = result.get(symbol) if isinstance(result, dict) else None
     if quote is None:
         logger.warning(f"{symbol}: no quote returned for symbol — rejected")
-        _reject(symbol, received_at, "no_quote")
+        _reject(symbol, received_at, "no_quote", feed=feed_label)
         return None
     try:
         bid = float(getattr(quote, "bid_price", 0.0) or 0.0)
         ask = float(getattr(quote, "ask_price", 0.0) or 0.0)
     except (TypeError, ValueError):
         logger.warning(f"{symbol}: arrival quote has malformed prices — rejected")
-        _reject(symbol, received_at, "malformed_prices")
+        _reject(symbol, received_at, "malformed_prices", feed=feed_label)
         return None
     if not (math.isfinite(bid) and math.isfinite(ask)):
         # NaN/inf reach here as floats and survive every `<= 0` comparison.
@@ -348,7 +361,10 @@ def fetch_latest_quote(
             f"{symbol}: arrival quote has non-finite prices (bid={bid}, ask={ask}) "
             "— rejected"
         )
-        _reject(symbol, received_at, "non_finite", bid=bid, ask=ask)
+        _reject(
+            symbol, received_at, "non_finite", feed=feed_label,
+            bid=bid, ask=ask,
+        )
         return None
     if bid <= 0 or ask <= 0:
         # Alpaca staff on IEX: "there can be a lot of 0 price and size quotes".
@@ -359,7 +375,10 @@ def fetch_latest_quote(
             f"{symbol}: arrival quote is one-sided (bid={bid}, ask={ask}) "
             "— rejected (expected on IEX; see 10.D1)"
         )
-        _reject(symbol, received_at, "zero_side", bid=bid, ask=ask)
+        _reject(
+            symbol, received_at, "zero_side", feed=feed_label,
+            bid=bid, ask=ask,
+        )
         return None
     if ask < bid:
         # Crossed book. This function's docstring has claimed to reject crossed
@@ -373,7 +392,10 @@ def fetch_latest_quote(
         logger.warning(
             f"{symbol}: arrival quote is crossed (bid={bid} > ask={ask}) — rejected"
         )
-        _reject(symbol, received_at, "crossed", bid=bid, ask=ask)
+        _reject(
+            symbol, received_at, "crossed", feed=feed_label,
+            bid=bid, ask=ask,
+        )
         return None
 
     # A LOCKED book (bid == ask) is deliberately allowed: it is a real, if
@@ -391,6 +413,7 @@ def fetch_latest_quote(
             symbol, midpoint, bid, ask, spread_bps,
             quote_timestamp=None, captured_at=received_at,
             age_seconds=None, accepted=False, reason="no_quote_timestamp",
+            feed=feed_label,
         )
         return None
     try:
@@ -409,6 +432,7 @@ def fetch_latest_quote(
             symbol, midpoint, bid, ask, spread_bps,
             quote_timestamp=None, captured_at=received_at,
             age_seconds=None, accepted=False, reason="bad_quote_timestamp",
+            feed=feed_label,
         )
         return None
 
@@ -428,6 +452,7 @@ def fetch_latest_quote(
         age_seconds=age_seconds, accepted=accepted,
         reason=reason,
         repeat_of_previous=is_repeat, consecutive_repeats=repeats,
+        feed=feed_label,
     )
     if not accepted:
         if not age_accepted:
@@ -473,7 +498,8 @@ _LAST_QUOTE_TS: dict[str, datetime] = {}
 
 def _reject(
     symbol: str, captured_at: datetime, reason: str,
-    *, bid: float | None = None, ask: float | None = None,
+    *, feed: str | None, bid: float | None = None,
+    ask: float | None = None,
 ) -> None:
     """Emit an arrival_quote event for a shape/availability rejection.
 
@@ -489,6 +515,7 @@ def _reject(
         quote_timestamp=None, captured_at=captured_at,
         age_seconds=None, accepted=False, reason=reason,
         repeat_of_previous=None, consecutive_repeats=None,
+        feed=feed,
     )
 
 
@@ -517,6 +544,7 @@ def _emit_arrival_quote_event(
     *, quote_timestamp, captured_at, age_seconds, accepted: bool,
     reason: str | None, repeat_of_previous: bool | None = None,
     consecutive_repeats: int | None = None,
+    feed: str | None,
 ) -> None:
     """Observational only — never blocks a trade, never raises."""
     try:
@@ -534,7 +562,7 @@ def _emit_arrival_quote_event(
             reject_reason=reason,
             repeat_of_previous=repeat_of_previous,
             consecutive_repeats=consecutive_repeats,
-            feed="iex",
+            feed=feed,
         ).debug(f"arrival_quote {symbol} accepted={accepted}")
     except Exception:  # noqa: BLE001 — instrumentation must never break trading
         pass

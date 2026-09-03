@@ -21,6 +21,7 @@ import datetime as dt
 from unittest.mock import MagicMock, patch
 
 import pytest
+from alpaca.data.enums import DataFeed
 
 import data.fetcher as fetcher
 from data.fetcher import ArrivalQuote, fetch_latest_quote, fetch_latest_quote_midpoint
@@ -133,8 +134,59 @@ class TestProvenanceCapture:
         fetcher._emit_arrival_quote_event(
             "AAA", 1.0, 1.0, 1.0, float("nan"),
             quote_timestamp=None, captured_at=dt.datetime.now(dt.timezone.utc),
-            age_seconds=None, accepted=True, reason=None,
+            age_seconds=None, accepted=True, reason=None, feed="iex",
         )
+
+
+class TestConfiguredFeed:
+    """The live stock-feed setting controls both the request and telemetry."""
+
+    @pytest.mark.parametrize(
+        "feed_label, expected_feed",
+        [("iex", DataFeed.IEX), ("sip", DataFeed.SIP)],
+    )
+    def test_setting_controls_request_and_event(
+        self, monkeypatch, feed_label, expected_feed,
+    ):
+        client = MagicMock()
+        client.get_stock_latest_quote.return_value = {
+            "AAA": _quote(age_seconds=1.0)
+        }
+        events = []
+        real_bind = fetcher.logger.bind
+
+        def spy(**kw):
+            if kw.get("event") == "arrival_quote":
+                events.append(kw)
+            return real_bind(**kw)
+
+        monkeypatch.setattr(fetcher, "ALPACA_DATA_FEED", feed_label)
+        with patch.object(fetcher, "_get_client", return_value=client):
+            with patch.object(fetcher.logger, "bind", side_effect=spy):
+                assert fetch_latest_quote("AAA") is not None
+
+        request = client.get_stock_latest_quote.call_args.args[0]
+        assert request.feed == expected_feed
+        assert events[-1]["feed"] == feed_label
+
+    def test_invalid_setting_fails_closed_and_is_observable(self, monkeypatch):
+        client = MagicMock()
+        events = []
+        real_bind = fetcher.logger.bind
+
+        def spy(**kw):
+            if kw.get("event") == "arrival_quote":
+                events.append(kw)
+            return real_bind(**kw)
+
+        monkeypatch.setattr(fetcher, "ALPACA_DATA_FEED", "not-a-feed")
+        with patch.object(fetcher, "_get_client", return_value=client):
+            with patch.object(fetcher.logger, "bind", side_effect=spy):
+                assert fetch_latest_quote("AAA") is None
+
+        client.get_stock_latest_quote.assert_not_called()
+        assert events[-1]["reject_reason"] == "invalid_feed"
+        assert events[-1]["feed"] is None
 
 
 class TestQuoteShapeValidation:
