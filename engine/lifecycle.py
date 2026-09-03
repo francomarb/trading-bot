@@ -28,18 +28,17 @@ This module is the foundation. It introduces:
   `closed`/`canceled`).
 - `position_lifecycle_legs` — child rows for spread legs.
 
-Phase A scope (operator controls v1)
-------------------------------------
-The operator CLI is the first and only customer in Phase A. The store
-is designed so other subsystems can adopt `position_uid` independently,
-each in its own future PR, per proposal §17. **No other subsystem reads
-this table in Phase A.**
+Current scope
+-------------
+The operator CLI was the first customer. The engine now also uses the
+store as the primary ownership source when restoring broker-held
+single-leg positions at startup. Other consumers remain independently
+adoptable per proposal §17.
 
-Phase A is purely additive: no existing call signature, schema column,
-or behavior path changes. Lifecycle writes are best-effort and wrapped
-by the caller in try/except so persistence failure can never abort an
-order or a cycle (matches the same discipline used by
-`strategies.health.lifecycle`).
+Lifecycle writes remain best-effort so a persistence failure cannot
+abort an order or cycle. Reads used for startup ownership are different:
+an unreadable or contradictory durable claim is treated as an ownership
+conflict rather than silently bypassed with historical trade replay.
 
 Reusability contract (per implementation plan)
 ----------------------------------------------
@@ -789,6 +788,23 @@ class PositionLifecycleStore:
         rows = self._conn.execute(
             _SELECT_LIFECYCLE_COLUMNS
             + " WHERE status IN ('pending', 'open', 'partially_filled') "
+            "ORDER BY created_at ASC"
+        ).fetchall()
+        return [self._row_with_legs(r) for r in rows]
+
+    def get_ownership_claims(self) -> list[PositionLifecycleRow]:
+        """Rows that still claim an ``owner_key`` for startup restoration.
+
+        This deliberately includes ``error``. An errored lifecycle is not an
+        open position the operator can manage normally, but it retains the
+        database ownership lock until explicit resolution. Startup must see
+        that claim and fail closed instead of bypassing it through legacy
+        trade replay.
+        """
+        rows = self._conn.execute(
+            _SELECT_LIFECYCLE_COLUMNS
+            + " WHERE status IN "
+            "('pending', 'open', 'partially_filled', 'error') "
             "ORDER BY created_at ASC"
         ).fetchall()
         return [self._row_with_legs(r) for r in rows]

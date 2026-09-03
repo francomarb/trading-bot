@@ -85,6 +85,39 @@ def _broker(
 
 
 # ─────────────────────────────────────────────────────────────────────
+# Startup ownership query includes rows that retain the DB owner lock
+# ─────────────────────────────────────────────────────────────────────
+
+
+class TestOwnershipClaims:
+    def test_error_row_is_hidden_from_operator_open_but_claims_ownership(
+        self, store_and_path
+    ):
+        store, _, _ = store_and_path
+        uid = new_position_uid()
+        store.create_pending(
+            position_uid=uid,
+            symbol="NVDA",
+            owner_key="NVDA",
+            strategy="sma_crossover",
+            position_type="single_leg",
+            entry_qty=10.0,
+        )
+        store._conn.execute(
+            "UPDATE position_lifecycle SET status = 'error' "
+            "WHERE position_uid = ?",
+            (uid,),
+        )
+        store._conn.commit()
+
+        assert store.get_open() == []
+        claims = store.get_ownership_claims()
+        assert [(row.position_uid, row.status) for row in claims] == [
+            (uid, "error")
+        ]
+
+
+# ─────────────────────────────────────────────────────────────────────
 # F1 — backfill must read Position dataclass fields, not float(value)
 # ─────────────────────────────────────────────────────────────────────
 

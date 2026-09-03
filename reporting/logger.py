@@ -2415,8 +2415,9 @@ class TradeLogger:
 
         This is the trade log's view of currently-open positions and their
         owning strategies, including positions that have been partially
-        reduced by one or more sell rows. Used by the engine on startup to
-        restore durable ownership without guessing from slot order.
+        reduced by one or more sell rows. Startup uses this as a legacy
+        ownership fallback only when no lifecycle claim exists. Spread
+        reconstruction and accounting consumers still use trade history.
         """
         return {
             symbol: state["strategy"]

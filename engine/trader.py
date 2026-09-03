@@ -54,7 +54,7 @@ import time
 import uuid
 from dataclasses import asdict, dataclass, field, replace
 from datetime import datetime, timedelta, timezone
-from typing import TYPE_CHECKING, Callable
+from typing import TYPE_CHECKING, Any, Callable
 from zoneinfo import ZoneInfo
 
 import pandas as pd
@@ -127,6 +127,7 @@ from utils.option_symbols import is_occ_option, parse_occ_symbol
 from regime.detector import MarketRegime
 
 if TYPE_CHECKING:
+    from engine.lifecycle import PositionLifecycleRow
     from execution.stream import StreamManager
     from regime.detector import RegimeDetector
     from risk.allocator import SleeveAllocator
@@ -978,8 +979,9 @@ class TradingEngine:
             all_symbols.extend(slot.active_symbols())
         unique_symbols = sorted(set(all_symbols))
 
-        # Restore position ownership from the trade DB (10.C1) and determine
-        # startup mode (10.C2). This replaces the old best-effort slot-match.
+        # Restore single-leg ownership from durable lifecycle identity first,
+        # with trade replay and slot matching retained only for legacy gaps.
+        # Spread reconstruction remains trade-ledger based for now.
         conflict_symbols = self._restore_ownership_from_db(startup_snapshot)
         self._restore_runtime_state_from_db(startup_snapshot)
         self._startup_mode = self._reconcile_startup(
@@ -3422,10 +3424,9 @@ class TradingEngine:
         Best-effort: any failure logs CRITICAL and absorbs. The
         substrate already recorded the fill at the substrate
         level; the engine-side cleanup not happening means the
-        position stays "owned" in the engine's view until the
-        next restart, when _restore_ownership_from_db picks up
-        the truth from the trade log (which the substrate
-        UPSERT also wrote).
+        position stays "owned" in the current process until the next
+        broker reconciliation/restart. Durable lifecycle state governs
+        identity; the substrate's trade UPSERT preserves fill accounting.
         """
         if event.status != "filled":
             return
@@ -5970,10 +5971,10 @@ class TradingEngine:
     ) -> dict:
         """Persist one operator close fill before reporting command success.
 
-        The durable trade row is the restart source of truth. Runtime allocator
-        accounting uses that exact value once; a full close also drops engine
-        ownership immediately so a later substrate observation cannot dispatch
-        the same fill a second time.
+        The durable trade row is the restart source of accounting truth.
+        Runtime allocator accounting uses that exact value once; a full close
+        also drops engine ownership immediately so a later substrate
+        observation cannot dispatch the same fill a second time.
         """
         close_price = float(result.avg_fill_price or 0.0)
         filled_qty = float(result.filled_qty or 0.0)
@@ -12185,24 +12186,29 @@ class TradingEngine:
 
     def _restore_ownership_from_db(self, snapshot: BrokerSnapshot) -> set[str]:
         """
-        Restore ``_positions`` from the trade DB (10.C1).
+        Restore ``_positions`` from durable ownership records.
 
         For each symbol in the broker's open positions:
-        - If the trade DB records a still-open buy for that symbol, use the
-          logged strategy as the authoritative owner.
-        - If the logged strategy is no longer in any configured slot, log a
-          WARNING and mark the symbol as a conflict.
-        - If the DB has no record (new account or DB gap), fall back to
-          best-effort slot-order match with a WARNING.
+        - A matching single-leg lifecycle row is authoritative.
+        - Historical trade replay is used only when no lifecycle claim exists.
+        - Best-effort slot matching is the final legacy fallback.
+
+        A lifecycle contradiction is never treated as absence. Errored rows,
+        retired strategies, exact-symbol mismatches, ambiguous broker holdings,
+        and lifecycle read failures become startup conflicts rather than
+        silently falling through to the older ledger.
 
         OCC option symbols (e.g. SPY260516C00520000) are keyed under their
         underlying ticker ("SPY") in _positions — owner_key_for() handles the
         normalization, matching how the engine tracks options during normal
         operation via _get_position_for().
 
-        Returns the set of conflict underlying keys (DB owner no longer in any slot).
+        Spread reconstruction remains trade-ledger based because spread
+        lifecycle rows do not yet contain the complete two-leg/net-credit
+        reconstruction context.
+
+        Returns the set of conflicting owner keys.
         """
-        db_owners = self.trade_logger.read_all_open_owners()
         known_strategy_names = {slot.strategy.name for slot in self.slots}
         conflicts: set[str] = set()
 
@@ -12215,16 +12221,139 @@ class TradingEngine:
         # which could then close one leg and leave a naked short put.
         spread_leg_occs = self._restore_spread_positions(snapshot, conflicts)
 
-        for sym in snapshot.account.open_positions:
-            if sym in spread_leg_occs:
-                continue  # leg of a reconstructed spread — already handled
+        single_leg_symbols = [
+            sym
+            for sym in snapshot.account.open_positions
+            if sym not in spread_leg_occs
+        ]
 
+        # A single-leg owner_key represents exactly one equity or one option
+        # contract. Multiple broker symbols collapsing to the same key cannot
+        # be represented safely by one Position/lifecycle row.
+        symbols_by_owner: dict[str, list[str]] = {}
+        for sym in single_leg_symbols:
+            symbols_by_owner.setdefault(owner_key_for(sym), []).append(sym)
+        ambiguous_owners = {
+            owner_key
+            for owner_key, symbols in symbols_by_owner.items()
+            if len(symbols) > 1
+        }
+        for owner_key in sorted(ambiguous_owners):
+            logger.warning(
+                f"restart: multiple single-leg broker symbols share "
+                f"owner_key='{owner_key}' ({symbols_by_owner[owner_key]}) — "
+                "ownership is ambiguous; declaring a conflict"
+            )
+            conflicts.add(owner_key)
+
+        lifecycle_claims: dict[str, "PositionLifecycleRow"] = {}
+        lifecycle_store = getattr(self, "lifecycle_store", None)
+        if lifecycle_store is not None:
+            try:
+                claims = lifecycle_store.get_ownership_claims()
+                lifecycle_claims = {row.owner_key: row for row in claims}
+            except Exception as exc:
+                # The primary authority exists but could not be read. Falling
+                # through to trade replay would make an I/O failure look like
+                # legitimate absence and could hide a contradictory claim.
+                affected = {
+                    owner_key_for(sym) for sym in single_leg_symbols
+                }
+                conflicts.update(affected)
+                logger.critical(
+                    "restart: lifecycle ownership query failed "
+                    f"({type(exc).__name__}: {exc}) — refusing legacy "
+                    f"fallback for {sorted(affected)}"
+                )
+                return conflicts
+
+        legacy_candidates: list[str] = []
+
+        for sym in single_leg_symbols:
+            owner_key = owner_key_for(sym)
+            if owner_key in ambiguous_owners:
+                continue
+
+            claim = lifecycle_claims.get(owner_key)
+            if claim is None:
+                legacy_candidates.append(sym)
+                continue
+
+            claim_symbols = {claim.symbol, *(leg.symbol for leg in claim.legs)}
+            conflict_reason: str | None = None
+            if claim.status == "error":
+                conflict_reason = "lifecycle status is error"
+            elif claim.position_type != "single_leg":
+                conflict_reason = (
+                    f"lifecycle position_type is {claim.position_type!r}"
+                )
+            elif sym not in claim_symbols:
+                conflict_reason = (
+                    f"lifecycle symbol/legs {sorted(claim_symbols)} do not "
+                    f"match broker symbol {sym!r}"
+                )
+            elif claim.strategy not in known_strategy_names:
+                conflict_reason = (
+                    f"lifecycle strategy {claim.strategy!r} is not configured"
+                )
+
+            existing = self._positions.get(owner_key)
+            if conflict_reason is None and existing is not None:
+                existing_symbol = (
+                    existing.primary_leg.symbol
+                    if existing.primary_leg is not None
+                    else None
+                )
+                if (
+                    not existing.is_single_leg
+                    or existing.strategy_name != claim.strategy
+                    or existing_symbol != sym
+                ):
+                    conflict_reason = "existing in-memory ownership disagrees"
+
+            if conflict_reason is not None:
+                logger.warning(
+                    f"restart: lifecycle ownership conflict for {sym} "
+                    f"(owner_key='{owner_key}', position_uid="
+                    f"'{claim.position_uid}'): {conflict_reason}; position "
+                    "will not be restored through a fallback"
+                )
+                conflicts.add(owner_key)
+                continue
+
+            if existing is None:
+                self._register_single_leg(
+                    strategy_name=claim.strategy,
+                    symbol=sym,
+                )
+            logger.info(
+                f"restart: assigned existing position {sym} "
+                f"→ '{claim.strategy}' (owner_key='{owner_key}', "
+                f"lifecycle={claim.position_uid})"
+            )
+
+        if not legacy_candidates:
+            return conflicts
+
+        try:
+            db_owners = self.trade_logger.read_all_open_owners()
+        except Exception as exc:
+            affected = {owner_key_for(sym) for sym in legacy_candidates}
+            conflicts.update(affected)
+            logger.warning(
+                "restart: legacy trade ownership replay failed "
+                f"({type(exc).__name__}: {exc}) — uncovered positions "
+                f"remain unmanaged: {sorted(affected)}"
+            )
+            return conflicts
+
+        for sym in legacy_candidates:
             # For OCC option symbols, ownership is stored under the underlying.
             owner_key = owner_key_for(sym)
             is_option = owner_key != sym
 
             if owner_key in self._positions:
-                continue  # already assigned (shouldn't happen at startup)
+                continue
 
             # DB lookup: try the exact broker symbol first (OCC string or equity),
             # then fall back to the underlying ticker for options.
@@ -12237,7 +12366,8 @@ class TradingEngine:
                     self._register_single_leg(strategy_name=db_owner, symbol=sym)
                     logger.info(
                         f"restart: assigned existing position {sym} "
-                        f"→ '{db_owner}' (owner_key='{owner_key}', trade DB record)"
+                        f"→ '{db_owner}' (owner_key='{owner_key}', legacy "
+                        "trade replay)"
                     )
                 else:
                     logger.warning(
@@ -12258,9 +12388,9 @@ class TradingEngine:
                             symbol=sym,
                         )
                         logger.warning(
-                            f"restart: no DB record for {sym}; assigned to "
-                            f"'{slot.strategy.name}' via underlying '{lookup}' "
-                            "(best-effort slot match)"
+                            f"restart: no durable ownership record for {sym}; "
+                            f"assigned to '{slot.strategy.name}' via underlying "
+                            f"'{lookup}' (last-resort slot match)"
                         )
                         matched = True
                         break
