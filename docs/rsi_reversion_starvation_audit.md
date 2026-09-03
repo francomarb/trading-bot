@@ -160,7 +160,7 @@ Top symbols by `RSI_FILTER_BLOCKED` evaluation count:
 1. Treat CAT 2026-07-30 as an order-submission reliability miss. The current
    substrate correctly reconciled it as never accepted, but the entry
    opportunity was lost.
-2. Continue 11.23 paper-watch under the RSI3 reset: the live question is now
+2. Continue 11.23 paper-watch under the RSI3 reset: the evidence question is now
    whether the simplified signal produces enough clean candidates and fills
    without uncontrolled clustered dip-buying.
 3. Consider structured per-candidate reason persistence before further filter

@@ -1,6 +1,6 @@
 # Donchian Channel Breakout — Strategy Research & Deployment Guide
 
-**Status:** ✅ **ACTIVE** — wired in `forward_test.py` since 2026-05-01.
+**Status:** ✅ **PAPER ACTIVE** — wired in `forward_test.py` since 2026-05-01.
 Built as the successor analysis to [bollinger_squeeze_universe_research.md](bollinger_squeeze_universe_research.md).
 
 **Last updated:** 2026-08-12

@@ -1,7 +1,11 @@
 # Order Lifecycle State Machine — Discovery
 
-Status: Discovery doc, no code changes yet. Revised in response to PR #59 review.
-Purpose: Document the current state of `position_lifecycle` in code, surface the holes that PR #58 (Donchian stop-limit + hybrid residual) made visible, recommend the structural shape the foundation PR should take, and capture the process learning that explains why this wasn't caught earlier.
+Status: Historical discovery and design record. The lifecycle foundation and
+the later amendments marked as shipped below are deployed; consult
+`order_lifecycle_foundation_tracker.md` and `PLAN.md` for current status.
+Purpose: Preserve the state discovered before the foundation work, the holes
+that PR #58 exposed, the recommended structural shape, and the process learning
+that explains why they were not caught earlier.
 
 This doc is intentionally grounded in code. Where it makes a recommendation, it says so explicitly.
 
@@ -1057,7 +1061,7 @@ The `role` column in `position_lifecycle_orders` is an open enum (§6.2). The fo
 | `entry_residual` | 🟡 Schema-only | PR #58 rebuild. Enum value exists; no writer in foundation. | When PR #58 rebuild wires Donchian hybrid. Until then no current strategy needs this role. |
 | `partial_close` | ✅ Wired | Operator Controls Phase C. `reduce-position` writes a tagged `partial_close` row. A timed-out broker `partially_filled` order is canceled and settled before accounting or residual-stop submission; its trade row remains semantic `status='partial'`. The handler writes an absolute broker-derived residual, then verifies or restores exact GTC protection before reporting success. | No bot-originated path creates partial closes; only the operator queue does. |
 
-**Consequence for live readiness — and what the rollup does NOT cover.** The four wired roles cover production strategies that operate at the **single-leg level**: SMA Crossover, RSI Reversion, Donchian Breakout (classic market entries), and single-leg SPY options. The position-level rollup is authoritative for every position those strategies open.
+**Consequence for live readiness — and what the rollup does NOT cover.** The four wired roles cover the active strategies that operate at the **single-leg level**: SMA Crossover, RSI Reversion, Donchian Breakout (classic market entries), and single-leg SPY options. The position-level rollup is authoritative for every position those strategies open.
 
 **MLEG spreads (credit_spread strategy) remain on their existing path.** Spread entries and exits do not use any of the four wired roles. They continue to use `log_spread_fill` and the existing `trades` aggregation. The foundation PR adds no `position_lifecycle_orders` writes for spread legs, and the per-order rollup at §6.6 is **not authoritative for spread positions** — those positions remain visible through `log_spread_fill`'s rows on `trades` and through the spread-side ownership tracking in `engine.positions`. PR #59 review-4 (P2) correctly pushed back on a prior wording that implied spreads benefited from foundation wiring; they do not. Spread lifecycle wiring is the separate spread-lifecycle PR's responsibility ([3] in the recommended sequence).
 

@@ -1,7 +1,9 @@
 # Stopless Position Lifecycle and Notional Risk Proposal
 
-**Status:** approved and merged in PR #124; implementation is proceeding on a
-paper-only branch. This document still does not authorize live activation.
+**Status:** approved and merged in PR #124; the capability is deployed in the
+paper environment. This substrate document does not authorize any consuming
+strategy for live inclusion; strategy graduation and operator approval remain
+separate decisions.
 
 **Primary consumer:** leveraged-index trend strategies such as SPY→SPXL and
 QQQ→TQQQ.

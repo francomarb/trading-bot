@@ -1,6 +1,6 @@
 # Trading Bot
 
-A modular, strategy-agnostic algorithmic trading bot built in Python. Five strategy sleeves are running simultaneously in Alpaca paper trading, with a full go/no-go framework for live capital deployment.
+A modular, strategy-agnostic algorithmic trading bot built in Python. Six strategy sleeves are running simultaneously in Alpaca paper trading, with per-strategy graduation criteria for possible live inclusion.
 
 ## Stack
 
@@ -22,11 +22,12 @@ A modular, strategy-agnostic algorithmic trading bot built in Python. Five strat
 
 | Strategy | Type | Order Type | Sleeve | Status |
 |---|---|---|---|---|
-| SMA Crossover | Trend-following | Market | 40% | **Active — Paper Trading** |
-| RSI Reversion | Mean-reversion | Limit | 20% | **Active — Paper Trading** |
-| Donchian Breakout | Trend continuation | Market | 25% | **Active — Paper Trading** |
-| SPY Options RSI Reversion | Options mean-reversion | Limit (OCC) | 5% | **Active — Paper Trading** |
-| Credit Spread | Short-premium options | Limit MLEG | 10% | **Active — Paper Trading** |
+| SMA Crossover | Trend-following | Market | 30% equity | **Active — Paper Trading** |
+| RSI Reversion | Mean-reversion | Limit | 15% equity | **Active — Paper Trading** |
+| Donchian Breakout | Trend continuation | Stop-limit | 15% equity | **Active — Paper Trading** |
+| Leveraged Trend | Benchmark-confirmed trend | Market | 25% equity | **Active — Paper Trading** |
+| SPY Options RSI Reversion | Options mean-reversion | Limit (OCC) | 5% isolated options | **Active — Paper Trading** |
+| Credit Spread | Short-premium options | Limit MLEG | 10% isolated options | **Active — Paper Trading** |
 
 See [docs/strategies.md](docs/strategies.md) for full signal logic, parameters, and exit guards.
 
@@ -36,7 +37,7 @@ See [docs/strategies.md](docs/strategies.md) for full signal logic, parameters, 
 Engine (live loop) → Data Layer → Indicators + Strategies → Risk Manager → Broker → Reporting
 ```
 
-The engine runs multiple strategy slots, each with its own symbol universe. Risk and execution are shared across all slots, with an allocator that splits deployable capital into an 85% equity pool and a 15% isolated-options pool. Every trade is logged to SQLite and evaluated against go/no-go thresholds before live deployment.
+The engine runs multiple strategy slots, each with its own symbol universe. Risk and execution are shared across all slots, with an allocator that splits deployable capital into an 85% equity pool and a 15% isolated-options pool. Trades and operational evidence are recorded for later per-strategy graduation review.
 
 See [docs/architecture.md](docs/architecture.md) for the full architecture guide.
 
@@ -70,32 +71,21 @@ tmux attach -t bot
 tmux send-keys -t bot C-c
 ```
 
-## Go/No-Go Checker
+## Strategy Graduation
 
-Before deploying with live capital, run the go/no-go checker against paper trading results:
+Paper strategies are evaluated individually for possible live inclusion. No
+strategy is preselected, and the operator makes the final decision from the
+documented profitability, risk, execution, and operational evidence. The former
+portfolio-wide `gonogo.py` checker was retired because it could not represent
+the bot's current strategy and position types. See [PLAN.md](PLAN.md) and the
+[architecture guide](docs/architecture.md) for the graduation criteria and the
+tracked replacement report.
 
-```bash
-python scripts/gonogo.py              # human-readable report
-python scripts/gonogo.py --json       # machine-readable output
-```
-
-Thresholds (from [architecture.md](docs/architecture.md)):
-
-| Metric | Threshold |
-|---|---|
-| Minimum trades | >= 50 |
-| Trading span | >= 4 weeks |
-| Sharpe Ratio | > 1.0 |
-| Max Drawdown | < 15% |
-| Profit Factor | > 1.3 |
-| Win Rate | > 45% |
-| Avg Win / Avg Loss | > 1.5 |
-
-The 50-trade threshold is a statistical live-readiness gate. With five active
-strategies the combined trade rate is higher, but daily-bar trend strategies
-(SMA, Donchian) and defined-risk options spreads still need enough paper
-cycles to prove execution quality. Use `backtest/reconcile.py`, strategy
-health reports, and operational stability alongside the trade-count gate.
+Fifty closed trades is a target for sample depth, not an automatic universal
+gate. Slower strategies may be reviewed with fewer outcomes only when the
+smaller sample and untested conditions are explicit. Reconciliation, strategy
+health, execution quality, and operational reliability remain separate parts
+of the evidence package.
 
 ## Testing
 

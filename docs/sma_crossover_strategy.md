@@ -1,6 +1,6 @@
 # SMA Crossover — Strategy Research & Deployment Guide
 
-**Status:** ✅ **ACTIVE** — wired in `engine/trader.py` and `forward_test.py`
+**Status:** ✅ **PAPER ACTIVE** — wired in `engine/trader.py` and `forward_test.py`
 since project inception. The original MVP trend-follower for this project.
 
 **Last updated:** 2026-06-06

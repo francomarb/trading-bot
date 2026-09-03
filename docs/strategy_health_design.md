@@ -23,7 +23,7 @@ These four bullets are the user's stated priorities. **Every design decision mus
 
 | # | What the operator needs | How v1 delivers it |
 |---|---|---|
-| 1 | **Knowing whether each strategy is actually healthy in live paper conditions** | Weekly L1–L3 + EdgeReport per strategy written to disk; dashboard panel shows both scorecards; on-demand CLI. Operator never derives "is X healthy?" from raw logs. |
+| 1 | **Knowing whether each strategy is actually healthy in paper conditions** | Weekly L1–L3 + EdgeReport per strategy written to disk; dashboard panel shows both scorecards; on-demand CLI. Operator never derives "is X healthy?" from raw logs. |
 | 2 | **Distinguishing "bad execution" from "bad edge"** | Edge/Health primacy inversion (§3): bad execution = `continue and monitor`, fix in parallel, do not throttle. Bad edge = silent-killer alarm + `pause and investigate`. Visually and operationally separable in every report. |
 | 3 | **Distinguishing "temporary drawdown" from "real degradation"** | `min_trades_for_verdict` floor per strategy + three independent statistical signals must agree for NEGATIVE + **3-week persistence requirement** before alarm fires (§9). A single bad week is exactly what normal variance looks like; three consecutive bad weeks is harder to write off. |
 | 4 | **Being able to make sizing / pause / continue decisions with confidence** | Four-label recommendation set (`continue` / `continue and monitor` / `reduce size` / `pause and investigate`) — each carries sufficiency, driving checks, and measured/inferred/envelope provenance (§11.5, §12.4). |
@@ -68,7 +68,7 @@ These four bullets are the user's stated priorities. **Every design decision mus
 
 | Criterion | v1 covers? | What does the covering |
 |---|---|---|
-| 1. Healthy in live paper conditions | ✅ | EdgeReport + HealthReport, weekly markdown, dashboard panel, CLI |
+| 1. Healthy in paper conditions | ✅ | EdgeReport + HealthReport, weekly markdown, dashboard panel, CLI |
 | 2. Bad execution vs bad edge | ✅ | Edge/Health primacy inversion + decision matrix (§4) |
 | 3. Temporary drawdown vs real degradation | ✅ (heuristic, honest about it) | `min_trades_for_verdict` floor + three statistical signals must agree + **3-week persistence requirement** before NEGATIVE alarm (§9) |
 | 4. Sizing / pause / continue with confidence | ✅ | Four-label recommendation set including `reduce size` as advisory (§11.5); each carries sufficiency + driving checks + provenance |

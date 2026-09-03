@@ -4,7 +4,7 @@
 
 This document defines the target architecture for the Alpaca trading bot. It is the source of truth for structural decisions, coding conventions, and the go/no-go framework for live capital deployment. All refactoring and new development should align with this guide.
 
-The bot is built in Python using `alpaca-py`. Six strategy sleeves are active in paper trading: SMA Crossover, RSI Reversion, Donchian Breakout, Leveraged Trend, SPY Options RSI Reversion, and Credit Spread. The current live GO/NO-GO gate is the combined six-strategy paper run after the Phase 10/11 safety and execution-calibration work is complete.
+The bot is built in Python using `alpaca-py`. Six strategy sleeves are active in paper trading: SMA Crossover, RSI Reversion, Donchian Breakout, Leveraged Trend, SPY Options RSI Reversion, and Credit Spread. Paper mode is the development environment: strategies are evaluated individually for live eligibility, and no strategy is preselected or required to graduate alongside the others.
 
 ---
 
@@ -177,7 +177,6 @@ trading-bot/
 │
 ├── scripts/
 │   ├── __init__.py
-│   ├── gonogo.py              # Go/no-go checker for live readiness
 │   ├── build_envelopes.py     # Builds per-strategy backtest envelopes (health monitor)
 │   ├── calibrate_health_thresholds.py  # Health-threshold diff suggestions from N weeks of data
 │   ├── backtest_leveraged_trend.py  # Reproducible SIP grid/report (research only)
@@ -190,7 +189,7 @@ trading-bot/
 │   ├── rsi_watchlist_scan.py
 │   ├── sma_watchlist_scan.py
 │   ├── verify_spread_order.py    # 11.28 MLEG submit/cancel merge gate (real paper API)
-│   ├── verify_credit_spread.py   # 11.29 strategy decision pipeline against live paper data
+│   ├── verify_credit_spread.py   # 11.29 strategy decision pipeline against paper data
 │   └── watchlist_review.py
 │
 ├── tests/
@@ -208,7 +207,6 @@ trading-bot/
 │   ├── test_metrics.py
 │   ├── test_regime.py
 │   ├── test_filters.py
-│   ├── test_gonogo.py
 │   ├── test_sector_gauge.py
 │   ├── test_sector_resolver.py
 │   ├── test_spy_options_reversion.py  # Signals, guards, trailing stop, edge filter
@@ -650,21 +648,21 @@ Every row carries a `position_id` and `position_type` (added in 11.27). For sing
 
 **Metrics computed (`reporting/metrics.py`):**
 
-| Metric | Formula | Go/No-Go threshold |
-|---|---|---|
-| Sharpe Ratio | (Mean return − Risk-free rate) / Std dev of returns | > 1.0 |
-| Max Drawdown | Largest peak-to-trough drop | < 15% |
-| Profit Factor | Gross profit / Gross loss | > 1.3 |
-| Win Rate | Winning trades / Total trades | > 45% |
-| Avg Win / Avg Loss | Mean winning PnL / Mean losing PnL | > 1.5 |
+`reporting/metrics.py` computes generic dashboard diagnostics such as Sharpe,
+drawdown, profit factor, win rate, and average win/loss from a supplied P&L
+series. These metrics do not issue a live-readiness verdict.
 
-Metrics are computed by `compute_metrics()` from a list of per-trade P&L values. The `MetricsSnapshot.meets_go_thresholds()` method checks all five gates at once.
-
-**Go/no-go checker (`scripts/gonogo.py`):**
-CLI tool that reads the trade DB, pairs buy/sell fills into round-trip P&Ls, computes all metrics, and renders a final GO/NO-GO verdict. Supports `--json` for machine-readable output.
+The April-era portfolio-wide `scripts/gonogo.py` checker was removed in 2026-09.
+It paired raw buys and sells with a FIFO long-only model, mixed all strategies,
+and applied one universal threshold set. That cannot represent current
+single-leg, MLEG, partial-close, configuration-epoch, and strategy-specific
+payoff semantics. `PLAN.md` tracks its replacement: a per-strategy evidence
+report built from authoritative realized-P&L and operational records. The
+replacement must report facts and uncertainty; operator approval remains the
+live-inclusion decision.
 
 **Pre-flight checklist (`scripts/preflight.py`):**
-Must exit 0 before any live capital is committed. Validates: credentials point to the live endpoint, buying power meets minimum, `SLIPPAGE_DRIFT_ENABLED=True`, dry-run cycle passes, go/no-go file on disk with GO verdict.
+Must exit 0 before any live capital is committed. Validates: credentials point to the live endpoint, buying power meets minimum, `SLIPPAGE_DRIFT_ENABLED=True`, dry-run cycle passes, and the operator has explicitly set `STRATEGY_GRADUATION_APPROVED=yes`. Until the replacement graduation report is implemented, this is a manual operator assertion rather than validation of an evidence artifact.
 
 #### Strategy Health & Edge Monitor (`strategies/health/`, PLAN.md 11.10)
 
@@ -681,21 +679,26 @@ Full v1 design and rationale: `docs/strategy_health_design.md`. Deliberately def
 
 ---
 
-## Go/No-Go Framework
+## Strategy Graduation Framework
 
-Before committing live capital, ALL of the following must be satisfied:
+Before committing live capital, the strategy under consideration must satisfy the
+strategy-specific gates below. Shared platform gates must also pass before any live
+launch. Passing these checks makes a strategy eligible for operator review; only an
+explicit operator decision authorizes its inclusion.
 
-1. Minimum **50 closed trades** in paper trading (statistical significance)
-2. Paper trading period spans **at least 4 weeks** across varying market conditions, with all six active strategy sleeves running
-3. All five metrics meet their thresholds (see table above)
-4. Bot has run for at least **72 hours continuously** without crashes or errors
-5. Risk manager daily halt has never been triggered without being intentional
-6. `scripts/preflight.py` exits 0 against the live endpoint
-7. `SLIPPAGE_DRIFT_ENABLED=True` — kill switch calibrated from real fills. Calibrate against the **execution-quality family only** (PR #84); a pool that includes `fallback_latest_close` rows reads ~200 bps and would set a threshold that can never fire on genuine degradation. Leave headroom: the arrival midpoint is IEX BBO, not full SIP NBBO, on a paper account.
+1. Target **50 closed trades** in paper trading; a smaller sample for a slow strategy requires documented forward-test reconciliation and an explicit statement of the remaining uncertainty
+2. Paper trading spans **at least 4 weeks** and more than one market condition where practical; untested conditions are documented
+3. Profitability, expectancy, drawdown, and payoff-shape metrics meet documented thresholds appropriate to that strategy; generic dashboard diagnostics are supporting evidence, not universal requirements
+4. Net profitability and expectancy remain positive after realistic fees and slippage across meaningful subperiods and are not dominated by one exceptional winner
+5. Drawdown, loss streaks, and capital usage remain within the strategy's documented limits
+6. The strategy's entries, exits, protection, attribution, accounting, restart recovery, and operator controls have reliable paper evidence
+7. The bot has run for at least **72 hours continuously** without crashes or errors
+8. The risk manager daily halt has never been triggered without being intentional
+9. `scripts/preflight.py` exits 0 against the live endpoint
+10. `SLIPPAGE_DRIFT_ENABLED=True` — kill switch calibrated from real fills. Calibrate against the **execution-quality family only** (PR #84); a pool that includes `fallback_latest_close` rows reads ~200 bps and would set a threshold that can never fire on genuine degradation. Leave headroom: the arrival midpoint is IEX BBO, not full SIP NBBO, on a paper account.
+11. The operator reviews the evidence and explicitly approves the strategy for live inclusion
 
-Run the checker: `python scripts/gonogo.py` (exit code 0 = GO, 1 = NO-GO).
-
-For slow daily-bar strategies, 50 closed trades may not be attainable in a 2–4 week paper window. In that case, forward-test reconciliation and operational stability are the primary stabilization gates.
+For slow daily-bar strategies, 50 closed trades may not be attainable in a short paper window. In that case, forward-test reconciliation and operational stability provide supporting evidence but do not erase the smaller sample's uncertainty. A strategy that does not graduate remains in paper development and does not block a different strategy from being considered.
 
 ---
 

@@ -1,6 +1,6 @@
 # Credit Spread — Strategy Research & Deployment Guide
 
-**Status:** ✅ **ACTIVE** — wired in `forward_test.py` since PLAN 11.29.
+**Status:** ✅ **PAPER ACTIVE** — wired in `forward_test.py` since PLAN 11.29.
 Running on **SPY + QQQ** in paper mode for several weeks as of this
 update; allocated 10% of equity in the isolated-options pool.
 
@@ -13,14 +13,14 @@ update; allocated 10% of equity in the isolated-options pool.
 > proposal* before the strategy existed. The original proposal text is
 > preserved below (sections 1–15) as the rationale and research record —
 > it explains *why* the strategy looks the way it does. The
-> **Deployment configuration** section immediately below this header
-> captures the *live* parameters as of the last-updated date. When the
+> **Runtime configuration** section immediately below this header
+> captures the active paper parameters as of the last-updated date. When the
 > two disagree, settings.py and `forward_test.py` are the source of
 > truth; the proposal below is research, not spec.
 
 ---
 
-## Deployment configuration (live)
+## Runtime configuration (paper)
 
 ### Sleeve mechanics
 
@@ -216,7 +216,7 @@ market as the autonomous final step.
 
 See [`mleg_close_design.md`](mleg_close_design.md) for the full design.
 
-Live mapping of credit-spread triggers → typed reasons:
+Current runtime mapping of credit-spread triggers → typed reasons:
 
 | Internal trigger | Typed reason | Behaviour |
 |---|---|---|
@@ -228,7 +228,7 @@ Live mapping of credit-spread triggers → typed reasons:
 
 ### Close-walk tuning review
 
-After ~10–20 paper closes accumulate (4–8 weeks of live paper running),
+After ~10–20 paper closes accumulate (4–8 weeks of paper running),
 review the walk-step fill distribution. The data lives in
 `logs/bot.jsonl` as structured `mleg_walk_step` events; grep them out
 with:
@@ -1124,7 +1124,7 @@ The original 2-PR plan combined the multi-leg broker with the strategy. Splittin
 | Integration verify script | ~250 |
 | **Total** | **~1,610 LOC** |
 
-**Functional outcome:** Live credit spreads on SPY + QQQ paper trading.
+**Functional outcome:** Credit spreads running on SPY + QQQ in paper trading.
 
 **Risk profile:** Strategy logic + parameter tuning. The hard plumbing is already in via PR 1 and PR 2, so review focuses on strategy correctness rather than infrastructure mechanics.
 

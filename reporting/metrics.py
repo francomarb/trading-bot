@@ -1,7 +1,4 @@
-"""
-Live performance metrics (Step 6).
-
-Computes the five go/no-go metrics from a stream of closed-trade P&Ls:
+"""Performance diagnostics computed from a stream of closed-trade P&Ls.
 
   1. Sharpe Ratio  — (mean return - risk-free) / std dev of returns
   2. Max Drawdown  — largest peak-to-trough equity drop (as fraction)
@@ -9,23 +6,16 @@ Computes the five go/no-go metrics from a stream of closed-trade P&Ls:
   4. Win Rate      — winning trades / total trades
   5. Avg Win / Avg Loss ratio
 
-Architecture thresholds (from architecture.md):
-
-  | Metric          | Go/No-Go threshold |
-  |-----------------|-------------------|
-  | Sharpe Ratio    | > 1.0             |
-  | Max Drawdown    | < 15%             |
-  | Profit Factor   | > 1.3             |
-  | Win Rate        | > 45%             |
-  | Avg Win/Avg Loss| > 1.5             |
-
 Design principles:
   - Pure functions of data: every metric is computed from a list of floats
     (per-trade P&L values). No I/O, no state, no side effects.
   - The `MetricsSnapshot` dataclass holds a point-in-time summary. The
     `compute_metrics()` factory builds one from a P&L list.
-  - The `meets_go_thresholds()` method checks all five gates at once.
   - Annualization for Sharpe assumes 252 trading days per year.
+
+These generic dollar-P&L diagnostics support the dashboard. They do not decide
+whether a strategy is eligible for live inclusion; that requires the
+strategy-specific graduation evidence tracked in PLAN.md.
 """
 
 from __future__ import annotations
@@ -42,14 +32,6 @@ if TYPE_CHECKING:
 
 TRADING_DAYS_PER_YEAR = 252
 DEFAULT_RISK_FREE_RATE = 0.0  # Per-trade, not annualized
-
-# Go/no-go thresholds (from architecture.md)
-SHARPE_THRESHOLD = 1.0
-MAX_DRAWDOWN_THRESHOLD = 0.15  # 15%
-PROFIT_FACTOR_THRESHOLD = 1.3
-WIN_RATE_THRESHOLD = 0.45  # 45%
-AVG_WIN_LOSS_THRESHOLD = 1.5
-
 
 # ── Kelly Criterion ─────────────────────────────────────────────────────────
 
@@ -114,91 +96,6 @@ class MetricsSnapshot:
     mean_pnl: float
     largest_win: float
     largest_loss: float
-
-    def meets_go_thresholds(self, *, min_trades: int = 50) -> tuple[bool, list[str]]:
-        """
-        Check all five go/no-go gates. Returns (go, reasons).
-
-        `min_trades` enforces the statistical significance requirement
-        from architecture.md (default: 50 closed trades).
-        """
-        reasons: list[str] = []
-
-        if self.trade_count < min_trades:
-            reasons.append(
-                f"insufficient trades: {self.trade_count} < {min_trades}"
-            )
-
-        if self.sharpe_ratio <= SHARPE_THRESHOLD:
-            reasons.append(
-                f"Sharpe {self.sharpe_ratio:.2f} <= {SHARPE_THRESHOLD}"
-            )
-
-        if self.max_drawdown_pct >= MAX_DRAWDOWN_THRESHOLD:
-            reasons.append(
-                f"max drawdown {self.max_drawdown_pct:.1%} >= "
-                f"{MAX_DRAWDOWN_THRESHOLD:.0%}"
-            )
-
-        if self.profit_factor <= PROFIT_FACTOR_THRESHOLD:
-            reasons.append(
-                f"profit factor {self.profit_factor:.2f} <= "
-                f"{PROFIT_FACTOR_THRESHOLD}"
-            )
-
-        if self.win_rate <= WIN_RATE_THRESHOLD:
-            reasons.append(
-                f"win rate {self.win_rate:.1%} <= {WIN_RATE_THRESHOLD:.0%}"
-            )
-
-        if self.avg_win_loss_ratio <= AVG_WIN_LOSS_THRESHOLD:
-            reasons.append(
-                f"avg win/loss {self.avg_win_loss_ratio:.2f} <= "
-                f"{AVG_WIN_LOSS_THRESHOLD}"
-            )
-
-        go = len(reasons) == 0
-        return go, reasons
-
-    def format_report(self, *, min_trades: int = 50) -> str:
-        """Human-readable summary of all metrics."""
-        go, reasons = self.meets_go_thresholds(min_trades=min_trades)
-        verdict = "GO" if go else "NO-GO"
-
-        lines = [
-            "# Performance Metrics",
-            "",
-            f"| Metric | Value | Threshold | Status |",
-            f"|--------|-------|-----------|--------|",
-            f"| Trades | {self.trade_count} | >= {min_trades} | "
-            f"{'PASS' if self.trade_count >= min_trades else 'FAIL'} |",
-            f"| Sharpe Ratio | {self.sharpe_ratio:.2f} | > {SHARPE_THRESHOLD} | "
-            f"{'PASS' if self.sharpe_ratio > SHARPE_THRESHOLD else 'FAIL'} |",
-            f"| Max Drawdown | {self.max_drawdown_pct:.1%} | < {MAX_DRAWDOWN_THRESHOLD:.0%} | "
-            f"{'PASS' if self.max_drawdown_pct < MAX_DRAWDOWN_THRESHOLD else 'FAIL'} |",
-            f"| Profit Factor | {self.profit_factor:.2f} | > {PROFIT_FACTOR_THRESHOLD} | "
-            f"{'PASS' if self.profit_factor > PROFIT_FACTOR_THRESHOLD else 'FAIL'} |",
-            f"| Win Rate | {self.win_rate:.1%} | > {WIN_RATE_THRESHOLD:.0%} | "
-            f"{'PASS' if self.win_rate > WIN_RATE_THRESHOLD else 'FAIL'} |",
-            f"| Avg Win/Loss | {self.avg_win_loss_ratio:.2f} | > {AVG_WIN_LOSS_THRESHOLD} | "
-            f"{'PASS' if self.avg_win_loss_ratio > AVG_WIN_LOSS_THRESHOLD else 'FAIL'} |",
-            "",
-            f"| Total P&L | ${self.total_pnl:,.2f} |",
-            f"| Mean P&L | ${self.mean_pnl:,.2f} |",
-            f"| Largest Win | ${self.largest_win:,.2f} |",
-            f"| Largest Loss | ${self.largest_loss:,.2f} |",
-            "",
-            f"**Verdict: {verdict}**",
-        ]
-
-        if reasons:
-            lines.append("")
-            lines.append("Failures:")
-            for r in reasons:
-                lines.append(f"  - {r}")
-
-        return "\n".join(lines)
-
 
 # ── Computation ─────────────────────────────────────────────────────────────
 

@@ -1,7 +1,9 @@
 # Leveraged Trend Strategy
 
-**Status:** merged and paper active behind a paper-only switch; four entries
-are open and exit evidence is still pending. Live mode remains unauthorized.
+**Status:** merged and active in paper development behind a paper-specific
+activation switch; four entries are open and exit evidence is still pending.
+Any future live inclusion is subject to the same graduation criteria and
+explicit operator approval as every other strategy.
 
 ## Thesis
 

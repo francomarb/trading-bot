@@ -11,8 +11,6 @@ Coverage:
   - Profit factor: normal, no losses (inf), no wins (0)
   - Win rate: 100%, 0%, mixed
   - Avg win/loss ratio: normal, no losses (inf), no wins (0)
-  - MetricsSnapshot.meets_go_thresholds: all-pass, individual failures
-  - format_report: produces readable output
 """
 
 from __future__ import annotations
@@ -21,16 +19,7 @@ import math
 
 import pytest
 
-from reporting.metrics import (
-    AVG_WIN_LOSS_THRESHOLD,
-    MAX_DRAWDOWN_THRESHOLD,
-    PROFIT_FACTOR_THRESHOLD,
-    SHARPE_THRESHOLD,
-    TRADING_DAYS_PER_YEAR,
-    WIN_RATE_THRESHOLD,
-    MetricsSnapshot,
-    compute_metrics,
-)
+from reporting.metrics import TRADING_DAYS_PER_YEAR, MetricsSnapshot, compute_metrics
 
 
 # ── Empty input ─────────────────────────────────────────────────────────────
@@ -46,13 +35,6 @@ class TestEmptyInput:
         assert m.win_rate == 0.0
         assert m.avg_win_loss_ratio == 0.0
         assert m.total_pnl == 0.0
-
-    def test_no_trades_fails_go_threshold(self):
-        m = compute_metrics([])
-        go, reasons = m.meets_go_thresholds()
-        assert go is False
-        assert any("insufficient" in r for r in reasons)
-
 
 # ── Sharpe Ratio ────────────────────────────────────────────────────────────
 
@@ -192,83 +174,3 @@ class TestAggregates:
 
 
 # ── Go/No-Go thresholds ────────────────────────────────────────────────────
-
-
-class TestGoThresholds:
-    def _passing_pnls(self) -> list[float]:
-        """Build a P&L list that passes all go thresholds."""
-        # 60 trades: interleaved 3 wins of +200, then 1 loss of -50
-        # win rate = 45/60 = 75% > 45% ✓
-        # avg win = 200, avg loss = 50, ratio = 4.0 > 1.5 ✓
-        # profit factor = 9000/750 = 12.0 > 1.3 ✓
-        # Max early dd: after 3 wins (600), one loss (550) = 8.3% < 15% ✓
-        pattern = [200.0, 200.0, 200.0, -50.0]  # repeats 15 times = 60 trades
-        return pattern * 15
-
-    def test_all_pass(self):
-        m = compute_metrics(self._passing_pnls())
-        go, reasons = m.meets_go_thresholds()
-        assert go is True, f"expected GO, got failures: {reasons}"
-        assert reasons == []
-
-    def test_insufficient_trades(self):
-        m = compute_metrics([200.0] * 10 + [-80.0] * 5)
-        go, reasons = m.meets_go_thresholds(min_trades=50)
-        assert go is False
-        assert any("insufficient" in r for r in reasons)
-
-    def test_custom_min_trades(self):
-        m = compute_metrics([200.0] * 10 + [-80.0] * 5)
-        go, reasons = m.meets_go_thresholds(min_trades=10)
-        # With 15 trades ≥ 10, the trade count gate passes
-        assert not any("insufficient" in r for r in reasons)
-
-    def test_low_sharpe_fails(self):
-        # All flat trades → sharpe = 0
-        m = compute_metrics([0.0] * 60)
-        go, reasons = m.meets_go_thresholds()
-        assert go is False
-        assert any("Sharpe" in r for r in reasons)
-
-    def test_high_drawdown_fails(self):
-        # Big win then big loss → high drawdown
-        pnls = [1000] + [-500] * 5 + [100] * 55
-        m = compute_metrics(pnls)
-        if m.max_drawdown_pct >= MAX_DRAWDOWN_THRESHOLD:
-            go, reasons = m.meets_go_thresholds()
-            assert any("drawdown" in r for r in reasons)
-
-    def test_low_win_rate_fails(self):
-        # 20 wins, 40 losses → 33% win rate < 45%
-        pnls = [300.0] * 20 + [-100.0] * 40
-        m = compute_metrics(pnls)
-        assert m.win_rate < WIN_RATE_THRESHOLD
-        go, reasons = m.meets_go_thresholds()
-        assert any("win rate" in r for r in reasons)
-
-
-# ── format_report ───────────────────────────────────────────────────────────
-
-
-class TestFormatReport:
-    def test_report_contains_key_sections(self):
-        m = compute_metrics([100, -50, 80, -20, 60])
-        report = m.format_report()
-        assert "Performance Metrics" in report
-        assert "Sharpe Ratio" in report
-        assert "Max Drawdown" in report
-        assert "Profit Factor" in report
-        assert "Win Rate" in report
-        assert "Avg Win/Loss" in report
-        assert "Verdict" in report
-
-    def test_passing_report_shows_go(self):
-        pnls = [200.0, 200.0, 200.0, -50.0] * 15
-        m = compute_metrics(pnls)
-        report = m.format_report()
-        assert "GO" in report
-
-    def test_failing_report_shows_failures(self):
-        m = compute_metrics([])
-        report = m.format_report()
-        assert "NO-GO" in report

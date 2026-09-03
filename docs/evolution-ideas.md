@@ -2,10 +2,13 @@
 
 ## Purpose
 
-Capture key ideas and strategic upgrades for the trading bot as it evolves from:
+Capture key ideas and strategic upgrades for the trading bot as it evolves from
+paper development into selectively approved live operation and later versions.
+This is an ideas document, not the live-readiness authority; current graduation
+policy lives in `PLAN.md` and `docs/architecture.md`.
 
 ```text
-v1 (post Phase 11, live trading)
+paper development → operator-approved strategy graduation
 → v1.1 / v1.2 iterative improvements
 → v2+ advanced system
 ```
@@ -25,13 +28,12 @@ prioritization, and design guidance.
 
 ---
 
-## 🚀 v1 Launch Strategy (Post Phase 11)
+## 🚀 Initial Live Launch Principles
 
 ### Requirements Before Going Live
 
-- SMA + RSI running together in paper mode
+- At least one strategy independently satisfies the documented graduation criteria and receives explicit operator approval
 - Strategy-level capital allocation implemented
-- RSI edge filter active
 - Ownership + restart handling reliable
 - No unexplained behavior in logs
 - Basic observability in place

@@ -50,7 +50,7 @@ A Python-based algorithmic trading bot built incrementally, starting with paper 
 trading-bot/
 ├── CLAUDE.md                  # This file
 ├── docs/
-│   └── architecture.md        # Architecture guide and go/no-go framework
+│   └── architecture.md        # Architecture and strategy graduation framework
 ├── PLAN.md                    # Phased build plan and progress tracker
 ├── requirements.txt           # Pinned dependencies
 ├── main.py                    # Entry point
@@ -126,7 +126,6 @@ trading-bot/
 ├── dashboard.py               # Streamlit read-only analytics dashboard
 ├── scripts/
 │   ├── preflight.py           # Pre-flight checklist (must exit 0 before live flip)
-│   ├── gonogo.py              # Go/no-go checker for live readiness
 │   ├── build_envelopes.py     # Builds per-strategy backtest envelopes for the health monitor
 │   ├── strategy_health_review.py # On-demand strategy health/edge report CLI
 │   ├── calibrate_health_thresholds.py # Suggests health-threshold diffs from N weeks of data

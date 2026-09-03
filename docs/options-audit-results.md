@@ -1,8 +1,10 @@
 # Options Strategies Audit — Addendum (Phase 11)
 
 **Date:** 2026-05-27
-**Companion to:** `options_strategies_audit_results.md`
 **Purpose:** Verified, actionable items only, ordered for Phase 11 follow-up. Each item has its claim checked against the actual code at the cited line numbers; verification notes are kept inline so future readers can re-check without redoing the work.
+
+> **Status note:** This is a dated audit record, not the current work queue or
+> live-approval policy. Use `PLAN.md` for present status and priorities.
 
 This addendum supersedes the priority matrix in the original document. Of the original 15 numbered issues + 2 missing-feature notes, **7 are actionable** (6 from the original audit + PLAN.md 11.31 promoted from "tracked"), **1 is documented design** (kept as a future-work note), and the rest are dropped — see `## Rejected / De-prioritized` for reasoning per item.
 
