@@ -477,10 +477,17 @@ def _enqueue_simple_action(args, *, action: str, expected_confirm: str) -> int:
     target_strategy = getattr(args, "strategy", None)
     if target_strategy:
         print(f"strategy:    {target_strategy}")
-    print(
-        f"engine heartbeat drains the queue every "
-        f"~{settings.OPERATOR_COMMAND_HEARTBEAT_SECONDS}s."
-    )
+    if action == "resolve-unexpected-protection":
+        print(
+            "the engine processes this store-dependent command at the next "
+            "safe cycle or sleep boundary; it expires after "
+            f"{settings.OPERATOR_ENGINE_THREAD_COMMAND_EXPIRY_SECONDS}s."
+        )
+    else:
+        print(
+            f"engine heartbeat drains the queue every "
+            f"~{settings.OPERATOR_COMMAND_HEARTBEAT_SECONDS}s."
+        )
     return 0
 
 
@@ -582,8 +589,9 @@ def _enqueue_destructive_action(
             print("broker qty:  revalidated by the engine before submission")
     print(
         "the engine processes this store-dependent command at the next "
-        "safe cycle or sleep boundary; use `operator.py commands` to see "
-        "the result."
+        "safe cycle or sleep boundary; it expires after "
+        f"{settings.OPERATOR_ENGINE_THREAD_COMMAND_EXPIRY_SECONDS}s if that "
+        "boundary is not reached. Use `operator.py commands` to see the result."
     )
     return 0
 

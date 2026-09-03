@@ -235,6 +235,23 @@ def _seed_filled_entry_lifecycle_order(
 
 
 class TestDestructiveThreadRouting:
+    def test_engine_thread_lane_uses_extended_expiry(self, tmp_path):
+        from config import settings
+        from engine.trader import _ENGINE_THREAD_OPERATOR_ACTIONS
+
+        engine, _ = _build_engine(tmp_path)
+        engine.operator_command_store = MagicMock()
+        engine.operator_command_store.claim_next_pending.return_value = None
+
+        engine._process_operator_engine_thread_command()
+
+        engine.operator_command_store.claim_next_pending.assert_called_once_with(
+            expiry_seconds=(
+                settings.OPERATOR_ENGINE_THREAD_COMMAND_EXPIRY_SECONDS
+            ),
+            actions=_ENGINE_THREAD_OPERATOR_ACTIONS,
+        )
+
     def test_heartbeat_leaves_pending_and_engine_executes_cancel(self, tmp_path):
         """Regression for the cross-thread failure found by the paper drill."""
         engine, command_store = _build_engine(tmp_path)

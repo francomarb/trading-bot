@@ -294,17 +294,24 @@ On restart:
 - A command with an existing `client_order_id` must never dispatch a second order until reconciliation proves no broker-side order exists.
 - If reconciliation cannot prove whether a destructive command reached Alpaca, mark the command `indeterminate` / `needs_operator_review` instead of automatically retrying.
 
-Suggested v1 expiration:
+Current expiration policy:
 
 ```text
-pending command older than 60 seconds at engine pickup or startup => rejected_expired
+heartbeat-lane command older than 180 seconds at pickup => rejected_expired
+engine-thread command older than 900 seconds at pickup => rejected_expired
 ```
 
-This is intentionally conservative. An operator can always re-issue the command after checking current state.
+Expiry is scoped to the caller's action lane. The heartbeat must not expire a
+close, reduce, cancel, or latch-resolution command that only the engine thread
+may claim. Fifteen minutes covers observed non-stalled cycles with margin while
+still rejecting intent left behind by a severe API stall. An operator can
+always re-issue an expired command after checking current state.
 
 Implementation requirement:
 
 - `OPERATOR_COMMAND_EXPIRY_SECONDS = 180` should live in `config/settings.py`.
+- `OPERATOR_ENGINE_THREAD_COMMAND_EXPIRY_SECONDS = 900` should live in
+  `config/settings.py`.
 - `OPERATOR_COMMAND_HEARTBEAT_SECONDS = 5` should live in `config/settings.py`.
 - Heartbeat-safe command polling runs independently of slow strategy cycles.
   Commands that read lifecycle/trade SQLite state — close, reduce, cancel, and
@@ -312,7 +319,8 @@ Implementation requirement:
   reaches a safe boundary, then that thread claims and executes one.
   This preserves SQLite's deliberate single-thread lifecycle/trade connection
   and avoids a durable `accepted` row waiting in an in-memory handoff.
-- The expiry can be lowered to 60 seconds only after the fast heartbeat is implemented, verified, and shown not to miss valid commands during normal bot operation.
+- Each poll may expire only commands in the same action lane it is permitted
+  to claim.
 - `client_order_id` strings must fit Alpaca's documented client order ID constraints. Keep generated IDs short and deterministic, for example `op_<command_uid_short>_<action_short>`, with the full mapping stored in SQLite.
 
 ---
@@ -660,7 +668,8 @@ reconciled the option trailing-state pointer to the replacement stop with
 NORMAL startup. Entry pause also survived restart and was lifted after the
 drills. The degraded-basis allocator follow-up is complete: reductions now
 update live allocation state only from durable realized P&L, matching full
-closes. More expiry margin for long engine cycles remains in `PLAN.md`.
+closes. Engine-thread commands now have a separate 15-minute wait budget, and
+heartbeat polling cannot expire commands from that lane.
 
 ### Phase C invariant: allocator and PnL reintegration
 
@@ -728,7 +737,8 @@ Integration/manual paper checks should cover:
 Claude/Gemini reviewers should specifically audit the remaining unresolved or high-risk choices:
 
 1. Is the proposed crash-recovery sequence sufficient to prevent double dispatch?
-2. Is `OPERATOR_COMMAND_EXPIRY_SECONDS = 180` with `OPERATOR_COMMAND_HEARTBEAT_SECONDS = 5` conservative enough for v1?
+2. Do the separate 180-second heartbeat and 900-second engine-thread expiry
+   windows remain appropriate as cycle duration changes?
 3. Is the stop cancel/recreate sequence safe enough for fast markets with equity market/marketable exits?
 4. Which strategy-driven exits, if any, are allowed to supersede an operator lock, and how should that be audited?
 5. Does `position_lifecycle_legs` cover every options/spread restart case already present in the engine?
@@ -752,7 +762,9 @@ Recommended defaults for v1:
 - Mark operator commands `executing` and persist `client_order_id` before broker dispatch.
 - Pre-register operator `client_order_id` with `StreamManager` before broker dispatch.
 - Expire stale pending commands rather than executing old intent.
-- Use `OPERATOR_COMMAND_EXPIRY_SECONDS = 180` and `OPERATOR_COMMAND_HEARTBEAT_SECONDS = 5` as v1 defaults.
+- Use a 180-second expiry for heartbeat controls, a 900-second expiry for
+  engine-thread controls, and a five-second heartbeat cadence. Scope expiry to
+  the same action lane as claim eligibility.
 - Mark ambiguous destructive-command reconciliation as `indeterminate` / `needs_operator_review`; do not auto-retry.
 - Add `position_lifecycle_legs`.
 - Require full `position_uid` for destructive commands in non-interactive mode.
