@@ -6749,22 +6749,25 @@ class TradingEngine:
                         f"{type(exc).__name__}: {exc}"
                     )
 
-            # Live allocator update. This must still run if another durable
-            # projection failed because the broker fill already happened.
-            # When the trade row exists, use its weighted ledger basis so the
-            # live allocator and restart replay book the same dollar result.
-            self._record_realized_pnl(
-                symbol=lifecycle_row.symbol,
-                strategy_name=lifecycle_row.strategy,
-                close_price=close_price,
-                qty=filled_qty,
-                multiplier=100 if _OCC_PAT.match(lifecycle_row.symbol) else 1,
-                external=False,
-                is_full_close=False,
-                update_lifecycle=False,
-                position_uid_override=lifecycle_row.position_uid,
-                realized_pnl_override=durable_realized_pnl,
-            )
+            # Live allocator update. A failed lifecycle projection does not
+            # invalidate a committed ledger value, but a missing durable P&L
+            # must fail closed. Falling back to the in-memory entry-price
+            # estimate here would make live state disagree with restart replay.
+            if durable_realized_pnl is not None:
+                self._record_realized_pnl(
+                    symbol=lifecycle_row.symbol,
+                    strategy_name=lifecycle_row.strategy,
+                    close_price=close_price,
+                    qty=filled_qty,
+                    multiplier=(
+                        100 if _OCC_PAT.match(lifecycle_row.symbol) else 1
+                    ),
+                    external=False,
+                    is_full_close=False,
+                    update_lifecycle=False,
+                    position_uid_override=lifecycle_row.position_uid,
+                    realized_pnl_override=durable_realized_pnl,
+                )
 
             if accounting_errors:
                 durable_trade_written = durable_trade_status in {
