@@ -679,7 +679,7 @@ Full v1 design and rationale: `docs/strategy_health_design.md`. Deliberately def
 
 ---
 
-## Go/No-Go Framework
+## Strategy Graduation Framework
 
 Before committing live capital, the strategy under consideration must satisfy the
 strategy-specific gates below. Shared platform gates must also pass before any live
@@ -688,7 +688,7 @@ explicit operator decision authorizes its inclusion.
 
 1. Target **50 closed trades** in paper trading; a smaller sample for a slow strategy requires documented forward-test reconciliation and an explicit statement of the remaining uncertainty
 2. Paper trading spans **at least 4 weeks** and more than one market condition where practical; untested conditions are documented
-3. Profitability, expectancy, drawdown, and payoff-shape metrics meet documented thresholds appropriate to that strategy; the generic aggregate-checker defaults above are supporting diagnostics, not universal requirements
+3. Profitability, expectancy, drawdown, and payoff-shape metrics meet documented thresholds appropriate to that strategy; generic dashboard diagnostics are supporting evidence, not universal requirements
 4. Net profitability and expectancy remain positive after realistic fees and slippage across meaningful subperiods and are not dominated by one exceptional winner
 5. Drawdown, loss streaks, and capital usage remain within the strategy's documented limits
 6. The strategy's entries, exits, protection, attribution, accounting, restart recovery, and operator controls have reliable paper evidence

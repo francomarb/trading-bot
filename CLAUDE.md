@@ -50,7 +50,7 @@ A Python-based algorithmic trading bot built incrementally, starting with paper 
 trading-bot/
 ├── CLAUDE.md                  # This file
 ├── docs/
-│   └── architecture.md        # Architecture guide and go/no-go framework
+│   └── architecture.md        # Architecture and strategy graduation framework
 ├── PLAN.md                    # Phased build plan and progress tracker
 ├── requirements.txt           # Pinned dependencies
 ├── main.py                    # Entry point

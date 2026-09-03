@@ -47,7 +47,7 @@ A Python-based algorithmic trading bot built incrementally, starting with paper 
 trading-bot/
 ├── AGENTS.md                  # This file
 ├── docs/
-│   └── architecture.md        # Architecture guide and go/no-go framework
+│   └── architecture.md        # Architecture and strategy graduation framework
 ├── PLAN.md                    # Phased build plan and progress tracker
 ├── requirements.txt           # Pinned dependencies
 ├── main.py                    # Entry point
@@ -260,42 +260,23 @@ python scripts/legacy_verify/phase9_verify.py
 
 ## Current Phase
 
-**Phase 10 — In Progress (2026-04-29). Phases 1–9 and 9.5 complete.**
+**Phase 10/11 paper development — in progress (2026-09-03).**
 
-Both **SMA Crossover** and **RSI Reversion** are currently active in
-`forward_test.py` in paper mode. The bot is running in tmux for the combined
-Phase 10 paper-validation gate; this is now a multi-strategy operational test,
-not the earlier SMA-only forward run.
+Six strategy sleeves are active in `forward_test.py`: SMA Crossover, RSI
+Reversion, Donchian Breakout, Leveraged Trend, SPY Options Reversion, and
+Credit Spread. Paper mode is the development environment. Strategies are
+evaluated independently for possible live inclusion; none is preselected, and
+only explicit operator approval can graduate a strategy.
 
-Phase 10 completed to date:
-- **10.B1** Live config separation (`LIVE_TRADING`, separate credentials, `trades_live.db`)
-- **10.B2** Pre-flight checklist (`scripts/preflight.py`)
-- **10.B3** `WatchlistSource` abstraction + `StaticWatchlistSource`; per-strategy watchlists wired
-- **10.C1** Durable position ownership restored from trade DB on restart
-- **10.C2** Startup reconciliation with NORMAL / RESTRICTED fail-safe modes
-- **10.C3/C4** Tests + external-close detection with 3-cycle confirmation window
-- **10.E1** WebSocket order/fill streaming via `TradingStream` (stream-first, REST fallback)
-- **10.F1** Per-strategy capital sleeve allocator (`STRATEGY_ALLOCATIONS`, 50/50 sleeves)
-- **10.F2/F3** Regime detector + engine-level `allowed_regimes` gating
-- **10.F3a** SMA edge filter (`SPY > 200 SMA`, stock `> 200 SMA`, `10d vol > 30d vol`)
-- **10.F3b** RSI edge filter (`SPY 50 SMA with 1% band`, earnings blackout, liquidity floor, active-breakdown gate: new 20-day low below stock 200 SMA; structural SPY 200/BEAR veto owned by regime)
-- **10.F4** RSI paper activation in `forward_test.py`
-- **10.G1** `LIVE_SIZE_MULTIPLIER=0.25` applied in risk manager when live
-- **10.G4** `DRY_RUN` flag — broker logs orders without submitting
-- **10.G6** Fractional share sizing (`FRACTIONAL_ENABLED=True`; fractional DAY entry + standalone whole-share stop path)
+Current priorities and blockers live in `PLAN.md`. In summary:
+- collect clean slippage-calibration fills and enable the drift guard only after review;
+- collect strategy-specific profitability, risk, and operational evidence;
+- build the trustworthy strategy-graduation report tracked in `PLAN.md`;
+- verify the live-size throttle and preflight immediately before any live launch; and
+- keep VPS deployment deferred until the operator decides at least one strategy merits live consideration.
 
-Phase 10 current focus / remaining blockers before live (see `PLAN.md`):
-- **10.D1/D2** Slippage kill switch calibration and enablement — this is the active work now
-- **10.F6** Verify combined SMA + RSI paper logs: startup reconciliation, sleeve accounting, regime gating, attribution
-- **10.G2** Hard dollar cap config for live `.env`
-- **10.G5** Final live go/no-go verification
-- **10.H1-H5** VPS provisioning and deployment hardening before any live transition
-- Minimum **2-4 week combined SMA + RSI paper run** with documented GO/NO-GO before flipping live
-
-Current local verification: **757 tests passing** via
-`/Users/franco/trading-bot/venv/bin/pytest` on 2026-04-30. `PLAN.md`'s latest
-recorded milestone is **646 unit tests passing** as of 2026-04-25, before the
-2026-04-28 dashboard work and 2026-04-29 Bollinger strategy additions.
+Do not rely on a static test-count claim in this file; run the project suite for
+the current branch and report the observed result.
 
 **Operational preference:**
 - Do **not** create Git worktrees for this repo unless the user explicitly asks.
@@ -320,13 +301,13 @@ recorded milestone is **646 unit tests passing** as of 2026-04-25, before the
 1. Keep `python forward_test.py` running and continue collecting real paper fills.
 2. After enough fills accumulate, calibrate realized slippage vs the 5 bps model (`10.D1`).
 3. If thresholds hold, enable `SLIPPAGE_DRIFT_ENABLED=True` (`10.D2`).
-4. Continue the combined SMA + RSI paper-validation window and produce the Phase 10 GO/NO-GO evidence package before any live flip.
+4. Continue per-strategy paper evidence collection; no strategy graduates automatically or as part of a combined portfolio verdict.
 
 ---
 
 ## Manual Restart Verification (Phase 10 operational gate — completed 2026-04-24)
 
-Verified live with MU + NVDA open. Both restored from trade DB record; NORMAL
+Verified against the paper broker with MU + NVDA open. Both restored from trade DB record; NORMAL
 mode confirmed. Expected startup log pattern for reference:
 
 **Position found and assigned from DB:**
