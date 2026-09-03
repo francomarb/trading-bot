@@ -531,10 +531,10 @@ CREATE TABLE IF NOT EXISTS trades (
 """
 
 _MIGRATION_COLUMNS = {
-    # PLAN 11.58(b): legacy/minimal schemas may predate these original
-    # price fields. They are nullable because an unavailable price is NULL,
-    # never a numeric zero sentinel.
-    "avg_fill_price": "REAL",
+    # PLAN 11.58(b): defensively restore the reference column on incomplete
+    # legacy schemas before normalizing its old zero sentinel. The shipped
+    # SQLite schema has always included avg_fill_price, so that core column
+    # does not belong in this additive-migration list.
     "entry_reference_price": "REAL",
     # PLAN 11.54 — dollars the strategy INTENDED to risk on this trade
     # (`equity x risk_per_trade_pct` at sizing time). Nullable; rows

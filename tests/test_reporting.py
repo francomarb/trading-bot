@@ -1983,6 +1983,7 @@ class TestSlippageUnificationSchema:
                 symbol TEXT NOT NULL,
                 side TEXT NOT NULL,
                 qty REAL NOT NULL,
+                avg_fill_price REAL,
                 strategy TEXT NOT NULL,
                 reason TEXT NOT NULL,
                 status TEXT NOT NULL,
