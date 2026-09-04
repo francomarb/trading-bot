@@ -64,6 +64,51 @@ EntryAllowedCallback = Callable[[], bool]
 _ENTRY_WATCH_TIMEOUT_SECONDS = MLEG_ENTRY_WATCH_TIMEOUT_SECONDS
 
 
+def _status_value(value: object) -> str:
+    """Return a lowercase Alpaca status/event string."""
+    raw = value.value if hasattr(value, "value") else value
+    return str(raw or "").lower()
+
+
+def _terminal_outcome(*, order: object | None, stream_update: object | None) -> str:
+    """Classify a terminal order without treating every wake-up as a fill.
+
+    ``StreamManager.watch`` wakes for every terminal event, including cancel,
+    reject, expiry, and replacement.  REST order state is preferred when it is
+    terminal; the captured stream event is the fallback when REST is stale or
+    unavailable.  Any terminal order with a positive cumulative fill is
+    preserved as ``partially_filled`` even if its final status is expired.
+    """
+    stream_order = getattr(stream_update, "order", None)
+    resolved_order = order or stream_order
+    filled_qty = float(getattr(resolved_order, "filled_qty", 0) or 0)
+    order_status = _status_value(getattr(resolved_order, "status", None))
+    stream_event = _status_value(getattr(stream_update, "event", None))
+
+    terminal_order_statuses = {
+        "filled", "stopped", "partially_filled", "canceled", "cancelled",
+        "expired", "replaced", "rejected", "done_for_day",
+    }
+    if order_status in terminal_order_statuses:
+        if order_status in {"filled", "stopped"}:
+            return "filled"
+        if filled_qty > 0 or order_status == "partially_filled":
+            return "partially_filled"
+        if order_status == "rejected":
+            return "rejected"
+        return "canceled"
+
+    if stream_event == "fill":
+        return "filled"
+    if filled_qty > 0 or stream_event == "partial_fill":
+        return "partially_filled"
+    if stream_event == "rejected":
+        return "rejected"
+    # watch() only wakes on terminal events. Unknown, canceled, expired,
+    # replaced, and done-for-day outcomes are therefore safely non-fills.
+    return "canceled"
+
+
 # ── Multi-leg order construction (11.28) ────────────────────────────────────
 
 
@@ -283,16 +328,34 @@ class _BaseExecutionWorker(threading.Thread):
         before submission (None when no stream is wired).
         """
         if stream_event is not None:
-            filled = stream_event.wait(timeout=timeout)
-            self.stream_manager.unwatch(order_id)
-            if filled:
-                logger.info(f"[{self.name}] order filled via stream.")
+            terminal = stream_event.wait(timeout=timeout)
+            if terminal:
+                # Capture the stream payload before unwatch() removes it.
+                stream_update = self.stream_manager.get_update(order_id)
                 try:
                     final = self.api.get_order_by_id(order_id)
-                    self._report_fill("filled", order_id, final)
                 except Exception:
-                    self._report_fill("filled", order_id)
+                    final = getattr(stream_update, "order", None)
+                stream_order = getattr(stream_update, "order", None)
+                if stream_order is not None:
+                    stream_qty = float(
+                        getattr(stream_order, "filled_qty", 0) or 0
+                    )
+                    final_qty = float(getattr(final, "filled_qty", 0) or 0)
+                    if stream_qty > final_qty:
+                        # REST can briefly lag the terminal stream update.
+                        final = stream_order
+                outcome = _terminal_outcome(
+                    order=final,
+                    stream_update=stream_update,
+                )
+                self.stream_manager.unwatch(order_id)
+                logger.info(
+                    f"[{self.name}] order resolved via stream: {outcome}."
+                )
+                self._report_fill(outcome, order_id, final)
                 return
+            self.stream_manager.unwatch(order_id)
             # Stream gap — re-check REST before declaring it unfilled.
             try:
                 latest = self.api.get_order_by_id(order_id)

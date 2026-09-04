@@ -45,7 +45,7 @@ Watchlist → raw strategy signal → edge filter (+ sector momentum/IV) → reg
 - **Defined-risk spread path** sizes from max loss and sleeve capacity, then dispatches atomic MLEG orders
 - **Execution** only places orders after all upstream gates pass
 
-For single-leg options, the execution path diverges after the risk manager: the broker detects the OCC symbol and dispatches an `OptionsExecutionWorker` thread that handles the async limit-entry + bracket lifecycle independently of the engine loop. Multi-leg options strategies such as credit spreads bypass `RiskManager.evaluate` after the sleeve check because max loss is defined by the spread; they route through the MLEG combo path and `SpreadExecutionWorker`.
+For single-leg options, the execution path diverges after the risk manager: the broker detects the OCC symbol and dispatches an `OptionsExecutionWorker` thread for the async DAY limit entry. After a fill, the engine seeds durable trailing state and synchronizes the protective stop; profit and defensive exits remain engine-managed. Multi-leg options strategies such as credit spreads bypass `RiskManager.evaluate` after the sleeve check because max loss is defined by the spread; they route through the MLEG combo path and `SpreadExecutionWorker`.
 
 Single-leg equity lifecycle policy is explicit and durable. Traditional
 strategies use `STOP_DISTANCE + BROKER_STOP`; intentionally stopless trend
@@ -544,8 +544,8 @@ Options orders are detected by matching the OCC symbol format (`^[A-Z]{1,6}[0-9]
 
 1. Calls `build_option_execution(symbol, underlying_price)` on the strategy to get `(occ_symbol, limit_price, take_profit, stop_loss)`. If `None` is returned (e.g. spread too wide), the worker exits without placing an order.
 2. Submits a limit entry order for the OCC symbol via `TradingClient`.
-3. Polls `StreamManager` for a fill event for up to `MLEG_ENTRY_WATCH_TIMEOUT_SECONDS` seconds (default 180; shared by the async options workers). If no fill arrives, cancels the order and exits.
-4. On confirmed fill: submits take-profit and stop-loss legs as a bracket OTO order.
+3. Waits for a terminal `StreamManager` event for up to `MLEG_ENTRY_WATCH_TIMEOUT_SECONDS` seconds (default 180; shared by the async options workers), then classifies the actual broker/stream status. Filled, partially filled, rejected, expired, and canceled outcomes remain distinct; a timeout cancels the order.
+4. On a confirmed fill, the engine seeds durable option-trailing state and synchronizes the standalone protective stop. Profit-taking, time, delta, and trailing exits are engine-managed rather than an entry bracket.
 5. Reports the fill back to the engine via a queue drained by `drain_option_fills()` each cycle.
 
 **DRY_RUN guard:** the dry-run check fires before the worker is created — no thread is spawned and no order is submitted during dry runs.

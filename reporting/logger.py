@@ -967,6 +967,21 @@ class TradeLogger:
             )
             conn.execute(_POSITION_ID_INDEX_SQL)
             conn.execute(_POSITION_UID_INDEX_SQL)
+            # Lifecycle P&L is a projection of durable trade rows. A
+            # substrate stop fill historically recomputed the parent before
+            # `log_stop_fill` committed the realized amount, leaving the
+            # parent stale (most visibly after an operator partial reduction
+            # followed by a final stop). Repair only parents that have at
+            # least one explicit realized-P&L row; legacy parents without an
+            # authoritative trade value are deliberately left untouched.
+            conn.execute(
+                "UPDATE position_lifecycle SET net_realized_pnl = ("
+                "SELECT COALESCE(SUM(t.realized_pnl), 0.0) FROM trades AS t "
+                "WHERE t.position_uid = position_lifecycle.position_uid"
+                ") WHERE EXISTS (SELECT 1 FROM trades AS t "
+                "WHERE t.position_uid = position_lifecycle.position_uid "
+                "AND t.realized_pnl IS NOT NULL)"
+            )
             # 11.10c: signal-lifecycle counter table for the Strategy Health
             # Monitor. Local import avoids a circular dependency
             # (strategies.health.* can import reporting.logger types).

@@ -106,6 +106,89 @@ class TestOptionsExecutionWorker:
         )
         stream.unwatch.assert_called_once_with("ord-1")
 
+    @pytest.mark.parametrize(
+        ("terminal_status", "expected"),
+        [
+            ("canceled", "canceled"),
+            ("expired", "canceled"),
+            ("rejected", "rejected"),
+        ],
+    )
+    def test_stream_terminal_non_fill_is_not_reported_as_filled(
+        self, terminal_status, expected
+    ):
+        api = MagicMock()
+        api.submit_order.return_value = _submitted_order("ord-1")
+        final = _submitted_order("ord-1", status=terminal_status)
+        api.get_order_by_id.return_value = final
+        stream = MagicMock()
+        stream_event = MagicMock()
+        stream_event.wait.return_value = True
+        stream.watch.return_value = stream_event
+        stream.get_update.return_value = SimpleNamespace(
+            event=SimpleNamespace(value=terminal_status),
+            order=final,
+        )
+        on_fill = MagicMock()
+
+        worker = OptionsExecutionWorker(
+            decision=_decision(),
+            api=api,
+            stream_manager=stream,
+            on_fill=on_fill,
+        )
+        worker.run()
+
+        on_fill.assert_called_once_with(expected, 0.0, None, "ord-1")
+
+    def test_expired_order_with_cumulative_fill_reports_partial(self):
+        api = MagicMock()
+        api.submit_order.return_value = _submitted_order("ord-1")
+        final = SimpleNamespace(
+            id="ord-1",
+            status=SimpleNamespace(value="expired"),
+            filled_qty="1",
+            filled_avg_price="10.25",
+        )
+        api.get_order_by_id.return_value = final
+        stream = MagicMock()
+        stream_event = MagicMock()
+        stream_event.wait.return_value = True
+        stream.watch.return_value = stream_event
+        stream.get_update.return_value = SimpleNamespace(
+            event=SimpleNamespace(value="expired"),
+            order=final,
+        )
+        on_fill = MagicMock()
+
+        OptionsExecutionWorker(
+            decision=_decision(), api=api, stream_manager=stream, on_fill=on_fill,
+        ).run()
+
+        on_fill.assert_called_once_with(
+            "partially_filled", 1.0, 10.25, "ord-1"
+        )
+
+    def test_stream_fill_payload_survives_rest_lookup_failure(self):
+        api = MagicMock()
+        api.submit_order.return_value = _submitted_order("ord-1")
+        api.get_order_by_id.side_effect = RuntimeError("REST unavailable")
+        stream = MagicMock()
+        stream_event = MagicMock()
+        stream_event.wait.return_value = True
+        stream.watch.return_value = stream_event
+        stream.get_update.return_value = SimpleNamespace(
+            event=SimpleNamespace(value="fill"),
+            order=_filled_order("ord-1"),
+        )
+        on_fill = MagicMock()
+
+        OptionsExecutionWorker(
+            decision=_decision(), api=api, stream_manager=stream, on_fill=on_fill,
+        ).run()
+
+        on_fill.assert_called_once_with("filled", 2.0, 10.5, "ord-1")
+
     def test_submit_failure_reports_rejected_and_cleans_watch(self):
         api = MagicMock()
         api.submit_order.side_effect = Exception("complex orders not supported for options trading")
@@ -313,6 +396,33 @@ class TestSpreadExecutionWorker:
         )
         stream.unwatch.assert_called_once_with("combo-1")
         on_fill.assert_called_once_with("filled", 1.0, 3.25, "combo-1")
+
+    def test_stream_rejection_is_not_reported_as_mleg_fill(self):
+        api = MagicMock()
+        api.submit_order.return_value = _mleg_submitted("combo-1")
+        final = _mleg_submitted("combo-1", status="rejected")
+        api.get_order_by_id.return_value = final
+        stream = MagicMock()
+        stream_event = MagicMock()
+        stream_event.wait.return_value = True
+        stream.watch.return_value = stream_event
+        stream.get_update.return_value = SimpleNamespace(
+            event=SimpleNamespace(value="rejected"),
+            order=final,
+        )
+        on_fill = MagicMock()
+
+        SpreadExecutionWorker(
+            legs=_open_legs(),
+            qty=1,
+            limit_price=3.25,
+            strategy_name="credit_spread",
+            api=api,
+            stream_manager=stream,
+            on_fill=on_fill,
+        ).run()
+
+        on_fill.assert_called_once_with("rejected", 0.0, None, "combo-1")
 
     def test_submit_failure_reports_rejected_and_cleans_watch(self):
         api = MagicMock()
