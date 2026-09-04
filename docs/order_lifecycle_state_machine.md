@@ -1235,6 +1235,8 @@ Explicit so the implementation PR cannot silently expand any one table into anot
 
 This boundary is the load-bearing answer to "the per-order table is not a second slippage-reporting store." Foundation PR persists pre-fill benchmark provenance on the order row; the trades row continues to be the source of truth for computed slippage. Phase 2 consumer migration reads computed values from `trades` exactly as it does today.
 
+At startup these boundaries now determine restoration order. Broker state answers whether a position exists; `position_lifecycle` supplies identity and strategy ownership for single-leg positions; `trades` supplies fill accounting and serves as an ownership fallback only where no lifecycle claim exists. An `error` lifecycle row remains a claim because the partial unique index still reserves its `owner_key`; it must be resolved, not bypassed. MLEG spreads remain the documented exception in §10.7: their runtime legs and entry economics are still reconstructed from `trades` until the spread entry substrate is complete.
+
 **Idempotency keys differ between the two tables, but both use cumulative state.** §6.4 / §6.5 spell this out:
 
 - `position_lifecycle_orders` dedups state transitions by `(order_id, last_observed_broker_updated_at)` plus state-machine rank. Each row holds the order's most recent observed state.

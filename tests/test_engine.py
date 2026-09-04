@@ -50,6 +50,7 @@ from engine.trader import (
     _recent_bar_alignment_error,
 )
 from engine.lifecycle_orders import OrderEvent
+from engine.positions import owner_key_for
 from execution.broker import (
     AlpacaBroker,
     BrokerOrderAuditSnapshot,
@@ -3103,11 +3104,243 @@ def _write_sell(tl: TradeLogger, symbol: str, strategy: str) -> None:
     )
 
 
+def _write_lifecycle_claim(
+    engine: TradingEngine,
+    *,
+    symbol: str,
+    strategy: str = "fake_strategy",
+    owner_key: str | None = None,
+    status: str = "open",
+) -> str:
+    """Create one lifecycle ownership claim for restart tests."""
+    from engine.lifecycle import new_position_uid
+
+    uid = new_position_uid()
+    engine.lifecycle_store.create_pending(
+        position_uid=uid,
+        symbol=symbol,
+        owner_key=owner_key or owner_key_for(symbol),
+        strategy=strategy,
+        position_type="single_leg",
+        entry_qty=10.0,
+    )
+    if status == "open":
+        engine.lifecycle_store.mark_open(
+            position_uid=uid,
+            avg_entry_price=100.5,
+            current_qty=10.0,
+        )
+    elif status == "error":
+        engine.lifecycle_store._conn.execute(
+            "UPDATE position_lifecycle SET status = 'error' "
+            "WHERE position_uid = ?",
+            (uid,),
+        )
+        engine.lifecycle_store._conn.commit()
+    else:
+        raise ValueError(f"unsupported test lifecycle status: {status}")
+    return uid
+
+
 class TestDurableOwnershipFromDB:
-    """10.C1 — _restore_ownership_from_db reads the trade log, not slot order."""
+    """Lifecycle-first ownership with legacy trade/slot fallbacks."""
+
+    def test_lifecycle_restores_owner_without_trade_history(
+        self, patch_fetch, tmp_path
+    ):
+        positions = {"AAPL": Position("AAPL", 10, 100.0, 1000.0)}
+        engine, _, _ = _engine_with_db(
+            patch_fetch, tmp_path, positions=positions
+        )
+        _write_lifecycle_claim(engine, symbol="AAPL")
+
+        conflicts = engine._restore_ownership_from_db(
+            _snapshot(positions=positions)
+        )
+
+        assert engine._get_owner("AAPL") == "fake_strategy"
+        assert conflicts == set()
+
+    def test_lifecycle_owner_does_not_read_contradictory_trade_replay(
+        self, patch_fetch, tmp_path
+    ):
+        """A complete lifecycle claim makes malformed history irrelevant."""
+        positions = {"AAPL": Position("AAPL", 10, 100.0, 1000.0)}
+        engine, _, _ = _engine_with_db(
+            patch_fetch, tmp_path, positions=positions
+        )
+        _write_lifecycle_claim(engine, symbol="AAPL")
+        engine.trade_logger.read_all_open_owners = MagicMock(
+            side_effect=AssertionError("legacy replay must not run")
+        )
+
+        conflicts = engine._restore_ownership_from_db(
+            _snapshot(positions=positions)
+        )
+
+        assert engine._get_owner("AAPL") == "fake_strategy"
+        assert conflicts == set()
+        engine.trade_logger.read_all_open_owners.assert_not_called()
+
+    def test_lifecycle_error_blocks_trade_fallback(
+        self, patch_fetch, tmp_path
+    ):
+        positions = {"AAPL": Position("AAPL", 10, 100.0, 1000.0)}
+        engine, _, tl = _engine_with_db(
+            patch_fetch, tmp_path, positions=positions
+        )
+        _write_lifecycle_claim(engine, symbol="AAPL", status="error")
+        _write_buy(tl, "AAPL", "fake_strategy")
+
+        conflicts = engine._restore_ownership_from_db(
+            _snapshot(positions=positions)
+        )
+
+        assert not engine._has_position("AAPL")
+        assert conflicts == {"AAPL"}
+
+    def test_lifecycle_exact_contract_mismatch_is_conflict(
+        self, patch_fetch, tmp_path
+    ):
+        held = "SPY260918C00800000"
+        recorded = "SPY260918C00790000"
+        positions = {held: Position(held, 1, 10.0, 1000.0)}
+        engine, _, _ = _engine_with_db(
+            patch_fetch, tmp_path, positions=positions
+        )
+        _write_lifecycle_claim(
+            engine,
+            symbol=recorded,
+            owner_key="SPY",
+        )
+
+        conflicts = engine._restore_ownership_from_db(
+            _snapshot(positions=positions)
+        )
+
+        assert not engine._has_position(held)
+        assert conflicts == {"SPY"}
+
+    def test_multiple_single_leg_contracts_for_owner_are_conflict(
+        self, patch_fetch, tmp_path
+    ):
+        first = "SPY260918C00790000"
+        second = "SPY260918C00800000"
+        positions = {
+            first: Position(first, 1, 10.0, 1000.0),
+            second: Position(second, 1, 9.0, 900.0),
+        }
+        engine, _, _ = _engine_with_db(
+            patch_fetch, tmp_path, positions=positions
+        )
+        _write_lifecycle_claim(engine, symbol=first, owner_key="SPY")
+
+        conflicts = engine._restore_ownership_from_db(
+            _snapshot(positions=positions)
+        )
+
+        assert not engine._has_position(first)
+        assert conflicts == {"SPY"}
+
+    def test_equity_and_option_for_same_owner_are_conflict(
+        self, patch_fetch, tmp_path
+    ):
+        option = "SPY260918C00800000"
+        positions = {
+            "SPY": Position("SPY", 10, 500.0, 5000.0),
+            option: Position(option, 1, 9.0, 900.0),
+        }
+        engine, _, _ = _engine_with_db(
+            patch_fetch, tmp_path, positions=positions
+        )
+        _write_lifecycle_claim(engine, symbol="SPY")
+
+        conflicts = engine._restore_ownership_from_db(
+            _snapshot(positions=positions)
+        )
+
+        assert not engine._has_position("SPY")
+        assert conflicts == {"SPY"}
+
+    def test_lifecycle_retired_strategy_is_conflict(
+        self, patch_fetch, tmp_path
+    ):
+        positions = {"AAPL": Position("AAPL", 10, 100.0, 1000.0)}
+        engine, _, _ = _engine_with_db(
+            patch_fetch, tmp_path, positions=positions
+        )
+        _write_lifecycle_claim(
+            engine,
+            symbol="AAPL",
+            strategy="retired_strategy",
+        )
+
+        conflicts = engine._restore_ownership_from_db(
+            _snapshot(positions=positions)
+        )
+
+        assert not engine._has_position("AAPL")
+        assert conflicts == {"AAPL"}
+
+    def test_lifecycle_query_failure_refuses_trade_fallback(
+        self, patch_fetch, tmp_path
+    ):
+        positions = {"AAPL": Position("AAPL", 10, 100.0, 1000.0)}
+        engine, _, tl = _engine_with_db(
+            patch_fetch, tmp_path, positions=positions
+        )
+        _write_buy(tl, "AAPL", "fake_strategy")
+        engine.lifecycle_store.get_ownership_claims = MagicMock(
+            side_effect=sqlite3.OperationalError("synthetic read failure")
+        )
+
+        conflicts = engine._restore_ownership_from_db(
+            _snapshot(positions=positions)
+        )
+
+        assert not engine._has_position("AAPL")
+        assert conflicts == {"AAPL"}
+
+    def test_legacy_trade_query_failure_is_conflict(
+        self, patch_fetch, tmp_path
+    ):
+        positions = {"AAPL": Position("AAPL", 10, 100.0, 1000.0)}
+        engine, _, _ = _engine_with_db(
+            patch_fetch, tmp_path, positions=positions
+        )
+        engine.trade_logger.read_all_open_owners = MagicMock(
+            side_effect=sqlite3.OperationalError("synthetic replay failure")
+        )
+
+        conflicts = engine._restore_ownership_from_db(
+            _snapshot(positions=positions)
+        )
+
+        assert not engine._has_position("AAPL")
+        assert conflicts == {"AAPL"}
+
+    def test_existing_runtime_owner_disagreement_is_conflict(
+        self, patch_fetch, tmp_path
+    ):
+        positions = {"AAPL": Position("AAPL", 10, 100.0, 1000.0)}
+        engine, _, _ = _engine_with_db(
+            patch_fetch, tmp_path, positions=positions
+        )
+        _write_lifecycle_claim(engine, symbol="AAPL")
+        engine._register_single_leg(
+            strategy_name="retired_strategy",
+            symbol="AAPL",
+        )
+
+        conflicts = engine._restore_ownership_from_db(
+            _snapshot(positions=positions)
+        )
+
+        assert engine._get_owner("AAPL") == "retired_strategy"
+        assert conflicts == {"AAPL"}
 
     def test_db_record_authoritative_owner(self, patch_fetch, tmp_path):
-        """DB buy record → ownership assigned from DB, not slot guess."""
+        """No lifecycle claim: trade history remains the first fallback."""
         positions = {"AAPL": Position("AAPL", 10, 100.0, 1000.0)}
         engine, _, tl = _engine_with_db(patch_fetch, tmp_path, positions=positions)
         _write_buy(tl, "AAPL", "fake_strategy")
