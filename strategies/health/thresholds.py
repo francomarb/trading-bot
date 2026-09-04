@@ -79,7 +79,8 @@ _DEFAULTS: dict[str, CheckThresholds] = {
     # Fill rate is "below" direction — low fill rate is bad
     "fill_rate": CheckThresholds(watch=0.70, degraded=0.50, broken=0.30, direction="below"),
     "partial_fill_rate": CheckThresholds(watch=0.05, degraded=0.15, broken=0.30),
-    # TODO(11.10h): options spread realized vs picked — calibrate post 11.26
+    # 11.26 established the SPY-options paper baseline; this remains a
+    # distinct monitoring metric rather than an entry-cutoff setting.
     "options_spread_realized_vs_picked_pct": CheckThresholds(
         watch=0.10, degraded=0.25, broken=0.50
     ),

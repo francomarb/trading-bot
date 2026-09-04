@@ -106,18 +106,16 @@ This addendum supersedes the priority matrix in the original document. Of the or
 
 ### A7 — Tighten `FATAL_SPREAD_PCT` after paper-data review
 
-**Severity:** Low — already on the watch list per memory `project_options_picker_spread_watch`.
+**Status:** ✅ Completed with the `11.26` paper-data review (2026-09-04).
 
 **Verification (and correction of the original audit's claim):**
-- [`utils/options_ranker.py:43`](utils/options_ranker.py:43) — `FATAL_SPREAD_PCT = 0.10`
+- [`utils/options_ranker.py:43`](utils/options_ranker.py:43) — `FATAL_SPREAD_PCT = 0.06`
 - [`utils/options_ranker.py:44`](utils/options_ranker.py:44) — `SOFT_SPREAD_PCT = 0.05` (scoring only, not a hard filter)
-- **The original audit (and my first addendum) incorrectly claimed the SPY-options strategy enforces its own 5% spread gate downstream in `build_option_execution`. It does not.** I re-read [`strategies/spy_options_reversion.py:213-256`](strategies/spy_options_reversion.py:213): the strategy only checks `notional_cap > 0` and `premium > 0`. `pick.spread_pct` is logged but never gated. So `FATAL_SPREAD_PCT = 0.10` is the **only** hard spread cutoff for SPY calls.
+- **The original audit (and my first addendum) incorrectly claimed the SPY-options strategy enforces its own 5% spread gate downstream in `build_option_execution`. It does not.** The ranker's 6% ceiling is the only hard spread cutoff for SPY calls.
 
-That makes the 10% threshold more load-bearing than the audit assumed: there is no second-line defense. It was deliberately relaxed from 5% during 11.25 (`project_options_picker_spread_watch`).
+The corrected current-picker cohort produced 11 fills from 14 attempts (78.6%). Picked spreads were 0.55% p50 / 1.27% p95, no fill exceeded 5%, and worst adverse entry drift was 3.5 bps. Contracts stayed within 17–24 DTE and near the 0.5%-ITM target.
 
-**Fix (only after paper-data confirmation):** consider lowering `FATAL_SPREAD_PCT` to ~0.06 (still above SOFT_SPREAD_PCT for graceful scoring) **or** make it a per-call parameter so each strategy can pass its own ceiling.
-
-**Pre-requisite:** review actual SPY-options fills from paper trading to confirm what spread% the filled contracts have been transacting at. Do not tighten without that data.
+**Decision:** use a 6% hard ceiling, preserving a small buffer above the 5% soft-quality line. Keep the scoring weights and 180-second timeout unchanged; the observed non-fills all had narrow spreads, so neither setting caused them.
 
 ---
 
@@ -181,5 +179,5 @@ Entries describe the *pre-fix* state observed during the audit. The Status colum
 | A4 | Put-spread picker uses midpoint | `utils/options_lookup.py:455-459` | Reference design — call picker now mirrors it (PR [#29](https://github.com/francomarb/trading-bot/pull/29)) |
 | A5 | `_build_quote_lookup` instantiated client per call | `strategies/spy_options_reversion.py:223, 259-297` (pre-PR-29) | ✅ Addressed by PR [#29](https://github.com/francomarb/trading-bot/pull/29) |
 | A6 | `OptionTradeRejected` imported cross-module from a strategy module | `engine/trader.py:95`, `tests/test_engine.py:55`, `tests/test_spy_options_reversion.py:163` (pre-PR-27) | ✅ Addressed by PR [#27](https://github.com/francomarb/trading-bot/pull/27) — canonical location now `strategies/base.py`, re-exported for back-compat |
-| A7 | `FATAL_SPREAD_PCT = 0.10` is the only hard spread cutoff (no 5% gate in strategy) | `utils/options_ranker.py:43`, `strategies/spy_options_reversion.py:213-256` | ⏸ Deferred — paper-data review per `project_options_picker_spread_watch` memory |
+| A7 | The ranker is the only hard spread cutoff (no second strategy-level gate) | `utils/options_ranker.py`, `strategies/spy_options_reversion.py` | ✅ 11.26 closed; 6% hard ceiling adopted after paper review |
 | N1 | Daily VIX caching is documented design | `docs/architecture.md:656`, `docs/spy_options_reversion_strategy.md:47, 214-216` | ✓ — future-work note only, no fix planned |

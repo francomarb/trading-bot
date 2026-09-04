@@ -25,7 +25,7 @@ The bot is organized into seven layers. Each layer has a single responsibility a
 │        Risk Manager + Allocator         │  Position sizing, sleeve budgets, kill switches
 ├─────────────────────────────────────────┤
 │         Execution Layer (alpaca-py)     │  TradingClient, order management, paper↔live
-│         Options Execution Workers       │  Async single-leg brackets + MLEG combos
+│         Options Execution Workers       │  Async single-leg DAY limits + MLEG combos
 ├─────────────────────────────────────────┤
 │         Reporting & Monitoring          │  Trade log (SQLite), PnL, metrics, alerts
 └─────────────────────────────────────────┘
@@ -433,7 +433,7 @@ Each slot binds a strategy to its symbol universe, timeframe, and allowed regime
 | RSI Reversion | `rsi_reversion.py` | **Paper Trading** | LIMIT | All (`allowed_regimes=None`) | 15% (equity) |
 | Donchian Breakout | `donchian_breakout.py` | **Paper Trading** | STOP_LIMIT | TRENDING, RANGING, VOLATILE | 15% (equity) |
 | Leveraged Trend (SPXL/TQQQ/TECL/SOXL) | `leveraged_trend.py` | **Paper Trading** | MARKET | All | 25% (equity, no stretch) |
-| SPY Options RSI Reversion | `spy_options_reversion.py` | **Paper Trading** | LIMIT (async bracket) | TRENDING, RANGING | 5% (isolated) |
+| SPY Options RSI Reversion | `spy_options_reversion.py` | **Paper Trading** | DAY LIMIT (async) | TRENDING, RANGING | 5% (isolated) |
 | Credit Spread (SPY + QQQ) | `credit_spread.py` | **Paper Trading** | MLEG combo (async) | TRENDING, RANGING | 10% (isolated, shared across underlyings) |
 
 ### 5. Risk Manager + Sleeve Allocator
@@ -476,7 +476,7 @@ The isolated options pool uses the same `SleeveAllocator` and HWM drawdown gate 
 - Enforce the daily percentage loss limit against Alpaca prior-close equity when
   available; account-loss halts stay sticky for that broker baseline and
   recompute after baseline rollover.
-- Apply stop-loss levels to every order (ATR-based for equities; bracket legs for options)
+- Apply stop-loss levels to every protected order (ATR-based for equities; standalone broker stops for single-leg options)
 - Track current exposure per symbol and overall
 - Loss-streak cooldown per strategy
 - Broker-error-streak kill switch
@@ -556,14 +556,14 @@ Options orders are detected by matching the OCC symbol format (`^[A-Z]{1,6}[0-9]
 
 | Path | OCC-specific behaviour |
 |---|---|
-| `_repair_missing_protective_stops` | Skips OCC symbols — bracket stop legs are managed by Alpaca, not the engine |
+| `_repair_missing_protective_stops` | Skips OCC symbols — their standalone stops are owned by the dedicated option-trailing synchronizer |
 | `_record_fill` (slippage monitor) | Skipped for OCC exits — underlying bar price vs option premium produces meaningless bps. The pre-close arrival-quote fetch is also OCC-gated (OPRA, not the stock quote endpoint). Independently of OCC, `_record_fill` now drops any fill whose `benchmark_kind` is outside the execution-quality family — see "Slippage metric families" below |
 | `_log_close` | Uses `result.avg_fill_price` (option premium) as `modeled_price` instead of the underlying bar close |
 | `_record_realized_pnl` | Accepts `multiplier=100` for options; default 1 for equities |
 | `_maybe_dispatch_substrate_stop_fill` | Normalizes OCC → underlying via `owner_key_for()` before `_positions` lookup; logs with `log_stop_fill`. Replaced `_process_stream_stop_fills`, removed 2026-08-14 |
 | `inspect_open_positions` exit | Calls `_OCC_PAT`-gated multiplier; skips `_record_fill`; uses premium as modeled price |
 
-**WebSocket stream stop fills:** When a bracket stop leg fills, the stream delivers the event with the OCC symbol. It is translated to a substrate `OrderEvent`, applied by `apply_order_event`, and dispatched by `_maybe_dispatch_substrate_stop_fill`, which normalizes the OCC string to the underlying ticker (the `position_id` in `_positions`), records the real P&L with the 100× multiplier, and calls `log_stop_fill` to persist the confirmed execution. **This is the only path.** The legacy `_process_stream_stop_fills` compatibility fallback and the `_stop_fills` stream accumulator were removed on 2026-08-14, after 7 weeks in which it handled zero fills — 5 real stop-outs were all handled by the substrate while the legacy path logged "already handled" and returned. Duplicate events are rejected by the substrate's compare-and-set rather than by a trade-log lookup.
+**WebSocket stream stop fills:** When a standalone option protective stop fills, the stream delivers the event with the OCC symbol. It is translated to a substrate `OrderEvent`, applied by `apply_order_event`, and dispatched by `_maybe_dispatch_substrate_stop_fill`, which normalizes the OCC string to the underlying ticker (the `position_id` in `_positions`), records the real P&L with the 100× multiplier, and calls `log_stop_fill` to persist the confirmed execution. **This is the only path.** The legacy `_process_stream_stop_fills` compatibility fallback and the `_stop_fills` stream accumulator were removed on 2026-08-14, after 7 weeks in which it handled zero fills — 5 real stop-outs were all handled by the substrate while the legacy path logged "already handled" and returned. Duplicate events are rejected by the substrate's compare-and-set rather than by a trade-log lookup.
 
 **Position ownership model (PLAN.md 11.27):** `_positions: dict[position_id, Position]` keys single-leg positions by `owner_key_for(symbol)` — equity ticker or option underlying — and reserves UUID `position_id`s for spreads. That abstraction is what lets a single-leg SPY option and a SPY credit spread coexist: the single-leg option owns the `"SPY"` slot, while the spread owns a UUID. Two single-leg options strategies on the same underlying are still intentionally blocked by the underlying-level conflict check until single-leg option positions are moved off the underlying-keyed slot. See `engine/positions.py` and the PLAN.md 11.44 follow-up.
 
@@ -643,7 +643,7 @@ The `TradeLogger` inserts a row for every fill. Write paths:
 |---|---|---|
 | `log(build_record(...))` | Entry fills (single-leg strategies) | `result.avg_fill_price` |
 | `log(build_close_record(...))` | Signal-based single-leg exit fills | `result.avg_fill_price`; `modeled_price` is the premium for options, bar close for equities |
-| `log_stop_fill(symbol, strategy, qty, avg_fill_price)` | Confirmed WebSocket bracket stop fills | Exact stream fill price and qty |
+| `log_stop_fill(symbol, strategy, qty, avg_fill_price)` | Confirmed WebSocket protective-stop fills | Exact stream fill price and qty |
 | `log_external_close(symbol, strategy, reason)` | Inferred external closes (no confirmed fill event) | `NULL` — price unknown |
 | `log_spread_fill(position_id, short_occ, long_occ, qty, net_price, opening, realized_pnl=...)` | MLEG combo open / close (credit spreads, 11.29) | Writes **two rows per fill** (one per leg) keyed by the same `position_id`, `position_type='spread'`. Net economics on the short-leg row; realized P&L on the short-leg close row feeds the allocator HWM gate via `read_strategy_realized_pnl_summary`. |
 

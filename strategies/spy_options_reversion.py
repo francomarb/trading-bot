@@ -348,7 +348,7 @@ class SPYOptionsReversionStrategy(BaseStrategy):
         Selection uses ``utils.options_ranker``: quotes the top-5 strike-nearest
         candidates and scores each on (strike proximity, spread quality,
         premium efficiency). Hard filters drop unaffordable, broken-quote,
-        outrageously-spread (>10%), or premium-outlier contracts.
+        excessively-spread (>6%), or premium-outlier contracts.
 
         ``notional_cap`` is the per-position dollar budget from the allocator
         and is passed straight through to the ranker as ``max_premium_per_contract``.
