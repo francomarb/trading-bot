@@ -1098,7 +1098,7 @@ The `role` column in `position_lifecycle_orders` is an open enum (§6.2). The fo
 | `Position.position_uid` engine-state integration, dashboard exposure, broad alert adoption | Separate consumer PRs per §17 |
 | Health monitor / sleeve allocator / PnL reporting / backtest reconciliation adoption of `position_uid` | Separate consumer PRs per §17 |
 | ~~Slippage Phase 2 + 4 consumer migration (health, risk kill switch, calibration script, dashboard display + denominator fix, pnl reports, reconcile gate, legacy dual-write removal)~~ ✅ SHIPPED (PR #67, merged 2026-06-17) | ~~Slippage Phase 2 PR~~ |
-| Slippage Phase 3 historical cleanup (phantom recovery rows, pre-`8316e64` LIMIT rows) | Slippage Phase 3 PR |
+| ~~Slippage Phase 3 historical cleanup~~ ✅ Closed without migration 2026-09-04; version-aware consumers already exclude incompatible history | No PR; preserve raw audit rows |
 | Spread lifecycle wiring | Separate spread-lifecycle PR |
 | Implementation-shortfall or trigger-time-quote metrics | Out of taxonomy; not in scope anywhere current |
 

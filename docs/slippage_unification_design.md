@@ -1,8 +1,8 @@
 # Slippage Unification Design
 
-Status: Phase 1 and Phase 2 + 4 merged; Phase 3 pending. See
+Status: Complete. Phases 1 and 2 + 4 merged; Phase 3 closed without migration. See
 `docs/slippage_unification_tracker.md` for as-built commit history.
-Updated: 2026-06-17
+Updated: 2026-09-04
 
 ## Goal
 
@@ -509,10 +509,9 @@ Their role as of Phase 2 + 4 (PR #67, merged 2026-06-17):
     `slippage_benchmark_kind='decision_price'`
 - `modeled_slippage_bps`
   - **historical only.** New rows write `NULL`. No reader consults
-    this column anywhere in the codebase. Phase 3 will null out
-    populated historical rows where the original benchmark was
-    bad provenance (pre-`32e21c2` recovered-context rows and
-    pre-`8316e64` LIMIT rows).
+    this column anywhere in the codebase. Historical values remain
+    untouched as raw audit evidence; current analysis uses the modern
+    taxonomy and version contract.
 - `realized_slippage_bps`
   - **historical only.** Same status as `modeled_slippage_bps`.
     Phase 1 (`bf16b5a`) wrote it in parallel with
@@ -1008,22 +1007,14 @@ state.
   `slip=Nonebps` (always NULL post-Phase-4) to
   `slip_signed=... kind=... quality=...` from the new taxonomy
 
-### Phase 3 — Historical cleanup ⬜ pending
+### Phase 3 — Historical cleanup ✅ closed without migration
 
-- null or annotate known-bad legacy recovery rows using a deterministic
-  migration predicate:
-  - `reason LIKE '%recovered entry context%'`
-  - `realized_slippage_bps IS NOT NULL`
-  - `timestamp < '2026-06-02T18:20:37+00:00'` (pre-`32e21c2`)
-- null or annotate pre-LIMIT-carve-out rows using:
-  - `order_type = 'limit'`
-  - `realized_slippage_bps IS NOT NULL`
-  - `timestamp < '2026-06-02T23:31:45+00:00'` (pre-`8316e64`)
-- comparison relies on ISO-8601 timestamp ordering; the migration script
-  should verify the stored suffix format matches `TradeRecord.timestamp`
-  before executing the cleanup query.
-- backfill new slippage columns only where the benchmark is provably reconstructable
-- do not force speculative backfills
+Reassessed 2026-09-04. Measurement versioning now excludes incompatible
+arrival-midpoint rows from every current execution-quality consumer. The old
+cleanup predicates match only 3 legacy rows and would change no calibration or
+runtime result. Raw history is more useful preserved than destructively nulled.
+Manual analysis must use the modern taxonomy and version contract; no historical
+values will be invented, backfilled, or deleted.
 
 ### Phase 4 — Legacy deprecation ✅ FOLDED INTO PHASE 2
 
@@ -1032,7 +1023,8 @@ eventually stop using them." Implemented in PR #67 as a clean drop:
 every Phase 2 consumer landed reading the new columns directly, and
 the legacy dual-writes were removed in the same PR rather than living
 on as a deprecated read path. The legacy columns remain on the schema
-to keep historical rows readable; Phase 3 cleans those up.
+to keep historical rows readable. Phase 3 was closed without modifying
+them after version-aware filtering made cleanup unnecessary.
 
 ## Specific Current Issues This Design Resolves
 

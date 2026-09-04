@@ -70,7 +70,8 @@ What did NOT land in Phase 1 (deferred as planned):
 - Consumer migration (health, risk, calibration, dashboard) — Phase 2.
 - Dashboard denominator dilution fix — Phase 2.
 - Stop legacy dual-writes — Phase 2 (folded in from prior Phase 4).
-- Historical row cleanup migration — Phase 3.
+- Historical row cleanup migration — Phase 3, later closed as unnecessary
+  after version-aware consumer filtering shipped.
 
 ---
 
@@ -81,7 +82,7 @@ What did NOT land in Phase 1 (deferred as planned):
 | 1 | Schema + writers + dual-write to legacy + 13 codepath tests | `feature/slippage-unification-phase1` | #43 merged `bf16b5a` | ✅ Merged |
 | Smoke check | 2 days paper run on main; spot-check rows per codepath | main | — | ✅ Superseded by Phase 2 + 4 merge — no defects surfaced; new rows verified via the test suite + tracker as-built |
 | 2 + 4 | Consumer migration (health, risk, calibration, dashboard, pnl) + dashboard denominator dilution fix + drop legacy dual-writes | `feature/slippage-unification-phase2` | #67 merged `0b0dfee` | ✅ Merged |
-| 3 | Historical cleanup migration (phantom recovery rows + pre-`8316e64` LIMIT rows) | `feature/slippage-unification-phase3` | — | ⬜ Not started |
+| 3 | Historical cleanup migration (phantom recovery rows + pre-`8316e64` LIMIT rows) | — | — | ✅ Closed without migration — version filtering makes cleanup unnecessary |
 
 Adjacent follow-up shipped: PR #68 (`8977f22`, 2026-06-17) closed the recovered-entry accounting completeness gap discovered during PR #61 round-2 review — the substrate-driven UNKNOWN-at-submit recovery path now writes computed `slippage_signed_bps` / `slippage_adverse_bps` via a focused UPDATE that preserves audit fields. Also fixed the engine submit path to forward order-type-aware tags (LIMIT and STOP_LIMIT correctly get `kind='limit_price'`/`quality='unavailable'` instead of `'arrival_midpoint'`/`'primary'`). See `docs/order_lifecycle_foundation_tracker.md` for the as-built summary.
 
@@ -266,9 +267,10 @@ What landed:
   `test_market_entry_without_benchmark_legacy_still_uses_decision_price`
   is replaced with the reconciled-divergence pin.
 
-What did NOT land in Phase 2 (deferred as planned):
+What did NOT land in Phase 2:
 
-- Historical row cleanup migration — Phase 3.
+- Historical row cleanup was deferred to Phase 3, then closed without a
+  migration after version-aware filtering made it operationally irrelevant.
 
 ---
 
@@ -322,32 +324,18 @@ Branch: `feature/slippage-unification-phase2`
 
 ---
 
-## Phase 3 — Historical cleanup scope
+## Phase 3 — Historical cleanup ✅ closed without migration
 
-Branch: `feature/slippage-unification-phase3`
+Reassessed 2026-09-04 after measurement versioning shipped. The proposed
+predicates match only 3 rows in the paper database. All 17 unversioned
+arrival-midpoint rows are already excluded by the shared execution-quality
+predicate from calibration, the kill switch, health, P&L, dashboard statistics,
+and reconciliation. Nulling retired legacy columns would therefore change no
+current result and would erase useful raw audit history.
 
-Two deterministic predicates (idempotent migration script with dry-run mode):
-
-```sql
--- Phantom recovery rows (pre-32e21c2)
-UPDATE trades
-SET realized_slippage_bps = NULL, modeled_slippage_bps = NULL
-WHERE reason LIKE '%recovered entry context%'
-  AND realized_slippage_bps IS NOT NULL
-  AND timestamp < '2026-06-02T18:20:37+00:00';
-
--- Pre-LIMIT-carve-out limit rows (pre-8316e64)
-UPDATE trades
-SET realized_slippage_bps = NULL, modeled_slippage_bps = NULL
-WHERE order_type = 'limit'
-  AND realized_slippage_bps IS NOT NULL
-  AND timestamp < '2026-06-02T23:31:45+00:00';
-```
-
-- [ ] Script runs in `--dry-run` mode, prints affected row count per predicate
-- [ ] Backup `trades.db` before destructive run
-- [ ] Verify post-run row counts match dry-run prediction
-- [ ] Health / dashboard re-render confirms cleaner averages
+Decision: do not create the migration and do not modify `trades.db`. Manual SQL
+analysis must use the modern taxonomy columns and the shared version contract,
+not the retired `modeled_slippage_bps` / `realized_slippage_bps` fields.
 
 ---
 
