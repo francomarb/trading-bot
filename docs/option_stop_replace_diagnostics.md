@@ -1,10 +1,17 @@
 # Temporary option-stop diagnostics
 
-This diagnostic is narrowly scoped to unresolved `spy_options_reversion`
-option-stop execution questions: immediate-fill timing while ratcheting
-broker-side stops, and adverse slippage on ordinary protective-stop fills. It
-is instrumentation, not a trading-behavior change and not a general order
-audit.
+This diagnostic was built for `spy_options_reversion` option-stop execution
+questions: immediate-fill timing while ratcheting broker-side stops, and
+adverse slippage on ordinary protective-stop fills. It is instrumentation, not
+a trading-behavior change and not a general order audit.
+
+The incident watch closed without reproducing the original failure. The local
+collector was disabled and its disposable database removed on 2026-09-04. Its
+final retained summary was 23 replacement decisions/results, 22 matching
+stream replacement events, two initial-stop submissions, two stop-fill
+contexts, one deferred ratchet, and no diagnostic failure records. The largest
+recorded adverse stop-fill difference was 156.63 bps; this did not identify a
+replacement failure.
 
 ## Isolation
 
@@ -17,7 +24,7 @@ audit.
 - Removing the standalone DB removes all captured evidence without touching
   accounting or lifecycle state.
 
-## Enable temporarily
+## Re-enable only for a new incident
 
 Set these in `config/.env`, then recycle the bot:
 
@@ -54,6 +61,6 @@ Set `OPTION_STOP_REPLACE_AUDIT_ENABLED=false` and recycle the bot. The
 diagnostic then has zero runtime activity. After exporting any useful incident
 report, delete `data/diagnostics/option_stop_replace_audit.db`.
 
-This work does not close the deferred investigation. A behavioral change
-should follow only if captured broker and stream evidence identifies a
-specific failure mechanism.
+The diagnostic should remain disabled unless a new incident provides a
+specific reason to reopen it. A behavioral change should follow only if new
+broker and stream evidence identifies a failure mechanism.

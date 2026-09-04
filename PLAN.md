@@ -70,7 +70,7 @@ from proceeding.
 | Strategy Health threshold watch (`11.10h`) | ✅ Closed — no tuning | The watch produced no false alarms and no defensible threshold change. Continue routine scheduled reports. |
 | RSI3 simplification paper-watch (`11.23`) | 🔄 6 entries / 4 completed exits | The reset is producing trades, but four outcomes are too few to judge expectancy or clustered dip-buying. |
 | Credit-spread paper-watch (`11.30`, `11.34`, `11.41`) | ✅ Closed — operation proven, profitability weak | Entry and exit mechanics work. Further optimization waits for `11.63` bounded-entry-walk evidence. |
-| SPY option trailing durability | ✅ Closed — incident not reproduced after hardening | Fourteen clean price-ratchet replacements followed the incident. The temporary diagnostic is still enabled locally and should now be retired; reopen only on a new incident. |
+| SPY option trailing durability | ✅ Closed — incident not reproduced after hardening | The temporary diagnostic was retired 2026-09-04 after capturing 23 replacement decisions/results, 22 matching stream replacement events, two stop-fill contexts, and no diagnostic failure records. Reopen only on a new incident. |
 | Capped equity entry stop durability | ✅ **CLOSED 2026-08-14.** Seven capped fills exercised durable DAY-child-to-GTC-stop rebuilding, including one real failed rebuild that alerted and was repaired without duplicate sell exposure. | Closed; reopen only on a new durability incident. Detailed forensics remain in `docs/deferred_followups.md`. |
 | Single-leg exit fill durability | ✅ Reconfirmed end to end | Post-PR #61 substrate exit rows now include filled SMA, RSI, and SPY-options closes. The former “awaiting a signal-driven close” note is obsolete. |
 | Live launch throttle (`10.G2`) | ⬜ Set at live flip | The flat `HARD_DOLLAR_LOSS_CAP` was retired 2026-09-01 (tripped on ordinary market noise once the account grew; did not scale). Account drawdown is owned by `MAX_DAILY_LOSS_PCT` (5%, scales); the launch-only "start tiny" gate is now `LIVE_SIZE_MULTIPLIER` ≤ 0.25, verified by preflight. |
@@ -87,8 +87,7 @@ from proceeding.
 | Priority | Item | Current State | Next Action |
 |---:|---|---|---|
 | 1 | Trustworthy strategy graduation report | Contract and implementation are not started | Design the per-strategy report from authoritative lifecycle/P&L data, then implement it in a reviewed PR |
-| 2 | Temporary SPY option-stop diagnostic | Incident watch is closed, but the local diagnostic remains enabled | Disable it, recycle once, then remove the disposable diagnostic DB after preserving any wanted evidence |
-| 3 | `11.62` portfolio heat ceiling | Open design problem; no portfolio-wide initial-risk ceiling exists | Audit interactions with per-sleeve `11.60`, then propose a simple policy before implementation |
+| 2 | `11.62` portfolio heat ceiling | Open design problem; no portfolio-wide initial-risk ceiling exists | Audit interactions with per-sleeve `11.60`, then propose a simple policy before implementation |
 
 Evidence still collecting: slippage calibration **2/10**; RSI3 **6 entries / 4 completed exits**; credit-spread bounded entry walk **3/~20 attempts**; Donchian heat-cap observation **1 would-block event**; leveraged trend **4 open entries / 0 exits**. `11.41a` and `11.54a` remain event-gated and require no work until their trigger occurs. VPS and live-flip tasks remain deferred by operator decision.
 
