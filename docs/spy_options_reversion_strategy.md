@@ -36,10 +36,10 @@ human discretion lacks (greed, holding winners past the target).
 | RSI length | 14 (Wilder's RMA) |
 | RSI entry threshold | **45** — cross from below to above |
 | Contract | Call, strike ≈ 0.5% ITM (strike = close × 0.995) |
-| DTE window | **14–28 calendar days** (first available Friday expiry) |
+| DTE window | **14–28 calendar days** (expiration closest to the 21-day midpoint) |
 | Target delta at entry | ~0.55 (approximated geometrically; no live Greeks) |
 | Order type | LIMIT at OPRA bid/ask midpoint |
-| Spread guard | Reject if (ask − bid) / midpoint > 5% |
+| Spread guard | Reject if (ask − bid) / midpoint > **6%** |
 | Take profit | **+200% safety valve** only — trailing stop handles real exits |
 | Trailing stop | Activates once Alpaca's observed premium rises ≥ **10%** above entry premium; exits if premium drops ≥ **15%** below the durable HWM |
 | Stop loss | **−25%** of entry premium (hard floor, always active) |
@@ -359,9 +359,12 @@ this found real evidence of erosion: a 2026-07-01 stop fill at 18.72 against a
 Those are not disasters, but they are exactly the quantity that should be
 trended rather than discovered by hand.
 
-It still feeds `11.26` (options picker audit — fill quality on the 10% fatal-spread
-threshold). The June 12/15 trailing-stop incident watch is closed after later
-diagnostics did not reproduce it.
+The `11.26` options-picker audit is closed: the current-picker cohort filled
+11/14 attempts (78.6%), picked spreads were 0.55% p50 / 1.27% p95, no fill
+required a spread above 5%, and worst adverse entry drift was 3.5 bps. The hard
+ceiling is therefore 6%; scoring weights and the 180-second timeout remain
+unchanged. The June 12/15 trailing-stop incident watch is separately closed
+after later diagnostics did not reproduce it.
 
 The shipped consumer-side fix keeps `STOP_GAP_KINDS` as a **separate** reported
 figure. Merging it back into execution quality would recreate the original
@@ -377,6 +380,6 @@ defect. See closed PLAN `11.49` for scope and acceptance.
 | `strategies/filters/spy_options_reversion.py` | `SPYOptionsEdgeFilter` — 100 SMA gate + TRENDING-only VIX-percentile gate |
 | `utils/iv_proxy.py` | `IVProxyResolver` — trailing-1y VIX series, `resolve_rank(...).percentile` for the gate |
 | `utils/options_lookup.py` | OCC contract resolver (`find_best_call`) |
-| `execution/options_executor.py` | Background bracket-order worker |
+| `execution/options_executor.py` | Background DAY-limit entry worker |
 | `backtest/spy_options_backtest.py` | Production-mirrored backtest (100 SMA + regime + VIX gate; baseline vs gated, regime×IVR cross-tab, SL sweep) |
 | `tests/test_spy_options_reversion.py` | Unit tests (RSI signal, exit guards, edge filter incl. VIX-gate behavior + regime injection) |

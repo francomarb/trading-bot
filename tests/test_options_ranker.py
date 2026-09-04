@@ -99,7 +99,7 @@ class TestScoringFormula:
             target_strike=100.0,
             max_premium_per_contract=10_000.0,
         )
-        # WIDE is dropped by FATAL_SPREAD filter (>10%), only TIGHT remains.
+        # WIDE is dropped by the fatal-spread filter, only TIGHT remains.
         assert result.best.occ_symbol == "TIGHT"
 
     def test_tight_spread_runner_up_with_modest_strike_distance(self):
@@ -143,7 +143,7 @@ class TestHardFilters:
         cands = [_c("OK", 100.0), _c("WIDE", 100.5)]
         quotes = {
             "OK":   Quote(bid=2.00, ask=2.02),
-            "WIDE": Quote(bid=1.80, ask=2.40),  # ~28% spread, > 10%
+            "WIDE": Quote(bid=1.80, ask=2.40),  # ~28% spread, above the ceiling
         }
         result = rank_call_candidates(
             cands, quotes,
@@ -153,6 +153,27 @@ class TestHardFilters:
         assert result.best.occ_symbol == "OK"
         rejected_syms = [c.occ_symbol for c, _ in result.rejected]
         assert "WIDE" in rejected_syms
+
+    def test_default_fatal_spread_boundary_is_six_percent(self):
+        assert FATAL_SPREAD_PCT == pytest.approx(0.06)
+        cands = [_c("BELOW", 100.0), _c("ABOVE", 100.5)]
+        quotes = {
+            "BELOW": Quote(bid=1.941, ask=2.059),  # 5.9%
+            "ABOVE": Quote(bid=1.939, ask=2.061),  # 6.1%
+        }
+
+        result = rank_call_candidates(
+            cands,
+            quotes,
+            target_strike=100.0,
+            max_premium_per_contract=10_000.0,
+        )
+
+        assert result.best is not None
+        assert result.best.occ_symbol == "BELOW"
+        assert [(c.occ_symbol, reason) for c, reason in result.rejected] == [
+            ("ABOVE", "spread 6.1% > 6%")
+        ]
 
     def test_fatal_spread_threshold_is_configurable(self):
         cands = [_c("WIDE", 100.0)]

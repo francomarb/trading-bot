@@ -40,7 +40,7 @@ WEIGHT_SPREAD = 0.35
 WEIGHT_PREMIUM_EFF = 0.20
 
 STRIKE_TOLERANCE_PCT = 0.03   # used as the score denominator only
-FATAL_SPREAD_PCT = 0.10       # drop entirely if spread is wider than this
+FATAL_SPREAD_PCT = 0.06       # paper-calibrated hard ceiling (PLAN 11.26)
 SOFT_SPREAD_PCT = 0.05        # spread that scores zero on the spread axis
 PREMIUM_OUTLIER_MULTIPLIER = 2.0  # drop candidates whose mid > N× median(mid)
 

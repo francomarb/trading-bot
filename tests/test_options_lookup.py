@@ -175,7 +175,7 @@ class TestFindBestCall:
         client = MagicMock()
         client.get_option_contracts.return_value = response
 
-        # Both have spreads above the 10% FATAL_SPREAD_PCT.
+        # Both have spreads above the 6% FATAL_SPREAD_PCT.
         quote_lookup = _quotes({
             "SPY260522C00730000": Quote(bid=5.00, ask=6.00),  # 18% spread
             "SPY260522C00735000": Quote(bid=4.00, ask=5.00),  # 22% spread

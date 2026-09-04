@@ -113,7 +113,7 @@ lookup. The allocator routes them through a single shared sleeve.
 - `strategies/credit_spread.py` — `CreditSpread` strategy + `CreditSpreadConfig`.
 - `strategies/filters/credit_spread.py` — `CreditSpreadEdgeFilter`.
 - `utils/options_ranker.py` — two-leg composite-score ranker (extended from 11.25).
-- `execution/options_executor.py` — async bracket / MLEG order worker.
+- `execution/options_executor.py` — async single-leg DAY-limit / MLEG order workers.
 - `engine/trader.py` — `dispatch_spread_order`, `SpreadExecutionWorker`,
   spread-aware position model, startup spread reconstruction.
 - `config/settings.py` — `CREDIT_SPREAD_INSTRUMENTS`, sleeve config,
@@ -389,7 +389,7 @@ Build a defined-risk premium-selling options strategy that:
 - Is **underlying-agnostic by design** — one strategy class, one set of logic, parameterized per instrument. SPY, QQQ, IWM, mega-cap single names, and (with care) leveraged ETFs all use the same class with different config blocks
 - Trades **multiple concurrent positions across multiple underlyings** so the absolute $ contribution to portfolio P&L is meaningful, not just the sleeve-return ratio
 - Lays cleaner plumbing for future spread-based strategies (iron condors, calendar spreads, multi-leg directional)
-- Sits **alongside or replaces** the current `spy_options_reversion` (long SPY calls) strategy depending on the 11.26 paper audit results
+- Runs alongside `spy_options_reversion` in paper. The completed 11.26 audit validated that strategy's contract picker; it did not retire either strategy or decide live graduation.
 
 The current SPY options strategy is, by acknowledgement, **plumbing first, edge second**. It proved the engine can route OCC symbols, manage async fill workers, normalize underlying-vs-contract symbol ambiguity, and apply the 100× P&L multiplier correctly. That groundwork transfers directly to this strategy. What changes is the trade structure (one-leg long premium → two-leg short premium), the underlying engine plumbing for multi-leg orders, and the operating mode (one underlying → N underlyings).
 
@@ -600,7 +600,7 @@ Honest math for SPY + QQQ + IWM running concurrently:
 
 Plus headroom for new entries while existing ones are open. **Recommend `CREDIT_SPREAD_SLEEVE_BUDGET = $11k–13k`, i.e. 10–12% of $108k equity.**
 
-Combined with the existing 5% `spy_options_reversion` sleeve, total options exposure = 15–17%. If the `spy_options_reversion` is being retired post-11.26 audit, the credit spread sleeve absorbs that allocation and lands at 15–17% solo.
+Combined with the existing 5% `spy_options_reversion` sleeve, the current paper options allocation is 15% (10% credit spread + 5% single-leg). The completed 11.26 picker audit did not transfer capital between them; any future allocation change requires its own strategy-graduation decision.
 
 ### Capital flow under defaults
 
@@ -870,7 +870,7 @@ SPY, QQQ, IWM are correlated — when one breaches its short strike, the others 
 Capture answers in the PLAN.md row before coding starts:
 
 1. **Alpaca account options level** — is it Level 3 (spreads on cash)? Verify before any code goes in.
-2. **Sleeve allocation** — accept the proposed 10–12% credit-spread sleeve, or different size? Replace the existing 5% `spy_options_reversion` sleeve entirely after 11.26 audit?
+2. **Sleeve allocation — resolved:** keep the separate 10% credit-spread and 5% `spy_options_reversion` paper sleeves. The 11.26 picker audit does not decide strategy graduation or reallocation.
 3. **v1 underlyings** — SPY + QQQ + IWM as proposed? Or start with SPY only and add the others in a v1.1? My recommendation: launch with SPY + QQQ at v1, add IWM after 30 days of paper.
 4. **TQQQ in scope?** Strong recommendation: not v1, not v2 either. Possibly v3 only with explicit acknowledgement of the very different risk profile. See §15.
 5. **Single-name underlyings (AAPL, NVDA, MSFT) in scope?** Possible from v1 if the earnings blackout works correctly, but adds idiosyncratic gap risk. My recommendation: ETFs only at launch; single names as v2 after 60 days of clean paper.

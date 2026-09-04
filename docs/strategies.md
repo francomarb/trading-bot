@@ -326,7 +326,7 @@ Donchian breakout is a pure trend-continuation system (Turtle Trading, System 1)
 - **Entry:** RSI(14) crosses *above* 30 (confirming a recovery from oversold)
 - **Exit:** Three independent guards handled by `inspect_open_positions` each cycle (see below)
 
-Entry targets slightly in-the-money SPY calls: `find_best_call` selects the contract closest to Δ=0.55 with 14–28 days to expiry from the Alpaca options chain. The current hard bid-ask cutoff is 10% of mid-price; `11.26` is reviewing whether to tighten it after the execution-correctness fixes land. A DAY limit entry is submitted asynchronously via `OptionsExecutionWorker` so the engine loop is not blocked. After fill, the engine synchronizes durable protective-stop state; profit-taking and other defensive exits remain engine-managed.
+Entry targets slightly in-the-money SPY calls: `find_best_call` selects the contract closest to Δ=0.55 with 14–28 days to expiry from the Alpaca options chain. The hard bid-ask cutoff is 6% of mid-price, tightened after the completed `11.26` paper audit; 11/14 current-picker attempts filled while no observed fill required a spread above 5%. A DAY limit entry is submitted asynchronously via `OptionsExecutionWorker` so the engine loop is not blocked. After fill, the engine synchronizes durable protective-stop state; profit-taking and other defensive exits remain engine-managed.
 
 **Default parameters:**
 
@@ -660,7 +660,7 @@ The `spy_options_reversion` strategy lays the generic engine foundation for any 
 
 - `_OCC_PAT` in `engine/trader.py` — module-level compiled regex, used in all engine paths to detect options symbols
 - `OptionsExecutionWorker` in `execution/options_executor.py` — reusable async single-leg DAY-limit entry thread
-- `log_stop_fill` in `reporting/logger.py` — persists confirmed WebSocket bracket stop fills with real price and qty
+- `log_stop_fill` in `reporting/logger.py` — persists confirmed WebSocket protective-stop fills with real price and qty
 - `find_best_call` in `utils/options_lookup.py` — selects the best-fit call contract by delta and DTE from the Alpaca chain
 - All engine paths (slippage recording, audit trail, stop repair, stream stop fills, P&L multiplier) are OCC-aware and generic
 
