@@ -3568,6 +3568,22 @@ class TradingEngine:
                 order_id=event.order_id,
                 position_uid=order_row.position_uid,
             )
+            # apply_order_event rolls the lifecycle parent up before this
+            # richer stop-fill writer commits realized P&L to `trades`.
+            # Refresh again after the durable row exists so a prior partial
+            # reduction and this final stop are both represented on the
+            # parent.  This projection is operator/reporting metadata; a
+            # refresh failure must not suppress allocator accounting or
+            # ownership cleanup for a stop that already filled at Alpaca.
+            try:
+                self.lifecycle_store.refresh_realized_pnl(
+                    position_uid=order_row.position_uid,
+                )
+            except Exception as exc:
+                logger.warning(
+                    f"{raw_symbol}: lifecycle P&L refresh after stop fill "
+                    f"failed: {exc}"
+                )
             self._record_option_stop_fill_context(
                 owner=owner,
                 raw_symbol=raw_symbol,

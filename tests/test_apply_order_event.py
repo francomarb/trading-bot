@@ -2831,6 +2831,143 @@ class TestSubstrateStopFillDispatchSemantics:
         assert "FRO" not in engine._entry_prices
         assert "FRO" not in engine._external_close_suspects
 
+    def test_final_stop_refreshes_parent_after_operator_partial_reduction(
+        self,
+        conn: sqlite3.Connection,
+        tmp_db_path: str,
+        pos_store: PositionLifecycleStore,
+        orders_store: PositionLifecycleOrdersStore,
+    ):
+        """The real 2026-09-03 sequence: reduce one, stop the remaining two."""
+        from engine.positions import Position
+        from engine.trader import TradingEngine
+
+        symbol = "SPY260925C00759000"
+        uid = new_position_uid()
+        pos_store.create_pending(
+            position_uid=uid,
+            symbol=symbol,
+            owner_key="SPY",
+            strategy="spy_options_reversion",
+            position_type="single_leg",
+            entry_qty=3.0,
+        )
+        _insert_entry(
+            orders_store,
+            uid,
+            client_order_id="cli-option-entry",
+            intended_qty=3.0,
+        )
+        _attach_and_get_order_id(
+            orders_store,
+            "cli-option-entry",
+            order_id="entry-order",
+        )
+        assert apply_order_event(
+            conn,
+            OrderEvent(
+                order_id="entry-order",
+                status="filled",
+                filled_qty=3.0,
+                avg_fill_price=11.62,
+                broker_updated_at="2026-09-01T19:45:00+00:00",
+            ),
+            reason="stream",
+        ).applied is True
+        orders_store.insert_pending(
+            position_uid=uid,
+            role="partial_close",
+            client_order_id="cli-option-reduce",
+            order_type="market",
+            order_class="simple",
+            time_in_force="day",
+            side="sell",
+            intended_qty=1.0,
+        )
+        _attach_and_get_order_id(
+            orders_store,
+            "cli-option-reduce",
+            order_id="reduce-order",
+        )
+        assert apply_order_event(
+            conn,
+            OrderEvent(
+                order_id="reduce-order",
+                status="filled",
+                filled_qty=1.0,
+                avg_fill_price=13.29,
+                broker_updated_at="2026-09-02T17:45:00+00:00",
+            ),
+            reason="operator",
+        ).applied is True
+        conn.execute(
+            "UPDATE trades SET reason = 'operator reduce', status = 'partial', "
+            "realized_pnl = 167, r_multiple = 0.59 "
+            "WHERE order_id = 'reduce-order'"
+        )
+        conn.commit()
+        assert pos_store.refresh_realized_pnl(position_uid=uid) == pytest.approx(167.0)
+
+        _insert_protective_stop(
+            orders_store,
+            uid,
+            client_order_id="cli-option-stop",
+            intended_qty=2.0,
+            stop_price=13.50,
+        )
+        order_id = _attach_and_get_order_id(
+            orders_store,
+            "cli-option-stop",
+            order_id="option-stop-order",
+        )
+        event = OrderEvent(
+            order_id=order_id,
+            status="filled",
+            filled_qty=2.0,
+            avg_fill_price=16.53,
+            broker_updated_at="2026-09-03T15:25:00+00:00",
+        )
+        assert apply_order_event(conn, event, reason="stream").applied is True
+        # The substrate rolls up before the specialized stop writer adds P&L.
+        assert pos_store.get_by_position_uid(uid).net_realized_pnl == pytest.approx(167.0)
+
+        trade_logger = TradeLogger(path=tmp_db_path)
+        engine = MagicMock(spec=TradingEngine)
+        engine.lifecycle_orders_store = orders_store
+        engine.lifecycle_store = pos_store
+        engine.trade_logger = trade_logger
+        engine.alerts = MagicMock()
+        engine._allocator = MagicMock()
+        engine._positions = {
+            "SPY": Position(
+                position_id="SPY",
+                position_type="single_leg",
+                strategy_name="spy_options_reversion",
+            )
+        }
+        engine._entry_prices = {"SPY": 11.62}
+        engine._external_close_suspects = {}
+        engine._has_position = lambda key: key in engine._positions
+        engine._pop_position = lambda key: engine._positions.pop(key, None)
+        engine._get_position_for = TradingEngine._get_position_for
+        engine._record_realized_pnl = TradingEngine._record_realized_pnl.__get__(engine)
+        engine._cleanup_option_trailing_state = MagicMock()
+
+        TradingEngine._maybe_dispatch_substrate_stop_fill(
+            engine,
+            event=event,
+            snapshot=BrokerSnapshot(
+                account=SimpleNamespace(open_positions={}),
+                open_orders=[],
+            ),
+        )
+
+        parent = pos_store.get_by_position_uid(uid)
+        assert parent is not None
+        assert parent.status == "closed"
+        assert parent.net_realized_pnl == pytest.approx(1149.0)
+        trade_logger.close()
+
     def test_fractional_residual_stop_fill_preserves_ownership(
         self,
         pos_store: PositionLifecycleStore,

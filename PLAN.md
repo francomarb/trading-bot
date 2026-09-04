@@ -86,7 +86,7 @@ from proceeding.
 
 | Priority | Item | Current State | Next Action |
 |---:|---|---|---|
-| 1 | `11.26` SPY options picker audit | **Ready for review:** 11 unique entries, meeting the 10–20 target | Review selection, spread, fill, and outcome evidence; do not tune before the audit |
+| 1 | `11.26` SPY options picker audit | **Review started:** picker evidence is clean; two adjacent accounting/execution defects are being fixed first | Resume the picker verdict after terminal-status and lifecycle-P&L corrections merge; do not tune before then |
 | 2 | Trustworthy strategy graduation report | Contract and implementation are not started | Design the per-strategy report from authoritative lifecycle/P&L data, then implement it in a reviewed PR |
 | 3 | Temporary SPY option-stop diagnostic | Incident watch is closed, but the local diagnostic remains enabled | Disable it, recycle once, then remove the disposable diagnostic DB after preserving any wanted evidence |
 | 4 | `11.62` portfolio heat ceiling | Open design problem; no portfolio-wide initial-risk ceiling exists | Audit interactions with per-sleeve `11.60`, then propose a simple policy before implementation |
@@ -108,6 +108,7 @@ Evidence still collecting: slippage calibration **2/10**; RSI3 **6 entries / 4 c
 
 | Item | Why It Matters | Acceptance |
 |---|---|---|
+| `11.26` evidence-integrity corrections | **FIX IN REVIEW.** A terminal stream wake was assumed to mean fill even for an expiry/rejection, and a substrate stop could write realized P&L after the lifecycle parent had already rolled up. | Classify the broker's actual terminal outcome, preserve cumulative partial fills, refresh the parent after durable stop accounting, and repair stale parents from authoritative realized-P&L rows at startup. Then resume—not close—the picker audit. |
 | ~~Operator reduce degraded-accounting parity~~ | ✅ **FIXED in PR #141.** A filled reduction with missing durable realized P&L reports accounting failure without booking an in-memory estimate into the allocator. | Closed. Durable-write and missing-P&L parity tests pass; a lifecycle projection failure still permits allocator accounting when durable P&L exists. |
 | ~~Operator command expiry margin~~ | ✅ **FIXED in PR #142.** Heartbeats keep their short freshness window; engine-thread commands get 15 minutes after submission to reach a safe cycle boundary. | Closed. Expiration is scoped to the caller's action lane and covered by timing tests. |
 | Slippage model unification review (`10.D1` support) | ✅ **COMPLETE.** Execution quality, implementation shortfall, and stop-gap erosion have separate contracts. Versioning excludes incompatible arrival-midpoint history from every current consumer. | Phases 1, 2, and 4 shipped. **Phase 3 cleanup closed as unnecessary 2026-09-04:** only 3 legacy rows match its predicates, while all 17 unversioned arrival rows are already excluded from calibration, kill switch, health, P&L, dashboard statistics, and reconciliation. Preserve the raw audit history; do not mutate `trades.db`. See [`docs/slippage_unification_tracker.md`](docs/slippage_unification_tracker.md). |

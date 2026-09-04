@@ -820,7 +820,7 @@ FROM trades
 WHERE position_uid = :position_uid;
 ```
 
-This query runs as part of Step 3 of `apply_order_event`'s transaction (§6.4) alongside the `current_qty` and `avg_entry_price` recomputes — all three feed into the same atomic UPDATE on `position_lifecycle`. The `trades.position_uid` column has been populated since the slippage Phase 1 / Operator Controls Phase A work and is indexed at [reporting/logger.py:262](../reporting/logger.py:262) for fast lookup.
+This query runs as part of Step 3 of `apply_order_event`'s transaction (§6.4) alongside the `current_qty` and `avg_entry_price` recomputes — all three feed into the same atomic UPDATE on `position_lifecycle`. Specialized accounting writers can enrich the trade row immediately afterward: spread fills and substrate protective-stop fills therefore refresh the parent again after their durable realized-P&L write. Database startup also repairs stale parents when authoritative realized-P&L rows exist, without inventing values for legacy rows that lack them. The `trades.position_uid` column has been populated since the slippage Phase 1 / Operator Controls Phase A work and is indexed for fast lookup.
 
 Canceled rows with `filled_qty = 0` contribute 0 to the per-order rollups (`current_qty` and `avg_entry_price`), so the partial-then-cancel case is captured correctly. Realized-P&L rollup is similarly idempotent: a canceled order produces no new trade row, so re-applying the same event leaves `net_realized_pnl` unchanged.
 

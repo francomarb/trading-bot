@@ -123,6 +123,43 @@ class TestSchemaMigration:
             "position_lifecycle_orders",
         ]
 
+    def test_startup_repairs_stale_lifecycle_pnl_from_durable_trades(
+        self, tmp_path
+    ):
+        db_path = tmp_path / "trades.db"
+        first = TradeLogger(path=str(db_path))
+        conn = first._ensure_db()
+        store = PositionLifecycleStore(conn)
+        uid = new_position_uid()
+        store.create_pending(
+            position_uid=uid,
+            symbol="SPY260925C00759000",
+            owner_key="SPY",
+            strategy="spy_options_reversion",
+            position_type="single_leg",
+            entry_qty=3.0,
+        )
+        store.mark_closed(position_uid=uid, net_realized_pnl=167.0)
+        conn.execute(
+            "INSERT INTO trades (timestamp, symbol, side, qty, strategy, "
+            "reason, status, position_type, position_uid, realized_pnl) "
+            "VALUES (?, ?, 'sell', 3, ?, 'close', 'filled', "
+            "'single_leg', ?, 1149.0)",
+            (
+                "2026-09-03T15:25:00+00:00",
+                "SPY260925C00759000",
+                "spy_options_reversion",
+                uid,
+            ),
+        )
+        conn.commit()
+        first.close()
+
+        repaired_conn = TradeLogger(path=str(db_path))._ensure_db()
+        repaired = PositionLifecycleStore(repaired_conn).get_by_position_uid(uid)
+        assert repaired is not None
+        assert repaired.net_realized_pnl == pytest.approx(1149.0)
+
     def test_trades_has_position_uid_column_after_migration(self, tmp_path):
         db_path = tmp_path / "trades.db"
         conn = TradeLogger(path=str(db_path))._ensure_db()

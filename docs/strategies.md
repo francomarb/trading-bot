@@ -315,7 +315,7 @@ Donchian breakout is a pure trend-continuation system (Turtle Trading, System 1)
 | Class | `SPYOptionsReversionStrategy` |
 | Type | Options mean-reversion |
 | Instrument | SPY call options (ITM, 14–28 DTE) |
-| Order type | LIMIT (async bracket via `OptionsExecutionWorker`) |
+| Order type | DAY LIMIT via `OptionsExecutionWorker`; protective stop synchronized after fill |
 | Status | **Paper Trading** |
 | Sleeve weight | 5% of gross capital |
 | Max positions | 1 |
@@ -326,7 +326,7 @@ Donchian breakout is a pure trend-continuation system (Turtle Trading, System 1)
 - **Entry:** RSI(14) crosses *above* 30 (confirming a recovery from oversold)
 - **Exit:** Three independent guards handled by `inspect_open_positions` each cycle (see below)
 
-Entry targets slightly in-the-money SPY calls: `find_best_call` selects the contract closest to Δ=0.55 with 14–28 days to expiry from the Alpaca options chain. Entry is rejected if the bid-ask spread exceeds 5% of mid-price. A bracket order (limit entry + take-profit + stop-loss) is submitted asynchronously via `OptionsExecutionWorker` so the engine loop is not blocked.
+Entry targets slightly in-the-money SPY calls: `find_best_call` selects the contract closest to Δ=0.55 with 14–28 days to expiry from the Alpaca options chain. The current hard bid-ask cutoff is 10% of mid-price; `11.26` is reviewing whether to tighten it after the execution-correctness fixes land. A DAY limit entry is submitted asynchronously via `OptionsExecutionWorker` so the engine loop is not blocked. After fill, the engine synchronizes durable protective-stop state; profit-taking and other defensive exits remain engine-managed.
 
 **Default parameters:**
 
@@ -381,11 +381,12 @@ Fails **closed** on API failure (no SPY data → no entry); the VIX gate likewis
 Options orders do not go through the standard equity broker path. The flow is:
 
 1. `broker.place_order()` detects the OCC symbol → dispatches `OptionsExecutionWorker` thread
-2. Worker submits a limit entry; if unfilled after 60 s, cancels and returns
-3. On fill: broker submits take-profit and stop-loss legs as a bracket
-4. Fill is reported back to the engine via `drain_option_fills()` (polled each cycle)
-5. Mid-trade exits are triggered by `inspect_open_positions` → `broker.close_position(occ)`
-6. Bracket stop-leg fills are delivered by the WebSocket stream → `apply_order_event` → `_maybe_dispatch_substrate_stop_fill` (the legacy `_process_stream_stop_fills` path was removed 2026-08-14)
+2. Worker submits a DAY limit entry; if unresolved after the configured 180-second window, cancels and returns
+3. A terminal stream wake is classified from actual broker/stream status; expiry, rejection, and cancel are never treated as fills, while cumulative partial fills are preserved
+4. On fill, the engine seeds durable trailing state and synchronizes the protective stop; profit exits remain engine-managed
+5. The terminal result is reported back to the engine via `drain_option_fills()` (polled each cycle)
+6. Mid-trade exits are triggered by `inspect_open_positions` → `broker.close_position(occ)`
+7. Protective-stop fills are delivered by the WebSocket stream → `apply_order_event` → `_maybe_dispatch_substrate_stop_fill` (the legacy `_process_stream_stop_fills` path was removed 2026-08-14)
 
 The engine's ownership map (`_positions`) keys single-leg option positions by the underlying ticker (`"SPY"`) via `owner_key_for()`, and reserves UUID `position_id`s for multi-leg positions (see PLAN.md 11.27 and `engine/positions.py`). The credit-spread strategy below uses that UUID path; a same-underlying single-leg + spread combination cannot collide on the ownership map.
 
@@ -658,7 +659,7 @@ See the checklist in [`architecture.md`](architecture.md#adding-a-new-strategy--
 The `spy_options_reversion` strategy lays the generic engine foundation for any future options strategy:
 
 - `_OCC_PAT` in `engine/trader.py` — module-level compiled regex, used in all engine paths to detect options symbols
-- `OptionsExecutionWorker` in `execution/options_executor.py` — reusable async bracket-order thread
+- `OptionsExecutionWorker` in `execution/options_executor.py` — reusable async single-leg DAY-limit entry thread
 - `log_stop_fill` in `reporting/logger.py` — persists confirmed WebSocket bracket stop fills with real price and qty
 - `find_best_call` in `utils/options_lookup.py` — selects the best-fit call contract by delta and DTE from the Alpaca chain
 - All engine paths (slippage recording, audit trail, stop repair, stream stop fills, P&L multiplier) are OCC-aware and generic
