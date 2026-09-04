@@ -3242,6 +3242,46 @@ class TestDurableOwnershipFromDB:
         assert not engine._has_position(first)
         assert conflicts == {"SPY"}
 
+    def test_equity_and_option_for_same_owner_are_conflict(
+        self, patch_fetch, tmp_path
+    ):
+        option = "SPY260918C00800000"
+        positions = {
+            "SPY": Position("SPY", 10, 500.0, 5000.0),
+            option: Position(option, 1, 9.0, 900.0),
+        }
+        engine, _, _ = _engine_with_db(
+            patch_fetch, tmp_path, positions=positions
+        )
+        _write_lifecycle_claim(engine, symbol="SPY")
+
+        conflicts = engine._restore_ownership_from_db(
+            _snapshot(positions=positions)
+        )
+
+        assert not engine._has_position("SPY")
+        assert conflicts == {"SPY"}
+
+    def test_lifecycle_retired_strategy_is_conflict(
+        self, patch_fetch, tmp_path
+    ):
+        positions = {"AAPL": Position("AAPL", 10, 100.0, 1000.0)}
+        engine, _, _ = _engine_with_db(
+            patch_fetch, tmp_path, positions=positions
+        )
+        _write_lifecycle_claim(
+            engine,
+            symbol="AAPL",
+            strategy="retired_strategy",
+        )
+
+        conflicts = engine._restore_ownership_from_db(
+            _snapshot(positions=positions)
+        )
+
+        assert not engine._has_position("AAPL")
+        assert conflicts == {"AAPL"}
+
     def test_lifecycle_query_failure_refuses_trade_fallback(
         self, patch_fetch, tmp_path
     ):
@@ -3259,6 +3299,44 @@ class TestDurableOwnershipFromDB:
         )
 
         assert not engine._has_position("AAPL")
+        assert conflicts == {"AAPL"}
+
+    def test_legacy_trade_query_failure_is_conflict(
+        self, patch_fetch, tmp_path
+    ):
+        positions = {"AAPL": Position("AAPL", 10, 100.0, 1000.0)}
+        engine, _, _ = _engine_with_db(
+            patch_fetch, tmp_path, positions=positions
+        )
+        engine.trade_logger.read_all_open_owners = MagicMock(
+            side_effect=sqlite3.OperationalError("synthetic replay failure")
+        )
+
+        conflicts = engine._restore_ownership_from_db(
+            _snapshot(positions=positions)
+        )
+
+        assert not engine._has_position("AAPL")
+        assert conflicts == {"AAPL"}
+
+    def test_existing_runtime_owner_disagreement_is_conflict(
+        self, patch_fetch, tmp_path
+    ):
+        positions = {"AAPL": Position("AAPL", 10, 100.0, 1000.0)}
+        engine, _, _ = _engine_with_db(
+            patch_fetch, tmp_path, positions=positions
+        )
+        _write_lifecycle_claim(engine, symbol="AAPL")
+        engine._register_single_leg(
+            strategy_name="retired_strategy",
+            symbol="AAPL",
+        )
+
+        conflicts = engine._restore_ownership_from_db(
+            _snapshot(positions=positions)
+        )
+
+        assert engine._get_owner("AAPL") == "retired_strategy"
         assert conflicts == {"AAPL"}
 
     def test_db_record_authoritative_owner(self, patch_fetch, tmp_path):
