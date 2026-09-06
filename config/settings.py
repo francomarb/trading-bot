@@ -702,6 +702,20 @@ STRATEGY_ALLOWED_REGIMES: dict[str, set[str]] = {
     "leveraged_trend": {"TRENDING", "RANGING", "VOLATILE", "BEAR"},
 }
 
+# Strategy graduation identity. Increment a strategy's human-readable version
+# when its trading logic or intended behavior changes. The runtime also stamps
+# an automatic configuration hash, so a forgotten version bump cannot silently
+# merge unlike trades into one evidence cohort. These versions begin tracking
+# at deployment of the graduation report; they do not relabel older history.
+STRATEGY_VERSIONS: dict[str, str] = {
+    "sma_crossover": "1.0",
+    "rsi_reversion": "1.0",
+    "donchian_breakout": "1.0",
+    "leveraged_trend": "1.0",
+    "spy_options_reversion": "1.0",
+    "credit_spread": "1.0",
+}
+
 # ── Capital allocation (Immediate allocator enhancements) ───────────────────
 # The allocator works on deployable capital:
 #   deployable_capital = equity × MAX_GROSS_EXPOSURE_PCT

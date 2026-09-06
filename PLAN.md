@@ -76,17 +76,17 @@ from proceeding.
 | Live launch throttle (`10.G2`) | ⬜ Set at live flip | The flat `HARD_DOLLAR_LOSS_CAP` was retired 2026-09-01 (tripped on ordinary market noise once the account grew; did not scale). Account drawdown is owned by `MAX_DAILY_LOSS_PCT` (5%, scales); the launch-only "start tiny" gate is now `LIVE_SIZE_MULTIPLIER` ≤ 0.25, verified by preflight. |
 | Preflight + dry run (`10.G5`) | ✅ Code complete | Re-run immediately before live flip |
 | VPS deployment (`10.H1-H5`) | ⏸ Deferred by operator | Resume only after the operator is satisfied that at least one strategy merits live consideration. Then provision the production runtime, systemd, secure env, and log shipping. |
-| Strategy graduation evidence package | ⬜ Tooling not started | Build the reviewed per-strategy report described below; it informs an operator decision and never approves a strategy automatically. |
+| Strategy graduation evidence package | 🔄 Foundation implemented; clean cohorts begin after deployment | Lifecycle-first JSON/Markdown reporting and immutable version/config/commit stamping are in review. Legacy history stays explicitly unknown. Add forward daily marks and a reviewed cost model before any cohort can be called ready for operator review. |
 
 ---
 
 ## Active Work Queue
 
-### Current Priority View — 2026-09-04
+### Current Priority View — 2026-09-06
 
 | Priority | Item | Current State | Next Action |
 |---:|---|---|---|
-| 1 | Trustworthy strategy graduation report | Contract and implementation are not started | Design the per-strategy report from authoritative lifecycle/P&L data, then implement it in a reviewed PR |
+| 1 | Trustworthy strategy graduation report | Lifecycle-first report and entry-time cohort identity implemented | Review generated reports, then add forward daily marks and a reviewed cost model; preflight binding remains a later PR |
 | 2 | `11.62` portfolio heat ceiling | Open design problem; no portfolio-wide initial-risk ceiling exists | Audit interactions with per-sleeve `11.60`, then propose a simple policy before implementation |
 
 Evidence still collecting: slippage calibration **2/10**; RSI3 **6 entries / 4 completed exits**; credit-spread bounded entry walk **3/~20 attempts**; Donchian heat-cap observation **1 would-block event**; leveraged trend **4 open entries / 0 exits**. `11.41a` and `11.54a` remain event-gated and require no work until their trigger occurs. VPS and live-flip tasks remain deferred by operator decision.
@@ -96,7 +96,7 @@ Evidence still collecting: slippage calibration **2/10**; RSI3 **6 entries / 4 c
 | Item | Why It Matters | Acceptance |
 |---|---|---|
 | Slippage kill-switch calibration | Live trading must halt if execution quality drifts beyond modeled edge | Paper fill audit shows thresholds are reasonable; `SLIPPAGE_DRIFT_ENABLED=True` before live |
-| Trustworthy strategy graduation report | The removed April-era checker assumed FIFO long-only fills, mixed every strategy, and produced one automatic verdict from raw dollar P&L. That model cannot represent the current bot. | Build a per-strategy, configuration-epoch report from authoritative realized-P&L events. Cover single-leg, MLEG, and partial closes; fees/slippage; normalized return or R; drawdown; sample/span; subperiod consistency; outlier dependence; and operational evidence. Report facts and uncertainty without automatic approval; the operator makes the decision. Wire the approved strategy set into preflight only after this contract is reviewed. |
+| Trustworthy strategy graduation report | The lifecycle-first foundation stamps strategy version, configuration hash, bot commit, and entry regime; it groups partial exits and MLEG legs into one outcome and emits advisory JSON/Markdown. Pre-deployment history remains unknown instead of being guessed. | Review the first generated cohorts. Add forward daily marks and a reviewed cost model so total drawdown and net-after-cost performance become available. Only afterward define evidence-sufficiency rules and bind explicit operator approvals to preflight in a separate PR. |
 | VPS/systemd deployment | **Deferred until at least one strategy merits live consideration.** Local Mac + tmux remains the paper-development environment. | After the operator authorizes this work: VPS provisioned, secrets deployed safely, `systemd` restarts bot on crash/boot, logs are recoverable |
 | Live `.env` launch throttle | Launch-only protection: start sizes small | `LIVE_SIZE_MULTIPLIER` ≤ 0.25 verified by preflight (replaced the retired `HARD_DOLLAR_LOSS_CAP`). Malfunction is caught by the broker-error-streak and slippage-drift kill switches, not a flat dollar floor. |
 | ~~Operator controls Phase A + B + C (`docs/operator_controls_proposal.md`)~~ | ✅ **PAPER-VALIDATED 2026-09-02.** Pause/resume, cancel, full close, exact-share equity reduce, exact-contract single-leg option reduce, residual GTC protection, durable P&L, and restart recovery all passed. The full-close defect found during the drill was fixed in PR #137; its repaired row and both reductions restored exactly once after recycle with NORMAL startup. | Closed. Genuine unexpected-protection latch clearing remains unit-tested and should be exercised operationally only when a real latch occurs; do not manufacture unsafe broker state for evidence. |

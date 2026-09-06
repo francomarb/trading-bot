@@ -122,6 +122,7 @@ from strategies.base import (
     PositionTarget,
     StrategySlot,
 )
+from strategies.identity import resolve_strategy_identity
 from utils.option_symbols import is_occ_option, parse_occ_symbol
 
 from regime.detector import MarketRegime
@@ -1825,6 +1826,7 @@ class TradingEngine:
                             strategy_reasons=strategy_reasons,
                             signal_symbol=slot.signal_symbol_for(symbol),
                             data_feed=slot.data_feed,
+                            allowed_regimes=slot.allowed_regimes,
                         )
                         if filled is not None:
                             new_positions += 1
@@ -1893,6 +1895,7 @@ class TradingEngine:
         strategy_reasons: dict[str, list[str]] | None = None,
         signal_symbol: str | None = None,
         data_feed: str | None = None,
+        allowed_regimes: frozenset[MarketRegime] | None = None,
     ) -> Position | None:
         """
         The full per-symbol decision path. Returns a Position if an entry was
@@ -2504,6 +2507,10 @@ class TradingEngine:
                 signal_bar=signal_bar,
                 strategy_statuses=strategy_statuses,
                 strategy_reasons=strategy_reasons,
+                current_regime=current_regime,
+                allowed_regimes=allowed_regimes,
+                data_feed=data_feed,
+                timeframe=timeframe,
             )
             return None
 
@@ -2686,6 +2693,19 @@ class TradingEngine:
             )
             return None
         assert isinstance(decision, RiskDecision)
+        identity = resolve_strategy_identity(
+            strategy,
+            allowed_regimes=allowed_regimes,
+            data_feed=data_feed,
+            timeframe=timeframe,
+        )
+        decision = replace(
+            decision,
+            strategy_version=identity.strategy_version,
+            strategy_config_hash=identity.strategy_config_hash,
+            bot_git_commit=identity.bot_git_commit,
+            entry_regime=current_regime.value if current_regime is not None else None,
+        )
 
         # PLAN 11.60 correlated-entry heat cap. Observation-only unless
         # settings.STRATEGY_HEAT_CAP_ENFORCED. Placed here because this is the
@@ -10817,6 +10837,10 @@ class TradingEngine:
         symbol: str,
         qty: int,
         entry_client_order_id: str | None = None,
+        strategy_version: str | None = None,
+        strategy_config_hash: str | None = None,
+        bot_git_commit: str | None = None,
+        entry_regime: str | None = None,
     ) -> str | None:
         """Write a ``pending`` position_lifecycle row for a spread before
         the broker submission goes out. Returns the substrate
@@ -10837,6 +10861,10 @@ class TradingEngine:
                 symbol=symbol,
                 owner_key=position_id,
                 strategy=strategy_name,
+                strategy_version=strategy_version,
+                strategy_config_hash=strategy_config_hash,
+                bot_git_commit=bot_git_commit,
+                entry_regime=entry_regime,
                 position_type="spread",
                 entry_qty=float(qty),
                 entry_client_order_id=entry_client_order_id,
@@ -11189,6 +11217,10 @@ class TradingEngine:
         signal_bar: "pd.Timestamp",
         strategy_statuses: dict[str, str] | None,
         strategy_reasons: dict[str, list[str]] | None,
+        current_regime: MarketRegime | None = None,
+        allowed_regimes: frozenset[MarketRegime] | None = None,
+        data_feed: str | None = None,
+        timeframe: str | None = None,
     ) -> None:
         """
         Generic MLEG entry path: build the spread plan, dispatch the async
@@ -11276,6 +11308,12 @@ class TradingEngine:
             return
 
         position_id = new_spread_id()
+        identity = resolve_strategy_identity(
+            strategy,
+            allowed_regimes=allowed_regimes,
+            data_feed=data_feed,
+            timeframe=timeframe,
+        )
         entry_walk, entry_quote_provider = self._build_entry_walk(
             strategy=strategy,
             symbol=symbol,
@@ -11345,6 +11383,10 @@ class TradingEngine:
             strategy_name=strategy.name,
             symbol=plan.short_occ,
             qty=plan.qty,
+            strategy_version=identity.strategy_version,
+            strategy_config_hash=identity.strategy_config_hash,
+            bot_git_commit=identity.bot_git_commit,
+            entry_regime=current_regime.value if current_regime is not None else None,
         )
         logger.info(
             f"[{strategy.name}] {symbol}: credit spread dispatched "

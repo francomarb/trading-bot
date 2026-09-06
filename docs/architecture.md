@@ -2,7 +2,7 @@
 
 ## Overview
 
-This document defines the target architecture for the Alpaca trading bot. It is the source of truth for structural decisions, coding conventions, and the go/no-go framework for live capital deployment. All refactoring and new development should align with this guide.
+This document defines the target architecture for the Alpaca trading bot. It is the source of truth for structural decisions, coding conventions, and the operator-reviewed framework for live capital deployment. All refactoring and new development should align with this guide.
 
 The bot is built in Python using `alpaca-py`. Six strategy sleeves are active in paper trading: SMA Crossover, RSI Reversion, Donchian Breakout, Leveraged Trend, SPY Options RSI Reversion, and Credit Spread. Paper mode is the development environment: strategies are evaluated individually for live eligibility, and no strategy is preselected or required to graduate alongside the others.
 
@@ -631,7 +631,7 @@ The MLEG limit-price sign convention was confirmed against the Alpaca paper API 
 
 ### 7. Reporting & Monitoring
 
-Every trade is logged to SQLite for the go/no-go evaluation. This layer also computes live performance metrics and sends alerts.
+Every trade is logged to SQLite for per-strategy graduation evidence. This layer also computes live performance metrics and sends alerts.
 
 **Trade logs (SQLite):**
 - `data/trades.db` — paper trading (never mixed with live data)
@@ -665,7 +665,7 @@ replacement must report facts and uncertainty; operator approval remains the
 live-inclusion decision.
 
 **Pre-flight checklist (`scripts/preflight.py`):**
-Must exit 0 before any live capital is committed. Validates: credentials point to the live endpoint, buying power meets minimum, `SLIPPAGE_DRIFT_ENABLED=True`, dry-run cycle passes, and the operator has explicitly set `STRATEGY_GRADUATION_APPROVED=yes`. Until the replacement graduation report is implemented, this is a manual operator assertion rather than validation of an evidence artifact.
+Must exit 0 before any live capital is committed. Validates: credentials point to the live endpoint, buying power meets minimum, `SLIPPAGE_DRIFT_ENABLED=True`, dry-run cycle passes, and the operator has explicitly set `STRATEGY_GRADUATION_APPROVED=yes`. The lifecycle-first graduation report now produces advisory evidence, but preflight remains a manual operator assertion until a later reviewed change binds an approved strategy, cohort, and report digest.
 
 #### Strategy Health & Edge Monitor (`strategies/health/`, PLAN.md 11.10)
 

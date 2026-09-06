@@ -93,6 +93,10 @@ CREATE TABLE IF NOT EXISTS position_lifecycle (
     symbol                  TEXT    NOT NULL,
     owner_key               TEXT    NOT NULL,
     strategy                TEXT    NOT NULL,
+    strategy_version        TEXT,
+    strategy_config_hash    TEXT,
+    bot_git_commit          TEXT,
+    entry_regime            TEXT,
     position_type           TEXT    NOT NULL,
     status                  TEXT    NOT NULL,
     entry_qty               REAL,
@@ -197,6 +201,8 @@ _CREATE_POSITION_LIFECYCLE_INDEXES_SQL = (
     "ON position_lifecycle(status)",
     "CREATE INDEX IF NOT EXISTS idx_position_lifecycle_strategy "
     "ON position_lifecycle(strategy)",
+    "CREATE INDEX IF NOT EXISTS idx_position_lifecycle_strategy_cohort "
+    "ON position_lifecycle(strategy, strategy_version, strategy_config_hash, status)",
     "CREATE INDEX IF NOT EXISTS idx_position_lifecycle_legs_uid "
     "ON position_lifecycle_legs(position_uid)",
 )
@@ -312,6 +318,10 @@ class PositionLifecycleRow:
     symbol: str
     owner_key: str
     strategy: str
+    strategy_version: str | None
+    strategy_config_hash: str | None
+    bot_git_commit: str | None
+    entry_regime: str | None
     position_type: str
     status: str
     entry_qty: float | None
@@ -365,6 +375,10 @@ class PositionLifecycleStore:
         symbol: str,
         owner_key: str,
         strategy: str,
+        strategy_version: str | None = None,
+        strategy_config_hash: str | None = None,
+        bot_git_commit: str | None = None,
+        entry_regime: str | None = None,
         position_type: str,
         entry_qty: float | None,
         entry_client_order_id: str | None = None,
@@ -406,7 +420,9 @@ class PositionLifecycleStore:
             """
             INSERT INTO position_lifecycle (
                 schema_version, position_uid, created_at, closed_at,
-                symbol, owner_key, strategy, position_type, status,
+                symbol, owner_key, strategy, strategy_version,
+                strategy_config_hash, bot_git_commit, entry_regime,
+                position_type, status,
                 entry_qty, current_qty, avg_entry_price,
                 net_realized_pnl,
                 entry_order_id, entry_client_order_id,
@@ -415,7 +431,7 @@ class PositionLifecycleStore:
                 stated_leverage_multiplier, stress_exposure_multiplier,
                 stated_effective_exposure_dollars,
                 stress_effective_exposure_dollars, metadata_json
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             (
                 LIFECYCLE_SCHEMA_VERSION,
@@ -425,6 +441,10 @@ class PositionLifecycleStore:
                 symbol,
                 owner_key,
                 strategy,
+                strategy_version,
+                strategy_config_hash,
+                bot_git_commit,
+                entry_regime,
                 position_type,
                 "pending",
                 entry_qty,
@@ -870,11 +890,11 @@ class PositionLifecycleStore:
     def _row_with_legs(self, row: tuple) -> PositionLifecycleRow:
         position_uid = row[0]
         meta = {}
-        if row[23]:
+        if row[27]:
             try:
-                meta = json.loads(row[23])
+                meta = json.loads(row[27])
             except (TypeError, ValueError):
-                meta = {"_raw": row[23]}
+                meta = {"_raw": row[27]}
         legs = tuple(self.get_legs_for(position_uid))
         return PositionLifecycleRow(
             position_uid=position_uid,
@@ -883,23 +903,27 @@ class PositionLifecycleStore:
             symbol=row[3],
             owner_key=row[4],
             strategy=row[5],
-            position_type=row[6],
-            status=row[7],
-            entry_qty=row[8],
-            current_qty=row[9],
-            avg_entry_price=row[10],
-            net_realized_pnl=row[11],
-            entry_order_id=row[12],
-            entry_client_order_id=row[13],
-            first_fill_at=row[14],
-            last_fill_at=row[15],
-            sizing_model=row[16],
-            protection_model=row[17],
-            approved_notional_dollars=row[18],
-            stated_leverage_multiplier=row[19],
-            stress_exposure_multiplier=row[20],
-            stated_effective_exposure_dollars=row[21],
-            stress_effective_exposure_dollars=row[22],
+            strategy_version=row[6],
+            strategy_config_hash=row[7],
+            bot_git_commit=row[8],
+            entry_regime=row[9],
+            position_type=row[10],
+            status=row[11],
+            entry_qty=row[12],
+            current_qty=row[13],
+            avg_entry_price=row[14],
+            net_realized_pnl=row[15],
+            entry_order_id=row[16],
+            entry_client_order_id=row[17],
+            first_fill_at=row[18],
+            last_fill_at=row[19],
+            sizing_model=row[20],
+            protection_model=row[21],
+            approved_notional_dollars=row[22],
+            stated_leverage_multiplier=row[23],
+            stress_exposure_multiplier=row[24],
+            stated_effective_exposure_dollars=row[25],
+            stress_effective_exposure_dollars=row[26],
             metadata=meta,
             legs=legs,
         )
@@ -907,7 +931,8 @@ class PositionLifecycleStore:
 
 _SELECT_LIFECYCLE_COLUMNS = (
     "SELECT position_uid, created_at, closed_at, symbol, owner_key, "
-    "strategy, position_type, status, entry_qty, current_qty, "
+    "strategy, strategy_version, strategy_config_hash, bot_git_commit, "
+    "entry_regime, position_type, status, entry_qty, current_qty, "
     "avg_entry_price, net_realized_pnl, entry_order_id, "
     "entry_client_order_id, first_fill_at, last_fill_at, sizing_model, "
     "protection_model, approved_notional_dollars, "
