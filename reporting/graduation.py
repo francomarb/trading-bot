@@ -11,12 +11,24 @@ from dataclasses import dataclass, replace
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
+from urllib.parse import quote
 
 from reporting.logger import is_execution_quality_measurement
 
 
 REPORT_SCHEMA_VERSION = 1
 TERMINAL_STATUSES = frozenset({"closed", "external_closed"})
+_REQUIRED_LIFECYCLE_COLUMNS = frozenset({
+    "position_uid", "strategy", "strategy_version", "strategy_config_hash",
+    "bot_git_commit", "entry_regime", "created_at", "closed_at", "status",
+    "net_realized_pnl",
+})
+_REQUIRED_TRADE_COLUMNS = frozenset({
+    "position_uid", "initial_risk_dollars", "realized_pnl", "strategy",
+    "slippage_benchmark_kind", "slippage_measurement_quality",
+    "slippage_measurement_version", "slippage_adverse_bps",
+})
+_REQUIRED_ORDER_COLUMNS = frozenset({"position_uid", "status", "origin_kind"})
 
 
 @dataclass(frozen=True)
@@ -35,6 +47,7 @@ class _Outcome:
     execution_slippage_bps: tuple[float, ...]
     order_events: tuple[tuple[str, str], ...]
     pnl_reconciled: bool
+    has_realized_pnl_event: bool
     identity_source: str = "recorded"
 
 
@@ -67,17 +80,19 @@ def _table_columns(conn: sqlite3.Connection, table: str) -> set[str]:
 
 def _read_outcomes(conn: sqlite3.Connection) -> tuple[list[_Outcome], dict[str, Any]]:
     lifecycle_columns = _table_columns(conn, "position_lifecycle")
-    required_identity = {
-        "strategy_version",
-        "strategy_config_hash",
-        "bot_git_commit",
-        "entry_regime",
-    }
-    if not required_identity.issubset(lifecycle_columns):
-        missing = sorted(required_identity - lifecycle_columns)
+    if not _REQUIRED_LIFECYCLE_COLUMNS.issubset(lifecycle_columns):
+        missing = sorted(_REQUIRED_LIFECYCLE_COLUMNS - lifecycle_columns)
         raise RuntimeError(
             "database has not received the graduation identity migration; "
             f"missing position_lifecycle columns: {', '.join(missing)}"
+        )
+
+    trade_columns = _table_columns(conn, "trades")
+    if not _REQUIRED_TRADE_COLUMNS.issubset(trade_columns):
+        missing = sorted(_REQUIRED_TRADE_COLUMNS - trade_columns)
+        raise RuntimeError(
+            "trade database schema is too old for graduation reporting; "
+            f"missing trades columns: {', '.join(missing)}"
         )
 
     trade_rows = conn.execute(
@@ -88,6 +103,7 @@ def _read_outcomes(conn: sqlite3.Connection) -> tuple[list[_Outcome], dict[str, 
     ).fetchall()
     risk_by_uid: dict[str, float] = {}
     trade_pnl_by_uid: dict[str, float] = defaultdict(float)
+    pnl_event_uids: set[str] = set()
     slippage_by_uid: dict[str, list[float]] = defaultdict(list)
     for row in trade_rows:
         uid = str(row[0])
@@ -95,6 +111,7 @@ def _read_outcomes(conn: sqlite3.Connection) -> tuple[list[_Outcome], dict[str, 
         if risk is not None and float(risk) > 0:
             risk_by_uid[uid] = max(risk_by_uid.get(uid, 0.0), float(risk))
         if row[2] is not None:
+            pnl_event_uids.add(uid)
             trade_pnl_by_uid[uid] += float(row[2])
         if (
             row[6] is not None
@@ -103,7 +120,14 @@ def _read_outcomes(conn: sqlite3.Connection) -> tuple[list[_Outcome], dict[str, 
             slippage_by_uid[uid].append(float(row[6]))
 
     order_events_by_uid: dict[str, list[tuple[str, str]]] = defaultdict(list)
-    if _table_columns(conn, "position_lifecycle_orders"):
+    order_columns = _table_columns(conn, "position_lifecycle_orders")
+    if order_columns and not _REQUIRED_ORDER_COLUMNS.issubset(order_columns):
+        missing = sorted(_REQUIRED_ORDER_COLUMNS - order_columns)
+        raise RuntimeError(
+            "order lifecycle schema is too old for graduation reporting; "
+            f"missing position_lifecycle_orders columns: {', '.join(missing)}"
+        )
+    if order_columns:
         for uid, status, origin_kind in conn.execute(
             "SELECT position_uid, status, origin_kind "
             "FROM position_lifecycle_orders"
@@ -136,6 +160,7 @@ def _read_outcomes(conn: sqlite3.Connection) -> tuple[list[_Outcome], dict[str, 
                 trade_pnl_by_uid.get(str(row[0]), 0.0),
                 abs_tol=0.01,
             ),
+            has_realized_pnl_event=str(row[0]) in pnl_event_uids,
         )
         for row in rows
     ]
@@ -162,14 +187,18 @@ def _summarize(
     config_hash: str,
     rows: list[_Outcome],
 ) -> dict[str, Any]:
-    completed = [row for row in rows if row.status in TERMINAL_STATUSES]
-    completed.sort(key=lambda row: (row.closed_at or row.opened_at, row.position_uid))
-    pnls = [row.pnl for row in completed]
+    terminal = [row for row in rows if row.status in TERMINAL_STATUSES]
+    trusted = [
+        row for row in terminal
+        if row.has_realized_pnl_event and row.pnl_reconciled
+    ]
+    trusted.sort(key=lambda row: (row.closed_at or row.opened_at, row.position_uid))
+    pnls = [row.pnl for row in trusted]
     wins = [pnl for pnl in pnls if pnl > 0]
     losses = [pnl for pnl in pnls if pnl < 0]
-    r_values = [row.pnl / row.risk_dollars for row in completed if row.risk_dollars]
+    r_values = [row.pnl / row.risk_dollars for row in trusted if row.risk_dollars]
     months: dict[str, float] = defaultdict(float)
-    for row in completed:
+    for row in trusted:
         months[(row.closed_at or row.opened_at)[:7]] += row.pnl
     commits = sorted({row.bot_commit for row in rows if row.bot_commit})
     if len(commits) == 1:
@@ -182,7 +211,7 @@ def _summarize(
     else:
         commit_label = "unknown"
     regimes: dict[str, int] = defaultdict(int)
-    for row in completed:
+    for row in trusted:
         regimes[row.entry_regime or "unknown"] += 1
     slippage = sorted(
         value for row in rows for value in row.execution_slippage_bps
@@ -204,9 +233,10 @@ def _summarize(
     best = max(pnls) if pnls else None
     pnl_without_best = total - best if best is not None else None
     integrity_missing = sum(1 for row in rows if not row.version or not row.config_hash)
-    pnl_mismatches = sum(not row.pnl_reconciled for row in completed)
-    status = "EARLY EVIDENCE" if completed else "DATA INCOMPLETE"
-    if integrity_missing or pnl_mismatches or not completed:
+    pnl_mismatches = sum(not row.pnl_reconciled for row in terminal)
+    missing_pnl_events = sum(not row.has_realized_pnl_event for row in terminal)
+    status = "EARLY EVIDENCE" if trusted else "DATA INCOMPLETE"
+    if integrity_missing or pnl_mismatches or missing_pnl_events or not trusted:
         status = "DATA INCOMPLETE"
 
     return {
@@ -222,20 +252,23 @@ def _summarize(
         "operator_decision": "not_recorded",
         "coverage": {
             "lifecycles": len(rows),
-            "completed": len(completed),
-            "open_or_nonterminal": len(rows) - len(completed),
+            "terminal_lifecycles": len(terminal),
+            "trusted_completed": len(trusted),
+            "unresolved_economics": len(terminal) - len(trusted),
+            "open_or_nonterminal": len(rows) - len(terminal),
             "identity_missing": integrity_missing,
             "pnl_reconciliation_mismatches": pnl_mismatches,
+            "missing_realized_pnl_events": missing_pnl_events,
             "first_opened_at": min((row.opened_at for row in rows), default=None),
             "last_closed_at": max(
-                (row.closed_at for row in completed if row.closed_at),
+                (row.closed_at for row in trusted if row.closed_at),
                 default=None,
             ),
             "historical_mtm": "unavailable_not_recorded",
             "cost_adjustment": "unavailable_not_recorded",
         },
         "performance": {
-            "gross_realized_pnl": total,
+            "gross_realized_pnl": total if pnls else None,
             "net_after_costs": None,
             "average_outcome": statistics.fmean(pnls) if pnls else None,
             "median_outcome": statistics.median(pnls) if pnls else None,
@@ -332,7 +365,10 @@ def build_graduation_report(
 ) -> dict[str, Any]:
     """Build a schema-versioned report without modifying the trade database."""
     path = Path(db_path)
-    conn = sqlite3.connect(path)
+    if not path.is_file():
+        raise FileNotFoundError(f"trade database does not exist: {path}")
+    uri = f"file:{quote(str(path.resolve()), safe='/')}?mode=ro"
+    conn = sqlite3.connect(uri, uri=True)
     try:
         outcomes, diagnostics = _read_outcomes(conn)
     finally:
@@ -341,7 +377,13 @@ def build_graduation_report(
     outcomes = _apply_reviewed_epochs(outcomes, reviewed_epochs_path)
     cohorts: dict[tuple[str, str, str], list[_Outcome]] = defaultdict(list)
     unknown: dict[str, dict[str, float | int]] = defaultdict(
-        lambda: {"lifecycles": 0, "completed": 0, "realized_pnl": 0.0}
+        lambda: {
+            "lifecycles": 0,
+            "terminal_lifecycles": 0,
+            "trusted_completed": 0,
+            "unresolved_economics": 0,
+            "realized_pnl": 0.0,
+        }
     )
     for row in outcomes:
         if row.version and row.version != "unknown" and row.config_hash:
@@ -349,8 +391,12 @@ def build_graduation_report(
         else:
             unknown[row.strategy]["lifecycles"] += 1
             if row.status in TERMINAL_STATUSES:
-                unknown[row.strategy]["completed"] += 1
-                unknown[row.strategy]["realized_pnl"] += row.pnl
+                unknown[row.strategy]["terminal_lifecycles"] += 1
+                if row.has_realized_pnl_event and row.pnl_reconciled:
+                    unknown[row.strategy]["trusted_completed"] += 1
+                    unknown[row.strategy]["realized_pnl"] += row.pnl
+                else:
+                    unknown[row.strategy]["unresolved_economics"] += 1
 
     return {
         "schema_version": REPORT_SCHEMA_VERSION,
@@ -360,7 +406,10 @@ def build_graduation_report(
             str(reviewed_epochs_path) if reviewed_epochs_path is not None else None
         ),
         "report_contract": {
-            "unit": "one completed position_lifecycle, regardless of partial exits or leg count",
+            "unit": (
+                "one economically reconciled completed position_lifecycle, "
+                "regardless of partial exits or leg count"
+            ),
             "authority": "position_lifecycle.net_realized_pnl backed by trades.realized_pnl",
             "approval": "operator_only",
         },
@@ -369,7 +418,15 @@ def build_graduation_report(
             for (strategy, version, config_hash), rows in sorted(cohorts.items())
         ],
         "unknown_epoch_history": [
-            {"strategy": strategy, **values}
+            {
+                "strategy": strategy,
+                **values,
+                "realized_pnl": (
+                    values["realized_pnl"]
+                    if values["trusted_completed"]
+                    else None
+                ),
+            }
             for strategy, values in sorted(unknown.items())
         ],
         "diagnostics": diagnostics,
@@ -400,9 +457,14 @@ def render_markdown(report: dict[str, Any]) -> str:
             f"Status: **{cohort['evidence_status']}** — "
             f"operator decision: `{cohort['operator_decision']}`",
             "",
-            f"Completed lifecycles: {coverage['completed']} "
-            f"(open/nonterminal: {coverage['open_or_nonterminal']})",
-            f"Gross realized P&L: ${perf['gross_realized_pnl']:,.2f}",
+            f"Trusted completed lifecycles: {coverage['trusted_completed']} "
+            f"(unresolved economics: {coverage['unresolved_economics']}; "
+            f"open/nonterminal: {coverage['open_or_nonterminal']})",
+            (
+                f"Gross realized P&L: ${perf['gross_realized_pnl']:,.2f}"
+                if perf["gross_realized_pnl"] is not None
+                else "Gross realized P&L: unavailable"
+            ),
             f"Net after costs: unavailable",
             (
                 f"Win rate: {perf['win_rate']:.1%}"
@@ -429,9 +491,16 @@ def render_markdown(report: dict[str, Any]) -> str:
     if report["unknown_epoch_history"]:
         lines.extend(["## Unknown-epoch history", ""])
         for item in report["unknown_epoch_history"]:
+            pnl_text = (
+                f"${item['realized_pnl']:,.2f} realized"
+                if item["realized_pnl"] is not None
+                else "realized P&L unavailable"
+            )
             lines.append(
-                f"- `{item['strategy']}`: {item['completed']} completed lifecycle(s), "
-                f"${item['realized_pnl']:,.2f} realized; context only, excluded from cohorts."
+                f"- `{item['strategy']}`: {item['trusted_completed']} trusted "
+                f"completed lifecycle(s), {item['unresolved_economics']} unresolved, "
+                f"{pnl_text}; context only, "
+                "excluded from cohorts."
             )
         lines.append("")
     return "\n".join(lines)

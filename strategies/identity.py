@@ -8,28 +8,67 @@ import subprocess
 from dataclasses import asdict, dataclass, is_dataclass
 from enum import Enum
 from functools import lru_cache
+from pathlib import Path
 from typing import Any, Iterable
 
 from config import settings
 
 
-_RUNTIME_FIELDS = frozenset({
-    "_cache",
-    "_cache_time",
-    "_iv_resolver",
-    "_last_scan_time",
-    "_last_metrics",
-    "_last_reason",
-    "_last_reasons",
-    "_open_spreads",
-    "_position_base",
-    "_position_hwm",
-    "_quote_lookup",
-    "_quote_types",
-    "_regime",
-    "_spy_cache",
-    "_symbol",
-})
+# Explicit configuration contract for every component reachable from an active
+# strategy. Runtime caches, observations, clients and callbacks are absent by
+# construction. An unknown component fails clearly instead of silently merging
+# or fragmenting evidence cohorts.
+_CONFIG_FIELDS: dict[str, tuple[str, ...]] = {
+    "strategies.sma_crossover.SMACrossover": ("fast", "slow", "_edge_filter"),
+    "strategies.rsi_reversion.RSIReversion": (
+        "period", "oversold", "overbought", "entry_mode", "exit_sma_window",
+        "quick_exit_rsi", "_edge_filter",
+    ),
+    "strategies.donchian_breakout.DonchianBreakout": (
+        "entry_window", "exit_window", "_edge_filter",
+    ),
+    "strategies.leveraged_trend.LeveragedTrend": (
+        "sma_length", "entry_days", "exit_days", "signal_column",
+        "target_notional_pct", "stated_leverage_multiplier",
+        "stress_exposure_multiplier", "_edge_filter",
+    ),
+    "strategies.spy_options_reversion.SPYOptionsReversionStrategy": (
+        "config", "rsi_length", "rsi_threshold", "trail_activation_pct",
+        "trail_pct", "_edge_filter",
+    ),
+    "strategies.credit_spread.CreditSpread": ("config", "symbol", "_edge_filter"),
+    "strategies.filters.common.CompositeEdgeFilter": ("_filters",),
+    "strategies.filters.common.EarningsBlackout": ("_days_before", "_days_after"),
+    "strategies.filters.common.SPYTrendFilter": (
+        "_windows", "_lookback_days", "_cache_ttl", "_sma_tolerance_pct",
+    ),
+    "strategies.filters.sma_crossover.SMAEdgeFilter": (
+        "_stock_sma_window", "_vol_short", "_vol_long", "_earnings",
+    ),
+    "strategies.filters.rsi_reversion.RSIEdgeFilter": (
+        "_stock_sma_window", "_vol_min_window", "_notional_min_avg",
+    ),
+    "strategies.filters.donchian_breakout.DonchianEdgeFilter": (
+        "_stock_sma_window", "_vol_min_window", "_notional_min_avg",
+        "_earnings", "_feed_label_override",
+    ),
+    "strategies.filters.sector_momentum.SectorMomentumFilter": (
+        "_gauge", "_resolver", "_sector_entry_policy", "_score_threshold",
+    ),
+    "strategies.filters.spy_options_reversion.SPYOptionsEdgeFilter": (
+        "_spy_filter", "_min_vix_percentile", "_vix_source",
+    ),
+    "strategies.filters.credit_spread.CreditSpreadEdgeFilter": (
+        "_iv_source", "_min_iv_proxy", "_sma_window",
+        "_trend_sma_buffer_pct", "_earnings",
+    ),
+    "sector.gauge.SectorMomentumGauge": (
+        "_sector_etfs", "_cache_ttl", "_lookback_days", "_smooth_window",
+    ),
+    "sector.resolver.SectorResolver": (
+        "_cache_path", "_valid_sectors", "_per_symbol_timeout", "_max_retries",
+    ),
+}
 
 
 @dataclass(frozen=True)
@@ -62,19 +101,30 @@ def _canonical(value: Any) -> Any:
         return sorted(items, key=lambda item: json.dumps(item, sort_keys=True))
     if value is None or isinstance(value, (str, int, float, bool)):
         return value
-    if callable(value):
-        return None
+    if isinstance(value, Path):
+        return str(value)
     if hasattr(value, "__dict__"):
-        fields = {
-            key: _canonical(item)
-            for key, item in vars(value).items()
-            if key not in _RUNTIME_FIELDS and not callable(item)
-        }
+        class_name = f"{value.__class__.__module__}.{value.__class__.__qualname__}"
+        field_names = _CONFIG_FIELDS.get(class_name)
+        if field_names is None:
+            raise TypeError(
+                f"no strategy identity configuration contract for {class_name}"
+            )
+        missing = [field for field in field_names if not hasattr(value, field)]
+        if missing:
+            raise TypeError(
+                f"strategy identity contract for {class_name} references "
+                f"missing fields {missing}"
+            )
         return {
-            "class": f"{value.__class__.__module__}.{value.__class__.__qualname__}",
-            "fields": fields,
+            "class": class_name,
+            "fields": {
+                field: _canonical(getattr(value, field)) for field in field_names
+            },
         }
-    return repr(value)
+    raise TypeError(
+        f"unsupported strategy identity configuration value: {type(value).__name__}"
+    )
 
 
 def strategy_config_payload(
@@ -91,16 +141,11 @@ def strategy_config_payload(
         if allowed_regimes is not None
         else settings.STRATEGY_ALLOWED_REGIMES.get(strategy_name)
     )
-    instance_fields = {
-        key: _canonical(value)
-        for key, value in vars(strategy).items()
-        if key not in _RUNTIME_FIELDS and not callable(value)
-    }
     return {
         "strategy": strategy_name,
         "class": f"{strategy.__class__.__module__}.{strategy.__class__.__qualname__}",
         "preferred_order_type": strategy.preferred_order_type.value,
-        "instance": instance_fields,
+        "instance": _canonical(strategy),
         "allowed_regimes": _canonical(regimes),
         "allocation": _canonical(settings.STRATEGY_ALLOCATIONS.get(strategy_name)),
         "watchlist": _canonical(settings.STRATEGY_WATCHLISTS.get(strategy_name)),
@@ -180,6 +225,12 @@ def resolve_strategy_identity(
     # Unknown/test/plugin strategies must not break order admission. They are
     # stamped honestly as unknown and excluded from comparable cohorts.
     version = settings.STRATEGY_VERSIONS.get(str(strategy.name), "unknown")
+    if version == "unknown":
+        return StrategyRunIdentity(
+            strategy_version="unknown",
+            strategy_config_hash="unknown",
+            bot_git_commit=bot_git_commit(),
+        )
     return StrategyRunIdentity(
         strategy_version=version,
         strategy_config_hash=strategy_config_hash(

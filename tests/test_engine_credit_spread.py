@@ -1588,6 +1588,9 @@ class TestSpreadLifecycleWiredInEnter:
         assert row is not None
         assert row.status == "pending"
         assert row.position_type == "spread"
+        assert row.strategy_version == "1.0"
+        assert len(row.strategy_config_hash or "") == 12
+        assert row.bot_git_commit
 
 
 class TestSpreadLifecycleWiredInDrain:

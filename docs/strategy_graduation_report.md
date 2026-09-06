@@ -19,7 +19,9 @@ Every new lifecycle records three separate values at entry:
 - `strategy_config_hash`: an automatic fingerprint of the actual runtime
   strategy parameters, edge-filter configuration, allowed regimes, sleeve
   allocation, universe, effective data feed/timeframe, risk policy, and
-  entry-cap policy.
+  entry-cap policy. Active strategies and filters use an explicit field
+  contract: runtime caches and observations are excluded by construction, and
+  a newly introduced component without a reviewed contract fails clearly.
 - `bot_git_commit`: the exact running Git commit. A dirty checkout is recorded
   as `uncommitted:<commit>` rather than being presented as reproducible code.
 
@@ -56,6 +58,17 @@ The report includes lifecycle counts, realized P&L, expectancy, median, win
 rate, profit factor, R coverage, realized drawdown and loss streak, monthly
 consistency, entry regimes, outlier dependence, order outcomes, operator-order
 count, external closes, and calibration-grade execution slippage.
+
+Only terminal lifecycles with at least one linked realized-P&L event and a
+parent/ledger total that reconciles within one cent enter performance metrics.
+External or recovered closes without durable economics remain visible as
+`unresolved_economics`; they are not converted into zero-dollar outcomes. Any
+such row keeps the cohort at `DATA INCOMPLETE` while valid outcomes and their
+metrics remain visible.
+
+The database is opened read-only. A missing path or an older lifecycle, trade,
+or order schema produces an actionable error and never creates or migrates a
+file as a side effect of reporting.
 
 ## Honest limitations in the first deployment
 

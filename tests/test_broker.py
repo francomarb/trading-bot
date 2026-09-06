@@ -41,6 +41,7 @@ from execution.broker import (
     OrderStatus,
 )
 from execution.options_executor import SpreadLeg
+from engine.lifecycle import PositionLifecycleStore
 from alpaca.trading.enums import OrderClass as AlpacaOrderClass
 from risk.manager import (
     AccountState,
@@ -49,6 +50,7 @@ from risk.manager import (
     Side,
 )
 from risk.models import ProtectionModel, SizingModel
+from reporting.logger import TradeLogger
 from strategies.base import OrderType
 
 
@@ -2181,6 +2183,37 @@ class TestOptionsDryRun:
         mock_worker_cls.return_value.start.assert_called_once()
         assert result.status is OrderStatus.ACCEPTED
         api.submit_order.assert_not_called()  # worker handles submission, not broker directly
+
+    def test_option_entry_persists_strategy_identity(self, tmp_path):
+        api = MagicMock()
+        trade_logger = TradeLogger(path=str(tmp_path / "trades.db"))
+        lifecycle_store = PositionLifecycleStore(trade_logger._ensure_db())
+        broker = AlpacaBroker(
+            client=api,
+            max_attempts=1,
+            base_delay=0.0,
+            dry_run=False,
+            lifecycle_store=lifecycle_store,
+        )
+        decision = replace(
+            _occ_decision(),
+            strategy_version="1.0",
+            strategy_config_hash="abcdef123456",
+            bot_git_commit="deadbeef",
+            entry_regime="RANGING",
+        )
+
+        with patch("execution.broker.OptionsExecutionWorker") as worker_cls:
+            worker_cls.return_value = MagicMock()
+            broker.place_order(decision)
+
+        row = lifecycle_store.get_open_for_owner_key("SPY")
+        assert row is not None
+        assert row.strategy_version == "1.0"
+        assert row.strategy_config_hash == "abcdef123456"
+        assert row.bot_git_commit == "deadbeef"
+        assert row.entry_regime == "RANGING"
+        trade_logger.close()
 
 
 class TestOptionGtcStops:

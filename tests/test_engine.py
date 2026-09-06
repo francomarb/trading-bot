@@ -42,6 +42,7 @@ from unittest.mock import MagicMock
 import pandas as pd
 import pytest
 
+from config import settings
 from engine.trader import (
     EngineConfig,
     TradingEngine,
@@ -62,6 +63,7 @@ from execution.broker import (
     OrderStatus,
 )
 from reporting.logger import TradeLogger
+from regime.detector import MarketRegime
 from risk.manager import (
     AccountState,
     Position,
@@ -82,6 +84,8 @@ from strategies.base import (
     StrategySlot,
 )
 from strategies.leveraged_trend import LeveragedTrend
+from strategies.sma_crossover import SMACrossover
+from strategies.spy_options_reversion import SPYOptionsReversionStrategy
 
 
 # ── Fakes ────────────────────────────────────────────────────────────────────
@@ -699,6 +703,106 @@ class TestProcessSymbol:
         assert filled == Position("AAPL", 1, 100.5, 100.5)
         broker.close_position.assert_not_called()
 
+    def test_equity_entry_persists_resolved_strategy_identity(
+        self, engine_factory, patch_fetch
+    ):
+        engine, _mock_broker = engine_factory()
+        strategy = SMACrossover(20, 50)
+        index = patch_fetch["df"].index
+        strategy._raw_signals = MagicMock(return_value=SignalFrame(
+            entries=pd.Series([False] * (len(index) - 1) + [True], index=index),
+            exits=pd.Series(False, index=index),
+        ))
+        engine.slots[0].strategy = strategy
+
+        api = MagicMock()
+        api.submit_order.return_value = SimpleNamespace(
+            id="equity-identity-1",
+            status="filled",
+            filled_qty="1",
+            filled_avg_price="100.50",
+            symbol="AAPL",
+            side="buy",
+            qty="1",
+            type="market",
+            limit_price=None,
+            stop_price=None,
+            time_in_force="gtc",
+            submitted_at=T0,
+            filled_at=T0,
+        )
+        api.get_order_by_id.return_value = api.submit_order.return_value
+        broker = AlpacaBroker(
+            client=api,
+            max_attempts=1,
+            base_delay=0.0,
+            lifecycle_store=engine.lifecycle_store,
+            lifecycle_orders_store=engine.lifecycle_orders_store,
+        )
+        broker.get_latest_quote_midpoint = MagicMock(return_value=None)
+        engine.broker = broker
+        snap = _snapshot()
+
+        engine._process_symbol(
+            "AAPL", snap, snap.account, strategy, "1Day",
+            current_regime=None,
+            allowed_regimes=None,
+            data_feed="iex",
+        )
+
+        row = engine.lifecycle_store.get_open_for_owner_key("AAPL")
+        assert row is not None
+        assert row.strategy_version == settings.STRATEGY_VERSIONS["sma_crossover"]
+        assert len(row.strategy_config_hash or "") == 12
+        assert row.bot_git_commit
+
+    def test_option_entry_persists_resolved_strategy_identity(
+        self, engine_factory, patch_fetch, monkeypatch
+    ):
+        engine, _mock_broker = engine_factory()
+        strategy = SPYOptionsReversionStrategy(rsi_length=14, rsi_threshold=45)
+        index = patch_fetch["df"].index
+        strategy._raw_signals = MagicMock(return_value=SignalFrame(
+            entries=pd.Series([False] * (len(index) - 1) + [True], index=index),
+            exits=pd.Series(False, index=index),
+        ))
+        occ = "SPY260516C00520000"
+        strategy.build_option_execution = MagicMock(
+            return_value=(occ, 10.0, 30.0, 7.5)
+        )
+        engine.slots[0].strategy = strategy
+
+        worker = MagicMock()
+        worker.start = MagicMock()
+        worker_cls = MagicMock(return_value=worker)
+        monkeypatch.setattr("execution.broker.OptionsExecutionWorker", worker_cls)
+        broker = AlpacaBroker(
+            client=MagicMock(),
+            max_attempts=1,
+            base_delay=0.0,
+            lifecycle_store=engine.lifecycle_store,
+            lifecycle_orders_store=engine.lifecycle_orders_store,
+        )
+        engine.broker = broker
+        snap = _snapshot()
+
+        engine._process_symbol(
+            "SPY", snap, snap.account, strategy, "5Min",
+            current_regime=MarketRegime.RANGING,
+            allowed_regimes=frozenset({MarketRegime.RANGING}),
+            data_feed="iex",
+        )
+
+        row = engine.lifecycle_store.get_open_for_owner_key("SPY")
+        assert row is not None
+        assert row.symbol == occ
+        assert row.strategy_version == settings.STRATEGY_VERSIONS[
+            "spy_options_reversion"
+        ]
+        assert len(row.strategy_config_hash or "") == 12
+        assert row.bot_git_commit
+        assert row.entry_regime == MarketRegime.RANGING.value
+
     def test_entry_signal_with_existing_position_no_order(self, engine_factory):
         engine, broker = engine_factory(entries=[False] * 59 + [True])
         positions = {
@@ -1235,7 +1339,7 @@ class TestProcessSymbol:
         assert not any("Failed to build option execution for SPY" in msg for msg in errors)
 
     def test_async_option_dispatch_registers_position_with_occ_leg(
-        self, engine_factory
+        self, engine_factory, monkeypatch
     ):
         """The async (ACCEPTED) options path must register the Position with
         the OCC contract as its leg symbol — not the strategy's underlying.
@@ -1246,6 +1350,12 @@ class TestProcessSymbol:
         _compute_sector_exposure() miscount SPY options as equity exposure.
         """
         occ = "SPY260521C00730000"
+        # This test uses a local fake class under an active strategy name. Keep
+        # its original ownership focus without pretending the fake has the
+        # production strategy's reviewed identity contract.
+        monkeypatch.delitem(
+            settings.STRATEGY_VERSIONS, "spy_options_reversion"
+        )
 
         class _OptionStrategy(FakeStrategy):
             name = "spy_options_reversion"
