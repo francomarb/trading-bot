@@ -557,6 +557,17 @@ class TradingEngine:
         except Exception as exc:
             logger.warning(f"lifecycle store init skipped: {exc}")
             self.lifecycle_store = None
+        # Strategy graduation phase 2 — latest daily cohort mark. This shares
+        # the trade-log connection so ledger P&L, lifecycle identity, and the
+        # broker snapshot are committed into one local evidence store.
+        try:
+            from reporting.graduation_marks import StrategyDailyMarkStore
+            self.strategy_daily_mark_store = StrategyDailyMarkStore(
+                self.trade_logger._ensure_db()
+            )
+        except Exception as exc:
+            logger.warning(f"strategy daily mark store init skipped: {exc}")
+            self.strategy_daily_mark_store = None
         # Foundation commit 6 — per-order substrate store. Same DB connection
         # so the FK from position_lifecycle_orders.position_uid →
         # position_lifecycle.position_uid resolves locally. Best-effort: if
@@ -1871,6 +1882,7 @@ class TradingEngine:
             # failure logs WARNING and continues — must NEVER raise into
             # the trading loop (design §12.4.1 hard rule).
             self._flush_lifecycle_counters()
+            self._write_strategy_daily_marks()
             self._write_state_snapshot()
             # Close idle HTTP connections so they don't go stale during the
             # inter-cycle sleep (5 min default).  Fresh connections are cheap.
@@ -13202,6 +13214,18 @@ class TradingEngine:
             os.replace(tmp, path)
         except Exception as exc:
             logger.debug(f"_write_state_snapshot failed: {exc}")
+
+    def _write_strategy_daily_marks(self) -> None:
+        """Persist advisory cohort P&L without affecting the trading cycle."""
+        if self.strategy_daily_mark_store is None or self._last_snapshot is None:
+            return
+        try:
+            self.strategy_daily_mark_store.record_snapshot(
+                self._last_snapshot.account.open_positions,
+                observed_at=self._last_snapshot.fetched_at,
+            )
+        except Exception as exc:
+            logger.warning(f"strategy daily mark write skipped: {exc}")
 
     def _baseline_watchlist_status(
         self,

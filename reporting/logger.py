@@ -865,6 +865,16 @@ class TradeLogger:
                 conn.execute(trigger_sql)
             for index_sql in _CREATE_POSITION_LIFECYCLE_INDEXES_SQL:
                 conn.execute(index_sql)
+            # Strategy graduation phase 2 — forward-only cohort marks. The
+            # report opens the database read-only, so collection schema must
+            # be installed here with the rest of the runtime bootstrap.
+            from reporting.graduation_marks import (
+                _CREATE_STRATEGY_DAILY_MARKS_INDEXES_SQL,
+                _CREATE_STRATEGY_DAILY_MARKS_SQL,
+            )
+            conn.execute(_CREATE_STRATEGY_DAILY_MARKS_SQL)
+            for index_sql in _CREATE_STRATEGY_DAILY_MARKS_INDEXES_SQL:
+                conn.execute(index_sql)
             # Order lifecycle foundation (PR #59): per-order substrate.
             # Same migration scaffolding pattern as the position_lifecycle
             # DDL above; the local import keeps engine.lifecycle_orders

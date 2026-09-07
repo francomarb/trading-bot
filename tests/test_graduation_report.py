@@ -8,6 +8,7 @@ from engine.lifecycle import (
     _CREATE_POSITION_LIFECYCLE_SQL,
 )
 from reporting.graduation import build_graduation_report, render_markdown
+from reporting.graduation_marks import _CREATE_STRATEGY_DAILY_MARKS_SQL
 from reporting.logger import _CREATE_TABLE_SQL
 
 
@@ -16,6 +17,7 @@ def _database(path):
     conn.execute(_CREATE_TABLE_SQL)
     conn.execute(_CREATE_POSITION_LIFECYCLE_SQL)
     conn.execute(_CREATE_POSITION_LIFECYCLE_LEGS_SQL)
+    conn.execute(_CREATE_STRATEGY_DAILY_MARKS_SQL)
     conn.commit()
     return conn
 
