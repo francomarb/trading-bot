@@ -85,7 +85,13 @@ invented. Realized events later than the broker snapshot are deferred to the
 next snapshot, preventing old position marks from being mixed with new ledger
 events. Repeated cycles replace only that day's observation; older days are
 immutable. The resulting `forward_daily_total_max_drawdown` begins when this
-collector is deployed and does not pretend to reconstruct earlier marks.
+collector is deployed and does not pretend to reconstruct earlier marks. A
+report run before the engine creates the new table treats forward marks as not
+yet collected; an existing table with the wrong schema remains an error. If a
+cohort has incomplete days, drawdown is calculated from its complete observed
+days while mark coverage stays explicit and the cohort remains `DATA
+INCOMPLETE`. Because a missing day could hide a deeper trough, that observed-day
+drawdown may understate the true drawdown.
 
 ### Reviewed regulatory-cost model
 

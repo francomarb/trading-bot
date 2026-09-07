@@ -239,3 +239,41 @@ class TestGraduationDailyMarksAndCosts:
         assert cohort["performance"]["estimated_regulatory_costs"] == pytest.approx(0.04006)
         assert cohort["performance"]["net_after_costs"] == pytest.approx(99.95994)
         assert cohort["evidence_status"] == "EARLY EVIDENCE"
+
+    def test_report_drawdown_uses_complete_days_and_discloses_gap(self, tmp_path):
+        db = tmp_path / "trades.db"
+        conn, lifecycle, marks = _stores(db)
+        _create_open(lifecycle)
+        _trade(
+            conn,
+            timestamp="2026-09-07T15:00:00+00:00",
+            side="buy",
+            price=100,
+        )
+        marks.record_snapshot(
+            {"AAPL": Position("AAPL", 10, 100, 1100, unrealized_pl=100)},
+            observed_at=datetime(2026, 9, 7, 21, tzinfo=timezone.utc),
+        )
+        marks.record_snapshot(
+            {}, observed_at=datetime(2026, 9, 8, 21, tzinfo=timezone.utc)
+        )
+        marks.record_snapshot(
+            {"AAPL": Position("AAPL", 10, 100, 1040, unrealized_pl=40)},
+            observed_at=datetime(2026, 9, 9, 21, tzinfo=timezone.utc),
+        )
+        _trade(
+            conn,
+            timestamp="2026-09-10T15:00:00+00:00",
+            side="sell",
+            price=104,
+            pnl=40,
+        )
+        lifecycle.mark_closed(position_uid=UID, net_realized_pnl=40)
+        conn.close()
+
+        cohort = build_graduation_report(db)["cohorts"][0]
+
+        assert cohort["coverage"]["daily_marks"] == 3
+        assert cohort["coverage"]["complete_daily_marks"] == 2
+        assert cohort["performance"]["forward_daily_total_max_drawdown"] == -60
+        assert cohort["evidence_status"] == "DATA INCOMPLETE"

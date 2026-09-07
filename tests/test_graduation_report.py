@@ -45,6 +45,44 @@ class TestGraduationReport:
         with pytest.raises(RuntimeError, match="missing trades columns"):
             build_graduation_report(db)
 
+    def test_absent_forward_mark_table_is_empty_evidence(self, tmp_path):
+        db = tmp_path / "pre_deployment.db"
+        conn = _database(db)
+        store = PositionLifecycleStore(conn)
+        store.create_pending(
+            position_uid="pos_cccccccccccccccccccccccccccccccc",
+            symbol="AAPL",
+            owner_key="AAPL",
+            strategy="sma_crossover",
+            strategy_version="1.0",
+            strategy_config_hash="abc123",
+            bot_git_commit="deadbeef",
+            position_type="single_leg",
+            entry_qty=1,
+        )
+        conn.execute("DROP TABLE strategy_daily_marks")
+        conn.commit()
+        conn.close()
+
+        report = build_graduation_report(db)
+
+        assert len(report["cohorts"]) == 1
+        cohort = report["cohorts"][0]
+        assert cohort["coverage"]["daily_marks"] == 0
+        assert cohort["performance"]["forward_daily_total_max_drawdown"] is None
+        assert cohort["evidence_status"] == "DATA INCOMPLETE"
+
+    def test_malformed_forward_mark_table_still_gets_clear_error(self, tmp_path):
+        db = tmp_path / "bad_migration.db"
+        conn = _database(db)
+        conn.execute("DROP TABLE strategy_daily_marks")
+        conn.execute("CREATE TABLE strategy_daily_marks (mark_date TEXT)")
+        conn.commit()
+        conn.close()
+
+        with pytest.raises(RuntimeError, match="daily-mark migration"):
+            build_graduation_report(db)
+
     def test_partial_exit_rows_are_one_lifecycle_outcome(self, tmp_path):
         db = tmp_path / "trades.db"
         conn = _database(db)

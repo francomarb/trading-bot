@@ -237,6 +237,10 @@ def _read_daily_marks(
     conn: sqlite3.Connection,
 ) -> dict[tuple[str, str, str], list[_DailyMark]]:
     columns = _table_columns(conn, "strategy_daily_marks")
+    if not columns:
+        # The read-only report may run after code deployment but before the
+        # engine has performed this new forward-collection migration.
+        return {}
     if not _REQUIRED_MARK_COLUMNS.issubset(columns):
         missing = sorted(_REQUIRED_MARK_COLUMNS - columns)
         raise RuntimeError(
@@ -396,7 +400,7 @@ def _summarize(
             "worst_outcome": min(pnls) if pnls else None,
             "realized_max_drawdown": _max_drawdown(pnls),
             "forward_daily_total_max_drawdown": (
-                _max_level_drawdown(daily_levels) if marks_complete else None
+                _max_level_drawdown(daily_levels) if daily_levels else None
             ),
             "longest_loss_streak": _longest_loss_streak(pnls),
             "pnl_without_best_outcome": pnl_without_best,
@@ -440,6 +444,7 @@ def _summarize(
         },
         "limitations": [
             "Daily total drawdown begins with forward collection; pre-deployment marks are not reconstructed.",
+            "When daily marks are incomplete, drawdown uses complete observed days only and may understate the true drawdown.",
             "Regulatory costs are modeled from the reviewed schedule; actual fills already include slippage.",
             "This status reports evidence readiness and never approves live trading.",
         ],
