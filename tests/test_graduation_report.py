@@ -211,6 +211,169 @@ class TestGraduationReport:
         assert "1 without lifecycle ID" in markdown
         assert "1 with no lifecycle parent" in markdown
 
+    def test_filters_outcomes_marks_and_trade_only_footer(self, tmp_path):
+        db = tmp_path / "trades.db"
+        conn = _database(db)
+        store = PositionLifecycleStore(conn)
+        cases = (
+            (
+                "pos_11111111111111111111111111111111",
+                "sma_crossover",
+                "2026-01-15",
+                10.0,
+                "abc123",
+            ),
+            (
+                "pos_22222222222222222222222222222222",
+                "sma_crossover",
+                "2026-02-15",
+                20.0,
+                "abc123",
+            ),
+            (
+                "pos_33333333333333333333333333333333",
+                "rsi_reversion",
+                "2026-02-15",
+                30.0,
+                "abc123",
+            ),
+            (
+                "pos_44444444444444444444444444444444",
+                "sma_crossover",
+                "2026-03-15",
+                40.0,
+                "later456",
+            ),
+        )
+        for uid, strategy, day, pnl, config_hash in cases:
+            store.create_pending(
+                position_uid=uid,
+                symbol="AAPL",
+                owner_key=uid,
+                strategy=strategy,
+                strategy_version="1.0",
+                strategy_config_hash=config_hash,
+                bot_git_commit="deadbeef",
+                position_type="single_leg",
+                entry_qty=1,
+            )
+            store.mark_open(position_uid=uid, avg_entry_price=100, current_qty=1)
+            conn.execute(
+                "INSERT INTO trades "
+                "(timestamp,symbol,side,qty,strategy,reason,status,position_type,"
+                "position_uid,realized_pnl) VALUES "
+                "(?,'AAPL','sell',1,?,'exit','filled','single_leg',?,?)",
+                (f"{day}T20:00:00+00:00", strategy, uid, pnl),
+            )
+            conn.commit()
+            store.mark_closed(position_uid=uid, net_realized_pnl=pnl)
+            conn.execute(
+                "UPDATE position_lifecycle SET created_at=?, closed_at=? "
+                "WHERE position_uid=?",
+                (
+                    f"{day}T15:00:00+00:00",
+                    f"{day}T20:00:00+00:00",
+                    uid,
+                ),
+            )
+        conn.executemany(
+            "INSERT INTO strategy_daily_marks "
+            "(mark_date,observed_at,strategy,strategy_version,"
+            "strategy_config_hash,realized_pnl,unrealized_pnl,total_pnl,"
+            "open_lifecycles,valued_lifecycles,missing_lifecycles,"
+            "unresolved_economics,source) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)",
+            [
+                (
+                    "2026-01-15", "2026-01-15T21:00:00+00:00",
+                    "sma_crossover", "1.0", "abc123", 10, 0, 10,
+                    0, 0, 0, 0, "broker_snapshot",
+                ),
+                (
+                    "2026-02-15", "2026-02-15T21:00:00+00:00",
+                    "sma_crossover", "1.0", "abc123", 30, 0, 30,
+                    0, 0, 0, 0, "broker_snapshot",
+                ),
+                (
+                    "2026-02-20", "2026-02-20T21:00:00+00:00",
+                    "sma_crossover", "1.0", "later456", 0, 5, 5,
+                    1, 1, 0, 0, "broker_snapshot",
+                ),
+                (
+                    "2026-02-15", "2026-02-15T21:00:00+00:00",
+                    "rsi_reversion", "1.0", "abc123", 30, 0, 30,
+                    0, 0, 0, 0, "broker_snapshot",
+                ),
+            ],
+        )
+        conn.executemany(
+            "INSERT INTO trades "
+            "(timestamp,symbol,side,qty,strategy,reason,status,position_type,"
+            "position_uid,realized_pnl) VALUES "
+            "(?,'OLD','sell',1,?,'legacy','filled','single_leg',NULL,?)",
+            [
+                ("2026-01-20T20:00:00+00:00", "sma_crossover", -1),
+                ("2026-02-20T20:00:00+00:00", "sma_crossover", -2),
+                ("2026-02-20T20:00:00+00:00", "rsi_reversion", -3),
+            ],
+        )
+        conn.commit()
+        conn.close()
+
+        report = build_graduation_report(
+            db,
+            start_date="2026-02-01",
+            end_date="2026-02-28",
+            strategies=["sma_crossover"],
+        )
+
+        assert report["filters"] == {
+            "start_date": "2026-02-01",
+            "end_date": "2026-02-28",
+            "strategies": ["sma_crossover"],
+            "lifetime": False,
+            "timezone": "UTC",
+        }
+        assert len(report["cohorts"]) == 2
+        cohort = next(
+            item for item in report["cohorts"]
+            if item["strategy_config_hash"] == "abc123"
+        )
+        assert cohort["coverage"]["trusted_completed"] == 1
+        assert cohort["performance"]["gross_realized_pnl"] == 20
+        assert [
+            mark["mark_date"] for mark in cohort["mark_to_market"]["daily"]
+        ] == ["2026-02-15"]
+        mark_only = next(
+            item for item in report["cohorts"]
+            if item["strategy_config_hash"] == "later456"
+        )
+        assert mark_only["coverage"]["trusted_completed"] == 0
+        assert [
+            mark["mark_date"] for mark in mark_only["mark_to_market"]["daily"]
+        ] == ["2026-02-20"]
+        assert report["diagnostics"]["excluded_trade_only_realized_events"] == [
+            {
+                "strategy": "sma_crossover",
+                "exclusion_kind": "no_position_uid",
+                "events": 1,
+                "realized_pnl": -2.0,
+            }
+        ]
+        markdown = render_markdown(report)
+        assert "UTC 2026-02-01 through 2026-02-28" in markdown
+        assert "`sma_crossover`" in markdown
+
+    def test_date_filter_validation_is_strict(self, tmp_path):
+        db = tmp_path / "trades.db"
+        _database(db).close()
+
+        with pytest.raises(ValueError, match="valid YYYY-MM-DD"):
+            build_graduation_report(db, start_date="February 1, 2026")
+        with pytest.raises(ValueError, match="on or before"):
+            build_graduation_report(
+                db, start_date="2026-03-01", end_date="2026-02-01"
+            )
+
     def test_terminal_without_economics_is_excluded_not_zero(self, tmp_path):
         db = tmp_path / "trades.db"
         conn = _database(db)

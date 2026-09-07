@@ -56,6 +56,24 @@ The command writes matching schema-versioned JSON and Markdown files under
 - `READY FOR OPERATOR REVIEW`: reserved for a later reviewed sufficiency
   contract; it still will not mean approved.
 
+The default is the complete lifetime database view. Optional filters produce a
+clearly labeled observation slice:
+
+```bash
+./venv/bin/python scripts/strategy_graduation_report.py \
+  --start-date 2026-07-01 \
+  --end-date 2026-09-30 \
+  --strategy spy_options_reversion
+```
+
+Dates are inclusive UTC dates. Completed lifecycle outcomes are selected by
+close date, daily marks by `mark_date`, and excluded trade-only P&L by event
+date. Active lifecycles opened before the end date remain visible because they
+intersect the observation window. Repeat `--strategy` to select more than one
+strategy. The JSON `filters` object and Markdown `Report scope` line always
+record the selection; omitted bounds mean earliest/latest. Filters never merge
+strategy-version/configuration cohorts or replace the lifetime report.
+
 The report includes lifecycle counts, realized P&L, expectancy, median, win
 rate, profit factor, R coverage, realized drawdown and loss streak, monthly
 consistency, entry regimes, outlier dependence, order outcomes, operator-order
@@ -102,7 +120,7 @@ drawdown may understate the true drawdown.
 ### Reviewed regulatory-cost model
 
 Realized lifecycle P&L already uses actual broker fill prices, so execution
-slippage is already present and is not deducted again. Report schema v2 applies
+slippage is already present and is not deducted again. Report schema v3 applies
 the versioned `alpaca-retail-us-2026-06-01-v1` pass-through schedule to actual
 filled quantities:
 
