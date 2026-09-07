@@ -756,6 +756,36 @@ class TestProcessSymbol:
         assert len(row.strategy_config_hash or "") == 12
         assert row.bot_git_commit
 
+    def test_identity_failure_does_not_block_equity_entry(
+        self, engine_factory, patch_fetch, monkeypatch
+    ):
+        engine, broker = engine_factory()
+        strategy = SMACrossover(20, 50)
+        index = patch_fetch["df"].index
+        strategy._raw_signals = MagicMock(return_value=SignalFrame(
+            entries=pd.Series([False] * (len(index) - 1) + [True], index=index),
+            exits=pd.Series(False, index=index),
+        ))
+        engine.slots[0].strategy = strategy
+
+        def _raise_identity_error(*args, **kwargs):
+            raise TypeError("missing reviewed identity contract")
+
+        monkeypatch.setattr(
+            "strategies.identity.strategy_config_hash", _raise_identity_error
+        )
+        snap = _snapshot()
+
+        filled = engine._process_symbol(
+            "AAPL", snap, snap.account, strategy, "1Day", data_feed="iex"
+        )
+
+        assert filled is not None
+        broker.place_order.assert_called_once()
+        decision = broker.place_order.call_args.args[0]
+        assert decision.strategy_version == "unknown"
+        assert decision.strategy_config_hash == "unknown"
+
     def test_option_entry_persists_resolved_strategy_identity(
         self, engine_factory, patch_fetch, monkeypatch
     ):

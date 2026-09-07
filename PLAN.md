@@ -76,7 +76,7 @@ from proceeding.
 | Live launch throttle (`10.G2`) | ⬜ Set at live flip | The flat `HARD_DOLLAR_LOSS_CAP` was retired 2026-09-01 (tripped on ordinary market noise once the account grew; did not scale). Account drawdown is owned by `MAX_DAILY_LOSS_PCT` (5%, scales); the launch-only "start tiny" gate is now `LIVE_SIZE_MULTIPLIER` ≤ 0.25, verified by preflight. |
 | Preflight + dry run (`10.G5`) | ✅ Code complete | Re-run immediately before live flip |
 | VPS deployment (`10.H1-H5`) | ⏸ Deferred by operator | Resume only after the operator is satisfied that at least one strategy merits live consideration. Then provision the production runtime, systemd, secure env, and log shipping. |
-| Strategy graduation evidence package | 🔄 Foundation implemented; clean cohorts begin after deployment | Lifecycle-first JSON/Markdown reporting and immutable version/config/commit stamping are in review. Legacy history stays explicitly unknown. Add forward daily marks and a reviewed cost model before any cohort can be called ready for operator review. |
+| Strategy graduation evidence package | 🔄 Foundation implemented; clean cohorts begin after deployment | Lifecycle-first JSON/Markdown reporting and version/config/commit stamping are in review. Identity failures remain visible as unknown history without blocking entries. Add forward daily marks and a reviewed cost model before any cohort can be called ready for operator review. |
 
 ---
 

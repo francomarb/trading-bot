@@ -21,7 +21,9 @@ Every new lifecycle records three separate values at entry:
   allocation, universe, effective data feed/timeframe, risk policy, and
   entry-cap policy. Active strategies and filters use an explicit field
   contract: runtime caches and observations are excluded by construction, and
-  a newly introduced component without a reviewed contract fails clearly.
+  direct validation fails clearly for a component without a reviewed contract.
+  Entry-time resolution logs the failure and stamps the lifecycle as unknown
+  instead of allowing advisory reporting metadata to block a valid order.
 - `bot_git_commit`: the exact running Git commit. A dirty checkout is recorded
   as `uncommitted:<commit>` rather than being presented as reproducible code.
 

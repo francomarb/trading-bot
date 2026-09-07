@@ -72,6 +72,15 @@ class TestStrategyConfigIdentity:
         with pytest.raises(TypeError, match="no strategy identity configuration"):
             strategy_config_hash(strategy)
 
+    def test_runtime_resolution_degrades_unclassified_component_to_unknown(self):
+        strategy = RSIReversion(edge_filter=self._UnclassifiedFilter())
+
+        identity = resolve_strategy_identity(strategy)
+
+        assert identity.strategy_version == "unknown"
+        assert identity.strategy_config_hash == "unknown"
+        assert identity.bot_git_commit
+
     def test_sector_runtime_caches_do_not_change_hash(self, tmp_path):
         gauge = SectorMomentumGauge({"technology": "XLK"})
         resolver = SectorResolver(
@@ -121,7 +130,7 @@ class TestStrategyConfigIdentity:
         ],
     )
     def test_every_active_strategy_has_explicit_contract(self, strategy):
-        identity = resolve_strategy_identity(strategy)
+        config_hash = strategy_config_hash(strategy)
 
-        assert identity.strategy_version == settings.STRATEGY_VERSIONS[strategy.name]
-        assert len(identity.strategy_config_hash) == 12
+        assert strategy.name in settings.STRATEGY_VERSIONS
+        assert len(config_hash) == 12

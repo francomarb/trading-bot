@@ -11,13 +11,16 @@ from functools import lru_cache
 from pathlib import Path
 from typing import Any, Iterable
 
+from loguru import logger
+
 from config import settings
 
 
 # Explicit configuration contract for every component reachable from an active
 # strategy. Runtime caches, observations, clients and callbacks are absent by
-# construction. An unknown component fails clearly instead of silently merging
-# or fragmenting evidence cohorts.
+# construction. Strict hash validation rejects an unknown component instead of
+# silently merging or fragmenting evidence cohorts; entry-time resolution
+# degrades that failure to excluded unknown-epoch history.
 _CONFIG_FIELDS: dict[str, tuple[str, ...]] = {
     "strategies.sma_crossover.SMACrossover": ("fast", "slow", "_edge_filter"),
     "strategies.rsi_reversion.RSIReversion": (
@@ -221,7 +224,7 @@ def resolve_strategy_identity(
     data_feed: str | None = None,
     timeframe: str | None = None,
 ) -> StrategyRunIdentity:
-    """Resolve the immutable identity for a newly admitted entry."""
+    """Resolve entry identity without allowing advisory metadata to block it."""
     # Unknown/test/plugin strategies must not break order admission. They are
     # stamped honestly as unknown and excluded from comparable cohorts.
     version = settings.STRATEGY_VERSIONS.get(str(strategy.name), "unknown")
@@ -231,13 +234,32 @@ def resolve_strategy_identity(
             strategy_config_hash="unknown",
             bot_git_commit=bot_git_commit(),
         )
-    return StrategyRunIdentity(
-        strategy_version=version,
-        strategy_config_hash=strategy_config_hash(
+    try:
+        config_hash = strategy_config_hash(
             strategy,
             allowed_regimes=allowed_regimes,
             data_feed=data_feed,
             timeframe=timeframe,
-        ),
+        )
+    except Exception as exc:
+        # Identity is advisory evidence, not an order-admission control. Keep
+        # strategy_config_hash() strict so CI/audits expose missing contracts,
+        # but fail open on the live entry path and exclude the trade from a
+        # comparable cohort by stamping the whole strategy epoch unknown.
+        logger.error(
+            "strategy identity unavailable for {} ({}): {} — "
+            "entry will continue in unknown-epoch history",
+            strategy.name,
+            type(exc).__name__,
+            exc,
+        )
+        return StrategyRunIdentity(
+            strategy_version="unknown",
+            strategy_config_hash="unknown",
+            bot_git_commit=bot_git_commit(),
+        )
+    return StrategyRunIdentity(
+        strategy_version=version,
+        strategy_config_hash=config_hash,
         bot_git_commit=bot_git_commit(),
     )
