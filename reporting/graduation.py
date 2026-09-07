@@ -221,10 +221,30 @@ def _read_outcomes(conn: sqlite3.Connection) -> tuple[list[_Outcome], dict[str, 
         "FROM trades WHERE realized_pnl IS NOT NULL AND position_uid IS NULL "
         "GROUP BY strategy ORDER BY strategy"
     ).fetchall()
+    excluded_trade_only = conn.execute(
+        "SELECT t.strategy, "
+        "CASE WHEN t.position_uid IS NULL THEN 'no_position_uid' "
+        "ELSE 'missing_lifecycle_parent' END AS exclusion_kind, "
+        "COUNT(*), COALESCE(SUM(t.realized_pnl), 0.0) "
+        "FROM trades t LEFT JOIN position_lifecycle p "
+        "ON p.position_uid = t.position_uid "
+        "WHERE t.realized_pnl IS NOT NULL AND p.position_uid IS NULL "
+        "GROUP BY t.strategy, exclusion_kind "
+        "ORDER BY t.strategy, exclusion_kind"
+    ).fetchall()
     diagnostics = {
         "legacy_unlinked_realized_events": [
             {"strategy": row[0], "events": int(row[1]), "realized_pnl": float(row[2])}
             for row in legacy
+        ],
+        "excluded_trade_only_realized_events": [
+            {
+                "strategy": row[0],
+                "exclusion_kind": row[1],
+                "events": int(row[2]),
+                "realized_pnl": float(row[3]),
+            }
+            for row in excluded_trade_only
         ],
         "execution_quality_measurements": sum(len(v) for v in slippage_by_uid.values()),
         "historical_mtm": "forward_collection_only",
@@ -666,6 +686,37 @@ def render_markdown(report: dict[str, Any]) -> str:
                 f"completed lifecycle(s), {item['unresolved_economics']} unresolved, "
                 f"{pnl_text}; context only, "
                 "excluded from cohorts."
+            )
+        lines.append("")
+    excluded = report["diagnostics"].get(
+        "excluded_trade_only_realized_events", []
+    )
+    if excluded:
+        lines.extend([
+            "## Excluded trade-only history",
+            "",
+            "These realized-P&L events have no matching lifecycle and are not "
+            "included in lifecycle totals or graduation cohorts.",
+            "",
+        ])
+        by_strategy: dict[str, list[dict[str, Any]]] = defaultdict(list)
+        for item in excluded:
+            by_strategy[str(item["strategy"])].append(item)
+        for strategy, items in sorted(by_strategy.items()):
+            events = sum(int(item["events"]) for item in items)
+            pnl = sum(float(item["realized_pnl"]) for item in items)
+            event_word = "event" if events == 1 else "events"
+            reasons = {str(item["exclusion_kind"]): int(item["events"]) for item in items}
+            reason_parts = []
+            if reasons.get("no_position_uid"):
+                reason_parts.append(f"{reasons['no_position_uid']} without lifecycle ID")
+            if reasons.get("missing_lifecycle_parent"):
+                reason_parts.append(
+                    f"{reasons['missing_lifecycle_parent']} with no lifecycle parent"
+                )
+            lines.append(
+                f"- `{strategy}`: {events} P&L {event_word}, ${pnl:,.2f} net "
+                f"({'; '.join(reason_parts)})."
             )
         lines.append("")
     return "\n".join(lines)

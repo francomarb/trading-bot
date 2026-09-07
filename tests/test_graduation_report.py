@@ -173,6 +173,44 @@ class TestGraduationReport:
         assert report["unknown_epoch_history"][0]["realized_pnl"] == 25
         assert "excluded from cohorts" in render_markdown(report)
 
+    def test_footer_discloses_trade_events_without_lifecycle(self, tmp_path):
+        db = tmp_path / "trades.db"
+        conn = _database(db)
+        conn.execute(
+            "INSERT INTO trades "
+            "(timestamp,symbol,side,qty,strategy,reason,status,position_type,"
+            "position_uid,realized_pnl) VALUES "
+            "('2026-01-02','SPY','sell',1,'legacy_strategy','exit','filled',"
+            "'single_leg',NULL,-10),"
+            "('2026-01-03','SPY','sell',1,'legacy_strategy','exit','filled',"
+            "'single_leg','pos_missing_parent',4)"
+        )
+        conn.commit()
+        conn.close()
+
+        report = build_graduation_report(db)
+        excluded = report["diagnostics"]["excluded_trade_only_realized_events"]
+
+        assert excluded == [
+            {
+                "strategy": "legacy_strategy",
+                "exclusion_kind": "missing_lifecycle_parent",
+                "events": 1,
+                "realized_pnl": 4.0,
+            },
+            {
+                "strategy": "legacy_strategy",
+                "exclusion_kind": "no_position_uid",
+                "events": 1,
+                "realized_pnl": -10.0,
+            },
+        ]
+        markdown = render_markdown(report)
+        assert "## Excluded trade-only history" in markdown
+        assert "2 P&L events, $-6.00 net" in markdown
+        assert "1 without lifecycle ID" in markdown
+        assert "1 with no lifecycle parent" in markdown
+
     def test_terminal_without_economics_is_excluded_not_zero(self, tmp_path):
         db = tmp_path / "trades.db"
         conn = _database(db)

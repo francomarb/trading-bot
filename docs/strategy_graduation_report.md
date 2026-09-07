@@ -69,6 +69,12 @@ External or recovered closes without durable economics remain visible as
 such row keeps the cohort at `DATA INCOMPLETE` while valid outcomes and their
 metrics remain visible.
 
+The Markdown footer separately totals realized-P&L trade events that have no
+matching lifecycle. It distinguishes rows with no lifecycle ID from rows whose
+old identifier has no lifecycle parent. These values explain differences from
+trade-row dashboards but remain context only: they are neither lifecycle
+outcomes nor versioned cohort evidence.
+
 ### Forward daily marks
 
 After each engine cycle, `strategy_daily_marks` keeps the latest broker
