@@ -12,7 +12,7 @@ This document catalogues every strategy in the bot, its signal logic, edge filte
 | **Backtesting** | Backtested with vectorbt, tuning parameters |
 | **Paper Trading** | Running against the Alpaca paper account |
 | **Live** | Deployed with real capital |
-| **Retired** | Disabled after failing go/no-go or underperforming |
+| **Retired** | Disabled by operator decision after evidence review |
 
 ---
 

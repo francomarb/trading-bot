@@ -834,6 +834,10 @@ class TradeLogger:
                 "stress_exposure_multiplier": "REAL",
                 "stated_effective_exposure_dollars": "REAL",
                 "stress_effective_exposure_dollars": "REAL",
+                "strategy_version": "TEXT",
+                "strategy_config_hash": "TEXT",
+                "bot_git_commit": "TEXT",
+                "entry_regime": "TEXT",
             }.items():
                 if column not in lifecycle_columns:
                     conn.execute(

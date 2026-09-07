@@ -288,6 +288,12 @@ class RiskDecision:
     # Launch scaling is independent of the exposure-cap stack. Keeping it
     # separate preserves the binding cap when both reduce the same order.
     applied_size_multiplier: float | None = 1.0
+    # Graduation evidence identity, attached by the engine after risk sizing.
+    # The lifecycle row owns these values; exits never recompute them.
+    strategy_version: str | None = None
+    strategy_config_hash: str | None = None
+    bot_git_commit: str | None = None
+    entry_regime: str | None = None
     sizing_model: SizingModel = SizingModel.STOP_DISTANCE
     protection_model: ProtectionModel = ProtectionModel.BROKER_STOP
     approved_notional_dollars: float | None = None
