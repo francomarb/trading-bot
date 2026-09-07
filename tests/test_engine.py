@@ -786,6 +786,39 @@ class TestProcessSymbol:
         assert decision.strategy_version == "unknown"
         assert decision.strategy_config_hash == "unknown"
 
+    def test_daily_graduation_mark_uses_latest_broker_snapshot(self, engine_factory):
+        engine, _broker = engine_factory()
+        uid = "pos_99999999999999999999999999999999"
+        engine.lifecycle_store.create_pending(
+            position_uid=uid,
+            symbol="AAPL",
+            owner_key="AAPL",
+            strategy="sma_crossover",
+            strategy_version="1.0",
+            strategy_config_hash="abc123",
+            bot_git_commit="deadbeef",
+            position_type="single_leg",
+            entry_qty=10,
+        )
+        engine.lifecycle_store.mark_open(
+            position_uid=uid,
+            avg_entry_price=100,
+            current_qty=10,
+        )
+        engine._last_snapshot = _snapshot(positions={
+            "AAPL": Position(
+                "AAPL", 10, 100, 1050, cost_basis=1000, unrealized_pl=50
+            )
+        })
+
+        engine._write_strategy_daily_marks()
+
+        row = engine.trade_logger._ensure_db().execute(
+            "SELECT unrealized_pnl, total_pnl FROM strategy_daily_marks "
+            "WHERE strategy = 'sma_crossover'"
+        ).fetchone()
+        assert row == (50.0, 50.0)
+
     def test_option_entry_persists_resolved_strategy_identity(
         self, engine_factory, patch_fetch, monkeypatch
     ):

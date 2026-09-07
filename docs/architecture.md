@@ -664,6 +664,18 @@ report built from authoritative realized-P&L and operational records. The
 replacement must report facts and uncertainty; operator approval remains the
 live-inclusion decision.
 
+The replacement now records forward-only daily marks in
+`strategy_daily_marks`: durable realized trade P&L plus Alpaca's
+broker-reported unrealized P&L, grouped by strategy version and configuration
+hash. Missing positions/legs produce NULL rather than an inferred valuation.
+Reports calculate forward drawdown from complete observed days while exposing
+mark coverage; any gap keeps the cohort incomplete and means the observed
+drawdown may understate the true drawdown.
+The report also applies a versioned Alpaca regulatory-fee schedule to actual
+fills. Actual fill P&L already contains execution slippage, so the fee model
+does not charge modeled slippage a second time. MLEG net-after-costs stays
+unavailable when individual sell-leg principal is absent.
+
 **Pre-flight checklist (`scripts/preflight.py`):**
 Must exit 0 before any live capital is committed. Validates: credentials point to the live endpoint, buying power meets minimum, `SLIPPAGE_DRIFT_ENABLED=True`, dry-run cycle passes, and the operator has explicitly set `STRATEGY_GRADUATION_APPROVED=yes`. The lifecycle-first graduation report now produces advisory evidence, but preflight remains a manual operator assertion until a later reviewed change binds an approved strategy, cohort, and report digest.
 

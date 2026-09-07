@@ -59,7 +59,8 @@ The command writes matching schema-versioned JSON and Markdown files under
 The report includes lifecycle counts, realized P&L, expectancy, median, win
 rate, profit factor, R coverage, realized drawdown and loss streak, monthly
 consistency, entry regimes, outlier dependence, order outcomes, operator-order
-count, external closes, and calibration-grade execution slippage.
+count, external closes, calibration-grade execution slippage, modeled
+regulatory costs, and forward daily total-P&L drawdown.
 
 Only terminal lifecycles with at least one linked realized-P&L event and a
 parent/ledger total that reconciles within one cent enter performance metrics.
@@ -68,18 +69,67 @@ External or recovered closes without durable economics remain visible as
 such row keeps the cohort at `DATA INCOMPLETE` while valid outcomes and their
 metrics remain visible.
 
-The database is opened read-only. A missing path or an older lifecycle, trade,
-or order schema produces an actionable error and never creates or migrates a
-file as a side effect of reporting.
+### Forward daily marks
 
-## Honest limitations in the first deployment
+After each engine cycle, `strategy_daily_marks` keeps the latest broker
+observation for each strategy-version/configuration cohort and UTC date. Its
+total is:
 
-The database has no historical daily mark-to-market series and no complete,
-reviewed fee ledger. Therefore the report labels total-P&L drawdown and net
-after costs as unavailable; it never substitutes realized-only drawdown or
-zero fees under those names. Realized-only drawdown is shown explicitly.
+`durable realized trade P&L to date + broker-reported unrealized P&L`
 
-Forward collection of daily strategy marks and a reviewed cost model are the
-next report increments. Binding an operator-approved strategy/epoch/report
-digest into live preflight is also deliberately separate and must happen only
-after the evidence contract and generated reports have been reviewed.
+Single-leg positions use their exact broker symbol. MLEG positions sum the
+broker-reported P&L of every recorded leg. A missing position, missing leg,
+non-finite broker value, errored lifecycle, or unreconciled terminal lifecycle
+makes that cohort/day incomplete and leaves `total_pnl` NULL. No price is
+invented. Realized events later than the broker snapshot are deferred to the
+next snapshot, preventing old position marks from being mixed with new ledger
+events. Repeated cycles replace only that day's observation; older days are
+immutable. The resulting `forward_daily_total_max_drawdown` begins when this
+collector is deployed and does not pretend to reconstruct earlier marks. A
+report run before the engine creates the new table treats forward marks as not
+yet collected; an existing table with the wrong schema remains an error. If a
+cohort has incomplete days, drawdown is calculated from its complete observed
+days while mark coverage stays explicit and the cohort remains `DATA
+INCOMPLETE`. Because a missing day could hide a deeper trough, that observed-day
+drawdown may understate the true drawdown.
+
+### Reviewed regulatory-cost model
+
+Realized lifecycle P&L already uses actual broker fill prices, so execution
+slippage is already present and is not deducted again. Report schema v2 applies
+the versioned `alpaca-retail-us-2026-06-01-v1` pass-through schedule to actual
+filled quantities:
+
+| Cost | Rate |
+|---|---:|
+| Alpaca self-directed API commission | $0/order |
+| Equity TAF, sells | $0.000195/share, $9.79/order cap |
+| Option TAF, sells | $0.00329/contract |
+| Option ORF, buys and sells | $0.02295/contract |
+| OCC clearing, buys and sells | $0.025/contract |
+| SEC transaction fee, sells | $20.60 per $1,000,000 principal |
+| CAT fees, buys and sells | $0.000003/executed-equivalent share |
+
+The model is effective for fills on or after 2026-06-01. Its version, rates,
+effective date, and primary sources are embedded in every JSON report. Sources:
+[Alpaca Brokerage Fee Schedule](https://files.alpaca.markets/disclosures/library/BrokFeeSched.pdf),
+[FINRA 2026 TAF schedule](https://www.finra.org/rules-guidance/rule-filings/sr-finra-2024-019/fee-adjustment-schedule),
+and [CAT fee alerts](https://www.catnmsplan.com/cat-fee-alerts).
+
+If a round trip is missing a side, predates the model, or lacks sell principal,
+`net_after_costs` remains unavailable. In particular, current MLEG rows store a
+net combo price rather than both individual leg premiums, so their SEC
+sell-principal component cannot be reconstructed and credit-spread cost
+coverage remains explicitly incomplete.
+
+The database is opened read-only by the report. A missing path or an older
+lifecycle, trade, order, or mark schema produces an actionable error and never
+creates or migrates a file as a side effect of reporting.
+
+## Honest limitations
+
+Pre-deployment daily marks remain unavailable and are never backfilled. Modeled
+fees are not a broker fee ledger; changing rates requires a new reviewed model
+version. Binding an operator-approved strategy/epoch/report digest into live
+preflight remains deliberately separate and must happen only after generated
+reports and evidence-sufficiency rules have been reviewed.

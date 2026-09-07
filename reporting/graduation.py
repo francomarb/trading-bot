@@ -13,10 +13,11 @@ from pathlib import Path
 from typing import Any
 from urllib.parse import quote
 
+from reporting.costs import DEFAULT_COST_MODEL
 from reporting.logger import is_execution_quality_measurement
 
 
-REPORT_SCHEMA_VERSION = 1
+REPORT_SCHEMA_VERSION = 2
 TERMINAL_STATUSES = frozenset({"closed", "external_closed"})
 _REQUIRED_LIFECYCLE_COLUMNS = frozenset({
     "position_uid", "strategy", "strategy_version", "strategy_config_hash",
@@ -26,9 +27,17 @@ _REQUIRED_LIFECYCLE_COLUMNS = frozenset({
 _REQUIRED_TRADE_COLUMNS = frozenset({
     "position_uid", "initial_risk_dollars", "realized_pnl", "strategy",
     "slippage_benchmark_kind", "slippage_measurement_quality",
-    "slippage_measurement_version", "slippage_adverse_bps",
+    "slippage_measurement_version", "slippage_adverse_bps", "timestamp",
+    "symbol", "side", "qty", "avg_fill_price", "filled_qty", "status",
+    "order_id",
 })
 _REQUIRED_ORDER_COLUMNS = frozenset({"position_uid", "status", "origin_kind"})
+_REQUIRED_MARK_COLUMNS = frozenset({
+    "mark_date", "observed_at", "strategy", "strategy_version",
+    "strategy_config_hash", "realized_pnl", "unrealized_pnl", "total_pnl",
+    "open_lifecycles", "valued_lifecycles", "missing_lifecycles",
+    "unresolved_economics", "source",
+})
 
 
 @dataclass(frozen=True)
@@ -48,7 +57,23 @@ class _Outcome:
     order_events: tuple[tuple[str, str], ...]
     pnl_reconciled: bool
     has_realized_pnl_event: bool
+    estimated_cost: float | None
+    cost_complete: bool
+    cost_reasons: tuple[str, ...]
     identity_source: str = "recorded"
+
+
+@dataclass(frozen=True)
+class _DailyMark:
+    mark_date: str
+    observed_at: str
+    realized_pnl: float
+    unrealized_pnl: float | None
+    total_pnl: float | None
+    open_lifecycles: int
+    valued_lifecycles: int
+    missing_lifecycles: int
+    unresolved_economics: int
 
 
 def _safe_div(numerator: float, denominator: float) -> float | None:
@@ -63,6 +88,16 @@ def _max_drawdown(values: list[float]) -> float:
         running += value
         peak = max(peak, running)
         worst = min(worst, running - peak)
+    return worst
+
+
+def _max_level_drawdown(values: list[float]) -> float:
+    """Peak-to-trough drawdown on cumulative daily P&L levels."""
+    peak = 0.0
+    worst = 0.0
+    for value in values:
+        peak = max(peak, value)
+        worst = min(worst, value - peak)
     return worst
 
 
@@ -98,13 +133,16 @@ def _read_outcomes(conn: sqlite3.Connection) -> tuple[list[_Outcome], dict[str, 
     trade_rows = conn.execute(
         "SELECT position_uid, initial_risk_dollars, realized_pnl, "
         "slippage_benchmark_kind, slippage_measurement_quality, "
-        "slippage_measurement_version, slippage_adverse_bps "
+        "slippage_measurement_version, slippage_adverse_bps, "
+        "timestamp, symbol, side, qty, avg_fill_price, filled_qty, status, "
+        "order_id "
         "FROM trades WHERE position_uid IS NOT NULL"
     ).fetchall()
     risk_by_uid: dict[str, float] = {}
     trade_pnl_by_uid: dict[str, float] = defaultdict(float)
     pnl_event_uids: set[str] = set()
     slippage_by_uid: dict[str, list[float]] = defaultdict(list)
+    fills_by_uid: dict[str, list[dict[str, Any]]] = defaultdict(list)
     for row in trade_rows:
         uid = str(row[0])
         risk = row[1]
@@ -118,6 +156,16 @@ def _read_outcomes(conn: sqlite3.Connection) -> tuple[list[_Outcome], dict[str, 
             and is_execution_quality_measurement(row[3], row[4], row[5])
         ):
             slippage_by_uid[uid].append(float(row[6]))
+        fills_by_uid[uid].append({
+            "timestamp": row[7],
+            "symbol": row[8],
+            "side": row[9],
+            "qty": row[10],
+            "avg_fill_price": row[11],
+            "filled_qty": row[12],
+            "status": row[13],
+            "order_id": row[14],
+        })
 
     order_events_by_uid: dict[str, list[tuple[str, str]]] = defaultdict(list)
     order_columns = _table_columns(conn, "position_lifecycle_orders")
@@ -140,8 +188,11 @@ def _read_outcomes(conn: sqlite3.Connection) -> tuple[list[_Outcome], dict[str, 
         "closed_at, status, net_realized_pnl FROM position_lifecycle "
         "ORDER BY COALESCE(closed_at, created_at), position_uid"
     ).fetchall()
-    outcomes = [
-        _Outcome(
+    outcomes: list[_Outcome] = []
+    for row in rows:
+        uid = str(row[0])
+        cost = DEFAULT_COST_MODEL.estimate(fills_by_uid.get(uid, ()))
+        outcomes.append(_Outcome(
             position_uid=str(row[0]),
             strategy=str(row[1]),
             version=row[2],
@@ -161,9 +212,10 @@ def _read_outcomes(conn: sqlite3.Connection) -> tuple[list[_Outcome], dict[str, 
                 abs_tol=0.01,
             ),
             has_realized_pnl_event=str(row[0]) in pnl_event_uids,
-        )
-        for row in rows
-    ]
+            estimated_cost=cost.amount,
+            cost_complete=cost.complete,
+            cost_reasons=cost.reasons,
+        ))
     legacy = conn.execute(
         "SELECT strategy, COUNT(*), COALESCE(SUM(realized_pnl), 0.0) "
         "FROM trades WHERE realized_pnl IS NOT NULL AND position_uid IS NULL "
@@ -175,10 +227,47 @@ def _read_outcomes(conn: sqlite3.Connection) -> tuple[list[_Outcome], dict[str, 
             for row in legacy
         ],
         "execution_quality_measurements": sum(len(v) for v in slippage_by_uid.values()),
-        "historical_mtm": "unavailable_not_recorded",
-        "cost_adjustment": "unavailable_not_recorded",
+        "historical_mtm": "forward_collection_only",
+        "cost_adjustment": DEFAULT_COST_MODEL.version,
     }
     return outcomes, diagnostics
+
+
+def _read_daily_marks(
+    conn: sqlite3.Connection,
+) -> dict[tuple[str, str, str], list[_DailyMark]]:
+    columns = _table_columns(conn, "strategy_daily_marks")
+    if not columns:
+        # The read-only report may run after code deployment but before the
+        # engine has performed this new forward-collection migration.
+        return {}
+    if not _REQUIRED_MARK_COLUMNS.issubset(columns):
+        missing = sorted(_REQUIRED_MARK_COLUMNS - columns)
+        raise RuntimeError(
+            "database has not received the strategy daily-mark migration; "
+            f"missing strategy_daily_marks columns: {', '.join(missing)}"
+        )
+    marks: dict[tuple[str, str, str], list[_DailyMark]] = defaultdict(list)
+    rows = conn.execute(
+        "SELECT mark_date, observed_at, strategy, strategy_version, "
+        "strategy_config_hash, realized_pnl, unrealized_pnl, total_pnl, "
+        "open_lifecycles, valued_lifecycles, missing_lifecycles, "
+        "unresolved_economics FROM strategy_daily_marks "
+        "ORDER BY mark_date, observed_at"
+    ).fetchall()
+    for row in rows:
+        marks[(str(row[2]), str(row[3]), str(row[4]))].append(_DailyMark(
+            mark_date=str(row[0]),
+            observed_at=str(row[1]),
+            realized_pnl=float(row[5]),
+            unrealized_pnl=float(row[6]) if row[6] is not None else None,
+            total_pnl=float(row[7]) if row[7] is not None else None,
+            open_lifecycles=int(row[8]),
+            valued_lifecycles=int(row[9]),
+            missing_lifecycles=int(row[10]),
+            unresolved_economics=int(row[11]),
+        ))
+    return marks
 
 
 def _summarize(
@@ -186,6 +275,7 @@ def _summarize(
     version: str,
     config_hash: str,
     rows: list[_Outcome],
+    marks: list[_DailyMark],
 ) -> dict[str, Any]:
     terminal = [row for row in rows if row.status in TERMINAL_STATUSES]
     trusted = [
@@ -232,11 +322,25 @@ def _summarize(
     total = sum(pnls)
     best = max(pnls) if pnls else None
     pnl_without_best = total - best if best is not None else None
+    cost_complete_rows = [row for row in trusted if row.cost_complete]
+    costs_complete = bool(trusted) and len(cost_complete_rows) == len(trusted)
+    estimated_costs = (
+        sum(float(row.estimated_cost or 0.0) for row in trusted)
+        if costs_complete
+        else None
+    )
+    cost_reasons = sorted({reason for row in trusted for reason in row.cost_reasons})
+    complete_marks = [mark for mark in marks if mark.total_pnl is not None]
+    marks_complete = bool(marks) and len(complete_marks) == len(marks)
+    daily_levels = [float(mark.total_pnl) for mark in complete_marks]
     integrity_missing = sum(1 for row in rows if not row.version or not row.config_hash)
     pnl_mismatches = sum(not row.pnl_reconciled for row in terminal)
     missing_pnl_events = sum(not row.has_realized_pnl_event for row in terminal)
     status = "EARLY EVIDENCE" if trusted else "DATA INCOMPLETE"
-    if integrity_missing or pnl_mismatches or missing_pnl_events or not trusted:
+    if (
+        integrity_missing or pnl_mismatches or missing_pnl_events or not trusted
+        or not costs_complete or not marks_complete
+    ):
         status = "DATA INCOMPLETE"
 
     return {
@@ -264,18 +368,40 @@ def _summarize(
                 (row.closed_at for row in trusted if row.closed_at),
                 default=None,
             ),
-            "historical_mtm": "unavailable_not_recorded",
-            "cost_adjustment": "unavailable_not_recorded",
+            "daily_marks": len(marks),
+            "complete_daily_marks": len(complete_marks),
+            "first_daily_mark": marks[0].mark_date if marks else None,
+            "last_daily_mark": marks[-1].mark_date if marks else None,
+            "daily_mark_missing_lifecycles": sum(
+                mark.missing_lifecycles for mark in marks
+            ),
+            "cost_complete_lifecycles": len(cost_complete_rows),
+            "cost_incomplete_reasons": cost_reasons,
+            "historical_mtm": (
+                "forward_daily_marks_complete" if marks_complete
+                else "forward_daily_marks_incomplete"
+            ),
+            "cost_adjustment": (
+                DEFAULT_COST_MODEL.version if costs_complete else "incomplete"
+            ),
         },
         "performance": {
             "gross_realized_pnl": total if pnls else None,
-            "net_after_costs": None,
+            "estimated_regulatory_costs": estimated_costs,
+            "net_after_costs": (
+                total - estimated_costs
+                if pnls and estimated_costs is not None
+                else None
+            ),
             "average_outcome": statistics.fmean(pnls) if pnls else None,
             "median_outcome": statistics.median(pnls) if pnls else None,
             "win_rate": _safe_div(len(wins), len(pnls)),
             "profit_factor": _safe_div(sum(wins), abs(sum(losses))),
             "worst_outcome": min(pnls) if pnls else None,
             "realized_max_drawdown": _max_drawdown(pnls),
+            "forward_daily_total_max_drawdown": (
+                _max_level_drawdown(daily_levels) if daily_levels else None
+            ),
             "longest_loss_streak": _longest_loss_streak(pnls),
             "pnl_without_best_outcome": pnl_without_best,
             "best_outcome_share_of_positive_pnl": (
@@ -292,6 +418,22 @@ def _summarize(
             "months_observed": len(months),
             "entry_regimes": dict(sorted(regimes.items())),
         },
+        "mark_to_market": {
+            "daily": [
+                {
+                    "mark_date": mark.mark_date,
+                    "observed_at": mark.observed_at,
+                    "realized_pnl": mark.realized_pnl,
+                    "unrealized_pnl": mark.unrealized_pnl,
+                    "total_pnl": mark.total_pnl,
+                    "open_lifecycles": mark.open_lifecycles,
+                    "valued_lifecycles": mark.valued_lifecycles,
+                    "missing_lifecycles": mark.missing_lifecycles,
+                    "unresolved_economics": mark.unresolved_economics,
+                }
+                for mark in marks
+            ],
+        },
         "operations": {
             "order_status_counts": dict(sorted(order_statuses.items())),
             "operator_orders": operator_orders,
@@ -301,8 +443,9 @@ def _summarize(
             "p95_execution_slippage_bps": percentile(slippage, 0.95),
         },
         "limitations": [
-            "Net-after-costs is unavailable until a reviewed cost model or recorded fees exists.",
-            "Drawdown is realized-only; historical daily mark-to-market was not recorded.",
+            "Daily total drawdown begins with forward collection; pre-deployment marks are not reconstructed.",
+            "When daily marks are incomplete, drawdown uses complete observed days only and may understate the true drawdown.",
+            "Regulatory costs are modeled from the reviewed schedule; actual fills already include slippage.",
             "This status reports evidence readiness and never approves live trading.",
         ],
     }
@@ -371,6 +514,7 @@ def build_graduation_report(
     conn = sqlite3.connect(uri, uri=True)
     try:
         outcomes, diagnostics = _read_outcomes(conn)
+        marks = _read_daily_marks(conn)
     finally:
         conn.close()
 
@@ -412,9 +556,19 @@ def build_graduation_report(
             ),
             "authority": "position_lifecycle.net_realized_pnl backed by trades.realized_pnl",
             "approval": "operator_only",
+            "cost_model": {
+                "version": DEFAULT_COST_MODEL.version,
+                "effective_from": DEFAULT_COST_MODEL.effective_from,
+                "parameters": DEFAULT_COST_MODEL.parameters,
+                "sources": list(DEFAULT_COST_MODEL.sources),
+                "slippage_treatment": "already_embedded_in_actual_fill_pnl",
+            },
         },
         "cohorts": [
-            _summarize(strategy, version, config_hash, rows)
+            _summarize(
+                strategy, version, config_hash, rows,
+                marks.get((strategy, version, config_hash), []),
+            )
             for (strategy, version, config_hash), rows in sorted(cohorts.items())
         ],
         "unknown_epoch_history": [
@@ -465,7 +619,12 @@ def render_markdown(report: dict[str, Any]) -> str:
                 if perf["gross_realized_pnl"] is not None
                 else "Gross realized P&L: unavailable"
             ),
-            f"Net after costs: unavailable",
+            (
+                f"Net after modeled costs: ${perf['net_after_costs']:,.2f} "
+                f"(costs ${perf['estimated_regulatory_costs']:,.2f})"
+                if perf["net_after_costs"] is not None
+                else "Net after modeled costs: unavailable"
+            ),
             (
                 f"Win rate: {perf['win_rate']:.1%}"
                 if perf["win_rate"] is not None
@@ -478,14 +637,20 @@ def render_markdown(report: dict[str, Any]) -> str:
             ),
             f"Realized max drawdown: ${perf['realized_max_drawdown']:,.2f}",
             (
+                "Forward daily total max drawdown: "
+                f"${perf['forward_daily_total_max_drawdown']:,.2f}"
+                if perf["forward_daily_total_max_drawdown"] is not None
+                else "Forward daily total max drawdown: unavailable"
+            ),
+            (
                 f"P&L excluding best outcome: "
                 f"${perf['pnl_without_best_outcome']:,.2f}"
                 if perf["pnl_without_best_outcome"] is not None
                 else "P&L excluding best outcome: unavailable"
             ),
             "",
-            "Limitations: costs and historical daily mark-to-market are not "
-            "recorded; drawdown is realized-only.",
+            f"Daily marks: {coverage['complete_daily_marks']}/"
+            f"{coverage['daily_marks']} complete; collection begins forward only.",
             "",
         ])
     if report["unknown_epoch_history"]:
