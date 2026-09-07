@@ -76,7 +76,7 @@ from proceeding.
 | Live launch throttle (`10.G2`) | ⬜ Set at live flip | The flat `HARD_DOLLAR_LOSS_CAP` was retired 2026-09-01 (tripped on ordinary market noise once the account grew; did not scale). Account drawdown is owned by `MAX_DAILY_LOSS_PCT` (5%, scales); the launch-only "start tiny" gate is now `LIVE_SIZE_MULTIPLIER` ≤ 0.25, verified by preflight. |
 | Preflight + dry run (`10.G5`) | ✅ Code complete | Re-run immediately before live flip |
 | VPS deployment (`10.H1-H5`) | ⏸ Deferred by operator | Resume only after the operator is satisfied that at least one strategy merits live consideration. Then provision the production runtime, systemd, secure env, and log shipping. |
-| Strategy graduation evidence package | 🔄 Daily evidence phase implemented; collection begins after deployment | Lifecycle outcomes, version/config/commit identity, forward broker marks, and a versioned regulatory-cost model are in review. Missing marks or unmodelable costs remain unavailable. Review collected reports before defining sufficiency rules. |
+| Strategy graduation evidence package | 🔄 Daily evidence deployed; first report validated | Lifecycle outcomes, version/config/commit identity, forward broker marks, regulatory costs, and excluded trade-only history are explicit. Collect the first versioned cohorts before defining sufficiency rules. |
 
 ---
 
@@ -86,7 +86,7 @@ from proceeding.
 
 | Priority | Item | Current State | Next Action |
 |---:|---|---|---|
-| 1 | Trustworthy strategy graduation report | Lifecycle-first reporting, cohort identity, forward daily marks, and regulatory-cost modeling implemented | Deploy and review collected reports; define evidence-sufficiency rules only after the output is trusted. Preflight binding remains a later PR |
+| 1 | Trustworthy strategy graduation report | Deployed; empty-state report validated and legacy exclusions made explicit | Collect and review the first versioned cohorts, then define evidence-sufficiency rules. Preflight binding remains a later PR |
 | 2 | `11.62` portfolio heat ceiling | Open design problem; no portfolio-wide initial-risk ceiling exists | Audit interactions with per-sleeve `11.60`, then propose a simple policy before implementation |
 
 Evidence still collecting: slippage calibration **2/10**; RSI3 **6 entries / 4 completed exits**; credit-spread bounded entry walk **3/~20 attempts**; Donchian heat-cap observation **1 would-block event**; leveraged trend **4 open entries / 0 exits**. `11.41a` and `11.54a` remain event-gated and require no work until their trigger occurs. VPS and live-flip tasks remain deferred by operator decision.

@@ -671,6 +671,8 @@ hash. Missing positions/legs produce NULL rather than an inferred valuation.
 Reports calculate forward drawdown from complete observed days while exposing
 mark coverage; any gap keeps the cohort incomplete and means the observed
 drawdown may understate the true drawdown.
+Trade-only realized-P&L events with no matching lifecycle are disclosed in a
+separate footer and never merged into lifecycle or versioned-cohort totals.
 The report also applies a versioned Alpaca regulatory-fee schedule to actual
 fills. Actual fill P&L already contains execution slippage, so the fee model
 does not charge modeled slippage a second time. MLEG net-after-costs stays
