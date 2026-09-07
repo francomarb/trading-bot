@@ -8,7 +8,7 @@ import sqlite3
 import statistics
 from collections import defaultdict
 from dataclasses import dataclass, replace
-from datetime import datetime, timezone
+from datetime import date, datetime, timezone
 from pathlib import Path
 from typing import Any
 from urllib.parse import quote
@@ -17,8 +17,9 @@ from reporting.costs import DEFAULT_COST_MODEL
 from reporting.logger import is_execution_quality_measurement
 
 
-REPORT_SCHEMA_VERSION = 2
+REPORT_SCHEMA_VERSION = 3
 TERMINAL_STATUSES = frozenset({"closed", "external_closed"})
+ACTIVE_STATUSES = frozenset({"pending", "open", "partially_filled"})
 _REQUIRED_LIFECYCLE_COLUMNS = frozenset({
     "position_uid", "strategy", "strategy_version", "strategy_config_hash",
     "bot_git_commit", "entry_regime", "created_at", "closed_at", "status",
@@ -113,7 +114,13 @@ def _table_columns(conn: sqlite3.Connection, table: str) -> set[str]:
     return {str(row[1]) for row in conn.execute(f"PRAGMA table_info({table})")}
 
 
-def _read_outcomes(conn: sqlite3.Connection) -> tuple[list[_Outcome], dict[str, Any]]:
+def _read_outcomes(
+    conn: sqlite3.Connection,
+    *,
+    start_date: date | None = None,
+    end_date: date | None = None,
+    strategies: tuple[str, ...] = (),
+) -> tuple[list[_Outcome], dict[str, Any]]:
     lifecycle_columns = _table_columns(conn, "position_lifecycle")
     if not _REQUIRED_LIFECYCLE_COLUMNS.issubset(lifecycle_columns):
         missing = sorted(_REQUIRED_LIFECYCLE_COLUMNS - lifecycle_columns)
@@ -216,10 +223,24 @@ def _read_outcomes(conn: sqlite3.Connection) -> tuple[list[_Outcome], dict[str, 
             cost_complete=cost.complete,
             cost_reasons=cost.reasons,
         ))
+    trade_scope_sql = ""
+    trade_scope_params: list[str] = []
+    if start_date is not None:
+        trade_scope_sql += " AND substr(t.timestamp, 1, 10) >= ?"
+        trade_scope_params.append(start_date.isoformat())
+    if end_date is not None:
+        trade_scope_sql += " AND substr(t.timestamp, 1, 10) <= ?"
+        trade_scope_params.append(end_date.isoformat())
+    if strategies:
+        placeholders = ", ".join("?" for _ in strategies)
+        trade_scope_sql += f" AND t.strategy IN ({placeholders})"
+        trade_scope_params.extend(strategies)
+
     legacy = conn.execute(
         "SELECT strategy, COUNT(*), COALESCE(SUM(realized_pnl), 0.0) "
-        "FROM trades WHERE realized_pnl IS NOT NULL AND position_uid IS NULL "
-        "GROUP BY strategy ORDER BY strategy"
+        "FROM trades t WHERE realized_pnl IS NOT NULL AND position_uid IS NULL "
+        f"{trade_scope_sql} GROUP BY strategy ORDER BY strategy",
+        trade_scope_params,
     ).fetchall()
     excluded_trade_only = conn.execute(
         "SELECT t.strategy, "
@@ -229,8 +250,9 @@ def _read_outcomes(conn: sqlite3.Connection) -> tuple[list[_Outcome], dict[str, 
         "FROM trades t LEFT JOIN position_lifecycle p "
         "ON p.position_uid = t.position_uid "
         "WHERE t.realized_pnl IS NOT NULL AND p.position_uid IS NULL "
-        "GROUP BY t.strategy, exclusion_kind "
-        "ORDER BY t.strategy, exclusion_kind"
+        f"{trade_scope_sql} GROUP BY t.strategy, exclusion_kind "
+        "ORDER BY t.strategy, exclusion_kind",
+        trade_scope_params,
     ).fetchall()
     diagnostics = {
         "legacy_unlinked_realized_events": [
@@ -521,24 +543,142 @@ def _apply_reviewed_epochs(
     return result
 
 
+def _parse_filter_date(value: str | date | None, *, name: str) -> date | None:
+    """Parse one strict ISO date used by the observation-window contract."""
+    if value is None:
+        return None
+    if isinstance(value, datetime):
+        raise ValueError(f"{name} must be YYYY-MM-DD, not a timestamp")
+    if isinstance(value, date):
+        return value
+    try:
+        parsed = date.fromisoformat(str(value))
+    except ValueError as exc:
+        raise ValueError(f"{name} must be a valid YYYY-MM-DD date") from exc
+    if parsed.isoformat() != str(value):
+        raise ValueError(f"{name} must use YYYY-MM-DD format")
+    return parsed
+
+
+def _record_date(value: str | None, *, field: str) -> date:
+    """Read a persisted UTC timestamp as a UTC calendar date."""
+    if not value:
+        raise ValueError(f"cannot apply date filter: {field} is missing")
+    try:
+        parsed = datetime.fromisoformat(str(value).replace("Z", "+00:00"))
+    except ValueError as exc:
+        raise ValueError(
+            f"cannot apply date filter: invalid {field} timestamp {value!r}"
+        ) from exc
+    if parsed.tzinfo is None:
+        parsed = parsed.replace(tzinfo=timezone.utc)
+    return parsed.astimezone(timezone.utc).date()
+
+
+def _outcome_in_scope(
+    row: _Outcome,
+    *,
+    start_date: date | None,
+    end_date: date | None,
+    strategies: tuple[str, ...],
+) -> bool:
+    """Select outcomes without changing their full-lifecycle economics."""
+    if strategies and row.strategy not in strategies:
+        return False
+    if start_date is None and end_date is None:
+        return True
+    opened = _record_date(row.opened_at, field="created_at")
+    if row.status in ACTIVE_STATUSES:
+        # An active lifecycle opened before the window remains active during it.
+        return end_date is None or opened <= end_date
+    if row.status in TERMINAL_STATUSES:
+        event_date = _record_date(row.closed_at, field="closed_at")
+    else:
+        event_date = (
+            _record_date(row.closed_at, field="closed_at")
+            if row.closed_at
+            else opened
+        )
+    return (
+        (start_date is None or event_date >= start_date)
+        and (end_date is None or event_date <= end_date)
+    )
+
+
+def _marks_in_scope(
+    marks: dict[tuple[str, str, str], list[_DailyMark]],
+    *,
+    start_date: date | None,
+    end_date: date | None,
+    strategies: tuple[str, ...],
+) -> dict[tuple[str, str, str], list[_DailyMark]]:
+    """Filter daily observations by their explicit UTC mark date."""
+    scoped: dict[tuple[str, str, str], list[_DailyMark]] = {}
+    for key, values in marks.items():
+        if strategies and key[0] not in strategies:
+            continue
+        selected = [
+            mark for mark in values
+            if (start_date is None or date.fromisoformat(mark.mark_date) >= start_date)
+            and (end_date is None or date.fromisoformat(mark.mark_date) <= end_date)
+        ]
+        if selected:
+            scoped[key] = selected
+    return scoped
+
+
 def build_graduation_report(
     db_path: str | Path,
     *,
     reviewed_epochs_path: str | Path | None = None,
+    start_date: str | date | None = None,
+    end_date: str | date | None = None,
+    strategies: list[str] | tuple[str, ...] | set[str] | None = None,
 ) -> dict[str, Any]:
     """Build a schema-versioned report without modifying the trade database."""
+    start = _parse_filter_date(start_date, name="start_date")
+    end = _parse_filter_date(end_date, name="end_date")
+    if start is not None and end is not None and start > end:
+        raise ValueError("start_date must be on or before end_date")
+    selected_strategies = tuple(sorted({
+        str(strategy).strip() for strategy in (strategies or ())
+        if str(strategy).strip()
+    }))
     path = Path(db_path)
     if not path.is_file():
         raise FileNotFoundError(f"trade database does not exist: {path}")
     uri = f"file:{quote(str(path.resolve()), safe='/')}?mode=ro"
     conn = sqlite3.connect(uri, uri=True)
     try:
-        outcomes, diagnostics = _read_outcomes(conn)
+        outcomes, diagnostics = _read_outcomes(
+            conn,
+            start_date=start,
+            end_date=end,
+            strategies=selected_strategies,
+        )
         marks = _read_daily_marks(conn)
     finally:
         conn.close()
 
     outcomes = _apply_reviewed_epochs(outcomes, reviewed_epochs_path)
+    outcomes = [
+        row for row in outcomes
+        if _outcome_in_scope(
+            row,
+            start_date=start,
+            end_date=end,
+            strategies=selected_strategies,
+        )
+    ]
+    marks = _marks_in_scope(
+        marks,
+        start_date=start,
+        end_date=end,
+        strategies=selected_strategies,
+    )
+    diagnostics["execution_quality_measurements"] = sum(
+        len(row.execution_slippage_bps) for row in outcomes
+    )
     cohorts: dict[tuple[str, str, str], list[_Outcome]] = defaultdict(list)
     unknown: dict[str, dict[str, float | int]] = defaultdict(
         lambda: {
@@ -561,6 +701,11 @@ def build_graduation_report(
                     unknown[row.strategy]["realized_pnl"] += row.pnl
                 else:
                     unknown[row.strategy]["unresolved_economics"] += 1
+    # A position may have a mark inside the requested window but close after
+    # it. Preserve that observation without pulling the later outcome into the
+    # window's close-date metrics.
+    for cohort_key in marks:
+        cohorts.setdefault(cohort_key, [])
 
     return {
         "schema_version": REPORT_SCHEMA_VERSION,
@@ -569,6 +714,15 @@ def build_graduation_report(
         "reviewed_epoch_file": (
             str(reviewed_epochs_path) if reviewed_epochs_path is not None else None
         ),
+        "filters": {
+            "start_date": start.isoformat() if start is not None else None,
+            "end_date": end.isoformat() if end is not None else None,
+            "strategies": list(selected_strategies),
+            "lifetime": (
+                start is None and end is None and not selected_strategies
+            ),
+            "timezone": "UTC",
+        },
         "report_contract": {
             "unit": (
                 "one economically reconciled completed position_lifecycle, "
@@ -609,12 +763,23 @@ def build_graduation_report(
 
 def render_markdown(report: dict[str, Any]) -> str:
     """Render the JSON contract as a compact operator-facing document."""
+    filters = report.get("filters", {})
+    if filters.get("lifetime", True):
+        scope = "Lifetime database history; all strategies; UTC."
+    else:
+        start = filters.get("start_date") or "earliest"
+        end = filters.get("end_date") or "latest"
+        selected = filters.get("strategies") or []
+        strategy_scope = ", ".join(f"`{name}`" for name in selected) or "all strategies"
+        scope = f"UTC {start} through {end}; {strategy_scope}."
     lines = [
         "# Strategy Graduation Evidence",
         "",
         f"Generated: {report['generated_at']}",
         "",
         "> Advisory evidence only. The report never authorizes live trading.",
+        "",
+        f"**Report scope:** {scope}",
         "",
     ]
     if not report["cohorts"]:
@@ -727,10 +892,17 @@ def write_graduation_report(
     output_dir: str | Path,
     *,
     reviewed_epochs_path: str | Path | None = None,
+    start_date: str | date | None = None,
+    end_date: str | date | None = None,
+    strategies: list[str] | tuple[str, ...] | set[str] | None = None,
 ) -> tuple[Path, Path]:
     """Write matching JSON and Markdown evidence artifacts."""
     report = build_graduation_report(
-        db_path, reviewed_epochs_path=reviewed_epochs_path
+        db_path,
+        reviewed_epochs_path=reviewed_epochs_path,
+        start_date=start_date,
+        end_date=end_date,
+        strategies=strategies,
     )
     destination = Path(output_dir)
     destination.mkdir(parents=True, exist_ok=True)
