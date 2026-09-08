@@ -32,13 +32,20 @@ SECTOR_MAP = {
     "AMKR": "XLK", "MPWR": "XLK", "COHR": "XLK", "FORM": "XLK", "CIEN": "XLK",
     "CLS": "XLK", "BE": "XLK", "MTZ": "XLK", "TIGO": "XLK", "SN": "XLK", "CDNS": "XLK",
     "TSM": "XLK", "LSCC": "XLK", "LRCX": "XLK", "NOK": "XLK", "FLEX": "XLK",
-    "SANM": "XLK", "COHU": "XLK",
+    "SANM": "XLK", "COHU": "XLK", "PANW": "XLK", "CRDO": "XLK", "LITE": "XLK",
+    "CRWD": "XLK", "NET": "XLK",
     # Financials
     "ALLY": "XLF", "TFC": "XLF",
+    # Consumer discretionary
+    "LULU": "XLY",
     # Materials
     "CCK": "XLB", "AA": "XLB",
     # Industrials
-    "ATI": "XLI"
+    "ATI": "XLI", "PWR": "XLI",
+    # Energy / utilities
+    "VIST": "XLE", "VST": "XLU",
+    # Diversified ETF; SPY is the appropriate broad-market comparison.
+    "SPCX": "SPY",
 }
 
 def analyze_trades(days: int):

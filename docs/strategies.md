@@ -96,7 +96,7 @@ There is no fixed take-profit target. The strategy lets winners run for as long 
 
 We intentionally do not add a trailing stop to SMA Crossover. The bearish crossunder already acts as the strategy's trend exit, and the 2x ATR stop already provides downside protection before the crossunder arrives. Adding a second trailing exit tends to reduce drawdown, but in testing it clipped winners more often than it improved overall risk-adjusted returns, so the strategy keeps the simpler crossunder-plus-ATR-stop design.
 
-**Watchlist:** 50 names in `SMA_WATCHLIST` (`config/settings.py`).
+**Watchlist:** Curated static names in `SMA_WATCHLIST` (`config/settings.py`).
 Originally derived from `scripts/sma_watchlist_scan.py` rule
 `sma_watchlist_v2` (2026-05-11, with 10 fundamentals-sanitized additions on 2026-06-08) with a few manual additions. Treat the
 deployment guide as the live source of truth — the list rotates more
@@ -122,7 +122,7 @@ SMA crossover is the simplest trend-following signal. It captures sustained dire
 | Hard max positions | 8 |
 | Max position % of sleeve | 40% |
 | Per-position budget | **$4,800** baseline at $100k paper equity (0.40 × $12k target sleeve); **up to $5,520** with allocator stretch (`can_stretch: True`) |
-| Watchlist size | 30 names (`RSI_WATCHLIST`) |
+| Watchlist | Curated static `RSI_WATCHLIST` |
 
 **Signal logic:**
 - **Entry:** RSI3 is below 15 while the symbol is flat
@@ -175,7 +175,7 @@ Unlike the old RSI14 configuration, active RSI3 does not wait for a full RSI70 o
 
 RSI uses LIMIT orders for entry — price is controlled, so no fractional-share path is used (LIMIT/GTC always uses whole-share `floor()`).
 
-**Watchlist:** 30 names in `RSI_WATCHLIST` (`config/settings.py`).
+**Watchlist:** Curated static names in `RSI_WATCHLIST` (`config/settings.py`).
 Treat the deployment guide as the runtime source of truth — the
 embedded list above the current edit was 28 names and stale. The
 deployment guide reflects the current composition and the

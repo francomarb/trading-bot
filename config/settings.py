@@ -499,6 +499,8 @@ SMA_WATCHLIST = [
     # MANUAL OVERRIDE: Added mid-paper-run to capitalize on the active AI/Semiconductor uptrend,
     # temporarily bypassing the 3-per-sector cap and mid-run freeze per operator direction.
     "TSM", "DELL", "LSCC", "LRCX", "NOK", "FLEX", "SANM", "ATI", "COHU", "AA",
+    # Operator-directed additions (2026-09-08).
+    "CRWD", "NET", "PWR", "VIST", "VST",
 ]
 # Cull deferred 2026-06-06 — an earlier audit (scripts/sma_giveback_audit.py)
 # flagged VIAV, VSAT, CIEN, ALB, INTC as chronic underperformers and removed
@@ -515,7 +517,7 @@ RSI_WATCHLIST = [
     "ALLY", "CDNS", "KBE", "SN", "BA", "TFC", "HON", "TMUS", "MSFT",
     "CCK", "ABNB", "PG", "SPG", "MA", "LMT", "MCD", "AAPL", "ANET", "NFLX",
     "CAT", "CIEN", "MCO", "AMZN", "EQIX", "RTX", "META", "HD",
-    "SOFI", "ARM", "MSTR",
+    "SOFI", "ARM", "MSTR", "LULU",
 ]
 # Legacy/reference RSI macro-gate tolerance used by the historical
 # `scripts/rsi_filter_variant_backtest.py` SPY50 study. The active RSI3
@@ -575,7 +577,7 @@ DONCHIAN_WATCHLIST = [
     # Big Tech
     "MSFT", "AAPL", "GOOG", "META", "AMZN", "ORCL", "TSLA",
     # AI software (secondary)
-    "PLTR", "CRWD", "NOW", "ALAB", "CRWV", "NBIS",
+    "PLTR", "CRWD", "PANW", "NOW", "ALAB", "CRWV", "NBIS",
     # Platforms
     "DASH", "UBER",
     # AI compute / quantum (post-IPO names with full 4y history)
@@ -583,6 +585,8 @@ DONCHIAN_WATCHLIST = [
     # AI-adjacent: semiconductor equipment, networking, data-centre power,
     # quantum computing — highly correlated with AI core but add breadth
     "ASML",   # Semiconductor lithography — only supplier of EUV, AI capex pick-and-shovel
+    "CRDO",   # Credo Technology — high-speed connectivity for AI data-centre networks
+    "LITE",   # Lumentum — optical components for data-centre interconnects
     "CLS",    # Celestica — contract mfg for hyperscaler AI networking hardware
     "CIEN",   # Ciena — optical networking; direct beneficiary of AI data-centre traffic
     "CEG",    # Constellation Energy — nuclear power for AI data-centre load growth
@@ -598,6 +602,7 @@ DONCHIAN_WATCHLIST = [
     "RKLB",   # Development of rocket launch and control systems for the space and defense industries
     "RDW",    # Redwire — space infrastructure and defense-adjacent systems
     "ASTS",   # Space-based broadband cellular network
+    "SPCX",   # SPAC and new-issue ETF — diversified emerging-growth trend exposure
     # Leopold Aschenbrenner picks
     "APLD", "RIOT", "WYFI", "CORZ",
 ]

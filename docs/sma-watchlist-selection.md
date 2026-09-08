@@ -132,14 +132,10 @@ position ownership.
 
 ## Current State
 
-Today, SMA uses a static list in `config/settings.py`:
-
-```python
-SMA_WATCHLIST = [
-    "AAPL", "MSFT", "GOOGL", "AMZN", "META", "NVDA", "AVGO", "AMD",
-    "MU", "TSLA", "ORCL", "ANET", "MRVL", "MELI", "GS", "BAC",
-]
-```
+Today, SMA uses the curated static `SMA_WATCHLIST` in `config/settings.py`.
+That runtime setting is the source of truth; this methodology document does
+not duplicate the symbol list because operator-directed additions occur during
+paper development.
 
 The active paper engine passes this static list into `StrategySlot`.
 

@@ -105,7 +105,12 @@ thin. Reconsider in 2026 Q1.*
 
 ---
 
-### Current watchlist (32 names, as of 2026-05-01)
+### Historical research watchlist (32 names, as of 2026-05-01)
+
+This table preserves the universe used for the original research results below;
+it is not the active runtime list. The current curated paper watchlist lives in
+`config/settings.py` as `DONCHIAN_WATCHLIST`. It contains 52 symbols as of
+2026-09-08, including the operator-directed additions PANW, CRDO, LITE, and SPCX.
 
 #### Category 1 — AI / Semiconductors (primary, 9 names)
 The core thesis: AI training and inference hardware; highest-conviction names.
