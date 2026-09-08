@@ -425,6 +425,20 @@ Detection is purely duck-typed: a strategy exposing `build_spread_execution` is 
 **StrategySlot:**
 Each slot binds a strategy to its symbol universe, timeframe, and allowed regimes. The engine iterates over slots each cycle.
 
+**Entry-candidate observation (`11.61a`):** after signal, edge, regime,
+pre-instrument ownership, pending-order, and operator-control checks pass, the
+engine writes a per-candidate audit row before allocation can reject it.
+Contract-specific option conflicts are resolved later and recorded as the final
+disposition. `BaseStrategy` owns a pure `candidate_features(df)` hook;
+option/MLeg strategies may also expose
+picker facts already computed by the real execution path through
+`candidate_execution_features()`. These hooks cannot fetch data and their
+output never feeds back into trading. Same-strategy/same-signal-bar groups retain
+explicit slot, watchlist, and global evaluation order. Groups where one
+candidate was selected and another hit a capacity gate enqueue a disposable
+counterfactual outcome row. Ranking remains disabled; see
+[`entry_candidate_observation.md`](entry_candidate_observation.md).
+
 **Current strategies:**
 
 | Strategy | File | Status | Order Type | Allowed Regimes | Sleeve |
@@ -634,6 +648,12 @@ The MLEG limit-price sign convention was confirmed against the Alpaca paper API 
 Every trade is logged to SQLite for per-strategy graduation evidence. This layer also computes live performance metrics and sends alerts.
 
 **Trade logs (SQLite):**
+
+In addition to fills and lifecycle state, `entry_candidate_decisions` retains
+the permanent explanation of actionable entry choices. The separate
+`entry_candidate_shadow_outcomes` table is calibration-only and can be removed
+after a reviewed ranking policy replaces fixed-order selection. Neither table
+is read by the order path.
 - `data/trades.db` — paper trading (never mixed with live data)
 - `data/trades_live.db` — live trading (separate file to prevent cross-contamination)
 
@@ -737,16 +757,19 @@ When implementing any new equity strategy:
 9. Add unit tests in `tests/test_strategies.py` and `tests/test_filters.py`
 10. Add a `StrategySlot` with `allowed_regimes` in `forward_test.py`
 11. Update `docs/strategies.md`
+12. Implement `candidate_features(df)` with factual, strategy-specific entry
+    characteristics when the strategy participates in `11.61`; it must not
+    fetch data or assign a ranking score
 
 ### Additional steps for options strategies
 
-12. Implement `build_option_execution(symbol, underlying_price) -> tuple | None` — returns `(occ_symbol, limit_price, take_profit, stop_loss)` or `None` to abort
-13. Implement `inspect_open_positions(position, latest_close) -> bool` — mid-trade exit guards (time stop, delta floor, trailing stop, etc.)
-14. Use `utils/options_lookup.find_best_call` (or an equivalent) to select the contract
-15. Add tests for `build_option_execution`, `inspect_open_positions`, and each exit guard in `tests/test_<strategy_name>.py`
-16. For a multi-leg options strategy, implement the MLEG duck-typed hooks (`build_spread_execution`, `evaluate_spread_exit`, `register_spread`, `release_spread`, `open_spreads`, `get_open_spread`) and route entries through `_enter_multi_leg`
-17. Use UUID `position_id`s for spreads and add startup reconstruction through the spread restore path so broker legs cannot be mis-assigned as standalone options
-18. For a second single-leg options strategy on an already-used underlying, first change the single-leg option ownership model away from the underlying-keyed slot; otherwise the underlying-level `SYMBOL_CONFLICT` rule will correctly block it
+13. Implement `build_option_execution(symbol, underlying_price) -> tuple | None` — returns `(occ_symbol, limit_price, take_profit, stop_loss)` or `None` to abort
+14. Implement `inspect_open_positions(position, latest_close) -> bool` — mid-trade exit guards (time stop, delta floor, trailing stop, etc.)
+15. Use `utils/options_lookup.find_best_call` (or an equivalent) to select the contract
+16. Add tests for `build_option_execution`, `inspect_open_positions`, and each exit guard in `tests/test_<strategy_name>.py`
+17. For a multi-leg options strategy, implement the MLEG duck-typed hooks (`build_spread_execution`, `evaluate_spread_exit`, `register_spread`, `release_spread`, `open_spreads`, `get_open_spread`) and route entries through `_enter_multi_leg`
+18. Use UUID `position_id`s for spreads and add startup reconstruction through the spread restore path so broker legs cannot be mis-assigned as standalone options
+19. For a second single-leg options strategy on an already-used underlying, first change the single-leg option ownership model away from the underlying-keyed slot; otherwise the underlying-level `SYMBOL_CONFLICT` rule will correctly block it
 
 ---
 

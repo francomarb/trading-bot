@@ -16,7 +16,7 @@ from __future__ import annotations
 
 from collections import defaultdict
 from dataclasses import dataclass
-from datetime import datetime, timedelta, timezone
+from datetime import date, datetime, timedelta, timezone
 from typing import Callable
 
 from loguru import logger
@@ -71,6 +71,8 @@ class ContractPick:
     score: float              # composite 0.0–1.0
     components: dict[str, float]
     runners_up: list[ScoredPick]  # next-best (top 3 for log explainability)
+    strike: float | None = None
+    expiration_date: date | None = None
 
 
 def _get_client() -> TradingClient:
@@ -286,6 +288,8 @@ def find_best_call(
         score=top.score,
         components=dict(top.components),
         runners_up=runners_up,
+        strike=top.candidate.strike,
+        expiration_date=top.candidate.expiration_date,
     )
 
 
@@ -304,7 +308,7 @@ class SpreadPick:
     long_occ: str
     short_strike: float
     long_strike: float
-    expiration_date: object       # datetime.date
+    expiration_date: date
     width: float                  # $/share
     net_credit: float             # $/share (short mid − long mid)
     max_loss: float               # $ per contract
@@ -312,6 +316,9 @@ class SpreadPick:
     score: float                  # composite 0.0–1.0
     components: dict[str, float]
     runners_up: list[ScoredSpread]
+    short_spread_pct: float | None = None
+    long_spread_pct: float | None = None
+    dte: int | None = None
 
 
 def build_opra_quote_lookup() -> QuoteLookup:
@@ -621,4 +628,7 @@ def find_best_put_spread(
         score=top.score,
         components=dict(top.components),
         runners_up=runners_up,
+        short_spread_pct=top.short_quote.spread_pct,
+        long_spread_pct=top.long_quote.spread_pct,
+        dte=(chosen_expiry - datetime.now(timezone.utc).date()).days,
     )

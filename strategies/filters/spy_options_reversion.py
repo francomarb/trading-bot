@@ -89,6 +89,8 @@ class SPYOptionsEdgeFilter:
         # Current market-regime label, injected by the engine each cycle via
         # set_regime(). None → VIX gate not enforced (offline/back-compat).
         self._regime: str | None = None
+        self._last_metrics: dict[str, object] = {}
+        self._last_vix_snapshot = None
 
     def set_symbol(self, symbol: str) -> None:
         # SPY is both the symbol and the filter target — nothing to propagate.
@@ -107,6 +109,10 @@ class SPYOptionsEdgeFilter:
         value = getattr(regime, "value", regime)
         self._regime = value.lower() if isinstance(value, str) else None
 
+    def candidate_features(self) -> dict[str, object]:
+        """Return the latest SPY/VIX gate facts without another data fetch."""
+        return dict(self._last_metrics)
+
     def _vix_gate(self) -> tuple[bool, str | None]:
         """Evaluate the VIX-percentile gate. Returns ``(allowed, block_reason)``.
 
@@ -114,6 +120,7 @@ class SPYOptionsEdgeFilter:
         unavailable or the trailing series is insufficient.
         """
         snap = self._iv_resolver.resolve_rank(self._vix_source)
+        self._last_vix_snapshot = snap
         pct = snap.percentile
         if pct is None or not snap.sufficient:
             return False, (
@@ -140,8 +147,39 @@ class SPYOptionsEdgeFilter:
         # the latest bar drives a live entry.
         enforce_vix = self._regime == "trending"
         vix_ok, vix_reason = True, None
+        self._last_vix_snapshot = None
         if enforce_vix:
             vix_ok, vix_reason = self._vix_gate()
+
+        self._last_metrics = {
+            "spy_trend_allowed": bool(spy_ok.iloc[-1]) if not df.empty else None,
+            "spy_trend_reason": spy_reason,
+            "vix_gate_enforced": enforce_vix,
+            "vix_gate_allowed": vix_ok,
+            "vix_gate_reason": vix_reason,
+            "min_vix_percentile": self._min_vix_percentile,
+            "vix_rank": (
+                self._last_vix_snapshot.rank
+                if self._last_vix_snapshot is not None
+                else None
+            ),
+            "vix_percentile": (
+                self._last_vix_snapshot.percentile
+                if self._last_vix_snapshot is not None
+                else None
+            ),
+            "vix_current": (
+                self._last_vix_snapshot.current
+                if self._last_vix_snapshot is not None
+                else None
+            ),
+            "vix_history_sufficient": (
+                self._last_vix_snapshot.sufficient
+                if self._last_vix_snapshot is not None
+                else None
+            ),
+            "regime": self._regime,
+        }
 
         allowed = spy_ok & vix_ok  # scalar bool broadcasts over the Series
 

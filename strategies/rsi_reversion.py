@@ -134,6 +134,42 @@ class RSIReversion(BaseStrategy):
             out["exit_sma"] = float(sma) if pd.notna(sma) else None
         return out
 
+    def candidate_features(self, df: pd.DataFrame) -> dict[str, object]:
+        """Describe the depth and recent shape of the oversold setup."""
+        with_rsi = add_rsi(df, self.period)
+        rsi = with_rsi[f"rsi_{self.period}"]
+        close = df["close"].astype(float)
+        current_rsi = float(rsi.iloc[-1]) if pd.notna(rsi.iloc[-1]) else None
+        previous_rsi = (
+            float(rsi.iloc[-2]) if len(rsi) > 1 and pd.notna(rsi.iloc[-2]) else None
+        )
+        features: dict[str, object] = {
+            **self.latest_observation(df),
+            "previous_rsi": previous_rsi,
+            "oversold_depth": (
+                float(self.oversold) - current_rsi
+                if current_rsi is not None
+                else None
+            ),
+            "one_bar_return_pct": (
+                float(close.iloc[-1] / close.iloc[-2] - 1.0)
+                if len(close) > 1 and close.iloc[-2] > 0
+                else None
+            ),
+            "three_bar_return_pct": (
+                float(close.iloc[-1] / close.iloc[-4] - 1.0)
+                if len(close) > 3 and close.iloc[-4] > 0
+                else None
+            ),
+        }
+        exit_sma = features.get("exit_sma")
+        features["distance_to_exit_sma_pct"] = (
+            float(close.iloc[-1]) / float(exit_sma) - 1.0
+            if exit_sma is not None and float(exit_sma) > 0
+            else None
+        )
+        return features
+
     def __repr__(self) -> str:
         return (
             f"RSIReversion(period={self.period}, "

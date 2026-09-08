@@ -172,6 +172,39 @@ class LeveragedTrend(BaseStrategy):
         _signals, target = self._replay(df)
         return target
 
+    def candidate_features(self, df: pd.DataFrame) -> dict[str, object]:
+        """Describe confirmation strength on the unleveraged signal asset."""
+        signal_close = pd.to_numeric(df[self.signal_column], errors="coerce")
+        sma = signal_close.rolling(self.sma_length).mean()
+        close = float(signal_close.iloc[-1])
+        sma_now = float(sma.iloc[-1])
+        above_streak = 0
+        for price, average in zip(
+            reversed(signal_close.tolist()),
+            reversed(sma.tolist()),
+            strict=False,
+        ):
+            if pd.isna(average) or float(price) <= float(average):
+                break
+            above_streak += 1
+        return {
+            "signal_column": self.signal_column,
+            "signal_close": close,
+            "sma_length": self.sma_length,
+            "signal_sma": sma_now,
+            "distance_above_sma_pct": close / sma_now - 1.0,
+            "confirmed_above_streak": above_streak,
+            "required_entry_streak": self.entry_days,
+            "sma_slope_pct": (
+                (sma_now - float(sma.iloc[-2])) / close
+                if len(sma) > 1 and pd.notna(sma.iloc[-2])
+                else None
+            ),
+            "target_notional_pct": self.target_notional_pct,
+            "stated_leverage_multiplier": self.stated_leverage_multiplier,
+            "stress_exposure_multiplier": self.stress_exposure_multiplier,
+        }
+
     def __repr__(self) -> str:
         return (
             "LeveragedTrend("

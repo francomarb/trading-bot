@@ -66,9 +66,14 @@ class SectorMomentumFilter:
         self._sector_entry_policy = sector_entry_policy
         self._score_threshold = score_threshold
         self._symbol: str = ""
+        self._last_metrics: dict[str, object] = {}
 
     def set_symbol(self, symbol: str) -> None:
         self._symbol = symbol
+
+    def candidate_features(self) -> dict[str, object]:
+        """Return the last resolved sector state without another lookup."""
+        return dict(self._last_metrics)
 
     def __call__(self, df: pd.DataFrame) -> EdgeFilterDecision:
         if not self._symbol:
@@ -83,6 +88,18 @@ class SectorMomentumFilter:
             return EdgeFilterDecision.allow_all(df.index)
 
         detail = self._gauge.get_details(sector)
+        self._last_metrics = {
+            "sector": sector,
+            "sector_etf": detail.etf_ticker,
+            "score": detail.score,
+            "classification": detail.classification.value,
+            "distance_from_sma50_pct": detail.dist_sma50_pct,
+            "above_sma50": detail.above_sma50,
+            "above_sma200": detail.above_sma200,
+            "golden_cross": detail.golden_cross,
+            "volume_confirmed": detail.vol_confirm,
+            "entry_policy": self._sector_entry_policy,
+        }
 
         from sector.gauge import SectorMomentum
         if self._score_threshold is not None:

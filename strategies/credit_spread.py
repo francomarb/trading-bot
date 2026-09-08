@@ -252,6 +252,7 @@ class CreditSpread(BaseStrategy):
         # a stub. None is allowed at construction so the strategy can be built
         # for unit tests that never reach build_spread_execution.
         self._quote_lookup = quote_lookup
+        self._last_candidate_execution_features: dict[str, object] = {}
         # Per-instance open positions, kept in sync by the engine (PR 3b).
         self._open_spreads: dict[str, OpenSpread] = {}
 
@@ -273,6 +274,24 @@ class CreditSpread(BaseStrategy):
         entries = pd.Series(True, index=df.index, dtype=bool)
         exits = pd.Series(False, index=df.index, dtype=bool)
         return SignalFrame(entries=entries, exits=exits)
+
+    def candidate_features(self, df: pd.DataFrame) -> dict[str, object]:
+        """Describe underlying gates using values the filter already resolved."""
+        edge_metrics = getattr(self._edge_filter, "last_metrics", {})
+        return {
+            "underlying": self.symbol,
+            "spread_width": self.config.spread_width,
+            "target_short_delta": self.config.short_leg_delta,
+            "dte_min": self.config.dte_min,
+            "dte_max": self.config.dte_max,
+            "min_credit_pct_of_width": self.config.min_credit_pct_of_width,
+            "open_instance_positions": len(self._open_spreads),
+            **(edge_metrics if isinstance(edge_metrics, dict) else {}),
+        }
+
+    def candidate_execution_features(self) -> dict[str, object]:
+        """Expose the already-computed spread pick without another chain query."""
+        return dict(self._last_candidate_execution_features)
 
     # ── Open-position bookkeeping (engine callbacks, PR 3b) ──────────────
 
@@ -473,6 +492,33 @@ class CreditSpread(BaseStrategy):
         # price is a net credit required. We demand at least the picker's
         # estimated net credit.
         limit_price = -round(pick.net_credit, 2)
+
+        self._last_candidate_execution_features = {
+            "short_occ": pick.short_occ,
+            "long_occ": pick.long_occ,
+            "short_strike": pick.short_strike,
+            "long_strike": pick.long_strike,
+            "expiration_date": pick.expiration_date,
+            "dte": pick.dte,
+            "width": pick.width,
+            "net_credit": pick.net_credit,
+            "max_loss": pick.max_loss,
+            "return_on_risk": (
+                pick.net_credit * _CONTRACT_MULTIPLIER / pick.max_loss
+                if pick.max_loss > 0
+                else None
+            ),
+            "short_leg_delta": pick.short_leg_delta,
+            "short_spread_pct": pick.short_spread_pct,
+            "long_spread_pct": pick.long_spread_pct,
+            "rank_score": pick.score,
+            "rank_components": pick.components,
+            "runner_up_count": len(pick.runners_up),
+            "selection_spot": selection_spot,
+            "selection_spot_live": spot_live,
+            "signal_close": underlying_price,
+            "iv_proxy": iv_points,
+        }
 
         logger.info(
             f"[{self.name}] {self.symbol} spread plan: "

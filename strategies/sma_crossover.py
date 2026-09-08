@@ -84,5 +84,32 @@ class SMACrossover(BaseStrategy):
 
         return SignalFrame(entries=entries, exits=exits)
 
+    def candidate_features(self, df: pd.DataFrame) -> dict[str, object]:
+        """Describe crossover shape without assigning it a quality score."""
+        with_sma = add_sma(df, self.fast)
+        with_sma = add_sma(with_sma, self.slow)
+        close = float(df["close"].iloc[-1])
+        fast = with_sma[f"sma_{self.fast}"]
+        slow = with_sma[f"sma_{self.slow}"]
+        fast_now = float(fast.iloc[-1])
+        slow_now = float(slow.iloc[-1])
+        previous_close = float(df["close"].iloc[-2]) if len(df) > 1 else None
+        return {
+            "fast_window": self.fast,
+            "slow_window": self.slow,
+            "fast_sma": fast_now,
+            "slow_sma": slow_now,
+            "crossover_gap_pct": (fast_now - slow_now) / close,
+            "fast_slope_pct": (
+                (fast_now - float(fast.iloc[-2])) / close if len(fast) > 1 else None
+            ),
+            "slow_slope_pct": (
+                (slow_now - float(slow.iloc[-2])) / close if len(slow) > 1 else None
+            ),
+            "one_bar_return_pct": (
+                close / previous_close - 1.0 if previous_close else None
+            ),
+        }
+
     def __repr__(self) -> str:
         return f"SMACrossover(fast={self.fast}, slow={self.slow})"
