@@ -15,6 +15,9 @@ from dataclasses import dataclass
 from datetime import datetime, timezone
 from typing import Any, Mapping
 
+from risk.allocator import SleeveRejectionCode
+from risk.manager import RejectionCode
+
 
 _CREATE_CANDIDATE_DECISIONS_SQL = """
 CREATE TABLE IF NOT EXISTS entry_candidate_decisions (
@@ -92,12 +95,12 @@ _CREATE_CANDIDATE_INDEXES_SQL = (
 
 _CAPACITY_DISPOSITIONS = frozenset(
     {
-        "sleeve_full",
-        "sleeve_max_positions",
-        "gross_exposure_cap",
-        "insufficient_cash",
-        "max_positions_reached",
-        "max_strategy_heat_reached",
+        SleeveRejectionCode.SLEEVE_FULL.value,
+        SleeveRejectionCode.SLEEVE_MAX_POSITIONS.value,
+        RejectionCode.GROSS_EXPOSURE_CAP.value,
+        RejectionCode.INSUFFICIENT_CASH.value,
+        RejectionCode.MAX_POSITIONS_REACHED.value,
+        RejectionCode.MAX_STRATEGY_HEAT_REACHED.value,
     }
 )
 

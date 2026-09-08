@@ -630,5 +630,5 @@ def find_best_put_spread(
         runners_up=runners_up,
         short_spread_pct=top.short_quote.spread_pct,
         long_spread_pct=top.long_quote.spread_pct,
-        dte=(chosen_expiry - datetime.now(timezone.utc).date()).days,
+        dte=chosen_dte,
     )

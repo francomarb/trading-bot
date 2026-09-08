@@ -9,7 +9,13 @@ from datetime import datetime, timezone
 import pytest
 import pandas as pd
 
-from engine.candidate_observation import CandidateObservationStore, CandidateStart
+from engine.candidate_observation import (
+    CandidateObservationStore,
+    CandidateStart,
+    _CAPACITY_DISPOSITIONS,
+)
+from risk.allocator import SleeveRejectionCode
+from risk.manager import RejectionCode
 from strategies.donchian_breakout import DonchianBreakout
 from strategies.leveraged_trend import LeveragedTrend
 from strategies.rsi_reversion import RSIReversion
@@ -58,6 +64,16 @@ def store() -> CandidateObservationStore:
 
 
 class TestCandidateObservationStore:
+    def test_capacity_dispositions_follow_source_enums(self) -> None:
+        assert _CAPACITY_DISPOSITIONS == {
+            SleeveRejectionCode.SLEEVE_FULL.value,
+            SleeveRejectionCode.SLEEVE_MAX_POSITIONS.value,
+            RejectionCode.GROSS_EXPOSURE_CAP.value,
+            RejectionCode.INSUFFICIENT_CASH.value,
+            RejectionCode.MAX_POSITIONS_REACHED.value,
+            RejectionCode.MAX_STRATEGY_HEAT_REACHED.value,
+        }
+
     def test_start_persists_identity_and_sanitizes_non_finite_features(
         self, store: CandidateObservationStore
     ) -> None:
