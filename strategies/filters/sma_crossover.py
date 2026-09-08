@@ -118,6 +118,7 @@ class SMAEdgeFilter:
         self._vol_short = vol_short_window
         self._vol_long = vol_long_window
         self._symbol: str = ""
+        self._last_metrics: dict[str, object] = {}
 
         self._earnings = EarningsBlackout(
             days_before=days_before,
@@ -136,6 +137,10 @@ class SMAEdgeFilter:
         """Injected by BaseStrategy.generate_signals before __call__."""
         self._symbol = symbol
         self._earnings.set_symbol(symbol)
+
+    def candidate_features(self) -> dict[str, object]:
+        """Return latest gate values already computed by ``__call__``."""
+        return dict(self._last_metrics)
 
     def _stock_above_sma(self, df: pd.DataFrame) -> pd.Series:
         """
@@ -182,6 +187,12 @@ class SMAEdgeFilter:
         reasons_by_bar: list[list[str]] = []
 
         stock_sma = df["close"].rolling(self._stock_sma_window).mean()
+        if "volume" in df.columns:
+            volume = df["volume"].astype(float)
+            short_median = volume.rolling(self._vol_short).median().iloc[-1]
+            long_median = volume.rolling(self._vol_long).median().iloc[-1]
+        else:
+            short_median = long_median = None
         for i, (stock_ok, vol_ok, earnings_ok) in enumerate(
             zip(
                 stock_gate.tolist(),
@@ -217,6 +228,27 @@ class SMAEdgeFilter:
             stock_ok     = bool(stock_gate.iloc[-1])
             vol_ok       = bool(vol_gate.iloc[-1])
             earnings_ok  = bool(earnings_gate.iloc[-1])
+            latest_sma = stock_sma.iloc[-1]
+            latest_close = float(df["close"].iloc[-1])
+            self._last_metrics = {
+                "stock_sma_window": self._stock_sma_window,
+                "stock_sma": (
+                    float(latest_sma) if pd.notna(latest_sma) else None
+                ),
+                "distance_above_stock_sma_pct": (
+                    latest_close / float(latest_sma) - 1.0
+                    if pd.notna(latest_sma) and latest_sma > 0
+                    else None
+                ),
+                "volume_expanding": vol_ok,
+                "volume_short_median": (
+                    float(short_median) if pd.notna(short_median) else None
+                ),
+                "volume_long_median": (
+                    float(long_median) if pd.notna(long_median) else None
+                ),
+                "earnings_allowed": earnings_ok,
+            }
 
             if allowed:
                 logger.debug(

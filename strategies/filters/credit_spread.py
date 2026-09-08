@@ -85,6 +85,7 @@ class CreditSpreadEdgeFilter:
             raise ValueError("trend_sma_buffer_pct must be non-negative")
         self._iv_resolver = iv_resolver or IVProxyResolver()
         self._symbol: str = ""
+        self._last_metrics: dict[str, float | bool | str | None] = {}
         # Earnings gate only matters for single names; ETFs pass 0 and the
         # gate is skipped entirely (no yfinance lookups).
         self._earnings: EarningsBlackout | None = (
@@ -101,6 +102,11 @@ class CreditSpreadEdgeFilter:
         self._symbol = symbol
         if self._earnings is not None:
             self._earnings.set_symbol(symbol)
+
+    @property
+    def last_metrics(self) -> dict[str, float | bool | str | None]:
+        """Return latest values already computed by the entry filter."""
+        return dict(self._last_metrics)
 
     def _trend_gate(self, df: pd.DataFrame) -> pd.Series:
         """True where the underlying close is above its own N-day SMA.
@@ -130,6 +136,25 @@ class CreditSpreadEdgeFilter:
             earnings_gate = pd.Series(True, index=df.index, dtype=bool)
 
         combined = trend_gate & iv_gate & earnings_gate
+
+        close = df["close"].astype(float)
+        sma = close.rolling(self._sma_window).mean()
+        latest_sma = sma.iloc[-1]
+        self._last_metrics = {
+            "trend_allowed": bool(trend_gate.iloc[-1]),
+            "trend_sma_window": self._sma_window,
+            "trend_sma": float(latest_sma) if pd.notna(latest_sma) else None,
+            "trend_cushion_pct": (
+                float(close.iloc[-1] / latest_sma - 1.0)
+                if pd.notna(latest_sma) and latest_sma > 0
+                else None
+            ),
+            "trend_sma_buffer_pct": self._trend_sma_buffer_pct,
+            "iv_proxy_source": self._iv_source,
+            "iv_proxy": float(iv_value),
+            "min_iv_proxy": self._min_iv_proxy,
+            "earnings_allowed": bool(earnings_gate.iloc[-1]),
+        }
 
         reasons_by_bar: list[list[str]] = []
         for trend_ok, earn_ok in zip(

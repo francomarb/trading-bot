@@ -88,6 +88,7 @@ class SPYOptionsReversionStrategy(BaseStrategy):
         # requires Alpaca credentials and subsequent entries reuse the same
         # client instead of churning one per signal bar.
         self._quote_lookup = quote_lookup
+        self._last_candidate_execution_features: dict[str, object] = {}
 
     def required_bars(self) -> int:
         return self.rsi_length + 5
@@ -149,6 +150,28 @@ class SPYOptionsReversionStrategy(BaseStrategy):
         # Delta floor).  No time-based exit series here — _raw_signals has no
         # access to the specific contract's expiry date.
         return SignalFrame(entries=entries, exits=false_series)
+
+    def candidate_features(self, df: pd.DataFrame) -> dict[str, object]:
+        """Describe the underlying RSI recovery before contract selection."""
+        with_rsi = add_rsi(df, self.rsi_length)
+        rsi = with_rsi[f"rsi_{self.rsi_length}"]
+        current = float(rsi.iloc[-1]) if pd.notna(rsi.iloc[-1]) else None
+        previous = (
+            float(rsi.iloc[-2]) if len(rsi) > 1 and pd.notna(rsi.iloc[-2]) else None
+        )
+        return {
+            "rsi_length": self.rsi_length,
+            "rsi_threshold": self.rsi_threshold,
+            "rsi": current,
+            "previous_rsi": previous,
+            "threshold_cross_size": (
+                current - self.rsi_threshold if current is not None else None
+            ),
+        }
+
+    def candidate_execution_features(self) -> dict[str, object]:
+        """Expose the already-computed contract pick without another quote."""
+        return dict(self._last_candidate_execution_features)
 
     # ── Mid-trade exit guards ────────────────────────────────────────────────
 
@@ -405,6 +428,20 @@ class SPYOptionsReversionStrategy(BaseStrategy):
         # the trailing stop in inspect_open_positions handles real profit-taking.
         take_profit = round(premium * self.config.take_profit_multiple, 2)
         stop_loss = round(premium * self.config.stop_loss_multiple, 2)
+
+        self._last_candidate_execution_features = {
+            "occ_symbol": pick.occ_symbol,
+            "strike": pick.strike,
+            "expiration_date": pick.expiration_date,
+            "target_delta": self.config.target_delta,
+            "target_strike_pct": self.config.target_strike_pct,
+            "premium": premium,
+            "premium_per_contract": premium * 100.0,
+            "spread_pct": pick.spread_pct,
+            "rank_score": pick.score,
+            "rank_components": pick.components,
+            "runner_up_count": len(pick.runners_up),
+        }
 
         logger.info(
             f"[{self.name}] {pick.occ_symbol}: premium=${premium:.2f} "

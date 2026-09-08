@@ -105,11 +105,16 @@ class DonchianEdgeFilter:
         # defeated provenance tracking in backtest reports.
         self._feed_label_override = feed_label
         self._symbol: str = ""
+        self._last_metrics: dict[str, object] = {}
 
     def set_symbol(self, symbol: str) -> None:
         """Injected by BaseStrategy.generate_signals before __call__."""
         self._symbol = symbol
         self._earnings.set_symbol(symbol)
+
+    def candidate_features(self) -> dict[str, object]:
+        """Return latest gate values already computed by ``__call__``."""
+        return dict(self._last_metrics)
 
     def _stock_above_sma(self, df: pd.DataFrame) -> pd.Series:
         """
@@ -189,6 +194,31 @@ class DonchianEdgeFilter:
             stock_ok  = bool(stock_gate.iloc[-1])
             earn_ok   = bool(earnings_gate.iloc[-1])
             liq_ok    = bool(liquidity_gate.iloc[-1])
+            latest_sma = stock_sma.iloc[-1]
+            latest_close = float(df["close"].iloc[-1])
+            latest_dollar_volume = (
+                avg_dollar_vol.iloc[-1] if avg_dollar_vol is not None else None
+            )
+            self._last_metrics = {
+                "stock_sma_window": self._stock_sma_window,
+                "stock_sma": (
+                    float(latest_sma) if pd.notna(latest_sma) else None
+                ),
+                "distance_above_stock_sma_pct": (
+                    latest_close / float(latest_sma) - 1.0
+                    if pd.notna(latest_sma) and latest_sma > 0
+                    else None
+                ),
+                "liquid": liq_ok,
+                "average_dollar_volume": (
+                    float(latest_dollar_volume)
+                    if latest_dollar_volume is not None
+                    and pd.notna(latest_dollar_volume)
+                    else None
+                ),
+                "earnings_allowed": earn_ok,
+                "feed": feed_label,
+            }
 
             if allowed:
                 logger.info(

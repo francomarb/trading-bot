@@ -231,6 +231,15 @@ class CompositeEdgeFilter:
     def get_last_block_reasons(self) -> list[str]:
         return list(self._last_reasons)
 
+    def candidate_features(self) -> dict[str, object]:
+        """Return latest child-filter facts without re-running a filter."""
+        features: dict[str, object] = {}
+        for child in self._filters:
+            getter = getattr(child, "candidate_features", None)
+            if callable(getter):
+                features[type(child).__name__] = getter()
+        return features
+
 
 # ── EarningsBlackout ─────────────────────────────────────────────────────────
 

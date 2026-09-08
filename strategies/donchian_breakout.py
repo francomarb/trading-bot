@@ -146,6 +146,35 @@ class DonchianBreakout(BaseStrategy):
             )
         return trigger
 
+    def candidate_features(self, df: pd.DataFrame) -> dict[str, object]:
+        """Describe breakout strength and channel geometry."""
+        with_high = add_donchian_high(df, self.entry_window)
+        with_channels = add_donchian_low(with_high, self.exit_window)
+        close = float(df["close"].iloc[-1])
+        trigger = float(
+            with_channels[f"donchian_high_{self.entry_window}"].iloc[-1]
+        )
+        exit_low = float(
+            with_channels[f"donchian_low_{self.exit_window}"].iloc[-1]
+        )
+        volume_ratio = None
+        if "volume" in df.columns:
+            volume = df["volume"].astype(float)
+            average = volume.rolling(20).mean().iloc[-1]
+            if pd.notna(average) and average > 0:
+                volume_ratio = float(volume.iloc[-1] / average)
+        return {
+            "entry_window": self.entry_window,
+            "exit_window": self.exit_window,
+            "entry_trigger": trigger,
+            "breakout_pct": close / trigger - 1.0 if trigger > 0 else None,
+            "exit_channel_low": exit_low,
+            "channel_width_pct": (
+                (trigger - exit_low) / close if close > 0 else None
+            ),
+            "volume_vs_20d_average": volume_ratio,
+        }
+
     def __repr__(self) -> str:
         return (
             f"DonchianBreakout(entry={self.entry_window}, exit={self.exit_window})"

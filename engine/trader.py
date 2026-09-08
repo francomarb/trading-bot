@@ -538,6 +538,18 @@ class TradingEngine:
             lambda: not self.risk.is_halted() and not self.risk.is_entries_paused()
         )
         self.trade_logger = trade_logger or TradeLogger()
+        # PLAN 11.61a — permanent candidate-decision audit plus a disposable
+        # shadow-outcome queue. Observation failures are isolated and never
+        # participate in admission or order routing.
+        try:
+            from engine.candidate_observation import CandidateObservationStore
+            self.candidate_observation_store = CandidateObservationStore(
+                self.trade_logger._ensure_db()
+            )
+        except Exception as exc:
+            logger.warning(f"candidate observation store init skipped: {exc}")
+            self.candidate_observation_store = None
+        self._candidate_cycle_uid: str | None = None
         # Operator Controls Phase A — wire the lifecycle store to the
         # broker so equity entry paths persist `position_uid` pending →
         # open transitions. Best-effort: if the broker already has a
@@ -1166,7 +1178,214 @@ class TradingEngine:
 
     # ── Correlated-entry heat cap (PLAN 11.60) ───────────────────────────
 
-    def _heat_cap_allows(self, decision: "RiskDecision") -> bool:
+    def _start_candidate_observation(
+        self,
+        *,
+        strategy: BaseStrategy,
+        symbol: str,
+        signal_symbol: str,
+        timeframe: str,
+        data_feed: str,
+        signal_at: pd.Timestamp,
+        current_regime: MarketRegime | None,
+        slot_ordinal: int | None,
+        watchlist_ordinal: int | None,
+        evaluation_ordinal: int | None,
+        df: pd.DataFrame,
+        latest_close: float,
+        latest_atr: float,
+        account: AccountState,
+        snapshot: BrokerSnapshot,
+        order_strategy: dict[str, str],
+        allowed_regimes: frozenset[MarketRegime] | None,
+    ) -> str | None:
+        """Persist one actionable candidate without affecting its decision."""
+        store = self.candidate_observation_store
+        cycle_uid = self._candidate_cycle_uid
+        if store is None or cycle_uid is None:
+            return None
+        try:
+            from engine.candidate_observation import CandidateStart
+
+            identity = resolve_strategy_identity(
+                strategy,
+                allowed_regimes=allowed_regimes,
+                data_feed=data_feed,
+                timeframe=timeframe,
+            )
+            try:
+                raw_strategy_features = strategy.candidate_features(df)
+                if not isinstance(raw_strategy_features, dict):
+                    raise TypeError("candidate_features must return a dict")
+                strategy_features = dict(raw_strategy_features)
+            except Exception as exc:
+                strategy_features = {
+                    "observation_error": f"{type(exc).__name__}: {exc}"
+                }
+            edge_filter = getattr(strategy, "_edge_filter", None)
+            edge_feature_getter = getattr(edge_filter, "candidate_features", None)
+            try:
+                if callable(edge_feature_getter):
+                    strategy_features = {
+                        **strategy_features,
+                        "edge_filters": edge_feature_getter(),
+                    }
+                else:
+                    edge_metrics = getattr(edge_filter, "last_metrics", None)
+                    if isinstance(edge_metrics, dict):
+                        strategy_features = {
+                            **strategy_features,
+                            "edge_filters": edge_metrics,
+                        }
+            except Exception as exc:
+                strategy_features = {
+                    **strategy_features,
+                    "edge_filter_observation_error": (
+                        f"{type(exc).__name__}: {exc}"
+                    ),
+                }
+            sector = None
+            sector_positions = None
+            if self._sector_resolver is not None and not is_occ_option(symbol):
+                try:
+                    sector = self._sector_resolver.resolve(symbol)
+                    if sector is not None:
+                        sector_positions = len(
+                            self._compute_sector_exposure().get(sector, [])
+                        )
+                except Exception as exc:
+                    strategy_features["sector_observation_error"] = (
+                        f"{type(exc).__name__}: {exc}"
+                    )
+            common_context: dict[str, Any] = {
+                "portfolio_open_positions": len(account.open_positions),
+                "strategy_open_positions": sum(
+                    1
+                    for owner in self._owners_view().values()
+                    if owner == strategy.name
+                ),
+                "open_orders": len(snapshot.open_orders),
+                "sector": sector,
+                "sector_open_positions": sector_positions,
+                "bar_volume": (
+                    float(df["volume"].iloc[-1]) if "volume" in df.columns else None
+                ),
+                "bar_dollar_volume": (
+                    float(df["volume"].iloc[-1]) * latest_close
+                    if "volume" in df.columns
+                    else None
+                ),
+            }
+            if self._allocator is not None:
+                try:
+                    allocator_snapshot = self._allocator.snapshot(
+                        account,
+                        snapshot.open_orders,
+                        self._owners_view(),
+                        order_strategy,
+                        self._multi_leg_risk_notional_by_strategy(),
+                    )
+                    common_context["sleeve"] = allocator_snapshot[
+                        "strategies"
+                    ].get(strategy.name)
+                    pool_name = (
+                        common_context["sleeve"] or {}
+                    ).get("pool_type", "")
+                    if pool_name == "isolated":
+                        pool_name = "isolated_options"
+                    common_context["pool"] = allocator_snapshot["pools"].get(
+                        pool_name
+                    )
+                except Exception as exc:
+                    common_context["allocator_observation_error"] = (
+                        f"{type(exc).__name__}: {exc}"
+                    )
+            timestamp = signal_at.to_pydatetime()
+            if timestamp.tzinfo is None:
+                timestamp = timestamp.replace(tzinfo=timezone.utc)
+            return store.start(
+                CandidateStart(
+                    cycle_uid=cycle_uid,
+                    signal_at=timestamp,
+                    strategy=strategy.name,
+                    strategy_version=identity.strategy_version,
+                    strategy_config_hash=identity.strategy_config_hash,
+                    bot_git_commit=identity.bot_git_commit,
+                    symbol=symbol,
+                    signal_symbol=signal_symbol,
+                    timeframe=timeframe,
+                    data_feed=data_feed,
+                    regime=(
+                        current_regime.value if current_regime is not None else None
+                    ),
+                    slot_ordinal=slot_ordinal,
+                    watchlist_ordinal=watchlist_ordinal,
+                    evaluation_ordinal=evaluation_ordinal,
+                    feature_schema_version=(
+                        strategy.candidate_feature_schema_version
+                    ),
+                    reference_price=latest_close,
+                    atr=latest_atr,
+                    strategy_features=strategy_features,
+                    common_context=common_context,
+                ),
+                observed_at=self._clock(),
+            )
+        except Exception as exc:
+            logger.warning(
+                f"[{strategy.name}] {symbol}: candidate observation start "
+                f"failed — {type(exc).__name__}: {exc}"
+            )
+            return None
+
+    def _update_candidate_observation(
+        self, candidate_uid: str | None, **values: Any
+    ) -> None:
+        """Best-effort candidate enrichment; failure never blocks trading."""
+        if candidate_uid is None or self.candidate_observation_store is None:
+            return
+        try:
+            self.candidate_observation_store.update(candidate_uid, **values)
+        except Exception as exc:
+            logger.warning(
+                f"candidate observation update failed for {candidate_uid[:8]} — "
+                f"{type(exc).__name__}: {exc}"
+            )
+
+    @staticmethod
+    def _candidate_execution_features(strategy: BaseStrategy) -> dict[str, object]:
+        """Read picker facts defensively; observation must not affect orders."""
+        try:
+            features = strategy.candidate_execution_features()
+            if not isinstance(features, dict):
+                raise TypeError("candidate_execution_features must return a dict")
+            return dict(features)
+        except Exception as exc:
+            return {"observation_error": f"{type(exc).__name__}: {exc}"}
+
+    def _finalize_candidate_observations(self) -> None:
+        """Classify cycle-level contention and seed its disposable queue."""
+        if (
+            self._candidate_cycle_uid is None
+            or self.candidate_observation_store is None
+        ):
+            return
+        try:
+            self.candidate_observation_store.finalize_cycle(
+                self._candidate_cycle_uid
+            )
+        except Exception as exc:
+            logger.warning(
+                "candidate observation cycle finalization failed — "
+                f"{type(exc).__name__}: {exc}"
+            )
+
+    def _heat_cap_allows(
+        self,
+        decision: "RiskDecision",
+        *,
+        candidate_uid: str | None = None,
+    ) -> bool:
         """Evaluate the sleeve's open heat against its cap for one candidate.
 
         Returns True when the entry may proceed. In observation mode it
@@ -1210,6 +1429,20 @@ class TradingEngine:
         _, price_source = worst_case_entry_price(decision)
         cap_dollars = equity * cap_pct
         projected = filled + pending + candidate
+
+        self._update_candidate_observation(
+            candidate_uid,
+            execution_features_json={
+                "filled_heat_dollars": filled,
+                "pending_heat_dollars": pending,
+                "candidate_heat_dollars": candidate,
+                "projected_heat_dollars": projected,
+                "heat_cap_dollars": cap_dollars,
+                "heat_price_source": price_source,
+                "heat_would_block": projected > cap_dollars,
+                "heat_enforced": settings.STRATEGY_HEAT_CAP_ENFORCED,
+            },
+        )
 
         unpriced = gaps.get(strategy) or []
         if unpriced:
@@ -1512,6 +1745,7 @@ class TradingEngine:
         new_positions = 0
         error_count = 0
         cycle_status = "ok"
+        self._candidate_cycle_uid = uuid.uuid4().hex
 
         # PLAN 11.10f: reset the per-cycle lifecycle counter accumulator
         # at the start of each cycle. Flushed via _flush_lifecycle_counters
@@ -1765,7 +1999,8 @@ class TradingEngine:
 
             self._watchlist_statuses = {}
             self._watchlist_reasons = {}
-            for slot in self._slots_by_priority():
+            evaluation_ordinal = 0
+            for slot_ordinal, slot in enumerate(self._slots_by_priority()):
                 # Per-slot regime gate: block new entries if current regime is
                 # not in the slot's allowed set. Exits always proceed.
                 entry_allowed = True
@@ -1812,7 +2047,9 @@ class TradingEngine:
                 strategy_reasons = self._watchlist_reasons.setdefault(
                     slot.strategy.name, {}
                 )
-                for symbol in symbols:
+                for watchlist_ordinal, symbol in enumerate(symbols):
+                    current_evaluation_ordinal = evaluation_ordinal
+                    evaluation_ordinal += 1
                     strategy_statuses[symbol] = self._baseline_watchlist_status(
                         symbol,
                         snapshot,
@@ -1838,6 +2075,9 @@ class TradingEngine:
                             signal_symbol=slot.signal_symbol_for(symbol),
                             data_feed=slot.data_feed,
                             allowed_regimes=slot.allowed_regimes,
+                            slot_ordinal=slot_ordinal,
+                            watchlist_ordinal=watchlist_ordinal,
+                            evaluation_ordinal=current_evaluation_ordinal,
                         )
                         if filled is not None:
                             new_positions += 1
@@ -1882,6 +2122,7 @@ class TradingEngine:
             # failure logs WARNING and continues — must NEVER raise into
             # the trading loop (design §12.4.1 hard rule).
             self._flush_lifecycle_counters()
+            self._finalize_candidate_observations()
             self._write_strategy_daily_marks()
             self._write_state_snapshot()
             # Close idle HTTP connections so they don't go stale during the
@@ -1908,6 +2149,9 @@ class TradingEngine:
         signal_symbol: str | None = None,
         data_feed: str | None = None,
         allowed_regimes: frozenset[MarketRegime] | None = None,
+        slot_ordinal: int | None = None,
+        watchlist_ordinal: int | None = None,
+        evaluation_ordinal: int | None = None,
     ) -> Position | None:
         """
         The full per-symbol decision path. Returns a Position if an entry was
@@ -2469,6 +2713,26 @@ class TradingEngine:
                 )
                 return None
 
+        candidate_uid = self._start_candidate_observation(
+            strategy=strategy,
+            symbol=symbol,
+            signal_symbol=signal_symbol or symbol,
+            timeframe=timeframe,
+            data_feed=selected_feed,
+            signal_at=signal_bar,
+            current_regime=current_regime,
+            slot_ordinal=slot_ordinal,
+            watchlist_ordinal=watchlist_ordinal,
+            evaluation_ordinal=evaluation_ordinal,
+            df=df,
+            latest_close=latest_close,
+            latest_atr=latest_atr,
+            account=account,
+            snapshot=snapshot,
+            order_strategy=order_strategy or {},
+            allowed_regimes=allowed_regimes,
+        )
+
         # Sleeve check — must pass before risk sizing.
         # Narrows the notional budget available to this strategy without
         # bypassing any global risk control. Exits are never sleeve-gated.
@@ -2484,6 +2748,17 @@ class TradingEngine:
                 additional_used_notional=self._multi_leg_risk_notional_by_strategy(),
             )
             if isinstance(sleeve, SleeveRejection):
+                self._update_candidate_observation(
+                    candidate_uid,
+                    disposition=sleeve.code.value,
+                    disposition_reason=sleeve.message,
+                    execution_features_json={
+                        "execution_envelope_available": False,
+                        "execution_envelope_unavailable_reason": (
+                            "sleeve gate rejected before sizing or instrument selection"
+                        ),
+                    },
+                )
                 logger.info(
                     f"[{strategy.name}] {symbol}: "
                     f"sleeve blocked — {sleeve.message}"
@@ -2523,6 +2798,7 @@ class TradingEngine:
                 allowed_regimes=allowed_regimes,
                 data_feed=data_feed,
                 timeframe=timeframe,
+                candidate_uid=candidate_uid,
             )
             return None
 
@@ -2545,16 +2821,35 @@ class TradingEngine:
                 logger.warning(
                     f"[{strategy.name}] Option trade rejected for {symbol}: {e}"
                 )
+                self._update_candidate_observation(
+                    candidate_uid,
+                    disposition="execution_unavailable",
+                    disposition_reason=str(e),
+                )
                 self._mark_signal_bar_processed(
                     signal_key, signal_bar, strategy_statuses, strategy_reasons, symbol
                 )
                 return None
             except Exception as e:
                 logger.error(f"[{strategy.name}] Failed to build option execution for {symbol}: {e}")
+                self._update_candidate_observation(
+                    candidate_uid,
+                    disposition="execution_error",
+                    disposition_reason=f"{type(e).__name__}: {e}",
+                )
                 self._mark_signal_bar_processed(
                     signal_key, signal_bar, strategy_statuses, strategy_reasons, symbol
                 )
                 return None
+
+            self._update_candidate_observation(
+                candidate_uid,
+                target_symbol=target_symbol,
+                execution_features_json={
+                    "execution_envelope_available": True,
+                    **self._candidate_execution_features(strategy),
+                },
+            )
 
             # PLAN 11.44: contract-level conflict guard. The picker resolved
             # the OCC; reject before order submission if another strategy
@@ -2571,6 +2866,13 @@ class TradingEngine:
                     symbol=symbol,
                     occs=[target_symbol],
                 ) is not None:
+                    self._update_candidate_observation(
+                        candidate_uid,
+                        disposition="contract_conflict",
+                        disposition_reason=(
+                            f"{target_symbol} owned by another strategy"
+                        ),
+                    )
                     if strategy_statuses is not None:
                         strategy_statuses[symbol] = "Contract Conflict"
                     if strategy_reasons is not None:
@@ -2632,6 +2934,11 @@ class TradingEngine:
                     f"requires an ENTRY_PRICE_CAPS policy to anchor the limit "
                     f"leg; skipping entry"
                 )
+                self._update_candidate_observation(
+                    candidate_uid,
+                    disposition="invalid_execution_policy",
+                    disposition_reason="STOP_LIMIT entry price cap is missing",
+                )
                 self._mark_signal_bar_processed(
                     signal_key, signal_bar, strategy_statuses, strategy_reasons, symbol
                 )
@@ -2642,6 +2949,11 @@ class TradingEngine:
                 logger.error(
                     f"[entry-guard] {strategy.name} {symbol}: "
                     f"compute_entry_trigger failed: {e}"
+                )
+                self._update_candidate_observation(
+                    candidate_uid,
+                    disposition="execution_error",
+                    disposition_reason=f"compute_entry_trigger: {type(e).__name__}: {e}",
                 )
                 self._mark_signal_bar_processed(
                     signal_key, signal_bar, strategy_statuses, strategy_reasons, symbol
@@ -2690,6 +3002,11 @@ class TradingEngine:
         )
         decision = self.risk.evaluate(sig, account, notional_cap=notional_cap)
         if isinstance(decision, RiskRejection):
+            self._update_candidate_observation(
+                candidate_uid,
+                disposition=decision.code.value,
+                disposition_reason=decision.message,
+            )
             # Already logged by risk; alert the operator.
             self.alerts.order_rejection(
                 symbol, strategy.name, decision.message, decision.code.value
@@ -2718,13 +3035,31 @@ class TradingEngine:
             bot_git_commit=identity.bot_git_commit,
             entry_regime=current_regime.value if current_regime is not None else None,
         )
+        self._update_candidate_observation(
+            candidate_uid,
+            disposition="approved",
+            target_symbol=decision.symbol,
+            order_type=decision.order_type.value,
+            requested_qty=decision.qty,
+            approved_notional_dollars=decision.approved_notional_dollars,
+            risk_budget_dollars=decision.risk_budget_dollars,
+            approved_risk_dollars=decision.approved_risk_dollars,
+            risk_clip_kind=decision.risk_clip_kind,
+            applied_size_multiplier=decision.applied_size_multiplier,
+            execution_features_json={"execution_envelope_available": True},
+        )
 
         # PLAN 11.60 correlated-entry heat cap. Observation-only unless
         # settings.STRATEGY_HEAT_CAP_ENFORCED. Placed here because this is the
         # first point where the decision is final — qty and stop are settled,
         # so the candidate's worst-case risk is knowable — and still before
         # submission, which is where a correlated burst is actually admitted.
-        if not self._heat_cap_allows(decision):
+        if not self._heat_cap_allows(decision, candidate_uid=candidate_uid):
+            self._update_candidate_observation(
+                candidate_uid,
+                disposition=RejectionCode.MAX_STRATEGY_HEAT_REACHED.value,
+                disposition_reason="strategy heat cap blocked entry",
+            )
             self._mark_signal_bar_processed(
                 signal_key, signal_bar, strategy_statuses, strategy_reasons, symbol
             )
@@ -2812,6 +3147,14 @@ class TradingEngine:
                     _now_iso if slippage_ref is not None else None
                 ),
                 slippage_measurement_quality=slippage_quality,
+            )
+            self._update_candidate_observation(
+                candidate_uid,
+                selected=True,
+                disposition=result.status.value,
+                disposition_reason=result.message or None,
+                order_id=result.order_id,
+                position_uid=result.position_uid,
             )
             # PLAN 11.10f: lifecycle counter — submitted increments
             # once per place_order call (regardless of fill status).
@@ -2936,6 +3279,12 @@ class TradingEngine:
             )
         except Exception as e:
             logger.error(f"{symbol}: place_order raised: {e}")
+            self._update_candidate_observation(
+                candidate_uid,
+                selected=True,
+                disposition="submit_error",
+                disposition_reason=f"{type(e).__name__}: {e}",
+            )
             self.risk.record_broker_error()
             self.alerts.broker_error(f"{symbol} place_order: {e}")
         return None
@@ -11233,6 +11582,7 @@ class TradingEngine:
         allowed_regimes: frozenset[MarketRegime] | None = None,
         data_feed: str | None = None,
         timeframe: str | None = None,
+        candidate_uid: str | None = None,
     ) -> None:
         """
         Generic MLEG entry path: build the spread plan, dispatch the async
@@ -11246,7 +11596,24 @@ class TradingEngine:
         (PLAN.md 11.31 generalized the MLEG plumbing; 11.44 renamed this
         entry point to match).
         """
-        def _done(status: str) -> None:
+        def _done(
+            status: str,
+            *,
+            disposition: str | None = None,
+            reason: str | None = None,
+            selected: bool = False,
+            order_id: str | None = None,
+            position_uid: str | None = None,
+        ) -> None:
+            if disposition is not None:
+                self._update_candidate_observation(
+                    candidate_uid,
+                    disposition=disposition,
+                    disposition_reason=reason,
+                    selected=selected,
+                    order_id=order_id,
+                    position_uid=position_uid,
+                )
             if strategy_statuses is not None:
                 strategy_statuses[symbol] = status
             if strategy_reasons is not None:
@@ -11263,7 +11630,11 @@ class TradingEngine:
             self.alerts.order_rejection(
                 symbol, strategy.name, reason, RejectionCode.HALTED.value
             )
-            _done("Risk Blocked")
+            _done(
+                "Risk Blocked",
+                disposition=RejectionCode.HALTED.value,
+                reason=reason,
+            )
             return
 
         if notional_cap is None or notional_cap <= 0:
@@ -11271,7 +11642,11 @@ class TradingEngine:
                 f"[{strategy.name}] {symbol}: credit spread skipped — "
                 f"no sleeve notional available"
             )
-            _done("No Signal")
+            _done(
+                "No Signal",
+                disposition="execution_unavailable",
+                reason="no sleeve notional available",
+            )
             return
 
         total_open = self._count_open_spreads()
@@ -11283,14 +11658,34 @@ class TradingEngine:
             )
         except MultiLegTradeRejected as e:
             logger.info(f"[{strategy.name}] {symbol}: multi-leg entry rejected — {e}")
-            _done("No Signal")
+            _done(
+                "No Signal",
+                disposition="execution_unavailable",
+                reason=str(e),
+            )
             return
         except Exception as e:
             logger.error(
                 f"[{strategy.name}] {symbol}: build_spread_execution failed: {e}"
             )
-            _done("No Signal")
+            _done(
+                "No Signal",
+                disposition="execution_error",
+                reason=f"{type(e).__name__}: {e}",
+            )
             return
+
+        self._update_candidate_observation(
+            candidate_uid,
+            target_symbol=plan.short_occ,
+            order_type="limit",
+            requested_qty=plan.qty,
+            approved_notional_dollars=plan.max_loss * plan.qty,
+            execution_features_json={
+                "execution_envelope_available": True,
+                **self._candidate_execution_features(strategy),
+            },
+        )
 
         # PLAN 11.44: contract-level conflict guard. The plan resolved every
         # leg OCC; reject before dispatch if any leg collides with a contract
@@ -11304,7 +11699,11 @@ class TradingEngine:
             symbol=symbol,
             occs=leg_occs,
         ) is not None:
-            _done("Contract Conflict")
+            _done(
+                "Contract Conflict",
+                disposition="contract_conflict",
+                reason="one or more spread legs owned by another strategy",
+            )
             return
 
         if self.risk.is_halted():
@@ -11316,7 +11715,11 @@ class TradingEngine:
             self.alerts.order_rejection(
                 symbol, strategy.name, reason, RejectionCode.HALTED.value
             )
-            _done("Risk Blocked")
+            _done(
+                "Risk Blocked",
+                disposition=RejectionCode.HALTED.value,
+                reason=reason,
+            )
             return
 
         position_id = new_spread_id()
@@ -11347,7 +11750,12 @@ class TradingEngine:
             logger.error(f"[{strategy.name}] {symbol}: dispatch_spread_order raised: {e}")
             self.risk.record_broker_error()
             self.alerts.broker_error(f"{symbol} dispatch_spread_order: {e}")
-            _done("No Signal")
+            _done(
+                "No Signal",
+                disposition="submit_error",
+                reason=f"{type(e).__name__}: {e}",
+                selected=True,
+            )
             return
 
         if result.status is not OrderStatus.ACCEPTED:
@@ -11355,7 +11763,13 @@ class TradingEngine:
                 f"[{strategy.name}] {symbol}: spread dispatch returned "
                 f"{result.status.value} — not pre-registering"
             )
-            _done("No Signal")
+            _done(
+                "No Signal",
+                disposition=result.status.value,
+                reason=result.message or None,
+                selected=True,
+                order_id=result.order_id,
+            )
             return
 
         # PLAN 11.10f: lifecycle counter — submitted++ for the
@@ -11390,7 +11804,7 @@ class TradingEngine:
         # spread tracked at the engine level so the close path still
         # works; cycle reconciliation will not see a substrate row but
         # the legacy in-memory ownership is preserved.
-        self._lifecycle_begin_spread(
+        lifecycle_uid = self._lifecycle_begin_spread(
             position_id=position_id,
             strategy_name=strategy.name,
             symbol=plan.short_occ,
@@ -11406,7 +11820,14 @@ class TradingEngine:
             f"net_credit=${plan.net_credit:.2f}/sh max_loss=${plan.max_loss:,.0f} "
             f"position_id={position_id[:8]} — pre-registered"
         )
-        _done("Pending Entry")
+        _done(
+            "Pending Entry",
+            disposition=result.status.value,
+            reason=result.message or None,
+            selected=True,
+            order_id=result.order_id,
+            position_uid=lifecycle_uid,
+        )
 
     def _drain_spread_fills(self) -> None:
         """

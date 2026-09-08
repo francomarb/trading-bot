@@ -786,6 +786,71 @@ class TestProcessSymbol:
         assert decision.strategy_version == "unknown"
         assert decision.strategy_config_hash == "unknown"
 
+    def test_actionable_entry_records_candidate_and_lifecycle_link(
+        self, engine_factory
+    ):
+        result = _filled_result("AAPL", 1, 100.5)
+        result = replace(result, position_uid="pos_candidate_1")
+        engine, broker = engine_factory(
+            entries=[False] * 59 + [True], place_result=result
+        )
+        engine._candidate_cycle_uid = "candidate-cycle"
+        snap = _snapshot()
+
+        filled = engine._process_symbol(
+            "AAPL",
+            snap,
+            snap.account,
+            engine.strategy,
+            "1Day",
+            data_feed="iex",
+            slot_ordinal=2,
+            watchlist_ordinal=7,
+            evaluation_ordinal=19,
+        )
+
+        assert filled is not None
+        [row] = engine.candidate_observation_store.read_cycle("candidate-cycle")
+        assert row["symbol"] == "AAPL"
+        assert row["slot_ordinal"] == 2
+        assert row["watchlist_ordinal"] == 7
+        assert row["evaluation_ordinal"] == 19
+        assert row["selected"] == 1
+        assert row["disposition"] == "filled"
+        assert row["position_uid"] == "pos_candidate_1"
+        assert row["requested_qty"] > 0
+        broker.place_order.assert_called_once()
+
+    def test_candidate_feature_failure_does_not_block_entry(self, engine_factory):
+        engine, broker = engine_factory(entries=[False] * 59 + [True])
+        engine._candidate_cycle_uid = "candidate-cycle"
+        engine.strategy.candidate_features = MagicMock(
+            side_effect=RuntimeError("diagnostic bug")
+        )
+        snap = _snapshot()
+
+        filled = engine._process_symbol(
+            "AAPL", snap, snap.account, engine.strategy, "1Day", data_feed="iex"
+        )
+
+        assert filled is not None
+        [row] = engine.candidate_observation_store.read_cycle("candidate-cycle")
+        assert row["selected"] == 1
+        assert row["strategy_features"] == {
+            "observation_error": "RuntimeError: diagnostic bug"
+        }
+        broker.place_order.assert_called_once()
+
+    def test_candidate_execution_feature_failure_is_contained(self, engine_factory):
+        engine, _broker = engine_factory()
+        engine.strategy.candidate_execution_features = MagicMock(
+            side_effect=RuntimeError("picker diagnostic bug")
+        )
+
+        assert engine._candidate_execution_features(engine.strategy) == {
+            "observation_error": "RuntimeError: picker diagnostic bug"
+        }
+
     def test_daily_graduation_mark_uses_latest_broker_snapshot(self, engine_factory):
         engine, _broker = engine_factory()
         uid = "pos_99999999999999999999999999999999"

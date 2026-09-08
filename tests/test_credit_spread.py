@@ -233,6 +233,11 @@ class TestBuildSpreadExecution:
         short_leg = next(l for l in plan.legs if l.side is Side.SELL)
         assert short_leg.occ_symbol == plan.short_occ
         assert all(l.opening for l in plan.legs)
+        observation = strat.candidate_execution_features()
+        assert observation["short_occ"] == plan.short_occ
+        assert observation["net_credit"] == pytest.approx(1.45)
+        assert observation["max_loss"] == pytest.approx(855.0)
+        assert observation["return_on_risk"] == pytest.approx(145.0 / 855.0)
 
     def test_rejects_when_notional_cap_zero(self):
         strat = _strategy()

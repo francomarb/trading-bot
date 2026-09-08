@@ -82,12 +82,13 @@ from proceeding.
 
 ## Active Work Queue
 
-### Current Priority View — 2026-09-06
+### Current Priority View — 2026-09-08
 
 | Priority | Item | Current State | Next Action |
 |---:|---|---|---|
 | 1 | Trustworthy strategy graduation report | Deployed; empty state, legacy exclusions, and scoped report controls validated | Collect and review the first versioned cohorts, then define evidence-sufficiency rules. Preflight binding remains a later PR |
-| 2 | `11.62` portfolio heat ceiling | Open design problem; no portfolio-wide initial-risk ceiling exists | Audit interactions with per-sleeve `11.60`, then propose a simple policy before implementation |
+| 2 | `11.61a` entry-candidate observation | Code complete in the current review; ranking remains off | After merge/recycle, collect real same-strategy contention, then build strategy-aware counterfactual resolution before proposing any ranking rule |
+| 3 | `11.62` portfolio heat ceiling | Deferred while `11.60` has only one would-block event | Collect more sleeve-heat evidence before designing a portfolio-wide ceiling |
 
 Evidence still collecting: slippage calibration **2/10**; RSI3 **6 entries / 4 completed exits**; credit-spread bounded entry walk **3/~20 attempts**; Donchian heat-cap observation **1 would-block event**; leveraged trend **4 open entries / 0 exits**. `11.41a` and `11.54a` remain event-gated and require no work until their trigger occurs. VPS and live-flip tasks remain deferred by operator decision.
 
@@ -150,8 +151,8 @@ Evidence still collecting: slippage calibration **2/10**; RSI3 **6 entries / 4 c
 | ~~`11.50` Cross-instrument slippage aggregation~~ | ✅ **SHIPPED.** P&L reports segment execution-quality bps by instrument class instead of pooling equities and options. | Closed. |
 | Dynamic watchlists (`11.1`) | Static universes are operationally simple; dynamic rotation needs durable ownership proven first | Dynamic source supports refresh cadence and never abandons open positions |
 | `11.48b` Long-term risk-target maintenance | Static targets depend on periodic watchlist-volatility checks; drift is safe because caps only reduce risk. | Park until dynamic watchlists. Then add an automated coverage and clip-rate check before changing targets. |
-| `11.62` Portfolio-level heat ceiling | **OPEN — design required.** Per-sleeve heat caps do not bound total initial risk across the book. | Audit current aggregate heat and interactions with `11.60`, then propose a simple fail-closed portfolio ceiling before implementation. |
-| `11.61` Entry-candidate ranking | **OPEN.** When capital or heat binds, fixed watchlist order decides which eligible symbol wins. | First log contended candidates and the chosen order. Rank only on observable cost, diversification, and risk efficiency—not predicted returns. |
+| `11.62` Portfolio-level heat ceiling | **DEFERRED pending more `11.60` evidence.** Per-sleeve heat caps do not bound total initial risk across the book, but only one Donchian would-block event exists. | Collect more `11.60` observations, then audit aggregate heat and propose a simple policy before implementation. |
+| `11.61` Entry-candidate ranking | 🟡 **`11.61a` CODE COMPLETE IN REVIEW; ranking off.** Permanent decisions record strategy-specific signal/filter facts, allocation/risk/execution context, selection order, and lifecycle links. A disposable shadow table is queued only for real same-strategy capacity contention. | After merge/recycle, collect contention. Resolve refused candidates with strategy/instrument-correct fill and exit semantics before a separately reviewed `11.61b` ranking rule. Never compare scores across strategies. See [`docs/entry_candidate_observation.md`](docs/entry_candidate_observation.md). |
 | Calibrated sector caps (`11.8`) | Sector exposure is observable; caps should be data-driven, not blanket | Add targeted caps only if paper exposure shows a real concentration problem |
 | Dynamic strategy allocation (`11.9`) | Could improve capital efficiency once each sleeve has enough live/paper evidence | Weight suggestions based on expectancy/Sharpe with operator approval. *When implemented, key `SleeveAllocator` reserve/release on `(strategy, position_uid)` per `docs/operator_controls_proposal.md` §17.* |
 | Defensive cash sweep (`11.45`) | Idle capital during prolonged BEAR/VOLATILE regimes loses purchasing power | SGOV/BIL-style posture only after strict prolonged-BEAR confirmation and recovery state machine |

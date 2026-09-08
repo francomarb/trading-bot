@@ -353,6 +353,8 @@ class TestBuildOptionExecution:
                 "premium_efficiency": 0.85,
             },
             runners_up=[],
+            strike=730.0,
+            expiration_date=date(2026, 5, 21),
         )
 
         with patch(
@@ -374,6 +376,11 @@ class TestBuildOptionExecution:
         assert premium == 4.90
         assert take_profit == 14.70
         assert stop_loss == 3.68
+        observation = strat.candidate_execution_features()
+        assert observation["occ_symbol"] == occ_symbol
+        assert observation["strike"] == 730.0
+        assert observation["expiration_date"] == date(2026, 5, 21)
+        assert observation["rank_score"] == 0.85
 
     def test_uses_configured_entry_picker_and_exit_multipliers(self):
         from utils.options_lookup import ContractPick

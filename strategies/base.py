@@ -310,6 +310,7 @@ class BaseStrategy(ABC):
 
     name: str  # concrete subclasses must override
     preferred_order_type: OrderType = OrderType.MARKET
+    candidate_feature_schema_version: int = 1
 
     def __init__(self, *, edge_filter: EdgeFilter | None = None) -> None:
         self._edge_filter = edge_filter
@@ -334,6 +335,26 @@ class BaseStrategy(ABC):
         from risk.models import PositionRiskProfile
 
         return PositionRiskProfile()
+
+    def candidate_features(self, df: pd.DataFrame) -> dict[str, object]:
+        """Return strategy-owned, observation-only facts for the latest bar.
+
+        These values explain what makes two candidates from this strategy
+        different.  They are persisted for PLAN 11.61 calibration but are not
+        read by the engine or used to rank orders.  Implementations must use
+        only the supplied frame and state already populated by signal/filter
+        evaluation; this hook must never make a network request.
+        """
+        return {}
+
+    def candidate_execution_features(self) -> dict[str, object]:
+        """Return facts from the most recent option/spread picker, if any.
+
+        Equity strategies inherit the empty result.  Options strategies may
+        expose the picker result already computed for the real decision; this
+        hook must not fetch or recompute market data.
+        """
+        return {}
 
     def inspect_open_positions(self, position, latest_close: float) -> bool:
         """
