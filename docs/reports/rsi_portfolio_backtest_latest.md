@@ -1,5 +1,8 @@
 # RSI Portfolio Backtest - 2026-05-01T14:15:39+00:00
 
+> Historical simplified RSI14 research. This report is reference material and
+> does not determine current watchlist membership.
+
 - This report uses one shared-capital equity curve per basket.
 - Entries split available cash equally across same-day new positions.
 - Max simultaneous positions: `5`

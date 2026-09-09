@@ -19,18 +19,37 @@ from pathlib import Path
 from unittest.mock import patch
 
 import pytest
+from requests.exceptions import ReadTimeout
 
 from reporting.logger import TradeLogger, TradeRecord
 from scripts.sma_watchlist_scan import (
     REJECTION_LABELS,
     RULE_VERSION,
     ScanConfig,
+    _call_with_retry,
     _first_technical_rejection,
     _hydrate_industry_cache,
     _is_biotech_industry,
     _normalize_company_name,
     get_open_sma_positions,
 )
+
+
+class TestCallWithRetry:
+    def test_retries_requests_read_timeout(self, monkeypatch):
+        attempts = 0
+
+        def flaky_call():
+            nonlocal attempts
+            attempts += 1
+            if attempts == 1:
+                raise ReadTimeout("temporary")
+            return "ok"
+
+        monkeypatch.setattr("scripts.sma_watchlist_scan.time.sleep", lambda _delay: None)
+
+        assert _call_with_retry(flaky_call, "test", max_attempts=2) == "ok"
+        assert attempts == 2
 
 
 # ── Rule version ─────────────────────────────────────────────────────────────

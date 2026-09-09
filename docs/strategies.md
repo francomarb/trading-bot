@@ -124,6 +124,10 @@ SMA crossover is the simplest trend-following signal. It captures sustained dire
 | Per-position budget | **$4,800** baseline at $100k paper equity (0.40 × $12k target sleeve); **up to $5,520** with allocator stretch (`can_stretch: True`) |
 | Watchlist | Curated static `RSI_WATCHLIST` |
 
+The active list is the 50-name v3 durable-company opportunity pool promoted on
+2026-09-09, plus temporary open-position retention entries. Pool size does not
+change the eight-position ceiling.
+
 **Signal logic:**
 - **Entry:** RSI3 is below 15 while the symbol is flat
 - **Exit:** close is above SMA5 or RSI3 is above 55

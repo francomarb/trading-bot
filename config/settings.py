@@ -509,15 +509,24 @@ SMA_WATCHLIST = [
 # + sector + earnings filters. The cull was reverted pending a filter-aware,
 # walk-forward, OOS-validated re-audit. See sma_crossover_optimizations.md
 # for the gating conditions before any cull is re-promoted.
-# RSI Reversion — mean-reversion; promoted from the 2026-04-30 expanded
-# backtest pass to increase signal density for the static paper-trading pool.
-# This list intentionally favors breadth over the earlier narrow scanner
-# snapshot so the RSI sleeve can accumulate enough trades for evaluation.
+# RSI Reversion — 50-name durable-company opportunity pool promoted from the
+# 2026-09-09 v3 SIP scan. Selection uses price, dollar liquidity, company size,
+# and affirmative solvency; technical state and historical RSI outcomes are
+# reference-only. Sector concentration is accepted. GOOG is the required
+# Alphabet share class; GOOGL is forbidden by the scanner contract.
+#
+# ABNB and CCK are temporarily retained after the ranked 50 because the trade
+# ledger showed open RSI positions immediately before promotion. Remove each
+# only after it is flat and terminal; they do not consume the 8-position cap.
 RSI_WATCHLIST = [
-    "ALLY", "CDNS", "KBE", "SN", "BA", "TFC", "HON", "TMUS", "MSFT",
-    "CCK", "ABNB", "PG", "SPG", "MA", "LMT", "MCD", "AAPL", "ANET", "NFLX",
-    "CAT", "CIEN", "MCO", "AMZN", "EQIX", "RTX", "META", "HD",
-    "SOFI", "ARM", "MSTR", "LULU",
+    "MU", "NVDA", "SNDK", "AAPL", "TSLA", "MSFT", "AMD", "META", "INTC",
+    "AMZN", "AVGO", "GOOG", "PLTR", "MRVL", "TSM", "NBIS", "ORCL", "AMAT",
+    "STX", "WDC", "BE", "DELL", "LRCX", "LLY", "ASML", "CRM", "NFLX",
+    "WMT", "V", "JPM", "GEV", "CAT", "NOW", "CRWV", "KLAC", "APP", "CSCO",
+    "MRNA", "PANW", "HOOD", "XOM", "IBM", "QCOM", "UNH", "GS", "GLW",
+    "COST", "TXN", "CRWD", "BAC",
+    # Protected open-position additions outside the ranked 50.
+    "ABNB", "CCK",
 ]
 # Legacy/reference RSI macro-gate tolerance used by the historical
 # `scripts/rsi_filter_variant_backtest.py` SPY50 study. The active RSI3
@@ -770,7 +779,9 @@ STRATEGY_ALLOCATIONS: dict[str, dict] = {
         "can_stretch": True,
         "hard_max_positions": 8,
         "max_position_pct_of_sleeve": 0.40,
-        "risk_per_trade_pct": 0.0025,  # 0.25% — covers watchlist ATR% ≥ 2.0 (all but KBE)
+        # Coverage depends on the current watchlist and sleeve cap. The
+        # refresh report recomputes it; cap clipping only reduces risk.
+        "risk_per_trade_pct": 0.0025,
     },
     "donchian_breakout": {
         "target_pct": 0.15,

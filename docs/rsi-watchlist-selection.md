@@ -1,395 +1,218 @@
-# RSI Watchlist Selection
+# RSI Watchlist Selection And Refresh
+
+**Status:** Active procedure; v3 pool promoted 2026-09-09.
+
+**Rule version:** `rsi_watchlist_v3_durable_company_pool`
+
+**Target:** 50 ranked opportunity candidates, plus any temporarily protected
+symbols with open RSI positions.
+
+The current runtime list is the report's 50 candidates plus ABNB and CCK,
+which were open at promotion time and remain only until flat and terminal.
 
 ## Purpose
 
-Define stock-selection rules for the RSI mean-reversion strategy.
+The RSI watchlist is a stable opportunity pool for the active RSI3 reversion
+strategy. It is refreshed periodically from durable tradability, liquidity,
+data-quality, size, and financial-survival evidence.
 
-RSI Reversion should not watch every stock that becomes oversold. It should
-watch liquid, financially survivable names where a short-term sell-off is more
-likely to be temporary than terminal.
-
-This document defines the candidate universe. The strategy still controls entry
-and exit timing.
+The selector is forward-oriented: it asks which stocks look suitable to watch
+for future RSI3 setups. It cannot know future returns. Historical event studies
+and backtests are useful context, but they do not determine membership and are
+not promotion gates.
 
 ## Responsibility Split
 
 ```text
-Universe -> Watchlist Source -> RSI Watchlist -> raw RSI Signal -> RSI Edge Filter -> Risk -> Execution
+Tradable universe -> offline selector -> 50-name static pool
+                  -> RSI3 signal -> runtime edge filter -> risk -> execution
 ```
 
-- Watchlist source: selects symbols eligible for RSI mean reversion.
-- RSI strategy: detects oversold/overbought threshold crossings.
-- Edge filter: confirms or rejects raw RSI entries under current conditions.
-- Risk manager: sizes positions and enforces stops, exposure, and kill switches.
-
-The watchlist selector answers:
-
-> Which stocks are safe and useful enough to watch for mean-reversion setups?
-
-The RSI strategy answers:
-
-> Is there an actual oversold entry signal now?
-
-The RSI edge filter answers:
-
-> Is this raw RSI signal allowed to trade right now?
-
-Do not embed universe-selection logic inside `RSIReversion`.
-Do not embed MACD, EMA5/EMA10, or other entry-confirmation rules in scanner
-scripts. Those belong in an RSI edge filter when used as confirmation/vetoes,
-or in a clearly named RSI strategy variant if they redefine the signal timing.
-
-## Core Principle
-
-RSI Reversion is a liquidity-provision / contrarian strategy.
-
-It should buy temporary weakness in strong or stable names, not catch collapsing
-businesses.
-
-In plain English:
-
-> Buy the dip only when the company, liquidity, and market regime make a bounce
-> plausible.
-
-## Current Strategy
-
-Implemented strategy:
-
-- file: `strategies/rsi_reversion.py`
-- default RSI period: 14
-- default entry: RSI crosses below 30
-- default exit: RSI crosses above 70
-- order type: LIMIT
-- status: active in paper trading
-
-The watchlist rules below are independent of those signal parameters.
-
-## RSI Candidate Rule
-
-A symbol is eligible for the RSI reversion watchlist only if all hard filters
-pass.
-
-### 1. Tradability
-
-Required:
-
-- Alpaca active US equity
-- tradable through Alpaca
-- regular listed security, not OTC
-- at least 260 daily bars available
-
-Excluded:
-
-- leveraged ETFs
-- inverse ETFs
-- warrants, rights, units, and thin structured products
-- symbols with unreliable or incomplete daily data
-
-### 2. Size And Liquidity
-
-Required:
-
-- market capitalization >= 2,000,000,000
-- latest close >= 10.00
-- 20-day average share volume >= 1,000,000
-- 50-day average dollar volume >= 100,000,000
-
-Rationale:
-
-Mean-reversion entries often happen during fast sell-offs. The strategy must be
-able to place limit orders in names with enough depth to avoid poor fills and
-wide spreads.
-
-### 3. Financial Survival
-
-Required:
-
-- profitable, or cash runway >= 12 months
-
-Preferred but not mandatory:
-
-- annual free cash flow > 0
-- YoY revenue growth > 0
-
-Excluded:
-
-- known solvency crisis
-- unresolved bank-debt or refinancing crisis
-- pre-profit story stock with inadequate runway
-
-Rationale:
-
-RSI Reversion can tolerate weaker fundamentals than SMA because the setup is a
-temporary oversold bounce. It still cannot buy names where the sell-off may be
-the market pricing bankruptcy or permanent impairment.
-
-### 4. Runtime Market Gate
-
-Required before allowing new RSI entries:
-
-- active production RSI3 does not use a regime gate
-- active `RSIEdgeFilter` requires stock close > SMA200 and 20-day average dollar volume >= $10M
-
-Rationale:
-
-The 2026-08 reset deliberately stopped using broad-market gates as watchlist
-membership criteria. The runtime question is now whether RSI3 can trade enough
-while protected by stock-local trend, liquidity, ATR stops, sleeve limits, and
-global risk controls.
-
-### 5. Symbol Structure
-
-Required:
-
-- close > SMA200
-- close >= 0.60 * 52-week high
-- close >= 1.20 * 52-week low
-
-Preferred:
-
-- close > SMA50
-
-Rationale:
-
-RSI should buy pullbacks in structurally intact names. A stock below its 200-day
-average or far from its highs may be in a breakdown, not a dip.
-
-Unlike SMA, RSI does not require `SMA50 > SMA150 > SMA200`. That stack is too
-trend-following-heavy and would remove many useful pullback candidates.
-
-### 6. Mean-Reversion Character
-
-Required:
-
-- at least 3 RSI(3) oversold events in the last 252 trading days
-- at least 50% of those events reverted to RSI(3) >= 55 or close > SMA5 within 10 trading days
-- no more than 2 ATR-stop-style failures in the last 252 trading days
-
-Rationale:
-
-Not every stock mean-reverts well. Some trend smoothly and rarely become
-oversold; others fall and keep falling. The watchlist should prefer names that
-have historically snapped back after oversold readings.
-
-### 7. Volatility Window
-
-Required:
-
-- ATR14 / close >= 0.015
-- ATR14 / close <= 0.07
-- Bollinger Band width 20,2 >= 0.04
-
-Rationale:
-
-RSI needs enough movement to create profitable oversold setups, but not so much
-chaos that stops dominate. Bollinger Band width prevents selecting dead names
-with no meaningful reversion opportunity.
-
-### 8. Avoid News Shock And Crash Risk
-
-Reject if any of these are true:
-
-- one-day drop <= -12%
-- 5-day return <= -20%
-- earnings occurred today or will occur next trading day
-- obvious split/merger/corporate-action distortion in the recent bars
-
-Rationale:
-
-Short-term reversal can be overwhelmed by genuine new information. Large
-news-driven sell-offs are not the same as ordinary liquidity-driven pullbacks.
-
-If earnings-calendar data is unavailable, this rule should be logged as
-`not_checked`, not silently ignored.
-
-### 9. Sector And Correlation Hygiene
-
-Required:
-
-- no more than 3 symbols per sector in the final RSI watchlist
-- avoid selecting multiple highly correlated versions of the same trade
-- avoid overlap with SMA unless strategy ownership and capital sleeves are
-  explicit
-
-Rationale:
-
-Mean-reversion trades cluster during sell-offs. Sector concentration can cause
-many "independent" RSI entries to become one large correlated bet.
-
-## Ranking Survivors
-
-If more symbols pass than the target list size allows, rank survivors.
-
-Recommended ranking inputs:
-
-1. historical oversold reversion hit rate
-2. average 10-day return after RSI oversold events
-3. liquidity: 50-day dollar volume
-4. volatility quality: ATR% in the middle of the allowed range
-5. structural strength: close above SMA200 and distance from 52-week low
-6. solvency strength: profitable, positive FCF, positive revenue growth
-7. sector diversification
-
-Do not rank by deepest current RSI alone. Deeply oversold can mean "cheap", but
-it can also mean "broken".
-
-## Post-Analysis Promotion Layer
-
-The scanner creates candidates. It does not automatically promote every
-candidate into the active RSI watchlist.
-
-Before a symbol enters the static RSI pool, run post-analysis over the scanner
-survivors. Current implementation:
-
-- scanner: `scripts/rsi_watchlist_scan.py`
-- validator: `scripts/rsi_candidate_validate.py`
-- post-analysis ranker: `scripts/rsi_candidate_post_analysis.py`
-- report: `logs/rsi_candidate_post_analysis_latest.md`
-
-Initial promoted RSI pool:
-
-- ALLY
-- CDNS
-- CCK
-- SN
-- TFC
-
-Current post-analysis guardrails:
-
-- minimum oversold events: 5
-- minimum exact-strategy return: 20%
-- minimum profit factor: 1.20
-- maximum exact-strategy drawdown: -65%
-- minimum event hit rate: 35%
-- maximum ATR-stop-failure rate: 35%
-
-Rationale:
-
-A stock can pass the scanner because it often bounces after oversold readings,
-but still be a poor fit for the exact bot strategy if the exit rule produces
-large drawdowns or poor realized trade outcomes. Post-analysis is the promotion
-step that catches that difference.
-
-## Stop-Loss And Re-Entry Guardrail
-
-ATR stop-loss orders protect an individual RSI trade. They do not, by
-themselves, protect the strategy from repeatedly buying the same symbol while it
-keeps falling.
-
-Before RSI is activated in paper mode, add or verify a symbol-level re-entry
-guardrail after stop-outs:
-
-- if a symbol stops out, block new RSI entries in that symbol for a cooldown
-  window
-- require a fresh setup after cooldown rather than immediately rebuying the next
-  oversold print
-- track repeated stop-outs by symbol, not only by strategy
-- demote or disable a symbol after repeated RSI stop-outs during the paper
-  window
-
-Recommended first-version rule:
-
-- after one RSI stop-out: symbol cooldown for at least 10 trading days
-- after two RSI stop-outs in a rolling 60 trading-day window: disable the symbol
-  for RSI until the next watchlist refresh
-
-Rationale:
-
-Mean reversion can be correct often and still fail badly when a stock enters a
-real breakdown. The bot must avoid repeated stop-out and rebuy behavior.
-
-## What Stays Out Of The Core Rule
-
-These should not be hard first-version admission rules:
-
-- analyst ratings
-- social media sentiment
-- intraday order-flow imbalance
-- options implied volatility
-- news NLP
-- averaging down / martingale scaling
-
-Reason:
-
-They add data dependencies and operational complexity before the basic RSI
-watchlist has been proven in paper mode.
-
-## Static To Dynamic Migration
-
-Recommended rollout:
-
-1. Write this rulebook.
-2. Build `scripts/rsi_watchlist_scan.py` as report-only.
-3. Run the scanner against delayed SIP data with fundamentals enabled.
-4. Compare current `settings.RSI_WATCHLIST` against scanner output.
-5. Promote a static RSI list before the Phase 10 combined SMA + RSI paper run.
-6. Keep dynamic RSI scanning in report-only mode during that first paper window.
-7. Only later allow a dynamic watchlist source to drive RSI directly.
-
-The scanner must log:
-
-- rule version
-- data feed
-- data timestamp
-- base universe size
-- symbols removed by each hard filter
-- final candidate count
-- selected symbols
-- market-regime state
-- warnings for unavailable earnings or sector data
-
-## Dynamic Watchlist Guardrails
-
-Dynamic RSI watchlists must follow the same guardrails as other dynamic lists:
-
-- do not remove a symbol with an open position unless exit behavior is explicit
-- do not change the active watchlist mid-paper-run used for reconciliation
-- cache every generated list with timestamp and rule version
-- log rejection counts for every hard filter
-- run new selectors in report-only mode first
-- preserve strategy ownership across restarts
-
-Scanner membership is not position ownership.
-
-## Rule Version
-
-Current rule version: `rsi_watchlist_v1`
-
-Changing any hard threshold creates a new rule version.
-
-Examples:
-
-- changing minimum market cap from 10B to 5B
-- removing the `close > SMA200` requirement
-- changing ATR% bounds
-- changing the required historical oversold reversion hit rate
-- adding an earnings-calendar hard block
-
-## Sources
-
-- StockCharts ChartSchool, "RSI(2)": summarizes Larry Connors' RSI(2)
-  approach, including the 200-day SMA trend filter and deeply oversold RSI
-  entries. This supports using long-term trend context around RSI pullbacks.
-- Larry Connors and Cesar Alvarez, *Short Term Trading Strategies That Work*
-  (2008): practitioner source for RSI(2), buying pullbacks rather than
-  breakouts, and using trend filters. Use as strategy inspiration, not as a
-  complete production rulebook.
-- Avellaneda and Lee, "Statistical Arbitrage in the U.S. Equities Market"
-  (Quantitative Finance, 2010): mean-reversion/contrarian equity strategies are
-  modeled on residual/idiosyncratic returns; volume information improved
-  ETF-based signals in their tests. This supports liquidity and sector-aware
-  screening.
-- Liew and Roberts, "U.S. Equity Mean-Reversion Examined" (Risks, 2013):
-  describes mean reversion as liquidity provision after prices move away from
-  equilibrium, supporting the idea that RSI reversion should avoid structural
-  breakdowns and focus on tradable/liquid names.
-- Blitz, Huij, and Martens, "Residual Momentum" / residual reversal literature,
-  and "Short-term residual reversal" (Journal of Financial Markets, 2013):
-  short-term reversal effects can persist even in large-cap stocks after costs,
-  supporting a large-cap, liquid-universe approach.
-- StockCharts and Bollinger Band educational material: lower-band/RSI
-  combinations are commonly used to identify stretched short-term moves, but
-  trend context matters because price can "walk the band" in strong trends.
-- Existing project docs: `docs/RSI-edge-filter.md` requires market and symbol
-  trend gates, and `scripts/watchlist_review.py` already treats RSI FCF/revenue
-  as informational while enforcing solvency.
+- The selector chooses a broad pool of plausible future candidates.
+- `RSIReversion` decides whether RSI3 is below 15 and when a bounce exit occurs.
+- `RSIEdgeFilter` rechecks stock-above-SMA200 and live liquidity at decision
+  time. A name passing the periodic scan never bypasses those runtime gates.
+- `RiskManager` and `SleeveAllocator` size and constrain every actual entry.
+
+Selection should not reproduce the entire runtime gate stack or optimize the
+pool for historical backtest winners. The pool is deliberately broader than
+the set of names that could enter on any particular day.
+
+## Active Strategy Context
+
+The production configuration comes from `settings.RSI_REVERSION_PARAMS`:
+
+- RSI period: 3
+- entry: RSI3 below 15 while flat (`level_below`)
+- exit: close above SMA5 or RSI3 above 55
+- entry order: limit
+- runtime edge gates: close above SMA200 and 20-day average dollar volume at
+  least $10 million
+- protective stop: 2 x ATR14
+- risk target: 0.25% of account equity
+- hard maximum positions: 8
+
+The 50-name pool expands opportunity coverage; it does not increase the
+position limit or weaken any entry, sizing, stop, ownership, or account guard.
+
+## Scanner
+
+The authoritative report-only selector is:
+
+- `scripts/rsi_watchlist_scan.py`
+- default target: 50
+- delayed research feed: SIP
+- lookback: 420 calendar days
+
+### Eligibility and ordering
+
+The scanner requires only:
+
+- at least 260 clean daily bars;
+- active, tradable, stock-like Alpaca security;
+- close at least $10;
+- 50-day average dollar volume at least $50 million;
+- market capitalization at least $2 billion and affirmatively established
+  solvency when `--include-fundamentals` is used.
+
+Eligible companies are ordered by 50-day average dollar volume. This is an
+execution-quality priority, not a return forecast. To keep Yahoo lookups
+bounded after removing temporary technical gates, fundamentals are evaluated
+in that order until twice the requested pool size (or the pool size plus 25,
+whichever is larger) qualifies.
+
+Share volume, SMA200 state, 52-week position, current ATR, Bollinger width,
+one- and five-day returns, and historical RSI14 event outcomes remain visible
+for review. None can include, exclude, or rank a company. The active strategy
+itself remains RSI3, and current SMA200 and liquidity are enforced at runtime.
+
+Sector concentration is accepted as an output of the method. The scanner does
+not cap sectors or rerank candidates for diversification.
+
+Alphabet has one explicit share-class rule: `GOOGL` is never eligible, and an
+otherwise eligible `GOOG` is preserved in the selected 50 even if it falls
+below the normal dollar-liquidity cutoff.
+
+## Backtest Policy
+
+Backtests answer, "How would these names have behaved under specified
+historical assumptions?" They do not answer which names will work next.
+
+Accordingly:
+
+- backtest results are optional reference material;
+- historical return, Sharpe, or profit factor does not automatically include
+  or exclude a symbol;
+- a weak historical result may prompt manual investigation, not an automatic
+  veto;
+- a strong historical result is not sufficient promotion evidence;
+- the active paper cohort remains the authority for evaluating the strategy.
+
+The old static-universe builder, post-analysis ranker, hybrid comparison, and
+RSI14 portfolio reports are retained only for historical research. They are not
+part of this refresh procedure.
+
+## Refresh Procedure
+
+### 1. Run focused tests
+
+```bash
+/Users/franco/trading-bot/venv/bin/pytest \
+  tests/test_rsi_watchlist_scan.py \
+  tests/test_watchlist_review.py \
+  tests/test_strategies.py
+```
+
+### 2. Generate the candidate report
+
+```bash
+/Users/franco/trading-bot/venv/bin/python scripts/rsi_watchlist_scan.py \
+  --top 50 \
+  --feed sip \
+  --end-delay-minutes 60 \
+  --include-fundamentals \
+  --output docs/reports/rsi_watchlist_scan_latest.md
+```
+
+The command is report-only. It never edits `config/settings.py`.
+
+By default it reads the trade ledger and appends any open RSI position that is
+outside the ranked 50 as a clearly marked protected symbol. Protected symbols
+do not consume one of the 50 opportunity slots. `--ignore-open-positions`
+exists for research diagnostics only and must not be used for promotion.
+
+### 3. Review the proposed pool
+
+Review:
+
+1. all 50 names are ordinary stocks and operationally tradable;
+2. fundamentals were actually enforced and failures are visible;
+3. recent metrics are not distorted by a split, merger, stale bars, or other
+   corporate action;
+4. sector concentration is accepted as the method's output and has not been
+   manually reranked;
+5. `GOOGL` is absent and eligible `GOOG` is preserved;
+6. current watchlist names that disappear have a documented reason;
+7. every ledger-confirmed open RSI position remains protected in the runtime
+   list, and unresolved RSI orders are checked separately before promotion;
+8. no single historical backtest metric is being treated as a forecast.
+
+Backtests may be run here as supporting context, but they cannot decide the
+promotion outcome.
+
+For an expansion, preserve established members unless there is a separate,
+documented removal reason. Fill the new slots from the highest-priority acceptable
+nonmembers after corporate-action and data-integrity review. Do not replace most of the pool
+merely because one refresh reordered dollar-liquidity priority.
+
+### 4. Recheck risk-target coverage
+
+For the proposed runtime list, fetch current delayed-SIP daily bars, calculate
+latest ATR14/close, and report the minimum, p10, median, and p90. Confirm how
+many names would be clipped below the 0.25% risk target by sleeve or notional
+caps. See `allocator_risk_target_reconciliation.md` section 9.
+
+Ordinary cap clipping is safe because it reduces risk. Repeated clipping across
+many names indicates that the watchlist's calm end moved and the target should
+be reviewed separately; a watchlist refresh does not silently change the risk
+target.
+
+### 5. Promote with explicit approval
+
+After operator approval:
+
+- update `RSI_WATCHLIST` in `config/settings.py`;
+- retain protected open-position symbols until they are flat and terminal;
+- update this document, `rsi_reversion_strategy.md`, `strategies.md`, and
+  `PLAN.md` if their operational statements change;
+- run the focused tests and the full unit suite;
+- commit code, tests, reports, and documentation together;
+- recycle the paper bot only with `./recycle_bot.sh`;
+- verify startup ownership, stop protection, and the 50-name RSI slot count.
+
+## Evidence Cohorts
+
+The strategy configuration hash includes the watchlist. A promoted refresh
+therefore begins a new RSI paper-evidence cohort automatically. Pre-refresh and
+post-refresh results remain available but must not be pooled as if membership
+were unchanged.
+
+## Cadence
+
+Review quarterly, or sooner after a material market-structure change, sustained
+candidate starvation, repeated symbol-specific failures, corporate actions, or
+tradability changes. Stability matters: do not rotate the list merely because
+another name briefly has higher dollar volume.
+
+## Historical Documents
+
+- `static-rsi-watchlist-selection.md`: obsolete RSI14/backtest-first procedure.
+- `dynamic-rsi-watchlist.md`: obsolete future dynamic-runtime design.
+- `reports/rsi_static_universe_latest.md`: historical May 2026 RSI14 research.
+- `reports/rsi_static_backtest_report_latest.md`: historical May 2026 RSI14
+  research.
+- `reports/rsi_portfolio_backtest_latest.md`: historical May 2026 simplified
+  RSI14 research.
+- `reports/rsi_hybrid_comparison.md`: historical May 2026 hybrid research.
+- `reports/rsi_watchlist_scan_v2_20260909.md`: superseded v2 scan retained for
+  audit history; it must not be used for promotion.

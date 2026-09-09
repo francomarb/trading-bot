@@ -1,5 +1,10 @@
 #!/usr/bin/env python3
 """
+Historical RSI candidate post-analysis.
+
+OBSOLETE FOR WATCHLIST PROMOTION: backtest outcomes are reference-only under
+docs/rsi-watchlist-selection.md.
+
 Post-process RSI validation winners into a promotion ranking.
 
 The RSI scanner answers: "Which large, liquid stocks have the right setup
@@ -162,7 +167,7 @@ def render_report(
         f"# RSI Candidate Post-Analysis - {generated}",
         "",
         f"- Rule version: `{RULE_VERSION}`",
-        f"- Source scanner rule: `rsi_watchlist_v1`",
+        f"- Source scanner rule: `rsi_watchlist_v3_durable_company_pool`",
         f"- Source validation rule: `rsi_validation_v1`",
         f"- Candidates: {', '.join(candidates)}",
         f"- Controls: {', '.join(controls)}",

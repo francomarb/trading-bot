@@ -1,6 +1,10 @@
 #!/usr/bin/env python3
 """
-Combined-portfolio RSI basket backtest.
+Historical combined-portfolio RSI basket backtest.
+
+This simplified model is reference-only and does not determine membership in
+the forward-oriented 50-candidate pool documented in
+docs/rsi-watchlist-selection.md.
 
 This script differs from the existing RSI research reports:
 

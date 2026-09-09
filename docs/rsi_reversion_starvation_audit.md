@@ -142,9 +142,10 @@ Top symbols by `RSI_FILTER_BLOCKED` evaluation count:
 
 ## Documentation And Parity Notes
 
-- `docs/rsi_reversion_strategy.md` and `docs/strategies.md` previously still
-  said the RSI watchlist had 29 names. The current `RSI_WATCHLIST` has 30 names
-  after NFLX was added.
+- At the time of this audit, `docs/rsi_reversion_strategy.md` and
+  `docs/strategies.md` still said the watchlist had 29 names while the runtime
+  snapshot had 30 after NFLX was added. Treat those counts as historical; the
+  live composition remains `config/settings.py`.
 - Some June research reports reference sector `score <= -2` in backtest
   harnesses. The prior live RSI14 wiring used `score_threshold=-3`, which was
   less restrictive and intentionally mean-reversion-specific. The active RSI3

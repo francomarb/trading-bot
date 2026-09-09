@@ -90,7 +90,12 @@ This is a historical sizing snapshot from 2026-07-13, before NFLX was added to
 Reproduce: fetch each watchlist symbol's daily SIP bars, `add_atr(d, 14)`,
 take `atr_14/close` of the latest bar (see §9).
 
-## 5. Per-position caps in force today
+## 5. Per-position caps at the 2026-07-13 calibration
+
+This table is historical. The RSI target allocation later moved to 15% of
+deployable gross capital, making its current baseline per-position cap 4.8% of
+account equity (5.52% while stretch is available). Current coverage belongs in
+each watchlist refresh report rather than this snapshot.
 
 | Strategy | Sleeve budget (of equity) | Concentration cap | Effective per-pos cap |
 |---|---|---|---|
@@ -104,7 +109,7 @@ take `atr_14/close` of the latest bar (see §9).
 |---|---|---|---|---|---|
 | donchian_breakout | **0.40%** | 2.5% — full watchlist | none (AAPL 2.6% is the floor) | 3.2% | median-ATR position ≈ 2.4% notional × 8 ≈ 19% ≈ the 20% budget |
 | sma_crossover | **0.60%** | 3.0% — all but GSAT | GSAT | 4.8% | median-ATR position ≈ 4.2% × 8 ≈ 34% ≈ the 32% budget |
-| rsi_reversion | **0.25%** | 2.0% — all but KBE | KBE | 2.0% | median-ATR position ≈ 4.2% notional; budget supports ~4 concurrent, then waterfall priority applies as designed |
+| rsi_reversion | **0.25%** | 2.0% at the then-current cap — all but KBE | KBE | 2.0% | Historical calibration; recompute against the current allocation and watchlist before using this coverage claim. |
 
 Notes:
 

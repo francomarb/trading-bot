@@ -4,7 +4,9 @@ from __future__ import annotations
 
 import pytest
 
+from config import settings
 from data.watchlists import StaticWatchlistSource, WatchlistSource
+from scripts.post_mortem import SECTOR_MAP
 from strategies.base import StrategySlot
 
 
@@ -70,6 +72,16 @@ class TestStaticWatchlistSource:
     def test_name_is_stripped(self):
         src = StaticWatchlistSource(["AAPL"], name=" sma ")
         assert src.name == "sma"
+
+
+class TestRSIWatchlistPromotion:
+    def test_uses_only_preferred_alphabet_share_class(self):
+        assert "GOOG" in settings.RSI_WATCHLIST
+        assert "GOOGL" not in settings.RSI_WATCHLIST
+
+    def test_symbols_are_unique_and_have_post_mortem_sector_mapping(self):
+        assert len(settings.RSI_WATCHLIST) == len(set(settings.RSI_WATCHLIST))
+        assert set(settings.RSI_WATCHLIST) <= set(SECTOR_MAP)
 
 
 # ── StrategySlot with watchlist_source ──────────────────────────────────────

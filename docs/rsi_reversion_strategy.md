@@ -2,7 +2,7 @@
 
 **Status:** Active in paper trading.
 
-**Last updated:** 2026-08-21
+**Last updated:** 2026-09-09
 
 ## Thesis
 
@@ -28,10 +28,16 @@ Configured in `forward_test.py`:
 | Regime gate | None (`allowed_regimes=None`) |
 | Edge filter | `RSIEdgeFilter()` |
 | Watchlist | `settings.RSI_WATCHLIST` |
-| Sleeve target | 20% of deployable equity pool |
+| Sleeve target | 15% of deployable gross capital |
 | Hard max positions | 8 |
 | Risk per trade | 0.25% of equity |
 | Protective stop | `entry - 2 * ATR(14)` |
+
+The active `RSI_WATCHLIST` contains the 50-name v3 durable-company opportunity
+pool promoted on 2026-09-09, plus ABNB and CCK temporarily retained for open
+RSI position management. The additional evaluated symbols do not change the
+eight-position ceiling or any runtime gate. See
+[`rsi-watchlist-selection.md`](rsi-watchlist-selection.md).
 
 `RSIReversion` keeps backward-compatible defaults (`period=14`, cross-below-30 entry, cross-above-70 exit) for generic tests and research scripts. Production opts into the RSI3 quick-exit behavior through explicit parameters.
 

@@ -33,17 +33,31 @@ SECTOR_MAP = {
     "CLS": "XLK", "BE": "XLK", "MTZ": "XLK", "TIGO": "XLK", "SN": "XLK", "CDNS": "XLK",
     "TSM": "XLK", "LSCC": "XLK", "LRCX": "XLK", "NOK": "XLK", "FLEX": "XLK",
     "SANM": "XLK", "COHU": "XLK", "PANW": "XLK", "CRDO": "XLK", "LITE": "XLK",
-    "CRWD": "XLK", "NET": "XLK",
+    "CRWD": "XLK", "NET": "XLK", "SNDK": "XLK", "AAPL": "XLK",
+    "MSFT": "XLK", "AMD": "XLK", "INTC": "XLK", "AVGO": "XLK",
+    "PLTR": "XLK", "MRVL": "XLK", "NBIS": "XLK", "ORCL": "XLK",
+    "AMAT": "XLK", "STX": "XLK", "ASML": "XLK", "CRM": "XLK",
+    "NOW": "XLK", "CRWV": "XLK", "KLAC": "XLK", "APP": "XLK",
+    "CSCO": "XLK", "IBM": "XLK", "QCOM": "XLK", "GLW": "XLK",
+    "TXN": "XLK",
     # Financials
-    "ALLY": "XLF", "TFC": "XLF",
+    "ALLY": "XLF", "TFC": "XLF", "V": "XLF", "JPM": "XLF",
+    "HOOD": "XLF", "GS": "XLF", "BAC": "XLF",
+    # Communication services
+    "META": "XLC", "GOOG": "XLC", "NFLX": "XLC",
     # Consumer discretionary
-    "LULU": "XLY",
+    "LULU": "XLY", "TSLA": "XLY", "AMZN": "XLY", "ABNB": "XLY",
+    # Consumer staples
+    "WMT": "XLP", "COST": "XLP",
+    # Healthcare
+    "LLY": "XLV", "MRNA": "XLV", "UNH": "XLV",
     # Materials
     "CCK": "XLB", "AA": "XLB",
     # Industrials
-    "ATI": "XLI", "PWR": "XLI",
+    "ATI": "XLI", "PWR": "XLI", "BE": "XLI", "GEV": "XLI",
+    "CAT": "XLI",
     # Energy / utilities
-    "VIST": "XLE", "VST": "XLU",
+    "VIST": "XLE", "VST": "XLU", "XOM": "XLE",
     # Diversified ETF; SPY is the appropriate broad-market comparison.
     "SPCX": "SPY",
 }

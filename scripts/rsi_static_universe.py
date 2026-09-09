@@ -1,6 +1,11 @@
 #!/usr/bin/env python3
 """
-Build a static RSI universe optimized for long-run profitability and trade density.
+Historical RSI static-universe research tool.
+
+OBSOLETE FOR WATCHLIST PROMOTION: the active procedure is the forward-oriented
+50-candidate scan in docs/rsi-watchlist-selection.md. This script may still be
+used for historical reference, but its backtest ranking must not determine
+runtime watchlist membership.
 
 This script is intentionally separate from `scripts/rsi_watchlist_scan.py`.
 The dynamic scanner answers: "Which names look attractive *right now*?"

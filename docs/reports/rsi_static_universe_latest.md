@@ -1,5 +1,8 @@
 # RSI Static Universe Builder - 2026-05-01T11:53:33+00:00
 
+> Historical RSI14/backtest-first research. This report is not part of the
+> active 2026-09-09 forward-oriented 50-candidate refresh procedure.
+
 - Rule version: `rsi_static_universe_v2`
 - Alpaca feed: `sip`
 - Recent prefilter window: 2025-03-07 to 2026-05-01

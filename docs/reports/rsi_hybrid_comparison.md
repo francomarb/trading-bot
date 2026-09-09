@@ -1,5 +1,8 @@
 # RSI Hybrid Comparison - 2026-05-01
 
+> Historical RSI14 hybrid research. This report is reference material and is
+> not part of the active 50-candidate refresh procedure.
+
 - Purpose: compare the new static RSI basket against hybrid variants that swap in the strongest names from the current promoted `RSI_WATCHLIST`
 - Source static report: `docs/reports/rsi_static_universe_latest.md`
 - Current promoted watchlist source: `config/settings.py`

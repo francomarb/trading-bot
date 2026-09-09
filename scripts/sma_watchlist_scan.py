@@ -42,6 +42,9 @@ from alpaca.trading.client import TradingClient
 from alpaca.trading.enums import AssetClass, AssetStatus
 from alpaca.trading.requests import GetAssetsRequest
 from loguru import logger
+from requests.exceptions import ChunkedEncodingError
+from requests.exceptions import ConnectionError as RequestsConnectionError
+from requests.exceptions import Timeout as RequestsTimeout
 
 ROOT = Path(__file__).resolve().parents[1]
 if str(ROOT) not in sys.path:
@@ -396,7 +399,13 @@ def _call_with_retry(fn, op_desc: str, max_attempts: int = 5):
                 delay *= 2
                 continue
             raise
-        except (ConnectionError, TimeoutError) as exc:
+        except (
+            ConnectionError,
+            TimeoutError,
+            ChunkedEncodingError,
+            RequestsConnectionError,
+            RequestsTimeout,
+        ) as exc:
             last_exc = exc
             logger.warning(
                 f"{op_desc} attempt {attempt}/{max_attempts} network error; "

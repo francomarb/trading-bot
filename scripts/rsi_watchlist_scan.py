@@ -2,8 +2,8 @@
 """
 RSI watchlist scanner.
 
-Builds a ranked list of RSI mean-reversion candidates using the documented
-`rsi_watchlist_v1` rules in docs/rsi-watchlist-selection.md.
+Builds a ranked 50-name RSI mean-reversion opportunity pool using the
+forward-oriented rules in docs/rsi-watchlist-selection.md.
 
 Data sources:
   - Alpaca Trading API: active/tradable US equity universe
@@ -12,7 +12,7 @@ Data sources:
 
 Usage:
     python scripts/rsi_watchlist_scan.py
-    python scripts/rsi_watchlist_scan.py --top 30 --include-fundamentals
+    python scripts/rsi_watchlist_scan.py --top 50 --include-fundamentals
     python scripts/rsi_watchlist_scan.py --feed sip --end-delay-minutes 60
     python scripts/rsi_watchlist_scan.py --explain-symbols AAPL MSFT NVDA
 
@@ -36,6 +36,7 @@ ROOT = Path(__file__).resolve().parents[1]
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
+from config import settings
 from indicators.technicals import add_atr, add_rsi, add_sma
 from scripts.sma_watchlist_scan import (
     AssetInfo,
@@ -47,39 +48,28 @@ from scripts.sma_watchlist_scan import (
 from scripts.watchlist_review import RSI_PROFILE, assess_fitness, fetch_fundamentals
 
 
-RULE_VERSION = "rsi_watchlist_v1"
+RULE_VERSION = "rsi_watchlist_v3_durable_company_pool"
+DEFAULT_POOL_SIZE = 50
+EXCLUDED_SHARE_CLASSES: dict[str, str] = {"GOOGL": "GOOG"}
+ALWAYS_PRESERVE_SYMBOLS: frozenset[str] = frozenset(
+    EXCLUDED_SHARE_CLASSES.values()
+)
 
 
 @dataclass(frozen=True)
 class ScanConfig:
-    """Thresholds for the RSI watchlist scanner."""
+    """Durable company-eligibility thresholds for the RSI watchlist."""
 
     min_bars: int = 260
     min_market_cap: float = 2_000_000_000.0
     min_price: float = 10.0
-    # Share-volume was too strict for large-cap, high-price names such as MA,
-    # MCD, and SPG. Lowering it keeps the universe liquid without excluding
-    # slower-turnover blue chips that still provide valid RSI opportunities.
-    min_avg_volume_20: float = 500_000.0
     min_avg_dollar_volume_50: float = 50_000_000.0
-    min_pct_of_52w_high: float = 0.60
-    min_above_52w_low: float = 1.20
-    min_atr_pct: float = 0.015
-    max_atr_pct: float = 0.07
-    min_bb_width_pct: float = 0.04
-    # For a broader static RSI universe, requiring only 2-3 oversold events
-    # and a modest hit rate is more realistic than demanding a tiny set of
-    # near-perfect names.
-    min_oversold_events: int = 2
-    min_reversion_hit_rate: float = 0.35
-    max_stop_failures: int = 4
+    # These parameters define reference-only historical characterization.
+    # They never include, exclude, or rank a company.
     reversion_window_days: int = 10
     oversold_threshold: float = 30.0
     reversion_threshold: float = 50.0
     atr_stop_multiplier: float = 2.0
-    max_one_day_drop: float = -0.12
-    max_five_day_return: float = -0.20
-    max_per_sector: int = 3
 
 
 @dataclass
@@ -98,6 +88,7 @@ class Candidate:
     sma200: float
     rsi14: float
     atr_pct: float
+    median_atr_pct_252: float
     bb_width_pct: float
     high_52w: float
     low_52w: float
@@ -107,28 +98,82 @@ class Candidate:
     stop_failures: int
     one_day_return: float
     five_day_return: float
-    score: float
     notes: list[str] = field(default_factory=list)
 
 
+def _candidate_from_metric(
+    symbol: str,
+    metric: dict[str, float | int],
+    asset: AssetInfo,
+    *,
+    market_cap: float | None,
+    notes: list[str] | None = None,
+) -> Candidate:
+    """Build a report candidate from computed, non-decision metrics."""
+    return Candidate(
+        symbol=symbol,
+        name=asset.name,
+        exchange=asset.exchange,
+        sector=asset.sector,
+        close=float(metric["close"]),
+        avg_volume_20=float(metric["avg_volume_20"]),
+        avg_dollar_volume_50=float(metric["avg_dollar_volume_50"]),
+        market_cap=market_cap,
+        sma50=float(metric["sma50"]),
+        sma200=float(metric["sma200"]),
+        rsi14=float(metric["rsi14"]),
+        atr_pct=float(metric["atr_pct"]),
+        median_atr_pct_252=float(metric["median_atr_pct_252"]),
+        bb_width_pct=float(metric["bb_width_pct"]),
+        high_52w=float(metric["high_52w"]),
+        low_52w=float(metric["low_52w"]),
+        oversold_events=int(metric["oversold_events"]),
+        reversion_hit_rate=float(metric["reversion_hit_rate"]),
+        avg_reversion_return_10d=float(metric["avg_reversion_return_10d"]),
+        stop_failures=int(metric["stop_failures"]),
+        one_day_return=float(metric["one_day_return"]),
+        five_day_return=float(metric["five_day_return"]),
+        notes=list(notes or []),
+    )
+
+
+def get_open_rsi_positions(db_path: str) -> set[str]:
+    """Return symbols currently owned by RSI according to the trade ledger."""
+    if not Path(db_path).exists():
+        return set()
+    try:
+        from reporting.logger import TradeLogger
+
+        trade_logger = TradeLogger(path=db_path)
+        try:
+            owners = trade_logger.read_all_open_owners()
+        finally:
+            trade_logger.close()
+        return {
+            symbol.upper()
+            for symbol, strategy in owners.items()
+            if strategy == "rsi_reversion"
+        }
+    except Exception as exc:
+        from loguru import logger
+
+        logger.warning(f"could not read open RSI positions from {db_path}: {exc}")
+        return set()
+
+
 REJECTION_LABELS: dict[str, str] = {
-    "insufficient_or_bad_bars": "Not enough clean daily bars for 200-day structure and 1-year RSI event checks.",
+    "insufficient_or_bad_bars": (
+        "Not enough clean daily bars for durable review and reference metrics."
+    ),
     "price": "Latest close is below the minimum price threshold.",
-    "share_volume": "20-day average share volume is below the liquidity threshold.",
     "dollar_volume": "50-day average dollar volume is below the liquidity threshold.",
     "market_cap": "Market capitalization is below the RSI minimum size threshold.",
-    "solvency": "RSI solvency check failed or fundamental data was unavailable.",
-    "below_sma200": "Price is below SMA200, so the stock may be structurally broken.",
-    "too_far_from_high": "Price is too far below the 52-week high.",
-    "too_close_to_low": "Price is not far enough above the 52-week low.",
-    "atr_too_low": "ATR14 / close is too low; the name may be too quiet for RSI reversion.",
-    "atr_too_high": "ATR14 / close is too high; the name may be too chaotic for RSI reversion.",
-    "bb_width": "Bollinger Band width is too narrow; not enough volatility for meaningful reversion.",
-    "oversold_events": "Too few RSI oversold events in the last year.",
-    "reversion_hit_rate": "Historical oversold events did not revert often enough.",
-    "stop_failures": "Too many historical oversold events breached an ATR-style stop.",
-    "one_day_drop": "One-day drop is too large; likely news/crash risk.",
-    "five_day_drop": "Five-day return is too negative; likely crash/breakdown risk.",
+    "solvency": (
+        "Solvency was not affirmatively established or the fundamentals request failed."
+    ),
+    "nonpreferred_share_class": (
+        "Excluded by share-class policy; use GOOG for Alphabet exposure, never GOOGL."
+    ),
 }
 
 
@@ -140,16 +185,27 @@ def scan_candidates(
     include_fundamentals: bool,
     top: int,
     explain_symbols: set[str] | None = None,
+    protected_symbols: set[str] | None = None,
 ) -> tuple[list[Candidate], Counter[str], dict[str, list[str]], dict[str, str]]:
-    """Apply RSI v1 rules and return ranked candidates plus rejection details."""
+    """Apply RSI pool rules and return ranked candidates plus protected holdings."""
     asset_by_symbol = {a.symbol: a for a in assets}
     rejections: Counter[str] = Counter()
     examples: dict[str, list[str]] = defaultdict(list)
     explanations: dict[str, str] = {}
     explain_symbols = explain_symbols or set()
+    protected_symbols = {symbol.upper() for symbol in (protected_symbols or set())}
     ranked: list[Candidate] = []
+    prequalified: list[tuple[str, dict[str, float | int]]] = []
 
     for symbol, df in bars_by_symbol.items():
+        if symbol in EXCLUDED_SHARE_CLASSES:
+            _reject(symbol, "nonpreferred_share_class", rejections, examples)
+            if symbol in explain_symbols:
+                explanations[symbol] = (
+                    "Rejected: nonpreferred_share_class; use "
+                    f"{EXCLUDED_SHARE_CLASSES[symbol]}."
+                )
+            continue
         metric = _compute_metrics(df, config)
         if metric is None:
             _reject(symbol, "insufficient_or_bad_bars", rejections, examples)
@@ -157,16 +213,35 @@ def scan_candidates(
                 explanations[symbol] = "Rejected: insufficient_or_bad_bars"
             continue
 
-        market_cap: float | None = None
         reason = _first_rejection(metric, config)
         if reason is not None:
             _reject(symbol, reason, rejections, examples)
             if symbol in explain_symbols:
                 explanations[symbol] = _format_explanation(
-                    reason, metric, config, market_cap=market_cap
+                    reason, metric, config, market_cap=None
                 )
             continue
+        prequalified.append((symbol, metric))
 
+    # Dollar liquidity is the only automatic ordering input. It is relatively
+    # durable, directly relevant to execution, and does not encode realized RSI
+    # outcomes. Fundamentals are reviewed in that order to avoid thousands of
+    # slow, rate-limited Yahoo requests after removing temporary technical gates.
+    prequalified.sort(
+        key=lambda item: float(item[1]["avg_dollar_volume_50"]),
+        reverse=True,
+    )
+    review_goal = max(top * 2, top + 25)
+    for symbol, metric in prequalified:
+        if (
+            include_fundamentals
+            and len(ranked) >= review_goal
+            and symbol not in explain_symbols
+            and symbol not in ALWAYS_PRESERVE_SYMBOLS
+        ):
+            continue
+
+        market_cap: float | None = None
         if include_fundamentals:
             fundamentals = fetch_fundamentals(symbol)
             market_cap = fundamentals.market_cap
@@ -178,7 +253,7 @@ def scan_candidates(
                     )
                 continue
             fitness = assess_fitness(fundamentals, RSI_PROFILE)
-            if fitness.solvency_ok is False or fitness.error:
+            if fitness.solvency_ok is not True or fitness.error:
                 _reject(symbol, "solvency", rejections, examples)
                 if symbol in explain_symbols:
                     explanations[symbol] = _format_explanation(
@@ -187,31 +262,12 @@ def scan_candidates(
                 continue
 
         asset = asset_by_symbol.get(symbol, AssetInfo(symbol, symbol, "UNKNOWN"))
-        score = _score_candidate(metric, config)
         ranked.append(
-            Candidate(
-                symbol=symbol,
-                name=asset.name,
-                exchange=asset.exchange,
-                sector=asset.sector,
-                close=float(metric["close"]),
-                avg_volume_20=float(metric["avg_volume_20"]),
-                avg_dollar_volume_50=float(metric["avg_dollar_volume_50"]),
+            _candidate_from_metric(
+                symbol,
+                metric,
+                asset,
                 market_cap=market_cap,
-                sma50=float(metric["sma50"]),
-                sma200=float(metric["sma200"]),
-                rsi14=float(metric["rsi14"]),
-                atr_pct=float(metric["atr_pct"]),
-                bb_width_pct=float(metric["bb_width_pct"]),
-                high_52w=float(metric["high_52w"]),
-                low_52w=float(metric["low_52w"]),
-                oversold_events=int(metric["oversold_events"]),
-                reversion_hit_rate=float(metric["reversion_hit_rate"]),
-                avg_reversion_return_10d=float(metric["avg_reversion_return_10d"]),
-                stop_failures=int(metric["stop_failures"]),
-                one_day_return=float(metric["one_day_return"]),
-                five_day_return=float(metric["five_day_return"]),
-                score=score,
             )
         )
         if symbol in explain_symbols:
@@ -219,8 +275,58 @@ def scan_candidates(
                 "PASS", metric, config, market_cap=market_cap
             )
 
-    ranked.sort(key=lambda c: c.score, reverse=True)
-    ranked = _apply_sector_cap(ranked, config.max_per_sector, top)
+    # Preserve liquidity ordering, with explicit share-class preferences as
+    # the only deterministic override.
+    ranked.sort(key=lambda c: c.avg_dollar_volume_50, reverse=True)
+    ranked = _select_pool(ranked, top)
+
+    # A static watchlist is also the engine's signal-exit evaluation universe.
+    # Retain any currently held RSI name even when it fails this refresh or
+    # falls below the top-N cutoff; otherwise only its broker stop would remain
+    # active and the strategy would stop evaluating its normal quick exit.
+    selected_symbols = {candidate.symbol for candidate in ranked}
+    for symbol in sorted(protected_symbols - selected_symbols):
+        metric = _compute_metrics(bars_by_symbol.get(symbol, pd.DataFrame()), config)
+        asset = asset_by_symbol.get(symbol, AssetInfo(symbol, symbol, "UNKNOWN"))
+        if metric is None:
+            nan = float("nan")
+            ranked.append(
+                Candidate(
+                    symbol=symbol,
+                    name=asset.name,
+                    exchange=asset.exchange,
+                    sector=asset.sector,
+                    close=nan,
+                    avg_volume_20=nan,
+                    avg_dollar_volume_50=nan,
+                    market_cap=None,
+                    sma50=nan,
+                    sma200=nan,
+                    rsi14=nan,
+                    atr_pct=nan,
+                    median_atr_pct_252=nan,
+                    bb_width_pct=nan,
+                    high_52w=nan,
+                    low_52w=nan,
+                    oversold_events=0,
+                    reversion_hit_rate=nan,
+                    avg_reversion_return_10d=nan,
+                    stop_failures=0,
+                    one_day_return=nan,
+                    five_day_return=nan,
+                    notes=["PROTECTED: open RSI position; metrics unavailable"],
+                )
+            )
+            continue
+        ranked.append(
+            _candidate_from_metric(
+                symbol,
+                metric,
+                asset,
+                market_cap=None,
+                notes=["PROTECTED: open RSI position; outside refreshed top pool"],
+            )
+        )
     for symbol in explain_symbols - set(explanations):
         explanations[symbol] = "No bars returned from Alpaca."
     return ranked, rejections, examples, explanations
@@ -271,6 +377,9 @@ def _compute_metrics(
         "low_52w": float(work["low"].tail(252).min()),
         "rsi14": float(last["rsi_14"]),
         "atr_pct": float(last["atr_14"] / close),
+        "median_atr_pct_252": float(
+            (work["atr_14"] / work["close"]).tail(252).median()
+        ),
         "bb_width_pct": float(last["bb_width_pct_20_2"]),
         "oversold_events": int(reversion["events"]),
         "reversion_hit_rate": float(reversion["hit_rate"]),
@@ -365,86 +474,32 @@ def _first_rejection(
     close = float(metric["close"])
     if close < config.min_price:
         return "price"
-    if float(metric["avg_volume_20"]) < config.min_avg_volume_20:
-        return "share_volume"
     if float(metric["avg_dollar_volume_50"]) < config.min_avg_dollar_volume_50:
         return "dollar_volume"
-    if close <= float(metric["sma200"]):
-        return "below_sma200"
-    if close < config.min_pct_of_52w_high * float(metric["high_52w"]):
-        return "too_far_from_high"
-    if close < config.min_above_52w_low * float(metric["low_52w"]):
-        return "too_close_to_low"
-    atr_pct = float(metric["atr_pct"])
-    if atr_pct < config.min_atr_pct:
-        return "atr_too_low"
-    if atr_pct > config.max_atr_pct:
-        return "atr_too_high"
-    if float(metric["bb_width_pct"]) < config.min_bb_width_pct:
-        return "bb_width"
-    if int(metric["oversold_events"]) < config.min_oversold_events:
-        return "oversold_events"
-    if float(metric["reversion_hit_rate"]) < config.min_reversion_hit_rate:
-        return "reversion_hit_rate"
-    if int(metric["stop_failures"]) > config.max_stop_failures:
-        return "stop_failures"
-    if float(metric["one_day_return"]) <= config.max_one_day_drop:
-        return "one_day_drop"
-    if float(metric["five_day_return"]) <= config.max_five_day_return:
-        return "five_day_drop"
     return None
 
 
-def _score_candidate(metric: dict[str, float | int], config: ScanConfig) -> float:
-    """Composite rank score for already-qualified RSI candidates."""
-    hit_rate_score = float(metric["reversion_hit_rate"]) * 100.0
-    avg_return_score = max(
-        0.0, min((float(metric["avg_reversion_return_10d"]) + 0.05) / 0.15, 1.0)
-    ) * 100.0
-    dollar_volume = float(metric["avg_dollar_volume_50"])
-    liquidity_score = min(math.log10(max(dollar_volume, 1.0)) / 10.0, 1.0) * 100.0
-    atr_pct = float(metric["atr_pct"])
-    atr_mid = (config.min_atr_pct + config.max_atr_pct) / 2.0
-    atr_range = (config.max_atr_pct - config.min_atr_pct) / 2.0
-    atr_quality = max(0.0, 1.0 - abs(atr_pct - atr_mid) / atr_range) * 100.0
-    low_distance = float(metric["close"]) / float(metric["low_52w"]) - 1.0
-    structure_score = max(0.0, min(low_distance / 1.0, 1.0)) * 100.0
-    stop_penalty = int(metric["stop_failures"]) * 8.0
-    event_bonus = min(int(metric["oversold_events"]), 8) * 2.0
-
-    return (
-        hit_rate_score * 0.35
-        + avg_return_score * 0.20
-        + liquidity_score * 0.15
-        + atr_quality * 0.15
-        + structure_score * 0.15
-        + event_bonus
-        - stop_penalty
-    )
-
-
-def _apply_sector_cap(
-    candidates: list[Candidate],
-    max_per_sector: int,
-    top: int,
-) -> list[Candidate]:
-    """Apply best-effort sector cap when sector metadata exists."""
-    counts: Counter[str] = Counter()
-    selected: list[Candidate] = []
-    overflow: list[Candidate] = []
-    for candidate in candidates:
-        sector = candidate.sector or "UNKNOWN"
-        if sector == "UNKNOWN" or counts[sector] < max_per_sector:
-            selected.append(candidate)
-            counts[sector] += 1
-        else:
-            candidate.notes.append(f"sector cap overflow: {sector}")
-            overflow.append(candidate)
-        if len(selected) >= top:
-            break
-    if len(selected) < top:
-        selected.extend(overflow[: top - len(selected)])
-    return selected[:top]
+def _select_pool(candidates: list[Candidate], top: int) -> list[Candidate]:
+    """Select the liquidity leaders while enforcing share-class preferences."""
+    if top <= 0:
+        return []
+    selected = candidates[:top]
+    selected_symbols = {candidate.symbol for candidate in selected}
+    for symbol in ALWAYS_PRESERVE_SYMBOLS:
+        if symbol in selected_symbols:
+            continue
+        preferred = next(
+            (candidate for candidate in candidates if candidate.symbol == symbol),
+            None,
+        )
+        if preferred is None:
+            continue
+        preferred.notes.append("PREFERRED SHARE CLASS: retain GOOG, never GOOGL")
+        displaced = selected[-1]
+        selected[-1] = preferred
+        selected_symbols.discard(displaced.symbol)
+        selected_symbols.add(symbol)
+    return selected
 
 
 def _reject(
@@ -486,11 +541,24 @@ def _format_explanation(
         f"Vol20={float(metric['avg_volume_20']):,.0f}; "
         f"$Vol50={_fmt_dollars(float(metric['avg_dollar_volume_50']))}. "
         f"Thresholds: MarketCap>={_fmt_dollars(config.min_market_cap)}, "
-        f"price>={config.min_price:.2f}, Vol20>={config.min_avg_volume_20:,.0f}, "
+        f"price>={config.min_price:.2f}, "
         f"$Vol50>={_fmt_dollars(config.min_avg_dollar_volume_50)}, "
-        f"ATR%={config.min_atr_pct * 100:.1f}-{config.max_atr_pct * 100:.1f}, "
-        f"hit_rate>={config.min_reversion_hit_rate * 100:.0f}%."
+        "solvency=affirmatively established. Other metrics are reference-only."
     )
+
+
+def _is_protected(candidate: Candidate) -> bool:
+    """Return whether a candidate is present only to manage an open position."""
+    return any(note.startswith("PROTECTED:") for note in candidate.notes)
+
+
+def _nearest_rank(values: list[float], percentile: float) -> float:
+    """Return a deterministic nearest-rank percentile for a small report set."""
+    ordered = sorted(values)
+    if not ordered:
+        return float("nan")
+    index = round((len(ordered) - 1) * percentile)
+    return ordered[index]
 
 
 def render_report(
@@ -503,6 +571,7 @@ def render_report(
     assets_seen: int,
     bars_seen: int,
     include_fundamentals: bool,
+    target_size: int,
     start: datetime,
     end: datetime,
 ) -> str:
@@ -518,43 +587,151 @@ def render_report(
         f"- Tradable assets considered: {assets_seen}",
         f"- Assets with bars: {bars_seen}",
         f"- Fundamentals enforced: {include_fundamentals}",
-        f"- Candidates selected: {len(candidates)}",
+        f"- Target opportunity-pool size: {target_size}",
+        f"- Ranked candidates selected: {sum(not _is_protected(c) for c in candidates)}",
+        f"- Protected open-position additions: {sum(_is_protected(c) for c in candidates)}",
         "",
         "## Rule Rationale",
         "",
-        "- Liquidity and market-cap filters keep RSI in names that can absorb limit orders.",
-        "- Solvency keeps RSI from buying companies where a sell-off may be terminal.",
-        "- Price above SMA200 keeps entries in structurally intact names.",
-        "- 52-week position avoids deep breakdowns while allowing deep pullbacks (down to 40% off highs) required for mean-reversion.",
-        "- Historical oversold-event behavior measures whether the stock actually mean-reverts.",
-        "- ATR and Bollinger width require enough movement for opportunity without chaos.",
-        "- One-day and five-day crash filters avoid news shocks and falling knives.",
+        "- Price, dollar liquidity, market cap, and affirmative solvency are the only company eligibility gates.",
+        "- Dollar liquidity orders eligible companies because it is durable and directly relevant to execution quality.",
+        "- Sector concentration is accepted; no sector cap or diversification reranking is applied.",
+        "- Alphabet share-class policy is explicit: preserve eligible GOOG and never select GOOGL.",
+        "- SMA200, 52-week location, volatility, recent returns, and historical RSI outcomes are reference-only columns.",
+        "- The active RSI3 strategy and its runtime gates decide whether an eligible company can actually enter.",
         "",
         "## Top Candidates",
         "",
     ]
-    if not candidates:
+    regular = [candidate for candidate in candidates if not _is_protected(candidate)]
+    protected = [candidate for candidate in candidates if _is_protected(candidate)]
+    if not regular:
         lines.append("No candidates passed all enabled filters.")
     else:
         lines.extend(
             [
-                "| Rank | Symbol | Score | Close | RSI | Hit % | Events | Avg10d | ATR % | BB Width | $Vol50 | Stops |",
-                "|---:|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|",
+                "| Rank | Symbol | Mkt Cap | Close | RSI14 | Hit % | Events | Avg10d | ATR % | Median ATR % | BB Width | $Vol50 | Stops |",
+                "|---:|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|",
             ]
         )
-        for rank, candidate in enumerate(candidates, start=1):
+        for rank, candidate in enumerate(regular, start=1):
+            market_cap = (
+                _fmt_dollars(candidate.market_cap)
+                if candidate.market_cap is not None
+                else "N/A"
+            )
             lines.append(
                 "| "
-                f"{rank} | {candidate.symbol} | {candidate.score:.1f} | "
-                f"{candidate.close:.2f} | {candidate.rsi14:.1f} | "
+                f"{rank} | {candidate.symbol} | {market_cap} | "
+                f"{candidate.close:.2f} | "
+                f"{candidate.rsi14:.1f} | "
                 f"{candidate.reversion_hit_rate * 100:.1f}% | "
                 f"{candidate.oversold_events} | "
                 f"{candidate.avg_reversion_return_10d * 100:.1f}% | "
                 f"{candidate.atr_pct * 100:.1f}% | "
+                f"{candidate.median_atr_pct_252 * 100:.1f}% | "
                 f"{candidate.bb_width_pct * 100:.1f}% | "
                 f"{_fmt_dollars(candidate.avg_dollar_volume_50)} | "
                 f"{candidate.stop_failures} |"
             )
+
+    if protected:
+        lines.extend(
+            [
+                "",
+                "## Protected Open RSI Positions",
+                "",
+                "These symbols are retained outside the 50-name opportunity pool until "
+                "their RSI positions are flat, so normal strategy exits remain active.",
+                "",
+                "| Symbol | Note |",
+                "|---|---|",
+            ]
+        )
+        for candidate in protected:
+            lines.append(f"| {candidate.symbol} | {'; '.join(candidate.notes)} |")
+
+    current_symbols = list(settings.RSI_WATCHLIST)
+    current_set = set(current_symbols)
+    overlap = [candidate.symbol for candidate in regular if candidate.symbol in current_set]
+    additions_needed = max(target_size - len(current_symbols), 0)
+    expansion_additions = [
+        candidate.symbol for candidate in regular if candidate.symbol not in current_set
+    ][:additions_needed]
+    lines.extend(
+        [
+            "",
+            "## Expansion-Only Review",
+            "",
+            f"- Current active pool: {len(current_symbols)} symbols",
+            f"- Current symbols also in the refreshed top {target_size}: "
+            f"{len(overlap)} ({', '.join(overlap) if overlap else 'none'})",
+            f"- Additions needed to reach {target_size} without one-scan removals: "
+            f"{additions_needed}",
+            f"- Highest-ranked nonmembers for review: "
+            f"{', '.join(expansion_additions) if expansion_additions else 'none'}",
+            "- This is a stability-first review list, not an automatic promotion. "
+            "Operator approval remains required.",
+        ]
+    )
+
+    atr_candidates = [
+        candidate
+        for candidate in regular
+        if math.isfinite(candidate.atr_pct) and candidate.atr_pct > 0
+    ]
+    protected_atr_candidates = [
+        candidate
+        for candidate in protected
+        if math.isfinite(candidate.atr_pct) and candidate.atr_pct > 0
+    ]
+    atr_values = [candidate.atr_pct for candidate in atr_candidates]
+    allocation = settings.STRATEGY_ALLOCATIONS["rsi_reversion"]
+    baseline_position_cap = (
+        settings.MAX_GROSS_EXPOSURE_PCT
+        * float(allocation["target_pct"])
+        * float(allocation["max_position_pct_of_sleeve"])
+    )
+    risk_target = float(allocation["risk_per_trade_pct"])
+    atr_binding_threshold = risk_target / (2.0 * baseline_position_cap)
+    clipped = [
+        candidate.symbol
+        for candidate in atr_candidates
+        if candidate.atr_pct < atr_binding_threshold
+    ]
+    lines.extend(["", "## Risk-Target Coverage", ""])
+    if atr_values:
+        lines.extend(
+            [
+                f"- Ranked symbols measured: {len(atr_values)}",
+                f"- ATR14/close: min={min(atr_values):.2%}, "
+                f"p10={_nearest_rank(atr_values, 0.10):.2%}, "
+                f"median={_nearest_rank(atr_values, 0.50):.2%}, "
+                f"p90={_nearest_rank(atr_values, 0.90):.2%}",
+                f"- Baseline per-position cap: {baseline_position_cap:.2%} of equity",
+                f"- RSI risk target: {risk_target:.2%} of equity",
+                f"- Risk sizing binds at ATR14/close >= {atr_binding_threshold:.2%}; "
+                f"{len(clipped)} symbol(s) are conservatively cap-clipped: "
+                f"{', '.join(clipped) if clipped else 'none'}",
+                "- This is a coverage check, not a reason to change the risk target automatically.",
+            ]
+        )
+        protected_clipped = [
+            candidate.symbol
+            for candidate in protected_atr_candidates
+            if candidate.atr_pct < atr_binding_threshold
+        ]
+        if protected_atr_candidates:
+            lines.insert(
+                len(lines) - 1,
+                "- Protected open-position coverage is reported separately: "
+                f"{len(protected_atr_candidates)} measured; "
+                f"{len(protected_clipped)} conservatively cap-clipped"
+                + (f" ({', '.join(protected_clipped)})" if protected_clipped else "")
+                + ".",
+            )
+    else:
+        lines.append("ATR coverage unavailable because no candidate had valid metrics.")
 
     lines.extend(["", "## Rejections", ""])
     if not rejections:
@@ -579,9 +756,12 @@ def render_report(
             "",
             "- This script is report-only and does not change the active bot watchlist.",
             "- Earnings-calendar blocking is not implemented yet; treat as `not_checked`.",
-            "- Sector caps are best-effort because Alpaca asset metadata does not include sector.",
-            "- Fundamentals are checked only after technical filters pass; requested-symbol "
-            "explanations can show `MarketCap=N/A` when a symbol failed earlier.",
+            "- Sector concentration is accepted by design; the scanner does not cap or rerank sectors.",
+            "- GOOGL is always excluded; eligible GOOG is preserved in the selected pool.",
+            "- Fundamentals are checked in dollar-liquidity order until a 2x candidate "
+            "review buffer qualifies; this avoids rate-limited full-universe lookups.",
+            "- Fundamental rejection counts cover that reviewed buffer, not every "
+            "operationally eligible symbol.",
             "- If fundamentals are disabled, market cap and solvency are not enforced.",
             "- With `feed=sip`, Basic Alpaca accounts require the request end time to be "
             "outside the latest 15-minute restricted window.",
@@ -595,7 +775,12 @@ def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description="Scan Alpaca assets for RSI mean-reversion watchlist candidates.",
     )
-    parser.add_argument("--top", type=int, default=30, help="Number of candidates to show.")
+    parser.add_argument(
+        "--top",
+        type=int,
+        default=DEFAULT_POOL_SIZE,
+        help="Number of ranked opportunity-pool candidates to show.",
+    )
     parser.add_argument(
         "--lookback-days",
         type=int,
@@ -647,6 +832,17 @@ def parse_args() -> argparse.Namespace:
         metavar="SYM",
         help="Include pass/fail details for specific symbols in the markdown report.",
     )
+    parser.add_argument(
+        "--ignore-open-positions",
+        action="store_true",
+        help="Do not append currently held RSI symbols as protected members.",
+    )
+    parser.add_argument(
+        "--trade-db",
+        type=str,
+        default=settings.TRADE_LOG_DB,
+        help="Trade-log database used to find currently held RSI symbols.",
+    )
     parser.add_argument("--verbose", action="store_true", help="Enable debug logging.")
     return parser.parse_args()
 
@@ -681,6 +877,11 @@ def main() -> None:
     logger.info(f"assets with daily bars: {len(bars)}")
 
     explain_symbols = {sym.upper() for sym in args.explain_symbols}
+    protected_symbols = (
+        set()
+        if args.ignore_open_positions
+        else get_open_rsi_positions(args.trade_db)
+    )
     candidates, rejections, examples, explanations = scan_candidates(
         assets,
         bars,
@@ -688,6 +889,7 @@ def main() -> None:
         include_fundamentals=args.include_fundamentals,
         top=args.top,
         explain_symbols=explain_symbols,
+        protected_symbols=protected_symbols,
     )
 
     report = render_report(
@@ -699,6 +901,7 @@ def main() -> None:
         assets_seen=len(assets),
         bars_seen=len(bars),
         include_fundamentals=args.include_fundamentals,
+        target_size=args.top,
         start=start,
         end=end,
     )

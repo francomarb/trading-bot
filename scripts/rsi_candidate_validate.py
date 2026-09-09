@@ -2,9 +2,11 @@
 """
 Validate RSI watchlist candidates against rejected controls.
 
-This script is a report-only companion to scripts/rsi_watchlist_scan.py. It
-pulls daily Alpaca bars, summarizes historical RSI oversold events, and runs
-the bot's exact RSIReversion strategy through the vectorbt backtester.
+This optional report pulls daily Alpaca bars, summarizes historical RSI
+oversold events, and runs the configured RSI signal through the vectorbt
+backtester. It is reference material and does not determine watchlist
+membership. It does not reproduce every production filter, sizing, and
+execution behavior.
 
 Example:
     python scripts/rsi_candidate_validate.py
@@ -265,7 +267,7 @@ def render_report(
         f"# RSI Candidate Validation - {generated}",
         "",
         f"- Rule version: `{RULE_VERSION}`",
-        f"- Source scanner rule: `rsi_watchlist_v1`",
+        f"- Source scanner rule: `rsi_watchlist_v3_durable_company_pool`",
         f"- Candidates: {', '.join(candidates)}",
         f"- Controls: {', '.join(controls)}",
         f"- Alpaca feed: `{feed}`",
@@ -337,8 +339,9 @@ def render_report(
             "",
             "## Reading This",
             "",
-            "- Event Hit % asks whether RSI recovered to 50 within 10 trading days after an oversold cross.",
-            "- Strategy Return is the exact bot RSI strategy: enter on RSI cross below 30, exit on RSI cross above 70, filled next open with costs.",
+            "- Event Hit % asks whether the configured RSI recovered to the event threshold within 10 trading days after an oversold event.",
+            "- Strategy Return uses the RSI parameters printed in this report and next-open fills with the stated costs.",
+            "- This historical validation is reference material; it does not determine current watchlist membership.",
             "- Buy/Hold is included as a baseline, not as the strategy benchmark.",
             "- Earnings-date overlay is not implemented yet; treat event rows near earnings as requiring manual review.",
             "- A good validation result should beat rejected controls on event quality, drawdown behavior, or exact strategy results.",

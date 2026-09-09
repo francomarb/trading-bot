@@ -24,6 +24,10 @@ This is a snapshot reference comparing the active strategies under backtest sett
 | ATR stops in backtest | NO — vectorbt does not model the engine's `ATR_STOP_MULTIPLIER=2.0` stop legs |
 | Aggregation | Equally weighted across each strategy's universe |
 
+> The RSI14 rows and promoted-basket methodology below are historical research.
+> They do not describe the active RSI3 selection procedure and do not determine
+> current watchlist membership. See `rsi-watchlist-selection.md`.
+
 ## Results
 
 | Strategy | Universe (kind) | Symbols traded / total | Sharpe | MeanRet | MeanDD | Trades | WinRate |

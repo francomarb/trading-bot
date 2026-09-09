@@ -2,9 +2,10 @@
 """
 Formal RSI backtest report for promoted and comparison symbols.
 
-This is a review artifact for Phase 10 RSI activation. It runs the exact
-RSIReversion strategy through the project backtester, saves equity/drawdown
-charts, and renders a compact markdown report.
+This is optional historical reference material. It runs the configured RSI
+signal through the project backtester, saves equity/drawdown charts, and
+renders a compact markdown report. It does not determine watchlist membership
+or reproduce every production filter, sizing, and execution behavior.
 """
 
 from __future__ import annotations
