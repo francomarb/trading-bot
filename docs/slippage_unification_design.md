@@ -919,6 +919,7 @@ Show, at minimum:
 - `Benchmark Kind`
 - `Quality`
 - `Measurement Note`
+- `P&L` for genuine close rows
 
 `Measurement Note` is an operator-readable interpretation of the persisted
 benchmark provenance. It must not equate `unavailable` with quote staleness:
@@ -926,6 +927,12 @@ option exits, fractional-residual cleanup, recovery/external rows, passive
 spread legs, and genuinely missing benchmarks all share that state. Where the
 exact cause is not persisted, the note must say so rather than infer a quote
 failure.
+
+`P&L` renders the trade log's persisted `realized_pnl`; it is not reconstructed
+by the dashboard. This includes single-leg sell closes and the credit-spread
+short-leg buy-to-close row that owns the spread's net economics. Ordinary entry
+buys, fractional-residual cleanup sells, and close rows without durable realized
+accounting remain unavailable.
 
 Optional:
 
