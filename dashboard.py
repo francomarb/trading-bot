@@ -761,6 +761,29 @@ def slippage_measurement_note(row: pd.Series) -> str:
     return f"Measured vs {kind} benchmark"
 
 
+def recent_trade_realized_pnl(row: pd.Series) -> float | None:
+    """Return persisted realized P&L for a genuine close row.
+
+    Single-leg closes are sells. Credit-spread economics ride the short-leg
+    row, which is a buy-to-close, so side alone cannot identify every close.
+    Fractional-residual cleanup remains hidden because the whole-share stop
+    row is the operator-facing lifecycle result. The trade log remains the
+    source of truth; the dashboard never reconstructs P&L from prices.
+    """
+    side_value = row.get("side")
+    type_value = row.get("position_type")
+    reason_value = row.get("reason")
+    side = "" if pd.isna(side_value) else str(side_value).strip().lower()
+    position_type = "" if pd.isna(type_value) else str(type_value).strip().lower()
+    reason = "" if pd.isna(reason_value) else str(reason_value).strip().lower()
+    is_close_side = side == "sell" or (
+        side == "buy" and position_type == "spread"
+    )
+    if not is_close_side or reason == "fractional residual cleanup":
+        return None
+    return _as_float(row.get("realized_pnl"))
+
+
 def _stop_gap_dollars(frame: pd.DataFrame) -> float:
     """Total dollars lost past the stop trigger for one strategy's rows.
 
@@ -2548,9 +2571,12 @@ def render_dashboard() -> None:
         recent_rows["Measurement Note"] = recent_rows.apply(
             slippage_measurement_note, axis=1
         )
+        recent_rows["P&L"] = recent_rows.apply(
+            recent_trade_realized_pnl, axis=1
+        )
         display_cols = [
             "timestamp", "symbol", "side", "qty", "avg_fill_price",
-            "strategy", "reason",
+            "P&L", "strategy", "reason",
             "slippage_signed_bps",
             "slippage_benchmark_kind",
             "slippage_measurement_quality",
@@ -2563,6 +2589,10 @@ def render_dashboard() -> None:
         if "avg_fill_price" in recent.columns:
             recent["avg_fill_price"] = recent["avg_fill_price"].map(
                 lambda x: f"${x:,.2f}" if pd.notna(x) else "—"
+            )
+        if "P&L" in recent.columns:
+            recent["P&L"] = recent["P&L"].map(
+                lambda x: f"${x:+,.2f}" if pd.notna(x) else "—"
             )
         if "slippage_signed_bps" in recent.columns:
             recent["slippage_signed_bps"] = recent["slippage_signed_bps"].map(

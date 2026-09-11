@@ -32,6 +32,7 @@ from dashboard import (
     multi_leg_display_rows,
     regime_gate_allows,
     realized_trade_events,
+    recent_trade_realized_pnl,
     refresh_multi_leg_positions,
     resolve_account_metrics,
     slippage_measurement_note,
@@ -197,6 +198,63 @@ class TestSlippageMeasurementNote:
         assert slippage_measurement_note(pd.Series({})) == (
             "Not measured: legacy row has no benchmark provenance"
         )
+
+
+class TestRecentTradeRealizedPnl:
+    def test_sell_uses_persisted_realized_pnl(self):
+        row = pd.Series({
+            "side": "sell",
+            "reason": "signal exit",
+            "realized_pnl": "125.75",
+        })
+        assert recent_trade_realized_pnl(row) == pytest.approx(125.75)
+
+    def test_losing_sell_preserves_negative_value(self):
+        row = pd.Series({
+            "side": "sell",
+            "reason": "stop triggered",
+            "realized_pnl": "-48.20",
+        })
+        assert recent_trade_realized_pnl(row) == pytest.approx(-48.20)
+
+    def test_single_leg_entry_buy_has_no_realized_pnl_display(self):
+        row = pd.Series({
+            "side": "buy",
+            "position_type": "single_leg",
+            "reason": "entry",
+            "realized_pnl": "99.00",
+        })
+        assert recent_trade_realized_pnl(row) is None
+
+    def test_spread_short_leg_buy_to_close_displays_pnl(self):
+        row = pd.Series({
+            "side": "buy",
+            "position_type": "spread",
+            "reason": "spread exit",
+            "realized_pnl": "245.50",
+        })
+        assert recent_trade_realized_pnl(row) == pytest.approx(245.50)
+
+    def test_null_metadata_stays_unavailable(self):
+        row = pd.Series({
+            "side": pd.NA,
+            "position_type": pd.NA,
+            "reason": pd.NA,
+            "realized_pnl": "12.00",
+        })
+        assert recent_trade_realized_pnl(row) is None
+
+    def test_fractional_residual_cleanup_sell_is_excluded(self):
+        row = pd.Series({
+            "side": "sell",
+            "reason": "fractional residual cleanup",
+            "realized_pnl": "-3.74",
+        })
+        assert recent_trade_realized_pnl(row) is None
+
+    def test_sell_without_durable_pnl_stays_unavailable(self):
+        row = pd.Series({"side": "sell", "reason": "external close"})
+        assert recent_trade_realized_pnl(row) is None
 
 
 class TestRegimeGateAllows:
