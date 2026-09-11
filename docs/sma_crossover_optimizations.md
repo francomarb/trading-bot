@@ -280,10 +280,12 @@ The older giveback harness below is intentionally unfiltered and unit-share, so
 it is not the decision tool for entry or initial-stop changes. The new
 production-mirror, fixed-risk, split-sample comparison lives in
 [`sma_entry_quality_audit.md`](sma_entry_quality_audit.md). Its fixed run does
-not support either a wider SMA50-aware stop or a five-session pullback entry.
-The audit is closed with current behavior retained. Do not tune additional
-thresholds against that run; reopen only on contradictory paper evidence or a
-materially different pre-registered proposal.
+not support either a wider SMA50-aware stop or a five-session pullback entry;
+review hardening also restored the originally named 2×ATR-over-SMA50 extension
+cap, which failed the retention and paired-CI gates. The audit is closed with
+current behavior retained. Watchlist composition remains the separate
+highest-leverage research area below. Do not tune more thresholds against this
+run.
 
 ### 1. Watchlist composition — HIGHEST LEVERAGE
 
