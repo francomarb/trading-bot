@@ -274,6 +274,19 @@ the universe materially changes or someone proposes a new exit variant.
 
 ## Optimization opportunities (ranked by leverage)
 
+### Closed entry-quality audit (`11.70`)
+
+The older giveback harness below is intentionally unfiltered and unit-share, so
+it is not the decision tool for entry or initial-stop changes. The new
+production-mirror, fixed-risk, split-sample comparison lives in
+[`sma_entry_quality_audit.md`](sma_entry_quality_audit.md). Its fixed run does
+not support either a wider SMA50-aware stop or a five-session pullback entry;
+review hardening also restored the originally named 2×ATR-over-SMA50 extension
+cap, which failed the retention and paired-CI gates. The audit is closed with
+current behavior retained. Watchlist composition remains the separate
+highest-leverage research area below. Do not tune more thresholds against this
+run.
+
 ### 1. Watchlist composition — HIGHEST LEVERAGE
 
 Profit concentration analysis: **60% of lifetime profit comes from 5 of

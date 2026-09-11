@@ -5,6 +5,13 @@ since project inception. The original MVP trend-follower for this project.
 
 **Last updated:** 2026-06-06
 
+> **Entry-quality audit (PLAN `11.70`, closed 2026-09-11):** the
+> production-mirror control, wider structure-aware stop, five-session pullback,
+> and fixed extension cap completed a fixed SIP development/held-out
+> comparison. No alternative passed the retention, stability, drawdown, and
+> paired-CI decision rule, so current paper behavior is retained. See
+> [`sma_entry_quality_audit.md`](sma_entry_quality_audit.md).
+
 ---
 
 ## Why this strategy
