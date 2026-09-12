@@ -133,7 +133,7 @@ def main() -> int:
             )
             daily_bars, _ = fetch_symbol(
                 symbol,
-                signal_at - timedelta(days=60),
+                signal_at - timedelta(days=contract.warmup_calendar_days),
                 as_of + timedelta(days=1),
                 timeframe="1Day",
                 adjustment="all",

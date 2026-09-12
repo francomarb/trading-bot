@@ -54,10 +54,11 @@ Current strategy-owned feature groups are:
 | Credit Spread | underlying trend/IV state, configured delta/DTE/credit constraints, selected spread economics and rank components |
 
 RSI feature schema v2 also stores the RSI period. Its candidate context freezes
-the entry order and the broker's actual TIF, ATR-stop multiplier, exit rule, and
-modeled market-exit slippage. A configuration hash distinguishes epochs but
-cannot be reversed into these values, so future replay never borrows whatever
-configuration happens to be active when the resolver is run.
+the entry order, the broker's actual TIF, the stop anchor and ATR multiplier,
+the exit rule, and modeled market-exit slippage. A configuration hash
+distinguishes epochs but cannot be reversed into these values, so future replay
+never borrows whatever configuration happens to be active when the resolver is
+run.
 
 The engine captures only values already computed by the real path. Observation
 must not add quote calls, chain requests, or timing changes. Consequently, a
@@ -99,14 +100,19 @@ candidate's recorded feed after the observation time. RSI equity limits are
 GTC in the running bot, so an untouched order remains eligible on later
 completed daily sessions until Alpaca's 90-day GTC expiry. A legacy candidate's
 exact TIF is recovered from the selected peer's durable entry-order row; it is
-never guessed. After a fill, the resolver applies the recorded ATR stop and the
-production RSI exit rule on completed daily bars; signal exits use the next
+never guessed. The replay contract explicitly records that ordinary RSI GTC
+OTO stops currently remain anchored to the entry reference; this matches the
+selected trades rather than assuming the fill-anchoring used by other equity
+entry variants. After a fill, the resolver applies that recorded ATR stop and
+the production RSI exit rule on completed daily bars; signal exits use the next
 session open and the recorded market-slippage model. Same-bar entry/stop
 ordering is marked `needs_review`, not guessed. A live GTC order remains
 `awaiting_fill`; a filled candidate with no exit stays `open`. Both can be
-refreshed later. Old schema-v1 candidates recover their missing configuration
-by parsing literal settings from their immutable stored bot commit; historical
-Python is never executed and current settings are never substituted.
+refreshed later. The indicator warm-up is derived from the frozen RSI/SMA
+windows rather than a fixed date span. Old schema-v1 candidates recover their
+missing configuration by parsing literal settings from their immutable stored
+bot commit; historical Python is never executed and current settings are never
+substituted.
 
 The command only updates `entry_candidate_shadow_outcomes`. It never changes a
 decision, lifecycle, allocator state, or bot behavior. Once ranking is accepted,

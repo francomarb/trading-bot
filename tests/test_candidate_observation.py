@@ -276,6 +276,7 @@ class TestStrategyCandidateFeatures:
         assert contract["period"] == 3
         assert contract["entry_order_type"] == "limit"
         assert "entry_time_in_force" not in contract
+        assert contract["stop_anchor"] == "reference"
         assert contract["atr_stop_multiplier"] > 0
         assert contract["exit_order_type"] == "market"
 

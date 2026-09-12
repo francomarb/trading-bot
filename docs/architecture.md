@@ -439,7 +439,9 @@ candidate was selected and another hit a capacity gate enqueue a disposable
 counterfactual outcome row. RSI candidates freeze a replay contract through
 `candidate_replay_contract()`, enriched with the broker's actual entry TIF, and
 can be resolved offline from post-observation minute bars plus completed daily
-bars. Other strategies require their own
+bars. The contract also versions the effective stop anchor so a future
+production change cannot rewrite historical counterfactuals. Other strategies
+require their own
 instrument-correct resolver. Ranking remains disabled; see
 [`entry_candidate_observation.md`](entry_candidate_observation.md).
 

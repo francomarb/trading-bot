@@ -193,6 +193,10 @@ class RSIReversion(BaseStrategy):
             "exit_sma_window": self.exit_sma_window,
             "quick_exit_rsi": self.quick_exit_rsi,
             "entry_order_type": self.preferred_order_type.value,
+            # Ordinary whole-share GTC LIMIT + OTO entries retain the stop
+            # submitted from the signal reference. Capped/fractional paths
+            # differ, but RSI currently reaches this ordinary broker path.
+            "stop_anchor": "reference",
             "atr_stop_multiplier": settings.ATR_STOP_MULTIPLIER,
             "exit_order_type": "market",
             "modeled_exit_slippage_bps": settings.SLIPPAGE_MODEL_MARKET_BPS,

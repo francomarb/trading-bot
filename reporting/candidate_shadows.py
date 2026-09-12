@@ -44,6 +44,7 @@ class RSIReplayContract:
     quick_exit_rsi: float | None
     entry_order_type: str
     entry_time_in_force: str
+    stop_anchor: str
     atr_stop_multiplier: float
     exit_order_type: str
     modeled_exit_slippage_bps: float
@@ -70,6 +71,7 @@ class RSIReplayContract:
             ),
             entry_order_type=str(value["entry_order_type"]),
             entry_time_in_force=str(value["entry_time_in_force"]),
+            stop_anchor=str(value["stop_anchor"]),
             atr_stop_multiplier=float(value["atr_stop_multiplier"]),
             exit_order_type=str(value["exit_order_type"]),
             modeled_exit_slippage_bps=float(
@@ -93,6 +95,8 @@ class RSIReplayContract:
             raise ValueError("RSI shadow replay requires a DAY or GTC LIMIT entry")
         if self.exit_order_type != "market":
             raise ValueError("RSI shadow replay requires MARKET signal exits")
+        if self.stop_anchor not in {"reference", "fill"}:
+            raise ValueError("RSI shadow replay requires a known stop anchor")
         if (
             not math.isfinite(self.atr_stop_multiplier)
             or not math.isfinite(self.modeled_exit_slippage_bps)
@@ -109,6 +113,12 @@ class RSIReplayContract:
             exit_sma_window=self.exit_sma_window,
             quick_exit_rsi=self.quick_exit_rsi,
         )
+
+    @property
+    def warmup_calendar_days(self) -> int:
+        """Conservative calendar span for the frozen indicator lookback."""
+        required_bars = max(self.period + 1, self.exit_sma_window or 0)
+        return max(30, required_bars * 2 + 14)
 
 
 @dataclass(frozen=True)
@@ -195,6 +205,9 @@ def historical_contract_from_settings_source(
             **params,
             "entry_order_type": "limit",
             "entry_time_in_force": entry_time_in_force,
+            # Legacy/current ordinary RSI GTC OTO stops were submitted from
+            # the reference and were not rebuilt after a gap-down fill.
+            "stop_anchor": "reference",
             "atr_stop_multiplier": values["ATR_STOP_MULTIPLIER"],
             "exit_order_type": "market",
             "modeled_exit_slippage_bps": values[
@@ -327,11 +340,21 @@ def resolve_rsi_shadow(
     as_of = as_of.astimezone(timezone.utc)
     limit_price = float(candidate["reference_price"])
     atr = float(candidate["atr"])
-    stop = limit_price - contract.atr_stop_multiplier * atr
-    if not all(math.isfinite(value) for value in (limit_price, atr, stop)):
+    if not all(math.isfinite(value) for value in (limit_price, atr)):
         raise ValueError("candidate reference/ATR must be finite")
-    if limit_price <= 0 or atr <= 0 or stop <= 0:
-        raise ValueError("candidate reference/ATR does not produce a valid stop")
+    if limit_price <= 0 or atr <= 0:
+        raise ValueError("candidate reference/ATR must be positive")
+
+    def stop_for_entry(entry_price: float) -> float:
+        anchor = limit_price if contract.stop_anchor == "reference" else entry_price
+        value = anchor - contract.atr_stop_multiplier * atr
+        if (
+            not math.isfinite(value)
+            or value <= 0
+            or (contract.stop_anchor == "fill" and value >= entry_price)
+        ):
+            raise ValueError("candidate replay contract does not produce a valid stop")
+        return value
 
     daily = _bars(daily_bars, name="daily")
     local_dates = pd.Index(daily.index.tz_convert(_NY).date)
@@ -360,7 +383,7 @@ def resolve_rsi_shadow(
         "contract": asdict(contract),
         "as_of": as_of.isoformat(),
         "entry_limit_price": limit_price,
-        "stop_price": stop,
+        "stop_anchor": contract.stop_anchor,
         "entry_timing_basis": (
             "first complete 1-minute bar after observation; "
             "later completed daily bars for GTC"
@@ -371,6 +394,7 @@ def resolve_rsi_shadow(
         fill_at = touched.index[0]
         fill_bar = touched.iloc[0]
         entry = min(float(fill_bar["open"]), limit_price)
+        stop = stop_for_entry(entry)
         post_fill = usable[usable.index >= fill_at]
         high = max(entry, float(fill_bar["high"]))
         low = min(entry, float(fill_bar["low"]))
@@ -380,6 +404,7 @@ def resolve_rsi_shadow(
                 "entry_at": fill_at.isoformat(),
                 "fill_resolution": "1_minute",
                 "excursion_precision": "one_minute_bounds",
+                "stop_price": stop,
             }
         )
         if float(fill_bar["low"]) <= stop:
@@ -479,6 +504,7 @@ def resolve_rsi_shadow(
         fill_bar = later_touches.iloc[0]
         session_date = fill_bar["_session_date"]
         entry = min(float(fill_bar["open"]), limit_price)
+        stop = stop_for_entry(entry)
         high = entry
         low = entry
         base_meta.update(
@@ -488,6 +514,7 @@ def resolve_rsi_shadow(
                 "fill_resolution": "daily",
                 "excursion_precision": "fill_session_excluded",
                 "gtc_expires_at": expires_at.isoformat(),
+                "stop_price": stop,
             }
         )
         if float(fill_bar["low"]) <= stop:

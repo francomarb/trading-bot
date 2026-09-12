@@ -21,7 +21,9 @@ from reporting.candidate_shadows import (
 OBSERVED = datetime(2026, 9, 9, 13, 43, 21, tzinfo=timezone.utc)
 
 
-def _contract(*, time_in_force: str = "day") -> RSIReplayContract:
+def _contract(
+    *, time_in_force: str = "day", stop_anchor: str = "reference"
+) -> RSIReplayContract:
     return RSIReplayContract.from_mapping(
         {
             "contract_version": 1,
@@ -35,6 +37,7 @@ def _contract(*, time_in_force: str = "day") -> RSIReplayContract:
             "quick_exit_rsi": 55.0,
             "entry_order_type": "limit",
             "entry_time_in_force": time_in_force,
+            "stop_anchor": stop_anchor,
             "atr_stop_multiplier": 2.0,
             "exit_order_type": "market",
             "modeled_exit_slippage_bps": 5.0,
@@ -123,8 +126,18 @@ ATR_STOP_MULTIPLIER = 2.5
 
         assert contract.period == 4
         assert contract.entry_time_in_force == "gtc"
+        assert contract.stop_anchor == "reference"
         assert contract.atr_stop_multiplier == 2.5
         assert contract.modeled_exit_slippage_bps == 7.0
+
+    def test_warmup_is_derived_from_frozen_indicator_settings(self) -> None:
+        short = _contract()
+        long = RSIReplayContract.from_mapping(
+            {**short.__dict__, "exit_sma_window": 100}
+        )
+
+        assert short.warmup_calendar_days == 30
+        assert long.warmup_calendar_days == 214
 
     def test_legacy_candidate_uses_immutable_commit_settings(
         self, tmp_path, monkeypatch
@@ -220,6 +233,25 @@ class TestRSIShadowReplay:
         assert result.metadata["exit_reason"] == "protective_stop_entry_session"
         assert result.exit_price == pytest.approx(90.0 * 0.9995)
         assert result.max_favorable_pct == pytest.approx(100.0 / 99.0 - 1.0)
+
+    def test_fill_anchored_contract_keeps_exact_atr_risk_offset(self) -> None:
+        result = resolve_rsi_shadow(
+            _candidate(),
+            _contract(stop_anchor="fill"),
+            daily_bars=_daily(),
+            entry_minutes=_minutes(
+                ("2026-09-09T13:44:00", 99.0, 100.0, 98.0, 99.5),
+                ("2026-09-09T13:45:00", 89.0, 90.0, 88.0, 89.0),
+            ),
+            as_of=datetime(2026, 9, 12, 12, tzinfo=timezone.utc),
+            entry_window_complete=True,
+            contract_source="test",
+        )
+
+        assert result.status == "resolved"
+        assert result.entry_price == 99.0
+        assert result.metadata["stop_price"] == 89.0
+        assert result.entry_price - result.metadata["stop_price"] == 10.0
 
     def test_same_minute_entry_and_stop_is_not_guessed(self) -> None:
         result = resolve_rsi_shadow(
