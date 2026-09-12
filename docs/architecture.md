@@ -436,7 +436,11 @@ picker facts already computed by the real execution path through
 output never feeds back into trading. Same-strategy/same-signal-bar groups retain
 explicit slot, watchlist, and global evaluation order. Groups where one
 candidate was selected and another hit a capacity gate enqueue a disposable
-counterfactual outcome row. Ranking remains disabled; see
+counterfactual outcome row. RSI candidates freeze a replay contract through
+`candidate_replay_contract()`, enriched with the broker's actual entry TIF, and
+can be resolved offline from post-observation minute bars plus completed daily
+bars. Other strategies require their own
+instrument-correct resolver. Ranking remains disabled; see
 [`entry_candidate_observation.md`](entry_candidate_observation.md).
 
 **Current strategies:**
@@ -652,8 +656,9 @@ Every trade is logged to SQLite for per-strategy graduation evidence. This layer
 In addition to fills and lifecycle state, `entry_candidate_decisions` retains
 the permanent explanation of actionable entry choices. The separate
 `entry_candidate_shadow_outcomes` table is calibration-only and can be removed
-after a reviewed ranking policy replaces fixed-order selection. Neither table
-is read by the order path.
+after a reviewed ranking policy replaces fixed-order selection. The offline RSI
+resolver may update only that disposable shadow table; neither table is read by
+the order path.
 - `data/trades.db` — paper trading (never mixed with live data)
 - `data/trades_live.db` — live trading (separate file to prevent cross-contamination)
 
@@ -760,16 +765,19 @@ When implementing any new equity strategy:
 12. Implement `candidate_features(df)` with factual, strategy-specific entry
     characteristics when the strategy participates in `11.61`; it must not
     fetch data or assign a ranking score
+13. Add `candidate_replay_contract()` only when a strategy has a reviewed,
+    instrument-correct offline shadow resolver; never reuse another strategy's
+    fill or exit assumptions
 
 ### Additional steps for options strategies
 
-13. Implement `build_option_execution(symbol, underlying_price) -> tuple | None` — returns `(occ_symbol, limit_price, take_profit, stop_loss)` or `None` to abort
-14. Implement `inspect_open_positions(position, latest_close) -> bool` — mid-trade exit guards (time stop, delta floor, trailing stop, etc.)
-15. Use `utils/options_lookup.find_best_call` (or an equivalent) to select the contract
-16. Add tests for `build_option_execution`, `inspect_open_positions`, and each exit guard in `tests/test_<strategy_name>.py`
-17. For a multi-leg options strategy, implement the MLEG duck-typed hooks (`build_spread_execution`, `evaluate_spread_exit`, `register_spread`, `release_spread`, `open_spreads`, `get_open_spread`) and route entries through `_enter_multi_leg`
-18. Use UUID `position_id`s for spreads and add startup reconstruction through the spread restore path so broker legs cannot be mis-assigned as standalone options
-19. For a second single-leg options strategy on an already-used underlying, first change the single-leg option ownership model away from the underlying-keyed slot; otherwise the underlying-level `SYMBOL_CONFLICT` rule will correctly block it
+14. Implement `build_option_execution(symbol, underlying_price) -> tuple | None` — returns `(occ_symbol, limit_price, take_profit, stop_loss)` or `None` to abort
+15. Implement `inspect_open_positions(position, latest_close) -> bool` — mid-trade exit guards (time stop, delta floor, trailing stop, etc.)
+16. Use `utils/options_lookup.find_best_call` (or an equivalent) to select the contract
+17. Add tests for `build_option_execution`, `inspect_open_positions`, and each exit guard in `tests/test_<strategy_name>.py`
+18. For a multi-leg options strategy, implement the MLEG duck-typed hooks (`build_spread_execution`, `evaluate_spread_exit`, `register_spread`, `release_spread`, `open_spreads`, `get_open_spread`) and route entries through `_enter_multi_leg`
+19. Use UUID `position_id`s for spreads and add startup reconstruction through the spread restore path so broker legs cannot be mis-assigned as standalone options
+20. For a second single-leg options strategy on an already-used underlying, first change the single-leg option ownership model away from the underlying-keyed slot; otherwise the underlying-level `SYMBOL_CONFLICT` rule will correctly block it
 
 ---
 

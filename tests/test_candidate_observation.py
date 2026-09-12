@@ -256,9 +256,28 @@ class TestStrategyCandidateFeatures:
             exit_sma_window=5,
             quick_exit_rsi=55,
         ).candidate_features(frame)
+        assert features["period"] == 3
         assert features["oversold"] == 15.0
         assert "oversold_depth" in features
         assert "distance_to_exit_sma_pct" in features
+
+    def test_rsi_replay_contract_freezes_execution_and_exit_policy(self) -> None:
+        strategy = RSIReversion(
+            period=3,
+            oversold=15,
+            entry_mode="level_below",
+            exit_sma_window=5,
+            quick_exit_rsi=55,
+        )
+
+        contract = strategy.candidate_replay_contract()
+
+        assert strategy.candidate_feature_schema_version == 2
+        assert contract["period"] == 3
+        assert contract["entry_order_type"] == "limit"
+        assert "entry_time_in_force" not in contract
+        assert contract["atr_stop_multiplier"] > 0
+        assert contract["exit_order_type"] == "market"
 
     def test_donchian_features_describe_breakout_and_channel(self) -> None:
         features = DonchianBreakout(

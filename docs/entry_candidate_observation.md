@@ -2,10 +2,11 @@
 
 ## Status
 
-Phase `11.61a` is observation-only. It records which actionable candidates
-reached allocation, what distinguished them, which one the existing sequential
-engine selected, and why another was refused. It does not rank, reorder, resize,
-or submit an additional order.
+Phase `11.61a` records which actionable candidates reached allocation, what
+distinguished them, which one the existing sequential engine selected, and why
+another was refused. The first strategy-specific shadow resolver now supports
+RSI equity candidates offline. Nothing ranks, reorders, resizes, or submits an
+additional order.
 
 ## The decision boundary
 
@@ -52,6 +53,12 @@ Current strategy-owned feature groups are:
 | SPY Options Reversion | RSI recovery shape, SPY/VIX gate state, selected contract premium/spread and rank components |
 | Credit Spread | underlying trend/IV state, configured delta/DTE/credit constraints, selected spread economics and rank components |
 
+RSI feature schema v2 also stores the RSI period. Its candidate context freezes
+the entry order and the broker's actual TIF, ATR-stop multiplier, exit rule, and
+modeled market-exit slippage. A configuration hash distinguishes epochs but
+cannot be reversed into these values, so future replay never borrows whatever
+configuration happens to be active when the resolver is run.
+
 The engine captures only values already computed by the real path. Observation
 must not add quote calls, chain requests, or timing changes. Consequently, a
 candidate rejected by the sleeve before sizing or option selection explicitly
@@ -66,22 +73,50 @@ there is no same-strategy cross-symbol contest to rank.
 decision record. It is populated only when a same-strategy group contains both
 an actually selected candidate and a capacity refusal. The selected row points
 to its real lifecycle. The refused row is marked
-`counterfactual_required`; a later strategy-aware replay can attach fill,
-exit, P&L/R, and favorable/adverse excursion through
-`CandidateObservationStore.record_shadow_outcome`.
+`counterfactual_required`; a strategy-aware replay can attach fill, exit,
+return/R, and favorable/adverse excursion through
+`CandidateObservationStore.record_shadow_outcome`. Dollar P&L remains NULL for
+a refused candidate because allocation never approved a quantity.
 
 The table is a work queue, not a claim that an untraded position earned or lost
-money. No automatic resolver is enabled in `11.61a`: equity, single-leg option,
-and MLEG fills/exits have different semantics, and applying one generic price
-horizon would create misleading evidence. After enough real contention exists,
-the resolver should be implemented per instrument/strategy and tested against
-the production order and exit rules. Once ranking is accepted, this temporary
-table can be dropped without affecting trading or the permanent audit trail.
+money. There is deliberately no generic resolver: equity, single-leg option,
+and MLEG fills/exits have different semantics, and applying one price horizon
+would create misleading evidence. RSI is the only supported resolver because
+it is the only strategy with a real contention group so far.
+
+The RSI resolver is an explicit offline command:
+
+```bash
+# Preview only; does not update the database.
+./venv/bin/python scripts/resolve_candidate_shadows.py
+
+# Persist the previewed states to the disposable shadow table.
+./venv/bin/python scripts/resolve_candidate_shadows.py --apply
+```
+
+It tests the observation session against complete one-minute bars from the
+candidate's recorded feed after the observation time. RSI equity limits are
+GTC in the running bot, so an untouched order remains eligible on later
+completed daily sessions until Alpaca's 90-day GTC expiry. A legacy candidate's
+exact TIF is recovered from the selected peer's durable entry-order row; it is
+never guessed. After a fill, the resolver applies the recorded ATR stop and the
+production RSI exit rule on completed daily bars; signal exits use the next
+session open and the recorded market-slippage model. Same-bar entry/stop
+ordering is marked `needs_review`, not guessed. A live GTC order remains
+`awaiting_fill`; a filled candidate with no exit stays `open`. Both can be
+refreshed later. Old schema-v1 candidates recover their missing configuration
+by parsing literal settings from their immutable stored bot commit; historical
+Python is never executed and current settings are never substituted.
+
+The command only updates `entry_candidate_shadow_outcomes`. It never changes a
+decision, lifecycle, allocator state, or bot behavior. Once ranking is accepted,
+this temporary table can be dropped without affecting trading or the permanent
+audit trail.
 
 ## When ranking may begin
 
 `11.61b` remains blocked until the evidence shows repeated real contention and
-the counterfactual outcomes are resolvable. A proposed strategy-specific rule
+resolved counterfactual outcomes. A proposed strategy-specific rule
 must be pre-registered, tested out of sample, and remain explainable from the
 permanent fields. Signal characteristics may be evaluated, but they must not be
 assumed predictive merely because they sound stronger. Existing order behavior

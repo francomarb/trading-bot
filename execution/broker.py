@@ -384,6 +384,11 @@ class AlpacaBroker:
                 by_client_id=self._stream_lookup_order_by_client_id,
             )
 
+    @property
+    def entry_time_in_force(self) -> str:
+        """Return the effective TIF used by ordinary equity entries."""
+        return "day" if self._time_in_force == "day" else "gtc"
+
     def _entries_allowed(self) -> bool:
         """Return whether a new opening order may be submitted right now."""
         callback = getattr(self, "_entry_allowed", None)

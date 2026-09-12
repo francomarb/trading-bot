@@ -38,6 +38,7 @@ from strategies.base import BaseStrategy, EdgeFilter, OrderType, SignalFrame
 class RSIReversion(BaseStrategy):
     name = "rsi_reversion"
     preferred_order_type = OrderType.LIMIT
+    candidate_feature_schema_version = 2
 
     def __init__(
         self,
@@ -145,6 +146,7 @@ class RSIReversion(BaseStrategy):
         )
         features: dict[str, object] = {
             **self.latest_observation(df),
+            "period": self.period,
             "previous_rsi": previous_rsi,
             "oversold_depth": (
                 float(self.oversold) - current_rsi
@@ -169,6 +171,32 @@ class RSIReversion(BaseStrategy):
             else None
         )
         return features
+
+    def candidate_replay_contract(self) -> dict[str, object]:
+        """Freeze the production entry, protection, and exit semantics.
+
+        A configuration hash proves two candidates differed, but it cannot be
+        reversed into the values needed by an offline replay.  Store those
+        values with the candidate so a later run never borrows today's RSI or
+        risk settings for an older decision.
+        """
+        from config import settings
+
+        return {
+            "contract_version": 1,
+            "strategy": self.name,
+            "timeframe": "1Day",
+            "period": self.period,
+            "oversold": self.oversold,
+            "overbought": self.overbought,
+            "entry_mode": self.entry_mode,
+            "exit_sma_window": self.exit_sma_window,
+            "quick_exit_rsi": self.quick_exit_rsi,
+            "entry_order_type": self.preferred_order_type.value,
+            "atr_stop_multiplier": settings.ATR_STOP_MULTIPLIER,
+            "exit_order_type": "market",
+            "modeled_exit_slippage_bps": settings.SLIPPAGE_MODEL_MARKET_BPS,
+        }
 
     def __repr__(self) -> str:
         return (
