@@ -921,7 +921,7 @@ class TestProcessSymbol:
             data_feed="iex",
         )
 
-        row = engine.lifecycle_store.get_open_for_owner_key("SPY")
+        row = engine.lifecycle_store.get_open_for_owner_key(occ)
         assert row is not None
         assert row.symbol == occ
         assert row.strategy_version == settings.STRATEGY_VERSIONS[
@@ -1293,7 +1293,7 @@ class TestProcessSymbol:
         engine._allocator = MagicMock()
         engine.slots[0].strategy = strategy
         engine._register_single_leg(strategy_name=strategy.name, symbol=occ)
-        engine._entry_prices["SPY"] = 10.0
+        engine._entry_prices[occ] = 10.0
         signal_key = (strategy.name, "SPY", engine.slots[0].timeframe)
         engine._processed_signal_bars[signal_key] = pd.Timestamp(
             patch_fetch["df"].index[-1]
@@ -1309,7 +1309,7 @@ class TestProcessSymbol:
         broker.close_position.assert_called_once_with(occ, position_uid=None)
         broker.place_order.assert_not_called()
         assert not engine._has_position("SPY")
-        assert "SPY" not in engine._entry_prices
+        assert occ not in engine._entry_prices
         engine._allocator.record_realized_pnl.assert_called_once_with(
             strategy.name,
             -100.0,
@@ -1511,10 +1511,9 @@ class TestProcessSymbol:
 
         self._process(engine, "SPY", snap)
 
-        # Position is keyed by the underlying, but the leg carries the OCC.
-        assert "SPY" in engine._positions
-        pos = engine._positions["SPY"]
-        assert pos.position_id == "SPY"
+        # Position is keyed by the lifecycle UID; the leg carries the OCC.
+        pos = next(iter(engine._positions.values()))
+        assert pos.position_id.startswith("pos_")
         assert pos.primary_leg is not None
         assert pos.primary_leg.symbol == occ
         assert pos.strategy_name == "spy_options_reversion"
@@ -3357,7 +3356,7 @@ def _write_lifecycle_claim(
     engine.lifecycle_store.create_pending(
         position_uid=uid,
         symbol=symbol,
-        owner_key=owner_key or owner_key_for(symbol),
+        owner_key=owner_key or symbol,
         strategy=strategy,
         position_type="single_leg",
         entry_qty=10.0,
@@ -3449,7 +3448,7 @@ class TestDurableOwnershipFromDB:
         _write_lifecycle_claim(
             engine,
             symbol=recorded,
-            owner_key="SPY",
+            owner_key=recorded,
         )
 
         conflicts = engine._restore_ownership_from_db(
@@ -3457,9 +3456,9 @@ class TestDurableOwnershipFromDB:
         )
 
         assert not engine._has_position(held)
-        assert conflicts == {"SPY"}
+        assert conflicts == {held}
 
-    def test_multiple_single_leg_contracts_for_owner_are_conflict(
+    def test_claimed_contract_restores_while_unclaimed_contract_conflicts(
         self, patch_fetch, tmp_path
     ):
         first = "SPY260918C00790000"
@@ -3471,16 +3470,51 @@ class TestDurableOwnershipFromDB:
         engine, _, _ = _engine_with_db(
             patch_fetch, tmp_path, positions=positions
         )
-        _write_lifecycle_claim(engine, symbol=first, owner_key="SPY")
+        _write_lifecycle_claim(engine, symbol=first, owner_key=first)
 
         conflicts = engine._restore_ownership_from_db(
             _snapshot(positions=positions)
         )
 
-        assert not engine._has_position(first)
-        assert conflicts == {"SPY"}
+        assert engine._has_position(first)
+        assert not engine._has_position(second)
+        assert conflicts == {second}
 
-    def test_equity_and_option_for_same_owner_are_conflict(
+    def test_distinct_same_underlying_contracts_restore_to_separate_strategies(
+        self, patch_fetch, tmp_path
+    ):
+        first = "SPY260918C00790000"
+        second = "SPY260918C00800000"
+        positions = {
+            first: Position(first, 1, 10.0, 1000.0),
+            second: Position(second, 1, 9.0, 900.0),
+        }
+        engine, _, _ = _engine_with_db(
+            patch_fetch, tmp_path, positions=positions
+        )
+        engine.slots.append(SimpleNamespace(
+            strategy=SimpleNamespace(name="other_option_strategy")
+        ))
+        first_uid = _write_lifecycle_claim(
+            engine, symbol=first, owner_key=first,
+        )
+        second_uid = _write_lifecycle_claim(
+            engine,
+            symbol=second,
+            owner_key=second,
+            strategy="other_option_strategy",
+        )
+
+        conflicts = engine._restore_ownership_from_db(
+            _snapshot(positions=positions)
+        )
+
+        assert conflicts == set()
+        assert set(engine._positions) == {first_uid, second_uid}
+        assert engine._get_owner(first) == "fake_strategy"
+        assert engine._get_owner(second) == "other_option_strategy"
+
+    def test_claimed_equity_restores_while_unclaimed_option_conflicts(
         self, patch_fetch, tmp_path
     ):
         option = "SPY260918C00800000"
@@ -3497,8 +3531,9 @@ class TestDurableOwnershipFromDB:
             _snapshot(positions=positions)
         )
 
-        assert not engine._has_position("SPY")
-        assert conflicts == {"SPY"}
+        assert engine._has_position("SPY")
+        assert not engine._has_position(option)
+        assert conflicts == {option}
 
     def test_lifecycle_retired_strategy_is_conflict(
         self, patch_fetch, tmp_path
@@ -4239,7 +4274,7 @@ class TestExternalCloseDetection:
         from risk.allocator import SleeveAllocator
 
         engine, _, _ = _engine_with_confirm(patch_fetch, tmp_path, confirm=1)
-        engine._entry_prices["SPY"] = 10.0
+        engine._entry_prices["SPY260620C00730000"] = 10.0
         allocator = MagicMock(spec=SleeveAllocator)
         engine._allocator = allocator
 
@@ -4460,15 +4495,19 @@ class TestOptionsEngineFixes:
         engine._repair_missing_protective_stops(snap)
         engine.broker.place_protective_stop.assert_not_called()
 
-    def test_state_snapshot_maps_occ_position_detail_to_owner_key(self, tmp_path):
-        """Options owned by an underlying key should still populate positions_detail."""
+    def test_state_snapshot_keeps_exact_occ_position_detail(self, tmp_path):
+        """Distinct option contracts retain exact rows in positions_detail."""
         import json
 
         from config import settings
 
         engine = self._engine(tmp_path)
         occ = "SPY260618C00746000"
-        engine._register_single_leg(strategy_name="spy_options_reversion", symbol="SPY")
+        engine._register_single_leg(
+            strategy_name="spy_options_reversion",
+            symbol=occ,
+            position_id="pos_snapshot",
+        )
         pos = SimpleNamespace(
             qty=3.0,
             symbol=occ,
@@ -4490,12 +4529,12 @@ class TestOptionsEngineFixes:
         with open(settings.STATE_SNAPSHOT_PATH) as fh:
             state = json.load(fh)
 
-        assert state["open_positions"]["SPY"] == "spy_options_reversion"
-        assert state["positions_detail"]["SPY"]["qty"] == 3.0
-        assert state["positions_detail"]["SPY"]["avg_entry_price"] == 12.77
-        assert state["positions_detail"]["SPY"]["market_value"] == 4335.0
-        assert state["positions_detail"]["SPY"]["cost_basis"] == 3831.0
-        assert state["positions_detail"]["SPY"]["unrealized_pnl"] == 504.0
+        assert state["open_positions"][occ] == "spy_options_reversion"
+        assert state["positions_detail"][occ]["qty"] == 3.0
+        assert state["positions_detail"][occ]["avg_entry_price"] == 12.77
+        assert state["positions_detail"][occ]["market_value"] == 4335.0
+        assert state["positions_detail"][occ]["cost_basis"] == 3831.0
+        assert state["positions_detail"][occ]["unrealized_pnl"] == 504.0
 
     def test_stop_repair_reconstructs_missing_entry_context_for_managed_equity(self, tmp_path, monkeypatch):
         """If DB context is missing but broker position + owner exist, self-heal should reconstruct and repair."""
@@ -4785,8 +4824,12 @@ class TestOptionsEngineFixes:
         """Rejected option entries must clean up pre-registered underlying ownership immediately."""
         engine = self._engine(tmp_path)
         occ = "SPY260516C00520000"
-        engine._register_single_leg(strategy_name="spy_options_reversion", symbol="SPY")
-        engine._entry_prices["SPY"] = 12.15
+        engine._register_single_leg(
+            strategy_name="spy_options_reversion",
+            symbol=occ,
+            position_id="pos_rejected",
+        )
+        engine._entry_prices[occ] = 12.15
         engine.broker.drain_option_fills = MagicMock(return_value=[
             (
                 SimpleNamespace(
@@ -4806,8 +4849,8 @@ class TestOptionsEngineFixes:
 
         engine._drain_option_fills()
 
-        assert not engine._has_position("SPY")
-        assert "SPY" not in engine._entry_prices
+        assert not engine._has_position(occ)
+        assert occ not in engine._entry_prices
 
     def test_drain_option_filled_calls_register_fill_on_strategy(self, tmp_path):
         """A3 — confirmed BUY fill must anchor the strategy's trailing-stop base
@@ -4821,7 +4864,11 @@ class TestOptionsEngineFixes:
         strat_mock = MagicMock()
         strat_mock.name = "spy_options_reversion"
         engine.slots = [StrategySlot(strategy=strat_mock, symbols=["SPY"])]
-        engine._register_single_leg(strategy_name="spy_options_reversion", symbol="SPY")
+        engine._register_single_leg(
+            strategy_name="spy_options_reversion",
+            symbol=occ,
+            position_id="pos_filled",
+        )
         engine.broker.drain_option_fills = MagicMock(return_value=[
             (
                 SimpleNamespace(
@@ -4853,7 +4900,7 @@ class TestOptionsEngineFixes:
         assert lifecycle_result.position_uid == "pos_filled"
         strat_mock.register_fill.assert_called_once_with(occ, 12.40)
         # Entry price tracking continues to use the fill price as before.
-        assert engine._entry_prices.get("SPY") == 12.40
+        assert engine._entry_prices.get(occ) == 12.40
 
 
     # Fix 3: slippage not recorded for options exits ──────────────────────────
@@ -4910,21 +4957,19 @@ class TestOptionsEngineFixes:
 
     # Fix 4: 100x multiplier for options P&L ─────────────────────────────────
 
-    def test_record_realized_pnl_normalizes_occ_to_underlying_entry_key(
+    def test_record_realized_pnl_uses_exact_occ_entry_key(
         self, tmp_path,
     ):
-        """OCC exits use the underlying-keyed entry premium and 100x multiplier."""
+        """OCC exits use the contract-specific entry premium and 100x multiplier."""
         from unittest.mock import MagicMock
         from risk.allocator import SleeveAllocator
 
         engine = self._engine(tmp_path)
         allocator = MagicMock(spec=SleeveAllocator)
         engine._allocator = allocator
-        engine._entry_prices["SPY"] = 10.0  # option premium at entry
-
-        # Production stores the entry premium under owner_key='SPY', while
-        # substrate/operator exit paths pass the exact OCC contract.
         occ = "SPY260516C00520000"
+        engine._entry_prices[occ] = 10.0  # option premium at entry
+
         # 2 contracts, exit premium $15, gain = (15-10)*2*100 = $1 000
         engine._record_realized_pnl(
             occ, "spy_options_reversion", 15.0, 2, multiplier=100,
@@ -5155,13 +5200,14 @@ class TestGenericSingleLegOptionTrailingStops:
         engine._register_single_leg(
             strategy_name=strategy.name,
             symbol="SPY260618C00746000",
+            position_id="pos_abc123",
         )
-        engine._entry_prices["SPY"] = 12.77
+        engine._entry_prices["SPY260618C00746000"] = 12.77
         if create_lifecycle:
             engine.lifecycle_store.create_pending(
                 position_uid="pos_abc123",
                 symbol="SPY260618C00746000",
-                owner_key="SPY",
+                owner_key="SPY260618C00746000",
                 strategy=strategy.name,
                 position_type="single_leg",
                 entry_qty=3,
@@ -5369,7 +5415,9 @@ class TestGenericSingleLegOptionTrailingStops:
         engine._sync_option_trailing_stops(snapshot)
         engine._sync_option_trailing_stops(snapshot)
 
-        lifecycle_row = engine.lifecycle_store.get_open_for_owner_key("SPY")
+        lifecycle_row = engine.lifecycle_store.get_open_for_owner_key(
+            "SPY260618C00746000"
+        )
         assert lifecycle_row is not None
         assert lifecycle_row.symbol == "SPY260618C00746000"
         assert lifecycle_row.strategy == "generic_single_leg_options"
@@ -6661,6 +6709,113 @@ class TestSharedSymbolConflict:
         broker.close_position.assert_called_once_with("AAPL", position_uid=None)
 
 
+class TestSameUnderlyingSingleLegOptionOwnership:
+    """UUID identity keeps same-underlying contracts independently routable."""
+
+    def test_two_strategies_can_own_distinct_spy_contracts(
+        self, engine_factory
+    ):
+        first = "SPY261016C00690000"
+        second = "SPY261016C00700000"
+        engine, _ = engine_factory()
+        engine._register_single_leg(
+            strategy_name="option_strategy_a",
+            symbol=first,
+            position_id="pos_first",
+        )
+        engine._register_single_leg(
+            strategy_name="option_strategy_b",
+            symbol=second,
+            position_id="pos_second",
+        )
+        snapshot = _snapshot(positions={
+            first: Position(first, 1, 10.0, 1_000.0),
+            second: Position(second, 2, 8.0, 1_600.0),
+        })
+
+        assert set(engine._positions) == {"pos_first", "pos_second"}
+        assert engine._owners_view() == {
+            first: "option_strategy_a",
+            second: "option_strategy_b",
+        }
+        assert engine._broker_position_for_strategy(
+            strategy_name="option_strategy_a",
+            underlying="SPY",
+            snapshot=snapshot,
+        ).symbol == first
+        assert engine._broker_position_for_strategy(
+            strategy_name="option_strategy_b",
+            underlying="SPY",
+            snapshot=snapshot,
+        ).symbol == second
+
+    def test_one_strategy_can_own_spy_and_qqq_independently(
+        self, engine_factory
+    ):
+        spy = "SPY261016C00690000"
+        qqq = "QQQ261016C00590000"
+        engine, _ = engine_factory()
+        engine._register_single_leg(
+            strategy_name="index_options_reversion",
+            symbol=spy,
+            position_id="pos_spy",
+        )
+        engine._register_single_leg(
+            strategy_name="index_options_reversion",
+            symbol=qqq,
+            position_id="pos_qqq",
+        )
+
+        assert set(engine._positions) == {"pos_spy", "pos_qqq"}
+        assert engine._tracked_single_leg_for(
+            strategy_name="index_options_reversion", underlying="SPY"
+        ).position_id == "pos_spy"
+        assert engine._tracked_single_leg_for(
+            strategy_name="index_options_reversion", underlying="QQQ"
+        ).position_id == "pos_qqq"
+
+    def test_exact_contract_conflict_is_still_rejected(self, engine_factory):
+        occ = "SPY261016C00690000"
+        engine, _ = engine_factory()
+        engine._register_single_leg(
+            strategy_name="option_strategy_a",
+            symbol=occ,
+            position_id="pos_first",
+        )
+        engine.alerts = MagicMock()
+
+        conflict = engine._reject_if_contract_conflict(
+            strategy_name="option_strategy_b",
+            symbol="SPY",
+            occs=[occ],
+        )
+
+        assert conflict == ("option_strategy_a", occ)
+        assert engine.alerts.order_rejection.call_args.args[3] == "CONTRACT_CONFLICT"
+
+    def test_contract_cleanup_does_not_remove_same_underlying_peer(
+        self, engine_factory
+    ):
+        first = "SPY261016C00690000"
+        second = "SPY261016C00700000"
+        engine, _ = engine_factory()
+        engine._register_single_leg(
+            strategy_name="option_strategy_a",
+            symbol=first,
+            position_id="pos_first",
+        )
+        engine._register_single_leg(
+            strategy_name="option_strategy_b",
+            symbol=second,
+            position_id="pos_second",
+        )
+
+        assert engine._pop_position(first) == "option_strategy_a"
+        assert not engine._has_position(first)
+        assert engine._has_position(second)
+        assert set(engine._positions) == {"pos_second"}
+
+
 # ── Sector exposure observability (11.7 Part B) ────────────────────────────
 
 
@@ -7387,7 +7542,7 @@ class TestSubstrateStopFillSeamEndToEnd:
         occ, entry_px, stop_px, qty = "SPY260821C00738000", 20.0, 18.72, 2.0
         occ_uid = new_position_uid()
         pos_store.create_pending(
-            position_uid=occ_uid, symbol=occ, owner_key="SPY",
+            position_uid=occ_uid, symbol=occ, owner_key=occ,
             strategy="generic_single_leg_options", position_type="single_leg",
             entry_qty=qty,
         )
@@ -7405,11 +7560,12 @@ class TestSubstrateStopFillSeamEndToEnd:
         # NOT spy_options_reversion: OPTION_STOP_REPLACE_AUDIT_STRATEGY is
         # scoped to it, and the audit path needs fixtures unrelated to the
         # multiplier this test is about.
-        engine._positions["SPY"] = Position(
-            symbol=occ, qty=qty, avg_entry_price=entry_px,
-            market_value=entry_px * qty * 100,
+        engine._register_single_leg(
+            strategy_name="generic_single_leg_options",
+            symbol=occ,
+            position_id=occ_uid,
         )
-        engine._entry_prices["SPY"] = entry_px
+        engine._entry_prices[occ] = entry_px
 
         captured: dict = {}
         real_record = engine._record_realized_pnl
@@ -7441,8 +7597,8 @@ class TestSubstrateStopFillSeamEndToEnd:
             f"option stop fill booked at multiplier "
             f"{captured.get('multiplier')} — option P&L understated 100x"
         )
-        assert captured.get("owner_key") == "SPY", (
-            "the OCC symbol must normalise to the underlying for ownership"
+        assert captured.get("owner_key") == occ, (
+            "option accounting must stay scoped to the exact OCC contract"
         )
         assert captured.get("qty") == pytest.approx(qty)
 

@@ -36,6 +36,7 @@ from datetime import datetime, timedelta, timezone
 from typing import Iterable, Sequence
 
 from risk.models import ProtectionModel, SizingModel
+from utils.option_symbols import is_occ_option
 
 
 # ── Schema version ──
@@ -269,9 +270,9 @@ _IDX_LIFECYCLE_ORDERS_REPLACES_SQL = (
 # table (no column change — index only). PR #59 review-6 P1 + R8-3 +
 # R9-P1c: includes 'error' so an errored position retains the
 # owner_key lock until the operator explicitly resolves it. Spreads
-# have UUID owner_keys (always unique), so multiple spreads on the
-# same underlying don't collide. Equity / single-leg options get
-# one non-terminal position per owner_key.
+# have UUID owner_keys (always unique), while equities use their ticker and
+# single-leg options use the exact OCC contract. Distinct contracts on one
+# underlying may coexist; the same broker-aggregated instrument may not.
 _UNIQ_ONE_ACTIVE_POSITION_PER_OWNER_KEY_SQL = (
     "CREATE UNIQUE INDEX IF NOT EXISTS uniq_one_active_position_per_owner_key "
     "ON position_lifecycle(owner_key) "
@@ -2101,7 +2102,9 @@ def apply_order_event(
                         "approved_risk_dollars": approved_risk_dollars,
                         "risk_clip_kind": risk_clip_kind,
                         "applied_size_multiplier": applied_size_multiplier,
-                        "position_id": owner_key,
+                        "position_id": (
+                            position_uid if is_occ_option(symbol) else symbol
+                        ),
                         "position_uid": position_uid,
                         "slippage_benchmark_price": slip_price,
                         "slippage_benchmark_kind": slip_kind,

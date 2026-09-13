@@ -17,8 +17,6 @@ from typing import TYPE_CHECKING
 
 from loguru import logger
 
-from engine.positions import owner_key_for
-
 if TYPE_CHECKING:
     from execution.broker import OpenOrder
     from risk.manager import AccountState
@@ -742,9 +740,7 @@ class SleeveAllocator:
     ) -> dict[str, float]:
         totals = {name: 0.0 for name in self._entries}
         for symbol, pos in account.open_positions.items():
-            owner = position_owners.get(symbol) or position_owners.get(
-                owner_key_for(symbol)
-            )
+            owner = position_owners.get(symbol)
             if owner in totals:
                 totals[owner] += abs(pos.market_value)
         for strategy_name, notional in (additional_used_notional or {}).items():

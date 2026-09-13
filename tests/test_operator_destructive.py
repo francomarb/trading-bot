@@ -43,6 +43,7 @@ from execution.broker import OrderResult, OrderStatus
 from reporting.logger import TradeLogger, TradeRecord
 from risk.manager import AccountState, Position, RiskManager, Side
 from risk.models import ProtectionModel, SizingModel
+from utils.option_symbols import is_occ_option
 
 
 def _build_engine(
@@ -70,7 +71,7 @@ def _build_engine(
     engine._session_start_equity = 100_000.0
     # Stub bookkeeping used by _record_realized_pnl.
     engine._allocator = MagicMock()
-    engine._entry_prices = {owner_key_for(symbol): 95.0}
+    engine._entry_prices = {symbol: 95.0}
     engine._positions = {}
     engine._external_close_suspects = {}
     engine._cleanup_option_trailing_state = MagicMock()
@@ -188,7 +189,7 @@ def _seed_entry_trade(
             initial_risk_per_share * qty * multiplier
         ),
         entry_timestamp=entered_at,
-        position_id=owner_key_for(symbol),
+        position_id=position_uid if is_occ_option(symbol) else symbol,
         position_type="single_leg",
         position_uid=position_uid,
     ))
@@ -618,12 +619,12 @@ class TestReducePosition:
         pos_uid = _seed_open_lifecycle(
             engine,
             symbol=occ,
-            owner_key="SPY",
+            owner_key=occ,
             strategy="spy_options_reversion",
             qty=float(current_qty),
             entry_price=10.0,
         )
-        engine._entry_prices["SPY"] = 10.0
+        engine._entry_prices[occ] = 10.0
         engine.broker.close_position.return_value = OrderResult(
             status=OrderStatus.FILLED,
             order_id="alpaca-opt-reduce",
@@ -734,7 +735,7 @@ class TestDurableReduceAccounting:
         # Deliberately disagree with the weighted durable basis. The live
         # allocator must receive the committed close record's P&L, not this
         # stale/incomplete runtime cache value.
-        engine._entry_prices[owner_key] = entry_price + 1.0
+        engine._entry_prices[symbol] = entry_price + 1.0
 
         command_uid = new_command_uid()
         order_id = "operator-reduce-order"
@@ -1745,7 +1746,7 @@ class TestImmediateResidualProtection:
             tmp_path, broker_qty=3.0, broker_price=5.0, symbol=occ
         )
         pos_uid = _seed_open_lifecycle(
-            engine, symbol=occ, owner_key=owner_key_for(occ),
+            engine, symbol=occ, owner_key=occ,
             strategy="spy_options_reversion", qty=3.0, entry_price=5.0,
         )
         engine.broker.close_position.return_value = OrderResult(

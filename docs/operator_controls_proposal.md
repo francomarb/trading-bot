@@ -97,19 +97,24 @@ The bot should therefore separate broker identity from bot identity:
 
 | Concept | Meaning | Example |
 |---|---|---|
-| `broker_symbol` | Alpaca aggregate position key | `NVDA` |
-| `owner_key` / current engine `position_id` | Bot's current management key for broker aggregation | `NVDA`, `SPY`, or spread UUID |
+| `broker_symbol` | Exact instrument Alpaca aggregates | `NVDA` or `SPY260925C00700000` |
+| `owner_key` | Exclusive durable ownership boundary | Equity ticker, exact OCC, or spread UUID |
+| Engine `Position.position_id` | Runtime logical-position key | Equity ticker, single-leg option `position_uid`, or spread UUID |
 | `position_uid` | Unique lifecycle ID for this specific opened position | `pos_f3b1...` |
 | `order_id` | Alpaca order ID | broker generated |
 | `client_order_id` | Bot-provided order ID, should include or map to `position_uid` | `bot_pos_f3b1_reduce_...` |
 
-The current engine already has `engine.positions.Position.position_id`. For single-leg equities this is currently the symbol, which is useful for live ownership but is not enough for lifecycle identity.
+The engine separates broker aggregation from logical lifecycle identity. Equities
+retain their ticker as the runtime position ID. Single-leg options use their
+durable `position_uid`, while their exact OCC leg remains the broker and
+ownership boundary. Spreads retain their per-instance UUID position ID.
 
-Proposed rule:
+Implemented rule:
 
 ```text
-Keep existing position_id / owner_key behavior for broker aggregation.
-Add position_uid for immutable lifecycle identity.
+Use exact broker symbols to prevent aggregation conflicts.
+Use position_uid as immutable single-leg option lifecycle identity.
+Never collapse distinct OCC contracts to their underlying ticker for ownership.
 ```
 
 For spreads, the existing `position_id` UUID remains the owner key used by the engine to track and reconstruct the multi-leg broker aggregate. The canonical lifecycle identity is `spread_substrate_uid(position_id)` (`pos_<position_id>`), and spread trade rows carry both values in their respective columns. `position_uid` is not a rename or replacement for the raw spread UUID. This exact identity match lets `show-position` join the parent to its fills and report the parent's refreshed realized P&L.

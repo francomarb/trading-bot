@@ -1013,19 +1013,17 @@ The strategy itself is roughly 30% of the implementation. The remaining 70% is i
 | Regime gating via `StrategySlot.allowed_regimes` | Reused as-is |
 | `blackscholes` library (in requirements) | Reused for delta estimation |
 
-### Hard prerequisites — must exist before strategy code can land
+### Implemented prerequisites
 
 #### Prereq 1 — Position abstraction
 
-Today the engine thinks `_position_owners: dict[symbol, strategy_name]`. For options it's keyed by underlying ticker (`"SPY"`) — the 11.23 known limitation. Credit spreads make this harder because **a single logical position is two OCC symbols simultaneously.**
-
-Generalize to a position-ID concept:
+The engine now uses a position-ID concept:
 
 ```python
 _positions: dict[str, Position]   # position_id → Position
 # Position carries: strategy, legs[], entry_prices[], position_type
-# Single-leg options: one entry in legs
-# Spreads: two entries
+# Single-leg options: lifecycle UUID plus one exact-OCC leg
+# Spreads: UUID plus two legs
 # Equities: position_id = equity symbol (backward compat)
 ```
 
@@ -1036,7 +1034,8 @@ Touch points (~10 sites in `engine/trader.py`):
 - State snapshot for dashboard
 - `_record_realized_pnl`
 
-**Estimated:** ~400 LOC + significant test rewrites. **Subsumes 11.23 as a byproduct.**
+This prerequisite is complete. Exact OCC conflicts are rejected while distinct
+same-underlying contracts remain independently owned.
 
 #### Prereq 2 — Trade DB schema migration
 

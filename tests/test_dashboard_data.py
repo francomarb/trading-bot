@@ -318,10 +318,13 @@ class TestFormatLocalTimestamp:
 
 
 class TestMergeDisplayPositionsDetail:
-    def test_maps_occ_broker_symbol_back_to_owner_key(self):
+    def test_merges_single_leg_option_by_exact_occ_symbol(self):
         state = {
             "positions_detail": {
-                "SPY": {"strategy": "spy_options_reversion"}
+                "SPY260618C00746000": {
+                    "strategy": "spy_options_reversion",
+                    "position_id": "pos_example",
+                }
             }
         }
         broker_positions_detail = {
@@ -334,10 +337,12 @@ class TestMergeDisplayPositionsDetail:
             }
         }
         merged = merge_display_positions_detail(state, broker_positions_detail)
-        assert list(merged) == ["SPY"]
-        assert merged["SPY"]["strategy"] == "spy_options_reversion"
-        assert merged["SPY"]["qty"] == 3.0
-        assert merged["SPY"]["cost_basis"] == 3831.0
+        assert list(merged) == ["SPY260618C00746000"]
+        detail = merged["SPY260618C00746000"]
+        assert detail["strategy"] == "spy_options_reversion"
+        assert detail["position_id"] == "pos_example"
+        assert detail["qty"] == 3.0
+        assert detail["cost_basis"] == 3831.0
 
     def test_malformed_json_returns_empty_dict(self, tmp_path):
         f = tmp_path / "state.json"
