@@ -2388,7 +2388,6 @@ class TradingEngine:
         self._last_atr[symbol] = latest_atr
 
         if signal_bar_already_processed:
-            processed_owner_conflict = False
             if hasattr(strategy, "evaluate_spread_exit"):
                 self._process_credit_spread_exits(
                     strategy=strategy,
@@ -2441,8 +2440,6 @@ class TradingEngine:
                 and signal_key in self._processed_signal_reasons
             ):
                 strategy_reasons[symbol] = list(self._processed_signal_reasons[signal_key])
-            if processed_owner_conflict:
-                return
             return
 
         # 4. Signals.
@@ -4950,10 +4947,8 @@ class TradingEngine:
             row = self.lifecycle_store.get_open_for_owner_key(owner_key)
             if row is None:
                 return
-            # Phase A scope: only act on equity single-leg rows. Spread
-            # and options lifecycle close transitions are bundled into
-            # Phase C with the rest of the options/spread lifecycle
-            # wiring.
+            # Single-leg equity and option positions close here. Spreads have
+            # their own parent lifecycle and atomic MLEG close path.
             if row.position_type != "single_leg":
                 return
             self.lifecycle_store.mark_closed(
