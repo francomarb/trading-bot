@@ -599,12 +599,9 @@ _POSITION_UID_INDEX_SQL = (
 
 # Backfill: existing rows pre-PR-11.27 are all single-leg, with
 # position_id = symbol. Run once per database after the ALTERs.
-# One-shot backfill for rows that pre-date PR 11.27. The OWNER_KEY() SQLite
-# UDF (registered in _ensure_db, wired to utils.option_symbols.owner_key_for)
-# collapses OCC option symbols to their underlying ticker — so legacy equity
-# rows store position_id = symbol, and legacy option rows store
-# position_id = underlying. This matches what engine.positions builds for
-# new positions, keeping the engine lookup key and the DB key consistent.
+# One-shot backfill for rows that pre-date PR 11.27. Rows with a lifecycle UID
+# use it as logical identity; older rows without one retain the exact broker
+# symbol. No option contract is collapsed to its underlying.
 # Guarded by `WHERE position_id IS NULL` so explicit writes (future spreads)
 # are never overwritten on subsequent startups.
 #
@@ -624,7 +621,7 @@ _POSITION_UID_INDEX_SQL = (
 # missed a case) and should raise loudly rather than be swallowed.
 _BACKFILL_SQL = (
     "UPDATE trades "
-    "SET position_id = OWNER_KEY(symbol), "
+    "SET position_id = COALESCE(position_uid, symbol), "
     "    position_type = COALESCE(position_type, 'single_leg') "
     "WHERE position_id IS NULL "
     "  AND (position_type IS NULL OR position_type = 'single_leg')"
@@ -793,9 +790,7 @@ class TradeLogger:
             # once that migration lands) are enforced from the first
             # statement onward.
             conn.execute("PRAGMA foreign_keys = ON;")
-            # Register OWNER_KEY() as a SQLite UDF so the backfill SQL can
-            # normalize OCC option symbols to their underlying. Keeps the
-            # stored position_id consistent with engine.positions.owner_key_for().
+            # Retained for older migration queries and diagnostics.
             conn.create_function("OWNER_KEY", 1, owner_key_for, deterministic=True)
             conn.execute(_CREATE_TABLE_SQL)
             existing = {
@@ -860,6 +855,16 @@ class TradeLogger:
                 "WHERE sizing_model IS NULL OR protection_model IS NULL "
                 "OR stated_leverage_multiplier IS NULL "
                 "OR stress_exposure_multiplier IS NULL"
+            )
+            # Single-leg options now reserve the exact OCC contract as their
+            # broker ownership key. The immutable position_uid remains their
+            # logical identity. This migration is deterministic and does not
+            # invent ownership: position_lifecycle.symbol already stores the
+            # exact contract selected for every row.
+            conn.execute(
+                "UPDATE position_lifecycle SET owner_key = symbol "
+                "WHERE position_type = 'single_leg' "
+                "AND OWNER_KEY(symbol) != symbol AND owner_key != symbol"
             )
             for trigger_sql in _CREATE_POSITION_LIFECYCLE_POLICY_TRIGGERS_SQL:
                 conn.execute(trigger_sql)
@@ -964,6 +969,13 @@ class TradeLogger:
             # conflicts here; any IntegrityError signals a bug in
             # detect_trades_order_id_duplicates and must raise loudly.
             conn.execute(_BACKFILL_SQL)
+            conn.execute(
+                "UPDATE trades SET position_id = position_uid "
+                "WHERE position_type = 'single_leg' "
+                "AND position_uid IS NOT NULL "
+                "AND OWNER_KEY(symbol) != symbol "
+                "AND position_id != position_uid"
+            )
             # PLAN 11.58(b): zero is never a valid price. Older writers used
             # it for "unknown", which survives IS NOT NULL checks and looks
             # like real data. Normalize only the sentinel to NULL; do not
@@ -1269,7 +1281,11 @@ class TradeLogger:
             r_multiple=None,
             entry_timestamp=now_iso,
             exit_timestamp=None,
-            position_id=owner_key_for(decision.symbol),
+            position_id=(
+                position_uid
+                if position_uid and _OCC_OPTION_SYMBOL.fullmatch(decision.symbol)
+                else decision.symbol
+            ),
             position_type="single_leg",
             position_uid=position_uid,
             slippage_benchmark_price=new_benchmark_price,
@@ -1476,7 +1492,11 @@ class TradeLogger:
             r_multiple=r_multiple,
             entry_timestamp=entry_timestamp,
             exit_timestamp=now_iso,
-            position_id=owner_key_for(result.symbol),
+            position_id=(
+                position_uid
+                if position_uid and _OCC_OPTION_SYMBOL.fullmatch(result.symbol)
+                else result.symbol
+            ),
             position_type="single_leg",
             # PR #56 R1: persist position_uid so restart reconstruction
             # of the allocator's trade-count dedup state matches live
@@ -1889,7 +1909,14 @@ class TradeLogger:
         rows.reverse()  # Return in chronological order
         return rows
 
-    def log_external_close(self, *, symbol: str, strategy: str, reason: str) -> None:
+    def log_external_close(
+        self,
+        *,
+        symbol: str,
+        strategy: str,
+        reason: str,
+        position_uid: str | None = None,
+    ) -> None:
         """
         Write a synthetic sell record when a position disappears externally
         (stop-out, manual liquidation, margin call, etc.) without the bot
@@ -1929,8 +1956,13 @@ class TradeLogger:
             r_multiple=None,
             entry_timestamp=None,
             exit_timestamp=datetime.now(timezone.utc).isoformat(),
-            position_id=owner_key_for(symbol),
+            position_id=(
+                position_uid
+                if position_uid and _OCC_OPTION_SYMBOL.fullmatch(symbol)
+                else symbol
+            ),
             position_type="single_leg",
+            position_uid=position_uid,
             slippage_benchmark_price=None,
             slippage_benchmark_kind="unavailable",
             slippage_benchmark_timestamp=None,
@@ -2402,7 +2434,11 @@ class TradeLogger:
             r_multiple=r_multiple,
             entry_timestamp=entry_timestamp,
             exit_timestamp=now_iso,
-            position_id=owner_key_for(symbol),
+            position_id=(
+                position_uid
+                if position_uid and _OCC_OPTION_SYMBOL.fullmatch(symbol)
+                else symbol
+            ),
             position_type="single_leg",
             # PR #56 R1: persist position_uid so restart reconstruction
             # of the allocator's trade-count dedup state matches live

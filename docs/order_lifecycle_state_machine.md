@@ -22,7 +22,7 @@ CREATE TABLE position_lifecycle (
     created_at              TEXT    NOT NULL,        -- lifecycle creation time, NOT first fill
     closed_at               TEXT,                    -- terminal-status time
     symbol                  TEXT    NOT NULL,        -- equity ticker OR primary OCC leg
-    owner_key               TEXT    NOT NULL,        -- engine.positions.owner_key_for(symbol)
+    owner_key               TEXT    NOT NULL,        -- ticker, exact OCC, or spread UUID
     strategy                TEXT    NOT NULL,
     position_type           TEXT    NOT NULL,        -- 'single_leg' | 'spread'
     status                  TEXT    NOT NULL,        -- see status set below
@@ -459,13 +459,10 @@ CREATE INDEX idx_lifecycle_orders_replaces     ON position_lifecycle_orders(repl
 Foundation PR also adds a partial unique index to the existing `position_lifecycle` table (no schema column change, index only):
 
 ```sql
--- At most one non-terminal lifecycle row per owner_key. Spreads have
--- per-instance UUID owner_keys (always unique), so multiple spreads
--- on the same underlying don't collide. Equity / single-leg options
--- get one position per owner_key (ticker / underlying), which is the
--- live duplicate-entry-prevention invariant the bot relies on today
--- (currently enforced softly via _positions[]; foundation PR makes
--- it durable). PR #59 review-6 finding #1.
+-- At most one non-terminal lifecycle row per owner_key. Equities use
+-- the ticker, single-leg options use the exact OCC, and spreads use a
+-- per-instance UUID. Distinct option contracts on one underlying may
+-- coexist; the same broker-aggregated instrument may not.
 --
 -- 'error' is included in the lock (PR #59 review-8 finding #3 fix):
 -- an errored position needs operator resolution before the symbol
@@ -1030,7 +1027,7 @@ If during slippage Phase 1's Defect 2 fix we had paused and asked "should this f
 - **Lifecycle row** — one row in `position_lifecycle`. The position-level identity record.
 - **Per-order row** — one row in `position_lifecycle_orders` (proposed §6). The durable record of one specific order in a position's life.
 - **Pending row** — lifecycle row with `status='pending'`. Created before broker submit; awaiting fill confirmation. Under the proposed shape, this status applies to the position-level row only when no order has reached `working` yet.
-- **owner_key** — `engine.positions.owner_key_for(symbol)`. Equity = ticker, options = underlying ticker, spread = per-instance UUID. Used as the broker-aggregation key.
+- **owner_key** — exclusive ownership boundary. Equity = ticker, single-leg option = exact OCC, spread = per-instance UUID.
 - **Recovery row** — a trade-log row written for a fill that was not observed synchronously. Currently tagged `slippage_measurement_quality='recovered'`.
 - **Suspect order** — an order whose terminal state the bot didn't confirm before the synchronous timeout. Held in `_suspect_orders` (entry) or `_suspect_residual_orders` (hybrid residual). Both caches go away with the per-order table.
 - **Synthesized row** — a lifecycle row created retroactively to back a broker-open position the bot didn't originate. Tagged `metadata.synthesized=true`.

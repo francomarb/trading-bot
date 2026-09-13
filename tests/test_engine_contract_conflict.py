@@ -80,11 +80,12 @@ class TestContractOwner:
 
     def test_finds_single_leg_owner_by_exact_occ(self, tmp_path):
         engine = _engine(tmp_path)
-        engine._positions["SPY"] = make_single_leg(
+        position = make_single_leg(
             strategy_name="spy_options_reversion", symbol=_SPY_CALL_A
         )
+        engine._positions[position.position_id] = position
         owner = engine._contract_owner(_SPY_CALL_A)
-        assert owner == ("spy_options_reversion", "SPY")
+        assert owner == ("spy_options_reversion", position.position_id)
 
     def test_distinct_occ_on_same_underlying_is_not_owned(self, tmp_path):
         """The whole point of 11.44 — different strike/expiry/right ≠ collision."""
@@ -129,10 +130,8 @@ class TestRejectIfContractConflict:
         engine.alerts.order_rejection.assert_not_called()
         assert engine._contract_conflicts == []
 
-    def test_same_strategy_re_check_passes(self, tmp_path):
-        """An already-owned contract from the same strategy is not a conflict —
-        only cross-strategy collisions block. (Re-entry de-dup is handled
-        elsewhere via _entry_blocked_by_existing_position.)"""
+    def test_same_strategy_exact_contract_reentry_blocks(self, tmp_path):
+        """Alpaca aggregates an exact OCC holding, even for one strategy."""
         engine = _engine(tmp_path)
         engine.alerts = MagicMock()
         engine._positions["SPY"] = make_single_leg(
@@ -141,8 +140,8 @@ class TestRejectIfContractConflict:
         result = engine._reject_if_contract_conflict(
             strategy_name="spy_options_reversion", symbol="SPY", occs=[_SPY_CALL_A],
         )
-        assert result is None
-        engine.alerts.order_rejection.assert_not_called()
+        assert result == ("spy_options_reversion", _SPY_CALL_A)
+        engine.alerts.order_rejection.assert_called_once()
 
     def test_cross_strategy_exact_occ_blocks(self, tmp_path):
         engine = _engine(tmp_path)
@@ -162,6 +161,31 @@ class TestRejectIfContractConflict:
         assert code == "CONTRACT_CONFLICT"
         # Counter was incremented.
         assert len(engine._contract_conflicts) == 1
+
+    def test_unresolved_durable_contract_claim_blocks(self, tmp_path):
+        engine = _engine(tmp_path)
+        engine.alerts = MagicMock()
+        uid = "pos_unresolved_contract_00000001"
+        engine.lifecycle_store.create_pending(
+            position_uid=uid,
+            symbol=_SPY_CALL_A,
+            owner_key=_SPY_CALL_A,
+            strategy="retired_option_strategy",
+            position_type="single_leg",
+            entry_qty=1.0,
+        )
+        engine.lifecycle_store._conn.execute(
+            "UPDATE position_lifecycle SET status='error' "
+            "WHERE position_uid=?",
+            (uid,),
+        )
+        engine.lifecycle_store._conn.commit()
+
+        assert engine._reject_if_contract_conflict(
+            strategy_name="spy_options_reversion",
+            symbol="SPY",
+            occs=[_SPY_CALL_A],
+        ) == ("retired_option_strategy", _SPY_CALL_A)
 
     def test_mleg_leg_overlap_blocks(self, tmp_path):
         """A new spread sharing even one leg with an existing position is blocked."""
@@ -325,9 +349,8 @@ class TestUnderlyingLevelSkipBoundaries:
             stub.build_spread_execution = lambda *a, **kw: None
         return stub
 
-    def test_single_leg_options_blocked_when_single_leg_owner_exists(self, tmp_path):
-        """The bug the review caught: two single-leg options strategies on the
-        same underlying must not both register."""
+    def test_single_leg_options_are_not_blocked_by_underlying_alone(self, tmp_path):
+        """Distinct contracts may coexist; the later OCC guard blocks overlap."""
         engine = _engine(tmp_path)
         engine.alerts = MagicMock()
         engine._positions["SPY"] = make_single_leg(
@@ -336,14 +359,14 @@ class TestUnderlyingLevelSkipBoundaries:
         strategy = self._stub_strategy(
             name="other_single_leg", single_leg=True, mleg=False,
         )
-        # _get_owner is the operative check; verify it picks up the conflict
-        # and that the new is_mleg_strategy skip does NOT exempt single-leg.
+        # Underlying ownership is intentionally no longer used for options.
         assert hasattr(strategy, "build_option_execution")
         assert not hasattr(strategy, "build_spread_execution")
         owner = engine._get_owner("SPY")
-        assert owner == "spy_options_reversion"
-        # Same-strategy re-register is the existing "skip re-entry" path,
-        # not a conflict — only cross-strategy triggers SYMBOL_CONFLICT.
+        assert owner is None
+        assert engine._reject_if_contract_conflict(
+            strategy_name="other_single_leg", symbol="SPY", occs=[_SPY_CALL_B]
+        ) is None
 
     def test_mleg_strategy_passes_underlying_check_when_single_leg_owner_exists(
         self, tmp_path

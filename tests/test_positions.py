@@ -148,7 +148,7 @@ class TestMakeSingleLeg:
         assert pos.primary_leg.symbol == "AAPL"
         assert pos.entry_price == 150.0
 
-    def test_option_position_id_is_underlying(self) -> None:
+    def test_option_position_id_is_durable_uid(self) -> None:
         pos = make_single_leg(
             strategy_name="spy_options_reversion",
             symbol="SPY260516C00520000",
@@ -156,7 +156,7 @@ class TestMakeSingleLeg:
             entry_price=3.25,
             side="BUY",
         )
-        assert pos.position_id == "SPY"
+        assert pos.position_id.startswith("pos_")
         assert pos.primary_leg.symbol == "SPY260516C00520000"
         assert pos.entry_price == 3.25
 
@@ -205,14 +205,17 @@ class TestNewSpreadId:
 
 
 class TestViewOwnerMap:
-    def test_collapses_to_legacy_dict(self) -> None:
+    def test_uses_exact_single_leg_broker_symbols(self) -> None:
         p1 = make_single_leg(strategy_name="sma", symbol="AAPL")
         p2 = make_single_leg(
             strategy_name="spy_options_reversion",
             symbol="SPY260516C00520000",
         )
         view = view_owner_map([p1, p2])
-        assert view == {"AAPL": "sma", "SPY": "spy_options_reversion"}
+        assert view == {
+            "AAPL": "sma",
+            "SPY260516C00520000": "spy_options_reversion",
+        }
 
 
 class TestBrokerPositionCurrentPrice:

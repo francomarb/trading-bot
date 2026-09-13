@@ -16,7 +16,7 @@ The bot is running in Alpaca paper mode as a six-sleeve portfolio:
 | Equity | RSI Reversion | Static RSI watchlist | Paper active | RSI3 quick-exit reset; limit entries; stock SMA200/liquidity gates |
 | Equity | Donchian Breakout | AI/big-tech watchlist | Paper active | Trend-continuation; TRENDING/RANGING/VOLATILE, BEAR blocked |
 | Equity | Leveraged Trend | SPXL, TQQQ, TECL, SOXL | Paper active | Four slots; signal exits |
-| Isolated options | SPY Options Reversion | SPY calls | Paper active | Single-leg options; underlying-keyed ownership |
+| Isolated options | SPY Options Reversion | SPY calls | Paper active | Single-leg options; lifecycle-UID ownership |
 | Isolated options | Credit Spread | SPY + QQQ bull put spreads | Paper active | MLEG combos; UUID-keyed positions; SPY/QQQ share one sleeve |
 
 Runtime posture:
@@ -27,10 +27,9 @@ Runtime posture:
 - Before an actual live launch: at least one strategy must be operator-approved, slippage calibration must pass, the live-size throttle must be verified, and deployment hardening must be complete
 - VPS work is intentionally deferred until the operator is satisfied that one or more strategies merit live consideration
 - Current ownership model: `_positions: dict[position_id, Position]`
-  - Equity and single-leg options use `owner_key_for(symbol)` as `position_id`
-  - Spreads use UUID `position_id`
-  - Single-leg + MLEG on the same underlying can coexist if OCC legs do not overlap
-  - Two single-leg options strategies on the same underlying are still blocked until the single-leg option ownership model changes
+  - Equities use the ticker; single-leg options and spreads use durable UUID position IDs
+  - The exact OCC contract is the option aggregation boundary; different contracts on one underlying can coexist, but exact-contract overlap is rejected
+  - A single-leg strategy remains limited to one active position per underlying
 
 Current allocation model:
 
@@ -161,7 +160,7 @@ Evidence still collecting: slippage calibration **2/10**; RSI3 **9 entries / 6 c
 | Calibrated sector caps (`11.8`) | Sector exposure is observable; caps should be data-driven, not blanket | Add targeted caps only if paper exposure shows a real concentration problem |
 | Dynamic strategy allocation (`11.9`) | Could improve capital efficiency once each sleeve has enough live/paper evidence | Weight suggestions based on expectancy/Sharpe with operator approval. *When implemented, key `SleeveAllocator` reserve/release on `(strategy, position_uid)` per `docs/operator_controls_proposal.md` §17.* |
 | Defensive cash sweep (`11.45`) | Idle capital during prolonged BEAR/VOLATILE regimes loses purchasing power | SGOV/BIL-style posture only after strict prolonged-BEAR confirmation and recovery state machine |
-| Same-underlying single-leg options ownership | Needed before adding a second single-leg options strategy on SPY/QQQ | Single-leg options can use OCC/UUID position ids without breaking exits, DB restore, allocator, dashboard |
+| ~~Same-underlying single-leg options ownership~~ | ✅ **IMPLEMENTED.** Single-leg options use lifecycle UUIDs while exact OCC symbols isolate broker holdings and accounting. Different strategies may own different contracts on the same underlying; exact-contract overlap remains blocked. | Closed. Restart restore, exits, partial reduce, allocator accounting, and dashboard rows are exact-contract aware. One active position per `(strategy, underlying)` remains the initial policy. |
 | Operator controls dashboard integration | Surface `position_uid` in the dashboard's open-positions table by reading the per-order substrate directly. Independent of operator controls Phase A/B/C, which have shipped. | Per `docs/operator_controls_proposal.md` §17.2. Reads from `position_lifecycle_orders` rather than `engine_state.json`. |
 | Backtest reconcile by lifecycle ID | **OPEN — eligible but low priority.** The original four-week data-age gate is satisfied; no current decision requires lifecycle-exact matching. | Refactor `backtest/reconcile.py` only when a paper/backtest investigation needs lifecycle-exact joins. |
 | `trades.parent_position_uid` column | For rolls/derived positions | Add when the rolls/derived-positions feature is designed — bundle into that PR. Per `docs/operator_controls_proposal.md` §8. |
@@ -235,7 +234,7 @@ Evidence still collecting: slippage calibration **2/10**; RSI3 **9 entries / 6 c
   never reject or rank a company. The target pool is 50 names; open RSI
   positions remain temporarily included until flat so signal exits are not
   orphaned. See `docs/rsi-watchlist-selection.md`.
-- Do not add a second same-underlying single-leg options strategy until the ownership model supports it.
+- Same-underlying single-leg option strategies must use separate exact OCC contracts; never bypass the exact-contract conflict guard.
 - Do not tune paper-watch parameters pre-emptively; audit first, change second.
 - `position_uid` is project-wide lifecycle identity, generated before broker submission and persisted in `position_lifecycle`. Operator controls, the per-order substrate, and single-leg startup ownership use it today. Remaining dashboard/reconcile consumers adopt it only when their contracts require it; MLEG startup reconstruction remains trade-ledger based until spread entry substrate data is complete.
 

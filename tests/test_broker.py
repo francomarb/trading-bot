@@ -2218,7 +2218,7 @@ class TestOptionsDryRun:
             worker_cls.return_value = MagicMock()
             broker.place_order(decision)
 
-        row = lifecycle_store.get_open_for_owner_key("SPY")
+        row = lifecycle_store.get_open_for_owner_key(decision.symbol)
         assert row is not None
         assert row.strategy_version == "1.0"
         assert row.strategy_config_hash == "abcdef123456"

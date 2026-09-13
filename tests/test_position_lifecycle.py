@@ -490,6 +490,39 @@ class TestReads:
         assert row is not None
         assert row.position_uid == uid_first
 
+    def test_distinct_option_contracts_share_underlying_but_not_owner_key(
+        self, store
+    ):
+        first_occ = "SPY261218C00600000"
+        second_occ = "SPY261218C00610000"
+        first_uid = new_position_uid()
+        store.create_pending(
+            position_uid=first_uid,
+            symbol=first_occ,
+            owner_key=first_occ,
+            strategy="spy_options_reversion",
+            position_type="single_leg",
+            entry_qty=1.0,
+        )
+        store.create_pending(
+            position_uid=new_position_uid(),
+            symbol=second_occ,
+            owner_key=second_occ,
+            strategy="other_option_strategy",
+            position_type="single_leg",
+            entry_qty=1.0,
+        )
+
+        with pytest.raises(sqlite3.IntegrityError):
+            store.create_pending(
+                position_uid=new_position_uid(),
+                symbol=first_occ,
+                owner_key=first_occ,
+                strategy="other_option_strategy",
+                position_type="single_leg",
+                entry_qty=1.0,
+            )
+
     def test_get_open_for_owner_key_excludes_closed(self, store):
         uid = new_position_uid()
         store.create_pending(

@@ -1028,8 +1028,7 @@ class TestTradeLogger:
         assert by_symbol["AAPL"]["avg_fill_price"] == pytest.approx(200.0)
 
     def test_position_id_backfill_populates_existing_rows(self, tmp_csv):
-        """Pre-11.27 rows are backfilled to position_id = owner_key_for(symbol):
-        equities keep symbol, OCC options collapse to the underlying."""
+        """Legacy rows keep exact broker symbols when no lifecycle UID exists."""
         conn = sqlite3.connect(tmp_csv)
         conn.execute(
             """
@@ -1074,11 +1073,9 @@ class TestTradeLogger:
             "SELECT symbol, position_id, position_type FROM trades ORDER BY id"
         ).fetchall()
         conn.close()
-        # OCC option rows get normalized to the underlying ticker so the
-        # stored position_id matches engine.positions.owner_key_for().
         assert rows == [
             ("AAPL", "AAPL", "single_leg"),
-            ("SPY260516C00520000", "SPY", "single_leg"),
+            ("SPY260516C00520000", "SPY260516C00520000", "single_leg"),
         ]
 
     def test_position_id_backfill_is_idempotent(self, tmp_csv, sample_decision, sample_result):
@@ -1120,10 +1117,8 @@ class TestTradeLogger:
         # sample_decision uses an equity ticker, so owner_key == symbol.
         assert row == (sample_decision.symbol, "single_leg")
 
-    def test_option_record_writes_underlying_as_position_id(self, tmp_csv):
-        """OCC option fills must store position_id = underlying ticker."""
-        # build a synthetic option entry via log_external_close, which
-        # exercises the same owner_key_for() normalization path.
+    def test_legacy_option_record_writes_exact_symbol_as_position_id(self, tmp_csv):
+        """An option row without a lifecycle UID must not collapse identity."""
         tl = TradeLogger(path=tmp_csv)
         tl.log_external_close(
             symbol="SPY260516C00520000",
@@ -1137,7 +1132,49 @@ class TestTradeLogger:
             "SELECT symbol, position_id, position_type FROM trades WHERE id = 1"
         ).fetchone()
         conn.close()
-        assert row == ("SPY260516C00520000", "SPY", "single_leg")
+        assert row == (
+            "SPY260516C00520000",
+            "SPY260516C00520000",
+            "single_leg",
+        )
+
+    def test_lifecycle_option_external_close_keeps_uid_identity(self, tmp_csv):
+        tl = TradeLogger(path=tmp_csv)
+        occ = "SPY260516C00520000"
+        uid = "pos_external_option_000000000001"
+        tl.log_external_close(
+            symbol=occ,
+            strategy="spy_options_reversion",
+            reason="test_synthetic",
+            position_uid=uid,
+        )
+        row = tl.read_all()[0]
+        assert row["position_id"] == uid
+        assert row["position_uid"] == uid
+
+    def test_legacy_option_lifecycle_owner_migrates_to_exact_contract(self, tmp_csv):
+        tl = TradeLogger(path=tmp_csv)
+        conn = tl._ensure_db()
+        uid = "pos_legacy_option_owner_00000001"
+        occ = "SPY260516C00520000"
+        conn.execute(
+            "INSERT INTO position_lifecycle ("
+            "position_uid, schema_version, created_at, symbol, owner_key, "
+            "strategy, position_type, status, entry_qty, current_qty"
+            ") VALUES (?, 1, ?, ?, 'SPY', 'spy_options_reversion', "
+            "'single_leg', 'open', 1, 1)",
+            (uid, "2026-04-02T00:00:00+00:00", occ),
+        )
+        conn.commit()
+        tl.close()
+
+        migrated = TradeLogger(path=tmp_csv)
+        row = migrated._ensure_db().execute(
+            "SELECT owner_key FROM position_lifecycle WHERE position_uid = ?",
+            (uid,),
+        ).fetchone()
+        migrated.close()
+        assert row == (occ,)
 
 
 # ── TestSpreadLogging (11.29) ───────────────────────────────────────────────

@@ -9,13 +9,10 @@ carry one or many legs:
   - single-leg option   → one PositionLeg, symbol = OCC string
   - spread (future)     → two or more PositionLegs sharing a position_id
 
-For single-leg positions, `position_id` equals the legacy `owner_key`:
-  - equity:  position_id = ticker (e.g. "AAPL")
-  - option:  position_id = underlying ticker (e.g. "SPY"), leg symbol = OCC
-The DB backfill mirrors this: legacy equity rows get
-`position_id = symbol`, and legacy option rows get
-`position_id = owner_key_for(symbol)` (the underlying), so engine
-lookups and stored rows key on the same value.
+Equity positions retain their ticker as ``position_id``.  Single-leg option
+positions use the durable ``position_uid`` generated before submission, just
+like multi-leg positions use an explicit UUID.  The full OCC symbol remains
+the broker aggregation key and is carried by the leg.
 
 Spread support arrives in PR 2/3. PR 1 only ships the abstraction so that
 the engine no longer cares whether a position has one leg or many.
@@ -100,9 +97,9 @@ class Position:
     A logical position composed of one or more legs, owned by one strategy.
 
     The ``position_id`` is the engine's primary key in ``_positions``:
-      - For single-leg positions, it equals the equity ticker or option
-        underlying (i.e. ``owner_key_for(symbol)``).
-      - For spreads (PR 2/3), it is a UUID assigned at submission time.
+      - For equity positions, it equals the ticker.
+      - For option positions, it is the durable ``position_uid``.
+      - For spreads, it is a UUID assigned at submission time.
 
     Attributes:
         position_id:    Stable identifier across legs.
@@ -188,7 +185,9 @@ def owner_key_for(symbol: str) -> str:
     Delegates to :func:`utils.option_symbols.owner_key_for`. Re-exported
     here so engine call sites can keep the historical import path.
 
-    For single-leg positions, owner_key == position_id by convention.
+    This is the legacy underlying normalizer.  It is still useful for grouping
+    options by underlying, but it is no longer the identity of a single-leg
+    option position.
     """
     return _owner_key_for(symbol)
 
@@ -201,13 +200,19 @@ def make_single_leg(
     entry_price: float | None = None,
     entry_time: datetime | None = None,
     side: str = "BUY",
+    position_id: str | None = None,
 ) -> Position:
     """
-    Construct a single-leg Position. ``position_id`` is derived from the
-    symbol (underlying for OCC option strings, ticker for equities) to
-    preserve the existing engine keying.
+    Construct a single-leg Position.
+
+    Equities keep their ticker identity.  Options require a caller-supplied
+    durable lifecycle UID in production; a fresh ``pos_<uuid>`` is generated
+    for legacy/test callers that do not yet have one.
     """
-    position_id = owner_key_for(symbol)
+    if position_id is None:
+        position_id = (
+            f"pos_{uuid.uuid4().hex}" if is_occ_option(symbol) else symbol
+        )
     leg = PositionLeg(
         symbol=symbol,
         qty=qty,
@@ -278,14 +283,21 @@ def make_spread(
 
 def view_owner_map(positions: Iterable[Position]) -> dict[str, str]:
     """
-    Build the legacy ``dict[owner_key, strategy_name]`` view from Position
-    records. Used to bridge the old SleeveAllocator interface in PR 1 without
-    forcing an allocator refactor.
+    Build the broker-facing ``dict[key, strategy_name]`` ownership view.
 
-    Spreads contribute one entry per position_id (since the allocator counts
-    *positions* per strategy, not legs).
+    Single-leg positions contribute their exact broker symbol, which lets two
+    distinct OCC contracts on the same underlying remain independently
+    attributable. Spreads contribute one entry per logical position because
+    their notional is supplied separately by the spread allocator path.
     """
-    return {pos.position_id: pos.strategy_name for pos in positions}
+    return {
+        (
+            pos.primary_leg.symbol
+            if pos.is_single_leg and pos.primary_leg is not None
+            else pos.position_id
+        ): pos.strategy_name
+        for pos in positions
+    }
 
 
 def _field(obj: Any, name: str, default: Any = None) -> Any:

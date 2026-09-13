@@ -2511,21 +2511,18 @@ class TestExitDispatchEndToEnd:
         engine.trade_logger = MagicMock()
         engine.alerts = MagicMock()
         engine.risk = MagicMock()
-        engine._positions = {owner_key: Position(
-            position_id=owner_key, position_type="single_leg",
+        engine_key = broker_symbol
+        engine._positions = {engine_key: Position(
+            position_id=engine_key, position_type="single_leg",
             strategy_name=strategy,
         )}
-        engine._entry_prices = {owner_key: entry_price}
+        engine._entry_prices = {broker_symbol: entry_price}
         engine._external_close_suspects = {}
         # Mock spec stubs out _has_position / _pop_position; wire
         # them to real dict semantics so the dispatch's gate and
         # cleanup are observable.
-        engine._has_position = (
-            lambda sym: owner_key_for(sym) in engine._positions
-        )
-        engine._pop_position = (
-            lambda sym: engine._positions.pop(owner_key_for(sym), None)
-        )
+        engine._has_position = lambda sym: sym in engine._positions
+        engine._pop_position = lambda sym: engine._positions.pop(sym, None)
         # Bind the REAL _record_recovered_exit_fill and its
         # dependencies so the dispatch's call into it actually
         # writes the close log and fires the alert.
@@ -2554,7 +2551,7 @@ class TestExitDispatchEndToEnd:
         # Seed: an open position with an exit order pending.
         uid = new_position_uid()
         pos_store.create_pending(
-            position_uid=uid, symbol=broker_symbol, owner_key=owner_key,
+            position_uid=uid, symbol=broker_symbol, owner_key=broker_symbol,
             strategy=strategy, position_type="single_leg",
             entry_qty=qty,
         )
@@ -2610,9 +2607,9 @@ class TestExitDispatchEndToEnd:
         # Side effects should have fired even though the trade row
         # was already in trades:
         # 1. Ownership cleared from _positions
-        assert owner_key not in engine._positions
+        assert broker_symbol not in engine._positions
         # 2. Entry-price cache cleared
-        assert owner_key not in engine._entry_prices
+        assert broker_symbol not in engine._entry_prices
         # 3. alerts.trade_executed fired
         engine.alerts.trade_executed.assert_called_once()
         engine._allocator.record_realized_pnl.assert_called_once_with(
@@ -2631,7 +2628,7 @@ class TestExitDispatchEndToEnd:
         from types import SimpleNamespace
         from engine.lifecycle_orders import apply_order_event
         from engine.trader import TradingEngine
-        from engine.positions import Position
+        from engine.positions import Position, PositionLeg
         from execution.broker import BrokerSnapshot
         from reporting.logger import TradeLogger
         from engine.lifecycle import PositionLifecycleStore, new_position_uid
@@ -2839,7 +2836,7 @@ class TestSubstrateStopFillDispatchSemantics:
         orders_store: PositionLifecycleOrdersStore,
     ):
         """The real 2026-09-03 sequence: reduce one, stop the remaining two."""
-        from engine.positions import Position
+        from engine.positions import Position, PositionLeg
         from engine.trader import TradingEngine
 
         symbol = "SPY260925C00759000"
@@ -2847,7 +2844,7 @@ class TestSubstrateStopFillDispatchSemantics:
         pos_store.create_pending(
             position_uid=uid,
             symbol=symbol,
-            owner_key="SPY",
+            owner_key=symbol,
             strategy="spy_options_reversion",
             position_type="single_leg",
             entry_qty=3.0,
@@ -2939,16 +2936,21 @@ class TestSubstrateStopFillDispatchSemantics:
         engine.alerts = MagicMock()
         engine._allocator = MagicMock()
         engine._positions = {
-            "SPY": Position(
-                position_id="SPY",
+            uid: Position(
+                position_id=uid,
                 position_type="single_leg",
                 strategy_name="spy_options_reversion",
             )
         }
-        engine._entry_prices = {"SPY": 11.62}
+        engine._positions[uid].legs = [
+            PositionLeg(symbol=symbol, qty=2.0, side="BUY", entry_price=11.62)
+        ]
+        engine._entry_prices = {symbol: 11.62}
         engine._external_close_suspects = {}
-        engine._has_position = lambda key: key in engine._positions
-        engine._pop_position = lambda key: engine._positions.pop(key, None)
+        engine._has_position = lambda key: any(
+            key in pos.symbols() for pos in engine._positions.values()
+        )
+        engine._pop_position = lambda key: engine._positions.pop(uid, None)
         engine._get_position_for = TradingEngine._get_position_for
         engine._record_realized_pnl = TradingEngine._record_realized_pnl.__get__(engine)
         engine._cleanup_option_trailing_state = MagicMock()
@@ -3119,9 +3121,7 @@ class TestEntryDispatchSlippageCompleteness:
         engine._entry_prices = {}
         engine._has_position = lambda sym: sym in engine._positions
         engine._register_single_leg = MagicMock(
-            side_effect=lambda strategy_name, symbol: engine._positions.update(
-                {symbol: object()}
-            )
+            side_effect=TradingEngine._register_single_leg.__get__(engine)
         )
         engine._ensure_recovered_protective_stop = MagicMock()
         engine._lookup_position_uid_for_owner = lambda key: None
@@ -4246,8 +4246,8 @@ class TestRiskCarrySurvivesTheDispatchSeam:
         engine._entry_prices = {}
         engine._has_position = lambda s: s in engine._positions
         engine._register_single_leg = MagicMock(
-            side_effect=lambda strategy_name, symbol: engine._positions.update(
-                {symbol: object()}))
+            side_effect=TradingEngine._register_single_leg.__get__(engine)
+        )
         engine._ensure_recovered_protective_stop = MagicMock()
         engine._lookup_position_uid_for_owner = lambda key: None
         engine._apply_recovered_entry_side_effects = (

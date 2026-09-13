@@ -102,9 +102,9 @@ class SymbolLockRegistry:
         treat this as a rejection (do not retry without inspecting
         the existing holder via ``is_locked``).
 
-        ``owner_key`` is the foundation's engine.positions.owner_key_for
-        result (ticker / underlying / spread UUID). The registry does
-        NOT validate it; the caller is expected to normalise.
+        ``owner_key`` is the lifecycle ownership boundary (ticker, exact OCC,
+        or spread UUID). The registry does not validate it; the caller supplies
+        the already-resolved key.
         """
         if not owner_key:
             raise ValueError("owner_key must be a non-empty string")

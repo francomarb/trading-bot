@@ -465,12 +465,14 @@ class AlpacaBroker:
             return None
         try:
             from engine.lifecycle import new_position_uid
-            from engine.positions import owner_key_for
             uid = new_position_uid()
+            # A single-leg owner key is the exact broker aggregation key.
+            # For equities that is the ticker; for options it is the full OCC
+            # contract.  The logical engine identity remains position_uid.
             self._lifecycle_store.create_pending(
                 position_uid=uid,
                 symbol=decision.symbol,
-                owner_key=owner_key or owner_key_for(decision.symbol),
+                owner_key=owner_key or decision.symbol,
                 strategy=decision.strategy_name,
                 strategy_version=decision.strategy_version,
                 strategy_config_hash=decision.strategy_config_hash,

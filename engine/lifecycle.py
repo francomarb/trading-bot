@@ -832,9 +832,9 @@ class PositionLifecycleStore:
     def get_open_for_owner_key(self, owner_key: str) -> PositionLifecycleRow | None:
         """The single open lifecycle row for an owner_key, or None.
 
-        Per `engine.positions`, owner_key is the broker-aggregation key
-        (equity: symbol; options: underlying ticker; spread: per-
-        instance UUID). At any moment a single owner_key should have
+        ``owner_key`` is the exclusive ownership boundary (equity ticker,
+        exact OCC contract, or per-instance spread UUID). At any moment a
+        single owner_key should have
         at most one non-terminal lifecycle row — if more than one is
         found, this returns the *most recently created* and logs
         nothing (the caller should detect and reconcile).

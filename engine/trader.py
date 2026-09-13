@@ -64,7 +64,7 @@ from config import settings
 from config.settings import SLIPPAGE_MODEL_MARKET_BPS
 from data.fetcher import StaleDataError, close_connections, fetch_symbol, require_fresh
 from engine.positions import (
-    Position,
+    Position as EnginePosition,
     PositionLeg,
     build_credit_spread_snapshot,
     make_single_leg,
@@ -730,11 +730,10 @@ class TradingEngine:
         # Position ownership: position_id → Position. Tracks which strategy
         # opened each position so that exit signals from a *different*
         # strategy watching the same symbol don't close someone else's trade.
-        # For single-leg positions the position_id == owner_key_for(symbol)
-        # (equity ticker, or option underlying for OCC). PR 1 part 2 only
-        # populates single-leg entries; spreads land with the credit-spread
-        # strategy in 11.28/11.29.
-        self._positions: dict[str, Position] = {}
+        # Equity position ids remain tickers. Single-leg options use the
+        # durable position_uid returned by the lifecycle substrate; spreads
+        # use their existing UUID ids. Broker symbols live on the legs.
+        self._positions: dict[str, EnginePosition] = {}
 
         # Credit-spread positions (11.29 PR 3b): position_id → the owning
         # CreditSpread strategy instance. Multiple credit_spread instances
@@ -835,43 +834,138 @@ class TradingEngine:
         return view_owner_map(self._positions.values())
 
     def _get_owner(self, symbol: str) -> str | None:
-        """Return owning strategy_name for a broker symbol (OCC-aware), or None."""
-        pos = self._positions.get(owner_key_for(symbol))
-        return pos.strategy_name if pos else None
+        """Return the unambiguous owner of an exact broker symbol.
+
+        An underlying ticker may group several option contracts, so callers
+        that need that relationship must also supply a strategy and use
+        ``_tracked_single_leg_for``.
+        """
+        matches = [
+            pos for pos in self._positions.values()
+            if getattr(pos, "is_single_leg", False)
+            and pos.primary_leg is not None
+            and pos.primary_leg.symbol == symbol
+        ]
+        if len(matches) == 1:
+            return matches[0].strategy_name
+        return None
 
     def _has_position(self, symbol: str) -> bool:
-        """True if a Position is tracked for ``symbol`` (OCC-normalized)."""
-        return owner_key_for(symbol) in self._positions
+        """True if a Position is tracked by id or exact broker symbol."""
+        if symbol in self._positions:
+            return True
+        return any(
+            getattr(pos, "is_single_leg", False)
+            and pos.primary_leg is not None
+            and pos.primary_leg.symbol == symbol
+            for pos in self._positions.values()
+        )
+
+    def _tracked_single_leg_for(
+        self,
+        *,
+        strategy_name: str,
+        underlying: str,
+    ) -> EnginePosition | None:
+        """Return this strategy's one allowed single-leg position per underlying."""
+        matches = [
+            pos for pos in self._positions.values()
+            if getattr(pos, "is_single_leg", False)
+            and pos.strategy_name == strategy_name
+            and pos.primary_leg is not None
+            and owner_key_for(pos.primary_leg.symbol) == underlying
+        ]
+        if len(matches) > 1:
+            raise RuntimeError(
+                f"[{strategy_name}] {underlying}: multiple single-leg positions "
+                "violate the current one-per-strategy/underlying policy; "
+                "refusing to choose one"
+            )
+        return matches[0] if matches else None
+
+    def _broker_position_for_strategy(
+        self,
+        *,
+        strategy_name: str,
+        underlying: str,
+        snapshot: BrokerSnapshot,
+    ):
+        """Resolve a strategy-owned logical position to its exact broker row."""
+        tracked = self._tracked_single_leg_for(
+            strategy_name=strategy_name,
+            underlying=underlying,
+        )
+        if tracked is None or tracked.primary_leg is None:
+            # Legacy/unowned equity positions remain manageable during
+            # startup recovery. An underlying ticker cannot safely select an
+            # arbitrary OCC contract, so options require durable ownership.
+            if self._get_owner(underlying) is not None:
+                return None
+            return snapshot.account.open_positions.get(underlying)
+        return snapshot.account.open_positions.get(tracked.primary_leg.symbol)
 
     def _register_single_leg(
         self,
         *,
         strategy_name: str,
         symbol: str,
-    ) -> Position:
-        """Create + store a single-leg Position keyed by its owner_key.
+        position_id: str | None = None,
+    ) -> EnginePosition:
+        """Create and store a single-leg Position by logical identity.
 
-        Idempotent: if a Position already exists for this owner_key,
-        returns the existing record (does not overwrite the strategy)."""
-        key = owner_key_for(symbol)
-        existing = self._positions.get(key)
-        if existing is not None:
-            return existing
-        pos = make_single_leg(strategy_name=strategy_name, symbol=symbol)
+        Exact-symbol idempotency prevents two logical owners from claiming the
+        same broker-aggregated holding. Options use their lifecycle UID as the
+        position id; equities retain the ticker default.
+        """
+        logical_position_id = position_id if _OCC_PAT.match(symbol) else None
+        for existing in self._positions.values():
+            if (
+                getattr(existing, "is_single_leg", False)
+                and existing.primary_leg is not None
+                and existing.primary_leg.symbol == symbol
+            ):
+                if existing.strategy_name != strategy_name:
+                    raise ValueError(
+                        f"{symbol} already owned by {existing.strategy_name!r}"
+                    )
+                if (
+                    logical_position_id is not None
+                    and existing.position_id != logical_position_id
+                ):
+                    raise ValueError(
+                        f"{symbol} already bound to position_id "
+                        f"{existing.position_id!r}, not {logical_position_id!r}"
+                    )
+                return existing
+        pos = make_single_leg(
+            strategy_name=strategy_name,
+            symbol=symbol,
+            position_id=logical_position_id,
+        )
         self._positions[pos.position_id] = pos
         return pos
 
-    def _pop_position(self, symbol: str) -> str | None:
-        """Remove the Position for ``symbol`` (OCC-aware). Return strategy_name."""
-        pos = self._positions.pop(owner_key_for(symbol), None)
+    def _pop_position(self, symbol_or_id: str) -> str | None:
+        """Remove a Position by logical id or exact broker symbol."""
+        pos = self._positions.pop(symbol_or_id, None)
+        if pos is None:
+            match_id = next((
+                candidate.position_id
+                for candidate in self._positions.values()
+                if getattr(candidate, "is_single_leg", False)
+                and candidate.primary_leg is not None
+                and candidate.primary_leg.symbol == symbol_or_id
+            ), None)
+            if match_id is not None:
+                pos = self._positions.pop(match_id, None)
         return pos.strategy_name if pos else None
 
     # ── Contract-level conflict (PLAN 11.44) ─────────────────────────────
 
     def _contract_owner(self, occ: str) -> tuple[str, str] | None:
         """
-        Return ``(strategy_name, position_id)`` for any tracked position that
-        already holds ``occ`` as a leg, else ``None``.
+        Return ``(strategy_name, position_id)`` for any active ownership claim
+        that already holds ``occ`` as a leg, else ``None``.
 
         Leg-level, strategy-agnostic scan — applies equally to single-leg
         option positions and to any leg of any multi-leg position. Used by
@@ -888,6 +982,22 @@ class TradingEngine:
             for leg in pos.legs:
                 if leg.symbol == occ:
                     return (pos.strategy_name, pos.position_id)
+        # An unresolved lifecycle claim may intentionally be absent from the
+        # runtime map (notably status='error'). It must still block an exact-
+        # contract submit; otherwise the broker would aggregate a new order
+        # into ownership state that startup already declared unsafe.
+        lifecycle_store = getattr(self, "lifecycle_store", None)
+        if lifecycle_store is not None:
+            try:
+                for claim in lifecycle_store.get_ownership_claims():
+                    claimed_symbols = {claim.symbol, claim.owner_key}
+                    claimed_symbols.update(leg.symbol for leg in claim.legs)
+                    if occ in claimed_symbols:
+                        return (claim.strategy, claim.position_uid)
+            except Exception as exc:
+                raise RuntimeError(
+                    f"durable contract ownership lookup failed for {occ}: {exc}"
+                ) from exc
         return None
 
     def _reject_if_contract_conflict(
@@ -899,7 +1009,7 @@ class TradingEngine:
     ) -> tuple[str, str] | None:
         """
         Check every OCC in ``occs`` against ``_contract_owner``. If any leg is
-        already owned by a different strategy, fire the ``CONTRACT_CONFLICT``
+        already owned by any logical position, fire the ``CONTRACT_CONFLICT``
         alert, increment the rolling counter, and return the first colliding
         ``(other_strategy_name, occ)`` pair. Returns ``None`` when clear.
 
@@ -909,7 +1019,7 @@ class TradingEngine:
         """
         for occ in occs:
             owner = self._contract_owner(occ)
-            if owner is not None and owner[0] != strategy_name:
+            if owner is not None:
                 other_strategy, _ = owner
                 reason = (
                     f"contract {occ} already owned by '{other_strategy}'"
@@ -2287,7 +2397,11 @@ class TradingEngine:
                     current_regime=current_regime,
                 )
             else:
-                position = self._get_position_for(symbol, snapshot)
+                position = self._broker_position_for_strategy(
+                    strategy_name=strategy.name,
+                    underlying=symbol,
+                    snapshot=snapshot,
+                )
                 if position is not None:
                     closed = self._process_single_leg_emergency_exit(
                         symbol=symbol,
@@ -2305,22 +2419,14 @@ class TradingEngine:
                                 or position_target is PositionTarget.FLAT
                             )
                             if should_exit:
-                                owner = self._get_owner(symbol)
-                                if owner is not None and owner != strategy.name:
-                                    processed_owner_conflict = True
-                                    logger.debug(
-                                        f"[{strategy.name}] {symbol}: processed-bar exit ignored — "
-                                        f"position owned by '{owner}'"
-                                    )
-                                else:
-                                    self._close_single_leg_position(
-                                        symbol=symbol,
-                                        strategy=strategy,
-                                        position=position,
-                                        snapshot=snapshot,
-                                        latest_close=latest_close,
-                                        alert_reason="exit signal",
-                                    )
+                                self._close_single_leg_position(
+                                    symbol=symbol,
+                                    strategy=strategy,
+                                    position=position,
+                                    snapshot=snapshot,
+                                    latest_close=latest_close,
+                                    alert_reason="exit signal",
+                                )
                         except Exception as e:
                             logger.error(
                                 f"[{strategy.name}] {symbol}: processed-bar exit check failed: {e}"
@@ -2348,7 +2454,11 @@ class TradingEngine:
         raw_entry = bool(raw_signals.entries.iloc[-1])
         last_entry = bool(signals.entries.iloc[-1])
         last_exit = bool(signals.exits.iloc[-1])
-        position = self._get_position_for(symbol, snapshot)
+        position = self._broker_position_for_strategy(
+            strategy_name=strategy.name,
+            underlying=symbol,
+            snapshot=snapshot,
+        )
         position_target = _current_position_target(strategy, df)
 
         # State-based strategies reconcile broker reality to the currently
@@ -2489,18 +2599,7 @@ class TradingEngine:
                 logger.error(f"[{strategy.name}] {symbol}: inspect_open_positions failed: {e}")
 
         if (last_exit or emergency_exit) and position is not None:
-            # Only the strategy that opened the position may close it.
-            owner = self._get_owner(symbol)
-            if owner is not None and owner != strategy.name:
-                logger.info(
-                    f"[{strategy.name}] {symbol}: exit signal ignored — "
-                    f"position owned by '{owner}'"
-                )
-                self._mark_signal_bar_processed(
-                    signal_key, signal_bar, strategy_statuses, strategy_reasons, symbol
-                )
-                return
-            if self._has_pending_close_order(symbol, snapshot):
+            if self._has_pending_close_order(position.symbol, snapshot):
                 if strategy_statuses is not None:
                     strategy_statuses[symbol] = "Pending Exit"
                 if strategy_reasons is not None:
@@ -2579,10 +2678,22 @@ class TradingEngine:
                 signal_key, signal_bar, strategy_statuses, strategy_reasons, symbol
             )
             return
-        if self._entry_blocked_by_existing_position(strategy, position):
+        tracked_single_leg = (
+            self._tracked_single_leg_for(
+                strategy_name=strategy.name,
+                underlying=symbol,
+            )
+            if hasattr(strategy, "build_option_execution")
+            else None
+        )
+        if (
+            self._entry_blocked_by_existing_position(strategy, position)
+            or tracked_single_leg is not None
+        ):
             # Already in this position — the crossover bar persists across
             # intra-day cycles, so this is expected noise, not a real signal.
-            # Risk would reject anyway; skip to avoid spamming alerts.
+            # A tracked-but-not-yet-visible option also blocks re-entry while
+            # its asynchronous broker order settles.
             self._mark_signal_bar_processed(
                 signal_key, signal_bar, strategy_statuses, strategy_reasons, symbol
             )
@@ -2686,36 +2797,13 @@ class TradingEngine:
             return None
 
         # Shared-symbol conflict (11.7 Part A, refined by PLAN 11.44).
-        #
-        # Asymmetry by ownership-model keying:
-        #   * Equity and single-leg-options positions are keyed in ``_positions``
-        #     by ``owner_key_for(symbol)`` (equity ticker or option underlying).
-        #     Two of them on the same underlying ticker cannot coexist — the
-        #     map can only hold one record per owner_key, so a second
-        #     pre-registration would either be silently dropped (clobbering
-        #     ownership / entry-price attribution) or aggregate into one
-        #     broker position with ambiguous attribution. Both incoming
-        #     equity strategies and incoming single-leg options strategies
-        #     must therefore pass this check.
-        #   * MLEG (spread) positions are keyed by UUID and never occupy the
-        #     underlying slot, so MLEG strategies skip the underlying check
-        #     entirely. The contract-level guard at dispatch
-        #     (``_reject_if_contract_conflict``) is the operative safety net
-        #     for them — it blocks the exact-OCC overlap case (the only
-        #     scenario that would aggregate at the broker).
-        #
-        # ``_get_owner`` only finds single-leg owners by construction (the
-        # underlying-key lookup misses UUID-keyed spreads), so an existing
-        # spread on the same underlying does NOT block an incoming
-        # single-leg options strategy here — exactly the headline
-        # 2026-05-29 case (spy_options_reversion + credit_spread on SPY).
-        #
-        # Future expansion: allowing two single-leg options strategies on
-        # the same underlying requires moving single-leg option Positions
-        # off the underlying-keyed ``_positions`` slot (e.g. UUID or full
-        # OCC). Tracked as follow-up to PLAN 11.44.
+        # Equities still aggregate at the ticker and therefore retain the
+        # cross-strategy ticker conflict. Option strategies are keyed by
+        # position_uid and may share an underlying; after contract selection
+        # the exact-OCC guard below prevents broker aggregation conflicts.
         is_mleg_strategy = hasattr(strategy, "build_spread_execution")
-        if not is_mleg_strategy:
+        is_single_leg_option_strategy = hasattr(strategy, "build_option_execution")
+        if not is_mleg_strategy and not is_single_leg_option_strategy:
             existing_owner = self._get_owner(symbol)
             if existing_owner is not None and existing_owner != strategy.name:
                 logger.info(
@@ -2876,15 +2964,10 @@ class TradingEngine:
                 },
             )
 
-            # PLAN 11.44: contract-level conflict guard. The picker resolved
-            # the OCC; reject before order submission if another strategy
-            # already owns the exact contract. For single-leg options this
-            # is the second of two checks — the underlying-level
-            # ``_get_owner`` check above already blocks another single-leg
-            # owner of the same underlying (the single-leg ``_positions``
-            # slot can only hold one), so the case reached here is the
-            # exact-OCC clash against an MLEG leg owner (whose UUID-keyed
-            # position does not occupy the underlying slot).
+            # Exact-contract conflict guard. The picker has now resolved the
+            # OCC, so reject if any logical position already owns the broker-
+            # aggregated contract. Distinct contracts on one underlying are
+            # intentionally independent.
             if is_occ_option(target_symbol):
                 if self._reject_if_contract_conflict(
                     strategy_name=strategy.name,
@@ -3225,12 +3308,12 @@ class TradingEngine:
                 # Options worker dispatched asynchronously — pre-register
                 # ownership so the position is managed when it arrives in the
                 # broker snapshot. The actual fill is logged via drain_option_fills().
-                # Register with target_symbol (the OCC contract) so the
-                # Position's leg carries the real option symbol; owner_key_for()
-                # still keys the position by the underlying. _entry_prices stays
-                # keyed by `symbol` (== the owner key).
-                self._register_single_leg(strategy_name=strategy.name, symbol=target_symbol)
-                self._entry_prices[symbol] = target_price
+                self._register_single_leg(
+                    strategy_name=strategy.name,
+                    symbol=target_symbol,
+                    position_id=result.position_uid,
+                )
+                self._entry_prices[target_symbol] = target_price
                 logger.info(
                     f"[{strategy.name}] {symbol}: options order dispatched "
                     f"({target_symbol}), ownership pre-registered"
@@ -3269,7 +3352,11 @@ class TradingEngine:
                 # target_symbol == symbol for equities; the OCC contract for
                 # synchronous option fills. Register with it so the leg carries
                 # the real traded symbol.
-                self._register_single_leg(strategy_name=strategy.name, symbol=target_symbol)
+                self._register_single_leg(
+                    strategy_name=strategy.name,
+                    symbol=target_symbol,
+                    position_id=result.position_uid,
+                )
                 if strategy_statuses is not None:
                     strategy_statuses[symbol] = "Long"
                 if strategy_reasons is not None:
@@ -3277,7 +3364,7 @@ class TradingEngine:
                 fill_price = result.avg_fill_price or decision.entry_reference_price
                 fill_qty = float(result.filled_qty or decision.qty)
                 # Cache entry price for HWM P&L gate (used on close).
-                self._entry_prices[symbol] = fill_price
+                self._entry_prices[target_symbol] = fill_price
                 self.alerts.trade_executed(
                     symbol=symbol,
                     strategy=strategy.name,
@@ -3389,6 +3476,7 @@ class TradingEngine:
         decision: RiskDecision,
         fill_price: float,
         fill_qty: float,
+        position_uid: str | None = None,
         reason_suffix: str = "(recovered)",
         entry_order_id: str | None = None,
     ) -> None:
@@ -3436,7 +3524,9 @@ class TradingEngine:
         """
         symbol = decision.symbol
         self._register_single_leg(
-            strategy_name=decision.strategy_name, symbol=symbol,
+            strategy_name=decision.strategy_name,
+            symbol=symbol,
+            position_id=position_uid,
         )
         self._entry_prices[symbol] = fill_price
         self._ensure_recovered_protective_stop(
@@ -3454,8 +3544,8 @@ class TradingEngine:
             qty=fill_qty,
             price=fill_price,
             reason=f"{decision.reason} {reason_suffix}".strip(),
-            position_uid=self._lookup_position_uid_for_owner(
-                owner_key_for(symbol)
+            position_uid=(
+                position_uid or self._lookup_position_uid_for_owner(symbol)
             ),
         )
 
@@ -3699,6 +3789,7 @@ class TradingEngine:
                             decision=recovered_decision,
                             fill_price=float(event.avg_fill_price),
                             fill_qty=float(event.filled_qty),
+                            position_uid=order_row.position_uid,
                             reason_suffix="(substrate)",
                             entry_order_id=event.order_id,
                         )
@@ -3898,7 +3989,7 @@ class TradingEngine:
             )
             if wrote:
                 self._pop_position(symbol)
-                entry_key = owner_key_for(symbol)
+                entry_key = symbol
                 self._entry_prices.pop(entry_key, None)
                 self._external_close_suspects.pop(entry_key, None)
                 logger.warning(
@@ -3946,15 +4037,15 @@ class TradingEngine:
                 return
 
             raw_symbol = pos_row.symbol
-            owner_key = owner_key_for(raw_symbol)
-            if not self._has_position(owner_key):
+            owner_key = raw_symbol
+            if not self._has_position(raw_symbol):
                 return
 
             owner = pos_row.strategy
             price = float(event.avg_fill_price)
             _occ_m = _OCC_PAT.match(raw_symbol)
             residual_position = (
-                self._get_position_for(owner_key, snapshot)
+                self._get_position_for(raw_symbol, snapshot)
                 if snapshot is not None and not _occ_m
                 else None
             )
@@ -4033,8 +4124,8 @@ class TradingEngine:
                 )
                 return
 
-            self._pop_position(owner_key)
-            self._entry_prices.pop(owner_key, None)
+            self._pop_position(raw_symbol)
+            self._entry_prices.pop(raw_symbol, None)
             self._cleanup_option_trailing_state(
                 raw_symbol,
                 reason="substrate stop fill",
@@ -4142,7 +4233,7 @@ class TradingEngine:
                 if self.lifecycle_store is not None:
                     try:
                         _row = self.lifecycle_store.get_open_for_owner_key(
-                            owner_key_for(symbol),
+                            symbol,
                         )
                         if _row is not None:
                             _rebuild_uid = _row.position_uid
@@ -4226,7 +4317,7 @@ class TradingEngine:
         if self.lifecycle_store is not None:
             try:
                 _row = self.lifecycle_store.get_open_for_owner_key(
-                    owner_key_for(symbol),
+                    symbol,
                 )
                 if _row is not None:
                     _recover_uid = _row.position_uid
@@ -4494,11 +4585,11 @@ class TradingEngine:
         # failures don't block the log write, but the record is
         # written with position_uid=None and restart dedup will treat
         # it as legacy.
-        position_uid = position_uid_override
+        position_uid = position_uid_override or getattr(result, "position_uid", None)
         if position_uid is None:
             try:
                 row = self.lifecycle_store.get_open_for_owner_key(
-                    owner_key_for(result.symbol),
+                    result.symbol,
                 )
                 if row is not None:
                     position_uid = row.position_uid
@@ -4702,9 +4793,7 @@ class TradingEngine:
         position_uid: str | None = position_uid_override
         if position_uid is None:
             try:
-                row = self.lifecycle_store.get_open_for_owner_key(
-                    owner_key_for(symbol),
-                )
+                row = self.lifecycle_store.get_open_for_owner_key(symbol)
                 if row is not None:
                     position_uid = row.position_uid
             except Exception as exc:
@@ -4720,7 +4809,7 @@ class TradingEngine:
             # rollup from durable per-order truth.
             if is_full_close:
                 self._close_lifecycle_for_owner_key(
-                    owner_key=owner_key_for(symbol),
+                    owner_key=symbol,
                     external=external,
                 )
             else:
@@ -4731,7 +4820,7 @@ class TradingEngine:
                 # against fill-event rounding) the helper falls back to a
                 # full close so the row reaches a terminal status.
                 self._reduce_lifecycle_for_owner_key(
-                    owner_key=owner_key_for(symbol),
+                    owner_key=symbol,
                     reduced_by=float(qty),
                 )
 
@@ -4755,10 +4844,9 @@ class TradingEngine:
                 f"{realized_pnl:+.2f} (durable trade-ledger basis)"
             )
         else:
-            # Runtime position state is keyed by owner_key. For equities that
-            # is the ticker itself; for a single-leg OCC option it is the
-            # underlying. Exit callers may legitimately pass either shape.
-            entry_key = owner_key_for(symbol)
+            # Entry bases are keyed by the exact broker symbol so distinct
+            # contracts on one underlying never share accounting state.
+            entry_key = symbol
             entry_price = self._entry_prices.get(entry_key)
             if entry_price is None or entry_price <= 0.0:
                 logger.debug(
@@ -6492,7 +6580,7 @@ class TradingEngine:
 
         if is_full_close:
             self._pop_position(lifecycle_row.symbol)
-            entry_key = owner_key_for(lifecycle_row.symbol)
+            entry_key = lifecycle_row.symbol
             self._entry_prices.pop(entry_key, None)
             self._external_close_suspects.pop(entry_key, None)
             self._cleanup_option_trailing_state(
@@ -7138,6 +7226,7 @@ class TradingEngine:
                 timestamp_override=result.filled_at or result.submitted_at,
                 reason=f"operator reduce: {command.reason}",
                 is_full_close=False,
+                position_uid_override=lifecycle_row.position_uid,
             )
             if close_record is None:
                 accounting_errors.append(
@@ -7405,7 +7494,7 @@ class TradingEngine:
         if self.lifecycle_store is not None:
             try:
                 _row = self.lifecycle_store.get_open_for_owner_key(
-                    owner_key_for(position.symbol),
+                    position.symbol,
                 )
                 if _row is not None:
                     _exit_uid = _row.position_uid
@@ -8153,8 +8242,8 @@ class TradingEngine:
         for occ, position in snapshot.account.open_positions.items():
             if not is_occ_option(occ):
                 continue
-            owner_key = owner_key_for(occ)
-            owner = self._get_owner(owner_key)
+            owner_key = occ
+            owner = self._get_owner(occ)
             if owner is None:
                 continue
             if self._close_side_transition_blocks_stop_sync(occ):
@@ -8788,16 +8877,8 @@ class TradingEngine:
 
     @staticmethod
     def _get_position_for(symbol: str, snapshot: BrokerSnapshot):
-        """Get the position for the symbol or its corresponding option contract."""
-        position = snapshot.account.open_positions.get(symbol)
-        if position is not None:
-            return position
-        import re
-        pat = re.compile(rf"^{re.escape(symbol)}[0-9]{{6}}[CP][0-9]{{8}}$")
-        for pos_symbol, pos in snapshot.account.open_positions.items():
-            if pat.match(pos_symbol):
-                return pos
-        return None
+        """Get one exact broker position; never choose an arbitrary OCC leg."""
+        return snapshot.account.open_positions.get(symbol)
 
     @staticmethod
     def _is_matching_symbol(target: str, actual: str) -> bool:
@@ -8909,9 +8990,9 @@ class TradingEngine:
     def _reconcile_vanished_db_positions(self, snapshot: BrokerSnapshot) -> None:
         """Recover broker-proven exits for DB-open positions absent at startup."""
         broker_symbols = set(snapshot.account.open_positions)
-        broker_owner_keys = {owner_key_for(symbol) for symbol in broker_symbols}
+        broker_owner_keys = set(broker_symbols)
         for symbol, owner in self.trade_logger.read_all_open_owners().items():
-            if symbol in broker_symbols or owner_key_for(symbol) in broker_owner_keys:
+            if symbol in broker_symbols or symbol in broker_owner_keys:
                 continue
             try:
                 _sizing, protection = self._position_risk_policy(symbol=symbol)
@@ -8998,6 +9079,7 @@ class TradingEngine:
                 symbol=raw_symbol,
                 strategy=owner,
                 reason="stop_triggered",
+                position_uid=self._lookup_position_uid_for_owner(raw_symbol),
             )
             # Operator Controls Phase A — _record_realized_pnl is not
             # called on this fallback (missing price/qty), so close
@@ -9005,7 +9087,7 @@ class TradingEngine:
             # semantic above. Mirrors the WebSocket stop-fill fallback
             # fix from the F7 patch.
             self._close_lifecycle_for_owner_key(
-                owner_key=owner_key_for(raw_symbol),
+                owner_key=raw_symbol,
                 external=True,
             )
             self._cleanup_option_trailing_state(
@@ -9030,7 +9112,7 @@ class TradingEngine:
         stop_fill_position_uid: str | None = None
         try:
             _row = self.lifecycle_store.get_open_for_owner_key(
-                owner_key_for(raw_symbol),
+                raw_symbol,
             )
             if _row is not None:
                 stop_fill_position_uid = _row.position_uid
@@ -9052,7 +9134,7 @@ class TradingEngine:
         )
         pnl_multiplier = 100 if _OCC_PAT.match(raw_symbol) else 1
         self._record_realized_pnl(
-            symbol,
+            raw_symbol,
             owner,
             price,
             qty,
@@ -9080,7 +9162,7 @@ class TradingEngine:
         if self.lifecycle_store is not None:
             try:
                 row = self.lifecycle_store.get_open_for_owner_key(
-                    owner_key_for(symbol)
+                    symbol
                 )
                 if row is not None:
                     position_uid = row.position_uid
@@ -9122,7 +9204,7 @@ class TradingEngine:
             return SizingModel.STOP_DISTANCE, ProtectionModel.BROKER_STOP
         try:
             row = self.lifecycle_store.get_open_for_owner_key(
-                owner_key_for(symbol)
+                symbol
             )
         except Exception as exc:
             logger.error(
@@ -9146,7 +9228,7 @@ class TradingEngine:
 
     def _close_side_transition_blocks_stop_sync(self, symbol: str) -> bool:
         """Do not race a working close or an operator-held symbol lock."""
-        owner_key = owner_key_for(symbol)
+        owner_key = symbol
         locks = getattr(self, "symbol_locks", None)
         if locks is not None and locks.is_locked(owner_key):
             return True
@@ -9238,7 +9320,7 @@ class TradingEngine:
                 if self.lifecycle_store is not None:
                     try:
                         _row = self.lifecycle_store.get_open_for_owner_key(
-                            owner_key_for(symbol),
+                            symbol,
                         )
                         if _row is not None:
                             _rebuild_uid = _row.position_uid
@@ -9321,7 +9403,7 @@ class TradingEngine:
                 if self.lifecycle_store is not None:
                     try:
                         _row = self.lifecycle_store.get_open_for_owner_key(
-                            owner_key_for(symbol),
+                            symbol,
                         )
                         if _row is not None:
                             _repair_uid = _row.position_uid
@@ -9500,7 +9582,7 @@ class TradingEngine:
         # exists for the owner_key, it returns that uid unchanged.
         if self.lifecycle_store is not None:
             try:
-                owner_key_val = owner_key_for(symbol)
+                owner_key_val = symbol
                 recovered_uid = self.lifecycle_store.synthesize_for_existing(
                     symbol=symbol,
                     owner_key=owner_key_val,
@@ -9603,8 +9685,12 @@ class TradingEngine:
         """
         confirm = self.config.external_close_confirm_cycles
 
-        for symbol, tracked_position in list(self._positions.items()):
-            position_present = self._get_position_for(symbol, snapshot) is not None
+        for position_id, tracked_position in list(self._positions.items()):
+            primary_leg = tracked_position.primary_leg
+            broker_symbol = (
+                primary_leg.symbol if primary_leg is not None else position_id
+            )
+            position_present = broker_symbol in snapshot.account.open_positions
             if tracked_position.is_spread:
                 broker_symbols = set(snapshot.account.open_positions)
                 present_legs = [
@@ -9619,46 +9705,46 @@ class TradingEngine:
                         if leg.symbol not in broker_symbols
                     ]
                     msg = (
-                        f"{symbol}: spread owned by '{tracked_position.strategy_name}' "
+                        f"{position_id}: spread owned by '{tracked_position.strategy_name}' "
                         f"is partially present at broker; missing leg(s) {missing_legs}. "
                         "Leaving ownership intact for manual reconciliation."
                     )
                     logger.warning(msg)
                     self.alerts.broker_error(msg)
-                    self._external_close_suspects.pop(symbol, None)
+                    self._external_close_suspects.pop(position_id, None)
                     continue
 
             if position_present:
                 # Position is present — reset any suspect counter and continue.
-                self._external_close_suspects.pop(symbol, None)
+                self._external_close_suspects.pop(position_id, None)
                 continue
 
-            count = self._external_close_suspects.get(symbol, 0) + 1
-            self._external_close_suspects[symbol] = count
+            count = self._external_close_suspects.get(position_id, 0) + 1
+            self._external_close_suspects[position_id] = count
 
             if count < confirm:
                 logger.debug(
-                    f"{symbol}: absent from broker positions "
+                    f"{broker_symbol}: absent from broker positions "
                     f"({count}/{confirm} cycles) — awaiting confirmation"
                 )
                 continue
 
             # Confirmed absent for `confirm` consecutive cycles.
             owner = tracked_position.strategy_name
-            self._external_close_suspects.pop(symbol, None)
+            self._external_close_suspects.pop(position_id, None)
             try:
                 if tracked_position.is_spread:
-                    self._pop_position(symbol)
+                    self._pop_position(position_id)
                     msg = (
-                        f"{symbol}: position owned by '{owner}' absent for "
+                        f"{position_id}: position owned by '{owner}' absent for "
                         f"{confirm} consecutive cycle(s) — declared externally closed "
                         "(stop-out, manual liquidation, or margin call)"
                     )
                     logger.warning(msg)
                     self.alerts.broker_error(msg)
-                    strategy = self._spread_owner_strategy.pop(symbol, None)
+                    strategy = self._spread_owner_strategy.pop(position_id, None)
                     released = (
-                        strategy.release_spread(symbol)
+                        strategy.release_spread(position_id)
                         if strategy is not None and hasattr(strategy, "release_spread")
                         else None
                     )
@@ -9677,7 +9763,7 @@ class TradingEngine:
                         if ext_spread_max_loss > 0:
                             ext_close_risk_dollars = ext_spread_max_loss * qty
                     self.trade_logger.log_spread_fill(
-                        position_id=symbol,
+                        position_id=position_id,
                         strategy=owner,
                         short_occ=short_occ,
                         long_occ=long_occ,
@@ -9690,34 +9776,36 @@ class TradingEngine:
                         initial_risk_dollars=ext_close_risk_dollars,
                     )
                 else:
-                    _sizing, protection = self._position_risk_policy(symbol=symbol)
+                    _sizing, protection = self._position_risk_policy(
+                        symbol=broker_symbol
+                    )
                     stop_fill = None
                     exit_fills = []
                     if protection is ProtectionModel.SIGNAL_EXIT_ONLY:
                         exit_fills = self._lookup_recent_exit_fills(
-                            symbol=symbol, owner=owner,
+                            symbol=broker_symbol, owner=owner,
                         )
                         if not exit_fills:
                             stop_fill = self._lookup_recent_stop_fill(
-                                symbol=symbol, owner=owner,
+                                symbol=broker_symbol, owner=owner,
                             )
                     else:
                         stop_fill = self._lookup_recent_stop_fill(
-                            symbol=symbol, owner=owner,
+                            symbol=broker_symbol, owner=owner,
                         )
                         if stop_fill is None:
                             exit_fills = self._lookup_recent_exit_fills(
-                                symbol=symbol, owner=owner,
+                                symbol=broker_symbol, owner=owner,
                             )
-                    self._pop_position(symbol)
+                    self._pop_position(position_id)
                     if stop_fill is not None:
                         self._record_recovered_stop_fill(
-                            symbol=symbol,
+                            symbol=broker_symbol,
                             owner=owner,
                             stop_fill=stop_fill,
                         )
                         logger.warning(
-                            f"{symbol}: position owned by '{owner}' absent for "
+                            f"{broker_symbol}: position owned by '{owner}' absent for "
                             f"{confirm} consecutive cycle(s) — reconciled as "
                             "protective stop fill from broker history"
                         )
@@ -9725,7 +9813,7 @@ class TradingEngine:
                         if exit_fills:
                             for index, exit_fill in enumerate(exit_fills):
                                 self._record_recovered_exit_fill(
-                                    symbol=symbol,
+                                    symbol=broker_symbol,
                                     owner=owner,
                                     exit_fill=exit_fill,
                                     alert_reason="broker_history_sell_recovered",
@@ -9733,28 +9821,31 @@ class TradingEngine:
                                     external=True,
                                 )
                             logger.warning(
-                                f"{symbol}: position owned by '{owner}' absent for "
+                                f"{broker_symbol}: position owned by '{owner}' absent for "
                                 f"{confirm} consecutive cycle(s) — reconciled from "
                                 f"{len(exit_fills)} filled SELL order(s) in broker history"
                             )
                         else:
                             msg = (
-                                f"{symbol}: position owned by '{owner}' absent for "
+                                f"{broker_symbol}: position owned by '{owner}' absent for "
                                 f"{confirm} consecutive cycle(s) — declared externally closed "
                                 "(stop-out, manual liquidation, or margin call)"
                             )
                             logger.warning(msg)
                             self.alerts.broker_error(msg)
                             self.trade_logger.log_external_close(
-                                symbol=symbol,
+                                symbol=broker_symbol,
                                 strategy=owner,
                                 reason="external_close_detected",
+                                position_uid=self._lookup_position_uid_for_owner(
+                                    broker_symbol
+                                ),
                             )
                             # Operator Controls Phase A — close the
                             # lifecycle row directly when no real fill can
                             # be recovered from broker history.
                             self._close_lifecycle_for_owner_key(
-                                owner_key=owner_key_for(symbol),
+                                owner_key=broker_symbol,
                                 external=True,
                             )
                     leg = tracked_position.primary_leg
@@ -9763,9 +9854,9 @@ class TradingEngine:
                             leg.symbol,
                             reason="external close",
                         )
-                    self._entry_prices.pop(symbol, None)
+                    self._entry_prices.pop(broker_symbol, None)
             except Exception as e:
-                logger.error(f"{symbol}: failed to log external close: {e}")
+                logger.error(f"{broker_symbol}: failed to log external close: {e}")
 
     def _drain_lifecycle_attaches(self) -> None:
         """Apply per-order substrate attaches enqueued by background
@@ -10704,12 +10795,16 @@ class TradingEngine:
                 _lc = self._lifecycle_counter_for(decision.strategy_name)
                 if _lc is not None:
                     _lc.filled_entries += 1
-                # Update entry price with actual fill price; find the underlying
-                # symbol that was pre-registered when the worker was dispatched.
+                # Update the exact contract's entry basis. The logical Position
+                # was pre-registered under this lifecycle UID at dispatch.
                 underlying = owner_key_for(decision.symbol)
                 if underlying != decision.symbol and avg_fill_price:
-                    if underlying in self._positions:
-                        self._entry_prices[underlying] = avg_fill_price
+                    self._register_single_leg(
+                        strategy_name=decision.strategy_name,
+                        symbol=decision.symbol,
+                        position_id=position_uid,
+                    )
+                    self._entry_prices[decision.symbol] = avg_fill_price
                     strategy = self._strategy_by_name(decision.strategy_name)
                     if self.option_trailing_store is not None:
                         try:
@@ -10769,19 +10864,20 @@ class TradingEngine:
             else:
                 # Order was canceled/rejected — remove pre-registered ownership
                 # so the symbol is not mistakenly tracked as an open position.
-                underlying = owner_key_for(decision.symbol)
-                pre_registered = self._positions.get(underlying)
-                if (
-                    underlying != decision.symbol
-                    and pre_registered is not None
-                    and pre_registered.strategy_name == decision.strategy_name
-                ):
+                pre_registered = next((
+                    pos for pos in self._positions.values()
+                    if pos.position_id == position_uid
+                    and pos.strategy_name == decision.strategy_name
+                    and pos.primary_leg is not None
+                    and pos.primary_leg.symbol == decision.symbol
+                ), None)
+                if pre_registered is not None:
                     logger.info(
                         f"[{decision.strategy_name}] options order canceled/rejected "
                         f"({decision.symbol}) — removing pre-registered ownership"
                     )
-                    self._pop_position(underlying)
-                    self._entry_prices.pop(underlying, None)
+                    self._pop_position(position_uid)
+                    self._entry_prices.pop(decision.symbol, None)
 
     def _process_single_leg_emergency_exit(
         self,
@@ -10807,14 +10903,14 @@ class TradingEngine:
         logger.warning(
             f"[{strategy.name}] {symbol}: EMERGENCY EXIT triggered by strategy hook."
         )
-        owner = self._get_owner(symbol)
+        owner = self._get_owner(position.symbol)
         if owner is not None and owner != strategy.name:
             logger.info(
                 f"[{strategy.name}] {symbol}: emergency exit ignored — "
                 f"position owned by '{owner}'"
             )
             return False
-        if self._has_pending_close_order(symbol, snapshot):
+        if self._has_pending_close_order(position.symbol, snapshot):
             logger.info(
                 f"{symbol}: emergency exit but a close order is already pending — skipping"
             )
@@ -10840,7 +10936,7 @@ class TradingEngine:
         alert_reason: str,
     ) -> bool:
         """Close a single-leg position and perform shared exit bookkeeping."""
-        if self._has_pending_close_order(symbol, snapshot):
+        if self._has_pending_close_order(position.symbol, snapshot):
             logger.info(f"{symbol}: close requested but a close order is already pending — skipping")
             return False
 
@@ -10848,7 +10944,7 @@ class TradingEngine:
         # can overlap an operator close/reduce on the same owner_key. Current
         # destructive routing is engine-thread serial, while the lock remains
         # the explicit ownership invariant around every broker mutation.
-        owner_key_str = owner_key_for(position.symbol)
+        owner_key_str = position.symbol
         lock_holder = None
         registry = getattr(self, "symbol_locks", None)
         if registry is not None:
@@ -10996,6 +11092,7 @@ class TradingEngine:
             strategy.name,
             benchmark_kind=close_benchmark_kind,
             measurement_quality=close_measurement_quality,
+            position_uid_override=getattr(result, "position_uid", None),
         )
         if result.status not in {OrderStatus.FILLED, OrderStatus.PARTIAL}:
             # P-7: _suspect_exit_orders staging removed. The substrate
@@ -11022,7 +11119,7 @@ class TradingEngine:
             price=close_price,
             reason=alert_reason,
             position_uid=getattr(result, "position_uid", None)
-                or self._lookup_position_uid_for_owner(symbol),
+                or self._lookup_position_uid_for_owner(position.symbol),
         )
         pnl_mult = 100 if _OCC_PAT.match(position.symbol) else 1
         # Operator Controls Phase A — only close the lifecycle row when
@@ -11032,16 +11129,17 @@ class TradingEngine:
         # lifecycle row must stay open or the operator CLI will hide a
         # real managed residual.
         self._record_realized_pnl(
-            symbol,
+            position.symbol,
             strategy.name,
             close_price,
             close_qty,
             multiplier=pnl_mult,
             is_full_close=(result.status is OrderStatus.FILLED),
+            position_uid_override=getattr(result, "position_uid", None),
         )
         if result.status is OrderStatus.FILLED:
-            self._pop_position(symbol)
-            self._entry_prices.pop(symbol, None)
+            self._pop_position(position.symbol)
+            self._entry_prices.pop(position.symbol, None)
             self._cleanup_option_trailing_state(
                 position.symbol,
                 reason="close",
@@ -12714,10 +12812,8 @@ class TradingEngine:
         and lifecycle read failures become startup conflicts rather than
         silently falling through to the older ledger.
 
-        OCC option symbols (e.g. SPY260516C00520000) are keyed under their
-        underlying ticker ("SPY") in _positions — owner_key_for() handles the
-        normalization, matching how the engine tracks options during normal
-        operation via _get_position_for().
+        OCC option positions are keyed by their lifecycle ``position_uid``;
+        their exact contract symbol is the durable broker ownership key.
 
         Spread reconstruction remains trade-ledger based because spread
         lifecycle rows do not yet contain the complete two-leg/net-credit
@@ -12743,37 +12839,18 @@ class TradingEngine:
             if sym not in spread_leg_occs
         ]
 
-        # A single-leg owner_key represents exactly one equity or one option
-        # contract. Multiple broker symbols collapsing to the same key cannot
-        # be represented safely by one Position/lifecycle row.
-        symbols_by_owner: dict[str, list[str]] = {}
-        for sym in single_leg_symbols:
-            symbols_by_owner.setdefault(owner_key_for(sym), []).append(sym)
-        ambiguous_owners = {
-            owner_key
-            for owner_key, symbols in symbols_by_owner.items()
-            if len(symbols) > 1
-        }
-        for owner_key in sorted(ambiguous_owners):
-            logger.warning(
-                f"restart: multiple single-leg broker symbols share "
-                f"owner_key='{owner_key}' ({symbols_by_owner[owner_key]}) — "
-                "ownership is ambiguous; declaring a conflict"
-            )
-            conflicts.add(owner_key)
-
         lifecycle_claims: dict[str, "PositionLifecycleRow"] = {}
         lifecycle_store = getattr(self, "lifecycle_store", None)
         if lifecycle_store is not None:
             try:
                 claims = lifecycle_store.get_ownership_claims()
-                lifecycle_claims = {row.owner_key: row for row in claims}
+                lifecycle_claims = {row.symbol: row for row in claims}
             except Exception as exc:
                 # The primary authority exists but could not be read. Falling
                 # through to trade replay would make an I/O failure look like
                 # legitimate absence and could hide a contradictory claim.
                 affected = {
-                    owner_key_for(sym) for sym in single_leg_symbols
+                    sym for sym in single_leg_symbols
                 }
                 conflicts.update(affected)
                 logger.critical(
@@ -12786,11 +12863,8 @@ class TradingEngine:
         legacy_candidates: list[str] = []
 
         for sym in single_leg_symbols:
-            owner_key = owner_key_for(sym)
-            if owner_key in ambiguous_owners:
-                continue
-
-            claim = lifecycle_claims.get(owner_key)
+            owner_key = sym
+            claim = lifecycle_claims.get(sym)
             if claim is None:
                 legacy_candidates.append(sym)
                 continue
@@ -12813,7 +12887,12 @@ class TradingEngine:
                     f"lifecycle strategy {claim.strategy!r} is not configured"
                 )
 
-            existing = self._positions.get(owner_key)
+            existing = next((
+                pos for pos in self._positions.values()
+                if getattr(pos, "is_single_leg", False)
+                and pos.primary_leg is not None
+                and pos.primary_leg.symbol == sym
+            ), None)
             if conflict_reason is None and existing is not None:
                 existing_symbol = (
                     existing.primary_leg.symbol
@@ -12841,6 +12920,7 @@ class TradingEngine:
                 self._register_single_leg(
                     strategy_name=claim.strategy,
                     symbol=sym,
+                    position_id=claim.position_uid,
                 )
             logger.info(
                 f"restart: assigned existing position {sym} "
@@ -12854,7 +12934,7 @@ class TradingEngine:
         try:
             db_owners = self.trade_logger.read_all_open_owners()
         except Exception as exc:
-            affected = {owner_key_for(sym) for sym in legacy_candidates}
+            affected = set(legacy_candidates)
             conflicts.update(affected)
             logger.warning(
                 "restart: legacy trade ownership replay failed "
@@ -12864,18 +12944,18 @@ class TradingEngine:
             return conflicts
 
         for sym in legacy_candidates:
-            # For OCC option symbols, ownership is stored under the underlying.
-            owner_key = owner_key_for(sym)
-            is_option = owner_key != sym
+            owner_key = sym
+            underlying = owner_key_for(sym)
+            is_option = underlying != sym
 
-            if owner_key in self._positions:
+            if self._has_position(sym):
                 continue
 
             # DB lookup: try the exact broker symbol first (OCC string or equity),
             # then fall back to the underlying ticker for options.
             db_owner = db_owners.get(sym)
             if db_owner is None and is_option:
-                db_owner = db_owners.get(owner_key)
+                db_owner = db_owners.get(underlying)
 
             if db_owner is not None:
                 if db_owner in known_strategy_names:
@@ -12896,6 +12976,8 @@ class TradingEngine:
                 # No DB record — fall back to best-effort slot-order match.
                 # For options, match the underlying ticker against slot symbols.
                 lookup = owner_key if is_option else sym
+                if is_option:
+                    lookup = underlying
                 matched = False
                 for slot in self.slots:
                     if lookup in slot.active_symbols():
@@ -12917,6 +12999,7 @@ class TradingEngine:
                         "managed by this engine. Close it manually or add it to a "
                         "strategy's symbol universe."
                     )
+                    conflicts.add(sym)
 
         return conflicts
 
@@ -13094,7 +13177,6 @@ class TradingEngine:
     def _restore_entry_prices_from_db(self, snapshot: BrokerSnapshot) -> None:
         """Restore actual fill bases for currently-open broker positions."""
         for sym in snapshot.account.open_positions:
-            owner_key = owner_key_for(sym)
             occ_m = _OCC_PAT.match(sym)
             owner = self._get_owner(sym)
             if owner is None:
@@ -13105,7 +13187,7 @@ class TradingEngine:
             )
             if context is None and occ_m:
                 context = self.trade_logger.read_latest_open_entry_context(
-                    symbol=owner_key,
+                    symbol=owner_key_for(sym),
                     strategy=owner,
                 )
             if context is None:
@@ -13123,12 +13205,12 @@ class TradingEngine:
                 # _record_realized_pnl → the allocator's HWM drawdown
                 # gate, so a reference basis must not be seeded here.
                 # The lifecycle substrate keeps the broker fill basis.
-                lifecycle_price = self._lifecycle_avg_entry_price(owner_key)
+                lifecycle_price = self._lifecycle_avg_entry_price(sym)
                 if lifecycle_price is None:
                     if entry_price > 0.0:
                         logger.warning(
                             f"restart: NOT restoring entry price for {sym} "
-                            f"(owner_key='{owner_key}') — replay basis "
+                            f"(owner_key='{sym}') — replay basis "
                             f"${entry_price:.2f} has source="
                             f"'{basis_source}' and no lifecycle "
                             f"avg_entry_price exists; realized P&L for "
@@ -13142,10 +13224,10 @@ class TradingEngine:
                     f"(source='{basis_source}') — using lifecycle "
                     f"avg_entry_price ${entry_price:.2f}"
                 )
-            self._entry_prices[owner_key] = entry_price
+            self._entry_prices[sym] = entry_price
             logger.info(
                 f"restart: restored entry price for {sym} "
-                f"(owner_key='{owner_key}') at ${entry_price:.2f}"
+                f"(owner_key='{sym}') at ${entry_price:.2f}"
             )
 
     def _lifecycle_avg_entry_price(self, owner_key: str) -> float | None:
@@ -13184,8 +13266,8 @@ class TradingEngine:
             return "RESTRICTED"
 
         # Check for broker positions with no ownership at all.
-        # OCC option positions are owned under their underlying ticker, so we
-        # must resolve the owner key before checking _positions.
+        # Single-leg positions are resolved by exact broker symbol; spread legs
+        # remain represented by their parent UUID and are checked separately.
         managed_spread_legs = {
             leg.symbol
             for position in self._positions.values()
@@ -13195,7 +13277,7 @@ class TradingEngine:
         unmanaged = [
             sym
             for sym in snapshot.account.open_positions
-            if owner_key_for(sym) not in self._positions
+            if not self._has_position(sym)
             and sym not in managed_spread_legs
         ]
         if unmanaged:
@@ -13252,11 +13334,16 @@ class TradingEngine:
                 for leg in tracked.legs
             }
             for sym, position in snapshot.account.open_positions.items():
-                owner = owner_key_for(sym)
+                owner = sym
                 existing = self.lifecycle_store.get_open_for_owner_key(owner)
                 if existing is not None:
                     continue
-                pos = self._positions.get(owner)
+                pos = next((
+                    tracked for tracked in self._positions.values()
+                    if getattr(tracked, "is_single_leg", False)
+                    and tracked.primary_leg is not None
+                    and tracked.primary_leg.symbol == sym
+                ), None)
                 is_occ = bool(_OCC_PAT.match(sym))
                 if is_occ:
                     if sym in managed_spread_legs:
@@ -13291,6 +13378,11 @@ class TradingEngine:
                     position_type="single_leg",
                     current_qty=qty_val,
                     avg_entry_price=avg_val,
+                    position_uid=(
+                        pos.position_id
+                        if is_occ and pos is not None
+                        else None
+                    ),
                     legs=legs,
                     backfill_note=(
                         "synthesized at startup from broker OCC option state"
@@ -13312,9 +13404,7 @@ class TradingEngine:
             # mid-submit would mass-close legitimate pending rows as
             # external_closed before _lifecycle_mark_filled gets a
             # chance to transition them.
-            broker_owners = {
-                owner_key_for(s) for s in snapshot.account.open_positions
-            }
+            broker_owners = set(snapshot.account.open_positions)
             grace_seconds = int(settings.LIFECYCLE_PENDING_GRACE_SECONDS)
             now_utc = datetime.now(timezone.utc)
             for row in self.lifecycle_store.get_open():
@@ -13518,11 +13608,8 @@ class TradingEngine:
                 self._last_snapshot.account.open_positions
                 if self._last_snapshot else {}
             )
-            broker_positions_by_owner = {
-                owner_key_for(sym): pos for sym, pos in broker_positions.items()
-            }
             for sym, strat in self._owners_view().items():
-                pos = broker_positions.get(sym) or broker_positions_by_owner.get(sym)
+                pos = broker_positions.get(sym)
                 unrealized_pnl = None
                 cost_basis = None
                 current_price = None

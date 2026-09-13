@@ -36,7 +36,7 @@ from reporting.logger import (
     STOP_GAP_KINDS,
     is_execution_quality_measurement,
 )
-from engine.positions import build_credit_spread_snapshot, owner_key_for
+from engine.positions import build_credit_spread_snapshot
 from monitors.leveraged_trend import (
     Phase,
     TrendMonitorState,
@@ -86,10 +86,8 @@ def merge_display_positions_detail(
     """
     Merge broker position detail onto snapshot-owned position keys.
 
-    The engine tracks single-leg options by their owner key (e.g. ``SPY``),
-    while Alpaca reports the raw OCC contract symbol. This helper normalizes
-    broker positions through ``owner_key_for`` so option positions still render
-    correctly in the Open Positions table.
+    Single-leg positions are keyed by their exact broker symbol. This preserves
+    separate rows for distinct option contracts on the same underlying.
     """
     if not broker_positions_detail:
         return dict(state.get("positions_detail") or {})
@@ -97,15 +95,10 @@ def merge_display_positions_detail(
     positions_detail: dict[str, dict[str, Any]] = {}
     snapshot_positions = state.get("positions_detail") or {}
     for sym, detail in broker_positions_detail.items():
-        owner_key = owner_key_for(sym)
-        enriched = dict(detail)
-        snapshot_detail = (
-            snapshot_positions.get(owner_key)
-            or snapshot_positions.get(sym, {})
-        )
-        if "strategy" not in enriched and snapshot_detail.get("strategy") is not None:
-            enriched["strategy"] = snapshot_detail["strategy"]
-        positions_detail[owner_key] = enriched
+        snapshot_detail = snapshot_positions.get(sym, {})
+        enriched = dict(snapshot_detail)
+        enriched.update(detail)
+        positions_detail[sym] = enriched
 
     for sym, detail in snapshot_positions.items():
         positions_detail.setdefault(sym, dict(detail))
