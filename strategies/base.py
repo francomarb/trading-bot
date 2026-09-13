@@ -325,6 +325,15 @@ class BaseStrategy(ABC):
         """
         return 50
 
+    def candidate_replay_contract(self) -> dict[str, object] | None:
+        """Return immutable facts needed to replay a refused candidate.
+
+        Candidate observation is advisory and must never influence trading.
+        Most strategies do not yet have a shadow resolver, so the default is
+        deliberately absent rather than a misleading generic contract.
+        """
+        return None
+
     def risk_profile(self, symbol: str) -> "PositionRiskProfile":
         """Return immutable entry-risk intent for ``symbol``.
 

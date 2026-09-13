@@ -1276,6 +1276,31 @@ class TradingEngine:
                     else None
                 ),
             }
+            replay_contract_getter = getattr(
+                strategy, "candidate_replay_contract", None
+            )
+            if callable(replay_contract_getter):
+                try:
+                    replay_contract = replay_contract_getter()
+                    if replay_contract is not None:
+                        if not isinstance(replay_contract, dict):
+                            raise TypeError(
+                                "candidate_replay_contract must return a dict or None"
+                            )
+                        replay_contract = dict(replay_contract)
+                        entry_tif = getattr(
+                            self._broker, "entry_time_in_force", None
+                        )
+                        if not isinstance(entry_tif, str) or not entry_tif:
+                            raise ValueError(
+                                "broker does not expose its equity entry TIF"
+                            )
+                        replay_contract["entry_time_in_force"] = entry_tif
+                        common_context["shadow_replay_contract"] = replay_contract
+                except Exception as exc:
+                    common_context["shadow_replay_contract_error"] = (
+                        f"{type(exc).__name__}: {exc}"
+                    )
             if self._allocator is not None:
                 try:
                     allocator_snapshot = self._allocator.snapshot(

@@ -192,6 +192,17 @@ def _no_sleep(monkeypatch):
 
 
 class TestPlaceOrderContract:
+    @pytest.mark.parametrize(
+        ("configured", "effective"),
+        [("day", "day"), ("gtc", "gtc"), ("unexpected", "gtc")],
+    )
+    def test_entry_time_in_force_reports_effective_broker_behavior(
+        self, configured, effective
+    ):
+        broker = AlpacaBroker(client=MagicMock(), time_in_force=configured)
+
+        assert broker.entry_time_in_force == effective
+
     def test_rejects_non_RiskDecision(self):
         api = MagicMock()
         broker = _broker_with_mock(api)
